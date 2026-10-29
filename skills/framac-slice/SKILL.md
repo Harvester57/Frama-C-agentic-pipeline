@@ -35,7 +35,7 @@ python3 $S/workspace_overlay.py init --target /target --overlay workspace
 
 The target is never modified. If the overlay already exists and the target changed since it was captured, `init` fails: start a new run directory instead of resuming.
 
-If the target has no `compile_commands.json` (or has an out-of-tree build system where running `bear` is impractical), `build_callgraph_dag.py` in Step 2 automatically discovers all in-repository header directories and can emit a synthesized `compile_commands.json` via `--emit-compile-commands workspace/reports/compile_commands.json` while stripping any host `/usr/include` paths. If you do want to capture build flags from the target's native build, do so in a disposable full copy inside the inner sandbox:
+If the target has no `compile_commands.json` (or has an out-of-tree build system where running `bear` is impractical), `build_callgraph_dag.py` in Step 2 automatically discovers all in-repository header directories and can emit a synthesized `compile_commands.json` via `--emit-compile-commands workspace/reports/compile_commands.json` while stripping any host `/usr/include` paths. If you do want to capture build flags from the target's native build, do so in a disposable full copy run through `sandbox_exec.py` (rlimits, env allowlist, timeout):
 
 ```text
 mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/
@@ -101,6 +101,12 @@ Supported `--entry-style` modes and options in `generate_harness.py`:
 - Note: Passing a workspace path like `--header workspace/work/src/Mod/Mod.h` automatically adds `-Iworkspace/work/src/Mod` to `cppflags` and emits `#include "Mod.h"`.
 - If `entry_fn` is `static` inside its `.c` file, pass `--include-source` so the harness includes the `.c` translation unit directly instead of compiling it twice.
 - If a dynamic LibFuzzer binary cannot link an external third-party library symbol at link time, pass `--stubbed-callee <fn>` so it is recorded in `harness_<mod>.json` (`stubbed_callees`) and any linker stub is guarded by `#ifndef __FRAMAC__`.
+
+Module headers are often not self-sufficient (for example `Events.h` uses `Boolean_T`, `GST_CHAIN_MODE_T`, or `CMD_NAME_MAX_LEN` defined in `PtfUtil.h` without including it). Auto-prelude handles this (on by default):
+- After writing the harness, `generate_harness.py` runs `clang -fsyntax-only -x c <cppflags> harness_<mod>.c` (LibFuzzer branch, no `-D__FRAMAC__`), collects `unknown type name` / `use of undeclared identifier` diagnostics, finds the defining `*.h` in the `-I` directories of `--cppflags` (typedefs, `} X;`, `#define X`, enum constants; top-level of each directory only), and `#include`s it before the module header. It repeats this up to 3 rounds.
+- The outcome is recorded in `harness_<mod>.json` and the JSON output as `prelude_headers`, `prelude_status` (`clean`, `resolved`, `unresolved`, `skipped` when clang is missing or hits a fatal error, `disabled`), and `prelude_unresolved`. If symbols are still unresolved, the command fails and lists them. In that case, add the missing directory with `-I`, or use the manual form below.
+- Pass `--no-auto-prelude` to turn it off. The manual form still works: `--header <root>.h --extra-include <mod>.h` (the root header that defines the shared types goes first, then the module header).
+- Boundary stubs and harness code must never redefine identifiers the target owns (enum constants, target typedefs, target macros). The target header is parsed after the prelude and stubs, so a redefinition causes a redeclaration error or silently uses a different type. Include the target's own header instead.
 
 The harness must respect the entry function's declared or documented contract (buffer sizes, non-NULL arguments, length limits). A crash caused by a harness that violates that contract is `rejected` as harness-induced, so get this right before fuzzing. Verify that every generated harness parses cleanly with the Frama-C kernel (`frama-c -machdep gcc_x86_64 ... -kernel-warn-key annot-error=abort`).
 

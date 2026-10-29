@@ -5,7 +5,7 @@ description: >-
   hunting per module slice by generating RTE assertions (-rte), compiling them
   with E-ACSL into runtime shadow-memory and arithmetic checks, and fuzzing the
   resulting binary with Clang LibFuzzer inside the hardened framac-pipeline
-  container and the bubblewrap inner sandbox. Catches intra-struct sub-object
+  container under sandbox_exec.py (rlimits, env allowlist, timeout). Catches intra-struct sub-object
   overflows, uninitialized reads, signed/unsigned overflows, and Layer 4-6 ACSL
   security contract violations. Crashes become fingerprinted candidates, not
   findings, until independently verified.
@@ -32,6 +32,18 @@ Select all modules with `run_eacsl_fuzz: true` (or the specific `--module <name>
 
 ---
 
+## Step 1b — Verify the E-ACSL Toolchain (once per image / Frama-C version)
+
+```powershell
+& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
+  -TargetDir "<target-dir>" -RunDir "<run-dir>" `
+  "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
+```
+
+`selftest` builds `templates/eacsl_canary/canary.c` through the exact production E-ACSL path and writes `workspace/reports/eacsl_selftest.json`. Its checks are `compiled`, `no_gmp_only`, `instrumented_binary`, `detects_overflow`, and `attributes_line` (the last one is informational). If it fails, `campaign --engine auto` skips E-ACSL for every module with `engine_fallback_reason: eacsl_selftest_failed: ...` instead of failing each compile. Read `checks` and the canary `compile_log` before touching harnesses: a failing canary is a toolchain problem, not a target problem.
+
+---
+
 ## Step 2 — Parallel Fuzzing Fan-Out
 
 Run one campaign per module slice (up to 8 concurrently). Each campaign writes only its own module's corpus, crash directory, and report:
@@ -44,11 +56,17 @@ $env:PYTHONIOENCODING="utf-8"
 ```
 
 `run_eacsl_fuzz.py` supports `--engine {auto,eacsl,sanitizers}` (default `auto` in `campaign` mode):
-- It first invokes `e-acsl-gcc` (or legacy `e-acsl-gcc.sh`) with `-rte-select` and `-e-acsl-functions` scoped to the target slice functions so E-ACSL does not attempt to instrument Frama-C's internal `__fc_libc` helpers, and writes the full compiler transcript to `<out-bin>.compile.log`.
-- If `e-acsl-gcc` still fails on a target C construct and `--engine auto` is active, `campaign` mode automatically falls back to compiling a native Clang LibFuzzer + AddressSanitizer + UndefinedBehaviorSanitizer binary (`-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all`), parses ASan/UBSan runtime failures into the identical `failure` structure and `<file>#<function>::<kind>::<hash10>` fingerprint format, and records `"engine_used": "clang_sanitizers_fallback"` in `workspace/reports/fuzz/<mod>.json`.
-- Note: Phase 3 `/framac-wp` `guardrail` mode always uses E-ACSL (`compile_eacsl_binary`), because the guardrail's purpose is to execute candidate ACSL annotations against the corpus.
+- **Two-stage E-ACSL build.** Stage 1 instruments with `e-acsl-gcc -F <frama-c flags> -E <frontend>`: all preprocessor flags (`-I`, `-D`, `-include`), the `fc_stubs` directory first, `fc_compat_types.h` and `-D__FRAMAC_EACSL__`. Stage 2 compiles the self-contained `<out-bin>.instrumented.c` with `e-acsl-gcc -C -e <codegen flags only>`. Never force-include headers into stage 2 (it redefines `timeval`, `fd_set`, ...), so boundary stub headers do not need E-ACSL-specific branches. The full transcript is in `<out-bin>.compile.log`.
+- **Argv contract.** `e-acsl-gcc` splits flag values on spaces and re-parses standalone short options (a bare `-g` becomes `--gmp`). The script joins `-I dir` into `-Idir`, rewrites `-g` to `-gline-tables-only`, and refuses other standalone single-letter tokens or paths containing spaces (`reason: eacsl_argv_unsafe`).
+- **Instrumented binary only.** The fuzzed binary is `<out-bin>.e-acsl`, and it must contain E-ACSL instrumentation (`reason: eacsl_binary_not_instrumented` otherwise). The guardrail refuses uninstrumented binaries instead of reporting a vacuous `passed_dynamic_oracle`.
+- **Function scoping.** `-rte-select` / `-e-acsl-functions` come from the preprocessed slice sources, so functions disabled by `#if` are excluded. Functions Frama-C still reports as unknown are dropped once and listed in `rte_select_dropped`.
+- **Variadic fallbacks.** Undefined `<fn>_fallback_<N>` symbols are defined in a generated, link-only `<out-bin>_fallbacks/eacsl_fallbacks.o`, which forwards to the real libc function when possible. `variadic_fallbacks` lists each one; `mode: enosys` entries always fail with `ENOSYS`, which is a coverage caveat for the code behind them. `--no-variadic-translation` asks Frama-C not to emit them at all.
+- **Sanitizer fallback.** With `--engine auto`, an E-ACSL failure (or a failed selftest) falls back to Clang LibFuzzer + ASan + UBSan (`-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all`). The report then has `engine_used: sanitizers` and `engine_fallback_reason`, and ledger evidence notes that no E-ACSL contract checks or intra-object bounds checks ran.
+- **Crash attribution.** When an E-ACSL crash has no usable location (for example the RTL crashed in `unsafe_initialize`), the input is replayed on a sanitizer build of the same slice. The artifact then has `attribution` and `failure_source: sanitizer_replay`. Disable with `--no-attribution-replay`.
+- Phase 3 `/framac-wp` `guardrail` mode always uses E-ACSL (`compile_eacsl_binary`), because its purpose is to execute candidate ACSL annotations against the corpus.
+- `compile.undeclared_functions` lists functions called without a prototype. Add them to the matching `templates/fc_stubs/` header (see `templates/fc_stubs/README.md`).
 
-The fuzzer, and every crash replay, runs inside `sandbox_exec.py` (read-only filesystem except the corpus/crash/scratch directories, no network, rlimits, timeout). If the report says `sandbox_unavailable`, stop and fix the container rather than running unsandboxed; `-AllowDegradedSandbox` is an explicit operator decision that is recorded.
+The fuzzer, and every crash replay, runs inside the hardened container through `sandbox_exec.py` (rlimits, env allowlist, timeout with process-group kill). There is no filesystem isolation inside the container. If the report says `sandbox_unavailable`, the command was not run inside the container (non-POSIX host); stop and rerun it through the wrapper rather than running it unsandboxed.
 
 *(Never pass `-fsanitize=address` alongside E-ACSL's memory tracking runtime in the same binary, as both intercept `malloc`/`free` and map conflicting shadow memory.)*
 

@@ -32,6 +32,41 @@ Common issues encountered when running Frama-C (`RTE`, `Eva`, `WP`, `E-ACSL`) an
 - **Cause:** `frama-c` runs with `-frama-c-stdlib` (`-nostdinc`), searching only `__fc_libc` and explicit `-I` flags so host `/usr/include` does not shadow `__fc_libc`.
 - **Fix:** `run_eva_slice.py`, `run_wp_function.py`, and `GNUmakefile.template` automatically append `-I/opt/framac-pipeline/templates/fc_stubs -include fc_compat_types.h`, providing bodyless ACSL-annotated prototypes for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, and glibc `__int8_t`..`__uint64_t` typedefs while keeping external specifications `Considered valid` (`STATUS_ASSUMED`) in the ledger.
 
+### Symptom: `implicit cast: cannot cast from __e_acsl_mpz_t to size_t` (E-ACSL silently in GMP-only mode)
+- **Cause:** `e-acsl-gcc` splits the values of `-e`/`-E`/`-F`/`-l` on spaces and re-parses the tokens. A standalone `-g` inside `-e` is read as its own `--gmp` option (`-e-acsl-gmp-only`).
+- **Fix:** `run_eacsl_fuzz.py` normalizes every passthrough value: `-g` becomes `-gline-tables-only`, `-I dir` becomes `-Idir`, and other standalone single-letter tokens or paths with spaces are refused (`reason: eacsl_argv_unsafe`). `run_eacsl_fuzz.py selftest` checks that the compile log never contains `-e-acsl-gmp-only`.
+
+### Symptom: Campaign Reports `engine_used: eacsl` but E-ACSL Never Fires, or the Guardrail Always Passes
+- **Cause:** `e-acsl-gcc -O <out>` writes the instrumented executable to `<out>.e-acsl`; `<out>` is a plain build.
+- **Fix:** the script selects `<out>.e-acsl` and refuses any binary without E-ACSL instrumentation (`reason: eacsl_binary_not_instrumented`). The guardrail refuses uninstrumented binaries (`guardrail_error`) instead of reporting `passed_dynamic_oracle`.
+
+### Symptom: `redefinition of 'timeval'` / `'timespec'` or Conflicting `fd_set` Types When Compiling the Instrumented File
+- **Cause:** the instrumented file printed by Frama-C is self-contained (it has no `#include` lines and already contains every typedef). Force-including headers that pull in host system headers into its compile duplicates those typedefs.
+- **Fix:** `run_eacsl_fuzz.py` builds in two stages. All preprocessor flags (`-I`, `-D`, `-include`) go to instrumentation (`-E`) only; the instrumented file is compiled with codegen flags only (`e-acsl-gcc -C -e ...`). `fc_compat_types.h` is empty whenever `__FRAMAC__` is undefined. Boundary stub headers need no E-ACSL-specific branches.
+
+### Symptom: `syntax error` on `__int32_t`, `u_short` (E-ACSL Host-Header Mode)
+- **Cause:** E-ACSL runs Frama-C with `-no-frama-c-stdlib`, so the glibc-internal and BSD aliases must come from host headers.
+- **Fix:** in host-header mode `fc_compat_types.h` includes glibc `<sys/types.h>`, so the aliases are identical to glibc's by construction. Do not hand-write `__intN_t` typedefs: `__int64_t` is `long` on LP64 and `long long` on ILP32.
+
+### Symptom: `undefined reference to 'open_fallback_N'` at Link Time
+- **Cause:** in host-header mode, the Variadic translation emits `<fn>_fallback_<N>` for variadic calls without a libc specification (`open`, `fcntl`, `ioctl`, ...), and the E-ACSL RTL does not define them.
+- **Fix:** automatic. The script generates `<out-bin>_fallbacks/eacsl_fallbacks.c`, which forwards to the real function (or fails with `ENOSYS` when the signature or header is unknown, recorded as `mode: enosys`), compiles it to a link-only object, and retries the link once. Never add these definitions to the instrumented sources: each definition shifts the fallback numbering. `--no-variadic-translation` passes `-variadic-no-translation` to Frama-C instead.
+
+### Symptom: `call to undeclared function 'X'` or `invalid application of 'alignof' to an incomplete type`
+- **Cause:** a `templates/fc_stubs/` header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
+- **Fix:** add the prototype and complete the handle with a single dummy member (see `templates/fc_stubs/README.md`). Tool JSONs list missing prototypes under `undeclared_functions`. For Eva/WP this is a soundness issue: Frama-C invents `int X()`.
+
+### Symptom: Instrumentation Aborts With `no function 'X'`
+- **Cause:** `-rte-select` / `-e-acsl-functions` named a function that is absent from the parsed AST (disabled by `#if`, or in a file that failed to parse).
+- **Fix:** function discovery runs on preprocessed sources. Names Frama-C still rejects are dropped once and listed in `rte_select_dropped`.
+
+### Symptom: E-ACSL Crash With `failure: null` or a Location Inside the E-ACSL Runtime (`unsafe_initialize`)
+- **Cause:** heap corruption made the E-ACSL RTL crash before it printed the failing assertion.
+- **Fix:** automatic. The crash input is replayed on a sanitizer build of the same slice; `attribution` and `failure_source: sanitizer_replay` give the precise file:line. The crash is still classified from the E-ACSL run.
+
+### Symptom: Why Not `-L` / Frama-C's libc for E-ACSL?
+- E-ACSL aborts on Frama-C libc specifications (`unbounded ranges are not part of E-ACSL`, `share/libc/string.h`). Host-header mode is the only supported E-ACSL mode.
+
 ### Symptom: Linker or Shadow Memory Conflict When Combining E-ACSL with AddressSanitizer (`-fsanitize=address`)
 - **Cause:** E-ACSL embeds its own shadow-memory runtime (`rtl`) to track byte-level pointer validity (`\valid`), initialization (`\initialized`), and sub-object bounds. AddressSanitizer (`ASan`) also maps shadow memory and intercepts `malloc`/`free`. Running both in the same binary causes immediate `mmap` collisions or false aborts.
 - **Fix:**
@@ -40,6 +75,14 @@ Common issues encountered when running Frama-C (`RTE`, `Eva`, `WP`, `E-ACSL`) an
 ### Symptom: `e-acsl-gcc.sh` Rejects Complex Unbounded Quantifiers (`\forall integer k; ...`)
 - **Cause:** E-ACSL can only compile **bounded** quantifiers where the lower and upper bounds of the quantified integer variable `k` are syntactic integer expressions (e.g., `\forall integer k; 0 <= k < len ==> ...`).
 - **Fix:** Always write explicit integer lower and upper bounds in `\forall` and `\exists` predicates (`0 <= k < n`), and use the `integer` type (or `size_t` / `int`) explicitly.
+
+### Symptom: Wrapper Exits With Code 2: `-NoInnerSandbox` / `--no-inner-sandbox` (or `-AllowDegradedSandbox` / `--allow-degraded-sandbox`) "is no longer supported"
+- **Cause:** The bubblewrap layer was removed. The hardened container, with Docker's default seccomp and AppArmor profiles, is the only isolation boundary, and target-controlled binaries run under `scripts/sandbox_exec.py` (rlimits, env allowlist, timeout). The legacy flags fail hard rather than being silently ignored.
+- **Fix:** Remove the flag from the command line or script. No replacement flag is needed.
+
+### Symptom: LeakSanitizer Reports `LeakSanitizer has encountered a fatal error` or `LeakSanitizer does not work under ptrace`
+- **Cause:** LeakSanitizer (enabled by default with `-fsanitize=address` in the native LibFuzzer fallback) uses `ptrace` to stop threads while scanning. Docker's default seccomp profile allows `ptrace` on kernels >= 4.8; older hosts block it.
+- **Fix:** Do not relax seccomp. Set `ASAN_OPTIONS=detect_leaks=0` (or pass LibFuzzer `-detect_leaks=0`) for the campaign and record in the run notes / agent result that leak detection was disabled, so missing leak coverage is visible.
 
 ---
 

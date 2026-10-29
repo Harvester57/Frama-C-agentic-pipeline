@@ -48,7 +48,7 @@ cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
 
 ### Make / Autotools Projects (Inside `framac-pipeline` Container)
 
-The target is mounted read-only, so the build runs in a disposable copy inside the run directory and inside the inner sandbox:
+The target is mounted read-only, so the build runs in a disposable copy inside the run directory, through `sandbox_exec.py` (rlimits, env allowlist, timeout):
 
 ```powershell
 & "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `

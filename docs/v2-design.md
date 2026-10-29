@@ -44,10 +44,12 @@ Runs live **outside the target** by default:
 
 ## 3. Execution Safety
 
-Two layers:
+Two layers, of which only the first is an isolation boundary:
 
-1. **Outer container** (wrappers): `--network none`, `--cap-drop ALL`, `--security-opt no-new-privileges`, CPU/memory/PID limits, target read-only, only the run directory writable, environment limited to an explicit allowlist. `seccomp=unconfined` is kept only because bubblewrap needs user namespaces for the inner sandbox; `-NoInnerSandbox` drops it. `SYS_PTRACE` is removed.
-2. **Inner sandbox** (`scripts/sandbox_exec.py`): every target-controlled binary (LibFuzzer campaigns, guardrail replays, reproducers, later target builds) runs under bubblewrap with the whole filesystem read-only except its assigned scratch/output paths, no network, a cleared environment plus allowlist, and rlimits on CPU, address space, file size, open files, and processes, plus a wall-clock timeout. If bubblewrap cannot be used, execution fails closed unless the operator explicitly sets `FRAMAC_SANDBOX_DEGRADED=1`; degraded execution is recorded in tool outputs.
+1. **Outer container** (wrappers): the sole isolation boundary. `--network none`, `--cap-drop ALL`, `--security-opt no-new-privileges`, Docker's default seccomp and AppArmor profiles (neither is relaxed), CPU/memory/PID limits, target read-only, only the run directory writable, environment limited to an explicit allowlist. `SYS_PTRACE` is removed. The legacy `-NoInnerSandbox` / `-AllowDegradedSandbox` (`--no-inner-sandbox` / `--allow-degraded-sandbox`) flags fail hard with exit code 2.
+2. **Inner resource layer** (`scripts/sandbox_exec.py`): every target-controlled binary (LibFuzzer campaigns, guardrail replays, reproducers, later target builds) runs with a cleared environment plus allowlist, rlimits on CPU, file size, open files, and processes (optional address space; core dumps disabled), and a wall-clock timeout that SIGKILLs the whole process group. Runs record `sandbox: "rlimits"`. This layer provides no filesystem or namespace isolation inside the container.
+
+**Residual risk.** Target-controlled binaries can write anywhere in `/framac-run` that the container user can write, including `coverage-ledger.json`, `candidates.json`, and `findings.json`. Authoritative state is schema-validated and fingerprinted on phase transitions, so tampering surfaces as validation failure or fingerprint mismatch rather than silent corruption, but it is not prevented. This is acceptable for auditing non-adversarial production code; deliberately hostile targets are out of scope.
 
 ---
 
@@ -172,7 +174,7 @@ Roles: recon, header architect, prover, breaker, crash verifier, proof auditor, 
 5. Treating a WP stall as a finding, or hiding it as covered.
 6. Agents editing shared headers, the shared corpus, or ledgers directly.
 7. Executable C changes in the ACSL work tree.
-8. Running target-controlled binaries outside the inner sandbox.
+8. Running target-controlled binaries outside `sandbox_exec.py` (rlimits, env allowlist, timeout) or outside the hardened container.
 9. Writing report prose that disagrees with `findings.json`, or writing it before verification.
 10. Claiming complete coverage from a profile, tier, or budget cut.
 
@@ -182,7 +184,7 @@ Roles: recon, header architect, prover, breaker, crash verifier, proof auditor, 
 
 | Milestone | Content |
 |---|---|
-| **M1 Foundation** | Run directory outside the target; hardened wrappers + bubblewrap sandbox; findings, candidates, ledger, metadata, and agent-result schemas; stdlib-only validators with pytest; fingerprints; status-classification fixes (fuzz outcomes, guardrail RTE vs contract, Eva dead/assumed buckets, CSV column normalization); ledger seeding and phase ingestion; report and SARIF derived from findings + ledger. |
+| **M1 Foundation** | Run directory outside the target; hardened wrappers + `sandbox_exec.py` resource layer (rlimits, env allowlist, timeout); findings, candidates, ledger, metadata, and agent-result schemas; stdlib-only validators with pytest; fingerprints; status-classification fixes (fuzz outcomes, guardrail RTE vs contract, Eva dead/assumed buckets, CSV column normalization); ledger seeding and phase ingestion; report and SARIF derived from findings + ledger. |
 | **M2 Verification & Isolation** | Crash verifier brief (`crash_verifier_brief.md`) + gate (`ledger.py ingest-verifier` & `ingest-agent-hypothesis`); per-agent scratch overlays (`workspace_overlay.py init-agent`) and structural function-span patch merge + re-verification (`merge-agent`); safe artifact/seed/crash promotion (`promote_artifact.py`); lexical pure-ACSL annotation-only check (`acsl_ast.py`); harness legitimacy (exact-size `malloc(size)` + `size == 0` sentinel buffers and `harness_<mod>.json` sidecars). |
 | M3 | Deterministic proof audit, `-wp-smoke-tests`, entry-function `requires` rule, assumption resolution, LLM auditor for L4-L6. |
 | M4 | Recon agents and `architecture.md`; Frama-C call graph; C/ACSL companion file; coverage critic. |

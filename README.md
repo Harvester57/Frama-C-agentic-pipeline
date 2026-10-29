@@ -26,7 +26,7 @@ All verification tools execute exclusively inside a reproducible **`framac-pipel
    - **Layer 5:** Output Grammar & Sanitization (`ensures` character-class bounds against CRLF/log injection)
    - **Layer 6:** Secret Zeroization & Information Flow / Non-Interference (`buffer_is_zeroed` + `-eva-domains taint`)
 7. **Evidence Discipline (v2, see [`docs/v2-design.md`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/v2-design.md)):**
-   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (function x obligation class) records what is proven unconditionally, what is proven under open assumptions, and what is blocked, deferred, or out of scope. All shared artifacts are schema-validated, the target is mounted read-only, and target-controlled binaries run in a bubblewrap sandbox.
+   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (function x obligation class) records what is proven unconditionally, what is proven under open assumptions, and what is blocked, deferred, or out of scope. All shared artifacts are schema-validated and the target is mounted read-only. The hardened container (no network, all capabilities dropped, no-new-privileges, Docker's default seccomp and AppArmor profiles, resource limits) is the isolation boundary; inside it, target-controlled binaries run through `sandbox_exec.py`, which applies rlimits (CPU, file size, open files, processes), a cleared environment with an explicit allowlist, and a wall-clock timeout with process-group kill. There is no filesystem isolation inside the container (see the residual-risk note in `docs/v2-design.md`, Section 3).
 
 ---
 
@@ -50,7 +50,7 @@ frama-c/
 │   ├── run_eva_slice.py                      # Runs Frama-C Eva + RTE per module slice & exports SARIF
 │   ├── run_wp_function.py                    # Runs Frama-C WP + RTE per function (-wp-fct) & buckets unproven goals
 │   ├── contract_negotiator.py                # Manages cross-wave Caller-Callee contract strengthening requests
-│   ├── sandbox_exec.py                       # bubblewrap inner sandbox for target-controlled binaries
+│   ├── sandbox_exec.py                       # rlimits + env allowlist + timeout for target-controlled binaries
 │   ├── fingerprint.py                        # Stable <file>#<function>::<kind>::<hash> finding fingerprints
 │   ├── ledger.py                             # Coverage ledger seeding, phase/hypothesis/verifier ingestion
 │   ├── run_metadata.py                       # run-metadata.json (source ref, profile, toolchain, run status)
@@ -102,7 +102,7 @@ docker build "-t" "framac-pipeline:latest" "C:\Users\Florian\OneDrive\Documents\
 
 ### 2. Run a Command Inside the Hardened Container
 
-Use [framac-docker.ps1](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/wrappers/framac-docker.ps1). The target is mounted read-only at `/target`; the run directory (default `~/framac-pipeline/<repo>/run-<N>/`, created by `-NewRun`) is the read-write working directory `/framac-run`. The container has no network, drops all capabilities, and runs with CPU/memory/PID limits.
+Use [framac-docker.ps1](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/wrappers/framac-docker.ps1). The target is mounted read-only at `/target`; the run directory (default `~/framac-pipeline/<repo>/run-<N>/`, created by `-NewRun`) is the read-write working directory `/framac-run`. The container has no network, drops all capabilities, keeps Docker's default seccomp and AppArmor profiles, and runs with CPU/memory/PID limits. `sandbox_exec.py probe` prints `{"sandbox": "rlimits"}` inside the container. The legacy `-NoInnerSandbox` / `-AllowDegradedSandbox` switches (`--no-inner-sandbox` / `--allow-degraded-sandbox` in the POSIX wrapper) were removed together with bubblewrap and now fail with exit code 2.
 
 ```powershell
 & "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
