@@ -13,15 +13,17 @@ WP_TIMEOUT  ?= 15
 # Sources and Preprocessing Flags (populated by /framac-slice)
 SOURCES     ?=
 CPPFLAGS    ?= -I. -I/opt/framac-pipeline/templates/acsl
+FC_STUBS    ?= /opt/framac-pipeline/templates/fc_stubs
 
 # Kernel Flags
 FCFLAGS     += -machdep $(MACHDEP) \
                -warn-signed-overflow \
                -warn-signed-downcast \
-               -warn-invalid-shift \
+               -warn-left-shift-negative \
+               -warn-right-shift-negative \
                -warn-pointer-downcast \
                -kernel-msg-key pp \
-               -cpp-extra-args="$(CPPFLAGS)"
+               -cpp-extra-args="$(CPPFLAGS) -I$(FC_STUBS) -include $(FC_STUBS)/fc_compat_types.h"
 
 # Eva Flags
 EVAFLAGS    += -eva-domains cvalue,equality,symbolic-locations,octagon,gauges \
@@ -76,7 +78,7 @@ $(TARGET).eacsl: $(SOURCES)
 			--compiler=clang \
 			--machdep=$(MACHDEP) \
 			--rte=all \
-			--cflag="-fsanitize=fuzzer -g -O1 $(CPPFLAGS)" \
+			--cflag="-fsanitize=fuzzer -g -O1 -D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
 			--ldflag="-fsanitize=fuzzer" \
 			-o $@/fuzz_runner \
 			-O $@/instrumented.c \
@@ -85,8 +87,8 @@ $(TARGET).eacsl: $(SOURCES)
 		$(EACSL_GCC) \
 			-G clang \
 			-F "-rte -machdep $(MACHDEP)" \
-			-E "$(CPPFLAGS)" \
-			-e "-fsanitize=fuzzer -g -O1 -fcommon $(CPPFLAGS)" \
+			-E "-D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
+			-e "-fsanitize=fuzzer -g -O1 -fcommon -D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
 			-l "-fsanitize=fuzzer" \
 			-o $@/instrumented.c \
 			-O $@/fuzz_runner \

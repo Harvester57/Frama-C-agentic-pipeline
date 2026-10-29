@@ -36,6 +36,7 @@ from framac_common import (  # noqa: E402
     STATUS_UNKNOWN,
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
+    augment_framac_cppflags,
     read_report_csv,
 )
 
@@ -170,12 +171,13 @@ def check_acsl_syntax(
     machdep: str = "gcc_x86_64",
     cppflags: str = "-I.",
 ) -> dict:
+    effective_cppflags = augment_framac_cppflags(cppflags)
     cmd = [
         "frama-c",
         "-pp-annot",
         "-no-unicode",
         "-machdep", machdep,
-        f"-cpp-extra-args={cppflags}",
+        f"-cpp-extra-args={effective_cppflags}",
         "-kernel-warn-key", "annot-error=abort",
         str(c_file),
     ]
@@ -242,6 +244,7 @@ def run_wp_on_function(
     sarif_path = out_dir / f"wp_{fn_name}.sarif"
     sav_path = out_dir / f"wp_{fn_name}.sav"
 
+    effective_cppflags = augment_framac_cppflags(cppflags)
     sources = [str(c_file)] + (extra_sources or [])
     cmd = [
         "frama-c",
@@ -250,7 +253,8 @@ def run_wp_on_function(
         "-machdep", machdep,
         "-warn-signed-overflow",
         "-warn-signed-downcast",
-        "-warn-invalid-shift",
+        "-warn-left-shift-negative",
+        "-warn-right-shift-negative",
         "-warn-pointer-downcast",
     ]
     if warn_invalid_pointer:
@@ -259,7 +263,7 @@ def run_wp_on_function(
         cmd.extend(["-warn-unsigned-overflow", "-warn-unsigned-downcast"])
 
     cmd.extend([
-        f"-cpp-extra-args={cppflags}",
+        f"-cpp-extra-args={effective_cppflags}",
         *sources,
         "-wp",
         "-wp-rte",

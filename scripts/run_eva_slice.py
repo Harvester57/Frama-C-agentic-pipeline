@@ -42,6 +42,7 @@ from framac_common import (  # noqa: E402
     STATUS_UNKNOWN,
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
+    augment_framac_cppflags,
     read_report_csv,
 )
 
@@ -70,7 +71,8 @@ def run_eva_on_slice(
         "-machdep", machdep,
         "-warn-signed-overflow",
         "-warn-signed-downcast",
-        "-warn-invalid-shift",
+        "-warn-left-shift-negative",
+        "-warn-right-shift-negative",
         "-warn-pointer-downcast",
     ]
     reduced_checks: list[str] = []
@@ -83,8 +85,9 @@ def run_eva_on_slice(
     else:
         reduced_checks.extend(["-no-warn-unsigned-overflow", "-no-warn-unsigned-downcast"])
 
+    effective_cppflags = augment_framac_cppflags(cppflags)
     cmd.extend([
-        f"-cpp-extra-args={cppflags}",
+        f"-cpp-extra-args={effective_cppflags}",
         *sources,
         "-main", main_fn,
         "-rte",

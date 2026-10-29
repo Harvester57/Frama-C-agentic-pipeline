@@ -15,7 +15,7 @@
 #define MAX_INPUT_SIZE {{MAX_INPUT_SIZE}}
 #endif
 
-#ifdef __FRAMAC__
+#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)
 #include "__fc_builtin.h"
 
 /*@
@@ -30,16 +30,20 @@ int eva_main(void) {
     if (input_len > 0) {
         Frama_C_make_unknown((char *)input_buf, input_len);
     }
+    uint8_t *fuzz_buf = input_buf;
+    size_t fuzz_len = input_len;
+    (void)fuzz_buf;
+    (void)fuzz_len;
 
     /* Invoke target module entry point */
     {{TARGET_INVOCATION_EVA}}
 
     return 0;
 }
-#endif /* __FRAMAC__ */
+#endif /* defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__) */
 
 /*
- * LibFuzzer Entry Point (Compiled via e-acsl-gcc.sh --rte=all -fsanitize=fuzzer)
+ * LibFuzzer Entry Point (Compiled via e-acsl-gcc or clang -fsanitize=fuzzer)
  */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (data == NULL || size > MAX_INPUT_SIZE) {
@@ -47,9 +51,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
 
     /*
-     * Allocate an exact-sized heap buffer so E-ACSL shadow memory tracks
+     * Allocate an exact-sized heap buffer so E-ACSL / ASan shadow memory tracks
      * exact validity [0 .. size - 1]. For size == 0, pass a non-NULL pointer
-     * one byte past a 1-byte allocation so any dereference faults in E-ACSL.
+     * one byte past a 1-byte allocation so any dereference faults immediately.
      */
     uint8_t *alloc_ptr = (uint8_t *)malloc(size > 0 ? size : 1U);
     if (alloc_ptr == NULL) {
@@ -59,6 +63,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size > 0) {
         memcpy(bounded_buf, data, size);
     }
+    uint8_t *fuzz_buf = bounded_buf;
+    size_t fuzz_len = size;
+    (void)fuzz_buf;
+    (void)fuzz_len;
 
     /* Invoke target module entry point */
     {{TARGET_INVOCATION_FUZZ}}

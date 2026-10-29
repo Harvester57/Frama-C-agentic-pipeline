@@ -219,6 +219,21 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         stub_tokens = tokenize_c_acsl(stubs_text)
         assert find_unsound_acsl_keywords(stub_tokens, path="external_stubs.h") == []
 
+        from build_callgraph_dag import extract_functions_from_code
+        from framac_common import augment_framac_cppflags
+
+        fc_stubs_dir = repo_root / "templates" / "fc_stubs"
+        for stub_path in sorted(fc_stubs_dir.rglob("*.h")):
+            st_text = stub_path.read_text(encoding="utf-8")
+            st_tokens = tokenize_c_acsl(st_text, path=str(stub_path))
+            assert find_unsound_acsl_keywords(st_tokens, path=str(stub_path)) == []
+            # Ensure fc_stubs headers contain only declarations/types, never C function bodies
+            assert extract_functions_from_code(st_text, path=str(stub_path)) == []
+
+        aug = augment_framac_cppflags("-Iworkspace/work/include")
+        assert "templates/fc_stubs" in aug
+        assert "-include " in aug and "fc_compat_types.h" in aug
+
 
 class TestSpanLocationAndSplicing:
     """Tests for function span extraction and same-wave parallel prover splicing."""

@@ -181,3 +181,35 @@ def to_run_relative(path: Path, run_dir: Path) -> str:
         return p.resolve().relative_to(Path(run_dir).resolve()).as_posix()
     except ValueError:
         return Path(path).as_posix()
+
+
+def resolve_fc_stubs_dir() -> Path | None:
+    """Locate the pipeline's templates/fc_stubs directory (container or local checkout)."""
+    container_dir = Path("/opt/framac-pipeline/templates/fc_stubs")
+    if container_dir.is_dir():
+        return container_dir
+    local_dir = Path(__file__).resolve().parent.parent / "templates" / "fc_stubs"
+    if local_dir.is_dir():
+        return local_dir
+    return None
+
+
+def augment_framac_cppflags(cppflags: str) -> str:
+    """
+    Append `-I<fc_stubs>` and `-include <fc_compat_types.h>` for Frama-C `-nostdinc` runs
+    (Eva and WP) so third-party headers (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`)
+    and glibc internal integer typedefs (`__int32_t`, etc.) resolve cleanly without
+    shadowing `__fc_libc`.
+    """
+    base = (cppflags or "-I.").strip()
+    fc_stubs = resolve_fc_stubs_dir()
+    if fc_stubs is None:
+        return base
+    stubs_posix = fc_stubs.as_posix()
+    compat_hdr = (fc_stubs / "fc_compat_types.h").as_posix()
+    parts = [base] if base else []
+    if f"-I{stubs_posix}" not in base:
+        parts.append(f"-I{stubs_posix}")
+    if "fc_compat_types.h" not in base and (fc_stubs / "fc_compat_types.h").is_file():
+        parts.append(f"-include {compat_hdr}")
+    return " ".join(parts)
