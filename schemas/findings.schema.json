@@ -1,0 +1,198 @@
+{
+  "$comment": "Contract for findings.json: one verdict record per fingerprint. Checked by scripts/validate_artifacts.py findings (schema + semantic checks).",
+  "type": "array",
+  "maxItems": 5000,
+  "items": {
+    "oneOf": [
+      {"$ref": "#/definitions/confirmed"},
+      {"$ref": "#/definitions/needs_validation"},
+      {"$ref": "#/definitions/rejected"}
+    ]
+  },
+  "definitions": {
+    "text": {"type": "string", "minLength": 1, "visibleContent": true},
+    "relpath": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\][^\\\\]*$"},
+    "fingerprint": {"type": "string", "minLength": 5, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$"},
+    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret)$"},
+    "location": {
+      "type": "object",
+      "properties": {
+        "file": {"$ref": "#/definitions/relpath"},
+        "line": {"type": "integer", "minimum": 1},
+        "function": {"$ref": "#/definitions/text"}
+      },
+      "required": ["file", "line", "function"],
+      "additionalProperties": false
+    },
+    "property": {
+      "type": "object",
+      "properties": {
+        "kind": {"$ref": "#/definitions/text"},
+        "predicate": {"$ref": "#/definitions/text"}
+      },
+      "required": ["kind", "predicate"],
+      "additionalProperties": false
+    },
+    "trace": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {"type": "string", "enum": ["entrypoint", "propagation", "sink"]},
+          "file": {"$ref": "#/definitions/relpath"},
+          "line": {"type": "integer", "minimum": 1},
+          "function": {"$ref": "#/definitions/text"},
+          "description": {"$ref": "#/definitions/text"}
+        },
+        "required": ["kind", "file", "line", "function", "description"],
+        "additionalProperties": false
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "properties": {
+          "phase": {"type": "string", "enum": ["fuzz", "eva", "wp", "breaker", "verifier", "audit"]},
+          "tool_output": {"$ref": "#/definitions/relpath"},
+          "description": {"$ref": "#/definitions/text"}
+        },
+        "required": ["phase", "tool_output", "description"],
+        "additionalProperties": false
+      }
+    },
+    "linked_units": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/definitions/coverage_id"}
+    },
+    "verifier": {
+      "type": "object",
+      "properties": {
+        "agent_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
+        "method": {"type": "string", "enum": ["reproduced", "source_review", "reproduced_and_source_review"]},
+        "notes": {"$ref": "#/definitions/text"}
+      },
+      "required": ["agent_id", "method", "notes"],
+      "additionalProperties": false
+    },
+    "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api"]},
+    "confirmed": {
+      "type": "object",
+      "description": "A reproduced E-ACSL failure in target code through a harness that respected the entry function's contract.",
+      "properties": {
+        "verdict": {"const": "confirmed"},
+        "fingerprint": {"$ref": "#/definitions/fingerprint"},
+        "title": {"$ref": "#/definitions/text"},
+        "description": {"$ref": "#/definitions/text"},
+        "location": {"$ref": "#/definitions/location"},
+        "property": {"$ref": "#/definitions/property"},
+        "root_cause": {"$ref": "#/definitions/text"},
+        "intended_behavior": {"$ref": "#/definitions/text"},
+        "trace": {"$ref": "#/definitions/trace"},
+        "evidence": {"$ref": "#/definitions/evidence"},
+        "reachability": {"$ref": "#/definitions/reachability"},
+        "harness": {
+          "type": "object",
+          "properties": {
+            "file": {"$ref": "#/definitions/relpath"},
+            "entry_function": {"$ref": "#/definitions/text"},
+            "contract_respected": {"const": true},
+            "notes": {"$ref": "#/definitions/text"}
+          },
+          "required": ["file", "entry_function", "contract_respected", "notes"],
+          "additionalProperties": false
+        },
+        "reproducers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "properties": {
+              "input": {"$ref": "#/definitions/relpath"},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "size_bytes": {"type": "integer", "minimum": 0},
+              "command": {"$ref": "#/definitions/text"},
+              "observed_result": {"$ref": "#/definitions/text"}
+            },
+            "required": ["input", "sha256", "size_bytes", "command", "observed_result"],
+            "additionalProperties": false
+          }
+        },
+        "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+        "severity_rationale": {"$ref": "#/definitions/text"},
+        "remediation": {
+          "type": "object",
+          "properties": {
+            "summary": {"$ref": "#/definitions/text"},
+            "invariant": {"$ref": "#/definitions/text"},
+            "fix_patch": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]}
+          },
+          "required": ["summary", "invariant", "fix_patch"],
+          "additionalProperties": false
+        },
+        "linked_units": {"$ref": "#/definitions/linked_units"},
+        "verifier": {"$ref": "#/definitions/verifier"}
+      },
+      "required": ["verdict", "fingerprint", "title", "description", "location", "property", "root_cause", "intended_behavior", "trace", "evidence", "reachability", "harness", "reproducers", "severity", "severity_rationale", "remediation", "linked_units", "verifier"],
+      "additionalProperties": false
+    },
+    "needs_validation": {
+      "type": "object",
+      "description": "A specific source-grounded fault hypothesis that could not be reproduced. No severity.",
+      "properties": {
+        "verdict": {"const": "needs_validation"},
+        "fingerprint": {"$ref": "#/definitions/fingerprint"},
+        "title": {"$ref": "#/definitions/text"},
+        "description": {"$ref": "#/definitions/text"},
+        "location": {"$ref": "#/definitions/location"},
+        "property": {"$ref": "#/definitions/property"},
+        "origin": {"type": "string", "enum": ["eva_invalid_no_witness", "fault_hypothesis"]},
+        "claimed_root_cause": {"$ref": "#/definitions/text"},
+        "trace": {"$ref": "#/definitions/trace"},
+        "evidence": {"$ref": "#/definitions/evidence"},
+        "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api", "unknown"]},
+        "blockers": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/definitions/text"}},
+        "validation_plan": {
+          "type": "object",
+          "properties": {
+            "local": {"$ref": "#/definitions/text"},
+            "owner": {"$ref": "#/definitions/text"}
+          },
+          "anyOf": [{"required": ["local"]}, {"required": ["owner"]}],
+          "additionalProperties": false
+        },
+        "linked_units": {"$ref": "#/definitions/linked_units"},
+        "verifier": {"$ref": "#/definitions/verifier"}
+      },
+      "required": ["verdict", "fingerprint", "title", "description", "location", "property", "origin", "claimed_root_cause", "trace", "evidence", "reachability", "blockers", "validation_plan", "linked_units", "verifier"],
+      "additionalProperties": false
+    },
+    "rejected": {
+      "type": "object",
+      "description": "A candidate disproved during verification, retained to suppress the identical claim in later runs.",
+      "properties": {
+        "verdict": {"const": "rejected"},
+        "fingerprint": {"$ref": "#/definitions/fingerprint"},
+        "title": {"$ref": "#/definitions/text"},
+        "description": {"$ref": "#/definitions/text"},
+        "location": {"$ref": "#/definitions/location"},
+        "property": {"$ref": "#/definitions/property"},
+        "claimed_root_cause": {"$ref": "#/definitions/text"},
+        "evidence": {"$ref": "#/definitions/evidence"},
+        "rejection_class": {"type": "string", "enum": ["harness_induced", "dead_code", "toolchain_artifact", "contract_overconstraint", "disproved_by_source", "duplicate", "other"]},
+        "reason": {"$ref": "#/definitions/text"},
+        "linked_units": {"$ref": "#/definitions/linked_units"},
+        "verifier": {"$ref": "#/definitions/verifier"}
+      },
+      "required": ["verdict", "fingerprint", "title", "description", "location", "property", "claimed_root_cause", "evidence", "rejection_class", "reason", "linked_units", "verifier"],
+      "additionalProperties": false
+    }
+  }
+}

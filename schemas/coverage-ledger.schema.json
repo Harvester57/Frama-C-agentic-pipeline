@@ -1,0 +1,57 @@
+{
+  "$comment": "Contract for coverage-ledger.json: one unit per function x obligation class. The state table is enforced by scripts/validate_artifacts.py ledger.",
+  "type": "array",
+  "maxItems": 200000,
+  "items": {"$ref": "#/definitions/unit"},
+  "definitions": {
+    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret)$"},
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "phase": {"type": "string", "enum": ["fuzz", "eva", "wp", "breaker", "verifier", "audit", "carry_forward"]},
+        "producer": {"type": "string", "minLength": 1},
+        "result": {"type": "string", "minLength": 1},
+        "discharging": {"type": "boolean"},
+        "tool_output": {"type": ["string", "null"]},
+        "summary": {"type": "string", "minLength": 1, "visibleContent": true},
+        "details": {"type": "object"}
+      },
+      "required": ["phase", "producer", "result", "discharging", "tool_output", "summary"],
+      "additionalProperties": false
+    },
+    "assumption": {
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "enum": ["callee_contract_hypothesis", "caller_requires_unverified", "stub_contract", "boundary_assumption", "valid_under_hyp", "other"]},
+        "description": {"type": "string", "minLength": 1, "visibleContent": true},
+        "related_units": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/coverage_id"}}
+      },
+      "required": ["kind", "description", "related_units"],
+      "additionalProperties": false
+    },
+    "unit": {
+      "type": "object",
+      "properties": {
+        "coverage_id": {"$ref": "#/definitions/coverage_id"},
+        "file": {"type": "string", "minLength": 1},
+        "function": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+        "obligation_class": {"type": "string", "enum": ["rte", "l2_termination", "l3_frame", "l4_auth", "l5_output", "l6_secret"]},
+        "module": {"type": "string", "minLength": 1},
+        "tier": {"type": "string", "minLength": 1},
+        "wave": {"type": ["integer", "null"], "minimum": 0},
+        "callgraph_source": {"type": "string", "enum": ["frama_c", "regex"]},
+        "status": {"type": "string", "enum": ["planned", "in_progress", "blocked", "covered", "candidate", "deferred", "out_of_scope", "not_applicable"]},
+        "agent_id": {"type": ["string", "null"]},
+        "evidence": {"type": "array", "items": {"$ref": "#/definitions/evidence"}},
+        "result_fingerprints": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$"}},
+        "unresolved": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "visibleContent": true}},
+        "assumptions": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/assumption"}},
+        "attempts": {"type": "array", "items": {"type": "object"}},
+        "inference_reason": {"type": "string"},
+        "bookkeeping": {"type": "object"}
+      },
+      "required": ["coverage_id", "file", "function", "obligation_class", "module", "tier", "wave", "callgraph_source", "status", "agent_id", "evidence", "result_fingerprints", "unresolved", "assumptions", "attempts"],
+      "additionalProperties": false
+    }
+  }
+}

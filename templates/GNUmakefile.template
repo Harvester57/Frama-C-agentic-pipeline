@@ -1,0 +1,92 @@
+# Frama-C Modular Verification Makefile Template
+# Supports: .parse, .eva, .wp, .eacsl, and .sarif targets per module slice
+
+FRAMAC      ?= frama-c
+EACSL_GCC   ?= e-acsl-gcc.sh
+MACHDEP     ?= gcc_x86_64
+TARGET      ?= module_slice
+MAIN_FN     ?= eva_main
+WP_PROVERS  ?= alt-ergo,z3,cvc5
+WP_PAR      ?= 8
+WP_TIMEOUT  ?= 15
+
+# Sources and Preprocessing Flags (populated by /framac-slice)
+SOURCES     ?=
+CPPFLAGS    ?= -I. -I/opt/framac-pipeline/templates/acsl
+
+# Kernel Flags
+FCFLAGS     += -machdep $(MACHDEP) \
+               -warn-signed-overflow \
+               -warn-signed-downcast \
+               -warn-invalid-shift \
+               -warn-pointer-downcast \
+               -kernel-msg-key pp \
+               -cpp-extra-args="$(CPPFLAGS)"
+
+# Eva Flags
+EVAFLAGS    += -eva-warn-key builtins:missing-spec=abort \
+               -eva-domains cvalue,equality,symbolic-locations,octagon,gauges \
+               -eva-auto-loop-unroll 32 \
+               -eva-slevel 100 \
+               -eva-partition-history 2 \
+               -eva-report-red-statuses "$(TARGET).eva/red_alarms.csv"
+
+# WP Flags
+WPFLAGS     += -wp \
+               -wp-rte \
+               -wp-model "Typed+ref+int" \
+               -wp-prover $(WP_PROVERS) \
+               -wp-par $(WP_PAR) \
+               -wp-timeout $(WP_TIMEOUT) \
+               -wp-status-all
+
+.PHONY: all clean $(TARGET).wp $(TARGET).eacsl $(TARGET).sarif
+
+all: $(TARGET).eva $(TARGET).sarif
+
+$(TARGET).parse: $(SOURCES)
+	@mkdir -p $@
+	$(FRAMAC) $(FCFLAGS) $(SOURCES) \
+		-save $@/framac.ast \
+		-kernel-log i:$@/parse.log
+
+$(TARGET).eva: $(TARGET).parse
+	@mkdir -p $@
+	$(FRAMAC) -load $</framac.ast \
+		-main $(MAIN_FN) \
+		-eva $(EVAFLAGS) \
+		-then -rte \
+		-then -metrics -metrics-eva-cover \
+		-then -report -report-csv $@/alarms.csv \
+		-save $@/framac.sav \
+		-kernel-log i:$@/eva.log
+
+$(TARGET).wp: $(TARGET).parse
+	@mkdir -p $@
+	$(FRAMAC) -load $</framac.ast \
+		$(WPFLAGS) \
+		-wp-out $@/wp_out \
+		-wp-report-json $@/wp_report.json \
+		-then -report -report-csv $@/wp_alarms.csv \
+		-save $@/framac_wp.sav
+
+$(TARGET).eacsl: $(SOURCES)
+	@mkdir -p $@
+	$(EACSL_GCC) \
+		--compiler=clang \
+		--machdep=$(MACHDEP) \
+		--rte=all \
+		--cflag="-fsanitize=fuzzer -g -O1 $(CPPFLAGS)" \
+		--ldflag="-fsanitize=fuzzer" \
+		-o $@/fuzz_runner \
+		-O $@/instrumented.c \
+		$(SOURCES)
+
+$(TARGET).sarif: $(TARGET).eva
+	$(FRAMAC) -load $</framac.sav \
+		-mdr-gen sarif \
+		-mdr-no-print-libc \
+		-mdr-out $(TARGET).sarif
+
+clean:
+	rm -rf $(TARGET).parse $(TARGET).eva $(TARGET).wp $(TARGET).eacsl $(TARGET).sarif

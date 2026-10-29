@@ -1,0 +1,64 @@
+/*
+ * Layer 4 Security Property Template: Authentication & Access-Control State Machine
+ *
+ * Purpose:
+ * Prove that privileged protocol handlers (e.g., SNMPv3 SetRequest/GetRequest,
+ * authenticated RPC commands, administrative actions) CANNOT be reached unless
+ * cryptographic authentication and authorization checks have both succeeded.
+ *
+ * Pure-ACSL Rule:
+ * Every declaration in this template is inside an ACSL annotation block so it
+ * can be placed directly in target headers/sources without altering the C token stream.
+ *
+ * Works with:
+ * - Frama-C WP (statically proves no control-flow path bypasses authentication)
+ * - Frama-C E-ACSL (compiles ghost state transitions into runtime assertions for fuzzing)
+ */
+
+/*
+ * Step 1: Declare Ghost Security State Variables
+ * Values:
+ *   0 = UNAUTHENTICATED / UNCHECKED
+ *   1 = VERIFIED_OK
+ */
+/*@ ghost int g_sec_auth_verified = 0; */
+/*@ ghost int g_sec_acl_authorized = 0; */
+
+/*
+ * Step 2: Reset Ghost State at Session/Packet Entry
+ * Place this ghost statement at the start of packet or request entry processing
+ * so a previous authenticated packet cannot bleed authentication state into the
+ * next packet:
+ *
+ *   /@ ghost g_sec_auth_verified = 0; g_sec_acl_authorized = 0; @/
+ */
+
+/*
+ * Step 3: Contract Template for Authentication Verification Function
+ * Attach these named clauses to the target codebase's authentication verifier
+ * (e.g., snmpv3_usm_verify_hmac or auth_verify_token):
+ *
+ *   assigns g_sec_auth_verified;
+ *   ensures L4_auth_ok: \result == 0 ==> g_sec_auth_verified == 1;
+ *   ensures L4_auth_fail: \result != 0 ==> g_sec_auth_verified == 0;
+ */
+
+/*
+ * Step 4: Contract Template for Access-Control (VACM / RBAC) Function
+ * Attach these named clauses to the authorization function
+ * (e.g., snmpv3_vacm_check_access):
+ *
+ *   requires L4_auth_before_acl: sec_level >= SEC_LEVEL_AUTH ==> g_sec_auth_verified == 1;
+ *   assigns g_sec_acl_authorized;
+ *   ensures L4_acl_ok: \result == 0 ==> g_sec_acl_authorized == 1;
+ *   ensures L4_acl_fail: \result != 0 ==> g_sec_acl_authorized == 0;
+ */
+
+/*
+ * Step 5: Mandatory Precondition on Privileged Action / PDU Execution
+ * Attach this named precondition to the privileged dispatcher
+ * (e.g., snmpv3_process_pdu or config_apply_mutation):
+ *
+ *   requires L4_priv_auth: (pdu->sec_level >= SEC_LEVEL_AUTH) ==> (g_sec_auth_verified == 1);
+ *   requires L4_priv_acl: g_sec_acl_authorized == 1;
+ */

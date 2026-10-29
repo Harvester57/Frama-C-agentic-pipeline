@@ -1,0 +1,70 @@
+/*
+ * Dual-Use Harness Template for Frama-C (Eva) and Clang LibFuzzer (E-ACSL)
+ * Generated/Customized by /framac-slice for Module: {{MODULE_NAME}}
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Include module header and external boundary stubs */
+#include "{{MODULE_HEADER}}"
+
+#ifndef MAX_INPUT_SIZE
+#define MAX_INPUT_SIZE {{MAX_INPUT_SIZE}}
+#endif
+
+#ifdef __FRAMAC__
+#include "__fc_builtin.h"
+
+/*@
+  requires \nothing;
+  terminates \true;
+  exits \false;
+  assigns \nothing;
+*/
+int eva_main(void) {
+    uint8_t input_buf[MAX_INPUT_SIZE];
+    size_t input_len = Frama_C_unsigned_int_interval(0, MAX_INPUT_SIZE);
+
+    /* Initialize only [0 .. input_len - 1] so reads past input_len trigger Eva alarms */
+    if (input_len > 0) {
+        Frama_C_make_unknown((char *)input_buf, input_len);
+    }
+
+    /* Invoke target module entry point */
+    {{TARGET_INVOCATION_EVA}}
+
+    return 0;
+}
+#endif /* __FRAMAC__ */
+
+/*
+ * LibFuzzer Entry Point (Compiled via e-acsl-gcc.sh --rte=all -fsanitize=fuzzer)
+ */
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (data == NULL || size > MAX_INPUT_SIZE) {
+        return 0;
+    }
+
+    /*
+     * Allocate an exact-sized heap buffer so E-ACSL shadow memory tracks
+     * exact validity [0 .. size - 1]. For size == 0, pass a non-NULL pointer
+     * one byte past a 1-byte allocation so any dereference faults in E-ACSL.
+     */
+    uint8_t *alloc_ptr = (uint8_t *)malloc(size > 0 ? size : 1U);
+    if (alloc_ptr == NULL) {
+        return 0;
+    }
+    uint8_t *bounded_buf = (size > 0) ? alloc_ptr : (alloc_ptr + 1);
+    if (size > 0) {
+        memcpy(bounded_buf, data, size);
+    }
+
+    /* Invoke target module entry point */
+    {{TARGET_INVOCATION_FUZZ}}
+
+    free(alloc_ptr);
+    return 0;
+}

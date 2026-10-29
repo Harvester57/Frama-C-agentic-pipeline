@@ -1,0 +1,130 @@
+from run_eacsl_fuzz import classify_campaign, classify_guardrail, parse_eacsl_failure
+from run_wp_function import (
+    extract_vc_goal_dumps,
+    goal_obligation_class,
+    scan_wp_log_soundness,
+)
+
+NEW_STYLE = """INFO: Seed: 123
+src/snmp/ber.c: In function 'ber_decode_len'
+src/snmp/ber.c:42: Error: Assertion failed:
+	The failing predicate is:
+	mem_access: \\valid_read(buf + off).
+==1== ERROR: libFuzzer: deadly signal
+"""
+
+OLD_STYLE = """Precondition failed at line 17 in function parse_hdr.
+The failing predicate is:
+len <= 64.
+"""
+
+ANNOTATION = """src/x.c: In function 'f'
+src/x.c:9: Error: Loop invariant failed:
+	The failing predicate is:
+	0 <= i <= n - 1.
+"""
+
+
+def test_parse_new_style_rte_failure():
+    f = parse_eacsl_failure(NEW_STYLE)
+    assert f["file"] == "src/snmp/ber.c" and f["line"] == 42
+    assert f["function"] == "ber_decode_len"
+    assert f["kind"] == "assertion" and f["alarm_kind"] == "mem_access" and f["is_rte"]
+    assert f["predicate"] == "mem_access: \\valid_read(buf + off)"
+
+
+def test_parse_old_style_precondition_failure():
+    f = parse_eacsl_failure(OLD_STYLE)
+    assert f["line"] == 17 and f["function"] == "parse_hdr"
+    assert f["kind"] == "precondition" and not f["is_rte"]
+    assert f["predicate"] == "len <= 64"
+
+
+def test_parse_returns_none_without_report():
+    assert parse_eacsl_failure("random libFuzzer output") is None
+
+
+def test_campaign_classification():
+    assert classify_campaign(0, False, []) == "clean"
+    assert classify_campaign(1, False, []) == "fuzzer_error"
+    assert classify_campaign(0, True, []) == "fuzzer_error"
+    assert classify_campaign(1, False, [{"kind": "crash"}]) == "crash_found"
+    assert classify_campaign(1, False, [{"kind": "timeout"}]) == "timeout_found"
+    assert classify_campaign(1, False, [{"kind": "oom"}]) == "oom_found"
+
+
+def test_guardrail_separates_code_faults_from_overconstrained_contracts():
+    assert classify_guardrail(0, False, "")["status"] == "passed_dynamic_oracle"
+    rte = classify_guardrail(1, False, NEW_STYLE)
+    assert rte["status"] == "code_fault" and rte["fingerprint"].startswith("src/snmp/ber.c#ber_decode_len::mem_access::")
+    assert classify_guardrail(1, False, ANNOTATION)["status"] == "rejected_overconstrained"
+    assert classify_guardrail(1, False, "segfault")["status"] == "guardrail_error"
+
+
+def test_wp_goal_to_obligation_class():
+    assert goal_obligation_class({"kind": "postcondition", "annotation": "ensures L5_no_crlf: no_crlf_or_nul(out, \\result)"}) == "l5_output"
+    assert goal_obligation_class({"kind": "postcondition", "annotation": "L6_key_wiped: buffer_is_zeroed(k, 32)"}) == "l6_secret"
+    assert goal_obligation_class({"kind": "loop variant", "annotation": "n - i"}) == "l2_termination"
+    assert goal_obligation_class({"kind": "assigns", "annotation": "assigns out[0..n-1]"}) == "l3_frame"
+    assert goal_obligation_class({"kind": "assertion", "annotation": "rte: mem_access: \\valid(p)"}) == "rte"
+
+
+def test_scan_wp_log_soundness_detects_abort_and_silent_unsoundness():
+    clean_log = """
+[kernel] Parsing src/foo.c (with preprocessing)
+[rte:annot] annotating function foo
+[wp] 4 goals scheduled
+[wp] Proved goals:    4 / 4
+"""
+    clean = scan_wp_log_soundness(clean_log)
+    assert clean["ok"] is True
+    assert clean["tier_a_aborts"] == []
+    assert clean["tier_b_unsound"] == []
+
+    abort_log = """
+[kernel] Parsing src/foo.c (with preprocessing)
+[wp] user error: No 'calls' specification for function pointer call
+"""
+    aborted = scan_wp_log_soundness(abort_log)
+    assert aborted["ok"] is False
+    assert len(aborted["tier_a_aborts"]) == 1
+
+    unsound_log = """
+[wp] warning: Missing assigns clause (assigns 'everything' instead)
+[wp] warning: Ignoring terminates specification for foo
+[wp] warning: Memory model hypotheses for function 'foo':
+[rte:annot] warning: Through function pointer (*cb): cannot generate validity guard
+[wp] Smoke Tests : 0 / 1
+"""
+    unsound = scan_wp_log_soundness(
+        unsound_log,
+        check_memory_model=False,
+        unsigned_reduced=True,
+        warn_invalid_pointer=False,
+    )
+    assert unsound["ok"] is False
+    assert any("Missing assigns clause" in w for w in unsound["tier_b_unsound"])
+    assert any("Ignoring terminates specification" in w for w in unsound["tier_b_unsound"])
+    assert any("Memory model hypotheses" in w for w in unsound["tier_b_unsound"])
+    assert any("Smoke Tests" in w for w in unsound["tier_b_unsound"])
+    assert len(unsound["skipped_rte_guards"]) == 1
+    assert len(unsound["reduced_checks"]) == 2
+
+
+def test_extract_vc_goal_dumps_parses_wp_print_sequents():
+    sample_log = """
+------------------------------------------------------------
+Goal Post-condition 'bound' in 'parse_hdr':
+Assume {
+  Type: is_sint32(n).
+  (* Pre-condition *)
+  Have: 0 <= n.
+}
+Prove: 0 <= result.
+Prover Alt-Ergo 2.5.4 returns Timeout (Qed:2ms) (10s)
+------------------------------------------------------------
+"""
+    dumps = extract_vc_goal_dumps(sample_log)
+    assert len(dumps) == 1
+    assert "Goal Post-condition 'bound' in 'parse_hdr':" in dumps[0]
+    assert "Prove: 0 <= result." in dumps[0]

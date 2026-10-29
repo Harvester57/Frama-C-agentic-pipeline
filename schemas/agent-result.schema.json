@@ -1,0 +1,140 @@
+{
+  "$comment": "Contract for the single JSON object each subagent returns. Malformed or prose-wrapped results are discarded, never repaired. Checked by scripts/validate_artifacts.py agent-result.",
+  "oneOf": [
+    {"$ref": "#/definitions/prover"},
+    {"$ref": "#/definitions/breaker"},
+    {"$ref": "#/definitions/architect"},
+    {"$ref": "#/definitions/crash_verifier"},
+    {"$ref": "#/definitions/critic"}
+  ],
+  "definitions": {
+    "text": {"type": "string", "minLength": 1, "visibleContent": true},
+    "agent_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
+    "relpath": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\][^\\\\]*$"},
+    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret)$"},
+    "evidence_item": {
+      "type": "object",
+      "properties": {
+        "tool_output": {"$ref": "#/definitions/relpath"},
+        "result": {"$ref": "#/definitions/text"}
+      },
+      "required": ["tool_output", "result"],
+      "additionalProperties": false
+    },
+    "fault_hypothesis": {
+      "type": "object",
+      "properties": {
+        "input_condition": {"$ref": "#/definitions/text"},
+        "predicate": {"$ref": "#/definitions/text"},
+        "why_not_reproduced": {"$ref": "#/definitions/text"}
+      },
+      "required": ["input_condition", "predicate", "why_not_reproduced"],
+      "additionalProperties": false
+    },
+    "prover": {
+      "type": "object",
+      "properties": {
+        "role": {"const": "prover"},
+        "agent_id": {"$ref": "#/definitions/agent_id"},
+        "file": {"$ref": "#/definitions/relpath"},
+        "function": {"$ref": "#/definitions/text"},
+        "status": {"type": "string", "enum": ["all_proven", "stalled_after_k_retries", "blocked"]},
+        "patch": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
+        "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/evidence_item"}},
+        "unproven_goals": {"type": "array", "items": {"type": "object"}},
+        "strengthening_requests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "callee": {"$ref": "#/definitions/text"},
+              "header_file": {"$ref": "#/definitions/relpath"},
+              "needed_clause": {"$ref": "#/definitions/text"},
+              "reason": {"$ref": "#/definitions/text"}
+            },
+            "required": ["callee", "header_file", "needed_clause", "reason"],
+            "additionalProperties": false
+          }
+        },
+        "boundary_assumptions": {"type": "array", "items": {"$ref": "#/definitions/text"}},
+        "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]}
+      },
+      "required": ["role", "agent_id", "file", "function", "status", "patch", "evidence", "unproven_goals", "strengthening_requests", "boundary_assumptions", "fault_hypothesis"],
+      "additionalProperties": false
+    },
+    "breaker": {
+      "type": "object",
+      "properties": {
+        "role": {"const": "breaker"},
+        "agent_id": {"$ref": "#/definitions/agent_id"},
+        "file": {"$ref": "#/definitions/relpath"},
+        "function": {"$ref": "#/definitions/text"},
+        "status": {"type": "string", "enum": ["crash_found", "clean"]},
+        "seeds": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/relpath"}},
+        "crash_artifact": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
+        "failing_predicate": {"type": ["string", "null"]},
+        "analysis": {"$ref": "#/definitions/text"},
+        "suggested_requires": {"type": ["string", "null"]},
+        "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]}
+      },
+      "required": ["role", "agent_id", "file", "function", "status", "seeds", "crash_artifact", "failing_predicate", "analysis", "suggested_requires", "fault_hypothesis"],
+      "additionalProperties": false
+    },
+    "architect": {
+      "type": "object",
+      "properties": {
+        "role": {"const": "architect"},
+        "agent_id": {"$ref": "#/definitions/agent_id"},
+        "header": {"$ref": "#/definitions/relpath"},
+        "status": {"type": "string", "enum": ["passed", "failed"]},
+        "patch": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
+        "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/evidence_item"}},
+        "boundary_assumptions": {"type": "array", "items": {"$ref": "#/definitions/text"}},
+        "notes": {"type": "string"}
+      },
+      "required": ["role", "agent_id", "header", "status", "patch", "evidence", "boundary_assumptions", "notes"],
+      "additionalProperties": false
+    },
+    "crash_verifier": {
+      "type": "object",
+      "properties": {
+        "role": {"const": "crash_verifier"},
+        "agent_id": {"$ref": "#/definitions/agent_id"},
+        "candidate_fingerprint": {"type": "string", "minLength": 5},
+        "decision": {"type": "string", "enum": ["confirmed", "needs_validation", "rejected"]},
+        "refingerprint_reason": {"type": ["string", "null"]},
+        "record": {"type": "object"},
+        "additional_records": {"type": "array", "items": {"type": "object"}}
+      },
+      "required": ["role", "agent_id", "candidate_fingerprint", "decision", "refingerprint_reason", "record"],
+      "additionalProperties": false
+    },
+    "critic": {
+      "type": "object",
+      "properties": {
+        "role": {"const": "critic"},
+        "agent_id": {"$ref": "#/definitions/agent_id"},
+        "phase": {"type": "string", "enum": ["slice", "fuzz", "eva", "wp", "final"]},
+        "missing_units": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file": {"$ref": "#/definitions/relpath"},
+              "function": {"$ref": "#/definitions/text"},
+              "obligation_class": {"type": "string", "enum": ["rte", "l2_termination", "l3_frame", "l4_auth", "l5_output", "l6_secret"]},
+              "reason": {"$ref": "#/definitions/text"}
+            },
+            "required": ["file", "function", "obligation_class", "reason"],
+            "additionalProperties": false
+          }
+        },
+        "reassign_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/coverage_id"}},
+        "harness_gaps": {"type": "array", "items": {"$ref": "#/definitions/text"}},
+        "stop": {"type": "boolean"}
+      },
+      "required": ["role", "agent_id", "phase", "missing_units", "reassign_ids", "harness_gaps", "stop"],
+      "additionalProperties": false
+    }
+  }
+}

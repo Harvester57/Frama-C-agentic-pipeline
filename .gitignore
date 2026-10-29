@@ -1,0 +1,18 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Local agent/analysis scratch directories
+.agents/
+to_analyze/
+.framac-*/
+workspace/

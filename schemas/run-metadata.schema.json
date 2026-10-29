@@ -1,0 +1,41 @@
+{
+  "$comment": "Contract for run-metadata.json. Written only by the parent via scripts/run_metadata.py.",
+  "type": "object",
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^run-[0-9]+$"},
+    "repo": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "target": {"type": "string", "minLength": 1},
+    "source_ref": {
+      "type": "object",
+      "properties": {
+        "vcs": {"type": "string", "enum": ["git", "none"]},
+        "commit": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]}
+      },
+      "required": ["vcs", "commit", "dirty"],
+      "additionalProperties": false
+    },
+    "profile": {"type": "string", "enum": ["quick", "standard", "deep"]},
+    "scope_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "budget": {"type": ["integer", "null"], "minimum": 1},
+    "execution_policy": {"const": "sandboxed-local-only"},
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "outer": {"type": "string", "enum": ["docker-hardened", "unknown"]},
+        "inner": {"type": "string", "enum": ["bubblewrap", "degraded", "unknown"]}
+      },
+      "required": ["outer", "inner"],
+      "additionalProperties": false
+    },
+    "prior_runs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "toolchain": {"type": "object"},
+    "run_status": {"type": "string", "enum": ["in_progress", "complete", "incomplete"]},
+    "incomplete_reason": {"type": ["string", "null"]},
+    "created_at": {"type": "string", "minLength": 1},
+    "updated_at": {"type": "string", "minLength": 1}
+  },
+  "required": ["schema_version", "run_id", "repo", "target", "source_ref", "profile", "scope_paths", "budget", "execution_policy", "sandbox", "prior_runs", "toolchain", "run_status", "incomplete_reason", "created_at", "updated_at"],
+  "additionalProperties": false
+}

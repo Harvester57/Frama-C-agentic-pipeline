@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Shared helpers for the Frama-C pipeline scripts (stdlib only).
+
+- Atomic JSON writes and strict JSON loads (no silent fallback to {}).
+- Normalization of Frama-C property statuses and `-report-csv` columns, which
+  differ between Frama-C releases ("property kind" vs "kind", "Valid under hyp."
+  vs "Valid_under_hyp").
+- Safe run-relative path checks used by validators and ingestion.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Canonical status buckets used across Eva and WP parsing.
+STATUS_VALID = "valid"
+STATUS_VALID_UNDER_HYP = "valid_under_hyp"
+STATUS_UNKNOWN = "unknown"
+STATUS_INVALID = "invalid"
+STATUS_INVALID_UNDER_HYP = "invalid_under_hyp"
+STATUS_DEAD = "dead"
+STATUS_ASSUMED = "assumed"
+STATUS_NEVER_TRIED = "never_tried"
+STATUS_INCONSISTENT = "inconsistent"
+STATUS_OTHER = "other"
+
+_STATUS_MAP = {
+    "valid": STATUS_VALID,
+    "valid_under_hyp": STATUS_VALID_UNDER_HYP,
+    "valid_under_hypotheses": STATUS_VALID_UNDER_HYP,
+    "unknown": STATUS_UNKNOWN,
+    "invalid": STATUS_INVALID,
+    "invalid_under_hyp": STATUS_INVALID_UNDER_HYP,
+    "invalid_under_hypotheses": STATUS_INVALID_UNDER_HYP,
+    # "... but dead": the property sits in code that is unreachable under the
+    # analysis context. Never a bug, never a proof.
+    "invalid_but_dead": STATUS_DEAD,
+    "valid_but_dead": STATUS_DEAD,
+    "unknown_but_dead": STATUS_DEAD,
+    # Considered valid: an assumption (e.g. a libc or stub specification), not
+    # something this run established.
+    "considered_valid": STATUS_ASSUMED,
+    "never_tried": STATUS_NEVER_TRIED,
+    "inconsistent": STATUS_INCONSISTENT,
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_status(raw: str | None) -> str:
+    """Map any Frama-C status spelling onto a canonical bucket."""
+    key = re.sub(r"[^a-z0-9]+", "_", (raw or "").strip().lower()).strip("_")
+    return _STATUS_MAP.get(key, STATUS_OTHER)
+
+
+def atomic_write_json(path: Path, data) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, sort_keys=False, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+class ArtifactError(RuntimeError):
+    """Raised when a required pipeline artifact is missing or malformed."""
+
+
+def load_json_strict(path: Path, max_bytes: int = 64 * 1024 * 1024):
+    """Load JSON and fail loudly. Callers must decide explicitly how to treat absence."""
+    path = Path(path)
+    if not path.is_file():
+        raise ArtifactError(f"missing artifact: {path}")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ArtifactError(f"artifact exceeds {max_bytes} bytes: {path}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"malformed JSON in {path}: {exc}") from exc
+
+
+def load_json_optional(path: Path, default):
+    """Load JSON if present; a present-but-malformed file still raises."""
+    path = Path(path)
+    if not path.exists():
+        return default
+    return load_json_strict(path)
+
+
+# Frama-C `-report-csv` header: directory, file, line, function, property kind,
+# status, property. Older scripts assumed "kind"/"annotation"; accept all.
+_CSV_ALIASES = {
+    "directory": ("directory", "dir"),
+    "file": ("file",),
+    "line": ("line",),
+    "function": ("function",),
+    "kind": ("property kind", "property_kind", "kind"),
+    "status": ("status",),
+    "property": ("property", "annotation"),
+}
+
+
+def _pick(row: dict[str, str], names) -> str:
+    lowered = {(k or "").strip().lower(): v for k, v in row.items()}
+    for name in names:
+        if name in lowered and lowered[name] is not None:
+            return str(lowered[name]).strip()
+    return ""
+
+
+def read_report_csv(csv_path: Path) -> list[dict]:
+    """Parse a Frama-C report CSV into normalized property rows."""
+    rows: list[dict] = []
+    with open(csv_path, encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for raw in reader:
+            line_txt = _pick(raw, _CSV_ALIASES["line"])
+            try:
+                line_no = int(line_txt) if line_txt else 0
+            except ValueError:
+                line_no = 0
+            status_raw = _pick(raw, _CSV_ALIASES["status"])
+            rows.append({
+                "directory": _pick(raw, _CSV_ALIASES["directory"]),
+                "file": _pick(raw, _CSV_ALIASES["file"]),
+                "line": line_no,
+                "function": _pick(raw, _CSV_ALIASES["function"]),
+                "kind": _pick(raw, _CSV_ALIASES["kind"]),
+                "status_raw": status_raw,
+                "status": normalize_status(status_raw),
+                "property": _pick(raw, _CSV_ALIASES["property"]),
+            })
+    return rows
+
+
+_WINDOWS_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.IGNORECASE)
+
+
+def is_safe_relative_path(value: str) -> bool:
+    """True for a non-empty, forward-slash, relative path without traversal."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if "\\" in value or "\x00" in value or value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        return False
+    parts = value.split("/")
+    for part in parts:
+        if part in ("", ".", "..") or _WINDOWS_DEVICE.match(part):
+            return False
+    return True
+
+
+AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def is_safe_agent_id(value: str) -> bool:
+    return isinstance(value, str) and bool(AGENT_ID_RE.match(value)) and not _WINDOWS_DEVICE.match(value)
+
+
+def to_run_relative(path: Path, run_dir: Path) -> str:
+    """Express a path relative to the run directory using forward slashes."""
+    p = Path(path)
+    if not p.is_absolute():
+        p = (Path.cwd() / p)
+    try:
+        return p.resolve().relative_to(Path(run_dir).resolve()).as_posix()
+    except ValueError:
+        return Path(path).as_posix()
