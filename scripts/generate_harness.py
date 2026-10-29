@@ -4,13 +4,24 @@ Generates per-module Frama-C GNUmakefile, dual-use C harness
 (supporting both Frama-C Eva via eva_main() and Clang LibFuzzer via LLVMFuzzerTestOneInput()),
 and a structured sidecar JSON (harness_<module>.json) tracking entry reachability,
 contract notes, and harness repair attempts (capped at 2).
+
+By default the generated harness is probed with `clang -fsyntax-only` and any
+headers (from the -I directories) that define identifiers the module header
+uses without including are auto-#included before it ("auto-prelude"); disable
+with --no-auto-prelude.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +160,297 @@ def _build_invocations(
     raise ValueError(f"invalid entry_style: {entry_style!r}")
 
 
+# ---------------------------------------------------------------------------
+# Automatic prelude resolution
+#
+# Module headers in real targets are frequently not self-sufficient: they use
+# typedefs, enum constants, or macros defined in a sibling "root" header that
+# they never include themselves. resolve_prelude_headers() compiles the
+# generated harness with `clang -fsyntax-only` (LibFuzzer branch, i.e. without
+# -D__FRAMAC__), collects unresolved identifiers from the diagnostics, finds
+# the header in the -I directories that defines them, and #includes it before
+# the module header. This replaces the manual
+# `--header <root>.h --extra-include <mod>.h` workaround.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PRELUDE_MAX_ITERATIONS = 3
+_PRELUDE_CLANG_TIMEOUT_S = 120
+_DIAG_SYMBOL_RE = re.compile(
+    r"^(?P<file>.*?):\d+:\d+:\s+(?:fatal\s+)?error:\s+"
+    r"(?:unknown type name|use of undeclared identifier)\s+'(?P<sym>[A-Za-z_]\w*)'",
+    re.MULTILINE,
+)
+_DIAG_FATAL_RE = re.compile(r"^(?P<line>.*?:\d+:\d+:\s+fatal error:.*)$", re.MULTILINE)
+_C_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_C_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_ENUM_BODY_RE = re.compile(r"\benum\b[^{;]*\{[^{}]*\}", re.DOTALL)
+
+
+def _split_cppflags(cppflags: str) -> list[str]:
+    flags = cppflags or ""
+    if os.name == "nt":
+        # shlex (POSIX mode) treats backslashes as escapes; Windows paths use them as separators.
+        flags = flags.replace("\\", "/")
+    return shlex.split(flags)
+
+
+def _include_dirs_from_cppflags(cppflags: str) -> list[Path]:
+    """Return the -I directories (both `-Idir` and `-I dir` forms) in command-line order, de-duplicated."""
+    tokens = _split_cppflags(cppflags)
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        value: str | None = None
+        if tok == "-I":
+            if i + 1 < len(tokens):
+                value = tokens[i + 1]
+                i += 1
+        elif tok.startswith("-I") and len(tok) > 2:
+            value = tok[2:]
+        i += 1
+        if value is None:
+            continue
+        key = os.path.normcase(os.path.normpath(value))
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(Path(value))
+    return dirs
+
+
+def _candidate_headers(include_dirs: list[Path]) -> list[Path]:
+    """
+    List *.h files directly inside each -I directory (non-recursive). A basename
+    found in an earlier -I directory shadows later ones, mirroring how the
+    compiler resolves `#include "<basename>"`.
+    """
+    seen_names: set[str] = set()
+    headers: list[Path] = []
+    for d in include_dirs:
+        if not d.is_dir():
+            continue
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for p in entries:
+            if p.suffix.lower() != ".h" or not p.is_file():
+                continue
+            if p.name in seen_names:
+                continue
+            seen_names.add(p.name)
+            headers.append(p)
+    return headers
+
+
+def _strip_c_comments(text: str) -> str:
+    return _C_LINE_COMMENT_RE.sub("", _C_BLOCK_COMMENT_RE.sub(" ", text))
+
+
+def _header_defines_symbol(text: str, symbol: str) -> bool:
+    """Heuristic check whether comment-stripped header `text` defines `symbol`."""
+    s = re.escape(symbol)
+    patterns = (
+        # typedef unsigned char Boolean_T;  /  typedef uint8_t Buf_T[4];
+        rf"\btypedef\b[^;{{}}]*\b{s}\s*(?:\[[^\]]*\]\s*)*;",
+        # typedef void (*Handler_T)(int);
+        rf"\btypedef\b[^;{{}}]*\(\s*\*\s*{s}\s*\)",
+        # } Mode_T;  /  } Mode_T, *PMode_T;  (closing a typedef struct/union/enum)
+        rf"\}}[^;{{}}]*?\b{s}\s*[,;]",
+        # #define CMD_NAME_MAX_LEN 32
+        rf"^[ \t]*#[ \t]*define[ \t]+{s}\b",
+    )
+    for pat in patterns:
+        if re.search(pat, text, re.MULTILINE):
+            return True
+    enum_const = re.compile(rf"[{{,]\s*{s}\s*(?:=|,|\}})")
+    return any(enum_const.search(m.group(0)) for m in _ENUM_BODY_RE.finditer(text))
+
+
+def _parse_symbol_diagnostics(output: str) -> dict[str, list[str]]:
+    """Map unresolved symbol -> list of files the diagnostic was reported in (discovery order)."""
+    found: dict[str, list[str]] = {}
+    for m in _DIAG_SYMBOL_RE.finditer(output or ""):
+        sym = m.group("sym")
+        fpath = m.group("file").strip()
+        files = found.setdefault(sym, [])
+        if fpath not in files:
+            files.append(fpath)
+    return found
+
+
+def _insert_prelude_includes(
+    harness_file: Path,
+    header_include: str,
+    new_headers: list[tuple[str, str | None]],
+) -> None:
+    """
+    Insert `#include "<hdr>"` lines into the harness. Each entry is (header,
+    before) where `before` is an already-included prelude header that depends
+    on `header` (it must therefore come first), or None to insert directly
+    before the module header line (preserving discovery order).
+    """
+    lines = harness_file.read_text(encoding="utf-8").splitlines(keepends=True)
+    module_line = f'#include "{header_include}"'
+
+    def _find(target: str) -> int | None:
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == target or stripped.startswith(target + " "):
+                return idx
+        return None
+
+    for hdr, before in new_headers:
+        idx = _find(f'#include "{before}"') if before else None
+        if idx is None:
+            idx = _find(module_line)
+        if idx is None:
+            # Module header line not found: insert before the first quoted include, else at the top.
+            idx = next((i for i, line in enumerate(lines) if line.lstrip().startswith('#include "')), 0)
+        lines.insert(idx, f'#include "{hdr}" /* auto-prelude */\n')
+    harness_file.write_text("".join(lines), encoding="utf-8")
+
+
+def resolve_prelude_headers(
+    harness_file: Path,
+    cppflags: str,
+    header_include: str,
+    max_iterations: int = DEFAULT_PRELUDE_MAX_ITERATIONS,
+    clang: str | None = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> dict[str, Any]:
+    """
+    Make the harness self-sufficient by auto-including the headers that define
+    identifiers the module header uses but does not declare.
+
+    Runs `clang -fsyntax-only -x c <cppflags> <harness_file>` (without
+    -D__FRAMAC__ so the LibFuzzer branch is checked), parses `unknown type name`
+    and `use of undeclared identifier` diagnostics, searches *.h files in the
+    -I directories for a definition (typedef, closing `} X;`, `#define X`, enum
+    constant) and rewrites the harness so the defining headers are included
+    before `#include "<header_include>"`. Repeats up to `max_iterations`
+    rewrite rounds, re-running clang after each one.
+
+    Returns a dict with `status` ("clean" | "resolved" | "unresolved" |
+    "skipped"), `prelude_headers` (basenames as included), `unresolved_symbols`,
+    `iterations` (number of clang runs) and, when skipped, `reason`.
+    """
+    harness_file = Path(harness_file)
+    result: dict[str, Any] = {
+        "status": "skipped",
+        "prelude_headers": [],
+        "unresolved_symbols": [],
+        "iterations": 0,
+    }
+    clang_bin = clang or shutil.which("clang")
+    if not clang_bin:
+        result["reason"] = "clang not found"
+        return result
+
+    include_dirs = _include_dirs_from_cppflags(cppflags)
+    module_line_include = (header_include or "").replace("\\", "/").strip()
+    harness_resolved = harness_file.resolve()
+    header_cache: dict[Path, str] = {}
+
+    def _header_text(p: Path) -> str:
+        if p not in header_cache:
+            try:
+                header_cache[p] = _strip_c_comments(p.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                header_cache[p] = ""
+        return header_cache[p]
+
+    cmd = [
+        clang_bin,
+        "-fsyntax-only",
+        "-fno-color-diagnostics",
+        "-ferror-limit=0",
+        "-x",
+        "c",
+        *_split_cppflags(cppflags),
+        str(harness_file),
+    ]
+    prelude: list[str] = []
+    max_rounds = max(0, int(max_iterations))
+    rounds = 0
+    while True:
+        try:
+            proc = runner(cmd, capture_output=True, text=True, check=False, timeout=_PRELUDE_CLANG_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as exc:
+            result.update(status="skipped", reason=f"clang invocation failed: {exc}", prelude_headers=list(prelude))
+            return result
+        result["iterations"] += 1
+        output = f"{getattr(proc, 'stderr', '') or ''}\n{getattr(proc, 'stdout', '') or ''}"
+        symbols = _parse_symbol_diagnostics(output)
+        result["prelude_headers"] = list(prelude)
+
+        if not symbols:
+            fatal = _DIAG_FATAL_RE.search(output)
+            if fatal and not prelude:
+                # e.g. module header not found: nothing this resolver can fix.
+                result.update(status="skipped", reason=f"clang fatal error: {fatal.group('line').strip()}")
+            else:
+                result.update(status="resolved" if prelude else "clean", unresolved_symbols=[])
+            return result
+
+        if rounds >= max_rounds:
+            result.update(status="unresolved", unresolved_symbols=list(symbols))
+            result["reason"] = f"prelude iteration cap ({max_rounds}) reached"
+            return result
+
+        # Collect candidate definitions for every unresolved symbol.
+        candidates: dict[str, list[Path]] = {}
+        for sym, failing_files in symbols.items():
+            failing_names = {Path(f.replace("\\", "/")).name for f in failing_files}
+            cands: list[Path] = []
+            for hdr in _candidate_headers(include_dirs):
+                if hdr.resolve() == harness_resolved or hdr.name in prelude:
+                    continue
+                # A header cannot be its own prelude: skip it when the symbol failed inside it.
+                if hdr.name in failing_names:
+                    continue
+                if _header_defines_symbol(_header_text(hdr), sym):
+                    cands.append(hdr)
+            candidates[sym] = cands
+
+        coverage: dict[Path, int] = {}
+        for cands in candidates.values():
+            for hdr in cands:
+                coverage[hdr] = coverage.get(hdr, 0) + 1
+
+        new_headers: list[tuple[str, str | None]] = []
+        chosen_names: list[str] = []
+        unresolved: list[str] = []
+        for sym, cands in candidates.items():
+            if not cands:
+                unresolved.append(sym)
+                continue
+            best = sorted(cands, key=lambda p: (-coverage[p], len(str(p)), str(p)))[0]
+            if best.name in chosen_names:
+                continue
+            # If the symbol failed inside an earlier prelude header, the new header must precede it.
+            failing_names = [Path(f.replace("\\", "/")).name for f in symbols[sym]]
+            before = next((h for h in prelude if h in failing_names), None)
+            chosen_names.append(best.name)
+            new_headers.append((best.name, before))
+
+        if not new_headers:
+            result.update(status="unresolved", unresolved_symbols=unresolved or list(symbols))
+            result["reason"] = "no defining header found in -I directories"
+            return result
+
+        _insert_prelude_includes(harness_file, module_line_include, new_headers)
+        for hdr, before in new_headers:
+            if before and before in prelude:
+                prelude.insert(prelude.index(before), hdr)
+            else:
+                prelude.append(hdr)
+        result["prelude_headers"] = list(prelude)
+        rounds += 1
+
+
 def generate_module_harness(
     module_name: str,
     sources: list[str],
@@ -170,6 +472,10 @@ def generate_module_harness(
     eva_expr: str | None = None,
     fuzz_expr: str | None = None,
     null_terminate: bool = False,
+    auto_prelude: bool = True,
+    prelude_max_iterations: int = DEFAULT_PRELUDE_MAX_ITERATIONS,
+    prelude_clang: str | None = None,
+    prelude_runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     if reachability not in ("untrusted_surface", "internal_api"):
         raise ValueError(f"invalid reachability: {reachability!r}")
@@ -231,6 +537,25 @@ def generate_module_harness(
 
     harness_file.write_text(harness_content, encoding="utf-8")
 
+    if auto_prelude:
+        prelude = resolve_prelude_headers(
+            harness_file,
+            norm_cppflags,
+            norm_header,
+            max_iterations=prelude_max_iterations,
+            clang=prelude_clang,
+            runner=prelude_runner or subprocess.run,
+        )
+    else:
+        prelude = {"status": "disabled", "prelude_headers": [], "unresolved_symbols": [], "iterations": 0}
+    prelude_fields = {
+        "prelude_headers": list(prelude.get("prelude_headers") or []),
+        "prelude_status": prelude.get("status"),
+        "prelude_unresolved": list(prelude.get("unresolved_symbols") or []),
+    }
+    if prelude.get("reason"):
+        prelude_fields["prelude_reason"] = prelude["reason"]
+
     mk_content = (
         f"TARGET := {module_name}\n"
         f"MAIN_FN := eva_main\n"
@@ -262,8 +587,18 @@ def generate_module_harness(
         "repair_attempts": 0,
         "max_repair_attempts": MAX_HARNESS_REPAIR_ATTEMPTS,
         "repair_history": [],
+        **prelude_fields,
     }
     atomic_write_json(harness_meta_file, sidecar)
+
+    if prelude.get("status") == "unresolved" and prelude_fields["prelude_unresolved"] and prelude.get("iterations", 0) > 0:
+        raise ValueError(
+            "harness for module "
+            f"{module_name!r} has unresolved identifiers after automatic prelude resolution: "
+            f"{', '.join(prelude_fields['prelude_unresolved'])}. "
+            "Pass the defining root header manually (--header <root>.h --extra-include <mod>.h), "
+            "add its directory to --cppflags with -I, or disable resolution with --no-auto-prelude."
+        )
 
     return {
         "module": module_name,
@@ -279,6 +614,7 @@ def generate_module_harness(
         "null_terminate": effective_null_terminate,
         "include_source": include_source,
         "reachability": reachability,
+        **prelude_fields,
     }
 
 
@@ -336,6 +672,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--stubbed-callee", action="append", default=[], help="External/I/O callee stubbed by the harness (repeatable)")
     parser.add_argument("--contract-note", action="append", default=[], help="Entry contract note (repeatable)")
+    parser.add_argument(
+        "--no-auto-prelude",
+        dest="auto_prelude",
+        action="store_false",
+        help=(
+            "Disable automatic prelude resolution (clang -fsyntax-only probe that #includes headers from the "
+            "-I directories defining identifiers the module header uses but does not include)"
+        ),
+    )
     parser.add_argument("--record-repair", type=Path, default=None, help="Path to harness_<mod>.json to record a repair")
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
     args = parser.parse_args(argv)
@@ -351,28 +696,33 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.module and args.sources and args.header and args.entry_fn):
         parser.error("--module, --sources, --header, and --entry-fn are required when generating a harness")
 
-    result = generate_module_harness(
-        module_name=args.module,
-        sources=args.sources,
-        header_include=args.header,
-        entry_fn=args.entry_fn,
-        max_input_size=args.max_size,
-        cppflags=args.cppflags,
-        out_dir=args.out_dir,
-        reachability=args.reachability,
-        contract_notes=args.contract_note,
-        entry_style=args.entry_style,
-        global_buf=args.global_buf,
-        global_len=args.global_len,
-        struct_type=args.struct_type,
-        include_source=args.include_source,
-        stubbed_callees=args.stubbed_callee,
-        extra_includes=args.extra_include,
-        call_expr=args.call_expr,
-        eva_expr=args.eva_expr,
-        fuzz_expr=args.fuzz_expr,
-        null_terminate=args.null_terminate,
-    )
+    try:
+        result = generate_module_harness(
+            module_name=args.module,
+            sources=args.sources,
+            header_include=args.header,
+            entry_fn=args.entry_fn,
+            max_input_size=args.max_size,
+            cppflags=args.cppflags,
+            out_dir=args.out_dir,
+            reachability=args.reachability,
+            contract_notes=args.contract_note,
+            entry_style=args.entry_style,
+            global_buf=args.global_buf,
+            global_len=args.global_len,
+            struct_type=args.struct_type,
+            include_source=args.include_source,
+            stubbed_callees=args.stubbed_callee,
+            extra_includes=args.extra_include,
+            call_expr=args.call_expr,
+            eva_expr=args.eva_expr,
+            fuzz_expr=args.fuzz_expr,
+            null_terminate=args.null_terminate,
+            auto_prelude=args.auto_prelude,
+        )
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        return 1
     print(json.dumps(result, indent=2))
     return 0
 
