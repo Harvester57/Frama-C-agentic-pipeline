@@ -47,6 +47,9 @@ param(
     [string]$Image = "framac-pipeline:latest",
 
     [Parameter(Mandatory = $false)]
+    [string]$TargetPackages = "",
+
+    [Parameter(Mandatory = $false)]
     [switch]$BuildIfMissing,
 
     [Parameter(Mandatory = $false)]
@@ -128,6 +131,17 @@ if (-not $imageExists) {
     }
 }
 
+if ($TargetPackages) {
+    $DerivedImage = "framac-pipeline:$RepoName"
+    Write-Host "[framac-docker] Building derived image $DerivedImage with target packages: $TargetPackages"
+    docker build "-t" "$DerivedImage" "--build-arg" "TARGET_APT_PACKAGES=$TargetPackages" "$PipelineRoot"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to build derived Docker image $DerivedImage"
+    }
+    $Image = $DerivedImage
+}
+
+$RunId = Split-Path -Leaf $ResolvedRun
 $CmdString = $Command -join " "
 
 $dockerArgs = @(
@@ -147,7 +161,8 @@ $dockerArgs += @(
     "-e", "PYTHONIOENCODING=utf-8",
     "-e", "FRAMAC_OUTER_SANDBOX=docker-hardened",
     "-e", "FRAMAC_TARGET_HOST=$ResolvedTarget",
-    "-e", "FRAMAC_REPO=$RepoName"
+    "-e", "FRAMAC_REPO=$RepoName",
+    "-e", "FRAMAC_RUN_ID=$RunId"
 )
 if ($AllowDegradedSandbox) {
     $dockerArgs += @("-e", "FRAMAC_SANDBOX_DEGRADED=1")

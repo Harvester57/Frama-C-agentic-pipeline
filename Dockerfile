@@ -26,9 +26,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     graphviz \
     jq \
+    libbsd-dev \
     libclang-rt-dev \
+    libevent-dev \
     libgmp-dev \
+    libjson-c-dev \
     libmpfr-dev \
+    libpcap-dev \
+    libsnmp-dev \
+    libsqlite3-dev \
+    libssl-dev \
+    libxml2-dev \
     llvm \
     m4 \
     ninja-build \
@@ -61,6 +69,14 @@ RUN opam init --bare --disable-sandboxing --root=/opt/opam && \
 
 ENV PATH="/opt/opam/framac/bin:${PATH}"
 ENV FRAMAC_SHARE="/opt/opam/framac/share/frama-c"
+
+# Optional target-specific apt packages (built via --target-packages / -TargetPackages before dropping capabilities)
+ARG TARGET_APT_PACKAGES=""
+RUN if [ -n "${TARGET_APT_PACKAGES}" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends ${TARGET_APT_PACKAGES} && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Copy pipeline scripts, templates and artifact schemas into /opt/framac-pipeline for container-internal access
 COPY scripts/ /opt/framac-pipeline/scripts/

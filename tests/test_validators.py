@@ -126,6 +126,23 @@ def test_metadata_incomplete_reason():
     assert any("must be null" in e for e in validate_metadata(metadata("complete", "x")))
 
 
+def test_run_metadata_init_respects_framac_run_id_env(tmp_path, monkeypatch):
+    import run_metadata
+
+    container_cwd = tmp_path / "framac-run"
+    container_cwd.mkdir()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    monkeypatch.chdir(container_cwd)
+    monkeypatch.setenv("FRAMAC_RUN_ID", "run-1")
+
+    rc = run_metadata.main(["init", "--repo", "demo", "--target", str(target_dir), "--profile", "quick"])
+    assert rc == 0
+    meta = run_metadata.json.loads((container_cwd / "run-metadata.json").read_text(encoding="utf-8"))
+    assert meta["run_id"] == "run-1"
+    assert list(validate_metadata(meta)) == []
+
+
 def prover_result(**kw):
     r = {
         "role": "prover", "agent_id": "prover-1", "file": "src/a.c", "function": "f",

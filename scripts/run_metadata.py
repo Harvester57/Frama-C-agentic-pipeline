@@ -81,16 +81,26 @@ def write(meta: dict) -> None:
     atomic_write_json(META, meta)
 
 
-def cmd_init(repo: str, target: str, profile: str, scope: list[str], budget: int | None, prior: list[str]) -> dict:
+def cmd_init(
+    repo: str,
+    target: str,
+    profile: str,
+    scope: list[str],
+    budget: int | None,
+    prior: list[str],
+    run_id: str | None = None,
+) -> dict:
     if META.exists():
         raise ArtifactError(f"{META} already exists; a run directory is initialized once")
-    run_id = Path.cwd().name
-    if not re.match(r"^run-[0-9]+$", run_id):
-        raise ArtifactError(f"working directory must be the run directory (run-<N>), got {run_id!r}")
+    resolved_run_id = (run_id or os.environ.get("FRAMAC_RUN_ID") or Path.cwd().name).strip()
+    if not re.match(r"^run-[0-9]+$", resolved_run_id):
+        raise ArtifactError(
+            f"run_id must match run-<N> (via --run-id, FRAMAC_RUN_ID, or working directory name), got {resolved_run_id!r}"
+        )
     now = utc_now()
     meta = {
         "schema_version": 1,
-        "run_id": run_id,
+        "run_id": resolved_run_id,
         "repo": repo,
         "target": os.environ.get("FRAMAC_TARGET_HOST") or target,
         "source_ref": source_ref(target),
@@ -127,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("init")
     p.add_argument("--repo", required=True)
+    p.add_argument("--run-id", default=None, help="Explicit run-<N> identifier (overrides FRAMAC_RUN_ID and cwd name)")
     p.add_argument("--target", default="/target")
     p.add_argument("--profile", choices=["quick", "standard", "deep"], default="standard")
     p.add_argument("--scope", action="append", default=[])
@@ -139,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
-            out = cmd_init(args.repo, args.target, args.profile, args.scope, args.budget, args.prior_run)
+            out = cmd_init(args.repo, args.target, args.profile, args.scope, args.budget, args.prior_run, args.run_id)
         elif args.cmd == "set-status":
             out = cmd_set_status(args.status, args.reason)
         else:

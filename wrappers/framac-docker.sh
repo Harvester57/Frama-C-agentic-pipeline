@@ -2,7 +2,8 @@
 # Executes a command inside the hardened framac-pipeline container.
 #
 #   framac-docker.sh [--target DIR] (--run-dir DIR | --new-run) [--repo NAME]
-#                    [--build-if-missing] [--no-inner-sandbox] [--allow-degraded-sandbox]
+#                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
+#                    [--no-inner-sandbox] [--allow-degraded-sandbox]
 #                    [--allow-run-dir-in-target] -- <command...>
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
@@ -24,6 +25,7 @@ PIDS="${FRAMAC_PIDS_LIMIT:-4096}"
 RUN_DIR=""
 NEW_RUN=0
 REPO=""
+TARGET_PACKAGES=""
 BUILD=0
 INNER=1
 DEGRADED=0
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --run-dir) RUN_DIR="$2"; shift 2 ;;
         --new-run) NEW_RUN=1; shift ;;
         --repo) REPO="$2"; shift 2 ;;
+        --target-packages) TARGET_PACKAGES="$2"; shift 2 ;;
         --build-if-missing) BUILD=1; shift ;;
         --no-inner-sandbox) INNER=0; shift ;;
         --allow-degraded-sandbox) DEGRADED=1; shift ;;
@@ -84,11 +87,21 @@ if [[ -z "$(docker images -q "${IMAGE}" 2>/dev/null)" ]]; then
     fi
 fi
 
+if [[ -n "${TARGET_PACKAGES}" ]]; then
+    DERIVED_IMAGE="framac-pipeline:${REPO}"
+    echo "[framac-docker] Building derived image ${DERIVED_IMAGE} with target packages: ${TARGET_PACKAGES}" >&2
+    docker build -t "${DERIVED_IMAGE}" --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}"
+    IMAGE="${DERIVED_IMAGE}"
+fi
+
+RUN_ID="$(basename "${RESOLVED_RUN}")"
+
 ARGS=(run --rm -i --network none --cap-drop ALL --security-opt no-new-privileges
       --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}")
 [[ ${INNER} -eq 1 ]] && ARGS+=(--security-opt seccomp=unconfined)
 ARGS+=(-e PYTHONIOENCODING=utf-8 -e FRAMAC_OUTER_SANDBOX=docker-hardened
-       -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}")
+       -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
+       -e "FRAMAC_RUN_ID=${RUN_ID}")
 [[ ${DEGRADED} -eq 1 ]] && ARGS+=(-e FRAMAC_SANDBOX_DEGRADED=1)
 ARGS+=(-v "${RESOLVED_TARGET}:/target:ro"
        -v "${RESOLVED_RUN}:/framac-run"
