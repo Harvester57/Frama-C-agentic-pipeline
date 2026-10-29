@@ -105,9 +105,10 @@ def sandbox_mode() -> str:
     if degraded_allowed():
         return "degraded"
     raise SandboxUnavailable(
-        "bubblewrap cannot create a sandbox here (missing binary or user namespaces blocked). "
-        "Refusing to run target-controlled code. Fix the container (see wrappers/) or set "
-        "FRAMAC_SANDBOX_DEGRADED=1 to accept rlimit/env-only isolation; degraded runs are recorded."
+        "bubblewrap cannot create a sandbox here (missing binary or user namespaces blocked by host AppArmor/sysctl). "
+        "Refusing to run target-controlled code. Ensure the container runs with '--security-opt seccomp=unconfined "
+        "--security-opt apparmor=unconfined' (and host sysctl kernel.apparmor_restrict_unprivileged_userns=0 if needed), "
+        "or pass --allow-degraded-sandbox (FRAMAC_SANDBOX_DEGRADED=1) to accept rlimit/env-only isolation; degraded runs are recorded."
     )
 
 

@@ -19,8 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-$(pwd)}"
 IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-pipeline:latest}"
-CPUS="${FRAMAC_CPUS:-4}"
-MEMORY="${FRAMAC_MEMORY:-8g}"
+DEFAULT_CPUS="$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)"
+DEFAULT_MEM="$(awk '/MemTotal:/ { g = int(($2 / 1048576) * 0.75); if (g < 8) g = 8; print g "g" }' /proc/meminfo 2>/dev/null || echo 8g)"
+[[ -z "${DEFAULT_MEM}" ]] && DEFAULT_MEM="8g"
+CPUS="${FRAMAC_CPUS:-${DEFAULT_CPUS}}"
+MEMORY="${FRAMAC_MEMORY:-${DEFAULT_MEM}}"
 PIDS="${FRAMAC_PIDS_LIMIT:-4096}"
 RUN_DIR=""
 NEW_RUN=0
@@ -95,13 +98,24 @@ if [[ -n "${TARGET_PACKAGES}" ]]; then
 fi
 
 RUN_ID="$(basename "${RESOLVED_RUN}")"
+TARGET_COMMIT="$(git -C "${RESOLVED_TARGET}" rev-parse HEAD 2>/dev/null || true)"
+TARGET_DIRTY=""
+if [[ -n "${TARGET_COMMIT}" ]]; then
+    if [[ -n "$(git -C "${RESOLVED_TARGET}" status --porcelain --untracked-files=no 2>/dev/null || true)" ]]; then
+        TARGET_DIRTY="1"
+    else
+        TARGET_DIRTY="0"
+    fi
+fi
 
 ARGS=(run --rm -i --network none --cap-drop ALL --security-opt no-new-privileges
       --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}")
-[[ ${INNER} -eq 1 ]] && ARGS+=(--security-opt seccomp=unconfined)
+[[ ${INNER} -eq 1 ]] && ARGS+=(--security-opt seccomp=unconfined --security-opt apparmor=unconfined)
 ARGS+=(-e PYTHONIOENCODING=utf-8 -e FRAMAC_OUTER_SANDBOX=docker-hardened
        -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
-       -e "FRAMAC_RUN_ID=${RUN_ID}")
+       -e "FRAMAC_RUN_ID=${RUN_ID}"
+       -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"
+       -e "FRAMAC_TARGET_DIRTY=${TARGET_DIRTY}")
 [[ ${DEGRADED} -eq 1 ]] && ARGS+=(-e FRAMAC_SANDBOX_DEGRADED=1)
 ARGS+=(-v "${RESOLVED_TARGET}:/target:ro"
        -v "${RESOLVED_RUN}:/framac-run"

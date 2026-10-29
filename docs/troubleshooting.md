@@ -22,9 +22,15 @@ Common issues encountered when running Frama-C (`RTE`, `Eva`, `WP`, `E-ACSL`) an
 
 ## 2. E-ACSL + LibFuzzer Build & Runtime Issues
 
-### Symptom: `e-acsl-gcc` Fails on `__fc_libc/stdlib.h` (`\old(endptr)`) or Unknown Legacy Flag `--rte=`
-- **Cause:** Frama-C 33+ replaced legacy `e-acsl-gcc.sh` long flags (`--c-flags`, `--rte=all`) with `e-acsl-gcc` short flags (`-F`, `-G`, `-E`, `-e`, `-l`), and running `-rte` across all functions without `-rte-select` instruments unused `__fc_libc` inline functions such as `strtol`.
-- **Fix:** `run_eacsl_fuzz.py` and `GNUmakefile.template` automatically detect `e-acsl-gcc` vs `e-acsl-gcc.sh` and scope `-rte-select` and `-e-acsl-functions` to the functions defined in the target slice `.c` files. Full compiler diagnostics are saved to `<out-bin>.compile.log`. If `e-acsl-gcc` still fails in `campaign` mode, `--engine auto` falls back to native `clang -fsanitize=fuzzer,address,undefined`.
+### Symptom: `e-acsl-gcc` Fails on `__fc_builtin.h`, `__fc_libc/stdlib.h` (`\old(endptr)`), or Unknown Legacy Flag `--rte=`
+- **Cause:**
+  1. `e-acsl-gcc` runs `frama-c -no-frama-c-stdlib` so its second pass can compile `instrumented.c` with host `clang` against host glibc. If a harness guards `#include "__fc_builtin.h"` only with `#ifdef __FRAMAC__`, `e-acsl-gcc` enters that block and fails because `__fc_builtin.h` is not on the host include path, and host `<math.h>`/`<stdlib.h>` expose `_Float128` prototypes on glibc >= 2.26.
+  2. Frama-C 33+ replaced legacy `e-acsl-gcc.sh` long flags (`--c-flags`, `--rte=all`) with `e-acsl-gcc` short flags (`-F`, `-G`, `-E`, `-e`, `-l`), and running `-rte` across all functions without `-rte-select` instruments unused inline helpers.
+- **Fix:** `harness_dual.c.template` guards `#include "__fc_builtin.h"` and `eva_main()` with `#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)`, and `run_eacsl_fuzz.py` / `GNUmakefile.template` automatically pass `-D__FRAMAC_EACSL__ -D_Float128=double` along with `-rte-select` and `-e-acsl-functions` scoped to the functions defined in the target slice `.c` files. Full compiler diagnostics are saved to `<out-bin>.compile.log`. If `e-acsl-gcc` still fails in `campaign` mode, `--engine auto` falls back to native `clang -fsanitize=fuzzer,address,undefined`.
+
+### Symptom: `frama-c` (Eva / WP) Cannot Find `<bsd/string.h>`, `<json-c/json.h>`, `<netinet/ip_icmp.h>`, or `__int32_t`
+- **Cause:** `frama-c` runs with `-frama-c-stdlib` (`-nostdinc`), searching only `__fc_libc` and explicit `-I` flags so host `/usr/include` does not shadow `__fc_libc`.
+- **Fix:** `run_eva_slice.py`, `run_wp_function.py`, and `GNUmakefile.template` automatically append `-I/opt/framac-pipeline/templates/fc_stubs -include fc_compat_types.h`, providing bodyless ACSL-annotated prototypes for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, and glibc `__int8_t`..`__uint64_t` typedefs while keeping external specifications `Considered valid` (`STATUS_ASSUMED`) in the ledger.
 
 ### Symptom: Linker or Shadow Memory Conflict When Combining E-ACSL with AddressSanitizer (`-fsanitize=address`)
 - **Cause:** E-ACSL embeds its own shadow-memory runtime (`rtl`) to track byte-level pointer validity (`\valid`), initialization (`\initialized`), and sub-object bounds. AddressSanitizer (`ASan`) also maps shadow memory and intercepts `malloc`/`free`. Running both in the same binary causes immediate `mmap` collisions or false aborts.

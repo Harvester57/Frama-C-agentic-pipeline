@@ -53,10 +53,10 @@ param(
     [switch]$BuildIfMissing,
 
     [Parameter(Mandatory = $false)]
-    [string]$Cpus = "4",
+    [string]$Cpus = $(if ($env:FRAMAC_CPUS) { $env:FRAMAC_CPUS } else { [string][Environment]::ProcessorCount }),
 
     [Parameter(Mandatory = $false)]
-    [string]$Memory = "8g",
+    [string]$Memory = $(if ($env:FRAMAC_MEMORY) { $env:FRAMAC_MEMORY } else { "8g" }),
 
     [Parameter(Mandatory = $false)]
     [int]$PidsLimit = 4096,
@@ -143,6 +143,18 @@ if ($TargetPackages) {
 
 $RunId = Split-Path -Leaf $ResolvedRun
 $CmdString = $Command -join " "
+$TargetCommit = ""
+$TargetDirty = ""
+try {
+    $gitRev = & git -C "$ResolvedTarget" rev-parse HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $gitRev) {
+        $TargetCommit = ($gitRev | Select-Object -First 1).Trim()
+        $gitSt = & git -C "$ResolvedTarget" status --porcelain "--untracked-files=no" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $TargetDirty = if ($gitSt) { "1" } else { "0" }
+        }
+    }
+} catch {}
 
 $dockerArgs = @(
     "run", "--rm", "-i",
@@ -155,14 +167,16 @@ $dockerArgs = @(
 )
 if (-not $NoInnerSandbox) {
     # Required only so bubblewrap can unshare a user namespace for the inner sandbox.
-    $dockerArgs += @("--security-opt", "seccomp=unconfined")
+    $dockerArgs += @("--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined")
 }
 $dockerArgs += @(
     "-e", "PYTHONIOENCODING=utf-8",
     "-e", "FRAMAC_OUTER_SANDBOX=docker-hardened",
     "-e", "FRAMAC_TARGET_HOST=$ResolvedTarget",
     "-e", "FRAMAC_REPO=$RepoName",
-    "-e", "FRAMAC_RUN_ID=$RunId"
+    "-e", "FRAMAC_RUN_ID=$RunId",
+    "-e", "FRAMAC_TARGET_COMMIT=$TargetCommit",
+    "-e", "FRAMAC_TARGET_DIRTY=$TargetDirty"
 )
 if ($AllowDegradedSandbox) {
     $dockerArgs += @("-e", "FRAMAC_SANDBOX_DEGRADED=1")

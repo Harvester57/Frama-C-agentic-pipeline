@@ -42,10 +42,19 @@ def _run(cmd: list[str], cwd: str | None = None) -> str | None:
 def source_ref(target: str) -> dict:
     git = ["git", "-c", "safe.directory=*", "-C", target]
     commit = _run(git + ["rev-parse", "HEAD"])
-    if commit is None:
-        return {"vcs": "none", "commit": None, "dirty": None}
-    status = _run(git + ["status", "--porcelain", "--untracked-files=no"])
-    return {"vcs": "git", "commit": commit, "dirty": bool(status) if status is not None else None}
+    if commit is not None:
+        status = _run(git + ["status", "--porcelain", "--untracked-files=no"])
+        return {"vcs": "git", "commit": commit, "dirty": bool(status) if status is not None else None}
+    env_commit = (os.environ.get("FRAMAC_TARGET_COMMIT") or "").strip()
+    if env_commit:
+        env_dirty = (os.environ.get("FRAMAC_TARGET_DIRTY") or "").strip().lower()
+        dirty_val: bool | None = (
+            True
+            if env_dirty in ("1", "true", "yes")
+            else (False if env_dirty in ("0", "false", "no") else None)
+        )
+        return {"vcs": "git", "commit": env_commit, "dirty": dirty_val}
+    return {"vcs": "none", "commit": None, "dirty": None}
 
 
 def toolchain() -> dict:
