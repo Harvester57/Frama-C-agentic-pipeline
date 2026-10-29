@@ -1,0 +1,15 @@
+# Ignore everything by default to keep Docker build context minimal
+*
+
+# Allow only the directories copied by Dockerfile
+!scripts/
+!scripts/**
+!templates/
+!templates/**
+!schemas/
+!schemas/**
+
+# Exclude Python bytecode/caches inside allowed directories
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
