@@ -72,4 +72,16 @@ python3 /opt/framac-pipeline/scripts/ledger.py ingest-fuzz workspace/reports/fuz
 python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
 ```
 
-Each fingerprint becomes one entry in `candidates.json` (several crash inputs with the same failing predicate collapse into one candidate), and the matching ledger units become `candidate`, which excludes them from WP. A crash is a candidate until a verifier confirms that the fault is in target code and that the harness respected the entry function's contract.
+Each fingerprint becomes one entry in `candidates.json` (several crash inputs with the same failing predicate collapse into one candidate), and the matching ledger units become `candidate` (including any `deferred` Tier 3 helper functions reached via cross-module calls), which excludes them from WP. A crash is a candidate until a verifier confirms that the fault is in target code and that the harness respected the entry function's contract.
+
+To scaffold a schema-valid `crash_verifier` JSON record for any candidate in `candidates.json` (pre-populating `sha256`, `size_bytes`, `linked_units`, and `refingerprint_reason`), run:
+
+```text
+python3 /opt/framac-pipeline/scripts/ledger.py scaffold-verifier --fingerprint <fp> --decision confirmed --agent-id verifier-1 --out agents/verifier-1/scratch/result.json
+```
+
+At the end of a `quick` or profile-bounded run where Phase 3 WP is not scheduled for remaining `planned` units, close remaining open units cleanly before marking the run `complete`:
+
+```text
+python3 /opt/framac-pipeline/scripts/ledger.py close-remaining --reason "quick_profile_wp_not_scheduled: Phase 3 WP not run in quick profile"
+```

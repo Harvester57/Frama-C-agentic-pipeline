@@ -100,6 +100,24 @@ def test_discover_slice_functions_and_eva_error_summary(tmp_path):
     assert any("Frama-C aborted: invalid user input" in line for line in summary)
 
 
+def test_ubsan_resolves_function_from_source_line_without_stacktrace(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    src_file = tmp_path / "workspace" / "work" / "src" / "LibPtfCom" / "Events.c"
+    src_file.parent.mkdir(parents=True)
+    src_file.write_text(
+        "int Helper(int x) {\n    return x;\n}\n\nint SendEvent(const char *name, int code) {\n    int arr[2] = {1, 2};\n    return arr[code];\n}\n",
+        encoding="utf-8",
+    )
+    # Single-line UBSan output with no #0 stack frame
+    ubsan_no_stack = "src/LibPtfCom/Events.c:7:12: runtime error: index 5 out of bounds for type 'int[2]'\n"
+    parsed = parse_sanitizer_failure(ubsan_no_stack)
+    assert parsed is not None
+    assert parsed["file"] == "src/LibPtfCom/Events.c"
+    assert parsed["line"] == 7
+    assert parsed["function"] == "SendEvent"
+    assert parsed["alarm_kind"] == "index_bound"
+
+
 def test_campaign_classification():
     assert classify_campaign(0, False, []) == "clean"
     assert classify_campaign(1, False, []) == "fuzzer_error"

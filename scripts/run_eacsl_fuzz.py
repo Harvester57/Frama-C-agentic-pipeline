@@ -36,8 +36,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from build_callgraph_dag import extract_functions_from_code  # noqa: E402
-from fingerprint import detect_alarm_kind, make_fingerprint  # noqa: E402
+from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
 from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed  # noqa: E402
+
+SANITIZER_RUNTIME_ENV = {
+    "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
+    "ASAN_OPTIONS": "abort_on_error=1",
+}
+_TEST_UNIT_WRITTEN_RE = re.compile(r"Test unit written to\s+(?P<path>\S+)")
 
 ARTIFACT_KINDS = (
     ("crash-", "crash"),
@@ -119,6 +125,36 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _resolve_function_at_line(file_path: str, line: int) -> str:
+    """Resolve the enclosing C function at `file_path:line` using token-based span extraction."""
+    if not file_path or line <= 0:
+        return "unknown_function"
+    norm = normalize_file(file_path)
+    candidates: list[Path] = []
+    for cand in (
+        Path(file_path),
+        Path(norm),
+        Path("workspace/work") / norm,
+        Path("workspace/baseline") / norm,
+    ):
+        if cand.is_file() and cand not in candidates:
+            candidates.append(cand)
+    if not candidates and Path("workspace/work").is_dir():
+        bname = Path(norm).name
+        matches = list(Path("workspace/work").rglob(bname))
+        if len(matches) == 1:
+            candidates.append(matches[0])
+    for cpath in candidates:
+        try:
+            raw = cpath.read_text(encoding="utf-8", errors="replace")
+            for fn in extract_functions_from_code(raw, path=str(cpath)):
+                if int(fn.get("line", 0)) <= line <= int(fn.get("end_line", 0)):
+                    return fn.get("name") or "unknown_function"
+        except Exception:
+            continue
+    return "unknown_function"
+
+
 def parse_eacsl_failure(text: str) -> dict | None:
     """Extract the first E-ACSL failure (file, line, function, kind, predicate) from runtime output."""
     if not text:
@@ -129,19 +165,22 @@ def parse_eacsl_failure(text: str) -> dict | None:
     if not hit:
         return None
     file_ = hit.group("file") or ""
+    line_ = int(hit.group("line"))
     function = hit.groupdict().get("function") or ""
     if not function:
         fns = [m for m in _FN_RE.finditer(text) if m.start() <= hit.start()]
         if fns:
             function = fns[-1].group("function")
             file_ = file_ or fns[-1].group("file")
+    if not function or function == "unknown_function":
+        function = _resolve_function_at_line(file_, line_)
     pred_m = _PRED_RE.search(text, hit.end())
     predicate = pred_m.group("pred").strip().rstrip(".") if pred_m else ""
     kind = hit.group("kind").strip().lower().replace(" ", "_")
     alarm = detect_alarm_kind(predicate)
     return {
         "file": file_ or "unknown",
-        "line": int(hit.group("line")),
+        "line": line_,
         "function": function or "unknown_function",
         "kind": kind,
         "alarm_kind": alarm or None,
@@ -175,6 +214,8 @@ def parse_sanitizer_failure(text: str) -> dict | None:
                 break
         if fn == "unknown_function" and best_frame is not None:
             fn = best_frame.group("function")
+        if fn == "unknown_function":
+            fn = _resolve_function_at_line(file_, line_)
         alarm = _map_sanitizer_alarm_kind(pred)
         return {
             "file": file_,
@@ -195,6 +236,8 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         file_ = best_frame.group("file") if best_frame else "unknown"
         line_ = int(best_frame.group("line")) if best_frame else 0
         fn = best_frame.group("function") if best_frame else "unknown_function"
+        if fn == "unknown_function" and file_ != "unknown" and line_ > 0:
+            fn = _resolve_function_at_line(file_, line_)
         pred = f"AddressSanitizer: {asan_kind}{op_txt}"
         return {
             "file": file_,
@@ -265,9 +308,11 @@ def compile_eacsl_binary(
 
     target_fns = _discover_slice_functions(sources, functions)
     eacsl_bin, is_modern = _resolve_eacsl_gcc()
+    eacsl_defs = "-D__FRAMAC_EACSL__ -D_Float128=double"
+    eacsl_cppflags = f"{eacsl_defs} {cppflags}".strip()
 
     if not is_modern:
-        cflags = f"-g -O1 {cppflags}"
+        cflags = f"-g -O1 {eacsl_cppflags}"
         ldflags = ldflags_extra.strip()
         if fuzzer_flag:
             cflags = f"-fsanitize=fuzzer {cflags}"
@@ -300,8 +345,8 @@ def compile_eacsl_binary(
             eacsl_bin,
             "-G", "clang",
             "-F", " ".join(fc_flags),
-            "-E", cppflags,
-            "-e", f"{compile_only} {cppflags}",
+            "-E", eacsl_cppflags,
+            "-e", f"{compile_only} {eacsl_cppflags}",
             "-o", str(instrumented_c),
             "-O", str(out_bin),
         ]
@@ -399,6 +444,7 @@ def replay_artifact(binary: Path, artifact: Path, scratch: Path, timeout_s: int 
         writable=[scratch],
         timeout_s=timeout_s,
         limits=Limits(cpu_seconds=timeout_s * 2),
+        extra_env=SANITIZER_RUNTIME_ENV,
     )
     out = res.stdout + "\n" + res.stderr
     return {
@@ -444,7 +490,11 @@ def run_fuzz_campaign(
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     scratch = artifacts_dir.parent / f".scratch_{artifacts_dir.name}"
     scratch.mkdir(parents=True, exist_ok=True)
-    before = {p.name for p in artifacts_dir.iterdir()}
+    before_meta = {
+        p.name: (p.stat().st_mtime_ns, sha256_file(p))
+        for p in artifacts_dir.iterdir()
+        if p.is_file() and not p.is_symlink()
+    }
 
     cmd = [
         str(binary.resolve()),
@@ -464,13 +514,39 @@ def run_fuzz_campaign(
         writable=[scratch, corpus_dir, artifacts_dir],
         timeout_s=max_time + 180,
         limits=Limits(cpu_seconds=(max_time + 180) * 2),
+        extra_env=SANITIZER_RUNTIME_ENV,
     )
     combined_out = res.stdout + "\n" + res.stderr
+    written_names = {
+        Path(m.group("path").strip()).name
+        for m in _TEST_UNIT_WRITTEN_RE.finditer(combined_out)
+    }
+
+    all_artifact_files = [
+        p for p in sorted(artifacts_dir.iterdir())
+        if _artifact_kind(p.name) and p.is_file() and not p.is_symlink()
+    ]
+    selected_files: list[tuple[Path, bool]] = []
+    for p in all_artifact_files:
+        if p.name not in before_meta:
+            selected_files.append((p, False))
+        else:
+            old_mtime, old_sha = before_meta[p.name]
+            new_mtime = p.stat().st_mtime_ns
+            new_sha = sha256_file(p)
+            if new_mtime != old_mtime or new_sha != old_sha or p.name in written_names:
+                selected_files.append((p, False))
+
+    # If the fuzzer exited non-zero and hit an identical content-addressed crash artifact
+    # within the same filesystem timestamp granularity, collect existing artifacts rather
+    # than reporting fuzzer_error with an empty artifacts list.
+    if not selected_files and res.returncode != 0 and all_artifact_files:
+        selected_files = [(p, True) for p in all_artifact_files]
 
     artifacts: list[dict] = []
-    for p in sorted(artifacts_dir.iterdir()):
+    for p, pre_existing in selected_files:
         kind = _artifact_kind(p.name)
-        if not kind or p.name in before or p.is_symlink() or not p.is_file():
+        if not kind:
             continue
         entry = {
             "artifact": str(p),
@@ -481,6 +557,8 @@ def run_fuzz_campaign(
             "fingerprint": None,
             "reproducible": None,
         }
+        if pre_existing:
+            entry["pre_existing"] = True
         if kind in ("crash", "leak"):
             replay = replay_artifact(binary, p, scratch)
             failure = replay["failure"] or parse_runtime_failure(combined_out)
