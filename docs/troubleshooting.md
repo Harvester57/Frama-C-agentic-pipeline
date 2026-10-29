@@ -6,16 +6,25 @@ Common issues encountered when running Frama-C (`RTE`, `Eva`, `WP`, `E-ACSL`) an
 
 ## 1. Frama-C Kernel Parsing & Preprocessing Errors
 
-### Symptom: `[kernel] user error: syntax error` on GCC/Clang Intrinsics or System Headers
-- **Cause:** The target C file or its `-I` flags pulled in host `/usr/include` headers containing compiler-specific extensions (`__builtin_va_arg_pack`, inline assembly `__asm__`, or SIMD intrinsics) instead of Frama-C's standard library (`__fc_libc`).
+### Symptom: `[kernel] user error: syntax error` on GCC/Clang Intrinsics or System Headers (`_Float128`, etc.)
+- **Cause:** The target C file or its `-I` flags pulled in host `/usr/include` headers containing glibc/compiler-specific extensions (`_Float128`, `__builtin_va_arg_pack`, inline assembly `__asm__`, or SIMD intrinsics) instead of Frama-C's standard library (`__fc_libc`).
 - **Fix:**
-  1. Never pass `-I/usr/include` or `-I/usr/local/include` in `CPPFLAGS`. Let Frama-C use its default `__fc_libc` headers.
-  2. Ensure `-machdep gcc_x86_64` (already the default in `GNUmakefile.template`, `run_eva_slice.py`, and `run_wp_function.py`) is active so GNU C extensions supported by Frama-C are enabled.
-  3. Guard hardware inline assembly or unsupported compiler intrinsics with `#ifndef __FRAMAC__ ... #else ... #endif` in the `workspace/work/` shadow tree.
+  1. Never pass `-I/usr/include` or `-I/usr/local/include` in `CPPFLAGS`. `build_callgraph_dag.py` automatically strips host system include paths from `compile_commands.json` so Frama-C uses its portable `__fc_libc` headers.
+  2. If the target requires third-party system headers (e.g., `<bsd/string.h>`, `<openssl/evp.h>`), pass `--target-packages "<pkg>"` (`-TargetPackages` in PowerShell) to `framac-docker` so the real `-dev` package is installed in the container image.
+  3. Ensure `-machdep gcc_x86_64` (already the default in `GNUmakefile.template`, `run_eva_slice.py`, and `run_wp_function.py`) is active so GNU C extensions supported by Frama-C are enabled.
+  4. Guard hardware inline assembly or unsupported compiler intrinsics with `#ifndef __FRAMAC__ ... #else ... #endif` in the `workspace/work/` shadow tree.
+
+### Symptom: `[kernel:annot-error] unbound logic variable alse` or `orall`
+- **Cause:** An ACSL annotation containing `\false`, `\forall`, `\at`, or `\base_addr` was written through an unescaped Python or shell string, turning `\f` into ASCII `0x0c` (form-feed), `\a` into `0x07`, or `\b` into `0x08`.
+- **Fix:** Always use raw Python strings (`r"..."`) or file-editing tools when writing ACSL annotations. `acsl_ast.py` (`check-acsl-only`) automatically flags control characters (`\x07`, `\x08`, `\x0c`) inside ACSL comments.
 
 ---
 
 ## 2. E-ACSL + LibFuzzer Build & Runtime Issues
+
+### Symptom: `e-acsl-gcc` Fails on `__fc_libc/stdlib.h` (`\old(endptr)`) or Unknown Legacy Flag `--rte=`
+- **Cause:** Frama-C 33+ replaced legacy `e-acsl-gcc.sh` long flags (`--c-flags`, `--rte=all`) with `e-acsl-gcc` short flags (`-F`, `-G`, `-E`, `-e`, `-l`), and running `-rte` across all functions without `-rte-select` instruments unused `__fc_libc` inline functions such as `strtol`.
+- **Fix:** `run_eacsl_fuzz.py` and `GNUmakefile.template` automatically detect `e-acsl-gcc` vs `e-acsl-gcc.sh` and scope `-rte-select` and `-e-acsl-functions` to the functions defined in the target slice `.c` files. Full compiler diagnostics are saved to `<out-bin>.compile.log`. If `e-acsl-gcc` still fails in `campaign` mode, `--engine auto` falls back to native `clang -fsanitize=fuzzer,address,undefined`.
 
 ### Symptom: Linker or Shadow Memory Conflict When Combining E-ACSL with AddressSanitizer (`-fsanitize=address`)
 - **Cause:** E-ACSL embeds its own shadow-memory runtime (`rtl`) to track byte-level pointer validity (`\valid`), initialization (`\initialized`), and sub-object bounds. AddressSanitizer (`ASan`) also maps shadow memory and intercepts `malloc`/`free`. Running both in the same binary causes immediate `mmap` collisions or false aborts.

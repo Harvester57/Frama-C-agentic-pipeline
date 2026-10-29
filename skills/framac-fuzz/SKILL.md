@@ -40,12 +40,17 @@ Run one campaign per module slice (up to 8 concurrently). Each campaign writes o
 $env:PYTHONIOENCODING="utf-8"
 & "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
   -TargetDir "<target-dir>" -RunDir "<run-dir>" `
-  "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources workspace/work/src/<mod>/*.c workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --max-time <time> --cppflags '-Iworkspace/work/include -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json"
+  "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources workspace/work/src/<mod>/*.c workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --max-time <time> --engine auto --cppflags '-Iworkspace/work/include -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json"
 ```
+
+`run_eacsl_fuzz.py` supports `--engine {auto,eacsl,sanitizers}` (default `auto` in `campaign` mode):
+- It first invokes `e-acsl-gcc` (or legacy `e-acsl-gcc.sh`) with `-rte-select` and `-e-acsl-functions` scoped to the target slice functions so E-ACSL does not attempt to instrument Frama-C's internal `__fc_libc` helpers, and writes the full compiler transcript to `<out-bin>.compile.log`.
+- If `e-acsl-gcc` still fails on a target C construct and `--engine auto` is active, `campaign` mode automatically falls back to compiling a native Clang LibFuzzer + AddressSanitizer + UndefinedBehaviorSanitizer binary (`-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all`), parses ASan/UBSan runtime failures into the identical `failure` structure and `<file>#<function>::<kind>::<hash10>` fingerprint format, and records `"engine_used": "clang_sanitizers_fallback"` in `workspace/reports/fuzz/<mod>.json`.
+- Note: Phase 3 `/framac-wp` `guardrail` mode always uses E-ACSL (`compile_eacsl_binary`), because the guardrail's purpose is to execute candidate ACSL annotations against the corpus.
 
 The fuzzer, and every crash replay, runs inside `sandbox_exec.py` (read-only filesystem except the corpus/crash/scratch directories, no network, rlimits, timeout). If the report says `sandbox_unavailable`, stop and fix the container rather than running unsandboxed; `-AllowDegradedSandbox` is an explicit operator decision that is recorded.
 
-*(Never pass `-fsanitize=address` alongside E-ACSL's memory tracking runtime, as both intercept `malloc`/`free` and map conflicting shadow memory.)*
+*(Never pass `-fsanitize=address` alongside E-ACSL's memory tracking runtime in the same binary, as both intercept `malloc`/`free` and map conflicting shadow memory.)*
 
 ---
 
