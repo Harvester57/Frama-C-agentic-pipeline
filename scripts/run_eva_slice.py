@@ -44,6 +44,7 @@ from framac_common import (  # noqa: E402
     STATUS_VALID_UNDER_HYP,
     augment_framac_cppflags,
     read_report_csv,
+    scan_undeclared_functions,
 )
 
 
@@ -174,6 +175,8 @@ def run_eva_on_slice(
         "status": status,
         "returncode": proc.returncode,
         "error_summary": error_summary,
+        # Non-empty means Frama-C invented `int f()` prototypes: fix the stubs before trusting results.
+        "undeclared_functions": scan_undeclared_functions(combined_log),
         "main_fn": main_fn,
         "sources": list(sources),
         "total_properties": total_checked,
@@ -235,6 +238,7 @@ def main() -> int:
     print(json.dumps({
         "status": res["status"],
         "error_summary": res["error_summary"],
+        "undeclared_functions": res["undeclared_functions"],
         "valid_count": res["valid_count"],
         "unknown_count": res["unknown_count"],
         "invalid_count": res["invalid_count"],

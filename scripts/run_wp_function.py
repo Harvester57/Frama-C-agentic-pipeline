@@ -38,6 +38,7 @@ from framac_common import (  # noqa: E402
     STATUS_VALID_UNDER_HYP,
     augment_framac_cppflags,
     read_report_csv,
+    scan_undeclared_functions,
 )
 
 _LAYER_NAME_RE = re.compile(r"\bL([4-6])_[A-Za-z0-9_]+")
@@ -434,6 +435,8 @@ def run_wp_on_function(
         "unproven_count": len(unproven_goals),
         "dead_count": len(dead_goals),
         "soundness": soundness,
+        # Non-empty means Frama-C invented `int f()` prototypes: fix the stubs before trusting results.
+        "undeclared_functions": scan_undeclared_functions(combined_log),
         "by_obligation_class": by_class,
         "next_synthesis_focus": next_focus,
         "unproven_by_bucket": buckets,

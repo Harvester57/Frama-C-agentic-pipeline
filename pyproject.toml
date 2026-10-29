@@ -29,6 +29,7 @@ known-first-party = [
     "checkpoint",
     "conftest",
     "contract_negotiator",
+    "eacsl_toolchain",
     "fingerprint",
     "framac_common",
     "generate_harness",

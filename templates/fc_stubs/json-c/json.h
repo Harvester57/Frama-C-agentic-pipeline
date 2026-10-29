@@ -32,6 +32,14 @@ typedef enum json_type {
     json_type_string
 } json_type;
 
+/*
+ * Opaque handles are complete (single dummy member) because E-ACSL emits
+ * alignof/sizeof on pointed-to types. Target code must never dereference them;
+ * json-c allocates and owns the real objects.
+ */
+struct json_object { int _fc_opaque; };
+struct array_list { int _fc_opaque; };
+struct lh_table { int _fc_opaque; };
 typedef struct json_object json_object;
 typedef struct array_list array_list;
 typedef struct lh_table lh_table;
@@ -45,6 +53,7 @@ typedef struct lh_table lh_table;
 
 json_object *json_tokener_parse(const char *str);
 json_object *json_object_from_file(const char *filename);
+json_object *json_object_from_fd(int fd);
 int json_object_to_file(const char *filename, json_object *obj);
 int json_object_to_file_ext(const char *filename, json_object *obj, int flags);
 const char *json_object_to_json_string(json_object *obj);

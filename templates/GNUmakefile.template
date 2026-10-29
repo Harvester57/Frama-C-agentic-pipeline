@@ -71,6 +71,13 @@ $(TARGET).wp: $(TARGET).parse
 		-then -report -report-csv $@/wp_alarms.csv \
 		-save $@/framac_wp.sav
 
+# E-ACSL build. scripts/run_eacsl_fuzz.py is the supported path (argv normalization,
+# -rte-select retry, Variadic fallback objects, sanitizer fallback); this target mirrors
+# its two-stage contract: preprocessor flags go to the Frama-C frontend (-E) only, the
+# self-contained instrumented file is compiled with codegen flags only (-e), and the
+# instrumented executable is <out>.e-acsl. Use attached option forms in CPPFLAGS
+# (-Idir, -DX): e-acsl-gcc splits flag values on spaces and re-parses standalone
+# short options (a bare -g becomes --gmp).
 $(TARGET).eacsl: $(SOURCES)
 	@mkdir -p $@
 	@if echo "$(EACSL_GCC)" | grep -q '\.sh$$'; then \
@@ -78,7 +85,7 @@ $(TARGET).eacsl: $(SOURCES)
 			--compiler=clang \
 			--machdep=$(MACHDEP) \
 			--rte=all \
-			--cflag="-fsanitize=fuzzer -g -O1 -D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
+			--cflag="-fsanitize=fuzzer -gline-tables-only -O1 -D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
 			--ldflag="-fsanitize=fuzzer" \
 			-o $@/fuzz_runner \
 			-O $@/instrumented.c \
@@ -86,14 +93,23 @@ $(TARGET).eacsl: $(SOURCES)
 	else \
 		$(EACSL_GCC) \
 			-G clang \
-			-F "-rte -machdep $(MACHDEP)" \
-			-E "-D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
-			-e "-fsanitize=fuzzer -g -O1 -fcommon -D__FRAMAC_EACSL__ -D_Float128=double $(CPPFLAGS)" \
-			-l "-fsanitize=fuzzer" \
+			-F "-rte -machdep $(MACHDEP) -e-acsl-assert-print-data" \
+			-E "-D__FRAMAC_EACSL__ -D_Float128=double -I$(FC_STUBS) -include $(FC_STUBS)/fc_compat_types.h $(CPPFLAGS)" \
 			-o $@/instrumented.c \
+			$(SOURCES) && \
+		$(EACSL_GCC) \
+			-C \
+			-G clang \
+			-e "-fsanitize=fuzzer -gline-tables-only -O1 -fcommon" \
+			-l "-fsanitize=fuzzer" \
 			-O $@/fuzz_runner \
-			$(SOURCES); \
+			$@/instrumented.c; \
 	fi
+	@bin=$@/fuzz_runner; [ -f $@/fuzz_runner.e-acsl ] && bin=$@/fuzz_runner.e-acsl; \
+		if ! grep -q '__e_acsl_' "$$bin"; then \
+			echo "error: $$bin is not E-ACSL-instrumented" >&2; exit 1; \
+		fi; \
+		echo "E-ACSL binary: $$bin"
 
 $(TARGET).sarif: $(TARGET).eva
 	$(FRAMAC) -load $</framac.sav \

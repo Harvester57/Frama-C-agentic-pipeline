@@ -287,6 +287,18 @@ def _module_units(units: Dict[str, dict], module: str) -> List[dict]:
     return [u for u in units.values() if u["module"] == module and u["status"] not in NO_TOUCH]
 
 
+def fuzz_engine_note(report: dict) -> str:
+    """Human-readable engine qualifier for fuzz evidence (sanitizer fallback has narrower checks)."""
+    if report.get("engine_used") == "sanitizers":
+        reason = report.get("engine_fallback_reason")
+        suffix = f"; E-ACSL fallback reason: {reason}" if reason else ""
+        return (
+            "Clang ASan+UBSan + LibFuzzer (no E-ACSL contract checks, no intra-object bounds checks"
+            f"{suffix})"
+        )
+    return "E-ACSL + LibFuzzer"
+
+
 def cmd_ingest_fuzz(paths: List[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "candidates": 0}
@@ -297,12 +309,13 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
         module = report.get("module") or path.stem
         status = report.get("status", "unknown")
         mod_units = _module_units(units, module)
+        engine_note = fuzz_engine_note(report)
 
         if status == "clean":
             for u in mod_units:
                 add_evidence(
                     u, "fuzz", "run_eacsl_fuzz.py", "fuzz_clean", False, tool_output,
-                    "E-ACSL + LibFuzzer campaign found no failure (not a proof).",
+                    f"{engine_note} campaign found no failure (not a proof).",
                 )
             continue
         if status in ("compile_error", "fuzzer_error", "sandbox_unavailable"):
@@ -339,7 +352,7 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
                 for cid in linked:
                     add_evidence(
                         units[cid], "fuzz", "run_eacsl_fuzz.py", "fuzz_failure", False, tool_output,
-                        f"E-ACSL failure {failure.get('alarm_kind') or failure.get('kind')} at line {failure.get('line')}.",
+                        f"{engine_note} failure {failure.get('alarm_kind') or failure.get('kind')} at line {failure.get('line')}.",
                         {"artifact": artifact_rel, "reproducible": art.get("reproducible")},
                     )
                     mark_candidate(units[cid], fp)

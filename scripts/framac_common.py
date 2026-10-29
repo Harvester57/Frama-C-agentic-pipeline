@@ -213,3 +213,22 @@ def augment_framac_cppflags(cppflags: str) -> str:
     if "fc_compat_types.h" not in base and (fc_stubs / "fc_compat_types.h").is_file():
         parts.append(f"-include {compat_hdr}")
     return " ".join(parts)
+
+
+# Frama-C: "Calling undeclared function X. Old style K&R code?" (it then invents `int X()`,
+# which is unsound for Eva/WP). Clang: "call to undeclared function 'X'" /
+# "implicit declaration of function 'X'".
+_UNDECLARED_FN_RES = (
+    re.compile(r"Calling undeclared function\s+'?(?P<fn>[A-Za-z_]\w*)'?"),
+    re.compile(r"call to undeclared (?:library )?function '(?P<fn>[A-Za-z_]\w*)'"),
+    re.compile(r"implicit declaration of function '(?P<fn>[A-Za-z_]\w*)'"),
+)
+
+
+def scan_undeclared_functions(log_text: str) -> list[str]:
+    """Functions called without a prototype (missing stub/header declaration), sorted and unique."""
+    found: set[str] = set()
+    for rx in _UNDECLARED_FN_RES:
+        for m in rx.finditer(log_text or ""):
+            found.add(m.group("fn"))
+    return sorted(found)

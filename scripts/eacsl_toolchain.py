@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+E-ACSL toolchain contract helpers used by run_eacsl_fuzz.py.
+
+`e-acsl-gcc` (Frama-C 33+) splits the values of `-e`, `-E`, `-F` and `-l` on
+whitespace and re-parses the resulting tokens, so a standalone `-g` inside
+`-e` silently becomes `--gmp` (`-e-acsl-gmp-only`), and paths containing
+spaces break. This module enforces the invocation contract:
+
+  - `normalize_passthrough()` joins separated short options (`-I dir` ->
+    `-Idir`), rewrites `-g` to `-gline-tables-only`, and rejects any other
+    standalone single-letter token or whitespace-containing token;
+  - `build_eacsl_flag_sets()` keeps preprocessor flags (`-I`, `-D`, `-include`,
+    fc_stubs) on the Frama-C frontend only, and gives the backend compile of
+    the self-contained instrumented C file codegen flags only;
+  - `select_eacsl_binary()` / `is_eacsl_instrumented()` guarantee that a run
+    labelled `engine=eacsl` actually executes an E-ACSL-instrumented binary;
+  - `find_variadic_fallbacks()` / `generate_fallback_source()` define the
+    `<fn>_fallback_<N>` symbols the Variadic translation emits for variadic
+    calls without a libc specification, in a link-only object that never
+    enters the instrumented sources (so the fallback numbering stays stable).
+"""
+
+from __future__ import annotations
+
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from framac_common import resolve_fc_stubs_dir  # noqa: E402
+
+EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double")
+EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon")
+EACSL_FC_EXTRA_FLAGS = ("-e-acsl-assert-print-data",)
+EACSL_BINARY_MARKERS = (b"__e_acsl_", b"eacsl_assert")
+
+_JOINABLE_SHORT = frozenset({"-I", "-D", "-U", "-L", "-l"})
+_SEPARATE_PREPROCESSOR = frozenset({"-I", "-D", "-U", "-include", "-imacros", "-isystem", "-idirafter", "-iquote"})
+_JOINED_PREPROCESSOR = ("-I", "-D", "-U", "-isystem", "-idirafter", "-iquote")
+# Force-includes must never reach the backend compile: the instrumented file is
+# self-contained and re-including headers redefines its typedefs.
+_FORCE_INCLUDE = frozenset({"-include", "-imacros"})
+
+
+class UnsafePassthroughError(ValueError):
+    """A flag value would be misinterpreted by e-acsl-gcc's whitespace re-parsing."""
+
+
+def normalize_passthrough(value: str) -> str:
+    """Make a flag string safe for e-acsl-gcc's whitespace splitting, or raise UnsafePassthroughError."""
+    try:
+        tokens = shlex.split(value or "", posix=True)
+    except ValueError as exc:
+        raise UnsafePassthroughError(f"unparseable flag string {value!r}: {exc}") from exc
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok or any(c.isspace() for c in tok):
+            raise UnsafePassthroughError(
+                f"token {tok!r} contains whitespace; e-acsl-gcc splits flag values on spaces (move the path to one without spaces)"
+            )
+        if tok in _JOINABLE_SHORT:
+            if i + 1 >= len(tokens):
+                raise UnsafePassthroughError(f"option {tok!r} is missing its argument")
+            arg = tokens[i + 1]
+            if not arg or any(c.isspace() for c in arg):
+                raise UnsafePassthroughError(
+                    f"argument {arg!r} of {tok} contains whitespace; e-acsl-gcc splits flag values on spaces"
+                )
+            out.append(tok + arg)
+            i += 2
+            continue
+        if tok == "-g":
+            out.append("-gline-tables-only")
+            i += 1
+            continue
+        if re.fullmatch(r"-[A-Za-z]", tok):
+            raise UnsafePassthroughError(
+                f"standalone short option {tok!r} would be re-parsed by e-acsl-gcc as one of its own options"
+            )
+        out.append(tok)
+        i += 1
+    return " ".join(out)
+
+
+def split_preprocessor_flags(flags: str) -> tuple[list[str], list[str], list[str]]:
+    """Return (preprocessor_flags, force_include_flags, other_flags) from a flag string."""
+    tokens = shlex.split(flags or "", posix=True)
+    pre: list[str] = []
+    forced: list[str] = []
+    other: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _SEPARATE_PREPROCESSOR and i + 1 < len(tokens):
+            (forced if tok in _FORCE_INCLUDE else pre).extend([tok, tokens[i + 1]])
+            i += 2
+            continue
+        if tok.startswith(_JOINED_PREPROCESSOR) or tok == "-nostdinc":
+            pre.append(tok)
+        else:
+            other.append(tok)
+        i += 1
+    return pre, forced, other
+
+
+def build_eacsl_flag_sets(cppflags: str, fuzzer: bool = True, fc_stubs: Path | None | str = "auto") -> dict[str, str]:
+    """
+    frontend: passed to `-E` (Frama-C preprocessing of the original sources).
+    backend:  passed to `-e` (Clang compile of the self-contained instrumented file).
+    """
+    stubs = resolve_fc_stubs_dir() if fc_stubs == "auto" else (Path(fc_stubs) if fc_stubs else None)
+    pre, forced, other = split_preprocessor_flags(cppflags)
+    joined_user = " ".join(pre + forced)
+    front: list[str] = list(EACSL_DEFINES)
+    if stubs is not None:
+        stubs_posix = Path(stubs).as_posix()
+        if f"-I{stubs_posix}" not in joined_user:
+            front.append(f"-I{stubs_posix}")
+        if "fc_compat_types.h" not in joined_user:
+            front.extend(["-include", f"{stubs_posix}/fc_compat_types.h"])
+    front.extend(pre)
+    front.extend(forced)
+    front.extend(t for t in other if t.startswith("-std="))
+    backend: list[str] = (["-fsanitize=fuzzer"] if fuzzer else []) + list(EACSL_CODEGEN_FLAGS) + other
+    return {
+        "frontend": normalize_passthrough(shlex.join(front)),
+        "backend": normalize_passthrough(shlex.join(backend)),
+    }
+
+
+def is_eacsl_instrumented(path: Path) -> bool:
+    """True if the binary contains E-ACSL runtime/instrumentation symbols."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    return any(marker in data for marker in EACSL_BINARY_MARKERS)
+
+
+def select_eacsl_binary(out_bin: Path) -> Path:
+    """e-acsl-gcc writes the instrumented executable to `<out>.e-acsl`; prefer it when present."""
+    out_bin = Path(out_bin)
+    instrumented = out_bin.with_name(out_bin.name + ".e-acsl")
+    return instrumented if instrumented.is_file() else out_bin
+
+
+# ---------------------------------------------------------------------------
+# -rte-select / -e-acsl-functions robustness
+# ---------------------------------------------------------------------------
+
+_NO_FUNCTION_RES = (
+    re.compile(r"no function '(?P<fn>[A-Za-z_]\w*)'"),
+    re.compile(r"function '(?P<fn>[A-Za-z_]\w*)' (?:does not exist|not found|is unknown)"),
+    re.compile(r"[Uu]nknown function '(?P<fn>[A-Za-z_]\w*)'"),
+)
+
+
+def parse_missing_functions(log: str) -> list[str]:
+    found: list[str] = []
+    for rx in _NO_FUNCTION_RES:
+        for m in rx.finditer(log or ""):
+            if m.group("fn") not in found:
+                found.append(m.group("fn"))
+    return found
+
+
+_LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?\d+\s+"(?P<file>[^"]+)"')
+
+
+def filter_preprocessed_to_file(preprocessed: str, source: Path) -> str:
+    """Keep only the lines of `clang -E` output that originate from `source` (blank out the rest, keep line count)."""
+    target_name = Path(source).name
+    target_resolved = str(Path(source).resolve()).replace("\\", "/")
+    keep = False
+    out: list[str] = []
+    for line in preprocessed.splitlines():
+        m = _LINE_MARKER_RE.match(line)
+        if m:
+            marker = m.group("file").replace("\\", "/")
+            keep = marker == target_resolved or marker.endswith("/" + target_name) or marker == target_name
+            out.append("")
+            continue
+        out.append(line if keep else "")
+    return "\n".join(out)
+
+
+def preprocess_source(source: Path, cppflags: str, runner: Callable[..., Any] = subprocess.run, clang: str | None = None) -> str | None:
+    exe = clang or shutil.which("clang")
+    if not exe:
+        return None
+    pre, forced, _ = split_preprocessor_flags(cppflags)
+    cmd = [exe, "-E", "-x", "c", *EACSL_DEFINES, *pre, *forced, str(source)]
+    try:
+        proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return filter_preprocessed_to_file(proc.stdout or "", source)
+
+
+# ---------------------------------------------------------------------------
+# Variadic `<fn>_fallback_<N>` link-only definitions
+# ---------------------------------------------------------------------------
+
+FALLBACK_HEADER_MAP: dict[str, tuple[str, ...]] = {
+    "open": ("fcntl.h",),
+    "openat": ("fcntl.h",),
+    "fcntl": ("fcntl.h",),
+    "ioctl": ("sys/ioctl.h",),
+    "prctl": ("sys/prctl.h",),
+    "execl": ("unistd.h",),
+    "execlp": ("unistd.h",),
+    "execle": ("unistd.h",),
+    "printf": ("stdio.h",),
+    "fprintf": ("stdio.h",),
+    "dprintf": ("stdio.h",),
+    "sprintf": ("stdio.h",),
+    "snprintf": ("stdio.h",),
+    "scanf": ("stdio.h",),
+    "fscanf": ("stdio.h",),
+    "sscanf": ("stdio.h",),
+    "syslog": ("syslog.h",),
+}
+
+_FALLBACK_UNDEFINED_RE = re.compile(r"undefined reference to [`'\"](?P<name>[A-Za-z_]\w*_fallback_\d+)['\"]")
+_FALLBACK_PROTO_RE = re.compile(
+    r"(?P<ret>(?:[A-Za-z_]\w*[\s\*]+)+?)(?P<name>(?P<base>[A-Za-z_]\w*?)_fallback_(?P<idx>\d+))\s*\((?P<params>[^;{}()]*)\)\s*(?P<end>[;{])"
+)
+_C_TYPE_WORDS = frozenset({
+    "const", "volatile", "restrict", "unsigned", "signed", "char", "short", "int", "long",
+    "float", "double", "void", "struct", "union", "enum", "_Bool",
+})
+_STATEMENT_WORDS = frozenset({"return", "else", "do", "case", "goto", "sizeof"})
+
+
+def parse_undefined_fallbacks(link_log: str) -> list[str]:
+    names: list[str] = []
+    for m in _FALLBACK_UNDEFINED_RE.finditer(link_log or ""):
+        if m.group("name") not in names:
+            names.append(m.group("name"))
+    return names
+
+
+def _split_params(params: str) -> list[str]:
+    parts = [p.strip() for p in params.split(",")]
+    return [p for p in parts if p]
+
+
+def _name_params(params: list[str]) -> tuple[list[str], list[str]] | None:
+    """Return (declarations_with_names, argument_names), or None if a parameter cannot be handled."""
+    if params == ["void"] or not params:
+        return [], []
+    decls: list[str] = []
+    names: list[str] = []
+    for i, p in enumerate(params):
+        if p == "..." or "(" in p or "[" in p:
+            return None
+        words = re.findall(r"[A-Za-z_]\w*", p)
+        last = words[-1] if words else ""
+        named = len(words) >= 2 and last not in _C_TYPE_WORDS and not p.rstrip().endswith("*")
+        if named:
+            decls.append(p)
+            names.append(last)
+        else:
+            arg = f"a{i}"
+            decls.append(f"{p} {arg}")
+            names.append(arg)
+    return decls, names
+
+
+def find_variadic_fallbacks(instrumented_source: str) -> list[dict[str, Any]]:
+    """Fallback prototypes declared but not defined in the instrumented source."""
+    declared: dict[str, dict[str, Any]] = {}
+    defined: set[str] = set()
+    for m in _FALLBACK_PROTO_RE.finditer(instrumented_source or ""):
+        name = m.group("name")
+        if m.group("end") == "{":
+            defined.add(name)
+            continue
+        ret = " ".join(m.group("ret").split())
+        ret = re.sub(r"^(?:extern|static|inline)\s+", "", ret)
+        if set(re.findall(r"[A-Za-z_]\w*", ret)) & _STATEMENT_WORDS:
+            continue  # a call statement such as `return open_fallback_1(a, b, c);`
+        declared.setdefault(name, {
+            "name": name,
+            "base": m.group("base"),
+            "index": int(m.group("idx")),
+            "ret": ret,
+            "params": _split_params(m.group("params")),
+        })
+    return [d for n, d in sorted(declared.items(), key=lambda kv: (kv[1]["base"], kv[1]["index"])) if n not in defined]
+
+
+def _enosys_body(fb: dict[str, Any]) -> str:
+    ret = fb.get("ret") or "int"
+    if ret.strip() == "void":
+        return f"void {fb['name']}() {{ errno = ENOSYS; }}\n"
+    if "*" in ret:
+        return f"void *{fb['name']}() {{ errno = ENOSYS; return 0; }}\n"
+    return f"long {fb['name']}() {{ errno = ENOSYS; return -1; }}\n"
+
+
+def generate_fallback_source(fallbacks: list[dict[str, Any]], force_enosys: bool = False) -> tuple[str, list[dict[str, str]]]:
+    """
+    Emit C definitions for the fallbacks: forward to the real libc function when the base
+    is known and the signature is parseable, otherwise set errno=ENOSYS and fail.
+    Returns (source_text, records) where records = [{name, base, mode}].
+    """
+    headers: list[str] = ["errno.h", "sys/types.h", "stddef.h", "stdint.h"]
+    bodies: list[str] = []
+    records: list[dict[str, str]] = []
+    for fb in fallbacks:
+        mode = "enosys"
+        named = None if force_enosys else _name_params(fb.get("params") or [])
+        base_headers = FALLBACK_HEADER_MAP.get(fb["base"])
+        if base_headers and named is not None:
+            decls, args = named
+            for h in base_headers:
+                if h not in headers:
+                    headers.append(h)
+            ret = fb.get("ret") or "int"
+            call = f"{fb['base']}({', '.join(args)})"
+            stmt = f"{call};" if ret.strip() == "void" else f"return {call};"
+            bodies.append(f"{ret} {fb['name']}({', '.join(decls) or 'void'}) {{ {stmt} }}\n")
+            mode = "forward"
+        else:
+            bodies.append(_enosys_body(fb))
+        records.append({"name": fb["name"], "base": fb["base"], "mode": mode})
+    text = (
+        "/* Generated by run_eacsl_fuzz.py: link-only definitions for Variadic fallbacks.\n"
+        " * Never add this file to the instrumented sources (it would shift the fallback numbering). */\n"
+        "#define _GNU_SOURCE 1\n"
+        + "".join(f"#include <{h}>\n" for h in headers)
+        + "\n"
+        + "".join(bodies)
+    )
+    return text, records
+
+
+def build_fallback_object(
+    instrumented_c: Path,
+    out_dir: Path,
+    runner: Callable[..., Any] = subprocess.run,
+    compiler: str = "clang",
+) -> dict[str, Any]:
+    """Generate and compile `eacsl_fallbacks.o` next to the binary. Falls back to ENOSYS-only stubs if forwarding fails to compile."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        text = Path(instrumented_c).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"status": "error", "reason": f"cannot read instrumented source: {exc}", "fallbacks": []}
+    fallbacks = find_variadic_fallbacks(text)
+    if not fallbacks:
+        return {"status": "none", "fallbacks": []}
+    src = out_dir / "eacsl_fallbacks.c"
+    obj = out_dir / "eacsl_fallbacks.o"
+    last_err = ""
+    for force_enosys in (False, True):
+        source, records = generate_fallback_source(fallbacks, force_enosys=force_enosys)
+        src.write_text(source, encoding="utf-8")
+        cmd = [compiler, "-c", "-O1", "-w", "-std=gnu17", str(src), "-o", str(obj)]
+        try:
+            proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            rc, last_err = proc.returncode, (proc.stderr or "")[-4000:]
+        except OSError as exc:
+            rc, last_err = 127, str(exc)
+        if rc == 0:
+            return {"status": "built", "object": str(obj), "source": str(src), "fallbacks": records}
+    return {"status": "error", "reason": f"fallback object failed to compile: {last_err}", "fallbacks": []}
