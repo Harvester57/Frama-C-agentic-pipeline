@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from framac_common import atomic_write_json, load_agent_result_json, load_json_optional, utc_now  # noqa: E402
 
 
 def load_ledger(path: Path) -> dict:
@@ -60,6 +60,81 @@ def cmd_request(
     return entry
 
 
+def _infer_callee_file(
+    callee_fn: str,
+    header_file: str,
+    coverage_ledger_path: Path,
+    dag_path: Path,
+) -> str:
+    cov = load_json_optional(coverage_ledger_path, [])
+    if isinstance(cov, list):
+        for u in cov:
+            if isinstance(u, dict) and u.get("function") == callee_fn and u.get("file"):
+                return str(u["file"])
+    dag = load_json_optional(dag_path, {})
+    if isinstance(dag, dict):
+        fmeta = (dag.get("functions") or {}).get(callee_fn)
+        if isinstance(fmeta, dict) and fmeta.get("file"):
+            return str(fmeta["file"])
+    return Path(header_file).with_suffix(".c").as_posix()
+
+
+def cmd_ingest_prover(
+    ledger_path: Path,
+    result_path: Path,
+    coverage_ledger_path: Path = Path("coverage-ledger.json"),
+    dag_path: Path = Path("workspace/reports/callgraph_dag.json"),
+) -> dict:
+    """
+    Ingest `strengthening_requests` from a prover's `result.json`, inferring `callee_file`
+    from `coverage-ledger.json` or `callgraph_dag.json` when omitted, and deduplicating
+    identical `(caller_function, callee_function, needed_clause)` requests.
+    """
+    res = load_agent_result_json(result_path)
+    caller_fn = str(res.get("function") or "")
+    raw_reqs = res.get("strengthening_requests") or []
+    ledger = load_ledger(ledger_path)
+    existing_keys = {
+        (r.get("caller_function"), r.get("callee_function"), r.get("needed_clause"))
+        for r in ledger.get("requests", [])
+    }
+
+    added: list[dict] = []
+    skipped = 0
+    for item in raw_reqs:
+        callee_fn = str(item.get("callee") or "")
+        header_file = str(item.get("header_file") or "")
+        needed_clause = str(item.get("needed_clause") or "")
+        reason = str(item.get("reason") or "")
+        if not (caller_fn and callee_fn and header_file and needed_clause):
+            continue
+        key = (caller_fn, callee_fn, needed_clause)
+        if key in existing_keys:
+            skipped += 1
+            continue
+        callee_file = item.get("callee_file") or _infer_callee_file(
+            callee_fn, header_file, coverage_ledger_path, dag_path
+        )
+        entry = cmd_request(
+            ledger_path=ledger_path,
+            caller_fn=caller_fn,
+            callee_fn=callee_fn,
+            callee_file=str(callee_file),
+            header_file=header_file,
+            needed_clause=needed_clause,
+            reason=reason,
+        )
+        existing_keys.add(key)
+        added.append(entry)
+
+    return {
+        "caller_function": caller_fn,
+        "added_count": len(added),
+        "added_requests": added,
+        "skipped_duplicates": skipped,
+    }
+
+
 def cmd_list(ledger_path: Path, status_filter: str | None = None, callee_filter: str | None = None) -> dict:
     ledger = load_ledger(ledger_path)
     reqs = ledger.get("requests", [])
@@ -99,6 +174,11 @@ def main(argv: list[str] | None = None) -> int:
     p_req.add_argument("--needed-clause", required=True, help="e.g. 'ensures \\result <= max_len;'")
     p_req.add_argument("--reason", required=True)
 
+    p_ing = sub.add_parser("ingest-prover")
+    p_ing.add_argument("result", type=Path)
+    p_ing.add_argument("--coverage-ledger", type=Path, default=Path("coverage-ledger.json"))
+    p_ing.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
+
     p_list = sub.add_parser("list")
     p_list.add_argument("--status", default=None, choices=["pending", "verified_and_applied", "rejected_by_callee"])
     p_list.add_argument("--callee", default=None)
@@ -119,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             args.needed_clause,
             args.reason,
         )
+    elif args.cmd == "ingest-prover":
+        res = cmd_ingest_prover(args.ledger, args.result, args.coverage_ledger, args.dag)
     elif args.cmd == "list":
         res = cmd_list(args.ledger, args.status, args.callee)
     elif args.cmd == "resolve":
@@ -132,3 +214,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -103,6 +103,66 @@ def load_json_optional(path: Path, default):
     return load_json_strict(path)
 
 
+_UNESCAPED_ACSL_IN_JSON_RE = re.compile(
+    r"(?<!\\)\\("
+    r"valid_read|valid_function|valid|separated|result|old|initialized|at|"
+    r"forall|exists|lambda|let|null|true|false|base_addr|block_length|offset|"
+    r"allocation|freeable|fresh|subset|empty|union|inter|is_NaN|is_finite|"
+    r"tainted|nothing|exact|round_error"
+    r")\b"
+)
+_INVALID_JSON_ESCAPE_RE = re.compile(r'(?<!\\)\\(?![/\"\\bfnrtu])')
+_CTRL_ACSL_SUBS = (
+    (re.compile(r"(?:\x07|(?<!\\)\\u0007)(?=t\b)"), r"\\a"),
+    (re.compile(r"(?:\x08|(?<!\\)\\u0008)(?=(?:ase_addr|lock_length)\b)"), r"\\b"),
+    (re.compile(r"(?:\x0b|(?<!\\)\\u000[bB])(?=alid(?:_read|_function)?\b)"), r"\\v"),
+    (re.compile(r"(?:\x0c|(?<!\\)\\u000[cC])(?=(?:orall|alse|reeable|resh)\b)"), r"\\f"),
+)
+
+
+def repair_acsl_json_text(raw: str) -> tuple[str, bool]:
+    """
+    Repair unescaped ACSL backslash keywords (e.g. `\\valid`, `\\forall`, `\\false`, `\\at`)
+    and control-character-corrupted ACSL keywords inside raw JSON text.
+    """
+    repaired = raw
+    for rx, repl in _CTRL_ACSL_SUBS:
+        repaired = rx.sub(repl, repaired)
+    repaired = _UNESCAPED_ACSL_IN_JSON_RE.sub(r"\\\\\1", repaired)
+    repaired = _INVALID_JSON_ESCAPE_RE.sub(r"\\\\", repaired)
+    return repaired, (repaired != raw)
+
+
+def load_agent_result_json(path: Path, max_bytes: int = 64 * 1024 * 1024) -> dict:
+    """
+    Load an agent result JSON file, repairing unescaped ACSL backslashes (`\\valid`,
+    `\\forall`, `\\false`, `\\at`, etc.) if present and persisting the sanitized JSON.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ArtifactError(f"missing artifact: {path}")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ArtifactError(f"artifact exceeds {max_bytes} bytes: {path}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ArtifactError(f"malformed UTF-8 in {path}: {exc}") from exc
+
+    repaired_raw, changed = repair_acsl_json_text(raw)
+    try:
+        data = json.loads(repaired_raw)
+    except json.JSONDecodeError as exc:
+        raise ArtifactError(f"malformed JSON in {path}: {exc}") from exc
+
+    if changed and isinstance(data, dict):
+        try:
+            atomic_write_json(path, data)
+        except OSError:
+            pass
+    return data
+
+
 # Frama-C `-report-csv` header: directory, file, line, function, property kind,
 # status, property. Older scripts assumed "kind"/"annotation"; accept all.
 _CSV_ALIASES = {

@@ -30,8 +30,16 @@ from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
-from framac_common import ArtifactError, atomic_write_json, load_json_optional, load_json_strict, utc_now  # noqa: E402
+from framac_common import (  # noqa: E402
+    ArtifactError,
+    atomic_write_json,
+    load_agent_result_json,
+    load_json_optional,
+    load_json_strict,
+    utc_now,
+)
 from promote_artifact import PromotionError, promote_file, promote_seeds  # noqa: E402
 from run_wp_function import goal_obligation_class  # noqa: E402
 from validate_artifacts import (  # noqa: E402
@@ -113,6 +121,22 @@ def commit(
     atomic_write_json(CANDIDATES, cands)
     if recs is not None:
         atomic_write_json(FINDINGS, recs)
+
+    # Workstream 5: Auto-transition run-metadata.json from "complete" to "in_progress"
+    # whenever an unverified candidate or an active planned/in_progress unit exists.
+    has_unverified_cand = any(c.get("status") == "unverified" for c in cands)
+    has_open_unit = any(u.get("status") in ("planned", "in_progress") for u in ledger)
+    if has_unverified_cand or has_open_unit:
+        meta_path = (run_dir or Path.cwd()) / "run-metadata.json"
+        if meta_path.is_file():
+            try:
+                meta = load_json_strict(meta_path)
+                if isinstance(meta, dict) and meta.get("run_status") == "complete":
+                    meta["run_status"] = "in_progress"
+                    meta["incomplete_reason"] = None
+                    atomic_write_json(meta_path, meta)
+            except ArtifactError:
+                pass
 
 
 def add_evidence(
@@ -582,10 +606,11 @@ def _infer_module_for_function(units: Dict[str, dict], file: str, function: str)
 
 def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None) -> dict:
     """
-    Promote breaker seeds (if any) and record a prover/breaker fault_hypothesis
+    Promote breaker seeds (if any), record prover strengthening_requests into
+    contract_negotiator, and record a prover/breaker fault_hypothesis
     as an unverified candidate in candidates.json.
     """
-    res = load_json_strict(result_path)
+    res = load_agent_result_json(result_path)
     errs = validate_agent_result(res)
     if errs:
         raise LedgerError("invalid agent-result:\n  " + "\n  ".join(errs[:20]))
@@ -604,6 +629,14 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None)
     if role == "breaker" and res.get("seeds"):
         prom = promote_seeds(Path.cwd(), aid, mod, list(res["seeds"]))
         seeds_promoted = list(prom["promoted"])
+
+    strengthening_requests_added = 0
+    if role == "prover" and res.get("strengthening_requests"):
+        neg_res = cmd_ingest_prover(
+            Path("workspace/reports/strengthen_requests.json"),
+            result_path,
+        )
+        strengthening_requests_added = int(neg_res.get("added_count", 0))
 
     candidates_added = 0
     fh = res.get("fault_hypothesis")
@@ -651,6 +684,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None)
         "role": role,
         "seeds_promoted": seeds_promoted,
         "candidates_added": candidates_added,
+        "strengthening_requests_added": strengthening_requests_added,
     }
 
 
@@ -701,7 +735,7 @@ def cmd_ingest_verifier(
     findings.json and candidates.json, and transitioning coverage-ledger.json units.
     """
     run_dir = Path.cwd().resolve()
-    res = load_json_strict(result_path)
+    res = load_agent_result_json(result_path)
     errs = validate_agent_result(res)
     if errs:
         raise LedgerError("invalid crash_verifier result:\n  " + "\n  ".join(errs[:25]))

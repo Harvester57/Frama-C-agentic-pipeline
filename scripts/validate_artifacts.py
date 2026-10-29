@@ -27,7 +27,13 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import ArtifactError, is_safe_agent_id, is_safe_relative_path, load_json_strict  # noqa: E402
+from framac_common import (  # noqa: E402
+    ArtifactError,
+    is_safe_agent_id,
+    is_safe_relative_path,
+    load_agent_result_json,
+    load_json_strict,
+)
 from fingerprint import is_valid_fingerprint  # noqa: E402
 from minischema import MAX_ERRORS, Validator, load_schema  # noqa: E402
 
@@ -283,6 +289,10 @@ def validate_agent_result(data) -> Errors:
             errors.add("$.unproven_goals: required when the proof did not complete")
         for idx, ev in enumerate(data["evidence"]):
             _path_ok(errors, f"$.evidence[{idx}].tool_output", ev["tool_output"])
+        for idx, req in enumerate(data.get("strengthening_requests") or []):
+            _path_ok(errors, f"$.strengthening_requests[{idx}].header_file", req.get("header_file"))
+            if req.get("callee_file") is not None:
+                _path_ok(errors, f"$.strengthening_requests[{idx}].callee_file", req.get("callee_file"))
     elif role == "breaker":
         for idx, seed in enumerate(data["seeds"]):
             _under_agent_dir(errors, f"$.seeds[{idx}]", aid, seed)
@@ -401,6 +411,9 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "run-dir":
             return _emit(validate_run_dir(args.path))
+        if args.cmd == "agent-result":
+            data = load_agent_result_json(args.path)
+            return _emit(validate_agent_result(data))
         data = load_json_strict(args.path)
         if args.cmd == "findings":
             return _emit(validate_findings(data, args.run_dir))
@@ -408,9 +421,7 @@ def main(argv=None) -> int:
             return _emit(validate_ledger(data, args.run_dir))
         if args.cmd == "candidates":
             return _emit(validate_candidates(data))
-        if args.cmd == "metadata":
-            return _emit(validate_metadata(data))
-        return _emit(validate_agent_result(data))
+        return _emit(validate_metadata(data))
     except ArtifactError as exc:
         print(json.dumps({"ok": False, "error_count": 1, "errors": [str(exc)]}, indent=2))
         return 2

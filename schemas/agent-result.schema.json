@@ -41,13 +41,14 @@
         "status": {"type": "string", "enum": ["all_proven", "stalled_after_k_retries", "blocked"]},
         "patch": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
         "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/evidence_item"}},
-        "unproven_goals": {"type": "array", "items": {"type": "object"}},
+        "unproven_goals": {"type": "array", "items": {"anyOf": [{"type": "object"}, {"$ref": "#/definitions/text"}]}},
         "strengthening_requests": {
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
               "callee": {"$ref": "#/definitions/text"},
+              "callee_file": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
               "header_file": {"$ref": "#/definitions/relpath"},
               "needed_clause": {"$ref": "#/definitions/text"},
               "reason": {"$ref": "#/definitions/text"}
