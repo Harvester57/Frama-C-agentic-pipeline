@@ -103,11 +103,22 @@ def goal_obligation_class(item: dict) -> str:
     return "rte"
 
 
+_BITWISE_GOAL_RE = re.compile(
+    r"\b(?:shift|lsr|lsl|land|lor|lxor|bit_test|bw_)\b|(?:<<|>>|\^|~\s*[A-Za-z0-9_(])",
+    re.IGNORECASE,
+)
+_BITWISE_LOG_RE = re.compile(
+    r"\b(?:lsr|lsl|land|lor|lxor|bit_test|shift_left|shift_right|rte_shift)\b",
+    re.IGNORECASE,
+)
+
+
 def scan_wp_log_soundness(
     log_text: str,
     check_memory_model: bool = True,
     unsigned_reduced: bool = False,
     warn_invalid_pointer: bool = True,
+    warn_unsigned_downcast: bool = True,
 ) -> dict:
     """
     Scan Frama-C WP log output for Tier-A aborts, Tier-B silent unsoundness,
@@ -141,6 +152,8 @@ def scan_wp_log_soundness(
     reduced_checks: List[str] = []
     if unsigned_reduced:
         reduced_checks.append("-warn-unsigned-overflow / -warn-unsigned-downcast OFF")
+    elif not warn_unsigned_downcast:
+        reduced_checks.append("-no-warn-unsigned-downcast")
     if not warn_invalid_pointer:
         reduced_checks.append("-warn-invalid-pointer OFF")
 
@@ -208,6 +221,16 @@ def classify_unproven_goal(row: dict) -> str:
     return "step_c_contract_postcondition"
 
 
+def _has_bitwise_unproven_goals(unproven_goals: List[dict], combined_log: str) -> bool:
+    for g in unproven_goals:
+        text = f"{g.get('kind') or ''} {g.get('annotation') or ''}"
+        if _BITWISE_GOAL_RE.search(text):
+            return True
+    if _BITWISE_LOG_RE.search(combined_log):
+        return True
+    return False
+
+
 def run_wp_on_function(
     c_file: Path,
     fn_name: str,
@@ -222,6 +245,8 @@ def run_wp_on_function(
     check_memory_model: bool = True,
     warn_invalid_pointer: bool = True,
     unsigned_reduced: bool = False,
+    warn_unsigned_downcast: bool = True,
+    retry_bitwise: bool = True,
     smoke_tests: bool = False,
     prop: Optional[str] = None,
     dump_goal: bool = False,
@@ -261,7 +286,9 @@ def run_wp_on_function(
     if warn_invalid_pointer:
         cmd.append("-warn-invalid-pointer")
     if not unsigned_reduced:
-        cmd.extend(["-warn-unsigned-overflow", "-warn-unsigned-downcast"])
+        cmd.append("-warn-unsigned-overflow")
+        if warn_unsigned_downcast:
+            cmd.append("-warn-unsigned-downcast")
 
     cmd.extend([
         f"-cpp-extra-args={effective_cppflags}",
@@ -310,6 +337,7 @@ def run_wp_on_function(
         check_memory_model=check_memory_model,
         unsigned_reduced=unsigned_reduced,
         warn_invalid_pointer=warn_invalid_pointer,
+        warn_unsigned_downcast=warn_unsigned_downcast,
     )
     goal_dumps = extract_vc_goal_dumps(combined_log) if dump_goal else []
 
@@ -370,11 +398,14 @@ def run_wp_on_function(
                 # Under -warn-invalid-pointer, loading a function pointer from memory yields a
                 # Degenerated \valid_function goal that WP cannot prove; count it as an explicit assumption.
                 annot_low = (item.get("annotation") or "").lower()
+                kind_low = (item.get("kind") or "").lower()
                 if fpv_assumed_count > 0 and ("\\valid_function" in annot_low or "pointer_value" in annot_low):
                     under_hyp_goals.append(item)
                     counts["proven_under_hyp"] += 1
                     continue
-                if not row_fn or "lemma" in (item.get("kind") or "").lower():
+                if "unsigned_downcast" in kind_low or "unsigned_downcast" in annot_low:
+                    item["c11_modulo_candidate"] = True
+                if not row_fn or "lemma" in kind_low:
                     unproven_lemmas.append(item)
                 bkey = classify_unproven_goal(item)
                 item["diagnostic_bucket"] = bkey
@@ -389,6 +420,54 @@ def run_wp_on_function(
             f"{len(unproven_lemmas)} unproven lemma(s) in scope (WP offers unproven lemmas as hypotheses to sibling goals)"
         )
         soundness["ok"] = False
+
+    # Workstream 3: Automatic bitwise/shift solver retry with Typed+ref+int and extended timeout
+    model_parts = {m.strip().lower() for m in re.split(r"[+,]", wp_model) if m.strip()}
+    if (
+        retry_bitwise
+        and len(unproven_goals) > 0
+        and not soundness["tier_a_aborts"]
+        and "int" not in model_parts
+        and _has_bitwise_unproven_goals(unproven_goals, combined_log)
+    ):
+        retry_model = "Typed+ref+int"
+        retry_timeout = max(timeout, 30)
+        try:
+            retry_res = run_wp_on_function(
+                c_file=c_file,
+                fn_name=fn_name,
+                out_dir=out_dir,
+                machdep=machdep,
+                cppflags=cppflags,
+                provers=provers,
+                wp_par=wp_par,
+                timeout=retry_timeout,
+                wp_steps=wp_steps,
+                wp_model=retry_model,
+                check_memory_model=check_memory_model,
+                warn_invalid_pointer=warn_invalid_pointer,
+                unsigned_reduced=unsigned_reduced,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+                retry_bitwise=False,
+                smoke_tests=smoke_tests,
+                prop=prop,
+                dump_goal=dump_goal,
+                session_dir=session_dir,
+                extra_sources=extra_sources,
+            )
+            if (
+                retry_res.get("soundness", {}).get("ok", False)
+                and retry_res.get("unproven_count", len(unproven_goals)) < len(unproven_goals)
+            ):
+                retry_res["bitwise_retry"] = {
+                    "triggered": True,
+                    "wp_model": retry_model,
+                    "timeout": retry_timeout,
+                    "initial_unproven_count": len(unproven_goals),
+                }
+                return retry_res
+        except Exception:
+            pass
 
     total_goals = len(proven_goals) + len(under_hyp_goals) + len(unproven_goals)
     all_valid = (
@@ -465,6 +544,16 @@ def main() -> int:
     parser.add_argument("--no-check-memory-model", action="store_true", help="Disable -wp-check-memory-model")
     parser.add_argument("--no-warn-invalid-pointer", action="store_true", help="Disable -warn-invalid-pointer")
     parser.add_argument("--no-warn-unsigned", action="store_true", help="Disable -warn-unsigned-overflow / -warn-unsigned-downcast")
+    parser.add_argument(
+        "--no-warn-unsigned-downcast",
+        action="store_true",
+        help="Disable -warn-unsigned-downcast only (C11 modulo narrowing; keeps -warn-unsigned-overflow enabled)",
+    )
+    parser.add_argument(
+        "--no-retry-bitwise",
+        action="store_true",
+        help="Disable automatic retry with -wp-model Typed+ref+int when bitwise/shift goals remain unproven",
+    )
     parser.add_argument("--smoke-tests", action="store_true", help="Run -wp-smoke-tests vacuity check in this pass")
     parser.add_argument("--prop", default=None, help="Isolate a single named clause (-wp-prop=<name>)")
     parser.add_argument("--dump-goal", action="store_true", help="Dump unsimplified raw VC (-wp-print -wp-no-qed)")
@@ -485,6 +574,8 @@ def main() -> int:
         check_memory_model=not args.no_check_memory_model,
         warn_invalid_pointer=not args.no_warn_invalid_pointer,
         unsigned_reduced=args.no_warn_unsigned,
+        warn_unsigned_downcast=not args.no_warn_unsigned_downcast,
+        retry_bitwise=not args.no_retry_bitwise,
         smoke_tests=args.smoke_tests,
         prop=args.prop,
         dump_goal=args.dump_goal,

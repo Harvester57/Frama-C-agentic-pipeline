@@ -57,6 +57,7 @@ def run_eva_on_slice(
     slevel: int = 100,
     warn_invalid_pointer: bool = True,
     warn_unsigned: bool = True,
+    warn_unsigned_downcast: bool = True,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "alarms.csv"
@@ -82,7 +83,11 @@ def run_eva_on_slice(
     else:
         reduced_checks.append("-no-warn-invalid-pointer")
     if warn_unsigned:
-        cmd.extend(["-warn-unsigned-overflow", "-warn-unsigned-downcast"])
+        cmd.append("-warn-unsigned-overflow")
+        if warn_unsigned_downcast:
+            cmd.append("-warn-unsigned-downcast")
+        else:
+            reduced_checks.append("-no-warn-unsigned-downcast")
     else:
         reduced_checks.extend(["-no-warn-unsigned-overflow", "-no-warn-unsigned-downcast"])
 
@@ -220,6 +225,11 @@ def main() -> int:
         action="store_true",
         help="Disable -warn-unsigned-overflow and -warn-unsigned-downcast (recorded in reduced_checks).",
     )
+    parser.add_argument(
+        "--no-warn-unsigned-downcast",
+        action="store_true",
+        help="Disable -warn-unsigned-downcast only (C11 modulo narrowing; recorded in reduced_checks).",
+    )
     args = parser.parse_args()
 
     res = run_eva_on_slice(
@@ -231,6 +241,7 @@ def main() -> int:
         slevel=args.slevel,
         warn_invalid_pointer=not args.no_warn_invalid_pointer,
         warn_unsigned=not args.no_warn_unsigned,
+        warn_unsigned_downcast=not args.no_warn_unsigned_downcast,
     )
     res["module"] = args.module
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

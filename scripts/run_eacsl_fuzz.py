@@ -399,6 +399,7 @@ def compile_eacsl_binary(
     functions: list[str] | None = None,
     ldflags_extra: str = "",
     variadic_translation: bool = True,
+    warn_unsigned_downcast: bool = False,
     runner=subprocess.run,
 ) -> dict:
     """
@@ -469,6 +470,8 @@ def compile_eacsl_binary(
             "-o", str(out_bin),
             "-O", str(instrumented_c),
         ]
+        if warn_unsigned_downcast:
+            cmd.append("--frama-c-extra=-warn-unsigned-downcast")
         if target_fns:
             cmd.append(f"--rte-select={','.join(target_fns)}")
             cmd.append(f"--e-acsl-extra=-e-acsl-functions={','.join(target_fns)}")
@@ -482,6 +485,8 @@ def compile_eacsl_binary(
     else:
         def _stage1(fns: list[str]) -> tuple[list[str], int, str, str]:
             fc_flags = ["-rte", f"-machdep {machdep}", *EACSL_FC_EXTRA_FLAGS]
+            if warn_unsigned_downcast:
+                fc_flags.append("-warn-unsigned-downcast")
             if not variadic_translation:
                 fc_flags.append("-variadic-no-translation")
             if fns:
@@ -638,6 +643,8 @@ def run_fuzz_campaign(
     rss_limit_mb: int = 2048,
     extra_corpus: list[Path] | None = None,
     attribution_builder=None,
+    jobs: int = 1,
+    workers: int = 1,
 ) -> dict:
     """
     `corpus_dir` receives new units (writable); `extra_corpus` directories are read-only
@@ -668,17 +675,38 @@ def run_fuzz_campaign(
         str(corpus_dir.resolve()),
     ]
     cmd += [str(Path(d).resolve()) for d in (extra_corpus or []) if Path(d).is_dir()]
+    eff_jobs = max(1, int(jobs or 1))
+    eff_workers = max(1, int(workers or 1))
+    if eff_workers > 1 and eff_jobs == 1:
+        eff_jobs = eff_workers
+    elif eff_jobs > 1 and eff_workers == 1:
+        eff_workers = eff_jobs
+
+    if eff_workers > 1:
+        cmd.insert(1, f"-workers={eff_workers}")
+    if eff_jobs > 1:
+        cmd.insert(1, f"-jobs={eff_jobs}")
     if dict_file and dict_file.exists():
         cmd.insert(1, f"-dict={dict_file.resolve()}")
 
+    waves = max(1, (eff_jobs + eff_workers - 1) // eff_workers)
+    wall_timeout = max_time * waves + 180
+    cpu_mult = max(2, eff_workers + 1)
     res = run_sandboxed(
         cmd,
         writable=[scratch, corpus_dir, artifacts_dir],
-        timeout_s=max_time + 180,
-        limits=Limits(cpu_seconds=(max_time + 180) * 2),
+        timeout_s=wall_timeout,
+        limits=Limits(cpu_seconds=wall_timeout * cpu_mult),
         extra_env=SANITIZER_RUNTIME_ENV,
     )
-    combined_out = res.stdout + "\n" + res.stderr
+    worker_logs: list[str] = []
+    for log_path in sorted(scratch.glob("fuzz-*.log")):
+        if log_path.is_file():
+            try:
+                worker_logs.append(log_path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    combined_out = "\n".join([res.stdout, res.stderr, *worker_logs])
     written_names = {
         Path(m.group("path").strip()).name
         for m in _TEST_UNIT_WRITTEN_RE.finditer(combined_out)
@@ -941,6 +969,10 @@ def main() -> int:
     p_camp.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
     p_camp.add_argument("--no-variadic-translation", action="store_true",
                         help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)")
+    p_camp.add_argument("--warn-unsigned-downcast", action="store_true",
+                        help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
+    p_camp.add_argument("--jobs", type=int, default=1, help="LibFuzzer -jobs=<N> (default: 1)")
+    p_camp.add_argument("--workers", type=int, default=1, help="LibFuzzer -workers=<N> (default: 1)")
     p_camp.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON,
                         help="Cached selftest result; with --engine auto a failed selftest for this Frama-C version skips E-ACSL")
     p_camp.add_argument("--no-attribution-replay", action="store_true",
@@ -959,6 +991,8 @@ def main() -> int:
     p_guard.add_argument("--ldflags", default="", help="Extra linker flags")
     p_guard.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
     p_guard.add_argument("--no-variadic-translation", action="store_true")
+    p_guard.add_argument("--warn-unsigned-downcast", action="store_true",
+                         help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
     p_guard.add_argument("--out-json", type=Path, required=True)
 
     p_self = sub.add_parser("selftest", help="Verify the E-ACSL toolchain contract on the bundled canary")
@@ -985,6 +1019,7 @@ def main() -> int:
                 functions=args.functions,
                 ldflags_extra=args.ldflags,
                 variadic_translation=not args.no_variadic_translation,
+                warn_unsigned_downcast=args.warn_unsigned_downcast,
             )
             if comp["returncode"] != 0:
                 res = {"mode": "guardrail", "status": "compile_error", "reason": comp.get("reason"), "compile": comp}
@@ -1022,6 +1057,7 @@ def _run_campaign_mode(args) -> dict:
                 functions=args.functions,
                 ldflags_extra=args.ldflags,
                 variadic_translation=not args.no_variadic_translation,
+                warn_unsigned_downcast=args.warn_unsigned_downcast,
             )
             if comp["returncode"] != 0 and args.engine == "auto":
                 eacsl_attempt = comp
@@ -1042,9 +1078,18 @@ def _run_campaign_mode(args) -> dict:
                 san = compile_sanitizer_binary(args.sources, san_out, args.cppflags, True, ldflags_extra=args.ldflags)
                 return Path(san["binary"]) if san["returncode"] == 0 else None
 
-        fuzz = run_fuzz_campaign(Path(comp["binary"]), args.corpus_dir, args.artifacts_dir, args.max_time, args.dict,
-                                 args.per_input_timeout, extra_corpus=args.extra_corpus,
-                                 attribution_builder=attribution_builder)
+        fuzz = run_fuzz_campaign(
+            Path(comp["binary"]),
+            args.corpus_dir,
+            args.artifacts_dir,
+            args.max_time,
+            args.dict,
+            args.per_input_timeout,
+            extra_corpus=args.extra_corpus,
+            attribution_builder=attribution_builder,
+            jobs=args.jobs,
+            workers=args.workers,
+        )
         res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
     if fallback_reason:
         res["engine_fallback_reason"] = fallback_reason
