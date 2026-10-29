@@ -2,7 +2,7 @@
 # Supports: .parse, .eva, .wp, .eacsl, and .sarif targets per module slice
 
 FRAMAC      ?= frama-c
-EACSL_GCC   ?= e-acsl-gcc.sh
+EACSL_GCC   ?= $(shell command -v e-acsl-gcc 2>/dev/null || command -v e-acsl-gcc.sh 2>/dev/null || echo e-acsl-gcc)
 MACHDEP     ?= gcc_x86_64
 TARGET      ?= module_slice
 MAIN_FN     ?= eva_main
@@ -24,8 +24,7 @@ FCFLAGS     += -machdep $(MACHDEP) \
                -cpp-extra-args="$(CPPFLAGS)"
 
 # Eva Flags
-EVAFLAGS    += -eva-warn-key builtins:missing-spec=abort \
-               -eva-domains cvalue,equality,symbolic-locations,octagon,gauges \
+EVAFLAGS    += -eva-domains cvalue,equality,symbolic-locations,octagon,gauges \
                -eva-auto-loop-unroll 32 \
                -eva-slevel 100 \
                -eva-partition-history 2 \
@@ -54,8 +53,8 @@ $(TARGET).eva: $(TARGET).parse
 	@mkdir -p $@
 	$(FRAMAC) -load $</framac.ast \
 		-main $(MAIN_FN) \
-		-eva $(EVAFLAGS) \
-		-then -rte \
+		-rte \
+		-then -eva $(EVAFLAGS) \
 		-then -metrics -metrics-eva-cover \
 		-then -report -report-csv $@/alarms.csv \
 		-save $@/framac.sav \
@@ -72,15 +71,27 @@ $(TARGET).wp: $(TARGET).parse
 
 $(TARGET).eacsl: $(SOURCES)
 	@mkdir -p $@
-	$(EACSL_GCC) \
-		--compiler=clang \
-		--machdep=$(MACHDEP) \
-		--rte=all \
-		--cflag="-fsanitize=fuzzer -g -O1 $(CPPFLAGS)" \
-		--ldflag="-fsanitize=fuzzer" \
-		-o $@/fuzz_runner \
-		-O $@/instrumented.c \
-		$(SOURCES)
+	@if echo "$(EACSL_GCC)" | grep -q '\.sh$$'; then \
+		$(EACSL_GCC) \
+			--compiler=clang \
+			--machdep=$(MACHDEP) \
+			--rte=all \
+			--cflag="-fsanitize=fuzzer -g -O1 $(CPPFLAGS)" \
+			--ldflag="-fsanitize=fuzzer" \
+			-o $@/fuzz_runner \
+			-O $@/instrumented.c \
+			$(SOURCES); \
+	else \
+		$(EACSL_GCC) \
+			-G clang \
+			-F "-rte -machdep $(MACHDEP)" \
+			-E "$(CPPFLAGS)" \
+			-e "-fsanitize=fuzzer -g -O1 -fcommon $(CPPFLAGS)" \
+			-l "-fsanitize=fuzzer" \
+			-o $@/instrumented.c \
+			-O $@/fuzz_runner \
+			$(SOURCES); \
+	fi
 
 $(TARGET).sarif: $(TARGET).eva
 	$(FRAMAC) -load $</framac.sav \

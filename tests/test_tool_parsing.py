@@ -1,4 +1,12 @@
-from run_eacsl_fuzz import classify_campaign, classify_guardrail, parse_eacsl_failure
+from run_eacsl_fuzz import (
+    _discover_slice_functions,
+    classify_campaign,
+    classify_guardrail,
+    parse_eacsl_failure,
+    parse_runtime_failure,
+    parse_sanitizer_failure,
+)
+from run_eva_slice import extract_error_summary
 from run_wp_function import (
     extract_vc_goal_dumps,
     goal_obligation_class,
@@ -42,6 +50,54 @@ def test_parse_old_style_precondition_failure():
 
 def test_parse_returns_none_without_report():
     assert parse_eacsl_failure("random libFuzzer output") is None
+
+
+def test_parse_sanitizer_ubsan_and_asan_failures():
+    ubsan_log = """INFO: Running with entropic power schedule
+src/LibPtfCom/PtfMsg.c:91:28: runtime error: signed integer overflow: 2147483640 + 100 cannot be represented in type 'int'
+    #0 0x555555601234 in CheckMessageValidity /framac-run/workspace/work/src/LibPtfCom/PtfMsg.c:91:28
+    #1 0x555555602000 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_PtfMsg.c:30:5
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/LibPtfCom/PtfMsg.c:91:28
+"""
+    f_ub = parse_sanitizer_failure(ubsan_log)
+    assert f_ub is not None
+    assert f_ub["file"] == "src/LibPtfCom/PtfMsg.c"
+    assert f_ub["line"] == 91
+    assert f_ub["function"] == "CheckMessageValidity"
+    assert f_ub["alarm_kind"] == "signed_overflow"
+    assert f_ub["is_rte"] is True
+
+    asan_log = """=================================================================
+==42==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014 at pc 0x55555558a123 bp 0x7fffffffd100 sp 0x7fffffffd0f8
+READ of size 4 at 0x602000000014 thread T0
+    #0 0x55555558a122 in __asan_memcpy (/framac-run/workspace/harnesses/fuzz_SyncMem+0x4a122)
+    #1 0x5555555c9876 in UpdateSyncMem /framac-run/workspace/work/src/LibPtfCom/SyncMem.c:292:9
+    #2 0x5555555ca000 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_SyncMem.c:40:5
+"""
+    f_as = parse_runtime_failure(asan_log)
+    assert f_as is not None
+    assert f_as["file"] == "/framac-run/workspace/work/src/LibPtfCom/SyncMem.c"
+    assert f_as["line"] == 292
+    assert f_as["function"] == "UpdateSyncMem"
+    assert f_as["alarm_kind"] == "mem_access"
+
+
+def test_discover_slice_functions_and_eva_error_summary(tmp_path):
+    c_file = tmp_path / "mod.c"
+    c_file.write_text("int helper(int x) { return x + 1; }\nint entry(int y) { return helper(y); }\n", encoding="utf-8")
+    h_file = tmp_path / "harness_mod.c"
+    h_file.write_text("int LLVMFuzzerTestOneInput(const char *d, int s) { return entry(s); }\n", encoding="utf-8")
+    fns = _discover_slice_functions([str(c_file), str(h_file)])
+    assert fns == ["entry", "helper"]
+
+    eva_err = """[kernel] Parsing mod.c (with preprocessing)
+[kernel:annot-error] mod.c:12: Warning: unbound logic variable alse. Ignoring logic specification of function foo
+[kernel] User Error: warning annot-error treated as fatal error.
+[kernel] Frama-C aborted: invalid user input.
+"""
+    summary = extract_error_summary(eva_err)
+    assert any("unbound logic variable alse" in line for line in summary)
+    assert any("Frama-C aborted: invalid user input" in line for line in summary)
 
 
 def test_campaign_classification():

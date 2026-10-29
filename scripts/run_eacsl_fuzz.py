@@ -27,12 +27,15 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from build_callgraph_dag import extract_functions_from_code  # noqa: E402
 from fingerprint import detect_alarm_kind, make_fingerprint  # noqa: E402
 from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed  # noqa: E402
 
@@ -58,6 +61,54 @@ _OLD_RE = re.compile(
     re.IGNORECASE,
 )
 _PRED_RE = re.compile(r"The failing predicate is:\s*\n?\s*(?P<pred>[^\n]+)", re.IGNORECASE)
+
+# UBSan format:
+#   SyncMem.c:819:9: runtime error: index 1025 out of bounds for type 'char[1024]'
+_UBSAN_RE = re.compile(
+    r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+)(?::\d+)?:\s*runtime error:\s*(?P<pred>[^\n]+)",
+    re.IGNORECASE,
+)
+
+# ASan header:
+#   ==123==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x...
+_ASAN_ERR_RE = re.compile(
+    r"ERROR:\s*AddressSanitizer:\s*(?P<kind>[A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+_ASAN_OP_RE = re.compile(
+    r"^(?P<op>(?:READ|WRITE)\s+of\s+size\s+\d+)",
+    re.MULTILINE,
+)
+# Sanitizer stack frame:
+#   #0 0x555555 in UpdateSyncMem /path/to/SyncMem.c:827:5
+_STACK_FRAME_RE = re.compile(
+    r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<file>[^\s():]+\.[ch]):(?P<line>\d+)"
+)
+
+
+def _map_sanitizer_alarm_kind(kind_or_msg: str) -> str:
+    low = (kind_or_msg or "").lower()
+    if "out of bounds" in low:
+        return "index_bound"
+    if "signed integer overflow" in low or "cannot be represented in type" in low:
+        return "signed_overflow"
+    if "unsigned integer overflow" in low:
+        return "unsigned_overflow"
+    if "shift" in low:
+        return "shift"
+    if "division by zero" in low or "divide by zero" in low or "fpe" in low:
+        return "division_by_zero"
+    if "overlap" in low:
+        return "separation"
+    if "use-after-free" in low or "use-after-scope" in low or "use-after-return" in low:
+        return "dangling_pointer"
+    if "bad-free" in low or "attempting free" in low:
+        return "freeable"
+    if "bool" in low:
+        return "bool_value"
+    if "nan" in low or "inf" in low:
+        return "is_nan_or_infinite"
+    return "mem_access"
 
 
 def sha256_file(path: Path) -> str:
@@ -99,6 +150,105 @@ def parse_eacsl_failure(text: str) -> dict | None:
     }
 
 
+def parse_sanitizer_failure(text: str) -> dict | None:
+    """Extract the first UBSan or ASan runtime failure from LibFuzzer/sanitizer output."""
+    if not text:
+        return None
+
+    frames = list(_STACK_FRAME_RE.finditer(text))
+    non_harness_frames = [
+        m for m in frames
+        if not Path(m.group("file")).name.startswith("harness_")
+        and not m.group("function").startswith(("__interceptor_", "__asan_", "LLVMFuzzerTestOneInput"))
+    ]
+    best_frame = (non_harness_frames or frames or [None])[0]
+
+    ub = _UBSAN_RE.search(text)
+    if ub:
+        file_ = ub.group("file")
+        line_ = int(ub.group("line"))
+        pred = ub.group("pred").strip().rstrip(".")
+        fn = "unknown_function"
+        for m in frames:
+            if Path(m.group("file")).name == Path(file_).name and int(m.group("line")) == line_:
+                fn = m.group("function")
+                break
+        if fn == "unknown_function" and best_frame is not None:
+            fn = best_frame.group("function")
+        alarm = _map_sanitizer_alarm_kind(pred)
+        return {
+            "file": file_,
+            "line": line_,
+            "function": fn,
+            "kind": "ubsan_runtime_error",
+            "alarm_kind": alarm,
+            "is_rte": True,
+            "predicate": f"rte: {alarm}: {pred}",
+        }
+
+    asan = _ASAN_ERR_RE.search(text)
+    if asan:
+        asan_kind = asan.group("kind").strip()
+        op_m = _ASAN_OP_RE.search(text, asan.end())
+        op_txt = f" ({op_m.group('op')})" if op_m else ""
+        alarm = _map_sanitizer_alarm_kind(asan_kind)
+        file_ = best_frame.group("file") if best_frame else "unknown"
+        line_ = int(best_frame.group("line")) if best_frame else 0
+        fn = best_frame.group("function") if best_frame else "unknown_function"
+        pred = f"AddressSanitizer: {asan_kind}{op_txt}"
+        return {
+            "file": file_,
+            "line": line_,
+            "function": fn,
+            "kind": "asan_" + asan_kind.lower().replace("-", "_"),
+            "alarm_kind": alarm,
+            "is_rte": True,
+            "predicate": f"rte: {alarm}: {pred}",
+        }
+
+    return None
+
+
+def parse_runtime_failure(text: str) -> dict | None:
+    """Parse an E-ACSL failure report, falling back to ASan/UBSan runtime failure parsing."""
+    return parse_eacsl_failure(text) or parse_sanitizer_failure(text)
+
+
+def _discover_slice_functions(sources: list[str], explicit_functions: list[str] | None = None) -> list[str]:
+    """Extract target function names defined in `sources` (excluding harness entry points)."""
+    if explicit_functions:
+        return sorted({f.strip() for f in explicit_functions if f.strip()})
+    discovered: set[str] = set()
+    for src in sources:
+        p = Path(src)
+        if not p.is_file() or p.name.startswith("harness_"):
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            for fn in extract_functions_from_code(raw, path=str(p)):
+                name = fn.get("name", "")
+                if name and name not in ("eva_main", "LLVMFuzzerTestOneInput", "main"):
+                    discovered.add(name)
+        except Exception:
+            continue
+    return sorted(discovered)
+
+
+def _resolve_eacsl_gcc() -> tuple[str, bool]:
+    """
+    Return (binary_path, is_modern_cli).
+    Frama-C <= 32 installs `e-acsl-gcc.sh` (long-option CLI).
+    Frama-C 33+ installs `e-acsl-gcc` (short-option CLI: -G, -F, -E, -e, -l, -o instrumented.c, -O binary).
+    """
+    modern = shutil.which("e-acsl-gcc")
+    legacy = shutil.which("e-acsl-gcc.sh")
+    if modern and not modern.endswith(".sh"):
+        return modern, True
+    if legacy:
+        return legacy, False
+    return "e-acsl-gcc.sh", False
+
+
 def compile_eacsl_binary(
     sources: list[str],
     out_bin: Path,
@@ -106,37 +256,132 @@ def compile_eacsl_binary(
     cppflags: str = "-I.",
     rte_flags: str = "all",
     fuzzer_flag: bool = True,
+    functions: list[str] | None = None,
+    ldflags_extra: str = "",
 ) -> dict:
     out_bin.parent.mkdir(parents=True, exist_ok=True)
     instrumented_c = out_bin.with_suffix(".instrumented.c")
+    compile_log = out_bin.with_suffix(".compile.log")
 
-    cflags = f"-g -O1 {cppflags}"
-    ldflags = ""
-    if fuzzer_flag:
-        cflags = f"-fsanitize=fuzzer {cflags}"
-        ldflags = "-fsanitize=fuzzer"
+    target_fns = _discover_slice_functions(sources, functions)
+    eacsl_bin, is_modern = _resolve_eacsl_gcc()
 
-    cmd = [
-        "e-acsl-gcc.sh",
-        "--compiler=clang",
-        f"--machdep={machdep}",
-        f"--rte={rte_flags}",
-        f"--cflag={cflags}",
-        "-o", str(out_bin),
-        "-O", str(instrumented_c),
-    ]
-    if ldflags:
-        cmd.append(f"--ldflag={ldflags}")
-    cmd.extend(sources)
+    if not is_modern:
+        cflags = f"-g -O1 {cppflags}"
+        ldflags = ldflags_extra.strip()
+        if fuzzer_flag:
+            cflags = f"-fsanitize=fuzzer {cflags}"
+            ldflags = f"-fsanitize=fuzzer {ldflags}".strip()
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        cmd = [
+            eacsl_bin,
+            "--compiler=clang",
+            f"--machdep={machdep}",
+            f"--rte={rte_flags}",
+            f"--cflag={cflags}",
+            "-o", str(out_bin),
+            "-O", str(instrumented_c),
+        ]
+        if target_fns:
+            cmd.append(f"--rte-select={','.join(target_fns)}")
+            cmd.append(f"--e-acsl-extra=-e-acsl-functions={','.join(target_fns)}")
+        if ldflags:
+            cmd.append(f"--ldflag={ldflags}")
+        cmd.extend(sources)
+    else:
+        compile_only = "-fsanitize=fuzzer -g -O1 -fcommon" if fuzzer_flag else "-g -O1 -fcommon"
+        ldflags = f"-fsanitize=fuzzer {ldflags_extra}".strip() if fuzzer_flag else ldflags_extra.strip()
+        fc_flags = ["-rte", f"-machdep {machdep}"]
+        if target_fns:
+            fn_csv = ",".join(target_fns)
+            fc_flags.append(f"-rte-select {fn_csv}")
+            fc_flags.append(f"-e-acsl-functions {fn_csv}")
+        cmd = [
+            eacsl_bin,
+            "-G", "clang",
+            "-F", " ".join(fc_flags),
+            "-E", cppflags,
+            "-e", f"{compile_only} {cppflags}",
+            "-o", str(instrumented_c),
+            "-O", str(out_bin),
+        ]
+        if ldflags:
+            cmd.extend(["-l", ldflags])
+        cmd.extend(sources)
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        rc = proc.returncode
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+    except OSError as exc:
+        rc = 127
+        stdout = ""
+        stderr = str(exc)
+
+    compile_log.write_text(
+        f"Command: {' '.join(cmd)}\nReturncode: {rc}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\n",
+        encoding="utf-8",
+    )
     return {
-        "returncode": proc.returncode,
+        "engine": "eacsl",
+        "returncode": rc,
         "command": " ".join(cmd),
         "binary": str(out_bin),
         "instrumented_source": str(instrumented_c),
-        "stdout": proc.stdout[-4000:],
-        "stderr": proc.stderr[-4000:],
+        "compile_log": str(compile_log),
+        "stdout": stdout[-16000:],
+        "stderr": stderr[-16000:],
+    }
+
+
+def compile_sanitizer_binary(
+    sources: list[str],
+    out_bin: Path,
+    cppflags: str = "-I.",
+    fuzzer_flag: bool = True,
+    ldflags_extra: str = "",
+) -> dict:
+    """Compile a slice directly with Clang + LibFuzzer + ASan + UBSan when E-ACSL cannot instrument."""
+    out_bin.parent.mkdir(parents=True, exist_ok=True)
+    compile_log = out_bin.with_suffix(".sanitizer_compile.log")
+    san_flags = "-fsanitize=fuzzer,address,undefined" if fuzzer_flag else "-fsanitize=address,undefined"
+    cmd = [
+        "clang",
+        "-g",
+        "-O1",
+        "-fcommon",
+        san_flags,
+        "-fno-sanitize-recover=all",
+        *shlex.split(cppflags),
+        *sources,
+        "-o",
+        str(out_bin),
+        *shlex.split(ldflags_extra),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        rc = proc.returncode
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+    except OSError as exc:
+        rc = 127
+        stdout = ""
+        stderr = str(exc)
+
+    compile_log.write_text(
+        f"Command: {' '.join(cmd)}\nReturncode: {rc}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\n",
+        encoding="utf-8",
+    )
+    return {
+        "engine": "sanitizers",
+        "returncode": rc,
+        "command": " ".join(cmd),
+        "binary": str(out_bin),
+        "instrumented_source": None,
+        "compile_log": str(compile_log),
+        "stdout": stdout[-16000:],
+        "stderr": stderr[-16000:],
     }
 
 
@@ -160,7 +405,7 @@ def replay_artifact(binary: Path, artifact: Path, scratch: Path, timeout_s: int 
         "reproduced": res.returncode != 0 or res.timed_out,
         "returncode": res.returncode,
         "timed_out": res.timed_out,
-        "failure": parse_eacsl_failure(out),
+        "failure": parse_runtime_failure(out),
         "sandbox": res.sandbox,
         "log_tail": out[-3000:],
     }
@@ -238,7 +483,7 @@ def run_fuzz_campaign(
         }
         if kind in ("crash", "leak"):
             replay = replay_artifact(binary, p, scratch)
-            failure = replay["failure"] or parse_eacsl_failure(combined_out)
+            failure = replay["failure"] or parse_runtime_failure(combined_out)
             entry["reproducible"] = replay["reproduced"]
             entry["replay_log_tail"] = replay["log_tail"]
             entry["failure"] = failure
@@ -319,7 +564,15 @@ def main() -> int:
     p_camp.add_argument("--dict", type=Path, default=None)
     p_camp.add_argument("--machdep", default="gcc_x86_64")
     p_camp.add_argument("--cppflags", default="-I.")
+    p_camp.add_argument("--ldflags", default="", help="Extra linker flags (e.g. '-lbsd -lm')")
     p_camp.add_argument("--rte", default="all")
+    p_camp.add_argument(
+        "--engine",
+        choices=["auto", "eacsl", "sanitizers"],
+        default="auto",
+        help="Instrumentation engine: 'auto' tries E-ACSL first and falls back to Clang ASan+UBSan on compile error",
+    )
+    p_camp.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
     p_camp.add_argument("--module", default="")
     p_camp.add_argument("--out-json", type=Path, required=True)
 
@@ -331,21 +584,78 @@ def main() -> int:
     p_guard.add_argument("--extra-runs", type=int, default=200)
     p_guard.add_argument("--machdep", default="gcc_x86_64")
     p_guard.add_argument("--cppflags", default="-I.")
+    p_guard.add_argument("--ldflags", default="", help="Extra linker flags")
+    p_guard.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
     p_guard.add_argument("--out-json", type=Path, required=True)
 
     args = parser.parse_args()
 
     try:
         if args.mode == "campaign":
-            comp = compile_eacsl_binary(args.sources, args.out_bin, args.machdep, args.cppflags, args.rte, True)
+            eacsl_attempt = None
+            if args.engine in ("auto", "eacsl"):
+                comp = compile_eacsl_binary(
+                    args.sources,
+                    args.out_bin,
+                    args.machdep,
+                    args.cppflags,
+                    args.rte,
+                    True,
+                    functions=args.functions,
+                    ldflags_extra=args.ldflags,
+                )
+                if comp["returncode"] != 0 and args.engine == "auto":
+                    eacsl_attempt = comp
+                    comp = compile_sanitizer_binary(
+                        args.sources,
+                        args.out_bin,
+                        args.cppflags,
+                        True,
+                        ldflags_extra=args.ldflags,
+                    )
+            else:
+                comp = compile_sanitizer_binary(
+                    args.sources,
+                    args.out_bin,
+                    args.cppflags,
+                    True,
+                    ldflags_extra=args.ldflags,
+                )
+
             if comp["returncode"] != 0:
-                res = {"mode": "campaign", "module": args.module, "status": "compile_error", "compile": comp}
+                res = {
+                    "mode": "campaign",
+                    "module": args.module,
+                    "status": "compile_error",
+                    "engine_used": comp.get("engine", args.engine),
+                    "compile": comp,
+                }
+                if eacsl_attempt is not None:
+                    res["eacsl_compile_attempt"] = eacsl_attempt
             else:
                 fuzz = run_fuzz_campaign(args.out_bin, args.corpus_dir, args.artifacts_dir, args.max_time, args.dict,
                                          args.per_input_timeout, extra_corpus=args.extra_corpus)
-                res = {"mode": "campaign", "module": args.module, "sources": args.sources, "compile": comp, **fuzz}
+                res = {
+                    "mode": "campaign",
+                    "module": args.module,
+                    "sources": args.sources,
+                    "engine_used": comp.get("engine", args.engine),
+                    "compile": comp,
+                    **fuzz,
+                }
+                if eacsl_attempt is not None:
+                    res["eacsl_compile_attempt"] = eacsl_attempt
         else:
-            comp = compile_eacsl_binary(args.sources, args.out_bin, args.machdep, args.cppflags, "all", True)
+            comp = compile_eacsl_binary(
+                args.sources,
+                args.out_bin,
+                args.machdep,
+                args.cppflags,
+                "all",
+                True,
+                functions=args.functions,
+                ldflags_extra=args.ldflags,
+            )
             if comp["returncode"] != 0:
                 res = {"mode": "guardrail", "status": "compile_error", "compile": comp}
             else:
