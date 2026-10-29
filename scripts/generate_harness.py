@@ -32,7 +32,15 @@ from framac_common import atomic_write_json, load_json_strict, utc_now  # noqa: 
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
-VALID_ENTRY_STYLES = ("buffer_len", "global_buffer", "struct_arg", "void_call", "c_string", "custom")
+VALID_ENTRY_STYLES = (
+    "buffer_len",
+    "global_buffer",
+    "struct_arg",
+    "void_call",
+    "c_string",
+    "custom",
+    "auto_prototype",
+)
 _WORKSPACE_PREFIXES = (
     "/framac-run/workspace/work/",
     "/framac-run/workspace/baseline/",
@@ -86,6 +94,521 @@ def _wrap_null_terminated(eva_inner: str, fuzz_inner: str) -> tuple[str, str]:
     return eva_wrapped, fuzz_wrapped
 
 
+_PARAM_DECL_RE = re.compile(
+    r"^(?P<type_part>.*?)(?P<stars>(?:\*\s*)+)?(?P<name>[A-Za-z_]\w*)\s*(?P<array>\[[^\]]*\])?$"
+)
+_FN_PTR_PARAM_RE = re.compile(
+    r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*\((?P<args>.*)\)$"
+)
+_FN_TYPE_PARAM_RE = re.compile(
+    r"^(?P<head>[^(]+)\((?P<args>.*)\)$"
+)
+_C_PP_DIRECTIVE_RE = re.compile(r"^[ \t]*#[^\n]*(?:\\\r?\n[^\n]*)*", re.MULTILINE)
+_CPP_GUARD_RE = re.compile(
+    r"#[ \t]*if(?:def)?[ \t]+(?:defined[ \t]*\([ \t]*)?__cplusplus\b.*?#[ \t]*endif\b",
+    re.DOTALL,
+)
+_C_TYPE_KEYWORDS = frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "bool",
+        "_Bool",
+        "const",
+        "volatile",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "struct",
+        "union",
+        "enum",
+    }
+)
+_C_QUALIFIER_OR_TAG_ONLY = frozenset(
+    {
+        "const",
+        "volatile",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "struct",
+        "union",
+        "enum",
+    }
+)
+
+
+def _find_matching_paren(text: str, open_pos: int) -> int:
+    """Return index of ')' matching '(' at `open_pos`, or -1 if unmatched."""
+    depth = 0
+    in_str: str | None = None
+    i = open_pos
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _strip_gcc_attributes(text: str) -> str:
+    """Remove `__attribute__((...))` and `__asm__(...)` / `asm(...)` clauses with balanced parens."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    attr_re = re.compile(r"\b(?:__attribute__|__asm__|asm)\s*\(")
+    while i < n:
+        m = attr_re.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i : m.start()])
+        open_pos = m.end() - 1
+        close_pos = _find_matching_paren(text, open_pos)
+        if close_pos < 0:
+            out.append(text[m.start() :])
+            break
+        i = close_pos + 1
+    return "".join(out)
+
+
+def _has_concrete_type_token(type_part: str) -> bool:
+    tokens = re.findall(r"[A-Za-z_]\w*", type_part)
+    return any(tok not in _C_QUALIFIER_OR_TAG_ONLY for tok in tokens)
+
+
+def _parse_c_param(raw_param: str, index: int) -> dict[str, Any]:
+    clean = " ".join(_strip_gcc_attributes(raw_param).replace("\n", " ").split()).strip()
+    m_fp = _FN_PTR_PARAM_RE.match(clean)
+    if m_fp:
+        ret = m_fp.group("ret").strip()
+        inner = m_fp.group("inner").strip()
+        args = m_fp.group("args").strip()
+        ident_matches = [
+            tok
+            for tok in re.findall(r"[A-Za-z_]\w*", inner)
+            if tok not in ("const", "volatile", "restrict", "__restrict", "__restrict__")
+        ]
+        if ident_matches:
+            name = ident_matches[-1]
+            inner_quals = re.sub(rf"\b{re.escape(name)}\b", "", inner).strip()
+        else:
+            name = f"arg_{index}"
+            inner_quals = inner
+        star_part = f"* {inner_quals}".strip() if inner_quals else "*"
+        full_type = f"{ret} ({star_part})({args})"
+        return {
+            "raw": clean,
+            "type": full_type,
+            "pointee_type": full_type,
+            "name": name,
+            "is_pointer": True,
+            "is_fn_pointer": True,
+            "is_const": False,
+        }
+
+    m_ft = _FN_TYPE_PARAM_RE.match(clean)
+    if m_ft:
+        head = m_ft.group("head").strip()
+        args = m_ft.group("args").strip()
+        m_head = re.match(r"^(?P<ret>.*?)\b(?P<name>[A-Za-z_]\w*)$", head)
+        if m_head:
+            cand_ret = m_head.group("ret").strip()
+            cand_name = m_head.group("name").strip()
+            if cand_name not in _C_TYPE_KEYWORDS and _has_concrete_type_token(cand_ret):
+                ret = cand_ret
+                name = cand_name
+            else:
+                ret = head
+                name = f"arg_{index}"
+        else:
+            ret = head
+            name = f"arg_{index}"
+        full_type = f"{ret} (*)({args})"
+        return {
+            "raw": clean,
+            "type": full_type,
+            "pointee_type": full_type,
+            "name": name,
+            "is_pointer": True,
+            "is_fn_pointer": True,
+            "is_const": False,
+        }
+
+    m = _PARAM_DECL_RE.match(clean)
+    if m:
+        type_part = m.group("type_part").strip()
+        stars = (m.group("stars") or "").strip()
+        cand_name = m.group("name").strip()
+        array = (m.group("array") or "").strip()
+    else:
+        type_part = ""
+        stars = ""
+        cand_name = ""
+        array = ""
+
+    if m and cand_name not in _C_TYPE_KEYWORDS and _has_concrete_type_token(type_part):
+        name = cand_name
+        full_type = f"{type_part} {stars}".strip()
+        if array:
+            full_type = f"{full_type} *"
+    else:
+        array_m = re.search(r"\[[^\]]*\]\s*$", clean)
+        if array_m:
+            base = clean[: array_m.start()].strip()
+            full_type = f"{base} *".strip()
+            array = array_m.group(0).strip()
+        else:
+            full_type = clean
+            array = ""
+        name = f"arg_{index}"
+        stars = "*" if "*" in full_type else ""
+
+    is_pointer = ("*" in full_type) or bool(array)
+    is_const = bool(re.search(r"\bconst\b", full_type))
+    pointee_type = re.sub(r"\b(?:const|volatile|restrict|__restrict|__restrict__)\b", " ", full_type)
+    pointee_type = pointee_type.replace("*", " ")
+    pointee_type = " ".join(pointee_type.split()).strip() or "int"
+    if pointee_type == "void":
+        pointee_type = "uint8_t"
+
+    return {
+        "raw": clean,
+        "type": full_type,
+        "pointee_type": pointee_type,
+        "name": name,
+        "is_pointer": is_pointer,
+        "is_fn_pointer": False,
+        "is_const": is_const,
+    }
+
+
+def _split_top_level_params(params_raw: str) -> list[str]:
+    """Split a C parameter list on commas at top-level parenthesis/bracket depth 0."""
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    for ch in params_raw:
+        if ch in ("(", "["):
+            depth += 1
+            cur.append(ch)
+        elif ch in (")", "]"):
+            if depth > 0:
+                depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            part = "".join(cur).strip()
+            if part and part != "...":
+                parts.append(part)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail and tail != "...":
+        parts.append(tail)
+    return parts
+
+
+def _strip_brace_bodies(text: str) -> str:
+    """Replace top-level `{ ... }` blocks with `{}` so calls inside function bodies are ignored."""
+    out: list[str] = []
+    depth = 0
+    in_str: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                if depth == 0:
+                    out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            if depth == 0:
+                out.append(ch)
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+            if depth == 0:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == "{":
+            if depth == 0:
+                out.append("{")
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0:
+                    out.append("}")
+            else:
+                out.append("}")
+            i += 1
+            continue
+        if depth == 0:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _prepare_prototype_search_text(raw_text: str) -> str:
+    """Strip comments, C++ extern guards, preprocessor directives, GCC attributes, and brace bodies."""
+    no_comments = _strip_c_comments(raw_text)
+    no_cpp_guards = _CPP_GUARD_RE.sub(" ", no_comments)
+    no_pp = _C_PP_DIRECTIVE_RE.sub(" ", no_cpp_guards)
+    no_attrs = _strip_gcc_attributes(no_pp)
+    return _strip_brace_bodies(no_attrs)
+
+
+def extract_function_prototype(
+    entry_fn: str,
+    header_include: str | None = None,
+    sources: list[str] | None = None,
+    cppflags: str = "-I.",
+) -> list[dict[str, Any]]:
+    """
+    Locate the C declaration or definition of `entry_fn` in `header_include` or `sources`
+    and return its parsed parameter list.
+    """
+    search_paths: list[Path] = []
+    include_dirs = _include_dirs_from_cppflags(cppflags)
+    if header_include:
+        hp = Path(header_include.replace("\\", "/").strip())
+        if hp.is_file():
+            search_paths.append(hp)
+        for inc_dir in include_dirs:
+            cand = inc_dir / hp.name
+            if cand.is_file() and cand not in search_paths:
+                search_paths.append(cand)
+        ws_cand = Path("workspace/work") / hp
+        if ws_cand.is_file() and ws_cand not in search_paths:
+            search_paths.append(ws_cand)
+
+    for src in sources or []:
+        sp = Path(src.replace("\\", "/").strip())
+        if sp.is_file() and sp not in search_paths:
+            search_paths.append(sp)
+        ws_sp = Path("workspace/work") / sp
+        if ws_sp.is_file() and ws_sp not in search_paths:
+            search_paths.append(ws_sp)
+
+    sig_head_re = re.compile(
+        rf"(?:[\w]+(?:\s+|\s*\*+\s*))+\**\s*\b{re.escape(entry_fn)}\s*\(",
+        re.DOTALL,
+    )
+    for path in search_paths:
+        try:
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+            text = _prepare_prototype_search_text(raw_text)
+        except OSError:
+            continue
+        for m in sig_head_re.finditer(text):
+            open_pos = m.end() - 1
+            close_pos = _find_matching_paren(text, open_pos)
+            if close_pos < 0:
+                continue
+            trailing = text[close_pos + 1 :].lstrip()
+            if not trailing.startswith((";", "{")):
+                continue
+            params_raw = text[open_pos + 1 : close_pos].strip()
+            if not params_raw or params_raw == "void":
+                return []
+            parts = _split_top_level_params(params_raw)
+            return [_parse_c_param(p, idx) for idx, p in enumerate(parts)]
+
+    raise ValueError(
+        f"Could not locate C prototype for function {entry_fn!r} in header {header_include!r} or sources {sources!r}"
+    )
+
+
+def _is_c_string_param(param: dict[str, Any], next_param: dict[str, Any] | None) -> bool:
+    if not param["is_pointer"] or param.get("is_fn_pointer"):
+        return False
+    pt = param["pointee_type"]
+    if pt != "char":
+        return False
+    if next_param and not next_param["is_pointer"]:
+        next_name = next_param["name"].lower()
+        if any(k in next_name for k in ("len", "size", "count", "cap")):
+            return False
+    return True
+
+
+def _is_buf_len_pair(param: dict[str, Any], next_param: dict[str, Any] | None) -> bool:
+    if (
+        not param["is_pointer"]
+        or param.get("is_fn_pointer")
+        or next_param is None
+        or next_param["is_pointer"]
+    ):
+        return False
+    pt = param["pointee_type"].lower()
+    next_pt = next_param["pointee_type"].lower()
+    next_name = next_param["name"].lower()
+    is_int_like = any(
+        k in next_pt for k in ("int", "size_t", "ssize_t", "long", "short", "unsigned", "len", "word")
+    )
+    if not is_int_like:
+        return False
+    if any(k in pt for k in ("uint8_t", "unsigned char", "int8_t", "byte", "uchar")) or param["type"].replace("const", "").strip().startswith("void"):
+        return True
+    if pt == "char" and any(k in next_name for k in ("len", "size", "count", "cap")):
+        return True
+    return False
+
+
+def _build_auto_prototype_invocations(
+    entry_fn: str,
+    params: list[dict[str, Any]],
+) -> tuple[str, str, bool]:
+    """
+    Synthesize dual Eva (`eva_main`) and LibFuzzer (`LLVMFuzzerTestOneInput`) argument
+    unpacking and invocation statements from a parsed C parameter list.
+    Returns `(eva_stmt, fuzz_stmt, needs_null_terminate)`.
+    """
+    if not params:
+        return (
+            f"(void)input_buf; (void)input_len; {entry_fn}();",
+            f"(void)bounded_buf; {entry_fn}();",
+            False,
+        )
+
+    eva_lines: list[str] = []
+    fuzz_lines: list[str] = ["size_t fuzz_off = 0;"]
+    eva_args: list[str] = []
+    fuzz_args: list[str] = []
+    needs_null_terminate = False
+    used_primary_buf = False
+
+    i = 0
+    while i < len(params):
+        p = params[i]
+        next_p = params[i + 1] if (i + 1) < len(params) else None
+
+        if _is_buf_len_pair(p, next_p):
+            assert next_p is not None
+            ptr_cast = f"({p['type']})"
+            len_cast = f"({next_p['type']})"
+            if not used_primary_buf:
+                used_primary_buf = True
+                eva_args.append(f"{ptr_cast}fuzz_buf")
+                eva_args.append(f"{len_cast}fuzz_len")
+                fuzz_args.append(f"{ptr_cast}(fuzz_buf + fuzz_off)")
+                fuzz_args.append(f"{len_cast}(fuzz_len - fuzz_off)")
+            else:
+                vname = f"arg_{i}"
+                eva_lines.append(f"uint8_t {vname}[MAX_INPUT_SIZE];")
+                eva_lines.append(f"Frama_C_make_unknown((char *){vname}, sizeof({vname}));")
+                eva_args.append(f"{ptr_cast}{vname}")
+                eva_args.append(f"{len_cast}sizeof({vname})")
+                fuzz_lines.append(f"uint8_t {vname}[MAX_INPUT_SIZE];")
+                fuzz_lines.append(f"memset({vname}, 0, sizeof({vname}));")
+                fuzz_args.append(f"{ptr_cast}{vname}")
+                fuzz_args.append(f"{len_cast}sizeof({vname})")
+            i += 2
+            continue
+
+        if _is_c_string_param(p, next_p):
+            ptr_cast = f"({p['type']})"
+            if not used_primary_buf:
+                used_primary_buf = True
+                needs_null_terminate = True
+                eva_args.append(f"{ptr_cast}fuzz_buf")
+                fuzz_args.append(f"{ptr_cast}(fuzz_buf + fuzz_off)")
+            else:
+                vname = f"arg_{i}"
+                eva_lines.append(f"char {vname}[MAX_INPUT_SIZE + 1];")
+                eva_lines.append(f"Frama_C_make_unknown({vname}, MAX_INPUT_SIZE);")
+                eva_lines.append(f"{vname}[MAX_INPUT_SIZE] = '\\0';")
+                eva_args.append(f"{ptr_cast}{vname}")
+                fuzz_lines.append(f"char {vname}[MAX_INPUT_SIZE + 1];")
+                fuzz_lines.append(f"memset({vname}, 0, sizeof({vname}));")
+                fuzz_args.append(f"{ptr_cast}{vname}")
+            i += 1
+            continue
+
+        if p.get("is_fn_pointer"):
+            eva_args.append("NULL")
+            fuzz_args.append("NULL")
+            i += 1
+            continue
+
+        if p["is_pointer"]:
+            pt = p["pointee_type"]
+            vname = f"arg_{i}"
+            eva_lines.append(f"{pt} {vname};")
+            eva_lines.append(f"Frama_C_make_unknown((char *)&{vname}, sizeof({vname}));")
+            eva_args.append(f"&{vname}")
+
+            fuzz_lines.append(f"{pt} {vname};")
+            fuzz_lines.append(f"memset(&{vname}, 0, sizeof({vname}));")
+            fuzz_lines.append(
+                f"if (fuzz_len >= fuzz_off + sizeof({vname})) {{ "
+                f"memcpy(&{vname}, fuzz_buf + fuzz_off, sizeof({vname})); "
+                f"fuzz_off += sizeof({vname}); }}"
+            )
+            fuzz_args.append(f"&{vname}")
+            i += 1
+            continue
+
+        # Scalar integer / enum / struct-by-value parameter
+        st = p["pointee_type"]
+        vname = f"arg_{i}"
+        eva_lines.append(f"{st} {vname};")
+        eva_lines.append(f"Frama_C_make_unknown((char *)&{vname}, sizeof({vname}));")
+        eva_args.append(vname)
+
+        fuzz_lines.append(f"{st} {vname};")
+        fuzz_lines.append(f"memset(&{vname}, 0, sizeof({vname}));")
+        fuzz_lines.append(
+            f"if (fuzz_len >= fuzz_off + sizeof({vname})) {{ "
+            f"memcpy(&{vname}, fuzz_buf + fuzz_off, sizeof({vname})); "
+            f"fuzz_off += sizeof({vname}); }}"
+        )
+        fuzz_args.append(vname)
+        i += 1
+
+    if not used_primary_buf:
+        eva_lines.insert(0, "(void)fuzz_buf; (void)fuzz_len;")
+        fuzz_lines.insert(0, "(void)fuzz_buf; (void)fuzz_len;")
+
+    eva_lines.append(f"{entry_fn}({', '.join(eva_args)});")
+    fuzz_lines.append(f"{entry_fn}({', '.join(fuzz_args)});")
+    eva_stmt = "\n    ".join(eva_lines)
+    fuzz_stmt = "\n    ".join(fuzz_lines)
+    return eva_stmt, fuzz_stmt, needs_null_terminate
+
+
 def _build_invocations(
     entry_fn: str,
     entry_style: str,
@@ -96,7 +619,13 @@ def _build_invocations(
     eva_expr: str | None = None,
     fuzz_expr: str | None = None,
     null_terminate: bool = False,
+    auto_params: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
+    if entry_style == "auto_prototype":
+        eva_stmt, fuzz_stmt, auto_nt = _build_auto_prototype_invocations(entry_fn, auto_params or [])
+        if null_terminate or auto_nt:
+            return _wrap_null_terminated(eva_stmt, fuzz_stmt)
+        return eva_stmt, fuzz_stmt
     if entry_style == "buffer_len":
         eva_call, fuzz_call = f"{entry_fn}(input_buf, input_len);", f"{entry_fn}(bounded_buf, size);"
         if null_terminate:
@@ -459,7 +988,7 @@ def generate_module_harness(
     max_input_size: int,
     cppflags: str,
     out_dir: Path,
-    reachability: str = "untrusted_surface",
+    reachability: str | None = None,
     contract_notes: list[str] | None = None,
     entry_style: str = "buffer_len",
     global_buf: str | None = None,
@@ -472,11 +1001,16 @@ def generate_module_harness(
     eva_expr: str | None = None,
     fuzz_expr: str | None = None,
     null_terminate: bool = False,
+    auto_args: bool = False,
     auto_prelude: bool = True,
     prelude_max_iterations: int = DEFAULT_PRELUDE_MAX_ITERATIONS,
     prelude_clang: str | None = None,
     prelude_runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
+    if auto_args:
+        entry_style = "auto_prototype"
+    if reachability is None:
+        reachability = "internal_api" if entry_style == "auto_prototype" else "untrusted_surface"
     if reachability not in ("untrusted_surface", "internal_api"):
         raise ValueError(f"invalid reachability: {reachability!r}")
     if entry_style not in VALID_ENTRY_STYLES:
@@ -498,7 +1032,13 @@ def generate_module_harness(
         if nh and nh not in norm_extra_includes and nh != norm_header:
             norm_extra_includes.append(nh)
 
-    effective_null_terminate = bool(null_terminate or entry_style == "c_string")
+    auto_params: list[dict[str, Any]] | None = None
+    auto_needs_nt = False
+    if entry_style == "auto_prototype":
+        auto_params = extract_function_prototype(entry_fn, header_include, sources, norm_cppflags)
+        _, _, auto_needs_nt = _build_auto_prototype_invocations(entry_fn, auto_params)
+
+    effective_null_terminate = bool(null_terminate or entry_style == "c_string" or auto_needs_nt)
     eva_call, fuzz_call = _build_invocations(
         entry_fn=entry_fn,
         entry_style=entry_style,
@@ -509,6 +1049,7 @@ def generate_module_harness(
         eva_expr=eva_expr,
         fuzz_expr=fuzz_expr,
         null_terminate=effective_null_terminate,
+        auto_params=auto_params,
     )
 
     inc_lines = [f'#include "{norm_header}"']
@@ -637,6 +1178,7 @@ def record_harness_repair(harness_meta_path: Path, reason: str) -> dict[str, Any
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(description="Generate Dual-Use Eva + E-ACSL LibFuzzer Harness.")
     parser.add_argument("--module", help="Module slice identifier (e.g. snmpv3)")
     parser.add_argument("--sources", nargs="+", help="List of C source files in the module slice")
@@ -655,7 +1197,12 @@ def main(argv: list[str] | None = None) -> int:
         "--entry-style",
         choices=list(VALID_ENTRY_STYLES),
         default="buffer_len",
-        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, or custom",
+        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, or auto_prototype",
+    )
+    parser.add_argument(
+        "--auto-args",
+        action="store_true",
+        help="Synthesize argument bindings automatically from the C prototype of --entry-fn (sets --entry-style=auto_prototype and defaults --reachability=internal_api)",
     )
     parser.add_argument("--global-buf", default=None, help="Global buffer symbol when --entry-style=global_buffer")
     parser.add_argument("--global-len", default=None, help="Optional global length symbol when --entry-style=global_buffer")
@@ -696,6 +1243,14 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.module and args.sources and args.header and args.entry_fn):
         parser.error("--module, --sources, --header, and --entry-fn are required when generating a harness")
 
+    effective_style = "auto_prototype" if args.auto_args else args.entry_style
+    explicit_reachability = any(a == "--reachability" or a.startswith("--reachability=") for a in raw_argv)
+    effective_reachability = (
+        "internal_api"
+        if (effective_style == "auto_prototype" and not explicit_reachability)
+        else args.reachability
+    )
+
     try:
         result = generate_module_harness(
             module_name=args.module,
@@ -705,9 +1260,9 @@ def main(argv: list[str] | None = None) -> int:
             max_input_size=args.max_size,
             cppflags=args.cppflags,
             out_dir=args.out_dir,
-            reachability=args.reachability,
+            reachability=effective_reachability,
             contract_notes=args.contract_note,
-            entry_style=args.entry_style,
+            entry_style=effective_style,
             global_buf=args.global_buf,
             global_len=args.global_len,
             struct_type=args.struct_type,
@@ -718,6 +1273,7 @@ def main(argv: list[str] | None = None) -> int:
             eva_expr=args.eva_expr,
             fuzz_expr=args.fuzz_expr,
             null_terminate=args.null_terminate,
+            auto_args=args.auto_args,
             auto_prelude=args.auto_prelude,
         )
     except ValueError as exc:

@@ -821,3 +821,573 @@ class TestHarnessLegitimacyAndMetadata:
             == 0
         )
 
+    def test_load_agent_result_json_repairs_unescaped_acsl_backslashes(self, run_dir: Path) -> None:
+        """
+        Hand-written result.json containing unescaped ACSL backslashes (\\valid_read, \\forall,
+        \\false, \\base_addr, \\at) is automatically repaired on load and passes schema validation.
+        """
+        from framac_common import load_agent_result_json
+
+        res_file = run_dir / "agents" / "prover-esc" / "scratch" / "result.json"
+        res_file.parent.mkdir(parents=True)
+        # Raw JSON text with unescaped \valid_read (\v -> invalid JSON escape) and \forall/\false (\f -> formfeed)
+        raw_bad_json = (
+            '{\n'
+            '  "role": "prover",\n'
+            '  "agent_id": "prover-esc",\n'
+            '  "file": "src/snmp/ber.c",\n'
+            '  "function": "ber_decode_len",\n'
+            '  "status": "stalled_after_k_retries",\n'
+            '  "patch": null,\n'
+            '  "evidence": [{"tool_output": "workspace/reports/wp/ber.json", "result": "unproven_goals_remain"}],\n'
+            '  "unproven_goals": ["rte: mem_access: \\valid_read(buf + i) && \\forall integer k; \\false || \\at(x, Pre) == 0"],\n'
+            '  "strengthening_requests": [\n'
+            '    {\n'
+            '      "callee": "helper_fn",\n'
+            '      "callee_file": "src/snmp/helper.c",\n'
+            '      "header_file": "src/snmp/helper.h",\n'
+            '      "needed_clause": "ensures \\valid(\\result) && \\base_addr(\\result) == \\base_addr(buf);",\n'
+            '      "reason": "caller needs pointer validity"\n'
+            '    }\n'
+            '  ],\n'
+            '  "boundary_assumptions": [],\n'
+            '  "fault_hypothesis": null\n'
+            '}\n'
+        )
+        res_file.write_text(raw_bad_json, encoding="utf-8")
+
+        loaded = load_agent_result_json(res_file)
+        assert r"\valid_read(buf + i)" in loaded["unproven_goals"][0]
+        assert r"\forall integer k;" in loaded["unproven_goals"][0]
+        assert r"\false" in loaded["unproven_goals"][0]
+        assert r"\at(x, Pre)" in loaded["unproven_goals"][0]
+        assert r"\valid(\result)" in loaded["strengthening_requests"][0]["needed_clause"]
+        assert r"\base_addr(\result)" in loaded["strengthening_requests"][0]["needed_clause"]
+        assert validate_agent_result(loaded) == []
+
+    def test_prover_strengthening_requests_auto_ingested_and_run_status_flipped(self, run_dir: Path) -> None:
+        """
+        1. ingest-agent-hypothesis automatically records prover strengthening_requests into
+           workspace/reports/strengthen_requests.json (inferring callee_file when omitted).
+        2. Adding an unverified candidate when run_status is 'complete' automatically flips
+           run-metadata.json back to 'in_progress'.
+        """
+        import contract_negotiator
+
+        write_json(run_dir / "run-metadata.json", metadata("complete"))
+        u_caller = unit(
+            "src/LibPtfCom/SyncMem.c",
+            "GetInt",
+            "rte",
+            status="blocked",
+            module="syncmem",
+            evidence=[{
+                "phase": "wp",
+                "producer": "run_wp_function.py",
+                "result": "wp_unproven",
+                "discharging": False,
+                "tool_output": "workspace/reports/wp/GetInt.json",
+                "summary": "1 unproven goal",
+            }],
+            unresolved=["unproven index_bound"],
+        )
+        u_callee = unit(
+            "src/LibPtfCom/SyncMem.c",
+            "Hash",
+            "rte",
+            status="covered",
+            module="syncmem",
+            evidence=[{
+                "phase": "wp",
+                "producer": "run_wp_function.py",
+                "result": "wp_all_proved",
+                "discharging": True,
+                "tool_output": "workspace/reports/wp/GetInt.json",
+                "summary": "All goals proved",
+            }],
+        )
+        write_json(
+            run_dir / "coverage-ledger.json",
+            sorted([u_caller, u_callee], key=lambda u: u["coverage_id"]),
+        )
+        write_json(run_dir / "workspace/reports/wp/GetInt.json", {"status": "unproven_goals_remain"})
+
+        prover_res_path = run_dir / "agents" / "prover-getint" / "scratch" / "result.json"
+        prover_res = {
+            "role": "prover",
+            "agent_id": "prover-getint",
+            "file": "src/LibPtfCom/SyncMem.c",
+            "function": "GetInt",
+            "status": "stalled_after_k_retries",
+            "patch": None,
+            "evidence": [{"tool_output": "workspace/reports/wp/GetInt.json", "result": "unproven_goals_remain"}],
+            "unproven_goals": ["rte: index_bound: 0 <= HashIndex < 256"],
+            "strengthening_requests": [
+                {
+                    "callee": "Hash",
+                    "header_file": "src/LibPtfCom/SyncMem.h",
+                    "needed_clause": r"ensures 0 <= \result < MaxValue;",
+                    "reason": "GetInt indexes G_HashTable[HashIndex] without checking negative return.",
+                }
+            ],
+            "boundary_assumptions": [],
+            "fault_hypothesis": {
+                "input_condition": "Name with high-bit bytes causing negative signed char sum in Hash()",
+                "predicate": "0 <= HashIndex",
+                "why_not_reproduced": "UpdateSyncMem crashes at line 828 before reaching HashTableUpdateInt.",
+            },
+        }
+        write_json(prover_res_path, prover_res)
+
+        out = ledger.cmd_ingest_agent_hypothesis(prover_res_path, module="syncmem")
+        assert out["candidates_added"] == 1
+        assert out["strengthening_requests_added"] == 1
+
+        # Verify strengthening_requests.json was populated and callee_file was auto-inferred
+        req_file = run_dir / "workspace/reports/strengthen_requests.json"
+        assert req_file.is_file()
+        listed = contract_negotiator.cmd_list(req_file, status_filter="pending")
+        assert listed["count"] == 1
+        assert listed["requests"][0]["callee_function"] == "Hash"
+        assert listed["requests"][0]["callee_file"] == "src/LibPtfCom/SyncMem.c"
+
+        # Verify run-metadata.json was automatically transitioned from 'complete' to 'in_progress'
+        meta_after = json.loads((run_dir / "run-metadata.json").read_text(encoding="utf-8"))
+        assert meta_after["run_status"] == "in_progress"
+        assert validate_run_dir(run_dir) == []
+
+    def test_prepare_agent_renders_brief_and_initializes_overlay(self, run_dir: Path, tmp_path: Path) -> None:
+        """workspace_overlay.prepare_agent initializes the agent overlay and renders a populated brief.md."""
+        import workspace_overlay as wo_mod
+
+        target = tmp_path / "target_prep"
+        target.mkdir()
+        (target / "src").mkdir()
+        (target / "src/SyncMem.c").write_text("int Hash(const char *Name, int MaxValue) { return 0; }\n", encoding="utf-8")
+        (target / "src/SyncMem.h").write_text("int Hash(const char *Name, int MaxValue);\n", encoding="utf-8")
+
+        wo_mod.init_overlay(target, run_dir / "workspace")
+        write_json(
+            run_dir / "workspace/reports/callgraph_dag.json",
+            {
+                "functions": {
+                    "Hash": {
+                        "name": "Hash",
+                        "file": "src/SyncMem.c",
+                        "module": "syncmem",
+                        "wave": 0,
+                        "security_properties": [],
+                    }
+                },
+                "modules": {"syncmem": {"tier": "Tier 1"}},
+            },
+        )
+        write_json(
+            run_dir / "coverage-ledger.json",
+            [unit("src/SyncMem.c", "Hash", "rte", status="planned", module="syncmem")],
+        )
+        write_json(
+            run_dir / "workspace/harnesses/harness_syncmem.json",
+            {
+                "module": "syncmem",
+                "sources": ["workspace/work/src/SyncMem.c", "workspace/stubs/ptf_stubs.c"],
+                "header": "src/SyncMem.h",
+                "cppflags": "-Iworkspace/work/src",
+                "ldflags": "-lbsd",
+                "entry_fn": "UpdateSyncMem",
+                "reachability": "untrusted_surface",
+            },
+        )
+        stubs_dir = run_dir / "workspace/stubs"
+        stubs_dir.mkdir(parents=True, exist_ok=True)
+        (stubs_dir / "ptf_stubs.c").write_text("int ptf_stub(void) { return 0; }\n", encoding="utf-8")
+        write_json(
+            run_dir / "workspace/reports/eva/syncmem.json",
+            {
+                "status": "ok",
+                "unknown_obligations_by_function": {
+                    "Hash": [{"kind": "signed_overflow", "line": 42, "annotation": "x + y <= 2147483647"}]
+                },
+            },
+        )
+
+        prep = wo_mod.prepare_agent(
+            run_dir=run_dir,
+            agent_id="prover-hash",
+            role="prover",
+            module="syncmem",
+            function="Hash",
+        )
+        assert prep["ok"] is True
+        assert prep["file"] == "src/SyncMem.c"
+        assert prep["header"] == "src/SyncMem.h"
+        assert "--ldflags '-lbsd'" in prep["merge_command"]
+        brief_text = (run_dir / prep["brief_file"]).read_text(encoding="utf-8")
+        assert "prover-hash" in brief_text
+        assert "Hash" in brief_text
+        assert "--ldflags '-lbsd'" in brief_text
+        assert "agents/prover-hash/scratch/work/src/SyncMem.c" in brief_text
+        assert "workspace/stubs/ptf_stubs.c" in brief_text
+        assert "scratch/work/workspace/stubs/ptf_stubs.c" not in brief_text
+
+        # Also test prepare_agent with role="verifier" and candidate_fp
+        write_json(
+            run_dir / "candidates.json",
+            [
+                {
+                    "fingerprint": r"src/SyncMem.c#GetStr::rte: mem_access: \valid(OutValue)",
+                    "module": "syncmem",
+                    "status": "unverified",
+                }
+            ],
+        )
+        prep_ver = wo_mod.prepare_agent(
+            run_dir=run_dir,
+            agent_id="verifier-1",
+            role="verifier",
+            candidate_fp=r"src/SyncMem.c#GetStr::rte: mem_access: \valid(OutValue)",
+        )
+        assert prep_ver["ok"] is True
+        ver_brief = (run_dir / prep_ver["brief_file"]).read_text(encoding="utf-8")
+        assert "{candidate_short}" not in ver_brief
+        assert "--ldflags '-lbsd'" in ver_brief
+        assert "workspace/stubs/ptf_stubs.c" in ver_brief
+        assert "workspace/work/workspace/stubs/ptf_stubs.c" not in ver_brief
+
+    def test_load_agent_result_json_repairs_json_dumps_unicode_control_escapes(self, tmp_path: Path) -> None:
+        """
+        When a subagent uses json.dumps() on a non-raw Python string containing \\valid, \\at,
+        \\base_addr, \\forall, or \\false, json.dumps serializes \\x0b as \\u000b and \\x07 as \\u0007.
+        load_agent_result_json must repair those back to \\valid, \\at, \\base_addr, \\forall, \\false.
+        """
+        from framac_common import load_agent_result_json
+
+        # Deliberately non-raw string passed to json.dumps
+        non_raw_payload = {
+            "clause": "ensures \valid(p) && \valid_read(q) && \at(x, Old) == 0 && \base_addr(p) == \base_addr(q) && \forall integer i; \false == \false;"
+        }
+        p = tmp_path / "result_unicode_ctrl.json"
+        p.write_text(json.dumps(non_raw_payload), encoding="utf-8")
+        raw_on_disk = p.read_text(encoding="utf-8")
+        assert "\\u000balid" in raw_on_disk
+        assert "\\u0007t" in raw_on_disk
+
+        loaded = load_agent_result_json(p)
+        assert loaded["clause"] == (
+            r"ensures \valid(p) && \valid_read(q) && \at(x, Old) == 0 && "
+            r"\base_addr(p) == \base_addr(q) && \forall integer i; \false == \false;"
+        )
+
+    def test_generate_harness_auto_prototype_for_internal_api_functions(self, tmp_path: Path) -> None:
+        """
+        Tests --auto-args / --entry-style=auto_prototype on:
+        1. int Hash(const char *Name, int MaxValue)
+        2. int GetInt(const char *Name, int *Value)
+        3. int ParsePacket(const uint8_t *buf, size_t len, uint16_t flags)
+        4. int GetStr(const char *Name, char *OutValue) -> secondary char* gets distinct stack buffer
+        5. Static function in .c file preceded by a caller invoking it inside a function body
+        """
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        hdr = src_dir / "SyncMem.h"
+        hdr.write_text(
+            "#ifdef __cplusplus\n"
+            'extern "C" {\n'
+            "#endif\n"
+            '#define CALL_DEFAULT RegisterCallback("x", 0, 0);\n'
+            "int Hash(const char *Name, int MaxValue);\n"
+            "int GetInt(const char *Name, int *Value);\n"
+            "int GetStr(const char *Name, char *OutValue);\n"
+            "int ParsePacket(const uint8_t *buf, size_t len, unsigned short flags);\n"
+            "int RegisterCallback(const char *Name, int (*cb)(int, int), int Flags) __attribute__((nonnull(1)));\n"
+            "const char* DispatchRaw(const uint8_t *, size_t, int (*)(void *), unsigned short, struct Ctx, int x __attribute__((unused)));\n"
+            "#ifdef __cplusplus\n"
+            "}\n"
+            "#endif\n",
+            encoding="utf-8",
+        )
+        c_file = src_dir / "SyncMem.c"
+        c_file.write_text(
+            "void CallerBeforeDef(int x) {\n"
+            "    InternalHelper(x + 1, 42);\n"
+            "}\n"
+            "static int InternalHelper(const char *Name, int MaxValue) {\n"
+            "    return MaxValue;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        out_dir = tmp_path / "harnesses"
+
+        # 1. Hash(const char *Name, int MaxValue) via CLI --auto-args
+        rc = generate_harness.main(
+            [
+                "--module",
+                "sync_hash",
+                "--sources",
+                str(c_file),
+                "--header",
+                str(hdr),
+                "--entry-fn",
+                "Hash",
+                "--auto-args",
+                "--no-auto-prelude",
+                "--out-dir",
+                str(out_dir),
+            ]
+        )
+        assert rc == 0
+        hash_c = (out_dir / "harness_sync_hash.c").read_text(encoding="utf-8")
+        hash_meta = json.loads((out_dir / "harness_sync_hash.json").read_text(encoding="utf-8"))
+        assert hash_meta["entry_style"] == "auto_prototype"
+        assert hash_meta["reachability"] == "internal_api"
+        assert hash_meta["null_terminate"] is True
+        assert "cstr_buf[size] = 0;" in hash_c
+        assert "int arg_1;" in hash_c
+        assert "Hash((const char *)(fuzz_buf + fuzz_off), arg_1);" in hash_c
+
+        # 2. GetInt(const char *Name, int *Value)
+        res_get = generate_harness.generate_module_harness(
+            module_name="sync_getint",
+            sources=[str(c_file)],
+            header_include=str(hdr),
+            entry_fn="GetInt",
+            max_input_size=512,
+            cppflags=f"-I{src_dir.as_posix()}",
+            out_dir=out_dir,
+            auto_args=True,
+            auto_prelude=False,
+        )
+        get_c = (out_dir / "harness_sync_getint.c").read_text(encoding="utf-8")
+        assert res_get["null_terminate"] is True
+        assert res_get["reachability"] == "internal_api"
+        assert "int arg_1;" in get_c
+        assert "GetInt((const char *)(fuzz_buf + fuzz_off), &arg_1);" in get_c
+
+        # 3. ParsePacket(const uint8_t *buf, size_t len, unsigned short flags)
+        res_pkt = generate_harness.generate_module_harness(
+            module_name="sync_pkt",
+            sources=[str(c_file)],
+            header_include=str(hdr),
+            entry_fn="ParsePacket",
+            max_input_size=512,
+            cppflags=f"-I{src_dir.as_posix()}",
+            out_dir=out_dir,
+            auto_args=True,
+            auto_prelude=False,
+        )
+        pkt_c = (out_dir / "harness_sync_pkt.c").read_text(encoding="utf-8")
+        assert res_pkt["null_terminate"] is False
+        assert "unsigned short arg_2;" in pkt_c
+        assert "ParsePacket((const uint8_t *)(fuzz_buf + fuzz_off), (size_t)(fuzz_len - fuzz_off), arg_2);" in pkt_c
+
+        # 4. GetStr(const char *Name, char *OutValue) -> distinct stack buffer for OutValue
+        res_str = generate_harness.generate_module_harness(
+            module_name="sync_getstr",
+            sources=[str(c_file)],
+            header_include=str(hdr),
+            entry_fn="GetStr",
+            max_input_size=512,
+            cppflags=f"-I{src_dir.as_posix()}",
+            out_dir=out_dir,
+            auto_args=True,
+            auto_prelude=False,
+        )
+        str_c = (out_dir / "harness_sync_getstr.c").read_text(encoding="utf-8")
+        assert res_str["null_terminate"] is True
+        assert "char arg_1[MAX_INPUT_SIZE + 1];" in str_c
+        assert "GetStr((const char *)(fuzz_buf + fuzz_off), (char *)arg_1);" in str_c
+
+        # 5. InternalHelper defined in .c after a caller invoking InternalHelper(x + 1, 42);
+        params_helper = generate_harness.extract_function_prototype(
+            "InternalHelper",
+            header_include=str(hdr),
+            sources=[str(c_file)],
+        )
+        assert len(params_helper) == 2
+        assert params_helper[0]["type"] == "const char *"
+        assert params_helper[1]["type"] == "int"
+
+        # 6. RegisterCallback(const char *Name, int (*cb)(int, int), int Flags) -> nested parens & fn pointer
+        params_cb = generate_harness.extract_function_prototype(
+            "RegisterCallback",
+            header_include=str(hdr),
+            sources=[str(c_file)],
+        )
+        assert len(params_cb) == 3
+        assert params_cb[1]["name"] == "cb"
+        assert params_cb[1]["type"] == "int (*)(int, int)"
+        assert params_cb[1]["is_fn_pointer"] is True
+        assert params_cb[2]["name"] == "Flags"
+        assert params_cb[2]["type"] == "int"
+
+        res_cb = generate_harness.generate_module_harness(
+            module_name="sync_cb",
+            sources=[str(c_file)],
+            header_include=str(hdr),
+            entry_fn="RegisterCallback",
+            max_input_size=512,
+            cppflags=f"-I{src_dir.as_posix()}",
+            out_dir=out_dir,
+            auto_args=True,
+            auto_prelude=False,
+        )
+        cb_c = (out_dir / "harness_sync_cb.c").read_text(encoding="utf-8")
+        assert res_cb["null_terminate"] is True
+        assert "int arg_2;" in cb_c
+        assert "RegisterCallback((const char *)fuzz_buf, NULL, arg_2);" in cb_c
+        assert "RegisterCallback((const char *)(fuzz_buf + fuzz_off), NULL, arg_2);" in cb_c
+
+        # 7. DispatchRaw: attached pointer return type, unnamed params (size_t, int (*)(void *), unsigned short, struct Ctx), and param __attribute__((unused))
+        params_raw = generate_harness.extract_function_prototype(
+            "DispatchRaw",
+            header_include=str(hdr),
+            sources=[str(c_file)],
+        )
+        assert len(params_raw) == 6
+        assert params_raw[0]["type"] == "const uint8_t *"
+        assert params_raw[1]["type"] == "size_t"
+        assert params_raw[1]["name"] == "arg_1"
+        assert params_raw[2]["type"] == "int (*)(void *)"
+        assert params_raw[2]["is_fn_pointer"] is True
+        assert params_raw[2]["name"] == "arg_2"
+        assert params_raw[3]["type"] == "unsigned short"
+        assert params_raw[3]["pointee_type"] == "unsigned short"
+        assert params_raw[4]["type"] == "struct Ctx"
+        assert params_raw[4]["pointee_type"] == "struct Ctx"
+        assert params_raw[5]["type"] == "int"
+        assert params_raw[5]["name"] == "x"
+        assert params_raw[5]["is_fn_pointer"] is False
+
+    def test_run_fuzz_campaign_parallel_workers_and_jobs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        run_fuzz_campaign coordinates -jobs and -workers when either is > 1, scales CPU/wall
+        timeouts, and reads worker logs (fuzz-*.log) from the scratch directory.
+        """
+        import run_eacsl_fuzz as fuzz_mod
+        import sandbox_exec as sb_mod
+
+        bin_path = tmp_path / "fuzz_bin"
+        bin_path.write_text("", encoding="utf-8")
+        corpus_dir = tmp_path / "corpus"
+        artifacts_dir = tmp_path / "crashes"
+
+        captured: dict = {}
+
+        def fake_run_sandboxed(cmd, writable, timeout_s, limits=None, extra_env=None):
+            captured["cmd"] = list(cmd)
+            captured["timeout_s"] = timeout_s
+            captured["cpu_seconds"] = limits.cpu_seconds if limits else None
+            scratch_dir = writable[0]
+            crash_file = artifacts_dir / "crash-deadbeef"
+            crash_file.write_bytes(b"ABCD")
+            (scratch_dir / "fuzz-0.log").write_text(
+                f"Test unit written to {crash_file}\nSUMMARY: AddressSanitizer:Frama-C-E-ACSL\n",
+                encoding="utf-8",
+            )
+            return sb_mod.SandboxResult(returncode=77, stdout="", stderr="", timed_out=False, sandbox="rlimits")
+
+        def fake_replay(binary, input_file, scratch_dir, timeout_s=30):
+            return {
+                "reproduced": True,
+                "reproducible": True,
+                "returncode": 77,
+                "log_tail": "",
+                "failure": {
+                    "file": "src/SyncMem.c",
+                    "line": 42,
+                    "function": "Hash",
+                    "kind": "rte: mem_access",
+                    "alarm_kind": "rte: mem_access",
+                    "predicate": r"\valid(p)",
+                    "raw_message": "Assertion failed",
+                },
+            }
+
+        monkeypatch.setattr(fuzz_mod, "run_sandboxed", fake_run_sandboxed)
+        monkeypatch.setattr(fuzz_mod, "replay_artifact", fake_replay)
+
+        report = fuzz_mod.run_fuzz_campaign(
+            binary=bin_path,
+            corpus_dir=corpus_dir,
+            artifacts_dir=artifacts_dir,
+            max_time=30,
+            workers=4,
+            jobs=1,
+        )
+        assert "-jobs=4" in captured["cmd"]
+        assert "-workers=4" in captured["cmd"]
+        assert captured["timeout_s"] == 30 + 180
+        assert captured["cpu_seconds"] == (30 + 180) * 5
+        assert report["status"] == "crash_found"
+        assert len(report["artifacts"]) == 1
+
+    def test_wp_unsigned_downcast_and_bitwise_retry(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        Tests Workstream 3:
+        1. scan_wp_log_soundness records '-no-warn-unsigned-downcast' when warn_unsigned_downcast=False.
+        2. run_wp_on_function tags unsigned_downcast goals with c11_modulo_candidate=True and
+           automatically retries unproven bitwise/shift goals with -wp-model Typed+ref+int.
+        """
+        import subprocess
+        import run_wp_function as wp_mod
+
+        snd = wp_mod.scan_wp_log_soundness("", warn_unsigned_downcast=False)
+        assert "-no-warn-unsigned-downcast" in snd["reduced_checks"]
+
+        c_file = tmp_path / "cksum.c"
+        c_file.write_text("unsigned short InCksum(unsigned int sum) { return (unsigned short)~(sum >> 16); }\n", encoding="utf-8")
+        out_dir = tmp_path / "wp_out"
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            csv_file = out_dir / "wp_InCksum.csv"
+            if "-wp" in cmd:
+                model_idx = cmd.index("-wp-model") + 1
+                model = cmd[model_idx]
+                out_dir.mkdir(parents=True, exist_ok=True)
+                if model == "Typed":
+                    # First attempt under Typed fails on a shift/downcast goal
+                    csv_file.write_text(
+                        "directory\tfile\tfunction\tline\tkind\tstatus\tproperty\n"
+                        ".\tcksum.c\tInCksum\t1\trte: unsigned_downcast\tUnknown\t(sum >> 16) <= 65535\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    # Retry under Typed+ref+int discharges the goal!
+                    csv_file.write_text(
+                        "directory\tfile\tfunction\tline\tkind\tstatus\tproperty\n"
+                        ".\tcksum.c\tInCksum\t1\trte: unsigned_downcast\tValid\t(sum >> 16) <= 65535\n",
+                        encoding="utf-8",
+                    )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(wp_mod.subprocess, "run", fake_run)
+
+        # First test without retry to verify c11_modulo_candidate tagging
+        res_no_retry = wp_mod.run_wp_on_function(
+            c_file=c_file,
+            fn_name="InCksum",
+            out_dir=out_dir,
+            retry_bitwise=False,
+            warn_unsigned_downcast=False,
+        )
+        assert res_no_retry["status"] == "unproven_goals_remain"
+        assert res_no_retry["unproven_goals"][0]["c11_modulo_candidate"] is True
+        assert "-no-warn-unsigned-downcast" in res_no_retry["soundness"]["reduced_checks"]
+
+        # Now test with retry_bitwise=True -> automatically retries with Typed+ref+int and proves the goal
+        res_retry = wp_mod.run_wp_on_function(
+            c_file=c_file,
+            fn_name="InCksum",
+            out_dir=out_dir,
+            retry_bitwise=True,
+        )
+        assert res_retry["status"] == "all_proven"
+        assert res_retry["bitwise_retry"]["triggered"] is True
+        assert res_retry["bitwise_retry"]["wp_model"] == "Typed+ref+int"
+        assert res_retry["bitwise_retry"]["timeout"] == 30
+
+
+
