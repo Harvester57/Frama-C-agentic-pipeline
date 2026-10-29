@@ -70,6 +70,8 @@ The fuzzer, and every crash replay, runs inside the hardened container through `
 
 *(Never pass `-fsanitize=address` alongside E-ACSL's memory tracking runtime in the same binary, as both intercept `malloc`/`free` and map conflicting shadow memory.)*
 
+For E-ACSL behaviour not covered here, start with [`docs/references/e-acsl-quickref.md`](../../docs/references/e-acsl-quickref.md), which covers `e-acsl-gcc` and `-e-acsl-*` options, runtime output and limitations. Then grep the E-ACSL plug-in manual (Frama-C 33.0) in [`docs/references/`](../../docs/references/README.md). The manual's examples mix old and new option spellings, so check any flag against `e-acsl-gcc -h` in the container.
+
 ---
 
 ## Step 3 — Read Outcomes and Ingest

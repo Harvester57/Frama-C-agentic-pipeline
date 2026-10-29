@@ -69,7 +69,10 @@ param(
     [string]$Memory = $(if ($env:FRAMAC_MEMORY) { $env:FRAMAC_MEMORY } else { "8g" }),
 
     [Parameter(Mandatory = $false)]
-    [int]$PidsLimit = 4096,
+    [int]$Agents = $(if ($env:FRAMAC_CONCURRENT_AGENTS) { [int]$env:FRAMAC_CONCURRENT_AGENTS } else { 1 }),
+
+    [Parameter(Mandatory = $false)]
+    [int]$PidsLimit = $(if ($env:FRAMAC_PIDS_LIMIT) { [int]$env:FRAMAC_PIDS_LIMIT } else { 4096 }),
 
     # Legacy switches kept only so old command lines bind; both fail hard below.
     [Parameter(Mandatory = $false)]
@@ -98,6 +101,23 @@ foreach ($legacy in @("NoInnerSandbox", "AllowDegradedSandbox")) {
             "binaries run under scripts/sandbox_exec.py (rlimits, env allowlist, timeout). Drop -$legacy from the command line."
         )
         exit 2
+    }
+}
+
+if ($Agents -gt 1) {
+    if (-not $PSBoundParameters.ContainsKey("Cpus") -and -not $env:FRAMAC_CPUS) {
+        $divCpus = [Math]::Max(2, [int][Math]::Floor([Environment]::ProcessorCount / $Agents))
+        $Cpus = [string]$divCpus
+    }
+    if (-not $PSBoundParameters.ContainsKey("Memory") -and -not $env:FRAMAC_MEMORY) {
+        $memNum = 8
+        if ($Memory -match '^(\d+)g$') { $memNum = [int]$Matches[1] }
+        $divMem = [Math]::Max(2, [int][Math]::Floor($memNum / $Agents))
+        $Memory = "${divMem}g"
+    }
+    if (-not $PSBoundParameters.ContainsKey("PidsLimit") -and -not $env:FRAMAC_PIDS_LIMIT) {
+        $divPids = [Math]::Max(512, [int][Math]::Floor(4096 / $Agents))
+        $PidsLimit = $divPids
     }
 }
 
@@ -203,6 +223,7 @@ $dockerArgs += @(
     "-v", "${PipelineRoot}/scripts:/opt/framac-pipeline/scripts:ro",
     "-v", "${PipelineRoot}/templates:/opt/framac-pipeline/templates:ro",
     "-v", "${PipelineRoot}/schemas:/opt/framac-pipeline/schemas:ro",
+    "-v", "${PipelineRoot}/skills:/opt/framac-pipeline/skills:ro",
     "-w", "/framac-run",
     "$Image",
     "$CmdString"

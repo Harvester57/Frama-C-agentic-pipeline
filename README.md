@@ -56,7 +56,8 @@ frama-c/
 │   ├── run_metadata.py                       # run-metadata.json (source ref, profile, toolchain, run status)
 │   ├── validate_artifacts.py                 # Schema + semantic validators for all shared artifacts
 │   ├── minischema.py, framac_common.py       # Stdlib-only JSON Schema subset & shared helpers
-│   └── generate_report.py                    # Derives REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif
+│   ├── generate_report.py                    # Derives REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif
+│   └── extract_references.py                 # Host-side: converts docs/references/*.pdf into greppable .md + INDEX.md
 ├── schemas/                                  # findings, candidates, coverage-ledger, run-metadata, agent-result contracts
 ├── tests/                                    # pytest suite (python -m pytest tests)
 ├── templates/
@@ -84,7 +85,8 @@ frama-c/
     ├── security-properties.md                # Proving Security Layers 1-6 in ACSL
     ├── agentic-swarm.md                      # Wavefront DAG parallelism, Dual Oracle, & Contract Negotiation
     ├── v2-design.md                          # Evidence discipline: verdicts, ledger, isolation, milestones
-    └── troubleshooting.md                    # Common Frama-C, E-ACSL, Eva, and WP troubleshooting guide
+    ├── troubleshooting.md                    # Common Frama-C, E-ACSL, Eva, and WP troubleshooting guide
+    └── references/                           # Upstream manuals (acsl/ language specs, one folder per plug-in): PDFs, greppable .md twins, INDEX.md, e-acsl-quickref.md
 ```
 
 ---
@@ -133,3 +135,4 @@ Pass the printed run directory as `-RunDir` for every later command of the same 
 - [Proving Security Properties Beyond Memory Safety (`docs/security-properties.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/security-properties.md)
 - [Multi-Agent Swarm & Dual-Oracle Guardrail (`docs/agentic-swarm.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/agentic-swarm.md)
 - [Troubleshooting Guide (`docs/troubleshooting.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/troubleshooting.md)
+- [Frama-C Reference Manuals (`docs/references/README.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/references/README.md): how to grep the upstream manuals instead of reading them whole

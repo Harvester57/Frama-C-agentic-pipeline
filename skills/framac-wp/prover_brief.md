@@ -58,7 +58,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 1. If an RTE assertion (`mem_access`, `signed_overflow`, `unsigned_overflow`, `division_by_zero`, `index_bound`, `pointer_value`) or security postcondition remains unproven after loop invariants are valid:
    - Isolate the failing goal by passing `--prop <clause_name> --dump-goal` to `run_wp_function.py` and read `vc_goal_dumps` in the JSON output to see the exact `Goal ... : ... Prove: ...` sequent.
    - Check if `{function_name}` relies on caller guarantees (e.g., `len <= MAX_PDU_SIZE`, `buf != \null`, `\valid_read(buf + (0 .. len - 1))`). Add the minimal necessary `requires` clause to `agents/{agent_id}/scratch/work/{header_file}`, subject to Rule 3.
-   - Check if `{function_name}` fails because a **callee function `g()`** has a weak contract in its `.h` header. Do not edit `g()`; add an entry to `strengthening_requests` in your result (`callee`, `header_file`, `needed_clause`, `reason`).
+    - Check if `{function_name}` fails because a **callee function `g()`** has a weak contract in its `.h` header. Do not edit `g()`; add an entry to `strengthening_requests` in your result (`callee`, `header_file`, optional `callee_file`, `needed_clause`, `reason`).
 2. **Common ACSL Traps to Avoid:**
    - **Never negate a C comparison result directly in ACSL:** write `cmp(a, b) == 0` instead of `!cmp(a, b)` (`!` requires a `boolean` term, whereas C functions return `int`).
    - **`\at(expr, Old)` distributes over array indexing:** `\at(a[i], Pre)` evaluates `a[\at(i, Pre)]` in the `Pre` state. Inside a loop where `k` is quantified, write `\at(a, Pre)[k]` or `loop invariant \forall integer k; 0 <= k < i ==> a[k] == \at(a[k], LoopEntry);`.
@@ -74,7 +74,7 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
 
 1. **Oracle 1 — Dynamic Anti-Hallucination Guardrail (`E-ACSL`):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags '-Iagents/{agent_id}/scratch/work {cppflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags '-Iagents/{agent_id}/scratch/work {cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
    ```
    The shared corpus is replayed read-only; new units and artifacts stay in your scratch directory.
    - `rejected_overconstrained`: one of your annotations is FALSE on a real input. Read `runtime_trace` and `failure`, and fix it.
@@ -86,11 +86,15 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
    ```
    `proven_under_hyp_count` goals rely on callee contracts; they are acceptable but are recorded as assumptions.
 
+## Reference Manuals (Last Resort)
+
+The Frama-C manuals are available as greppable Markdown under `{references_dir}`. Use them only when this brief and the tool output do not explain an ACSL parse or typing error, the meaning of a construct, or a WP option or message. Grep `{references_dir}/INDEX.md` for the topic and Read only the line range it reports (at most ~200 lines). Never read a manual whole; `{references_dir}/README.md` has the recipe. Start with the ACSL reference `acsl/frama-c-acsl-implementation.md`: contracts §2.3, loop annotations §2.4.2, `\at` §2.4.3, termination §2.5, logic definitions §2.6, memory built-ins §2.7. For WP itself, use `wp/frama-c-wp-manual.md`: supported annotations §2.1, options §2.4. The E-ACSL guardrail does not execute `assigns`, `loop assigns`, `decreases`, or lemmas (`acsl/e-acsl-implementation.md`, Figure 1.1), so only WP validates those clauses.
+
 ## Exit Criteria and Result
 
 - Finish when `agents/{agent_id}/scratch/wp_{function_name}.json` reports `"status": "all_proven"` AND the guardrail reports `passed_dynamic_oracle`, or after `{max_retries}` full iterations with `unproven_goals_remain` (`stalled_after_k_retries`).
 - Write your final annotation diff (against `agents/{agent_id}/scratch/base/`) to `agents/{agent_id}/scratch/{function_name}.patch` and reference it in `patch`. The parent splices your scratch overlay into `workspace/work/` via `workspace_overlay.py merge-agent` and re-verifies on the merged tree.
-- Return **exactly one JSON object** and no surrounding prose:
+- Always write `agents/{agent_id}/scratch/result.json` using `python3 -c "import json, pathlib; pathlib.Path('agents/{agent_id}/scratch/result.json').write_text(json.dumps(res, indent=2))"` so ACSL backslashes (`\valid`, `\forall`, `\false`, `\at`) are properly JSON-escaped, and return **exactly one JSON object** and no surrounding prose:
 
 ```json
 {

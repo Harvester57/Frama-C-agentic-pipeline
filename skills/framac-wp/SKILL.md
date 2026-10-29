@@ -38,28 +38,30 @@ Modular deductive verification stage powered by a **Wavefront Parallel Subagent 
 - The parent is the only writer of `coverage-ledger.json`, `candidates.json`, `findings.json`, `workspace/work/`, `workspace/corpus/`, and `workspace/crashes/`.
 - Before spawning any `architect` or `prover`, run:
   ```text
-  python3 $S/workspace_overlay.py init-agent --agent-id <agent-id>
+  python3 $S/workspace_overlay.py prepare-agent --agent-id <agent-id> --role <architect|prover|breaker|verifier> [--module <mod>] [--function <fn>] [--file <c_file>] [--header <h_file>] [--candidate-fp '<fp>']
   ```
+- `prepare-agent` snapshots `workspace/work/` into `agents/<agent-id>/scratch/work/`, transitions planned ledger units to `in_progress` (for provers), and renders `agents/<agent-id>/brief.md` with all template variables (`{scratch_module_sources}`, `{module_sources}`, `{cppflags}`, `{ldflags}`, `{coverage_ids_json}`, etc.) pre-filled.
 - Every subagent writes only under `agents/<agent-id>/scratch/` and returns **one JSON object** validated with `validate_artifacts.py agent-result`.
-- Provers and architects may add **pure ACSL annotations only** (`/*@ ... */`, `//@ ...`) within their assigned function/header scope. `workspace_overlay.py merge-agent` mechanically rejects any C token modification, scope violation, or `admit`/`axiom` directive, and rolls back if parent-side guardrail or WP re-verification fails on the merged `workspace/work/` tree.
+- Every brief has a `{references_dir}` placeholder. Fill it with the absolute host path of this repository's `docs/references/` (this skill's `../../docs/references`, next to `wrappers/`). That folder holds greppable Frama-C manuals (see its [`README.md`](../../docs/references/README.md)), which subagents grep only as a last resort.
+- Provers and architects may add **pure ACSL annotations only** (`/*@ ... */`, `//@ ...`) within their assigned function/header scope. `workspace_overlay.py merge-agent` and `merge-batch` mechanically reject any C token modification, scope violation, or `admit`/`axiom` directive, deduplicate shared header declarations, and roll back if parent-side guardrail or WP re-verification fails on the merged `workspace/work/` tree.
 
 ---
 
 ## Step-by-Step Orchestration Instructions
 
-`S=/opt/framac-pipeline/scripts`; all commands run through the wrapper with `-TargetDir <target-dir> -RunDir <run-dir>`.
+`S=/opt/framac-pipeline/scripts`; all commands run through the wrapper with `-TargetDir <target-dir> -RunDir <run-dir>` (pass `-Agents <N>` / `--agents <N>` when running `N` concurrent subagent containers).
 
 ### Step 0 — Run the Pre-WP Crash Verification Gate
 
 Check `candidates.json` for entries with `"status": "unverified"`:
-1. For each unverified candidate, spawn a fresh subagent with `crash_verifier_brief.md` (`agent_id: verifier-<n>`).
+1. For each unverified candidate, prepare and spawn a fresh subagent with `crash_verifier_brief.md` (`python3 $S/workspace_overlay.py prepare-agent --agent-id verifier-<n> --role verifier --candidate-fp '<fp>'`).
 2. Validate its JSON result (`python3 $S/validate_artifacts.py agent-result agents/<verifier-id>/scratch/result.json`), then ingest:
    ```text
    python3 $S/ledger.py ingest-verifier agents/<verifier-id>/scratch/result.json [--replay-report <fuzz.json>] --harness-meta workspace/harnesses/harness_<mod>.json
    ```
 3. If `decision == "rejected"` with `rejection_class == "harness_induced"` and `harness_exhausted == false`:
    - Record the repair attempt: `python3 $S/generate_harness.py --record-repair workspace/harnesses/harness_<mod>.json --reason "<reason>"`
-   - Update `workspace/harnesses/harness_<mod>.c`, re-run Phase 1 (`/framac-fuzz`) and Phase 2 (`/framac-eva`) for `<mod>`, and re-run Step 0 on any resulting candidates.
+   - Update `workspace/harnesses/harness_<mod>.c` (or regenerate with `--auto-args` / `--entry-style auto_prototype` if targeting an internal multi-argument function), re-run Phase 1 (`/framac-fuzz`) and Phase 2 (`/framac-eva`) for `<mod>`, and re-run Step 0 on any resulting candidates.
 
 ### Step 1 — Load the Topological Work Queue
 
@@ -69,32 +71,38 @@ Read `workspace/reports/callgraph_dag.json`, `workspace/reports/wp_queue.json`, 
 
 ### Step 2 — Run Stage 3A: Speculative Header Contracts
 
-1. For each module header `<h_file>`, initialize the architect scratch overlay (`python3 $S/workspace_overlay.py init-agent --agent-id arch-<mod>`) and spawn `header_architect_brief.md`.
-2. Validate the returned JSON, then merge and re-verify on `workspace/work/`:
+1. For each module header `<h_file>`, prepare the architect scratch overlay (`python3 $S/workspace_overlay.py prepare-agent --agent-id arch-<mod> --role architect --module <mod> --header <h_file>`) and spawn the subagent with `agents/arch-<mod>/brief.md`.
+2. Validate the returned JSON, then merge and re-verify on `workspace/work/` (single agent via `merge-agent`, or multiple architects on the same module via `merge-batch`):
    ```text
-   python3 $S/workspace_overlay.py merge-agent --agent-id arch-<mod> --role architect --header <h_file> --module <mod> --sources <sources...> --cppflags '<cppflags>'
+   python3 $S/workspace_overlay.py merge-agent --agent-id arch-<mod> --role architect --header <h_file> --module <mod> --sources <sources...> --cppflags '<cppflags>' --ldflags '<ldflags>'
    ```
 
 ### Step 3 — Run Stage 3B & 3C: Wavefront Function Pods
 
 For `wave_idx` from `0` to `K`:
 1. For each function `<fn>` in the wave:
-   - Transition its planned units: `python3 $S/ledger.py transition --id <file>#<fn>::<class> --status in_progress --agent-id <prover-id>`
-   - Initialize the prover scratch overlay: `python3 $S/workspace_overlay.py init-agent --agent-id <prover-id>`
-   - Spawn a **Function Prover Subagent** with `prover_brief.md`.
-2. When a prover returns:
-   - Validate its JSON result (`python3 $S/validate_artifacts.py agent-result agents/<prover-id>/scratch/result.json`).
+   - Prepare the prover scratch overlay, transition its planned units to `in_progress`, and render `agents/<prover-id>/brief.md`:
+     ```text
+     python3 $S/workspace_overlay.py prepare-agent --agent-id <prover-id> --role prover --module <mod> --function <fn> --file <c_file> --header <h_file>
+     ```
+   - Spawn a **Function Prover Subagent** with `agents/<prover-id>/brief.md`.
+2. When provers in the wave return:
+   - Validate each JSON result (`python3 $S/validate_artifacts.py agent-result agents/<prover-id>/scratch/result.json`).
    - **`all_proven`**:
-     - Merge its scratch annotations into `workspace/work/` and run parent-side guardrail + WP re-verification:
+     - Merge proven scratch overlays into `workspace/work/` and run parent-side guardrail + WP re-verification (use `merge-batch --agents <id1> <id2> ... --role prover --module <mod>` to merge a wave batch with a single guardrail pass per module, or `merge-agent` individually):
        ```text
-       python3 $S/workspace_overlay.py merge-agent --agent-id <prover-id> --role prover --file <c_file> --function <fn> --header <h_file> --module <mod> --sources <sources...> --cppflags '<cppflags>'
+       python3 $S/workspace_overlay.py merge-batch --agents <prover-1> <prover-2> --role prover --module <mod>
        ```
-     - Ingest the parent-verified WP report: `python3 $S/ledger.py ingest-wp workspace/reports/wp/<fn>.json`.
-     - Save shard checkpoint: `python3 $S/checkpoint.py save-shard state --phase 3 --shard-id <fn> --from-file workspace/reports/wp/<fn>.json`.
+     - For each merged function `<fn>`, ingest the parent-verified WP report and save shard checkpoint:
+       ```text
+       python3 $S/ledger.py ingest-wp workspace/reports/wp/<fn>.json
+       python3 $S/checkpoint.py save-shard state --phase 3 --shard-id <fn> --from-file workspace/reports/wp/<fn>.json
+       ```
    - **`stalled_after_k_retries` or `blocked`**:
-     - Copy/promote the scratch WP report and ingest (`python3 $S/ledger.py ingest-wp ...`) so the unit becomes `blocked` with its unproven goals recorded.
+     - Copy/promote the scratch WP report (`agents/<prover-id>/scratch/wp_<fn>.json`) and ingest (`python3 $S/ledger.py ingest-wp ...`) so the unit becomes `blocked` with its unproven goals recorded.
+     - If the prover reported `strengthening_requests`, enqueue them via `python3 $S/contract_negotiator.py ingest-prover agents/<prover-id>/scratch/result.json`.
      - If the prover reported a `fault_hypothesis`: `python3 $S/ledger.py ingest-agent-hypothesis agents/<prover-id>/scratch/result.json --module <mod>`.
-     - Spawn an **Adversarial Breaker Subagent** (`breaker_brief.md`) on the unproven goals:
+     - Prepare (`prepare-agent --role breaker`) and spawn an **Adversarial Breaker Subagent** (`breaker_brief.md`) on the unproven goals:
        - Validate the breaker JSON and run `python3 $S/ledger.py ingest-agent-hypothesis agents/<breaker-id>/scratch/result.json --module <mod>` to promote its seeds to `workspace/corpus/<mod>/` and record any `fault_hypothesis`.
        - If the breaker returned `crash_found`: re-run the module campaign with `--extra-corpus workspace/corpus/<mod> --max-time 30`, ingest with `ledger.py ingest-fuzz`, and verify the new candidate via Step 0 (`crash_verifier_brief.md`).
 3. After all pods in `wave_idx` finish, process pending strengthening requests via `contract_negotiator.py` and run `python3 $S/validate_artifacts.py run-dir .` before advancing to `wave_idx + 1`.

@@ -34,7 +34,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 1. **Replay & Inspect in the Sandbox:**
    - Inspect the existing fuzz report in `tool_outputs` and replay the reproducer(s) in your scratch directory if needed:
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/empty_corpus --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 10 --cppflags '{cppflags}' --out-json agents/{agent_id}/scratch/replay_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/empty_corpus --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 10 --cppflags '{cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/replay_{module_name}.json
      ```
 2. **Audit Harness Legitimacy:**
    - Read `workspace/harnesses/harness_{module_name}.c`, `workspace/harnesses/harness_{module_name}.json`, and the target entry function's header and implementation in `workspace/work/`.
@@ -54,10 +54,17 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 2. **Targeted Reproduction Attempt (Up to 20s):**
    - If the path appears feasible from `LLVMFuzzerTestOneInput`, write 1–3 targeted seed files into `agents/{agent_id}/scratch/seeds/` and run a short sandboxed E-ACSL campaign:
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/seeds --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 20 --cppflags '{cppflags}' --out-json agents/{agent_id}/scratch/attempt_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/seeds --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 20 --cppflags '{cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/attempt_{module_name}.json
      ```
    - **If reproduced (`reproducible: true`):** upgrade to `decision: "confirmed"` and attach the reproducer from `agents/{agent_id}/scratch/crashes/` (also pass `--replay-report agents/{agent_id}/scratch/attempt_{module_name}.json` when the parent ingests your verdict).
    - **If not reproduced:** return `decision: "needs_validation"` with `origin` set to `"eva_invalid_no_witness"` or `"fault_hypothesis"`, concrete `blockers`, and a specific `validation_plan` (`local` and/or `owner`).
+
+### Reference Manuals (Last Resort)
+
+When the meaning of an alarm decides the verdict and neither this brief nor the tool output settles it, grep the greppable Frama-C manuals under `{references_dir}`. Grep `INDEX.md` for the topic and Read only the reported line range; never read a manual whole. Useful sections:
+- RTE manual `rte/frama-c-rte-manual.md`: the condition behind each `rte` alarm kind §2, undefined behaviours RTE does not cover §2.8.
+- Eva manual `eva/frama-c-eva-manual.md`: what Eva checks §3.2, its log messages and statuses §3.3.
+- `e-acsl-quickref.md`, which summarizes the E-ACSL plug-in manual `eacsl/e-acsl-manual.md`. It covers runtime errors inside annotations (§2.3.1) and the known limitations (§3). E-ACSL misses memory-related violations in programs without `main` that are built without `-M` (every fuzz harness, §3.3.1), and violations that depend on undefined functions, recursion or function pointers (§3.3.2–3.6). A failed reproduction attempt therefore does not show the alarm is spurious.
 
 ---
 
@@ -72,6 +79,12 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 
 ## Output Contract
 
+To avoid hand-crafting all fields, scaffold a schema-valid skeleton first via:
+```text
+python3 /opt/framac-pipeline/scripts/ledger.py scaffold-verifier --fingerprint '{candidate_fingerprint}' --decision <confirmed|needs_validation|rejected> --agent-id {agent_id} --out agents/{agent_id}/scratch/result.json
+```
+Then refine `agents/{agent_id}/scratch/result.json` using `python3 -c "import json, pathlib; ..."` (always use raw Python strings `r"..."` with `json.dumps` so ACSL backslashes like `\valid`, `\forall`, `\false`, and `\at` are not interpreted as Python control escapes). Note that `verifier` MUST be nested inside `record.verifier` (never top-level), and `record.verifier.method` must be one of `"reproduced"`, `"source_review"`, or `"reproduced_and_source_review"`.
+
 Return **exactly one JSON object** matching `schemas/agent-result.schema.json` (`crash_verifier` branch) and no surrounding prose:
 
 ```json
@@ -84,6 +97,11 @@ Return **exactly one JSON object** matching `schemas/agent-result.schema.json` (
   "record": {
     "verdict": "confirmed | needs_validation | rejected",
     "fingerprint": "{candidate_fingerprint}",
+    "verifier": {
+      "agent_id": "{agent_id}",
+      "method": "reproduced | source_review | reproduced_and_source_review",
+      "notes": "..."
+    },
     "...": "see schemas/findings.schema.json for the exact branch fields"
   }
 }

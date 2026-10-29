@@ -91,3 +91,72 @@ def test_overlay_refuses_stale_baseline(tmp_path):
     (target / "src" / "a.c").write_text("int f(void){return 1;}\n", encoding="utf-8")
     with pytest.raises(StaleBaselineError):
         init_overlay(target, overlay)
+
+
+def test_wrappers_divide_cpu_memory_pids_and_mount_skills(tmp_path):
+    import shutil
+    import subprocess
+
+    sh = _read("wrappers/framac-docker.sh")
+    ps1 = _read("wrappers/framac-docker.ps1")
+    for text in (sh, ps1):
+        assert "/opt/framac-pipeline/skills:ro" in text
+        assert "512" in text
+
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if not pwsh:
+        pytest.skip("pwsh/powershell not available")
+
+    # Create a fake docker shim in tmp_path/bin to capture the arguments passed by framac-docker.ps1
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log_file = tmp_path / "docker_args.txt"
+    if os.name == "nt":
+        shim = bin_dir / "docker.cmd"
+        shim.write_text(
+            f'@echo off\r\nif "%1"=="images" (\r\n  echo sha256:deadbeef\r\n  exit /b 0\r\n)\r\necho %* > "{log_file}"\r\nexit /b 0\r\n',
+            encoding="utf-8",
+        )
+    else:
+        shim = bin_dir / "docker"
+        shim.write_text(
+            f'#!/bin/sh\nif [ "$1" = "images" ]; then echo sha256:deadbeef; exit 0; fi\necho "$@" > "{log_file}"\nexit 0\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+
+    target_dir = tmp_path / "target_repo"
+    target_dir.mkdir()
+    run_dir = tmp_path / "run_1"
+    run_dir.mkdir()
+
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    env.pop("FRAMAC_CPUS", None)
+    env.pop("FRAMAC_MEMORY", None)
+    env.pop("FRAMAC_PIDS_LIMIT", None)
+
+    proc = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(ROOT / "wrappers/framac-docker.ps1"),
+            "-TargetDir",
+            str(target_dir),
+            "-RunDir",
+            str(run_dir),
+            "-Agents",
+            "3",
+            "true",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    docker_invocation = log_file.read_text(encoding="utf-8")
+    assert "--memory 2g" in docker_invocation
+    assert "--pids-limit 1365" in docker_invocation
+    assert "/opt/framac-pipeline/skills:ro" in docker_invocation
+

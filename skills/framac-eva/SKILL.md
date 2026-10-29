@@ -38,6 +38,7 @@ A Frama-C failure is reported as `status: "analysis_error"` (exit code 1), never
 If a `Tier 1A` or `Tier 1B` module has an unusually low discharge rate (< 70% Valid) due to loop widening:
 - Re-run `run_eva_slice.py` with higher `--slevel 250` or add `/*@ loop pragma UNROLL 64; */` above bounded fixed-size header loops in `workspace/work/`.
 - If Layer 6 (Secret Non-Interference / Taint) properties are active on the module, enable `-eva-domains taint` to verify `!\tainted(...)` assertions at network emission sinks.
+- For any other precision lever, or an alarm or message you do not understand, grep the Eva manual through [`docs/references/`](../../docs/references/README.md) rather than reading it: loops §6.4, case splitting and partitioning §6.5, domains §6.7, what each alarm checks §3.2, log messages §3.3, FAQ §10.
 
 ---
 

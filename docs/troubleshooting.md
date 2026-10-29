@@ -2,6 +2,8 @@
 
 Common issues encountered when running Frama-C (`RTE`, `Eva`, `WP`, `E-ACSL`) and Clang LibFuzzer on real-world C codebases, and how to resolve them.
 
+If a symptom is not listed here, look it up in the upstream manuals in [`references/`](references/README.md). Grep `references/INDEX.md` or the manual itself, then read only the matching lines.
+
 ---
 
 ## 1. Frama-C Kernel Parsing & Preprocessing Errors

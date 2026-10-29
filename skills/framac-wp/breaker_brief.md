@@ -19,6 +19,7 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
 - Inputs must respect the harness entry function's declared or documented contract. A failure that requires violating that contract (for example a length larger than the buffer the API documents) is harness-induced and does not count.
 - Do not write to the shared corpus, crash directories, ledgers, or the work tree. The parent promotes your seeds and crashes.
 - Stop at the first failing assertion; do not explore further impact.
+- **Reference manuals (last resort):** if you cannot tell what an `rte: <kind>` assertion requires, or how the E-ACSL runtime reports a failure, grep the greppable Frama-C manuals under `{references_dir}`. Grep `INDEX.md` for the topic and Read only the reported line range; never read a manual whole. Use the RTE manual `rte/frama-c-rte-manual.md` §2 for the condition behind each alarm kind, and `e-acsl-quickref.md` (runtime output formats) or the E-ACSL plug-in manual `eacsl/e-acsl-manual.md` §2.3.5 for runtime reporting.
 
 ## Execution Steps
 
@@ -29,9 +30,9 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
    - Write a short Python script that generates 3–5 surgical seed files in `agents/{agent_id}/scratch/seeds/` that satisfy all outer header checks and place extreme boundary values (`0x7FFFFFFF`, `0xFFFFFFFF`, `0x00`, unescaped `\r\n`, or unauthenticated `sec_level` flags) at the exact offset read by `{function_name}`.
 3. **Run a Targeted E-ACSL + LibFuzzer Campaign (sandboxed):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/breaker_{function_name} --corpus-dir agents/{agent_id}/scratch/seeds --extra-corpus workspace/corpus/{module_name} --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 45 --cppflags '{cppflags}' --out-json agents/{agent_id}/scratch/breaker_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/breaker_{function_name} --corpus-dir agents/{agent_id}/scratch/seeds --extra-corpus workspace/corpus/{module_name} --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 45 --cppflags '{cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/breaker_{function_name}.json
    ```
-4. **Return exactly one JSON object and no surrounding prose:**
+4. **Write `agents/{agent_id}/scratch/result.json` using `python3 -c "import json, pathlib; pathlib.Path('agents/{agent_id}/scratch/result.json').write_text(json.dumps(res, indent=2))"` so ACSL backslashes (`\valid`, `\forall`) are properly JSON-escaped, and return exactly one JSON object and no surrounding prose:**
 
 ```json
 {

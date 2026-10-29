@@ -25,9 +25,10 @@ IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-pipeline:latest}"
 DEFAULT_CPUS="$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)"
 DEFAULT_MEM="$(awk '/MemTotal:/ { g = int(($2 / 1048576) * 0.75); if (g < 8) g = 8; print g "g" }' /proc/meminfo 2>/dev/null || echo 8g)"
 [[ -z "${DEFAULT_MEM}" ]] && DEFAULT_MEM="8g"
-CPUS="${FRAMAC_CPUS:-${DEFAULT_CPUS}}"
-MEMORY="${FRAMAC_MEMORY:-${DEFAULT_MEM}}"
-PIDS="${FRAMAC_PIDS_LIMIT:-4096}"
+CPUS="${FRAMAC_CPUS:-}"
+MEMORY="${FRAMAC_MEMORY:-}"
+AGENTS="${FRAMAC_CONCURRENT_AGENTS:-1}"
+PIDS="${FRAMAC_PIDS_LIMIT:-}"
 RUN_DIR=""
 NEW_RUN=0
 REPO=""
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
         --repo) REPO="$2"; shift 2 ;;
         --target-packages) TARGET_PACKAGES="$2"; shift 2 ;;
         --build-if-missing) BUILD=1; shift ;;
+        --agents) AGENTS="$2"; shift 2 ;;
+        --cpus) CPUS="$2"; shift 2 ;;
+        --memory) MEMORY="$2"; shift 2 ;;
+        --pids-limit) PIDS="$2"; shift 2 ;;
         --no-inner-sandbox|--allow-degraded-sandbox)
             echo "[framac-docker] ERROR: $1 is no longer supported. The bubblewrap inner sandbox was removed;" \
                  "the hardened container (default seccomp/AppArmor) is the isolation boundary and target-controlled" \
@@ -53,6 +58,29 @@ while [[ $# -gt 0 ]]; do
         *) break ;;
     esac
 done
+
+if [[ "${AGENTS}" =~ ^[0-9]+$ ]] && (( AGENTS > 1 )); then
+    if [[ -z "${CPUS}" ]]; then
+        DIV_CPUS=$(( DEFAULT_CPUS / AGENTS ))
+        (( DIV_CPUS < 2 )) && DIV_CPUS=2
+        CPUS="${DIV_CPUS}"
+    fi
+    if [[ -z "${MEMORY}" ]]; then
+        MEM_NUM="${DEFAULT_MEM%g}"
+        [[ "${MEM_NUM}" =~ ^[0-9]+$ ]] || MEM_NUM=8
+        DIV_MEM=$(( MEM_NUM / AGENTS ))
+        (( DIV_MEM < 2 )) && DIV_MEM=2
+        MEMORY="${DIV_MEM}g"
+    fi
+    if [[ -z "${PIDS}" ]]; then
+        DIV_PIDS=$(( 4096 / AGENTS ))
+        (( DIV_PIDS < 512 )) && DIV_PIDS=512
+        PIDS="${DIV_PIDS}"
+    fi
+fi
+CPUS="${CPUS:-${DEFAULT_CPUS}}"
+MEMORY="${MEMORY:-${DEFAULT_MEM}}"
+PIDS="${PIDS:-4096}"
 
 RESOLVED_TARGET="$(cd "${TARGET_DIR}" && pwd)"
 REPO="${REPO:-$(basename "${RESOLVED_TARGET}")}"
@@ -124,6 +152,7 @@ ARGS+=(-v "${RESOLVED_TARGET}:/target:ro"
        -v "${PIPELINE_ROOT}/scripts:/opt/framac-pipeline/scripts:ro"
        -v "${PIPELINE_ROOT}/templates:/opt/framac-pipeline/templates:ro"
        -v "${PIPELINE_ROOT}/schemas:/opt/framac-pipeline/schemas:ro"
+       -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro"
        -w /framac-run "${IMAGE}" "$*")
 
 exec docker "${ARGS[@]}"

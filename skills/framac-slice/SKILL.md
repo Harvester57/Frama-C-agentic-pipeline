@@ -88,7 +88,7 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 
 ```text
-python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|custom> --max-size 1500 --out-dir workspace/harnesses
+python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom> [--auto-args] --max-size 1500 --out-dir workspace/harnesses
 ```
 
 Supported `--entry-style` modes and options in `generate_harness.py`:
@@ -97,6 +97,7 @@ Supported `--entry-style` modes and options in `generate_harness.py`:
 - `global_buffer`: copies fuzz/symbolic bytes into `--global-buf <name>` (and optional `--global-len <name>`) before calling `entry_fn()`.
 - `struct_arg`: populates a stack struct of `--struct-type <Type>` with fuzz/symbolic bytes before calling `entry_fn(&target_arg)`.
 - `void_call`: invokes `entry_fn()` directly after initializing any globals.
+- `auto_prototype` (or `--auto-args`): inspects the C declaration of `--entry-fn` in `--header` or `--sources`, automatically synthesizes Eva (`Frama_C_make_unknown`) and LibFuzzer (`fuzz_buf + fuzz_off`) argument unpacking for arbitrary multi-argument internal functions (buffer+length pairs, C strings, output buffers, pointers, and scalars), and defaults `reachability` to `internal_api`.
 - `custom`: executes arbitrary C statements passed via `--call-expr '<stmts using fuzz_buf and fuzz_len>'` (or separate `--eva-expr` and `--fuzz-expr`), with optional `--null-terminate` and repeatable `--extra-include <hdr.h>`.
 - Note: Passing a workspace path like `--header workspace/work/src/Mod/Mod.h` automatically adds `-Iworkspace/work/src/Mod` to `cppflags` and emits `#include "Mod.h"`.
 - If `entry_fn` is `static` inside its `.c` file, pass `--include-source` so the harness includes the `.c` translation unit directly instead of compiling it twice.

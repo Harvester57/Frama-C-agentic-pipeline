@@ -19,6 +19,8 @@ argument-hint: "<target-dir> [--module <name>] [--profile quick|standard|deep] [
 
 Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: [`docs/v2-design.md`](../../docs/v2-design.md).
 
+The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in [`docs/references/`](../../docs/references/README.md). Consult them only when a skill, a brief, and `docs/troubleshooting.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. When spawning a brief, fill its `{references_dir}` placeholder with that folder's absolute host path.
+
 ## Operating modes
 
 - **Full mode** (this workflow): only when the user explicitly asks to verify/audit a codebase with the pipeline, or asks for report artifacts.
