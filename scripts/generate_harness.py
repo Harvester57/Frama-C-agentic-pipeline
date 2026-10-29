@@ -21,7 +21,14 @@ from framac_common import atomic_write_json, load_json_strict, utc_now  # noqa: 
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
-VALID_ENTRY_STYLES = ("buffer_len", "global_buffer", "struct_arg", "void_call")
+VALID_ENTRY_STYLES = ("buffer_len", "global_buffer", "struct_arg", "void_call", "c_string", "custom")
+_WORKSPACE_PREFIXES = (
+    "/framac-run/workspace/work/",
+    "/framac-run/workspace/baseline/",
+    "workspace/work/",
+    "workspace/baseline/",
+    "/target/",
+)
 
 
 def resolve_template_dir() -> Path:
@@ -30,15 +37,71 @@ def resolve_template_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "templates"
 
 
+def _normalize_header_include(header_include: str, cppflags: str) -> tuple[str, str]:
+    """
+    If `header_include` is passed as a workspace/target file path (e.g.
+    `workspace/work/src/LibPtfCom/PtfMsg.h`), add `-I<parent_dir>` to `cppflags`
+    and emit `#include "PtfMsg.h"` so compilers running from any working directory
+    resolve the header cleanly.
+    """
+    norm = (header_include or "").replace("\\", "/").strip()
+    updated_flags = (cppflags or "-I.").strip()
+    p = Path(norm)
+    parent_posix = p.parent.as_posix()
+    has_ws_prefix = any(norm.startswith(pref) for pref in _WORKSPACE_PREFIXES)
+    if (has_ws_prefix or p.is_file()) and parent_posix not in ("", "."):
+        inc_flag = f"-I{parent_posix}"
+        if inc_flag not in updated_flags.split():
+            updated_flags = f"{updated_flags} {inc_flag}".strip()
+        return p.name, updated_flags
+    return norm, updated_flags
+
+
+def _wrap_null_terminated(eva_inner: str, fuzz_inner: str) -> tuple[str, str]:
+    eva_wrapped = (
+        "input_buf[input_len < MAX_INPUT_SIZE ? input_len : (MAX_INPUT_SIZE - 1)] = 0;\n"
+        f"    {eva_inner}"
+    )
+    fuzz_wrapped = (
+        "uint8_t *cstr_buf = (uint8_t *)malloc(size + 1U);\n"
+        "    if (cstr_buf != NULL) {\n"
+        "        if (size > 0) { memcpy(cstr_buf, bounded_buf, size); }\n"
+        "        cstr_buf[size] = 0;\n"
+        "        fuzz_buf = cstr_buf;\n"
+        f"        {fuzz_inner}\n"
+        "        free(cstr_buf);\n"
+        "    }"
+    )
+    return eva_wrapped, fuzz_wrapped
+
+
 def _build_invocations(
     entry_fn: str,
     entry_style: str,
     global_buf: str | None = None,
     global_len: str | None = None,
     struct_type: str | None = None,
+    call_expr: str | None = None,
+    eva_expr: str | None = None,
+    fuzz_expr: str | None = None,
+    null_terminate: bool = False,
 ) -> tuple[str, str]:
     if entry_style == "buffer_len":
-        return f"{entry_fn}(input_buf, input_len);", f"{entry_fn}(bounded_buf, size);"
+        eva_call, fuzz_call = f"{entry_fn}(input_buf, input_len);", f"{entry_fn}(bounded_buf, size);"
+        if null_terminate:
+            return _wrap_null_terminated(f"{entry_fn}(fuzz_buf, fuzz_len);", f"{entry_fn}(fuzz_buf, fuzz_len);")
+        return eva_call, fuzz_call
+    if entry_style == "c_string":
+        call_stmt = f"{entry_fn}((const char *)fuzz_buf);"
+        return _wrap_null_terminated(call_stmt, call_stmt)
+    if entry_style == "custom":
+        e_stmt = (eva_expr or call_expr or "").strip()
+        f_stmt = (fuzz_expr or call_expr or "").strip()
+        if not e_stmt or not f_stmt:
+            raise ValueError("entry_style 'custom' requires --call-expr (or both --eva-expr and --fuzz-expr)")
+        if null_terminate:
+            return _wrap_null_terminated(e_stmt, f_stmt)
+        return e_stmt, f_stmt
     if entry_style == "global_buffer":
         if not global_buf:
             raise ValueError("entry_style 'global_buffer' requires global_buf")
@@ -52,6 +115,18 @@ def _build_invocations(
             f"if (size > 0) {{ memcpy((void *){global_buf}, bounded_buf, size); }}"
             f"{len_fuzz} {entry_fn}();"
         )
+        if null_terminate:
+            eva_nt = (
+                f"if (input_len > 0) {{ memcpy((void *){global_buf}, input_buf, input_len); }}\n"
+                f"    ((char *){global_buf})[input_len < MAX_INPUT_SIZE ? input_len : (MAX_INPUT_SIZE - 1)] = 0;"
+                f"{len_eva} {entry_fn}();"
+            )
+            fuzz_nt = (
+                f"if (size > 0) {{ memcpy((void *){global_buf}, bounded_buf, size); }}\n"
+                f"    ((char *){global_buf})[size < MAX_INPUT_SIZE ? size : (MAX_INPUT_SIZE - 1)] = 0;"
+                f"{len_fuzz} {entry_fn}();"
+            )
+            return eva_nt, fuzz_nt
         return eva_call, fuzz_call
     if entry_style == "struct_arg":
         if not struct_type:
@@ -90,6 +165,11 @@ def generate_module_harness(
     struct_type: str | None = None,
     include_source: bool = False,
     stubbed_callees: list[str] | None = None,
+    extra_includes: list[str] | None = None,
+    call_expr: str | None = None,
+    eva_expr: str | None = None,
+    fuzz_expr: str | None = None,
+    null_terminate: bool = False,
 ) -> dict[str, Any]:
     if reachability not in ("untrusted_surface", "internal_api"):
         raise ValueError(f"invalid reachability: {reachability!r}")
@@ -105,36 +185,49 @@ def generate_module_harness(
     harness_meta_file = out_dir / f"harness_{module_name}.json"
     makefile_path = out_dir / f"{module_name}.mk"
 
+    norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
+    norm_extra_includes: list[str] = []
+    for ext_inc in extra_includes or []:
+        nh, norm_cppflags = _normalize_header_include(ext_inc, norm_cppflags)
+        if nh and nh not in norm_extra_includes and nh != norm_header:
+            norm_extra_includes.append(nh)
+
+    effective_null_terminate = bool(null_terminate or entry_style == "c_string")
     eva_call, fuzz_call = _build_invocations(
         entry_fn=entry_fn,
         entry_style=entry_style,
         global_buf=global_buf,
         global_len=global_len,
         struct_type=struct_type,
+        call_expr=call_expr,
+        eva_expr=eva_expr,
+        fuzz_expr=fuzz_expr,
+        null_terminate=effective_null_terminate,
     )
 
-    header_block = header_include
+    inc_lines = [f'#include "{norm_header}"']
+    for ext_h in norm_extra_includes:
+        inc_lines.append(f'#include "{ext_h}"')
     if include_source:
-        inc_lines = [f'#include "{header_include}"']
         for src in sources:
-            inc_lines.append(f'#include "{Path(src).name}"')
-        harness_content = (
-            harness_tpl.replace("{{MODULE_NAME}}", module_name)
-            .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))
-            .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
-            .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
-            .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
-        )
+            src_path = Path(src.replace("\\", "/").strip())
+            src_parent = src_path.parent.as_posix()
+            if src_parent not in ("", "."):
+                inc_flag = f"-I{src_parent}"
+                if inc_flag not in norm_cppflags.split():
+                    norm_cppflags = f"{norm_cppflags} {inc_flag}".strip()
+            inc_lines.append(f'#include "{src_path.name}"')
         all_sources = str(harness_file)
     else:
-        harness_content = (
-            harness_tpl.replace("{{MODULE_NAME}}", module_name)
-            .replace("{{MODULE_HEADER}}", header_block)
-            .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
-            .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
-            .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
-        )
         all_sources = " ".join(sources + [str(harness_file)])
+
+    harness_content = (
+        harness_tpl.replace("{{MODULE_NAME}}", module_name)
+        .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))
+        .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
+        .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
+        .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
+    )
 
     harness_file.write_text(harness_content, encoding="utf-8")
 
@@ -142,7 +235,7 @@ def generate_module_harness(
         f"TARGET := {module_name}\n"
         f"MAIN_FN := eva_main\n"
         f"SOURCES := {all_sources}\n"
-        f"CPPFLAGS := {cppflags} -I. -I{tpl_dir / 'acsl'}\n\n"
+        f"CPPFLAGS := {norm_cppflags} -I. -I{tpl_dir / 'acsl'}\n\n"
         + mk_tpl
     )
     makefile_path.write_text(mk_content, encoding="utf-8")
@@ -152,9 +245,15 @@ def generate_module_harness(
         "harness_file": str(harness_file).replace("\\", "/"),
         "makefile": str(makefile_path).replace("\\", "/"),
         "sources": list(sources),
-        "header": header_include,
+        "header": norm_header,
+        "extra_includes": norm_extra_includes,
+        "cppflags": norm_cppflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
+        "null_terminate": effective_null_terminate,
+        "call_expr": call_expr,
+        "eva_expr": eva_expr,
+        "fuzz_expr": fuzz_expr,
         "include_source": include_source,
         "stubbed_callees": sorted(set(stubbed_callees or [])),
         "reachability": reachability,
@@ -172,8 +271,12 @@ def generate_module_harness(
         "harness_meta": str(harness_meta_file),
         "makefile": str(makefile_path),
         "sources": sources,
+        "header": norm_header,
+        "extra_includes": norm_extra_includes,
+        "cppflags": norm_cppflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
+        "null_terminate": effective_null_terminate,
         "include_source": include_source,
         "reachability": reachability,
     }
@@ -216,11 +319,16 @@ def main(argv: list[str] | None = None) -> int:
         "--entry-style",
         choices=list(VALID_ENTRY_STYLES),
         default="buffer_len",
-        help="Entry invocation pattern: buffer_len (default), global_buffer, struct_arg, or void_call",
+        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, or custom",
     )
     parser.add_argument("--global-buf", default=None, help="Global buffer symbol when --entry-style=global_buffer")
     parser.add_argument("--global-len", default=None, help="Optional global length symbol when --entry-style=global_buffer")
     parser.add_argument("--struct-type", default=None, help="C struct type (e.g. 'Anomaly_T') when --entry-style=struct_arg")
+    parser.add_argument("--extra-include", action="append", default=[], help="Additional header to #include in the harness (repeatable)")
+    parser.add_argument("--call-expr", default=None, help="Custom C invocation statements using fuzz_buf and fuzz_len when --entry-style=custom")
+    parser.add_argument("--eva-expr", default=None, help="Custom Eva invocation statements (overrides --call-expr for eva_main)")
+    parser.add_argument("--fuzz-expr", default=None, help="Custom LibFuzzer invocation statements (overrides --call-expr for LLVMFuzzerTestOneInput)")
+    parser.add_argument("--null-terminate", action="store_true", help="Guarantee fuzz_buf is NUL-terminated in both Eva and LibFuzzer")
     parser.add_argument(
         "--include-source",
         action="store_true",
@@ -259,6 +367,11 @@ def main(argv: list[str] | None = None) -> int:
         struct_type=args.struct_type,
         include_source=args.include_source,
         stubbed_callees=args.stubbed_callee,
+        extra_includes=args.extra_include,
+        call_expr=args.call_expr,
+        eva_expr=args.eva_expr,
+        fuzz_expr=args.fuzz_expr,
+        null_terminate=args.null_terminate,
     )
     print(json.dumps(result, indent=2))
     return 0

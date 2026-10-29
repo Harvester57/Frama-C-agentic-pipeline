@@ -72,7 +72,8 @@ Read `workspace/reports/callgraph_dag.json` and review the structural classifica
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 1. Check `required_sources` and `external_callees` in `callgraph_dag.json`.
    - **In-repository callees (`cross_module_callees`):** Compile the sibling `.c` files listed in `required_sources` together in the slice rather than stubbing them, so call chains into sibling modules remain reachable for fuzzing, Eva, and WP.
-   - **True external library calls (`external_callees`):** Under Frama-C (`__FRAMAC__`), external functions **must remain bodyless prototypes** (declared in real target headers or `/opt/framac-pipeline/templates/acsl/external_stubs.h`) with optional ACSL contracts (`requires`, `assigns`, `ensures`). **Never** give an external function a dummy C body like `{ return 0; }` under Frama-C: a C body hides the open assumption from the ledger (`Considered valid` / `STATUS_ASSUMED`) and makes callers falsely appear proven under `return 0;`.
+   - **True external library calls (`external_callees`):** Under Frama-C (`__FRAMAC__`), external functions **must remain bodyless prototypes** (declared in real target headers, `/opt/framac-pipeline/templates/fc_stubs/` for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, or `/opt/framac-pipeline/templates/acsl/external_stubs.h`) with optional ACSL contracts (`requires`, `assigns`, `ensures`). **Never** give an external function a dummy C body like `{ return 0; }` under Frama-C: a C body hides the open assumption from the ledger (`Considered valid` / `STATUS_ASSUMED`) and makes callers falsely appear proven under `return 0;`.
+   - **Network/IPC boundary stubs for dynamic fuzzing:** If a module reads input through a blocking socket/port helper (e.g., `RECEIVE_MESSAGE`), put `extern` declarations in a `.h` file and function definitions in a single `.c` file (never define functions in a force-included header across multiple TUs), and inject `fuzz_buf` on **every** call (never gate injection on a `static int calls` counter, which would block all LibFuzzer iterations after the first).
 2. Inspect each function's `security_properties` array and attach the corresponding template headers from `/opt/framac-pipeline/templates/acsl/`:
    - `layer4_auth_state_machine.acsl` for authentication / access-control gates (`g_sec_auth_verified`, `g_sec_acl_authorized`).
    - `layer5_output_sanitization.acsl` for structured output formatters (`no_crlf_or_nul`, `is_printable_ascii`).
@@ -87,15 +88,18 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 
 ```text
-python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|global_buffer|struct_arg|void_call> --max-size 1500 --out-dir workspace/harnesses
+python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|custom> --max-size 1500 --out-dir workspace/harnesses
 ```
 
-Supported `--entry-style` modes in `generate_harness.py`:
+Supported `--entry-style` modes and options in `generate_harness.py`:
 - `buffer_len` (default): `entry_fn(input_buf, input_len)` for standard `(const uint8_t *, size_t)` parsers.
+- `c_string`: NUL-terminates `fuzz_buf` in both Eva and LibFuzzer and calls `entry_fn((const char *)fuzz_buf)`.
 - `global_buffer`: copies fuzz/symbolic bytes into `--global-buf <name>` (and optional `--global-len <name>`) before calling `entry_fn()`.
-- `struct_arg`: populates a stack struct of `--struct-type <Type>` with fuzz/symbolic bytes before calling `entry_fn(&arg)`.
+- `struct_arg`: populates a stack struct of `--struct-type <Type>` with fuzz/symbolic bytes before calling `entry_fn(&target_arg)`.
 - `void_call`: invokes `entry_fn()` directly after initializing any globals.
-- If `entry_fn` is `static` inside its `.c` file, pass `--include-source <rel.c>` so the harness includes the `.c` translation unit directly instead of compiling it twice.
+- `custom`: executes arbitrary C statements passed via `--call-expr '<stmts using fuzz_buf and fuzz_len>'` (or separate `--eva-expr` and `--fuzz-expr`), with optional `--null-terminate` and repeatable `--extra-include <hdr.h>`.
+- Note: Passing a workspace path like `--header workspace/work/src/Mod/Mod.h` automatically adds `-Iworkspace/work/src/Mod` to `cppflags` and emits `#include "Mod.h"`.
+- If `entry_fn` is `static` inside its `.c` file, pass `--include-source` so the harness includes the `.c` translation unit directly instead of compiling it twice.
 - If a dynamic LibFuzzer binary cannot link an external third-party library symbol at link time, pass `--stubbed-callee <fn>` so it is recorded in `harness_<mod>.json` (`stubbed_callees`) and any linker stub is guarded by `#ifndef __FRAMAC__`.
 
 The harness must respect the entry function's declared or documented contract (buffer sizes, non-NULL arguments, length limits). A crash caused by a harness that violates that contract is `rejected` as harness-induced, so get this right before fuzzing. Verify that every generated harness parses cleanly with the Frama-C kernel (`frama-c -machdep gcc_x86_64 ... -kernel-warn-key annot-error=abort`).
