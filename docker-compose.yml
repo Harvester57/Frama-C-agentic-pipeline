@@ -10,10 +10,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges
-      # Needed only so bubblewrap can unshare a user namespace for the inner sandbox
-      # (scripts/sandbox_exec.py). Remove to keep Docker's default seccomp profile;
-      # target-controlled execution then fails closed unless FRAMAC_SANDBOX_DEGRADED=1.
-      - seccomp:unconfined
     cpus: 4
     mem_limit: 8g
     pids_limit: 4096

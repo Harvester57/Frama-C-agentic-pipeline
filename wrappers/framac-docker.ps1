@@ -8,11 +8,15 @@
       /framac-run                run directory (~/framac-pipeline/<repo>/run-<N>), read-write, working directory
       /opt/framac-pipeline/...   pipeline scripts, templates and schemas, read-only
 
-    Container hardening: no network, all capabilities dropped, no-new-privileges, CPU/memory/PID limits,
-    and an environment limited to an explicit allowlist. seccomp is relaxed only so that bubblewrap can
-    create user namespaces for the inner sandbox around target-controlled binaries (scripts/sandbox_exec.py);
-    -NoInnerSandbox keeps Docker's default seccomp profile, in which case target-controlled execution fails
-    closed unless -AllowDegradedSandbox is also given.
+    Container hardening: no network, all capabilities dropped, no-new-privileges, Docker's default seccomp
+    and AppArmor profiles, CPU/memory/PID limits, and an environment limited to an explicit allowlist. The
+    container is the isolation boundary. Inside it, target-controlled binaries run through
+    scripts/sandbox_exec.py (rlimits, environment allowlist, timeout); there is no filesystem isolation
+    inside the container.
+
+    The legacy -NoInnerSandbox and -AllowDegradedSandbox switches are still declared so that old command
+    lines bind, but bubblewrap has been removed and either switch now fails hard (exit code 2) before Docker
+    runs. Drop them from your command line.
 
 .PARAMETER TargetDir
     Path to the target C repository on the host. Defaults to the current directory.
@@ -28,6 +32,12 @@
 
 .PARAMETER Command
     Command string executed inside the container (bash -lc) with /framac-run as working directory.
+
+.PARAMETER NoInnerSandbox
+    Removed (bubblewrap is no longer used). Passing it fails with exit code 2.
+
+.PARAMETER AllowDegradedSandbox
+    Removed (bubblewrap is no longer used). Passing it fails with exit code 2.
 #>
 [CmdletBinding()]
 param(
@@ -61,6 +71,7 @@ param(
     [Parameter(Mandatory = $false)]
     [int]$PidsLimit = 4096,
 
+    # Legacy switches kept only so old command lines bind; both fail hard below.
     [Parameter(Mandatory = $false)]
     [switch]$NoInnerSandbox,
 
@@ -77,6 +88,18 @@ param(
 $ErrorActionPreference = "Stop"
 $env:PYTHONIOENCODING = "utf-8"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# ---- Removed legacy sandbox switches: fail hard before anything else runs ----
+foreach ($legacy in @("NoInnerSandbox", "AllowDegradedSandbox")) {
+    if ($PSBoundParameters.ContainsKey($legacy)) {
+        [Console]::Error.WriteLine(
+            "[framac-docker] ERROR: -$legacy is no longer supported. The bubblewrap inner sandbox was removed; " +
+            "the hardened container (default seccomp/AppArmor) is the isolation boundary and target-controlled " +
+            "binaries run under scripts/sandbox_exec.py (rlimits, env allowlist, timeout). Drop -$legacy from the command line."
+        )
+        exit 2
+    }
+}
 
 $PipelineRoot = Split-Path -Parent $PSScriptRoot
 $ResolvedTarget = (Resolve-Path -Path $TargetDir).Path.TrimEnd('\', '/')
@@ -165,10 +188,6 @@ $dockerArgs = @(
     "--memory", "$Memory",
     "--pids-limit", "$PidsLimit"
 )
-if (-not $NoInnerSandbox) {
-    # Required only so bubblewrap can unshare a user namespace for the inner sandbox.
-    $dockerArgs += @("--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined")
-}
 $dockerArgs += @(
     "-e", "PYTHONIOENCODING=utf-8",
     "-e", "FRAMAC_OUTER_SANDBOX=docker-hardened",
@@ -178,9 +197,6 @@ $dockerArgs += @(
     "-e", "FRAMAC_TARGET_COMMIT=$TargetCommit",
     "-e", "FRAMAC_TARGET_DIRTY=$TargetDirty"
 )
-if ($AllowDegradedSandbox) {
-    $dockerArgs += @("-e", "FRAMAC_SANDBOX_DEGRADED=1")
-}
 $dockerArgs += @(
     "-v", "${ResolvedTarget}:/target:ro",
     "-v", "${ResolvedRun}:/framac-run",

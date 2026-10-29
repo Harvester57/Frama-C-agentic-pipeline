@@ -65,7 +65,6 @@ def toolchain() -> dict:
         ("z3", ["z3", "--version"]),
         ("cvc5", ["cvc5", "--version"]),
         ("clang", ["clang", "--version"]),
-        ("bwrap", ["bwrap", "--version"]),
     ):
         out = _run(cmd)
         versions[name] = out.splitlines()[0] if out else None
@@ -73,6 +72,7 @@ def toolchain() -> dict:
 
 
 def inner_sandbox() -> str:
+    """'rlimits' inside the container (POSIX), otherwise 'unknown'."""
     try:
         from sandbox_exec import SandboxUnavailable, sandbox_mode
         try:

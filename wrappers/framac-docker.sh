@@ -3,14 +3,17 @@
 #
 #   framac-docker.sh [--target DIR] (--run-dir DIR | --new-run) [--repo NAME]
 #                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
-#                    [--no-inner-sandbox] [--allow-degraded-sandbox]
 #                    [--allow-run-dir-in-target] -- <command...>
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
 # /opt/framac-pipeline/{scripts,templates,schemas} (read-only).
-# Hardening: --network none, --cap-drop ALL, no-new-privileges, cpu/memory/pids limits,
-# allowlisted environment. seccomp is relaxed only for bubblewrap's user namespaces
-# (inner sandbox, scripts/sandbox_exec.py); --no-inner-sandbox keeps the default profile.
+# Hardening: --network none, --cap-drop ALL, no-new-privileges, Docker's default
+# seccomp and AppArmor profiles, cpu/memory/pids limits, allowlisted environment.
+# The container is the isolation boundary; target-controlled binaries run through
+# scripts/sandbox_exec.py (rlimits, env allowlist, timeout) with no filesystem
+# isolation inside the container.
+# The legacy --no-inner-sandbox and --allow-degraded-sandbox flags were removed
+# together with bubblewrap; passing either one fails with exit 2.
 set -euo pipefail
 
 export PYTHONIOENCODING="utf-8"
@@ -30,8 +33,6 @@ NEW_RUN=0
 REPO=""
 TARGET_PACKAGES=""
 BUILD=0
-INNER=1
-DEGRADED=0
 ALLOW_IN_TARGET=0
 
 while [[ $# -gt 0 ]]; do
@@ -42,8 +43,11 @@ while [[ $# -gt 0 ]]; do
         --repo) REPO="$2"; shift 2 ;;
         --target-packages) TARGET_PACKAGES="$2"; shift 2 ;;
         --build-if-missing) BUILD=1; shift ;;
-        --no-inner-sandbox) INNER=0; shift ;;
-        --allow-degraded-sandbox) DEGRADED=1; shift ;;
+        --no-inner-sandbox|--allow-degraded-sandbox)
+            echo "[framac-docker] ERROR: $1 is no longer supported. The bubblewrap inner sandbox was removed;" \
+                 "the hardened container (default seccomp/AppArmor) is the isolation boundary and target-controlled" \
+                 "binaries run under scripts/sandbox_exec.py (rlimits, env allowlist, timeout). Drop $1 from the command line." >&2
+            exit 2 ;;
         --allow-run-dir-in-target) ALLOW_IN_TARGET=1; shift ;;
         --) shift; break ;;
         *) break ;;
@@ -110,13 +114,11 @@ fi
 
 ARGS=(run --rm -i --network none --cap-drop ALL --security-opt no-new-privileges
       --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}")
-[[ ${INNER} -eq 1 ]] && ARGS+=(--security-opt seccomp=unconfined --security-opt apparmor=unconfined)
 ARGS+=(-e PYTHONIOENCODING=utf-8 -e FRAMAC_OUTER_SANDBOX=docker-hardened
        -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
        -e "FRAMAC_RUN_ID=${RUN_ID}"
        -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"
        -e "FRAMAC_TARGET_DIRTY=${TARGET_DIRTY}")
-[[ ${DEGRADED} -eq 1 ]] && ARGS+=(-e FRAMAC_SANDBOX_DEGRADED=1)
 ARGS+=(-v "${RESOLVED_TARGET}:/target:ro"
        -v "${RESOLVED_RUN}:/framac-run"
        -v "${PIPELINE_ROOT}/scripts:/opt/framac-pipeline/scripts:ro"

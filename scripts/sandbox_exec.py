@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """
-Inner sandbox for target-controlled binaries (LibFuzzer campaigns, guardrail
-replays, reproducers, target builds).
+Resource-limited execution of target-controlled binaries (LibFuzzer campaigns,
+guardrail replays, reproducers, target builds).
 
-Controls applied to every run:
-  - bubblewrap: whole filesystem read-only, only the declared writable paths are
-    bound read-write, fresh /tmp, network/IPC/UTS/user namespaces unshared,
-    process dies with its parent;
-  - cleared environment populated only from an explicit allowlist;
-  - rlimits on CPU time, file size, open files and process count;
-  - wall-clock timeout that kills the whole process group.
+Isolation model:
+  - The isolation boundary is the hardened outer Docker container started by
+    wrappers/framac-docker.{sh,ps1}: no network, all capabilities dropped,
+    no-new-privileges, Docker's default seccomp and AppArmor profiles,
+    cpu/memory/pids limits, target mounted read-only, only the run directory
+    writable.
+  - This module is the inner layer. It applies, to every run:
+      * a cleared environment populated only from an explicit allowlist;
+      * rlimits on CPU time, file size, open files and process count (optional
+        address space), and core dumps disabled;
+      * a wall-clock timeout that SIGKILLs the whole process group
+        (the child is started in its own session).
+  - There is NO filesystem isolation inside the container: a target-controlled
+    binary can read anything the container user can read and write anywhere
+    the container user can write, including the whole run directory.
 
 RLIMIT_AS is NOT set by default: E-ACSL's shadow memory reserves very large
 virtual regions and fails under an address-space limit. Memory is bounded by the
 container cgroup (--memory) and by LibFuzzer's -rss_limit_mb instead.
 
-If bubblewrap is unavailable the run fails closed (SandboxUnavailable) unless the
-operator sets FRAMAC_SANDBOX_DEGRADED=1, in which case only rlimits, the
-environment allowlist and the timeout apply, and the result says "degraded".
+Execution requires a POSIX host (i.e. inside the container); elsewhere
+SandboxUnavailable is raised and nothing is run.
 """
 
 import argparse
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -33,11 +39,7 @@ from typing import Dict, List, Optional, Sequence
 
 DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 OUTPUT_TAIL_BYTES = 8000
-
-# No PID namespace and no fresh /proc: Docker masks parts of /proc, which makes
-# `bwrap --proc` fail with EPERM inside a container. /proc stays visible read-only
-# through the root bind; the network, IPC, UTS and user namespaces are still unshared.
-UNSHARE_FLAGS = ["--unshare-user-try", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try"]
+SANDBOX_MODE = "rlimits"
 
 
 class SandboxUnavailable(RuntimeError):
@@ -73,43 +75,11 @@ class SandboxResult:
         }
 
 
-_BWRAP_OK: Optional[bool] = None
-
-
-def bwrap_available() -> bool:
-    global _BWRAP_OK
-    if _BWRAP_OK is None:
-        exe = shutil.which("bwrap")
-        if not exe:
-            _BWRAP_OK = False
-        else:
-            try:
-                probe = subprocess.run(
-                    [exe, *UNSHARE_FLAGS, "--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/tmp", "--die-with-parent", "true"],
-                    capture_output=True, timeout=20,
-                )
-                _BWRAP_OK = probe.returncode == 0
-            except (OSError, subprocess.SubprocessError):
-                _BWRAP_OK = False
-    return _BWRAP_OK
-
-
-def degraded_allowed() -> bool:
-    return os.environ.get("FRAMAC_SANDBOX_DEGRADED", "") == "1"
-
-
 def sandbox_mode() -> str:
-    """'bubblewrap', 'degraded', or raises SandboxUnavailable."""
-    if bwrap_available():
-        return "bubblewrap"
-    if degraded_allowed():
-        return "degraded"
-    raise SandboxUnavailable(
-        "bubblewrap cannot create a sandbox here (missing binary or user namespaces blocked by host AppArmor/sysctl). "
-        "Refusing to run target-controlled code. Ensure the container runs with '--security-opt seccomp=unconfined "
-        "--security-opt apparmor=unconfined' (and host sysctl kernel.apparmor_restrict_unprivileged_userns=0 if needed), "
-        "or pass --allow-degraded-sandbox (FRAMAC_SANDBOX_DEGRADED=1) to accept rlimit/env-only isolation; degraded runs are recorded."
-    )
+    """'rlimits' on a POSIX host; raises SandboxUnavailable elsewhere."""
+    if os.name != "posix":
+        raise SandboxUnavailable("sandboxed execution requires a POSIX host (run inside the container)")
+    return SANDBOX_MODE
 
 
 def build_env(home: Path, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -125,25 +95,6 @@ def build_env(home: Path, extra: Optional[Dict[str, str]] = None) -> Dict[str, s
             raise ValueError(f"invalid environment entry {key!r}")
         env[key] = str(value)
     return env
-
-
-def build_bwrap_argv(
-    argv: Sequence[str],
-    writable: Sequence[Path],
-    env: Dict[str, str],
-    cwd: Path,
-    bwrap_exe: str = "bwrap",
-) -> List[str]:
-    cmd = [bwrap_exe, "--die-with-parent", "--new-session", *UNSHARE_FLAGS, "--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/tmp"]
-    for w in writable:
-        p = str(Path(w))
-        cmd += ["--bind", p, p]
-    cmd.append("--clearenv")
-    for key in sorted(env):
-        cmd += ["--setenv", key, env[key]]
-    cmd += ["--chdir", str(cwd), "--"]
-    cmd += list(argv)
-    return cmd
 
 
 def _make_preexec(limits: Limits):
@@ -172,9 +123,7 @@ def run_sandboxed(
     limits: Optional[Limits] = None,
     extra_env: Optional[Dict[str, str]] = None,
 ) -> SandboxResult:
-    if os.name != "posix":
-        raise SandboxUnavailable("sandboxed execution requires a POSIX host (run inside the container)")
-    mode = sandbox_mode()
+    mode = sandbox_mode()  # raises SandboxUnavailable on non-POSIX hosts
     limits = limits or Limits()
     writable = [Path(w).resolve() for w in writable]
     for w in writable:
@@ -182,17 +131,10 @@ def run_sandboxed(
     cwd = Path(cwd).resolve() if cwd else writable[0]
     env = build_env(home=writable[0], extra=extra_env)
 
-    if mode == "bubblewrap":
-        cmd = build_bwrap_argv(argv, writable, env, cwd, bwrap_exe=shutil.which("bwrap") or "bwrap")
-        popen_env = {"PATH": DEFAULT_PATH}
-    else:
-        cmd = list(argv)
-        popen_env = env
-
     proc = subprocess.Popen(
-        cmd,
+        list(argv),
         cwd=str(cwd),
-        env=popen_env,
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -220,7 +162,9 @@ def run_sandboxed(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a target-controlled command in the inner sandbox.")
+    parser = argparse.ArgumentParser(
+        description="Run a target-controlled command with rlimits, an environment allowlist and a timeout."
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("probe", help="Report which sandbox mode is available")
     p_run = sub.add_parser("run")

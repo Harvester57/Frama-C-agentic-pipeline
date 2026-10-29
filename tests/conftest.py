@@ -125,7 +125,7 @@ def metadata(status="in_progress", reason=None):
         "scope_paths": [],
         "budget": None,
         "execution_policy": "sandboxed-local-only",
-        "sandbox": {"outer": "docker-hardened", "inner": "bubblewrap"},
+        "sandbox": {"outer": "docker-hardened", "inner": "rlimits"},
         "prior_runs": [],
         "toolchain": {},
         "run_status": status,

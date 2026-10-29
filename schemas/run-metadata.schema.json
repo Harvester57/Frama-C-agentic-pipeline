@@ -24,7 +24,7 @@
       "type": "object",
       "properties": {
         "outer": {"type": "string", "enum": ["docker-hardened", "unknown"]},
-        "inner": {"type": "string", "enum": ["bubblewrap", "degraded", "unknown"]}
+        "inner": {"type": "string", "enum": ["rlimits", "bubblewrap", "degraded", "unknown"]}
       },
       "required": ["outer", "inner"],
       "additionalProperties": false
