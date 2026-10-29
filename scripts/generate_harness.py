@@ -21,12 +21,57 @@ from framac_common import atomic_write_json, load_json_strict, utc_now  # noqa: 
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
+VALID_ENTRY_STYLES = ("buffer_len", "global_buffer", "struct_arg", "void_call")
 
 
 def resolve_template_dir() -> Path:
     if DEFAULT_TEMPLATE_DIR.exists():
         return DEFAULT_TEMPLATE_DIR
     return Path(__file__).resolve().parent.parent / "templates"
+
+
+def _build_invocations(
+    entry_fn: str,
+    entry_style: str,
+    global_buf: str | None = None,
+    global_len: str | None = None,
+    struct_type: str | None = None,
+) -> tuple[str, str]:
+    if entry_style == "buffer_len":
+        return f"{entry_fn}(input_buf, input_len);", f"{entry_fn}(bounded_buf, size);"
+    if entry_style == "global_buffer":
+        if not global_buf:
+            raise ValueError("entry_style 'global_buffer' requires global_buf")
+        len_eva = f" {global_len} = input_len;" if global_len else ""
+        len_fuzz = f" {global_len} = size;" if global_len else ""
+        eva_call = (
+            f"if (input_len > 0) {{ memcpy((void *){global_buf}, input_buf, input_len); }}"
+            f"{len_eva} {entry_fn}();"
+        )
+        fuzz_call = (
+            f"if (size > 0) {{ memcpy((void *){global_buf}, bounded_buf, size); }}"
+            f"{len_fuzz} {entry_fn}();"
+        )
+        return eva_call, fuzz_call
+    if entry_style == "struct_arg":
+        if not struct_type:
+            raise ValueError("entry_style 'struct_arg' requires struct_type")
+        eva_call = (
+            f"{struct_type} target_arg;\n"
+            f"    Frama_C_make_unknown((char *)&target_arg, sizeof(target_arg));\n"
+            f"    (void)input_buf; (void)input_len;\n"
+            f"    {entry_fn}(&target_arg);"
+        )
+        fuzz_call = (
+            f"{struct_type} target_arg;\n"
+            f"    memset(&target_arg, 0, sizeof(target_arg));\n"
+            f"    if (size > 0) {{ memcpy(&target_arg, bounded_buf, size < sizeof(target_arg) ? size : sizeof(target_arg)); }}\n"
+            f"    {entry_fn}(&target_arg);"
+        )
+        return eva_call, fuzz_call
+    if entry_style == "void_call":
+        return f"(void)input_buf; (void)input_len; {entry_fn}();", f"(void)bounded_buf; {entry_fn}();"
+    raise ValueError(f"invalid entry_style: {entry_style!r}")
 
 
 def generate_module_harness(
@@ -39,9 +84,17 @@ def generate_module_harness(
     out_dir: Path,
     reachability: str = "untrusted_surface",
     contract_notes: list[str] | None = None,
+    entry_style: str = "buffer_len",
+    global_buf: str | None = None,
+    global_len: str | None = None,
+    struct_type: str | None = None,
+    include_source: bool = False,
+    stubbed_callees: list[str] | None = None,
 ) -> dict[str, Any]:
     if reachability not in ("untrusted_surface", "internal_api"):
         raise ValueError(f"invalid reachability: {reachability!r}")
+    if entry_style not in VALID_ENTRY_STYLES:
+        raise ValueError(f"invalid entry_style: {entry_style!r}")
 
     tpl_dir = resolve_template_dir()
     harness_tpl = (tpl_dir / "harness_dual.c.template").read_text(encoding="utf-8")
@@ -52,19 +105,39 @@ def generate_module_harness(
     harness_meta_file = out_dir / f"harness_{module_name}.json"
     makefile_path = out_dir / f"{module_name}.mk"
 
-    eva_call = f"{entry_fn}(input_buf, input_len);"
-    fuzz_call = f"{entry_fn}(bounded_buf, size);"
-
-    harness_content = (
-        harness_tpl.replace("{{MODULE_NAME}}", module_name)
-        .replace("{{MODULE_HEADER}}", header_include)
-        .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
-        .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
-        .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
+    eva_call, fuzz_call = _build_invocations(
+        entry_fn=entry_fn,
+        entry_style=entry_style,
+        global_buf=global_buf,
+        global_len=global_len,
+        struct_type=struct_type,
     )
+
+    header_block = header_include
+    if include_source:
+        inc_lines = [f'#include "{header_include}"']
+        for src in sources:
+            inc_lines.append(f'#include "{Path(src).name}"')
+        harness_content = (
+            harness_tpl.replace("{{MODULE_NAME}}", module_name)
+            .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))
+            .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
+            .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
+            .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
+        )
+        all_sources = str(harness_file)
+    else:
+        harness_content = (
+            harness_tpl.replace("{{MODULE_NAME}}", module_name)
+            .replace("{{MODULE_HEADER}}", header_block)
+            .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
+            .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
+            .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
+        )
+        all_sources = " ".join(sources + [str(harness_file)])
+
     harness_file.write_text(harness_content, encoding="utf-8")
 
-    all_sources = " ".join(sources + [str(harness_file)])
     mk_content = (
         f"TARGET := {module_name}\n"
         f"MAIN_FN := eva_main\n"
@@ -81,6 +154,9 @@ def generate_module_harness(
         "sources": list(sources),
         "header": header_include,
         "entry_fn": entry_fn,
+        "entry_style": entry_style,
+        "include_source": include_source,
+        "stubbed_callees": sorted(set(stubbed_callees or [])),
         "reachability": reachability,
         "max_input_size": max_input_size,
         "contract_notes": list(contract_notes or []),
@@ -97,6 +173,8 @@ def generate_module_harness(
         "makefile": str(makefile_path),
         "sources": sources,
         "entry_fn": entry_fn,
+        "entry_style": entry_style,
+        "include_source": include_source,
         "reachability": reachability,
     }
 
@@ -134,6 +212,21 @@ def main(argv: list[str] | None = None) -> int:
         default="untrusted_surface",
         help="Reachability classification of the entry function",
     )
+    parser.add_argument(
+        "--entry-style",
+        choices=list(VALID_ENTRY_STYLES),
+        default="buffer_len",
+        help="Entry invocation pattern: buffer_len (default), global_buffer, struct_arg, or void_call",
+    )
+    parser.add_argument("--global-buf", default=None, help="Global buffer symbol when --entry-style=global_buffer")
+    parser.add_argument("--global-len", default=None, help="Optional global length symbol when --entry-style=global_buffer")
+    parser.add_argument("--struct-type", default=None, help="C struct type (e.g. 'Anomaly_T') when --entry-style=struct_arg")
+    parser.add_argument(
+        "--include-source",
+        action="store_true",
+        help="Include target .c source(s) directly in the harness translation unit for static-function visibility",
+    )
+    parser.add_argument("--stubbed-callee", action="append", default=[], help="External/I/O callee stubbed by the harness (repeatable)")
     parser.add_argument("--contract-note", action="append", default=[], help="Entry contract note (repeatable)")
     parser.add_argument("--record-repair", type=Path, default=None, help="Path to harness_<mod>.json to record a repair")
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
@@ -160,6 +253,12 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=args.out_dir,
         reachability=args.reachability,
         contract_notes=args.contract_note,
+        entry_style=args.entry_style,
+        global_buf=args.global_buf,
+        global_len=args.global_len,
+        struct_type=args.struct_type,
+        include_source=args.include_source,
+        stubbed_callees=args.stubbed_callee,
     )
     print(json.dumps(result, indent=2))
     return 0

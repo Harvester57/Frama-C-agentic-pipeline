@@ -19,10 +19,8 @@
 #include "__fc_builtin.h"
 
 /*@
-  requires \nothing;
   terminates \true;
   exits \false;
-  assigns \nothing;
 */
 int eva_main(void) {
     uint8_t input_buf[MAX_INPUT_SIZE];

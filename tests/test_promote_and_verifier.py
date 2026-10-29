@@ -560,6 +560,52 @@ class TestHarnessLegitimacyAndMetadata:
         assert r2["repair_attempts"] == 2
         assert r2["exhausted"] is True
 
+    def test_generate_harness_entry_styles_and_include_source(self, tmp_path: Path) -> None:
+        """Tests global_buffer, struct_arg, void_call entry styles and --include-source for static entry functions."""
+        out_dir = tmp_path / "harnesses_styles"
+
+        # 1. global_buffer + include_source + stubbed_callees
+        generate_harness.generate_module_harness(
+            module_name="sync",
+            sources=["src/SyncMem.c"],
+            header_include="SyncMem.h",
+            entry_fn="UpdateSyncMem",
+            max_input_size=1500,
+            cppflags="-Isrc",
+            out_dir=out_dir,
+            entry_style="global_buffer",
+            global_buf="g_rx_buf",
+            global_len="g_rx_len",
+            include_source=True,
+            stubbed_callees=["SendCommand"],
+        )
+        sync_c = (out_dir / "harness_sync.c").read_text(encoding="utf-8")
+        assert '#include "SyncMem.c"' in sync_c
+        assert "memcpy((void *)g_rx_buf, input_buf, input_len);" in sync_c
+        assert "memcpy((void *)g_rx_buf, bounded_buf, size);" in sync_c
+        assert "g_rx_len = input_len;" in sync_c
+        assert "UpdateSyncMem();" in sync_c
+        sync_meta = json.loads((out_dir / "harness_sync.json").read_text(encoding="utf-8"))
+        assert sync_meta["entry_style"] == "global_buffer"
+        assert sync_meta["stubbed_callees"] == ["SendCommand"]
+
+        # 2. struct_arg
+        generate_harness.generate_module_harness(
+            module_name="msg",
+            sources=["src/PtfMsg.c"],
+            header_include="PtfMsg.h",
+            entry_fn="CheckMessageValidity",
+            max_input_size=1500,
+            cppflags="-Isrc",
+            out_dir=out_dir,
+            entry_style="struct_arg",
+            struct_type="T_PtfMsg",
+        )
+        msg_c = (out_dir / "harness_msg.c").read_text(encoding="utf-8")
+        assert "T_PtfMsg target_arg;" in msg_c
+        assert "CheckMessageValidity(&target_arg);" in msg_c
+        assert "Frama_C_make_unknown((char *)&target_arg, sizeof(target_arg));" in msg_c
+
     def test_m2_cli_entrypoints(self, run_dir: Path, tmp_path: Path) -> None:
         """Exercises CLI main() entrypoints of generate_harness, workspace_overlay, promote_artifact, and ledger."""
         import promote_artifact as pa_mod
