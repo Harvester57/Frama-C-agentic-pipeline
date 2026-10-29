@@ -29,3 +29,7 @@ def test_normalizers():
 def test_invalid_fingerprints_rejected():
     assert not is_valid_fingerprint("no-separators")
     assert not is_valid_fingerprint("src/a.c#f::k::abc with space")
+    assert not is_valid_fingerprint("SyncMem.c#UpdateSyncMem::rte::oob_read_memcpy")
+    assert not is_valid_fingerprint("src/a.c#f::mem_access::012345678")
+    assert not is_valid_fingerprint("src/a.c#f::mem_access::0123456789a")
+    assert is_valid_fingerprint("harness_snmp.c#unknown_function::unparsed_crash::0123456789")

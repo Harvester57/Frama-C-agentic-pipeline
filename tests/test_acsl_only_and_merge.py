@@ -163,6 +163,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
             "/*@ logic int bad_sum(int x) = x + 1; */",
             "/*@ logic integer bad_param(size_t n) = n; */",
             "/*@ invariant 0 <= i <= n; */",
+            "/*@ exits \x0calse; */",
         ],
         ids=[
             "admit-clause",
@@ -171,6 +172,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
             "logic-c-int-return-type",
             "logic-c-size-t-param-type",
             "statement-invariant-without-loop",
+            "formfeed-escaped-false-in-acsl",
         ],
     )
     def test_verify_acsl_only_rejects_unsound_admit_or_axiom(self, forbidden_acsl: str) -> None:

@@ -11,10 +11,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+_KERNEL_ERR_RE = re.compile(
+    r"^(?:\[kernel[^\]]*\]|[^:\n]+:\d+:).*?(?:user error|syntax error|fatal error|error:|unbound logic|invalid).*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
+    """Extract concise kernel/preprocessor error lines from a Frama-C log."""
+    matches = [m.group(0).strip() for m in _KERNEL_ERR_RE.finditer(log_text or "")]
+    if matches:
+        return matches[:max_lines]
+    tail = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
+    return tail[-max_lines:]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -84,7 +99,8 @@ def run_eva_on_slice(
     ])
 
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    log_path.write_text((proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8")
+    combined_log = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    log_path.write_text(combined_log, encoding="utf-8")
 
     # Generate SARIF from saved state if sav_path was produced
     if sav_path.exists():
@@ -149,10 +165,12 @@ def run_eva_on_slice(
 
     # A failed Frama-C run or a missing report must never look like "0 alarms".
     status = "ok" if proc.returncode == 0 and csv_path.exists() else "analysis_error"
+    error_summary = extract_error_summary(combined_log) if status != "ok" else []
 
     return {
         "status": status,
         "returncode": proc.returncode,
+        "error_summary": error_summary,
         "main_fn": main_fn,
         "sources": list(sources),
         "total_properties": total_checked,
@@ -213,6 +231,7 @@ def main() -> int:
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({
         "status": res["status"],
+        "error_summary": res["error_summary"],
         "valid_count": res["valid_count"],
         "unknown_count": res["unknown_count"],
         "invalid_count": res["invalid_count"],

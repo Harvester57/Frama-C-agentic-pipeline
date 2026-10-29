@@ -5,7 +5,7 @@
   "items": {
     "type": "object",
     "properties": {
-      "fingerprint": {"type": "string", "minLength": 5, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$"},
+      "fingerprint": {"type": "string", "minLength": 16, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"},
       "status": {"type": "string", "enum": ["unverified", "verified"]},
       "origin": {"type": "string", "enum": ["fuzz", "eva", "breaker", "prover"]},
       "proposed_verdict": {"type": "string", "enum": ["confirmed", "needs_validation"]},
@@ -34,7 +34,7 @@
       "linked_units": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
       "first_seen": {"type": "string", "minLength": 1},
       "notes": {"type": "array", "items": {"type": "string"}},
-      "resolved_fingerprints": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 5, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$"}},
+      "resolved_fingerprints": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 16, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"}},
       "refingerprint_reason": {"type": ["string", "null"]}
     },
     "required": ["fingerprint", "status", "origin", "proposed_verdict", "module", "location", "property", "reproducers", "tool_outputs", "linked_units", "first_seen"],

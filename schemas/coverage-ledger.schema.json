@@ -43,7 +43,7 @@
         "status": {"type": "string", "enum": ["planned", "in_progress", "blocked", "covered", "candidate", "deferred", "out_of_scope", "not_applicable"]},
         "agent_id": {"type": ["string", "null"]},
         "evidence": {"type": "array", "items": {"$ref": "#/definitions/evidence"}},
-        "result_fingerprints": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$"}},
+        "result_fingerprints": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"}},
         "unresolved": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "visibleContent": true}},
         "assumptions": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/assumption"}},
         "attempts": {"type": "array", "items": {"type": "object"}},

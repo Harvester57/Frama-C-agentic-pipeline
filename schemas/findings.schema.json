@@ -12,7 +12,7 @@
   "definitions": {
     "text": {"type": "string", "minLength": 1, "visibleContent": true},
     "relpath": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\][^\\\\]*$"},
-    "fingerprint": {"type": "string", "minLength": 5, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$"},
+    "fingerprint": {"type": "string", "minLength": 16, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"},
     "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret)$"},
     "location": {
       "type": "object",

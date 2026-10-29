@@ -100,7 +100,7 @@
       "properties": {
         "role": {"const": "crash_verifier"},
         "agent_id": {"$ref": "#/definitions/agent_id"},
-        "candidate_fingerprint": {"type": "string", "minLength": 5},
+        "candidate_fingerprint": {"type": "string", "minLength": 16, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"},
         "decision": {"type": "string", "enum": ["confirmed", "needs_validation", "rejected"]},
         "refingerprint_reason": {"type": ["string", "null"]},
         "record": {"type": "object"},

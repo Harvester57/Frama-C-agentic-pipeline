@@ -23,7 +23,9 @@ import json
 import re
 import sys
 
-FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$")
+FINGERPRINT_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"
+)
 
 # Alarm / RTE kinds emitted by RTE, Eva and E-ACSL.
 KNOWN_ALARM_KINDS = (

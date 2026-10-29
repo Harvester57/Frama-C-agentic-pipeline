@@ -67,6 +67,7 @@ _C_INT_PARAM_RE = re.compile(
 _INVARIANT_CLAUSE_RE = re.compile(r"(?:(loop|type|global|strong)\s+)?\binvariant\b(?!\s*:)")
 _STRING_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
+_ESCAPED_CTRL_IN_ACSL_RE = re.compile(r"[\x07\x08\x0c]")
 
 
 def tokenize_c_acsl(source: str, path: str = "<input>") -> list[Token]:
@@ -211,6 +212,14 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
             continue
         if tok.text in baseline_acsl_texts:
             continue
+        m_ctrl = _ESCAPED_CTRL_IN_ACSL_RE.search(tok.text)
+        if m_ctrl:
+            ctrl_map = {"\x07": r"\a", "\x08": r"\b", "\x0c": r"\f"}
+            esc = ctrl_map.get(m_ctrl.group(0), repr(m_ctrl.group(0)))
+            errors.append(
+                f"{path}:{tok.line}: syntax hazard: control character {m_ctrl.group(0)!r} ({esc}) found in ACSL "
+                "annotation (likely caused by unescaped \\false, \\forall, \\at, or \\base_addr in a Python/shell string)"
+            )
         scrubbed = _COMMENT_IN_ACSL_RE.sub("", _STRING_IN_ACSL_RE.sub('""', tok.text))
         m = _UNSOUND_ACSL_RE.search(scrubbed)
         if m:
