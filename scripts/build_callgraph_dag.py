@@ -780,7 +780,153 @@ def compute_topological_waves(
     return waves, cycles
 
 
-def build_dag(target_dir: Path, compile_commands_path: Optional[Path] = None) -> dict:
+_INCLUDE_DIRECTIVE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
+_SYSTEM_INCLUDE_PREFIXES = ("-I/usr/include", "-I/usr/local/include", "-I/lib/", "-isystem/usr/")
+
+
+def _filter_host_system_flags(flags: List[str]) -> List[str]:
+    """Strip host system include directories (-I/usr/include*) so Frama-C keeps __fc_libc."""
+    out: List[str] = []
+    for fl in flags:
+        norm = fl.replace("\\", "/")
+        if any(norm.startswith(p) for p in _SYSTEM_INCLUDE_PREFIXES):
+            continue
+        if norm not in out:
+            out.append(fl)
+    return out
+
+
+def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str, List[str]]:
+    """
+    Build-free include path and define discovery across `target_dir`:
+    1. Indexes all in-tree `.h` files by basename and relative path suffix.
+    2. Extracts `-D...` defines from in-tree Makefiles / CMakeLists.txt.
+    3. Resolves `#include` directives in each `.c` file (and its included local `.h` files)
+       to concrete `-I<dir>` flags without requiring a build or touching `/target`.
+    """
+    target_dir = target_dir.resolve()
+    headers_by_name: Dict[str, List[Path]] = defaultdict(list)
+    all_headers: List[Path] = []
+    makefile_defines: List[str] = []
+
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
+        ]
+        root_path = Path(root).resolve()
+        for f in sorted(files):
+            fp = root_path / f
+            if f.endswith(".h"):
+                all_headers.append(fp)
+                headers_by_name[f].append(fp)
+            elif f in ("Makefile", "GNUmakefile", "CMakeLists.txt") or f.endswith(".mk"):
+                try:
+                    mk_text = fp.read_text(encoding="utf-8", errors="replace")
+                    for m_def in re.findall(r"(?<![A-Za-z0-9_])-D[A-Za-z_][A-Za-z0-9_]*(?:=[^\s\"'\\]+)?", mk_text):
+                        if m_def not in makefile_defines:
+                            makefile_defines.append(m_def)
+                except OSError:
+                    pass
+
+    def _resolve_include(inc: str) -> List[Tuple[Path, Path]]:
+        """Return list of (include_root_dir, resolved_header_file) for `#include inc`."""
+        inc_norm = inc.replace("\\", "/").strip("/")
+        inc_parts = Path(inc_norm).parts
+        leaf = inc_parts[-1] if inc_parts else inc_norm
+        matches: List[Tuple[Path, Path]] = []
+        for h_file in headers_by_name.get(leaf, []):
+            try:
+                rel_h = h_file.relative_to(target_dir)
+            except ValueError:
+                continue
+            if len(inc_parts) == 1:
+                matches.append((h_file.parent, h_file))
+            elif len(rel_h.parts) >= len(inc_parts) and rel_h.parts[-len(inc_parts):] == inc_parts:
+                inc_root = h_file
+                for _ in range(len(inc_parts)):
+                    inc_root = inc_root.parent
+                matches.append((inc_root, h_file))
+        return matches
+
+    result: Dict[str, List[str]] = {}
+    for c_file in c_files:
+        try:
+            rel_key = c_file.resolve().relative_to(target_dir).as_posix()
+        except ValueError:
+            rel_key = c_file.name
+
+        include_dirs: List[Path] = [c_file.resolve().parent]
+        seen_headers: Set[Path] = set()
+        queue: List[Path] = [c_file.resolve()]
+
+        while queue:
+            curr = queue.pop(0)
+            try:
+                text = curr.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in _INCLUDE_DIRECTIVE_RE.finditer(text):
+                for inc_dir, h_file in _resolve_include(m.group(1)):
+                    if inc_dir not in include_dirs:
+                        include_dirs.append(inc_dir)
+                    if h_file not in seen_headers:
+                        seen_headers.add(h_file)
+                        queue.append(h_file)
+
+        flags: List[str] = []
+        for d in include_dirs:
+            try:
+                rel_d = d.relative_to(target_dir).as_posix()
+                flag = f"-I{(target_dir / rel_d).as_posix()}" if rel_d != "." else f"-I{target_dir.as_posix()}"
+            except ValueError:
+                flag = f"-I{d.as_posix()}"
+            if flag not in flags:
+                flags.append(flag)
+        for d_flag in makefile_defines:
+            if d_flag not in flags:
+                flags.append(d_flag)
+        result[rel_key] = flags
+
+    return result
+
+
+def synthesize_compile_commands(
+    target_dir: Path,
+    c_files: List[Path],
+    flags_by_file: Dict[str, List[str]],
+    out_path: Path,
+) -> Path:
+    """Write a build-free `compile_commands.json` inside the run workspace (never inside `/target`)."""
+    out_resolved = out_path.resolve()
+    if str(out_resolved).replace("\\", "/").startswith("/target/"):
+        raise ValueError(f"refusing to write compile_commands.json into read-only target: {out_resolved}")
+    target_resolved = target_dir.resolve()
+    entries = []
+    for c_file in sorted(set(c_files)):
+        c_res = c_file.resolve()
+        try:
+            rel_key = c_res.relative_to(target_resolved).as_posix()
+        except ValueError:
+            rel_key = c_res.name
+        flags = flags_by_file.get(rel_key, [])
+        flag_str = " ".join(flags)
+        cmd = f"clang -c {flag_str} {c_res.as_posix()}".strip()
+        entries.append({
+            "directory": target_resolved.as_posix(),
+            "file": c_res.as_posix(),
+            "command": re.sub(r"\s+", " ", cmd),
+        })
+    out_resolved.parent.mkdir(parents=True, exist_ok=True)
+    out_resolved.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    return out_resolved
+
+
+def build_dag(
+    target_dir: Path,
+    compile_commands_path: Optional[Path] = None,
+    emit_compile_commands: Optional[Path] = None,
+) -> dict:
     target_dir = target_dir.resolve()
     threat_model_path = target_dir / "THREAT_MODEL.md"
     threat_model_text = (
@@ -802,7 +948,7 @@ def build_dag(target_dir: Path, compile_commands_path: Optional[Path] = None) ->
             if fpath.exists() and fpath.suffix.lower() == ".c":
                 c_files.append(fpath)
                 cmd_str = entry.get("command", "") or " ".join(entry.get("arguments", []))
-                flags = re.findall(r"(?:-[IDU]\S+|-std=\S+)", cmd_str)
+                flags = _filter_host_system_flags(re.findall(r"(?:-[IDU]\S+|-std=\S+)", cmd_str))
                 try:
                     rel_key = fpath.relative_to(target_dir).as_posix()
                 except ValueError:
@@ -818,6 +964,15 @@ def build_dag(target_dir: Path, compile_commands_path: Optional[Path] = None) ->
             for f in sorted(files):
                 if f.endswith(".c"):
                     c_files.append((Path(root) / f).resolve())
+
+    # Supplement missing per-file flags via build-free in-tree header/Makefile discovery
+    discovered_flags = discover_in_tree_cppflags(target_dir, c_files)
+    for rel_key, disc in discovered_flags.items():
+        if not compile_flags_by_file.get(rel_key):
+            compile_flags_by_file[rel_key] = disc
+
+    if emit_compile_commands is not None:
+        synthesize_compile_commands(target_dir, c_files, compile_flags_by_file, emit_compile_commands)
 
     functions: Dict[str, dict] = {}
     name_collisions: List[dict] = []
@@ -942,9 +1097,44 @@ def build_dag(target_dir: Path, compile_commands_path: Optional[Path] = None) ->
             f for f in mod_fns
             if f in functions and functions[f]["verifiability"] == "shell_unverifiable_wp"
         ]
+
+        # Compute transitive in-repo callee closure so slices link real sibling sources instead of fake stubs
+        mod_files_set = set(mod_data["files"])
+        closure_fns: Set[str] = set(mod_fns)
+        worklist: List[str] = list(mod_fns)
+        while worklist:
+            cur_fn = worklist.pop(0)
+            for callee in functions.get(cur_fn, {}).get("internal_callees", []):
+                if callee not in closure_fns and callee in functions:
+                    closure_fns.add(callee)
+                    worklist.append(callee)
+
+        cross_module_callees = sorted(
+            f for f in (closure_fns - mod_fn_set)
+            if f in functions and functions[f]["file"] not in mod_files_set
+        )
+        required_sources = sorted(
+            mod_files_set | {functions[f]["file"] for f in cross_module_callees if f in functions}
+        )
+        unresolved_external_callees = sorted({
+            ext
+            for f in mod_fns
+            if f in functions
+            for ext in functions[f].get("external_callees", [])
+        })
+        module_cppflags: List[str] = []
+        for src_rel in required_sources:
+            for fl in compile_flags_by_file.get(src_rel, []):
+                if fl not in module_cppflags:
+                    module_cppflags.append(fl)
+
         module_summaries[mod_name] = {
             "module": mod_name,
-            "files": sorted(set(mod_data["files"])),
+            "files": sorted(mod_files_set),
+            "required_sources": required_sources,
+            "cross_module_callees": cross_module_callees,
+            "external_callees": unresolved_external_callees,
+            "cppflags": module_cppflags,
             "function_count": len(mod_fns),
             "functions": mod_fns,
             "provable_functions": provable_fns,
@@ -974,11 +1164,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build Call-Graph DAG and Topological Waves for Frama-C.")
     parser.add_argument("--target", type=Path, required=True, help="Target C repository or overlay work directory")
     parser.add_argument("--compile-commands", type=Path, default=None, help="Optional compile_commands.json path")
+    parser.add_argument(
+        "--emit-compile-commands",
+        type=Path,
+        default=None,
+        help="Optional output path (in workspace/) to write synthesized compile_commands.json when no build is available",
+    )
     parser.add_argument("--out", type=Path, required=True, help="Output JSON path for the DAG")
     args = parser.parse_args()
 
     cc_path = args.compile_commands or (args.target / "compile_commands.json")
-    dag = build_dag(args.target, cc_path)
+    dag = build_dag(args.target, cc_path, emit_compile_commands=args.emit_compile_commands)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(dag, indent=2) + "\n", encoding="utf-8")
 

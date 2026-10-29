@@ -5,13 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from build_callgraph_dag import (
+    _filter_host_system_flags,
     analyze_body,
     analyze_signature,
     build_dag,
     classify_module_tier,
     compute_topological_waves,
+    discover_in_tree_cppflags,
     extract_functions_from_code,
     infer_security_properties,
+    synthesize_compile_commands,
 )
 
 
@@ -303,3 +306,42 @@ int decode_stream(const uint8_t *buf, size_t len, uint8_t *scratch, size_t scrat
         assert 2 in layers  # loop termination
         assert 6 in layers  # structural memory zeroization
         assert infer_security_properties is not None
+
+    def test_cross_module_required_sources_and_compile_commands_synthesis(self, tmp_path: Path) -> None:
+        inc_dir = tmp_path / "include" / "common"
+        inc_dir.mkdir(parents=True)
+        (inc_dir / "util.h").write_text("int util_crc(const unsigned char *p, unsigned int n);\n", encoding="utf-8")
+
+        mod_a = tmp_path / "src" / "mod_a"
+        mod_b = tmp_path / "src" / "mod_b"
+        mod_a.mkdir(parents=True)
+        mod_b.mkdir(parents=True)
+
+        (mod_b / "util.c").write_text(
+            '#include "util.h"\nint util_crc(const unsigned char *p, unsigned int n) { return n > 0 ? p[0] : 0; }\n',
+            encoding="utf-8",
+        )
+        (mod_a / "parser.c").write_text(
+            '#include "util.h"\nint parse_msg(const unsigned char *buf, unsigned int len) { return util_crc(buf, len) + ext_lib_call(len); }\n',
+            encoding="utf-8",
+        )
+
+        # Verify host /usr/include flags are stripped
+        assert _filter_host_system_flags(["-I/usr/include", "-I/usr/local/include/foo", "-Iinclude", "-DTEST=1"]) == [
+            "-Iinclude",
+            "-DTEST=1",
+        ]
+
+        c_files = [mod_a / "parser.c", mod_b / "util.c"]
+        in_tree = discover_in_tree_cppflags(tmp_path, c_files)
+        assert any(f.endswith("include/common") for f in in_tree["src/mod_a/parser.c"])
+
+        cc_out = tmp_path / "compile_commands.json"
+        dag = build_dag(tmp_path, emit_compile_commands=cc_out)
+        assert cc_out.is_file()
+
+        mod_a_info = dag["modules"]["mod_a"]
+        assert "src/mod_a/parser.c" in mod_a_info["required_sources"]
+        assert "src/mod_b/util.c" in mod_a_info["required_sources"]
+        assert mod_a_info["cross_module_callees"] == ["util_crc"]
+        assert mod_a_info["external_callees"] == ["ext_lib_call"]
