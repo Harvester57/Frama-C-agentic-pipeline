@@ -153,7 +153,7 @@
         "description": {"$ref": "#/definitions/text"},
         "location": {"$ref": "#/definitions/location"},
         "property": {"$ref": "#/definitions/property"},
-        "origin": {"type": "string", "enum": ["eva_invalid_no_witness", "fault_hypothesis"]},
+        "origin": {"type": "string", "enum": ["eva_invalid_no_witness", "fault_hypothesis", "fuzz_timeout_or_oom", "fuzz_unreproduced"]},
         "claimed_root_cause": {"$ref": "#/definitions/text"},
         "trace": {"$ref": "#/definitions/trace"},
         "evidence": {"$ref": "#/definitions/evidence"},

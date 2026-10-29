@@ -606,6 +606,137 @@ class TestHarnessLegitimacyAndMetadata:
         assert "CheckMessageValidity(&target_arg);" in msg_c
         assert "Frama_C_make_unknown((char *)&target_arg, sizeof(target_arg));" in msg_c
 
+        # 3. Header path normalization + extra_includes + custom call_expr + null_terminate
+        res_ev = generate_harness.generate_module_harness(
+            module_name="events",
+            sources=["workspace/work/src/LibPtfCom/Events.c"],
+            header_include="workspace/work/src/LibPtfCom/Events.h",
+            entry_fn="SendEvent",
+            max_input_size=1500,
+            cppflags="-Iworkspace/stubs",
+            out_dir=out_dir,
+            entry_style="custom",
+            extra_includes=["workspace/work/src/LibPtfCom/CmdHandler.h"],
+            call_expr='SendEvent("TEST_EVT", "harness", 0, "%s", (char *)fuzz_buf);',
+            null_terminate=True,
+        )
+        ev_c = (out_dir / "harness_events.c").read_text(encoding="utf-8")
+        assert '#include "Events.h"' in ev_c
+        assert '#include "CmdHandler.h"' in ev_c
+        assert "workspace/work/src/LibPtfCom/Events.h" not in ev_c
+        assert "-Iworkspace/work/src/LibPtfCom" in res_ev["cppflags"]
+        assert "cstr_buf[size] = 0;" in ev_c
+        assert 'SendEvent("TEST_EVT", "harness", 0, "%s", (char *)fuzz_buf);' in ev_c
+        assert "#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)" in ev_c
+
+    def test_deferred_unit_promotion_scaffold_verifier_and_close_remaining(self, run_dir: Path) -> None:
+        """
+        Verifies run-3 ledger workflows:
+        1. A Tier 3 unit seeded as 'deferred' cleanly promotes to 'candidate' when reached by a crash.
+        2. scaffold-verifier builds a schema-valid crash_verifier result (with refingerprinting).
+        3. close-remaining transitions planned units with evidence to 'blocked' and without evidence to 'deferred'.
+        """
+        write_json(run_dir / "run-metadata.json", metadata("in_progress"))
+        u_tier3_def = unit(
+            "src/LibPtfCom/Events.c",
+            "SendEvent",
+            "rte",
+            status="deferred",
+            module="events",
+            tier="Tier 3 (Internal Glue)",
+            unresolved=["tier3_not_scheduled"],
+        )
+        u_with_ev = unit(
+            "src/LibPtfCom/SyncMem.c",
+            "ReadSyncMem",
+            "rte",
+            status="planned",
+            module="syncmem",
+            evidence=[{
+                "phase": "eva",
+                "producer": "run_eva_slice.py",
+                "result": "eva_unknown",
+                "discharging": False,
+                "tool_output": "workspace/reports/eva/syncmem.json",
+                "summary": "2 unknown RTE obligations",
+            }],
+        )
+        u_untouched = unit(
+            "src/LibPtfCom/SyncMem.c",
+            "InitSyncMem",
+            "rte",
+            status="planned",
+            module="syncmem",
+        )
+        write_json(
+            run_dir / "coverage-ledger.json",
+            sorted([u_tier3_def, u_with_ev, u_untouched], key=lambda u: u["coverage_id"]),
+        )
+        write_json(run_dir / "workspace/reports/eva/syncmem.json", {"status": "ok"})
+
+        crash_bytes = b"ABCD"
+        crash_sha = hashlib.sha256(crash_bytes).hexdigest()
+        crash_file = run_dir / "workspace" / "crashes" / "events" / "crash-1"
+        crash_file.parent.mkdir(parents=True)
+        crash_file.write_bytes(crash_bytes)
+
+        cand_fp = make_fingerprint("src/LibPtfCom/Events.c", "unknown_function", "index_bound", "index 5 out of bounds")
+        fuzz_report = run_dir / "workspace" / "reports" / "fuzz" / "events.json"
+        write_json(
+            fuzz_report,
+            {
+                "module": "events",
+                "status": "crash_found",
+                "artifacts": [
+                    {
+                        "artifact": "workspace/crashes/events/crash-1",
+                        "sha256": crash_sha,
+                        "size_bytes": len(crash_bytes),
+                        "reproducible": True,
+                        "fingerprint": cand_fp,
+                    }
+                ],
+            },
+        )
+        write_json(
+            run_dir / "candidates.json",
+            [
+                {
+                    "fingerprint": cand_fp,
+                    "status": "unverified",
+                    "origin": "fuzz",
+                    "proposed_verdict": "confirmed",
+                    "module": "events",
+                    "location": {"file": "src/LibPtfCom/Events.c", "line": 545, "function": "unknown_function"},
+                    "property": {"kind": "index_bound", "predicate": "index 5 out of bounds"},
+                    "reproducers": ["workspace/crashes/events/crash-1"],
+                    "tool_outputs": ["workspace/reports/fuzz/events.json"],
+                    "linked_units": [],
+                    "first_seen": "2026-10-29T00:00:00+00:00",
+                }
+            ],
+        )
+
+        scaf_path = run_dir / "agents" / "verifier-1" / "scratch" / "res.json"
+        scaf_obj = ledger.cmd_scaffold_verifier(
+            cand_fp,
+            decision="confirmed",
+            agent_id="verifier-1",
+            file_override="src/LibPtfCom/Events.c",
+            fn_override="SendEvent",
+            line_override=545,
+            out_path=scaf_path,
+        )
+        assert validate_agent_result(scaf_obj) == []
+        assert scaf_obj["refingerprint_reason"] is not None
+
+        ledger.cmd_ingest_verifier(scaf_path, replay_reports=[fuzz_report])
+        close_res = ledger.cmd_close_remaining("quick_profile_wp_not_scheduled")
+        assert close_res == {"transitioned_to_blocked": 1, "transitioned_to_deferred": 1}
+
+        write_json(run_dir / "run-metadata.json", metadata("complete"))
+        assert validate_run_dir(run_dir) == []
+
     def test_m2_cli_entrypoints(self, run_dir: Path, tmp_path: Path) -> None:
         """Exercises CLI main() entrypoints of generate_harness, workspace_overlay, promote_artifact, and ledger."""
         import promote_artifact as pa_mod

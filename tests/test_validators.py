@@ -143,6 +143,31 @@ def test_run_metadata_init_respects_framac_run_id_env(tmp_path, monkeypatch):
     assert list(validate_metadata(meta)) == []
 
 
+def test_run_metadata_worktree_fallback_to_host_git_env(tmp_path, monkeypatch):
+    import run_metadata
+
+    container_cwd = tmp_path / "run-3"
+    container_cwd.mkdir()
+    worktree_target = tmp_path / "target_wt"
+    worktree_target.mkdir()
+    # Simulate a git worktree whose .git file points to an unmounted host path
+    (worktree_target / ".git").write_text("gitdir: /unmounted/host/repo/.git/worktrees/wt1\n", encoding="utf-8")
+
+    monkeypatch.chdir(container_cwd)
+    monkeypatch.setenv("FRAMAC_TARGET_COMMIT", "94e33bb58ce66295073d5e8275d81148ab5ad829")
+    monkeypatch.setenv("FRAMAC_TARGET_DIRTY", "0")
+
+    rc = run_metadata.main(["init", "--repo", "ptf", "--target", str(worktree_target), "--profile", "quick"])
+    assert rc == 0
+    meta = run_metadata.json.loads((container_cwd / "run-metadata.json").read_text(encoding="utf-8"))
+    assert meta["source_ref"] == {
+        "vcs": "git",
+        "commit": "94e33bb58ce66295073d5e8275d81148ab5ad829",
+        "dirty": False,
+    }
+    assert list(validate_metadata(meta)) == []
+
+
 def prover_result(**kw):
     r = {
         "role": "prover", "agent_id": "prover-1", "file": "src/a.c", "function": "f",

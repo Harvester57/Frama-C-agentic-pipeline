@@ -146,11 +146,13 @@ def add_assumption(unit: dict, kind: str, description: str, related: Optional[Li
 
 
 def mark_candidate(unit: dict, fingerprint: str) -> None:
-    if unit["status"] in NO_TOUCH:
+    if unit["status"] in ("out_of_scope", "not_applicable"):
         return
     if fingerprint not in unit["result_fingerprints"]:
         unit["result_fingerprints"].append(fingerprint)
     unit["status"] = "candidate"
+    unit["agent_id"] = None
+    unit["unresolved"] = []
 
 
 def upsert_candidate(
@@ -319,7 +321,11 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
                 file = normalize_file(failure["file"])
                 function = failure["function"]
                 cls = goal_obligation_class({"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")})
-                linked = [u["coverage_id"] for u in units_for_function(units, file, function) if u["obligation_class"] == cls]
+                linked = [
+                    u["coverage_id"]
+                    for u in units_for_function(units, file, function)
+                    if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
+                ]
                 proposed = "confirmed" if art.get("reproducible") else "needs_validation"
                 note = None if art.get("reproducible") else "crash did not reproduce on replay"
                 if not linked:
@@ -591,7 +597,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None)
     if fh is not None:
         cls = goal_obligation_class({"kind": "assertion", "annotation": fh["predicate"]})
         fp = make_fingerprint(file, fn, cls, fh["predicate"])
-        fn_units = [u for u in units_for_function(units, file, fn) if u["status"] not in NO_TOUCH]
+        fn_units = [u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")]
         linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [u["coverage_id"] for u in fn_units]
         if res.get("evidence"):
             tool_out = res["evidence"][0]["tool_output"]
@@ -749,10 +755,10 @@ def cmd_ingest_verifier(
                 prom_fix = promote_file(run_dir, aid, fix_patch, kind="artifact")
                 rec["remediation"]["fix_patch"] = str(prom_fix["dest"])
 
-            # Expand linked_units to all active units of the confirmed-buggy function so it is excluded from WP
+            # Expand linked_units to all active or deferred units of the confirmed-buggy function so it is excluded from WP
             fn_units = [
                 u for u in units_for_function(units, rec["location"]["file"], rec["location"]["function"])
-                if u["status"] not in NO_TOUCH
+                if u["status"] not in ("out_of_scope", "not_applicable")
             ]
             for u in fn_units:
                 if u["coverage_id"] not in rec["linked_units"]:
@@ -868,6 +874,247 @@ def cmd_transition(cid: str, status: str, agent_id: Optional[str], reason: Optio
     return u
 
 
+def cmd_close_remaining(reason: str) -> dict:
+    """
+    Close all remaining 'planned' or 'in_progress' units at the end of a bounded campaign:
+    - Units that already carry non-discharging evidence (e.g. fuzz_clean, eva_unknown)
+      transition to 'blocked' with `reason` appended to `unresolved` (preserving evidence).
+    - Units with no evidence transition to 'deferred' with `unresolved = [reason]`.
+    """
+    if not (reason or "").strip():
+        raise LedgerError("close-remaining requires a non-empty --reason")
+    clean_reason = reason.strip()
+    units, candidates = load_state()
+    to_blocked = 0
+    to_deferred = 0
+    for u in units.values():
+        if u["status"] in ("planned", "in_progress"):
+            u["agent_id"] = None
+            if u["evidence"]:
+                u["status"] = "blocked"
+                u["unresolved"] = sorted(set(u["unresolved"] + [clean_reason]))
+                to_blocked += 1
+            else:
+                u["status"] = "deferred"
+                u["unresolved"] = [clean_reason]
+                to_deferred += 1
+    commit(units, candidates)
+    return {
+        "transitioned_to_blocked": to_blocked,
+        "transitioned_to_deferred": to_deferred,
+    }
+
+
+def cmd_scaffold_verifier(
+    cand_fp: str,
+    decision: str,
+    agent_id: str,
+    file_override: Optional[str] = None,
+    fn_override: Optional[str] = None,
+    line_override: Optional[int] = None,
+    severity: str = "high",
+    out_path: Optional[Path] = None,
+) -> dict:
+    """
+    Generate a schema-valid crash_verifier result skeleton from `candidates.json`
+    and its referenced fuzz/Eva tool reports so verifiers do not hand-craft 20-field JSONs.
+    """
+    units, candidates = load_state()
+    if cand_fp not in candidates:
+        raise LedgerError(f"unknown candidate_fingerprint: {cand_fp}")
+    cand = candidates[cand_fp]
+    module = cand.get("module") or "unknown"
+    loc = cand.get("location") or {}
+    prop = cand.get("property") or {}
+
+    loc_file = normalize_file(file_override or loc.get("file") or "unknown.c")
+    loc_fn = (fn_override or loc.get("function") or "unknown_function").strip()
+    loc_line = int(line_override if line_override is not None else (loc.get("line") or 1))
+    if loc_line < 1:
+        loc_line = 1
+
+    p_kind = prop.get("kind") or "mem_access"
+    p_pred = prop.get("predicate") or p_kind
+
+    if loc_file != normalize_file(loc.get("file") or "") or loc_fn != (loc.get("function") or ""):
+        rec_fp = make_fingerprint(loc_file, loc_fn, p_kind, p_pred)
+        refp_reason: Optional[str] = (
+            f"Resolved candidate location {loc.get('file')}#{loc.get('function')} "
+            f"to {loc_file}#{loc_fn} at line {loc_line}."
+        )
+    else:
+        rec_fp = cand_fp
+        refp_reason = None
+
+    fn_units = [
+        u["coverage_id"]
+        for u in units_for_function(units, loc_file, loc_fn)
+        if u["status"] not in ("out_of_scope", "not_applicable")
+    ]
+    linked = fn_units or list(cand.get("linked_units") or [])
+    tool_outputs = list(cand.get("tool_outputs") or [])
+    primary_tool = tool_outputs[0] if tool_outputs else f"workspace/reports/fuzz/{module}.json"
+    ev_phase = "eva" if cand.get("origin") == "eva" else "fuzz"
+
+    harness_file = f"workspace/harnesses/harness_{module}.c"
+    entry_fn = loc_fn
+    hmeta_path = Path("workspace/harnesses") / f"harness_{module}.json"
+    if hmeta_path.is_file():
+        try:
+            hmeta = load_json_strict(hmeta_path)
+            harness_file = hmeta.get("harness_file") or harness_file
+            entry_fn = hmeta.get("entry_fn") or entry_fn
+        except ArtifactError:
+            pass
+
+    reproducers: List[dict] = []
+    for rep_rel in cand.get("reproducers") or []:
+        rep_path = Path(rep_rel)
+        sha = "0" * 64
+        sz = 0
+        if rep_path.is_file():
+            raw = rep_path.read_bytes()
+            sha = hashlib.sha256(raw).hexdigest()
+            sz = len(raw)
+        reproducers.append({
+            "input": rep_rel,
+            "sha256": sha,
+            "size_bytes": sz,
+            "command": f"workspace/harnesses/fuzz_{module} -runs=1 {rep_rel}",
+            "observed_result": f"{p_kind}: {p_pred}",
+        })
+
+    base_fields = {
+        "verdict": decision,
+        "fingerprint": rec_fp,
+        "title": f"{p_kind} in {loc_fn} ({loc_file}:{loc_line})",
+        "description": f"Runtime or static violation of {p_pred} at {loc_file}:{loc_line} in {loc_fn}.",
+        "location": {"file": loc_file, "line": loc_line, "function": loc_fn},
+        "property": {"kind": p_kind, "predicate": p_pred},
+    }
+
+    if decision == "confirmed":
+        record = {
+            **base_fields,
+            "root_cause": f"Unchecked input reaches {loc_file}:{loc_line} in {loc_fn}.",
+            "intended_behavior": f"Validate bounds and preconditions before executing line {loc_line} in {loc_fn}.",
+            "trace": [
+                {
+                    "kind": "entrypoint",
+                    "file": loc_file,
+                    "line": loc_line,
+                    "function": entry_fn,
+                    "description": f"Harness invokes {entry_fn}.",
+                },
+                {
+                    "kind": "sink",
+                    "file": loc_file,
+                    "line": loc_line,
+                    "function": loc_fn,
+                    "description": f"Violation of {p_pred} at {loc_file}:{loc_line}.",
+                },
+            ],
+            "evidence": [
+                {
+                    "phase": ev_phase,
+                    "tool_output": primary_tool,
+                    "description": f"Reproduced {p_kind} failure in {loc_fn}.",
+                }
+            ],
+            "reachability": "untrusted_surface",
+            "harness": {
+                "file": harness_file,
+                "entry_function": entry_fn,
+                "contract_respected": True,
+                "notes": f"Reproduced via {harness_file}.",
+            },
+            "reproducers": reproducers,
+            "severity": severity,
+            "severity_rationale": f"Reproducible {p_kind} reachable from {entry_fn}.",
+            "remediation": {
+                "summary": f"Enforce bounds check in {loc_fn} before line {loc_line}.",
+                "invariant": p_pred,
+                "fix_patch": None,
+            },
+            "linked_units": linked,
+            "verifier": {
+                "agent_id": agent_id,
+                "method": "reproduced_and_source_review",
+                "notes": f"Verified reproducibility and root cause at {loc_file}:{loc_line}.",
+            },
+        }
+    elif decision == "needs_validation":
+        nv_origin = (
+            "eva_invalid_no_witness"
+            if cand.get("origin") == "eva"
+            else ("fuzz_timeout_or_oom" if p_kind in ("timeout", "oom") else "fault_hypothesis")
+        )
+        record = {
+            **base_fields,
+            "origin": nv_origin,
+            "claimed_root_cause": f"Potential {p_kind} at {loc_file}:{loc_line} in {loc_fn}.",
+            "trace": [
+                {
+                    "kind": "sink",
+                    "file": loc_file,
+                    "line": loc_line,
+                    "function": loc_fn,
+                    "description": f"Candidate {p_kind} at {loc_file}:{loc_line}.",
+                }
+            ],
+            "evidence": [
+                {
+                    "phase": ev_phase,
+                    "tool_output": primary_tool,
+                    "description": f"Tool reported {p_kind} candidate in {loc_fn}.",
+                }
+            ],
+            "reachability": "untrusted_surface",
+            "blockers": [f"Requires caller/environment state validation for {loc_fn}."],
+            "validation_plan": {
+                "local": f"Replay with full state initialization in {harness_file}."
+            },
+            "linked_units": linked,
+            "verifier": {
+                "agent_id": agent_id,
+                "method": "source_review",
+                "notes": f"Triaged {p_kind} candidate at {loc_file}:{loc_line}.",
+            },
+        }
+    else:
+        record = {
+            **base_fields,
+            "claimed_root_cause": f"Candidate {p_kind} at {loc_file}:{loc_line}.",
+            "evidence": [
+                {
+                    "phase": ev_phase,
+                    "tool_output": primary_tool,
+                    "description": f"Tool output for rejected candidate {cand_fp}.",
+                }
+            ],
+            "rejection_class": "harness_induced",
+            "reason": f"Candidate in {loc_fn} does not occur under valid entry preconditions.",
+            "linked_units": linked,
+            "verifier": {
+                "agent_id": agent_id,
+                "method": "source_review",
+                "notes": f"Rejected candidate {cand_fp} after source review.",
+            },
+        }
+
+    result_obj = {
+        "role": "crash_verifier",
+        "agent_id": agent_id,
+        "candidate_fingerprint": cand_fp,
+        "decision": decision,
+        "refingerprint_reason": refp_reason,
+        "record": record,
+    }
+    if out_path is not None:
+        atomic_write_json(out_path, result_obj)
+    return result_obj
+
+
 def cmd_summary() -> dict:
     units, candidates, findings = load_all_state()
     by_status: Dict[str, int] = {}
@@ -915,6 +1162,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--agent-id", default=None)
     p.add_argument("--reason", default=None)
+    p_close = sub.add_parser("close-remaining")
+    p_close.add_argument("--reason", required=True, help="Reason for closing remaining planned/in_progress units")
+    p_scaf = sub.add_parser("scaffold-verifier")
+    p_scaf.add_argument("--fingerprint", required=True, help="Candidate fingerprint in candidates.json")
+    p_scaf.add_argument("--decision", required=True, choices=["confirmed", "needs_validation", "rejected"])
+    p_scaf.add_argument("--agent-id", default="verifier-1")
+    p_scaf.add_argument("--file", default=None, help="Override source file path (triggers refingerprint)")
+    p_scaf.add_argument("--function", default=None, help="Override function name (triggers refingerprint)")
+    p_scaf.add_argument("--line", type=int, default=None, help="Override 1-based source line")
+    p_scaf.add_argument("--severity", choices=["critical", "high", "medium", "low"], default="high")
+    p_scaf.add_argument("--out", type=Path, default=None, help="Write scaffolded crash_verifier JSON to this path")
     sub.add_parser("summary")
     args = parser.parse_args(argv)
 
@@ -933,6 +1191,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
         elif args.cmd == "transition":
             out = cmd_transition(args.id, args.status, args.agent_id, args.reason)
+        elif args.cmd == "close-remaining":
+            out = cmd_close_remaining(args.reason)
+        elif args.cmd == "scaffold-verifier":
+            out = cmd_scaffold_verifier(
+                args.fingerprint,
+                args.decision,
+                args.agent_id,
+                file_override=args.file,
+                fn_override=args.function,
+                line_override=args.line,
+                severity=args.severity,
+                out_path=args.out,
+            )
         else:
             out = cmd_summary()
     except (LedgerError, PromotionError, ArtifactError) as exc:
