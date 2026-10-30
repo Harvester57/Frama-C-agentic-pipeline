@@ -23,18 +23,34 @@ import json
 import re
 import sys
 
-FINGERPRINT_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"
-)
+FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$")
 
 # Alarm / RTE kinds emitted by RTE, Eva and E-ACSL.
 KNOWN_ALARM_KINDS = (
-    "mem_access", "index_bound", "pointer_value", "ptr_value",
-    "signed_overflow", "unsigned_overflow", "signed_downcast", "unsigned_downcast",
-    "division_by_zero", "shift", "initialization", "dangling_pointer",
-    "float_to_int", "is_nan_or_infinite", "is_nan", "function_pointer",
-    "bool_value", "separation", "overlap", "differing_blocks",
-    "pointer_comparison", "pointer_downcast", "freeable", "valid_string",
+    "mem_access",
+    "index_bound",
+    "pointer_value",
+    "ptr_value",
+    "signed_overflow",
+    "unsigned_overflow",
+    "signed_downcast",
+    "unsigned_downcast",
+    "division_by_zero",
+    "shift",
+    "initialization",
+    "dangling_pointer",
+    "float_to_int",
+    "is_nan_or_infinite",
+    "is_nan",
+    "function_pointer",
+    "bool_value",
+    "separation",
+    "overlap",
+    "differing_blocks",
+    "pointer_comparison",
+    "pointer_downcast",
+    "freeable",
+    "valid_string",
 )
 
 _PATH_PREFIXES = (
@@ -57,9 +73,23 @@ _LABEL_RE = re.compile(
 _KIND_LABEL_RE = re.compile(r"^\s*(?:rte/)?(?:" + "|".join(KNOWN_ALARM_KINDS) + r")\s*:\s*", re.IGNORECASE)
 # Frama-C prints ACSL with Unicode symbols unless -no-unicode; E-ACSL reports and Eva/WP CSVs differ.
 _UNICODE_ACSL = {
-    "≤": "<=", "≥": ">=", "≢": "!=", "≠": "!=", "≡": "==", "⇒": "==>", "⇔": "<==>",
-    "∧": "&&", "∨": "||", "¬": "!", "⊕": "^^", "∀": "\\forall", "∃": "\\exists", "∈": "\\in",
-    "ℤ": "integer", "ℝ": "real", "𝔹": "boolean",
+    "≤": "<=",
+    "≥": ">=",
+    "≢": "!=",
+    "≠": "!=",
+    "≡": "==",
+    "⇒": "==>",
+    "⇔": "<==>",
+    "∧": "&&",
+    "∨": "||",
+    "¬": "!",
+    "⊕": "^^",
+    "∀": "\\forall",
+    "∃": "\\exists",
+    "∈": "\\in",
+    "ℤ": "integer",
+    "ℝ": "real",
+    "𝔹": "boolean",
 }
 
 
@@ -85,7 +115,7 @@ def normalize_file(path: str) -> str:
         changed = False
         for prefix in _PATH_PREFIXES:
             if p.startswith(prefix):
-                p = p[len(prefix):]
+                p = p[len(prefix) :]
                 changed = True
     p = re.sub(r"/+", "/", p).strip("/")
     return p or "unknown"
@@ -142,7 +172,7 @@ def make_fingerprint(file: str, function: str, kind: str, predicate: str) -> str
     rel = _sanitize(normalize_file(file), r"A-Za-z0-9._/@+-")
     fn = _sanitize((function or "").strip() or "unknown_function", r"A-Za-z0-9_")
     pkind = normalize_kind(kind, predicate)
-    digest = hashlib.sha256(normalize_predicate(predicate).encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha256(normalize_predicate(predicate).encode()).hexdigest()[:10]
     fp = f"{rel}#{fn}::{pkind}::{digest}"
     if not fp[0].isalnum():
         fp = "x" + fp

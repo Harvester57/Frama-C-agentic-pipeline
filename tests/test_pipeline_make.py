@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,7 +23,7 @@ from conftest import evidence, metadata, unit, write_json
 REPO = Path(__file__).resolve().parent.parent
 ACSL = "/opt/framac-pipeline/templates"
 
-DAG_MODULES = {
+DAG_MODULES: dict[str, dict[str, Any]] = {
     "cfg": {
         "tier": "Tier 2 (Recursive Heap / Tree Parser)",
         "run_eacsl_fuzz": True,
@@ -63,7 +64,11 @@ DAG_MODULES = {
 SIDECARS = {
     # Sidecar sources in every accepted spelling; the harness itself is dropped and re-added last.
     "snmp": {
-        "sources": ["workspace/work/src/snmp/pdu.c", "src/snmp/ber.c", "/framac-run/workspace/harnesses/harness_snmp.c"],
+        "sources": [
+            "workspace/work/src/snmp/pdu.c",
+            "src/snmp/ber.c",
+            "/framac-run/workspace/harnesses/harness_snmp.c",
+        ],
         "cppflags": "-I. -Iworkspace/work/src/snmp -DDEBUG=2",
         "ldflags": "-lm",
         "include_source": False,
@@ -165,6 +170,7 @@ SNMP_PARAMS = {
 # gen
 # ---------------------------------------------------------------------------
 
+
 def test_gen_golden_output(tmp_path):
     run = _make_run(tmp_path, params=SNMP_PARAMS)
 
@@ -217,8 +223,14 @@ def test_gen_flags_come_from_the_sidecar_and_dag_flags_are_diagnostics(tmp_path)
 
     spec = pm.module_build_spec("snmp", run)
     assert spec == {
-        "sources": ["workspace/work/src/snmp/pdu.c", "workspace/work/src/snmp/ber.c", "workspace/harnesses/harness_snmp.c"],
-        "cppflags": shlex.join(pm.with_acsl(["-I.", "-Iworkspace/work/src/snmp", "-DDEBUG=2"], pm.build_plan(run).acsl_dir)),
+        "sources": [
+            "workspace/work/src/snmp/pdu.c",
+            "workspace/work/src/snmp/ber.c",
+            "workspace/harnesses/harness_snmp.c",
+        ],
+        "cppflags": shlex.join(
+            pm.with_acsl(["-I.", "-Iworkspace/work/src/snmp", "-DDEBUG=2"], pm.build_plan(run).acsl_dir)
+        ),
         "ldflags": "-lm",
     }
     with pytest.raises(ValueError, match="fplugin"):
@@ -262,6 +274,7 @@ def test_gen_malformed_dag_is_an_error(tmp_path):
 # ---------------------------------------------------------------------------
 # Flag allowlist and make quoting
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "flags",
@@ -327,6 +340,7 @@ def test_gen_value_with_line_break_excludes_module(tmp_path):
 # params
 # ---------------------------------------------------------------------------
 
+
 def test_params_set_and_show(tmp_path):
     run = _make_run(tmp_path)
 
@@ -382,6 +396,7 @@ def test_malformed_params_is_a_gen_error(tmp_path):
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
+
 
 class FakeMake:
     """Records make invocations; fails the given recipes the way GNU make 4.3 reports them."""
@@ -442,7 +457,11 @@ def test_run_summary_and_command(tmp_path):
     assert out["targets"]["fuzz"]["status"] == "failed"
     assert nodes["fuzz-cfg"]["status"] == "skipped"  # its build failed, so make never ran it
     assert nodes["fuzz-snmp"] == {
-        "status": "ok", "output": "workspace/reports/fuzz/snmp.json", "exists": True, "updated": True, "report_status": "clean",
+        "status": "ok",
+        "output": "workspace/reports/fuzz/snmp.json",
+        "exists": True,
+        "updated": True,
+        "report_status": "clean",
     }
     assert nodes["fuzz-log"]["status"] == "ok" and nodes["fuzz-log"]["updated"] is False
     assert out["stages"][0]["rc"] == 2 and out["stages"][0]["log_tail"]
@@ -454,8 +473,9 @@ def test_run_orders_targets_in_stages(tmp_path):
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
     fake = FakeMake()
-    rc, out = pm.run_targets(["ingest", "wp-queue", "fuzz", "eva", "module-log", "report"], run, jobs=1,
-                             make_runner=fake, templates_dir=ACSL)
+    rc, out = pm.run_targets(
+        ["ingest", "wp-queue", "fuzz", "eva", "module-log", "report"], run, jobs=1, make_runner=fake, templates_dir=ACSL
+    )
     assert [c[7:] for c in fake.calls] == [["fuzz", "eva", "module-log"], ["ingest", "wp-queue"], ["report"]]
     assert out["targets"]["eva"]["nodes"]["eva-cfg"]["status"] == "no_output"
 
@@ -475,6 +495,7 @@ def test_run_marks_everything_failed_when_make_names_no_target(tmp_path):
 # ---------------------------------------------------------------------------
 # ingest
 # ---------------------------------------------------------------------------
+
 
 class FakeScripts:
     def __init__(self, fail: set[str] | None = None):
@@ -511,7 +532,10 @@ def test_ingest_stubs_expected_modules_and_is_idempotent(tmp_path):
     ]
     fuzz_stub = json.loads((run / "workspace/reports/fuzz/cfg.json").read_text(encoding="utf-8"))
     assert {k: fuzz_stub[k] for k in ("mode", "module", "status", "reason")} == {
-        "mode": "campaign", "module": "cfg", "status": "not_run", "reason": "fuzz-cfg produced no report",
+        "mode": "campaign",
+        "module": "cfg",
+        "status": "not_run",
+        "reason": "fuzz-cfg produced no report",
     }
     evil_stub = json.loads((run / "workspace/reports/fuzz/evil.json").read_text(encoding="utf-8"))
     assert evil_stub["reason"].startswith("excluded from the Make phases: flags outside the build allowlist")
@@ -535,7 +559,9 @@ def test_ingest_stubs_expected_modules_and_is_idempotent(tmp_path):
     assert _ledger_calls(again) == [] and res["already_ingested"] == {"fuzz": 4, "eva": 4} and res["stubs"] == []
 
     # A new report (new digest) is ingested alone.
-    write_json(run / "workspace/reports/fuzz/snmp.json", {"mode": "campaign", "module": "snmp", "status": "crash_found"})
+    write_json(
+        run / "workspace/reports/fuzz/snmp.json", {"mode": "campaign", "module": "snmp", "status": "crash_found"}
+    )
     third = FakeScripts()
     pm.ingest(run, runner=third)
     assert _ledger_calls(third) == [("ingest-fuzz", ["workspace/reports/fuzz/snmp.json"])]
@@ -580,13 +606,21 @@ def _in_process(script, args):
 def test_ingest_stubs_are_accepted_by_the_real_ledger(run_dir):
     _make_run(run_dir)
     write_json(run_dir / "run-metadata.json", metadata())
-    write_json(run_dir / "coverage-ledger.json", [
-        unit("src/cfg/parse.c", "cfg_parse", "rte", module="cfg", tier="Tier 2 (Recursive Heap / Tree Parser)"),
-        unit("src/snmp/ber.c", "ber_decode", "rte", module="snmp"),
-    ])
-    write_json(run_dir / "workspace/reports/eva/snmp.json", {
-        "module": "snmp", "status": "ok", "functions_with_properties": ["ber_decode"],
-    })
+    write_json(
+        run_dir / "coverage-ledger.json",
+        [
+            unit("src/cfg/parse.c", "cfg_parse", "rte", module="cfg", tier="Tier 2 (Recursive Heap / Tree Parser)"),
+            unit("src/snmp/ber.c", "ber_decode", "rte", module="snmp"),
+        ],
+    )
+    write_json(
+        run_dir / "workspace/reports/eva/snmp.json",
+        {
+            "module": "snmp",
+            "status": "ok",
+            "functions_with_properties": ["ber_decode"],
+        },
+    )
 
     res = pm.ingest(run_dir, runner=_in_process)
 
@@ -601,27 +635,39 @@ def test_ingest_stubs_are_accepted_by_the_real_ledger(run_dir):
 # WP sweep
 # ---------------------------------------------------------------------------
 
+
 def _wp_ev(result="wp_proven", discharging=True):
-    return {**evidence(phase="wp", result=result, discharging=discharging, tool_output="workspace/reports/wp/f.json"),
-            "producer": "run_wp_function.py"}
+    return {
+        **evidence(phase="wp", result=result, discharging=discharging, tool_output="workspace/reports/wp/f.json"),
+        "producer": "run_wp_function.py",
+    }
 
 
 def _sweep_ledger(run: Path) -> None:
-    write_json(run / "coverage-ledger.json", [
-        unit("src/snmp/ber.c", "ber_decode", "rte", status="covered", module="snmp", evidence=[_wp_ev()]),
-        unit("src/snmp/ber.c", "ber_decode", "l2_termination", status="covered", module="snmp", evidence=[_wp_ev()]),
-        unit("src/snmp/pdu.c", "pdu_parse", "rte", status="covered", module="snmp", evidence=[evidence()]),  # Eva only
-        unit("src/glue/g.c", "glue_step", "rte", status="covered", module="glue", evidence=[_wp_ev()]),
-        unit("src/evil/e.c", "evil_entry", "rte", status="covered", module="evil", evidence=[_wp_ev()]),
-        unit("src/log/emit.c", "log_emit", "rte", status="planned", module="log"),
-    ])
+    write_json(
+        run / "coverage-ledger.json",
+        [
+            unit("src/snmp/ber.c", "ber_decode", "rte", status="covered", module="snmp", evidence=[_wp_ev()]),
+            unit(
+                "src/snmp/ber.c", "ber_decode", "l2_termination", status="covered", module="snmp", evidence=[_wp_ev()]
+            ),
+            unit(
+                "src/snmp/pdu.c", "pdu_parse", "rte", status="covered", module="snmp", evidence=[evidence()]
+            ),  # Eva only
+            unit("src/glue/g.c", "glue_step", "rte", status="covered", module="glue", evidence=[_wp_ev()]),
+            unit("src/evil/e.c", "evil_entry", "rte", status="covered", module="evil", evidence=[_wp_ev()]),
+            unit("src/log/emit.c", "log_emit", "rte", status="planned", module="log"),
+        ],
+    )
 
 
 def test_sweep_list(tmp_path):
     _sweep_ledger(tmp_path)
     entries, skipped = pm.sweep_list(tmp_path)
     assert [(e["file"], e["function"]) for e in entries] == [
-        ("src/evil/e.c", "evil_entry"), ("src/glue/g.c", "glue_step"), ("src/snmp/ber.c", "ber_decode"),
+        ("src/evil/e.c", "evil_entry"),
+        ("src/glue/g.c", "glue_step"),
+        ("src/snmp/ber.c", "ber_decode"),
     ]
     assert entries[2]["coverage_ids"] == ["src/snmp/ber.c#ber_decode::rte", "src/snmp/ber.c#ber_decode::l2_termination"]
     assert skipped == []
@@ -655,14 +701,31 @@ def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
     assert summary["skipped"][0]["function"] == "evil_entry" and "-fplugin" in summary["skipped"][0]["reason"]
     ber = next(c for c in calls if "ber_decode" in c)
     broker, tool = ber[: ber.index("--") + 1], ber[ber.index("--") + 1 :]
-    assert broker[1:] == [f"{pm.SCRIPTS_DIR.as_posix()}/resources.py", "run", "--class", "wp", "--key",
-                          "src_snmp_ber.c__ber_decode", "--output", "workspace/reports/wp-sweep/src_snmp_ber.c__ber_decode.json", "--"]
+    assert broker[1:] == [
+        f"{pm.SCRIPTS_DIR.as_posix()}/resources.py",
+        "run",
+        "--class",
+        "wp",
+        "--key",
+        "src_snmp_ber.c__ber_decode",
+        "--output",
+        "workspace/reports/wp-sweep/src_snmp_ber.c__ber_decode.json",
+        "--",
+    ]
     assert tool[1:] == [
-        f"{pm.SCRIPTS_DIR.as_posix()}/run_wp_function.py", "--file", "workspace/work/src/snmp/ber.c", "--function", "ber_decode",
+        f"{pm.SCRIPTS_DIR.as_posix()}/run_wp_function.py",
+        "--file",
+        "workspace/work/src/snmp/ber.c",
+        "--function",
+        "ber_decode",
         "--cppflags=-I. -Iworkspace/work/src/snmp -DDEBUG=2",  # as the parent re-check proved it
-        "--cache-dir", "off", "--sarif",
-        "--out-dir", "workspace/reports/wp-sweep/work/src_snmp_ber.c",
-        "--out-json", "workspace/reports/wp-sweep/src_snmp_ber.c__ber_decode.json",
+        "--cache-dir",
+        "off",
+        "--sarif",
+        "--out-dir",
+        "workspace/reports/wp-sweep/work/src_snmp_ber.c",
+        "--out-json",
+        "workspace/reports/wp-sweep/src_snmp_ber.c__ber_decode.json",
     ]
     glue = next(c for c in calls if "glue_step" in c)
     assert "--cppflags=-I." in glue  # no sidecar: the parent re-check's default
@@ -678,8 +741,13 @@ def test_sweep_flags_a_failed_regression_ingestion(tmp_path):
         write_json(run / out_json, {"function": cmd[cmd.index("--function") + 1], "status": "unproven_goals_remain"})
         return 0
 
-    summary = pm.sweep(run, jobs=1, runner=fake, plan=pm.build_plan(run, templates_dir=ACSL),
-                       script_runner=lambda script, args: (1, "boom"))
+    summary = pm.sweep(
+        run,
+        jobs=1,
+        runner=fake,
+        plan=pm.build_plan(run, templates_dir=ACSL),
+        script_runner=lambda script, args: (1, "boom"),
+    )
     assert summary["status"] == "regressions" and summary["ok"] is False
     assert "regressions not recorded" in summary["ledger_error"]
 
@@ -702,6 +770,7 @@ def test_file_slugs_disambiguate_collisions():
 # generate_harness: the sidecar is the source of truth, no per-module .mk
 # ---------------------------------------------------------------------------
 
+
 def test_generate_harness_records_ldflags_and_writes_no_makefile(tmp_path):
     out_dir = tmp_path / "harnesses"
     res = generate_harness.generate_module_harness(
@@ -722,10 +791,25 @@ def test_generate_harness_records_ldflags_and_writes_no_makefile(tmp_path):
 
 
 def test_generate_harness_cli_accepts_a_single_ldflag(tmp_path, capsys):
-    rc = generate_harness.main([
-        "--module", "snmp", "--sources", "src/snmp/pdu.c", "--header", "snmp/pdu.h", "--entry-fn", "snmp_parse_pdu",
-        "--cppflags", "-Isrc", "--ldflags", "-lbsd", "--out-dir", str(tmp_path), "--no-auto-prelude",
-    ])
+    rc = generate_harness.main(
+        [
+            "--module",
+            "snmp",
+            "--sources",
+            "src/snmp/pdu.c",
+            "--header",
+            "snmp/pdu.h",
+            "--entry-fn",
+            "snmp_parse_pdu",
+            "--cppflags",
+            "-Isrc",
+            "--ldflags",
+            "-lbsd",
+            "--out-dir",
+            str(tmp_path),
+            "--no-auto-prelude",
+        ]
+    )
     assert rc == 0, capsys.readouterr().out
     sidecar = json.loads((tmp_path / "harness_snmp.json").read_text(encoding="utf-8"))
     assert sidecar["ldflags"] == "-lbsd" and sidecar["cppflags"].startswith("-Isrc")
@@ -734,6 +818,7 @@ def test_generate_harness_cli_accepts_a_single_ldflag(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 # GNU make (integration: needs make, e.g. inside the framac-pipeline container)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.integration
 @pytest.mark.skipif(shutil.which("make") is None, reason="GNU make not available")
@@ -744,7 +829,9 @@ def test_make_dry_run(tmp_path):
     scripts = f"S={(REPO / 'scripts').as_posix()}"
 
     def make(*args):
-        proc = subprocess.run(["make", "-f", pm.MAKEFILE, scripts, *args], cwd=run, capture_output=True, text=True, check=False)
+        proc = subprocess.run(
+            ["make", "-f", pm.MAKEFILE, scripts, *args], cwd=run, capture_output=True, text=True, check=False
+        )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return proc.stdout.replace("\\\n", " ")
 
@@ -760,12 +847,17 @@ def test_make_dry_run(tmp_path):
     # Executed (not -n) with a fake interpreter that prints argv: the flags reach Python intact.
     echo = tmp_path / "argv.py"
     echo.write_text("import json, sys\nprint('ARGV ' + json.dumps(sys.argv[1:]))\n", encoding="utf-8")
-    proc = subprocess.run(["make", "-f", pm.MAKEFILE, scripts, f"PY={sys.executable} {echo.as_posix()}", "eva-cfg"],
-                          cwd=run, capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        ["make", "-f", pm.MAKEFILE, scripts, f"PY={sys.executable} {echo.as_posix()}", "eva-cfg"],
+        cwd=run,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     argv = json.loads(next(line for line in proc.stdout.splitlines() if line.startswith("ARGV "))[5:])
     tool = argv[argv.index("--") + 1 :]
-    cppflags = next(a for a in tool if a.startswith("--cppflags="))[len("--cppflags="):]
+    cppflags = next(a for a in tool if a.startswith("--cppflags="))[len("--cppflags=") :]
     assert shlex.split(cppflags)[:3] == ["-I.", "-DQ=$5#x", '-DFMT="%s"']
 
 
@@ -776,3 +868,69 @@ def test_make_jobs_follow_this_containers_lease_not_the_node_pool(monkeypatch):
     monkeypatch.setenv("FRAMAC_POOL_MEM_MB", "96000")
     monkeypatch.setattr(resources, "job_budget", lambda root="/": resources.Budget(cpus=3, mem_mb=8192, source="test"))
     assert pm._make_jobs() == 3
+
+
+def test_private_make_runner_renders_outside_run_dir_and_cleans_up(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_default_runner(cmd, cwd, sink):
+        makefile_arg = Path(cmd[cmd.index("-f") + 1])
+        seen["makefile"] = makefile_arg
+        seen["exists_during_run"] = makefile_arg.is_file() and (makefile_arg.parent / "modules.mk").is_file()
+        seen["content"] = makefile_arg.read_text(encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(pm, "_default_make_runner", fake_default_runner)
+    runner = pm._private_make_runner("include modules.mk\n", "MODULES := snmp\n")
+    rc = runner(["make", "-f", pm.MAKEFILE, "build"], tmp_path, lambda line: None)
+    assert rc == 0
+    assert seen["exists_during_run"] is True
+    assert tmp_path not in seen["makefile"].parents
+    assert "include " in seen["content"] and "modules.mk" in seen["content"]
+    assert not seen["makefile"].parent.exists()
+
+
+def test_private_make_runner_path_branch(tmp_path):
+    seen: dict[str, Any] = {}
+
+    def fake_runner(cmd, cwd, sink):
+        seen["cmd"] = list(cmd)
+        idx = cmd.index("-f")
+        seen["makefile"] = Path(cmd[idx + 1])
+        return 0
+
+    priv_mk = tmp_path / "custom" / "Makefile"
+    runner = pm._private_make_runner(priv_mk, fake_runner)
+    rc = runner(["make", "-f", pm.MAKEFILE, "build"], tmp_path, lambda line: None)
+    assert rc == 0
+    assert seen["makefile"] == priv_mk
+
+
+def test_ingest_publishes_corpora_even_when_fuzz_report_was_already_ingested(tmp_path, monkeypatch):
+    run = _make_run(tmp_path / "run")
+    shared_cache = tmp_path / "shared_cache"
+    shared_cache.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("FRAMAC_SHARED_CACHE_DIR", str(shared_cache))
+    monkeypatch.setenv("FRAMAC_CACHE", "on")
+
+    write_json(run / "workspace/reports/fuzz/snmp.json", {"mode": "campaign", "module": "snmp", "status": "clean"})
+    write_json(run / "workspace/reports/eva/snmp.json", {"module": "snmp", "status": "ok"})
+    corpus_dir = run / "workspace/corpus/snmp"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    (corpus_dir / "evolved1").write_bytes(b"\x30\x03\x02\x01\x01")
+
+    # Phase 1: module-snmp ingests under ro cache mode (no corpus published yet)
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "ro")
+    res_ro = pm.ingest(run, module="snmp", runner=FakeScripts())
+    assert res_ro["ingested"]["fuzz"] == ["workspace/reports/fuzz/snmp.json"]
+    assert "published_corpora" not in res_ro
+
+    # Phase 2: parent run ingest runs under rw cache mode; snmp report is already ingested
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "rw")
+    res_rw = pm.ingest(run, module="snmp", runner=FakeScripts())
+    assert res_rw["already_ingested"]["fuzz"] == 1
+    assert res_rw["ingested"]["fuzz"] == []
+    assert res_rw.get("published_corpora") == {"snmp": 1}
+    shared_mod_dir = shared_cache / "corpora" / "snmp"
+    assert shared_mod_dir.is_dir()
+    assert len(list(shared_mod_dir.iterdir())) == 1

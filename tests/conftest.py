@@ -38,8 +38,14 @@ def unit(file, function, cls, status="planned", **kw):
 
 
 def evidence(phase="eva", result="eva_all_valid", discharging=True, tool_output="workspace/reports/eva/snmp.json"):
-    return {"phase": phase, "producer": "run_eva_slice.py", "result": result, "discharging": discharging,
-            "tool_output": tool_output, "summary": "summary text"}
+    return {
+        "phase": phase,
+        "producer": "run_eva_slice.py",
+        "result": result,
+        "discharging": discharging,
+        "tool_output": tool_output,
+        "summary": "summary text",
+    }
 
 
 def verifier():
@@ -57,17 +63,58 @@ def confirmed_record(fp=FP_PARSE):
         "root_cause": "Length-of-length byte count is not checked against remaining input.",
         "intended_behavior": "Reject encodings whose length field exceeds the remaining buffer.",
         "trace": [
-            {"kind": "entrypoint", "file": "src/snmp/pdu.c", "line": 10, "function": "snmp_parse_pdu", "description": "Untrusted UDP payload enters."},
-            {"kind": "propagation", "file": "src/snmp/ber.c", "line": 30, "function": "ber_decode_tlv", "description": "Calls length decoder."},
-            {"kind": "sink", "file": "src/snmp/ber.c", "line": 42, "function": "ber_decode_len", "description": "Reads buf[off] past len."},
+            {
+                "kind": "entrypoint",
+                "file": "src/snmp/pdu.c",
+                "line": 10,
+                "function": "snmp_parse_pdu",
+                "description": "Untrusted UDP payload enters.",
+            },
+            {
+                "kind": "propagation",
+                "file": "src/snmp/ber.c",
+                "line": 30,
+                "function": "ber_decode_tlv",
+                "description": "Calls length decoder.",
+            },
+            {
+                "kind": "sink",
+                "file": "src/snmp/ber.c",
+                "line": 42,
+                "function": "ber_decode_len",
+                "description": "Reads buf[off] past len.",
+            },
         ],
-        "evidence": [{"phase": "fuzz", "tool_output": "workspace/reports/fuzz/snmp.json", "description": "E-ACSL mem_access failure."}],
+        "evidence": [
+            {
+                "phase": "fuzz",
+                "tool_output": "workspace/reports/fuzz/snmp.json",
+                "description": "E-ACSL mem_access failure.",
+            }
+        ],
         "reachability": "untrusted_surface",
-        "harness": {"file": "workspace/harnesses/harness_snmp.c", "entry_function": "snmp_parse_pdu", "contract_respected": True, "notes": "Exact-size buffer, len within documented max."},
-        "reproducers": [{"input": "workspace/crashes/snmp/crash-1", "sha256": "0" * 64, "size_bytes": 3, "command": "fuzz_snmp crash-1", "observed_result": "E-ACSL: mem_access failed at ber.c:42"}],
+        "harness": {
+            "file": "workspace/harnesses/harness_snmp.c",
+            "entry_function": "snmp_parse_pdu",
+            "contract_respected": True,
+            "notes": "Exact-size buffer, len within documented max.",
+        },
+        "reproducers": [
+            {
+                "input": "workspace/crashes/snmp/crash-1",
+                "sha256": "0" * 64,
+                "size_bytes": 3,
+                "command": "fuzz_snmp crash-1",
+                "observed_result": "E-ACSL: mem_access failed at ber.c:42",
+            }
+        ],
         "severity": "high",
         "severity_rationale": "Unauthenticated out-of-bounds read; no write shown.",
-        "remediation": {"summary": "Check length-of-length against remaining bytes.", "invariant": "off + nbytes <= len", "fix_patch": None},
+        "remediation": {
+            "summary": "Check length-of-length against remaining bytes.",
+            "invariant": "off + nbytes <= len",
+            "fix_patch": None,
+        },
         "linked_units": ["src/snmp/ber.c#ber_decode_len::rte"],
         "verifier": verifier(),
     }
@@ -83,8 +130,12 @@ def needs_validation_record(fp=FP_EVA):
         "property": {"kind": "signed_overflow", "predicate": "pos + n <= 2147483647"},
         "origin": "eva_invalid_no_witness",
         "claimed_root_cause": "snprintf would-have-written length added to pos.",
-        "trace": [{"kind": "sink", "file": "src/log/emit.c", "line": 77, "function": "emit_field", "description": "pos += n"}],
-        "evidence": [{"phase": "eva", "tool_output": "workspace/reports/eva/log.json", "description": "Invalid status."}],
+        "trace": [
+            {"kind": "sink", "file": "src/log/emit.c", "line": 77, "function": "emit_field", "description": "pos += n"}
+        ],
+        "evidence": [
+            {"phase": "eva", "tool_output": "workspace/reports/eva/log.json", "description": "Invalid status."}
+        ],
         "reachability": "unknown",
         "blockers": ["No input reaching n > cap - pos found by the breaker within budget."],
         "validation_plan": {"local": "Craft a field longer than cap and replay through harness_log."},
@@ -102,7 +153,9 @@ def rejected_record(fp=FP_REJ):
         "location": {"file": "src/snmp/ber.c", "line": 12, "function": "ber_decode_tag"},
         "property": {"kind": "mem_access", "predicate": r"\valid_read(p)"},
         "claimed_root_cause": "NULL dereference.",
-        "evidence": [{"phase": "verifier", "tool_output": "agents/verifier-3/artifacts/notes.txt", "description": "Harness bug."}],
+        "evidence": [
+            {"phase": "verifier", "tool_output": "agents/verifier-3/artifacts/notes.txt", "description": "Harness bug."}
+        ],
         "rejection_class": "harness_induced",
         "reason": "ber_decode_tag documents p != NULL; all real callers check it.",
         "linked_units": ["src/snmp/ber.c#ber_decode_tag::rte"],
@@ -156,4 +209,3 @@ def deep():
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return ROOT
-

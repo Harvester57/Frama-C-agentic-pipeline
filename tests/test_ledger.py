@@ -14,11 +14,38 @@ DAG = {
         "glue": {"tier": "Tier 3 (Internal State / Glue Module)"},
     },
     "functions": {
-        "ber_decode_len": {"name": "ber_decode_len", "file": "src/snmp/ber.c", "module": "snmp", "wave": 0, "has_loops": True,
-                           "security_properties": [{"layer": 2, "reason": "loops"}, {"layer": 6, "reason": "touches auth_key"}]},
-        "ber_decode_tag": {"name": "ber_decode_tag", "file": "src/snmp/ber.c", "module": "snmp", "wave": 0, "has_loops": False, "security_properties": []},
-        "snmp_parse_pdu": {"name": "snmp_parse_pdu", "file": "src/snmp/pdu.c", "module": "snmp", "wave": 1, "has_loops": False, "security_properties": []},
-        "glue_init": {"name": "glue_init", "file": "src/glue/init.c", "module": "glue", "wave": 0, "has_loops": False, "security_properties": []},
+        "ber_decode_len": {
+            "name": "ber_decode_len",
+            "file": "src/snmp/ber.c",
+            "module": "snmp",
+            "wave": 0,
+            "has_loops": True,
+            "security_properties": [{"layer": 2, "reason": "loops"}, {"layer": 6, "reason": "touches auth_key"}],
+        },
+        "ber_decode_tag": {
+            "name": "ber_decode_tag",
+            "file": "src/snmp/ber.c",
+            "module": "snmp",
+            "wave": 0,
+            "has_loops": False,
+            "security_properties": [],
+        },
+        "snmp_parse_pdu": {
+            "name": "snmp_parse_pdu",
+            "file": "src/snmp/pdu.c",
+            "module": "snmp",
+            "wave": 1,
+            "has_loops": False,
+            "security_properties": [],
+        },
+        "glue_init": {
+            "name": "glue_init",
+            "file": "src/glue/init.c",
+            "module": "glue",
+            "wave": 0,
+            "has_loops": False,
+            "security_properties": [],
+        },
     },
 }
 
@@ -60,10 +87,18 @@ def test_seed_scope_marks_out_of_scope(run_dir):
 
 def eva_report(**kw):
     r = {
-        "status": "ok", "module": "snmp",
+        "status": "ok",
+        "module": "snmp",
         "unknown_obligations_by_function": {"snmp_parse_pdu": [{"line": 5}]},
-        "invalid_alarms": [{"file": "workspace/work/src/snmp/ber.c", "function": "ber_decode_len", "line": 42, "kind": "assertion",
-                            "annotation": "mem_access: \\valid_read(buf + off)"}],
+        "invalid_alarms": [
+            {
+                "file": "workspace/work/src/snmp/ber.c",
+                "function": "ber_decode_len",
+                "line": 42,
+                "kind": "assertion",
+                "annotation": "mem_access: \\valid_read(buf + off)",
+            }
+        ],
         "dead_alarms": [],
         "assumed_properties": [{"function": "ber_decode_tag"}],
         "functions_with_properties": ["ber_decode_len", "ber_decode_tag", "snmp_parse_pdu"],
@@ -96,8 +131,14 @@ def test_ingest_eva_keys_alarms_by_directory_and_file(run_dir):
     seed(run_dir)
     # Frama-C's CSV keeps the directory apart from the bare file name; an alarm of a same-named
     # function in another file belongs to that file's unit, never to this one.
-    alarm = {"directory": "workspace/work/src/snmp", "file": "ber.c", "function": "ber_decode_len", "line": 42,
-             "kind": "index_bound", "annotation": "i < 8"}
+    alarm = {
+        "directory": "workspace/work/src/snmp",
+        "file": "ber.c",
+        "function": "ber_decode_len",
+        "line": 42,
+        "kind": "index_bound",
+        "annotation": "i < 8",
+    }
     elsewhere = {**alarm, "directory": "workspace/work/src/other", "annotation": "j < 4"}
     write_json(run_dir / "workspace/reports/eva/snmp.json", eva_report(invalid_alarms=[alarm, elsewhere]))
     assert L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])["candidates"] == 1
@@ -119,14 +160,31 @@ def test_ingest_fuzz_crash_and_clean(run_dir):
     crash.parent.mkdir(parents=True)
     crash.write_bytes(b"\x30\x84")
     from fingerprint import make_fingerprint
+
     fp = make_fingerprint("src/snmp/ber.c", "ber_decode_len", "mem_access", "mem_access: \\valid_read(buf + off)")
     report = {
-        "mode": "campaign", "module": "snmp", "status": "crash_found",
-        "artifacts": [{
-            "artifact": str(crash), "kind": "crash", "sha256": "x", "size_bytes": 2, "reproducible": True, "fingerprint": fp,
-            "failure": {"file": "/framac-run/workspace/work/src/snmp/ber.c", "line": 42, "function": "ber_decode_len",
-                        "kind": "assertion", "alarm_kind": "mem_access", "is_rte": True, "predicate": "mem_access: \\valid_read(buf + off)"},
-        }],
+        "mode": "campaign",
+        "module": "snmp",
+        "status": "crash_found",
+        "artifacts": [
+            {
+                "artifact": str(crash),
+                "kind": "crash",
+                "sha256": "x",
+                "size_bytes": 2,
+                "reproducible": True,
+                "fingerprint": fp,
+                "failure": {
+                    "file": "/framac-run/workspace/work/src/snmp/ber.c",
+                    "line": 42,
+                    "function": "ber_decode_len",
+                    "kind": "assertion",
+                    "alarm_kind": "mem_access",
+                    "is_rte": True,
+                    "predicate": "mem_access: \\valid_read(buf + off)",
+                },
+            }
+        ],
     }
     write_json(run_dir / "workspace/reports/fuzz/snmp.json", report)
     L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
@@ -147,9 +205,21 @@ def test_ingest_fuzz_crash_and_clean(run_dir):
 
 def test_ingest_fuzz_unparsed_crash_gets_triage_candidate(run_dir):
     seed(run_dir)
-    report = {"module": "snmp", "status": "crash_found",
-              "artifacts": [{"artifact": "workspace/crashes/snmp/crash-1", "kind": "crash", "sha256": "ab", "size_bytes": 1,
-                             "reproducible": True, "fingerprint": None, "failure": None}]}
+    report = {
+        "module": "snmp",
+        "status": "crash_found",
+        "artifacts": [
+            {
+                "artifact": "workspace/crashes/snmp/crash-1",
+                "kind": "crash",
+                "sha256": "ab",
+                "size_bytes": 1,
+                "reproducible": True,
+                "fingerprint": None,
+                "failure": None,
+            }
+        ],
+    }
     write_json(run_dir / "workspace/reports/fuzz/snmp.json", report)
     L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
     cand = load(run_dir / "candidates.json")[0]
@@ -158,7 +228,9 @@ def test_ingest_fuzz_unparsed_crash_gets_triage_candidate(run_dir):
 
 def wp_report(**kw):
     r = {
-        "status": "all_proven", "function": "snmp_parse_pdu", "file": "workspace/work/src/snmp/pdu.c",
+        "status": "all_proven",
+        "function": "snmp_parse_pdu",
+        "file": "workspace/work/src/snmp/pdu.c",
         "by_obligation_class": {"rte": {"proven": 3, "proven_under_hyp": 2, "unproven": 0}},
         "unproven_goals": [],
     }
@@ -174,11 +246,21 @@ def test_ingest_wp_proven_with_hypotheses_and_unproven(run_dir):
     assert u["status"] == "covered"
     assert any(a["kind"] == "valid_under_hyp" for a in u["assumptions"])
 
-    write_json(run_dir / "workspace/reports/wp/ber_decode_len.json", wp_report(
-        status="unproven_goals_remain", function="ber_decode_len", file="workspace/work/src/snmp/ber.c",
-        by_obligation_class={"l2_termination": {"proven": 0, "proven_under_hyp": 0, "unproven": 1}, "rte": {"proven": 4, "proven_under_hyp": 0, "unproven": 0}},
-        unproven_goals=[{"obligation_class": "l2_termination", "kind": "loop variant", "line": 7, "annotation": "len - i"}],
-    ))
+    write_json(
+        run_dir / "workspace/reports/wp/ber_decode_len.json",
+        wp_report(
+            status="unproven_goals_remain",
+            function="ber_decode_len",
+            file="workspace/work/src/snmp/ber.c",
+            by_obligation_class={
+                "l2_termination": {"proven": 0, "proven_under_hyp": 0, "unproven": 1},
+                "rte": {"proven": 4, "proven_under_hyp": 0, "unproven": 0},
+            },
+            unproven_goals=[
+                {"obligation_class": "l2_termination", "kind": "loop variant", "line": 7, "annotation": "len - i"}
+            ],
+        ),
+    )
     L.cmd_ingest_wp([run_dir / "workspace/reports/wp/ber_decode_len.json"])
     units = units_by_id(run_dir)
     l2 = units["src/snmp/ber.c#ber_decode_len::l2_termination"]
@@ -213,19 +295,22 @@ def test_commit_refuses_invalid_state(run_dir):
 def test_ingest_wp_rejects_unsound_proof_and_records_reduced_checks(run_dir):
     seed(run_dir)
     # 1. An unsound_proof report (e.g. Missing assigns clause or Memory model hypotheses) must block, never cover.
-    write_json(run_dir / "workspace/reports/wp/pdu_unsound.json", wp_report(
-        status="unsound_proof",
-        function="snmp_parse_pdu",
-        file="workspace/work/src/snmp/pdu.c",
-        soundness={
-            "sound": False,
-            "tier_a_abort_errors": [],
-            "tier_b_unsound_warnings": ["[wp] warning: Missing assigns clause (assigns 'everything' instead)"],
-            "memory_model_hypotheses": ["[wp] warning: Memory model hypotheses for function 'snmp_parse_pdu':"],
-            "unproven_global_lemmas": [],
-            "reduced_checks": [],
-        },
-    ))
+    write_json(
+        run_dir / "workspace/reports/wp/pdu_unsound.json",
+        wp_report(
+            status="unsound_proof",
+            function="snmp_parse_pdu",
+            file="workspace/work/src/snmp/pdu.c",
+            soundness={
+                "sound": False,
+                "tier_a_abort_errors": [],
+                "tier_b_unsound_warnings": ["[wp] warning: Missing assigns clause (assigns 'everything' instead)"],
+                "memory_model_hypotheses": ["[wp] warning: Memory model hypotheses for function 'snmp_parse_pdu':"],
+                "unproven_global_lemmas": [],
+                "reduced_checks": [],
+            },
+        ),
+    )
     out = L.cmd_ingest_wp([run_dir / "workspace/reports/wp/pdu_unsound.json"])
     assert out["covered"] == 0 and out["blocked"] == 1
     u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
@@ -233,20 +318,23 @@ def test_ingest_wp_rejects_unsound_proof_and_records_reduced_checks(run_dir):
     assert any("Missing assigns clause" in msg for msg in u["unresolved"])
 
     # 2. A sound all_proven report with reduced_checks records the assumption and covers the unit.
-    write_json(run_dir / "workspace/reports/wp/pdu_proven.json", wp_report(
-        status="all_proven",
-        function="snmp_parse_pdu",
-        file="workspace/work/src/snmp/pdu.c",
-        soundness={
-            "sound": True,
-            "tier_a_abort_errors": [],
-            "tier_b_unsound_warnings": [],
-            "memory_model_hypotheses": [],
-            "unproven_global_lemmas": [],
-            "reduced_checks": ["-no-warn-unsigned-overflow"],
-            "assumed_function_pointer_goals": ["\\valid_function(cb)"],
-        },
-    ))
+    write_json(
+        run_dir / "workspace/reports/wp/pdu_proven.json",
+        wp_report(
+            status="all_proven",
+            function="snmp_parse_pdu",
+            file="workspace/work/src/snmp/pdu.c",
+            soundness={
+                "sound": True,
+                "tier_a_abort_errors": [],
+                "tier_b_unsound_warnings": [],
+                "memory_model_hypotheses": [],
+                "unproven_global_lemmas": [],
+                "reduced_checks": ["-no-warn-unsigned-overflow"],
+                "assumed_function_pointer_goals": ["\\valid_function(cb)"],
+            },
+        ),
+    )
     out2 = L.cmd_ingest_wp([run_dir / "workspace/reports/wp/pdu_proven.json"])
     assert out2["covered"] == 1
     u2 = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
@@ -259,9 +347,15 @@ def test_ingest_wp_rejects_unsound_proof_and_records_reduced_checks(run_dir):
 
 def test_ingest_wp_analysis_error_records_evidence_without_status_change(run_dir):
     seed(run_dir)
-    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report(
-        status="analysis_error", reason="oom_killed", by_obligation_class={}, unproven_goals=[],
-    ))
+    write_json(
+        run_dir / "workspace/reports/wp/snmp_parse_pdu.json",
+        wp_report(
+            status="analysis_error",
+            reason="oom_killed",
+            by_obligation_class={},
+            unproven_goals=[],
+        ),
+    )
     L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
     u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
     assert u["status"] == "planned"
@@ -273,7 +367,10 @@ def test_ingest_wp_analysis_error_records_evidence_without_status_change(run_dir
 
 def test_ingest_fuzz_not_run_is_recorded_not_ignored(run_dir):
     seed(run_dir)
-    write_json(run_dir / "workspace/reports/fuzz/snmp.json", {"mode": "campaign", "module": "snmp", "status": "not_run", "reason": "job killed"})
+    write_json(
+        run_dir / "workspace/reports/fuzz/snmp.json",
+        {"mode": "campaign", "module": "snmp", "status": "not_run", "reason": "job killed"},
+    )
     L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
     u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
     assert u["status"] == "planned"
@@ -304,3 +401,152 @@ def test_ledger_commands_hold_the_run_lock_and_release_it(run_dir):
         L.cmd_transition("src/snmp/pdu.c#snmp_parse_pdu::rte", "in_progress", "prover-1", None)
         assert lock_dir.is_dir()
     assert not (run_dir / ".framac-locks").exists()
+
+
+def test_ingest_fuzz_insufficient_memory_records_evidence_and_unresolved(run_dir):
+    seed(run_dir)
+    write_json(
+        run_dir / "workspace/reports/fuzz/snmp.json",
+        {"mode": "campaign", "module": "snmp", "status": "insufficient_memory", "error_summary": ["need 2560 MiB"]},
+    )
+    L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
+    u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
+    assert u["status"] == "planned"
+    assert u["unresolved"] == []
+    assert u["evidence"][-1]["result"] == "fuzz_insufficient_memory"
+    assert u["evidence"][-1]["discharging"] is False
+    assert "need 2560 MiB" in u["evidence"][-1]["summary"]
+
+
+def test_ingest_eva_disambiguates_same_named_statics_across_files(run_dir):
+    dag = {
+        "modules": {"m": {"tier": "Tier 1", "files": ["src/a.c", "src/b.c"]}},
+        "functions": {
+            "src/a.c#helper": {"name": "helper", "file": "src/a.c", "module": "m", "tier": "Tier 1"},
+            "src/b.c#helper": {"name": "helper", "file": "src/b.c", "module": "m", "tier": "Tier 1"},
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
+    rep = eva_report(
+        module="m",
+        sources=["workspace/work/src/a.c", "workspace/work/src/b.c"],
+        functions_with_properties=["helper"],
+        functions_with_properties_by_file={"src/a.c": ["helper"], "src/b.c": ["helper"]},
+        unknown_obligations=[
+            {
+                "file": "workspace/work/src/a.c",
+                "function": "helper",
+                "line": 12,
+                "kind": "mem_access",
+                "property": "\\valid(p)",
+            },
+        ],
+        unknown_obligations_by_function={
+            "helper": [
+                {
+                    "file": "workspace/work/src/a.c",
+                    "function": "helper",
+                    "line": 12,
+                    "kind": "mem_access",
+                    "property": "\\valid(p)",
+                },
+            ],
+        },
+        invalid_alarms=[],
+        dead_alarms=[],
+    )
+    write_json(run_dir / "workspace/reports/eva/m.json", rep)
+    L.cmd_ingest_eva([run_dir / "workspace/reports/eva/m.json"])
+    by_id = units_by_id(run_dir)
+    assert by_id["src/a.c#helper::rte"]["status"] == "planned"
+    assert by_id["src/a.c#helper::rte"]["evidence"][-1]["result"] == "eva_unknown"
+    assert by_id["src/b.c#helper::rte"]["status"] == "covered"
+    assert by_id["src/b.c#helper::rte"]["evidence"][-1]["result"] == "eva_all_valid"
+
+
+def test_transition_many_commits_atomically_or_rolls_back_all(run_dir):
+    seed(run_dir)
+    c1 = "src/snmp/pdu.c#snmp_parse_pdu::rte"
+    c2 = "src/snmp/ber.c#ber_decode_len::rte"
+    res = L.cmd_transition_many(
+        [
+            {"id": c1, "status": "in_progress", "agent_id": "prover-1", "expected": ["planned"]},
+            {"id": c2, "status": "in_progress", "agent_id": "prover-2", "expected": ["planned"]},
+        ]
+    )
+    assert len(res) == 2
+    by_id = units_by_id(run_dir)
+    assert by_id[c1]["status"] == "in_progress" and by_id[c2]["status"] == "in_progress"
+    # If the second item fails compare-and-set, the first item is not committed either.
+    with pytest.raises(L.LedgerError, match="expected one of"):
+        L.cmd_transition_many(
+            [
+                {"id": c1, "status": "planned", "expected": ["in_progress"]},
+                {"id": c2, "status": "planned", "expected": ["covered"]},
+            ]
+        )
+    by_id = units_by_id(run_dir)
+    assert by_id[c1]["status"] == "in_progress" and by_id[c2]["status"] == "in_progress"
+
+
+def test_transition_rejects_manual_covered(run_dir):
+    seed(run_dir)
+    c1 = "src/snmp/pdu.c#snmp_parse_pdu::rte"
+    with pytest.raises(L.LedgerError, match="cannot manually transition"):
+        L.cmd_transition(c1, "covered", None, None)
+    with pytest.raises(L.LedgerError, match="cannot manually transition"):
+        L.cmd_transition_many([{"id": c1, "status": "covered"}])
+
+
+def test_commit_clears_snapshot_manifest_on_reopen(run_dir):
+    seed(run_dir)
+    c1 = "src/snmp/pdu.c#snmp_parse_pdu::rte"
+    meta_path = run_dir / "run-metadata.json"
+    meta = {
+        "schema_version": 1,
+        "run_id": "run-1",
+        "repo": "test",
+        "run_status": "complete",
+        "snapshot_manifest": "state/snapshot-manifest.json",
+        "snapshot_digest": "deadbeef" * 8,
+    }
+    write_json(meta_path, meta)
+    snap_path = run_dir / "state/snapshot-manifest.json"
+    snap_path.parent.mkdir(parents=True, exist_ok=True)
+    snap_path.write_text("{}", encoding="utf-8")
+
+    units, cands = L.load_state()
+    # Setting unit back to planned reopens the run
+    units[c1]["status"] = "planned"
+    L.commit(units, cands, run_dir=run_dir)
+
+    new_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert new_meta["run_status"] == "in_progress"
+    assert new_meta["snapshot_manifest"] is None
+    assert new_meta["snapshot_digest"] is None
+    assert not snap_path.exists()
+
+
+def test_ingest_fuzz_publishes_corpus_to_shared_cache_when_rw(run_dir, tmp_path, monkeypatch):
+    seed(run_dir)
+    shared_cache = tmp_path / "shared_cache"
+    shared_cache.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("FRAMAC_SHARED_CACHE_DIR", str(shared_cache))
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "rw")
+    monkeypatch.setenv("FRAMAC_CACHE", "on")
+
+    corpus_dir = run_dir / "workspace/corpus/snmp"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    (corpus_dir / "seed1").write_bytes(b"\x30\x00")
+    (corpus_dir / "seed2").write_bytes(b"\x30\x02\x01\x05")
+
+    write_json(
+        run_dir / "workspace/reports/fuzz/snmp.json",
+        {"mode": "campaign", "module": "snmp", "status": "clean", "artifacts": []},
+    )
+    out = L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
+    assert out.get("published_corpora") == {"snmp": 2}
+    shared_mod_dir = shared_cache / "corpora" / "snmp"
+    assert shared_mod_dir.is_dir()
+    assert len(list(shared_mod_dir.iterdir())) == 2

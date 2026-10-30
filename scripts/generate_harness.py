@@ -28,7 +28,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_strict, utc_now  # noqa: E402
+from framac_common import atomic_write_json, load_json_strict, normalize_flag_args, utc_now  # noqa: E402
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
@@ -77,10 +77,7 @@ def _normalize_header_include(header_include: str, cppflags: str) -> tuple[str, 
 
 
 def _wrap_null_terminated(eva_inner: str, fuzz_inner: str) -> tuple[str, str]:
-    eva_wrapped = (
-        "input_buf[input_len < MAX_INPUT_SIZE ? input_len : (MAX_INPUT_SIZE - 1)] = 0;\n"
-        f"    {eva_inner}"
-    )
+    eva_wrapped = f"input_buf[input_len < MAX_INPUT_SIZE ? input_len : (MAX_INPUT_SIZE - 1)] = 0;\n    {eva_inner}"
     fuzz_wrapped = (
         "uint8_t *cstr_buf = (uint8_t *)malloc(size + 1U);\n"
         "    if (cstr_buf != NULL) {\n"
@@ -97,12 +94,8 @@ def _wrap_null_terminated(eva_inner: str, fuzz_inner: str) -> tuple[str, str]:
 _PARAM_DECL_RE = re.compile(
     r"^(?P<type_part>.*?)(?P<stars>(?:\*\s*)+)?(?P<name>[A-Za-z_]\w*)\s*(?P<array>\[[^\]]*\])?$"
 )
-_FN_PTR_PARAM_RE = re.compile(
-    r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*\((?P<args>.*)\)$"
-)
-_FN_TYPE_PARAM_RE = re.compile(
-    r"^(?P<head>[^(]+)\((?P<args>.*)\)$"
-)
+_FN_PTR_PARAM_RE = re.compile(r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*\((?P<args>.*)\)$")
+_FN_TYPE_PARAM_RE = re.compile(r"^(?P<head>[^(]+)\((?P<args>.*)\)$")
 _C_PP_DIRECTIVE_RE = re.compile(r"^[ \t]*#[^\n]*(?:\\\r?\n[^\n]*)*", re.MULTILINE)
 _CPP_GUARD_RE = re.compile(
     r"#[ \t]*if(?:def)?[ \t]+(?:defined[ \t]*\([ \t]*)?__cplusplus\b.*?#[ \t]*endif\b",
@@ -465,22 +458,17 @@ def _is_c_string_param(param: dict[str, Any], next_param: dict[str, Any] | None)
 
 
 def _is_buf_len_pair(param: dict[str, Any], next_param: dict[str, Any] | None) -> bool:
-    if (
-        not param["is_pointer"]
-        or param.get("is_fn_pointer")
-        or next_param is None
-        or next_param["is_pointer"]
-    ):
+    if not param["is_pointer"] or param.get("is_fn_pointer") or next_param is None or next_param["is_pointer"]:
         return False
     pt = param["pointee_type"].lower()
     next_pt = next_param["pointee_type"].lower()
     next_name = next_param["name"].lower()
-    is_int_like = any(
-        k in next_pt for k in ("int", "size_t", "ssize_t", "long", "short", "unsigned", "len", "word")
-    )
+    is_int_like = any(k in next_pt for k in ("int", "size_t", "ssize_t", "long", "short", "unsigned", "len", "word"))
     if not is_int_like:
         return False
-    if any(k in pt for k in ("uint8_t", "unsigned char", "int8_t", "byte", "uchar")) or param["type"].replace("const", "").strip().startswith("void"):
+    if any(k in pt for k in ("uint8_t", "unsigned char", "int8_t", "byte", "uchar")) or param["type"].replace(
+        "const", ""
+    ).strip().startswith("void"):
         return True
     if pt == "char" and any(k in next_name for k in ("len", "size", "count", "cap")):
         return True
@@ -648,13 +636,9 @@ def _build_invocations(
         len_eva = f" {global_len} = input_len;" if global_len else ""
         len_fuzz = f" {global_len} = size;" if global_len else ""
         eva_call = (
-            f"if (input_len > 0) {{ memcpy((void *){global_buf}, input_buf, input_len); }}"
-            f"{len_eva} {entry_fn}();"
+            f"if (input_len > 0) {{ memcpy((void *){global_buf}, input_buf, input_len); }}{len_eva} {entry_fn}();"
         )
-        fuzz_call = (
-            f"if (size > 0) {{ memcpy((void *){global_buf}, bounded_buf, size); }}"
-            f"{len_fuzz} {entry_fn}();"
-        )
+        fuzz_call = f"if (size > 0) {{ memcpy((void *){global_buf}, bounded_buf, size); }}{len_fuzz} {entry_fn}();"
         if null_terminate:
             eva_nt = (
                 f"if (input_len > 0) {{ memcpy((void *){global_buf}, input_buf, input_len); }}\n"
@@ -960,7 +944,7 @@ def resolve_prelude_headers(
             if best.name in chosen_names:
                 continue
             # If the symbol failed inside an earlier prelude header, the new header must precede it.
-            failing_names = [Path(f.replace("\\", "/")).name for f in symbols[sym]]
+            failing_names = {Path(f.replace("\\", "/")).name for f in symbols[sym]}
             before = next((h for h in prelude if h in failing_names), None)
             chosen_names.append(best.name)
             new_headers.append((best.name, before))
@@ -971,11 +955,11 @@ def resolve_prelude_headers(
             return result
 
         _insert_prelude_includes(harness_file, module_line_include, new_headers)
-        for hdr, before in new_headers:
+        for hdr_name, before in new_headers:
             if before and before in prelude:
-                prelude.insert(prelude.index(before), hdr)
+                prelude.insert(prelude.index(before), hdr_name)
             else:
-                prelude.append(hdr)
+                prelude.append(hdr_name)
         result["prelude_headers"] = list(prelude)
         rounds += 1
 
@@ -1120,7 +1104,11 @@ def generate_module_harness(
     }
     atomic_write_json(harness_meta_file, sidecar)
 
-    if prelude.get("status") == "unresolved" and prelude_fields["prelude_unresolved"] and prelude.get("iterations", 0) > 0:
+    if (
+        prelude.get("status") == "unresolved"
+        and prelude_fields["prelude_unresolved"]
+        and prelude.get("iterations", 0) > 0
+    ):
         raise ValueError(
             "harness for module "
             f"{module_name!r} has unresolved identifiers after automatic prelude resolution: "
@@ -1170,16 +1158,7 @@ def _bind_flag_values(argv: list[str]) -> list[str]:
     argparse reads a lone value such as `--ldflags -lbsd` as an unknown option; bind the value of
     --cppflags / --ldflags with `=` so single flags work as well as quoted flag lists.
     """
-    out: list[str] = []
-    i = 0
-    while i < len(argv):
-        if argv[i] in ("--cppflags", "--ldflags") and i + 1 < len(argv):
-            out.append(f"{argv[i]}={argv[i + 1]}")
-            i += 2
-        else:
-            out.append(argv[i])
-            i += 1
-    return out
+    return normalize_flag_args(argv, ("--cppflags", "--ldflags"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1215,19 +1194,39 @@ def main(argv: list[str] | None = None) -> int:
         help="Synthesize argument bindings automatically from the C prototype of --entry-fn (sets --entry-style=auto_prototype and defaults --reachability=internal_api)",
     )
     parser.add_argument("--global-buf", default=None, help="Global buffer symbol when --entry-style=global_buffer")
-    parser.add_argument("--global-len", default=None, help="Optional global length symbol when --entry-style=global_buffer")
-    parser.add_argument("--struct-type", default=None, help="C struct type (e.g. 'Anomaly_T') when --entry-style=struct_arg")
-    parser.add_argument("--extra-include", action="append", default=[], help="Additional header to #include in the harness (repeatable)")
-    parser.add_argument("--call-expr", default=None, help="Custom C invocation statements using fuzz_buf and fuzz_len when --entry-style=custom")
-    parser.add_argument("--eva-expr", default=None, help="Custom Eva invocation statements (overrides --call-expr for eva_main)")
-    parser.add_argument("--fuzz-expr", default=None, help="Custom LibFuzzer invocation statements (overrides --call-expr for LLVMFuzzerTestOneInput)")
-    parser.add_argument("--null-terminate", action="store_true", help="Guarantee fuzz_buf is NUL-terminated in both Eva and LibFuzzer")
+    parser.add_argument(
+        "--global-len", default=None, help="Optional global length symbol when --entry-style=global_buffer"
+    )
+    parser.add_argument(
+        "--struct-type", default=None, help="C struct type (e.g. 'Anomaly_T') when --entry-style=struct_arg"
+    )
+    parser.add_argument(
+        "--extra-include", action="append", default=[], help="Additional header to #include in the harness (repeatable)"
+    )
+    parser.add_argument(
+        "--call-expr",
+        default=None,
+        help="Custom C invocation statements using fuzz_buf and fuzz_len when --entry-style=custom",
+    )
+    parser.add_argument(
+        "--eva-expr", default=None, help="Custom Eva invocation statements (overrides --call-expr for eva_main)"
+    )
+    parser.add_argument(
+        "--fuzz-expr",
+        default=None,
+        help="Custom LibFuzzer invocation statements (overrides --call-expr for LLVMFuzzerTestOneInput)",
+    )
+    parser.add_argument(
+        "--null-terminate", action="store_true", help="Guarantee fuzz_buf is NUL-terminated in both Eva and LibFuzzer"
+    )
     parser.add_argument(
         "--include-source",
         action="store_true",
         help="Include target .c source(s) directly in the harness translation unit for static-function visibility",
     )
-    parser.add_argument("--stubbed-callee", action="append", default=[], help="External/I/O callee stubbed by the harness (repeatable)")
+    parser.add_argument(
+        "--stubbed-callee", action="append", default=[], help="External/I/O callee stubbed by the harness (repeatable)"
+    )
     parser.add_argument("--contract-note", action="append", default=[], help="Entry contract note (repeatable)")
     parser.add_argument(
         "--no-auto-prelude",
@@ -1238,7 +1237,9 @@ def main(argv: list[str] | None = None) -> int:
             "-I directories defining identifiers the module header uses but does not include)"
         ),
     )
-    parser.add_argument("--record-repair", type=Path, default=None, help="Path to harness_<mod>.json to record a repair")
+    parser.add_argument(
+        "--record-repair", type=Path, default=None, help="Path to harness_<mod>.json to record a repair"
+    )
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
     args = parser.parse_args(raw_argv)
 
@@ -1256,9 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
     effective_style = "auto_prototype" if args.auto_args else args.entry_style
     explicit_reachability = any(a == "--reachability" or a.startswith("--reachability=") for a in raw_argv)
     effective_reachability = (
-        "internal_api"
-        if (effective_style == "auto_prototype" and not explicit_reachability)
-        else args.reachability
+        "internal_api" if (effective_style == "auto_prototype" and not explicit_reachability) else args.reachability
     )
 
     try:

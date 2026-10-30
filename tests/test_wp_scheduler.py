@@ -39,6 +39,7 @@ def ready():
 
 
 def wp_report(fn, file_field, status="all_proven", reason=None):
+    goals: list[dict]
     if status == "all_proven":
         by_class, goals = {"rte": {"proven": 2, "proven_under_hyp": 0, "unproven": 0}}, []
     elif status == "analysis_error":
@@ -46,16 +47,26 @@ def wp_report(fn, file_field, status="all_proven", reason=None):
     else:
         by_class = {"rte": {"proven": 1, "proven_under_hyp": 0, "unproven": 1}}
         goals = [{"obligation_class": "rte", "kind": "assert", "line": 3, "annotation": "p != 0"}]
-    report = {"status": status, "function": fn, "file": file_field, "by_obligation_class": by_class,
-              "unproven_goals": goals}
+    report = {
+        "status": status,
+        "function": fn,
+        "file": file_field,
+        "by_obligation_class": by_class,
+        "unproven_goals": goals,
+    }
     if reason:
         report["reason"] = reason
     return report
 
 
 def request(callee, n):
-    return {"callee": callee, "callee_file": f"src/m/{callee}.c", "header_file": f"src/m/{callee}.h",
-            "needed_clause": f"ensures R{n}: n >= {n};", "reason": f"the caller needs bound {n}"}
+    return {
+        "callee": callee,
+        "callee_file": f"src/m/{callee}.c",
+        "header_file": f"src/m/{callee}.h",
+        "needed_clause": f"ensures R{n}: n >= {n};",
+        "reason": f"the caller needs bound {n}",
+    }
 
 
 class Sim:
@@ -85,7 +96,8 @@ class Sim:
 
     def build(self, functions, *, units=None, extra_units=(), collisions=(), sidecars=None, modules=None):
         """functions: {name: (file, module, [callees])}; one planned rte unit each unless `units` is given."""
-        dag_fns, mods = {}, {}
+        dag_fns: dict[str, dict] = {}
+        mods: dict[str, dict] = {}
         for name, (file, module, callees) in functions.items():
             dag_fns[name] = {"name": name, "file": file, "module": module, "internal_callees": list(callees), "wave": 0}
             mod = mods.setdefault(module, {"tier": TIER1, "files": [], "run_eva": True, "run_eacsl_fuzz": True})
@@ -97,26 +109,52 @@ class Sim:
             mod["required_sources"] = sorted(mod["files"])
             mod.update((modules or {}).get(name, {}))
         modules = mods
-        write_json(self.run_dir / "workspace/reports/callgraph_dag.json", {
-            "functions": dag_fns, "modules": modules, "name_collisions": list(collisions), "recursion_cycles": [],
-        })
+        write_json(
+            self.run_dir / "workspace/reports/callgraph_dag.json",
+            {
+                "functions": dag_fns,
+                "modules": modules,
+                "name_collisions": list(collisions),
+                "recursion_cycles": [],
+            },
+        )
         if units is None:
-            units = [unit(file, name, "rte", module=module, tier=TIER1) for name, (file, module, _) in functions.items()]
+            units = [
+                unit(file, name, "rte", module=module, tier=TIER1) for name, (file, module, _) in functions.items()
+            ]
         all_units = sorted([*units, *extra_units], key=lambda u: u["coverage_id"])
         write_json(self.run_dir / "coverage-ledger.json", all_units)
         write_json(self.run_dir / "candidates.json", [])
         for mod, extra in (sidecars or {}).items():
-            write_json(self.run_dir / f"workspace/harnesses/harness_{mod}.json",
-                       {"module": mod, "sources": [], "cppflags": "-I.", "repair_attempts": 0, "max_repair_attempts": 2, **extra})
+            write_json(
+                self.run_dir / f"workspace/harnesses/harness_{mod}.json",
+                {
+                    "module": mod,
+                    "sources": [],
+                    "cppflags": "-I.",
+                    "repair_attempts": 0,
+                    "max_repair_attempts": 2,
+                    **extra,
+                },
+            )
 
     def eva_candidate(self, module, file, fn):
         """An Eva Invalid alarm: a real candidate, its unit moved to `candidate` by the ledger."""
         path = self.run_dir / f"workspace/reports/eva/{module}.json"
-        write_json(path, {
-            "status": "ok", "module": module, "unknown_obligations_by_function": {},
-            "invalid_alarms": [{"file": file, "function": fn, "line": 3, "kind": "mem_access", "annotation": "p != 0"}],
-            "dead_alarms": [], "assumed_properties": [], "functions_with_properties": [fn],
-        })
+        write_json(
+            path,
+            {
+                "status": "ok",
+                "module": module,
+                "unknown_obligations_by_function": {},
+                "invalid_alarms": [
+                    {"file": file, "function": fn, "line": 3, "kind": "mem_access", "annotation": "p != 0"}
+                ],
+                "dead_alarms": [],
+                "assumed_properties": [],
+                "functions_with_properties": [fn],
+            },
+        )
         L.cmd_ingest_eva([path])
         return [c["fingerprint"] for c in load("candidates.json") if c["location"]["function"] == fn][0]
 
@@ -126,20 +164,37 @@ class Sim:
         report = f"agents/{aid}/scratch/wp_{fn}.json"
         wp_status = wp_status or ("all_proven" if status == "all_proven" else "unproven_goals_remain")
         write_json(self.run_dir / report, wp_report(fn, f"agents/{aid}/scratch/work/{file}", wp_status, wp_reason))
-        write_json(self.run_dir / f"agents/{aid}/scratch/result.json", {
-            "role": "prover", "agent_id": aid, "file": file, "function": fn, "status": status, "patch": None,
-            "evidence": [{"tool_output": report, "result": wp_status}],
-            "unproven_goals": [] if status == "all_proven" else [{"line": 3, "annotation": "p != 0"}],
-            "strengthening_requests": [dict(r) for r in requests], "boundary_assumptions": [],
-            "fault_hypothesis": hypothesis,
-        })
+        write_json(
+            self.run_dir / f"agents/{aid}/scratch/result.json",
+            {
+                "role": "prover",
+                "agent_id": aid,
+                "file": file,
+                "function": fn,
+                "status": status,
+                "patch": None,
+                "evidence": [{"tool_output": report, "result": wp_status}],
+                "unproven_goals": [] if status == "all_proven" else [{"line": 3, "annotation": "p != 0"}],
+                "strengthening_requests": [dict(r) for r in requests],
+                "boundary_assumptions": [],
+                "fault_hypothesis": hypothesis,
+            },
+        )
 
     def architect(self, aid, header, status="passed"):
-        write_json(self.run_dir / f"agents/{aid}/scratch/result.json", {
-            "role": "architect", "agent_id": aid, "header": header, "status": status, "patch": None,
-            "evidence": [{"tool_output": f"agents/{aid}/scratch/notes.txt", "result": status}],
-            "boundary_assumptions": [], "notes": "",
-        })
+        write_json(
+            self.run_dir / f"agents/{aid}/scratch/result.json",
+            {
+                "role": "architect",
+                "agent_id": aid,
+                "header": header,
+                "status": status,
+                "patch": None,
+                "evidence": [{"tool_output": f"agents/{aid}/scratch/notes.txt", "result": status}],
+                "boundary_assumptions": [],
+                "notes": "",
+            },
+        )
 
     def breaker(self, aid, fn, file, crash=False, hypothesis=None):
         scratch = self.run_dir / f"agents/{aid}/scratch"
@@ -149,13 +204,22 @@ class Sim:
             (scratch / "seed-1").write_bytes(b"\x02\x03")
             (scratch / "crash-1").write_bytes(b"\x00\x01")
             seeds = [f"agents/{aid}/scratch/seed-1"]
-        write_json(scratch / "result.json", {
-            "role": "breaker", "agent_id": aid, "file": file, "function": fn,
-            "status": "crash_found" if crash else "clean", "seeds": seeds,
-            "crash_artifact": f"agents/{aid}/scratch/crash-1" if crash else None,
-            "failing_predicate": "p != 0" if crash else None, "analysis": "Probed the length field.",
-            "suggested_requires": None, "fault_hypothesis": hypothesis,
-        })
+        write_json(
+            scratch / "result.json",
+            {
+                "role": "breaker",
+                "agent_id": aid,
+                "file": file,
+                "function": fn,
+                "status": "crash_found" if crash else "clean",
+                "seeds": seeds,
+                "crash_artifact": f"agents/{aid}/scratch/crash-1" if crash else None,
+                "failing_predicate": "p != 0" if crash else None,
+                "analysis": "Probed the length field.",
+                "suggested_requires": None,
+                "fault_hypothesis": hypothesis,
+            },
+        )
 
     def finish(self, aid, fn, file, force=False):
         """A prover proves its function and the result is merged."""
@@ -186,21 +250,33 @@ class Sim:
             if aid in self.merge_fail:
                 failed.append({"ok": False, "rolled_back": True, "agent_id": aid, "reason": self.merge_fail[aid]})
             else:
-                merged.append({"ok": True, "agent_id": aid, "modified_files": self.modified.get(aid, []),
-                               "parent_wp_report": rel})
+                merged.append(
+                    {"ok": True, "agent_id": aid, "modified_files": self.modified.get(aid, []), "parent_wp_report": rel}
+                )
         return {"ok": not failed, "batch_verified": True, "bisected": bool(failed), "merged": merged, "failed": failed}
 
     def merge_agent_overlay(self, run_dir, agent_id, role, **kw):
         self.arch_merges.append((agent_id, role, kw))
-        return {"ok": agent_id not in self.merge_fail, "agent_id": agent_id,
-                "modified_files": self.modified.get(agent_id, []), "reason": self.merge_fail.get(agent_id)}
+        return {
+            "ok": agent_id not in self.merge_fail,
+            "agent_id": agent_id,
+            "modified_files": self.modified.get(agent_id, []),
+            "reason": self.merge_fail.get(agent_id),
+        }
 
     def recheck_function(self, run_dir, agent_id, file, function, module):
         self.recheck_calls.append(function)
         ok = self.recheck_ok.get(function, True)
         rel = f"agents/{agent_id}/scratch/parent_wp/{function}.json"
-        write_json(self.run_dir / rel, wp_report(function, f"workspace/work/{file}", "all_proven" if ok else "unproven_goals_remain"))
-        return {"ok": ok, "reason": "verified" if ok else "parent WP check returned status='unproven_goals_remain'", "report": rel}
+        write_json(
+            self.run_dir / rel,
+            wp_report(function, f"workspace/work/{file}", "all_proven" if ok else "unproven_goals_remain"),
+        )
+        return {
+            "ok": ok,
+            "reason": "verified" if ok else "parent WP check returned status='unproven_goals_remain'",
+            "report": rel,
+        }
 
 
 @pytest.fixture
@@ -211,6 +287,7 @@ def sim(run_dir, monkeypatch):
 # ---------------------------------------------------------------------------
 # Dependency shapes
 # ---------------------------------------------------------------------------
+
 
 def test_chain_runs_callees_first_and_callers_wait_for_the_merge(sim, capsys):
     sim.build({"a": ("src/m/a.c", "m", ["b"]), "b": ("src/m/b.c", "m", ["c"]), "c": ("src/m/c.c", "m", [])})
@@ -249,8 +326,14 @@ def test_chain_runs_callees_first_and_callers_wait_for_the_merge(sim, capsys):
 
 
 def test_diamond_releases_both_branches_and_joins_on_both(sim):
-    sim.build({"a": ("src/m/a.c", "m", ["b", "c"]), "b": ("src/m/b.c", "m", ["d"]),
-               "c": ("src/m/c.c", "m", ["d"]), "d": ("src/m/d.c", "m", [])})
+    sim.build(
+        {
+            "a": ("src/m/a.c", "m", ["b", "c"]),
+            "b": ("src/m/b.c", "m", ["d"]),
+            "c": ("src/m/c.c", "m", ["d"]),
+            "d": ("src/m/d.c", "m", []),
+        }
+    )
     S.cmd_init()
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m/d.c#d"]
     sim.finish("prove-d", "d", "src/m/d.c")
@@ -284,7 +367,11 @@ def test_recursion_group_is_ready_together_and_its_callers_wait_for_every_member
 
 def test_name_collisions_resolve_same_file_statics_and_otherwise_wait_for_every_definition(sim):
     sim.build(
-        {"helper": ("src/a/x.c", "a", []), "top": ("src/c/z.c", "c", ["helper"]), "local": ("src/b/y.c", "b", ["helper"])},
+        {
+            "helper": ("src/a/x.c", "a", []),
+            "top": ("src/c/z.c", "c", ["helper"]),
+            "local": ("src/b/y.c", "b", ["helper"]),
+        },
         extra_units=[unit("src/b/y.c", "helper", "rte", module="b", tier=TIER1)],
         collisions=[{"function": "helper", "files": ["src/a/x.c", "src/b/y.c"]}],
     )
@@ -307,13 +394,23 @@ def test_name_collisions_resolve_same_file_statics_and_otherwise_wait_for_every_
 
 
 def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_module(sim):
-    covered_g = unit("src/m2/g.c", "g", "rte", status="covered", module="m2", tier=TIER1,
-                     evidence=[evidence(tool_output="workspace/reports/eva/m2.json")])
+    covered_g = unit(
+        "src/m2/g.c",
+        "g",
+        "rte",
+        status="covered",
+        module="m2",
+        tier=TIER1,
+        evidence=[evidence(tool_output="workspace/reports/eva/m2.json")],
+    )
     write_json(sim.run_dir / "workspace/reports/eva/m2.json", {"status": "ok", "module": "m2"})
     sim.build(
         {"f": ("src/m1/f.c", "m1", ["g"]), "g": ("src/m2/g.c", "m2", []), "g2": ("src/m2/g2.c", "m2", [])},
-        units=[unit("src/m1/f.c", "f", "rte", module="m1", tier=TIER1), covered_g,
-               unit("src/m2/g2.c", "g2", "rte", module="m2", tier=TIER1)],
+        units=[
+            unit("src/m1/f.c", "f", "rte", module="m1", tier=TIER1),
+            covered_g,
+            unit("src/m2/g2.c", "g2", "rte", module="m2", tier=TIER1),
+        ],
         sidecars={"m1": {"header": "src/m1/m1.h"}, "m2": {"header": "src/m2/m2.h"}},
     )
     S.cmd_init()
@@ -336,10 +433,20 @@ def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_modul
 
 
 def test_priority_is_caller_height_then_eva_unknowns_then_name(sim):
-    sim.build({"p": ("src/m/p.c", "m", []), "p1": ("src/m/p1.c", "m", ["p"]), "p2": ("src/m/p2.c", "m", ["p1"]),
-               "q": ("src/m/q.c", "m", []), "r": ("src/m/r.c", "m", []), "s": ("src/m/s.c", "m", [])})
-    write_json(sim.run_dir / "workspace/reports/eva/m.json",
-               {"status": "ok", "module": "m", "unknown_obligations_by_function": {"q": [{}] * 5, "r": [{}]}})
+    sim.build(
+        {
+            "p": ("src/m/p.c", "m", []),
+            "p1": ("src/m/p1.c", "m", ["p"]),
+            "p2": ("src/m/p2.c", "m", ["p1"]),
+            "q": ("src/m/q.c", "m", []),
+            "r": ("src/m/r.c", "m", []),
+            "s": ("src/m/s.c", "m", []),
+        }
+    )
+    write_json(
+        sim.run_dir / "workspace/reports/eva/m.json",
+        {"status": "ok", "module": "m", "unknown_obligations_by_function": {"q": [{}] * 5, "r": [{}]}},
+    )
     S.cmd_init()
     order = [ids(S.cmd_next("1"))[0] for _ in range(4)]
     assert order == ["prove:src/m/p.c#p", "prove:src/m/q.c#q", "prove:src/m/r.c#r", "prove:src/m/s.c#s"]
@@ -348,6 +455,7 @@ def test_priority_is_caller_height_then_eva_unknowns_then_name(sim):
 # ---------------------------------------------------------------------------
 # Gates
 # ---------------------------------------------------------------------------
+
 
 def _stall_and_dispatch_breaker(sim):
     sim.build({"f": ("src/m/f.c", "m", []), "h": ("src/m/h.c", "m", ["f"])}, sidecars={"m": {}})
@@ -360,7 +468,10 @@ def _stall_and_dispatch_breaker(sim):
     assert ready() == ["breaker:src/m/f.c#f", "prove:src/m/h.c#h"]  # the stalled callee released its caller
     brk = S.cmd_next("1", prepare=True)
     assert ids(brk) == ["breaker:src/m/f.c#f"]
-    assert brk["tasks"][0]["agent_id"] == "breaker-f" and brk["tasks"][0]["wp_report"] == "agents/prove-f/artifacts/wp_f.json"
+    assert (
+        brk["tasks"][0]["agent_id"] == "breaker-f"
+        and brk["tasks"][0]["wp_report"] == "agents/prove-f/artifacts/wp_f.json"
+    )
     # The brief is rendered from the stalled prover's report, not workspace/reports/wp/f.json.
     assert sim.prepared[-1][2]["wp_report"] == "agents/prove-f/artifacts/wp_f.json"
 
@@ -395,7 +506,9 @@ def test_breaker_fault_hypothesis_adds_a_verify_task_that_closes_the_gate(sim):
     ver = nxt["tasks"][0]
     assert ver["role"] == "verifier" and ver["candidate_fingerprint"] == fp
     assert sim.prepared[-1][2] == {"module": "m", "candidate_fp": fp}
-    L.cmd_scaffold_verifier(fp, "needs_validation", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json"))
+    L.cmd_scaffold_verifier(
+        fp, "needs_validation", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json")
+    )
     assert S.cmd_complete(ver["agent_id"])["decision"] == "needs_validation"
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m/h.c#h"]
 
@@ -411,7 +524,9 @@ def test_harness_induced_rejection_creates_a_repair_that_holds_the_gate(sim):
     assert ids(nxt) == [f"verify:{fp}"]
     ver = nxt["tasks"][0]
     assert ver["harness_meta"] == "workspace/harnesses/harness_m.json" and ver["replay_reports"] == []
-    L.cmd_scaffold_verifier(fp, "rejected", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json"))
+    L.cmd_scaffold_verifier(
+        fp, "rejected", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json")
+    )
     out = S.cmd_complete(ver["agent_id"])
     assert out["decision"] == "rejected" and "repair:m" in out["new_tasks"]
     assert units()["src/m/f.c#f::rte"]["status"] == "planned"
@@ -428,20 +543,43 @@ def test_gate_waits_for_every_slice_covering_the_module_but_not_for_tier3_slices
     tier3 = "Tier 3 (Internal State / Glue Module)"
     sim.build(
         {"u": ("src/lib/u.c", "lib", []), "a": ("src/app/a.c", "app", ["u"]), "gfn": ("src/glue/g.c", "glue", ["u"])},
-        units=[unit("src/lib/u.c", "u", "rte", module="lib", tier=TIER1),
-               unit("src/app/a.c", "a", "rte", module="app", tier=TIER1),
-               unit("src/glue/g.c", "gfn", "rte", status="deferred", module="glue", tier=tier3,
-                    unresolved=["tier3_not_scheduled"])],
-        modules={"app": {"required_sources": ["src/app/a.c", "src/lib/u.c"]},
-                 "glue": {"tier": tier3, "required_sources": ["src/glue/g.c", "src/lib/u.c"], "run_eacsl_fuzz": False}},
+        units=[
+            unit("src/lib/u.c", "u", "rte", module="lib", tier=TIER1),
+            unit("src/app/a.c", "a", "rte", module="app", tier=TIER1),
+            unit(
+                "src/glue/g.c",
+                "gfn",
+                "rte",
+                status="deferred",
+                module="glue",
+                tier=tier3,
+                unresolved=["tier3_not_scheduled"],
+            ),
+        ],
+        modules={
+            "app": {"required_sources": ["src/app/a.c", "src/lib/u.c"]},
+            "glue": {"tier": tier3, "required_sources": ["src/glue/g.c", "src/lib/u.c"], "run_eacsl_fuzz": False},
+        },
     )
     glue_fp = make_fingerprint("src/glue/g.c", "gfn", "mem_access", "q != 0")
-    write_json(sim.run_dir / "candidates.json", [{
-        "fingerprint": glue_fp, "status": "unverified", "origin": "eva", "proposed_verdict": "needs_validation",
-        "module": "glue", "location": {"file": "src/glue/g.c", "line": 3, "function": "gfn"},
-        "property": {"kind": "mem_access", "predicate": "q != 0"}, "reproducers": [],
-        "tool_outputs": ["workspace/reports/eva/glue.json"], "linked_units": [], "first_seen": "2026-10-30T00:00:00+00:00",
-    }])
+    write_json(
+        sim.run_dir / "candidates.json",
+        [
+            {
+                "fingerprint": glue_fp,
+                "status": "unverified",
+                "origin": "eva",
+                "proposed_verdict": "needs_validation",
+                "module": "glue",
+                "location": {"file": "src/glue/g.c", "line": 3, "function": "gfn"},
+                "property": {"kind": "mem_access", "predicate": "q != 0"},
+                "reproducers": [],
+                "tool_outputs": ["workspace/reports/eva/glue.json"],
+                "linked_units": [],
+                "first_seen": "2026-10-30T00:00:00+00:00",
+            }
+        ],
+    )
     app_fp = sim.eva_candidate("app", "src/app/a.c", "a")
     S.cmd_init()
     state = load("state/wp_schedule.json")
@@ -458,13 +596,16 @@ def test_replay_reports_are_found_by_fingerprint_and_passed_to_the_verifier(sim)
     write_json(sim.run_dir / "workspace/reports/replay/unrelated.json", {"artifacts": [{"fingerprint": "x"}]})
     S.cmd_init()
     ver = S.cmd_next("auto", prepare=True)["tasks"][0]
-    assert ver["replay_reports"] == ["workspace/reports/replay/other.json",
-                                     f"workspace/reports/replay/{S._fp_slug(fp)}.json"]
+    assert ver["replay_reports"] == [
+        "workspace/reports/replay/other.json",
+        f"workspace/reports/replay/{S._fp_slug(fp)}.json",
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Negotiation and contract re-checks
 # ---------------------------------------------------------------------------
+
 
 def test_negotiation_requeues_the_caller_and_is_capped_per_pair(sim):
     sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
@@ -482,7 +623,9 @@ def test_negotiation_requeues_the_caller_and_is_capped_per_pair(sim):
         assert neg["requests"][0]["needed_clause"] == f"ensures R{n}: n >= {n};"
         assert neg["callers"] == ["prove:src/m/f.c#f"]
         prepared = [kw for aid, _, kw in sim.prepared if aid == negotiator][-1]
-        assert [r["needed_clause"] for r in prepared["requests"]] == [f"ensures R{n}: n >= {n};"]  # rendered into the brief
+        assert [r["needed_clause"] for r in prepared["requests"]] == [
+            f"ensures R{n}: n >= {n};"
+        ]  # rendered into the brief
         sim.finish(negotiator, "g", "src/m/g.c", force=True)
         assert tasks()["prove:src/m/f.c#f"]["state"] == "pending"  # requeued once the request was applied
         redo = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "prove"]
@@ -551,8 +694,9 @@ def test_contract_change_rechecks_merged_callers_and_a_failure_reproves_them(sim
 # merge-pending
 # ---------------------------------------------------------------------------
 
+
 def test_merge_pending_triggers(sim):
-    fns = {n: (f"src/m/{n}.c", "m", []) for n in "abcdefg"}
+    fns: dict[str, tuple[str, str, list[str]]] = {n: (f"src/m/{n}.c", "m", []) for n in "abcdefg"}
     fns.update({"x": ("src/n/x.c", "n", ["y"]), "y": ("src/n/y.c", "n", []), "z": ("src/n/z.c", "n", [])})
     sim.build(fns)
     S.cmd_init()
@@ -585,7 +729,13 @@ def test_merge_pending_triggers(sim):
     out = S.cmd_merge_pending(module="n")
     assert out["fired"] == [{"module": "n", "reasons": ["caller_waiting"], "agents": ["prove-y"]}]
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/n/x.c#x"]
-    assert sim.merge_calls == [["prove-a"], ["prove-b"], ["prove-c", "prove-d", "prove-e", "prove-f"], ["prove-g"], ["prove-y"]]
+    assert sim.merge_calls == [
+        ["prove-a"],
+        ["prove-b"],
+        ["prove-c", "prove-d", "prove-e", "prove-f"],
+        ["prove-g"],
+        ["prove-y"],
+    ]
 
 
 def test_failed_merge_is_requeued_once_then_blocks(sim):
@@ -630,6 +780,7 @@ def test_parent_analysis_error_retries_the_merge_once_then_blocks(sim):
 # Ledger safety and recovery
 # ---------------------------------------------------------------------------
 
+
 def test_prepare_never_overwrites_a_unit_that_just_became_a_candidate(sim):
     sim.build({"f": ("src/m/f.c", "m", [])})
     S.cmd_init()
@@ -648,8 +799,10 @@ def test_prepare_never_overwrites_a_unit_that_just_became_a_candidate(sim):
 def test_reconcile_returns_orphaned_in_progress_units_and_reports_stale_briefs(sim):
     sim.build(
         {"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])},
-        units=[unit("src/m/f.c", "f", "rte", status="in_progress", agent_id="prover-old", module="m", tier=TIER1),
-               unit("src/m/g.c", "g", "rte", module="m", tier=TIER1)],
+        units=[
+            unit("src/m/f.c", "f", "rte", status="in_progress", agent_id="prover-old", module="m", tier=TIER1),
+            unit("src/m/g.c", "g", "rte", module="m", tier=TIER1),
+        ],
         sidecars={"m": {"header": "src/m/m.h"}},
     )
     brief = sim.run_dir / "agents/prover-old/brief.md"
@@ -664,10 +817,15 @@ def test_reconcile_returns_orphaned_in_progress_units_and_reports_stale_briefs(s
     out = S.cmd_init(reconcile=True)
     assert out["reconciled_units"] == [{"coverage_id": "src/m/f.c#f::rte", "agent_id": "prover-old"}]
     assert units()["src/m/f.c#f::rte"]["status"] == "planned" and "prove:src/m/f.c#f" in tasks()
-    assert out["stale_briefs"] == [{
-        "brief": "agents/prover-old/brief.md", "agent_id": "prover-old", "live": False,
-        "reasons": ["unrendered placeholders: {c_file}, {function_name}"], "action": "re-render with next --prepare",
-    }]
+    assert out["stale_briefs"] == [
+        {
+            "brief": "agents/prover-old/brief.md",
+            "agent_id": "prover-old",
+            "live": False,
+            "reasons": ["unrendered placeholders: {c_file}, {function_name}"],
+            "action": "re-render with next --prepare",
+        }
+    ]
     assert out["adopted_architects"] == ["arch:m"] and tasks()["arch:m"]["outcome"] == "merged_before_scheduler"
     assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m/f.c#f", "prove:src/m/g.c#g"]
     assert S.cmd_init(reconcile=True)["reconciled_units"] == []  # live agents keep their units
@@ -734,8 +892,14 @@ def test_requeue_stale_agents_and_accept_a_late_result(sim):
 
 
 def test_waves_mode_keeps_a_barrier_between_waves(sim, monkeypatch):
-    sim.build({"a": ("src/m/a.c", "m", ["b"]), "b": ("src/m/b.c", "m", ["c"]),
-               "c": ("src/m/c.c", "m", []), "d": ("src/m/d.c", "m", [])})
+    sim.build(
+        {
+            "a": ("src/m/a.c", "m", ["b"]),
+            "b": ("src/m/b.c", "m", ["c"]),
+            "c": ("src/m/c.c", "m", []),
+            "d": ("src/m/d.c", "m", []),
+        }
+    )
     S.cmd_init()
     monkeypatch.setenv("FRAMAC_SCHEDULER", "waves")
     nxt = S.cmd_next("auto", prepare=True)
@@ -763,8 +927,9 @@ def test_real_overlay_prepare_and_merge_round_trip(sim, monkeypatch):
         if any(str(c).endswith("run_wp_function.py") for c in cmd):
             out = Path(cmd[cmd.index("--out-json") + 1])
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(wp_report(cmd[cmd.index("--function") + 1], cmd[cmd.index("--file") + 1])),
-                           encoding="utf-8")
+            out.write_text(
+                json.dumps(wp_report(cmd[cmd.index("--function") + 1], cmd[cmd.index("--file") + 1])), encoding="utf-8"
+            )
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unavailable in tests")
 
@@ -799,3 +964,62 @@ def test_status_and_cli(sim, capsys):
     assert S.main(["next", "--slots", "auto", "--max-agents", "1"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["slots"]["max_agents"] == 1 and [t["agent_id"] for t in out["tasks"]] == ["prove-b"]
+
+
+def test_batch_transitions_in_claim_and_park_units(sim, monkeypatch):
+    sim.build(
+        {
+            "f": ("src/m/f.c", "m", []),
+            "g": ("src/m/g.c", "m", []),
+        },
+        extra_units=[unit("src/m/f.c", "f", "l2_termination", module="m", tier=TIER1)],
+    )
+    S.cmd_init()
+    batch_calls: list[list[dict]] = []
+    orig_many = S.DEPS.transition_many
+
+    def spy_many(items):
+        batch_calls.append(list(items))
+        return orig_many(items)
+
+    monkeypatch.setattr(S.DEPS, "transition_many", spy_many)
+    dispatched = S.cmd_next("auto", prepare=True)["tasks"]
+    assert len(dispatched) == 2
+    assert len(batch_calls) == 1
+    assert {item["id"] for item in batch_calls[0]} == {
+        "src/m/f.c#f::rte",
+        "src/m/f.c#f::l2_termination",
+        "src/m/g.c#g::rte",
+    }
+    task = next(t for t in dispatched if t["function"] == "f")
+
+    # Park units when one unit has evidence and one does not: both handled in a single transition_many call.
+    u_map, c_map = L.load_state()
+    L.add_evidence(
+        u_map["src/m/f.c#f::rte"],
+        "wp",
+        "run_wp_function.py",
+        "wp_unproven",
+        False,
+        "workspace/reports/wp/f.json",
+        "1 goal unproven",
+    )
+    (sim.run_dir / "workspace/reports/wp").mkdir(parents=True, exist_ok=True)
+    (sim.run_dir / "workspace/reports/wp/f.json").write_text("{}\n", encoding="utf-8")
+    L.commit(u_map, c_map)
+
+    parked = S._park_units(
+        {
+            "kind": "prove",
+            "file": "src/m/f.c",
+            "function": "f",
+            "agents": [task["agent_id"]],
+            "units": task["coverage_ids"],
+        },
+        task["agent_id"],
+        "stalled after retries",
+    )
+    assert len(batch_calls) == 2
+    assert parked["blocked"] == ["src/m/f.c#f::rte"]
+    assert parked["planned"] == ["src/m/f.c#f::l2_termination"]
+    assert parked["errors"] == []

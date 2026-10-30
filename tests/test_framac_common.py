@@ -43,18 +43,23 @@ def test_report_csv_with_current_and_legacy_headers(tmp_path):
     assert rows[1]["status"] == STATUS_DEAD
 
     legacy = tmp_path / "legacy.csv"
-    legacy.write_text("file\tline\tfunction\tkind\tstatus\tannotation\nx.c\t1\tf\tassigns\tValid\tassigns \\nothing\n", encoding="utf-8")
+    legacy.write_text(
+        "file\tline\tfunction\tkind\tstatus\tannotation\nx.c\t1\tf\tassigns\tValid\tassigns \\nothing\n",
+        encoding="utf-8",
+    )
     row = read_report_csv(legacy)[0]
     assert row["kind"] == "assigns" and row["property"] == "assigns \\nothing" and row["status"] == STATUS_VALID
 
 
 def test_safe_paths_and_agent_ids():
     assert is_safe_relative_path("workspace/reports/eva/x.json")
-    for bad in ("", "/abs", "C:/x", "a/../b", "a\\b", "./a", "aux/x", " a"):
+    for bad in ("", "/abs", "C:/x", "a/../b", "a\\b", "./a", " a"):
         assert not is_safe_relative_path(bad), bad
+    assert is_safe_relative_path("aux/x")
     assert is_safe_agent_id("prover-ber-len-1")
     assert not is_safe_agent_id("Prover")
     assert not is_safe_agent_id("con")
+    assert not is_safe_agent_id("aux")
 
 
 def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
@@ -70,13 +75,17 @@ def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
 
     marker = tmp_path / "holder_has_lock"
     holder = subprocess.Popen(
-        [sys.executable, "-c",
-         "import pathlib, sys, time\n"
-         "from framac_common import run_lock\n"
-         "with run_lock('ledger', pathlib.Path(sys.argv[1])):\n"
-         "    pathlib.Path(sys.argv[2]).write_text('1')\n"
-         "    time.sleep(1.5)\n",
-         str(tmp_path), str(marker)],
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys, time\n"
+            "from framac_common import run_lock\n"
+            "with run_lock('ledger', pathlib.Path(sys.argv[1])):\n"
+            "    pathlib.Path(sys.argv[2]).write_text('1')\n"
+            "    time.sleep(1.5)\n",
+            str(tmp_path),
+            str(marker),
+        ],
         env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
     )
     try:

@@ -58,18 +58,18 @@ Every container invocation belongs to a class. The class sets its CPU range, its
 
 The wrapper infers the class from the command; `--class` (`-Class`) overrides it. Inference only sizes jobs. It is never a security decision (Section 5). A command the inference does not recognise runs as `light`, with 1 CPU and 1 GiB; give a heavy ad-hoc command an explicit `--class`.
 
-Memory estimates learn from history. Each container records its peak memory, OOM kills and CPU time in `state/resource-history/`. The next lease for the same class and module gets 1.25 × the largest of the last five peaks, counting an OOM-killed run twice. History only ever raises a lease above the class model, never lowers it, so `-wp-memlimit` and `-rss_limit_mb` always fit.
+Memory estimates learn from history. Each container records its peak memory, OOM kills and CPU time in `state/resource-history/` (and mirrors them into `/framac-cache/resource-history/` when the shared store is mounted read-write). The next lease for the same class and module gets 1.25 × the largest of the last five peaks across per-run and shared history, counting an OOM-killed run twice. History only ever raises a lease above the class model, never lowers it, so `-wp-memlimit` and `-rss_limit_mb` always fit.
 
 ### How tools size themselves
 
 | Tool | Sized from the job budget | Fixed |
 |---|---|---|
 | WP | `--wp-par auto` = min(CPUs, (memory − 768 MiB) / 1000 MiB). A job limited to less than 1768 MiB (one prover plus Frama-C) is not run: it reports `analysis_error`, `reason: insufficient_memory`, because starved provers fail goals that a properly sized job proves | `-wp-memlimit 1000`, `-wp-timeout` from the profile |
-| LibFuzzer campaign | `--workers auto` = min(CPUs, (memory − 512 MiB) / 2.5 GiB); wall time = max(30 s, CPU-second budget / workers) | `-rss_limit_mb 2048`, per-input `-timeout` |
+| LibFuzzer campaign | `--workers auto` = min(CPUs, (memory − 512 MiB) / 2.5 GiB); wall time = max(30 s, CPU-second budget / workers). A job limited to less than 2560 MiB (512 MiB overhead + 2048 MiB `-rss_limit_mb`) is not run and reports `status: insufficient_memory` | `-rss_limit_mb 2048`, per-input `-timeout` |
 | Guardrail / replay | single process | `-rss_limit_mb 2048`, per-input `-timeout`, deterministic `-seed` |
 | Eva | 1 CPU; parallelism comes from running modules side by side | `--timeout` from the profile |
-| Parent re-check (`merge-batch`) | per-function WP runs in a pool: workers = min(n, CPUs), each `-wp-par = CPUs / workers` | as WP |
-| Make | `-j` = container CPUs; each recipe is admitted by CPU and memory | — |
+| Parent re-check (`merge-batch`) | per-function WP runs in a pool: workers = min(n, CPUs, memory / 1768 MiB), each `-wp-par = min(CPUs / workers, (memory / workers − 768 MiB) / 1000 MiB)` | as WP |
+| Make | `-j` = container CPUs; each recipe is admitted by CPU and memory, running against a stage-private copy of `Makefile` and `modules.mk` rendered directly from memory | — |
 
 The fuzz budget is CPU-seconds per module: quick 60, standard 120, deep 900. A bigger node finishes sooner with the same or more effort. `--max-time` stays as a wall-clock override.
 
@@ -110,7 +110,7 @@ python3 scripts/resources.py gc         # reclaim leases of dead holders whose c
 - Whenever this process may only use part of the machine (a Slurm allocation, a cgroup cpuset), containers get `--cpuset-cpus=<allowed set>`, because containers started by `dockerd` would otherwise escape the allocation.
 - In `auto` mode on native Linux with more than one NUMA node or L3 domain, each lease also gets an exclusive set of whole cores (SMT siblings together), inside one domain when possible. Light jobs share the allowed set.
 - `FRAMAC_PIN=on|off` forces it. Memory is never pinned: the kernel already allocates locally.
-- On Docker Desktop and Podman machines, pinning is pointless: the hypervisor moves virtual CPUs freely.
+- On Docker Desktop (outside WSL2) and Podman machines, pinning is skipped because the hypervisor moves virtual CPUs freely; inside WSL2 distributions sharing the Docker Desktop Linux VM, affinity confinement is preserved.
 
 **Podman and unenforceable limits.**
 - Rootless Podman can only enforce the limits whose cgroup controllers are delegated; by default that is often just memory and pids.
@@ -168,7 +168,8 @@ Set every knob on the host, where you run the wrapper. The container's environme
 
 | What | Key | Hit restores |
 |---|---|---|
-| E-ACSL and sanitizer builds of `workspace/work` (Make builds, parent re-checks, verifiers, breakers) | toolchain identity + effective flags + output path + cwd + dependency manifest | the binary, `instrumented.c`, the fallback object, `compile.log` |
+| E-ACSL and sanitizer builds of `workspace/work` (Make builds, parent re-checks, verifiers, breakers) | L1: toolchain identity + effective flags + output path + cwd + dependency manifest; L2 (E-ACSL builds): line-shift-normalized dependency manifest | the binary, `instrumented.c`, the fallback object, `compile.log` |
+| Guardrail verdicts (run-local `guardrail` store) | binary sha256 + corpus manifest + `--extra-runs` + `--timeout` + `-seed` + module | `passed_dynamic_oracle`, `rejected_overconstrained`, or `code_fault` verdict |
 | WP prover results | Frama-C's own goal digest (`-wp-cache update -wp-cache-dir state/cache/wp`) | unchanged goals across a prover's iterations and in the parent re-check |
 | Eva reports with status `ok` | toolchain identity + Eva flags + dependency manifest | report JSON, `alarms.csv`, `red_alarms.csv`, `eva.log`, `slice.sarif` |
 
@@ -198,18 +199,18 @@ The shared store lets later runs reuse builds, Eva results and proofs for unchan
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`
+- `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest` (and `… pipeline_make.py ingest`, `… pipeline_make.py run ingest wp-queue`)
 - `python3 /opt/framac-pipeline/scripts/cache.py gc` and `… cache.py stats`
 
-The match is token-exact: no other target, option, variable or shell syntax. Write the script path out in full (not `$S`), or the step runs with a read-only store. These steps get write access automatically; `FRAMAC_CACHE_RW=off` keeps the store read-only everywhere. Every other container mounts it read-only. The job class is not used for this decision: it is inferred from a command string an LLM wrote. The flags used by those trusted builds pass an allowlist (Section 6).
+The match is token-exact after expanding `$S/` or `${S}/` to `/opt/framac-pipeline/scripts/` (`S=/opt/framac-pipeline/scripts` is exported inside the container): no other target, option, variable or shell syntax is accepted. These steps get write access automatically; `FRAMAC_CACHE_RW=off` keeps the store read-only everywhere. Every other container mounts it read-only. The job class is not used for this decision: it is inferred from a command string an LLM wrote. The flags used by those trusted builds pass an allowlist (Section 6).
 
+- **Mutual exclusion with target code:** On the same run directory (`run_dir`, compared via `realpath`), the host broker never runs a writable-cache (`cache_mode="rw"`) container concurrently with a container that runs target code (`fuzz`, `guardrail`, `replay`, `selftest`, `verify`, `phase-dynamic`, or any unrecognized command which fails closed as running target code), automatically downgrading an allowlisted `rw` step to `ro` when a target-code job is already active on that `run_dir`, and `pipeline_make.py run` executes `make` against a stage-private temporary copy of `Makefile` and `modules.mk` rendered directly from memory. Target code in another container therefore cannot race a trusted build/Eva/sweep step or rewrite the Makefile it executes.
 - **WP results** reach the shared store only through `wp-sweep`. That end-of-run step re-proves every merged function on the final tree without reading the per-run cache, which agents could have written. It is also the cheap "WP replay" behind carry-forward.
 - **Partitioning and promotion:**
   - The store has one partition per repository (`$FRAMAC_CACHE_DIR/repos/<repo>`, the wrappers' repository name), so a repository's runs only ever read entries that its own runs wrote.
   - Within a partition, entries are keyed by toolchain identity.
   - Per-run entries are never promoted.
 - **Lookup order:** run, then shared.
-
-**Residual risk.** The trusted steps read their inputs from the run directory, which target code running in other containers can write (`docs/v2-design.md`, Section 3). A target that rewrites its own sources while a trusted step builds them could plant an entry for content it was not built from. The pre-publish manifest check stops accidental changes, not a deliberate race. The per-repository partition confines such an entry to that repository's own later runs. Deliberately hostile targets are out of scope, as for the run directory itself; for code you do not trust at all, set `FRAMAC_CACHE_DIR=off`.
 
 ---
 
@@ -221,8 +222,9 @@ Per-module work that needs no judgment runs from a generated Makefile instead of
 python3 $S/pipeline_make.py gen                                         # once, in the foreground
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run build         # trusted: fills the shared store
 python3 $S/pipeline_make.py run fuzz                                    # \ run these two at the same time,
-python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva           # /  as two background wrapper calls
-python3 $S/pipeline_make.py run ingest replay wp-queue
+python3 $S/pipeline_make.py run eva                                     # /  as two background wrapper calls (ro alongside fuzz; use /opt/framac-pipeline/scripts/pipeline_make.py run eva when running Eva standalone with rw shared cache)
+python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest        # trusted: ingests reports and publishes evolved fuzz corpora to /framac-cache/corpora/<module>
+python3 $S/pipeline_make.py run replay wp-queue
 ```
 
 The trusted steps are spelled out in full: only that exact command line gets a writable shared store (Section 5).
@@ -342,7 +344,7 @@ Every container of a run shares the run directory, so shared state is protected 
 | Results differ between cache on and off | Run with `FRAMAC_CACHE=off`, compare, and report it: keys are meant to be sound. `cache.py clear` removes entries. |
 | "run dir on a network filesystem" warning | Move the run directory to local disk; NFS and 9p make WP and fuzzing I/O-bound. |
 | Podman (or Docker) refuses a fuzz or guardrail job | The engine reports that it cannot enforce memory or pids limits; with rootless Podman the controller is usually not delegated to your user. Enable delegation, or set `FRAMAC_ALLOW_UNENFORCED_LIMITS=1` knowingly. |
-| A trusted step ran with `FRAMAC_CACHE_MODE=ro` | Its command line is not exactly an allowlisted one (`$S` instead of the full path, an extra target or option). Nothing is wrong with the results; only the shared store was not filled. |
+| A trusted step ran with `FRAMAC_CACHE_MODE=ro` | Its command line is not an allowlisted one (an extra target, option, or shell operator; note that `$S/` and `${S}/` are expanded before matching). Nothing is wrong with the results; only the shared store was not filled. |
 | A result's `cache` field says `not_published` | Its inputs changed while it was built, typically a merge into `workspace/work`. The result is valid for the content it was built from; it is just not stored. |
 | A heavy ad-hoc command is OOM-killed at 1 GiB | It ran as `light`. Pass `--class` (`-Class`), for example `build` or `phase-dynamic`. History doubles the next `light` lease after an OOM. |
 | `RunLockTimeout` | Another container held the run lock longer than `FRAMAC_LOCK_TIMEOUT`. The message names the holder. |

@@ -2,9 +2,13 @@ from fingerprint import is_valid_fingerprint, make_fingerprint, normalize_file, 
 
 
 def test_fingerprint_is_stable_across_tools_paths_and_formatting():
-    a = make_fingerprint("/framac-run/workspace/work/src/ber.c", "ber_len", "Assertion", r"rte: mem_access: \valid_read(buf + i).")
+    a = make_fingerprint(
+        "/framac-run/workspace/work/src/ber.c", "ber_len", "Assertion", r"rte: mem_access: \valid_read(buf + i)."
+    )
     b = make_fingerprint("src/ber.c", "ber_len", "mem_access", r"\valid_read(buf+i)")
-    c = make_fingerprint("workspace/work/src/ber.c", "ber_len", "assertion", r"assert Eva: mem_access: \valid_read(buf +  i);")
+    c = make_fingerprint(
+        "workspace/work/src/ber.c", "ber_len", "assertion", r"assert Eva: mem_access: \valid_read(buf +  i);"
+    )
     assert a == b == c
     assert a.startswith("src/ber.c#ber_len::mem_access::")
     assert is_valid_fingerprint(a)

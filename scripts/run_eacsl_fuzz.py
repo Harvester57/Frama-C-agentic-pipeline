@@ -74,9 +74,31 @@ from eacsl_toolchain import (  # noqa: E402
     select_eacsl_binary,
 )
 from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
-from framac_common import atomic_write_json, load_json_optional, scan_undeclared_functions, utc_now  # noqa: E402
-from resources import CLASSES, FUZZ_RSS_LIMIT_MB, fuzz_workers  # noqa: E402
+from framac_common import (  # noqa: E402
+    atomic_write_json,
+    load_json_optional,
+    normalize_flag_args,
+    scan_undeclared_functions,
+    utc_now,
+)
+from resources import (  # noqa: E402
+    CLASSES,
+    FUZZ_RSS_LIMIT_MB,
+    FUZZ_WORKER_OVERHEAD_MB,
+    enforced_memory_mb,
+    fuzz_workers,
+)
 from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed  # noqa: E402
+
+# Below this, a single LibFuzzer worker cannot have its fixed -rss_limit_mb=2048 alongside
+# runtime/fork overhead without risking cgroup OOM kills (sizing model: 512 + int(2048 * 1.25) = 3072).
+FUZZ_MIN_MEMORY_MB = FUZZ_WORKER_OVERHEAD_MB + int(FUZZ_RSS_LIMIT_MB * 1.25)
+
+
+def fuzz_required_memory_mb(workers: int = 1) -> int:
+    """Minimum memory required for `workers` LibFuzzer workers under the 1.25x headroom sizing model."""
+    return FUZZ_WORKER_OVERHEAD_MB + max(1, workers) * int(FUZZ_RSS_LIMIT_MB * 1.25)
+
 
 # Wall-clock limit of each compile stage (e-acsl-gcc, clang); a hung toolchain must not hold a lease forever.
 BUILD_TIMEOUT_S = CLASSES["build"].wall_timeout_s or 3600
@@ -112,7 +134,9 @@ ARTIFACT_KINDS = (
 #               i < 8.
 #           With values at failure point:
 _FN_RE = re.compile(r"(?P<file>[^\s:'\"]+\.[ch]):\s*In function '(?P<function>[^']+)'")
-_ERR_RE = re.compile(r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?", re.IGNORECASE)
+_ERR_RE = re.compile(
+    r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?", re.IGNORECASE
+)
 # Older style: "Assertion failed at line 42 in file foo.c." / "... in function parse."
 _OLD_RE = re.compile(
     r"(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed at line (?P<line>\d+)"
@@ -128,8 +152,19 @@ _SEGMENT_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # Functions that belong to the E-ACSL runtime or sanitizer runtimes, never to the target.
-_RUNTIME_FN_PREFIXES = ("__e_acsl", "eacsl_", "__eacsl", "e_acsl_", "unsafe_", "__asan", "__ubsan", "__sanitizer",
-                        "__interceptor", "__lsan", "fuzzer::")
+_RUNTIME_FN_PREFIXES = (
+    "__e_acsl",
+    "eacsl_",
+    "__eacsl",
+    "e_acsl_",
+    "unsafe_",
+    "__asan",
+    "__ubsan",
+    "__sanitizer",
+    "__interceptor",
+    "__lsan",
+    "fuzzer::",
+)
 _RUNTIME_FILE_MARKERS = ("e-acsl/", "e_acsl", "/share/frama-c/", "compiler-rt", "libfuzzer")
 
 
@@ -139,6 +174,7 @@ def is_runtime_function(name: str | None, file_: str | None = None) -> bool:
         return True
     low = (file_ or "").replace("\\", "/").lower()
     return any(marker in low for marker in _RUNTIME_FILE_MARKERS)
+
 
 # UBSan format:
 #   SyncMem.c:819:9: runtime error: index 1025 out of bounds for type 'char[1024]'
@@ -286,7 +322,7 @@ def _failing_predicate(text: str, start: int) -> tuple[str, str]:
     head = _PRED_HEAD_RE.search(text, start)
     if not head:
         return "", ""
-    first, _, rest = text[head.end():].partition("\n")
+    first, _, rest = text[head.end() :].partition("\n")
     lines = rest.split("\n")
     if not first.strip() and lines and lines[0].strip():
         first, lines = lines[0], lines[1:]  # the line after the header, indented or not (older releases)
@@ -346,11 +382,13 @@ def parse_sanitizer_failure(text: str) -> dict | None:
 
     frames = list(_STACK_FRAME_RE.finditer(text))
     non_harness_frames = [
-        m for m in frames
+        m
+        for m in frames
         if not Path(m.group("file")).name.startswith("harness_")
         and not m.group("function").startswith(("__interceptor_", "__asan_", "LLVMFuzzerTestOneInput"))
     ]
-    best_frame = (non_harness_frames or frames or [None])[0]
+    candidates = non_harness_frames or frames
+    best_frame: re.Match[str] | None = candidates[0] if candidates else None
 
     ub = _UBSAN_RE.search(text)
     if ub:
@@ -545,6 +583,7 @@ def compile_eacsl_binary(
     rte_initialized: bool = True,
     runner=subprocess.run,
     use_cache: bool = True,
+    enable_l2: bool | None = None,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL (see `_compile_eacsl_binary_uncached`).
@@ -555,18 +594,39 @@ def compile_eacsl_binary(
     then names the cache entry). The result carries `cache: {"hit": bool, "key": str | None}`.
     """
     out_bin = Path(out_bin)
+    target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
 
     def _build() -> dict:
         return _compile_eacsl_binary_uncached(
-            sources, out_bin, machdep, cppflags, rte_flags, fuzzer_flag, functions, ldflags_extra,
-            variadic_translation, warn_unsigned_downcast, rte_initialized, runner,
+            sources,
+            out_bin,
+            machdep,
+            cppflags,
+            rte_flags,
+            fuzzer_flag,
+            functions,
+            ldflags_extra,
+            variadic_translation,
+            warn_unsigned_downcast,
+            rte_initialized,
+            runner,
+            target_fns=target_fns,
         )
 
     material = None
     if use_cache and not _in_agent_scratch(out_bin):
         material = _eacsl_cache_material(
-            sources, out_bin, machdep, cppflags, rte_flags, fuzzer_flag, functions, ldflags_extra,
-            variadic_translation, warn_unsigned_downcast, rte_initialized,
+            sources,
+            out_bin,
+            machdep,
+            cppflags,
+            rte_flags,
+            fuzzer_flag,
+            functions,
+            ldflags_extra,
+            variadic_translation,
+            warn_unsigned_downcast,
+            rte_initialized,
         )
     if material is None:
         res = _build()
@@ -584,6 +644,9 @@ def compile_eacsl_binary(
             files["fallbacks.c"] = fallback_dir / "eacsl_fallbacks.c"
         return files
 
+    if enable_l2 is None:
+        enable_l2 = bool(target_fns)
+    l2_functions = target_fns if target_fns else None
     return cache.memoize(
         "eacsl-build",
         material,
@@ -594,6 +657,8 @@ def compile_eacsl_binary(
         ok=lambda res: res.get("returncode") == 0,
         runner=runner,
         on_restore=_note_cache_restore,
+        enable_l2=enable_l2,
+        l2_target_functions=l2_functions,
     )
 
 
@@ -610,6 +675,7 @@ def _compile_eacsl_binary_uncached(
     warn_unsigned_downcast: bool = False,
     rte_initialized: bool = True,
     runner=subprocess.run,
+    target_fns: list[str] | None = None,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL.
@@ -673,7 +739,8 @@ def _compile_eacsl_binary_uncached(
         return _finish(2, "eacsl_argv_unsafe")
     result["frontend_flags"] = flags["frontend"]
     result["backend_flags"] = flags["backend"]
-    target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
+    if target_fns is None:
+        target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
 
     if not is_modern:
         cmd = [
@@ -682,8 +749,10 @@ def _compile_eacsl_binary_uncached(
             f"--machdep={machdep}",
             f"--rte={rte_flags}",
             f"--cflag={flags['backend']} {flags['frontend']}",
-            "-o", str(out_bin),
-            "-O", str(instrumented_c),
+            "-o",
+            str(out_bin),
+            "-O",
+            str(instrumented_c),
         ]
         if warn_unsigned_downcast:
             cmd.append("--frama-c-extra=-warn-unsigned-downcast")
@@ -698,6 +767,7 @@ def _compile_eacsl_binary_uncached(
         if rc != 0:
             return _finish(rc, "eacsl_compile_failed")
     else:
+
         def _stage1(fns: list[str]) -> tuple[list[str], int, str, str]:
             fc_flags = ["-rte", f"-machdep {machdep}", *EACSL_FC_EXTRA_FLAGS]
             if rte_initialized:
@@ -710,8 +780,19 @@ def _compile_eacsl_binary_uncached(
                 fn_csv = ",".join(fns)
                 fc_flags.append(f"-rte-select {fn_csv}")
                 fc_flags.append(f"-e-acsl-functions {fn_csv}")
-            cmd1 = [eacsl_bin, "-n", "-G", "clang", "-F", " ".join(fc_flags), "-E", flags["frontend"],
-                    "-o", str(instrumented_c), *sources]
+            cmd1 = [
+                eacsl_bin,
+                "-n",
+                "-G",
+                "clang",
+                "-F",
+                " ".join(fc_flags),
+                "-E",
+                flags["frontend"],
+                "-o",
+                str(instrumented_c),
+                *sources,
+            ]
             return (cmd1, *_run_tool(cmd1, runner))
 
         cmd1, rc, out, err = _stage1(target_fns)
@@ -727,16 +808,21 @@ def _compile_eacsl_binary_uncached(
         if rte_initialized and instrumented_c.is_file():
             # Without this, any `ensures` reading \result fails \initialized(&__retres) on every input.
             patched, n_inits = mark_wrapper_results_initialized(
-                instrumented_c.read_text(encoding="utf-8", errors="replace"))
+                instrumented_c.read_text(encoding="utf-8", errors="replace")
+            )
             if n_inits:
                 instrumented_c.write_text(patched, encoding="utf-8", newline="\n")
                 result["wrapper_result_inits"] = n_inits
-                log_parts.append(f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
-                                 "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n")
+                log_parts.append(
+                    f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
+                    "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n"
+                )
 
         init_hook: list[str] = []
         if fuzzer_flag:
-            instrumented_text = instrumented_c.read_text(encoding="utf-8", errors="replace") if instrumented_c.is_file() else ""
+            instrumented_text = (
+                instrumented_c.read_text(encoding="utf-8", errors="replace") if instrumented_c.is_file() else ""
+            )
             if defines_fuzzer_initialize(instrumented_text):
                 log_parts.append(
                     "The slice defines LLVMFuzzerInitialize, which the E-ACSL runtime init hook "
@@ -758,7 +844,10 @@ def _compile_eacsl_binary_uncached(
         _record(cmd2, rc, out, err)
         if rc != 0 and parse_undefined_fallbacks(out + "\n" + err):
             fb = build_fallback_object(
-                instrumented_c, out_bin.parent / f"{out_bin.name}_fallbacks", runner=runner, timeout=BUILD_TIMEOUT_S,
+                instrumented_c,
+                out_bin.parent / f"{out_bin.name}_fallbacks",
+                runner=runner,
+                timeout=BUILD_TIMEOUT_S,
             )
             result["variadic_fallbacks"] = fb.get("fallbacks", [])
             if fb.get("status") != "built":
@@ -777,7 +866,9 @@ def _compile_eacsl_binary_uncached(
     binary = select_eacsl_binary(out_bin)
     result["binary"] = str(binary)
     if not is_eacsl_instrumented(binary):
-        log_parts.append(f"Binary {binary} does not contain E-ACSL instrumentation; refusing to label it engine=eacsl.\n")
+        log_parts.append(
+            f"Binary {binary} does not contain E-ACSL instrumentation; refusing to label it engine=eacsl.\n"
+        )
         return _finish(1, "eacsl_binary_not_instrumented")
     return _finish(0)
 
@@ -834,7 +925,12 @@ def compile_sanitizer_binary(
         res = _build()
         res["cache"] = {"hit": False, "key": None}
         return res
-    material = {"kind": "sanitizers", "command": cmd, "sources": [str(s) for s in sources], "out_bin": out_bin.as_posix()}
+    material = {
+        "kind": "sanitizers",
+        "command": cmd,
+        "sources": [str(s) for s in sources],
+        "out_bin": out_bin.as_posix(),
+    }
     return cache.memoize(
         "eacsl-build",
         material,
@@ -935,6 +1031,26 @@ def run_fuzz_campaign(
     an E-ACSL crash has no usable location (failure missing, line 0, or a runtime-internal
     function), and the crash input is replayed on that build to attribute file:line.
     """
+    req_mem = fuzz_required_memory_mb(workers)
+    mem_limit = enforced_memory_mb()
+    if mem_limit is not None and mem_limit < req_mem:
+        note = (
+            f"this job may use {mem_limit} MiB, but LibFuzzer needs at least {req_mem} MiB "
+            f"({FUZZ_WORKER_OVERHEAD_MB} MiB overhead plus {workers} worker(s) at "
+            f"{int(FUZZ_RSS_LIMIT_MB * 1.25)} MiB each for the fixed {FUZZ_RSS_LIMIT_MB} MiB -rss_limit_mb)"
+        )
+        return {
+            "status": "insufficient_memory",
+            "reason": "insufficient_memory",
+            "error_summary": [note],
+            "memory_limit_mb": mem_limit,
+            "min_memory_mb": req_mem,
+            "returncode": None,
+            "timed_out": False,
+            "artifacts": [],
+            "new_A2_artifacts": [],
+            "log_tail": note,
+        }
     corpus_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     scratch = artifacts_dir.parent / f".scratch_{artifacts_dir.name}"
@@ -987,14 +1103,10 @@ def run_fuzz_campaign(
             except OSError:
                 pass
     combined_out = "\n".join([res.stdout, res.stderr, *worker_logs])
-    written_names = {
-        Path(m.group("path").strip()).name
-        for m in _TEST_UNIT_WRITTEN_RE.finditer(combined_out)
-    }
+    written_names = {Path(m.group("path").strip()).name for m in _TEST_UNIT_WRITTEN_RE.finditer(combined_out)}
 
     all_artifact_files = [
-        p for p in sorted(artifacts_dir.iterdir())
-        if _artifact_kind(p.name) and p.is_file() and not p.is_symlink()
+        p for p in sorted(artifacts_dir.iterdir()) if _artifact_kind(p.name) and p.is_file() and not p.is_symlink()
     ]
     selected_files: list[tuple[Path, bool]] = []
     for p in all_artifact_files:
@@ -1084,12 +1196,18 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
         return {"status": "passed_dynamic_oracle"}
     failure = parse_eacsl_failure(output)
     if failure is None:
-        return {"status": "guardrail_error", "reason": "Binary failed without a recognizable E-ACSL failure report.", "failure": None}
+        return {
+            "status": "guardrail_error",
+            "reason": "Binary failed without a recognizable E-ACSL failure report.",
+            "failure": None,
+        }
     if failure["is_rte"]:
         return {
             "status": "code_fault",
             "reason": "An RTE assertion failed on a real input: code defect candidate, not evidence against the proposed contract.",
-            "fingerprint": make_fingerprint(failure["file"], failure["function"], failure["alarm_kind"] or failure["kind"], failure["predicate"]),
+            "fingerprint": make_fingerprint(
+                failure["file"], failure["function"], failure["alarm_kind"] or failure["kind"], failure["predicate"]
+            ),
             "failure": failure,
         }
     return {
@@ -1097,6 +1215,20 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
         "reason": "A proposed ACSL annotation failed at runtime on a real corpus/test input.",
         "failure": failure,
     }
+
+
+def corpus_manifest(corpus_dir: Path) -> list[list[str | int]]:
+    """Sorted `[name, sha256, size]` manifest of regular non-hidden files in `corpus_dir`."""
+    if not Path(corpus_dir).is_dir():
+        return []
+    entries: list[list[str | int]] = []
+    for p in sorted(Path(corpus_dir).iterdir()):
+        if not p.is_file() or p.is_symlink() or p.name.startswith("."):
+            continue
+        with contextlib.suppress(OSError):
+            st = p.stat()
+            entries.append([p.name, cache.file_digest(p) or sha256_file(p), st.st_size])
+    return entries
 
 
 def run_guardrail_check(
@@ -1109,6 +1241,8 @@ def run_guardrail_check(
     per_input_timeout: int = GUARDRAIL_PER_INPUT_TIMEOUT_S,
     module: str = "",
     seed: int | None = None,
+    use_cache: bool = True,
+    use_verdict_cache: bool = True,
 ) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
@@ -1118,7 +1252,15 @@ def run_guardrail_check(
 
     The binary must be E-ACSL-instrumented: replaying an uninstrumented build would return 0
     for any contract and produce a vacuous `passed_dynamic_oracle`.
+
+    When caching is enabled (`scripts/cache.py`), deterministic passing verdicts
+    (`passed_dynamic_oracle`) are cached in the run-local `guardrail` namespace
+    keyed by `{binary_sha256, corpus, scratch_corpus, extra_runs, per_input_timeout, seed, module}`.
+    Transient failures (`rejected_overconstrained`, `code_fault`) are never cached.
     """
+    binary = Path(binary)
+    corpus_dir = Path(corpus_dir)
+    scratch_dir = Path(scratch_dir)
     if not is_eacsl_instrumented(binary):
         return {
             "status": "guardrail_error",
@@ -1131,6 +1273,32 @@ def run_guardrail_check(
     scratch_corpus.mkdir(parents=True, exist_ok=True)
     corpus_dir.mkdir(parents=True, exist_ok=True)
     seed = derive_seed(binary, module) if seed is None else seed
+
+    g_key: str | None = None
+    g_material: dict | None = None
+    in_parent_guard = "parent_guard" in binary.as_posix().split("/")
+    if use_cache and use_verdict_cache and cache.enabled() and not _in_agent_scratch(binary):
+        bin_sha = cache.file_digest(binary)
+        if bin_sha is not None:
+            g_material = {
+                "kind": "guardrail",
+                "binary_sha256": bin_sha,
+                "corpus": corpus_manifest(corpus_dir),
+                "scratch_corpus": corpus_manifest(scratch_corpus),
+                "extra_runs": int(runs),
+                "per_input_timeout": int(per_input_timeout),
+                "seed": int(seed),
+                "module": module,
+            }
+            g_key = cache.make_key("guardrail", g_material)
+            entry = cache.lookup("guardrail", g_key, include_run=not in_parent_guard)
+            if entry is not None:
+                cached = dict(entry.data.get("verdict") or {})
+                if cached.get("status") == "passed_dynamic_oracle":
+                    cached["corpus_dir"] = str(corpus_dir)
+                    cached["cache"] = {"hit": True, "key": g_key}
+                    return cached
+
     cmd = [
         str(binary.resolve()),
         f"-runs={runs}",
@@ -1144,16 +1312,30 @@ def run_guardrail_check(
     res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
     combined_out = res.stdout + "\n" + res.stderr
     verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
-    verdict.update({
-        "returncode": res.returncode,
-        "timed_out": res.timed_out,
-        "sandbox": res.sandbox,
-        "corpus_dir": str(corpus_dir),
-        "seed": seed,
-        "per_input_timeout": per_input_timeout,
-    })
+    verdict.update(
+        {
+            "returncode": res.returncode,
+            "timed_out": res.timed_out,
+            "sandbox": res.sandbox,
+            "corpus_dir": str(corpus_dir),
+            "seed": seed,
+            "per_input_timeout": per_input_timeout,
+        }
+    )
     if verdict["status"] != "passed_dynamic_oracle":
         verdict["runtime_trace"] = combined_out[-4000:]
+    if g_key is not None and g_material is not None:
+        if verdict["status"] == "passed_dynamic_oracle":
+            with contextlib.suppress(OSError, ValueError):
+                if in_parent_guard:
+                    s_store = cache.shared_store()
+                    if s_store is not None and s_store.writable:
+                        s_store.put("guardrail", g_key, {}, {"verdict": dict(verdict)}, key_material=g_material)
+                else:
+                    cache.publish("guardrail", g_key, {}, {"verdict": dict(verdict)}, key_material=g_material)
+        verdict["cache"] = {"hit": False, "key": g_key}
+    else:
+        verdict["cache"] = {"hit": False, "key": None}
     return verdict
 
 
@@ -1197,12 +1379,22 @@ def run_selftest(
     replay = replay or replay_artifact
     src = resolve_canary_source()
     expected_line = next(
-        (i for i, line in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1) if "/* CANARY_OOB */" in line), 0
+        (
+            i
+            for i, line in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1)
+            if "/* CANARY_OOB */" in line
+        ),
+        0,
     )
     work_dir.mkdir(parents=True, exist_ok=True)
     comp = compile_eacsl_binary(
-        [str(src)], work_dir / "canary", machdep, cppflags=f"-I{src.parent.as_posix()}",
-        variadic_translation=variadic_translation, runner=runner, use_cache=False,
+        [str(src)],
+        work_dir / "canary",
+        machdep,
+        cppflags=f"-I{src.parent.as_posix()}",
+        variadic_translation=variadic_translation,
+        runner=runner,
+        use_cache=False,
     )
     log_path = Path(comp["compile_log"])
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
@@ -1223,7 +1415,9 @@ def run_selftest(
         benign.write_bytes(CANARY_BENIGN_INPUT)
         benign_rep = replay(Path(comp["binary"]), benign, work_dir / "scratch")
         checks["benign_input_clean"] = not benign_rep.get("reproduced")
-        benign_failure = None if checks["benign_input_clean"] else (benign_rep.get("failure") or benign_rep.get("log_tail"))
+        benign_failure = (
+            None if checks["benign_input_clean"] else (benign_rep.get("failure") or benign_rep.get("log_tail"))
+        )
         inp = work_dir / "canary_input.bin"
         inp.write_bytes(CANARY_INPUT)
         rep = replay(Path(comp["binary"]), inp, work_dir / "scratch")
@@ -1234,14 +1428,27 @@ def run_selftest(
         uninit.write_bytes(CANARY_UNINIT_INPUT)
         uninit_rep = replay(Path(comp["binary"]), uninit, work_dir / "scratch")
         uninit_failure = uninit_rep.get("failure") or {}
-        checks["detects_uninitialized"] = bool(uninit_rep.get("reproduced")) and uninit_failure.get("alarm_kind") == "initialization"
-    required = ("compiled", "no_gmp_only", "instrumented_binary", "benign_input_clean", "detects_overflow", "detects_uninitialized")
+        checks["detects_uninitialized"] = (
+            bool(uninit_rep.get("reproduced")) and uninit_failure.get("alarm_kind") == "initialization"
+        )
+    required = (
+        "compiled",
+        "no_gmp_only",
+        "instrumented_binary",
+        "benign_input_clean",
+        "detects_overflow",
+        "detects_uninitialized",
+    )
     ok = all(checks[k] for k in required)
     return {
         "mode": "selftest",
         "ok": ok,
         "checks": checks,
-        "warnings": [] if checks["attributes_line"] or not ok else ["E-ACSL detected the canary overflow but did not attribute the CANARY_OOB line; crashes will rely on sanitizer_replay attribution."],
+        "warnings": []
+        if checks["attributes_line"] or not ok
+        else [
+            "E-ACSL detected the canary overflow but did not attribute the CANARY_OOB line; crashes will rely on sanitizer_replay attribution."
+        ],
         "frama_c_version": framac_version(runner),
         "eacsl_gcc": _resolve_eacsl_gcc()[0],
         "variadic_translation": variadic_translation,
@@ -1250,7 +1457,19 @@ def run_selftest(
         "failure": failure,
         "benign_failure": benign_failure,
         "uninitialized_failure": uninit_failure or None,
-        "compile": {k: comp.get(k) for k in ("returncode", "reason", "compile_log", "binary", "frontend_flags", "backend_flags", "init_hook", "reduced_checks")},
+        "compile": {
+            k: comp.get(k)
+            for k in (
+                "returncode",
+                "reason",
+                "compile_log",
+                "binary",
+                "frontend_flags",
+                "backend_flags",
+                "init_hook",
+                "reduced_checks",
+            )
+        },
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -1285,6 +1504,7 @@ def build_module_binary(
     variadic_translation: bool = True,
     warn_unsigned_downcast: bool = False,
     rte_initialized: bool = True,
+    use_cache: bool = True,
 ) -> dict:
     """
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
@@ -1312,13 +1532,14 @@ def build_module_binary(
                 variadic_translation=variadic_translation,
                 warn_unsigned_downcast=warn_unsigned_downcast,
                 rte_initialized=rte_initialized,
+                use_cache=use_cache,
             )
             if comp["returncode"] != 0 and engine == "auto":
                 eacsl_attempt = comp
                 fallback_reason = comp.get("reason") or "eacsl_compile_failed"
                 comp = None
     if comp is None:
-        comp = compile_sanitizer_binary(sources, out_bin, cppflags, True, ldflags_extra=ldflags)
+        comp = compile_sanitizer_binary(sources, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
     return {
         "compile": comp,
         "engine_used": comp.get("engine", engine),
@@ -1327,14 +1548,16 @@ def build_module_binary(
     }
 
 
-def _sanitizer_attribution_builder(sources: list[str], out_bin: Path, cppflags: str, ldflags: str):
+def _sanitizer_attribution_builder(
+    sources: list[str], out_bin: Path, cppflags: str, ldflags: str, *, use_cache: bool = True
+):
     """Lazily build (at most once) the ASan+UBSan twin used to attribute unlocated E-ACSL crashes."""
     state: dict = {}
 
     def builder() -> Path | None:
         if "binary" not in state:
             san_out = out_bin.with_name(out_bin.name + ".sanreplay")
-            san = compile_sanitizer_binary(sources, san_out, cppflags, True, ldflags_extra=ldflags)
+            san = compile_sanitizer_binary(sources, san_out, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
             state["binary"] = Path(san["binary"]) if san["returncode"] == 0 else None
         return state["binary"]
 
@@ -1465,7 +1688,11 @@ def prepare_replay_binary(
     prepared["binary"] = Path(comp["binary"])
     if attribution and build["engine_used"] == "eacsl":
         prepared["attribution_builder"] = _sanitizer_attribution_builder(
-            sources, Path(out_bin), build_options.get("cppflags", "-I."), build_options.get("ldflags", ""),
+            sources,
+            Path(out_bin),
+            build_options.get("cppflags", "-I."),
+            build_options.get("ldflags", ""),
+            use_cache=build_options.get("use_cache", True),
         )
     return prepared
 
@@ -1522,7 +1749,11 @@ def replay_report(
         return report
     try:
         report["artifacts"] = replay_inputs(
-            bin_path, files, scratch, module=module, per_input_timeout=per_input_timeout,
+            bin_path,
+            files,
+            scratch,
+            module=module,
+            per_input_timeout=per_input_timeout,
             attribution_builder=attribution_builder,
         )
     except SandboxUnavailable as exc:
@@ -1554,7 +1785,7 @@ def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
     if not meta.get("include_source"):
         for raw in meta.get("sources") or []:
             src = str(raw).replace("\\", "/").strip()
-            src = src[len("/framac-run/"):] if src.startswith("/framac-run/") else src
+            src = src[len("/framac-run/") :] if src.startswith("/framac-run/") else src
             if src and Path(src).name != f"harness_{module}.c" and src not in sources:
                 sources.append(src)
     tokens = shlex.split(meta.get("cppflags") or "-I.")
@@ -1581,7 +1812,7 @@ def replay_build_spec(module: str, harness_dir: Path = Path("workspace/harnesses
 
 def _candidate_slug(fingerprint: str) -> str:
     base = re.sub(r"[^A-Za-z0-9_.-]+", "_", fingerprint).strip("._")[:80] or "candidate"
-    return f"{base}-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:10]}"
+    return f"{base}-{hashlib.sha256(fingerprint.encode()).hexdigest()[:10]}"
 
 
 def _candidate_engine(cand: dict) -> str:
@@ -1626,10 +1857,7 @@ def replay_candidates(
     and `index.json`, which maps each fingerprint to its report.
     """
     candidates = load_json_optional(Path(candidates_path), [])
-    todo = [
-        c for c in candidates
-        if isinstance(c, dict) and c.get("status") == "unverified" and _reproducer_paths(c)
-    ]
+    todo = [c for c in candidates if isinstance(c, dict) and c.get("status") == "unverified" and _reproducer_paths(c)]
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
@@ -1648,12 +1876,23 @@ def replay_candidates(
                 prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
             else:
                 prepared_by_key[key] = prepare_replay_binary(
-                    module, spec["sources"], bin_dir / f"fuzz_{module}", attribution=attribution, engine=eng,
-                    selftest_json=selftest_json, machdep=machdep, cppflags=spec["cppflags"], ldflags=spec["ldflags"],
+                    module,
+                    spec["sources"],
+                    bin_dir / f"fuzz_{module}",
+                    attribution=attribution,
+                    engine=eng,
+                    selftest_json=selftest_json,
+                    machdep=machdep,
+                    cppflags=spec["cppflags"],
+                    ldflags=spec["ldflags"],
                 )
         scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
         report = replay_report(
-            module, _reproducer_paths(cand), scratch, prepared=prepared_by_key[key], per_input_timeout=per_input_timeout,
+            module,
+            _reproducer_paths(cand),
+            scratch,
+            prepared=prepared_by_key[key],
+            per_input_timeout=per_input_timeout,
         )
         report["candidate_fingerprint"] = fingerprint
         report["fingerprint_matches"] = any(a.get("fingerprint") == fingerprint for a in report["artifacts"])
@@ -1662,11 +1901,14 @@ def replay_candidates(
         index[fingerprint] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
         by_status[report["status"]] = by_status.get(report["status"], 0) + 1
     index_path = out_dir / "index.json"
-    atomic_write_json(index_path, {
-        "generated_at": utc_now(),
-        "candidates_file": Path(candidates_path).as_posix(),
-        "by_fingerprint": index,
-    })
+    atomic_write_json(
+        index_path,
+        {
+            "generated_at": utc_now(),
+            "candidates_file": Path(candidates_path).as_posix(),
+            "by_fingerprint": index,
+        },
+    )
     return {
         "mode": "replay-candidates",
         "status": "error" if by_status.get("error") else "ok",
@@ -1689,14 +1931,32 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
         help="Instrumentation engine: 'auto' tries E-ACSL first and falls back to Clang ASan+UBSan on compile error",
     )
     p.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
-    p.add_argument("--no-variadic-translation", action="store_true",
-                   help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)")
-    p.add_argument("--warn-unsigned-downcast", action="store_true",
-                   help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
-    p.add_argument("--no-rte-initialized", action="store_true",
-                   help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks")
-    p.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON,
-                   help="Cached selftest result; with --engine auto a failed selftest for this Frama-C version skips E-ACSL")
+    p.add_argument(
+        "--no-variadic-translation",
+        action="store_true",
+        help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)",
+    )
+    p.add_argument(
+        "--warn-unsigned-downcast",
+        action="store_true",
+        help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation",
+    )
+    p.add_argument(
+        "--no-rte-initialized",
+        action="store_true",
+        help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks",
+    )
+    p.add_argument(
+        "--selftest-json",
+        type=Path,
+        default=DEFAULT_SELFTEST_JSON,
+        help="Cached selftest result; with --engine auto a failed selftest for this Frama-C version skips E-ACSL",
+    )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not read or write the run/shared cache",
+    )
 
 
 def _build_options(args) -> dict:
@@ -1711,6 +1971,7 @@ def _build_options(args) -> dict:
         "variadic_translation": not args.no_variadic_translation,
         "warn_unsigned_downcast": args.warn_unsigned_downcast,
         "rte_initialized": not args.no_rte_initialized,
+        "use_cache": not getattr(args, "no_cache", False),
     }
 
 
@@ -1735,17 +1996,28 @@ def main(argv: list[str] | None = None) -> int:
     p_camp.add_argument("--corpus-dir", type=Path, required=True, help="Writable corpus directory (receives new units)")
     p_camp.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Read-only seed corpus directories")
     p_camp.add_argument("--artifacts-dir", type=Path, required=True)
-    p_camp.add_argument("--max-time", type=int, default=None,
-                        help="Wall-clock seconds per job (default: from --fuzz-budget, else 60)")
-    p_camp.add_argument("--fuzz-budget", type=int, default=None,
-                        help="CPU-second budget: wall time = max(30, budget / workers) unless --max-time is given")
+    p_camp.add_argument(
+        "--max-time", type=int, default=None, help="Wall-clock seconds per job (default: from --fuzz-budget, else 60)"
+    )
+    p_camp.add_argument(
+        "--fuzz-budget",
+        type=int,
+        default=None,
+        help="CPU-second budget: wall time = max(30, budget / workers) unless --max-time is given",
+    )
     p_camp.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_camp.add_argument("--dict", type=Path, default=None)
     p_camp.add_argument("--jobs", type=int, default=None, help="LibFuzzer -jobs=<N> (default: the number of workers)")
-    p_camp.add_argument("--workers", default="auto",
-                        help="LibFuzzer -workers=<N>: 'auto' (from this job's CPUs and memory at -rss_limit_mb 2048) or N")
-    p_camp.add_argument("--no-attribution-replay", action="store_true",
-                        help="Do not replay unattributed E-ACSL crashes on a sanitizer build")
+    p_camp.add_argument(
+        "--workers",
+        default="auto",
+        help="LibFuzzer -workers=<N>: 'auto' (from this job's CPUs and memory at -rss_limit_mb 2048) or N",
+    )
+    p_camp.add_argument(
+        "--no-attribution-replay",
+        action="store_true",
+        help="Do not replay unattributed E-ACSL crashes on a sanitizer build",
+    )
     p_camp.add_argument("--module", default="")
     p_camp.add_argument("--out-json", type=Path, required=True)
 
@@ -1753,20 +2025,44 @@ def main(argv: list[str] | None = None) -> int:
     p_guard.add_argument("--sources", nargs="+", required=True)
     p_guard.add_argument("--out-bin", type=Path, required=True)
     p_guard.add_argument("--corpus-dir", type=Path, required=True)
-    p_guard.add_argument("--scratch-dir", type=Path, default=None, help="Agent scratch dir (default: next to --out-bin)")
+    p_guard.add_argument(
+        "--scratch-dir", type=Path, default=None, help="Agent scratch dir (default: next to --out-bin)"
+    )
     p_guard.add_argument("--extra-runs", type=int, default=200)
-    p_guard.add_argument("--per-input-timeout", type=int, default=GUARDRAIL_PER_INPUT_TIMEOUT_S,
-                         help="LibFuzzer -timeout per input (fixed; never derived from the machine)")
+    p_guard.add_argument(
+        "--per-input-timeout",
+        type=int,
+        default=GUARDRAIL_PER_INPUT_TIMEOUT_S,
+        help="LibFuzzer -timeout per input (fixed; never derived from the machine)",
+    )
     p_guard.add_argument("--module", default="", help="Module name (part of the deterministic -seed)")
     p_guard.add_argument("--machdep", default="gcc_x86_64")
     p_guard.add_argument("--cppflags", default="-I.")
     p_guard.add_argument("--ldflags", default="", help="Extra linker flags")
-    p_guard.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
+    p_guard.add_argument(
+        "--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL"
+    )
     p_guard.add_argument("--no-variadic-translation", action="store_true")
-    p_guard.add_argument("--warn-unsigned-downcast", action="store_true",
-                         help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
-    p_guard.add_argument("--no-rte-initialized", action="store_true",
-                         help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks")
+    p_guard.add_argument(
+        "--warn-unsigned-downcast",
+        action="store_true",
+        help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation",
+    )
+    p_guard.add_argument(
+        "--no-rte-initialized",
+        action="store_true",
+        help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks",
+    )
+    p_guard.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not read or write the run/shared cache",
+    )
+    p_guard.add_argument(
+        "--no-verdict-cache",
+        action="store_true",
+        help="Do not read or write the guardrail verdict cache",
+    )
     p_guard.add_argument("--out-json", type=Path, required=True)
 
     p_self = sub.add_parser("selftest", help="Verify the E-ACSL toolchain contract on the bundled canary")
@@ -1788,25 +2084,39 @@ def main(argv: list[str] | None = None) -> int:
     p_replay.add_argument("--binary", type=Path, default=None, help="Replay on this binary instead of building one")
     p_replay.add_argument("--out-bin", type=Path, default=None)
     p_replay.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
-    p_replay.add_argument("--scratch-dir", type=Path, default=None, help="Sandbox scratch (default: next to --out-json)")
-    p_replay.add_argument("--no-attribution-replay", action="store_true",
-                          help="Do not replay unattributed E-ACSL crashes on a sanitizer build")
+    p_replay.add_argument(
+        "--scratch-dir", type=Path, default=None, help="Sandbox scratch (default: next to --out-json)"
+    )
+    p_replay.add_argument(
+        "--no-attribution-replay",
+        action="store_true",
+        help="Do not replay unattributed E-ACSL crashes on a sanitizer build",
+    )
     p_replay.add_argument("--out-json", type=Path, required=True)
 
     p_cands = sub.add_parser("replay-candidates", help="Replay the reproducers of every unverified candidate")
     p_cands.add_argument("--candidates", type=Path, default=Path("candidates.json"))
     p_cands.add_argument("--harness-dir", type=Path, default=Path("workspace/harnesses"))
     p_cands.add_argument("--out-dir", type=Path, default=Path("workspace/reports/replay"))
-    p_cands.add_argument("--bin-dir", type=Path, default=None,
-                         help="Where module binaries are built (default: workspace/harnesses, as `make build`)")
-    p_cands.add_argument("--engine", choices=["auto", "eacsl", "sanitizers"], default=None,
-                         help="Default: the engine of the campaign that found each candidate, else auto")
+    p_cands.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=None,
+        help="Where module binaries are built (default: workspace/harnesses, as `make build`)",
+    )
+    p_cands.add_argument(
+        "--engine",
+        choices=["auto", "eacsl", "sanitizers"],
+        default=None,
+        help="Default: the engine of the campaign that found each candidate, else auto",
+    )
     p_cands.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON)
     p_cands.add_argument("--machdep", default="gcc_x86_64")
     p_cands.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_cands.add_argument("--no-attribution-replay", action="store_true")
 
-    args = parser.parse_args(argv)
+    raw_argv = normalize_flag_args(list(argv) if argv is not None else sys.argv[1:])
+    args = parser.parse_args(raw_argv)
     if args.mode == "campaign" and str(args.workers).strip().lower() != "auto":
         try:
             if int(args.workers) < 1:
@@ -1818,9 +2128,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "replay-candidates":
         summary = replay_candidates(
-            args.candidates, args.harness_dir, args.out_dir, bin_dir=args.bin_dir,
-            engine=args.engine, selftest_json=args.selftest_json,
-            machdep=args.machdep, per_input_timeout=args.per_input_timeout,
+            args.candidates,
+            args.harness_dir,
+            args.out_dir,
+            bin_dir=args.bin_dir,
+            engine=args.engine,
+            selftest_json=args.selftest_json,
+            machdep=args.machdep,
+            per_input_timeout=args.per_input_timeout,
             attribution=not args.no_attribution_replay,
         )
         print(json.dumps(summary, indent=2))
@@ -1837,15 +2152,23 @@ def main(argv: list[str] | None = None) -> int:
             prepared = None
             if args.binary is None:
                 prepared = prepare_replay_binary(
-                    args.module, args.sources, args.out_bin, attribution=not args.no_attribution_replay,
+                    args.module,
+                    args.sources,
+                    args.out_bin,
+                    attribution=not args.no_attribution_replay,
                     **_build_options(args),
                 )
             scratch = args.scratch_dir or args.out_json.parent / f".scratch_replay_{args.module or 'module'}"
             res = replay_report(
-                args.module, args.inputs, scratch, prepared=prepared, binary=args.binary,
+                args.module,
+                args.inputs,
+                scratch,
+                prepared=prepared,
+                binary=args.binary,
                 per_input_timeout=args.per_input_timeout,
             )
         else:
+            use_cache = not getattr(args, "no_cache", False)
             comp = compile_eacsl_binary(
                 args.sources,
                 args.out_bin,
@@ -1858,14 +2181,22 @@ def main(argv: list[str] | None = None) -> int:
                 variadic_translation=not args.no_variadic_translation,
                 warn_unsigned_downcast=args.warn_unsigned_downcast,
                 rte_initialized=not args.no_rte_initialized,
+                use_cache=use_cache,
             )
             if comp["returncode"] != 0:
                 res = {"mode": "guardrail", "status": "compile_error", "reason": comp.get("reason"), "compile": comp}
             else:
                 scratch = args.scratch_dir or args.out_bin.parent / f"{args.out_bin.name}_guard_scratch"
+                use_verdict_cache = use_cache and not getattr(args, "no_verdict_cache", False)
                 guard = run_guardrail_check(
-                    Path(comp["binary"]), args.corpus_dir, scratch, args.extra_runs,
-                    per_input_timeout=args.per_input_timeout, module=args.module,
+                    Path(comp["binary"]),
+                    args.corpus_dir,
+                    scratch,
+                    args.extra_runs,
+                    per_input_timeout=args.per_input_timeout,
+                    module=args.module,
+                    use_cache=use_cache,
+                    use_verdict_cache=use_verdict_cache,
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
     except SandboxUnavailable as exc:
@@ -1909,20 +2240,56 @@ def _run_build_mode(args) -> dict:
 
 
 def _run_campaign_mode(args) -> dict:
-    build = build_module_binary(args.sources, args.out_bin, **_build_options(args))
-    comp = build["compile"]
-    engine_used = build["engine_used"]
     workers = resolve_workers(args.workers)
     jobs = args.jobs if args.jobs else workers
     max_time = campaign_wall_time(args.max_time, args.fuzz_budget, workers)
+    sizing = {
+        "workers": workers,
+        "jobs": jobs,
+        "max_time": max_time,
+        "fuzz_budget_cpu_s": args.fuzz_budget,
+        "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
+        "per_input_timeout": args.per_input_timeout,
+    }
+    req_mem = fuzz_required_memory_mb(workers)
+    mem_limit = enforced_memory_mb()
+    if mem_limit is not None and mem_limit < req_mem:
+        note = (
+            f"this job may use {mem_limit} MiB, but LibFuzzer needs at least {req_mem} MiB "
+            f"({FUZZ_WORKER_OVERHEAD_MB} MiB overhead plus {workers} worker(s) at "
+            f"{int(FUZZ_RSS_LIMIT_MB * 1.25)} MiB each for the fixed {FUZZ_RSS_LIMIT_MB} MiB -rss_limit_mb)"
+        )
+        return {
+            "mode": "campaign",
+            "module": args.module,
+            "sources": args.sources,
+            "status": "insufficient_memory",
+            "reason": "insufficient_memory",
+            "error_summary": [note],
+            "memory_limit_mb": mem_limit,
+            "min_memory_mb": req_mem,
+            "returncode": None,
+            "timed_out": False,
+            "artifacts": [],
+            "new_A2_artifacts": [],
+            "log_tail": note,
+            "sizing": {**sizing, "memory_limit_mb": mem_limit},
+        }
+    use_cache = not getattr(args, "no_cache", False)
+    build = build_module_binary(args.sources, args.out_bin, **_build_options(args))
+    comp = build["compile"]
+    engine_used = build["engine_used"]
     res: dict = {"mode": "campaign", "module": args.module}
     if comp["returncode"] != 0:
         res.update({"status": "compile_error", "engine_used": engine_used, "compile": comp})
     else:
         attribution_builder = None
         if engine_used == "eacsl" and not args.no_attribution_replay:
-            attribution_builder = _sanitizer_attribution_builder(args.sources, args.out_bin, args.cppflags, args.ldflags)
+            attribution_builder = _sanitizer_attribution_builder(
+                args.sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
+            )
 
+        warm_started = cache.warm_start_corpus(args.module, args.corpus_dir) if (args.module and use_cache) else 0
         fuzz = run_fuzz_campaign(
             Path(comp["binary"]),
             args.corpus_dir,
@@ -1935,17 +2302,17 @@ def _run_campaign_mode(args) -> dict:
             jobs=jobs,
             workers=workers,
         )
+        published = (
+            cache.publish_corpus(args.module, args.corpus_dir)
+            if args.module and use_cache and fuzz.get("status") != "insufficient_memory"
+            else 0
+        )
         res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
+        if warm_started or published:
+            res["corpus_cache"] = {"warm_started": warm_started, "published": published}
         if engine_used == "eacsl" and comp.get("reduced_checks"):
             res["reduced_checks"] = comp["reduced_checks"]
-    res["sizing"] = {
-        "workers": workers,
-        "jobs": jobs,
-        "max_time": max_time,
-        "fuzz_budget_cpu_s": args.fuzz_budget,
-        "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
-        "per_input_timeout": args.per_input_timeout,
-    }
+    res["sizing"] = sizing
     if build["engine_fallback_reason"]:
         res["engine_fallback_reason"] = build["engine_fallback_reason"]
     if build["eacsl_compile_attempt"] is not None:

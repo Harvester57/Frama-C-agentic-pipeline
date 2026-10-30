@@ -7,8 +7,13 @@ from pathlib import Path
 import resources as R
 
 
-def _cgroup_tree(root: Path, cpu_max: str | None = None, mem_max: str | None = None, cpuset: str | None = None,
-                 mem_available_kb: int | None = None) -> Path:
+def _cgroup_tree(
+    root: Path,
+    cpu_max: str | None = None,
+    mem_max: str | None = None,
+    cpuset: str | None = None,
+    mem_available_kb: int | None = None,
+) -> Path:
     cg = root / "sys/fs/cgroup"
     cg.mkdir(parents=True, exist_ok=True)
     if cpu_max is not None:
@@ -20,7 +25,8 @@ def _cgroup_tree(root: Path, cpu_max: str | None = None, mem_max: str | None = N
     if mem_available_kb is not None:
         (root / "proc").mkdir(parents=True, exist_ok=True)
         (root / "proc/meminfo").write_text(
-            f"MemTotal:       {mem_available_kb * 2} kB\nMemAvailable:   {mem_available_kb} kB\n", encoding="utf-8",
+            f"MemTotal:       {mem_available_kb * 2} kB\nMemAvailable:   {mem_available_kb} kB\n",
+            encoding="utf-8",
         )
     return root
 
@@ -104,7 +110,16 @@ def test_infer_class_maps_commands_to_classes():
         f"{S}/pipeline_make.py run fuzz": "phase-dynamic",
         f"{S}/pipeline_make.py run fuzz-snmp": "phase-dynamic",
         f"{S}/pipeline_make.py run --jobs 4 build-snmp eva-snmp": "phase-static",
+        f"{S}/pipeline_make.py --run-dir . run fuzz-snmp": "phase-dynamic",
+        f"{S}/pipeline_make.py --run-dir . run build-snmp": "phase-static",
+        f"{S}/pipeline_make.py sweep --jobs 4": "phase-static",
         f"{S}/pipeline_make.py run module-snmp": "phase-dynamic",
+        f"{S}/build_callgraph_dag.py --root workspace/work": "eva",
+        f"{S}/extract_references.py --check": "build",
+        "python3 $S/run_wp_function.py --file a.c --function f --out-json x.json": "wp",
+        "python3 ${S}/pipeline_make.py run build": "phase-static",
+        "e-acsl-gcc.sh -c -o a.i.c -O a.e-acsl a.c": "build",
+        "clang -fsanitize=fuzzer,address,undefined harness.c -o fuzz_m": "build",
         f"{S}/ledger.py ingest-wp workspace/reports/wp/f.json": "light",
         # Ad-hoc heavy commands are not left in the 1-CPU light class.
         f"{S}/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j8": "phase-dynamic",
@@ -117,4 +132,6 @@ def test_infer_class_maps_commands_to_classes():
     for cmd, expected in cases.items():
         assert R.infer_class(cmd) == expected, cmd
     assert all(not R.CLASSES[c].runs_target_code for c in ("light", "wp", "eva", "build", "phase-static"))
-    assert all(R.CLASSES[c].runs_target_code for c in ("fuzz", "guardrail", "replay", "selftest", "verify", "phase-dynamic"))
+    assert all(
+        R.CLASSES[c].runs_target_code for c in ("fuzz", "guardrail", "replay", "selftest", "verify", "phase-dynamic")
+    )

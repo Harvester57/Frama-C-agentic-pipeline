@@ -6,6 +6,7 @@ import json
 import subprocess
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -46,7 +47,8 @@ class FakeFramaC:
             if self.rc == 0:
                 fn = _flag(cmd, "-wp-fct")
                 Path(_flag(cmd, "-report-csv")).write_text(
-                    CSV_HEADER + f".\tf.c\t{fn}\t1\trte: mem_access\t{self.status}\tx\n", encoding="utf-8")
+                    CSV_HEADER + f".\tf.c\t{fn}\t1\trte: mem_access\t{self.status}\tx\n", encoding="utf-8"
+                )
             if "-save" in cmd:
                 Path(_flag(cmd, "-save")).write_bytes(b"sav")
         elif "-mdr-gen" in cmd:
@@ -63,6 +65,7 @@ def _c_file(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 # WP
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("cpus,mem_mb,expected", [(2, 65536, 2), (16, 65536, 16), (16, 2600, 1), (8, 4800, 4)])
 def test_wp_par_scales_with_the_budget_while_memlimit_stays_fixed(tmp_path, monkeypatch, cpus, mem_mb, expected):
@@ -145,7 +148,9 @@ def test_bitwise_retry_reuses_the_cache_dir_and_sizing(tmp_path, monkeypatch):
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         status = "Unknown" if _flag(cmd, "-wp-model") == "Typed" else "Valid"
-        Path(_flag(cmd, "-report-csv")).write_text(CSV_HEADER + f".\tf.c\tf\t1\trte: shift\t{status}\tx << 3\n", encoding="utf-8")
+        Path(_flag(cmd, "-report-csv")).write_text(
+            CSV_HEADER + f".\tf.c\tf\t1\trte: shift\t{status}\tx << 3\n", encoding="utf-8"
+        )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(W.subprocess, "run", fake_run)
@@ -169,12 +174,14 @@ C_SYNTAX_LOG = (
     "[kernel] Parsing f.c (with preprocessing)\n"
     "[kernel] f.c:1: \n"
     "  syntax error:\n"
-    "  Location: \"f.c\", line 1, before or at token: ;\n"
+    '  Location: "f.c", line 1, before or at token: ;\n'
     "[kernel] Frama-C aborted: invalid user input.\n"
 )
 
 
-@pytest.mark.parametrize("log,needle", [(ANNOT_ERROR_LOG, "unbound logic variable alse"), (C_SYNTAX_LOG, "syntax error")])
+@pytest.mark.parametrize(
+    "log,needle", [(ANNOT_ERROR_LOG, "unbound logic variable alse"), (C_SYNTAX_LOG, "syntax error")]
+)
 def test_folded_syntax_check_still_reports_acsl_syntax_error(tmp_path, monkeypatch, log, needle):
     fake = FakeFramaC(rc=1, log=log)
     monkeypatch.setattr(W.subprocess, "run", fake)
@@ -188,8 +195,10 @@ def test_folded_syntax_check_still_reports_acsl_syntax_error(tmp_path, monkeypat
 
 
 def test_a_wp_user_error_is_a_tier_a_abort_not_a_syntax_error(tmp_path, monkeypatch):
-    log = "[kernel] Parsing f.c\n[wp] User Error: Main entry point function 'f' is (potentially) recursive.\n" \
-          "[kernel] Frama-C aborted: invalid user input.\n"
+    log = (
+        "[kernel] Parsing f.c\n[wp] User Error: Main entry point function 'f' is (potentially) recursive.\n"
+        "[kernel] Frama-C aborted: invalid user input.\n"
+    )
     monkeypatch.setattr(W.subprocess, "run", FakeFramaC(rc=1, log=log))
     res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")
     assert res["status"] == "wp_aborted"
@@ -200,8 +209,17 @@ def test_wp_cli_defaults(tmp_path, monkeypatch):
     fake = FakeFramaC()
     monkeypatch.setattr(W.subprocess, "run", fake)
     monkeypatch.delenv("FRAMAC_WP_WALL_TIMEOUT", raising=False)
-    base = ["--file", str(_c_file(tmp_path)), "--function", "f", "--out-dir", str(tmp_path / "wp"),
-            "--out-json", str(tmp_path / "wp.json"), "--no-retry-bitwise"]
+    base = [
+        "--file",
+        str(_c_file(tmp_path)),
+        "--function",
+        "f",
+        "--out-dir",
+        str(tmp_path / "wp"),
+        "--out-json",
+        str(tmp_path / "wp.json"),
+        "--no-retry-bitwise",
+    ]
     assert W.main(base) == 0
     cmd, kwargs = fake.calls[-1]
     assert kwargs["timeout"] == CLASSES["wp"].wall_timeout_s and _flag(cmd, "-wp-par") == "6"
@@ -220,10 +238,13 @@ def test_wp_cli_defaults(tmp_path, monkeypatch):
 # Fuzz campaigns, guardrails, replays, builds
 # ---------------------------------------------------------------------------
 
+
 def _campaign(monkeypatch, tmp_path, *extra):
-    seen = {}
+    seen: dict[str, Any] = {}
     binary = tmp_path / "fuzz_mod.e-acsl"
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(binary)})
+    monkeypatch.setattr(
+        R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(binary)}
+    )
 
     def fake_campaign(binary, corpus, artifacts, max_time, *a, **k):
         seen.update(max_time=max_time, jobs=k["jobs"], workers=k["workers"])
@@ -231,9 +252,24 @@ def _campaign(monkeypatch, tmp_path, *extra):
 
     monkeypatch.setattr(R, "run_fuzz_campaign", fake_campaign)
     out = tmp_path / "out.json"
-    R.main(["campaign", "--sources", "mod.c", "--out-bin", str(tmp_path / "fuzz_mod"), "--corpus-dir", str(tmp_path / "c"),
-            "--artifacts-dir", str(tmp_path / "a"), "--selftest-json", str(tmp_path / "none.json"),
-            "--out-json", str(out), *extra])
+    R.main(
+        [
+            "campaign",
+            "--sources",
+            "mod.c",
+            "--out-bin",
+            str(tmp_path / "fuzz_mod"),
+            "--corpus-dir",
+            str(tmp_path / "c"),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--selftest-json",
+            str(tmp_path / "none.json"),
+            "--out-json",
+            str(out),
+            *extra,
+        ]
+    )
     return seen, json.loads(out.read_text(encoding="utf-8"))
 
 
@@ -304,6 +340,7 @@ def test_compile_stages_get_the_build_class_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     monkeypatch.setattr(R.shutil, "which", lambda name: None)
     import eacsl_toolchain as T
+
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
     timeouts = []
     src = tmp_path / "mod.c"
@@ -312,7 +349,7 @@ def test_compile_stages_get_the_build_class_timeout(tmp_path, monkeypatch):
     def runner(cmd, **kwargs):
         timeouts.append(kwargs.get("timeout"))
         if "-C" in cmd:
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"), output=b"linking", stderr=None)
+            raise subprocess.TimeoutExpired(cmd, float(kwargs.get("timeout") or 0), output=b"linking", stderr=None)
         Path(cmd[cmd.index("-o") + 1]).write_text("int f(void) { return 0; }\n", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -326,6 +363,7 @@ def test_compile_stages_get_the_build_class_timeout(tmp_path, monkeypatch):
 # Eva
 # ---------------------------------------------------------------------------
 
+
 def test_eva_timeout_default_and_extra_domains(tmp_path, monkeypatch):
     seen = []
 
@@ -334,8 +372,16 @@ def test_eva_timeout_default_and_extra_domains(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
 
     monkeypatch.setattr(run_eva_slice.subprocess, "run", fake_run)
-    base = ["--sources", str(_c_file(tmp_path)), "--main", "eva_main", "--out-dir", str(tmp_path / "eva"),
-            "--out-json", str(tmp_path / "eva.json")]
+    base = [
+        "--sources",
+        str(_c_file(tmp_path)),
+        "--main",
+        "eva_main",
+        "--out-dir",
+        str(tmp_path / "eva"),
+        "--out-json",
+        str(tmp_path / "eva.json"),
+    ]
     run_eva_slice.main(base)
     cmd, timeout = seen[-1]
     assert timeout == CLASSES["eva"].wall_timeout_s
@@ -376,7 +422,8 @@ def _batch_run(tmp_path: Path, edits: dict[str, tuple[str, str]], module: bool =
     if module:
         (overlay / "harnesses").mkdir(parents=True, exist_ok=True)
         (overlay / "harnesses" / "harness_m.json").write_text(
-            json.dumps({"module": "m", "sources": ["workspace/work/m.c"], "cppflags": "-I."}), encoding="utf-8")
+            json.dumps({"module": "m", "sources": ["workspace/work/m.c"], "cppflags": "-I."}), encoding="utf-8"
+        )
     for agent_id, (old, new) in edits.items():
         workspace_overlay.init_agent_overlay(run_dir, agent_id, overlay)
         path = run_dir / "agents" / agent_id / "scratch" / "work" / "m.c"
@@ -385,7 +432,10 @@ def _batch_run(tmp_path: Path, edits: dict[str, tuple[str, str]], module: bool =
 
 
 EDITS = {
-    "prover-callee": ("    return x;\n}\n\nint caller", "    //@ assert callee_ok: x == x;\n    return x;\n}\n\nint caller"),
+    "prover-callee": (
+        "    return x;\n}\n\nint caller",
+        "    //@ assert callee_ok: x == x;\n    return x;\n}\n\nint caller",
+    ),
     "prover-caller": ("    return callee(x);", "    //@ assert caller_ok: x == x;\n    return callee(x);"),
     "prover-other": ("    return x + 1;", "    //@ assert other_ok: x == x;\n    return x + 1;"),
 }
@@ -399,7 +449,9 @@ SPECS = [
 def test_parent_recheck_argv_is_accepted_by_the_real_clis(tmp_path, monkeypatch):
     """Single-token flags (`-I.`, `-lm`) must reach the child CLIs as `--opt=value`, or argparse rejects them."""
     run_dir, overlay = _batch_run(tmp_path, {})
-    (overlay / "harnesses" / "harness_m.c").write_text("int LLVMFuzzerTestOneInput(void) { return 0; }\n", encoding="utf-8")
+    (overlay / "harnesses" / "harness_m.c").write_text(
+        "int LLVMFuzzerTestOneInput(void) { return 0; }\n", encoding="utf-8"
+    )
     real_run = subprocess.run
     children = []
 
@@ -423,8 +475,17 @@ def test_parent_recheck_argv_is_accepted_by_the_real_clis(tmp_path, monkeypatch)
     monkeypatch.chdir(run_dir)
     try:
         ok, why = workspace_overlay._run_parent_reverify(
-            run_dir, "prover-1", "prover", overlay, "m.c", "callee", "m", ["workspace/work/m.c"], "-I.",
-            ldflags="-lm", wp_par=3,
+            run_dir,
+            "prover-1",
+            "prover",
+            overlay,
+            "m.c",
+            "callee",
+            "m",
+            ["workspace/work/m.c"],
+            "-I.",
+            ldflags="-lm",
+            wp_par=3,
         )
     finally:
         monkeypatch.setattr(workspace_overlay.subprocess, "run", real_run)
@@ -445,8 +506,9 @@ def test_merge_batch_rechecks_run_in_parallel_and_share_the_budget(tmp_path, mon
     barrier = threading.Barrier(4)  # 1 module guardrail + 3 WP checks must all be running at once
     seen = []
 
-    def fake_reverify(run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="",
-                      wp_par=None):
+    def fake_reverify(
+        run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+    ):
         barrier.wait(timeout=10)
         seen.append((role, function, module, wp_par))
         return True, "ok"
@@ -469,8 +531,9 @@ def test_merge_batch_fixpoint_rejects_a_caller_that_needed_a_rejected_callee(tmp
     monkeypatch.setattr(workspace_overlay, "job_budget", lambda: Budget(cpus=4, mem_mb=65536, source="test"))
     work = overlay / "work" / "m.c"
 
-    def fake_reverify(run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="",
-                      wp_par=None):
+    def fake_reverify(
+        run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+    ):
         tree = work.read_text(encoding="utf-8")
         if function == "callee":
             return False, "callee WP failed"
@@ -502,8 +565,9 @@ def test_merge_batch_shared_guardrail_failure_retries_overlays_one_by_one(tmp_pa
     work = overlay / "work" / "m.c"
     guardrails = []
 
-    def fake_reverify(run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="",
-                      wp_par=None):
+    def fake_reverify(
+        run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+    ):
         if module:
             guardrails.append(agent_id)
             if "other_ok" in work.read_text(encoding="utf-8"):
@@ -519,3 +583,53 @@ def test_merge_batch_shared_guardrail_failure_retries_overlays_one_by_one(tmp_pa
     tree = work.read_text(encoding="utf-8")
     assert "callee_ok" in tree and "other_ok" not in tree
     assert len(guardrails) == 3  # the shared check, then one per overlay
+
+
+def test_fuzz_campaign_refuses_when_memory_below_minimum(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "enforced_memory_mb", lambda: 2048)
+    monkeypatch.setattr(
+        R,
+        "build_module_binary",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not build when memory is insufficient")),
+    )
+    out = tmp_path / "fuzz.json"
+    rc = R.main(
+        [
+            "campaign",
+            "--module",
+            "m",
+            "--sources",
+            "m.c",
+            "--out-bin",
+            str(tmp_path / "fuzz_m"),
+            "--corpus-dir",
+            str(tmp_path / "c"),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--out-json",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    rep = json.loads(out.read_text(encoding="utf-8"))
+    assert rep["status"] == "insufficient_memory"
+    assert rep["min_memory_mb"] == R.fuzz_required_memory_mb(rep["sizing"]["workers"])
+    assert R.FUZZ_MIN_MEMORY_MB == 3072
+
+
+def test_merge_batch_bounds_workers_and_wp_par_by_memory(tmp_path, monkeypatch):
+    run_dir, overlay = _batch_run(tmp_path, EDITS, module=False)
+    # 8 CPUs, but 4000 MiB only fits 2 WP workers (2 * 1768 = 3536 MiB), each with wp_par=1 (2000 - 768 >= 1000).
+    monkeypatch.setattr(workspace_overlay, "job_budget", lambda: Budget(cpus=8, mem_mb=4000, source="test"))
+    seen_wp_par = []
+
+    def fake_reverify(
+        run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+    ):
+        seen_wp_par.append(wp_par)
+        return True, "ok"
+
+    monkeypatch.setattr(workspace_overlay, "_run_parent_reverify", fake_reverify)
+    res = workspace_overlay.merge_agent_batch(run_dir, SPECS, overlay_dir=overlay)
+    assert res["ok"] and len(res["merged"]) == 3
+    assert set(seen_wp_par) == {1}

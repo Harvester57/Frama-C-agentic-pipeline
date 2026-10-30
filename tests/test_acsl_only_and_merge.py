@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
+import workspace_overlay
 from acsl_ast import (
     AcslSyntaxError,
     ScopeViolationError,
@@ -16,8 +17,6 @@ from acsl_ast import (
     tokenize_c_acsl,
     verify_acsl_only,
 )
-import workspace_overlay
-
 
 BASELINE_C = """\
 #include "parser.h"
@@ -179,17 +178,12 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         annotated = forbidden_acsl + "\n" + BASELINE_C
         errors = verify_acsl_only(BASELINE_C, annotated, path="parser.c")
         assert len(errors) >= 1
-        assert any(
-            "unsound" in e.lower() or "forbidden" in e.lower() or "syntax hazard" in e.lower()
-            for e in errors
-        )
+        assert any("unsound" in e.lower() or "forbidden" in e.lower() or "syntax hazard" in e.lower() for e in errors)
 
     def test_verify_acsl_only_allows_valid_logic_integer_and_loop_invariant(self) -> None:
         """Valid logic integer functions (including pointer parameters) and loop/type/global invariants pass."""
         valid_acsl = (
-            "/*@ logic integer good_fn(int *arr, integer n) = n + 1;\n"
-            "    type invariant pos_int(int x) = x >= 0;\n"
-            "*/\n"
+            "/*@ logic integer good_fn(int *arr, integer n) = n + 1;\n    type invariant pos_int(int x) = x >= 0;\n*/\n"
         )
         annotated = valid_acsl + BASELINE_C
         errors = verify_acsl_only(BASELINE_C, annotated, path="parser.c")
@@ -207,10 +201,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         ):
             text = (acsl_dir / name).read_text(encoding="utf-8")
             tokens = tokenize_c_acsl(text)
-            c_tokens = [
-                t for t in tokens
-                if t.kind not in ("whitespace", "acsl_block", "acsl_line", "c_comment")
-            ]
+            c_tokens = [t for t in tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line", "c_comment")]
             assert c_tokens == [], f"{name} contains non-ACSL C tokens: {c_tokens[:5]}"
             assert find_unsound_acsl_keywords(tokens, path=name) == []
 
@@ -589,7 +580,9 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         assert set(res["modified_files"]) == {"parser.c", "parser.h"}
         assert "assigns \\nothing;" in (work_dir / "parser.h").read_text(encoding="utf-8")
 
-    def test_merge_batch_happy_path_and_bisect_on_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_merge_batch_happy_path_and_bisect_on_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """
         merge_agent_batch merges multiple agents in one pass when reverify succeeds, and
         automatically bisects when batch reverify fails so good agents stay merged.
@@ -631,8 +624,9 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         # Now reset workspace/work/ to baseline and simulate prover-2 failing verification during batch merge
         (overlay / "work/parser.c").write_text(BASELINE_C, encoding="utf-8")
 
-        def fake_reverify(run_dir, overlay_dir, agent_id, role, c_file, function, module, sources, cppflags, ldflags="",
-                          wp_par=None):
+        def fake_reverify(
+            run_dir, overlay_dir, agent_id, role, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+        ):
             assert wp_par is not None and wp_par >= 1  # parallel re-checks share the job budget
             if function == "parse_payload":
                 return False, "parse_payload WP failed"
@@ -665,7 +659,9 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         target.mkdir()
         (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
         (target / "parser.h").write_text(BASELINE_H, encoding="utf-8")
-        (target / "other.h").write_text("#ifndef OTHER_H\n#define OTHER_H\nint other_fn(int x);\n#endif\n", encoding="utf-8")
+        (target / "other.h").write_text(
+            "#ifndef OTHER_H\n#define OTHER_H\nint other_fn(int x);\n#endif\n", encoding="utf-8"
+        )
 
         run_dir = tmp_path / "run"
         overlay = run_dir / "workspace"
@@ -772,8 +768,9 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
 
         seen_cppflags: list[str] = []
 
-        def fake_reverify(run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="",
-                          wp_par=None):
+        def fake_reverify(
+            run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+        ):
             seen_cppflags.append(cppflags)
             return True, "ok"
 
@@ -793,5 +790,3 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         merged_h = (overlay / "work/parser.h").read_text(encoding="utf-8")
         assert "assigns \\nothing;" in merged_h
         assert "requires \\valid(out);" in merged_h
-
-

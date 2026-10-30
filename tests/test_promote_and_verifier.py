@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import generate_harness
+import ledger
 from conftest import (
     FP_EVA,
     FP_PARSE,
@@ -20,8 +22,6 @@ from conftest import (
     write_json,
 )
 from fingerprint import make_fingerprint
-import generate_harness
-import ledger
 from promote_artifact import (
     MAX_ARTIFACT_BYTES,
     MAX_SEED_BYTES,
@@ -107,7 +107,7 @@ class TestPromoteArtifact:
         too_many = []
         for idx in range(MAX_SEEDS_PER_AGENT + 1):
             p = seeds_dir / f"extra_{idx}.bin"
-            p.write_bytes(f"seed-{idx}".encode("utf-8"))
+            p.write_bytes(f"seed-{idx}".encode())
             too_many.append(f"agents/breaker-1/scratch/seeds/extra_{idx}.bin")
         with pytest.raises(PromotionError, match="too many seeds"):
             promote_seeds(run_dir, "breaker-1", "snmp", too_many)
@@ -119,11 +119,23 @@ class TestVerifierIngestionAndHypotheses:
     def test_ingest_agent_hypothesis_creates_unverified_candidate(self, run_dir: Path) -> None:
         """A breaker or prover with fault_hypothesis creates an unverified candidate in candidates.json."""
         write_json(run_dir / "run-metadata.json", metadata("in_progress"))
-        u_rte = unit("src/snmp/ber.c", "ber_decode_len", "rte", status="blocked",
-                     evidence=[{"phase": "wp", "producer": "run_wp_function.py", "result": "wp_unproven",
-                                "discharging": False, "tool_output": "workspace/reports/wp/ber_decode_len.json",
-                                "summary": "1 unproven goal"}],
-                     unresolved=["unproven mem_access"])
+        u_rte = unit(
+            "src/snmp/ber.c",
+            "ber_decode_len",
+            "rte",
+            status="blocked",
+            evidence=[
+                {
+                    "phase": "wp",
+                    "producer": "run_wp_function.py",
+                    "result": "wp_unproven",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/wp/ber_decode_len.json",
+                    "summary": "1 unproven goal",
+                }
+            ],
+            unresolved=["unproven mem_access"],
+        )
         write_json(run_dir / "coverage-ledger.json", [u_rte])
         write_json(run_dir / "workspace/reports/wp/ber_decode_len.json", {"status": "unproven_goals_remain"})
 
@@ -183,14 +195,16 @@ class TestVerifierIngestionAndHypotheses:
             "ber_decode_len",
             "rte",
             status="candidate",
-            evidence=[{
-                "phase": "fuzz",
-                "producer": "run_eacsl_fuzz.py",
-                "result": "fuzz_failure",
-                "discharging": False,
-                "tool_output": "workspace/reports/fuzz/snmp.json",
-                "summary": "E-ACSL failure",
-            }],
+            evidence=[
+                {
+                    "phase": "fuzz",
+                    "producer": "run_eacsl_fuzz.py",
+                    "result": "fuzz_failure",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/fuzz/snmp.json",
+                    "summary": "E-ACSL failure",
+                }
+            ],
             result_fingerprints=[FP_PARSE],
         )
         u_l2 = unit("src/snmp/ber.c", "ber_decode_len", "l2_termination", status="planned")
@@ -203,7 +217,10 @@ class TestVerifierIngestionAndHypotheses:
         scratch_crash.write_bytes(crash_bytes)
 
         scratch_fix = run_dir / "agents" / "verifier-1" / "scratch" / "ber.fix.patch"
-        scratch_fix.write_text("--- a/src/snmp/ber.c\n+++ b/src/snmp/ber.c\n@@ -40 +40 @@\n-if (n > 4)\n+if (n > 4 || off + n > len)\n", encoding="utf-8")
+        scratch_fix.write_text(
+            "--- a/src/snmp/ber.c\n+++ b/src/snmp/ber.c\n@@ -40 +40 @@\n-if (n > 4)\n+if (n > 4 || off + n > len)\n",
+            encoding="utf-8",
+        )
 
         fuzz_report_path = run_dir / "workspace" / "reports" / "fuzz" / "snmp.json"
         write_json(
@@ -282,7 +299,9 @@ class TestVerifierIngestionAndHypotheses:
             "src/snmp/ber.c#ber_decode_len::l2_termination",
         }
 
-        units = {u["coverage_id"]: u for u in json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))}
+        units = {
+            u["coverage_id"]: u for u in json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))
+        }
         assert units["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "candidate"
         assert units["src/snmp/ber.c#ber_decode_len::l2_termination"]["status"] == "candidate"
         assert FP_PARSE in units["src/snmp/ber.c#ber_decode_len::l2_termination"]["result_fingerprints"]
@@ -297,14 +316,16 @@ class TestVerifierIngestionAndHypotheses:
             "ber_decode_len",
             "rte",
             status="candidate",
-            evidence=[{
-                "phase": "fuzz",
-                "producer": "run_eacsl_fuzz.py",
-                "result": "fuzz_failure",
-                "discharging": False,
-                "tool_output": "workspace/reports/fuzz/snmp.json",
-                "summary": "E-ACSL failure",
-            }],
+            evidence=[
+                {
+                    "phase": "fuzz",
+                    "producer": "run_eacsl_fuzz.py",
+                    "result": "fuzz_failure",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/fuzz/snmp.json",
+                    "summary": "E-ACSL failure",
+                }
+            ],
             result_fingerprints=[FP_PARSE],
         )
         write_json(run_dir / "coverage-ledger.json", [u_rte])
@@ -376,14 +397,16 @@ class TestVerifierIngestionAndHypotheses:
             "ber_decode_tag",
             "rte",
             status="candidate",
-            evidence=[{
-                "phase": "fuzz",
-                "producer": "run_eacsl_fuzz.py",
-                "result": "fuzz_failure",
-                "discharging": False,
-                "tool_output": "workspace/reports/fuzz/snmp.json",
-                "summary": "E-ACSL failure",
-            }],
+            evidence=[
+                {
+                    "phase": "fuzz",
+                    "producer": "run_eacsl_fuzz.py",
+                    "result": "fuzz_failure",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/fuzz/snmp.json",
+                    "summary": "E-ACSL failure",
+                }
+            ],
             result_fingerprints=[FP_REJ],
         )
         write_json(run_dir / "coverage-ledger.json", [u_tag])
@@ -418,7 +441,9 @@ class TestVerifierIngestionAndHypotheses:
         )
 
         rej = rejected_record(FP_REJ)
-        rej["evidence"] = [{"phase": "verifier", "tool_output": "agents/verifier-3/scratch/notes.txt", "description": "Harness bug."}]
+        rej["evidence"] = [
+            {"phase": "verifier", "tool_output": "agents/verifier-3/scratch/notes.txt", "description": "Harness bug."}
+        ]
         res_path = run_dir / "agents" / "verifier-3" / "scratch" / "res.json"
         write_json(
             res_path,
@@ -652,14 +677,16 @@ class TestHarnessLegitimacyAndMetadata:
             "rte",
             status="planned",
             module="syncmem",
-            evidence=[{
-                "phase": "eva",
-                "producer": "run_eva_slice.py",
-                "result": "eva_unknown",
-                "discharging": False,
-                "tool_output": "workspace/reports/eva/syncmem.json",
-                "summary": "2 unknown RTE obligations",
-            }],
+            evidence=[
+                {
+                    "phase": "eva",
+                    "producer": "run_eva_slice.py",
+                    "result": "eva_unknown",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/eva/syncmem.json",
+                    "summary": "2 unknown RTE obligations",
+                }
+            ],
         )
         u_untouched = unit(
             "src/LibPtfCom/SyncMem.c",
@@ -730,11 +757,16 @@ class TestHarnessLegitimacyAndMetadata:
         assert validate_agent_result(scaf_obj) == []
         assert scaf_obj["refingerprint_reason"] is not None
         # The reproducer command replays on the module's own build, as the fuzz report names it.
-        expected_bin = (json.loads((run_dir / "workspace/reports/fuzz/events.json").read_text(encoding="utf-8"))
-                        .get("compile", {}).get("binary") or "workspace/harnesses/fuzz_events.e-acsl")
+        expected_bin = (
+            json.loads((run_dir / "workspace/reports/fuzz/events.json").read_text(encoding="utf-8"))
+            .get("compile", {})
+            .get("binary")
+            or "workspace/harnesses/fuzz_events.e-acsl"
+        )
         assert scaf_obj["record"]["reproducers"][0]["command"] == (
             "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module events "
-            f"--inputs workspace/crashes/events/crash-1 --binary {expected_bin}")
+            f"--inputs workspace/crashes/events/crash-1 --binary {expected_bin}"
+        )
 
         ledger.cmd_ingest_verifier(scaf_path, replay_reports=[fuzz_report])
         close_res = ledger.cmd_close_remaining("quick_profile_wp_not_scheduled")
@@ -838,7 +870,7 @@ class TestHarnessLegitimacyAndMetadata:
         res_file.parent.mkdir(parents=True)
         # Raw JSON text with unescaped \valid_read (\v -> invalid JSON escape) and \forall/\false (\f -> formfeed)
         raw_bad_json = (
-            '{\n'
+            "{\n"
             '  "role": "prover",\n'
             '  "agent_id": "prover-esc",\n'
             '  "file": "src/snmp/ber.c",\n'
@@ -848,17 +880,17 @@ class TestHarnessLegitimacyAndMetadata:
             '  "evidence": [{"tool_output": "workspace/reports/wp/ber.json", "result": "unproven_goals_remain"}],\n'
             '  "unproven_goals": ["rte: mem_access: \\valid_read(buf + i) && \\forall integer k; \\false || \\at(x, Pre) == 0"],\n'
             '  "strengthening_requests": [\n'
-            '    {\n'
+            "    {\n"
             '      "callee": "helper_fn",\n'
             '      "callee_file": "src/snmp/helper.c",\n'
             '      "header_file": "src/snmp/helper.h",\n'
             '      "needed_clause": "ensures \\valid(\\result) && \\base_addr(\\result) == \\base_addr(buf);",\n'
             '      "reason": "caller needs pointer validity"\n'
-            '    }\n'
-            '  ],\n'
+            "    }\n"
+            "  ],\n"
             '  "boundary_assumptions": [],\n'
             '  "fault_hypothesis": null\n'
-            '}\n'
+            "}\n"
         )
         res_file.write_text(raw_bad_json, encoding="utf-8")
 
@@ -887,14 +919,16 @@ class TestHarnessLegitimacyAndMetadata:
             "rte",
             status="blocked",
             module="syncmem",
-            evidence=[{
-                "phase": "wp",
-                "producer": "run_wp_function.py",
-                "result": "wp_unproven",
-                "discharging": False,
-                "tool_output": "workspace/reports/wp/GetInt.json",
-                "summary": "1 unproven goal",
-            }],
+            evidence=[
+                {
+                    "phase": "wp",
+                    "producer": "run_wp_function.py",
+                    "result": "wp_unproven",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/wp/GetInt.json",
+                    "summary": "1 unproven goal",
+                }
+            ],
             unresolved=["unproven index_bound"],
         )
         u_callee = unit(
@@ -903,14 +937,16 @@ class TestHarnessLegitimacyAndMetadata:
             "rte",
             status="covered",
             module="syncmem",
-            evidence=[{
-                "phase": "wp",
-                "producer": "run_wp_function.py",
-                "result": "wp_all_proved",
-                "discharging": True,
-                "tool_output": "workspace/reports/wp/GetInt.json",
-                "summary": "All goals proved",
-            }],
+            evidence=[
+                {
+                    "phase": "wp",
+                    "producer": "run_wp_function.py",
+                    "result": "wp_all_proved",
+                    "discharging": True,
+                    "tool_output": "workspace/reports/wp/GetInt.json",
+                    "summary": "All goals proved",
+                }
+            ],
         )
         write_json(
             run_dir / "coverage-ledger.json",
@@ -969,7 +1005,9 @@ class TestHarnessLegitimacyAndMetadata:
         target = tmp_path / "target_prep"
         target.mkdir()
         (target / "src").mkdir()
-        (target / "src/SyncMem.c").write_text("int Hash(const char *Name, int MaxValue) { return 0; }\n", encoding="utf-8")
+        (target / "src/SyncMem.c").write_text(
+            "int Hash(const char *Name, int MaxValue) { return 0; }\n", encoding="utf-8"
+        )
         (target / "src/SyncMem.h").write_text("int Hash(const char *Name, int MaxValue);\n", encoding="utf-8")
 
         wo_mod.init_overlay(target, run_dir / "workspace")
@@ -1340,13 +1378,16 @@ class TestHarnessLegitimacyAndMetadata:
            automatically retries unproven bitwise/shift goals with -wp-model Typed+ref+int.
         """
         import subprocess
+
         import run_wp_function as wp_mod
 
         snd = wp_mod.scan_wp_log_soundness("", warn_unsigned_downcast=False)
         assert "-no-warn-unsigned-downcast" in snd["reduced_checks"]
 
         c_file = tmp_path / "cksum.c"
-        c_file.write_text("unsigned short InCksum(unsigned int sum) { return (unsigned short)~(sum >> 16); }\n", encoding="utf-8")
+        c_file.write_text(
+            "unsigned short InCksum(unsigned int sum) { return (unsigned short)~(sum >> 16); }\n", encoding="utf-8"
+        )
         out_dir = tmp_path / "wp_out"
 
         calls: list[list[str]] = []
@@ -1400,6 +1441,3 @@ class TestHarnessLegitimacyAndMetadata:
         assert res_retry["bitwise_retry"]["triggered"] is True
         assert res_retry["bitwise_retry"]["wp_model"] == "Typed+ref+int"
         assert res_retry["bitwise_retry"]["timeout"] == 30
-
-
-

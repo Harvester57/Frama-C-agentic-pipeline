@@ -104,7 +104,10 @@ def test_ledger_state_table():
         (unit("src/a.c", "f", "rte", "blocked", evidence=[evidence()]), "blocker"),
         (unit("src/a.c", "f", "rte", "in_progress"), "agent_id"),
         (unit("src/a.c", "f", "rte", "candidate", evidence=[evidence()]), "result_fingerprints"),
-        (unit("src/a.c", "f", "rte", "covered", evidence=[evidence()], result_fingerprints=[FP_PARSE]), "only 'candidate'"),
+        (
+            unit("src/a.c", "f", "rte", "covered", evidence=[evidence()], result_fingerprints=[FP_PARSE]),
+            "only 'candidate'",
+        ),
     ]
     for u, needle in cases:
         errs = validate_ledger([u])
@@ -115,8 +118,20 @@ def test_ledger_id_must_match_fields_and_assumption_links():
     u = unit("src/a.c", "f", "rte")
     u["coverage_id"] = "src/a.c#g::rte"
     assert any("must equal" in e for e in validate_ledger([u]))
-    u = unit("src/a.c", "f", "rte", "covered", evidence=[evidence()],
-             assumptions=[{"kind": "caller_requires_unverified", "description": "caller unverified", "related_units": ["src/b.c#main::rte"]}])
+    u = unit(
+        "src/a.c",
+        "f",
+        "rte",
+        "covered",
+        evidence=[evidence()],
+        assumptions=[
+            {
+                "kind": "caller_requires_unverified",
+                "description": "caller unverified",
+                "related_units": ["src/b.c#main::rte"],
+            }
+        ],
+    )
     assert any("not in ledger" in e for e in validate_ledger([u]))
 
 
@@ -170,10 +185,17 @@ def test_run_metadata_worktree_fallback_to_host_git_env(tmp_path, monkeypatch):
 
 def prover_result(**kw):
     r = {
-        "role": "prover", "agent_id": "prover-1", "file": "src/a.c", "function": "f",
-        "status": "all_proven", "patch": "agents/prover-1/artifacts/f.patch",
+        "role": "prover",
+        "agent_id": "prover-1",
+        "file": "src/a.c",
+        "function": "f",
+        "status": "all_proven",
+        "patch": "agents/prover-1/artifacts/f.patch",
         "evidence": [{"tool_output": "agents/prover-1/scratch/wp_f.json", "result": "all_proven"}],
-        "unproven_goals": [], "strengthening_requests": [], "boundary_assumptions": [], "fault_hypothesis": None,
+        "unproven_goals": [],
+        "strengthening_requests": [],
+        "boundary_assumptions": [],
+        "fault_hypothesis": None,
     }
     r.update(kw)
     return r
@@ -185,8 +207,14 @@ def test_agent_results():
     assert any("unproven_goals" in e for e in validate_agent_result(prover_result(status="stalled_after_k_retries")))
     assert any("unexpected property" in e for e in validate_agent_result(prover_result(extra=1)))
 
-    verifier = {"role": "crash_verifier", "agent_id": "verifier-1", "candidate_fingerprint": FP_PARSE,
-                "decision": "confirmed", "refingerprint_reason": None, "record": confirmed_record()}
+    verifier = {
+        "role": "crash_verifier",
+        "agent_id": "verifier-1",
+        "candidate_fingerprint": FP_PARSE,
+        "decision": "confirmed",
+        "refingerprint_reason": None,
+        "record": confirmed_record(),
+    }
     assert list(validate_agent_result(verifier)) == []
     verifier["decision"] = "rejected"
     assert any("must equal decision" in e for e in validate_agent_result(verifier))
@@ -194,8 +222,15 @@ def test_agent_results():
     verifier["candidate_fingerprint"] = FP_EVA
     assert any("refingerprint_reason" in e for e in validate_agent_result(verifier))
 
-    critic = {"role": "critic", "agent_id": "critic-1", "phase": "eva", "missing_units": [],
-              "reassign_ids": ["src/a.c#f::rte"], "harness_gaps": [], "stop": True}
+    critic = {
+        "role": "critic",
+        "agent_id": "critic-1",
+        "phase": "eva",
+        "missing_units": [],
+        "reassign_ids": ["src/a.c#f::rte"],
+        "harness_gaps": [],
+        "stop": True,
+    }
     assert any("stop" in e for e in validate_agent_result(critic))
 
 
@@ -218,16 +253,29 @@ def test_run_dir_cross_checks(tmp_path):
     rec = confirmed_record()
     rec["reproducers"][0]["sha256"] = hashlib.sha256(b"abc").hexdigest()
     findings = sorted_findings(rec, needs_validation_record(), rejected_record())
-    ev = [evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/snmp.json")]
+    ev = [
+        evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/snmp.json")
+    ]
     ledger = [
         unit("src/snmp/ber.c", "ber_decode_len", "rte", "candidate", evidence=ev, result_fingerprints=[FP_PARSE]),
-        unit("src/log/emit.c", "emit_field", "rte", "candidate", evidence=ev, result_fingerprints=[FP_EVA], module="log"),
+        unit(
+            "src/log/emit.c", "emit_field", "rte", "candidate", evidence=ev, result_fingerprints=[FP_EVA], module="log"
+        ),
         unit("src/snmp/ber.c", "ber_decode_tag", "rte", "candidate", evidence=ev, result_fingerprints=[FP_REJ]),
     ]
-    cand = {"fingerprint": FP_PARSE, "status": "verified", "origin": "fuzz", "proposed_verdict": "confirmed", "module": "snmp",
-            "location": {"file": "src/snmp/ber.c", "line": 42, "function": "ber_decode_len"},
-            "property": {"kind": "mem_access", "predicate": "x"}, "reproducers": [], "tool_outputs": ["workspace/reports/fuzz/snmp.json"],
-            "linked_units": ["src/snmp/ber.c#ber_decode_len::rte"], "first_seen": "t"}
+    cand = {
+        "fingerprint": FP_PARSE,
+        "status": "verified",
+        "origin": "fuzz",
+        "proposed_verdict": "confirmed",
+        "module": "snmp",
+        "location": {"file": "src/snmp/ber.c", "line": 42, "function": "ber_decode_len"},
+        "property": {"kind": "mem_access", "predicate": "x"},
+        "reproducers": [],
+        "tool_outputs": ["workspace/reports/fuzz/snmp.json"],
+        "linked_units": ["src/snmp/ber.c#ber_decode_len::rte"],
+        "first_seen": "t",
+    }
     _write_run(run, findings, [cand], ledger, metadata("complete"))
     assert list(validate_run_dir(run)) == []
 
@@ -242,3 +290,70 @@ def test_run_dir_cross_checks(tmp_path):
     ledger[0]["unresolved"] = ["x"]
     _write_run(run, findings, [cand], ledger, metadata("in_progress"))
     assert any("not recorded in result_fingerprints" in e for e in validate_run_dir(run))
+
+
+def test_snapshot_manifest_and_prior_run_tamper_detection(tmp_path, monkeypatch):
+    import run_metadata
+    from validate_artifacts import validate_snapshot_manifest
+
+    run1 = tmp_path / "run-1"
+    run1.mkdir()
+    work_file = run1 / "workspace/work/src/a.c"
+    work_file.parent.mkdir(parents=True)
+    work_file.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+    write_json(run1 / "workspace/reports/eva/a.json", {"ok": True})
+    ev = [evidence(phase="eva", result="eva_all_valid", discharging=True, tool_output="workspace/reports/eva/a.json")]
+    ledger = [unit("src/a.c", "f", "rte", "covered", evidence=ev)]
+    _write_run(run1, [], [], ledger, metadata("complete"))
+
+    manifest = run_metadata.cmd_snapshot(run1)
+    assert manifest["schema_version"] == 1
+    assert "coverage-ledger.json" in manifest["files"]
+    assert "workspace/work/src/a.c" in manifest["files"]
+    assert "workspace/reports/eva/a.json" in manifest["files"]
+    assert list(validate_snapshot_manifest(manifest, run1)) == []
+    assert list(validate_run_dir(run1)) == []
+
+    # Initializing a new run with --prior-run pointing to intact run1 succeeds.
+    run2 = tmp_path / "run-2"
+    run2.mkdir()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    monkeypatch.chdir(run2)
+    assert (
+        run_metadata.main(
+            [
+                "init",
+                "--repo",
+                "demo",
+                "--target",
+                str(target_dir),
+                "--prior-run",
+                str(run1),
+            ]
+        )
+        == 0
+    )
+
+    # Tampering with workspace/work/src/a.c in run1 is caught by validate_run_dir and --prior-run verification.
+    work_file.write_text("int f(int x) { return x + 999; }\n", encoding="utf-8")
+    errs = validate_run_dir(run1)
+    assert any("snapshot" in e and "src/a.c" in e for e in errs)
+
+    run3 = tmp_path / "run-3"
+    run3.mkdir()
+    monkeypatch.chdir(run3)
+    assert (
+        run_metadata.main(
+            [
+                "init",
+                "--repo",
+                "demo",
+                "--target",
+                str(target_dir),
+                "--prior-run",
+                str(run1),
+            ]
+        )
+        == 1
+    )

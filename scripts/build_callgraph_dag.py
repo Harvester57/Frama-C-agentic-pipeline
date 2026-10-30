@@ -9,63 +9,162 @@ using deterministic C/ACSL tokenization.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import json
 import os
-from pathlib import Path
 import re
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from collections import defaultdict
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
 
 C_KEYWORDS = {
-    "if", "else", "for", "while", "do", "switch", "case", "default",
-    "sizeof", "Alignof", "_Alignof", " _Alignas", "typeof", "__typeof__",
-    "return", "goto", "break", "continue", "__attribute__", "__attribute",
-    "__declspec", "__builtin_expect", "__builtin_choose_expr",
-    "__builtin_typescompatible_p", "__builtin_offsetof", "defined",
-    "offsetof", "assert", "_Static_assert", "static_assert",
-    "asm", "__asm", "__asm__",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "sizeof",
+    "Alignof",
+    "_Alignof",
+    "_Alignas",
+    "typeof",
+    "__typeof__",
+    "return",
+    "goto",
+    "break",
+    "continue",
+    "__attribute__",
+    "__attribute",
+    "__declspec",
+    "__builtin_expect",
+    "__builtin_choose_expr",
+    "__builtin_typescompatible_p",
+    "__builtin_offsetof",
+    "defined",
+    "offsetof",
+    "assert",
+    "_Static_assert",
+    "static_assert",
+    "asm",
+    "__asm",
+    "__asm__",
 }
 
 TYPE_MODIFIERS_AND_PRIMITIVES = {
-    "void", "char", "short", "int", "long", "float", "double",
-    "signed", "unsigned", "_Bool", "bool", "size_t", "ssize_t",
-    "ptrdiff_t", "intptr_t", "uintptr_t",
-    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-    "int8_t", "int16_t", "int32_t", "int64_t",
-    "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
-    "const", "volatile", "restrict", "__restrict", "__restrict__",
-    "struct", "union", "enum",
+    "void",
+    "char",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "signed",
+    "unsigned",
+    "_Bool",
+    "bool",
+    "size_t",
+    "ssize_t",
+    "ptrdiff_t",
+    "intptr_t",
+    "uintptr_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "s8",
+    "s16",
+    "s32",
+    "s64",
+    "const",
+    "volatile",
+    "restrict",
+    "__restrict",
+    "__restrict__",
+    "struct",
+    "union",
+    "enum",
 }
 
 BYTE_BUFFER_TYPES = {
-    "char", "uint8_t", "int8_t", "u8", "s8", "void", "unsigned",
+    "char",
+    "uint8_t",
+    "int8_t",
+    "u8",
+    "s8",
+    "void",
+    "unsigned",
 }
 
 INTEGER_BOUND_TYPES = {
-    "size_t", "ssize_t", "int", "unsigned", "long", "short",
-    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-    "int8_t", "int16_t", "int32_t", "int64_t",
-    "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
+    "size_t",
+    "ssize_t",
+    "int",
+    "unsigned",
+    "long",
+    "short",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "s8",
+    "s16",
+    "s32",
+    "s64",
     "ptrdiff_t",
 }
 
 DYNAMIC_ALLOC_CALLEES = {
-    "malloc", "calloc", "realloc", "free", "aligned_alloc",
-    "strdup", "strndup", "alloca", "__builtin_alloca",
+    "malloc",
+    "calloc",
+    "realloc",
+    "free",
+    "aligned_alloc",
+    "strdup",
+    "strndup",
+    "alloca",
+    "__builtin_alloca",
 }
 
 ZEROIZATION_CALLEES = {
-    "explicit_bzero", "memset_s", "SecureZeroMemory", "OPENSSL_cleanse",
+    "explicit_bzero",
+    "memset_s",
+    "SecureZeroMemory",
+    "OPENSSL_cleanse",
 }
 
 FORMAT_OR_WRITE_CALLEES = {
-    "snprintf", "vsnprintf", "sprintf", "vsprintf",
-    "memcpy", "memmove", "strncpy", "strlcpy", "strncat", "strlcat",
+    "snprintf",
+    "vsnprintf",
+    "sprintf",
+    "vsprintf",
+    "memcpy",
+    "memmove",
+    "strncpy",
+    "strlcpy",
+    "strncat",
+    "strlcat",
 }
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -75,7 +174,7 @@ def _is_ident(text: str) -> bool:
     return bool(_IDENT_RE.match(text)) and text not in C_KEYWORDS
 
 
-def _find_matching_forward(tokens: List[Token], open_idx: int, open_tok: str, close_tok: str) -> int:
+def _find_matching_forward(tokens: list[Token], open_idx: int, open_tok: str, close_tok: str) -> int:
     depth = 0
     for idx in range(open_idx, len(tokens)):
         t = tokens[idx].text
@@ -88,7 +187,7 @@ def _find_matching_forward(tokens: List[Token], open_idx: int, open_tok: str, cl
     return -1
 
 
-def _find_matching_backward(tokens: List[Token], close_idx: int, open_tok: str, close_tok: str) -> int:
+def _find_matching_backward(tokens: list[Token], close_idx: int, open_tok: str, close_tok: str) -> int:
     depth = 0
     for idx in range(close_idx, -1, -1):
         t = tokens[idx].text
@@ -101,7 +200,7 @@ def _find_matching_backward(tokens: List[Token], close_idx: int, open_tok: str, 
     return -1
 
 
-def _strip_trailing_attributes(c_tokens: List[Token], end_idx: int, min_idx: int) -> int:
+def _strip_trailing_attributes(c_tokens: list[Token], end_idx: int, min_idx: int) -> int:
     """
     Walk backward from end_idx (exclusive) skipping trailing `__attribute__((...))`,
     `__declspec(...)`, or `asm(...)` qualifiers between `)` and `{`.
@@ -112,7 +211,12 @@ def _strip_trailing_attributes(c_tokens: List[Token], end_idx: int, min_idx: int
         if c_tokens[cursor].text == ")":
             open_p = _find_matching_backward(c_tokens, cursor, "(", ")")
             if open_p > min_idx and c_tokens[open_p - 1].text in {
-                "__attribute__", "__attribute", "__declspec", "asm", "__asm", "__asm__",
+                "__attribute__",
+                "__attribute",
+                "__declspec",
+                "asm",
+                "__asm",
+                "__asm__",
             }:
                 cursor = open_p - 2
                 continue
@@ -120,7 +224,7 @@ def _strip_trailing_attributes(c_tokens: List[Token], end_idx: int, min_idx: int
     return cursor
 
 
-def extract_functions_from_code(raw_code: str, path: str = "<input>") -> List[dict]:
+def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[dict]:
     """
     Deterministically extract all C function definitions from `raw_code` using
     the lossless C/ACSL tokenizer.
@@ -133,8 +237,8 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> List[di
         cleaned = re.sub(r"//[^\n]*", " ", cleaned)
         all_tokens = tokenize_c_acsl(cleaned, path=path)
 
-    c_tokens = [t for t in all_tokens if t.kind == "c_token"]
-    results: List[dict] = []
+    c_tokens = [t for t in all_tokens if t.kind in ("c_token", "string")]
+    results: list[dict] = []
 
     n = len(c_tokens)
     idx = 0
@@ -167,12 +271,21 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> List[di
 
         if text == "{":
             if brace_depth == 0 and paren_depth == 0:
+                header_slice = c_tokens[last_top_boundary + 1 : idx]
+                if (
+                    len(header_slice) >= 2
+                    and header_slice[-2].text == "extern"
+                    and header_slice[-1].text in ('"C"', '"C++"')
+                ) or (len(header_slice) == 1 and header_slice[-1].text == "extern"):
+                    last_top_boundary = idx
+                    idx += 1
+                    continue
+
                 close_brace = _find_matching_forward(c_tokens, idx, "{", "}")
                 if close_brace == -1:
                     break
 
                 # Check if tokens between last_top_boundary and idx form a function header
-                header_slice = c_tokens[last_top_boundary + 1 : idx]
                 has_top_equals = False
                 p_depth = 0
                 for ht in header_slice:
@@ -196,15 +309,17 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> List[di
                                 body_tokens = c_tokens[idx + 1 : close_brace]
                                 start_line = decl_prefix[0].line if decl_prefix else c_tokens[open_params].line
                                 end_line = c_tokens[close_brace].line
-                                results.append({
-                                    "name": fn_name,
-                                    "line": start_line,
-                                    "end_line": end_line,
-                                    "loc": max(1, end_line - start_line + 1),
-                                    "decl_tokens": decl_prefix,
-                                    "param_tokens": param_tokens,
-                                    "body_tokens": body_tokens,
-                                })
+                                results.append(
+                                    {
+                                        "name": fn_name,
+                                        "line": start_line,
+                                        "end_line": end_line,
+                                        "loc": max(1, end_line - start_line + 1),
+                                        "decl_tokens": decl_prefix,
+                                        "param_tokens": param_tokens,
+                                        "body_tokens": body_tokens,
+                                    }
+                                )
                                 last_top_boundary = close_brace
                                 idx = close_brace + 1
                                 continue
@@ -224,11 +339,11 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> List[di
 
 
 def _resolve_declarator(
-    c_tokens: List[Token],
+    c_tokens: list[Token],
     last_top_boundary: int,
     open_params: int,
     close_params: int,
-) -> Tuple[Optional[str], List[Token], List[Token]]:
+) -> tuple[str | None, list[Token], list[Token]]:
     """
     Resolve function name and parameter tokens from a top-level declarator.
     Handles standard `ret fn(params)` and function-pointer returning `ret (*fn(params))(fp_params)`.
@@ -263,15 +378,15 @@ def _resolve_declarator(
     return None, [], []
 
 
-def analyze_signature(decl_tokens: List[Token], param_tokens: List[Token]) -> dict:
+def analyze_signature(decl_tokens: list[Token], param_tokens: list[Token]) -> dict:
     """Analyze function return type, storage class, and parameter structure without keyword hints."""
     decl_texts = [t.text for t in decl_tokens]
     is_static = "static" in decl_texts
     returns_pointer = "*" in decl_texts
 
     # Split param_tokens on top-level commas
-    params_split: List[List[str]] = []
-    cur: List[str] = []
+    params_split: list[list[str]] = []
+    cur: list[str] = []
     p_depth = 0
     for tok in param_tokens:
         if tok.text == "(":
@@ -297,8 +412,8 @@ def analyze_signature(decl_tokens: List[Token], param_tokens: List[Token]) -> di
     byte_buf_in_params = 0
     byte_buf_out_params = 0
     int_bound_params = 0
-    fn_ptr_params: Set[str] = set()
-    param_names: Set[str] = set()
+    fn_ptr_params: set[str] = set()
+    param_names: set[str] = set()
 
     for p_toks in params_split:
         # Detect function pointer parameter: e.g. `int (*cb)(const uint8_t *, size_t)`
@@ -340,9 +455,7 @@ def analyze_signature(decl_tokens: List[Token], param_tokens: List[Token]) -> di
             if any(it in p_toks for it in INTEGER_BOUND_TYPES):
                 int_bound_params += 1
 
-    params_str = " ".join(
-        " ".join(p) for p in params_split
-    ) if params_split else ("void" if param_tokens else "")
+    params_str = " ".join(" ".join(p) for p in params_split) if params_split else ("void" if param_tokens else "")
     if params_split:
         params_str = ", ".join(" ".join(p) for p in params_split)
 
@@ -364,7 +477,7 @@ def analyze_signature(decl_tokens: List[Token], param_tokens: List[Token]) -> di
 
 def analyze_body(
     fn_name: str,
-    body_tokens: List[Token],
+    body_tokens: list[Token],
     sig_info: dict,
 ) -> dict:
     """
@@ -376,8 +489,8 @@ def analyze_body(
       container_of, volatile/inline asm)
     - structural security patterns (memory zeroization, formatting/serialization)
     """
-    direct_callees: Set[str] = set()
-    indirect_calls: List[str] = []
+    direct_callees: set[str] = set()
+    indirect_calls: list[str] = []
     self_recursive = False
 
     loop_count = 0
@@ -388,11 +501,11 @@ def analyze_body(
     has_zeroization = False
     uses_format_or_write = False
 
-    defined_labels: Dict[str, int] = {}
-    goto_sites: List[Tuple[str, int, int]] = []  # (label, token_idx, line)
+    defined_labels: dict[str, int] = {}
+    goto_sites: list[tuple[str, int, int]] = []  # (label, token_idx, line)
 
-    fn_ptr_params: Set[str] = sig_info["fn_ptr_params"]
-    param_names: Set[str] = sig_info["param_names"]
+    fn_ptr_params: set[str] = sig_info["fn_ptr_params"]
+    param_names: set[str] = sig_info["param_names"]
 
     n = len(body_tokens)
     for i, tok in enumerate(body_tokens):
@@ -407,9 +520,8 @@ def analyze_body(
                 c2 = body_tokens[i + 3].text
                 c3 = body_tokens[i + 4].text
                 c4 = body_tokens[i + 5].text
-                if (
-                    (_is_ident(c1) and c2 == "-" and c3 == "-" and c4 == ")")
-                    or (c1 == "-" and c2 == "-" and _is_ident(c3) and c4 == ")")
+                if (_is_ident(c1) and c2 == "-" and c3 == "-" and c4 == ")") or (
+                    c1 == "-" and c2 == "-" and _is_ident(c3) and c4 == ")"
                 ):
                     has_unsigned_wrap_idiom = True
 
@@ -437,10 +549,7 @@ def analyze_body(
             close_p = _find_matching_forward(body_tokens, i, "(", ")")
             if close_p != -1 and close_p - i <= 6 and body_tokens[close_p - 1].text == "*":
                 inner_texts = [bt.text for bt in body_tokens[i + 1 : close_p - 1]]
-                if inner_texts and all(
-                    (it in TYPE_MODIFIERS_AND_PRIMITIVES or _is_ident(it))
-                    for it in inner_texts
-                ):
+                if inner_texts and all((it in TYPE_MODIFIERS_AND_PRIMITIVES or _is_ident(it)) for it in inner_texts):
                     prev_text = body_tokens[i - 1].text if i > 0 else ";"
                     if not _is_ident(prev_text) and prev_text not in ("sizeof", "_Alignof", "typeof"):
                         if "void" not in inner_texts:
@@ -488,7 +597,11 @@ def analyze_body(
                             call_inner = [bt.text for bt in body_tokens[i + 1 : close_call]]
                             if "," in call_inner:
                                 first_comma = call_inner.index(",")
-                                if first_comma + 2 < len(call_inner) and call_inner[first_comma + 1] in ("0", "0u", "0U") and call_inner[first_comma + 2] == ",":
+                                if (
+                                    first_comma + 2 < len(call_inner)
+                                    and call_inner[first_comma + 1] in ("0", "0u", "0U")
+                                    and call_inner[first_comma + 2] == ","
+                                ):
                                     has_zeroization = True
                     if prev in FORMAT_OR_WRITE_CALLEES:
                         uses_format_or_write = True
@@ -496,17 +609,14 @@ def analyze_body(
                 # Check for dereferenced function pointer call `(*fp)(...)`
                 open_deref = _find_matching_backward(body_tokens, i - 1, "(", ")")
                 if open_deref != -1 and open_deref + 2 < i - 1 and body_tokens[open_deref + 1].text == "*":
-                    deref_expr = "".join(bt.text for bt in body_tokens[open_deref : i])
+                    deref_expr = "".join(bt.text for bt in body_tokens[open_deref:i])
                     if deref_expr not in indirect_calls:
                         indirect_calls.append(deref_expr)
 
-    has_backward_goto = any(
-        lbl in defined_labels and defined_labels[lbl] < goto_idx
-        for lbl, goto_idx, _ in goto_sites
-    )
+    has_backward_goto = any(lbl in defined_labels and defined_labels[lbl] < goto_idx for lbl, goto_idx, _ in goto_sites)
     has_dynamic_alloc = bool(direct_callees & DYNAMIC_ALLOC_CALLEES)
 
-    wp_blockers: List[str] = []
+    wp_blockers: list[str] = []
     if has_backward_goto:
         wp_blockers.append("irreducible_goto")
     if has_dynamic_alloc:
@@ -516,7 +626,7 @@ def analyze_body(
     if has_volatile_or_asm:
         wp_blockers.append("volatile_or_asm")
 
-    wp_notes: List[str] = []
+    wp_notes: list[str] = []
     if indirect_calls:
         wp_notes.append(f"indirect call(s) {indirect_calls} require '//@ calls <targets>;'")
     if self_recursive:
@@ -559,60 +669,70 @@ def infer_security_properties(
     body_info: dict,
     is_recursive: bool,
     threat_model_text: str,
-) -> List[dict]:
+) -> list[dict]:
     """
     Infer candidate Security Layers (Layers 2-6) from structural C properties
     and explicit THREAT_MODEL.md references (without hardcoded domain keyword lists).
     """
-    props: List[dict] = []
+    props: list[dict] = []
 
     # Layer 2: Loop or recursion termination (Anti-DoS)
     if body_info["has_loops"]:
-        props.append({
-            "layer": 2,
-            "category": "Termination / Anti-DoS",
-            "template": "loop variant",
-            "reason": f"Function contains {body_info['loop_count']} loop(s) requiring strict decreasing loop variant proofs.",
-        })
+        props.append(
+            {
+                "layer": 2,
+                "category": "Termination / Anti-DoS",
+                "template": "loop variant",
+                "reason": f"Function contains {body_info['loop_count']} loop(s) requiring strict decreasing loop variant proofs.",
+            }
+        )
     elif is_recursive:
-        props.append({
-            "layer": 2,
-            "category": "Termination / Anti-DoS",
-            "template": "decreases",
-            "reason": "Recursive function requires a strict decreasing measure.",
-        })
+        props.append(
+            {
+                "layer": 2,
+                "category": "Termination / Anti-DoS",
+                "template": "decreases",
+                "reason": "Recursive function requires a strict decreasing measure.",
+            }
+        )
 
     # Layer 5: Structured Output Buffer Formatting / Serialization
     if sig_info["writes_bounded_buffer"] and body_info["uses_format_or_write"]:
-        props.append({
-            "layer": 5,
-            "category": "Output Grammar & Sanitization (Anti-Injection)",
-            "template": "templates/acsl/layer5_output_sanitization.acsl",
-            "reason": f"Function '{fn_name}' formats or serializes data into a bounded mutable output buffer.",
-        })
+        props.append(
+            {
+                "layer": 5,
+                "category": "Output Grammar & Sanitization (Anti-Injection)",
+                "template": "templates/acsl/layer5_output_sanitization.acsl",
+                "reason": f"Function '{fn_name}' formats or serializes data into a bounded mutable output buffer.",
+            }
+        )
 
     # Layer 6: Memory / Secret Zeroization
     if body_info["has_zeroization"]:
-        props.append({
-            "layer": 6,
-            "category": "Secret Zeroization & Non-Interference (Taint)",
-            "template": "templates/acsl/layer6_zeroization_and_taint.acsl",
-            "reason": f"Function '{fn_name}' performs explicit memory zeroization.",
-        })
+        props.append(
+            {
+                "layer": 6,
+                "category": "Secret Zeroization & Non-Interference (Taint)",
+                "template": "templates/acsl/layer6_zeroization_and_taint.acsl",
+                "reason": f"Function '{fn_name}' performs explicit memory zeroization.",
+            }
+        )
 
     # Explicit Threat Model citation
     if threat_model_text and re.search(rf"\b{re.escape(fn_name)}\b", threat_model_text):
-        props.append({
-            "layer": 4,
-            "category": "Threat-Model Cited Entry/Boundary Function",
-            "template": "THREAT_MODEL.md",
-            "reason": f"Function '{fn_name}' is explicitly referenced in THREAT_MODEL.md.",
-        })
+        props.append(
+            {
+                "layer": 4,
+                "category": "Threat-Model Cited Entry/Boundary Function",
+                "template": "THREAT_MODEL.md",
+                "reason": f"Function '{fn_name}' is explicitly referenced in THREAT_MODEL.md.",
+            }
+        )
 
     return props
 
 
-def classify_module_tier(module_name: str, fn_records: List[dict]) -> dict:
+def classify_module_tier(module_name: str, fn_records: list[dict]) -> dict:
     """
     Classify a module into Risk Tiers 1A, 1B, 2, or 3 using purely structural
     metrics across its functions (no project-specific keyword hints).
@@ -628,15 +748,16 @@ def classify_module_tier(module_name: str, fn_records: List[dict]) -> dict:
 
     total = len(fn_records)
     heap_or_rec = sum(
-        1 for f in fn_records
-        if f.get("has_dynamic_alloc") or (f.get("is_recursive") and f.get("const_ptr_params", 0) + f.get("mutable_ptr_params", 0) > 0)
+        1
+        for f in fn_records
+        if f.get("has_dynamic_alloc")
+        or (f.get("is_recursive") and f.get("const_ptr_params", 0) + f.get("mutable_ptr_params", 0) > 0)
     )
     bounded_readers = sum(1 for f in fn_records if f.get("takes_bounded_buffer"))
     bounded_writers = sum(1 for f in fn_records if f.get("writes_bounded_buffer") and f.get("uses_format_or_write"))
     provable_count = sum(1 for f in fn_records if f.get("verifiability") != "shell_unverifiable_wp")
     has_any_ptr_or_loop = any(
-        f.get("has_loops") or f.get("const_ptr_params", 0) > 0 or f.get("mutable_ptr_params", 0) > 0
-        for f in fn_records
+        f.get("has_loops") or f.get("const_ptr_params", 0) > 0 or f.get("mutable_ptr_params", 0) > 0 for f in fn_records
     )
 
     # Tier 2: Dynamic heap allocation or recursive pointer-linked structures
@@ -680,9 +801,9 @@ def classify_module_tier(module_name: str, fn_records: List[dict]) -> dict:
 
 
 def compute_topological_waves(
-    functions: Dict[str, dict],
-    call_edges: Dict[str, Set[str]],
-) -> Tuple[List[List[str]], List[List[str]]]:
+    functions: dict[str, dict],
+    call_edges: dict[str, set[str]],
+) -> tuple[list[list[str]], list[list[str]]]:
     """
     Compute exact Strongly Connected Components (Tarjan's algorithm) and
     bottom-up Topological Waves:
@@ -691,18 +812,17 @@ def compute_topological_waves(
     """
     all_fns = sorted(functions.keys())
     all_fn_set = set(all_fns)
-    internal_callees: Dict[str, Set[str]] = {
-        fn: {c for c in call_edges.get(fn, set()) if c in all_fn_set and c != fn}
-        for fn in all_fns
+    internal_callees: dict[str, set[str]] = {
+        fn: {c for c in call_edges.get(fn, set()) if c in all_fn_set and c != fn} for fn in all_fns
     }
 
     # 1. Tarjan's SCC algorithm to detect mutual and self recursion accurately
     index = 0
-    indices: Dict[str, int] = {}
-    lowlink: Dict[str, int] = {}
-    stack: List[str] = []
-    on_stack: Set[str] = set()
-    sccs: List[List[str]] = []
+    indices: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    sccs: list[list[str]] = []
 
     def strongconnect(node: str) -> None:
         nonlocal index
@@ -720,7 +840,7 @@ def compute_topological_waves(
                 lowlink[node] = min(lowlink[node], indices[succ])
 
         if lowlink[node] == indices[node]:
-            scc: List[str] = []
+            scc: list[str] = []
             while True:
                 w = stack.pop()
                 on_stack.remove(w)
@@ -733,7 +853,7 @@ def compute_topological_waves(
         if fn not in indices:
             strongconnect(fn)
 
-    cycles: List[List[str]] = []
+    cycles: list[list[str]] = []
     for scc in sccs:
         if len(scc) > 1:
             cycles.append(scc)
@@ -742,13 +862,10 @@ def compute_topological_waves(
 
     # 2. Bottom-up wave scheduling
     remaining = set(all_fns)
-    waves: List[List[str]] = []
+    waves: list[list[str]] = []
 
     while remaining:
-        current_wave = sorted(
-            fn for fn in remaining
-            if len(internal_callees[fn] & remaining) == 0
-        )
+        current_wave = sorted(fn for fn in remaining if len(internal_callees[fn] & remaining) == 0)
         if current_wave:
             waves.append(current_wave)
             remaining -= set(current_wave)
@@ -784,9 +901,9 @@ _INCLUDE_DIRECTIVE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MUL
 _SYSTEM_INCLUDE_PREFIXES = ("-I/usr/include", "-I/usr/local/include", "-I/lib/", "-isystem/usr/")
 
 
-def _filter_host_system_flags(flags: List[str]) -> List[str]:
+def _filter_host_system_flags(flags: list[str]) -> list[str]:
     """Strip host system include directories (-I/usr/include*) so Frama-C keeps __fc_libc."""
-    out: List[str] = []
+    out: list[str] = []
     for fl in flags:
         norm = fl.replace("\\", "/")
         if any(norm.startswith(p) for p in _SYSTEM_INCLUDE_PREFIXES):
@@ -796,7 +913,7 @@ def _filter_host_system_flags(flags: List[str]) -> List[str]:
     return out
 
 
-def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str, List[str]]:
+def discover_in_tree_cppflags(target_dir: Path, c_files: list[Path]) -> dict[str, list[str]]:
     """
     Build-free include path and define discovery across `target_dir`:
     1. Indexes all in-tree `.h` files by basename and relative path suffix.
@@ -805,14 +922,13 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str
        to concrete `-I<dir>` flags without requiring a build or touching `/target`.
     """
     target_dir = target_dir.resolve()
-    headers_by_name: Dict[str, List[Path]] = defaultdict(list)
-    all_headers: List[Path] = []
-    makefile_defines: List[str] = []
+    headers_by_name: dict[str, list[Path]] = defaultdict(list)
+    all_headers: list[Path] = []
+    makefile_defines: list[str] = []
 
     for root, dirs, files in os.walk(target_dir):
         dirs[:] = [
-            d for d in dirs
-            if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
+            d for d in dirs if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
         ]
         root_path = Path(root).resolve()
         for f in sorted(files):
@@ -829,12 +945,12 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str
                 except OSError:
                     pass
 
-    def _resolve_include(inc: str) -> List[Tuple[Path, Path]]:
+    def _resolve_include(inc: str) -> list[tuple[Path, Path]]:
         """Return list of (include_root_dir, resolved_header_file) for `#include inc`."""
         inc_norm = inc.replace("\\", "/").strip("/")
         inc_parts = Path(inc_norm).parts
         leaf = inc_parts[-1] if inc_parts else inc_norm
-        matches: List[Tuple[Path, Path]] = []
+        matches: list[tuple[Path, Path]] = []
         for h_file in headers_by_name.get(leaf, []):
             try:
                 rel_h = h_file.relative_to(target_dir)
@@ -842,23 +958,23 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str
                 continue
             if len(inc_parts) == 1:
                 matches.append((h_file.parent, h_file))
-            elif len(rel_h.parts) >= len(inc_parts) and rel_h.parts[-len(inc_parts):] == inc_parts:
+            elif len(rel_h.parts) >= len(inc_parts) and rel_h.parts[-len(inc_parts) :] == inc_parts:
                 inc_root = h_file
                 for _ in range(len(inc_parts)):
                     inc_root = inc_root.parent
                 matches.append((inc_root, h_file))
         return matches
 
-    result: Dict[str, List[str]] = {}
+    result: dict[str, list[str]] = {}
     for c_file in c_files:
         try:
             rel_key = c_file.resolve().relative_to(target_dir).as_posix()
         except ValueError:
             rel_key = c_file.name
 
-        include_dirs: List[Path] = [c_file.resolve().parent]
-        seen_headers: Set[Path] = set()
-        queue: List[Path] = [c_file.resolve()]
+        include_dirs: list[Path] = [c_file.resolve().parent]
+        seen_headers: set[Path] = set()
+        queue: list[Path] = [c_file.resolve()]
 
         while queue:
             curr = queue.pop(0)
@@ -874,7 +990,7 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str
                         seen_headers.add(h_file)
                         queue.append(h_file)
 
-        flags: List[str] = []
+        flags: list[str] = []
         for d in include_dirs:
             try:
                 rel_d = d.relative_to(target_dir).as_posix()
@@ -893,8 +1009,8 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: List[Path]) -> Dict[str
 
 def synthesize_compile_commands(
     target_dir: Path,
-    c_files: List[Path],
-    flags_by_file: Dict[str, List[str]],
+    c_files: list[Path],
+    flags_by_file: dict[str, list[str]],
     out_path: Path,
 ) -> Path:
     """Write a build-free `compile_commands.json` inside the run workspace (never inside `/target`)."""
@@ -912,11 +1028,13 @@ def synthesize_compile_commands(
         flags = flags_by_file.get(rel_key, [])
         flag_str = " ".join(flags)
         cmd = f"clang -c {flag_str} {c_res.as_posix()}".strip()
-        entries.append({
-            "directory": target_resolved.as_posix(),
-            "file": c_res.as_posix(),
-            "command": re.sub(r"\s+", " ", cmd),
-        })
+        entries.append(
+            {
+                "directory": target_resolved.as_posix(),
+                "file": c_res.as_posix(),
+                "command": re.sub(r"\s+", " ", cmd),
+            }
+        )
     out_resolved.parent.mkdir(parents=True, exist_ok=True)
     out_resolved.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
     return out_resolved
@@ -924,19 +1042,17 @@ def synthesize_compile_commands(
 
 def build_dag(
     target_dir: Path,
-    compile_commands_path: Optional[Path] = None,
-    emit_compile_commands: Optional[Path] = None,
+    compile_commands_path: Path | None = None,
+    emit_compile_commands: Path | None = None,
 ) -> dict:
     target_dir = target_dir.resolve()
     threat_model_path = target_dir / "THREAT_MODEL.md"
     threat_model_text = (
-        threat_model_path.read_text(encoding="utf-8", errors="replace")
-        if threat_model_path.exists()
-        else ""
+        threat_model_path.read_text(encoding="utf-8", errors="replace") if threat_model_path.exists() else ""
     )
 
-    c_files: List[Path] = []
-    compile_flags_by_file: Dict[str, List[str]] = {}
+    c_files: list[Path] = []
+    compile_flags_by_file: dict[str, list[str]] = {}
 
     if compile_commands_path and compile_commands_path.exists():
         entries = json.loads(compile_commands_path.read_text(encoding="utf-8"))
@@ -958,7 +1074,8 @@ def build_dag(
     if not c_files:
         for root, dirs, files in os.walk(target_dir):
             dirs[:] = [
-                d for d in dirs
+                d
+                for d in dirs
                 if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
             ]
             for f in sorted(files):
@@ -974,10 +1091,10 @@ def build_dag(
     if emit_compile_commands is not None:
         synthesize_compile_commands(target_dir, c_files, compile_flags_by_file, emit_compile_commands)
 
-    functions: Dict[str, dict] = {}
-    name_collisions: List[dict] = []
-    call_edges: Dict[str, Set[str]] = defaultdict(set)
-    modules: Dict[str, dict] = defaultdict(lambda: {"files": [], "functions": []})
+    functions: dict[str, dict] = {}
+    name_collisions: list[dict] = []
+    call_edges: dict[str, set[str]] = defaultdict(set)
+    modules: dict[str, dict] = defaultdict(lambda: {"files": [], "functions": []})
 
     for c_file in sorted(set(c_files)):
         try:
@@ -1053,7 +1170,10 @@ def build_dag(
             fn_rec = functions[fn]
             fn_rec["wave"] = wave_idx
             fn_rec["is_recursive"] = fn in recursive_fns
-            if fn_rec["is_recursive"] and "recursive function requires 'decreases <measure>;'" not in fn_rec["wp_notes"]:
+            if (
+                fn_rec["is_recursive"]
+                and "recursive function requires 'decreases <measure>;'" not in fn_rec["wp_notes"]
+            ):
                 fn_rec["wp_notes"].append("recursive function requires 'decreases <measure>;'")
             fn_rec["internal_callees"] = sorted(call_edges[fn] & all_fns)
             fn_rec["external_callees"] = sorted(call_edges[fn] - all_fns)
@@ -1066,11 +1186,9 @@ def build_dag(
             )
 
     for fn in all_fns:
-        functions[fn]["internal_callers"] = sorted(
-            caller for caller in all_fns if fn in call_edges[caller]
-        )
+        functions[fn]["internal_callers"] = sorted(caller for caller in all_fns if fn in call_edges[caller])
 
-    module_summaries: Dict[str, dict] = {}
+    module_summaries: dict[str, dict] = {}
     for mod_name, mod_data in sorted(modules.items()):
         mod_fns = mod_data["functions"]
         mod_fn_records = [functions[f] for f in mod_fns if f in functions]
@@ -1079,29 +1197,23 @@ def build_dag(
         # Candidate entry points: non-static functions with 0 internal callers in this module,
         # falling back to any function with 0 internal callers in this module.
         non_static_roots = [
-            f for f in mod_fns
+            f
+            for f in mod_fns
             if f in functions
             and not functions[f].get("is_static", False)
             and not (set(functions[f]["internal_callers"]) & mod_fn_set)
         ]
-        all_roots = [
-            f for f in mod_fns
-            if f in functions and not (set(functions[f]["internal_callers"]) & mod_fn_set)
-        ]
+        all_roots = [f for f in mod_fns if f in functions and not (set(functions[f]["internal_callers"]) & mod_fn_set)]
         entry_points = non_static_roots or all_roots or mod_fns[:1]
         provable_fns = [
-            f for f in mod_fns
-            if f in functions and functions[f]["verifiability"] != "shell_unverifiable_wp"
+            f for f in mod_fns if f in functions and functions[f]["verifiability"] != "shell_unverifiable_wp"
         ]
-        shell_fns = [
-            f for f in mod_fns
-            if f in functions and functions[f]["verifiability"] == "shell_unverifiable_wp"
-        ]
+        shell_fns = [f for f in mod_fns if f in functions and functions[f]["verifiability"] == "shell_unverifiable_wp"]
 
         # Compute transitive in-repo callee closure so slices link real sibling sources instead of fake stubs
         mod_files_set = set(mod_data["files"])
-        closure_fns: Set[str] = set(mod_fns)
-        worklist: List[str] = list(mod_fns)
+        closure_fns: set[str] = set(mod_fns)
+        worklist: list[str] = list(mod_fns)
         while worklist:
             cur_fn = worklist.pop(0)
             for callee in functions.get(cur_fn, {}).get("internal_callees", []):
@@ -1110,19 +1222,15 @@ def build_dag(
                     worklist.append(callee)
 
         cross_module_callees = sorted(
-            f for f in (closure_fns - mod_fn_set)
-            if f in functions and functions[f]["file"] not in mod_files_set
+            f for f in (closure_fns - mod_fn_set) if f in functions and functions[f]["file"] not in mod_files_set
         )
         required_sources = sorted(
             mod_files_set | {functions[f]["file"] for f in cross_module_callees if f in functions}
         )
-        unresolved_external_callees = sorted({
-            ext
-            for f in mod_fns
-            if f in functions
-            for ext in functions[f].get("external_callees", [])
-        })
-        module_cppflags: List[str] = []
+        unresolved_external_callees = sorted(
+            {ext for f in mod_fns if f in functions for ext in functions[f].get("external_callees", [])}
+        )
+        module_cppflags: list[str] = []
         for src_rel in required_sources:
             for fl in compile_flags_by_file.get(src_rel, []):
                 if fl not in module_cppflags:
@@ -1151,10 +1259,7 @@ def build_dag(
         "total_waves": len(waves),
         "name_collisions": name_collisions,
         "modules": module_summaries,
-        "waves": [
-            {"wave": idx, "count": len(w), "functions": w}
-            for idx, w in enumerate(waves)
-        ],
+        "waves": [{"wave": idx, "count": len(w), "functions": w} for idx, w in enumerate(waves)],
         "recursion_cycles": cycles,
         "functions": functions,
     }

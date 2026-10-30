@@ -28,6 +28,7 @@ def _cp(cmd, rc=0, out="", err=""):
 # WS1.2 passthrough normalizer
 # ---------------------------------------------------------------------------
 
+
 def test_normalizer_rewrites_g_and_joins_short_options():
     assert T.normalize_passthrough("-fsanitize=fuzzer -g -O1") == "-fsanitize=fuzzer -gline-tables-only -O1"
     assert T.normalize_passthrough("-I dir -D FOO=1 -l bsd -L /opt/lib") == "-Idir -DFOO=1 -lbsd -L/opt/lib"
@@ -44,11 +45,14 @@ def test_normalizer_rejects_unsafe_tokens(value):
 # WS1.1 frontend / backend split
 # ---------------------------------------------------------------------------
 
+
 def test_flag_sets_keep_preprocessor_flags_on_frontend_only(tmp_path):
     stubs = tmp_path / "fc_stubs"
     stubs.mkdir()
     flags = T.build_eacsl_flag_sets(
-        "-Isrc -include workspace/stubs/net.h -DFOO -std=gnu99 -fcommon", fuzzer=True, fc_stubs=stubs,
+        "-Isrc -include workspace/stubs/net.h -DFOO -std=gnu99 -fcommon",
+        fuzzer=True,
+        fc_stubs=stubs,
     )
     front, back = flags["frontend"].split(), flags["backend"].split()
     assert front[:2] == ["-D__FRAMAC_EACSL__", "-D_Float128=double"]
@@ -70,11 +74,17 @@ def test_flag_sets_reject_paths_with_spaces(tmp_path):
 # WS1 two-stage compile, binary selection and instrumentation invariant
 # ---------------------------------------------------------------------------
 
+
 class FakeEacslGcc:
     """Simulates e-acsl-gcc stages and records the calls."""
 
-    def __init__(self, instrumented_text="int f(void) { return 0; }\n", instrumented=True,
-                 stage1_failures=None, stage2_failures=None):
+    def __init__(
+        self,
+        instrumented_text="int f(void) { return 0; }\n",
+        instrumented=True,
+        stage1_failures=None,
+        stage2_failures=None,
+    ):
         self.calls: list[list[str]] = []
         self.instrumented_text = instrumented_text
         self.instrumented = instrumented
@@ -113,8 +123,13 @@ def _src(tmp_path):
 
 def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path, modern_cli):
     fake = FakeEacslGcc()
-    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "out" / "fuzz_mod",
-                                 cppflags="-Isrc -include stub.h", ldflags_extra="-lbsd", runner=fake)
+    res = R.compile_eacsl_binary(
+        [str(_src(tmp_path))],
+        tmp_path / "out" / "fuzz_mod",
+        cppflags="-Isrc -include stub.h",
+        ldflags_extra="-lbsd",
+        runner=fake,
+    )
     assert res["returncode"] == 0, res
     stage1, stage2 = fake.calls
     assert "-E" in stage1 and "-e" not in stage1 and "-C" not in stage1
@@ -192,16 +207,26 @@ def test_contract_wrappers_mark_their_result_initialized():
     i = lines.index("                      len);")
     assert lines[i + 1] == "  " + T.WRAPPER_RESULT_INIT  # right after the multi-line call, before any check
     assert patched.count(T.WRAPPER_RESULT_INIT) == 1  # not in the prototype, the user function or a void wrapper
+    # Idempotent when run a second time or when upstream Frama-C already emits __e_acsl_initialize.
+    assert T.mark_wrapper_results_initialized(patched) == (patched, 0)
+    upstream_fixed = WRAPPER_C.replace(
+        "                      len);\n",
+        "                      len);\n  __e_acsl_initialize((void *)(& __retres),sizeof(int));\n",
+    )
+    assert T.mark_wrapper_results_initialized(upstream_fixed) == (upstream_fixed, 0)
     assert T.mark_wrapper_results_initialized("int f(void)\n{\n  int __retres;\n  __retres = 1;\n}\n") == (
-        "int f(void)\n{\n  int __retres;\n  __retres = 1;\n}\n", 0)
+        "int f(void)\n{\n  int __retres;\n  __retres = 1;\n}\n",
+        0,
+    )
 
 
 def test_the_build_patches_wrappers_only_when_uninitialized_reads_are_checked(tmp_path, modern_cli):
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=FakeEacslGcc(WRAPPER_C))
     assert res["returncode"] == 0 and res["wrapper_result_inits"] == 1
     assert T.WRAPPER_RESULT_INIT in (tmp_path / "fuzz_mod.instrumented.c").read_text(encoding="utf-8")
-    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "plain_mod", rte_initialized=False,
-                                 runner=FakeEacslGcc(WRAPPER_C))
+    res = R.compile_eacsl_binary(
+        [str(_src(tmp_path))], tmp_path / "plain_mod", rte_initialized=False, runner=FakeEacslGcc(WRAPPER_C)
+    )
     assert "wrapper_result_inits" not in res
     assert T.WRAPPER_RESULT_INIT not in (tmp_path / "plain_mod.instrumented.c").read_text(encoding="utf-8")
 
@@ -219,8 +244,12 @@ def test_campaign_cli_threads_no_rte_initialized(tmp_path, monkeypatch):
 
     def fake_compile(*a, **k):
         seen.update(k)
-        return {"engine": "eacsl", "returncode": 0, "binary": str(tmp_path / "fuzz_mod.e-acsl"),
-                "reduced_checks": ["-no-rte-initialized"]}
+        return {
+            "engine": "eacsl",
+            "returncode": 0,
+            "binary": str(tmp_path / "fuzz_mod.e-acsl"),
+            "reduced_checks": ["-no-rte-initialized"],
+        }
 
     monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
     monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
@@ -252,7 +281,9 @@ def test_unsafe_cppflags_never_reach_eacsl_gcc(tmp_path, modern_cli):
 
 def test_rte_select_retry_drops_unknown_functions(tmp_path, modern_cli):
     fake = FakeEacslGcc(stage1_failures=["[kernel] User Error: no function 'ghost'\n"])
-    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", functions=["entry", "ghost"], runner=fake)
+    res = R.compile_eacsl_binary(
+        [str(_src(tmp_path))], tmp_path / "fuzz_mod", functions=["entry", "ghost"], runner=fake
+    )
     assert res["returncode"] == 0
     assert res["rte_select_dropped"] == ["ghost"]
     retry_flags = fake.calls[1][fake.calls[1].index("-F") + 1]
@@ -266,15 +297,19 @@ def test_variadic_fallbacks_are_linked_from_a_separate_object(tmp_path, modern_c
         "int f(char const *p) { int __retres; __retres = open_fallback_1(p, 0, 0); return __retres; }\n"
         "int g(char const *p) { return open_fallback_1(p, 0, 0); }\n"
     )
-    fake = FakeEacslGcc(instrumented_text=instrumented,
-                        stage2_failures=["/usr/bin/ld: x.o: undefined reference to `open_fallback_1'\n"])
+    fake = FakeEacslGcc(
+        instrumented_text=instrumented, stage2_failures=["/usr/bin/ld: x.o: undefined reference to `open_fallback_1'\n"]
+    )
     out_bin = tmp_path / "fuzz_mod"
     res = R.compile_eacsl_binary([str(_src(tmp_path))], out_bin, runner=fake)
     assert res["returncode"] == 0, res
     assert res["variadic_fallbacks"] == [{"name": "open_fallback_1", "base": "open", "mode": "forward"}]
     gen = (tmp_path / "fuzz_mod_fallbacks" / "eacsl_fallbacks.c").read_text(encoding="utf-8")
     assert "#include <fcntl.h>" in gen
-    assert "int open_fallback_1(char const *filename, int flags, mode_t mode) { return open(filename, flags, mode); }" in gen
+    assert (
+        "int open_fallback_1(char const *filename, int flags, mode_t mode) { return open(filename, flags, mode); }"
+        in gen
+    )
     final_stage2 = fake.calls[-1]
     assert final_stage2[final_stage2.index("-l") + 1].endswith("eacsl_fallbacks.o")
     # The instrumented source is never modified (fallback numbering stays stable).
@@ -294,12 +329,13 @@ def test_legacy_cli_also_normalizes(tmp_path, monkeypatch):
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=runner)
     assert res["returncode"] == 0
     cflag = next(a for a in calls[0] if a.startswith("--cflag="))
-    assert " -g " not in f" {cflag[len('--cflag='):]} "
+    assert " -g " not in f" {cflag[len('--cflag=') :]} "
 
 
 # ---------------------------------------------------------------------------
 # WS2 fallback generation units
 # ---------------------------------------------------------------------------
+
 
 def test_fallback_generation_modes():
     fbs = T.find_variadic_fallbacks(
@@ -320,13 +356,16 @@ def test_fallback_generation_modes():
 
 
 def test_link_and_frama_c_log_parsers():
-    assert T.parse_undefined_fallbacks("undefined reference to `open_fallback_1'\nundefined reference to 'open_fallback_1'") == ["open_fallback_1"]
+    assert T.parse_undefined_fallbacks(
+        "undefined reference to `open_fallback_1'\nundefined reference to 'open_fallback_1'"
+    ) == ["open_fallback_1"]
     assert T.parse_missing_functions("no function 'a'\nfunction 'b' not found") == ["a", "b"]
 
 
 # ---------------------------------------------------------------------------
 # WS5 preprocessed function discovery
 # ---------------------------------------------------------------------------
+
 
 def test_discovery_uses_preprocessed_source(tmp_path, monkeypatch):
     src = tmp_path / "mod.c"
@@ -356,10 +395,11 @@ SEGMENT_LOG = (
 
 def test_segment_model_message_is_parsed_and_runtime_frames_skipped():
     f = R.parse_eacsl_failure(SEGMENT_LOG)
+    assert f is not None
     assert f["function"] == "UpdateSyncMem" and f["line"] == 292 and f["kind"] == "eacsl_runtime_error"
     assert not R.needs_attribution(f)
     bare = R.parse_eacsl_failure("Use of invalid address 0x7ffd1234 in unsafe_initialize\n")
-    assert bare["function"] == "unknown_function" and R.needs_attribution(bare)
+    assert bare is not None and bare["function"] == "unknown_function" and R.needs_attribution(bare)
     assert R.needs_attribution(None)
 
 
@@ -408,18 +448,33 @@ def test_guardrail_refuses_uninstrumented_binary(tmp_path):
 # main(): binary threading, fallback reason, selftest gating
 # ---------------------------------------------------------------------------
 
+
 def _campaign_argv(tmp_path, *extra):
     return [
-        "run_eacsl_fuzz.py", "campaign", "--sources", "mod.c", "--out-bin", str(tmp_path / "fuzz_mod"),
-        "--corpus-dir", str(tmp_path / "corpus"), "--artifacts-dir", str(tmp_path / "artifacts"),
-        "--out-json", str(tmp_path / "out.json"), "--selftest-json", str(tmp_path / "selftest.json"), *extra,
+        "run_eacsl_fuzz.py",
+        "campaign",
+        "--sources",
+        "mod.c",
+        "--out-bin",
+        str(tmp_path / "fuzz_mod"),
+        "--corpus-dir",
+        str(tmp_path / "corpus"),
+        "--artifacts-dir",
+        str(tmp_path / "artifacts"),
+        "--out-json",
+        str(tmp_path / "out.json"),
+        "--selftest-json",
+        str(tmp_path / "selftest.json"),
+        *extra,
     ]
 
 
 def test_main_fuzzes_the_instrumented_binary(tmp_path, monkeypatch):
     seen = {}
     instrumented = tmp_path / "fuzz_mod.e-acsl"
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(instrumented)})
+    monkeypatch.setattr(
+        R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(instrumented)}
+    )
 
     def fake_campaign(binary, *a, **k):
         seen["binary"] = binary
@@ -435,9 +490,21 @@ def test_main_fuzzes_the_instrumented_binary(tmp_path, monkeypatch):
 
 
 def test_main_records_engine_fallback_reason(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "eacsl_binary_not_instrumented"})
-    monkeypatch.setattr(R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": str(tmp_path / "fuzz_mod")})
-    monkeypatch.setattr(R, "run_fuzz_campaign", lambda binary, *a, **k: {"status": "clean", "artifacts": [], "builder": k.get("attribution_builder")})
+    monkeypatch.setattr(
+        R,
+        "compile_eacsl_binary",
+        lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "eacsl_binary_not_instrumented"},
+    )
+    monkeypatch.setattr(
+        R,
+        "compile_sanitizer_binary",
+        lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": str(tmp_path / "fuzz_mod")},
+    )
+    monkeypatch.setattr(
+        R,
+        "run_fuzz_campaign",
+        lambda binary, *a, **k: {"status": "clean", "artifacts": [], "builder": k.get("attribution_builder")},
+    )
     monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path))
     R.main()
     out = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
@@ -448,9 +515,16 @@ def test_main_records_engine_fallback_reason(tmp_path, monkeypatch):
 
 def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
     st = tmp_path / "selftest.json"
-    st.write_text(json.dumps({"ok": False, "frama_c_version": "33.0 (Arsenic)",
-                              "checks": {"compiled": True, "instrumented_binary": False, "attributes_line": False}}),
-                  encoding="utf-8")
+    st.write_text(
+        json.dumps(
+            {
+                "ok": False,
+                "frama_c_version": "33.0 (Arsenic)",
+                "checks": {"compiled": True, "instrumented_binary": False, "attributes_line": False},
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0 (Arsenic)")
     assert R.selftest_blocks_eacsl(st) == "eacsl_selftest_failed: instrumented_binary"
     monkeypatch.setattr(R, "framac_version", lambda runner=None: "34.0")
@@ -460,7 +534,9 @@ def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0 (Arsenic)")
     called = []
     monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: called.append(1))
-    monkeypatch.setattr(R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": "b"})
+    monkeypatch.setattr(
+        R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": "b"}
+    )
     monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
     monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path))
     R.main()
@@ -471,18 +547,26 @@ def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
 def test_selftest_with_fake_toolchain(tmp_path, modern_cli, monkeypatch):
     monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0")
     canary = R.resolve_canary_source()
-    expected = next(i for i, ln in enumerate(canary.read_text(encoding="utf-8").splitlines(), 1) if "/* CANARY_OOB */" in ln)
-    assert "heap[len] = 0;" in canary.read_text(encoding="utf-8").splitlines()[expected - 1]  # the statement, not the header
+    expected = next(
+        i for i, ln in enumerate(canary.read_text(encoding="utf-8").splitlines(), 1) if "/* CANARY_OOB */" in ln
+    )
+    assert (
+        "heap[len] = 0;" in canary.read_text(encoding="utf-8").splitlines()[expected - 1]
+    )  # the statement, not the header
 
     def fake_replay(binary, artifact, scratch, timeout_s=60):
         data = Path(artifact).read_bytes()
         if data == R.CANARY_BENIGN_INPUT:
             return {"reproduced": False, "failure": None}
         if data == R.CANARY_UNINIT_INPUT:
-            return {"reproduced": True, "failure": {"file": "canary.c", "line": 47, "function": "canary_pick",
-                                                    "alarm_kind": "initialization"}}
-        return {"reproduced": True, "failure": {"file": "canary.c", "line": expected, "function": "canary_process",
-                                                "alarm_kind": "mem_access"}}
+            return {
+                "reproduced": True,
+                "failure": {"file": "canary.c", "line": 47, "function": "canary_pick", "alarm_kind": "initialization"},
+            }
+        return {
+            "reproduced": True,
+            "failure": {"file": "canary.c", "line": expected, "function": "canary_process", "alarm_kind": "mem_access"},
+        }
 
     res = R.run_selftest(tmp_path / "st", runner=FakeEacslGcc(), replay=fake_replay)
     assert res["ok"] and all(res["checks"].values()) and res["warnings"] == []
@@ -513,6 +597,7 @@ def test_selftest_with_fake_toolchain(tmp_path, modern_cli, monkeypatch):
 # WS3 header environment, stubs, canary, undeclared functions
 # ---------------------------------------------------------------------------
 
+
 def _strip_c_comments(text: str) -> str:
     return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
 
@@ -536,8 +621,13 @@ def test_json_stub_completes_opaque_handles_and_declares_from_fd():
 
 def test_fc_stubs_readme_documents_rules():
     text = (REPO / "templates/fc_stubs/README.md").read_text(encoding="utf-8")
-    for needle in ("Never C function bodies", "Opaque handle types must be complete", "belong to the target",
-                   "force-included into the backend compile", "undeclared_functions"):
+    for needle in (
+        "Never C function bodies",
+        "Opaque handle types must be complete",
+        "belong to the target",
+        "force-included into the backend compile",
+        "undeclared_functions",
+    ):
         assert needle in text
 
 
@@ -568,6 +658,7 @@ def test_scan_undeclared_functions_formats():
 # Ledger engine qualification
 # ---------------------------------------------------------------------------
 
+
 def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
     # The two-stage E-ACSL contract lives in run_eacsl_fuzz.py only: the Make phases call it (and
     # every other tool) through the container broker instead of re-implementing the build.
@@ -594,9 +685,26 @@ def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
     fuzz = next(r for r in recipes if "campaign" in r)
     assert "--class fuzz" in fuzz and "--workers auto --fuzz-budget $(FUZZ_BUDGET_$*)" in fuzz
     assert "--selftest-json $(SELFTEST_JSON)" in fuzz and "--cppflags=$(CPPFLAGS_$*)" in fuzz
-    phony = set(re.search(r"^\.PHONY:((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE).group(1).replace("\\", " ").split())
-    assert {"slice-init", "seed", "build", "selftest", "fuzz", "eva", "ingest", "replay", "wp-queue", "wp-sweep",
-            "report", "$(BUILD_TARGETS)", "$(FUZZ_TARGETS)", "$(EVA_TARGETS)", "$(MODULE_TARGETS)"} <= phony
+    m_phony = re.search(r"^\.PHONY:((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE)
+    assert m_phony is not None
+    phony = set(m_phony.group(1).replace("\\", " ").split())
+    assert {
+        "slice-init",
+        "seed",
+        "build",
+        "selftest",
+        "fuzz",
+        "eva",
+        "ingest",
+        "replay",
+        "wp-queue",
+        "wp-sweep",
+        "report",
+        "$(BUILD_TARGETS)",
+        "$(FUZZ_TARGETS)",
+        "$(EVA_TARGETS)",
+        "$(MODULE_TARGETS)",
+    } <= phony
 
 
 def test_ledger_fuzz_engine_note():

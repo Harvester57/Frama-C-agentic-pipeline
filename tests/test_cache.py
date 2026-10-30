@@ -46,6 +46,7 @@ def run(tmp_path, monkeypatch):
 # Enablement
 # ---------------------------------------------------------------------------
 
+
 def test_enabled_only_in_a_run_dir_unless_forced(tmp_path, monkeypatch):
     monkeypatch.delenv("FRAMAC_CACHE", raising=False)
     monkeypatch.chdir(tmp_path)
@@ -63,16 +64,46 @@ def test_enabled_only_in_a_run_dir_unless_forced(tmp_path, monkeypatch):
 # Keys: dependency manifests
 # ---------------------------------------------------------------------------
 
+
 def test_parse_make_deps_handles_continuations_and_escapes():
     text = "a.o: a.c /usr/include/stdio.h \\\n  inc/my\\ hdr.h gen$$.h\nb.o: b.c \\\r\n inc/b.h\n"
     assert cache.parse_make_deps(text) == ["a.c", "/usr/include/stdio.h", "inc/my hdr.h", "gen$.h", "b.c", "inc/b.h"]
 
 
 def test_preprocessor_args_keep_only_what_changes_includes():
-    toks = ["-fsanitize=fuzzer", "-Iinc", "-I", "other", "-DX=1", "-include", "pre.h", "-O1",
-            "-imacros", "m.h", "-isystem", "sys", "-std=gnu99", "-nostdinc", "-Wall", "-UY"]
-    assert cache.preprocessor_args(toks) == ["-Iinc", "-I", "other", "-DX=1", "-include", "pre.h",
-                                             "-imacros", "m.h", "-isystem", "sys", "-std=gnu99", "-nostdinc", "-UY"]
+    toks = [
+        "-fsanitize=fuzzer",
+        "-Iinc",
+        "-I",
+        "other",
+        "-DX=1",
+        "-include",
+        "pre.h",
+        "-O1",
+        "-imacros",
+        "m.h",
+        "-isystem",
+        "sys",
+        "-std=gnu99",
+        "-nostdinc",
+        "-Wall",
+        "-UY",
+    ]
+    assert cache.preprocessor_args(toks) == [
+        "-Iinc",
+        "-I",
+        "other",
+        "-DX=1",
+        "-include",
+        "pre.h",
+        "-imacros",
+        "m.h",
+        "-isystem",
+        "sys",
+        "-std=gnu99",
+        "-nostdinc",
+        "-UY",
+    ]
 
 
 def test_dependency_manifest_unions_gcc_with_framac_defines_and_clang(tmp_path, monkeypatch):
@@ -89,11 +120,12 @@ def test_dependency_manifest_unions_gcc_with_framac_defines_and_clang(tmp_path, 
         return _cp(cmd, 0, "a.o: a.c clang_only.h\n")
 
     deps = cache.dependency_manifest(["a.c"], ["-Iinc", "-fsanitize=fuzzer"], runner=runner)
+    assert deps is not None
     gcc, clang = seen
     assert gcc[:3] == ["gcc", "-M", "-MG"] and "-D__FRAMAC__" in gcc and "-D__FC_MACHDEP_X86_64" in gcc
     assert clang[:3] == ["clang", "-M", "-MG"] and "-D__FRAMAC__" not in clang
     assert "-fsanitize=fuzzer" not in gcc and "-Iinc" in gcc
-    files = dict(deps)
+    files: dict[str, str] = {k: v for k, v in deps}
     assert set(files) == {"a.c", "fc_only.h", "clang_only.h", "generated.h"}
     assert files["generated.h"] == "missing" and len(files["fc_only.h"]) == 64
     # An incomplete manifest would make the key unsound: no manifest at all.
@@ -108,6 +140,7 @@ def test_dependency_manifest_unions_gcc_with_framac_defines_and_clang(tmp_path, 
 # ---------------------------------------------------------------------------
 # Store: publish, restore, single flight, gc
 # ---------------------------------------------------------------------------
+
 
 def _src_files(base: Path, payload: bytes) -> dict[str, Path]:
     base.mkdir(parents=True, exist_ok=True)
@@ -144,6 +177,7 @@ def test_restore_refuses_a_corrupted_entry(tmp_path):
     store = cache.Store(tmp_path / "cache")
     store.put("eacsl-build", KEY_A, _src_files(tmp_path / "out", b"good"), {})
     entry = store.get("eacsl-build", KEY_A)
+    assert entry is not None
     (entry.path / "files" / "binary").write_bytes(b"evil")
     target = tmp_path / "dest" / "prog"
     target.parent.mkdir()
@@ -172,7 +206,8 @@ def test_concurrent_publish_from_threads_leaves_one_entry(tmp_path):
     shard = tmp_path / "cache" / "eacsl-build" / KEY_A[:2]
     assert [p.name for p in shard.iterdir()] == [KEY_A]
     assert not [p for p in (tmp_path / "cache" / "eacsl-build").iterdir() if p.name.startswith(".tmp-")]
-    assert store.get("eacsl-build", KEY_A).data["publisher"] in range(8)
+    got = store.get("eacsl-build", KEY_A)
+    assert got is not None and got.data["publisher"] in range(8)
 
 
 def test_concurrent_publish_from_processes_leaves_one_entry(tmp_path):
@@ -213,10 +248,18 @@ def test_single_flight_builds_each_key_once(run):
     results = []
 
     def worker():
-        results.append(cache.memoize(
-            "eacsl-build", {"kind": "test"}, sources=["x.c"], dep_flags=[], build=build,
-            outputs=lambda r: {"binary": out}, ok=lambda r: r["returncode"] == 0, runner=runner,
-        ))
+        results.append(
+            cache.memoize(
+                "eacsl-build",
+                {"kind": "test"},
+                sources=["x.c"],
+                dep_flags=[],
+                build=build,
+                outputs=lambda r: {"binary": out},
+                ok=lambda r: r["returncode"] == 0,
+                runner=runner,
+            )
+        )
 
     threads = [threading.Thread(target=worker) for _ in range(4)]
     for t in threads:
@@ -240,8 +283,13 @@ def test_a_build_whose_inputs_changed_meanwhile_is_not_published(run):
 
     def memo(build):
         return cache.memoize(
-            "eacsl-build", {"kind": "test"}, sources=["x.c"], dep_flags=[], build=build,
-            outputs=lambda r: {"binary": out}, ok=lambda r: r["returncode"] == 0,
+            "eacsl-build",
+            {"kind": "test"},
+            sources=["x.c"],
+            dep_flags=[],
+            build=build,
+            outputs=lambda r: {"binary": out},
+            ok=lambda r: r["returncode"] == 0,
             runner=lambda cmd, **kw: _cp(cmd, 0, "x.o: x.c\n"),
         )
 
@@ -303,7 +351,9 @@ def test_cli_stats_gc_and_clear(run, capsys):
 def test_shared_store_is_read_after_the_run_store_and_written_only_rw(run, tmp_path, monkeypatch):
     shared_root = tmp_path / "shared"
     shared_root.mkdir()
-    cache.Store(shared_root, scope="shared").put("eva", KEY_A, _src_files(tmp_path / "s", b"shared"), {"from": "shared"})
+    cache.Store(shared_root, scope="shared").put(
+        "eva", KEY_A, _src_files(tmp_path / "s", b"shared"), {"from": "shared"}
+    )
     assert cache.lookup("eva", KEY_A) is None  # FRAMAC_CACHE_MODE unset: the shared store is not used
     monkeypatch.setenv("FRAMAC_SHARED_CACHE_DIR", str(shared_root))
     monkeypatch.setenv("FRAMAC_CACHE_MODE", "ro")
@@ -353,7 +403,9 @@ class FakeToolchain:
             Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x7fELF asan build")
             return _cp(cmd)
         if "-C" in cmd:
-            linking_fallbacks = any(a.endswith("eacsl_fallbacks.o") for a in cmd[cmd.index("-l") + 1].split()) if "-l" in cmd else False
+            linking_fallbacks = (
+                any(a.endswith("eacsl_fallbacks.o") for a in cmd[cmd.index("-l") + 1].split()) if "-l" in cmd else False
+            )
             if self.undefined_fallback and not linking_fallbacks:
                 return _cp(cmd, 1, "", "/usr/bin/ld: x.o: undefined reference to `open_fallback_1'\n")
             out = Path(cmd[cmd.index("-O") + 1])
@@ -428,7 +480,7 @@ def test_eacsl_hit_restores_every_output(run, modern_cli):
         if p.name.endswith(".compile.log"):
             restored = p.read_bytes()
             assert restored.startswith(data)  # the original log, then a note naming the entry
-            assert f"eacsl-build/{hit['cache']['key']}".encode() in restored[len(data):]
+            assert f"eacsl-build/{hit['cache']['key']}".encode() in restored[len(data) :]
         else:
             assert p.read_bytes() == data, p
     assert T.is_eacsl_instrumented(Path(hit["binary"]))
@@ -459,8 +511,11 @@ def test_agent_scratch_and_selftest_builds_are_never_cached(run, modern_cli, mon
     assert not any("-M" in c for c in fake.calls)
 
     monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0")
-    selftest = R.run_selftest(Path("workspace/eacsl_selftest"), runner=FakeToolchain(),
-                              replay=lambda *a, **k: {"reproduced": False, "failure": None})
+    selftest = R.run_selftest(
+        Path("workspace/eacsl_selftest"),
+        runner=FakeToolchain(),
+        replay=lambda *a, **k: {"reproduced": False, "failure": None},
+    )
     assert selftest["checks"]["compiled"]
     assert not (run / "state" / "cache" / "eacsl-build").exists()
 
@@ -519,6 +574,7 @@ def _fake_frama_c(calls: list, status: int = 0):
             Path(cmd[cmd.index("-eva-report-red-statuses") + 1]).write_text("red\n", encoding="utf-8")
             Path(cmd[cmd.index("-save") + 1]).write_bytes(b"sav")
         return _cp(cmd, status, "[eva] analysis done\n", "")
+
     return fake_run
 
 
@@ -555,3 +611,255 @@ def test_eva_failures_are_never_cached(run, monkeypatch):
         res = run_eva_slice.run_eva_on_slice(["mod.c"], "eva_main", Path("workspace/eva/mod"))
         assert res["status"] == "analysis_error" and res["cache"]["hit"] is False
     assert sum(1 for c in calls if c[0] == "frama-c" and "-load" not in c) == 2
+
+
+def test_eacsl_l2_cache_absorbs_line_shifts_and_unrelated_acsl(run, modern_cli):
+    (run / "inc").mkdir(exist_ok=True)
+    (run / "inc" / "mod.h").write_text("int helper(int y);\nint entry(int x);\n", encoding="utf-8")
+    src = run / "mod.c"
+    src.write_text(
+        '#include "mod.h"\nint helper(int y) {\n    return y + 1;\n}\nint entry(int x) {\n    return x;\n}\n',
+        encoding="utf-8",
+    )
+    fake = FakeToolchain(deps=["inc/mod.h"])
+    first = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=["entry"], runner=fake)
+    assert first["returncode"] == 0 and first["cache"]["hit"] is False
+    builds = len(fake.builds())
+
+    # Shift lines via #line directives, blank lines, and ACSL annotations on unrelated function `helper`.
+    src.write_text(
+        '#include "mod.h"\n\n'
+        "/*@ requires y >= 0;\n"
+        "    ensures \\result > y;\n"
+        "*/\n"
+        "int helper(int y) {\n"
+        "    /*@ assert y >= 0; */\n"
+        "    return y + 1;\n"
+        "}\n\n"
+        '#line 100 "mod.c"\n'
+        "int entry(int x) {\n"
+        "    return x;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    l2_hit = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=["entry"], runner=fake)
+    assert l2_hit["cache"]["hit"] is True
+    assert l2_hit["cache"].get("tier") == "l2"
+    assert l2_hit["cache"]["key"] != first["cache"]["key"]
+    assert len(fake.builds()) == builds
+
+    # Repeating the exact shifted file now hits L1 directly (promoted on L2 hit).
+    l1_promoted = R.compile_eacsl_binary(
+        ["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=["entry"], runner=fake
+    )
+    assert l1_promoted["cache"] == {"hit": True, "key": l2_hit["cache"]["key"]}
+    assert len(fake.builds()) == builds
+
+    # Adding an ACSL annotation to the target function `entry` must miss both L1 and L2.
+    src.write_text(
+        '#include "mod.h"\n'
+        "int helper(int y) {\n"
+        "    return y + 1;\n"
+        "}\n"
+        "/*@ requires x >= 0; */\n"
+        "int entry(int x) {\n"
+        "    return x;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    target_changed = R.compile_eacsl_binary(
+        ["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=["entry"], runner=fake
+    )
+    assert target_changed["cache"]["hit"] is False
+    assert len(fake.builds()) > builds
+
+
+def test_eacsl_l2_cache_enabled_for_module_builds_without_explicit_functions(run, modern_cli):
+    (run / "inc").mkdir(exist_ok=True)
+    hdr = run / "inc" / "mod.h"
+    hdr.write_text("int unrelated_hdr_fn(int z);\nint entry(int x);\n", encoding="utf-8")
+    src = run / "mod.c"
+    src.write_text('#include "mod.h"\nint entry(int x) {\n    return x;\n}\n', encoding="utf-8")
+    fake = FakeToolchain(deps=["inc/mod.h"])
+
+    first = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=None, runner=fake)
+    assert first["returncode"] == 0 and first["cache"]["hit"] is False
+    builds = len(fake.builds())
+
+    # Changing an unrelated function prototype's ACSL contract in inc/mod.h hits L2 when functions=None.
+    hdr.write_text(
+        "/*@ requires z > 0; */\nint unrelated_hdr_fn(int z);\nint entry(int x);\n",
+        encoding="utf-8",
+    )
+    l2_hit = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=None, runner=fake)
+    assert l2_hit["cache"]["hit"] is True
+    assert l2_hit["cache"].get("tier") == "l2"
+    assert len(fake.builds()) == builds
+
+    # Changing entry's own ACSL contract in inc/mod.h misses L2.
+    hdr.write_text(
+        "/*@ requires z > 0; */\nint unrelated_hdr_fn(int z);\n/*@ requires x > 0; */\nint entry(int x);\n",
+        encoding="utf-8",
+    )
+    hdr_miss = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=None, runner=fake)
+    assert hdr_miss["cache"]["hit"] is False
+    builds = len(fake.builds())
+
+    # Changing entry's own ACSL contract in mod.c also misses L2.
+    src.write_text(
+        '#include "mod.h"\n/*@ ensures \\result == x; */\nint entry(int x) {\n    return x;\n}\n',
+        encoding="utf-8",
+    )
+    src_miss = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", functions=None, runner=fake)
+    assert src_miss["cache"]["hit"] is False
+    assert len(fake.builds()) > builds
+
+
+def test_normalized_source_digest_handles_trailing_attribute_macros(tmp_path):
+    hdr = tmp_path / "api.h"
+
+    # 1. Target function with NONNULL(1) trailing attribute macro: ACSL contract must be preserved.
+    hdr.write_text("int target_fn(int x) NONNULL(1);\n", encoding="utf-8")
+    d_base = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
+    hdr.write_text("/*@ requires x > 0; */\nint target_fn(int x) NONNULL(1);\n", encoding="utf-8")
+    d_with_acsl = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
+    assert d_base != d_with_acsl
+
+    # Unrelated function with NONNULL(1) trailing attribute macro: ACSL contract must be stripped.
+    d_unrelated_base = cache.normalized_source_digest(hdr, target_functions=["other_fn"])
+    hdr.write_text("int target_fn(int x) NONNULL(1);\n", encoding="utf-8")
+    assert cache.normalized_source_digest(hdr, target_functions=["other_fn"]) == d_unrelated_base
+
+    # 2. Target function with bare EXPORTED trailing attribute macro: ACSL contract must be preserved.
+    hdr.write_text("int target_fn(int x) EXPORTED;\n", encoding="utf-8")
+    d_exp_base = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
+    hdr.write_text("/*@ requires x > 0; */\nint target_fn(int x) EXPORTED;\n", encoding="utf-8")
+    d_exp_acsl = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
+    assert d_exp_base != d_exp_acsl
+
+    # Unrelated function with bare EXPORTED trailing attribute macro: ACSL contract must be stripped.
+    hdr_plain = tmp_path / "exp_plain.h"
+    hdr_plain.write_text("int target_fn(int x) EXPORTED;\n", encoding="utf-8")
+    assert cache.normalized_source_digest(hdr, target_functions=["other_fn"]) == cache.normalized_source_digest(
+        hdr_plain, target_functions=["other_fn"]
+    )
+
+    # 3. Return-type macro RET_MACRO(int) target_fn(int x); must still resolve to target_fn and preserve ACSL.
+    hdr.write_text("RET_MACRO(int) target_fn(int x);\n", encoding="utf-8")
+    d_ret_base = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
+    hdr.write_text("/*@ requires x > 0; */\nRET_MACRO(int) target_fn(int x);\n", encoding="utf-8")
+    d_ret_acsl = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
+    assert d_ret_base != d_ret_acsl
+    assert cache.normalized_source_digest(hdr, target_functions=["other_fn"]) == d_ret_base
+
+
+def test_guardrail_verdict_cache_hits_and_invalidates_on_corpus_change(run, monkeypatch):
+    from sandbox_exec import SandboxResult
+
+    calls = []
+
+    def fake_sandbox(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        calls.append(list(cmd))
+        return SandboxResult(0, "", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    binary = run / "workspace" / "harnesses" / "guard_mod.e-acsl"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(EACSL_MARKER_BYTES)
+    corpus = run / "workspace" / "corpora" / "mod"
+    corpus.mkdir(parents=True, exist_ok=True)
+    (corpus / "seed1").write_bytes(b"hello")
+    scratch = run / "workspace" / "harnesses" / "scratch"
+
+    first = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    assert first["status"] == "passed_dynamic_oracle"
+    assert first["cache"]["hit"] is False and first["cache"]["key"]
+    assert len(calls) == 1
+
+    second = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    assert second["status"] == "passed_dynamic_oracle"
+    assert second["cache"] == {"hit": True, "key": first["cache"]["key"]}
+    assert len(calls) == 1
+
+    # Adding a corpus input invalidates the guardrail verdict cache key.
+    (corpus / "seed2").write_bytes(b"world")
+    third = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    assert third["cache"]["hit"] is False and third["cache"]["key"] != first["cache"]["key"]
+    assert len(calls) == 2
+
+    # Passing use_cache=False (or --no-cache on the CLI) bypasses the guardrail verdict cache.
+    no_cache = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod", use_cache=False)
+    assert no_cache["cache"] == {"hit": False, "key": None}
+    assert len(calls) == 3
+
+
+def test_parent_guard_ignores_run_store_verdict_cache(run, tmp_path, monkeypatch):
+    from sandbox_exec import SandboxResult
+
+    calls = []
+
+    def fake_sandbox(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        calls.append(list(cmd))
+        return SandboxResult(0, "", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    binary = run / "state" / "parent_guard" / "guard_mod.e-acsl"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(EACSL_MARKER_BYTES)
+    corpus = run / "workspace" / "corpora" / "mod"
+    corpus.mkdir(parents=True, exist_ok=True)
+    (corpus / "seed1").write_bytes(b"hello")
+    scratch = run / "state" / "parent_guard" / "scratch"
+
+    # Pre-populate the container-writable run_store with a forged passing verdict for this binary.
+    first = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    g_key = first["cache"]["key"]
+    assert g_key is not None and len(calls) == 1
+    cache.run_store().put(
+        "guardrail",
+        g_key,
+        {},
+        {"verdict": {"status": "passed_dynamic_oracle", "returncode": 0}},
+    )
+    assert cache.run_store().get("guardrail", g_key) is not None
+
+    # Because binary is under state/parent_guard, run_guardrail_check must ignore run_store and re-execute.
+    second = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    assert second["cache"]["hit"] is False
+    assert len(calls) == 2
+
+    # When shared_store is enabled (rw), parent_guard publishes to and hits from shared_store.
+    shared_root = tmp_path / "shared-guard"
+    shared_root.mkdir()
+    monkeypatch.setenv("FRAMAC_SHARED_CACHE_DIR", str(shared_root))
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "rw")
+    third = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    assert third["cache"]["hit"] is False
+    assert len(calls) == 3
+    fourth = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod")
+    assert fourth["cache"] == {"hit": True, "key": third["cache"]["key"]}
+    assert len(calls) == 3
+
+
+def test_warm_start_and_publish_corpus_across_runs(run, tmp_path, monkeypatch):
+    shared_root = tmp_path / "shared-cache"
+    shared_root.mkdir()
+    monkeypatch.setenv("FRAMAC_SHARED_CACHE_DIR", str(shared_root))
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "rw")
+
+    corpus_run1 = run / "workspace" / "corpora" / "parser"
+    corpus_run1.mkdir(parents=True)
+    (corpus_run1 / "seed_a").write_bytes(b"AAAA")
+    (corpus_run1 / "seed_b").write_bytes(b"BBBBBB")
+
+    published = cache.publish_corpus("parser", corpus_run1)
+    assert published == 2
+    assert cache.publish_corpus("parser", corpus_run1) == 0  # content-addressed deduplication
+
+    # In a second run (even with FRAMAC_CACHE_MODE=ro), warm_start_corpus copies the shared seeds.
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "ro")
+    corpus_run2 = run / "workspace" / "corpora" / "parser_fresh"
+    copied = cache.warm_start_corpus("parser", corpus_run2)
+    assert copied == 2
+    assert {p.read_bytes() for p in corpus_run2.iterdir() if p.is_file()} == {b"AAAA", b"BBBBBB"}
+    assert cache.warm_start_corpus("parser", corpus_run2) == 0  # idempotent when seeds already exist

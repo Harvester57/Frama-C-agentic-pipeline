@@ -62,7 +62,17 @@ def open_work(data: dict) -> dict:
 
 
 def assurance_table(ledger: list[dict]) -> list[str]:
-    cols = ["covered (unconditional)", "covered (with assumptions)", "candidate", "blocked", "planned", "in_progress", "deferred", "out_of_scope", "not_applicable"]
+    cols = [
+        "covered (unconditional)",
+        "covered (with assumptions)",
+        "candidate",
+        "blocked",
+        "planned",
+        "in_progress",
+        "deferred",
+        "out_of_scope",
+        "not_applicable",
+    ]
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     for u in ledger:
         key = u["status"]
@@ -83,7 +93,10 @@ def assurance_table(ledger: list[dict]) -> list[str]:
 def render_report(data: dict) -> str:
     meta, ledger, findings = data["meta"], data["ledger"], data["findings"]
     work = open_work(data)
-    confirmed = sorted((r for r in findings if r["verdict"] == "confirmed"), key=lambda r: (SEVERITY_ORDER[r["severity"]], r["fingerprint"]))
+    confirmed = sorted(
+        (r for r in findings if r["verdict"] == "confirmed"),
+        key=lambda r: (SEVERITY_ORDER[r["severity"]], r["fingerprint"]),
+    )
     needs = [r for r in findings if r["verdict"] == "needs_validation"]
     rejected = [r for r in findings if r["verdict"] == "rejected"]
     src = meta["source_ref"]
@@ -97,7 +110,8 @@ def render_report(data: dict) -> str:
         f"- **Run:** `{meta['run_id']}` of `{meta['repo']}`",
         f"- **Status:** **{status_line}**",
         f"- **Target:** `{meta['target']}`",
-        f"- **Source ref:** {src['vcs']} `{src['commit'] or 'n/a'}`" + (" (dirty worktree)" if src.get("dirty") else ""),
+        f"- **Source ref:** {src['vcs']} `{src['commit'] or 'n/a'}`"
+        + (" (dirty worktree)" if src.get("dirty") else ""),
         f"- **Profile:** `{meta['profile']}`; **scope:** {', '.join(f'`{p}`' for p in meta['scope_paths']) or 'whole target'}; **budget:** {meta['budget'] if meta['budget'] is not None else 'not set'}",
         f"- **Execution:** sandboxed, local only (outer: `{meta['sandbox']['outer']}`, inner: `{meta['sandbox']['inner']}`)",
         f"- **Prior runs used:** {', '.join(meta['prior_runs']) or 'none (this run does not imply that a single pass exhausts the target)'}",
@@ -106,14 +120,18 @@ def render_report(data: dict) -> str:
     partial = meta["run_status"] != "complete" or meta["profile"] == "quick" or meta["scope_paths"]
     if partial:
         out.append("> [!WARNING]")
-        out.append("> This is a partial pass. " + (
-            "It is not complete; " if meta["run_status"] != "complete" else ""
-        ) + ("the quick profile coarsens coverage; " if meta["profile"] == "quick" else "") + (
-            "only the listed scope paths were in scope; " if meta["scope_paths"] else ""
-        ) + "do not read the absence of findings outside the covered units as evidence of safety.")
+        out.append(
+            "> This is a partial pass. "
+            + ("It is not complete; " if meta["run_status"] != "complete" else "")
+            + ("the quick profile coarsens coverage; " if meta["profile"] == "quick" else "")
+            + ("only the listed scope paths were in scope; " if meta["scope_paths"] else "")
+            + "do not read the absence of findings outside the covered units as evidence of safety."
+        )
         out.append("")
     if work["unverified"]:
-        out.append(f"**{len(work['unverified'])} candidate(s) have not been independently verified.** They are not findings and are listed here only so the gap is visible:")
+        out.append(
+            f"**{len(work['unverified'])} candidate(s) have not been independently verified.** They are not findings and are listed here only so the gap is visible:"
+        )
         out.append("")
         for c in work["unverified"][:50]:
             out.append(f"- `{c['fingerprint']}` ({c['origin']}, proposed {c['proposed_verdict']})")
@@ -129,7 +147,8 @@ def render_report(data: dict) -> str:
     covered = [u for u in ledger if u["status"] == "covered"]
     cond = [u for u in covered if u["assumptions"]]
     out += [
-        f"- **Confirmed findings:** {len(confirmed)}" + (" (" + ", ".join(f"{sev[s]} {s}" for s in SEVERITY_ORDER if sev[s]) + ")" if confirmed else ""),
+        f"- **Confirmed findings:** {len(confirmed)}"
+        + (" (" + ", ".join(f"{sev[s]} {s}" for s in SEVERITY_ORDER if sev[s]) + ")" if confirmed else ""),
         f"- **Needs validation:** {len(needs)} (no severity; exact blockers listed)",
         f"- **Rejected candidates:** {len(rejected)} (retained to suppress repeated claims)",
         f"- **Proof coverage:** {len(covered) - len(cond)} unit(s) proven unconditionally, {len(cond)} proven under open assumptions, out of {len(ledger)} unit(s)",
@@ -140,9 +159,14 @@ def render_report(data: dict) -> str:
     if not confirmed:
         out += ["No confirmed findings.", ""]
     else:
-        out += ["| Severity | Title | Location | Reachability | Observed result |", "| :--- | :--- | :--- | :--- | :--- |"]
+        out += [
+            "| Severity | Title | Location | Reachability | Observed result |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
         for r in confirmed:
-            out.append(f"| {r['severity']} | {md_escape(r['title'])} | {loc(r)} | `{r['reachability']}` | {md_escape(r['reproducers'][0]['observed_result'])[:160]} |")
+            out.append(
+                f"| {r['severity']} | {md_escape(r['title'])} | {loc(r)} | `{r['reachability']}` | {md_escape(r['reproducers'][0]['observed_result'])[:160]} |"
+            )
         out.append("")
         for r in confirmed:
             out += [
@@ -164,7 +188,9 @@ def render_report(data: dict) -> str:
         out += ["| Title | Location | Blockers | Next step |", "| :--- | :--- | :--- | :--- |"]
         for r in needs:
             plan = r["validation_plan"].get("local") or r["validation_plan"].get("owner")
-            out.append(f"| {md_escape(r['title'])} | {loc(r)} | {md_escape('; '.join(r['blockers']))} | {md_escape(plan)} |")
+            out.append(
+                f"| {md_escape(r['title'])} | {loc(r)} | {md_escape('; '.join(r['blockers']))} | {md_escape(plan)} |"
+            )
         out.append("")
 
     out += ["## 5. Assurance summary", ""]
@@ -188,7 +214,11 @@ def render_report(data: dict) -> str:
         if len(blocked) > 50:
             out.append(f"- ... and {len(blocked) - 50} more (see coverage-ledger.json)")
         out.append("")
-    reasons = Counter((u["status"], u["unresolved"][0]) for u in ledger if u["status"] in ("deferred", "out_of_scope", "not_applicable"))
+    reasons = Counter(
+        (u["status"], u["unresolved"][0])
+        for u in ledger
+        if u["status"] in ("deferred", "out_of_scope", "not_applicable")
+    )
     if reasons:
         out.append("Units not worked in this run:")
         out.append("")
@@ -204,15 +234,23 @@ def render_report(data: dict) -> str:
         out += [f"- {md_escape(h)}" for h in sorted(set(hardening))]
         out.append("")
 
-    out += ["## Artifacts", "", "- `findings.json`, `coverage-ledger.json`, `candidates.json`, `run-metadata.json`",
-            "- `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, `report.sarif`", "- Raw tool output: `workspace/reports/`", ""]
+    out += [
+        "## Artifacts",
+        "",
+        "- `findings.json`, `coverage-ledger.json`, `candidates.json`, `run-metadata.json`",
+        "- `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, `report.sarif`",
+        "- Raw tool output: `workspace/reports/`",
+        "",
+    ]
     return "\n".join(out)
 
 
 def _trace_lines(rec: dict) -> list[str]:
     lines = []
     for t in rec.get("trace", []):
-        lines.append(f"1. **{t['kind']}** `{t['file']}:{t['line']}` in `{t['function']}`: {md_escape(t['description'])}")
+        lines.append(
+            f"1. **{t['kind']}** `{t['file']}:{t['line']}` in `{t['function']}`: {md_escape(t['description'])}"
+        )
     return lines
 
 
@@ -221,7 +259,10 @@ def _evidence_lines(rec: dict) -> list[str]:
 
 
 def render_findings_detail(findings: list[dict]) -> str:
-    confirmed = sorted((r for r in findings if r["verdict"] == "confirmed"), key=lambda r: (SEVERITY_ORDER[r["severity"]], r["fingerprint"]))
+    confirmed = sorted(
+        (r for r in findings if r["verdict"] == "confirmed"),
+        key=lambda r: (SEVERITY_ORDER[r["severity"]], r["fingerprint"]),
+    )
     out = ["# Confirmed Findings: Detail", ""]
     if not confirmed:
         return "\n".join(out + ["No confirmed findings.", ""])
@@ -251,19 +292,39 @@ def render_findings_detail(findings: list[dict]) -> str:
             "",
         ]
         for rep in r["reproducers"]:
-            out += [f"- `{rep['input']}` ({rep['size_bytes']} bytes, sha256 `{rep['sha256']}`)", f"  - command: `{md_escape(rep['command'])}`", f"  - observed: {md_escape(rep['observed_result'])}"]
-        out += ["", "**Evidence.**", "", *_evidence_lines(r), "",
-                f"**Remediation.** {md_escape(r['remediation']['summary'])}", "",
-                f"Invariant to enforce: {md_escape(r['remediation']['invariant'])}", ""]
+            out += [
+                f"- `{rep['input']}` ({rep['size_bytes']} bytes, sha256 `{rep['sha256']}`)",
+                f"  - command: `{md_escape(rep['command'])}`",
+                f"  - observed: {md_escape(rep['observed_result'])}",
+            ]
+        out += [
+            "",
+            "**Evidence.**",
+            "",
+            *_evidence_lines(r),
+            "",
+            f"**Remediation.** {md_escape(r['remediation']['summary'])}",
+            "",
+            f"Invariant to enforce: {md_escape(r['remediation']['invariant'])}",
+            "",
+        ]
         if r["remediation"]["fix_patch"]:
             out += [f"Candidate fix patch (not applied): `{r['remediation']['fix_patch']}`", ""]
-        out += [f"_Verified by `{r['verifier']['agent_id']}` ({r['verifier']['method']}): {md_escape(r['verifier']['notes'])}_", ""]
+        out += [
+            f"_Verified by `{r['verifier']['agent_id']}` ({r['verifier']['method']}): {md_escape(r['verifier']['notes'])}_",
+            "",
+        ]
     return "\n".join(out)
 
 
 def render_needs_validation(findings: list[dict]) -> str:
     needs = [r for r in findings if r["verdict"] == "needs_validation"]
-    out = ["# Needs Validation", "", "Prioritized leads without severity. Each names the exact fact that blocked confirmation.", ""]
+    out = [
+        "# Needs Validation",
+        "",
+        "Prioritized leads without severity. Each names the exact fact that blocked confirmation.",
+        "",
+    ]
     if not needs:
         return "\n".join(out + ["No open leads.", ""])
     for r in needs:
@@ -304,31 +365,45 @@ def render_sarif(findings: list[dict]) -> dict:
     results = []
     for r in records:
         rule_id = "framac/" + r["property"]["kind"].strip().lower().replace(" ", "_")
-        rules.setdefault(rule_id, {"id": rule_id, "shortDescription": {"text": f"Frama-C property kind: {r['property']['kind']}"}})
+        rules.setdefault(
+            rule_id, {"id": rule_id, "shortDescription": {"text": f"Frama-C property kind: {r['property']['kind']}"}}
+        )
         props = {"verdict": r["verdict"], "reachability": r["reachability"]}
         if r["verdict"] == "confirmed":
             props["severity"] = r["severity"]
-        results.append({
-            "ruleId": rule_id,
-            "level": "error" if r["verdict"] == "confirmed" else "warning",
-            "message": {"text": f"{r['title']}: {r['description']}"},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": r["location"]["file"]},
-                    "region": {"startLine": r["location"]["line"]},
-                },
-                "logicalLocations": [{"name": r["location"]["function"], "kind": "function"}],
-            }],
-            "partialFingerprints": {"framacFingerprint/v1": r["fingerprint"]},
-            "properties": props,
-        })
+        results.append(
+            {
+                "ruleId": rule_id,
+                "level": "error" if r["verdict"] == "confirmed" else "warning",
+                "message": {"text": f"{r['title']}: {r['description']}"},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": r["location"]["file"]},
+                            "region": {"startLine": r["location"]["line"]},
+                        },
+                        "logicalLocations": [{"name": r["location"]["function"], "kind": "function"}],
+                    }
+                ],
+                "partialFingerprints": {"framacFingerprint/v1": r["fingerprint"]},
+                "properties": props,
+            }
+        )
     return {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{
-            "tool": {"driver": {"name": "framac-pipeline", "informationUri": "https://frama-c.com/", "rules": [rules[k] for k in sorted(rules)]}},
-            "results": results,
-        }],
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "framac-pipeline",
+                        "informationUri": "https://frama-c.com/",
+                        "rules": [rules[k] for k in sorted(rules)],
+                    }
+                },
+                "results": results,
+            }
+        ],
     }
 
 
@@ -355,7 +430,9 @@ def generate(run_dir: Path, out_dir: Path) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Derive REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md and report.sarif.")
+    parser = argparse.ArgumentParser(
+        description="Derive REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md and report.sarif."
+    )
     parser.add_argument("--run-dir", type=Path, default=Path("."))
     parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args()

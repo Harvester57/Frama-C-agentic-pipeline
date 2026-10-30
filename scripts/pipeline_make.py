@@ -27,6 +27,7 @@ before each make invocation, so tuning and harness repairs apply without a separ
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -46,6 +47,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cache  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     RunLockTimeout,
@@ -174,6 +176,7 @@ def with_acsl(tokens: list[str], acsl_dir: str) -> list[str]:
 # Make quoting
 # ---------------------------------------------------------------------------
 
+
 def mk_quote(value: str) -> str:
     """
     One shell word, written so that make passes it through unchanged: shlex.quote, then `$` as
@@ -265,6 +268,7 @@ def effective_params(params_doc: dict, module: str, profile: str) -> dict:
 # ---------------------------------------------------------------------------
 # Module plan
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ModulePlan:
@@ -375,9 +379,9 @@ def normalize_source(raw: str, run_dir: Path) -> str:
     """Path of a slice source as the tools see it from the run directory (sidecar or DAG form)."""
     src = raw.replace("\\", "/").strip()
     if src.startswith("/framac-run/"):
-        src = src[len("/framac-run/"):]
+        src = src[len("/framac-run/") :]
     elif src.startswith("/target/"):
-        src = f"{WORK_DIR}/{src[len('/target/'):]}"
+        src = f"{WORK_DIR}/{src[len('/target/') :]}"
     while src.startswith("./"):
         src = src[2:]
     if src.startswith(("/", "workspace/")):
@@ -542,7 +546,11 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         warnings.append(f"{DAG_JSON} missing: no module targets until slice-init has run")
 
     harness_dir = run_dir / HARNESS_DIR
-    sidecars = {p.name[len("harness_"):-len(".json")] for p in harness_dir.glob("harness_*.json")} if harness_dir.is_dir() else set()
+    sidecars = (
+        {p.name[len("harness_") : -len(".json")] for p in harness_dir.glob("harness_*.json")}
+        if harness_dir.is_dir()
+        else set()
+    )
     for name in sorted(sidecars - set(dag_modules)):
         if dag_modules:
             warnings.append(f"harness sidecar for {name!r} ignored: no such module in the DAG")
@@ -636,7 +644,7 @@ def render_modules_mk(plan: Plan) -> str:
 
 
 def _write_if_changed(path: Path, text: str) -> bool:
-    data = text.encode("utf-8")
+    data = text.encode()
     try:
         if path.read_bytes() == data:
             return False
@@ -654,10 +662,20 @@ def _write_if_changed(path: Path, text: str) -> bool:
     return True
 
 
-def _generate(run_dir: Path, templates_dir: Path | str | None = None) -> tuple[Plan, bool]:
+def _generate(
+    run_dir: Path,
+    templates_dir: Path | str | None = None,
+    private_dir: Path | None = None,
+) -> tuple[Plan, bool]:
     plan = build_plan(run_dir, templates_dir)
-    changed = _write_if_changed(run_dir / MODULES_MK, render_modules_mk(plan))
+    modules_text = render_modules_mk(plan)
+    changed = _write_if_changed(run_dir / MODULES_MK, modules_text)
     changed = _write_if_changed(run_dir / MAKEFILE, MAKEFILE_TEXT) or changed
+    if private_dir is not None:
+        # Write the stage's private copy directly from memory so a concurrent `gen` or `params set`
+        # on workspace/build/ cannot mutate `modules.mk` between generation and `make` reading it.
+        _write_if_changed(private_dir / "modules.mk", modules_text)
+        _write_if_changed(private_dir / "Makefile", MAKEFILE_TEXT)
     return plan, changed
 
 
@@ -708,7 +726,11 @@ def params_set(run_dir: Path | str = ".", module: str = "", reset: bool = False,
     warnings = []
     if plan.dag_modules and module not in plan.dag_modules:
         warnings.append(f"{module!r} is not a module of the callgraph DAG")
-    if entry.get("fuzz_dict") and not (run_dir / entry["fuzz_dict"]).is_file() and not Path(entry["fuzz_dict"]).is_file():
+    if (
+        entry.get("fuzz_dict")
+        and not (run_dir / entry["fuzz_dict"]).is_file()
+        and not Path(entry["fuzz_dict"]).is_file()
+    ):
         warnings.append(f"fuzz dictionary {entry['fuzz_dict']!r} does not exist (yet)")
     return {
         "ok": True,
@@ -793,7 +815,12 @@ def _target_problem(target: str, plan: Plan) -> str | None:
     if target in STAGE_OF_TARGET:
         return None
     kind, _, mod = target.partition("-")
-    allowed = {"build": plan.fuzz_modules, "fuzz": plan.fuzz_modules, "eva": plan.eva_modules, "module": list(plan.modules)}[kind]
+    allowed = {
+        "build": plan.fuzz_modules,
+        "fuzz": plan.fuzz_modules,
+        "eva": plan.eva_modules,
+        "module": list(plan.modules),
+    }[kind]
     if mod in allowed:
         return None
     if mod in plan.excluded:
@@ -876,6 +903,50 @@ def _subprocess_make_runner(cmd: list[str], cwd: Path, sink: Callable[[str], Non
         return proc.wait()
 
 
+_default_make_runner = _subprocess_make_runner
+
+
+def _private_make_runner(
+    priv_makefile_or_text: Path | str,
+    modules_text_or_runner: str | MakeRunner | None = None,
+    base_runner: MakeRunner | None = None,
+) -> MakeRunner:
+    """Redirect `make -f workspace/build/Makefile` to a stage-private Makefile copy outside the run dir."""
+    if isinstance(priv_makefile_or_text, str) and isinstance(modules_text_or_runner, str):
+        makefile_text = priv_makefile_or_text
+        modules_text = modules_text_or_runner
+
+        def run_ephemeral(cmd: list[str], cwd: Path, sink: Callable[[str], None]) -> int:
+            eff_runner = base_runner or _default_make_runner
+            with tempfile.TemporaryDirectory(prefix="framac-make-") as tmp:
+                priv_dir = Path(tmp)
+                priv_mk = priv_dir / "Makefile"
+                _write_if_changed(priv_dir / "modules.mk", modules_text)
+                _write_if_changed(priv_mk, makefile_text)
+                actual = list(cmd)
+                if "-f" in actual:
+                    idx = actual.index("-f")
+                    if idx + 1 < len(actual):
+                        actual[idx + 1] = str(priv_mk)
+                return eff_runner(actual, cwd, sink)
+
+        return run_ephemeral
+
+    priv_makefile = Path(priv_makefile_or_text)
+    runner_arg = modules_text_or_runner if callable(modules_text_or_runner) else base_runner
+
+    def run(cmd: list[str], cwd: Path, sink: Callable[[str], None]) -> int:
+        eff_runner = runner_arg or _default_make_runner
+        actual = list(cmd)
+        if "-f" in actual:
+            idx = actual.index("-f")
+            if idx + 1 < len(actual):
+                actual[idx + 1] = str(priv_makefile)
+        return eff_runner(actual, cwd, sink)
+
+    return run
+
+
 def _make_jobs() -> int:
     """make -j: this container's own CPUs (its lease, re-read from the cgroup), not the node's pool."""
     from resources import job_budget
@@ -905,7 +976,9 @@ def _node_status(node: str, plan: Plan, run_dir: Path, failed: set[str], cache: 
     if node not in cache:
         if node in failed:
             status = "failed"
-        elif any(_node_status(d, plan, run_dir, failed, cache) in ("failed", "skipped") for d in _node_deps(node, plan)):
+        elif any(
+            _node_status(d, plan, run_dir, failed, cache) in ("failed", "skipped") for d in _node_deps(node, plan)
+        ):
             status = "skipped"  # a prerequisite failed, so make never ran this recipe
         else:
             out = _node_output(node)
@@ -929,17 +1002,24 @@ def run_targets(
     """
     run_dir = Path(run_dir)
     if not (run_dir / MAKEFILE).is_file():
-        return 2, {"ok": False, "error": f"{MAKEFILE} not found: run `pipeline_make.py gen` first, from the run directory"}
+        return 2, {
+            "ok": False,
+            "error": f"{MAKEFILE} not found: run `pipeline_make.py gen` first, from the run directory",
+        }
     targets = list(dict.fromkeys(targets))
     unknown = [t for t in targets if _stage(t) is None]
     if not targets or unknown:
         known = ", ".join([*STAGE_OF_TARGET, *(p + "<mod>" for p in MODULE_TARGET_PREFIXES)])
         return 2, {"ok": False, "error": f"unknown target(s) {unknown or '(none given)'}; targets: {known}"}
     make_bin = "make"
+    use_private_makefile = make_runner is None
     if make_runner is None:
         found = shutil.which("make")
         if found is None:
-            return 2, {"ok": False, "error": "make not found: `pipeline_make.py run` runs inside the framac-pipeline container"}
+            return 2, {
+                "ok": False,
+                "error": "make not found: `pipeline_make.py run` runs inside the framac-pipeline container",
+            }
         make_bin, make_runner = found, _subprocess_make_runner
     jobs = max(1, int(jobs or _make_jobs()))
 
@@ -948,10 +1028,18 @@ def run_targets(
     (run_dir / LOG_DIR).mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     summary: dict = {"ok": True, "targets": {}, "stages": [], "jobs": jobs, "log": log_rel}
-    with open(run_dir / log_rel, "w", encoding="utf-8", newline="\n") as log:
-        for stage in sorted({_stage(t) for t in targets if _stage(t) is not None}):
+    with contextlib.ExitStack() as stack:
+        priv_dir: Path | None = None
+        priv_makefile: Path | None = None
+        if use_private_makefile:
+            priv_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="framac-make-")))
+            priv_makefile = priv_dir / "Makefile"
+            make_runner = _private_make_runner(priv_makefile, make_runner)
+        log = stack.enter_context(open(run_dir / log_rel, "w", encoding="utf-8", newline="\n"))
+        stages = sorted({s for t in targets if (s := _stage(t)) is not None})
+        for stage in stages:
             stage_targets = [t for t in targets if _stage(t) == stage]
-            plan, _ = _generate(run_dir, templates_dir)
+            plan, _ = _generate(run_dir, templates_dir, private_dir=priv_dir)
             summary.update(excluded=plan.excluded, warnings=plan.warnings)
             runnable = []
             for target in stage_targets:
@@ -966,7 +1054,17 @@ def run_targets(
             nodes = {n for t in runnable for n in _target_nodes(t, plan)}
             outputs = {n: _node_output(n) for n in nodes}
             before = {out: _output_state(run_dir, out) for out in outputs.values() if out}
-            cmd = [make_bin, "-f", MAKEFILE, f"-j{jobs}", "-k", "--output-sync=target", f"S={SCRIPTS_DIR.as_posix()}", *runnable]
+            eff_makefile = str(priv_makefile) if priv_makefile is not None else MAKEFILE
+            cmd = [
+                make_bin,
+                "-f",
+                eff_makefile,
+                f"-j{jobs}",
+                "-k",
+                "--output-sync=target",
+                f"S={SCRIPTS_DIR.as_posix()}",
+                *runnable,
+            ]
             rc, failed, tail = _run_stage(make_runner, cmd, run_dir, log)
             if rc != 0 and not failed:
                 failed = set(runnable) | nodes  # make stopped without naming a target (see the log)
@@ -983,7 +1081,9 @@ def run_targets(
                     out = outputs.get(node) or _node_output(node)
                     if out:
                         after = _output_state(run_dir, out)
-                        info.update(output=out, exists=after is not None, updated=after is not None and after != before.get(out))
+                        info.update(
+                            output=out, exists=after is not None, updated=after is not None and after != before.get(out)
+                        )
                         info.update(_report_brief(run_dir / out))
                     entries[node] = info
                 bad = sorted(n for n, e in entries.items() if e["status"] in ("failed", "skipped"))
@@ -1012,7 +1112,12 @@ def _script_runner(run_dir: Path) -> ScriptRunner:
     def run(script: str, args: list[str]) -> tuple[int, str]:
         proc = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / script), *args],
-            cwd=run_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+            cwd=run_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
@@ -1051,7 +1156,9 @@ def _load_ingested(run_dir: Path) -> dict:
     return state
 
 
-def _pending_reports(run_dir: Path, kind: str, module: str | None, seen: dict) -> tuple[list[tuple[str, str]], int, list[dict]]:
+def _pending_reports(
+    run_dir: Path, kind: str, module: str | None, seen: dict
+) -> tuple[list[tuple[str, str]], int, list[dict]]:
     report_dir = run_dir / REPORT_DIRS[kind]
     if module is not None:
         paths = [report_dir / f"{module}.json"]
@@ -1141,6 +1248,29 @@ def ingest(
             atomic_write_json(run_dir / INGESTED_JSON, state)
             result["ingested"][kind] = [rel for rel, _ in pending]
 
+        if cache.shared_mode() == "rw":
+            published_corpora: dict[str, int] = {}
+            target_modules = (
+                [module]
+                if module is not None
+                else sorted(set(plan.fuzz_modules) | {Path(rel).stem for rel in result["ingested"].get("fuzz", [])})
+            )
+            for mod_name in target_modules:
+                c_dirs = [
+                    run_dir / "workspace" / "corpus" / mod_name,
+                    run_dir / "workspace" / "corpora" / mod_name,
+                    run_dir / "workspace" / "scratch" / "fuzz" / mod_name / "corpus",
+                    run_dir / "scratch" / "fuzz" / mod_name / "corpus",
+                ]
+                pub_count = 0
+                for cd in c_dirs:
+                    if cd.is_dir():
+                        pub_count += cache.publish_corpus(mod_name, cd)
+                if pub_count > 0:
+                    published_corpora[mod_name] = pub_count
+            if published_corpora:
+                result["published_corpora"] = published_corpora
+
         rc, out = runner("validate_artifacts.py", ["run-dir", "."])
         result["validate"] = _json_or_tail(out)
         if rc != 0:
@@ -1152,6 +1282,7 @@ def ingest(
 # ---------------------------------------------------------------------------
 # WP sweep
 # ---------------------------------------------------------------------------
+
 
 def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
     """
@@ -1170,10 +1301,17 @@ def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
         if not any(isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging") for e in evidence):
             continue  # covered by Eva, not by a proof
         file, function = unit.get("file"), unit.get("function")
-        if not (isinstance(file, str) and is_safe_relative_path(file) and isinstance(function, str) and FUNCTION_RE.match(function)):
+        if not (
+            isinstance(file, str)
+            and is_safe_relative_path(file)
+            and isinstance(function, str)
+            and FUNCTION_RE.match(function)
+        ):
             skipped.append({"file": file, "function": function, "reason": "unsafe file path or function name"})
             continue
-        entry = entries.setdefault((file, function), {"file": file, "function": function, "module": unit.get("module"), "coverage_ids": []})
+        entry = entries.setdefault(
+            (file, function), {"file": file, "function": function, "module": unit.get("module"), "coverage_ids": []}
+        )
         entry["coverage_ids"].append(unit.get("coverage_id"))
     return [entries[k] for k in sorted(entries)], skipped
 
@@ -1234,11 +1372,31 @@ def sweep(
             key = f"{slugs[e['file']]}__{e['function']}"
             out_json = f"{SWEEP_DIR}/{key}.json"
             cmd = [
-                py, f"{scripts}/resources.py", "run", "--class", "wp", "--key", key, "--output", out_json, "--",
-                py, f"{scripts}/run_wp_function.py", "--file", f"{WORK_DIR}/{e['file']}", "--function", e["function"],
-                f"--cppflags={shlex.join(flags)}", "--cache-dir", "off", "--sarif",
+                py,
+                f"{scripts}/resources.py",
+                "run",
+                "--class",
+                "wp",
+                "--key",
+                key,
+                "--output",
+                out_json,
+                "--",
+                py,
+                f"{scripts}/run_wp_function.py",
+                "--file",
+                f"{WORK_DIR}/{e['file']}",
+                "--function",
+                e["function"],
+                f"--cppflags={shlex.join(flags)}",
+                "--cache-dir",
+                "off",
+                "--sarif",
                 # One out-dir per file: run_wp_function names its artifacts after the function only.
-                "--out-dir", f"{SWEEP_DIR}/work/{slugs[e['file']]}", "--out-json", out_json,
+                "--out-dir",
+                f"{SWEEP_DIR}/work/{slugs[e['file']]}",
+                "--out-json",
+                out_json,
             ]
             # A report left by an earlier sweep must never be read as this sweep's result.
             (run_dir / out_json).unlink(missing_ok=True)
@@ -1253,7 +1411,14 @@ def sweep(
         results, regressions, missing = [], [], []
         for (e, out_json, _), rc in zip(tasks, rcs, strict=True):
             status = _report_brief(run_dir / out_json).get("report_status") if (run_dir / out_json).is_file() else None
-            row = {"file": e["file"], "function": e["function"], "module": e["module"], "rc": rc, "status": status, "report": out_json}
+            row = {
+                "file": e["file"],
+                "function": e["function"],
+                "module": e["module"],
+                "rc": rc,
+                "status": status,
+                "report": out_json,
+            }
             results.append(row)
             if status is None:
                 missing.append(row)
@@ -1272,7 +1437,9 @@ def sweep(
         }
         if regressions:
             # The sweep is the trusted backstop: a proof that no longer holds must reach the ledger.
-            rc, out = (script_runner or _script_runner(run_dir))("ledger.py", ["ingest-wp", *(r["report"] for r in regressions)])
+            rc, out = (script_runner or _script_runner(run_dir))(
+                "ledger.py", ["ingest-wp", *(r["report"] for r in regressions)]
+            )
             summary["ledger"] = _json_or_tail(out)
             if rc != 0:
                 summary["ok"] = False
@@ -1285,18 +1452,12 @@ def sweep(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _normalize_flag_args(argv: list[str]) -> list[str]:
     """`--fuzz-dict -x` would be read as an option by argparse: bind such values with `=`."""
-    out: list[str] = []
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--fuzz-dict" and i + 1 < len(argv):
-            out.append(f"--fuzz-dict={argv[i + 1]}")
-            i += 2
-        else:
-            out.append(argv[i])
-            i += 1
-    return out
+    from framac_common import normalize_flag_args
+
+    return normalize_flag_args(argv, ("--fuzz-dict",))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1318,7 +1479,9 @@ def main(argv: list[str] | None = None) -> int:
     p_set.add_argument("--eva-timeout", type=int, default=None, help="Eva wall-clock seconds (0 clears)")
     p_set.add_argument("--fuzz-dict", default=None, help="libFuzzer dictionary, run-relative ('' clears)")
     p_set.add_argument("--fuzz-budget", type=int, default=None, help="Campaign CPU-seconds (0: profile default)")
-    p_set.add_argument("--fuzz-max-time", type=int, default=None, help="Campaign wall-clock override in seconds (0 clears)")
+    p_set.add_argument(
+        "--fuzz-max-time", type=int, default=None, help="Campaign wall-clock override in seconds (0 clears)"
+    )
     p_show = psub.add_parser("show")
     p_show.add_argument("--module", default=None)
 

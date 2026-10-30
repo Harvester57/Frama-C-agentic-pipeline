@@ -21,11 +21,12 @@
 # Sizing: by default the host broker (scripts/resources.py exec, needs a host python3 >= 3.10)
 # measures the machine on every call, takes a lease for the job class (inferred from the
 # command unless --class) and starts the container with --cpus/--memory/--pids-limit from that
-# lease, so concurrent containers never oversubscribe the node. --cpus/--memory/--pids-limit
-# (or FRAMAC_CPUS/FRAMAC_MEMORY/FRAMAC_PIDS_LIMIT) request a fixed grant, still registered
-# with the broker. --no-broker or FRAMAC_BROKER=off (and, with a warning, a missing host
-# python3 >= 3.10) keep the legacy static sizing: per-container FRAMAC_CPUS/FRAMAC_MEMORY/
-# FRAMAC_PIDS_LIMIT, divided by --agents / FRAMAC_CONCURRENT_AGENTS.
+# lease, so concurrent containers never oversubscribe the node; when a gated lease releases and
+# no tickets are waiting, running elastic containers are grown via `<engine> update` (never
+# shrunk). --cpus/--memory/--pids-limit (or FRAMAC_CPUS/FRAMAC_MEMORY/FRAMAC_PIDS_LIMIT) request
+# a fixed grant, still registered with the broker. --no-broker or FRAMAC_BROKER=off (and, with a
+# warning, a missing host python3 >= 3.10) keep the legacy static sizing: per-container
+# FRAMAC_CPUS/FRAMAC_MEMORY/FRAMAC_PIDS_LIMIT, divided by --agents / FRAMAC_CONCURRENT_AGENTS.
 # Engine: --engine or FRAMAC_CONTAINER_ENGINE = docker | podman | auto (docker when usable).
 # SELinux (enforcing): pipeline-owned mounts get :z; the target mount needs
 # FRAMAC_SELINUX_TARGET=relabel (:z) or FRAMAC_SELINUX_TARGET=disable (label=disable).
@@ -236,7 +237,8 @@ if [[ -n "${TARGET_COMMIT}" ]]; then
 fi
 
 HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privileges)
-ENV_ARGS=(-e PYTHONIOENCODING=utf-8 -e "FRAMAC_OUTER_SANDBOX=${OUTER_SANDBOX}"
+ENV_ARGS=(-e PYTHONIOENCODING=utf-8 -e "S=/opt/framac-pipeline/scripts"
+          -e "FRAMAC_OUTER_SANDBOX=${OUTER_SANDBOX}"
           -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
           -e "FRAMAC_RUN_ID=${RUN_ID}" -e "FRAMAC_RUN_HOST=${RESOLVED_RUN}"
           -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"

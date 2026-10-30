@@ -22,9 +22,11 @@ import socket
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+
+from fingerprint import normalize_file
 
 # Canonical status buckets used across Eva and WP parsing.
 STATUS_VALID = "valid"
@@ -133,7 +135,7 @@ _UNESCAPED_ACSL_IN_JSON_RE = re.compile(
     r"tainted|nothing|exact|round_error"
     r")\b"
 )
-_INVALID_JSON_ESCAPE_RE = re.compile(r'(?<!\\)\\(?![/\"\\bfnrtu])')
+_INVALID_JSON_ESCAPE_RE = re.compile(r"(?<!\\)\\(?![/\"\\bfnrtu])")
 _CTRL_ACSL_SUBS = (
     (re.compile(r"(?:\x07|(?<!\\)\\u0007)(?=t\b)"), r"\\a"),
     (re.compile(r"(?:\x08|(?<!\\)\\u0008)(?=(?:ase_addr|lock_length)\b)"), r"\\b"),
@@ -218,17 +220,73 @@ def read_report_csv(csv_path: Path) -> list[dict]:
             except ValueError:
                 line_no = 0
             status_raw = _pick(raw, _CSV_ALIASES["status"])
-            rows.append({
-                "directory": _pick(raw, _CSV_ALIASES["directory"]),
-                "file": _pick(raw, _CSV_ALIASES["file"]),
-                "line": line_no,
-                "function": _pick(raw, _CSV_ALIASES["function"]),
-                "kind": _pick(raw, _CSV_ALIASES["kind"]),
-                "status_raw": status_raw,
-                "status": normalize_status(status_raw),
-                "property": _pick(raw, _CSV_ALIASES["property"]),
-            })
+            rows.append(
+                {
+                    "directory": _pick(raw, _CSV_ALIASES["directory"]),
+                    "file": _pick(raw, _CSV_ALIASES["file"]),
+                    "line": line_no,
+                    "function": _pick(raw, _CSV_ALIASES["function"]),
+                    "kind": _pick(raw, _CSV_ALIASES["kind"]),
+                    "status_raw": status_raw,
+                    "status": normalize_status(status_raw),
+                    "property": _pick(raw, _CSV_ALIASES["property"]),
+                }
+            )
     return rows
+
+
+def eva_alarm_in_file(alarm: dict, unit_file: str) -> bool:
+    """
+    Match an Eva report row's (directory, file) against a repository-relative `unit_file`
+    so same-named `static` functions in different `.c` files of a slice do not collide.
+    Rows without a `file` field match unconditionally (for legacy/synthetic fixtures).
+    """
+    raw_file = (alarm.get("file") or "").replace("\\", "/").strip()
+    while raw_file.startswith("./"):
+        raw_file = raw_file[2:]
+    if not raw_file:
+        return True
+    raw_dir = (alarm.get("directory") or "").replace("\\", "/").strip().rstrip("/")
+    while raw_dir.startswith("./"):
+        raw_dir = raw_dir[2:]
+    joined = f"{raw_dir}/{raw_file}" if raw_dir and raw_dir != "." and not raw_file.startswith("/") else raw_file
+    u = (unit_file or "").replace("\\", "/").strip()
+    while u.startswith("./"):
+        u = u[2:]
+    if not u:
+        return True
+    return normalize_file(joined) == normalize_file(u)
+
+
+def normalize_flag_args(
+    argv: Sequence[str],
+    options: Iterable[str] = ("--cppflags", "--ldflags"),
+) -> list[str]:
+    """
+    Bind flag-valued options (`--cppflags -I.`, `--ldflags -lm`, `--fuzz-dict -x`) with `=`
+    so `argparse` does not treat a leading `-` in their value as another option.
+    """
+    opt_set = frozenset(options)
+    out: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "--":
+            out.extend(argv[i:])
+            break
+        if tok in opt_set and i + 1 < n:
+            next_tok = argv[i + 1]
+            if next_tok.startswith("--"):
+                out.append(tok)
+                i += 1
+            else:
+                out.append(f"{tok}={next_tok}")
+                i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return out
 
 
 _WINDOWS_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.IGNORECASE)
@@ -242,7 +300,7 @@ def is_safe_relative_path(value: str) -> bool:
         return False
     parts = value.split("/")
     for part in parts:
-        if part in ("", ".", "..") or _WINDOWS_DEVICE.match(part):
+        if part in ("", ".", ".."):
             return False
     return True
 
@@ -258,7 +316,7 @@ def to_run_relative(path: Path, run_dir: Path) -> str:
     """Express a path relative to the run directory using forward slashes."""
     p = Path(path)
     if not p.is_absolute():
-        p = (Path.cwd() / p)
+        p = Path.cwd() / p
     try:
         return p.resolve().relative_to(Path(run_dir).resolve()).as_posix()
     except ValueError:

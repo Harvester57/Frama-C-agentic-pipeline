@@ -122,7 +122,9 @@ class TestResolvePreludeHeaders:
 
     def test_define_resolution_ignores_comments(self, tree: dict[str, Path]) -> None:
         """(c) A #define is resolved; a commented-out #define in another header is ignored."""
-        (tree["src"] / "A.h").write_text("/* #define CMD_NAME_MAX_LEN 64 */\n// #define CMD_NAME_MAX_LEN 1\n", encoding="utf-8")
+        (tree["src"] / "A.h").write_text(
+            "/* #define CMD_NAME_MAX_LEN 64 */\n// #define CMD_NAME_MAX_LEN 1\n", encoding="utf-8"
+        )
         (tree["src"] / "Limits.h").write_text("#  define CMD_NAME_MAX_LEN 32\n", encoding="utf-8")
         runner = ScriptedClang([diag(tree["events_h"], "ident", "CMD_NAME_MAX_LEN")])
 

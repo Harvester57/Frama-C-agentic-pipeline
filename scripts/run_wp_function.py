@@ -28,13 +28,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Optional
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -49,6 +48,7 @@ from framac_common import (  # noqa: E402
     STATUS_VALID_UNDER_HYP,
     augment_framac_cppflags,
     failure_reason,
+    normalize_flag_args,
     read_report_csv,
     scan_undeclared_functions,
 )
@@ -80,9 +80,7 @@ _TIER_B_PATTERNS = (
     "using complete behaviors assigns",
     "Failed smoke-test",
 )
-_TIER_B_RE = re.compile(
-    r"[^\n]*(?:" + "|".join(re.escape(p) for p in _TIER_B_PATTERNS) + r")[^\n]*"
-)
+_TIER_B_RE = re.compile(r"[^\n]*(?:" + "|".join(re.escape(p) for p in _TIER_B_PATTERNS) + r")[^\n]*")
 _SMOKE_FAIL_RE = re.compile(
     r"(Failed smoke-test[^\n]*|Unsuccess[^\n]*smoke[^\n]*|[^\n]*Smoke Tests\s*:\s*0\s*/\s*\d+[^\n]*)",
     re.IGNORECASE,
@@ -156,17 +154,19 @@ def scan_wp_log_soundness(
             f"Memory model hypotheses for function(s) {', '.join(mm_functions)} unchecked (-wp-no-check-memory-model)"
         )
 
-    skipped_rte = sorted({
-        (m.group(1) or m.group(2) or "").strip()
-        for m in _SKIPPED_RTE_RE.finditer(log_text)
-        if (m.group(1) or m.group(2))
-    })
+    skipped_rte = sorted(
+        {
+            (m.group(1) or m.group(2) or "").strip()
+            for m in _SKIPPED_RTE_RE.finditer(log_text)
+            if (m.group(1) or m.group(2))
+        }
+    )
     if skipped_rte and _INDIRECT_CALL_UNSOUND_RE.search(log_text):
         tier_b_unsound.append("indirect call present without '//@ calls' while \\valid_function RTE guards are skipped")
 
     fpv_goals = sorted({m.group(1) for m in _FPV_DEGEN_RE.finditer(log_text)})
 
-    reduced_checks: List[str] = []
+    reduced_checks: list[str] = []
     if unsigned_reduced:
         reduced_checks.append("-warn-unsigned-overflow / -warn-unsigned-downcast OFF")
     elif not warn_unsigned_downcast:
@@ -185,7 +185,7 @@ def scan_wp_log_soundness(
     }
 
 
-def extract_vc_goal_dumps(log_text: str, max_dumps: int = 5) -> List[str]:
+def extract_vc_goal_dumps(log_text: str, max_dumps: int = 5) -> list[str]:
     """Extract raw verification condition (`Assume` / `Prove`) dumps from `-wp-print` output."""
     dumps = [m.group(1).strip() for m in _VC_DUMP_RE.finditer(log_text)]
     return dumps[:max_dumps]
@@ -207,9 +207,11 @@ def check_acsl_syntax(
         "frama-c",
         "-pp-annot",
         "-no-unicode",
-        "-machdep", machdep,
+        "-machdep",
+        machdep,
         f"-cpp-extra-args={effective_cppflags}",
-        "-kernel-warn-key", "annot-error=abort",
+        "-kernel-warn-key",
+        "annot-error=abort",
         str(c_file),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -228,7 +230,9 @@ def check_acsl_syntax(
 _FC_MESSAGE_RE = re.compile(r"^\[(?P<plugin>[A-Za-z][\w-]*)(?::[^\]]*)?\]")
 _CPP_ERROR_RE = re.compile(r"^\S+\.[ch]:\d+(?::\d+)?:\s*(?:fatal )?error:", re.IGNORECASE)
 _KERNEL_ERROR_HINT_RE = re.compile(r"user error|syntax error|annot-error|failure|fatal error|error:", re.IGNORECASE)
-_PLUGIN_USER_ERROR_RE = re.compile(r"^\[(?!kernel\b)[A-Za-z][\w-]*(?::[^\]]*)?\][^\n]*user error", re.IGNORECASE | re.MULTILINE)
+_PLUGIN_USER_ERROR_RE = re.compile(
+    r"^\[(?!kernel\b)[A-Za-z][\w-]*(?::[^\]]*)?\][^\n]*user error", re.IGNORECASE | re.MULTILINE
+)
 
 
 def kernel_parse_errors(log_text: str) -> list[str]:
@@ -254,7 +258,9 @@ def kernel_parse_errors(log_text: str) -> list[str]:
     return errors
 
 
-def _folded_syntax_errors(log_text: str, returncode: int | None, timed_out: bool, report_exists: bool) -> list[str] | None:
+def _folded_syntax_errors(
+    log_text: str, returncode: int | None, timed_out: bool, report_exists: bool
+) -> list[str] | None:
     """Errors when the run stopped in the kernel (parsing/typing) before WP started, else None."""
     if timed_out or returncode in (0, None) or report_exists:
         return None
@@ -311,7 +317,7 @@ def classify_unproven_goal(row: dict) -> str:
     return "step_c_contract_postcondition"
 
 
-def _has_bitwise_unproven_goals(unproven_goals: List[dict], combined_log: str) -> bool:
+def _has_bitwise_unproven_goals(unproven_goals: list[dict], combined_log: str) -> bool:
     for g in unproven_goals:
         text = f"{g.get('kind') or ''} {g.get('annotation') or ''}"
         if _BITWISE_GOAL_RE.search(text):
@@ -333,7 +339,7 @@ def _analysis_error_result(
     fn_name: str,
     c_file: Path,
     reason: str,
-    returncode: Optional[int],
+    returncode: int | None,
     soundness: dict,
     combined_log: str,
 ) -> dict:
@@ -378,11 +384,11 @@ def run_wp_on_function(
     warn_unsigned_downcast: bool = True,
     retry_bitwise: bool = True,
     smoke_tests: bool = False,
-    prop: Optional[str] = None,
+    prop: str | None = None,
     dump_goal: bool = False,
-    session_dir: Optional[Path] = None,
-    extra_sources: Optional[List[str]] = None,
-    wall_timeout: Optional[int] = None,
+    session_dir: Path | None = None,
+    extra_sources: list[str] | None = None,
+    wall_timeout: int | None = None,
     artifact_suffix: str = "",
     cache_dir: str | Path | None = "auto",
     sarif: bool = False,
@@ -400,9 +406,13 @@ def run_wp_on_function(
     }
     mem_limit = enforced_memory_mb()
     if mem_limit is not None and mem_limit < WP_MIN_MEMORY_MB:
-        note = (f"this job may use {mem_limit} MiB, but WP needs at least {WP_MIN_MEMORY_MB} MiB "
-                f"({FRAMAC_KERNEL_RESERVE_MB} MiB for Frama-C plus the fixed {WP_MEMLIMIT_MB} MiB -wp-memlimit of one prover)")
-        error_res = _analysis_error_result(fn_name, c_file, "insufficient_memory", None, scan_wp_log_soundness(""), note)
+        note = (
+            f"this job may use {mem_limit} MiB, but WP needs at least {WP_MIN_MEMORY_MB} MiB "
+            f"({FRAMAC_KERNEL_RESERVE_MB} MiB for Frama-C plus the fixed {WP_MEMLIMIT_MB} MiB -wp-memlimit of one prover)"
+        )
+        error_res = _analysis_error_result(
+            fn_name, c_file, "insufficient_memory", None, scan_wp_log_soundness(""), note
+        )
         error_res["error_summary"] = [note]
         error_res["sizing"] = {**sizing, "memory_limit_mb": mem_limit}
         return error_res
@@ -431,9 +441,11 @@ def run_wp_on_function(
         "frama-c",
         "-pp-annot",
         "-no-unicode",
-        "-machdep", machdep,
+        "-machdep",
+        machdep,
         # The ACSL syntax/type check, folded into this run: an annotation error aborts parsing.
-        "-kernel-warn-key", "annot-error=abort",
+        "-kernel-warn-key",
+        "annot-error=abort",
         "-warn-signed-overflow",
         "-warn-signed-downcast",
         "-warn-left-shift-negative",
@@ -447,35 +459,49 @@ def run_wp_on_function(
         if warn_unsigned_downcast:
             cmd.append("-warn-unsigned-downcast")
 
-    cmd.extend([
-        f"-cpp-extra-args={effective_cppflags}",
-        *sources,
-        "-wp",
-        "-wp-rte",
-        "-wp-split",
-        "-wp-fct", fn_name,
-        "-wp-model", wp_model,
-    ])
+    cmd.extend(
+        [
+            f"-cpp-extra-args={effective_cppflags}",
+            *sources,
+            "-wp",
+            "-wp-rte",
+            "-wp-split",
+            "-wp-fct",
+            fn_name,
+            "-wp-model",
+            wp_model,
+        ]
+    )
     if check_memory_model:
         cmd.append("-wp-check-memory-model")
     for p in [p.strip() for p in provers.split(",") if p.strip()]:
         cmd.extend(["-wp-prover", p])
-    cmd.extend([
-        "-wp-par", str(par),
-        "-wp-timeout", str(timeout),
-        # Fixed per prover, whatever the machine: hardware changes how many provers run, never
-        # what one may use (scripts/resources.py).
-        "-wp-memlimit", str(WP_MEMLIMIT_MB),
-        "-wp-out", str(wp_out_dir),
-    ])
+    cmd.extend(
+        [
+            "-wp-par",
+            str(par),
+            "-wp-timeout",
+            str(timeout),
+            # Fixed per prover, whatever the machine: hardware changes how many provers run, never
+            # what one may use (scripts/resources.py).
+            "-wp-memlimit",
+            str(WP_MEMLIMIT_MB),
+            "-wp-out",
+            str(wp_out_dir),
+        ]
+    )
     if wp_steps > 0:
         cmd.extend(["-wp-steps", str(wp_steps)])
     if session_dir is not None:
         session_dir.mkdir(parents=True, exist_ok=True)
-        cmd.extend([
-            "-wp-session", str(session_dir),
-            "-wp-cache", "none" if dump_goal else "update",
-        ])
+        cmd.extend(
+            [
+                "-wp-session",
+                str(session_dir),
+                "-wp-cache",
+                "none" if dump_goal else "update",
+            ]
+        )
         if use_wp_cache:
             cmd.extend(["-wp-cache-dir", str(wp_cache)])
     elif use_wp_cache:
@@ -493,10 +519,15 @@ def run_wp_on_function(
         cmd.extend(["-save", str(sav_path)])
 
     timed_out = False
-    returncode: Optional[int]
+    returncode: int | None
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=wall_timeout,
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=wall_timeout,
         )
         returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as exc:
@@ -533,7 +564,12 @@ def run_wp_on_function(
         # Killed (OOM, wall-clock limit) or crashed before the report step: nothing was decided,
         # which must never read as "unproven goals remain" with nothing left to synthesize.
         error_res = _analysis_error_result(
-            fn_name, c_file, failure_reason(returncode, timed_out), returncode, soundness, combined_log,
+            fn_name,
+            c_file,
+            failure_reason(returncode, timed_out),
+            returncode,
+            soundness,
+            combined_log,
         )
         error_res["sizing"] = sizing
         return error_res
@@ -542,9 +578,14 @@ def run_wp_on_function(
     if sarif and sav_path.exists():
         subprocess.run(
             [
-                "frama-c", "-load", str(sav_path),
-                "-mdr-gen", "sarif", "-mdr-no-print-libc",
-                "-mdr-out", str(sarif_path),
+                "frama-c",
+                "-load",
+                str(sav_path),
+                "-mdr-gen",
+                "sarif",
+                "-mdr-no-print-libc",
+                "-mdr-out",
+                str(sarif_path),
             ],
             capture_output=True,
             text=True,
@@ -552,19 +593,19 @@ def run_wp_on_function(
             errors="replace",
         )
 
-    proven_goals: List[dict] = []
-    under_hyp_goals: List[dict] = []
-    unproven_goals: List[dict] = []
-    unproven_lemmas: List[dict] = []
-    dead_goals: List[dict] = []
-    buckets: Dict[str, List[dict]] = {
+    proven_goals: list[dict] = []
+    under_hyp_goals: list[dict] = []
+    unproven_goals: list[dict] = []
+    unproven_lemmas: list[dict] = []
+    dead_goals: list[dict] = []
+    buckets: dict[str, list[dict]] = {
         "step_a_assigns": [],
         "step_b_loop_invariant": [],
         "step_c_rte_obligation": [],
         "step_c_caller_precondition": [],
         "step_c_contract_postcondition": [],
     }
-    by_class: Dict[str, Dict[str, int]] = {}
+    by_class: dict[str, dict[str, int]] = {}
     fpv_assumed_count = len(soundness["assumed_function_pointer_goals"])
 
     if csv_path.exists():
@@ -675,12 +716,7 @@ def run_wp_on_function(
             pass
 
     total_goals = len(proven_goals) + len(under_hyp_goals) + len(unproven_goals)
-    all_valid = (
-        (total_goals > 0)
-        and (len(unproven_goals) == 0)
-        and (returncode == 0)
-        and soundness["ok"]
-    )
+    all_valid = (total_goals > 0) and (len(unproven_goals) == 0) and (returncode == 0) and soundness["ok"]
 
     if soundness["tier_a_aborts"]:
         status = "wp_aborted"
@@ -753,7 +789,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wp-model", default="Typed", help="WP memory model (default: Typed)")
     parser.add_argument("--no-check-memory-model", action="store_true", help="Disable -wp-check-memory-model")
     parser.add_argument("--no-warn-invalid-pointer", action="store_true", help="Disable -warn-invalid-pointer")
-    parser.add_argument("--no-warn-unsigned", action="store_true", help="Disable -warn-unsigned-overflow / -warn-unsigned-downcast")
+    parser.add_argument(
+        "--no-warn-unsigned", action="store_true", help="Disable -warn-unsigned-overflow / -warn-unsigned-downcast"
+    )
     parser.add_argument(
         "--no-warn-unsigned-downcast",
         action="store_true",
@@ -772,18 +810,19 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Wall-clock limit for the whole Frama-C run in seconds (0: none; default: FRAMAC_WP_WALL_TIMEOUT, "
-             "else the wp job class limit); exceeding it yields analysis_error",
+        "else the wp job class limit); exceeding it yields analysis_error",
     )
     parser.add_argument(
         "--cache-dir",
         default="auto",
         help="WP prover cache: 'auto' (-wp-cache update -wp-cache-dir <run>/state/cache/wp inside a run directory), "
-             "'off', or a directory",
+        "'off', or a directory",
     )
     parser.add_argument("--sarif", action="store_true", help="Also save the project (-save) and export SARIF")
     parser.add_argument("--keep-goals", action="store_true", help="Keep WP's goal files (-wp-out) under --out-dir")
     parser.add_argument("--out-json", type=Path, required=True)
-    args = parser.parse_args(argv)
+    raw_argv = normalize_flag_args(list(argv) if argv is not None else sys.argv[1:], ("--cppflags",))
+    args = parser.parse_args(raw_argv)
     if str(args.wp_par).strip().lower() != "auto":
         try:
             if int(args.wp_par) < 1:
@@ -819,15 +858,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({
-        "status": res["status"],
-        "function": res["function"],
-        "proven_count": res.get("proven_count", 0),
-        "proven_under_hyp_count": res.get("proven_under_hyp_count", 0),
-        "unproven_count": res.get("unproven_count", 0),
-        "soundness_ok": res.get("soundness", {}).get("ok", False),
-        "next_synthesis_focus": res.get("next_synthesis_focus", "syntax_error"),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "status": res["status"],
+                "function": res["function"],
+                "proven_count": res.get("proven_count", 0),
+                "proven_under_hyp_count": res.get("proven_under_hyp_count", 0),
+                "unproven_count": res.get("unproven_count", 0),
+                "soundness_ok": res.get("soundness", {}).get("ok", False),
+                "next_synthesis_focus": res.get("next_synthesis_focus", "syntax_error"),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

@@ -51,6 +51,7 @@ from framac_common import (  # noqa: E402
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
+    eva_alarm_in_file,
     load_agent_result_json,
     load_json_optional,
     load_json_strict,
@@ -75,20 +76,31 @@ LIVE = frozenset({"running", "merge_queued", "merging"})
 AGENT_KINDS = frozenset({"verify", "arch", "prove", "breaker", "negotiate"})
 PROVER_KINDS = frozenset({"prove", "negotiate"})
 # Role passed to workspace_overlay.prepare_agent, and the role the returned result must carry.
-ROLE_BY_KIND = {"verify": "verifier", "arch": "architect", "prove": "prover", "breaker": "breaker",
-                "negotiate": "prover", "repair": "parent"}
-RESULT_ROLE = {"verify": "crash_verifier", "arch": "architect", "prove": "prover", "breaker": "breaker",
-               "negotiate": "prover"}
+ROLE_BY_KIND = {
+    "verify": "verifier",
+    "arch": "architect",
+    "prove": "prover",
+    "breaker": "breaker",
+    "negotiate": "prover",
+    "repair": "parent",
+}
+RESULT_ROLE = {
+    "verify": "crash_verifier",
+    "arch": "architect",
+    "prove": "prover",
+    "breaker": "breaker",
+    "negotiate": "prover",
+}
 NO_TOUCH = ledger.NO_TOUCH
 
 MAX_NEGOTIATIONS_PER_PAIR = 2  # negotiation rounds per (caller, callee) pair
-MAX_MERGE_ATTEMPTS = 2         # a prover whose merge fails twice is blocked
-MAX_ANALYSIS_ERRORS = 2        # a WP analysis_error is retried once, then the units are blocked
-MAX_INVALID_RESULTS = 2        # a malformed result is re-run once with a fresh agent
+MAX_MERGE_ATTEMPTS = 2  # a prover whose merge fails twice is blocked
+MAX_ANALYSIS_ERRORS = 2  # a WP analysis_error is retried once, then the units are blocked
+MAX_INVALID_RESULTS = 2  # a malformed result is re-run once with a fresh agent
 MAX_PREPARE_ERRORS = 3
-MAX_INGEST_ERRORS = 2          # a verifier result refused by ingest-verifier is re-run once
-MERGE_BATCH_TRIGGER = 4        # queued results of one module that fire a merge
-MERGE_MAX_WAIT_S = 300.0       # the oldest queued result never waits longer than this
+MAX_INGEST_ERRORS = 2  # a verifier result refused by ingest-verifier is re-run once
+MERGE_BATCH_TRIGGER = 4  # queued results of one module that fire a merge
+MERGE_MAX_WAIT_S = 300.0  # the oldest queued result never waits longer than this
 HISTORY_LIMIT = 400
 REOPENABLE_SKIPS = frozenset({"candidate", "no_open_units"})
 _PLACEHOLDER_RE = re.compile(
@@ -109,6 +121,7 @@ class SchedulerError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Collaborators (replaced by fakes in tests)
 # ---------------------------------------------------------------------------
+
 
 def _save_shard(shard_id: str, report: Path) -> dict:
     """Phase-3 checkpoint shard; checkpoint.py prints its own JSON, which must not mix with ours."""
@@ -132,8 +145,15 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
     report.parent.mkdir(parents=True, exist_ok=True)
     with run_lock("merge", run_dir):
         ok, reason = workspace_overlay._run_parent_reverify(
-            run_dir=run_dir, agent_id=agent_id, role="prover", overlay_dir=run_dir / "workspace",
-            c_file=file, function=function, module=None, sources=None, cppflags=cppflags,
+            run_dir=run_dir,
+            agent_id=agent_id,
+            role="prover",
+            overlay_dir=run_dir / "workspace",
+            c_file=file,
+            function=function,
+            module=None,
+            sources=None,
+            cppflags=cppflags,
         )
     return {"ok": ok, "reason": reason, "report": report.relative_to(run_dir).as_posix() if report.is_file() else None}
 
@@ -148,6 +168,7 @@ class Deps:
         self.recheck_function: Callable[..., dict] = _default_recheck
         self.recommend: Callable[..., dict] = resources.recommend
         self.transition: Callable[..., dict] = ledger.cmd_transition
+        self.transition_many: Callable[[list[dict]], list[dict]] = ledger.cmd_transition_many
         self.ingest_wp: Callable[..., dict] = ledger.cmd_ingest_wp
         self.ingest_agent_hypothesis: Callable[..., dict] = ledger.cmd_ingest_agent_hypothesis
         self.ingest_verifier: Callable[..., dict] = ledger.cmd_ingest_verifier
@@ -163,6 +184,7 @@ DEPS = Deps()
 # Small helpers
 # ---------------------------------------------------------------------------
 
+
 def norm_path(value: str | None) -> str:
     """Repository-relative, forward-slash form of a source path seen from any pipeline view."""
     text = (value or "").replace("\\", "/").strip()
@@ -170,14 +192,14 @@ def norm_path(value: str | None) -> str:
     text = _WORK_PREFIX_RE.sub("", text)
     for prefix in ("/framac-run/", "/target/"):
         if text.startswith(prefix):
-            text = text[len(prefix):]
+            text = text[len(prefix) :]
     while text.startswith("./"):
         text = text[2:]
     return re.sub(r"/+", "/", text).strip("/")
 
 
 def _short_hash(text: str, n: int = 6) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:n]
+    return hashlib.sha256(text.encode()).hexdigest()[:n]
 
 
 def _slugify(text: str, limit: int = 40) -> str:
@@ -275,6 +297,7 @@ def _tarjan(nodes: Iterable[str], succ: dict[str, list[str]]) -> list[list[str]]
 # State file
 # ---------------------------------------------------------------------------
 
+
 def _empty_state() -> dict:
     now = utc_now()
     return {
@@ -371,8 +394,15 @@ def _finish(state: dict, task: dict, new_state: str, outcome: str, reason: str |
 
 def _reopen(state: dict, task: dict, reason: str) -> None:
     """Back to pending; the next dispatch gets a fresh agent id (<kind>-<slug>-<n>)."""
-    task.update(state="pending", outcome=None, agent_id=None, assigned_at=None, assigned_ts=None,
-                completed_at=None, last_reason=str(reason)[:500])
+    task.update(
+        state="pending",
+        outcome=None,
+        agent_id=None,
+        assigned_at=None,
+        assigned_ts=None,
+        completed_at=None,
+        last_reason=str(reason)[:500],
+    )
     task["reopened"] = int(task.get("reopened") or 0) + 1
     task.pop("merge", None)
     _event(state, "reopened", task["id"], reason=str(reason)[:200])
@@ -406,6 +436,7 @@ def _assign_parent(state: dict, task: dict) -> None:
 # Inputs: call graph, ledger, candidates, harness sidecars, Eva reports
 # ---------------------------------------------------------------------------
 
+
 class Ctx:
     """The read-only inputs of one scheduling decision, loaded once per command."""
 
@@ -417,7 +448,7 @@ class Ctx:
             str(k): v for k, v in (self.dag.get("modules") or {}).items() if isinstance(v, dict)
         }
         self.sidecars = self._load_sidecars()
-        self.eva_unknowns = self._load_eva()
+        self.eva_unknowns, self._eva_items_by_fn = self._load_eva()
 
         # DAG function records, by (file, name) and by bare name (`functions` is keyed by bare name;
         # a qualified `file#name` key is accepted too).
@@ -441,20 +472,21 @@ class Ctx:
                 self.module_files[mod].add(nf)
                 self.file_module.setdefault(nf, mod)
         for (file, _name), rec in sorted(self.dag_by_key.items()):
-            mod = rec.get("module")
-            if mod and file:
-                self.module_files[str(mod)].add(file)
-                self.file_module.setdefault(file, str(mod))
+            raw_mod = rec.get("module")
+            if raw_mod and file:
+                self.module_files[str(raw_mod)].add(file)
+                self.file_module.setdefault(file, str(raw_mod))
         for cid in sorted(self.units):
             u = self.units[cid]
             nf = norm_path(u["file"])
             self.units_by_fn[(nf, u["function"])].append(u)
-            mod = u.get("module")
-            if mod:
-                self.module_files[mod].add(nf)
-                self.file_module.setdefault(nf, mod)
+            raw_mod = u.get("module")
+            if raw_mod:
+                mod_str = str(raw_mod)
+                self.module_files[mod_str].add(nf)
+                self.file_module.setdefault(nf, mod_str)
                 if u.get("tier"):
-                    self.unit_tier.setdefault(mod, str(u["tier"]))
+                    self.unit_tier.setdefault(mod_str, str(u["tier"]))
 
         # Every definition of a name: {name: {file: module}}. Static functions in different files
         # share a name; the DAG keeps one of them and lists the others in name_collisions.
@@ -493,12 +525,13 @@ class Ctx:
                 except ArtifactError:
                     continue
                 if isinstance(data, dict):
-                    out[str(data.get("module") or path.stem[len("harness_"):])] = data
+                    out[str(data.get("module") or path.stem[len("harness_") :])] = data
         return out
 
     @staticmethod
-    def _load_eva() -> dict[str, int]:
+    def _load_eva() -> tuple[dict[str, int], dict[str, list[Any]]]:
         counts: dict[str, int] = {}
+        items_by_fn: dict[str, list[Any]] = defaultdict(list)
         if EVA_DIR.is_dir():
             for path in sorted(EVA_DIR.glob("*.json")):
                 try:
@@ -510,7 +543,25 @@ class Ctx:
                     for fn, items in by_fn.items():
                         n = len(items) if isinstance(items, list) else int(bool(items))
                         counts[fn] = max(counts.get(fn, 0), n)
-        return counts
+                        items_by_fn[fn].append(items)
+        return counts, dict(items_by_fn)
+
+    def eva_unknown_count(self, file: str | None, fn: str) -> int:
+        if not fn:
+            return 0
+        if not file:
+            return self.eva_unknowns.get(fn, 0)
+        slices = self._eva_items_by_fn.get(fn)
+        if not slices:
+            return self.eva_unknowns.get(fn, 0)
+        best = 0
+        for items in slices:
+            if isinstance(items, list):
+                n = sum(1 for a in items if not (isinstance(a, dict) and a.get("file")) or eva_alarm_in_file(a, file))
+            else:
+                n = int(bool(items))
+            best = max(best, n)
+        return best
 
     def tier(self, mod: str) -> str:
         return str((self.modules.get(mod) or {}).get("tier") or self.unit_tier.get(mod) or "")
@@ -571,6 +622,7 @@ class Ctx:
 # Graph: synchronisation with the ledger, dependencies, recursion groups, priorities
 # ---------------------------------------------------------------------------
 
+
 def _open_units(task: dict, fn_units: list[dict]) -> list[dict]:
     """Units a dispatch would claim: planned ones, plus blocked ones this task worked on before."""
     mine = set(task.get("units") or [])
@@ -610,9 +662,15 @@ def _sync(state: dict, ctx: Ctx) -> dict:
                 loc_file = norm_path(loc.get("file") or "")
                 fn = str(loc.get("function") or fp.split("#", 1)[-1].split("::", 1)[0])
                 _new_task(
-                    state, tid, "verify", f"{fn[:28]}_{fp.rsplit('::', 1)[-1]}",
+                    state,
+                    tid,
+                    "verify",
+                    f"{fn[:28]}_{fp.rsplit('::', 1)[-1]}",
                     module=cand.get("module") or ctx.file_module.get(loc_file) or "unknown",
-                    fingerprint=fp, location_file=loc_file, ingest_errors=0, invalid_results=0,
+                    fingerprint=fp,
+                    location_file=loc_file,
+                    ingest_errors=0,
+                    invalid_results=0,
                 )
                 changes["created"].append(tid)
         elif task is not None and task["state"] == "pending":
@@ -629,8 +687,18 @@ def _sync(state: dict, ctx: Ctx) -> dict:
         if task is None:
             module = next((u["module"] for u in fn_units if u.get("module")), None) or ctx.file_module.get(file)
             _new_task(
-                state, tid, "prove", fn, module=module, file=file, function=fn, units=planned_ids, callees=[],
-                merge_attempts=0, analysis_errors=0, invalid_results=0,
+                state,
+                tid,
+                "prove",
+                fn,
+                module=module,
+                file=file,
+                function=fn,
+                units=planned_ids,
+                callees=[],
+                merge_attempts=0,
+                analysis_errors=0,
+                invalid_results=0,
             )
             changes["created"].append(tid)
         elif task["state"] in TERMINAL:
@@ -666,8 +734,11 @@ def _sync(state: dict, ctx: Ctx) -> dict:
 
     gate_modules = sorted({t["module"] for t in tasks.values() if t["kind"] in ("prove", "arch")})
     state["gates"] = {
-        f"gate:{mod}": {"module": mod, "contributors": ctx.contributors(mod),
-                        "files": sorted(ctx.module_files.get(mod, set()))}
+        f"gate:{mod}": {
+            "module": mod,
+            "contributors": ctx.contributors(mod),
+            "files": sorted(ctx.module_files.get(mod, set())),
+        }
         for mod in gate_modules
     }
     _compute_deps(state, ctx)
@@ -700,11 +771,11 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
                         deps.add(f"arch:{cmod}")
             task["deps"] = sorted(deps)
             task["callees"] = sorted(callees)
-            task["eva_unknowns"] = ctx.eva_unknowns.get(task["function"], 0)
+            task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task["function"])
         elif task["kind"] == "arch":
             task["deps"] = [f"gate:{task['module']}"]
         elif task["kind"] in ("breaker", "negotiate"):
-            task["eva_unknowns"] = ctx.eva_unknowns.get(task.get("function") or "", 0)
+            task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task.get("function") or "")
     # Architects of modules sharing a header run one after the other: the second merge would
     # otherwise see a concurrent edit of the header and be refused.
     by_header: dict[str, list[str]] = defaultdict(list)
@@ -792,7 +863,7 @@ def _chain_heights(state: dict, open_only: bool) -> tuple[dict[str, int], int]:
                 if caller in live:  # the caller is requeued once the negotiation resolves
                     waiters[tid].add(caller)
     for gate in gates:
-        for blocker in _gate_blockers(state, gate[len("gate:"):], index):
+        for blocker in _gate_blockers(state, gate[len("gate:") :], index):
             if blocker in live:
                 waiters[blocker].add(gate)
     nodes = sorted(live | gates)
@@ -815,6 +886,7 @@ def _chain_heights(state: dict, open_only: bool) -> tuple[dict[str, int], int]:
 # ---------------------------------------------------------------------------
 # Readiness
 # ---------------------------------------------------------------------------
+
 
 class _View:
     """Readiness queries over one loaded state; `assume_terminal` asks "ready if these were done?"."""
@@ -847,7 +919,7 @@ class _View:
 
     def dep_ok(self, dep: str) -> bool:
         if dep.startswith("gate:"):
-            return self.gate_open(dep[len("gate:"):])
+            return self.gate_open(dep[len("gate:") :])
         # A callee inside a recursion group is done only when the whole group is.
         scc = (self.tasks.get(dep) or {}).get("scc")
         if not scc:
@@ -904,6 +976,7 @@ def _ready(state: dict, mode: str) -> list[dict]:
 # Ledger unit handling (always under the ledger lock)
 # ---------------------------------------------------------------------------
 
+
 def _unit_ids(task: dict, units: dict[str, dict]) -> list[str]:
     ids = set(task.get("units") or [])
     for cid, u in units.items():
@@ -912,22 +985,62 @@ def _unit_ids(task: dict, units: dict[str, dict]) -> list[str]:
     return sorted(cid for cid in ids if cid in units)
 
 
+def _can_batch_transitions() -> bool:
+    return DEPS.transition is ledger.cmd_transition and callable(DEPS.transition_many)
+
+
+def _batch_or_individual_transitions(
+    specs: list[dict],
+    *,
+    errors: list | None = None,
+    tag: str = "transition",
+) -> list[str]:
+    """
+    Attempt DEPS.transition_many(specs) first; on failure, fall back to individual
+    DEPS.transition calls. Returns the IDs of successfully transitioned units.
+    """
+    if not specs:
+        return []
+    if _can_batch_transitions():
+        try:
+            DEPS.transition_many(specs)
+            return [s["id"] for s in specs]
+        except (ledger.LedgerError, Exception) as exc:
+            if errors is not None:
+                errors.append(f"{tag} batch failed, falling back to individual: {exc}")
+    succeeded: list[str] = []
+    for s in specs:
+        cid = s["id"]
+        try:
+            DEPS.transition(
+                cid,
+                s["status"],
+                s.get("agent_id"),
+                s.get("reason"),
+                expected=s.get("expected"),
+            )
+            succeeded.append(cid)
+        except (ledger.LedgerError, Exception) as exc:
+            if errors is not None:
+                errors.append(f"{tag} {cid}: {exc}")
+    return succeeded
+
+
 def _release_units(task: dict) -> list[str]:
     """in_progress units held by this task's agents go back to planned (compare-and-set)."""
     if task["kind"] != "prove":
         return []
     units, _ = ledger.load_state()
     mine = set(task.get("agents") or [])
-    released = []
-    for cid in _unit_ids(task, units):
-        u = units[cid]
-        if u["status"] == "in_progress" and u.get("agent_id") in mine:
-            try:
-                DEPS.transition(cid, "planned", None, None, expected=["in_progress"])
-                released.append(cid)
-            except ledger.LedgerError:
-                continue
-    return released
+    cids = [
+        cid
+        for cid in _unit_ids(task, units)
+        if units[cid]["status"] == "in_progress" and units[cid].get("agent_id") in mine
+    ]
+    specs = [
+        {"id": cid, "status": "planned", "agent_id": None, "reason": None, "expected": ["in_progress"]} for cid in cids
+    ]
+    return _batch_or_individual_transitions(specs)
 
 
 def _park_units(task: dict, agent_id: str, reason: str) -> dict:
@@ -942,11 +1055,41 @@ def _park_units(task: dict, agent_id: str, reason: str) -> dict:
     units, _ = ledger.load_state()
     mine = set(task.get("agents") or []) | {agent_id}
     owned = set(task.get("units") or [])
+    eligible: list[tuple[str, dict, str]] = []
     for cid in _unit_ids(task, units):
         u = units[cid]
         status = u["status"]
-        if not ((status == "in_progress" and u.get("agent_id") in mine) or (status == "planned" and cid in owned)):
-            continue
+        if (status == "in_progress" and u.get("agent_id") in mine) or (status == "planned" and cid in owned):
+            eligible.append((cid, u, status))
+    if not eligible:
+        return out
+    has_reason = bool((reason or "").strip())
+    if _can_batch_transitions():
+        batch_items: list[dict] = []
+        planned_blocked: list[str] = []
+        planned_planned: list[str] = []
+        for cid, u, status in eligible:
+            if u.get("evidence") and has_reason:
+                batch_items.append(
+                    {"id": cid, "status": "blocked", "agent_id": None, "reason": reason, "expected": [status]}
+                )
+                planned_blocked.append(cid)
+            elif status == "planned":
+                planned_planned.append(cid)
+            else:
+                batch_items.append(
+                    {"id": cid, "status": "planned", "agent_id": None, "reason": None, "expected": ["in_progress"]}
+                )
+                planned_planned.append(cid)
+        try:
+            if batch_items:
+                DEPS.transition_many(batch_items)
+            out["blocked"].extend(planned_blocked)
+            out["planned"].extend(planned_planned)
+            return out
+        except ledger.LedgerError:
+            pass
+    for cid, _u, status in eligible:
         try:
             DEPS.transition(cid, "blocked", None, reason, expected=[status])
             out["blocked"].append(cid)
@@ -965,21 +1108,18 @@ def _park_units(task: dict, agent_id: str, reason: str) -> dict:
 def _block_covered_units(task: dict, reason: str) -> list[str]:
     """A failed contract re-check: the function's covered units are no longer credited."""
     units, _ = ledger.load_state()
-    blocked = []
-    for cid in _unit_ids(task, units):
-        if units[cid]["status"] == "covered":
-            try:
-                DEPS.transition(cid, "blocked", None, reason, expected=["covered"])
-                blocked.append(cid)
-            except ledger.LedgerError:
-                continue
-    return blocked
+    cids = [cid for cid in _unit_ids(task, units) if units[cid]["status"] == "covered"]
+    specs = [
+        {"id": cid, "status": "blocked", "agent_id": None, "reason": reason, "expected": ["covered"]} for cid in cids
+    ]
+    return _batch_or_individual_transitions(specs)
 
 
 def _restore_unit(cid: str, previous: str, unresolved: list[str]) -> None:
     if previous == "blocked":
-        DEPS.transition(cid, "blocked", None, "; ".join(unresolved) or "restored after a refused claim",
-                        expected=["in_progress"])
+        DEPS.transition(
+            cid, "blocked", None, "; ".join(unresolved) or "restored after a refused claim", expected=["in_progress"]
+        )
     else:
         DEPS.transition(cid, "planned", None, None, expected=["in_progress"])
 
@@ -1003,9 +1143,30 @@ def _claim_units(state: dict, task: dict) -> str | None:
     if refusal:
         _finish(state, task, "skipped", refusal, reason=f"claim refused at dispatch ({refusal})")
         return refusal
+    open_list = _open_units(task, fn_units)
+    if _can_batch_transitions():
+        try:
+            DEPS.transition_many(
+                [
+                    {
+                        "id": u["coverage_id"],
+                        "status": "in_progress",
+                        "agent_id": task["agent_id"],
+                        "reason": None,
+                        "expected": ["planned", "blocked"],
+                    }
+                    for u in open_list
+                ]
+            )
+        except ledger.LedgerError as exc:
+            refusal = "candidate" if "'candidate'" in str(exc) else "cas_refused"
+            _finish(state, task, "skipped", refusal, reason=str(exc))
+            return refusal
+        task["units"] = [u["coverage_id"] for u in open_list]
+        return None
     claimed: list[tuple[str, str, list[str]]] = []
     try:
-        for u in _open_units(task, fn_units):
+        for u in open_list:
             DEPS.transition(u["coverage_id"], "in_progress", task["agent_id"], None, expected=["planned", "blocked"])
             claimed.append((u["coverage_id"], u["status"], list(u.get("unresolved") or [])))
     except ledger.LedgerError as exc:
@@ -1021,6 +1182,7 @@ def _claim_units(state: dict, task: dict) -> str | None:
 # ---------------------------------------------------------------------------
 # Descriptions handed to the parent
 # ---------------------------------------------------------------------------
+
 
 def _requests() -> list[dict]:
     data = contract_negotiator.load_ledger(REQUESTS)
@@ -1043,11 +1205,14 @@ def _replay_reports(fingerprint: str, cand: dict) -> list[str]:
         data = _load_report(path)
         if not data:
             continue
-        arts = data.get("artifacts") if isinstance(data.get("artifacts"), list) else []
-        if (data.get("fingerprint") == fingerprint
-                or fingerprint in (data.get("fingerprints") or [])
-                or fingerprint in (data.get("candidates") or [])
-                or any(isinstance(a, dict) and a.get("fingerprint") == fingerprint for a in arts)):
+        raw_arts = data.get("artifacts")
+        arts: list[Any] = raw_arts if isinstance(raw_arts, list) else []
+        if (
+            data.get("fingerprint") == fingerprint
+            or fingerprint in (data.get("fingerprints") or [])
+            or fingerprint in (data.get("candidates") or [])
+            or any(isinstance(a, dict) and a.get("fingerprint") == fingerprint for a in arts)
+        ):
             found.append(path.as_posix())
     return found
 
@@ -1058,11 +1223,21 @@ def _prepare_kwargs(task: dict) -> dict:
     if kind == "prove":
         return {"module": module, "function": task["function"], "c_file": task["file"]}
     if kind == "breaker":  # the stalled prover's report, not the stale workspace/reports/wp/<fn>.json
-        return {"module": module, "function": task["function"], "c_file": task["file"], "wp_report": task.get("wp_report")}
+        return {
+            "module": module,
+            "function": task["function"],
+            "c_file": task["file"],
+            "wp_report": task.get("wp_report"),
+        }
     if kind == "negotiate":
         by_id = {r.get("id"): r for r in _requests()}
-        return {"module": module, "function": task["function"], "c_file": task["file"], "header_file": task.get("header"),
-                "requests": [by_id[r] for r in task.get("requests") or [] if r in by_id]}
+        return {
+            "module": module,
+            "function": task["function"],
+            "c_file": task["file"],
+            "header_file": task.get("header"),
+            "requests": [by_id[r] for r in task.get("requests") or [] if r in by_id],
+        }
     if kind == "arch":
         return {"module": module, "header_file": task.get("header")}
     return {"module": module, "candidate_fp": task["fingerprint"]}
@@ -1104,29 +1279,47 @@ def _describe_repair(task: dict) -> dict:
     mod = task["module"]
     actions = []
     if any(str(r).startswith("harness_induced") for r in task.get("reasons") or []):
-        actions.append(f'python3 {SCRIPTS}/generate_harness.py --record-repair workspace/harnesses/harness_{mod}.json --reason "<reason>"')
-        actions.append(f"repair workspace/harnesses/harness_{mod}.c (or regenerate it with --auto-args / --entry-style auto_prototype)")
+        actions.append(
+            f'python3 {SCRIPTS}/generate_harness.py --record-repair workspace/harnesses/harness_{mod}.json --reason "<reason>"'
+        )
+        actions.append(
+            f"repair workspace/harnesses/harness_{mod}.c (or regenerate it with --auto-args / --entry-style auto_prototype)"
+        )
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run module-{mod}")
     actions.append(f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}")
-    return {"task": task["id"], "kind": "repair", "role": "parent", "module": mod,
-            "reasons": list(task.get("reasons") or []), "actions": actions}
+    return {
+        "task": task["id"],
+        "kind": "repair",
+        "role": "parent",
+        "module": mod,
+        "reasons": list(task.get("reasons") or []),
+        "actions": actions,
+    }
 
 
 # ---------------------------------------------------------------------------
 # init / next
 # ---------------------------------------------------------------------------
 
+
 def _reconcile_units(state: dict, errors: list) -> list[dict]:
     """in_progress units whose agent holds no live task go back to planned (compare-and-set)."""
     live = {t.get("agent_id") for t in state["tasks"].values() if t["state"] in LIVE and t.get("agent_id")}
     units, _ = ledger.load_state()
-    reset = []
-    for cid in sorted(units):
-        u = units[cid]
-        if u["status"] == "in_progress" and u.get("agent_id") not in live:
-            if _try(errors, f"reconcile {cid}", DEPS.transition, cid, "planned", None, None, expected=["in_progress"]):
-                reset.append({"coverage_id": cid, "agent_id": u.get("agent_id")})
-    return reset
+    to_reset = [
+        (cid, units[cid].get("agent_id"))
+        for cid in sorted(units)
+        if units[cid]["status"] == "in_progress" and units[cid].get("agent_id") not in live
+    ]
+    if not to_reset:
+        return []
+    specs = [
+        {"id": cid, "status": "planned", "agent_id": None, "reason": None, "expected": ["in_progress"]}
+        for cid, _ in to_reset
+    ]
+    aid_map = dict(to_reset)
+    succeeded = _batch_or_individual_transitions(specs, errors=errors, tag="reconcile")
+    return [{"coverage_id": cid, "agent_id": aid_map[cid]} for cid in succeeded]
 
 
 def _newest_template_mtime() -> float | None:
@@ -1164,8 +1357,15 @@ def _stale_briefs(state: dict) -> list[dict]:
             aid = brief.parent.name
             task = state["tasks"].get(state["agents"].get(aid, ""))
             live = bool(task and task["state"] in LIVE and task.get("agent_id") == aid)
-            out.append({"brief": brief.as_posix(), "agent_id": aid, "live": live, "reasons": reasons,
-                        "action": "re-render with next --prepare" if not live else "let the running agent finish"})
+            out.append(
+                {
+                    "brief": brief.as_posix(),
+                    "agent_id": aid,
+                    "live": live,
+                    "reasons": reasons,
+                    "action": "re-render with next --prepare" if not live else "let the running agent finish",
+                }
+            )
     return out
 
 
@@ -1195,23 +1395,38 @@ def _write_wp_queue(state: dict) -> None:
         waves[int(task.get("wave") or 0)].append(_key(task))
         if task.get("scc"):
             groups[task["scc"]].append(_key(task))
-    atomic_write_json(WP_QUEUE, {
-        "generated_by": "wp_scheduler.py init",
-        "generated_at": utc_now(),
-        "scheduler": "ready_queue (FRAMAC_SCHEDULER=waves for the wave procedure)",
-        "queue": [
-            {"task": t["id"], "file": t["file"], "function": t["function"], "module": t["module"],
-             "wave": int(t.get("wave") or 0), "height": int(t.get("height") or 0),
-             "eva_unknowns": int(t.get("eva_unknowns") or 0), "coverage_ids": list(t.get("units") or []),
-             "state": t["state"]}
-            for t in prove
-        ],
-        "waves": [{"wave": w, "count": len(waves[w]), "functions": waves[w]} for w in sorted(waves)],
-        "recursion_groups": [sorted(v) for _, v in sorted(groups.items())],
-        "architects": [{"task": t["id"], "module": t["module"], "header": t.get("header")}
-                       for t in sorted(tasks.values(), key=lambda x: x["id"]) if t["kind"] == "arch"],
-        "verify": sorted(t["fingerprint"] for t in tasks.values() if t["kind"] == "verify" and t["state"] not in TERMINAL),
-    })
+    atomic_write_json(
+        WP_QUEUE,
+        {
+            "generated_by": "wp_scheduler.py init",
+            "generated_at": utc_now(),
+            "scheduler": "ready_queue (FRAMAC_SCHEDULER=waves for the wave procedure)",
+            "queue": [
+                {
+                    "task": t["id"],
+                    "file": t["file"],
+                    "function": t["function"],
+                    "module": t["module"],
+                    "wave": int(t.get("wave") or 0),
+                    "height": int(t.get("height") or 0),
+                    "eva_unknowns": int(t.get("eva_unknowns") or 0),
+                    "coverage_ids": list(t.get("units") or []),
+                    "state": t["state"],
+                }
+                for t in prove
+            ],
+            "waves": [{"wave": w, "count": len(waves[w]), "functions": waves[w]} for w in sorted(waves)],
+            "recursion_groups": [sorted(v) for _, v in sorted(groups.items())],
+            "architects": [
+                {"task": t["id"], "module": t["module"], "header": t.get("header")}
+                for t in sorted(tasks.values(), key=lambda x: x["id"])
+                if t["kind"] == "arch"
+            ],
+            "verify": sorted(
+                t["fingerprint"] for t in tasks.values() if t["kind"] == "verify" and t["state"] not in TERMINAL
+            ),
+        },
+    )
 
 
 def _summary(state: dict) -> dict:
@@ -1241,6 +1456,13 @@ def cmd_init(reconcile: bool = False) -> dict:
         if reconcile:
             out["reconciled_units"] = _reconcile_units(state, out["errors"])
             out["stale_briefs"] = _stale_briefs(state)
+            rechecks_reclaimed = []
+            for rid, entry in list((state.get("rechecks") or {}).items()):
+                if entry.get("state") == "running":
+                    entry["state"] = "queued"
+                    rechecks_reclaimed.append(rid)
+            if rechecks_reclaimed:
+                out["rechecks_reclaimed"] = rechecks_reclaimed
         out["sync"] = _sync(state, Ctx())
         if reconcile:
             out["adopted_architects"] = _adopt_merged_architects(state)
@@ -1272,8 +1494,15 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
     move to in_progress with a compare-and-set.
     """
     mode = scheduler_mode()
-    out: dict[str, Any] = {"ok": True, "mode": mode, "tasks": [], "parent_tasks": [], "skipped": [], "errors": [],
-                           "briefs": []}
+    out: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "tasks": [],
+        "parent_tasks": [],
+        "skipped": [],
+        "errors": [],
+        "briefs": [],
+    }
     with run_lock("ledger"):
         state = load_schedule()
         ctx = Ctx()
@@ -1316,13 +1545,16 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
     for tid in picked:
         task = snapshot[tid]
         try:
-            prepared[tid] = DEPS.prepare_agent(Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]],
-                                               **_prepare_kwargs(task))
+            prepared[tid] = DEPS.prepare_agent(
+                Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task)
+            )
         except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running
             failures[tid] = f"{type(exc).__name__}: {exc}"
 
     with run_lock("ledger"):
         state = load_schedule()
+        ready_tids: list[str] = []
+        prove_tasks: list[dict] = []
         for tid in picked:
             task = state["tasks"].get(tid)
             aid = snapshot[tid]["agent_id"]
@@ -1333,8 +1565,49 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                 _prepare_failed(state, task, failures[tid])
                 out["errors"].append({"task": tid, "agent_id": aid, "error": failures[tid]})
                 continue
+            ready_tids.append(tid)
             if task["kind"] == "prove":
-                refusal = _claim_units(state, task)
+                prove_tasks.append(task)
+
+        prove_refusals: dict[str, str | None] = {}
+        if prove_tasks and _can_batch_transitions():
+            units, _ = ledger.load_state()
+            batch_items: list[dict] = []
+            task_open_cids: dict[str, list[str]] = {}
+            for task in prove_tasks:
+                fn_units = [units[cid] for cid in _unit_ids(task, units) if units[cid]["status"] not in NO_TOUCH]
+                refusal = _prove_dispatch_check(task, fn_units)
+                if refusal:
+                    _finish(state, task, "skipped", refusal, reason=f"claim refused at dispatch ({refusal})")
+                    prove_refusals[task["id"]] = refusal
+                    continue
+                open_list = _open_units(task, fn_units)
+                task_open_cids[task["id"]] = [u["coverage_id"] for u in open_list]
+                for u in open_list:
+                    batch_items.append(
+                        {
+                            "id": u["coverage_id"],
+                            "status": "in_progress",
+                            "agent_id": task["agent_id"],
+                            "reason": None,
+                            "expected": ["planned", "blocked"],
+                        }
+                    )
+            if batch_items:
+                try:
+                    DEPS.transition_many(batch_items)
+                    for p_tid, cids in task_open_cids.items():
+                        state["tasks"][p_tid]["units"] = cids
+                        prove_refusals[p_tid] = None
+                except ledger.LedgerError:
+                    for p_tid in task_open_cids:
+                        prove_refusals[p_tid] = _claim_units(state, state["tasks"][p_tid])
+
+        for tid in ready_tids:
+            task = state["tasks"][tid]
+            aid = snapshot[tid]["agent_id"]
+            if task["kind"] == "prove":
+                refusal = prove_refusals[tid] if tid in prove_refusals else _claim_units(state, task)
                 if refusal:
                     out["skipped"].append({"task": tid, "agent_id": aid, "reason": refusal})
                     continue
@@ -1351,6 +1624,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
 # ---------------------------------------------------------------------------
 # complete
 # ---------------------------------------------------------------------------
+
 
 def _load_result(path: Path, task: dict, agent_id: str) -> tuple[dict | None, list[str]]:
     try:
@@ -1370,7 +1644,9 @@ def _load_result(path: Path, task: dict, agent_id: str) -> tuple[dict | None, li
         if res.get("function") != task["function"] or norm_path(res.get("file")) != task["file"]:
             errors.append(f"result is for {res.get('file')}#{res.get('function')}, expected {_key(task)}")
     if task["kind"] == "verify" and res.get("candidate_fingerprint") != task["fingerprint"]:
-        errors.append(f"candidate_fingerprint is {res.get('candidate_fingerprint')!r}, expected {task['fingerprint']!r}")
+        errors.append(
+            f"candidate_fingerprint is {res.get('candidate_fingerprint')!r}, expected {task['fingerprint']!r}"
+        )
     return res, errors
 
 
@@ -1403,8 +1679,16 @@ def _promote_agent_wp(task: dict, agent_id: str, res: dict, errors: list) -> tup
     src = _find_agent_wp_report(agent_id, res, task["function"])
     if src is None:
         return None, None
-    promoted = _try(errors, f"promote {src}", promote_file, Path.cwd(), agent_id, src, kind="artifact",
-                    dest_name=f"wp_{task['function']}.json")
+    promoted = _try(
+        errors,
+        f"promote {src}",
+        promote_file,
+        Path.cwd(),
+        agent_id,
+        src,
+        kind="artifact",
+        dest_name=f"wp_{task['function']}.json",
+    )
     if not promoted:
         return None, None
     dest = Path(promoted["dest"])
@@ -1436,18 +1720,32 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
         if not match and cfile and name:
             match = [(cfile, name, ctx.file_module.get(cfile, ""))]
         if not match:
-            _resolve_request(out["errors"], rid, "rejected_by_callee", "not dispatched: callee not found in the ledger or the call graph")
+            _resolve_request(
+                out["errors"],
+                rid,
+                "rejected_by_callee",
+                "not dispatched: callee not found in the ledger or the call graph",
+            )
             continue
         cfile, cname, cmod = match[0]
         key = f"{cfile}#{cname}"
         if key == caller_key:
-            _resolve_request(out["errors"], rid, "rejected_by_callee", "not dispatched: a function cannot strengthen its own contract by request")
+            _resolve_request(
+                out["errors"],
+                rid,
+                "rejected_by_callee",
+                "not dispatched: a function cannot strengthen its own contract by request",
+            )
             continue
         pair = f"{caller['id']}|{key}"
         count = int(state["negotiation_counts"].get(pair, 0))
         if count >= MAX_NEGOTIATIONS_PER_PAIR:
-            _resolve_request(out["errors"], rid, "rejected_by_callee",
-                             f"not dispatched: negotiation cap ({MAX_NEGOTIATIONS_PER_PAIR}) reached for {caller_key} -> {key}")
+            _resolve_request(
+                out["errors"],
+                rid,
+                "rejected_by_callee",
+                f"not dispatched: negotiation cap ({MAX_NEGOTIATIONS_PER_PAIR}) reached for {caller_key} -> {key}",
+            )
             out.setdefault("negotiations_capped", []).append({"request": rid, "callee": key})
             continue
         state["negotiation_counts"][pair] = count + 1
@@ -1455,9 +1753,23 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
         header = norm_path(req.get("header_file") or "") or None
         task = tasks.get(tid)
         if task is None:
-            task = _new_task(state, tid, "negotiate", cname, module=cmod, file=cfile, function=cname, header=header,
-                             requests=[rid], callers=[caller["id"]], followup_requests=[], followup_callers=[],
-                             merge_attempts=0, analysis_errors=0, invalid_results=0)
+            task = _new_task(
+                state,
+                tid,
+                "negotiate",
+                cname,
+                module=cmod,
+                file=cfile,
+                function=cname,
+                header=header,
+                requests=[rid],
+                callers=[caller["id"]],
+                followup_requests=[],
+                followup_callers=[],
+                merge_attempts=0,
+                analysis_errors=0,
+                invalid_results=0,
+            )
             if f"prove:{key}" in tasks:
                 task["deps"] = [f"prove:{key}"]  # never strengthen a contract still being proved
         elif task["state"] == "pending":
@@ -1478,7 +1790,8 @@ def _requeue_caller(state: dict, caller_id: str) -> bool:
     if caller is None or caller["kind"] != "prove":
         return False
     caller["extra_deps"] = sorted(
-        tid for tid, t in state["tasks"].items()
+        tid
+        for tid, t in state["tasks"].items()
         if t["kind"] == "negotiate" and t["state"] not in TERMINAL and caller_id in (t.get("callers") or [])
     )
     if caller["state"] == "blocked":
@@ -1506,8 +1819,16 @@ def _ensure_breaker(state: dict, prove_task: dict, agent_id: str, wp_report: str
     tid = f"breaker:{_key(prove_task)}"
     task = state["tasks"].get(tid)
     if task is None:
-        task = _new_task(state, tid, "breaker", prove_task["function"], module=prove_task["module"],
-                         file=prove_task["file"], function=prove_task["function"], invalid_results=0)
+        task = _new_task(
+            state,
+            tid,
+            "breaker",
+            prove_task["function"],
+            module=prove_task["module"],
+            file=prove_task["file"],
+            function=prove_task["function"],
+            invalid_results=0,
+        )
     elif task["state"] in TERMINAL:
         _reopen(state, task, "the prover stalled again")
     else:
@@ -1587,7 +1908,9 @@ def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, res
             # not chained into further negotiations.
             copy = Path("agents") / aid / "artifacts" / "result.hypothesis.json"
             atomic_write_json(copy, {**res, "strengthening_requests": []})
-            out["hypothesis"] = _try(out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, copy, task["module"])
+            out["hypothesis"] = _try(
+                out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, copy, task["module"]
+            )
         _resolve_negotiation(state, task, False, f"callee prover {aid} returned {status}", out)
         out["action"] = "negotiation_rejected"
         return
@@ -1595,7 +1918,9 @@ def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, res
     if report_rel and report and report.get("status") != "all_proven":
         out["ingest_wp"] = _try(out["errors"], "ingest-wp", DEPS.ingest_wp, [Path(report_rel)])
     before = {r.get("id") for r in _requests()}
-    out["hypothesis"] = _try(out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, result_path, task["module"])
+    out["hypothesis"] = _try(
+        out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, result_path, task["module"]
+    )
     _emit_negotiations(state, ctx, task, [r for r in _requests() if r.get("id") not in before], out)
     _ensure_breaker(state, task, aid, report_rel, out)
     out["units"] = _park_units(task, aid, f"prover {aid} returned {status}")
@@ -1611,15 +1936,26 @@ def _complete_architect(state: dict, task: dict, aid: str, res: dict, out: dict)
     task["state"] = "merging"
     task["merge"] = {"agent_id": aid, "started_at": utc_now(), "started_ts": DEPS.now()}
     out["action"] = "merging"
-    return {"task": task["id"], "agent_id": aid, "module": task["module"], "header": task.get("header") or res.get("header")}
+    return {
+        "task": task["id"],
+        "agent_id": aid,
+        "module": task["module"],
+        "header": task.get("header") or res.get("header"),
+    }
 
 
 def _merge_architect(job: dict) -> dict:
     side = load_json_optional(HARNESS_DIR / f"harness_{job['module']}.json", {}) or {}
     try:
         return DEPS.merge_agent_overlay(
-            Path.cwd(), job["agent_id"], "architect", header_file=job["header"], module=job["module"],
-            sources=side.get("sources") or None, cppflags=side.get("cppflags") or "-I.", ldflags=side.get("ldflags") or "",
+            Path.cwd(),
+            job["agent_id"],
+            "architect",
+            header_file=job["header"],
+            module=job["module"],
+            sources=side.get("sources") or None,
+            cppflags=side.get("cppflags") or "-I.",
+            ldflags=side.get("ldflags") or "",
         )
     except Exception as exc:  # a refused or crashed merge is an outcome, never a stuck task
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
@@ -1644,7 +1980,9 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
             out["action"] = "blocked_ingest_error"
         return
     records = [res.get("record") or {}, *(res.get("additional_records") or [])]
-    harness_induced = any(r.get("verdict") == "rejected" and r.get("rejection_class") == "harness_induced" for r in records)
+    harness_induced = any(
+        r.get("verdict") == "rejected" and r.get("rejection_class") == "harness_induced" for r in records
+    )
     if harness_induced and not ing.get("harness_exhausted"):
         _ensure_repair(state, task["module"], f"harness_induced: {fp}", out)
     _finish(state, task, "done", str(ing.get("decision")))
@@ -1652,12 +1990,23 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
 
 
 def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path: Path, out: dict) -> None:
-    out["hypothesis"] = _try(out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, result_path, task["module"])
+    out["hypothesis"] = _try(
+        out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, result_path, task["module"]
+    )
     if res["status"] == "crash_found":
         artifact = res.get("crash_artifact")
         if artifact and artifact not in (res.get("seeds") or []):
             # The module re-run must start from the crashing input.
-            _try(out["errors"], "promote crash seed", promote_file, Path.cwd(), aid, artifact, kind="seed", module=task["module"])
+            _try(
+                out["errors"],
+                "promote crash seed",
+                promote_file,
+                Path.cwd(),
+                aid,
+                artifact,
+                kind="seed",
+                module=task["module"],
+            )
         if (HARNESS_DIR / f"harness_{task['module']}.json").is_file():
             _ensure_repair(state, task["module"], f"breaker_crash: {aid}", out)
         else:
@@ -1716,8 +2065,9 @@ def cmd_complete(agent_id: str) -> dict:
             _finish(state, task, "done", "merged")
             out.update(action="merged", modified_files=merged.get("modified_files") or [])
             if merged.get("modified_files"):
-                out["rechecks_queued"] = _queue_rechecks_for_module(state, Ctx(), task["module"],
-                                                                   f"architect {agent_id} changed module contracts")
+                out["rechecks_queued"] = _queue_rechecks_for_module(
+                    state, Ctx(), task["module"], f"architect {agent_id} changed module contracts"
+                )
         else:
             _finish(state, task, "done", "merge_failed", reason=merged.get("reason"))
             out.update(action="merge_failed", reason=merged.get("reason"))
@@ -1730,20 +2080,31 @@ def cmd_complete(agent_id: str) -> dict:
 # merge-pending and contract re-checks
 # ---------------------------------------------------------------------------
 
+
 def _add_recheck(state: dict, caller: dict, reason: str) -> str:
     rid = f"recheck:{_key(caller)}"
     entry = state["rechecks"].get(rid)
     if entry is not None and entry.get("state") == "running":
         entry["again"] = True  # the change landed after the running check read the tree
     elif entry is None:
-        state["rechecks"][rid] = {"id": rid, "task": caller["id"], "reason": reason, "queued_at": utc_now(),
-                                  "queued_ts": DEPS.now(), "retries": 0, "state": "queued"}
+        state["rechecks"][rid] = {
+            "id": rid,
+            "task": caller["id"],
+            "reason": reason,
+            "queued_at": utc_now(),
+            "queued_ts": DEPS.now(),
+            "retries": 0,
+            "state": "queued",
+        }
     return rid
 
 
 def _merged_provers(state: dict) -> list[dict]:
-    return [t for _, t in sorted(state["tasks"].items())
-            if t["kind"] == "prove" and t["state"] == "done" and t.get("outcome") == "merged"]
+    return [
+        t
+        for _, t in sorted(state["tasks"].items())
+        if t["kind"] == "prove" and t["state"] == "done" and t.get("outcome") == "merged"
+    ]
 
 
 def _queue_rechecks_for(state: dict, merged: dict, reason: str) -> list[str]:
@@ -1751,14 +2112,20 @@ def _queue_rechecks_for(state: dict, merged: dict, reason: str) -> list[str]:
     key = _key(merged)
     skip = {merged["id"], f"prove:{key}"}
     scc = merged.get("scc") if merged["kind"] == "prove" else None
-    return [_add_recheck(state, c, reason) for c in _merged_provers(state)
-            if c["id"] not in skip and (key in (c.get("callees") or []) or (scc and c.get("scc") == scc))]
+    return [
+        _add_recheck(state, c, reason)
+        for c in _merged_provers(state)
+        if c["id"] not in skip and (key in (c.get("callees") or []) or (scc and c.get("scc") == scc))
+    ]
 
 
 def _queue_rechecks_for_module(state: dict, ctx: Ctx, module: str, reason: str) -> list[str]:
     """An architect rewrote a module header: re-check merged functions of the module and their callers."""
-    return [_add_recheck(state, c, reason) for c in _merged_provers(state)
-            if c["module"] == module or any(ctx.key_module(k) == module for k in c.get("callees") or [])]
+    return [
+        _add_recheck(state, c, reason)
+        for c in _merged_provers(state)
+        if c["module"] == module or any(ctx.key_module(k) == module for k in c.get("callees") or [])
+    ]
 
 
 def _waiting_caller_modules(state: dict, queued: set[str]) -> set[str]:
@@ -1779,8 +2146,13 @@ def _waiting_caller_modules(state: dict, queued: set[str]) -> set[str]:
 
 
 def _merge_entry(task: dict) -> dict:
-    entry = {"agent_id": task["merge"]["agent_id"], "role": "prover", "file": task["file"],
-             "function": task["function"], "module": task["module"]}
+    entry = {
+        "agent_id": task["merge"]["agent_id"],
+        "role": "prover",
+        "file": task["file"],
+        "function": task["function"],
+        "module": task["module"],
+    }
     if task.get("header"):
         entry["header"] = task["header"]
     return entry
@@ -1822,9 +2194,13 @@ def _on_merge_failed(state: dict, task: dict, aid: str, failure: dict, out: dict
             entry["action"] = "retry_merge"
         else:
             _try(out["errors"], "ingest-wp", DEPS.ingest_wp, [rep_path])
-            entry["units"] = _park_units(task, aid, f"analysis_error: the parent WP re-check did not complete twice ({report.get('reason')})")
+            entry["units"] = _park_units(
+                task, aid, f"analysis_error: the parent WP re-check did not complete twice ({report.get('reason')})"
+            )
             if task["kind"] == "negotiate":
-                _resolve_negotiation(state, task, False, f"parent WP re-check did not complete ({report.get('reason')})", out)
+                _resolve_negotiation(
+                    state, task, False, f"parent WP re-check did not complete ({report.get('reason')})", out
+                )
             else:
                 _finish(state, task, "blocked", "analysis_error", reason=reason)
             entry["action"] = "blocked_analysis_error"
@@ -1904,6 +2280,10 @@ def _apply_recheck(state: dict, job: dict, result: dict, out: dict) -> None:
 def _run_rechecks(module: str | None, out: dict) -> None:
     with run_lock("ledger"):
         state = load_schedule()
+        now = DEPS.now()
+        for entry in (state.get("rechecks") or {}).values():
+            if entry.get("state") == "running" and (now - float(entry.get("started_ts") or now) >= 1800.0):
+                entry["state"] = "queued"
         jobs = []
         for rid, entry in sorted(state["rechecks"].items()):
             caller = state["tasks"].get(entry.get("task", ""))
@@ -1912,17 +2292,26 @@ def _run_rechecks(module: str | None, out: dict) -> None:
                 continue
             if entry.get("state") != "queued" or (module and caller["module"] != module):
                 continue
-            entry.update(state="running", started_ts=DEPS.now())
-            jobs.append({"id": rid, "task": caller["id"], "file": caller["file"], "function": caller["function"],
-                         "module": caller["module"], "agent_id": f"recheck-{caller['slug']}"})
+            entry.update(state="running", started_ts=now)
+            jobs.append(
+                {
+                    "id": rid,
+                    "task": caller["id"],
+                    "file": caller["file"],
+                    "function": caller["function"],
+                    "module": caller["module"],
+                    "agent_id": f"recheck-{caller['slug']}",
+                }
+            )
         save_schedule(state)
     if not jobs:
         return
     results = {}
     for job in jobs:
         try:
-            results[job["id"]] = DEPS.recheck_function(Path.cwd().resolve(), job["agent_id"], job["file"],
-                                                       job["function"], job["module"])
+            results[job["id"]] = DEPS.recheck_function(
+                Path.cwd().resolve(), job["agent_id"], job["file"], job["function"], job["module"]
+            )
         except Exception as exc:  # treated like an analysis error: retried once, then a re-proof
             results[job["id"]] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "report": None}
     with run_lock("ledger"):
@@ -1939,8 +2328,15 @@ def cmd_merge_pending(module: str | None = None, force: bool = False) -> dict:
     on a queued callee, MERGE_BATCH_TRIGGER results are queued, the oldest waited MERGE_MAX_WAIT_S,
     or --force. Then ingest each parent WP report, save checkpoint shards and run contract re-checks.
     """
-    out: dict[str, Any] = {"ok": True, "fired": [], "waiting": [], "merged": [], "failed": [], "rechecks": {},
-                           "errors": []}
+    out: dict[str, Any] = {
+        "ok": True,
+        "fired": [],
+        "waiting": [],
+        "merged": [],
+        "failed": [],
+        "rechecks": {},
+        "errors": [],
+    }
     jobs: list[tuple[str, list[dict]]] = []
     with run_lock("ledger"):
         state = load_schedule()
@@ -1956,13 +2352,17 @@ def cmd_merge_pending(module: str | None = None, force: bool = False) -> dict:
         for mod in sorted(by_module):
             items = sorted(by_module[mod], key=lambda t: (float(t["merge"].get("queued_ts") or now), t["id"]))
             oldest = now - float(items[0]["merge"].get("queued_ts") or now)
-            reasons = [name for name, hit in (
-                ("forced", force),
-                ("no_running_provers", mod not in running_modules),
-                ("caller_waiting", mod in waiting_modules),
-                ("batch_full", len(items) >= MERGE_BATCH_TRIGGER),
-                ("max_wait", oldest >= MERGE_MAX_WAIT_S),
-            ) if hit]
+            reasons = [
+                name
+                for name, hit in (
+                    ("forced", force),
+                    ("no_running_provers", mod not in running_modules),
+                    ("caller_waiting", mod in waiting_modules),
+                    ("batch_full", len(items) >= MERGE_BATCH_TRIGGER),
+                    ("max_wait", oldest >= MERGE_MAX_WAIT_S),
+                )
+                if hit
+            ]
             if not reasons:
                 out["waiting"].append({"module": mod, "queued": len(items), "oldest_s": round(oldest, 1)})
                 continue
@@ -1993,6 +2393,7 @@ def cmd_merge_pending(module: str | None = None, force: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # refresh / requeue / status
 # ---------------------------------------------------------------------------
+
 
 def cmd_refresh(module: str | None = None) -> dict:
     """After the parent repaired a harness (or re-ran a module): close repair:<module> and re-sync."""
@@ -2031,20 +2432,31 @@ def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None)
         else:
             limit = float(stale_minutes or 0) * 60.0
             targets = [
-                t for _, t in sorted(tasks.items())
+                t
+                for _, t in sorted(tasks.items())
                 if (t["state"] == "running" and now - float(t.get("assigned_ts") or now) >= limit)
                 or (t["state"] == "merging" and now - float((t.get("merge") or {}).get("started_ts") or now) >= limit)
             ]
         for task in targets:
             if task["state"] == "merging":  # a merge-pending or complete that died mid-merge
                 task["state"] = "merge_queued" if task["kind"] in PROVER_KINDS else "running"
-                out["merges_requeued"].append({"task": task["id"], "agent_id": (task.get("merge") or {}).get("agent_id")})
+                out["merges_requeued"].append(
+                    {"task": task["id"], "agent_id": (task.get("merge") or {}).get("agent_id")}
+                )
                 continue
             released = _release_units(task)
             previous = task.get("agent_id")
             _reopen(state, task, f"requeued: agent {previous} never returned")
             task["requeued_from"] = previous  # its result, should it still arrive, is accepted
             out["requeued"].append({"task": task["id"], "agent_id": previous, "units_released": released})
+        limit = float(stale_minutes or 0) * 60.0
+        rechecks_requeued = []
+        for rid, entry in list((state.get("rechecks") or {}).items()):
+            if entry.get("state") == "running" and (now - float(entry.get("started_ts") or now) >= limit):
+                entry["state"] = "queued"
+                rechecks_requeued.append(rid)
+        if rechecks_requeued:
+            out["rechecks_requeued"] = rechecks_requeued
         save_schedule(state)
     return out
 
@@ -2060,19 +2472,32 @@ def cmd_status() -> dict:
     ready = _ready(state, mode)
     view = _View(state)
     running = [
-        {"task": t["id"], "kind": t["kind"], "agent_id": t.get("agent_id"),
-         "age_s": round(now - float(t.get("assigned_ts") or now), 1)}
-        for _, t in sorted(tasks.items()) if t["state"] == "running"
+        {
+            "task": t["id"],
+            "kind": t["kind"],
+            "agent_id": t.get("agent_id"),
+            "age_s": round(now - float(t.get("assigned_ts") or now), 1),
+        }
+        for _, t in sorted(tasks.items())
+        if t["state"] == "running"
     ]
     merge_queue = [
-        {"task": t["id"], "state": t["state"], "module": t["module"], "agent_id": (t.get("merge") or {}).get("agent_id"),
-         "age_s": round(now - float((t.get("merge") or {}).get("queued_ts") or now), 1)}
-        for _, t in sorted(tasks.items()) if t["state"] in ("merge_queued", "merging")
+        {
+            "task": t["id"],
+            "state": t["state"],
+            "module": t["module"],
+            "agent_id": (t.get("merge") or {}).get("agent_id"),
+            "age_s": round(now - float((t.get("merge") or {}).get("queued_ts") or now), 1),
+        }
+        for _, t in sorted(tasks.items())
+        if t["state"] in ("merge_queued", "merging")
     ]
     gates = {}
     for gate_id, gate in sorted((state.get("gates") or {}).items()):
         mod = gate["module"]
-        if not any(t["kind"] in ("prove", "arch") and t["module"] == mod and t["state"] not in TERMINAL for t in tasks.values()):
+        if not any(
+            t["kind"] in ("prove", "arch") and t["module"] == mod and t["state"] not in TERMINAL for t in tasks.values()
+        ):
             continue
         waiting_on = sorted(b for b in _gate_blockers(state, mod, view.index) if tasks[b]["state"] not in TERMINAL)
         gates[gate_id] = {"open": not waiting_on, "waiting_on": waiting_on}
@@ -2082,8 +2507,15 @@ def cmd_status() -> dict:
         "ok": True,
         "mode": mode,
         **_summary(state),
-        "ready": [{"task": t["id"], "kind": t["kind"], "height": int(t.get("height") or 0),
-                   "eva_unknowns": int(t.get("eva_unknowns") or 0)} for t in ready],
+        "ready": [
+            {
+                "task": t["id"],
+                "kind": t["kind"],
+                "height": int(t.get("height") or 0),
+                "eva_unknowns": int(t.get("eva_unknowns") or 0),
+            }
+            for t in ready
+        ],
         "running": running,
         "merge_queue": merge_queue,
         "rechecks": sorted(state.get("rechecks") or {}),
@@ -2099,12 +2531,16 @@ def cmd_status() -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase-3 ready-queue scheduler (run from the run directory).")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_init = sub.add_parser("init", help="Build the task graph and write workspace/reports/wp_queue.json")
-    p_init.add_argument("--reconcile", action="store_true",
-                        help="Adopt an existing run: orphaned in_progress units back to planned; report stale briefs")
+    p_init.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Adopt an existing run: orphaned in_progress units back to planned; report stale briefs",
+    )
     p_next = sub.add_parser("next", help="Hand out the highest-priority ready tasks")
     p_next.add_argument("--slots", default="auto", help="'auto' (recommend().max_agents minus running) or a number")
     p_next.add_argument("--prepare", action="store_true", help="Prepare overlays and briefs, claim prover units (CAS)")

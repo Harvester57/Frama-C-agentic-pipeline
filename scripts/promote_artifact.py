@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import ArtifactError, is_safe_agent_id, is_safe_relative_path  # noqa: E402
 
-
 MAX_SEED_BYTES = 64 * 1024
 MAX_SEEDS_PER_AGENT = 32
 MAX_ARTIFACT_BYTES = 1024 * 1024
@@ -104,9 +103,7 @@ def promote_file(
         raise PromotionError(f"unsafe relative path: {src_rel!r}")
     expected_prefix = f"agents/{agent_id}/scratch/"
     if not norm_rel.startswith(expected_prefix):
-        raise PromotionError(
-            f"source path {norm_rel!r} must reside under {expected_prefix!r}"
-        )
+        raise PromotionError(f"source path {norm_rel!r} must reside under {expected_prefix!r}")
     if kind not in ("artifact", "seed", "crash"):
         raise PromotionError(f"unsupported promotion kind: {kind!r}")
     if kind in ("seed", "crash") and not module:
@@ -121,9 +118,7 @@ def promote_file(
 
     max_bytes = MAX_SEED_BYTES if kind in ("seed", "crash") else MAX_ARTIFACT_BYTES
     if st_pre.st_size > max_bytes:
-        raise PromotionError(
-            f"{norm_rel}: file size {st_pre.st_size} bytes exceeds limit ({max_bytes} bytes)"
-        )
+        raise PromotionError(f"{norm_rel}: file size {st_pre.st_size} bytes exceeds limit ({max_bytes} bytes)")
 
     artifacts_dir = run_dir / "agents" / agent_id / "artifacts"
     if kind == "artifact":
@@ -138,11 +133,7 @@ def promote_file(
     fd = os.open(src_abs, flags)
     try:
         st_post = os.fstat(fd)
-        if (
-            st_post.st_dev != st_pre.st_dev
-            or st_post.st_ino != st_pre.st_ino
-            or st_post.st_size != st_pre.st_size
-        ):
+        if st_post.st_dev != st_pre.st_dev or st_post.st_ino != st_pre.st_ino or st_post.st_size != st_pre.st_size:
             raise PromotionError(f"{norm_rel}: file changed during promotion (TOCTOU detected)")
         blob = os.read(fd, st_pre.st_size + 1)
     finally:
@@ -179,13 +170,8 @@ def promote_seeds(
 ) -> dict[str, Any]:
     """Promote up to MAX_SEEDS_PER_AGENT breaker seeds into workspace/corpus/<module>/."""
     if len(seed_rels) > MAX_SEEDS_PER_AGENT:
-        raise PromotionError(
-            f"too many seeds ({len(seed_rels)}) from {agent_id}; limit is {MAX_SEEDS_PER_AGENT}"
-        )
-    promoted = [
-        promote_file(run_dir, agent_id, s, kind="seed", module=module)
-        for s in seed_rels
-    ]
+        raise PromotionError(f"too many seeds ({len(seed_rels)}) from {agent_id}; limit is {MAX_SEEDS_PER_AGENT}")
+    promoted = [promote_file(run_dir, agent_id, s, kind="seed", module=module) for s in seed_rels]
     return {"agent_id": agent_id, "module": module, "promoted": promoted}
 
 

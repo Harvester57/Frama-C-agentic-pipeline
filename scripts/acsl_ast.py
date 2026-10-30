@@ -329,7 +329,9 @@ def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close
     return -1
 
 
-def locate_function_span(source: str, function_name: str, is_header: bool = False, path: str = "<input>") -> Span | None:
+def locate_function_span(
+    source: str, function_name: str, is_header: bool = False, path: str = "<input>"
+) -> Span | None:
     """
     Locate the byte and line span of `function_name` (including any immediately preceding
     ACSL contract block) in a C source file (`is_header=False`) or header file (`is_header=True`).
@@ -375,7 +377,11 @@ def locate_function_span(source: str, function_name: str, is_header: bool = Fals
             # Candidate function name at top level
             if brace_depth == 0 and paren_depth == 0 and tok.text == function_name:
                 open_paren_idx = _next_meaningful(tokens, idx + 1)
-                if open_paren_idx < n and tokens[open_paren_idx].kind == "c_token" and tokens[open_paren_idx].text == "(":
+                if (
+                    open_paren_idx < n
+                    and tokens[open_paren_idx].kind == "c_token"
+                    and tokens[open_paren_idx].text == "("
+                ):
                     close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
                     if close_paren_idx != -1:
                         after_paren_idx = _next_meaningful(tokens, close_paren_idx + 1)
@@ -393,7 +399,7 @@ def locate_function_span(source: str, function_name: str, is_header: bool = Fals
                                         end_byte=end_tok.end,
                                         start_line=start_tok.line,
                                         end_line=end_tok.line,
-                                        text=source[start_tok.start:end_tok.end],
+                                        text=source[start_tok.start : end_tok.end],
                                     )
                             elif is_header and next_tok.text == ";":
                                 start_idx = _compute_span_start(tokens, last_top_boundary_idx, idx)
@@ -405,7 +411,7 @@ def locate_function_span(source: str, function_name: str, is_header: bool = Fals
                                     end_byte=end_tok.end,
                                     start_line=start_tok.line,
                                     end_line=end_tok.line,
-                                    text=source[start_tok.start:end_tok.end],
+                                    text=source[start_tok.start : end_tok.end],
                                 )
         idx += 1
 
@@ -462,15 +468,13 @@ def splice_prover_changes(
         )
 
     # Verify the agent did not modify anything before or after function_name's span
-    base_prefix = base_work_text[:base_span.start_byte]
-    agent_prefix = agent_work_text[:agent_span.start_byte]
-    base_suffix = base_work_text[base_span.end_byte:]
-    agent_suffix = agent_work_text[agent_span.end_byte:]
+    base_prefix = base_work_text[: base_span.start_byte]
+    agent_prefix = agent_work_text[: agent_span.start_byte]
+    base_suffix = base_work_text[base_span.end_byte :]
+    agent_suffix = agent_work_text[agent_span.end_byte :]
 
     if base_prefix != agent_prefix or base_suffix != agent_suffix:
-        raise ScopeViolationError(
-            f"{path}: agent modified content outside assigned function '{function_name}'"
-        )
+        raise ScopeViolationError(f"{path}: agent modified content outside assigned function '{function_name}'")
 
     # Verify that in current_work_text, function_name's span hasn't been concurrently altered
     if curr_span.text != base_span.text:
@@ -478,11 +482,7 @@ def splice_prover_changes(
             f"{path}: function '{function_name}' in workspace/work/ diverged from agent base snapshot"
         )
 
-    spliced = (
-        current_work_text[:curr_span.start_byte]
-        + agent_span.text
-        + current_work_text[curr_span.end_byte:]
-    )
+    spliced = current_work_text[: curr_span.start_byte] + agent_span.text + current_work_text[curr_span.end_byte :]
     post_errors = verify_acsl_only(current_work_text, spliced, path=path)
     if post_errors:
         raise AcslError(f"Post-splice ACSL-only check failed on {path}:\n  " + "\n  ".join(post_errors))
@@ -494,10 +494,22 @@ def splice_prover_changes(
 # ---------------------------------------------------------------------------
 
 _TOP_DECL_KWS = frozenset({"predicate", "logic", "lemma", "type", "axiomatic", "inductive", "ghost"})
-_CONTRACT_KWS = frozenset({
-    "requires", "terminates", "decreases", "exits", "assigns", "ensures",
-    "behavior", "assumes", "allocates", "frees", "complete", "disjoint",
-})
+_CONTRACT_KWS = frozenset(
+    {
+        "requires",
+        "terminates",
+        "decreases",
+        "exits",
+        "assigns",
+        "ensures",
+        "behavior",
+        "assumes",
+        "allocates",
+        "frees",
+        "complete",
+        "disjoint",
+    }
+)
 _CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\\n]){1,4}'")
 _STR_LIT_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
 
@@ -845,14 +857,16 @@ def extract_top_level_acsl_declarations(source: str, path: str = "<input>") -> l
             for seg in _parse_acsl_inner_segments(inner, tok.line):
                 if seg.kind in _TOP_DECL_KWS and seg.name:
                     profile_key = f"{seg.name}/{seg.arity}" if seg.arity is not None else seg.name
-                    decls.append({
-                        "kind": seg.kind,
-                        "name": seg.name,
-                        "arity": seg.arity,
-                        "profile_key": profile_key,
-                        "text": seg.raw_text.strip(),
-                        "line": seg.line,
-                    })
+                    decls.append(
+                        {
+                            "kind": seg.kind,
+                            "name": seg.name,
+                            "arity": seg.arity,
+                            "profile_key": profile_key,
+                            "text": seg.raw_text.strip(),
+                            "line": seg.line,
+                        }
+                    )
 
     return decls
 
@@ -959,4 +973,3 @@ def dedup_acsl_declarations(
         idx += 1
 
     return "".join(out_parts), removed
-

@@ -132,6 +132,7 @@ Pass the printed run directory as `-RunDir` for every later command of the same 
 
 The wrapper sizes every container itself; there are no CPU or memory flags to tune:
 - With a host Python 3.10+, it leases CPUs and memory from the measured pool and starts the container (Docker or Podman, `FRAMAC_CONTAINER_ENGINE`) with matching limits.
+- **Minimum memory floor:** Give the container engine VM at least **4 GiB of RAM** (8 GiB+ recommended for parallel runs). Tools refuse to run below their single-worker minimum (`run_wp_function.py`: **1768 MiB** = 768 MiB Frama-C kernel + 1000 MiB `-wp-memlimit`, reporting `status: "analysis_error"`, `reason: "insufficient_memory"`; `run_eacsl_fuzz.py campaign`: **2560 MiB** = 512 MiB overhead + 2048 MiB `-rss_limit_mb`, reporting `status: "insufficient_memory"`), so a 2 GiB Docker Desktop VM cannot run WP or fuzzing once the host reserve is subtracted.
 - Caps and knobs are environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_PIN`, `FRAMAC_CACHE`, …).
 - `-NoBroker` (`--no-broker`) restores the previous static sizing.
 - See [`docs/resources-and-caching.md`](docs/resources-and-caching.md).

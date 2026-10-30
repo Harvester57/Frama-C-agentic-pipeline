@@ -223,6 +223,43 @@ For selection options this is stricter than needed.
 **Workaround.** We compute the function list from preprocessed sources, and on `no function 'X'`
 we drop the names and retry once.
 
+## Issue 8: `__gen_e_acsl_<fn>` wrapper leaves `__retres` uninitialized under `-rte-initialized`
+
+**Observed.** When a function carries a `requires` contract and is instrumented with both `-rte`
+(`-rte-initialized`) and `-e-acsl`, E-ACSL generates a wrapper `__gen_e_acsl_<fn>` that declares a
+return temporary (e.g., `int __retres;`), checks the precondition, calls `<fn>`, assigns `__retres`,
+and checks any `ensures` clauses before returning `__retres`. In Frama-C 33.0 (and 32.0), E-ACSL
+also instruments the generated wrapper's own return statement with an initialization check on
+`__retres`, or emits code paths where `__e_acsl_initialize(&__retres, sizeof(__retres))` is not
+recorded before `__retres` is read, triggering a false-positive `initialization: \initialized(&__retres)`
+runtime abort inside `__gen_e_acsl_<fn>` even when `<fn>` returns a well-defined value.
+
+**Expected.** Compiler-generated return temporaries (`__retres`) in `__gen_e_acsl_<fn>` wrappers are
+either initialized at declaration and marked initialized in E-ACSL shadow memory (`__e_acsl_initialize`),
+or exempted from `-rte-initialized` checks inside E-ACSL's own generated wrapper functions.
+
+**Reproducer.**
+```c
+/* retres_repro.c */
+/*@ requires x >= 0;
+    ensures \result >= 0; */
+int id_nonneg(int x) {
+    return x;
+}
+
+int main(void) {
+    return id_nonneg(0);
+}
+```
+```sh
+frama-c -machdep gcc_x86_64 -rte -rte-initialized -then -e-acsl retres_repro.c -ocode instrumented.c
+```
+
+**Workaround.** `scripts/eacsl_toolchain.py` (`mark_wrapper_results_initialized`) post-processes
+`instrumented.c` using pattern matching (silent when no matches are found) to insert
+`__e_acsl_initialize((void *)(& __retres), sizeof(__retres));` immediately after
+`__e_acsl_store_block((void *)(& __retres), ...)`. This should be removed once fixed upstream.
+
 ---
 
 ## Summary table
@@ -236,3 +273,4 @@ we drop the names and retry once.
 | 5 | Bug (codegen) | Medium | Complete opaque types in stubs |
 | 6 | Diagnostics | Medium | Differential replay on a sanitizer build |
 | 7 | Feature request | Low | Preprocessed discovery and retry |
+| 8 | Bug (wrapper codegen) | High: false-positive abort on contracted functions | Post-process `__gen_e_acsl_*` wrapper `__retres` in `instrumented.c` |

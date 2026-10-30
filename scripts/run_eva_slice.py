@@ -37,6 +37,7 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
     tail = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
     return tail[-max_lines:]
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
@@ -51,6 +52,7 @@ from framac_common import (  # noqa: E402
     STATUS_VALID_UNDER_HYP,
     augment_framac_cppflags,
     failure_reason,
+    normalize_flag_args,
     read_report_csv,
     scan_undeclared_functions,
 )
@@ -109,8 +111,16 @@ def run_eva_on_slice(
             stale.unlink()
 
     cmd, reduced_checks = _eva_command(
-        sources, main_fn, out_dir, machdep, cppflags, slevel, warn_invalid_pointer, warn_unsigned,
-        warn_unsigned_downcast, extra_domains,
+        sources,
+        main_fn,
+        out_dir,
+        machdep,
+        cppflags,
+        slevel,
+        warn_invalid_pointer,
+        warn_unsigned,
+        warn_unsigned_downcast,
+        extra_domains,
     )
 
     def _run() -> dict:
@@ -166,7 +176,8 @@ def _eva_command(
         "frama-c",
         "-pp-annot",
         "-no-unicode",
-        "-machdep", machdep,
+        "-machdep",
+        machdep,
         "-warn-signed-overflow",
         "-warn-signed-downcast",
         "-warn-left-shift-negative",
@@ -188,20 +199,34 @@ def _eva_command(
         reduced_checks.extend(["-no-warn-unsigned-overflow", "-no-warn-unsigned-downcast"])
 
     effective_cppflags = augment_framac_cppflags(cppflags)
-    cmd.extend([
-        f"-cpp-extra-args={effective_cppflags}",
-        *sources,
-        "-main", main_fn,
-        "-rte",
-        "-then", "-eva",
-        "-eva-domains", eva_domains(extra_domains),
-        "-eva-slevel", str(slevel),
-        "-eva-auto-loop-unroll", "32",
-        "-eva-report-red-statuses", str(red_csv),
-        "-then", "-metrics", "-metrics-eva-cover",
-        "-then", "-report", "-report-csv", str(csv_path),
-        "-save", str(sav_path),
-    ])
+    cmd.extend(
+        [
+            f"-cpp-extra-args={effective_cppflags}",
+            *sources,
+            "-main",
+            main_fn,
+            "-rte",
+            "-then",
+            "-eva",
+            "-eva-domains",
+            eva_domains(extra_domains),
+            "-eva-slevel",
+            str(slevel),
+            "-eva-auto-loop-unroll",
+            "32",
+            "-eva-report-red-statuses",
+            str(red_csv),
+            "-then",
+            "-metrics",
+            "-metrics-eva-cover",
+            "-then",
+            "-report",
+            "-report-csv",
+            str(csv_path),
+            "-save",
+            str(sav_path),
+        ]
+    )
     return cmd, reduced_checks
 
 
@@ -234,18 +259,27 @@ def _execute_eva(
     if sav_path.exists() and not timed_out:
         sarif_cmd = [
             "frama-c",
-            "-load", str(sav_path),
-            "-mdr-gen", "sarif",
+            "-load",
+            str(sav_path),
+            "-mdr-gen",
+            "sarif",
             "-mdr-no-print-libc",
-            "-mdr-out", str(sarif_path),
+            "-mdr-out",
+            str(sarif_path),
         ]
         subprocess.run(sarif_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     alarms_by_status: dict[str, list[dict]] = {
-        "Valid": [], "Unknown": [], "Invalid": [], "Dead": [], "Assumed": [], "Other": [],
+        "Valid": [],
+        "Unknown": [],
+        "Invalid": [],
+        "Dead": [],
+        "Assumed": [],
+        "Other": [],
     }
     unknown_by_function: dict[str, list[dict]] = defaultdict(list)
-    functions_with_properties = set()
+    functions_with_properties: set[str] = set()
+    functions_with_properties_by_file: set[tuple[str, str, str]] = set()
 
     if csv_path.exists():
         for row in read_report_csv(csv_path):
@@ -262,6 +296,7 @@ def _execute_eva(
             }
             if row["function"]:
                 functions_with_properties.add(row["function"])
+                functions_with_properties_by_file.add((row["directory"], row["file"], row["function"]))
             if st in (STATUS_VALID, STATUS_VALID_UNDER_HYP):
                 alarms_by_status["Valid"].append(entry)
             elif st in (STATUS_UNKNOWN, STATUS_NEVER_TRIED):
@@ -280,22 +315,16 @@ def _execute_eva(
             else:
                 alarms_by_status["Other"].append(entry)
 
-    total_checked = (
-        len(alarms_by_status["Valid"])
-        + len(alarms_by_status["Unknown"])
-        + len(alarms_by_status["Invalid"])
-    )
-    discharged_pct = (
-        round(100.0 * len(alarms_by_status["Valid"]) / total_checked, 2)
-        if total_checked > 0
-        else 0.0
-    )
+    total_checked = len(alarms_by_status["Valid"]) + len(alarms_by_status["Unknown"]) + len(alarms_by_status["Invalid"])
+    discharged_pct = round(100.0 * len(alarms_by_status["Valid"]) / total_checked, 2) if total_checked > 0 else 0.0
 
     # A failed Frama-C run or a missing report must never look like "0 alarms".
     reason = None
     if timed_out:
         status = "analysis_timeout"
-        error_summary = [f"Frama-C Eva exceeded the {timeout} s wall-clock limit"] + extract_error_summary(combined_log)[-5:]
+        error_summary = [f"Frama-C Eva exceeded the {timeout} s wall-clock limit"] + extract_error_summary(
+            combined_log
+        )[-5:]
     else:
         status = "ok" if returncode == 0 and csv_path.exists() else "analysis_error"
         error_summary = extract_error_summary(combined_log) if status != "ok" else []
@@ -323,6 +352,9 @@ def _execute_eva(
         "surviving_unknown_functions": sorted(unknown_by_function.keys()),
         "unknown_obligations_by_function": dict(unknown_by_function),
         "functions_with_properties": sorted(functions_with_properties),
+        "functions_with_properties_by_file": [
+            {"directory": d, "file": f, "function": fn} for d, f, fn in sorted(functions_with_properties_by_file)
+        ],
         "invalid_alarms": alarms_by_status["Invalid"],
         "dead_alarms": alarms_by_status["Dead"],
         "assumed_properties": alarms_by_status["Assumed"],
@@ -364,14 +396,15 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Wall-clock limit in seconds (0: none; default: the eva job class limit); "
-             "exceeding it yields status analysis_timeout.",
+        "exceeding it yields status analysis_timeout.",
     )
     parser.add_argument(
         "--extra-domains",
         default="",
         help="Comma-separated Eva domains appended to -eva-domains (e.g. 'taint').",
     )
-    args = parser.parse_args(argv)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
     timeout = CLASSES["eva"].wall_timeout_s if args.timeout is None else args.timeout
     try:
         eva_domains(args.extra_domains)
@@ -394,19 +427,24 @@ def main(argv: list[str] | None = None) -> int:
     res["module"] = args.module
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({
-        "status": res["status"],
-        "reason": res.get("reason"),
-        "error_summary": res["error_summary"],
-        "undeclared_functions": res["undeclared_functions"],
-        "valid_count": res["valid_count"],
-        "unknown_count": res["unknown_count"],
-        "invalid_count": res["invalid_count"],
-        "dead_count": res["dead_count"],
-        "assumed_count": res["assumed_count"],
-        "discharged_percentage": res["discharged_percentage"],
-        "surviving_unknown_functions": res["surviving_unknown_functions"],
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "status": res["status"],
+                "reason": res.get("reason"),
+                "error_summary": res["error_summary"],
+                "undeclared_functions": res["undeclared_functions"],
+                "valid_count": res["valid_count"],
+                "unknown_count": res["unknown_count"],
+                "invalid_count": res["invalid_count"],
+                "dead_count": res["dead_count"],
+                "assumed_count": res["assumed_count"],
+                "discharged_percentage": res["discharged_percentage"],
+                "surviving_unknown_functions": res["surviving_unknown_functions"],
+            },
+            indent=2,
+        )
+    )
     return 0 if res["status"] == "ok" else 1
 
 

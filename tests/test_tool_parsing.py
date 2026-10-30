@@ -56,6 +56,7 @@ state/w/src/util/sum.h:11: Error: Postcondition failed:
 
 def test_parse_new_style_rte_failure():
     f = parse_eacsl_failure(NEW_STYLE)
+    assert f is not None
     assert f["file"] == "src/snmp/ber.c" and f["line"] == 42
     assert f["function"] == "ber_decode_len"
     assert f["kind"] == "assertion" and f["alarm_kind"] == "mem_access" and f["is_rte"]
@@ -64,15 +65,23 @@ def test_parse_new_style_rte_failure():
 
 def test_parse_framac33_label_line_then_predicate():
     f = parse_eacsl_failure(FRAMAC33_RTE)
+    assert f is not None
     assert (f["line"], f["function"], f["kind"]) == (30, "parse_record", "assertion")
-    assert (f["label"], f["predicate"], f["alarm_kind"], f["is_rte"]) == ("rte/index_bound", "i < 8", "index_bound", True)
+    assert (f["label"], f["predicate"], f["alarm_kind"], f["is_rte"]) == (
+        "rte/index_bound",
+        "i < 8",
+        "index_bound",
+        True,
+    )
     post = parse_eacsl_failure(FRAMAC33_POST)
+    assert post is not None
     assert (post["kind"], post["label"], post["predicate"]) == ("postcondition", "range", "0 ≤ \\result ≤ 0xF")
     assert post["alarm_kind"] is None and not post["is_rte"]
 
 
 def test_parse_old_style_precondition_failure():
     f = parse_eacsl_failure(OLD_STYLE)
+    assert f is not None
     assert f["line"] == 17 and f["function"] == "parse_hdr"
     assert f["kind"] == "precondition" and not f["is_rte"]
     assert f["predicate"] == "len <= 64"
@@ -160,14 +169,24 @@ def test_campaign_classification():
 def test_guardrail_separates_code_faults_from_overconstrained_contracts():
     assert classify_guardrail(0, False, "")["status"] == "passed_dynamic_oracle"
     rte = classify_guardrail(1, False, NEW_STYLE)
-    assert rte["status"] == "code_fault" and rte["fingerprint"].startswith("src/snmp/ber.c#ber_decode_len::mem_access::")
+    assert rte["status"] == "code_fault" and rte["fingerprint"].startswith(
+        "src/snmp/ber.c#ber_decode_len::mem_access::"
+    )
     assert classify_guardrail(1, False, ANNOTATION)["status"] == "rejected_overconstrained"
     assert classify_guardrail(1, False, "segfault")["status"] == "guardrail_error"
 
 
 def test_wp_goal_to_obligation_class():
-    assert goal_obligation_class({"kind": "postcondition", "annotation": "ensures L5_no_crlf: no_crlf_or_nul(out, \\result)"}) == "l5_output"
-    assert goal_obligation_class({"kind": "postcondition", "annotation": "L6_key_wiped: buffer_is_zeroed(k, 32)"}) == "l6_secret"
+    assert (
+        goal_obligation_class(
+            {"kind": "postcondition", "annotation": "ensures L5_no_crlf: no_crlf_or_nul(out, \\result)"}
+        )
+        == "l5_output"
+    )
+    assert (
+        goal_obligation_class({"kind": "postcondition", "annotation": "L6_key_wiped: buffer_is_zeroed(k, 32)"})
+        == "l6_secret"
+    )
     assert goal_obligation_class({"kind": "loop variant", "annotation": "n - i"}) == "l2_termination"
     assert goal_obligation_class({"kind": "assigns", "annotation": "assigns out[0..n-1]"}) == "l3_frame"
     assert goal_obligation_class({"kind": "assertion", "annotation": "rte: mem_access: \\valid(p)"}) == "rte"

@@ -27,15 +27,17 @@ Execution requires a POSIX host (i.e. inside the container); elsewhere
 SandboxUnavailable is raised and nothing is run.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import signal
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
 
 DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 OUTPUT_TAIL_BYTES = 8000
@@ -52,7 +54,7 @@ class Limits:
     file_size_mb: int = 512
     open_files: int = 1024
     processes: int = 256
-    address_space_mb: Optional[int] = None
+    address_space_mb: int | None = None
 
 
 @dataclass
@@ -62,7 +64,7 @@ class SandboxResult:
     stderr: str
     timed_out: bool
     sandbox: str
-    command: List[str] = field(default_factory=list)
+    command: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -82,7 +84,7 @@ def sandbox_mode() -> str:
     return SANDBOX_MODE
 
 
-def build_env(home: Path, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def build_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = {
         "PATH": DEFAULT_PATH,
         "LANG": "C.UTF-8",
@@ -103,15 +105,16 @@ def _make_preexec(limits: Limits):
 
         def _set(which, value):
             if value is not None:
-                resource.setrlimit(which, (value, value))
+                resource.setrlimit(which, (value, value))  # type: ignore[attr-defined]
 
-        _set(resource.RLIMIT_CPU, limits.cpu_seconds)
-        _set(resource.RLIMIT_FSIZE, limits.file_size_mb * 1024 * 1024 if limits.file_size_mb else None)
-        _set(resource.RLIMIT_NOFILE, limits.open_files)
-        _set(resource.RLIMIT_NPROC, limits.processes)
+        _set(resource.RLIMIT_CPU, limits.cpu_seconds)  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_FSIZE, limits.file_size_mb * 1024 * 1024 if limits.file_size_mb else None)  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_NOFILE, limits.open_files)  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_NPROC, limits.processes)  # type: ignore[attr-defined]
         if limits.address_space_mb:
-            _set(resource.RLIMIT_AS, limits.address_space_mb * 1024 * 1024)
-        _set(resource.RLIMIT_CORE, 0)
+            _set(resource.RLIMIT_AS, limits.address_space_mb * 1024 * 1024)  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_CORE, 0)  # type: ignore[attr-defined]
+
     return _apply
 
 
@@ -119,9 +122,9 @@ def run_sandboxed(
     argv: Sequence[str],
     writable: Sequence[Path],
     timeout_s: int,
-    cwd: Optional[Path] = None,
-    limits: Optional[Limits] = None,
-    extra_env: Optional[Dict[str, str]] = None,
+    cwd: Path | None = None,
+    limits: Limits | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> SandboxResult:
     mode = sandbox_mode()  # raises SandboxUnavailable on non-POSIX hosts
     limits = limits or Limits()
@@ -147,7 +150,7 @@ def run_sandboxed(
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
         except ProcessLookupError:
             pass
         out, err = proc.communicate()

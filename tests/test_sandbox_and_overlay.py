@@ -96,7 +96,7 @@ def test_overlay_refuses_stale_baseline(tmp_path):
         init_overlay(target, overlay)
 
 
-FAKE_ENGINE = '''
+FAKE_ENGINE = """
 import json, pathlib, sys
 here = pathlib.Path(__file__).parent
 cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -110,10 +110,19 @@ elif cmd == "--version":
     print("Docker version 28.0.0")
 elif cmd == "run":
     (here / "run_args.txt").write_text("\\n".join(sys.argv[1:]) + "\\n", encoding="utf-8")
-'''
+"""
 
-DOCKER_INFO = {"NCPU": 4, "MemTotal": 8 * 1024**3, "OperatingSystem": "Docker Desktop", "CgroupVersion": "2",
-               "CpuCfsQuota": True, "CPUSet": True, "MemoryLimit": True, "SwapLimit": True, "PidsLimit": True}
+DOCKER_INFO = {
+    "NCPU": 4,
+    "MemTotal": 8 * 1024**3,
+    "OperatingSystem": "Docker Desktop",
+    "CgroupVersion": "2",
+    "CpuCfsQuota": True,
+    "CPUSet": True,
+    "MemoryLimit": True,
+    "SwapLimit": True,
+    "PidsLimit": True,
+}
 
 
 def _fake_engine(tmp_path):
@@ -133,9 +142,14 @@ def _fake_engine(tmp_path):
     (tmp_path / "run_1").mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith("FRAMAC_")}
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
-    env.update(FRAMAC_PYTHON=sys.executable, FRAMAC_BROKER_DIR=str(tmp_path / "broker"),
-               FRAMAC_CACHE_DIR=str(tmp_path / "cache"), FRAMAC_POOL_CPUS="2", FRAMAC_POOL_MEMORY="4g",
-               PYTHONDONTWRITEBYTECODE="1")
+    env.update(
+        FRAMAC_PYTHON=sys.executable,
+        FRAMAC_BROKER_DIR=str(tmp_path / "broker"),
+        FRAMAC_CACHE_DIR=str(tmp_path / "cache"),
+        FRAMAC_POOL_CPUS="2",
+        FRAMAC_POOL_MEMORY="4g",
+        PYTHONDONTWRITEBYTECODE="1",
+    )
     return bin_dir / "run_args.txt", env
 
 
@@ -147,17 +161,20 @@ def _engine_run_args(log):
 
 def _assert_broker_flags(args, pairs, job_class):
     """The host broker's lease flags sit right after `run`; limits match the job env; the shim gets the command."""
-    lease = args[2][len("framac-"):]
+    lease = args[2][len("framac-") :]
     assert args[:2] == ["run", "--name"] and ("--label", f"framac.lease={lease}") in pairs and "--init" in args
     env = dict(a.split("=", 1) for a in args if a.startswith("FRAMAC_"))
     assert env["FRAMAC_JOB_CLASS"] == job_class and 1 <= int(env["FRAMAC_POOL_CPUS"]) <= 2
     assert ("--cpus", env["FRAMAC_JOB_CPUS"]) in pairs
-    assert ("--memory", env["FRAMAC_JOB_MEM_MB"] + "m") in pairs and ("--memory-swap", env["FRAMAC_JOB_MEM_MB"] + "m") in pairs
+    assert ("--memory", env["FRAMAC_JOB_MEM_MB"] + "m") in pairs and (
+        "--memory-swap",
+        env["FRAMAC_JOB_MEM_MB"] + "m",
+    ) in pairs
     assert ("--pids-limit", "4096") in pairs and env["FRAMAC_IMAGE_ID"] == "sha256:feedface"
     assert env["FRAMAC_OUTER_SANDBOX"] == "docker-hardened" and env["FRAMAC_RUN_HOST"]
     assert ("--entrypoint", "/bin/bash") in pairs and "/opt/framac-pipeline/skills:ro" in " ".join(args)
     assert env["FRAMAC_SHARED_CACHE_DIR"] == "/framac-cache" and env["FRAMAC_CACHE_MODE"] in ("ro", "rw")
-    assert args.index("--init") < args.index("--network")    # injected before the caller's hardening flags
+    assert args.index("--init") < args.index("--network")  # injected before the caller's hardening flags
     return env
 
 
@@ -213,8 +230,16 @@ def test_ps1_broker_path_sizes_the_container_through_resources_exec(tmp_path):
     if not pwsh:
         pytest.skip("pwsh/powershell not available")
     log_file, env = _fake_engine(tmp_path)
-    base = [pwsh, "-NoProfile", "-File", str(ROOT / "wrappers/framac-docker.ps1"),
-            "-TargetDir", str(tmp_path / "target_repo"), "-RunDir", str(tmp_path / "run_1")]
+    base = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(ROOT / "wrappers/framac-docker.ps1"),
+        "-TargetDir",
+        str(tmp_path / "target_repo"),
+        "-RunDir",
+        str(tmp_path / "run_1"),
+    ]
 
     proc = subprocess.run([*base, "-Class", "wp", "true"], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr or proc.stdout
@@ -222,7 +247,7 @@ def test_ps1_broker_path_sizes_the_container_through_resources_exec(tmp_path):
     job = _assert_broker_flags(args, pairs, "wp")
     assert job["FRAMAC_CACHE_MODE"] == "ro" and any(a.endswith(":/framac-cache:ro") for a in args)
     assert args[-2:] == ["/opt/framac-pipeline/scripts/container_entry.sh", "true"]
-    assert not list((tmp_path / "broker" / "leases").glob("*.json"))     # the lease was released
+    assert not list((tmp_path / "broker" / "leases").glob("*.json"))  # the lease was released
 
     trusted = "python3 /opt/framac-pipeline/scripts/cache.py stats"
     proc = subprocess.run([*base, "-CacheRw", trusted], env=env, capture_output=True, text=True)
@@ -242,8 +267,16 @@ def test_ps1_forwards_the_pipeline_knobs_read_inside_the_container(tmp_path):
         pytest.skip("pwsh/powershell not available")
     log_file, env = _fake_engine(tmp_path)
     env.update(FRAMAC_SCHEDULER="waves", FRAMAC_MAX_AGENTS="3", FRAMAC_CACHE="off")
-    base = [pwsh, "-NoProfile", "-File", str(ROOT / "wrappers/framac-docker.ps1"),
-            "-TargetDir", str(tmp_path / "target_repo"), "-RunDir", str(tmp_path / "run_1")]
+    base = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(ROOT / "wrappers/framac-docker.ps1"),
+        "-TargetDir",
+        str(tmp_path / "target_repo"),
+        "-RunDir",
+        str(tmp_path / "run_1"),
+    ]
     for extra in ([], ["-NoBroker"]):
         proc = subprocess.run([*base, *extra, "true"], env=env, capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr or proc.stdout
@@ -262,10 +295,18 @@ def test_sh_wrapper_broker_and_legacy_paths(tmp_path):
     if not bash:
         pytest.skip("bash not available")
     log_file, env = _fake_engine(tmp_path)
-    base = [bash, str(ROOT / "wrappers/framac-docker.sh"), "--target", str(tmp_path / "target_repo"),
-            "--run-dir", str(tmp_path / "run_1")]
+    base = [
+        bash,
+        str(ROOT / "wrappers/framac-docker.sh"),
+        "--target",
+        str(tmp_path / "target_repo"),
+        "--run-dir",
+        str(tmp_path / "run_1"),
+    ]
 
-    proc = subprocess.run([*base, "--no-broker", "--agents", "3", "--", "true"], env=env, capture_output=True, text=True)
+    proc = subprocess.run(
+        [*base, "--no-broker", "--agents", "3", "--", "true"], env=env, capture_output=True, text=True
+    )
     assert proc.returncode == 0, proc.stderr
     args, pairs = _engine_run_args(log_file)
     assert ("--pids-limit", "1365") in pairs and "--init" not in args and args[-1] == "true"
@@ -285,4 +326,3 @@ def test_sh_wrapper_broker_and_legacy_paths(tmp_path):
 
     proc = subprocess.run([*base, "--agents", "2", "--", "true"], env=env, capture_output=True, text=True)
     assert proc.returncode == 0 and "deprecated" in proc.stderr
-

@@ -52,7 +52,11 @@ def cmd_request(
     ledger = load_ledger(ledger_path)
     # IDs derive from the highest existing sequence number, never from len(), so a
     # resolved or removed entry cannot cause a collision. The parent is the only writer.
-    seqs = [int(r["id"].split("_")[1]) for r in ledger["requests"] if r.get("id", "").startswith("req_") and r["id"].split("_")[1].isdigit()]
+    seqs = [
+        int(r["id"].split("_")[1])
+        for r in ledger["requests"]
+        if r.get("id", "").startswith("req_") and r["id"].split("_")[1].isdigit()
+    ]
     req_id = f"req_{(max(seqs) if seqs else 0) + 1:04d}_{caller_fn}_to_{callee_fn}"
     entry = {
         "id": req_id,
@@ -108,8 +112,7 @@ def cmd_ingest_prover(
     raw_reqs = res.get("strengthening_requests") or []
     ledger = load_ledger(ledger_path)
     existing_keys = {
-        (r.get("caller_function"), r.get("callee_function"), r.get("needed_clause"))
-        for r in ledger.get("requests", [])
+        (r.get("caller_function"), r.get("callee_function"), r.get("needed_clause")) for r in ledger.get("requests", [])
     }
 
     added: list[dict] = []
@@ -228,4 +231,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

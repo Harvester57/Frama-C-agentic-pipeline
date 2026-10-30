@@ -14,7 +14,6 @@ from build_callgraph_dag import (
     discover_in_tree_cppflags,
     extract_functions_from_code,
     infer_security_properties,
-    synthesize_compile_commands,
 )
 
 
@@ -121,7 +120,9 @@ retry:
         fns = extract_functions_from_code(src)
         by_name = {f["name"]: f for f in fns}
 
-        fwd_sig = analyze_signature(by_name["forward_cleanup"]["decl_tokens"], by_name["forward_cleanup"]["param_tokens"])
+        fwd_sig = analyze_signature(
+            by_name["forward_cleanup"]["decl_tokens"], by_name["forward_cleanup"]["param_tokens"]
+        )
         fwd_body = analyze_body("forward_cleanup", by_name["forward_cleanup"]["body_tokens"], fwd_sig)
         assert fwd_body["has_backward_goto"] is False
         assert fwd_body["verifiability"] == "core_provable"

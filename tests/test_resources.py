@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,7 +28,13 @@ GiB = 1024**3
 def _isolated_env(monkeypatch):
     """Probes must only see the fake trees and variables a test sets."""
     for name in list(os.environ):
-        if name.startswith(("FRAMAC_", "SLURM_")) or name in ("DOCKER_HOST", "CONTAINER_HOST", "DOCKER_CONTEXT"):
+        if name.startswith(("FRAMAC_", "SLURM_")) or name in (
+            "DOCKER_HOST",
+            "CONTAINER_HOST",
+            "DOCKER_CONTEXT",
+            "WSL_DISTRO_NAME",
+            "WSL_INTEROP",
+        ):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("FRAMAC_PROBE_MEMO_S", "0")
 
@@ -60,10 +67,10 @@ def test_cgroup_v2_takes_the_minimum_over_every_ancestor(tmp_path):
     put(tmp_path, "/proc/self/cgroup", "0::/user.slice/job.scope/step\n")
     put(tmp_path, "/proc/self/mountinfo", CGROUP2_MOUNT)
     cg = "/sys/fs/cgroup"
-    put(tmp_path, f"{cg}/user.slice/cpu.max", "200000 100000\n")          # the tightest CPU limit is an ancestor
+    put(tmp_path, f"{cg}/user.slice/cpu.max", "200000 100000\n")  # the tightest CPU limit is an ancestor
     put(tmp_path, f"{cg}/user.slice/memory.max", str(8 * GiB))
     put(tmp_path, f"{cg}/user.slice/job.scope/cpu.max", "600000 100000\n")
-    put(tmp_path, f"{cg}/user.slice/job.scope/memory.max", str(3 * GiB))   # ...and memory the middle one
+    put(tmp_path, f"{cg}/user.slice/job.scope/memory.max", str(3 * GiB))  # ...and memory the middle one
     put(tmp_path, f"{cg}/user.slice/job.scope/step/cpu.max", "max 100000\n")
     put(tmp_path, f"{cg}/user.slice/job.scope/step/memory.max", "max\n")
     put(tmp_path, f"{cg}/user.slice/job.scope/step/memory.high", str(5 * GiB))
@@ -87,16 +94,24 @@ def test_cgroup_v2_path_is_resolved_against_the_mount_root(tmp_path):
 
 
 def test_cgroup_v1_limits_and_usage_through_mountinfo_roots(tmp_path):
-    put(tmp_path, "/proc/self/cgroup", """
+    put(
+        tmp_path,
+        "/proc/self/cgroup",
+        """
         12:memory:/docker/abc
         11:cpu,cpuacct:/docker/abc
         10:cpuset:/docker/abc
-    """)
-    put(tmp_path, "/proc/self/mountinfo", """
+    """,
+    )
+    put(
+        tmp_path,
+        "/proc/self/mountinfo",
+        """
         40 30 0:35 /docker/abc /sys/fs/cgroup/memory ro,nosuid - cgroup cgroup rw,memory
         41 30 0:36 /docker/abc /sys/fs/cgroup/cpu,cpuacct ro,nosuid - cgroup cgroup rw,cpu,cpuacct
         42 30 0:37 /docker/abc /sys/fs/cgroup/cpuset ro,nosuid - cgroup cgroup rw,cpuset
-    """)
+    """,
+    )
     put(tmp_path, "/sys/fs/cgroup/memory/memory.limit_in_bytes", str(2 * GiB))
     put(tmp_path, "/sys/fs/cgroup/memory/memory.max_usage_in_bytes", str(700 * 1024 * 1024))
     put(tmp_path, "/sys/fs/cgroup/memory/memory.oom_control", "oom_kill_disable 0\nunder_oom 0\noom_kill 2\n")
@@ -158,7 +173,7 @@ def test_container_scope_reserves_only_for_machine_bound_resources(tmp_path, mon
     pool = R.probe("container", root=root)
     # The cgroup CPU limit is the host broker's grant: no reserve. Memory is only bounded by the machine.
     assert (pool.cpus, pool.binding["cpus"], pool.reserve["cpus"]) == (4, "cgroup", 0.0)
-    assert (pool.binding["mem_mb"], pool.mem_mb) == ("machine", 58982)   # 64 GiB - max(1 GiB, 10%)
+    assert (pool.binding["mem_mb"], pool.mem_mb) == ("machine", 58982)  # 64 GiB - max(1 GiB, 10%)
     monkeypatch.setenv("FRAMAC_JOB_CPUS", "2")
     monkeypatch.setenv("FRAMAC_JOB_MEM_MB", "3000")
     granted = R.probe("container", root=root)
@@ -169,20 +184,37 @@ def test_container_scope_reserves_only_for_machine_bound_resources(tmp_path, mon
 
 def test_probe_reports_pressure_and_network_filesystems(tmp_path):
     root = _machine(tmp_path)
-    put(root, "/proc/pressure/memory", "some avg10=35.00 avg60=1.00 avg300=0.00 total=1\nfull avg10=9.50 avg60=0 avg300=0 total=1\n")
+    put(
+        root,
+        "/proc/pressure/memory",
+        "some avg10=35.00 avg60=1.00 avg300=0.00 total=1\nfull avg10=9.50 avg60=0 avg300=0 total=1\n",
+    )
     put(root, "/proc/pressure/cpu", "some avg10=75.00 avg60=1.00 avg300=0.00 total=1\n")
-    put(root, "/proc/self/mountinfo", """
+    put(
+        root,
+        "/proc/self/mountinfo",
+        """
         1 0 0:1 / / rw - overlay overlay rw
         2 1 0:2 /Users/x/run /framac-run rw - 9p C:\\134 rw,aname=drvfs
         3 1 0:3 / /framac-cache rw - ext4 /dev/sda1 rw
-    """)
+    """,
+    )
     pool = R.probe("container", root=root, run_dir="/framac-run/sub", cache_dir="/framac-cache")
     assert pool.psi["memory"] == {"some": 35.0, "full": 9.5} and pool.psi["cpu"]["some"] == 75.0
     assert pool.fs == {"run_dir": "9p", "cache_dir": "ext4"}
     text = " | ".join(pool.warnings)
     assert "memory pressure" in text and "CPU pressure" in text and "9p" in text and "ext4" not in text
-    for kind, network in (("nfs4", True), ("fuse.sshfs", True), ("cifs", True), ("virtiofs", True), ("lustre", True),
-                          ("ext4", False), ("overlay", False), ("xfs", False), (None, False)):
+    for kind, network in (
+        ("nfs4", True),
+        ("fuse.sshfs", True),
+        ("cifs", True),
+        ("virtiofs", True),
+        ("lustre", True),
+        ("ext4", False),
+        ("overlay", False),
+        ("xfs", False),
+        (None, False),
+    ):
         assert R.is_network_fs(kind) is network, kind
 
 
@@ -205,20 +237,21 @@ def _two_numa_smt(root: Path) -> Path:
 
 def test_topology_and_whole_core_allocator_on_two_numa_nodes(tmp_path):
     topo = R.cpu_topology(_two_numa_smt(tmp_path), range(16))
+    assert topo is not None
     assert topo["cores"][:2] == [[0, 8], [1, 9]] and len(topo["cores"]) == 8 and topo["threads_per_core"] == 2
     assert topo["numa"] == [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]] and len(topo["l3"]) == 2
 
     taken: set[int] = set()
     first = R.allocate_cpuset(topo, range(16), taken, 4)
-    assert first == [0, 1, 8, 9]                       # whole cores, lowest domain on a tie
+    assert first == [0, 1, 8, 9]  # whole cores, lowest domain on a tie
     taken |= set(first)
     second = R.allocate_cpuset(topo, range(16), taken, 3)
-    assert second == [2, 3, 10, 11]                     # rounded up to whole cores; best fit = fuller node 0
+    assert second == [2, 3, 10, 11]  # rounded up to whole cores; best fit = fuller node 0
     taken |= set(second)
     third = R.allocate_cpuset(topo, range(16), taken, 6)
-    assert third == [4, 5, 6, 12, 13, 14]               # stays inside node 1
+    assert third == [4, 5, 6, 12, 13, 14]  # stays inside node 1
     taken |= set(third)
-    assert R.allocate_cpuset(topo, range(16), taken, 4) is None   # only one free core left
+    assert R.allocate_cpuset(topo, range(16), taken, 4) is None  # only one free core left
     # No single node has enough free cores: spread over the emptiest domains.
     busy = {0, 8, 1, 9, 2, 10, 4, 12, 5, 13, 6, 14}
     assert R.allocate_cpuset(topo, range(16), busy, 4) == [3, 7, 11, 15]
@@ -235,8 +268,13 @@ def test_pin_plan_policy(tmp_path, monkeypatch):
     assert not R.pin_plan(multi, R.EngineInfo(kind="docker", vm_backed=True), platform="linux").exclusive
     assert not R.pin_plan(multi, R.EngineInfo(kind="podman", cpuset=False), platform="linux").exclusive
     assert not R.pin_plan(multi, native, platform="win32").exclusive
-    single = R.Pool(scope="host", cpus=7, mem_mb=60000, cpu_ids=tuple(range(8)),
-                    topology={"cores": [[i] for i in range(8)], "l3": [list(range(8))], "numa": [list(range(8))]})
+    single = R.Pool(
+        scope="host",
+        cpus=7,
+        mem_mb=60000,
+        cpu_ids=tuple(range(8)),
+        topology={"cores": [[i] for i in range(8)], "l3": [list(range(8))], "numa": [list(range(8))]},
+    )
     assert not R.pin_plan(single, native, platform="linux").exclusive
     assert R.pin_plan(single, native, mode="on", platform="linux").exclusive
     # An affinity that is a strict subset of the machine (Slurm, cpusets) is always passed on.
@@ -254,38 +292,68 @@ def test_probe_marks_affinity_subsets_and_reads_topology(tmp_path):
     put(root, "/proc/self/status", "Name:\tpython\nCpus_allowed_list:\t4-7,12-15\n")
     pool = R.probe("host", root=root)
     assert pool.subset and pool.cpu_ids == (4, 5, 6, 7, 12, 13, 14, 15) and pool.binding["cpus"] == "affinity"
-    assert pool.topology["numa"] == [[4, 5, 6, 7, 12, 13, 14, 15]] and pool.cpus == 7
+    assert pool.topology is not None and pool.topology["numa"] == [[4, 5, 6, 7, 12, 13, 14, 15]] and pool.cpus == 7
 
 
 # ---------------------------------------------------------------------------
 # Engine views
 # ---------------------------------------------------------------------------
 
-DOCKER_DESKTOP = {"NCPU": 12, "MemTotal": 16731901952, "OperatingSystem": "Docker Desktop (containerized)",
-                  "CgroupVersion": "2", "CpuCfsQuota": True, "CPUSet": True, "MemoryLimit": True, "SwapLimit": True,
-                  "PidsLimit": True, "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"]}
+DOCKER_DESKTOP = {
+    "NCPU": 12,
+    "MemTotal": 16731901952,
+    "OperatingSystem": "Docker Desktop (containerized)",
+    "CgroupVersion": "2",
+    "CpuCfsQuota": True,
+    "CPUSet": True,
+    "MemoryLimit": True,
+    "SwapLimit": True,
+    "PidsLimit": True,
+    "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+}
 
 
 def test_engine_info_docker_desktop_and_native_docker():
     desktop = R.parse_engine_info(DOCKER_DESKTOP, env={}, platform="linux")
     assert (desktop.kind, desktop.ncpu, desktop.mem_total_mb, desktop.vm_backed, desktop.remote) == (
-        "docker", 12, 15956, True, False)
+        "docker",
+        12,
+        15956,
+        True,
+        False,
+    )
     assert desktop.cpu and desktop.cpuset and desktop.memory and desktop.swap and desktop.pids
-    native = dict(DOCKER_DESKTOP, OperatingSystem="Ubuntu 24.04.1 LTS", SwapLimit=False,
-                  SecurityOptions=["name=seccomp,profile=builtin", "name=rootless", "name=cgroupns"])
+    native = dict(
+        DOCKER_DESKTOP,
+        OperatingSystem="Ubuntu 24.04.1 LTS",
+        SwapLimit=False,
+        SecurityOptions=["name=seccomp,profile=builtin", "name=rootless", "name=cgroupns"],
+    )
     info = R.parse_engine_info(native, env={}, platform="linux")
     assert not info.vm_backed and info.rootless and not info.swap and info.memory
-    assert R.parse_engine_info(native, env={}, platform="win32").vm_backed      # Linux containers on Windows: a VM
+    assert R.parse_engine_info(native, env={}, platform="win32").vm_backed  # Linux containers on Windows: a VM
     remote = R.parse_engine_info(native, env={"DOCKER_HOST": "tcp://build-host:2376"}, platform="linux")
     assert remote.remote and remote.vm_backed
-    local_socket = R.parse_engine_info(native, env={"DOCKER_HOST": "unix:///run/user/1000/docker.sock"}, platform="linux")
+    local_socket = R.parse_engine_info(
+        native, env={"DOCKER_HOST": "unix:///run/user/1000/docker.sock"}, platform="linux"
+    )
     assert not local_socket.remote and not local_socket.vm_backed
 
 
 def _podman(controllers, rootless=True, remote=False):
-    return {"host": {"cpus": 16, "memTotal": 32 * GiB, "cgroupVersion": "v2", "cgroupControllers": controllers,
-                     "security": {"rootless": rootless}, "serviceIsRemote": remote, "os": "linux"},
-            "store": {}, "version": {"Version": "5.2.0"}}
+    return {
+        "host": {
+            "cpus": 16,
+            "memTotal": 32 * GiB,
+            "cgroupVersion": "v2",
+            "cgroupControllers": controllers,
+            "security": {"rootless": rootless},
+            "serviceIsRemote": remote,
+            "os": "linux",
+        },
+        "store": {},
+        "version": {"Version": "5.2.0"},
+    }
 
 
 def test_engine_info_rootless_podman_with_and_without_delegated_controllers():
@@ -294,7 +362,7 @@ def test_engine_info_rootless_podman_with_and_without_delegated_controllers():
     assert (default.cpu, default.cpuset, default.memory, default.swap, default.pids) == (False, False, True, True, True)
     full = R.parse_engine_info(_podman(["cpuset", "cpu", "io", "memory", "hugetlb", "pids"]), env={}, platform="linux")
     assert full.cpu and full.cpuset and full.memory and full.pids and not full.vm_backed
-    none = R.parse_engine_info(_podman([]), env={}, platform="linux")   # cgroup v1 rootless: nothing enforceable
+    none = R.parse_engine_info(_podman([]), env={}, platform="linux")  # cgroup v1 rootless: nothing enforceable
     assert not (none.cpu or none.cpuset or none.memory or none.swap or none.pids)
     machine = R.parse_engine_info(_podman(["memory", "pids"], remote=True), env={}, platform="linux")
     assert machine.remote and machine.vm_backed
@@ -310,25 +378,54 @@ def test_engine_info_runs_the_engine_once_and_caches_in_the_broker_dir(tmp_path)
     info = R.engine_info("fake-engine", cache_dir=tmp_path, runner=runner)
     assert info.ok and info.ncpu == 12 and calls == [["fake-engine", "info", "--format", "{{json .}}"]]
     R._ENGINE_MEMO.clear()
-    cached = R.engine_info("fake-engine", cache_dir=tmp_path)          # served from the cache file, no process
+    cached = R.engine_info("fake-engine", cache_dir=tmp_path)  # served from the cache file, no process
     assert cached.ok and cached.ncpu == 12 and len(calls) == 1
     R._ENGINE_MEMO.clear()
-    failing = R.engine_info("fake-engine", cache_dir=tmp_path, runner=lambda cmd, **kw: subprocess.CompletedProcess(
-        cmd, 1, stdout="", stderr="Cannot connect to the Docker daemon"))
-    assert not failing.ok and "Cannot connect" in failing.error
+    failing = R.engine_info(
+        "fake-engine",
+        cache_dir=tmp_path,
+        runner=lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="Cannot connect to the Docker daemon"
+        ),
+    )
+    assert not failing.ok and failing.error is not None and "Cannot connect" in failing.error
 
 
 # ---------------------------------------------------------------------------
 # Engine command line
 # ---------------------------------------------------------------------------
 
-def _argv(**kw):
-    base = dict(lease_id="0123456789ab", cls_name="wp", key="ber_decode", cpus=4, mem_mb=4768,
-                eng=R.EngineInfo(kind="docker"), pool_cpus=11, pool_mem_mb=14000, pids_limit=4096,
-                cache_host="/home/u/.cache/framac-pipeline", cache_mode="ro", command="true", image_id="sha256:abc")
+
+def _argv(**kw: Any):
+    base: dict[str, Any] = dict(
+        lease_id="0123456789ab",
+        cls_name="wp",
+        key="ber_decode",
+        cpus=4,
+        mem_mb=4768,
+        eng=R.EngineInfo(kind="docker"),
+        pool_cpus=11,
+        pool_mem_mb=14000,
+        pids_limit=4096,
+        cache_host="/home/u/.cache/framac-pipeline",
+        cache_mode="ro",
+        command="true",
+        image_id="sha256:abc",
+    )
     base.update(kw)
-    return R.build_engine_argv(["docker", "run", "--rm", "-i", "--network", "none", "img:1",
-                                "/opt/framac-pipeline/scripts/container_entry.sh"], **base)
+    return R.build_engine_argv(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "--network",
+            "none",
+            "img:1",
+            "/opt/framac-pipeline/scripts/container_entry.sh",
+        ],
+        **base,
+    )
 
 
 def _pairs(argv):
@@ -337,22 +434,48 @@ def _pairs(argv):
 
 def test_engine_argv_inserts_lease_flags_limits_env_and_cache_after_run():
     argv = _argv()
-    assert argv[:7] == ["docker", "run", "--name", "framac-0123456789ab", "--label", "framac.lease=0123456789ab", "--init"]
+    assert argv[:7] == [
+        "docker",
+        "run",
+        "--name",
+        "framac-0123456789ab",
+        "--label",
+        "framac.lease=0123456789ab",
+        "--init",
+    ]
     pairs = _pairs(argv)
-    for pair in (("--cpus", "4"), ("--memory", "4768m"), ("--memory-swap", "4768m"), ("--pids-limit", "4096"),
-                 ("-e", "FRAMAC_JOB_CPUS=4"), ("-e", "FRAMAC_JOB_MEM_MB=4768"), ("-e", "FRAMAC_JOB_CLASS=wp"),
-                 ("-e", "FRAMAC_JOB_KEY=ber_decode"), ("-e", "FRAMAC_POOL_CPUS=11"), ("-e", "FRAMAC_POOL_MEM_MB=14000"),
-                 ("-e", "FRAMAC_IMAGE_ID=sha256:abc"), ("-e", "FRAMAC_CACHE_MODE=ro"),
-                 ("-e", "FRAMAC_SHARED_CACHE_DIR=/framac-cache"),
-                 ("-v", "/home/u/.cache/framac-pipeline:/framac-cache:ro")):
+    for pair in (
+        ("--cpus", "4"),
+        ("--memory", "4768m"),
+        ("--memory-swap", "4768m"),
+        ("--pids-limit", "4096"),
+        ("-e", "FRAMAC_JOB_CPUS=4"),
+        ("-e", "FRAMAC_JOB_MEM_MB=4768"),
+        ("-e", "FRAMAC_JOB_CLASS=wp"),
+        ("-e", "FRAMAC_JOB_KEY=ber_decode"),
+        ("-e", "FRAMAC_POOL_CPUS=11"),
+        ("-e", "FRAMAC_POOL_MEM_MB=14000"),
+        ("-e", "FRAMAC_IMAGE_ID=sha256:abc"),
+        ("-e", "FRAMAC_CACHE_MODE=ro"),
+        ("-e", "FRAMAC_SHARED_CACHE_DIR=/framac-cache"),
+        ("-v", "/home/u/.cache/framac-pipeline:/framac-cache:ro"),
+    ):
         assert pair in pairs, pair
     assert "--cpuset-cpus" not in argv
     # The caller's flags follow the injected ones; the command string is the last argument.
     assert argv[-4:] == ["none", "img:1", "/opt/framac-pipeline/scripts/container_entry.sh", "true"]
     assert argv.index("--init") < argv.index("--rm")
     with pytest.raises(ValueError):
-        R.build_engine_argv(["docker", "ps"], lease_id="x", cls_name="wp", cpus=1, mem_mb=1, eng=R.EngineInfo(),
-                            pool_cpus=1, pool_mem_mb=1)
+        R.build_engine_argv(
+            ["docker", "ps"],
+            lease_id="x",
+            cls_name="wp",
+            cpus=1,
+            mem_mb=1,
+            eng=R.EngineInfo(),
+            pool_cpus=1,
+            pool_mem_mb=1,
+        )
 
 
 def test_engine_argv_omits_limits_the_engine_cannot_enforce():
@@ -386,13 +509,28 @@ def test_engine_argv_cache_modes():
 
 def test_cache_mount_mode_allowlist_is_exact(monkeypatch):
     s = "python3 /opt/framac-pipeline/scripts"
-    for cmd in (f"{s}/pipeline_make.py run build", f"{s}/pipeline_make.py run eva", f"{s}/pipeline_make.py run wp-sweep",
-                f"{s}/cache.py gc", f"{s}/cache.py stats", f"  {s}/cache.py   stats "):
+    for cmd in (
+        f"{s}/pipeline_make.py run build",
+        f"{s}/pipeline_make.py run eva",
+        f"{s}/pipeline_make.py run wp-sweep",
+        f"{s}/cache.py gc",
+        f"{s}/cache.py stats",
+        f"  {s}/cache.py   stats ",
+    ):
         assert R.cache_mount_mode(cmd, True) == "rw", cmd
         assert R.cache_mount_mode(cmd, False) == "ro", cmd
-    for cmd in (f"{s}/pipeline_make.py run build eva", f"{s}/pipeline_make.py run fuzz", f"{s}/cache.py gc; rm -rf /",
-                f"{s}/cache.py gc && touch x", f"bash -c '{s}/cache.py gc'", f"{s}/cache.py gc $(id)",
-                f"PYTHONPATH=/tmp {s}/cache.py gc", f"{s}/cache.py clear", "python3 /tmp/cache.py gc", ""):
+    for cmd in (
+        f"{s}/pipeline_make.py run build eva",
+        f"{s}/pipeline_make.py run fuzz",
+        f"{s}/cache.py gc; rm -rf /",
+        f"{s}/cache.py gc && touch x",
+        f"bash -c '{s}/cache.py gc'",
+        f"{s}/cache.py gc $(id)",
+        f"PYTHONPATH=/tmp {s}/cache.py gc",
+        f"{s}/cache.py clear",
+        "python3 /tmp/cache.py gc",
+        "",
+    ):
         assert R.cache_mount_mode(cmd, True) == "ro", cmd
     assert R.cache_mount_mode(f"{s}/cache.py gc", True, "off") == "off"
     monkeypatch.setenv("FRAMAC_CACHE", "off")
@@ -403,53 +541,64 @@ def test_cache_mount_mode_allowlist_is_exact(monkeypatch):
 # Grant planning (pure)
 # ---------------------------------------------------------------------------
 
+
 def _ticket(lid, cls="wp", seq=1, state="waiting", **kw):
     c = R.CLASSES[cls]
-    demand = {"min_cpus": c.min_cpus, "max_cpus": c.max_cpus, "mem_base_mb": c.mem_base_mb,
-              "mem_per_cpu_mb": c.mem_per_cpu_mb, "mem_floor_mb": kw.pop("floor", None),
-              "fixed_cpus": kw.pop("fixed_cpus", None), "fixed_mem_mb": kw.pop("fixed_mem", None)}
+    demand = {
+        "min_cpus": c.min_cpus,
+        "max_cpus": c.max_cpus,
+        "mem_base_mb": c.mem_base_mb,
+        "mem_per_cpu_mb": c.mem_per_cpu_mb,
+        "mem_floor_mb": kw.pop("floor", None),
+        "fixed_cpus": kw.pop("fixed_cpus", None),
+        "fixed_mem_mb": kw.pop("fixed_mem", None),
+    }
     return {"id": lid, "class": cls, "seq": seq, "state": state, "gated": c.gated, "demand": demand, **kw}
 
 
 def test_plan_grant_elastic_cpus_memory_fit_and_clamps():
     me = _ticket("a")
-    assert R.plan_grant(me, [me], 12, 32000).cpus == 6                    # min(max 8, pool // 2)
+    g1 = R.plan_grant(me, [me], 12, 32000)
+    assert g1 is not None and g1.cpus == 6  # min(max 8, pool // 2)
     others = [_ticket("b", seq=2), _ticket("c", seq=3)]
-    assert R.plan_grant(me, [me, *others], 12, 32000).cpus == 4           # free // (1 + waiting)
-    g = R.plan_grant(me, [me], 12, 3000)                                  # 768 + 1000 x cpus must fit in 3000
-    assert (g.cpus, g.mem_mb) == (2, 2768)
+    g2 = R.plan_grant(me, [me, *others], 12, 32000)
+    assert g2 is not None and g2.cpus == 4  # free // (1 + waiting)
+    g = R.plan_grant(me, [me], 12, 3000)  # 768 + 1000 x cpus must fit in 3000
+    assert g is not None and (g.cpus, g.mem_mb) == (2, 2768)
     fixed = _ticket("f", fixed_cpus=3.0, fixed_mem=5000)
-    assert (R.plan_grant(fixed, [fixed], 12, 32000).cpus, R.plan_grant(fixed, [fixed], 12, 32000).mem_mb) == (3, 5000)
-    big = _ticket("p", cls="phase-dynamic")                               # min 2 CPUs on a 1-CPU pool: clamped
+    gf = R.plan_grant(fixed, [fixed], 12, 32000)
+    assert gf is not None and (gf.cpus, gf.mem_mb) == (3, 5000)
+    big = _ticket("p", cls="phase-dynamic")  # min 2 CPUs on a 1-CPU pool: clamped
     assert R.plan_grant(big, [big], 1, 1000) == R.Grant(cpus=1.0, mem_mb=1000)
-    floor = _ticket("h", cls="eva", floor=6000)                           # history raises the estimate
-    assert R.plan_grant(floor, [floor], 4, 32000).mem_mb == 6000
+    floor = _ticket("h", cls="eva", floor=6000)  # history raises the estimate
+    gh = R.plan_grant(floor, [floor], 4, 32000)
+    assert gh is not None and gh.mem_mb == 6000
 
 
 def test_plan_grant_fifo_backfill_and_shrink():
     holder = _ticket("x", cls="build", state="granted", cpus=3.0, mem_mb=2048)
-    head = _ticket("h", cls="phase-static", seq=1)                       # needs 2 CPUs, only 1 free
-    late = _ticket("l", cls="eva", seq=2)                                 # needs 1 CPU
+    head = _ticket("h", cls="phase-static", seq=1)  # needs 2 CPUs, only 1 free
+    late = _ticket("l", cls="eva", seq=2)  # needs 1 CPU
     entries = [holder, head, late]
     assert R.plan_grant(head, entries, 4, 32000) is None
-    assert R.plan_grant(late, entries, 4, 32000) is None                  # backfill would delay the blocked head
-    assert R.plan_grant(late, entries, 5, 32000) is None                  # 2 free: taking 1 would delay the head
-    assert R.plan_grant(late, entries, 6, 32000) is not None              # head still fits afterwards: backfill
+    assert R.plan_grant(late, entries, 4, 32000) is None  # backfill would delay the blocked head
+    assert R.plan_grant(late, entries, 5, 32000) is None  # 2 free: taking 1 would delay the head
+    assert R.plan_grant(late, entries, 6, 32000) is not None  # head still fits afterwards: backfill
     assert R.queue_position("l", entries) == (2, 2)
     light = _ticket("q", cls="light", state="granted", cpus=1.0, mem_mb=1024)
-    assert R.plan_grant(head, [*entries, light], 5, 32000) is not None    # light leases never count
-    assert R.plan_grant(late, entries, 3, 32000) is None                  # pool shrank below what is granted
+    assert R.plan_grant(head, [*entries, light], 5, 32000) is not None  # light leases never count
+    assert R.plan_grant(late, entries, 3, 32000) is None  # pool shrank below what is granted
 
 
 def test_history_estimate_uses_recent_peaks_per_key(tmp_path):
     for peak, key, oom in ((100, "f", False), (400, "f", False), (900, "g", False), (300, "f", False)):
         R.write_history(tmp_path, {"class": "wp", "key": key, "peak_mb": peak, "oom_killed": oom})
         time.sleep(0.002)
-    assert R.history_estimate(tmp_path, "wp", "f") == 500                 # 1.25 x max(100, 400, 300)
+    assert R.history_estimate(tmp_path, "wp", "f") == 500  # 1.25 x max(100, 400, 300)
     assert R.history_estimate(tmp_path, "wp", "g") == 1125
     assert R.history_estimate(tmp_path, "wp", None) is None and R.history_estimate(tmp_path, "eva", "f") is None
     R.write_history(tmp_path, {"class": "wp", "key": "f", "peak_mb": 450, "oom_killed": True})
-    assert R.history_estimate(tmp_path, "wp", "f") == 900                 # an OOM kill doubles the last peak
+    assert R.history_estimate(tmp_path, "wp", "f") == 900  # an OOM kill doubles the last peak
     (tmp_path / "state/resource-history/wp/zzzz-bad.json").write_text("{not json", encoding="utf-8")
     assert R.history_estimate(tmp_path, "wp", "f") == 900
     assert R.write_history(tmp_path, {"class": "../escape", "peak_mb": 1}) is None
@@ -465,14 +614,21 @@ def test_lease_of_a_dead_holder_is_kept_while_its_container_runs(tmp_path):
         return running["value"]
 
     broker = R.Broker(tmp_path, lambda: pool, container_alive=container_alive, orphan_recheck_s=0.0)
-    dead = _ticket("aaaaaaaaaaaa", cls="phase-static", state="granted", cpus=4.0, mem_mb=6144,
-                   container="framac-aaaaaaaaaaaa", engine="docker")
+    dead = _ticket(
+        "aaaaaaaaaaaa",
+        cls="phase-static",
+        state="granted",
+        cpus=4.0,
+        mem_mb=6144,
+        container="framac-aaaaaaaaaaaa",
+        engine="docker",
+    )
     (tmp_path / "leases" / "aaaaaaaaaaaa.json").write_text(json.dumps(dead), encoding="utf-8")
     with broker.locked():
         entries = broker.entries()
     assert [e["id"] for e in entries] == ["aaaaaaaaaaaa"] and entries[0]["orphaned"] and not entries[0]["alive"]
     me = _ticket("bbbbbbbbbbbb", cls="eva")
-    assert R.plan_grant(me, [*entries, me], pool.cpus, pool.mem_mb) is None   # still counted against the pool
+    assert R.plan_grant(me, [*entries, me], pool.cpus, pool.mem_mb) is None  # still counted against the pool
     running["value"] = False
     with broker.locked():
         assert broker.entries() == []
@@ -492,9 +648,9 @@ def test_in_process_acquire_release_and_light_leases(tmp_path):
     with broker.locked():
         states = {e["id"]: (e["state"], e["alive"]) for e in broker.entries()}
     assert states == {a.id: ("granted", True), light.id: ("granted", True)}
-    assert broker.release(light) is False and broker.release(a) is False   # they overlapped: not single jobs
+    assert broker.release(light) is False and broker.release(a) is False  # they overlapped: not single jobs
     with pytest.raises(TimeoutError):
-        hog = broker.acquire("phase-static")                               # 2 CPUs, 4096 MiB
+        hog = broker.acquire("phase-static")  # 2 CPUs, 4096 MiB
         try:
             broker.acquire("phase-static", fixed_cpus=4, timeout=0.3)
         finally:
@@ -507,7 +663,7 @@ def test_in_process_acquire_release_and_light_leases(tmp_path):
 # Real processes: the container broker (`run`), `record`, file locks
 # ---------------------------------------------------------------------------
 
-CHILD = textwrap.dedent('''
+CHILD = textwrap.dedent("""
     import json, os, sys, time
     log_dir, name, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])
     gate = sys.argv[4] if len(sys.argv) > 4 else ""
@@ -524,7 +680,7 @@ CHILD = textwrap.dedent('''
         time.sleep(0.02)
     rec["end"] = time.time()
     dump(".end.json")
-''')
+""")
 
 
 class Harness:
@@ -543,8 +699,12 @@ class Harness:
         self.procs: list[subprocess.Popen] = []
         self.names: list[str] = []
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("FRAMAC_", "SLURM_"))}
-        self.env.update(FRAMAC_BROKER_DIR=str(self.broker), FRAMAC_PROBE_ROOT=str(self.root),
-                        PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+        self.env.update(
+            FRAMAC_BROKER_DIR=str(self.broker),
+            FRAMAC_PROBE_ROOT=str(self.root),
+            PYTHONDONTWRITEBYTECODE="1",
+            PYTHONIOENCODING="utf-8",
+        )
 
     def set_pool(self, cpus: float, mem_mb: int) -> None:
         cg = self.root / "sys/fs/cgroup"
@@ -552,8 +712,20 @@ class Harness:
         (cg / "memory.max").write_text(f"{mem_mb * 1024 * 1024}\n", encoding="utf-8")
 
     def start(self, name: str, cls: str, hold: float = 0.3, gate: Path | None = None, extra=()) -> subprocess.Popen:
-        cmd = [sys.executable, str(SCRIPT), "run", "--class", cls, *extra, "--",
-               sys.executable, str(self.child), str(self.logs), name, str(hold)] + ([str(gate)] if gate else [])
+        cmd = [
+            sys.executable,
+            str(SCRIPT),
+            "run",
+            "--class",
+            cls,
+            *extra,
+            "--",
+            sys.executable,
+            str(self.child),
+            str(self.logs),
+            name,
+            str(hold),
+        ] + ([str(gate)] if gate else [])
         with open(self.logs / f"{name}.broker.txt", "w", encoding="utf-8") as out:
             proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdout=out, stderr=subprocess.STDOUT)
         self.procs.append(proc)
@@ -601,7 +773,7 @@ def harness(tmp_path):
 
 
 def test_concurrent_grants_never_exceed_the_pool(harness):
-    harness.set_pool(4, 5120)                     # memory allows two 2 GiB builds at once, CPUs four
+    harness.set_pool(4, 5120)  # memory allows two 2 GiB builds at once, CPUs four
     names = [f"job{i}" for i in range(6)]
     for name in names:
         harness.start(name, "build", hold=0.4)
@@ -622,7 +794,7 @@ def test_tickets_are_served_first_in_first_out(harness):
     wait_for(lambda: harness.record("blocker"))
     for i, name in enumerate(("a", "b", "c"), start=1):
         harness.start(name, "eva", hold=0.2)
-        wait_for(lambda i=i: harness.waiting() == i)   # ticket registered before the next one is created
+        wait_for(lambda i=i: harness.waiting() == i)  # ticket registered before the next one is created
     gate.write_text("go", encoding="utf-8")
     harness.finish()
     starts = [harness.record(n)["start"] for n in ("a", "b", "c")]
@@ -644,13 +816,13 @@ def test_light_jobs_are_never_blocked(harness):
 
 def test_a_killed_holder_is_reclaimed(harness):
     harness.set_pool(2, 65536)
-    holder = harness.start("holder", "phase-static", hold=60)   # takes both CPUs
+    holder = harness.start("holder", "phase-static", hold=60)  # takes both CPUs
     wait_for(lambda: harness.record("holder"))
     harness.start("next", "eva", hold=0)
     wait_for(lambda: harness.waiting() == 1)
     time.sleep(0.5)
     assert harness.record("next") is None
-    holder.kill()                                                # the broker dies; the OS drops its lease lock
+    holder.kill()  # the broker dies; the OS drops its lease lock
     holder.wait(timeout=10)
     killed_at = time.time()
     rec = wait_for(lambda: harness.record("next", "end"), timeout=20)
@@ -660,10 +832,10 @@ def test_a_killed_holder_is_reclaimed(harness):
 def test_a_pool_shrink_blocks_new_grants_without_preemption(harness):
     harness.set_pool(4, 65536)
     gate = harness.tmp / "gate"
-    harness.start("first", "phase-static", hold=60, gate=gate)   # 2 of 4 CPUs
+    harness.start("first", "phase-static", hold=60, gate=gate)  # 2 of 4 CPUs
     wait_for(lambda: harness.record("first"))
     assert harness.record("first")["cpus"] == 2
-    harness.set_pool(2, 65536)                                   # the container was resized down
+    harness.set_pool(2, 65536)  # the container was resized down
     harness.start("second", "eva", hold=0)
     wait_for(lambda: harness.waiting() == 1)
     time.sleep(1.0)
@@ -678,29 +850,40 @@ def test_a_pool_shrink_blocks_new_grants_without_preemption(harness):
 
 def _run_cli(harness_or_env, args, cwd):
     env = harness_or_env.env if isinstance(harness_or_env, Harness) else harness_or_env
-    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, env=env, capture_output=True, text=True,
-                          timeout=60)
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=60
+    )
 
 
 def test_run_output_means_success_when_the_file_was_produced(harness):
     harness.set_pool(2, 8192)
     write_and_fail = "import sys; open(sys.argv[1], 'w').write('report'); sys.exit(3)"
-    proc = _run_cli(harness, ["run", "--class", "light", "--output", "out.json", "--", sys.executable, "-c",
-                              write_and_fail, "out.json"], harness.cwd)
+    proc = _run_cli(
+        harness,
+        ["run", "--class", "light", "--output", "out.json", "--", sys.executable, "-c", write_and_fail, "out.json"],
+        harness.cwd,
+    )
     assert proc.returncode == 0, proc.stderr
-    proc = _run_cli(harness, ["run", "--class", "light", "--output", "missing.json", "--", sys.executable, "-c",
-                              "import sys; sys.exit(3)"], harness.cwd)
+    proc = _run_cli(
+        harness,
+        ["run", "--class", "light", "--output", "missing.json", "--", sys.executable, "-c", "import sys; sys.exit(3)"],
+        harness.cwd,
+    )
     assert proc.returncode == 3
-    (harness.cwd / "stale.json").write_text("old", encoding="utf-8")   # an untouched old report does not count
-    proc = _run_cli(harness, ["run", "--class", "light", "--output", "stale.json", "--", sys.executable, "-c",
-                              "import sys; sys.exit(4)"], harness.cwd)
+    (harness.cwd / "stale.json").write_text("old", encoding="utf-8")  # an untouched old report does not count
+    proc = _run_cli(
+        harness,
+        ["run", "--class", "light", "--output", "stale.json", "--", sys.executable, "-c", "import sys; sys.exit(4)"],
+        harness.cwd,
+    )
     assert proc.returncode == 4
-    proc = _run_cli(harness, ["run", "--class", "light", "--", sys.executable, "-c", "import sys; sys.exit(5)"],
-                    harness.cwd)
+    proc = _run_cli(
+        harness, ["run", "--class", "light", "--", sys.executable, "-c", "import sys; sys.exit(5)"], harness.cwd
+    )
     assert proc.returncode == 5
 
 
-OOM_CHILD = textwrap.dedent('''
+OOM_CHILD = textwrap.dedent("""
     import json, os, sys
     state, events = sys.argv[1], sys.argv[2]
     runs = json.load(open(state)) if os.path.exists(state) else []
@@ -711,7 +894,7 @@ OOM_CHILD = textwrap.dedent('''
             f.write("low 0\\nhigh 0\\nmax 3\\noom 1\\noom_kill 1\\n")
         sys.exit(137)  # what a shell reports for a child killed by SIGKILL
     sys.exit(0)
-''')
+""")
 
 
 @pytest.mark.parametrize(("cls", "retried"), [("eva", True), ("guardrail", False)])
@@ -723,8 +906,11 @@ def test_oom_kill_is_retried_once_with_twice_the_memory_only_for_idempotent_clas
     child = harness.tmp / "oom_child.py"
     child.write_text(OOM_CHILD, encoding="utf-8")
     state = harness.tmp / "runs.json"
-    proc = _run_cli(harness, ["run", "--class", cls, "--key", "mod1", "--", sys.executable, str(child), str(state),
-                              str(events)], harness.cwd)
+    proc = _run_cli(
+        harness,
+        ["run", "--class", cls, "--key", "mod1", "--", sys.executable, str(child), str(state), str(events)],
+        harness.cwd,
+    )
     runs = json.loads(state.read_text(encoding="utf-8"))
     first = R.CLASSES[cls].mem_base_mb
     if retried:
@@ -747,15 +933,28 @@ def test_record_writes_history_and_always_returns_the_exit_code(tmp_path):
     run_dir.mkdir()
     (run_dir / "run-metadata.json").write_text("{}", encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FRAMAC_", "SLURM_"))}
-    env.update(FRAMAC_PROBE_ROOT=str(root), FRAMAC_JOB_CLASS="wp", FRAMAC_JOB_KEY="ber_decode",
-               FRAMAC_JOB_CPUS="4", FRAMAC_JOB_MEM_MB="4768", PYTHONDONTWRITEBYTECODE="1")
+    env.update(
+        FRAMAC_PROBE_ROOT=str(root),
+        FRAMAC_JOB_CLASS="wp",
+        FRAMAC_JOB_KEY="ber_decode",
+        FRAMAC_JOB_CPUS="4",
+        FRAMAC_JOB_MEM_MB="4768",
+        PYTHONDONTWRITEBYTECODE="1",
+    )
     proc = _run_cli(env, ["record", "--rc", "3"], run_dir)
     assert proc.returncode == 3, proc.stderr
     (path,) = list((run_dir / "state/resource-history/wp").glob("*.json"))
     rec = json.loads(path.read_text(encoding="utf-8"))
     assert {k: rec[k] for k in ("class", "key", "rc", "peak_mb", "oom_killed", "cpu_seconds", "cpus", "mem_mb")} == {
-        "class": "wp", "key": "ber_decode", "rc": 3, "peak_mb": 1536, "oom_killed": False, "cpu_seconds": 2.5,
-        "cpus": 4.0, "mem_mb": 4768}
+        "class": "wp",
+        "key": "ber_decode",
+        "rc": 3,
+        "peak_mb": 1536,
+        "oom_killed": False,
+        "cpu_seconds": 2.5,
+        "cpus": 4.0,
+        "mem_mb": 4768,
+    }
     assert R.history_estimate(run_dir, "wp", "ber_decode") == 1920
     # Outside a run dir nothing is written, and a broken probe still returns the exit code.
     elsewhere = tmp_path / "elsewhere"
@@ -766,7 +965,7 @@ def test_record_writes_history_and_always_returns_the_exit_code(tmp_path):
     assert _run_cli(env, ["record", "--rc", "7"], run_dir).returncode == 7
 
 
-LOCK_HOLDER = textwrap.dedent('''
+LOCK_HOLDER = textwrap.dedent("""
     import sys, time
     sys.path.insert(0, sys.argv[1])
     import resources
@@ -774,21 +973,23 @@ LOCK_HOLDER = textwrap.dedent('''
     assert lock.acquire(blocking=False)
     print("held", flush=True)
     time.sleep(120)
-''')
+""")
 
 
 def test_file_lock_is_released_when_the_holder_dies(tmp_path):
     path = tmp_path / "x.lock"
-    holder = subprocess.Popen([sys.executable, "-c", LOCK_HOLDER, str(SCRIPT.parent), str(path)],
-                              stdout=subprocess.PIPE, text=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", LOCK_HOLDER, str(SCRIPT.parent), str(path)], stdout=subprocess.PIPE, text=True
+    )
     try:
-        assert holder.stdout.readline().strip() == "held"
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
         assert R.lock_is_held(path)
         assert not R.FileLock(path).acquire(blocking=False)
     finally:
         holder.kill()
         holder.wait(timeout=10)
-        holder.stdout.close()
+        if holder.stdout is not None:
+            holder.stdout.close()
     wait_for(lambda: not R.lock_is_held(path), timeout=10)
     lock = R.FileLock(path)
     assert lock.acquire(blocking=False)
@@ -800,7 +1001,7 @@ def test_windows_locks_use_msvcrt_and_exclude_other_handles(tmp_path):
     assert R.msvcrt is not None and R.fcntl is None
     first, second = R.FileLock(tmp_path / "w.lock"), R.FileLock(tmp_path / "w.lock")
     assert first.acquire(blocking=False)
-    assert not second.acquire(blocking=False)          # a second handle, even in the same process, is refused
+    assert not second.acquire(blocking=False)  # a second handle, even in the same process, is refused
     assert not second.acquire(timeout=0.2)
     first.release()
     assert second.acquire(blocking=False)
@@ -821,12 +1022,14 @@ def test_posix_locks_use_flock_per_open_file(tmp_path):
 # Host broker `exec` with a fake engine
 # ---------------------------------------------------------------------------
 
+
 def make_fake_engine(bin_dir: Path, info: dict, log: Path) -> None:
     """A `docker` on PATH answering info/images/image/ps/--version and logging `run` arguments (one per line)."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     (bin_dir / "info.json").write_text(json.dumps(info), encoding="utf-8")
     script = bin_dir / "fake_engine.py"
-    script.write_text(textwrap.dedent(f'''
+    script.write_text(
+        textwrap.dedent(f"""
         import pathlib, sys, time
         here = pathlib.Path(__file__).parent
         cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -850,7 +1053,9 @@ def make_fake_engine(bin_dir: Path, info: dict, log: Path) -> None:
                     time.sleep(0.01)
                 sys.exit(1)
             sys.exit(int(dict(a.split("=", 1) for a in sys.argv if a.startswith("FAKE_RC=")).get("FAKE_RC", 0)))
-    '''), encoding="utf-8")
+    """),
+        encoding="utf-8",
+    )
     if os.name == "nt":
         (bin_dir / "docker.cmd").write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
     else:
@@ -879,8 +1084,23 @@ def test_exec_dry_run_builds_the_full_engine_command(tmp_path, fake_engine, monk
     fake_engine(DOCKER_DESKTOP)
     monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/run_wp_function.py --file a.c")
     monkeypatch.setenv("FRAMAC_IMAGE_ID", "sha256:feedface")
-    rc = R.main(["exec", "--run-dir", str(tmp_path / "run-1"), "--key", "f", "--dry-run", "--",
-                 "docker", "run", "--rm", "-i", "img", "/opt/framac-pipeline/scripts/container_entry.sh"])
+    rc = R.main(
+        [
+            "exec",
+            "--run-dir",
+            str(tmp_path / "run-1"),
+            "--key",
+            "f",
+            "--dry-run",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "img",
+            "/opt/framac-pipeline/scripts/container_entry.sh",
+        ]
+    )
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     argv = out["argv"]
@@ -890,11 +1110,12 @@ def test_exec_dry_run_builds_the_full_engine_command(tmp_path, fake_engine, monk
     assert ("-e", "FRAMAC_JOB_CLASS=wp") in pairs and ("-e", "FRAMAC_JOB_KEY=f") in pairs
     assert ("-e", "FRAMAC_IMAGE_ID=sha256:feedface") in pairs and ("-e", "FRAMAC_CACHE_MODE=ro") in pairs
     assert argv[-1] == "python3 /opt/framac-pipeline/scripts/run_wp_function.py --file a.c"
-    assert not list((tmp_path / "broker" / "leases").glob("*.json"))       # the lease was released
+    assert not list((tmp_path / "broker" / "leases").glob("*.json"))  # the lease was released
 
 
 def test_exec_mounts_this_repositorys_cache_partition_writable_only_for_allowlisted_steps(
-        tmp_path, fake_engine, monkeypatch, capsys):
+    tmp_path, fake_engine, monkeypatch, capsys
+):
     fake_engine(DOCKER_DESKTOP)
     monkeypatch.setenv("FRAMAC_REPO", "net-snmp")
     monkeypatch.delenv("FRAMAC_CACHE_RW", raising=False)
@@ -917,20 +1138,39 @@ def test_exec_mounts_this_repositorys_cache_partition_writable_only_for_allowlis
 def test_exec_runs_the_engine_and_returns_its_exit_code(tmp_path, fake_engine, monkeypatch):
     log = fake_engine(DOCKER_DESKTOP)
     monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "true")
-    rc = R.main(["exec", "--run-dir", str(tmp_path / "run-1"), "--cpus", "1", "--memory", "1500m", "--",
-                 "docker", "run", "--rm", "-e", "FAKE_RC=9", "img", "/entry.sh"])
+    rc = R.main(
+        [
+            "exec",
+            "--run-dir",
+            str(tmp_path / "run-1"),
+            "--cpus",
+            "1",
+            "--memory",
+            "1500m",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+            "-e",
+            "FAKE_RC=9",
+            "img",
+            "/entry.sh",
+        ]
+    )
     assert rc == 9
     args = log.read_text(encoding="utf-8").splitlines()
-    assert args[:6] == ["run", "--name", args[2], "--label", f"framac.lease={args[2][len('framac-'):]}", "--init"]
+    assert args[:6] == ["run", "--name", args[2], "--label", f"framac.lease={args[2][len('framac-') :]}", "--init"]
     assert ("--cpus", "1") in _pairs(args) and ("--memory", "1500m") in _pairs(args) and args[-1] == "true"
 
 
 def test_exec_refuses_target_code_when_memory_or_pids_cannot_be_enforced(tmp_path, fake_engine, monkeypatch, capsys):
     fake_engine(_podman(["cpu", "cpuset"]))
-    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module m")
+    monkeypatch.setenv(
+        "FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module m"
+    )
     run = ["exec", "--run-dir", str(tmp_path / "run-1"), "--dry-run", "--", "docker", "run", "img"]
     assert R.main(run) == 2 and "FRAMAC_ALLOW_UNENFORCED_LIMITS" in capsys.readouterr().err
-    assert R.main(["exec", "--class", "wp", *run[1:]]) == 0                  # no target code: allowed
+    assert R.main(["exec", "--class", "wp", *run[1:]]) == 0  # no target code: allowed
     out = json.loads(capsys.readouterr().out)
     assert "--memory" not in out["argv"] and "--pids-limit" not in out["argv"] and "--cpus" in out["argv"]
     monkeypatch.setenv("FRAMAC_ALLOW_UNENFORCED_LIMITS", "1")
@@ -949,8 +1189,22 @@ def test_exec_rejects_limit_flags_it_manages(tmp_path, fake_engine, monkeypatch)
 def test_exec_forwards_termination_as_an_engine_kill(tmp_path, fake_engine):
     log = fake_engine(DOCKER_DESKTOP)
     env = dict(os.environ, FRAMAC_CONTAINER_CMD="true")
-    proc = subprocess.Popen([sys.executable, str(SCRIPT), "exec", "--run-dir", str(tmp_path / "run-1"), "--",
-                             "docker", "run", "-e", "FAKE_WAIT=1", "img"], env=env)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "exec",
+            "--run-dir",
+            str(tmp_path / "run-1"),
+            "--",
+            "docker",
+            "run",
+            "-e",
+            "FAKE_WAIT=1",
+            "img",
+        ],
+        env=env,
+    )
     try:
         wait_for(lambda: (tmp_path / "bin" / "started").exists())
         proc.send_signal(signal.SIGTERM)
@@ -977,8 +1231,9 @@ def test_run_forwards_termination_to_its_child(harness):
 def test_status_lists_and_gc_reclaims(tmp_path, capsys):
     broker = R.Broker(tmp_path, lambda: R.Budget(4, 8000, "t"))
     live = broker.acquire("eva")
-    (tmp_path / "leases" / "dddddddddddd.json").write_text(json.dumps(_ticket("dddddddddddd", state="granted",
-                                                                              cpus=1, mem_mb=10)), encoding="utf-8")
+    (tmp_path / "leases" / "dddddddddddd.json").write_text(
+        json.dumps(_ticket("dddddddddddd", state="granted", cpus=1, mem_mb=10)), encoding="utf-8"
+    )
     assert R.main(["status", "--scope", "container", "--broker-dir", str(tmp_path)]) == 0
     status = json.loads(capsys.readouterr().out)
     assert {r["id"]: r["alive"] for r in status["granted"]} == {live.id: True, "dddddddddddd": False}
@@ -1002,7 +1257,9 @@ def test_run_metadata_records_resources_host_run_dir_and_podman(tmp_path, monkey
     monkeypatch.chdir(run)
     assert run_metadata.main(["init", "--repo", "demo", "--target", str(tmp_path / "root"), "--profile", "quick"]) == 0
     meta = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
-    assert meta["sandbox"]["outer"] == "podman-hardened" and meta["run_dir_host"] == "/home/u/framac-pipeline/demo/run-4"
+    assert (
+        meta["sandbox"]["outer"] == "podman-hardened" and meta["run_dir_host"] == "/home/u/framac-pipeline/demo/run-4"
+    )
     assert (meta["resources"]["cpus"], meta["resources"]["mem_mb"]) == (2, 3072)
     assert "pool" not in meta["resources"]  # no host broker
     assert list(validate_metadata(meta)) == []
@@ -1023,3 +1280,236 @@ def test_cpu_list_round_trip_and_byte_sizes():
     assert R.format_cpu_list([11, 0, 1, 2, 3, 8, 10]) == "0-3,8,10-11" and R.format_cpu_list([]) == ""
     assert R.parse_cpu_list(R.format_cpu_list([5, 1, 2])) == [1, 2, 5]
     assert R.parse_mem("1048576b") == 1 and R.parse_mem("512mb") == 512 and R.parse_mem("1.5g") == 1536
+
+
+def test_wsl2_docker_desktop_is_not_treated_as_vm_backed(tmp_path, monkeypatch):
+    assert R.parse_engine_info(DOCKER_DESKTOP, env={}, platform="linux").vm_backed is True
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu-24.04")
+    assert R.parse_engine_info(DOCKER_DESKTOP, env=dict(os.environ), platform="linux").vm_backed is False
+    monkeypatch.delenv("WSL_DISTRO_NAME")
+    put(tmp_path, "/proc/sys/kernel/osrelease", "5.15.167.4-microsoft-standard-WSL2\n")
+    assert R.is_wsl2(env={}, root=tmp_path, platform="linux") is True
+
+
+def test_cache_mount_mode_expands_script_var(monkeypatch):
+    monkeypatch.delenv("FRAMAC_CACHE_RW", raising=False)
+    assert R.cache_mount_mode("python3 $S/pipeline_make.py run build", True) == "rw"
+    assert R.cache_mount_mode("python3 ${S}/pipeline_make.py run wp-sweep", True) == "rw"
+    assert R.cache_mount_mode("python3 $S/pipeline_make.py run fuzz", True) == "ro"
+    assert R.cache_mount_mode("python3 $S/pipeline_make.py run build && id", True) == "ro"
+
+
+def test_shared_cache_mirrors_and_reads_resource_history(tmp_path, monkeypatch):
+    run1 = tmp_path / "run-1"
+    run2 = tmp_path / "run-2"
+    shared = tmp_path / "shared-cache"
+    for r in (run1, run2):
+        r.mkdir()
+        (r / "run-metadata.json").write_text("{}", encoding="utf-8")
+    shared.mkdir()
+    monkeypatch.setenv("FRAMAC_SHARED_CACHE_DIR", str(shared))
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "rw")
+    R.write_history(
+        run1,
+        {
+            "class": "eva",
+            "key": "snmp",
+            "rc": 0,
+            "peak_mb": 3200,
+            "oom_killed": False,
+            "cpu_seconds": 4.0,
+            "cpus": 1.0,
+            "mem_mb": 4096,
+        },
+    )
+    assert list((shared / "resource-history/eva").glob("*.json"))
+    # A fresh run directory with read-only access to the shared cache inherits the historical peak.
+    monkeypatch.setenv("FRAMAC_CACHE_MODE", "ro")
+    assert R.history_estimate(run2, "eva", "snmp") == 4000
+
+
+def test_run_dir_mutual_exclusion_between_rw_cache_and_target_code(tmp_path):
+    run_a = str((tmp_path / "run-a").resolve())
+    run_b = str((tmp_path / "run-b").resolve())
+    pool = R.Budget(16, 65536, "test")
+    # While a target-executing job is active on run_a, a writable-cache job on run_a must wait,
+    # whereas the same job on run_b or a read-only job on run_a is granted immediately.
+    active_fuzz = [_ticket("111111111111", state="granted", cls="fuzz", cpus=2, mem_mb=3072, run_dir=run_a)]
+    me_rw_a = _ticket("aaaaaaaaaaaa", cls="phase-static", run_dir=run_a, cache_mode="rw")
+    me_ro_a = _ticket("bbbbbbbbbbbb", cls="phase-static", run_dir=run_a, cache_mode="ro")
+    me_rw_b = _ticket("cccccccccccc", cls="phase-static", run_dir=run_b, cache_mode="rw")
+    assert R.plan_grant(me_rw_a, active_fuzz, pool.cpus, pool.mem_mb) is None
+    assert R.plan_grant(me_ro_a, active_fuzz, pool.cpus, pool.mem_mb) is not None
+    assert R.plan_grant(me_rw_b, active_fuzz, pool.cpus, pool.mem_mb) is not None
+
+    # Symmetrically, while a writable-cache job is active on run_a, a target-executing job on run_a waits.
+    active_rw = [
+        _ticket(
+            "222222222222", state="granted", cls="phase-static", cpus=2, mem_mb=4096, run_dir=run_a, cache_mode="rw"
+        )
+    ]
+    fuzz_a = _ticket("dddddddddddd", cls="fuzz", run_dir=run_a, cache_mode="ro")
+    eva_a = _ticket("eeeeeeeeeeee", cls="eva", run_dir=run_a, cache_mode="ro")
+    fuzz_b = _ticket("ffffffffffff", cls="fuzz", run_dir=run_b, cache_mode="ro")
+    assert R.plan_grant(fuzz_a, active_rw, pool.cpus, pool.mem_mb) is None
+    assert R.plan_grant(eva_a, active_rw, pool.cpus, pool.mem_mb) is not None
+    assert R.plan_grant(fuzz_b, active_rw, pool.cpus, pool.mem_mb) is not None
+
+
+def test_grow_only_rebalancing_of_running_containers(tmp_path):
+    pool = R.Budget(12, 32000, "test")
+    # Two running elastic wp containers initially granted 2 CPUs / 2768 MiB each because a third job held 8 CPUs.
+    # Once the third job finishes, 8 CPUs and 26464 MiB are free; both grow to 6 CPUs / 6768 MiB.
+    a = _ticket(
+        "111111111111",
+        cls="wp",
+        seq=1,
+        state="granted",
+        cpus=2.0,
+        mem_mb=2768,
+        container="framac-111111111111",
+        engine="docker",
+    )
+    b = _ticket(
+        "222222222222",
+        cls="wp",
+        seq=2,
+        state="granted",
+        cpus=2.0,
+        mem_mb=2768,
+        container="framac-222222222222",
+        engine="docker",
+    )
+    fixed = _ticket(
+        "333333333333",
+        cls="wp",
+        seq=3,
+        state="granted",
+        cpus=2.0,
+        mem_mb=2768,
+        fixed_cpus=2.0,
+        container="framac-333333333333",
+        engine="docker",
+    )
+    plans = R.rebalance_grants([a, b, fixed], pool.cpus, pool.mem_mb)
+    assert [(p["id"], p["cpus"], p["mem_mb"]) for p in plans] == [
+        ("111111111111", 5.0, 5768),
+        ("222222222222", 5.0, 5768),
+    ]
+    # Once `fixed` also finishes, 8 CPUs are free and both elastic wp jobs grow to 6 CPUs / 6768 MiB.
+    assert [(p["id"], p["cpus"], p["mem_mb"]) for p in R.rebalance_grants([a, b], pool.cpus, pool.mem_mb)] == [
+        ("111111111111", 6.0, 6768),
+        ("222222222222", 6.0, 6768),
+    ]
+    # Never rebalance while any gated ticket is waiting in the queue.
+    waiter = _ticket("444444444444", cls="eva", seq=4, state="waiting")
+    assert R.rebalance_grants([a, b, waiter], pool.cpus, pool.mem_mb) == []
+    # Never shrink a container whose current grant already exceeds the pool share.
+    over = _ticket(
+        "555555555555",
+        cls="wp",
+        seq=1,
+        state="granted",
+        cpus=8.0,
+        mem_mb=8768,
+        container="framac-555555555555",
+        engine="docker",
+    )
+    assert R.rebalance_grants([over], 4, 4000) == []
+
+    # Broker.rebalance runs `<engine> update` and persists the grown grant on success.
+    broker = R.Broker(tmp_path, lambda: pool)
+    l1 = broker.acquire("wp", lease_id="111111111111", extra={"container": "framac-111111111111", "engine": "docker"})
+    try:
+        # Simulate that l1 was initially granted 2 CPUs / 2768 MiB under contention.
+        entry_path = tmp_path / "leases" / "111111111111.json"
+        data = json.loads(entry_path.read_text(encoding="utf-8"))
+        data.update(cpus=2.0, mem_mb=2768)
+        entry_path.write_text(json.dumps(data), encoding="utf-8")
+
+        updates: list[list[str]] = []
+
+        def fake_runner(cmd, **_kw):
+            updates.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        applied = broker.rebalance(eng=R.EngineInfo(kind="docker"), runner=fake_runner)
+        assert len(applied) == 1 and applied[0]["applied"] is True
+        assert applied[0]["cpus"] == 6.0 and applied[0]["mem_mb"] == 6768
+        assert updates == [
+            [
+                "docker",
+                "update",
+                "--cpus",
+                "6",
+                "--memory",
+                "6768m",
+                "--memory-swap",
+                "6768m",
+                "framac-111111111111",
+            ]
+        ]
+        persisted = json.loads(entry_path.read_text(encoding="utf-8"))
+        assert persisted["cpus"] == 6.0 and persisted["mem_mb"] == 6768 and "rebalanced_at" in persisted
+    finally:
+        broker.release(l1)
+
+
+def test_is_known_static_command_rejects_shell_chaining_and_anchors():
+    assert R.is_known_static_command("python3 $S/ledger.py summary") is True
+    assert R.is_known_static_command("python3 $S/pipeline_make.py gen") is True
+    assert R.is_known_static_command("python3 $S/pipeline_make.py ingest") is True
+    assert R.is_known_static_command("python3 $S/pipeline_make.py run eva") is True
+    assert R.is_known_static_command("python3 $S/pipeline_make.py run") is False
+    for cmd in (
+        "python3 $S/ledger.py summary && ./evil",
+        "frama-c -version; ./evil",
+        "python3 $S/cache.py stats | sh",
+        "python3 $S/cache.py stats $(id)",
+        "./evil /opt/framac-pipeline/scripts/ledger.py",
+        "./evil /opt/framac-pipeline/scripts/pipeline_make.py run eva",
+    ):
+        assert R.is_known_static_command(cmd) is False, cmd
+
+
+def test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name():
+    assert R.infer_class("python3 $S/run_eacsl_fuzz.py campaign --module build") == "fuzz"
+    assert R.infer_class("python3 $S/run_eacsl_fuzz.py guardrail --module build") == "guardrail"
+    assert R.infer_class("python3 $S/run_eacsl_fuzz.py replay --module build") == "replay"
+    assert R.infer_class("python3 $S/run_eacsl_fuzz.py selftest --module build") == "selftest"
+    assert R.infer_class("python3 $S/run_eacsl_fuzz.py build --module build") == "build"
+
+
+def test_exec_auto_downgrades_cache_mode_when_target_code_lease_is_active_on_run_dir(
+    tmp_path, fake_engine, monkeypatch, capsys
+):
+    root = _machine(tmp_path / "root")
+    monkeypatch.setenv("FRAMAC_PROBE_ROOT", str(root))
+    fake_engine(DOCKER_DESKTOP)
+    monkeypatch.setenv("FRAMAC_REPO", "net-snmp")
+    monkeypatch.setenv("FRAMAC_POOL_CPUS", "8")
+    monkeypatch.setenv("FRAMAC_POOL_MEMORY", "16g")
+    monkeypatch.delenv("FRAMAC_CACHE_RW", raising=False)
+
+    assert R.cache_mount_mode("python3 $S/pipeline_make.py ingest", True) == "rw"
+    assert R.cache_mount_mode("python3 $S/pipeline_make.py run ingest wp-queue", True) == "rw"
+
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    broker = R.Broker(tmp_path / "broker", lambda: R.Budget(8, 16384, "test"))
+    fuzz_lease = broker.acquire(
+        "fuzz",
+        fixed_cpus=1.0,
+        fixed_mem_mb=1024,
+        lease_id="111111111111",
+        extra={"run_dir": str(run_dir), "cache_mode": "ro", "runs_target_code": True},
+    )
+    try:
+        monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva")
+        assert R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"]) == 0
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        assert out["cache_mode"] == "ro"
+        assert "shared cache mounted read-only: a target-code job is active on this run directory" in captured.err
+    finally:
+        broker.release(fuzz_lease)

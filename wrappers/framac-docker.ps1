@@ -19,10 +19,12 @@
     Sizing: by default the host broker (scripts/resources.py exec, needs a host Python >= 3.10 found as
     py -3, python3 or python) measures the machine on every call, takes a lease for the job class (inferred
     from the command unless -Class) and starts the container with --cpus/--memory/--pids-limit from that
-    lease, so concurrent containers never oversubscribe the machine. -Cpus/-Memory/-PidsLimit (or
-    FRAMAC_CPUS/FRAMAC_MEMORY/FRAMAC_PIDS_LIMIT) request a fixed grant, still registered with the broker.
-    -NoBroker or FRAMAC_BROKER=off (and, with a warning, a missing host Python) keep the legacy static
-    sizing: per-container -Cpus/-Memory/-PidsLimit divided by -Agents / FRAMAC_CONCURRENT_AGENTS.
+    lease, so concurrent containers never oversubscribe the machine; when a gated lease releases and no
+    tickets are waiting, running elastic containers are grown via `<engine> update` (never shrunk).
+    -Cpus/-Memory/-PidsLimit (or FRAMAC_CPUS/FRAMAC_MEMORY/FRAMAC_PIDS_LIMIT) request a fixed grant, still
+    registered with the broker. -NoBroker or FRAMAC_BROKER=off (and, with a warning, a missing host Python)
+    keep the legacy static sizing: per-container -Cpus/-Memory/-PidsLimit divided by -Agents /
+    FRAMAC_CONCURRENT_AGENTS.
 
     Engine: -Engine or FRAMAC_CONTAINER_ENGINE = docker | podman | auto (docker when usable).
 
@@ -64,6 +66,9 @@
 
 .PARAMETER Command
     Command string executed inside the container (bash -lc) with /framac-run as working directory.
+    When referencing $S (the /opt/framac-pipeline/scripts shorthand), wrap the command in single
+    quotes (e.g. -Command 'python3 $S/pipeline_make.py ...') or escape the dollar sign (`$S) so
+    PowerShell on the host does not expand $S as an empty host variable.
 
 .PARAMETER NoInnerSandbox
     Removed (bubblewrap is no longer used). Passing it fails with exit code 2.
@@ -376,6 +381,7 @@ $hardeningArgs = @(
 )
 $envArgs = @(
     "-e", "PYTHONIOENCODING=utf-8",
+    "-e", "S=/opt/framac-pipeline/scripts",
     "-e", "FRAMAC_OUTER_SANDBOX=$OuterSandbox",
     "-e", "FRAMAC_TARGET_HOST=$ResolvedTarget",
     "-e", "FRAMAC_REPO=$RepoName",

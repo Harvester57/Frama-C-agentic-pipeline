@@ -21,8 +21,12 @@ from generate_report import generate
 
 
 def build_run(run, status="incomplete", reason="candidate_validation_not_run", unverified=True):
-    for p in ("workspace/reports/fuzz/snmp.json", "workspace/reports/eva/log.json", "workspace/reports/eva/snmp.json",
-              "agents/verifier-3/artifacts/notes.txt"):
+    for p in (
+        "workspace/reports/fuzz/snmp.json",
+        "workspace/reports/eva/log.json",
+        "workspace/reports/eva/snmp.json",
+        "agents/verifier-3/artifacts/notes.txt",
+    ):
         write_json(run / p, {})
     crash = run / "workspace/crashes/snmp/crash-1"
     crash.parent.mkdir(parents=True, exist_ok=True)
@@ -30,26 +34,61 @@ def build_run(run, status="incomplete", reason="candidate_validation_not_run", u
     rec = confirmed_record()
     rec["reproducers"][0]["sha256"] = hashlib.sha256(b"abc").hexdigest()
     findings = sorted_findings(rec, needs_validation_record(), rejected_record())
-    ev = [evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/snmp.json")]
+    ev = [
+        evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/snmp.json")
+    ]
     ledger = [
         unit("src/snmp/ber.c", "ber_decode_len", "rte", "candidate", evidence=ev, result_fingerprints=[FP_PARSE]),
-        unit("src/log/emit.c", "emit_field", "rte", "candidate", evidence=ev, result_fingerprints=[FP_EVA], module="log"),
+        unit(
+            "src/log/emit.c", "emit_field", "rte", "candidate", evidence=ev, result_fingerprints=[FP_EVA], module="log"
+        ),
         unit("src/snmp/ber.c", "ber_decode_tag", "rte", "candidate", evidence=ev, result_fingerprints=[FP_REJ]),
-        unit("src/snmp/pdu.c", "snmp_parse_pdu", "rte", "covered", evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")],
-             assumptions=[{"kind": "boundary_assumption", "description": "Eva context", "related_units": []}]),
-        unit("src/snmp/pdu.c", "snmp_free", "rte", "covered", evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")]),
-        unit("src/snmp/pdu.c", "snmp_parse_pdu", "l2_termination", "blocked",
-             evidence=[evidence(phase="wp", result="wp_unproven", discharging=False, tool_output="workspace/reports/eva/snmp.json")],
-             unresolved=["unproven loop variant at line 7"]),
+        unit(
+            "src/snmp/pdu.c",
+            "snmp_parse_pdu",
+            "rte",
+            "covered",
+            evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")],
+            assumptions=[{"kind": "boundary_assumption", "description": "Eva context", "related_units": []}],
+        ),
+        unit(
+            "src/snmp/pdu.c",
+            "snmp_free",
+            "rte",
+            "covered",
+            evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")],
+        ),
+        unit(
+            "src/snmp/pdu.c",
+            "snmp_parse_pdu",
+            "l2_termination",
+            "blocked",
+            evidence=[
+                evidence(
+                    phase="wp", result="wp_unproven", discharging=False, tool_output="workspace/reports/eva/snmp.json"
+                )
+            ],
+            unresolved=["unproven loop variant at line 7"],
+        ),
         unit("src/glue/init.c", "glue_init", "rte", "deferred", unresolved=["tier3_not_scheduled"], module="glue"),
     ]
     cands = []
     if unverified:
-        cands.append({"fingerprint": "src/snmp/pdu.c#snmp_parse_pdu::timeout::0123456789", "status": "unverified", "origin": "fuzz",
-                      "proposed_verdict": "needs_validation", "module": "snmp",
-                      "location": {"file": "src/snmp/pdu.c", "line": 0, "function": "snmp_parse_pdu"},
-                      "property": {"kind": "timeout", "predicate": ""}, "reproducers": [], "tool_outputs": ["workspace/reports/fuzz/snmp.json"],
-                      "linked_units": [], "first_seen": "t"})
+        cands.append(
+            {
+                "fingerprint": "src/snmp/pdu.c#snmp_parse_pdu::timeout::0123456789",
+                "status": "unverified",
+                "origin": "fuzz",
+                "proposed_verdict": "needs_validation",
+                "module": "snmp",
+                "location": {"file": "src/snmp/pdu.c", "line": 0, "function": "snmp_parse_pdu"},
+                "property": {"kind": "timeout", "predicate": ""},
+                "reproducers": [],
+                "tool_outputs": ["workspace/reports/fuzz/snmp.json"],
+                "linked_units": [],
+                "first_seen": "t",
+            }
+        )
     write_json(run / "run-metadata.json", metadata(status, reason if status == "incomplete" else None))
     write_json(run / "coverage-ledger.json", sorted(ledger, key=lambda u: u["coverage_id"]))
     write_json(run / "candidates.json", cands)

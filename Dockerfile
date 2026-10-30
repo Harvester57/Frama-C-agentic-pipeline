@@ -68,6 +68,7 @@ RUN opam init --bare --disable-sandboxing --root=/opt/opam && \
 
 ENV PATH="/opt/opam/framac/bin:${PATH}"
 ENV FRAMAC_SHARE="/opt/opam/framac/share/frama-c"
+ENV S="/opt/framac-pipeline/scripts"
 
 # Optional target-specific apt packages (built via --target-packages / -TargetPackages before dropping capabilities)
 ARG TARGET_APT_PACKAGES=""

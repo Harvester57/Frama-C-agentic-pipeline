@@ -19,15 +19,17 @@ def test_fold_ascii_makes_options_and_quotes_greppable():
 
 
 def test_clean_page_drops_running_header_footer_and_toc_leaders():
-    page = "\n".join([
-        "                              2.4. COMMAND LINE OPTIONS",
-        "",
-        "2.4.3 Model Selection . . . . . . . . . . . . 33",
-        "-wp-timeout <t> sets the timeout",
-        "# frama-c -wp -wp-rte swap.c",
-        "",
-        "                                      32",
-    ])
+    page = "\n".join(
+        [
+            "                              2.4. COMMAND LINE OPTIONS",
+            "",
+            "2.4.3 Model Selection . . . . . . . . . . . . 33",
+            "-wp-timeout <t> sets the timeout",
+            "# frama-c -wp -wp-rte swap.c",
+            "",
+            "                                      32",
+        ]
+    )
     assert clean_page(page) == ["", "-wp-timeout <t> sets the timeout", " # frama-c -wp -wp-rte swap.c", ""]
 
 
@@ -52,7 +54,10 @@ def test_place_headings_matches_numbered_trailing_and_relocated_titles():
     lines, misses = place_headings(pages, sections)
     assert misses == 0
     assert [lines[s.line - 1] for s in sections] == [
-        "## 1 Introduction", "### 1.1 First contact", "### 1.2 Details", "## Bibliography",
+        "## 1 Introduction",
+        "### 1.1 First contact",
+        "### 1.2 Details",
+        "## Bibliography",
     ]
     assert sections[3].page == 4
     assert lines.count("<!-- page 1 -->") == 1 and "<!-- page 4 -->" in lines
@@ -91,7 +96,8 @@ def test_check_flags_missing_and_stale_markdown(tmp_path: Path):
 def test_moved_pdf_leaves_an_orphan_but_hand_written_markdown_is_ignored(tmp_path: Path):
     (tmp_path / "eacsl").mkdir()
     (tmp_path / "eacsl" / "old.md").write_text(
-        "# T\n\n<!-- source: eacsl/old.pdf sha256:" + "0" * 64 + " pages:1 -->\n", encoding="utf-8")
+        "# T\n\n<!-- source: eacsl/old.pdf sha256:" + "0" * 64 + " pages:1 -->\n", encoding="utf-8"
+    )
     (tmp_path / "eacsl" / "notes.md").write_text("# Hand-written notes\n", encoding="utf-8")
     assert orphan_outputs(tmp_path) == [tmp_path / "eacsl" / "old.md"]
     assert stale_outputs(tmp_path) == ["eacsl/old.md: orphan, its PDF was moved or deleted"]

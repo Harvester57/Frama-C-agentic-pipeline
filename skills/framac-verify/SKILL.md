@@ -101,12 +101,14 @@ These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/S
 2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`.
 3. Start **two background wrapper calls at the same time**:
    - `python3 $S/pipeline_make.py run fuzz`
-   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
+   - `python3 $S/pipeline_make.py run eva`
 
    Wait for both to finish.
 
-   Write the `build`, `eva` and `wp-sweep` commands exactly as shown, with the full script path. Only those exact command lines may write the shared cross-run cache, so later runs on the same repository reuse their builds, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
-4. Ingest and prepare Phase 3: `python3 $S/pipeline_make.py run ingest replay wp-queue`.
+   When running concurrently with `fuzz`, both containers mount `/framac-cache` read-only (`ro`) and run in parallel without triggering `_run_dir_conflict` (use `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva` when running Eva standalone with a writable `rw` shared cache). Write the `build`, `ingest`, standalone `eva` and `wp-sweep` commands as shown, with the full script path, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
+4. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
+   - `python3 $S/pipeline_make.py run replay wp-queue`
 
 Ingestion keeps the fuzz-then-Eva order:
 - crashes become fingerprinted candidates;

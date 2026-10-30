@@ -56,7 +56,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,7 +111,13 @@ CLASSES: dict[str, JobClass] = {
     "build": JobClass("build", False, 1, 4, 2048, 0, idempotent=True, wall_timeout_s=3600),
     "guardrail": JobClass("guardrail", True, 1, 2, 2048, 0, wall_timeout_s=1800),
     "fuzz": JobClass(
-        "fuzz", True, 1, 16, FUZZ_WORKER_OVERHEAD_MB, int(FUZZ_RSS_LIMIT_MB * 1.25), wall_timeout_s=None,
+        "fuzz",
+        True,
+        1,
+        16,
+        FUZZ_WORKER_OVERHEAD_MB,
+        int(FUZZ_RSS_LIMIT_MB * 1.25),
+        wall_timeout_s=None,
     ),
     "replay": JobClass("replay", True, 1, 1, 1024, 0, idempotent=True, wall_timeout_s=1800),
     "selftest": JobClass("selftest", True, 1, 1, 1024, 0, idempotent=True, wall_timeout_s=1800),
@@ -128,6 +134,7 @@ AGENT_DUTY = 2.0  # agents spend at least half their time in LLM inference
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -311,11 +318,13 @@ def slurm_limits(env: dict[str, str] | None = None) -> tuple[int | None, int | N
     env = dict(os.environ) if env is None else env
     node = _int(env.get("SLURM_NODEID")) or 0
     cpu_values = [
-        v for v in (
+        v
+        for v in (
             _int(env.get("SLURM_CPUS_ON_NODE")),
             _int(env.get("SLURM_CPUS_PER_TASK")),
             parse_slurm_cpus_per_node(env.get("SLURM_JOB_CPUS_PER_NODE"), node),
-        ) if v and v > 0
+        )
+        if v and v > 0
     ]
     cpus = min(cpu_values) if cpu_values else None
     mem = _int(env.get("SLURM_MEM_PER_NODE"))
@@ -354,10 +363,15 @@ def parse_mountinfo(root: Path | str = "/") -> list[Mount]:
         fields, tail = pre.split(), post.split()
         if not sep or len(fields) < 5 or not tail:
             continue
-        out.append(Mount(
-            root=_unescape(fields[3]), point=_unescape(fields[4]), fstype=tail[0],
-            source=_unescape(tail[1]) if len(tail) > 1 else "", options=tail[2] if len(tail) > 2 else "",
-        ))
+        out.append(
+            Mount(
+                root=_unescape(fields[3]),
+                point=_unescape(fields[4]),
+                fstype=tail[0],
+                source=_unescape(tail[1]) if len(tail) > 1 else "",
+                options=tail[2] if len(tail) > 2 else "",
+            )
+        )
     return out
 
 
@@ -406,6 +420,7 @@ def _kv(text: str | None) -> dict[str, int]:
 @dataclass
 class CgroupView:
     """Limits of this process's cgroup: the minimum over its ancestors (v2) or controller paths (v1)."""
+
     version: int | None = None
     cpu_quota: float | None = None
     mem_limit_mb: int | None = None
@@ -422,7 +437,7 @@ def _leaf_dir(root: Path, mount: Mount, path: str) -> Path:
     elif path == mroot:
         rel = "/"
     elif path.startswith(mroot + "/"):
-        rel = path[len(mroot):]
+        rel = path[len(mroot) :]
     else:
         rel = "/"  # outside the mounted subtree (cgroup namespace, moved process): the mount point is our view
     if ".." in rel.split("/"):
@@ -469,8 +484,14 @@ def cgroup_view(root: Path | str = "/") -> CgroupView:
         if any((base / f).exists() for f in ("cgroup.controllers", "cpu.max", "memory.max", "cpuset.cpus.effective")):
             v2 = (base, base)
         else:
-            for ctrl, sub in (("memory", "memory"), ("cpu", "cpu,cpuacct"), ("cpu", "cpu"),
-                              ("cpuacct", "cpu,cpuacct"), ("cpuacct", "cpuacct"), ("cpuset", "cpuset")):
+            for ctrl, sub in (
+                ("memory", "memory"),
+                ("cpu", "cpu,cpuacct"),
+                ("cpu", "cpu"),
+                ("cpuacct", "cpu,cpuacct"),
+                ("cpuacct", "cpuacct"),
+                ("cpuset", "cpuset"),
+            ):
                 if ctrl not in v1 and (base / sub).is_dir():
                     v1[ctrl] = (base / sub, base / sub)
 
@@ -513,8 +534,13 @@ def cgroup_view(root: Path | str = "/") -> CgroupView:
 def cgroup_stats(root: Path | str = "/") -> dict:
     """Usage of this process's cgroup: peak memory (MiB), OOM kills, CPU time (µs), memory limit."""
     view = cgroup_view(root)
-    out: dict[str, Any] = {"version": view.version, "peak_mb": None, "oom_kill": None, "cpu_usec": None,
-                           "limit_mb": view.mem_limit_mb}
+    out: dict[str, Any] = {
+        "version": view.version,
+        "peak_mb": None,
+        "oom_kill": None,
+        "cpu_usec": None,
+        "limit_mb": view.mem_limit_mb,
+    }
     if view.version == 2 and view.memory_dir is not None:
         out["peak_mb"] = _bytes_mb(_read_file(view.memory_dir / "memory.peak"), ceil=True)
         out["oom_kill"] = _kv(_read_file(view.memory_dir / "memory.events")).get("oom_kill")
@@ -547,6 +573,7 @@ def cpuset_cpus(root: Path | str) -> int | None:
 # Machine: CPUs, memory, pressure, topology, filesystems
 # ---------------------------------------------------------------------------
 
+
 def meminfo_mb(root: Path) -> dict[str, int]:
     info: dict[str, int] = {}
     for line in (_read(root, "/proc/meminfo") or "").splitlines():
@@ -564,10 +591,14 @@ def _windows_memory() -> tuple[int | None, int | None]:
 
         class MEMORYSTATUSEX(ctypes.Structure):
             _fields_ = [
-                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
                 ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
             ]
 
@@ -593,9 +624,9 @@ def host_memory(root: Path | str = "/") -> tuple[int | None, int | None, str]:
         return total, avail, "os"
     total = avail = None
     with contextlib.suppress(AttributeError, ValueError, OSError):
-        total = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // _MIB)
+        total = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // _MIB)  # type: ignore[attr-defined]
     with contextlib.suppress(AttributeError, ValueError, OSError):
-        avail = int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // _MIB)
+        avail = int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // _MIB)  # type: ignore[attr-defined]
     return total, avail, "os"
 
 
@@ -772,21 +803,23 @@ def in_container(root: Path | str = "/") -> bool:
 # Container engine view (docker / podman `info`)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class EngineInfo:
     """What the engine reports about its host and which limit flags it can enforce."""
-    kind: str = "unknown"            # docker | podman | unknown
+
+    kind: str = "unknown"  # docker | podman | unknown
     ncpu: int | None = None
     mem_total_mb: int | None = None
-    vm_backed: bool = False          # containers run in a VM (Docker Desktop, podman machine, remote host)
-    remote: bool = False             # the engine is on another machine (DOCKER_HOST/CONTAINER_HOST, remote service)
+    vm_backed: bool = False  # containers run in a VM (Docker Desktop, podman machine, remote host)
+    remote: bool = False  # the engine is on another machine (DOCKER_HOST/CONTAINER_HOST, remote service)
     rootless: bool = False
     cgroup_version: str | None = None
-    cpu: bool = True                 # --cpus
-    cpuset: bool = True              # --cpuset-cpus
-    memory: bool = True              # --memory
-    swap: bool = True                # --memory-swap
-    pids: bool = True                # --pids-limit
+    cpu: bool = True  # --cpus
+    cpuset: bool = True  # --cpuset-cpus
+    memory: bool = True  # --memory
+    swap: bool = True  # --memory-swap
+    pids: bool = True  # --pids-limit
     os: str | None = None
     ok: bool = True
     error: str | None = None
@@ -797,48 +830,104 @@ def _remote_url(url: str | None) -> bool:
     return bool(url) and not url.startswith(("unix://", "npipe://"))
 
 
-def parse_engine_info(data: dict, env: dict[str, str] | None = None, platform: str | None = None) -> EngineInfo:
+def is_wsl2(
+    env: Mapping[str, str] | None = None,
+    root: Path | str | None = None,
+    platform: str | None = None,
+) -> bool:
+    """
+    True when running inside a WSL2 Linux environment (where Docker Desktop shares the same
+    utility VM kernel and CPUs as the WSL2 distro rather than a separate hypervisor VM).
+    """
+    plat = platform or sys.platform
+    if not plat.startswith("linux"):
+        return False
+    check_env = os.environ if env is None else env
+    if check_env.get("WSL_DISTRO_NAME") or check_env.get("WSL_INTEROP"):
+        return True
+    if root is not None or env is None:
+        osrelease = (_read(_probe_root(root or "/"), "/proc/sys/kernel/osrelease") or "").lower()
+        if "microsoft" in osrelease or "wsl" in osrelease:
+            return True
+    return False
+
+
+def parse_engine_info(
+    data: dict,
+    env: dict[str, str] | None = None,
+    platform: str | None = None,
+    root: Path | str | None = None,
+) -> EngineInfo:
     """Parse `<engine> info --format '{{json .}}'` output (Docker or Podman shape)."""
-    env = dict(os.environ) if env is None else env
+    use_env = dict(os.environ) if env is None else env
     plat = platform or sys.platform
     host_vm = plat.startswith(("win", "cygwin", "darwin"))  # Linux containers on Windows/macOS live in a VM
     host = data.get("host") if isinstance(data, dict) else None
     if isinstance(host, dict):  # podman
         ctrls = {str(c) for c in (host.get("cgroupControllers") or [])}
-        security = host.get("security") if isinstance(host.get("security"), dict) else {}
-        remote = bool(host.get("serviceIsRemote")) or _remote_url(env.get("CONTAINER_HOST"))
+        raw_sec = host.get("security")
+        security = raw_sec if isinstance(raw_sec, dict) else {}
+        remote = bool(host.get("serviceIsRemote")) or _remote_url(use_env.get("CONTAINER_HOST"))
         mem = _int(host.get("memTotal"))
         return EngineInfo(
-            kind="podman", ncpu=_int(host.get("cpus")), mem_total_mb=mem // _MIB if mem else None,
-            vm_backed=remote or host_vm, remote=remote, rootless=bool(security.get("rootless")),
+            kind="podman",
+            ncpu=_int(host.get("cpus")),
+            mem_total_mb=mem // _MIB if mem else None,
+            vm_backed=remote or host_vm,
+            remote=remote,
+            rootless=bool(security.get("rootless")),
             cgroup_version=str(host.get("cgroupVersion") or "") or None,
-            cpu="cpu" in ctrls, cpuset="cpuset" in ctrls, memory="memory" in ctrls, swap="memory" in ctrls,
-            pids="pids" in ctrls, os=str(host.get("os") or "") or None,
+            cpu="cpu" in ctrls,
+            cpuset="cpuset" in ctrls,
+            memory="memory" in ctrls,
+            swap="memory" in ctrls,
+            pids="pids" in ctrls,
+            os=str(host.get("os") or "") or None,
         )
     os_name = str(data.get("OperatingSystem") or "")
-    remote = _remote_url(env.get("DOCKER_HOST"))
+    remote = _remote_url(use_env.get("DOCKER_HOST"))
     mem = _int(data.get("MemTotal"))
     security_opts = [str(s) for s in data.get("SecurityOptions") or []]
+    # On Windows/macOS, Docker Desktop runs in a Hyper-V/Virtualization.framework VM (`host_vm`).
+    # Inside WSL2, Docker Desktop's engine runs in the same WSL2 utility VM kernel as the caller,
+    # so CPU IDs and topology match the caller's `/sys/devices/system/cpu`.
+    desktop_vm = "docker desktop" in os_name.lower() and not is_wsl2(env, root, plat)
     return EngineInfo(
-        kind="docker", ncpu=_int(data.get("NCPU")), mem_total_mb=mem // _MIB if mem else None,
-        vm_backed="docker desktop" in os_name.lower() or remote or host_vm, remote=remote,
+        kind="docker",
+        ncpu=_int(data.get("NCPU")),
+        mem_total_mb=mem // _MIB if mem else None,
+        vm_backed=desktop_vm or remote or host_vm,
+        remote=remote,
         rootless=any("name=rootless" in s for s in security_opts),
         cgroup_version=str(data.get("CgroupVersion") or "") or None,
-        cpu=bool(data.get("CpuCfsQuota", True)), cpuset=bool(data.get("CPUSet", True)),
-        memory=bool(data.get("MemoryLimit", True)), swap=bool(data.get("SwapLimit", True)),
-        pids=bool(data.get("PidsLimit", True)), os=os_name or None,
+        cpu=bool(data.get("CpuCfsQuota", True)),
+        cpuset=bool(data.get("CPUSet", True)),
+        memory=bool(data.get("MemoryLimit", True)),
+        swap=bool(data.get("SwapLimit", True)),
+        pids=bool(data.get("PidsLimit", True)),
+        os=os_name or None,
     )
 
 
 _ENGINE_MEMO: dict[str, tuple[float, EngineInfo]] = {}
 
 
-def engine_info(engine: str, cache_dir: Path | str | None = None, max_age: float = ENGINE_INFO_MAX_AGE_S,
-                runner: Callable[..., Any] | None = None) -> EngineInfo:
+def engine_info(
+    engine: str,
+    cache_dir: Path | str | None = None,
+    max_age: float = ENGINE_INFO_MAX_AGE_S,
+    runner: Callable[..., Any] | None = None,
+) -> EngineInfo:
     """`<engine> info --format '{{json .}}'`, parsed; cached `max_age` seconds (in `cache_dir` when given)."""
-    ident = "|".join([engine, os.environ.get("DOCKER_HOST", ""), os.environ.get("CONTAINER_HOST", ""),
-                      os.environ.get("DOCKER_CONTEXT", "")])
-    digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+    ident = "|".join(
+        [
+            engine,
+            os.environ.get("DOCKER_HOST", ""),
+            os.environ.get("CONTAINER_HOST", ""),
+            os.environ.get("DOCKER_CONTEXT", ""),
+        ]
+    )
+    digest = hashlib.sha256(ident.encode()).hexdigest()[:16]
     now = time.time()
     hit = _ENGINE_MEMO.get(digest)
     if hit and now - hit[0] < max_age and runner is None:
@@ -846,21 +935,31 @@ def engine_info(engine: str, cache_dir: Path | str | None = None, max_age: float
     cache = Path(cache_dir) / f"engine-{digest}.json" if cache_dir else None
     if cache is not None and runner is None:
         cached = _load_json(cache)
-        if isinstance(cached, dict) and isinstance(cached.get("data"), dict) and now - float(cached.get("ts") or 0) < max_age:
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("data"), dict)
+            and now - float(cached.get("ts") or 0) < max_age
+        ):
             info = parse_engine_info(cached["data"])
             _ENGINE_MEMO[digest] = (now, info)
             return info
     run = runner or subprocess.run
     try:
-        proc = run([engine, "info", "--format", "{{json .}}"], capture_output=True, text=True,
-                   encoding="utf-8", errors="replace", timeout=60)
+        proc = run(
+            [engine, "info", "--format", "{{json .}}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return EngineInfo(ok=False, error=f"{engine} info: {exc}")
     out = (proc.stdout or "").strip()
     data = None
     if proc.returncode == 0 and out:
         with contextlib.suppress(ValueError):
-            data = json.loads(out[out.find("{"):]) if "{" in out else None
+            data = json.loads(out[out.find("{") :]) if "{" in out else None
     if not isinstance(data, dict):
         detail = (proc.stderr or out or "").strip().splitlines()
         return EngineInfo(ok=False, error=f"{engine} info failed: {detail[-1] if detail else proc.returncode}")
@@ -875,8 +974,14 @@ def engine_info(engine: str, cache_dir: Path | str | None = None, max_age: float
 def container_running(engine: str, lease_id: str) -> bool | None:
     """True/False when `<engine> ps` says whether the lease's container runs; None when it cannot tell."""
     try:
-        proc = subprocess.run([engine, "ps", "-q", "--filter", f"label=framac.lease={lease_id}"],
-                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        proc = subprocess.run(
+            [engine, "ps", "-q", "--filter", f"label=framac.lease={lease_id}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -888,6 +993,7 @@ def container_running(engine: str, lease_id: str) -> bool | None:
 # Pool: everything a decision needs, measured now
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Pool:
     scope: str
@@ -895,7 +1001,7 @@ class Pool:
     mem_mb: int
     cpu_ids: tuple[int, ...] = ()
     machine_cpus: int | None = None
-    subset: bool = False              # cpu_ids is a strict subset of the machine's online CPUs
+    subset: bool = False  # cpu_ids is a strict subset of the machine's online CPUs
     sources: dict = field(default_factory=dict)
     binding: dict = field(default_factory=dict)
     reserve: dict = field(default_factory=dict)
@@ -907,8 +1013,11 @@ class Pool:
     warnings: tuple[str, ...] = ()
 
     def budget(self) -> Budget:
-        return Budget(cpus=self.cpus, mem_mb=self.mem_mb,
-                      source=f"cpu:{self.binding.get('cpus', '?')},mem:{self.binding.get('mem_mb', '?')}")
+        return Budget(
+            cpus=self.cpus,
+            mem_mb=self.mem_mb,
+            source=f"cpu:{self.binding.get('cpus', '?')},mem:{self.binding.get('mem_mb', '?')}",
+        )
 
     def summary(self) -> dict:
         """Compact record for run-metadata.json."""
@@ -929,9 +1038,20 @@ class Pool:
 
 
 _PROBE_ENV = (
-    "FRAMAC_POOL_CPUS", "FRAMAC_POOL_MEMORY", "FRAMAC_POOL_MEM_MB", "FRAMAC_RESERVE_CPUS", "FRAMAC_RESERVE_MEMORY",
-    "FRAMAC_JOB_CPUS", "FRAMAC_JOB_MEM_MB", "SLURM_CPUS_ON_NODE", "SLURM_CPUS_PER_TASK", "SLURM_JOB_CPUS_PER_NODE",
-    "SLURM_MEM_PER_NODE", "SLURM_MEM_PER_CPU", "SLURM_NODEID", "FRAMAC_PROBE_ROOT",
+    "FRAMAC_POOL_CPUS",
+    "FRAMAC_POOL_MEMORY",
+    "FRAMAC_POOL_MEM_MB",
+    "FRAMAC_RESERVE_CPUS",
+    "FRAMAC_RESERVE_MEMORY",
+    "FRAMAC_JOB_CPUS",
+    "FRAMAC_JOB_MEM_MB",
+    "SLURM_CPUS_ON_NODE",
+    "SLURM_CPUS_PER_TASK",
+    "SLURM_JOB_CPUS_PER_NODE",
+    "SLURM_MEM_PER_NODE",
+    "SLURM_MEM_PER_CPU",
+    "SLURM_NODEID",
+    "FRAMAC_PROBE_ROOT",
 )
 _PROBE_MEMO: dict[tuple, tuple[float, Pool]] = {}
 _PROBE_LOCK = threading.Lock()
@@ -962,9 +1082,16 @@ def _reserve_amount(raw: str | None, total: float, default: float, memory: bool)
         return default
 
 
-def probe(scope: str = "host", engine: str | EngineInfo | None = None, root: Path | str = "/", *,
-          run_dir: Path | str | None = None, cache_dir: Path | str | None = None,
-          broker_dir: Path | str | None = None, fresh: bool = False) -> Pool:
+def probe(
+    scope: str = "host",
+    engine: str | EngineInfo | None = None,
+    root: Path | str = "/",
+    *,
+    run_dir: Path | str | None = None,
+    cache_dir: Path | str | None = None,
+    broker_dir: Path | str | None = None,
+    fresh: bool = False,
+) -> Pool:
     """
     Measure the pool now (memoized PROBE_MEMO_S seconds; FRAMAC_PROBE_MEMO_S=0 disables).
     The pool is the minimum over every source (machine, affinity/cpuset, cgroup limits up the
@@ -992,8 +1119,14 @@ def probe(scope: str = "host", engine: str | EngineInfo | None = None, root: Pat
     return pool
 
 
-def _probe(scope: str, engine: str | EngineInfo | None, root: Path, run_dir: Path | str | None,
-           cache_dir: Path | str | None, broker_dir: Path | str | None) -> Pool:
+def _probe(
+    scope: str,
+    engine: str | EngineInfo | None,
+    root: Path,
+    run_dir: Path | str | None,
+    cache_dir: Path | str | None,
+    broker_dir: Path | str | None,
+) -> Pool:
     real = _is_real_root(root)
     eng: EngineInfo | None = None
     if scope == "host" and engine is not None:
@@ -1059,8 +1192,14 @@ def _probe(scope: str, engine: str | EngineInfo | None, root: Path, run_dir: Pat
         res_mem = _reserve_amount(os.environ.get("FRAMAC_RESERVE_MEMORY"), raw_mem, max(1024.0, 0.10 * raw_mem), True)
     eff_cpu, eff_mem = raw_cpu - res_cpu, raw_mem - res_mem
     cap_cpu = _env_float("FRAMAC_POOL_CPUS")
-    cap_mem = min((v for v in (parse_mem(os.environ.get("FRAMAC_POOL_MEMORY")),
-                               parse_mem(os.environ.get("FRAMAC_POOL_MEM_MB"))) if v), default=None)
+    cap_mem = min(
+        (
+            v
+            for v in (parse_mem(os.environ.get("FRAMAC_POOL_MEMORY")), parse_mem(os.environ.get("FRAMAC_POOL_MEM_MB")))
+            if v
+        ),
+        default=None,
+    )
     binding = {"cpus": bind_cpu, "mem_mb": bind_mem}
     if cap_cpu is not None and cap_cpu < eff_cpu:
         eff_cpu, binding["cpus"] = cap_cpu, "cap"
@@ -1074,16 +1213,20 @@ def _probe(scope: str, engine: str | EngineInfo | None, root: Path, run_dir: Pat
     mem_mb = max(256, int(eff_mem))
 
     if avail_mb is not None and (native or not remote) and avail_mb < mem_mb // 2:
-        warnings.append(f"only {avail_mb} MiB of memory is available right now for a {mem_mb} MiB pool: "
-                        "other processes are using memory, so large grants may be OOM-killed")
+        warnings.append(
+            f"only {avail_mb} MiB of memory is available right now for a {mem_mb} MiB pool: "
+            "other processes are using memory, so large grants may be OOM-killed"
+        )
     psi = read_psi(root, view)
     if psi.get("memory", {}).get("some", 0.0) >= 20.0:
         warnings.append(f"memory pressure: {psi['memory']['some']:.0f}% of the last 10 s stalled on memory")
     if psi.get("cpu", {}).get("some", 0.0) >= 50.0:
         warnings.append(f"CPU pressure: {psi['cpu']['some']:.0f}% of the last 10 s waiting for a CPU")
     if not native and subset:
-        warnings.append(f"this process may only use CPUs {format_cpu_list(allowed or [])}, but the engine runs "
-                        "containers in a VM where that restriction does not apply")
+        warnings.append(
+            f"this process may only use CPUs {format_cpu_list(allowed or [])}, but the engine runs "
+            "containers in a VM where that restriction does not apply"
+        )
     if eng is not None and not eng.ok:
         warnings.append(f"container engine view unavailable ({eng.error}); sizing from the host only")
 
@@ -1106,22 +1249,36 @@ def _probe(scope: str, engine: str | EngineInfo | None, root: Path, run_dir: Pat
         kind = fs_type(path, root, mounts)
         fs[label] = kind
         if is_network_fs(kind):
-            warnings.append(f"{label.replace('_', ' ')} {path} is on {kind} (network or virtualized filesystem): "
-                            "slower I/O than a local disk")
+            warnings.append(
+                f"{label.replace('_', ' ')} {path} is on {kind} (network or virtualized filesystem): "
+                "slower I/O than a local disk"
+            )
 
     ids = tuple(allowed or online or ()) if native else ()
     topology = cpu_topology(root, ids) if ids else None
     return Pool(
-        scope=scope, cpus=cpus, mem_mb=mem_mb, cpu_ids=ids, machine_cpus=n_machine, subset=subset and native,
-        sources={"cpus": cpu, "mem_mb": mem}, binding=binding,
-        reserve={"cpus": round(res_cpu, 3), "mem_mb": int(res_mem)}, mem_available_mb=avail_mb, psi=psi,
-        topology=topology, engine=eng, fs=fs, warnings=tuple(warnings),
+        scope=scope,
+        cpus=cpus,
+        mem_mb=mem_mb,
+        cpu_ids=ids,
+        machine_cpus=n_machine,
+        subset=subset and native,
+        sources={"cpus": cpu, "mem_mb": mem},
+        binding=binding,
+        reserve={"cpus": round(res_cpu, 3), "mem_mb": int(res_mem)},
+        mem_available_mb=avail_mb,
+        psi=psi,
+        topology=topology,
+        engine=eng,
+        fs=fs,
+        warnings=tuple(warnings),
     )
 
 
 # ---------------------------------------------------------------------------
 # Budgets and sizing (stable API)
 # ---------------------------------------------------------------------------
+
 
 def job_budget(root: Path | str = "/", *, use_available: bool = True) -> Budget:
     """
@@ -1134,16 +1291,15 @@ def job_budget(root: Path | str = "/", *, use_available: bool = True) -> Budget:
     root = _probe_root(root)
     cpu_sources: list[tuple[float, str]] = []
     mem_sources: list[tuple[int, str]] = []
+    cgroup_enforced = os.environ.get("FRAMAC_CGROUP_ENFORCED", "").strip() == "1"
     env_cpus, env_mem = _env_int("FRAMAC_JOB_CPUS"), parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB"))
-    if env_cpus:
-        cpu_sources.append((env_cpus, "grant"))
-    if env_mem:
-        mem_sources.append((env_mem, "grant"))
     view = cgroup_view(root)
     if view.cpu_quota:
         cpu_sources.append((view.cpu_quota, "cgroup"))
     if view.cpuset:
         cpu_sources.append((len(view.cpuset), "cpuset"))
+    if env_cpus and not (cgroup_enforced and (view.cpu_quota or view.cpuset)):
+        cpu_sources.append((env_cpus, "grant"))
     affinity = _affinity_count(root)
     if affinity:
         cpu_sources.append((affinity, "affinity"))
@@ -1153,6 +1309,8 @@ def job_budget(root: Path | str = "/", *, use_available: bool = True) -> Budget:
             cpu_sources.append((n_machine, "os"))
     if view.mem_limit_mb:
         mem_sources.append((view.mem_limit_mb, "cgroup"))
+    if env_mem and not (cgroup_enforced and view.mem_limit_mb):
+        mem_sources.append((env_mem, "grant"))
     total, avail, mem_src = host_memory(root)
     machine_mem = avail if use_available else total
     if machine_mem:
@@ -1163,12 +1321,18 @@ def job_budget(root: Path | str = "/", *, use_available: bool = True) -> Budget:
         cpu_sources.append((1, "default"))
     cpus, cpu_src = min(cpu_sources, key=lambda t: t[0])
     mem, mem_src = min(mem_sources, key=lambda t: t[0])
-    return Budget(cpus=max(1, int(math.floor(cpus + 1e-9))), mem_mb=max(256, int(mem)), source=f"cpu:{cpu_src},mem:{mem_src}")
+    return Budget(
+        cpus=max(1, int(math.floor(cpus + 1e-9))), mem_mb=max(256, int(mem)), source=f"cpu:{cpu_src},mem:{mem_src}"
+    )
 
 
 def enforced_memory_mb(root: Path | str = "/") -> int | None:
     """The memory limit actually imposed on this job (its grant or its cgroup), or None when unlimited."""
-    limits = [v for v in (parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB")), cgroup_view(_probe_root(root)).mem_limit_mb) if v]
+    cg_mem = cgroup_view(_probe_root(root)).mem_limit_mb
+    cgroup_enforced = os.environ.get("FRAMAC_CGROUP_ENFORCED", "").strip() == "1"
+    if cgroup_enforced and cg_mem is not None:
+        return cg_mem
+    limits = [v for v in (parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB")), cg_mem) if v]
     return min(limits) if limits else None
 
 
@@ -1244,17 +1408,25 @@ def recommend(max_agents: int | None = None, pool: Budget | None = None) -> dict
 _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"run_wp_function\.py", "wp"),
     (r"run_eva_slice\.py", "eva"),
-    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build\b", "build"),
-    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?campaign\b", "fuzz"),
-    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?guardrail\b", "guardrail"),
-    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?replay(?:-candidates)?\b", "replay"),
-    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?selftest\b", "selftest"),
+    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?campaign(?:\s|$)", "fuzz"),
+    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?guardrail(?:\s|$)", "guardrail"),
+    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?replay(?:-candidates)?(?:\s|$)", "replay"),
+    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?selftest(?:\s|$)", "selftest"),
+    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", "build"),
+    (r"pipeline_make\.py\s+(?:\S+\s+)*?sweep(?:\s|$)", "phase-static"),
+    (r"build_callgraph_dag\.py\b", "eva"),
+    (r"extract_references\.py\b", "build"),
+    # The target's own build under the sandbox (bear -- make, cmake, ninja ...): target code, sized like a phase.
+    # Must appear before compiler patterns so sandboxed target builds are not downgraded to "build".
+    (
+        r"sandbox_exec\.py\s+run\b[^;&|]*?\s--\s+(?:\S*/)?(?:bear|make|gmake|cmake|ninja|meson|scons|configure)\b",
+        "phase-dynamic",
+    ),
+    (r"sandbox_exec\.py\s+run\b", "replay"),
+    (r"(?:^|[\s;&|(/])e-acsl-gcc(?:\.sh)?(?:\s|$)", "build"),
+    (r"(?:^|[\s;&|(/])(?:clang|gcc)\b[^;&|]*-fsanitize=[^\s;&|]*fuzzer", "build"),
     (r"workspace_overlay\.py\s+merge-(?:agent|batch)\b", "verify"),
     (r"wp_scheduler\.py\s+(?:complete|merge-pending)\b", "verify"),
-    # The target's own build under the sandbox (bear -- make, cmake, ninja ...): target code, sized like a phase.
-    (r"sandbox_exec\.py\s+run\b[^;&|]*?\s--\s+(?:\S*/)?(?:bear|make|gmake|cmake|ninja|meson|scons|configure)\b",
-     "phase-dynamic"),
-    (r"sandbox_exec\.py\s+run\b", "replay"),
     # A direct Frama-C call (parse or annotation check): one single-threaded kernel, like Eva.
     (r"(?:^|[\s;&|(/])frama-c(?:\s|$)", "eva"),
 )
@@ -1262,6 +1434,13 @@ _DYNAMIC_MAKE_TARGETS = frozenset({"selftest", "fuzz", "replay"})
 # Per-module targets that run target code (fuzz-<mod>, module-<mod>, ...); build-<mod>/eva-<mod> stay static.
 _DYNAMIC_MAKE_PREFIXES = ("module-", "fuzz-", "replay-", "selftest-")
 _MAKE_VALUE_OPTIONS = frozenset({"--jobs", "-j"})
+_PIPELINE_SCRIPTS = "/opt/framac-pipeline/scripts"
+_SCRIPT_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])(?:\$S|\$\{S\})(?=/|\s|$)")
+
+
+def expand_script_var(cmd: str) -> str:
+    """Replace `$S` or `${S}` script-path shorthand with `/opt/framac-pipeline/scripts`."""
+    return _SCRIPT_VAR_RE.sub(_PIPELINE_SCRIPTS, cmd or "")
 
 
 def _make_targets(args: str) -> list[str]:
@@ -1282,8 +1461,8 @@ def _make_targets(args: str) -> list[str]:
 
 def infer_class(cmd: str) -> str:
     """Job class of a container command line (sizing only; never a security decision)."""
-    text = cmd or ""
-    m = re.search(r"pipeline_make\.py\s+run\s+(?P<targets>[^;&|]*)", text)
+    text = expand_script_var(cmd or "")
+    m = re.search(r"pipeline_make\.py(?:\s+--run-dir(?:\s+\S+|=\S+))?\s+run\s+(?P<targets>[^;&|]*)", text)
     if m:
         targets = _make_targets(m.group("targets"))
         dynamic = any(t in _DYNAMIC_MAKE_TARGETS or t.startswith(_DYNAMIC_MAKE_PREFIXES) for t in targets)
@@ -1295,28 +1474,81 @@ def infer_class(cmd: str) -> str:
 
 
 # Commands allowed to write the shared cross-run cache (exact token match; see cache_mount_mode).
-_PIPELINE_SCRIPTS = "/opt/framac-pipeline/scripts"
-CACHE_RW_ALLOWLIST: frozenset[tuple[str, ...]] = frozenset({
-    ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "build"),
-    ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "eva"),
-    ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "wp-sweep"),
-    ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "gc"),
-    ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "stats"),
-})
+CACHE_RW_ALLOWLIST: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "build"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "eva"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "wp-sweep"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "ingest"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "ingest", "wp-queue"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "ingest"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "gc"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "stats"),
+    }
+)
 _PLAIN_COMMAND = re.compile(r"[A-Za-z0-9_./ \t-]*")
+
+
+def is_known_static_command(cmd: str | None) -> bool:
+    """
+    True ONLY when `cmd` is known with certainty to run only static analysis, pure Python
+    tooling, or compiler instrumentation without executing target binaries.
+    Fails closed: any unrecognized command, shell expression, or sandboxed execution returns False.
+    """
+    if not cmd or not isinstance(cmd, str):
+        return False
+    text = expand_script_var(cmd.strip())
+    if re.search(r"[;&|`$><\n\r]", text):
+        return False
+    # Any sandbox_exec.py run executes target code
+    if "sandbox_exec.py" in text:
+        return False
+    # Strip python interpreter prefix if present
+    clean = re.sub(r"^(?:/usr/bin/|/usr/local/bin/)?(?:python3?|pypy3?)\s+", "", text).strip()
+    m = re.match(
+        r"^(?:/opt/framac-pipeline/scripts/)?pipeline_make\.py(?:\s+--run-dir(?:\s+\S+|=\S+))?\s+(?P<sub>gen|plan|params|ingest|sweep|run)(?:\s+(?P<targets>.*))?$",
+        clean,
+    )
+    if m:
+        if m.group("sub") != "run":
+            return True
+        targets = _make_targets(m.group("targets") or "")
+        if not targets:
+            return False
+        return not any(t in _DYNAMIC_MAKE_TARGETS or t.startswith(_DYNAMIC_MAKE_PREFIXES) for t in targets)
+    if "run_eacsl_fuzz.py" in clean:
+        return bool(
+            re.match(r"^(?:/opt/framac-pipeline/scripts/)?run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", clean)
+        ) and not any(sub in clean for sub in ("campaign", "guardrail", "replay", "selftest"))
+    static_tool_res = (
+        r"^(?:/opt/framac-pipeline/scripts/)?run_wp_function\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?run_eva_slice\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?build_callgraph_dag\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?extract_references\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?generate_harness\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?ledger\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?run_metadata\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?validate_artifacts\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?cache\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?generate_report\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?contract_negotiator\.py\b",
+        r"^(?:/usr/bin/|/usr/local/bin/)?(?:e-acsl-gcc(?:\.sh)?|frama-c(?:-gui)?)(?:\s|$)",
+    )
+    return any(re.search(pat, clean) for pat in static_tool_res)
 
 
 def cache_mount_mode(cmd: str, cache_rw_requested: bool, cache_dir: str | Path | None = None) -> str:
     """
     How the shared cache is mounted for `cmd`: 'rw' only when rw was requested AND the command
-    is exactly an allowlisted trusted step (plain tokens, no shell syntax at all); 'off' when
-    the cache dir is 'off' or FRAMAC_CACHE=off; 'ro' otherwise. Class inference plays no part.
+    is exactly an allowlisted trusted step (plain tokens, no shell syntax at all, after expanding
+    `$S` / `${S}`); 'off' when the cache dir is 'off' or FRAMAC_CACHE=off; 'ro' otherwise. Class
+    inference plays no part.
     """
     if cache_dir is not None and str(cache_dir).strip().lower() == "off":
         return "off"
     if (os.environ.get("FRAMAC_CACHE") or "").strip().lower() == "off":
         return "off"
-    text = cmd or ""
+    text = expand_script_var(cmd or "")
     if cache_rw_requested and _PLAIN_COMMAND.fullmatch(text) and tuple(text.split()) in CACHE_RW_ALLOWLIST:
         return "rw"
     return "ro"
@@ -1327,37 +1559,81 @@ def cache_mount_mode(cmd: str, cache_rw_requested: bool, cache_dir: str | Path |
 # ---------------------------------------------------------------------------
 
 _HISTORY_KEEP = 400
+_SHARED_HISTORY_SUBDIR = "resource-history"
+
+
+def _prune_history_dir(d: Path) -> None:
+    with contextlib.suppress(OSError):
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+        for name in names[: max(0, len(names) - _HISTORY_KEEP)]:
+            _unlink(d / name)
+
+
+def _shared_history_dirs(cls: str, cache_dir: Path | str | None = None) -> list[Path]:
+    """Shared cross-run resource-history directories for `cls`, when enabled."""
+    if (os.environ.get("FRAMAC_CACHE") or "").strip().lower() == "off":
+        return []
+    shared = str(cache_dir or os.environ.get("FRAMAC_SHARED_CACHE_DIR") or "").strip()
+    if not shared or shared.lower() == "off":
+        return []
+    sp = Path(shared)
+    if not sp.is_dir():
+        return []
+    return [sp / _SHARED_HISTORY_SUBDIR / cls]
 
 
 def write_history(run_dir: Path | str, record: dict) -> Path | None:
-    """Store one usage record of a known class under the run dir; returns its path."""
+    """
+    Store one usage record of a known class under the run dir (and mirror into the shared
+    store when `FRAMAC_CACHE_MODE=rw`); returns the run-dir path.
+    """
     cls = record.get("class")
     if cls not in CLASSES:
         return None
     d = Path(run_dir) / HISTORY_DIR / str(cls)
     d.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = d / f"{stamp}-{secrets.token_hex(4)}.json"
+    fname = f"{stamp}-{secrets.token_hex(4)}.json"
+    path = d / fname
     _write_json(path, record)
-    with contextlib.suppress(OSError):
-        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
-        for name in names[: max(0, len(names) - _HISTORY_KEEP)]:
-            _unlink(d / name)
+    _prune_history_dir(d)
+    if (os.environ.get("FRAMAC_CACHE_MODE") or "").strip().lower() == "rw":
+        for sd in _shared_history_dirs(str(cls)):
+            with contextlib.suppress(OSError):
+                sd.mkdir(parents=True, exist_ok=True)
+                _write_json(sd / fname, record)
+                _prune_history_dir(sd)
     return path
 
 
-def history_estimate(run_dir: Path | str | None, cls: str, key: str | None = None, last: int = 5) -> int | None:
+def history_estimate(
+    run_dir: Path | str | None,
+    cls: str,
+    key: str | None = None,
+    last: int = 5,
+    cache_dir: Path | str | None = None,
+) -> int | None:
     """Memory (MiB) the history suggests: 1.25 x the max of the last `last` peaks (2 x after an OOM kill)."""
     if run_dir is None or cls not in CLASSES:
         return None
-    d = Path(run_dir) / HISTORY_DIR / cls
-    try:
-        names = sorted((n for n in os.listdir(d) if n.endswith(".json")), reverse=True)[:200]
-    except OSError:
+    dirs = [Path(run_dir) / HISTORY_DIR / cls, *_shared_history_dirs(cls, cache_dir=cache_dir)]
+    candidates: list[tuple[str, Path]] = []
+    seen_names: set[str] = set()
+    for d in dirs:
+        try:
+            names = [n for n in os.listdir(d) if n.endswith(".json")]
+        except OSError:
+            continue
+        for n in names:
+            if n not in seen_names:
+                seen_names.add(n)
+                candidates.append((n, d / n))
+    if not candidates:
         return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
     values: list[float] = []
-    for name in names:
-        rec = _load_json(d / name, max_bytes=64 * 1024)
+    for _, path in candidates[:64]:
+        rec = _load_json(path, max_bytes=64 * 1024)
         if not isinstance(rec, dict) or (rec.get("key") or None) != (key or None):
             continue
         peak = rec.get("peak_mb")
@@ -1373,10 +1649,11 @@ def history_estimate(run_dir: Path | str | None, cls: str, key: str | None = Non
 # Locks and leases
 # ---------------------------------------------------------------------------
 
+
 def _lock_fd(fd: int, blocking: bool) -> bool:
     if fcntl is not None:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))  # type: ignore[attr-defined]
             return True
         except BlockingIOError:
             return False
@@ -1432,7 +1709,7 @@ class FileLock:
             return
         try:
             if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
             elif msvcrt is not None:
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
@@ -1481,7 +1758,7 @@ class Lease:
     cpu_set: list[int] | None
     gated: bool
     grant_no: int
-    single: bool          # no other lease was live when this one was granted
+    single: bool  # no other lease was live when this one was granted
     pool_cpus: int
     pool_mem_mb: int
     waited: bool = False
@@ -1503,13 +1780,24 @@ def _mem_for(demand: dict, cpus: float, pool_mem: int) -> int:
 
 def _min_need(demand: dict, pool_cpus: float, pool_mem: int) -> tuple[float, int]:
     fixed = demand.get("fixed_cpus")
-    cpus = min(float(fixed), float(max(1, int(pool_cpus)))) if fixed else float(
-        _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus)[0])
+    cpus = (
+        min(float(fixed), float(max(1, int(pool_cpus))))
+        if fixed
+        else float(_cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus)[0])
+    )
     return cpus, _mem_for(demand, cpus, pool_mem)
 
 
-def _fit(demand: dict, free_cpus: float, free_mem: int, pool_cpus: float, pool_mem: int, waiting_others: int,
-         taken: set[int], placer: Callable[[int, set[int]], list[int] | None] | None) -> Grant | None:
+def _fit(
+    demand: dict,
+    free_cpus: float,
+    free_mem: int,
+    pool_cpus: float,
+    pool_mem: int,
+    waiting_others: int,
+    taken: set[int],
+    placer: Callable[[int, set[int]], list[int] | None] | None,
+) -> Grant | None:
     fixed = demand.get("fixed_cpus")
     if fixed:
         wanted: list[float] = [min(float(fixed), float(max(1, int(pool_cpus))))]
@@ -1536,25 +1824,70 @@ def _fit(demand: dict, free_cpus: float, free_mem: int, pool_cpus: float, pool_m
     return None
 
 
+def _norm_run_dir(run_dir: Any) -> str | None:
+    if not run_dir:
+        return None
+    s = str(run_dir).strip()
+    if not s:
+        return None
+    try:
+        return os.path.normcase(os.path.realpath(s))
+    except OSError:
+        return s
+
+
+def _entry_runs_target_code(entry: dict) -> bool:
+    if isinstance(entry.get("runs_target_code"), bool):
+        return bool(entry["runs_target_code"])
+    cls_obj = CLASSES.get(str(entry.get("class") or ""))
+    return bool(cls_obj.runs_target_code) if cls_obj else True
+
+
+def _run_dir_conflict(a: dict, b: dict) -> bool:
+    """
+    A `cache_mode='rw'` container and a `runs_target_code=True` container must never run
+    concurrently on the same `run_dir`, because both bind-mount `<run_dir>:/workspace:rw`
+    and target code could mutate sources/outputs while the `rw` container writes the shared store.
+    """
+    ra, rb = _norm_run_dir(a.get("run_dir")), _norm_run_dir(b.get("run_dir"))
+    if not ra or not rb or ra != rb:
+        return False
+    a_rw = a.get("cache_mode") == "rw"
+    b_rw = b.get("cache_mode") == "rw"
+    a_tc = _entry_runs_target_code(a)
+    b_tc = _entry_runs_target_code(b)
+    return (a_rw and b_tc) or (b_rw and a_tc)
+
+
 def _queue(entries: list[dict]) -> list[dict]:
     waiting = [e for e in entries if e.get("state") == "waiting" and e.get("gated", True)]
     return sorted(waiting, key=lambda e: (int(e.get("seq") or 0), str(e.get("id"))))
 
 
-def plan_grant(me: dict, entries: list[dict], pool_cpus: float, pool_mem: int,
-               placer: Callable[[int, set[int]], list[int] | None] | None = None) -> Grant | None:
+def plan_grant(
+    me: dict,
+    entries: list[dict],
+    pool_cpus: float,
+    pool_mem: int,
+    placer: Callable[[int, set[int]], list[int] | None] | None = None,
+) -> Grant | None:
     """
     Grant for ticket `me` now, or None to keep waiting. CPUs are elastic:
     clamp(free // (1 + waiting), min, min(max or pool, max(min, pool // 2))), lowered until the
     memory (base + per_cpu x cpus, raised by history) fits. Tickets are served FIFO; a later
     ticket is granted first (backfill) only when the head of the queue still fits afterwards.
+    A `cache_mode='rw'` ticket and a `runs_target_code=True` ticket on the same `run_dir` are
+    mutually exclusive.
     """
-    granted = [e for e in entries if e.get("state") == "granted" and e.get("gated", True)]
+    granted_all = [e for e in entries if e.get("state") == "granted"]
+    if any(_run_dir_conflict(me, e) for e in granted_all):
+        return None
+    granted = [e for e in granted_all if e.get("gated", True)]
     free_cpus = pool_cpus - sum(float(e.get("cpus") or 0) for e in granted)
     free_mem = int(pool_mem) - sum(int(e.get("mem_mb") or 0) for e in granted)
     queue = _queue(entries)
     if not any(e.get("id") == me.get("id") for e in queue):
-        queue = _queue([*queue, {**me, "state": "waiting"}])
+        queue = _queue([*queue, {**me, "state": "waiting", "gated": True}])
     taken: set[int] = set()
     for e in granted:
         taken.update(int(c) for c in e.get("cpu_set") or [])
@@ -1563,6 +1896,8 @@ def plan_grant(me: dict, entries: list[dict], pool_cpus: float, pool_mem: int,
         return None
     head = queue[0]
     if head.get("id") != me.get("id"):
+        if _run_dir_conflict(me, head):
+            return None
         need_cpus, need_mem = _min_need(head["demand"], pool_cpus, pool_mem)
         if need_cpus > free_cpus - grant.cpus + 1e-9 or need_mem > free_mem - grant.mem_mb:
             return None
@@ -1572,6 +1907,107 @@ def plan_grant(me: dict, entries: list[dict], pool_cpus: float, pool_mem: int,
 def queue_position(lease_id: str, entries: list[dict]) -> tuple[int, int]:
     ids = [e.get("id") for e in _queue(entries)]
     return (ids.index(lease_id) + 1 if lease_id in ids else 0), len(ids)
+
+
+def rebalance_grants(
+    entries: list[dict],
+    pool_cpus: float,
+    pool_mem: int,
+    placer: Callable[[int, set[int]], list[int] | None] | None = None,
+) -> list[dict]:
+    """
+    Plan grow-only CPU/memory increases for running elastic container leases when the queue is
+    empty and free pool resources exist. Never shrinks CPUs or memory (shrinking `--memory` below
+    a running container's resident usage can kill or fail it).
+    """
+    if _queue(entries):
+        return []
+    granted = sorted(
+        (e for e in entries if e.get("state") == "granted" and e.get("gated", True)),
+        key=lambda e: (int(e.get("seq") or 0), str(e.get("id"))),
+    )
+    if not granted:
+        return []
+    used_cpus = sum(float(e.get("cpus") or 0) for e in granted)
+    used_mem = sum(int(e.get("mem_mb") or 0) for e in granted)
+    free_cpus = float(pool_cpus) - used_cpus
+    free_mem = int(pool_mem) - used_mem
+    if free_cpus <= 1e-9 and free_mem <= 0:
+        return []
+
+    eligible: list[dict] = []
+    for e in granted:
+        if not e.get("container"):
+            continue
+        demand = e.get("demand") or {}
+        if demand.get("fixed_cpus") or demand.get("fixed_mem_mb"):
+            continue
+        cur_cpus = float(e.get("cpus") or 1)
+        cur_mem = int(e.get("mem_mb") or 0)
+        _lo, hi = _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus)
+        target_mem_at_cur = _mem_for(demand, cur_cpus, pool_mem)
+        if cur_cpus + 1e-9 < hi or cur_mem < target_mem_at_cur:
+            eligible.append(e)
+    if not eligible:
+        return []
+
+    taken: set[int] = set()
+    for e in granted:
+        taken.update(int(c) for c in (e.get("cpu_set") or []))
+
+    updates: list[dict] = []
+    for idx, e in enumerate(eligible):
+        remaining = len(eligible) - idx
+        demand = e.get("demand") or {}
+        cur_cpus = float(e.get("cpus") or 1)
+        cur_mem = int(e.get("mem_mb") or 0)
+        cur_cpuset = sorted(int(c) for c in (e.get("cpu_set") or []))
+        _lo, hi = _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus)
+        extra_share = int(math.floor(max(0.0, free_cpus) / remaining + 1e-9))
+        if extra_share == 0 and free_cpus >= 1.0 - 1e-9:
+            extra_share = 1
+        cur_int = int(math.ceil(cur_cpus - 1e-9))
+        top = max(cur_int, min(int(hi), int(math.floor(cur_cpus + extra_share + 1e-9))))
+        for want in range(top, cur_int - 1, -1):
+            actual = max(cur_cpus, float(want))
+            new_cpuset: list[int] | None = list(cur_cpuset) if cur_cpuset else None
+            if (cur_cpuset or placer is not None) and actual > cur_cpus + 1e-9:
+                if placer is None:
+                    continue
+                need_extra = int(math.ceil(actual - 1e-9)) - len(cur_cpuset)
+                if need_extra > 0:
+                    added = placer(need_extra, taken)
+                    if not added:
+                        continue
+                    new_cpuset = sorted(set(cur_cpuset) | set(added))
+                    actual = float(len(new_cpuset))
+            delta_cpus = actual - cur_cpus
+            if delta_cpus < -1e-9 or delta_cpus > free_cpus + 1e-9:
+                continue
+            new_mem = max(cur_mem, _mem_for(demand, actual, pool_mem))
+            delta_mem = new_mem - cur_mem
+            if delta_mem < 0 or delta_mem > free_mem:
+                continue
+            if delta_cpus > 1e-9 or delta_mem > 0:
+                updates.append(
+                    {
+                        "id": str(e["id"]),
+                        "container": str(e["container"]),
+                        "engine": e.get("engine"),
+                        "old_cpus": cur_cpus,
+                        "cpus": actual,
+                        "old_mem_mb": cur_mem,
+                        "mem_mb": new_mem,
+                        "old_cpu_set": cur_cpuset or None,
+                        "cpu_set": new_cpuset,
+                    }
+                )
+                free_cpus -= delta_cpus
+                free_mem -= delta_mem
+                if new_cpuset:
+                    taken.update(new_cpuset)
+                break
+    return updates
 
 
 class Broker:
@@ -1584,11 +2020,19 @@ class Broker:
     preempted. Light (ungated) classes are registered but never wait and never count.
     """
 
-    def __init__(self, directory: Path | str, pool_fn: Callable[[], Any], *,
-                 history_fn: Callable[[str, str | None], int | None] | None = None,
-                 placer: Callable[[int, set[int]], list[int] | None] | None = None,
-                 container_alive: Callable[[dict], bool | None] | None = None,
-                 poll: float = 0.1, max_poll: float = 0.5, orphan_recheck_s: float = 5.0, log: Any = None) -> None:
+    def __init__(
+        self,
+        directory: Path | str,
+        pool_fn: Callable[[], Any],
+        *,
+        history_fn: Callable[[str, str | None], int | None] | None = None,
+        placer: Callable[[int, set[int]], list[int] | None] | None = None,
+        container_alive: Callable[[dict], bool | None] | None = None,
+        poll: float = 0.1,
+        max_poll: float = 0.5,
+        orphan_recheck_s: float = 5.0,
+        log: Any = None,
+    ) -> None:
         self.dir = Path(directory)
         self.leases = self.dir / "leases"
         self.leases.mkdir(parents=True, exist_ok=True)
@@ -1649,8 +2093,12 @@ class Broker:
                 continue
             entry["alive"] = alive
             if not alive:
-                if entry.get("state") == "granted" and entry.get("container") and self.container_alive is not None \
-                        and self._container_running(entry):
+                if (
+                    entry.get("state") == "granted"
+                    and entry.get("container")
+                    and self.container_alive is not None
+                    and self._container_running(entry)
+                ):
                     entry["orphaned"] = True
                 elif reap:
                     self._drop(lease_id)
@@ -1658,9 +2106,18 @@ class Broker:
             out.append(entry)
         return out
 
-    def acquire(self, cls_name: str, key: str | None = None, *, fixed_cpus: float | None = None,
-                fixed_mem_mb: int | None = None, mem_floor_mb: int | None = None, lease_id: str | None = None,
-                extra: dict | None = None, timeout: float | None = None) -> Lease:
+    def acquire(
+        self,
+        cls_name: str,
+        key: str | None = None,
+        *,
+        fixed_cpus: float | None = None,
+        fixed_mem_mb: int | None = None,
+        mem_floor_mb: int | None = None,
+        lease_id: str | None = None,
+        extra: dict | None = None,
+        timeout: float | None = None,
+    ) -> Lease:
         cls = CLASSES[cls_name]
         lid = lease_id or new_lease_id()
         lock = FileLock(self.leases / f"{lid}.lock")
@@ -1674,39 +2131,88 @@ class Broker:
             _unlink(self.leases / f"{lid}.lock")
             raise
 
-    def _grant(self, entry: dict, grant: Grant, pool: Any, single: bool, warnings: list[str],
-               lock: FileLock, waited: bool) -> Lease:
+    def _grant(
+        self, entry: dict, grant: Grant, pool: Any, single: bool, warnings: list[str], lock: FileLock, waited: bool
+    ) -> Lease:
         counters = self._counters()
         counters["grants"] += 1
-        entry.update(state="granted", cpus=grant.cpus, mem_mb=grant.mem_mb, cpu_set=grant.cpu_set,
-                     grant_no=counters["grants"], granted_at=_utc_now(),
-                     pool={"cpus": int(pool.cpus), "mem_mb": int(pool.mem_mb)})
+        entry.update(
+            state="granted",
+            cpus=grant.cpus,
+            mem_mb=grant.mem_mb,
+            cpu_set=grant.cpu_set,
+            grant_no=counters["grants"],
+            granted_at=_utc_now(),
+            pool={"cpus": int(pool.cpus), "mem_mb": int(pool.mem_mb)},
+        )
         _write_json(self.dir / "counters.json", counters)
         self._write_entry(entry)
-        return Lease(id=entry["id"], cls=entry["class"], key=entry.get("key"), cpus=grant.cpus, mem_mb=grant.mem_mb,
-                     cpu_set=grant.cpu_set, gated=bool(entry.get("gated", True)), grant_no=counters["grants"],
-                     single=single, pool_cpus=int(pool.cpus), pool_mem_mb=int(pool.mem_mb), waited=waited,
-                     warnings=warnings, lock=lock)
+        return Lease(
+            id=entry["id"],
+            cls=entry["class"],
+            key=entry.get("key"),
+            cpus=grant.cpus,
+            mem_mb=grant.mem_mb,
+            cpu_set=grant.cpu_set,
+            gated=bool(entry.get("gated", True)),
+            grant_no=counters["grants"],
+            single=single,
+            pool_cpus=int(pool.cpus),
+            pool_mem_mb=int(pool.mem_mb),
+            waited=waited,
+            warnings=warnings,
+            lock=lock,
+        )
 
-    def _acquire(self, lid: str, lock: FileLock, cls: JobClass, key: str | None, fixed_cpus: float | None,
-                 fixed_mem_mb: int | None, mem_floor_mb: int | None, extra: dict, timeout: float | None) -> Lease:
+    def _acquire(
+        self,
+        lid: str,
+        lock: FileLock,
+        cls: JobClass,
+        key: str | None,
+        fixed_cpus: float | None,
+        fixed_mem_mb: int | None,
+        mem_floor_mb: int | None,
+        extra: dict,
+        timeout: float | None,
+    ) -> Lease:
         hist = None
         if self.history_fn is not None:
             with contextlib.suppress(Exception):
                 hist = self.history_fn(cls.name, key)
         floor = max(v for v in (mem_floor_mb or 0, hist or 0))
         demand = {
-            "min_cpus": cls.min_cpus, "max_cpus": cls.max_cpus, "mem_base_mb": cls.mem_base_mb,
-            "mem_per_cpu_mb": cls.mem_per_cpu_mb, "mem_floor_mb": floor or None,
-            "fixed_cpus": float(fixed_cpus) if fixed_cpus else None, "fixed_mem_mb": int(fixed_mem_mb) if fixed_mem_mb else None,
+            "min_cpus": cls.min_cpus,
+            "max_cpus": cls.max_cpus,
+            "mem_base_mb": cls.mem_base_mb,
+            "mem_per_cpu_mb": cls.mem_per_cpu_mb,
+            "mem_floor_mb": floor or None,
+            "fixed_cpus": float(fixed_cpus) if fixed_cpus else None,
+            "fixed_mem_mb": int(fixed_mem_mb) if fixed_mem_mb else None,
         }
-        entry = {"id": lid, "state": "waiting", "class": cls.name, "key": key, "gated": cls.gated, "pid": os.getpid(),
-                 "host": socket.gethostname(), "created_at": _utc_now(), "demand": demand, **extra}
+        runs_tc = extra.pop("runs_target_code", None)
+        if runs_tc is None:
+            runs_tc = cls.runs_target_code
+        entry = {
+            "id": lid,
+            "state": "waiting",
+            "class": cls.name,
+            "key": key,
+            "gated": cls.gated,
+            "runs_target_code": runs_tc,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "created_at": _utc_now(),
+            "demand": demand,
+            **extra,
+        }
         warnings: list[str] = []
         pool = self.pool_fn()
         need_cpus = float(fixed_cpus) if fixed_cpus else float(cls.min_cpus)
         if need_cpus > pool.cpus:
-            warnings.append(f"{cls.name} asks for {_fmt_cpus(need_cpus)} CPUs but the pool has {pool.cpus}: clamped to the pool")
+            warnings.append(
+                f"{cls.name} asks for {_fmt_cpus(need_cpus)} CPUs but the pool has {pool.cpus}: clamped to the pool"
+            )
         model_mem = fixed_mem_mb or max(cls.mem_base_mb + cls.mem_per_cpu_mb * int(math.ceil(need_cpus)), floor)
         if model_mem > pool.mem_mb:
             warnings.append(f"{cls.name} needs {model_mem} MiB but the pool has {pool.mem_mb} MiB: clamped to the pool")
@@ -1718,11 +2224,24 @@ class Broker:
             counters["seq"] += 1
             entry["seq"] = counters["seq"]
             _write_json(self.dir / "counters.json", counters)
+            others = [e for e in self.entries() if e.get("state") == "granted"]
             if not cls.gated:
-                cpus = min(need_cpus, float(max(1, pool.cpus)))
-                others = [e for e in self.entries() if e.get("state") == "granted"]
-                return self._grant(entry, Grant(cpus, _mem_for(demand, cpus, pool.mem_mb)), pool, not others,
-                                   warnings, lock, waited=False)
+                conflicting = [e for e in others if _run_dir_conflict(entry, e)]
+                if not conflicting:
+                    cpus = min(need_cpus, float(max(1, pool.cpus)))
+                    return self._grant(
+                        entry,
+                        Grant(cpus, _mem_for(demand, cpus, pool.mem_mb)),
+                        pool,
+                        not others,
+                        warnings,
+                        lock,
+                        waited=False,
+                    )
+                self._report(
+                    f"{cls.name} lease {lid} waiting on run-dir conflict on {entry.get('run_dir')} "
+                    f"with {[c.get('id') for c in conflicting]}"
+                )
             self._write_entry(entry)
         deadline = None if timeout is None else time.monotonic() + timeout
         delay, last_pos, last_report, waited = self.poll, None, 0.0, False
@@ -1733,18 +2252,39 @@ class Broker:
                     self._write_entry(entry)
                     entries.append(dict(entry))
                 pool = self.pool_fn()
-                grant = plan_grant(entry, entries, pool.cpus, pool.mem_mb, self.placer)
-                if grant is not None:
+                if not cls.gated:
                     others = [e for e in entries if e.get("id") != lid and e.get("state") == "granted"]
-                    return self._grant(entry, grant, pool, not others, warnings, lock, waited)
+                    if not any(_run_dir_conflict(entry, e) for e in others):
+                        cpus = min(need_cpus, float(max(1, pool.cpus)))
+                        return self._grant(
+                            entry,
+                            Grant(cpus, _mem_for(demand, cpus, pool.mem_mb)),
+                            pool,
+                            not others,
+                            warnings,
+                            lock,
+                            waited,
+                        )
+                    grant = None
+                else:
+                    grant = plan_grant(entry, entries, pool.cpus, pool.mem_mb, self.placer)
+                    if grant is not None:
+                        others = [e for e in entries if e.get("id") != lid and e.get("state") == "granted"]
+                        return self._grant(entry, grant, pool, not others, warnings, lock, waited)
                 pos, total = queue_position(lid, entries)
-                used_cpus = sum(float(e.get("cpus") or 0) for e in entries if e.get("state") == "granted" and e.get("gated", True))
-                used_mem = sum(int(e.get("mem_mb") or 0) for e in entries if e.get("state") == "granted" and e.get("gated", True))
+                used_cpus = sum(
+                    float(e.get("cpus") or 0) for e in entries if e.get("state") == "granted" and e.get("gated", True)
+                )
+                used_mem = sum(
+                    int(e.get("mem_mb") or 0) for e in entries if e.get("state") == "granted" and e.get("gated", True)
+                )
             waited = True
             now = time.monotonic()
             if pos != last_pos or now - last_report >= 30.0:
-                self._report(f"{cls.name} lease {lid} waiting: #{pos} of {total} in queue "
-                             f"(in use {_fmt_cpus(used_cpus)}/{pool.cpus} CPUs, {used_mem}/{pool.mem_mb} MiB)")
+                self._report(
+                    f"{cls.name} lease {lid} waiting: #{pos} of {total} in queue "
+                    f"(in use {_fmt_cpus(used_cpus)}/{pool.cpus} CPUs, {used_mem}/{pool.mem_mb} MiB)"
+                )
                 last_pos, last_report = pos, now
             if deadline is not None and now >= deadline:
                 raise TimeoutError(f"no {cls.name} lease within {timeout:.0f}s")
@@ -1757,7 +2297,9 @@ class Broker:
         try:
             with self.locked():
                 counters = self._counters()
-                others = [e for e in self.entries(reap=False) if e.get("id") != lease.id and e.get("state") == "granted"]
+                others = [
+                    e for e in self.entries(reap=False) if e.get("id") != lease.id and e.get("state") == "granted"
+                ]
                 single = lease.single and counters["grants"] == lease.grant_no and not others
                 _unlink(self.leases / f"{lease.id}.json")
         finally:
@@ -1765,6 +2307,78 @@ class Broker:
                 lease.lock.release()
             _unlink(self.leases / f"{lease.id}.lock")
         return single
+
+    def rebalance(
+        self,
+        *,
+        eng: EngineInfo | None = None,
+        runner: Callable[..., Any] | None = None,
+        dry_run: bool = False,
+    ) -> list[dict]:
+        """
+        Grow running elastic container leases when the queue is empty and free pool resources exist.
+        Never shrinks CPUs or memory. Runs `<engine> update` and updates the lease JSON on success.
+        """
+        run = runner or subprocess.run
+        applied: list[dict] = []
+        plans_to_run: list[tuple[dict, list[str]]] = []
+        with self.locked():
+            entries = self.entries(reap=True)
+            pool = self.pool_fn()
+            if pool is None:
+                return []
+            placer = self.placer
+            if placer is None and isinstance(pool, Pool) and pool.topology and pool.cpu_ids:
+                if any(e.get("cpu_set") for e in entries) or (eng and pin_plan(pool, eng).exclusive):
+                    placer = _cpuset_placer(pool)
+            plans = rebalance_grants(entries, pool.cpus, pool.mem_mb, placer)
+            if not plans:
+                return []
+            by_id = {str(e["id"]): e for e in entries}
+            for plan in plans:
+                entry = by_id.get(plan["id"])
+                if entry is None:
+                    continue
+                engine_bin = str(plan.get("engine") or _default_engine() or "docker")
+                use_eng = eng or engine_info(engine_bin, cache_dir=self.dir, runner=runner)
+                argv = build_engine_update_argv(
+                    engine_bin,
+                    plan["container"],
+                    cpus=plan["cpus"] if plan["cpus"] > plan["old_cpus"] + 1e-9 else None,
+                    mem_mb=plan["mem_mb"] if plan["mem_mb"] > plan["old_mem_mb"] else None,
+                    cpu_set=plan["cpu_set"] if plan["cpu_set"] != plan["old_cpu_set"] else None,
+                    eng=use_eng,
+                )
+                if argv is None:
+                    continue
+                plans_to_run.append((plan, argv))
+
+        for plan, argv in plans_to_run:
+            rec = {**plan, "argv": argv, "applied": False}
+            if dry_run:
+                applied.append(rec)
+                continue
+            try:
+                proc = run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+                if proc.returncode == 0:
+                    with self.locked():
+                        current = self.entries(reap=False)
+                        entry = next((e for e in current if str(e.get("id")) == str(plan["id"])), None)
+                        if entry is not None:
+                            entry["cpus"] = plan["cpus"]
+                            entry["mem_mb"] = plan["mem_mb"]
+                            entry["cpu_set"] = plan["cpu_set"]
+                            entry["rebalanced_at"] = _utc_now()
+                            self._write_entry(entry)
+                    rec["applied"] = True
+                else:
+                    rec["error"] = proc.stderr.strip() or f"exit code {proc.returncode}"
+            except subprocess.TimeoutExpired as exc:
+                rec["error"] = f"timed out after {exc.timeout}s"
+            except (OSError, subprocess.SubprocessError) as exc:
+                rec["error"] = str(exc)
+            applied.append(rec)
+        return applied
 
     def _sweep_locks(self) -> None:
         """Remove lock files left without a lease (Windows cannot delete a file another process is probing)."""
@@ -1789,6 +2403,7 @@ class Broker:
 # ---------------------------------------------------------------------------
 # Container broker: `run` (sub-leases inside one container) and `record`
 # ---------------------------------------------------------------------------
+
 
 def container_broker_dir() -> Path:
     env = (os.environ.get("FRAMAC_BROKER_DIR") or "").strip()
@@ -1876,13 +2491,33 @@ def _oom_killed(rc: int, before: dict, after: dict) -> bool:
     return a is not None and b is not None and a > b
 
 
-def _record_run_history(cls_name: str, key: str | None, lease: Lease, rc: int, oom: bool, peak: int | None,
-                        source: str | None, wall: float, attempt: int) -> None:
+def _record_run_history(
+    cls_name: str,
+    key: str | None,
+    lease: Lease,
+    rc: int,
+    oom: bool,
+    peak: int | None,
+    source: str | None,
+    wall: float,
+    attempt: int,
+) -> None:
     if not Path("run-metadata.json").is_file():
         return
-    rec = {"class": cls_name, "key": key, "ts": _utc_now(), "rc": rc, "peak_mb": peak, "oom_killed": oom,
-           "cpus": lease.cpus, "mem_mb": lease.mem_mb, "wall_seconds": round(wall, 3), "source": source,
-           "scope": "job", "attempt": attempt}
+    rec = {
+        "class": cls_name,
+        "key": key,
+        "ts": _utc_now(),
+        "rc": rc,
+        "peak_mb": peak,
+        "oom_killed": oom,
+        "cpus": lease.cpus,
+        "mem_mb": lease.mem_mb,
+        "wall_seconds": round(wall, 3),
+        "source": source,
+        "scope": "job",
+        "attempt": attempt,
+    }
     with contextlib.suppress(OSError):
         write_history(Path.cwd(), rec)
 
@@ -1913,16 +2548,24 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         _say(problem)
         return 2
     run_dir = Path.cwd()
-    broker = Broker(broker_dir, lambda: job_budget(root_p, use_available=False),
-                    history_fn=lambda c, k: history_estimate(run_dir, c, k), log=sys.stderr)
+    broker = Broker(
+        broker_dir,
+        lambda: job_budget(root_p, use_available=False),
+        history_fn=lambda c, k: history_estimate(run_dir, c, k),
+        log=sys.stderr,
+    )
     floor: int | None = None
     attempt = 0
     while True:
         attempt += 1
         lease = broker.acquire(cls_name, args.key, mem_floor_mb=floor)
         env = dict(os.environ)
-        env.update(FRAMAC_JOB_CPUS=_fmt_cpus(lease.cpus), FRAMAC_JOB_MEM_MB=str(lease.mem_mb),
-                   FRAMAC_JOB_CLASS=cls_name, FRAMAC_SUBLEASE_ID=lease.id)
+        env.update(
+            FRAMAC_JOB_CPUS=_fmt_cpus(lease.cpus),
+            FRAMAC_JOB_MEM_MB=str(lease.mem_mb),
+            FRAMAC_JOB_CLASS=cls_name,
+            FRAMAC_SUBLEASE_ID=lease.id,
+        )
         if args.key:
             env["FRAMAC_JOB_KEY"] = args.key
         before = cgroup_stats(root_p)
@@ -1957,10 +2600,20 @@ def cmd_record(rc: int, cls: str | None = None, key: str | None = None, root: Pa
         if peak is None and oom:
             peak = stats.get("limit_mb")
         usec = stats.get("cpu_usec")
-        rec = {"class": cls_name, "key": key, "ts": _utc_now(), "rc": rc, "peak_mb": peak, "oom_killed": oom,
-               "oom_kills": stats.get("oom_kill"), "cpu_seconds": round(usec / 1e6, 3) if usec is not None else None,
-               "cpus": _env_float("FRAMAC_JOB_CPUS"), "mem_mb": parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB")),
-               "source": "cgroup", "scope": "container"}
+        rec = {
+            "class": cls_name,
+            "key": key,
+            "ts": _utc_now(),
+            "rc": rc,
+            "peak_mb": peak,
+            "oom_killed": oom,
+            "oom_kills": stats.get("oom_kill"),
+            "cpu_seconds": round(usec / 1e6, 3) if usec is not None else None,
+            "cpus": _env_float("FRAMAC_JOB_CPUS"),
+            "mem_mb": parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB")),
+            "source": "cgroup",
+            "scope": "container",
+        }
         written = write_history(Path.cwd(), rec) if Path("run-metadata.json").is_file() else None
         print(json.dumps({**rec, "written": str(written) if written else None}))
     except Exception as exc:  # recording must never change the command's outcome
@@ -1971,6 +2624,7 @@ def cmd_record(rc: int, cls: str | None = None, key: str | None = None, root: Pa
 # ---------------------------------------------------------------------------
 # Host broker: `exec` (one lease per container), pinning, engine command line
 # ---------------------------------------------------------------------------
+
 
 def host_broker_dir() -> Path:
     env = (os.environ.get("FRAMAC_BROKER_DIR") or "").strip()
@@ -2006,8 +2660,8 @@ def prepare_broker_dir(path: Path, default_location: bool = False) -> str | None
 
 @dataclass(frozen=True)
 class PinPlan:
-    exclusive: bool                        # allocate exclusive whole-core CPU sets per lease
-    confine: tuple[int, ...] | None        # shared allowed set every container is confined to
+    exclusive: bool  # allocate exclusive whole-core CPU sets per lease
+    confine: tuple[int, ...] | None  # shared allowed set every container is confined to
     warnings: tuple[str, ...] = ()
 
 
@@ -2028,8 +2682,10 @@ def pin_plan(pool: Pool, eng: EngineInfo, mode: str | None = None, platform: str
         if eng.cpuset:
             confine = tuple(pool.cpu_ids)
         else:
-            warnings.append(f"this process may only use CPUs {format_cpu_list(pool.cpu_ids)}, but {eng.kind} cannot "
-                            "set --cpuset-cpus (cpuset controller not delegated): containers may use other CPUs")
+            warnings.append(
+                f"this process may only use CPUs {format_cpu_list(pool.cpu_ids)}, but {eng.kind} cannot "
+                "set --cpuset-cpus (cpuset controller not delegated): containers may use other CPUs"
+            )
     if not native:
         if mode == "on":
             warnings.append("FRAMAC_PIN=on ignored: the engine runs containers in a VM or on another host")
@@ -2096,12 +2752,26 @@ def allocate_cpuset(topology: dict, allowed: Iterable[int], taken: Iterable[int]
 _MANAGED_FLAGS = frozenset({"--cpus", "--cpuset-cpus", "--memory", "-m", "--memory-swap", "--pids-limit", "--name"})
 
 
-def build_engine_argv(engine_argv: list[str], *, lease_id: str, cls_name: str, cpus: float, mem_mb: int,
-                      eng: EngineInfo, pool_cpus: int, pool_mem_mb: int, key: str | None = None,
-                      cpu_set: Iterable[int] | None = None, confine: Iterable[int] | None = None,
-                      pids_limit: int | None = DEFAULT_PIDS_LIMIT, cache_host: str | Path | None = None,
-                      cache_mode: str = "off", selinux: bool = False, command: str | None = None,
-                      image_id: str | None = None) -> list[str]:
+def build_engine_argv(
+    engine_argv: list[str],
+    *,
+    lease_id: str,
+    cls_name: str,
+    cpus: float,
+    mem_mb: int,
+    eng: EngineInfo,
+    pool_cpus: int,
+    pool_mem_mb: int,
+    key: str | None = None,
+    cpu_set: Iterable[int] | None = None,
+    confine: Iterable[int] | None = None,
+    pids_limit: int | None = DEFAULT_PIDS_LIMIT,
+    cache_host: str | Path | None = None,
+    cache_mode: str = "off",
+    selinux: bool = False,
+    command: str | None = None,
+    image_id: str | None = None,
+) -> list[str]:
     """
     `<engine> run <lease flags> <caller's flags...> [command]`. Inserted right after `run`: the
     lease's --name/--label, --init, the CPU/memory/pids limits (each only when the engine can
@@ -2125,7 +2795,13 @@ def build_engine_argv(engine_argv: list[str], *, lease_id: str, cls_name: str, c
             flags += ["--memory-swap", f"{int(mem_mb)}m"]
     if pids_limit and eng.pids:
         flags += ["--pids-limit", str(int(pids_limit))]
-    env = [("FRAMAC_JOB_CPUS", _fmt_cpus(cpus)), ("FRAMAC_JOB_MEM_MB", str(int(mem_mb))), ("FRAMAC_JOB_CLASS", cls_name)]
+    env = [
+        ("FRAMAC_JOB_CPUS", _fmt_cpus(cpus)),
+        ("FRAMAC_JOB_MEM_MB", str(int(mem_mb))),
+        ("FRAMAC_JOB_CLASS", cls_name),
+    ]
+    if eng.cpu or eng.memory:
+        env.append(("FRAMAC_CGROUP_ENFORCED", "1"))
     if key:
         env.append(("FRAMAC_JOB_KEY", key))
     env += [("FRAMAC_POOL_CPUS", str(int(pool_cpus))), ("FRAMAC_POOL_MEM_MB", str(int(pool_mem_mb)))]
@@ -2146,6 +2822,36 @@ def build_engine_argv(engine_argv: list[str], *, lease_id: str, cls_name: str, c
     return [engine_argv[0], "run", *flags, *tail]
 
 
+def build_engine_update_argv(
+    engine_bin: str,
+    container: str,
+    *,
+    cpus: float | None = None,
+    mem_mb: int | None = None,
+    cpu_set: Iterable[int] | None = None,
+    eng: EngineInfo | None = None,
+) -> list[str] | None:
+    """
+    `<engine> update <flags> <container>` for grow-only resizing of a running container.
+    Only emits flags the engine can enforce; returns None if no flag applies.
+    """
+    info = eng or EngineInfo()
+    flags: list[str] = []
+    exclusive = sorted(set(cpu_set or []))
+    if exclusive:
+        if info.cpuset:
+            flags += ["--cpuset-cpus", format_cpu_list(exclusive)]
+    elif cpus is not None and info.cpu:
+        flags += ["--cpus", _fmt_cpus(cpus)]
+    if mem_mb is not None and info.memory:
+        flags += ["--memory", f"{int(mem_mb)}m"]
+        if info.swap:
+            flags += ["--memory-swap", f"{int(mem_mb)}m"]
+    if not flags:
+        return None
+    return [engine_bin, "update", *flags, container]
+
+
 _REPO_PARTITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -2159,7 +2865,7 @@ def _cache_plan(cache_dir: str | None, cache_rw: bool, command: str | None) -> t
     if repo:
         # One store per repository (the wrappers' repo name): a repository's runs only ever read
         # entries that its own runs' trusted steps wrote.
-        part = repo if _REPO_PARTITION_RE.fullmatch(repo) else hashlib.sha256(repo.encode("utf-8")).hexdigest()[:16]
+        part = repo if _REPO_PARTITION_RE.fullmatch(repo) else hashlib.sha256(repo.encode()).hexdigest()[:16]
         path = path / "repos" / part
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -2206,15 +2912,20 @@ def cmd_exec(argv: list[str]) -> int:
     """`exec [--class C] --run-dir R [...] -- <engine> run ...`: run one container under a host lease."""
     opts, engine_argv = _split_dashdash(argv)
     parser = argparse.ArgumentParser(prog="resources.py exec", description="Run a container under a host lease.")
-    parser.add_argument("--class", dest="cls", default="auto", help="Job class (default: inferred from FRAMAC_CONTAINER_CMD)")
+    parser.add_argument(
+        "--class", dest="cls", default="auto", help="Job class (default: inferred from FRAMAC_CONTAINER_CMD)"
+    )
     parser.add_argument("--key", default=None)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--cpus", default=None, help="Fixed CPU grant (still registered with the broker)")
     parser.add_argument("--memory", default=None, help="Fixed memory grant, e.g. 8g")
     parser.add_argument("--pids-limit", type=int, default=None)
     parser.add_argument("--cache-dir", default=None, help="Shared cache dir on the host, or 'off'")
-    parser.add_argument("--cache-rw", action="store_true",
-                        help="Writable shared cache for the allowlisted commands; the default unless FRAMAC_CACHE_RW=off")
+    parser.add_argument(
+        "--cache-rw",
+        action="store_true",
+        help="Writable shared cache for the allowlisted commands; the default unless FRAMAC_CACHE_RW=off",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the engine command line instead of running it")
     args = parser.parse_args(opts)
     if len(engine_argv) < 2 or engine_argv[1] != "run":
@@ -2227,10 +2938,16 @@ def cmd_exec(argv: list[str]) -> int:
     if clash:
         parser.error(f"{clash} is managed by the broker; pass --cpus/--memory/--pids-limit to exec instead")
     command = os.environ.get("FRAMAC_CONTAINER_CMD")
-    cls_name = infer_class(command or "") if args.cls in ("", "auto") else args.cls
-    if cls_name not in CLASSES:
-        parser.error(f"unknown class {cls_name!r} (one of: {', '.join(CLASSES)})")
-    cls = CLASSES[cls_name]
+    if args.cls in ("", "auto"):
+        cls_name = infer_class(command or "")
+        cls = CLASSES[cls_name]
+        runs_target_code = cls.runs_target_code or not is_known_static_command(command)
+    else:
+        cls_name = args.cls
+        if cls_name not in CLASSES:
+            parser.error(f"unknown class {cls_name!r} (one of: {', '.join(CLASSES)})")
+        cls = CLASSES[cls_name]
+        runs_target_code = cls.runs_target_code
     fixed_cpus = None
     if args.cpus:
         try:
@@ -2252,14 +2969,21 @@ def cmd_exec(argv: list[str]) -> int:
     if not eng.ok:
         _say(f"container engine view unavailable ({eng.error}); sizing from the host and passing every limit flag")
     missing = [n for n, ok in (("memory", eng.memory), ("pids", eng.pids)) if not ok]
-    if missing and cls.runs_target_code and os.environ.get("FRAMAC_ALLOW_UNENFORCED_LIMITS") != "1":
-        _say(f"{eng.kind} cannot enforce {' and '.join(missing)} limits here (cgroup controllers not available or "
-             f"not delegated), so class {cls_name}, which runs target code, is refused. Delegate the controllers "
-             "(e.g. systemd Delegate=cpu cpuset memory pids) or set FRAMAC_ALLOW_UNENFORCED_LIMITS=1.")
+    if missing and runs_target_code and os.environ.get("FRAMAC_ALLOW_UNENFORCED_LIMITS") != "1":
+        _say(
+            f"{eng.kind} cannot enforce {' and '.join(missing)} limits here (cgroup controllers not available or "
+            f"not delegated), so class {cls_name}, which runs target code, is refused. Delegate the controllers "
+            "(e.g. systemd Delegate=cpu cpuset memory pids) or set FRAMAC_ALLOW_UNENFORCED_LIMITS=1."
+        )
         return 2
     run_dir = Path(args.run_dir)
     # The exact allowlist decides; FRAMAC_CACHE_RW=off keeps the shared store read-only everywhere.
-    cache_rw = args.cache_rw or (os.environ.get("FRAMAC_CACHE_RW") or "on").strip().lower() not in ("0", "off", "no", "false")
+    cache_rw = args.cache_rw or (os.environ.get("FRAMAC_CACHE_RW") or "on").strip().lower() not in (
+        "0",
+        "off",
+        "no",
+        "false",
+    )
     cache_host, cache_mode = _cache_plan(args.cache_dir, cache_rw, command)
 
     def pool_fn() -> Pool:
@@ -2270,31 +2994,85 @@ def cmd_exec(argv: list[str]) -> int:
     placer = _cpuset_placer(pool) if plan.exclusive and pool.topology and cls.gated else None
     lease_id = new_lease_id()
     name = f"framac-{lease_id}"
-    broker = Broker(broker_dir, pool_fn, history_fn=lambda c, k: history_estimate(run_dir, c, k), placer=placer,
-                    container_alive=lambda e: container_running(str(e.get("engine") or engine_bin), e["id"]),
-                    log=sys.stderr)
-    lease = broker.acquire(cls_name, args.key, fixed_cpus=fixed_cpus, fixed_mem_mb=fixed_mem, lease_id=lease_id,
-                           extra={"container": name, "engine": engine_bin, "scope": "host", "run_dir": str(run_dir)})
+    broker = Broker(
+        broker_dir,
+        pool_fn,
+        history_fn=lambda c, k: history_estimate(run_dir, c, k, cache_dir=cache_host),
+        placer=placer,
+        container_alive=lambda e: container_running(str(e.get("engine") or engine_bin), e["id"]),
+        log=sys.stderr,
+    )
+    if cache_mode == "rw" and not args.cache_rw:
+        norm_rd = _norm_run_dir(run_dir)
+        with broker.locked():
+            entries = broker.entries()
+        if norm_rd and any(_norm_run_dir(e.get("run_dir")) == norm_rd and _entry_runs_target_code(e) for e in entries):
+            cache_mode = "ro"
+            _say("shared cache mounted read-only: a target-code job is active on this run directory")
+    lease = broker.acquire(
+        cls_name,
+        args.key,
+        fixed_cpus=fixed_cpus,
+        fixed_mem_mb=fixed_mem,
+        lease_id=lease_id,
+        extra={
+            "container": name,
+            "engine": engine_bin,
+            "scope": "host",
+            "run_dir": str(run_dir),
+            "cache_mode": cache_mode,
+            "runs_target_code": runs_target_code,
+        },
+    )
     try:
         for warning in plan.warnings:
             _say(warning)
         full = build_engine_argv(
-            [engine_bin, *engine_argv[1:]], lease_id=lease.id, cls_name=cls_name, key=args.key, cpus=lease.cpus,
-            mem_mb=lease.mem_mb, cpu_set=lease.cpu_set, confine=plan.confine,
-            pids_limit=args.pids_limit or DEFAULT_PIDS_LIMIT, eng=eng, pool_cpus=lease.pool_cpus,
-            pool_mem_mb=lease.pool_mem_mb, cache_host=cache_host, cache_mode=cache_mode,
-            selinux=selinux_enforcing(), command=command, image_id=os.environ.get("FRAMAC_IMAGE_ID") or None,
+            [engine_bin, *engine_argv[1:]],
+            lease_id=lease.id,
+            cls_name=cls_name,
+            key=args.key,
+            cpus=lease.cpus,
+            mem_mb=lease.mem_mb,
+            cpu_set=lease.cpu_set,
+            confine=plan.confine,
+            pids_limit=args.pids_limit or DEFAULT_PIDS_LIMIT,
+            eng=eng,
+            pool_cpus=lease.pool_cpus,
+            pool_mem_mb=lease.pool_mem_mb,
+            cache_host=cache_host,
+            cache_mode=cache_mode,
+            selinux=selinux_enforcing(),
+            command=command,
+            image_id=os.environ.get("FRAMAC_IMAGE_ID") or None,
         )
         if lease.waited or os.environ.get("FRAMAC_RESOURCES_VERBOSE") == "1":
-            _say(f"{cls_name} lease {lease.id}: {_fmt_cpus(lease.cpus)} CPUs, {lease.mem_mb} MiB "
-                 f"(pool {lease.pool_cpus} CPUs, {lease.pool_mem_mb} MiB)")
+            _say(
+                f"{cls_name} lease {lease.id}: {_fmt_cpus(lease.cpus)} CPUs, {lease.mem_mb} MiB "
+                f"(pool {lease.pool_cpus} CPUs, {lease.pool_mem_mb} MiB)"
+            )
         if args.dry_run:
-            print(json.dumps({"argv": full, "class": cls_name, "lease": lease.id, "cpus": lease.cpus,
-                              "mem_mb": lease.mem_mb, "cpu_set": lease.cpu_set, "cache_mode": cache_mode}, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "argv": full,
+                        "class": cls_name,
+                        "lease": lease.id,
+                        "cpus": lease.cpus,
+                        "mem_mb": lease.mem_mb,
+                        "cpu_set": lease.cpu_set,
+                        "cache_mode": cache_mode,
+                    },
+                    indent=2,
+                )
+            )
             return 0
         return _run_engine(full, engine_bin, name)
     finally:
         broker.release(lease)
+        if lease.gated and not args.dry_run:
+            with contextlib.suppress(Exception):
+                broker.rebalance(eng=eng)
 
 
 def _default_engine() -> str | None:
@@ -2321,14 +3099,36 @@ def _status(scope: str, broker_dir: str | None, gc: bool, engine: str | None = N
             out["pool"] = asdict(job_budget(use_available=False))
     if not (d / "leases").is_dir():
         return out
-    broker = Broker(d, lambda: None, container_alive=(
-        (lambda e: container_running(str(e["engine"]), e["id"]) if e.get("engine") else None) if scope == "host" else None))
+    broker = Broker(
+        d,
+        lambda: None,
+        container_alive=(
+            (lambda e: container_running(str(e["engine"]), e["id"]) if e.get("engine") else None)
+            if scope == "host"
+            else None
+        ),
+    )
     if gc:
         out["reclaimed"] = broker.gc()
     with broker.locked():
         entries = broker.entries(reap=False)
-    keys = ("id", "class", "key", "state", "cpus", "mem_mb", "cpu_set", "pid", "host", "container", "created_at",
-            "granted_at", "seq", "alive", "orphaned")
+    keys = (
+        "id",
+        "class",
+        "key",
+        "state",
+        "cpus",
+        "mem_mb",
+        "cpu_set",
+        "pid",
+        "host",
+        "container",
+        "created_at",
+        "granted_at",
+        "seq",
+        "alive",
+        "orphaned",
+    )
     for e in sorted(entries, key=lambda e: int(e.get("seq") or 0)):
         row = {k: e.get(k) for k in keys if k in e}
         out["granted" if e.get("state") == "granted" else "waiting"].append(row)
@@ -2338,7 +3138,7 @@ def _status(scope: str, broker_dir: str | None, gc: bool, engine: str | None = N
 def _split_dashdash(argv: list[str]) -> tuple[list[str], list[str]]:
     if "--" in argv:
         i = argv.index("--")
-        return argv[:i], argv[i + 1:]
+        return argv[:i], argv[i + 1 :]
     return argv, []
 
 
@@ -2369,7 +3169,15 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name, help=text)
         p.add_argument("--scope", choices=["host", "container", "auto"], default="auto")
         p.add_argument("--broker-dir", default=None)
-        p.add_argument("--engine", default=None, help="Engine whose view sizes the host pool (default: FRAMAC_CONTAINER_ENGINE, docker, podman)")
+        p.add_argument(
+            "--engine",
+            default=None,
+            help="Engine whose view sizes the host pool (default: FRAMAC_CONTAINER_ENGINE, docker, podman)",
+        )
+    p_reb = sub.add_parser("rebalance", help="Grow running elastic container leases into free pool resources")
+    p_reb.add_argument("--broker-dir", default=None)
+    p_reb.add_argument("--engine", default=None)
+    p_reb.add_argument("--dry-run", action="store_true")
     sub.add_parser("run", help="Container broker: run --class C [--key K] [--output P] -- cmd...")
     sub.add_parser("exec", help="Host broker: exec [--class C] --run-dir R [...] -- <engine> run ...")
     args = parser.parse_args(argv)
@@ -2378,7 +3186,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "recommend":
         rec = recommend(args.max_agents)
         if args.field:
-            print(rec.get(args.field) if not isinstance(rec.get(args.field), (dict, list)) else json.dumps(rec.get(args.field)))
+            print(
+                rec.get(args.field)
+                if not isinstance(rec.get(args.field), (dict, list))
+                else json.dumps(rec.get(args.field))
+            )
             return 0
         out = rec
     elif args.cmd == "classify":
@@ -2390,6 +3202,16 @@ def main(argv: list[str] | None = None) -> int:
         out = pool.summary() if args.summary else pool.to_dict()
     elif args.cmd == "record":
         return cmd_record(args.rc, args.cls, args.key)
+    elif args.cmd == "rebalance":
+        bdir = Path(args.broker_dir) if args.broker_dir else host_broker_dir()
+        eng_bin = (shutil.which(args.engine) or args.engine) if args.engine else _default_engine()
+        eng_obj = engine_info(eng_bin, cache_dir=bdir) if eng_bin else None
+        broker = Broker(
+            bdir,
+            lambda: probe("host", engine=eng_obj or eng_bin, broker_dir=bdir),
+            container_alive=lambda e: container_running(str(e.get("engine") or eng_bin or "docker"), e["id"]),
+        )
+        out = {"rebalanced": broker.rebalance(eng=eng_obj, dry_run=args.dry_run)}
     else:
         out = _status(args.scope, args.broker_dir, gc=args.cmd == "gc", engine=args.engine)
     print(json.dumps(out, indent=2))

@@ -46,16 +46,26 @@ GENERATOR = "scripts/extract_references.py"
 _HASH_RE = re.compile(r"<!-- source: (?P<pdf>\S+) sha256:(?P<sha>[0-9a-f]{64}) ")
 
 # Typographic characters that break plain-ASCII greps for options, code and quotes.
-_ASCII_FOLD = str.maketrans({
-    "‘": "'", "’": "'", "′": "'",
-    "“": '"', "”": '"',
-    "–": "-", "−": "-",
-    "∗": "*",
-    "…": "...",
-    " ": " ",
-    "ﬁ": "fi", "ﬂ": "fl", "ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl",
-    "": None,  # private-use brace fragment emitted for multi-line math
-})
+_ASCII_FOLD = str.maketrans(
+    {
+        "‘": "'",
+        "’": "'",
+        "′": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "−": "-",
+        "∗": "*",
+        "…": "...",
+        " ": " ",
+        "ﬁ": "fi",
+        "ﬂ": "fl",
+        "ﬀ": "ff",
+        "ﬃ": "ffi",
+        "ﬄ": "ffl",
+        "": None,  # private-use brace fragment emitted for multi-line math
+    }
+)
 
 _TOC_LEADER_RE = re.compile(r"(?:\s?\.){4,}\s*\d+\s*$")
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:\d+|[ivxlcdm]+)\s*$", re.IGNORECASE)
@@ -140,8 +150,14 @@ def _locate(pages: list[list[str]], page: int, title: str, start: int, last_page
     for candidate in range(page, min(page + _MAX_FORWARD_PAGES, last_page, len(pages)) + 1):
         lines = pages[candidate - 1]
         head = [i for i, line in enumerate(lines) if line.strip()][:3]
-        hit = next((i for i in head if i >= (start if candidate == page else 0)
-                    and _heading_matches(lines[i], title, columns=True)), None)
+        hit = next(
+            (
+                i
+                for i in head
+                if i >= (start if candidate == page else 0) and _heading_matches(lines[i], title, columns=True)
+            ),
+            None,
+        )
         if hit is not None:
             return candidate, hit
     return None
@@ -221,7 +237,7 @@ def _squeeze_blank(lines: list[str], sections: list[Section]) -> list[str]:
 def assign_ends(sections: list[Section], total_lines: int) -> None:
     ordered = sorted(sections, key=lambda s: s.line)
     for i, sec in enumerate(ordered):
-        nxt = next((s.line for s in ordered[i + 1:] if s.depth <= sec.depth), total_lines + 1)
+        nxt = next((s.line for s in ordered[i + 1 :] if s.depth <= sec.depth), total_lines + 1)
         sec.end = nxt - 1
 
 
@@ -329,8 +345,11 @@ def _source_hash(md: Path) -> str | None:
 
 def orphan_outputs(root: Path) -> list[Path]:
     """Generated Markdown files whose PDF was moved or deleted."""
-    return [md for md in sorted(root.glob("*/*.md"))
-            if not md.with_suffix(".pdf").is_file() and _source_hash(md) is not None]
+    return [
+        md
+        for md in sorted(root.glob("*/*.md"))
+        if not md.with_suffix(".pdf").is_file() and _source_hash(md) is not None
+    ]
 
 
 def stale_outputs(root: Path) -> list[str]:
@@ -351,7 +370,9 @@ def stale_outputs(root: Path) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="references directory (default: docs/references)")
+    parser.add_argument(
+        "--root", type=Path, default=DEFAULT_ROOT, help="references directory (default: docs/references)"
+    )
     parser.add_argument("--check", action="store_true", help="only verify that every PDF has an up-to-date .md")
     args = parser.parse_args(argv)
     root: Path = args.root.resolve()

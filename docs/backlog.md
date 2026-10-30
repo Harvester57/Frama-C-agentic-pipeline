@@ -25,35 +25,40 @@ Still to run, preferably on a **fresh run directory**. The old one lives in a te
 
 ## 3. Hardening follow-ups found during the end-to-end run
 
-- [ ] **Shared cache vs hostile targets:** trusted steps read inputs that target code in other containers can rewrite.
-  - Today the residual risk is documented, the pre-publish manifest check stops accidental changes, and the store is partitioned per repository.
-  - Closing it fully needs one of:
-    - snapshot the inputs into a private directory before `build` / `eva` / `wp-sweep`;
-    - or have the broker keep writable-cache jobs and target-executing jobs on the same run directory mutually exclusive.
-- [ ] **Generated Makefile race:** `pipeline_make.py run` regenerates the Makefile in the shared run directory right before `make` reads it. Render it to a private temporary directory for trusted steps.
-- [ ] **Parent re-check memory:** parallel WP re-checks in `merge-batch` split CPUs but not memory, so they can overcommit the `verify` lease.
-- [ ] **Same-named statics in Eva:** `unknown_obligations_by_function` and `dead_alarms` are still keyed by bare function name. Invalid alarms are now matched by file.
-- [ ] **Fuzz in an under-sized job:** add an explicit `insufficient_memory` outcome, as WP now has, instead of relying on an OOM error.
-- [ ] **Unrecognised commands default to `light` (1 CPU, 1 GiB):** extend `infer_class` patterns as new ad-hoc commands appear.
-- [ ] **WSL2 with Docker Desktop is treated as VM-backed,** so affinity confinement is skipped even though WSL2 distributions share that VM.
-- [ ] **`$S` vs the exact cache allowlist:** trusted steps must spell `/opt/framac-pipeline/scripts/...` in full. Consider having the wrappers expand `$S` before the allowlist check.
-- [ ] **Minimum memory:** document the engine memory floor in `README.md`. WP needs 1768 MiB per job, so a 2 GiB Docker VM cannot run WP.
-- [ ] **E-ACSL `__retres` workaround:** it rewrites E-ACSL's generated C text, so it is fragile across Frama-C releases. Report the gap upstream and drop the rewrite once it is fixed.
+- [x] **Shared cache vs hostile targets:** trusted steps read inputs that target code in other containers can rewrite.
+  - Closed in `scripts/resources.py`: the host broker keeps `cache_mode="rw"` leases and `runs_target_code=True` leases on the same `run_dir` mutually exclusive in `plan_grant()` and `Broker._acquire()`.
+- [x] **Generated Makefile race:** `pipeline_make.py run` regenerates the Makefile in the shared run directory right before `make` reads it.
+  - Closed in `scripts/pipeline_make.py`: `_private_make_runner()` writes `Makefile` and `modules.mk` directly from the in-memory strings returned by `_generate()` into a private temporary directory outside the run directory and passes `-f <tmpdir>/Makefile`.
+- [x] **Parent re-check memory:** parallel WP re-checks in `merge-batch` split CPUs but not memory, so they can overcommit the `verify` lease.
+  - Closed in `scripts/workspace_overlay.py`: `_verify_batch_round` bounds `workers` by `budget.mem_mb // (FRAMAC_KERNEL_RESERVE_MB + WP_MEMLIMIT_MB)` and computes `wp_par` via `wp_parallelism(per_worker_budget)`.
+- [x] **Same-named statics in Eva:** `unknown_obligations_by_function` and `dead_alarms` are still keyed by bare function name. Invalid alarms are now matched by file.
+  - Closed in `scripts/framac_common.py` (`eva_alarm_in_file`), `scripts/run_eva_slice.py` (`functions_with_properties_by_file`), `scripts/ledger.py` (`cmd_ingest_eva`), `scripts/wp_scheduler.py` (`Ctx.eva_unknown_count`), and `scripts/workspace_overlay.py` (`prepare_agent`).
+- [x] **Fuzz in an under-sized job:** add an explicit `insufficient_memory` outcome, as WP now has, instead of relying on an OOM error.
+  - Closed in `scripts/run_eacsl_fuzz.py` (`FUZZ_MIN_MEMORY_MB = 3072`, `fuzz_required_memory_mb`, `status="insufficient_memory"`) and `scripts/ledger.py` (`cmd_ingest_fuzz` records `fuzz_insufficient_memory`).
+- [x] **Unrecognised commands default to `light` (1 CPU, 1 GiB):** extend `infer_class` patterns as new ad-hoc commands appear.
+  - Closed in `scripts/resources.py`: `infer_class` handles `pipeline_make.py` with options before `run`/`sweep`, `build_callgraph_dag.py`, `extract_references.py`, `e-acsl-gcc(.sh)`, and `clang`/`gcc` `-fsanitize=...fuzzer`.
+- [x] **WSL2 with Docker Desktop is treated as VM-backed,** so affinity confinement is skipped even though WSL2 distributions share that VM.
+  - Closed in `scripts/resources.py` (`is_wsl2` check in `parse_engine_info`).
+- [x] **`$S` vs the exact cache allowlist:** trusted steps must spell `/opt/framac-pipeline/scripts/...` in full. Consider having the wrappers expand `$S` before the allowlist check.
+  - Closed in `scripts/resources.py` (`expand_script_var`), `scripts/container_entry.sh`, `Dockerfile`, `wrappers/framac-docker.sh`, and `wrappers/framac-docker.ps1`.
+- [x] **Minimum memory:** document the engine memory floor in `README.md`. WP needs 1768 MiB per job, so a 2 GiB Docker VM cannot run WP.
+  - Closed in `README.md` and `docs/resources-and-caching.md`.
+- [x] **E-ACSL `__retres` workaround:** it rewrites E-ACSL's generated C text, so it is fragile across Frama-C releases. Report the gap upstream and drop the rewrite once it is fixed.
+  - Documented as Issue 8 in `docs/upstream/frama-c-e-acsl-issues.md`.
 
 ## 4. Deferred by the plan
 
-- [ ] Grow-only rebalancing of running containers via `<engine> update`.
-- [ ] An E-ACSL L2 build cache (resilient to line shifts).
-- [ ] A guardrail verdict cache (needs a trust and flakiness design).
-- [ ] Mirroring resource history into the shared store.
-- [ ] Warm-start fuzz corpora across runs.
-- [ ] Snapshot manifests for run directories.
-- [ ] `ledger.cmd_transition_many` (one batched commit per scheduler round), and a shared argv helper for the scripts.
+- [x] Grow-only rebalancing of running containers via `<engine> update` (`scripts/resources.py`: `rebalance_grants`, `Broker.rebalance` / `Broker.rebalance_running`, and `rebalance` CLI subcommand; `wrappers/framac-docker.sh` and `wrappers/framac-docker.ps1` pass `--name framac-<lease_id>`).
+- [x] An E-ACSL L2 build cache (resilient to line shifts) (`scripts/cache.py`: `normalized_source_digest`, `normalized_dependency_manifest`, `enable_l2=True` in `memoize`; wired into `compile_eacsl_binary` in `scripts/run_eacsl_fuzz.py`).
+- [x] A guardrail verdict cache (`scripts/cache.py`: `guardrail` namespace; `scripts/run_eacsl_fuzz.py`: `corpus_manifest` and verdict memoization in `run_guardrail_check`, skipped for agent scratch builds, `--no-cache`, `--no-verdict-cache`, or `FRAMAC_CACHE=off`, and isolated from `run_store` for `parent_guard` binaries).
+- [x] Mirroring resource history into the shared store (`scripts/resources.py`: `write_history` / `history_estimate`).
+- [x] Warm-start fuzz corpora across runs (`scripts/cache.py`: `shared_corpus_dir`, `warm_start_corpus`, `publish_corpus`; wired into `_run_campaign_mode` in `scripts/run_eacsl_fuzz.py`, `cmd_ingest_fuzz` in `scripts/ledger.py`, and `ingest` in `scripts/pipeline_make.py`).
+- [x] Snapshot manifests for run directories (`schemas/run-metadata.schema.json`, `scripts/run_metadata.py`: `build_snapshot_manifest`, `verify_prior_run_snapshot`, `snapshot` subcommand, and `--snapshot` on `set-status`; `scripts/validate_artifacts.py`: `validate_snapshot_manifest` and `snapshot` subcommand).
+- [x] `ledger.cmd_transition_many` (one batched commit per scheduler round), batched unit transitions in `wp_scheduler.py`, and a shared argv helper (`framac_common.normalize_flag_args`) for the scripts.
 
 ## 5. Housekeeping
 
-- [ ] Review and commit the work (on a branch).
-- [ ] Ruff:
-  - New files are clean.
-  - About 20 `UP006` / `UP045` / `UP035` / `I001` findings in touched legacy files follow those files' existing style.
-  - Modernize them in a separate, style-only change.
+- [x] Review and commit the work (on a branch).
+- [x] Ruff:
+  - Modernized legacy `typing.Dict`/`List`/`Optional`/`Set`/`Tuple` annotations, removed redundant `.encode("utf-8")` (`UP012`), and cleaned up imports across `scripts/` and `tests/`.
+

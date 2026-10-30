@@ -7,6 +7,7 @@ Subcommands:
   candidates    <candidates.json>
   ledger        <coverage-ledger.json> [--run-dir DIR]
   metadata      <run-metadata.json>
+  snapshot      <snapshot-manifest.json> [--run-dir DIR]
   agent-result  <result.json>
   run-dir       <run-dir>             (all present artifacts + cross-file consistency)
 
@@ -18,15 +19,19 @@ Exit code 0 when valid, 1 when errors were found, 2 on usage/IO problems.
 Validator success proves format and consistency only, not that a claim is true.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fingerprint import is_valid_fingerprint  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     is_safe_agent_id,
@@ -34,8 +39,9 @@ from framac_common import (  # noqa: E402
     load_agent_result_json,
     load_json_strict,
 )
-from fingerprint import is_valid_fingerprint  # noqa: E402
 from minischema import MAX_ERRORS, Validator, load_schema  # noqa: E402
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def schema_dir() -> Path:
@@ -46,7 +52,7 @@ def schema_dir() -> Path:
     raise ArtifactError("schemas/ directory not found")
 
 
-_SCHEMAS: Dict[str, dict] = {}
+_SCHEMAS: dict[str, dict] = {}
 
 
 def get_schema(name: str) -> dict:
@@ -61,12 +67,12 @@ class Errors(list):
             self.append(msg)
 
 
-def _path_ok(errors: Errors, where: str, value: Optional[str]) -> None:
+def _path_ok(errors: Errors, where: str, value: str | None) -> None:
     if value is not None and not is_safe_relative_path(value):
         errors.add(f"{where}: unsafe or non-relative path {value!r}")
 
 
-def _exists(errors: Errors, where: str, run_dir: Optional[Path], value: Optional[str]) -> None:
+def _exists(errors: Errors, where: str, run_dir: Path | None, value: str | None) -> None:
     if run_dir is not None and value is not None and is_safe_relative_path(value):
         if not (run_dir / value).is_file():
             errors.add(f"{where}: referenced file does not exist under run dir: {value}")
@@ -77,17 +83,19 @@ def _exists(errors: Errors, where: str, run_dir: Optional[Path], value: Optional
 SEVERITY_CAP_INTERNAL = {"medium", "low"}
 
 
-def check_trace(errors: Errors, where: str, trace: List[dict]) -> None:
+def check_trace(errors: Errors, where: str, trace: list[dict]) -> None:
     kinds = [t.get("kind") for t in trace]
     if len(kinds) == 1:
         if kinds[0] not in ("entrypoint", "sink"):
             errors.add(f"{where}: a one-entry trace must be 'entrypoint' or 'sink'")
         return
     if kinds[0] != "entrypoint" or kinds[-1] != "sink" or any(k != "propagation" for k in kinds[1:-1]):
-        errors.add(f"{where}: multi-entry trace must start with 'entrypoint', end with 'sink', and use 'propagation' in between")
+        errors.add(
+            f"{where}: multi-entry trace must start with 'entrypoint', end with 'sink', and use 'propagation' in between"
+        )
 
 
-def validate_findings(data, run_dir: Optional[Path] = None) -> Errors:
+def validate_findings(data, run_dir: Path | None = None) -> Errors:
     errors = Errors()
     for e in Validator(get_schema("findings")).errors(data):
         errors.add(e)
@@ -139,6 +147,7 @@ def validate_findings(data, run_dir: Optional[Path] = None) -> Errors:
 
 # -------------------------------------------------------------- candidates
 
+
 def validate_candidates(data) -> Errors:
     errors = Errors()
     for e in Validator(get_schema("candidates")).errors(data):
@@ -161,7 +170,7 @@ def validate_candidates(data) -> Errors:
 NO_EVIDENCE_STATES = {"deferred", "out_of_scope", "not_applicable"}
 
 
-def validate_ledger(data, run_dir: Optional[Path] = None) -> Errors:
+def validate_ledger(data, run_dir: Path | None = None) -> Errors:
     errors = Errors()
     for e in Validator(get_schema("coverage-ledger")).errors(data):
         errors.add(e)
@@ -243,6 +252,7 @@ def validate_ledger(data, run_dir: Optional[Path] = None) -> Errors:
 
 # ---------------------------------------------------------------- metadata
 
+
 def validate_metadata(data) -> Errors:
     errors = Errors()
     for e in Validator(get_schema("run-metadata")).errors(data):
@@ -255,12 +265,63 @@ def validate_metadata(data) -> Errors:
         errors.add("$.incomplete_reason: must be null unless run_status is 'incomplete'")
     for idx, p in enumerate(data["scope_paths"]):
         _path_ok(errors, f"$.scope_paths[{idx}]", p)
+    if data.get("snapshot_manifest") is not None:
+        _path_ok(errors, "$.snapshot_manifest", data["snapshot_manifest"])
+    return errors
+
+
+# ------------------------------------------------------- snapshot manifest
+
+
+def validate_snapshot_manifest(data, run_dir: Path | None = None) -> Errors:
+    errors = Errors()
+    if not isinstance(data, dict):
+        errors.add("$: snapshot manifest must be an object")
+        return errors
+    if data.get("schema_version") != 1:
+        errors.add("$.schema_version: must equal 1")
+    if not isinstance(data.get("run_id"), str) or not data.get("run_id"):
+        errors.add("$.run_id: must be a non-empty string")
+    manifest_sha = data.get("manifest_sha256")
+    if not isinstance(manifest_sha, str) or not _HEX64_RE.match(manifest_sha):
+        errors.add("$.manifest_sha256: must be a 64-character lowercase hex sha256")
+    files = data.get("files")
+    if not isinstance(files, dict):
+        errors.add("$.files: must be an object mapping relative paths to {sha256, size}")
+        return errors
+    for rel, info in files.items():
+        where = f"$.files[{rel!r}]"
+        _path_ok(errors, where, rel)
+        if not isinstance(info, dict):
+            errors.add(f"{where}: must be an object")
+            continue
+        sha = info.get("sha256")
+        size = info.get("size")
+        if not isinstance(sha, str) or not _HEX64_RE.match(sha):
+            errors.add(f"{where}.sha256: must be a 64-character lowercase hex sha256")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            errors.add(f"{where}.size: must be a non-negative integer")
+        if run_dir is not None and is_safe_relative_path(rel):
+            full = Path(run_dir) / rel
+            if not full.is_file():
+                errors.add(f"{where}: snapshotted file missing from run dir: {rel}")
+            else:
+                blob = full.read_bytes()
+                if isinstance(size, int) and len(blob) != size:
+                    errors.add(f"{where}.size: file size changed (expected {size}, got {len(blob)})")
+                if isinstance(sha, str) and hashlib.sha256(blob).hexdigest() != sha:
+                    errors.add(f"{where}.sha256: file digest changed after snapshot: {rel}")
+    if isinstance(manifest_sha, str) and _HEX64_RE.match(manifest_sha):
+        computed = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if computed != manifest_sha:
+            errors.add("$.manifest_sha256: does not match canonical digest of $.files")
     return errors
 
 
 # ------------------------------------------------------------ agent result
 
-def _under_agent_dir(errors: Errors, where: str, agent_id: str, value: Optional[str]) -> None:
+
+def _under_agent_dir(errors: Errors, where: str, agent_id: str, value: str | None) -> None:
     if value is None:
         return
     _path_ok(errors, where, value)
@@ -313,8 +374,12 @@ def validate_agent_result(data) -> Errors:
         for idx, extra in enumerate(extra_recs):
             for e in validate_findings([extra]):
                 errors.add(e.replace("$[0]", f"$.additional_records[{idx}]", 1))
-        if (record.get("fingerprint") != data["candidate_fingerprint"] or extra_recs) and not (data["refingerprint_reason"] or "").strip():
-            errors.add("$.refingerprint_reason: required when the record fingerprint differs from the candidate or additional_records are present")
+        if (record.get("fingerprint") != data["candidate_fingerprint"] or extra_recs) and not (
+            data["refingerprint_reason"] or ""
+        ).strip():
+            errors.add(
+                "$.refingerprint_reason: required when the record fingerprint differs from the candidate or additional_records are present"
+            )
     elif role == "critic":
         if data["stop"] and (data["missing_units"] or data["reassign_ids"]):
             errors.add("$.stop: may only be true when no missing_units and no reassign_ids are proposed")
@@ -323,15 +388,17 @@ def validate_agent_result(data) -> Errors:
 
 # ----------------------------------------------------------------- run dir
 
+
 def validate_run_dir(run_dir: Path) -> Errors:
     errors = Errors()
     loaded = {}
-    for name, fn, needs_run in (
+    validators: tuple[tuple[str, Any, bool], ...] = (
         ("run-metadata.json", validate_metadata, False),
         ("coverage-ledger.json", validate_ledger, True),
         ("candidates.json", validate_candidates, False),
         ("findings.json", validate_findings, True),
-    ):
+    )
+    for name, fn, needs_run in validators:
         path = run_dir / name
         if not path.exists():
             if name in ("run-metadata.json", "coverage-ledger.json"):
@@ -343,7 +410,7 @@ def validate_run_dir(run_dir: Path) -> Errors:
             errors.add(f"{name}: {exc}")
             continue
         loaded[name] = data
-        for e in (fn(data, run_dir) if needs_run else fn(data)):
+        for e in fn(data, run_dir) if needs_run else fn(data):
             errors.add(f"{name}: {e}")
     if errors:
         return errors
@@ -357,16 +424,22 @@ def validate_run_dir(run_dir: Path) -> Errors:
             unit = ledger.get(cid)
             if unit is None:
                 errors.add(f"findings.json: {fp} links unknown unit {cid}")
-            elif fp not in unit["result_fingerprints"] and not any(fp in a.get("result_fingerprints", []) for a in unit["attempts"]):
+            elif fp not in unit["result_fingerprints"] and not any(
+                fp in a.get("result_fingerprints", []) for a in unit["attempts"]
+            ):
                 errors.add(f"findings.json: {fp} not recorded in result_fingerprints of {cid}")
     for fp, cand in candidates.items():
         resolved_fps = cand.get("resolved_fingerprints") or [fp]
         if cand["status"] == "verified":
             missing_fps = [rfp for rfp in resolved_fps if rfp not in findings]
             if missing_fps:
-                errors.add(f"candidates.json: {fp} marked verified but resolved fingerprint(s) {missing_fps} have no findings.json record")
+                errors.add(
+                    f"candidates.json: {fp} marked verified but resolved fingerprint(s) {missing_fps} have no findings.json record"
+                )
             if resolved_fps != [fp] and not (cand.get("refingerprint_reason") or "").strip():
-                errors.add(f"candidates.json: {fp} was refingerprinted/split to {resolved_fps} without refingerprint_reason")
+                errors.add(
+                    f"candidates.json: {fp} was refingerprinted/split to {resolved_fps} without refingerprint_reason"
+                )
         if cand["status"] == "unverified" and fp in findings:
             errors.add(f"candidates.json: {fp} has a verdict but is still marked unverified")
         for cid in cand["linked_units"]:
@@ -375,7 +448,9 @@ def validate_run_dir(run_dir: Path) -> Errors:
     for cid, unit in ledger.items():
         for fp in unit["result_fingerprints"]:
             if fp not in findings and fp not in candidates:
-                errors.add(f"coverage-ledger.json: {cid} references fingerprint {fp} found in neither findings nor candidates")
+                errors.add(
+                    f"coverage-ledger.json: {cid} references fingerprint {fp} found in neither findings nor candidates"
+                )
 
     meta = loaded.get("run-metadata.json")
     if meta and meta["run_status"] == "complete":
@@ -384,10 +459,31 @@ def validate_run_dir(run_dir: Path) -> Errors:
         open_units = [cid for cid, u in ledger.items() if u["status"] in ("planned", "in_progress")]
         if open_units:
             errors.add(f"run-metadata.json: run cannot be complete with {len(open_units)} planned/in_progress units")
+
+    snap_rel = (meta.get("snapshot_manifest") if meta else None) or "state/snapshot-manifest.json"
+    snap_path = run_dir / snap_rel
+    if snap_path.exists() or (meta and meta.get("snapshot_manifest")):
+        if not snap_path.is_file():
+            errors.add(f"{snap_rel}: snapshot manifest missing")
+        else:
+            try:
+                snap_data = load_json_strict(snap_path)
+            except ArtifactError as exc:
+                errors.add(f"{snap_rel}: {exc}")
+            else:
+                for e in validate_snapshot_manifest(snap_data, run_dir):
+                    errors.add(f"{snap_rel}: {e}")
+                if (
+                    meta
+                    and meta.get("snapshot_digest")
+                    and snap_data.get("manifest_sha256") != meta.get("snapshot_digest")
+                ):
+                    errors.add(f"{snap_rel}: manifest_sha256 does not match run-metadata.json snapshot_digest")
     return errors
 
 
 # --------------------------------------------------------------------- CLI
+
 
 def _emit(errors: Errors) -> int:
     print(json.dumps({"ok": not errors, "error_count": len(errors), "errors": list(errors)}, indent=2))
@@ -397,7 +493,7 @@ def _emit(errors: Errors) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Validate Frama-C pipeline artifacts.")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("findings", "ledger"):
+    for name in ("findings", "ledger", "snapshot"):
         p = sub.add_parser(name)
         p.add_argument("path", type=Path)
         p.add_argument("--run-dir", type=Path, default=None)
@@ -419,6 +515,8 @@ def main(argv=None) -> int:
             return _emit(validate_findings(data, args.run_dir))
         if args.cmd == "ledger":
             return _emit(validate_ledger(data, args.run_dir))
+        if args.cmd == "snapshot":
+            return _emit(validate_snapshot_manifest(data, args.run_dir))
         if args.cmd == "candidates":
             return _emit(validate_candidates(data))
         return _emit(validate_metadata(data))

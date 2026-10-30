@@ -21,6 +21,7 @@ result is never written. Every read-modify-write holds the run-wide `ledger` loc
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import functools
 import hashlib
@@ -29,16 +30,18 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, TypeVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cache  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
+    eva_alarm_in_file,
     load_agent_result_json,
     load_json_optional,
     load_json_strict,
@@ -62,6 +65,7 @@ LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame", 4: "l4_auth", 5: "l5_outpu
 UNIT_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*$")
 FN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NO_TOUCH = {"deferred", "out_of_scope", "not_applicable"}
+ALLOWED_MANUAL_STATUSES = frozenset({"planned", "in_progress", "blocked", "deferred", "out_of_scope", "not_applicable"})
 
 
 class LedgerError(RuntimeError):
@@ -109,28 +113,28 @@ def new_unit(file, function, cls, module, tier, wave, source, status, unresolved
     return unit
 
 
-def load_state() -> Tuple[Dict[str, dict], Dict[str, dict]]:
+def load_state() -> tuple[dict[str, dict], dict[str, dict]]:
     ledger = load_json_optional(LEDGER, [])
     candidates = load_json_optional(CANDIDATES, [])
     return {u["coverage_id"]: u for u in ledger}, {c["fingerprint"]: c for c in candidates}
 
 
-def load_all_state() -> Tuple[Dict[str, dict], Dict[str, dict], Dict[str, dict]]:
+def load_all_state() -> tuple[dict[str, dict], dict[str, dict], dict[str, dict]]:
     units, candidates = load_state()
     findings = load_json_optional(FINDINGS, [])
     return units, candidates, {f["fingerprint"]: f for f in findings}
 
 
 def commit(
-    units: Dict[str, dict],
-    candidates: Dict[str, dict],
-    findings: Optional[Dict[str, dict]] = None,
-    run_dir: Optional[Path] = None,
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    findings: dict[str, dict] | None = None,
+    run_dir: Path | None = None,
 ) -> None:
     ledger = [units[k] for k in sorted(units)]
     cands = [candidates[k] for k in sorted(candidates)]
     errors = list(validate_ledger(ledger, run_dir)) + [f"candidates: {e}" for e in validate_candidates(cands)]
-    recs: Optional[List[dict]] = None
+    recs: list[dict] | None = None
     if findings is not None:
         recs = [findings[k] for k in sorted(findings)]
         errors.extend(f"findings: {e}" for e in validate_findings(recs, run_dir))
@@ -145,17 +149,34 @@ def commit(
     # whenever an unverified candidate or an active planned/in_progress unit exists.
     has_unverified_cand = any(c.get("status") == "unverified" for c in cands)
     has_open_unit = any(u.get("status") in ("planned", "in_progress") for u in ledger)
-    if has_unverified_cand or has_open_unit:
-        meta_path = (run_dir or Path.cwd()) / "run-metadata.json"
-        if meta_path.is_file():
-            try:
-                meta = load_json_strict(meta_path)
-                if isinstance(meta, dict) and meta.get("run_status") == "complete":
-                    meta["run_status"] = "in_progress"
-                    meta["incomplete_reason"] = None
-                    atomic_write_json(meta_path, meta)
-            except ArtifactError:
-                pass
+    meta_path = (run_dir or Path.cwd()) / "run-metadata.json"
+    if meta_path.is_file():
+        try:
+            meta = load_json_strict(meta_path)
+            changed_meta = False
+            reopened = False
+            if (
+                (has_unverified_cand or has_open_unit)
+                and isinstance(meta, dict)
+                and meta.get("run_status") == "complete"
+            ):
+                meta["run_status"] = "in_progress"
+                meta["incomplete_reason"] = None
+                changed_meta = True
+                reopened = True
+            if reopened or (isinstance(meta, dict) and meta.get("run_status") == "in_progress"):
+                if meta.get("snapshot_manifest") or meta.get("snapshot_digest"):
+                    meta["snapshot_manifest"] = None
+                    meta["snapshot_digest"] = None
+                    changed_meta = True
+                snap_manifest = (run_dir or Path.cwd()) / "state" / "snapshot-manifest.json"
+                if snap_manifest.is_file():
+                    with contextlib.suppress(OSError):
+                        snap_manifest.unlink()
+            if changed_meta:
+                atomic_write_json(meta_path, meta)
+        except ArtifactError:
+            pass
 
 
 def add_evidence(
@@ -164,9 +185,9 @@ def add_evidence(
     producer: str,
     result: str,
     discharging: bool,
-    tool_output: Optional[str],
+    tool_output: str | None,
     summary: str,
-    details: Optional[dict] = None,
+    details: dict | None = None,
 ) -> None:
     ev = {
         "phase": phase,
@@ -182,7 +203,7 @@ def add_evidence(
         unit["evidence"].append(ev)
 
 
-def add_assumption(unit: dict, kind: str, description: str, related: Optional[List[str]] = None) -> None:
+def add_assumption(unit: dict, kind: str, description: str, related: list[str] | None = None) -> None:
     a = {"kind": kind, "description": description, "related_units": sorted(set(related or []))}
     if a not in unit["assumptions"]:
         unit["assumptions"].append(a)
@@ -258,7 +279,7 @@ def rel(path: str) -> str:
     return text
 
 
-def units_for_function(units: Dict[str, dict], file: str, function: str) -> List[dict]:
+def units_for_function(units: dict[str, dict], file: str, function: str) -> list[dict]:
     nf = normalize_file(file)
     exact = [u for u in units.values() if u["function"] == function and u["file"] == nf]
     if exact:
@@ -270,8 +291,9 @@ def units_for_function(units: Dict[str, dict], file: str, function: str) -> List
 
 # --------------------------------------------------------------------- seed
 
+
 @ledger_locked
-def cmd_seed(dag_path: Path, scope: List[str], callgraph_source: str) -> dict:
+def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str) -> dict:
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
     modules = dag.get("modules", {})
@@ -301,13 +323,29 @@ def cmd_seed(dag_path: Path, scope: List[str], callgraph_source: str) -> dict:
                 continue
             if not in_scope:
                 unit = new_unit(
-                    file, name, cls, module, tier, wave, callgraph_source, "out_of_scope",
-                    ["outside requested scope_paths"], reason,
+                    file,
+                    name,
+                    cls,
+                    module,
+                    tier,
+                    wave,
+                    callgraph_source,
+                    "out_of_scope",
+                    ["outside requested scope_paths"],
+                    reason,
                 )
             elif tier.startswith("Tier 3"):
                 unit = new_unit(
-                    file, name, cls, module, tier, wave, callgraph_source, "deferred",
-                    ["tier3_not_scheduled: no harness is generated for Tier 3 modules in this profile"], reason,
+                    file,
+                    name,
+                    cls,
+                    module,
+                    tier,
+                    wave,
+                    callgraph_source,
+                    "deferred",
+                    ["tier3_not_scheduled: no harness is generated for Tier 3 modules in this profile"],
+                    reason,
                 )
             else:
                 unit = new_unit(file, name, cls, module, tier, wave, callgraph_source, "planned", None, reason)
@@ -327,7 +365,8 @@ def cmd_seed(dag_path: Path, scope: List[str], callgraph_source: str) -> dict:
 
 # ---------------------------------------------------------------- ingestion
 
-def _module_units(units: Dict[str, dict], module: str) -> List[dict]:
+
+def _module_units(units: dict[str, dict], module: str) -> list[dict]:
     return [u for u in units.values() if u["module"] == module and u["status"] not in NO_TOUCH]
 
 
@@ -336,19 +375,17 @@ def fuzz_engine_note(report: dict) -> str:
     if report.get("engine_used") == "sanitizers":
         reason = report.get("engine_fallback_reason")
         suffix = f"; E-ACSL fallback reason: {reason}" if reason else ""
-        return (
-            "Clang ASan+UBSan + LibFuzzer (no E-ACSL contract checks, no intra-object bounds checks"
-            f"{suffix})"
-        )
+        return f"Clang ASan+UBSan + LibFuzzer (no E-ACSL contract checks, no intra-object bounds checks{suffix})"
     if report.get("reduced_checks"):
         return f"E-ACSL + LibFuzzer (reduced checks: {', '.join(report['reduced_checks'])})"
     return "E-ACSL + LibFuzzer"
 
 
 @ledger_locked
-def cmd_ingest_fuzz(paths: List[Path]) -> dict:
+def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
-    stats = {"reports": 0, "candidates": 0}
+    stats: dict[str, Any] = {"reports": 0, "candidates": 0}
+    ingested_modules: list[str] = []
     for path in paths:
         report = load_json_strict(path)
         stats["reports"] += 1
@@ -359,22 +396,35 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
         engine_note = fuzz_engine_note(report)
 
         if status == "clean":
+            ingested_modules.append(module)
             for u in mod_units:
                 add_evidence(
-                    u, "fuzz", "run_eacsl_fuzz.py", "fuzz_clean", False, tool_output,
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_clean",
+                    False,
+                    tool_output,
                     f"{engine_note} campaign found no failure (not a proof).",
                 )
             continue
-        if status in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run"):
-            summary = (
-                f"Fuzz campaign was never run ({report.get('reason') or 'no report produced'})."
-                if status == "not_run"
-                else f"Fuzz campaign did not run to completion ({status})."
-            )
+        if status in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run", "insufficient_memory"):
+            if status == "not_run":
+                summary = f"Fuzz campaign was never run ({report.get('reason') or 'no report produced'})."
+            elif status == "insufficient_memory":
+                reason_text = (
+                    report.get("reason")
+                    or "; ".join(str(x) for x in (report.get("error_summary") or []) if x)
+                    or "insufficient_memory"
+                )
+                summary = f"Fuzz campaign could not run ({reason_text})."
+            else:
+                summary = f"Fuzz campaign did not run to completion ({status})."
             for u in mod_units:
                 add_evidence(u, "fuzz", "run_eacsl_fuzz.py", f"fuzz_{status}", False, tool_output, summary)
             continue
 
+        ingested_modules.append(module)
         for art in report.get("artifacts", []):
             artifact_rel = rel(art["artifact"])
             failure = art.get("failure")
@@ -382,7 +432,9 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
                 fp = art["fingerprint"]
                 file = normalize_file(failure["file"])
                 function = failure["function"]
-                cls = goal_obligation_class({"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")})
+                cls = goal_obligation_class(
+                    {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
+                )
                 linked = [
                     u["coverage_id"]
                     for u in units_for_function(units, file, function)
@@ -391,53 +443,83 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
                 proposed = "confirmed" if art.get("reproducible") else "needs_validation"
                 note = None if art.get("reproducible") else "crash did not reproduce on replay"
                 if not linked:
-                    note = (note + "; " if note else "") + f"no ledger unit for {file}#{function}::{cls} (harness or unseeded code)"
+                    note = (
+                        note + "; " if note else ""
+                    ) + f"no ledger unit for {file}#{function}::{cls} (harness or unseeded code)"
                 upsert_candidate(
-                    candidates, fp, "fuzz", proposed, module,
+                    candidates,
+                    fp,
+                    "fuzz",
+                    proposed,
+                    module,
                     {"file": file, "line": failure.get("line", 0), "function": function},
-                    {"kind": failure.get("alarm_kind") or failure.get("kind") or "assertion", "predicate": failure.get("predicate", "")},
-                    [artifact_rel], tool_output, linked, note,
+                    {
+                        "kind": failure.get("alarm_kind") or failure.get("kind") or "assertion",
+                        "predicate": failure.get("predicate", ""),
+                    },
+                    [artifact_rel],
+                    tool_output,
+                    linked,
+                    note,
                 )
                 for cid in linked:
                     add_evidence(
-                        units[cid], "fuzz", "run_eacsl_fuzz.py", "fuzz_failure", False, tool_output,
+                        units[cid],
+                        "fuzz",
+                        "run_eacsl_fuzz.py",
+                        "fuzz_failure",
+                        False,
+                        tool_output,
                         f"{engine_note} failure {failure.get('alarm_kind') or failure.get('kind')} at line {failure.get('line')}.",
                         {"artifact": artifact_rel, "reproducible": art.get("reproducible")},
                     )
                     mark_candidate(units[cid], fp)
             else:
                 kind = art.get("kind", "crash")
-                digest = hashlib.sha256(f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak') else ''}".encode()).hexdigest()[:10]
+                digest = hashlib.sha256(
+                    f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak') else ''}".encode()
+                ).hexdigest()[:10]
                 fp = f"harness_{re.sub(r'[^A-Za-z0-9_.-]', '_', module)}.c#unknown_function::{'unparsed_' + kind if kind in ('crash', 'leak') else kind}::{digest}"
                 upsert_candidate(
-                    candidates, fp, "fuzz", "needs_validation", module,
+                    candidates,
+                    fp,
+                    "fuzz",
+                    "needs_validation",
+                    module,
                     {"file": f"harness_{module}.c", "line": 0, "function": "unknown_function"},
                     {"kind": kind, "predicate": ""},
-                    [artifact_rel], tool_output, [],
+                    [artifact_rel],
+                    tool_output,
+                    [],
                     "no E-ACSL failure report could be parsed; verifier must triage and link units",
                 )
             stats["candidates"] += 1
     commit(units, candidates)
+    if cache.shared_mode() == "rw" and ingested_modules:
+        published_corpora: dict[str, int] = {}
+        for mod_name in sorted(set(ingested_modules)):
+            c_dirs = [
+                Path("workspace") / "corpus" / mod_name,
+                Path("workspace") / "corpora" / mod_name,
+            ]
+            pub_count = 0
+            for cd in c_dirs:
+                if cd.is_dir():
+                    pub_count += cache.publish_corpus(mod_name, cd)
+            if pub_count > 0:
+                published_corpora[mod_name] = pub_count
+        if published_corpora:
+            stats["published_corpora"] = published_corpora
     return stats
 
 
-@ledger_locked
 def _alarm_in_file(alarm: dict, unit_file: str) -> bool:
-    """
-    Whether an Eva report row lies in `unit_file`. The report keeps the CSV's `directory` and
-    bare `file` columns apart: joined and normalized they give the repository-relative path. A
-    row without a directory can only be matched by base name.
-    """
-    name = (alarm.get("file") or "").replace("\\", "/")
-    if not name:
-        return True
-    directory = (alarm.get("directory") or "").replace("\\", "/").rstrip("/")
-    path = normalize_file(f"{directory}/{name}" if directory and directory != "." and not name.startswith("/") else name)
-    target = normalize_file(unit_file)
-    return path == target if "/" in path else path == target.rsplit("/", 1)[-1]
+    """Whether an Eva report row lies in `unit_file` (delegates to framac_common.eva_alarm_in_file)."""
+    return eva_alarm_in_file(alarm, unit_file)
 
 
-def cmd_ingest_eva(paths: List[Path]) -> dict:
+@ledger_locked
+def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "candidates": 0}
     for path in paths:
@@ -446,74 +528,145 @@ def cmd_ingest_eva(paths: List[Path]) -> dict:
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
         rte_units = [u for u in _module_units(units, module) if u["obligation_class"] == "rte"]
+        report_sources = {normalize_file(s) for s in report["sources"]} if report.get("sources") else None
+        if report_sources:
+            rte_units = [u for u in rte_units if normalize_file(u["file"]) in report_sources]
 
         if report.get("status") != "ok":
             for u in rte_units:
                 add_evidence(
-                    u, "eva", "run_eva_slice.py", "eva_analysis_error", False, tool_output,
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_analysis_error",
+                    False,
+                    tool_output,
                     "Eva did not complete; no property statuses are available.",
                 )
             continue
 
         unknown_by_fn = report.get("unknown_obligations_by_function", {})
-        invalid_by_fn: Dict[str, List[dict]] = {}
+        invalid_by_fn: dict[str, list[dict]] = {}
         for alarm in report.get("invalid_alarms", []):
             invalid_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
-        dead_fns = {a.get("function") for a in report.get("dead_alarms", [])}
-        assumed_by_fn: Dict[str, int] = {}
-        for a in report.get("assumed_properties", []):
-            assumed_by_fn[a.get("function", "")] = assumed_by_fn.get(a.get("function", ""), 0) + 1
+        dead_by_fn: dict[str, list[dict]] = {}
+        for alarm in report.get("dead_alarms", []):
+            dead_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
+        assumed_by_fn: dict[str, list[dict]] = {}
+        for alarm in report.get("assumed_properties", []):
+            assumed_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
+        props_by_fn: dict[str, list[dict]] = {}
+        raw_props_by_file = report.get("functions_with_properties_by_file") or []
+        if isinstance(raw_props_by_file, dict):
+            for fpath, fns in raw_props_by_file.items():
+                for fn_name in fns or []:
+                    props_by_fn.setdefault(str(fn_name), []).append({"file": str(fpath), "function": str(fn_name)})
+        else:
+            for item in raw_props_by_file:
+                if isinstance(item, dict) and item.get("function"):
+                    props_by_fn.setdefault(str(item["function"]), []).append(item)
         with_props = set(report.get("functions_with_properties", []))
 
         for u in rte_units:
             fn = u["function"]
-            for alarm in invalid_by_fn.get(fn, []):
-                if not _alarm_in_file(alarm, u["file"]):
-                    continue  # a same-named function in another file
-                fp = make_fingerprint(u["file"], fn, alarm.get("kind", ""), alarm.get("annotation", ""))
+            u_file = u["file"]
+            unit_invalids = [a for a in invalid_by_fn.get(fn, []) if _alarm_in_file(a, u_file)]
+            unit_unknowns = [
+                a for a in (unknown_by_fn.get(fn) or []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)
+            ]
+            unit_deads = [a for a in dead_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)]
+            unit_assumed = [
+                a for a in assumed_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)
+            ]
+            if props_by_fn:
+                has_props = any(_alarm_in_file(p, u_file) for p in props_by_fn.get(fn, []))
+            elif report_sources:
+                has_props = fn in with_props and (normalize_file(u_file) in report_sources)
+            else:
+                has_props = fn in with_props
+            has_props = has_props or bool(unit_invalids or unit_unknowns or unit_deads or unit_assumed)
+
+            for alarm in unit_invalids:
+                fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
                 upsert_candidate(
-                    candidates, fp, "eva", "needs_validation", module,
-                    {"file": normalize_file(u["file"]), "line": int(alarm.get("line") or 0), "function": fn},
+                    candidates,
+                    fp,
+                    "eva",
+                    "needs_validation",
+                    module,
+                    {"file": normalize_file(u_file), "line": int(alarm.get("line") or 0), "function": fn},
                     {"kind": alarm.get("kind") or "assertion", "predicate": alarm.get("annotation", "")},
-                    [], tool_output, [u["coverage_id"]],
+                    [],
+                    tool_output,
+                    [u["coverage_id"]],
                     "Eva Invalid status without a concrete witness input",
                 )
                 add_evidence(
-                    u, "eva", "run_eva_slice.py", "eva_invalid", False, tool_output,
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_invalid",
+                    False,
+                    tool_output,
                     f"Eva reports Invalid at line {alarm.get('line')}: {alarm.get('annotation', '')[:200] or alarm.get('kind', '')}",
                 )
                 mark_candidate(u, fp)
                 stats["candidates"] += 1
-            if assumed_by_fn.get(fn):
-                add_assumption(u, "stub_contract", f"{assumed_by_fn[fn]} property status(es) 'Considered valid' (libc/stub specifications) under Eva.")
-            if fn in invalid_by_fn:
-                continue
-            if fn in unknown_by_fn:
-                add_evidence(
-                    u, "eva", "run_eva_slice.py", "eva_unknown", False, tool_output,
-                    f"{len(unknown_by_fn[fn])} RTE obligation(s) remain Unknown; queued for WP.",
+            if unit_assumed:
+                add_assumption(
+                    u,
+                    "stub_contract",
+                    f"{len(unit_assumed)} property status(es) 'Considered valid' (libc/stub specifications) under Eva.",
                 )
-            elif fn in with_props and fn not in dead_fns:
+            if unit_invalids:
+                continue
+            if unit_unknowns:
                 add_evidence(
-                    u, "eva", "run_eva_slice.py", "eva_all_valid", True, tool_output,
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_unknown",
+                    False,
+                    tool_output,
+                    f"{len(unit_unknowns)} RTE obligation(s) remain Unknown; queued for WP.",
+                )
+            elif has_props and not unit_deads:
+                add_evidence(
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_all_valid",
+                    True,
+                    tool_output,
                     "Every RTE obligation in this function is Valid under Eva.",
                 )
                 add_assumption(
-                    u, "boundary_assumption",
+                    u,
+                    "boundary_assumption",
                     f"Eva result holds for calling contexts reachable from eva_main of module '{module}'.",
                 )
                 if u["status"] in ("planned", "blocked"):
                     u["status"] = "covered"
                     u["unresolved"] = []
                     stats["covered"] += 1
-            elif fn in dead_fns:
+            elif unit_deads:
                 add_evidence(
-                    u, "eva", "run_eva_slice.py", "eva_dead", False, tool_output,
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_dead",
+                    False,
+                    tool_output,
                     "Properties are dead under the module harness: function not reached from eva_main (harness gap).",
                 )
             else:
                 add_evidence(
-                    u, "eva", "run_eva_slice.py", "eva_no_properties", False, tool_output,
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_no_properties",
+                    False,
+                    tool_output,
                     "Eva reported no property for this function (trivial or not reached).",
                 )
     commit(units, candidates)
@@ -521,7 +674,7 @@ def cmd_ingest_eva(paths: List[Path]) -> dict:
 
 
 @ledger_locked
-def cmd_ingest_wp(paths: List[Path]) -> dict:
+def cmd_ingest_wp(paths: list[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "blocked": 0}
     for path in paths:
@@ -535,7 +688,12 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
         if report["status"] == "acsl_syntax_error":
             for u in targets:
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_acsl_syntax_error", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_acsl_syntax_error",
+                    False,
+                    tool_output,
                     "ACSL kernel check failed; WP did not run.",
                 )
             continue
@@ -545,7 +703,12 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
             reason = str(report.get("reason") or "unknown")
             for u in targets:
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_analysis_error", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_analysis_error",
+                    False,
+                    tool_output,
                     f"WP did not complete ({reason}); no goal was credited.",
                     details={"reason": reason},
                 )
@@ -563,7 +726,12 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
             summary = "; ".join(issues[:3]) if issues else f"WP reported {report['status']}"
             for u in targets:
                 add_evidence(
-                    u, "wp", "run_wp_function.py", f"wp_{report['status']}", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    f"wp_{report['status']}",
+                    False,
+                    tool_output,
                     f"WP soundness gate rejected proof ({report['status']}): {summary[:220]}",
                 )
                 if u["status"] != "candidate":
@@ -574,14 +742,19 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
         soundness = report.get("soundness", {})
         by_class = report.get("by_obligation_class", {})
         all_proven = report["status"] == "all_proven"
-        unproven_by_class: Dict[str, List[dict]] = {}
+        unproven_by_class: dict[str, list[dict]] = {}
         for g in report.get("unproven_goals", []):
             unproven_by_class.setdefault(g.get("obligation_class", "rte"), []).append(g)
 
         for u in targets:
             if u["status"] == "candidate":
                 add_evidence(
-                    u, "wp", "run_wp_function.py", f"wp_{report['status']}", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    f"wp_{report['status']}",
+                    False,
+                    tool_output,
                     "WP result recorded on a unit with an open candidate; candidate verdict takes precedence.",
                 )
                 continue
@@ -590,7 +763,12 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
             if counts and counts.get("unproven", 0) > 0:
                 goals = unproven_by_class.get(cls, [])
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_unproven", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_unproven",
+                    False,
+                    tool_output,
                     f"{counts['unproven']} goal(s) unproven, {counts.get('proven', 0)} proven.",
                 )
                 u["status"] = "blocked"
@@ -601,22 +779,30 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
                 stats["blocked"] += 1
             elif counts and (counts.get("proven", 0) + counts.get("proven_under_hyp", 0)) > 0 and all_proven:
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_proven", True, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_proven",
+                    True,
+                    tool_output,
                     f"{counts.get('proven', 0)} goal(s) proven, {counts.get('proven_under_hyp', 0)} valid under hypotheses.",
                 )
                 if counts.get("proven_under_hyp", 0):
                     add_assumption(
-                        u, "valid_under_hyp",
+                        u,
+                        "valid_under_hyp",
                         f"{counts['proven_under_hyp']} goal(s) valid under hypotheses (callee contracts); resolved by the proof audit.",
                     )
                 if soundness.get("reduced_checks"):
                     add_assumption(
-                        u, "other",
+                        u,
+                        "other",
                         f"WP run with reduced RTE check flags: {', '.join(soundness['reduced_checks'])}.",
                     )
                 if soundness.get("assumed_function_pointer_goals"):
                     add_assumption(
-                        u, "other",
+                        u,
+                        "other",
                         f"WP assumed degenerated \\valid_function goals: {len(soundness['assumed_function_pointer_goals'])} goal(s).",
                     )
                 u["status"] = "covered"
@@ -624,12 +810,18 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
                 stats["covered"] += 1
             elif cls == "rte" and all_proven and not counts:
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_no_rte_goals", True, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_no_rte_goals",
+                    True,
+                    tool_output,
                     "WP generated no RTE goal for this function.",
                 )
                 if soundness.get("reduced_checks"):
                     add_assumption(
-                        u, "other",
+                        u,
+                        "other",
                         f"WP run with reduced RTE check flags: {', '.join(soundness['reduced_checks'])}.",
                     )
                 u["status"] = "covered"
@@ -637,13 +829,27 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
                 stats["covered"] += 1
             elif counts and not all_proven:
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_function_incomplete", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_function_incomplete",
+                    False,
+                    tool_output,
                     f"Goals of class {cls} are proven, but the function proof is incomplete; not credited.",
                 )
             else:
-                hint = f" (layer clauses must be named {cls[:2].upper()}_*)" if cls in ("l4_auth", "l5_output", "l6_secret") else ""
+                hint = (
+                    f" (layer clauses must be named {cls[:2].upper()}_*)"
+                    if cls in ("l4_auth", "l5_output", "l6_secret")
+                    else ""
+                )
                 add_evidence(
-                    u, "wp", "run_wp_function.py", "wp_no_credited_goals", False, tool_output,
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_no_credited_goals",
+                    False,
+                    tool_output,
                     f"No WP goal could be credited to {cls}{hint}.",
                 )
     commit(units, candidates)
@@ -652,7 +858,8 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
 
 # --------------------------------------------- M2 hypotheses & crash verifier
 
-def _infer_module_for_function(units: Dict[str, dict], file: str, function: str) -> str:
+
+def _infer_module_for_function(units: dict[str, dict], file: str, function: str) -> str:
     matched = units_for_function(units, file, function)
     if matched:
         return matched[0].get("module") or "unknown"
@@ -660,7 +867,7 @@ def _infer_module_for_function(units: Dict[str, dict], file: str, function: str)
 
 
 @ledger_locked
-def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None) -> dict:
+def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) -> dict:
     """
     Promote breaker seeds (if any), record prover strengthening_requests into
     contract_negotiator, and record a prover/breaker fault_hypothesis
@@ -681,7 +888,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None)
     fn = res["function"]
     mod = module or _infer_module_for_function(units, file, fn)
 
-    seeds_promoted: List[dict] = []
+    seeds_promoted: list[dict] = []
     if role == "breaker" and res.get("seeds"):
         prom = promote_seeds(Path.cwd(), aid, mod, list(res["seeds"]))
         seeds_promoted = list(prom["promoted"])
@@ -699,8 +906,12 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None)
     if fh is not None:
         cls = goal_obligation_class({"kind": "assertion", "annotation": fh["predicate"]})
         fp = make_fingerprint(file, fn, cls, fh["predicate"])
-        fn_units = [u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")]
-        linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [u["coverage_id"] for u in fn_units]
+        fn_units = [
+            u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")
+        ]
+        linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
+            u["coverage_id"] for u in fn_units
+        ]
         if res.get("evidence"):
             tool_out = res["evidence"][0]["tool_output"]
         else:
@@ -744,10 +955,10 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None)
     }
 
 
-def _collect_reproducible_shas(run_dir: Path, report_paths: List[Path], tool_outputs: List[str]) -> Set[str]:
-    shas: Set[str] = set()
+def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_outputs: list[str]) -> set[str]:
+    shas: set[str] = set()
     all_paths = list(report_paths) + [run_dir / t for t in tool_outputs]
-    seen_paths: Set[Path] = set()
+    seen_paths: set[Path] = set()
     for p in all_paths:
         try:
             rp = p.resolve()
@@ -783,8 +994,8 @@ def _merge_finding_record(existing: dict, incoming: dict) -> None:
 @ledger_locked
 def cmd_ingest_verifier(
     result_path: Path,
-    replay_reports: Optional[List[Path]] = None,
-    harness_meta_path: Optional[Path] = None,
+    replay_reports: list[Path] | None = None,
+    harness_meta_path: Path | None = None,
 ) -> dict:
     """
     Validate and ingest a crash_verifier subagent result, promoting scratch artifacts/crashes,
@@ -823,7 +1034,7 @@ def cmd_ingest_verifier(
             harness_exhausted = False
 
     records = [copy.deepcopy(res["record"])] + [copy.deepcopy(r) for r in (res.get("additional_records") or [])]
-    resolved_fps: List[str] = []
+    resolved_fps: list[str] = []
 
     for rec in records:
         fp = rec["fingerprint"]
@@ -861,7 +1072,8 @@ def cmd_ingest_verifier(
 
             # Expand linked_units to all active or deferred units of the confirmed-buggy function so it is excluded from WP
             fn_units = [
-                u for u in units_for_function(units, rec["location"]["file"], rec["location"]["function"])
+                u
+                for u in units_for_function(units, rec["location"]["file"], rec["location"]["function"])
                 if u["status"] not in ("out_of_scope", "not_applicable")
             ]
             for u in fn_units:
@@ -875,7 +1087,12 @@ def cmd_ingest_verifier(
                 if cand_fp != fp and cand_fp in u["result_fingerprints"]:
                     u["result_fingerprints"].remove(cand_fp)
                 add_evidence(
-                    u, "verifier", aid, "confirmed", False, primary_ev_out,
+                    u,
+                    "verifier",
+                    aid,
+                    "confirmed",
+                    False,
+                    primary_ev_out,
                     f"Crash verifier confirmed {fp} ({rec['severity']}).",
                 )
                 mark_candidate(u, fp)
@@ -888,7 +1105,12 @@ def cmd_ingest_verifier(
                 if cand_fp != fp and cand_fp in u["result_fingerprints"]:
                     u["result_fingerprints"].remove(cand_fp)
                 add_evidence(
-                    u, "verifier", aid, "needs_validation", False, primary_ev_out,
+                    u,
+                    "verifier",
+                    aid,
+                    "needs_validation",
+                    False,
+                    primary_ev_out,
                     f"Crash verifier classified {fp} as needs_validation.",
                 )
                 mark_candidate(u, fp)
@@ -914,15 +1136,18 @@ def cmd_ingest_verifier(
                 if attempt_entry not in u["attempts"]:
                     u["attempts"].append(attempt_entry)
                 add_evidence(
-                    u, "verifier", aid, f"rejected:{rej_class}", False, primary_ev_out,
+                    u,
+                    "verifier",
+                    aid,
+                    f"rejected:{rej_class}",
+                    False,
+                    primary_ev_out,
                     f"Rejected ({rej_class}): {rec['reason'][:140]}",
                 )
                 if not u["result_fingerprints"] and u["status"] == "candidate":
                     if rej_class == "harness_induced" and harness_exhausted:
                         u["status"] = "blocked"
-                        u["unresolved"] = sorted(
-                            set(u["unresolved"] + [f"harness_repair_exhausted: {rec['reason']}"])
-                        )
+                        u["unresolved"] = sorted(set(u["unresolved"] + [f"harness_repair_exhausted: {rec['reason']}"]))
                     else:
                         u["status"] = "covered" if any(e.get("discharging") for e in u["evidence"]) else "planned"
                         u["agent_id"] = None
@@ -949,25 +1174,26 @@ def cmd_ingest_verifier(
 
 # ---------------------------------------------------------------- transition
 
-@ledger_locked
-def cmd_transition(
+
+def _apply_transition(
+    units: dict[str, dict],
     cid: str,
     status: str,
-    agent_id: Optional[str],
-    reason: Optional[str],
-    expected: Optional[List[str]] = None,
+    agent_id: str | None = None,
+    reason: str | None = None,
+    expected: list[str] | None = None,
 ) -> dict:
-    """
-    Move one unit to `status`. With `expected`, this is a compare-and-set: the transition is
-    refused unless the unit is currently in one of those statuses (a scheduler preparing a
-    prover must never overwrite a unit that an ingest just marked `candidate`).
-    """
-    units, candidates = load_state()
+    if status not in ALLOWED_MANUAL_STATUSES:
+        raise LedgerError(
+            f"cannot manually transition to {status!r}; allowed manual statuses: {sorted(ALLOWED_MANUAL_STATUSES)}"
+        )
     if cid not in units:
         raise LedgerError(f"unknown coverage id {cid}")
     u = units[cid]
     if expected and u["status"] not in expected:
-        raise LedgerError(f"{cid} is {u['status']!r}, expected one of {sorted(expected)}; transition to {status!r} refused")
+        raise LedgerError(
+            f"{cid} is {u['status']!r}, expected one of {sorted(expected)}; transition to {status!r} refused"
+        )
     if status in ("in_progress",):
         if not agent_id:
             raise LedgerError("in_progress requires --agent-id")
@@ -988,8 +1214,56 @@ def cmd_transition(
         u["agent_id"] = None
         u["unresolved"] = []
     u["status"] = status
+    return u
+
+
+@ledger_locked
+def cmd_transition(
+    cid: str,
+    status: str,
+    agent_id: str | None,
+    reason: str | None,
+    expected: list[str] | None = None,
+) -> dict:
+    """
+    Move one unit to `status`. With `expected`, this is a compare-and-set: the transition is
+    refused unless the unit is currently in one of those statuses (a scheduler preparing a
+    prover must never overwrite a unit that an ingest just marked `candidate`).
+    """
+    units, candidates = load_state()
+    u = _apply_transition(units, cid, status, agent_id, reason, expected)
     commit(units, candidates)
     return u
+
+
+@ledger_locked
+def cmd_transition_many(items: list[dict]) -> list[dict]:
+    """
+    Apply a batch of unit status transitions atomically in one load + validate + commit cycle.
+    Each item is `{"id": cid, "status": status, "agent_id": ..., "reason": ..., "expected": ...}`.
+    If any transition fails, no change is committed.
+    """
+    if not items:
+        return []
+    units, candidates = load_state()
+    updated: list[dict] = []
+    for item in items:
+        cid = item.get("id") or item.get("coverage_id")
+        status = item.get("status")
+        if not cid or not status:
+            raise LedgerError("transition_many item requires 'id' and 'status'")
+        updated.append(
+            _apply_transition(
+                units,
+                str(cid),
+                str(status),
+                item.get("agent_id"),
+                item.get("reason"),
+                item.get("expected"),
+            )
+        )
+    commit(units, candidates)
+    return updated
 
 
 @ledger_locked
@@ -1028,11 +1302,11 @@ def cmd_scaffold_verifier(
     cand_fp: str,
     decision: str,
     agent_id: str,
-    file_override: Optional[str] = None,
-    fn_override: Optional[str] = None,
-    line_override: Optional[int] = None,
+    file_override: str | None = None,
+    fn_override: str | None = None,
+    line_override: int | None = None,
     severity: str = "high",
-    out_path: Optional[Path] = None,
+    out_path: Path | None = None,
 ) -> dict:
     """
     Generate a schema-valid crash_verifier result skeleton from `candidates.json`
@@ -1057,7 +1331,7 @@ def cmd_scaffold_verifier(
 
     if loc_file != normalize_file(loc.get("file") or "") or loc_fn != (loc.get("function") or ""):
         rec_fp = make_fingerprint(loc_file, loc_fn, p_kind, p_pred)
-        refp_reason: Optional[str] = (
+        refp_reason: str | None = (
             f"Resolved candidate location {loc.get('file')}#{loc.get('function')} "
             f"to {loc_file}#{loc_fn} at line {loc_line}."
         )
@@ -1094,7 +1368,7 @@ def cmd_scaffold_verifier(
     compile_info = fuzz_report.get("compile") if isinstance(fuzz_report, dict) else None
     binary = (compile_info or {}).get("binary") if isinstance(compile_info, dict) else None
     binary = binary or f"workspace/harnesses/fuzz_{module}.e-acsl"
-    reproducers: List[dict] = []
+    reproducers: list[dict] = []
     for rep_rel in cand.get("reproducers") or []:
         rep_path = Path(rep_rel)
         sha = "0" * 64
@@ -1103,14 +1377,18 @@ def cmd_scaffold_verifier(
             raw = rep_path.read_bytes()
             sha = hashlib.sha256(raw).hexdigest()
             sz = len(raw)
-        reproducers.append({
-            "input": rep_rel,
-            "sha256": sha,
-            "size_bytes": sz,
-            "command": (f"python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module} "
-                        f"--inputs {rep_rel} --binary {binary}"),
-            "observed_result": f"{p_kind}: {p_pred}",
-        })
+        reproducers.append(
+            {
+                "input": rep_rel,
+                "sha256": sha,
+                "size_bytes": sz,
+                "command": (
+                    f"python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module} "
+                    f"--inputs {rep_rel} --binary {binary}"
+                ),
+                "observed_result": f"{p_kind}: {p_pred}",
+            }
+        )
 
     base_fields = {
         "verdict": decision,
@@ -1199,9 +1477,7 @@ def cmd_scaffold_verifier(
             ],
             "reachability": "untrusted_surface",
             "blockers": [f"Requires caller/environment state validation for {loc_fn}."],
-            "validation_plan": {
-                "local": f"Replay with full state initialization in {harness_file}."
-            },
+            "validation_plan": {"local": f"Replay with full state initialization in {harness_file}."},
             "linked_units": linked,
             "verifier": {
                 "agent_id": agent_id,
@@ -1245,13 +1521,13 @@ def cmd_scaffold_verifier(
 
 def cmd_summary() -> dict:
     units, candidates, findings = load_all_state()
-    by_status: Dict[str, int] = {}
-    by_class: Dict[str, Dict[str, int]] = {}
+    by_status: dict[str, int] = {}
+    by_class: dict[str, dict[str, int]] = {}
     for u in units.values():
         by_status[u["status"]] = by_status.get(u["status"], 0) + 1
         c = by_class.setdefault(u["obligation_class"], {})
         c[u["status"]] = c.get(u["status"], 0) + 1
-    by_verdict: Dict[str, int] = {}
+    by_verdict: dict[str, int] = {}
     for f in findings.values():
         v = f.get("verdict", "unknown")
         by_verdict[v] = by_verdict.get(v, 0) + 1
@@ -1264,7 +1540,24 @@ def cmd_summary() -> dict:
     }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _parse_transitions_spec(raw: str) -> list[dict]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    path = Path(text)
+    if not text.startswith("[") and path.is_file():
+        data = load_json_strict(path)
+    else:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise LedgerError(f"invalid --spec-json: {exc}") from exc
+    if not isinstance(data, list):
+        raise LedgerError("--spec-json must be a JSON list of transition objects")
+    return data
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Coverage ledger and candidate management (parent-only).")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("seed")
@@ -1296,6 +1589,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=[],
         help="Compare-and-set: refuse unless the unit's current status is one of these (repeatable)",
     )
+    p_many = sub.add_parser("transition-many")
+    p_many.add_argument(
+        "--spec-json",
+        required=True,
+        help="JSON list (or path to JSON file) of {id, status, agent_id?, reason?, expected?} transitions",
+    )
     p_close = sub.add_parser("close-remaining")
     p_close.add_argument("--reason", required=True, help="Reason for closing remaining planned/in_progress units")
     p_scaf = sub.add_parser("scaffold-verifier")
@@ -1310,6 +1609,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("summary")
     args = parser.parse_args(argv)
 
+    out: object
     try:
         if args.cmd == "seed":
             out = cmd_seed(args.dag, args.scope, args.callgraph_source)
@@ -1325,6 +1625,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
         elif args.cmd == "transition":
             out = cmd_transition(args.id, args.status, args.agent_id, args.reason, args.expect or None)
+        elif args.cmd == "transition-many":
+            out = cmd_transition_many(_parse_transitions_spec(args.spec_json))
         elif args.cmd == "close-remaining":
             out = cmd_close_remaining(args.reason)
         elif args.cmd == "scaffold-verifier":
