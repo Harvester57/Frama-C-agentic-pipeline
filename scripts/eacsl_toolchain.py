@@ -15,6 +15,9 @@ spaces break. This module enforces the invocation contract:
     the self-contained instrumented C file codegen flags only;
   - `select_eacsl_binary()` / `is_eacsl_instrumented()` guarantee that a run
     labelled `engine=eacsl` actually executes an E-ACSL-instrumented binary;
+  - `resolve_fuzz_init_source()` / `defines_fuzzer_initialize()` supply the
+    `LLVMFuzzerInitialize` hook that initializes the E-ACSL runtime, which a
+    main-less libFuzzer target never does on its own;
   - `find_variadic_fallbacks()` / `generate_fallback_source()` define the
     `<fn>_fallback_<N>` symbols the Variadic translation emits for variadic
     calls without a libc specification, in a link-only object that never
@@ -38,7 +41,15 @@ from framac_common import resolve_fc_stubs_dir  # noqa: E402
 
 EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double")
 EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon")
-EACSL_FC_EXTRA_FLAGS = ("-e-acsl-assert-print-data",)
+# Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
+# leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full
+# tracking fixes that; it needs the runtime initialized by templates/eacsl_runtime/fuzz_init.c.
+EACSL_FC_EXTRA_FLAGS = ("-e-acsl-assert-print-data", "-e-acsl-full-mtracking")
+# RTE emits no initialization assertions unless asked, so uninitialized reads would go unchecked.
+# Reads of memory written outside instrumented code (libFuzzer's `data`, external libraries) fail
+# these checks: harnesses must copy the input into their own buffer, as generated harnesses do.
+EACSL_RTE_INITIALIZED_FLAG = "-rte-initialized @all"
+_FUZZER_INITIALIZE_DEF_RE = re.compile(r"\bLLVMFuzzerInitialize\s*\([^;{)]*\)\s*\{")
 EACSL_BINARY_MARKERS = (b"__e_acsl_", b"eacsl_assert")
 
 _JOINABLE_SHORT = frozenset({"-I", "-D", "-U", "-L", "-l"})
@@ -144,6 +155,20 @@ def is_eacsl_instrumented(path: Path) -> bool:
     except OSError:
         return False
     return any(marker in data for marker in EACSL_BINARY_MARKERS)
+
+
+def resolve_fuzz_init_source() -> Path:
+    """Locate templates/eacsl_runtime/fuzz_init.c (container or local checkout)."""
+    for base in (Path("/opt/framac-pipeline/templates"), Path(__file__).resolve().parent.parent / "templates"):
+        cand = base / "eacsl_runtime" / "fuzz_init.c"
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError("templates/eacsl_runtime/fuzz_init.c not found")
+
+
+def defines_fuzzer_initialize(c_text: str) -> bool:
+    """True if the (instrumented) slice already defines LLVMFuzzerInitialize, which the init hook also defines."""
+    return bool(_FUZZER_INITIALIZE_DEF_RE.search(c_text))
 
 
 def select_eacsl_binary(out_bin: Path) -> Path:

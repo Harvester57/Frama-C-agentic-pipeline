@@ -14,6 +14,7 @@ WP_TIMEOUT  ?= 15
 SOURCES     ?=
 CPPFLAGS    ?= -I. -I/opt/framac-pipeline/templates/acsl
 FC_STUBS    ?= /opt/framac-pipeline/templates/fc_stubs
+EACSL_FUZZ_INIT ?= /opt/framac-pipeline/templates/eacsl_runtime/fuzz_init.c
 
 # Kernel Flags
 FCFLAGS     += -machdep $(MACHDEP) \
@@ -75,9 +76,13 @@ $(TARGET).wp: $(TARGET).parse
 # -rte-select retry, Variadic fallback objects, sanitizer fallback); this target mirrors
 # its two-stage contract: preprocessor flags go to the Frama-C frontend (-E) only, the
 # self-contained instrumented file is compiled with codegen flags only (-e), and the
-# instrumented executable is <out>.e-acsl. Use attached option forms in CPPFLAGS
-# (-Idir, -DX): e-acsl-gcc splits flag values on spaces and re-parses standalone
-# short options (a bare -g becomes --gmp).
+# instrumented executable is <out>.e-acsl. Stage 1 needs -n (otherwise e-acsl-gcc also links
+# the original main-less harness and fails); fuzz builds use full memory tracking and link
+# $(EACSL_FUZZ_INIT), which initializes the E-ACSL runtime from LLVMFuzzerInitialize.
+# Uninitialized reads are checked (-rte-initialized @all), so harness code must copy the fuzz
+# input into its own buffer before passing it to the target (generated harnesses do). Use
+# attached option forms in CPPFLAGS (-Idir, -DX): e-acsl-gcc splits flag values on spaces and
+# re-parses standalone short options (a bare -g becomes --gmp).
 $(TARGET).eacsl: $(SOURCES)
 	@mkdir -p $@
 	@if echo "$(EACSL_GCC)" | grep -q '\.sh$$'; then \
@@ -92,8 +97,9 @@ $(TARGET).eacsl: $(SOURCES)
 			$(SOURCES); \
 	else \
 		$(EACSL_GCC) \
+			-n \
 			-G clang \
-			-F "-rte -machdep $(MACHDEP) -e-acsl-assert-print-data" \
+			-F "-rte -machdep $(MACHDEP) -e-acsl-assert-print-data -e-acsl-full-mtracking -rte-initialized @all" \
 			-E "-D__FRAMAC_EACSL__ -D_Float128=double -I$(FC_STUBS) -include $(FC_STUBS)/fc_compat_types.h $(CPPFLAGS)" \
 			-o $@/instrumented.c \
 			$(SOURCES) && \
@@ -103,6 +109,7 @@ $(TARGET).eacsl: $(SOURCES)
 			-e "-fsanitize=fuzzer -gline-tables-only -O1 -fcommon" \
 			-l "-fsanitize=fuzzer" \
 			-O $@/fuzz_runner \
+			$(EACSL_FUZZ_INIT) \
 			$@/instrumented.c; \
 	fi
 	@bin=$@/fuzz_runner; [ -f $@/fuzz_runner.e-acsl ] && bin=$@/fuzz_runner.e-acsl; \

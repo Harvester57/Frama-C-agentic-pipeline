@@ -39,6 +39,9 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 2. **Audit Harness Legitimacy:**
    - Read `workspace/harnesses/harness_{module_name}.c`, `workspace/harnesses/harness_{module_name}.json`, and the target entry function's header and implementation in `workspace/work/`.
    - Check whether the failure occurred because the harness violated a non-attacker precondition of the entry function (for example: passing an uninitialized context struct pointer, violating a documented internal API invariant, or faulting inside the harness itself).
+   - An `initialization` failure on memory written outside instrumented code is not a target defect. Two cases:
+     - Target code read libFuzzer's `data` instead of the harness copy `fuzz_buf`: reject it as `harness_induced`.
+     - Source review shows an external-library or `read`/`recv` call initialized the bytes: reject it as `disproved_by_source`.
    - **If harness-induced:** return `decision: "rejected"` with `rejection_class: "harness_induced"` and explain the exact change needed in `harness_{module_name}.c` in `record.reason` so the parent orchestrator can repair the harness and re-fuzz.
 3. **Trace Root Cause in Target Code:**
    - If the harness call is legitimate (`contract_respected: true`) and the fault is in target C code:
@@ -64,7 +67,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 When the meaning of an alarm decides the verdict and neither this brief nor the tool output settles it, grep the greppable Frama-C manuals under `{references_dir}`. Grep `INDEX.md` for the topic and Read only the reported line range; never read a manual whole. Useful sections:
 - RTE manual `rte/frama-c-rte-manual.md`: the condition behind each `rte` alarm kind §2, undefined behaviours RTE does not cover §2.8.
 - Eva manual `eva/frama-c-eva-manual.md`: what Eva checks §3.2, its log messages and statuses §3.3.
-- `e-acsl-quickref.md`, which summarizes the E-ACSL plug-in manual `eacsl/e-acsl-manual.md`. It covers runtime errors inside annotations (§2.3.1) and the known limitations (§3). E-ACSL misses memory-related violations in programs without `main` that are built without `-M` (every fuzz harness, §3.3.1), and violations that depend on undefined functions, recursion or function pointers (§3.3.2–3.6). A failed reproduction attempt therefore does not show the alarm is spurious.
+- `e-acsl-quickref.md`, which summarizes the E-ACSL plug-in manual `eacsl/e-acsl-manual.md`. It covers runtime errors inside annotations (§2.3.1) and the known limitations (§3). E-ACSL misses violations that depend on undefined functions, recursion or function pointers (§3.3.2–3.6), so a failed reproduction attempt does not show the alarm is spurious. Fuzz binaries are built with full memory tracking and a runtime init hook, because harnesses have no `main` (§3.3.1). If a replay crashes inside the E-ACSL runtime (`shadow_alloca`, `e_acsl_segment_tracking.c`), suspect the toolchain rather than the target: rerun `run_eacsl_fuzz.py selftest`.
 
 ---
 

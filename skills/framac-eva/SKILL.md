@@ -34,6 +34,8 @@ $env:PYTHONIOENCODING="utf-8"
 
 A Frama-C failure is reported as `status: "analysis_error"` (exit code 1), never as zero alarms.
 
+`run_eva_slice.py` runs `-rte -then -eva` on purpose. Eva's own alarms would find the same errors, but RTE supplies the full list of obligations, which Eva then marks Valid, Unknown, Invalid or Dead. The ledger's `covered` rule and the Dead (harness-gap) bucket depend on that list. Do not drop `-rte` from this phase, and do not add `-rte-initialized`: Eva already reports uninitialized reads (see `docs/references/README.md`, "Key facts").
+
 ### Tuning Eva Precision When Needed
 If a `Tier 1A` or `Tier 1B` module has an unusually low discharge rate (< 70% Valid) due to loop widening:
 - Re-run `run_eva_slice.py` with higher `--slevel 250` or add `/*@ loop pragma UNROLL 64; */` above bounded fixed-size header loops in `workspace/work/`.

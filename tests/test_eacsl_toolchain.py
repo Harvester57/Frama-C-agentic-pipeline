@@ -118,16 +118,70 @@ def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path
     assert res["returncode"] == 0, res
     stage1, stage2 = fake.calls
     assert "-E" in stage1 and "-e" not in stage1 and "-C" not in stage1
-    assert "-e-acsl-assert-print-data" in stage1[stage1.index("-F") + 1]
+    # -n: instrument only. Without it e-acsl-gcc also links the original main-less harness and fails.
+    assert stage1[1] == "-n"
+    fc_flags = stage1[stage1.index("-F") + 1]
+    assert "-e-acsl-assert-print-data" in fc_flags and "-e-acsl-full-mtracking" in fc_flags
+    assert "-rte-initialized @all" in fc_flags and res["reduced_checks"] == []
     assert "-include stub.h" in stage1[stage1.index("-E") + 1]
     backend = stage2[stage2.index("-e") + 1]
-    assert "-C" in stage2 and "-E" not in stage2
+    assert "-C" in stage2 and "-n" not in stage2 and "-E" not in stage2
     assert "-include" not in backend and "-I" not in backend.split()[0]
     assert " -g " not in f" {backend} " and "-gline-tables-only" in backend
     assert stage2[stage2.index("-l") + 1] == "-fsanitize=fuzzer -lbsd"
+    # The runtime init hook is linked right before the instrumented file.
+    assert stage2[-2].endswith("eacsl_runtime/fuzz_init.c") and res["init_hook"] == stage2[-2]
     assert stage2[-1].endswith("fuzz_mod.instrumented.c")
     assert res["binary"].endswith("fuzz_mod.e-acsl")
     assert res["undeclared_functions"] == []
+
+
+def test_slice_defining_llvmfuzzerinitialize_is_refused(tmp_path, modern_cli):
+    fake = FakeEacslGcc(instrumented_text="int LLVMFuzzerInitialize(int *argc, char ***argv)\n{\n  return 0;\n}\n")
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=fake)
+    assert res["returncode"] == 1 and res["reason"] == "eacsl_init_hook_conflict"
+    assert len(fake.calls) == 1  # stage 2 never runs
+
+
+def test_init_hook_detection_and_source():
+    assert T.defines_fuzzer_initialize("int LLVMFuzzerInitialize(int *argc, char ***argv) {")
+    assert not T.defines_fuzzer_initialize("int LLVMFuzzerInitialize(int *argc, char ***argv);")
+    hook = T.resolve_fuzz_init_source().read_text(encoding="utf-8")
+    assert "int LLVMFuzzerInitialize(int *argc, char ***argv)" in hook
+    assert "__e_acsl_memory_init(argc, argv, sizeof(void *));" in hook
+    assert "void __e_acsl_globals_init(void) __attribute__((weak));" in hook
+
+
+def test_rte_initialized_opt_out_is_recorded(tmp_path, modern_cli):
+    fake = FakeEacslGcc()
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", rte_initialized=False, runner=fake)
+    assert res["returncode"] == 0
+    assert "-rte-initialized" not in fake.calls[0][fake.calls[0].index("-F") + 1]
+    assert res["reduced_checks"] == ["-no-rte-initialized"]
+
+
+def test_campaign_cli_threads_no_rte_initialized(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_compile(*a, **k):
+        seen.update(k)
+        return {"engine": "eacsl", "returncode": 0, "binary": str(tmp_path / "fuzz_mod.e-acsl"),
+                "reduced_checks": ["-no-rte-initialized"]}
+
+    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
+    monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path, "--no-rte-initialized"))
+    R.main()
+    out = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert seen["rte_initialized"] is False and out["reduced_checks"] == ["-no-rte-initialized"]
+    assert "reduced checks: -no-rte-initialized" in ledger.fuzz_engine_note(out)
+
+
+def test_non_fuzzer_build_links_no_init_hook(tmp_path, modern_cli):
+    fake = FakeEacslGcc()
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "prog", fuzzer_flag=False, runner=fake)
+    assert res["returncode"] == 0 and "init_hook" not in res
+    assert not any(a.endswith("fuzz_init.c") for a in fake.calls[-1])
 
 
 def test_uninstrumented_binary_is_refused(tmp_path, modern_cli):
@@ -363,15 +417,42 @@ def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
 def test_selftest_with_fake_toolchain(tmp_path, modern_cli, monkeypatch):
     monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0")
     canary = R.resolve_canary_source()
-    expected = next(i for i, ln in enumerate(canary.read_text(encoding="utf-8").splitlines(), 1) if "CANARY_OOB" in ln)
+    expected = next(i for i, ln in enumerate(canary.read_text(encoding="utf-8").splitlines(), 1) if "/* CANARY_OOB */" in ln)
+    assert "heap[len] = 0;" in canary.read_text(encoding="utf-8").splitlines()[expected - 1]  # the statement, not the header
 
     def fake_replay(binary, artifact, scratch, timeout_s=60):
-        return {"reproduced": True, "failure": {"file": "canary.c", "line": expected, "function": "canary_process"}}
+        data = Path(artifact).read_bytes()
+        if data == R.CANARY_BENIGN_INPUT:
+            return {"reproduced": False, "failure": None}
+        if data == R.CANARY_UNINIT_INPUT:
+            return {"reproduced": True, "failure": {"file": "canary.c", "line": 47, "function": "canary_pick",
+                                                    "alarm_kind": "initialization"}}
+        return {"reproduced": True, "failure": {"file": "canary.c", "line": expected, "function": "canary_process",
+                                                "alarm_kind": "mem_access"}}
 
     res = R.run_selftest(tmp_path / "st", runner=FakeEacslGcc(), replay=fake_replay)
     assert res["ok"] and all(res["checks"].values()) and res["warnings"] == []
+    assert res["compile"]["init_hook"].endswith("fuzz_init.c")
     bad = R.run_selftest(tmp_path / "st2", runner=FakeEacslGcc(instrumented=False), replay=fake_replay)
     assert not bad["ok"] and not bad["checks"]["instrumented_binary"]
+
+    # A binary that fails on every input (uninitialized runtime, false alarms) must not pass.
+    def crash_on_everything(binary, artifact, scratch, timeout_s=60):
+        return {"reproduced": True, "failure": None, "log_tail": "SEGV in shadow_alloca"}
+
+    crashy = R.run_selftest(tmp_path / "st3", runner=FakeEacslGcc(), replay=crash_on_everything)
+    assert crashy["checks"]["detects_overflow"] and not crashy["checks"]["benign_input_clean"]
+    assert not crashy["ok"] and crashy["benign_failure"] == "SEGV in shadow_alloca"
+    assert not crashy["checks"]["detects_uninitialized"]  # a crash is not an initialization report
+
+    # A build without initialization checks misses the canary's uninitialized read.
+    def no_init_checks(binary, artifact, scratch, timeout_s=60):
+        if Path(artifact).read_bytes() in (R.CANARY_BENIGN_INPUT, R.CANARY_UNINIT_INPUT):
+            return {"reproduced": False, "failure": None}
+        return fake_replay(binary, artifact, scratch)
+
+    blind = R.run_selftest(tmp_path / "st4", runner=FakeEacslGcc(), replay=no_init_checks)
+    assert not blind["ok"] and not blind["checks"]["detects_uninitialized"] and blind["checks"]["detects_overflow"]
 
 
 # ---------------------------------------------------------------------------
@@ -410,8 +491,13 @@ def test_canary_exercises_contract():
     text = (REPO / "templates/eacsl_canary/canary.c").read_text(encoding="utf-8")
     assert text.count("CANARY_OOB") >= 2  # documented in the header and placed on the statement
     assert "open(" in text and "u_short" in text and "__int32_t" in text and "/*@ requires" in text
-    assert "int LLVMFuzzerTestOneInput(" in text
+    assert "int LLVMFuzzerTestOneInput(" in text and "LLVMFuzzerInitialize" not in text.split("*/", 1)[1]
+    assert "canary_fill(local," in text  # stack buffer written through a callee on every input
+    assert "memcpy(copy, data, size);" in text and "canary_process(copy, size)" in text  # never reads libFuzzer's data
+    assert "return picked; /* CANARY_UNINIT" in text
     assert R.CANARY_INPUT.startswith(b"FC33") and len(R.CANARY_INPUT) >= 8
+    assert R.CANARY_BENIGN_INPUT[:1] not in (b"O", b"F", b"U") and len(R.CANARY_BENIGN_INPUT) <= 64
+    assert R.CANARY_UNINIT_INPUT.startswith(b"UNIN") and R.CANARY_UNINIT_INPUT[4:5] != b"S"
 
 
 def test_scan_undeclared_functions_formats():
@@ -435,6 +521,11 @@ def test_makefile_eacsl_target_mirrors_two_stage_contract():
     assert "\t\t\t-C \\" in recipe and "fuzz_runner.e-acsl" in recipe and "__e_acsl_" in recipe
     backend = re.search(r'-e "([^"]*)"', recipe).group(1)
     assert "CPPFLAGS" not in backend and "-include" not in backend
+    modern = recipe.split("else", 1)[1]
+    stage1, stage2 = modern.split("&&", 1)
+    assert "\t\t\t-n \\" in stage1 and "-e-acsl-full-mtracking" in stage1 and "-rte-initialized @all" in stage1
+    assert "$(EACSL_FUZZ_INIT) \\\n\t\t\t$@/instrumented.c" in stage2
+    assert "EACSL_FUZZ_INIT ?= /opt/framac-pipeline/templates/eacsl_runtime/fuzz_init.c" in text
 
 
 def test_ledger_fuzz_engine_note():

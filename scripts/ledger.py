@@ -320,6 +320,8 @@ def fuzz_engine_note(report: dict) -> str:
             "Clang ASan+UBSan + LibFuzzer (no E-ACSL contract checks, no intra-object bounds checks"
             f"{suffix})"
         )
+    if report.get("reduced_checks"):
+        return f"E-ACSL + LibFuzzer (reduced checks: {', '.join(report['reduced_checks'])})"
     return "E-ACSL + LibFuzzer"
 
 

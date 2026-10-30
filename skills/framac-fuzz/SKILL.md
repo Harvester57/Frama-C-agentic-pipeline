@@ -2,12 +2,13 @@
 name: framac-fuzz
 description: >-
   Phase 1 of the Frama-C verification pipeline. Runs zero-ACSL dynamic bug
-  hunting per module slice by generating RTE assertions (-rte), compiling them
-  with E-ACSL into runtime shadow-memory and arithmetic checks, and fuzzing the
-  resulting binary with Clang LibFuzzer inside the hardened framac-pipeline
-  container under sandbox_exec.py (rlimits, env allowlist, timeout). Catches intra-struct sub-object
-  overflows, uninitialized reads, signed/unsigned overflows, and Layer 4-6 ACSL
-  security contract violations. Crashes become fingerprinted candidates, not
+  hunting per module slice by generating RTE assertions (-rte -rte-initialized),
+  compiling them with E-ACSL into runtime shadow-memory and arithmetic checks,
+  and fuzzing the resulting binary with Clang LibFuzzer inside the hardened
+  framac-pipeline container under sandbox_exec.py (rlimits, env allowlist,
+  timeout). Catches intra-struct sub-object overflows, use-after-free,
+  uninitialized reads, signed overflows, and Layer 4-6 ACSL security contract
+  violations. Crashes become fingerprinted candidates, not
   findings, until independently verified.
 argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--time <seconds>] [--dict <file>]"
 ---
@@ -18,8 +19,8 @@ Dynamic bug-hunting stage that pairs **Frama-C RTE + E-ACSL** with **Clang LibFu
 
 ## Why This Runs Before Eva and WP
 
-1. **Zero Human ACSL Required:** `--rte=all` automatically injects `\valid`, `\valid_read`, `\initialized`, `signed_overflow`, `division_by_zero`, and shift bounds across every C expression in the slice.
-2. **Sub-Object Precision:** Unlike ASan (which only places redzones between top-level allocations), E-ACSL checks exact array/field sub-object bounds (catching `pkt.header[16]` overflowing into `pkt.is_admin` inside the same struct) and tracks byte-level initialization without full-program MSan rebuilds.
+1. **Zero Human ACSL Required:** `-rte -rte-initialized @all` automatically injects `\valid` / `\valid_read` (`mem_access`), `initialization`, `signed_overflow`, `division_by_zero`, and shift bounds across every C expression in the slice. `--warn-unsigned-downcast` adds unsigned downcasts. Unsigned overflow and signed downcasts are **not** checked while fuzzing: intentional wrap-around (hashes, checksums) and narrowing casts (byte encoders) would stop every campaign on its first input. Eva and WP check those kinds statically.
+2. **Sub-Object Precision:** Unlike ASan (which only places redzones between top-level allocations), E-ACSL checks exact array/field sub-object bounds (catching `pkt.header[16]` overflowing into `pkt.is_admin` inside the same struct). Its per-byte initialization tracking backs the `initialization` checks without full-program MSan rebuilds.
 3. **Coverage-Guided ACSL Exploration:** E-ACSL compiles ACSL predicates into explicit C `if` branches before calling `__e_acsl_assert()`. Clang's `-fsanitize=fuzzer` instruments those generated branches, actively steering mutations toward RTE and security contract boundaries.
 
 ---
@@ -40,7 +41,7 @@ Select all modules with `run_eacsl_fuzz: true` (or the specific `--module <name>
   "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
 ```
 
-`selftest` builds `templates/eacsl_canary/canary.c` through the exact production E-ACSL path and writes `workspace/reports/eacsl_selftest.json`. Its checks are `compiled`, `no_gmp_only`, `instrumented_binary`, `detects_overflow`, and `attributes_line` (the last one is informational). If it fails, `campaign --engine auto` skips E-ACSL for every module with `engine_fallback_reason: eacsl_selftest_failed: ...` instead of failing each compile. Read `checks` and the canary `compile_log` before touching harnesses: a failing canary is a toolchain problem, not a target problem.
+`selftest` builds `templates/eacsl_canary/canary.c` through the exact production E-ACSL path and writes `workspace/reports/eacsl_selftest.json`. Its checks are `compiled`, `no_gmp_only`, `instrumented_binary`, `benign_input_clean`, `detects_overflow`, `detects_uninitialized`, and `attributes_line` (the last one is informational). `benign_input_clean` matters because a replay counts any non-zero exit as a reproduction: a binary that fails on every input (uninitialized runtime, false `\valid` alarms) would otherwise pass `detects_overflow`. If it fails, `campaign --engine auto` skips E-ACSL for every module with `engine_fallback_reason: eacsl_selftest_failed: ...` instead of failing each compile. Read `checks` and the canary `compile_log` before touching harnesses: a failing canary is a toolchain problem, not a target problem.
 
 ---
 
@@ -56,7 +57,9 @@ $env:PYTHONIOENCODING="utf-8"
 ```
 
 `run_eacsl_fuzz.py` supports `--engine {auto,eacsl,sanitizers}` (default `auto` in `campaign` mode):
-- **Two-stage E-ACSL build.** Stage 1 instruments with `e-acsl-gcc -F <frama-c flags> -E <frontend>`: all preprocessor flags (`-I`, `-D`, `-include`), the `fc_stubs` directory first, `fc_compat_types.h` and `-D__FRAMAC_EACSL__`. Stage 2 compiles the self-contained `<out-bin>.instrumented.c` with `e-acsl-gcc -C -e <codegen flags only>`. Never force-include headers into stage 2 (it redefines `timeval`, `fd_set`, ...), so boundary stub headers do not need E-ACSL-specific branches. The full transcript is in `<out-bin>.compile.log`.
+- **Two-stage E-ACSL build.** Stage 1 instruments only (`e-acsl-gcc -n -F <frama-c flags> -E <frontend>`). It receives all preprocessor flags (`-I`, `-D`, `-include`), the `fc_stubs` directory first, `fc_compat_types.h` and `-D__FRAMAC_EACSL__`. Without `-n`, `e-acsl-gcc` also links the original main-less harness and fails. Stage 2 compiles the self-contained `<out-bin>.instrumented.c` with `e-acsl-gcc -C -e <codegen flags only>`.
+- **Runtime initialization.** Harnesses have no `main()`, so the build uses `-e-acsl-full-mtracking` and links `templates/eacsl_runtime/fuzz_init.c`. Its `LLVMFuzzerInitialize` initializes the E-ACSL runtime the way an instrumented `main()` would. Without full tracking, valid writes to a caller's stack buffer fail `\valid`; without the hook, every input crashes in `shadow_alloca`. A harness must therefore not define its own `LLVMFuzzerInitialize` (`reason: eacsl_init_hook_conflict`). Never force-include headers into stage 2 (it redefines `timeval`, `fd_set`, ...), so boundary stub headers do not need E-ACSL-specific branches. The full transcript is in `<out-bin>.compile.log`.
+- **Initialization checks.** Stage 1 adds `-rte-initialized @all`, so every read of a local or pointed-to value must be initialized. libFuzzer writes the input buffer outside instrumented code, so target code must never read `data` directly: generated harnesses copy it into their own buffer (`fuzz_buf`) first. Reads of memory filled by other uninstrumented code, such as external libraries behind `fc_stubs` or `read`/`recv`, can raise false `initialization` alarms. Measured on one harness, the checks roughly halve throughput (3.3k vs 7.5k exec/s). `--no-rte-initialized` (campaign and guardrail) turns them off. That opt-out is recorded in `reduced_checks` and in the ledger's evidence note, and Eva still reports uninitialized reads statically.
 - **Argv contract.** `e-acsl-gcc` splits flag values on spaces and re-parses standalone short options (a bare `-g` becomes `--gmp`). The script joins `-I dir` into `-Idir`, rewrites `-g` to `-gline-tables-only`, and refuses other standalone single-letter tokens or paths containing spaces (`reason: eacsl_argv_unsafe`).
 - **Instrumented binary only.** The fuzzed binary is `<out-bin>.e-acsl`, and it must contain E-ACSL instrumentation (`reason: eacsl_binary_not_instrumented` otherwise). The guardrail refuses uninstrumented binaries instead of reporting a vacuous `passed_dynamic_oracle`.
 - **Function scoping.** `-rte-select` / `-e-acsl-functions` come from the preprocessed slice sources, so functions disabled by `#if` are excluded. Functions Frama-C still reports as unknown are dropped once and listed in `rte_select_dropped`.

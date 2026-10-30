@@ -39,14 +39,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_callgraph_dag import extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
+    EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
     build_eacsl_flag_sets,
     build_fallback_object,
+    defines_fuzzer_initialize,
     is_eacsl_instrumented,
     normalize_passthrough,
     parse_missing_functions,
     parse_undefined_fallbacks,
     preprocess_source,
+    resolve_fuzz_init_source,
     select_eacsl_binary,
 )
 from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
@@ -400,6 +403,7 @@ def compile_eacsl_binary(
     ldflags_extra: str = "",
     variadic_translation: bool = True,
     warn_unsigned_downcast: bool = False,
+    rte_initialized: bool = True,
     runner=subprocess.run,
 ) -> dict:
     """
@@ -407,10 +411,15 @@ def compile_eacsl_binary(
 
     Modern CLI (Frama-C 33+) runs in two explicit stages so preprocessor flags never reach the
     compile of the self-contained instrumented file:
-      1. instrument: `e-acsl-gcc -G clang -F <frama-c flags> -E <frontend> -o <out>.instrumented.c <sources>`
-      2. compile:    `e-acsl-gcc -C -G clang -e <backend> -l <ldflags> -O <out> <out>.instrumented.c`
-    Stage 1 is retried once without functions Frama-C reports as unknown; stage 2 is retried
-    once with a generated link-only object when Variadic `<fn>_fallback_<N>` symbols are undefined.
+      1. instrument: `e-acsl-gcc -n -G clang -F <frama-c flags> -E <frontend> -o <out>.instrumented.c <sources>`
+      2. compile:    `e-acsl-gcc -C -G clang -e <backend> -l <ldflags> -O <out> [fuzz_init.c] <out>.instrumented.c`
+    `-n` matters: without it `e-acsl-gcc` also links the original sources, which fails on a
+    main-less fuzz harness. Fuzz builds use full memory tracking and link
+    templates/eacsl_runtime/fuzz_init.c, whose LLVMFuzzerInitialize initializes the runtime that
+    an instrumented main() would. Uninitialized reads are checked (`-rte-initialized @all`)
+    unless `rte_initialized` is False, which is recorded in `reduced_checks`. Stage 1 is retried
+    once without functions Frama-C reports as unknown; stage 2 is retried once with a generated
+    link-only object when Variadic `<fn>_fallback_<N>` symbols are undefined.
     On success the result's `binary` is the E-ACSL-instrumented executable (`<out>.e-acsl` when
     present) and is guaranteed to contain E-ACSL instrumentation.
     """
@@ -431,6 +440,7 @@ def compile_eacsl_binary(
         "stderr": "",
         "variadic_fallbacks": [],
         "rte_select_dropped": [],
+        "reduced_checks": [] if rte_initialized else ["-no-rte-initialized"],
     }
 
     def _record(cmd: list[str], rc: int, out: str, err: str) -> None:
@@ -485,6 +495,8 @@ def compile_eacsl_binary(
     else:
         def _stage1(fns: list[str]) -> tuple[list[str], int, str, str]:
             fc_flags = ["-rte", f"-machdep {machdep}", *EACSL_FC_EXTRA_FLAGS]
+            if rte_initialized:
+                fc_flags.append(EACSL_RTE_INITIALIZED_FLAG)
             if warn_unsigned_downcast:
                 fc_flags.append("-warn-unsigned-downcast")
             if not variadic_translation:
@@ -493,7 +505,7 @@ def compile_eacsl_binary(
                 fn_csv = ",".join(fns)
                 fc_flags.append(f"-rte-select {fn_csv}")
                 fc_flags.append(f"-e-acsl-functions {fn_csv}")
-            cmd1 = [eacsl_bin, "-G", "clang", "-F", " ".join(fc_flags), "-E", flags["frontend"],
+            cmd1 = [eacsl_bin, "-n", "-G", "clang", "-F", " ".join(fc_flags), "-E", flags["frontend"],
                     "-o", str(instrumented_c), *sources]
             return (cmd1, *_run_tool(cmd1, runner))
 
@@ -508,10 +520,23 @@ def compile_eacsl_binary(
         if rc != 0:
             return _finish(rc, "eacsl_instrumentation_failed")
 
+        init_hook: list[str] = []
+        if fuzzer_flag:
+            instrumented_text = instrumented_c.read_text(encoding="utf-8", errors="replace") if instrumented_c.is_file() else ""
+            if defines_fuzzer_initialize(instrumented_text):
+                log_parts.append(
+                    "The slice defines LLVMFuzzerInitialize, which the E-ACSL runtime init hook "
+                    "(templates/eacsl_runtime/fuzz_init.c) also defines; remove it from the harness.\n"
+                )
+                return _finish(1, "eacsl_init_hook_conflict")
+            init_hook = [resolve_fuzz_init_source().as_posix()]
+            result["init_hook"] = init_hook[0]
+
         def _stage2(link: str) -> tuple[list[str], int, str, str]:
             cmd2 = [eacsl_bin, "-C", "-G", "clang", "-e", flags["backend"], "-O", str(out_bin)]
             if link:
                 cmd2.extend(["-l", link])
+            cmd2.extend(init_hook)
             cmd2.append(str(instrumented_c))
             return (cmd2, *_run_tool(cmd2, runner))
 
@@ -855,6 +880,10 @@ def run_guardrail_check(binary: Path, corpus_dir: Path, scratch_dir: Path, runs:
 
 
 CANARY_INPUT = b"FC33" + b"P" * 12
+# Reaches neither the open() branch nor the overflow; must run clean (no false alarm, no runtime crash).
+CANARY_BENIGN_INPUT = b"BENIGN" + b"P" * 10
+# Reaches canary_pick with data[4] != 'S': an uninitialized read that -rte-initialized must report.
+CANARY_UNINIT_INPUT = b"UNINX" + b"P" * 11
 DEFAULT_SELFTEST_JSON = Path("workspace/reports/eacsl_selftest.json")
 
 
@@ -880,13 +909,16 @@ def run_selftest(
 ) -> dict:
     """
     Build the canary through the production E-ACSL path and check the toolchain contract:
-    compile succeeds, gmp-only mode was not triggered, the binary is instrumented, and the
-    known overflow input is detected (and, ideally, attributed to the CANARY_OOB line).
+    compile succeeds, gmp-only mode was not triggered, the binary is instrumented, a benign
+    input runs clean, the known overflow input is detected (and, ideally, attributed to the
+    CANARY_OOB line), and the known uninitialized read is reported as `initialization`. The
+    benign run matters because replay counts any non-zero exit as reproduced: a binary that
+    crashes on every input would otherwise pass.
     """
     replay = replay or replay_artifact
     src = resolve_canary_source()
     expected_line = next(
-        (i for i, line in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1) if "CANARY_OOB" in line), 0
+        (i for i, line in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1) if "/* CANARY_OOB */" in line), 0
     )
     work_dir.mkdir(parents=True, exist_ok=True)
     comp = compile_eacsl_binary(
@@ -899,18 +931,33 @@ def run_selftest(
         "compiled": comp["returncode"] == 0,
         "no_gmp_only": "-e-acsl-gmp-only" not in log_text,
         "instrumented_binary": comp["returncode"] == 0 and is_eacsl_instrumented(Path(comp["binary"])),
+        "benign_input_clean": False,
         "detects_overflow": False,
+        "detects_uninitialized": False,
         "attributes_line": False,
     }
     failure = None
+    benign_failure = None
+    uninit_failure: dict = {}
     if checks["instrumented_binary"]:
+        benign = work_dir / "canary_benign.bin"
+        benign.write_bytes(CANARY_BENIGN_INPUT)
+        benign_rep = replay(Path(comp["binary"]), benign, work_dir / "scratch")
+        checks["benign_input_clean"] = not benign_rep.get("reproduced")
+        benign_failure = None if checks["benign_input_clean"] else (benign_rep.get("failure") or benign_rep.get("log_tail"))
         inp = work_dir / "canary_input.bin"
         inp.write_bytes(CANARY_INPUT)
         rep = replay(Path(comp["binary"]), inp, work_dir / "scratch")
         failure = rep.get("failure")
         checks["detects_overflow"] = bool(rep.get("reproduced"))
         checks["attributes_line"] = bool(failure) and int(failure.get("line") or 0) == expected_line
-    ok = all(checks[k] for k in ("compiled", "no_gmp_only", "instrumented_binary", "detects_overflow"))
+        uninit = work_dir / "canary_uninit.bin"
+        uninit.write_bytes(CANARY_UNINIT_INPUT)
+        uninit_rep = replay(Path(comp["binary"]), uninit, work_dir / "scratch")
+        uninit_failure = uninit_rep.get("failure") or {}
+        checks["detects_uninitialized"] = bool(uninit_rep.get("reproduced")) and uninit_failure.get("alarm_kind") == "initialization"
+    required = ("compiled", "no_gmp_only", "instrumented_binary", "benign_input_clean", "detects_overflow", "detects_uninitialized")
+    ok = all(checks[k] for k in required)
     return {
         "mode": "selftest",
         "ok": ok,
@@ -922,7 +969,9 @@ def run_selftest(
         "variadic_fallbacks": comp.get("variadic_fallbacks", []),
         "expected_line": expected_line,
         "failure": failure,
-        "compile": {k: comp.get(k) for k in ("returncode", "reason", "compile_log", "binary", "frontend_flags", "backend_flags")},
+        "benign_failure": benign_failure,
+        "uninitialized_failure": uninit_failure or None,
+        "compile": {k: comp.get(k) for k in ("returncode", "reason", "compile_log", "binary", "frontend_flags", "backend_flags", "init_hook", "reduced_checks")},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -971,6 +1020,8 @@ def main() -> int:
                         help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)")
     p_camp.add_argument("--warn-unsigned-downcast", action="store_true",
                         help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
+    p_camp.add_argument("--no-rte-initialized", action="store_true",
+                        help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks")
     p_camp.add_argument("--jobs", type=int, default=1, help="LibFuzzer -jobs=<N> (default: 1)")
     p_camp.add_argument("--workers", type=int, default=1, help="LibFuzzer -workers=<N> (default: 1)")
     p_camp.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON,
@@ -993,6 +1044,8 @@ def main() -> int:
     p_guard.add_argument("--no-variadic-translation", action="store_true")
     p_guard.add_argument("--warn-unsigned-downcast", action="store_true",
                          help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
+    p_guard.add_argument("--no-rte-initialized", action="store_true",
+                         help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks")
     p_guard.add_argument("--out-json", type=Path, required=True)
 
     p_self = sub.add_parser("selftest", help="Verify the E-ACSL toolchain contract on the bundled canary")
@@ -1020,13 +1073,14 @@ def main() -> int:
                 ldflags_extra=args.ldflags,
                 variadic_translation=not args.no_variadic_translation,
                 warn_unsigned_downcast=args.warn_unsigned_downcast,
+                rte_initialized=not args.no_rte_initialized,
             )
             if comp["returncode"] != 0:
                 res = {"mode": "guardrail", "status": "compile_error", "reason": comp.get("reason"), "compile": comp}
             else:
                 scratch = args.scratch_dir or args.out_bin.parent / f"{args.out_bin.name}_guard_scratch"
                 guard = run_guardrail_check(Path(comp["binary"]), args.corpus_dir, scratch, args.extra_runs)
-                res = {"mode": "guardrail", "compile": comp, **guard}
+                res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
     except SandboxUnavailable as exc:
         res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
 
@@ -1058,6 +1112,7 @@ def _run_campaign_mode(args) -> dict:
                 ldflags_extra=args.ldflags,
                 variadic_translation=not args.no_variadic_translation,
                 warn_unsigned_downcast=args.warn_unsigned_downcast,
+                rte_initialized=not args.no_rte_initialized,
             )
             if comp["returncode"] != 0 and args.engine == "auto":
                 eacsl_attempt = comp
@@ -1091,6 +1146,8 @@ def _run_campaign_mode(args) -> dict:
             workers=args.workers,
         )
         res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
+        if engine_used == "eacsl" and comp.get("reduced_checks"):
+            res["reduced_checks"] = comp["reduced_checks"]
     if fallback_reason:
         res["engine_fallback_reason"] = fallback_reason
     if eacsl_attempt is not None:

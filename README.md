@@ -9,7 +9,7 @@ All verification tools execute exclusively inside a reproducible **`framac-pipel
 ## Key Capabilities
 
 1. **Zero-ACSL Dynamic Triage (`RTE + E-ACSL + LibFuzzer`):**
-   Automatically injects ACSL runtime-error assertions (`-rte`) and compiles them into shadow-memory and arithmetic runtime checks (`e-acsl-gcc.sh --rte=all -fsanitize=fuzzer`). Catches intra-struct sub-object buffer overflows, uninitialized memory reads, signed/unsigned integer overflows, and functional contract violations before a single minute is spent on formal proofs.
+   Automatically injects ACSL runtime-error assertions (`-rte`) and compiles them with E-ACSL into shadow-memory and arithmetic runtime checks, linked with LibFuzzer (`e-acsl-gcc`, `-fsanitize=fuzzer`). Catches intra-struct sub-object buffer overflows, use-after-free, uninitialized reads (`-rte-initialized`), signed integer overflow, division by zero, invalid shifts, and functional contract violations before a single minute is spent on formal proofs. Unsigned downcasts are opt-in (`--warn-unsigned-downcast`). Unsigned overflow and signed downcasts are left to Eva and WP, because intentional wrap-around would stop every fuzz campaign.
 2. **Module-Level Abstract Interpretation (`Eva`):**
    Simulates all symbolic inputs (`0 .. MAX_INPUT_SIZE`) from per-module `eva_main()` harnesses to automatically discharge **80–90% of RTE assertions** without writing loop invariants.
 3. **Wavefront Parallel Subagent WP Swarm (`/framac-wp`):**
@@ -63,6 +63,9 @@ frama-c/
 ├── templates/
 │   ├── GNUmakefile.template                  # Frama-C Makefile template (.parse, .eva, .wp, .eacsl, .sarif)
 │   ├── harness_dual.c.template               # Dual-use Eva + LibFuzzer C harness template
+│   ├── eacsl_runtime/fuzz_init.c             # LLVMFuzzerInitialize hook that initializes the E-ACSL runtime (linked into fuzz builds)
+│   ├── eacsl_canary/canary.c                 # E-ACSL toolchain canary for `run_eacsl_fuzz.py selftest`
+│   ├── fc_stubs/                             # Bodyless ACSL-annotated prototypes for host/library headers
 │   └── acsl/
 │       ├── external_stubs.h                  # ACSL boundary stubs for crypto, network, and OS calls
 │       ├── layer4_auth_state_machine.acsl    # Ghost state machine contracts for authentication gates

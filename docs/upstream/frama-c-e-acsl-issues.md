@@ -98,8 +98,13 @@ e-acsl-gcc -G clang -e "-O1" -o t.instrumented.c -O t t.c && ls -l t t.e-acsl
 nm t | grep -c __e_acsl_ ; nm t.e-acsl | grep -c __e_acsl_   # 0 vs > 0
 ```
 
-**Workaround.** We instrument in one call (`-o instrumented.c`), compile with `-C` in a second
+**Workaround.** We instrument in one call (`-n -o instrumented.c`), compile with `-C` in a second
 call, select `<out>.e-acsl` when it exists, and refuse any executable that has no E-ACSL symbols.
+
+**Note (2026-10-30).** Skipping the plain build already exists: `-n` ("do not compile instrumented
+code", E-ACSL manual §2.2.1). Drop improvement 1's second half before reporting. `-n` is also
+required for main-less libFuzzer harnesses: without it, the plain link fails on
+`undefined reference to 'main'`, and `e-acsl-gcc` exits 1 even though instrumentation succeeded.
 
 ---
 
@@ -225,7 +230,7 @@ we drop the names and retry once.
 | # | Kind | Severity for users | Our workaround |
 |---|---|---|---|
 | 1 | Bug (option parsing) | High: silent semantic change | Argv normalization (`-gline-tables-only`) |
-| 2 | Usability / documentation | High: silently fuzzing an uninstrumented binary | Two-stage build, `.e-acsl` selection, instrumentation check |
+| 2 | Usability / documentation | High: silently fuzzing an uninstrumented binary | Two-stage build (`-n`, then `-C`), `.e-acsl` selection, instrumentation check |
 | 3 | Bug (host-header mode) | High: link failure for any variadic call | Generated link-only forwarding object |
 | 4 | Limitation | Medium: forces host-header mode | None (host-header mode only) |
 | 5 | Bug (codegen) | Medium | Complete opaque types in stubs |

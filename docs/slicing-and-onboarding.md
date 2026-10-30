@@ -29,7 +29,7 @@ Not every module in a 90,000 LoC repository has the same code structure or threa
 - **Code Characteristics:** Recursive descent, dynamic heap allocation (`malloc`, `realloc`, `free`), doubly-linked DOM node trees, or third-party C libraries (`libxml2`, `expat`).
 - **Why Deductive WP Should Not Be Used on DOM Trees:** Proving pointer separation (`\separated`) across arbitrary recursive heap graphs in SMT logic requires complex inductive separation predicates that do not scale.
 - **Verification Strategy:**
-  1. **Phase 1 (`/framac-fuzz`):** Compile the XML module with `e-acsl-gcc.sh --rte=all -fsanitize=fuzzer` and fuzz with an XML dictionary (`-dict=xml.dict`). E-ACSL's shadow memory tracks every `malloc`/`free`, sub-struct array bound, and `\initialized` byte at runtime with zero ACSL annotations.
+  1. **Phase 1 (`/framac-fuzz`):** Build the XML module with `run_eacsl_fuzz.py campaign` (RTE + E-ACSL + `-fsanitize=fuzzer`) and fuzz with an XML dictionary (`-dict=xml.dict`). E-ACSL's shadow memory tracks every `malloc`/`free`, sub-struct array bound and initialized byte at runtime with zero ACSL annotations. Uninitialized reads are checked through `-rte-initialized`.
   2. **Boundary Decoupling for WP:** Once the XML parser populates a flat C configuration struct (`struct app_config`), run `/framac-wp` and `/framac-eva` on `config_validate(const struct app_config *cfg)` so all downstream modules enjoy mathematically proven configuration bounds!
 
 ### Tier 3: Internal Glue, IPC & State Machines (Remaining ~70k LoC)

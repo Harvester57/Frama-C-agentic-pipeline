@@ -44,6 +44,9 @@ int eva_main(void) {
 
 /*
  * LibFuzzer Entry Point (Compiled via e-acsl-gcc or clang -fsanitize=fuzzer)
+ * Do not define LLVMFuzzerInitialize here: E-ACSL builds link
+ * templates/eacsl_runtime/fuzz_init.c, which defines it to initialize the
+ * E-ACSL runtime (run_eacsl_fuzz.py refuses with eacsl_init_hook_conflict).
  */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (data == NULL || size > MAX_INPUT_SIZE) {
@@ -54,6 +57,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
      * Allocate an exact-sized heap buffer so E-ACSL / ASan shadow memory tracks
      * exact validity [0 .. size - 1]. For size == 0, pass a non-NULL pointer
      * one byte past a 1-byte allocation so any dereference faults immediately.
+     * The copy also matters for E-ACSL's initialization checks
+     * (-rte-initialized): libFuzzer writes `data` outside instrumented code,
+     * so target code must only ever read fuzz_buf, never `data`.
      */
     uint8_t *alloc_ptr = (uint8_t *)malloc(size > 0 ? size : 1U);
     if (alloc_ptr == NULL) {

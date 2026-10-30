@@ -44,7 +44,7 @@ Under that precondition, `frama-c -wp` will report `100% Valid` on every goal in
 Every single iteration of the Function Prover Subagent (`prover_brief.md`) and Interface Architect Subagent (`header_architect_brief.md`) must pass **two orthogonal oracles** in sequence:
 
 1. **Oracle 1 — The Dynamic E-ACSL Oracle (`run_eacsl_fuzz.py guardrail`):**
-   Compiles the newly proposed ACSL annotations (`requires`, `ensures`, `loop invariant`, `assert`) into executable C checks via `e-acsl-gcc.sh` and replays the module's valid fuzzer corpus (plus 100–200 additional mutations).
+   Compiles the newly proposed ACSL annotations (`requires`, `ensures`, `loop invariant`, `assert`) into executable C checks via `e-acsl-gcc` (the same build as Phase 1 fuzzing: instrument with `-n`, full memory tracking, runtime init hook) and replays the module's valid fuzzer corpus (plus 100–200 additional mutations).
    - If *any* real input violates the proposed `requires` or `loop invariant`, the annotation is **immediately rejected as `rejected_overconstrained`**, and the exact failing variable values from the runtime stack trace are fed back to the subagent.
 2. **Oracle 2 — The Static Deductive Oracle (`run_wp_function.py`):**
    Only after a contract holds on 100% of real dynamic executions is it passed to `frama-c -wp -wp-rte -wp-fct <fn>` to prove that it holds mathematically across *all* possible inputs.
