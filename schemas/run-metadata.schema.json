@@ -23,7 +23,7 @@
     "sandbox": {
       "type": "object",
       "properties": {
-        "outer": {"type": "string", "enum": ["docker-hardened", "unknown"]},
+        "outer": {"type": "string", "enum": ["docker-hardened", "podman-hardened", "unknown"]},
         "inner": {"type": "string", "enum": ["rlimits", "bubblewrap", "degraded", "unknown"]}
       },
       "required": ["outer", "inner"],
@@ -31,6 +31,29 @@
     },
     "prior_runs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "toolchain": {"type": "object"},
+    "resources": {
+      "$comment": "Optional. Compact summary of `resources.py probe --scope container` at init: what the init container itself measured (its lease), plus under `pool` the node pool the host broker measured.",
+      "type": "object",
+      "properties": {
+        "cpus": {"type": "integer", "minimum": 1},
+        "mem_mb": {"type": "integer", "minimum": 1},
+        "sources": {"type": "object"},
+        "binding": {"type": "object"},
+        "reserve": {"type": "object"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "pool": {
+          "type": "object",
+          "properties": {
+            "cpus": {"type": "integer", "minimum": 1},
+            "mem_mb": {"type": "integer", "minimum": 1},
+            "source": {"type": "string"}
+          },
+          "required": ["cpus", "mem_mb"]
+        }
+      },
+      "required": ["cpus", "mem_mb", "sources", "warnings"]
+    },
+    "run_dir_host": {"$comment": "Optional. Host path of the run directory (FRAMAC_RUN_HOST).", "type": ["string", "null"]},
     "run_status": {"type": "string", "enum": ["in_progress", "complete", "incomplete"]},
     "incomplete_reason": {"type": ["string", "null"]},
     "created_at": {"type": "string", "minLength": 1},

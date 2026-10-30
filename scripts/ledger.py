@@ -9,24 +9,27 @@ Subcommands (run with the run directory as working directory):
   ingest-wp                <workspace/reports/wp/*.json ...>
   ingest-agent-hypothesis  <agent_result.json> [--module MOD]
   ingest-verifier          <verifier_result.json> [--replay-report <fuzz.json> ...] [--harness-meta <harness_mod.json>]
-  transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT]
+  transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT] [--expect STATUS ...]
   summary
 
 Units are function x obligation class (docs/v2-design.md, Section 5). Every write
 is validated against schemas/ before it is committed atomically; an invalid
-result is never written.
+result is never written. Every read-modify-write holds the run-wide `ledger` lock
+(framac_common.run_lock), so concurrent containers of one run never lose updates.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import hashlib
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, TypeVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -34,10 +37,12 @@ from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
+    RunLockTimeout,
     atomic_write_json,
     load_agent_result_json,
     load_json_optional,
     load_json_strict,
+    run_lock,
     utc_now,
 )
 from promote_artifact import PromotionError, promote_file, promote_seeds  # noqa: E402
@@ -61,6 +66,20 @@ NO_TOUCH = {"deferred", "out_of_scope", "not_applicable"}
 
 class LedgerError(RuntimeError):
     pass
+
+
+_F = TypeVar("_F", bound=Callable)
+
+
+def ledger_locked(fn: _F) -> _F:
+    """Run a read-modify-write ledger command under the run-wide `ledger` lock."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with run_lock("ledger"):
+            return fn(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 
 def unit_id(file: str, function: str, cls: str) -> str:
@@ -251,6 +270,7 @@ def units_for_function(units: Dict[str, dict], file: str, function: str) -> List
 
 # --------------------------------------------------------------------- seed
 
+@ledger_locked
 def cmd_seed(dag_path: Path, scope: List[str], callgraph_source: str) -> dict:
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
@@ -325,6 +345,7 @@ def fuzz_engine_note(report: dict) -> str:
     return "E-ACSL + LibFuzzer"
 
 
+@ledger_locked
 def cmd_ingest_fuzz(paths: List[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "candidates": 0}
@@ -344,12 +365,14 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
                     f"{engine_note} campaign found no failure (not a proof).",
                 )
             continue
-        if status in ("compile_error", "fuzzer_error", "sandbox_unavailable"):
+        if status in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run"):
+            summary = (
+                f"Fuzz campaign was never run ({report.get('reason') or 'no report produced'})."
+                if status == "not_run"
+                else f"Fuzz campaign did not run to completion ({status})."
+            )
             for u in mod_units:
-                add_evidence(
-                    u, "fuzz", "run_eacsl_fuzz.py", f"fuzz_{status}", False, tool_output,
-                    f"Fuzz campaign did not run to completion ({status}).",
-                )
+                add_evidence(u, "fuzz", "run_eacsl_fuzz.py", f"fuzz_{status}", False, tool_output, summary)
             continue
 
         for art in report.get("artifacts", []):
@@ -398,6 +421,22 @@ def cmd_ingest_fuzz(paths: List[Path]) -> dict:
     return stats
 
 
+@ledger_locked
+def _alarm_in_file(alarm: dict, unit_file: str) -> bool:
+    """
+    Whether an Eva report row lies in `unit_file`. The report keeps the CSV's `directory` and
+    bare `file` columns apart: joined and normalized they give the repository-relative path. A
+    row without a directory can only be matched by base name.
+    """
+    name = (alarm.get("file") or "").replace("\\", "/")
+    if not name:
+        return True
+    directory = (alarm.get("directory") or "").replace("\\", "/").rstrip("/")
+    path = normalize_file(f"{directory}/{name}" if directory and directory != "." and not name.startswith("/") else name)
+    target = normalize_file(unit_file)
+    return path == target if "/" in path else path == target.rsplit("/", 1)[-1]
+
+
 def cmd_ingest_eva(paths: List[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "candidates": 0}
@@ -429,10 +468,12 @@ def cmd_ingest_eva(paths: List[Path]) -> dict:
         for u in rte_units:
             fn = u["function"]
             for alarm in invalid_by_fn.get(fn, []):
-                fp = make_fingerprint(alarm.get("file") or u["file"], fn, alarm.get("kind", ""), alarm.get("annotation", ""))
+                if not _alarm_in_file(alarm, u["file"]):
+                    continue  # a same-named function in another file
+                fp = make_fingerprint(u["file"], fn, alarm.get("kind", ""), alarm.get("annotation", ""))
                 upsert_candidate(
                     candidates, fp, "eva", "needs_validation", module,
-                    {"file": normalize_file(alarm.get("file") or u["file"]), "line": int(alarm.get("line") or 0), "function": fn},
+                    {"file": normalize_file(u["file"]), "line": int(alarm.get("line") or 0), "function": fn},
                     {"kind": alarm.get("kind") or "assertion", "predicate": alarm.get("annotation", "")},
                     [], tool_output, [u["coverage_id"]],
                     "Eva Invalid status without a concrete witness input",
@@ -479,6 +520,7 @@ def cmd_ingest_eva(paths: List[Path]) -> dict:
     return stats
 
 
+@ledger_locked
 def cmd_ingest_wp(paths: List[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "blocked": 0}
@@ -495,6 +537,17 @@ def cmd_ingest_wp(paths: List[Path]) -> dict:
                 add_evidence(
                     u, "wp", "run_wp_function.py", "wp_acsl_syntax_error", False, tool_output,
                     "ACSL kernel check failed; WP did not run.",
+                )
+            continue
+        if report["status"] == "analysis_error":
+            # Frama-C was killed or crashed (OOM, wall-clock limit): no goal was decided, so the
+            # unit status is left to the scheduler (retry once, then blocked).
+            reason = str(report.get("reason") or "unknown")
+            for u in targets:
+                add_evidence(
+                    u, "wp", "run_wp_function.py", "wp_analysis_error", False, tool_output,
+                    f"WP did not complete ({reason}); no goal was credited.",
+                    details={"reason": reason},
                 )
             continue
         if report["status"] in ("wp_aborted", "unsound_proof"):
@@ -606,6 +659,7 @@ def _infer_module_for_function(units: Dict[str, dict], file: str, function: str)
     return "unknown"
 
 
+@ledger_locked
 def cmd_ingest_agent_hypothesis(result_path: Path, module: Optional[str] = None) -> dict:
     """
     Promote breaker seeds (if any), record prover strengthening_requests into
@@ -726,6 +780,7 @@ def _merge_finding_record(existing: dict, incoming: dict) -> None:
                     existing[key].append(item)
 
 
+@ledger_locked
 def cmd_ingest_verifier(
     result_path: Path,
     replay_reports: Optional[List[Path]] = None,
@@ -894,11 +949,25 @@ def cmd_ingest_verifier(
 
 # ---------------------------------------------------------------- transition
 
-def cmd_transition(cid: str, status: str, agent_id: Optional[str], reason: Optional[str]) -> dict:
+@ledger_locked
+def cmd_transition(
+    cid: str,
+    status: str,
+    agent_id: Optional[str],
+    reason: Optional[str],
+    expected: Optional[List[str]] = None,
+) -> dict:
+    """
+    Move one unit to `status`. With `expected`, this is a compare-and-set: the transition is
+    refused unless the unit is currently in one of those statuses (a scheduler preparing a
+    prover must never overwrite a unit that an ingest just marked `candidate`).
+    """
     units, candidates = load_state()
     if cid not in units:
         raise LedgerError(f"unknown coverage id {cid}")
     u = units[cid]
+    if expected and u["status"] not in expected:
+        raise LedgerError(f"{cid} is {u['status']!r}, expected one of {sorted(expected)}; transition to {status!r} refused")
     if status in ("in_progress",):
         if not agent_id:
             raise LedgerError("in_progress requires --agent-id")
@@ -923,6 +992,7 @@ def cmd_transition(cid: str, status: str, agent_id: Optional[str], reason: Optio
     return u
 
 
+@ledger_locked
 def cmd_close_remaining(reason: str) -> dict:
     """
     Close all remaining 'planned' or 'in_progress' units at the end of a bounded campaign:
@@ -1016,6 +1086,14 @@ def cmd_scaffold_verifier(
         except ArtifactError:
             pass
 
+    # The module's own build, as the fuzz report names it (`<out-bin>.e-acsl` for E-ACSL builds).
+    try:
+        fuzz_report = load_json_optional(Path("workspace/reports/fuzz") / f"{module}.json", {})
+    except ArtifactError:
+        fuzz_report = {}
+    compile_info = fuzz_report.get("compile") if isinstance(fuzz_report, dict) else None
+    binary = (compile_info or {}).get("binary") if isinstance(compile_info, dict) else None
+    binary = binary or f"workspace/harnesses/fuzz_{module}.e-acsl"
     reproducers: List[dict] = []
     for rep_rel in cand.get("reproducers") or []:
         rep_path = Path(rep_rel)
@@ -1029,7 +1107,8 @@ def cmd_scaffold_verifier(
             "input": rep_rel,
             "sha256": sha,
             "size_bytes": sz,
-            "command": f"workspace/harnesses/fuzz_{module} -runs=1 {rep_rel}",
+            "command": (f"python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module} "
+                        f"--inputs {rep_rel} --binary {binary}"),
             "observed_result": f"{p_kind}: {p_pred}",
         })
 
@@ -1211,6 +1290,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--agent-id", default=None)
     p.add_argument("--reason", default=None)
+    p.add_argument(
+        "--expect",
+        action="append",
+        default=[],
+        help="Compare-and-set: refuse unless the unit's current status is one of these (repeatable)",
+    )
     p_close = sub.add_parser("close-remaining")
     p_close.add_argument("--reason", required=True, help="Reason for closing remaining planned/in_progress units")
     p_scaf = sub.add_parser("scaffold-verifier")
@@ -1239,7 +1324,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.cmd == "ingest-verifier":
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
         elif args.cmd == "transition":
-            out = cmd_transition(args.id, args.status, args.agent_id, args.reason)
+            out = cmd_transition(args.id, args.status, args.agent_id, args.reason, args.expect or None)
         elif args.cmd == "close-remaining":
             out = cmd_close_remaining(args.reason)
         elif args.cmd == "scaffold-verifier":
@@ -1255,7 +1340,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         else:
             out = cmd_summary()
-    except (LedgerError, PromotionError, ArtifactError) as exc:
+    except (LedgerError, PromotionError, ArtifactError, RunLockTimeout) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         return 1
     print(json.dumps(out, indent=2))

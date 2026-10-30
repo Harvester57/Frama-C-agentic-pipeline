@@ -10,19 +10,27 @@ Guarantees:
 3. Only ACSL-only changes within the subagent's assigned function/header scope
    are spliced into workspace/work/, and the parent re-verifies the merged tree
    (rolling back automatically on failure) before committing.
-4. `apply-in-place` is a host-side step run after the final report.
+4. Writes to workspace/work/ hold the run-wide `merge` lock and are journaled in
+   state/merge-journal.json, so a merge killed between splice and rollback is undone
+   by the next merge or prepare call instead of leaving unverified ACSL behind.
+5. A merge batch re-checks its overlays in parallel within the job budget (one guardrail
+   per module, one WP run per prover) and converges to the largest passing subset.
+6. `apply-in-place` is a host-side step run after the final report.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -38,11 +46,16 @@ from acsl_ast import (  # noqa: E402
 )
 from framac_common import (  # noqa: E402
     ArtifactError,
+    atomic_write_json,
     is_safe_agent_id,
     is_safe_relative_path,
     load_agent_result_json,
     load_json_optional,
+    load_json_strict,
+    run_lock,
+    utc_now,
 )
+from resources import job_budget  # noqa: E402
 
 
 SOURCE_EXTS = {".c", ".h", ".acsl", ".i"}
@@ -55,6 +68,56 @@ _WORK_PREFIX_RE = re.compile(
 
 class StaleBaselineError(RuntimeError):
     """The target changed after the overlay baseline was captured."""
+
+
+def _journal_path(run_dir: Path) -> Path:
+    return run_dir / "state" / "merge-journal.json"
+
+
+def _write_merge_journal(run_dir: Path, owner: str, backups: Dict[str, bytes]) -> None:
+    atomic_write_json(_journal_path(run_dir), {
+        "owner": owner,
+        "created_at": utc_now(),
+        "files": {rel: base64.b64encode(raw).decode("ascii") for rel, raw in sorted(backups.items())},
+    })
+
+
+def _clear_merge_journal(run_dir: Path) -> None:
+    try:
+        _journal_path(run_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def recover_merge_journal(run_dir: Path, overlay_dir: Optional[Path] = None) -> Optional[dict]:
+    """
+    Restore workspace/work/ files that a killed merge left spliced but unverified. Call it
+    while holding the `merge` lock: a journal present then can only belong to a dead merge.
+    """
+    run_dir = Path(run_dir).resolve()
+    path = _journal_path(run_dir)
+    if not path.is_file():
+        return None
+    data = load_json_strict(path)
+    shared_work = (overlay_dir or (run_dir / "workspace")).resolve() / "work"
+    restored: List[str] = []
+    for rel_str, encoded in (data.get("files") or {}).items():
+        if not is_safe_relative_path(rel_str):
+            continue
+        (shared_work / rel_str).write_bytes(base64.b64decode(encoded))
+        restored.append(rel_str)
+    _clear_merge_journal(run_dir)
+    return {"recovered_from": data.get("owner"), "restored_files": restored}
+
+
+def _parent_wp_report_rel(agent_id: str, function: str) -> str:
+    return f"agents/{agent_id}/scratch/parent_wp/{function}.json"
+
+
+def _function_files(run_dir: Path, function: str) -> set[str]:
+    """Distinct source files that define a function of this name (static functions can collide)."""
+    units = load_json_optional(run_dir / "coverage-ledger.json", [])
+    return {_normalize_work_relpath(u.get("file") or "") for u in units if u.get("function") == function}
 
 
 class OverlayMergeError(RuntimeError):
@@ -148,6 +211,28 @@ def init_overlay(target_dir: Path, overlay_dir: Path, force: bool = False) -> di
     return meta
 
 
+def _copy_tree(src: Path, dest: Path) -> None:
+    """
+    Copy a directory tree to a new `dest`: `cp -a --reflink=auto` on POSIX (copy-on-write
+    clones where the filesystem supports them, a plain copy elsewhere), else shutil.copytree.
+    Always independent copies, never symlinks or hardlinks.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix" and shutil.which("cp"):
+        try:
+            proc = subprocess.run(
+                ["cp", "-a", "--reflink=auto", str(src), str(dest)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if proc.returncode == 0 and dest.is_dir():
+                return
+        except OSError:
+            pass
+        if dest.exists():
+            shutil.rmtree(dest)  # a partial copy (e.g. a cp without --reflink)
+    shutil.copytree(src, dest)
+
+
 def init_agent_overlay(run_dir: Path, agent_id: str, overlay_dir: Optional[Path] = None) -> dict:
     """Create an isolated per-agent scratch copy of workspace/work/ under agents/<agent-id>/scratch/."""
     if not is_safe_agent_id(agent_id):
@@ -166,7 +251,7 @@ def init_agent_overlay(run_dir: Path, agent_id: str, overlay_dir: Optional[Path]
     for dest in (scratch_work, scratch_base):
         if dest.exists():
             shutil.rmtree(dest)
-        shutil.copytree(shared_work, dest)
+        _copy_tree(shared_work, dest)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     _rewrite_compile_commands(scratch_work / "compile_commands.json", shared_work, scratch_work)
@@ -311,15 +396,23 @@ def _run_parent_reverify(
     sources: Optional[List[str]],
     cppflags: str,
     ldflags: str = "",
+    wp_par: Optional[int] = None,
 ) -> Tuple[bool, str]:
-    """Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree."""
+    """
+    Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
+    caps the WP run's concurrent provers when several re-checks share the job budget (default:
+    `auto`, the whole budget). The guardrail binary is built outside the agent's scratch, at a
+    path fixed per module build, so an unchanged module is restored from the build cache.
+    """
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
 
     if module and sources:
         harness = overlay_dir / "harnesses" / f"harness_{module}.c"
         corpus = overlay_dir / "corpus" / module
-        guard_bin = run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}"
+        build_tag = hashlib.sha256(json.dumps([list(sources), cppflags, ldflags]).encode("utf-8")).hexdigest()[:10]
+        safe_module = re.sub(r"[^A-Za-z0-9_.-]+", "_", module)
+        guard_bin = run_dir / "state" / "parent_guard" / f"{safe_module}-{build_tag}" / f"guard_{safe_module}"
         guard_scratch = run_dir / "agents" / agent_id / "scratch" / "parent_guard"
         guard_json = run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
         work_sources = [_resolve_overlay_source(run_dir, work_dir, s) for s in sources]
@@ -339,14 +432,16 @@ def _run_parent_reverify(
             str(corpus),
             "--extra-runs",
             "50",
-            "--cppflags",
-            cppflags,
+            # `--opt=value`: argparse rejects a separate value that starts with '-' (e.g. `-I.`).
+            f"--cppflags={cppflags}",
+            "--module",
+            module,
             "--out-json",
             str(guard_json),
         ]
         if ldflags:
-            cmd.extend(["--ldflags", ldflags])
-        proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True)
+            cmd.append(f"--ldflags={ldflags}")
+        proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if proc.returncode != 0 or not guard_json.is_file():
             return False, f"parent guardrail failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
         report = json.loads(guard_json.read_text(encoding="utf-8"))
@@ -356,7 +451,11 @@ def _run_parent_reverify(
     if role == "prover" and c_file and function:
         norm_c = _normalize_work_relpath(c_file)
         wp_out_dir = run_dir / "agents" / agent_id / "scratch" / "parent_wp"
-        wp_json = overlay_dir / "reports" / "wp" / f"{function}.json"
+        # Written per agent: same-named static functions re-checked in parallel must never
+        # read each other's report. Published under reports/wp/ only after success.
+        wp_json = run_dir / _parent_wp_report_rel(agent_id, function)
+        if wp_json.exists():
+            wp_json.unlink()
         cmd = [
             sys.executable,
             str(scripts_dir / "run_wp_function.py"),
@@ -366,17 +465,23 @@ def _run_parent_reverify(
             function,
             "--out-dir",
             str(wp_out_dir),
-            "--cppflags",
-            cppflags,
+            f"--cppflags={cppflags}",
+            "--wp-par",
+            str(wp_par) if wp_par else "auto",
+            "--sarif",
             "--out-json",
             str(wp_json),
         ]
-        proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True)
+        proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if proc.returncode != 0 or not wp_json.is_file():
             return False, f"parent WP check failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
         wp_report = json.loads(wp_json.read_text(encoding="utf-8"))
         if wp_report.get("status") != "all_proven":
             return False, f"parent WP check on merged tree returned status={wp_report.get('status')!r}"
+        if len(_function_files(run_dir, function) - {norm_c}) == 0:
+            canonical = overlay_dir / "reports" / "wp" / f"{function}.json"
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(wp_json, canonical)
 
     return True, "verified"
 
@@ -395,13 +500,43 @@ def merge_agent_overlay(
     ldflags: str = "",
     skip_reverify: bool = False,
     verify_hook: Optional[Callable[[], Tuple[bool, str]]] = None,
+    journal: bool = True,
 ) -> dict:
     """
     Validate an agent's scratch overlay (ACSL-only + role/function scope), structurally
     splice its annotations into workspace/work/, deduplicate shared ACSL declarations across
     headers, re-verify on the merged tree (rolling back on failure), and write the resulting
-    unified diff into agents/<id>/artifacts/.
+    unified diff into agents/<id>/artifacts/. Holds the `merge` lock; with `journal`, the
+    pre-splice contents are journaled so a killed merge is rolled back by the next caller.
     """
+    run_dir = Path(run_dir).resolve()
+    with run_lock("merge", run_dir):
+        recovered = recover_merge_journal(run_dir, overlay_dir) if journal else None
+        res = _merge_agent_overlay_locked(
+            run_dir, agent_id, role, overlay_dir, c_file, function, header_file, module, sources,
+            cppflags, ldflags, skip_reverify, verify_hook, journal,
+        )
+        if recovered:
+            res["recovered_journal"] = recovered
+        return res
+
+
+def _merge_agent_overlay_locked(
+    run_dir: Path,
+    agent_id: str,
+    role: str,
+    overlay_dir: Optional[Path],
+    c_file: Optional[str],
+    function: Optional[str],
+    header_file: Optional[str],
+    module: Optional[str],
+    sources: Optional[List[str]],
+    cppflags: str,
+    ldflags: str,
+    skip_reverify: bool,
+    verify_hook: Optional[Callable[[], Tuple[bool, str]]],
+    journal: bool,
+) -> dict:
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid agent_id: {agent_id!r}")
     if role not in ("prover", "architect"):
@@ -505,46 +640,59 @@ def merge_agent_overlay(
             raise AcslError(f"Merged ACSL-only check failed on {rel_str}:\n  " + "\n  ".join(merged_errs))
         new_contents[rel_str] = spliced
 
-    # Write spliced contents to workspace/work/
-    for rel_str, text in new_contents.items():
-        (shared_work / rel_str).write_text(text, encoding="utf-8")
-
     patch_stem = function if role == "prover" and function else Path(norm_header_file or "header").stem
     patch_path = artifacts_dir / f"{patch_stem}.patch"
 
-    # Parent-side re-verification on the merged workspace/work/ tree
-    if not skip_reverify:
-        if verify_hook is not None:
-            ok, reason = verify_hook()
-        else:
-            ok, reason = _run_parent_reverify(
-                run_dir,
-                agent_id,
-                role,
-                overlay,
-                norm_c_file,
-                function,
-                module,
-                sources,
-                cppflags,
-                ldflags=ldflags,
-            )
-        if not ok:
-            for rel_str, raw in backups.items():
-                (shared_work / rel_str).write_bytes(raw)
-            if patch_path.is_file():
-                try:
-                    patch_path.unlink()
-                except OSError:
-                    pass
-            return {
-                "ok": False,
-                "rolled_back": True,
-                "agent_id": agent_id,
-                "modified_files": changed_rels,
-                "deduplicated_declarations": deduplicated_declarations,
-                "reason": reason,
-            }
+    if journal:
+        _write_merge_journal(run_dir, f"merge-agent:{agent_id}", backups)
+    try:
+        # Write spliced contents to workspace/work/
+        for rel_str, text in new_contents.items():
+            (shared_work / rel_str).write_text(text, encoding="utf-8")
+
+        # Parent-side re-verification on the merged workspace/work/ tree
+        if not skip_reverify:
+            if verify_hook is not None:
+                ok, reason = verify_hook()
+            else:
+                ok, reason = _run_parent_reverify(
+                    run_dir,
+                    agent_id,
+                    role,
+                    overlay,
+                    norm_c_file,
+                    function,
+                    module,
+                    sources,
+                    cppflags,
+                    ldflags=ldflags,
+                )
+            if not ok:
+                for rel_str, raw in backups.items():
+                    (shared_work / rel_str).write_bytes(raw)
+                if journal:
+                    _clear_merge_journal(run_dir)
+                if patch_path.is_file():
+                    try:
+                        patch_path.unlink()
+                    except OSError:
+                        pass
+                return {
+                    "ok": False,
+                    "rolled_back": True,
+                    "agent_id": agent_id,
+                    "modified_files": changed_rels,
+                    "deduplicated_declarations": deduplicated_declarations,
+                    "reason": reason,
+                }
+    except BaseException:
+        for rel_str, raw in backups.items():
+            (shared_work / rel_str).write_bytes(raw)
+        if journal:
+            _clear_merge_journal(run_dir)
+        raise
+    if journal:
+        _clear_merge_journal(run_dir)
 
     # Export unified diff of the agent's change to agents/<agent-id>/artifacts/
     diff_chunks: List[str] = []
@@ -564,7 +712,7 @@ def merge_agent_overlay(
 
     patch_path.write_text("\n".join(diff_chunks), encoding="utf-8")
 
-    return {
+    result = {
         "ok": True,
         "rolled_back": False,
         "agent_id": agent_id,
@@ -572,6 +720,10 @@ def merge_agent_overlay(
         "deduplicated_declarations": deduplicated_declarations,
         "patch_artifact": patch_path.relative_to(run_dir).as_posix(),
     }
+    if role == "prover" and function and not skip_reverify and verify_hook is None:
+        # The report to ingest: written for this agent only, so same-named functions never collide.
+        result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
+    return result
 
 
 def _enrich_batch_entry(
@@ -614,13 +766,18 @@ def _enrich_batch_entry(
                 c_file = cs[0]
 
     if not module and function:
+        # Match by file and function: static functions in different files can share a name.
         ledger_units = load_json_optional(run_dir / "coverage-ledger.json", [])
-        for u in ledger_units:
-            if u.get("function") == function:
-                module = u.get("module")
-                if not c_file:
-                    c_file = u.get("file")
-                break
+        norm_c = _normalize_work_relpath(c_file) if c_file else None
+        matches = [
+            u for u in ledger_units
+            if u.get("function") == function
+            and (norm_c is None or _normalize_work_relpath(u.get("file") or "") == norm_c)
+        ]
+        if len({_normalize_work_relpath(u.get("file") or "") for u in matches}) == 1:
+            module = matches[0].get("module")
+            if not c_file:
+                c_file = matches[0].get("file")
 
     hmeta: dict = {}
     if module:
@@ -643,6 +800,18 @@ def _enrich_batch_entry(
     }
 
 
+def _batch_touched_files(run_dir: Path, entries: List[dict]) -> List[str]:
+    touched: set[str] = set()
+    for e in entries:
+        aid = e.get("agent_id") or ""
+        if not is_safe_agent_id(aid):
+            continue
+        scratch = run_dir / "agents" / aid / "scratch"
+        if (scratch / "base").is_dir() and (scratch / "work").is_dir():
+            touched.update(_collect_changed_files(scratch / "base", scratch / "work"))
+    return sorted(touched)
+
+
 def merge_agent_batch(
     run_dir: Path,
     entries: List[dict],
@@ -657,10 +826,162 @@ def merge_agent_batch(
 ) -> dict:
     """
     Merge a batch of architect or prover overlays onto `workspace/work/`, deduplicating
-    shared ACSL declarations across headers and running a single E-ACSL guardrail per
-    unique module (plus WP per prover). If the combined guardrail/WP fails, automatically
-    bisects by rolling back and testing each overlay individually so good overlays succeed.
+    shared ACSL declarations across headers and re-checking the combined tree in parallel
+    within the job budget: one E-ACSL guardrail per unique module build and one WP run per
+    prover. Overlays whose checks fail are rejected, the pre-batch snapshot is restored and
+    the passing subset re-spliced and re-verified until a round passes (`bisected`); overlays
+    of a module whose shared guardrail failed are then retried one by one on the result.
+    Holds the `merge` lock and journals the pre-batch contents of every touched file.
     """
+    run_dir = Path(run_dir).resolve()
+    with run_lock("merge", run_dir):
+        recovered = recover_merge_journal(run_dir, overlay_dir)
+        shared_work = (overlay_dir or (run_dir / "workspace")).resolve() / "work"
+        journal_backups = {
+            rel: (shared_work / rel).read_bytes()
+            for rel in _batch_touched_files(run_dir, entries)
+            if (shared_work / rel).is_file()
+        }
+        owner = "merge-batch:" + ",".join(str(e.get("agent_id")) for e in entries)
+        _write_merge_journal(run_dir, owner, journal_backups)
+        try:
+            res = _merge_agent_batch_locked(
+                run_dir, entries, overlay_dir, cppflags, ldflags, skip_reverify, verify_hook,
+                default_role, default_module, default_sources,
+            )
+        except BaseException:
+            for rel_str, raw in journal_backups.items():
+                (shared_work / rel_str).write_bytes(raw)
+            _clear_merge_journal(run_dir)
+            raise
+        _clear_merge_journal(run_dir)
+        if recovered:
+            res["recovered_journal"] = recovered
+        return res
+
+
+def _splice_batch(run_dir: Path, overlay: Path, items: list[dict]) -> tuple[list[tuple[dict, dict]], list[dict]]:
+    """Splice each item onto workspace/work/ without verification; (spliced (item, result), failures)."""
+    spliced: list[tuple[dict, dict]] = []
+    failures: list[dict] = []
+    for item in items:
+        try:
+            res = merge_agent_overlay(
+                run_dir=run_dir,
+                agent_id=item["agent_id"],
+                role=item["role"] or "",
+                overlay_dir=overlay,
+                c_file=item["c_file"],
+                function=item["function"],
+                header_file=item["header_file"],
+                module=item["module"],
+                sources=item["sources"],
+                cppflags=item["cppflags"],
+                ldflags=item["ldflags"],
+                skip_reverify=True,
+                journal=False,
+            )
+            spliced.append((item, res))
+        except (OverlayMergeError, AcslError, ScopeViolationError, ArtifactError) as exc:
+            failures.append({
+                "ok": False,
+                "rolled_back": True,
+                "agent_id": item.get("agent_id"),
+                "reason": str(exc),
+            })
+    return spliced, failures
+
+
+def _verify_batch_round(
+    run_dir: Path,
+    overlay: Path,
+    items: list[dict],
+    verify_hook: Callable[[dict], tuple[bool, str]] | None,
+) -> list[tuple[list[int], str]]:
+    """
+    Re-check the spliced tree: one guardrail per unique module build and one WP run per prover,
+    run in parallel with workers = min(checks, CPUs) and `-wp-par` = CPUs // workers each.
+    Returns the failed checks as (indices of the implicated items, reason).
+    """
+    if verify_hook is not None:
+        failures: list[tuple[list[int], str]] = []
+        for i, item in enumerate(items):
+            ok, reason = verify_hook(item)
+            if not ok:
+                failures.append(([i], reason))
+        return failures
+
+    checks: list[tuple[list[int], dict]] = []
+    modules: dict[tuple[str, tuple[str, ...], str, str], list[int]] = {}
+    for i, item in enumerate(items):
+        if item.get("module") and item.get("sources"):
+            mod_key = (item["module"], tuple(item["sources"]), item["cppflags"], item["ldflags"])
+            modules.setdefault(mod_key, []).append(i)
+    for (mod, srcs, cpp, ld), idxs in modules.items():
+        checks.append((idxs, {
+            "agent_id": items[idxs[0]]["agent_id"], "role": "architect", "c_file": None, "function": None,
+            "module": mod, "sources": list(srcs), "cppflags": cpp, "ldflags": ld,
+        }))
+    for i, item in enumerate(items):
+        if item["role"] == "prover" and item.get("c_file") and item.get("function"):
+            checks.append(([i], {
+                "agent_id": item["agent_id"], "role": "prover", "c_file": item["c_file"],
+                "function": item["function"], "module": None, "sources": None,
+                "cppflags": item["cppflags"], "ldflags": item["ldflags"],
+            }))
+    if not checks:
+        return []
+
+    cpus = max(1, job_budget().cpus)
+    workers = max(1, min(len(checks), cpus))
+    wp_par = max(1, cpus // workers)
+
+    def _check(kwargs: dict) -> tuple[bool, str]:
+        return _run_parent_reverify(run_dir=run_dir, overlay_dir=overlay, wp_par=wp_par, **kwargs)
+
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="parent-recheck")
+    try:
+        futures = [pool.submit(_check, kwargs) for _, kwargs in checks]
+        outcomes = [f.result() for f in futures]
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    return [(idxs, reason) for (idxs, _), (ok, reason) in zip(checks, outcomes, strict=True) if not ok]
+
+
+def _rejected_result(item: dict, splice_res: dict, reason: str) -> dict:
+    return {
+        "ok": False,
+        "rolled_back": True,
+        "agent_id": item["agent_id"],
+        "modified_files": splice_res.get("modified_files", []),
+        "deduplicated_declarations": splice_res.get("deduplicated_declarations", []),
+        "reason": reason,
+    }
+
+
+def _drop_patch(run_dir: Path, splice_res: dict) -> None:
+    rel = splice_res.get("patch_artifact")
+    if rel:
+        try:
+            (run_dir / rel).unlink()
+        except OSError:
+            pass
+
+
+def _merge_agent_batch_locked(
+    run_dir: Path,
+    entries: list[dict],
+    overlay_dir: Path | None,
+    cppflags: str | None,
+    ldflags: str,
+    skip_reverify: bool,
+    verify_hook: Callable[[dict], tuple[bool, str]] | None,
+    default_role: str | None,
+    default_module: str | None,
+    default_sources: list[str] | None,
+) -> dict:
     run_dir = run_dir.resolve()
     overlay = (overlay_dir or (run_dir / "workspace")).resolve()
     shared_work = overlay / "work"
@@ -681,45 +1002,28 @@ def merge_agent_batch(
         for e in entries
     ]
 
-    # Snapshot all files in shared_work prior to batch splicing
-    batch_backups: Dict[str, bytes] = {}
-    for root, _, files in os.walk(shared_work):
-        for fname in files:
-            p = Path(root) / fname
-            if p.suffix.lower() in SOURCE_EXTS:
-                batch_backups[p.relative_to(shared_work).as_posix()] = p.read_bytes()
+    # Snapshot every file a splice may touch, before any splicing
+    batch_backups: dict[str, bytes] = {
+        rel: (shared_work / rel).read_bytes()
+        for rel in _batch_touched_files(run_dir, entries)
+        if (shared_work / rel).is_file()
+    }
 
-    spliced_entries: List[Tuple[dict, dict]] = []
-    failed_results: List[dict] = []
-    all_deduped: List[str] = []
+    def _restore_snapshot() -> None:
+        for rel_str, raw in batch_backups.items():
+            path = shared_work / rel_str
+            if not path.is_file() or path.read_bytes() != raw:
+                path.write_bytes(raw)
 
-    for item in enriched:
-        try:
-            res = merge_agent_overlay(
-                run_dir=run_dir,
-                agent_id=item["agent_id"],
-                role=item["role"] or "",
-                overlay_dir=overlay,
-                c_file=item["c_file"],
-                function=item["function"],
-                header_file=item["header_file"],
-                module=item["module"],
-                sources=item["sources"],
-                cppflags=item["cppflags"],
-                ldflags=item["ldflags"],
-                skip_reverify=True,
-            )
-            for d in res.get("deduplicated_declarations", []):
-                if d not in all_deduped:
-                    all_deduped.append(d)
-            spliced_entries.append((item, res))
-        except (OverlayMergeError, AcslError, ScopeViolationError, ArtifactError) as exc:
-            failed_results.append({
-                "ok": False,
-                "rolled_back": True,
-                "agent_id": item.get("agent_id"),
-                "reason": str(exc),
-            })
+    spliced_entries, failed_results = _splice_batch(run_dir, overlay, enriched)
+
+    def _dedup_union(results: list[dict]) -> list[str]:
+        names: list[str] = []
+        for r in results:
+            for d in r.get("deduplicated_declarations", []):
+                if d not in names:
+                    names.append(d)
+        return names
 
     if skip_reverify or not spliced_entries:
         merged_results = [r for _, r in spliced_entries]
@@ -729,82 +1033,53 @@ def merge_agent_batch(
             "bisected": False,
             "merged": merged_results,
             "failed": failed_results,
-            "deduplicated_declarations": all_deduped,
+            "deduplicated_declarations": _dedup_union(merged_results),
         }
 
-    # Run 1 guardrail per unique module and 1 WP check per prover on the combined work tree
-    batch_ok = True
+    # Verify the combined tree. Failed checks reject the overlays they implicate; the snapshot is
+    # restored, the rest re-spliced and re-verified, until a round passes (a fixpoint: dropping a
+    # callee's contract can break a caller's proof). Every failing round removes at least one
+    # overlay, so this ends within len(spliced_entries) + 1 rounds.
+    active = spliced_entries
+    deferred: list[tuple[dict, str]] = []
+    bisected = False
     batch_fail_reason = ""
-    checked_modules: set[Tuple[str, Tuple[str, ...], str, str]] = set()
+    rounds = 0
+    while active:
+        rounds += 1
+        failures = _verify_batch_round(run_dir, overlay, [item for item, _ in active], verify_hook)
+        if not failures:
+            break
+        bisected = True
+        batch_fail_reason = batch_fail_reason or failures[0][1]
+        hard: dict[int, str] = {}
+        ambiguous: dict[int, str] = {}
+        for idxs, reason in failures:
+            for i in idxs:
+                (hard if len(idxs) == 1 else ambiguous).setdefault(i, reason)
+        for i in hard:
+            ambiguous.pop(i, None)
+        for i, reason in hard.items():
+            item, res = active[i]
+            failed_results.append(_rejected_result(item, res, reason))
+            _drop_patch(run_dir, res)
+        for i, reason in ambiguous.items():
+            # A module guardrail failed with several overlays of that module in the batch: none can
+            # be blamed yet, so each is retried alone on top of the converged tree.
+            deferred.append((active[i][0], reason))
+            _drop_patch(run_dir, active[i][1])
+        remaining = [item for i, (item, _) in enumerate(active) if i not in hard and i not in ambiguous]
+        _restore_snapshot()
+        active, splice_failures = _splice_batch(run_dir, overlay, remaining)
+        failed_results.extend(splice_failures)
 
-    for item, _ in spliced_entries:
-        if verify_hook is not None:
-            ok, reason = verify_hook(item)
-            if not ok:
-                batch_ok = False
-                batch_fail_reason = reason
-                break
-            continue
+    merged_results: list[dict] = []
+    for item, r in active:
+        if verify_hook is None and item["role"] == "prover" and item.get("function"):
+            r["parent_wp_report"] = _parent_wp_report_rel(item["agent_id"], item["function"])
+        merged_results.append(r)
 
-        mod = item.get("module")
-        srcs = item.get("sources")
-        if mod and srcs:
-            mod_key = (mod, tuple(srcs), item["cppflags"], item["ldflags"])
-            if mod_key not in checked_modules:
-                checked_modules.add(mod_key)
-                ok, reason = _run_parent_reverify(
-                    run_dir=run_dir,
-                    agent_id=item["agent_id"],
-                    role="architect",
-                    overlay_dir=overlay,
-                    c_file=None,
-                    function=None,
-                    module=mod,
-                    sources=srcs,
-                    cppflags=item["cppflags"],
-                    ldflags=item["ldflags"],
-                )
-                if not ok:
-                    batch_ok = False
-                    batch_fail_reason = reason
-                    break
-
-        if item["role"] == "prover" and item.get("c_file") and item.get("function"):
-            ok, reason = _run_parent_reverify(
-                run_dir=run_dir,
-                agent_id=item["agent_id"],
-                role="prover",
-                overlay_dir=overlay,
-                c_file=item["c_file"],
-                function=item["function"],
-                module=None,
-                sources=None,
-                cppflags=item["cppflags"],
-                ldflags=item["ldflags"],
-            )
-            if not ok:
-                batch_ok = False
-                batch_fail_reason = reason
-                break
-
-    if batch_ok:
-        merged_results = [r for _, r in spliced_entries]
-        return {
-            "ok": len(failed_results) == 0,
-            "batch_verified": True,
-            "bisected": False,
-            "merged": merged_results,
-            "failed": failed_results,
-            "deduplicated_declarations": all_deduped,
-        }
-
-    # Automatic Bisection / Isolation Fallback: restore pre-batch snapshot and test each spliced agent individually
-    for rel_str, raw in batch_backups.items():
-        (shared_work / rel_str).write_bytes(raw)
-
-    merged_results = []
-    all_deduped = []
-    for item, _ in spliced_entries:
+    for item, batch_reason in deferred:
         indiv_hook = (lambda it=item: verify_hook(it)) if verify_hook is not None else None
         res = merge_agent_overlay(
             run_dir=run_dir,
@@ -820,24 +1095,31 @@ def merge_agent_batch(
             ldflags=item["ldflags"],
             skip_reverify=False,
             verify_hook=indiv_hook,
+            journal=False,
         )
         if res["ok"]:
-            for d in res.get("deduplicated_declarations", []):
-                if d not in all_deduped:
-                    all_deduped.append(d)
             merged_results.append(res)
         else:
+            res["batch_failure_reason"] = batch_reason
             failed_results.append(res)
 
-    return {
+    result = {
         "ok": len(failed_results) == 0,
         "batch_verified": True,
-        "bisected": True,
-        "batch_failure_reason": batch_fail_reason,
+        "bisected": bisected,
+        "rounds": rounds,
         "merged": merged_results,
         "failed": failed_results,
-        "deduplicated_declarations": all_deduped,
+        "deduplicated_declarations": _dedup_union(merged_results),
     }
+    if bisected:
+        result["batch_failure_reason"] = batch_fail_reason
+    return result
+
+
+def _brief_path(value: str) -> str:
+    """Briefs embed paths inside double quotes; a quote in the value would break the command."""
+    return str(value).replace('"', "")
 
 
 def _resolve_brief_template(role: str) -> str:
@@ -869,11 +1151,18 @@ def prepare_agent(
     candidate_fp: Optional[str] = None,
     cppflags: Optional[str] = None,
     ldflags: Optional[str] = None,
+    wp_report: Optional[str] = None,
+    requests: Optional[List[dict]] = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
     file (`agents/<agent-id>/brief.md`) from `callgraph_dag.json`, `coverage-ledger.json`,
     `workspace/harnesses/harness_<mod>.json`, and `workspace/reports/eva/<mod>.json`.
+
+    `wp_report` names the WP report whose unproven goals the brief lists (a breaker gets the
+    stalled prover's report); the default is `workspace/reports/wp/<function>.json`.
+    `requests` are strengthening requests a negotiating callee prover must answer; they are
+    appended to its brief.
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -886,7 +1175,12 @@ def prepare_agent(
 
     overlay_info: dict = {}
     if role in ("architect", "prover"):
-        overlay_info = init_agent_overlay(run_dir, agent_id, overlay)
+        # Snapshot workspace/work/ under the merge lock: never mid-merge, never half-merged.
+        with run_lock("merge", run_dir):
+            recovered = recover_merge_journal(run_dir, overlay)
+            overlay_info = init_agent_overlay(run_dir, agent_id, overlay)
+        if recovered:
+            overlay_info["recovered_journal"] = recovered
     else:
         (agent_root / "scratch").mkdir(parents=True, exist_ok=True)
         (agent_root / "artifacts").mkdir(parents=True, exist_ok=True)
@@ -902,17 +1196,24 @@ def prepare_agent(
     norm_c_file = _normalize_work_relpath(c_file) if c_file else None
     norm_header = _normalize_work_relpath(header_file) if header_file else None
 
-    if function and function in dag_fns:
-        fn_meta = dag_fns[function]
-        if not norm_c_file and fn_meta.get("file"):
-            norm_c_file = _normalize_work_relpath(fn_meta["file"])
-        if not module and fn_meta.get("module"):
-            module = fn_meta["module"]
+    # The DAG keys functions by bare name: when c_file names another definition (a same-named
+    # static elsewhere), the DAG entry describes that other function, not this one.
+    fn_meta: dict = dag_fns.get(function, {}) if function and isinstance(dag_fns.get(function), dict) else {}
+    if norm_c_file and fn_meta.get("file") and _normalize_work_relpath(fn_meta["file"]) != norm_c_file:
+        fn_meta = {}
+    if not norm_c_file and fn_meta.get("file"):
+        norm_c_file = _normalize_work_relpath(fn_meta["file"])
+    if not module and fn_meta.get("module"):
+        module = fn_meta["module"]
 
-    fn_units = [u for u in ledger_units if function and u.get("function") == function]
+    def _same_file(unit: dict) -> bool:
+        return not norm_c_file or _normalize_work_relpath(unit.get("file") or "") == norm_c_file
+
+    fn_units = [u for u in ledger_units if function and u.get("function") == function and _same_file(u)]
     if fn_units:
         if not norm_c_file and fn_units[0].get("file"):
             norm_c_file = _normalize_work_relpath(fn_units[0]["file"])
+            fn_units = [u for u in fn_units if _same_file(u)]
         if not module and fn_units[0].get("module"):
             module = fn_units[0]["module"]
 
@@ -969,22 +1270,29 @@ def prepare_agent(
     eff_ldflags = ldflags if ldflags is not None else (hmeta.get("ldflags") or "")
 
     eva_report = load_json_optional(overlay / "reports" / "eva" / f"{module}.json", {}) if module else {}
-    wp_report = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {}) if function else {}
+    wp_report_rel: Optional[str] = None
+    wp_data: dict = {}
+    if wp_report:
+        wp_report_path = Path(wp_report) if Path(wp_report).is_absolute() else run_dir / wp_report
+        wp_data = load_json_optional(wp_report_path, {})
+        wp_report_rel = wp_report.replace("\\", "/")
+    elif function:
+        wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
 
     unknown_obligations = []
     if isinstance(eva_report, dict) and function:
         unknown_obligations = eva_report.get("unknown_obligations_by_function", {}).get(function, [])
 
-    unproven_goals = wp_report.get("unproven_goals", []) if isinstance(wp_report, dict) else []
+    unproven_goals = wp_data.get("unproven_goals", []) if isinstance(wp_data, dict) else []
     if not unproven_goals and unknown_obligations:
         unproven_goals = unknown_obligations
 
     sec_props = []
     wave_index = 0
     untrusted_entries = []
-    if function and function in dag_fns:
-        sec_props = dag_fns[function].get("security_properties", [])
-        wave_index = dag_fns[function].get("wave", 0)
+    if fn_meta:
+        sec_props = fn_meta.get("security_properties", [])
+        wave_index = fn_meta.get("wave", 0)
     elif module:
         for fn_name, fmeta in dag_fns.items():
             if fmeta.get("module") == module:
@@ -1029,12 +1337,33 @@ def prepare_agent(
         "{candidate_fingerprint}": candidate_fp or "",
         "{candidate_short}": cand_short,
         "{candidate_json}": json.dumps(cand_obj),
-        "{target_dir}": str(run_meta.get("target_dir") or "/target"),
-        "{run_dir}": str(run_dir),
+        # Host paths: agents invoke the host-side wrapper, which needs host paths, never the
+        # container's /target and /framac-run. The wrapper passes them as environment.
+        "{target_dir}": _brief_path(os.environ.get("FRAMAC_TARGET_HOST") or run_meta.get("target") or "/target"),
+        "{run_dir}": _brief_path(os.environ.get("FRAMAC_RUN_HOST") or run_meta.get("run_dir_host") or str(run_dir)),
     }
     rendered = tpl
     for k, v in replacements.items():
         rendered = rendered.replace(k, v)
+    # Appended after substitution: request and report contents are data, never placeholders.
+    if wp_report_rel:
+        rendered += (
+            "\n## Stalled Prover's WP Report\n\n"
+            f"The unproven goals above come from `{wp_report_rel}`. Read it for each goal's exact "
+            "property name, line and prover verdicts.\n"
+        )
+    if requests:
+        fn_label = function or "the callee"
+        rendered += (
+            "\n## Contract Negotiation Requests\n\n"
+            f"Callers asked you to strengthen `{fn_label}`'s contract. Add each `needed_clause` below to "
+            f"`{fn_label}`'s contract, then prove `{fn_label}` against the strengthened contract with both "
+            "oracles. Return `all_proven` only when every requested clause is in place and proven: the "
+            "parent then merges it and requeues the callers. If a clause does not hold, leave it out, "
+            "return `stalled_after_k_retries` or `blocked`, and say in `unproven_goals` which clause "
+            "fails and why. Never weaken an existing clause to make a requested one provable.\n\n"
+            "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
+        )
 
     brief_path = agent_root / "brief.md"
     brief_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1042,12 +1371,13 @@ def prepare_agent(
 
     merge_cmd: Optional[str] = None
     src_args = f" --sources {' '.join(merge_sources_list)}" if merge_sources_list else ""
-    ld_args = f" --ldflags '{eff_ldflags}'" if eff_ldflags else ""
+    # `--opt='value'`: argparse rejects a separate value that starts with '-' (e.g. `-I.`, `-lbsd`).
+    ld_args = f" --ldflags='{eff_ldflags}'" if eff_ldflags else ""
     if role == "architect":
         merge_cmd = (
             f"python3 /opt/framac-pipeline/scripts/workspace_overlay.py merge-agent "
             f"--agent-id {agent_id} --role architect --header {norm_header or '<header>'} "
-            f"--module {module or '<mod>'}{src_args} --cppflags '{eff_cppflags}'{ld_args}"
+            f"--module {module or '<mod>'}{src_args} --cppflags='{eff_cppflags}'{ld_args}"
         )
     elif role == "prover":
         hdr_arg = f" --header {norm_header}" if norm_header else ""
@@ -1055,7 +1385,7 @@ def prepare_agent(
             f"python3 /opt/framac-pipeline/scripts/workspace_overlay.py merge-agent "
             f"--agent-id {agent_id} --role prover --file {norm_c_file or '<file>'} "
             f"--function {function or '<fn>'}{hdr_arg} "
-            f"--module {module or '<mod>'}{src_args} --cppflags '{eff_cppflags}'{ld_args}"
+            f"--module {module or '<mod>'}{src_args} --cppflags='{eff_cppflags}'{ld_args}"
         )
 
     return {
@@ -1182,6 +1512,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_prep.add_argument("--candidate-fp", default=None)
     p_prep.add_argument("--cppflags", default=None)
     p_prep.add_argument("--ldflags", default=None)
+    p_prep.add_argument("--wp-report", default=None, help="WP report whose unproven goals the brief lists (run-relative)")
+    p_prep.add_argument("--request-id", action="append", default=[], help="Strengthening request the callee prover must answer (repeatable)")
 
     p_check = sub.add_parser("check-acsl-only")
     p_check.add_argument("--overlay", type=Path, default=Path("workspace"))
@@ -1229,6 +1561,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.cmd == "init-agent":
             res = init_agent_overlay(args.run_dir, args.agent_id, args.overlay)
         elif args.cmd == "prepare-agent":
+            requests = None
+            if args.request_id:
+                req_file = (args.overlay or args.run_dir / "workspace") / "reports" / "strengthen_requests.json"
+                req_data = load_json_optional(req_file, {})
+                known = {r.get("id"): r for r in (req_data.get("requests") or []) if isinstance(r, dict)} if isinstance(req_data, dict) else {}
+                missing = [rid for rid in args.request_id if rid not in known]
+                if missing:
+                    raise ArtifactError(f"unknown strengthening request(s) in {req_file}: {', '.join(missing)}")
+                requests = [known[rid] for rid in args.request_id]
             res = prepare_agent(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -1242,6 +1583,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 candidate_fp=args.candidate_fp,
                 cppflags=args.cppflags,
                 ldflags=args.ldflags,
+                wp_report=args.wp_report,
+                requests=requests,
             )
         elif args.cmd == "check-acsl-only":
             res = check_acsl_only(args.overlay, args.work_dir, args.file or None)

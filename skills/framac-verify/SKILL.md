@@ -6,8 +6,10 @@ description: >-
   DAG, risk-tier slicing, dual harnesses, coverage ledger), Phase 1
   (/framac-fuzz: zero-ACSL RTE + E-ACSL + LibFuzzer dynamic triage), Phase 2
   (/framac-eva: module-level abstract interpretation), the Pre-WP Crash
-  Verification Gate, and Phase 3 (/framac-wp: isolated parallel wavefront ACSL
-  synthesis for AoRTE + Layers 1-6). Runs every tool in the hardened
+  Verification Gate, and Phase 3 (/framac-wp: isolated parallel ACSL synthesis
+  for AoRTE + Layers 1-6, dispatched by a dependency-driven scheduler). Sizes
+  every invocation from the measured machine, runs deterministic per-module
+  work through Make, and caches builds, Eva results and proofs. Runs every tool in the hardened
   framac-pipeline container with the target mounted read-only and a run
   directory outside the target; classifies results into a validated coverage
   ledger and verdict records (confirmed / needs_validation / rejected); emits
@@ -46,9 +48,17 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 - `--module <name>`: Verify only a specific module slice (repeatable).
 - `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
 - `--scope <path>`: Restrict to repository-relative paths (repeatable). Everything else is seeded `out_of_scope`.
-- `--max-agents <N>`: Maximum concurrent subagents per wave or module (default: `8`).
-- `--fuzz-time <SEC>`: Duration per module for the Phase 1 burst (default: `60`).
+- `--max-agents <N>`: Cap on concurrent LLM subagents. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), itself capped by `FRAMAC_MAX_AGENTS` (16).
+- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst. Default: the profile's CPU-second budget (quick 60, standard 120, deep 900) divided by the workers the machine allows.
 - `--run-dir <dir>`: Resume an existing run directory instead of creating a new one.
+
+## Resources
+
+The pipeline sizes itself; do not pass CPU, memory or agent counts to the wrapper.
+- Every wrapper call leases CPUs and memory from the measured pool (cgroups, Slurm, the container engine, `FRAMAC_POOL_*` caps). Each tool runs as many provers or fuzz workers as its lease allows; `-wp-memlimit` and `-rss_limit_mb` stay fixed, so results do not depend on the machine.
+- Run long phases (`pipeline_make.py run …`) as background commands and wait for them to finish. A waiting command prints its queue position.
+
+Details, knobs and troubleshooting: [`docs/resources-and-caching.md`](../../docs/resources-and-caching.md).
 
 ---
 
@@ -71,47 +81,70 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 
 ### Setup
 
-1. `-NewRun` (or `-RunDir <existing>`), then: `python3 $S/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...`
-2. If `state/progress.json` exists (`python3 $S/checkpoint.py load state`), resume from the recorded phase. Re-initializing the overlay on a changed target fails by design: start a new run instead.
+1. `-NewRun` (or `-RunDir <existing>`), then: `python3 $S/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
+2. Check the measured machine: `python3 $S/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
+3. If `state/progress.json` exists (`python3 $S/checkpoint.py load state`), resume from the recorded phase. For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead.
 
 ### Phase 0 — Slicing, DAG, ledger seeding (`/framac-slice`)
 
-Execute `skills/framac-slice/SKILL.md`. It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`) and ends with `ledger.py seed`, creating one unit per function x obligation class. Tier 3 and out-of-scope work is seeded `deferred` / `out_of_scope` with reasons. Checkpoint `phase_done = 0`.
+Execute `skills/framac-slice/SKILL.md`:
+- It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`).
+- It ends with `ledger.py seed`, which creates one unit per function × obligation class. Tier 3 and out-of-scope work is seeded `deferred` / `out_of_scope` with reasons.
+- Then `pipeline_make.py gen` writes the Makefile for the next phases.
 
-### Phase 1 — Zero-ACSL dynamic triage (`/framac-fuzz`)
+Checkpoint `phase_done = 0`.
 
-Execute `skills/framac-fuzz/SKILL.md`, then ingest: `python3 $S/ledger.py ingest-fuzz workspace/reports/fuzz/*.json`. Crashes become candidates keyed by fingerprint; their units become `candidate`. Checkpoint `phase_done = 1`.
+### Phases 1 and 2 — Fuzzing and abstract interpretation, in parallel (Make, no subagents)
 
-### Phase 2 — Abstract interpretation (`/framac-eva`)
+These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/SKILL.md`, `skills/framac-eva/SKILL.md`):
+1. Regenerate the Makefile in the foreground if harnesses changed since Phase 0: `python3 $S/pipeline_make.py gen`.
+2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`.
+3. Start **two background wrapper calls at the same time**:
+   - `python3 $S/pipeline_make.py run fuzz`
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
 
-Execute `skills/framac-eva/SKILL.md`, then: `python3 $S/ledger.py ingest-eva workspace/reports/eva/*.json`. Functions whose RTE obligations are all Valid become `covered` (with the harness-context assumption recorded); Eva `Invalid` becomes a `needs_validation` candidate; `Invalid_but_dead` is dead-code evidence only. Checkpoint `phase_done = 2`.
+   Wait for both to finish.
 
-### Pre-WP Crash Verification Gate (`crash_verifier_brief.md`)
+   Write the `build`, `eva` and `wp-sweep` commands exactly as shown, with the full script path. Only those exact command lines may write the shared cross-run cache, so later runs on the same repository reuse their builds, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
+4. Ingest and prepare Phase 3: `python3 $S/pipeline_make.py run ingest replay wp-queue`.
 
-For every entry in `candidates.json` with `status: "unverified"`:
-1. Spawn a fresh **Crash Verifier Subagent** (`skills/framac-wp/crash_verifier_brief.md`).
-2. Validate its JSON output (`python3 $S/validate_artifacts.py agent-result <path>`) and ingest via:
-   ```text
-   python3 $S/ledger.py ingest-verifier <path> [--replay-report <fuzz.json>] --harness-meta workspace/harnesses/harness_<mod>.json
-   ```
-3. If `confirmed`: all active units of the buggy function are marked `candidate` and excluded from WP; optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
-4. If `rejected` as `harness_induced`: if `repair_attempts < 2`, record the repair (`python3 $S/generate_harness.py --record-repair workspace/harnesses/harness_<mod>.json --reason "<reason>"`), fix `harness_<mod>.c`, and re-run Phase 1 & 2 on `<mod>`; once `repair_attempts == 2`, remaining active units of `<mod>` become `blocked` (`harness_repair_exhausted`).
+Ingestion keeps the fuzz-then-Eva order:
+- crashes become fingerprinted candidates;
+- all-Valid RTE units become `covered`, with the harness-context assumption recorded;
+- Eva `Invalid` becomes a `needs_validation` candidate;
+- `Invalid_but_dead` is dead-code evidence only.
 
-### Phase 3 — Wavefront WP (`/framac-wp`)
+Tune modules with `pipeline_make.py params set` when Eva or fuzzing needs it, then re-run the target.
 
-Execute `skills/framac-wp/SKILL.md`. Each architect and prover runs in an isolated overlay (`workspace_overlay.py init-agent`), is merged via `workspace_overlay.py merge-agent` (enforcing pure-ACSL, function scope, and parent-side guardrail + WP re-verification), and updates the ledger via `ledger.py ingest-wp`. Breaker crashes and fault hypotheses go through `ledger.py ingest-agent-hypothesis` and the Crash Verification Gate. Checkpoint `phase_done = 3`.
+Checkpoint `phase_done = 2`.
+
+### Crash Verification Gate and Phase 3 (`/framac-wp`)
+
+Execute `skills/framac-wp/SKILL.md`. Its scheduler loop handles everything:
+- **Gate.** Verifier tasks for every `unverified` candidate (`skills/framac-wp/crash_verifier_brief.md`):
+  - `confirmed`: the function's units become `candidate` and are excluded from WP. Optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
+  - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run module-<mod>`, then `wp_scheduler.py refresh --module <mod>`.
+  - After two attempts, the module's remaining active units become `blocked` (`harness_repair_exhausted`).
+- **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine.
+
+Checkpoint `phase_done = 3`.
 
 ### Phase 4 — Export, status, and reports
 
 1. Verify the ACSL-only invariant across the work tree: `python3 $S/workspace_overlay.py check-acsl-only`.
-2. Export the ACSL diff: `python3 $S/workspace_overlay.py export-diff`.
+2. Re-prove merged functions on the final tree, and feed the shared proof cache: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep` (background).
 3. Set the terminal status:
    - `python3 $S/run_metadata.py set-status --status complete` only if no candidate is unverified and no unit is `planned`/`in_progress`;
    - otherwise `python3 $S/run_metadata.py set-status --status incomplete --reason <exact reason>`.
-4. Validate: `python3 $S/validate_artifacts.py run-dir .` (must pass).
-5. Generate reports: `python3 $S/generate_report.py` (refuses invalid inputs).
-6. Mark the checkpoint complete: `python3 $S/checkpoint.py complete state`.
-7. `--in-place` is a separate host-side step after the user reviews the report: `python <pipeline>\scripts\workspace_overlay.py apply-in-place --overlay <run-dir>\workspace --target <target-dir>`.
+4. Export the diff, validate and generate the reports: `python3 $S/pipeline_make.py run report`. It runs `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
+5. Mark the checkpoint complete: `python3 $S/checkpoint.py complete state`.
+6. `--in-place` is a separate host-side step after the user reviews the report: `python <pipeline>\scripts\workspace_overlay.py apply-in-place --overlay <run-dir>\workspace --target <target-dir>`.
+
+### Kill switches (A/B comparison, troubleshooting)
+
+- `FRAMAC_CACHE=off`: no caches at all.
+- `FRAMAC_BROKER=off` (or `-NoBroker`): the wrapper's previous static sizing.
+- `FRAMAC_SCHEDULER=waves`: wave-by-wave dispatch with barriers.
 
 ## Anti-patterns
 

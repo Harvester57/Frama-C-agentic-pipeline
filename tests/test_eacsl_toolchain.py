@@ -152,6 +152,60 @@ def test_init_hook_detection_and_source():
     assert "void __e_acsl_globals_init(void) __attribute__((weak));" in hook
 
 
+WRAPPER_C = """\
+int __gen_e_acsl_checksum(uint8_t const *buf, size_t len);
+
+int checksum(uint8_t const *buf, size_t len)
+{
+  int __retres;
+  __e_acsl_store_block((void *)(& __retres),4UL);
+  __retres = 0;
+  return __retres;
+}
+
+int __gen_e_acsl_checksum(uint8_t const *buf,
+                          size_t len)
+{
+  int __retres;
+  __e_acsl_store_block((void *)(& __retres),4UL);
+  __retres = checksum(buf,
+                      len);
+  {
+    int __gen_e_acsl_initialized_2;
+    __gen_e_acsl_initialized_2 = __e_acsl_initialized((void *)(& __retres),sizeof(int));
+  }
+  return __retres;
+}
+
+void __gen_e_acsl_reset(int *p)
+{
+  reset(p);
+  return;
+}
+"""
+
+
+def test_contract_wrappers_mark_their_result_initialized():
+    patched, n = T.mark_wrapper_results_initialized(WRAPPER_C)
+    assert n == 1
+    lines = patched.split("\n")
+    i = lines.index("                      len);")
+    assert lines[i + 1] == "  " + T.WRAPPER_RESULT_INIT  # right after the multi-line call, before any check
+    assert patched.count(T.WRAPPER_RESULT_INIT) == 1  # not in the prototype, the user function or a void wrapper
+    assert T.mark_wrapper_results_initialized("int f(void)\n{\n  int __retres;\n  __retres = 1;\n}\n") == (
+        "int f(void)\n{\n  int __retres;\n  __retres = 1;\n}\n", 0)
+
+
+def test_the_build_patches_wrappers_only_when_uninitialized_reads_are_checked(tmp_path, modern_cli):
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=FakeEacslGcc(WRAPPER_C))
+    assert res["returncode"] == 0 and res["wrapper_result_inits"] == 1
+    assert T.WRAPPER_RESULT_INIT in (tmp_path / "fuzz_mod.instrumented.c").read_text(encoding="utf-8")
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "plain_mod", rte_initialized=False,
+                                 runner=FakeEacslGcc(WRAPPER_C))
+    assert "wrapper_result_inits" not in res
+    assert T.WRAPPER_RESULT_INIT not in (tmp_path / "plain_mod.instrumented.c").read_text(encoding="utf-8")
+
+
 def test_rte_initialized_opt_out_is_recorded(tmp_path, modern_cli):
     fake = FakeEacslGcc()
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", rte_initialized=False, runner=fake)
@@ -514,18 +568,35 @@ def test_scan_undeclared_functions_formats():
 # Ledger engine qualification
 # ---------------------------------------------------------------------------
 
-def test_makefile_eacsl_target_mirrors_two_stage_contract():
-    text = (REPO / "templates/GNUmakefile.template").read_text(encoding="utf-8")
-    recipe = text.split("$(TARGET).eacsl: $(SOURCES)", 1)[1].split("$(TARGET).sarif:", 1)[0]
-    assert " -g " not in recipe and "-gline-tables-only" in recipe
-    assert "\t\t\t-C \\" in recipe and "fuzz_runner.e-acsl" in recipe and "__e_acsl_" in recipe
-    backend = re.search(r'-e "([^"]*)"', recipe).group(1)
-    assert "CPPFLAGS" not in backend and "-include" not in backend
-    modern = recipe.split("else", 1)[1]
-    stage1, stage2 = modern.split("&&", 1)
-    assert "\t\t\t-n \\" in stage1 and "-e-acsl-full-mtracking" in stage1 and "-rte-initialized @all" in stage1
-    assert "$(EACSL_FUZZ_INIT) \\\n\t\t\t$@/instrumented.c" in stage2
-    assert "EACSL_FUZZ_INIT ?= /opt/framac-pipeline/templates/eacsl_runtime/fuzz_init.c" in text
+def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
+    # The two-stage E-ACSL contract lives in run_eacsl_fuzz.py only: the Make phases call it (and
+    # every other tool) through the container broker instead of re-implementing the build.
+    assert not (REPO / "templates/GNUmakefile.template").exists()
+    text = (REPO / "templates/pipeline.mk").read_text(encoding="utf-8")
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "e-acsl-gcc" not in code and re.search(r"\bframa-c\b", code) is None and "FRAMAC" not in code
+
+    # Logical recipe lines: a tab-led line plus its backslash continuations.
+    recipes = [re.sub(r"\s*\\\n\s*", " ", r) for r in re.findall(r"^\t((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE)]
+    invocations = 0
+    for line in recipes:
+        if line == "$(PM) sweep":  # the coordinator; it leases one `wp` job per function itself
+            continue
+        for m in re.finditer(r"\$\(PY\) \$\(S\)/\w+\.py|\$\(PM\)", line):
+            invocations += 1
+            prefix = line[: m.start()]
+            assert re.search(r"\$\(RUN\) --class [\w-]+ --key \S+(?: --output \S+)? -- $", prefix), line
+    assert invocations >= 15
+
+    # fuzz depends on the selftest and the module's build; the static build never runs the canary.
+    assert re.search(r"^\$\(FUZZ_TARGETS\): fuzz-%: selftest build-%$", text, re.MULTILINE)
+    assert re.search(r"^\$\(BUILD_TARGETS\): build-%:$", text, re.MULTILINE)
+    fuzz = next(r for r in recipes if "campaign" in r)
+    assert "--class fuzz" in fuzz and "--workers auto --fuzz-budget $(FUZZ_BUDGET_$*)" in fuzz
+    assert "--selftest-json $(SELFTEST_JSON)" in fuzz and "--cppflags=$(CPPFLAGS_$*)" in fuzz
+    phony = set(re.search(r"^\.PHONY:((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE).group(1).replace("\\", " ").split())
+    assert {"slice-init", "seed", "build", "selftest", "fuzz", "eva", "ingest", "replay", "wp-queue", "wp-sweep",
+            "report", "$(BUILD_TARGETS)", "$(FUZZ_TARGETS)", "$(EVA_TARGETS)", "$(MODULE_TARGETS)"} <= phony
 
 
 def test_ledger_fuzz_engine_note():

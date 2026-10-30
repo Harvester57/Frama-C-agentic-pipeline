@@ -33,12 +33,42 @@ src/x.c:9: Error: Loop invariant failed:
 """
 
 
+FRAMAC33_RTE = """workspace/work/src/parser/parser.c: In function 'parse_record'
+workspace/work/src/parser/parser.c:30: Error: Assertion failed:
+\tThe failing predicate is:
+\trte/index_bound:
+\t\ti < 8.
+\tWith values at failure point:
+\t- i: 8
+==181== ERROR: libFuzzer: deadly signal
+"""
+
+FRAMAC33_POST = """state/w/src/util/sum.h: In function 'checksum'
+state/w/src/util/sum.h:11: Error: Postcondition failed:
+\tThe failing predicate is:
+\trange:
+\t\t0 ≤ \\result ≤
+\t\t0xF.
+\tWith values at failure point:
+\t- \\result: 101
+"""
+
+
 def test_parse_new_style_rte_failure():
     f = parse_eacsl_failure(NEW_STYLE)
     assert f["file"] == "src/snmp/ber.c" and f["line"] == 42
     assert f["function"] == "ber_decode_len"
     assert f["kind"] == "assertion" and f["alarm_kind"] == "mem_access" and f["is_rte"]
-    assert f["predicate"] == "mem_access: \\valid_read(buf + off)"
+    assert (f["label"], f["predicate"]) == ("mem_access", "\\valid_read(buf + off)")
+
+
+def test_parse_framac33_label_line_then_predicate():
+    f = parse_eacsl_failure(FRAMAC33_RTE)
+    assert (f["line"], f["function"], f["kind"]) == (30, "parse_record", "assertion")
+    assert (f["label"], f["predicate"], f["alarm_kind"], f["is_rte"]) == ("rte/index_bound", "i < 8", "index_bound", True)
+    post = parse_eacsl_failure(FRAMAC33_POST)
+    assert (post["kind"], post["label"], post["predicate"]) == ("postcondition", "range", "0 ≤ \\result ≤ 0xF")
+    assert post["alarm_kind"] is None and not post["is_rte"]
 
 
 def test_parse_old_style_precondition_failure():

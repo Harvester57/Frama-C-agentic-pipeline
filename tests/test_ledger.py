@@ -4,6 +4,7 @@ import pytest
 
 import ledger as L
 from conftest import write_json
+from fingerprint import make_fingerprint
 from validate_artifacts import validate_candidates, validate_ledger
 
 DAG = {
@@ -89,6 +90,20 @@ def test_ingest_eva(run_dir):
     assert cands[0]["origin"] == "eva" and cands[0]["proposed_verdict"] == "needs_validation"
     assert cands[0]["location"]["file"] == "src/snmp/ber.c"
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_eva_keys_alarms_by_directory_and_file(run_dir):
+    seed(run_dir)
+    # Frama-C's CSV keeps the directory apart from the bare file name; an alarm of a same-named
+    # function in another file belongs to that file's unit, never to this one.
+    alarm = {"directory": "workspace/work/src/snmp", "file": "ber.c", "function": "ber_decode_len", "line": 42,
+             "kind": "index_bound", "annotation": "i < 8"}
+    elsewhere = {**alarm, "directory": "workspace/work/src/other", "annotation": "j < 4"}
+    write_json(run_dir / "workspace/reports/eva/snmp.json", eva_report(invalid_alarms=[alarm, elsewhere]))
+    assert L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])["candidates"] == 1
+    (cand,) = load(run_dir / "candidates.json")
+    assert cand["fingerprint"] == make_fingerprint("src/snmp/ber.c", "ber_decode_len", "index_bound", "i < 8")
+    assert cand["location"]["file"] == "src/snmp/ber.c"
 
 
 def test_ingest_eva_analysis_error_never_covers(run_dir):
@@ -240,3 +255,52 @@ def test_ingest_wp_rejects_unsound_proof_and_records_reduced_checks(run_dir):
     assert "-no-warn-unsigned-overflow" in descriptions
     assert "\\valid_function" in descriptions
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_wp_analysis_error_records_evidence_without_status_change(run_dir):
+    seed(run_dir)
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report(
+        status="analysis_error", reason="oom_killed", by_obligation_class={}, unproven_goals=[],
+    ))
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
+    assert u["status"] == "planned"
+    ev = u["evidence"][-1]
+    assert ev["result"] == "wp_analysis_error" and not ev["discharging"]
+    assert ev["details"] == {"reason": "oom_killed"} and "oom_killed" in ev["summary"]
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_fuzz_not_run_is_recorded_not_ignored(run_dir):
+    seed(run_dir)
+    write_json(run_dir / "workspace/reports/fuzz/snmp.json", {"mode": "campaign", "module": "snmp", "status": "not_run", "reason": "job killed"})
+    L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
+    u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
+    assert u["status"] == "planned"
+    assert u["evidence"][-1]["result"] == "fuzz_not_run" and "job killed" in u["evidence"][-1]["summary"]
+
+
+def test_transition_compare_and_set_protects_fresh_candidate(run_dir):
+    seed(run_dir)
+    cid = "src/snmp/ber.c#ber_decode_len::rte"
+    write_json(run_dir / "workspace/reports/eva/snmp.json", eva_report())
+    L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])
+    assert units_by_id(run_dir)[cid]["status"] == "candidate"
+    with pytest.raises(L.LedgerError, match="expected one of"):
+        L.cmd_transition(cid, "in_progress", "prover-1", None, expected=["planned"])
+    assert units_by_id(run_dir)[cid]["status"] == "candidate"
+    pdu = "src/snmp/pdu.c#snmp_parse_pdu::rte"
+    assert L.cmd_transition(pdu, "in_progress", "prover-2", None, expected=["planned"])["status"] == "in_progress"
+    # The CLI exposes the same compare-and-set.
+    assert L.main(["transition", "--id", pdu, "--status", "planned", "--expect", "covered"]) == 1
+
+
+def test_ledger_commands_hold_the_run_lock_and_release_it(run_dir):
+    from framac_common import run_lock
+
+    seed(run_dir)
+    with run_lock("ledger", run_dir) as lock_dir:
+        # Reentrant within one process: a scheduler holding the lock can call ledger commands.
+        L.cmd_transition("src/snmp/pdu.c#snmp_parse_pdu::rte", "in_progress", "prover-1", None)
+        assert lock_dir.is_dir()
+    assert not (run_dir / ".framac-locks").exists()

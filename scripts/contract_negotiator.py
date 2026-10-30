@@ -5,19 +5,30 @@ Manages Caller-Callee ACSL Contract Strengthening Requests across Topological Wa
 When a Caller Subagent in Wave W fails a WP proof because a Callee function in Wave W-1
 has a weak postcondition (`ensures`) or overly broad `assigns` clause in its `.h` header,
 the Caller Subagent returns a strengthening request in its structured result instead of
-editing the Callee's contract. The parent (the only writer of this ledger) records it here.
+editing the Callee's contract. The parent (the only writer of this ledger) records it here,
+under the run-wide `ledger` lock (framac_common.run_lock).
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_agent_result_json, load_json_optional, utc_now  # noqa: E402
+from framac_common import atomic_write_json, load_agent_result_json, load_json_optional, run_lock, utc_now  # noqa: E402
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with run_lock("ledger"):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def load_ledger(path: Path) -> dict:
@@ -28,6 +39,7 @@ def save_ledger(path: Path, data: dict) -> None:
     atomic_write_json(path, data)
 
 
+@_locked
 def cmd_request(
     ledger_path: Path,
     caller_fn: str,
@@ -79,6 +91,7 @@ def _infer_callee_file(
     return Path(header_file).with_suffix(".c").as_posix()
 
 
+@_locked
 def cmd_ingest_prover(
     ledger_path: Path,
     result_path: Path,
@@ -145,6 +158,7 @@ def cmd_list(ledger_path: Path, status_filter: str | None = None, callee_filter:
     return {"count": len(reqs), "requests": reqs}
 
 
+@_locked
 def cmd_resolve(ledger_path: Path, req_id: str, new_status: str, note: str) -> dict:
     ledger = load_ledger(ledger_path)
     for r in ledger.get("requests", []):

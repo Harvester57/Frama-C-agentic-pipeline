@@ -26,6 +26,7 @@ ignore = ["E501"]
 known-first-party = [
     "acsl_ast",
     "build_callgraph_dag",
+    "cache",
     "checkpoint",
     "conftest",
     "contract_negotiator",
@@ -37,7 +38,9 @@ known-first-party = [
     "generate_report",
     "ledger",
     "minischema",
+    "pipeline_make",
     "promote_artifact",
+    "resources",
     "run_eacsl_fuzz",
     "run_eva_slice",
     "run_metadata",
@@ -45,6 +48,7 @@ known-first-party = [
     "sandbox_exec",
     "validate_artifacts",
     "workspace_overlay",
+    "wp_scheduler",
 ]
 
 [tool.mypy]

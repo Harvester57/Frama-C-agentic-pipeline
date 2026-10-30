@@ -10,7 +10,8 @@ Creates and updates run-metadata.json (parent-only).
 The run id is the run directory name (run-<N>). The source ref is read from the
 target's git metadata without modifying it. Toolchain versions and the available
 sandbox mode are recorded so later runs can decide whether carried evidence is
-still comparable.
+still comparable, together with the host path of the run dir (FRAMAC_RUN_HOST) and
+the resources the container measured (scripts/resources.py probe).
 """
 
 from __future__ import annotations
@@ -71,6 +72,34 @@ def toolchain() -> dict:
     return versions
 
 
+OUTER_SANDBOXES = ("docker-hardened", "podman-hardened")
+
+
+def outer_sandbox() -> str:
+    """The hardened engine the wrapper started this container with (FRAMAC_OUTER_SANDBOX), else 'unknown'."""
+    value = (os.environ.get("FRAMAC_OUTER_SANDBOX") or "").strip()
+    return value if value in OUTER_SANDBOXES else "unknown"
+
+
+def resources_summary() -> dict | None:
+    """
+    Compact view of the resources this container measured, plus under `pool` the node pool the
+    host broker measured (FRAMAC_POOL_*), which this container's own lease is only a slice of.
+    Never fails init.
+    """
+    try:
+        from resources import probe
+
+        summary = probe(scope="container").summary()
+    except Exception:
+        return None
+    pool_cpus = (os.environ.get("FRAMAC_POOL_CPUS") or "").strip()
+    pool_mem = (os.environ.get("FRAMAC_POOL_MEM_MB") or "").strip()
+    if pool_cpus.isdigit() and pool_mem.isdigit() and int(pool_cpus) > 0 and int(pool_mem) > 0:
+        summary["pool"] = {"cpus": int(pool_cpus), "mem_mb": int(pool_mem), "source": "host broker"}
+    return summary
+
+
 def inner_sandbox() -> str:
     """'rlimits' inside the container (POSIX), otherwise 'unknown'."""
     try:
@@ -118,16 +147,20 @@ def cmd_init(
         "budget": budget,
         "execution_policy": "sandboxed-local-only",
         "sandbox": {
-            "outer": "docker-hardened" if os.environ.get("FRAMAC_OUTER_SANDBOX") == "docker-hardened" else "unknown",
+            "outer": outer_sandbox(),
             "inner": inner_sandbox(),
         },
         "prior_runs": prior,
         "toolchain": toolchain(),
+        "run_dir_host": (os.environ.get("FRAMAC_RUN_HOST") or "").strip() or None,
         "run_status": "in_progress",
         "incomplete_reason": None,
         "created_at": now,
         "updated_at": now,
     }
+    summary = resources_summary()
+    if summary is not None:
+        meta["resources"] = summary
     write(meta)
     return meta
 

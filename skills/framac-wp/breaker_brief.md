@@ -30,8 +30,9 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
    - Write a short Python script that generates 3–5 surgical seed files in `agents/{agent_id}/scratch/seeds/` that satisfy all outer header checks and place extreme boundary values (`0x7FFFFFFF`, `0xFFFFFFFF`, `0x00`, unescaped `\r\n`, or unauthenticated `sec_level` flags) at the exact offset read by `{function_name}`.
 3. **Run a Targeted E-ACSL + LibFuzzer Campaign (sandboxed):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/breaker_{function_name} --corpus-dir agents/{agent_id}/scratch/seeds --extra-corpus workspace/corpus/{module_name} --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 45 --cppflags '{cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/breaker_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/breaker_{function_name} --corpus-dir agents/{agent_id}/scratch/seeds --extra-corpus workspace/corpus/{module_name} --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 45 --workers auto --cppflags='{cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/breaker_{function_name}.json
    ```
+   `--workers auto` runs as many LibFuzzer workers as your container's CPUs and memory allow. The per-input memory limit stays fixed. The module binary comes from the build cache when the work tree is unchanged.
 4. **Write `agents/{agent_id}/scratch/result.json` using `python3 -c "import json, pathlib; pathlib.Path('agents/{agent_id}/scratch/result.json').write_text(json.dumps(res, indent=2))"` so ACSL backslashes (`\valid`, `\forall`) are properly JSON-escaped, and return exactly one JSON object and no surrounding prose:**
 
 ```json

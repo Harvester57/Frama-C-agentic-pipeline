@@ -3,15 +3,32 @@
 #
 #   framac-docker.sh [--target DIR] (--run-dir DIR | --new-run) [--repo NAME]
 #                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
-#                    [--allow-run-dir-in-target] -- <command...>
+#                    [--allow-run-dir-in-target] [--engine docker|podman|auto]
+#                    [--class CLASS] [--no-broker] [--cpus N] [--memory SIZE] [--pids-limit N]
+#                    [--cache-dir DIR|off] [--cache-rw] -- <command...>
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
-# /opt/framac-pipeline/{scripts,templates,schemas} (read-only).
-# Hardening: --network none, --cap-drop ALL, no-new-privileges, Docker's default
-# seccomp and AppArmor profiles, cpu/memory/pids limits, allowlisted environment.
+# /opt/framac-pipeline/{scripts,templates,schemas,skills} (read-only) and, on the broker path,
+# the shared cache /framac-cache: this repository's partition of FRAMAC_CACHE_DIR, writable only
+# for the exactly allowlisted trusted commands (read-only everywhere with FRAMAC_CACHE_RW=off;
+# --cache-rw is the default and kept for compatibility).
+# Hardening: --network none, --cap-drop ALL, no-new-privileges, the engine's default
+# seccomp and AppArmor/SELinux profiles, cpu/memory/pids limits, allowlisted environment.
 # The container is the isolation boundary; target-controlled binaries run through
 # scripts/sandbox_exec.py (rlimits, env allowlist, timeout) with no filesystem
 # isolation inside the container.
+#
+# Sizing: by default the host broker (scripts/resources.py exec, needs a host python3 >= 3.10)
+# measures the machine on every call, takes a lease for the job class (inferred from the
+# command unless --class) and starts the container with --cpus/--memory/--pids-limit from that
+# lease, so concurrent containers never oversubscribe the node. --cpus/--memory/--pids-limit
+# (or FRAMAC_CPUS/FRAMAC_MEMORY/FRAMAC_PIDS_LIMIT) request a fixed grant, still registered
+# with the broker. --no-broker or FRAMAC_BROKER=off (and, with a warning, a missing host
+# python3 >= 3.10) keep the legacy static sizing: per-container FRAMAC_CPUS/FRAMAC_MEMORY/
+# FRAMAC_PIDS_LIMIT, divided by --agents / FRAMAC_CONCURRENT_AGENTS.
+# Engine: --engine or FRAMAC_CONTAINER_ENGINE = docker | podman | auto (docker when usable).
+# SELinux (enforcing): pipeline-owned mounts get :z; the target mount needs
+# FRAMAC_SELINUX_TARGET=relabel (:z) or FRAMAC_SELINUX_TARGET=disable (label=disable).
 # The legacy --no-inner-sandbox and --allow-degraded-sandbox flags were removed
 # together with bubblewrap; passing either one fails with exit 2.
 set -euo pipefail
@@ -22,13 +39,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-$(pwd)}"
 IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-pipeline:latest}"
-DEFAULT_CPUS="$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)"
-DEFAULT_MEM="$(awk '/MemTotal:/ { g = int(($2 / 1048576) * 0.75); if (g < 8) g = 8; print g "g" }' /proc/meminfo 2>/dev/null || echo 8g)"
-[[ -z "${DEFAULT_MEM}" ]] && DEFAULT_MEM="8g"
+ENGINE_PREF="${FRAMAC_CONTAINER_ENGINE:-auto}"
 CPUS="${FRAMAC_CPUS:-}"
 MEMORY="${FRAMAC_MEMORY:-}"
-AGENTS="${FRAMAC_CONCURRENT_AGENTS:-1}"
+AGENTS="${FRAMAC_CONCURRENT_AGENTS:-}"
 PIDS="${FRAMAC_PIDS_LIMIT:-}"
+JOB_CLASS=""
+NO_BROKER=0
+[[ "${FRAMAC_BROKER:-}" == "off" ]] && NO_BROKER=1
+CACHE_DIR=""
+CACHE_RW=0
 RUN_DIR=""
 NEW_RUN=0
 REPO=""
@@ -48,6 +68,11 @@ while [[ $# -gt 0 ]]; do
         --cpus) CPUS="$2"; shift 2 ;;
         --memory) MEMORY="$2"; shift 2 ;;
         --pids-limit) PIDS="$2"; shift 2 ;;
+        --class) JOB_CLASS="$2"; shift 2 ;;
+        --engine) ENGINE_PREF="$2"; shift 2 ;;
+        --no-broker) NO_BROKER=1; shift ;;
+        --cache-dir) CACHE_DIR="$2"; shift 2 ;;
+        --cache-rw) CACHE_RW=1; shift ;;
         --no-inner-sandbox|--allow-degraded-sandbox)
             echo "[framac-docker] ERROR: $1 is no longer supported. The bubblewrap inner sandbox was removed;" \
                  "the hardened container (default seccomp/AppArmor) is the isolation boundary and target-controlled" \
@@ -59,28 +84,78 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${AGENTS}" =~ ^[0-9]+$ ]] && (( AGENTS > 1 )); then
-    if [[ -z "${CPUS}" ]]; then
-        DIV_CPUS=$(( DEFAULT_CPUS / AGENTS ))
-        (( DIV_CPUS < 2 )) && DIV_CPUS=2
-        CPUS="${DIV_CPUS}"
-    fi
-    if [[ -z "${MEMORY}" ]]; then
-        MEM_NUM="${DEFAULT_MEM%g}"
-        [[ "${MEM_NUM}" =~ ^[0-9]+$ ]] || MEM_NUM=8
-        DIV_MEM=$(( MEM_NUM / AGENTS ))
-        (( DIV_MEM < 2 )) && DIV_MEM=2
-        MEMORY="${DIV_MEM}g"
-    fi
-    if [[ -z "${PIDS}" ]]; then
-        DIV_PIDS=$(( 4096 / AGENTS ))
-        (( DIV_PIDS < 512 )) && DIV_PIDS=512
-        PIDS="${DIV_PIDS}"
-    fi
+# ---- Container engine (docker or podman) ----
+have() { command -v "$1" >/dev/null 2>&1; }
+case "${ENGINE_PREF}" in
+    docker|podman)
+        have "${ENGINE_PREF}" || { echo "[framac-docker] container engine '${ENGINE_PREF}' not found on PATH" >&2; exit 2; }
+        ENGINE="${ENGINE_PREF}" ;;
+    auto|"")
+        if have docker && { ! have podman || docker info >/dev/null 2>&1; }; then
+            ENGINE=docker
+        elif have podman; then
+            ENGINE=podman
+        else
+            echo "[framac-docker] no container engine found (install docker or podman, or set FRAMAC_CONTAINER_ENGINE)" >&2; exit 2
+        fi ;;
+    *) echo "[framac-docker] invalid engine '${ENGINE_PREF}' (docker|podman|auto)" >&2; exit 2 ;;
+esac
+OUTER_SANDBOX="docker-hardened"
+ENGINE_VERSION="$("${ENGINE}" --version 2>/dev/null || true)"
+case "${ENGINE}:${ENGINE_VERSION}" in
+    podman:*|*[Pp]odman*) OUTER_SANDBOX="podman-hardened" ;;
+esac
+
+# ---- Sizing path: host broker (default) or legacy static limits ----
+PYTHON=""
+find_python() {
+    local cand
+    for cand in "${FRAMAC_PYTHON:-}" python3; do
+        [[ -n "${cand}" ]] || continue
+        if have "${cand}" && "${cand}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+            PYTHON="${cand}"
+            return 0
+        fi
+    done
+    return 1
+}
+if [[ ${NO_BROKER} -eq 0 ]] && ! find_python; then
+    echo "[framac-docker] WARNING: no host python3 >= 3.10 found; using static per-container limits (as with --no-broker)" >&2
+    NO_BROKER=1
 fi
-CPUS="${CPUS:-${DEFAULT_CPUS}}"
-MEMORY="${MEMORY:-${DEFAULT_MEM}}"
-PIDS="${PIDS:-4096}"
+if [[ ${NO_BROKER} -eq 0 && -n "${AGENTS}" ]]; then
+    echo "[framac-docker] WARNING: --agents / FRAMAC_CONCURRENT_AGENTS is deprecated and ignored: the host broker" \
+         "sizes every container from the measured pool (use --no-broker for the legacy division)" >&2
+fi
+
+if [[ ${NO_BROKER} -eq 1 ]]; then
+    AGENTS="${AGENTS:-1}"
+    DEFAULT_CPUS="$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)"
+    DEFAULT_MEM="$(awk '/MemTotal:/ { g = int(($2 / 1048576) * 0.75); if (g < 8) g = 8; print g "g" }' /proc/meminfo 2>/dev/null || echo 8g)"
+    [[ -z "${DEFAULT_MEM}" ]] && DEFAULT_MEM="8g"
+    if [[ "${AGENTS}" =~ ^[0-9]+$ ]] && (( AGENTS > 1 )); then
+        if [[ -z "${CPUS}" ]]; then
+            DIV_CPUS=$(( DEFAULT_CPUS / AGENTS ))
+            (( DIV_CPUS < 2 )) && DIV_CPUS=2
+            CPUS="${DIV_CPUS}"
+        fi
+        if [[ -z "${MEMORY}" ]]; then
+            MEM_NUM="${DEFAULT_MEM%g}"
+            [[ "${MEM_NUM}" =~ ^[0-9]+$ ]] || MEM_NUM=8
+            DIV_MEM=$(( MEM_NUM / AGENTS ))
+            (( DIV_MEM < 2 )) && DIV_MEM=2
+            MEMORY="${DIV_MEM}g"
+        fi
+        if [[ -z "${PIDS}" ]]; then
+            DIV_PIDS=$(( 4096 / AGENTS ))
+            (( DIV_PIDS < 512 )) && DIV_PIDS=512
+            PIDS="${DIV_PIDS}"
+        fi
+    fi
+    CPUS="${CPUS:-${DEFAULT_CPUS}}"
+    MEMORY="${MEMORY:-${DEFAULT_MEM}}"
+    PIDS="${PIDS:-4096}"
+fi
 
 RESOLVED_TARGET="$(cd "${TARGET_DIR}" && pwd)"
 REPO="${REPO:-$(basename "${RESOLVED_TARGET}")}"
@@ -113,10 +188,29 @@ case "${RESOLVED_RUN}/" in
 esac
 echo "[framac-docker] run dir: ${RESOLVED_RUN}" >&2
 
-if [[ -z "$(docker images -q "${IMAGE}" 2>/dev/null)" ]]; then
+# ---- SELinux: relabel pipeline-owned mounts; the target needs an explicit choice ----
+Z=""
+ZRW=""
+ZT=""
+SELINUX_ARGS=()
+if [[ -r /sys/fs/selinux/enforce && "$(cat /sys/fs/selinux/enforce 2>/dev/null)" == "1" ]]; then
+    Z=",z"
+    ZRW=":z"
+    case "${FRAMAC_SELINUX_TARGET:-}" in
+        relabel) ZT=",z" ;;
+        disable) SELINUX_ARGS=(--security-opt label=disable) ;;
+        *)
+            echo "[framac-docker] SELinux is enforcing: set FRAMAC_SELINUX_TARGET=relabel to relabel the target" \
+                 "(shared container label, :z) or FRAMAC_SELINUX_TARGET=disable to run without SELinux confinement" \
+                 "(--security-opt label=disable)." >&2
+            exit 2 ;;
+    esac
+fi
+
+if [[ -z "$("${ENGINE}" images -q "${IMAGE}" 2>/dev/null)" ]]; then
     if [[ ${BUILD} -eq 1 ]]; then
         echo "[framac-docker] Building ${IMAGE}..." >&2
-        docker build -t "${IMAGE}" "${PIPELINE_ROOT}"
+        "${ENGINE}" build -t "${IMAGE}" "${PIPELINE_ROOT}" >&2
     else
         echo "[framac-docker] image ${IMAGE} not found (use --build-if-missing)" >&2; exit 2
     fi
@@ -125,9 +219,10 @@ fi
 if [[ -n "${TARGET_PACKAGES}" ]]; then
     DERIVED_IMAGE="framac-pipeline:${REPO}"
     echo "[framac-docker] Building derived image ${DERIVED_IMAGE} with target packages: ${TARGET_PACKAGES}" >&2
-    docker build -t "${DERIVED_IMAGE}" --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}"
+    "${ENGINE}" build -t "${DERIVED_IMAGE}" --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}" >&2
     IMAGE="${DERIVED_IMAGE}"
 fi
+IMAGE_ID="$( ("${ENGINE}" image inspect -f '{{.Id}}' "${IMAGE}" 2>/dev/null | head -n 1) || true)"
 
 RUN_ID="$(basename "${RESOLVED_RUN}")"
 TARGET_COMMIT="$(git -C "${RESOLVED_TARGET}" rev-parse HEAD 2>/dev/null || true)"
@@ -140,19 +235,43 @@ if [[ -n "${TARGET_COMMIT}" ]]; then
     fi
 fi
 
-ARGS=(run --rm -i --network none --cap-drop ALL --security-opt no-new-privileges
-      --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}")
-ARGS+=(-e PYTHONIOENCODING=utf-8 -e FRAMAC_OUTER_SANDBOX=docker-hardened
-       -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
-       -e "FRAMAC_RUN_ID=${RUN_ID}"
-       -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"
-       -e "FRAMAC_TARGET_DIRTY=${TARGET_DIRTY}")
-ARGS+=(-v "${RESOLVED_TARGET}:/target:ro"
-       -v "${RESOLVED_RUN}:/framac-run"
-       -v "${PIPELINE_ROOT}/scripts:/opt/framac-pipeline/scripts:ro"
-       -v "${PIPELINE_ROOT}/templates:/opt/framac-pipeline/templates:ro"
-       -v "${PIPELINE_ROOT}/schemas:/opt/framac-pipeline/schemas:ro"
-       -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro"
-       -w /framac-run "${IMAGE}" "$*")
+HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privileges)
+ENV_ARGS=(-e PYTHONIOENCODING=utf-8 -e "FRAMAC_OUTER_SANDBOX=${OUTER_SANDBOX}"
+          -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
+          -e "FRAMAC_RUN_ID=${RUN_ID}" -e "FRAMAC_RUN_HOST=${RESOLVED_RUN}"
+          -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"
+          -e "FRAMAC_TARGET_DIRTY=${TARGET_DIRTY}")
+# Pipeline knobs that scripts read inside the container: forwarded when set on the host.
+for knob in FRAMAC_CACHE FRAMAC_CACHE_MAX FRAMAC_MAX_AGENTS FRAMAC_SCHEDULER FRAMAC_LOCK_TIMEOUT \
+            FRAMAC_LOCK_STALE FRAMAC_WP_WALL_TIMEOUT FRAMAC_RESOURCES_VERBOSE; do
+    [[ -n "${!knob:-}" ]] && ENV_ARGS+=(-e "${knob}=${!knob}")
+done
+MOUNT_ARGS=(-v "${RESOLVED_TARGET}:/target:ro${ZT}"
+            -v "${RESOLVED_RUN}:/framac-run${ZRW}"
+            -v "${PIPELINE_ROOT}/scripts:/opt/framac-pipeline/scripts:ro${Z}"
+            -v "${PIPELINE_ROOT}/templates:/opt/framac-pipeline/templates:ro${Z}"
+            -v "${PIPELINE_ROOT}/schemas:/opt/framac-pipeline/schemas:ro${Z}"
+            -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro${Z}")
 
-exec docker "${ARGS[@]}"
+if [[ ${NO_BROKER} -eq 1 ]]; then
+    exec "${ENGINE}" run "${HARDENING[@]}" --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}" \
+        ${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"} "${ENV_ARGS[@]}" -e "FRAMAC_IMAGE_ID=${IMAGE_ID}" \
+        "${MOUNT_ARGS[@]}" -w /framac-run "${IMAGE}" "$*"
+fi
+
+# Broker path: resources.py exec leases CPUs/memory for the job class and inserts --name,
+# --label, --init, the limits, the job/pool environment and the shared cache mount after `run`.
+# The command string travels in FRAMAC_CONTAINER_CMD and becomes the entry shim's argument.
+export FRAMAC_CONTAINER_CMD="$*"
+export FRAMAC_IMAGE_ID="${IMAGE_ID}"
+export FRAMAC_REPO="${REPO}"   # partitions the shared cache per repository
+EXEC_ARGS=(exec --run-dir "${RESOLVED_RUN}")
+[[ -n "${JOB_CLASS}" ]] && EXEC_ARGS+=(--class "${JOB_CLASS}")
+[[ -n "${CPUS}" ]] && EXEC_ARGS+=(--cpus "${CPUS}")
+[[ -n "${MEMORY}" ]] && EXEC_ARGS+=(--memory "${MEMORY}")
+[[ -n "${PIDS}" ]] && EXEC_ARGS+=(--pids-limit "${PIDS}")
+[[ -n "${CACHE_DIR}" ]] && EXEC_ARGS+=(--cache-dir "${CACHE_DIR}")
+[[ ${CACHE_RW} -eq 1 ]] && EXEC_ARGS+=(--cache-rw)
+exec "${PYTHON}" "${PIPELINE_ROOT}/scripts/resources.py" "${EXEC_ARGS[@]}" -- \
+    "${ENGINE}" run "${HARDENING[@]}" ${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"} "${ENV_ARGS[@]}" "${MOUNT_ARGS[@]}" \
+    -w /framac-run --entrypoint /bin/bash "${IMAGE}" /opt/framac-pipeline/scripts/container_entry.sh

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Generates per-module Frama-C GNUmakefile, dual-use C harness
+Generates a per-module dual-use C harness
 (supporting both Frama-C Eva via eva_main() and Clang LibFuzzer via LLVMFuzzerTestOneInput()),
-and a structured sidecar JSON (harness_<module>.json) tracking entry reachability,
-contract notes, and harness repair attempts (capped at 2).
+and a structured sidecar JSON (harness_<module>.json) tracking sources, preprocessor and
+linker flags, entry reachability, contract notes, and harness repair attempts (capped at 2).
+The sidecar is what `pipeline_make.py gen` builds the module's Make recipes from.
 
 By default the generated harness is probed with `clang -fsyntax-only` and any
 headers (from the -I directories) that define identifiers the module header
@@ -28,7 +29,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import atomic_write_json, load_json_strict, utc_now  # noqa: E402
-
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
@@ -1006,6 +1006,7 @@ def generate_module_harness(
     prelude_max_iterations: int = DEFAULT_PRELUDE_MAX_ITERATIONS,
     prelude_clang: str | None = None,
     prelude_runner: Callable[..., Any] | None = None,
+    ldflags: str = "",
 ) -> dict[str, Any]:
     if auto_args:
         entry_style = "auto_prototype"
@@ -1018,12 +1019,11 @@ def generate_module_harness(
 
     tpl_dir = resolve_template_dir()
     harness_tpl = (tpl_dir / "harness_dual.c.template").read_text(encoding="utf-8")
-    mk_tpl = (tpl_dir / "GNUmakefile.template").read_text(encoding="utf-8")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     harness_file = out_dir / f"harness_{module_name}.c"
     harness_meta_file = out_dir / f"harness_{module_name}.json"
-    makefile_path = out_dir / f"{module_name}.mk"
+    norm_ldflags = (ldflags or "").strip()
 
     norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
     norm_extra_includes: list[str] = []
@@ -1064,9 +1064,6 @@ def generate_module_harness(
                 if inc_flag not in norm_cppflags.split():
                     norm_cppflags = f"{norm_cppflags} {inc_flag}".strip()
             inc_lines.append(f'#include "{src_path.name}"')
-        all_sources = str(harness_file)
-    else:
-        all_sources = " ".join(sources + [str(harness_file)])
 
     harness_content = (
         harness_tpl.replace("{{MODULE_NAME}}", module_name)
@@ -1097,23 +1094,14 @@ def generate_module_harness(
     if prelude.get("reason"):
         prelude_fields["prelude_reason"] = prelude["reason"]
 
-    mk_content = (
-        f"TARGET := {module_name}\n"
-        f"MAIN_FN := eva_main\n"
-        f"SOURCES := {all_sources}\n"
-        f"CPPFLAGS := {norm_cppflags} -I. -I{tpl_dir / 'acsl'}\n\n"
-        + mk_tpl
-    )
-    makefile_path.write_text(mk_content, encoding="utf-8")
-
     sidecar = {
         "module": module_name,
         "harness_file": str(harness_file).replace("\\", "/"),
-        "makefile": str(makefile_path).replace("\\", "/"),
         "sources": list(sources),
         "header": norm_header,
         "extra_includes": norm_extra_includes,
         "cppflags": norm_cppflags,
+        "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
         "null_terminate": effective_null_terminate,
@@ -1145,11 +1133,11 @@ def generate_module_harness(
         "module": module_name,
         "harness_file": str(harness_file),
         "harness_meta": str(harness_meta_file),
-        "makefile": str(makefile_path),
         "sources": sources,
         "header": norm_header,
         "extra_includes": norm_extra_includes,
         "cppflags": norm_cppflags,
+        "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
         "null_terminate": effective_null_terminate,
@@ -1177,8 +1165,25 @@ def record_harness_repair(harness_meta_path: Path, reason: str) -> dict[str, Any
     }
 
 
+def _bind_flag_values(argv: list[str]) -> list[str]:
+    """
+    argparse reads a lone value such as `--ldflags -lbsd` as an unknown option; bind the value of
+    --cppflags / --ldflags with `=` so single flags work as well as quoted flag lists.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--cppflags", "--ldflags") and i + 1 < len(argv):
+            out.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
-    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    raw_argv = _bind_flag_values(list(argv) if argv is not None else sys.argv[1:])
     parser = argparse.ArgumentParser(description="Generate Dual-Use Eva + E-ACSL LibFuzzer Harness.")
     parser.add_argument("--module", help="Module slice identifier (e.g. snmpv3)")
     parser.add_argument("--sources", nargs="+", help="List of C source files in the module slice")
@@ -1186,6 +1191,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--entry-fn", help="Target entry function accepting (buf, len)")
     parser.add_argument("--max-size", type=int, default=1500, help="Max symbolic/fuzzer buffer size in bytes")
     parser.add_argument("--cppflags", default="-I.", help="Extra preprocessor flags")
+    parser.add_argument(
+        "--ldflags",
+        default="",
+        help="Linker flags the module's fuzz builds need (e.g. '-lbsd -lm'); recorded in the sidecar for pipeline_make.py",
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("workspace/harnesses"))
     parser.add_argument(
         "--reachability",
@@ -1230,7 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--record-repair", type=Path, default=None, help="Path to harness_<mod>.json to record a repair")
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     if args.record_repair is not None:
         if not args.reason.strip():
@@ -1275,6 +1285,7 @@ def main(argv: list[str] | None = None) -> int:
             null_terminate=args.null_terminate,
             auto_args=args.auto_args,
             auto_prelude=args.auto_prelude,
+            ldflags=args.ldflags,
         )
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

@@ -33,7 +33,7 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
    - **Check 1 (Frama-C Kernel Syntax):** run `run_wp_function.py` or `frama-c -kernel-warn-key annot-error=abort` on `agents/{agent_id}/scratch/work/` to confirm zero ACSL syntax or typing errors.
    - **Check 2 (Dynamic E-ACSL Anti-Hallucination Guardrail):**
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/guard_{module_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 200 --cppflags '-Iagents/{agent_id}/scratch/work {cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/header_guard_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/guard_{module_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 200 --cppflags='-Iagents/{agent_id}/scratch/work {cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/header_guard_{module_name}.json
      ```
    - `rejected_overconstrained`: inspect `runtime_trace` and `failure`, relax the clause that failed on real inputs, and re-run until `passed_dynamic_oracle`.
    - `code_fault`: an RTE failed on a real input; report it (status `failed`) instead of weakening contracts around it.

@@ -1,8 +1,8 @@
 /*
  * E-ACSL runtime initialization for libFuzzer targets.
  *
- * Linked as-is into every E-ACSL fuzz binary by run_eacsl_fuzz.py and
- * GNUmakefile.template (stage 2, `e-acsl-gcc -C`); it is never instrumented.
+ * Linked as-is into every E-ACSL fuzz binary by run_eacsl_fuzz.py (stage 2,
+ * `e-acsl-gcc -C`), which every Make recipe calls; it is never instrumented.
  *
  * E-ACSL inserts __e_acsl_memory_init / __e_acsl_globals_init at the top of
  * main(). A libFuzzer target has no main of its own (libFuzzer's main is not

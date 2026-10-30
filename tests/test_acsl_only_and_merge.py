@@ -631,7 +631,9 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         # Now reset workspace/work/ to baseline and simulate prover-2 failing verification during batch merge
         (overlay / "work/parser.c").write_text(BASELINE_C, encoding="utf-8")
 
-        def fake_reverify(run_dir, overlay_dir, agent_id, role, c_file, function, module, sources, cppflags, ldflags=""):
+        def fake_reverify(run_dir, overlay_dir, agent_id, role, c_file, function, module, sources, cppflags, ldflags="",
+                          wp_par=None):
+            assert wp_par is not None and wp_par >= 1  # parallel re-checks share the job budget
             if function == "parse_payload":
                 return False, "parse_payload WP failed"
             return True, "ok"
@@ -770,7 +772,8 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
 
         seen_cppflags: list[str] = []
 
-        def fake_reverify(run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags=""):
+        def fake_reverify(run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="",
+                          wp_par=None):
             seen_cppflags.append(cppflags)
             return True, "ok"
 

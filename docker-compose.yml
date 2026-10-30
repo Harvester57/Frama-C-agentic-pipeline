@@ -1,3 +1,9 @@
+# Manual use only (e.g. `docker compose run --rm framac-pipeline "<command>"`).
+# The wrappers (wrappers/framac-docker.sh / .ps1) do not use this file: they size every container
+# dynamically through the host broker (scripts/resources.py exec), which measures the machine on each
+# call and sets --cpus/--memory/--pids-limit per job class. The static limits below are only a
+# reasonable default for an interactive container; scripts inside still size themselves from the
+# container's cgroup limits.
 services:
   framac-pipeline:
     build:

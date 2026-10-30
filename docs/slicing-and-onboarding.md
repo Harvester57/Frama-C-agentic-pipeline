@@ -53,10 +53,12 @@ The target is mounted read-only, so the build runs in a disposable copy inside t
 ```powershell
 & "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
   -TargetDir "C:\path\to\c-project" -RunDir "<run-dir>" `
-  "mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/ && python3 /opt/framac-pipeline/scripts/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j8"
+  "mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/ && python3 /opt/framac-pipeline/scripts/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j`$FRAMAC_JOB_CPUS"
 ```
 
-Once `compile_commands.json` exists, `build_callgraph_dag.py` automatically extracts per-file `-I` and `-D` flags and populates `workspace/harnesses/<module>.mk`.
+`FRAMAC_JOB_CPUS` is the number of CPUs the broker leased to this container, so the build uses the whole lease and no more. In PowerShell the backtick keeps `$FRAMAC_JOB_CPUS` for the container's shell; in the POSIX wrapper, single-quote the command instead.
+
+Once `compile_commands.json` exists, `build_callgraph_dag.py` automatically extracts per-file `-I` and `-D` flags into each module's `cppflags`. The harness sidecars carry them into `pipeline_make.py gen`, which writes the per-module Make recipes.
 
 ---
 

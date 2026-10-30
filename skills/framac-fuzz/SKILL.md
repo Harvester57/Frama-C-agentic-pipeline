@@ -35,6 +35,8 @@ Select all modules with `run_eacsl_fuzz: true` (or the specific `--module <name>
 
 ## Step 1b — Verify the E-ACSL Toolchain (once per image / Frama-C version)
 
+The `selftest` Make target (a prerequisite of `fuzz`) runs it; for a one-off check:
+
 ```powershell
 & "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
   -TargetDir "<target-dir>" -RunDir "<run-dir>" `
@@ -45,15 +47,24 @@ Select all modules with `run_eacsl_fuzz: true` (or the specific `--module <name>
 
 ---
 
-## Step 2 — Parallel Fuzzing Fan-Out
+## Step 2 — Fuzz Every Module with Make (no subagents)
 
-Run one campaign per module slice (up to 8 concurrently). Each campaign writes only its own module's corpus, crash directory, and report:
+Campaigns need no judgment, so they run from the generated Makefile, not from one LLM subagent per module. Make admits each campaign by CPU and memory and gives it as many LibFuzzer workers as the measured budget allows (`docs/resources-and-caching.md`). The wrapper commands below are the same on POSIX (`framac-docker.sh`). `S=/opt/framac-pipeline/scripts`.
 
-```powershell
-$env:PYTHONIOENCODING="utf-8"
-& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
-  -TargetDir "<target-dir>" -RunDir "<run-dir>" `
-  "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources workspace/work/src/<mod>/*.c workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --max-time <time> --engine auto --cppflags '-Iworkspace/work/include -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json"
+1. Generate the Makefile once, in the foreground: `python3 $S/pipeline_make.py gen`. Its JSON lists the runnable modules and any module excluded with a reason (no harness sidecar, or a flag outside the allowlist).
+2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`. Builds are cached by content, so repeating this after a harness repair rebuilds only what changed. Write this command exactly as shown, with the full path: only this exact command line may also fill the shared cross-run cache (`docs/resources-and-caching.md`, Section 5).
+3. Fuzz every module **in the background**, since it can exceed a foreground tool timeout: `python3 $S/pipeline_make.py run fuzz`. `/framac-eva` runs at the same time, as a second background wrapper call.
+4. Tune per module only where needed, then re-run the target. Options: dictionaries, budgets, `--fuzz-max-time`.
+   ```text
+   python3 $S/pipeline_make.py params set --module <mod> --fuzz-dict <file> --fuzz-budget <cpu-seconds>
+   ```
+
+Each campaign writes only its own module's corpus, crash directory, and report (`workspace/reports/fuzz/<mod>.json`). The fuzz budget is CPU-seconds per module from the profile (quick 60, standard 120, deep 900). Wall time = budget / workers, at least 30 s, so a larger node finishes sooner at equal or greater effort. `-rss_limit_mb` stays fixed at 2048 on every machine, so `oom_found` means the same thing everywhere.
+
+For a single module in guidance mode, the underlying command is:
+
+```text
+python3 $S/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
 ```
 
 `run_eacsl_fuzz.py` supports `--engine {auto,eacsl,sanitizers}` (default `auto` in `campaign` mode):
@@ -87,13 +98,15 @@ For E-ACSL behaviour not covered here, start with [`docs/references/e-acsl-quick
 | `timeout_found` / `oom_found` | Per-input timeout or RSS limit hit. A termination/DoS lead, not a memory-safety bug. |
 | `clean` | No failure within the time budget. The corpus in `workspace/corpus/<mod>/` becomes the dynamic anti-hallucination corpus for `/framac-wp`. Fuzzing is not proof. |
 | `fuzzer_error` / `compile_error` / `sandbox_unavailable` | The campaign did not run to completion. Never read this as clean. |
+| `not_run` | No report was produced for an expected module (the job was killed or excluded). Written by `ingest` so the gap is recorded, never silent. |
 
-Then ingest all reports (parent only):
+Then ingest (parent only), after both fuzz and Eva have finished:
 
 ```text
-python3 /opt/framac-pipeline/scripts/ledger.py ingest-fuzz workspace/reports/fuzz/*.json
-python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
+python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest
 ```
+
+`ingest` ingests only reports it has not seen before, matched by content digest. Fuzz reports go before Eva reports. Every expected module gets a report, or a `not_run` record. Then it runs `validate_artifacts.py run-dir .`.
 
 Each fingerprint becomes one entry in `candidates.json` (several crash inputs with the same failing predicate collapse into one candidate), and the matching ledger units become `candidate` (including any `deferred` Tier 3 helper functions reached via cross-module calls), which excludes them from WP. A crash is a candidate until a verifier confirms that the fault is in target code and that the harness respected the entry function's contract.
 

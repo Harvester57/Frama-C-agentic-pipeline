@@ -13,7 +13,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 - **Fix:**
   1. Never pass `-I/usr/include` or `-I/usr/local/include` in `CPPFLAGS`. `build_callgraph_dag.py` automatically strips host system include paths from `compile_commands.json` so Frama-C uses its portable `__fc_libc` headers.
   2. If the target requires third-party system headers (e.g., `<bsd/string.h>`, `<openssl/evp.h>`), pass `--target-packages "<pkg>"` (`-TargetPackages` in PowerShell) to `framac-docker` so the real `-dev` package is installed in the container image.
-  3. Ensure `-machdep gcc_x86_64` (already the default in `GNUmakefile.template`, `run_eva_slice.py`, and `run_wp_function.py`) is active so GNU C extensions supported by Frama-C are enabled.
+  3. Ensure `-machdep gcc_x86_64` (already the default in `run_eva_slice.py`, `run_wp_function.py`, and `run_eacsl_fuzz.py`, which every Make recipe calls) is active so GNU C extensions supported by Frama-C are enabled.
   4. Guard hardware inline assembly or unsupported compiler intrinsics with `#ifndef __FRAMAC__ ... #else ... #endif` in the `workspace/work/` shadow tree.
 
 ### Symptom: `[kernel:annot-error] unbound logic variable alse` or `orall`
@@ -28,15 +28,15 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 - **Cause:**
   1. `e-acsl-gcc` runs `frama-c -no-frama-c-stdlib` so its second pass can compile `instrumented.c` with host `clang` against host glibc. If a harness guards `#include "__fc_builtin.h"` only with `#ifdef __FRAMAC__`, `e-acsl-gcc` enters that block and fails because `__fc_builtin.h` is not on the host include path, and host `<math.h>`/`<stdlib.h>` expose `_Float128` prototypes on glibc >= 2.26.
   2. Frama-C 33+ installs `e-acsl-gcc` (no `.sh`). Its `-h` lists only the short flags (`-F`, `-G`, `-E`, `-e`, `-l`, `-n`, `-C`, `-M`), though long options such as `--rte=all` are still accepted. Running `-rte` across all functions without `-rte-select` instruments unused inline helpers.
-- **Fix:** `harness_dual.c.template` guards `#include "__fc_builtin.h"` and `eva_main()` with `#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)`, and `run_eacsl_fuzz.py` / `GNUmakefile.template` automatically pass `-D__FRAMAC_EACSL__ -D_Float128=double` along with `-rte-select` and `-e-acsl-functions` scoped to the functions defined in the target slice `.c` files. Full compiler diagnostics are saved to `<out-bin>.compile.log`. If `e-acsl-gcc` still fails in `campaign` mode, `--engine auto` falls back to native `clang -fsanitize=fuzzer,address,undefined`.
+- **Fix:** `harness_dual.c.template` guards `#include "__fc_builtin.h"` and `eva_main()` with `#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)`, and `run_eacsl_fuzz.py` automatically passes `-D__FRAMAC_EACSL__ -D_Float128=double` along with `-rte-select` and `-e-acsl-functions` scoped to the functions defined in the target slice `.c` files. Full compiler diagnostics are saved to `<out-bin>.compile.log`. If `e-acsl-gcc` still fails in `campaign` mode, `--engine auto` falls back to native `clang -fsanitize=fuzzer,address,undefined`.
 
 ### Symptom: `frama-c` (Eva / WP) Cannot Find `<bsd/string.h>`, `<json-c/json.h>`, `<netinet/ip_icmp.h>`, or `__int32_t`
 - **Cause:** `frama-c` runs with `-frama-c-stdlib` (`-nostdinc`), searching only `__fc_libc` and explicit `-I` flags so host `/usr/include` does not shadow `__fc_libc`.
-- **Fix:** `run_eva_slice.py`, `run_wp_function.py`, and `GNUmakefile.template` automatically append `-I/opt/framac-pipeline/templates/fc_stubs -include fc_compat_types.h`, providing bodyless ACSL-annotated prototypes for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, and glibc `__int8_t`..`__uint64_t` typedefs while keeping external specifications `Considered valid` (`STATUS_ASSUMED`) in the ledger.
+- **Fix:** `run_eva_slice.py` and `run_wp_function.py` automatically append `-I/opt/framac-pipeline/templates/fc_stubs -include fc_compat_types.h`, providing bodyless ACSL-annotated prototypes for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, and glibc `__int8_t`..`__uint64_t` typedefs while keeping external specifications `Considered valid` (`STATUS_ASSUMED`) in the ledger.
 
 ### Symptom: Selftest `compiled: false` With `undefined reference to 'main'` / `fail to compile/link un-instrumented code`
 - **Cause:** by default `e-acsl-gcc` instruments **and** links the original sources. A libFuzzer harness has no `main()`, so that link fails and `e-acsl-gcc` exits 1, even though the instrumented file was written.
-- **Fix:** `run_eacsl_fuzz.py` and `GNUmakefile.template` pass `-n` (instrument only) in stage 1.
+- **Fix:** `run_eacsl_fuzz.py` passes `-n` (instrument only) in stage 1.
 
 ### Symptom: Every Input Crashes in `shadow_alloca` (`e_acsl_segment_tracking.c`), or Valid Stack Accesses Fail `\valid`
 - **Cause:** E-ACSL initializes its runtime at the top of `main()`, and a harness has none. Without full memory tracking, its memory analysis leaves a caller's stack buffer untracked, so a callee's valid write fails `\valid`. With full tracking but no runtime initialization, the runtime segfaults on the first tracked stack block.
@@ -52,6 +52,10 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
   - If a library-filled buffer is the cause, initialize it before the call (`= {0}` / `memset`) or rerun with `--no-rte-initialized`. That opt-out is recorded in `reduced_checks`, and Eva still reports uninitialized reads statically.
   - Per-function exclusion (`-rte-initialized=@all,-f`) only works for non-`static` functions in Frama-C 33.
   - The crash verifier classifies such reports as `harness_induced`.
+
+### Symptom: Every Input Fails `\initialized(&__retres)` in a `__gen_e_acsl_<fn>` Wrapper
+- **Cause:** an E-ACSL gap in Frama-C 33. The wrapper that checks a function contract registers its `__retres` with the runtime but never marks it initialized after `__retres = <fn>(...)`. Under `-rte-initialized`, any `ensures` that reads `\result` then fails on the first input.
+- **Fix:** automatic. Between instrumentation and compilation, `run_eacsl_fuzz.py` inserts the missing `__e_acsl_initialize` after each such assignment; the build report counts them in `compile.wrapper_result_inits`. This is sound, because the callee's own return value is still checked for uninitialized reads. A report of this failure means the build ran without that step: rebuild it, and never weaken a contract to get past it.
 
 ### Symptom: `implicit cast: cannot cast from __e_acsl_mpz_t to size_t` (E-ACSL silently in GMP-only mode)
 - **Cause:** `e-acsl-gcc` splits the values of `-e`/`-E`/`-F`/`-l` on spaces and re-parses the tokens. A standalone `-g` inside `-e` is read as its own `--gmp` option (`-e-acsl-gmp-only`).
@@ -150,3 +154,17 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 ### Symptom: PowerShell Splits Frama-C or Docker CLI Flags Containing `.` or `=`
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.
 - **Fix:** Always invoke container commands through [`wrappers/framac-docker.ps1`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
+
+---
+
+## Resources, Caches and Scheduling
+
+The full guide is [`resources-and-caching.md`](resources-and-caching.md) (Section 9 lists symptoms). The most common ones:
+
+- **A command prints "queue position N" and waits:** the measured pool is busy. `python3 scripts/resources.py status` (on the host) lists the leases. Leases of killed wrappers are released once their containers exit (`resources.py gc`).
+- **A WP report has `"status": "analysis_error"`:** Frama-C was killed or timed out (`reason`: `oom_killed`, `timeout`, `crashed`). Nothing was proven or refuted. The recorded peak memory makes the next lease larger, and the scheduler retries once before marking the units `blocked`.
+- **Suspected stale cache result:** re-run with `FRAMAC_CACHE=off` and compare, then `python3 /opt/framac-pipeline/scripts/cache.py clear`.
+- **The shared cross-run store stays empty:** only the exact commands `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build|eva|wp-sweep` may write it. A `$S/...` path, an extra target or option, or `FRAMAC_CACHE_RW=off` makes the store read-only (`FRAMAC_CACHE_MODE=ro` inside the container).
+- **An ad-hoc command is OOM-killed at 1 GiB:** commands the broker does not recognise run as `light` (1 CPU, 1 GiB). Pass `-Class` / `--class` (for example `build` or `phase-dynamic`).
+- **`RunLockTimeout`:** another container held the run's `ledger` or `merge` lock for longer than `FRAMAC_LOCK_TIMEOUT`. A holder whose heartbeat stopped (`FRAMAC_LOCK_STALE`, default 120 s) is broken automatically, and an interrupted merge is rolled back from `state/merge-journal.json` by the next merge.
+- **Need the previous static behavior:** `FRAMAC_BROKER=off` (`-NoBroker`) for container sizing, `FRAMAC_SCHEDULER=waves` for Phase 3 dispatch.

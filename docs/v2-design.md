@@ -152,7 +152,7 @@ Roles: recon, header architect, prover, breaker, crash verifier, proof auditor, 
 - Profiles change breadth, never the evidence bar.
 - **Budget** (optional, in agent invocations) reserves critic and verifier/auditor calls before any prover or breaker is launched. Exhaustion sets `run_status: incomplete` with a reason.
 - **Guidance mode**: focused requests ("help me prove this function", "why does WP fail here") use the relevant brief and tooling on a scratch copy with no run directory, ledger, or report. Full mode only on an explicit pipeline request or when artifacts are requested.
-- **Carry-forward** across `run-<N>`: each unit stores hashes of its preprocessed body, its own contract, the callee contracts it relies on, the stubs it uses, and toolchain versions. A prior `covered` unit carries forward only on a full match plus a cheap WP replay. Prior `confirmed` findings re-run their reproducer. Prior `needs_validation`, `deferred`, and `blocked` units become current work. A prior `rejected` record suppresses only the identical fingerprint.
+- **Carry-forward** across `run-<N>`: each unit stores hashes of its preprocessed body, its own contract, the callee contracts it relies on, the stubs it uses, and toolchain versions. A prior `covered` unit carries forward only on a full match plus a cheap WP replay. The replay is cheap because the trusted end-of-run `wp-sweep` fills the shared proof cache; see `docs/resources-and-caching.md`, Section 5. Prior `confirmed` findings re-run their reproducer. Prior `needs_validation`, `deferred`, and `blocked` units become current work. A prior `rejected` record suppresses only the identical fingerprint.
 
 ---
 

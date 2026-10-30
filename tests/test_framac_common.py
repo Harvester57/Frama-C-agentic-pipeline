@@ -19,6 +19,9 @@ def test_status_spellings_from_different_frama_c_releases():
     assert normalize_status("Valid_under_hyp") == STATUS_VALID_UNDER_HYP
     assert normalize_status("Unknown") == STATUS_UNKNOWN
     assert normalize_status("Invalid") == STATUS_INVALID
+    # Frama-C 33's report CSV spells Eva's red alarm and plain dead code this way.
+    assert normalize_status("Invalid or unreachable") == STATUS_INVALID
+    assert normalize_status("Dead") == STATUS_DEAD
     assert normalize_status("Invalid but dead") == STATUS_DEAD
     assert normalize_status("Invalid_but_dead") == STATUS_DEAD
     assert normalize_status("Considered valid") == STATUS_ASSUMED
@@ -52,3 +55,49 @@ def test_safe_paths_and_agent_ids():
     assert is_safe_agent_id("prover-ber-len-1")
     assert not is_safe_agent_id("Prover")
     assert not is_safe_agent_id("con")
+
+
+def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+
+    import pytest
+
+    from conftest import ROOT
+    from framac_common import RunLockTimeout, run_lock
+
+    marker = tmp_path / "holder_has_lock"
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import pathlib, sys, time\n"
+         "from framac_common import run_lock\n"
+         "with run_lock('ledger', pathlib.Path(sys.argv[1])):\n"
+         "    pathlib.Path(sys.argv[2]).write_text('1')\n"
+         "    time.sleep(1.5)\n",
+         str(tmp_path), str(marker)],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
+    )
+    try:
+        deadline = time.time() + 30
+        while not marker.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), "holder never acquired the lock"
+        with pytest.raises(RunLockTimeout):
+            with run_lock("ledger", tmp_path, timeout=0.3):
+                pass
+        with run_lock("ledger", tmp_path, timeout=30):
+            assert holder.poll() is not None  # acquired only after the holder released it
+    finally:
+        holder.wait(timeout=30)
+
+    # A lock whose heartbeat stopped long ago belongs to a dead holder and is broken.
+    stale = tmp_path / ".framac-locks" / "merge.lock"
+    stale.mkdir(parents=True)
+    (stale / "owner.json").write_text("{}", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(stale / "owner.json", (old, old))
+    with run_lock("merge", tmp_path, timeout=1, stale_after=60) as lock_dir:
+        assert lock_dir == stale and (lock_dir / "owner.json").stat().st_mtime > old
+    assert not (tmp_path / ".framac-locks").exists()

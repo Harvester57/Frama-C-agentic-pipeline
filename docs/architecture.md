@@ -45,14 +45,14 @@ flowchart TD
         J["Run frama-c -eva -main eva_main ... -then -rte<br/>(run_eva_slice.py)"] --> K{"Inspect RTE Alarm Table"}
         K -- "Green (Valid: ~85%)" --> L["Discharged Automatically"]
         K -- "Red (Invalid)" --> I
-        K -- "Orange (Unknown: ~15%)" --> M["Filter Surviving Unknown Functions<br/>into Topological Waves 0..K"]
+        K -- "Orange (Unknown: ~15%)" --> M["Queue Surviving Unknown Functions<br/>(wp_scheduler.py init)"]
     end
 
-    subgraph P3["Phase 3: Wavefront Parallel Subagent WP Loop (/framac-wp)"]
+    subgraph P3["Phase 3: Dependency-Driven Subagent WP Loop (/framac-wp)"]
         M --> N["Stage 3A: Speculative Header Architect Swarm<br/>Drafts .h Contracts Validated via E-ACSL Guardrail"]
-        N --> O["Stage 3B: Wavefront Function Pods (Wave 0 -> Wave K)<br/>Parallel Prover Subagents (-wp-fct fn)"]
+        N --> O["Stage 3B: Ready-Queue Function Provers<br/>(dispatched once callees are merged; -wp-fct fn)"]
         O --> P{"All Goals Proven<br/>within K Retries?"}
-        P -- "Yes" --> Q["Lock Verified Contract in .h<br/>& Process Cross-Wave Strengthening Requests"]
+        P -- "Yes" --> Q["Lock Verified Contract in .h<br/>& Process Strengthening Requests"]
         P -- "Stalled after K Retries" --> R["Stage 3C: Spawn Adversarial Breaker Subagent<br/>(Targeted E-ACSL Seed Synthesis)"]
         R -- "Crash Triggered" --> I
         R -- "Unreachable / Non-Linear" --> S["Retain Surgical E-ACSL Runtime Check<br/>for Residual Assertion"]
@@ -67,7 +67,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start(["Target Function f() in Wave W<br/>with Unproven RTE or Security Goals"]) --> StepA
+    Start(["Target Function f() (callees merged)<br/>with Unproven RTE or Security Goals"]) --> StepA
 
     subgraph MicroLoop["Ordered Dual-Oracle ACSL Synthesis Loop"]
         StepA["Step A: Synthesize/Refine Frame Conditions<br/>(assigns & loop assigns)"] --> StepB
@@ -91,7 +91,7 @@ flowchart TD
     end
 
     Inspect -- "Stalled (Retries == K)" --> Breaker["Spawn Adversarial Breaker Subagent<br/>(Craft Targeted E-ACSL Input)"]
-    Inspect -- "100% Valid!" --> Done(["Save Verified Function Shard<br/>& Unblock Callers in Wave W+1"])
+    Inspect -- "100% Valid!" --> Done(["Save Verified Function Shard<br/>& Unblock Its Callers"])
 ```
 
 ---
@@ -108,22 +108,31 @@ run-<N>/
 ├── findings.json                             # Verdict records: confirmed / needs_validation / rejected
 ├── REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif   # Derived reports
 ├── state/
-│   ├── progress.json                         # Phase & wave resume pointer
+│   ├── progress.json                         # Phase resume pointer
 │   ├── phase0.json ... phase3.json           # Phase completion snapshots
-│   └── phase3_shards/<fn>.json               # Per-function WP completion shards
+│   ├── phase3_shards/<fn>.json               # Per-function WP completion shards
+│   ├── wp_schedule.json                      # Phase-3 task graph (wp_scheduler.py)
+│   ├── merge-journal.json                    # Present only while a merge is in flight
+│   ├── cache/                                # Per-run caches: E-ACSL builds, WP proofs, Eva results
+│   ├── resource-history/<class>/             # Peak memory / OOM records that size future leases
+│   └── ingested.json                         # Digests of reports already ingested
 ├── workspace/
 │   ├── baseline/                             # Clean read-only snapshot of original C/H files
 │   ├── work/                                 # Active shadow tree (ACSL annotations only)
-│   ├── harnesses/                            # Generated harness_<mod>.c, <mod>.mk, and E-ACSL binaries
+│   ├── harnesses/                            # Generated harness_<mod>.c, harness_<mod>.json, and E-ACSL binaries
+│   ├── build/                                # Generated Makefile, modules.mk, params.json (pipeline_make.py)
 │   ├── corpus/<mod>/                         # LibFuzzer seed and coverage corpus per module (parent-owned)
 │   ├── crashes/<mod>/                        # crash-* inputs triggering E-ACSL assertions
 │   ├── contracts/                            # Exported verified .h and .acsl contract headers
 │   └── reports/
 │       ├── callgraph_dag.json                # Call-Graph DAG, waves, risk tiers, & security properties
-│       ├── strengthen_requests.json          # Cross-wave Caller-Callee contract negotiation ledger
+│       ├── strengthen_requests.json          # Caller-Callee contract negotiation ledger
+│       ├── wp_queue.json                     # Ordered Phase-3 queue (written by wp_scheduler.py init)
 │       ├── verified_acsl.patch               # Unified diff of all verified ACSL annotations
 │       ├── fuzz/<mod>.json                   # Phase 1 campaign outputs (fingerprinted failures)
 │       ├── eva/<mod>.json                    # Phase 2 Eva + RTE status buckets & per-slice .sarif
-│       └── wp/<fn>.json                      # Phase 3 per-function WP results by obligation class
-└── agents/<agent-id>/scratch/                # The only place a subagent may write
+│       ├── replay/<fp>.json                  # Deterministic replays of candidate reproducers
+│       ├── wp/<fn>.json                      # Phase 3 per-function WP results by obligation class
+│       └── wp-sweep/                         # End-of-run re-proof of merged functions
+└── agents/<agent-id>/scratch/                # The only place a subagent may write (parent_wp/ holds the parent re-check)
 ```

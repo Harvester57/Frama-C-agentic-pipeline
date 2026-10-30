@@ -32,10 +32,15 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 ### Case A — Candidate Has Reproducer Input(s) (`origin: "fuzz"` or `"breaker"`)
 
 1. **Replay & Inspect in the Sandbox:**
-   - Inspect the existing fuzz report in `tool_outputs` and replay the reproducer(s) in your scratch directory if needed:
+   - Start from the facts:
+     - the existing fuzz report in `tool_outputs`;
+     - the deterministic replay the parent already ran for this candidate. Look it up in `workspace/reports/replay/index.json`, which maps fingerprints to replay reports. Each artifact records `reproducible`, the parsed `failure` and the fingerprint.
+   - To replay the reproducer(s) yourself, for example after editing a seed, reuse the module's own build. Take its path from `compile.binary` in `workspace/reports/fuzz/{module_name}.json`; it is usually `workspace/harnesses/fuzz_{module_name}.e-acsl`:
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/empty_corpus --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 10 --cppflags '{cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/replay_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module_name} --inputs <reproducer files> --binary <compile.binary> --out-json agents/{agent_id}/scratch/replay_{module_name}.json
      ```
+   - Never rebuild that binary yourself under `workspace/harnesses/`, with these or any other flags.
+   - Every input is replayed exactly once, with a fixed seed and per-input timeout. Pass the replay report to the parent; `ingest-verifier --replay-report` checks `confirmed` reproducers against it.
 2. **Audit Harness Legitimacy:**
    - Read `workspace/harnesses/harness_{module_name}.c`, `workspace/harnesses/harness_{module_name}.json`, and the target entry function's header and implementation in `workspace/work/`.
    - Check whether the failure occurred because the harness violated a non-attacker precondition of the entry function (for example: passing an uninitialized context struct pointer, violating a documented internal API invariant, or faulting inside the harness itself).
@@ -57,7 +62,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 2. **Targeted Reproduction Attempt (Up to 20s):**
    - If the path appears feasible from `LLVMFuzzerTestOneInput`, write 1–3 targeted seed files into `agents/{agent_id}/scratch/seeds/` and run a short sandboxed E-ACSL campaign:
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/seeds --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 20 --cppflags '{cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/attempt_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/seeds --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 20 --cppflags='{cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/attempt_{module_name}.json
      ```
    - **If reproduced (`reproducible: true`):** upgrade to `decision: "confirmed"` and attach the reproducer from `agents/{agent_id}/scratch/crashes/` (also pass `--replay-report agents/{agent_id}/scratch/attempt_{module_name}.json` when the parent ingests your verdict).
    - **If not reproduced:** return `decision: "needs_validation"` with `origin` set to `"eva_invalid_no_witness"` or `"fault_hypothesis"`, concrete `blockers`, and a specific `validation_plan` (`local` and/or `owner`).

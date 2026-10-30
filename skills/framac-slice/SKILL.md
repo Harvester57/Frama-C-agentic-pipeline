@@ -39,8 +39,10 @@ If the target has no `compile_commands.json` (or has an out-of-tree build system
 
 ```text
 mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/
-python3 $S/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j4
+python3 $S/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j"$FRAMAC_JOB_CPUS"
 ```
+
+The broker sizes a sandboxed `bear`, `make`, `cmake`, `ninja`, `meson` or `configure` command like a whole phase (`phase-dynamic`), and `FRAMAC_JOB_CPUS` is the CPU count it leased. `$FRAMAC_JOB_CPUS` must reach the container unexpanded: in the PowerShell wrapper's double-quoted command write `` `$FRAMAC_JOB_CPUS ``.
 
 For CMake: `cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"` inside the same scratch copy. Pass the result to Step 2 with `--compile-commands`. If the target depends on additional Debian/Ubuntu `-dev` packages not in the base image, pass `--target-packages "<pkg1> <pkg2>"` (or `-TargetPackages` in PowerShell) to the Docker wrapper so the real headers and libraries are installed into a cached derived image before container privileges are dropped.
 
@@ -88,8 +90,10 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 
 ```text
-python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom> [--auto-args] --max-size 1500 --out-dir workspace/harnesses
+python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom> [--auto-args] [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
 ```
+
+The sidecar `harness_<mod>.json` is the single source of truth for later phases: `sources`, `cppflags`, `ldflags`, `include_source`. `pipeline_make.py gen` builds every module's fuzz, Eva and build recipes from it, so put the module's real link flags in `--ldflags` here rather than on later command lines. Flags outside the build allowlist (for example `-fplugin`, `-B`, `-fuse-ld`, `-Wl,`) exclude the module from the Make phases. `gen` reports them.
 
 Supported `--entry-style` modes and options in `generate_harness.py`:
 - `buffer_len` (default): `entry_fn(input_buf, input_len)` for standard `(const uint8_t *, size_t)` parsers.
@@ -122,4 +126,7 @@ python3 $S/ledger.py seed --dag workspace/reports/callgraph_dag.json [--scope <r
 python3 $S/validate_artifacts.py run-dir .
 python3 $S/checkpoint.py init state --target /target
 python3 $S/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json
+python3 $S/pipeline_make.py gen
 ```
+
+`pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`). Check its JSON for modules excluded with a reason before moving on.

@@ -93,7 +93,7 @@ Checked on 2026-10-30 against a fresh `framac-pipeline:latest` build (Frama-C 33
   ```
   This mirrors what E-ACSL inserts at the top of a real `main`.
 - **With that hook, both `-n -M` and `-n -main LLVMFuzzerTestOneInput` are correct on all six probes.** Every violation is reported as `file:line: Error: Assertion failed:` (libFuzzer exit code 77), and every benign input runs clean.
-- **The pipeline now uses `-n -M` plus the hook** (`templates/eacsl_runtime/fuzz_init.c`, linked in stage 2 by `run_eacsl_fuzz.py` and `GNUmakefile.template`). On the rebuilt image, the following all passed:
+- **The pipeline now uses `-n -M` plus the hook** (`templates/eacsl_runtime/fuzz_init.c`, linked in stage 2 by `run_eacsl_fuzz.py`, which every Make recipe calls). On the rebuilt image, the following all passed:
   - all six probes, built through the unmodified pipeline;
   - the selftest, with every check passing, including the new `benign_input_clean`;
   - a 21-second `campaign` on a bug-free harness: 542,981 executions, `clean`, `engine_used: eacsl`, RSS flat at 51 MB;
@@ -103,4 +103,6 @@ Checked on 2026-10-30 against a fresh `framac-pipeline:latest` build (Frama-C 33
   - **Generated harness with a real bug:** both benign inputs ran clean, and the uninitialized read was flagged at its exact line.
   - **Bug-free generated harness:** `campaign` was `clean` and `guardrail` gave `passed_dynamic_oracle`. Throughput was 3,336 exec/s with the checks and 7,459 without (`--no-rte-initialized`).
   - **The six probes above:** all six violations are still detected. Two benign inputs now raise false alarms, both from target code reading libFuzzer's `data` directly, which generated harnesses never do.
+  - **Contract wrappers:** E-ACSL never marks the `__retres` of a generated `__gen_e_acsl_<fn>` wrapper initialized, so every `ensures` on `\result` failed `\initialized(&__retres)`. The build now inserts the missing `__e_acsl_initialize` between the two stages (`compile.wrapper_result_inits`). A deliberately false `ensures` is still rejected (`rejected_overconstrained`).
+- **Failure reports:** Frama-C 33 prints the failing property's label (`rte/index_bound`, a named clause) on its own line and the predicate (`i < 8`) on the next. `parse_eacsl_failure` returns them separately (`label`, `predicate`), so a crash and an Eva red alarm on the same property share one fingerprint.
 - **Measured noise of the other `--rte=all` checks** (not enabled): unsigned overflow flagged an FNV hash, unsigned downcast flagged a byte encoder, and signed downcast flagged a `(char)` cast of an input byte, all on benign inputs. A single alarm aborts the input, so the campaign stops there.

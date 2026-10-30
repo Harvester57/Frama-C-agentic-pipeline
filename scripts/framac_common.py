@@ -7,15 +7,22 @@ Shared helpers for the Frama-C pipeline scripts (stdlib only).
   differ between Frama-C releases ("property kind" vs "kind", "Valid under hyp."
   vs "Valid_under_hyp").
 - Safe run-relative path checks used by validators and ingestion.
+- `run_lock()`: an exclusive lock on run-dir state shared by every container of a run.
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import os
 import re
+import shutil
+import socket
 import tempfile
+import threading
+import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,10 +44,14 @@ _STATUS_MAP = {
     "valid_under_hypotheses": STATUS_VALID_UNDER_HYP,
     "unknown": STATUS_UNKNOWN,
     "invalid": STATUS_INVALID,
+    # Eva's red alarm in Frama-C 33 reports: the property fails whenever its statement is
+    # reached, and reachability is not established. Still a candidate needing a witness.
+    "invalid_or_unreachable": STATUS_INVALID,
     "invalid_under_hyp": STATUS_INVALID_UNDER_HYP,
     "invalid_under_hypotheses": STATUS_INVALID_UNDER_HYP,
-    # "... but dead": the property sits in code that is unreachable under the
+    # "Dead" and "... but dead": the property sits in code that is unreachable under the
     # analysis context. Never a bug, never a proof.
+    "dead": STATUS_DEAD,
     "invalid_but_dead": STATUS_DEAD,
     "valid_but_dead": STATUS_DEAD,
     "unknown_but_dead": STATUS_DEAD,
@@ -54,6 +65,17 @@ _STATUS_MAP = {
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def failure_reason(returncode: int | None, timed_out: bool) -> str:
+    """Why Frama-C produced no report: wall-clock limit, SIGKILL (the cgroup OOM killer), a signal, or a crash."""
+    if timed_out:
+        return "timeout"
+    if returncode in (-9, 137):
+        return "oom_killed"
+    if returncode is not None and returncode < 0:
+        return f"signal_{-returncode}"
+    return "crashed" if returncode else "no_report"
 
 
 def normalize_status(raw: str | None) -> str:
@@ -273,6 +295,138 @@ def augment_framac_cppflags(cppflags: str) -> str:
     if "fc_compat_types.h" not in base and (fc_stubs / "fc_compat_types.h").is_file():
         parts.append(f"-include {compat_hdr}")
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Run-dir locks
+# ---------------------------------------------------------------------------
+#
+# The run directory is shared by every container of a run (one per wrapper call), so a
+# lock must work across PID namespaces and on bind mounts where flock is unreliable
+# (NFS, 9p, virtiofs, Docker Desktop). A lock is a directory created with an atomic
+# mkdir; its owner refreshes `owner.json` as a heartbeat, and a lock whose heartbeat is
+# older than `stale_after` belongs to a dead holder and is broken. Locks are reentrant
+# within one process.
+
+LOCKS_DIR = ".framac-locks"
+
+
+class RunLockTimeout(RuntimeError):
+    """Another holder kept the run lock longer than the caller was willing to wait."""
+
+
+_held_locks: dict[str, int] = {}
+_held_guard = threading.Lock()
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _lock_age(lock_dir: Path) -> float | None:
+    for probe in (lock_dir / "owner.json", lock_dir):
+        try:
+            return time.time() - probe.stat().st_mtime
+        except OSError:
+            continue
+    return None
+
+
+def _break_stale_lock(lock_dir: Path) -> None:
+    tomb = lock_dir.with_name(f"{lock_dir.name}.stale-{os.getpid()}-{time.time_ns()}")
+    try:
+        os.replace(lock_dir, tomb)
+    except OSError:
+        return
+    shutil.rmtree(tomb, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def run_lock(
+    name: str = "ledger",
+    run_dir: Path | None = None,
+    timeout: float | None = None,
+    stale_after: float | None = None,
+) -> Iterator[Path]:
+    """
+    Hold the run-wide lock `name` (`ledger` guards coverage-ledger.json, candidates.json,
+    findings.json, strengthen_requests.json and the WP schedule; `merge` guards writes to
+    workspace/work/). Waits up to `timeout` seconds (FRAMAC_LOCK_TIMEOUT, default 1800).
+    """
+    lock_dir = (Path(run_dir) if run_dir is not None else Path.cwd()) / LOCKS_DIR / f"{name}.lock"
+    key = str(lock_dir.resolve())
+    with _held_guard:
+        depth = _held_locks.get(key, 0)
+        if depth:
+            _held_locks[key] = depth + 1
+    if depth:
+        try:
+            yield lock_dir
+        finally:
+            with _held_guard:
+                _held_locks[key] -= 1
+        return
+
+    wait_limit = timeout if timeout is not None else _env_seconds("FRAMAC_LOCK_TIMEOUT", 1800.0)
+    stale = stale_after if stale_after is not None else _env_seconds("FRAMAC_LOCK_STALE", 120.0)
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait_limit
+    delay = 0.02
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            break
+        except FileNotFoundError:
+            # A releasing holder removed the empty .framac-locks/ parent between our calls.
+            lock_dir.parent.mkdir(parents=True, exist_ok=True)
+            continue
+        except FileExistsError:
+            age = _lock_age(lock_dir)
+            if age is not None and age > stale:
+                _break_stale_lock(lock_dir)
+                continue
+            if time.monotonic() >= deadline:
+                owner = load_json_optional(lock_dir / "owner.json", {}) if (lock_dir / "owner.json").is_file() else {}
+                raise RunLockTimeout(
+                    f"run lock {lock_dir} still held after {wait_limit:.0f}s by {owner or 'an unknown holder'}"
+                ) from None
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
+
+    owner_file = lock_dir / "owner.json"
+    owner_file.write_text(
+        json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "acquired_at": utc_now()}) + "\n",
+        encoding="utf-8",
+    )
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        interval = max(1.0, min(15.0, stale / 4))
+        while not stop.wait(interval):
+            try:
+                os.utime(owner_file)
+            except OSError:
+                return
+
+    beat = threading.Thread(target=_heartbeat, name=f"run-lock-{name}", daemon=True)
+    beat.start()
+    with _held_guard:
+        _held_locks[key] = 1
+    try:
+        yield lock_dir
+    finally:
+        with _held_guard:
+            _held_locks.pop(key, None)
+        stop.set()
+        beat.join(timeout=5)
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        try:
+            lock_dir.parent.rmdir()  # leave no empty .framac-locks/ behind
+        except OSError:
+            pass
 
 
 # Frama-C: "Calling undeclared function X. Old style K&R code?" (it then invents `int X()`,

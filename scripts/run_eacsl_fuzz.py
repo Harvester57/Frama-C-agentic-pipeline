@@ -16,16 +16,35 @@ Modes:
      - code_fault               : an RTE assertion failed; this is a code defect candidate,
                                   not evidence against the contract
      - guardrail_error / compile_error
+3. `selftest`: builds the bundled canary through the production path (never cached).
+4. `build`: compiles a module's fuzz binary only (no target code runs). Used by Make.
+5. `replay`: replays given inputs once each on a given or built binary. The report's
+   `artifacts[{artifact, kind, sha256, size_bytes, reproducible, failure, fingerprint}]`
+   is the campaign's shape, which `ledger.py ingest-verifier --replay-report` accepts.
+6. `replay-candidates`: replays the reproducers of every unverified candidate on its module's
+   binary (built with Make's spec, `pipeline_make.module_build_spec`, so it is the cache entry
+   of `make build`) and writes one report per candidate plus index.json.
 
 All fuzzer, replay and guardrail executions run through scripts/sandbox_exec.py. The shared
 corpus is never written by the guardrail: new units go to a scratch corpus directory.
+
+Sizing and determinism (scripts/resources.py): campaigns scale the number of LibFuzzer workers
+with the job budget (`--workers auto`) and turn a CPU-second budget into wall time
+(`--fuzz-budget`), while `-rss_limit_mb` stays fixed at 2048. Guardrail and replay runs use a fixed
+per-input `-timeout`, the same `-rss_limit_mb` and a deterministic `-seed` derived from the sha256
+of the binary path and module, so rerunning them on the same build mutates and replays
+identically. Builds outside agents/*/scratch are cached per run (scripts/cache.py,
+namespace `eacsl-build`): an unchanged slice restores its binary instead of recompiling.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
+import math
+import os
 import re
 import shlex
 import shutil
@@ -36,6 +55,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cache  # noqa: E402
 from build_callgraph_dag import extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
@@ -45,6 +65,7 @@ from eacsl_toolchain import (  # noqa: E402
     build_fallback_object,
     defines_fuzzer_initialize,
     is_eacsl_instrumented,
+    mark_wrapper_results_initialized,
     normalize_passthrough,
     parse_missing_functions,
     parse_undefined_fallbacks,
@@ -53,8 +74,18 @@ from eacsl_toolchain import (  # noqa: E402
     select_eacsl_binary,
 )
 from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
-from framac_common import scan_undeclared_functions  # noqa: E402
+from framac_common import atomic_write_json, load_json_optional, scan_undeclared_functions, utc_now  # noqa: E402
+from resources import CLASSES, FUZZ_RSS_LIMIT_MB, fuzz_workers  # noqa: E402
 from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed  # noqa: E402
+
+# Wall-clock limit of each compile stage (e-acsl-gcc, clang); a hung toolchain must not hold a lease forever.
+BUILD_TIMEOUT_S = CLASSES["build"].wall_timeout_s or 3600
+# Per-input LibFuzzer -timeout: campaigns and replays (the campaign default), guardrails (contract
+# checks add overhead). Fixed values, never derived from the machine.
+DEFAULT_PER_INPUT_TIMEOUT_S = 10
+GUARDRAIL_PER_INPUT_TIMEOUT_S = 30
+DEFAULT_MAX_TIME_S = 60
+MIN_FUZZ_WALL_S = 30
 
 SANITIZER_RUNTIME_ENV = {
     "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
@@ -75,6 +106,11 @@ ARTIFACT_KINDS = (
 #   foo.c:42: Error: Assertion failed:
 #           The failing predicate is:
 #           mem_access: \valid_read(p + i).
+# Frama-C 33 puts the label on its own line and the predicate one level deeper:
+#           The failing predicate is:
+#           rte/index_bound:
+#               i < 8.
+#           With values at failure point:
 _FN_RE = re.compile(r"(?P<file>[^\s:'\"]+\.[ch]):\s*In function '(?P<function>[^']+)'")
 _ERR_RE = re.compile(r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?", re.IGNORECASE)
 # Older style: "Assertion failed at line 42 in file foo.c." / "... in function parse."
@@ -83,7 +119,7 @@ _OLD_RE = re.compile(
     r"(?:\s+in\s+file\s+(?P<file>[^\s]+?\.[ch]))?(?:\s+in\s+function\s+(?P<function>\w+))?",
     re.IGNORECASE,
 )
-_PRED_RE = re.compile(r"The failing predicate is:\s*\n?\s*(?P<pred>[^\n]+)", re.IGNORECASE)
+_PRED_HEAD_RE = re.compile(r"The failing predicate is:[ \t]*", re.IGNORECASE)
 # E-ACSL segment memory model runtime messages, e.g.
 #   Use of invalid address 0x7f... in unsafe_initialize
 _SEGMENT_RE = re.compile(
@@ -161,6 +197,28 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def derive_seed(binary: Path | str, module: str = "") -> int:
+    """
+    Deterministic LibFuzzer `-seed` for guardrail and replay runs: the first 32 bits of
+    sha256("<resolved binary path>\\0<module>"), in 1..2^31-1 (libFuzzer reads 0 as "pick a
+    random seed"). The same build at the same path mutates and replays identically on any machine.
+    """
+    digest = hashlib.sha256(f"{Path(binary).resolve().as_posix()}\0{module}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % 2147483646 + 1
+
+
+def _in_agent_scratch(path: Path | str) -> bool:
+    """True under agents/<id>/scratch/: agent builds are never cached (they are scoped instead)."""
+    parts = Path(os.path.abspath(path)).parts
+    return any(parts[i] == "agents" and parts[i + 2] == "scratch" for i in range(len(parts) - 2))
+
+
+def _decode(data) -> str:
+    if data is None:
+        return ""
+    return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+
+
 def _resolve_function_at_line(file_path: str, line: int) -> str:
     """Resolve the enclosing C function at `file_path:line` using token-based span extraction."""
     if not file_path or line <= 0:
@@ -219,8 +277,36 @@ def _parse_segment_failure(text: str) -> dict | None:
     }
 
 
+def _failing_predicate(text: str, start: int) -> tuple[str, str]:
+    """
+    (label, predicate) of the first "The failing predicate is:" block after `start`. The label is
+    the property name or RTE kind (`rte/index_bound`, `range`); the predicate is the expression
+    alone, as Eva and WP print it, so the same property fingerprints the same in every tool.
+    """
+    head = _PRED_HEAD_RE.search(text, start)
+    if not head:
+        return "", ""
+    first, _, rest = text[head.end():].partition("\n")
+    lines = rest.split("\n")
+    if not first.strip() and lines and lines[0].strip():
+        first, lines = lines[0], lines[1:]  # the line after the header, indented or not (older releases)
+    block = [first.strip()] if first.strip() and not first.strip().lower().startswith("with values") else []
+    for line in lines if block else []:
+        # Continuation lines are indented; the values section or unindented runtime output ends the block.
+        if not line[:1].isspace() or not line.strip() or line.strip().lower().startswith("with values"):
+            break
+        block.append(line.strip())
+    if len(block) >= 2 and block[0].endswith(":"):
+        return block[0][:-1].strip(), " ".join(block[1:]).rstrip(".").strip()
+    joined = " ".join(block).rstrip(".").strip()
+    m = re.match(r"^(?P<label>[A-Za-z_][\w/-]*)\s*:\s*(?P<pred>.+)$", joined)
+    if m and not m.group("pred").startswith(":"):  # one-line `label: predicate` (older releases)
+        return m.group("label"), m.group("pred").strip()
+    return "", joined
+
+
 def parse_eacsl_failure(text: str) -> dict | None:
-    """Extract the first E-ACSL failure (file, line, function, kind, predicate) from runtime output."""
+    """Extract the first E-ACSL failure (file, line, function, kind, label, predicate) from runtime output."""
     if not text:
         return None
     err = _ERR_RE.search(text)
@@ -238,17 +324,17 @@ def parse_eacsl_failure(text: str) -> dict | None:
             file_ = file_ or fns[-1].group("file")
     if not function or function == "unknown_function":
         function = _resolve_function_at_line(file_, line_)
-    pred_m = _PRED_RE.search(text, hit.end())
-    predicate = pred_m.group("pred").strip().rstrip(".") if pred_m else ""
+    label, predicate = _failing_predicate(text, hit.end())
     kind = hit.group("kind").strip().lower().replace(" ", "_")
-    alarm = detect_alarm_kind(predicate)
+    alarm = detect_alarm_kind(label) or detect_alarm_kind(predicate)
     return {
         "file": file_ or "unknown",
         "line": line_,
         "function": function or "unknown_function",
         "kind": kind,
         "alarm_kind": alarm or None,
-        "is_rte": bool(alarm) or predicate.lower().startswith("rte"),
+        "is_rte": bool(alarm) or label.lower().startswith("rte") or predicate.lower().startswith("rte"),
+        "label": label,
         "predicate": predicate,
     }
 
@@ -384,15 +470,134 @@ def _resolve_eacsl_gcc() -> tuple[str, bool]:
     return "e-acsl-gcc.sh", False
 
 
-def _run_tool(cmd: list[str], runner=subprocess.run) -> tuple[int, str, str]:
+def _run_tool(cmd: list[str], runner=subprocess.run, timeout: float | None = BUILD_TIMEOUT_S) -> tuple[int, str, str]:
     try:
-        proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        return 124, _decode(exc.stdout), _decode(exc.stderr) + f"\n{cmd[0]} exceeded the {timeout} s build time limit\n"
     except OSError as exc:
         return 127, "", str(exc)
 
 
+def _note_cache_restore(result: dict, entry: cache.Entry) -> dict:
+    """Name the cache entry at the end of the restored compile log."""
+    log = result.get("compile_log")
+    if log:
+        with contextlib.suppress(OSError), open(log, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n[cache] Restored from {entry.store.scope} build cache entry {entry.ns}/{entry.key}; "
+                "the log above is the original build's.\n"
+            )
+    return result
+
+
+def _eacsl_cache_material(
+    sources: list[str],
+    out_bin: Path,
+    machdep: str,
+    cppflags: str,
+    rte_flags: str,
+    fuzzer_flag: bool,
+    functions: list[str] | None,
+    ldflags_extra: str,
+    variadic_translation: bool,
+    warn_unsigned_downcast: bool,
+    rte_initialized: bool,
+) -> dict | None:
+    """Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse)."""
+    try:
+        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag)
+        ldflags = normalize_passthrough(f"-fsanitize=fuzzer {ldflags_extra}" if fuzzer_flag else ldflags_extra)
+    except UnsafePassthroughError:
+        return None
+    eacsl_bin, is_modern = _resolve_eacsl_gcc()
+    return {
+        "kind": "eacsl",
+        "eacsl_gcc": [eacsl_bin, is_modern],
+        "sources": [str(s) for s in sources],
+        "out_bin": out_bin.as_posix(),
+        "machdep": machdep,
+        "cppflags": cppflags,
+        "frontend": flags["frontend"],
+        "backend": flags["backend"],
+        "ldflags": ldflags,
+        "rte": rte_flags,
+        "fuzzer": fuzzer_flag,
+        "functions": sorted({f.strip() for f in functions if f.strip()}) if functions else None,
+        "variadic_translation": variadic_translation,
+        "warn_unsigned_downcast": warn_unsigned_downcast,
+        "rte_initialized": rte_initialized,
+    }
+
+
 def compile_eacsl_binary(
+    sources: list[str],
+    out_bin: Path,
+    machdep: str = "gcc_x86_64",
+    cppflags: str = "-I.",
+    rte_flags: str = "all",
+    fuzzer_flag: bool = True,
+    functions: list[str] | None = None,
+    ldflags_extra: str = "",
+    variadic_translation: bool = True,
+    warn_unsigned_downcast: bool = False,
+    rte_initialized: bool = True,
+    runner=subprocess.run,
+    use_cache: bool = True,
+) -> dict:
+    """
+    Instrument and compile a slice with E-ACSL (see `_compile_eacsl_binary_uncached`).
+
+    Outside agents/*/scratch, and when caching is enabled (scripts/cache.py), the build is
+    cached under its effective flags, output path, cwd and dependency manifest: a hit restores
+    the binary, `<out>.instrumented.c`, the variadic fallback object and the compile log (which
+    then names the cache entry). The result carries `cache: {"hit": bool, "key": str | None}`.
+    """
+    out_bin = Path(out_bin)
+
+    def _build() -> dict:
+        return _compile_eacsl_binary_uncached(
+            sources, out_bin, machdep, cppflags, rte_flags, fuzzer_flag, functions, ldflags_extra,
+            variadic_translation, warn_unsigned_downcast, rte_initialized, runner,
+        )
+
+    material = None
+    if use_cache and not _in_agent_scratch(out_bin):
+        material = _eacsl_cache_material(
+            sources, out_bin, machdep, cppflags, rte_flags, fuzzer_flag, functions, ldflags_extra,
+            variadic_translation, warn_unsigned_downcast, rte_initialized,
+        )
+    if material is None:
+        res = _build()
+        res["cache"] = {"hit": False, "key": None}
+        return res
+
+    instrumented_c = out_bin.with_suffix(".instrumented.c")
+    compile_log = out_bin.with_suffix(".compile.log")
+    fallback_dir = out_bin.parent / f"{out_bin.name}_fallbacks"
+
+    def _outputs(res: dict) -> dict[str, Path]:
+        files = {"binary": Path(res["binary"]), "instrumented.c": instrumented_c, "compile.log": compile_log}
+        if res.get("variadic_fallbacks"):
+            files["fallbacks.o"] = fallback_dir / "eacsl_fallbacks.o"
+            files["fallbacks.c"] = fallback_dir / "eacsl_fallbacks.c"
+        return files
+
+    return cache.memoize(
+        "eacsl-build",
+        material,
+        sources=sources,
+        dep_flags=shlex.split(material["frontend"]),
+        build=_build,
+        outputs=_outputs,
+        ok=lambda res: res.get("returncode") == 0,
+        runner=runner,
+        on_restore=_note_cache_restore,
+    )
+
+
+def _compile_eacsl_binary_uncached(
     sources: list[str],
     out_bin: Path,
     machdep: str = "gcc_x86_64",
@@ -519,6 +724,15 @@ def compile_eacsl_binary(
                 _record(cmd1, rc, out, err)
         if rc != 0:
             return _finish(rc, "eacsl_instrumentation_failed")
+        if rte_initialized and instrumented_c.is_file():
+            # Without this, any `ensures` reading \result fails \initialized(&__retres) on every input.
+            patched, n_inits = mark_wrapper_results_initialized(
+                instrumented_c.read_text(encoding="utf-8", errors="replace"))
+            if n_inits:
+                instrumented_c.write_text(patched, encoding="utf-8", newline="\n")
+                result["wrapper_result_inits"] = n_inits
+                log_parts.append(f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
+                                 "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n")
 
         init_hook: list[str] = []
         if fuzzer_flag:
@@ -543,7 +757,9 @@ def compile_eacsl_binary(
         cmd2, rc, out, err = _stage2(ldflags)
         _record(cmd2, rc, out, err)
         if rc != 0 and parse_undefined_fallbacks(out + "\n" + err):
-            fb = build_fallback_object(instrumented_c, out_bin.parent / f"{out_bin.name}_fallbacks", runner=runner)
+            fb = build_fallback_object(
+                instrumented_c, out_bin.parent / f"{out_bin.name}_fallbacks", runner=runner, timeout=BUILD_TIMEOUT_S,
+            )
             result["variadic_fallbacks"] = fb.get("fallbacks", [])
             if fb.get("status") != "built":
                 log_parts.append(f"Variadic fallback generation failed: {fb.get('reason')}\n")
@@ -572,9 +788,14 @@ def compile_sanitizer_binary(
     cppflags: str = "-I.",
     fuzzer_flag: bool = True,
     ldflags_extra: str = "",
+    runner=None,
+    use_cache: bool = True,
 ) -> dict:
-    """Compile a slice directly with Clang + LibFuzzer + ASan + UBSan when E-ACSL cannot instrument."""
-    out_bin.parent.mkdir(parents=True, exist_ok=True)
+    """
+    Compile a slice directly with Clang + LibFuzzer + ASan + UBSan when E-ACSL cannot instrument.
+    Cached like `compile_eacsl_binary` (binary and compile log) outside agents/*/scratch.
+    """
+    out_bin = Path(out_bin)
     compile_log = out_bin.with_suffix(".sanitizer_compile.log")
     san_flags = "-fsanitize=fuzzer,address,undefined" if fuzzer_flag else "-fsanitize=address,undefined"
     cmd = [
@@ -590,30 +811,41 @@ def compile_sanitizer_binary(
         str(out_bin),
         *shlex.split(ldflags_extra),
     ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        rc = proc.returncode
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-    except OSError as exc:
-        rc = 127
-        stdout = ""
-        stderr = str(exc)
 
-    compile_log.write_text(
-        f"Command: {' '.join(cmd)}\nReturncode: {rc}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\n",
-        encoding="utf-8",
+    def _build() -> dict:
+        out_bin.parent.mkdir(parents=True, exist_ok=True)
+        rc, stdout, stderr = _run_tool(cmd, runner or subprocess.run)
+        compile_log.write_text(
+            f"Command: {' '.join(cmd)}\nReturncode: {rc}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}\n",
+            encoding="utf-8",
+        )
+        return {
+            "engine": "sanitizers",
+            "returncode": rc,
+            "command": " ".join(cmd),
+            "binary": str(out_bin),
+            "instrumented_source": None,
+            "compile_log": str(compile_log),
+            "stdout": stdout[-16000:],
+            "stderr": stderr[-16000:],
+        }
+
+    if not use_cache or _in_agent_scratch(out_bin):
+        res = _build()
+        res["cache"] = {"hit": False, "key": None}
+        return res
+    material = {"kind": "sanitizers", "command": cmd, "sources": [str(s) for s in sources], "out_bin": out_bin.as_posix()}
+    return cache.memoize(
+        "eacsl-build",
+        material,
+        sources=sources,
+        dep_flags=shlex.split(cppflags),
+        build=_build,
+        outputs=lambda res: {"binary": out_bin, "compile.log": compile_log},
+        ok=lambda res: res.get("returncode") == 0,
+        runner=runner,
+        on_restore=_note_cache_restore,
     )
-    return {
-        "engine": "sanitizers",
-        "returncode": rc,
-        "command": " ".join(cmd),
-        "binary": str(out_bin),
-        "instrumented_source": None,
-        "compile_log": str(compile_log),
-        "stdout": stdout[-16000:],
-        "stderr": stderr[-16000:],
-    }
 
 
 def _artifact_kind(name: str) -> str | None:
@@ -623,13 +855,35 @@ def _artifact_kind(name: str) -> str | None:
     return None
 
 
-def replay_artifact(binary: Path, artifact: Path, scratch: Path, timeout_s: int = 60) -> dict:
-    """Replay one input in the sandbox; report the parsed failure and whether it reproduced."""
+def replay_artifact(
+    binary: Path,
+    artifact: Path,
+    scratch: Path,
+    timeout_s: int = 60,
+    *,
+    module: str = "",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    seed: int | None = None,
+) -> dict:
+    """
+    Replay one input in the sandbox with a fixed per-input `-timeout`, the fixed `-rss_limit_mb`
+    and a deterministic `-seed` (derive_seed); report the parsed failure and whether it reproduced.
+    """
+    binary = Path(binary)
+    seed = derive_seed(binary, module) if seed is None else seed
+    wall = max(int(timeout_s), 2 * int(per_input_timeout) + 10)
     res = run_sandboxed(
-        [str(binary.resolve()), "-runs=1", str(artifact.resolve())],
+        [
+            str(binary.resolve()),
+            "-runs=1",
+            f"-timeout={per_input_timeout}",
+            f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+            f"-seed={seed}",
+            str(Path(artifact).resolve()),
+        ],
         writable=[scratch],
-        timeout_s=timeout_s,
-        limits=Limits(cpu_seconds=timeout_s * 2),
+        timeout_s=wall,
+        limits=Limits(cpu_seconds=wall * 2),
         extra_env=SANITIZER_RUNTIME_ENV,
     )
     out = res.stdout + "\n" + res.stderr
@@ -639,6 +893,7 @@ def replay_artifact(binary: Path, artifact: Path, scratch: Path, timeout_s: int 
         "timed_out": res.timed_out,
         "failure": parse_runtime_failure(out),
         "sandbox": res.sandbox,
+        "seed": seed,
         "log_tail": out[-3000:],
     }
 
@@ -664,8 +919,8 @@ def run_fuzz_campaign(
     artifacts_dir: Path,
     max_time: int = 60,
     dict_file: Path | None = None,
-    per_input_timeout: int = 10,
-    rss_limit_mb: int = 2048,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    rss_limit_mb: int = FUZZ_RSS_LIMIT_MB,
     extra_corpus: list[Path] | None = None,
     attribution_builder=None,
     jobs: int = 1,
@@ -788,7 +1043,7 @@ def run_fuzz_campaign(
         if pre_existing:
             entry["pre_existing"] = True
         if kind in ("crash", "leak"):
-            replay = replay_artifact(binary, p, scratch)
+            replay = replay_artifact(binary, p, scratch, per_input_timeout=per_input_timeout)
             failure = replay["failure"] or parse_runtime_failure(combined_out)
             entry["reproducible"] = replay["reproduced"]
             entry["replay_log_tail"] = replay["log_tail"]
@@ -796,7 +1051,7 @@ def run_fuzz_campaign(
             if needs_attribution(failure):
                 san_bin = _attribution_binary()
                 if san_bin is not None:
-                    san_replay = replay_artifact(Path(san_bin), p, scratch)
+                    san_replay = replay_artifact(Path(san_bin), p, scratch, per_input_timeout=per_input_timeout)
                     entry["attribution"] = {
                         "source": "sanitizer_replay",
                         "binary": str(san_bin),
@@ -844,10 +1099,22 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
     }
 
 
-def run_guardrail_check(binary: Path, corpus_dir: Path, scratch_dir: Path, runs: int = 0, timeout_s: int = 600) -> dict:
+def run_guardrail_check(
+    binary: Path,
+    corpus_dir: Path,
+    scratch_dir: Path,
+    runs: int = 0,
+    timeout_s: int = 600,
+    *,
+    per_input_timeout: int = GUARDRAIL_PER_INPUT_TIMEOUT_S,
+    module: str = "",
+    seed: int | None = None,
+) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
     corpus and crash artifacts in scratch, so the guardrail never mutates shared state.
+    The per-input `-timeout`, `-rss_limit_mb` and the mutation `-seed` (derive_seed) are fixed,
+    so the same contract on the same build gets the same verdict on any machine.
 
     The binary must be E-ACSL-instrumented: replaying an uninstrumented build would return 0
     for any contract and produce a vacuous `passed_dynamic_oracle`.
@@ -863,9 +1130,13 @@ def run_guardrail_check(binary: Path, corpus_dir: Path, scratch_dir: Path, runs:
     scratch_corpus = scratch_dir / "new_units"
     scratch_corpus.mkdir(parents=True, exist_ok=True)
     corpus_dir.mkdir(parents=True, exist_ok=True)
+    seed = derive_seed(binary, module) if seed is None else seed
     cmd = [
         str(binary.resolve()),
         f"-runs={runs}",
+        f"-timeout={per_input_timeout}",
+        f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+        f"-seed={seed}",
         f"-artifact_prefix={scratch_dir.resolve()}/",
         str(scratch_corpus.resolve()),
         str(corpus_dir.resolve()),
@@ -873,7 +1144,14 @@ def run_guardrail_check(binary: Path, corpus_dir: Path, scratch_dir: Path, runs:
     res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
     combined_out = res.stdout + "\n" + res.stderr
     verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
-    verdict.update({"returncode": res.returncode, "timed_out": res.timed_out, "sandbox": res.sandbox, "corpus_dir": str(corpus_dir)})
+    verdict.update({
+        "returncode": res.returncode,
+        "timed_out": res.timed_out,
+        "sandbox": res.sandbox,
+        "corpus_dir": str(corpus_dir),
+        "seed": seed,
+        "per_input_timeout": per_input_timeout,
+    })
     if verdict["status"] != "passed_dynamic_oracle":
         verdict["runtime_trace"] = combined_out[-4000:]
     return verdict
@@ -913,7 +1191,8 @@ def run_selftest(
     input runs clean, the known overflow input is detected (and, ideally, attributed to the
     CANARY_OOB line), and the known uninitialized read is reported as `initialization`. The
     benign run matters because replay counts any non-zero exit as reproduced: a binary that
-    crashes on every input would otherwise pass.
+    crashes on every input would otherwise pass. The canary is always rebuilt: a selftest checks
+    the toolchain itself, so it never reads the build cache.
     """
     replay = replay or replay_artifact
     src = resolve_canary_source()
@@ -923,7 +1202,7 @@ def run_selftest(
     work_dir.mkdir(parents=True, exist_ok=True)
     comp = compile_eacsl_binary(
         [str(src)], work_dir / "canary", machdep, cppflags=f"-I{src.parent.as_posix()}",
-        variadic_translation=variadic_translation, runner=runner,
+        variadic_translation=variadic_translation, runner=runner, use_cache=False,
     )
     log_path = Path(comp["compile_log"])
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
@@ -992,40 +1271,479 @@ def selftest_blocks_eacsl(selftest_json: Path | None, runner=subprocess.run) -> 
     return f"eacsl_selftest_failed: {', '.join(failed) or 'unknown'}"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run E-ACSL + LibFuzzer Campaign or Dynamic Contract Guardrail.")
-    sub = parser.add_subparsers(dest="mode", required=True)
+def build_module_binary(
+    sources: list[str],
+    out_bin: Path,
+    *,
+    engine: str = "auto",
+    selftest_json: Path | None = DEFAULT_SELFTEST_JSON,
+    machdep: str = "gcc_x86_64",
+    cppflags: str = "-I.",
+    ldflags: str = "",
+    rte: str = "all",
+    functions: list[str] | None = None,
+    variadic_translation: bool = True,
+    warn_unsigned_downcast: bool = False,
+    rte_initialized: bool = True,
+) -> dict:
+    """
+    Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
+    `eacsl`, and for `auto` unless a failed selftest for this Frama-C version blocks it; Clang
+    ASan+UBSan for `sanitizers` and as the `auto` fallback. Both builds go through the cache.
+    Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt}.
+    """
+    eacsl_attempt = None
+    fallback_reason = None
+    comp = None
+    if engine in ("auto", "eacsl"):
+        blocked = selftest_blocks_eacsl(selftest_json) if engine == "auto" else None
+        if blocked:
+            fallback_reason = blocked
+        else:
+            comp = compile_eacsl_binary(
+                sources,
+                out_bin,
+                machdep,
+                cppflags,
+                rte,
+                True,
+                functions=functions,
+                ldflags_extra=ldflags,
+                variadic_translation=variadic_translation,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+                rte_initialized=rte_initialized,
+            )
+            if comp["returncode"] != 0 and engine == "auto":
+                eacsl_attempt = comp
+                fallback_reason = comp.get("reason") or "eacsl_compile_failed"
+                comp = None
+    if comp is None:
+        comp = compile_sanitizer_binary(sources, out_bin, cppflags, True, ldflags_extra=ldflags)
+    return {
+        "compile": comp,
+        "engine_used": comp.get("engine", engine),
+        "engine_fallback_reason": fallback_reason,
+        "eacsl_compile_attempt": eacsl_attempt,
+    }
 
-    p_camp = sub.add_parser("campaign")
-    p_camp.add_argument("--sources", nargs="+", required=True)
-    p_camp.add_argument("--out-bin", type=Path, required=True)
-    p_camp.add_argument("--corpus-dir", type=Path, required=True, help="Writable corpus directory (receives new units)")
-    p_camp.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Read-only seed corpus directories")
-    p_camp.add_argument("--artifacts-dir", type=Path, required=True)
-    p_camp.add_argument("--max-time", type=int, default=60)
-    p_camp.add_argument("--per-input-timeout", type=int, default=10)
-    p_camp.add_argument("--dict", type=Path, default=None)
-    p_camp.add_argument("--machdep", default="gcc_x86_64")
-    p_camp.add_argument("--cppflags", default="-I.")
-    p_camp.add_argument("--ldflags", default="", help="Extra linker flags (e.g. '-lbsd -lm')")
-    p_camp.add_argument("--rte", default="all")
-    p_camp.add_argument(
+
+def _sanitizer_attribution_builder(sources: list[str], out_bin: Path, cppflags: str, ldflags: str):
+    """Lazily build (at most once) the ASan+UBSan twin used to attribute unlocated E-ACSL crashes."""
+    state: dict = {}
+
+    def builder() -> Path | None:
+        if "binary" not in state:
+            san_out = out_bin.with_name(out_bin.name + ".sanreplay")
+            san = compile_sanitizer_binary(sources, san_out, cppflags, True, ldflags_extra=ldflags)
+            state["binary"] = Path(san["binary"]) if san["returncode"] == 0 else None
+        return state["binary"]
+
+    return builder
+
+
+def resolve_workers(value: int | str | None) -> int:
+    """`auto` (or None/0): LibFuzzer workers sized from this job's budget at the fixed -rss_limit_mb."""
+    if value is None or str(value).strip().lower() == "auto":
+        return fuzz_workers()
+    count = int(value)
+    return count if count > 0 else fuzz_workers()
+
+
+def campaign_wall_time(max_time: int | None, fuzz_budget: int | None, workers: int) -> int:
+    """`--max-time` when given; else max(30, CPU-second budget / workers); else 60 seconds."""
+    if max_time is not None:
+        return max_time
+    if fuzz_budget:
+        return max(MIN_FUZZ_WALL_S, math.ceil(fuzz_budget / max(1, workers)))
+    return DEFAULT_MAX_TIME_S
+
+
+def _collect_inputs(inputs: list[Path]) -> tuple[list[Path], list[str]]:
+    """Files given directly or found (non-recursively) in given directories; missing paths separately."""
+    files: list[Path] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for raw in inputs:
+        path = Path(raw)
+        if path.is_dir():
+            found = sorted(c for c in path.iterdir() if c.is_file() and not c.name.startswith("."))
+        elif path.is_file():
+            found = [path]
+        else:
+            missing.append(str(raw))
+            continue
+        for f in found:
+            key = os.path.abspath(f)
+            if key not in seen:
+                seen.add(key)
+                files.append(f)
+    return files, missing
+
+
+def replay_inputs(
+    binary: Path,
+    inputs: list[Path],
+    scratch: Path,
+    *,
+    module: str = "",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    attribution_builder=None,
+) -> list[dict]:
+    """Replay every input exactly once; one campaign-shaped artifact record per input."""
+    scratch.mkdir(parents=True, exist_ok=True)
+    artifacts: list[dict] = []
+    for path in inputs:
+        rep = replay_artifact(binary, path, scratch, module=module, per_input_timeout=per_input_timeout)
+        failure = rep.get("failure")
+        entry: dict = {
+            "artifact": path.as_posix(),
+            "kind": _artifact_kind(path.name) or "crash",
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+            "reproducible": bool(rep.get("reproduced")),
+            "failure": None,
+            "fingerprint": None,
+            "failure_source": "primary" if failure else None,
+            "returncode": rep.get("returncode"),
+            "timed_out": rep.get("timed_out"),
+            "seed": rep.get("seed"),
+            "replay_log_tail": rep.get("log_tail", ""),
+        }
+        if entry["reproducible"] and needs_attribution(failure) and attribution_builder is not None:
+            san_bin = attribution_builder()
+            if san_bin is not None:
+                san = replay_artifact(Path(san_bin), path, scratch, module=module, per_input_timeout=per_input_timeout)
+                entry["attribution"] = {
+                    "source": "sanitizer_replay",
+                    "binary": str(san_bin),
+                    "reproduced": san.get("reproduced"),
+                    "failure": san.get("failure"),
+                }
+                if san.get("failure") and not needs_attribution(san["failure"]):
+                    failure = san["failure"]
+                    entry["failure_source"] = "sanitizer_replay"
+        entry["failure"] = failure
+        if failure:
+            entry["fingerprint"] = make_fingerprint(
+                failure.get("file") or "unknown",
+                failure.get("function") or "unknown_function",
+                failure.get("alarm_kind") or failure.get("kind") or "crash",
+                failure.get("predicate") or "",
+            )
+        artifacts.append(entry)
+    return artifacts
+
+
+def _slim_compile(comp: dict) -> dict:
+    return {k: comp.get(k) for k in ("engine", "returncode", "reason", "binary", "compile_log", "cache")}
+
+
+def prepare_replay_binary(
+    module: str,
+    sources: list[str],
+    out_bin: Path,
+    *,
+    attribution: bool = True,
+    **build_options,
+) -> dict:
+    """Build the module binary for replays (normally a cache hit on the Make or campaign build)."""
+    build = build_module_binary(sources, Path(out_bin), **build_options)
+    comp = build["compile"]
+    prepared: dict = {
+        "module": module,
+        "binary": None,
+        "engine_used": build["engine_used"],
+        "compile": _slim_compile(comp),
+        "cache": comp.get("cache"),
+        "attribution_builder": None,
+    }
+    if build["engine_fallback_reason"]:
+        prepared["engine_fallback_reason"] = build["engine_fallback_reason"]
+    if comp["returncode"] != 0:
+        prepared["reason"] = f"compile_error ({comp.get('reason') or 'returncode ' + str(comp['returncode'])})"
+        return prepared
+    prepared["binary"] = Path(comp["binary"])
+    if attribution and build["engine_used"] == "eacsl":
+        prepared["attribution_builder"] = _sanitizer_attribution_builder(
+            sources, Path(out_bin), build_options.get("cppflags", "-I."), build_options.get("ldflags", ""),
+        )
+    return prepared
+
+
+def replay_report(
+    module: str,
+    inputs: list[Path],
+    scratch: Path,
+    *,
+    prepared: dict | None = None,
+    binary: Path | None = None,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+) -> dict:
+    """
+    Replay `inputs` on a prepared (built) or given binary. `status` is `reproduced` when any input
+    fails, `not_reproduced` when none does, `error` when nothing could be replayed. The
+    `artifacts[]` records are the campaign's, so `ingest-verifier --replay-report` accepts the report.
+    """
+    files, missing = _collect_inputs(inputs)
+    report: dict = {
+        "mode": "replay",
+        "module": module,
+        "status": "error",
+        "binary": None,
+        "inputs": [str(i) for i in inputs],
+        "missing_inputs": missing,
+        "per_input_timeout": per_input_timeout,
+        "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
+        "artifacts": [],
+    }
+    attribution_builder = None
+    if prepared is not None:
+        for key in ("engine_used", "engine_fallback_reason", "compile", "cache"):
+            if key in prepared:
+                report[key] = prepared[key]
+        if prepared.get("binary") is None:
+            report["reason"] = prepared.get("reason") or "no binary"
+            return report
+        bin_path = Path(prepared["binary"])
+        attribution_builder = prepared.get("attribution_builder")
+    elif binary is not None:
+        bin_path = Path(binary)
+        if not bin_path.is_file():
+            report["reason"] = f"binary not found: {bin_path}"
+            return report
+        report["engine_used"] = "eacsl" if is_eacsl_instrumented(bin_path) else "unknown"
+    else:
+        report["reason"] = "replay needs --binary, or --sources with --out-bin"
+        return report
+    report["binary"] = str(bin_path)
+    report["seed"] = derive_seed(bin_path, module)
+    if not files:
+        report["reason"] = "no_inputs"
+        return report
+    try:
+        report["artifacts"] = replay_inputs(
+            bin_path, files, scratch, module=module, per_input_timeout=per_input_timeout,
+            attribution_builder=attribution_builder,
+        )
+    except SandboxUnavailable as exc:
+        report["reason"] = f"sandbox_unavailable: {exc}"
+        return report
+    report["status"] = "reproduced" if any(a["reproducible"] for a in report["artifacts"]) else "not_reproduced"
+    return report
+
+
+def acsl_include_dir() -> Path | None:
+    for base in (Path("/opt/framac-pipeline/templates"), Path(__file__).resolve().parent.parent / "templates"):
+        if (base / "acsl").is_dir():
+            return base / "acsl"
+    return None
+
+
+def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
+    """
+    Fallback build spec when scripts/pipeline_make.py cannot be imported: the harness sidecar's
+    sources (the harness alone when it `include_source`s the target) plus the harness, and its
+    cppflags plus -I<templates>/acsl (once), as in the documented campaign command.
+    """
+    sidecar = Path(harness_dir) / f"harness_{module}.json"
+    meta = load_json_optional(sidecar, None)
+    if not isinstance(meta, dict):
+        raise FileNotFoundError(f"harness sidecar {sidecar} not found")
+    harness = (Path(harness_dir) / f"harness_{module}.c").as_posix()
+    sources: list[str] = []
+    if not meta.get("include_source"):
+        for raw in meta.get("sources") or []:
+            src = str(raw).replace("\\", "/").strip()
+            src = src[len("/framac-run/"):] if src.startswith("/framac-run/") else src
+            if src and Path(src).name != f"harness_{module}.c" and src not in sources:
+                sources.append(src)
+    tokens = shlex.split(meta.get("cppflags") or "-I.")
+    acsl_dir = acsl_include_dir()
+    if acsl_dir is not None and f"-I{acsl_dir.as_posix()}" not in tokens:
+        tokens.append(f"-I{acsl_dir.as_posix()}")
+    return {"sources": [*sources, harness], "cppflags": shlex.join(tokens), "ldflags": meta.get("ldflags") or ""}
+
+
+def replay_build_spec(module: str, harness_dir: Path = Path("workspace/harnesses")) -> dict:
+    """
+    Sources, cppflags and ldflags of a module's fuzz binary. Inside the pipeline this is
+    `pipeline_make.module_build_spec`: exactly what `make build` and the fuzz recipe pass, so a
+    replay reuses their cache entry and never rebuilds workspace/harnesses/fuzz_<mod> with other
+    flags or sources (ValueError when Make cannot build the module). The harness sidecar decides
+    only when pipeline_make cannot be imported.
+    """
+    try:
+        import pipeline_make  # imported lazily: replays work without the Make layer
+    except ImportError:
+        return _sidecar_build_spec(module, harness_dir)
+    return pipeline_make.module_build_spec(module, Path("."))
+
+
+def _candidate_slug(fingerprint: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", fingerprint).strip("._")[:80] or "candidate"
+    return f"{base}-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _candidate_engine(cand: dict) -> str:
+    """The engine of the campaign that found the candidate (its report's engine_used), else auto."""
+    for rel in cand.get("tool_outputs") or []:
+        try:
+            data = json.loads(Path(rel).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        engine = data.get("engine_used") if isinstance(data, dict) else None
+        if engine in ("eacsl", "sanitizers"):
+            return engine
+    return "auto"
+
+
+def _reproducer_paths(cand: dict) -> list[Path]:
+    paths: list[Path] = []
+    for rep in cand.get("reproducers") or []:
+        raw = rep.get("input") if isinstance(rep, dict) else rep
+        if isinstance(raw, str) and raw:
+            paths.append(Path(raw))
+    return paths
+
+
+def replay_candidates(
+    candidates_path: Path,
+    harness_dir: Path,
+    out_dir: Path,
+    *,
+    bin_dir: Path | None = None,
+    engine: str | None = None,
+    selftest_json: Path | None = DEFAULT_SELFTEST_JSON,
+    machdep: str = "gcc_x86_64",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    attribution: bool = True,
+) -> dict:
+    """
+    Replay the reproducers of every unverified candidate on its module's binary, built with
+    `replay_build_spec` (Make's sources and flags) into `<bin_dir>/fuzz_<mod>`, the path of
+    `make build` and of the campaign, so the build is a cache hit. Candidates whose module Make
+    cannot build get an `error` report. Writes `<out_dir>/<fingerprint-slug>.json` per candidate
+    and `index.json`, which maps each fingerprint to its report.
+    """
+    candidates = load_json_optional(Path(candidates_path), [])
+    todo = [
+        c for c in candidates
+        if isinstance(c, dict) and c.get("status") == "unverified" and _reproducer_paths(c)
+    ]
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
+    prepared_by_key: dict[tuple[str, str], dict] = {}
+    index: dict[str, dict] = {}
+    by_status: dict[str, int] = {}
+    for cand in todo:
+        fingerprint = str(cand.get("fingerprint") or "")
+        module = str(cand.get("module") or "")
+        eng = engine or _candidate_engine(cand)
+        key = (module, eng)
+        if key not in prepared_by_key:
+            try:
+                spec = replay_build_spec(module, Path(harness_dir))
+            except (OSError, ValueError, RuntimeError) as exc:
+                prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
+            else:
+                prepared_by_key[key] = prepare_replay_binary(
+                    module, spec["sources"], bin_dir / f"fuzz_{module}", attribution=attribution, engine=eng,
+                    selftest_json=selftest_json, machdep=machdep, cppflags=spec["cppflags"], ldflags=spec["ldflags"],
+                )
+        scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
+        report = replay_report(
+            module, _reproducer_paths(cand), scratch, prepared=prepared_by_key[key], per_input_timeout=per_input_timeout,
+        )
+        report["candidate_fingerprint"] = fingerprint
+        report["fingerprint_matches"] = any(a.get("fingerprint") == fingerprint for a in report["artifacts"])
+        report_path = out_dir / f"{_candidate_slug(fingerprint)}.json"
+        atomic_write_json(report_path, report)
+        index[fingerprint] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
+        by_status[report["status"]] = by_status.get(report["status"], 0) + 1
+    index_path = out_dir / "index.json"
+    atomic_write_json(index_path, {
+        "generated_at": utc_now(),
+        "candidates_file": Path(candidates_path).as_posix(),
+        "by_fingerprint": index,
+    })
+    return {
+        "mode": "replay-candidates",
+        "status": "error" if by_status.get("error") else "ok",
+        "candidates": len(todo),
+        "by_status": by_status,
+        "index": index_path.as_posix(),
+    }
+
+
+def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -> None:
+    p.add_argument("--sources", nargs="+", required=sources_required)
+    p.add_argument("--machdep", default="gcc_x86_64")
+    p.add_argument("--cppflags", default="-I.")
+    p.add_argument("--ldflags", default="", help="Extra linker flags (e.g. '-lbsd -lm')")
+    p.add_argument("--rte", default="all")
+    p.add_argument(
         "--engine",
         choices=["auto", "eacsl", "sanitizers"],
         default="auto",
         help="Instrumentation engine: 'auto' tries E-ACSL first and falls back to Clang ASan+UBSan on compile error",
     )
-    p_camp.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
-    p_camp.add_argument("--no-variadic-translation", action="store_true",
-                        help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)")
-    p_camp.add_argument("--warn-unsigned-downcast", action="store_true",
-                        help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
-    p_camp.add_argument("--no-rte-initialized", action="store_true",
-                        help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks")
-    p_camp.add_argument("--jobs", type=int, default=1, help="LibFuzzer -jobs=<N> (default: 1)")
-    p_camp.add_argument("--workers", type=int, default=1, help="LibFuzzer -workers=<N> (default: 1)")
-    p_camp.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON,
-                        help="Cached selftest result; with --engine auto a failed selftest for this Frama-C version skips E-ACSL")
+    p.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
+    p.add_argument("--no-variadic-translation", action="store_true",
+                   help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)")
+    p.add_argument("--warn-unsigned-downcast", action="store_true",
+                   help="Enable -warn-unsigned-downcast in Frama-C E-ACSL instrumentation")
+    p.add_argument("--no-rte-initialized", action="store_true",
+                   help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks")
+    p.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON,
+                   help="Cached selftest result; with --engine auto a failed selftest for this Frama-C version skips E-ACSL")
+
+
+def _build_options(args) -> dict:
+    return {
+        "engine": args.engine,
+        "selftest_json": args.selftest_json,
+        "machdep": args.machdep,
+        "cppflags": args.cppflags,
+        "ldflags": args.ldflags,
+        "rte": args.rte,
+        "functions": args.functions,
+        "variadic_translation": not args.no_variadic_translation,
+        "warn_unsigned_downcast": args.warn_unsigned_downcast,
+        "rte_initialized": not args.no_rte_initialized,
+    }
+
+
+def _summary(res: dict) -> dict:
+    """What is printed: the report without logs and compiler output (the JSON file has everything)."""
+    out = {k: v for k, v in res.items() if k not in ("compile", "log_tail", "runtime_trace", "eacsl_compile_attempt")}
+    if isinstance(out.get("artifacts"), list):
+        out["artifacts"] = [
+            {k: v for k, v in a.items() if k not in ("replay_log_tail", "attribution")} if isinstance(a, dict) else a
+            for a in out["artifacts"]
+        ]
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="E-ACSL + LibFuzzer campaigns, guardrails, builds and replays.")
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    p_camp = sub.add_parser("campaign")
+    _add_build_args(p_camp)
+    p_camp.add_argument("--out-bin", type=Path, required=True)
+    p_camp.add_argument("--corpus-dir", type=Path, required=True, help="Writable corpus directory (receives new units)")
+    p_camp.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Read-only seed corpus directories")
+    p_camp.add_argument("--artifacts-dir", type=Path, required=True)
+    p_camp.add_argument("--max-time", type=int, default=None,
+                        help="Wall-clock seconds per job (default: from --fuzz-budget, else 60)")
+    p_camp.add_argument("--fuzz-budget", type=int, default=None,
+                        help="CPU-second budget: wall time = max(30, budget / workers) unless --max-time is given")
+    p_camp.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_camp.add_argument("--dict", type=Path, default=None)
+    p_camp.add_argument("--jobs", type=int, default=None, help="LibFuzzer -jobs=<N> (default: the number of workers)")
+    p_camp.add_argument("--workers", default="auto",
+                        help="LibFuzzer -workers=<N>: 'auto' (from this job's CPUs and memory at -rss_limit_mb 2048) or N")
     p_camp.add_argument("--no-attribution-replay", action="store_true",
                         help="Do not replay unattributed E-ACSL crashes on a sanitizer build")
     p_camp.add_argument("--module", default="")
@@ -1037,6 +1755,9 @@ def main() -> int:
     p_guard.add_argument("--corpus-dir", type=Path, required=True)
     p_guard.add_argument("--scratch-dir", type=Path, default=None, help="Agent scratch dir (default: next to --out-bin)")
     p_guard.add_argument("--extra-runs", type=int, default=200)
+    p_guard.add_argument("--per-input-timeout", type=int, default=GUARDRAIL_PER_INPUT_TIMEOUT_S,
+                         help="LibFuzzer -timeout per input (fixed; never derived from the machine)")
+    p_guard.add_argument("--module", default="", help="Module name (part of the deterministic -seed)")
     p_guard.add_argument("--machdep", default="gcc_x86_64")
     p_guard.add_argument("--cppflags", default="-I.")
     p_guard.add_argument("--ldflags", default="", help="Extra linker flags")
@@ -1054,13 +1775,76 @@ def main() -> int:
     p_self.add_argument("--no-variadic-translation", action="store_true")
     p_self.add_argument("--out-json", type=Path, default=DEFAULT_SELFTEST_JSON)
 
-    args = parser.parse_args()
+    p_build = sub.add_parser("build", help="Compile a module's fuzz binary (cached); nothing is executed")
+    _add_build_args(p_build)
+    p_build.add_argument("--module", default="")
+    p_build.add_argument("--out-bin", type=Path, required=True)
+    p_build.add_argument("--out-json", type=Path, required=True)
+
+    p_replay = sub.add_parser("replay", help="Replay inputs once each on a given or (cached) built binary")
+    _add_build_args(p_replay, sources_required=False)
+    p_replay.add_argument("--module", required=True)
+    p_replay.add_argument("--inputs", type=Path, nargs="+", required=True, help="Input files or directories of inputs")
+    p_replay.add_argument("--binary", type=Path, default=None, help="Replay on this binary instead of building one")
+    p_replay.add_argument("--out-bin", type=Path, default=None)
+    p_replay.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_replay.add_argument("--scratch-dir", type=Path, default=None, help="Sandbox scratch (default: next to --out-json)")
+    p_replay.add_argument("--no-attribution-replay", action="store_true",
+                          help="Do not replay unattributed E-ACSL crashes on a sanitizer build")
+    p_replay.add_argument("--out-json", type=Path, required=True)
+
+    p_cands = sub.add_parser("replay-candidates", help="Replay the reproducers of every unverified candidate")
+    p_cands.add_argument("--candidates", type=Path, default=Path("candidates.json"))
+    p_cands.add_argument("--harness-dir", type=Path, default=Path("workspace/harnesses"))
+    p_cands.add_argument("--out-dir", type=Path, default=Path("workspace/reports/replay"))
+    p_cands.add_argument("--bin-dir", type=Path, default=None,
+                         help="Where module binaries are built (default: workspace/harnesses, as `make build`)")
+    p_cands.add_argument("--engine", choices=["auto", "eacsl", "sanitizers"], default=None,
+                         help="Default: the engine of the campaign that found each candidate, else auto")
+    p_cands.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON)
+    p_cands.add_argument("--machdep", default="gcc_x86_64")
+    p_cands.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_cands.add_argument("--no-attribution-replay", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.mode == "campaign" and str(args.workers).strip().lower() != "auto":
+        try:
+            if int(args.workers) < 1:
+                raise ValueError
+        except ValueError:
+            parser.error(f"--workers must be 'auto' or a positive integer (got {args.workers!r})")
+    if args.mode == "replay" and args.binary is None and not (args.sources and args.out_bin):
+        parser.error("replay needs --binary, or --sources with --out-bin")
+
+    if args.mode == "replay-candidates":
+        summary = replay_candidates(
+            args.candidates, args.harness_dir, args.out_dir, bin_dir=args.bin_dir,
+            engine=args.engine, selftest_json=args.selftest_json,
+            machdep=args.machdep, per_input_timeout=args.per_input_timeout,
+            attribution=not args.no_attribution_replay,
+        )
+        print(json.dumps(summary, indent=2))
+        return 0 if summary["status"] == "ok" else 1
 
     try:
         if args.mode == "selftest":
             res = run_selftest(args.work_dir, args.machdep, variadic_translation=not args.no_variadic_translation)
         elif args.mode == "campaign":
             res = _run_campaign_mode(args)
+        elif args.mode == "build":
+            res = _run_build_mode(args)
+        elif args.mode == "replay":
+            prepared = None
+            if args.binary is None:
+                prepared = prepare_replay_binary(
+                    args.module, args.sources, args.out_bin, attribution=not args.no_attribution_replay,
+                    **_build_options(args),
+                )
+            scratch = args.scratch_dir or args.out_json.parent / f".scratch_replay_{args.module or 'module'}"
+            res = replay_report(
+                args.module, args.inputs, scratch, prepared=prepared, binary=args.binary,
+                per_input_timeout=args.per_input_timeout,
+            )
         else:
             comp = compile_eacsl_binary(
                 args.sources,
@@ -1079,79 +1863,93 @@ def main() -> int:
                 res = {"mode": "guardrail", "status": "compile_error", "reason": comp.get("reason"), "compile": comp}
             else:
                 scratch = args.scratch_dir or args.out_bin.parent / f"{args.out_bin.name}_guard_scratch"
-                guard = run_guardrail_check(Path(comp["binary"]), args.corpus_dir, scratch, args.extra_runs)
+                guard = run_guardrail_check(
+                    Path(comp["binary"]), args.corpus_dir, scratch, args.extra_runs,
+                    per_input_timeout=args.per_input_timeout, module=args.module,
+                )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
     except SandboxUnavailable as exc:
         res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({k: v for k, v in res.items() if k not in ("compile", "log_tail", "runtime_trace")}, indent=2))
+    print(json.dumps(_summary(res), indent=2))
     if args.mode == "selftest":
         return 0 if res.get("ok") else 1
+    if args.mode == "build":
+        return 0 if res.get("status") == "built" else 1
+    if args.mode == "replay":
+        if str(res.get("reason") or "").startswith("sandbox_unavailable"):
+            return 3
+        return 0 if res.get("status") in ("reproduced", "not_reproduced") else 1
     return 3 if res.get("status") == "sandbox_unavailable" else 0
 
 
-def _run_campaign_mode(args) -> dict:
-    eacsl_attempt = None
-    fallback_reason = None
-    comp = None
-    if args.engine in ("auto", "eacsl"):
-        blocked = selftest_blocks_eacsl(args.selftest_json) if args.engine == "auto" else None
-        if blocked:
-            fallback_reason = blocked
-        else:
-            comp = compile_eacsl_binary(
-                args.sources,
-                args.out_bin,
-                args.machdep,
-                args.cppflags,
-                args.rte,
-                True,
-                functions=args.functions,
-                ldflags_extra=args.ldflags,
-                variadic_translation=not args.no_variadic_translation,
-                warn_unsigned_downcast=args.warn_unsigned_downcast,
-                rte_initialized=not args.no_rte_initialized,
-            )
-            if comp["returncode"] != 0 and args.engine == "auto":
-                eacsl_attempt = comp
-                fallback_reason = comp.get("reason") or "eacsl_compile_failed"
-                comp = None
-    if comp is None:
-        comp = compile_sanitizer_binary(args.sources, args.out_bin, args.cppflags, True, ldflags_extra=args.ldflags)
+def _run_build_mode(args) -> dict:
+    build = build_module_binary(args.sources, args.out_bin, **_build_options(args))
+    comp = build["compile"]
+    built = comp["returncode"] == 0
+    res: dict = {
+        "mode": "build",
+        "module": args.module,
+        "status": "built" if built else "compile_error",
+        "engine_used": build["engine_used"],
+        "binary": comp.get("binary") if built else None,
+        "sources": list(args.sources),
+        "cache": comp.get("cache"),
+        "compile": comp,
+    }
+    if built and build["engine_used"] == "eacsl" and comp.get("reduced_checks"):
+        res["reduced_checks"] = comp["reduced_checks"]
+    if build["engine_fallback_reason"]:
+        res["engine_fallback_reason"] = build["engine_fallback_reason"]
+    if build["eacsl_compile_attempt"] is not None:
+        res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
+    return res
 
-    engine_used = comp.get("engine", args.engine)
+
+def _run_campaign_mode(args) -> dict:
+    build = build_module_binary(args.sources, args.out_bin, **_build_options(args))
+    comp = build["compile"]
+    engine_used = build["engine_used"]
+    workers = resolve_workers(args.workers)
+    jobs = args.jobs if args.jobs else workers
+    max_time = campaign_wall_time(args.max_time, args.fuzz_budget, workers)
     res: dict = {"mode": "campaign", "module": args.module}
     if comp["returncode"] != 0:
         res.update({"status": "compile_error", "engine_used": engine_used, "compile": comp})
     else:
         attribution_builder = None
         if engine_used == "eacsl" and not args.no_attribution_replay:
-            def attribution_builder() -> Path | None:
-                san_out = args.out_bin.with_name(args.out_bin.name + ".sanreplay")
-                san = compile_sanitizer_binary(args.sources, san_out, args.cppflags, True, ldflags_extra=args.ldflags)
-                return Path(san["binary"]) if san["returncode"] == 0 else None
+            attribution_builder = _sanitizer_attribution_builder(args.sources, args.out_bin, args.cppflags, args.ldflags)
 
         fuzz = run_fuzz_campaign(
             Path(comp["binary"]),
             args.corpus_dir,
             args.artifacts_dir,
-            args.max_time,
+            max_time,
             args.dict,
             args.per_input_timeout,
             extra_corpus=args.extra_corpus,
             attribution_builder=attribution_builder,
-            jobs=args.jobs,
-            workers=args.workers,
+            jobs=jobs,
+            workers=workers,
         )
         res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
         if engine_used == "eacsl" and comp.get("reduced_checks"):
             res["reduced_checks"] = comp["reduced_checks"]
-    if fallback_reason:
-        res["engine_fallback_reason"] = fallback_reason
-    if eacsl_attempt is not None:
-        res["eacsl_compile_attempt"] = eacsl_attempt
+    res["sizing"] = {
+        "workers": workers,
+        "jobs": jobs,
+        "max_time": max_time,
+        "fuzz_budget_cpu_s": args.fuzz_budget,
+        "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
+        "per_input_timeout": args.per_input_timeout,
+    }
+    if build["engine_fallback_reason"]:
+        res["engine_fallback_reason"] = build["engine_fallback_reason"]
+    if build["eacsl_compile_attempt"] is not None:
+        res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     return res
 
 

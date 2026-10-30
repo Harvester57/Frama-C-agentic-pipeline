@@ -74,17 +74,24 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
 
 1. **Oracle 1 — Dynamic Anti-Hallucination Guardrail (`E-ACSL`):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags '-Iagents/{agent_id}/scratch/work {cppflags}' --ldflags '{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --functions {function_name} --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags='-Iagents/{agent_id}/scratch/work {cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
    ```
-   The shared corpus is replayed read-only; new units and artifacts stay in your scratch directory.
+   - The shared corpus is replayed read-only; new units and artifacts stay in your scratch directory.
+   - `--functions {function_name}` instruments only your function: its contract, loop annotations and RTE checks. That makes each iteration about an order of magnitude faster than instrumenting the whole module. The parent's re-check after the merge instruments the whole module.
+   - The run uses a fixed seed and fixed limits, so the same inputs give the same verdict.
    - `rejected_overconstrained`: one of your annotations is FALSE on a real input. Read `runtime_trace` and `failure`, and fix it.
    - `code_fault`: an RTE assertion failed on a real input. This is a code defect, not a contract problem. Stop and return it (status `blocked`, include the guardrail report in `evidence`).
 
 2. **Oracle 2 — Deductive Verification (`Frama-C WP + RTE`):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_wp_function.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --out-dir agents/{agent_id}/scratch/wp --cppflags '-Iagents/{agent_id}/scratch/work {cppflags}' --out-json agents/{agent_id}/scratch/wp_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_wp_function.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --out-dir agents/{agent_id}/scratch/wp --cppflags='-Iagents/{agent_id}/scratch/work {cppflags}' --out-json agents/{agent_id}/scratch/wp_{function_name}.json
    ```
-   `proven_under_hyp_count` goals rely on callee contracts; they are acceptable but are recorded as assumptions.
+   - `proven_under_hyp_count` goals rely on callee contracts; they are acceptable but are recorded as assumptions.
+   - Concurrent provers (`-wp-par`) are sized automatically from your container's CPUs and memory.
+   - Unchanged goals are answered from the run's proof cache, so re-running after a small edit only re-proves what changed.
+   - `"status": "analysis_error"` means Frama-C was killed or timed out (`reason`: `oom_killed`, `timeout`, `crashed`). Nothing was proven or refuted. Re-run once; if it repeats, report `blocked` with the reason.
+
+Both oracles read your scratch tree and write separate outputs, so you may run them as two concurrent background commands and wait for both. A guardrail rejection still decides the iteration.
 
 ## Reference Manuals (Last Resort)
 

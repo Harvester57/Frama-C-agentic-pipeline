@@ -171,6 +171,51 @@ def defines_fuzzer_initialize(c_text: str) -> bool:
     return bool(_FUZZER_INITIALIZE_DEF_RE.search(c_text))
 
 
+_WRAPPER_HEADER_RE = re.compile(r"^[A-Za-z_][^;{}]*\b__gen_e_acsl_\w+\s*\(")
+_RETRES_ASSIGN_RE = re.compile(r"^(?P<indent>\s+)__retres = ")
+WRAPPER_RESULT_INIT = "__e_acsl_initialize((void *)(& __retres),sizeof(__retres));"
+
+
+def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
+    """
+    Work around an E-ACSL gap (Frama-C 33): a contract wrapper `__gen_e_acsl_<fn>` registers its
+    `__retres` with the runtime but never marks it initialized after `__retres = <fn>(...);`.
+    Under -rte-initialized every `ensures` that reads \\result then fails `\\initialized(&__retres)`
+    on the first input. Insert the missing `__e_acsl_initialize` after each assignment to a
+    registered `__retres` inside a wrapper definition. Sound: the callee's own return is checked
+    for uninitialized reads. Returns the new text and the number of insertions.
+    """
+    out: list[str] = []
+    header = False  # inside a wrapper header, before its `{` (a `;` first means a prototype)
+    in_wrapper = tracked = False
+    indent: str | None = None  # inside a `__retres = ...` statement, until its `;`
+    count = 0
+    for line in c_text.split("\n"):
+        out.append(line)
+        if not in_wrapper:
+            if not header and _WRAPPER_HEADER_RE.match(line) and not line.rstrip().endswith(";"):
+                header = True
+            elif header and line.rstrip() == "{":
+                header, in_wrapper, tracked = False, True, False
+            elif header and line.rstrip().endswith(";"):
+                header = False
+            continue
+        if line.startswith("}"):
+            in_wrapper, indent = False, None
+            continue
+        if "__e_acsl_store_block((void *)(& __retres)" in line:
+            tracked = True
+        if indent is None and tracked:
+            m = _RETRES_ASSIGN_RE.match(line)
+            if m:
+                indent = m.group("indent")
+        if indent is not None and line.rstrip().endswith(";"):
+            out.append(indent + WRAPPER_RESULT_INIT)
+            count += 1
+            indent = None
+    return "\n".join(out), count
+
+
 def select_eacsl_binary(out_bin: Path) -> Path:
     """e-acsl-gcc writes the instrumented executable to `<out>.e-acsl`; prefer it when present."""
     out_bin = Path(out_bin)
@@ -377,8 +422,12 @@ def build_fallback_object(
     out_dir: Path,
     runner: Callable[..., Any] = subprocess.run,
     compiler: str = "clang",
+    timeout: float | None = None,
 ) -> dict[str, Any]:
-    """Generate and compile `eacsl_fallbacks.o` next to the binary. Falls back to ENOSYS-only stubs if forwarding fails to compile."""
+    """
+    Generate and compile `eacsl_fallbacks.o` next to the binary. Falls back to ENOSYS-only stubs if
+    forwarding fails to compile. `timeout` bounds each compile (the build job class limit).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         text = Path(instrumented_c).read_text(encoding="utf-8", errors="replace")
@@ -395,8 +444,10 @@ def build_fallback_object(
         src.write_text(source, encoding="utf-8")
         cmd = [compiler, "-c", "-O1", "-w", "-std=gnu17", str(src), "-o", str(obj)]
         try:
-            proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
             rc, last_err = proc.returncode, (proc.stderr or "")[-4000:]
+        except subprocess.TimeoutExpired:
+            rc, last_err = 124, f"{compiler} exceeded the {timeout} s build time limit"
         except OSError as exc:
             rc, last_err = 127, str(exc)
         if rc == 0:

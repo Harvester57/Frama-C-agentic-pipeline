@@ -54,11 +54,32 @@ _LABEL_RE = re.compile(
     r"^\s*(?:(?:assert|check|admit)\s+|(?:assert|check|admit|rte|eva|e-acsl|wp)\s*:\s*)+",
     re.IGNORECASE,
 )
-_KIND_LABEL_RE = re.compile(r"^\s*(?:" + "|".join(KNOWN_ALARM_KINDS) + r")\s*:\s*", re.IGNORECASE)
+_KIND_LABEL_RE = re.compile(r"^\s*(?:rte/)?(?:" + "|".join(KNOWN_ALARM_KINDS) + r")\s*:\s*", re.IGNORECASE)
+# Frama-C prints ACSL with Unicode symbols unless -no-unicode; E-ACSL reports and Eva/WP CSVs differ.
+_UNICODE_ACSL = {
+    "≤": "<=", "≥": ">=", "≢": "!=", "≠": "!=", "≡": "==", "⇒": "==>", "⇔": "<==>",
+    "∧": "&&", "∨": "||", "¬": "!", "⊕": "^^", "∀": "\\forall", "∃": "\\exists", "∈": "\\in",
+    "ℤ": "integer", "ℝ": "real", "𝔹": "boolean",
+}
+
+
+# Anchored anywhere in the path: an agent's scratch overlay, and a run directory seen from the host
+# (`/home/u/framac-pipeline/repo/run-3/workspace/work/...`, `C:/.../run-3/workspace/work/...`).
+_OVERLAY_ROOT_RES = (
+    re.compile(r"^(?:.*/)?agents/[A-Za-z0-9_-]+/scratch/(?:work|base)/"),
+    re.compile(r"^(?:.*/)?workspace/(?:work|baseline)/"),
+)
 
 
 def normalize_file(path: str) -> str:
+    """
+    Repository-relative path of a source file, whichever copy of it a tool saw: the container's
+    work tree, an agent's scratch overlay, or the run directory as seen from the host. The same
+    file must always give the same fingerprint and match the same ledger units.
+    """
     p = (path or "").replace("\\", "/").strip()
+    for rx in _OVERLAY_ROOT_RES:
+        p = rx.sub("", p, count=1)
     changed = True
     while changed:
         changed = False
@@ -101,6 +122,8 @@ def normalize_kind(kind: str, predicate: str = "") -> str:
 
 def normalize_predicate(predicate: str) -> str:
     text = (predicate or "").strip()
+    for symbol, ascii_form in _UNICODE_ACSL.items():
+        text = text.replace(symbol, ascii_form)
     previous = None
     while previous != text:
         previous = text

@@ -5,8 +5,8 @@ Frama-C Eva and WP parse with Frama-C's own libc (`-nostdinc`), so headers insta
 The pipeline puts this directory first on the Frama-C include path and force-includes
 `fc_compat_types.h`:
 
-- Eva / WP: via `augment_framac_cppflags()` in `scripts/framac_common.py` and `FC_STUBS` in
-  `templates/GNUmakefile.template`;
+- Eva / WP: via `augment_framac_cppflags()` in `scripts/framac_common.py`, which
+  `run_eva_slice.py` and `run_wp_function.py` (and therefore every Make recipe) apply;
 - E-ACSL (host-header mode, `-no-frama-c-stdlib`): via `build_eacsl_flag_sets()` in
   `scripts/eacsl_toolchain.py`, on the `-E` (Frama-C frontend) flags only.
 

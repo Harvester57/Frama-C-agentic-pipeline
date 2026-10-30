@@ -729,6 +729,12 @@ class TestHarnessLegitimacyAndMetadata:
         )
         assert validate_agent_result(scaf_obj) == []
         assert scaf_obj["refingerprint_reason"] is not None
+        # The reproducer command replays on the module's own build, as the fuzz report names it.
+        expected_bin = (json.loads((run_dir / "workspace/reports/fuzz/events.json").read_text(encoding="utf-8"))
+                        .get("compile", {}).get("binary") or "workspace/harnesses/fuzz_events.e-acsl")
+        assert scaf_obj["record"]["reproducers"][0]["command"] == (
+            "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module events "
+            f"--inputs workspace/crashes/events/crash-1 --binary {expected_bin}")
 
         ledger.cmd_ingest_verifier(scaf_path, replay_reports=[fuzz_report])
         close_res = ledger.cmd_close_remaining("quick_profile_wp_not_scheduled")
@@ -1021,11 +1027,12 @@ class TestHarnessLegitimacyAndMetadata:
         assert prep["ok"] is True
         assert prep["file"] == "src/SyncMem.c"
         assert prep["header"] == "src/SyncMem.h"
-        assert "--ldflags '-lbsd'" in prep["merge_command"]
+        # `--ldflags='-lbsd'`: a separate dash-leading value would be rejected by argparse.
+        assert "--ldflags='-lbsd'" in prep["merge_command"]
         brief_text = (run_dir / prep["brief_file"]).read_text(encoding="utf-8")
         assert "prover-hash" in brief_text
         assert "Hash" in brief_text
-        assert "--ldflags '-lbsd'" in brief_text
+        assert "--ldflags='-lbsd'" in brief_text
         assert "agents/prover-hash/scratch/work/src/SyncMem.c" in brief_text
         assert "workspace/stubs/ptf_stubs.c" in brief_text
         assert "scratch/work/workspace/stubs/ptf_stubs.c" not in brief_text
@@ -1050,7 +1057,7 @@ class TestHarnessLegitimacyAndMetadata:
         assert prep_ver["ok"] is True
         ver_brief = (run_dir / prep_ver["brief_file"]).read_text(encoding="utf-8")
         assert "{candidate_short}" not in ver_brief
-        assert "--ldflags '-lbsd'" in ver_brief
+        assert "--ldflags='-lbsd'" in ver_brief
         assert "workspace/stubs/ptf_stubs.c" in ver_brief
         assert "workspace/work/workspace/stubs/ptf_stubs.c" not in ver_brief
 
@@ -1286,7 +1293,9 @@ class TestHarnessLegitimacyAndMetadata:
             )
             return sb_mod.SandboxResult(returncode=77, stdout="", stderr="", timed_out=False, sandbox="rlimits")
 
-        def fake_replay(binary, input_file, scratch_dir, timeout_s=30):
+        def fake_replay(binary, input_file, scratch_dir, timeout_s=30, **kwargs):
+            # Crash replays use the campaign's fixed per-input timeout.
+            captured["replay_per_input_timeout"] = kwargs.get("per_input_timeout")
             return {
                 "reproduced": True,
                 "reproducible": True,
@@ -1316,8 +1325,10 @@ class TestHarnessLegitimacyAndMetadata:
         )
         assert "-jobs=4" in captured["cmd"]
         assert "-workers=4" in captured["cmd"]
+        assert "-rss_limit_mb=2048" in captured["cmd"]  # fixed, whatever the worker count
         assert captured["timeout_s"] == 30 + 180
         assert captured["cpu_seconds"] == (30 + 180) * 5
+        assert captured["replay_per_input_timeout"] == 10
         assert report["status"] == "crash_found"
         assert len(report["artifacts"]) == 1
 
@@ -1342,7 +1353,8 @@ class TestHarnessLegitimacyAndMetadata:
 
         def fake_run(cmd, **kwargs):
             calls.append(list(cmd))
-            csv_file = out_dir / "wp_InCksum.csv"
+            # The bitwise retry writes its own artifacts (wp_<fn>_retry.*): honor -report-csv.
+            csv_file = Path(cmd[cmd.index("-report-csv") + 1]) if "-report-csv" in cmd else out_dir / "wp_InCksum.csv"
             if "-wp" in cmd:
                 model_idx = cmd.index("-wp-model") + 1
                 model = cmd[model_idx]
