@@ -209,6 +209,9 @@ PARAM_TYPES: dict[str, type] = {
     "fuzz_budget": int,
     "fuzz_max_time": int,
     "fuzz_dict": str,
+    "fuzz_engine": str,
+    "wp_exclude_files": list,
+    "wp_extra_sources": list,
 }
 
 
@@ -220,6 +223,9 @@ def default_params(profile: str) -> dict:
         "fuzz_budget": FUZZ_BUDGET_BY_PROFILE.get(profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE]),
         "fuzz_max_time": None,
         "fuzz_dict": None,
+        "fuzz_engine": "auto",
+        "wp_exclude_files": [],
+        "wp_extra_sources": [],
     }
 
 
@@ -235,6 +241,15 @@ def _param_problem(key: str, value: Any) -> str | None:
         if key == "eva_slevel":
             return None if 0 <= value <= 1_000_000 else "must be between 0 and 1000000"
         return None if value > 0 else "must be positive"
+    if key == "fuzz_engine":
+        return None if isinstance(value, str) and value in ("auto", "eacsl", "sanitizers") else "must be one of: 'auto', 'eacsl', 'sanitizers'"
+    if key in ("wp_exclude_files", "wp_extra_sources"):
+        if not isinstance(value, list) or any(
+            not isinstance(v, str) or not v or v.startswith("-") or any(c in v for c in "\n\r\0")
+            for v in value
+        ):
+            return "must be a list of file paths (not empty, not starting with '-', no line breaks)"
+        return None
     if not isinstance(value, str) or not value or value.startswith("-") or any(c in value for c in "\n\r\0"):
         return "must be a file path (not empty, not starting with '-', no line breaks)"
     return None
@@ -442,6 +457,19 @@ def _module_base_cppflags(run_dir: Path, name: str, sidecar: dict | None = None)
     return tokens
 
 
+_MAIN_DEF_RE = re.compile(r"\bmain\s*\([^;{}]*\)\s*\{")
+
+
+def _source_defines_main(path: Path) -> bool:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    cleaned = re.sub(r"/\*.*?\*/", " ", content, flags=re.DOTALL)
+    cleaned = re.sub(r"//[^\n]*", " ", cleaned)
+    return bool(_MAIN_DEF_RE.search(cleaned))
+
+
 def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     fuzz, eva = bool(dag_mod.get("run_eacsl_fuzz")), bool(dag_mod.get("run_eva"))
     if not MODULE_RE.match(name):
@@ -459,6 +487,33 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         if src.startswith("-"):
             raise _Excluded(f"source {src!r} looks like an option")
     base = _module_base_cppflags(plan.run_dir, name, sidecar)
+
+    # Detect whether slice sources define main( to prevent linker collision with LibFuzzer's main()
+    all_slice_sources = list(sources)
+    for raw_s in (sidecar.get("sources") or []) + (dag_mod.get("required_sources") or []):
+        if isinstance(raw_s, str) and raw_s not in all_slice_sources:
+            all_slice_sources.append(raw_s)
+    has_main_def = False
+    for src in all_slice_sources:
+        if PurePosixPath(src).name == f"harness_{name}.c":
+            continue
+        cand_paths = [
+            plan.run_dir / src if not src.startswith("/") else Path(src),
+            plan.run_dir / WORK_DIR / src,
+        ]
+        for cp in cand_paths:
+            if cp.is_file():
+                if _source_defines_main(cp):
+                    has_main_def = True
+                break
+        if has_main_def:
+            break
+
+    if has_main_def:
+        main_flag = f"-Dmain=__framac_module_main_{name}"
+        if not any(tok.startswith("-Dmain=") for tok in base):
+            base.append(main_flag)
+
     try:
         ldflags = split_flags(sidecar.get("ldflags"), "")
     except ValueError as exc:
@@ -619,6 +674,7 @@ def _module_block(mod: ModulePlan) -> list[str]:
         _assign(f"FUZZ_BUDGET_{n}", mk_quote(str(p["fuzz_budget"]))),
         _assign(f"FUZZ_MAX_TIME_{n}", _opt(p["fuzz_max_time"])),
         _assign(f"FUZZ_DICT_{n}", _opt(p["fuzz_dict"])),
+        _assign(f"FUZZ_ENGINE_{n}", mk_quote(str(p.get("fuzz_engine") or "auto"))),
     ]
 
 
@@ -710,7 +766,12 @@ def params_set(run_dir: Path | str = ".", module: str = "", reset: bool = False,
         for key, value in updates.items():
             if value is None:
                 continue
-            if (key in _CLEARED_BY_ZERO and value == 0) or (key == "fuzz_dict" and value == ""):
+            if (
+                (key in _CLEARED_BY_ZERO and value == 0)
+                or (key == "fuzz_dict" and value == "")
+                or (key == "fuzz_engine" and value == "")
+                or (key in ("wp_exclude_files", "wp_extra_sources") and value == [])
+            ):
                 entry.pop(key, None)
                 continue
             problem = _param_problem(key, value)
@@ -780,6 +841,7 @@ STAGE_OF_TARGET = {
     "ingest": 3,
     "replay": 3,
     "wp-queue": 3,
+    "wp-baseline": 3,
     "wp-sweep": 4,
     "report": 5,
 }
@@ -791,6 +853,7 @@ _TARGET_OUTPUTS = {
     "ingest": INGESTED_JSON,
     "replay": "workspace/reports/replay/index.json",
     "wp-queue": "workspace/reports/wp_queue.json",
+    "wp-baseline": "workspace/reports/wp_baseline.json",
     "wp-sweep": f"{SWEEP_DIR}/summary.json",
     "report": "REPORT.md",
 }
@@ -850,6 +913,8 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
         return deps + ([f"eva-{mod}"] if mod in plan.eva_modules else [])
     if node in ("replay", "wp-queue"):
         return ["ingest"]
+    if node == "wp-baseline":
+        return ["wp-queue"]
     return []
 
 
@@ -1369,8 +1434,9 @@ def sweep(
             if flags is None:
                 skipped.append({"file": e["file"], "function": e["function"], "reason": reason})
                 continue
-            key = f"{slugs[e['file']]}__{e['function']}"
-            out_json = f"{SWEEP_DIR}/{key}.json"
+            key = f"{e['module']}:{e['file']}#{e['function']}"
+            out_json = f"{SWEEP_DIR}/{slugs[e['file']]}__{e['function']}.json"
+            extra_sources = plan.params_doc.get("modules", {}).get(e["module"], {}).get("wp_extra_sources", [])
             cmd = [
                 py,
                 f"{scripts}/resources.py",
@@ -1398,6 +1464,8 @@ def sweep(
                 "--out-json",
                 out_json,
             ]
+            if extra_sources:
+                cmd.extend(["--extra-sources", *extra_sources])
             # A report left by an earlier sweep must never be read as this sweep's result.
             (run_dir / out_json).unlink(missing_ok=True)
             tasks.append((e, out_json, cmd))
@@ -1457,7 +1525,7 @@ def _normalize_flag_args(argv: list[str]) -> list[str]:
     """`--fuzz-dict -x` would be read as an option by argparse: bind such values with `=`."""
     from framac_common import normalize_flag_args
 
-    return normalize_flag_args(argv, ("--fuzz-dict",))
+    return normalize_flag_args(argv, ("--fuzz-dict", "--fuzz-engine"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1481,6 +1549,24 @@ def main(argv: list[str] | None = None) -> int:
     p_set.add_argument("--fuzz-budget", type=int, default=None, help="Campaign CPU-seconds (0: profile default)")
     p_set.add_argument(
         "--fuzz-max-time", type=int, default=None, help="Campaign wall-clock override in seconds (0 clears)"
+    )
+    p_set.add_argument(
+        "--fuzz-engine",
+        choices=["auto", "eacsl", "sanitizers", ""],
+        default=None,
+        help="Instrumentation engine (auto, eacsl, sanitizers; '' clears)",
+    )
+    p_set.add_argument(
+        "--wp-exclude-files",
+        nargs="*",
+        default=None,
+        help="C files to exclude from WP analysis (empty list clears)",
+    )
+    p_set.add_argument(
+        "--wp-extra-sources",
+        nargs="*",
+        default=None,
+        help="Extra C files needed for WP analysis (empty list clears)",
     )
     p_show = psub.add_parser("show")
     p_show.add_argument("--module", default=None)
@@ -1513,6 +1599,9 @@ def main(argv: list[str] | None = None) -> int:
                 fuzz_dict=args.fuzz_dict,
                 fuzz_budget=args.fuzz_budget,
                 fuzz_max_time=args.fuzz_max_time,
+                fuzz_engine=args.fuzz_engine,
+                wp_exclude_files=args.wp_exclude_files,
+                wp_extra_sources=args.wp_extra_sources,
             )
         elif args.cmd == "params":
             out = params_show(run_dir, args.module)

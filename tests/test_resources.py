@@ -1066,6 +1066,9 @@ def make_fake_engine(bin_dir: Path, info: dict, log: Path) -> None:
 
 @pytest.fixture
 def fake_engine(tmp_path, monkeypatch):
+    probe_root = _machine(tmp_path / "probe_root")
+    monkeypatch.setenv("FRAMAC_PROBE_ROOT", str(probe_root))
+
     def _make(info: dict) -> Path:
         log = tmp_path / "engine_run_args.txt"
         make_fake_engine(tmp_path / "bin", info, log)
@@ -1074,6 +1077,7 @@ def fake_engine(tmp_path, monkeypatch):
         monkeypatch.setenv("FRAMAC_CACHE_DIR", str(tmp_path / "cache"))
         monkeypatch.setenv("FRAMAC_POOL_CPUS", "2")
         monkeypatch.setenv("FRAMAC_POOL_MEMORY", "4g")
+        monkeypatch.setenv("FRAMAC_PROBE_ROOT", str(probe_root))
         R._ENGINE_MEMO.clear()
         return log
 
@@ -1175,6 +1179,29 @@ def test_exec_refuses_target_code_when_memory_or_pids_cannot_be_enforced(tmp_pat
     assert "--memory" not in out["argv"] and "--pids-limit" not in out["argv"] and "--cpus" in out["argv"]
     monkeypatch.setenv("FRAMAC_ALLOW_UNENFORCED_LIMITS", "1")
     assert R.main(run) == 0
+
+
+def test_fake_engine_isolates_from_multi_numa_host_topology(tmp_path, fake_engine):
+    fake_engine(DOCKER_DESKTOP)
+    probe_root = Path(os.environ["FRAMAC_PROBE_ROOT"])
+    assert probe_root.exists()
+    topo = R.cpu_topology(probe_root, range(16))
+    assert topo is not None
+    assert len(topo.get("numa") or []) == 0
+    assert len(topo.get("l3") or []) == 0
+
+    # Under Linux with multi-NUMA host, pin_plan forces exclusive pinning (--cpuset-cpus).
+    # With fake_engine's mock topology, exclusive pinning is avoided.
+    eng = R.EngineInfo(kind="podman", cpuset=True, cpu=True)
+    pool_isolated = R.Pool(scope="host", cpus=16, mem_mb=64 * 1024, topology=topo)
+    plan_isolated = R.pin_plan(pool_isolated, eng, mode="auto", platform="linux")
+    assert not plan_isolated.exclusive
+
+    # Contrast with an un-isolated multi-NUMA host topology
+    topo_multi = R.cpu_topology(_two_numa_smt(tmp_path / "multi_numa"), range(16))
+    pool_multi = R.Pool(scope="host", cpus=16, mem_mb=64 * 1024, topology=topo_multi)
+    plan_multi = R.pin_plan(pool_multi, eng, mode="auto", platform="linux")
+    assert plan_multi.exclusive
 
 
 def test_exec_rejects_limit_flags_it_manages(tmp_path, fake_engine, monkeypatch):
@@ -1513,3 +1540,50 @@ def test_exec_auto_downgrades_cache_mode_when_target_code_lease_is_active_on_run
         assert "shared cache mounted read-only: a target-code job is active on this run directory" in captured.err
     finally:
         broker.release(fuzz_lease)
+
+
+def test_history_estimate_3_tier_hierarchical_fallback_and_oom_inheritance(tmp_path):
+    """
+    Test 3-tier hierarchical fallback in history_estimate:
+    - Tier 1: exact match on <module>:<file>#<fn>
+    - Tier 2 (TU prefix): search records matching <module>:<file> or starting with <module>:<file>#
+      and inherit 2.0x OOM multiplier for sibling functions in heavy TUs
+    - Tier 3 (Module prefix): search records matching <module> or starting with <module>:
+    - Return None if no records match across all 3 tiers
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    # Tier 1: exact match
+    R.write_history(run_dir, {"class": "wp", "key": "mod_a:src/a.c#fn1", "peak_mb": 200, "oom_killed": False})
+    est1 = R.history_estimate(run_dir, "wp", "mod_a:src/a.c#fn1")
+    assert est1 == 250  # 200 * 1.25
+
+    # Tier 2: sibling function in same TU falls back to TU prefix
+    # Sibling fn2 has no record, but fn1 in src/a.c exists
+    est2 = R.history_estimate(run_dir, "wp", "mod_a:src/a.c#fn2")
+    assert est2 == 250
+
+    # Tier 2: heavy TU with OOM killed record inherits 2.0x multiplier
+    R.write_history(run_dir, {"class": "wp", "key": "mod_b:src/heavy.c#heavy_fn", "peak_mb": 500, "oom_killed": True})
+    est_heavy_sibling = R.history_estimate(run_dir, "wp", "mod_b:src/heavy.c#sibling_fn")
+    assert est_heavy_sibling == 1000  # 500 * 2.0
+
+    # Also test record matching TU prefix exactly (<module>:<file>)
+    R.write_history(run_dir, {"class": "wp", "key": "mod_c:src/tu_only.c", "peak_mb": 300, "oom_killed": False})
+    est_tu_match = R.history_estimate(run_dir, "wp", "mod_c:src/tu_only.c#any_fn")
+    assert est_tu_match == 375  # 300 * 1.25
+
+    # Tier 3: unseen TU in known module falls back to module prefix
+    # mod_a:src/unseen.c#some_fn has no src/unseen.c record, falls back to mod_a (which has mod_a:src/a.c#fn1)
+    est3 = R.history_estimate(run_dir, "wp", "mod_a:src/unseen.c#some_fn")
+    assert est3 == 250
+
+    # Also test record matching module prefix exactly (<module>)
+    R.write_history(run_dir, {"class": "wp", "key": "mod_d", "peak_mb": 400, "oom_killed": False})
+    est_mod_match = R.history_estimate(run_dir, "wp", "mod_d:src/file.c#fn")
+    assert est_mod_match == 500  # 400 * 1.25
+
+    # Completely unknown key returns None
+    assert R.history_estimate(run_dir, "wp", "unknown_mod:src/file.c#fn") is None
+    assert R.history_estimate(run_dir, "wp", "nonexistent") is None

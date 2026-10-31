@@ -378,6 +378,132 @@ def _resolve_declarator(
     return None, [], []
 
 
+def _split_param_tokens(param_tokens: list[Token]) -> list[list[str]]:
+    """Split param_tokens on top-level commas, treating '(void)' as 0 parameters."""
+    params_split: list[list[str]] = []
+    cur: list[str] = []
+    p_depth = 0
+    for tok in param_tokens:
+        if tok.text in ("(", "[", "{"):
+            p_depth += 1
+            cur.append(tok.text)
+        elif tok.text in (")", "]", "}"):
+            p_depth = max(0, p_depth - 1)
+            cur.append(tok.text)
+        elif tok.text == "," and p_depth == 0:
+            if cur:
+                params_split.append(cur)
+                cur = []
+        else:
+            cur.append(tok.text)
+    if cur:
+        params_split.append(cur)
+    if params_split == [["void"]]:
+        return []
+    return params_split
+
+
+def extract_prototypes_from_code(raw_code: str, path: str = "<input>") -> list[dict]:
+    """
+    Extract C function prototypes from `raw_code` (top-level declarations ending in ';').
+    Returns a list of dicts with 'name', 'line', 'decl_tokens', 'param_tokens'.
+    """
+    try:
+        all_tokens = tokenize_c_acsl(raw_code, path=path)
+    except AcslSyntaxError:
+        cleaned = re.sub(r"/\*.*?\*/", " ", raw_code, flags=re.DOTALL)
+        cleaned = re.sub(r"//[^\n]*", " ", cleaned)
+        all_tokens = tokenize_c_acsl(cleaned, path=path)
+
+    c_tokens = [t for t in all_tokens if t.kind in ("c_token", "string")]
+    results: list[dict] = []
+
+    n = len(c_tokens)
+    idx = 0
+    brace_depth = 0
+    paren_depth = 0
+    last_top_boundary = -1
+
+    while idx < n:
+        tok = c_tokens[idx]
+        text = tok.text
+
+        if text == "(":
+            paren_depth += 1
+            idx += 1
+            continue
+        if text == ")":
+            paren_depth = max(0, paren_depth - 1)
+            idx += 1
+            continue
+        if text == "{" and paren_depth == 0:
+            if brace_depth == 0:
+                header_slice = c_tokens[last_top_boundary + 1 : idx]
+                if (
+                    len(header_slice) >= 2
+                    and header_slice[-2].text == "extern"
+                    and header_slice[-1].text in ('"C"', '"C++"')
+                ) or (len(header_slice) == 1 and header_slice[-1].text == "extern"):
+                    last_top_boundary = idx
+                    idx += 1
+                    continue
+                close_brace = _find_matching_forward(c_tokens, idx, "{", "}")
+                if close_brace == -1:
+                    break
+                last_top_boundary = close_brace
+                idx = close_brace + 1
+                continue
+            else:
+                brace_depth += 1
+                idx += 1
+                continue
+        if text == "}" and paren_depth == 0:
+            brace_depth = max(0, brace_depth - 1)
+            if brace_depth == 0:
+                last_top_boundary = idx
+            idx += 1
+            continue
+
+        if text == ";" and brace_depth == 0 and paren_depth == 0:
+            header_slice = c_tokens[last_top_boundary + 1 : idx]
+            if header_slice and not any(t.text == "typedef" for t in header_slice):
+                has_top_equals = False
+                p_depth = 0
+                for ht in header_slice:
+                    if ht.text == "(":
+                        p_depth += 1
+                    elif ht.text == ")":
+                        p_depth = max(0, p_depth - 1)
+                    elif ht.text == "=" and p_depth == 0:
+                        has_top_equals = True
+                        break
+                if not has_top_equals:
+                    before_semi = _strip_trailing_attributes(c_tokens, idx, last_top_boundary)
+                    if before_semi > last_top_boundary and c_tokens[before_semi].text == ")":
+                        open_params = _find_matching_backward(c_tokens, before_semi, "(", ")")
+                        if open_params > last_top_boundary:
+                            fn_name, param_tokens, decl_prefix = _resolve_declarator(
+                                c_tokens, last_top_boundary, open_params, before_semi
+                            )
+                            if fn_name and _is_ident(fn_name) and not any(t.text == "typedef" for t in decl_prefix):
+                                start_line = decl_prefix[0].line if decl_prefix else c_tokens[open_params].line
+                                results.append(
+                                    {
+                                        "name": fn_name,
+                                        "line": start_line,
+                                        "decl_tokens": decl_prefix,
+                                        "param_tokens": param_tokens,
+                                    }
+                                )
+            last_top_boundary = idx
+            idx += 1
+            continue
+
+        idx += 1
+
+    return results
+
+
 def analyze_signature(decl_tokens: list[Token], param_tokens: list[Token]) -> dict:
     """Analyze function return type, storage class, and parameter structure without keyword hints."""
     decl_texts = [t.text for t in decl_tokens]
@@ -1071,16 +1197,21 @@ def build_dag(
                     rel_key = fpath.name
                 compile_flags_by_file[rel_key] = flags
 
-    if not c_files:
-        for root, dirs, files in os.walk(target_dir):
-            dirs[:] = [
-                d
-                for d in dirs
-                if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
-            ]
-            for f in sorted(files):
-                if f.endswith(".c"):
-                    c_files.append((Path(root) / f).resolve())
+    all_source_files: list[Path] = []
+    c_files_needed = not c_files
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [
+            d
+            for d in dirs
+            if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
+        ]
+        for f in sorted(files):
+            suffix = Path(f).suffix.lower()
+            if suffix in (".c", ".h"):
+                resolved = (Path(root) / f).resolve()
+                all_source_files.append(resolved)
+                if c_files_needed and suffix == ".c":
+                    c_files.append(resolved)
 
     # Supplement missing per-file flags via build-free in-tree header/Makefile discovery
     discovered_flags = discover_in_tree_cppflags(target_dir, c_files)
@@ -1092,6 +1223,7 @@ def build_dag(
         synthesize_compile_commands(target_dir, c_files, compile_flags_by_file, emit_compile_commands)
 
     functions: dict[str, dict] = {}
+    def_param_counts: dict[str, int] = {}
     name_collisions: list[dict] = []
     call_edges: dict[str, set[str]] = defaultdict(set)
     modules: dict[str, dict] = defaultdict(lambda: {"files": [], "functions": []})
@@ -1157,9 +1289,52 @@ def build_dag(
                 "raw_callees": sorted(body_info["direct_callees"]),
                 "cppflags": compile_flags_by_file.get(rel_path, []),
             }
+            def_param_counts[fn_name] = len(_split_param_tokens(item["param_tokens"]))
             call_edges[fn_name] = set(body_info["direct_callees"])
             if fn_name not in modules[module_name]["functions"]:
                 modules[module_name]["functions"].append(fn_name)
+
+    # Pre-flight warnings: walk both .h and .c files to extract prototypes
+    warnings: list[str] = []
+    proto_files = sorted(set(all_source_files) | set(c_files))
+    for src_file in proto_files:
+        try:
+            rel_path = src_file.relative_to(target_dir).as_posix()
+        except ValueError:
+            rel_path = src_file.name
+        raw = src_file.read_text(encoding="utf-8", errors="replace")
+        prototypes = extract_prototypes_from_code(raw, path=rel_path)
+        for proto in prototypes:
+            fn_name = proto["name"]
+            params_split = _split_param_tokens(proto["param_tokens"])
+            K = len(params_split)
+
+            # Check for multidimensional VLA parameters (2+ bracket pairs `[` `]`)
+            for p_toks in params_split:
+                bracket_pairs = min(p_toks.count("["), p_toks.count("]"))
+                if bracket_pairs >= 2:
+                    warn = (
+                        f"multidimensional array/VLA parameter in function prototype "
+                        f"'{fn_name}' at {rel_path}:{proto['line']}"
+                    )
+                    if warn not in warnings:
+                        warnings.append(warn)
+                        print(f"pre-flight warning: {warn}", file=sys.stderr)
+
+            # Check for prototype/definition parameter count mismatches
+            if fn_name in def_param_counts:
+                M = def_param_counts[fn_name]
+                if K != M:
+                    def_file = functions[fn_name]["file"]
+                    def_line = functions[fn_name]["line"]
+                    warn = (
+                        f"parameter count mismatch for '{fn_name}': prototype has {K} "
+                        f"parameter(s) at {rel_path}:{proto['line']}, definition has {M} "
+                        f"parameter(s) at {def_file}:{def_line}"
+                    )
+                    if warn not in warnings:
+                        warnings.append(warn)
+                        print(f"pre-flight warning: {warn}", file=sys.stderr)
 
     waves, cycles = compute_topological_waves(functions, call_edges)
     recursive_fns = {fn for scc in cycles for fn in scc}
@@ -1258,6 +1433,7 @@ def build_dag(
         "total_functions": len(functions),
         "total_waves": len(waves),
         "name_collisions": name_collisions,
+        "warnings": warnings,
         "modules": module_summaries,
         "waves": [{"wave": idx, "count": len(w), "functions": w} for idx, w in enumerate(waves)],
         "recursion_cycles": cycles,

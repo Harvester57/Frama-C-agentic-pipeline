@@ -32,11 +32,11 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init seed build selftest fuzz eva ingest replay wp-queue wp-sweep report \
+.PHONY: help slice-init seed build selftest fuzz eva ingest replay wp-queue wp-baseline wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(EVA_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init seed build selftest fuzz eva ingest replay wp-queue wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init seed build selftest fuzz eva ingest replay wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -66,6 +66,7 @@ $(BUILD_TARGETS): build-%:
 	$(RUN) --class build --key $* --output workspace/build/$*.build.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py build --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
+		--engine=$(FUZZ_ENGINE_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/build/$*.build.json
 
 # The E-ACSL toolchain canary (runs a compiled canary, so dynamic).
@@ -82,6 +83,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 		--out-bin workspace/harnesses/fuzz_$* --corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
+		--engine=$(FUZZ_ENGINE_$*) \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/reports/fuzz/$*.json
 
@@ -110,6 +112,11 @@ replay: ingest
 
 wp-queue: ingest
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init
+
+# Mechanical Phase-3 WP baseline wave across all queued functions.
+# Not leased itself: wp_scheduler.py only coordinates, and leases one `wp` job per function.
+wp-baseline: wp-queue
+	$(PY) $(S)/wp_scheduler.py baseline
 
 # --- Phase 4 ---------------------------------------------------------------------------------
 

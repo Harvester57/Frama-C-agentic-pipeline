@@ -471,10 +471,10 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         assert verify_acsl_only(BASELINE_H, deduped_h, path="parser.h") == []
 
     def test_architect_multi_header_merge_deduplicates_shared_predicates(self, tmp_path: Path) -> None:
-        """Merging two architect headers that both define no_crlf_or_nul automatically deduplicates the second."""
+        """Merging two architect headers where other.h transitively includes parser.h deduplicates the shared predicate."""
         target = tmp_path / "target"
         target.mkdir()
-        h2_base = "#ifndef OTHER_H\n#define OTHER_H\nint other_fn(char *s);\n#endif\n"
+        h2_base = '#ifndef OTHER_H\n#define OTHER_H\n#include "parser.h"\nint other_fn(char *s);\n#endif\n'
         (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
         (target / "parser.h").write_text(BASELINE_H, encoding="utf-8")
         (target / "other.h").write_text(h2_base, encoding="utf-8")
@@ -487,7 +487,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
 
         shared_pred = (
             "/*@\n"
-            "  predicate no_crlf_or_nul(char *buf, integer len) =\n"
+            "  predicate shared_packet_valid(char *buf, integer len) =\n"
             "    \\forall integer k; 0 <= k < len ==> buf[k] != '\\r' && buf[k] != '\\n' && buf[k] != '\\0';\n"
             "*/\n"
         )
@@ -520,9 +520,9 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
             skip_reverify=True,
         )
         assert r2["ok"] is True
-        assert r2["deduplicated_declarations"] == ["no_crlf_or_nul"]
-        assert "no_crlf_or_nul" in (overlay / "work/parser.h").read_text(encoding="utf-8")
-        assert "no_crlf_or_nul" not in (overlay / "work/other.h").read_text(encoding="utf-8")
+        assert r2["deduplicated_declarations"] == ["shared_packet_valid"]
+        assert "shared_packet_valid" in (overlay / "work/parser.h").read_text(encoding="utf-8")
+        assert "shared_packet_valid" not in (overlay / "work/other.h").read_text(encoding="utf-8")
         assert "assigns \\nothing;" in (overlay / "work/other.h").read_text(encoding="utf-8")
 
     def test_prover_auto_sibling_header_and_source_path_normalization(self, tmp_path: Path) -> None:
@@ -660,7 +660,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
         (target / "parser.h").write_text(BASELINE_H, encoding="utf-8")
         (target / "other.h").write_text(
-            "#ifndef OTHER_H\n#define OTHER_H\nint other_fn(int x);\n#endif\n", encoding="utf-8"
+            '#ifndef OTHER_H\n#define OTHER_H\n#include "parser.h"\nint other_fn(int x);\n#endif\n', encoding="utf-8"
         )
 
         run_dir = tmp_path / "run"
@@ -677,7 +677,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
             encoding="utf-8",
         )
         (run_dir / "agents/arch-overload-2/scratch/work/other.h").write_text(
-            "#ifndef OTHER_H\n#define OTHER_H\n"
+            '#ifndef OTHER_H\n#define OTHER_H\n#include "parser.h"\n'
             + pred_arity_2
             + pred_arity_3
             + "/*@ assigns \\nothing; */\nint other_fn(int x);\n#endif\n",

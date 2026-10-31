@@ -37,7 +37,11 @@ import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import fnmatch
 from pathlib import Path
+import shlex
+import subprocess
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -63,6 +67,7 @@ from validate_artifacts import validate_agent_result  # noqa: E402
 
 SCHEDULE = Path("state/wp_schedule.json")
 WP_QUEUE = Path("workspace/reports/wp_queue.json")
+WP_BASELINE = Path("workspace/reports/wp_baseline.json")
 DAG_PATH = Path("workspace/reports/callgraph_dag.json")
 REQUESTS = Path("workspace/reports/strengthen_requests.json")
 HARNESS_DIR = Path("workspace/harnesses")
@@ -143,6 +148,17 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
     cppflags = (side.get("cppflags") if isinstance(side, dict) else None) or "-I."
     report = run_dir / "agents" / agent_id / "scratch" / "parent_wp" / f"{function}.json"
     report.parent.mkdir(parents=True, exist_ok=True)
+    extra_sources = None
+    if module:
+        params_file = run_dir / "workspace" / "build" / "params.json"
+        if not params_file.is_file():
+            params_file = run_dir / "build" / "params.json"
+        if params_file.is_file():
+            try:
+                pdata = json.loads(params_file.read_text(encoding="utf-8"))
+                extra_sources = pdata.get("modules", {}).get(module, {}).get("wp_extra_sources")
+            except Exception:
+                pass
     with run_lock("merge", run_dir):
         ok, reason = workspace_overlay._run_parent_reverify(
             run_dir=run_dir,
@@ -151,9 +167,10 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
             overlay_dir=run_dir / "workspace",
             c_file=file,
             function=function,
-            module=None,
+            module=module,
             sources=None,
             cppflags=cppflags,
+            wp_extra_sources=extra_sources,
         )
     return {"ok": ok, "reason": reason, "report": report.relative_to(run_dir).as_posix() if report.is_file() else None}
 
@@ -175,6 +192,7 @@ class Deps:
         self.resolve_request: Callable[..., dict] = contract_negotiator.cmd_resolve
         self.save_shard: Callable[[str, Path], dict] = _save_shard
         self.now: Callable[[], float] = time.time
+        self.run_cmd: Callable[..., Any] = subprocess.run
 
 
 DEPS = Deps()
@@ -2527,6 +2545,276 @@ def cmd_status() -> dict:
     return out
 
 
+def _matches_exclude(file_path: str, patterns: list[str]) -> bool:
+    norm_file = norm_path(file_path)
+    file_name = Path(norm_file).name
+    for pat in patterns:
+        norm_pat = norm_path(pat)
+        if norm_file == norm_pat or norm_file.endswith("/" + norm_pat.lstrip("/")):
+            return True
+        if fnmatch.fnmatch(norm_file, norm_pat) or fnmatch.fnmatch(file_name, norm_pat):
+            return True
+        if fnmatch.fnmatch(norm_file, f"*/{norm_pat}"):
+            return True
+    return False
+
+
+def cmd_baseline(
+    run_dir: Path | str = ".",
+    jobs: int | None = None,
+    recheck_all: bool = False,
+) -> dict:
+    """
+    Mechanical Phase-3 WP baseline wave using a rolling ThreadPoolExecutor pool.
+    Pulls tasks from workspace/reports/wp_queue.json (or state/wp_schedule.json),
+    filters tasks matching module wp_exclude_files, skips already proven tasks (unless recheck_all),
+    runs each task via resources.py run --class wp --key <module>:<file>#<fn> -- run_wp_function.py ...,
+    passes wp_extra_sources if configured, and incrementally ingests results into ledger under run_lock("ledger").
+    """
+    run_dir = Path(run_dir).resolve()
+    scripts_dir = Path(__file__).resolve().parent
+    py = sys.executable or "python3"
+    resources_py = str(scripts_dir / "resources.py")
+    run_wp_py = str(scripts_dir / "run_wp_function.py")
+    work_dir = run_dir / "workspace" / "work"
+
+    rec_jobs = DEPS.recommend().get("make_jobs") or DEPS.recommend().get("max_agents") or 4
+    max_workers = int(jobs) if jobs and int(jobs) > 0 else int(rec_jobs)
+    max_workers = max(1, max_workers)
+
+    raw_tasks: list[dict] = []
+    if (run_dir / WP_QUEUE).is_file():
+        q_data = load_json_strict(run_dir / WP_QUEUE)
+        raw_tasks = list(q_data.get("queue") or [])
+    elif (run_dir / SCHEDULE).is_file():
+        s_data = load_json_strict(run_dir / SCHEDULE)
+        raw_tasks = [t for t in s_data.get("tasks", {}).values() if t.get("kind") == "prove"]
+    else:
+        with run_lock("ledger", run_dir):
+            cmd_init()
+        if (run_dir / WP_QUEUE).is_file():
+            raw_tasks = list(load_json_strict(run_dir / WP_QUEUE).get("queue") or [])
+
+    params_doc = load_json_optional(run_dir / "workspace" / "build" / "params.json", None)
+    if params_doc is None:
+        params_doc = load_json_optional(run_dir / "build" / "params.json", {})
+    modules_params = params_doc.get("modules", {}) if isinstance(params_doc, dict) else {}
+
+    filtered: list[dict] = []
+    skipped_proven: list[dict] = []
+    to_run: list[dict] = []
+
+    for t in raw_tasks:
+        tid = t.get("task") or t.get("id") or ""
+        c_file = t.get("file")
+        fn = t.get("function")
+        mod = t.get("module") or "unknown"
+        if not c_file or not fn:
+            continue
+
+        mod_params = modules_params.get(mod, {})
+        exclude_pats = mod_params.get("wp_exclude_files", [])
+        if _matches_exclude(c_file, exclude_pats):
+            filtered.append({"task": tid, "file": c_file, "function": fn, "module": mod, "reason": "wp_exclude_files"})
+            continue
+
+        if not recheck_all:
+            wp_rep_path = run_dir / "workspace" / "reports" / "wp" / f"{fn}.json"
+            if not wp_rep_path.is_file():
+                wp_rep_path = run_dir / "reports" / "wp" / f"{fn}.json"
+            is_proven = False
+            if wp_rep_path.is_file():
+                try:
+                    rdata = json.loads(wp_rep_path.read_text(encoding="utf-8"))
+                    if rdata.get("status") == "all_proven":
+                        is_proven = True
+                except Exception:
+                    pass
+            if not is_proven and t.get("state") == "done" and t.get("outcome") == "all_proven":
+                is_proven = True
+            if is_proven:
+                skipped_proven.append({"task": tid, "file": c_file, "function": fn, "module": mod, "reason": "already_proven"})
+                continue
+
+        to_run.append({
+            "task_id": tid,
+            "file": c_file,
+            "function": fn,
+            "module": mod,
+            "mod_params": mod_params,
+        })
+
+    # Update filtered tasks in state if any
+    if filtered:
+        with run_lock("ledger", run_dir):
+            state = load_schedule()
+            changed = False
+            for f_item in filtered:
+                t_obj = state.get("tasks", {}).get(f_item["task"])
+                if t_obj and t_obj.get("state") != "skipped":
+                    _finish(state, t_obj, "skipped", "wp_exclude_files", reason="filtered by wp_exclude_files")
+                    changed = True
+            if changed:
+                save_schedule(state)
+                _write_wp_queue(state)
+
+    task_plans: list[dict] = []
+    for item in to_run:
+        tid = item["task_id"]
+        c_file = item["file"]
+        fn = item["function"]
+        mod = item["module"]
+        mod_params = item["mod_params"]
+
+        norm_c = norm_path(c_file)
+        c_file_path = (work_dir / norm_c) if (work_dir / norm_c).is_file() else (run_dir / norm_c)
+        hmeta = load_json_optional(run_dir / "workspace" / "harnesses" / f"harness_{mod}.json", {})
+        if not hmeta:
+            hmeta = load_json_optional(run_dir / "harnesses" / f"harness_{mod}.json", {})
+        cppflags = (hmeta.get("cppflags") if isinstance(hmeta, dict) else None) or "-I."
+        extra_sources = mod_params.get("wp_extra_sources", [])
+
+        slug = _slugify(c_file)
+        out_dir = run_dir / "workspace" / "reports" / "wp" / "work" / f"{slug}_{fn}"
+        out_json = run_dir / "workspace" / "reports" / "wp" / f"{fn}.json"
+        key = f"{mod}:{c_file}#{fn}"
+
+        cmd = [
+            py,
+            resources_py,
+            "run",
+            "--class",
+            "wp",
+            "--key",
+            key,
+            "--output",
+            str(out_json),
+            "--",
+            py,
+            run_wp_py,
+            "--file",
+            str(c_file_path),
+            "--function",
+            fn,
+            "--out-dir",
+            str(out_dir),
+            f"--cppflags={cppflags}",
+            "--wp-par",
+            "auto",
+            "--sarif",
+            "--out-json",
+            str(out_json),
+        ]
+        if extra_sources:
+            cmd.extend(["--extra-sources", *extra_sources])
+
+        task_plans.append({
+            "task_id": tid,
+            "file": c_file,
+            "function": fn,
+            "module": mod,
+            "out_dir": out_dir,
+            "out_json": out_json,
+            "cmd": cmd,
+        })
+
+    def _run_single(plan: dict) -> dict:
+        plan["out_dir"].mkdir(parents=True, exist_ok=True)
+        if plan["out_json"].is_file():
+            try:
+                plan["out_json"].unlink()
+            except OSError:
+                pass
+        proc = DEPS.run_cmd(
+            plan["cmd"],
+            cwd=str(run_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        report = load_json_optional(plan["out_json"], None)
+        status = (report.get("status") if isinstance(report, dict) else None) or ("failed" if getattr(proc, "returncode", 0) != 0 else "no_report")
+        return {
+            "task_id": plan["task_id"],
+            "function": plan["function"],
+            "file": plan["file"],
+            "module": plan["module"],
+            "out_json": plan["out_json"],
+            "returncode": getattr(proc, "returncode", 0),
+            "status": status,
+            "report": report,
+        }
+
+    results: list[dict] = []
+    if task_plans:
+        workers = min(max_workers, len(task_plans))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_plan = {pool.submit(_run_single, p): p for p in task_plans}
+            for future in as_completed(future_to_plan):
+                res = future.result()
+                results.append(res)
+                out_json_path = res["out_json"]
+
+                with run_lock("ledger", run_dir):
+                    if out_json_path.is_file():
+                        try:
+                            DEPS.ingest_wp([out_json_path])
+                        except Exception as exc:
+                            res["ingest_error"] = str(exc)
+
+                    state = load_schedule()
+                    task_obj = state.get("tasks", {}).get(res["task_id"])
+                    if task_obj:
+                        status_str = res["status"]
+                        raw_rep = res.get("report")
+                        rep_dict: dict[str, Any] = raw_rep if isinstance(raw_rep, dict) else {}
+                        rep_reason = rep_dict.get("reason")
+                        if status_str == "analysis_error":
+                            task_obj["analysis_errors"] = int(task_obj.get("analysis_errors") or 0) + 1
+                            if task_obj["analysis_errors"] >= MAX_ANALYSIS_ERRORS:
+                                _finish(state, task_obj, "blocked", "analysis_error", reason=rep_reason or "analysis_error")
+                            else:
+                                task_obj["state"] = "pending"
+                        elif status_str in ("all_proven", "unproven", "wp_aborted", "unsound_proof", "acsl_syntax_error"):
+                            _finish(state, task_obj, "done", status_str, reason=rep_reason)
+                        else:
+                            _finish(state, task_obj, "done", status_str, reason=rep_reason)
+                        save_schedule(state)
+                        _write_wp_queue(state)
+
+    proven_count = sum(1 for r in results if r["status"] == "all_proven")
+    unproven_count = sum(1 for r in results if r["status"] in ("unproven", "partial_proof"))
+    errors_count = sum(1 for r in results if r["status"] in ("analysis_error", "failed", "no_report", "wp_aborted", "acsl_syntax_error"))
+
+    summary = {
+        "ok": True,
+        "total_tasks": len(raw_tasks),
+        "filtered": len(filtered),
+        "already_proven": len(skipped_proven),
+        "executed": len(results),
+        "proven": proven_count,
+        "unproven": unproven_count,
+        "errors": errors_count,
+        "filtered_tasks": filtered,
+        "already_proven_tasks": skipped_proven,
+        "results": [
+            {
+                "task": r["task_id"],
+                "file": r["file"],
+                "function": r["function"],
+                "module": r["module"],
+                "status": r["status"],
+                "returncode": r["returncode"],
+            }
+            for r in results
+        ],
+    }
+    (run_dir / WP_BASELINE).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(run_dir / WP_BASELINE, summary)
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2541,6 +2829,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Adopt an existing run: orphaned in_progress units back to planned; report stale briefs",
     )
+    p_base = sub.add_parser("baseline", help="Mechanical Phase-3 WP baseline wave using a rolling worker pool")
+    p_base.add_argument("--run-dir", type=Path, default=Path("."), help="Run directory (default: .)")
+    p_base.add_argument("--jobs", type=int, default=None, help="Number of concurrent workers (default: recommend)")
+    p_base.add_argument("--recheck-all", action="store_true", help="Recheck tasks already proven")
     p_next = sub.add_parser("next", help="Hand out the highest-priority ready tasks")
     p_next.add_argument("--slots", default="auto", help="'auto' (recommend().max_agents minus running) or a number")
     p_next.add_argument("--prepare", action="store_true", help="Prepare overlays and briefs, claim prover units (CAS)")
@@ -2562,6 +2854,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "init":
             out = cmd_init(args.reconcile)
+        elif args.cmd == "baseline":
+            out = cmd_baseline(run_dir=args.run_dir, jobs=args.jobs, recheck_all=args.recheck_all)
         elif args.cmd == "next":
             slots = str(args.slots).strip().lower()
             if slots != "auto" and not slots.isdigit():

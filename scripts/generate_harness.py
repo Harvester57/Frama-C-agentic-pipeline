@@ -1049,6 +1049,29 @@ def generate_module_harness(
                     norm_cppflags = f"{norm_cppflags} {inc_flag}".strip()
             inc_lines.append(f'#include "{src_path.name}"')
 
+    main_def_re = re.compile(r"\bmain\s*\([^;{}]*\)\s*\{")
+    has_main_def = False
+    for src in sources or []:
+        sp = Path(src.replace("\\", "/").strip())
+        cands = [sp, Path("workspace/work") / sp]
+        for c in cands:
+            if c.is_file():
+                try:
+                    content = c.read_text(encoding="utf-8", errors="replace")
+                    cleaned = _strip_c_comments(content)
+                    if main_def_re.search(cleaned):
+                        has_main_def = True
+                        break
+                except OSError:
+                    pass
+        if has_main_def:
+            break
+
+    if has_main_def:
+        main_flag = f"-Dmain=__framac_module_main_{module_name}"
+        if "-Dmain=" not in norm_cppflags:
+            norm_cppflags = f"{norm_cppflags} {main_flag}".strip() if norm_cppflags else main_flag
+
     harness_content = (
         harness_tpl.replace("{{MODULE_NAME}}", module_name)
         .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))

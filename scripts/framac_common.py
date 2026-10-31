@@ -330,16 +330,33 @@ def resolve_fc_stubs_dir() -> Path | None:
         return container_dir
     local_dir = Path(__file__).resolve().parent.parent / "templates" / "fc_stubs"
     if local_dir.is_dir():
+        if os.name == "nt" and " " in str(local_dir):
+            try:
+                import ctypes
+
+                parts = list(local_dir.parts)
+                buf = ctypes.create_unicode_buffer(500)
+                short_parts: list[str] = [parts[0]]
+                cur = parts[0]
+                for part in parts[1:]:
+                    cur = os.path.join(cur, part)
+                    if " " in part:
+                        ctypes.windll.kernel32.GetShortPathNameW(cur, buf, 500)
+                        part = Path(buf.value).name
+                    short_parts.append(part)
+                return Path(*short_parts)
+            except Exception:
+                pass
         return local_dir
     return None
 
 
 def augment_framac_cppflags(cppflags: str) -> str:
     """
-    Append `-I<fc_stubs>` and `-include <fc_compat_types.h>` for Frama-C `-nostdinc` runs
+    Prepend `-I<fc_stubs>` and `-include <fc_compat_types.h>` for Frama-C `-nostdinc` runs
     (Eva and WP) so third-party headers (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`)
     and glibc internal integer typedefs (`__int32_t`, etc.) resolve cleanly without
-    shadowing `__fc_libc`.
+    shadowing `__fc_libc`, ensuring stubs and compatibility headers precede target headers.
     """
     base = (cppflags or "-I.").strip()
     fc_stubs = resolve_fc_stubs_dir()
@@ -347,12 +364,14 @@ def augment_framac_cppflags(cppflags: str) -> str:
         return base
     stubs_posix = fc_stubs.as_posix()
     compat_hdr = (fc_stubs / "fc_compat_types.h").as_posix()
-    parts = [base] if base else []
+    prefix: list[str] = []
     if f"-I{stubs_posix}" not in base:
-        parts.append(f"-I{stubs_posix}")
+        prefix.append(f"-I{stubs_posix}")
     if "fc_compat_types.h" not in base and (fc_stubs / "fc_compat_types.h").is_file():
-        parts.append(f"-include {compat_hdr}")
-    return " ".join(parts)
+        prefix.append(f"-include {compat_hdr}")
+    if base:
+        prefix.append(base)
+    return " ".join(prefix)
 
 
 # ---------------------------------------------------------------------------

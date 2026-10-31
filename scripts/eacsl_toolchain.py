@@ -31,7 +31,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from framac_common import resolve_fc_stubs_dir  # noqa: E402
 
 EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double")
-EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon")
+EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-function-declaration")
 # Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
 # leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full
 # tracking fixes that; it needs the runtime initialized by templates/eacsl_runtime/fuzz_init.c.
@@ -52,7 +52,7 @@ EACSL_RTE_INITIALIZED_FLAG = "-rte-initialized @all"
 _FUZZER_INITIALIZE_DEF_RE = re.compile(r"\bLLVMFuzzerInitialize\s*\([^;{)]*\)\s*\{")
 EACSL_BINARY_MARKERS = (b"__e_acsl_", b"eacsl_assert")
 
-_JOINABLE_SHORT = frozenset({"-I", "-D", "-U", "-L", "-l"})
+_JOINABLE_SHORT = frozenset({"-I", "-D", "-U", "-L", "-l", "-W"})
 _SEPARATE_PREPROCESSOR = frozenset({"-I", "-D", "-U", "-include", "-imacros", "-isystem", "-idirafter", "-iquote"})
 _JOINED_PREPROCESSOR = ("-I", "-D", "-U", "-isystem", "-idirafter", "-iquote")
 # Force-includes must never reach the backend compile: the instrumented file is
@@ -123,7 +123,12 @@ def split_preprocessor_flags(flags: str) -> tuple[list[str], list[str], list[str
     return pre, forced, other
 
 
-def build_eacsl_flag_sets(cppflags: str, fuzzer: bool = True, fc_stubs: Path | None | str = "auto") -> dict[str, str]:
+def build_eacsl_flag_sets(
+    cppflags: str,
+    fuzzer: bool = True,
+    fc_stubs: Path | None | str = "auto",
+    concurrency: bool = False,
+) -> dict[str, str]:
     """
     frontend: passed to `-E` (Frama-C preprocessing of the original sources).
     backend:  passed to `-e` (Clang compile of the self-contained instrumented file).
@@ -141,7 +146,13 @@ def build_eacsl_flag_sets(cppflags: str, fuzzer: bool = True, fc_stubs: Path | N
     front.extend(pre)
     front.extend(forced)
     front.extend(t for t in other if t.startswith("-std="))
-    backend: list[str] = (["-fsanitize=fuzzer"] if fuzzer else []) + list(EACSL_CODEGEN_FLAGS) + other
+    # Codegen flags and warning suppression (-Wno-*) stay isolated on the backend compile
+    backend: list[str] = (["-fsanitize=fuzzer"] if fuzzer else []) + list(EACSL_CODEGEN_FLAGS)
+    if concurrency and "-DE_ACSL_CONCURRENCY_PTHREAD" not in backend:
+        backend.append("-DE_ACSL_CONCURRENCY_PTHREAD")
+    for tok in other:
+        if tok not in backend:
+            backend.append(tok)
     return {
         "frontend": normalize_passthrough(shlex.join(front)),
         "backend": normalize_passthrough(shlex.join(backend)),
@@ -169,6 +180,22 @@ def resolve_fuzz_init_source() -> Path:
 def defines_fuzzer_initialize(c_text: str) -> bool:
     """True if the (instrumented) slice already defines LLVMFuzzerInitialize, which the init hook also defines."""
     return bool(_FUZZER_INITIALIZE_DEF_RE.search(c_text))
+
+
+_PTHREAD_CREATE_RE = re.compile(r"\bpthread_create\b")
+
+
+def slice_has_pthread(sources: Sequence[str | Path]) -> bool:
+    """True if any slice source file references pthread_create."""
+    for s in sources:
+        try:
+            p = Path(s)
+            if p.is_file() and _PTHREAD_CREATE_RE.search(p.read_text(encoding="utf-8", errors="replace")):
+                return True
+        except OSError:
+            continue
+    return False
+
 
 
 _WRAPPER_HEADER_RE = re.compile(r"^[A-Za-z_][^;{}]*\b__gen_e_acsl_\w+\s*\(")

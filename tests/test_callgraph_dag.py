@@ -13,6 +13,7 @@ from build_callgraph_dag import (
     compute_topological_waves,
     discover_in_tree_cppflags,
     extract_functions_from_code,
+    extract_prototypes_from_code,
     infer_security_properties,
 )
 
@@ -346,3 +347,120 @@ int decode_stream(const uint8_t *buf, size_t len, uint8_t *scratch, size_t scrat
         assert "src/mod_b/util.c" in mod_a_info["required_sources"]
         assert mod_a_info["cross_module_callees"] == ["util_crc"]
         assert mod_a_info["external_callees"] == ["ext_lib_call"]
+
+
+class TestPreflightWarningsAndPrototypeExtraction:
+    """Tests for C prototype extraction, multidimensional VLA detection, and param count mismatch warnings."""
+
+    def test_extract_prototypes_handles_declarations_and_skips_typedefs(self) -> None:
+        src = """\
+#include <stdint.h>
+
+/* Typedef must be skipped */
+typedef void (*Callback_T)(int a, int b);
+typedef struct State_T State_T;
+
+/* Struct declaration must be skipped */
+struct Point { int x; int y; };
+
+/* Function prototypes */
+int parse_header(const uint8_t *buf, size_t len);
+void process_matrix(double matrix[10][20]);
+extern void reset_device(void);
+
+/* Definition should be skipped during prototype extraction */
+int helper(int x) {
+    return x + 1;
+}
+"""
+        protos = extract_prototypes_from_code(src, path="test.h")
+        names = [p["name"] for p in protos]
+        assert names == ["parse_header", "process_matrix", "reset_device"]
+
+    def test_multidimensional_vla_preflight_warning(self, tmp_path: Path, capsys) -> None:
+        src_dir = tmp_path / "src" / "reader"
+        src_dir.mkdir(parents=True)
+        (src_dir / "TypesReader.h").write_text(
+            """\
+typedef double DOUBLE;
+#define MaxRows 10
+#define MaxCols 20
+
+void ReadData(int id, DOUBLE GstBufferField[MaxRows][MaxCols]);
+""",
+            encoding="utf-8",
+        )
+        (src_dir / "TypesReader.c").write_text(
+            """\
+#include "TypesReader.h"
+void ReadData(int id, DOUBLE GstBufferField[MaxRows][MaxCols]) {
+    (void)id;
+    (void)GstBufferField;
+}
+""",
+            encoding="utf-8",
+        )
+
+        dag = build_dag(tmp_path)
+        err = capsys.readouterr().err
+
+        assert "warnings" in dag
+        vla_warns = [w for w in dag["warnings"] if "multidimensional array/VLA" in w]
+        assert len(vla_warns) >= 1
+        assert "ReadData" in vla_warns[0]
+        assert "TypesReader.h" in vla_warns[0]
+        assert "multidimensional array/VLA parameter in function prototype 'ReadData'" in err
+
+    def test_prototype_definition_param_count_mismatch_warning(self, tmp_path: Path, capsys) -> None:
+        src_dir = tmp_path / "src" / "steering"
+        src_dir.mkdir(parents=True)
+        (src_dir / "steering.h").write_text(
+            """\
+void Stop_Steering(int channel, int speed);
+""",
+            encoding="utf-8",
+        )
+        (src_dir / "steering.c").write_text(
+            """\
+#include "steering.h"
+void Stop_Steering(int channel, int speed, int force) {
+    (void)channel; (void)speed; (void)force;
+}
+""",
+            encoding="utf-8",
+        )
+
+        dag = build_dag(tmp_path)
+        err = capsys.readouterr().err
+
+        mismatch_warns = [w for w in dag["warnings"] if "parameter count mismatch" in w]
+        assert len(mismatch_warns) == 1
+        assert "Stop_Steering" in mismatch_warns[0]
+        assert "prototype has 2 parameter(s)" in mismatch_warns[0]
+        assert "definition has 3 parameter(s)" in mismatch_warns[0]
+        assert "parameter count mismatch for 'Stop_Steering'" in err
+
+    def test_clean_project_emits_no_warnings(self, tmp_path: Path, capsys) -> None:
+        src_dir = tmp_path / "src" / "clean"
+        src_dir.mkdir(parents=True)
+        (src_dir / "clean.h").write_text(
+            """\
+int add(int a, int b);
+void ping(void);
+""",
+            encoding="utf-8",
+        )
+        (src_dir / "clean.c").write_text(
+            """\
+#include "clean.h"
+int add(int a, int b) { return a + b; }
+void ping(void) {}
+""",
+            encoding="utf-8",
+        )
+
+        dag = build_dag(tmp_path)
+        err = capsys.readouterr().err
+        assert dag["warnings"] == []
+        assert err == ""
+
