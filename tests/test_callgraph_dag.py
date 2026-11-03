@@ -149,6 +149,50 @@ void *alloc_node(void *member_ptr, size_t sz) {
         assert body["has_container_of"] is True
         assert set(body["wp_blockers"]) == {"dynamic_allocation", "container_of"}
 
+    def test_marks_fuzz_and_eva_harness_entrypoints_as_shell_unverifiable_wp(self) -> None:
+        src = """\
+int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
+    return size > 0 ? data[0] : 0;
+}
+int eva_main(void) {
+    return 0;
+}
+"""
+        fns = {f["name"]: f for f in extract_functions_from_code(src)}
+        for name in ("LLVMFuzzerTestOneInput", "eva_main"):
+            sig = analyze_signature(fns[name]["decl_tokens"], fns[name]["param_tokens"])
+            body = analyze_body(name, fns[name]["body_tokens"], sig)
+            assert "fuzz_or_eva_harness_entrypoint" in body["wp_blockers"]
+            assert body["verifiability"] == "shell_unverifiable_wp"
+
+    def test_ignores_do_while_zero_macros_and_counts_do_while_once(self) -> None:
+        src = """\
+int macro_only(int x) {
+    do {
+        x += 1;
+    } while (0);
+    return x;
+}
+
+int real_do_while(int n) {
+    int i = 0;
+    do {
+        i++;
+    } while (i < n);
+    return i;
+}
+"""
+        fns = {f["name"]: f for f in extract_functions_from_code(src)}
+        sig1 = analyze_signature(fns["macro_only"]["decl_tokens"], fns["macro_only"]["param_tokens"])
+        body1 = analyze_body("macro_only", fns["macro_only"]["body_tokens"], sig1)
+        assert body1["has_loops"] is False
+        assert body1["loop_count"] == 0
+
+        sig2 = analyze_signature(fns["real_do_while"]["decl_tokens"], fns["real_do_while"]["param_tokens"])
+        body2 = analyze_body("real_do_while", fns["real_do_while"]["body_tokens"], sig2)
+        assert body2["has_loops"] is True
+        assert body2["loop_count"] == 1
+
 
 class TestTarjanWavesAndHintFreeClassification:
     """Tests for Tarjan SCC wave calculation and purely structural module tiering."""

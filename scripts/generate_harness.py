@@ -56,22 +56,45 @@ def resolve_template_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "templates"
 
 
-def _normalize_header_include(header_include: str, cppflags: str) -> tuple[str, str]:
+def _normalize_run_rel_dir(dir_str: str) -> str:
+    norm = (dir_str or "").replace("\\", "/").strip()
+    if norm.startswith("/framac-run/"):
+        norm = norm[len("/framac-run/") :]
+    elif norm == "/framac-run":
+        norm = "."
+    elif norm.startswith("/target/"):
+        norm = f"workspace/work/{norm[len('/target/') :]}"
+    elif norm == "/target":
+        norm = "workspace/work"
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.rstrip("/") or "."
+
+
+def _append_cppflag(cppflags: str, flag: str) -> str:
+    existing = _split_cppflags(cppflags)
+    if flag not in existing:
+        return f"{cppflags} {flag}".strip()
+    return cppflags.strip()
+
+
+def _normalize_header_include(header_include: str | None, cppflags: str) -> tuple[str | None, str]:
     """
     If `header_include` is passed as a workspace/target file path (e.g.
     `workspace/work/src/LibPtfCom/PtfMsg.h`), add `-I<parent_dir>` to `cppflags`
     and emit `#include "PtfMsg.h"` so compilers running from any working directory
-    resolve the header cleanly.
+    resolve the header cleanly. Returns `(None, updated_flags)` when `header_include`
+    is omitted or `"none"`.
     """
     norm = (header_include or "").replace("\\", "/").strip()
     updated_flags = (cppflags or "-I.").strip()
+    if not norm or norm.lower() == "none":
+        return None, updated_flags
     p = Path(norm)
-    parent_posix = p.parent.as_posix()
+    parent_posix = _normalize_run_rel_dir(p.parent.as_posix())
     has_ws_prefix = any(norm.startswith(pref) for pref in _WORKSPACE_PREFIXES)
     if (has_ws_prefix or p.is_file()) and parent_posix not in ("", "."):
-        inc_flag = f"-I{parent_posix}"
-        if inc_flag not in updated_flags.split():
-            updated_flags = f"{updated_flags} {inc_flag}".strip()
+        updated_flags = _append_cppflag(updated_flags, f"-I{parent_posix}")
         return p.name, updated_flags
     return norm, updated_flags
 
@@ -383,19 +406,14 @@ def _prepare_prototype_search_text(raw_text: str) -> str:
     return _strip_brace_bodies(no_attrs)
 
 
-def extract_function_prototype(
-    entry_fn: str,
+def _collect_prototype_search_paths(
     header_include: str | None = None,
     sources: list[str] | None = None,
     cppflags: str = "-I.",
-) -> list[dict[str, Any]]:
-    """
-    Locate the C declaration or definition of `entry_fn` in `header_include` or `sources`
-    and return its parsed parameter list.
-    """
+) -> list[Path]:
     search_paths: list[Path] = []
     include_dirs = _include_dirs_from_cppflags(cppflags)
-    if header_include:
+    if header_include and header_include.lower() != "none":
         hp = Path(header_include.replace("\\", "/").strip())
         if hp.is_file():
             search_paths.append(hp)
@@ -411,9 +429,78 @@ def extract_function_prototype(
         sp = Path(src.replace("\\", "/").strip())
         if sp.is_file() and sp not in search_paths:
             search_paths.append(sp)
+        for inc_dir in include_dirs:
+            cand = inc_dir / sp.name
+            if cand.is_file() and cand not in search_paths:
+                search_paths.append(cand)
         ws_sp = Path("workspace/work") / sp
         if ws_sp.is_file() and ws_sp not in search_paths:
             search_paths.append(ws_sp)
+    return search_paths
+
+
+def extract_function_declaration(
+    entry_fn: str,
+    header_include: str | None = None,
+    sources: list[str] | None = None,
+    cppflags: str = "-I.",
+) -> str | None:
+    """
+    Extract a C forward declaration (`<ret> <entry_fn>(<params>);`) from `header_include` or `sources`,
+    stripping any leading `static` storage class so a multi-TU harness can declare it when `--header` is omitted.
+    """
+    search_paths = _collect_prototype_search_paths(header_include, sources, cppflags)
+    sig_head_re = re.compile(
+        rf"(?P<head>(?:[\w]+(?:\s+|\s*\*+\s*))+\**\s*\b{re.escape(entry_fn)})\s*\(",
+        re.DOTALL,
+    )
+    for path in search_paths:
+        try:
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+            text = _prepare_prototype_search_text(raw_text)
+        except OSError:
+            continue
+        for m in sig_head_re.finditer(text):
+            open_pos = m.end() - 1
+            close_pos = _find_matching_paren(text, open_pos)
+            if close_pos < 0:
+                continue
+            trailing = text[close_pos + 1 :].lstrip()
+            if not trailing.startswith((";", "{")):
+                continue
+            head = " ".join(m.group("head").split())
+            head = re.sub(r"\b(?:static|inline|__inline__|__inline)\b\s*", "", head).strip() or f"int {entry_fn}"
+            params_raw = " ".join(text[open_pos + 1 : close_pos].split()).strip() or "void"
+            return f"{head}({params_raw});"
+    return None
+
+
+_FUZZER_ENTRY_DEF_RE = re.compile(r"\bLLVMFuzzerTestOneInput\s*\([^;{)]*\)\s*\{")
+
+
+def _source_defines_fuzzer_entry(src: str, cppflags: str = "-I.") -> bool:
+    """Return True if `src` defines `LLVMFuzzerTestOneInput(...) { ... }`."""
+    for p in _collect_prototype_search_paths(None, [src], cppflags):
+        try:
+            text = _strip_c_comments(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if _FUZZER_ENTRY_DEF_RE.search(text):
+            return True
+    return False
+
+
+def extract_function_prototype(
+    entry_fn: str,
+    header_include: str | None = None,
+    sources: list[str] | None = None,
+    cppflags: str = "-I.",
+) -> list[dict[str, Any]]:
+    """
+    Locate the C declaration or definition of `entry_fn` in `header_include` or `sources`
+    and return its parsed parameter list.
+    """
+    search_paths = _collect_prototype_search_paths(header_include, sources, cppflags)
 
     sig_head_re = re.compile(
         rf"(?:[\w]+(?:\s+|\s*\*+\s*))+\**\s*\b{re.escape(entry_fn)}\s*\(",
@@ -694,6 +781,7 @@ _DIAG_SYMBOL_RE = re.compile(
     re.MULTILINE,
 )
 _DIAG_FATAL_RE = re.compile(r"^(?P<line>.*?:\d+:\d+:\s+fatal error:.*)$", re.MULTILINE)
+_DIAG_ERROR_RE = re.compile(r"^(?P<line>.*?:\d+:\d+:\s+(?:fatal\s+)?error:.*)$", re.MULTILINE)
 _C_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _C_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _ENUM_BODY_RE = re.compile(r"\benum\b[^{;]*\{[^{}]*\}", re.DOTALL)
@@ -904,6 +992,18 @@ def resolve_prelude_headers(
             if fatal and not prelude:
                 # e.g. module header not found: nothing this resolver can fix.
                 result.update(status="skipped", reason=f"clang fatal error: {fatal.group('line').strip()}")
+            elif getattr(proc, "returncode", 0) != 0:
+                err_m = _DIAG_ERROR_RE.search(output)
+                err_line = (
+                    err_m.group("line").strip()
+                    if err_m
+                    else (
+                        output.strip().splitlines()[0].strip()
+                        if output.strip()
+                        else f"clang exited with {proc.returncode}"
+                    )
+                )
+                result.update(status="error", reason=f"clang compile error: {err_line}", unresolved_symbols=[])
             else:
                 result.update(status="resolved" if prelude else "clean", unresolved_symbols=[])
             return result
@@ -964,10 +1064,52 @@ def resolve_prelude_headers(
         rounds += 1
 
 
+def _normalize_dag_cppflag(tok: str) -> str:
+    if tok.startswith("-I") and len(tok) > 2:
+        norm_dir = _normalize_run_rel_dir(tok[2:])
+        return f"-I{norm_dir}"
+    return tok
+
+
+def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -> str:
+    """
+    If `callgraph_dag.json` exists next to `out_dir` (e.g. `workspace/reports/callgraph_dag.json`),
+    normalize and merge its discovered `-I`/`-D` flags for `module_name` into `cppflags`.
+    """
+    dag_candidates = [
+        out_dir.parent / "reports" / "callgraph_dag.json",
+        Path("workspace/reports/callgraph_dag.json"),
+    ]
+    for dag_path in dag_candidates:
+        if not dag_path.is_file():
+            continue
+        try:
+            dag = json.loads(dag_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        mod_info = ((dag.get("modules") or {}) if isinstance(dag, dict) else {}).get(module_name)
+        if not isinstance(mod_info, dict):
+            continue
+        for raw_flag in mod_info.get("cppflags") or []:
+            if not isinstance(raw_flag, str) or not raw_flag.strip():
+                continue
+            norm_flag = _normalize_dag_cppflag(raw_flag.strip())
+            if norm_flag.startswith(("-I", "-D", "-U", "-std=")):
+                cppflags = _append_cppflag(cppflags, norm_flag)
+        break
+    return cppflags
+
+
+_FUZZ_FN_BLOCK_RE = re.compile(
+    r"/\*\s*\n\s*\*\s*LibFuzzer Entry Point.*?^int LLVMFuzzerTestOneInput\(const uint8_t \*data, size_t size\)\s*\{.*?^\}",
+    re.DOTALL | re.MULTILINE,
+)
+
+
 def generate_module_harness(
     module_name: str,
     sources: list[str],
-    header_include: str,
+    header_include: str | None,
     entry_fn: str,
     max_input_size: int,
     cppflags: str,
@@ -981,6 +1123,8 @@ def generate_module_harness(
     include_source: bool = False,
     stubbed_callees: list[str] | None = None,
     extra_includes: list[str] | None = None,
+    static_analysis_includes: list[str] | None = None,
+    self_harnessed: bool = False,
     call_expr: str | None = None,
     eva_expr: str | None = None,
     fuzz_expr: str | None = None,
@@ -1001,6 +1145,8 @@ def generate_module_harness(
     if entry_style not in VALID_ENTRY_STYLES:
         raise ValueError(f"invalid entry_style: {entry_style!r}")
 
+    effective_self_harnessed = bool(self_harnessed or entry_fn == "LLVMFuzzerTestOneInput")
+
     tpl_dir = resolve_template_dir()
     harness_tpl = (tpl_dir / "harness_dual.c.template").read_text(encoding="utf-8")
 
@@ -1010,11 +1156,39 @@ def generate_module_harness(
     norm_ldflags = (ldflags or "").strip()
 
     norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
+    norm_cppflags = _merge_dag_module_cppflags(module_name, out_dir, norm_cppflags)
     norm_extra_includes: list[str] = []
     for ext_inc in extra_includes or []:
         nh, norm_cppflags = _normalize_header_include(ext_inc, norm_cppflags)
         if nh and nh not in norm_extra_includes and nh != norm_header:
             norm_extra_includes.append(nh)
+
+    norm_static_includes: list[str] = []
+    for sa_inc in static_analysis_includes or []:
+        raw_sa = (sa_inc or "").replace("\\", "/").strip()
+        if not raw_sa:
+            continue
+        norm_sa = _normalize_run_rel_dir(raw_sa)
+        sa_parent = _normalize_run_rel_dir(Path(norm_sa).parent.as_posix())
+        if sa_parent not in ("", "."):
+            norm_cppflags = _append_cppflag(norm_cppflags, f"-I{sa_parent}")
+        existing_tokens = _split_cppflags(norm_cppflags)
+        if norm_sa not in existing_tokens:
+            norm_cppflags = f"{norm_cppflags} -include {norm_sa}".strip()
+        if norm_sa not in norm_static_includes:
+            norm_static_includes.append(norm_sa)
+
+    if include_source:
+        for src in sources:
+            src_path = Path(src.replace("\\", "/").strip())
+            src_parent = _normalize_run_rel_dir(src_path.parent.as_posix())
+            if src_parent not in ("", "."):
+                norm_cppflags = _append_cppflag(norm_cppflags, f"-I{src_parent}")
+            else:
+                ws_cand = Path("workspace/work") / src_path.name
+                out_ws_cand = out_dir.parent / "work" / src_path.name
+                if ws_cand.is_file() or out_ws_cand.is_file() or (out_dir.parent / "work").is_dir():
+                    norm_cppflags = _append_cppflag(norm_cppflags, "-Iworkspace/work")
 
     auto_params: list[dict[str, Any]] | None = None
     auto_needs_nt = False
@@ -1036,21 +1210,56 @@ def generate_module_harness(
         auto_params=auto_params,
     )
 
-    inc_lines = [f'#include "{norm_header}"']
+    inc_lines: list[str] = []
+    if norm_header:
+        inc_lines.append(f'#include "{norm_header}"')
     for ext_h in norm_extra_includes:
         inc_lines.append(f'#include "{ext_h}"')
+
+    embedded_fuzzer_in_sources = any(_source_defines_fuzzer_entry(s, norm_cppflags) for s in sources)
+    rename_embedded_fuzzer = bool(embedded_fuzzer_in_sources and not effective_self_harnessed)
+
     if include_source:
         for src in sources:
             src_path = Path(src.replace("\\", "/").strip())
-            src_parent = src_path.parent.as_posix()
-            if src_parent not in ("", "."):
-                inc_flag = f"-I{src_parent}"
-                if inc_flag not in norm_cppflags.split():
-                    norm_cppflags = f"{norm_cppflags} {inc_flag}".strip()
-            inc_lines.append(f'#include "{src_path.name}"')
+            if rename_embedded_fuzzer and _source_defines_fuzzer_entry(src, norm_cppflags):
+                inc_lines.append("#define LLVMFuzzerTestOneInput __framac_target_embedded_LLVMFuzzerTestOneInput")
+                inc_lines.append(f'#include "{src_path.name}"')
+                inc_lines.append("#undef LLVMFuzzerTestOneInput")
+            else:
+                inc_lines.append(f'#include "{src_path.name}"')
+    else:
+        if rename_embedded_fuzzer:
+            norm_cppflags = _append_cppflag(
+                norm_cppflags, "-DLLVMFuzzerTestOneInput=__framac_target_embedded_LLVMFuzzerTestOneInput"
+            )
+        if not norm_header:
+            if effective_self_harnessed:
+                inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+            else:
+                synth_decl = extract_function_declaration(entry_fn, None, sources, norm_cppflags)
+                if synth_decl:
+                    inc_lines.append(synth_decl)
+        elif effective_self_harnessed:
+            inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+
+    if not inc_lines:
+        inc_lines.append("/* No external module header required */")
+
+    rendered_tpl = harness_tpl
+    if effective_self_harnessed:
+        rendered_tpl = _FUZZ_FN_BLOCK_RE.sub(
+            "/* Self-harnessed slice: LLVMFuzzerTestOneInput is defined by the target source. */",
+            rendered_tpl,
+        )
+    elif rename_embedded_fuzzer and not include_source:
+        rendered_tpl = rendered_tpl.replace(
+            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {",
+            "#undef LLVMFuzzerTestOneInput\nint LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {",
+        )
 
     harness_content = (
-        harness_tpl.replace("{{MODULE_NAME}}", module_name)
+        rendered_tpl.replace("{{MODULE_NAME}}", module_name)
         .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))
         .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
         .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
@@ -1063,7 +1272,7 @@ def generate_module_harness(
         prelude = resolve_prelude_headers(
             harness_file,
             norm_cppflags,
-            norm_header,
+            norm_header or "",
             max_iterations=prelude_max_iterations,
             clang=prelude_clang,
             runner=prelude_runner or subprocess.run,
@@ -1084,10 +1293,12 @@ def generate_module_harness(
         "sources": list(sources),
         "header": norm_header,
         "extra_includes": norm_extra_includes,
+        "static_analysis_includes": norm_static_includes,
         "cppflags": norm_cppflags,
         "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
+        "self_harnessed": effective_self_harnessed,
         "null_terminate": effective_null_terminate,
         "call_expr": call_expr,
         "eva_expr": eva_expr,
@@ -1124,10 +1335,12 @@ def generate_module_harness(
         "sources": sources,
         "header": norm_header,
         "extra_includes": norm_extra_includes,
+        "static_analysis_includes": norm_static_includes,
         "cppflags": norm_cppflags,
         "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
+        "self_harnessed": effective_self_harnessed,
         "null_terminate": effective_null_terminate,
         "include_source": include_source,
         "reachability": reachability,
@@ -1166,8 +1379,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate Dual-Use Eva + E-ACSL LibFuzzer Harness.")
     parser.add_argument("--module", help="Module slice identifier (e.g. snmpv3)")
     parser.add_argument("--sources", nargs="+", help="List of C source files in the module slice")
-    parser.add_argument("--header", help="Primary module header to include in harness")
-    parser.add_argument("--entry-fn", help="Target entry function accepting (buf, len)")
+    parser.add_argument("--header", default=None, help="Optional module header to include in harness (or 'none')")
+    parser.add_argument("--entry-fn", help="Target entry function accepting (buf, len) or LLVMFuzzerTestOneInput")
     parser.add_argument("--max-size", type=int, default=1500, help="Max symbolic/fuzzer buffer size in bytes")
     parser.add_argument("--cppflags", default="-I.", help="Extra preprocessor flags")
     parser.add_argument(
@@ -1202,6 +1415,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--extra-include", action="append", default=[], help="Additional header to #include in the harness (repeatable)"
+    )
+    parser.add_argument(
+        "--static-analysis-include",
+        action="append",
+        default=[],
+        help="Header to force-include via -include in sidecar cppflags so Eva, WP, guardrail, and merge re-checks inherit it (repeatable)",
+    )
+    parser.add_argument(
+        "--self-harnessed",
+        action="store_true",
+        help="Target already defines LLVMFuzzerTestOneInput; emit only eva_main in the generated harness",
     )
     parser.add_argument(
         "--call-expr",
@@ -1251,8 +1475,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2))
         return 0
 
-    if not (args.module and args.sources and args.header and args.entry_fn):
-        parser.error("--module, --sources, --header, and --entry-fn are required when generating a harness")
+    if not (args.module and args.sources and args.entry_fn):
+        parser.error("--module, --sources, and --entry-fn are required when generating a harness")
 
     effective_style = "auto_prototype" if args.auto_args else args.entry_style
     explicit_reachability = any(a == "--reachability" or a.startswith("--reachability=") for a in raw_argv)
@@ -1278,6 +1502,8 @@ def main(argv: list[str] | None = None) -> int:
             include_source=args.include_source,
             stubbed_callees=args.stubbed_callee,
             extra_includes=args.extra_include,
+            static_analysis_includes=args.static_analysis_include,
+            self_harnessed=args.self_harnessed,
             call_expr=args.call_expr,
             eva_expr=args.eva_expr,
             fuzz_expr=args.fuzz_expr,

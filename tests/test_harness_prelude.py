@@ -405,3 +405,72 @@ class TestGenerateModuleHarnessPrelude:
         assert rc == 0
         sidecar = json.loads((tree["out"] / "harness_events.json").read_text(encoding="utf-8"))
         assert sidecar["prelude_status"] == "disabled"
+
+    def test_non_symbol_clang_error_reports_prelude_status_error(self, tree: dict[str, Path]) -> None:
+        """Duplicate definition or syntax error with non-zero clang return code reports prelude_status='error'."""
+        runner = ScriptedClang(
+            [f"{tree['harness'].as_posix()}:18:5: error: redefinition of 'LLVMFuzzerTestOneInput'\n"]
+        )
+        res = resolve_prelude_headers(
+            tree["harness"], f"-I{tree['src'].as_posix()}", "Events.h", clang="clang", runner=runner
+        )
+        assert res["status"] == "error"
+        assert "redefinition of 'LLVMFuzzerTestOneInput'" in res["reason"]
+
+    def test_self_harnessed_optional_header_and_static_shim(self, tmp_path: Path) -> None:
+        """Self-harnessed single-TU target with no --header, --include-source, and --static-analysis-include."""
+        work = tmp_path / "workspace" / "work"
+        work.mkdir(parents=True)
+        canary_c = work / "canary.c"
+        canary_c.write_text(
+            "#include <stdint.h>\n#include <stddef.h>\n"
+            "int canary_process(const uint8_t *data, size_t len) { return (int)len; }\n"
+            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+            "    return canary_process(data, size);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        shim_h = tmp_path / "workspace" / "headers" / "framac_shim.h"
+        shim_h.parent.mkdir(parents=True)
+        shim_h.write_text("typedef int __int32_t;\n", encoding="utf-8")
+        out_dir = tmp_path / "workspace" / "harnesses"
+
+        # Case 1: entry_fn == LLVMFuzzerTestOneInput -> emits only eva_main, no duplicate fuzzer entry
+        res1 = generate_module_harness(
+            module_name="canary_self",
+            sources=[str(canary_c)],
+            header_include=None,
+            entry_fn="LLVMFuzzerTestOneInput",
+            max_input_size=64,
+            cppflags="",
+            out_dir=out_dir,
+            include_source=True,
+            static_analysis_includes=[str(shim_h)],
+            auto_prelude=False,
+        )
+        assert res1["self_harnessed"] is True
+        h1_text = (out_dir / "harness_canary_self.c").read_text(encoding="utf-8")
+        assert "int eva_main(void)" in h1_text
+        assert h1_text.count("LLVMFuzzerTestOneInput(") == 1  # only the call inside eva_main
+        assert "__int32_t" in h1_text  # inline Frama-C shim in template
+        sidecar1 = json.loads((out_dir / "harness_canary_self.json").read_text(encoding="utf-8"))
+        assert "-include" in sidecar1["cppflags"]
+        assert shim_h.as_posix() in sidecar1["cppflags"]
+
+        # Case 2: entry_fn == canary_process on a source that also defines LLVMFuzzerTestOneInput
+        # -> auto-renames the embedded LLVMFuzzerTestOneInput around #include "canary.c"
+        res2 = generate_module_harness(
+            module_name="canary_wrap",
+            sources=[str(canary_c)],
+            header_include="none",
+            entry_fn="canary_process",
+            max_input_size=64,
+            cppflags="",
+            out_dir=out_dir,
+            include_source=True,
+            auto_prelude=False,
+        )
+        assert res2["self_harnessed"] is False
+        h2_text = (out_dir / "harness_canary_wrap.c").read_text(encoding="utf-8")
+        assert "#define LLVMFuzzerTestOneInput __framac_target_embedded_LLVMFuzzerTestOneInput" in h2_text
+        assert "#undef LLVMFuzzerTestOneInput" in h2_text

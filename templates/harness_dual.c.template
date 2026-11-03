@@ -8,6 +8,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__) && !defined(__GLIBC_INTERNAL_INT_TYPES_DEFINED)
+#define __GLIBC_INTERNAL_INT_TYPES_DEFINED 1
+#if defined(__INT8_TYPE__) && defined(__UINT8_TYPE__) && defined(__INT16_TYPE__) && defined(__UINT16_TYPE__) \
+    && defined(__INT32_TYPE__) && defined(__UINT32_TYPE__) && defined(__INT64_TYPE__) && defined(__UINT64_TYPE__)
+typedef __INT8_TYPE__ __int8_t;
+typedef __UINT8_TYPE__ __uint8_t;
+typedef __INT16_TYPE__ __int16_t;
+typedef __UINT16_TYPE__ __uint16_t;
+typedef __INT32_TYPE__ __int32_t;
+typedef __UINT32_TYPE__ __uint32_t;
+typedef __INT64_TYPE__ __int64_t;
+typedef __UINT64_TYPE__ __uint64_t;
+#else
+typedef int8_t __int8_t;
+typedef uint8_t __uint8_t;
+typedef int16_t __int16_t;
+typedef uint16_t __uint16_t;
+typedef int32_t __int32_t;
+typedef uint32_t __uint32_t;
+typedef int64_t __int64_t;
+typedef uint64_t __uint64_t;
+#endif
+#endif
+
 /* Include module header and external boundary stubs */
 #include "{{MODULE_HEADER}}"
 

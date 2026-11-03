@@ -147,6 +147,14 @@ DYNAMIC_ALLOC_CALLEES = {
     "__builtin_alloca",
 }
 
+HARNESS_ENTRYPOINT_NAMES = frozenset(
+    {
+        "LLVMFuzzerTestOneInput",
+        "LLVMFuzzerInitialize",
+        "eva_main",
+    }
+)
+
 ZEROIZATION_CALLEES = {
     "explicit_bzero",
     "memset_s",
@@ -511,11 +519,21 @@ def analyze_body(
     for i, tok in enumerate(body_tokens):
         t = tok.text
 
-        if t in ("for", "while", "do"):
+        if t == "for":
             loop_count += 1
+        elif t == "while":
+            is_trivial_false = False
+            if i + 1 < n and body_tokens[i + 1].text == "(":
+                close_w = _find_matching_forward(body_tokens, i + 1, "(", ")")
+                if close_w != -1:
+                    cond_toks = [bt.text.lower() for bt in body_tokens[i + 2 : close_w] if bt.text not in ("(", ")")]
+                    if len(cond_toks) == 1 and cond_toks[0] in ("0", "0u", "0l", "0ul", "0ull", "false"):
+                        is_trivial_false = True
+            if not is_trivial_false:
+                loop_count += 1
             # Check for `while (count--)` or `while (--count)` unsigned wraparound idiom
             # Note: tokenize_c_acsl emits each `-` as a separate single-char c_token
-            if t == "while" and i + 5 < n and body_tokens[i + 1].text == "(":
+            if i + 5 < n and body_tokens[i + 1].text == "(":
                 c1 = body_tokens[i + 2].text
                 c2 = body_tokens[i + 3].text
                 c3 = body_tokens[i + 4].text
@@ -617,6 +635,8 @@ def analyze_body(
     has_dynamic_alloc = bool(direct_callees & DYNAMIC_ALLOC_CALLEES)
 
     wp_blockers: list[str] = []
+    if fn_name in HARNESS_ENTRYPOINT_NAMES:
+        wp_blockers.append("fuzz_or_eva_harness_entrypoint")
     if has_backward_goto:
         wp_blockers.append("irreducible_goto")
     if has_dynamic_alloc:
@@ -627,6 +647,8 @@ def analyze_body(
         wp_blockers.append("volatile_or_asm")
 
     wp_notes: list[str] = []
+    if fn_name in HARNESS_ENTRYPOINT_NAMES:
+        wp_notes.append("fuzz/Eva harness entrypoint: verified dynamically by E-ACSL + LibFuzzer and Eva, not WP")
     if indirect_calls:
         wp_notes.append(f"indirect call(s) {indirect_calls} require '//@ calls <targets>;'")
     if self_recursive:
@@ -994,9 +1016,12 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: list[Path]) -> dict[str
         for d in include_dirs:
             try:
                 rel_d = d.relative_to(target_dir).as_posix()
-                flag = f"-I{(target_dir / rel_d).as_posix()}" if rel_d != "." else f"-I{target_dir.as_posix()}"
+                inc_posix = (target_dir / rel_d).as_posix() if rel_d != "." else target_dir.as_posix()
             except ValueError:
-                flag = f"-I{d.as_posix()}"
+                inc_posix = d.as_posix()
+            if inc_posix.startswith("/framac-run/"):
+                inc_posix = inc_posix[len("/framac-run/") :]
+            flag = f"-I{inc_posix}"
             if flag not in flags:
                 flags.append(flag)
         for d_flag in makefile_defines:
