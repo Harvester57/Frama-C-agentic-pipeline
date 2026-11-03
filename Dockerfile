@@ -57,8 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod a+rx /home/opam \
     && printf 'export PATH="/home/opam/.opam/5.5/bin:${PATH}"\nexport FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"\n' > /etc/profile.d/framac.sh \
     && chmod 644 /etc/profile.d/framac.sh \
-    && sed -i 's/\^\\\\(\[0-9\.\]\[+\]\\\\)\$/^\\([0-9.]+\\)/g' \
-        /home/opam/.opam/5.5/share/why3/provers-detection-data.conf \
+    && python3 -c "from pathlib import Path; p = Path('/home/opam/.opam/5.5/share/why3/provers-detection-data.conf'); p.write_text(p.read_text().replace(')$', ')'))" \
     && why3 config detect \
     && cp -f /root/.why3.conf /home/opam/.why3.conf \
     && chown opam:opam /home/opam/.why3.conf
