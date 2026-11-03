@@ -20,9 +20,15 @@
  * Values:
  *   0 = UNAUTHENTICATED / UNCHECKED
  *   1 = VERIFIED_OK
+ *
+ * Multi-TU Note:
+ * In shared headers (.h), omit the `= 0` initializer so the C compiler treats
+ * each declaration as a C tentative definition (`COMMON` symbol under `-fcommon`).
+ * C tentative definitions are zero-initialized by the C standard (for both WP
+ * and E-ACSL) and coalesce cleanly across multiple translation units at link time.
  */
-/*@ ghost int g_sec_auth_verified = 0; */
-/*@ ghost int g_sec_acl_authorized = 0; */
+/*@ ghost int g_sec_auth_verified; */
+/*@ ghost int g_sec_acl_authorized; */
 
 /*
  * Step 2: Reset Ghost State at Session/Packet Entry

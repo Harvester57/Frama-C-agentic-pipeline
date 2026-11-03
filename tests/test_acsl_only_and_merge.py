@@ -162,6 +162,10 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
             "/*@ logic integer bad_param(size_t n) = n; */",
             "/*@ invariant 0 <= i <= n; */",
             "/*@ exits \x0calse; */",
+            "/*@ requires \\false; */",
+            "/*@ requires dead: 0; */",
+            "/*@ loop invariant \\false; */",
+            "/*@ behavior b: assumes \\false; */",
         ],
         ids=[
             "admit-clause",
@@ -171,6 +175,10 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
             "logic-c-size-t-param-type",
             "statement-invariant-without-loop",
             "formfeed-escaped-false-in-acsl",
+            "vacuous-requires-false",
+            "vacuous-requires-zero",
+            "vacuous-loop-invariant-false",
+            "vacuous-assumes-false",
         ],
     )
     def test_verify_acsl_only_rejects_unsound_admit_or_axiom(self, forbidden_acsl: str) -> None:
@@ -790,3 +798,77 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         merged_h = (overlay / "work/parser.h").read_text(encoding="utf-8")
         assert "assigns \\nothing;" in merged_h
         assert "requires \\valid(out);" in merged_h
+
+    def test_prover_merge_resolves_non_sibling_header_from_harness_sidecar(self, tmp_path: Path) -> None:
+        """
+        When a module has multiple .c files sharing a module header whose stem differs from the
+        .c file stem (e.g. src/snmp/ber.c + include/snmp.h recorded in harness_snmp.json),
+        merge_agent_overlay and merge_agent_batch automatically splice the prover's prototype
+        contract edits in include/snmp.h without requiring an explicit --header argument.
+        """
+        target = tmp_path / "target"
+        (target / "src/snmp").mkdir(parents=True)
+        (target / "include").mkdir(parents=True)
+        (target / "src/snmp/ber.c").write_text(BASELINE_C, encoding="utf-8")
+        (target / "include/snmp.h").write_text(BASELINE_H, encoding="utf-8")
+
+        run_dir = tmp_path / "run"
+        overlay = run_dir / "workspace"
+        workspace_overlay.init_overlay(target, overlay)
+        (overlay / "harnesses").mkdir(parents=True, exist_ok=True)
+        (overlay / "harnesses/harness_snmp.json").write_text(
+            json.dumps(
+                {
+                    "module": "snmp",
+                    "sources": ["workspace/work/src/snmp/ber.c"],
+                    "header": "include/snmp.h",
+                    "cppflags": "-Iworkspace/work/include",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        workspace_overlay.init_agent_overlay(run_dir, "prover-ber", overlay)
+        (run_dir / "agents/prover-ber/scratch/work/src/snmp/ber.c").write_text(
+            BASELINE_C.replace("    return acc;", "    //@ assert acc >= 0;\n    return acc;"),
+            encoding="utf-8",
+        )
+        (run_dir / "agents/prover-ber/scratch/work/include/snmp.h").write_text(
+            BASELINE_H.replace(
+                "int parse_magic(const uint8_t *buf, size_t len);",
+                "/*@ assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+            ),
+            encoding="utf-8",
+        )
+
+        res = workspace_overlay.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id="prover-ber",
+            role="prover",
+            overlay_dir=overlay,
+            c_file="src/snmp/ber.c",
+            function="parse_magic",
+            module="snmp",
+            skip_reverify=True,
+        )
+        assert res["ok"] is True
+        assert set(res["modified_files"]) == {"src/snmp/ber.c", "include/snmp.h"}
+        assert "assigns \\nothing;" in (overlay / "work/include/snmp.h").read_text(encoding="utf-8")
+
+    def test_check_acsl_only_accepts_agent_scratch_root(self, tmp_path: Path) -> None:
+        """Passing --overlay agents/<id>/scratch compares scratch/base vs scratch/work instead of failing on base/."""
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
+        run_dir = tmp_path / "run"
+        overlay = run_dir / "workspace"
+        workspace_overlay.init_overlay(target, overlay)
+        workspace_overlay.init_agent_overlay(run_dir, "prover-1", overlay)
+
+        scratch = run_dir / "agents/prover-1/scratch"
+        (scratch / "work/parser.c").write_text(
+            BASELINE_C.replace("    return acc;", "    //@ assert acc >= 0;\n    return acc;"),
+            encoding="utf-8",
+        )
+        res = workspace_overlay.check_acsl_only(scratch)
+        assert res["ok"] is True and res["errors"] == []

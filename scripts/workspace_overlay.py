@@ -275,15 +275,99 @@ def init_agent_overlay(run_dir: Path, agent_id: str, overlay_dir: Path | None = 
     }
 
 
+def _resolve_baseline_and_work(overlay_dir: Path, work_dir: Path | None = None) -> tuple[Path, Path]:
+    """
+    Resolve `(baseline_dir, target_work)` for both `workspace/` (`baseline/` + `work/`)
+    and agent scratch directories (`agents/<id>/scratch` with `base/` + `work/`).
+    """
+    overlay_dir = overlay_dir.resolve()
+    baseline_dir = overlay_dir / "baseline"
+    if not baseline_dir.is_dir() and (overlay_dir / "base").is_dir() and (overlay_dir / "work").is_dir():
+        baseline_dir = overlay_dir / "base"
+    if work_dir is not None:
+        resolved_work = work_dir.resolve()
+        if (resolved_work / "base").is_dir() and (resolved_work / "work").is_dir():
+            if not baseline_dir.is_dir():
+                baseline_dir = resolved_work / "base"
+            resolved_work = resolved_work / "work"
+        elif (resolved_work / "baseline").is_dir() and (resolved_work / "work").is_dir():
+            baseline_dir = resolved_work / "baseline"
+            resolved_work = resolved_work / "work"
+        elif resolved_work.name == "work" and (resolved_work.parent / "base").is_dir() and not baseline_dir.is_dir():
+            baseline_dir = resolved_work.parent / "base"
+        target_work = resolved_work
+    else:
+        target_work = (overlay_dir / "work").resolve()
+    return baseline_dir, target_work
+
+
+def map_work_to_baseline_line(
+    file_rel: str,
+    line: int,
+    run_dir: Path | None = None,
+    overlay_dir: Path | None = None,
+) -> tuple[int, int]:
+    """
+    Map a line number in `workspace/work/<file_rel>` (or `workspace/baseline/<file_rel>`) to
+    `(canonical_baseline_line, current_work_line)` by aligning C tokens between baseline and work.
+    If `line` already matches a statement in `baseline` that shifted to a later line in `work`,
+    returns `(line, shifted_work_line)`; if `line` matches the shifted statement in `work`,
+    returns `(canonical_baseline_line, line)`.
+    """
+    if line <= 0:
+        return (line, line)
+    root = (run_dir or Path.cwd()).resolve()
+    ov = (overlay_dir or (root / "workspace")).resolve()
+    norm_rel = _normalize_work_relpath(file_rel)
+    base_file = ov / "baseline" / norm_rel
+    if not base_file.is_file():
+        base_file = ov / "base" / norm_rel
+    work_file = ov / "work" / norm_rel
+    if not base_file.is_file() or not work_file.is_file():
+        return (line, line)
+    try:
+        base_text = base_file.read_text(encoding="utf-8", errors="replace")
+        work_text = work_file.read_text(encoding="utf-8", errors="replace")
+        if base_text == work_text:
+            return (line, line)
+        from acsl_ast import tokenize_c_acsl
+
+        base_c = [
+            t
+            for t in tokenize_c_acsl(base_text, path=norm_rel)
+            if t.kind not in ("whitespace", "acsl_block", "acsl_line")
+        ]
+        work_c = [
+            t
+            for t in tokenize_c_acsl(work_text, path=norm_rel)
+            if t.kind not in ("whitespace", "acsl_block", "acsl_line")
+        ]
+        if len(base_c) != len(work_c) or not base_c:
+            return (line, line)
+        w2b: dict[int, int] = {}
+        b2w: dict[int, int] = {}
+        for bt, wt in zip(base_c, work_c, strict=True):
+            w2b.setdefault(wt.line, bt.line)
+            b2w.setdefault(bt.line, wt.line)
+        if line in w2b and w2b[line] != line:
+            return (w2b[line], line)
+        if line in b2w and b2w[line] != line:
+            return (line, b2w[line])
+        if line in w2b:
+            b_line = w2b[line]
+            return (b_line, b2w.get(b_line, line))
+    except Exception:
+        return (line, line)
+    return (line, line)
+
+
 def check_acsl_only(
     overlay_dir: Path,
     work_dir: Path | None = None,
     files: list[str] | None = None,
 ) -> dict:
     """Verify that work_dir (default: overlay_dir/work) differs from overlay_dir/baseline only in ACSL comments."""
-    overlay_dir = overlay_dir.resolve()
-    baseline_dir = overlay_dir / "baseline"
-    target_work = (work_dir or (overlay_dir / "work")).resolve()
+    baseline_dir, target_work = _resolve_baseline_and_work(overlay_dir, work_dir)
 
     errors: list[str] = []
     checked = 0
@@ -308,10 +392,16 @@ def check_acsl_only(
         base_file = baseline_dir / rel_str
         work_file = target_work / rel_str
         if not base_file.is_file() and work_file.is_file():
-            errors.append(f"{rel_str}: new source file created outside baseline")
+            errors.append(
+                f"{rel_str}: new source file created outside baseline "
+                f"(compared work_dir={target_work.as_posix()} against baseline_dir={baseline_dir.as_posix()})"
+            )
             continue
         if base_file.is_file() and not work_file.is_file():
-            errors.append(f"{rel_str}: baseline source file deleted")
+            errors.append(
+                f"{rel_str}: baseline source file deleted "
+                f"(compared work_dir={target_work.as_posix()} against baseline_dir={baseline_dir.as_posix()})"
+            )
             continue
         if not base_file.is_file():
             continue
@@ -321,7 +411,13 @@ def check_acsl_only(
         if base_text != work_text:
             errors.extend(verify_acsl_only(base_text, work_text, path=rel_str))
 
-    return {"ok": len(errors) == 0, "checked_files": checked, "errors": errors}
+    return {
+        "ok": len(errors) == 0,
+        "checked_files": checked,
+        "baseline_dir": baseline_dir.as_posix(),
+        "work_dir": target_work.as_posix(),
+        "errors": errors,
+    }
 
 
 def _collect_changed_files(base_dir: Path, work_dir: Path) -> list[str]:
@@ -596,7 +692,7 @@ def _merge_agent_overlay_locked(
             raise ArtifactError("prover merge requires c_file and function")
         allowed_rels.add(norm_c_file)
         if not norm_header_file:
-            # Auto-infer sibling header when the prover also updated its function prototype contract
+            # Auto-infer sibling or module header when the prover also updated its function prototype contract
             sibling_h = Path(norm_c_file).with_suffix(".h").as_posix()
             if sibling_h in changed_rels:
                 norm_header_file = sibling_h
@@ -604,6 +700,12 @@ def _merge_agent_overlay_locked(
                 stem_matches = [r for r in changed_rels if r.endswith(".h") and Path(r).stem == Path(norm_c_file).stem]
                 if len(stem_matches) == 1:
                     norm_header_file = stem_matches[0]
+                elif module:
+                    hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
+                    if isinstance(hmeta, dict) and hmeta.get("header"):
+                        mod_hdr = _normalize_work_relpath(str(hmeta["header"]))
+                        if mod_hdr in changed_rels:
+                            norm_header_file = mod_hdr
         if norm_header_file:
             allowed_rels.add(norm_header_file)
 
@@ -823,6 +925,8 @@ def _enrich_batch_entry(
     hmeta: dict = {}
     if module:
         hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
+    if role == "prover" and not header_file and isinstance(hmeta, dict) and hmeta.get("header"):
+        header_file = _normalize_work_relpath(str(hmeta["header"]))
 
     sources = entry.get("sources") or default_sources or hmeta.get("sources")
     cppflags = entry.get("cppflags") or default_cppflags or hmeta.get("cppflags") or "-I."
@@ -1404,6 +1508,43 @@ def prepare_agent(
 
     coverage_ids = [u["coverage_id"] for u in fn_units if u.get("status") not in ("out_of_scope", "not_applicable")]
 
+    unit_bk = (fn_units[0].get("bookkeeping") or {}) if fn_units and isinstance(fn_units[0], dict) else {}
+    verifiability = str(fn_meta.get("verifiability") or unit_bk.get("verifiability") or "core_provable")
+    wp_blockers = list(fn_meta.get("wp_blockers") or unit_bk.get("wp_blockers") or [])
+    wp_notes = list(fn_meta.get("wp_notes") or unit_bk.get("wp_notes") or [])
+    profile = str(run_meta.get("profile") or "standard").strip().lower()
+
+    effective_max_retries = max_retries
+    max_wall_clock_s = 900
+    max_wp_invocations = effective_max_retries + 2
+    if role == "prover":
+        if max_retries == 4 and (profile == "quick" or verifiability == "shell_unverifiable_wp"):
+            effective_max_retries = 2
+        env_wall = (os.environ.get("FRAMAC_PROVER_WALL_BUDGET_S") or "").strip()
+        if env_wall.isdigit() and int(env_wall) > 0:
+            max_wall_clock_s = int(env_wall)
+        elif profile == "quick" or verifiability == "shell_unverifiable_wp":
+            max_wall_clock_s = 300
+        elif profile == "deep":
+            max_wall_clock_s = 1800
+        else:
+            max_wall_clock_s = 900
+        max_wp_invocations = effective_max_retries + 2
+        budget_payload = {
+            "agent_id": agent_id,
+            "function": function or "",
+            "file": norm_c_file or "",
+            "profile": profile,
+            "verifiability": verifiability,
+            "wp_blockers": wp_blockers,
+            "max_retries": effective_max_retries,
+            "max_wp_invocations": max_wp_invocations,
+            "max_wall_clock_s": max_wall_clock_s,
+            "wp_invocations": 0,
+            "first_wp_at": None,
+        }
+        atomic_write_json(agent_root / "scratch" / ".prover_budget.json", budget_payload)
+
     cand_short = "candidate"
     if candidate_fp:
         raw_short = candidate_fp.split("::")[-1] if "::" in candidate_fp else candidate_fp
@@ -1426,7 +1567,7 @@ def prepare_agent(
         "{coverage_ids_json}": json.dumps(coverage_ids),
         "{unknown_obligations_json}": json.dumps(unknown_obligations),
         "{reachability}": reachability,
-        "{max_retries}": str(max_retries),
+        "{max_retries}": str(effective_max_retries),
         "{unproven_goals_json}": json.dumps(unproven_goals),
         "{candidate_fingerprint}": candidate_fp or "",
         "{candidate_short}": cand_short,
@@ -1435,11 +1576,37 @@ def prepare_agent(
         # container's /target and /framac-run. The wrapper passes them as environment.
         "{target_dir}": _brief_path(os.environ.get("FRAMAC_TARGET_HOST") or run_meta.get("target") or "/target"),
         "{run_dir}": _brief_path(os.environ.get("FRAMAC_RUN_HOST") or run_meta.get("run_dir_host") or str(run_dir)),
+        "{references_dir}": _brief_path(
+            os.environ.get("FRAMAC_REFERENCES_HOST")
+            or str(Path(__file__).resolve().parent.parent / "docs" / "references")
+        ),
     }
     rendered = tpl
     for k, v in replacements.items():
         rendered = rendered.replace(k, v)
     # Appended after substitution: request and report contents are data, never placeholders.
+    if role == "prover" and (verifiability != "core_provable" or wp_blockers or wp_notes or profile == "quick"):
+        fn_label = function or "this function"
+        rendered += (
+            "\n## WP Verifiability & Iteration Budget\n\n"
+            f"- **Static WP Verifiability Classification:** `{verifiability}`\n"
+            f"- **Detected WP Blockers:** `{json.dumps(wp_blockers)}`\n"
+            f"- **Detected WP Notes:** `{json.dumps(wp_notes)}`\n"
+            f"- **Enforced Budget (`agents/{agent_id}/scratch/.prover_budget.json`):** "
+            f"at most `{max_wp_invocations}` `run_wp_function.py` invocations and `{max_wall_clock_s}s` wall-clock.\n"
+        )
+        if verifiability == "shell_unverifiable_wp" or "dynamic_allocation" in wp_blockers:
+            rendered += (
+                f"- **Fast-Fail Rule for `{fn_label}`:** This function is classified as `shell_unverifiable_wp` "
+                f"(blockers: `{', '.join(wp_blockers) or 'structural'}`). Frama-C WP does not support dynamic "
+                "allocation predicates (`\\freeable`, `\\fresh`, `\\allocable`, `allocates`, `frees`) from "
+                "`<stdlib.h>`. Prove all dischargeable non-allocation RTE/frame/loop obligations, verify that the "
+                "E-ACSL guardrail passes (`passed_dynamic_oracle`), and as soon as only WP-unsupported allocation "
+                "or structural goals remain (or `next_synthesis_focus` is "
+                '`"wp_dynamic_allocation_limitation_stop_now"` / `"budget_exhausted_write_result_json_now"`), '
+                'immediately write `result.json` with `"status": "stalled_after_k_retries"`. Never write '
+                "synthetic `probe_*.c` files.\n"
+            )
     if wp_report_rel:
         rendered += (
             "\n## Stalled Prover's WP Report\n\n"

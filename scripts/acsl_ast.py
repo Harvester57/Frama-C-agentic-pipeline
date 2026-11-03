@@ -65,6 +65,9 @@ _C_INT_PARAM_RE = re.compile(
     r"^\s*(?:(?:const|unsigned|signed)\s+)*(?:int|long|short|char|size_t|ssize_t|u?int(?:8|16|32|64)_t)\s+[A-Za-z_][A-Za-z0-9_]*\s*$"
 )
 _INVARIANT_CLAUSE_RE = re.compile(r"(?:(loop|type|global|strong)\s+)?\binvariant\b(?!\s*:)")
+_VACUOUS_FALSE_CLAUSE_RE = re.compile(
+    r"\b(requires|assumes|loop\s+invariant)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*:\s*)*(?:\\false|0)\s*;"
+)
 _STRING_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
 _ESCAPED_CTRL_IN_ACSL_RE = re.compile(r"[\x07\x08\x0c]")
@@ -249,6 +252,12 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                     "(WP silently drops statement invariants; use 'loop invariant' or 'assert')"
                 )
                 break
+        m_vac = _VACUOUS_FALSE_CLAUSE_RE.search(scrubbed)
+        if m_vac:
+            errors.append(
+                f"{path}:{tok.line}: forbidden vacuous '{m_vac.group(0).strip()}' in annotation "
+                "(assuming \\false or 0 makes all WP obligations vacuously true)"
+            )
     return errors
 
 
