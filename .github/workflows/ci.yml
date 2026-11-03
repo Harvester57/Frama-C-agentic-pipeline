@@ -4,9 +4,37 @@ on:
   push:
     branches:
       - main
+    paths:
+      - ".agents/**"
+      - ".dockerignore"
+      - ".github/workflows/ci.yml"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "docs/**"
+      - "pyproject.toml"
+      - "schemas/**"
+      - "scripts/**"
+      - "skills/**"
+      - "templates/**"
+      - "tests/**"
+      - "wrappers/**"
   pull_request:
     branches:
       - main
+    paths:
+      - ".agents/**"
+      - ".dockerignore"
+      - ".github/workflows/ci.yml"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "docs/**"
+      - "pyproject.toml"
+      - "schemas/**"
+      - "scripts/**"
+      - "skills/**"
+      - "templates/**"
+      - "tests/**"
+      - "wrappers/**"
   workflow_dispatch:
 
 # Default to zero permissions at the workflow level; each job grants only what it requires.

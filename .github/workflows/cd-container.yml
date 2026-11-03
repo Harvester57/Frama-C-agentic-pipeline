@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - main
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/cd-container.yml"
+      - "Dockerfile"
+      - "schemas/**"
+      - "scripts/**"
+      - "skills/**"
+      - "templates/**"
     tags:
       - "v*.*.*"
   workflow_dispatch:
