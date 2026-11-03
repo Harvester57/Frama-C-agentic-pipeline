@@ -75,7 +75,7 @@ COPY scripts/ /opt/framac-pipeline/scripts/
 COPY templates/ /opt/framac-pipeline/templates/
 COPY schemas/ /opt/framac-pipeline/schemas/
 COPY skills/ /opt/framac-pipeline/skills/
-RUN chmod +x /opt/framac-pipeline/scripts/*.py
+RUN chmod +x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh
 
 WORKDIR /framac-run
 
