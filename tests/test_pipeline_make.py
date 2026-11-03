@@ -882,8 +882,9 @@ def test_make_dry_run(tmp_path):
     # Executed (not -n) with a fake interpreter that prints argv: the flags reach Python intact.
     echo = tmp_path / "argv.py"
     echo.write_text("import json, sys\nprint('ARGV ' + json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    py_posix = Path(sys.executable).as_posix()
     proc = subprocess.run(
-        ["make", "-f", pm.MAKEFILE, scripts, f"PY={sys.executable} {echo.as_posix()}", "eva-cfg"],
+        ["make", "-f", pm.MAKEFILE, scripts, f"PY={py_posix} {echo.as_posix()}", "eva-cfg"],
         cwd=run,
         capture_output=True,
         text=True,
