@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 LABEL maintainer="Frama-C Agentic Verification Pipeline"
 LABEL description="Self-contained Frama-C (RTE, Eva, WP, E-ACSL, Mdr/SARIF) + SMT Solvers (Alt-Ergo, Z3, CVC5) + Clang/LibFuzzer + Bear container"
