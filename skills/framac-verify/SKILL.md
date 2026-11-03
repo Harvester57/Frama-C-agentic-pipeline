@@ -21,7 +21,7 @@ argument-hint: "<target-dir> [--module <name>] [--profile quick|standard|deep] [
 
 Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: [`docs/v2-design.md`](../../docs/v2-design.md).
 
-The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in [`docs/references/`](../../docs/references/README.md). Consult them only when a skill, a brief, and `docs/troubleshooting.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. When spawning a brief, fill its `{references_dir}` placeholder with that folder's absolute host path.
+The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in [`docs/references/`](../../docs/references/README.md) (mounted inside the container at `/opt/framac-pipeline/docs/references`). Consult them only when a skill, a brief, and `docs/troubleshooting.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. `wp_scheduler.py next --prepare` automatically populates `{references_dir}` in rendered briefs.
 
 ## Operating modes
 
@@ -33,7 +33,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 
 1. **Hardened container only.** Every Frama-C, E-ACSL, Clang/LibFuzzer, and helper-script invocation runs through `wrappers/framac-docker.ps1` (Windows) or `wrappers/framac-docker.sh` (POSIX). The container has no network, keeps Docker's default seccomp and AppArmor profiles, the target is mounted read-only at `/target`, and the run directory is the working directory `/framac-run`. Target-controlled binaries additionally run through `scripts/sandbox_exec.py` (rlimits, env allowlist, timeout); outside the container (non-POSIX host) they do not run.
 2. **Run directory outside the target.** Default `~/framac-pipeline/<repo>/run-<N>/` (`-NewRun`). A run directory inside the target is allowed only when explicitly requested and git-ignored.
-3. **The parent is the only writer of shared state**: `run-metadata.json`, `coverage-ledger.json`, `candidates.json`, `findings.json`, `workspace/work/`, `workspace/corpus/`, and `workspace/crashes/`. Subagents work in isolated scratch overlays (`agents/<agent-id>/scratch/`) and return **one JSON object** matching `schemas/agent-result.schema.json`. Discard malformed or prose-wrapped results; do not repair them.
+3. **The parent is the only writer of shared state**: `run-metadata.json`, `coverage-ledger.json`, `candidates.json`, `findings.json`, `workspace/work/`, `workspace/corpus/`, and `workspace/crashes/`. Subagents work in isolated scratch overlays (`agents/<agent-id>/scratch/`), write their final JSON result to `agents/<agent-id>/scratch/result.json` (which `wp_scheduler.py complete --agent-id <agent-id>` reads and validates against `schemas/agent-result.schema.json`), and return **one JSON object**. Discard malformed or prose-wrapped results; do not repair them.
 4. **Pure-ACSL & Function-Scope Isolation.** After stripping ACSL comments (`/*@ ... */`, `//@ ...`), `workspace/work/` must match `workspace/baseline/` token-for-token (`workspace_overlay.py check-acsl-only`). Prover patches are structurally spliced per function (`workspace_overlay.py merge-agent`) and re-verified by the parent before commit.
 5. **Never prove broken code.** Run Phase 1, Phase 2, and the Crash Verification Gate before Phase 3. Functions with `confirmed` or `needs_validation` defects have all active units marked `candidate` and are excluded from WP.
 6. **Candidates are not findings.** Tool hits go to `candidates.json`. Each unverified candidate is verified by a fresh Crash Verifier subagent (`skills/framac-wp/crash_verifier_brief.md`) and ingested via `ledger.py ingest-verifier` (which mechanically checks that `confirmed` reproducers replay in the sandbox).
@@ -56,7 +56,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 
 The pipeline sizes itself; do not pass CPU, memory or agent counts to the wrapper.
 - Every wrapper call leases CPUs and memory from the measured pool (cgroups, Slurm, the container engine, `FRAMAC_POOL_*` caps). Each tool runs as many provers or fuzz workers as its lease allows; `-wp-memlimit` and `-rss_limit_mb` stay fixed, so results do not depend on the machine.
-- Run long phases (`pipeline_make.py run …`) as background commands and wait for them to finish. A waiting command prints its queue position.
+- Run wrapper commands in the **foreground** and wait for them to finish (or as background jobs only if your host harness explicitly supports non-detaching background commands). A waiting command prints its queue position.
 
 Details, knobs and troubleshooting: [`docs/resources-and-caching.md`](../../docs/resources-and-caching.md).
 
@@ -73,7 +73,7 @@ $env:PYTHONIOENCODING="utf-8"
   "<command>"
 ```
 
-Create the run directory once with `-NewRun` (the wrapper prints the path) and pass it as `-RunDir` afterwards. `S=/opt/framac-pipeline/scripts` below.
+Create the run directory once with `-NewRun` (the wrapper prints the path) and pass it as `-RunDir` afterwards. Always use explicit `/opt/framac-pipeline/scripts/<script>.py` paths inside `"<command>"` so host PowerShell never expands `$S` as an empty host variable.
 
 ---
 
@@ -81,9 +81,9 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 
 ### Setup
 
-1. `-NewRun` (or `-RunDir <existing>`), then: `python3 $S/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
-2. Check the measured machine: `python3 $S/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
-3. If `state/progress.json` exists (`python3 $S/checkpoint.py load state`), resume from the recorded phase. For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead.
+1. `-NewRun` (or `-RunDir <existing>`), then: `python3 /opt/framac-pipeline/scripts/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
+2. Check the measured machine: `python3 /opt/framac-pipeline/scripts/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
+3. If `state/progress.json` exists (`python3 /opt/framac-pipeline/scripts/checkpoint.py load state`), resume from the recorded phase. For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead.
 
 ### Phase 0 — Slicing, DAG, ledger seeding (`/framac-slice`)
 
@@ -94,21 +94,19 @@ Execute `skills/framac-slice/SKILL.md`:
 
 Checkpoint `phase_done = 0`.
 
-### Phases 1 and 2 — Fuzzing and abstract interpretation, in parallel (Make, no subagents)
+### Phases 1 and 2 — Fuzzing and abstract interpretation (Make, no subagents)
 
 These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/SKILL.md`, `skills/framac-eva/SKILL.md`):
-1. Regenerate the Makefile in the foreground if harnesses changed since Phase 0: `python3 $S/pipeline_make.py gen`.
+1. Regenerate the Makefile in the foreground if harnesses changed since Phase 0: `python3 /opt/framac-pipeline/scripts/pipeline_make.py gen`.
 2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`.
-3. Start **two background wrapper calls at the same time**:
-   - `python3 $S/pipeline_make.py run fuzz`
-   - `python3 $S/pipeline_make.py run eva`
+3. Run `fuzz` and `eva` in the foreground (sequentially gives standalone `eva` a writable `rw` `/framac-cache` mount; if your harness supports concurrent background wrapper calls, you may run `fuzz` and `python3 $S/pipeline_make.py run eva` concurrently with `ro` cache):
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz`
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
 
-   Wait for both to finish.
-
-   When running concurrently with `fuzz`, both containers mount `/framac-cache` read-only (`ro`) and run in parallel without triggering `_run_dir_conflict` (use `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva` when running Eva standalone with a writable `rw` shared cache). Write the `build`, `ingest`, standalone `eva` and `wp-sweep` commands as shown, with the full script path, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
+   Write the `build`, `ingest`, standalone `eva` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
 4. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
-   - `python3 $S/pipeline_make.py run replay wp-queue`
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue`
 
 Ingestion keeps the fuzz-then-Eva order:
 - crashes become fingerprinted candidates;
@@ -127,19 +125,19 @@ Execute `skills/framac-wp/SKILL.md`. Its scheduler loop handles everything:
   - `confirmed`: the function's units become `candidate` and are excluded from WP. Optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
   - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run module-<mod>`, then `wp_scheduler.py refresh --module <mod>`.
   - After two attempts, the module's remaining active units become `blocked` (`harness_repair_exhausted`).
-- **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine.
+- **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine. (Note: in a `--profile quick` triage-only run where the user explicitly skips Phase 3 WP after the Crash Verification Gate, close remaining `planned` units with `python3 /opt/framac-pipeline/scripts/ledger.py close-remaining --reason "quick_profile_wp_not_scheduled: Phase 3 WP not run in quick profile"`; otherwise run the Phase 3 scheduler loop to completion.)
 
 Checkpoint `phase_done = 3`.
 
 ### Phase 4 — Export, status, and reports
 
-1. Verify the ACSL-only invariant across the work tree: `python3 $S/workspace_overlay.py check-acsl-only`.
-2. Re-prove merged functions on the final tree, and feed the shared proof cache: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep` (background).
+1. Verify the ACSL-only invariant across the work tree: `python3 /opt/framac-pipeline/scripts/workspace_overlay.py check-acsl-only`.
+2. Re-prove merged functions on the final tree, and feed the shared proof cache: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`.
 3. Set the terminal status:
-   - `python3 $S/run_metadata.py set-status --status complete` only if no candidate is unverified and no unit is `planned`/`in_progress`;
-   - otherwise `python3 $S/run_metadata.py set-status --status incomplete --reason <exact reason>`.
-4. Export the diff, validate and generate the reports: `python3 $S/pipeline_make.py run report`. It runs `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
-5. Mark the checkpoint complete: `python3 $S/checkpoint.py complete state`.
+   - `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status complete` only if no candidate is unverified and no unit is `planned`/`in_progress`;
+   - otherwise `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status incomplete --reason <exact reason>`.
+4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
+5. Mark the checkpoint complete: `python3 /opt/framac-pipeline/scripts/checkpoint.py complete state`.
 6. `--in-place` is a separate host-side step after the user reviews the report: `python <pipeline>\scripts\workspace_overlay.py apply-in-place --overlay <run-dir>\workspace --target <target-dir>`.
 
 ### Kill switches (A/B comparison, troubleshooting)

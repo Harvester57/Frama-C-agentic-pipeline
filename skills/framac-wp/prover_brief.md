@@ -19,14 +19,15 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 
 ## Strict Rules
 
-1. **Pure ACSL Annotations Only (`/*@ ... */`, `//@ ...`):** Never alter executable C tokens, normal C comments, or `#include` directives, and never introduce `admit`, `axiom`, `axiomatic`, or `inductive`. The parent runs a mechanical C/ACSL lexical check (`workspace_overlay.py check-acsl-only`) and rejects any non-ACSL modification, C integer types in `logic` declarations (`logic int` instead of `logic integer`), or statement-level `invariant` without `loop`.
-2. **Function-Level Scope Isolation:** Only add or edit ACSL inside `{function_name}`'s contract+body span in `agents/{agent_id}/scratch/work/{c_file}` and `{function_name}`'s contract+prototype span in `agents/{agent_id}/scratch/work/{header_file}`. Do not touch any other function in those files, and never write to `workspace/work/`, the shared corpus, or the ledger. If a callee contract is too weak, put a strengthening request in `strengthening_requests`.
-3. **Trust Boundary Rule:** If `{function_name}` is an `untrusted_surface` entry function, its `requires` may only state memory shape (validity, separation, non-NULL for non-attacker pointers). A value constraint on attacker-controlled bytes or lengths (for example `requires len <= 64;`) defines the bug away and will be rejected. List any environment assumption you rely on in `boundary_assumptions`.
+1. **Pure ACSL Annotations Only (`/*@ ... */`, `//@ ...`):** Never alter executable C tokens, normal C comments, or `#include` directives, and never introduce `admit`, `axiom`, `axiomatic`, `inductive`, or vacuous `\false` assumptions (`requires \false;`, `assumes \false;`, `loop invariant \false;`). The parent runs a mechanical C/ACSL lexical check (`workspace_overlay.py check-acsl-only`) and rejects any non-ACSL modification, vacuous `\false` clause, C integer types in `logic` declarations (`logic int` instead of `logic integer`), or statement-level `invariant` without `loop`.
+2. **Function-Level Scope Isolation:** Only add or edit ACSL inside `{function_name}`'s contract+body span in `agents/{agent_id}/scratch/work/{c_file}` and `{function_name}`'s contract+prototype span in `agents/{agent_id}/scratch/work/{header_file}`. Do not touch any other function in those files, and never write to `workspace/work/`, the shared corpus, or the ledger. If `{header_file}` contains an overly strong speculative `ensures` on `{function_name}` itself, you may refine `{function_name}`'s prototype contract in `agents/{agent_id}/scratch/work/{header_file}` so long as the module guardrail still passes. If a callee contract is too weak, put a strengthening request in `strengthening_requests`.
+3. **Trust Boundary & No Magic Bounds Rule:** If `{function_name}` is an `untrusted_surface` entry function, its `requires` may only state memory shape (validity, separation, non-NULL for non-attacker pointers). A value constraint on attacker-controlled bytes or lengths (for example `requires len <= 64;`) defines the bug away and will be rejected. Even on `internal_api` helpers, **never invent arbitrary magic constant bounds** (such as `requires char_range: n <= 128;`) that do not come from an explicit `#define` constant, buffer capacity, or actual caller check; derive bounds directly from callers or omit them (`requires 0 <= n;` + `\valid(buf + (0 .. n - 1))`). List any environment assumption you rely on in `boundary_assumptions`.
 4. **Named Clauses & Enforced Clause Order:**
    - Name every clause (`requires valid_buf: ...;`, `loop invariant range: ...;`, `ensures bound: ...;`) so you can isolate failing goals by name with `--prop <clause_name> --dump-goal`.
-   - Name Layer 4–6 clauses `L4_*`, `L5_*`, or `L6_*` (for example `ensures L5_no_crlf: no_crlf_or_nul(out, \result);`) so the ledger can credit them. Copy pure-ACSL predicate and ghost blocks directly from `/opt/framac-pipeline/templates/acsl/layer*.acsl` inside `/*@ ... */` blocks.
+   - Name Layer 4–6 clauses `L4_*`, `L5_*`, or `L6_*` (for example `ensures L5_no_crlf: no_crlf_or_nul(out, \result);`) so the ledger can credit them. Copy pure-ACSL predicate and ghost blocks directly from `/opt/framac-pipeline/templates/acsl/layer*.acsl` inside `/*@ ... */` blocks (declare shared header ghost globals as tentative definitions without `= 0`, e.g., `/*@ ghost int g_sec_auth_verified; */`).
    - Follow Frama-C's mandatory clause order in function contracts: `requires` -> `terminates` / `decreases` -> `exits` -> `assigns` -> `ensures` -> `behavior`. Putting `terminates` or `exits` after `assigns` causes a fatal kernel parse error.
-5. **No Silent Unsoundness:** `run_wp_function.py` fails with `wp_aborted` or `unsound_proof` if WP logs any `user error`, `failure`, `Ignoring ... specification`, `Missing assigns clause`, `Incompatible ...`, or `Memory model hypotheses for function`. Always resolve these warnings rather than working around them.
+5. **No Silent Unsoundness & Known WP Limitations:** `run_wp_function.py` fails with `wp_aborted` or `unsound_proof` if WP logs any `user error`, `failure`, `Ignoring ... specification`, `Missing assigns clause`, `Incompatible ...`, or `Memory model hypotheses for function`. Always resolve these warnings rather than working around them.
+   - **Exception — Dynamic Allocation (`\freeable`, `\fresh`, `\allocable`, `allocates`, `frees`):** Frama-C WP does not support dynamic allocation predicates from `<stdlib.h>` (`malloc`/`calloc`/`realloc`/`free`) and prints `not yet supported (skipped)` while leaving `\freeable` / `allocates` goals `Unknown`. Never write synthetic `probe_*.c` files or invoke `frama-c` on standalone test programs to investigate this limitation (`run_wp_function.py` mechanically rejects `probe_*.c` files and files outside `agents/{agent_id}/scratch/work/`). Once all non-allocation goals are proven and the E-ACSL guardrail passes (`passed_dynamic_oracle`), or when `next_synthesis_focus` is `"wp_dynamic_allocation_limitation_stop_now"` or `"budget_exhausted_write_result_json_now"`, stop immediately and write `agents/{agent_id}/scratch/result.json` with `"status": "stalled_after_k_retries"`.
 
 ---
 
@@ -35,8 +36,9 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 LLMs fail when trying to write all ACSL annotations in a single pass. You MUST synthesize and verify annotations in this strict 3-step order:
 
 ### Step A — Frame Conditions (`assigns`, `loop assigns`, `terminates`, `exits`)
-1. Inspect every loop, pointer write, and function call inside `{function_name}`.
+1. Inspect every loop, pointer write, global variable write, and function call inside `{function_name}`.
 2. Write `loop assigns i, acc, out_buf[0 .. len - 1];` for every loop (innermost loops first) and `terminates \true; exits \false; assigns ...;` on the function contract.
+   - **`assigns \nothing;` Purity Rule:** Write `assigns \nothing;` **ONLY** for pure functions whose body has zero pointer dereference writes (`*p = ...`, `p[i] = ...`), zero global variable writes, zero `memset`/`memcpy` calls, and zero `malloc`/`calloc`/`realloc`/`free` calls. Never write `assigns \nothing;` on a function that allocates, frees, or mutates pointed-to memory.
    - For functions with indirect calls (`fp(...)` or `ops->cb(...)`), annotate the call site with `//@ calls f1, f2;` or precede it with `//@ assert fp \in {&f1, &f2};` so `-rte` generates guards and WP does not abort on missing `calls`.
 3. Run `run_wp_function.py`. If `unproven_by_bucket.step_a_assigns` is non-empty, inspect the WP log to see which modified variable or memory location was omitted, update `assigns` / `loop assigns`, and repeat until `step_a_assigns` has 0 unproven goals.
 
@@ -59,12 +61,53 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    - Isolate the failing goal by passing `--prop <clause_name> --dump-goal` to `run_wp_function.py` and read `vc_goal_dumps` in the JSON output to see the exact `Goal ... : ... Prove: ...` sequent.
    - Check if `{function_name}` relies on caller guarantees (e.g., `len <= MAX_PDU_SIZE`, `buf != \null`, `\valid_read(buf + (0 .. len - 1))`). Add the minimal necessary `requires` clause to `agents/{agent_id}/scratch/work/{header_file}`, subject to Rule 3.
     - Check if `{function_name}` fails because a **callee function `g()`** has a weak contract in its `.h` header. Do not edit `g()`; add an entry to `strengthening_requests` in your result (`callee`, `header_file`, optional `callee_file`, `needed_clause`, `reason`).
-2. **Common ACSL Traps to Avoid:**
-   - **Never negate a C comparison result directly in ACSL:** write `cmp(a, b) == 0` instead of `!cmp(a, b)` (`!` requires a `boolean` term, whereas C functions return `int`).
+2. **Common ACSL Traps to Avoid (WP + E-ACSL Intersection Cheat Sheet):**
+
+   | Rule / Construct | WRONG (Fails WP, E-ACSL, or Parser) | RIGHT (Valid in Both WP and E-ACSL) |
+   | :--- | :--- | :--- |
+   | **Quantifier type & bounds** | `\forall int k; k >= 0 && k < n ==> a[k] == 0;` | `\forall integer k; 0 <= k < n ==> a[k] == 0;` (`integer` type + chained `lo <= k < hi` guard required by E-ACSL) |
+   | **Zero-length / `(NULL, 0)` buffers** | `requires \valid_read(buf + (0 .. len - 1));` | `requires len > 0 ==> \valid_read(buf + (0 .. len - 1));` (guards `len == 0` so `(NULL, 0)` corpus inputs pass E-ACSL) |
+   | **Function clause order** | `assigns *out; requires \valid(out);` | `requires` -> `terminates` -> `exits` -> `assigns` -> `ensures` -> `behavior` |
+   | **Loop clause order & placement** | `while (i < n) { /*@ loop invariant ... */ }` or `loop variant` before `loop assigns` | Place **immediately above** `for`/`while`/`do` in strict order: `loop invariant` -> `loop assigns` -> `loop variant` |
+   | **Loop counter upper bound** | `loop invariant 0 <= i < n;` (false when `i == n` at loop exit!) | `loop invariant 0 <= i <= n;` (holds at entry `0` and at loop exit `n`) |
+   | **Complete `loop assigns`** | `loop assigns buf[0 .. n - 1];` (omits loop counter `i` / accumulators) | `loop assigns i, acc, buf[0 .. n - 1];` (list **every** variable and memory range modified in the loop) |
+   | **Pre-state in `ensures`** | `ensures *out == *out + 1;` | `ensures *out == \old(*out) + 1;` |
+   | **C calls & booleans in ACSL** | `requires !is_valid(p);` (C functions cannot be called in ACSL; `!` takes `boolean`, not `int`) | Inline the struct/pointer predicate directly (`p != \null && p->len <= MAX`), and write `x == 0` instead of `!x` |
+   | **Arithmetic overflow in ACSL** | `requires a + b <= MAX;` (when intending 32-bit C wrap) | In ACSL, `+`, `-`, `*` on `integer` never overflow (`a + b` is mathematical integer sum; cast `(int)(a + b)` only if testing C truncation) |
+
    - **`\at(expr, Old)` distributes over array indexing:** `\at(a[i], Pre)` evaluates `a[\at(i, Pre)]` in the `Pre` state. Inside a loop where `k` is quantified, write `\at(a, Pre)[k]` or `loop invariant \forall integer k; 0 <= k < i ==> a[k] == \at(a[k], LoopEntry);`.
    - **Recursive `logic` functions must descend by `- 1`:** SMT solvers only trigger the inductive unfolding axiom when the recursive call uses `n - 1` (never `n / 2`).
    - **Floating-point comparisons:** always guard floating-point arguments with `requires !\is_NaN(x) && \is_finite(x);`.
    - **Smoke Test for Vacuous Contracts:** once all goals are proven, run `run_wp_function.py --smoke-tests` to check if `\false` is provable at the end of `{function_name}` (which indicates inconsistent `requires` or callee contracts).
+
+3. **Canonical C + ACSL Annotated Function Template:**
+   ```c
+   /*@ requires n >= 0;
+     @ requires n > 0 ==> \valid_read(src + (0 .. n - 1));
+     @ requires \valid(out_sum);
+     @ requires \separated(out_sum, src + (0 .. n - 1));
+     @ terminates \true;
+     @ exits \false;
+     @ assigns *out_sum;
+     @ ensures \result == 0;
+     @*/
+   int sum_clamped(const int *src, int n, int *out_sum) {
+       int acc = 0;
+       /*@ loop invariant bound: 0 <= i <= n;
+         @ loop invariant acc_range: 0 <= acc <= i * 100;
+         @ loop assigns i, acc;
+         @ loop variant n - i;
+         @*/
+       for (int i = 0; i < n; i++) {
+           int v = src[i];
+           if (v > 0 && v <= 100) {
+               acc += v;
+           }
+       }
+       *out_sum = acc;
+       return 0;
+   }
+   ```
 
 ---
 
@@ -91,7 +134,7 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
    - Unchanged goals are answered from the run's proof cache, so re-running after a small edit only re-proves what changed.
    - `"status": "analysis_error"` means Frama-C was killed or timed out (`reason`: `oom_killed`, `timeout`, `crashed`). Nothing was proven or refuted. Re-run once; if it repeats, report `blocked` with the reason.
 
-Both oracles read your scratch tree and write separate outputs, so you may run them as two concurrent background commands and wait for both. A guardrail rejection still decides the iteration.
+Run wrapper commands in the **foreground** and wait for completion: either run **Oracle 2 (`run_wp_function.py`) first** (catches ACSL syntax, `assigns`, and loop invariant errors in seconds) followed by **Oracle 1 (`run_eacsl_fuzz.py guardrail`)**, or run both in parallel inside a **single foreground wrapper call** (`<guardrail_cmd> & gpid=$!; <wp_cmd> & wpid=$!; wait $gpid $wpid`). Never leave detached background commands running across turns. A guardrail rejection still decides the iteration.
 
 ## Reference Manuals (Last Resort)
 
@@ -99,7 +142,7 @@ The Frama-C manuals are available as greppable Markdown under `{references_dir}`
 
 ## Exit Criteria and Result
 
-- Finish when `agents/{agent_id}/scratch/wp_{function_name}.json` reports `"status": "all_proven"` AND the guardrail reports `passed_dynamic_oracle`, or after `{max_retries}` full iterations with `unproven_goals_remain` (`stalled_after_k_retries`).
+- Finish when `agents/{agent_id}/scratch/wp_{function_name}.json` reports `"status": "all_proven"` AND the guardrail reports `passed_dynamic_oracle`, or after `{max_retries}` full iterations with `unproven_goals_remain` (`stalled_after_k_retries`), or immediately with `stalled_after_k_retries` when `next_synthesis_focus` is `"wp_dynamic_allocation_limitation_stop_now"` or `"budget_exhausted_write_result_json_now"`.
 - Write your final annotation diff (against `agents/{agent_id}/scratch/base/`) to `agents/{agent_id}/scratch/{function_name}.patch` and reference it in `patch`. The parent splices your scratch overlay into `workspace/work/` via `workspace_overlay.py merge-agent` and re-verifies on the merged tree.
 - Always write `agents/{agent_id}/scratch/result.json` using `python3 -c "import json, pathlib; pathlib.Path('agents/{agent_id}/scratch/result.json').write_text(json.dumps(res, indent=2))"` so ACSL backslashes (`\valid`, `\forall`, `\false`, `\at`) are properly JSON-escaped, and return **exactly one JSON object** and no surrounding prose:
 

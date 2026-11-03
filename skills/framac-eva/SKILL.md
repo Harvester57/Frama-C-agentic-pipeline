@@ -25,13 +25,13 @@ Read `workspace/reports/callgraph_dag.json` and `workspace/harnesses/`. If Phase
 
 Eva runs need no judgment, so they run from the generated Makefile (`docs/resources-and-caching.md`), not from one LLM subagent per module. Eva is single-threaded. Make runs modules side by side, admitting each by memory, and the probe's history learns each module's peak memory. `S=/opt/framac-pipeline/scripts`.
 
-1. If `/framac-fuzz` has not done it yet, generate the Makefile once: `python3 $S/pipeline_make.py gen`.
-2. Run every module **in the background**, at the same time as the `fuzz` target: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`. Results with status `ok` are cached by content, so an unchanged module is not re-analyzed. Write this command exactly as shown, with the full path: only this exact command line may also fill the shared cross-run cache (`docs/resources-and-caching.md`, Section 5).
+1. If `/framac-fuzz` has not done it yet, generate the Makefile once: `python3 /opt/framac-pipeline/scripts/pipeline_make.py gen`.
+2. Run every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva` (run in the foreground after `fuzz` so `eva` gets a writable `rw` `/framac-cache` mount, or concurrently in the background with `ro` cache if your host harness supports background wrapper calls). Results with status `ok` are cached by content, so an unchanged module is not re-analyzed. Write this command exactly as shown, with the full path: only this exact command line may also fill the shared cross-run cache (`docs/resources-and-caching.md`, Section 5).
 
 For a single module in guidance mode, the underlying command is:
 
 ```text
-python3 $S/run_eva_slice.py --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --main eva_main --out-dir workspace/eva/<mod> --slevel <slevel_or_100> --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/eva/<mod>.json
+python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --main eva_main --out-dir workspace/eva/<mod> --slevel <slevel_or_100> --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/eva/<mod>.json
 ```
 
 - A Frama-C failure is reported as `status: "analysis_error"` (exit code 1), never as zero alarms.
@@ -42,7 +42,7 @@ python3 $S/run_eva_slice.py --module <mod> --sources <sidecar sources> workspace
 ### Tuning Eva Precision When Needed
 Tuning is your judgment call. Make applies it: record per-module parameters in `workspace/build/params.json`, then re-run the `eva` target (or `module-<mod>`).
 - **Low discharge rate:** if a `Tier 1A` or `Tier 1B` module discharges unusually little (< 70% Valid) because of loop widening:
-  - raise the slevel: `python3 $S/pipeline_make.py params set --module <mod> --eva-slevel 250`;
+  - raise the slevel: `python3 /opt/framac-pipeline/scripts/pipeline_make.py params set --module <mod> --eva-slevel 250`;
   - or add `/*@ loop pragma UNROLL 64; */` above bounded fixed-size header loops in `workspace/work/`.
 - **Taint:** if Layer 6 (Secret Non-Interference / Taint) properties are active on the module, enable the taint domain with `params set --module <mod> --eva-taint`. It adds `taint` to `-eva-domains`, so `!\tainted(...)` assertions at network emission sinks get verified.
 - For any other precision lever, or an alarm or message you do not understand, grep the Eva manual through [`docs/references/`](../../docs/references/README.md) rather than reading it: loops §6.4, case splitting and partitioning §6.5, domains §6.7, what each alarm checks §3.2, log messages §3.3, FAQ §10.

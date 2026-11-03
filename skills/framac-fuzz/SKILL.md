@@ -51,12 +51,12 @@ The `selftest` Make target (a prerequisite of `fuzz`) runs it; for a one-off che
 
 Campaigns need no judgment, so they run from the generated Makefile, not from one LLM subagent per module. Make admits each campaign by CPU and memory and gives it as many LibFuzzer workers as the measured budget allows (`docs/resources-and-caching.md`). The wrapper commands below are the same on POSIX (`framac-docker.sh`). `S=/opt/framac-pipeline/scripts`.
 
-1. Generate the Makefile once, in the foreground: `python3 $S/pipeline_make.py gen`. Its JSON lists the runnable modules and any module excluded with a reason (no harness sidecar, or a flag outside the allowlist).
+1. Generate the Makefile once, in the foreground: `python3 /opt/framac-pipeline/scripts/pipeline_make.py gen`. Its JSON lists the runnable modules and any module excluded with a reason (no harness sidecar, or a flag outside the allowlist).
 2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`. Builds are cached by content, so repeating this after a harness repair rebuilds only what changed. Write this command exactly as shown, with the full path: only this exact command line may also fill the shared cross-run cache (`docs/resources-and-caching.md`, Section 5).
-3. Fuzz every module **in the background**, since it can exceed a foreground tool timeout: `python3 $S/pipeline_make.py run fuzz`. `/framac-eva` runs at the same time, as a second background wrapper call.
+3. Fuzz every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz` (run in the foreground and wait for completion, or concurrently in the background alongside `/framac-eva` if your host harness supports background wrapper calls).
 4. Tune per module only where needed, then re-run the target. Options: dictionaries, budgets, `--fuzz-max-time`.
    ```text
-   python3 $S/pipeline_make.py params set --module <mod> --fuzz-dict <file> --fuzz-budget <cpu-seconds>
+   python3 /opt/framac-pipeline/scripts/pipeline_make.py params set --module <mod> --fuzz-dict <file> --fuzz-budget <cpu-seconds>
    ```
 
 Each campaign writes only its own module's corpus, crash directory, and report (`workspace/reports/fuzz/<mod>.json`). The fuzz budget is CPU-seconds per module from the profile (quick 60, standard 120, deep 900). Wall time = budget / workers, at least 30 s, so a larger node finishes sooner at equal or greater effort. `-rss_limit_mb` stays fixed at 2048 on every machine, so `oom_found` means the same thing everywhere.
@@ -64,7 +64,7 @@ Each campaign writes only its own module's corpus, crash directory, and report (
 For a single module in guidance mode, the underlying command is:
 
 ```text
-python3 $S/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
+python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
 ```
 
 `run_eacsl_fuzz.py` supports `--engine {auto,eacsl,sanitizers}` (default `auto` in `campaign` mode):

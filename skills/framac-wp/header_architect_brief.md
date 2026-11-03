@@ -21,15 +21,26 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
    - Every function contract MUST follow Frama-C's required clause ordering:
      `requires` -> `terminates` / `decreases` -> `exits` -> `assigns` -> `ensures` -> `behavior`.
    - Name every clause (`requires valid_in: ...;`, `ensures progress: ...;`) so downstream prover subagents can target individual VCs with `--prop <name>`.
-3. **Every Function Contract Must Specify:**
-   - Pointer validity preconditions (`requires valid_in: ptr != \null && \valid_read(ptr + (0 .. len - 1));` or `\valid(...)` for output buffers).
+3. **Every Function Contract Must Specify Conservative, Sound Baselines:**
+   - Pointer validity preconditions (`requires valid_in: ptr != \null && \valid_read(ptr + (0 .. len - 1));` or `\valid(...)` for output buffers). Never write vacuous preconditions (`requires \false;` or `requires 0;`).
    - Memory separation (`requires sep: \separated(out_buf + (0 .. cap - 1), in_buf + (0 .. len - 1));`) when a function takes both input and output pointers.
    - Termination and non-exit clauses (`terminates \true; exits \false;`) before `assigns`.
    - Frame conditions (`assigns \nothing;` for pure parsers/checkers, or `assigns *out_pdu;` / `assigns out_buf[0 .. cap - 1];`).
-   - Return-value bounds and parser progress (`ensures status: \result == 0 || \result == -1;`, `ensures progress: \result == 0 ==> 0 <= *offset_out <= len && *offset_out >= \old(*offset_out);`, `ensures init: \result == 0 ==> \initialized(out_pdu);`).
-   - Applicable Layer 4 (Ghost Auth State), Layer 5 (Output Sanitization), or Layer 6 (Secret Zeroization) postconditions, named `L4_*`, `L5_*`, `L6_*`.
+   - **Prefer conservative `ensures` over speculative postconditions:** only state `ensures` clauses that clearly hold from the implementation (such as basic return-code bounds `ensures status: \result == 0 || \result == -1;`). Avoid speculative `ensures` clauses that guess internal struct invariants before bottom-up provers verify the callees; each bottom-up function prover can strengthen or refine its own prototype contract in `{header_file}` when needed.
+   - Applicable Layer 4 (Ghost Auth State), Layer 5 (Output Sanitization), or Layer 6 (Secret Zeroization) postconditions, named `L4_*`, `L5_*`, `L6_*`. When declaring Layer 4 ghost globals in a shared `.h` header, use tentative definitions without `= 0` (`/*@ ghost int g_sec_auth_verified; */`) so multi-TU E-ACSL builds link without duplicate-symbol errors.
 4. **Trust boundary:** on untrusted entry functions, `requires` may state memory shape only (validity, separation, non-NULL for non-attacker pointers). Never constrain attacker-controlled values or lengths; list environment assumptions in `boundary_assumptions`.
-5. **Mandatory Dual Check Before Returning:**
+5. **Common Header Contract Traps (WP + E-ACSL Intersection Cheat Sheet):**
+
+   | Rule / Construct | WRONG (Fails WP, E-ACSL, or Parser) | RIGHT (Valid in Both WP and E-ACSL) |
+   | :--- | :--- | :--- |
+   | **Clause ordering** | `assigns *out; requires \valid(out);` | `requires` -> `terminates` -> `exits` -> `assigns` -> `ensures` -> `behavior` |
+   | **Zero-length / `(NULL, 0)` buffers** | `requires \valid_read(buf + (0 .. len - 1));` | `requires len > 0 ==> \valid_read(buf + (0 .. len - 1));` (so `(NULL, 0)` corpus inputs pass E-ACSL) |
+   | **Quantifiers in `predicate` / `ensures`** | `\forall int k; k >= 0 && k < n ==> ...` | `\forall integer k; 0 <= k < n ==> ...` (`integer` type + chained `lo <= k < hi` guard required by E-ACSL) |
+   | **`logic` / `predicate` definitions** | `axiomatic A { logic int f(int x); }` (uninterpreted `axiomatic` or C `int` type) | `predicate is_bounded(integer x, integer hi) = 0 <= x <= hi;` (concrete body with `integer` parameters) |
+   | **C calls & booleans in ACSL** | `requires !check_hdr(h);` | Never call C functions inside ACSL; inline struct field predicates directly (`h->magic == 0x4643`) |
+   | **Pre-state in `ensures`** | `ensures *off >= *off;` | `ensures *off >= \old(*off);` |
+
+6. **Mandatory Dual Check Before Returning:**
    - **Check 1 (Frama-C Kernel Syntax):** run `run_wp_function.py` or `frama-c -kernel-warn-key annot-error=abort` on `agents/{agent_id}/scratch/work/` to confirm zero ACSL syntax or typing errors.
    - **Check 2 (Dynamic E-ACSL Anti-Hallucination Guardrail):**
      ```text

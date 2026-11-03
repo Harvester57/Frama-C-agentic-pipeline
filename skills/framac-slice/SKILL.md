@@ -25,12 +25,12 @@ $env:PYTHONIOENCODING="utf-8"
   "<command>"
 ```
 
-`S=/opt/framac-pipeline/scripts`.
+Always use full `/opt/framac-pipeline/scripts/<script>.py` paths inside `"<command>"` so host PowerShell does not expand `$S`.
 
 ## Step 1 — Initialize the Shadow Overlay Workspace
 
 ```text
-python3 $S/workspace_overlay.py init --target /target --overlay workspace
+python3 /opt/framac-pipeline/scripts/workspace_overlay.py init --target /target --overlay workspace
 ```
 
 The target is never modified. If the overlay already exists and the target changed since it was captured, `init` fails: start a new run directory instead of resuming.
@@ -39,7 +39,7 @@ If the target has no `compile_commands.json` (or has an out-of-tree build system
 
 ```text
 mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/
-python3 $S/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j"$FRAMAC_JOB_CPUS"
+python3 /opt/framac-pipeline/scripts/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j"$FRAMAC_JOB_CPUS"
 ```
 
 The broker sizes a sandboxed `bear`, `make`, `cmake`, `ninja`, `meson` or `configure` command like a whole phase (`phase-dynamic`), and `FRAMAC_JOB_CPUS` is the CPU count it leased. `$FRAMAC_JOB_CPUS` must reach the container unexpanded: in the PowerShell wrapper's double-quoted command write `` `$FRAMAC_JOB_CPUS ``.
@@ -51,7 +51,7 @@ For CMake: `cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"` inside the same
 ## Step 2 — Build the Call-Graph DAG, Topological Waves & Risk Tiers
 
 ```text
-python3 $S/build_callgraph_dag.py --target workspace/work --out workspace/reports/callgraph_dag.json --emit-compile-commands workspace/reports/compile_commands.json
+python3 /opt/framac-pipeline/scripts/build_callgraph_dag.py --target workspace/work --out workspace/reports/callgraph_dag.json --emit-compile-commands workspace/reports/compile_commands.json
 ```
 
 Read `workspace/reports/callgraph_dag.json` and review the structural classifications. `build_callgraph_dag.py` uses a C/ACSL lexical token stream (`tokenize_c_acsl`), Tarjan's SCC algorithm for recursion cycles, and purely structural signature/body analysis (no project-specific keyword hints):
@@ -90,7 +90,7 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 
 ```text
-python3 $S/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom> [--auto-args] [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
+python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom> [--auto-args] [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
 ```
 
 The sidecar `harness_<mod>.json` is the single source of truth for later phases: `sources`, `cppflags`, `ldflags`, `include_source`. `pipeline_make.py gen` builds every module's fuzz, Eva and build recipes from it, so put the module's real link flags in `--ldflags` here rather than on later command lines. Flags outside the build allowlist (for example `-fplugin`, `-B`, `-fuse-ld`, `-Wl,`) exclude the module from the Make phases. `gen` reports them.
@@ -122,11 +122,11 @@ The harness must respect the entry function's declared or documented contract (b
 ## Step 5 — Seed the Coverage Ledger and Checkpoint
 
 ```text
-python3 $S/ledger.py seed --dag workspace/reports/callgraph_dag.json [--scope <repo-relative path>]...
-python3 $S/validate_artifacts.py run-dir .
-python3 $S/checkpoint.py init state --target /target
-python3 $S/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json
-python3 $S/pipeline_make.py gen
+python3 /opt/framac-pipeline/scripts/ledger.py seed --dag workspace/reports/callgraph_dag.json [--scope <repo-relative path>]...
+python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
+python3 /opt/framac-pipeline/scripts/checkpoint.py init state --target /target
+python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json
+python3 /opt/framac-pipeline/scripts/pipeline_make.py gen
 ```
 
 `pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`). Check its JSON for modules excluded with a reason before moving on.

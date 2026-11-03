@@ -53,8 +53,8 @@ How resources are measured and how caches work: [`docs/resources-and-caching.md`
   - It snapshots `workspace/work/` into `agents/<agent-id>/scratch/work/`.
   - It moves the prover's planned units to `in_progress` with a compare-and-set, so a unit that just became a `candidate` is never handed out.
   - It renders `agents/<agent-id>/brief.md` with every template variable filled, including the host paths the agent needs for the wrapper.
-- **Agent outputs:** every subagent writes only under `agents/<agent-id>/scratch/` and returns **one JSON object**, validated with `validate_artifacts.py agent-result`.
-- **References:** every brief has a `{references_dir}` placeholder. Fill it with the absolute host path of this repository's `docs/references/` (this skill's `../../docs/references`, next to `wrappers/`). That folder holds greppable Frama-C manuals (see its [`README.md`](../../docs/references/README.md)), which subagents grep only as a last resort.
+- **Agent outputs:** every subagent writes only under `agents/<agent-id>/scratch/`, writes its final JSON result to `agents/<agent-id>/scratch/result.json` (which `wp_scheduler.py complete --agent-id <agent-id>` reads from disk and validates with `validate_artifacts.py agent-result`), and returns **one JSON object**.
+- **References:** `prepare-agent` / `next --prepare` automatically fills the `{references_dir}` placeholder in every brief with the path to `docs/references/` (mounted inside the container at `/opt/framac-pipeline/docs/references`). That folder holds greppable Frama-C manuals (see its [`README.md`](../../docs/references/README.md)), which subagents grep only as a last resort.
 - **Pure ACSL, in scope:** provers and architects may add **pure ACSL annotations only** (`/*@ ... */`, `//@ ...`) within their assigned function or header. `merge-agent` and `merge-batch` mechanically reject:
   - any C token modification;
   - any scope violation;
@@ -66,25 +66,25 @@ How resources are measured and how caches work: [`docs/resources-and-caching.md`
 
 ## Step-by-Step Orchestration Instructions
 
-`S=/opt/framac-pipeline/scripts`. All commands run through the wrapper with `-TargetDir <target-dir> -RunDir <run-dir>` (`--target` / `--run-dir` in the POSIX wrapper). The wrapper sizes every container from the measured machine. Do not pass `-Agents`.
+All commands run through the wrapper with `-TargetDir <target-dir> -RunDir <run-dir>` (`--target` / `--run-dir` in the POSIX wrapper). Use full `/opt/framac-pipeline/scripts/<script>.py` paths so host PowerShell never expands `$S`. The wrapper sizes every container from the measured machine. Do not pass `-Agents`.
 
 ### Step 1 — Build the task graph
 
 Run this once, after `pipeline_make.py run ingest replay wp-queue` (which already calls it):
 
 ```text
-python3 $S/wp_scheduler.py init
+python3 /opt/framac-pipeline/scripts/wp_scheduler.py init
 ```
 
 When resuming a run that was interrupted, or one started before the scheduler existed, use `init --reconcile`. It returns `in_progress` units with no live agent to `planned` and reports briefs that need re-rendering.
 
 ### Step 2 — The dispatch loop (rolling window)
 
-Repeat until `python3 $S/wp_scheduler.py status` reports `"done": true`:
+Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` reports `"done": true`:
 
 1. **Hand out ready tasks.**
    ```text
-   python3 $S/wp_scheduler.py next --slots auto --prepare
+   python3 /opt/framac-pipeline/scripts/wp_scheduler.py next --slots auto --prepare
    ```
    - `--slots auto` = `recommend().max_agents` minus running tasks. It is recomputed each round from the measured machine, and capped by `--max-agents` / `FRAMAC_MAX_AGENTS`.
    - Each entry of `tasks[]` has a `kind`, an `agent_id`, a `role` and a `brief_file`.
@@ -92,22 +92,22 @@ Repeat until `python3 $S/wp_scheduler.py status` reports `"done": true`:
    - `parent_tasks[]` are `repair` tasks for you, the parent. They take no agent slot:
      1. Record the attempt:
         ```text
-        python3 $S/generate_harness.py --record-repair workspace/harnesses/harness_<mod>.json --reason "<reason>"
+        python3 /opt/framac-pipeline/scripts/generate_harness.py --record-repair workspace/harnesses/harness_<mod>.json --reason "<reason>"
         ```
      2. Fix `workspace/harnesses/harness_<mod>.c`, or regenerate it with `--auto-args` / `--entry-style auto_prototype` for an internal multi-argument function.
      3. Run the task's listed `actions`, typically `pipeline_make.py run module-<mod>`.
      4. Then run `wp_scheduler.py refresh --module <mod>`.
-2. **Spawn one background subagent per task**, with its `brief_file`. Do not wait for a whole batch: handle each completion as it arrives. Two kinds carry extra context, which `--prepare` already renders into the brief:
+2. **Execute or spawn each task** using its rendered `brief_file` (spawn one subagent per task if your host supports subagents, or execute each task sequentially in the foreground, writing `agents/<id>/scratch/result.json` before calling `complete`). Two kinds carry extra context, which `--prepare` already renders into the brief:
    - **`negotiate`:** a callee prover asked to strengthen its contract. The brief ends with every entry of the task's `requests[]` (the `needed_clause`, the `reason`, the requesting caller). The prover must prove each clause or explain why it does not hold.
    - **`breaker`:** the brief lists the unproven goals from the task's `wp_report`, the stalled prover's own WP report, and names that file.
 
    Without `--prepare`, render the same briefs with `workspace_overlay.py prepare-agent --request-id <id>` (repeatable) or `--wp-report <path>`.
 3. **On each completion:**
    ```text
-   python3 $S/wp_scheduler.py complete --agent-id <id>
-   python3 $S/wp_scheduler.py merge-pending
+   python3 /opt/framac-pipeline/scripts/wp_scheduler.py complete --agent-id <id>
+   python3 /opt/framac-pipeline/scripts/wp_scheduler.py merge-pending
    ```
-   `complete` validates the result and dispatches by role:
+   `complete` reads `agents/<id>/scratch/result.json`, validates it, and dispatches by role:
    - **proven** provers are queued for merging;
    - **stalled or blocked** provers:
      - get their WP report ingested;
@@ -124,7 +124,7 @@ Repeat until `python3 $S/wp_scheduler.py status` reports `"done": true`:
    - or the oldest has waited 5 minutes.
 
    It ingests each merged function's parent WP report and saves checkpoint shards.
-4. Run `python3 $S/validate_artifacts.py run-dir .` after any manual write.
+4. Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .` after any manual write.
 
 **Recovery:**
 - An agent that never returns: `wp_scheduler.py requeue --stale-minutes <N>` (or `--agent-id <id>`) puts its task back and returns its units to `planned`. If its result arrives later anyway, `complete` still accepts it.
@@ -133,7 +133,7 @@ Repeat until `python3 $S/wp_scheduler.py status` reports `"done": true`:
 
 ### Step 3 — Final Record Re-Verification & Diff Export
 
-1. Confirm `python3 $S/workspace_overlay.py check-acsl-only` passes on `workspace/work/`.
+1. Confirm `python3 /opt/framac-pipeline/scripts/workspace_overlay.py check-acsl-only` passes on `workspace/work/`.
 2. In `standard` and `deep` profiles, if any finding record in `findings.json` was upgraded or had its root cause or severity altered during Phase 3, re-verify it with a fresh `crash_verifier_brief.md` subagent.
 3. Re-prove every merged function on the final tree: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`, written exactly so, with the full path. This is the trusted sweep:
    - it does not read the per-run WP cache;
@@ -141,4 +141,4 @@ Repeat until `python3 $S/wp_scheduler.py status` reports `"done": true`:
    - it ingests regressions into the ledger.
 
    If `workspace/reports/wp-sweep/summary.json` reports `regressions`, those functions' units are now `blocked`. Find out why (usually a later callee contract change) before marking the run complete.
-4. Run `python3 $S/workspace_overlay.py export-diff` to write `workspace/reports/verified_acsl.patch` and copy verified `.h` files to `workspace/contracts/`.
+4. Run `python3 /opt/framac-pipeline/scripts/workspace_overlay.py export-diff` to write `workspace/reports/verified_acsl.patch` and copy verified `.h` files to `workspace/contracts/`.
