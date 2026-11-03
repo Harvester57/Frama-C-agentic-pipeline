@@ -999,6 +999,38 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
 
     candidates_added = 0
     fh = res.get("fault_hypothesis")
+    pg = res.get("proof_gap")
+    if pg is not None:
+        cls = goal_obligation_class({"kind": "assertion", "annotation": pg["predicate"]})
+        fn_units = [
+            u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")
+        ]
+        linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
+            u["coverage_id"] for u in fn_units
+        ]
+        if res.get("evidence"):
+            tool_out = res["evidence"][0]["tool_output"]
+        else:
+            prom_res = promote_file(Path.cwd(), aid, rel(str(result_path)), kind="artifact")
+            tool_out = str(prom_res["dest"])
+        phase = "breaker" if role == "breaker" else "wp"
+        gap_note = f"proof_gap: {pg['predicate']}: {pg['reason']}"
+        for cid in linked:
+            u = units[cid]
+            add_evidence(
+                u,
+                phase,
+                aid,
+                "proof_gap",
+                False,
+                tool_out,
+                f"Proof gap on {pg['predicate'][:120]}: {pg['reason'][:140]}",
+            )
+            u["status"] = "blocked"
+            u["agent_id"] = None
+            if gap_note not in u["unresolved"]:
+                u["unresolved"] = sorted(set(u["unresolved"] + [gap_note]))
+
     if fh is not None:
         cls = goal_obligation_class({"kind": "assertion", "annotation": fh["predicate"]})
         existing_cand = _find_matching_sink_candidate(candidates, file, fn, cls, fh["predicate"])
@@ -1102,6 +1134,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         "seeds_promoted": seeds_promoted,
         "candidates_added": candidates_added,
         "strengthening_requests_added": strengthening_requests_added,
+        "proof_gaps_recorded": 1 if pg is not None else 0,
     }
 
 
@@ -1339,13 +1372,25 @@ def cmd_ingest_verifier(
                     f"Rejected ({rej_class}): {rec['reason'][:140]}",
                 )
                 if not u["result_fingerprints"] and u["status"] == "candidate":
-                    if rej_class == "harness_induced" and harness_exhausted:
-                        u["status"] = "blocked"
-                        u["unresolved"] = sorted(set(u["unresolved"] + [f"harness_repair_exhausted: {rec['reason']}"]))
-                    else:
+                    if rej_class == "harness_induced" and not harness_exhausted:
                         u["status"] = "covered" if any(e.get("discharging") for e in u["evidence"]) else "planned"
                         u["agent_id"] = None
                         u["unresolved"] = []
+                    elif rej_class == "harness_induced" and harness_exhausted:
+                        u["status"] = "blocked"
+                        u["unresolved"] = sorted(set(u["unresolved"] + [f"harness_repair_exhausted: {rec['reason']}"]))
+                        u["agent_id"] = None
+                    else:
+                        has_discharging = any(e.get("discharging") for e in u["evidence"])
+                        u["status"] = "covered" if has_discharging else "blocked"
+                        u["agent_id"] = None
+                        if has_discharging:
+                            u["unresolved"] = []
+                        else:
+                            u["unresolved"] = [
+                                f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
+                            ]
+
 
         if fp in findings:
             _merge_finding_record(findings[fp], rec)

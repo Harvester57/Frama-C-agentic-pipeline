@@ -1411,17 +1411,23 @@ def pool_budget() -> Budget:
     return Budget(cpus=cpus or own.cpus, mem_mb=mem or own.mem_mb, source=f"pool-from-{own.source}")
 
 
-def _cpu_bounds(min_cpus: int, max_cpus: int | None, pool_cpus: float) -> tuple[int, int]:
-    """(lo, hi) CPUs for one grant: hi = min(max or pool, max(min, pool // 2)); both clamped to the pool."""
+def _cpu_bounds(
+    min_cpus: int, max_cpus: int | None, pool_cpus: float, alone: bool = False
+) -> tuple[int, int]:
+    """(lo, hi) CPUs for one grant: hi = min(max or pool, pool if alone else max(min, pool // 2)); both clamped to the pool."""
     pool_i = max(1, int(math.floor(pool_cpus + 1e-9)))
     lo = max(1, min(int(min_cpus), pool_i))
-    hi = min(max_cpus if max_cpus else pool_i, max(lo, pool_i // 2))
+    if alone:
+        hi = min(max_cpus if max_cpus else pool_i, pool_i)
+    else:
+        hi = min(max_cpus if max_cpus else pool_i, max(lo, pool_i // 2))
     return lo, max(lo, hi)
 
 
 def nominal_grant(cls: JobClass, pool: Budget) -> dict:
     """What the broker grants one job of this class on an idle pool (the elastic formula, memory-fitted)."""
-    lo, hi = _cpu_bounds(cls.min_cpus, cls.max_cpus, pool.cpus)
+    alone = cls.name == "wp"
+    lo, hi = _cpu_bounds(cls.min_cpus, cls.max_cpus, pool.cpus, alone=alone)
     cpus = hi if cls.gated else lo
     while cpus > lo and cls.mem_base_mb + cls.mem_per_cpu_mb * cpus > pool.mem_mb:
         cpus -= 1
@@ -1511,10 +1517,9 @@ def _make_targets(args: str) -> list[str]:
     return targets
 
 
-def infer_class(cmd: str) -> str:
-    """Job class of a container command line (sizing only; never a security decision)."""
-    text = expand_script_var(cmd or "")
-    m = re.search(r"pipeline_make\.py(?:\s+--run-dir(?:\s+\S+|=\S+))?\s+run\s+(?P<targets>[^;&|]*)", text)
+def _match_class_patterns(text: str) -> str | None:
+    text = expand_script_var(text or "")
+    m = re.search(r"pipeline_make\.py(?:\s+--run-dir(?:\s+\S+|=\S+))?\s+run\s+(?P<targets>[^;&|\n]*)", text)
     if m:
         targets = _make_targets(m.group("targets"))
         dynamic = any(t in _DYNAMIC_MAKE_TARGETS or t.startswith(_DYNAMIC_MAKE_PREFIXES) for t in targets)
@@ -1522,6 +1527,88 @@ def infer_class(cmd: str) -> str:
     for pattern, name in _CLASS_PATTERNS:
         if re.search(pattern, text):
             return name
+    return None
+
+
+def _unwrap_command(cmd: str) -> str:
+    text = (cmd or "").strip()
+    for _ in range(5):
+        m_entry = re.search(r"(?:^|[\s;&|(/])container_entry\.sh(?:\s+-[^\s]+)*\s+(.*)$", text)
+        if m_entry:
+            inner = m_entry.group(1).strip()
+            if (inner.startswith('"') and inner.endswith('"')) or (inner.startswith("'") and inner.endswith("'")):
+                inner = inner[1:-1]
+            text = inner.strip()
+            continue
+
+        m_sh = re.search(
+            r"(?:^|[\s;&|(/])(?:bash|sh)\s+(?:-[a-zA-Z0-9_-]*c\s+)(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\")(?:\s|$)",
+            text,
+            re.DOTALL,
+        )
+        if m_sh:
+            inner = m_sh.group(1) if m_sh.group(1) is not None else m_sh.group(2)
+            text = inner.strip()
+            continue
+
+        m_sh_bare = re.search(r"(?:^|[\s;&|(/])(?:bash|sh)\s+(?:-[a-zA-Z0-9_-]*c\s+)(.*)$", text)
+        if m_sh_bare:
+            inner = m_sh_bare.group(1).strip()
+            if (inner.startswith('"') and inner.endswith('"')) or (inner.startswith("'") and inner.endswith("'")):
+                inner = inner[1:-1]
+            text = inner.strip()
+            continue
+
+        break
+    return text
+
+
+def _extract_script_paths(cmd: str) -> list[Path]:
+    paths: list[Path] = []
+    token_lists: list[list[str]] = []
+    try:
+        token_lists.append(shlex.split(cmd, posix=(os.name != "nt")))
+    except ValueError:
+        pass
+    token_lists.append(cmd.split())
+
+    seen: set[str] = set()
+    for tokens in token_lists:
+        for idx, tok in enumerate(tokens):
+            clean_tok = tok.strip("\"'")
+            if clean_tok in ("bash", "sh", "/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/bin/sh"):
+                for next_tok in tokens[idx + 1:]:
+                    if not next_tok.startswith("-"):
+                        cand = next_tok.strip("\"'")
+                        if cand not in seen:
+                            seen.add(cand)
+                            paths.append(Path(cand))
+                        break
+            elif clean_tok.endswith(".sh") or clean_tok.startswith("./") or clean_tok.startswith("/") or "\\" in clean_tok:
+                if clean_tok not in seen:
+                    seen.add(clean_tok)
+                    paths.append(Path(clean_tok))
+    return paths
+
+
+def infer_class(cmd: str) -> str:
+    """Job class of a container command line (sizing only; never a security decision)."""
+    unwrapped = _unwrap_command(cmd or "")
+    matched = _match_class_patterns(unwrapped)
+    if matched:
+        return matched
+
+    # Check if the command runs an on-disk shell script file
+    for p in _extract_script_paths(unwrapped):
+        try:
+            if p.is_file():
+                content = p.read_text(encoding="utf-8", errors="replace")[:65536]
+                script_matched = _match_class_patterns(content)
+                if script_matched:
+                    return script_matched
+        except OSError:
+            pass
+
     return "light"
 
 
@@ -1849,12 +1936,14 @@ def _fit(
     waiting_others: int,
     taken: set[int],
     placer: Callable[[int, set[int]], list[int] | None] | None,
+    alone: bool = False,
 ) -> Grant | None:
     fixed = demand.get("fixed_cpus")
     if fixed:
         wanted: list[float] = [min(float(fixed), float(max(1, int(pool_cpus))))]
     else:
-        lo, hi = _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus)
+        is_wp = demand.get("class") == "wp"
+        lo, hi = _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus, alone=(alone and is_wp))
         share = int(max(0.0, free_cpus) + 1e-9) // (1 + max(0, waiting_others))
         top = max(lo, min(share, hi))
         wanted = [float(c) for c in range(top, lo - 1, -1)]  # lower CPUs until the memory fits
@@ -1943,7 +2032,12 @@ def plan_grant(
     taken: set[int] = set()
     for e in granted:
         taken.update(int(c) for c in e.get("cpu_set") or [])
-    grant = _fit(me["demand"], free_cpus, free_mem, pool_cpus, pool_mem, len(queue) - 1, taken, placer)
+    waiting_others = len(queue) - 1
+    alone = (not granted) and (waiting_others == 0)
+    cls_name = me.get("class") or (me.get("demand") or {}).get("class")
+    if cls_name and "class" not in me["demand"]:
+        me["demand"]["class"] = cls_name
+    grant = _fit(me["demand"], free_cpus, free_mem, pool_cpus, pool_mem, waiting_others, taken, placer, alone=alone)
     if grant is None:
         return None
     head = queue[0]
@@ -2007,14 +2101,17 @@ def rebalance_grants(
     for e in granted:
         taken.update(int(c) for c in (e.get("cpu_set") or []))
 
+    alone = len(granted) == 1
     updates: list[dict] = []
     for idx, e in enumerate(eligible):
         remaining = len(eligible) - idx
         demand = e.get("demand") or {}
+        cls_name = e.get("class") or demand.get("class")
+        is_wp = cls_name == "wp"
         cur_cpus = float(e.get("cpus") or 1)
         cur_mem = int(e.get("mem_mb") or 0)
         cur_cpuset = sorted(int(c) for c in (e.get("cpu_set") or []))
-        _lo, hi = _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus)
+        _lo, hi = _cpu_bounds(demand.get("min_cpus") or 1, demand.get("max_cpus"), pool_cpus, alone=(alone and is_wp))
         extra_share = int(math.floor(max(0.0, free_cpus) / remaining + 1e-9))
         if extra_share == 0 and free_cpus >= 1.0 - 1e-9:
             extra_share = 1
@@ -2234,6 +2331,7 @@ class Broker:
                 hist = self.history_fn(cls.name, key)
         floor = max(v for v in (mem_floor_mb or 0, hist or 0))
         demand = {
+            "class": cls.name,
             "min_cpus": cls.min_cpus,
             "max_cpus": cls.max_cpus,
             "mem_base_mb": cls.mem_base_mb,

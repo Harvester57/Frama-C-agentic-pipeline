@@ -377,3 +377,55 @@ def test_cli_aliases_for_checkpoint_and_run_metadata(tmp_path, monkeypatch):
     assert run_metadata.main(["finalize", "--status", "complete"]) == 0
     meta = run_metadata.json.loads((run_dir / "run-metadata.json").read_text(encoding="utf-8"))
     assert meta["run_status"] == "complete"
+
+
+def test_validate_agent_result_proof_gap():
+    prover_base = {
+        "role": "prover",
+        "agent_id": "prover-1",
+        "file": "src/a.c",
+        "function": "f",
+        "status": "stalled_after_k_retries",
+        "patch": None,
+        "evidence": [{"tool_output": "agents/prover-1/scratch/wp.json", "result": "wp_timeout"}],
+        "unproven_goals": ["rte: mem_access"],
+        "strengthening_requests": [],
+        "boundary_assumptions": [],
+        "fault_hypothesis": None,
+        "proof_gap": {
+            "predicate": "\\valid_read(p)",
+            "reason": "Missing callee contract lemma for buffer range",
+        },
+    }
+    # Valid proof_gap on stalled prover passes
+    assert list(validate_agent_result(prover_base)) == []
+
+    # proof_gap is forbidden when status is all_proven
+    all_proven = dict(prover_base, status="all_proven", unproven_goals=[], proof_gap={"predicate": "x", "reason": "y"})
+    errs = list(validate_agent_result(all_proven))
+    assert any("proof_gap" in e and "all_proven" in e for e in errs)
+
+    # Valid proof_gap on breaker passes
+    breaker_base = {
+        "role": "breaker",
+        "agent_id": "breaker-1",
+        "file": "src/a.c",
+        "function": "f",
+        "status": "clean",
+        "seeds": [],
+        "crash_artifact": None,
+        "failing_predicate": None,
+        "analysis": "No crash found within fuzz budget.",
+        "suggested_requires": None,
+        "fault_hypothesis": None,
+        "proof_gap": {
+            "predicate": "0 <= x",
+            "reason": "Invariant cannot be violated under current precondition",
+        },
+    }
+    assert list(validate_agent_result(breaker_base)) == []
+
+    # Invalid proof_gap (missing reason) fails schema validation
+    bad_gap = dict(prover_base, proof_gap={"predicate": "\\valid(p)"})
+    assert any("proof_gap" in e for e in validate_agent_result(bad_gap))
+

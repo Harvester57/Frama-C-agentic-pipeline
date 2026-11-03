@@ -83,7 +83,7 @@ The wrappers (`framac-docker.sh` / `framac-docker.ps1`) call `resources.py exec`
 
 1. **Leases resources** from the host pool:
    - Requests are served first in, first out. A later request can jump ahead only when that doesn't delay the head of the queue.
-   - Grants are elastic: `cpus = clamp(free // (1 + waiting), class min, min(class max, pool / 2))`.
+   - Grants are elastic: `cpus = clamp(free // (1 + waiting), class min, min(class max, pool / 2))`. When a single `wp` job is running or scheduled with no competitors, it can expand up to `min(class max, pool)` (up to 8 CPUs) to fully utilize available cores.
    - Memory comes from the class model or history. CPUs are lowered when memory doesn't fit.
    - `light` jobs are never queued.
    - Nothing is preempted. When the pool shrinks, new grants wait until enough is released.

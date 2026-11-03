@@ -346,6 +346,8 @@ def validate_agent_result(data) -> Errors:
                 errors.add("$.unproven_goals: must be empty when status is all_proven")
             if data["fault_hypothesis"] is not None:
                 errors.add("$.fault_hypothesis: must be null when status is all_proven")
+            if data.get("proof_gap") is not None:
+                errors.add("$.proof_gap: must be null when status is all_proven")
         elif not data["unproven_goals"]:
             errors.add("$.unproven_goals: required when the proof did not complete")
         for idx, ev in enumerate(data["evidence"]):

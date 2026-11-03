@@ -31,6 +31,15 @@
       "required": ["input_condition", "predicate", "why_not_reproduced"],
       "additionalProperties": false
     },
+    "proof_gap": {
+      "type": "object",
+      "properties": {
+        "predicate": {"$ref": "#/definitions/text"},
+        "reason": {"$ref": "#/definitions/text"}
+      },
+      "required": ["predicate", "reason"],
+      "additionalProperties": false
+    },
     "prover": {
       "type": "object",
       "properties": {
@@ -58,7 +67,8 @@
           }
         },
         "boundary_assumptions": {"type": "array", "items": {"$ref": "#/definitions/text"}},
-        "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]}
+        "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]},
+        "proof_gap": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/proof_gap"}]}
       },
       "required": ["role", "agent_id", "file", "function", "status", "patch", "evidence", "unproven_goals", "strengthening_requests", "boundary_assumptions", "fault_hypothesis"],
       "additionalProperties": false
@@ -76,7 +86,8 @@
         "failing_predicate": {"type": ["string", "null"]},
         "analysis": {"$ref": "#/definitions/text"},
         "suggested_requires": {"type": ["string", "null"]},
-        "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]}
+        "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]},
+        "proof_gap": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/proof_gap"}]}
       },
       "required": ["role", "agent_id", "file", "function", "status", "seeds", "crash_artifact", "failing_predicate", "analysis", "suggested_requires", "fault_hypothesis"],
       "additionalProperties": false

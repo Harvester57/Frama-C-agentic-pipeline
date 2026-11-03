@@ -109,15 +109,51 @@ def resources_summary() -> dict | None:
     Never fails init.
     """
     try:
-        from resources import probe
+        from resources import parse_mem, probe
 
         summary = probe(scope="container").summary()
     except Exception:
         return None
-    pool_cpus = (os.environ.get("FRAMAC_POOL_CPUS") or "").strip()
-    pool_mem = (os.environ.get("FRAMAC_POOL_MEM_MB") or "").strip()
-    if pool_cpus.isdigit() and pool_mem.isdigit() and int(pool_cpus) > 0 and int(pool_mem) > 0:
-        summary["pool"] = {"cpus": int(pool_cpus), "mem_mb": int(pool_mem), "source": "host broker"}
+
+    raw_cpus = (os.environ.get("FRAMAC_POOL_CPUS") or "").strip()
+    raw_mem = (os.environ.get("FRAMAC_POOL_MEM_MB") or os.environ.get("FRAMAC_POOL_MEMORY") or "").strip()
+
+    pool_cpus: int | None = None
+    if raw_cpus:
+        try:
+            val = float(raw_cpus)
+            if val > 0:
+                pool_cpus = int(round(val))
+        except ValueError:
+            pass
+
+    pool_mem = parse_mem(raw_mem) if raw_mem else None
+
+    if pool_cpus is not None and pool_mem is not None and pool_cpus > 0 and pool_mem > 0:
+        summary["pool"] = {"cpus": pool_cpus, "mem_mb": pool_mem, "source": "host broker"}
+    else:
+        try:
+            host_b = probe(scope="host").budget()
+            summary["pool"] = {
+                "cpus": pool_cpus if (pool_cpus and pool_cpus > 0) else host_b.cpus,
+                "mem_mb": pool_mem if (pool_mem and pool_mem > 0) else host_b.mem_mb,
+                "source": f"host probe ({host_b.source})",
+            }
+        except Exception:
+            try:
+                mach_b = probe(scope="machine").budget()
+                summary["pool"] = {
+                    "cpus": pool_cpus if (pool_cpus and pool_cpus > 0) else mach_b.cpus,
+                    "mem_mb": pool_mem if (pool_mem and pool_mem > 0) else mach_b.mem_mb,
+                    "source": f"machine probe ({mach_b.source})",
+                }
+            except Exception:
+                container_b = probe(scope="container").budget()
+                summary["pool"] = {
+                    "cpus": pool_cpus if (pool_cpus and pool_cpus > 0) else container_b.cpus,
+                    "mem_mb": pool_mem if (pool_mem and pool_mem > 0) else container_b.mem_mb,
+                    "source": f"container probe ({container_b.source})",
+                }
     return summary
 
 

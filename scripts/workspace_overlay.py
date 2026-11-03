@@ -517,9 +517,13 @@ def _run_parent_reverify(
     if module and sources:
         harness = overlay_dir / "harnesses" / f"harness_{module}.c"
         corpus = overlay_dir / "corpus" / module
-        build_tag = hashlib.sha256(json.dumps([list(sources), cppflags, ldflags]).encode()).hexdigest()[:10]
+        build_tag_items = [list(sources), cppflags, ldflags]
+        if function:
+            build_tag_items.append(function)
+        build_tag = hashlib.sha256(json.dumps(build_tag_items).encode()).hexdigest()[:10]
         safe_module = re.sub(r"[^A-Za-z0-9_.-]+", "_", module)
-        guard_bin = run_dir / "state" / "parent_guard" / f"{safe_module}-{build_tag}" / f"guard_{safe_module}"
+        bin_name = f"guard_{safe_module}_{function}" if function else f"guard_{safe_module}"
+        guard_bin = run_dir / "state" / "parent_guard" / f"{safe_module}-{build_tag}" / bin_name
         guard_scratch = run_dir / "agents" / agent_id / "scratch" / "parent_guard"
         guard_json = run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
         work_sources = [_resolve_overlay_source(run_dir, work_dir, s) for s in sources]
@@ -547,6 +551,8 @@ def _run_parent_reverify(
             "--out-json",
             str(guard_json),
         ]
+        if function:
+            cmd.extend(["--functions", function])
         if ldflags:
             cmd.append(f"--ldflags={ldflags}")
         proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -579,6 +585,10 @@ def _run_parent_reverify(
             f"--cppflags={cppflags}",
             "--wp-par",
             str(wp_par) if wp_par else "auto",
+            # Match the prover path and Frama-C's own default: unsigned *downcast* is
+            # C11 modulo narrowing, not undefined behavior, so its heuristic guard must
+            # not block a merge that the prover already discharged with this flag.
+            "--no-warn-unsigned-downcast",
             "--sarif",
             "--out-json",
             str(wp_json),

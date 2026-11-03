@@ -559,7 +559,11 @@ def _ticket(lid, cls="wp", seq=1, state="waiting", **kw):
 def test_plan_grant_elastic_cpus_memory_fit_and_clamps():
     me = _ticket("a")
     g1 = R.plan_grant(me, [me], 12, 32000)
-    assert g1 is not None and g1.cpus == 6  # min(max 8, pool // 2)
+    assert g1 is not None and g1.cpus == 8  # min(max 8, pool 12) when alone on idle pool
+    # Under competition from a running job, clamped to pool // 2:
+    competitor = _ticket("comp", cls="wp", state="granted", cpus=2.0, mem_mb=2768)
+    g1_busy = R.plan_grant(me, [me, competitor], 12, 32000)
+    assert g1_busy is not None and g1_busy.cpus == 6  # min(max 8, pool // 2)
     others = [_ticket("b", seq=2), _ticket("c", seq=3)]
     g2 = R.plan_grant(me, [me, *others], 12, 32000)
     assert g2 is not None and g2.cpus == 4  # free // (1 + waiting)
@@ -1261,7 +1265,9 @@ def test_run_metadata_records_resources_host_run_dir_and_podman(tmp_path, monkey
         meta["sandbox"]["outer"] == "podman-hardened" and meta["run_dir_host"] == "/home/u/framac-pipeline/demo/run-4"
     )
     assert (meta["resources"]["cpus"], meta["resources"]["mem_mb"]) == (2, 3072)
-    assert "pool" not in meta["resources"]  # no host broker
+    assert "pool" in meta["resources"]  # pool is always populated with probe fallback
+    assert meta["resources"]["pool"]["cpus"] >= 1
+    assert meta["resources"]["pool"]["mem_mb"] >= 256
     assert list(validate_metadata(meta)) == []
     meta["sandbox"]["outer"] = "lxc"
     assert list(validate_metadata(meta))
@@ -1435,22 +1441,22 @@ def test_grow_only_rebalancing_of_running_containers(tmp_path):
 
         applied = broker.rebalance(eng=R.EngineInfo(kind="docker"), runner=fake_runner)
         assert len(applied) == 1 and applied[0]["applied"] is True
-        assert applied[0]["cpus"] == 6.0 and applied[0]["mem_mb"] == 6768
+        assert applied[0]["cpus"] == 8.0 and applied[0]["mem_mb"] == 8768
         assert updates == [
             [
                 "docker",
                 "update",
                 "--cpus",
-                "6",
+                "8",
                 "--memory",
-                "6768m",
+                "8768m",
                 "--memory-swap",
-                "6768m",
+                "8768m",
                 "framac-111111111111",
             ]
         ]
         persisted = json.loads(entry_path.read_text(encoding="utf-8"))
-        assert persisted["cpus"] == 6.0 and persisted["mem_mb"] == 6768 and "rebalanced_at" in persisted
+        assert persisted["cpus"] == 8.0 and persisted["mem_mb"] == 8768 and "rebalanced_at" in persisted
     finally:
         broker.release(l1)
 
@@ -1513,3 +1519,59 @@ def test_exec_auto_downgrades_cache_mode_when_target_code_lease_is_active_on_run
         assert "shared cache mounted read-only: a target-code job is active on this run directory" in captured.err
     finally:
         broker.release(fuzz_lease)
+
+
+def test_resources_summary_pool_parsing_and_fallback(monkeypatch):
+    import run_metadata
+
+    # 1. Float string for CPUs and unit suffix for memory
+    monkeypatch.setenv("FRAMAC_POOL_CPUS", "12.0")
+    monkeypatch.setenv("FRAMAC_POOL_MEM_MB", "20480MB")
+    res = run_metadata.resources_summary()
+    assert res is not None
+    assert res["pool"] == {"cpus": 12, "mem_mb": 20480, "source": "host broker"}
+
+    # 2. String with 'g' unit
+    monkeypatch.setenv("FRAMAC_POOL_CPUS", "8")
+    monkeypatch.setenv("FRAMAC_POOL_MEM_MB", "16GB")
+    res2 = run_metadata.resources_summary()
+    assert res2 is not None
+    assert res2["pool"] == {"cpus": 8, "mem_mb": 16384, "source": "host broker"}
+
+    # 3. Missing env vars fall back to host/machine/container probe and still populate pool
+    monkeypatch.delenv("FRAMAC_POOL_CPUS", raising=False)
+    monkeypatch.delenv("FRAMAC_POOL_MEM_MB", raising=False)
+    monkeypatch.delenv("FRAMAC_POOL_MEMORY", raising=False)
+    res_fallback = run_metadata.resources_summary()
+    assert res_fallback is not None
+    assert "pool" in res_fallback
+    assert res_fallback["pool"]["cpus"] >= 1
+    assert res_fallback["pool"]["mem_mb"] >= 256
+    assert isinstance(res_fallback["pool"]["source"], str)
+
+
+def test_infer_class_shell_unwrapping_and_script_inspection(tmp_path, monkeypatch):
+    # Unwrapping bash -c, sh -c, and container_entry.sh
+    assert R.infer_class("bash -c \"python3 /opt/framac-pipeline/scripts/run_wp_function.py --file a.c\"") == "wp"
+    assert R.infer_class("sh -c 'run_eva_slice.py --sources a.c'") == "eva"
+    assert R.infer_class("container_entry.sh \"python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module m\"") == "fuzz"
+    assert R.infer_class("container_entry.sh bash -c \"python3 /opt/framac-pipeline/scripts/run_wp_function.py\"") == "wp"
+    assert R.infer_class('bash -c "echo \\"hello\\" && python3 run_wp_function.py"') == "wp"
+
+    # Shell script on disk
+    wp_script = tmp_path / "run_wp.sh"
+    wp_script.write_text("#!/bin/bash\npython3 /opt/framac-pipeline/scripts/run_wp_function.py --file f.c\n", encoding="utf-8")
+    assert R.infer_class(f"bash {wp_script}") == "wp"
+    assert R.infer_class(f"sh {wp_script}") == "wp"
+
+    fuzz_script = tmp_path / "run_fuzz.sh"
+    fuzz_script.write_text("#!/bin/bash\nexec python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module x\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert R.infer_class("./run_fuzz.sh") == "fuzz"
+    assert R.infer_class(str(fuzz_script)) == "fuzz"
+
+    # Script without tool command falls back to light
+    other_script = tmp_path / "other.sh"
+    other_script.write_text("#!/bin/bash\necho hello world\n", encoding="utf-8")
+    assert R.infer_class(f"bash {other_script}") == "light"
+

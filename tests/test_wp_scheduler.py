@@ -1129,3 +1129,106 @@ def test_negotiate_skips_callee_already_in_candidate_status_and_tracks_wall_budg
     )
     assert out.get("negotiations_created", []) == []
     assert out.get("negotiations_skipped", [{}])[0].get("reason") == "candidate"
+
+
+def test_is_done_requires_no_planned_or_in_progress_units(sim):
+    sim.build({"f": ("src/m/f.c", "m", [])})
+    S.cmd_init()
+    assert not S.cmd_status()["done"]
+
+    # Even if all tasks are marked done in schedule, an open ledger unit prevents completion
+    sched_path = sim.run_dir / "state/wp_schedule.json"
+    sched = load(sched_path)
+    for t in sched["tasks"].values():
+        t["state"] = "done"
+    write_json(sched_path, sched)
+
+    assert not S._is_done(sched)
+
+    # Once unit is covered, _is_done returns True
+    u_path = sim.run_dir / "coverage-ledger.json"
+    u_list = load(u_path)
+    u_list[0]["status"] = "covered"
+    u_list[0]["evidence"] = [{"phase": "wp", "producer": "p", "result": "proved", "discharging": True, "tool_output": None, "summary": "ok"}]
+    write_json(u_path, u_list)
+    assert S._is_done(sched)
+
+
+def test_architect_merge_retries_on_analysis_error(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {"header": "src/m/m.h"}})
+    S.cmd_init()
+    nxt = S.cmd_next("auto", prepare=True)
+    arch_task = [t for t in nxt["tasks"] if t["kind"] == "arch"][0]
+    aid = arch_task["agent_id"]
+    assert aid.startswith("arch-m")
+
+    call_count = [0]
+
+    def retry_then_succeed(run_dir, agent_id, role, **kw):
+        sim.arch_merges.append((agent_id, role, kw))
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return {"ok": False, "reason": "parent guardrail returned status='analysis_error'"}
+        return {"ok": True, "agent_id": agent_id, "modified_files": ["src/m/m.h"]}
+
+    monkeypatch.setattr(S.DEPS, "merge_agent_overlay", retry_then_succeed)
+    sim.architect(aid, "src/m/m.h")
+
+    out = S.cmd_complete(aid)
+    assert out["action"] == "merged"
+    assert call_count[0] == 2
+    t = tasks()["arch:m"]
+    assert t["state"] == "done" and t["outcome"] == "merged"
+    assert t.get("analysis_retries") == 1
+
+
+def test_architect_merge_exhausts_retries_on_persistent_analysis_error(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {"header": "src/m/m.h"}})
+    S.cmd_init()
+    nxt = S.cmd_next("auto", prepare=True)
+    arch_task = [t for t in nxt["tasks"] if t["kind"] == "arch"][0]
+    aid = arch_task["agent_id"]
+
+    call_count = [0]
+
+    def always_analysis_error(run_dir, agent_id, role, **kw):
+        sim.arch_merges.append((agent_id, role, kw))
+        call_count[0] += 1
+        return {"ok": False, "reason": "parent guardrail returned status='analysis_error'"}
+
+    monkeypatch.setattr(S.DEPS, "merge_agent_overlay", always_analysis_error)
+    sim.architect(aid, "src/m/m.h")
+
+    out = S.cmd_complete(aid)
+    assert out["action"] == "merge_failed"
+    assert call_count[0] == S.MAX_ANALYSIS_ERRORS
+    t = tasks()["arch:m"]
+    assert t["state"] == "done" and t["outcome"] == "merge_failed"
+    assert t.get("analysis_retries") == S.MAX_ANALYSIS_ERRORS - 1
+
+
+def test_architect_merge_does_not_retry_non_analysis_error(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {"header": "src/m/m.h"}})
+    S.cmd_init()
+    nxt = S.cmd_next("auto", prepare=True)
+    arch_task = [t for t in nxt["tasks"] if t["kind"] == "arch"][0]
+    aid = arch_task["agent_id"]
+
+    call_count = [0]
+
+    def syntax_error(run_dir, agent_id, role, **kw):
+        sim.arch_merges.append((agent_id, role, kw))
+        call_count[0] += 1
+        return {"ok": False, "reason": "parent guardrail returned status='rejected_overconstrained'"}
+
+    monkeypatch.setattr(S.DEPS, "merge_agent_overlay", syntax_error)
+    sim.architect(aid, "src/m/m.h")
+
+    out = S.cmd_complete(aid)
+    assert out["action"] == "merge_failed"
+    assert call_count[0] == 1  # No retry on contract rejection
+    t = tasks()["arch:m"]
+    assert t["state"] == "done" and t["outcome"] == "merge_failed"
+    assert not t.get("analysis_retries")
+
+

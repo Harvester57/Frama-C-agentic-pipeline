@@ -839,7 +839,11 @@ def _sync(state: dict, ctx: Ctx) -> dict:
             # A skip that no longer applies, or units this task never held becoming planned (a rejected
             # candidate, a unit added later): prove the function again. Units the task itself left
             # planned (no evidence to block them with) never reopen it.
-            fresh = set(planned_ids) - set(task.get("units") or [])
+            fresh = bool(set(planned_ids) - set(task.get("units") or [])) or any(
+                bool(u.get("attempts") and u["attempts"][-1].get("phase") == "verifier")
+                for u in fn_units
+                if u["coverage_id"] in planned_ids
+            )
             reopenable = task["state"] == "skipped" and task.get("outcome") in REOPENABLE_SKIPS
             merged_units = sorted(set(task.get("units") or []) | set(planned_ids))
             if (reopenable or fresh) and _skip_verdict(
@@ -1671,8 +1675,20 @@ def _prepare_failed(state: dict, task: dict, error: str) -> None:
         _reopen(state, task, f"prepare-agent failed: {error}")
 
 
-def _is_done(state: dict) -> bool:
-    return not state.get("rechecks") and all(t["state"] in TERMINAL for t in state["tasks"].values())
+def _is_done(state: dict, ctx: Ctx | None = None) -> bool:
+    if state.get("rechecks"):
+        return False
+    if not all(t["state"] in TERMINAL for t in state["tasks"].values()):
+        return False
+    if ctx is not None:
+        units: list[dict] = list(ctx.units.values())
+    else:
+        try:
+            raw_units, _ = ledger.load_state()
+            units = list(raw_units.values())
+        except Exception:
+            units = []
+    return not any(u.get("status") in ("planned", "in_progress") for u in units)
 
 
 def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None = None) -> dict:
@@ -1741,7 +1757,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
         if not prepare:
             out["tasks"] = [_describe(snapshot[tid], ctx) for tid in picked]
             out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
-            out["done"] = _is_done(state)
+            out["done"] = _is_done(state, ctx)
             return out
 
     # Scratch overlays are snapshotted under the `merge` lock: never while holding the ledger lock.
@@ -1838,7 +1854,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             if task["brief_file"]:
                 out["briefs"].append(task["brief_file"])
         out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
-        out["done"] = _is_done(state)
+        out["done"] = _is_done(state, ctx)
         save_schedule(state)
     return out
 
@@ -2177,6 +2193,26 @@ def _complete_architect(state: dict, task: dict, aid: str, res: dict, out: dict)
     }
 
 
+def _is_architect_analysis_error(merged: dict, task: dict, aid: str) -> bool:
+    if merged.get("analysis_error") or merged.get("status") == "analysis_error":
+        return True
+    reason = str(merged.get("reason") or "").lower()
+    if any(
+        k in reason
+        for k in ("analysis_error", "timed out", "timeout", "oom", "memory limit", "killed", "sandbox_unavailable", "rc=-9", "rc=137")
+    ):
+        return True
+    mod = task.get("module") or ""
+    rep_path = Path("agents") / aid / "scratch" / f"parent_guard_{mod}.json"
+    if rep_path.is_file():
+        rep = load_json_optional(rep_path, {}) or {}
+        if rep.get("status") in ("analysis_error", "sandbox_unavailable") or rep.get("timed_out"):
+            return True
+        if "analysis_error" in str(rep.get("reason") or "").lower():
+            return True
+    return False
+
+
 def _merge_architect(job: dict) -> dict:
     side = load_json_optional(HARNESS_DIR / f"harness_{job['module']}.json", {}) or {}
     try:
@@ -2285,24 +2321,51 @@ def cmd_complete(agent_id: str) -> dict:
     if merge_job is None:
         return out
 
-    merged = _merge_architect(merge_job)
-    with run_lock("ledger"):
-        state = load_schedule()
-        task = state["tasks"].get(merge_job["task"])
-        if task is None or task["state"] != "merging" or (task.get("merge") or {}).get("agent_id") != agent_id:
-            out["errors"].append("the architect task changed while it was being merged")
-        elif merged.get("ok"):
-            _finish(state, task, "done", "merged")
-            out.update(action="merged", modified_files=merged.get("modified_files") or [])
-            if merged.get("modified_files"):
-                out["rechecks_queued"] = _queue_rechecks_for_module(
-                    state, Ctx(), task["module"], f"architect {agent_id} changed module contracts"
-                )
-        else:
-            _finish(state, task, "done", "merge_failed", reason=merged.get("reason"))
-            out.update(action="merge_failed", reason=merged.get("reason"))
-        out["sync"] = _sync(state, Ctx())
-        save_schedule(state)
+    while merge_job is not None:
+        merged = _merge_architect(merge_job)
+        retry_needed = False
+        with run_lock("ledger"):
+            state = load_schedule()
+            task = state["tasks"].get(merge_job["task"])
+            if task is None or task["state"] not in ("merging", "merge_queued") or (task.get("merge") or {}).get("agent_id") != agent_id:
+                out["errors"].append("the architect task changed while it was being merged")
+                break
+            if merged.get("ok"):
+                _finish(state, task, "done", "merged")
+                out.update(action="merged", modified_files=merged.get("modified_files") or [])
+                if merged.get("modified_files"):
+                    out["rechecks_queued"] = _queue_rechecks_for_module(
+                        state, Ctx(), task["module"], f"architect {agent_id} changed module contracts"
+                    )
+                out["sync"] = _sync(state, Ctx())
+                save_schedule(state)
+                break
+
+            retries = int(task.get("analysis_retries") or (task.get("merge") or {}).get("analysis_retries") or 0)
+            if _is_architect_analysis_error(merged, task, agent_id) and retries < MAX_ANALYSIS_ERRORS - 1:
+                task["analysis_retries"] = retries + 1
+                if task.get("merge"):
+                    task["merge"]["analysis_retries"] = task["analysis_retries"]
+                task["state"] = "merge_queued"
+                out["action"] = "retry_merge"
+                save_schedule(state)
+                retry_needed = True
+
+            if not retry_needed:
+                _finish(state, task, "done", "merge_failed", reason=merged.get("reason"))
+                out.update(action="merge_failed", reason=merged.get("reason"))
+                out["sync"] = _sync(state, Ctx())
+                save_schedule(state)
+                break
+
+        if retry_needed:
+            with run_lock("ledger"):
+                state = load_schedule()
+                task = state["tasks"].get(merge_job["task"])
+                if task:
+                    task["state"] = "merging"
+                    save_schedule(state)
+            continue
     return out
 
 
@@ -2697,7 +2760,8 @@ def cmd_status() -> dict:
     """Counts by state, ready and running tasks, the merge queue, gates and the remaining critical path."""
     with run_lock("ledger"):
         state = load_schedule()
-        _sync(state, Ctx())  # in memory only: what `next` would see
+        ctx = Ctx()
+        _sync(state, ctx)  # in memory only: what `next` would see
     mode = scheduler_mode()
     tasks = state["tasks"]
     now = DEPS.now()
@@ -2736,7 +2800,7 @@ def cmd_status() -> dict:
         waiting_on = sorted(b for b in _gate_blockers(state, mod, view.index) if tasks[b]["state"] not in TERMINAL)
         gates[gate_id] = {"open": not waiting_on, "waiting_on": waiting_on}
     _, critical = _chain_heights(state, open_only=True)
-    done = _is_done(state)
+    done = _is_done(state, ctx)
     out = {
         "ok": True,
         "mode": mode,

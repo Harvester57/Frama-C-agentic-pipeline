@@ -1441,3 +1441,128 @@ class TestHarnessLegitimacyAndMetadata:
         assert res_retry["bitwise_retry"]["triggered"] is True
         assert res_retry["bitwise_retry"]["wp_model"] == "Typed+ref+int"
         assert res_retry["bitwise_retry"]["timeout"] == 30
+
+    def test_ingest_verifier_disproved_by_source_parks_to_blocked(self, run_dir: Path) -> None:
+        """
+        When a verifier rejects a candidate with disproved_by_source, the linked unit
+        parks to 'blocked' with rejection reason instead of returning to 'planned'.
+        """
+        write_json(run_dir / "run-metadata.json", metadata("in_progress"))
+        notes_scratch = run_dir / "agents" / "verifier-4" / "scratch" / "notes.txt"
+        notes_scratch.parent.mkdir(parents=True)
+        notes_scratch.write_text("Source inspect proves loop counter cannot exceed buffer bound.", encoding="utf-8")
+
+        u_tag = unit(
+            "src/snmp/ber.c",
+            "ber_decode_tag",
+            "rte",
+            status="candidate",
+            evidence=[
+                {
+                    "phase": "fuzz",
+                    "producer": "run_eacsl_fuzz.py",
+                    "result": "fuzz_failure",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/fuzz/snmp.json",
+                    "summary": "E-ACSL failure",
+                }
+            ],
+            result_fingerprints=[FP_REJ],
+        )
+        write_json(run_dir / "coverage-ledger.json", [u_tag])
+        write_json(run_dir / "workspace/reports/fuzz/snmp.json", {"status": "eacsl_violation"})
+        write_json(
+            run_dir / "candidates.json",
+            [
+                {
+                    "fingerprint": FP_REJ,
+                    "status": "unverified",
+                    "origin": "fuzz",
+                    "proposed_verdict": "confirmed",
+                    "module": "snmp",
+                    "location": {"file": "src/snmp/ber.c", "line": 12, "function": "ber_decode_tag"},
+                    "property": {"kind": "mem_access", "predicate": r"\valid_read(p)"},
+                    "reproducers": [],
+                    "tool_outputs": ["workspace/reports/fuzz/snmp.json"],
+                    "linked_units": ["src/snmp/ber.c#ber_decode_tag::rte"],
+                    "first_seen": "2026-10-29T00:00:00+00:00",
+                }
+            ],
+        )
+
+        rej = rejected_record(FP_REJ)
+        rej["rejection_class"] = "disproved_by_source"
+        rej["reason"] = "Loop counter bound guarantees safety."
+        rej["evidence"] = [
+            {"phase": "verifier", "tool_output": "agents/verifier-4/scratch/notes.txt", "description": "Manual proof in source."}
+        ]
+        res_path = run_dir / "agents" / "verifier-4" / "scratch" / "res.json"
+        write_json(
+            res_path,
+            {
+                "role": "crash_verifier",
+                "agent_id": "verifier-4",
+                "candidate_fingerprint": FP_REJ,
+                "decision": "rejected",
+                "refingerprint_reason": None,
+                "record": rej,
+            },
+        )
+
+        ledger.cmd_ingest_verifier(res_path)
+        units = json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))
+        assert units[0]["status"] == "blocked"
+        assert units[0]["result_fingerprints"] == []
+        assert any("candidate_rejected (disproved_by_source)" in u for u in units[0]["unresolved"])
+        assert validate_run_dir(run_dir) == []
+
+    def test_ingest_agent_hypothesis_proof_gap_does_not_promote_candidate(self, run_dir: Path) -> None:
+        """
+        Proof gap in agent result records evidence and unresolved note on linked unit,
+        sets unit status to blocked, and does NOT add a candidate to candidates.json.
+        """
+        write_json(run_dir / "run-metadata.json", metadata("in_progress"))
+        u_init = unit("src/snmp/ber.c", "ber_decode_len", "rte", status="planned", evidence=[])
+        write_json(run_dir / "coverage-ledger.json", [u_init])
+        write_json(run_dir / "candidates.json", [])
+
+        prover_scratch = run_dir / "agents" / "prover-gap" / "scratch"
+        prover_scratch.mkdir(parents=True)
+        wp_report = prover_scratch / "wp.json"
+        wp_report.write_text("{}", encoding="utf-8")
+
+        res_path = prover_scratch / "result.json"
+        write_json(
+            res_path,
+            {
+                "role": "prover",
+                "agent_id": "prover-gap",
+                "file": "src/snmp/ber.c",
+                "function": "ber_decode_len",
+                "status": "stalled_after_k_retries",
+                "patch": None,
+                "evidence": [{"tool_output": "agents/prover-gap/scratch/wp.json", "result": "wp_timeout"}],
+                "unproven_goals": ["rte: mem_access"],
+                "strengthening_requests": [],
+                "boundary_assumptions": [],
+                "fault_hypothesis": None,
+                "proof_gap": {
+                    "predicate": "\\valid_read(buf + off)",
+                    "reason": "Missing callee contract lemma for multi-byte buffer framing",
+                },
+            },
+        )
+
+        out = ledger.cmd_ingest_agent_hypothesis(res_path, module="snmp")
+        assert out["candidates_added"] == 0
+        assert out["proof_gaps_recorded"] == 1
+
+        cands = json.loads((run_dir / "candidates.json").read_text(encoding="utf-8"))
+        assert len(cands) == 0  # No non-defect candidate created!
+
+        units = json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))
+        assert units[0]["status"] == "blocked"
+        assert units[0]["result_fingerprints"] == []
+        assert any(e["result"] == "proof_gap" for e in units[0]["evidence"])
+        assert any("proof_gap: \\valid_read" in u for u in units[0]["unresolved"])
+        assert validate_run_dir(run_dir) == []
