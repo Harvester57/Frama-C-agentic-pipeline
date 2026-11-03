@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import pytest
 
@@ -7,7 +8,7 @@ from conftest import write_json
 from fingerprint import make_fingerprint
 from validate_artifacts import validate_candidates, validate_ledger
 
-DAG = {
+DAG: dict[str, Any] = {
     "callgraph_source": "regex",
     "modules": {
         "snmp": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"},

@@ -963,9 +963,7 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: list[Path]) -> dict[str
     makefile_defines: list[str] = []
 
     for root, dirs, files in os.walk(target_dir):
-        dirs[:] = [
-            d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}
-        ]
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}]
         root_path = Path(root).resolve()
         for f in sorted(files):
             fp = root_path / f
@@ -1115,11 +1113,7 @@ def build_dag(
 
     if not c_files:
         for root, dirs, files in os.walk(target_dir):
-            dirs[:] = [
-                d
-                for d in dirs
-                if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}
-            ]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}]
             for f in sorted(files):
                 if f.endswith(".c"):
                     c_files.append((Path(root) / f).resolve())
@@ -1177,8 +1171,7 @@ def build_dag(
                         call_edges[existing_key] = call_edges.pop(fn_name)
                     fn_key = f"{rel_path}#{fn_name}"
                 elif any(
-                    k == f"{rel_path}#{fn_name}"
-                    or (k.endswith(f"#{fn_name}") and functions[k].get("name") == fn_name)
+                    k == f"{rel_path}#{fn_name}" or (k.endswith(f"#{fn_name}") and functions[k].get("name") == fn_name)
                     for k in functions
                 ):
                     existing_files = [functions[k]["file"] for k in functions if functions[k].get("name") == fn_name]

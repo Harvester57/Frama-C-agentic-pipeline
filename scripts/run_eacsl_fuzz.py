@@ -1134,8 +1134,7 @@ def run_fuzz_campaign(
                             f.seek(sz - MAX_WORKER_LOG_BYTES)
                             tail_bytes = f.read(MAX_WORKER_LOG_BYTES)
                         worker_logs.append(
-                            "... [truncated earlier worker log] ...\n"
-                            + tail_bytes.decode("utf-8", errors="replace")
+                            "... [truncated earlier worker log] ...\n" + tail_bytes.decode("utf-8", errors="replace")
                         )
                 except OSError:
                     pass
@@ -1213,7 +1212,10 @@ def run_fuzz_campaign(
                 entry["failure"] = failure
                 if failure:
                     entry["fingerprint"] = make_fingerprint(
-                        failure["file"], failure["function"], failure["alarm_kind"] or failure["kind"], failure["predicate"]
+                        failure["file"],
+                        failure["function"],
+                        failure["alarm_kind"] or failure["kind"],
+                        failure["predicate"],
                     )
             artifacts.append(entry)
 
@@ -1470,9 +1472,7 @@ def run_guardrail_check(
                     return cached
 
     corpus_files = [
-        p
-        for p in sorted(corpus_dir.iterdir())
-        if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
+        p for p in sorted(corpus_dir.iterdir()) if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
     ]
     replay_dir = corpus_dir
     if max_corpus_inputs is not None and max_corpus_inputs > 0 and len(corpus_files) > max_corpus_inputs:

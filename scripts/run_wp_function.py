@@ -393,7 +393,6 @@ _VARIADIC_CALLEE_RE = re.compile(
 )
 
 
-
 def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
     """
     Generate concise, actionable diagnostic hints for ACSL syntax errors, WP soundness
@@ -689,7 +688,10 @@ def _check_internal_variadic(
                         fn_data = v
                         break
         if fn_data and "internal_variadic" in fn_data.get("wp_blockers", []):
-            return True, f"Target function '{fn_name}' in '{c_file}' is marked with wp_blocker 'internal_variadic' in callgraph DAG"
+            return (
+                True,
+                f"Target function '{fn_name}' in '{c_file}' is marked with wp_blocker 'internal_variadic' in callgraph DAG",
+            )
 
     if c_file.is_file():
         try:

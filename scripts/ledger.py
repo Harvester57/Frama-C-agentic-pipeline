@@ -1391,7 +1391,6 @@ def cmd_ingest_verifier(
                                 f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
                             ]
 
-
         if fp in findings:
             _merge_finding_record(findings[fp], rec)
         else:

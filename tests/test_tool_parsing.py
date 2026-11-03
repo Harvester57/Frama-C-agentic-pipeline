@@ -192,10 +192,7 @@ def test_guardrail_classifies_unsound_verdicts():
     assert res_unsound3["status"] == "guardrail_error" and res_unsound3["unsound"] is True
 
     # When returncode != 0, unsound verdict warning must NOT be reported as code_fault or rejected_overconstrained
-    fail_unsound = (
-        "Warning: no sound verdict for Assertion (guess: FAIL).\n"
-        + ANNOTATION
-    )
+    fail_unsound = "Warning: no sound verdict for Assertion (guess: FAIL).\n" + ANNOTATION
     res_fail = classify_guardrail(1, False, fail_unsound)
     assert res_fail["status"] == "guardrail_error"
     assert res_fail["unsound"] is True

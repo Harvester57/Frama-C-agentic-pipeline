@@ -1,4 +1,5 @@
 import hashlib
+from typing import Any
 
 from conftest import (
     FP_EVA,
@@ -406,7 +407,7 @@ def test_validate_agent_result_proof_gap():
     assert any("proof_gap" in e and "all_proven" in e for e in errs)
 
     # Valid proof_gap on breaker passes
-    breaker_base = {
+    breaker_base: dict[str, Any] = {
         "role": "breaker",
         "agent_id": "breaker-1",
         "file": "src/a.c",
@@ -428,4 +429,3 @@ def test_validate_agent_result_proof_gap():
     # Invalid proof_gap (missing reason) fails schema validation
     bad_gap = dict(prover_base, proof_gap={"predicate": "\\valid(p)"})
     assert any("proof_gap" in e for e in validate_agent_result(bad_gap))
-

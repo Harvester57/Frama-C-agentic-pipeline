@@ -755,6 +755,7 @@ def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
         "--cppflags=-I. -Iworkspace/work/src/snmp -DDEBUG=2",  # as the parent re-check proved it
         "--cache-dir",
         "off",
+        "--no-warn-unsigned-downcast",
         "--sarif",
         "--out-dir",
         "workspace/reports/wp-sweep/work/src_snmp_ber.c",

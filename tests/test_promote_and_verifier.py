@@ -1494,7 +1494,11 @@ class TestHarnessLegitimacyAndMetadata:
         rej["rejection_class"] = "disproved_by_source"
         rej["reason"] = "Loop counter bound guarantees safety."
         rej["evidence"] = [
-            {"phase": "verifier", "tool_output": "agents/verifier-4/scratch/notes.txt", "description": "Manual proof in source."}
+            {
+                "phase": "verifier",
+                "tool_output": "agents/verifier-4/scratch/notes.txt",
+                "description": "Manual proof in source.",
+            }
         ]
         res_path = run_dir / "agents" / "verifier-4" / "scratch" / "res.json"
         write_json(

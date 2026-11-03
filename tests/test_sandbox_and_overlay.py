@@ -375,7 +375,7 @@ def test_bounded_stream_drainer_huge_output_bounds_memory_and_keeps_tail():
     assert drained.endswith(full_data[-tail_limit:])
     assert b"output truncated" in drained
     # OUTPUT_TAIL_BYTES (8000) semantics preserved
-    assert drained[-S.OUTPUT_TAIL_BYTES:] == full_data[-S.OUTPUT_TAIL_BYTES:]
+    assert drained[-S.OUTPUT_TAIL_BYTES :] == full_data[-S.OUTPUT_TAIL_BYTES :]
 
 
 def test_bounded_stream_drainer_thread_no_deadlock():
@@ -421,7 +421,9 @@ def test_fuzz_campaign_scratch_dir_in_tmp_and_cleaned_up(tmp_path, monkeypatch):
         # Write worker logs, one small and one very large (> 1MB)
         (scratch_dir / "fuzz-0.log").write_text("worker 0 started\nTest unit written to ./artifacts/crash-1\n")
         large_log = scratch_dir / "fuzz-1.log"
-        large_log.write_bytes(b"LOG_HEAD\n" + (b"fuzz worker status pulse line\n" * 45000) + b"Test unit written to ./artifacts/crash-2\n")
+        large_log.write_bytes(
+            b"LOG_HEAD\n" + (b"fuzz worker status pulse line\n" * 45000) + b"Test unit written to ./artifacts/crash-2\n"
+        )
         return S.SandboxResult(0, "fuzz output", "", False, "rlimits", list(cmd))
 
     monkeypatch.setattr(R, "run_sandboxed", fake_run)

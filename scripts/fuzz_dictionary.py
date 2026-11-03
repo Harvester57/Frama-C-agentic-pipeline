@@ -191,8 +191,7 @@ def collect_source_files(paths: list[Path | str]) -> list[Path]:
                 dirs[:] = [
                     d
                     for d in dirs
-                    if not d.startswith(".")
-                    and d not in {"build", "CMakeFiles", "__pycache__", "node_modules"}
+                    if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__", "node_modules"}
                 ]
                 for fn in sorted(filenames):
                     if fn.endswith((".c", ".h", ".cpp", ".cc", ".cxx")):

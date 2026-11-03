@@ -168,16 +168,12 @@ class BoundedStreamDrainer:
             return b"".join(self.tail_chunks)
         tail_bytes = b"".join(self.tail_chunks)
         if len(tail_bytes) > self.tail_limit:
-            tail_bytes = tail_bytes[-self.tail_limit:]
+            tail_bytes = tail_bytes[-self.tail_limit :]
         if self.total_bytes <= len(self.head) + len(tail_bytes):
             overlap = len(self.head) + len(tail_bytes) - self.total_bytes
             return bytes(self.head) + tail_bytes[overlap:]
         omitted = self.total_bytes - len(self.head) - len(tail_bytes)
-        marker = (
-            b"\n... [output truncated: "
-            + str(omitted).encode("ascii")
-            + b" bytes omitted] ...\n"
-        )
+        marker = b"\n... [output truncated: " + str(omitted).encode("ascii") + b" bytes omitted] ...\n"
         return bytes(self.head) + marker + tail_bytes
 
 

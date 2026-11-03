@@ -219,9 +219,7 @@ def render_report(data: dict) -> str:
     blocked = [u for u in ledger if u["status"] == "blocked"]
 
     wp_units = [
-        u
-        for u in covered
-        if any(e.get("phase") == "wp" and e.get("discharging", True) for e in u.get("evidence", []))
+        u for u in covered if any(e.get("phase") == "wp" and e.get("discharging", True) for e in u.get("evidence", []))
     ]
     eva_units = [
         u

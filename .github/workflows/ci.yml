@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Default to zero permissions at the workflow level; each job grants only what it requires.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint-and-typecheck:
+    name: Lint, Format & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install lint and typecheck tools
+        run: |
+          python -m pip install --upgrade "ruff==0.9.9" "mypy==1.15.0" "pytest>=8.0,<10.0"
+
+      - name: Run Ruff linter
+        run: python -m ruff check scripts tests
+
+      - name: Run Ruff formatter check
+        run: python -m ruff format --check scripts tests
+
+      - name: Run Mypy typechecker
+        run: python -m mypy scripts tests
+
+      - name: Verify reference manuals and skill mirrors
+        run: python scripts/extract_references.py --check
+
+      - name: Check POSIX shell script syntax
+        run: bash -n wrappers/framac-docker.sh scripts/container_entry.sh
+
+  test:
+    name: Pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.10"
+          - "3.12"
+          - "3.13"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: python -m pip install --upgrade "pytest>=8.0,<10.0"
+
+      - name: Run test suite
+        run: python -m pytest tests
+
+  wrapper-smoke:
+    name: Wrapper CLI Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify POSIX wrapper argument validation (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ./wrappers/framac-docker.sh --no-inner-sandbox -- true 2>/dev/null; then
+            echo "Expected --no-inner-sandbox to fail with exit code 2" >&2
+            exit 1
+          fi
+          if ./wrappers/framac-docker.sh --unknown-option -- true 2>/dev/null; then
+            echo "Expected --unknown-option to fail with exit code 2" >&2
+            exit 1
+          fi
+
+      - name: Verify PowerShell wrapper argument validation (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & ".\wrappers\framac-docker.ps1" -NoInnerSandbox "true" 2>$null
+          if ($LASTEXITCODE -ne 2) {
+            throw "Expected -NoInnerSandbox to exit with code 2, got $LASTEXITCODE"
+          }
+          & ".\wrappers\framac-docker.ps1" -UnknownFlag "true" 2>$null
+          if ($LASTEXITCODE -ne 2) {
+            throw "Expected -UnknownFlag to exit with code 2, got $LASTEXITCODE"
+          }
+          $global:LASTEXITCODE = 0
+
+  container-canary:
+    name: Container Build & E-ACSL Canary Selftest
+    needs:
+      - lint-and-typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build hardened framac-pipeline container image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: framac-pipeline:latest
+          cache-from: type=gha
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
+
+      - name: Run sandbox probe and E-ACSL canary selftest in hardened container
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./wrappers/framac-docker.sh \
+            --target templates/eacsl_canary \
+            --new-run \
+            -- "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"

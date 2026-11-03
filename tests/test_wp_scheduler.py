@@ -1149,7 +1149,9 @@ def test_is_done_requires_no_planned_or_in_progress_units(sim):
     u_path = sim.run_dir / "coverage-ledger.json"
     u_list = load(u_path)
     u_list[0]["status"] = "covered"
-    u_list[0]["evidence"] = [{"phase": "wp", "producer": "p", "result": "proved", "discharging": True, "tool_output": None, "summary": "ok"}]
+    u_list[0]["evidence"] = [
+        {"phase": "wp", "producer": "p", "result": "proved", "discharging": True, "tool_output": None, "summary": "ok"}
+    ]
     write_json(u_path, u_list)
     assert S._is_done(sched)
 
@@ -1230,5 +1232,3 @@ def test_architect_merge_does_not_retry_non_analysis_error(sim, monkeypatch):
     t = tasks()["arch:m"]
     assert t["state"] == "done" and t["outcome"] == "merge_failed"
     assert not t.get("analysis_retries")
-
-

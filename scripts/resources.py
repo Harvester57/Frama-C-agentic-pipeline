@@ -1411,9 +1411,7 @@ def pool_budget() -> Budget:
     return Budget(cpus=cpus or own.cpus, mem_mb=mem or own.mem_mb, source=f"pool-from-{own.source}")
 
 
-def _cpu_bounds(
-    min_cpus: int, max_cpus: int | None, pool_cpus: float, alone: bool = False
-) -> tuple[int, int]:
+def _cpu_bounds(min_cpus: int, max_cpus: int | None, pool_cpus: float, alone: bool = False) -> tuple[int, int]:
     """(lo, hi) CPUs for one grant: hi = min(max or pool, pool if alone else max(min, pool // 2)); both clamped to the pool."""
     pool_i = max(1, int(math.floor(pool_cpus + 1e-9)))
     lo = max(1, min(int(min_cpus), pool_i))
@@ -1577,14 +1575,19 @@ def _extract_script_paths(cmd: str) -> list[Path]:
         for idx, tok in enumerate(tokens):
             clean_tok = tok.strip("\"'")
             if clean_tok in ("bash", "sh", "/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/bin/sh"):
-                for next_tok in tokens[idx + 1:]:
+                for next_tok in tokens[idx + 1 :]:
                     if not next_tok.startswith("-"):
                         cand = next_tok.strip("\"'")
                         if cand not in seen:
                             seen.add(cand)
                             paths.append(Path(cand))
                         break
-            elif clean_tok.endswith(".sh") or clean_tok.startswith("./") or clean_tok.startswith("/") or "\\" in clean_tok:
+            elif (
+                clean_tok.endswith(".sh")
+                or clean_tok.startswith("./")
+                or clean_tok.startswith("/")
+                or "\\" in clean_tok
+            ):
                 if clean_tok not in seen:
                     seen.add(clean_tok)
                     paths.append(Path(clean_tok))

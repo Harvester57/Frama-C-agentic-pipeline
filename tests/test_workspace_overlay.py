@@ -19,7 +19,9 @@ def test_parent_reverify_scoped_by_function_and_unique_binary(tmp_path, monkeypa
     harnesses_dir = overlay_dir / "harnesses"
     harnesses_dir.mkdir(parents=True)
     (harnesses_dir / "harness_parser.c").write_text("int main() { return 0; }\n", encoding="utf-8")
-    (work_dir / "parser.c").write_text("int parse_magic() { return 1; }\nint parse_body() { return 2; }\n", encoding="utf-8")
+    (work_dir / "parser.c").write_text(
+        "int parse_magic() { return 1; }\nint parse_body() { return 2; }\n", encoding="utf-8"
+    )
 
     captured_cmds: list[list[str]] = []
 

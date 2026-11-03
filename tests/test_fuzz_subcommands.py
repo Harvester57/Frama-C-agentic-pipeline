@@ -648,4 +648,3 @@ def test_guardrail_cli_max_corpus_inputs(tmp_path, monkeypatch):
     )
     assert rc == 0
     assert seen_max_corpus.get("max_corpus_inputs") == 32
-

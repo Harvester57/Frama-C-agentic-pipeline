@@ -364,4 +364,3 @@ def test_wp_hints_for_unframed_variadic_callees() -> None:
     }
     hints3 = derive_wp_diagnostic_hints(res3)
     assert any("unframed variadic callees (minmea_scan)" in h for h in hints3)
-

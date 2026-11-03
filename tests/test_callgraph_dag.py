@@ -532,7 +532,7 @@ int fixed_message(int level, const char *msg) {
         # Existing fuzz harness file in same module
         (lib_dir / "fuzz_target.c").write_text(
             '#include "codec.h"\n#include <stdint.h>\n#include <stddef.h>\n'
-            'int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return codec_decode((const char *)data); }\n',
+            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return codec_decode((const char *)data); }\n",
             encoding="utf-8",
         )
 
@@ -562,4 +562,3 @@ int fixed_message(int level, const char *msg) {
         assert "src/codec/main.c" not in service_mod["required_sources"]
         assert "src/codec/fuzz_target.c" not in service_mod["required_sources"]
         assert service_mod["cross_module_callees"] == ["codec_decode"]
-

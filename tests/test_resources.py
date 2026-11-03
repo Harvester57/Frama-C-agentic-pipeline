@@ -1552,20 +1552,28 @@ def test_resources_summary_pool_parsing_and_fallback(monkeypatch):
 
 def test_infer_class_shell_unwrapping_and_script_inspection(tmp_path, monkeypatch):
     # Unwrapping bash -c, sh -c, and container_entry.sh
-    assert R.infer_class("bash -c \"python3 /opt/framac-pipeline/scripts/run_wp_function.py --file a.c\"") == "wp"
+    assert R.infer_class('bash -c "python3 /opt/framac-pipeline/scripts/run_wp_function.py --file a.c"') == "wp"
     assert R.infer_class("sh -c 'run_eva_slice.py --sources a.c'") == "eva"
-    assert R.infer_class("container_entry.sh \"python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module m\"") == "fuzz"
-    assert R.infer_class("container_entry.sh bash -c \"python3 /opt/framac-pipeline/scripts/run_wp_function.py\"") == "wp"
+    assert (
+        R.infer_class('container_entry.sh "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module m"')
+        == "fuzz"
+    )
+    assert R.infer_class('container_entry.sh bash -c "python3 /opt/framac-pipeline/scripts/run_wp_function.py"') == "wp"
     assert R.infer_class('bash -c "echo \\"hello\\" && python3 run_wp_function.py"') == "wp"
 
     # Shell script on disk
     wp_script = tmp_path / "run_wp.sh"
-    wp_script.write_text("#!/bin/bash\npython3 /opt/framac-pipeline/scripts/run_wp_function.py --file f.c\n", encoding="utf-8")
+    wp_script.write_text(
+        "#!/bin/bash\npython3 /opt/framac-pipeline/scripts/run_wp_function.py --file f.c\n", encoding="utf-8"
+    )
     assert R.infer_class(f"bash {wp_script}") == "wp"
     assert R.infer_class(f"sh {wp_script}") == "wp"
 
     fuzz_script = tmp_path / "run_fuzz.sh"
-    fuzz_script.write_text("#!/bin/bash\nexec python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module x\n", encoding="utf-8")
+    fuzz_script.write_text(
+        "#!/bin/bash\nexec python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module x\n",
+        encoding="utf-8",
+    )
     monkeypatch.chdir(tmp_path)
     assert R.infer_class("./run_fuzz.sh") == "fuzz"
     assert R.infer_class(str(fuzz_script)) == "fuzz"
@@ -1574,4 +1582,3 @@ def test_infer_class_shell_unwrapping_and_script_inspection(tmp_path, monkeypatc
     other_script = tmp_path / "other.sh"
     other_script.write_text("#!/bin/bash\necho hello world\n", encoding="utf-8")
     assert R.infer_class(f"bash {other_script}") == "light"
-

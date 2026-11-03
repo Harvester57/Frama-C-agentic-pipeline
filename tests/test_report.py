@@ -310,4 +310,3 @@ def test_reporting_semantics_wp_vs_eva_and_sarif_levels(tmp_path):
     assert levels_by_sev["medium"] == "warning"
     assert levels_by_sev["low"] == "note"
     assert levels_by_sev["needs_validation"] == "warning"
-

@@ -2199,7 +2199,17 @@ def _is_architect_analysis_error(merged: dict, task: dict, aid: str) -> bool:
     reason = str(merged.get("reason") or "").lower()
     if any(
         k in reason
-        for k in ("analysis_error", "timed out", "timeout", "oom", "memory limit", "killed", "sandbox_unavailable", "rc=-9", "rc=137")
+        for k in (
+            "analysis_error",
+            "timed out",
+            "timeout",
+            "oom",
+            "memory limit",
+            "killed",
+            "sandbox_unavailable",
+            "rc=-9",
+            "rc=137",
+        )
     ):
         return True
     mod = task.get("module") or ""
@@ -2327,7 +2337,11 @@ def cmd_complete(agent_id: str) -> dict:
         with run_lock("ledger"):
             state = load_schedule()
             task = state["tasks"].get(merge_job["task"])
-            if task is None or task["state"] not in ("merging", "merge_queued") or (task.get("merge") or {}).get("agent_id") != agent_id:
+            if (
+                task is None
+                or task["state"] not in ("merging", "merge_queued")
+                or (task.get("merge") or {}).get("agent_id") != agent_id
+            ):
                 out["errors"].append("the architect task changed while it was being merged")
                 break
             if merged.get("ok"):
