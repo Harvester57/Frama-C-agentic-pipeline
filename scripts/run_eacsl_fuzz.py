@@ -1217,6 +1217,107 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
     }
 
 
+def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
+    """
+    Generate concise, actionable diagnostic hints for E-ACSL guardrail rejections and
+    instrumentation compile errors. Returns [] when status == 'passed_dynamic_oracle'.
+    """
+    status = res.get("status")
+    if status in ("passed_dynamic_oracle", "built", "no_crash"):
+        return []
+
+    hints: list[str] = []
+
+    def _add(msg: str) -> None:
+        if msg not in hints:
+            hints.append(msg)
+
+    if status == "rejected_overconstrained":
+        failure = res.get("failure") or {}
+        kind = (failure.get("kind") or "").lower()
+        label = (failure.get("label") or "").lower()
+        pred = failure.get("predicate") or ""
+        loc = f"{failure.get('file', 'unknown')}:{failure.get('line', 0)} in {failure.get('function', 'unknown')}"
+        _add(
+            f"ACSL annotation failed at runtime on a real corpus input ({loc}, clause={label or kind!r}, "
+            f"predicate={pred!r}): your specification is stronger than the actual runtime behavior."
+        )
+        if "\\valid" in pred:
+            _add(
+                "Pointer validity clause failed at runtime: if 'len == 0' can occur with a NULL or one-past-end "
+                "pointer, guard the clause with 'requires len > 0 ==> \\valid_read(buf + (0 .. len - 1));'."
+            )
+        if "precondition" in kind or "requires" in kind or "requires" in label:
+            _add(
+                "Precondition failed on a real caller/harness input: never constrain attacker-controlled values "
+                "or lengths on untrusted entry functions, and relax bounds that exclude valid caller inputs."
+            )
+        elif "postcondition" in kind or "ensures" in kind or "ensures" in label:
+            _add(
+                "Postcondition failed at runtime: check whether the property only holds on success "
+                "(guard with '\\result == 0 ==> ...') or whether '\\old(...)' was omitted when comparing to pre-state."
+            )
+        elif "invariant" in kind or "invariant" in label:
+            _add(
+                "Loop invariant failed at runtime: check the entry and exit bounds (use '0 <= i <= n', NOT "
+                "'0 <= i < n') and verify accumulator relationships against negative or boundary inputs."
+            )
+        return hints
+
+    if status == "code_fault":
+        failure = res.get("failure") or {}
+        loc = f"{failure.get('file', 'unknown')}:{failure.get('line', 0)} in {failure.get('function', 'unknown')}"
+        _add(
+            f"RTE assertion failed at runtime on a real input ({loc}, predicate={failure.get('predicate')!r}): "
+            "this is a code defect candidate, NOT a contract error. Do NOT weaken your ACSL contracts to hide it; "
+            "stop synthesis and return status 'blocked' (or 'failed' for architect) with this guardrail report in 'evidence'."
+        )
+        return hints
+
+    if status in ("compile_error", "guardrail_error"):
+        comp = res.get("compile") or {}
+        log_blob = "\n".join(
+            [
+                str(res.get("reason") or ""),
+                str(comp.get("reason") or ""),
+                str(comp.get("stdout") or ""),
+                str(comp.get("stderr") or ""),
+            ]
+        )
+        if any(
+            k in log_blob.lower()
+            for k in ("unbounded quantification", "invalid quantification", "quantification", "\\forall", "\\exists")
+        ):
+            _add(
+                "E-ACSL rejected a quantifier: E-ACSL only executes bounded integer quantifications written as "
+                "'\\forall integer k; 0 <= k < n ==> ...' (use mathematical type 'integer' and chained 'lo <= k < hi' bounds)."
+            )
+        if any(k in log_blob.lower() for k in ("not yet supported", "unsupported", "axiomatic", "no body")):
+            _add(
+                "E-ACSL encountered an unsupported ACSL construct (such as an uninterpreted 'axiomatic' logic "
+                "function without a definition): rewrite as a concrete 'predicate' or bounded '\\forall integer k; 0 <= k < n ==> ...'."
+            )
+        if any(
+            k in log_blob.lower() for k in ("annot-error", "syntax error", "unbound logic", "wrong order of clause")
+        ):
+            _add(
+                "ACSL syntax/typing error during E-ACSL build: verify clause order ('requires -> terminates -> exits -> "
+                "assigns -> ensures' for functions; 'loop invariant -> loop assigns -> loop variant' for loops), "
+                "';' terminators, and intact backslashes (\\valid, \\forall, \\old, \\result)."
+            )
+        if "not e-acsl-instrumented" in log_blob.lower():
+            _add(
+                "Guardrail binary lacks E-ACSL instrumentation: ensure '--functions <function_name>' names a "
+                "non-inlined C function defined in '--sources'."
+            )
+        if not hints and status == "compile_error":
+            _add(
+                "E-ACSL instrumentation/compilation failed: inspect 'compile.stderr' and 'compile.compile_log' "
+                "for ACSL annotation or C header errors."
+            )
+    return hints
+
+
 def corpus_manifest(corpus_dir: Path) -> list[list[str | int]]:
     """Sorted `[name, sha256, size]` manifest of regular non-hidden files in `corpus_dir`."""
     if not Path(corpus_dir).is_dir():
@@ -1262,12 +1363,14 @@ def run_guardrail_check(
     corpus_dir = Path(corpus_dir)
     scratch_dir = Path(scratch_dir)
     if not is_eacsl_instrumented(binary):
-        return {
+        err_verdict: dict[str, object] = {
             "status": "guardrail_error",
             "reason": f"{binary} is not E-ACSL-instrumented; refusing to report a vacuous dynamic-oracle pass.",
             "failure": None,
             "corpus_dir": str(corpus_dir),
         }
+        err_verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(err_verdict)
+        return err_verdict
     scratch_dir.mkdir(parents=True, exist_ok=True)
     scratch_corpus = scratch_dir / "new_units"
     scratch_corpus.mkdir(parents=True, exist_ok=True)
@@ -1324,6 +1427,7 @@ def run_guardrail_check(
     )
     if verdict["status"] != "passed_dynamic_oracle":
         verdict["runtime_trace"] = combined_out[-4000:]
+    verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(verdict)
     if g_key is not None and g_material is not None:
         if verdict["status"] == "passed_dynamic_oracle":
             with contextlib.suppress(OSError, ValueError):
@@ -2185,6 +2289,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if comp["returncode"] != 0:
                 res = {"mode": "guardrail", "status": "compile_error", "reason": comp.get("reason"), "compile": comp}
+                res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
             else:
                 scratch = args.scratch_dir or args.out_bin.parent / f"{args.out_bin.name}_guard_scratch"
                 use_verdict_cache = use_cache and not getattr(args, "no_verdict_cache", False)
@@ -2199,6 +2304,8 @@ def main(argv: list[str] | None = None) -> int:
                     use_verdict_cache=use_verdict_cache,
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
+                if "diagnostic_hints" not in res:
+                    res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     except SandboxUnavailable as exc:
         res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
 
@@ -2236,6 +2343,7 @@ def _run_build_mode(args) -> dict:
         res["engine_fallback_reason"] = build["engine_fallback_reason"]
     if build["eacsl_compile_attempt"] is not None:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
+    res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 
 
@@ -2317,6 +2425,7 @@ def _run_campaign_mode(args) -> dict:
         res["engine_fallback_reason"] = build["engine_fallback_reason"]
     if build["eacsl_compile_attempt"] is not None:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
+    res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 
 

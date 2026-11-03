@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -126,6 +127,38 @@ _BITWISE_LOG_RE = re.compile(
     r"\b(?:lsr|lsl|land|lor|lxor|bit_test|shift_left|shift_right|rte_shift)\b",
     re.IGNORECASE,
 )
+_WP_ALLOC_UNSUPPORTED_RE = re.compile(
+    r"\\(?:freeable|fresh|allocable|allocation)\b|\b(?:freeable|allocates|frees)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_alloc_limitation_goal(item: dict) -> bool:
+    text = f"{item.get('kind') or ''} {item.get('annotation') or ''}"
+    return bool(_WP_ALLOC_UNSUPPORTED_RE.search(text))
+
+
+def _locate_agent_scratch_dir(c_file: Path, out_dir: Path) -> Path | None:
+    """If `c_file` or `out_dir` is inside `.../agents/<agent_id>/scratch/...`, return that `scratch` dir."""
+    for candidate in (c_file, out_dir):
+        parts = candidate.parts
+        for idx, part in enumerate(parts):
+            if part == "agents" and idx + 2 < len(parts) and parts[idx + 2] == "scratch":
+                return Path(*parts[: idx + 3])
+    return None
+
+
+def _is_synthetic_probe_file(c_file: Path, scratch_dir: Path | None) -> bool:
+    """True when `c_file` is a synthetic `probe_*.c` file or sits in `agents/<id>/scratch` outside `scratch/work`."""
+    if c_file.name.lower().startswith("probe_"):
+        return True
+    if scratch_dir is None:
+        return False
+    try:
+        rel = c_file.resolve(strict=False).relative_to(scratch_dir.resolve(strict=False))
+    except ValueError:
+        return False
+    return not rel.parts or rel.parts[0] != "work"
 
 
 def scan_wp_log_soundness(
@@ -327,6 +360,229 @@ def _has_bitwise_unproven_goals(unproven_goals: list[dict], combined_log: str) -
     return False
 
 
+_EATEN_BACKSLASH_RE = re.compile(
+    r"unbound logic variable\s+(?:alse|rue|orall|xists|alid|alid_read|esult|othing|eparated|ld|t|nitialized)\b"
+    r"|invalid character|unexpected token.*\\x0",
+    re.IGNORECASE,
+)
+_CLAUSE_ORDER_ERR_RE = re.compile(
+    r"wrong order of clause|"
+    r"(?:syntax error|unexpected token).*?\b(?:terminates|decreases|exits|assigns|ensures|requires|behavior|loop\s+variant|loop\s+assigns|loop\s+invariant)\b",
+    re.IGNORECASE,
+)
+_C_TYPE_OR_CALL_ERR_RE = re.compile(
+    r"unbound logic function|not a logic type|C functions cannot be called|"
+    r"\\(?:forall|exists)\s+(?:int|unsigned|size_t|long|short|char|uint\d+_t|int\d+_t)\b",
+    re.IGNORECASE,
+)
+_BOOL_PRED_ERR_RE = re.compile(
+    r"expected a (?:predicate|boolean|term)|invalid implicit conversion from .* to boolean",
+    re.IGNORECASE,
+)
+_LOOP_ESTABLISHED_FAIL_RE = re.compile(
+    r"^\[wp\]\s*\[(?:Timeout|Unknown|Failed|Stepout)\][^\n]*loop_invariant[^\n]*established",
+    re.IGNORECASE | re.MULTILINE,
+)
+_LOOP_PRESERVED_FAIL_RE = re.compile(
+    r"^\[wp\]\s*\[(?:Timeout|Unknown|Failed|Stepout)\][^\n]*loop_invariant[^\n]*preserved",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
+    """
+    Generate concise, actionable diagnostic hints for ACSL syntax errors, WP soundness
+    aborts, and unproven goal buckets. Returns [] when status == 'all_proven'.
+    """
+    status = res.get("status")
+    if status == "all_proven":
+        return []
+
+    hints: list[str] = []
+
+    def _add(msg: str) -> None:
+        if msg not in hints:
+            hints.append(msg)
+
+    if status == "acsl_syntax_error":
+        sc = res.get("syntax_check") or {}
+        err_blob = "\n".join(sc.get("errors") or []) + "\n" + (sc.get("raw_log") or "") + "\n" + (log_text or "")
+        if _EATEN_BACKSLASH_RE.search(err_blob):
+            _add(
+                "Backslash in an ACSL keyword was eaten by string escaping (e.g. \\false -> form-feed + 'alse', "
+                "\\forall -> form-feed + 'orall', \\valid -> '\\v' + 'alid', \\t -> tab). Use a Python raw string "
+                "r'''...''' or double backslashes when writing ACSL annotations."
+            )
+        if _CLAUSE_ORDER_ERR_RE.search(err_blob):
+            _add(
+                "Check Frama-C clause ordering: function contracts MUST follow "
+                "'requires -> terminates/decreases -> exits -> assigns -> ensures -> behavior'; "
+                "loop annotations MUST sit immediately above 'for'/'while'/'do' in order: "
+                "'loop invariant -> loop assigns -> loop variant' ('loop variant' must be last)."
+            )
+        if re.search(r"\binvariant\b", err_blob, re.IGNORECASE) and "loop invariant" not in err_blob.lower():
+            _add(
+                "Loop invariants require the 'loop' keyword ('loop invariant ...;') and must be placed "
+                "immediately BEFORE the 'for'/'while'/'do' statement, never inside the loop body '{ ... }'."
+            )
+        if _C_TYPE_OR_CALL_ERR_RE.search(err_blob):
+            _add(
+                "In ACSL quantifiers and logic/predicate definitions, use mathematical 'integer' instead of C types "
+                "('int', 'size_t'), chain quantifier bounds as '\\forall integer k; 0 <= k < n ==> ...', and never "
+                "call C functions inside ACSL (inline the struct/pointer condition instead)."
+            )
+        if _BOOL_PRED_ERR_RE.search(err_blob):
+            _add(
+                "ACSL separates terms (values) from predicates (formulas): write 'x == 0' instead of '!x' on C "
+                "integers, and use '==>' or '<==>' instead of '? :' when combining predicates."
+            )
+        if not hints:
+            _add(
+                "ACSL syntax/typing error: check that every clause ends with ';', backslashes are intact "
+                "(\\result, \\old, \\valid, \\valid_read, \\separated, \\forall, \\nothing), and function/loop "
+                "clause order is respected."
+            )
+        return hints
+
+    if status == "analysis_error":
+        reason = res.get("reason") or "unknown"
+        _add(
+            f"Frama-C WP terminated before producing a report (reason: {reason}). Re-run once; if it repeats, "
+            "report status 'blocked' with this reason rather than weakening contracts."
+        )
+        return hints
+
+    soundness = res.get("soundness") or {}
+    aborts_and_unsound = "\n".join(
+        list(soundness.get("tier_a_aborts") or [])
+        + list(soundness.get("tier_b_unsound") or [])
+        + [log_text or "", res.get("wp_log_tail") or ""]
+    )
+    if not soundness.get("ok", True) or status in ("wp_aborted", "unsound_proof"):
+        if "Missing assigns clause" in aborts_and_unsound or "using unguarded behavior assigns" in aborts_and_unsound:
+            _add(
+                "WP reported a missing 'assigns' or 'loop assigns' clause: every loop and every called function "
+                "must have an explicit 'loop assigns ...;' / 'assigns ...;' clause (use 'assigns \\nothing;' for "
+                "pure functions)."
+            )
+        if "Memory model hypotheses" in aborts_and_unsound or soundness.get("checked_memory_model_functions"):
+            _add(
+                "WP emitted Typed memory-model separation hypotheses: add explicit "
+                "'requires \\separated(p1 + (0 .. n1 - 1), p2 + (0 .. n2 - 1));' preconditions for distinct "
+                "pointer parameters."
+            )
+        if (
+            soundness.get("skipped_rte_guards")
+            or "Missing 'calls'" in aborts_and_unsound
+            or "Through function pointer" in aborts_and_unsound
+        ):
+            _add(
+                "Indirect call through a function pointer without a 'calls' annotation: place "
+                "'//@ calls f1, f2;' immediately above the indirect call statement."
+            )
+        if "unproven lemma" in aborts_and_unsound.lower():
+            _add(
+                "Unproven global ACSL lemma in scope: replace global 'lemma' declarations with a recursive "
+                "'/*@ ghost ... */' C function with 'decreases n; assigns \\nothing;' so WP proves induction."
+            )
+        if _SMOKE_FAIL_RE.search(aborts_and_unsound):
+            _add(
+                "Vacuous proof detected (--wp-smoke-tests proved \\false): your 'requires' clauses or loop "
+                "invariants are mutually contradictory. Inspect and relax conflicting preconditions."
+            )
+        if "Ignoring " in aborts_and_unsound or "not yet supported (skipped)" in aborts_and_unsound:
+            if _WP_ALLOC_UNSUPPORTED_RE.search(aborts_and_unsound):
+                _add(
+                    "Frama-C WP does not support dynamic allocation clauses ('\\freeable', '\\fresh', "
+                    "'\\allocable', 'allocates', 'frees') from <stdlib.h> ('not yet supported (skipped)'). "
+                    "Do NOT write synthetic probe_*.c programs to investigate this limitation; once all "
+                    "non-allocation goals are proven and the E-ACSL guardrail passes, stop and write "
+                    "result.json with status 'stalled_after_k_retries'."
+                )
+            else:
+                _add(
+                    "Frama-C ignored part of a specification (see 'soundness.tier_b_unsound'): rewrite the unsupported "
+                    "or misplaced clause so WP checks it."
+                )
+
+    if res.get("budget_exhausted"):
+        _add(
+            "Prover iteration or wall-clock budget is exhausted for this function. Stop running WP or writing "
+            "probe files immediately and write agents/<id>/scratch/result.json with status 'stalled_after_k_retries' "
+            "recording the remaining unproven_goals."
+        )
+
+    if status == "unproven_goals_remain":
+        buckets = res.get("unproven_by_bucket") or {}
+        unproven_goals = res.get("unproven_goals") or []
+        full_log = (log_text or "") + "\n" + (res.get("wp_log_tail") or "")
+        alloc_goals = [g for g in unproven_goals if _is_alloc_limitation_goal(g)]
+        if alloc_goals or _WP_ALLOC_UNSUPPORTED_RE.search(full_log):
+            _add(
+                "Frama-C WP does not support dynamic allocation predicates ('\\freeable', '\\fresh', "
+                "'\\allocable', 'allocates', 'frees') on malloc/calloc/realloc/free in <stdlib.h>. "
+                "These goals cannot be discharged by WP and cannot be worked around in user annotations. "
+                "Do NOT create synthetic probe_*.c test files; once all non-allocation goals are proven and "
+                "the E-ACSL guardrail passes, stop immediately and write result.json with status "
+                "'stalled_after_k_retries'."
+            )
+
+        if buckets.get("step_a_assigns"):
+            _add(
+                "Step A (Frame Conditions) has unproven 'assigns' / 'loop assigns' goals: fix 'assigns' and "
+                "'loop assigns' FIRST before editing loop invariants or postconditions. List every variable "
+                "(including loop counter 'i' and accumulators) and memory range modified in the loop or function."
+            )
+        if buckets.get("step_b_loop_invariant"):
+            if _LOOP_ESTABLISHED_FAIL_RE.search(full_log):
+                _add(
+                    "Loop invariant ESTABLISHMENT failed: the invariant is false before the first iteration. "
+                    "Check initial variable values at loop entry or add a 'requires' precondition "
+                    "(e.g. 'requires n >= 0;' for 'loop invariant 0 <= i <= n;')."
+                )
+            if _LOOP_PRESERVED_FAIL_RE.search(full_log):
+                _add(
+                    "Loop invariant PRESERVATION failed: the invariant is not inductive across an iteration, "
+                    "or 'loop assigns' is missing/too broad, or the upper bound uses '< n' instead of '<= n' "
+                    "(at loop exit 'i == n', so write 'loop invariant 0 <= i <= n;')."
+                )
+            if not _LOOP_ESTABLISHED_FAIL_RE.search(full_log) and not _LOOP_PRESERVED_FAIL_RE.search(full_log):
+                _add(
+                    "Step B (Loops) has unproven goals: ensure 'loop invariant 0 <= i <= n;' uses '<= n' "
+                    "(not '< n'), bound any accumulator or pointer offset modified in the loop, and place "
+                    "'loop variant n - i;' AFTER 'loop assigns'."
+                )
+        if (
+            buckets.get("step_c_rte_obligation")
+            or buckets.get("step_c_caller_precondition")
+            or buckets.get("step_c_contract_postcondition")
+        ):
+            goal_text = " ".join(f"{g.get('kind') or ''} {g.get('annotation') or ''}".lower() for g in unproven_goals)
+            if any(k in goal_text for k in ("mem_access", "index_bound", "pointer_value")):
+                _add(
+                    "Unproven pointer/array access ('mem_access' / 'index_bound'): add 'requires \\valid(p);' or "
+                    "'requires n > 0 ==> \\valid_read(buf + (0 .. n - 1));' (guarding 'n > 0' so (NULL, 0) passes "
+                    "E-ACSL) and bound loop indices with 'loop invariant 0 <= i <= n;'."
+                )
+            if any(k in goal_text for k in ("signed_overflow", "unsigned_overflow", "division_by_zero", "shift")):
+                _add(
+                    "Unproven arithmetic RTE ('overflow' / 'division_by_zero' / 'shift'): bound the inputs or loop "
+                    "accumulators via 'requires' / 'loop invariant' so the C expression cannot overflow or divide by 0."
+                )
+            if "initialization" in goal_text or "\\initialized" in goal_text:
+                _add(
+                    "Unproven 'initialization' goal: ensure local buffers are initialized on all paths, add "
+                    "'requires n > 0 ==> \\initialized(in_buf + (0 .. n - 1));' for caller inputs, or add "
+                    "'loop invariant \\initialized(out_buf + (0 .. i - 1));' for loops that populate an output buffer."
+                )
+            _add(
+                "Tip: isolate a single stalled clause with '--prop <clause_name> --dump-goal' to inspect the raw "
+                "Why3 sequent in 'goal_dumps'."
+            )
+
+    return hints
+
+
 def _decode_output(data) -> str:
     if data is None:
         return ""
@@ -343,7 +599,7 @@ def _analysis_error_result(
     soundness: dict,
     combined_log: str,
 ) -> dict:
-    return {
+    res = {
         "status": "analysis_error",
         "reason": reason,
         "returncode": returncode,
@@ -365,6 +621,8 @@ def _analysis_error_result(
         "sarif_file": None,
         "wp_log_tail": combined_log[-3000:],
     }
+    res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
+    return res
 
 
 def run_wp_on_function(
@@ -404,6 +662,128 @@ def run_wp_on_function(
         "wall_timeout_s": wall_timeout,
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
+    scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
+    if not artifact_suffix.endswith("_retry"):
+        if _is_synthetic_probe_file(c_file, scratch_dir):
+            probe_msg = (
+                f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
+                "Prover subagents may only run run_wp_function.py on the assigned target source file under "
+                "agents/<id>/scratch/work/. Do not write probe_*.c files to investigate Frama-C WP limitations "
+                "(such as \\freeable or \\fresh); write result.json with status 'stalled_after_k_retries' instead."
+            )
+            soundness = scan_wp_log_soundness("")
+            soundness["ok"] = False
+            soundness["tier_a_aborts"] = [probe_msg]
+            probe_res = {
+                "status": "wp_aborted",
+                "function": fn_name,
+                "file": str(c_file),
+                "total_goals": 0,
+                "proven_count": 0,
+                "proven_under_hyp_count": 0,
+                "unproven_count": 0,
+                "dead_count": 0,
+                "soundness": soundness,
+                "undeclared_functions": [],
+                "by_obligation_class": {},
+                "next_synthesis_focus": "forbidden_synthetic_probe_file_stop_now",
+                "unproven_by_bucket": {
+                    "step_a_assigns": [],
+                    "step_b_loop_invariant": [],
+                    "step_c_rte_obligation": [],
+                    "step_c_caller_precondition": [],
+                    "step_c_contract_postcondition": [],
+                },
+                "unproven_goals": [],
+                "proven_under_hyp_goals": [],
+                "goal_dumps": [],
+                "sarif_file": None,
+                "wp_log_tail": probe_msg,
+                "sizing": sizing,
+                "diagnostic_hints": [probe_msg],
+            }
+            return probe_res
+
+        if scratch_dir is not None:
+            budget_path = scratch_dir / ".prover_budget.json"
+            if budget_path.is_file():
+                try:
+                    budget_data = json.loads(budget_path.read_text(encoding="utf-8"))
+                except Exception:
+                    budget_data = None
+                if isinstance(budget_data, dict):
+                    now_ts = time.time()
+                    first_wp_at = budget_data.get("first_wp_at")
+                    if not isinstance(first_wp_at, (int, float)) or first_wp_at <= 0:
+                        first_wp_at = now_ts
+                        budget_data["first_wp_at"] = first_wp_at
+                    invocations = int(budget_data.get("wp_invocations") or 0) + 1
+                    budget_data["wp_invocations"] = invocations
+                    try:
+                        budget_path.write_text(json.dumps(budget_data, indent=2) + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                    max_inv = int(budget_data.get("max_wp_invocations") or 0)
+                    max_wall_s = int(budget_data.get("max_wall_clock_s") or 0)
+                    elapsed_s = max(0.0, now_ts - float(first_wp_at))
+                    inv_exceeded = max_inv > 0 and invocations > max_inv
+                    wall_exceeded = invocations > 1 and max_wall_s > 0 and elapsed_s > max_wall_s
+                    if inv_exceeded or wall_exceeded:
+                        prior_report_path = scratch_dir / f"wp_{fn_name}.json"
+                        prior_report: dict = {}
+                        if prior_report_path.is_file():
+                            try:
+                                loaded = json.loads(prior_report_path.read_text(encoding="utf-8"))
+                                if isinstance(loaded, dict):
+                                    prior_report = loaded
+                            except Exception:
+                                prior_report = {}
+                        exhausted_msg = (
+                            f"Prover budget exhausted for '{fn_name}' "
+                            f"(wp_invocations={invocations}/{max_inv or 'unlimited'}, "
+                            f"elapsed={int(elapsed_s)}s/{max_wall_s or 'unlimited'}s). "
+                            "Stop immediately and write agents/<id>/scratch/result.json with "
+                            "status 'stalled_after_k_retries'."
+                        )
+                        cap_res = {
+                            "status": "unproven_goals_remain",
+                            "function": fn_name,
+                            "file": str(c_file),
+                            "total_goals": int(prior_report.get("total_goals") or 0),
+                            "proven_count": int(prior_report.get("proven_count") or 0),
+                            "proven_under_hyp_count": int(prior_report.get("proven_under_hyp_count") or 0),
+                            "unproven_count": int(prior_report.get("unproven_count") or 0),
+                            "dead_count": int(prior_report.get("dead_count") or 0),
+                            "soundness": prior_report.get("soundness") or scan_wp_log_soundness(""),
+                            "undeclared_functions": prior_report.get("undeclared_functions") or [],
+                            "by_obligation_class": prior_report.get("by_obligation_class") or {},
+                            "next_synthesis_focus": "budget_exhausted_write_result_json_now",
+                            "unproven_by_bucket": prior_report.get("unproven_by_bucket")
+                            or {
+                                "step_a_assigns": [],
+                                "step_b_loop_invariant": [],
+                                "step_c_rte_obligation": [],
+                                "step_c_caller_precondition": [],
+                                "step_c_contract_postcondition": [],
+                            },
+                            "unproven_goals": prior_report.get("unproven_goals") or [],
+                            "proven_under_hyp_goals": prior_report.get("proven_under_hyp_goals") or [],
+                            "goal_dumps": [],
+                            "sarif_file": None,
+                            "wp_log_tail": prior_report.get("wp_log_tail") or exhausted_msg,
+                            "sizing": sizing,
+                            "budget_exhausted": True,
+                        }
+                        if prior_report.get("wp_allocation_limitation"):
+                            cap_res["wp_allocation_limitation"] = True
+                        cap_res["diagnostic_hints"] = derive_wp_diagnostic_hints(
+                            cap_res, str(cap_res.get("wp_log_tail") or "")
+                        )
+                        return cap_res
+                    if max_wall_s > 0:
+                        rem_s = max(15, int(max_wall_s - elapsed_s))
+                        wall_timeout = min(wall_timeout, rem_s) if wall_timeout else rem_s
+                        sizing["wall_timeout_s"] = wall_timeout
     mem_limit = enforced_memory_mb()
     if mem_limit is not None and mem_limit < WP_MIN_MEMORY_MB:
         note = (
@@ -541,7 +921,7 @@ def run_wp_on_function(
 
     syntax_errors = _folded_syntax_errors(combined_log, returncode, timed_out, csv_path.exists())
     if syntax_errors is not None:
-        return {
+        syn_res = {
             "status": "acsl_syntax_error",
             "function": fn_name,
             "file": str(c_file),
@@ -552,6 +932,8 @@ def run_wp_on_function(
                 "raw_log": combined_log[-3000:],
             },
         }
+        syn_res["diagnostic_hints"] = derive_wp_diagnostic_hints(syn_res, combined_log)
+        return syn_res
 
     soundness = scan_wp_log_soundness(
         combined_log,
@@ -644,6 +1026,8 @@ def run_wp_on_function(
                     continue
                 if "unsigned_downcast" in kind_low or "unsigned_downcast" in annot_low:
                     item["c11_modulo_candidate"] = True
+                if _is_alloc_limitation_goal(item):
+                    item["wp_allocation_limitation"] = True
                 if not row_fn or "lemma" in kind_low:
                     unproven_lemmas.append(item)
                 bkey = classify_unproven_goal(item)
@@ -727,11 +1111,24 @@ def run_wp_on_function(
     else:
         status = "unproven_goals_remain"
 
+    all_unproven_are_alloc = bool(unproven_goals) and all(
+        bool(g.get("wp_allocation_limitation")) for g in unproven_goals
+    )
+    if all_unproven_are_alloc:
+        soundness["tier_b_unsound"] = [
+            msg
+            for msg in soundness["tier_b_unsound"]
+            if not ("not yet supported (skipped)" in msg and _WP_ALLOC_UNSUPPORTED_RE.search(msg))
+        ]
+        soundness["ok"] = len(soundness["tier_a_aborts"]) == 0 and len(soundness["tier_b_unsound"]) == 0
+
     # Determine next recommended synthesis focus for the Prover Subagent
     if soundness["tier_a_aborts"]:
         next_focus = "tier_a_abort_restructure_required"
     elif soundness["tier_b_unsound"]:
         next_focus = "tier_b_soundness_fix_required"
+    elif all_unproven_are_alloc:
+        next_focus = "wp_dynamic_allocation_limitation_stop_now"
     elif buckets["step_a_assigns"]:
         next_focus = "step_a_assigns"
     elif buckets["step_b_loop_invariant"]:
@@ -745,7 +1142,7 @@ def run_wp_on_function(
     else:
         next_focus = "complete"
 
-    return {
+    res = {
         "status": status,
         "function": fn_name,
         "file": str(c_file),
@@ -767,6 +1164,10 @@ def run_wp_on_function(
         "wp_log_tail": combined_log[-3000:],
         "sizing": sizing,
     }
+    if all_unproven_are_alloc:
+        res["wp_allocation_limitation"] = True
+    res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
+    return res
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -858,20 +1259,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-    print(
-        json.dumps(
-            {
-                "status": res["status"],
-                "function": res["function"],
-                "proven_count": res.get("proven_count", 0),
-                "proven_under_hyp_count": res.get("proven_under_hyp_count", 0),
-                "unproven_count": res.get("unproven_count", 0),
-                "soundness_ok": res.get("soundness", {}).get("ok", False),
-                "next_synthesis_focus": res.get("next_synthesis_focus", "syntax_error"),
-            },
-            indent=2,
-        )
-    )
+    summary = {
+        "status": res["status"],
+        "function": res["function"],
+        "proven_count": res.get("proven_count", 0),
+        "proven_under_hyp_count": res.get("proven_under_hyp_count", 0),
+        "unproven_count": res.get("unproven_count", 0),
+        "soundness_ok": res.get("soundness", {}).get("ok", False),
+        "next_synthesis_focus": res.get("next_synthesis_focus", "syntax_error"),
+    }
+    if res.get("diagnostic_hints"):
+        summary["diagnostic_hints"] = res["diagnostic_hints"]
+    print(json.dumps(summary, indent=2))
     return 0
 
 
