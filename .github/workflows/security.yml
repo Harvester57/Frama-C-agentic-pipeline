@@ -52,6 +52,36 @@ jobs:
         uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         with:
           category: "/language:${{ matrix.language }}"
+          output: sarif-results
+          upload: never
+          upload-database: false
+
+      - name: Enforce zero CodeQL findings
+        run: |
+          python3 -c '
+          import json, pathlib, sys
+          alerts = []
+          for sarif_path in sorted(pathlib.Path("sarif-results").glob("*.sarif")):
+              data = json.loads(sarif_path.read_text(encoding="utf-8"))
+              for run in data.get("runs", []):
+                  for res in run.get("results", []):
+                      level = res.get("level", "warning")
+                      if level in ("error", "warning"):
+                          rule = res.get("ruleId", "unknown")
+                          msg = res.get("message", {}).get("text", "")
+                          locs = res.get("locations", [])
+                          where = ""
+                          if locs:
+                              phys = locs[0].get("physicalLocation", {})
+                              uri = phys.get("artifactLocation", {}).get("uri", "")
+                              line = phys.get("region", {}).get("startLine", 0)
+                              where = f"{uri}:{line}"
+                          alerts.append(f"[{level}] {rule} at {where}: {msg}")
+          if alerts:
+              print("\n".join(alerts), file=sys.stderr)
+              sys.exit(1)
+          print("CodeQL check passed with 0 alerts.")
+          '
 
   dependency-review:
     name: Dependency Review
