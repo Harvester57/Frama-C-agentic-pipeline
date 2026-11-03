@@ -235,6 +235,100 @@ def _strip_trailing_attributes(c_tokens: list[Token], end_idx: int, min_idx: int
     return cursor
 
 
+_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(\([^)]*\))?(.*)$", re.DOTALL)
+
+
+def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str, dict]:
+    """
+    Extract file-scope `#define` macros from `raw_code`, computing each macro's transitive
+    callees and embedded non-trivial loop count (`for` and `while` excluding `while (0)`).
+    """
+    try:
+        all_tokens = tokenize_c_acsl(raw_code, path=path)
+    except AcslSyntaxError:
+        cleaned = re.sub(r"/\*.*?\*/", " ", raw_code, flags=re.DOTALL)
+        cleaned = re.sub(r"//[^\n]*", " ", cleaned)
+        all_tokens = tokenize_c_acsl(cleaned, path=path)
+
+    raw_macros: dict[str, dict] = {}
+    for tok in all_tokens:
+        if tok.kind != "pp_directive":
+            continue
+        unfolded = re.sub(r"\\\r?\n", " ", tok.text)
+        m = _DEFINE_RE.match(unfolded)
+        if not m:
+            continue
+        m_name = m.group(1)
+        if not _is_ident(m_name):
+            continue
+        param_str = m.group(2) or ""
+        param_names = {p for p in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", param_str) if _is_ident(p)}
+        body_str = m.group(3) or ""
+        try:
+            b_tokens = [t for t in tokenize_c_acsl(body_str, path=path) if t.kind in ("c_token", "string")]
+        except AcslSyntaxError:
+            continue
+
+        direct_calls: set[str] = set()
+        ident_refs: set[str] = set()
+        direct_loops = 0
+        nb = len(b_tokens)
+        for idx, bt in enumerate(b_tokens):
+            txt = bt.text
+            if txt == "for":
+                direct_loops += 1
+            elif txt == "while":
+                is_trivial_false = False
+                if idx + 1 < nb and b_tokens[idx + 1].text == "(":
+                    close_w = _find_matching_forward(b_tokens, idx + 1, "(", ")")
+                    if close_w != -1:
+                        cond_toks = [ct.text.lower() for ct in b_tokens[idx + 2 : close_w] if ct.text not in ("(", ")")]
+                        if len(cond_toks) == 1 and cond_toks[0] in ("0", "0u", "0l", "0ul", "0ull", "false"):
+                            is_trivial_false = True
+                if not is_trivial_false:
+                    direct_loops += 1
+            elif txt == "(" and idx > 0:
+                prev = b_tokens[idx - 1].text
+                if _is_ident(prev) and prev not in param_names and prev != m_name:
+                    direct_calls.add(prev)
+            elif _is_ident(txt) and txt not in param_names and txt != m_name:
+                ident_refs.add(txt)
+
+        raw_macros[m_name] = {
+            "name": m_name,
+            "line": tok.line,
+            "direct_calls": direct_calls,
+            "ident_refs": ident_refs | direct_calls,
+            "direct_loops": direct_loops,
+        }
+
+    macro_names = set(raw_macros.keys())
+    resolved: dict[str, dict] = {}
+    for m_name, info in raw_macros.items():
+        visited: set[str] = {m_name}
+        queue = [ref for ref in sorted(info["ident_refs"]) if ref in macro_names and ref != m_name]
+        callees = {c for c in info["direct_calls"] if c not in macro_names}
+        total_loops = info["direct_loops"]
+        while queue:
+            cur = queue.pop(0)
+            if cur in visited:
+                continue
+            visited.add(cur)
+            sub = raw_macros[cur]
+            callees |= {c for c in sub["direct_calls"] if c not in macro_names}
+            total_loops += sub["direct_loops"]
+            for ref in sorted(sub["ident_refs"]):
+                if ref in macro_names and ref not in visited:
+                    queue.append(ref)
+        resolved[m_name] = {
+            "name": m_name,
+            "line": info["line"],
+            "callees": callees,
+            "loop_count": total_loops,
+        }
+    return resolved
+
+
 def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[dict]:
     """
     Deterministically extract all C function definitions from `raw_code` using
@@ -497,12 +591,13 @@ def analyze_body(
     fn_name: str,
     body_tokens: list[Token],
     sig_info: dict,
+    macros: dict[str, dict] | None = None,
 ) -> dict:
     """
     Analyze function body token stream for:
-    - direct callees & self-recursion
+    - direct callees & self-recursion (including callees inside file-scope #define macros)
     - indirect (function-pointer) calls requiring `//@ calls`
-    - loop counts & unsigned wraparound loop idioms
+    - loop counts (including loops inside file-scope #define macros) & unsigned wraparound loop idioms
     - WP blockers (backward/irreducible goto, dynamic memory allocation, pointer casts,
       container_of, volatile/inline asm)
     - structural security patterns (memory zeroization, formatting/serialization)
@@ -510,6 +605,9 @@ def analyze_body(
     direct_callees: set[str] = set()
     indirect_calls: list[str] = []
     self_recursive = False
+    macro_loops: list[str] = []
+    seen_loop_macros: set[str] = set()
+    macro_map = macros or {}
 
     loop_count = 0
     has_unsigned_wrap_idiom = False
@@ -528,6 +626,24 @@ def analyze_body(
     n = len(body_tokens)
     for i, tok in enumerate(body_tokens):
         t = tok.text
+
+        if t in macro_map:
+            m_info = macro_map[t]
+            for m_callee in m_info.get("callees") or ():
+                if m_callee == fn_name:
+                    self_recursive = True
+                elif m_callee not in param_names:
+                    direct_callees.add(m_callee)
+                    if m_callee in ZEROIZATION_CALLEES:
+                        has_zeroization = True
+                    if m_callee in FORMAT_OR_WRITE_CALLEES:
+                        uses_format_or_write = True
+            m_loops = int(m_info.get("loop_count") or 0)
+            if m_loops > 0:
+                loop_count += m_loops
+                if t not in seen_loop_macros:
+                    seen_loop_macros.add(t)
+                    macro_loops.append(t)
 
         if t == "for":
             loop_count += 1
@@ -614,7 +730,7 @@ def analyze_body(
                         indirect_calls.append(prev)
                 elif prev == fn_name:
                     self_recursive = True
-                elif prev not in param_names:
+                elif prev not in param_names and prev not in macro_map:
                     direct_callees.add(prev)
                     if prev in ZEROIZATION_CALLEES:
                         has_zeroization = True
@@ -671,6 +787,11 @@ def analyze_body(
         wp_notes.append("unsigned decrement loop idiom may require --no-warn-unsigned")
     if has_pointer_cast:
         wp_notes.append("pointer cast may trigger incompatible pointer cast warning under Typed model")
+    if macro_loops:
+        wp_notes.append(
+            f"invokes loop-bearing preprocessor macro(s) {macro_loops}: "
+            "C preprocessor strips '/*@ loop ... */' comments inside #define bodies"
+        )
 
     if wp_blockers:
         verifiability = "shell_unverifiable_wp"
@@ -682,6 +803,7 @@ def analyze_body(
     return {
         "has_loops": loop_count > 0,
         "loop_count": loop_count,
+        "macro_loops": macro_loops,
         "direct_callees": direct_callees,
         "indirect_calls": indirect_calls,
         "self_recursive": self_recursive,
@@ -1149,12 +1271,13 @@ def build_dag(
         modules[module_name]["files"].append(rel_path)
 
         raw_code = c_file.read_text(encoding="utf-8", errors="replace")
+        file_macros = extract_macro_definitions(raw_code, path=rel_path)
         extracted = extract_functions_from_code(raw_code, path=rel_path)
 
         for item in extracted:
             fn_name = item["name"]
             sig_info = analyze_signature(item["decl_tokens"], item["param_tokens"])
-            body_info = analyze_body(fn_name, item["body_tokens"], sig_info)
+            body_info = analyze_body(fn_name, item["body_tokens"], sig_info, macros=file_macros)
 
             if fn_name in DISAMBIGUATE_COLLISION_NAMES:
                 if fn_name in functions and functions[fn_name]["file"] != rel_path:
@@ -1206,6 +1329,7 @@ def build_dag(
                 "writes_bounded_buffer": sig_info["writes_bounded_buffer"],
                 "has_loops": body_info["has_loops"],
                 "loop_count": body_info["loop_count"],
+                "macro_loops": body_info.get("macro_loops", []),
                 "self_recursive": body_info["self_recursive"],
                 "indirect_calls": body_info["indirect_calls"],
                 "has_dynamic_alloc": body_info["has_dynamic_alloc"],

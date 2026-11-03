@@ -504,6 +504,7 @@ def _run_parent_reverify(
     cppflags: str,
     ldflags: str = "",
     wp_par: int | None = None,
+    allow_partial_wp: bool = False,
 ) -> tuple[bool, str]:
     """
     Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
@@ -597,8 +598,18 @@ def _run_parent_reverify(
         if proc.returncode != 0 or not wp_json.is_file():
             return False, f"parent WP check failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
         wp_report = json.loads(wp_json.read_text(encoding="utf-8"))
-        if wp_report.get("status") != "all_proven":
-            return False, f"parent WP check on merged tree returned status={wp_report.get('status')!r}"
+        wp_status = wp_report.get("status")
+        if allow_partial_wp:
+            sound_ok = bool((wp_report.get("soundness") or {}).get("ok"))
+            assigns_unproven = len(((wp_report.get("unproven_by_bucket") or {}).get("step_a_assigns")) or [])
+            if wp_status not in ("all_proven", "unproven_goals_remain") or not sound_ok or assigns_unproven > 0:
+                return (
+                    False,
+                    f"parent partial WP check rejected (status={wp_status!r}, sound_ok={sound_ok}, "
+                    f"assigns_unproven={assigns_unproven})",
+                )
+        elif wp_status != "all_proven":
+            return False, f"parent WP check on merged tree returned status={wp_status!r}"
         if len(_function_files(run_dir, function) - {norm_c}) == 0:
             canonical = overlay_dir / "reports" / "wp" / f"{function}.json"
             canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -622,6 +633,8 @@ def merge_agent_overlay(
     skip_reverify: bool = False,
     verify_hook: Callable[[], tuple[bool, str]] | None = None,
     journal: bool = True,
+    allow_partial_wp: bool = False,
+    contract_only: bool = False,
 ) -> dict:
     """
     Validate an agent's scratch overlay (ACSL-only + role/function scope), structurally
@@ -648,6 +661,8 @@ def merge_agent_overlay(
             skip_reverify,
             verify_hook,
             journal,
+            allow_partial_wp=allow_partial_wp,
+            contract_only=contract_only,
         )
         if recovered:
             res["recovered_journal"] = recovered
@@ -669,6 +684,8 @@ def _merge_agent_overlay_locked(
     skip_reverify: bool,
     verify_hook: Callable[[], tuple[bool, str]] | None,
     journal: bool,
+    allow_partial_wp: bool = False,
+    contract_only: bool = False,
 ) -> dict:
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid agent_id: {agent_id!r}")
@@ -772,6 +789,7 @@ def _merge_agent_overlay_locked(
                 function_name=function or "",
                 is_header=is_hdr,
                 path=rel_str,
+                contract_only=contract_only,
             )
 
         if is_hdr:
@@ -806,6 +824,20 @@ def _merge_agent_overlay_locked(
         if not skip_reverify:
             if verify_hook is not None:
                 ok, reason = verify_hook()
+            elif allow_partial_wp:
+                ok, reason = _run_parent_reverify(
+                    run_dir,
+                    agent_id,
+                    role,
+                    overlay,
+                    norm_c_file,
+                    function,
+                    module,
+                    sources,
+                    cppflags,
+                    ldflags=ldflags,
+                    allow_partial_wp=True,
+                )
             else:
                 ok, reason = _run_parent_reverify(
                     run_dir,
@@ -1811,6 +1843,16 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--cppflags", default="-I.")
     p_merge.add_argument("--ldflags", default="", help="Extra linker flags for parent guardrail")
     p_merge.add_argument("--skip-reverify", action="store_true")
+    p_merge.add_argument(
+        "--allow-partial-wp",
+        action="store_true",
+        help="Allow merging a stalled prover whose assigns and soundness are verified so callers can use its contract",
+    )
+    p_merge.add_argument(
+        "--contract-only",
+        action="store_true",
+        help="Splice only the function contract pre-body span (preserve original C body without loop annotations)",
+    )
 
     p_batch = sub.add_parser("merge-batch")
     p_batch.add_argument("--run-dir", type=Path, default=Path("."))
@@ -1887,6 +1929,8 @@ def main(argv: list[str] | None = None) -> int:
                 cppflags=args.cppflags,
                 ldflags=args.ldflags,
                 skip_reverify=args.skip_reverify,
+                allow_partial_wp=args.allow_partial_wp,
+                contract_only=args.contract_only,
             )
             print(json.dumps(res, indent=2))
             return 0 if res["ok"] else 1

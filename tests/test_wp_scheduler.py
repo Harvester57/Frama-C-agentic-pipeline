@@ -1232,3 +1232,74 @@ def test_architect_merge_does_not_retry_non_analysis_error(sim, monkeypatch):
     t = tasks()["arch:m"]
     assert t["state"] == "done" and t["outcome"] == "merge_failed"
     assert not t.get("analysis_retries")
+
+
+def test_stalled_prover_with_sound_contract_triggers_partial_merge(sim, monkeypatch):
+    sim.build({"caller": ("src/m/p.c", "m", ["callee"]), "callee": ("src/m/p.c", "m", [])})
+    S.cmd_init()
+    nxt = S.cmd_next("auto", prepare=True)
+    callee_task = [t for t in nxt["tasks"] if t["task"] == "prove:src/m/p.c#callee"][0]
+    aid = callee_task["agent_id"]
+
+    # Write a sound WP report with 0 unproven step_a_assigns goals and a function contract in scratch
+    scratch_c = sim.run_dir / f"agents/{aid}/scratch/work/src/m/p.c"
+    scratch_c.parent.mkdir(parents=True, exist_ok=True)
+    scratch_c.write_text(
+        "/*@ requires x >= 0;\n  @ assigns \\nothing;\n  @ ensures \\result == x;\n  @*/\n"
+        "static int callee(int x) { return x; }\n"
+        "int caller(int x) { return callee(x); }\n",
+        encoding="utf-8",
+    )
+    write_json(
+        sim.run_dir / f"agents/{aid}/scratch/guard_callee.json",
+        {"status": "passed_dynamic_oracle"},
+    )
+    report_rel = f"agents/{aid}/scratch/wp_callee.json"
+    write_json(
+        sim.run_dir / report_rel,
+        {
+            "status": "unproven_goals_remain",
+            "function": "callee",
+            "file": f"agents/{aid}/scratch/work/src/m/p.c",
+            "soundness": {"ok": True},
+            "by_obligation_class": {"rte": {"proven": 4, "proven_under_hyp": 0, "unproven": 1}},
+            "unproven_by_bucket": {
+                "step_a_assigns": [],
+                "step_b_loop_invariant": [{"line": 3, "annotation": "p != 0"}],
+                "step_c_rte_obligation": [],
+                "step_c_caller_precondition": [],
+                "step_c_contract_postcondition": [],
+            },
+            "unproven_goals": [{"obligation_class": "rte", "kind": "assert", "line": 3, "annotation": "p != 0"}],
+        },
+    )
+    write_json(
+        sim.run_dir / f"agents/{aid}/scratch/result.json",
+        {
+            "role": "prover",
+            "agent_id": aid,
+            "file": "src/m/p.c",
+            "function": "callee",
+            "status": "stalled_after_k_retries",
+            "patch": None,
+            "evidence": [{"tool_output": report_rel, "result": "unproven_goals_remain"}],
+            "unproven_goals": [{"line": 3, "annotation": "p != 0"}],
+            "strengthening_requests": [],
+            "boundary_assumptions": [],
+            "fault_hypothesis": None,
+        },
+    )
+    sim.modified[aid] = ["src/m/p.c"]
+
+    out = S.cmd_complete(aid)
+    assert out["action"] == "blocked"
+    assert out.get("partial_merge", {}).get("ok") is True
+    # Verify merge_agent_overlay was called with role="prover" and allow_partial_wp=True
+    prover_merges = [(a, r, kw) for (a, r, kw) in sim.arch_merges if a == aid and r == "prover"]
+    assert len(prover_merges) == 1
+    assert prover_merges[0][2].get("allow_partial_wp") is True
+    # Callee task remains blocked, while partial_contract_merged is recorded and caller is now ready
+    t_callee = tasks()["prove:src/m/p.c#callee"]
+    assert t_callee["state"] == "blocked"
+    assert t_callee.get("partial_contract_merged") is True
+    assert "prove:src/m/p.c#caller" in ready()

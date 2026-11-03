@@ -562,3 +562,45 @@ int fixed_message(int level, const char *msg) {
         assert "src/codec/main.c" not in service_mod["required_sources"]
         assert "src/codec/fuzz_target.c" not in service_mod["required_sources"]
         assert service_mod["cross_module_callees"] == ["codec_decode"]
+
+    def test_macro_callee_and_macro_loop_detection(self, tmp_path: Path) -> None:
+        from build_callgraph_dag import extract_macro_definitions
+
+        src = """\
+#define ADVANCE_TOKEN(tok, toklen) do { \\
+    while (1) { \\
+        tok = findchar_fast(tok, buf_end, ranges, sizeof(ranges) - 1, &found); \\
+        if (found) break; \\
+    } \\
+} while (0)
+
+static const char *findchar_fast(const char *buf, const char *buf_end, const char *ranges, int rlen, int *found) {
+    *found = 1;
+    return buf;
+}
+
+static const char *parse_token(const char *buf, const char *buf_end, const char **tok, int *toklen) {
+    int found = 0;
+    const char ranges[] = "\\x00 ";
+    ADVANCE_TOKEN(buf, *toklen);
+    return buf;
+}
+"""
+        macros = extract_macro_definitions(src)
+        assert "ADVANCE_TOKEN" in macros
+        assert "findchar_fast" in macros["ADVANCE_TOKEN"]["callees"]
+        assert macros["ADVANCE_TOKEN"]["loop_count"] == 1
+
+        src_dir = tmp_path / "src"
+        src_dir.mkdir(parents=True)
+        (src_dir / "parser.c").write_text(src, encoding="utf-8")
+
+        dag = build_dag(tmp_path)
+        fn_parse = dag["functions"]["parse_token"]
+        assert "findchar_fast" in fn_parse["internal_callees"]
+        assert fn_parse["has_loops"] is True
+        assert fn_parse["loop_count"] == 1
+        assert fn_parse["macro_loops"] == ["ADVANCE_TOKEN"]
+        assert any("ADVANCE_TOKEN" in note for note in fn_parse["wp_notes"])
+        # Topological wave must place findchar_fast before parse_token
+        assert dag["functions"]["findchar_fast"]["wave"] < fn_parse["wave"]

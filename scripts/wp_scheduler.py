@@ -42,6 +42,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import acsl_ast  # noqa: E402
 import checkpoint  # noqa: E402
 import contract_negotiator  # noqa: E402
 import ledger  # noqa: E402
@@ -2137,7 +2138,72 @@ def _on_analysis_error(state: dict, task: dict, agent_id: str, report_rel: str, 
     out["action"] = "blocked_analysis_error"
 
 
-def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, result_path: Path, out: dict) -> None:
+def _partial_contract_merge_job(task: dict, aid: str, report: dict | None) -> dict | None:
+    """
+    Return a partial-merge spec when a stalled `prove` task has a sound, assigns-verified
+    contract in its scratch overlay that did not fail the E-ACSL dynamic oracle, so callers
+    can verify against the callee's contract while the callee itself remains `blocked`.
+    """
+    if task.get("kind") != "prove" or not isinstance(report, dict):
+        return None
+    if report.get("status") != "unproven_goals_remain":
+        return None
+    if not bool((report.get("soundness") or {}).get("ok")):
+        return None
+    assigns_unproven = len(((report.get("unproven_by_bucket") or {}).get("step_a_assigns")) or [])
+    if assigns_unproven > 0:
+        return None
+    fn = str(task.get("function") or "")
+    c_rel = norm_path(str(task.get("file") or ""))
+    if not fn or not c_rel:
+        return None
+    guard_path = Path("agents") / aid / "scratch" / f"guard_{fn}.json"
+    if guard_path.is_file():
+        guard_data = load_json_optional(guard_path, {}) or {}
+        if isinstance(guard_data, dict) and guard_data.get("status") not in (None, "passed_dynamic_oracle"):
+            return None
+    scratch_c = Path("agents") / aid / "scratch" / "work" / c_rel
+    if not scratch_c.is_file():
+        return None
+    try:
+        c_text = scratch_c.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not acsl_ast.has_function_contract(c_text, fn, is_header=False, path=c_rel):
+        return None
+    return {
+        "task": task["id"],
+        "agent_id": aid,
+        "file": task["file"],
+        "function": fn,
+        "header": task.get("header"),
+        "module": task["module"],
+    }
+
+
+def _merge_partial_prover(job: dict) -> dict:
+    side = load_json_optional(HARNESS_DIR / f"harness_{job['module']}.json", {}) or {}
+    try:
+        return DEPS.merge_agent_overlay(
+            Path.cwd(),
+            job["agent_id"],
+            "prover",
+            c_file=job["file"],
+            function=job["function"],
+            header_file=job.get("header"),
+            module=job["module"],
+            sources=side.get("sources") or None,
+            cppflags=side.get("cppflags") or "-I.",
+            ldflags=side.get("ldflags") or "",
+            allow_partial_wp=True,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _complete_prover(
+    state: dict, ctx: Ctx, task: dict, aid: str, res: dict, result_path: Path, out: dict
+) -> dict | None:
     status = res["status"]
     out["result_status"] = status
     if status == "all_proven":
@@ -2145,11 +2211,11 @@ def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, res
         task["merge"] = {"agent_id": aid, "queued_at": utc_now(), "queued_ts": DEPS.now(), "analysis_retries": 0}
         _event(state, "merge_queued", task["id"], agent_id=aid)
         out["action"] = "queued_for_merge"
-        return
+        return None
     report_rel, report = _promote_agent_wp(task, aid, res, out["errors"])
     if report is not None and report_rel and report.get("status") == "analysis_error":
         _on_analysis_error(state, task, aid, report_rel, report, out)
-        return
+        return None
     if task["kind"] == "negotiate":
         if res.get("fault_hypothesis"):
             # The callee's fault hypothesis is still worth verifying; its own strengthening requests are
@@ -2161,7 +2227,7 @@ def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, res
             )
         _resolve_negotiation(state, task, False, f"callee prover {aid} returned {status}", out)
         out["action"] = "negotiation_rejected"
-        return
+        return None
     # A stalled report that claims all_proven is not parent-verified: never credit it.
     if report_rel and report and report.get("status") != "all_proven":
         out["ingest_wp"] = _try(out["errors"], "ingest-wp", DEPS.ingest_wp, [Path(report_rel)])
@@ -2175,6 +2241,7 @@ def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, res
     out["units"] = _park_units(task, aid, f"prover {aid} returned {status}")
     _finish(state, task, "blocked", status)  # terminal: its callers are released
     out["action"] = "blocked"
+    return _partial_contract_merge_job(task, aid, report)
 
 
 def _complete_architect(state: dict, task: dict, aid: str, res: dict, out: dict) -> dict | None:
@@ -2295,6 +2362,7 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
 def cmd_complete(agent_id: str) -> dict:
     """Validate agents/<id>/scratch/result.json and dispatch it by role (ledger functions in-process)."""
     merge_job: dict | None = None
+    partial_merge_job: dict | None = None
     with run_lock("ledger"):
         state = load_schedule()
         tid = state["agents"].get(agent_id)
@@ -2319,7 +2387,7 @@ def cmd_complete(agent_id: str) -> dict:
         if errors or res is None:
             _on_invalid_result(state, task, agent_id, errors or ["unreadable result"], out)
         elif task["kind"] in PROVER_KINDS:
-            _complete_prover(state, ctx, task, agent_id, res, result_path, out)
+            partial_merge_job = _complete_prover(state, ctx, task, agent_id, res, result_path, out)
         elif task["kind"] == "arch":
             merge_job = _complete_architect(state, task, agent_id, res, out)
         elif task["kind"] == "verify":
@@ -2328,6 +2396,21 @@ def cmd_complete(agent_id: str) -> dict:
             _complete_breaker(state, task, agent_id, res, result_path, out)
         out["sync"] = _sync(state, Ctx())
         save_schedule(state)
+    if partial_merge_job is not None:
+        pmerged = _merge_partial_prover(partial_merge_job)
+        out["partial_merge"] = pmerged
+        if pmerged.get("ok"):
+            with run_lock("ledger"):
+                state = load_schedule()
+                ptask = state["tasks"].get(partial_merge_job["task"])
+                if ptask is not None:
+                    ptask["partial_contract_merged"] = True
+                    ptask["partial_merged_at"] = utc_now()
+                    if pmerged.get("modified_files"):
+                        out["rechecks_queued"] = _queue_rechecks_for(
+                            state, ptask, f"partial contract of {_key(ptask)} merged from {agent_id}"
+                        )
+                    save_schedule(state)
     if merge_job is None:
         return out
 

@@ -391,6 +391,41 @@ _VARIADIC_CALLEE_RE = re.compile(
     r"(?:variadic|varargs|variable argument|\bva_list\b|unframed\s+variadic)",
     re.IGNORECASE,
 )
+_WHY3_MEMADDR_ERR_RE = re.compile(
+    r"\[Why3 Error\]\s*Type mismatch between\s+frama_c_wp\.memaddr\.MemAddr\.addr\s+and\s+int",
+    re.IGNORECASE,
+)
+_PTR_DIFF_EQ_RE = re.compile(
+    r"(?:-\s*[A-Za-z_]\w*\s*==\s*0\s*==>\s*[A-Za-z_]\w*\s*==|"
+    r"[A-Za-z_]\w*\s*!=\s*[A-Za-z_]\w*\s*==>\s*[A-Za-z_]\w*\s*-\s*[A-Za-z_]\w*\s*>\s*0|"
+    r"\\base_addr\s*\()"
+)
+_MISSING_ASSIGNS_LINE_RE = re.compile(r"([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*Warning:\s*Missing assigns clause")
+_WP_PROVED_GOALS_RE = re.compile(r"^\[wp\]\s*Proved goals:\s*(\d+)\s*/\s*(\d+)", re.MULTILINE)
+_WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILINE)
+
+
+def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
+    """Return `{line: macro_name}` for loop-bearing `#define` macro invocations inside `fn_name`."""
+    if not c_file.is_file():
+        return {}
+    try:
+        from build_callgraph_dag import extract_functions_from_code, extract_macro_definitions
+
+        raw_code = c_file.read_text(encoding="utf-8", errors="replace")
+        macros = extract_macro_definitions(raw_code, path=str(c_file))
+        loop_macros = {k for k, v in macros.items() if int(v.get("loop_count") or 0) > 0}
+        if not loop_macros:
+            return {}
+        lines: dict[int, str] = {}
+        for item in extract_functions_from_code(raw_code, path=str(c_file)):
+            if item["name"] == fn_name:
+                for tok in item["body_tokens"]:
+                    if tok.text in loop_macros:
+                        lines.setdefault(tok.line, tok.text)
+        return lines
+    except Exception:
+        return {}
 
 
 def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
@@ -527,6 +562,25 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
             "recording the remaining unproven_goals."
         )
 
+    if res.get("wp_why3_memaddr_limitation") or _WHY3_MEMADDR_ERR_RE.search(aborts_and_unsound):
+        _add(
+            "Why3 failed with 'Type mismatch between frama_c_wp.memaddr.MemAddr.addr and int' (typically caused by "
+            '`assert(!"string_literal")` where WP\'s Cstring table types string literals as `int` IDs against '
+            '`MemAddr.null`). When `assert(!"...")` sits on an unreachable default/switch branch, place '
+            '`/*@ assert unreachable_branch: \\false; */` immediately BEFORE `assert(!"...");` and bound the '
+            'switch variable via `requires` / `loop invariant` so Qed proves `\\false` and prunes the `assert(!"...")` '
+            "goal before Why3 translation."
+        )
+
+    if res.get("wp_macro_loop_limitation") or soundness.get("macro_loop_warnings"):
+        _add(
+            "Function expands a file-scope `#define` macro containing an unannotatable C loop (`while`/`for`). "
+            "Preprocessor macros cannot carry `/*@ loop invariant */` or `/*@ loop assigns */` at invocation sites "
+            "without modifying C code. Prove the function's `assigns` and contract obligations that do not depend "
+            "on the macro loop, run the E-ACSL guardrail, and report status 'stalled_after_k_retries' so callers "
+            "can still verify against this function's contract."
+        )
+
     if status == "unproven_goals_remain":
         buckets = res.get("unproven_by_bucket") or {}
         unproven_goals = res.get("unproven_goals") or []
@@ -540,6 +594,16 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
                 "Do NOT create synthetic probe_*.c test files; once all non-allocation goals are proven and "
                 "the E-ACSL guardrail passes, stop immediately and write result.json with status "
                 "'stalled_after_k_retries'."
+            )
+        goal_annot_blob = " ".join(f"{g.get('kind') or ''} {g.get('annotation') or ''}" for g in unproven_goals)
+        if _PTR_DIFF_EQ_RE.search(goal_annot_blob) or _PTR_DIFF_EQ_RE.search(full_log):
+            _add(
+                "Pointer-difference equality bridge (`p_end - p == 0 ==> p == p_end` or `\\base_addr(p) == \\base_addr(p_end)`): "
+                "Frama-C WP's Typed model does not export `b1 == b2 ==> (ofs1 - ofs2 == 0 ==> p1 == p2)` for two "
+                "symbolic pointers even with `\\base_addr`. Anchor BOTH pointers to the same base `\\at(p, Pre)` via "
+                "explicit offset invariants (`loop invariant 0 <= p - \\at(p, Pre) <= p_end - \\at(p, Pre);` and "
+                "`loop invariant p == \\at(p, Pre) + (p - \\at(p, Pre));` plus `/*@ assert p_end == \\at(p, Pre) + (p_end - \\at(p, Pre)); */`) "
+                "so Qed reduces `p == p_end` to integer offset equality."
             )
 
         if buckets.get("step_a_assigns"):
@@ -747,6 +811,7 @@ def run_wp_on_function(
     unsigned_reduced: bool = False,
     warn_unsigned_downcast: bool = True,
     retry_bitwise: bool = True,
+    retry_tail: bool = True,
     smoke_tests: bool = False,
     prop: str | None = None,
     dump_goal: bool = False,
@@ -770,7 +835,7 @@ def run_wp_on_function(
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
     scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
-    if not artifact_suffix.endswith("_retry"):
+    if not artifact_suffix.endswith(("_retry", "_tail")):
         if _is_synthetic_probe_file(c_file, scratch_dir):
             probe_msg = (
                 f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
@@ -1096,6 +1161,20 @@ def run_wp_on_function(
         warn_invalid_pointer=warn_invalid_pointer,
         warn_unsigned_downcast=warn_unsigned_downcast,
     )
+    macro_loop_lines = _find_macro_loop_lines(c_file, fn_name)
+    if macro_loop_lines and soundness.get("tier_b_unsound"):
+        kept_tier_b: list[str] = []
+        macro_loop_warns: list[str] = []
+        for msg in soundness["tier_b_unsound"]:
+            m_line = _MISSING_ASSIGNS_LINE_RE.search(msg)
+            if m_line and int(m_line.group(2)) in macro_loop_lines:
+                macro_loop_warns.append(msg)
+            else:
+                kept_tier_b.append(msg)
+        if macro_loop_warns:
+            soundness["tier_b_unsound"] = kept_tier_b
+            soundness["macro_loop_warnings"] = macro_loop_warns
+            soundness["ok"] = len(soundness["tier_a_aborts"]) == 0 and len(soundness["tier_b_unsound"]) == 0
     if not csv_path.exists() and not soundness["tier_a_aborts"]:
         # Killed (OOM, wall-clock limit) or crashed before the report step: nothing was decided,
         # which must never read as "unproven goals remain" with nothing left to synthesize.
@@ -1229,6 +1308,7 @@ def run_wp_on_function(
                 unsigned_reduced=unsigned_reduced,
                 warn_unsigned_downcast=warn_unsigned_downcast,
                 retry_bitwise=False,
+                retry_tail=False,
                 smoke_tests=smoke_tests,
                 prop=prop,
                 dump_goal=dump_goal,
@@ -1255,6 +1335,77 @@ def run_wp_on_function(
                 return retry_res
         except Exception:
             pass
+
+    # Automatic focused tail retry when >=90% of VCs are proven (or >=5 proven properties and <=4
+    # unproven properties with >=3:1 ratio) and 1..30 VCs timed out on SMT solvers.
+    if (
+        retry_tail
+        and not prop
+        and not dump_goal
+        and len(unproven_goals) > 0
+        and soundness["ok"]
+        and not _WHY3_MEMADDR_ERR_RE.search(combined_log)
+    ):
+        proved_m = _WP_PROVED_GOALS_RE.search(combined_log)
+        timeout_m = _WP_TIMEOUT_COUNT_RE.search(combined_log)
+        vc_proved = int(proved_m.group(1)) if proved_m else 0
+        vc_total = int(proved_m.group(2)) if proved_m else 0
+        vc_timeouts = int(timeout_m.group(1)) if timeout_m else 0
+        proven_props = len(proven_goals) + len(under_hyp_goals)
+        high_vc_ratio = vc_total >= 10 and (vc_proved / vc_total) >= 0.90
+        high_prop_ratio = (
+            proven_props >= 5
+            and len(unproven_goals) <= 4
+            and (proven_props / max(1, proven_props + len(unproven_goals))) >= 0.75
+        )
+        has_timeout_tail = (1 <= vc_timeouts <= 30) or (vc_total == 0 and high_prop_ratio)
+        if (high_vc_ratio or high_prop_ratio) and has_timeout_tail:
+            tail_timeout = max(timeout * 2, 45)
+            tail_steps = max(wp_steps, 50000)
+            if tail_timeout > timeout or tail_steps > wp_steps:
+                try:
+                    tail_res = run_wp_on_function(
+                        c_file=c_file,
+                        fn_name=fn_name,
+                        out_dir=out_dir,
+                        machdep=machdep,
+                        cppflags=cppflags,
+                        provers=provers,
+                        wp_par=par,
+                        timeout=tail_timeout,
+                        wp_steps=tail_steps,
+                        wp_model=wp_model,
+                        check_memory_model=check_memory_model,
+                        warn_invalid_pointer=warn_invalid_pointer,
+                        unsigned_reduced=unsigned_reduced,
+                        warn_unsigned_downcast=warn_unsigned_downcast,
+                        retry_bitwise=False,
+                        retry_tail=False,
+                        smoke_tests=smoke_tests,
+                        prop=prop,
+                        dump_goal=dump_goal,
+                        session_dir=session_dir,
+                        extra_sources=extra_sources,
+                        wall_timeout=wall_timeout,
+                        artifact_suffix=f"{artifact_suffix}_tail",
+                        cache_dir=wp_cache if wp_cache is not None else "off",
+                        sarif=sarif,
+                        keep_goals=keep_goals,
+                    )
+                    if (
+                        tail_res.get("status") not in ("analysis_error", "acsl_syntax_error")
+                        and tail_res.get("soundness", {}).get("ok", False)
+                        and tail_res.get("unproven_count", len(unproven_goals)) < len(unproven_goals)
+                    ):
+                        tail_res["tail_retry"] = {
+                            "triggered": True,
+                            "timeout": tail_timeout,
+                            "wp_steps": tail_steps,
+                            "initial_unproven_count": len(unproven_goals),
+                        }
+                        return tail_res
+                except Exception:
+                    pass
 
     total_goals = len(proven_goals) + len(under_hyp_goals) + len(unproven_goals)
     all_valid = (total_goals > 0) and (len(unproven_goals) == 0) and (returncode == 0) and soundness["ok"]
@@ -1325,6 +1476,10 @@ def run_wp_on_function(
         res["unframed_variadic_callees"] = unframed_var_callees
     if all_unproven_are_alloc:
         res["wp_allocation_limitation"] = True
+    if _WHY3_MEMADDR_ERR_RE.search(combined_log):
+        res["wp_why3_memaddr_limitation"] = True
+    if soundness.get("macro_loop_warnings"):
+        res["wp_macro_loop_limitation"] = True
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
     return res
 
@@ -1361,6 +1516,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-retry-bitwise",
         action="store_true",
         help="Disable automatic retry with -wp-model Typed+ref+int when bitwise/shift goals remain unproven",
+    )
+    parser.add_argument(
+        "--no-retry-tail",
+        action="store_true",
+        help="Disable automatic focused tail retry when >=90% of VCs are proven and only a timeout tail remains",
     )
     parser.add_argument("--smoke-tests", action="store_true", help="Run -wp-smoke-tests vacuity check in this pass")
     parser.add_argument("--prop", default=None, help="Isolate a single named clause (-wp-prop=<name>)")
@@ -1412,6 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
         unsigned_reduced=args.no_warn_unsigned,
         warn_unsigned_downcast=not args.no_warn_unsigned_downcast,
         retry_bitwise=not args.no_retry_bitwise,
+        retry_tail=not args.no_retry_tail,
         smoke_tests=args.smoke_tests,
         prop=args.prop,
         dump_goal=args.dump_goal,

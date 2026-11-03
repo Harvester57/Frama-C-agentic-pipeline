@@ -450,6 +450,51 @@ def _compute_span_start(tokens: list[Token], last_top_boundary_idx: int, fn_name
     return start_idx
 
 
+def _find_body_brace_offset(span_text: str, path: str = "<input>") -> int | None:
+    """Return the byte offset of the function body's opening `{` inside `span_text`, or None."""
+    tokens = tokenize_c_acsl(span_text, path=path)
+    paren_depth = 0
+    for tok in tokens:
+        if tok.kind == "c_token":
+            if tok.text == "(":
+                paren_depth += 1
+            elif tok.text == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif tok.text == "{" and paren_depth == 0:
+                return tok.start
+    return None
+
+
+def has_function_contract(
+    source: str,
+    function_name: str,
+    is_header: bool = False,
+    path: str = "<input>",
+) -> bool:
+    """
+    Return True when `function_name`'s span in `source` has at least one function-level ACSL
+    contract clause (`requires`, `terminates`, `decreases`, `exits`, `assigns`, `ensures`,
+    `behavior`, `assumes`, `allocates`, `frees`, `complete`, `disjoint`) before its body `{`
+    (or `;` for a prototype).
+    """
+    span = locate_function_span(source, function_name, is_header=is_header, path=path)
+    if span is None:
+        return False
+    header_part = span.text
+    if not is_header:
+        brace_off = _find_body_brace_offset(span.text, path=path)
+        if brace_off is not None:
+            header_part = span.text[:brace_off]
+    tokens = tokenize_c_acsl(header_part, path=path)
+    for tok in tokens:
+        if tok.kind in ("acsl_block", "acsl_line"):
+            inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
+            for seg in _parse_acsl_inner_segments(inner, tok.line):
+                if seg.kind in _CONTRACT_KWS:
+                    return True
+    return False
+
+
 def splice_prover_changes(
     base_work_text: str,
     agent_work_text: str,
@@ -457,11 +502,14 @@ def splice_prover_changes(
     function_name: str,
     is_header: bool = False,
     path: str = "<input>",
+    contract_only: bool = False,
 ) -> str:
     """
     Validate that the prover only modified ACSL annotations inside `function_name`'s span
     (comparing `agent_work_text` against `base_work_text`), then splice `function_name`'s
-    updated span into `current_work_text`.
+    updated span into `current_work_text`. When `contract_only=True` and `not is_header`,
+    only the function-level contract before `{` is taken from `agent_work_text` while the
+    body `{ ... }` is preserved from `base_work_text`.
     """
     acsl_errors = verify_acsl_only(base_work_text, agent_work_text, path=path)
     if acsl_errors:
@@ -491,7 +539,14 @@ def splice_prover_changes(
             f"{path}: function '{function_name}' in workspace/work/ diverged from agent base snapshot"
         )
 
-    spliced = current_work_text[: curr_span.start_byte] + agent_span.text + current_work_text[curr_span.end_byte :]
+    replacement_span = agent_span.text
+    if contract_only and not is_header:
+        agent_brace = _find_body_brace_offset(agent_span.text, path=path)
+        base_brace = _find_body_brace_offset(base_span.text, path=path)
+        if agent_brace is not None and base_brace is not None:
+            replacement_span = agent_span.text[:agent_brace] + base_span.text[base_brace:]
+
+    spliced = current_work_text[: curr_span.start_byte] + replacement_span + current_work_text[curr_span.end_byte :]
     post_errors = verify_acsl_only(current_work_text, spliced, path=path)
     if post_errors:
         raise AcslError(f"Post-splice ACSL-only check failed on {path}:\n  " + "\n  ".join(post_errors))
