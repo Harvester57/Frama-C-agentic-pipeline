@@ -38,22 +38,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
-        with:
-          languages: ${{ matrix.language }}
-          queries: security-extended
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
-        with:
-          category: "/language:${{ matrix.language }}"
-          output: sarif-results
-          upload: never
-          upload-database: false
+      - name: Run CodeQL Analysis
+        run: |
+          set -euo pipefail
+          CODEQL_BIN="$(find /opt/hostedtoolcache/CodeQL -path '*/codeql/codeql' -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -z "${CODEQL_BIN}" ]] || ! "${CODEQL_BIN}" resolve languages | grep -q "^${{ matrix.language }} "; then
+            mkdir -p /tmp/codeql-bundle
+            curl -fsSL "https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.27.4/codeql-bundle-${{ matrix.language }}-linux64.tar.zst" \
+              | tar -x --zstd --ignore-zeros --warning=no-unknown-keyword --overwrite -f - -C /tmp/codeql-bundle
+            CODEQL_BIN="/tmp/codeql-bundle/codeql/codeql"
+          fi
+          printf 'queries:\n  - uses: security-extended\n' > /tmp/codeql-config.yaml
+          "${CODEQL_BIN}" database create /tmp/codeql-db \
+            --language="${{ matrix.language }}" \
+            --source-root=. \
+            --codescanning-config=/tmp/codeql-config.yaml \
+            --threads=2
+          mkdir -p sarif-results
+          "${CODEQL_BIN}" database analyze /tmp/codeql-db \
+            --format=sarif-latest \
+            --output="sarif-results/${{ matrix.language }}.sarif" \
+            --threads=2
 
       - name: Enforce zero CodeQL findings
         run: |

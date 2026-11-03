@@ -245,6 +245,9 @@ if [[ -n "${TARGET_COMMIT}" ]]; then
 fi
 
 HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privileges)
+if [[ "${OUTER_SANDBOX}" == "docker-hardened" ]]; then
+    HARDENING+=(--user "$(id -u):$(id -g)")
+fi
 ENV_ARGS=(-e PYTHONIOENCODING=utf-8 -e "S=/opt/framac-pipeline/scripts"
           -e "FRAMAC_OUTER_SANDBOX=${OUTER_SANDBOX}"
           -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}"

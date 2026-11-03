@@ -5,7 +5,7 @@ LABEL maintainer="Frama-C Agentic Verification Pipeline"
 LABEL description="Self-contained Frama-C (RTE, Eva, WP, E-ACSL, Mdr/SARIF) + SMT Solvers (Alt-Ergo, Z3, CVC5) + Clang/LibFuzzer + Bear container"
 
 USER root
-ENV HOME=/root
+ENV HOME=/home/opam
 ENV DEBIAN_FRONTEND=noninteractive
 ENV OPAMYES=1
 ENV OPAMROOT=/home/opam/.opam
@@ -14,6 +14,7 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PATH="/home/opam/.opam/5.5/bin:${PATH}"
 ENV FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"
+ENV WHY3CONFIG="/home/opam/.why3.conf"
 ENV S="/opt/framac-pipeline/scripts"
 
 # Install system dependencies, Clang + LibFuzzer, Bear, and SMT solvers (Z3, CVC5)
@@ -54,13 +55,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     z3 \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && chmod a+rx /home/opam \
-    && printf 'export PATH="/home/opam/.opam/5.5/bin:${PATH}"\nexport FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"\n' > /etc/profile.d/framac.sh \
+    && chmod a+rx /home/opam /root \
+    && chmod -R a+rX /home/opam/.opam \
+    && printf 'export PATH="/home/opam/.opam/5.5/bin:${PATH}"\nexport FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"\nexport WHY3CONFIG="/home/opam/.why3.conf"\n' > /etc/profile.d/framac.sh \
     && chmod 644 /etc/profile.d/framac.sh \
     && python3 -c "from pathlib import Path; p = Path('/home/opam/.opam/5.5/share/why3/provers-detection-data.conf'); p.write_text(p.read_text().replace(')$', ')'))" \
-    && why3 config detect \
-    && cp -f /root/.why3.conf /home/opam/.why3.conf \
-    && chown opam:opam /home/opam/.why3.conf
+    && why3 config detect -C /home/opam/.why3.conf \
+    && cp -f /home/opam/.why3.conf /root/.why3.conf \
+    && chmod 644 /home/opam/.why3.conf /root/.why3.conf
 
 # Optional target-specific apt packages (built via --target-packages / -TargetPackages before dropping capabilities)
 ARG TARGET_APT_PACKAGES=""
