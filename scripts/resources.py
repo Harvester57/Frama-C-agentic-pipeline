@@ -1021,7 +1021,7 @@ class Pool:
 
     def summary(self) -> dict:
         """Compact record for run-metadata.json."""
-        return {
+        out = {
             "cpus": self.cpus,
             "mem_mb": self.mem_mb,
             "sources": {k: dict(v) for k, v in self.sources.items()},
@@ -1029,6 +1029,12 @@ class Pool:
             "reserve": dict(self.reserve),
             "warnings": list(self.warnings),
         }
+        if self.scope == "container":
+            pool_cpus = (os.environ.get("FRAMAC_POOL_CPUS") or "").strip()
+            pool_mem = (os.environ.get("FRAMAC_POOL_MEM_MB") or "").strip()
+            if pool_cpus.isdigit() and pool_mem.isdigit() and int(pool_cpus) > 0 and int(pool_mem) > 0:
+                out["pool"] = {"cpus": int(pool_cpus), "mem_mb": int(pool_mem), "source": "host broker"}
+        return out
 
     def to_dict(self) -> dict:
         out = asdict(self)
@@ -1230,6 +1236,42 @@ def _probe(
     if eng is not None and not eng.ok:
         warnings.append(f"container engine view unavailable ({eng.error}); sizing from the host only")
 
+    # Warn loudly when cgroup limits are much smaller than the broker pool / engine / host capacity.
+    ref_cpus_candidates = [
+        v
+        for v in (
+            _env_float("FRAMAC_POOL_CPUS") if scope == "container" else None,
+            cpu.get("engine"),
+            cpu.get("machine"),
+        )
+        if v and v > 0
+    ]
+    ref_mem_candidates = [
+        v
+        for v in (
+            parse_mem(os.environ.get("FRAMAC_POOL_MEM_MB")) if scope == "container" else None,
+            mem.get("engine"),
+            mem.get("machine"),
+        )
+        if v and v > 0
+    ]
+    cg_cpu = cpu.get("cgroup")
+    if cg_cpu is not None and ref_cpus_candidates:
+        ref_cpu = max(ref_cpus_candidates)
+        if ref_cpu >= 2.0 and cg_cpu <= ref_cpu * 0.5:
+            warnings.append(
+                f"cgroup CPU limit ({_fmt_cpus(cg_cpu)} CPUs) is much smaller than pool/host capacity "
+                f"({_fmt_cpus(ref_cpu)} CPUs): tasks in this cgroup are throttled to {_fmt_cpus(cg_cpu)} CPUs"
+            )
+    cg_mem = mem.get("cgroup")
+    if cg_mem is not None and ref_mem_candidates:
+        ref_mem = max(ref_mem_candidates)
+        if ref_mem >= 2048 and cg_mem <= ref_mem // 2:
+            warnings.append(
+                f"cgroup memory limit ({cg_mem} MiB) is much smaller than pool/host capacity "
+                f"({ref_mem} MiB): tasks in this cgroup are capped at {cg_mem} MiB"
+            )
+
     if scope == "container" and real:
         if run_dir is None and Path("/framac-run").is_dir():
             run_dir = "/framac-run"
@@ -1351,10 +1393,20 @@ def fuzz_workers(budget: Budget | None = None) -> int:
 
 
 def pool_budget() -> Budget:
-    """The whole pipeline pool: FRAMAC_POOL_* (set by the host broker) when present, else the probe."""
+    """The whole pipeline pool: FRAMAC_POOL_* (set by the host broker) when present, else run-metadata.json's pool, else the probe."""
     cpus, mem = _env_int("FRAMAC_POOL_CPUS"), parse_mem(os.environ.get("FRAMAC_POOL_MEM_MB"))
     if cpus and mem:
         return Budget(cpus=cpus, mem_mb=mem, source="pool-env")
+    if in_container():
+        meta_path = Path("run-metadata.json")
+        if meta_path.is_file():
+            with contextlib.suppress(Exception):
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta_pool = ((meta.get("resources") or {}).get("pool") or {}) if isinstance(meta, dict) else {}
+                mc = int(meta_pool.get("cpus") or 0)
+                mm = int(meta_pool.get("mem_mb") or 0)
+                if mc > 0 and mm > 0:
+                    return Budget(cpus=cpus or mc, mem_mb=mem or mm, source="run-metadata-pool")
     own = probe(scope="container" if in_container() else "host").budget()
     return Budget(cpus=cpus or own.cpus, mem_mb=mem or own.mem_mb, source=f"pool-from-{own.source}")
 

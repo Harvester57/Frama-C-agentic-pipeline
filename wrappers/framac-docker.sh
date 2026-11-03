@@ -81,6 +81,12 @@ while [[ $# -gt 0 ]]; do
             exit 2 ;;
         --allow-run-dir-in-target) ALLOW_IN_TARGET=1; shift ;;
         --) shift; break ;;
+        -*)
+            echo "[framac-docker] ERROR: unknown wrapper option '$1'." \
+                 "Valid options: --target, --run-dir, --new-run, --repo, --target-packages, --build-if-missing," \
+                 "--allow-run-dir-in-target, --engine, --class, --no-broker, --cpus, --memory, --pids-limit," \
+                 "--cache-dir, --cache-rw, -- <command...>" >&2
+            exit 2 ;;
         *) break ;;
     esac
 done
@@ -253,7 +259,8 @@ MOUNT_ARGS=(-v "${RESOLVED_TARGET}:/target:ro${ZT}"
             -v "${PIPELINE_ROOT}/scripts:/opt/framac-pipeline/scripts:ro${Z}"
             -v "${PIPELINE_ROOT}/templates:/opt/framac-pipeline/templates:ro${Z}"
             -v "${PIPELINE_ROOT}/schemas:/opt/framac-pipeline/schemas:ro${Z}"
-            -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro${Z}")
+            -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro${Z}"
+            -v "${PIPELINE_ROOT}/docs/references:/opt/framac-pipeline/docs/references:ro${Z}")
 
 if [[ ${NO_BROKER} -eq 1 ]]; then
     exec "${ENGINE}" run "${HARDENING[@]}" --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}" \

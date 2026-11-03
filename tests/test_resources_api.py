@@ -86,11 +86,24 @@ def test_recommend_derives_agents_and_make_jobs_from_the_pool(monkeypatch):
     assert R.recommend(pool=R.Budget(1, 1024, "t"))["max_agents"] == 1
 
 
-def test_recommend_reads_the_pool_passed_by_the_host_broker(monkeypatch):
+def test_recommend_reads_the_pool_passed_by_the_host_broker(monkeypatch, tmp_path):
     monkeypatch.setenv("FRAMAC_POOL_CPUS", "24")
     monkeypatch.setenv("FRAMAC_POOL_MEM_MB", "96000")
     rec = R.recommend()
     assert rec["pool"]["cpus"] == 24 and rec["make_jobs"] == 24
+
+    # Inside a light container (1 CPU / 1024 MiB lease) when FRAMAC_POOL_* is absent, pool_budget()
+    # falls back to run-metadata.json's resources.pool so max_agents is not clamped to 1.
+    monkeypatch.delenv("FRAMAC_POOL_CPUS", raising=False)
+    monkeypatch.delenv("FRAMAC_POOL_MEM_MB", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "run-metadata.json").write_text(
+        '{"resources": {"cpus": 1, "mem_mb": 1024, "pool": {"cpus": 12, "mem_mb": 32000, "source": "host broker"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(R, "in_container", lambda root=Path("/"): True)
+    assert R.pool_budget().cpus == 12 and R.pool_budget().mem_mb == 32000
+    assert R.recommend()["max_agents"] == 6
 
 
 def test_infer_class_maps_commands_to_classes():

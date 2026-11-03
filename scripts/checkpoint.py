@@ -46,7 +46,8 @@ def cmd_load(state_dir: Path) -> None:
     print(json.dumps(data))
 
 
-def cmd_save_phase(state_dir: Path, phase: int, from_file: Path) -> None:
+def cmd_save_phase(state_dir: Path, phase: int, from_file: Path | None) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
     progress_path = state_dir / "progress.json"
     progress = load_json(progress_path)
     if not progress:
@@ -58,7 +59,7 @@ def cmd_save_phase(state_dir: Path, phase: int, from_file: Path) -> None:
             "shards_done": {},
         }
 
-    payload = load_json(from_file)
+    payload = load_json(from_file) if from_file is not None else {}
     phase_file = state_dir / f"phase{phase}.json"
     atomic_write_json(phase_file, payload)
 
@@ -111,14 +112,15 @@ def main(argv: list[str] | None = None) -> int:
     p_load = sub.add_parser("load")
     p_load.add_argument("state_dir", type=Path)
 
-    p_save = sub.add_parser("save-phase")
-    p_save.add_argument("state_dir", type=Path)
-    p_save.add_argument("--phase", type=int, required=True)
-    p_save.add_argument("--from-file", type=Path, required=True)
+    for save_cmd in ("save-phase", "save"):
+        p_save = sub.add_parser(save_cmd)
+        p_save.add_argument("state_dir", type=Path)
+        p_save.add_argument("--phase", "--phase-done", dest="phase", type=int, required=True)
+        p_save.add_argument("--from-file", type=Path, default=None)
 
     p_shard = sub.add_parser("save-shard")
     p_shard.add_argument("state_dir", type=Path)
-    p_shard.add_argument("--phase", type=int, required=True)
+    p_shard.add_argument("--phase", "--phase-done", dest="phase", type=int, required=True)
     p_shard.add_argument("--shard-id", required=True)
     p_shard.add_argument("--from-file", type=Path, required=True)
 
@@ -130,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd_init(args.state_dir, args.target, args.mode)
     elif args.action == "load":
         cmd_load(args.state_dir)
-    elif args.action == "save-phase":
+    elif args.action in ("save-phase", "save"):
         cmd_save_phase(args.state_dir, args.phase, args.from_file)
     elif args.action == "save-shard":
         cmd_save_shard(args.state_dir, args.phase, args.shard_id, args.from_file)

@@ -357,3 +357,23 @@ def test_snapshot_manifest_and_prior_run_tamper_detection(tmp_path, monkeypatch)
         )
         == 1
     )
+
+
+def test_cli_aliases_for_checkpoint_and_run_metadata(tmp_path, monkeypatch):
+    import checkpoint
+    import run_metadata
+
+    state_dir = tmp_path / "state"
+    assert checkpoint.main(["save", str(state_dir), "--phase-done", "0"]) == 0
+    prog = checkpoint.load_json(state_dir / "progress.json")
+    assert prog["phase_done"] == 0
+
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    monkeypatch.chdir(run_dir)
+    assert run_metadata.main(["init", "--repo", "demo", "--target", str(target_dir)]) == 0
+    assert run_metadata.main(["finalize", "--status", "complete"]) == 0
+    meta = run_metadata.json.loads((run_dir / "run-metadata.json").read_text(encoding="utf-8"))
+    assert meta["run_status"] == "complete"

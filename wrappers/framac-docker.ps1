@@ -144,6 +144,16 @@ $ErrorActionPreference = "Stop"
 $env:PYTHONIOENCODING = "utf-8"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# ---- Reject unknown wrapper flags bound into $Command via ValueFromRemainingArguments ----
+if ($Command -and $Command.Count -gt 0 -and $Command[0] -match '^-[A-Za-z]') {
+    [Console]::Error.WriteLine(
+        "[framac-docker] ERROR: unknown wrapper option '$($Command[0])'. " +
+        "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
+        "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -Command."
+    )
+    exit 2
+}
+
 # ---- Removed legacy sandbox switches: fail hard before anything else runs ----
 foreach ($legacy in @("NoInnerSandbox", "AllowDegradedSandbox")) {
     if ($PSBoundParameters.ContainsKey($legacy)) {
@@ -384,6 +394,7 @@ $envArgs = @(
     "-e", "S=/opt/framac-pipeline/scripts",
     "-e", "FRAMAC_OUTER_SANDBOX=$OuterSandbox",
     "-e", "FRAMAC_TARGET_HOST=$ResolvedTarget",
+    "-e", "FRAMAC_REFERENCES_HOST=$PipelineRoot/docs/references",
     "-e", "FRAMAC_REPO=$RepoName",
     "-e", "FRAMAC_RUN_ID=$RunId",
     "-e", "FRAMAC_RUN_HOST=$ResolvedRun",
@@ -402,7 +413,8 @@ $mountArgs = @(
     "-v", "${PipelineRoot}/scripts:/opt/framac-pipeline/scripts:ro$z",
     "-v", "${PipelineRoot}/templates:/opt/framac-pipeline/templates:ro$z",
     "-v", "${PipelineRoot}/schemas:/opt/framac-pipeline/schemas:ro$z",
-    "-v", "${PipelineRoot}/skills:/opt/framac-pipeline/skills:ro$z"
+    "-v", "${PipelineRoot}/skills:/opt/framac-pipeline/skills:ro$z",
+    "-v", "${PipelineRoot}/docs/references:/opt/framac-pipeline/docs/references:ro$z"
 )
 
 if ($useBroker) {

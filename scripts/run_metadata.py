@@ -360,10 +360,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scope", action="append", default=[])
     p.add_argument("--budget", type=int, default=None)
     p.add_argument("--prior-run", action="append", default=[])
-    p = sub.add_parser("set-status")
-    p.add_argument("--status", required=True, choices=["in_progress", "complete", "incomplete"])
-    p.add_argument("--reason", default=None)
-    p.add_argument("--snapshot", action="store_true", help="Also emit state/snapshot-manifest.json")
+    for status_cmd in ("set-status", "finalize"):
+        p = sub.add_parser(status_cmd)
+        p.add_argument(
+            "--status",
+            required=(status_cmd == "set-status"),
+            default="complete" if status_cmd == "finalize" else None,
+            choices=["in_progress", "complete", "incomplete"],
+        )
+        p.add_argument("--reason", default=None)
+        p.add_argument("--snapshot", action="store_true", help="Also emit state/snapshot-manifest.json")
     p = sub.add_parser("snapshot", help="Write state/snapshot-manifest.json for the run directory")
     p.add_argument("--run-dir", type=Path, default=Path("."))
     p.add_argument("--out", type=Path, default=None)
@@ -372,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "init":
             out = cmd_init(args.repo, args.target, args.profile, args.scope, args.budget, args.prior_run, args.run_id)
-        elif args.cmd == "set-status":
+        elif args.cmd in ("set-status", "finalize"):
             out = cmd_set_status(args.status, args.reason, snapshot=args.snapshot)
         elif args.cmd == "snapshot":
             out = cmd_snapshot(args.run_dir, args.out)
