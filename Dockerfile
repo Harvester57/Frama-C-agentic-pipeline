@@ -1,17 +1,22 @@
 # syntax=docker/dockerfile:1
-FROM ubuntu:24.04
+FROM framac/frama-c:dev@sha256:89ab2bd8e8a133ede99257c0403a2752c872bf2861e1a15911279a322da69cdd
 
 LABEL maintainer="Frama-C Agentic Verification Pipeline"
 LABEL description="Self-contained Frama-C (RTE, Eva, WP, E-ACSL, Mdr/SARIF) + SMT Solvers (Alt-Ergo, Z3, CVC5) + Clang/LibFuzzer + Bear container"
 
+USER root
+ENV HOME=/root
 ENV DEBIAN_FRONTEND=noninteractive
 ENV OPAMYES=1
-ENV OPAMROOT=/opt/opam
+ENV OPAMROOT=/home/opam/.opam
 ENV PYTHONIOENCODING=utf-8
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+ENV PATH="/home/opam/.opam/5.5/bin:${PATH}"
+ENV FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"
+ENV S="/opt/framac-pipeline/scripts"
 
-# Install system dependencies, Clang + LibFuzzer, Bear, SMT solvers, and OCaml/Opam build prerequisites
+# Install system dependencies, Clang + LibFuzzer, Bear, and SMT solvers (Z3, CVC5)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     autoconf \
     automake \
@@ -39,36 +44,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     llvm \
     m4 \
     ninja-build \
-    ocaml \
-    opam \
     pkg-config \
     python3 \
     python3-pip \
     python3-venv \
-     time \
+    time \
     unzip \
     wget \
     z3 \
     zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Initialize Opam and install Frama-C with Alt-Ergo, Why3, E-ACSL, and SARIF (mdr) support
-RUN opam init --bare --disable-sandboxing --root=/opt/opam && \
-    opam switch create framac ocaml-base-compiler.5.1.1 && \
-    eval $(opam env --root=/opt/opam --switch=framac) && \
-    opam update && \
-    opam install -y \
-        conf-gmp \
-        why3 \
-        alt-ergo \
-        frama-c \
-    && eval $(opam env --root=/opt/opam --switch=framac) \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod a+rx /home/opam \
+    && printf 'export PATH="/home/opam/.opam/5.5/bin:${PATH}"\nexport FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"\n' > /etc/profile.d/framac.sh \
+    && chmod 644 /etc/profile.d/framac.sh \
+    && sed -i 's/\^\\\\(\[0-9\.\]\[+\]\\\\)\$/^\\([0-9.]+\\)/g' \
+        /home/opam/.opam/5.5/share/why3/provers-detection-data.conf \
     && why3 config detect \
-    && opam clean -a -c -s --logs
-
-ENV PATH="/opt/opam/framac/bin:${PATH}"
-ENV FRAMAC_SHARE="/opt/opam/framac/share/frama-c"
-ENV S="/opt/framac-pipeline/scripts"
+    && cp -f /root/.why3.conf /home/opam/.why3.conf \
+    && chown opam:opam /home/opam/.why3.conf
 
 # Optional target-specific apt packages (built via --target-packages / -TargetPackages before dropping capabilities)
 ARG TARGET_APT_PACKAGES=""

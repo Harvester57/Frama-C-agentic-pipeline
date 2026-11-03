@@ -21,7 +21,7 @@ services:
     pids_limit: 4096
     environment:
       - PYTHONIOENCODING=utf-8
-      - OPAMROOT=/opt/opam
+      - OPAMROOT=/home/opam/.opam
       - FRAMAC_OUTER_SANDBOX=docker-hardened
     volumes:
       - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro
