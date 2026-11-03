@@ -1520,7 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-retry-tail",
         action="store_true",
-        help="Disable automatic focused tail retry when >=90% of VCs are proven and only a timeout tail remains",
+        help="Disable automatic focused tail retry when >=90%% of VCs are proven and only a timeout tail remains",
     )
     parser.add_argument("--smoke-tests", action="store_true", help="Run -wp-smoke-tests vacuity check in this pass")
     parser.add_argument("--prop", default=None, help="Isolate a single named clause (-wp-prop=<name>)")
