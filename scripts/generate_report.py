@@ -216,12 +216,32 @@ def render_report(data: dict) -> str:
     sev = Counter(r["severity"] for r in confirmed)
     covered = [u for u in ledger if u["status"] == "covered"]
     cond = [u for u in covered if u["assumptions"]]
+    blocked = [u for u in ledger if u["status"] == "blocked"]
+
+    wp_units = [
+        u
+        for u in covered
+        if any(e.get("phase") == "wp" and e.get("discharging", True) for e in u.get("evidence", []))
+    ]
+    eva_units = [
+        u
+        for u in covered
+        if u not in wp_units
+        and any(e.get("phase") == "eva" and e.get("discharging", True) for e in u.get("evidence", []))
+    ]
+    other_covered = len(covered) - len(wp_units) - len(eva_units)
+    if other_covered:
+        proof_breakdown = f" ({len(wp_units)} proven by WP, {len(eva_units)} discharged by Eva, {other_covered} other)"
+    else:
+        proof_breakdown = f" ({len(wp_units)} proven by WP, {len(eva_units)} discharged by Eva)"
+
     out += [
         f"- **Confirmed findings:** {len(confirmed)}"
         + (" (" + ", ".join(f"{sev[s]} {s}" for s in SEVERITY_ORDER if sev[s]) + ")" if confirmed else ""),
         f"- **Needs validation:** {len(needs)} (no severity; exact blockers listed)",
         f"- **Rejected candidates:** {len(rejected)} (retained to suppress repeated claims)",
-        f"- **Proof coverage:** {len(covered) - len(cond)} unit(s) proven unconditionally, {len(cond)} proven under open assumptions, out of {len(ledger)} unit(s)",
+        f"- **Blocked units:** {len(blocked)}",
+        f"- **Proof coverage:** {len(covered) - len(cond)} unit(s) proven unconditionally, {len(cond)} proven under open assumptions, out of {len(ledger)} unit(s){proof_breakdown}",
         "",
     ]
 
@@ -448,10 +468,21 @@ def render_sarif(findings: list[dict], run_dir: Path | None = None) -> dict:
         props = {"verdict": r["verdict"], "reachability": r["reachability"]}
         if r["verdict"] == "confirmed":
             props["severity"] = r["severity"]
+            sev = r["severity"].lower()
+            if sev in ("critical", "high"):
+                level = "error"
+            elif sev == "medium":
+                level = "warning"
+            elif sev == "low":
+                level = "note"
+            else:
+                level = "error"
+        else:
+            level = "warning"
         results.append(
             {
                 "ruleId": rule_id,
-                "level": "error" if r["verdict"] == "confirmed" else "warning",
+                "level": level,
                 "message": {"text": f"{r['title']}: {r['description']}"},
                 "locations": [
                     {

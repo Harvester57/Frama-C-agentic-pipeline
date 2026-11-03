@@ -155,6 +155,9 @@ HARNESS_ENTRYPOINT_NAMES = frozenset(
     }
 )
 
+DISAMBIGUATE_COLLISION_NAMES = frozenset({"main"}) | HARNESS_ENTRYPOINT_NAMES
+
+
 ZEROIZATION_CALLEES = {
     "explicit_bzero",
     "memset_s",
@@ -467,8 +470,15 @@ def analyze_signature(decl_tokens: list[Token], param_tokens: list[Token]) -> di
     if params_split:
         params_str = ", ".join(" ".join(p) for p in params_split)
 
+    non_ws_params = [t for t in param_tokens if getattr(t, "kind", "") != "whitespace" and t.text.strip()]
+    is_variadic = any(t.text == "..." for t in non_ws_params) or any(
+        non_ws_params[idx].text == "." and non_ws_params[idx + 1].text == "." and non_ws_params[idx + 2].text == "."
+        for idx in range(len(non_ws_params) - 2)
+    )
+
     return {
         "is_static": is_static,
+        "is_variadic": is_variadic,
         "returns_pointer": returns_pointer,
         "params_str": params_str,
         "param_names": param_names,
@@ -637,6 +647,8 @@ def analyze_body(
     wp_blockers: list[str] = []
     if fn_name in HARNESS_ENTRYPOINT_NAMES:
         wp_blockers.append("fuzz_or_eva_harness_entrypoint")
+    if sig_info.get("is_variadic", False):
+        wp_blockers.append("internal_variadic")
     if has_backward_goto:
         wp_blockers.append("irreducible_goto")
     if has_dynamic_alloc:
@@ -649,6 +661,8 @@ def analyze_body(
     wp_notes: list[str] = []
     if fn_name in HARNESS_ENTRYPOINT_NAMES:
         wp_notes.append("fuzz/Eva harness entrypoint: verified dynamically by E-ACSL + LibFuzzer and Eva, not WP")
+    if sig_info.get("is_variadic", False):
+        wp_notes.append("internal variadic function: Frama-C WP does not support variadic function specifications")
     if indirect_calls:
         wp_notes.append(f"indirect call(s) {indirect_calls} require '//@ calls <targets>;'")
     if self_recursive:
@@ -950,7 +964,7 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: list[Path]) -> dict[str
 
     for root, dirs, files in os.walk(target_dir):
         dirs[:] = [
-            d for d in dirs if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
+            d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}
         ]
         root_path = Path(root).resolve()
         for f in sorted(files):
@@ -1087,13 +1101,16 @@ def build_dag(
                 fpath = Path(entry.get("directory", str(target_dir))) / fpath
             fpath = fpath.resolve()
             if fpath.exists() and fpath.suffix.lower() == ".c":
-                c_files.append(fpath)
-                cmd_str = entry.get("command", "") or " ".join(entry.get("arguments", []))
-                flags = _filter_host_system_flags(re.findall(r"(?:-[IDU]\S+|-std=\S+)", cmd_str))
                 try:
                     rel_key = fpath.relative_to(target_dir).as_posix()
                 except ValueError:
                     rel_key = fpath.name
+                rel_parts = Path(rel_key).parts
+                if any(part.startswith(".") for part in rel_parts[:-1]):
+                    continue
+                c_files.append(fpath)
+                cmd_str = entry.get("command", "") or " ".join(entry.get("arguments", []))
+                flags = _filter_host_system_flags(re.findall(r"(?:-[IDU]\S+|-std=\S+)", cmd_str))
                 compile_flags_by_file[rel_key] = flags
 
     if not c_files:
@@ -1101,7 +1118,7 @@ def build_dag(
             dirs[:] = [
                 d
                 for d in dirs
-                if not d.startswith(".framac") and d not in {".git", "build", "CMakeFiles", "__pycache__"}
+                if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}
             ]
             for f in sorted(files):
                 if f.endswith(".c"):
@@ -1145,14 +1162,41 @@ def build_dag(
             sig_info = analyze_signature(item["decl_tokens"], item["param_tokens"])
             body_info = analyze_body(fn_name, item["body_tokens"], sig_info)
 
-            if fn_name in functions and functions[fn_name]["file"] != rel_path:
-                existing_file = functions[fn_name]["file"]
-                name_collisions.append({"function": fn_name, "files": [existing_file, rel_path]})
-                # Prefer non-static (exported) definition over a file-local static helper
-                if sig_info["is_static"] and not functions[fn_name].get("is_static", False):
-                    continue
+            if fn_name in DISAMBIGUATE_COLLISION_NAMES:
+                if fn_name in functions and functions[fn_name]["file"] != rel_path:
+                    existing_file = functions[fn_name]["file"]
+                    name_collisions.append({"function": fn_name, "files": [existing_file, rel_path]})
+                    existing_key = f"{existing_file}#{fn_name}"
+                    existing_rec = functions.pop(fn_name)
+                    functions[existing_key] = existing_rec
+                    ex_mod = existing_rec["module"]
+                    if fn_name in modules[ex_mod]["functions"]:
+                        ex_idx = modules[ex_mod]["functions"].index(fn_name)
+                        modules[ex_mod]["functions"][ex_idx] = existing_key
+                    if fn_name in call_edges:
+                        call_edges[existing_key] = call_edges.pop(fn_name)
+                    fn_key = f"{rel_path}#{fn_name}"
+                elif any(
+                    k == f"{rel_path}#{fn_name}"
+                    or (k.endswith(f"#{fn_name}") and functions[k].get("name") == fn_name)
+                    for k in functions
+                ):
+                    existing_files = [functions[k]["file"] for k in functions if functions[k].get("name") == fn_name]
+                    if rel_path not in existing_files:
+                        name_collisions.append({"function": fn_name, "files": existing_files + [rel_path]})
+                    fn_key = f"{rel_path}#{fn_name}"
+                else:
+                    fn_key = fn_name
+            else:
+                fn_key = fn_name
+                if fn_name in functions and functions[fn_name]["file"] != rel_path:
+                    existing_file = functions[fn_name]["file"]
+                    name_collisions.append({"function": fn_name, "files": [existing_file, rel_path]})
+                    # Prefer non-static (exported) definition over a file-local static helper
+                    if sig_info["is_static"] and not functions[fn_name].get("is_static", False):
+                        continue
 
-            functions[fn_name] = {
+            functions[fn_key] = {
                 "name": fn_name,
                 "file": rel_path,
                 "module": module_name,
@@ -1160,6 +1204,7 @@ def build_dag(
                 "end_line": item["end_line"],
                 "loc": item["loc"],
                 "is_static": sig_info["is_static"],
+                "is_variadic": sig_info.get("is_variadic", False),
                 "returns_pointer": sig_info["returns_pointer"],
                 "params": sig_info["params_str"],
                 "const_ptr_params": sig_info["const_ptr_params"],
@@ -1182,9 +1227,9 @@ def build_dag(
                 "raw_callees": sorted(body_info["direct_callees"]),
                 "cppflags": compile_flags_by_file.get(rel_path, []),
             }
-            call_edges[fn_name] = set(body_info["direct_callees"])
-            if fn_name not in modules[module_name]["functions"]:
-                modules[module_name]["functions"].append(fn_name)
+            call_edges[fn_key] = set(body_info["direct_callees"])
+            if fn_key not in modules[module_name]["functions"]:
+                modules[module_name]["functions"].append(fn_key)
 
     waves, cycles = compute_topological_waves(functions, call_edges)
     recursive_fns = {fn for scc in cycles for fn in scc}
@@ -1213,6 +1258,12 @@ def build_dag(
     for fn in all_fns:
         functions[fn]["internal_callers"] = sorted(caller for caller in all_fns if fn in call_edges[caller])
 
+    files_with_main_or_harness = {
+        f_rec["file"]
+        for f_rec in functions.values()
+        if f_rec.get("name") == "main" or f_rec.get("name") in HARNESS_ENTRYPOINT_NAMES
+    }
+
     module_summaries: dict[str, dict] = {}
     for mod_name, mod_data in sorted(modules.items()):
         mod_fns = mod_data["functions"]
@@ -1237,6 +1288,10 @@ def build_dag(
 
         # Compute transitive in-repo callee closure so slices link real sibling sources instead of fake stubs
         mod_files_set = set(mod_data["files"])
+        mod_effective_files = {f for f in mod_files_set if f not in files_with_main_or_harness}
+        if not mod_effective_files:
+            mod_effective_files = set(mod_files_set)
+
         closure_fns: set[str] = set(mod_fns)
         worklist: list[str] = list(mod_fns)
         while worklist:
@@ -1247,10 +1302,21 @@ def build_dag(
                     worklist.append(callee)
 
         cross_module_callees = sorted(
-            f for f in (closure_fns - mod_fn_set) if f in functions and functions[f]["file"] not in mod_files_set
+            f
+            for f in (closure_fns - mod_fn_set)
+            if f in functions
+            and functions[f]["file"] not in mod_files_set
+            and functions[f]["file"] not in files_with_main_or_harness
+            and functions[f].get("name") != "main"
+            and functions[f].get("name") not in HARNESS_ENTRYPOINT_NAMES
         )
         required_sources = sorted(
-            mod_files_set | {functions[f]["file"] for f in cross_module_callees if f in functions}
+            mod_effective_files
+            | {
+                functions[f]["file"]
+                for f in cross_module_callees
+                if f in functions and functions[f]["file"] not in files_with_main_or_harness
+            }
         )
         unresolved_external_callees = sorted(
             {ext for f in mod_fns if f in functions for ext in functions[f].get("external_callees", [])}

@@ -22,8 +22,8 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
    - Anchors (never rate above demonstrated impact):
      - `critical`: `untrusted_surface` + out-of-bounds write / control-flow corruption, or Layer 4 authentication bypass.
      - `high`: `untrusted_surface` out-of-bounds read of secrets, Layer 6 secret leak, Layer 5 injection into a security-relevant sink.
-     - `medium`: `untrusted_surface` DoS / non-termination, or `internal_api` memory corruption.
-     - `low`: `internal_api` read or undefined behavior with no shown security impact.
+     - `medium`: `untrusted_surface` DoS / non-termination, `untrusted_surface` arithmetic undefined behavior (signed integer overflow, divide-by-zero, invalid shift) that bypasses validation logic, corrupts state, or feeds invalid parameters into subsequent APIs, or `internal_api` memory corruption.
+     - `low`: `untrusted_surface` arithmetic undefined behavior that is strictly localized (e.g. fractional scaling) with no memory safety, bypass, or DoS effect; `internal_api` read or undefined behavior with no shown security impact.
 
 ---
 

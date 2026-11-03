@@ -136,7 +136,10 @@ param(
     [Parameter(Mandatory = $false)]
     [switch]$AllowRunDirInTarget,
 
-    [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
+    [Parameter(Mandatory = $false)]
+    [string]$ScriptFile = $null,
+
+    [Parameter(Mandatory = $false, Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Command
 )
 
@@ -149,8 +152,22 @@ if ($Command -and $Command.Count -gt 0 -and $Command[0] -match '^-[A-Za-z]') {
     [Console]::Error.WriteLine(
         "[framac-docker] ERROR: unknown wrapper option '$($Command[0])'. " +
         "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
-        "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -Command."
+        "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -ScriptFile, -Command."
     )
+    exit 2
+}
+
+if (-not $ScriptFile -and (-not $Command -or $Command.Count -eq 0)) {
+    [Console]::Error.WriteLine(
+        "[framac-docker] ERROR: either a command or -ScriptFile is required. " +
+        "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
+        "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -ScriptFile, -Command."
+    )
+    exit 2
+}
+
+if ($ScriptFile -and -not (Test-Path $ScriptFile -PathType Leaf)) {
+    [Console]::Error.WriteLine("[framac-docker] ERROR: script file '$ScriptFile' does not exist")
     exit 2
 }
 
@@ -369,7 +386,12 @@ try {
 } catch {}
 
 $RunId = Split-Path -Leaf $ResolvedRun
-$CmdString = $Command -join " "
+if ($ScriptFile) {
+    $resolvedScript = (Resolve-Path $ScriptFile).Path
+    $CmdString = [System.IO.File]::ReadAllText($resolvedScript, [System.Text.Encoding]::UTF8).Replace("`r`n", "`n")
+} else {
+    $CmdString = $Command -join " "
+}
 $TargetCommit = ""
 $TargetDirty = ""
 try {

@@ -1450,6 +1450,9 @@ def sweep(
                 f"--cppflags={shlex.join(flags)}",
                 "--cache-dir",
                 "off",
+                # Downcast to an unsigned type is C11 modulo narrowing, not UB; keep the
+                # sweep consistent with the prover path and the parent merge re-check.
+                "--no-warn-unsigned-downcast",
                 "--sarif",
                 # One out-dir per file: run_wp_function names its artifacts after the function only.
                 "--out-dir",

@@ -56,6 +56,7 @@ REPO=""
 TARGET_PACKAGES=""
 BUILD=0
 ALLOW_IN_TARGET=0
+SCRIPT_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -74,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --no-broker) NO_BROKER=1; shift ;;
         --cache-dir) CACHE_DIR="$2"; shift 2 ;;
         --cache-rw) CACHE_RW=1; shift ;;
+        --script-file) SCRIPT_FILE="$2"; shift 2 ;;
         --no-inner-sandbox|--allow-degraded-sandbox)
             echo "[framac-docker] ERROR: $1 is no longer supported. The bubblewrap inner sandbox was removed;" \
                  "the hardened container (default seccomp/AppArmor) is the isolation boundary and target-controlled" \
@@ -85,7 +87,7 @@ while [[ $# -gt 0 ]]; do
             echo "[framac-docker] ERROR: unknown wrapper option '$1'." \
                  "Valid options: --target, --run-dir, --new-run, --repo, --target-packages, --build-if-missing," \
                  "--allow-run-dir-in-target, --engine, --class, --no-broker, --cpus, --memory, --pids-limit," \
-                 "--cache-dir, --cache-rw, -- <command...>" >&2
+                 "--cache-dir, --cache-rw, --script-file, -- <command...>" >&2
             exit 2 ;;
         *) break ;;
     esac
@@ -262,16 +264,30 @@ MOUNT_ARGS=(-v "${RESOLVED_TARGET}:/target:ro${ZT}"
             -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro${Z}"
             -v "${PIPELINE_ROOT}/docs/references:/opt/framac-pipeline/docs/references:ro${Z}")
 
+if [[ -n "${SCRIPT_FILE}" ]]; then
+    if [[ ! -f "${SCRIPT_FILE}" ]]; then
+        echo "[framac-docker] ERROR: script file '${SCRIPT_FILE}' does not exist" >&2
+        exit 2
+    fi
+    CMD_STRING="$(cat "${SCRIPT_FILE}")"
+else
+    if [[ $# -eq 0 ]]; then
+        echo "[framac-docker] ERROR: either a command or --script-file is required." >&2
+        exit 2
+    fi
+    CMD_STRING="$*"
+fi
+
 if [[ ${NO_BROKER} -eq 1 ]]; then
     exec "${ENGINE}" run "${HARDENING[@]}" --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}" \
         ${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"} "${ENV_ARGS[@]}" -e "FRAMAC_IMAGE_ID=${IMAGE_ID}" \
-        "${MOUNT_ARGS[@]}" -w /framac-run "${IMAGE}" "$*"
+        "${MOUNT_ARGS[@]}" -w /framac-run "${IMAGE}" "${CMD_STRING}"
 fi
 
 # Broker path: resources.py exec leases CPUs/memory for the job class and inserts --name,
 # --label, --init, the limits, the job/pool environment and the shared cache mount after `run`.
 # The command string travels in FRAMAC_CONTAINER_CMD and becomes the entry shim's argument.
-export FRAMAC_CONTAINER_CMD="$*"
+export FRAMAC_CONTAINER_CMD="${CMD_STRING}"
 export FRAMAC_IMAGE_ID="${IMAGE_ID}"
 export FRAMAC_REPO="${REPO}"   # partitions the shared cache per repository
 EXEC_ARGS=(exec --run-dir "${RESOLVED_RUN}")

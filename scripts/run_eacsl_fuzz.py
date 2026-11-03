@@ -50,6 +50,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -70,7 +71,9 @@ from eacsl_toolchain import (  # noqa: E402
     parse_missing_functions,
     parse_undefined_fallbacks,
     preprocess_source,
+    reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
+    rewrite_sound_verdict_resets,
     select_eacsl_binary,
 )
 from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
@@ -805,18 +808,40 @@ def _compile_eacsl_binary_uncached(
                 _record(cmd1, rc, out, err)
         if rc != 0:
             return _finish(rc, "eacsl_instrumentation_failed")
-        if rte_initialized and instrumented_c.is_file():
-            # Without this, any `ensures` reading \result fails \initialized(&__retres) on every input.
-            patched, n_inits = mark_wrapper_results_initialized(
-                instrumented_c.read_text(encoding="utf-8", errors="replace")
-            )
-            if n_inits:
-                instrumented_c.write_text(patched, encoding="utf-8", newline="\n")
-                result["wrapper_result_inits"] = n_inits
+        if instrumented_c.is_file():
+            c_text = instrumented_c.read_text(encoding="utf-8", errors="replace")
+            c_modified = False
+
+            if rte_initialized:
+                # Without this, any `ensures` reading \result fails \initialized(&__retres) on every input.
+                c_text, n_inits = mark_wrapper_results_initialized(c_text)
+                if n_inits:
+                    c_modified = True
+                    result["wrapper_result_inits"] = n_inits
+                    log_parts.append(
+                        f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
+                        "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n"
+                    )
+
+            c_text, n_rewrites = rewrite_sound_verdict_resets(c_text)
+            if n_rewrites:
+                c_modified = True
+                result["sound_verdict_rewrites"] = n_rewrites
                 log_parts.append(
-                    f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
-                    "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n"
+                    f"Rewrote {n_rewrites} __e_acsl_sound_verdict = 0 reset(s) after strto*/wcsto* call(s).\n"
                 )
+
+            if fuzzer_flag:
+                c_text, n_resets = reset_verdict_on_input_entry(c_text)
+                if n_resets:
+                    c_modified = True
+                    result["verdict_resets_injected"] = n_resets
+                    log_parts.append(
+                        f"Injected {n_resets} __e_acsl_sound_verdict = 1 reset(s) at LLVMFuzzerTestOneInput entry.\n"
+                    )
+
+            if c_modified:
+                instrumented_c.write_text(c_text, encoding="utf-8", newline="\n")
 
         init_hook: list[str] = []
         if fuzzer_flag:
@@ -1053,145 +1078,173 @@ def run_fuzz_campaign(
         }
     corpus_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    scratch = artifacts_dir.parent / f".scratch_{artifacts_dir.name}"
+    scratch = Path(tempfile.gettempdir()) / f"fuzz_scratch_{artifacts_dir.name}_{os.getpid()}"
     scratch.mkdir(parents=True, exist_ok=True)
-    before_meta = {
-        p.name: (p.stat().st_mtime_ns, sha256_file(p))
-        for p in artifacts_dir.iterdir()
-        if p.is_file() and not p.is_symlink()
-    }
-
-    cmd = [
-        str(binary.resolve()),
-        f"-max_total_time={max_time}",
-        f"-timeout={per_input_timeout}",
-        f"-rss_limit_mb={rss_limit_mb}",
-        f"-artifact_prefix={artifacts_dir.resolve()}/",
-        "-print_final_stats=1",
-        str(corpus_dir.resolve()),
-    ]
-    cmd += [str(Path(d).resolve()) for d in (extra_corpus or []) if Path(d).is_dir()]
-    eff_jobs = max(1, int(jobs or 1))
-    eff_workers = max(1, int(workers or 1))
-    if eff_workers > 1 and eff_jobs == 1:
-        eff_jobs = eff_workers
-    elif eff_jobs > 1 and eff_workers == 1:
-        eff_workers = eff_jobs
-
-    if eff_workers > 1:
-        cmd.insert(1, f"-workers={eff_workers}")
-    if eff_jobs > 1:
-        cmd.insert(1, f"-jobs={eff_jobs}")
-    if dict_file and dict_file.exists():
-        cmd.insert(1, f"-dict={dict_file.resolve()}")
-
-    waves = max(1, (eff_jobs + eff_workers - 1) // eff_workers)
-    wall_timeout = max_time * waves + 180
-    cpu_mult = max(2, eff_workers + 1)
-    res = run_sandboxed(
-        cmd,
-        writable=[scratch, corpus_dir, artifacts_dir],
-        timeout_s=wall_timeout,
-        limits=Limits(cpu_seconds=wall_timeout * cpu_mult),
-        extra_env=SANITIZER_RUNTIME_ENV,
-    )
-    worker_logs: list[str] = []
-    for log_path in sorted(scratch.glob("fuzz-*.log")):
-        if log_path.is_file():
-            try:
-                worker_logs.append(log_path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                pass
-    combined_out = "\n".join([res.stdout, res.stderr, *worker_logs])
-    written_names = {Path(m.group("path").strip()).name for m in _TEST_UNIT_WRITTEN_RE.finditer(combined_out)}
-
-    all_artifact_files = [
-        p for p in sorted(artifacts_dir.iterdir()) if _artifact_kind(p.name) and p.is_file() and not p.is_symlink()
-    ]
-    selected_files: list[tuple[Path, bool]] = []
-    for p in all_artifact_files:
-        if p.name not in before_meta:
-            selected_files.append((p, False))
-        else:
-            old_mtime, old_sha = before_meta[p.name]
-            new_mtime = p.stat().st_mtime_ns
-            new_sha = sha256_file(p)
-            if new_mtime != old_mtime or new_sha != old_sha or p.name in written_names:
-                selected_files.append((p, False))
-
-    # If the fuzzer exited non-zero and hit an identical content-addressed crash artifact
-    # within the same filesystem timestamp granularity, collect existing artifacts rather
-    # than reporting fuzzer_error with an empty artifacts list.
-    if not selected_files and res.returncode != 0 and all_artifact_files:
-        selected_files = [(p, True) for p in all_artifact_files]
-
-    artifacts: list[dict] = []
-    attribution_state: dict = {"built": False, "binary": None}
-
-    def _attribution_binary() -> Path | None:
-        if attribution_builder is None:
-            return None
-        if not attribution_state["built"]:
-            attribution_state["built"] = True
-            try:
-                attribution_state["binary"] = attribution_builder()
-            except Exception:
-                attribution_state["binary"] = None
-        return attribution_state["binary"]
-
-    for p, pre_existing in selected_files:
-        kind = _artifact_kind(p.name)
-        if not kind:
-            continue
-        entry = {
-            "artifact": str(p),
-            "kind": kind,
-            "sha256": sha256_file(p),
-            "size_bytes": p.stat().st_size,
-            "failure": None,
-            "fingerprint": None,
-            "reproducible": None,
+    try:
+        before_meta = {
+            p.name: (p.stat().st_mtime_ns, sha256_file(p))
+            for p in artifacts_dir.iterdir()
+            if p.is_file() and not p.is_symlink()
         }
-        if pre_existing:
-            entry["pre_existing"] = True
-        if kind in ("crash", "leak"):
-            replay = replay_artifact(binary, p, scratch, per_input_timeout=per_input_timeout)
-            failure = replay["failure"] or parse_runtime_failure(combined_out)
-            entry["reproducible"] = replay["reproduced"]
-            entry["replay_log_tail"] = replay["log_tail"]
-            entry["failure_source"] = "primary" if failure else None
-            if needs_attribution(failure):
-                san_bin = _attribution_binary()
-                if san_bin is not None:
-                    san_replay = replay_artifact(Path(san_bin), p, scratch, per_input_timeout=per_input_timeout)
-                    entry["attribution"] = {
-                        "source": "sanitizer_replay",
-                        "binary": str(san_bin),
-                        "reproduced": san_replay["reproduced"],
-                        "failure": san_replay["failure"],
-                    }
-                    if san_replay["failure"] and not needs_attribution(san_replay["failure"]):
-                        failure = san_replay["failure"]
-                        entry["failure_source"] = "sanitizer_replay"
-            entry["failure"] = failure
-            if failure:
-                entry["fingerprint"] = make_fingerprint(
-                    failure["file"], failure["function"], failure["alarm_kind"] or failure["kind"], failure["predicate"]
-                )
-        artifacts.append(entry)
 
-    status = classify_campaign(res.returncode, res.timed_out, artifacts)
-    return {
-        "status": status,
-        "returncode": res.returncode,
-        "timed_out": res.timed_out,
-        "sandbox": res.sandbox,
-        "artifacts": artifacts,
-        "log_tail": combined_out[-4000:],
-    }
+        cmd = [
+            str(binary.resolve()),
+            f"-max_total_time={max_time}",
+            f"-timeout={per_input_timeout}",
+            f"-rss_limit_mb={rss_limit_mb}",
+            f"-artifact_prefix={artifacts_dir.resolve()}/",
+            "-print_final_stats=1",
+            str(corpus_dir.resolve()),
+        ]
+        cmd += [str(Path(d).resolve()) for d in (extra_corpus or []) if Path(d).is_dir()]
+        eff_jobs = max(1, int(jobs or 1))
+        eff_workers = max(1, int(workers or 1))
+        if eff_workers > 1 and eff_jobs == 1:
+            eff_jobs = eff_workers
+        elif eff_jobs > 1 and eff_workers == 1:
+            eff_workers = eff_jobs
+
+        if eff_workers > 1:
+            cmd.insert(1, f"-workers={eff_workers}")
+        if eff_jobs > 1:
+            cmd.insert(1, f"-jobs={eff_jobs}")
+        if dict_file and dict_file.exists():
+            cmd.insert(1, f"-dict={dict_file.resolve()}")
+
+        waves = max(1, (eff_jobs + eff_workers - 1) // eff_workers)
+        wall_timeout = max_time * waves + 180
+        cpu_mult = max(2, eff_workers + 1)
+        res = run_sandboxed(
+            cmd,
+            writable=[scratch, corpus_dir, artifacts_dir],
+            timeout_s=wall_timeout,
+            limits=Limits(cpu_seconds=wall_timeout * cpu_mult),
+            extra_env=SANITIZER_RUNTIME_ENV,
+        )
+        MAX_WORKER_LOG_BYTES = 1024 * 1024
+        worker_logs: list[str] = []
+        for log_path in sorted(scratch.glob("fuzz-*.log")):
+            if log_path.is_file():
+                try:
+                    sz = log_path.stat().st_size
+                    if sz <= MAX_WORKER_LOG_BYTES:
+                        worker_logs.append(log_path.read_text(encoding="utf-8", errors="replace"))
+                    else:
+                        with log_path.open("rb") as f:
+                            f.seek(sz - MAX_WORKER_LOG_BYTES)
+                            tail_bytes = f.read(MAX_WORKER_LOG_BYTES)
+                        worker_logs.append(
+                            "... [truncated earlier worker log] ...\n"
+                            + tail_bytes.decode("utf-8", errors="replace")
+                        )
+                except OSError:
+                    pass
+        combined_out = "\n".join([res.stdout, res.stderr, *worker_logs])
+        written_names = {Path(m.group("path").strip()).name for m in _TEST_UNIT_WRITTEN_RE.finditer(combined_out)}
+
+        all_artifact_files = [
+            p for p in sorted(artifacts_dir.iterdir()) if _artifact_kind(p.name) and p.is_file() and not p.is_symlink()
+        ]
+        selected_files: list[tuple[Path, bool]] = []
+        for p in all_artifact_files:
+            if p.name not in before_meta:
+                selected_files.append((p, False))
+            else:
+                old_mtime, old_sha = before_meta[p.name]
+                new_mtime = p.stat().st_mtime_ns
+                new_sha = sha256_file(p)
+                if new_mtime != old_mtime or new_sha != old_sha or p.name in written_names:
+                    selected_files.append((p, False))
+
+        # If the fuzzer exited non-zero and hit an identical content-addressed crash artifact
+        # within the same filesystem timestamp granularity, collect existing artifacts rather
+        # than reporting fuzzer_error with an empty artifacts list.
+        if not selected_files and res.returncode != 0 and all_artifact_files:
+            selected_files = [(p, True) for p in all_artifact_files]
+
+        artifacts: list[dict] = []
+        attribution_state: dict = {"built": False, "binary": None}
+
+        def _attribution_binary() -> Path | None:
+            if attribution_builder is None:
+                return None
+            if not attribution_state["built"]:
+                attribution_state["built"] = True
+                try:
+                    attribution_state["binary"] = attribution_builder()
+                except Exception:
+                    attribution_state["binary"] = None
+            return attribution_state["binary"]
+
+        for p, pre_existing in selected_files:
+            kind = _artifact_kind(p.name)
+            if not kind:
+                continue
+            entry = {
+                "artifact": str(p),
+                "kind": kind,
+                "sha256": sha256_file(p),
+                "size_bytes": p.stat().st_size,
+                "failure": None,
+                "fingerprint": None,
+                "reproducible": None,
+            }
+            if pre_existing:
+                entry["pre_existing"] = True
+            if kind in ("crash", "leak"):
+                replay = replay_artifact(binary, p, scratch, per_input_timeout=per_input_timeout)
+                failure = replay["failure"] or parse_runtime_failure(combined_out)
+                entry["reproducible"] = replay["reproduced"]
+                entry["replay_log_tail"] = replay["log_tail"]
+                entry["failure_source"] = "primary" if failure else None
+                if needs_attribution(failure):
+                    san_bin = _attribution_binary()
+                    if san_bin is not None:
+                        san_replay = replay_artifact(Path(san_bin), p, scratch, per_input_timeout=per_input_timeout)
+                        entry["attribution"] = {
+                            "source": "sanitizer_replay",
+                            "binary": str(san_bin),
+                            "reproduced": san_replay["reproduced"],
+                            "failure": san_replay["failure"],
+                        }
+                        if san_replay["failure"] and not needs_attribution(san_replay["failure"]):
+                            failure = san_replay["failure"]
+                            entry["failure_source"] = "sanitizer_replay"
+                entry["failure"] = failure
+                if failure:
+                    entry["fingerprint"] = make_fingerprint(
+                        failure["file"], failure["function"], failure["alarm_kind"] or failure["kind"], failure["predicate"]
+                    )
+            artifacts.append(entry)
+
+        status = classify_campaign(res.returncode, res.timed_out, artifacts)
+        return {
+            "status": status,
+            "returncode": res.returncode,
+            "timed_out": res.timed_out,
+            "sandbox": res.sandbox,
+            "artifacts": artifacts,
+            "log_tail": combined_out[-4000:],
+        }
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
+    has_unsound = bool(re.search(r"[Ww]arning:\s*(?:no sound verdict for|unsound verdict)", output or ""))
+    if has_unsound:
+        if returncode == 0 and not timed_out:
+            return {
+                "status": "guardrail_error",
+                "reason": "E-ACSL emitted unsound verdict warning during execution",
+                "unsound": True,
+            }
+        return {
+            "status": "guardrail_error",
+            "reason": "Assertion failed under unsound E-ACSL verdict",
+            "unsound": True,
+            "failure": parse_eacsl_failure(output),
+        }
     if returncode == 0 and not timed_out:
         return {"status": "passed_dynamic_oracle"}
     failure = parse_eacsl_failure(output)
@@ -1292,6 +1345,12 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "E-ACSL rejected a quantifier: E-ACSL only executes bounded integer quantifications written as "
                 "'\\forall integer k; 0 <= k < n ==> ...' (use mathematical type 'integer' and chained 'lo <= k < hi' bounds)."
             )
+        if res.get("unsound") or "unsound" in log_blob.lower() or "no sound verdict for" in log_blob.lower():
+            _add(
+                "E-ACSL emitted an unsound verdict warning: an assertion was evaluated under an untrusted verdict, "
+                "often caused by unsupported C standard library functions (e.g. unmodeled libc conversions) or constructs. "
+                "Inspect the execution output and replace unsupported calls with verified or modeled equivalents."
+            )
         if any(k in log_blob.lower() for k in ("not yet supported", "unsupported", "axiomatic", "no body")):
             _add(
                 "E-ACSL encountered an unsupported ACSL construct (such as an uninterpreted 'axiomatic' logic "
@@ -1344,6 +1403,7 @@ def run_guardrail_check(
     seed: int | None = None,
     use_cache: bool = True,
     use_verdict_cache: bool = True,
+    max_corpus_inputs: int = 64,
 ) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
@@ -1377,6 +1437,13 @@ def run_guardrail_check(
     corpus_dir.mkdir(parents=True, exist_ok=True)
     seed = derive_seed(binary, module) if seed is None else seed
 
+    corpus_entries = corpus_manifest(corpus_dir)
+    replay_manifest = (
+        corpus_entries[:max_corpus_inputs]
+        if (max_corpus_inputs is not None and max_corpus_inputs > 0 and len(corpus_entries) > max_corpus_inputs)
+        else corpus_entries
+    )
+
     g_key: str | None = None
     g_material: dict | None = None
     in_parent_guard = "parent_guard" in binary.as_posix().split("/")
@@ -1386,7 +1453,7 @@ def run_guardrail_check(
             g_material = {
                 "kind": "guardrail",
                 "binary_sha256": bin_sha,
-                "corpus": corpus_manifest(corpus_dir),
+                "corpus": replay_manifest,
                 "scratch_corpus": corpus_manifest(scratch_corpus),
                 "extra_runs": int(runs),
                 "per_input_timeout": int(per_input_timeout),
@@ -1402,6 +1469,21 @@ def run_guardrail_check(
                     cached["cache"] = {"hit": True, "key": g_key}
                     return cached
 
+    corpus_files = [
+        p
+        for p in sorted(corpus_dir.iterdir())
+        if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
+    ]
+    replay_dir = corpus_dir
+    if max_corpus_inputs is not None and max_corpus_inputs > 0 and len(corpus_files) > max_corpus_inputs:
+        replay_corpus = scratch_dir / "replay_corpus"
+        if replay_corpus.is_dir():
+            shutil.rmtree(replay_corpus, ignore_errors=True)
+        replay_corpus.mkdir(parents=True, exist_ok=True)
+        for f in corpus_files[:max_corpus_inputs]:
+            shutil.copy2(f, replay_corpus / f.name)
+        replay_dir = replay_corpus
+
     cmd = [
         str(binary.resolve()),
         f"-runs={runs}",
@@ -1410,7 +1492,7 @@ def run_guardrail_check(
         f"-seed={seed}",
         f"-artifact_prefix={scratch_dir.resolve()}/",
         str(scratch_corpus.resolve()),
-        str(corpus_dir.resolve()),
+        str(replay_dir.resolve()),
     ]
     res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
     combined_out = res.stdout + "\n" + res.stderr
@@ -2167,6 +2249,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not read or write the guardrail verdict cache",
     )
+    p_guard.add_argument(
+        "--max-corpus-inputs",
+        type=int,
+        default=64,
+        help="Maximum number of corpus inputs to replay (default: 64)",
+    )
     p_guard.add_argument("--out-json", type=Path, required=True)
 
     p_self = sub.add_parser("selftest", help="Verify the E-ACSL toolchain contract on the bundled canary")
@@ -2302,6 +2390,7 @@ def main(argv: list[str] | None = None) -> int:
                     module=args.module,
                     use_cache=use_cache,
                     use_verdict_cache=use_verdict_cache,
+                    max_corpus_inputs=args.max_corpus_inputs,
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
                 if "diagnostic_hints" not in res:

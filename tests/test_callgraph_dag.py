@@ -14,6 +14,7 @@ from build_callgraph_dag import (
     discover_in_tree_cppflags,
     extract_functions_from_code,
     infer_security_properties,
+    tokenize_c_acsl,
 )
 
 
@@ -390,3 +391,175 @@ int decode_stream(const uint8_t *buf, size_t len, uint8_t *scratch, size_t scrat
         assert "src/mod_b/util.c" in mod_a_info["required_sources"]
         assert mod_a_info["cross_module_callees"] == ["util_crc"]
         assert mod_a_info["external_callees"] == ["ext_lib_call"]
+
+    def test_detects_internal_variadic_function_signature_and_blocker(self, tmp_path: Path) -> None:
+        src = """\
+#include <stddef.h>
+#include <stdarg.h>
+
+int log_message(int level, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    va_end(args);
+    return level;
+}
+
+int fixed_message(int level, const char *msg) {
+    return level + (msg != NULL);
+}
+"""
+        fns = extract_functions_from_code(src)
+        assert len(fns) == 2
+        var_fn = next(f for f in fns if f["name"] == "log_message")
+        fix_fn = next(f for f in fns if f["name"] == "fixed_message")
+
+        sig_var = analyze_signature(var_fn["decl_tokens"], var_fn["param_tokens"])
+        assert sig_var["is_variadic"] is True
+        body_var = analyze_body("log_message", var_fn["body_tokens"], sig_var)
+        assert "internal_variadic" in body_var["wp_blockers"]
+        assert body_var["verifiability"] == "shell_unverifiable_wp"
+        assert any("variadic function" in n for n in body_var["wp_notes"])
+
+        sig_fix = analyze_signature(fix_fn["decl_tokens"], fix_fn["param_tokens"])
+        assert sig_fix["is_variadic"] is False
+        body_fix = analyze_body("fixed_message", fix_fn["body_tokens"], sig_fix)
+        assert "internal_variadic" not in body_fix["wp_blockers"]
+
+        # End-to-end DAG build
+        src_file = tmp_path / "logger.c"
+        src_file.write_text(src, encoding="utf-8")
+        dag = build_dag(tmp_path)
+        assert dag["functions"]["log_message"]["is_variadic"] is True
+        assert "internal_variadic" in dag["functions"]["log_message"]["wp_blockers"]
+        assert dag["functions"]["log_message"]["verifiability"] == "shell_unverifiable_wp"
+        assert dag["functions"]["fixed_message"]["is_variadic"] is False
+
+        # Spaced variadic dots (. . .) recognition
+        spaced_toks = tokenize_c_acsl("int bar(int x, . . .)")
+        lp = [i for i, t in enumerate(spaced_toks) if t.text == "("][0]
+        rp = [i for i, t in enumerate(spaced_toks) if t.text == ")"][0]
+        sig_spaced = analyze_signature(spaced_toks[: rp + 1], spaced_toks[lp + 1 : rp])
+        assert sig_spaced["is_variadic"] is True
+
+    def test_dot_directories_pruning_in_tree_and_compile_commands(self, tmp_path: Path) -> None:
+        import json
+
+        # Create directories: real include vs dot-directories
+        inc_real = tmp_path / "include"
+        inc_real.mkdir(parents=True)
+        (inc_real / "api.h").write_text("int api_call(void);\n", encoding="utf-8")
+
+        dot_build = tmp_path / ".build" / "headers"
+        dot_build.mkdir(parents=True)
+        (dot_build / "cached.h").write_text("int cached_call(void);\n", encoding="utf-8")
+
+        dot_cache = tmp_path / ".cache"
+        dot_cache.mkdir(parents=True)
+        (dot_cache / "stale.h").write_text("int stale_call(void);\n", encoding="utf-8")
+
+        src_dir = tmp_path / "src"
+        src_dir.mkdir(parents=True)
+        src_c = src_dir / "app.c"
+        src_c.write_text('#include "api.h"\nint app_run(void) { return api_call(); }\n', encoding="utf-8")
+
+        # In-tree discovery skips .build and .cache
+        disc = discover_in_tree_cppflags(tmp_path, [src_c])
+        assert any("include" in fl for fl in disc.get("src/app.c", []))
+        assert not any(".build" in fl or ".cache" in fl for fl in disc.get("src/app.c", []))
+
+        # Fallback discovery skips .build and .tmp C files
+        dot_c1 = tmp_path / ".build" / "gen.c"
+        dot_c1.write_text("int gen_fn(void) { return 1; }\n", encoding="utf-8")
+        dot_c2 = tmp_path / ".tmp" / "tmp.c"
+        dot_c2.parent.mkdir(parents=True)
+        dot_c2.write_text("int tmp_fn(void) { return 2; }\n", encoding="utf-8")
+
+        dag = build_dag(tmp_path)
+        assert "app_run" in dag["functions"]
+        assert "gen_fn" not in dag["functions"]
+        assert "tmp_fn" not in dag["functions"]
+
+        # compile_commands.json ingestion skips dot-directory entries
+        cc = tmp_path / "compile_commands.json"
+        cc_entries = [
+            {"directory": str(tmp_path), "file": "src/app.c", "command": "clang -c -Iinclude src/app.c"},
+            {"directory": str(tmp_path), "file": ".build/gen.c", "command": "clang -c .build/gen.c"},
+            {"directory": str(tmp_path), "file": "sub/.cache/extra.c", "command": "clang -c sub/.cache/extra.c"},
+        ]
+        cc.write_text(json.dumps(cc_entries), encoding="utf-8")
+        dag_cc = build_dag(tmp_path, compile_commands_path=cc)
+        assert "app_run" in dag_cc["functions"]
+        assert "gen_fn" not in dag_cc["functions"]
+
+    def test_main_and_harness_disambiguation_across_multiple_files(self, tmp_path: Path) -> None:
+        src_a = tmp_path / "src" / "tool_a"
+        src_b = tmp_path / "src" / "tool_b"
+        src_a.mkdir(parents=True)
+        src_b.mkdir(parents=True)
+
+        (src_a / "main.c").write_text("int main(void) { return 1; }\n", encoding="utf-8")
+        (src_b / "main.c").write_text("int main(int argc, char **argv) { return argc; }\n", encoding="utf-8")
+
+        dag = build_dag(tmp_path)
+        assert len(dag["name_collisions"]) >= 1
+        assert any(c["function"] == "main" for c in dag["name_collisions"])
+
+        # Both definitions must be retained with disambiguated file keys
+        key_a = "src/tool_a/main.c#main"
+        key_b = "src/tool_b/main.c#main"
+        assert key_a in dag["functions"]
+        assert key_b in dag["functions"]
+        assert dag["functions"][key_a]["file"] == "src/tool_a/main.c"
+        assert dag["functions"][key_b]["file"] == "src/tool_b/main.c"
+
+        # Module function lists contain their respective disambiguated keys
+        assert key_a in dag["modules"]["tool_a"]["functions"]
+        assert key_b in dag["modules"]["tool_b"]["functions"]
+
+    def test_library_module_excludes_main_and_harness_from_required_sources(self, tmp_path: Path) -> None:
+        lib_dir = tmp_path / "src" / "codec"
+        lib_dir.mkdir(parents=True)
+        (lib_dir / "codec.h").write_text("int codec_decode(const char *in);\n", encoding="utf-8")
+        (lib_dir / "codec.c").write_text(
+            '#include "codec.h"\nint codec_decode(const char *in) { return in != 0; }\n',
+            encoding="utf-8",
+        )
+        # Standalone runner in same module
+        (lib_dir / "main.c").write_text(
+            '#include "codec.h"\nint main(void) { return codec_decode("test"); }\n',
+            encoding="utf-8",
+        )
+        # Existing fuzz harness file in same module
+        (lib_dir / "fuzz_target.c").write_text(
+            '#include "codec.h"\n#include <stdint.h>\n#include <stddef.h>\n'
+            'int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return codec_decode((const char *)data); }\n',
+            encoding="utf-8",
+        )
+
+        # Another module that calls codec_decode
+        caller_dir = tmp_path / "src" / "service"
+        caller_dir.mkdir(parents=True)
+        (caller_dir / "service.c").write_text(
+            '#include "codec.h"\nint handle_request(const char *req) { return codec_decode(req); }\n',
+            encoding="utf-8",
+        )
+
+        dag = build_dag(tmp_path)
+        codec_mod = dag["modules"]["codec"]
+        service_mod = dag["modules"]["service"]
+
+        # codec module files list includes all 3 files
+        assert "src/codec/codec.c" in codec_mod["files"]
+        assert "src/codec/main.c" in codec_mod["files"]
+        assert "src/codec/fuzz_target.c" in codec_mod["files"]
+
+        # But required_sources for codec library MUST exclude main.c and fuzz_target.c
+        assert codec_mod["required_sources"] == ["src/codec/codec.c"]
+
+        # service module calls codec_decode: required_sources must only pull codec.c, not main.c or fuzz_target.c
+        assert "src/service/service.c" in service_mod["required_sources"]
+        assert "src/codec/codec.c" in service_mod["required_sources"]
+        assert "src/codec/main.c" not in service_mod["required_sources"]
+        assert "src/codec/fuzz_target.c" not in service_mod["required_sources"]
+        assert service_mod["cross_module_callees"] == ["codec_decode"]
+

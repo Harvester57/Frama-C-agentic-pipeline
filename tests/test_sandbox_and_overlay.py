@@ -326,3 +326,182 @@ def test_sh_wrapper_broker_and_legacy_paths(tmp_path):
 
     proc = subprocess.run([*base, "--agents", "2", "--", "true"], env=env, capture_output=True, text=True)
     assert proc.returncode == 0 and "deprecated" in proc.stderr
+
+
+def test_bounded_stream_drainer_small_output():
+    import io
+
+    raw = b"line 1\nline 2\nline 3\n"
+    stream = io.BytesIO(raw)
+    drainer = S.BoundedStreamDrainer(stream, head_limit=1024, tail_limit=2048)
+    drainer.run()
+    assert drainer.get_bytes() == raw
+    assert drainer.total_bytes == len(raw)
+
+
+def test_bounded_stream_drainer_overlap_no_omitted_marker():
+    import io
+
+    # tail_limit < total_bytes <= head_limit + tail_limit:
+    # Full stream should be retained with zero omitted marker and no duplication.
+    data = b"0123456789ABCDEF"  # 16 bytes
+    stream = io.BytesIO(data)
+    drainer = S.BoundedStreamDrainer(stream, head_limit=8, tail_limit=10)
+    drainer.run()
+    assert drainer.total_bytes == 16
+    res = drainer.get_bytes()
+    assert res == data
+    assert b"bytes omitted" not in res
+
+
+def test_bounded_stream_drainer_huge_output_bounds_memory_and_keeps_tail():
+    import io
+
+    # Generate 500 KB of repetitive numbered lines
+    chunks = [f"record-{i:06d}\n".encode("ascii") for i in range(35000)]
+    full_data = b"".join(chunks)
+    stream = io.BytesIO(full_data)
+
+    head_limit = 1024
+    tail_limit = 16384
+    drainer = S.BoundedStreamDrainer(stream, head_limit=head_limit, tail_limit=tail_limit)
+    drainer.run()
+    drained = drainer.get_bytes()
+
+    assert drainer.total_bytes == len(full_data)
+    # Head is intact
+    assert drained.startswith(full_data[:head_limit])
+    # Tail is intact and preserves exact last tail_limit bytes
+    assert drained.endswith(full_data[-tail_limit:])
+    assert b"output truncated" in drained
+    # OUTPUT_TAIL_BYTES (8000) semantics preserved
+    assert drained[-S.OUTPUT_TAIL_BYTES:] == full_data[-S.OUTPUT_TAIL_BYTES:]
+
+
+def test_bounded_stream_drainer_thread_no_deadlock():
+    import os
+    import threading
+
+    r, w = os.pipe()
+    r_stream = os.fdopen(r, "rb")
+    drainer = S.BoundedStreamDrainer(r_stream, head_limit=2048, tail_limit=4096)
+
+    def _writer():
+        with os.fdopen(w, "wb") as w_stream:
+            for _ in range(100):
+                w_stream.write(b"A" * 8192)  # Total 800 KB, exceeds OS pipe buffer
+
+    t_write = threading.Thread(target=_writer)
+    t_read = threading.Thread(target=drainer.run)
+    t_write.start()
+    t_read.start()
+    t_write.join(timeout=5.0)
+    t_read.join(timeout=5.0)
+
+    assert not t_write.is_alive()
+    assert not t_read.is_alive()
+    assert drainer.total_bytes == 800 * 1024
+    drained = drainer.get_bytes()
+    assert len(drained) <= 2048 + 4096 + 100  # Strictly bounded in memory
+    assert drained.endswith(b"A" * 4096)
+
+
+def test_fuzz_campaign_scratch_dir_in_tmp_and_cleaned_up(tmp_path, monkeypatch):
+    import tempfile
+
+    import run_eacsl_fuzz as R
+
+    created_scratch = []
+
+    def fake_run(cmd, writable, timeout_s, limits=None, extra_env=None):
+        scratch_dir = writable[0]
+        created_scratch.append(scratch_dir)
+        # Scratch must be under tempfile.gettempdir()
+        assert str(scratch_dir).startswith(tempfile.gettempdir())
+        # Write worker logs, one small and one very large (> 1MB)
+        (scratch_dir / "fuzz-0.log").write_text("worker 0 started\nTest unit written to ./artifacts/crash-1\n")
+        large_log = scratch_dir / "fuzz-1.log"
+        large_log.write_bytes(b"LOG_HEAD\n" + (b"fuzz worker status pulse line\n" * 45000) + b"Test unit written to ./artifacts/crash-2\n")
+        return S.SandboxResult(0, "fuzz output", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "crash-1").write_bytes(b"crash1")
+    (artifacts / "crash-2").write_bytes(b"crash2")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    dummy_bin = tmp_path / "fuzz.bin"
+    dummy_bin.write_bytes(b"\x7fELF")
+
+    res = R.run_fuzz_campaign(
+        binary=dummy_bin,
+        corpus_dir=corpus,
+        artifacts_dir=artifacts,
+        max_time=1,
+        jobs=2,
+        workers=2,
+    )
+
+    # The campaign and any artifact replays share the unified scratch directory under tempdir
+    assert len(set(created_scratch)) == 1
+    # Scratch directory must be cleaned up in finally block
+    assert not created_scratch[0].exists()
+    assert "crash-1" in res["log_tail"] or len(res["artifacts"]) >= 1
+
+
+def test_wrapper_script_file_support(tmp_path):
+    import shutil
+    import subprocess
+
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if not pwsh:
+        pytest.skip("pwsh/powershell not available")
+
+    log_file, env = _fake_engine(tmp_path)
+    script_f = tmp_path / "run_pipeline.sh"
+    script_f.write_text("echo 'hello from script file'", encoding="utf-8")
+
+    base = [
+        pwsh,
+        "-NoProfile",
+        "-File",
+        str(ROOT / "wrappers/framac-docker.ps1"),
+        "-TargetDir",
+        str(tmp_path / "target_repo"),
+        "-RunDir",
+        str(tmp_path / "run_1"),
+        "-NoBroker",
+    ]
+
+    # 1. Success with -ScriptFile and no -Command
+    proc = subprocess.run(
+        [*base, "-ScriptFile", str(script_f)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    args, _pairs = _engine_run_args(log_file)
+    assert args[-1] == "echo 'hello from script file'"
+
+    # 2. Failure when -ScriptFile does not exist
+    proc = subprocess.run(
+        [*base, "-ScriptFile", str(tmp_path / "nonexistent.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "script file" in proc.stderr.lower() and "does not exist" in proc.stderr.lower()
+
+    # 3. Failure when neither -ScriptFile nor -Command is provided
+    proc = subprocess.run(
+        base,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "either a command or -ScriptFile is required" in proc.stderr

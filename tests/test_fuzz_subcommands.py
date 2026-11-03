@@ -543,3 +543,109 @@ def test_replay_candidates_fall_back_to_the_sidecar_without_pipeline_make(run_di
     sources, out_bin, cppflags, _ = eacsl_calls[0]
     assert sources == ["src/snmp/ber.c", "workspace/work/src/snmp/pdu.c", "workspace/harnesses/harness_snmp.c"]
     assert out_bin == Path("workspace/harnesses/fuzz_snmp") and cppflags == f"-Iworkspace/work/src -I{acsl}"
+
+
+# ---------------------------------------------------------------------------
+# guardrail corpus replay capping (Item 6)
+# ---------------------------------------------------------------------------
+
+
+def test_guardrail_caps_corpus_replay_to_max_inputs(tmp_path, monkeypatch):
+    binary = tmp_path / "guard_mod.e-acsl"
+    binary.write_bytes(EACSL_MARKER_BYTES)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(parents=True, exist_ok=True)
+    # Create 100 corpus files
+    for i in range(100):
+        (corpus / f"seed_{i:03d}").write_bytes(f"input_{i}".encode())
+    scratch = tmp_path / "scratch"
+
+    calls: list[list[str]] = []
+
+    def fake_sandbox(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        calls.append(list(cmd))
+        return SandboxResult(0, "", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+
+    # 1. Default max_corpus_inputs=64
+    verdict = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod", use_cache=False)
+    assert verdict["status"] == "passed_dynamic_oracle"
+    assert len(calls) == 1
+    cmd = calls[0]
+    replay_dir_arg = Path(cmd[-1])
+    assert replay_dir_arg == scratch / "replay_corpus"
+    staged_files = sorted(f.name for f in replay_dir_arg.iterdir())
+    assert len(staged_files) == 64
+    expected_first_64 = sorted(f"seed_{i:03d}" for i in range(100))[:64]
+    assert staged_files == expected_first_64
+
+    # 2. Custom max_corpus_inputs=10
+    scratch2 = tmp_path / "scratch2"
+    verdict2 = R.run_guardrail_check(
+        binary, corpus, scratch2, runs=50, module="mod", use_cache=False, max_corpus_inputs=10
+    )
+    assert verdict2["status"] == "passed_dynamic_oracle"
+    replay_dir_arg2 = Path(calls[-1][-1])
+    assert replay_dir_arg2 == scratch2 / "replay_corpus"
+    staged_files2 = sorted(f.name for f in replay_dir_arg2.iterdir())
+    assert len(staged_files2) == 10
+    assert staged_files2 == sorted(f"seed_{i:03d}" for i in range(100))[:10]
+
+    # 3. Small corpus with 5 files (less than cap) is NOT staged into replay_corpus
+    small_corpus = tmp_path / "small_corpus"
+    small_corpus.mkdir()
+    for i in range(5):
+        (small_corpus / f"seed_{i}").write_bytes(b"data")
+    scratch3 = tmp_path / "scratch3"
+    R.run_guardrail_check(binary, small_corpus, scratch3, runs=50, module="mod", use_cache=False)
+    replay_dir_arg3 = Path(calls[-1][-1])
+    assert replay_dir_arg3 == small_corpus.resolve()
+    assert not (scratch3 / "replay_corpus").exists()
+
+
+def test_guardrail_cli_max_corpus_inputs(tmp_path, monkeypatch):
+    binary = tmp_path / "guard_mod.e-acsl"
+    binary.write_bytes(EACSL_MARKER_BYTES)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(parents=True, exist_ok=True)
+    for i in range(80):
+        (corpus / f"seed_{i:03d}").write_bytes(b"x")
+    out_bin = tmp_path / "guard_mod"
+    out_json = tmp_path / "guard.json"
+
+    seen_max_corpus = {}
+
+    def fake_compile(*a, **k):
+        return {
+            "engine": "eacsl",
+            "returncode": 0,
+            "binary": str(binary),
+            "reduced_checks": [],
+        }
+
+    def fake_run_guardrail(bin_path, corpus_dir, scratch, runs, **kwargs):
+        seen_max_corpus.update(kwargs)
+        return {"status": "passed_dynamic_oracle", "corpus_dir": str(corpus_dir)}
+
+    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(R, "run_guardrail_check", fake_run_guardrail)
+
+    rc = R.main(
+        [
+            "guardrail",
+            "--sources",
+            "mod.c",
+            "--out-bin",
+            str(out_bin),
+            "--corpus-dir",
+            str(corpus),
+            "--max-corpus-inputs",
+            "32",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    assert seen_max_corpus.get("max_corpus_inputs") == 32
+

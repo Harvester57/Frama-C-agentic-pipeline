@@ -16,6 +16,7 @@ from conftest import (
     unit,
     write_json,
 )
+from fingerprint import make_fingerprint
 from framac_common import ArtifactError
 from generate_report import generate
 
@@ -107,7 +108,9 @@ def test_report_renders_status_first_and_separates_verdicts(tmp_path):
     assert "| high | Out-of-bounds read in BER length decoder" in report
     assert "Possible signed overflow" in report.split("## 4. Needs validation")[1]
     assert "Harness passed NULL" not in report  # rejected records are not findings
+    assert "- **Blocked units:** 1" in report
     assert "1 unit(s) proven unconditionally, 1 proven under open assumptions" in report
+    assert "(0 proven by WP, 2 discharged by Eva)" in report
     assert "unproven loop variant at line 7" in report
     assert "tier3_not_scheduled" in report
 
@@ -173,3 +176,138 @@ def test_report_dedupes_same_sink_findings_and_shows_work_line_shift(tmp_path):
     assert "- **Confirmed findings:** 1 (1 high)" in report
     assert "also merged:" in report
     assert "work: `src/snmp/ber.c:45`" in report
+
+
+def test_reporting_semantics_wp_vs_eva_and_sarif_levels(tmp_path):
+    build_run(tmp_path)
+    write_json(tmp_path / "workspace/reports/wp/snmp.json", {})
+    ev_wp = [evidence(phase="wp", result="wp_proven", discharging=True, tool_output="workspace/reports/wp/snmp.json")]
+    ev_eva = [
+        evidence(phase="eva", result="eva_all_valid", discharging=True, tool_output="workspace/reports/eva/snmp.json")
+    ]
+    ev_blocked = [
+        evidence(phase="wp", result="wp_unproven", discharging=False, tool_output="workspace/reports/wp/snmp.json")
+    ]
+    fp_crit = make_fingerprint("src/a.c", "fn_crit", "mem_access", r"\valid(p)")
+    fp_high = make_fingerprint("src/a.c", "fn_high", "mem_access", r"\valid_read(p)")
+    fp_med = make_fingerprint("src/b.c", "fn_med", "signed_overflow", "x + 1 <= 100")
+    fp_low = make_fingerprint("src/b.c", "fn_low", "signed_overflow", "scale * 10 <= 1000")
+
+    f_crit = confirmed_record(fp_crit)
+    f_crit["location"] = {"file": "src/a.c", "line": 10, "function": "fn_crit"}
+    f_crit["property"] = {"kind": "mem_access", "predicate": r"\valid(p)"}
+    f_crit["severity"] = "critical"
+    f_crit["severity_rationale"] = "OOB write on untrusted surface"
+    f_crit["linked_units"] = ["src/a.c#fn_crit::rte"]
+
+    f_high = confirmed_record(fp_high)
+    f_high["location"] = {"file": "src/a.c", "line": 20, "function": "fn_high"}
+    f_high["property"] = {"kind": "mem_access", "predicate": r"\valid_read(p)"}
+    f_high["severity"] = "high"
+    f_high["severity_rationale"] = "Secret read"
+    f_high["linked_units"] = ["src/a.c#fn_high::rte"]
+
+    f_med = confirmed_record(fp_med)
+    f_med["location"] = {"file": "src/b.c", "line": 30, "function": "fn_med"}
+    f_med["property"] = {"kind": "signed_overflow", "predicate": "x + 1 <= 100"}
+    f_med["severity"] = "medium"
+    f_med["severity_rationale"] = "Arithmetic UB bypasses validation"
+    f_med["linked_units"] = ["src/b.c#fn_med::rte"]
+
+    f_low = confirmed_record(fp_low)
+    f_low["location"] = {"file": "src/b.c", "line": 40, "function": "fn_low"}
+    f_low["property"] = {"kind": "signed_overflow", "predicate": "scale * 10 <= 1000"}
+    f_low["severity"] = "low"
+    f_low["severity_rationale"] = "Localized fractional scale overflow"
+    f_low["linked_units"] = ["src/b.c#fn_low::rte"]
+
+    f_nv = needs_validation_record()
+    f_nv["linked_units"] = ["src/log/emit.c#emit_field::rte"]
+
+    ev_fuzz = [
+        evidence(
+            phase="fuzz",
+            result="fuzz_failure",
+            discharging=False,
+            tool_output="workspace/reports/fuzz/snmp.json",
+        )
+    ]
+    ledger = [
+        unit("src/a.c", "fn_wp_uncond", "rte", "covered", evidence=ev_wp),
+        unit(
+            "src/a.c",
+            "fn_wp_cond",
+            "rte",
+            "covered",
+            evidence=ev_wp,
+            assumptions=[{"kind": "caller_requires_unverified", "description": "req", "related_units": []}],
+        ),
+        unit("src/b.c", "fn_eva_1", "rte", "covered", evidence=ev_eva),
+        unit(
+            "src/b.c",
+            "fn_eva_2",
+            "rte",
+            "covered",
+            evidence=ev_eva,
+            assumptions=[{"kind": "boundary_assumption", "description": "ctx", "related_units": []}],
+        ),
+        unit("src/c.c", "fn_blocked_1", "rte", "blocked", evidence=ev_blocked, unresolved=["stuck in alt-ergo"]),
+        unit(
+            "src/c.c",
+            "fn_blocked_2",
+            "l2_termination",
+            "blocked",
+            evidence=ev_blocked,
+            unresolved=["missing loop variant"],
+        ),
+        unit("src/a.c", "fn_crit", "rte", "candidate", evidence=ev_fuzz, result_fingerprints=[fp_crit]),
+        unit("src/a.c", "fn_high", "rte", "candidate", evidence=ev_fuzz, result_fingerprints=[fp_high]),
+        unit("src/b.c", "fn_med", "rte", "candidate", evidence=ev_fuzz, result_fingerprints=[fp_med]),
+        unit("src/b.c", "fn_low", "rte", "candidate", evidence=ev_fuzz, result_fingerprints=[fp_low]),
+        unit(
+            "src/log/emit.c",
+            "emit_field",
+            "rte",
+            "candidate",
+            evidence=ev_fuzz,
+            result_fingerprints=[f_nv["fingerprint"]],
+            module="log",
+        ),
+    ]
+    ledger.sort(key=lambda u: u["coverage_id"])
+    write_json(tmp_path / "coverage-ledger.json", ledger)
+
+    repro_bytes = b"abc"
+    for rec in (f_crit, f_high, f_med, f_low):
+        crash_path = tmp_path / rec["reproducers"][0]["input"]
+        crash_path.parent.mkdir(parents=True, exist_ok=True)
+        crash_path.write_bytes(repro_bytes)
+        rec["reproducers"][0]["sha256"] = hashlib.sha256(repro_bytes).hexdigest()
+        rec["reproducers"][0]["size_bytes"] = len(repro_bytes)
+
+    write_json(tmp_path / "findings.json", sorted_findings(f_crit, f_high, f_med, f_low, f_nv))
+
+    generate(tmp_path, tmp_path)
+
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "- **Blocked units:** 2" in report
+    assert (
+        "2 unit(s) proven unconditionally, 2 proven under open assumptions, out of 11 unit(s) (2 proven by WP, 2 discharged by Eva)"
+        in report
+    )
+
+    sarif = json.loads((tmp_path / "report.sarif").read_text(encoding="utf-8"))
+    results = sarif["runs"][0]["results"]
+    assert len(results) == 5
+
+    levels_by_sev = {}
+    for r in results:
+        sev = r["properties"].get("severity", r["properties"]["verdict"])
+        levels_by_sev[sev] = r["level"]
+
+    assert levels_by_sev["critical"] == "error"
+    assert levels_by_sev["high"] == "error"
+    assert levels_by_sev["medium"] == "warning"
+    assert levels_by_sev["low"] == "note"
+    assert levels_by_sev["needs_validation"] == "warning"
+
