@@ -8,7 +8,7 @@ Two rules hold throughout:
    - WP `-wp-memlimit` is always 1000 MB per prover.
    - LibFuzzer `-rss_limit_mb` is always 2048.
    - The per-input timeout is fixed: 30 s for guardrail runs, 10 s for campaigns and replays. Guardrails and replays also use a deterministic seed.
-2. **Measure, don't remember.** Resources are re-probed on every lease and every scheduling round, with a 5-second memo. CPUs or memory added to or removed from the node take effect on the next job. Running jobs keep the size they started with: their `-wp-par`, `-workers` and `make -j` are fixed at start.
+2. **Measure, don't remember.** Resources are re-probed on every lease and every scheduling round, with a 5-second memo. CPUs or memory added to or removed from the node take effect on the next job. A running tool invocation keeps the `-wp-par`, `-workers`, and `make -j` it started with, while the host broker can grow running elastic container leases via `<engine> update` (`resources.py rebalance`) when a gated lease releases and no tickets are waiting.
 
 ---
 
@@ -65,7 +65,7 @@ Memory estimates learn from history. Each container records its peak memory, OOM
 | Tool | Sized from the job budget | Fixed |
 |---|---|---|
 | WP | `--wp-par auto` = min(CPUs, (memory − 768 MiB) / 1000 MiB). A job limited to less than 1768 MiB (one prover plus Frama-C) is not run: it reports `analysis_error`, `reason: insufficient_memory`, because starved provers fail goals that a properly sized job proves | `-wp-memlimit 1000`, `-wp-timeout` from the profile |
-| LibFuzzer campaign | `--workers auto` = min(CPUs, (memory − 512 MiB) / 2.5 GiB); wall time = max(30 s, CPU-second budget / workers). A job limited to less than 2560 MiB (512 MiB overhead + 2048 MiB `-rss_limit_mb`) is not run and reports `status: insufficient_memory` | `-rss_limit_mb 2048`, per-input `-timeout` |
+| LibFuzzer campaign | `--workers auto` = min(CPUs, (memory − 512 MiB) / 2.5 GiB); wall time = max(30 s, CPU-second budget / workers). A job limited to less than 3072 MiB (512 MiB overhead + 2560 MiB, i.e. 1.25 × 2048 MiB `-rss_limit_mb`) is not run and reports `status: insufficient_memory` | `-rss_limit_mb 2048`, per-input `-timeout` |
 | Guardrail / replay | single process | `-rss_limit_mb 2048`, per-input `-timeout`, deterministic `-seed` |
 | Eva | 1 CPU; parallelism comes from running modules side by side | `--timeout` from the profile |
 | Parent re-check (`merge-batch`) | per-function WP runs in a pool: workers = min(n, CPUs, memory / 1768 MiB), each `-wp-par = min(CPUs / workers, (memory / workers − 768 MiB) / 1000 MiB)` | as WP |
@@ -96,6 +96,7 @@ The wrappers (`framac-docker.sh` / `framac-docker.ps1`) call `resources.py exec`
 
    The command string reaches the container through `FRAMAC_CONTAINER_CMD` and the entry shim `container_entry.sh`, which runs it with `bash -lc` and then records the container's usage.
 4. **Releases the lease** when the container exits.
+   - When a gated lease releases and no tickets are waiting, the broker can grow running elastic container leases via `<engine> update` (`resources.py rebalance`); leases are never shrunk while running.
    - Ctrl-C and SIGTERM are forwarded as `docker kill`.
    - If the holder process dies, its lease is kept while the labelled container is still running.
 
@@ -103,6 +104,7 @@ While a request waits, the broker prints its queue position. Long phases are mea
 
 ```text
 python3 scripts/resources.py status     # leases held and waiting requests
+python3 scripts/resources.py rebalance  # grow running elastic container leases when free pool allows
 python3 scripts/resources.py gc         # reclaim leases of dead holders whose containers are gone
 ```
 
@@ -156,9 +158,10 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_ALLOW_UNENFORCED_LIMITS` | Allow target-executing classes without memory/pids limits | off |
 | `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE` | Run-lock wait and heartbeat staleness (seconds) | 1800, 120 |
 | `FRAMAC_WP_WALL_TIMEOUT` | Wall-clock limit for one WP run (seconds) | 3600 |
+| `FRAMAC_PROVER_WALL_BUDGET_S` | Wall-clock budget for one prover subagent session across retries (seconds) | 600 (`quick`), 900 (`standard`), 1800 (`deep`) |
 | `FRAMAC_CPUS`, `FRAMAC_MEMORY`, `FRAMAC_PIDS_LIMIT`, `FRAMAC_CONCURRENT_AGENTS` | Legacy per-container sizing, used only on the no-broker path | — |
 
-Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT` and `FRAMAC_RESOURCES_VERBOSE`. The others are read by the wrappers or the host broker. The pool reaches the container only as the broker's measurement (`FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`).
+Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT`, `FRAMAC_PROVER_WALL_BUDGET_S` and `FRAMAC_RESOURCES_VERBOSE`. The others are read by the wrappers or the host broker. The pool reaches the container only as the broker's measurement (`FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`).
 
 ---
 
@@ -227,7 +230,7 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest        # truste
 python3 $S/pipeline_make.py run replay wp-queue
 ```
 
-The trusted steps are spelled out in full: only that exact command line gets a writable shared store (Section 5).
+The trusted steps are spelled out in full: only that exact command line gets a writable shared store (Section 5). When invoking via `framac-docker.ps1` on Windows PowerShell, wrap `$S/...` commands in single quotes, escape `` `$S ``, or write `/opt/framac-pipeline/scripts/...` in full so host PowerShell does not expand `$S` as an empty host variable.
 
 | Target | Does | Trust |
 |---|---|---|

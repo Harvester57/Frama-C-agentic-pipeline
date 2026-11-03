@@ -63,7 +63,7 @@ Two layers, of which only the first is an isolation boundary:
 
 Rules:
 
-- A WP stall is **not** a finding. It is a `blocked` ledger unit with its unproven goals, attempts, and the residual E-ACSL guard. It becomes a `needs_validation` candidate only when a concrete fault hypothesis is stated.
+- A WP stall is **not** a finding. It is a `blocked` ledger unit with its unproven goals, attempts, and the residual E-ACSL guard. It becomes a `needs_validation` candidate only when a concrete `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) is stated. When a goal stalls due to a WP/SMT limitation (for example `<stdlib.h>` dynamic allocation predicates `\freeable` / `allocates`, nonlinear arithmetic, or an unreachable branch established by caller invariants) rather than a suspected bug, the prover or breaker records `"proof_gap": {"predicate": "...", "reason": "..."}` instead (`status = "blocked"` in the ledger, with no candidate created).
 - `Invalid_but_dead` Eva statuses are dead-code evidence, never a candidate.
 - **Reachability** is a recorded field: `untrusted_surface` (the harness entry corresponds to an untrusted input surface identified by reconnaissance) or `internal_api`. It caps severity.
 - **Severity anchors** (confirmed only, never above the demonstrated effect):
@@ -117,27 +117,32 @@ Evidence entries name their phase (`fuzz`, `eva`, `wp`, `audit`, `verifier`), pr
 
 A function's proof-side units are `covered` only after audit:
 
-- **Deterministic audit script**: no unexplained `Valid_under_hyp`; `-wp-smoke-tests` clean (no vacuous preconditions or dead branches); every added `requires` either proven at all verified call sites or recorded as an assumption; no axioms or admits introduced by agents; the contract diff against the last locked version shows no weakened security clause.
-- **Entry-function rule**: on `untrusted_surface` entry functions, `requires` may only state memory shape (validity, separation, non-null for non-attacker pointers) and environment facts recorded as boundary assumptions. Any value constraint on attacker-controlled bytes or lengths fails the audit and the unit becomes `blocked`.
-- **LLM auditor** (fresh agent) only for Layer 4-6 contracts and the plausibility of boundary assumptions.
+- **Deterministic audit checks (implemented):**
+  - `ledger.py audit-hypotheses --dag workspace/reports/callgraph_dag.json` (run automatically during `pipeline_make.py run wp-sweep` and `report`) resolves `callee_contract_hypothesis` / `valid_under_hyp` assumptions against callee `rte` and `l3_frame` units in the ledger (`status: "discharged"` when every non-external callee is `covered`, `"refuted"` when any callee is `blocked`/`candidate`, or `"open"` otherwise).
+  - `run_wp_function.py --smoke-tests` checks for vacuous preconditions (`\false` provable at function exit) and dead branches.
+  - Mechanical lexical checks (`acsl_ast.py` / `workspace_overlay.py check-acsl-only`) reject `admit`, `axiom`, `axiomatic`, `inductive`, vacuous `\false` clauses, and any non-ACSL token changes.
+- **Entry-function rule (implemented in briefs and parent re-checks):** on `untrusted_surface` entry functions, `requires` may only state memory shape (validity, separation, non-null for non-attacker pointers) and environment facts recorded as boundary assumptions. Any value constraint on attacker-controlled bytes or lengths fails the audit and the unit becomes `blocked`.
+- **LLM auditor (planned roadmap):** a separate fresh LLM auditor agent for Layer 4-6 contracts and boundary-assumption plausibility.
 
 ---
 
 ## 7. Agents and Structured Results
 
-Roles: recon, header architect, prover, breaker, crash verifier, proof auditor, coverage critic. Each returns exactly one JSON object validated against `schemas/agent-result.schema.json`. A malformed or prose-wrapped result is discarded, not repaired, and the task is rerun with a fresh agent if the budget allows.
+Implemented roles in `schemas/agent-result.schema.json`: `header_architect`, `prover`, `breaker`, `crash_verifier` (with `recon`, `proof_auditor`, and `coverage_critic` reserved on the M3/M4 roadmap). Each returns exactly one JSON object validated against `schemas/agent-result.schema.json`. A malformed or prose-wrapped result is discarded, not repaired, and the task is rerun with a fresh agent if the budget allows.
 
-- **Write isolation (M2)**: each prover, breaker, or architect works in its own scratch overlay and returns an annotation-only patch plus evidence. The parent applies patches serially, re-runs the kernel check, guardrail, and WP on the merged tree, and then commits. Breaker seeds are promoted from scratch into the shared corpus by the parent.
-- **Annotation-only rule (M2)**: after stripping ACSL comments, the C token stream of the work tree must equal the baseline. Confirmed findings carry remediation text and an optional separate fix patch that is never merged into the work tree.
-- **Coverage critic (M4)**: a deterministic gap script (Eva-unreached code from `-metrics-eva-cover`, unstubbed external callees, units closed without evidence, recursion cycles broken arbitrarily, function-pointer calls) feeds one fresh LLM critic per phase. The critic returns missing units and reassignments; the parent accepts or rejects them.
+- **Write isolation (M2, implemented):** each prover, breaker, or architect works in its own scratch overlay and returns an annotation-only patch plus evidence. The parent applies patches serially or in micro-batches (`merge-agent` / `merge-batch`), re-runs the kernel check, guardrail, and WP on the merged tree, and then commits. Breaker seeds are promoted from scratch into the shared corpus by the parent.
+- **Annotation-only rule (M2, implemented):** after stripping ACSL comments, the C token stream of the work tree must equal the baseline. Confirmed findings carry remediation text and an optional separate fix patch that is never merged into the work tree.
+- **Coverage critic (M4, planned roadmap):** a deterministic gap script (Eva-unreached code from `-metrics-eva-cover`, unstubbed external callees, units closed without evidence, recursion cycles broken arbitrarily, function-pointer calls) feeding a fresh LLM critic per phase.
 
 ---
 
 ## 8. Reconnaissance and Call Graph (M4)
 
-- Parallel recon agents (entry surfaces and untrusted inputs; principals, authentication, and secret handling; build and harness feasibility) return structured facts. The parent writes a capped `architecture.md` and a module table (entry functions, input shape, tier, assigned L3-L6 classes, reachability) that overrides the regex baseline. Each override records a source-backed reason.
-- The Frama-C kernel call graph, built from the AST parsed with `compile_commands.json` flags, is authoritative. Eva-resolved function-pointer edges are merged after Phase 2. The regex script remains only as a fallback, and units derived from it are flagged in the ledger.
-- A C/ACSL companion file (adapted from security-audit's memory-safety classes plus Layers 2-6) gives each class a hunting move (breakers, recon), an ACSL property pattern (provers, architects), and validation rules (verifiers). Ledger units record which blocks were selected or excluded and why; prompts copy blocks verbatim.
+- **Current implementation:** `build_callgraph_dag.py` uses a C/ACSL lexical token stream (`tokenize_c_acsl`), Tarjan's SCC algorithm for recursion cycles, `compile_commands.json` flag extraction, and structural signature/body classification (`verifiability`, `wp_blockers`, `wp_notes`, risk tiers, and Layers 2-6 property inference).
+- **Planned M4 roadmap:**
+  - Parallel recon agents (entry surfaces and untrusted inputs; principals, authentication, and secret handling; build and harness feasibility) returning structured facts to override the baseline module table with source-backed reasons.
+  - Authoritative Frama-C kernel AST call graph merged with Eva-resolved function-pointer edges after Phase 2.
+  - A C/ACSL companion file giving each vulnerability class a hunting move, ACSL property pattern, and validation rules.
 
 ---
 
@@ -145,14 +150,14 @@ Roles: recon, header architect, prover, breaker, crash verifier, proof auditor, 
 
 | Profile | Scope |
 |---|---|
-| `quick` | Phases 0-2 + crash verification; WP only on Tier 1A entry chains; one critic pass; merged verifier/auditor. |
-| `standard` | All phases; a critic per phase; separate crash verifier and proof auditor. |
-| `deep` | More fuzz time and a higher retry limit K; Tier 3 `rte` units assigned instead of deferred; final-clean critic; second auditor on L4-L6. |
+| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget, 600 s prover wall budget); WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
+| `standard` | All phases on Tier 1A, 1B, and Tier 2 validators (120 CPU-s fuzz budget, 900 s prover wall budget); final record re-verification before reporting. |
+| `deep` | Extended budgets (900 CPU-s fuzz budget, 1800 s prover wall budget, higher retry limit `K`); Tier 3 `rte` units scheduled instead of deferred. |
 
 - Profiles change breadth, never the evidence bar.
-- **Budget** (optional, in agent invocations) reserves critic and verifier/auditor calls before any prover or breaker is launched. Exhaustion sets `run_status: incomplete` with a reason.
-- **Guidance mode**: focused requests ("help me prove this function", "why does WP fail here") use the relevant brief and tooling on a scratch copy with no run directory, ledger, or report. Full mode only on an explicit pipeline request or when artifacts are requested.
-- **Carry-forward** across `run-<N>`: each unit stores hashes of its preprocessed body, its own contract, the callee contracts it relies on, the stubs it uses, and toolchain versions. A prior `covered` unit carries forward only on a full match plus a cheap WP replay. The replay is cheap because the trusted end-of-run `wp-sweep` fills the shared proof cache; see `docs/resources-and-caching.md`, Section 5. Prior `confirmed` findings re-run their reproducer. Prior `needs_validation`, `deferred`, and `blocked` units become current work. A prior `rejected` record suppresses only the identical fingerprint.
+- **Budget** (optional, in agent invocations or wall-clock budgets via `FRAMAC_PROVER_WALL_BUDGET_S`) bounds prover/breaker execution. Exhaustion sets `run_status: incomplete` with a reason.
+- **Guidance mode (implemented):** focused requests ("help me prove this function", "why does WP fail here") use the relevant brief and tooling on a scratch copy with no run directory, ledger, or report. Full mode runs on an explicit pipeline request or when artifacts are requested.
+- **Cross-run caching and carry-forward:** content-addressed shared caches (`/framac-cache`, populated by trusted `build`, `eva`, `ingest`, and end-of-run `wp-sweep` steps; see `docs/resources-and-caching.md`, Section 5) reuse E-ACSL builds, Eva reports, evolved fuzz corpora, and WP proofs across `run-<N>` directories. Run-directory snapshot manifests (`run_metadata.py snapshot` / `validate_artifacts.py snapshot`) record cryptographic digests of prior run artifacts; full per-unit ledger carry-forward across runs remains on the M5 roadmap.
 
 ---
 
@@ -182,10 +187,10 @@ Roles: recon, header architect, prover, breaker, crash verifier, proof auditor, 
 
 ## 12. Milestones
 
-| Milestone | Content |
-|---|---|
-| **M1 Foundation** | Run directory outside the target; hardened wrappers + `sandbox_exec.py` resource layer (rlimits, env allowlist, timeout); findings, candidates, ledger, metadata, and agent-result schemas; stdlib-only validators with pytest; fingerprints; status-classification fixes (fuzz outcomes, guardrail RTE vs contract, Eva dead/assumed buckets, CSV column normalization); ledger seeding and phase ingestion; report and SARIF derived from findings + ledger. |
-| **M2 Verification & Isolation** | Crash verifier brief (`crash_verifier_brief.md`) + gate (`ledger.py ingest-verifier` & `ingest-agent-hypothesis`); per-agent scratch overlays (`workspace_overlay.py init-agent`) and structural function-span patch merge + re-verification (`merge-agent`); safe artifact/seed/crash promotion (`promote_artifact.py`); lexical pure-ACSL annotation-only check (`acsl_ast.py`); harness legitimacy (exact-size `malloc(size)` + `size == 0` sentinel buffers and `harness_<mod>.json` sidecars). |
-| M3 | Deterministic proof audit, `-wp-smoke-tests`, entry-function `requires` rule, assumption resolution, LLM auditor for L4-L6. |
-| M4 | Recon agents and `architecture.md`; Frama-C call graph; C/ACSL companion file; coverage critic. |
-| M5 | Profiles and budget; hash-gated carry-forward; guidance mode. |
+| Milestone | Status | Content |
+|---|---|---|
+| **M1 Foundation** | Implemented | Run directory outside the target; hardened wrappers + `sandbox_exec.py` resource layer (rlimits, env allowlist, timeout); findings, candidates, ledger, metadata, and agent-result schemas; stdlib-only validators with pytest; fingerprints; status-classification fixes (fuzz outcomes, guardrail RTE vs contract, Eva dead/assumed buckets, CSV column normalization); ledger seeding and phase ingestion; report and SARIF derived from findings + ledger. |
+| **M2 Verification & Isolation** | Implemented | Crash verifier brief (`crash_verifier_brief.md`) + gate (`ledger.py ingest-verifier` & `ingest-agent-hypothesis`); per-agent scratch overlays (`workspace_overlay.py init-agent`) and structural function-span patch merge + re-verification (`merge-agent`, `merge-batch`); safe artifact/seed/crash promotion (`promote_artifact.py`); lexical pure-ACSL annotation-only check (`acsl_ast.py`); harness legitimacy (exact-size `malloc(size)` + `size == 0` sentinel buffers and `harness_<mod>.json` sidecars). |
+| **M3 Proof Audit** | Partial (deterministic checks implemented; LLM auditor planned) | Implemented: `ledger.py audit-hypotheses`, `run_wp_function.py --smoke-tests`, lexical `admit`/`axiom`/`\false` rejection, `proof_gap` vs `fault_hypothesis` distinction, and entry-function `requires` rules. Planned: standalone LLM proof-auditor subagent for L4-L6 contracts. |
+| **M4 Recon & Critics** | Planned | Recon subagents and `architecture.md` overrides; Frama-C kernel AST call graph + Eva function-pointer edges; C/ACSL companion file; per-phase coverage critic subagents. |
+| **M5 Profiles, Caches & Carry-Forward** | Partial (profiles, guidance mode, shared caches & snapshots implemented; ledger carry-forward planned) | Implemented: `quick` / `standard` / `deep` profiles, Guidance Mode, content-addressed per-run and cross-run caches (`cache.py`, `wp-sweep`), warm-start corpora, and snapshot manifests (`run_metadata.py snapshot`). Planned: automated per-unit ledger carry-forward across runs. |

@@ -30,7 +30,7 @@ All verification tools execute exclusively inside a reproducible **`framac-pipel
    - **Machine-independent results.** Limits that decide outcomes (`-wp-memlimit`, `-rss_limit_mb`, seeds) stay fixed.
    - **Make for deterministic work.** Per-module fuzz and Eva runs, builds, ingestion and replays run from a generated Makefile instead of LLM subagents.
    - **Caches.** Content-addressed caches reuse E-ACSL builds, Eva results and WP proofs within a run. A trusted end-of-run sweep shares proofs across runs.
-8. **Evidence Discipline (v2, see [`docs/v2-design.md`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/v2-design.md)):**
+8. **Evidence Discipline (v2, see [`docs/v2-design.md`](docs/v2-design.md)):**
    Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (function x obligation class) records what is proven unconditionally, what is proven under open assumptions, and what is blocked, deferred, or out of scope. All shared artifacts are schema-validated and the target is mounted read-only. The hardened container (no network, all capabilities dropped, no-new-privileges, Docker's default seccomp and AppArmor profiles, resource limits) is the isolation boundary; inside it, target-controlled binaries run through `sandbox_exec.py`, which applies rlimits (CPU, file size, open files, processes), a cleared environment with an explicit allowlist, and a wall-clock timeout with process-group kill. There is no filesystem isolation inside the container (see the residual-risk note in `docs/v2-design.md`, Section 3).
 
 ---
@@ -51,6 +51,8 @@ frama-c/
 │   ├── promote_artifact.py                   # Safe parent-side promotion from agents/<id>/scratch/
 │   ├── build_callgraph_dag.py                # Builds Call-Graph DAG, topological waves, & risk-tier classifications
 │   ├── generate_harness.py                   # Generates exact-size dual harnesses + harness_<mod>.json sidecars
+│   ├── eacsl_toolchain.py                    # Two-stage E-ACSL build helpers, argv validation, and variadic fallbacks
+│   ├── fuzz_dictionary.py                    # Extracts string/hex/magic-number LibFuzzer dictionaries from C sources
 │   ├── run_eacsl_fuzz.py                     # E-ACSL + LibFuzzer campaigns & Dynamic Guardrail (sandboxed, fingerprinted)
 │   ├── run_eva_slice.py                      # Runs Frama-C Eva + RTE per module slice & exports SARIF
 │   ├── run_wp_function.py                    # Runs Frama-C WP + RTE per function (-wp-fct) & buckets unproven goals
@@ -100,6 +102,7 @@ frama-c/
     ├── resources-and-caching.md              # Resource measurement, broker, job sizing, caches, Make phases, scheduler
     ├── v2-design.md                          # Evidence discipline: verdicts, ledger, isolation, milestones
     ├── troubleshooting.md                    # Common Frama-C, E-ACSL, Eva, and WP troubleshooting guide
+    ├── upstream/frama-c-e-acsl-issues.md     # Upstream Frama-C 33.0 E-ACSL & Variadic issues and pipeline mitigations
     └── references/                           # Upstream manuals (acsl/ language specs, one folder per plug-in): PDFs, greppable .md twins, INDEX.md, e-acsl-quickref.md
 ```
 
@@ -118,7 +121,7 @@ docker build "-t" "framac-pipeline:latest" "C:\Users\Florian\OneDrive\Documents\
 
 ### 2. Run a Command Inside the Hardened Container
 
-Use [framac-docker.ps1](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/wrappers/framac-docker.ps1). The target is mounted read-only at `/target`; the run directory (default `~/framac-pipeline/<repo>/run-<N>/`, created by `-NewRun`) is the read-write working directory `/framac-run`. The container has no network, drops all capabilities, keeps Docker's default seccomp and AppArmor profiles, and runs with CPU/memory/PID limits. `sandbox_exec.py probe` prints `{"sandbox": "rlimits"}` inside the container. The legacy `-NoInnerSandbox` / `-AllowDegradedSandbox` switches (`--no-inner-sandbox` / `--allow-degraded-sandbox` in the POSIX wrapper) were removed together with bubblewrap and now fail with exit code 2.
+Use [`wrappers/framac-docker.ps1`](wrappers/framac-docker.ps1). The target is mounted read-only at `/target`; the run directory (default `~/framac-pipeline/<repo>/run-<N>/`, created by `-NewRun`) is the read-write working directory `/framac-run`. The container has no network, drops all capabilities, keeps Docker's default seccomp and AppArmor profiles, and runs with CPU/memory/PID limits. `sandbox_exec.py probe` prints `{"sandbox": "rlimits"}` inside the container. The legacy `-NoInnerSandbox` / `-AllowDegradedSandbox` switches (`--no-inner-sandbox` / `--allow-degraded-sandbox` in the POSIX wrapper) were removed together with bubblewrap and now fail with exit code 2.
 
 ```powershell
 & "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
@@ -132,7 +135,7 @@ Pass the printed run directory as `-RunDir` for every later command of the same 
 
 The wrapper sizes every container itself; there are no CPU or memory flags to tune:
 - With a host Python 3.10+, it leases CPUs and memory from the measured pool and starts the container (Docker or Podman, `FRAMAC_CONTAINER_ENGINE`) with matching limits.
-- **Minimum memory floor:** Give the container engine VM at least **4 GiB of RAM** (8 GiB+ recommended for parallel runs). Tools refuse to run below their single-worker minimum (`run_wp_function.py`: **1768 MiB** = 768 MiB Frama-C kernel + 1000 MiB `-wp-memlimit`, reporting `status: "analysis_error"`, `reason: "insufficient_memory"`; `run_eacsl_fuzz.py campaign`: **2560 MiB** = 512 MiB overhead + 2048 MiB `-rss_limit_mb`, reporting `status: "insufficient_memory"`), so a 2 GiB Docker Desktop VM cannot run WP or fuzzing once the host reserve is subtracted.
+- **Minimum memory floor:** Give the container engine VM at least **4 GiB of RAM** (8 GiB+ recommended for parallel runs). Tools refuse to run below their single-worker minimum (`run_wp_function.py`: **1768 MiB** = 768 MiB Frama-C kernel + 1000 MiB `-wp-memlimit`, reporting `status: "analysis_error"`, `reason: "insufficient_memory"`; `run_eacsl_fuzz.py campaign`: **3072 MiB** = 512 MiB overhead + 2560 MiB (1.25x of 2048 MiB `-rss_limit_mb`), reporting `status: "insufficient_memory"`), so a 2 GiB Docker Desktop VM cannot run WP or fuzzing once the host reserve is subtracted.
 - Caps and knobs are environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_PIN`, `FRAMAC_CACHE`, …).
 - `-NoBroker` (`--no-broker`) restores the previous static sizing.
 - See [`docs/resources-and-caching.md`](docs/resources-and-caching.md).
@@ -141,20 +144,22 @@ The wrapper sizes every container itself; there are no CPU or memory flags to tu
 
 | Skill | Stage | Purpose |
 | :--- | :---: | :--- |
-| [`/framac-verify`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/skills/framac-verify/SKILL.md) | **All (0–4)** | End-to-end pipeline: slices the codebase, fuzzes with E-ACSL, prunes with Eva, proves with parallel WP subagents, records everything in a validated coverage ledger, and emits `REPORT.md`, `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, and `report.sarif`. |
-| [`/framac-slice`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/skills/framac-slice/SKILL.md) | **Phase 0** | Creates the `workspace/` shadow overlay, builds Call-Graph DAG & topological waves, classifies modules by Risk Tier, generates dual harnesses, and seeds the coverage ledger. |
-| [`/framac-fuzz`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice. |
-| [`/framac-eva`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -eva -then -rte` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
-| [`/framac-wp`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/skills/framac-wp/SKILL.md) | **Phase 3** | Runs the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) from `wp_scheduler.py`, with the E-ACSL Dynamic Guardrail and Adversarial Breaker subagents. |
+| [`/framac-verify`](skills/framac-verify/SKILL.md) | **All (0–4)** | End-to-end pipeline: slices the codebase, fuzzes with E-ACSL, prunes with Eva, proves with parallel WP subagents, records everything in a validated coverage ledger, and emits `REPORT.md`, `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, and `report.sarif`. |
+| [`/framac-slice`](skills/framac-slice/SKILL.md) | **Phase 0** | Creates the `workspace/` shadow overlay, builds Call-Graph DAG & topological waves, classifies modules by Risk Tier, generates dual harnesses, and seeds the coverage ledger. |
+| [`/framac-fuzz`](skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice. |
+| [`/framac-eva`](skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -eva -then -rte` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
+| [`/framac-wp`](skills/framac-wp/SKILL.md) | **Phase 3** | Runs the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) from `wp_scheduler.py`, with the E-ACSL Dynamic Guardrail and Adversarial Breaker subagents. |
 
 ---
 
 ## Documentation Index
 
-- [Architecture & Dataflow (`docs/architecture.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/architecture.md)
-- [Slicing & Onboarding 90k+ LoC Codebases (`docs/slicing-and-onboarding.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/slicing-and-onboarding.md)
-- [Proving Security Properties Beyond Memory Safety (`docs/security-properties.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/security-properties.md)
-- [Multi-Agent Swarm & Dual-Oracle Guardrail (`docs/agentic-swarm.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/agentic-swarm.md)
-- [Resources, Scheduling & Caching (`docs/resources-and-caching.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/resources-and-caching.md)
-- [Troubleshooting Guide (`docs/troubleshooting.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/troubleshooting.md)
-- [Frama-C Reference Manuals (`docs/references/README.md`)](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/docs/references/README.md): how to grep the upstream manuals instead of reading them whole
+- [Architecture & Dataflow (`docs/architecture.md`)](docs/architecture.md)
+- [Slicing & Onboarding 90k+ LoC Codebases (`docs/slicing-and-onboarding.md`)](docs/slicing-and-onboarding.md)
+- [Proving Security Properties Beyond Memory Safety (`docs/security-properties.md`)](docs/security-properties.md)
+- [Multi-Agent Swarm & Dual-Oracle Guardrail (`docs/agentic-swarm.md`)](docs/agentic-swarm.md)
+- [Resources, Scheduling & Caching (`docs/resources-and-caching.md`)](docs/resources-and-caching.md)
+- [Pipeline v2 Design & Evidence Discipline (`docs/v2-design.md`)](docs/v2-design.md)
+- [Troubleshooting Guide (`docs/troubleshooting.md`)](docs/troubleshooting.md)
+- [Upstream Frama-C 33.0 E-ACSL & Variadic Issues (`docs/upstream/frama-c-e-acsl-issues.md`)](docs/upstream/frama-c-e-acsl-issues.md)
+- [Frama-C Reference Manuals (`docs/references/README.md`)](docs/references/README.md): how to grep the upstream manuals instead of reading them whole

@@ -6,7 +6,7 @@
     Mount layout:
       /target                    target C repository, READ-ONLY
       /framac-run                run directory (~/framac-pipeline/<repo>/run-<N>), read-write, working directory
-      /opt/framac-pipeline/...   pipeline scripts, templates, schemas and skills, read-only
+      /opt/framac-pipeline/...   pipeline scripts, templates, schemas, skills and docs/references, read-only
       /framac-cache              shared cross-run cache (broker path), read-only unless -CacheRw and an
                                  allowlisted command
 
@@ -69,6 +69,10 @@
     When referencing $S (the /opt/framac-pipeline/scripts shorthand), wrap the command in single
     quotes (e.g. -Command 'python3 $S/pipeline_make.py ...') or escape the dollar sign (`$S) so
     PowerShell on the host does not expand $S as an empty host variable.
+
+.PARAMETER ScriptFile
+    Host file whose contents are passed as the container command string (instead of -Command),
+    avoiding host PowerShell quoting issues for multi-line scripts.
 
 .PARAMETER NoInnerSandbox
     Removed (bubblewrap is no longer used). Passing it fails with exit code 2.
@@ -425,7 +429,7 @@ $envArgs = @(
 )
 # Pipeline knobs that scripts read inside the container: forwarded when set on the host.
 foreach ($knob in @("FRAMAC_CACHE", "FRAMAC_CACHE_MAX", "FRAMAC_MAX_AGENTS", "FRAMAC_SCHEDULER", "FRAMAC_LOCK_TIMEOUT",
-                    "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_RESOURCES_VERBOSE")) {
+                    "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_PROVER_WALL_BUDGET_S", "FRAMAC_RESOURCES_VERBOSE")) {
     $knobValue = [Environment]::GetEnvironmentVariable($knob)
     if ($knobValue) { $envArgs += @("-e", "$knob=$knobValue") }
 }

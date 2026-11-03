@@ -106,3 +106,26 @@ def test_moved_pdf_leaves_an_orphan_but_hand_written_markdown_is_ignored(tmp_pat
 def test_committed_reference_markdown_is_up_to_date():
     # Regenerate with `python scripts/extract_references.py` after adding or replacing a PDF.
     assert stale_outputs(DEFAULT_ROOT) == []
+
+
+def test_framac_skills_mirror_is_in_sync():
+    repo_root = DEFAULT_ROOT.parent.parent
+    skills_dir = repo_root / "skills"
+    agent_skills_dir = repo_root / ".agents" / "skills"
+    primary = {
+        p.relative_to(skills_dir).as_posix(): p.read_bytes()
+        for p in sorted(skills_dir.rglob("*"))
+        if p.is_file() and p.relative_to(skills_dir).parts[0].startswith("framac-")
+    }
+    if not agent_skills_dir.is_dir():
+        return
+    mirrored = {
+        p.relative_to(agent_skills_dir).as_posix(): p.read_bytes()
+        for p in sorted(agent_skills_dir.rglob("*"))
+        if p.is_file() and p.relative_to(agent_skills_dir).parts[0].startswith("framac-")
+    }
+    if not mirrored:
+        return
+    assert primary.keys() == mirrored.keys()
+    for rel_path, content in primary.items():
+        assert mirrored[rel_path] == content, f"Skill mirror drift in {rel_path}"

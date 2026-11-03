@@ -1,6 +1,6 @@
 # Backlog: self-sizing, cache-backed, Make-driven pipeline
 
-What is still open after implementing the plan (milestones M0–M6, see `docs/resources-and-caching.md`). Nothing below is committed work yet; the implementation itself is uncommitted too.
+What remains open after implementing and committing milestones M0–M6 and the hardening follow-ups (see [`docs/resources-and-caching.md`](resources-and-caching.md)). Sections 1 and 2 track open verification items; Sections 3–5 record completed follow-ups.
 
 ## 1. Finish the end-to-end agent loop
 

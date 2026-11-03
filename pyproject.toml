@@ -34,6 +34,7 @@ known-first-party = [
     "extract_references",
     "fingerprint",
     "framac_common",
+    "fuzz_dictionary",
     "generate_harness",
     "generate_report",
     "ledger",

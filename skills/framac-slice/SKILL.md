@@ -57,7 +57,7 @@ python3 /opt/framac-pipeline/scripts/build_callgraph_dag.py --target workspace/w
 Read `workspace/reports/callgraph_dag.json` and review the structural classifications. `build_callgraph_dag.py` uses a C/ACSL lexical token stream (`tokenize_c_acsl`), Tarjan's SCC algorithm for recursion cycles, and purely structural signature/body analysis (no project-specific keyword hints):
 - Check each module's `required_sources` (the transitive in-repository `.c` file closure needed to compile and analyze the module together with its in-repo sibling callees), `cross_module_callees`, `external_callees`, and auto-discovered `cppflags`.
 - Check `name_collisions` (same-named static functions in different files), `recursion_cycles`, and `indirect_calls` (function-pointer call sites requiring `//@ calls f1, f2;` or `//@ assert fp \in {...};`).
-- Check each function's `verifiability` (`verifiable`, `needs_annotation_or_stub`, or `refactor_required`), `wp_blockers` (`irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`), and `wp_notes` (e.g., `while (n--)` unsigned wraparound idiom or pointer casts requiring `-wp-model Typed+cast`).
+- Check each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`), and `wp_notes` (e.g., `while (n--)` unsigned wraparound idiom or pointer casts requiring `-wp-model Typed+cast`).
 - Record any tier override with a source-backed reason.
 
 | Risk Tier | Code Archetype (Structural Signature & Body Profile) | Verification Route |

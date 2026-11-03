@@ -68,7 +68,7 @@ Frama-C substitutes the host's `/usr/include` standard C library with its own AC
 
 For external third-party libraries (such as OpenSSL/mbedTLS in SNMPv3 or OS hardware abstractions):
 1. **Never include third-party library `.c` files in a module slice.**
-2. Include [`templates/acsl/external_stubs.h`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/templates/acsl/external_stubs.h) or attach a concise ACSL contract to the external function's `.h` prototype:
+2. Include [`templates/acsl/external_stubs.h`](../templates/acsl/external_stubs.h) or attach a concise ACSL contract to the external function's `.h` prototype:
    ```c
    /*@
      requires \valid_read(key + (0 .. key_len - 1));

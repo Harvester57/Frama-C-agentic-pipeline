@@ -164,8 +164,9 @@ The Frama-C manuals are available as greppable Markdown under `{references_dir}`
   "unproven_goals": [],
   "strengthening_requests": [],
   "boundary_assumptions": [],
-  "fault_hypothesis": null
+  "fault_hypothesis": null,
+  "proof_gap": null
 }
 ```
 
-Set `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) only when you believe a specific input violates a specific goal; a stall without a hypothesis is reported through `unproven_goals` alone.
+Set `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) only when you believe a specific input violates a specific goal (which creates a `needs_validation` bug candidate). When a goal stalls due to a WP/SMT limitation (for example `<stdlib.h>` dynamic allocation predicates `\freeable` / `allocates` or nonlinear arithmetic) or an unreachable branch rather than a code bug, leave `fault_hypothesis` as `null` and set `proof_gap` (`{"predicate": "...", "reason": "..."}`; must be `null` when `status` is `"all_proven"`). A stall without either is reported through `unproven_goals` alone.

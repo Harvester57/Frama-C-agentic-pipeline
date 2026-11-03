@@ -5,13 +5,13 @@
 #                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
 #                    [--allow-run-dir-in-target] [--engine docker|podman|auto]
 #                    [--class CLASS] [--no-broker] [--cpus N] [--memory SIZE] [--pids-limit N]
-#                    [--cache-dir DIR|off] [--cache-rw] -- <command...>
+#                    [--cache-dir DIR|off] [--cache-rw] [--script-file FILE] -- <command...>
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
-# /opt/framac-pipeline/{scripts,templates,schemas,skills} (read-only) and, on the broker path,
-# the shared cache /framac-cache: this repository's partition of FRAMAC_CACHE_DIR, writable only
-# for the exactly allowlisted trusted commands (read-only everywhere with FRAMAC_CACHE_RW=off;
-# --cache-rw is the default and kept for compatibility).
+# /opt/framac-pipeline/{scripts,templates,schemas,skills,docs/references} (read-only) and, on the
+# broker path, the shared cache /framac-cache: this repository's partition of FRAMAC_CACHE_DIR,
+# writable only for the exactly allowlisted trusted commands (read-only everywhere with
+# FRAMAC_CACHE_RW=off; --cache-rw is the default and kept for compatibility).
 # Hardening: --network none, --cap-drop ALL, no-new-privileges, the engine's default
 # seccomp and AppArmor/SELinux profiles, cpu/memory/pids limits, allowlisted environment.
 # The container is the isolation boundary; target-controlled binaries run through
@@ -247,13 +247,15 @@ fi
 HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privileges)
 ENV_ARGS=(-e PYTHONIOENCODING=utf-8 -e "S=/opt/framac-pipeline/scripts"
           -e "FRAMAC_OUTER_SANDBOX=${OUTER_SANDBOX}"
-          -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}" -e "FRAMAC_REPO=${REPO}"
+          -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}"
+          -e "FRAMAC_REFERENCES_HOST=${PIPELINE_ROOT}/docs/references"
+          -e "FRAMAC_REPO=${REPO}"
           -e "FRAMAC_RUN_ID=${RUN_ID}" -e "FRAMAC_RUN_HOST=${RESOLVED_RUN}"
           -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"
           -e "FRAMAC_TARGET_DIRTY=${TARGET_DIRTY}")
 # Pipeline knobs that scripts read inside the container: forwarded when set on the host.
 for knob in FRAMAC_CACHE FRAMAC_CACHE_MAX FRAMAC_MAX_AGENTS FRAMAC_SCHEDULER FRAMAC_LOCK_TIMEOUT \
-            FRAMAC_LOCK_STALE FRAMAC_WP_WALL_TIMEOUT FRAMAC_RESOURCES_VERBOSE; do
+            FRAMAC_LOCK_STALE FRAMAC_WP_WALL_TIMEOUT FRAMAC_PROVER_WALL_BUDGET_S FRAMAC_RESOURCES_VERBOSE; do
     [[ -n "${!knob:-}" ]] && ENV_ARGS+=(-e "${knob}=${!knob}")
 done
 MOUNT_ARGS=(-v "${RESOLVED_TARGET}:/target:ro${ZT}"

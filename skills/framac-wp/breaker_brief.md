@@ -47,9 +47,10 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
   "failing_predicate": "the E-ACSL failing predicate, or null",
   "analysis": "how the input reaches the assertion, or why it is unreachable",
   "suggested_requires": "the caller precondition that closes the proof, or null",
-  "fault_hypothesis": null
+  "fault_hypothesis": null,
+  "proof_gap": null
 }
 ```
 
 - **`crash_found`**: give the crash artifact and failing predicate from the campaign report. The parent reproduces and fingerprints it; it becomes a candidate, not yet a finding.
-- **`clean`**: explain why the branch is dynamically unreachable (e.g., a prior sanitization check in caller `f()` restricts the range) and give the missing caller `requires` if one exists. If you still believe a specific input breaks the goal but could not produce it, fill `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`).
+- **`clean`**: explain why the branch is dynamically unreachable (e.g., a prior sanitization check in caller `f()` restricts the range) and give the missing caller `requires` if one exists. If you still believe a specific input breaks the goal but could not produce it, fill `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`). If the goal is safe/unreachable or blocked only by a WP/SMT limitation rather than a suspected bug, leave `fault_hypothesis` as `null` and optionally record `proof_gap` (`{"predicate": "...", "reason": "..."}`).

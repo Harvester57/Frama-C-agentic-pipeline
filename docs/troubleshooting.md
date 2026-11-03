@@ -129,7 +129,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 | Symptom in `wp.log` / `run_wp_function.py` | Root Cause | Exact Fix |
 | :--- | :--- | :--- |
 | Every goal after a loop fails, even for untouched variables | Missing `loop assigns` (WP havocs all memory on every iteration) | Write `loop assigns` (**Step A**) before any `loop invariant` (**Step B**). |
-| `loop invariant` is `Valid` for `established`, `Unknown` for `preserved` | Invariant is not inductive across `i -> i + 1` or omits modified variables | Conjoin loop counter bounds (`0 <= i <= n`) with accumulator/pointer relationship (`p == base + i`), or drill down with `--prop <name> --dump-goal`. |
+| `loop invariant` is `Valid` for `established`, `Unknown` for `preserved` | Invariant is not inductive across `i -> i + 1` or omits modified variables | Conjoin loop counter bounds (`0 <= i <= n`) with accumulator/pointer relationship (`offset == i * sizeof(elem_t)`), constrain all variables modified in the loop body, or drill down with `--prop <clause_name> --dump-goal` (`vc_goal_dumps`). |
 | `loop invariant` fails `established` on `0 <= i <= n` | `n` can be negative on entry | Add `requires n >= 0;` (or use unsigned `size_t`). |
 | `[wp] warning: Missing assigns clause` | Loop or callee lacks `assigns` (`run_wp_function.py` flags this as `unsound_proof`) | Add explicit `loop assigns ...;` and callee `assigns ...;`. |
 | `[wp] warning: Memory model hypotheses for function ...` | `-wp-check-memory-model` detected raw `\separated` missing on pointer arguments | Add `requires \separated(p + (0 .. n-1), q + (0 .. m-1));` to the function contract. |
@@ -140,20 +140,9 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 | Address taken `&local_var` passed to helper | Stack variable address taken | Pass `--wp-model Typed+ref` (the default in `run_wp_function.py`). |
 | `syntax error` on `terminates` or `exits` | Wrong ACSL clause order in function contract | Order clauses strictly: `requires` -> `terminates` / `decreases` -> `exits` -> `assigns` -> `ensures` -> `behavior`. |
 
-### Symptom: Every Goal After a Loop Fails in WP, Even for Variables the Loop Never Touches
-- **Cause:** Missing `loop assigns` clause on the loop! In Frama-C WP, if a loop does not have a `loop assigns` clause, WP assumes the loop body can arbitrarily modify **all memory in the program** on every iteration.
-- **Fix:** Always follow `prover_brief.md`'s mandatory order: write `loop assigns` (**Step A**) before writing any `loop invariant` (**Step B**).
-
-### Symptom: `loop invariant` Is Marked `Valid` for Establishment, But `Unknown` for Preservation
-- **Cause:** The invariant is true on loop entry (`i == 0`), but not inductive—meaning knowing the invariant holds at iteration `i` is not strong enough for the SMT solver to prove it holds at `i + 1`.
-- **Fix:**
-  - Conjoin the relationship between the loop counter `i` and the accumulator/pointer offset (e.g., `loop invariant offset == i * sizeof(elem_t);` and `loop invariant 0 <= i <= count;`).
-  - Ensure all variables modified inside the loop body have their bounds constrained in the `loop invariant`.
-  - Run `run_wp_function.py --prop <clause_name> --dump-goal` and inspect `vc_goal_dumps` to see the exact unproven hypothesis in the sequent.
-
 ### Symptom: PowerShell Splits Frama-C or Docker CLI Flags Containing `.` or `=`
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.
-- **Fix:** Always invoke container commands through [`wrappers/framac-docker.ps1`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
+- **Fix:** Always invoke container commands through [`wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
 
 ---
 

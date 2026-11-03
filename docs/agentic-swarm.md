@@ -21,7 +21,7 @@ LLM subagents are used only where judgment is needed.
 ### Level 1: Module-Level Parallelism without Subagents (Phase 1 `/framac-fuzz` & Phase 2 `/framac-eva`)
 Independent modules (`snmpv3`, `syslog`, `xml`, `ipc`, etc.) share no internal state during slice verification, and their fuzz and Eva runs need no reasoning.
 - A generated Makefile (`pipeline_make.py`) runs them. Each recipe is admitted by CPU and memory inside one container per phase.
-- Fuzzing (CPU-bound) and Eva (single-threaded, memory-bound) run **at the same time**, as two background phases. Ingestion keeps the fuzz-then-Eva order.
+- Fuzzing (CPU-bound) and Eva (single-threaded, memory-bound) can run either **sequentially in the foreground** (giving standalone `eva` a writable `rw` `/framac-cache` mount) or **concurrently in the background** as two wrapper calls (where `eva` mounts `/framac-cache` read-only while `fuzz` runs target code). Ingestion keeps the fuzz-then-Eva order.
 - Each campaign runs as many LibFuzzer workers as its lease allows. Builds and Eva results are cached by content, so a harness repair re-runs only what changed.
 
 ### Level 2: Speculative Header Decoupling (architects)
@@ -78,7 +78,7 @@ int parse_ber_length(const uint8_t *buf, size_t max_len);
 ```
 whereas Caller `B` needs to know that `\result <= (int)max_len` to prove that advancing `buf + \result` stays in bounds.
 
-Instead of allowing Caller Subagent `B` to edit Callee `A`'s contract directly (which could break `A`'s proof or cause race conditions between parallel subagents), `B` invokes [`scripts/contract_negotiator.py`](file:///C:/Users/Florian/OneDrive/Documents/Dev/frama-c/scripts/contract_negotiator.py):
+Instead of allowing Caller Subagent `B` to edit Callee `A`'s contract directly (which could break `A`'s proof or cause race conditions between parallel subagents), `B` invokes [`scripts/contract_negotiator.py`](../scripts/contract_negotiator.py):
 
 ```bash
 python3 /opt/framac-pipeline/scripts/contract_negotiator.py request \

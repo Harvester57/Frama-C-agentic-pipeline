@@ -138,7 +138,8 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
 3. Re-prove every merged function on the final tree: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`, written exactly so, with the full path. This is the trusted sweep:
    - it does not read the per-run WP cache;
    - it feeds the shared proof cache for later runs;
-   - it ingests regressions into the ledger.
+   - it ingests regressions into the ledger;
+   - it runs `python3 /opt/framac-pipeline/scripts/ledger.py audit-hypotheses --dag workspace/reports/callgraph_dag.json` (also run during `pipeline_make.py run report`) to resolve `callee_contract_hypothesis` / `valid_under_hyp` assumptions against callee `rte` and `l3_frame` statuses in the ledger (`discharged`, `refuted`, or `open`).
 
    If `workspace/reports/wp-sweep/summary.json` reports `regressions`, those functions' units are now `blocked`. Find out why (usually a later callee contract change) before marking the run complete.
 4. Run `python3 /opt/framac-pipeline/scripts/workspace_overlay.py export-diff` to write `workspace/reports/verified_acsl.patch` and copy verified `.h` files to `workspace/contracts/`.
