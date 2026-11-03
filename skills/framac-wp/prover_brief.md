@@ -74,7 +74,13 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    | **Pre-state in `ensures`** | `ensures *out == *out + 1;` | `ensures *out == \old(*out) + 1;` |
    | **C calls & booleans in ACSL** | `requires !is_valid(p);` (C functions cannot be called in ACSL; `!` takes `boolean`, not `int`) | Inline the struct/pointer predicate directly (`p != \null && p->len <= MAX`), and write `x == 0` instead of `!x` |
    | **Arithmetic overflow in ACSL** | `requires a + b <= MAX;` (when intending 32-bit C wrap) | In ACSL, `+`, `-`, `*` on `integer` never overflow (`a + b` is mathematical integer sum; cast `(int)(a + b)` only if testing C truncation) |
+   | **C-string contracts & `\strlen`** | `requires valid_read_string(s);` (Frama-C libc axiomatic) or `\strlen(s) < n` | `requires valid_read_nstring(s, n);` or `requires valid_read_string(s);` (concrete bounded predicates from `fc_compat_types.h`) |
 
+   - **Concrete Dual-Oracle C-String Predicates:** Frama-C libc standard library axiomatics (`\strlen`, uninterpreted `valid_read_string` relying on `\strlen(s) >= 0`) do not survive E-ACSL `-no-frama-c-stdlib` dynamic verification because host libc headers lack executable E-ACSL models for uninterpreted logic functions. The pipeline force-includes `fc_compat_types.h`, which provides concrete bounded predicates executable by both WP and E-ACSL:
+     - `valid_read_nstring(char *s, integer n)`: validates reading up to `n` characters with null termination.
+     - `valid_read_string(char *s)`: validates null termination within a bounded horizon (65536).
+     - `valid_string(char *s)`: validates a writable null-terminated buffer.
+     Always use `valid_read_nstring(s, max_len)` or `valid_read_string(s)` instead of `\strlen` or libc string axiomatics.
    - **`\at(expr, Old)` distributes over array indexing:** `\at(a[i], Pre)` evaluates `a[\at(i, Pre)]` in the `Pre` state. Inside a loop where `k` is quantified, write `\at(a, Pre)[k]` or `loop invariant \forall integer k; 0 <= k < i ==> a[k] == \at(a[k], LoopEntry);`.
    - **Recursive `logic` functions must descend by `- 1`:** SMT solvers only trigger the inductive unfolding axiom when the recursive call uses `n - 1` (never `n / 2`).
    - **Floating-point comparisons:** always guard floating-point arguments with `requires !\is_NaN(x) && \is_finite(x);`.

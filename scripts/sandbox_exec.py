@@ -30,17 +30,22 @@ SandboxUnavailable is raised and nothing is run.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
+import typing
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 OUTPUT_TAIL_BYTES = 8000
+DEFAULT_MAX_HEAD_BYTES = 64 * 1024
+DEFAULT_MAX_TAIL_BYTES = 2 * 1024 * 1024
 SANDBOX_MODE = "rlimits"
 
 
@@ -118,6 +123,64 @@ def _make_preexec(limits: Limits):
     return _apply
 
 
+class BoundedStreamDrainer:
+    """
+    Reads a stream continuously in chunks to prevent pipe deadlocks,
+    retaining head and rolling tail chunks to bound total memory to O(1).
+    """
+
+    def __init__(
+        self,
+        stream: typing.IO[bytes] | None,
+        head_limit: int = DEFAULT_MAX_HEAD_BYTES,
+        tail_limit: int = DEFAULT_MAX_TAIL_BYTES,
+    ) -> None:
+        self.stream = stream
+        self.head_limit = head_limit
+        self.tail_limit = tail_limit
+        self.head = bytearray()
+        self.tail_chunks: collections.deque[bytes] = collections.deque()
+        self.tail_len = 0
+        self.total_bytes = 0
+
+    def run(self) -> None:
+        if self.stream is None:
+            return
+        chunk_size = 65536
+        try:
+            while True:
+                chunk = self.stream.read(chunk_size)
+                if not chunk:
+                    break
+                self.total_bytes += len(chunk)
+                if len(self.head) < self.head_limit:
+                    needed = self.head_limit - len(self.head)
+                    self.head.extend(chunk[:needed])
+                self.tail_chunks.append(chunk)
+                self.tail_len += len(chunk)
+                while self.tail_chunks and (self.tail_len - len(self.tail_chunks[0])) >= self.tail_limit:
+                    self.tail_len -= len(self.tail_chunks.popleft())
+        except OSError:
+            pass
+
+    def get_bytes(self) -> bytes:
+        if self.total_bytes <= self.tail_limit:
+            return b"".join(self.tail_chunks)
+        tail_bytes = b"".join(self.tail_chunks)
+        if len(tail_bytes) > self.tail_limit:
+            tail_bytes = tail_bytes[-self.tail_limit:]
+        if self.total_bytes <= len(self.head) + len(tail_bytes):
+            overlap = len(self.head) + len(tail_bytes) - self.total_bytes
+            return bytes(self.head) + tail_bytes[overlap:]
+        omitted = self.total_bytes - len(self.head) - len(tail_bytes)
+        marker = (
+            b"\n... [output truncated: "
+            + str(omitted).encode("ascii")
+            + b" bytes omitted] ...\n"
+        )
+        return bytes(self.head) + marker + tail_bytes
+
+
 def run_sandboxed(
     argv: Sequence[str],
     writable: Sequence[Path],
@@ -144,20 +207,50 @@ def run_sandboxed(
         start_new_session=True,
         preexec_fn=_make_preexec(limits),
     )
+    drainer_out = BoundedStreamDrainer(proc.stdout)
+    drainer_err = BoundedStreamDrainer(proc.stderr)
+    t_out = threading.Thread(target=drainer_out.run, daemon=True)
+    t_err = threading.Thread(target=drainer_err.run, daemon=True)
+    t_out.start()
+    t_err.start()
+
     timed_out = False
     try:
-        out, err = proc.communicate(timeout=timeout_s)
+        proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
             os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
-        except ProcessLookupError:
+        except (ProcessLookupError, AttributeError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
             pass
-        out, err = proc.communicate()
+
+    t_out.join(timeout=5.0)
+    t_err.join(timeout=5.0)
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+    except OSError:
+        pass
+    try:
+        if proc.stderr:
+            proc.stderr.close()
+    except OSError:
+        pass
+
+    out_bytes = drainer_out.get_bytes()
+    err_bytes = drainer_err.get_bytes()
+
     return SandboxResult(
-        returncode=proc.returncode,
-        stdout=out.decode("utf-8", errors="replace"),
-        stderr=err.decode("utf-8", errors="replace"),
+        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=out_bytes.decode("utf-8", errors="replace"),
+        stderr=err_bytes.decode("utf-8", errors="replace"),
         timed_out=timed_out,
         sandbox=mode,
         command=list(argv),

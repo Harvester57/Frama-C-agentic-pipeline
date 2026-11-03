@@ -268,3 +268,100 @@ def test_wp_hints_and_guard_for_dynamic_allocation_and_probe_files(tmp_path: Pat
     assert cap_res["next_synthesis_focus"] == "budget_exhausted_write_result_json_now"
     assert cap_res["proven_count"] == 5 and cap_res["unproven_count"] == 5
     assert any("budget is exhausted" in h for h in cap_res["diagnostic_hints"])
+
+
+def test_wp_fast_fail_on_internal_variadic(tmp_path: Path) -> None:
+    work_c = tmp_path / "work" / "mod.c"
+    work_c.parent.mkdir(parents=True, exist_ok=True)
+    work_c.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+
+    # 1. Fast-fail via explicit wp_blockers parameter
+    res1 = run_wp_on_function(
+        c_file=work_c,
+        fn_name="f",
+        out_dir=tmp_path / "wp1",
+        wp_blockers=["internal_variadic"],
+    )
+    assert res1["status"] == "wp_aborted"
+    assert res1["next_synthesis_focus"] == "internal_variadic_unsupported_by_wp"
+    assert res1["soundness"]["ok"] is False
+    assert any("internal variadic function" in h for h in res1["diagnostic_hints"])
+    assert res1["wp_blockers"] == ["internal_variadic"]
+
+    # 2. Fast-fail via C source inspection of variadic function
+    var_c = tmp_path / "work" / "var.c"
+    var_c.write_text(
+        "#include <stdarg.h>\nint my_printf(const char *fmt, ...) { return 0; }\n",
+        encoding="utf-8",
+    )
+    res2 = run_wp_on_function(
+        c_file=var_c,
+        fn_name="my_printf",
+        out_dir=tmp_path / "wp2",
+    )
+    assert res2["status"] == "wp_aborted"
+    assert res2["next_synthesis_focus"] == "internal_variadic_unsupported_by_wp"
+    assert any("internal variadic function" in h for h in res2["diagnostic_hints"])
+    assert res2["wp_blockers"] == ["internal_variadic"]
+
+    # 3. Fast-fail via callgraph_dag.json lookup
+    dag_dir = tmp_path / "workspace" / "reports"
+    dag_dir.mkdir(parents=True, exist_ok=True)
+    import json
+
+    (dag_dir / "callgraph_dag.json").write_text(
+        json.dumps(
+            {
+                "functions": {
+                    "dag_var_fn": {
+                        "name": "dag_var_fn",
+                        "file": "work/mod.c",
+                        "wp_blockers": ["internal_variadic"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    res3 = run_wp_on_function(
+        c_file=work_c,
+        fn_name="dag_var_fn",
+        out_dir=tmp_path / "workspace" / "wp",
+    )
+    assert res3["status"] == "wp_aborted"
+    assert res3["next_synthesis_focus"] == "internal_variadic_unsupported_by_wp"
+    assert any("internal variadic function" in h for h in res3["diagnostic_hints"])
+
+
+def test_wp_hints_for_unframed_variadic_callees() -> None:
+    # 1. Unframed variadic callee in unproven_goals_remain
+    res = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "unframed_variadic_callees": ["minmea_scan"],
+    }
+    hints = derive_wp_diagnostic_hints(res, "Missing assigns clause on minmea_scan")
+    assert any("unframed variadic callees (minmea_scan)" in h for h in hints)
+    assert any("framing stub" in h for h in hints)
+
+    # 2. Abort on call to variadic function in log
+    res2 = {
+        "status": "wp_aborted",
+        "soundness": {
+            "ok": False,
+            "tier_a_aborts": ["Call to variadic function minmea_scan not supported"],
+        },
+    }
+    hints2 = derive_wp_diagnostic_hints(res2)
+    assert any("variadic function specifications" in h for h in hints2)
+    assert any("framing stub" in h for h in hints2)
+
+    # 3. Analysis error with unframed variadic callees
+    res3 = {
+        "status": "analysis_error",
+        "reason": "kernel_crash",
+        "unframed_variadic_callees": ["minmea_scan"],
+    }
+    hints3 = derive_wp_diagnostic_hints(res3)
+    assert any("unframed variadic callees (minmea_scan)" in h for h in hints3)
+

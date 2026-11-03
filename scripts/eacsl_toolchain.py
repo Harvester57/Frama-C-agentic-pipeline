@@ -223,6 +223,139 @@ def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
     return "\n".join(out), count
 
 
+_STRTO_CALL_RE = re.compile(r"\b(?:strto\w*|wcsto\w*)\s*\(")
+_SOUND_VERDICT_RESET_RE = re.compile(r"\b__e_acsl_sound_verdict\s*=\s*0\s*;")
+_FUZZER_TEST_ONE_INPUT_DEF_RE = re.compile(
+    r"(?:^|\s)LLVMFuzzerTestOneInput\s*\([^;{]*\)[^{;]*\{",
+    re.MULTILINE,
+)
+
+
+def _is_comment_line(line: str, in_block_comment: bool) -> tuple[bool, bool]:
+    """
+    Check if a line contains only comments and whitespace, and track block comment state.
+    Returns (is_comment_only, new_in_block_comment).
+    """
+    i = 0
+    n = len(line)
+    has_code = False
+    while i < n:
+        if in_block_comment:
+            end_idx = line.find("*/", i)
+            if end_idx != -1:
+                in_block_comment = False
+                i = end_idx + 2
+            else:
+                i = n
+        else:
+            if line[i].isspace():
+                i += 1
+                continue
+            if line[i : i + 2] == "//":
+                break
+            elif line[i : i + 2] == "/*":
+                in_block_comment = True
+                i += 2
+            else:
+                has_code = True
+                i += 1
+    return (not has_code), in_block_comment
+
+
+def rewrite_sound_verdict_resets(c_text: str) -> tuple[str, int]:
+    """
+    Work around E-ACSL automatically emitting `__e_acsl_sound_verdict = 0;` after standard library
+    string/wide-string conversion functions (strto*, wcsto*). Without models for these functions,
+    E-ACSL poisons the verdict, permanently causing all subsequent assertions to be flagged unsound.
+    Comments out `__e_acsl_sound_verdict = 0;` within statements immediately following such calls.
+    Returns (new_text, count).
+    """
+    lines = c_text.split("\n")
+    out: list[str] = []
+    count = 0
+    pending_window = 0
+    in_call = False
+    call_lines_left = 0
+    in_block_comment = False
+
+    for line in lines:
+        was_in_block = in_block_comment
+        is_comment_only, in_block_comment = _is_comment_line(line, in_block_comment)
+
+        if not is_comment_only and not was_in_block and _STRTO_CALL_RE.search(line):
+            if ";" in line:
+                in_call = False
+                pending_window = 3
+            else:
+                in_call = True
+                call_lines_left = 10
+        elif in_call:
+            if ";" in line:
+                in_call = False
+                pending_window = 3
+            else:
+                call_lines_left -= 1
+                if call_lines_left <= 0:
+                    in_call = False
+
+        if pending_window > 0 and _SOUND_VERDICT_RESET_RE.search(line):
+            stripped = line.strip()
+            if not stripped.startswith("/*") and not stripped.startswith("//") and not was_in_block:
+                new_line = _SOUND_VERDICT_RESET_RE.sub("/* __e_acsl_sound_verdict = 0; */", line)
+                if new_line != line:
+                    out.append(new_line)
+                    count += 1
+                    pending_window = 0
+                    continue
+            else:
+                pending_window = 0
+        elif pending_window > 0 and line.strip() and not in_call:
+            if not is_comment_only and not _STRTO_CALL_RE.search(line):
+                pending_window -= 1
+
+        out.append(line)
+
+    return "\n".join(out), count
+
+
+def reset_verdict_on_input_entry(c_text: str) -> tuple[str, int]:
+    """
+    Inject `__e_acsl_sound_verdict = 1;` at entry of LLVMFuzzerTestOneInput if not already present,
+    preventing any verdict poisoning from an earlier test iteration from affecting later runs.
+    Returns (new_text, count).
+    """
+    if "LLVMFuzzerTestOneInput" not in c_text:
+        return c_text, 0
+
+    m = _FUZZER_TEST_ONE_INPUT_DEF_RE.search(c_text)
+    if not m:
+        return c_text, 0
+
+    brace_pos = m.end() - 1
+    brace_line_idx = c_text[:brace_pos].count("\n")
+
+    lines = c_text.split("\n")
+    # Check if already present in the next few statements after the brace line
+    already_present = any(
+        "__e_acsl_sound_verdict" in lines[j] and "= 1" in lines[j]
+        for j in range(brace_line_idx, min(len(lines), brace_line_idx + 10))
+    )
+    if already_present:
+        return c_text, 0
+
+    # Determine indentation from following non-empty lines, or default to 4 spaces
+    indent = "    "
+    for j in range(brace_line_idx + 1, min(len(lines), brace_line_idx + 5)):
+        if lines[j].strip():
+            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+            break
+
+    out = list(lines[: brace_line_idx + 1])
+    out.append(f"{indent}__e_acsl_sound_verdict = 1;")
+    out.extend(lines[brace_line_idx + 1 :])
+    return "\n".join(out), 1
+
+
 def select_eacsl_binary(out_bin: Path) -> Path:
     """e-acsl-gcc writes the instrumented executable to `<out>.e-acsl`; prefer it when present."""
     out_bin = Path(out_bin)

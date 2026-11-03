@@ -2,6 +2,7 @@ from run_eacsl_fuzz import (
     _discover_slice_functions,
     classify_campaign,
     classify_guardrail,
+    derive_eacsl_diagnostic_hints,
     parse_eacsl_failure,
     parse_runtime_failure,
     parse_sanitizer_failure,
@@ -174,6 +175,47 @@ def test_guardrail_separates_code_faults_from_overconstrained_contracts():
     )
     assert classify_guardrail(1, False, ANNOTATION)["status"] == "rejected_overconstrained"
     assert classify_guardrail(1, False, "segfault")["status"] == "guardrail_error"
+
+
+def test_guardrail_classifies_unsound_verdicts():
+    # When returncode == 0, unsound verdict warning must NOT pass the guardrail
+    ok_unsound = "Warning: no sound verdict for Assertion (guess: ok).\nDone."
+    res_ok = classify_guardrail(0, False, ok_unsound)
+    assert res_ok["status"] == "guardrail_error"
+    assert res_ok["unsound"] is True
+    assert "unsound verdict" in res_ok["reason"]
+
+    # Also match alternate wording 'Warning: unsound verdict reached' and 'warning: unsound verdict'
+    res_unsound2 = classify_guardrail(0, False, "Warning: unsound verdict reached\n")
+    assert res_unsound2["status"] == "guardrail_error" and res_unsound2["unsound"] is True
+    res_unsound3 = classify_guardrail(0, False, "warning: unsound verdict\n")
+    assert res_unsound3["status"] == "guardrail_error" and res_unsound3["unsound"] is True
+
+    # When returncode != 0, unsound verdict warning must NOT be reported as code_fault or rejected_overconstrained
+    fail_unsound = (
+        "Warning: no sound verdict for Assertion (guess: FAIL).\n"
+        + ANNOTATION
+    )
+    res_fail = classify_guardrail(1, False, fail_unsound)
+    assert res_fail["status"] == "guardrail_error"
+    assert res_fail["unsound"] is True
+    assert "unsound E-ACSL verdict" in res_fail["reason"]
+    assert res_fail.get("failure") is not None
+
+    # Normal execution without unsound warning preserves standard behavior
+    assert classify_guardrail(0, False, "Clean run\n")["status"] == "passed_dynamic_oracle"
+    assert classify_guardrail(1, False, ANNOTATION)["status"] == "rejected_overconstrained"
+
+
+def test_eacsl_hints_for_unsound_verdict():
+    res = {
+        "status": "guardrail_error",
+        "reason": "Assertion failed under unsound E-ACSL verdict",
+        "unsound": True,
+    }
+    hints = derive_eacsl_diagnostic_hints(res)
+    assert any("unsound verdict warning" in h for h in hints)
+    assert any("unsupported C standard library functions" in h for h in hints)
 
 
 def test_wp_goal_to_obligation_class():

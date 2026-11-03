@@ -711,3 +711,116 @@ def test_ledger_fuzz_engine_note():
     assert ledger.fuzz_engine_note({"engine_used": "eacsl"}) == "E-ACSL + LibFuzzer"
     note = ledger.fuzz_engine_note({"engine_used": "sanitizers", "engine_fallback_reason": "eacsl_compile_failed"})
     assert "no E-ACSL contract checks" in note and "eacsl_compile_failed" in note
+
+
+def test_rewrite_sound_verdict_resets_after_strto_and_wcsto():
+    c_sample = """
+    tmp_7 = strtol(field, &endptr, 10);
+    __e_acsl_sound_verdict = 0;
+
+    val = strtoull(buf, NULL, 16);
+    __e_acsl_sound_verdict = 0;
+
+    wval = wcstol(wstr, &wend, 10);
+    __e_acsl_sound_verdict = 0;
+
+    // Multiline call
+    res = strtod(
+        input_str,
+        &endptr
+    );
+    __e_acsl_sound_verdict = 0;
+
+    // Unrelated reset after other function should NOT be rewritten
+    foo();
+    __e_acsl_sound_verdict = 0;
+    """
+
+    patched, count = T.rewrite_sound_verdict_resets(c_sample)
+    assert count == 4
+    # All 4 strto/wcsto resets commented out
+    assert patched.count("/* __e_acsl_sound_verdict = 0; */") == 4
+    # The unrelated reset after foo() remains active
+    assert "foo();\n    __e_acsl_sound_verdict = 0;" in patched
+
+    # Idempotent: running on already patched code performs 0 rewrites
+    patched_again, count_again = T.rewrite_sound_verdict_resets(patched)
+    assert count_again == 0
+    assert patched_again == patched
+
+    # Multiline comment between strtol and reset does not exhaust window
+    multiline_comment_sample = """
+    long val = strtol(s, &endptr, 10);
+    /*
+     * Multiline comment explaining conversion
+     * Another comment line
+     * A third comment line
+     * A fourth comment line
+     */
+    __e_acsl_sound_verdict = 0;
+    """
+    patched_mc, count_mc = T.rewrite_sound_verdict_resets(multiline_comment_sample)
+    assert count_mc == 1
+    assert "/* __e_acsl_sound_verdict = 0; */" in patched_mc
+
+
+def test_reset_verdict_on_input_entry():
+    c_sample = """
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (data == NULL) return 0;
+    return 1;
+}
+"""
+    patched, count = T.reset_verdict_on_input_entry(c_sample)
+    assert count == 1
+    assert "__e_acsl_sound_verdict = 1;" in patched
+    assert "LLVMFuzzerTestOneInput" in patched
+
+    # Idempotent: running on already patched code does not duplicate
+    patched_again, count_again = T.reset_verdict_on_input_entry(patched)
+    assert count_again == 0
+    assert patched_again == patched
+
+    # Split-line return type and multiline signature
+    split_sample = """
+int
+LLVMFuzzerTestOneInput(
+    const uint8_t *data,
+    size_t size
+)
+{
+    return 0;
+}
+"""
+    patched_split, count_split = T.reset_verdict_on_input_entry(split_sample)
+    assert count_split == 1
+    assert "__e_acsl_sound_verdict = 1;" in patched_split
+
+    # Code without LLVMFuzzerTestOneInput is untouched
+    plain = "int f(int x) { return x + 1; }\n"
+    assert T.reset_verdict_on_input_entry(plain) == (plain, 0)
+
+
+def test_compat_types_abs_preconditions_and_dual_oracle_cstring_predicates():
+    header_path = REPO / "templates" / "fc_stubs" / "fc_compat_types.h"
+    content = header_path.read_text(encoding="utf-8")
+
+    # Item 2: abs, labs, llabs contracts under __FRAMAC_EACSL__
+    assert "requires abs_representable: j > (-2147483647 - 1);" in content
+    assert "int abs(int j);" in content
+    assert "long int labs(long int j);" in content
+    assert "long long int llabs(long long int j);" in content
+
+    # Item 4: concrete dual-oracle C-string predicates under __FRAMAC__
+    assert "predicate valid_read_nstring(char *s, integer n)" in content
+    assert "predicate valid_read_string(char *s)" in content
+    assert "predicate valid_string(char *s)" in content
+    assert "\\exists integer i; 0 <= i <= n" in content
+
+
+def test_harness_dual_template_resets_sound_verdict():
+    template_path = REPO / "templates" / "harness_dual.c.template"
+    content = template_path.read_text(encoding="utf-8")
+    assert "__FRAMAC_EACSL__" in content
+    assert "extern int __e_acsl_sound_verdict;" in content
+    assert "__e_acsl_sound_verdict = 1;" in content

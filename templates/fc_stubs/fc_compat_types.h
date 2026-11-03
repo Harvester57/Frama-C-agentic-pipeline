@@ -28,6 +28,21 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+/*@ requires abs_representable: j > (-2147483647 - 1);
+  @ assigns \nothing;
+  @*/
+int abs(int j);
+
+/*@ requires abs_representable: j > (-9223372036854775807L - 1L);
+  @ assigns \nothing;
+  @*/
+long int labs(long int j);
+
+/*@ requires abs_representable: j > (-9223372036854775807LL - 1LL);
+  @ assigns \nothing;
+  @*/
+long long int llabs(long long int j);
+
 #else /* Frama-C __fc_libc */
 
 #include <stdint.h>
@@ -64,6 +79,45 @@ typedef unsigned short u_short;
 typedef unsigned int u_int;
 typedef unsigned long u_long;
 #endif /* __FC_COMPAT_BSD_ALIASES_DEFINED */
+
+#endif /* __FRAMAC_EACSL__ */
+
+/*
+ * Concrete Dual-Oracle C-String Predicates (E-ACSL host-header mode only)
+ *
+ * Standard Frama-C libc axiomatics (\\strlen, valid_read_string) do not survive
+ * E-ACSL -no-frama-c-stdlib builds because host libc lacks E-ACSL models for
+ * uninterpreted logic functions. These bounded predicates use explicit integer
+ * quantifiers executable under both WP first-order proving and E-ACSL dynamic
+ * instrumentation.
+ *
+ * They must NOT be defined in the Eva/WP (-nostdinc, __fc_libc) configuration:
+ * there __fc_string_axiomatic.h already declares valid_string,
+ * valid_read_string, valid_read_nstring and valid_nstring, and a second
+ * declaration aborts the kernel under annot-error=abort.
+ */
+
+#if defined(__FRAMAC_EACSL__)
+
+/*@
+  @ predicate valid_read_nstring(char *s, integer n) =
+  @   0 <= n &&
+  @   \exists integer i; 0 <= i <= n &&
+  @     \valid_read(s + (0 .. i)) &&
+  @     s[i] == '\0';
+  @
+  @ predicate valid_read_string(char *s) =
+  @   valid_read_nstring(s, 65536);
+  @
+  @ predicate valid_nstring(char *s, integer n) =
+  @   0 <= n &&
+  @   \exists integer i; 0 <= i <= n &&
+  @     \valid(s + (0 .. i)) &&
+  @     s[i] == '\0';
+  @
+  @ predicate valid_string(char *s) =
+  @   valid_nstring(s, 65536);
+  @*/
 
 #endif /* __FRAMAC_EACSL__ */
 

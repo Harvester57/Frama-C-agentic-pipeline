@@ -39,6 +39,13 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
    | **`logic` / `predicate` definitions** | `axiomatic A { logic int f(int x); }` (uninterpreted `axiomatic` or C `int` type) | `predicate is_bounded(integer x, integer hi) = 0 <= x <= hi;` (concrete body with `integer` parameters) |
    | **C calls & booleans in ACSL** | `requires !check_hdr(h);` | Never call C functions inside ACSL; inline struct field predicates directly (`h->magic == 0x4643`) |
    | **Pre-state in `ensures`** | `ensures *off >= *off;` | `ensures *off >= \old(*off);` |
+   | **C-string contracts & `\strlen`** | `requires valid_read_string(s);` (Frama-C libc axiomatic) or `\strlen(s) < n` | `requires valid_read_nstring(s, n);` or `requires valid_read_string(s);` (concrete bounded predicates from `fc_compat_types.h`) |
+
+   - **Concrete Dual-Oracle C-String Predicates:** Frama-C libc standard library axiomatics (`\strlen`, uninterpreted `valid_read_string` relying on `\strlen(s) >= 0`) do not survive E-ACSL `-no-frama-c-stdlib` dynamic verification because host libc headers lack executable E-ACSL models for uninterpreted logic functions. The pipeline force-includes `fc_compat_types.h`, which provides concrete bounded predicates executable by both WP and E-ACSL:
+     - `valid_read_nstring(char *s, integer n)`: validates reading up to `n` characters with null termination.
+     - `valid_read_string(char *s)`: validates null termination within a bounded horizon (65536).
+     - `valid_string(char *s)`: validates a writable null-terminated buffer.
+     Always specify `valid_read_nstring(s, max_len)` or `valid_read_string(s)` in header interfaces instead of uninterpreted libc string axiomatics.
 
 6. **Mandatory Dual Check Before Returning:**
    - **Check 1 (Frama-C Kernel Syntax):** run `run_wp_function.py` or `frama-c -kernel-warn-key annot-error=abort` on `agents/{agent_id}/scratch/work/` to confirm zero ACSL syntax or typing errors.

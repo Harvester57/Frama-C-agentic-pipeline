@@ -97,6 +97,7 @@ def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
             with run_lock("ledger", tmp_path, timeout=0.3):
                 pass
         with run_lock("ledger", tmp_path, timeout=30):
+            holder.wait(timeout=10)
             assert holder.poll() is not None  # acquired only after the holder released it
     finally:
         holder.wait(timeout=30)

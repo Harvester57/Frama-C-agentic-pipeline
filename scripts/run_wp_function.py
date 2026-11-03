@@ -387,6 +387,11 @@ _LOOP_PRESERVED_FAIL_RE = re.compile(
     r"^\[wp\]\s*\[(?:Timeout|Unknown|Failed|Stepout)\][^\n]*loop_invariant[^\n]*preserved",
     re.IGNORECASE | re.MULTILINE,
 )
+_VARIADIC_CALLEE_RE = re.compile(
+    r"(?:variadic|varargs|variable argument|\bva_list\b|unframed\s+variadic)",
+    re.IGNORECASE,
+)
+
 
 
 def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
@@ -450,6 +455,17 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
             f"Frama-C WP terminated before producing a report (reason: {reason}). Re-run once; if it repeats, "
             "report status 'blocked' with this reason rather than weakening contracts."
         )
+        unframed_var = res.get("unframed_variadic_callees") or []
+        if (
+            unframed_var
+            or bool(_VARIADIC_CALLEE_RE.search(log_text or ""))
+            or bool(_VARIADIC_CALLEE_RE.search(res.get("wp_log_tail") or ""))
+        ):
+            var_targets = f" ({', '.join(unframed_var)})" if unframed_var else ""
+            _add(
+                f"Frama-C WP does not support variadic function specifications or proof through unframed variadic callees{var_targets}. "
+                "Introduce a non-variadic framing stub/contract or isolate the variadic callee in an unverified shell wrapper."
+            )
         return hints
 
     soundness = res.get("soundness") or {}
@@ -575,10 +591,16 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
                     "'requires n > 0 ==> \\initialized(in_buf + (0 .. n - 1));' for caller inputs, or add "
                     "'loop invariant \\initialized(out_buf + (0 .. i - 1));' for loops that populate an output buffer."
                 )
-            _add(
-                "Tip: isolate a single stalled clause with '--prop <clause_name> --dump-goal' to inspect the raw "
-                "Why3 sequent in 'goal_dumps'."
-            )
+    unframed_var = res.get("unframed_variadic_callees") or []
+    has_variadic_err = bool(_VARIADIC_CALLEE_RE.search(aborts_and_unsound)) or bool(
+        _VARIADIC_CALLEE_RE.search(log_text or "")
+    )
+    if unframed_var or has_variadic_err:
+        var_targets = f" ({', '.join(unframed_var)})" if unframed_var else ""
+        _add(
+            f"Frama-C WP does not support variadic function specifications or proof through unframed variadic callees{var_targets}. "
+            "Introduce a non-variadic framing stub/contract or isolate the variadic callee in an unverified shell wrapper."
+        )
 
     return hints
 
@@ -625,6 +647,88 @@ def _analysis_error_result(
     return res
 
 
+def _find_and_load_dag(c_file: Path, out_dir: Path) -> dict | None:
+    candidates = [
+        out_dir / "reports" / "callgraph_dag.json",
+        out_dir.parent / "reports" / "callgraph_dag.json",
+        out_dir.parent / "workspace" / "reports" / "callgraph_dag.json",
+        c_file.parent / "reports" / "callgraph_dag.json",
+        c_file.parent.parent / "reports" / "callgraph_dag.json",
+        c_file.parent.parent.parent / "reports" / "callgraph_dag.json",
+        Path("workspace/reports/callgraph_dag.json"),
+    ]
+    for p in candidates:
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "functions" in data:
+                    return data
+            except Exception:
+                pass
+    return None
+
+
+def _check_internal_variadic(
+    c_file: Path,
+    fn_name: str,
+    out_dir: Path,
+    wp_blockers: list[str] | None = None,
+) -> tuple[bool, str]:
+    if wp_blockers is not None and "internal_variadic" in wp_blockers:
+        return True, "Target function explicitly marked with wp_blocker 'internal_variadic'"
+
+    dag = _find_and_load_dag(c_file, out_dir)
+    if dag:
+        fn_data = dag.get("functions", {}).get(fn_name)
+        if not fn_data:
+            c_str = str(c_file).replace("\\", "/")
+            for v in dag.get("functions", {}).values():
+                if v.get("name") == fn_name:
+                    v_file = v.get("file", "").replace("\\", "/")
+                    if v_file == c_str or c_str.endswith("/" + v_file) or c_str == v_file:
+                        fn_data = v
+                        break
+        if fn_data and "internal_variadic" in fn_data.get("wp_blockers", []):
+            return True, f"Target function '{fn_name}' in '{c_file}' is marked with wp_blocker 'internal_variadic' in callgraph DAG"
+
+    if c_file.is_file():
+        try:
+            from build_callgraph_dag import analyze_body, analyze_signature, extract_functions_from_code
+
+            raw_code = c_file.read_text(encoding="utf-8", errors="replace")
+            for item in extract_functions_from_code(raw_code, path=str(c_file)):
+                if item["name"] == fn_name:
+                    sig = analyze_signature(item["decl_tokens"], item["param_tokens"])
+                    body = analyze_body(fn_name, item["body_tokens"], sig)
+                    if "internal_variadic" in body.get("wp_blockers", []):
+                        return True, f"Target function '{fn_name}' in '{c_file}' has variadic parameter '...'"
+        except Exception:
+            pass
+
+    return False, ""
+
+
+def _find_unframed_variadic_callees(c_file: Path, fn_name: str, out_dir: Path) -> list[str]:
+    dag = _find_and_load_dag(c_file, out_dir)
+    variadic_callees: list[str] = []
+    if dag:
+        fn_data = dag.get("functions", {}).get(fn_name)
+        if not fn_data:
+            c_str = str(c_file).replace("\\", "/")
+            for v in dag.get("functions", {}).values():
+                if v.get("name") == fn_name:
+                    v_file = v.get("file", "").replace("\\", "/")
+                    if v_file == c_str or c_str.endswith("/" + v_file) or c_str == v_file:
+                        fn_data = v
+                        break
+        if fn_data:
+            for callee in fn_data.get("internal_callees", []):
+                callee_data = dag.get("functions", {}).get(callee, {})
+                if "internal_variadic" in callee_data.get("wp_blockers", []):
+                    variadic_callees.append(callee)
+    return variadic_callees
+
+
 def run_wp_on_function(
     c_file: Path,
     fn_name: str,
@@ -651,6 +755,7 @@ def run_wp_on_function(
     cache_dir: str | Path | None = "auto",
     sarif: bool = False,
     keep_goals: bool = False,
+    wp_blockers: list[str] | None = None,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     par = resolve_wp_par(wp_par)
@@ -703,6 +808,49 @@ def run_wp_on_function(
                 "diagnostic_hints": [probe_msg],
             }
             return probe_res
+
+        is_var, var_reason = _check_internal_variadic(c_file, fn_name, out_dir, wp_blockers=wp_blockers)
+        if is_var:
+            variadic_msg = (
+                f"Refused to run Frama-C WP on internal variadic function '{fn_name}' ({var_reason}). "
+                "Frama-C WP does not support variadic function specifications or proof. "
+                "The function is marked with wp_blocker 'internal_variadic' and verifiability "
+                "'shell_unverifiable_wp'. Isolate variadic functions behind non-variadic framing "
+                "stubs or verify them via E-ACSL / Eva instead."
+            )
+            soundness = scan_wp_log_soundness("")
+            soundness["ok"] = False
+            soundness["tier_a_aborts"] = [variadic_msg]
+            variadic_res = {
+                "status": "wp_aborted",
+                "function": fn_name,
+                "file": str(c_file),
+                "total_goals": 0,
+                "proven_count": 0,
+                "proven_under_hyp_count": 0,
+                "unproven_count": 0,
+                "dead_count": 0,
+                "soundness": soundness,
+                "undeclared_functions": [],
+                "by_obligation_class": {},
+                "next_synthesis_focus": "internal_variadic_unsupported_by_wp",
+                "unproven_by_bucket": {
+                    "step_a_assigns": [],
+                    "step_b_loop_invariant": [],
+                    "step_c_rte_obligation": [],
+                    "step_c_caller_precondition": [],
+                    "step_c_contract_postcondition": [],
+                },
+                "unproven_goals": [],
+                "proven_under_hyp_goals": [],
+                "goal_dumps": [],
+                "sarif_file": None,
+                "wp_log_tail": variadic_msg,
+                "sizing": sizing,
+                "diagnostic_hints": [variadic_msg],
+                "wp_blockers": ["internal_variadic"],
+            }
+            return variadic_res
 
         if scratch_dir is not None:
             budget_path = scratch_dir / ".prover_budget.json"
@@ -796,6 +944,8 @@ def run_wp_on_function(
         error_res["error_summary"] = [note]
         error_res["sizing"] = {**sizing, "memory_limit_mb": mem_limit}
         return error_res
+
+    unframed_var_callees = _find_unframed_variadic_callees(c_file, fn_name, out_dir)
 
     stem = f"wp_{fn_name}{artifact_suffix}"
     csv_path = out_dir / f"{stem}.csv"
@@ -932,6 +1082,8 @@ def run_wp_on_function(
                 "raw_log": combined_log[-3000:],
             },
         }
+        if unframed_var_callees:
+            syn_res["unframed_variadic_callees"] = unframed_var_callees
         syn_res["diagnostic_hints"] = derive_wp_diagnostic_hints(syn_res, combined_log)
         return syn_res
 
@@ -953,6 +1105,9 @@ def run_wp_on_function(
             soundness,
             combined_log,
         )
+        if unframed_var_callees:
+            error_res["unframed_variadic_callees"] = unframed_var_callees
+            error_res["diagnostic_hints"] = derive_wp_diagnostic_hints(error_res, combined_log)
         error_res["sizing"] = sizing
         return error_res
     goal_dumps = extract_vc_goal_dumps(combined_log) if dump_goal else []
@@ -1164,6 +1319,8 @@ def run_wp_on_function(
         "wp_log_tail": combined_log[-3000:],
         "sizing": sizing,
     }
+    if unframed_var_callees:
+        res["unframed_variadic_callees"] = unframed_var_callees
     if all_unproven_are_alloc:
         res["wp_allocation_limitation"] = True
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
@@ -1221,6 +1378,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--sarif", action="store_true", help="Also save the project (-save) and export SARIF")
     parser.add_argument("--keep-goals", action="store_true", help="Keep WP's goal files (-wp-out) under --out-dir")
+    parser.add_argument(
+        "--wp-blockers",
+        nargs="*",
+        default=None,
+        help="Optional list of known WP blockers for the target function (e.g. internal_variadic)",
+    )
     parser.add_argument("--out-json", type=Path, required=True)
     raw_argv = normalize_flag_args(list(argv) if argv is not None else sys.argv[1:], ("--cppflags",))
     args = parser.parse_args(raw_argv)
@@ -1256,6 +1419,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_dir=args.cache_dir,
         sarif=args.sarif,
         keep_goals=args.keep_goals,
+        wp_blockers=args.wp_blockers,
     )
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")

@@ -73,6 +73,10 @@ int eva_main(void) {
  * E-ACSL runtime (run_eacsl_fuzz.py refuses with eacsl_init_hook_conflict).
  */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+#ifdef __FRAMAC_EACSL__
+    extern int __e_acsl_sound_verdict;
+    __e_acsl_sound_verdict = 1;
+#endif
     if (data == NULL || size > MAX_INPUT_SIZE) {
         return 0;
     }
