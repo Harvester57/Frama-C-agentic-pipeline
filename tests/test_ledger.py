@@ -550,3 +550,104 @@ def test_ingest_fuzz_publishes_corpus_to_shared_cache_when_rw(run_dir, tmp_path,
     shared_mod_dir = shared_cache / "corpora" / "snmp"
     assert shared_mod_dir.is_dir()
     assert len(list(shared_mod_dir.iterdir())) == 2
+
+
+def test_ingest_wp_credits_qed_simplified_l2_and_l3_but_requires_explicit_l4_to_l6(run_dir):
+    seed(run_dir)
+    # ber_decode_len has rte, l2_termination, and l6_secret units.
+    # If WP reports status="all_proven" with only rte goals (e.g. Qed simplified l2_termination),
+    # l2_termination is credited with wp_qed_simplified, while l6_secret stays planned.
+    write_json(
+        run_dir / "workspace/reports/wp/ber_decode_len.json",
+        wp_report(
+            function="ber_decode_len",
+            file="workspace/work/src/snmp/ber.c",
+            by_obligation_class={"rte": {"proven": 4, "proven_under_hyp": 0, "unproven": 0}},
+        ),
+    )
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/ber_decode_len.json"])
+    by_id = units_by_id(run_dir)
+    assert by_id["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "covered"
+    assert by_id["src/snmp/ber.c#ber_decode_len::l2_termination"]["status"] == "covered"
+    assert by_id["src/snmp/ber.c#ber_decode_len::l2_termination"]["evidence"][-1]["result"] == "wp_qed_simplified"
+    assert by_id["src/snmp/ber.c#ber_decode_len::l6_secret"]["status"] == "planned"
+
+
+def test_audit_hypotheses_discharges_proven_callees_and_flags_unverified_callees(run_dir):
+    dag_with_callees = {
+        **DAG,
+        "functions": {
+            **DAG["functions"],
+            "snmp_parse_pdu": {
+                **DAG["functions"]["snmp_parse_pdu"],
+                "internal_callees": ["ber_decode_tag", "ber_decode_len"],
+            },
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag_with_callees)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+
+    # snmp_parse_pdu is proven by WP with valid_under_hyp
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report())
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+
+    # Case 1: callees are not WP-proven -> valid_under_hyp becomes callee_contract_hypothesis
+    res1 = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
+    assert res1["conditional"] == 1 and res1["discharged"] == 0
+    pdu_u = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
+    cch = [a for a in pdu_u["assumptions"] if a["kind"] == "callee_contract_hypothesis"]
+    assert len(cch) == 1
+    assert "src/snmp/ber.c#ber_decode_tag::rte" in cch[0]["related_units"]
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+    # Case 2: both callees are now WP-proven -> hypothesis is discharged!
+    for fn in ("ber_decode_tag", "ber_decode_len"):
+        write_json(
+            run_dir / f"workspace/reports/wp/{fn}.json",
+            wp_report(
+                function=fn,
+                file="workspace/work/src/snmp/ber.c",
+                by_obligation_class={
+                    "rte": {"proven": 2, "proven_under_hyp": 0, "unproven": 0},
+                    "l6_secret": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+                },
+            ),
+        )
+    L.cmd_ingest_wp(
+        [
+            run_dir / "workspace/reports/wp/ber_decode_tag.json",
+            run_dir / "workspace/reports/wp/ber_decode_len.json",
+        ]
+    )
+    res2 = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
+    assert res2["discharged"] == 1 and res2["conditional"] == 0
+    pdu_u2 = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
+    assert not any(a["kind"] in ("valid_under_hyp", "callee_contract_hypothesis") for a in pdu_u2["assumptions"])
+    assert pdu_u2["evidence"][-1]["result"] == "hypotheses_discharged"
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_eva_include_source_harness_extracts_target_sources(run_dir):
+    """When include_source: true is used, report['sources'] lists only harness_<mod>.c; target units must still ingest."""
+    seed(run_dir)
+    rep = eva_report(
+        sources=["workspace/harnesses/harness_snmp.c"],
+        functions_with_properties_by_file={
+            "workspace/work/src/snmp/ber.c": ["ber_decode_len", "ber_decode_tag"],
+            "workspace/work/src/snmp/pdu.c": ["snmp_parse_pdu"],
+        },
+    )
+    write_json(run_dir / "workspace/reports/eva/snmp.json", rep)
+    out = L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])
+    assert out == {"reports": 1, "covered": 1, "candidates": 1}
+    units = units_by_id(run_dir)
+    assert units["src/snmp/ber.c#ber_decode_tag::rte"]["status"] == "covered"
+    assert units["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "candidate"
+
+
+def test_status_subcommand_alias(run_dir, capsys):
+    seed(run_dir)
+    rc = L.main(["status"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["units"] == 6

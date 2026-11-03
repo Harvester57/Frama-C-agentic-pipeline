@@ -137,3 +137,39 @@ def test_complete_run_with_unverified_candidates_is_rejected(tmp_path):
     build_run(tmp_path, status="complete")
     with pytest.raises(ArtifactError):
         generate(tmp_path, tmp_path)
+
+
+def test_report_dedupes_same_sink_findings_and_shows_work_line_shift(tmp_path):
+    build_run(tmp_path)
+    # Create baseline and work files where merged ACSL shifted line 42 to line 45
+    base_f = tmp_path / "workspace/baseline/src/snmp/ber.c"
+    work_f = tmp_path / "workspace/work/src/snmp/ber.c"
+    base_f.parent.mkdir(parents=True, exist_ok=True)
+    work_f.parent.mkdir(parents=True, exist_ok=True)
+    base_lines = [f"int line_{i} = {i};" for i in range(1, 50)]
+    work_lines = base_lines[:40] + ["/*@ requires x >= 0;", "    assigns \\nothing;", "*/"] + base_lines[40:]
+    base_f.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+    work_f.write_text("\n".join(work_lines) + "\n", encoding="utf-8")
+
+    findings = json.loads((tmp_path / "findings.json").read_text(encoding="utf-8"))
+    orig = next(r for r in findings if r["verdict"] == "confirmed")
+    orig["location"]["line"] = 45  # work line 45 corresponds to baseline line 42
+    dup_fp = "src/snmp/ber.c#ber_decode_len::rte::9999999999"
+    dup = json.loads(json.dumps(orig))
+    dup["fingerprint"] = dup_fp
+    dup["location"]["line"] = 42  # baseline line 42
+    dup["property"]["predicate"] = "\\valid(heap + len)"
+    findings.append(dup)
+    write_json(tmp_path / "findings.json", sorted_findings(*findings))
+
+    ledger = json.loads((tmp_path / "coverage-ledger.json").read_text(encoding="utf-8"))
+    for u in ledger:
+        if u["coverage_id"] == "src/snmp/ber.c#ber_decode_len::rte":
+            u["result_fingerprints"].append(dup_fp)
+    write_json(tmp_path / "coverage-ledger.json", ledger)
+
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "- **Confirmed findings:** 1 (1 high)" in report
+    assert "also merged:" in report
+    assert "work: `src/snmp/ber.c:45`" in report

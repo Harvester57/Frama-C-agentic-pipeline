@@ -673,6 +673,40 @@ def test_sweep_list(tmp_path):
     assert skipped == []
 
 
+def test_sweep_list_includes_eva_only_callee_when_caller_has_valid_under_hyp(tmp_path):
+    _sweep_ledger(tmp_path)
+    # Add valid_under_hyp to ber_decode and declare pdu_parse (Eva-only) as its callee in callgraph_dag.json
+    led = json.loads((tmp_path / "coverage-ledger.json").read_text(encoding="utf-8"))
+    for u in led:
+        if u["function"] == "ber_decode":
+            u["assumptions"] = [{"kind": "valid_under_hyp", "summary": "2 goals proved under callee hypotheses"}]
+    write_json(tmp_path / "coverage-ledger.json", led)
+    write_json(
+        tmp_path / pm.DAG_JSON,
+        {
+            "modules": DAG_MODULES,
+            "functions": {
+                "ber_decode": {
+                    "name": "ber_decode",
+                    "file": "src/snmp/ber.c",
+                    "module": "snmp",
+                    "internal_callees": ["pdu_parse"],
+                },
+                "pdu_parse": {
+                    "name": "pdu_parse",
+                    "file": "src/snmp/pdu.c",
+                    "module": "snmp",
+                    "internal_callees": [],
+                },
+            },
+        },
+    )
+    entries, _ = pm.sweep_list(tmp_path)
+    by_fn = {e["function"]: e for e in entries}
+    assert "pdu_parse" in by_fn
+    assert by_fn["pdu_parse"]["eva_only"] is True
+
+
 def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
     run = _make_run(tmp_path)
     _sweep_ledger(run)

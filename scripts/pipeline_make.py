@@ -1287,20 +1287,27 @@ def ingest(
 def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
     """
     The ledger's covered proof units, one entry per (file, function): units whose status is
-    `covered` with discharging WP evidence. Returns (entries, skipped).
+    `covered` with discharging WP evidence, plus any Eva-covered callee in `callgraph_dag.json`
+    called by a WP-covered caller that carries a `valid_under_hyp` assumption. Returns (entries, skipped).
     """
-    ledger = load_json_optional(Path(run_dir) / LEDGER_JSON, [])
+    run_path = Path(run_dir)
+    ledger = load_json_optional(run_path / LEDGER_JSON, [])
     if not isinstance(ledger, list):
         raise ArtifactError(f"{LEDGER_JSON} is not a list")
     entries: dict[tuple[str, str], dict] = {}
+    eva_covered_by_fn: dict[str, list[dict]] = {}
+    vuh_callers: list[tuple[str, str]] = []
     skipped: list[dict] = []
     for unit in ledger:
         if not isinstance(unit, dict) or unit.get("status") != "covered":
             continue
         evidence = unit.get("evidence") or []
-        if not any(isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging") for e in evidence):
-            continue  # covered by Eva, not by a proof
+        has_wp = any(isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging") for e in evidence)
         file, function = unit.get("file"), unit.get("function")
+        if not has_wp:
+            if isinstance(file, str) and isinstance(function, str):
+                eva_covered_by_fn.setdefault(function, []).append(unit)
+            continue
         if not (
             isinstance(file, str)
             and is_safe_relative_path(file)
@@ -1313,6 +1320,58 @@ def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
             (file, function), {"file": file, "function": function, "module": unit.get("module"), "coverage_ids": []}
         )
         entry["coverage_ids"].append(unit.get("coverage_id"))
+        if any(
+            isinstance(a, dict) and a.get("kind") in ("valid_under_hyp", "callee_contract_hypothesis")
+            for a in (unit.get("assumptions") or [])
+        ):
+            if (file, function) not in vuh_callers:
+                vuh_callers.append((file, function))
+
+    if vuh_callers and eva_covered_by_fn:
+        dag = load_json_optional(run_path / DAG_JSON, {})
+        dag_fns = dag.get("functions", {}) if isinstance(dag, dict) else {}
+        if isinstance(dag_fns, dict) and dag_fns:
+            callees_map: dict[tuple[str, str], list[str]] = {}
+            callees_by_name: dict[str, list[str]] = {}
+            for k, fmeta in dag_fns.items():
+                if not isinstance(fmeta, dict):
+                    continue
+                fn_n = str(fmeta.get("name") or (k.split("#", 1)[-1] if "#" in str(k) else k))
+                fn_f = str(fmeta.get("file") or (k.split("#", 1)[0] if "#" in str(k) else ""))
+                raw_c = fmeta.get("internal_callees") or fmeta.get("direct_callees") or fmeta.get("callees") or []
+                clean_c = [str(c) for c in raw_c if isinstance(c, str) and c]
+                if fn_f and fn_n:
+                    callees_map[(fn_f, fn_n)] = clean_c
+                if fn_n and fn_n not in callees_by_name:
+                    callees_by_name[fn_n] = clean_c
+
+            for c_file, c_fn in vuh_callers:
+                c_names = callees_map.get((c_file, c_fn)) or callees_by_name.get(c_fn, [])
+                for callee_name in c_names:
+                    cand_units = eva_covered_by_fn.get(callee_name, [])
+                    same_file = [u for u in cand_units if u.get("file") == c_file]
+                    for u in same_file or cand_units:
+                        uf, ufn = u.get("file"), u.get("function")
+                        if not (
+                            isinstance(uf, str)
+                            and is_safe_relative_path(uf)
+                            and isinstance(ufn, str)
+                            and FUNCTION_RE.match(ufn)
+                        ):
+                            continue
+                        ent = entries.setdefault(
+                            (uf, ufn),
+                            {
+                                "file": uf,
+                                "function": ufn,
+                                "module": u.get("module"),
+                                "coverage_ids": [],
+                                "eva_only": True,
+                            },
+                        )
+                        if u.get("coverage_id") not in ent["coverage_ids"]:
+                            ent["coverage_ids"].append(u.get("coverage_id"))
+
     return [entries[k] for k in sorted(entries)], skipped
 
 
@@ -1408,7 +1467,7 @@ def sweep(
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 rcs = list(pool.map(lambda t: runner(t[2], f"{SWEEP_DIR}/logs/{PurePosixPath(t[1]).stem}.log"), tasks))
 
-        results, regressions, missing = [], [], []
+        results, regressions, missing, newly_wp_proven = [], [], [], []
         for (e, out_json, _), rc in zip(tasks, rcs, strict=True):
             status = _report_brief(run_dir / out_json).get("report_status") if (run_dir / out_json).is_file() else None
             row = {
@@ -1424,6 +1483,8 @@ def sweep(
                 missing.append(row)
             elif status != "all_proven":
                 regressions.append(row)
+            elif e.get("eva_only"):
+                newly_wp_proven.append(row)
         summary = {
             "ok": not missing,
             "status": "incomplete" if missing else ("regressions" if regressions else "ok"),
@@ -1435,15 +1496,28 @@ def sweep(
             "results": results,
             "generated_at": utc_now(),
         }
-        if regressions:
-            # The sweep is the trusted backstop: a proof that no longer holds must reach the ledger.
-            rc, out = (script_runner or _script_runner(run_dir))(
-                "ledger.py", ["ingest-wp", *(r["report"] for r in regressions)]
-            )
+        s_runner = script_runner or _script_runner(run_dir)
+        to_ingest = [*(r["report"] for r in regressions), *(r["report"] for r in newly_wp_proven)]
+        if to_ingest:
+            # The sweep is the trusted backstop: regressions and newly WP-verified Eva callees reach the ledger.
+            rc, out = s_runner("ledger.py", ["ingest-wp", *to_ingest])
             summary["ledger"] = _json_or_tail(out)
             if rc != 0:
                 summary["ok"] = False
                 summary["ledger_error"] = f"ledger.py ingest-wp failed (rc={rc}); regressions not recorded"
+        raw_ledger = load_json_optional(run_dir / LEDGER_JSON, [])
+        has_vuh = any(
+            isinstance(u, dict)
+            and any(
+                isinstance(a, dict) and a.get("kind") in ("valid_under_hyp", "callee_contract_hypothesis")
+                for a in (u.get("assumptions") or [])
+            )
+            for u in (raw_ledger if isinstance(raw_ledger, list) else [])
+        )
+        if has_vuh and summary["ok"]:
+            rc_a, out_a = s_runner("ledger.py", ["audit-hypotheses"])
+            if rc_a == 0:
+                summary["hypothesis_audit"] = _json_or_tail(out_a)
         atomic_write_json(run_dir / SWEEP_DIR / "summary.json", summary)
     return summary
 

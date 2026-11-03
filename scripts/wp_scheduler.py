@@ -103,6 +103,46 @@ MERGE_BATCH_TRIGGER = 4  # queued results of one module that fire a merge
 MERGE_MAX_WAIT_S = 300.0  # the oldest queued result never waits longer than this
 HISTORY_LIMIT = 400
 REOPENABLE_SKIPS = frozenset({"candidate", "no_open_units"})
+DEFAULT_WALL_BUDGET_S = {
+    "quick": 600,
+    "standard": 900,
+    "deep": 1800,
+}
+
+
+def _agent_wall_budget_s() -> int:
+    env_wall = (os.environ.get("FRAMAC_PROVER_WALL_BUDGET_S") or "").strip()
+    if env_wall.isdigit() and int(env_wall) > 0:
+        return int(env_wall)
+    meta = load_json_optional(Path("run-metadata.json"), {}) or {}
+    profile = str(meta.get("profile") or "standard").strip().lower()
+    return DEFAULT_WALL_BUDGET_S.get(profile, 900)
+
+
+def _over_budget_tasks(state: dict, now: float | None = None) -> list[dict]:
+    now_ts = DEPS.now() if now is None else now
+    over: list[dict] = []
+    for _, t in sorted(state["tasks"].items()):
+        if t["state"] != "running" or t["kind"] not in AGENT_KINDS:
+            continue
+        assigned = float(t.get("assigned_ts") or now_ts)
+        budget_s = int(t.get("wall_budget_s") or _agent_wall_budget_s())
+        age_s = round(now_ts - assigned, 1)
+        if age_s >= budget_s:
+            over.append(
+                {
+                    "task": t["id"],
+                    "kind": t["kind"],
+                    "agent_id": t.get("agent_id"),
+                    "age_s": age_s,
+                    "wall_budget_s": budget_s,
+                    "action": "FINALIZE NOW: inject 'FINALIZE NOW — write agents/<agent-id>/scratch/result.json immediately' or run wp_scheduler.py requeue --agent-id "
+                    + str(t.get("agent_id") or ""),
+                }
+            )
+    return over
+
+
 _PLACEHOLDER_RE = re.compile(
     r"\{(agent_id|module_name|header_file|c_file|function_name|wave_index|scratch_module_sources|module_sources|"
     r"cppflags|ldflags|security_properties_json|untrusted_entry_functions_json|coverage_ids_json|"
@@ -170,6 +210,7 @@ class Deps:
         self.transition: Callable[..., dict] = ledger.cmd_transition
         self.transition_many: Callable[[list[dict]], list[dict]] = ledger.cmd_transition_many
         self.ingest_wp: Callable[..., dict] = ledger.cmd_ingest_wp
+        self.audit_hypotheses: Callable[..., dict] = ledger.cmd_audit_hypotheses
         self.ingest_agent_hypothesis: Callable[..., dict] = ledger.cmd_ingest_agent_hypothesis
         self.ingest_verifier: Callable[..., dict] = ledger.cmd_ingest_verifier
         self.resolve_request: Callable[..., dict] = contract_negotiator.cmd_resolve
@@ -418,7 +459,17 @@ def _assign_agent(state: dict, task: dict) -> str:
         if aid not in state["agents"] and not (Path("agents") / aid).exists():
             break
         n += 1
-    task.update(dispatches=n, agent_id=aid, state="running", assigned_at=utc_now(), assigned_ts=DEPS.now())
+    now_iso = utc_now()
+    now_ts = DEPS.now()
+    task.update(
+        dispatches=n,
+        agent_id=aid,
+        state="running",
+        assigned_at=now_iso,
+        assigned_ts=now_ts,
+        dispatched_at=now_iso,
+        wall_budget_s=_agent_wall_budget_s(),
+    )
     task.pop("requeued_from", None)
     task.setdefault("agents", []).append(aid)
     state["agents"][aid] = task["id"]
@@ -598,6 +649,33 @@ class Ctx:
             rec = recs[0] if recs else {}
         return sorted({str(c) for c in rec.get("internal_callees") or [] if c})
 
+    def _fn_dag_rec(self, file: str, fn: str) -> dict:
+        rec = self.dag_by_key.get((file, fn))
+        if rec is None:
+            recs = self.dag_by_name.get(fn) or []
+            rec = recs[0] if recs else {}
+        return rec if isinstance(rec, dict) else {}
+
+    def verifiability(self, file: str, fn: str) -> str:
+        rec = self._fn_dag_rec(file, fn)
+        if rec.get("verifiability"):
+            return str(rec["verifiability"])
+        for u in self.fn_units(file, fn):
+            bk = u.get("bookkeeping") or {}
+            if bk.get("verifiability"):
+                return str(bk["verifiability"])
+        return "core_provable"
+
+    def wp_blockers(self, file: str, fn: str) -> list[str]:
+        rec = self._fn_dag_rec(file, fn)
+        if rec.get("wp_blockers"):
+            return [str(b) for b in rec["wp_blockers"] if b]
+        for u in self.fn_units(file, fn):
+            bk = u.get("bookkeeping") or {}
+            if bk.get("wp_blockers"):
+                return [str(b) for b in bk["wp_blockers"] if b]
+        return []
+
     def resolve(self, callee: str, caller_file: str) -> list[tuple[str, str, str]]:
         """(file, name, module) definitions a call may reach. A definition in the caller's own file wins
         (a static there shadows every other); an ambiguous name reaches every same-named function."""
@@ -629,18 +707,70 @@ def _open_units(task: dict, fn_units: list[dict]) -> list[dict]:
     return [u for u in fn_units if u["status"] == "planned" or (u["status"] == "blocked" and u["coverage_id"] in mine)]
 
 
-def _skip_verdict(task: dict, fn_units: list[dict], open_verify: set[str]) -> str | None:
+def _skip_verdict(
+    task: dict, fn_units: list[dict], open_verify: set[str], verifiability: str | None = None
+) -> str | None:
     """
     Why a prove task must not run: a unit of its function is a candidate whose verification is over
-    (never prove broken code), or nothing is left to prove. A candidate still being verified only
-    keeps the task waiting behind its gate.
+    (never prove broken code), the function is statically classified as `shell_unverifiable_wp`,
+    or nothing is left to prove. A candidate still being verified only keeps the task waiting
+    behind its gate.
     """
     cand_units = [u for u in fn_units if u["status"] == "candidate"]
     if cand_units and not any(fp in open_verify for u in cand_units for fp in u.get("result_fingerprints") or []):
         return "candidate"
+    verif = verifiability or task.get("verifiability")
+    if verif == "shell_unverifiable_wp":
+        return "shell_unverifiable_wp"
     if not _open_units(task, fn_units):
         return "no_open_units"
     return None
+
+
+def _negotiate_skip_verdict(
+    fn_units: list[dict], open_verify: set[str], verifiability: str | None = None
+) -> str | None:
+    """Why a negotiate task must not run: its callee has a confirmed/unverified candidate unit or is shell_unverifiable_wp."""
+    cand_units = [u for u in fn_units if u["status"] == "candidate"]
+    if cand_units:
+        return "candidate"
+    if verifiability == "shell_unverifiable_wp":
+        return "shell_unverifiable_wp"
+    return None
+
+
+def _park_shell_unverifiable_units(task: dict, fn_units: list[dict], wp_blockers: list[str], errors: list) -> None:
+    """
+    Park planned units of a `shell_unverifiable_wp` function without dispatching a prover:
+    - Harness entrypoints (`fuzz_or_eva_harness_entrypoint`) with no evidence become `not_applicable`
+      (or `blocked` if they already carry fuzz/Eva evidence).
+    - Other `shell_unverifiable_wp` functions become `blocked` (if they carry evidence) or `deferred`
+      (if no evidence is recorded yet) with the `shell_unverifiable_wp` blocker reason.
+    """
+    is_harness_entry = "fuzz_or_eva_harness_entrypoint" in wp_blockers
+    blocker_detail = ", ".join(wp_blockers) if wp_blockers else "unsupported C construct"
+    reason = f"shell_unverifiable_wp ({blocker_detail}): skipped WP prover dispatch"
+    specs: list[dict] = []
+    for u in fn_units:
+        if u["status"] != "planned":
+            continue
+        if u.get("evidence"):
+            target_status = "blocked"
+        elif is_harness_entry:
+            target_status = "not_applicable"
+        else:
+            target_status = "deferred"
+        specs.append(
+            {
+                "id": u["coverage_id"],
+                "status": target_status,
+                "agent_id": None,
+                "reason": reason,
+                "expected": ["planned"],
+            }
+        )
+    if specs:
+        _batch_or_individual_transitions(specs, errors=errors, tag="shell_unverifiable_wp")
 
 
 def _sync(state: dict, ctx: Ctx) -> dict:
@@ -684,6 +814,8 @@ def _sync(state: dict, ctx: Ctx) -> dict:
         task = tasks.get(tid)
         fn_units = ctx.fn_units(file, fn)
         planned_ids = [u["coverage_id"] for u in fn_units if u["status"] == "planned"]
+        verifiability = ctx.verifiability(file, fn)
+        wp_blockers = ctx.wp_blockers(file, fn)
         if task is None:
             module = next((u["module"] for u in fn_units if u.get("module")), None) or ctx.file_module.get(file)
             _new_task(
@@ -696,6 +828,8 @@ def _sync(state: dict, ctx: Ctx) -> dict:
                 function=fn,
                 units=planned_ids,
                 callees=[],
+                verifiability=verifiability,
+                wp_blockers=wp_blockers,
                 merge_attempts=0,
                 analysis_errors=0,
                 invalid_results=0,
@@ -708,19 +842,59 @@ def _sync(state: dict, ctx: Ctx) -> dict:
             fresh = set(planned_ids) - set(task.get("units") or [])
             reopenable = task["state"] == "skipped" and task.get("outcome") in REOPENABLE_SKIPS
             merged_units = sorted(set(task.get("units") or []) | set(planned_ids))
-            if (reopenable or fresh) and _skip_verdict({**task, "units": merged_units}, fn_units, open_verify) is None:
+            if (reopenable or fresh) and _skip_verdict(
+                {**task, "units": merged_units, "verifiability": verifiability}, fn_units, open_verify, verifiability
+            ) is None:
                 task["units"] = merged_units
+                task["verifiability"] = verifiability
+                task["wp_blockers"] = wp_blockers
                 _reopen(state, task, "units are planned again")
                 changes["reopened"].append(tid)
 
     for tid in sorted(tasks):
         task = tasks[tid]
-        if task["kind"] != "prove" or task["state"] != "pending":
+        if task["state"] != "pending":
             continue
-        verdict = _skip_verdict(task, ctx.fn_units(task["file"], task["function"]), open_verify)
-        if verdict:
-            _finish(state, task, "skipped", verdict, reason=f"not dispatched ({verdict})")
-            changes["skipped"].append(tid)
+        if task["kind"] == "prove":
+            fn_units = ctx.fn_units(task["file"], task["function"])
+            verifiability = ctx.verifiability(task["file"], task["function"])
+            wp_blockers = ctx.wp_blockers(task["file"], task["function"])
+            task["verifiability"] = verifiability
+            task["wp_blockers"] = wp_blockers
+            verdict = _skip_verdict(task, fn_units, open_verify, verifiability)
+            if verdict:
+                if verdict == "shell_unverifiable_wp":
+                    _park_shell_unverifiable_units(task, fn_units, wp_blockers, [])
+                    blocker_str = ", ".join(wp_blockers) if wp_blockers else "unsupported C construct"
+                    _finish(
+                        state,
+                        task,
+                        "skipped",
+                        verdict,
+                        reason=f"not dispatched: {verdict} ({blocker_str})",
+                    )
+                    eva_unk = ctx.eva_unknown_count(task.get("file"), task["function"])
+                    if eva_unk > 0 and "fuzz_or_eva_harness_entrypoint" not in wp_blockers:
+                        _ensure_breaker(
+                            state,
+                            task,
+                            "scheduler",
+                            None,
+                            {"new_tasks": changes["created"], "errors": []},
+                        )
+                else:
+                    _finish(state, task, "skipped", verdict, reason=f"not dispatched ({verdict})")
+                changes["skipped"].append(tid)
+        elif task["kind"] == "negotiate":
+            fn_units = ctx.fn_units(task["file"], task["function"])
+            verifiability = ctx.verifiability(task["file"], task["function"])
+            neg_verdict = _negotiate_skip_verdict(fn_units, open_verify, verifiability)
+            if neg_verdict:
+                note = f"not dispatched: callee unit is {neg_verdict}"
+                for rid in task.get("requests") or []:
+                    _resolve_request([], str(rid), "rejected_by_callee", note)
+                _finish(state, task, "skipped", neg_verdict, reason=note)
+                changes["skipped"].append(tid)
 
     prove_modules = sorted({t["module"] for t in tasks.values() if t["kind"] == "prove" and t["state"] != "skipped"})
     for mod in prove_modules:
@@ -772,6 +946,8 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
             task["deps"] = sorted(deps)
             task["callees"] = sorted(callees)
             task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task["function"])
+            task["verifiability"] = ctx.verifiability(task["file"], task["function"])
+            task["wp_blockers"] = ctx.wp_blockers(task["file"], task["function"])
         elif task["kind"] == "arch":
             task["deps"] = [f"gate:{task['module']}"]
         elif task["kind"] in ("breaker", "negotiate"):
@@ -945,7 +1121,18 @@ class _View:
 
 
 def _priority_key(task: dict) -> tuple:
-    return (-int(task.get("height") or 0), -int(task.get("eva_unknowns") or 0), task["id"])
+    # Leaf/unverifiable shell tasks (height == 0 and shell_unverifiable_wp) are scheduled after
+    # core_provable tasks so a single-agent queue does not stall behind a known WP limitation.
+    shell_leaf = (
+        1
+        if (
+            task.get("kind") == "prove"
+            and task.get("verifiability") == "shell_unverifiable_wp"
+            and int(task.get("height") or 0) == 0
+        )
+        else 0
+    )
+    return (shell_leaf, -int(task.get("height") or 0), -int(task.get("eva_unknowns") or 0), task["id"])
 
 
 def _waves_filter(state: dict) -> Callable[[dict], bool]:
@@ -1272,6 +1459,8 @@ def _describe(task: dict, ctx: Ctx | None = None) -> dict:
         out["wp_report"] = task["wp_report"]  # the stalled prover's promoted WP report (unproven goals)
     if task.get("brief_file"):
         out["brief_file"] = task["brief_file"]
+    if task.get("wall_budget_s") is not None:
+        out["wall_budget_s"] = int(task["wall_budget_s"])
     return out
 
 
@@ -1529,8 +1718,24 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                     _finish(state, task, "skipped", refusal, reason=f"not dispatched ({refusal})")
                     out["skipped"].append({"task": task["id"], "reason": refusal})
                     continue
+            elif task["kind"] == "negotiate":
+                neg_refusal = _negotiate_skip_verdict(
+                    ctx.fn_units(task["file"], task["function"]),
+                    set(),
+                    ctx.verifiability(task["file"], task["function"]),
+                )
+                if neg_refusal:
+                    note = f"not dispatched: callee unit is {neg_refusal}"
+                    for rid in task.get("requests") or []:
+                        _resolve_request(out["errors"], str(rid), "rejected_by_callee", note)
+                    _finish(state, task, "skipped", neg_refusal, reason=note)
+                    out["skipped"].append({"task": task["id"], "reason": neg_refusal})
+                    continue
             _assign_agent(state, task)
             picked.append(task["id"])
+        over_budget = _over_budget_tasks(state)
+        if over_budget:
+            out["over_budget_tasks"] = over_budget
         save_schedule(state)
         snapshot = {tid: json.loads(json.dumps(state["tasks"][tid])) for tid in picked}
         if not prepare:
@@ -1603,6 +1808,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                     for p_tid in task_open_cids:
                         prove_refusals[p_tid] = _claim_units(state, state["tasks"][p_tid])
 
+        units_for_neg: dict[str, dict] | None = None
         for tid in ready_tids:
             task = state["tasks"][tid]
             aid = snapshot[tid]["agent_id"]
@@ -1610,6 +1816,22 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                 refusal = prove_refusals[tid] if tid in prove_refusals else _claim_units(state, task)
                 if refusal:
                     out["skipped"].append({"task": tid, "agent_id": aid, "reason": refusal})
+                    continue
+            elif task["kind"] == "negotiate":
+                if units_for_neg is None:
+                    units_for_neg, _ = ledger.load_state()
+                neg_units = [
+                    units_for_neg[cid]
+                    for cid in _unit_ids(task, units_for_neg)
+                    if units_for_neg[cid]["status"] not in NO_TOUCH
+                ]
+                neg_refusal = _negotiate_skip_verdict(neg_units, set(), task.get("verifiability"))
+                if neg_refusal:
+                    note = f"claim refused at dispatch: callee unit is {neg_refusal}"
+                    for rid in task.get("requests") or []:
+                        _resolve_request(out["errors"], str(rid), "rejected_by_callee", note)
+                    _finish(state, task, "skipped", neg_refusal, reason=note)
+                    out["skipped"].append({"task": tid, "agent_id": aid, "reason": neg_refusal})
                     continue
             task["brief_file"] = prepared[tid].get("brief_file")
             out["tasks"].append(_describe(task, ctx))
@@ -1736,6 +1958,16 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
                 "rejected_by_callee",
                 "not dispatched: a function cannot strengthen its own contract by request",
             )
+            continue
+        neg_verdict = _negotiate_skip_verdict(ctx.fn_units(cfile, cname), set(), ctx.verifiability(cfile, cname))
+        if neg_verdict:
+            _resolve_request(
+                out["errors"],
+                rid,
+                "rejected_by_callee",
+                f"not dispatched: callee {key} is {neg_verdict}",
+            )
+            out.setdefault("negotiations_skipped", []).append({"request": rid, "callee": key, "reason": neg_verdict})
             continue
         pair = f"{caller['id']}|{key}"
         count = int(state["negotiation_counts"].get(pair, 0))
@@ -1922,7 +2154,8 @@ def _complete_prover(state: dict, ctx: Ctx, task: dict, aid: str, res: dict, res
         out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, result_path, task["module"]
     )
     _emit_negotiations(state, ctx, task, [r for r in _requests() if r.get("id") not in before], out)
-    _ensure_breaker(state, task, aid, report_rel, out)
+    if not (report and report.get("wp_allocation_limitation") is True):
+        _ensure_breaker(state, task, aid, report_rel, out)
     out["units"] = _park_units(task, aid, f"prover {aid} returned {status}")
     _finish(state, task, "blocked", status)  # terminal: its callers are released
     out["action"] = "blocked"
@@ -1996,7 +2229,8 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
     if res["status"] == "crash_found":
         artifact = res.get("crash_artifact")
         if artifact and artifact not in (res.get("seeds") or []):
-            # The module re-run must start from the crashing input.
+            # Promote the crashing input into the module corpus; repair:<module> is only created
+            # when a verifier rejects a candidate as harness_induced.
             _try(
                 out["errors"],
                 "promote crash seed",
@@ -2007,10 +2241,6 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
                 kind="seed",
                 module=task["module"],
             )
-        if (HARNESS_DIR / f"harness_{task['module']}.json").is_file():
-            _ensure_repair(state, task["module"], f"breaker_crash: {aid}", out)
-        else:
-            out["errors"].append(f"no harness sidecar for module {task['module']}: the crash cannot be re-run")
     _finish(state, task, "done", res["status"])
     out["action"] = "ingested"
     out["result_status"] = res["status"]
@@ -2164,6 +2394,8 @@ def _on_merged(state: dict, task: dict, aid: str, merged: dict, out: dict) -> No
     entry: dict[str, Any] = {"task": task["id"], "agent_id": aid}
     if rep_path.is_file():
         _try(out["errors"], f"ingest-wp {rep}", DEPS.ingest_wp, [rep_path])
+        if any(state["tasks"].get(f"prove:{c}", {}).get("state") == "blocked" for c in (task.get("callees") or [])):
+            _try(out["errors"], f"audit-hypotheses {task['id']}", DEPS.audit_hypotheses)
         entry["checkpoint"] = _try(out["errors"], f"checkpoint {task['id']}", DEPS.save_shard, task["slug"], rep_path)
         entry["parent_wp_report"] = rep_path.as_posix()
     else:
@@ -2477,10 +2709,12 @@ def cmd_status() -> dict:
             "kind": t["kind"],
             "agent_id": t.get("agent_id"),
             "age_s": round(now - float(t.get("assigned_ts") or now), 1),
+            "wall_budget_s": int(t.get("wall_budget_s") or _agent_wall_budget_s()),
         }
         for _, t in sorted(tasks.items())
         if t["state"] == "running"
     ]
+    over_budget = _over_budget_tasks(state, now)
     merge_queue = [
         {
             "task": t["id"],
@@ -2517,6 +2751,7 @@ def cmd_status() -> dict:
             for t in ready
         ],
         "running": running,
+        "over_budget_tasks": over_budget,
         "merge_queue": merge_queue,
         "rechecks": sorted(state.get("rechecks") or {}),
         "gates": gates,

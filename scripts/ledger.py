@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
-from fingerprint import make_fingerprint, normalize_file  # noqa: E402
+from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     RunLockTimeout,
@@ -518,6 +518,71 @@ def _alarm_in_file(alarm: dict, unit_file: str) -> bool:
     return eva_alarm_in_file(alarm, unit_file)
 
 
+def _extract_eva_report_sources(report: dict) -> set[str] | None:
+    """
+    Collect normalized target source files covered by an Eva report when `report["sources"]`
+    is present.
+    When `include_source: true` is used, `report["sources"]` lists only
+    `workspace/harnesses/harness_<mod>.c` while the actual analyzed C files appear in
+    `functions_with_properties_by_file`, `invalid_alarms`, `unknown_obligations_by_function`,
+    `dead_alarms`, and `assumed_properties` (or, if none of those carry file paths, all module
+    units are in scope of the `#include`-based slice).
+    """
+    raw_sources = report.get("sources")
+    if not raw_sources:
+        return None
+    files: set[str] = set()
+    for s in raw_sources:
+        nf = normalize_file(str(s))
+        if nf and not nf.startswith("workspace/harnesses/") and not Path(nf).name.startswith("harness_"):
+            files.add(nf)
+    if files:
+        return files
+
+    # All entries in `report["sources"]` were harness files (`include_source: true`).
+    # Extract target files from `functions_with_properties_by_file` when present; otherwise
+    # return `None` so all units of the module are eligible (individual alarm matching still
+    # checks `_alarm_in_file(alarm, u_file)`).
+    raw_props_by_file = report.get("functions_with_properties_by_file") or []
+    if isinstance(raw_props_by_file, dict):
+        for fpath in raw_props_by_file:
+            nf = normalize_file(str(fpath))
+            if nf and not Path(nf).name.startswith("harness_"):
+                files.add(nf)
+    elif isinstance(raw_props_by_file, list):
+        for item in raw_props_by_file:
+            if isinstance(item, dict) and item.get("file"):
+                nf = normalize_file(str(item["file"]))
+                if nf and not Path(nf).name.startswith("harness_"):
+                    files.add(nf)
+    for key in ("invalid_alarms", "dead_alarms", "assumed_properties"):
+        for alarm in report.get(key) or []:
+            if isinstance(alarm, dict):
+                joined = (
+                    f"{alarm['directory'].rstrip('/')}/{alarm['file']}"
+                    if alarm.get("directory") and alarm.get("file")
+                    else (alarm.get("file") or "")
+                )
+                nf = normalize_file(str(joined))
+                if nf and not Path(nf).name.startswith("harness_"):
+                    files.add(nf)
+    unknown_by_fn = report.get("unknown_obligations_by_function") or {}
+    if isinstance(unknown_by_fn, dict):
+        for items in unknown_by_fn.values():
+            if isinstance(items, list):
+                for alarm in items:
+                    if isinstance(alarm, dict):
+                        joined = (
+                            f"{alarm['directory'].rstrip('/')}/{alarm['file']}"
+                            if alarm.get("directory") and alarm.get("file")
+                            else (alarm.get("file") or "")
+                        )
+                        nf = normalize_file(str(joined))
+                        if nf and not Path(nf).name.startswith("harness_"):
+                            files.add(nf)
+    return files or None
+
+
 @ledger_locked
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -528,7 +593,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
         rte_units = [u for u in _module_units(units, module) if u["obligation_class"] == "rte"]
-        report_sources = {normalize_file(s) for s in report["sources"]} if report.get("sources") else None
+        report_sources = _extract_eva_report_sources(report)
         if report_sources:
             rte_units = [u for u in rte_units if normalize_file(u["file"]) in report_sources]
 
@@ -808,15 +873,21 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                 u["status"] = "covered"
                 u["unresolved"] = []
                 stats["covered"] += 1
-            elif cls == "rte" and all_proven and not counts:
+            elif cls in ("rte", "l2_termination", "l3_frame") and all_proven and not counts:
+                ev_result = "wp_no_rte_goals" if cls == "rte" else "wp_qed_simplified"
+                ev_summary = (
+                    "WP generated no RTE goal for this function."
+                    if cls == "rte"
+                    else f"WP soundness passed and Qed discharged {cls} with zero remaining prover goals."
+                )
                 add_evidence(
                     u,
                     "wp",
                     "run_wp_function.py",
-                    "wp_no_rte_goals",
+                    ev_result,
                     True,
                     tool_output,
-                    "WP generated no RTE goal for this function.",
+                    ev_summary,
                 )
                 if soundness.get("reduced_checks"):
                     add_assumption(
@@ -866,12 +937,37 @@ def _infer_module_for_function(units: dict[str, dict], file: str, function: str)
     return "unknown"
 
 
+def _find_matching_sink_candidate(
+    candidates: dict[str, dict],
+    file: str,
+    function: str,
+    kind_or_cls: str,
+    predicate: str,
+) -> dict | None:
+    """
+    Find an existing candidate for the same `(file, function, normalized_kind)` sink
+    so a prover/breaker hypothesis or breaker crash merges with an existing fuzz/Eva
+    candidate instead of inflating `candidates.json` with a second fingerprint.
+    """
+    norm_f = normalize_file(file)
+    norm_k = normalize_kind(kind_or_cls, predicate)
+    for cand in candidates.values():
+        loc = cand.get("location") or {}
+        if normalize_file(loc.get("file") or "") != norm_f or loc.get("function") != function:
+            continue
+        prop = cand.get("property") or {}
+        cand_k = normalize_kind(prop.get("kind") or "", prop.get("predicate") or "")
+        if cand_k == norm_k or norm_k in ("rte", "assertion", "property") or cand_k in ("rte", "assertion", "property"):
+            return cand
+    return None
+
+
 @ledger_locked
 def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) -> dict:
     """
     Promote breaker seeds (if any), record prover strengthening_requests into
-    contract_negotiator, and record a prover/breaker fault_hypothesis
-    as an unverified candidate in candidates.json.
+    contract_negotiator, and record a prover/breaker fault_hypothesis (or breaker
+    crash_found artifact) as an unverified candidate in candidates.json.
     """
     res = load_agent_result_json(result_path)
     errs = validate_agent_result(res)
@@ -905,7 +1001,12 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
     fh = res.get("fault_hypothesis")
     if fh is not None:
         cls = goal_obligation_class({"kind": "assertion", "annotation": fh["predicate"]})
-        fp = make_fingerprint(file, fn, cls, fh["predicate"])
+        existing_cand = _find_matching_sink_candidate(candidates, file, fn, cls, fh["predicate"])
+        fp = (
+            existing_cand["fingerprint"]
+            if existing_cand is not None
+            else make_fingerprint(file, fn, cls, fh["predicate"])
+        )
         fn_units = [
             u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")
         ]
@@ -942,8 +1043,57 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
                 tool_out,
                 f"Fault hypothesis on {fh['predicate'][:120]}",
             )
-            mark_candidate(units[cid], fp)
-        candidates_added += 1
+            if existing_cand is None or existing_cand.get("status") == "unverified":
+                mark_candidate(units[cid], fp)
+        if existing_cand is None:
+            candidates_added += 1
+
+    if role == "breaker" and res.get("status") == "crash_found" and res.get("crash_artifact"):
+        pred = str(res.get("failing_predicate") or (fh["predicate"] if fh else "") or "crash_found")
+        cls = goal_obligation_class({"kind": "assertion", "annotation": pred})
+        existing_cand = _find_matching_sink_candidate(candidates, file, fn, cls, pred)
+        fp = existing_cand["fingerprint"] if existing_cand is not None else make_fingerprint(file, fn, cls, pred)
+        fn_units = [
+            u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")
+        ]
+        linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
+            u["coverage_id"] for u in fn_units
+        ]
+        crash_rel = rel(str(res["crash_artifact"]))
+        if crash_rel.startswith(f"agents/{aid}/scratch/"):
+            prom_crash = promote_file(Path.cwd(), aid, crash_rel, kind="crash", module=mod)
+            crash_rel = str(prom_crash["dest"])
+        prom_res = promote_file(Path.cwd(), aid, rel(str(result_path)), kind="artifact")
+        tool_out = str(prom_res["dest"])
+        note = str(res.get("analysis") or "breaker reproduced crash")
+        upsert_candidate(
+            candidates,
+            fp,
+            "breaker",
+            "confirmed",
+            mod,
+            {"file": file, "line": 0, "function": fn},
+            {"kind": normalize_kind(cls, pred), "predicate": pred},
+            [crash_rel],
+            tool_out,
+            linked,
+            note,
+        )
+        for cid in linked:
+            add_evidence(
+                units[cid],
+                "breaker",
+                aid,
+                "breaker_crash_found",
+                False,
+                tool_out,
+                f"Breaker reproduced failure on {pred[:120]}",
+                {"artifact": crash_rel},
+            )
+            if existing_cand is None or existing_cand.get("status") == "unverified":
+                mark_candidate(units[cid], fp)
+        if existing_cand is None:
+            candidates_added += 1
 
     commit(units, candidates, run_dir=Path.cwd())
     return {
@@ -976,6 +1126,50 @@ def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_out
                 if isinstance(art, dict) and art.get("reproducible") is True and art.get("sha256"):
                     shas.add(str(art["sha256"]))
     return shas
+
+
+def _find_matching_sink_finding(
+    findings: dict[str, dict],
+    rec: dict,
+    run_dir: Path | None = None,
+) -> dict | None:
+    """
+    Find an already-recorded finding with the same verdict and the same canonical sink
+    `(normalized_file, function, canonical_baseline_line, normalized_kind)` so two different
+    fingerprints for the same root cause (e.g. a prover hypothesis predicate and a fuzz crash
+    predicate at the same line) merge into a single finding instead of inflating the report count.
+    """
+    loc = rec.get("location") or {}
+    rec_file = normalize_file(loc.get("file") or "")
+    rec_fn = loc.get("function") or ""
+    rec_line = int(loc.get("line") or 0)
+    if not rec_file or not rec_fn or rec_line <= 0:
+        return None
+    from workspace_overlay import map_work_to_baseline_line
+
+    rec_base_line, _ = map_work_to_baseline_line(rec_file, rec_line, run_dir=run_dir)
+    rec_prop = rec.get("property") or {}
+    rec_kind = normalize_kind(rec_prop.get("kind") or "", rec_prop.get("predicate") or "")
+
+    for existing in findings.values():
+        if existing.get("verdict") != rec.get("verdict"):
+            continue
+        eloc = existing.get("location") or {}
+        if normalize_file(eloc.get("file") or "") != rec_file or eloc.get("function") != rec_fn:
+            continue
+        eline = int(eloc.get("line") or 0)
+        ebase_line, _ = map_work_to_baseline_line(rec_file, eline, run_dir=run_dir)
+        if ebase_line != rec_base_line:
+            continue
+        eprop = existing.get("property") or {}
+        ekind = normalize_kind(eprop.get("kind") or "", eprop.get("predicate") or "")
+        if (
+            ekind == rec_kind
+            or ekind in ("rte", "assertion", "property")
+            or rec_kind in ("rte", "assertion", "property")
+        ):
+            return existing
+    return None
 
 
 def _merge_finding_record(existing: dict, incoming: dict) -> None:
@@ -1156,7 +1350,26 @@ def cmd_ingest_verifier(
         if fp in findings:
             _merge_finding_record(findings[fp], rec)
         else:
-            findings[fp] = rec
+            existing_sink = _find_matching_sink_finding(findings, rec, run_dir=run_dir)
+            if existing_sink is not None:
+                canon_fp = existing_sink["fingerprint"]
+                _merge_finding_record(existing_sink, rec)
+                if fp in resolved_fps:
+                    resolved_fps = [canon_fp if x == fp else x for x in resolved_fps]
+                    resolved_fps = list(dict.fromkeys(resolved_fps))
+                for cid in rec.get("linked_units") or []:
+                    if cid in units:
+                        u = units[cid]
+                        if fp != canon_fp and fp in u["result_fingerprints"]:
+                            u["result_fingerprints"].remove(fp)
+                        if u["status"] == "candidate" and canon_fp not in u["result_fingerprints"]:
+                            u["result_fingerprints"].append(canon_fp)
+                if not res.get("refingerprint_reason") and not cand.get("refingerprint_reason"):
+                    cand["refingerprint_reason"] = (
+                        f"Merged duplicate sink finding {fp} into canonical finding {canon_fp}."
+                    )
+            else:
+                findings[fp] = rec
 
     cand["status"] = "verified"
     cand["resolved_fingerprints"] = resolved_fps
@@ -1519,6 +1732,101 @@ def cmd_scaffold_verifier(
     return result_obj
 
 
+@ledger_locked
+def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.json")) -> dict:
+    """
+    Resolve provisional `valid_under_hyp` assumptions on WP-covered units against the call graph:
+    - If every in-scope callee in the DAG is deductively proven by WP (`covered` with discharging
+      `wp` evidence and no `blocked`/`candidate` units), remove `valid_under_hyp` and record
+      `phase="audit"`, `result="hypotheses_discharged"` evidence.
+    - If any callee in the DAG is `blocked`, `candidate`, `planned`, `in_progress`, `deferred`,
+      or covered only by Eva (`phase="eva"`, no discharging `wp` evidence), attach an explicit
+      `callee_contract_hypothesis` assumption referencing the callee's `related_units`.
+    """
+    units, candidates = load_state()
+    dag = load_json_optional(dag_path, {}) if dag_path else {}
+    dag_fns = dag.get("functions", {}) if isinstance(dag, dict) else {}
+
+    callees_by_key: dict[tuple[str, str], list[str]] = {}
+    callees_by_name: dict[str, list[str]] = {}
+    for key, fmeta in dag_fns.items() if isinstance(dag_fns, dict) else []:
+        if not isinstance(fmeta, dict):
+            continue
+        fn_name = str(fmeta.get("name") or (key.split("#", 1)[-1] if "#" in str(key) else key))
+        fn_file = normalize_file(fmeta.get("file") or (key.split("#", 1)[0] if "#" in str(key) else ""))
+        raw_callees = fmeta.get("internal_callees") or fmeta.get("direct_callees") or fmeta.get("callees") or []
+        clean_callees = [str(c) for c in raw_callees if isinstance(c, str) and c and c != fn_name]
+        if fn_file and fn_name:
+            callees_by_key[(fn_file, fn_name)] = clean_callees
+        if fn_name and fn_name not in callees_by_name:
+            callees_by_name[fn_name] = clean_callees
+
+    units_by_fn_name: dict[str, list[dict]] = {}
+    for u in units.values():
+        units_by_fn_name.setdefault(u["function"], []).append(u)
+
+    def _has_wp_discharge(unit_obj: dict) -> bool:
+        return any(
+            isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging")
+            for e in (unit_obj.get("evidence") or [])
+        )
+
+    discharged = 0
+    conditional = 0
+    for u in units.values():
+        if u["status"] != "covered" or not _has_wp_discharge(u):
+            continue
+        u_file = normalize_file(u["file"])
+        u_fn = u["function"]
+        callee_names = callees_by_key.get((u_file, u_fn))
+        if callee_names is None:
+            callee_names = callees_by_name.get(u_fn, [])
+
+        callee_units: list[dict] = []
+        for cname in callee_names:
+            cand_units = [
+                cu
+                for cu in units_by_fn_name.get(cname, [])
+                if cu["status"] not in ("out_of_scope", "not_applicable")
+                and not (normalize_file(cu["file"]) == u_file and cu["function"] == u_fn)
+            ]
+            same_file = [cu for cu in cand_units if normalize_file(cu["file"]) == u_file]
+            callee_units.extend(same_file or cand_units)
+
+        unproven_callees = [cu for cu in callee_units if cu["status"] != "covered" or not _has_wp_discharge(cu)]
+        has_vuh = any(a.get("kind") in ("valid_under_hyp", "callee_contract_hypothesis") for a in u["assumptions"])
+
+        if unproven_callees:
+            rel_ids = sorted({cu["coverage_id"] for cu in unproven_callees})
+            u["assumptions"] = [
+                a for a in u["assumptions"] if a.get("kind") not in ("valid_under_hyp", "callee_contract_hypothesis")
+            ]
+            add_assumption(
+                u,
+                "callee_contract_hypothesis",
+                f"Caller proof relies on callee contract(s) not deductively proven by WP: {', '.join(rel_ids[:5])}.",
+                related=rel_ids,
+            )
+            conditional += 1
+        elif has_vuh and callee_units:
+            u["assumptions"] = [
+                a for a in u["assumptions"] if a.get("kind") not in ("valid_under_hyp", "callee_contract_hypothesis")
+            ]
+            add_evidence(
+                u,
+                "audit",
+                "ledger.py",
+                "hypotheses_discharged",
+                False,
+                None,
+                "All callee contracts in the call graph are deductively proven by WP.",
+            )
+            discharged += 1
+
+    commit(units, candidates)
+    return {"discharged": discharged, "conditional": conditional}
+
+
 def cmd_summary() -> dict:
     units, candidates, findings = load_all_state()
     by_status: dict[str, int] = {}
@@ -1606,7 +1914,10 @@ def main(argv: list[str] | None = None) -> int:
     p_scaf.add_argument("--line", type=int, default=None, help="Override 1-based source line")
     p_scaf.add_argument("--severity", choices=["critical", "high", "medium", "low"], default="high")
     p_scaf.add_argument("--out", type=Path, default=None, help="Write scaffolded crash_verifier JSON to this path")
+    p_audit = sub.add_parser("audit-hypotheses", help="Resolve valid_under_hyp assumptions against callgraph_dag.json")
+    p_audit.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
     sub.add_parser("summary")
+    sub.add_parser("status", help="Alias for summary")
     args = parser.parse_args(argv)
 
     out: object
@@ -1640,6 +1951,8 @@ def main(argv: list[str] | None = None) -> int:
                 severity=args.severity,
                 out_path=args.out,
             )
+        elif args.cmd == "audit-hypotheses":
+            out = cmd_audit_hypotheses(args.dag)
         else:
             out = cmd_summary()
     except (LedgerError, PromotionError, ArtifactError, RunLockTimeout) as exc:

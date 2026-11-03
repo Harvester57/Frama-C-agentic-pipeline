@@ -480,15 +480,20 @@ def test_breaker_crash_reopens_the_gate_until_the_module_is_refreshed(sim):
     _stall_and_dispatch_breaker(sim)
     sim.breaker("breaker-f", "f", "src/m/f.c", crash=True)
     out = S.cmd_complete("breaker-f")
-    assert out["result_status"] == "crash_found" and "repair:m" in out["new_tasks"]
+    assert out["result_status"] == "crash_found"
+    assert "repair:m" not in out.get("new_tasks", [])
     assert len(list((sim.run_dir / "workspace/corpus/m").iterdir())) == 2  # the seed and the crashing input
-    assert S.cmd_status()["gates"]["gate:m"] == {"open": False, "waiting_on": ["repair:m"]}
+    fp = load("candidates.json")[0]["fingerprint"]
+    assert tasks()[f"verify:{fp}"]["state"] == "pending"
+    assert S.cmd_status()["gates"]["gate:m"] == {"open": False, "waiting_on": [f"verify:{fp}"]}
 
     nxt = S.cmd_next("auto", prepare=True)
-    assert nxt["tasks"] == [] and [p["task"] for p in nxt["parent_tasks"]] == ["repair:m"]
-    assert any("pipeline_make.py run module-m" in a for a in nxt["parent_tasks"][0]["actions"])
-    assert S.cmd_next("auto", prepare=True)["parent_tasks"] == []  # handed out once
-    assert S.cmd_refresh("m")["repair"] == "done"
+    assert nxt["parent_tasks"] == [] and ids(nxt) == [f"verify:{fp}"]
+    ver = nxt["tasks"][0]
+    L.cmd_scaffold_verifier(
+        fp, "needs_validation", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json")
+    )
+    assert S.cmd_complete(ver["agent_id"])["decision"] == "needs_validation"
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m/h.c#h"]
 
 
@@ -1023,3 +1028,104 @@ def test_batch_transitions_in_claim_and_park_units(sim, monkeypatch):
     assert parked["blocked"] == ["src/m/f.c#f::rte"]
     assert parked["planned"] == ["src/m/f.c#f::l2_termination"]
     assert parked["errors"] == []
+
+
+def test_caller_merged_with_blocked_callee_audits_hypotheses(sim):
+    sim.build({"caller": ("src/m/a.c", "m", ["callee"]), "callee": ("src/m/b.c", "m", [])}, sidecars={"m": {}})
+    S.cmd_init()
+    # Dispatch and stall callee so callee becomes blocked and releases caller
+    t_callee = S.cmd_next("auto", prepare=True)["tasks"][0]
+    assert t_callee["function"] == "callee"
+    sim.prover(t_callee["agent_id"], "callee", "src/m/b.c", status="stalled_after_k_retries")
+    out = S.cmd_complete(t_callee["agent_id"])
+    assert out["action"] == "blocked" and tasks()["prove:src/m/b.c#callee"]["state"] == "blocked"
+
+    # Dispatch caller (and breaker); complete breaker cleanly
+    dispatched = S.cmd_next("auto", prepare=True)["tasks"]
+    brk_task = next(t for t in dispatched if t["kind"] == "breaker")
+    sim.breaker(brk_task["agent_id"], "callee", "src/m/b.c", crash=False)
+    S.cmd_complete(brk_task["agent_id"])
+
+    t_caller = next(t for t in dispatched if t["kind"] == "prove")
+    assert t_caller["function"] == "caller"
+    aid_caller = t_caller["agent_id"]
+    sim.prover(aid_caller, "caller", "src/m/a.c", status="all_proven")
+    assert S.cmd_complete(aid_caller)["action"] == "queued_for_merge"
+
+    # Make merge_agent_batch write a parent WP report with proven_under_hyp=1
+    orig_batch = sim.merge_agent_batch
+
+    def batch_with_hyp(run_dir, entries, **kw):
+        res = orig_batch(run_dir, entries, **kw)
+        for m in res["merged"]:
+            rep_path = sim.run_dir / m["parent_wp_report"]
+            rep = json.loads(rep_path.read_text(encoding="utf-8"))
+            rep["by_obligation_class"] = {"rte": {"proven": 1, "proven_under_hyp": 1, "unproven": 0}}
+            write_json(rep_path, rep)
+        return res
+
+    sim.merge_agent_batch = batch_with_hyp
+    S.DEPS.merge_agent_batch = batch_with_hyp
+    S.cmd_merge_pending()
+
+    caller_unit = units()["src/m/a.c#caller::rte"]
+    assert caller_unit["status"] == "covered"
+    cch = [a for a in caller_unit["assumptions"] if a["kind"] == "callee_contract_hypothesis"]
+    assert len(cch) == 1
+    assert "src/m/b.c#callee::rte" in cch[0]["related_units"]
+
+
+def test_shell_unverifiable_leaf_is_deprioritized_and_alloc_stall_skips_breaker(sim, monkeypatch):
+    sim.build({"a_shell": ("src/m/a.c", "m", []), "b_core": ("src/m/b.c", "m", [])})
+    dag = load(sim.run_dir / "workspace/reports/callgraph_dag.json")
+    dag["functions"]["a_shell"]["verifiability"] = "shell_unverifiable_wp"
+    dag["functions"]["a_shell"]["wp_blockers"] = ["dynamic_allocation"]
+    dag["functions"]["b_core"]["verifiability"] = "core_provable"
+    write_json(sim.run_dir / "workspace/reports/callgraph_dag.json", dag)
+
+    S.cmd_init()
+    # 'a_shell' is shell_unverifiable_wp so it is immediately skipped by the scheduler
+    # (no prover slot burned) and its unit is parked; 'b_core' is dispatched directly.
+    assert tasks()["prove:src/m/a.c#a_shell"]["state"] == "skipped"
+    assert tasks()["prove:src/m/a.c#a_shell"]["outcome"] == "shell_unverifiable_wp"
+    assert units()["src/m/a.c#a_shell::rte"]["status"] == "deferred"
+
+    monkeypatch.setattr(S.DEPS, "recommend", lambda max_agents=None: {"max_agents": 1})
+    first = S.cmd_next("auto", prepare=True)["tasks"]
+    assert [t["function"] for t in first] == ["b_core"]
+    sim.finish(first[0]["agent_id"], "b_core", "src/m/b.c")
+
+    assert S.cmd_next("auto", prepare=True)["tasks"] == []
+    assert not any(t["kind"] == "breaker" for t in tasks().values())
+    assert S.cmd_status()["done"]
+
+
+def test_negotiate_skips_callee_already_in_candidate_status_and_tracks_wall_budget(sim):
+    sim.build({"leaf": ("src/m/a.c", "m", []), "caller": ("src/m/b.c", "m", ["leaf"])})
+    S.cmd_init()
+    # Dispatch leaf first and verify wall_budget_s is populated
+    nxt = S.cmd_next("auto", prepare=True)
+    assert nxt["tasks"][0]["wall_budget_s"] > 0
+
+    # Mark leaf's unit as candidate before caller requests strengthening
+    u_path = sim.run_dir / "coverage-ledger.json"
+    u_list = load(u_path)
+    for u in u_list:
+        if u["function"] == "leaf":
+            u["status"] = "candidate"
+            u["result_fingerprints"] = ["src/m/a.c#leaf::rte::0123456789"]
+    write_json(u_path, u_list)
+
+    # Attempting to emit a negotiation for a callee whose unit is already candidate is skipped
+    sched = load(sim.run_dir / "state/wp_schedule.json")
+    ctx = S.Ctx()
+    out: dict = {"errors": []}
+    S._emit_negotiations(
+        sched,
+        ctx,
+        {"id": "prove:src/m/b.c#caller", "file": "src/m/b.c", "function": "caller"},
+        [{"id": "req-1", "callee_function": "leaf", "callee_file": "src/m/a.c"}],
+        out,
+    )
+    assert out.get("negotiations_created", []) == []
+    assert out.get("negotiations_skipped", [{}])[0].get("reason") == "candidate"
