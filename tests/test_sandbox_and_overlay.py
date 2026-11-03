@@ -137,7 +137,7 @@ def _fake_engine(tmp_path):
     else:
         shim = bin_dir / "docker"
         shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
-        shim.chmod(0o755)
+        shim.chmod(0o700)
     (tmp_path / "target_repo").mkdir()
     (tmp_path / "run_1").mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith("FRAMAC_")}

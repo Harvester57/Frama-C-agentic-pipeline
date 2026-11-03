@@ -1065,7 +1065,7 @@ def make_fake_engine(bin_dir: Path, info: dict, log: Path) -> None:
     else:
         shim = bin_dir / "docker"
         shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
-        shim.chmod(0o755)
+        shim.chmod(0o700)
 
 
 @pytest.fixture

@@ -146,7 +146,7 @@ def _src_files(base: Path, payload: bytes) -> dict[str, Path]:
     base.mkdir(parents=True, exist_ok=True)
     binary = base / "prog"
     binary.write_bytes(payload)
-    os.chmod(binary, 0o755)
+    os.chmod(binary, 0o700)
     log = base / "prog.log"
     log.write_text("built\n", encoding="utf-8")
     return {"binary": binary, "compile.log": log}
