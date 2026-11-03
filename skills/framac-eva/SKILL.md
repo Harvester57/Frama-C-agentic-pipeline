@@ -45,7 +45,7 @@ Tuning is your judgment call. Make applies it: record per-module parameters in `
   - raise the slevel: `python3 /opt/framac-pipeline/scripts/pipeline_make.py params set --module <mod> --eva-slevel 250`;
   - or add `/*@ loop pragma UNROLL 64; */` above bounded fixed-size header loops in `workspace/work/`.
 - **Taint:** if Layer 6 (Secret Non-Interference / Taint) properties are active on the module, enable the taint domain with `params set --module <mod> --eva-taint`. It adds `taint` to `-eva-domains`, so `!\tainted(...)` assertions at network emission sinks get verified.
-- For any other precision lever, or an alarm or message you do not understand, grep the Eva manual through [`docs/references/`](../../docs/references/README.md) rather than reading it: loops §6.4, case splitting and partitioning §6.5, domains §6.7, what each alarm checks §3.2, log messages §3.3, FAQ §10.
+- For any other precision lever, or an alarm or message you do not understand, grep the Eva manual through `docs/references/` (see `docs/references/README.md`) rather than reading it: loops §6.4, case splitting and partitioning §6.5, domains §6.7, what each alarm checks §3.2, log messages §3.3, FAQ §10.
 
 ---
 

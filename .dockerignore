@@ -8,6 +8,8 @@
 !templates/**
 !schemas/
 !schemas/**
+!skills/
+!skills/**
 
 # Exclude Python bytecode/caches inside allowed directories
 **/__pycache__/

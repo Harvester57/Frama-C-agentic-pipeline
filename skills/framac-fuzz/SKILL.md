@@ -38,9 +38,17 @@ Select all modules with `run_eacsl_fuzz: true` (or the specific `--module <name>
 The `selftest` Make target (a prerequisite of `fuzz`) runs it; for a one-off check:
 
 ```powershell
-& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
+# Windows (PowerShell)
+& ".\wrappers\framac-docker.ps1" `
   -TargetDir "<target-dir>" -RunDir "<run-dir>" `
   "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
+```
+
+```bash
+# Linux / macOS (POSIX)
+./wrappers/framac-docker.sh \
+  --target "<target-dir>" --run-dir "<run-dir>" \
+  -- "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
 ```
 
 `selftest` builds `templates/eacsl_canary/canary.c` through the exact production E-ACSL path and writes `workspace/reports/eacsl_selftest.json`. Its checks are `compiled`, `no_gmp_only`, `instrumented_binary`, `benign_input_clean`, `detects_overflow`, `detects_uninitialized`, and `attributes_line` (the last one is informational). `benign_input_clean` matters because a replay counts any non-zero exit as a reproduction: a binary that fails on every input (uninitialized runtime, false `\valid` alarms) would otherwise pass `detects_overflow`. If it fails, `campaign --engine auto` skips E-ACSL for every module with `engine_fallback_reason: eacsl_selftest_failed: ...` instead of failing each compile. Read `checks` and the canary `compile_log` before touching harnesses: a failing canary is a toolchain problem, not a target problem.
@@ -84,7 +92,7 @@ The fuzzer, and every crash replay, runs inside the hardened container through `
 
 *(Never pass `-fsanitize=address` alongside E-ACSL's memory tracking runtime in the same binary, as both intercept `malloc`/`free` and map conflicting shadow memory.)*
 
-For E-ACSL behaviour not covered here, start with [`docs/references/e-acsl-quickref.md`](../../docs/references/e-acsl-quickref.md), which covers `e-acsl-gcc` and `-e-acsl-*` options, runtime output and limitations. Then grep the E-ACSL plug-in manual (Frama-C 33.0) in [`docs/references/`](../../docs/references/README.md). The manual's examples mix old and new option spellings, so check any flag against `e-acsl-gcc -h` in the container.
+For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickref.md`, which covers `e-acsl-gcc` and `-e-acsl-*` options, runtime output and limitations. Then grep the E-ACSL plug-in manual (Frama-C 33.0) in `docs/references/` (see `docs/references/README.md`). The manual's examples mix old and new option spellings, so check any flag against `e-acsl-gcc -h` in the container.
 
 ---
 

@@ -24,7 +24,7 @@ Modular deductive verification stage built from:
 - **The Dual-Oracle Guardrail** (`E-ACSL` + `WP`).
 - **The Crash Verification Gate** (`crash_verifier_brief.md`).
 
-How resources are measured and how caches work: [`docs/resources-and-caching.md`](../../docs/resources-and-caching.md).
+How resources are measured and how caches work: `docs/resources-and-caching.md`.
 
 ## Architecture Overview
 
@@ -54,7 +54,7 @@ How resources are measured and how caches work: [`docs/resources-and-caching.md`
   - It moves the prover's planned units to `in_progress` with a compare-and-set, so a unit that just became a `candidate` is never handed out.
   - It renders `agents/<agent-id>/brief.md` with every template variable filled, including the host paths the agent needs for the wrapper.
 - **Agent outputs:** every subagent writes only under `agents/<agent-id>/scratch/`, writes its final JSON result to `agents/<agent-id>/scratch/result.json` (which `wp_scheduler.py complete --agent-id <agent-id>` reads from disk and validates with `validate_artifacts.py agent-result`), and returns **one JSON object**.
-- **References:** `prepare-agent` / `next --prepare` automatically fills the `{references_dir}` placeholder in every brief with the path to `docs/references/` (mounted inside the container at `/opt/framac-pipeline/docs/references`). That folder holds greppable Frama-C manuals (see its [`README.md`](../../docs/references/README.md)), which subagents grep only as a last resort.
+- **References:** `prepare-agent` / `next --prepare` automatically fills the `{references_dir}` placeholder in every brief with the path to `docs/references/` (mounted inside the container at `/opt/framac-pipeline/docs/references`). That folder holds greppable Frama-C manuals (see `docs/references/README.md`), which subagents grep only as a last resort.
 - **Pure ACSL, in scope:** provers and architects may add **pure ACSL annotations only** (`/*@ ... */`, `//@ ...`) within their assigned function or header. `merge-agent` and `merge-batch` mechanically reject:
   - any C token modification;
   - any scope violation;

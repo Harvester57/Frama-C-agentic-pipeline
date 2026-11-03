@@ -19,10 +19,18 @@ Slices a large C codebase into verifiable module harnesses and per-function topo
 All commands run through the wrapper with the run directory as working directory (`/framac-run`) and the target mounted read-only at `/target`:
 
 ```powershell
+# Windows (PowerShell)
 $env:PYTHONIOENCODING="utf-8"
-& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
+& ".\wrappers\framac-docker.ps1" `
   -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildIfMissing `
   "<command>"
+```
+
+```bash
+# Linux / macOS (POSIX)
+./wrappers/framac-docker.sh \
+  --target "<target-dir>" --run-dir "<run-dir>" --build-if-missing \
+  -- "<command>"
 ```
 
 Always use full `/opt/framac-pipeline/scripts/<script>.py` paths inside `"<command>"` so host PowerShell does not expand `$S`.

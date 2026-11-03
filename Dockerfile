@@ -78,10 +78,11 @@ RUN if [ -n "${TARGET_APT_PACKAGES}" ]; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Copy pipeline scripts, templates and artifact schemas into /opt/framac-pipeline for container-internal access
+# Copy pipeline scripts, templates, schemas, and skills into /opt/framac-pipeline for container-internal access
 COPY scripts/ /opt/framac-pipeline/scripts/
 COPY templates/ /opt/framac-pipeline/templates/
 COPY schemas/ /opt/framac-pipeline/schemas/
+COPY skills/ /opt/framac-pipeline/skills/
 RUN chmod +x /opt/framac-pipeline/scripts/*.py
 
 WORKDIR /framac-run

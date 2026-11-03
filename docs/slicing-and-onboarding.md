@@ -51,9 +51,17 @@ cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
 The target is mounted read-only, so the build runs in a disposable copy inside the run directory, through `sandbox_exec.py` (rlimits, env allowlist, timeout):
 
 ```powershell
-& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
+# Windows (PowerShell)
+& ".\wrappers\framac-docker.ps1" `
   -TargetDir "C:\path\to\c-project" -RunDir "<run-dir>" `
   "mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/ && python3 /opt/framac-pipeline/scripts/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j`$FRAMAC_JOB_CPUS"
+```
+
+```bash
+# Linux / macOS (POSIX)
+./wrappers/framac-docker.sh \
+  --target /path/to/c-project --run-dir "<run-dir>" \
+  -- 'mkdir -p workspace/build-scratch && cp -a /target/. workspace/build-scratch/ && python3 /opt/framac-pipeline/scripts/sandbox_exec.py run --writable workspace/build-scratch --cwd workspace/build-scratch -- bear -- make -j$FRAMAC_JOB_CPUS'
 ```
 
 `FRAMAC_JOB_CPUS` is the number of CPUs the broker leased to this container, so the build uses the whole lease and no more. In PowerShell the backtick keeps `$FRAMAC_JOB_CPUS` for the container's shell; in the POSIX wrapper, single-quote the command instead.

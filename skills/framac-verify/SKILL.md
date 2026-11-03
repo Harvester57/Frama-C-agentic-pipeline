@@ -19,9 +19,9 @@ argument-hint: "<target-dir> [--module <name>] [--profile quick|standard|deep] [
 
 # /framac-verify
 
-Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: [`docs/v2-design.md`](../../docs/v2-design.md).
+Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: `docs/v2-design.md`.
 
-The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in [`docs/references/`](../../docs/references/README.md) (mounted inside the container at `/opt/framac-pipeline/docs/references`). Consult them only when a skill, a brief, and `docs/troubleshooting.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. `wp_scheduler.py next --prepare` automatically populates `{references_dir}` in rendered briefs.
+The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in `docs/references/` (see `docs/references/README.md`; mounted inside the container at `/opt/framac-pipeline/docs/references`). Consult them only when a skill, a brief, and `docs/troubleshooting.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. `wp_scheduler.py next --prepare` automatically populates `{references_dir}` in rendered briefs.
 
 ## Operating modes
 
@@ -58,7 +58,7 @@ The pipeline sizes itself; do not pass CPU, memory or agent counts to the wrappe
 - Every wrapper call leases CPUs and memory from the measured pool (cgroups, Slurm, the container engine, `FRAMAC_POOL_*` caps). Each tool runs as many provers or fuzz workers as its lease allows; `-wp-memlimit` and `-rss_limit_mb` stay fixed, so results do not depend on the machine.
 - Run wrapper commands in the **foreground** and wait for them to finish (or as background jobs only if your host harness explicitly supports non-detaching background commands). A waiting command prints its queue position.
 
-Details, knobs and troubleshooting: [`docs/resources-and-caching.md`](../../docs/resources-and-caching.md).
+Details, knobs and troubleshooting: `docs/resources-and-caching.md`.
 
 ---
 
@@ -67,10 +67,18 @@ Details, knobs and troubleshooting: [`docs/resources-and-caching.md`](../../docs
 All commands below run inside the container from the run directory:
 
 ```powershell
+# Windows (PowerShell)
 $env:PYTHONIOENCODING="utf-8"
-& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
+& ".\wrappers\framac-docker.ps1" `
   -TargetDir "<target-dir>" -RunDir "<run-dir>" `
   "<command>"
+```
+
+```bash
+# Linux / macOS (POSIX)
+./wrappers/framac-docker.sh \
+  --target "<target-dir>" --run-dir "<run-dir>" \
+  -- "<command>"
 ```
 
 Create the run directory once with `-NewRun` (the wrapper prints the path) and pass it as `-RunDir` afterwards. Always use explicit `/opt/framac-pipeline/scripts/<script>.py` paths inside `"<command>"` so host PowerShell never expands `$S` as an empty host variable.

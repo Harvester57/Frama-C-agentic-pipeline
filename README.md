@@ -1,23 +1,38 @@
 # Frama-C Agentic Verification & Hybrid Fuzzing Pipeline
 
-An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C** (`RTE`, `Eva`, `WP`, `E-ACSL`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
+An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 33.0** (`RTE`, `Eva`, `WP`, `E-ACSL`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
 
-All verification tools execute exclusively inside a reproducible **`framac-pipeline` Docker container**, orchestrated by modular **Agent Skills** (`/framac-verify`, `/framac-slice`, `/framac-fuzz`, `/framac-eva`, `/framac-wp`) and deterministic Python helper scripts.
+All verification tools execute inside a reproducible, network-isolated **`framac-pipeline` container**, orchestrated by modular **Agent Skills** ([`/framac-verify`](skills/framac-verify/SKILL.md), [`/framac-slice`](skills/framac-slice/SKILL.md), [`/framac-fuzz`](skills/framac-fuzz/SKILL.md), [`/framac-eva`](skills/framac-eva/SKILL.md), [`/framac-wp`](skills/framac-wp/SKILL.md)) and deterministic Python helper scripts.
 
 ---
 
-## Key Capabilities
+## How It Works
+
+```mermaid
+flowchart LR
+    Target["Read-Only Target C Repo<br/>(/target)"] --> P0["Phase 0: /framac-slice<br/>Shadow Overlay, Call-Graph DAG,<br/>Risk Tiers & Dual Harnesses"]
+    P0 --> P1["Phase 1: /framac-fuzz<br/>RTE + E-ACSL + LibFuzzer<br/>Dynamic Crash Triage"]
+    P0 --> P2["Phase 2: /framac-eva<br/>Abstract Interpretation<br/>Discharges 80-90% RTEs"]
+    P1 & P2 --> Gate["Crash Verification Gate<br/>Independent Verifier Subagents<br/>& Sandbox Replay"]
+    Gate -- "Confirmed Bug" --> Findings["findings.json<br/>(Excluded from WP)"]
+    Gate -- "Surviving Unknowns" --> P3["Phase 3: /framac-wp<br/>Dependency-Driven Prover Swarm<br/>+ Dual-Oracle E-ACSL Guardrail"]
+    P3 -- "Stalled Proof" --> Breaker["Adversarial Breaker<br/>Targeted Seed Synthesis"]
+    Breaker --> Gate
+    P3 & Findings --> P4["Phase 4: Audit & Reports<br/>wp-sweep, REPORT.md,<br/>report.sarif, verified_acsl.patch"]
+```
+
+### Key Capabilities
 
 1. **Zero-ACSL Dynamic Triage (`RTE + E-ACSL + LibFuzzer`):**
-   Automatically injects ACSL runtime-error assertions (`-rte`) and compiles them with E-ACSL into shadow-memory and arithmetic runtime checks, linked with LibFuzzer (`e-acsl-gcc`, `-fsanitize=fuzzer`). Catches intra-struct sub-object buffer overflows, use-after-free, uninitialized reads (`-rte-initialized`), signed integer overflow, division by zero, invalid shifts, and functional contract violations before a single minute is spent on formal proofs. Unsigned downcasts are opt-in (`--warn-unsigned-downcast`). Unsigned overflow and signed downcasts are left to Eva and WP, because intentional wrap-around would stop every fuzz campaign.
+   Automatically injects ACSL runtime-error assertions (`-rte -rte-initialized`) and compiles them with E-ACSL into shadow-memory and arithmetic runtime checks linked with LibFuzzer (`e-acsl-gcc`, `-fsanitize=fuzzer`). Catches intra-struct sub-object buffer overflows, use-after-free, uninitialized reads, signed integer overflow, division by zero, invalid shifts, and functional contract violations before a single minute is spent on formal proofs.
 2. **Module-Level Abstract Interpretation (`Eva`):**
-   Simulates all symbolic inputs (`0 .. MAX_INPUT_SIZE`) from per-module `eva_main()` harnesses to automatically discharge **80–90% of RTE assertions** without writing loop invariants.
+   Simulates symbolic inputs (`0 .. MAX_INPUT_SIZE`) from per-module `eva_main()` harnesses to automatically discharge **80–90% of RTE assertions** without writing loop invariants.
 3. **Dependency-Driven Subagent WP Swarm (`/framac-wp`):**
-   A deterministic scheduler (`wp_scheduler.py`) dispatches a **Function Prover Subagent** (`frama-c -wp -wp-rte -wp-fct <fn>`) as soon as the function's callees are merged. Longest caller chains go first, and finished proofs merge in parallel micro-batches. There are no global waves or barriers.
+   A deterministic scheduler ([`scripts/wp_scheduler.py`](scripts/wp_scheduler.py)) dispatches a **Function Prover Subagent** (`frama-c -wp -wp-rte -wp-fct <fn>`) as soon as the function's callees are merged. Longest caller chains go first, and finished proofs merge in parallel micro-batches without global wave barriers.
 4. **Dual-Oracle Anti-Hallucination Guardrail:**
-   Every ACSL contract (`requires`, `assigns`, `ensures`, `loop invariant`) proposed by a subagent is compiled with **E-ACSL** and tested against the live fuzzer corpus before being passed to **WP**, mathematically preventing the LLM from passing proofs via vacuous or contradictory preconditions (`requires \false`).
+   Every ACSL contract (`requires`, `assigns`, `ensures`, `loop invariant`) proposed by a subagent is compiled with **E-ACSL** and tested against the live fuzzer corpus before being passed to **WP**, preventing the LLM from passing proofs via vacuous or over-constrained preconditions (`requires \false`).
 5. **Adversarial Prover-vs-Breaker Dual-Play:**
-   When a WP proof stalls after `K` retries on an assertion, an **Adversarial Breaker Subagent** crafts targeted fuzzer seeds that trigger the assertion at runtime. It never blocks the stalled function's callers.
+   When a WP proof stalls after `K` retries on an assertion, an **Adversarial Breaker Subagent** crafts targeted fuzzer seeds that trigger the assertion at runtime without blocking the stalled function's callers.
 6. **6 Layers of Security Properties (Beyond Memory Safety):**
    - **Layer 1:** Absence of Run-Time Errors (`AoRTE` via `-rte`)
    - **Layer 2:** Termination & Anti-DoS (`loop variant`, `decreases`)
@@ -25,13 +40,96 @@ All verification tools execute exclusively inside a reproducible **`framac-pipel
    - **Layer 4:** Authentication & Protocol State-Machine Integrity (`ghost` state variables)
    - **Layer 5:** Output Grammar & Sanitization (`ensures` character-class bounds against CRLF/log injection)
    - **Layer 6:** Secret Zeroization & Information Flow / Non-Interference (`buffer_is_zeroed` + `-eva-domains taint`)
-7. **Sizes Itself to Any Machine (see [`docs/resources-and-caching.md`](docs/resources-and-caching.md)):**
-   - **Measured resources.** Before every job the pipeline measures what it may use: cgroups, Slurm allocations, the Docker/Podman engine and user caps. A host-side broker leases CPUs and memory to each container (optional CPU pinning on multi-NUMA hosts). Each tool sizes its own parallelism from its lease (`-wp-par`, LibFuzzer workers, `make -j`). Resources added to or removed from a node take effect on the next job.
-   - **Machine-independent results.** Limits that decide outcomes (`-wp-memlimit`, `-rss_limit_mb`, seeds) stay fixed.
-   - **Make for deterministic work.** Per-module fuzz and Eva runs, builds, ingestion and replays run from a generated Makefile instead of LLM subagents.
-   - **Caches.** Content-addressed caches reuse E-ACSL builds, Eva results and WP proofs within a run. A trusted end-of-run sweep shares proofs across runs.
-8. **Evidence Discipline (v2, see [`docs/v2-design.md`](docs/v2-design.md)):**
-   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (function x obligation class) records what is proven unconditionally, what is proven under open assumptions, and what is blocked, deferred, or out of scope. All shared artifacts are schema-validated and the target is mounted read-only. The hardened container (no network, all capabilities dropped, no-new-privileges, Docker's default seccomp and AppArmor profiles, resource limits) is the isolation boundary; inside it, target-controlled binaries run through `sandbox_exec.py`, which applies rlimits (CPU, file size, open files, processes), a cleared environment with an explicit allowlist, and a wall-clock timeout with process-group kill. There is no filesystem isolation inside the container (see the residual-risk note in `docs/v2-design.md`, Section 3).
+7. **Self-Sizing Resource Broker & Content-Addressed Caches:**
+   Before every job, [`scripts/resources.py`](scripts/resources.py) measures available cgroups, Slurm allocations, and Docker/Podman engine limits to lease CPUs and memory per container while keeping outcome-deciding limits (`-wp-memlimit`, `-rss_limit_mb`, seeds) fixed across machines. Deterministic per-module builds, fuzzing, and Eva runs execute via Make ([`scripts/pipeline_make.py`](scripts/pipeline_make.py)) backed by per-run and cross-run caches ([`docs/resources-and-caching.md`](docs/resources-and-caching.md)).
+8. **Evidence Discipline & Mechanical Validation:**
+   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`docs/v2-design.md`](docs/v2-design.md)).
+
+> [!IMPORTANT]
+> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`scripts/sandbox_exec.py`](scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container; see [`docs/v2-design.md` (Section 3)](docs/v2-design.md) for the residual-risk model.
+
+---
+
+## Prerequisites
+
+- **Container Engine:** Docker or Podman (`FRAMAC_CONTAINER_ENGINE=auto|docker|podman`).
+  - Allocate at least **4 GiB of RAM** to the container engine VM (**8 GiB+ recommended** for parallel WP and fuzzing). Tools refuse to run below their single-worker memory floor (`1768 MiB` for WP, `3072 MiB` for LibFuzzer) rather than producing starved or flaky results.
+- **Host Python:** Python **3.10+** (stdlib only; used on the host by the resource broker and test suite).
+- **Target C Project:** Standard C99/C11 source tree. If the project does not provide a `compile_commands.json`, Phase 0 ([`scripts/build_callgraph_dag.py`](scripts/build_callgraph_dag.py)) automatically discovers in-repository header directories and synthesizes one (or you can capture exact flags via `bear -- make` inside a disposable scratch copy).
+
+---
+
+## Quickstart
+
+### 1. Build the Container Image
+
+From the repository root:
+
+```powershell
+# Windows (PowerShell)
+$env:PYTHONIOENCODING="utf-8"
+docker build "-t" "framac-pipeline:latest" .
+```
+
+```bash
+# Linux / macOS (POSIX)
+docker build -t framac-pipeline:latest .
+```
+
+### 2. Initialize a Run and Verify the E-ACSL Canary
+
+Use [`wrappers/framac-docker.ps1`](wrappers/framac-docker.ps1) on Windows or [`wrappers/framac-docker.sh`](wrappers/framac-docker.sh) on Linux/macOS. Passing `-NewRun` (`--new-run`) creates a fresh run directory outside the target at `~/framac-pipeline/<repo>/run-<N>/` and prints its path:
+
+```powershell
+# Windows (PowerShell)
+& ".\wrappers\framac-docker.ps1" `
+  -TargetDir "C:\path\to\c-project" `
+  -NewRun `
+  -BuildIfMissing `
+  "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
+```
+
+```bash
+# Linux / macOS (POSIX)
+./wrappers/framac-docker.sh \
+  --target /path/to/c-project \
+  --new-run \
+  --build-if-missing \
+  -- "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
+```
+
+Pass the printed run directory as `-RunDir "<run-dir>"` (`--run-dir "<run-dir>"`) on subsequent commands for that run.
+- `sandbox_exec.py probe` verifies the inner sandbox (`{"sandbox": "rlimits"}`).
+- `run_eacsl_fuzz.py selftest` compiles and runs the built-in E-ACSL canary ([`templates/eacsl_canary/canary.c`](templates/eacsl_canary/canary.c)) to verify that benign inputs pass cleanly while buffer overflows and uninitialized reads are caught at runtime.
+- Optional resource caps and cache settings are controlled via host environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_CACHE`, `FRAMAC_BROKER=off`; see [`docs/resources-and-caching.md`](docs/resources-and-caching.md)).
+
+### 3. Run the Agent Skills
+
+Invoke the skills from your AI coding assistant:
+
+| Skill | Stage | Purpose |
+| :--- | :---: | :--- |
+| [`/framac-verify`](skills/framac-verify/SKILL.md) | **All (0–4)** | **End-to-end orchestrator:** slices the codebase, fuzzes with E-ACSL, prunes with Eva, verifies crash candidates, proves surviving obligations with parallel WP subagents, and emits final reports. Supports `--profile quick\|standard\|deep`. |
+| [`/framac-slice`](skills/framac-slice/SKILL.md) | **Phase 0** | Initializes the `workspace/` shadow overlay, builds the Call-Graph DAG and topological waves, classifies modules by Risk Tier, generates dual harnesses, and seeds `coverage-ledger.json`. |
+| [`/framac-fuzz`](skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice via Make. |
+| [`/framac-eva`](skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
+| [`/framac-wp`](skills/framac-wp/SKILL.md) | **Phase 3** | Dispatches the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) via `wp_scheduler.py`, enforcing the E-ACSL Dynamic Guardrail and spawning Adversarial Breakers on stalled goals. |
+
+---
+
+## Run Outputs & Artifacts
+
+Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contained, schema-validated audit trail:
+
+| Artifact | Description |
+| :--- | :--- |
+| `REPORT.md` | Executive summary: run status (`complete` or `incomplete`), confirmed vulnerabilities table, needs-validation candidates, assurance summary (unconditional vs. conditional proofs), and coverage metrics. |
+| `FINDINGS-DETAIL.md` | Detailed root-cause traces, reproduction commands, and candidate fix diffs for every `confirmed` finding. |
+| `NEEDS-VALIDATION.md` | Source-grounded hypotheses and unverified Eva `Invalid` alarms with concrete validation plans. |
+| `report.sarif` | SARIF v2.1.0 report containing verified records (`confirmed` as `error`, `needs_validation` as `warning`) for GitHub Code Scanning / IDE integration. |
+| `coverage-ledger.json` | Machine-readable ledger of every `function x obligation class` unit (`covered`, `blocked`, `candidate`, `deferred`, `out_of_scope`) and its open assumptions. |
+| `findings.json` / `candidates.json` | Canonical verdict records and fingerprinted tool hits (`<file>#<function>::<kind>::<hash10>`). |
+| `workspace/reports/verified_acsl.patch` | Unified diff of all pure-ACSL contracts proven during the run (applicable to the target via `workspace_overlay.py apply-in-place`). |
 
 ---
 
@@ -39,116 +137,72 @@ All verification tools execute exclusively inside a reproducible **`framac-pipel
 
 ```text
 frama-c/
-├── Dockerfile                                # Ubuntu 24.04 + Opam Frama-C + E-ACSL + Alt-Ergo/Z3/CVC5 + Clang/LibFuzzer
-├── docker-compose.yml                        # Container service definition & volume mappings
+├── Dockerfile                        # Ubuntu 24.04 + Opam Frama-C 33.0 + E-ACSL + Alt-Ergo/Z3/CVC5 + Clang/LibFuzzer
+├── docker-compose.yml                # Manual container service definition & volume mappings
 ├── wrappers/
-│   ├── framac-docker.ps1                     # Windows PowerShell wrapper for container execution
-│   └── framac-docker.sh                      # POSIX/Bash wrapper for container execution
-├── scripts/
-│   ├── checkpoint.py                         # Atomic JSON checkpointing in <run-dir>/state/
-│   ├── workspace_overlay.py                  # Manages workspace/ shadow overlay, per-agent overlays & structural merges
-│   ├── acsl_ast.py                           # C/ACSL lexical analyzer, ACSL-only verifier & function span splicer
-│   ├── promote_artifact.py                   # Safe parent-side promotion from agents/<id>/scratch/
-│   ├── build_callgraph_dag.py                # Builds Call-Graph DAG, topological waves, & risk-tier classifications
-│   ├── generate_harness.py                   # Generates exact-size dual harnesses + harness_<mod>.json sidecars
-│   ├── eacsl_toolchain.py                    # Two-stage E-ACSL build helpers, argv validation, and variadic fallbacks
-│   ├── fuzz_dictionary.py                    # Extracts string/hex/magic-number LibFuzzer dictionaries from C sources
-│   ├── run_eacsl_fuzz.py                     # E-ACSL + LibFuzzer campaigns & Dynamic Guardrail (sandboxed, fingerprinted)
-│   ├── run_eva_slice.py                      # Runs Frama-C Eva + RTE per module slice & exports SARIF
-│   ├── run_wp_function.py                    # Runs Frama-C WP + RTE per function (-wp-fct) & buckets unproven goals
-│   ├── contract_negotiator.py                # Manages cross-wave Caller-Callee contract strengthening requests
-│   ├── sandbox_exec.py                       # rlimits + env allowlist + timeout for target-controlled binaries
-│   ├── fingerprint.py                        # Stable <file>#<function>::<kind>::<hash> finding fingerprints
-│   ├── ledger.py                             # Coverage ledger seeding, phase/hypothesis/verifier ingestion
-│   ├── run_metadata.py                       # run-metadata.json (source ref, profile, toolchain, resources, run status)
-│   ├── resources.py                          # Resource probe, job sizing, host and container lease brokers
-│   ├── cache.py                              # Content-addressed per-run and shared caches (stats, gc, clear)
-│   ├── pipeline_make.py                      # Generates and runs the Makefile for deterministic per-module phases
-│   ├── wp_scheduler.py                       # Dependency-driven Phase-3 task scheduler (ready queue, merges, gates)
-│   ├── container_entry.sh                    # Container entry point: runs the command, records resource usage
-│   ├── validate_artifacts.py                 # Schema + semantic validators for all shared artifacts
-│   ├── minischema.py, framac_common.py       # Stdlib-only JSON Schema subset & shared helpers
-│   ├── generate_report.py                    # Derives REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif
-│   └── extract_references.py                 # Host-side: converts docs/references/*.pdf into greppable .md + INDEX.md
-├── schemas/                                  # findings, candidates, coverage-ledger, run-metadata, agent-result contracts
-├── tests/                                    # pytest suite (python -m pytest tests)
-├── templates/
-│   ├── pipeline.mk                           # Make rules for build, fuzz, eva, ingest, replay, wp-queue, wp-sweep, report
-│   ├── harness_dual.c.template               # Dual-use Eva + LibFuzzer C harness template
-│   ├── eacsl_runtime/fuzz_init.c             # LLVMFuzzerInitialize hook that initializes the E-ACSL runtime (linked into fuzz builds)
-│   ├── eacsl_canary/canary.c                 # E-ACSL toolchain canary for `run_eacsl_fuzz.py selftest`
-│   ├── fc_stubs/                             # Bodyless ACSL-annotated prototypes for host/library headers
-│   └── acsl/
-│       ├── external_stubs.h                  # ACSL boundary stubs for crypto, network, and OS calls
-│       ├── layer4_auth_state_machine.acsl    # Ghost state machine contracts for authentication gates
-│       ├── layer5_output_sanitization.acsl   # Output grammar predicates against CRLF/control-char injection
-│       └── layer6_zeroization_and_taint.acsl # Secret zeroization & Eva taint non-interference templates
-├── skills/
-│   ├── framac-verify/SKILL.md                # Umbrella end-to-end orchestrator (/framac-verify)
-│   ├── framac-slice/SKILL.md                 # Phase 0: Slicing, Call-Graph DAG, stubs & harnesses (/framac-slice)
-│   ├── framac-fuzz/SKILL.md                  # Phase 1: Zero-ACSL RTE + E-ACSL + LibFuzzer triage (/framac-fuzz)
-│   ├── framac-eva/SKILL.md                   # Phase 2: Module-level abstract interpretation (/framac-eva)
-│   └── framac-wp/                            # Phase 3: dependency-driven parallel WP swarm (/framac-wp)
+│   ├── framac-docker.ps1             # Windows PowerShell wrapper (host broker + container hardening)
+│   └── framac-docker.sh              # POSIX/Bash wrapper (host broker + container hardening)
+├── skills/                           # Modular Agent Skills (mirrored in .agents/skills/)
+│   ├── framac-verify/SKILL.md        # Umbrella end-to-end orchestrator (/framac-verify)
+│   ├── framac-slice/SKILL.md         # Phase 0: Slicing, Call-Graph DAG, stubs & harnesses (/framac-slice)
+│   ├── framac-fuzz/SKILL.md          # Phase 1: Zero-ACSL RTE + E-ACSL + LibFuzzer triage (/framac-fuzz)
+│   ├── framac-eva/SKILL.md           # Phase 2: Module-level abstract interpretation (/framac-eva)
+│   └── framac-wp/                    # Phase 3: Dependency-driven parallel WP swarm (/framac-wp)
 │       ├── SKILL.md
-│       ├── header_architect_brief.md
-│       ├── prover_brief.md
-│       ├── breaker_brief.md
-│       └── crash_verifier_brief.md
-└── docs/
-    ├── architecture.md                       # Macro & Micro pipeline workflows and Mermaid diagrams
-    ├── slicing-and-onboarding.md             # Strategy for slicing 90k+ LoC C codebases (SNMPv3, Syslog, XML)
-    ├── security-properties.md                # Proving Security Layers 1-6 in ACSL
-    ├── agentic-swarm.md                      # Levels of parallelism, Dual Oracle, & Contract Negotiation
-    ├── resources-and-caching.md              # Resource measurement, broker, job sizing, caches, Make phases, scheduler
-    ├── v2-design.md                          # Evidence discipline: verdicts, ledger, isolation, milestones
-    ├── troubleshooting.md                    # Common Frama-C, E-ACSL, Eva, and WP troubleshooting guide
-    ├── upstream/frama-c-e-acsl-issues.md     # Upstream Frama-C 33.0 E-ACSL & Variadic issues and pipeline mitigations
-    └── references/                           # Upstream manuals (acsl/ language specs, one folder per plug-in): PDFs, greppable .md twins, INDEX.md, e-acsl-quickref.md
+│       └── *_brief.md                # Subagent briefs (header_architect, prover, breaker, crash_verifier)
+├── scripts/                          # Stdlib-only Python 3.10+ pipeline scripts
+│   ├── build_callgraph_dag.py        # Phase 0: Call-Graph DAG, Risk Tiers, & Layer 2-6 property inference
+│   ├── generate_harness.py           # Phase 0: Dual-use Eva + LibFuzzer harness & sidecar generator
+│   ├── pipeline_make.py              # Phases 1-4: Generates & runs Makefile for deterministic module work
+│   ├── run_eacsl_fuzz.py             # Phase 1 & 3: E-ACSL + LibFuzzer campaigns, replays, selftest & guardrail
+│   ├── run_eva_slice.py              # Phase 2: Frama-C Eva + RTE runner & SARIF exporter
+│   ├── wp_scheduler.py               # Phase 3: Dependency-driven WP task scheduler, micro-batch merges & gates
+│   ├── run_wp_function.py            # Phase 3: Per-function Frama-C WP + RTE runner & goal bucketer
+│   ├── contract_negotiator.py        # Phase 3: Cross-function Caller-Callee contract strengthening ledger
+│   ├── workspace_overlay.py          # Shadow overlay, per-agent scratch trees, & pure-ACSL structural splicing
+│   ├── acsl_ast.py                   # C/ACSL lexical analyzer & token-stream verifier
+│   ├── ledger.py                     # Coverage ledger seeding, phase ingestion, & hypothesis auditing
+│   ├── generate_report.py            # Phase 4: Derives REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif
+│   ├── resources.py, cache.py        # Host/container resource broker & content-addressed build/proof caches
+│   ├── sandbox_exec.py               # Inner rlimits, environment allowlist, & process-group timeout runner
+│   └── validate_artifacts.py, ...    # Schema & semantic validators, checkpointing, fingerprinting, & shared helpers
+├── schemas/                          # JSON Schemas (findings, candidates, coverage-ledger, run-metadata, agent-result)
+├── templates/
+│   ├── pipeline.mk                   # Make rules for build, selftest, fuzz, eva, ingest, replay, wp-sweep, report
+│   ├── harness_dual.c.template       # Dual-use Eva + LibFuzzer C harness template
+│   ├── eacsl_runtime/fuzz_init.c     # LLVMFuzzerInitialize hook initializing E-ACSL shadow memory
+│   ├── eacsl_canary/canary.c         # Self-test canary for `run_eacsl_fuzz.py selftest`
+│   ├── fc_stubs/                     # Bodyless ACSL-annotated prototypes for third-party/host headers
+│   └── acsl/                         # Reusable ACSL templates for external stubs and Security Layers 4-6
+├── tests/                            # Pytest unit and integration test suite
+└── docs/                             # Architecture, onboarding, security layers, caching, & reference manuals
 ```
 
 ---
 
-## Quickstart
+## Testing & Development
 
-### 1. Build the Docker Image
-
-From PowerShell on Windows:
+All helper scripts in `scripts/` use the Python 3.10+ standard library only and run on both Windows and POSIX hosts. To run the test suite and static checks locally:
 
 ```powershell
+# Windows (PowerShell)
 $env:PYTHONIOENCODING="utf-8"
-docker build "-t" "framac-pipeline:latest" "C:\Users\Florian\OneDrive\Documents\Dev\frama-c"
+python -m pytest tests
+python -m ruff check scripts tests
+python -m ruff format --check scripts tests
+python -m mypy scripts tests
 ```
 
-### 2. Run a Command Inside the Hardened Container
-
-Use [`wrappers/framac-docker.ps1`](wrappers/framac-docker.ps1). The target is mounted read-only at `/target`; the run directory (default `~/framac-pipeline/<repo>/run-<N>/`, created by `-NewRun`) is the read-write working directory `/framac-run`. The container has no network, drops all capabilities, keeps Docker's default seccomp and AppArmor profiles, and runs with CPU/memory/PID limits. `sandbox_exec.py probe` prints `{"sandbox": "rlimits"}` inside the container. The legacy `-NoInnerSandbox` / `-AllowDegradedSandbox` switches (`--no-inner-sandbox` / `--allow-degraded-sandbox` in the POSIX wrapper) were removed together with bubblewrap and now fail with exit code 2.
-
-```powershell
-& "C:\Users\Florian\OneDrive\Documents\Dev\frama-c\wrappers\framac-docker.ps1" `
-  -TargetDir "C:\path\to\c-project" `
-  -NewRun `
-  -BuildIfMissing `
-  "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe"
+```bash
+# Linux / macOS (POSIX)
+python3 -m pytest tests
+python3 -m ruff check scripts tests
+python3 -m ruff format --check scripts tests
+python3 -m mypy scripts tests
 ```
 
-Pass the printed run directory as `-RunDir` for every later command of the same run.
-
-The wrapper sizes every container itself; there are no CPU or memory flags to tune:
-- With a host Python 3.10+, it leases CPUs and memory from the measured pool and starts the container (Docker or Podman, `FRAMAC_CONTAINER_ENGINE`) with matching limits.
-- **Minimum memory floor:** Give the container engine VM at least **4 GiB of RAM** (8 GiB+ recommended for parallel runs). Tools refuse to run below their single-worker minimum (`run_wp_function.py`: **1768 MiB** = 768 MiB Frama-C kernel + 1000 MiB `-wp-memlimit`, reporting `status: "analysis_error"`, `reason: "insufficient_memory"`; `run_eacsl_fuzz.py campaign`: **3072 MiB** = 512 MiB overhead + 2560 MiB (1.25x of 2048 MiB `-rss_limit_mb`), reporting `status: "insufficient_memory"`), so a 2 GiB Docker Desktop VM cannot run WP or fuzzing once the host reserve is subtracted.
-- Caps and knobs are environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_PIN`, `FRAMAC_CACHE`, …).
-- `-NoBroker` (`--no-broker`) restores the previous static sizing.
-- See [`docs/resources-and-caching.md`](docs/resources-and-caching.md).
-
-### 3. Run the Agent Skills
-
-| Skill | Stage | Purpose |
-| :--- | :---: | :--- |
-| [`/framac-verify`](skills/framac-verify/SKILL.md) | **All (0–4)** | End-to-end pipeline: slices the codebase, fuzzes with E-ACSL, prunes with Eva, proves with parallel WP subagents, records everything in a validated coverage ledger, and emits `REPORT.md`, `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, and `report.sarif`. |
-| [`/framac-slice`](skills/framac-slice/SKILL.md) | **Phase 0** | Creates the `workspace/` shadow overlay, builds Call-Graph DAG & topological waves, classifies modules by Risk Tier, generates dual harnesses, and seeds the coverage ledger. |
-| [`/framac-fuzz`](skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice. |
-| [`/framac-eva`](skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -eva -then -rte` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
-| [`/framac-wp`](skills/framac-wp/SKILL.md) | **Phase 3** | Runs the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) from `wp_scheduler.py`, with the E-ACSL Dynamic Guardrail and Adversarial Breaker subagents. |
+> [!NOTE]
+> If you edit any skill or brief under `skills/framac-*` and have a local `.agents/skills/framac-*` directory, keep both copies synchronized (`tests/test_extract_references.py` verifies that they match byte-for-byte).
 
 ---
 
@@ -160,6 +214,8 @@ The wrapper sizes every container itself; there are no CPU or memory flags to tu
 - [Multi-Agent Swarm & Dual-Oracle Guardrail (`docs/agentic-swarm.md`)](docs/agentic-swarm.md)
 - [Resources, Scheduling & Caching (`docs/resources-and-caching.md`)](docs/resources-and-caching.md)
 - [Pipeline v2 Design & Evidence Discipline (`docs/v2-design.md`)](docs/v2-design.md)
+- [Implementation Backlog & Verification Checklist (`docs/backlog.md`)](docs/backlog.md)
 - [Troubleshooting Guide (`docs/troubleshooting.md`)](docs/troubleshooting.md)
 - [Upstream Frama-C 33.0 E-ACSL & Variadic Issues (`docs/upstream/frama-c-e-acsl-issues.md`)](docs/upstream/frama-c-e-acsl-issues.md)
-- [Frama-C Reference Manuals (`docs/references/README.md`)](docs/references/README.md): how to grep the upstream manuals instead of reading them whole
+- [Frama-C Reference Manuals (`docs/references/README.md`)](docs/references/README.md) & [E-ACSL Quick Reference (`docs/references/e-acsl-quickref.md`)](docs/references/e-acsl-quickref.md)
+- [Third-Party Header Stubs Guide (`templates/fc_stubs/README.md`)](templates/fc_stubs/README.md)

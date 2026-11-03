@@ -29,3 +29,5 @@ services:
       - ./scripts:/opt/framac-pipeline/scripts:ro
       - ./templates:/opt/framac-pipeline/templates:ro
       - ./schemas:/opt/framac-pipeline/schemas:ro
+      - ./skills:/opt/framac-pipeline/skills:ro
+      - ./docs/references:/opt/framac-pipeline/docs/references:ro
