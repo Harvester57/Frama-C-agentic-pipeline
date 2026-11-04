@@ -16,6 +16,8 @@ build/
 to_analyze/
 .framac-*/
 workspace/
+state/
+docs/papers/
 opencode.json
 .opencode/
 

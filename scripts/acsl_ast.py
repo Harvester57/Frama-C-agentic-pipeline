@@ -427,18 +427,36 @@ def locate_function_span(
     return None
 
 
+def _is_top_level_acsl_token(tok: Token) -> bool:
+    """Return True if an ACSL block or line token contains a top-level logic declaration keyword."""
+    if tok.kind not in ("acsl_block", "acsl_line"):
+        return False
+    inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
+    for seg in _parse_acsl_inner_segments(inner, tok.line):
+        if seg.kind in _TOP_DECL_KWS:
+            return True
+    return False
+
+
 def _compute_span_start(tokens: list[Token], last_top_boundary_idx: int, fn_name_idx: int) -> int:
     """
     Walk backward from fn_name_idx (stopping after last_top_boundary_idx) to include
     the return type/declarator tokens and any immediately preceding ACSL contract comments,
-    while leaving normal C comments above the contract outside the span.
+    while leaving normal C comments and top-level ACSL declarations outside the span.
     """
     # Step 1: walk back across the return type / storage class / pointer tokens of this declaration
     start_idx = fn_name_idx
     cursor = fn_name_idx - 1
     while cursor > last_top_boundary_idx:
         t = tokens[cursor]
-        if t.kind in ("c_token", "acsl_block", "acsl_line"):
+        if t.kind in ("acsl_block", "acsl_line"):
+            if _is_top_level_acsl_token(t):
+                # Stop: this is a top-level logic declaration (predicate, logic, etc.), not a function contract
+                break
+            start_idx = cursor
+            cursor -= 1
+            continue
+        if t.kind == "c_token":
             start_idx = cursor
             cursor -= 1
             continue
@@ -448,6 +466,98 @@ def _compute_span_start(tokens: list[Token], last_top_boundary_idx: int, fn_name
         # Stop at a normal C comment (e.g., /* Parse header magic */) before the contract/declarator
         break
     return start_idx
+
+
+def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]:
+    """Locate all function prototype spans in a header source file in source order."""
+    tokens = tokenize_c_acsl(source, path=path)
+    brace_depth = 0
+    paren_depth = 0
+    last_top_boundary_idx = -1
+    spans: list[Span] = []
+
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
+            last_top_boundary_idx = idx
+            idx += 1
+            continue
+
+        if tok.kind == "c_token":
+            if tok.text == "{":
+                brace_depth += 1
+                idx += 1
+                continue
+            if tok.text == "}":
+                brace_depth = max(0, brace_depth - 1)
+                if brace_depth == 0 and paren_depth == 0:
+                    last_top_boundary_idx = idx
+                idx += 1
+                continue
+            if tok.text == "(":
+                paren_depth += 1
+                idx += 1
+                continue
+            if tok.text == ")":
+                paren_depth = max(0, paren_depth - 1)
+                idx += 1
+                continue
+            if tok.text == ";" and brace_depth == 0 and paren_depth == 0:
+                last_top_boundary_idx = idx
+                idx += 1
+                continue
+
+            # Candidate function name at top level
+            if brace_depth == 0 and paren_depth == 0 and _IDENT_RE.match(tok.text):
+                if tok.text not in (
+                    "typedef",
+                    "extern",
+                    "static",
+                    "inline",
+                    "struct",
+                    "enum",
+                    "union",
+                    "__attribute__",
+                ):
+                    open_paren_idx = _next_meaningful(tokens, idx + 1)
+                    if (
+                        open_paren_idx < n
+                        and tokens[open_paren_idx].kind == "c_token"
+                        and tokens[open_paren_idx].text == "("
+                    ):
+                        close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
+                        if close_paren_idx != -1:
+                            after_paren_idx = _next_meaningful(tokens, close_paren_idx + 1)
+                            if (
+                                after_paren_idx < n
+                                and tokens[after_paren_idx].kind == "c_token"
+                                and tokens[after_paren_idx].text == ";"
+                            ):
+                                has_typedef = any(
+                                    tokens[k].kind == "c_token" and tokens[k].text == "typedef"
+                                    for k in range(max(0, last_top_boundary_idx + 1), idx)
+                                )
+                                if not has_typedef:
+                                    start_idx = _compute_span_start(tokens, last_top_boundary_idx, idx)
+                                    start_tok = tokens[start_idx]
+                                    end_tok = tokens[after_paren_idx]
+                                    spans.append(
+                                        Span(
+                                            function=tok.text,
+                                            start_byte=start_tok.start,
+                                            end_byte=end_tok.end,
+                                            start_line=start_tok.line,
+                                            end_line=end_tok.line,
+                                            text=source[start_tok.start : end_tok.end],
+                                        )
+                                    )
+                                    last_top_boundary_idx = after_paren_idx
+                                    idx = after_paren_idx + 1
+                                    continue
+        idx += 1
+    return spans
 
 
 def _find_body_brace_offset(span_text: str, path: str = "<input>") -> int | None:
@@ -1037,3 +1147,120 @@ def dedup_acsl_declarations(
         idx += 1
 
     return "".join(out_parts), removed
+
+
+def _normalize_text_whitespace(text: str) -> str:
+    """Normalize whitespace within code or contract snippets for equality checking."""
+    return " ".join(text.split())
+
+
+def splice_architect_header(
+    base_text: str,
+    agent_text: str,
+    current_text: str,
+    path: str = "<input>",
+) -> str:
+    """
+    Tolerantly merge an Interface Architect's header modifications into current_text
+    when current_text was concurrently updated by a leaf/static prover or peer architect.
+    """
+    acsl_errors = verify_acsl_only(base_text, agent_text, path=path)
+    if acsl_errors:
+        raise AcslError(f"ACSL-only check failed on {path}:\n  " + "\n  ".join(acsl_errors))
+
+    curr_errors = verify_acsl_only(base_text, current_text, path=path)
+    if curr_errors:
+        raise AcslError(f"Current workspace has ACSL-only check errors on {path}:\n  " + "\n  ".join(curr_errors))
+
+    if current_text == base_text:
+        return agent_text
+    if agent_text == base_text or agent_text == current_text:
+        return current_text
+
+    base_proto_spans = locate_all_prototype_spans(base_text, path=path)
+    agent_proto_spans = locate_all_prototype_spans(agent_text, path=path)
+    curr_proto_spans = locate_all_prototype_spans(current_text, path=path)
+
+    base_spans = {s.function: s for s in base_proto_spans}
+    agent_spans = {s.function: s for s in agent_proto_spans}
+    curr_spans = {s.function: s for s in curr_proto_spans}
+
+    if set(base_spans.keys()) != set(agent_spans.keys()) or set(base_spans.keys()) != set(curr_spans.keys()):
+        raise ScopeViolationError(f"{path}: function prototype mismatch between base, agent, and current")
+
+    # Step 1: Detect prototype contract conflicts and record replacements
+    replacements: list[tuple[int, int, str]] = []  # (start_byte, end_byte, replacement_text)
+    for fn, b_s in base_spans.items():
+        a_s = agent_spans[fn]
+        c_s = curr_spans[fn]
+        a_mod = _normalize_text_whitespace(a_s.text) != _normalize_text_whitespace(b_s.text)
+        c_mod = _normalize_text_whitespace(c_s.text) != _normalize_text_whitespace(b_s.text)
+
+        if a_mod and c_mod:
+            if _normalize_text_whitespace(a_s.text) != _normalize_text_whitespace(c_s.text):
+                raise ScopeViolationError(
+                    f"{path}: conflicting concurrent modification to prototype contract of '{fn}'"
+                )
+        elif a_mod and not c_mod:
+            replacements.append((c_s.start_byte, c_s.end_byte, a_s.text))
+
+    # Step 2: Extract and reconcile top-level ACSL declarations
+    b_decls = {d["profile_key"]: d for d in extract_top_level_acsl_declarations(base_text, path=path)}
+    a_decls = {d["profile_key"]: d for d in extract_top_level_acsl_declarations(agent_text, path=path)}
+    c_decls = {d["profile_key"]: d for d in extract_top_level_acsl_declarations(current_text, path=path)}
+
+    for k, a_d in a_decls.items():
+        if k in c_decls:
+            if _normalize_text_whitespace(a_d["text"]) != _normalize_text_whitespace(c_decls[k]["text"]):
+                raise ScopeViolationError(f"{path}: conflicting concurrent declaration of '{a_d['name']}'")
+
+    for k, b_d in b_decls.items():
+        if k not in a_decls and k in c_decls:
+            if _normalize_text_whitespace(c_decls[k]["text"]) != _normalize_text_whitespace(b_d["text"]):
+                raise ScopeViolationError(
+                    f"{path}: conflicting concurrent modification/deletion of declaration '{b_d['name']}'"
+                )
+
+    # Step 3: Apply prototype replacements in current_text in reverse order
+    spliced = current_text
+    for start, end, rep in sorted(replacements, key=lambda x: x[0], reverse=True):
+        spliced = spliced[:start] + rep + spliced[end:]
+
+    # Step 4: Splice new top-level ACSL declarations introduced by the architect
+    new_decls = [d for k, d in a_decls.items() if k not in b_decls and k not in c_decls]
+    if new_decls:
+        agent_tokens = tokenize_c_acsl(agent_text, path=path)
+        blocks_to_insert: list[tuple[str | None, str]] = []  # (anchor_fn, block_text)
+        for t in agent_tokens:
+            if t.kind in ("acsl_block", "acsl_line"):
+                inner = t.text[3:-2] if t.kind == "acsl_block" else t.text[3:]
+                segs = _parse_acsl_inner_segments(inner, t.line)
+                if any(s.name and any(d["name"] == s.name for d in new_decls) for s in segs):
+                    # Identify anchor: find next function prototype in agent_proto_spans
+                    anchor_fn = None
+                    for span in agent_proto_spans:
+                        if span.start_byte >= t.end:
+                            anchor_fn = span.function
+                            break
+                    blocks_to_insert.append((anchor_fn, t.text))
+
+        for anchor_fn, blk_text in blocks_to_insert:
+            fresh_spans = {s.function: s for s in locate_all_prototype_spans(spliced, path=path)}
+            if anchor_fn and anchor_fn in fresh_spans:
+                pos = fresh_spans[anchor_fn].start_byte
+                spliced = spliced[:pos] + blk_text + "\n\n" + spliced[pos:]
+            else:
+                pos = spliced.rfind("#endif")
+                if pos == -1:
+                    pos = len(spliced)
+                spliced = spliced[:pos] + blk_text + "\n\n" + spliced[pos:]
+
+    # Deduplicate intra-file declarations
+    spliced, _ = dedup_acsl_declarations(spliced, set(), baseline_text=base_text, path=path)
+
+    # Step 5: Post-splice verification
+    post_errors = verify_acsl_only(base_text, spliced, path=path)
+    if post_errors:
+        raise AcslError(f"Post-splice ACSL-only check failed on {path}:\n  " + "\n  ".join(post_errors))
+
+    return spliced

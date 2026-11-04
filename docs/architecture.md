@@ -48,9 +48,9 @@ flowchart TD
         K -- "Orange (Unknown: ~15%)" --> M["Queue Surviving Unknown Functions<br/>(wp_scheduler.py init)"]
     end
 
-    subgraph P3["Phase 3: Dependency-Driven Subagent WP Loop (/framac-wp)"]
-        M --> N["Stage 3A: Speculative Header Architect Swarm<br/>Drafts .h Contracts Validated via E-ACSL Guardrail"]
-        N --> O["Stage 3B: Ready-Queue Function Provers<br/>(dispatched once callees are merged; -wp-fct fn)"]
+    subgraph P3["Phase 3: Continuous Reactive Subagent WP Loop (/framac-wp)"]
+        M --> N["Stage 3A: Speculative Header Architect Swarm<br/>Drafts .h Contracts Spliced via 3-Way AST Merge"]
+        N --> O["Stage 3B: Reactive Sliding-Window Function Provers<br/>(speculative contract-first dispatch; atomic step)"]
         O --> P{"All Goals Proven<br/>within K Retries?"}
         P -- "Yes" --> Q["Lock Verified Contract in .h<br/>& Process Strengthening Requests"]
         P -- "Stalled after K Retries" --> R["Stage 3C: Spawn Adversarial Breaker Subagent<br/>(Targeted E-ACSL Seed Synthesis)"]
