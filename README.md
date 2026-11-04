@@ -176,7 +176,24 @@ frama-c/
 │   └── acsl/                         # Reusable ACSL templates for external stubs and Security Layers 4-6
 ├── tests/                            # Pytest unit and integration test suite
 └── docs/                             # Architecture, onboarding, security layers, caching, & reference manuals
+    ├── bugs-found/                   # Public vulnerability advisories & verification reports per target
+    ├── upstream/                     # Upstream Frama-C 33.0 / e-acsl-gcc bug reports & workarounds
+    └── references/                   # Frama-C 33.0 RTE, Eva, WP, ACSL, and E-ACSL reference manuals
 ```
+
+---
+
+## Bugs Found
+
+See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master vulnerability index, disclosure statuses, upstream GitHub ticket links, standalone reproducers, and candidate fix diffs across evaluated open-source C targets:
+
+| Target | Upstream Repository | Confirmed Bugs | Details |
+| :--- | :--- | :---: | :--- |
+| **minmea** | [`kosma/minmea`](https://github.com/kosma/minmea) | **3** (2 Medium, 1 Low) | [`./docs/bugs-found/minmea/README.md`](./docs/bugs-found/minmea/README.md) |
+| **QCBOR** | [`laurencelundblade/QCBOR`](https://github.com/laurencelundblade/QCBOR) | **3** (1 Medium, 2 Low) | [`./docs/bugs-found/qcbor/README.md`](./docs/bugs-found/qcbor/README.md) |
+| **CryptoLib** | [`nasa/CryptoLib`](https://github.com/nasa/CryptoLib) | **1** (1 Medium; +1 C11 hygiene note) | [`./docs/bugs-found/cryptolib/README.md`](./docs/bugs-found/cryptolib/README.md) |
+| **picohttpparser** | [`h2o/picohttpparser`](https://github.com/h2o/picohttpparser) | **0** (11 units proven) | [`./docs/bugs-found/picohttpparser/README.md`](./docs/bugs-found/picohttpparser/README.md) |
+| **Frama-C 33.0 (`e-acsl-gcc`)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **8** (4 Bugs, 4 Limitations/UX) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
 
 ---
 
@@ -208,6 +225,7 @@ python3 -m mypy scripts tests
 
 ## Documentation Index
 
+- [Bugs Found & Target Verification Reports (`./docs/bugs-found/README.md`)](./docs/bugs-found/README.md)
 - [Architecture & Dataflow (`./docs/architecture.md`)](./docs/architecture.md)
 - [Slicing & Onboarding 90k+ LoC Codebases (`./docs/slicing-and-onboarding.md`)](./docs/slicing-and-onboarding.md)
 - [Proving Security Properties Beyond Memory Safety (`./docs/security-properties.md`)](./docs/security-properties.md)
