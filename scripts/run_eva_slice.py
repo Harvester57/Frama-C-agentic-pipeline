@@ -9,7 +9,12 @@ A failed Frama-C run is reported as status "analysis_error", never as zero alarm
 Inside a run directory, a report with status "ok" is cached (scripts/cache.py, namespace `eva`)
 under the toolchain, the Eva command line, the output directory and the content of every source
 and header it includes; an identical later run restores the report, alarms.csv, red_alarms.csv,
-eva.log and slice.sarif instead of re-running Eva (the .sav is not cached).
+eva.log, slice.sarif and flows.log instead of re-running Eva (the .sav is not cached).
+
+After a successful run, read and write sets are taken from the saved session in a separate
+Frama-C process (`-load framac.sav -deps -inout -input -out-external -cg`), so they can neither
+change Eva's status nor its timing. The report carries them as `flows`, by kernel function name:
+hints about this harness, used for the provers' briefs (function_facts.py), never a verdict.
 """
 
 from __future__ import annotations
@@ -66,7 +71,200 @@ _CACHED_OUTPUTS = {
     "red_alarms.csv": None,
     "eva.log": "log_file",
     "slice.sarif": "sarif_file",
+    "flows.log": None,
+    "flows.cg.dot": None,
 }
+# The flows step reads a saved session. It decides nothing but hints, so a slow machine loses
+# those hints at worst (`flows.status`), and the limit is well above what it takes on real modules.
+FLOWS_TIMEOUT_S = 600
+_FROM_SECTION_RE = re.compile(
+    r"^\[from\] ====== DEPENDENCIES COMPUTED ======$(.*?)^\[from\] ====== END OF DEPENDENCIES ======$",
+    re.MULTILINE | re.DOTALL,
+)
+_FROM_FUNCTION_RE = re.compile(r"^\[from\] Function (\S+?):\s*$")
+_FROM_ENTRY_RE = re.compile(r"^(.+?) FROM (.*)$")
+_INOUT_HEADER_RE = re.compile(r"^\[inout\] (Out \(external\)|Inputs|InOut \(internal\)) for function (\S+?):\s*$")
+_INOUT_SUBSECTIONS = {
+    "Operational inputs:": "operational_inputs",
+    "Operational inputs on termination:": "operational_inputs_on_termination",
+    "Sure outputs:": "sure_outputs",
+}
+_INOUT_FIELDS = {"Out (external)": "out_external", "Inputs": "inputs"}
+_DOT_NODE_RE = re.compile(r'"(?P<id>[^"]+)"\s*\[[^\]]*?label="(?P<label>[^"]+)"', re.DOTALL)
+_DOT_EDGE_RE = re.compile(r'"(?P<src>[^"]+)"\s*->\s*"(?P<dst>[^"]+)"')
+
+
+def split_locations(text: str) -> list[str]:
+    """Split Frama-C's `a; b{.x; .y}; c[0..3]` at top-level semicolons, dropping `\\nothing`."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote = False
+    prev = ""
+    for ch in text:
+        if ch == '"' and prev != "\\":
+            quote = not quote
+        elif not quote and ch == "{":
+            depth += 1
+        elif not quote and ch == "}":
+            depth = max(0, depth - 1)
+        if ch == ";" and depth == 0 and not quote:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        prev = ch
+    parts.append("".join(current))
+    cleaned = (" ".join(part.split()) for part in parts)
+    return [part for part in cleaned if part and part != "\\nothing"]
+
+
+def parse_deps_log(log_text: str) -> dict[str, dict]:
+    """
+    `-deps` output by function: `writes` ({loc, from, and_self}), `result_from`, and whether the
+    function has no effects. A continuation line's indent gives how much of the previous
+    location it shares (`r.len` then `   .buf[0..4]` is `r.buf[0..4]`).
+    """
+    out: dict[str, dict] = {}
+    section = _FROM_SECTION_RE.search(log_text or "")
+    if not section:
+        return out
+    current: dict | None = None
+    entry: dict | None = None
+    previous_loc = ""
+    pending_loc: str | None = None
+    pending_from: list[str] = []
+
+    def _close_entry() -> None:
+        nonlocal entry, pending_from
+        if entry is None:
+            pending_from = []
+            return
+        text = " ".join(pending_from)
+        entry["and_self"] = "(and SELF)" in text
+        entry["from"] = split_locations(text.replace("(and SELF)", ""))
+        if current is not None:
+            if entry["loc"] == "\\result":
+                current["result_from"] = entry["from"]
+            else:
+                current["writes"].append(entry)
+        entry, pending_from = None, []
+
+    for line in section.group(1).splitlines():
+        m_fn = _FROM_FUNCTION_RE.match(line)
+        if m_fn:
+            _close_entry()
+            current = {"writes": [], "result_from": None, "no_effects": False, "non_terminating": False}
+            out[m_fn.group(1)] = current
+            previous_loc = ""
+            continue
+        if current is None or not line.strip():
+            continue
+        stripped = line.strip()
+        if "NO EFFECTS" in stripped:
+            _close_entry()
+            current["no_effects"] = True
+            current["non_terminating"] = "NON TERMINATING" in stripped
+            continue
+        # A list wraps after a semicolon; any other line without FROM is a location of its own,
+        # whose FROM comes on the next line.
+        if entry is not None and pending_from and pending_from[-1].rstrip().endswith(";"):
+            pending_from.append(stripped)
+            continue
+        if stripped.startswith("FROM ") and pending_loc is not None:
+            entry, pending_loc = {"loc": pending_loc}, None
+            pending_from = [stripped[len("FROM ") :]]
+            continue
+        _close_entry()
+        indent = len(line) - len(line.lstrip())
+        m_entry = _FROM_ENTRY_RE.match(stripped)
+        loc = m_entry.group(1) if m_entry else stripped
+        if loc.startswith((".", "[")) and previous_loc:
+            loc = previous_loc[: max(0, indent - 2)] + loc
+        previous_loc = loc
+        if m_entry:
+            entry = {"loc": loc}
+            pending_from = [m_entry.group(2)]
+        else:
+            pending_loc = loc
+    _close_entry()
+    return out
+
+
+def parse_inout_log(log_text: str) -> dict[str, dict]:
+    """`-inout -input -out-external` output by function, each section a list of locations."""
+    out: dict[str, dict] = {}
+    field: str | None = None
+    function: str | None = None
+    buffers: dict[tuple[str, str], list[str]] = {}
+    for line in (log_text or "").splitlines():
+        m_head = _INOUT_HEADER_RE.match(line)
+        if m_head:
+            function = m_head.group(2)
+            field = _INOUT_FIELDS.get(m_head.group(1))
+            continue
+        if line.startswith("["):
+            function, field = None, None
+            continue
+        if function is None:
+            continue
+        stripped = line.strip()
+        if stripped in _INOUT_SUBSECTIONS:
+            field = _INOUT_SUBSECTIONS[stripped]
+        elif stripped and field:
+            buffers.setdefault((function, field), []).append(stripped)
+    for (fn, name), lines in buffers.items():
+        out.setdefault(fn, {})[name] = split_locations(" ".join(lines))
+    return out
+
+
+def parse_callgraph_dot(dot_text: str) -> dict[str, list[str]]:
+    """Caller -> callees from the Callgraph plug-in's dot file, by function name."""
+    labels = {m.group("id"): m.group("label") for m in _DOT_NODE_RE.finditer(dot_text or "")}
+    edges: dict[str, set[str]] = defaultdict(set)
+    for m in _DOT_EDGE_RE.finditer(dot_text or ""):
+        src, dst = labels.get(m.group("src")), labels.get(m.group("dst"))
+        if src and dst:
+            edges[src].add(dst)
+    return {caller: sorted(callees) for caller, callees in sorted(edges.items())}
+
+
+def collect_flows(sav_path: Path, out_dir: Path, timeout: int = FLOWS_TIMEOUT_S) -> dict:
+    """Read and write sets, and Eva-resolved call targets, from a saved Eva session (see module docstring)."""
+    log_path = out_dir / "flows.log"
+    dot_path = out_dir / "flows.cg.dot"
+    cmd = [
+        "frama-c",
+        "-no-unicode",
+        "-load",
+        str(sav_path),
+        "-deps",
+        "-inout",
+        "-input",
+        "-out-external",
+        "-cg",
+        str(dot_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "reason": f"exceeded {timeout} s", "by_function": {}, "call_edges": {}}
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return {"status": "failed", "reason": str(exc), "by_function": {}, "call_edges": {}}
+    log_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    log_path.write_text(log_text, encoding="utf-8")
+    deps = parse_deps_log(log_text)
+    inout = parse_inout_log(log_text)
+    if proc.returncode != 0 and not deps:
+        return {
+            "status": "failed",
+            "reason": f"frama-c exited with {proc.returncode}",
+            "by_function": {},
+            "call_edges": {},
+        }
+    by_function = {name: {**deps.get(name, {}), **inout.get(name, {})} for name in sorted(set(deps) | set(inout))}
+    dot_text = dot_path.read_text(encoding="utf-8", errors="replace") if dot_path.is_file() else ""
+    return {"status": "ok", "reason": None, "by_function": by_function, "call_edges": parse_callgraph_dot(dot_text)}
 
 
 def eva_domains(extra_domains: list[str] | str | None = None) -> str:
@@ -108,7 +306,7 @@ def run_eva_on_slice(
     sav_path = out_dir / "framac.sav"
     sarif_path = out_dir / "slice.sarif"
     # A report left over from an earlier run must never be read as this run's result.
-    for stale in (csv_path, red_csv, sav_path, sarif_path):
+    for stale in (csv_path, red_csv, sav_path, sarif_path, out_dir / "flows.log", out_dir / "flows.cg.dot"):
         if stale.exists():
             stale.unlink()
 
@@ -275,8 +473,10 @@ def _execute_eva(
     combined_log = stdout + "\n" + stderr
     log_path.write_text(combined_log, encoding="utf-8")
 
+    flows: dict = {"status": "not_run", "reason": "no saved session", "by_function": {}, "call_edges": {}}
     # Generate SARIF from saved state if sav_path was produced
     if sav_path.exists() and not timed_out:
+        flows = collect_flows(sav_path, out_dir)
         sarif_cmd = [
             "frama-c",
             "-load",
@@ -379,6 +579,7 @@ def _execute_eva(
         "dead_alarms": alarms_by_status["Dead"],
         "assumed_properties": alarms_by_status["Assumed"],
         "reduced_checks": reduced_checks,
+        "flows": flows,
         "sarif_file": str(sarif_path) if sarif_path.exists() else None,
         "csv_file": str(csv_path) if csv_path.exists() else None,
         "sav_file": str(sav_path) if sav_path.exists() else None,

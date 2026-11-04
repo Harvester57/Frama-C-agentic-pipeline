@@ -69,6 +69,8 @@ After both `fuzz` and `eva` have finished:
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest replay wp-queue
 ```
 
+`wp-queue` first runs `facts`: per-function facts for the prover briefs, from the kernel AST and the read and write sets in each Eva report (`workspace/reports/facts/<mod>.json`, cached by content). They are hints, and a failure only means briefs without them. Write `python3 /opt/framac-pipeline/scripts/pipeline_make.py run facts` as its own step after `eva` when you want them to fill the shared cross-run cache.
+
 **`ingest`:**
 - Ingests new fuzz reports, then new Eva reports. Expected modules without a report are recorded, never skipped.
 - Then validates the run directory. Results:

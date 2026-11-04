@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import prover_candidates  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_DEAD,
     STATUS_INVALID,
@@ -1591,6 +1592,9 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             parser.error(f"--wp-par must be 'auto' or a positive integer (got {args.wp_par!r})")
 
+    # --prop and --dump-goal are partial runs: they say nothing about the candidate as a whole.
+    whole_run = not (args.prop or args.dump_goal)
+    digest_before = prover_candidates.digest_before_run(args.out_json) if whole_run else None
     res = run_wp_on_function(
         c_file=args.file,
         fn_name=args.function,
@@ -1633,6 +1637,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if res.get("diagnostic_hints"):
         summary["diagnostic_hints"] = res["diagnostic_hints"]
+    if whole_run and not res.get("budget_exhausted"):
+        prover_candidates.add_candidate_block(summary, args.out_json, "wp", res, digest_before)
     print(json.dumps(summary, indent=2))
     return 0
 

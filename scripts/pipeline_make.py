@@ -4,8 +4,8 @@ Make-driven deterministic phases: writes the run's Makefile, runs its targets, a
 the recipes that need Python (stdlib only).
 
 Per-module work that needs no judgment runs from workspace/build/Makefile instead of LLM
-subagents: builds, the E-ACSL selftest, fuzz campaigns, Eva runs, report ingestion, candidate
-replays, the WP queue, the end-of-run WP sweep and the reports. Make runs inside the container
+subagents: builds, the E-ACSL selftest, fuzz campaigns, Eva runs, the provers' function facts,
+report ingestion, candidate replays, the WP queue, the end-of-run WP sweep and the reports. Make runs inside the container
 from the run directory (/framac-run), the working directory every script assumes.
 
 Subcommands (run from the run directory):
@@ -73,6 +73,7 @@ DAG_JSON = "workspace/reports/callgraph_dag.json"
 HARNESS_DIR = "workspace/harnesses"
 WORK_DIR = "workspace/work"
 REPORT_DIRS = {"fuzz": "workspace/reports/fuzz", "eva": "workspace/reports/eva"}
+FACTS_DIR = "workspace/reports/facts"
 SELFTEST_JSON = "workspace/reports/eacsl_selftest.json"
 INGESTED_JSON = "state/ingested.json"
 LEDGER_JSON = "coverage-ledger.json"
@@ -794,13 +795,14 @@ STAGE_OF_TARGET = {
     "selftest": 2,
     "fuzz": 2,
     "eva": 2,
+    "facts": 3,
     "ingest": 3,
     "replay": 3,
     "wp-queue": 3,
     "wp-sweep": 4,
     "report": 5,
 }
-MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "eva-", "module-")
+MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "eva-", "module-", "facts-")
 _TARGET_OUTPUTS = {
     "slice-init": DAG_JSON,
     "seed": LEDGER_JSON,
@@ -821,6 +823,8 @@ MakeRunner = Callable[[list[str], Path, Callable[[str], None]], int]
 def _stage(target: str) -> int | None:
     if target in STAGE_OF_TARGET:
         return STAGE_OF_TARGET[target]
+    if target.startswith("facts-") and target.partition("-")[2]:
+        return 3  # it reads the Eva report, so it follows the Eva stage of the same invocation
     if target.startswith(MODULE_TARGET_PREFIXES) and target.partition("-")[2]:
         return 2
     return None
@@ -837,6 +841,7 @@ def _target_problem(target: str, plan: Plan) -> str | None:
         "fuzz": plan.fuzz_modules,
         "eva": plan.eva_modules,
         "module": list(plan.modules),
+        "facts": list(plan.modules),
     }[kind]
     if mod in allowed:
         return None
@@ -854,6 +859,8 @@ def _target_nodes(target: str, plan: Plan) -> list[str]:
         return [f"fuzz-{m}" for m in plan.fuzz_modules]
     if target == "eva":
         return [f"eva-{m}" for m in plan.eva_modules]
+    if target == "facts":
+        return [f"facts-{m}" for m in plan.modules]
     return [target]
 
 
@@ -878,6 +885,7 @@ def _node_output(node: str) -> str | None:
         "build": f"{BUILD_DIR}/{mod}.build.json",
         "fuzz": f"{REPORT_DIRS['fuzz']}/{mod}.json",
         "eva": f"{REPORT_DIRS['eva']}/{mod}.json",
+        "facts": f"{FACTS_DIR}/{mod}.json",
         "module": INGESTED_JSON,
     }.get(kind)
 

@@ -560,6 +560,64 @@ def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]
     return spans
 
 
+def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str, Span]:
+    """Spans of every function definition in `source`, in one pass; the first one when a name repeats."""
+    tokens = tokenize_c_acsl(source, path=path)
+    spans: dict[str, Span] = {}
+    brace_depth = 0
+    paren_depth = 0
+    last_top_boundary_idx = -1
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
+            last_top_boundary_idx = idx
+        elif tok.kind == "c_token":
+            if tok.text == "{":
+                brace_depth += 1
+            elif tok.text == "}":
+                brace_depth = max(0, brace_depth - 1)
+                if brace_depth == 0 and paren_depth == 0:
+                    last_top_boundary_idx = idx
+            elif tok.text == "(":
+                paren_depth += 1
+            elif tok.text == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif tok.text == ";" and brace_depth == 0 and paren_depth == 0:
+                last_top_boundary_idx = idx
+            elif brace_depth == 0 and paren_depth == 0 and _IDENT_RE.fullmatch(tok.text):
+                open_paren_idx = _next_meaningful(tokens, idx + 1)
+                if (
+                    open_paren_idx < n
+                    and tokens[open_paren_idx].kind == "c_token"
+                    and tokens[open_paren_idx].text == "("
+                ):
+                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
+                    after_paren_idx = _next_meaningful(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
+                    if after_paren_idx < n and tokens[after_paren_idx].text == "{":
+                        close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}")
+                        if close_brace_idx != -1:
+                            start_tok = tokens[_compute_span_start(tokens, last_top_boundary_idx, idx)]
+                            end_tok = tokens[close_brace_idx]
+                            spans.setdefault(
+                                tok.text,
+                                Span(
+                                    function=tok.text,
+                                    start_byte=start_tok.start,
+                                    end_byte=end_tok.end,
+                                    start_line=start_tok.line,
+                                    end_line=end_tok.line,
+                                    text=source[start_tok.start : end_tok.end],
+                                ),
+                            )
+                            last_top_boundary_idx = close_brace_idx
+                            idx = close_brace_idx + 1
+                            continue
+        idx += 1
+    return spans
+
+
 def _find_body_brace_offset(span_text: str, path: str = "<input>") -> int | None:
     """Return the byte offset of the function body's opening `{` inside `span_text`, or None."""
     tokens = tokenize_c_acsl(span_text, path=path)

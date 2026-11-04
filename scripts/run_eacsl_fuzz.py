@@ -57,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import prover_candidates  # noqa: E402
 from acsl_ast import tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
@@ -2421,6 +2422,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "ok" else 1
 
+    digest_before = prover_candidates.digest_before_run(args.out_json) if args.mode == "guardrail" else None
     try:
         if args.mode == "selftest":
             res = run_selftest(args.work_dir, args.machdep, variadic_translation=not args.no_variadic_translation)
@@ -2488,7 +2490,10 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(_summary(res), indent=2))
+    summary = _summary(res)
+    if args.mode == "guardrail":
+        prover_candidates.add_candidate_block(summary, args.out_json, "guardrail", res, digest_before)
+    print(json.dumps(summary, indent=2))
     if args.mode == "selftest":
         return 0 if res.get("ok") else 1
     if args.mode == "build":

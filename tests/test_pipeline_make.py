@@ -517,6 +517,16 @@ def test_run_orders_targets_in_stages(tmp_path):
     assert out["targets"]["eva"]["nodes"]["eva-cfg"]["status"] == "no_output"
 
 
+def test_facts_run_after_eva_in_a_later_stage(tmp_path):
+    run = _make_run(tmp_path)
+    pm.generate(run, templates_dir=ACSL)
+    fake = FakeMake()
+    rc, out = pm.run_targets(["facts-log", "eva", "facts"], run, jobs=1, make_runner=fake, templates_dir=ACSL)
+    assert [c[7:] for c in fake.calls] == [["eva"], ["facts-log", "facts"]]
+    assert set(out["targets"]["facts"]["nodes"]) >= {"facts-cfg", "facts-log"}
+    assert out["targets"]["facts"]["nodes"]["facts-cfg"]["output"] == "workspace/reports/facts/cfg.json"
+
+
 def test_run_marks_everything_failed_when_make_names_no_target(tmp_path):
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
@@ -914,6 +924,10 @@ def test_make_dry_run(tmp_path):
     assert "resources.py run --class eva --key snmp" in out and "--slevel 250" in out and "--extra-domains taint" in out
     assert "resources.py run --class selftest" in out and "run_eacsl_fuzz.py build --module cfg" in out
     assert "pipeline_make.py ingest --module snmp" in out and "wp_scheduler.py init" in out
+    # Facts follow the new Eva report in the repair loop, and wp-queue always has them.
+    assert "resources.py run --class eva --key snmp --output workspace/reports/facts/snmp.json --" in out
+    assert "function_facts.py --module snmp" in out and "--eva-report workspace/reports/eva/snmp.json" in out
+    assert "function_facts.py --module cfg" in out
     assert "evil" not in out and "glue" not in out
 
     # Executed (not -n) with a fake interpreter that prints argv: the flags reach Python intact.

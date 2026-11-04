@@ -67,6 +67,22 @@ Every single iteration of the Function Prover Subagent ([`../skills/framac-wp/pr
 2. **Oracle 2 — The Static Deductive Oracle (`run_wp_function.py`):**
    Only after a contract holds on 100% of real dynamic executions is it passed to `frama-c -wp -wp-rte -wp-fct <fn>` to prove that it holds mathematically across *all* possible inputs.
 
+### The Best Candidate, Not the Last
+
+Both oracles record each iteration in the prover's scratch directory ([`../scripts/prover_candidates.py`](../scripts/prover_candidates.py)). Candidates that pass the guardrail are ranked by fewest unproven goals, then most proved goals. Only those compete, because a stronger `requires` can raise the proof ratio by excluding inputs. The tracker tells the prover to stop when an iteration improves neither number. Before a stalled prover's report and partial contract are used, `wp_scheduler.py complete` restores its best candidate.
+
+### What a Prover Starts From
+
+The deterministic side prepares what a prover would otherwise have to work out by reading code:
+
+- **Function facts** ([`../scripts/function_facts.py`](../scripts/function_facts.py), Make target `facts`, cached by content):
+  - From the Frama-C kernel AST ([`../scripts/kernel_ast.py`](../scripts/kernel_ast.py)): loops with their guard and updated variables, writes and reads in terms of formals and globals, possibly aliased pointer parameters, recursive calls with their decreasing argument, and return paths.
+  - From the module's Eva run ([`../scripts/run_eva_slice.py`](../scripts/run_eva_slice.py)): write and read sets, and resolved call targets.
+- **A reading slice** ([`../scripts/function_slice.py`](../scripts/function_slice.py)): the target's body, callee prototypes with their current contracts, and only the types, macros and globals the target references, resolved with the real compile flags. It is built from the agent's snapshot and is reading context only. The proof target stays the real file, because a slice can differ from the compiled program.
+- **A brief assembled for the function:** string, float, union and pointer-walking guidance, and similar parts, appear only for functions with those features. Every strict rule stays. Without facts, the whole brief is rendered.
+
+These are hints. Eva's locations hold only under the harness (`a[0..15]`, not `out[0 .. n - 1]`), so the prover restates them over the formals, and WP remains the only judge of `assigns`.
+
 ---
 
 ## 3. Caller-Callee Contract Negotiation

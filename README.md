@@ -155,7 +155,11 @@ frama-c/
 │   ├── generate_harness.py           # Phase 0: Dual-use Eva + LibFuzzer harness & sidecar generator
 │   ├── pipeline_make.py              # Phases 1-4: Generates & runs Makefile for deterministic module work
 │   ├── run_eacsl_fuzz.py             # Phase 1 & 3: E-ACSL + LibFuzzer campaigns, replays, selftest & guardrail
-│   ├── run_eva_slice.py              # Phase 2: Frama-C Eva + RTE runner & SARIF exporter
+│   ├── run_eva_slice.py              # Phase 2: Frama-C Eva + RTE runner, read/write sets & SARIF exporter
+│   ├── kernel_ast.py                 # Frama-C kernel AST facts & call graph (with kernel_ast_dump.ml)
+│   ├── function_facts.py             # Per-function prover facts (kernel AST + Eva flows) & brief assembly
+│   ├── function_slice.py             # Per-function reading slice from the real compile flags
+│   ├── prover_candidates.py          # A prover's best candidate across iterations
 │   ├── wp_scheduler.py               # Phase 3: Dependency-driven WP task scheduler, micro-batch merges & gates
 │   ├── run_wp_function.py            # Phase 3: Per-function Frama-C WP + RTE runner & goal bucketer
 │   ├── contract_negotiator.py        # Phase 3: Cross-function Caller-Callee contract strengthening ledger

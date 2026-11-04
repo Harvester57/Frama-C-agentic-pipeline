@@ -429,7 +429,7 @@ $envArgs = @(
 )
 # Pipeline knobs that scripts read inside the container: forwarded when set on the host.
 foreach ($knob in @("FRAMAC_CACHE", "FRAMAC_CACHE_MAX", "FRAMAC_MAX_AGENTS", "FRAMAC_SCHEDULER", "FRAMAC_LOCK_TIMEOUT",
-                    "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_PROVER_WALL_BUDGET_S", "FRAMAC_RESOURCES_VERBOSE")) {
+                    "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_PROVER_WALL_BUDGET_S", "FRAMAC_PROVER_CONTEXT", "FRAMAC_RESOURCES_VERBOSE")) {
     $knobValue = [Environment]::GetEnvironmentVariable($knob)
     if ($knobValue) { $envArgs += @("-e", "$knob=$knobValue") }
 }

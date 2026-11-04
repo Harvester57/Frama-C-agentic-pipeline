@@ -36,6 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import function_facts  # noqa: E402
+import function_slice  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
     ScopeViolationError,
@@ -1515,6 +1517,60 @@ def _resolve_brief_template(role: str) -> str:
     raise ArtifactError(f"brief template {fname} not found in skills/framac-wp")
 
 
+def _prover_context(
+    run_dir: Path,
+    overlay: Path,
+    agent_root: Path,
+    agent_id: str,
+    module: str | None,
+    function: str | None,
+    c_file: str | None,
+    header: str | None,
+    cppflags: str,
+    dag_functions: dict,
+) -> tuple[str, dict[str, bool] | None, dict]:
+    """
+    A prover's deterministic context: (brief section, features selecting the brief's conditional
+    parts, summary for the caller). Facts come from `pipeline_make.py run facts`; the slice is built
+    here because it must show the contracts in this agent's snapshot. Any problem only means less
+    context, and None as features keeps every conditional part of the brief.
+    """
+    if not function_facts.context_enabled():
+        return "", None, {"enabled": False}
+    if not (function and c_file):
+        return "", None, {"enabled": True, "facts": False, "slice": "no_target"}
+    work_dir = agent_root / "scratch" / "work"
+    context_dir = agent_root / "scratch" / "context"
+    record = function_facts.load_function_facts(overlay, module, c_file, function)
+    if record is not None:
+        atomic_write_json(context_dir / f"{function}.facts.json", record)
+    slice_result = function_slice.build_slice(
+        run_dir,
+        work_dir,
+        c_file,
+        function,
+        f"-Iagents/{agent_id}/scratch/work {cppflags}",
+        out_dir=context_dir,
+        header_file=header,
+        dag_functions=dag_functions,
+    )
+    usable_slice = slice_result if slice_result.get("status") in ("ok", "degraded") else None
+    try:
+        snapshot = (work_dir / c_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        snapshot = None
+    section = function_facts.render_section(record, usable_slice, snapshot, function)
+    features = record.get("features") if record is not None else None
+    summary = {
+        "enabled": True,
+        "facts": record is not None,
+        "slice": slice_result.get("status"),
+        "slice_reason": slice_result.get("reason"),
+        "section_chars": len(section),
+    }
+    return section, features if isinstance(features, dict) else None, summary
+
+
 def prepare_agent(
     run_dir: Path,
     agent_id: str,
@@ -1661,7 +1717,6 @@ def prepare_agent(
         wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
 
     unknown_obligations = []
-    fn_inout: dict[str, list[str]] = {}
     if isinstance(eva_report, dict) and function:
         raw_unknowns = eva_report.get("unknown_obligations_by_function", {}).get(function, [])
         if norm_c_file:
@@ -1670,12 +1725,6 @@ def prepare_agent(
             ]
         else:
             unknown_obligations = list(raw_unknowns)
-        raw_inout = (eva_report.get("inout_by_function") or {}).get(function)
-        if isinstance(raw_inout, dict):
-            fn_inout = {
-                "external": [str(x) for x in (raw_inout.get("external") or []) if str(x).strip()],
-                "internal": [str(x) for x in (raw_inout.get("internal") or []) if str(x).strip()],
-            }
 
     unproven_goals = wp_data.get("unproven_goals", []) if isinstance(wp_data, dict) else []
     if not unproven_goals and unknown_obligations:
@@ -1732,6 +1781,7 @@ def prepare_agent(
             "agent_id": agent_id,
             "function": function or "",
             "file": norm_c_file or "",
+            "header": norm_header or "",
             "profile": profile,
             "verifiability": verifiability,
             "wp_blockers": wp_blockers,
@@ -1749,6 +1799,13 @@ def prepare_agent(
         cand_short = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_short).strip("_")[:40] or "candidate"
 
     tpl = _resolve_brief_template(role)
+    context_section = ""
+    prover_context: dict = {}
+    if role == "prover":
+        context_section, features, prover_context = _prover_context(
+            run_dir, overlay, agent_root, agent_id, module, function, norm_c_file, norm_header, eff_cppflags, dag_fns
+        )
+        tpl = function_facts.render_conditionals(tpl, features)
     replacements = {
         "{agent_id}": agent_id,
         "{module_name}": module or "unknown",
@@ -1782,7 +1839,8 @@ def prepare_agent(
     rendered = tpl
     for k, v in replacements.items():
         rendered = rendered.replace(k, v)
-    # Appended after substitution: request and report contents are data, never placeholders.
+    # After substitution, like what is appended below: source text and reports are data, never placeholders.
+    rendered = rendered.replace(function_facts.CONTEXT_SENTINEL + "\n\n", context_section and context_section + "\n")
     if role == "prover" and (verifiability != "core_provable" or wp_blockers or wp_notes or profile == "quick"):
         fn_label = function or "this function"
         rendered += (
@@ -1805,21 +1863,6 @@ def prepare_agent(
                 'immediately write `result.json` with `"status": "stalled_after_k_retries"`. Never write '
                 "synthetic `probe_*.c` files.\n"
             )
-    if role == "prover" and (fn_inout.get("external") or fn_inout.get("internal")):
-        fn_label = function or "this function"
-        ext_locs = fn_inout.get("external") or []
-        int_locs = fn_inout.get("internal") or []
-        rendered += (
-            "\n## Eva Computed Frame Hints (Write# / Inout)\n\n"
-            f"Frama-C Eva (`-out-external` / `-out`) computed the following over-approximated written memory "
-            f"locations for `{fn_label}` under the module harness (use as a starting point for Step A `assigns` "
-            "and `loop assigns`; translate Eva synthetic base names like `S_p[0..n]` back to pointer dereferences "
-            "`p[0..n]`):\n"
-            f"- **External Written Locations (`-out-external`, excludes locals -> candidate `assigns`):** "
-            f"`{json.dumps(ext_locs)}`\n"
-            f"- **Internal Written Locations (`-out`, includes locals -> candidate `loop assigns`):** "
-            f"`{json.dumps(int_locs)}`\n"
-        )
     if wp_report_rel:
         rendered += (
             "\n## Stalled Prover's WP Report\n\n"
@@ -1872,6 +1915,7 @@ def prepare_agent(
         "function": function,
         "brief_file": brief_path.relative_to(run_dir).as_posix(),
         "merge_command": merge_cmd,
+        **({"prover_context": prover_context} if prover_context else {}),
         **overlay_info,
     }
 

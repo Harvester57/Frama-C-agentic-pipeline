@@ -6,7 +6,8 @@ Stores:
   run     <run>/state/cache/<ns>/<key[:2]>/<key>/{meta.json, key.json, files/<name>}
   shared  $FRAMAC_SHARED_CACHE_DIR (default /framac-cache when it exists), same layout. Looked up
           after the run store when FRAMAC_CACHE_MODE is `ro` or `rw`; written only with `rw`.
-Namespaces: `eacsl-build` (E-ACSL and sanitizer builds), `eva` (Eva reports), `guardrail` (run-local
+Namespaces: `eacsl-build` (E-ACSL and sanitizer builds), `eva` (Eva reports), `facts` (per-function
+prover facts), `slice-index` (parsed translation units for reading slices), `guardrail` (run-local
 dynamic oracle verdicts) and `wp`, which is Frama-C's own `-wp-cache-dir` (counted and collected
 here, never read or written by this module).
 
@@ -63,7 +64,7 @@ DEPS_TIMEOUT_S = 120
 SHARED_DEFAULT_DIR = Path("/framac-cache")
 # Frama-C preprocesses with these defined; headers guarded by them belong in the manifest.
 FRAMAC_DEP_DEFINES = ("-D__FRAMAC__", "-D__FC_MACHDEP_X86_64")
-NAMESPACES = ("eacsl-build", "eva", "guardrail", "wp")
+NAMESPACES = ("eacsl-build", "eva", "facts", "slice-index", "guardrail", "wp")
 CORPUS_MAX_FILES = 256
 CORPUS_MAX_FILE_BYTES = 64 * 1024
 CORPUS_MAX_TOTAL_BYTES = 4 * 1024 * 1024

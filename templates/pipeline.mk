@@ -27,16 +27,17 @@ SELFTEST_JSON := workspace/reports/eacsl_selftest.json
 BUILD_TARGETS  := $(addprefix build-,$(FUZZ_MODULES))
 FUZZ_TARGETS   := $(addprefix fuzz-,$(FUZZ_MODULES))
 EVA_TARGETS    := $(addprefix eva-,$(EVA_MODULES))
+FACTS_TARGETS  := $(addprefix facts-,$(MODULES))
 MODULE_TARGETS := $(addprefix module-,$(MODULES))
 
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init seed build selftest fuzz eva ingest replay wp-queue wp-sweep report \
-        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(EVA_TARGETS) $(MODULE_TARGETS)
+.PHONY: help slice-init seed build selftest fuzz eva facts ingest replay wp-queue wp-sweep report \
+        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(EVA_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init seed build selftest fuzz eva ingest replay wp-queue wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init seed build selftest fuzz eva facts ingest replay wp-queue wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -98,6 +99,15 @@ $(EVA_TARGETS): eva-%:
 		$(if $(EVA_TIMEOUT_$*),--timeout $(EVA_TIMEOUT_$*)) \
 		--cppflags=$(CPPFLAGS_$*) --out-json workspace/reports/eva/$*.json
 
+# Kernel AST facts of the module's functions, joined with the flows of its Eva report if there is
+# one, for the provers' briefs (cached by content). Hints only: a failure means briefs without
+# facts, never a stopped pipeline, hence the `-`.
+facts: $(FACTS_TARGETS)
+$(FACTS_TARGETS): facts-%:
+	-$(RUN) --class eva --key $* --output workspace/reports/facts/$*.json -- \
+		$(PY) $(S)/function_facts.py --module $* --sources $(SOURCES_$*) --cppflags=$(CPPFLAGS_$*) \
+		--eva-report workspace/reports/eva/$*.json --out-json workspace/reports/facts/$*.json
+
 # --- Ingestion and Phase 3 preparation -------------------------------------------------------
 
 # New reports only, fuzz before Eva; an expected module without a report is stubbed as not_run
@@ -112,7 +122,7 @@ replay: ingest
 		$(PY) $(S)/run_eacsl_fuzz.py replay-candidates --candidates candidates.json \
 		--harness-dir workspace/harnesses --out-dir workspace/reports/replay
 
-wp-queue: ingest
+wp-queue: ingest facts
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init
 
 # --- Phase 4 ---------------------------------------------------------------------------------
@@ -130,7 +140,10 @@ report:
 # --- Harness-repair loop ---------------------------------------------------------------------
 
 # module-<mod>: the module's own fuzz (with its build) and Eva targets, then ingestion of its
-# reports only.
+# reports only, then its facts from the new Eva report.
 $(foreach m,$(MODULES),$(eval module-$(m): $(filter fuzz-$(m) eva-$(m),$(FUZZ_TARGETS) $(EVA_TARGETS))))
 $(MODULE_TARGETS): module-%:
 	$(RUN) --class light --key ingest -- $(PM) ingest --module $*
+	-$(RUN) --class eva --key $* --output workspace/reports/facts/$*.json -- \
+		$(PY) $(S)/function_facts.py --module $* --sources $(SOURCES_$*) --cppflags=$(CPPFLAGS_$*) \
+		--eva-report workspace/reports/eva/$*.json --out-json workspace/reports/facts/$*.json
