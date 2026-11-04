@@ -1,3 +1,4 @@
+from fingerprint import is_valid_fingerprint
 from run_eacsl_fuzz import (
     _discover_slice_functions,
     classify_campaign,
@@ -239,11 +240,13 @@ def test_guardrail_classifies_annotation_rte_and_alarm_labeled_contracts(tmp_pat
         "\tmem_access: \\valid_read(p + i).\n"
     )
     res_acsl_line = classify_guardrail(1, False, acsl_line_out)
+    assert res_acsl_line["failure"]["file"] == src_file.as_posix()
     assert res_acsl_line["status"] == "rejected_overconstrained"
     assert res_acsl_line.get("annotation_rte") is True
 
     res_c_line = classify_guardrail(1, False, c_line_out)
     assert res_c_line["status"] == "code_fault"
+    assert is_valid_fingerprint(res_c_line["fingerprint"])
 
 
 def test_guardrail_classifies_unsound_verdicts():

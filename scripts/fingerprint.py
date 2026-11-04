@@ -110,6 +110,7 @@ def normalize_file(path: str) -> str:
     p = (path or "").replace("\\", "/").strip()
     for rx in _OVERLAY_ROOT_RES:
         p = rx.sub("", p, count=1)
+    p = re.sub(r"^[A-Za-z]:/+", "", p)
     changed = True
     while changed:
         changed = False

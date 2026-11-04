@@ -137,9 +137,9 @@ ARTIFACT_KINDS = (
 #           rte/index_bound:
 #               i < 8.
 #           With values at failure point:
-_FN_RE = re.compile(r"(?P<file>[^\s:'\"]+(?:\.[chi]|\.acsl)):\s*In function '(?P<function>[^']+)'")
+_FN_RE = re.compile(r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+(?:\.[chi]|\.acsl)):\s*In function '(?P<function>[^']+)'")
 _ERR_RE = re.compile(
-    r"(?P<file>[^\s:'\"]+(?:\.[chi]|\.acsl)):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?",
+    r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+(?:\.[chi]|\.acsl)):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?",
     re.IGNORECASE,
 )
 # Older style: "Assertion failed at line 42 in file foo.c." / "... in function parse."
