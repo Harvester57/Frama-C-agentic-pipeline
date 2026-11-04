@@ -386,11 +386,24 @@ def test_eva_timeout_default_and_extra_domains(tmp_path, monkeypatch):
     cmd, timeout = seen[-1]
     assert timeout == CLASSES["eva"].wall_timeout_s
     assert _flag(cmd, "-eva-domains") == "cvalue,equality,symbolic-locations,octagon,gauges"
-    run_eva_slice.main(base + ["--timeout", "0", "--extra-domains", "taint,octagon"])
+    assert "-eva-mlevel" not in cmd
+    run_eva_slice.main(
+        base
+        + ["--timeout", "0", "--extra-domains", "taint,octagon", "--mlevel", "4", "--allow-incomplete-recursion-specs"]
+    )
     cmd, timeout = seen[-1]
     assert timeout is None and _flag(cmd, "-eva-domains") == "cvalue,equality,symbolic-locations,octagon,gauges,taint"
+    assert _flag(cmd, "-eva-mlevel") == "4"
+    assert _flag(cmd, "-eva-warn-key") == "assigns:missing=warning"
+    # Both -eva-mlevel and -eva-warn-key must appear inside the -eva option group (before the next -then).
+    eva_idx = cmd.index("-eva")
+    next_then_idx = cmd.index("-then", eva_idx)
+    assert eva_idx < cmd.index("-eva-mlevel") < next_then_idx
+    assert eva_idx < cmd.index("-eva-warn-key") < next_then_idx
     with pytest.raises(SystemExit):
         run_eva_slice.main(base + ["--extra-domains", "taint;rm"])
+    with pytest.raises(SystemExit):
+        run_eva_slice.main(base + ["--mlevel", "-1"])
 
 
 # ---------------------------------------------------------------------------

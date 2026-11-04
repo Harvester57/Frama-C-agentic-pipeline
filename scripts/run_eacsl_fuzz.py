@@ -569,6 +569,7 @@ def _eacsl_cache_material(
         "variadic_translation": variadic_translation,
         "warn_unsigned_downcast": warn_unsigned_downcast,
         "rte_initialized": rte_initialized,
+        "no_constfold": True,
     }
 
 
@@ -748,6 +749,7 @@ def _compile_eacsl_binary_uncached(
     if not is_modern:
         cmd = [
             eacsl_bin,
+            "--no-constfold",
             "--compiler=clang",
             f"--machdep={machdep}",
             f"--rte={rte_flags}",
@@ -783,9 +785,12 @@ def _compile_eacsl_binary_uncached(
                 fn_csv = ",".join(fns)
                 fc_flags.append(f"-rte-select {fn_csv}")
                 fc_flags.append(f"-e-acsl-functions {fn_csv}")
+            # Pass --no-constfold so Frama-C's CIL constant folder does not zero-fold
+            # hoisted block-scope `static const` arrays indexed by variables.
             cmd1 = [
                 eacsl_bin,
                 "-n",
+                "--no-constfold",
                 "-G",
                 "clang",
                 "-F",
@@ -2071,6 +2076,7 @@ def replay_candidates(
                     machdep=machdep,
                     cppflags=spec["cppflags"],
                     ldflags=spec["ldflags"],
+                    rte_initialized=bool(spec.get("rte_initialized", True)),
                 )
         scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
         report = replay_report(

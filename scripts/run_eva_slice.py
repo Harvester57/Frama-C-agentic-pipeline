@@ -92,11 +92,13 @@ def run_eva_on_slice(
     machdep: str = "gcc_x86_64",
     cppflags: str = "-I.",
     slevel: int = 100,
+    mlevel: int = 0,
     warn_invalid_pointer: bool = True,
     warn_unsigned: bool = True,
     warn_unsigned_downcast: bool = True,
     timeout: int | None = None,
     extra_domains: list[str] | str | None = None,
+    allow_incomplete_recursion_specs: bool = False,
     use_cache: bool = True,
 ) -> dict:
     out_dir = Path(out_dir)
@@ -121,6 +123,8 @@ def run_eva_on_slice(
         warn_unsigned,
         warn_unsigned_downcast,
         extra_domains,
+        mlevel=mlevel,
+        allow_incomplete_recursion_specs=allow_incomplete_recursion_specs,
     )
 
     def _run() -> dict:
@@ -168,7 +172,11 @@ def _eva_command(
     warn_unsigned: bool,
     warn_unsigned_downcast: bool,
     extra_domains: list[str] | str | None,
+    mlevel: int = 0,
+    allow_incomplete_recursion_specs: bool = False,
 ) -> tuple[list[str], list[str]]:
+    if mlevel < 0:
+        raise ValueError(f"mlevel must be >= 0 (got {mlevel})")
     csv_path = out_dir / "alarms.csv"
     red_csv = out_dir / "red_alarms.csv"
     sav_path = out_dir / "framac.sav"
@@ -227,6 +235,18 @@ def _eva_command(
             str(sav_path),
         ]
     )
+    if mlevel > 0:
+        insert_at = cmd.index("-then", cmd.index("-eva"))
+        cmd[insert_at:insert_at] = ["-eva-mlevel", str(mlevel)]
+    if allow_incomplete_recursion_specs:
+        # A recursive call with no ACSL assigns clause aborts Eva with a deferred
+        # "warning as error assigns:missing". Downgrading the key keeps the analysis
+        # going with the kernel-inferred (incomplete) assigns; recorded as a reduced
+        # check because the recursion boundary is then interpreted unsoundly.
+        # Insert inside the Eva option group (before the next -then), not after -save.
+        insert_at = cmd.index("-then", cmd.index("-eva"))
+        cmd[insert_at:insert_at] = ["-eva-warn-key", "assigns:missing=warning"]
+        reduced_checks.append("-eva-warn-key assigns:missing=warning (recursive calls use kernel-inferred assigns)")
     return cmd, reduced_checks
 
 
@@ -374,6 +394,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--machdep", default="gcc_x86_64")
     parser.add_argument("--cppflags", default="-I.")
     parser.add_argument("--slevel", type=int, default=100)
+    parser.add_argument(
+        "--mlevel",
+        type=int,
+        default=0,
+        help="Maximum dynamic allocation calls per callstack returning fresh bases (-eva-mlevel, default: 0).",
+    )
     parser.add_argument("--module", default="")
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument(
@@ -403,6 +429,14 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Comma-separated Eva domains appended to -eva-domains (e.g. 'taint').",
     )
+    parser.add_argument(
+        "--allow-incomplete-recursion-specs",
+        action="store_true",
+        help=(
+            "Downgrade the deferred 'assigns:missing' error for recursive calls without an "
+            "ACSL assigns clause to a warning and continue (recorded in reduced_checks)."
+        ),
+    )
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
     timeout = CLASSES["eva"].wall_timeout_s if args.timeout is None else args.timeout
@@ -410,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
         eva_domains(args.extra_domains)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.mlevel < 0:
+        parser.error("--mlevel must be >= 0")
 
     res = run_eva_on_slice(
         sources=args.sources,
@@ -418,11 +454,13 @@ def main(argv: list[str] | None = None) -> int:
         machdep=args.machdep,
         cppflags=args.cppflags,
         slevel=args.slevel,
+        mlevel=args.mlevel,
         warn_invalid_pointer=not args.no_warn_invalid_pointer,
         warn_unsigned=not args.no_warn_unsigned,
         warn_unsigned_downcast=not args.no_warn_unsigned_downcast,
         timeout=timeout or None,
         extra_domains=args.extra_domains,
+        allow_incomplete_recursion_specs=args.allow_incomplete_recursion_specs,
     )
     res["module"] = args.module
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

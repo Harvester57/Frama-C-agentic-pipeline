@@ -266,16 +266,16 @@ The trusted steps are spelled out in full: only that exact command line gets a w
   - Reads `callgraph_dag.json`, the harness sidecars and the run profile.
   - Validates every module's flags against an allowlist (`-I -D -U -include -imacros -isystem -iquote -idirafter -std= -O -g -W -f[no-]common -l -L`). A module with any other flag, such as `-fplugin`, `-B`, `-fuse-ld` or `-Wl,`, is excluded with a reason.
 - **Targets are phony.** Repeated runs are cheap because of the caches and because ingestion records report digests in `state/ingested.json`, not because of timestamps, which are coarse on 9p and NFS.
-- **Tuning** that the orchestrator decides (Eva slevel, the taint domain, fuzz dictionaries, budgets) lives in `workspace/build/params.json`:
+- **Tuning** that the orchestrator decides (Eva slevel/mlevel, the taint domain, recursion fallback, fuzz dictionaries, budgets) lives in `workspace/build/params.json`:
 
   ```text
-  python3 $S/pipeline_make.py params set --module snmp --eva-slevel 250 --eva-taint --eva-timeout 3600
+  python3 $S/pipeline_make.py params set --module snmp --eva-slevel 250 --eva-mlevel 4 --eva-taint --eva-timeout 3600
   python3 $S/pipeline_make.py params set --module snmp --fuzz-dict workspace/dicts/snmp.dict --fuzz-budget 300
   python3 $S/pipeline_make.py params set --module snmp --reset       # back to the profile defaults
   python3 $S/pipeline_make.py params show [--module snmp]
   ```
 
-  A value of `0` clears `--fuzz-budget`, `--fuzz-max-time` and `--eva-timeout`, and `''` clears `--fuzz-dict`. Defaults: Eva slevel 100; a fuzz budget of 60 / 120 / 900 CPU-seconds for quick / standard / deep.
+  A value of `0` clears `--eva-mlevel`, `--fuzz-budget`, `--fuzz-max-time` and `--eva-timeout`, and `''` clears `--fuzz-dict`. Defaults: Eva slevel 100, mlevel 0; a fuzz budget of 60 / 120 / 900 CPU-seconds for quick / standard / deep.
 
 ---
 

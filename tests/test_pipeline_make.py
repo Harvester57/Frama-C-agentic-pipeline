@@ -106,33 +106,42 @@ SOURCES_cfg := workspace/work/src/cfg/parse.c workspace/work/src/util/str.c work
 CPPFLAGS_cfg := '-I. -I{ACSL}/acsl'
 LDFLAGS_cfg := ''
 EVA_SLEVEL_cfg := 100
+EVA_MLEVEL_cfg :=
 EVA_TAINT_cfg :=
 EVA_TIMEOUT_cfg :=
+EVA_RECURSION_FALLBACK_cfg :=
 FUZZ_BUDGET_cfg := 60
 FUZZ_MAX_TIME_cfg :=
 FUZZ_DICT_cfg :=
+FUZZ_NO_RTE_INIT_cfg :=
 
 # log
 SOURCES_log := workspace/harnesses/harness_log.c
 CPPFLAGS_log := '-I. -Iworkspace/work/src/log -I{ACSL}/acsl'
 LDFLAGS_log := ''
 EVA_SLEVEL_log := 100
+EVA_MLEVEL_log :=
 EVA_TAINT_log :=
 EVA_TIMEOUT_log :=
+EVA_RECURSION_FALLBACK_log :=
 FUZZ_BUDGET_log := 60
 FUZZ_MAX_TIME_log :=
 FUZZ_DICT_log :=
+FUZZ_NO_RTE_INIT_log :=
 
 # snmp
 SOURCES_snmp := workspace/work/src/snmp/pdu.c workspace/work/src/snmp/ber.c workspace/harnesses/harness_snmp.c
 CPPFLAGS_snmp := '-I. -Iworkspace/work/src/snmp -DDEBUG=2 -I{ACSL}/acsl'
 LDFLAGS_snmp := -lm
 EVA_SLEVEL_snmp := 250
+EVA_MLEVEL_snmp :=
 EVA_TAINT_snmp := 1
 EVA_TIMEOUT_snmp :=
+EVA_RECURSION_FALLBACK_snmp :=
 FUZZ_BUDGET_snmp := 300
 FUZZ_MAX_TIME_snmp := 30
 FUZZ_DICT_snmp := workspace/dicts/snmp.dict
+FUZZ_NO_RTE_INIT_snmp :=
 """
 
 
@@ -232,6 +241,7 @@ def test_gen_flags_come_from_the_sidecar_and_dag_flags_are_diagnostics(tmp_path)
             pm.with_acsl(["-I.", "-Iworkspace/work/src/snmp", "-DDEBUG=2"], pm.build_plan(run).acsl_dir)
         ),
         "ldflags": "-lm",
+        "rte_initialized": True,
     }
     with pytest.raises(ValueError, match="fplugin"):
         pm.module_build_spec("evil", run)
@@ -366,7 +376,15 @@ def test_params_set_and_show(tmp_path):
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"eva_slevel": -1}, {"fuzz_budget": -5}, {"fuzz_dict": "-x"}, {"eva_taint": "yes"}, {"fuzz_max_time": 1.5}],
+    [
+        {"eva_slevel": -1},
+        {"eva_mlevel": -1},
+        {"eva_mlevel": 1001},
+        {"fuzz_budget": -5},
+        {"fuzz_dict": "-x"},
+        {"eva_taint": "yes"},
+        {"fuzz_max_time": 1.5},
+    ],
 )
 def test_params_set_rejects_bad_values(tmp_path, kwargs):
     with pytest.raises(ValueError):
@@ -375,8 +393,26 @@ def test_params_set_rejects_bad_values(tmp_path, kwargs):
 
 def test_params_cli_and_gen_pick_up_tuning(tmp_path, capsys):
     run = _make_run(tmp_path)
-    rc = pm.main(["--run-dir", str(run), "params", "set", "--module", "snmp", "--eva-slevel", "250", "--eva-taint"])
-    assert rc == 0 and json.loads(capsys.readouterr().out)["overrides"] == {"eva_slevel": 250, "eva_taint": True}
+    rc = pm.main(
+        [
+            "--run-dir",
+            str(run),
+            "params",
+            "set",
+            "--module",
+            "snmp",
+            "--eva-slevel",
+            "250",
+            "--eva-mlevel",
+            "4",
+            "--eva-taint",
+        ]
+    )
+    assert rc == 0 and json.loads(capsys.readouterr().out)["overrides"] == {
+        "eva_slevel": 250,
+        "eva_mlevel": 4,
+        "eva_taint": True,
+    }
     assert pm.main(["--run-dir", str(run), "params", "set", "--module", "snmp", "--fuzz-dict", "-x"]) == 1
     assert "fuzz_dict" in json.loads(capsys.readouterr().out)["error"]
     assert pm.main(["--run-dir", str(run), "params", "set", "--module", "bad name"]) == 1
@@ -384,7 +420,8 @@ def test_params_cli_and_gen_pick_up_tuning(tmp_path, capsys):
 
     pm.generate(run, templates_dir=ACSL)
     text = (run / pm.MODULES_MK).read_text(encoding="utf-8")
-    assert "EVA_SLEVEL_snmp := 250\nEVA_TAINT_snmp := 1\n" in text
+    assert "EVA_SLEVEL_snmp := 250\nEVA_MLEVEL_snmp := 4\nEVA_TAINT_snmp := 1\n" in text
+    assert pm.params_set(run, "snmp", eva_mlevel=0)["overrides"] == {"eva_slevel": 250, "eva_taint": True}
 
 
 def test_malformed_params_is_a_gen_error(tmp_path):

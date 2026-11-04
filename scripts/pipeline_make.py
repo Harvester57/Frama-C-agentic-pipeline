@@ -205,22 +205,28 @@ def _opt(value: Any) -> str:
 
 PARAM_TYPES: dict[str, type] = {
     "eva_slevel": int,
+    "eva_mlevel": int,
     "eva_taint": bool,
     "eva_timeout": int,
+    "eva_recursion_fallback": bool,
     "fuzz_budget": int,
     "fuzz_max_time": int,
     "fuzz_dict": str,
+    "fuzz_rte_initialized": bool,
 }
 
 
 def default_params(profile: str) -> dict:
     return {
         "eva_slevel": DEFAULT_EVA_SLEVEL,
+        "eva_mlevel": 0,
         "eva_taint": False,
         "eva_timeout": None,
+        "eva_recursion_fallback": False,
         "fuzz_budget": FUZZ_BUDGET_BY_PROFILE.get(profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE]),
         "fuzz_max_time": None,
         "fuzz_dict": None,
+        "fuzz_rte_initialized": True,
     }
 
 
@@ -235,6 +241,8 @@ def _param_problem(key: str, value: Any) -> str | None:
             return "must be an integer"
         if key == "eva_slevel":
             return None if 0 <= value <= 1_000_000 else "must be between 0 and 1000000"
+        if key == "eva_mlevel":
+            return None if 0 <= value <= 1_000 else "must be between 0 and 1000"
         return None if value > 0 else "must be positive"
     if not isinstance(value, str) or not value or value.startswith("-") or any(c in value for c in "\n\r\0"):
         return "must be a file path (not empty, not starting with '-', no line breaks)"
@@ -590,7 +598,12 @@ def module_build_spec(module: str, run_dir: Path | str = ".") -> dict:
     mod = plan.modules.get(module)
     if mod is None:
         raise ValueError(f"module {module!r} is not runnable: {plan.excluded.get(module, 'not in the DAG')}")
-    return {"sources": list(mod.sources), "cppflags": shlex.join(mod.cppflags), "ldflags": shlex.join(mod.ldflags)}
+    return {
+        "sources": list(mod.sources),
+        "cppflags": shlex.join(mod.cppflags),
+        "ldflags": shlex.join(mod.ldflags),
+        "rte_initialized": bool(mod.params.get("fuzz_rte_initialized", True)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -615,11 +628,14 @@ def _module_block(mod: ModulePlan) -> list[str]:
         _assign(f"CPPFLAGS_{n}", mk_quote(shlex.join(mod.cppflags))),
         _assign(f"LDFLAGS_{n}", mk_quote(shlex.join(mod.ldflags))),
         _assign(f"EVA_SLEVEL_{n}", mk_quote(str(p["eva_slevel"]))),
+        _assign(f"EVA_MLEVEL_{n}", mk_quote(str(p["eva_mlevel"])) if p["eva_mlevel"] else ""),
         _assign(f"EVA_TAINT_{n}", "1" if p["eva_taint"] else ""),
         _assign(f"EVA_TIMEOUT_{n}", _opt(p["eva_timeout"])),
+        _assign(f"EVA_RECURSION_FALLBACK_{n}", "1" if p["eva_recursion_fallback"] else ""),
         _assign(f"FUZZ_BUDGET_{n}", mk_quote(str(p["fuzz_budget"]))),
         _assign(f"FUZZ_MAX_TIME_{n}", _opt(p["fuzz_max_time"])),
         _assign(f"FUZZ_DICT_{n}", _opt(p["fuzz_dict"])),
+        _assign(f"FUZZ_NO_RTE_INIT_{n}", "" if p["fuzz_rte_initialized"] else "1"),
     ]
 
 
@@ -690,12 +706,12 @@ def generate(run_dir: Path | str = ".", templates_dir: Path | str | None = None)
 # params set / show
 # ---------------------------------------------------------------------------
 
-_CLEARED_BY_ZERO = ("eva_timeout", "fuzz_budget", "fuzz_max_time")
+_CLEARED_BY_ZERO = ("eva_mlevel", "eva_timeout", "fuzz_budget", "fuzz_max_time")
 
 
 def params_set(run_dir: Path | str = ".", module: str = "", reset: bool = False, **updates: Any) -> dict:
     """
-    Update one module's overrides. 0 clears eva_timeout, fuzz_budget (back to the profile
+    Update one module's overrides. 0 clears eva_mlevel, eva_timeout, fuzz_budget (back to the profile
     default) and fuzz_max_time; an empty fuzz_dict clears the dictionary; `reset` drops every
     earlier override first. ValueError on an invalid value.
     """
@@ -1553,16 +1569,57 @@ def main(argv: list[str] | None = None) -> int:
     p_set.add_argument("--module", required=True)
     p_set.add_argument("--reset", action="store_true", help="Drop the module's earlier overrides first")
     p_set.add_argument("--eva-slevel", type=int, default=None)
+    p_set.add_argument(
+        "--eva-mlevel",
+        type=int,
+        default=None,
+        help="Eva dynamic allocation unrolling level per callstack (-eva-mlevel; 0 clears)",
+    )
     taint = p_set.add_mutually_exclusive_group()
     taint.add_argument("--eva-taint", dest="eva_taint", action="store_true", help="Add the taint domain")
     taint.add_argument("--no-eva-taint", dest="eva_taint", action="store_false")
     p_set.set_defaults(eva_taint=None)
     p_set.add_argument("--eva-timeout", type=int, default=None, help="Eva wall-clock seconds (0 clears)")
+    eva_rec = p_set.add_mutually_exclusive_group()
+    eva_rec.add_argument(
+        "--eva-recursion-fallback",
+        dest="eva_recursion_fallback",
+        action="store_true",
+        help=(
+            "Continue Eva when a recursive call has no assigns clause by downgrading the "
+            "assigns:missing error to a warning (recorded in reduced_checks)."
+        ),
+    )
+    eva_rec.add_argument(
+        "--no-eva-recursion-fallback",
+        dest="eva_recursion_fallback",
+        action="store_false",
+        help="Keep the default: a recursive call without assigns aborts Eva",
+    )
+    p_set.set_defaults(eva_recursion_fallback=None)
     p_set.add_argument("--fuzz-dict", default=None, help="libFuzzer dictionary, run-relative ('' clears)")
     p_set.add_argument("--fuzz-budget", type=int, default=None, help="Campaign CPU-seconds (0: profile default)")
     p_set.add_argument(
         "--fuzz-max-time", type=int, default=None, help="Campaign wall-clock override in seconds (0 clears)"
     )
+    rte_init = p_set.add_mutually_exclusive_group()
+    rte_init.add_argument(
+        "--fuzz-rte-initialized",
+        dest="fuzz_rte_initialized",
+        action="store_true",
+        help="Check uninitialized reads in the fuzz build (default)",
+    )
+    rte_init.add_argument(
+        "--no-fuzz-rte-initialized",
+        dest="fuzz_rte_initialized",
+        action="store_false",
+        help=(
+            "Drop -rte-initialized from the fuzz build for this module; recorded in "
+            "reduced_checks. Useful when E-ACSL's by-value struct parameter shadow copy "
+            "makes every input a false initialization alarm (Eva still checks statically)."
+        ),
+    )
+    p_set.set_defaults(fuzz_rte_initialized=None)
     p_show = psub.add_parser("show")
     p_show.add_argument("--module", default=None)
 
@@ -1589,11 +1646,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.module,
                 reset=args.reset,
                 eva_slevel=args.eva_slevel,
+                eva_mlevel=args.eva_mlevel,
                 eva_taint=args.eva_taint,
                 eva_timeout=args.eva_timeout,
+                eva_recursion_fallback=args.eva_recursion_fallback,
                 fuzz_dict=args.fuzz_dict,
                 fuzz_budget=args.fuzz_budget,
                 fuzz_max_time=args.fuzz_max_time,
+                fuzz_rte_initialized=args.fuzz_rte_initialized,
             )
         elif args.cmd == "params":
             out = params_show(run_dir, args.module)

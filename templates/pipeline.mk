@@ -66,6 +66,7 @@ $(BUILD_TARGETS): build-%:
 	$(RUN) --class build --key $* --output workspace/build/$*.build.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py build --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
+		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/build/$*.build.json
 
 # The E-ACSL toolchain canary (runs a compiled canary, so dynamic).
@@ -82,6 +83,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 		--out-bin workspace/harnesses/fuzz_$* --corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
+		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/reports/fuzz/$*.json
 
@@ -90,7 +92,9 @@ eva: $(EVA_TARGETS)
 $(EVA_TARGETS): eva-%:
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
 		$(PY) $(S)/run_eva_slice.py --module $* --sources $(SOURCES_$*) --main eva_main \
-		--out-dir workspace/eva/$* --slevel $(EVA_SLEVEL_$*) $(if $(EVA_TAINT_$*),--extra-domains taint) \
+		--out-dir workspace/eva/$* --slevel $(EVA_SLEVEL_$*) $(if $(EVA_MLEVEL_$*),--mlevel $(EVA_MLEVEL_$*)) \
+		$(if $(EVA_TAINT_$*),--extra-domains taint) \
+		$(if $(EVA_RECURSION_FALLBACK_$*),--allow-incomplete-recursion-specs) \
 		$(if $(EVA_TIMEOUT_$*),--timeout $(EVA_TIMEOUT_$*)) \
 		--cppflags=$(CPPFLAGS_$*) --out-json workspace/reports/eva/$*.json
 

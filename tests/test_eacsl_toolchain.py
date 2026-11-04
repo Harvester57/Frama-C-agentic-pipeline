@@ -134,7 +134,8 @@ def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path
     stage1, stage2 = fake.calls
     assert "-E" in stage1 and "-e" not in stage1 and "-C" not in stage1
     # -n: instrument only. Without it e-acsl-gcc also links the original main-less harness and fails.
-    assert stage1[1] == "-n"
+    # --no-constfold: prevent CIL constant folding from zero-folding block-scope static const arrays.
+    assert stage1[1:3] == ["-n", "--no-constfold"]
     fc_flags = stage1[stage1.index("-F") + 1]
     assert "-e-acsl-assert-print-data" in fc_flags and "-e-acsl-full-mtracking" in fc_flags
     assert "-rte-initialized @all" in fc_flags and res["reduced_checks"] == []
