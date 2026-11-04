@@ -1100,6 +1100,100 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
     return cppflags
 
 
+_HARNESS_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+
+
+def _merge_dag_harness_sources(
+    out_dir: Path,
+    sources: list[str],
+    include_source: bool,
+    *invocation_snippets: str | None,
+) -> list[str]:
+    """
+    If `callgraph_dag.json` exists next to `out_dir` and `include_source` is False,
+    inspect identifiers referenced in the harness invocation snippets (`entry_fn`,
+    `call_expr`, `eva_expr`, `fuzz_expr`), resolve any in-tree functions or header
+    `static inline` wrappers via the DAG, and append their module `required_sources`
+    (preserving `workspace/work/` prefix conventions from `sources`).
+    """
+    if include_source or not sources:
+        return list(sources)
+    dag_candidates = [
+        out_dir.parent / "reports" / "callgraph_dag.json",
+        Path("workspace/reports/callgraph_dag.json"),
+    ]
+    dag: dict[str, Any] | None = None
+    for dag_path in dag_candidates:
+        if not dag_path.is_file():
+            continue
+        try:
+            loaded = json.loads(dag_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                dag = loaded
+                break
+        except (OSError, ValueError):
+            continue
+    if not dag:
+        return list(sources)
+
+    functions_map = dag.get("functions") or {}
+    modules_map = dag.get("modules") or {}
+    inline_map = dag.get("header_inline_callees") or {}
+    if not isinstance(functions_map, dict) or not isinstance(modules_map, dict):
+        return list(sources)
+
+    referenced_idents: set[str] = set()
+    for snippet in invocation_snippets:
+        if snippet:
+            referenced_idents.update(_HARNESS_IDENT_RE.findall(snippet))
+
+    target_fns: set[str] = set()
+    for ident in referenced_idents:
+        if ident in functions_map:
+            target_fns.add(ident)
+        if isinstance(inline_map, dict) and ident in inline_map:
+            for resolved_fn in inline_map.get(ident) or []:
+                if isinstance(resolved_fn, str) and resolved_fn in functions_map:
+                    target_fns.add(resolved_fn)
+
+    if not target_fns:
+        return list(sources)
+
+    # Determine whether `sources` uses a prefix like `workspace/work/`
+    prefix = ""
+    first_norm = sources[0].replace("\\", "/").strip()
+    if first_norm.startswith("workspace/work/"):
+        prefix = "workspace/work/"
+    elif (out_dir.parent / "work").is_dir() and first_norm.startswith(
+        (out_dir.parent / "work").as_posix().rstrip("/") + "/"
+    ):
+        prefix = (out_dir.parent / "work").as_posix().rstrip("/") + "/"
+
+    merged = list(sources)
+    seen_norm = {s.replace("\\", "/").strip() for s in merged}
+    for fn_name in sorted(target_fns):
+        fn_rec = functions_map.get(fn_name)
+        if not isinstance(fn_rec, dict):
+            continue
+        mod_name = fn_rec.get("module")
+        mod_info = modules_map.get(mod_name) if isinstance(mod_name, str) else None
+        extra_rels: list[str] = []
+        if isinstance(mod_info, dict) and isinstance(mod_info.get("required_sources"), list):
+            extra_rels.extend(s for s in mod_info["required_sources"] if isinstance(s, str))
+        elif isinstance(fn_rec.get("file"), str):
+            extra_rels.append(fn_rec["file"])
+        for rel in extra_rels:
+            rel_clean = rel.replace("\\", "/").strip()
+            if prefix and not rel_clean.startswith(prefix):
+                cand = f"{prefix}{rel_clean}"
+            else:
+                cand = rel_clean
+            if cand not in seen_norm and rel_clean not in seen_norm:
+                merged.append(cand)
+                seen_norm.add(cand)
+    return merged
+
+
 _FUZZ_FN_BLOCK_RE = re.compile(
     r"/\*\s*\n\s*\*\s*LibFuzzer Entry Point.*?^int LLVMFuzzerTestOneInput\(const uint8_t \*data, size_t size\)\s*\{.*?^\}",
     re.DOTALL | re.MULTILINE,
@@ -1208,6 +1302,15 @@ def generate_module_harness(
         fuzz_expr=fuzz_expr,
         null_terminate=effective_null_terminate,
         auto_params=auto_params,
+    )
+    sources = _merge_dag_harness_sources(
+        out_dir,
+        sources,
+        include_source,
+        entry_fn,
+        call_expr,
+        eva_expr,
+        fuzz_expr,
     )
 
     inc_lines: list[str] = []

@@ -604,3 +604,147 @@ static const char *parse_token(const char *buf, const char *buf_end, const char 
         assert any("ADVANCE_TOKEN" in note for note in fn_parse["wp_notes"])
         # Topological wave must place findchar_fast before parse_token
         assert dag["functions"]["findchar_fast"]["wave"] < fn_parse["wave"]
+
+    def test_cross_module_symbol_closure_through_global_tables_callbacks_and_header_inlines(
+        self, tmp_path: Path
+    ) -> None:
+        from build_callgraph_dag import extract_file_scope_objects
+
+        inc_dir = tmp_path / "include"
+        inc_dir.mkdir(parents=True)
+        (inc_dir / "api.h").write_text(
+            """\
+#ifndef API_H
+#define API_H
+struct TagEntry {
+    int tag_id;
+    int (*cb)(const unsigned char *buf, unsigned int len);
+};
+extern const struct TagEntry GlobalTagTable[];
+int number_decode_value(const unsigned char *buf, unsigned int len);
+int spiffy_helper(const unsigned char *buf, unsigned int len);
+
+static inline int inline_decode_wrapper(const unsigned char *buf, unsigned int len) {
+    return number_decode_value(buf, len);
+}
+#endif
+""",
+            encoding="utf-8",
+        )
+
+        src_dir = tmp_path / "src"
+        src_dir.mkdir(parents=True)
+
+        # Module 1: spiffy_decode.c defines leaf helper called by tag_decode.c
+        (src_dir / "spiffy_decode.c").write_text(
+            """\
+#include "api.h"
+int spiffy_helper(const unsigned char *buf, unsigned int len) {
+    return len > 0 ? buf[0] : 0;
+}
+""",
+            encoding="utf-8",
+        )
+
+        # Module 2: tag_decode.c defines callback functions and an exported file-scope dispatch table
+        tag_code = """\
+#include "api.h"
+int tag_cb_bignum(const unsigned char *buf, unsigned int len) {
+    return spiffy_helper(buf, len);
+}
+const struct TagEntry GlobalTagTable[] = {
+    { .tag_id = 2, .cb = tag_cb_bignum },
+    { .tag_id = 0, .cb = 0 }
+};
+"""
+        (src_dir / "tag_decode.c").write_text(tag_code, encoding="utf-8")
+
+        objs = extract_file_scope_objects(tag_code, "src/tag_decode.c")
+        assert len(objs) == 1
+        assert objs[0]["name"] == "GlobalTagTable"
+        assert objs[0]["is_static"] is False
+        assert "tag_cb_bignum" in objs[0]["refs"]
+        assert "tag_id" not in objs[0]["refs"]
+
+        # Module 3: number_decode.c passes callback identifier `tag_cb_bignum` without `(`
+        (src_dir / "number_decode.c").write_text(
+            """\
+#include "api.h"
+static int run_cb(int (*fn)(const unsigned char *, unsigned int), const unsigned char *b, unsigned int n) {
+    return fn(b, n);
+}
+int number_decode_value(const unsigned char *buf, unsigned int len) {
+    return run_cb(tag_cb_bignum, buf, len);
+}
+""",
+            encoding="utf-8",
+        )
+
+        # Module 4: main_decode.c references `GlobalTagTable` (as a value) and calls `inline_decode_wrapper`
+        (src_dir / "main_decode.c").write_text(
+            """\
+#include "api.h"
+static int register_table(const struct TagEntry *tbl) {
+    return tbl != 0 ? tbl[0].tag_id : -1;
+}
+int main_decode_entry(const unsigned char *buf, unsigned int len) {
+    int rc = register_table(GlobalTagTable);
+    return rc + inline_decode_wrapper(buf, len);
+}
+""",
+            encoding="utf-8",
+        )
+
+        dag = build_dag(tmp_path)
+        assert dag["header_inline_callees"]["inline_decode_wrapper"] == ["number_decode_value"]
+
+        # number_decode references tag_cb_bignum as a callback pointer -> pulls tag_decode.c and transitively spiffy_decode.c
+        num_mod = dag["modules"]["number_decode"]
+        assert num_mod["required_sources"] == [
+            "src/number_decode.c",
+            "src/spiffy_decode.c",
+            "src/tag_decode.c",
+        ]
+        assert "tag_cb_bignum" in num_mod["cross_module_callees"]
+        assert "spiffy_helper" in num_mod["cross_module_callees"]
+
+        # main_decode references GlobalTagTable and calls inline_decode_wrapper -> pulls tag_decode.c, spiffy_decode.c, and number_decode.c
+        main_mod = dag["modules"]["main_decode"]
+        assert main_mod["required_sources"] == [
+            "src/main_decode.c",
+            "src/number_decode.c",
+            "src/spiffy_decode.c",
+            "src/tag_decode.c",
+        ]
+        assert "inline_decode_wrapper" not in main_mod["external_callees"]
+        assert "number_decode_value" in main_mod["cross_module_callees"]
+        assert "tag_cb_bignum" in main_mod["cross_module_callees"]
+        assert "spiffy_helper" in main_mod["cross_module_callees"]
+
+        # Verify generate_module_harness also resolves header inline wrappers / callees in --call-expr
+        import json
+
+        from generate_harness import generate_module_harness
+
+        reports_dir = tmp_path / "workspace" / "reports"
+        harnesses_dir = tmp_path / "workspace" / "harnesses"
+        reports_dir.mkdir(parents=True)
+        (reports_dir / "callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
+
+        res = generate_module_harness(
+            module_name="spiffy_decode",
+            sources=["workspace/work/src/spiffy_decode.c"],
+            header_include="api.h",
+            entry_fn="spiffy_helper",
+            max_input_size=256,
+            cppflags="-Iinclude",
+            out_dir=harnesses_dir,
+            entry_style="custom",
+            call_expr="spiffy_helper(fuzz_buf, (unsigned int)fuzz_len); inline_decode_wrapper(fuzz_buf, (unsigned int)fuzz_len);",
+            auto_prelude=False,
+        )
+        assert res["sources"] == [
+            "workspace/work/src/spiffy_decode.c",
+            "workspace/work/src/number_decode.c",
+            "workspace/work/src/tag_decode.c",
+        ]

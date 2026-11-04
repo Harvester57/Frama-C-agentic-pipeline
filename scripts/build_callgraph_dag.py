@@ -308,6 +308,7 @@ def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str,
         visited: set[str] = {m_name}
         queue = [ref for ref in sorted(info["ident_refs"]) if ref in macro_names and ref != m_name]
         callees = {c for c in info["direct_calls"] if c not in macro_names}
+        ident_refs = {r for r in info["ident_refs"] if r not in macro_names}
         total_loops = info["direct_loops"]
         while queue:
             cur = queue.pop(0)
@@ -316,6 +317,7 @@ def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str,
             visited.add(cur)
             sub = raw_macros[cur]
             callees |= {c for c in sub["direct_calls"] if c not in macro_names}
+            ident_refs |= {r for r in sub["ident_refs"] if r not in macro_names}
             total_loops += sub["direct_loops"]
             for ref in sorted(sub["ident_refs"]):
                 if ref in macro_names and ref not in visited:
@@ -324,9 +326,246 @@ def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str,
             "name": m_name,
             "line": info["line"],
             "callees": callees,
+            "ident_refs": ident_refs | callees,
             "loop_count": total_loops,
         }
     return resolved
+
+
+def _extract_declarator_ident(lhs_tokens: list[Token]) -> str | None:
+    """
+    Extract the declared variable/array/function-pointer identifier from the left-hand side
+    of a top-level object declaration (after stripping any inline struct/union/enum `{ ... }` body).
+    """
+    if not lhs_tokens:
+        return None
+    end_idx = _strip_trailing_attributes(lhs_tokens, len(lhs_tokens), -1)
+    trimmed = lhs_tokens[: end_idx + 1]
+    if not trimmed:
+        return None
+
+    # 1. Array declarator: `const struct Entry Table[...]` -> identifier immediately before top-level `[`
+    p_depth = 0
+    for idx, tok in enumerate(trimmed):
+        if tok.text == "(":
+            p_depth += 1
+        elif tok.text == ")":
+            p_depth = max(0, p_depth - 1)
+        elif tok.text == "[" and p_depth == 0:
+            if idx > 0 and _is_ident(trimmed[idx - 1].text):
+                cand = trimmed[idx - 1].text
+                if cand not in TYPE_MODIFIERS_AND_PRIMITIVES:
+                    return cand
+            break
+
+    # 2. Function-pointer variable declarator: `int (*handler)(int)`
+    for idx, tok in enumerate(trimmed):
+        if tok.text == "(" and idx + 2 < len(trimmed) and trimmed[idx + 1].text == "*":
+            for inner in trimmed[idx + 2 :]:
+                if inner.text == ")":
+                    break
+                if _is_ident(inner.text) and inner.text not in TYPE_MODIFIERS_AND_PRIMITIVES:
+                    return inner.text
+
+    # 3. Plain scalar/struct declarator: last non-keyword identifier at paren_depth == 0
+    # Require at least one preceding type token so bare identifiers are ignored.
+    p_depth = 0
+    ident_positions: list[tuple[int, str]] = []
+    for idx, tok in enumerate(trimmed):
+        if tok.text == "(":
+            p_depth += 1
+        elif tok.text == ")":
+            p_depth = max(0, p_depth - 1)
+        elif p_depth == 0 and _is_ident(tok.text):
+            ident_positions.append((idx, tok.text))
+    if not ident_positions:
+        return None
+    last_idx, last_ident = ident_positions[-1]
+    if last_ident in TYPE_MODIFIERS_AND_PRIMITIVES:
+        return None
+    if last_idx == 0:
+        return None
+    if trimmed[last_idx - 1].text in ("struct", "union", "enum"):
+        return None
+    return last_ident
+
+
+def extract_file_scope_objects(
+    raw_code: str,
+    path: str = "<input>",
+    macros: dict[str, dict] | None = None,
+) -> list[dict]:
+    """
+    Extract file-scope object definitions (global/static tables, structs, variables) and the
+    identifiers referenced in their initializers.
+    """
+    try:
+        all_tokens = tokenize_c_acsl(raw_code, path=path)
+    except AcslSyntaxError:
+        cleaned = re.sub(r"/\*.*?\*/", " ", raw_code, flags=re.DOTALL)
+        cleaned = re.sub(r"//[^\n]*", " ", cleaned)
+        all_tokens = tokenize_c_acsl(cleaned, path=path)
+
+    c_tokens = [t for t in all_tokens if t.kind in ("c_token", "string")]
+    macro_map = macros or {}
+    objects: list[dict] = []
+
+    n = len(c_tokens)
+    idx = 0
+    brace_depth = 0
+    paren_depth = 0
+    stmt_start = 0
+
+    while idx < n:
+        tok = c_tokens[idx]
+        text = tok.text
+
+        if text == "(":
+            paren_depth += 1
+            idx += 1
+            continue
+        if text == ")":
+            paren_depth = max(0, paren_depth - 1)
+            idx += 1
+            continue
+        if text == "}" and paren_depth == 0:
+            brace_depth = max(0, brace_depth - 1)
+            if brace_depth == 0:
+                stmt_start = idx + 1
+            idx += 1
+            continue
+
+        if text == "{" and brace_depth == 0 and paren_depth == 0:
+            header_slice = c_tokens[stmt_start:idx]
+            if (
+                len(header_slice) >= 2
+                and header_slice[-2].text == "extern"
+                and header_slice[-1].text in ('"C"', '"C++"')
+            ) or (len(header_slice) == 1 and header_slice[-1].text == "extern"):
+                stmt_start = idx + 1
+                idx += 1
+                continue
+
+            close_brace = _find_matching_forward(c_tokens, idx, "{", "}")
+            if close_brace == -1:
+                break
+
+            has_top_equals = False
+            p_depth = 0
+            for ht in header_slice:
+                if ht.text == "(":
+                    p_depth += 1
+                elif ht.text == ")":
+                    p_depth = max(0, p_depth - 1)
+                elif ht.text == "=" and p_depth == 0:
+                    has_top_equals = True
+                    break
+
+            if not has_top_equals and header_slice:
+                before_brace = _strip_trailing_attributes(c_tokens, idx, stmt_start - 1)
+                if before_brace >= stmt_start and c_tokens[before_brace].text == ")":
+                    open_params = _find_matching_backward(c_tokens, before_brace, "(", ")")
+                    if open_params > stmt_start:
+                        fn_name, _, _ = _resolve_declarator(c_tokens, stmt_start - 1, open_params, before_brace)
+                        if fn_name and _is_ident(fn_name):
+                            # Function definition: skip body and advance statement start
+                            stmt_start = close_brace + 1
+                            idx = close_brace + 1
+                            continue
+
+            # Struct/union/enum body or brace-enclosed initializer: jump past `}` and wait for `;`
+            idx = close_brace + 1
+            continue
+
+        if text == ";" and brace_depth == 0 and paren_depth == 0:
+            stmt_tokens = c_tokens[stmt_start:idx]
+            stmt_start = idx + 1
+            idx += 1
+            if not stmt_tokens:
+                continue
+            first_text = stmt_tokens[0].text
+            if first_text in ("typedef", "_Static_assert", "static_assert"):
+                continue
+
+            # Split on first top-level `=` (outside `{ ... }` and `( ... )`)
+            eq_idx = -1
+            b_d = 0
+            p_d = 0
+            for s_idx, st in enumerate(stmt_tokens):
+                if st.text == "{":
+                    b_d += 1
+                elif st.text == "}":
+                    b_d = max(0, b_d - 1)
+                elif st.text == "(":
+                    p_d += 1
+                elif st.text == ")":
+                    p_d = max(0, p_d - 1)
+                elif st.text == "=" and b_d == 0 and p_d == 0:
+                    eq_idx = s_idx
+                    break
+
+            lhs_tokens = stmt_tokens[:eq_idx] if eq_idx != -1 else stmt_tokens
+            rhs_tokens = stmt_tokens[eq_idx + 1 :] if eq_idx != -1 else []
+
+            # Strip any inline `{ ... }` body from lhs_tokens
+            lhs_outer: list[Token] = []
+            b_d = 0
+            for lt in lhs_tokens:
+                if lt.text == "{":
+                    b_d += 1
+                elif lt.text == "}":
+                    b_d = max(0, b_d - 1)
+                elif b_d == 0:
+                    lhs_outer.append(lt)
+
+            lhs_texts = [lt.text for lt in lhs_outer]
+            if eq_idx == -1:
+                if "extern" in lhs_texts:
+                    continue
+                if lhs_tokens and lhs_tokens[-1].text == "}":
+                    continue
+                # Skip function prototypes (`ret fn(params);`)
+                before_semi = _strip_trailing_attributes(lhs_outer, len(lhs_outer), -1)
+                if before_semi >= 0 and lhs_outer[before_semi].text == ")":
+                    open_p = _find_matching_backward(lhs_outer, before_semi, "(", ")")
+                    if open_p > 0 and _is_ident(lhs_outer[open_p - 1].text):
+                        continue
+
+            obj_name = _extract_declarator_ident(lhs_outer)
+            if not obj_name:
+                continue
+
+            init_refs: set[str] = set()
+            for r_idx, rt in enumerate(rhs_tokens):
+                r_txt = rt.text
+                if not _is_ident(r_txt) or r_txt in TYPE_MODIFIERS_AND_PRIMITIVES or r_txt == obj_name:
+                    continue
+                # Ignore designated initializer member names (`.field` or `->field`)
+                if r_idx >= 1 and rhs_tokens[r_idx - 1].text in (".", "->"):
+                    continue
+                if r_idx >= 2 and rhs_tokens[r_idx - 2].text == "-" and rhs_tokens[r_idx - 1].text == ">":
+                    continue
+                if r_txt in macro_map:
+                    init_refs |= {
+                        ref
+                        for ref in (macro_map[r_txt].get("ident_refs") or ())
+                        if ref not in TYPE_MODIFIERS_AND_PRIMITIVES and ref != obj_name
+                    }
+                else:
+                    init_refs.add(r_txt)
+
+            objects.append(
+                {
+                    "name": obj_name,
+                    "is_static": "static" in lhs_texts,
+                    "refs": sorted(init_refs),
+                }
+            )
+            continue
+
+        idx += 1
+
+    return objects
 
 
 def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[dict]:
@@ -603,6 +842,7 @@ def analyze_body(
     - structural security patterns (memory zeroization, formatting/serialization)
     """
     direct_callees: set[str] = set()
+    symbol_refs: set[str] = set()
     indirect_calls: list[str] = []
     self_recursive = False
     macro_loops: list[str] = []
@@ -638,12 +878,25 @@ def analyze_body(
                         has_zeroization = True
                     if m_callee in FORMAT_OR_WRITE_CALLEES:
                         uses_format_or_write = True
+            for m_ref in m_info.get("ident_refs") or ():
+                if m_ref != fn_name and m_ref not in param_names and m_ref not in TYPE_MODIFIERS_AND_PRIMITIVES:
+                    symbol_refs.add(m_ref)
             m_loops = int(m_info.get("loop_count") or 0)
             if m_loops > 0:
                 loop_count += m_loops
                 if t not in seen_loop_macros:
                     seen_loop_macros.add(t)
                     macro_loops.append(t)
+        elif (
+            _is_ident(t)
+            and t not in TYPE_MODIFIERS_AND_PRIMITIVES
+            and t != fn_name
+            and t not in param_names
+            and not (i >= 1 and body_tokens[i - 1].text in (".", "->", "goto", "struct", "union", "enum"))
+            and not (i >= 2 and body_tokens[i - 2].text == "-" and body_tokens[i - 1].text == ">")
+            and not (i + 1 < n and body_tokens[i + 1].text == ":")
+        ):
+            symbol_refs.add(t)
 
         if t == "for":
             loop_count += 1
@@ -805,6 +1058,7 @@ def analyze_body(
         "loop_count": loop_count,
         "macro_loops": macro_loops,
         "direct_callees": direct_callees,
+        "symbol_refs": symbol_refs,
         "indirect_calls": indirect_calls,
         "self_recursive": self_recursive,
         "has_backward_goto": has_backward_goto,
@@ -1199,6 +1453,46 @@ def synthesize_compile_commands(
     return out_resolved
 
 
+def _discover_header_inline_and_macros(target_dir: Path) -> tuple[dict[str, dict], dict[str, dict]]:
+    """
+    Scan in-tree `.h` files to extract `#define` macros and `static inline` / header-defined
+    helper functions so calls through header wrappers or macros resolve to their underlying
+    in-repo `.c` callees and global tables.
+    """
+    header_macros: dict[str, dict] = {}
+    header_fns_raw: dict[str, tuple[str, dict]] = {}
+    h_files: list[Path] = []
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}]
+        for fname in sorted(files):
+            if fname.endswith(".h"):
+                h_files.append((Path(root) / fname).resolve())
+
+    for h_file in h_files:
+        try:
+            rel_h = h_file.relative_to(target_dir).as_posix()
+        except ValueError:
+            rel_h = h_file.name
+        try:
+            raw = h_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        h_macros = extract_macro_definitions(raw, path=rel_h)
+        header_macros.update(h_macros)
+        for item in extract_functions_from_code(raw, path=rel_h):
+            header_fns_raw[item["name"]] = (rel_h, item)
+
+    header_inline: dict[str, dict] = {}
+    for fn_name, (_rel_h, item) in header_fns_raw.items():
+        sig_info = analyze_signature(item["decl_tokens"], item["param_tokens"])
+        body_info = analyze_body(fn_name, item["body_tokens"], sig_info, macros=header_macros)
+        header_inline[fn_name] = {
+            "callees": set(body_info["direct_callees"]),
+            "symbol_refs": set(body_info["symbol_refs"]),
+        }
+    return header_macros, header_inline
+
+
 def build_dag(
     target_dir: Path,
     compile_commands_path: Path | None = None,
@@ -1249,9 +1543,14 @@ def build_dag(
     if emit_compile_commands is not None:
         synthesize_compile_commands(target_dir, c_files, compile_flags_by_file, emit_compile_commands)
 
+    header_macros, header_inline = _discover_header_inline_and_macros(target_dir)
+
     functions: dict[str, dict] = {}
     name_collisions: list[dict] = []
     call_edges: dict[str, set[str]] = defaultdict(set)
+    symbol_edges: dict[str, set[str]] = defaultdict(set)
+    exported_objects: dict[str, dict] = {}
+    local_objects: dict[tuple[str, str], dict] = {}
     modules: dict[str, dict] = defaultdict(lambda: {"files": [], "functions": []})
 
     for c_file in sorted(set(c_files)):
@@ -1272,12 +1571,20 @@ def build_dag(
 
         raw_code = c_file.read_text(encoding="utf-8", errors="replace")
         file_macros = extract_macro_definitions(raw_code, path=rel_path)
+        effective_macros = {**header_macros, **file_macros}
+        for obj in extract_file_scope_objects(raw_code, path=rel_path, macros=effective_macros):
+            obj_rec = {"file": rel_path, "refs": set(obj["refs"])}
+            if obj["is_static"]:
+                local_objects[(rel_path, obj["name"])] = obj_rec
+            else:
+                exported_objects[obj["name"]] = obj_rec
+
         extracted = extract_functions_from_code(raw_code, path=rel_path)
 
         for item in extracted:
             fn_name = item["name"]
             sig_info = analyze_signature(item["decl_tokens"], item["param_tokens"])
-            body_info = analyze_body(fn_name, item["body_tokens"], sig_info, macros=file_macros)
+            body_info = analyze_body(fn_name, item["body_tokens"], sig_info, macros=effective_macros)
 
             if fn_name in DISAMBIGUATE_COLLISION_NAMES:
                 if fn_name in functions and functions[fn_name]["file"] != rel_path:
@@ -1292,6 +1599,8 @@ def build_dag(
                         modules[ex_mod]["functions"][ex_idx] = existing_key
                     if fn_name in call_edges:
                         call_edges[existing_key] = call_edges.pop(fn_name)
+                    if fn_name in symbol_edges:
+                        symbol_edges[existing_key] = symbol_edges.pop(fn_name)
                     fn_key = f"{rel_path}#{fn_name}"
                 elif any(
                     k == f"{rel_path}#{fn_name}" or (k.endswith(f"#{fn_name}") and functions[k].get("name") == fn_name)
@@ -1345,13 +1654,64 @@ def build_dag(
                 "cppflags": compile_flags_by_file.get(rel_path, []),
             }
             call_edges[fn_key] = set(body_info["direct_callees"])
+            symbol_edges[fn_key] = set(body_info["symbol_refs"])
             if fn_key not in modules[module_name]["functions"]:
                 modules[module_name]["functions"].append(fn_key)
+
+    all_fns = set(functions.keys())
+    fn_object_files: dict[str, set[str]] = defaultdict(set)
+
+    def _resolve_symbol_closure(start_syms: set[str], start_file: str | None) -> tuple[set[str], set[str]]:
+        """
+        Expand `start_syms` transitively through in-tree header `static inline` functions,
+        file-local (`static`) object initializers, and exported global object initializers.
+        Returns `(reached_in_repo_functions, reached_object_files)`.
+        """
+        reached_fns: set[str] = set()
+        reached_files: set[str] = set()
+        visited_inline: set[str] = set()
+        visited_local: set[tuple[str, str]] = set()
+        visited_exported: set[str] = set()
+        queue: list[tuple[str, str | None]] = [(s, start_file) for s in sorted(start_syms)]
+        while queue:
+            sym, cur_file = queue.pop(0)
+            if sym in all_fns:
+                reached_fns.add(sym)
+            if sym in header_inline and sym not in visited_inline:
+                visited_inline.add(sym)
+                h_info = header_inline[sym]
+                for nxt in sorted(h_info["callees"] | h_info["symbol_refs"]):
+                    queue.append((nxt, cur_file))
+            if cur_file and (cur_file, sym) in local_objects and (cur_file, sym) not in visited_local:
+                visited_local.add((cur_file, sym))
+                l_info = local_objects[(cur_file, sym)]
+                for nxt in sorted(l_info["refs"]):
+                    queue.append((nxt, cur_file))
+            elif sym in exported_objects and sym not in visited_exported:
+                visited_exported.add(sym)
+                e_info = exported_objects[sym]
+                obj_file = e_info["file"]
+                reached_files.add(obj_file)
+                for nxt in sorted(e_info["refs"]):
+                    queue.append((nxt, obj_file))
+        return reached_fns, reached_files
+
+    header_inline_callees: dict[str, list[str]] = {}
+    for h_name, h_info in sorted(header_inline.items()):
+        r_fns, _ = _resolve_symbol_closure(h_info["callees"] | h_info["symbol_refs"], None)
+        if r_fns:
+            header_inline_callees[h_name] = sorted(r_fns)
+
+    for fn_key in sorted(all_fns):
+        fn_file = functions[fn_key]["file"]
+        r_fns, r_files = _resolve_symbol_closure(call_edges[fn_key] | symbol_edges[fn_key], fn_file)
+        # Replace calls to in-tree header inline wrappers with their resolved in-repo `.c` targets
+        call_edges[fn_key] = (call_edges[fn_key] - set(header_inline.keys())) | (r_fns - {fn_key})
+        fn_object_files[fn_key] |= r_files
 
     waves, cycles = compute_topological_waves(functions, call_edges)
     recursive_fns = {fn for scc in cycles for fn in scc}
 
-    all_fns = set(functions.keys())
     for wave_idx, wave_fns in enumerate(waves):
         for fn in wave_fns:
             fn_rec = functions[fn]
@@ -1411,12 +1771,21 @@ def build_dag(
 
         closure_fns: set[str] = set(mod_fns)
         worklist: list[str] = list(mod_fns)
+        visited_obj_files: set[str] = set()
         while worklist:
             cur_fn = worklist.pop(0)
             for callee in functions.get(cur_fn, {}).get("internal_callees", []):
                 if callee not in closure_fns and callee in functions:
                     closure_fns.add(callee)
                     worklist.append(callee)
+            for obj_file in sorted(fn_object_files.get(cur_fn, set())):
+                if obj_file in files_with_main_or_harness or obj_file in visited_obj_files:
+                    continue
+                visited_obj_files.add(obj_file)
+                for fn_k, fn_rec in functions.items():
+                    if fn_rec["file"] == obj_file and fn_k not in closure_fns:
+                        closure_fns.add(fn_k)
+                        worklist.append(fn_k)
 
         cross_module_callees = sorted(
             f
@@ -1427,6 +1796,12 @@ def build_dag(
             and functions[f].get("name") != "main"
             and functions[f].get("name") not in HARNESS_ENTRYPOINT_NAMES
         )
+        object_dep_files = {
+            obj_file
+            for f in closure_fns
+            for obj_file in fn_object_files.get(f, set())
+            if obj_file not in files_with_main_or_harness
+        }
         required_sources = sorted(
             mod_effective_files
             | {
@@ -1434,6 +1809,7 @@ def build_dag(
                 for f in cross_module_callees
                 if f in functions and functions[f]["file"] not in files_with_main_or_harness
             }
+            | object_dep_files
         )
         unresolved_external_callees = sorted(
             {ext for f in mod_fns if f in functions for ext in functions[f].get("external_callees", [])}
@@ -1466,6 +1842,7 @@ def build_dag(
         "total_functions": len(functions),
         "total_waves": len(waves),
         "name_collisions": name_collisions,
+        "header_inline_callees": header_inline_callees,
         "modules": module_summaries,
         "waves": [{"wave": idx, "count": len(w), "functions": w} for idx, w in enumerate(waves)],
         "recursion_cycles": cycles,
