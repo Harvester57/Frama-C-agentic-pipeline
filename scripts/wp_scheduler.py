@@ -495,6 +495,10 @@ class Ctx:
     def __init__(self) -> None:
         dag = load_json_optional(DAG_PATH, {})
         self.dag: dict = dag if isinstance(dag, dict) else {}
+        meta = load_json_optional(Path("run-metadata.json"), {}) or {}
+        self.profile: str = (
+            str(meta.get("profile") or "standard").strip().lower() if isinstance(meta, dict) else "standard"
+        )
         self.units, self.candidates = ledger.load_state()
         self.modules: dict[str, dict] = {
             str(k): v for k, v in (self.dag.get("modules") or {}).items() if isinstance(v, dict)
@@ -696,6 +700,34 @@ class Ctx:
         file, name = key.rsplit("#", 1)
         return (self.defs.get(name) or {}).get(file) or self.file_module.get(file, "")
 
+    def quick_entry_chain(self, planned: list[tuple[str, str]]) -> set[tuple[str, str]]:
+        """
+        Under `--profile quick`, WP restricts prove tasks to Tier 1A entry functions and their
+        transitive callees (docs/v2-design.md Section 9). If no Tier 1A function exists in the
+        run, all `planned` functions remain eligible so `quick` is never vacuous.
+        """
+        all_fns = set(self.units_by_fn) | set(self.dag_by_key)
+        seeds: list[tuple[str, str]] = []
+        for file, fn in sorted(all_fns):
+            fn_units = self.fn_units(file, fn)
+            mod = next((u["module"] for u in fn_units if u.get("module")), None) or self.file_module.get(file, "")
+            tier = next((str(u["tier"]) for u in fn_units if u.get("tier")), "") or self.tier(str(mod))
+            if tier.startswith("Tier 1A"):
+                seeds.append((file, fn))
+        if not seeds:
+            return set(planned)
+        reachable: set[tuple[str, str]] = set(seeds)
+        queue = list(seeds)
+        while queue:
+            cur_file, cur_fn = queue.pop()
+            for callee in self.callees(cur_file, cur_fn):
+                for cfile, cname, _cmod in self.resolve(callee, cur_file):
+                    pair = (cfile, cname)
+                    if pair not in reachable:
+                        reachable.add(pair)
+                        queue.append(pair)
+        return set(planned) & reachable
+
 
 # ---------------------------------------------------------------------------
 # Graph: synchronisation with the ledger, dependencies, recursion groups, priorities
@@ -810,6 +842,9 @@ def _sync(state: dict, ctx: Ctx) -> dict:
     open_verify = {t["fingerprint"] for t in tasks.values() if t["kind"] == "verify" and t["state"] not in TERMINAL}
 
     planned = sorted({(norm_path(u["file"]), u["function"]) for u in ctx.units.values() if u["status"] == "planned"})
+    if ctx.profile == "quick":
+        allowed_quick = ctx.quick_entry_chain(planned)
+        planned = [pair for pair in planned if pair in allowed_quick]
     for file, fn in planned:
         tid = f"prove:{file}#{fn}"
         task = tasks.get(tid)

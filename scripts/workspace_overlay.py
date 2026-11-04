@@ -639,7 +639,19 @@ def _run_parent_reverify(
     if module and sources:
         harness = overlay_dir / "harnesses" / f"harness_{module}.c"
         corpus = overlay_dir / "corpus" / module
-        build_tag_items = [list(sources), cppflags, ldflags]
+        # The parent re-check must use the same reduced checks as the module's build:
+        # a module fuzzed with -no-rte-initialized would otherwise re-trip the E-ACSL
+        # by-value-struct initialization artifact here and be misread as code_fault.
+        rte_initialized = True
+        try:
+            import pipeline_make  # imported lazily; the overlay also works without the Make layer
+
+            _plan = pipeline_make.build_plan(run_dir)
+            _eff = pipeline_make.effective_params(pipeline_make.load_params(run_dir), module, _plan.profile)
+            rte_initialized = bool(_eff.get("fuzz_rte_initialized", True))
+        except Exception:
+            rte_initialized = True
+        build_tag_items = [list(sources), cppflags, ldflags, rte_initialized]
         if function:
             build_tag_items.append(function)
         build_tag = hashlib.sha256(json.dumps(build_tag_items).encode()).hexdigest()[:10]
@@ -675,6 +687,8 @@ def _run_parent_reverify(
         ]
         if function:
             cmd.extend(["--functions", function])
+        if not rte_initialized:
+            cmd.append("--no-rte-initialized")
         if ldflags:
             cmd.append(f"--ldflags={ldflags}")
         proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -716,6 +730,7 @@ def _run_parent_reverify(
             str(wp_par) if wp_par else "auto",
             *wp_extra_flags,
             "--sarif",
+            "--ignore-prover-budget",
             "--out-json",
             str(wp_json),
         ]
@@ -1694,6 +1709,8 @@ def prepare_agent(
     if role == "prover":
         if max_retries == 4 and (profile == "quick" or verifiability == "shell_unverifiable_wp"):
             effective_max_retries = 2
+        elif max_retries == 4 and profile == "deep":
+            effective_max_retries = 6
         env_wall = (os.environ.get("FRAMAC_PROVER_WALL_BUDGET_S") or "").strip()
         if env_wall.isdigit() and int(env_wall) > 0:
             max_wall_clock_s = int(env_wall)

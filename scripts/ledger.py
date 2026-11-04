@@ -291,12 +291,26 @@ def units_for_function(units: dict[str, dict], file: str, function: str) -> list
 
 # --------------------------------------------------------------------- seed
 
+VALID_PROFILES = ("quick", "standard", "deep")
+
+
+def _resolve_seed_profile(profile: str | None, dag_path: Path) -> str:
+    if profile in VALID_PROFILES:
+        return profile
+    for cand in (Path("run-metadata.json"), dag_path.parent.parent.parent / "run-metadata.json"):
+        if cand.is_file():
+            meta = load_json_optional(cand, {})
+            if isinstance(meta, dict) and meta.get("profile") in VALID_PROFILES:
+                return str(meta["profile"])
+    return "standard"
+
 
 @ledger_locked
-def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str) -> dict:
+def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: str | None = None) -> dict:
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
     modules = dag.get("modules", {})
+    resolved_profile = _resolve_seed_profile(profile, dag_path)
     added, skipped = 0, []
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
         name = fn.get("name", fn_name)
@@ -305,7 +319,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str) -> dict:
             skipped.append(f"{file}#{name}")
             continue
         module = fn.get("module") or "unknown"
-        tier = modules.get(module, {}).get("tier", "unclassified")
+        tier = modules.get(module, {}).get("tier") or fn.get("tier") or "unclassified"
         wave = fn.get("wave")
         in_scope = not scope or any(file == s.rstrip("/") or file.startswith(s.rstrip("/") + "/") for s in scope)
 
@@ -334,7 +348,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str) -> dict:
                     ["outside requested scope_paths"],
                     reason,
                 )
-            elif tier.startswith("Tier 3"):
+            elif tier.startswith("NO_TOUCH"):
                 unit = new_unit(
                     file,
                     name,
@@ -343,10 +357,39 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str) -> dict:
                     tier,
                     wave,
                     callgraph_source,
-                    "deferred",
-                    ["tier3_not_scheduled: no harness is generated for Tier 3 modules in this profile"],
+                    "out_of_scope",
+                    ["no_touch_tier: excluded by risk tier classification"],
                     reason,
                 )
+            elif tier.startswith("Tier 3"):
+                if resolved_profile == "deep" and cls == "rte":
+                    unit = new_unit(file, name, cls, module, tier, wave, callgraph_source, "planned", None, reason)
+                elif resolved_profile == "deep":
+                    unit = new_unit(
+                        file,
+                        name,
+                        cls,
+                        module,
+                        tier,
+                        wave,
+                        callgraph_source,
+                        "deferred",
+                        ["tier3_not_scheduled: Layers 2-6 are not scheduled for Tier 3 modules in deep profile"],
+                        reason,
+                    )
+                else:
+                    unit = new_unit(
+                        file,
+                        name,
+                        cls,
+                        module,
+                        tier,
+                        wave,
+                        callgraph_source,
+                        "deferred",
+                        ["tier3_not_scheduled: no harness is generated for Tier 3 modules in this profile"],
+                        reason,
+                    )
             else:
                 unit = new_unit(file, name, cls, module, tier, wave, callgraph_source, "planned", None, reason)
             if fn.get("verifiability") or fn.get("wp_blockers") or fn.get("wp_notes"):
@@ -631,6 +674,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 if isinstance(item, dict) and item.get("function"):
                     props_by_fn.setdefault(str(item["function"]), []).append(item)
         with_props = set(report.get("functions_with_properties", []))
+        reduced_checks = [str(x) for x in (report.get("reduced_checks") or []) if str(x).strip()]
 
         for u in rte_units:
             fn = u["function"]
@@ -696,6 +740,12 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     f"{len(unit_unknowns)} RTE obligation(s) remain Unknown; queued for WP.",
                 )
             elif has_props and not unit_deads:
+                summary_msg = "Every RTE obligation in this function is Valid under Eva."
+                if reduced_checks:
+                    summary_msg = (
+                        f"Every RTE obligation in this function is Valid under Eva "
+                        f"(reduced_checks: {', '.join(reduced_checks)})."
+                    )
                 add_evidence(
                     u,
                     "eva",
@@ -703,13 +753,20 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "eva_all_valid",
                     True,
                     tool_output,
-                    "Every RTE obligation in this function is Valid under Eva.",
+                    summary_msg,
                 )
                 add_assumption(
                     u,
                     "boundary_assumption",
                     f"Eva result holds for calling contexts reachable from eva_main of module '{module}'.",
                 )
+                if reduced_checks:
+                    add_assumption(
+                        u,
+                        "boundary_assumption",
+                        f"Eva slice '{module}' ran with reduced checks ({', '.join(reduced_checks)}); "
+                        "recursive or missing assigns specifications were treated as warnings.",
+                    )
                 if u["status"] in ("planned", "blocked"):
                     u["status"] = "covered"
                     u["unresolved"] = []
@@ -734,6 +791,44 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     tool_output,
                     "Eva reported no property for this function (trivial or not reached).",
                 )
+
+        # Ingest cross-module Invalid alarms when a slice compiles sibling source files.
+        cross_rte_units = [
+            u
+            for u in units.values()
+            if u["obligation_class"] == "rte" and u["module"] != module and u["status"] not in NO_TOUCH
+        ]
+        for u in cross_rte_units:
+            fn = u["function"]
+            u_file = u["file"]
+            cross_invalids = [a for a in invalid_by_fn.get(fn, []) if _alarm_in_file(a, u_file)]
+            for alarm in cross_invalids:
+                fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
+                upsert_candidate(
+                    candidates,
+                    fp,
+                    "eva",
+                    "needs_validation",
+                    u["module"] or module,
+                    {"file": normalize_file(u_file), "line": int(alarm.get("line") or 0), "function": fn},
+                    {"kind": alarm.get("kind") or "assertion", "predicate": alarm.get("annotation", "")},
+                    [],
+                    tool_output,
+                    [u["coverage_id"]],
+                    f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
+                )
+                add_evidence(
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_invalid",
+                    False,
+                    tool_output,
+                    f"Eva slice '{module}' reports Invalid at line {alarm.get('line')}: "
+                    f"{alarm.get('annotation', '')[:200] or alarm.get('kind', '')}",
+                )
+                mark_candidate(u, fp)
+                stats["candidates"] += 1
     commit(units, candidates)
     return stats
 
@@ -1916,6 +2011,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
     p.add_argument("--scope", action="append", default=[])
     p.add_argument("--callgraph-source", choices=["frama_c", "regex"], default="regex")
+    p.add_argument("--profile", choices=["quick", "standard", "deep"], default=None)
     for name in ("ingest-fuzz", "ingest-eva", "ingest-wp"):
         p = sub.add_parser(name)
         p.add_argument("reports", nargs="+", type=Path)
@@ -1967,7 +2063,7 @@ def main(argv: list[str] | None = None) -> int:
     out: object
     try:
         if args.cmd == "seed":
-            out = cmd_seed(args.dag, args.scope, args.callgraph_source)
+            out = cmd_seed(args.dag, args.scope, args.callgraph_source, args.profile)
         elif args.cmd == "ingest-fuzz":
             out = cmd_ingest_fuzz(args.reports)
         elif args.cmd == "ingest-eva":

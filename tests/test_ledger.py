@@ -652,3 +652,116 @@ def test_status_subcommand_alias(run_dir, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["units"] == 6
+
+
+def test_seed_deep_profile_schedules_tier3_rte_and_defers_tier3_layers(run_dir):
+    dag = {
+        **DAG,
+        "functions": {
+            **DAG["functions"],
+            "glue_init": {
+                **DAG["functions"]["glue_init"],
+                "has_loops": True,
+                "security_properties": [{"layer": 2, "reason": "loops"}],
+            },
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    write_json(
+        run_dir / "run-metadata.json",
+        {
+            "schema_version": 1,
+            "run_id": "run-deep",
+            "repo": "test",
+            "profile": "deep",
+            "run_status": "in_progress",
+            "incomplete_reason": None,
+            "scope_paths": [],
+        },
+    )
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    units = units_by_id(run_dir)
+    assert units["src/glue/init.c#glue_init::rte"]["status"] == "planned"
+    assert units["src/glue/init.c#glue_init::rte"]["unresolved"] == []
+    assert units["src/glue/init.c#glue_init::l2_termination"]["status"] == "deferred"
+    assert "deep profile" in units["src/glue/init.c#glue_init::l2_termination"]["unresolved"][0]
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_eva_cross_module_invalid_alarm_and_reduced_checks(run_dir):
+    dag = {
+        "callgraph_source": "regex",
+        "modules": {
+            "example": {"tier": "Tier 1B (Structured Packet / Buffer Emitter)"},
+            "ieee754": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"},
+        },
+        "functions": {
+            "RunTests": {
+                "name": "RunTests",
+                "file": "example.c",
+                "module": "example",
+                "wave": 1,
+                "has_loops": False,
+                "security_properties": [],
+            },
+            "IEEE754_DoubleToSingle": {
+                "name": "IEEE754_DoubleToSingle",
+                "file": "src/ieee754.c",
+                "module": "ieee754",
+                "wave": 0,
+                "has_loops": False,
+                "security_properties": [],
+            },
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+
+    rep = {
+        "status": "ok",
+        "module": "example",
+        "sources": [
+            "workspace/work/src/ieee754.c",
+            "workspace/work/example.c",
+            "workspace/harnesses/harness_example.c",
+        ],
+        "reduced_checks": ["-eva-warn-key assigns:missing=warning"],
+        "unknown_obligations_by_function": {},
+        "invalid_alarms": [
+            {
+                "directory": "workspace/work/src",
+                "file": "ieee754.c",
+                "function": "IEEE754_DoubleToSingle",
+                "line": 666,
+                "kind": "shift",
+                "annotation": "shift: 0 <= nShiftAmount < 64",
+            }
+        ],
+        "dead_alarms": [],
+        "assumed_properties": [],
+        "functions_with_properties": ["RunTests", "IEEE754_DoubleToSingle"],
+        "functions_with_properties_by_file": {
+            "workspace/work/example.c": ["RunTests"],
+            "workspace/work/src/ieee754.c": ["IEEE754_DoubleToSingle"],
+        },
+    }
+    write_json(run_dir / "workspace/reports/eva/example.json", rep)
+    out = L.cmd_ingest_eva([run_dir / "workspace/reports/eva/example.json"])
+    assert out == {"reports": 1, "covered": 1, "candidates": 1}
+
+    by_id = units_by_id(run_dir)
+    ex_u = by_id["example.c#RunTests::rte"]
+    assert ex_u["status"] == "covered"
+    assert "assigns:missing=warning" in ex_u["evidence"][-1]["summary"]
+    assert any("assigns:missing=warning" in a["description"] for a in ex_u["assumptions"])
+
+    ieee_u = by_id["src/ieee754.c#IEEE754_DoubleToSingle::rte"]
+    assert ieee_u["status"] == "candidate"
+    assert len(ieee_u["result_fingerprints"]) == 1
+    cands = load(run_dir / "candidates.json")
+    assert len(cands) == 1
+    assert cands[0]["module"] == "ieee754"
+    assert cands[0]["location"]["file"] == "src/ieee754.c"
+    assert cands[0]["location"]["function"] == "IEEE754_DoubleToSingle"
+    assert cands[0]["linked_units"] == ["src/ieee754.c#IEEE754_DoubleToSingle::rte"]
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []

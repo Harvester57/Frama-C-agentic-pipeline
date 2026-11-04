@@ -1303,3 +1303,44 @@ def test_stalled_prover_with_sound_contract_triggers_partial_merge(sim, monkeypa
     assert t_callee["state"] == "blocked"
     assert t_callee.get("partial_contract_merged") is True
     assert "prove:src/m/p.c#caller" in ready()
+
+
+def test_deep_and_quick_profile_scheduling(sim):
+    """Under deep profile, Tier 3 rte units are scheduled; under quick profile, only Tier 1A entry chains are scheduled."""
+    tier3 = "Tier 3 (Internal State / Glue Module)"
+    tier1b = "Tier 1B (Structured Packet / Buffer Emitter)"
+    functions = {
+        "entry_parse": ("src/p/parse.c", "parser", ["glue_helper"]),
+        "glue_helper": ("src/g/glue.c", "glue", []),
+        "emit_pkt": ("src/e/emit.c", "emitter", []),
+    }
+    custom_units = [
+        unit("src/p/parse.c", "entry_parse", "rte", module="parser", tier=TIER1),
+        unit("src/g/glue.c", "glue_helper", "rte", module="glue", tier=tier3, status="planned"),
+        unit("src/e/emit.c", "emit_pkt", "rte", module="emitter", tier=tier1b, status="planned"),
+    ]
+    sim.build(
+        functions,
+        units=custom_units,
+        modules={
+            "parser": {"tier": TIER1},
+            "glue": {"tier": tier3, "run_eva": False, "run_eacsl_fuzz": False},
+            "emitter": {"tier": tier1b},
+        },
+    )
+
+    # 1. Quick profile: schedules entry_parse (Tier 1A) and its callee glue_helper, skips unrelated Tier 1B emit_pkt.
+    write_json(sim.run_dir / "run-metadata.json", {"profile": "quick"})
+    S.cmd_init()
+    quick_tasks = tasks()
+    assert "prove:src/p/parse.c#entry_parse" in quick_tasks
+    assert "prove:src/g/glue.c#glue_helper" in quick_tasks
+    assert "prove:src/e/emit.c#emit_pkt" not in quick_tasks
+    assert "prove:src/g/glue.c#glue_helper" in ready()
+
+    # 2. Deep profile: schedules all planned units including emit_pkt and Tier 3 glue_helper.
+    write_json(sim.run_dir / "run-metadata.json", {"profile": "deep"})
+    S.cmd_init()
+    deep_tasks = tasks()
+    assert "prove:src/e/emit.c#emit_pkt" in deep_tasks
+    assert "prove:src/g/glue.c#glue_helper" in deep_tasks

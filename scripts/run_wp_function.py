@@ -827,6 +827,7 @@ def run_wp_on_function(
     sarif: bool = False,
     keep_goals: bool = False,
     wp_blockers: list[str] | None = None,
+    ignore_prover_budget: bool = False,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     par = resolve_wp_par(wp_par)
@@ -923,7 +924,7 @@ def run_wp_on_function(
             }
             return variadic_res
 
-        if scratch_dir is not None:
+        if scratch_dir is not None and not ignore_prover_budget:
             budget_path = scratch_dir / ".prover_budget.json"
             if budget_path.is_file():
                 try:
@@ -1567,6 +1568,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sarif", action="store_true", help="Also save the project (-save) and export SARIF")
     parser.add_argument("--keep-goals", action="store_true", help="Keep WP's goal files (-wp-out) under --out-dir")
     parser.add_argument(
+        "--ignore-prover-budget",
+        action="store_true",
+        help=(
+            "Do not read/enforce agents/<id>/scratch/.prover_budget.json. Parent re-checks on the "
+            "merged tree use this so an exhausted agent budget cannot mask an all-proven result."
+        ),
+    )
+    parser.add_argument(
         "--wp-blockers",
         nargs="*",
         default=None,
@@ -1609,6 +1618,7 @@ def main(argv: list[str] | None = None) -> int:
         sarif=args.sarif,
         keep_goals=args.keep_goals,
         wp_blockers=args.wp_blockers,
+        ignore_prover_budget=args.ignore_prover_budget,
     )
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")

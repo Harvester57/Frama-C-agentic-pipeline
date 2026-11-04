@@ -73,7 +73,7 @@ Read `workspace/reports/callgraph_dag.json` and review the structural classifica
 | **Tier 1A** | Untrusted Binary / Buffer Parser (`const uint8_t*/char*` + `size_t` reader with loops and no heap allocation) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layers 1-6) |
 | **Tier 1B** | Structured Packet / Buffer Emitter (mutable output buffer + capacity writer or formatting calls) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layer 5 Sanitization) |
 | **Tier 2** | Recursive or Heap-Allocating Module (`recursion_cycles` or `malloc`/`calloc`/`realloc`/`free` in call tree) | Phase 1 (`E-ACSL + Fuzz` with dictionary) + Phase 2 (`Eva`) + WP on non-allocating validators |
-| **Tier 3** | Internal Glue & State Machines | Seeded `deferred` in the ledger; spot `Eva` / on-demand `WP` only when explicitly scheduled |
+| **Tier 3** | Internal Glue & State Machines | Seeded `deferred` in `quick`/`standard` profiles; `rte` units seeded `planned` for WP in `deep` profile |
 
 ---
 
@@ -130,7 +130,7 @@ The harness must respect the entry function's declared or documented contract (b
 ## Step 5 — Seed the Coverage Ledger and Checkpoint
 
 ```text
-python3 /opt/framac-pipeline/scripts/ledger.py seed --dag workspace/reports/callgraph_dag.json [--scope <repo-relative path>]...
+python3 /opt/framac-pipeline/scripts/ledger.py seed --dag workspace/reports/callgraph_dag.json [--profile <quick|standard|deep>] [--scope <repo-relative path>]...
 python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
 python3 /opt/framac-pipeline/scripts/checkpoint.py init state --target /target
 python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json

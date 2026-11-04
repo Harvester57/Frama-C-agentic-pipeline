@@ -359,3 +359,28 @@ def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypat
         {"unproven_by_bucket": {"step_a_assigns": [{"line": 447, "status": "Unknown", "annotation": "assigns *p"}]}}
     )
     assert not WO.assigns_verified_for_partial_merge({"assigns_vcs_proven": False, "unproven_by_bucket": {}})
+
+
+def test_prepare_agent_scales_max_retries_by_profile(tmp_path):
+    target = tmp_path / "target"
+    src = target / "src"
+    src.mkdir(parents=True)
+    (src / "m.c").write_text("int f(int x) { return x; }\n", encoding="utf-8")
+
+    for profile, expected_retries, expected_wall in (("quick", 2, 300), ("standard", 4, 900), ("deep", 6, 1800)):
+        run_dir = tmp_path / f"run_{profile}"
+        WO.init_overlay(target, run_dir / "workspace")
+        (run_dir / "run-metadata.json").write_text(json.dumps({"profile": profile}), encoding="utf-8")
+        WO.prepare_agent(
+            run_dir=run_dir,
+            agent_id=f"prove-f-{profile}",
+            role="prover",
+            c_file="src/m.c",
+            function="f",
+        )
+        budget = json.loads(
+            (run_dir / "agents" / f"prove-f-{profile}" / "scratch" / ".prover_budget.json").read_text(encoding="utf-8")
+        )
+        assert budget["max_retries"] == expected_retries
+        assert budget["max_wp_invocations"] == expected_retries + 2
+        assert budget["max_wall_clock_s"] == expected_wall
