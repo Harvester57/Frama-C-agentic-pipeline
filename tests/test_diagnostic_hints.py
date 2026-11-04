@@ -148,6 +148,24 @@ def test_eacsl_hints_clean_and_failure_modes() -> None:
     comp_hints = derive_eacsl_diagnostic_hints(comp_err)
     assert any("bounded integer quantifications" in h for h in comp_hints)
     assert any("unsupported ACSL construct" in h for h in comp_hints)
+    assert any("field-by-field scalar comparisons" in h for h in comp_hints)
+
+    annot_rte_over = {
+        "status": "rejected_overconstrained",
+        "annotation_rte": True,
+        "failure": {
+            "file": "parser.c",
+            "line": 18,
+            "function": "parse_msg",
+            "kind": "rte",
+            "annotation_rte": True,
+            "label": "rte",
+            "predicate": "division_by_zero: denom != 0 && \\initialized(out_hdr)",
+        },
+    }
+    annot_rte_hints = derive_eacsl_diagnostic_hints(annot_rte_over)
+    assert any("3-valued partial logic" in h for h in annot_rte_hints)
+    assert any("flat shadow memory" in h and "\\initialized(&p->field)" in h for h in annot_rte_hints)
 
 
 def test_brief_templates_synced_and_render_cleanly(tmp_path: Path) -> None:

@@ -177,6 +177,75 @@ def test_guardrail_separates_code_faults_from_overconstrained_contracts():
     assert classify_guardrail(1, False, "segfault")["status"] == "guardrail_error"
 
 
+def test_guardrail_classifies_annotation_rte_and_alarm_labeled_contracts(tmp_path):
+    # 1. E-ACSL runtime error inside an ACSL annotation (Error: RTE failed / RTE failed at line ...)
+    annot_rte_new = (
+        "rte.i: In function 'is_dividable'\n"
+        "rte.i:5: Error: RTE failed:\n"
+        "\tThe failing predicate is:\n"
+        "\trte: division_by_zero: y != 0.\n"
+    )
+    f_new = parse_eacsl_failure(annot_rte_new)
+    assert f_new is not None
+    assert f_new["kind"] == "rte"
+    assert f_new["is_rte"] is False
+    assert f_new.get("annotation_rte") is True
+    res_new = classify_guardrail(1, False, annot_rte_new)
+    assert res_new["status"] == "rejected_overconstrained"
+    assert res_new.get("annotation_rte") is True
+
+    annot_rte_old = (
+        "RTE failed at line 5 in function is_dividable.\nThe failing predicate is:\nrte: division_by_zero: y != 0.\n"
+    )
+    f_old = parse_eacsl_failure(annot_rte_old)
+    assert f_old is not None
+    assert f_old["kind"] == "rte" and not f_old["is_rte"] and f_old.get("annotation_rte") is True
+    res_old = classify_guardrail(1, False, annot_rte_old)
+    assert res_old["status"] == "rejected_overconstrained"
+    assert res_old.get("annotation_rte") is True
+
+    # 2. Precondition / loop invariant whose label or predicate matches KNOWN_ALARM_KINDS
+    # (e.g. valid_string, separation, index_bound) must NOT be misclassified as code_fault
+    pre_alarm_label = (
+        "src/str.c: In function 'parse_name'\n"
+        "src/str.c:12: Error: Precondition failed:\n"
+        "\tThe failing predicate is:\n"
+        "\tvalid_string:\n"
+        "\t\tvalid_read_string(s).\n"
+    )
+    f_pre = parse_eacsl_failure(pre_alarm_label)
+    assert f_pre is not None
+    assert f_pre["kind"] == "precondition"
+    assert f_pre["alarm_kind"] == "valid_string"
+    assert f_pre["is_rte"] is False
+    assert classify_guardrail(1, False, pre_alarm_label)["status"] == "rejected_overconstrained"
+
+    # 3. Source-line disambiguation: Assertion failed on an ACSL-only line vs executable C line
+    src_file = tmp_path / "mod.c"
+    src_file.write_text(
+        "int check(const int *p, int i) {\n    /*@ assert mem_access: \\valid_read(p + i); */\n    return p[i];\n}\n",
+        encoding="utf-8",
+    )
+    acsl_line_out = (
+        f"{src_file.as_posix()}: In function 'check'\n"
+        f"{src_file.as_posix()}:2: Error: Assertion failed:\n"
+        "\tThe failing predicate is:\n"
+        "\tmem_access: \\valid_read(p + i).\n"
+    )
+    c_line_out = (
+        f"{src_file.as_posix()}: In function 'check'\n"
+        f"{src_file.as_posix()}:3: Error: Assertion failed:\n"
+        "\tThe failing predicate is:\n"
+        "\tmem_access: \\valid_read(p + i).\n"
+    )
+    res_acsl_line = classify_guardrail(1, False, acsl_line_out)
+    assert res_acsl_line["status"] == "rejected_overconstrained"
+    assert res_acsl_line.get("annotation_rte") is True
+
+    res_c_line = classify_guardrail(1, False, c_line_out)
+    assert res_c_line["status"] == "code_fault"
+
+
 def test_guardrail_classifies_unsound_verdicts():
     # When returncode == 0, unsound verdict warning must NOT pass the guardrail
     ok_unsound = "Warning: no sound verdict for Assertion (guess: ok).\nDone."

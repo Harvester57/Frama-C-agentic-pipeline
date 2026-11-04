@@ -57,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+from acsl_ast import tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
@@ -136,14 +137,15 @@ ARTIFACT_KINDS = (
 #           rte/index_bound:
 #               i < 8.
 #           With values at failure point:
-_FN_RE = re.compile(r"(?P<file>[^\s:'\"]+\.[ch]):\s*In function '(?P<function>[^']+)'")
+_FN_RE = re.compile(r"(?P<file>[^\s:'\"]+(?:\.[chi]|\.acsl)):\s*In function '(?P<function>[^']+)'")
 _ERR_RE = re.compile(
-    r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?", re.IGNORECASE
+    r"(?P<file>[^\s:'\"]+(?:\.[chi]|\.acsl)):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?",
+    re.IGNORECASE,
 )
 # Older style: "Assertion failed at line 42 in file foo.c." / "... in function parse."
 _OLD_RE = re.compile(
     r"(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed at line (?P<line>\d+)"
-    r"(?:\s+in\s+file\s+(?P<file>[^\s]+?\.[ch]))?(?:\s+in\s+function\s+(?P<function>\w+))?",
+    r"(?:\s+in\s+file\s+(?P<file>[^\s]+?(?:\.[chi]|\.acsl)))?(?:\s+in\s+function\s+(?P<function>\w+))?",
     re.IGNORECASE,
 )
 _PRED_HEAD_RE = re.compile(r"The failing predicate is:[ \t]*", re.IGNORECASE)
@@ -258,10 +260,10 @@ def _decode(data) -> str:
     return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
 
 
-def _resolve_function_at_line(file_path: str, line: int) -> str:
-    """Resolve the enclosing C function at `file_path:line` using token-based span extraction."""
-    if not file_path or line <= 0:
-        return "unknown_function"
+def _resolve_source_candidates(file_path: str) -> list[Path]:
+    """Return existing source file paths matching `file_path` in the workspace or current directory."""
+    if not file_path:
+        return []
     norm = normalize_file(file_path)
     candidates: list[Path] = []
     for cand in (
@@ -277,7 +279,47 @@ def _resolve_function_at_line(file_path: str, line: int) -> str:
         matches = list(Path("workspace/work").rglob(bname))
         if len(matches) == 1:
             candidates.append(matches[0])
-    for cpath in candidates:
+    return candidates
+
+
+def _is_acsl_annotation_line(file_path: str, line: int) -> bool:
+    """
+    True if `file_path:line` resolves to a source line containing only ACSL annotations
+    (`/*@ ... */` or `//@ ...`) and no executable C tokens.
+
+    Frama-C `-rte` attaches synthesized runtime assertions in-memory to executable C AST
+    statements without modifying the source file on disk, so a true C-code RTE always points
+    to a line with executable C tokens, whereas a user/agent-written `/*@ assert ... */` or
+    contract clause points to an ACSL annotation line (or an `.acsl` specification file).
+    """
+    if not file_path or line <= 0:
+        return False
+    if file_path.lower().endswith(".acsl"):
+        return True
+    for cpath in _resolve_source_candidates(file_path):
+        try:
+            raw = cpath.read_text(encoding="utf-8", errors="replace")
+            has_acsl = False
+            has_c_code = False
+            for tok in tokenize_c_acsl(raw):
+                tok_start = tok.line
+                tok_end = tok.line + tok.text.count("\n")
+                if tok_start <= line <= tok_end:
+                    if tok.kind in ("acsl_block", "acsl_line"):
+                        has_acsl = True
+                    elif tok.kind in ("c_token", "string", "char"):
+                        has_c_code = True
+            return has_acsl and not has_c_code
+        except Exception:
+            continue
+    return False
+
+
+def _resolve_function_at_line(file_path: str, line: int) -> str:
+    """Resolve the enclosing C function at `file_path:line` using token-based span extraction."""
+    if not file_path or line <= 0:
+        return "unknown_function"
+    for cpath in _resolve_source_candidates(file_path):
         try:
             raw = cpath.read_text(encoding="utf-8", errors="replace")
             for fn in extract_functions_from_code(raw, path=str(cpath)):
@@ -366,16 +408,26 @@ def parse_eacsl_failure(text: str) -> dict | None:
     label, predicate = _failing_predicate(text, hit.end())
     kind = hit.group("kind").strip().lower().replace(" ", "_")
     alarm = detect_alarm_kind(label) or detect_alarm_kind(predicate)
-    return {
+    explicit_rte_prefix = label.lower().startswith("rte") or predicate.lower().startswith("rte")
+    has_rte_marker = bool(alarm) or explicit_rte_prefix
+    on_acsl_line = _is_acsl_annotation_line(file_, line_)
+    annotation_rte = (
+        (kind == "rte") or (on_acsl_line and has_rte_marker) or (kind != "assertion" and explicit_rte_prefix)
+    )
+    is_rte = (kind == "assertion") and has_rte_marker and not on_acsl_line
+    res: dict = {
         "file": file_ or "unknown",
         "line": line_,
         "function": function or "unknown_function",
         "kind": kind,
         "alarm_kind": alarm or None,
-        "is_rte": bool(alarm) or label.lower().startswith("rte") or predicate.lower().startswith("rte"),
+        "is_rte": is_rte,
         "label": label,
         "predicate": predicate,
     }
+    if annotation_rte:
+        res["annotation_rte"] = True
+    return res
 
 
 def parse_sanitizer_failure(text: str) -> dict | None:
@@ -1261,6 +1313,16 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
             "reason": "Binary failed without a recognizable E-ACSL failure report.",
             "failure": None,
         }
+    if failure.get("annotation_rte"):
+        return {
+            "status": "rejected_overconstrained",
+            "reason": (
+                "An ACSL annotation evaluated an undefined term at runtime under E-ACSL's 3-valued partial logic "
+                "(e.g. unguarded division/modulo by zero or invalid pointer dereference inside a contract/assertion)."
+            ),
+            "annotation_rte": True,
+            "failure": failure,
+        }
     if failure["is_rte"]:
         return {
             "status": "code_fault",
@@ -1302,10 +1364,25 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
             f"ACSL annotation failed at runtime on a real corpus input ({loc}, clause={label or kind!r}, "
             f"predicate={pred!r}): your specification is stronger than the actual runtime behavior."
         )
+        if res.get("annotation_rte") or failure.get("annotation_rte") or kind == "rte":
+            _add(
+                "ACSL annotation runtime error (RTE inside specification): unlike WP's 2-valued total logic, "
+                "E-ACSL uses 3-valued partial logic and aborts when an annotation evaluates an undefined term "
+                "(such as 'x / y' or 'x % y' when 'y == 0', or '*p' / 'buf[i]' on an invalid/out-of-bounds pointer). "
+                "Guard partial terms on the left of '==>' or '&&' (e.g. 'y != 0 ==> x % y == 0', "
+                "'\\valid_read(p) ==> *p == 0')."
+            )
         if "\\valid" in pred:
             _add(
                 "Pointer validity clause failed at runtime: if 'len == 0' can occur with a NULL or one-past-end "
                 "pointer, guard the clause with 'requires len > 0 ==> \\valid_read(buf + (0 .. len - 1));'."
+            )
+        if "\\initialized" in pred:
+            _add(
+                "Initialization predicate failed at runtime: E-ACSL tracks initialization per byte across "
+                "'sizeof(*p)' in flat shadow memory, so '\\initialized(p)' fails on structs with uninitialized "
+                "padding bytes or unions initialized via a smaller member. Assert field-level initialization "
+                "('\\initialized(&p->field)') rather than whole-struct/union '\\initialized(p)'."
             )
         if "precondition" in kind or "requires" in kind or "requires" in label:
             _add(
@@ -1358,10 +1435,15 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "often caused by unsupported C standard library functions (e.g. unmodeled libc conversions) or constructs. "
                 "Inspect the execution output and replace unsupported calls with verified or modeled equivalents."
             )
-        if any(k in log_blob.lower() for k in ("not yet supported", "unsupported", "axiomatic", "no body")):
+        if any(
+            k in log_blob.lower()
+            for k in ("not yet supported", "unsupported", "axiomatic", "no body", "comparison of", "with")
+        ):
             _add(
                 "E-ACSL encountered an unsupported ACSL construct (such as an uninterpreted 'axiomatic' logic "
-                "function without a definition): rewrite as a concrete 'predicate' or bounded '\\forall integer k; 0 <= k < n ==> ...'."
+                "function without a definition, or a whole-struct/union comparison 's1 == s2' / functional update "
+                "'{ s \\with .x = v }'): rewrite as a concrete 'predicate', bounded '\\forall integer k; 0 <= k < n ==> ...', "
+                "or field-by-field scalar comparisons ('s1.x == s2.x')."
             )
         if any(
             k in log_blob.lower() for k in ("annot-error", "syntax error", "unbound logic", "wrong order of clause")
