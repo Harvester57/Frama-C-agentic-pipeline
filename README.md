@@ -2,7 +2,7 @@
 
 An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 33.0** (`RTE`, `Eva`, `WP`, `E-ACSL`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
 
-All verification tools execute inside a reproducible, network-isolated **`framac-pipeline` container**, orchestrated by modular **Agent Skills** ([`/framac-verify`](skills/framac-verify/SKILL.md), [`/framac-slice`](skills/framac-slice/SKILL.md), [`/framac-fuzz`](skills/framac-fuzz/SKILL.md), [`/framac-eva`](skills/framac-eva/SKILL.md), [`/framac-wp`](skills/framac-wp/SKILL.md)) and deterministic Python helper scripts.
+All verification tools execute inside a reproducible, network-isolated **`framac-pipeline` container**, orchestrated by modular **Agent Skills** ([`/framac-verify`](./skills/framac-verify/SKILL.md), [`/framac-slice`](./skills/framac-slice/SKILL.md), [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md), [`/framac-eva`](./skills/framac-eva/SKILL.md), [`/framac-wp`](./skills/framac-wp/SKILL.md)) and deterministic Python helper scripts.
 
 ---
 
@@ -28,7 +28,7 @@ flowchart LR
 2. **Module-Level Abstract Interpretation (`Eva`):**
    Simulates symbolic inputs (`0 .. MAX_INPUT_SIZE`) from per-module `eva_main()` harnesses to automatically discharge **80–90% of RTE assertions** without writing loop invariants.
 3. **Dependency-Driven Subagent WP Swarm (`/framac-wp`):**
-   A deterministic scheduler ([`scripts/wp_scheduler.py`](scripts/wp_scheduler.py)) dispatches a **Function Prover Subagent** (`frama-c -wp -wp-rte -wp-fct <fn>`) as soon as the function's callees are merged. Longest caller chains go first, and finished proofs merge in parallel micro-batches without global wave barriers.
+   A deterministic scheduler ([`./scripts/wp_scheduler.py`](./scripts/wp_scheduler.py)) dispatches a **Function Prover Subagent** (`frama-c -wp -wp-rte -wp-fct <fn>`) as soon as the function's callees are merged. Longest caller chains go first, and finished proofs merge in parallel micro-batches without global wave barriers.
 4. **Dual-Oracle Anti-Hallucination Guardrail:**
    Every ACSL contract (`requires`, `assigns`, `ensures`, `loop invariant`) proposed by a subagent is compiled with **E-ACSL** and tested against the live fuzzer corpus before being passed to **WP**, preventing the LLM from passing proofs via vacuous or over-constrained preconditions (`requires \false`).
 5. **Adversarial Prover-vs-Breaker Dual-Play:**
@@ -41,12 +41,12 @@ flowchart LR
    - **Layer 5:** Output Grammar & Sanitization (`ensures` character-class bounds against CRLF/log injection)
    - **Layer 6:** Secret Zeroization & Information Flow / Non-Interference (`buffer_is_zeroed` + `-eva-domains taint`)
 7. **Self-Sizing Resource Broker & Content-Addressed Caches:**
-   Before every job, [`scripts/resources.py`](scripts/resources.py) measures available cgroups, Slurm allocations, and Docker/Podman engine limits to lease CPUs and memory per container while keeping outcome-deciding limits (`-wp-memlimit`, `-rss_limit_mb`, seeds) fixed across machines. Deterministic per-module builds, fuzzing, and Eva runs execute via Make ([`scripts/pipeline_make.py`](scripts/pipeline_make.py)) backed by per-run and cross-run caches ([`docs/resources-and-caching.md`](docs/resources-and-caching.md)).
+   Before every job, [`./scripts/resources.py`](./scripts/resources.py) measures available cgroups, Slurm allocations, and Docker/Podman engine limits to lease CPUs and memory per container while keeping outcome-deciding limits (`-wp-memlimit`, `-rss_limit_mb`, seeds) fixed across machines. Deterministic per-module builds, fuzzing, and Eva runs execute via Make ([`./scripts/pipeline_make.py`](./scripts/pipeline_make.py)) backed by per-run and cross-run caches ([`./docs/resources-and-caching.md`](./docs/resources-and-caching.md)).
 8. **Evidence Discipline & Mechanical Validation:**
-   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`docs/v2-design.md`](docs/v2-design.md)).
+   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`./docs/v2-design.md`](./docs/v2-design.md)).
 
 > [!IMPORTANT]
-> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`scripts/sandbox_exec.py`](scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container; see [`docs/v2-design.md` (Section 3)](docs/v2-design.md) for the residual-risk model.
+> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`./scripts/sandbox_exec.py`](./scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container; see [`./docs/v2-design.md` (Section 3)](./docs/v2-design.md) for the residual-risk model.
 
 ---
 
@@ -55,7 +55,7 @@ flowchart LR
 - **Container Engine:** Docker or Podman (`FRAMAC_CONTAINER_ENGINE=auto|docker|podman`).
   - Allocate at least **4 GiB of RAM** to the container engine VM (**8 GiB+ recommended** for parallel WP and fuzzing). Tools refuse to run below their single-worker memory floor (`1768 MiB` for WP, `3072 MiB` for LibFuzzer) rather than producing starved or flaky results.
 - **Host Python:** Python **3.10+** (stdlib only; used on the host by the resource broker and test suite).
-- **Target C Project:** Standard C99/C11 source tree. If the project does not provide a `compile_commands.json`, Phase 0 ([`scripts/build_callgraph_dag.py`](scripts/build_callgraph_dag.py)) automatically discovers in-repository header directories and synthesizes one (or you can capture exact flags via `bear -- make` inside a disposable scratch copy).
+- **Target C Project:** Standard C99/C11 source tree. If the project does not provide a `compile_commands.json`, Phase 0 ([`./scripts/build_callgraph_dag.py`](./scripts/build_callgraph_dag.py)) automatically discovers in-repository header directories and synthesizes one (or you can capture exact flags via `bear -- make` inside a disposable scratch copy).
 
 ---
 
@@ -78,7 +78,7 @@ docker build -t framac-pipeline:latest .
 
 ### 2. Initialize a Run and Verify the E-ACSL Canary
 
-Use [`wrappers/framac-docker.ps1`](wrappers/framac-docker.ps1) on Windows or [`wrappers/framac-docker.sh`](wrappers/framac-docker.sh) on Linux/macOS. Passing `-NewRun` (`--new-run`) creates a fresh run directory outside the target at `~/framac-pipeline/<repo>/run-<N>/` and prints its path:
+Use [`./wrappers/framac-docker.ps1`](./wrappers/framac-docker.ps1) on Windows or [`./wrappers/framac-docker.sh`](./wrappers/framac-docker.sh) on Linux/macOS. Passing `-NewRun` (`--new-run`) creates a fresh run directory outside the target at `~/framac-pipeline/<repo>/run-<N>/` and prints its path:
 
 ```powershell
 # Windows (PowerShell)
@@ -100,8 +100,8 @@ Use [`wrappers/framac-docker.ps1`](wrappers/framac-docker.ps1) on Windows or [`w
 
 Pass the printed run directory as `-RunDir "<run-dir>"` (`--run-dir "<run-dir>"`) on subsequent commands for that run.
 - `sandbox_exec.py probe` verifies the inner sandbox (`{"sandbox": "rlimits"}`).
-- `run_eacsl_fuzz.py selftest` compiles and runs the built-in E-ACSL canary ([`templates/eacsl_canary/canary.c`](templates/eacsl_canary/canary.c)) to verify that benign inputs pass cleanly while buffer overflows and uninitialized reads are caught at runtime.
-- Optional resource caps and cache settings are controlled via host environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_CACHE`, `FRAMAC_BROKER=off`; see [`docs/resources-and-caching.md`](docs/resources-and-caching.md)).
+- `run_eacsl_fuzz.py selftest` compiles and runs the built-in E-ACSL canary ([`./templates/eacsl_canary/canary.c`](./templates/eacsl_canary/canary.c)) to verify that benign inputs pass cleanly while buffer overflows and uninitialized reads are caught at runtime.
+- Optional resource caps and cache settings are controlled via host environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_CACHE`, `FRAMAC_BROKER=off`; see [`./docs/resources-and-caching.md`](./docs/resources-and-caching.md)).
 
 ### 3. Run the Agent Skills
 
@@ -109,11 +109,11 @@ Invoke the skills from your AI coding assistant:
 
 | Skill | Stage | Purpose |
 | :--- | :---: | :--- |
-| [`/framac-verify`](skills/framac-verify/SKILL.md) | **All (0–4)** | **End-to-end orchestrator:** slices the codebase, fuzzes with E-ACSL, prunes with Eva, verifies crash candidates, proves surviving obligations with parallel WP subagents, and emits final reports. Supports `--profile quick\|standard\|deep`. |
-| [`/framac-slice`](skills/framac-slice/SKILL.md) | **Phase 0** | Initializes the `workspace/` shadow overlay, builds the Call-Graph DAG and topological waves, classifies modules by Risk Tier, generates dual harnesses, and seeds `coverage-ledger.json`. |
-| [`/framac-fuzz`](skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice via Make. |
-| [`/framac-eva`](skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
-| [`/framac-wp`](skills/framac-wp/SKILL.md) | **Phase 3** | Dispatches the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) via `wp_scheduler.py`, enforcing the E-ACSL Dynamic Guardrail and spawning Adversarial Breakers on stalled goals. |
+| [`/framac-verify`](./skills/framac-verify/SKILL.md) | **All (0–4)** | **End-to-end orchestrator:** slices the codebase, fuzzes with E-ACSL, prunes with Eva, verifies crash candidates, proves surviving obligations with parallel WP subagents, and emits final reports. Supports `--profile quick\|standard\|deep`. |
+| [`/framac-slice`](./skills/framac-slice/SKILL.md) | **Phase 0** | Initializes the `workspace/` shadow overlay, builds the Call-Graph DAG and topological waves, classifies modules by Risk Tier, generates dual harnesses, and seeds `coverage-ledger.json`. |
+| [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice via Make. |
+| [`/framac-eva`](./skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
+| [`/framac-wp`](./skills/framac-wp/SKILL.md) | **Phase 3** | Dispatches the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) via `wp_scheduler.py`, enforcing the E-ACSL Dynamic Guardrail and spawning Adversarial Breakers on stalled goals. |
 
 ---
 
@@ -208,14 +208,14 @@ python3 -m mypy scripts tests
 
 ## Documentation Index
 
-- [Architecture & Dataflow (`docs/architecture.md`)](docs/architecture.md)
-- [Slicing & Onboarding 90k+ LoC Codebases (`docs/slicing-and-onboarding.md`)](docs/slicing-and-onboarding.md)
-- [Proving Security Properties Beyond Memory Safety (`docs/security-properties.md`)](docs/security-properties.md)
-- [Multi-Agent Swarm & Dual-Oracle Guardrail (`docs/agentic-swarm.md`)](docs/agentic-swarm.md)
-- [Resources, Scheduling & Caching (`docs/resources-and-caching.md`)](docs/resources-and-caching.md)
-- [Pipeline v2 Design & Evidence Discipline (`docs/v2-design.md`)](docs/v2-design.md)
-- [Implementation Backlog & Verification Checklist (`docs/backlog.md`)](docs/backlog.md)
-- [Troubleshooting Guide (`docs/troubleshooting.md`)](docs/troubleshooting.md)
-- [Upstream Frama-C 33.0 E-ACSL & Variadic Issues (`docs/upstream/frama-c-e-acsl-issues.md`)](docs/upstream/frama-c-e-acsl-issues.md)
-- [Frama-C Reference Manuals (`docs/references/README.md`)](docs/references/README.md) & [E-ACSL Quick Reference (`docs/references/e-acsl-quickref.md`)](docs/references/e-acsl-quickref.md)
-- [Third-Party Header Stubs Guide (`templates/fc_stubs/README.md`)](templates/fc_stubs/README.md)
+- [Architecture & Dataflow (`./docs/architecture.md`)](./docs/architecture.md)
+- [Slicing & Onboarding 90k+ LoC Codebases (`./docs/slicing-and-onboarding.md`)](./docs/slicing-and-onboarding.md)
+- [Proving Security Properties Beyond Memory Safety (`./docs/security-properties.md`)](./docs/security-properties.md)
+- [Multi-Agent Swarm & Dual-Oracle Guardrail (`./docs/agentic-swarm.md`)](./docs/agentic-swarm.md)
+- [Resources, Scheduling & Caching (`./docs/resources-and-caching.md`)](./docs/resources-and-caching.md)
+- [Pipeline v2 Design & Evidence Discipline (`./docs/v2-design.md`)](./docs/v2-design.md)
+- [Implementation Backlog & Verification Checklist (`./docs/backlog.md`)](./docs/backlog.md)
+- [Troubleshooting Guide (`./docs/troubleshooting.md`)](./docs/troubleshooting.md)
+- [Upstream Frama-C 33.0 E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
+- [Frama-C Reference Manuals (`./docs/references/README.md`)](./docs/references/README.md) & [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md)
+- [Third-Party Header Stubs Guide (`./templates/fc_stubs/README.md`)](./templates/fc_stubs/README.md)

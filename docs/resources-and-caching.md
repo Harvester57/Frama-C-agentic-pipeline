@@ -4,7 +4,7 @@ The pipeline does not assume a machine size. Before every decision it measures w
 
 Two rules hold throughout:
 
-1. **Hardware changes throughput, never results.** More CPUs mean more provers or fuzz workers at once. The limits that decide an outcome stay fixed, so proofs and findings are comparable across machines (`docs/v2-design.md`, Section 9):
+1. **Hardware changes throughput, never results.** More CPUs mean more provers or fuzz workers at once. The limits that decide an outcome stay fixed, so proofs and findings are comparable across machines ([`./v2-design.md`](./v2-design.md#9-profiles-budget-modes-incremental-runs-m5), Section 9):
    - WP `-wp-memlimit` is always 1000 MB per prover.
    - LibFuzzer `-rss_limit_mb` is always 2048.
    - The per-input timeout is fixed: 30 s for guardrail runs, 10 s for campaigns and replays. Guardrails and replays also use a deterministic seed.
@@ -79,7 +79,7 @@ The fuzz budget is CPU-seconds per module: quick 60, standard 120, deep 900. A b
 
 ### Host broker (`resources.py exec`)
 
-The wrappers (`framac-docker.sh` / `framac-docker.ps1`) call `resources.py exec` with the host's Python (3.10 or newer). For each container it:
+The wrappers ([`../wrappers/framac-docker.sh`](../wrappers/framac-docker.sh) / [`../wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1)) call [`../scripts/resources.py`](../scripts/resources.py) `exec` with the host's Python (3.10 or newer). For each container it:
 
 1. **Leases resources** from the host pool:
    - Requests are served first in, first out. A later request can jump ahead only when that doesn't delay the head of the queue.

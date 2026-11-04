@@ -98,7 +98,7 @@ flowchart TD
 
 ## 4. On-Disk Run Directory & Artifact Layout
 
-Each run lives outside the target in `~/framac-pipeline/<repo>/run-<N>/` (mounted at `/framac-run`; the target is mounted read-only at `/target`). See [`v2-design.md`](v2-design.md) for ownership rules.
+Each run lives outside the target in `~/framac-pipeline/<repo>/run-<N>/` (mounted at `/framac-run`; the target is mounted read-only at `/target`). See [`./v2-design.md`](./v2-design.md) for ownership rules.
 
 ```text
 run-<N>/

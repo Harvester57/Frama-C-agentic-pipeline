@@ -51,7 +51,7 @@ By requiring `assigns *pdu_out;` and `requires \separated(buf + (0 .. len - 1), 
 
 ## Layer 4: Authentication & Protocol State Machines (`ghost` Variables)
 
-Using [`templates/acsl/layer4_auth_state_machine.acsl`](../templates/acsl/layer4_auth_state_machine.acsl), security state transitions are tracked via ACSL ghost variables (`g_sec_auth_verified` and `g_sec_acl_authorized`), which have **zero runtime cost in production builds** (since they live inside `/*@ ... */` comments) but are:
+Using [`../templates/acsl/layer4_auth_state_machine.acsl`](../templates/acsl/layer4_auth_state_machine.acsl), security state transitions are tracked via ACSL ghost variables (`g_sec_auth_verified` and `g_sec_acl_authorized`), which have **zero runtime cost in production builds** (since they live inside `/*@ ... */` comments) but are:
 1. **Compiled into active C assertions during `E-ACSL + LibFuzzer` runs**, turning any authentication bypass path into an immediate `SIGABRT` crash for the fuzzer.
 2. **Checked across all control-flow paths by `Frama-C WP`**, proving mathematically that `snmpv3_execute_pdu()` cannot be invoked on an `authPriv` or `authNoPriv` packet unless both `snmpv3_usm_verify_hmac()` and `snmpv3_vacm_check_access()` returned `0` (`SUCCESS`) on the current packet.
 
@@ -59,7 +59,7 @@ Using [`templates/acsl/layer4_auth_state_machine.acsl`](../templates/acsl/layer4
 
 ## Layer 5: Output Grammar & Sanitization Invariants
 
-Using [`templates/acsl/layer5_output_sanitization.acsl`](../templates/acsl/layer5_output_sanitization.acsl), emitters such as Syslog RFC 5424 formatters are annotated with quantified output grammar contracts:
+Using [`../templates/acsl/layer5_output_sanitization.acsl`](../templates/acsl/layer5_output_sanitization.acsl), emitters such as Syslog RFC 5424 formatters are annotated with quantified output grammar contracts:
 ```c
 /*@
   requires out_cap > 0 && \valid(out_buf + (0 .. out_cap - 1));
@@ -79,7 +79,7 @@ size_t syslog_format_sd_param(char *out_buf, size_t out_cap, const char *msg, si
 
 ## Layer 6: Secret Zeroization & Information Flow (`Taint`)
 
-Using [`templates/acsl/layer6_zeroization_and_taint.acsl`](../templates/acsl/layer6_zeroization_and_taint.acsl):
+Using [`../templates/acsl/layer6_zeroization_and_taint.acsl`](../templates/acsl/layer6_zeroization_and_taint.acsl):
 1. **Zeroization on All Exit Paths:**
    Adding `ensures buffer_is_zeroed(ctx->priv_key, KEY_LEN);` forces WP to verify that even when an early `if (err) return -1;` branch is taken, transient key material is scrubbed before the function returns.
 2. **Non-Interference / Taint Tracking (`-eva-domains taint`):**

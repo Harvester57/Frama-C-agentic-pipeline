@@ -3,12 +3,12 @@
 Frama-C Eva and WP parse with Frama-C's own libc (`-nostdinc`), so headers installed in
 `/usr/include` (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, ...) are invisible to them.
 The pipeline puts this directory first on the Frama-C include path and force-includes
-`fc_compat_types.h`:
+[`./fc_compat_types.h`](./fc_compat_types.h):
 
-- Eva / WP: via `augment_framac_cppflags()` in `scripts/framac_common.py`, which
-  `run_eva_slice.py` and `run_wp_function.py` (and therefore every Make recipe) apply;
+- Eva / WP: via `augment_framac_cppflags()` in [`../../scripts/framac_common.py`](../../scripts/framac_common.py), which
+  [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py) and [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) (and therefore every Make recipe) apply;
 - E-ACSL (host-header mode, `-no-frama-c-stdlib`): via `build_eacsl_flag_sets()` in
-  `scripts/eacsl_toolchain.py`, on the `-E` (Frama-C frontend) flags only.
+  [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py), on the `-E` (Frama-C frontend) flags only.
 
 ## Rules
 

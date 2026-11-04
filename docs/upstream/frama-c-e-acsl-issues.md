@@ -255,7 +255,7 @@ int main(void) {
 frama-c -machdep gcc_x86_64 -rte -rte-initialized -then -e-acsl retres_repro.c -ocode instrumented.c
 ```
 
-**Workaround.** `scripts/eacsl_toolchain.py` (`mark_wrapper_results_initialized`) post-processes
+**Workaround.** [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py) (`mark_wrapper_results_initialized`) post-processes
 `instrumented.c` using pattern matching (silent when no matches are found) to insert
 `__e_acsl_initialize((void *)(& __retres), sizeof(__retres));` immediately after
 `__e_acsl_store_block((void *)(& __retres), ...)`. This should be removed once fixed upstream.

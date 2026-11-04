@@ -2,7 +2,7 @@
 
 Common issues encountered when running Frama-C (`RTE`, `Eva`, `WP`, `E-ACSL`) and Clang LibFuzzer on real-world C codebases, and how to resolve them.
 
-If a symptom is not listed here, look it up in the upstream manuals in [`references/`](references/README.md). Grep `references/INDEX.md` or the manual itself, then read only the matching lines.
+If a symptom is not listed here, look it up in the upstream manuals in [`./references/README.md`](./references/README.md). Grep [`./references/INDEX.md`](./references/INDEX.md) or the manual itself, then read only the matching lines.
 
 ---
 
@@ -40,7 +40,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 
 ### Symptom: Every Input Crashes in `shadow_alloca` (`e_acsl_segment_tracking.c`), or Valid Stack Accesses Fail `\valid`
 - **Cause:** E-ACSL initializes its runtime at the top of `main()`, and a harness has none. Without full memory tracking, its memory analysis leaves a caller's stack buffer untracked, so a callee's valid write fails `\valid`. With full tracking but no runtime initialization, the runtime segfaults on the first tracked stack block.
-- **Fix:** automatic. Fuzz builds use `-e-acsl-full-mtracking` and link `templates/eacsl_runtime/fuzz_init.c`, whose `LLVMFuzzerInitialize` calls `__e_acsl_memory_init` and `__e_acsl_globals_init`. Do not define `LLVMFuzzerInitialize` in a harness (`reason: eacsl_init_hook_conflict`). The selftest's `benign_input_clean` check catches either regression.
+- **Fix:** automatic. Fuzz builds use `-e-acsl-full-mtracking` and link [`../templates/eacsl_runtime/fuzz_init.c`](../templates/eacsl_runtime/fuzz_init.c), whose `LLVMFuzzerInitialize` calls `__e_acsl_memory_init` and `__e_acsl_globals_init`. Do not define `LLVMFuzzerInitialize` in a harness (`reason: eacsl_init_hook_conflict`). The selftest's `benign_input_clean` check catches either regression.
 
 ### Symptom: E-ACSL Reports `rte: initialization` on Benign Inputs
 - **Cause:** E-ACSL builds pass `-rte-initialized @all`, so every read must be of initialized memory, and memory written outside instrumented code is never marked initialized. The usual culprits:
@@ -78,8 +78,8 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 - **Fix:** automatic. The script generates `<out-bin>_fallbacks/eacsl_fallbacks.c`, which forwards to the real function (or fails with `ENOSYS` when the signature or header is unknown, recorded as `mode: enosys`), compiles it to a link-only object, and retries the link once. Never add these definitions to the instrumented sources: each definition shifts the fallback numbering. `--no-variadic-translation` passes `-variadic-no-translation` to Frama-C instead.
 
 ### Symptom: `call to undeclared function 'X'` or `invalid application of 'alignof' to an incomplete type`
-- **Cause:** a `templates/fc_stubs/` header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
-- **Fix:** add the prototype and complete the handle with a single dummy member (see `templates/fc_stubs/README.md`). Tool JSONs list missing prototypes under `undeclared_functions`. For Eva/WP this is a soundness issue: Frama-C invents `int X()`.
+- **Cause:** a [`../templates/fc_stubs/`](../templates/fc_stubs/) header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
+- **Fix:** add the prototype and complete the handle with a single dummy member (see [`../templates/fc_stubs/README.md`](../templates/fc_stubs/README.md)). Tool JSONs list missing prototypes under `undeclared_functions`. For Eva/WP this is a soundness issue: Frama-C invents `int X()`.
 
 ### Symptom: Instrumentation Aborts With `no function 'X'`
 - **Cause:** `-rte-select` / `-e-acsl-functions` named a function that is absent from the parsed AST (disabled by `#if`, or in a file that failed to parse).
@@ -102,7 +102,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 - **Fix:** Always write explicit integer lower and upper bounds in `\forall` and `\exists` predicates (`0 <= k < n`), and use the `integer` type (or `size_t` / `int`) explicitly.
 
 ### Symptom: Wrapper Exits With Code 2: `-NoInnerSandbox` / `--no-inner-sandbox` (or `-AllowDegradedSandbox` / `--allow-degraded-sandbox`) "is no longer supported"
-- **Cause:** The bubblewrap layer was removed. The hardened container, with Docker's default seccomp and AppArmor profiles, is the only isolation boundary, and target-controlled binaries run under `scripts/sandbox_exec.py` (rlimits, env allowlist, timeout). The legacy flags fail hard rather than being silently ignored.
+- **Cause:** The bubblewrap layer was removed. The hardened container, with Docker's default seccomp and AppArmor profiles, is the only isolation boundary, and target-controlled binaries run under [`../scripts/sandbox_exec.py`](../scripts/sandbox_exec.py) (rlimits, env allowlist, timeout). The legacy flags fail hard rather than being silently ignored.
 - **Fix:** Remove the flag from the command line or script. No replacement flag is needed.
 
 ### Symptom: LeakSanitizer Reports `LeakSanitizer has encountered a fatal error` or `LeakSanitizer does not work under ptrace`
@@ -142,13 +142,13 @@ If a symptom is not listed here, look it up in the upstream manuals in [`referen
 
 ### Symptom: PowerShell Splits Frama-C or Docker CLI Flags Containing `.` or `=`
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.
-- **Fix:** Always invoke container commands through [`wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
+- **Fix:** Always invoke container commands through [`../wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
 
 ---
 
 ## Resources, Caches and Scheduling
 
-The full guide is [`resources-and-caching.md`](resources-and-caching.md) (Section 9 lists symptoms). The most common ones:
+The full guide is [`./resources-and-caching.md`](./resources-and-caching.md) (Section 9 lists symptoms). The most common ones:
 
 - **A command prints "queue position N" and waits:** the measured pool is busy. `python3 scripts/resources.py status` (on the host) lists the leases. Leases of killed wrappers are released once their containers exit (`resources.py gc`).
 - **A WP report has `"status": "analysis_error"`:** Frama-C was killed or timed out (`reason`: `oom_killed`, `timeout`, `crashed`). Nothing was proven or refuted. The recorded peak memory makes the next lease larger, and the scheduler retries once before marking the units `blocked`.

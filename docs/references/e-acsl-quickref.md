@@ -1,6 +1,6 @@
 # E-ACSL Quick Reference (Frama-C 33.0)
 
-Distilled by hand from the E-ACSL plug-in manual [`eacsl/e-acsl-manual.md`](eacsl/e-acsl-manual.md); `§` numbers refer to that manual. Grep its section for details (see [`README.md`](README.md)). For which ACSL constructs E-ACSL can execute at all, see Figure 1.1 of [`acsl/e-acsl-implementation.md`](acsl/e-acsl-implementation.md).
+Distilled by hand from the E-ACSL plug-in manual [`./eacsl/e-acsl-manual.md`](./eacsl/e-acsl-manual.md); `§` numbers refer to that manual. Grep its section for details (see [`./README.md`](./README.md)). For which ACSL constructs E-ACSL can execute at all, see Figure 1.1 of [`./acsl/e-acsl-implementation.md`](./acsl/e-acsl-implementation.md).
 
 The installed tool is the authority on option names: `e-acsl-gcc -h` or `man e-acsl-gcc` in the container (§2.2.6). The manual is not fully consistent. §2.2 documents the Frama-C 33 `e-acsl-gcc` short options, while some examples in §2.4 and §2.5.4 still use older spellings (`-c`, `--oexec-e-acsl`, `--e-acsl-extra`).
 
@@ -67,7 +67,7 @@ Frama-C 33 installs it as `e-acsl-gcc`, not `e-acsl-gcc.sh`. By default it uses 
 
 ## Limitations that change verdicts
 
-- **Constructs not executed:** `assigns`, `loop assigns`, `decreases`, lemmas, axiomatic definitions, `\dangling`, … (Figure 1.1 of `acsl/e-acsl-implementation.md`). Only WP validates them.
+- **Constructs not executed:** `assigns`, `loop assigns`, `decreases`, lemmas, axiomatic definitions, `\dangling`, … (Figure 1.1 of [`./acsl/e-acsl-implementation.md`](./acsl/e-acsl-implementation.md)). Only WP validates them.
 - **Memory analysis robustness:** the static analysis that trims memory instrumentation is "probably the less robust part of E-ACSL". On large code, turn it off with `-M` (§2.3.4).
 - **No `main`** (for example, a libFuzzer harness): according to the manual, instrumentation of memory-related annotations (`\valid`, `\initialized`, RTE `mem_access`) is partial and violations go undetected, unless `-M` / `-e-acsl-full-mtracking` is used. A `main` provided by another file must first call `__e_acsl_memory_init` and `__e_acsl_globals_init` (§3.3.1). In the container, the observed failure is a false alarm on valid stack accesses rather than a missed violation; see below.
 - **Undefined functions, recursion, function pointers, incomplete types:** violations of memory-related annotations that depend on them go undetected, with no workaround (§3.3.2, §3.3.3, §3.4, §3.6). Undefined variadic functions with contracts are not supported (§3.5).
@@ -93,7 +93,7 @@ Checked on 2026-10-30 against a fresh `framac-pipeline:latest` build (Frama-C 33
   ```
   This mirrors what E-ACSL inserts at the top of a real `main`.
 - **With that hook, both `-n -M` and `-n -main LLVMFuzzerTestOneInput` are correct on all six probes.** Every violation is reported as `file:line: Error: Assertion failed:` (libFuzzer exit code 77), and every benign input runs clean.
-- **The pipeline now uses `-n -M` plus the hook** (`templates/eacsl_runtime/fuzz_init.c`, linked in stage 2 by `run_eacsl_fuzz.py`, which every Make recipe calls). On the rebuilt image, the following all passed:
+- **The pipeline now uses `-n -M` plus the hook** ([`../../templates/eacsl_runtime/fuzz_init.c`](../../templates/eacsl_runtime/fuzz_init.c), linked in stage 2 by [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py), which every Make recipe calls). On the rebuilt image, the following all passed:
   - all six probes, built through the unmodified pipeline;
   - the selftest, with every check passing, including the new `benign_input_clean`;
   - a 21-second `campaign` on a bug-free harness: 542,981 executions, `clean`, `engine_used: eacsl`, RSS flat at 51 MB;

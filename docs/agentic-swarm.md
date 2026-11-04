@@ -5,7 +5,7 @@ This document explains:
 - how the **Dual-Oracle Guardrail** prevents LLM hallucination;
 - how callers and callees negotiate contracts.
 
-How resources are measured, leased and cached is in [`resources-and-caching.md`](resources-and-caching.md).
+How resources are measured, leased and cached is in [`./resources-and-caching.md`](./resources-and-caching.md).
 
 ---
 
@@ -26,7 +26,7 @@ Independent modules (`snmpv3`, `syslog`, `xml`, `ipc`, etc.) share no internal s
 
 ### Level 2: Speculative Header Decoupling (architects)
 Bottom-up verification would otherwise have to wait for leaf functions before callers.
-- A **Speculative Interface Architect Subagent** per `.h` header (`skills/framac-wp/header_architect_brief.md`) writes baseline `requires`, `assigns`, and `ensures` contracts.
+- A **Speculative Interface Architect Subagent** per `.h` header ([`../skills/framac-wp/header_architect_brief.md`](../skills/framac-wp/header_architect_brief.md)) writes baseline `requires`, `assigns`, and `ensures` contracts.
 - It validates them dynamically against the Phase 1 fuzzer corpus using `run_eacsl_fuzz.py guardrail`.
 - Because `frama-c -wp -wp-fct <caller>` trusts the `.h` contract of any function `<callee>` it calls, a caller only waits for its callees' own provers, never for a global wave.
 
@@ -43,7 +43,7 @@ Ordering and merging:
 
 ### Level 4: Adversarial Prover-vs-Breaker Dual-Play
 When a Function Prover Subagent fails to prove a specific RTE or security assertion after `K` retries (default `K = 4`):
-- The scheduler queues an **Adversarial Breaker Subagent** (`skills/framac-wp/breaker_brief.md`). Callers of the stalled function are released immediately: the breaker never blocks them.
+- The scheduler queues an **Adversarial Breaker Subagent** ([`../skills/framac-wp/breaker_brief.md`](../skills/framac-wp/breaker_brief.md)). Callers of the stalled function are released immediately: the breaker never blocks them.
 - The Breaker analyzes the exact unproven assertion and synthesizes surgical binary seed inputs for `E-ACSL + LibFuzzer` to trigger a runtime crash at that line.
 - A crash becomes a candidate for an independent Crash Verifier. It reopens the gates of the slices it affects, so no further proof work starts on code that may be broken.
 
@@ -59,7 +59,7 @@ Under that precondition, `frama-c -wp` will report `100% Valid` on every goal in
 
 ### How the Pipeline Prevents Vacuous Contracts
 
-Every single iteration of the Function Prover Subagent (`prover_brief.md`) and Interface Architect Subagent (`header_architect_brief.md`) must pass **two orthogonal oracles** in sequence:
+Every single iteration of the Function Prover Subagent ([`../skills/framac-wp/prover_brief.md`](../skills/framac-wp/prover_brief.md)) and Interface Architect Subagent ([`../skills/framac-wp/header_architect_brief.md`](../skills/framac-wp/header_architect_brief.md)) must pass **two orthogonal oracles** in sequence:
 
 1. **Oracle 1 — The Dynamic E-ACSL Oracle (`run_eacsl_fuzz.py guardrail`):**
    Compiles the newly proposed ACSL annotations (`requires`, `ensures`, `loop invariant`, `assert`) into executable C checks via `e-acsl-gcc` (the same build as Phase 1 fuzzing: instrument with `-n`, full memory tracking, runtime init hook) and replays the module's valid fuzzer corpus (plus 100–200 additional mutations).
@@ -78,7 +78,7 @@ int parse_ber_length(const uint8_t *buf, size_t max_len);
 ```
 whereas Caller `B` needs to know that `\result <= (int)max_len` to prove that advancing `buf + \result` stays in bounds.
 
-Instead of allowing Caller Subagent `B` to edit Callee `A`'s contract directly (which could break `A`'s proof or cause race conditions between parallel subagents), `B` invokes [`scripts/contract_negotiator.py`](../scripts/contract_negotiator.py):
+Instead of allowing Caller Subagent `B` to edit Callee `A`'s contract directly (which could break `A`'s proof or cause race conditions between parallel subagents), `B` invokes [`../scripts/contract_negotiator.py`](../scripts/contract_negotiator.py):
 
 ```bash
 python3 /opt/framac-pipeline/scripts/contract_negotiator.py request \
