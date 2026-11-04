@@ -10,7 +10,7 @@ Every entry listed here has passed the pipeline's **Crash Verification Gate**:
 3. **Root-Cause & Remediation Trace:** Source-level trace from the public entry point to the failing operation, paired with a minimal standalone reproducer and a candidate fix diff suitable for upstream disclosure.
 
 > [!NOTE]
-> For bugs discovered in **Frama-C 33.0 / `e-acsl-gcc` itself** while building and running this pipeline, see [`../upstream/frama-c-e-acsl-issues.md`](../upstream/frama-c-e-acsl-issues.md).
+> For bugs discovered in **Frama-C 33.0 / 34.0~~dev and `e-acsl-gcc` itself** while building and running this pipeline, see [`../upstream/frama-c-e-acsl-issues.md`](../upstream/frama-c-e-acsl-issues.md).
 
 ---
 

@@ -193,7 +193,7 @@ See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master 
 | **QCBOR** | [`laurencelundblade/QCBOR`](https://github.com/laurencelundblade/QCBOR) | **3** (1 Medium, 2 Low) | [`./docs/bugs-found/qcbor/README.md`](./docs/bugs-found/qcbor/README.md) |
 | **CryptoLib** | [`nasa/CryptoLib`](https://github.com/nasa/CryptoLib) | **1** (1 Medium; +1 C11 hygiene note) | [`./docs/bugs-found/cryptolib/README.md`](./docs/bugs-found/cryptolib/README.md) |
 | **picohttpparser** | [`h2o/picohttpparser`](https://github.com/h2o/picohttpparser) | **0** (11 units proven) | [`./docs/bugs-found/picohttpparser/README.md`](./docs/bugs-found/picohttpparser/README.md) |
-| **Frama-C 33.0 (`e-acsl-gcc`)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **8** (4 Bugs, 4 Limitations/UX) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
+| **Frama-C 33.0 / 34.0~~dev (`e-acsl-gcc`)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **10** (6 Bugs, 4 Limitations/UX) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
 
 ---
 
@@ -234,6 +234,6 @@ python3 -m mypy scripts tests
 - [Pipeline v2 Design & Evidence Discipline (`./docs/v2-design.md`)](./docs/v2-design.md)
 - [Implementation Backlog & Verification Checklist (`./docs/backlog.md`)](./docs/backlog.md)
 - [Troubleshooting Guide (`./docs/troubleshooting.md`)](./docs/troubleshooting.md)
-- [Upstream Frama-C 33.0 E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
+- [Upstream Frama-C 33.0 / 34.0~~dev E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
 - [Frama-C Reference Manuals (`./docs/references/README.md`)](./docs/references/README.md) & [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md)
 - [Third-Party Header Stubs Guide (`./templates/fc_stubs/README.md`)](./templates/fc_stubs/README.md)
