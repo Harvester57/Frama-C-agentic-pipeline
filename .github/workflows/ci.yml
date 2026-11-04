@@ -7,6 +7,7 @@ on:
     paths:
       - ".agents/**"
       - ".dockerignore"
+      - "benchmark/**"
       - ".github/workflows/ci.yml"
       - "Dockerfile"
       - "docker-compose.yml"
@@ -24,6 +25,7 @@ on:
     paths:
       - ".agents/**"
       - ".dockerignore"
+      - "benchmark/**"
       - ".github/workflows/ci.yml"
       - "Dockerfile"
       - "docker-compose.yml"

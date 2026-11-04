@@ -10,6 +10,17 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from fingerprint import make_fingerprint  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _no_inherited_git_location(monkeypatch):
+    """
+    Git exports these to hooks (GIT_DIR always, in a linked worktree). A test that runs git, with the
+    pre-commit hook running pytest, would otherwise act on the real repository instead of its own.
+    """
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_PREFIX"):
+        monkeypatch.delenv(name, raising=False)
+
+
 FP_PARSE = make_fingerprint("src/snmp/ber.c", "ber_decode_len", "mem_access", r"\valid_read(buf + off)")
 FP_EVA = make_fingerprint("src/log/emit.c", "emit_field", "signed_overflow", "pos + n <= 2147483647")
 FP_REJ = make_fingerprint("src/snmp/ber.c", "ber_decode_tag", "mem_access", r"\valid_read(p)")

@@ -1,0 +1,140 @@
+[
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto.c.o -c /framac-run/workspace/work/src/core/crypto.c",
+    "file": "/framac-run/workspace/work/src/core/crypto.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_aos.c.o -c /framac-run/workspace/work/src/core/crypto_aos.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_aos.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_aos.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_config.c.o -c /framac-run/workspace/work/src/core/crypto_config.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_config.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_config.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_error.c.o -c /framac-run/workspace/work/src/core/crypto_error.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_error.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_error.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_key_mgmt.c.o -c /framac-run/workspace/work/src/core/crypto_key_mgmt.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_key_mgmt.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_key_mgmt.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_mc.c.o -c /framac-run/workspace/work/src/core/crypto_mc.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_mc.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_mc.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_print.c.o -c /framac-run/workspace/work/src/core/crypto_print.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_print.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_print.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_tc.c.o -c /framac-run/workspace/work/src/core/crypto_tc.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_tc.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_tc.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_tm.c.o -c /framac-run/workspace/work/src/core/crypto_tm.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_tm.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_tm.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/core/crypto_user.c.o -c /framac-run/workspace/work/src/core/crypto_user.c",
+    "file": "/framac-run/workspace/work/src/core/crypto_user.c",
+    "output": "src/CMakeFiles/crypto.dir/core/crypto_user.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/crypto/custom_stub/cryptography_interface_custom_stub.template.c.o -c /framac-run/workspace/work/src/crypto/custom_stub/cryptography_interface_custom_stub.template.c",
+    "file": "/framac-run/workspace/work/src/crypto/custom_stub/cryptography_interface_custom_stub.template.c",
+    "output": "src/CMakeFiles/crypto.dir/crypto/custom_stub/cryptography_interface_custom_stub.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c.o -c /framac-run/workspace/work/src/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c",
+    "file": "/framac-run/workspace/work/src/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c",
+    "output": "src/CMakeFiles/crypto.dir/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/crypto/kmc_stub/cryptography_interface_kmc.stub.c.o -c /framac-run/workspace/work/src/crypto/kmc_stub/cryptography_interface_kmc.stub.c",
+    "file": "/framac-run/workspace/work/src/crypto/kmc_stub/cryptography_interface_kmc.stub.c",
+    "output": "src/CMakeFiles/crypto.dir/crypto/kmc_stub/cryptography_interface_kmc.stub.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c.o -c /framac-run/workspace/work/src/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c",
+    "file": "/framac-run/workspace/work/src/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c",
+    "output": "src/CMakeFiles/crypto.dir/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/key/custom_stub/key_interface_custom_stub.template.c.o -c /framac-run/workspace/work/src/key/custom_stub/key_interface_custom_stub.template.c",
+    "file": "/framac-run/workspace/work/src/key/custom_stub/key_interface_custom_stub.template.c",
+    "output": "src/CMakeFiles/crypto.dir/key/custom_stub/key_interface_custom_stub.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/key/internal/key_interface_internal.template.c.o -c /framac-run/workspace/work/src/key/internal/key_interface_internal.template.c",
+    "file": "/framac-run/workspace/work/src/key/internal/key_interface_internal.template.c",
+    "output": "src/CMakeFiles/crypto.dir/key/internal/key_interface_internal.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/key/kmc_stub/key_interface_kmc_stub.template.c.o -c /framac-run/workspace/work/src/key/kmc_stub/key_interface_kmc_stub.template.c",
+    "file": "/framac-run/workspace/work/src/key/kmc_stub/key_interface_kmc_stub.template.c",
+    "output": "src/CMakeFiles/crypto.dir/key/kmc_stub/key_interface_kmc_stub.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/mc/custom_stub/mc_interface_custom_stub.template.c.o -c /framac-run/workspace/work/src/mc/custom_stub/mc_interface_custom_stub.template.c",
+    "file": "/framac-run/workspace/work/src/mc/custom_stub/mc_interface_custom_stub.template.c",
+    "output": "src/CMakeFiles/crypto.dir/mc/custom_stub/mc_interface_custom_stub.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/mc/disabled_stub/mc_interface_disabled_stub.template.c.o -c /framac-run/workspace/work/src/mc/disabled_stub/mc_interface_disabled_stub.template.c",
+    "file": "/framac-run/workspace/work/src/mc/disabled_stub/mc_interface_disabled_stub.template.c",
+    "output": "src/CMakeFiles/crypto.dir/mc/disabled_stub/mc_interface_disabled_stub.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/mc/internal/mc_interface_internal.template.c.o -c /framac-run/workspace/work/src/mc/internal/mc_interface_internal.template.c",
+    "file": "/framac-run/workspace/work/src/mc/internal/mc_interface_internal.template.c",
+    "output": "src/CMakeFiles/crypto.dir/mc/internal/mc_interface_internal.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/sa/custom_stub/sa_interface_custom.stub.c.o -c /framac-run/workspace/work/src/sa/custom_stub/sa_interface_custom.stub.c",
+    "file": "/framac-run/workspace/work/src/sa/custom_stub/sa_interface_custom.stub.c",
+    "output": "src/CMakeFiles/crypto.dir/sa/custom_stub/sa_interface_custom.stub.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/sa/internal/sa_interface_inmemory.template.c.o -c /framac-run/workspace/work/src/sa/internal/sa_interface_inmemory.template.c",
+    "file": "/framac-run/workspace/work/src/sa/internal/sa_interface_inmemory.template.c",
+    "output": "src/CMakeFiles/crypto.dir/sa/internal/sa_interface_inmemory.template.c.o"
+  },
+  {
+    "directory": "/framac-run/workspace/build/internal/src",
+    "command": "/usr/bin/cc -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include  -Wall -Wextra -Werror -g -O0 -fPIC -ggdb -o CMakeFiles/crypto.dir/sa/mariadb_stub/sa_interface_mariadb.stub.c.o -c /framac-run/workspace/work/src/sa/mariadb_stub/sa_interface_mariadb.stub.c",
+    "file": "/framac-run/workspace/work/src/sa/mariadb_stub/sa_interface_mariadb.stub.c",
+    "output": "src/CMakeFiles/crypto.dir/sa/mariadb_stub/sa_interface_mariadb.stub.c.o"
+  }
+]
