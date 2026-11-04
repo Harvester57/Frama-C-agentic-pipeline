@@ -1237,6 +1237,11 @@ def _probe(
         warnings.append(f"container engine view unavailable ({eng.error}); sizing from the host only")
 
     # Warn loudly when cgroup limits are much smaller than the broker pool / engine / host capacity.
+    # In container scope, a cgroup limit that matches (or exceeds) the host broker's per-job grant
+    # (FRAMAC_JOB_CPUS / FRAMAC_JOB_MEM_MB) is the expected lease for this job class (e.g. 1 CPU /
+    # 1024 MiB for `light`), not an external cgroup throttle.
+    grant_cpu = cpu.get("grant") if scope == "container" else None
+    grant_mem = mem.get("grant") if scope == "container" else None
     ref_cpus_candidates = [
         v
         for v in (
@@ -1256,17 +1261,17 @@ def _probe(
         if v and v > 0
     ]
     cg_cpu = cpu.get("cgroup")
-    if cg_cpu is not None and ref_cpus_candidates:
+    if cg_cpu is not None and (grant_cpu is None or cg_cpu < grant_cpu - 1e-6) and ref_cpus_candidates:
         ref_cpu = max(ref_cpus_candidates)
-        if ref_cpu >= 2.0 and cg_cpu <= ref_cpu * 0.5:
+        if (grant_cpu is not None and cg_cpu < grant_cpu - 1e-6) or (ref_cpu >= 2.0 and cg_cpu <= ref_cpu * 0.5):
             warnings.append(
                 f"cgroup CPU limit ({_fmt_cpus(cg_cpu)} CPUs) is much smaller than pool/host capacity "
                 f"({_fmt_cpus(ref_cpu)} CPUs): tasks in this cgroup are throttled to {_fmt_cpus(cg_cpu)} CPUs"
             )
     cg_mem = mem.get("cgroup")
-    if cg_mem is not None and ref_mem_candidates:
+    if cg_mem is not None and (grant_mem is None or cg_mem < grant_mem) and ref_mem_candidates:
         ref_mem = max(ref_mem_candidates)
-        if ref_mem >= 2048 and cg_mem <= ref_mem // 2:
+        if (grant_mem is not None and cg_mem < grant_mem) or (ref_mem >= 2048 and cg_mem <= ref_mem // 2):
             warnings.append(
                 f"cgroup memory limit ({cg_mem} MiB) is much smaller than pool/host capacity "
                 f"({ref_mem} MiB): tasks in this cgroup are capped at {cg_mem} MiB"

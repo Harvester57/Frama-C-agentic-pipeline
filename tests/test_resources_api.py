@@ -106,6 +106,38 @@ def test_recommend_reads_the_pool_passed_by_the_host_broker(monkeypatch, tmp_pat
     assert R.recommend()["max_agents"] == 6
 
 
+def test_broker_granted_light_container_does_not_emit_false_cgroup_throttle_warnings(tmp_path, monkeypatch):
+    root = _cgroup_tree(
+        tmp_path,
+        cpu_max="100000 100000",
+        mem_max=str(1024 * 1024**2),
+        mem_available_kb=12 * 1024 * 1024,
+    )
+    monkeypatch.setattr(R, "machine_cpus", lambda _root=Path("/"): (12, list(range(12))))
+    monkeypatch.setenv("FRAMAC_POOL_CPUS", "11")
+    monkeypatch.setenv("FRAMAC_POOL_MEM_MB", "20480")
+
+    # 1. With matching broker grant (FRAMAC_JOB_CPUS=1, FRAMAC_JOB_MEM_MB=1024), cgroup == grant is expected.
+    monkeypatch.setenv("FRAMAC_JOB_CPUS", "1")
+    monkeypatch.setenv("FRAMAC_JOB_MEM_MB", "1024")
+    p_granted = R.probe("container", root=root, fresh=True)
+    assert not any("throttled to" in w or "capped at" in w for w in p_granted.warnings)
+
+    # 2. Without a broker grant (unbrokered container throttled to 1 CPU / 1024 MiB on a 12-CPU / 24-GiB host), warn.
+    monkeypatch.delenv("FRAMAC_JOB_CPUS", raising=False)
+    monkeypatch.delenv("FRAMAC_JOB_MEM_MB", raising=False)
+    p_unbrokered = R.probe("container", root=root, fresh=True)
+    assert any("cgroup CPU limit (1 CPUs) is much smaller" in w for w in p_unbrokered.warnings)
+    assert any("cgroup memory limit (1024 MiB) is much smaller" in w for w in p_unbrokered.warnings)
+
+    # 3. If an external cgroup throttles a container below its broker grant, warn.
+    monkeypatch.setenv("FRAMAC_JOB_CPUS", "4")
+    monkeypatch.setenv("FRAMAC_JOB_MEM_MB", "4096")
+    p_throttled = R.probe("container", root=root, fresh=True)
+    assert any("cgroup CPU limit (1 CPUs) is much smaller" in w for w in p_throttled.warnings)
+    assert any("cgroup memory limit (1024 MiB) is much smaller" in w for w in p_throttled.warnings)
+
+
 def test_infer_class_maps_commands_to_classes():
     S = "python3 /opt/framac-pipeline/scripts"
     cases = {
