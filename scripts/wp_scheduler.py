@@ -10,6 +10,8 @@ Subcommands (run with the run directory as working directory; each prints one JS
   init           [--reconcile]                  build the task graph, write workspace/reports/wp_queue.json
   next           [--slots auto|N] [--prepare] [--max-agents N]
                                                 hand out the highest-priority ready tasks
+  step           [--complete ID...] [--slots auto|N] [--prepare] [--max-agents N] [--force-merge] [--module M]
+                                                atomically complete, eager merge, and dispatch next
   complete       --agent-id ID                  validate one agent result and dispatch it by role
   merge-pending  [--module M] [--force]         merge finished provers in micro-batches, run re-checks
   refresh        [--module M]                   re-sync after a harness repair or a module re-run
@@ -27,6 +29,7 @@ always ledger -> merge. FRAMAC_SCHEDULER=waves restores wave-by-wave dispatch wi
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import io
@@ -832,6 +835,7 @@ def _sync(state: dict, ctx: Ctx) -> dict:
                     module=cand.get("module") or ctx.file_module.get(loc_file) or "unknown",
                     fingerprint=fp,
                     location_file=loc_file,
+                    location_function=fn,
                     ingest_errors=0,
                     invalid_results=0,
                 )
@@ -960,6 +964,202 @@ def _sync(state: dict, ctx: Ctx) -> dict:
     return changes
 
 
+# ---------------------------------------------------------------------------
+# Contract-first speculative dispatch helpers & call-cone reachability
+# ---------------------------------------------------------------------------
+
+# Cache for file-level ACSL function contract checks:
+# Key: (resolved_path_str, st_mtime, st_size, function_name, is_header) -> bool
+_FILE_CONTRACT_CACHE: dict[tuple[str, float, int, str, bool], bool] = {}
+
+
+def _file_has_contract(path: Path, fn_name: str, is_header: bool) -> bool:
+    """Check if `path` contains an ACSL contract for `fn_name`, with mtime/size caching."""
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    key = (str(path.resolve()), st.st_mtime, st.st_size, fn_name, is_header)
+    if key in _FILE_CONTRACT_CACHE:
+        return _FILE_CONTRACT_CACHE[key]
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    res = acsl_ast.has_function_contract(text, fn_name, is_header=is_header, path=str(path))
+    _FILE_CONTRACT_CACHE[key] = res
+    return res
+
+
+def callee_has_contract(
+    ctx: Ctx,
+    cfile: str,
+    cname: str,
+    cmod: str | None,
+    work_dir: Path | None = None,
+) -> bool:
+    """
+    Check whether `cname` in `cfile` (module `cmod`) has an ACSL function contract in workspace/work/.
+    Inspects:
+    1. Sibling header: workspace/work/<stem>.h (both prototype and inline definition)
+    2. Module header(s): workspace/work/<header> from ctx.header, ctx.modules, and ctx.sidecars
+    3. C source definition / prototype: workspace/work/<cfile>
+    """
+    cfile_norm = norm_path(cfile)
+    work_root = Path(work_dir) if work_dir is not None else Path("workspace/work")
+    if not work_root.is_dir():
+        return False
+
+    # Check per-command Ctx cache
+    cache: dict[tuple[str, str, str | None, str], bool] = getattr(ctx, "_callee_contract_cache", None)  # type: ignore[assignment]
+    if cache is None:
+        cache = ctx._callee_contract_cache = {}  # type: ignore[attr-defined]
+    cache_key = (cfile_norm, cname, cmod, str(work_root.resolve()))
+    if cache_key in cache:
+        return cache[cache_key]
+
+    # 1. Check sibling header (<stem>.h)
+    c_p = Path(cfile_norm)
+    if c_p.suffix.lower() in (".c", ".i"):
+        sib_path = work_root / c_p.with_suffix(".h")
+        if sib_path.is_file():
+            if _file_has_contract(sib_path, cname, is_header=True) or _file_has_contract(
+                sib_path, cname, is_header=False
+            ):
+                cache[cache_key] = True
+                return True
+    elif cfile_norm.endswith(".h"):
+        h_path = work_root / cfile_norm
+        if h_path.is_file():
+            if _file_has_contract(h_path, cname, is_header=True) or _file_has_contract(h_path, cname, is_header=False):
+                cache[cache_key] = True
+                return True
+
+    # 2. Check module header(s)
+    mod = cmod or ctx.file_module.get(cfile_norm)
+    if mod:
+        cand_headers: set[str] = set()
+        primary_h = ctx.header(mod)
+        if primary_h:
+            cand_headers.add(norm_path(primary_h))
+        m_rec = ctx.modules.get(mod) or {}
+        if m_rec.get("header"):
+            cand_headers.add(norm_path(str(m_rec["header"])))
+        for h in m_rec.get("headers") or []:
+            cand_headers.add(norm_path(str(h)))
+        s_rec = ctx.sidecars.get(mod) or {}
+        if s_rec.get("header"):
+            cand_headers.add(norm_path(str(s_rec["header"])))
+        for h in s_rec.get("headers") or []:
+            cand_headers.add(norm_path(str(h)))
+
+        for h_rel in sorted(cand_headers):
+            hdr_path = work_root / h_rel
+            if hdr_path.is_file():
+                if _file_has_contract(hdr_path, cname, is_header=True) or _file_has_contract(
+                    hdr_path, cname, is_header=False
+                ):
+                    cache[cache_key] = True
+                    return True
+
+    # 3. Check C source definition or prototype
+    src_path = work_root / cfile_norm
+    if src_path.is_file():
+        if _file_has_contract(src_path, cname, is_header=False) or _file_has_contract(src_path, cname, is_header=True):
+            cache[cache_key] = True
+            return True
+
+    cache[cache_key] = False
+    return False
+
+
+def touches_module_header(
+    ctx: Ctx,
+    file: str,
+    fn: str,
+    module: str | None,
+    work_dir: Path | None = None,
+) -> bool:
+    """Check whether `fn` has a prototype or declaration in the module header."""
+    if not module:
+        return False
+    cand_headers: list[str] = []
+    primary = ctx.header(module)
+    if primary:
+        cand_headers.append(norm_path(primary))
+    m_rec = ctx.modules.get(module) or {}
+    if m_rec.get("header"):
+        cand_headers.append(norm_path(str(m_rec["header"])))
+    for h in m_rec.get("headers") or []:
+        cand_headers.append(norm_path(str(h)))
+
+    if not cand_headers:
+        return False
+
+    root = Path(work_dir) if work_dir is not None else Path.cwd()
+    for hdr_rel in dict.fromkeys(cand_headers):
+        hdr_path = root / "workspace" / "work" / hdr_rel
+        if not hdr_path.is_file():
+            hdr_path = root / hdr_rel
+        if not hdr_path.is_file():
+            # Conservative fallback if configured header file does not exist on disk
+            return True
+        try:
+            hdr_text = hdr_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return True
+        if not re.search(r"\b" + re.escape(fn) + r"\b", hdr_text):
+            continue
+        span = acsl_ast.locate_function_span(hdr_text, fn, is_header=True, path=hdr_rel)
+        if span is not None:
+            return True
+    return False
+
+
+def is_static_fn(ctx: Ctx, file: str, fn: str, work_dir: Path | None = None) -> bool:
+    """Check whether `fn` in `file` is an internal static function."""
+    rec = ctx.dag_by_key.get((norm_path(file), fn))
+    if rec and rec.get("is_static"):
+        return True
+    root = Path(work_dir) if work_dir is not None else Path.cwd()
+    c_path = root / "workspace" / "work" / file
+    if not c_path.is_file():
+        c_path = root / file
+    if c_path.is_file():
+        try:
+            c_text = c_path.read_text(encoding="utf-8", errors="replace")
+            span = acsl_ast.locate_function_span(c_text, fn, is_header=False, path=file)
+            if span:
+                brace_off = acsl_ast._find_body_brace_offset(span.text, path=file)
+                decl_part = span.text[:brace_off] if brace_off is not None else span.text
+                if re.search(r"\bstatic\b", decl_part):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _call_cone(file: str, fn: str, ctx: Ctx | None = None) -> set[tuple[str, str]]:
+    """
+    Compute the reachable set of functions (file, fn) in the call graph DAG starting from (file, fn).
+    Includes (file, fn) itself and all transitive callees.
+    """
+    start = (norm_path(file), fn)
+    cone: set[tuple[str, str]] = {start}
+    if ctx is None:
+        return cone
+    queue = [start]
+    while queue:
+        cur_file, cur_fn = queue.pop()
+        for callee in ctx.callees(cur_file, cur_fn):
+            for cfile, cname, _cmod in ctx.resolve(callee, cur_file):
+                pair = (norm_path(cfile), cname)
+                if pair not in cone:
+                    cone.add(pair)
+                    queue.append(pair)
+    return cone
+
+
 def _compute_deps(state: dict, ctx: Ctx) -> None:
     tasks = state["tasks"]
     prove_by_key = {_key(t): tid for tid, t in tasks.items() if t["kind"] == "prove"}
@@ -968,8 +1168,7 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
         if task["kind"] == "prove":
             own = _key(task)
             deps: set[str] = {f"gate:{task['module']}"}
-            if f"arch:{task['module']}" in tasks:
-                deps.add(f"arch:{task['module']}")
+
             callees: set[str] = set()
             for callee in ctx.callees(task["file"], task["function"]):
                 for cfile, cname, cmod in ctx.resolve(callee, task["file"]):
@@ -977,12 +1176,24 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
                     if key == own:
                         continue  # self-recursion
                     callees.add(key)
-                    if key in prove_by_key:
-                        deps.add(prove_by_key[key])
-                    # The callee's contract comes from its module's architect, even when the callee
-                    # itself has nothing left to prove.
-                    if cmod and f"arch:{cmod}" in tasks:
-                        deps.add(f"arch:{cmod}")
+                    # Speculative contract-first dispatch (Option A):
+                    # If callee already has a contract in workspace/work/, caller does not wait
+                    # for the callee's body proof or callee module architect.
+                    has_contract = callee_has_contract(ctx, cfile, cname, cmod)
+                    if not has_contract:
+                        if key in prove_by_key:
+                            deps.add(prove_by_key[key])
+                        if cmod and f"arch:{cmod}" in tasks:
+                            deps.add(f"arch:{cmod}")
+
+            # Omit arch:<module> for leaf and static functions that do not touch the module header
+            touches_hdr = touches_module_header(ctx, task["file"], task["function"], task.get("module"))
+            is_leaf = len(callees) == 0
+            is_static = is_static_fn(ctx, task["file"], task["function"])
+            if not ((is_leaf or is_static) and not touches_hdr):
+                if f"arch:{task['module']}" in tasks:
+                    deps.add(f"arch:{task['module']}")
+
             task["deps"] = sorted(deps)
             task["callees"] = sorted(callees)
             task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task["function"])
@@ -1007,8 +1218,14 @@ def _compute_graph(state: dict) -> None:
     """Recursion groups (SCCs of the prove graph), waves over the condensed graph, and heights."""
     tasks = state["tasks"]
     prove_ids = sorted(tid for tid, t in tasks.items() if t["kind"] == "prove")
-    prove_set = set(prove_ids)
-    succ = {tid: sorted(d for d in tasks[tid]["deps"] if d in prove_set and d != tid) for tid in prove_ids}
+    prove_by_key = {_key(t): tid for tid, t in tasks.items() if t["kind"] == "prove"}
+    # Tarjan call graph SCCs are computed from the full call graph, decoupled from pruned execution deps
+    succ = {
+        tid: sorted(
+            {prove_by_key[c] for c in tasks[tid].get("callees", []) if c in prove_by_key and prove_by_key[c] != tid}
+        )
+        for tid in prove_ids
+    }
     comps = _tarjan(prove_ids, succ)
     comp_of: dict[str, int] = {}
     for i, comp in enumerate(comps):
@@ -1031,27 +1248,86 @@ def _compute_graph(state: dict) -> None:
         tasks[tid]["height"] = height
 
 
-def _blocker_index(state: dict) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+def _blocker_index(
+    state: dict,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[tuple[str, str], set[str]]]:
     by_module: dict[str, set[str]] = defaultdict(set)
     by_file: dict[str, set[str]] = defaultdict(set)
+    by_fn: dict[tuple[str, str], set[str]] = defaultdict(set)
     for tid, task in state["tasks"].items():
         if task["kind"] in ("verify", "repair"):
             by_module[task.get("module") or ""].add(tid)
-        if task["kind"] == "verify" and task.get("location_file"):
-            by_file[task["location_file"]].add(tid)
-    return by_module, by_file
+        if task["kind"] == "verify":
+            loc_file = norm_path(task.get("location_file") or "")
+            if loc_file:
+                by_file[loc_file].add(tid)
+            loc_fn = task.get("location_function") or task.get("function") or ""
+            if not loc_fn and task.get("fingerprint"):
+                fp = task["fingerprint"]
+                if "#" in fp and "::" in fp:
+                    loc_fn = fp.split("#", 1)[-1].split("::", 1)[0]
+            if loc_file and loc_fn:
+                by_fn[(loc_file, loc_fn)].add(tid)
+    return by_module, by_file, by_fn
 
 
-def _gate_blockers(state: dict, module: str, index: tuple[dict, dict]) -> set[str]:
-    """Verify and repair tasks gate:<module> waits on: those of every slice covering its files, and
-    every candidate located in its files."""
-    by_module, by_file = index
-    gate = state.get("gates", {}).get(f"gate:{module}") or {"contributors": [module], "files": []}
-    out: set[str] = set()
-    for mod in set(gate.get("contributors") or []) | {module}:
-        out |= by_module.get(mod, set())
-    for file in gate.get("files") or []:
-        out |= by_file.get(file, set())
+def _gate_blockers(
+    state: dict,
+    module: str,
+    index: tuple[Any, ...],
+    task: dict | None = None,
+    ctx: Ctx | None = None,
+) -> set[str]:
+    """
+    Verify and repair tasks blocking a gate or a task.
+    When task is None or kind != 'prove': coarse module gating for arch:<module>, _chain_heights, and cmd_status.
+    When task has kind == 'prove': fine-grained gating blocking only on verify tasks in task's call cone,
+    external contributor slices, and active repair tasks for the module.
+    """
+    by_module = index[0]
+    by_file = index[1]
+    by_fn = index[2] if len(index) > 2 else {}
+
+    # Active repair tasks on the module always block
+    active_repairs = {
+        tid for tid in by_module.get(module, set()) if state["tasks"].get(tid, {}).get("kind") == "repair"
+    }
+
+    if task is not None and task.get("kind") == "arch":
+        return set(active_repairs)
+
+    if task is None or task.get("kind") != "prove":
+        # Coarse module gate for _chain_heights, and cmd_status reporting
+        gate = state.get("gates", {}).get(f"gate:{module}") or {"contributors": [module], "files": []}
+        out = set(active_repairs)
+        for mod in set(gate.get("contributors") or []) | {module}:
+            out |= by_module.get(mod, set())
+        for file in gate.get("files") or []:
+            out |= by_file.get(file, set())
+        return out
+
+    # Fine-grained gate for prove:<fn>
+    out = set(active_repairs)
+
+    # 1. External contributor slices covering this module's files:
+    # If another slice compiles this module's sources, verify tasks from that contributor slice hold the gate.
+    gate = state.get("gates", {}).get(f"gate:{module}") or {}
+    external_contributors = set(gate.get("contributors") or []) - {module}
+    for ext_mod in external_contributors:
+        out |= by_module.get(ext_mod, set())
+
+    # 2. Harness-induced candidates:
+    # If the module has a harness sidecar (harness_<module>.json), any candidate in that module
+    # may trigger a harness rejection and repair:module, holding the gate for the module.
+    harness_path = HARNESS_DIR / f"harness_{module}.json"
+    if harness_path.is_file():
+        out |= by_module.get(module, set())
+    else:
+        # Fine-grained: only verify tasks whose candidate belongs to this function or its transitive callees
+        cone = _call_cone(task.get("file") or "", task.get("function") or "", ctx)
+        for cfile, cfn in cone:
+            out |= by_fn.get((cfile, cfn), set())
+
     return out
 
 
@@ -1107,16 +1383,22 @@ def _chain_heights(state: dict, open_only: bool) -> tuple[dict[str, int], int]:
 class _View:
     """Readiness queries over one loaded state; `assume_terminal` asks "ready if these were done?"."""
 
-    def __init__(self, state: dict, assume_terminal: Iterable[str] = ()) -> None:
+    def __init__(self, state: dict, assume_terminal: Iterable[str] = (), ctx: Ctx | None = None) -> None:
         self.state = state
         self.tasks = state["tasks"]
+        if ctx is None:
+            try:
+                ctx = Ctx()
+            except Exception:
+                ctx = None
+        self.ctx = ctx
         self.index = _blocker_index(state)
         self.assume = frozenset(assume_terminal)
         self.scc: dict[str, list[str]] = defaultdict(list)
         for tid in sorted(self.tasks):
             if self.tasks[tid].get("scc"):
                 self.scc[self.tasks[tid]["scc"]].append(tid)
-        self._gates: dict[str, bool] = {}
+        self._gates: dict[tuple[str, str | None], bool] = {}
         self._group_done: dict[str, bool] = {}
         self._group_ready: dict[str, bool] = {}
 
@@ -1124,22 +1406,34 @@ class _View:
         task = self.tasks.get(tid)
         return task is None or task["state"] in TERMINAL or tid in self.assume
 
-    def gate_open(self, module: str) -> bool:
-        if module not in self._gates:
-            self._gates[module] = all(self.terminal(b) for b in _gate_blockers(self.state, module, self.index))
-        return self._gates[module]
+    def gate_open(self, module: str, task: dict | None = None) -> bool:
+        task_id = task["id"] if task else None
+        key = (module, task_id)
+        if key not in self._gates:
+            blockers = _gate_blockers(self.state, module, self.index, task=task, ctx=self.ctx)
+            self._gates[key] = all(self.terminal(b) for b in blockers)
+        return self._gates[key]
 
     def group(self, tid: str) -> list[str]:
         task = self.tasks.get(tid)
         return self.scc[task["scc"]] if task and task.get("scc") else [tid]
 
-    def dep_ok(self, dep: str) -> bool:
+    def dep_ok(self, dep: str, task: dict | None = None) -> bool:
         if dep.startswith("gate:"):
-            return self.gate_open(dep[len("gate:") :])
+            return self.gate_open(dep[len("gate:") :], task=task)
         # A callee inside a recursion group is done only when the whole group is.
         scc = (self.tasks.get(dep) or {}).get("scc")
         if not scc:
-            return self.terminal(dep)
+            if self.terminal(dep):
+                return True
+            # Dynamic contract unblocking: if callee acquired a contract in workspace/work/, caller proceeds
+            if dep.startswith("prove:"):
+                t = self.tasks.get(dep)
+                if t:
+                    cctx = self.ctx or Ctx()
+                    if callee_has_contract(cctx, t["file"], t["function"], t.get("module")):
+                        return True
+            return False
         if scc not in self._group_done:
             self._group_done[scc] = all(self.terminal(m) for m in self.scc[scc])
         return self._group_done[scc]
@@ -1154,7 +1448,11 @@ class _View:
         inside = set(members)
         # Recursion-group members become ready together: the group waits on every member's
         # outside dependencies, never on its own members.
-        ok = all(dep in inside or self.dep_ok(dep) for member in members for dep in _deps(self.tasks[member]))
+        ok = all(
+            dep in inside or self.dep_ok(dep, task=self.tasks[member])
+            for member in members
+            for dep in _deps(self.tasks[member])
+        )
         if scc:
             self._group_ready[scc] = ok
         return ok
@@ -1193,8 +1491,8 @@ def _waves_filter(state: dict) -> Callable[[dict], bool]:
     return allowed
 
 
-def _ready(state: dict, mode: str) -> list[dict]:
-    view = _View(state)
+def _ready(state: dict, mode: str, ctx: Ctx | None = None) -> list[dict]:
+    view = _View(state, ctx=ctx)
     allowed = _waves_filter(state) if mode == "waves" else (lambda _task: True)
     return sorted((t for t in state["tasks"].values() if view.ready(t) and allowed(t)), key=_priority_key)
 
@@ -1757,7 +2055,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             budget = max(0, int(slots))
             out["slots"] = {"mode": "fixed", "running": running, "available": budget}
         picked: list[str] = []
-        for task in _ready(state, mode):
+        for task in _ready(state, mode, ctx=ctx):
             if task["kind"] == "repair":
                 _assign_parent(state, task)
                 out["parent_tasks"].append(_describe_repair(task))
@@ -1799,14 +2097,26 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
     # Scratch overlays are snapshotted under the `merge` lock: never while holding the ledger lock.
     prepared: dict[str, dict] = {}
     failures: dict[str, str] = {}
-    for tid in picked:
-        task = snapshot[tid]
-        try:
-            prepared[tid] = DEPS.prepare_agent(
-                Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task)
-            )
-        except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running
-            failures[tid] = f"{type(exc).__name__}: {exc}"
+    if picked:
+        worker_cap = min(len(picked), os.cpu_count() or 4, 16)
+
+        def _do_prepare(tid: str) -> tuple[str, dict | None, str | None]:
+            task = snapshot[tid]
+            try:
+                res = DEPS.prepare_agent(
+                    Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task)
+                )
+                return tid, res, None
+            except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running
+                return tid, None, f"{type(exc).__name__}: {exc}"
+
+        with run_lock("merge"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_cap) as executor:
+                for tid, res, err in executor.map(_do_prepare, picked):
+                    if err is not None:
+                        failures[tid] = err
+                    elif res is not None:
+                        prepared[tid] = res
 
     with run_lock("ledger"):
         state = load_schedule()
@@ -2733,13 +3043,26 @@ def _run_rechecks(module: str | None, out: dict) -> None:
     if not jobs:
         return
     results = {}
-    for job in jobs:
-        try:
-            results[job["id"]] = DEPS.recheck_function(
-                Path.cwd().resolve(), job["agent_id"], job["file"], job["function"], job["module"]
-            )
-        except Exception as exc:  # treated like an analysis error: retried once, then a re-proof
-            results[job["id"]] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "report": None}
+    worker_cap = min(len(jobs), os.cpu_count() or 4, 16)
+    with run_lock("merge"):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_cap) as executor:
+            future_to_job = {
+                executor.submit(
+                    DEPS.recheck_function,
+                    Path.cwd().resolve(),
+                    job["agent_id"],
+                    job["file"],
+                    job["function"],
+                    job["module"],
+                ): job
+                for job in jobs
+            }
+            for fut in concurrent.futures.as_completed(future_to_job):
+                job = future_to_job[fut]
+                try:
+                    results[job["id"]] = fut.result()
+                except Exception as exc:  # treated like an analysis error: retried once, then a re-proof
+                    results[job["id"]] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "report": None}
     with run_lock("ledger"):
         state = load_schedule()
         for job in jobs:
@@ -2814,6 +3137,48 @@ def cmd_merge_pending(module: str | None = None, force: bool = False) -> dict:
             save_schedule(state)
     _run_rechecks(module, out)
     return out
+
+
+def cmd_step(
+    complete_ids: list[str] | None = None,
+    slots: str | int = "auto",
+    prepare: bool = False,
+    max_agents: int | None = None,
+    force_merge: bool = False,
+    module: str | None = None,
+) -> dict:
+    """
+    Atomically complete finished agents, eagerly merge pending provers, and dispatch next tasks.
+    Enables a continuous reactive sliding-window loop without waiting for batch barriers.
+    """
+    completed: list[dict] = []
+    errors: list[Any] = []
+    for aid in complete_ids or []:
+        try:
+            res = cmd_complete(aid)
+            completed.append(res)
+            if res.get("errors"):
+                errors.extend(res["errors"])
+        except Exception as exc:
+            errors.append(f"complete {aid} failed: {type(exc).__name__}: {exc}")
+            completed.append({"ok": False, "agent_id": aid, "error": str(exc)})
+
+    merge_out = cmd_merge_pending(module=module, force=force_merge)
+    if merge_out.get("errors"):
+        errors.extend(merge_out["errors"])
+
+    next_out = cmd_next(slots=str(slots), prepare=prepare, max_agents=max_agents)
+    if next_out.get("errors"):
+        errors.extend(next_out["errors"])
+
+    ok = not errors and merge_out.get("ok", True) and next_out.get("ok", True)
+    return {
+        "ok": ok,
+        "completed": completed,
+        "merge_pending": merge_out,
+        "next": next_out,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2896,8 +3261,8 @@ def cmd_status() -> dict:
     mode = scheduler_mode()
     tasks = state["tasks"]
     now = DEPS.now()
-    ready = _ready(state, mode)
-    view = _View(state)
+    ready = _ready(state, mode, ctx=ctx)
+    view = _View(state, ctx=ctx)
     running = [
         {
             "task": t["id"],
@@ -2975,6 +3340,15 @@ def main(argv: list[str] | None = None) -> int:
     p_next.add_argument("--slots", default="auto", help="'auto' (recommend().max_agents minus running) or a number")
     p_next.add_argument("--prepare", action="store_true", help="Prepare overlays and briefs, claim prover units (CAS)")
     p_next.add_argument("--max-agents", type=int, default=None, help="Cap for --slots auto (else FRAMAC_MAX_AGENTS)")
+    p_step = sub.add_parser(
+        "step", help="Atomically complete agents, eagerly merge pending provers, and dispatch next tasks"
+    )
+    p_step.add_argument("--complete", nargs="*", default=None, help="Agent IDs to complete")
+    p_step.add_argument("--slots", default="auto", help="'auto' (recommend().max_agents minus running) or a number")
+    p_step.add_argument("--prepare", action="store_true", help="Prepare overlays and briefs, claim prover units (CAS)")
+    p_step.add_argument("--max-agents", type=int, default=None, help="Cap for --slots auto (else FRAMAC_MAX_AGENTS)")
+    p_step.add_argument("--force-merge", action="store_true", help="Force immediate merge of queued provers")
+    p_step.add_argument("--module", default=None, help="Restrict merge-pending to this module")
     p_comp = sub.add_parser("complete", help="Validate one agent result and dispatch it by role")
     p_comp.add_argument("--agent-id", required=True)
     p_merge = sub.add_parser("merge-pending", help="Merge queued prover results in micro-batches; run re-checks")
@@ -2997,6 +3371,18 @@ def main(argv: list[str] | None = None) -> int:
             if slots != "auto" and not slots.isdigit():
                 raise SchedulerError(f"--slots must be 'auto' or a non-negative integer, got {args.slots!r}")
             out = cmd_next(slots, args.prepare, args.max_agents)
+        elif args.cmd == "step":
+            slots = str(args.slots).strip().lower()
+            if slots != "auto" and not slots.isdigit():
+                raise SchedulerError(f"--slots must be 'auto' or a non-negative integer, got {args.slots!r}")
+            out = cmd_step(
+                complete_ids=args.complete,
+                slots=slots,
+                prepare=args.prepare,
+                max_agents=args.max_agents,
+                force_merge=args.force_merge,
+                module=args.module,
+            )
         elif args.cmd == "complete":
             out = cmd_complete(args.agent_id)
         elif args.cmd == "merge-pending":

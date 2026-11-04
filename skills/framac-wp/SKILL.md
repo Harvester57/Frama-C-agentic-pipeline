@@ -24,37 +24,39 @@ Modular deductive verification stage built from:
 - **The Dual-Oracle Guardrail** (`E-ACSL` + `WP`).
 - **The Crash Verification Gate** (`crash_verifier_brief.md`).
 
-How resources are measured and how caches work: `docs/resources-and-caching.md`.
+How resources are measured and how caches work: [resources-and-caching.md](../../docs/resources-and-caching.md).
 
 ## Architecture Overview
 
-1. **Ready queue, not waves.** A function's prover starts as soon as all of these are done:
-   - its callees are merged (recursion cycles become ready together);
-   - the header architects of its module and of every callee's module;
-   - the gate of every fuzz/Eva slice that covers its file.
+1. **Continuous reactive sliding-window loop (not wave barriers).** A function's prover starts as soon as:
+   - its callees have an initial contract in `workspace/work/` (speculative contract-first dispatch; callers do not wait for callee body proofs);
+   - internal static callees without any contract are proven first (Option A);
+   - leaf and internal static functions run concurrently with module architects (`arch:<module>`);
+   - verify tasks gate only functions within their direct call cone; safe functions remain unblocked.
 
-   The task with the longest chain of callers waiting on it goes first.
+   Tasks are prioritized by caller height, then Eva unknown count, then function name.
 2. **Crash Verification Gate.** Every `unverified` candidate becomes a `verify` task for a fresh Crash Verifier subagent.
    - `confirmed` marks the function's units `candidate`; they are excluded from WP.
    - `rejected` / `harness_induced`, with repairs left, creates a `repair` task for you, the parent (up to 2 per module): fix the harness, re-run the module, refresh the scheduler.
    - A gate opens once its candidates are verified and its repairs are done. New candidates (from breakers) or repairs reopen it.
-3. **Speculative Interface Architects.** One per module header (`header_architect_brief.md`). It writes baseline contracts in its scratch overlay. The scheduler merges it on completion.
-4. **Function Provers.** Several functions of the same `.c` or `.h` can be proved at once: each prover edits its own `agents/<id>/scratch/work/`, and the parent splices only that function's spans.
-   - Finished provers are merged in micro-batches per module (`merge-pending`).
-   - Merges re-run the guardrail and WP on the merged tree, with per-function WP checks in parallel.
-5. **Adversarial Breakers.** A prover that stalls after `K` retries (default `K = 4`) gets a breaker (`breaker_brief.md`). The breaker never blocks the callers. Its seeds and fault hypotheses go through the Crash Verification Gate.
+3. **Speculative Interface Architects & Tolerant Header Splice.** One architect per module header ([header_architect_brief.md](./header_architect_brief.md)). It writes baseline contracts in its scratch overlay. A tolerant 3-way AST declaration merger (`splice_architect_header`) cleanly splices non-overlapping function contracts and predicates into headers, enabling provers and architects to work on module headers concurrently.
+4. **Function Provers & Sliding-Window Dispatch.** Several functions of the same `.c` or `.h` can be proved at once: each prover edits its own `agents/<id>/scratch/work/`, and the parent splices only that function's spans.
+   - Finished provers are merged eagerly or in micro-batches per module (`merge-pending`).
+   - Merges re-run the guardrail and WP on the merged tree, with per-function WP re-checks executed in parallel.
+   - High-spec machines ($\ge 32$ CPUs, $\ge 64$ CPUs) scale concurrency up to 32 and 64 concurrent agents, while per-process limits remain strictly invariant (`WP_MEMLIMIT_MB=1000`, `FUZZ_RSS_LIMIT_MB=2048`).
+5. **Adversarial Breakers.** A prover that stalls after `K` retries (default `K = 4`) gets a breaker ([breaker_brief.md](./breaker_brief.md)). The breaker never blocks the callers. Its seeds and fault hypotheses go through the Crash Verification Gate.
 6. **Contract negotiation.** A strengthening request becomes a `negotiate` task as soon as it is ingested, capped per caller/callee pair. The caller is requeued once it resolves. Any merge that changes a contract re-checks the callers already merged (cached).
 
 ## Ownership & Isolation Rules
 
 - **Single writer:** the parent is the only writer of `coverage-ledger.json`, `candidates.json`, `findings.json`, `workspace/work/`, `workspace/corpus/`, and `workspace/crashes/`.
-- **Locks:** shared state is protected by run-wide locks; merges are journaled, so a killed merge is rolled back by the next one (`docs/resources-and-caching.md`, Section 8).
-- **Preparation:** the scheduler prepares every agent (`next --prepare`).
-  - It snapshots `workspace/work/` into `agents/<agent-id>/scratch/work/`.
+- **Locks:** shared state is protected by run-wide locks; merges are journaled, so a killed merge is rolled back by the next one ([resources-and-caching.md](../../docs/resources-and-caching.md), Section 8).
+- **Preparation:** the scheduler prepares agents concurrently via a thread pool (`next --prepare` or `step --prepare`).
+  - It snapshots `workspace/work/` into `agents/<agent-id>/scratch/work/` under the `merge` lock.
   - It moves the prover's planned units to `in_progress` with a compare-and-set, so a unit that just became a `candidate` is never handed out.
   - It renders `agents/<agent-id>/brief.md` with every template variable filled, including the host paths the agent needs for the wrapper.
 - **Agent outputs:** every subagent writes only under `agents/<agent-id>/scratch/`, writes its final JSON result to `agents/<agent-id>/scratch/result.json` (which `wp_scheduler.py complete --agent-id <agent-id>` reads from disk and validates with `validate_artifacts.py agent-result`), and returns **one JSON object**.
-- **References:** `prepare-agent` / `next --prepare` automatically fills the `{references_dir}` placeholder in every brief with the path to `docs/references/` (mounted inside the container at `/opt/framac-pipeline/docs/references`). That folder holds greppable Frama-C manuals (see `docs/references/README.md`), which subagents grep only as a last resort.
+- **References:** `prepare-agent` / `next --prepare` automatically fills the `{references_dir}` placeholder in every brief with the path to `docs/references/` (mounted inside the container at `/opt/framac-pipeline/docs/references`). That folder holds greppable Frama-C manuals (see [README.md](../../docs/references/README.md)), which subagents grep only as a last resort.
 - **Pure ACSL, in scope:** provers and architects may add **pure ACSL annotations only** (`/*@ ... */`, `//@ ...`) within their assigned function or header. `merge-agent` and `merge-batch` mechanically reject:
   - any C token modification;
   - any scope violation;
@@ -78,18 +80,19 @@ python3 /opt/framac-pipeline/scripts/wp_scheduler.py init
 
 When resuming a run that was interrupted, or one started before the scheduler existed, use `init --reconcile`. It returns `in_progress` units with no live agent to `planned` and reports briefs that need re-rendering.
 
-### Step 2 — The dispatch loop (rolling window)
+### Step 2 — The reactive continuous loop (sliding window)
 
 Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` reports `"done": true`:
 
-1. **Hand out ready tasks.**
+1. **Atomic step (recommended):** complete finished agents, eagerly merge queued provers, and pull the next ready tasks in a single invocation:
    ```text
-   python3 /opt/framac-pipeline/scripts/wp_scheduler.py next --slots auto --prepare
+   python3 /opt/framac-pipeline/scripts/wp_scheduler.py step --complete <id1> <id2>... --slots auto --prepare
    ```
-   - `--slots auto` = `recommend().max_agents` minus running tasks. It is recomputed each round from the measured machine, and capped by `--max-agents` / `FRAMAC_MAX_AGENTS`.
-   - Each entry of `tasks[]` has a `kind`, an `agent_id`, a `role` and a `brief_file`.
-   - Entries in `skipped[]` were not handed out, with a reason. For example, a unit that became a `candidate` since `init`: the compare-and-set refused it, so it stays excluded from WP.
-   - `parent_tasks[]` are `repair` tasks for you, the parent. They take no agent slot:
+   - On the first iteration, run with `--slots auto --prepare` without `--complete`.
+   - `--slots auto` = `recommend().max_agents` minus running tasks. On high-spec hardware, this scales dynamically up to 32 agents on $\ge 32$ CPUs and 64 agents on $\ge 64$ CPUs.
+   - Finished provers merge eagerly without waiting for unrelated module provers, unblocking callers immediately.
+   - Newly ready tasks in `next.tasks[]` provide the `agent_id`, `role`, and `brief_file` for newly spawned agents.
+   - `next.parent_tasks[]` are `repair` tasks for you, the parent. They take no agent slot:
      1. Record the attempt:
         ```text
         python3 /opt/framac-pipeline/scripts/generate_harness.py --record-repair workspace/harnesses/harness_<mod>.json --reason "<reason>"
@@ -97,39 +100,32 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
      2. Fix `workspace/harnesses/harness_<mod>.c`, or regenerate it with `--auto-args` / `--entry-style auto_prototype` for an internal multi-argument function.
      3. Run the task's listed `actions`, typically `pipeline_make.py run module-<mod>`.
      4. Then run `wp_scheduler.py refresh --module <mod>`.
-2. **Execute or spawn each task** using its rendered `brief_file` (spawn one subagent per task if your host supports subagents, or execute each task sequentially in the foreground, writing `agents/<id>/scratch/result.json` before calling `complete`). Two kinds carry extra context, which `--prepare` already renders into the brief:
+
+2. **Execute or spawn each task** using its rendered `brief_file`. Two kinds carry extra context, which `--prepare` already renders into the brief:
    - **`negotiate`:** a callee prover asked to strengthen its contract. The brief ends with every entry of the task's `requests[]` (the `needed_clause`, the `reason`, the requesting caller). The prover must prove each clause or explain why it does not hold.
    - **`breaker`:** the brief lists the unproven goals from the task's `wp_report`, the stalled prover's own WP report, and names that file.
 
    Without `--prepare`, render the same briefs with `workspace_overlay.py prepare-agent --request-id <id>` (repeatable) or `--wp-report <path>`.
-3. **On each completion:**
+
+3. **Granular subcommands (alternative to atomic step):**
+   If finer control is needed, the individual subcommands remain available:
    ```text
    python3 /opt/framac-pipeline/scripts/wp_scheduler.py complete --agent-id <id>
    python3 /opt/framac-pipeline/scripts/wp_scheduler.py merge-pending
+   python3 /opt/framac-pipeline/scripts/wp_scheduler.py next --slots auto --prepare
    ```
    `complete` reads `agents/<id>/scratch/result.json`, validates it, and dispatches by role:
    - **proven** provers are queued for merging;
-   - **stalled or blocked** provers:
-     - get their WP report ingested;
-     - get their hypotheses and strengthening requests recorded, each request emitting a `negotiate` task;
-     - leave a non-blocking `breaker` task behind;
+   - **stalled or blocked** provers get their WP report ingested, hypotheses/requests recorded, and leave a non-blocking breaker behind;
    - **verifiers** are ingested with their replay report (`ingest-verifier`);
-   - **architects** are merged;
-   - a WP run that ended in `analysis_error` (killed or timed out) is retried once with a larger lease, then its units become `blocked`.
+   - **architects** are merged via tolerant header splicing.
 
-   `merge-pending` merges finished provers in micro-batches. It runs when:
-   - a module has no running provers;
-   - or a ready caller is waiting on an unmerged callee;
-   - or ≥ 4 results are queued;
-   - or the oldest has waited 5 minutes.
-
-   It ingests each merged function's parent WP report and saves checkpoint shards.
 4. Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .` after any manual write.
 
 **Recovery:**
 - An agent that never returns: `wp_scheduler.py requeue --stale-minutes <N>` (or `--agent-id <id>`) puts its task back and returns its units to `planned`. If its result arrives later anyway, `complete` still accepts it.
 - `status` reports `"stuck": true` when nothing is ready or running yet tasks remain. That usually means a gate is waiting on a repair or verify task (see `gates`), or an agent never returned. Resolve it before looping again.
-- **Fallback:** `FRAMAC_SCHEDULER=waves` makes `next` hand out tasks wave by wave, with a barrier between waves. Use it only for A/B comparison.
+- **Fallback:** `FRAMAC_SCHEDULER=waves` makes `next` hand out tasks wave by wave, with strict barriers between waves. Use it for comparison or debugging.
 
 ### Step 3 — Final Record Re-Verification & Diff Export
 

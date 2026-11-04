@@ -41,6 +41,7 @@ from acsl_ast import (  # noqa: E402
     ScopeViolationError,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
+    splice_architect_header,
     splice_prover_changes,
     verify_acsl_only,
 )
@@ -919,8 +920,14 @@ def _merge_agent_overlay_locked(
         is_hdr = rel_str.endswith(".h")
         if role == "architect":
             if curr_text != base_snap_text:
-                raise ScopeViolationError(f"{rel_str}: header modified concurrently since architect started")
-            spliced = agent_text
+                spliced = splice_architect_header(
+                    base_text=base_snap_text,
+                    agent_text=agent_text,
+                    current_text=curr_text,
+                    path=rel_str,
+                )
+            else:
+                spliced = agent_text
         else:
             spliced = splice_prover_changes(
                 base_work_text=base_snap_text,

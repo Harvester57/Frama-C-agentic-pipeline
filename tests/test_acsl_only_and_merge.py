@@ -12,7 +12,9 @@ import workspace_overlay
 from acsl_ast import (
     AcslSyntaxError,
     ScopeViolationError,
+    locate_all_prototype_spans,
     locate_function_span,
+    splice_architect_header,
     splice_prover_changes,
     tokenize_c_acsl,
     verify_acsl_only,
@@ -872,3 +874,287 @@ int parse_payload(const uint8_t *buf, size_t len, int *out);
         )
         res = workspace_overlay.check_acsl_only(scratch)
         assert res["ok"] is True and res["errors"] == []
+
+
+class TestTolerantArchitectHeaderMerge:
+    """Tests for Milestone M1: Tolerant Header Merging (acsl_ast.splice_architect_header)."""
+
+    def test_locate_all_prototype_spans_and_predicate_separation(self) -> None:
+        """locate_all_prototype_spans finds all prototypes and does not absorb top-level predicates."""
+        spans = locate_all_prototype_spans(BASELINE_H, path="parser.h")
+        assert [s.function for s in spans] == ["parse_magic", "parse_payload"]
+        assert spans[0].text == "int parse_magic(const uint8_t *buf, size_t len);"
+        assert spans[1].text == "int parse_payload(const uint8_t *buf, size_t len, int *out);"
+
+        # Preceding predicate must not be swallowed into parse_magic span
+        src_with_pred = (
+            "/*@ predicate valid_buf(char *b) = b != \\null; */\nint parse_magic(const uint8_t *buf, size_t len);\n"
+        )
+        spans_pred = locate_all_prototype_spans(src_with_pred, path="test.h")
+        assert len(spans_pred) == 1
+        assert spans_pred[0].function == "parse_magic"
+        assert "predicate valid_buf" not in spans_pred[0].text
+        assert spans_pred[0].text == "int parse_magic(const uint8_t *buf, size_t len);"
+
+        fn_span = locate_function_span(src_with_pred, "parse_magic", is_header=True)
+        assert fn_span is not None
+        assert "predicate valid_buf" not in fn_span.text
+
+    def test_splice_architect_header_fast_paths(self) -> None:
+        """Fast paths: returns agent when current == base; returns current when agent == base or agent == current."""
+        base_h = BASELINE_H
+        annotated_magic = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@ assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+        )
+        annotated_payload = base_h.replace(
+            "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+            "/*@ requires out == \\null || \\valid(out); */\nint parse_payload(const uint8_t *buf, size_t len, int *out);",
+        )
+
+        # 1. current_text == base_text -> returns agent_text
+        res1 = splice_architect_header(base_h, annotated_magic, base_h, path="parser.h")
+        assert res1 == annotated_magic
+
+        # 2. agent_text == base_text -> returns current_text
+        res2 = splice_architect_header(base_h, base_h, annotated_payload, path="parser.h")
+        assert res2 == annotated_payload
+
+        # 3. agent_text == current_text -> returns current_text
+        res3 = splice_architect_header(base_h, annotated_magic, annotated_magic, path="parser.h")
+        assert res3 == annotated_magic
+
+    def test_splice_architect_header_disjoint_prototypes(self) -> None:
+        """Disjoint prototype modifications by architect and concurrent agent succeed and preserve C tokens."""
+        base_h = BASELINE_H
+        # Architect annotates parse_magic
+        agent_h = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@\n"
+            "  requires buf == \\null || \\valid_read(buf + (0 .. len - 1));\n"
+            "  assigns \\nothing;\n"
+            "*/\n"
+            "int parse_magic(const uint8_t *buf, size_t len);",
+        )
+        # Concurrent agent annotated parse_payload
+        curr_h = base_h.replace(
+            "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+            "/*@\n"
+            "  requires out == \\null || \\valid(out);\n"
+            "  assigns *out;\n"
+            "*/\n"
+            "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+        )
+
+        spliced = splice_architect_header(base_h, agent_h, curr_h, path="parser.h")
+        assert "\\valid_read(buf + (0 .. len - 1))" in spliced
+        assert "\\valid(out)" in spliced
+        assert "assigns \\nothing;" in spliced
+        assert "assigns *out;" in spliced
+        # Non-ACSL tokens match baseline identically
+        assert verify_acsl_only(base_h, spliced, path="parser.h") == []
+
+    def test_splice_architect_header_identical_concurrent_contract(self) -> None:
+        """Identical contract added by both architect and concurrent prover succeeds without conflict."""
+        base_h = BASELINE_H
+        annotated_magic = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@ requires len >= 4; assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+        )
+        spliced = splice_architect_header(base_h, annotated_magic, annotated_magic, path="parser.h")
+        assert "requires len >= 4;" in spliced
+        assert spliced.count("requires len >= 4;") == 1
+        assert verify_acsl_only(base_h, spliced, path="parser.h") == []
+
+        # Also test with whitespace differences: normalized contracts match
+        agent_h = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@\n  requires len >= 4;\n  assigns \\nothing;\n*/\nint parse_magic(const uint8_t *buf, size_t len);",
+        )
+        curr_h = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@ requires len >= 4; assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+        )
+        spliced2 = splice_architect_header(base_h, agent_h, curr_h, path="parser.h")
+        assert "requires len >= 4;" in spliced2
+        assert verify_acsl_only(base_h, spliced2, path="parser.h") == []
+
+    def test_splice_architect_header_conflicting_prototype_contract(self) -> None:
+        """Conflicting contracts on the same prototype raise ScopeViolationError."""
+        base_h = BASELINE_H
+        agent_h = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@ requires len >= 4; assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+        )
+        curr_h = base_h.replace(
+            "int parse_magic(const uint8_t *buf, size_t len);",
+            "/*@ requires len >= 8; assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+        )
+
+        with pytest.raises(
+            ScopeViolationError,
+            match=r"conflicting concurrent modification to prototype contract of 'parse_magic'",
+        ):
+            splice_architect_header(base_h, agent_h, curr_h, path="parser.h")
+
+    def test_splice_architect_header_predicates_disjoint_and_dedup(self) -> None:
+        """Disjoint predicates merge into spliced text and identical predicates deduplicate cleanly."""
+        base_h = BASELINE_H
+        shared_p = "/*@ predicate non_null(char *p) = p != \\null; */\n"
+        p1 = "/*@ predicate valid_magic_len(integer n) = n >= 4; */\n"
+        p2 = "/*@ predicate valid_payload_len(integer n) = n > 0; */\n"
+
+        # Architect adds P1 and shared_p
+        agent_h = base_h.replace("#define PARSER_H\n", f"#define PARSER_H\n\n{shared_p}{p1}")
+        # Concurrent agent added P2 and shared_p
+        curr_h = base_h.replace("#define PARSER_H\n", f"#define PARSER_H\n\n{shared_p}{p2}")
+
+        spliced = splice_architect_header(base_h, agent_h, curr_h, path="parser.h")
+        assert "valid_magic_len" in spliced
+        assert "valid_payload_len" in spliced
+        assert "non_null" in spliced
+        # Deduplication ensures non_null appears exactly once
+        assert spliced.count("predicate non_null") == 1
+        assert verify_acsl_only(base_h, spliced, path="parser.h") == []
+
+    def test_splice_architect_header_conflicting_predicate_declaration(self) -> None:
+        """Conflicting predicate declarations with the same name/profile raise ScopeViolationError."""
+        base_h = BASELINE_H
+        p_conflict_agent = "/*@ predicate check_magic(integer n) = n >= 4; */\n"
+        p_conflict_curr = "/*@ predicate check_magic(integer n) = n >= 8; */\n"
+        agent_h_conf = base_h.replace("#define PARSER_H\n", f"#define PARSER_H\n\n{p_conflict_agent}")
+        curr_h_conf = base_h.replace("#define PARSER_H\n", f"#define PARSER_H\n\n{p_conflict_curr}")
+
+        with pytest.raises(ScopeViolationError, match=r"conflicting concurrent declaration of 'check_magic'"):
+            splice_architect_header(base_h, agent_h_conf, curr_h_conf, path="parser.h")
+
+    def test_architect_header_merge_tolerates_concurrent_prover_on_disjoint_function(self, tmp_path: Path) -> None:
+        """Architect merge succeeds when a concurrent prover already updated a disjoint prototype in the header."""
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
+        (target / "parser.h").write_text(BASELINE_H, encoding="utf-8")
+
+        run_dir = tmp_path / "run"
+        overlay = run_dir / "workspace"
+        workspace_overlay.init_overlay(target, overlay)
+
+        # Initialize concurrent architect and prover from same baseline
+        workspace_overlay.init_agent_overlay(run_dir, "arch-1", overlay)
+        workspace_overlay.init_agent_overlay(run_dir, "prover-payload", overlay)
+
+        # Prover annotates parse_payload in its scratch copy
+        p_h = run_dir / "agents/prover-payload/scratch/work/parser.h"
+        p_h.write_text(
+            BASELINE_H.replace(
+                "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+                "/*@\n  requires out == \\null || \\valid(out);\n  assigns *out;\n*/\n"
+                "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+            ),
+            encoding="utf-8",
+        )
+
+        # Architect annotates parse_magic in its scratch copy
+        a_h = run_dir / "agents/arch-1/scratch/work/parser.h"
+        a_h.write_text(
+            BASELINE_H.replace(
+                "int parse_magic(const uint8_t *buf, size_t len);",
+                "/*@\n  requires buf == \\null || \\valid_read(buf + (0 .. len - 1));\n  assigns \\nothing;\n*/\n"
+                "int parse_magic(const uint8_t *buf, size_t len);",
+            ),
+            encoding="utf-8",
+        )
+
+        # Prover merges first
+        res_p = workspace_overlay.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id="prover-payload",
+            role="prover",
+            overlay_dir=overlay,
+            c_file="parser.c",
+            function="parse_payload",
+            header_file="parser.h",
+            skip_reverify=True,
+        )
+        assert res_p["ok"] is True
+
+        # Architect merges second (sees concurrent header modification)
+        res_a = workspace_overlay.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id="arch-1",
+            role="architect",
+            overlay_dir=overlay,
+            header_file="parser.h",
+            skip_reverify=True,
+        )
+        assert res_a["ok"] is True
+
+        # Verify both contracts are present in workspace/work/parser.h
+        merged_h = (overlay / "work/parser.h").read_text(encoding="utf-8")
+        assert "\\valid_read(buf + (0 .. len - 1))" in merged_h
+        assert "\\valid(out)" in merged_h
+        check_res = workspace_overlay.check_acsl_only(overlay)
+        assert check_res["ok"] is True and check_res["errors"] == []
+
+    def test_architect_header_merge_rejects_concurrent_conflict_on_same_function(self, tmp_path: Path) -> None:
+        """Architect merge rolls back and raises ScopeViolationError on conflicting prototype contract."""
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
+        (target / "parser.h").write_text(BASELINE_H, encoding="utf-8")
+
+        run_dir = tmp_path / "run"
+        overlay = run_dir / "workspace"
+        workspace_overlay.init_overlay(target, overlay)
+
+        workspace_overlay.init_agent_overlay(run_dir, "prover-magic", overlay)
+        workspace_overlay.init_agent_overlay(run_dir, "arch-conflict", overlay)
+
+        # Prover attaches contract A to parse_magic
+        (run_dir / "agents/prover-magic/scratch/work/parser.h").write_text(
+            BASELINE_H.replace(
+                "int parse_magic(const uint8_t *buf, size_t len);",
+                "/*@ requires len >= 4; assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+            ),
+            encoding="utf-8",
+        )
+        # Architect attaches conflicting contract B to parse_magic
+        (run_dir / "agents/arch-conflict/scratch/work/parser.h").write_text(
+            BASELINE_H.replace(
+                "int parse_magic(const uint8_t *buf, size_t len);",
+                "/*@ requires len >= 8; assigns \\nothing; */\nint parse_magic(const uint8_t *buf, size_t len);",
+            ),
+            encoding="utf-8",
+        )
+
+        # Prover merges first
+        res_p = workspace_overlay.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id="prover-magic",
+            role="prover",
+            overlay_dir=overlay,
+            c_file="parser.c",
+            function="parse_magic",
+            header_file="parser.h",
+            skip_reverify=True,
+        )
+        assert res_p["ok"] is True
+
+        # Architect merge raises ScopeViolationError on conflict
+        with pytest.raises(
+            ScopeViolationError,
+            match=r"conflicting concurrent modification to prototype contract of 'parse_magic'",
+        ):
+            workspace_overlay.merge_agent_overlay(
+                run_dir=run_dir,
+                agent_id="arch-conflict",
+                role="architect",
+                overlay_dir=overlay,
+                header_file="parser.h",
+                skip_reverify=True,
+            )
+
+        # Workspace header remains intact with Prover's contract
+        work_h = (overlay / "work/parser.h").read_text(encoding="utf-8")
+        assert "len >= 4" in work_h
+        assert "len >= 8" not in work_h

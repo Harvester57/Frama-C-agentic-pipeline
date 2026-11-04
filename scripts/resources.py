@@ -1430,7 +1430,13 @@ def _cpu_bounds(min_cpus: int, max_cpus: int | None, pool_cpus: float, alone: bo
 def nominal_grant(cls: JobClass, pool: Budget) -> dict:
     """What the broker grants one job of this class on an idle pool (the elastic formula, memory-fitted)."""
     alone = cls.name == "wp"
-    lo, hi = _cpu_bounds(cls.min_cpus, cls.max_cpus, pool.cpus, alone=alone)
+    max_c = cls.max_cpus
+    if pool.cpus >= 32:
+        if cls.name == "wp":
+            max_c = 16
+        elif cls.name == "guardrail":
+            max_c = 4
+    lo, hi = _cpu_bounds(cls.min_cpus, max_c, pool.cpus, alone=alone)
     cpus = hi if cls.gated else lo
     while cpus > lo and cls.mem_base_mb + cls.mem_per_cpu_mb * cpus > pool.mem_mb:
         cpus -= 1
@@ -1452,9 +1458,11 @@ def recommend(max_agents: int | None = None, pool: Budget | None = None) -> dict
     wp = CLASSES["wp"]
     wp_cpus = max(1, min(WP_NOMINAL_CPUS, p.cpus))
     wp_mem = wp.mem_base_mb + wp.mem_per_cpu_mb * wp_cpus
-    by_cpu = math.floor(p.cpus * AGENT_DUTY / wp_cpus)
+    duty = 4.0 if p.cpus >= 16 else AGENT_DUTY
+    by_cpu = math.floor(p.cpus * duty / wp_cpus)
     by_mem = math.floor(p.mem_mb * AGENT_DUTY / max(1, wp_mem))
-    cap = max_agents or _env_int("FRAMAC_MAX_AGENTS") or DEFAULT_MAX_AGENTS
+    default_cap = 64 if p.cpus >= 64 else (32 if p.cpus >= 32 else DEFAULT_MAX_AGENTS)
+    cap = max_agents or _env_int("FRAMAC_MAX_AGENTS") or default_cap
     agents = max(1, min(by_cpu, by_mem, cap))
     return {
         "pool": asdict(p),

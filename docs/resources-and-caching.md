@@ -141,7 +141,7 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 |---|---|---|
 | `FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY` | Cap for the whole pipeline pool | measured |
 | `FRAMAC_RESERVE_CPUS`, `FRAMAC_RESERVE_MEMORY` | Headroom kept free | max(0.5, 5 %), max(1 GiB, 10 %) |
-| `FRAMAC_MAX_AGENTS` | Cap on recommended concurrent LLM subagents | 16 |
+| `FRAMAC_MAX_AGENTS` | Cap on recommended concurrent LLM subagents | 16 (scales to 32 on $\ge 32$ CPUs, 64 on $\ge 64$ CPUs) |
 | `FRAMAC_CONTAINER_ENGINE` | `docker`, `podman` or `auto` | `auto` |
 | `FRAMAC_PIN` | `auto`, `on`, `off` | `auto` |
 | `FRAMAC_BROKER` | `off` disables the broker | on |
@@ -153,7 +153,7 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR` | Set by the broker inside the container: how the shared store is mounted, and where | — |
 | `FRAMAC_PYTHON` | Host Python the wrappers use for the broker | first `python3` ≥ 3.10 (`py -3` on Windows) |
 | `FRAMAC_RESOURCES_VERBOSE` | `1` prints every lease, not only those that waited | off |
-| `FRAMAC_SCHEDULER` | `waves` restores the wave-by-wave procedure | ready queue |
+| `FRAMAC_SCHEDULER` | `waves` restores wave-by-wave dispatch with barriers | continuous reactive sliding-window loop |
 | `FRAMAC_SELINUX_TARGET` | `relabel` or `disable` for the read-only target mount on SELinux hosts | required there |
 | `FRAMAC_ALLOW_UNENFORCED_LIMITS` | Allow target-executing classes without memory/pids limits | off |
 | `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE` | Run-lock wait and heartbeat staleness (seconds) | 1800, 120 |
@@ -292,34 +292,36 @@ The trusted steps are spelled out in full: only that exact command line gets a w
 - `negotiate:<file#function>`
 
 **A prove task becomes ready once all of these are done:**
-- its callees are merged (recursion cycles become ready together);
-- the architects of its own module and of every callee's module;
-- the gate of every fuzz/Eva slice that covers its file, meaning their candidates are verified and harness repairs are done.
+- its callees have an initial contract in `workspace/work/` (speculative contract-first dispatch; callers do not wait for callee body proofs; internal static callees without contracts are proven first via Option A);
+- the architects of its own module and of every callee's module (leaf and internal static functions run concurrently with architects via 3-way AST header declaration splicing);
+- the gate of every fuzz/Eva slice that covers its file, where verify tasks gate only functions within their call cone.
 
-**Priority:** the tasks with the longest chains of callers waiting on them go first.
+**Priority:** the tasks with the longest chains of callers waiting on them go first, followed by Eva unknown count, then function name.
 
-**The orchestrator's loop:**
+**The orchestrator's loop (continuous reactive sliding window):**
 
 ```text
-python3 $S/wp_scheduler.py init                        # after `make ingest replay`
-python3 $S/wp_scheduler.py next --slots auto --prepare # hand out ready tasks; renders briefs
-# spawn one background subagent per task; on each completion:
-python3 $S/wp_scheduler.py complete --agent-id <id>
-python3 $S/wp_scheduler.py merge-pending
-python3 $S/wp_scheduler.py next --slots auto --prepare
+python3 $S/wp_scheduler.py init                                                 # after `make ingest replay`
+python3 $S/wp_scheduler.py step --slots auto --prepare                          # initial dispatch; renders briefs
+# spawn background subagents; on completions, drive atomically:
+python3 $S/wp_scheduler.py step --complete <id1> <id2>... --slots auto --prepare
 ```
 
-- **`--slots auto`:** `recommend().max_agents` minus running tasks, recomputed every round from the measured pool.
+Granular individual subcommands (`complete`, `merge-pending`, `next`) remain fully supported for specialized or step-by-step control.
+
+- **`--slots auto`:** `recommend().max_agents` minus running tasks, recomputed dynamically from the measured pool. On high-spec hardware, agent concurrency scales up to 32 on $\ge 32$ CPUs and 64 on $\ge 64$ CPUs; `wp.max_cpus` scales up to 16, and `guardrail.max_cpus` scales up to 4.
+- **Fixed limits invariant:** per-process limits that decide proof and finding outcomes remain strictly constant regardless of pool scale (`WP_MEMLIMIT_MB=1000`, `FUZZ_RSS_LIMIT_MB=2048`).
+- **Parallel snapshot preparation and re-checks:** `next --prepare` and `merge-pending` execute agent snapshotting and contract re-checks in parallel via a thread pool under the `merge` lock, strictly observing the `ledger` $\rightarrow$ `merge` lock hierarchy.
 - **Breakers** never block callers.
 - **Strengthening requests** become `negotiate` tasks as soon as they are ingested, capped per caller/callee pair. The caller is requeued once the negotiation resolves.
 - **Briefs carry their context.** `--prepare` renders a negotiation brief with every request it must answer (`needed_clause`, `reason`, caller), and a breaker brief with the unproven goals of the stalled prover's own WP report. Units, module and DAG metadata are matched by file and function, so same-named `static` functions never share a brief's context.
-- **Contract changes:** any merge that changes a contract re-checks the already-merged callers, using the cache.
+- **Contract changes:** any merge that changes a contract re-checks the already-merged callers in parallel, using the cache.
 - **`analysis_error`** (a killed or timed-out WP run) is retried once with a larger lease, then the units become `blocked`, never stuck `in_progress`.
 - **Commands for interruptions:**
   - `requeue --stale-minutes N` resumes after an interrupted orchestrator.
   - `init --reconcile` adopts an existing run.
   - `refresh --module M` re-syncs after a harness repair.
-- **Fallback:** `FRAMAC_SCHEDULER=waves` restores wave-by-wave dispatch.
+- **Fallback:** `FRAMAC_SCHEDULER=waves` restores wave-by-wave dispatch with barriers between topological waves for comparison and regression testing.
 
 ---
 

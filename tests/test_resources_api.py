@@ -81,7 +81,9 @@ def test_recommend_derives_agents_and_make_jobs_from_the_pool(monkeypatch):
     assert R.recommend(pool=R.Budget(64, 4_000, "t"))["max_agents"] == 1
     assert rec["fixed_limits"] == {"wp_memlimit_mb": 1000, "fuzz_rss_limit_mb": 2048}
     assert set(rec["classes"]) == set(R.CLASSES)
-    assert R.recommend(pool=R.Budget(128, 512_000, "t"))["max_agents"] == 16  # default cap
+    assert R.recommend(pool=R.Budget(16, 64_000, "t"))["max_agents"] == 16
+    assert R.recommend(pool=R.Budget(32, 128_000, "t"))["max_agents"] == 32
+    assert R.recommend(pool=R.Budget(128, 512_000, "t"))["max_agents"] == 64  # scaled cap on >=64 CPUs
     assert R.recommend(max_agents=3, pool=R.Budget(128, 512_000, "t"))["max_agents"] == 3
     assert R.recommend(pool=R.Budget(1, 1024, "t"))["max_agents"] == 1
 
