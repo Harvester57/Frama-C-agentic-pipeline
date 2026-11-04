@@ -492,6 +492,127 @@ def _collect_existing_header_declarations(work_dir: Path, exclude_rels: set[str]
     return names
 
 
+def assigns_verified_for_partial_merge(wp_report: dict | None) -> bool:
+    """
+    Return True when a WP report has 0 unproven step_a_assigns VCs.
+    Tolerates legacy reports where Frama-C 33+ 'Partially proven' (Consolidation.Pending)
+    assigns clauses were placed in step_a_assigns despite having 100% proven VCs.
+    """
+    if not isinstance(wp_report, dict):
+        return False
+    if wp_report.get("assigns_vcs_proven") is False:
+        return False
+    step_a = ((wp_report.get("unproven_by_bucket") or {}).get("step_a_assigns")) or []
+    unproven = [
+        g for g in step_a if not isinstance(g, dict) or str(g.get("status") or "").strip().lower() != "partially proven"
+    ]
+    return len(unproven) == 0
+
+
+def infer_prover_wp_flags(
+    run_dir: Path,
+    overlay_dir: Path | None = None,
+    agent_id: str | None = None,
+    c_file: str | None = None,
+    function: str | None = None,
+) -> list[str]:
+    """
+    Infer the WP RTE check and memory-model CLI flags used by the prover for `function`
+    so parent merge re-checks, contract re-checks, and final WP sweeps run with matching
+    reduced-check assumptions (which `ledger.py` records explicitly on covered units) and
+    WP model. Defaults to `['--no-warn-unsigned-downcast']`.
+    """
+    overlay = (overlay_dir or (run_dir / "workspace")).resolve()
+    norm_c = _normalize_work_relpath(c_file) if c_file else None
+    cand_paths: list[Path] = []
+    if agent_id and function and is_safe_agent_id(agent_id):
+        agent_dir = run_dir / "agents" / agent_id
+        cand_paths.append(agent_dir / "scratch" / f"wp_{function}.json")
+        cand_paths.append(agent_dir / "artifacts" / f"wp_{function}.json")
+        res_file = agent_dir / "scratch" / "result.json"
+        if res_file.is_file():
+            res_data = load_json_optional(res_file, {}) or {}
+            if isinstance(res_data, dict):
+                for ev in res_data.get("evidence") or []:
+                    tout = str((ev or {}).get("tool_output") or "").replace("\\", "/").strip()
+                    if tout.startswith(f"agents/{agent_id}/") and tout.endswith(".json"):
+                        cand_paths.append(run_dir / tout)
+        cand_paths.append(agent_dir / "scratch" / "parent_wp" / f"{function}.json")
+    if function:
+        cand_paths.append(overlay / "reports" / "wp" / f"{function}.json")
+
+    reduced: list[str] = []
+    wp_model: str | None = None
+
+    for p in cand_paths:
+        if not p.is_file() or p.is_symlink():
+            continue
+        rep = load_json_optional(p, {}) or {}
+        if not isinstance(rep, dict) or rep.get("mode") == "guardrail":
+            continue
+        if function and rep.get("function") not in (None, function):
+            continue
+        rc = (rep.get("soundness") or {}).get("reduced_checks")
+        if isinstance(rc, list):
+            for item in rc:
+                if isinstance(item, str) and item not in reduced:
+                    reduced.append(item)
+        m = rep.get("wp_model") or (
+            (rep.get("bitwise_retry") or {}).get("wp_model")
+            if (rep.get("bitwise_retry") or {}).get("triggered")
+            else None
+        )
+        if isinstance(m, str) and m.strip() and wp_model is None:
+            wp_model = m.strip()
+        if reduced or wp_model:
+            break
+
+    if function and not reduced:
+        ledger_units = load_json_optional(run_dir / "coverage-ledger.json", [])
+        if isinstance(ledger_units, list):
+            for u in ledger_units:
+                if not isinstance(u, dict) or u.get("function") != function:
+                    continue
+                if norm_c and _normalize_work_relpath(str(u.get("file") or "")) != norm_c:
+                    continue
+                for a in u.get("assumptions") or []:
+                    desc = str((a or {}).get("description") or "")
+                    if "-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in desc:
+                        reduced.append("-warn-unsigned-overflow / -warn-unsigned-downcast OFF")
+                    if "-warn-invalid-pointer OFF" in desc:
+                        reduced.append("-warn-invalid-pointer OFF")
+                for ev in u.get("evidence") or []:
+                    if not isinstance(ev, dict) or ev.get("phase") != "wp":
+                        continue
+                    tout = str(ev.get("tool_output") or "").replace("\\", "/").strip()
+                    if tout and tout.endswith(".json"):
+                        ep = run_dir / tout
+                        if ep.is_file() and not ep.is_symlink():
+                            rep = load_json_optional(ep, {}) or {}
+                            if isinstance(rep, dict):
+                                for item in ((rep.get("soundness") or {}).get("reduced_checks")) or []:
+                                    if isinstance(item, str) and item not in reduced:
+                                        reduced.append(item)
+                                m = rep.get("wp_model") or (
+                                    (rep.get("bitwise_retry") or {}).get("wp_model")
+                                    if (rep.get("bitwise_retry") or {}).get("triggered")
+                                    else None
+                                )
+                                if isinstance(m, str) and m.strip() and wp_model is None:
+                                    wp_model = m.strip()
+
+    flags: list[str] = []
+    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
+        flags.append("--no-warn-unsigned")
+    else:
+        flags.append("--no-warn-unsigned-downcast")
+    if any("-warn-invalid-pointer OFF" in r for r in reduced):
+        flags.append("--no-warn-invalid-pointer")
+    if wp_model and wp_model != "Typed" and re.match(r"^[A-Za-z0-9_+,-]+$", wp_model):
+        flags.extend(["--wp-model", wp_model])
+    return flags
+
+
 def _run_parent_reverify(
     run_dir: Path,
     agent_id: str,
@@ -574,6 +695,13 @@ def _run_parent_reverify(
         wp_json = run_dir / _parent_wp_report_rel(agent_id, function)
         if wp_json.exists():
             wp_json.unlink()
+        wp_extra_flags = infer_prover_wp_flags(
+            run_dir,
+            overlay_dir=overlay_dir,
+            agent_id=agent_id,
+            c_file=norm_c,
+            function=function,
+        )
         cmd = [
             sys.executable,
             str(scripts_dir / "run_wp_function.py"),
@@ -586,10 +714,7 @@ def _run_parent_reverify(
             f"--cppflags={cppflags}",
             "--wp-par",
             str(wp_par) if wp_par else "auto",
-            # Match the prover path and Frama-C's own default: unsigned *downcast* is
-            # C11 modulo narrowing, not undefined behavior, so its heuristic guard must
-            # not block a merge that the prover already discharged with this flag.
-            "--no-warn-unsigned-downcast",
+            *wp_extra_flags,
             "--sarif",
             "--out-json",
             str(wp_json),
@@ -601,12 +726,12 @@ def _run_parent_reverify(
         wp_status = wp_report.get("status")
         if allow_partial_wp:
             sound_ok = bool((wp_report.get("soundness") or {}).get("ok"))
-            assigns_unproven = len(((wp_report.get("unproven_by_bucket") or {}).get("step_a_assigns")) or [])
-            if wp_status not in ("all_proven", "unproven_goals_remain") or not sound_ok or assigns_unproven > 0:
+            assigns_ok = assigns_verified_for_partial_merge(wp_report)
+            if wp_status not in ("all_proven", "unproven_goals_remain") or not sound_ok or not assigns_ok:
                 return (
                     False,
                     f"parent partial WP check rejected (status={wp_status!r}, sound_ok={sound_ok}, "
-                    f"assigns_unproven={assigns_unproven})",
+                    f"assigns_verified={assigns_ok})",
                 )
         elif wp_status != "all_proven":
             return False, f"parent WP check on merged tree returned status={wp_status!r}"
@@ -1514,6 +1639,7 @@ def prepare_agent(
         wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
 
     unknown_obligations = []
+    fn_inout: dict[str, list[str]] = {}
     if isinstance(eva_report, dict) and function:
         raw_unknowns = eva_report.get("unknown_obligations_by_function", {}).get(function, [])
         if norm_c_file:
@@ -1522,6 +1648,12 @@ def prepare_agent(
             ]
         else:
             unknown_obligations = list(raw_unknowns)
+        raw_inout = (eva_report.get("inout_by_function") or {}).get(function)
+        if isinstance(raw_inout, dict):
+            fn_inout = {
+                "external": [str(x) for x in (raw_inout.get("external") or []) if str(x).strip()],
+                "internal": [str(x) for x in (raw_inout.get("internal") or []) if str(x).strip()],
+            }
 
     unproven_goals = wp_data.get("unproven_goals", []) if isinstance(wp_data, dict) else []
     if not unproven_goals and unknown_obligations:
@@ -1649,6 +1781,21 @@ def prepare_agent(
                 'immediately write `result.json` with `"status": "stalled_after_k_retries"`. Never write '
                 "synthetic `probe_*.c` files.\n"
             )
+    if role == "prover" and (fn_inout.get("external") or fn_inout.get("internal")):
+        fn_label = function or "this function"
+        ext_locs = fn_inout.get("external") or []
+        int_locs = fn_inout.get("internal") or []
+        rendered += (
+            "\n## Eva Computed Frame Hints (Write# / Inout)\n\n"
+            f"Frama-C Eva (`-out-external` / `-out`) computed the following over-approximated written memory "
+            f"locations for `{fn_label}` under the module harness (use as a starting point for Step A `assigns` "
+            "and `loop assigns`; translate Eva synthetic base names like `S_p[0..n]` back to pointer dereferences "
+            "`p[0..n]`):\n"
+            f"- **External Written Locations (`-out-external`, excludes locals -> candidate `assigns`):** "
+            f"`{json.dumps(ext_locs)}`\n"
+            f"- **Internal Written Locations (`-out`, includes locals -> candidate `loop assigns`):** "
+            f"`{json.dumps(int_locs)}`\n"
+        )
     if wp_report_rel:
         rendered += (
             "\n## Stalled Prover's WP Report\n\n"

@@ -2150,8 +2150,7 @@ def _partial_contract_merge_job(task: dict, aid: str, report: dict | None) -> di
         return None
     if not bool((report.get("soundness") or {}).get("ok")):
         return None
-    assigns_unproven = len(((report.get("unproven_by_bucket") or {}).get("step_a_assigns")) or [])
-    if assigns_unproven > 0:
+    if not workspace_overlay.assigns_verified_for_partial_merge(report):
         return None
     fn = str(task.get("function") or "")
     c_rel = norm_path(str(task.get("file") or ""))

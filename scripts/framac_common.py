@@ -45,9 +45,12 @@ _STATUS_MAP = {
     "valid_under_hyp": STATUS_VALID_UNDER_HYP,
     "valid_under_hypotheses": STATUS_VALID_UNDER_HYP,
     "unknown": STATUS_UNKNOWN,
-    # "Partially proven" in -report-csv (e.g. -wp-split or loop invariant where one sub-goal is
-    # Valid and another is Unknown/Timeout/Failed): at least one sub-goal remains unproven.
-    "partially_proven": STATUS_UNKNOWN,
+    # In Frama-C 33+ -report-csv (src/plugins/report/csv.ml), "Partially proven" is
+    # Consolidation.Pending ("Locally validated"): 100% of the property's own VCs are Valid,
+    # and it only depends on assumed function preconditions, callee contracts, or other
+    # properties in the consolidation graph. Properties with >=1 unproven sub-VC are emitted
+    # as Consolidation.Unknown ("Unknown").
+    "partially_proven": STATUS_VALID,
     "invalid": STATUS_INVALID,
     # Eva's red alarm in Frama-C 33 reports: the property fails whenever its statement is
     # reached, and reachability is not established. Still a candidate needing a witness.

@@ -58,6 +58,7 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
 )
+from workspace_overlay import infer_prover_wp_flags  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 CONTAINER_TEMPLATES_DIR = Path("/opt/framac-pipeline/templates")
@@ -1430,6 +1431,11 @@ def sweep(
                 continue
             key = f"{slugs[e['file']]}__{e['function']}"
             out_json = f"{SWEEP_DIR}/{key}.json"
+            wp_extra_flags = infer_prover_wp_flags(
+                run_dir,
+                c_file=e["file"],
+                function=e["function"],
+            )
             cmd = [
                 py,
                 f"{scripts}/resources.py",
@@ -1450,9 +1456,7 @@ def sweep(
                 f"--cppflags={shlex.join(flags)}",
                 "--cache-dir",
                 "off",
-                # Downcast to an unsigned type is C11 modulo narrowing, not UB; keep the
-                # sweep consistent with the prover path and the parent merge re-check.
-                "--no-warn-unsigned-downcast",
+                *wp_extra_flags,
                 "--sarif",
                 # One out-dir per file: run_wp_function names its artifacts after the function only.
                 "--out-dir",

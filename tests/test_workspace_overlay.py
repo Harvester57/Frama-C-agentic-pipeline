@@ -223,10 +223,10 @@ def test_parent_reverify_allow_partial_wp(tmp_path, monkeypatch):
     assert ok_bad_assigns is False
 
 
-def test_normalize_status_maps_partially_proven_to_unknown():
-    from framac_common import STATUS_UNKNOWN, normalize_status
+def test_normalize_status_maps_partially_proven_to_valid():
+    from framac_common import STATUS_VALID, normalize_status
 
-    assert normalize_status("Partially proven") == STATUS_UNKNOWN
+    assert normalize_status("Partially proven") == STATUS_VALID
 
 
 def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypatch):
@@ -282,15 +282,15 @@ def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypat
         is_tail = "_tail.csv" in csv_path.name
         rows = [
             "directory\tfile\tfunction\tline\tkind\tstatus\tproperty",
-            f".\tmacro_test.c\tcaller\t2\tensures\t{'Valid' if is_tail else 'Partially proven'}\tp1",
+            f".\tmacro_test.c\tcaller\t2\tensures\t{'Partially proven' if is_tail else 'Unknown'}\tp1",
         ]
         for i in range(5):
-            rows.append(f".\tmacro_test.c\tcaller\t{i + 4}\tassert\tValid\tg{i}")
+            rows.append(f".\tmacro_test.c\tcaller\t{i + 4}\tassert\tPartially proven\tg{i}")
         csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
         stdout = (
             "[wp] macro_test.c:3: Warning: Missing assigns clause (assigns 'everything' instead)\n"
-            "[wp] Proved goals:   36 / 37\n"
-            "[wp]   Timeout:           1\n"
+            f"[wp] Proved goals:   {37 if is_tail else 36} / 37\n"
+            f"[wp]   Timeout:           {0 if is_tail else 1}\n"
         )
         return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
@@ -306,9 +306,56 @@ def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypat
         cache_dir="off",
     )
     assert len(calls) == 2
+    assert "-wp-steps" not in calls[1]
     assert wp_res["status"] == "all_proven"
     assert wp_res["soundness"]["ok"] is True
+    assert wp_res["assigns_vcs_proven"] is True
     assert len(wp_res["soundness"].get("macro_loop_warnings") or []) == 1
     assert wp_res.get("tail_retry", {}).get("triggered") is True
     assert wp_res["tail_retry"]["timeout"] == 45
-    assert wp_res["tail_retry"]["wp_steps"] == 50000
+    assert wp_res["tail_retry"]["wp_steps"] == 0
+
+    # 4. Prover WP flag propagation into parent re-check / sweep & partial-merge assigns gate
+    run_dir = tmp_path / "flag_run"
+    agent_scratch = run_dir / "agents" / "prove-get_token_to_eol-2" / "scratch"
+    agent_scratch.mkdir(parents=True, exist_ok=True)
+    (agent_scratch / "wp_get_token_to_eol.json").write_text(
+        json.dumps(
+            {
+                "status": "all_proven",
+                "function": "get_token_to_eol",
+                "wp_model": "Typed+int",
+                "soundness": {
+                    "ok": True,
+                    "reduced_checks": [
+                        "-warn-unsigned-overflow / -warn-unsigned-downcast OFF",
+                        "-warn-invalid-pointer OFF",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    flags = WO.infer_prover_wp_flags(
+        run_dir,
+        agent_id="prove-get_token_to_eol-2",
+        c_file="picohttpparser.c",
+        function="get_token_to_eol",
+    )
+    assert flags == ["--no-warn-unsigned", "--no-warn-invalid-pointer", "--wp-model", "Typed+int"]
+
+    # Default flags when no reduced checks were used
+    assert WO.infer_prover_wp_flags(run_dir, function="other_fn") == ["--no-warn-unsigned-downcast"]
+
+    # Partial merge assigns gate accepts legacy 'Partially proven' assigns and rejects 'Unknown' assigns
+    assert WO.assigns_verified_for_partial_merge(
+        {
+            "unproven_by_bucket": {
+                "step_a_assigns": [{"line": 447, "status": "Partially proven", "annotation": "assigns *p"}]
+            }
+        }
+    )
+    assert not WO.assigns_verified_for_partial_merge(
+        {"unproven_by_bucket": {"step_a_assigns": [{"line": 447, "status": "Unknown", "annotation": "assigns *p"}]}}
+    )
+    assert not WO.assigns_verified_for_partial_merge({"assigns_vcs_proven": False, "unproven_by_bucket": {}})

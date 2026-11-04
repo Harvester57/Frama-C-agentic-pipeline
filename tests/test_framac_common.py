@@ -15,6 +15,7 @@ from framac_common import (
 
 def test_status_spellings_from_different_frama_c_releases():
     assert normalize_status("Valid") == STATUS_VALID
+    assert normalize_status("Partially proven") == STATUS_VALID
     assert normalize_status("Valid under hyp.") == STATUS_VALID_UNDER_HYP
     assert normalize_status("Valid_under_hyp") == STATUS_VALID_UNDER_HYP
     assert normalize_status("Unknown") == STATUS_UNKNOWN

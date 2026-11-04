@@ -403,6 +403,10 @@ _PTR_DIFF_EQ_RE = re.compile(
 _MISSING_ASSIGNS_LINE_RE = re.compile(r"([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*Warning:\s*Missing assigns clause")
 _WP_PROVED_GOALS_RE = re.compile(r"^\[wp\]\s*Proved goals:\s*(\d+)\s*/\s*(\d+)", re.MULTILINE)
 _WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILINE)
+_ASSIGN_VC_FAIL_RE = re.compile(
+    r"^\[wp\]\s*\[(?:Timeout|Unknown|Failed|Stepout)\][^\n]*\bassigns\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
@@ -1336,7 +1340,13 @@ def run_wp_on_function(
         except Exception:
             pass
 
-    # Automatic focused tail retry when >=90% of VCs are proven (or >=5 proven properties and <=4
+    proved_m = _WP_PROVED_GOALS_RE.search(combined_log)
+    timeout_m = _WP_TIMEOUT_COUNT_RE.search(combined_log)
+    vc_proved = int(proved_m.group(1)) if proved_m else 0
+    vc_total = int(proved_m.group(2)) if proved_m else 0
+    vc_timeouts = int(timeout_m.group(1)) if timeout_m else 0
+
+    # Automatic focused tail retry when >=90% of VCs are proven (or >=5 proven properties and <=6
     # unproven properties with >=3:1 ratio) and 1..30 VCs timed out on SMT solvers.
     if (
         retry_tail
@@ -1346,22 +1356,20 @@ def run_wp_on_function(
         and soundness["ok"]
         and not _WHY3_MEMADDR_ERR_RE.search(combined_log)
     ):
-        proved_m = _WP_PROVED_GOALS_RE.search(combined_log)
-        timeout_m = _WP_TIMEOUT_COUNT_RE.search(combined_log)
-        vc_proved = int(proved_m.group(1)) if proved_m else 0
-        vc_total = int(proved_m.group(2)) if proved_m else 0
-        vc_timeouts = int(timeout_m.group(1)) if timeout_m else 0
         proven_props = len(proven_goals) + len(under_hyp_goals)
         high_vc_ratio = vc_total >= 10 and (vc_proved / vc_total) >= 0.90
         high_prop_ratio = (
             proven_props >= 5
-            and len(unproven_goals) <= 4
+            and len(unproven_goals) <= 6
             and (proven_props / max(1, proven_props + len(unproven_goals))) >= 0.75
         )
         has_timeout_tail = (1 <= vc_timeouts <= 30) or (vc_total == 0 and high_prop_ratio)
         if (high_vc_ratio or high_prop_ratio) and has_timeout_tail:
             tail_timeout = max(timeout * 2, 45)
-            tail_steps = max(wp_steps, 50000)
+            # Never introduce a -wp-steps cap when wp_steps == 0 (unbounded steps up to timeout);
+            # capping at 50k steps causes [Stepout] regressions on heavy goals that otherwise
+            # finish within the extended timeout.
+            tail_steps = max(wp_steps * 2, 50000) if wp_steps > 0 else 0
             if tail_timeout > timeout or tail_steps > wp_steps:
                 try:
                     tail_res = run_wp_on_function(
@@ -1392,23 +1400,37 @@ def run_wp_on_function(
                         sarif=sarif,
                         keep_goals=keep_goals,
                     )
+                    tail_unproven = tail_res.get("unproven_count", len(unproven_goals))
+                    tail_vc_proved = int((tail_res.get("wp_vc_stats") or {}).get("proved") or 0)
+                    improved = (tail_unproven < len(unproven_goals)) or (
+                        tail_unproven == len(unproven_goals) and vc_total > 0 and tail_vc_proved > vc_proved
+                    )
                     if (
                         tail_res.get("status") not in ("analysis_error", "acsl_syntax_error")
                         and tail_res.get("soundness", {}).get("ok", False)
-                        and tail_res.get("unproven_count", len(unproven_goals)) < len(unproven_goals)
+                        and improved
                     ):
                         tail_res["tail_retry"] = {
                             "triggered": True,
                             "timeout": tail_timeout,
                             "wp_steps": tail_steps,
                             "initial_unproven_count": len(unproven_goals),
+                            "initial_vc_proved": vc_proved,
                         }
                         return tail_res
                 except Exception:
                     pass
 
     total_goals = len(proven_goals) + len(under_hyp_goals) + len(unproven_goals)
-    all_valid = (total_goals > 0) and (len(unproven_goals) == 0) and (returncode == 0) and soundness["ok"]
+    all_valid = (
+        (total_goals > 0)
+        and (len(unproven_goals) == 0)
+        and (vc_total == 0 or vc_proved == vc_total)
+        and (vc_timeouts == 0)
+        and (returncode == 0)
+        and soundness["ok"]
+    )
+    assigns_vcs_proven = (len(buckets["step_a_assigns"]) == 0) and not bool(_ASSIGN_VC_FAIL_RE.search(combined_log))
 
     if soundness["tier_a_aborts"]:
         status = "wp_aborted"
@@ -1454,11 +1476,13 @@ def run_wp_on_function(
         "status": status,
         "function": fn_name,
         "file": str(c_file),
+        "wp_model": wp_model,
         "total_goals": total_goals,
         "proven_count": len(proven_goals),
         "proven_under_hyp_count": len(under_hyp_goals),
         "unproven_count": len(unproven_goals),
         "dead_count": len(dead_goals),
+        "assigns_vcs_proven": assigns_vcs_proven,
         "soundness": soundness,
         # Non-empty means Frama-C invented `int f()` prototypes: fix the stubs before trusting results.
         "undeclared_functions": scan_undeclared_functions(combined_log),
@@ -1472,6 +1496,8 @@ def run_wp_on_function(
         "wp_log_tail": combined_log[-3000:],
         "sizing": sizing,
     }
+    if vc_total > 0:
+        res["wp_vc_stats"] = {"proved": vc_proved, "total": vc_total, "timeouts": vc_timeouts}
     if unframed_var_callees:
         res["unframed_variadic_callees"] = unframed_var_callees
     if all_unproven_are_alloc:
