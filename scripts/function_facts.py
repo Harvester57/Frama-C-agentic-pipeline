@@ -88,6 +88,7 @@ MAX_EVA_LOCATIONS = 24
 MAX_FROM = 8
 MAX_LOCATION_CHARS = 120
 MAX_SHOWN_PATHS = 12
+MAX_SHOWN_CALLERS = 6
 MAX_SHOWN_FROM = 5
 MAX_CONDITION_CHARS = 200
 
@@ -502,6 +503,7 @@ def _function_record(
         "writes": writes,
         "reads": reads,
         "calls": calls,
+        "called_by": [],
         "may_alias": _may_alias(formals, writes),
         "recursion": recursion,
         "return_paths": paths,
@@ -509,6 +511,27 @@ def _function_record(
         "features": _features(raw, loops, calls, formals, src, recursion),
         "truncated": bool(raw.get("truncated")),
     }
+
+
+def _link_callers(raw_functions: list[dict], records: dict[str, dict]) -> None:
+    """What each in-tree caller passes, and what holds there: Rule 3 asks provers to derive bounds from it."""
+    by_kernel = {record["kernel_name"]: record for record in records.values()}
+    for raw in raw_functions:
+        loc = kernel_ast.parse_location(raw.get("loc"))
+        if work_relative(loc["file"]) is None:
+            continue  # a harness is not a caller whose checks a contract can rely on
+        for call in raw.get("calls") or []:
+            target = by_kernel.get(call.get("kernel_name"))
+            if target is None or call.get("indirect") or raw.get("kernel_name") == call.get("kernel_name"):
+                continue
+            target["called_by"].append(
+                {
+                    "caller": raw.get("name"),
+                    "args": list(call.get("args") or []),
+                    "conditions": [] if call.get("conditions_partial") else list(call.get("conditions") or []),
+                    "in_loop": bool(call.get("in_loop")),
+                }
+            )
 
 
 def build_module_facts(
@@ -570,6 +593,7 @@ def build_module_facts(
             )
         except AcslSyntaxError as exc:
             doc.setdefault("warnings", []).append(f"{key}: {exc}")
+    _link_callers(raw_functions, doc["functions"])
     doc["status"] = "ok" if flows.get("status") == "ok" else "partial"
     return doc
 
@@ -827,6 +851,30 @@ def _render_calls(record: dict, mapped, lines: list[str]) -> None:
             lines.append(f"- L{mapped(site['line'])} {_code(site.get('expr') or '?')}: {note}")
 
 
+def _render_callers(record: dict, lines: list[str]) -> None:
+    callers = record.get("called_by") or []
+    if not callers:
+        lines.append("\n**Callers:** none in this module's own code.")
+        return
+    lines.append("\n**Callers** (what they pass, and what their code has checked by then, in normalized C):")
+    name = record.get("name") or "?"
+    shown = list(
+        dict.fromkeys(
+            f"- `{item.get('caller')}`: {_code(_shorten(name + '(' + ', '.join(item.get('args') or []) + ')'))}"
+            + (
+                f" when {_code(_shorten(' && '.join(c for c in item['conditions'] if not _TEMP_RE.search(c))))}"
+                if any(not _TEMP_RE.search(c) for c in item.get("conditions") or [])
+                else ""
+            )
+            + (" (in a loop)" if item.get("in_loop") else "")
+            for item in callers
+        )
+    )
+    lines.extend(shown[:MAX_SHOWN_CALLERS])
+    if len(shown) > MAX_SHOWN_CALLERS:
+        lines.append(f"- ... {len(shown) - MAX_SHOWN_CALLERS} more.")
+
+
 def _render_alias(record: dict, lines: list[str]) -> None:
     pairs = record.get("may_alias") or []
     if not pairs:
@@ -909,6 +957,7 @@ def render_section(
         _render_frame(record, lines)
         _render_loops(record, mapped, lines)
         _render_calls(record, mapped, lines)
+        _render_callers(record, lines)
         _render_alias(record, lines)
         _render_recursion(record, mapped, lines)
         _render_returns(record, mapped, lines)
@@ -922,8 +971,10 @@ def render_section(
         lines.append(
             "The target with what it references, under the real compile flags: reading context only"
             f"{place}. **It is not the proof target**: it can differ from the compiled program, so "
-            f"never compile, edit or run a tool on it. Edit the real files, at lines "
-            f"{target.get('start_line', '?')}-{target.get('end_line', '?')} of `{target.get('file', '?')}`."
+            "never compile, edit or run a tool on it. It already shows what the target uses, so do not read "
+            f"the rest of the real files. To edit, read only lines {target.get('start_line', '?')}-"
+            f"{target.get('end_line', '?')} of `{target.get('file', '?')}` (and the prototype in the header "
+            "if there is one), and open the rest only when a tool message points there."
         )
         if slice_result.get("conditionals") == "unresolved":
             lines.append(

@@ -403,7 +403,7 @@ let arg_shape (e : exp) =
   | Lval (Mem a, Field _) -> on_formal a (fun v -> shape "field_descent" v ())
   | _ -> None
 
-let call_json ctx ~lhost ~args ~loc ~in_loop =
+let call_json ctx ~lhost ~args ~loc ~in_loop ~conds ~partial =
   let args_s = List.map exp_s args in
   match lhost with
   | Var f ->
@@ -421,6 +421,7 @@ let call_json ctx ~lhost ~args ~loc ~in_loop =
       O
         [ ("callee", S name); ("kernel_name", S f.vname); ("indirect", B false);
           ("args", L (List.map (fun a -> S a) args_s)); ("arg_shapes", L shapes);
+          ("conditions", L (List.rev_map (fun c -> S c) conds)); ("conditions_partial", B partial);
           ("loc", S loc); ("in_loop", B in_loop) ]
       :: ctx.calls;
     name
@@ -482,13 +483,13 @@ and walk_stmt ctx conds partial (s : stmt) =
   | Instr (Local_init (_, ConsInit (f, args, _), loc)) ->
     let line = loc_s loc in
     List.iter (collect_reads (record_read ctx line)) args;
-    let name = call_json ctx ~lhost:(Var f) ~args ~loc:line ~in_loop:(ctx.loop_stack <> []) in
+    let name = call_json ctx ~lhost:(Var f) ~args ~loc:line ~in_loop:(ctx.loop_stack <> []) ~conds ~partial in
     List.iter (fun l -> if not (List.mem name l.l_calls) then l.l_calls <- name :: l.l_calls) ctx.loop_stack
   | Instr (Local_init _) -> ()
   | Instr (Call (ret, lhost, args, loc)) ->
     let line = loc_s loc in
     List.iter (collect_reads (record_read ctx line)) args;
-    let name = call_json ctx ~lhost ~args ~loc:line ~in_loop:(ctx.loop_stack <> []) in
+    let name = call_json ctx ~lhost ~args ~loc:line ~in_loop:(ctx.loop_stack <> []) ~conds ~partial in
     List.iter (fun l -> if not (List.mem name l.l_calls) then l.l_calls <- name :: l.l_calls) ctx.loop_stack;
     (match ret with
      | Some lv ->

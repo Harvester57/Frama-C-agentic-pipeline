@@ -15,10 +15,14 @@ A failure here is never an analysis failure: every problem comes back as a `stat
 fall back to running without kernel facts. The compiled module is never stored in the run
 directory: target code run by earlier jobs can write there, and this module loads into trusted
 Frama-C runs.
+
+CLI: `kernel_ast.py selftest` says whether the dump still compiles and loads against this kernel.
+A failure only degrades briefs, so nothing else would notice it after a Frama-C upgrade.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -43,6 +47,12 @@ DUMP_TIMEOUT_S = 600
 # Fileloc.pretty: `file:12`, `file:12-15`, `file:12:3-9`, `file:12-15:3-9`, or a generated location.
 _LOC_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+)(?:-(?P<end>\d+))?(?::\d+(?:-\d+)?)?$")
 _NOTE_LIMIT = 2000
+_SELFTEST_SOURCE = """int total(const int *a, int n) {
+  int s = 0;
+  for (int i = 0; i < n; i++) s += a[i];
+  return s;
+}
+"""
 
 
 def parse_location(text: str | None) -> dict:
@@ -243,3 +253,28 @@ def call_graph(functions: Iterable[dict]) -> dict:
         "indirect_calls": {name: sites for name, sites in indirect.items() if sites},
         "recursion_cycles": recursion_cycles(edges),
     }
+
+
+def selftest(runner: Callable | None = None) -> dict:
+    """Compile and load the dump, and check it on one known loop."""
+    with tempfile.TemporaryDirectory(prefix="framac-kernel-ast-selftest-") as tmp:
+        source = Path(tmp) / "selftest.c"
+        source.write_text(_SELFTEST_SOURCE, encoding="utf-8")
+        res = dump_kernel_ast([str(source)], cwd=Path(tmp), runner=runner)
+    functions = res.get("functions") or []
+    loops = (functions[0].get("loops") or []) if functions else []
+    ok = res.get("status") == "ok" and len(loops) == 1 and loops[0].get("guard") == "i < n"
+    return {"ok": ok, "status": res.get("status"), "reason": res.get("reason") or ("" if ok else "unexpected dump")}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Frama-C kernel AST facts.")
+    parser.add_subparsers(dest="cmd", required=True).add_parser("selftest", help="Check the dump against this kernel")
+    parser.parse_args(argv)
+    res = selftest()
+    print(json.dumps(res, indent=2))
+    return 0 if res["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

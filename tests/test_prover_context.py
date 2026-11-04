@@ -149,7 +149,8 @@ def test_rendered_brief_shows_facts_and_slice_and_only_the_sections_that_apply(t
 
     # Files beside the brief.
     context = run_dir / "agents" / "prove-total" / "scratch" / "context"
-    assert (context / "total.facts.json").is_file() and (context / "total.slice.c").is_file()
+    assert (context / "total.slice.c").is_file()
+    assert not (context / "total.facts.json").exists(), "the brief has the facts: a copy only invites a second read"
     budget = json.loads((run_dir / "agents" / "prove-total" / "scratch" / ".prover_budget.json").read_text())
     assert budget["header"] == "mod.h" and budget["file"] == "mod.c"
 

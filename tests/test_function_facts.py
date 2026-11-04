@@ -291,6 +291,15 @@ def test_dump_never_parses_acsl_and_loads_the_module_from_a_private_directory(tm
     assert str(tmp_path) not in module, "the compiled module must not live in the run directory"
 
 
+def test_selftest_says_whether_the_dump_works() -> None:
+    good = {"functions": [_raw("total", "s.c:1", loops=[_loop(loc="s.c:3", guard="i < n")])]}
+    assert kernel_ast.selftest(runner=_fake_run(good))["ok"] is True
+    assert kernel_ast.selftest(runner=_fake_run(compile_rc=2))["status"] == "compile_failed"
+    assert kernel_ast.selftest(runner=_fake_run(compile_rc=2))["ok"] is False
+    wrong = {"functions": [_raw("total", "s.c:1")]}
+    assert kernel_ast.selftest(runner=_fake_run(wrong))["ok"] is False
+
+
 # ---------------------------------------------------------------------------
 # One function's facts
 # ---------------------------------------------------------------------------
@@ -619,6 +628,41 @@ def test_same_named_statics_stay_apart_and_harness_code_is_left_out(tmp_path: Pa
     assert result["status"] == "ok"
 
 
+def test_callers_show_what_they_pass_and_what_they_checked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path("m.c").write_text(
+        "int leaf(int n) {\n  return n;\n}\nint top(int k) {\n  if (k > 0) return leaf(k);\n  return 0;\n}\n"
+        "void eva_main(void) {\n  top(1);\n}\n",
+        encoding="utf-8",
+    )
+    leaf_call = {
+        "callee": "leaf",
+        "kernel_name": "leaf",
+        "indirect": False,
+        "args": ["k"],
+        "arg_shapes": [],
+        "conditions": ["k > 0"],
+        "conditions_partial": False,
+        "loc": "m.c:5",
+        "in_loop": False,
+    }
+    top_call = {**leaf_call, "callee": "top", "kernel_name": "top", "args": ["1"], "conditions": []}
+    doc = {
+        "functions": [
+            _raw("leaf", "m.c:1", formals=[_formal("n")]),
+            _raw("top", "m.c:4", formals=[_formal("k")], calls=[leaf_call]),
+            _raw("eva_main", "workspace/harnesses/harness_m.c:8", calls=[top_call]),
+        ]
+    }
+    result = ff.build_module_facts("m", ["m.c"], "-I.", None, runner=_fake_run(doc))
+    leaf, top = result["functions"]["m.c#leaf"], result["functions"]["m.c#top"]
+    assert leaf["called_by"] == [{"caller": "top", "args": ["k"], "conditions": ["k > 0"], "in_loop": False}]
+    assert top["called_by"] == [], "a harness is not a caller whose checks a contract can rely on"
+    section = ff.render_section(leaf, function="leaf")
+    assert "- `top`: `leaf(k)` when `k > 0`" in section
+    assert "**Callers:** none in this module" in ff.render_section(top, function="top")
+
+
 def test_ast_failure_gives_a_failed_document_without_functions() -> None:
     result = ff.build_module_facts("m", ["a.c"], "-I.", None, runner=_fake_run(compile_rc=2))
     assert result["status"] == "failed" and result["functions"] == {}
@@ -819,6 +863,13 @@ def test_no_probing_rule_keeps_the_reference_manuals_reachable() -> None:
     assert "{references_dir}/INDEX.md" in BRIEF
 
 
+def test_brief_states_the_wp_flags_a_prover_can_no_longer_discover_with_help() -> None:
+    # The prover proves what the parent will re-check: infer_prover_wp_flags defaults to this flag.
+    oracle = BRIEF[BRIEF.index("run_wp_function.py --file") :]
+    assert "--no-warn-unsigned-downcast" in oracle[: oracle.index("\n")]
+    assert "--no-warn-unsigned` for this and every later run" in BRIEF
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -863,7 +914,8 @@ def test_slice_is_shown_as_reading_context_only() -> None:
     }
     section = ff.render_section(None, result, function="f")
     assert "**It is not the proof target**" in section
-    assert "lines 3-5 of `m.c`" in section
+    assert "read only lines 3-5 of `m.c`" in section
+    assert "do not read the rest of the real files" in section
     assert "agents/a/scratch/context/f.slice.c" in section
     assert "```c\nint f(void) { return 0; }\n```" in section
     degraded = ff.render_section(None, {**result, "conditionals": "unresolved"}, function="f")
@@ -942,6 +994,12 @@ double avg(const float *v, int n) {
 
 
 @needs_framac
+def test_real_selftest() -> None:
+    res = kernel_ast.selftest()
+    assert res["ok"] is True, res
+
+
+@needs_framac
 def test_real_kernel_dump(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     Path("workspace/work").mkdir(parents=True)
@@ -973,6 +1031,7 @@ def test_real_kernel_dump(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert early["loops"][0]["exits"][0]["kind"] == "return"
     assert [p["value"] for p in early["return_paths"]] == ["-1", "i", "0"]
     assert early["return_paths"][0]["conditions"] == ["p == (int *)0"]
+    assert fns["m.c#sum_rec"]["called_by"] == [], "recursion is not a caller"
 
 
 @needs_framac

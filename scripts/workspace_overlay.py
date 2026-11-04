@@ -1542,8 +1542,6 @@ def _prover_context(
     work_dir = agent_root / "scratch" / "work"
     context_dir = agent_root / "scratch" / "context"
     record = function_facts.load_function_facts(overlay, module, c_file, function)
-    if record is not None:
-        atomic_write_json(context_dir / f"{function}.facts.json", record)
     slice_result = function_slice.build_slice(
         run_dir,
         work_dir,
