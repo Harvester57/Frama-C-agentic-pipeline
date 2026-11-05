@@ -38,6 +38,7 @@ from framac_common import (  # noqa: E402
     is_safe_relative_path,
     load_agent_result_json,
     load_json_strict,
+    wp_limits_problem,
 )
 from minischema import MAX_ERRORS, Validator, load_schema  # noqa: E402
 
@@ -239,6 +240,10 @@ def validate_ledger(data, run_dir: Path | None = None) -> Errors:
             if not is_valid_fingerprint(fp):
                 errors.add(f"{where}.result_fingerprints[{f_idx}]: invalid fingerprint")
         for e_idx, item in enumerate(ev):
+            if item["phase"] == "wp" and item["discharging"]:
+                problem = wp_limits_problem((item.get("details") or {}).get("limits"))
+                if problem:
+                    errors.add(f"{where}.evidence[{e_idx}]: discharging WP evidence is invalid: {problem}")
             _path_ok(errors, f"{where}.evidence[{e_idx}].tool_output", item["tool_output"])
             _exists(errors, f"{where}.evidence[{e_idx}].tool_output", run_dir, item["tool_output"])
 

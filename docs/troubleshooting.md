@@ -118,7 +118,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 - **Fix:**
   1. Check `workspace/eva/<mod>/eva.log` for `missing-spec` warnings. Add a contract stub to `external_stubs.h` for any unmodeled external function so Eva does not widen its return value to `[-inf, +inf]`.
   2. Increase `--slevel` (e.g., `--slevel 250` or `--slevel 500`) in `/framac-eva` so Eva tracks more separate execution paths before merging states.
-  3. Add `/*@ loop pragma UNROLL 32; */` above small fixed-bound parsing loops in `workspace/work/`.
+  3. Add `//@ loop unroll 32;` above small fixed-bound parsing loops in `workspace/work/`.
 
 ---
 
@@ -139,6 +139,17 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 | Pointer cast `(uint32_t *)byte_buf` rejected by `Typed` model | Type reinterpretation across pointer types | Pass `--wp-model Typed+cast` to `run_wp_function.py`. |
 | Address taken `&local_var` passed to helper | Stack variable address taken | Pass `--wp-model Typed+ref` (the default in `run_wp_function.py`). |
 | `syntax error` on `terminates` or `exits` | Wrong ACSL clause order in function contract | Order clauses strictly: `requires` -> `terminates` / `decreases` -> `exits` -> `assigns` -> `ensures` -> `behavior`. |
+
+### Symptom: `unsound_proof` With `Neither code nor specification for function X`
+
+- `X` is called but has neither a body nor a contract. Frama-C generates a default contract and WP would trust it, so the proof does not hold.
+- Add a contract to the prototype through `strengthening_requests`, or use a stub from `templates/acsl/external_stubs.h` for an external function.
+- `Neither code nor explicit exits and terminates for function X` is a different message: `X` has a specification, and this one is harmless.
+
+### Symptom: A Unit Stays Uncovered With `wp_trivial_clause_only` or `wp_limits_unmet`
+
+- `wp_trivial_clause_only`: every `L4_*`, `L5_*` or `L6_*` clause of that class holds whatever the function does. Write a clause that constrains the output or state.
+- `wp_limits_unmet`: the report has no `limits`, or its contract check did not pass. Re-run with the current `run_wp_function.py`; reports written before verdict limits existed are not credited.
 
 ### Symptom: PowerShell Splits Frama-C or Docker CLI Flags Containing `.` or `=`
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.

@@ -53,6 +53,7 @@ def wp_report(fn, file_field, status="all_proven", reason=None):
         "file": file_field,
         "by_obligation_class": by_class,
         "unproven_goals": goals,
+        "limits": {"vacuity": {"status": "consistent", "doomed": [], "dead_goals": 0}},
     }
     if reason:
         report["reason"] = reason

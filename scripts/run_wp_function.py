@@ -26,6 +26,7 @@ Drives Frama-C WP + RTE deductive verification on a single C function (-wp-fct).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -39,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+from acsl_ast import find_named_clause, is_trivial_predicate  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_DEAD,
     STATUS_INVALID,
@@ -80,7 +82,18 @@ _TIER_B_PATTERNS = (
     "using unguarded behavior assigns",
     "using complete behaviors assigns",
     "Failed smoke-test",
+    # The kernel invents a default contract (no writes to globals) for a called prototype: the
+    # caller's proof then rests on it. "Neither code nor explicit exits and terminates" is benign.
+    "Neither code nor specification for function",
 )
+_MISSING_SPEC_RE = re.compile(r"Neither code nor specification for function ([A-Za-z_][A-Za-z0-9_]*)")
+# Only a doomed `requires` makes a proof vacuous. Doomed dead_code / dead_call goals also fire on
+# correct defensive code (`if (p == NULL)` under `requires \valid(p)`), so they are only counted.
+_DOOMED_REQUIRES_RE = re.compile(r"\(Doomed\) typed_[A-Za-z0-9_]*?_wp_smoke_([A-Za-z0-9_]+)_requires\b")
+_DOOMED_DEAD_RE = re.compile(r"\(Doomed\) (typed_[A-Za-z0-9_]*?_wp_smoke_dead_[a-z]+_[A-Za-z0-9_]+)")
+VACUITY_GOAL_TIMEOUT_S = 1
+VACUITY_SMOKE_TIMEOUT_S = 5
+VACUITY_WALL_TIMEOUT_S = 300
 _TIER_B_RE = re.compile(r"[^\n]*(?:" + "|".join(re.escape(p) for p in _TIER_B_PATTERNS) + r")[^\n]*")
 _SMOKE_FAIL_RE = re.compile(
     r"(Failed smoke-test[^\n]*|Unsuccess[^\n]*smoke[^\n]*|[^\n]*Smoke Tests\s*:\s*0\s*/\s*\d+[^\n]*)",
@@ -543,6 +556,14 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
             _add(
                 "Vacuous proof detected (--wp-smoke-tests proved \\false): your 'requires' clauses or loop "
                 "invariants are mutually contradictory. Inspect and relax conflicting preconditions."
+            )
+        missing_spec = sorted(set(_MISSING_SPEC_RE.findall(aborts_and_unsound)))
+        if missing_spec:
+            _add(
+                f"Callee(s) without any contract: {', '.join(missing_spec)}. Frama-C generated a default contract "
+                "that WP then trusted, so this proof does not hold. A contract is needed on the prototype: "
+                "request it through `strengthening_requests`, or use a stub from `templates/acsl/external_stubs.h` "
+                "for an external function."
             )
         if "Ignoring " in aborts_and_unsound or "not yet supported (skipped)" in aborts_and_unsound:
             if _WP_ALLOC_UNSUPPORTED_RE.search(aborts_and_unsound):
@@ -1229,6 +1250,7 @@ def run_wp_on_function(
         "step_c_contract_postcondition": [],
     }
     by_class: dict[str, dict[str, int]] = {}
+    layer_goals: list[dict] = []
     fpv_assumed_count = len(soundness["assumed_function_pointer_goals"])
 
     if csv_path.exists():
@@ -1251,11 +1273,15 @@ def run_wp_on_function(
             if st == STATUS_VALID:
                 proven_goals.append(item)
                 counts["proven"] += 1
+                if cls in _LAYER_CLASS.values():
+                    layer_goals.append(item)
             elif st == STATUS_VALID_UNDER_HYP:
                 # Expected under -wp-fct: callee contracts are hypotheses proven in their own
                 # sessions. Kept separate so the proof audit can resolve every hypothesis.
                 under_hyp_goals.append(item)
                 counts["proven_under_hyp"] += 1
+                if cls in _LAYER_CLASS.values():
+                    layer_goals.append(item)
             elif st in (STATUS_UNKNOWN, STATUS_INVALID, STATUS_INVALID_UNDER_HYP, STATUS_NEVER_TRIED):
                 # Under -warn-invalid-pointer, loading a function pointer from memory yields a
                 # Degenerated \valid_function goal that WP cannot prove; count it as an explicit assumption.
@@ -1492,6 +1518,7 @@ def run_wp_on_function(
         "unproven_by_bucket": buckets,
         "unproven_goals": unproven_goals,
         "proven_under_hyp_goals": under_hyp_goals,
+        "layer_goals": layer_goals,
         "goal_dumps": goal_dumps,
         "sarif_file": str(sarif_path) if sarif and sarif_path.exists() else None,
         "wp_log_tail": combined_log[-3000:],
@@ -1508,6 +1535,155 @@ def run_wp_on_function(
     if soundness.get("macro_loop_warnings"):
         res["wp_macro_loop_limitation"] = True
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
+    return res
+
+
+def run_vacuity_check(
+    c_file: Path,
+    fn_name: str,
+    out_dir: Path,
+    machdep: str = "gcc_x86_64",
+    cppflags: str = "-I.",
+    provers: str = "alt-ergo,z3,cvc5",
+    wp_model: str = "Typed",
+    wp_par: int | str | None = None,
+    extra_sources: list[str] | None = None,
+) -> dict:
+    """
+    Ask WP whether the contract of `fn_name` can hold at all.
+
+    A separate pass, so smoke goals never mix with the proof's own counts. It needs no RTE goals,
+    and contract goals get a short timeout: only the smoke goals matter here. A prover that cannot
+    refute a `requires` within the timeout leaves it `consistent`, meaning "not refuted".
+    """
+    cmd = [
+        "frama-c",
+        "-pp-annot",
+        "-no-unicode",
+        "-machdep",
+        machdep,
+        f"-cpp-extra-args={augment_framac_cppflags(cppflags)}",
+        str(c_file),
+        *(extra_sources or []),
+        "-wp",
+        "-wp-fct",
+        fn_name,
+        "-wp-model",
+        wp_model,
+    ]
+    for p in [p.strip() for p in provers.split(",") if p.strip()]:
+        cmd.extend(["-wp-prover", p])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="vacuity_", dir=out_dir) as wp_out:
+        cmd.extend(
+            [
+                "-wp-par",
+                str(resolve_wp_par(wp_par)),
+                "-wp-timeout",
+                str(VACUITY_GOAL_TIMEOUT_S),
+                "-wp-memlimit",
+                str(WP_MEMLIMIT_MB),
+                "-wp-out",
+                wp_out,
+                "-wp-cache",
+                "none",
+                "-wp-smoke-tests",
+                "-wp-smoke-timeout",
+                str(VACUITY_SMOKE_TIMEOUT_S),
+            ]
+        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=VACUITY_WALL_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "inconclusive", "reason": f"timed out after {VACUITY_WALL_TIMEOUT_S}s", "doomed": []}
+        except OSError as exc:
+            return {"status": "inconclusive", "reason": str(exc), "doomed": []}
+    return classify_vacuity_log(proc.stdout + proc.stderr, proc.returncode)
+
+
+def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
+    doomed = sorted(set(_DOOMED_REQUIRES_RE.findall(log_text)))
+    dead = sorted(set(_DOOMED_DEAD_RE.findall(log_text)))
+    if doomed:
+        return {"status": "contradictory", "doomed": doomed, "dead_goals": len(dead)}
+    if returncode != 0 or "Smoke Tests" not in log_text:
+        return {
+            "status": "inconclusive",
+            "reason": f"smoke pass produced no result (rc={returncode})",
+            "doomed": [],
+            "dead_goals": len(dead),
+        }
+    return {"status": "consistent", "doomed": [], "dead_goals": len(dead)}
+
+
+def _read_goal_source(goal: dict, c_file: Path) -> str | None:
+    """The file a goal was reported in (contracts often live in a header), or None if it cannot be read."""
+    rel = str(goal.get("file") or "")
+    for cand in (Path(rel), c_file.parent / rel, c_file.parent / Path(rel).name, c_file):
+        with contextlib.suppress(OSError):
+            if rel and cand.is_file():
+                return cand.read_text(encoding="utf-8", errors="replace")
+    return None
+
+
+def layer_clause_limits(goals: list[dict], c_file: Path) -> dict:
+    """
+    Classify the proven L4-L6 clauses by reading their source. A class whose every clause says
+    nothing about the function (`\\true`, `x == x`) lands in `classes_without_real_clause`.
+    The check is syntactic: a tautology it cannot see stays credited.
+    """
+    by_class: dict[str, set[str]] = {}
+    trivial: set[str] = set()
+    unchecked: set[str] = set()
+    for goal in goals:
+        m = _LAYER_NAME_RE.search(f"{goal.get('kind', '')} {goal.get('annotation', '')}")
+        if not m:
+            continue
+        name = m.group(0)
+        by_class.setdefault(goal["obligation_class"], set()).add(name)
+        source = _read_goal_source(goal, c_file)
+        predicate = find_named_clause(source, name) if source is not None else None
+        if predicate is None:
+            unchecked.add(name)
+        elif is_trivial_predicate(predicate):
+            trivial.add(name)
+    return {
+        "trivial_layer_clauses": sorted(trivial),
+        "unchecked_layer_clauses": sorted(unchecked),
+        "classes_without_real_clause": sorted(cls for cls, names in by_class.items() if names <= trivial),
+    }
+
+
+def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None) -> dict:
+    """
+    Record what this verdict covered in `res["limits"]`. `coverage-ledger` credits a proof only when
+    the limits are recorded (scripts/ledger.py), and a contradictory contract fails the proof here.
+    `vacuity` is None when the check did not run.
+    """
+    soundness = res.get("soundness") or {}
+    missing_spec = sorted(
+        {name for msg in soundness.get("tier_b_unsound") or [] for name in _MISSING_SPEC_RE.findall(msg)}
+    )
+    res["limits"] = {
+        "vacuity": vacuity or {"status": "not_run", "doomed": []},
+        "missing_spec_callees": missing_spec,
+        **layer_clause_limits(res.get("layer_goals") or [], c_file),
+    }
+    if vacuity and vacuity["status"] == "contradictory":
+        names = ", ".join(vacuity["doomed"])
+        soundness.setdefault("tier_b_unsound", []).append(f"Failed smoke-test: contract is contradictory ({names})")
+        soundness["ok"] = False
+        res["soundness"] = soundness
+        res["status"] = "unsound_proof"
+        res["next_synthesis_focus"] = "tier_b_soundness_fix_required"
+        res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, "")
     return res
 
 
@@ -1620,6 +1796,21 @@ def main(argv: list[str] | None = None) -> int:
         wp_blockers=args.wp_blockers,
         ignore_prover_budget=args.ignore_prover_budget,
     )
+    vacuity = None
+    # A filtered or goal-dump run is not a whole proof: nothing is credited from it.
+    if res.get("status") == "all_proven" and not args.prop and not args.dump_goal:
+        vacuity = run_vacuity_check(
+            args.file,
+            args.function,
+            args.out_dir,
+            machdep=args.machdep,
+            cppflags=args.cppflags,
+            provers=args.provers,
+            wp_model=res.get("wp_model") or args.wp_model,
+            wp_par=args.wp_par,
+            extra_sources=args.extra_sources,
+        )
+    apply_verdict_limits(res, args.file, vacuity)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = {

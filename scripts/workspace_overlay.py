@@ -742,6 +742,7 @@ def _run_parent_reverify(
     """
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
+    guard_reach = None
 
     if module and sources:
         harness = overlay_dir / "harnesses" / f"harness_{module}.c"
@@ -807,6 +808,7 @@ def _run_parent_reverify(
         report = json.loads(guard_json.read_text(encoding="utf-8"))
         if report.get("status") != "passed_dynamic_oracle":
             return False, f"parent guardrail returned status={report.get('status')!r}"
+        guard_reach = report.get("reach")
 
     if role == "prover" and c_file and function:
         norm_c = _normalize_work_relpath(c_file)
@@ -857,6 +859,13 @@ def _run_parent_reverify(
                 )
         elif wp_status != "all_proven":
             return False, f"parent WP check on merged tree returned status={wp_status!r}"
+        if isinstance(guard_reach, dict) and guard_reach.get("measured"):
+            wp_report.setdefault("limits", {})["dynamic_oracle"] = {
+                "exercised": function not in (guard_reach.get("unreached") or []),
+                "hits": (guard_reach.get("functions") or {}).get(function),
+                "executed_inputs": guard_reach.get("executed_inputs"),
+            }
+            wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
         if len(_function_files(run_dir, function) - {norm_c}) == 0:
             canonical = overlay_dir / "reports" / "wp" / f"{function}.json"
             canonical.parent.mkdir(parents=True, exist_ok=True)

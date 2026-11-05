@@ -47,6 +47,7 @@ from framac_common import (  # noqa: E402
     load_json_strict,
     run_lock,
     utc_now,
+    wp_limits_problem,
 )
 from promote_artifact import PromotionError, promote_file, promote_seeds  # noqa: E402
 from run_wp_function import goal_obligation_class  # noqa: E402
@@ -207,6 +208,19 @@ def add_assumption(unit: dict, kind: str, description: str, related: list[str] |
     a = {"kind": kind, "description": description, "related_units": sorted(set(related or []))}
     if a not in unit["assumptions"]:
         unit["assumptions"].append(a)
+
+
+def add_wp_limit_assumptions(unit: dict, limits: dict, function: str) -> None:
+    """What a credited proof did not establish stays visible as an open assumption on the unit."""
+    if limits["vacuity"]["status"] == "inconclusive":
+        add_assumption(unit, "other", f"The consistency check of {function}'s contract was inconclusive.")
+    oracle = limits.get("dynamic_oracle") or {}
+    if oracle.get("exercised") is False:
+        add_assumption(
+            unit,
+            "other",
+            f"No guardrail input reached {function}: its contract was proven but not exercised at runtime.",
+        )
 
 
 def mark_candidate(unit: dict, fingerprint: str) -> None:
@@ -902,6 +916,8 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
         soundness = report.get("soundness", {})
         by_class = report.get("by_obligation_class", {})
         all_proven = report["status"] == "all_proven"
+        limits = report.get("limits")
+        limits_problem = wp_limits_problem(limits)
         unproven_by_class: dict[str, list[dict]] = {}
         for g in report.get("unproven_goals", []):
             unproven_by_class.setdefault(g.get("obligation_class", "rte"), []).append(g)
@@ -937,6 +953,27 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                     for g in goals[:10]
                 ] or [f"{counts['unproven']} unproven goal(s)"]
                 stats["blocked"] += 1
+            elif all_proven and limits_problem:
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_limits_unmet",
+                    False,
+                    tool_output,
+                    f"Proof not credited: {limits_problem}.",
+                )
+            elif all_proven and cls in limits.get("classes_without_real_clause", []):
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_trivial_clause_only",
+                    False,
+                    tool_output,
+                    f"Every {cls} clause holds whatever the function does "
+                    f"({', '.join(limits.get('trivial_layer_clauses', []))}); not credited.",
+                )
             elif counts and (counts.get("proven", 0) + counts.get("proven_under_hyp", 0)) > 0 and all_proven:
                 add_evidence(
                     u,
@@ -946,7 +983,9 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                     True,
                     tool_output,
                     f"{counts.get('proven', 0)} goal(s) proven, {counts.get('proven_under_hyp', 0)} valid under hypotheses.",
+                    details={"limits": limits},
                 )
+                add_wp_limit_assumptions(u, limits, report["function"])
                 if counts.get("proven_under_hyp", 0):
                     add_assumption(
                         u,
@@ -983,7 +1022,9 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                     True,
                     tool_output,
                     ev_summary,
+                    details={"limits": limits},
                 )
+                add_wp_limit_assumptions(u, limits, report["function"])
                 if soundness.get("reduced_checks"):
                     add_assumption(
                         u,

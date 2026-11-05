@@ -1,3 +1,4 @@
+import copy
 import json
 from typing import Any
 
@@ -234,9 +235,64 @@ def wp_report(**kw):
         "file": "workspace/work/src/snmp/pdu.c",
         "by_obligation_class": {"rte": {"proven": 3, "proven_under_hyp": 2, "unproven": 0}},
         "unproven_goals": [],
+        "limits": {"vacuity": {"status": "consistent", "doomed": [], "dead_goals": 0}},
     }
     r.update(kw)
     return r
+
+
+def _unit(run_dir, cls):
+    return next(
+        u
+        for u in load(run_dir / "coverage-ledger.json")
+        if u["function"] == "snmp_parse_pdu" and u["obligation_class"] == cls
+    )
+
+
+def test_ingest_wp_needs_recorded_limits(run_dir):
+    seed(run_dir)
+    report = wp_report()
+    del report["limits"]
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    unit = _unit(run_dir, "rte")
+    assert unit["status"] != "covered"
+    assert unit["evidence"][-1]["result"] == "wp_limits_unmet" and not unit["evidence"][-1]["discharging"]
+
+
+def test_ingest_wp_does_not_credit_a_class_of_trivial_clauses(run_dir):
+    seed(run_dir)
+    units = load(run_dir / "coverage-ledger.json")
+    l5 = copy.deepcopy(next(u for u in units if u["function"] == "snmp_parse_pdu" and u["obligation_class"] == "rte"))
+    l5.update(obligation_class="l5_output", coverage_id=l5["coverage_id"].replace("::rte", "::l5_output"))
+    write_json(run_dir / "coverage-ledger.json", [*units, l5])
+    report = wp_report(
+        by_obligation_class={
+            "rte": {"proven": 3, "proven_under_hyp": 0, "unproven": 0},
+            "l5_output": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+        },
+    )
+    report["limits"].update(trivial_layer_clauses=["L5_no_crlf"], classes_without_real_clause=["l5_output"])
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    assert _unit(run_dir, "rte")["status"] == "covered"
+    l5 = _unit(run_dir, "l5_output")
+    assert l5["status"] != "covered"
+    assert l5["evidence"][-1]["result"] == "wp_trivial_clause_only"
+
+
+def test_ingest_wp_keeps_limits_and_opens_assumptions(run_dir):
+    seed(run_dir)
+    report = wp_report()
+    report["limits"]["vacuity"]["status"] = "inconclusive"
+    report["limits"]["dynamic_oracle"] = {"exercised": False, "hits": 0, "executed_inputs": 3}
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    unit = _unit(run_dir, "rte")
+    assert unit["status"] == "covered"
+    assert unit["evidence"][-1]["details"]["limits"] == report["limits"]
+    text = " ".join(a["description"] for a in unit["assumptions"])
+    assert "inconclusive" in text and "not exercised at runtime" in text
 
 
 def test_ingest_wp_proven_with_hypotheses_and_unproven(run_dir):
