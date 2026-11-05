@@ -1574,8 +1574,12 @@ def _unwrap_command(cmd: str) -> str:
     return text
 
 
-def _extract_script_paths(cmd: str) -> list[Path]:
-    paths: list[Path] = []
+_SHELL_SHEBANG_RE = re.compile(r"#!\s*(?:\S*/)?(?:env\s+(?:-\S+\s+)*)?(?:ba|da)?sh(?:\s|$)")
+
+
+def _extract_script_paths(cmd: str) -> list[tuple[Path, bool]]:
+    """Path-like tokens of `cmd`, each with whether a `bash`/`sh` token names it as the script to run."""
+    paths: list[tuple[Path, bool]] = []
     token_lists: list[list[str]] = []
     try:
         token_lists.append(shlex.split(cmd, posix=(os.name != "nt")))
@@ -1593,7 +1597,7 @@ def _extract_script_paths(cmd: str) -> list[Path]:
                         cand = next_tok.strip("\"'")
                         if cand not in seen:
                             seen.add(cand)
-                            paths.append(Path(cand))
+                            paths.append((Path(cand), True))
                         break
             elif (
                 clean_tok.endswith(".sh")
@@ -1603,7 +1607,7 @@ def _extract_script_paths(cmd: str) -> list[Path]:
             ):
                 if clean_tok not in seen:
                     seen.add(clean_tok)
-                    paths.append(Path(clean_tok))
+                    paths.append((Path(clean_tok), False))
     return paths
 
 
@@ -1614,11 +1618,14 @@ def infer_class(cmd: str) -> str:
     if matched:
         return matched
 
-    # Check if the command runs an on-disk shell script file
-    for p in _extract_script_paths(unwrapped):
+    # Check if the command runs an on-disk shell script file. Other files are not scanned: a pipeline
+    # script's own source, or a report passed as an argument, can mention commands it does not run.
+    for p, run_by_shell in _extract_script_paths(unwrapped):
         try:
             if p.is_file():
                 content = p.read_text(encoding="utf-8", errors="replace")[:65536]
+                if not (run_by_shell or p.suffix == ".sh" or _SHELL_SHEBANG_RE.match(content)):
+                    continue
                 script_matched = _match_class_patterns(content)
                 if script_matched:
                     return script_matched
