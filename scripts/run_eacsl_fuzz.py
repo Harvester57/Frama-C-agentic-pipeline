@@ -1289,6 +1289,40 @@ def run_fuzz_campaign(
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+_COVERAGE_LINE_RE = re.compile(
+    r"^(?:UN)?COVERED_FUNC: hits: (\d+) edges: \d+/\d+ (\S+) .*$|^COVERAGE:\s*$|^stat::number_of_executed_units: (\d+)\s*$",
+    re.MULTILINE,
+)
+
+
+def parse_guardrail_reach(output: str, functions: list[str] | None) -> tuple[dict, str]:
+    """
+    What a guardrail replay executed, from libFuzzer's -print_coverage, and the output without those
+    lines (a report can run to hundreds of them, which would push a failure out of any log tail).
+
+    E-ACSL moves a contract into `__gen_e_acsl_<fn>`, so a function counts as reached through either
+    name. A function in neither list was inlined or not instrumented: its reach is unknown (None).
+    """
+    hits: dict[str, int] = {}
+    executed: int | None = None
+    for m in _COVERAGE_LINE_RE.finditer(output or ""):
+        if m.group(3) is not None:
+            executed = int(m.group(3))
+        elif m.group(2) is not None:
+            hits[m.group(2)] = hits.get(m.group(2), 0) + int(m.group(1))
+    by_fn: dict[str, int | None] = {}
+    for fn in functions or []:
+        names = [n for n in (fn, f"__gen_e_acsl_{fn}") if n in hits]
+        by_fn[fn] = sum(hits[n] for n in names) if names else None
+    reach = {
+        "measured": bool(hits),
+        "executed_inputs": executed,
+        "functions": by_fn,
+        "unreached": sorted(fn for fn, n in by_fn.items() if n == 0),
+    }
+    return reach, _COVERAGE_LINE_RE.sub("", output or "")
+
+
 def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
     has_unsound = bool(re.search(r"[Ww]arning:\s*(?:no sound verdict for|unsound verdict)", output or ""))
     if has_unsound:
@@ -1345,7 +1379,16 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
     instrumentation compile errors. Returns [] when status == 'passed_dynamic_oracle'.
     """
     status = res.get("status")
-    if status in ("passed_dynamic_oracle", "built", "no_crash"):
+    if status == "passed_dynamic_oracle":
+        unreached = (res.get("reach") or {}).get("unreached") or []
+        if not unreached:
+            return []
+        return [
+            f"This pass tested nothing for {', '.join(unreached)}: no replayed input reached it, so its contract "
+            "was not challenged at runtime. The merged proof records this as an open assumption. Keep every "
+            "`requires` as weak as the proof allows, because no runtime check will catch an over-constrained one."
+        ]
+    if status in ("built", "no_crash"):
         return []
 
     hints: list[str] = []
@@ -1493,6 +1536,7 @@ def run_guardrail_check(
     use_cache: bool = True,
     use_verdict_cache: bool = True,
     max_corpus_inputs: int = 64,
+    functions: list[str] | None = None,
 ) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
@@ -1502,6 +1546,9 @@ def run_guardrail_check(
 
     The binary must be E-ACSL-instrumented: replaying an uninstrumented build would return 0
     for any contract and produce a vacuous `passed_dynamic_oracle`.
+
+    A pass only says that no replayed input broke a check. `reach` records how often each of
+    `functions` ran: a contract on a function no input reached was not tested at all.
 
     When caching is enabled (`scripts/cache.py`), deterministic passing verdicts
     (`passed_dynamic_oracle`) are cached in the run-local `guardrail` namespace
@@ -1548,6 +1595,7 @@ def run_guardrail_check(
                 "per_input_timeout": int(per_input_timeout),
                 "seed": int(seed),
                 "module": module,
+                "reach_functions": sorted(functions or []),
             }
             g_key = cache.make_key("guardrail", g_material)
             entry = cache.lookup("guardrail", g_key, include_run=not in_parent_guard)
@@ -1578,14 +1626,17 @@ def run_guardrail_check(
         f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
         f"-seed={seed}",
         f"-artifact_prefix={scratch_dir.resolve()}/",
+        "-print_coverage=1",
+        "-print_final_stats=1",
         str(scratch_corpus.resolve()),
         str(replay_dir.resolve()),
     ]
     res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
-    combined_out = res.stdout + "\n" + res.stderr
+    reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
     verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
     verdict.update(
         {
+            "reach": reach,
             "returncode": res.returncode,
             "timed_out": res.timed_out,
             "sandbox": res.sandbox,
@@ -2479,6 +2530,7 @@ def main(argv: list[str] | None = None) -> int:
                     use_cache=use_cache,
                     use_verdict_cache=use_verdict_cache,
                     max_corpus_inputs=args.max_corpus_inputs,
+                    functions=args.functions,
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
                 if "diagnostic_hints" not in res:

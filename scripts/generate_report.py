@@ -158,6 +158,48 @@ def assurance_table(ledger: list[dict]) -> list[str]:
     return lines
 
 
+def verdict_limits_section(ledger: list[dict]) -> list[str]:
+    """What the WP verdicts did and did not establish, from the limits on their evidence."""
+    unexercised: set[str] = set()
+    inconclusive: set[str] = set()
+    unchecked: set[str] = set()
+    trivial: set[str] = set()
+    credited = 0
+    for u in ledger:
+        for e in u["evidence"]:
+            limits = (e.get("details") or {}).get("limits")
+            if e["phase"] != "wp" or not isinstance(limits, dict):
+                continue
+            credited += 1
+            name = f"{u['file']}#{u['function']}"
+            if (limits.get("dynamic_oracle") or {}).get("exercised") is False:
+                unexercised.add(name)
+            if (limits.get("vacuity") or {}).get("status") == "inconclusive":
+                inconclusive.add(name)
+            unchecked.update(f"{name} ({c})" for c in limits.get("unchecked_layer_clauses") or [])
+            trivial.update(f"{name} ({c})" for c in limits.get("trivial_layer_clauses") or [])
+    if not credited:
+        return []
+    out = [
+        "Verdict limits:",
+        "",
+        "- Contract consistency means no prover refuted the contract within its timeout, not that it is satisfiable.",
+        "- Trivial-clause detection is syntactic: a tautology it cannot recognize is still credited.",
+    ]
+    for label, names in (
+        ("Proven, but no guardrail input reached the function", unexercised),
+        ("Contract consistency check inconclusive", inconclusive),
+        ("Layer clauses that say nothing about the function", trivial),
+        ("Layer clauses whose source could not be read", unchecked),
+    ):
+        if names:
+            shown = ", ".join(f"`{n}`" for n in sorted(names)[:20])
+            more = f" and {len(names) - 20} more" if len(names) > 20 else ""
+            out.append(f"- {label} ({len(names)}): {shown}{more}")
+    out.append("")
+    return out
+
+
 def render_report(data: dict) -> str:
     meta, ledger = data["meta"], data["ledger"]
     run_dir = data.get("run_dir")
@@ -293,6 +335,7 @@ def render_report(data: dict) -> str:
         for k, n in sorted(kinds.items()):
             out.append(f"- `{k}`: {n}")
         out.append("")
+    out += verdict_limits_section(ledger)
 
     out += ["## 6. Coverage gaps", ""]
     blocked = [u for u in ledger if u["status"] == "blocked"]

@@ -1264,3 +1264,93 @@ def splice_architect_header(
         raise AcslError(f"Post-splice ACSL-only check failed on {path}:\n  " + "\n  ".join(post_errors))
 
     return spliced
+
+
+_INT_LITERAL_RE = re.compile(r"^[0-9]+$")
+_RELATION_RE = re.compile(r"==|!=|<=|>=|<|(?<!-)>")
+
+
+def find_named_clause(source: str, name: str) -> str | None:
+    """Predicate of the ACSL clause labelled `name` (`ensures L5_x: <predicate>;`), or None if absent."""
+    m = re.search(rf"\b{re.escape(name)}\s*:(.*?)(?:;|\*/)", source, re.DOTALL)
+    if m is None:
+        return None
+    return " ".join(m.group(1).replace("@", " ").split())
+
+
+def _top_level_positions(text: str) -> list[bool]:
+    """For each character of `text`, whether it sits outside every bracket."""
+    depth = 0
+    out = []
+    for ch in text:
+        if ch in ")]}":
+            depth -= 1
+        out.append(depth == 0)
+        if ch in "([{":
+            depth += 1
+    return out
+
+
+def _split_top_level(text: str, op: str) -> list[str]:
+    top = _top_level_positions(text)
+    parts: list[str] = []
+    start = i = 0
+    while i < len(text):
+        # `<==>` contains `==>`: it is split on first and must not read as an implication here.
+        if top[i] and text.startswith(op, i) and not (op == "==>" and i > 0 and text[i - 1] == "<"):
+            parts.append(text[start:i])
+            i += len(op)
+            start = i
+        else:
+            i += 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts]
+
+
+def _strip_outer_parens(text: str) -> str:
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(text):
+            depth += (ch == "(") - (ch == ")")
+            if depth == 0 and i < len(text) - 1:
+                return text
+        text = text[1:-1].strip()
+    return text
+
+
+def _is_trivial_relation(text: str) -> bool:
+    top = _top_level_positions(text)
+    found = [m for m in _RELATION_RE.finditer(text) if top[m.start()]]
+    if len(found) != 1:
+        return False
+    op = found[0].group(0)
+    lhs = _strip_outer_parens(text[: found[0].start()])
+    rhs = _strip_outer_parens(text[found[0].end() :])
+    if lhs == rhs:
+        return op in ("==", "<=", ">=")
+    if _INT_LITERAL_RE.match(lhs) and _INT_LITERAL_RE.match(rhs):
+        a, b = int(lhs), int(rhs)
+        return {"==": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b, "<": a < b, ">": a > b}[op]
+    return False
+
+
+def is_trivial_predicate(text: str) -> bool:
+    """
+    True when an ACSL predicate holds whatever the program does: `\\true`, a nonzero literal, `x == x`,
+    `1 <= 2`, or a connective built from those. Conservative and syntactic: it answers False for
+    anything it cannot see through, such as a predicate call or a quantifier.
+    """
+    text = _strip_outer_parens(" ".join(text.split()))
+    if text == "\\true" or (_INT_LITERAL_RE.match(text) and int(text) != 0):
+        return True
+    if len(parts := _split_top_level(text, "<==>")) > 1:
+        return len({_strip_outer_parens(p) for p in parts}) == 1
+    if len(parts := _split_top_level(text, "==>")) > 1:
+        lhs, rhs = _strip_outer_parens(parts[0]), _strip_outer_parens(" ==> ".join(parts[1:]))
+        return is_trivial_predicate(rhs) or lhs == rhs or lhs == "\\false"
+    if len(parts := _split_top_level(text, "||")) > 1:
+        return any(is_trivial_predicate(p) for p in parts)
+    if len(parts := _split_top_level(text, "&&")) > 1:
+        return all(is_trivial_predicate(p) for p in parts)
+    return _is_trivial_relation(text)

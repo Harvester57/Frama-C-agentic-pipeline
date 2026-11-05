@@ -71,6 +71,16 @@ _STATUS_MAP = {
 }
 
 
+def wp_limits_problem(limits: object) -> str | None:
+    """Why the verdict limits of a WP report (run_wp_function.py) do not allow crediting its proof, or None."""
+    if not isinstance(limits, dict):
+        return "the WP report records no verdict limits"
+    vacuity = (limits.get("vacuity") or {}).get("status")
+    if vacuity not in ("consistent", "inconclusive"):
+        return f"the contract consistency check did not pass (status: {vacuity})"
+    return None
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

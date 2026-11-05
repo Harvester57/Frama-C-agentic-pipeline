@@ -38,11 +38,12 @@ class FakeFramaC:
         self.status, self.rc, self.log = status, rc, log
 
     def wp_calls(self) -> list[list[str]]:
-        return [c for c, _ in self.calls if "-wp" in c]
+        # The proof runs: the contract consistency pass writes no report.
+        return [c for c, _ in self.calls if "-wp" in c and "-report-csv" in c]
 
     def __call__(self, cmd, **kwargs):
         self.calls.append((list(cmd), kwargs))
-        if "-wp" in cmd:
+        if "-wp" in cmd and "-report-csv" in cmd:
             self.goal_dir_existed = Path(_flag(cmd, "-wp-out")).is_dir()
             if self.rc == 0:
                 fn = _flag(cmd, "-wp-fct")
@@ -220,14 +221,18 @@ def test_wp_cli_defaults(tmp_path, monkeypatch):
         str(tmp_path / "wp.json"),
         "--no-retry-bitwise",
     ]
+
+    def proof_call():
+        return next((cmd, kw) for cmd, kw in reversed(fake.calls) if "-report-csv" in cmd)
+
     assert W.main(base) == 0
-    cmd, kwargs = fake.calls[-1]
+    cmd, kwargs = proof_call()
     assert kwargs["timeout"] == CLASSES["wp"].wall_timeout_s and _flag(cmd, "-wp-par") == "6"
     monkeypatch.setenv("FRAMAC_WP_WALL_TIMEOUT", "0")
     W.main(base)
-    assert fake.calls[-1][1]["timeout"] is None
+    assert proof_call()[1]["timeout"] is None
     W.main(base + ["--wall-timeout", "7", "--wp-par", "2"])
-    assert fake.calls[-1][1]["timeout"] == 7 and _flag(fake.calls[-1][0], "-wp-par") == "2"
+    assert proof_call()[1]["timeout"] == 7 and _flag(proof_call()[0], "-wp-par") == "2"
     with pytest.raises(SystemExit):
         W.main(base + ["--wp-par", "0"])
     report = json.loads((tmp_path / "wp.json").read_text(encoding="utf-8"))
@@ -484,7 +489,10 @@ def test_parent_recheck_argv_is_accepted_by_the_real_clis(tmp_path, monkeypatch)
 
     monkeypatch.setattr(workspace_overlay.subprocess, "run", fake_run)
     monkeypatch.setattr(R, "compile_eacsl_binary", compile_ok)
-    monkeypatch.setattr(R, "run_sandboxed", lambda cmd, **k: SandboxResult(0, "", "", False, "rlimits", list(cmd)))
+    coverage = "UNCOVERED_FUNC: hits: 0 edges: 0/1 __gen_e_acsl_callee m.c:1\nstat::number_of_executed_units: 3\n"
+    monkeypatch.setattr(
+        R, "run_sandboxed", lambda cmd, **k: SandboxResult(0, coverage, "", False, "rlimits", list(cmd))
+    )
     monkeypatch.chdir(run_dir)
     try:
         ok, why = workspace_overlay._run_parent_reverify(
@@ -510,6 +518,7 @@ def test_parent_recheck_argv_is_accepted_by_the_real_clis(tmp_path, monkeypatch)
     assert wp_script == "run_wp_function.py" and "--cppflags=-I." in wp_argv and "--sarif" in wp_argv
     assert wp_argv[wp_argv.index("--wp-par") + 1] == "3"
     report = json.loads((run_dir / "agents/prover-1/scratch/parent_wp/callee.json").read_text(encoding="utf-8"))
+    assert report["limits"]["dynamic_oracle"] == {"exercised": False, "hits": 0, "executed_inputs": 3}
     assert report["status"] == "all_proven" and report["sizing"]["wp_par"] == 3 and report["sarif_file"]
 
 

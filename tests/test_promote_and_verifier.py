@@ -945,6 +945,7 @@ class TestHarnessLegitimacyAndMetadata:
                     "discharging": True,
                     "tool_output": "workspace/reports/wp/GetInt.json",
                     "summary": "All goals proved",
+                    "details": {"limits": {"vacuity": {"status": "consistent"}}},
                 }
             ],
         )

@@ -181,7 +181,12 @@ def test_report_dedupes_same_sink_findings_and_shows_work_line_shift(tmp_path):
 def test_reporting_semantics_wp_vs_eva_and_sarif_levels(tmp_path):
     build_run(tmp_path)
     write_json(tmp_path / "workspace/reports/wp/snmp.json", {})
-    ev_wp = [evidence(phase="wp", result="wp_proven", discharging=True, tool_output="workspace/reports/wp/snmp.json")]
+    ev_wp = [
+        {
+            **evidence(phase="wp", result="wp_proven", discharging=True, tool_output="workspace/reports/wp/snmp.json"),
+            "details": {"limits": {"vacuity": {"status": "consistent"}}},
+        }
+    ]
     ev_eva = [
         evidence(phase="eva", result="eva_all_valid", discharging=True, tool_output="workspace/reports/eva/snmp.json")
     ]
