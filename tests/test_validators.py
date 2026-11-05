@@ -169,6 +169,8 @@ def test_run_metadata_worktree_fallback_to_host_git_env(tmp_path, monkeypatch):
     # Simulate a git worktree whose .git file points to an unmounted host path
     (worktree_target / ".git").write_text("gitdir: /unmounted/host/repo/.git/worktrees/wt1\n", encoding="utf-8")
 
+    # A commit hook run from a worktree exports GIT_DIR, which would override `git -C target`.
+    monkeypatch.delenv("GIT_DIR", raising=False)
     monkeypatch.chdir(container_cwd)
     monkeypatch.setenv("FRAMAC_TARGET_COMMIT", "94e33bb58ce66295073d5e8275d81148ab5ad829")
     monkeypatch.setenv("FRAMAC_TARGET_DIRTY", "0")
