@@ -26,7 +26,9 @@ import difflib
 import hashlib
 import json
 import os
+import posixpath
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -57,6 +59,7 @@ from framac_common import (  # noqa: E402
     normalize_flag_args,
     run_lock,
     scratch_first_cppflags,
+    source_tree_relpath,
     utc_now,
 )
 from resources import (  # noqa: E402
@@ -448,6 +451,108 @@ def _normalize_work_relpath(raw_path: str) -> str:
     while norm.startswith("./"):
         norm = norm[2:]
     return norm
+
+
+def _include_dirs_in_order(cppflags: str, run_dir: Path, work_dir: Path) -> list[str]:
+    """Tree-relative include directories of `cppflags` in the order `#include "x.h"` searches them."""
+    try:
+        words = shlex.split(cppflags or "")
+    except ValueError:
+        words = (cppflags or "").split()
+    by_option: dict[str, list[str]] = {o: [] for o in ("-iquote", "-I", "-isystem", "-idirafter")}
+    i = 0
+    while i < len(words):
+        option = next((o for o in sorted(by_option, key=len, reverse=True) if words[i].startswith(o)), None)
+        if option is None:
+            i += 1
+            continue
+        path = words[i][len(option) :]
+        if not path and i + 1 < len(words):
+            i += 1
+            path = words[i]
+        i += 1
+        rel = source_tree_relpath(f"{path.rstrip('/')}/_", run_dir, work_dir) if path else None
+        if rel is not None:
+            by_option[option].append(rel[:-1].strip("/"))
+    return [d for option in by_option for d in by_option[option]]
+
+
+def _resolve_include_header(run_dir: Path, work_dir: Path, header: str | None, cppflags: str) -> str | None:
+    """
+    The tree-relative file a harness sidecar's `header` names. The sidecar records the name the
+    harness includes (`qcbor.h`), which is a tree path only when the module's flags put the tree root
+    on the include path; otherwise search the include directories as the preprocessor would. A name
+    that matches nothing is returned unchanged.
+    """
+    if not header:
+        return header
+    norm = _normalize_work_relpath(header)
+    if "/" in norm and (work_dir / norm).is_file():
+        return norm
+    for d in _include_dirs_in_order(cppflags, run_dir, work_dir):
+        cand = f"{d}/{norm}" if d else norm
+        if (work_dir / cand).is_file():
+            return posixpath.normpath(cand)
+    if (work_dir / norm).is_file():
+        return norm
+    tails = [p.relative_to(work_dir).as_posix() for p in work_dir.rglob(Path(norm).name) if p.is_file()]
+    tails = [t for t in tails if t == norm or t.endswith("/" + norm)]
+    return tails[0] if len(tails) == 1 else norm
+
+
+def _declares_function(text: str, function: str) -> bool:
+    """Whether comment-stripped header `text` has a prototype (not a definition) of `function`."""
+    text = re.sub(r"/\*.*?\*/|//[^\n]*", " ", text, flags=re.S)
+    for m in re.finditer(rf"\b{re.escape(function)}\s*\(", text):
+        depth = 1
+        j = m.end()
+        while j < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        tail = re.match(r"[^;{}]*?([;{])", text[j:], flags=re.S)
+        if depth == 0 and tail and tail.group(1) == ";":
+            return True
+    return False
+
+
+def _prover_header(
+    run_dir: Path, work_dir: Path, c_file: str | None, function: str | None, header: str | None, cppflags: str
+) -> str | None:
+    """
+    The header a prover may edit for `function`: the one that declares its prototype. The sidecar's
+    header is the one the harness includes, often an umbrella that only includes the real one
+    (`qcbor.h` for `inc/qcbor/qcbor_main_decode.h`), so when the resolved header does not hold the
+    declaration look at the C file's sibling header, then at the one header in the tree that does.
+    """
+    resolved = _resolve_include_header(run_dir, work_dir, header, cppflags)
+    if not function:
+        return resolved
+
+    def declares(rel: str | None) -> bool:
+        path = work_dir / rel if rel else None
+        if path is None or not path.is_file():
+            return False
+        try:
+            return _declares_function(path.read_text(encoding="utf-8", errors="replace"), function)
+        except OSError:
+            return False
+
+    if declares(resolved):
+        return resolved
+    sibling = Path(c_file).with_suffix(".h").as_posix() if c_file else None
+    if declares(sibling):
+        return sibling
+    holders = [
+        rel for rel in (p.relative_to(work_dir).as_posix() for p in sorted(work_dir.rglob("*.h"))) if declares(rel)
+    ]
+    return holders[0] if len(holders) == 1 else resolved
+
+
+def _module_header_flags(overlay: Path, module: str | None, cppflags: str | None) -> str:
+    """The flags a header name is resolved with: the caller's, then the module's own."""
+    meta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {}) if module else {}
+    own = meta.get("cppflags") if isinstance(meta, dict) else None
+    return " ".join(f for f in (cppflags, own) if f)
 
 
 def _resolve_overlay_source(run_dir: Path, work_dir: Path, src: str) -> str:
@@ -849,6 +954,14 @@ def _merge_agent_overlay_locked(
 
     norm_c_file = _normalize_work_relpath(c_file) if c_file else None
     norm_header_file = _normalize_work_relpath(header_file) if header_file else None
+    header_flags = _module_header_flags(overlay, module, cppflags)
+    if norm_header_file:
+        if role == "prover":
+            norm_header_file = _prover_header(
+                run_dir, shared_work, norm_c_file, function, norm_header_file, header_flags
+            )
+        else:
+            norm_header_file = _resolve_include_header(run_dir, shared_work, norm_header_file, header_flags)
 
     changed_rels = _collect_changed_files(scratch_base, scratch_work)
     allowed_rels = set()
@@ -872,7 +985,9 @@ def _merge_agent_overlay_locked(
                 elif module:
                     hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
                     if isinstance(hmeta, dict) and hmeta.get("header"):
-                        mod_hdr = _normalize_work_relpath(str(hmeta["header"]))
+                        mod_hdr = _prover_header(
+                            run_dir, shared_work, norm_c_file, function, str(hmeta["header"]), header_flags
+                        )
                         if mod_hdr in changed_rels:
                             norm_header_file = mod_hdr
         if norm_header_file:
@@ -1115,11 +1230,17 @@ def _enrich_batch_entry(
     hmeta: dict = {}
     if module:
         hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
-    if role == "prover" and not header_file and isinstance(hmeta, dict) and hmeta.get("header"):
-        header_file = _normalize_work_relpath(str(hmeta["header"]))
-
     sources = entry.get("sources") or default_sources or hmeta.get("sources")
     cppflags = entry.get("cppflags") or default_cppflags or hmeta.get("cppflags") or "-I."
+    if role == "prover" and not header_file and isinstance(hmeta, dict) and hmeta.get("header"):
+        header_file = _prover_header(
+            run_dir,
+            overlay / "work",
+            c_file,
+            function,
+            str(hmeta["header"]),
+            _module_header_flags(overlay, module, cppflags),
+        )
     ldflags = (
         entry.get("ldflags") if entry.get("ldflags") is not None else (default_ldflags or hmeta.get("ldflags") or "")
     )
@@ -1650,6 +1771,13 @@ def prepare_agent(
 
     eff_cppflags = cppflags if cppflags is not None else (hmeta.get("cppflags") or "-I.")
     eff_ldflags = ldflags if ldflags is not None else (hmeta.get("ldflags") or "")
+
+    # The sidecar's header is the name the harness includes; the brief needs the file in the tree.
+    header_flags = _module_header_flags(overlay, module, eff_cppflags)
+    if role == "prover":
+        norm_header = _prover_header(run_dir, overlay / "work", norm_c_file, function, norm_header, header_flags)
+    else:
+        norm_header = _resolve_include_header(run_dir, overlay / "work", norm_header, header_flags)
 
     eva_report = load_json_optional(overlay / "reports" / "eva" / f"{module}.json", {}) if module else {}
     wp_report_rel: str | None = None

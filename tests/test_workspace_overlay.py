@@ -703,3 +703,124 @@ def test_a_scratch_contract_is_seen_by_the_provers_own_guardrail(tmp_path):
     assert _run_oracle(guardrail, run_dir)["status"] == "rejected_overconstrained"
     old_report = _run_oracle(guardrail, run_dir, cppflags=f"-I{NESTED_SCRATCH} {NESTED_FLAGS}")
     assert old_report["status"] == "passed_dynamic_oracle"
+
+
+# ---------------------------------------------------------------------------
+# A sidecar `header` is the name the harness includes, not a path in the work tree
+# ---------------------------------------------------------------------------
+
+UMBRELLA_FLAGS = "-I. -Iworkspace/work/inc -Iworkspace/work/inc/nest -Iworkspace/work/src"
+PROTO_WITH_CONTRACT = "#ifndef NEST_API_H\n#define NEST_API_H\n/*@ requires a >= 0; */\nint nest_add(int a);\n#endif\n"
+
+
+def _bare_header_module(tmp_path: Path, cppflags: str) -> Path:
+    run_dir = _nested_module(tmp_path, cppflags)
+    sidecar = run_dir / "workspace" / "harnesses" / "harness_nest.json"
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    meta["header"] = "api.h"
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+    return run_dir
+
+
+def _prepare_bare(run_dir: Path, **kwargs) -> dict:
+    return WO.prepare_agent(
+        run_dir=run_dir,
+        agent_id=NESTED_AGENT,
+        role="prover",
+        module="nest",
+        function="nest_add",
+        c_file="src/api.c",
+        **kwargs,
+    )
+
+
+# Flags where the include name finds the nested header directly, and where it finds the umbrella
+# `inc/api.h` that only includes it (QCBOR: `qcbor.h` versus `inc/qcbor/qcbor_main_decode.h`).
+@pytest.mark.parametrize("flags", [NESTED_FLAGS, UMBRELLA_FLAGS])
+def test_bare_sidecar_header_resolves_to_the_declaring_tree_file(tmp_path, flags):
+    run_dir = _bare_header_module(tmp_path, flags)
+    prep = _prepare_bare(run_dir)
+    assert prep["header"] == "inc/nest/api.h"
+    assert (run_dir / "workspace" / "work" / prep["header"]).is_file()
+    assert "--header inc/nest/api.h" in prep["merge_command"]
+    brief = (run_dir / prep["brief_file"]).read_text(encoding="utf-8")
+    assert f"{NESTED_SCRATCH}/inc/nest/api.h" in brief or "inc/nest/api.h" in brief
+    assert f"{NESTED_SCRATCH}/api.h" not in brief
+    assert (run_dir / NESTED_SCRATCH / prep["header"]).is_file()
+
+
+def test_bare_header_enrich_batch_entry_uses_the_tree_file(tmp_path):
+    run_dir = _bare_header_module(tmp_path, UMBRELLA_FLAGS)
+    _prepare_bare(run_dir)
+    item = WO._enrich_batch_entry(
+        run_dir,
+        run_dir / "workspace",
+        {"agent_id": NESTED_AGENT, "role": "prover", "module": "nest", "file": "src/api.c", "function": "nest_add"},
+        None,
+        None,
+        None,
+        None,
+        "",
+    )
+    assert item["header_file"] == "inc/nest/api.h"
+
+
+@pytest.mark.parametrize("flags", [NESTED_FLAGS, UMBRELLA_FLAGS])
+@pytest.mark.parametrize("header_arg", ["api.h", None])
+def test_prover_contract_in_nested_header_merges(tmp_path, flags, header_arg):
+    run_dir = _bare_header_module(tmp_path, flags)
+    _prepare_bare(run_dir)
+    (run_dir / NESTED_SCRATCH / "inc" / "nest" / "api.h").write_text(PROTO_WITH_CONTRACT, encoding="utf-8")
+    res = WO.merge_agent_overlay(
+        run_dir=run_dir,
+        agent_id=NESTED_AGENT,
+        role="prover",
+        c_file="src/api.c",
+        function="nest_add",
+        header_file=header_arg,
+        module="nest",
+        cppflags=flags,
+        verify_hook=lambda: (True, ""),
+    )
+    assert res["ok"]
+    merged = (run_dir / "workspace" / "work" / "inc" / "nest" / "api.h").read_text(encoding="utf-8")
+    assert "requires a >= 0" in merged
+
+
+def test_prover_edit_outside_function_scope_is_still_rejected(tmp_path):
+    run_dir = _bare_header_module(tmp_path, UMBRELLA_FLAGS)
+    _prepare_bare(run_dir)
+    scratch = run_dir / NESTED_SCRATCH
+    (scratch / "inc" / "nest" / "api.h").write_text(PROTO_WITH_CONTRACT, encoding="utf-8")
+    (scratch / "inc" / "nest" / "cfg.h").write_text(
+        "#ifndef NEST_CFG_H\n#define NEST_CFG_H\n/*@ predicate p = \true; */\n#endif\n", encoding="utf-8"
+    )
+    with pytest.raises(WO.ScopeViolationError, match="inc/nest/cfg.h"):
+        WO.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id=NESTED_AGENT,
+            role="prover",
+            c_file="src/api.c",
+            function="nest_add",
+            header_file="api.h",
+            module="nest",
+            cppflags=UMBRELLA_FLAGS,
+            verify_hook=lambda: (True, ""),
+        )
+    # The umbrella header is not in the prover's scope either.
+    (scratch / "inc" / "nest" / "cfg.h").write_text(
+        "#ifndef NEST_CFG_H\n#define NEST_CFG_H\n#endif\n", encoding="utf-8"
+    )
+    (scratch / "inc" / "api.h").write_text('#include "nest/api.h"\n/*@ predicate q = \true; */\n', encoding="utf-8")
+    with pytest.raises(WO.ScopeViolationError, match="inc/api.h"):
+        WO.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id=NESTED_AGENT,
+            role="prover",
+            c_file="src/api.c",
+            function="nest_add",
+            header_file="api.h",
+            module="nest",
+            cppflags=UMBRELLA_FLAGS,
+            verify_hook=lambda: (True, ""),
+        )
