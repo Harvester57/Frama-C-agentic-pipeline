@@ -78,6 +78,7 @@ from framac_common import (  # noqa: E402
     is_safe_relative_path,
     load_json_optional,
     normalize_flag_args,
+    scratch_first_flags,
     to_run_relative,
 )
 
@@ -374,27 +375,7 @@ def _snapshot_first(flags: list[str], tree: _Tree) -> list[str]:
     Give each include directory of the shared tree a snapshot twin just before it. Both copies hold
     the same C, but only the snapshot's line numbers and contracts are the ones this slice reports.
     """
-    out: list[str] = []
-    i = 0
-    while i < len(flags):
-        word = flags[i]
-        if word == "-I" and i + 1 < len(flags):
-            directory, consumed = flags[i + 1], 2
-        elif word.startswith("-I") and len(word) > 2:
-            directory, consumed = word[2:], 1
-        else:
-            out.append(word)
-            i += 1
-            continue
-        rel = tree.rel(f"{directory.rstrip('/')}/_")
-        if rel is not None:
-            twin = tree.work_dir / rel[:-1] if rel != "_" else tree.work_dir
-            twin_arg = to_run_relative(twin, tree.run_dir)
-            if twin.is_dir() and posixpath.normpath(twin_arg) != posixpath.normpath(directory):
-                out.append(f"-I{twin_arg}")
-        out.extend(flags[i : i + consumed])
-        i += consumed
-    return out
+    return scratch_first_flags(flags, tree.run_dir, tree.work_dir)
 
 
 # ---------------------------------------------------------------------------
