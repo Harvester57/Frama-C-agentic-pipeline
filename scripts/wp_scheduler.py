@@ -2557,6 +2557,15 @@ def _restore_best_candidate(aid: str, out: dict) -> dict | None:
     return out["best_candidate"]
 
 
+def _analysis_error_will_retry(task: dict, aid: str, res: dict) -> bool:
+    """Whether the prover's last WP report is an analysis_error that still gets its retry."""
+    if int(task.get("analysis_errors") or 0) + 1 >= MAX_ANALYSIS_ERRORS:
+        return False
+    src = _find_agent_wp_report(aid, res, task["function"])
+    report = _load_report(src) if src is not None else None
+    return report is not None and report.get("status") == "analysis_error"
+
+
 def _complete_prover(
     state: dict, ctx: Ctx, task: dict, aid: str, res: dict, result_path: Path, out: dict
 ) -> dict | None:
@@ -2570,9 +2579,12 @@ def _complete_prover(
         _event(state, "merge_queued", task["id"], agent_id=aid)
         out["action"] = "queued_for_merge"
         return None
-    # The promoted report and the partial contract merge below come from the best candidate. Its report is at the
-    # default path, so the result's evidence, which may name a report of the last iteration, must not take precedence.
-    restored = _restore_best_candidate(aid, out)
+    # The retry comes first: exceeding the WP job limit is an analysis_error, so settling for the best candidate here
+    # would make results depend on machine speed. The best candidate is for a task that ends without a proof.
+    # Then the promoted report and the partial contract merge below come from it. Its report is at the default path,
+    # so the result's evidence, which may name a report of the last iteration, must not take precedence.
+    out["best_candidate"] = None
+    restored = None if _analysis_error_will_retry(task, aid, res) else _restore_best_candidate(aid, out)
     report_rel, report = _promote_agent_wp(task, aid, {**res, "evidence": []} if restored else res, out["errors"])
     if report is not None and report_rel and report.get("status") == "analysis_error":
         _on_analysis_error(state, task, aid, report_rel, report, out)

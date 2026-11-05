@@ -546,6 +546,12 @@ def infer_prover_wp_flags(
 
     reduced: list[str] = []
     wp_model: str | None = None
+    wrap_code_lines: list[int] = []
+
+    def _note_wraps(report: dict) -> None:
+        declared = (report.get("unsigned_wraps") or {}).get("declared_code_lines")
+        if isinstance(declared, list) and not wrap_code_lines:
+            wrap_code_lines.extend(n for n in declared if isinstance(n, int) and not isinstance(n, bool))
 
     for p in cand_paths:
         if not p.is_file() or p.is_symlink():
@@ -567,6 +573,7 @@ def infer_prover_wp_flags(
         )
         if isinstance(m, str) and m.strip() and wp_model is None:
             wp_model = m.strip()
+        _note_wraps(rep)
         if reduced or wp_model:
             break
 
@@ -593,6 +600,7 @@ def infer_prover_wp_flags(
                         if ep.is_file() and not ep.is_symlink():
                             rep = load_json_optional(ep, {}) or {}
                             if isinstance(rep, dict):
+                                _note_wraps(rep)
                                 for item in ((rep.get("soundness") or {}).get("reduced_checks")) or []:
                                     if isinstance(item, str) and item not in reduced:
                                         reduced.append(item)
@@ -607,6 +615,8 @@ def infer_prover_wp_flags(
     flags: list[str] = []
     if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
         flags.append("--no-warn-unsigned")
+        if wrap_code_lines:
+            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
     else:
         flags.append("--no-warn-unsigned-downcast")
     if any("-warn-invalid-pointer OFF" in r for r in reduced):

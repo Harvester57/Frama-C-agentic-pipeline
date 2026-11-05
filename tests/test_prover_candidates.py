@@ -1224,17 +1224,49 @@ def test_complete_without_candidates_retries_a_final_analysis_error_as_before(si
     assert out["best_candidate"] is None and out["action"] == "retry_analysis_error"
 
 
-def test_complete_with_a_best_candidate_judges_it_instead_of_a_final_analysis_error(sim, monkeypatch):
+def test_an_analysis_error_keeps_its_retry_even_with_a_best_candidate(sim, monkeypatch):
+    # Exceeding the WP job limit yields analysis_error: settling for the best candidate here would make
+    # results depend on machine speed.
     prover = dispatch(sim)
     seen = spy_on_merge(monkeypatch, prover)
     prover.iterate("best", failed=1, proved=9)
-    prover.iterate("last", "analysis_error", reason="oom_killed")
+    prover.iterate("last", "analysis_error", reason="timeout")
     write_result(prover, "blocked")
+
+    out = S.cmd_complete(AID)
+
+    assert out["action"] == "retry_analysis_error" and out["best_candidate"] is None
+    assert prover.read() == annotated("last"), "nothing is restored while a retry is coming"
+    assert "partial_merge" not in out and not seen
+
+
+def test_a_task_ending_on_analysis_error_falls_back_to_its_best_candidate(sim, monkeypatch):
+    prover = dispatch(sim)
+    seen = spy_on_merge(monkeypatch, prover)
+    prover.iterate("best", failed=1, proved=9)
+    prover.iterate("last", "analysis_error", reason="timeout")
+    write_result(prover, "blocked")
+    state = S.load_schedule()
+    state["tasks"][state["agents"][AID]]["analysis_errors"] = S.MAX_ANALYSIS_ERRORS - 1
+    S.save_schedule(state)
 
     out = S.cmd_complete(AID)
 
     assert out["best_candidate"]["best"] == 1 and out["action"] == "blocked"
     assert seen["source"] == annotated("best") and out["partial_merge"]["ok"] is True
+
+
+def test_a_task_ending_on_analysis_error_without_a_best_candidate_blocks_as_before(sim):
+    prover = dispatch(sim)
+    write_json(prover.wp_path, prover.wp_report("analysis_error", reason="timeout"))
+    write_result(prover, "blocked")
+    state = S.load_schedule()
+    state["tasks"][state["agents"][AID]]["analysis_errors"] = S.MAX_ANALYSIS_ERRORS - 1
+    S.save_schedule(state)
+
+    out = S.cmd_complete(AID)
+
+    assert out["best_candidate"] is None and out["action"] == "blocked_analysis_error"
 
 
 def test_complete_of_a_negotiating_prover_restores_too(sim, monkeypatch):

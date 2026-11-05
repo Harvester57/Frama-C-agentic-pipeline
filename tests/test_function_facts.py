@@ -867,7 +867,7 @@ def test_brief_states_the_wp_flags_a_prover_can_no_longer_discover_with_help() -
     # The prover proves what the parent will re-check: infer_prover_wp_flags defaults to this flag.
     oracle = BRIEF[BRIEF.index("run_wp_function.py --file") :]
     assert "--no-warn-unsigned-downcast" in oracle[: oracle.index("\n")]
-    assert "--no-warn-unsigned` for this and every later run" in BRIEF
+    assert "`--no-warn-unsigned --wrap-lines <line,line>` for this and every later run" in BRIEF
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import function_facts  # noqa: E402
 import prover_candidates  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_DEAD,
@@ -1498,6 +1499,11 @@ def run_wp_on_function(
         "wp_log_tail": combined_log[-3000:],
         "sizing": sizing,
     }
+    if prop:
+        # Counted as proven above, but pending on some other property (check_declared_wraps needs them).
+        res["partially_proven_goals"] = [
+            g for g in proven_goals if str(g.get("status") or "").strip().lower() == "partially proven"
+        ]
     if vc_total > 0:
         res["wp_vc_stats"] = {"proved": vc_proved, "total": vc_total, "timeouts": vc_timeouts}
     if unframed_var_callees:
@@ -1509,6 +1515,134 @@ def run_wp_on_function(
     if soundness.get("macro_loop_warnings"):
         res["wp_macro_loop_limitation"] = True
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
+    return res
+
+
+def _line_list(raw: str) -> list[int]:
+    """`--wrap-lines 193,194`: positive line numbers, or argparse rejects the option."""
+    try:
+        values = [int(item) for item in raw.split(",") if item.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected comma-separated line numbers, got {raw!r}") from None
+    if any(value < 0 for value in values):
+        raise argparse.ArgumentTypeError(f"line numbers cannot be negative: {raw!r}")
+    return values
+
+
+def check_declared_wraps(
+    res: dict,
+    c_file: Path,
+    fn_name: str,
+    out_dir: Path,
+    wrap_lines: list[int] | None = None,
+    wrap_code_lines: list[int] | None = None,
+    **wp_options,
+) -> dict:
+    """
+    `--no-warn-unsigned` turns the unsigned overflow checks off for a whole function, so that a run proves
+    nothing about them. This second run, with them on, limits the opt-out to the lines a prover declared
+    as deliberate wraps: an `unsigned_overflow` goal elsewhere that is not fully proved leaves the
+    function unproven.
+
+    The proof stays the run with the checks off. Goals cannot be waived inside this one, because WP takes
+    each RTE assertion as a hypothesis for what follows, so a false wrap assertion would support later
+    proofs. For the same reason only `Valid` clears a goal here: one that is `Partially proven` may rest on
+    a declared wrap above it.
+
+    Declarations are stored as positions among the function's code lines (function_facts.code_lines),
+    which ACSL merges do not move, so a parent re-check on the merged tree finds the same lines.
+    """
+    if res.get("status") not in ("all_proven", "unproven_goals_remain") or res.get("budget_exhausted"):
+        return res
+    text = Path(c_file).read_text(encoding="utf-8", errors="replace")
+    code_lines = function_facts.code_lines(text, fn_name, path=str(c_file))
+    declared = {position for position in wrap_code_lines or () if 0 <= position < len(code_lines)}
+    unknown_lines = []
+    for line in wrap_lines or ():
+        if line in code_lines:
+            declared.add(code_lines.index(line))
+        else:
+            unknown_lines.append(line)
+
+    check = run_wp_on_function(
+        c_file,
+        fn_name,
+        out_dir,
+        unsigned_reduced=False,
+        warn_unsigned_downcast=False,
+        retry_bitwise=False,
+        retry_tail=False,
+        prop="unsigned_overflow",
+        artifact_suffix="_wrapcheck",
+        ignore_prover_budget=True,
+        **wp_options,
+    )
+    if check.get("status") not in ("all_proven", "unproven_goals_remain"):
+        res.update(
+            status="analysis_error",
+            reason=check.get("reason") or "unsigned_wrap_check_failed",
+            next_synthesis_focus="analysis_error_rerun_required",
+            unsigned_wraps={"status": "check_failed", "check_status": check.get("status")},
+        )
+        return res
+
+    used: dict[int, dict] = {}
+    undeclared: list[dict] = []
+    not_fully_proved = [
+        *(check.get("unproven_goals") or []),
+        *(check.get("proven_under_hyp_goals") or []),
+        *(check.get("partially_proven_goals") or []),
+    ]
+    for goal in not_fully_proved:
+        if "unsigned_overflow" not in str(goal.get("kind") or "").lower():
+            continue
+        try:
+            line = int(goal.get("line"))
+        except (TypeError, ValueError):
+            line = -1
+        same_file = Path(str(goal.get("file") or "")).name == Path(c_file).name
+        position = code_lines.index(line) if same_file and line in code_lines else None
+        if position in declared:
+            entry = used.setdefault(position, {"line": line, "code_line": position, "annotations": []})
+            entry["annotations"].append(goal.get("annotation"))
+        else:
+            undeclared.append({**goal, "diagnostic_bucket": "step_c_rte_obligation", "undeclared_unsigned_wrap": True})
+
+    declared_entries = [used[position] for position in sorted(used)]
+    res["unsigned_wraps"] = {
+        "status": "undeclared" if undeclared else "ok",
+        "declared": declared_entries,
+        "declared_code_lines": [entry["code_line"] for entry in declared_entries],
+        "undeclared": [
+            {"line": goal.get("line"), "status": goal.get("status"), "annotation": goal.get("annotation")}
+            for goal in undeclared
+        ],
+        "unused_code_lines": sorted(declared - set(used)),
+        "unknown_lines": unknown_lines,
+    }
+    if declared_entries:
+        lines = ", ".join(f"L{entry['line']}" for entry in declared_entries)
+        res.setdefault("soundness", {}).setdefault("reduced_checks", []).append(
+            f"unsigned overflow left unproved on declared deliberate wraps at {lines}"
+        )
+    if undeclared:
+        res.setdefault("unproven_goals", []).extend(undeclared)
+        res.setdefault("unproven_by_bucket", {}).setdefault("step_c_rte_obligation", []).extend(undeclared)
+        counts = res.setdefault("by_obligation_class", {}).setdefault(
+            "rte", {"proven": 0, "proven_under_hyp": 0, "unproven": 0}
+        )
+        counts["unproven"] += len(undeclared)
+        res["unproven_count"] = int(res.get("unproven_count") or 0) + len(undeclared)
+        res["total_goals"] = int(res.get("total_goals") or 0) + len(undeclared)
+        res["status"] = "unproven_goals_remain"
+        if res.get("next_synthesis_focus") == "complete":
+            res["next_synthesis_focus"] = "step_c_rte_obligation"
+        lines = ", ".join(sorted({str(goal.get("line")) for goal in undeclared}))
+        res.setdefault("diagnostic_hints", []).append(
+            f"With the unsigned checks on, unsigned_overflow goals are not fully proved on line(s) {lines}, which "
+            "--wrap-lines does not declare. Prove them, or declare a line in --wrap-lines only if its wrap is "
+            "deliberate. A 'Partially proven' goal below a declared wrap may rest on that wrap's false assertion."
+        )
     return res
 
 
@@ -1533,7 +1667,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-check-memory-model", action="store_true", help="Disable -wp-check-memory-model")
     parser.add_argument("--no-warn-invalid-pointer", action="store_true", help="Disable -warn-invalid-pointer")
     parser.add_argument(
-        "--no-warn-unsigned", action="store_true", help="Disable -warn-unsigned-overflow / -warn-unsigned-downcast"
+        "--no-warn-unsigned",
+        action="store_true",
+        help="Prove with -warn-unsigned-overflow / -warn-unsigned-downcast off, then re-run with overflow checks on: "
+        "a goal not fully proved on a line outside --wrap-lines leaves the function unproven",
+    )
+    parser.add_argument(
+        "--wrap-lines",
+        type=_line_list,
+        default=None,
+        help="With --no-warn-unsigned: comma-separated file lines holding deliberate unsigned wraps",
+    )
+    parser.add_argument(
+        "--wrap-code-lines",
+        type=_line_list,
+        default=None,
+        help="As --wrap-lines, as positions among the function's code lines, which ACSL merges do not move "
+        "(what parent re-checks pass, from the prover's report)",
     )
     parser.add_argument(
         "--no-warn-unsigned-downcast",
@@ -1591,6 +1741,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError
         except ValueError:
             parser.error(f"--wp-par must be 'auto' or a positive integer (got {args.wp_par!r})")
+    if (args.wrap_lines or args.wrap_code_lines) and not args.no_warn_unsigned:
+        parser.error("--wrap-lines and --wrap-code-lines only apply with --no-warn-unsigned")
 
     # --prop and --dump-goal are partial runs: they say nothing about the candidate as a whole.
     whole_run = not (args.prop or args.dump_goal)
@@ -1624,6 +1776,28 @@ def main(argv: list[str] | None = None) -> int:
         wp_blockers=args.wp_blockers,
         ignore_prover_budget=args.ignore_prover_budget,
     )
+    if args.no_warn_unsigned and whole_run:
+        res = check_declared_wraps(
+            res,
+            args.file,
+            args.function,
+            args.out_dir,
+            wrap_lines=args.wrap_lines,
+            wrap_code_lines=args.wrap_code_lines,
+            machdep=args.machdep,
+            cppflags=args.cppflags,
+            provers=args.provers,
+            wp_par=args.wp_par,
+            timeout=args.timeout,
+            wp_steps=args.wp_steps,
+            wp_model=res.get("wp_model") or args.wp_model,
+            check_memory_model=not args.no_check_memory_model,
+            warn_invalid_pointer=not args.no_warn_invalid_pointer,
+            session_dir=args.session_dir,
+            extra_sources=args.extra_sources,
+            wall_timeout=default_wall_timeout(args.wall_timeout),
+            cache_dir=args.cache_dir,
+        )
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = {
@@ -1637,6 +1811,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if res.get("diagnostic_hints"):
         summary["diagnostic_hints"] = res["diagnostic_hints"]
+    if res.get("unsigned_wraps"):
+        summary["unsigned_wraps"] = res["unsigned_wraps"]
     if whole_run and not res.get("budget_exhausted"):
         prover_candidates.add_candidate_block(summary, args.out_json, "wp", res, digest_before)
     print(json.dumps(summary, indent=2))
