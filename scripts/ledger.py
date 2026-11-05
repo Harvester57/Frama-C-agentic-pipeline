@@ -689,6 +689,10 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     props_by_fn.setdefault(str(item["function"]), []).append(item)
         with_props = set(report.get("functions_with_properties", []))
         reduced_checks = [str(x) for x in (report.get("reduced_checks") or []) if str(x).strip()]
+        tuning = report.get("tuning")
+        combination = tuning.get("combination") if isinstance(tuning, dict) else None
+        upgraded = combination.get("upgraded") if isinstance(combination, dict) else None
+        combined_fns = {str(item.get("function")) for item in upgraded or [] if isinstance(item, dict)}
 
         for u in rte_units:
             fn = u["function"]
@@ -780,6 +784,13 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                         "boundary_assumption",
                         f"Eva slice '{module}' ran with reduced checks ({', '.join(reduced_checks)}); "
                         "recursive or missing assigns specifications were treated as warnings.",
+                    )
+                if fn in combined_fns:
+                    add_assumption(
+                        u,
+                        "boundary_assumption",
+                        f"Eva slice '{module}': some obligations here are discharged by per-obligation combination "
+                        "of tuning runs, each Valid in a complete run of the same sources and harness.",
                     )
                 if u["status"] in ("planned", "blocked"):
                     u["status"] = "covered"

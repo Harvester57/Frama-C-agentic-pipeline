@@ -1477,6 +1477,7 @@ def recommend(max_agents: int | None = None, pool: Budget | None = None) -> dict
 _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"run_wp_function\.py", "wp"),
     (r"run_eva_slice\.py", "eva"),
+    (r"eva_tuning\.py", "eva"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?campaign(?:\s|$)", "fuzz"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?guardrail(?:\s|$)", "guardrail"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?(?:replay(?:-candidates)?|coverage)(?:\s|$)", "replay"),
@@ -1640,6 +1641,7 @@ CACHE_RW_ALLOWLIST: frozenset[tuple[str, ...]] = frozenset(
     {
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "build"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "eva"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "eva-tune"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "wp-sweep"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "ingest"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "ingest", "wp-queue"),
@@ -1685,6 +1687,7 @@ def is_known_static_command(cmd: str | None) -> bool:
     static_tool_res = (
         r"^(?:/opt/framac-pipeline/scripts/)?run_wp_function\.py\b",
         r"^(?:/opt/framac-pipeline/scripts/)?run_eva_slice\.py\b",
+        r"^(?:/opt/framac-pipeline/scripts/)?eva_tuning\.py\b",
         r"^(?:/opt/framac-pipeline/scripts/)?build_callgraph_dag\.py\b",
         r"^(?:/opt/framac-pipeline/scripts/)?extract_references\.py\b",
         r"^(?:/opt/framac-pipeline/scripts/)?generate_harness\.py\b",

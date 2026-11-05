@@ -28,16 +28,20 @@ BUILD_TARGETS  := $(addprefix build-,$(FUZZ_MODULES))
 FUZZ_TARGETS   := $(addprefix fuzz-,$(FUZZ_MODULES))
 COVERAGE_TARGETS := $(addprefix coverage-,$(FUZZ_MODULES))
 EVA_TARGETS    := $(addprefix eva-,$(EVA_MODULES))
+EVA_BASE_TARGETS := $(addprefix evabase-,$(EVA_MODULES))
+EVA_RUNG_TARGETS := $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))
+EVA_TUNE_TARGETS := $(addprefix evatune-,$(EVA_MODULES))
 MODULE_TARGETS := $(addprefix module-,$(MODULES))
 
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init seed build selftest fuzz coverage eva ingest replay wp-queue wp-sweep report \
-        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(EVA_TARGETS) $(MODULE_TARGETS)
+.PHONY: help slice-init seed build selftest fuzz coverage eva eva-tune eva-tune-base ingest replay wp-queue wp-sweep report \
+        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
+        $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init seed build selftest fuzz coverage eva ingest replay wp-queue wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init seed build selftest fuzz coverage eva eva-tune ingest replay wp-queue wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -99,16 +103,56 @@ $(COVERAGE_TARGETS): coverage-%:
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--out-json workspace/reports/coverage/$*.json
 
-# One Eva run per module, from the harness's eva_main.
+# What every Eva run of module $(1) has in common: the rest is tuning, and tuning never changes what
+# is checked, so runs differing only in that can be compared and combined (eva_tuning.py).
+eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EVA_SLEVEL_$(1)) \
+	$(if $(EVA_MLEVEL_$(1)),--mlevel $(EVA_MLEVEL_$(1))) \
+	$(if $(EVA_TAINT_$(1)),--extra-domains taint) \
+	$(if $(EVA_RECURSION_FALLBACK_$(1)),--allow-incomplete-recursion-specs) \
+	--cppflags=$(CPPFLAGS_$(1))
+
+# One Eva run per module, from the harness's eva_main, with its recorded tuning if it has one.
 eva: $(EVA_TARGETS)
 $(EVA_TARGETS): eva-%:
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
-		$(PY) $(S)/run_eva_slice.py --module $* --sources $(SOURCES_$*) --main eva_main \
-		--out-dir workspace/eva/$* --slevel $(EVA_SLEVEL_$*) $(if $(EVA_MLEVEL_$*),--mlevel $(EVA_MLEVEL_$*)) \
-		$(if $(EVA_TAINT_$*),--extra-domains taint) \
-		$(if $(EVA_RECURSION_FALLBACK_$*),--allow-incomplete-recursion-specs) \
+		$(PY) $(S)/run_eva_slice.py $(call eva_args,$*) --out-dir workspace/eva/$* \
+		$(EVA_OPTIONS_$*) $(EVA_LOOPS_$*) \
 		$(if $(EVA_TIMEOUT_$*),--timeout $(EVA_TIMEOUT_$*)) \
-		--cppflags=$(CPPFLAGS_$*) --out-json workspace/reports/eva/$*.json
+		--out-json workspace/reports/eva/$*.json
+
+# Eva ladder: the module's own settings first; `pipeline_make.py run` then regenerates modules.mk, so
+# only modules left with Unknowns get rungs. A rung is optional, so a failed one never blocks `finish`,
+# which writes the module's report and records the decision in params.json.
+eva-tune-base: $(EVA_BASE_TARGETS)
+$(EVA_BASE_TARGETS): evabase-%:
+	@rm -f workspace/reports/eva-tuning/$*/base.json
+	$(RUN) --class eva --key $* --output workspace/reports/eva-tuning/$*/base.json -- \
+		$(PY) $(S)/run_eva_slice.py $(call eva_args,$*) --out-dir workspace/eva/$*/tune/base \
+		$(EVA_BASE_OPTIONS_$*) \
+		$(if $(EVA_TIMEOUT_$*),--timeout $(EVA_TIMEOUT_$*)) \
+		--out-json workspace/reports/eva-tuning/$*/base.json
+
+define EVA_RUNG_RULE
+evarung-$(1)--$(2):
+	@rm -f workspace/reports/eva-tuning/$(1)/$(2).json
+	-$$(RUN) --class eva --key $(1) --output workspace/reports/eva-tuning/$(1)/$(2).json -- \
+		$$(PY) $$(S)/run_eva_slice.py $$(call eva_args,$(1)) --out-dir workspace/eva/$(1)/tune/$(2) \
+		$$(EVA_RUNG_OPTIONS_$(1)__$(2)) \
+		$$(if $$(EVA_TUNE_TIMEOUT_$(1)),--timeout $$(EVA_TUNE_TIMEOUT_$(1))) \
+		--out-json workspace/reports/eva-tuning/$(1)/$(2).json
+endef
+$(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),$(eval $(call EVA_RUNG_RULE,$(m),$(r)))))
+
+eva-tune: $(EVA_TUNE_TARGETS)
+$(foreach m,$(EVA_MODULES),$(eval evatune-$(m): $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r))))
+$(EVA_TUNE_TARGETS): evatune-%:
+	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
+		$(PY) $(S)/eva_tuning.py finish $(call eva_args,$*) \
+		$(if $(ENTRY_FN_$*),--entry-fn=$(ENTRY_FN_$*)) \
+		--settings-digest $(EVA_TUNE_DIGEST_$*) --rungs $(EVA_TUNE_RUNGS_$*) --loop-unroll $(EVA_LOOP_UNROLL_$*) \
+		$(if $(EVA_TUNE_TIMEOUT_$*),--timeout $(EVA_TUNE_TIMEOUT_$*)) \
+		--report-dir workspace/reports/eva-tuning/$* --work-dir workspace/eva/$*/tune \
+		--out-json workspace/reports/eva/$*.json
 
 # --- Ingestion and Phase 3 preparation -------------------------------------------------------
 
