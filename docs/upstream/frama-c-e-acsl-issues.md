@@ -520,10 +520,11 @@ e-acsl-gcc -G clang -F "-rte -machdep gcc_x86_64 -e-acsl-full-mtracking -rte-ini
 post-processes `instrumented.c` to insert
 `__e_acsl_initialize((void *)(& __retres), sizeof(__retres));` immediately after
 `__retres = <fn>(...);` in any `__gen_e_acsl_*` wrapper that registered `__retres` with
-`__e_acsl_store_block`. (Note: under `-keep-unused-functions none` with Clang 19, if a translation
-unit only uses `__e_acsl_full_init` and Frama-C prunes the declaration of `__e_acsl_initialize`,
-either `__e_acsl_full_init((void *)(& __retres));` or a forward declaration of
-`__e_acsl_initialize` is required so Clang 19 does not reject the implicit function declaration.)
+`__e_acsl_store_block`. Frama-C prunes the declaration of `__e_acsl_initialize` unless E-ACSL itself
+emits a call to it, which a `memcpy` or an array-element write does, but plain scalars, pointer
+parameters or `malloc` alone do not. Clang 19 rejects the inserted call as an implicit function
+declaration in such a slice, including this issue's own reproducer, so the workaround also inserts
+a forward declaration ahead of the first patched wrapper when none precedes it.
 
 ---
 
