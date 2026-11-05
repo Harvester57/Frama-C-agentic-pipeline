@@ -170,6 +170,9 @@ def test_run_metadata_worktree_fallback_to_host_git_env(tmp_path, monkeypatch):
     (worktree_target / ".git").write_text("gitdir: /unmounted/host/repo/.git/worktrees/wt1\n", encoding="utf-8")
 
     monkeypatch.chdir(container_cwd)
+    # Git exports these to a hook run from a linked worktree: `git -C` would read that repository instead.
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("FRAMAC_TARGET_COMMIT", "94e33bb58ce66295073d5e8275d81148ab5ad829")
     monkeypatch.setenv("FRAMAC_TARGET_DIRTY", "0")
 
