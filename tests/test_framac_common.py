@@ -1,3 +1,7 @@
+import shlex
+
+import pytest
+
 from framac_common import (
     STATUS_ASSUMED,
     STATUS_DEAD,
@@ -10,6 +14,9 @@ from framac_common import (
     is_safe_relative_path,
     normalize_status,
     read_report_csv,
+    scratch_first_cppflags,
+    scratch_first_flags,
+    source_tree_relpath,
 )
 
 
@@ -63,13 +70,179 @@ def test_safe_paths_and_agent_ids():
     assert not is_safe_agent_id("aux")
 
 
+@pytest.fixture
+def scratch_tree(tmp_path):
+    """(run_dir, work_dir) of an agent whose scratch copy holds inc/, inc/nest/ and src/."""
+    run_dir = tmp_path / "run"
+    work = run_dir / "agents" / "a1" / "scratch" / "work"
+    (work / "inc" / "nest").mkdir(parents=True)
+    (work / "src").mkdir()
+    (work / "inc" / "cfg.h").write_text("", encoding="utf-8")
+    return run_dir, work
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("workspace/work/inc/a.h", "inc/a.h"),
+        ("./workspace/work/src/../inc/a.h", "inc/a.h"),
+        ("/framac-run/workspace/work/inc/a.h", "inc/a.h"),
+        ("/framac-run/workspace/work/src/../inc/a.h", "inc/a.h"),
+        ("agents/a1/scratch/work/inc/a.h", "inc/a.h"),
+        ("agents/other/scratch/work/inc/a.h", "inc/a.h"),
+        ("/target/inc/a.h", "inc/a.h"),
+        ("workspace/stubs/a.h", None),
+        ("workspace/work/../stubs/a.h", None),
+        ("workspace/baseline/inc/a.h", None),
+        ("agents/a1/scratch/base/inc/a.h", None),
+        ("/usr/include/stdio.h", None),
+        ("a.h", None),
+        ("<built-in>", None),
+        ("", None),
+    ],
+)
+def test_source_tree_relpath(scratch_tree, path, expected):
+    run_dir, work = scratch_tree
+    assert source_tree_relpath(path, run_dir, work) == expected
+
+
+def test_source_tree_relpath_of_an_absolute_path_in_the_scratch_copy(scratch_tree):
+    run_dir, work = scratch_tree
+    assert source_tree_relpath((work / "inc" / "a.h").as_posix(), run_dir, work) == "inc/a.h"
+
+
+SCRATCH = "agents/a1/scratch/work"
+
+
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        # Every shared include directory gets its twin right before it; the rest keeps its place.
+        (
+            ["-I.", "-Iworkspace/work/inc/nest", "-Iworkspace/work/inc", "-Iworkspace/stubs", "-Iworkspace/work/src"],
+            [
+                "-I.",
+                f"-I{SCRATCH}/inc/nest",
+                "-Iworkspace/work/inc/nest",
+                f"-I{SCRATCH}/inc",
+                "-Iworkspace/work/inc",
+                "-Iworkspace/stubs",
+                f"-I{SCRATCH}/src",
+                "-Iworkspace/work/src",
+            ],
+        ),
+        (
+            ["-I", "workspace/work/src", "-DX", "-Iworkspace/work/gone"],
+            [f"-I{SCRATCH}/src", "-I", "workspace/work/src", "-DX", "-Iworkspace/work/gone"],
+        ),
+        # The search order goes by option, so a twin keeps the option of its directory.
+        (["-iquote", "workspace/work/inc"], [f"-iquote{SCRATCH}/inc", "-iquote", "workspace/work/inc"]),
+        (["-iquoteworkspace/work/inc"], [f"-iquote{SCRATCH}/inc", "-iquoteworkspace/work/inc"]),
+        (["-isystem", "workspace/work/inc"], [f"-isystem{SCRATCH}/inc", "-isystem", "workspace/work/inc"]),
+        (["-isystemworkspace/work/inc"], [f"-isystem{SCRATCH}/inc", "-isystemworkspace/work/inc"]),
+        (["-idirafter", "workspace/work/inc"], [f"-idirafter{SCRATCH}/inc", "-idirafter", "workspace/work/inc"]),
+        (["-idirafterworkspace/work/inc"], [f"-idirafter{SCRATCH}/inc", "-idirafterworkspace/work/inc"]),
+        # Every spelling of a shared directory that real sidecars and DAGs use.
+        (["-I/framac-run/workspace/work/inc"], [f"-I{SCRATCH}/inc", "-I/framac-run/workspace/work/inc"]),
+        (["-I/framac-run/workspace/work/src/../inc"], [f"-I{SCRATCH}/inc", "-I/framac-run/workspace/work/src/../inc"]),
+        (["-Iworkspace/work/src/../inc"], [f"-I{SCRATCH}/inc", "-Iworkspace/work/src/../inc"]),
+        (["-I./workspace/work/inc/"], [f"-I{SCRATCH}/inc", "-I./workspace/work/inc/"]),
+        (["-I/target/inc"], [f"-I{SCRATCH}/inc", "-I/target/inc"]),
+        (["-Iworkspace/work"], [f"-I{SCRATCH}", "-Iworkspace/work"]),
+        # One twin is enough; a flag that already names the scratch copy needs none.
+        (
+            ["-I/framac-run/workspace/work/inc", "-Iworkspace/work/inc"],
+            [f"-I{SCRATCH}/inc", "-I/framac-run/workspace/work/inc", "-Iworkspace/work/inc"],
+        ),
+        ([f"-I{SCRATCH}", "-I.", "-Iworkspace/work"], [f"-I{SCRATCH}", "-I.", "-Iworkspace/work"]),
+        ([f"-I{SCRATCH}/inc", "-Iworkspace/work/inc"], [f"-I{SCRATCH}/inc", "-Iworkspace/work/inc"]),
+        (
+            ["-iquoteworkspace/work/inc", "-Iworkspace/work/inc"],
+            [f"-iquote{SCRATCH}/inc", "-iquoteworkspace/work/inc", f"-I{SCRATCH}/inc", "-Iworkspace/work/inc"],
+        ),
+        # Force-included files are replaced: both copies would be read otherwise.
+        (["-include", "workspace/work/inc/cfg.h"], ["-include", f"{SCRATCH}/inc/cfg.h"]),
+        (["-includeworkspace/work/inc/cfg.h"], [f"-include{SCRATCH}/inc/cfg.h"]),
+        (["-imacros", "workspace/work/inc/cfg.h"], ["-imacros", f"{SCRATCH}/inc/cfg.h"]),
+        (["-imacrosworkspace/work/inc/cfg.h"], [f"-imacros{SCRATCH}/inc/cfg.h"]),
+        (["-include", "/framac-run/workspace/work/src/../inc/cfg.h"], ["-include", f"{SCRATCH}/inc/cfg.h"]),
+        (["-include", "/target/inc/cfg.h"], ["-include", f"{SCRATCH}/inc/cfg.h"]),
+        # Not under a source tree, found through the search chain, or with no twin: as written.
+        (["-include", "workspace/harnesses/compat.h"], ["-include", "workspace/harnesses/compat.h"]),
+        (["-include", "cfg.h"], ["-include", "cfg.h"]),
+        (["-include", "workspace/work/inc/gone.h"], ["-include", "workspace/work/inc/gone.h"]),
+        (["-imacros", "/opt/x.h"], ["-imacros", "/opt/x.h"]),
+        # Options with no value, and options the walk does not know.
+        (["-Iworkspace/work/inc", "-I"], [f"-I{SCRATCH}/inc", "-Iworkspace/work/inc", "-I"]),
+        (["-include"], ["-include"]),
+        (["-DPATH=workspace/work/inc", "-std=c11", "-O2"], ["-DPATH=workspace/work/inc", "-std=c11", "-O2"]),
+    ],
+)
+def test_scratch_first_flags(scratch_tree, flags, expected):
+    run_dir, work = scratch_tree
+    assert scratch_first_flags(flags, run_dir, work) == expected
+
+
+def test_scratch_first_flags_is_idempotent_and_a_no_op_on_the_shared_tree(scratch_tree):
+    run_dir, work = scratch_tree
+    flags = ["-Iworkspace/work/inc", "-iquote", "workspace/work/src", "-include", "workspace/work/inc/cfg.h"]
+    once = scratch_first_flags(flags, run_dir, work)
+    assert scratch_first_flags(once, run_dir, work) == once
+
+    shared = run_dir / "workspace" / "work"
+    (shared / "inc").mkdir(parents=True)
+    (shared / "inc" / "cfg.h").write_text("", encoding="utf-8")
+    assert scratch_first_flags(["-Iworkspace/work/inc", "-Iworkspace/work"], run_dir, shared) == [
+        "-Iworkspace/work/inc",
+        "-Iworkspace/work",
+    ]
+    assert scratch_first_flags(["-include", "workspace/work/inc/cfg.h"], run_dir, shared) == [
+        "-include",
+        "workspace/work/inc/cfg.h",
+    ]
+
+
+def test_scratch_first_cppflags_keeps_the_words_it_does_not_change(scratch_tree):
+    run_dir, work = scratch_tree
+    # Re-quoting these would change what they mean inside the brief's single-quoted --cppflags.
+    flags = r"""-DNAME=\"x\" -DTITLE="a b" -DEMPTY="" -Iworkspace/work/inc -include workspace/harnesses/c.h"""
+    assert scratch_first_cppflags(flags, run_dir, work) == (
+        r"""-DNAME=\"x\" -DTITLE="a b" -DEMPTY="" """
+        f"-I{SCRATCH}/inc -Iworkspace/work/inc -include workspace/harnesses/c.h"
+    )
+    assert scratch_first_cppflags("", run_dir, work) == ""
+    assert scratch_first_cppflags("-I.  \t -DX", run_dir, work) == "-I. -DX"
+
+
+def test_scratch_first_cppflags_reads_a_quoted_include_flag(scratch_tree):
+    run_dir, work = scratch_tree
+    assert scratch_first_cppflags('"-Iworkspace/work/inc"', run_dir, work) == (
+        f'-I{SCRATCH}/inc "-Iworkspace/work/inc"'
+    )
+    assert scratch_first_cppflags("-iquote 'workspace/work/inc'", run_dir, work) == (
+        f"-iquote{SCRATCH}/inc -iquote 'workspace/work/inc'"
+    )
+    # A twin that needs quoting stays one word, and double quotes survive the brief's single quotes.
+    (work / "my dir").mkdir()
+    flags = '-I"workspace/work/my dir"'
+    rendered = scratch_first_cppflags(flags, run_dir, work)
+    assert rendered == f'"-I{SCRATCH}/my dir" {flags}'
+    assert shlex.split(rendered) == [f"-I{SCRATCH}/my dir", "-Iworkspace/work/my dir"]
+
+
+@pytest.mark.parametrize(
+    "flags", ['-Iworkspace/work/inc -DX="oops', "-Iworkspace/work/inc -DX=\\", "-Iworkspace/work/inc 'a"]
+)
+def test_scratch_first_cppflags_leaves_broken_quoting_alone(scratch_tree, flags):
+    run_dir, work = scratch_tree
+    assert scratch_first_cppflags(flags, run_dir, work) == flags
+
+
 def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
     import os
     import subprocess
     import sys
     import time
-
-    import pytest
 
     from conftest import ROOT
     from framac_common import RunLockTimeout, run_lock
