@@ -332,7 +332,7 @@ Dead is never counted as a proof, since it is a harness gap. A red status beats 
 | `minmea`, symbolic 80-byte sentence | 8 → 4 | 146 → 81 | 304 → 355 | 175 → 175 | 17 → 14 | 30 s → 791 s |
 | `picohttpparser`, symbolic 32-byte request | 6 → 5 | 81 → 79 | 144 → 144 | 273 → 273 | 25 → 24 | 17 s → 215 s |
 
-- Options cannot fix an imprecise harness. On `jsmn` with a symbolic 16-byte input, every allowlisted option alone left 34 Unknowns in 3 functions, except the `slevel` values that timed out and `remove-redundant-alarms` off (35).
+- Options cannot fix an imprecise harness. On `jsmn` with a symbolic 16-byte input, every allowlisted option alone left 34 Unknowns in 3 functions, except the `slevel` values that timed out and `remove-redundant-alarms` off (35). Through `run eva-tune` with `--eva-timeout 1200` on a loaded machine, the base run stayed selected at 34 Unknowns and 6 of the 7 rungs timed out. Per-loop trials on this harness have not been measured.
 - A concrete input behaves as Loupe reports. On `jsmn` with the fixed string of its `simple.c`, Eva's defaults leave 45 Unknowns, `-eva-auto-loop-unroll 100` still 45, and full unrolling 0, faster (1.3 s against 3.3 s). The pipeline's base settings already reach 0.
 - That last case shows what the Dead guard costs: Dead rose from 11 to 74 there, legitimately, because a concrete input really does cut branches. From a less precise base, the guard would reject that run. Symbolic harnesses showed no Dead growth in any run measured.
 - On `minmea` and `picohttpparser`, combination discharged nothing beyond the selected run. It costs no extra Eva run, and the pair in the kernel comparison above shows it can matter when no one run dominates.

@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import cache
-from acsl_ast import AcslSyntaxError, Token, locate_function_span, tokenize_c_acsl
+from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl
 from framac_common import is_safe_relative_path
 
 MAX_LOOP_UNROLL = 1_000_000
@@ -173,19 +173,37 @@ def _existing_annotation_at(tokens: list[Token], idx: int) -> int | None:
     return None
 
 
+def _definition_bounds(tokens: list[Token], function: str) -> tuple[int, int] | None:
+    """
+    Byte range of `function`'s body: its name, a parameter list, then `{`. It does not count braces to
+    tell top level, because `#ifdef __cplusplus extern "C" {` leaves every function of a header one
+    deeper to a tokenizer that does not evaluate the preprocessor.
+    """
+    for idx, tok in enumerate(tokens):
+        if tok.kind != "c_token" or tok.text != function:
+            continue
+        open_paren = _next_code(tokens, idx + 1)
+        if open_paren >= len(tokens) or tokens[open_paren].text != "(":
+            continue
+        body = _next_code(tokens, _match_delim(tokens, open_paren, "(", ")") + 1)
+        if body < len(tokens) and tokens[body].text == "{":
+            return tokens[body].start, tokens[_match_delim(tokens, body, "{", "}")].end
+    return None
+
+
 def find_loops(source: str, function: str, path: str = "<input>") -> list[LoopSite]:
     """The loops of `function`'s definition, in source order; empty when it has no definition here."""
     try:
-        span = locate_function_span(source, function, is_header=False, path=path)
         tokens = tokenize_c_acsl(source, path=path)
     except AcslSyntaxError:
         return []
-    if span is None:
+    bounds = _definition_bounds(tokens, function)
+    if bounds is None:
         return []
     do_tails: set[int] = set()
     found: list[tuple[int, Token, int]] = []
     for idx, tok in enumerate(tokens):
-        if tok.kind != "c_token" or not span.start_byte <= tok.start < span.end_byte:
+        if tok.kind != "c_token" or not bounds[0] <= tok.start < bounds[1]:
             continue
         if tok.text not in _LOOP_KEYWORDS or idx in do_tails:
             continue

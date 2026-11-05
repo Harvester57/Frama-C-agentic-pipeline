@@ -705,6 +705,19 @@ def test_find_loops_sees_code_only_and_tells_a_do_while_from_a_while():
     assert [s.keyword for s in eva_loops.find_loops(LOOPS_C, "g")] == ["for"]
 
 
+def test_find_loops_sees_functions_inside_an_extern_c_block():
+    # Measured on jsmn.h: this guard, unevaluated by the tokenizer, used to hide every function in the header.
+    source = (
+        '#ifdef __cplusplus\nextern "C" {\n#endif\n'
+        "int f(int n);\n"
+        "int f(int n) { while (n) n--; return n; }\n"
+        "void g(void) { f(1); if (f(0)) { for (;;) break; } }\n"
+        "#ifdef __cplusplus\n}\n#endif\n"
+    )
+    assert [s.keyword for s in eva_loops.find_loops(source, "f")] == ["while"]
+    assert [s.keyword for s in eva_loops.find_loops(source, "g")] == ["for"]
+
+
 def test_nests_group_a_loop_with_the_loops_inside_it():
     nests = eva_loops.loop_nests(eva_loops.find_loops(LOOPS_C, "f"))
     assert [[s.ordinal for s in nest] for nest in nests] == [[0, 1], [2], [3]]
