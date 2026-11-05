@@ -1479,7 +1479,7 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"run_eva_slice\.py", "eva"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?campaign(?:\s|$)", "fuzz"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?guardrail(?:\s|$)", "guardrail"),
-    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?replay(?:-candidates)?(?:\s|$)", "replay"),
+    (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?(?:replay(?:-candidates)?|coverage)(?:\s|$)", "replay"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?selftest(?:\s|$)", "selftest"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", "build"),
     (r"pipeline_make\.py\s+(?:\S+\s+)*?sweep(?:\s|$)", "phase-static"),
@@ -1499,9 +1499,9 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     # A direct Frama-C call (parse or annotation check): one single-threaded kernel, like Eva.
     (r"(?:^|[\s;&|(/])frama-c(?:\s|$)", "eva"),
 )
-_DYNAMIC_MAKE_TARGETS = frozenset({"selftest", "fuzz", "replay"})
+_DYNAMIC_MAKE_TARGETS = frozenset({"selftest", "fuzz", "coverage", "replay"})
 # Per-module targets that run target code (fuzz-<mod>, module-<mod>, ...); build-<mod>/eva-<mod> stay static.
-_DYNAMIC_MAKE_PREFIXES = ("module-", "fuzz-", "replay-", "selftest-")
+_DYNAMIC_MAKE_PREFIXES = ("module-", "fuzz-", "coverage-", "replay-", "selftest-")
 _MAKE_VALUE_OPTIONS = frozenset({"--jobs", "-j"})
 _PIPELINE_SCRIPTS = "/opt/framac-pipeline/scripts"
 _SCRIPT_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])(?:\$S|\$\{S\})(?=/|\s|$)")
@@ -1681,7 +1681,7 @@ def is_known_static_command(cmd: str | None) -> bool:
     if "run_eacsl_fuzz.py" in clean:
         return bool(
             re.match(r"^(?:/opt/framac-pipeline/scripts/)?run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", clean)
-        ) and not any(sub in clean for sub in ("campaign", "guardrail", "replay", "selftest"))
+        ) and not any(sub in clean for sub in ("campaign", "guardrail", "replay", "selftest", "coverage"))
     static_tool_res = (
         r"^(?:/opt/framac-pipeline/scripts/)?run_wp_function\.py\b",
         r"^(?:/opt/framac-pipeline/scripts/)?run_eva_slice\.py\b",

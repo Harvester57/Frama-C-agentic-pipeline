@@ -52,7 +52,7 @@ Every container invocation belongs to a class. The class sets its CPU range, its
 | `build` | no | 1–4 | 2 GiB | `run_eacsl_fuzz.py build` |
 | `guardrail` | yes | 1–2 | 2 GiB | `run_eacsl_fuzz.py guardrail` |
 | `fuzz` | yes | 1–16 | 512 MiB + 2.5 GiB per worker | `run_eacsl_fuzz.py campaign` |
-| `replay`, `selftest` | yes | 1 | 1 GiB | crash replays, the E-ACSL canary, other `sandbox_exec.py run` commands |
+| `replay`, `selftest` | yes | 1 | 1 GiB | crash replays, corpus coverage (`run_eacsl_fuzz.py coverage`), the E-ACSL canary, other `sandbox_exec.py run` commands |
 | `verify` | yes | elastic | elastic | `merge-agent`, `merge-batch`, `wp_scheduler.py complete/merge-pending` |
 | `phase-static` / `phase-dynamic` | no / yes | elastic | elastic | `pipeline_make.py run …`; `phase-dynamic` also covers the target's own build under `sandbox_exec.py run -- bear -- make` (or `cmake`, `ninja`, `meson`, `configure`) |
 
@@ -226,6 +226,7 @@ python3 $S/pipeline_make.py gen                                         # once, 
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run build         # trusted: fills the shared store
 python3 $S/pipeline_make.py run fuzz                                    # \ run these two at the same time,
 python3 $S/pipeline_make.py run eva                                     # /  as two background wrapper calls (ro alongside fuzz; use /opt/framac-pipeline/scripts/pipeline_make.py run eva when running Eva standalone with rw shared cache)
+python3 $S/pipeline_make.py run coverage                                # after fuzz: what each corpus reached
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest        # trusted: ingests reports and publishes evolved fuzz corpora to /framac-cache/corpora/<module>
 python3 $S/pipeline_make.py run replay wp-queue
 ```
@@ -238,6 +239,7 @@ The trusted steps are spelled out in full: only that exact command line gets a w
 | `build` (`build-<mod>`) | E-ACSL / sanitizer compile of every fuzzable module | static |
 | `selftest` | the E-ACSL toolchain canary | dynamic |
 | `fuzz` (`fuzz-<mod>`) | one campaign per module; each depends on `selftest` and its `build-<mod>` | dynamic |
+| `coverage` (`coverage-<mod>`) | replays each module's corpus on a Clang source-coverage build and writes per-function reach to `workspace/reports/coverage/<mod>.json`; it starts no campaign, and nothing in the ledger reads it | dynamic |
 | `eva` (`eva-<mod>`) | one Eva run per module | static |
 | `ingest` | ingests new reports only (fuzz before Eva), then validates; an expected module without a report gets a `not_run` record (a malformed one is moved aside as `<mod>.json.malformed`) | static |
 | `replay` | replays every unverified candidate's reproducers for the crash verifiers: one report per candidate, plus `workspace/reports/replay/index.json` = `{generated_at, candidates_file, by_fingerprint: {<fingerprint>: {report, module, status}}}` | dynamic |

@@ -62,7 +62,8 @@ Campaigns need no judgment, so they run from the generated Makefile, not from on
 1. Generate the Makefile once, in the foreground: `python3 /opt/framac-pipeline/scripts/pipeline_make.py gen`. Its JSON lists the runnable modules and any module excluded with a reason (no harness sidecar, or a flag outside the allowlist).
 2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`. Builds are cached by content, so repeating this after a harness repair rebuilds only what changed. Write this command exactly as shown, with the full path: only this exact command line may also fill the shared cross-run cache (`docs/resources-and-caching.md`, Section 5).
 3. Fuzz every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz` (run in the foreground and wait for completion, or concurrently in the background alongside `/framac-eva` if your host harness supports background wrapper calls).
-4. Tune per module only where needed, then re-run the target. Options: dictionaries, budgets, `--fuzz-max-time`. When no `--dict` / `--fuzz-dict` is configured (unless `--no-auto-dict` is passed), `run_eacsl_fuzz.py campaign` automatically invokes `scripts/fuzz_dictionary.py` to extract string literals, hex constants, and comparison magic numbers from the module's sources into `workspace/dicts/<mod>.dict`. You can also generate or inspect a dictionary standalone with `python3 /opt/framac-pipeline/scripts/fuzz_dictionary.py --sources <files...> --out workspace/dicts/<mod>.dict`.
+4. Measure what each corpus reached: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage` (see Step 3).
+5. Tune per module only where needed, then re-run the target. Options: dictionaries, budgets, `--fuzz-max-time`. When no `--dict` / `--fuzz-dict` is configured (unless `--no-auto-dict` is passed), `run_eacsl_fuzz.py campaign` automatically invokes `scripts/fuzz_dictionary.py` to extract string literals, hex constants, and comparison magic numbers from the module's sources into `workspace/dicts/<mod>.dict`. You can also generate or inspect a dictionary standalone with `python3 /opt/framac-pipeline/scripts/fuzz_dictionary.py --sources <files...> --out workspace/dicts/<mod>.dict`.
    ```text
    python3 /opt/framac-pipeline/scripts/pipeline_make.py params set --module <mod> --fuzz-dict <file> --fuzz-budget <cpu-seconds>
    ```
@@ -107,6 +108,16 @@ For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickr
 | `clean` | No failure within the time budget. The corpus in `workspace/corpus/<mod>/` becomes the dynamic anti-hallucination corpus for `/framac-wp`. Fuzzing is not proof. |
 | `fuzzer_error` / `compile_error` / `sandbox_unavailable` | The campaign did not run to completion. Never read this as clean. |
 | `not_run` | No report was produced for an expected module (the job was killed or excluded). Written by `ingest` so the gap is recorded, never silent. |
+
+`workspace/reports/coverage/<mod>.json` says which of the target's functions and code regions the corpus executes, measured by replaying `workspace/corpus/<mod>/` on a plain Clang source-coverage build (`run_eacsl_fuzz.py coverage`, no E-ACSL and no sanitizers). `functions[]` has `executions`, `regions` and, for a function that ran, `uncovered_lines`. `make` replays the corpus as it stands, so run `coverage` again after a corpus changes.
+
+| Status | Meaning |
+| :--- | :--- |
+| `ok` | Every input replayed. |
+| `partial` | Some inputs failed or were not replayed (`failed_inputs`, `inputs`), so the counts are lower bounds. A failing input is a lead to replay on the fuzz binary, not a candidate. |
+| `no_inputs` / `compile_error` / `coverage_error` / `sandbox_unavailable` | Nothing was measured. Never read this as no reach. |
+
+Read `executions: 0` before tuning. The harness may simply not call that function, which a better dictionary or budget cannot fix: repair the harness instead. If the harness does call it, the corpus is stuck behind an input check, and `uncovered_lines` on the callers shows where. This report is reach only: it is not proof, the ledger does not read it, and a reached function is not a safe one.
 
 Then ingest (parent only), after both fuzz and Eva have finished:
 
