@@ -12,6 +12,7 @@ import workspace_overlay
 from acsl_ast import (
     AcslSyntaxError,
     ScopeViolationError,
+    locate_all_definition_spans,
     locate_all_prototype_spans,
     locate_function_span,
     splice_architect_header,
@@ -1158,3 +1159,20 @@ class TestTolerantArchitectHeaderMerge:
         work_h = (overlay / "work/parser.h").read_text(encoding="utf-8")
         assert "len >= 4" in work_h
         assert "len >= 8" not in work_h
+
+
+def test_all_definition_spans_agree_with_locate_function_span() -> None:
+    source = (
+        BASELINE_C
+        + r"""
+/*@ assigns \nothing; */
+static int with_contract(int a) { return a; }
+int proto_only(int b);
+int with_contract_again(void) { return 0; }
+"""
+    )
+    spans = locate_all_definition_spans(source)
+    assert {"parse_magic", "parse_payload", "with_contract", "with_contract_again"} <= set(spans)
+    assert "proto_only" not in spans
+    for name, span in spans.items():
+        assert span == locate_function_span(source, name), name

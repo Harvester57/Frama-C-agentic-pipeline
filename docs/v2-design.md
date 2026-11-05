@@ -146,7 +146,7 @@ Implemented roles in [`../schemas/agent-result.schema.json`](../schemas/agent-re
 - **Current implementation:** `build_callgraph_dag.py` uses a C/ACSL lexical token stream (`tokenize_c_acsl`), Tarjan's SCC algorithm for recursion cycles, `compile_commands.json` flag extraction, and structural signature/body classification (`verifiability`, `wp_blockers`, `wp_notes`, risk tiers, and Layers 2-6 property inference).
 - **Planned M4 roadmap:**
   - Parallel recon agents (entry surfaces and untrusted inputs; principals, authentication, and secret handling; build and harness feasibility) returning structured facts to override the baseline module table with source-backed reasons.
-  - Authoritative Frama-C kernel AST call graph merged with Eva-resolved function-pointer edges after Phase 2.
+  - Authoritative Frama-C kernel AST call graph merged with Eva-resolved function-pointer edges after Phase 2. The extraction exists and is shared with the prover facts: `kernel_ast.call_graph()` gives the kernel's direct edges, indirect call sites and recursion cycles, and `run_eva_slice.py` reports Eva-resolved edges (`flows.call_edges`). `build_callgraph_dag.py` does not use them yet: its `callgraph_source` stays `regex`.
   - A C/ACSL companion file giving each vulnerability class a hunting move, ACSL property pattern, and validation rules.
 
 ---

@@ -160,9 +160,10 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE` | Run-lock wait and heartbeat staleness (seconds) | 1800, 120 |
 | `FRAMAC_WP_WALL_TIMEOUT` | Wall-clock limit for one WP run (seconds) | 3600 |
 | `FRAMAC_PROVER_WALL_BUDGET_S` | Wall-clock budget for one prover subagent session across retries (seconds) | 600 (`quick`), 900 (`standard`), 1800 (`deep`) |
+| `FRAMAC_PROVER_CONTEXT` | `off` renders prover briefs without function facts and reading slice and with every conditional part, for A/B comparisons | on |
 | `FRAMAC_CPUS`, `FRAMAC_MEMORY`, `FRAMAC_PIDS_LIMIT`, `FRAMAC_CONCURRENT_AGENTS` | Legacy per-container sizing, used only on the no-broker path | — |
 
-Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT`, `FRAMAC_PROVER_WALL_BUDGET_S` and `FRAMAC_RESOURCES_VERBOSE`. The others are read by the wrappers or the host broker. The pool reaches the container only as the broker's measurement (`FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`).
+Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT`, `FRAMAC_PROVER_WALL_BUDGET_S`, `FRAMAC_PROVER_CONTEXT` and `FRAMAC_RESOURCES_VERBOSE`. The others are read by the wrappers or the host broker. The pool reaches the container only as the broker's measurement (`FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`).
 
 ---
 
@@ -175,7 +176,9 @@ Set every knob on the host, where you run the wrapper. The container's environme
 | E-ACSL and sanitizer builds of `workspace/work` (Make builds, parent re-checks, verifiers, breakers) | L1: toolchain identity + effective flags + output path + cwd + dependency manifest; L2 (E-ACSL builds): line-shift-normalized dependency manifest | the binary, `instrumented.c`, the fallback object, `compile.log` |
 | Guardrail verdicts (run-local `guardrail` store) | binary sha256 + corpus manifest + `--extra-runs` + `--timeout` + `-seed` + module | `passed_dynamic_oracle`, `rejected_overconstrained`, or `code_fault` verdict |
 | WP prover results | Frama-C's own goal digest (`-wp-cache update -wp-cache-dir state/cache/wp`) | unchanged goals across a prover's iterations and in the parent re-check |
-| Eva reports with status `ok` | toolchain identity + Eva flags + dependency manifest (the output directory is factored out, so a ladder rung and a later `run eva` with the same options share an entry) | report JSON, `alarms.csv`, `red_alarms.csv`, `eva.log`, `slice.sarif` |
+| Eva reports with status `ok` | toolchain identity + Eva flags + dependency manifest (the output directory is factored out, so a ladder rung and a later `run eva` with the same options share an entry) | report JSON, `alarms.csv`, `red_alarms.csv`, `eva.log`, `slice.sarif`, `flows.log`, `flows.cg.dot` |
+| Function facts of a module (`facts`) | toolchain identity + flags + dependency manifest + digest of the Eva flows | `workspace/reports/facts/<module>.json` |
+| Parsed translation units for reading slices (`slice-index`) | digest of the preprocessed C, ignoring line markers and whitespace | the declaration and macro index, shared by every prover of a file, because ACSL-only merges leave those tokens unchanged |
 
 **Toolchain identity** is the image ID, plus a digest of `scripts/` and `templates/`, which are bind-mounted and change without an image rebuild.
 
@@ -203,6 +206,7 @@ The shared store lets later runs reuse builds, Eva results and proofs for unchan
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune`
+- `python3 /opt/framac-pipeline/scripts/pipeline_make.py run facts`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest` (and `… pipeline_make.py ingest`, `… pipeline_make.py run ingest wp-queue`)
 - `python3 /opt/framac-pipeline/scripts/cache.py gc` and `… cache.py stats`
@@ -243,6 +247,7 @@ The trusted steps are spelled out in full: only that exact command line gets a w
 | `selftest` | the E-ACSL toolchain canary | dynamic |
 | `fuzz` (`fuzz-<mod>`) | one campaign per module; each depends on `selftest` and its `build-<mod>` | dynamic |
 | `coverage` (`coverage-<mod>`) | replays each module's corpus on a Clang source-coverage build and writes per-function reach to `workspace/reports/coverage/<mod>.json`; it starts no campaign, and nothing in the ledger reads it | dynamic |
+| `facts` (`facts-<mod>`) | kernel AST facts of the module's functions, joined with its Eva report's read and write sets, for the prover briefs; `wp-queue` depends on it, and a failure never stops the pipeline | static |
 | `eva` (`eva-<mod>`) | one Eva run per module, with its recorded tuning decision if it has one | static |
 | `eva-tune` | the Eva ladder: base run, then rungs, selection, per-loop analysis and combination for modules left with Unknowns; rewrites the module's Eva report and records the decision | static |
 | `ingest` | ingests new reports only (fuzz before Eva), then validates; an expected module without a report gets a `not_run` record (a malformed one is moved aside as `<mod>.json.malformed`) | static |

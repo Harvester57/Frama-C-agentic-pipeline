@@ -203,11 +203,11 @@ jobs:
           load: true
           tags: framac-pipeline:latest
 
-      - name: Run sandbox probe and E-ACSL canary selftest in hardened container
+      - name: Run sandbox probe, E-ACSL canary and kernel AST selftests in hardened container
         shell: bash
         run: |
           set -euo pipefail
           ./wrappers/framac-docker.sh \
             --target templates/eacsl_canary \
             --new-run \
-            -- "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest"
+            -- "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest && python3 /opt/framac-pipeline/scripts/kernel_ast.py selftest"

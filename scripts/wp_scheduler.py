@@ -49,6 +49,7 @@ import acsl_ast  # noqa: E402
 import checkpoint  # noqa: E402
 import contract_negotiator  # noqa: E402
 import ledger  # noqa: E402
+import prover_candidates  # noqa: E402
 import resources  # noqa: E402
 import workspace_overlay  # noqa: E402
 from framac_common import (  # noqa: E402
@@ -219,6 +220,7 @@ class Deps:
         self.ingest_verifier: Callable[..., dict] = ledger.cmd_ingest_verifier
         self.resolve_request: Callable[..., dict] = contract_negotiator.cmd_resolve
         self.save_shard: Callable[[str, Path], dict] = _save_shard
+        self.restore_best: Callable[[Path], dict | None] = prover_candidates.restore_best
         self.now: Callable[[], float] = time.time
 
 
@@ -2545,18 +2547,45 @@ def _merge_partial_prover(job: dict) -> dict:
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def _restore_best_candidate(aid: str, out: dict) -> dict | None:
+    """Put a stalled prover's best candidate back into its scratch tree; a failure never blocks its completion."""
+    out["best_candidate"] = None
+    try:
+        out["best_candidate"] = DEPS.restore_best(Path("agents") / aid / "scratch")
+    except Exception as exc:
+        out["errors"].append(f"restore best candidate: {type(exc).__name__}: {exc}")
+    return out["best_candidate"]
+
+
+def _analysis_error_will_retry(task: dict, aid: str, res: dict) -> bool:
+    """Whether the prover's last WP report is an analysis_error that still gets its retry."""
+    if int(task.get("analysis_errors") or 0) + 1 >= MAX_ANALYSIS_ERRORS:
+        return False
+    src = _find_agent_wp_report(aid, res, task["function"])
+    report = _load_report(src) if src is not None else None
+    return report is not None and report.get("status") == "analysis_error"
+
+
 def _complete_prover(
     state: dict, ctx: Ctx, task: dict, aid: str, res: dict, result_path: Path, out: dict
 ) -> dict | None:
     status = res["status"]
     out["result_status"] = status
     if status == "all_proven":
+        # Never restored: the parent re-verifies on merge, and a last iteration that skipped the guardrail must not
+        # be replaced by an older partial.
         task["state"] = "merge_queued"
         task["merge"] = {"agent_id": aid, "queued_at": utc_now(), "queued_ts": DEPS.now(), "analysis_retries": 0}
         _event(state, "merge_queued", task["id"], agent_id=aid)
         out["action"] = "queued_for_merge"
         return None
-    report_rel, report = _promote_agent_wp(task, aid, res, out["errors"])
+    # The retry comes first: exceeding the WP job limit is an analysis_error, so settling for the best candidate here
+    # would make results depend on machine speed. The best candidate is for a task that ends without a proof.
+    # Then the promoted report and the partial contract merge below come from it. Its report is at the default path,
+    # so the result's evidence, which may name a report of the last iteration, must not take precedence.
+    out["best_candidate"] = None
+    restored = None if _analysis_error_will_retry(task, aid, res) else _restore_best_candidate(aid, out)
+    report_rel, report = _promote_agent_wp(task, aid, {**res, "evidence": []} if restored else res, out["errors"])
     if report is not None and report_rel and report.get("status") == "analysis_error":
         _on_analysis_error(state, task, aid, report_rel, report, out)
         return None
@@ -2585,6 +2614,10 @@ def _complete_prover(
     out["units"] = _park_units(task, aid, f"prover {aid} returned {status}")
     _finish(state, task, "blocked", status)  # terminal: its callers are released
     out["action"] = "blocked"
+    # A restored best candidate can be fully proved while the prover stalled on a later, stronger contract. It is not
+    # credited above, but its callers still get its contract: the partial merge re-verifies it on the merged tree.
+    if restored and report and report.get("status") == "all_proven":
+        report = {**report, "status": "unproven_goals_remain"}
     return _partial_contract_merge_job(task, aid, report)
 
 
