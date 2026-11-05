@@ -7,20 +7,28 @@ extracts the surviving 'Unknown' functions for Phase 3 (/framac-wp), and emits S
 A failed Frama-C run is reported as status "analysis_error", never as zero alarms.
 
 Inside a run directory, a report with status "ok" is cached (scripts/cache.py, namespace `eva`)
-under the toolchain, the Eva command line, the output directory and the content of every source
-and header it includes; an identical later run restores the report, alarms.csv, red_alarms.csv,
-eva.log and slice.sarif instead of re-running Eva (the .sav is not cached).
+under the toolchain, the Eva command line (with the output directory factored out, so the same
+analysis is one entry wherever it writes) and the content of every source and header it includes;
+an identical later run restores the report, alarms.csv, red_alarms.csv, eva.log and slice.sarif
+instead of re-running Eva (the .sav is not cached).
+
+Tuning comes in two forms, both recorded in the report: `--eva-option name=value`, allowlisted by
+eva_options.py, and `--loop-unroll file#function#ordinal=N`, which analyses a scratch mirror of the
+sources (eva_loops.py) and maps its paths back, so workspace/work is never touched.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 
 _KERNEL_ERR_RE = re.compile(
@@ -41,6 +49,9 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+from eva_loops import LoopRef, parse_loop_ref, prepare_mirror, strip_mirror  # noqa: E402
+from eva_options import extra_domains as option_domains  # noqa: E402
+from eva_options import framac_args, options_problem, parse_option  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_ASSUMED,
     STATUS_DEAD,
@@ -59,6 +70,7 @@ from framac_common import (  # noqa: E402
 from resources import CLASSES  # noqa: E402
 
 BASE_DOMAINS = ("cvalue", "equality", "symbolic-locations", "octagon", "gauges")
+DEFAULT_AUTO_LOOP_UNROLL = 32
 _DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 # Report files restored from the cache; the .sav is never cached.
 _CACHED_OUTPUTS = {
@@ -100,9 +112,20 @@ def run_eva_on_slice(
     extra_domains: list[str] | str | None = None,
     allow_incomplete_recursion_specs: bool = False,
     use_cache: bool = True,
+    eva_options: dict | None = None,
+    loop_unroll: Iterable[LoopRef] | None = None,
+    mirror_root: str | None = None,
 ) -> dict:
+    """
+    `eva_options` are allowlisted tuning values; `loop_unroll` analyses a mirror of the sources at
+    `mirror_root` instead (default: under `out_dir`), with those loops annotated.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    options = dict(eva_options or {})
+    problem = options_problem(options)
+    if problem:
+        raise ValueError(problem)
     csv_path = out_dir / "alarms.csv"
     red_csv = out_dir / "red_alarms.csv"
     sav_path = out_dir / "framac.sav"
@@ -112,12 +135,29 @@ def run_eva_on_slice(
         if stale.exists():
             stale.unlink()
 
+    original_flags = shlex.split(augment_framac_cppflags(cppflags))
+    # Over the sources as given, before any mirror: runs of one analysis must agree on it.
+    input_digest = _input_digest(sources, original_flags)
+    eff_sources, eff_cppflags = list(sources), cppflags
+    applied: list[LoopRef] = []
+    dropped: list[LoopRef] = []
+    path_root: str | None = None
+    refs = sorted(set(loop_unroll or []))
+    if refs:
+        root = mirror_root or (out_dir / "mirror").as_posix()
+        mirror = prepare_mirror(root, sources, cppflags, original_flags, refs)
+        if mirror is None or not mirror.applied:
+            # Nothing to annotate: this is the plain analysis, and the cache already knows it.
+            dropped = refs
+        else:
+            eff_sources, eff_cppflags, path_root = mirror.sources, mirror.cppflags, mirror.root
+            applied, dropped = mirror.applied, mirror.dropped
     cmd, reduced_checks = _eva_command(
-        sources,
+        eff_sources,
         main_fn,
         out_dir,
         machdep,
-        cppflags,
+        eff_cppflags,
         slevel,
         warn_invalid_pointer,
         warn_unsigned,
@@ -125,15 +165,25 @@ def run_eva_on_slice(
         extra_domains,
         mlevel=mlevel,
         allow_incomplete_recursion_specs=allow_incomplete_recursion_specs,
+        eva_options=options,
     )
 
+    def _finalize(res: dict) -> dict:
+        # Never cached: these describe this invocation, and the digest is taken fresh each time.
+        res["sources"] = list(sources)
+        res["eva_options"] = options
+        res["loop_unroll"] = [ref.to_json() for ref in applied]
+        res["loop_unroll_dropped"] = [ref.to_json() for ref in dropped]
+        res["input_digest"] = input_digest
+        return res
+
     def _run() -> dict:
-        return _execute_eva(cmd, sources, main_fn, out_dir, reduced_checks, timeout)
+        return _execute_eva(cmd, eff_sources, main_fn, out_dir, reduced_checks, timeout, path_root=path_root)
 
     if not use_cache:
         res = _run()
         res["cache"] = {"hit": False, "key": None}
-        return res
+        return _finalize(res)
 
     def _restore_map(entry: cache.Entry) -> dict[str, Path]:
         return {name: out_dir / name for name in _CACHED_OUTPUTS}
@@ -147,18 +197,35 @@ def run_eva_on_slice(
         result["sav_file"] = None
         return result
 
-    material = {"kind": "eva", "command": cmd, "sources": list(sources), "out_dir": out_dir.as_posix()}
-    return cache.memoize(
-        "eva",
-        material,
-        sources=sources,
-        dep_flags=shlex.split(augment_framac_cppflags(cppflags)),
-        build=_run,
-        outputs=lambda res: {name: out_dir / name for name in _CACHED_OUTPUTS},
-        ok=lambda res: res.get("status") == "ok",
-        restore_map=_restore_map,
-        on_restore=_on_restore,
+    # The output files are not part of the analysis: the same analysis is one entry wherever it writes.
+    outputs_in_cmd = {str(out_dir / name): f"<out>/{name}" for name in ("alarms.csv", "red_alarms.csv", "framac.sav")}
+    material = {
+        "kind": "eva",
+        "command": [outputs_in_cmd.get(token, token) for token in cmd],
+        "sources": list(eff_sources),
+    }
+    return _finalize(
+        cache.memoize(
+            "eva",
+            material,
+            sources=eff_sources,
+            dep_flags=shlex.split(augment_framac_cppflags(eff_cppflags)),
+            build=_run,
+            outputs=lambda res: {name: out_dir / name for name in _CACHED_OUTPUTS},
+            ok=lambda res: res.get("status") == "ok",
+            restore_map=_restore_map,
+            on_restore=_on_restore,
+        )
     )
+
+
+def _input_digest(sources: list[str], flags: list[str]) -> str | None:
+    """One digest for the sources and every header they include; None when it cannot be computed."""
+    manifest = cache.dependency_manifest(sources, flags)
+    if manifest is None:
+        return None
+    blob = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def _eva_command(
@@ -174,9 +241,16 @@ def _eva_command(
     extra_domains: list[str] | str | None,
     mlevel: int = 0,
     allow_incomplete_recursion_specs: bool = False,
+    eva_options: dict | None = None,
 ) -> tuple[list[str], list[str]]:
     if mlevel < 0:
         raise ValueError(f"mlevel must be >= 0 (got {mlevel})")
+    options = dict(eva_options or {})
+    # These two always appear on the command line; an option only changes their value.
+    slevel = options.pop("slevel", slevel)
+    auto_loop_unroll = options.pop("auto-loop-unroll", DEFAULT_AUTO_LOOP_UNROLL)
+    domains = list(extra_domains.split(",") if isinstance(extra_domains, str) else (extra_domains or []))
+    domains += option_domains(options)
     csv_path = out_dir / "alarms.csv"
     red_csv = out_dir / "red_alarms.csv"
     sav_path = out_dir / "framac.sav"
@@ -217,11 +291,12 @@ def _eva_command(
             "-then",
             "-eva",
             "-eva-domains",
-            eva_domains(extra_domains),
+            eva_domains(domains),
             "-eva-slevel",
             str(slevel),
             "-eva-auto-loop-unroll",
-            "32",
+            str(auto_loop_unroll),
+            *framac_args(options),
             "-eva-report-red-statuses",
             str(red_csv),
             "-then",
@@ -250,6 +325,86 @@ def _eva_command(
     return cmd, reduced_checks
 
 
+def read_report_rows(csv_path: Path, path_root: str | None = None) -> list[dict]:
+    """The report's property rows, with a mirror's path prefix removed (see eva_loops.py)."""
+    rows = read_report_csv(csv_path)
+    if path_root:
+        for row in rows:
+            row["directory"] = strip_mirror(row["directory"], path_root)
+    return rows
+
+
+def summarize_rows(rows: list[dict]) -> dict:
+    """The report's status buckets and counts for a list of property rows."""
+    alarms_by_status: dict[str, list[dict]] = {
+        "Valid": [],
+        "Unknown": [],
+        "Invalid": [],
+        "Dead": [],
+        "Assumed": [],
+        "Other": [],
+    }
+    unknown_by_function: dict[str, list[dict]] = defaultdict(list)
+    functions_with_properties: set[str] = set()
+    functions_with_properties_by_file: set[tuple[str, str, str]] = set()
+
+    for row in rows:
+        st = row["status"]
+        entry = {
+            "directory": row["directory"],
+            "file": row["file"],
+            "function": row["function"],
+            "line": row["line"],
+            "kind": row["kind"],
+            "status": row["status_raw"],
+            "status_bucket": st,
+            "annotation": row["property"],
+        }
+        if row["function"]:
+            functions_with_properties.add(row["function"])
+            functions_with_properties_by_file.add((row["directory"], row["file"], row["function"]))
+        if st in (STATUS_VALID, STATUS_VALID_UNDER_HYP):
+            alarms_by_status["Valid"].append(entry)
+        elif st in (STATUS_UNKNOWN, STATUS_NEVER_TRIED):
+            alarms_by_status["Unknown"].append(entry)
+            if row["function"]:
+                unknown_by_function[row["function"]].append(entry)
+        elif st in (STATUS_INVALID, STATUS_INVALID_UNDER_HYP):
+            entry["under_hypotheses"] = st == STATUS_INVALID_UNDER_HYP
+            if row.get("tuning_run"):
+                entry["tuning_run"] = row["tuning_run"]
+            alarms_by_status["Invalid"].append(entry)
+        elif st == STATUS_DEAD:
+            # Unreachable from eva_main under this harness: neither a bug nor a proof.
+            alarms_by_status["Dead"].append(entry)
+        elif st == STATUS_ASSUMED:
+            # "Considered valid": an assumption (libc/stub spec), recorded, never counted as proven.
+            alarms_by_status["Assumed"].append(entry)
+        else:
+            alarms_by_status["Other"].append(entry)
+
+    total_checked = len(alarms_by_status["Valid"]) + len(alarms_by_status["Unknown"]) + len(alarms_by_status["Invalid"])
+    discharged_pct = round(100.0 * len(alarms_by_status["Valid"]) / total_checked, 2) if total_checked > 0 else 0.0
+    return {
+        "total_properties": total_checked,
+        "valid_count": len(alarms_by_status["Valid"]),
+        "unknown_count": len(alarms_by_status["Unknown"]),
+        "invalid_count": len(alarms_by_status["Invalid"]),
+        "dead_count": len(alarms_by_status["Dead"]),
+        "assumed_count": len(alarms_by_status["Assumed"]),
+        "discharged_percentage": discharged_pct,
+        "surviving_unknown_functions": sorted(unknown_by_function.keys()),
+        "unknown_obligations_by_function": dict(unknown_by_function),
+        "functions_with_properties": sorted(functions_with_properties),
+        "functions_with_properties_by_file": [
+            {"directory": d, "file": f, "function": fn} for d, f, fn in sorted(functions_with_properties_by_file)
+        ],
+        "invalid_alarms": alarms_by_status["Invalid"],
+        "dead_alarms": alarms_by_status["Dead"],
+        "assumed_properties": alarms_by_status["Assumed"],
+    }
+
+
 def _execute_eva(
     cmd: list[str],
     sources: list[str],
@@ -257,12 +412,14 @@ def _execute_eva(
     out_dir: Path,
     reduced_checks: list[str],
     timeout: int | None,
+    path_root: str | None = None,
 ) -> dict:
     csv_path = out_dir / "alarms.csv"
     sav_path = out_dir / "framac.sav"
     sarif_path = out_dir / "slice.sarif"
     log_path = out_dir / "eva.log"
 
+    started = time.monotonic()
     timed_out = False
     returncode: int | None
     try:
@@ -272,6 +429,7 @@ def _execute_eva(
         timed_out, returncode = True, None
         stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+    elapsed_s = round(time.monotonic() - started, 1)
     combined_log = stdout + "\n" + stderr
     log_path.write_text(combined_log, encoding="utf-8")
 
@@ -288,55 +446,13 @@ def _execute_eva(
             str(sarif_path),
         ]
         subprocess.run(sarif_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if path_root and sarif_path.exists():
+            # Findings must name the real sources, not the scratch mirror they were analysed in.
+            sarif_text = sarif_path.read_text(encoding="utf-8", errors="replace")
+            sarif_path.write_text(sarif_text.replace(f"{path_root}/", ""), encoding="utf-8")
 
-    alarms_by_status: dict[str, list[dict]] = {
-        "Valid": [],
-        "Unknown": [],
-        "Invalid": [],
-        "Dead": [],
-        "Assumed": [],
-        "Other": [],
-    }
-    unknown_by_function: dict[str, list[dict]] = defaultdict(list)
-    functions_with_properties: set[str] = set()
-    functions_with_properties_by_file: set[tuple[str, str, str]] = set()
-
-    if csv_path.exists():
-        for row in read_report_csv(csv_path):
-            st = row["status"]
-            entry = {
-                "directory": row["directory"],
-                "file": row["file"],
-                "function": row["function"],
-                "line": row["line"],
-                "kind": row["kind"],
-                "status": row["status_raw"],
-                "status_bucket": st,
-                "annotation": row["property"],
-            }
-            if row["function"]:
-                functions_with_properties.add(row["function"])
-                functions_with_properties_by_file.add((row["directory"], row["file"], row["function"]))
-            if st in (STATUS_VALID, STATUS_VALID_UNDER_HYP):
-                alarms_by_status["Valid"].append(entry)
-            elif st in (STATUS_UNKNOWN, STATUS_NEVER_TRIED):
-                alarms_by_status["Unknown"].append(entry)
-                if row["function"]:
-                    unknown_by_function[row["function"]].append(entry)
-            elif st in (STATUS_INVALID, STATUS_INVALID_UNDER_HYP):
-                entry["under_hypotheses"] = st == STATUS_INVALID_UNDER_HYP
-                alarms_by_status["Invalid"].append(entry)
-            elif st == STATUS_DEAD:
-                # Unreachable from eva_main under this harness: neither a bug nor a proof.
-                alarms_by_status["Dead"].append(entry)
-            elif st == STATUS_ASSUMED:
-                # "Considered valid": an assumption (libc/stub spec), recorded, never counted as proven.
-                alarms_by_status["Assumed"].append(entry)
-            else:
-                alarms_by_status["Other"].append(entry)
-
-    total_checked = len(alarms_by_status["Valid"]) + len(alarms_by_status["Unknown"]) + len(alarms_by_status["Invalid"])
-    discharged_pct = round(100.0 * len(alarms_by_status["Valid"]) / total_checked, 2) if total_checked > 0 else 0.0
+    rows = read_report_rows(csv_path, path_root) if csv_path.exists() else []
+    summary = summarize_rows(rows)
 
     # A failed Frama-C run or a missing report must never look like "0 alarms".
     reason = None
@@ -362,22 +478,9 @@ def _execute_eva(
         "undeclared_functions": scan_undeclared_functions(combined_log),
         "main_fn": main_fn,
         "sources": list(sources),
-        "total_properties": total_checked,
-        "valid_count": len(alarms_by_status["Valid"]),
-        "unknown_count": len(alarms_by_status["Unknown"]),
-        "invalid_count": len(alarms_by_status["Invalid"]),
-        "dead_count": len(alarms_by_status["Dead"]),
-        "assumed_count": len(alarms_by_status["Assumed"]),
-        "discharged_percentage": discharged_pct,
-        "surviving_unknown_functions": sorted(unknown_by_function.keys()),
-        "unknown_obligations_by_function": dict(unknown_by_function),
-        "functions_with_properties": sorted(functions_with_properties),
-        "functions_with_properties_by_file": [
-            {"directory": d, "file": f, "function": fn} for d, f, fn in sorted(functions_with_properties_by_file)
-        ],
-        "invalid_alarms": alarms_by_status["Invalid"],
-        "dead_alarms": alarms_by_status["Dead"],
-        "assumed_properties": alarms_by_status["Assumed"],
+        **summary,
+        "mirror_root": path_root,
+        "elapsed_s": elapsed_s,
         "reduced_checks": reduced_checks,
         "sarif_file": str(sarif_path) if sarif_path.exists() else None,
         "csv_file": str(csv_path) if csv_path.exists() else None,
@@ -437,11 +540,32 @@ def main(argv: list[str] | None = None) -> int:
             "ACSL assigns clause to a warning and continue (recorded in reduced_checks)."
         ),
     )
+    parser.add_argument(
+        "--eva-option",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Allowlisted Eva tuning option (see eva_options.py), for example slevel=1000. Repeatable.",
+    )
+    parser.add_argument(
+        "--loop-unroll",
+        action="append",
+        default=[],
+        metavar="FILE#FUNCTION#ORDINAL=N",
+        help="Unroll this loop N times, on a scratch mirror of the sources. Repeatable.",
+    )
+    parser.add_argument(
+        "--mirror-root",
+        default=None,
+        help="Where --loop-unroll writes its mirror (default: under --out-dir).",
+    )
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
     timeout = CLASSES["eva"].wall_timeout_s if args.timeout is None else args.timeout
     try:
         eva_domains(args.extra_domains)
+        options = dict(parse_option(text) for text in args.eva_option)
+        loop_unroll = [parse_loop_ref(text) for text in args.loop_unroll]
     except ValueError as exc:
         parser.error(str(exc))
     if args.mlevel < 0:
@@ -461,6 +585,9 @@ def main(argv: list[str] | None = None) -> int:
         timeout=timeout or None,
         extra_domains=args.extra_domains,
         allow_incomplete_recursion_specs=args.allow_incomplete_recursion_specs,
+        eva_options=options,
+        loop_unroll=loop_unroll,
+        mirror_root=args.mirror_root,
     )
     res["module"] = args.module
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

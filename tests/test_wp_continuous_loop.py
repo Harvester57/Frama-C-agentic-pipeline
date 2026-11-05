@@ -797,7 +797,7 @@ def test_tier4_end_to_end_sliding_window_simulation(sim):
             elif t_info["kind"] == "arch":
                 sim.architect(aid, t_info["header"])
             elif t_info["kind"] == "verify":
-                fp = t_info.get("candidate_fingerprint") or t_info.get("fingerprint")
+                fp = str(t_info.get("candidate_fingerprint") or t_info.get("fingerprint") or "")
                 out_path = sim.run_dir / f"agents/{aid}/scratch/result.json"
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 ledger.cmd_scaffold_verifier(fp, "needs_validation", aid, out_path=out_path)

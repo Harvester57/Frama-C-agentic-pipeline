@@ -13,6 +13,7 @@ Subcommands (run from the run directory):
   params set --module M [...]  record per-module tuning in workspace/build/params.json
   params show [--module M]     effective tuning of every module
   run <targets...>             make -f workspace/build/Makefile -j<this container's CPUs> -k --output-sync=target
+                               (`eva-tune` is the Eva ladder: docs/resources-and-caching.md, Section 6)
   ingest [--module M]          ingest new fuzz then Eva reports, stubbing missing ones; validate
   sweep-list                   the ledger's WP-covered proof units, as (file, function)
   sweep [--jobs N]             re-prove them without the per-run WP cache, one leased WP job each
@@ -48,6 +49,21 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+from eva_loops import loop_ref_from_json, mirror_id  # noqa: E402
+from eva_options import (  # noqa: E402
+    EVA_OPTIONS,
+    LADDER,
+    format_option,
+    loop_unroll_level,
+    merge_options,
+    options_problem,
+    parse_option,
+    record_is_current,
+    recorded_rungs,
+    settings_digest,
+    trial_timeout,
+    tuned_record_problem,
+)
 from framac_common import (  # noqa: E402
     ArtifactError,
     RunLockTimeout,
@@ -77,6 +93,9 @@ SELFTEST_JSON = "workspace/reports/eacsl_selftest.json"
 INGESTED_JSON = "state/ingested.json"
 LEDGER_JSON = "coverage-ledger.json"
 SWEEP_DIR = "workspace/reports/wp-sweep"
+TUNE_REPORT_DIR = "workspace/reports/eva-tuning"
+# Their eva-<name> targets would collide with the ladder's own aggregate targets.
+_RESERVED_MODULES = frozenset({"tune", "tune-base"})
 
 DEFAULT_PROFILE = "standard"
 FUZZ_BUDGET_BY_PROFILE = {"quick": 60, "standard": 120, "deep": 900}  # CPU-seconds per campaign
@@ -209,6 +228,8 @@ PARAM_TYPES: dict[str, type] = {
     "eva_taint": bool,
     "eva_timeout": int,
     "eva_recursion_fallback": bool,
+    "eva_options": dict,
+    "eva_tuned": dict,
     "fuzz_budget": int,
     "fuzz_max_time": int,
     "fuzz_dict": str,
@@ -223,6 +244,8 @@ def default_params(profile: str) -> dict:
         "eva_taint": False,
         "eva_timeout": None,
         "eva_recursion_fallback": False,
+        "eva_options": {},
+        "eva_tuned": None,
         "fuzz_budget": FUZZ_BUDGET_BY_PROFILE.get(profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE]),
         "fuzz_max_time": None,
         "fuzz_dict": None,
@@ -236,6 +259,8 @@ def _param_problem(key: str, value: Any) -> str | None:
         return "unknown parameter"
     if kind is bool:
         return None if isinstance(value, bool) else "must be true or false"
+    if kind is dict:
+        return options_problem(value) if key == "eva_options" else tuned_record_problem(value)
     if kind is int:
         if isinstance(value, bool) or not isinstance(value, int):
             return "must be an integer"
@@ -294,6 +319,10 @@ class ModulePlan:
     params: dict
     dag_cppflags_missing: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Rungs of the Eva ladder this module runs next, with their options; empty until its base run left Unknowns.
+    tune_rungs: dict[str, dict] = field(default_factory=dict)
+    tune_timeout: int | None = None
+    loop_unroll: int = field(default_factory=lambda: loop_unroll_level(None))
 
     def to_json(self) -> dict:
         return {
@@ -307,8 +336,42 @@ class ModulePlan:
             "ldflags": shlex.join(self.ldflags),
             "dag_cppflags_missing": self.dag_cppflags_missing,
             "params": self.params,
+            "tune_rungs": list(self.tune_rungs),
             "warnings": self.warnings,
         }
+
+    @property
+    def base_options(self) -> dict:
+        """The module's own Eva options, without any recorded tuning decision."""
+        return dict(self.params.get("eva_options") or {})
+
+    @property
+    def settings_digest(self) -> str:
+        """Everything but tuning that decides what Eva analyses for this module."""
+        p = self.params
+        return settings_digest(
+            {
+                "sources": sorted(self.sources),
+                "cppflags": self.cppflags,
+                "slevel": p["eva_slevel"],
+                "mlevel": p["eva_mlevel"],
+                "taint": p["eva_taint"],
+                "recursion_fallback": p["eva_recursion_fallback"],
+                # Raising the limit is how to give a rung that timed out another chance.
+                "timeout": p["eva_timeout"],
+                "options": self.base_options,
+            }
+        )
+
+    @property
+    def tuned(self) -> dict | None:
+        """The recorded decision, when it was made under these settings."""
+        record = self.params.get("eva_tuned")
+        return record if record and record.get("settings_digest") == self.settings_digest else None
+
+    def rung_options(self, overlay: dict) -> dict:
+        """A ladder rung's complete options: it refines the module's own settings, never lowers them."""
+        return merge_options({"slevel": self.params["eva_slevel"], **self.base_options}, overlay)
 
 
 @dataclass
@@ -453,7 +516,7 @@ def _module_base_cppflags(run_dir: Path, name: str, sidecar: dict | None = None)
 
 def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     fuzz, eva = bool(dag_mod.get("run_eacsl_fuzz")), bool(dag_mod.get("run_eva"))
-    if not MODULE_RE.match(name):
+    if not MODULE_RE.match(name) or name in _RESERVED_MODULES:
         raise _Excluded("module name cannot be used in make targets and report paths")
     if not (fuzz or eva):
         raise _Excluded("the DAG schedules neither fuzzing nor Eva (run_eacsl_fuzz and run_eva are false)")
@@ -495,17 +558,59 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         # Discovered by build_callgraph_dag.py but not in the sidecar: what to pass to
         # generate_harness.py --cppflags if the module does not build.
         dag_cppflags_missing=[t for t in dag_flags if t not in _joined_forms(base)],
+        loop_unroll=loop_unroll_level(sidecar.get("max_input_size")),
     )
     missing = [s for s in sources if not (plan.run_dir / s if not s.startswith("/") else Path(s)).is_file()]
     if missing:
         mod.warnings.append("source file(s) not found: " + ", ".join(missing))
     if origin == "dag" and len(sources) == 1:
         mod.warnings.append("no module sources: neither the sidecar nor the DAG lists any")
+    if mod.eva:
+        _plan_tuning(plan, mod)
     try:
         _module_block(mod)
     except ValueError as exc:
         raise _Excluded(str(exc)) from None
     return mod
+
+
+def _has_target_unknowns(report: dict) -> bool:
+    """Whether any Unknown is in target code: a libc function's own row never becomes prover work."""
+    by_function = report.get("unknown_obligations_by_function")
+    if not isinstance(by_function, dict):
+        return False
+    return any(
+        "FRAMAC_SHARE" not in str(row.get("directory") or "")
+        for rows in by_function.values()
+        for row in rows
+        if isinstance(row, dict)
+    )
+
+
+def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
+    """
+    The rungs `eva-tune` runs for this module, read from its base run: none when that left no
+    Unknowns, those of a recorded decision still valid for these settings and sources, else the
+    whole ladder. A rung that changes nothing here is the base run again and is left out.
+    """
+    try:
+        base = load_json_optional(plan.run_dir / TUNE_REPORT_DIR / mod.name / "base.json", None)
+    except ArtifactError as exc:
+        mod.warnings.append(f"Eva tuning: {exc}")
+        return
+    if not isinstance(base, dict) or base.get("status") != "ok" or not _has_target_unknowns(base):
+        return
+    mod.tune_timeout = trial_timeout(base.get("elapsed_s"), mod.params.get("eva_timeout"))
+    record = mod.params.get("eva_tuned")
+    if record is not None and record_is_current(record, mod.settings_digest, base.get("input_digest")):
+        wanted = set(recorded_rungs(record))
+    else:
+        wanted = {rung.name for rung in LADDER}
+    plain = mod.rung_options({})
+    for rung in LADDER:
+        options = mod.rung_options(dict(rung.options))
+        if rung.name in wanted and options != plain:
+            mod.tune_rungs[rung.name] = options
 
 
 def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = None) -> Plan:
@@ -620,6 +725,33 @@ include $(S)/../templates/pipeline.mk
 """
 
 
+def _option_words(options: dict) -> str:
+    return " ".join(mk_quote(f"--eva-option={format_option(k, options[k])}") for k in sorted(options))
+
+
+def _eva_tuning_lines(mod: ModulePlan) -> list[str]:
+    n = mod.name
+    tuned = mod.tuned
+    effective = merge_options(mod.base_options, tuned.get("options") or {}) if tuned else mod.base_options
+    loops = [loop_ref_from_json(item) for item in (tuned.get("loops") or [])] if tuned else []
+    loop_words = [mk_quote(f"--loop-unroll={ref.to_arg()}") for ref in sorted(loops)]
+    if loops:
+        loop_words.append(mk_quote(f"--mirror-root=workspace/eva/{n}/tune/mirrors/{mirror_id(loops)}"))
+    lines = [
+        _assign(f"ENTRY_FN_{n}", mk_quote(mod.entry_fn) if mod.entry_fn else ""),
+        _assign(f"EVA_OPTIONS_{n}", _option_words(effective)),
+        _assign(f"EVA_LOOPS_{n}", " ".join(loop_words)),
+        _assign(f"EVA_BASE_OPTIONS_{n}", _option_words(mod.base_options)),
+        _assign(f"EVA_TUNE_DIGEST_{n}", mk_quote(mod.settings_digest)),
+        _assign(f"EVA_TUNE_TIMEOUT_{n}", _opt(mod.tune_timeout)),
+        _assign(f"EVA_LOOP_UNROLL_{n}", mk_quote(str(mod.loop_unroll))),
+        _assign(f"EVA_TUNE_RUNGS_{n}", " ".join(mod.tune_rungs)),
+    ]
+    for rung, options in mod.tune_rungs.items():
+        lines.append(_assign(f"EVA_RUNG_OPTIONS_{n}__{rung}", _option_words(options)))
+    return lines
+
+
 def _module_block(mod: ModulePlan) -> list[str]:
     n, p = mod.name, mod.params
     return [
@@ -632,6 +764,7 @@ def _module_block(mod: ModulePlan) -> list[str]:
         _assign(f"EVA_TAINT_{n}", "1" if p["eva_taint"] else ""),
         _assign(f"EVA_TIMEOUT_{n}", _opt(p["eva_timeout"])),
         _assign(f"EVA_RECURSION_FALLBACK_{n}", "1" if p["eva_recursion_fallback"] else ""),
+        *_eva_tuning_lines(mod),
         _assign(f"FUZZ_BUDGET_{n}", mk_quote(str(p["fuzz_budget"]))),
         _assign(f"FUZZ_MAX_TIME_{n}", _opt(p["fuzz_max_time"])),
         _assign(f"FUZZ_DICT_{n}", _opt(p["fuzz_dict"])),
@@ -709,11 +842,30 @@ def generate(run_dir: Path | str = ".", templates_dir: Path | str | None = None)
 _CLEARED_BY_ZERO = ("eva_mlevel", "eva_timeout", "fuzz_budget", "fuzz_max_time")
 
 
-def params_set(run_dir: Path | str = ".", module: str = "", reset: bool = False, **updates: Any) -> dict:
+def parse_eva_option_updates(texts: list[str]) -> dict[str, Any]:
+    """`name=value` and `name=` (clear) from `params set --eva-option` into a params_set update."""
+    updates: dict[str, Any] = {}
+    for text in texts:
+        name, sep, value = text.partition("=")
+        if sep and not value.strip():
+            if name.strip() not in EVA_OPTIONS:
+                raise ValueError(f"{name.strip()!r} is not an allowed Eva option")
+            updates[name.strip()] = None
+        else:
+            key, parsed = parse_option(text)
+            updates[key] = parsed
+    return updates
+
+
+def params_set(
+    run_dir: Path | str = ".", module: str = "", reset: bool = False, eva_retune: bool = False, **updates: Any
+) -> dict:
     """
     Update one module's overrides. 0 clears eva_mlevel, eva_timeout, fuzz_budget (back to the profile
     default) and fuzz_max_time; an empty fuzz_dict clears the dictionary; `reset` drops every
-    earlier override first. ValueError on an invalid value.
+    earlier override first. `eva_options` updates individual options (None clears one). `eva_retune`
+    forgets the recorded tuning decision, so `eva-tune` searches the ladder again; a change to any
+    other setting Eva analyses under makes that decision stale by itself. ValueError on an invalid value.
     """
     run_dir = Path(run_dir)
     if not MODULE_RE.match(module or ""):
@@ -724,9 +876,22 @@ def params_set(run_dir: Path | str = ".", module: str = "", reset: bool = False,
     with run_lock("params", run_dir=run_dir):
         doc = load_params(run_dir)
         entry = {} if reset else dict(doc["modules"].get(module, {}))
+        if eva_retune:
+            entry.pop("eva_tuned", None)
         for key, value in updates.items():
             if value is None:
                 continue
+            if key == "eva_options":
+                options = dict(entry.get("eva_options") or {})
+                for name, option in value.items():
+                    if option is None:
+                        options.pop(name, None)
+                    else:
+                        options[name] = option
+                value = options
+                if not value:
+                    entry.pop(key, None)
+                    continue
             if (key in _CLEARED_BY_ZERO and value == 0) or (key == "fuzz_dict" and value == ""):
                 entry.pop(key, None)
                 continue
@@ -757,6 +922,17 @@ def params_set(run_dir: Path | str = ".", module: str = "", reset: bool = False,
         "applies": "on the next `pipeline_make.py run` (or `gen`)",
         "warnings": warnings,
     }
+
+
+def record_eva_tuning(run_dir: Path | str, module: str, record: dict) -> None:
+    """Store a module's tuning decision, so `eva` and another machine's `eva-tune` replay it."""
+    problem = tuned_record_problem(record)
+    if problem:
+        raise ValueError(f"eva_tuned {problem}")
+    with run_lock("params", run_dir=Path(run_dir)):
+        doc = load_params(run_dir)
+        doc["modules"].setdefault(module, {})["eva_tuned"] = record
+        atomic_write_json(Path(run_dir) / PARAMS_JSON, doc)
 
 
 def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
@@ -794,11 +970,14 @@ STAGE_OF_TARGET = {
     "selftest": 2,
     "fuzz": 2,
     "eva": 2,
-    "ingest": 3,
-    "replay": 3,
-    "wp-queue": 3,
-    "wp-sweep": 4,
-    "report": 5,
+    "eva-tune-base": 2,
+    # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
+    "eva-tune": 3,
+    "ingest": 4,
+    "replay": 4,
+    "wp-queue": 4,
+    "wp-sweep": 5,
+    "report": 6,
 }
 MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "eva-", "module-")
 _TARGET_OUTPUTS = {
@@ -854,6 +1033,10 @@ def _target_nodes(target: str, plan: Plan) -> list[str]:
         return [f"fuzz-{m}" for m in plan.fuzz_modules]
     if target == "eva":
         return [f"eva-{m}" for m in plan.eva_modules]
+    if target == "eva-tune-base":
+        return [f"evabase-{m}" for m in plan.eva_modules]
+    if target == "eva-tune":
+        return [f"evatune-{m}" for m in plan.eva_modules]
     return [target]
 
 
@@ -878,6 +1061,8 @@ def _node_output(node: str) -> str | None:
         "build": f"{BUILD_DIR}/{mod}.build.json",
         "fuzz": f"{REPORT_DIRS['fuzz']}/{mod}.json",
         "eva": f"{REPORT_DIRS['eva']}/{mod}.json",
+        "evabase": f"{TUNE_REPORT_DIR}/{mod}/base.json",
+        "evatune": f"{REPORT_DIRS['eva']}/{mod}.json",
         "module": INGESTED_JSON,
     }.get(kind)
 
@@ -1024,6 +1209,8 @@ def run_targets(
             "error": f"{MAKEFILE} not found: run `pipeline_make.py gen` first, from the run directory",
         }
     targets = list(dict.fromkeys(targets))
+    if "eva-tune" in targets and "eva-tune-base" not in targets:
+        targets.insert(targets.index("eva-tune"), "eva-tune-base")
     unknown = [t for t in targets if _stage(t) is None]
     if not targets or unknown:
         known = ", ".join([*STAGE_OF_TARGET, *(p + "<mod>" for p in MODULE_TARGET_PREFIXES)])
@@ -1597,6 +1784,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Keep the default: a recursive call without assigns aborts Eva",
     )
     p_set.set_defaults(eva_recursion_fallback=None)
+    p_set.add_argument(
+        "--eva-option",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Allowlisted Eva option (see eva_options.py), for example min-loop-unroll=8; NAME= clears it. Repeatable.",
+    )
+    p_set.add_argument(
+        "--eva-retune",
+        action="store_true",
+        help="Forget the recorded tuning decision, so the next `run eva-tune` searches the ladder again",
+    )
     p_set.add_argument("--fuzz-dict", default=None, help="libFuzzer dictionary, run-relative ('' clears)")
     p_set.add_argument("--fuzz-budget", type=int, default=None, help="Campaign CPU-seconds (0: profile default)")
     p_set.add_argument(
@@ -1650,6 +1849,8 @@ def main(argv: list[str] | None = None) -> int:
                 eva_taint=args.eva_taint,
                 eva_timeout=args.eva_timeout,
                 eva_recursion_fallback=args.eva_recursion_fallback,
+                eva_options=parse_eva_option_updates(args.eva_option) if args.eva_option else None,
+                eva_retune=args.eva_retune,
                 fuzz_dict=args.fuzz_dict,
                 fuzz_budget=args.fuzz_budget,
                 fuzz_max_time=args.fuzz_max_time,

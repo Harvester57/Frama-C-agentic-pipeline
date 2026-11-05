@@ -68,6 +68,7 @@ Memory estimates learn from history. Each container records its peak memory, OOM
 | LibFuzzer campaign | `--workers auto` = min(CPUs, (memory − 512 MiB) / 2.5 GiB); wall time = max(30 s, CPU-second budget / workers). A job limited to less than 3072 MiB (512 MiB overhead + 2560 MiB, i.e. 1.25 × 2048 MiB `-rss_limit_mb`) is not run and reports `status: insufficient_memory` | `-rss_limit_mb 2048`, per-input `-timeout` |
 | Guardrail / replay | single process | `-rss_limit_mb 2048`, per-input `-timeout`, deterministic `-seed` |
 | Eva | 1 CPU; parallelism comes from running modules side by side | `--timeout` from the profile |
+| Eva tuning (`eva-tune`) | 1 CPU per trial; rungs run side by side, loop trials one after another | which trials run. A rung's limit is 8 × the base run's time, a loop trial's 2 × the selected rung's (600 s to 7200 s), so a slower machine gets proportionally longer |
 | Parent re-check (`merge-batch`) | per-function WP runs in a pool: workers = min(n, CPUs, memory / 1768 MiB), each `-wp-par = min(CPUs / workers, (memory / workers − 768 MiB) / 1000 MiB)` | as WP |
 | Make | `-j` = container CPUs; each recipe is admitted by CPU and memory, running against a stage-private copy of `Makefile` and `modules.mk` rendered directly from memory | — |
 
@@ -174,7 +175,7 @@ Set every knob on the host, where you run the wrapper. The container's environme
 | E-ACSL and sanitizer builds of `workspace/work` (Make builds, parent re-checks, verifiers, breakers) | L1: toolchain identity + effective flags + output path + cwd + dependency manifest; L2 (E-ACSL builds): line-shift-normalized dependency manifest | the binary, `instrumented.c`, the fallback object, `compile.log` |
 | Guardrail verdicts (run-local `guardrail` store) | binary sha256 + corpus manifest + `--extra-runs` + `--timeout` + `-seed` + module | `passed_dynamic_oracle`, `rejected_overconstrained`, or `code_fault` verdict |
 | WP prover results | Frama-C's own goal digest (`-wp-cache update -wp-cache-dir state/cache/wp`) | unchanged goals across a prover's iterations and in the parent re-check |
-| Eva reports with status `ok` | toolchain identity + Eva flags + dependency manifest | report JSON, `alarms.csv`, `red_alarms.csv`, `eva.log`, `slice.sarif` |
+| Eva reports with status `ok` | toolchain identity + Eva flags + dependency manifest (the output directory is factored out, so a ladder rung and a later `run eva` with the same options share an entry) | report JSON, `alarms.csv`, `red_alarms.csv`, `eva.log`, `slice.sarif` |
 
 **Toolchain identity** is the image ID, plus a digest of `scripts/` and `templates/`, which are bind-mounted and change without an image rebuild.
 
@@ -201,6 +202,7 @@ python3 /opt/framac-pipeline/scripts/cache.py clear --ns eacsl-build
 The shared store lets later runs reuse builds, Eva results and proofs for unchanged code. Because a forged entry would be trusted later, the store is mounted read-write **only** for these exact commands, which never execute target code:
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
+- `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`
 - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest` (and `… pipeline_make.py ingest`, `… pipeline_make.py run ingest wp-queue`)
 - `python3 /opt/framac-pipeline/scripts/cache.py gc` and `… cache.py stats`
@@ -226,6 +228,7 @@ python3 $S/pipeline_make.py gen                                         # once, 
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run build         # trusted: fills the shared store
 python3 $S/pipeline_make.py run fuzz                                    # \ run these two at the same time,
 python3 $S/pipeline_make.py run eva                                     # /  as two background wrapper calls (ro alongside fuzz; use /opt/framac-pipeline/scripts/pipeline_make.py run eva when running Eva standalone with rw shared cache)
+python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune      # trusted: the Eva ladder, for modules that still have Unknowns
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest        # trusted: ingests reports and publishes evolved fuzz corpora to /framac-cache/corpora/<module>
 python3 $S/pipeline_make.py run replay wp-queue
 ```
@@ -238,7 +241,8 @@ The trusted steps are spelled out in full: only that exact command line gets a w
 | `build` (`build-<mod>`) | E-ACSL / sanitizer compile of every fuzzable module | static |
 | `selftest` | the E-ACSL toolchain canary | dynamic |
 | `fuzz` (`fuzz-<mod>`) | one campaign per module; each depends on `selftest` and its `build-<mod>` | dynamic |
-| `eva` (`eva-<mod>`) | one Eva run per module | static |
+| `eva` (`eva-<mod>`) | one Eva run per module, with its recorded tuning decision if it has one | static |
+| `eva-tune` | the Eva ladder: base run, then rungs, selection, per-loop analysis and combination for modules left with Unknowns; rewrites the module's Eva report and records the decision | static |
 | `ingest` | ingests new reports only (fuzz before Eva), then validates; an expected module without a report gets a `not_run` record (a malformed one is moved aside as `<mod>.json.malformed`) | static |
 | `replay` | replays every unverified candidate's reproducers for the crash verifiers: one report per candidate, plus `workspace/reports/replay/index.json` = `{generated_at, candidates_file, by_fingerprint: {<fingerprint>: {report, module, status}}}` | dynamic |
 | `wp-queue` | `wp_scheduler.py init` | static |
@@ -266,16 +270,73 @@ The trusted steps are spelled out in full: only that exact command line gets a w
   - Reads `callgraph_dag.json`, the harness sidecars and the run profile.
   - Validates every module's flags against an allowlist (`-I -D -U -include -imacros -isystem -iquote -idirafter -std= -O -g -W -f[no-]common -l -L`). A module with any other flag, such as `-fplugin`, `-B`, `-fuse-ld` or `-Wl,`, is excluded with a reason.
 - **Targets are phony.** Repeated runs are cheap because of the caches and because ingestion records report digests in `state/ingested.json`, not because of timestamps, which are coarse on 9p and NFS.
-- **Tuning** that the orchestrator decides (Eva slevel/mlevel, the taint domain, recursion fallback, fuzz dictionaries, budgets) lives in `workspace/build/params.json`:
+- **Tuning** that the orchestrator decides (Eva slevel/mlevel, allowlisted Eva options, the taint domain, recursion fallback, fuzz dictionaries, budgets) lives in `workspace/build/params.json`, next to the decision `eva-tune` records:
 
   ```text
   python3 $S/pipeline_make.py params set --module snmp --eva-slevel 250 --eva-mlevel 4 --eva-taint --eva-timeout 3600
+  python3 $S/pipeline_make.py params set --module snmp --eva-option min-loop-unroll=8 --eva-option split-return=auto
+  python3 $S/pipeline_make.py params set --module snmp --eva-retune    # forget the recorded decision: search again
   python3 $S/pipeline_make.py params set --module snmp --fuzz-dict workspace/dicts/snmp.dict --fuzz-budget 300
   python3 $S/pipeline_make.py params set --module snmp --reset       # back to the profile defaults
   python3 $S/pipeline_make.py params show [--module snmp]
   ```
 
-  A value of `0` clears `--eva-mlevel`, `--fuzz-budget`, `--fuzz-max-time` and `--eva-timeout`, and `''` clears `--fuzz-dict`. Defaults: Eva slevel 100, mlevel 0; a fuzz budget of 60 / 120 / 900 CPU-seconds for quick / standard / deep.
+  A value of `0` clears `--eva-mlevel`, `--fuzz-budget`, `--fuzz-max-time` and `--eva-timeout`, `''` clears `--fuzz-dict`, and `--eva-option name=` clears that option. Defaults: Eva slevel 100, mlevel 0; a fuzz budget of 60 / 120 / 900 CPU-seconds for quick / standard / deep.
+
+### Eva tuning (`eva-tune`)
+
+Every Eva Unknown that survives into Phase 3 costs a prover task, so Eva tuning runs as a deterministic, cached Make step rather than a judgment call. The logic is in [`../scripts/eva_tuning.py`](../scripts/eva_tuning.py), and the ladder and option allowlist are in [`../scripts/eva_options.py`](../scripts/eva_options.py).
+
+**The steps.** `run eva-tune` is two Make stages, with `modules.mk` regenerated in between so only modules left with Unknowns get rung targets:
+
+1. `evabase-<mod>`: the module's own settings. This is the reference for every guard, and identical to `eva-<mod>` until a decision is recorded, so they share a cache entry.
+2. `evarung-<mod>--<rung>`: each ladder rung, side by side. A failed or timed-out rung never blocks the module.
+3. `evatune-<mod>`: applies the guards, selects a run, tries per-loop unrolling, combines, writes `workspace/reports/eva/<mod>.json` and `workspace/reports/eva-tuning/<mod>/decision.json`, and records the decision in `params.json`.
+
+**The ladder** changes one concern per rung, because PARF (Wang et al., JCST 2025, Table A2) found no knob dominant on every program. slevel leads on average (0.490), then domains (0.258, mostly on in the base configuration already), and partition-history helps some programs and hurts others. The last rung is Eva's own all-round recipe. `multidim` stays out of the ladder, because Frama-C calls it experimental and a Valid can end a function's verification; it remains a module option for whoever chooses it.
+
+**Guards.** A run is rejected if any of these holds, and the reason is recorded:
+
+| Guard | Why |
+|---|---|
+| It did not complete | A timeout or crash has no usable statuses |
+| Different `input_digest`, entry, `reduced_checks` or `context-depth` | It is a different analysis |
+| It degenerated | A stopped analysis (signal, failed initialization, stop at an alarm) exits non-zero with no report, so it fails the first guard; a report without Eva's end-of-analysis summary is rejected as a backstop |
+| Any obligation Dead that the base run did not have Dead | Checked per obligation, not by total, so a hidden harness gap cannot cancel out |
+| An obligation newly `Inconsistent`, or more than a quarter of the base run's obligations missing, or inputs that changed during the run | The run's statuses can no longer be compared with the base run's. An alarm Eva stops emitting is normal (at most 14 of 815 measured); a quarter means obligations stopped matching, and absent alarms would look like proofs |
+| Fewer functions analysed, a lower coverage estimate, or the entry no longer reached | Coverage collapse removes alarms: PARF's miniz-ex1 fell from 1,828 alarms to 1 this way |
+| A function newly non-terminating | Eva stopped seeing its return, so what follows is cut |
+
+Red statuses from a run rejected for coverage still reach the report as candidates, because the alarm is often why the coverage was lost.
+
+**Selection** minimizes functions with an Unknown, then Unknowns, then ladder order, counting only rows in target code: a libc function's own row summarizes call sites that have rows of their own, and no ledger unit exists for it.
+
+**Per-loop analysis** follows Loupe's differential analysis (Mattar et al., ASE 2025) without its model. At most 8 trials per module, loop nests of the functions with the most Unknowns first, each with `//@ loop unroll N` on a scratch mirror of the include closure under `workspace/eva/<mod>/tune/mirrors/`. `workspace/work` never changes. The annotation sits on the loop's own line, so obligations keep their identity, and it joins a loop's existing annotation as its first clause, because the kernel rejects a second annotation comment on a loop. A loop is named by file, function and ordinal, so a decision survives ACSL landing above it. N is at least 256, or the harness's maximum input size plus 1 when that is larger: Eva stops at a loop's real bound, so an over-large N costs nothing there.
+
+**Combination** turns an Unknown Valid when any admissible run proves it. No paper states this for Eva, so here is the argument:
+
+- Eva's results hold under the assumption that its alarms hold (Eva manual 5.7, 8.1.2), but only for the execution so far. A Valid status means no execution can violate that property before violating an earlier alarm.
+- So in every sound run, the *first* property a real execution violates is reported as not Valid. If any run proves a property, it cannot be the first one violated. An alarm absent from a run that reached as many statements of that function says the same, since Eva emits one whenever it cannot prove the property.
+- Therefore, if the properties no run proves all hold, no execution violates anything, by induction on its length. Two runs each assuming what the other proves are no circle, because the assumption only reaches back in time.
+- The kernel agrees. Frama-C classifies each Eva parameter as tuning or correctness (`parameters.ml`), and `emitter.mli` says of a tuning parameter that "a valid status cannot become invalid"; `Property_status.emit` keeps the strongest status across runs of one session. Measured on `minmea` with two runs in one session, where each proves obligations the other does not (13 and 7): this combination matches the kernel on 813 of 815 obligation groups and is never weaker. The other 2 are alarms the first run never emitted, so the kernel has no status to keep; that is the absence rule above.
+- The argument needs runs that differ only in tuning. Every rung holds the sources, harness and checks fixed, and `context-depth`, the one allowed correctness parameter, is never varied.
+
+Dead is never counted as a proof, since it is a harness gap. A red status beats any Valid, as it does in the kernel, and the conflict is recorded. The CSV merges identical rows and hides columns, so one key (fingerprint and line) can cover several statements, and it counts as proved only if every row under it is Valid.
+
+**Determinism and replay.** Selection and combination read no clocks. Both proofs and red statuses are unions over completed runs, so a machine that finishes fewer trials discharges a subset of the same obligations and leaves more units `planned`. The one case that can differ is a red status only an unfinished rung would have found, on an obligation another run proves: that statement is unreachable unless an earlier alarm fails, so verifying the candidate finds no witness and the final verdict is the same. `params.json` records the selected options, the kept loops, the runs the report relied on for proofs and red statuses, and the rungs that did not finish, with the digests they were made under. `run eva` then applies the selected configuration, and `run eva-tune` on another machine runs only the recorded trials. Other sources or other module settings, including `--eva-timeout`, mean a new search; `params set --eva-retune` forces one. Bump `LADDER_VERSION` when the ladder changes.
+
+**Measured** with Frama-C 34.0~~dev through `run eva` and `run eva-tune`, one run each on a shared 12-thread machine, counting target code only:
+
+| Target and harness | Functions with Unknown | Unknowns | Valid | Dead | Prover tasks | Time |
+|---|---|---|---|---|---|---|
+| `minmea`, symbolic 80-byte sentence | 8 → 4 | 146 → 81 | 304 → 355 | 175 → 175 | 17 → 14 | 30 s → 791 s |
+| `picohttpparser`, symbolic 32-byte request | 6 → 5 | 81 → 79 | 144 → 144 | 273 → 273 | 25 → 24 | 17 s → 215 s |
+
+- Options cannot fix an imprecise harness. On `jsmn` with a symbolic 16-byte input, every allowlisted option alone left 34 Unknowns in 3 functions, except the `slevel` values that timed out and `remove-redundant-alarms` off (35).
+- A concrete input behaves as Loupe reports. On `jsmn` with the fixed string of its `simple.c`, Eva's defaults leave 45 Unknowns, `-eva-auto-loop-unroll 100` still 45, and full unrolling 0, faster (1.3 s against 3.3 s). The pipeline's base settings already reach 0.
+- That last case shows what the Dead guard costs: Dead rose from 11 to 74 there, legitimately, because a concrete input really does cut branches. From a less precise base, the guard would reject that run. Symbolic harnesses showed no Dead growth in any run measured.
+- On `minmea` and `picohttpparser`, combination discharged nothing beyond the selected run. It costs no extra Eva run, and the pair in the kernel comparison above shows it can matter when no one run dominates.
+- Replay on `minmea` took 8 s with the cache and 352 s from empty caches on the recorded runs, with identical obligations. With every trial limited to 60 s, the search chose another rung and left 138 Unknowns against 83 (all rows), with every Unknown of the full run still Unknown and the same red alarms.
 
 ---
 
@@ -346,6 +407,7 @@ Every container of a run shares the run directory, so shared state is protected 
 | WP report `analysis_error`, `reason: oom_killed` | The prover set exceeded the container's memory. History raises the next lease; the scheduler retries once. Repeated: check `resources.py budget` inside the container. |
 | WP report `analysis_error`, `reason: insufficient_memory` | The job was limited to less than 1768 MiB, usually by a fixed `--memory` / `-Memory` or a very small engine VM. Drop the fixed size or give the engine more memory. |
 | `analysis_timeout` from Eva | The module exceeded the profile's wall-clock limit. Lower the slevel in `params.json` or raise the timeout. |
+| `eva-tune` leaves a module unchanged | Read `tuning.runs` in `workspace/reports/eva/<mod>.json`: each run has a verdict and, if rejected, its reasons. Eva options often cannot help when the harness itself is imprecise, for example a symbolic input length. |
 | Results differ between cache on and off | Run with `FRAMAC_CACHE=off`, compare, and report it: keys are meant to be sound. `cache.py clear` removes entries. |
 | "run dir on a network filesystem" warning | Move the run directory to local disk; NFS and 9p make WP and fuzzing I/O-bound. |
 | Podman (or Docker) refuses a fuzz or guardrail job | The engine reports that it cannot enforce memory or pids limits; with rootless Podman the controller is usually not delegated to your user. Enable delegation, or set `FRAMAC_ALLOW_UNENFORCED_LIMITS=1` knowingly. |

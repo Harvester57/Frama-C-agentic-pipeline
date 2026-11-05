@@ -156,6 +156,9 @@ frama-c/
 │   ├── pipeline_make.py              # Phases 1-4: Generates & runs Makefile for deterministic module work
 │   ├── run_eacsl_fuzz.py             # Phase 1 & 3: E-ACSL + LibFuzzer campaigns, replays, selftest & guardrail
 │   ├── run_eva_slice.py              # Phase 2: Frama-C Eva + RTE runner & SARIF exporter
+│   ├── eva_tuning.py                 # Phase 2: Eva ladder selection, guards and per-obligation combination
+│   ├── eva_options.py                # Phase 2: allowlisted Eva options and the fixed ladder
+│   ├── eva_loops.py                  # Phase 2: per-loop unrolling on a scratch mirror of the sources
 │   ├── wp_scheduler.py               # Phase 3: Dependency-driven WP task scheduler, micro-batch merges & gates
 │   ├── run_wp_function.py            # Phase 3: Per-function Frama-C WP + RTE runner & goal bucketer
 │   ├── contract_negotiator.py        # Phase 3: Cross-function Caller-Callee contract strengthening ledger

@@ -117,8 +117,8 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 - **Cause:** Loop widening or path merging occurred before precision could stabilize, or an external helper function had no ACSL contract (`builtins:missing-spec`).
 - **Fix:**
   1. Check `workspace/eva/<mod>/eva.log` for `missing-spec` warnings. Add a contract stub to `external_stubs.h` for any unmodeled external function so Eva does not widen its return value to `[-inf, +inf]`.
-  2. Increase `--slevel` (e.g., `--slevel 250` or `--slevel 500`) in `/framac-eva` so Eva tracks more separate execution paths before merging states.
-  3. Add `/*@ loop pragma UNROLL 32; */` above small fixed-bound parsing loops in `workspace/work/`.
+  2. Run `pipeline_make.py run eva-tune`, then read `tuning` in `workspace/reports/eva/<mod>.json`. It tries slevel, unrolling and the other precision options as a fixed ladder, and says what helped and why any run was rejected ([`./resources-and-caching.md`](./resources-and-caching.md), Section 6). If nothing helped, look at the harness: a symbolic input length, for one, leaves every option with the same Unknowns.
+  3. For a small fixed-bound parsing loop the ladder did not settle, add `//@ loop unroll 32;` above it in `workspace/work/`. Do not write `loop pragma UNROLL`: the kernel rejects it and the run fails.
 
 ---
 

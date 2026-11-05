@@ -110,6 +110,7 @@ EVA_MLEVEL_cfg :=
 EVA_TAINT_cfg :=
 EVA_TIMEOUT_cfg :=
 EVA_RECURSION_FALLBACK_cfg :=
+@@TUNE_cfg@@
 FUZZ_BUDGET_cfg := 60
 FUZZ_MAX_TIME_cfg :=
 FUZZ_DICT_cfg :=
@@ -124,6 +125,7 @@ EVA_MLEVEL_log :=
 EVA_TAINT_log :=
 EVA_TIMEOUT_log :=
 EVA_RECURSION_FALLBACK_log :=
+@@TUNE_log@@
 FUZZ_BUDGET_log := 60
 FUZZ_MAX_TIME_log :=
 FUZZ_DICT_log :=
@@ -138,6 +140,7 @@ EVA_MLEVEL_snmp :=
 EVA_TAINT_snmp := 1
 EVA_TIMEOUT_snmp :=
 EVA_RECURSION_FALLBACK_snmp :=
+@@TUNE_snmp@@
 FUZZ_BUDGET_snmp := 300
 FUZZ_MAX_TIME_snmp := 30
 FUZZ_DICT_snmp := workspace/dicts/snmp.dict
@@ -180,13 +183,27 @@ SNMP_PARAMS = {
 # ---------------------------------------------------------------------------
 
 
+def _golden_modules_mk(run: Path) -> str:
+    """The golden text with each module's Eva tuning lines: untuned, so no options and no rungs yet."""
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    text = GOLDEN_MODULES_MK
+    for mod, entry in (("cfg", "cfg_parse"), ("log", "log_emit"), ("snmp", "snmp_parse_pdu")):
+        text = text.replace(
+            f"@@TUNE_{mod}@@",
+            f"ENTRY_FN_{mod} := {entry}\nEVA_OPTIONS_{mod} :=\nEVA_LOOPS_{mod} :=\nEVA_BASE_OPTIONS_{mod} :=\n"
+            f"EVA_TUNE_DIGEST_{mod} := {plan.modules[mod].settings_digest}\n"
+            f"EVA_TUNE_TIMEOUT_{mod} :=\nEVA_LOOP_UNROLL_{mod} := 256\nEVA_TUNE_RUNGS_{mod} :=",
+        )
+    return text
+
+
 def test_gen_golden_output(tmp_path):
     run = _make_run(tmp_path, params=SNMP_PARAMS)
 
     out = pm.generate(run, templates_dir=ACSL)
 
     assert out["ok"] is True and out["changed"] is True
-    assert (run / pm.MODULES_MK).read_text(encoding="utf-8") == GOLDEN_MODULES_MK
+    assert (run / pm.MODULES_MK).read_text(encoding="utf-8") == _golden_modules_mk(run)
     assert (run / pm.MAKEFILE).read_text(encoding="utf-8") == pm.MAKEFILE_TEXT
     assert "include $(S)/../templates/pipeline.mk" in pm.MAKEFILE_TEXT
     assert out["fuzz_modules"] == ["cfg", "log", "snmp"] and out["eva_modules"] == ["cfg", "log", "snmp"]
