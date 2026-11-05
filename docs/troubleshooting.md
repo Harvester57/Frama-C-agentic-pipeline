@@ -118,7 +118,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 - **Fix:**
   1. Check `workspace/eva/<mod>/eva.log` for `missing-spec` warnings. Add a contract stub to `external_stubs.h` for any unmodeled external function so Eva does not widen its return value to `[-inf, +inf]`.
   2. Increase `--slevel` (e.g., `--slevel 250` or `--slevel 500`) in `/framac-eva` so Eva tracks more separate execution paths before merging states.
-  3. Add `/*@ loop pragma UNROLL 32; */` above small fixed-bound parsing loops in `workspace/work/`.
+  3. Add `//@ loop unroll 32;` above small fixed-bound parsing loops in `workspace/work/`.
 
 ---
 

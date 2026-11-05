@@ -43,7 +43,7 @@ python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <
 Tuning is your judgment call. Make applies it: record per-module parameters in `workspace/build/params.json`, then re-run the `eva` target (or `module-<mod>`).
 - **Low discharge rate:** if a `Tier 1A` or `Tier 1B` module discharges unusually little (< 70% Valid) because of loop widening:
   - raise the slevel: `python3 /opt/framac-pipeline/scripts/pipeline_make.py params set --module <mod> --eva-slevel 250`;
-  - or add `/*@ loop pragma UNROLL 64; */` above bounded fixed-size header loops in `workspace/work/`.
+  - or add `//@ loop unroll 64;` above bounded fixed-size header loops in `workspace/work/`.
 - **Dynamic memory allocation (`Tier 2` heap/tree parsers):** by default, Eva merges dynamic allocations (`malloc`/`calloc`/`realloc`) at the same callstack (`-eva-mlevel 0`) into weak bases (`__malloc_w_*`), causing spurious aliasing on loop/tree/list/JSON/ASN.1 allocations. Unroll allocation sites per callstack with `params set --module <mod> --eva-mlevel 4` (or `--mlevel <K>` on `run_eva_slice.py`).
 - **Recursive call cycles without `assigns` specs (`Tier 2`):** if Eva aborts on a mutually recursive call cycle (`assigns:missing`), enable the recursion fallback for that module with `params set --module <mod> --eva-recursion-fallback` (which passes `--allow-incomplete-recursion-specs` / `-eva-warn-key assigns:missing=warning` and records the assumption in `reduced_checks`).
 - **Taint:** if Layer 6 (Secret Non-Interference / Taint) properties are active on the module, enable the taint domain with `params set --module <mod> --eva-taint`. It adds `taint` to `-eva-domains`, so `!\tainted(...)` assertions at network emission sinks get verified.
