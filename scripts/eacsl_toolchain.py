@@ -174,6 +174,8 @@ def defines_fuzzer_initialize(c_text: str) -> bool:
 _WRAPPER_HEADER_RE = re.compile(r"^[A-Za-z_][^;{}]*\b__gen_e_acsl_\w+\s*\(")
 _RETRES_ASSIGN_RE = re.compile(r"^(?P<indent>\s+)__retres = ")
 WRAPPER_RESULT_INIT = "__e_acsl_initialize((void *)(& __retres),sizeof(__retres));"
+WRAPPER_RESULT_INIT_DECL = "void __e_acsl_initialize(void *ptr, size_t size);"
+_INITIALIZE_DECL_RE = re.compile(r"\bvoid\s+__e_acsl_initialize\s*\(\s*void\s*\*")
 
 
 def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
@@ -183,19 +185,24 @@ def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
     Under -rte-initialized every `ensures` that reads \\result then fails `\\initialized(&__retres)`
     on the first input. Insert the missing `__e_acsl_initialize` after each assignment to a
     registered `__retres` inside a wrapper definition. Sound: the callee's own return is checked
-    for uninitialized reads. Returns the new text and the number of insertions.
+    for uninitialized reads. Frama-C prunes the runtime prototype unless E-ACSL emitted a call of its
+    own (a `memcpy` or an array-element write does; plain scalars, or `malloc` alone, do not), so
+    declare it ahead of the first patched wrapper when it is missing. Returns the new text and the
+    number of insertions.
     """
     lines = c_text.split("\n")
     out: list[str] = []
     header = False  # inside a wrapper header, before its `{` (a `;` first means a prototype)
     in_wrapper = tracked = False
     indent: str | None = None  # inside a `__retres = ...` statement, until its `;`
+    wrapper_at = first_patched_at = 0  # index in `out` of the current / first patched wrapper's header
     count = 0
     for idx, line in enumerate(lines):
         out.append(line)
         if not in_wrapper:
             if not header and _WRAPPER_HEADER_RE.match(line) and not line.rstrip().endswith(";"):
                 header = True
+                wrapper_at = len(out) - 1
             elif header and line.rstrip() == "{":
                 header, in_wrapper, tracked = False, True, False
             elif header and line.rstrip().endswith(";"):
@@ -218,8 +225,12 @@ def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
             )
             if not already_init:
                 out.append(indent + WRAPPER_RESULT_INIT)
+                if not count:
+                    first_patched_at = wrapper_at
                 count += 1
             indent = None
+    if count and not _INITIALIZE_DECL_RE.search("\n".join(out[:first_patched_at])):
+        out[first_patched_at:first_patched_at] = [WRAPPER_RESULT_INIT_DECL, ""]
     return "\n".join(out), count
 
 

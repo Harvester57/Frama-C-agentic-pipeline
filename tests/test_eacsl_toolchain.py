@@ -221,6 +221,41 @@ def test_contract_wrappers_mark_their_result_initialized():
     )
 
 
+def test_wrapper_patch_declares_the_runtime_function_frama_c_pruned():
+    # No `__e_acsl_initialize` call of E-ACSL's own means no prototype, and Clang rejects the inserted call.
+    patched, n = T.mark_wrapper_results_initialized(WRAPPER_C)
+    lines = patched.split("\n")
+    assert n == 1 and lines.count(T.WRAPPER_RESULT_INIT_DECL) == 1
+    # At file scope: right before the wrapper definition, so after the prototype and ahead of the call.
+    decl_at = lines.index(T.WRAPPER_RESULT_INIT_DECL)
+    assert lines[decl_at + 2] == "int __gen_e_acsl_checksum(uint8_t const *buf,"
+    assert decl_at < lines.index("  " + T.WRAPPER_RESULT_INIT)
+    assert T.mark_wrapper_results_initialized(patched) == (patched, 0)
+    # One declaration however many wrappers are patched.
+    patched, n = T.mark_wrapper_results_initialized(WRAPPER_C + WRAPPER_C.replace("checksum", "other"))
+    assert n == 2 and patched.split("\n").count(T.WRAPPER_RESULT_INIT_DECL) == 1
+    # A prototype after the wrapper is too late for Clang: only one ahead of it counts.
+    late = WRAPPER_C + "void __e_acsl_initialize(void *ptr,\n                         size_t size);\n"
+    assert T.WRAPPER_RESULT_INIT_DECL in T.mark_wrapper_results_initialized(late)[0]
+
+
+def test_wrapper_patch_keeps_frama_c_prototype_when_it_was_not_pruned():
+    # Printed as Frama-C prints it, over two lines: such a slice only gets the call, as before.
+    kept = (
+        " __attribute__((__FC_BUILTIN__)) void __e_acsl_initialize(void *ptr,\n"
+        "                                                          size_t size);\n\n" + WRAPPER_C
+    )
+    patched, n = T.mark_wrapper_results_initialized(kept)
+    assert n == 1 and T.WRAPPER_RESULT_INIT in patched and T.WRAPPER_RESULT_INIT_DECL not in patched
+    # A call is not a declaration, and nothing is declared when nothing is patched.
+    upstream_fixed = WRAPPER_C.replace(
+        "                      len);\n",
+        "                      len);\n  __e_acsl_initialize((void *)(& __retres),sizeof(int));\n",
+    )
+    assert T.mark_wrapper_results_initialized(upstream_fixed) == (upstream_fixed, 0)
+    assert T.WRAPPER_RESULT_INIT_DECL not in upstream_fixed
+
+
 def test_the_build_patches_wrappers_only_when_uninitialized_reads_are_checked(tmp_path, modern_cli):
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=FakeEacslGcc(WRAPPER_C))
     assert res["returncode"] == 0 and res["wrapper_result_inits"] == 1
