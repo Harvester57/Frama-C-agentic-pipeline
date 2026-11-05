@@ -79,7 +79,6 @@ DEFAULT_AUTO_LOOP_UNROLL = 32
 _DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 _PTR_FUNC_DEF_RE = re.compile(
-    r"(?:^|\n)\s*(?:(?:static|inline|__inline__|extern|[A-Za-z_][A-Za-z0-9_]*)\s+)*"
     r"\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{",
 )
 _FUNC_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -113,6 +112,10 @@ def detect_alloc_wrappers(sources: Iterable[str | Path]) -> list[str]:
         for m_fn in _PTR_FUNC_DEF_RE.finditer(text):
             name = m_fn.group(1)
             if name in _BASE_ALLOCATORS or name in ("if", "while", "for", "switch"):
+                continue
+            line_start = text.rfind("\n", 0, m_fn.start()) + 1
+            prefix = text[line_start : m_fn.start()].strip()
+            if prefix and not all(tok.isidentifier() for tok in prefix.split()):
                 continue
             brace_start = m_fn.end() - 1
             depth = 0

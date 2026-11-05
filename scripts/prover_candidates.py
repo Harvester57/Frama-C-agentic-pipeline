@@ -33,7 +33,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import sys
 import tempfile
 import threading
@@ -158,13 +157,11 @@ def _write_under(scratch: Path, rel: str, blob: bytes) -> None:
     _refuse_symlinked_parents(scratch, rel)
     dest = scratch / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
-    mode = stat.S_IMODE(dest.stat().st_mode) if dest.is_file() and not dest.is_symlink() else 0o644
     # Not a source suffix: a leftover temporary must not read as a new file of the overlay.
     fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".tmp_", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(blob)
-        os.chmod(tmp, mode)
         os.replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):

@@ -751,7 +751,9 @@ def test_mechanical_verifier_result_passes_the_agent_result_contract(tmp_path, m
 
 
 def _git(path: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", *args], cwd=path, check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 @pytest.mark.unit
