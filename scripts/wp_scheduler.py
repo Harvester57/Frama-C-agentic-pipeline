@@ -149,7 +149,7 @@ def _over_budget_tasks(state: dict, now: float | None = None) -> list[dict]:
 
 _PLACEHOLDER_RE = re.compile(
     r"\{(agent_id|module_name|header_file|c_file|function_name|wave_index|scratch_module_sources|module_sources|"
-    r"cppflags|ldflags|security_properties_json|untrusted_entry_functions_json|coverage_ids_json|"
+    r"cppflags|scratch_cppflags|ldflags|security_properties_json|untrusted_entry_functions_json|coverage_ids_json|"
     r"unknown_obligations_json|reachability|max_retries|unproven_goals_json|candidate_fingerprint|candidate_short|"
     r"candidate_json|target_dir|run_dir)\}"
 )

@@ -53,6 +53,7 @@ How resources are measured and how caches work: [resources-and-caching.md](../..
 - **Locks:** shared state is protected by run-wide locks; merges are journaled, so a killed merge is rolled back by the next one ([resources-and-caching.md](../../docs/resources-and-caching.md), Section 8).
 - **Preparation:** the scheduler prepares agents concurrently via a thread pool (`next --prepare` or `step --prepare`).
   - It snapshots `workspace/work/` into `agents/<agent-id>/scratch/work/` under the `merge` lock.
+  - The agent's own oracle commands read that copy: their flags put a scratch twin before each include directory of the source tree. `merge-agent` keeps the module's flags, because the parent re-checks the merged tree.
   - It moves the prover's planned units to `in_progress` with a compare-and-set, so a unit that just became a `candidate` is never handed out.
   - It renders `agents/<agent-id>/brief.md` with every template variable filled, including the host paths the agent needs for the wrapper.
 - **Agent outputs:** every subagent writes only under `agents/<agent-id>/scratch/`, writes its final JSON result to `agents/<agent-id>/scratch/result.json` (which `wp_scheduler.py complete --agent-id <agent-id>` reads from disk and validates with `validate_artifacts.py agent-result`), and returns **one JSON object**.

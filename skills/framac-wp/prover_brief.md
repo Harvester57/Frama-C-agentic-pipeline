@@ -134,7 +134,7 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
 
 1. **Oracle 1 — Dynamic Anti-Hallucination Guardrail (`E-ACSL`):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --functions {function_name} --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags='-Iagents/{agent_id}/scratch/work {cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --functions {function_name} --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
    ```
    - The shared corpus is replayed read-only; new units and artifacts stay in your scratch directory.
    - `--functions {function_name}` instruments only your function: its contract, loop annotations and RTE checks. That makes each iteration about an order of magnitude faster than instrumenting the whole module. The parent's re-check after the merge instruments the whole module.
@@ -144,7 +144,7 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
 
 2. **Oracle 2 — Deductive Verification (`Frama-C WP + RTE`):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_wp_function.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --out-dir agents/{agent_id}/scratch/wp --cppflags='-Iagents/{agent_id}/scratch/work {cppflags}' --out-json agents/{agent_id}/scratch/wp_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_wp_function.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --out-dir agents/{agent_id}/scratch/wp --cppflags='{scratch_cppflags}' --out-json agents/{agent_id}/scratch/wp_{function_name}.json
    ```
    - `proven_under_hyp_count` goals rely on callee contracts; they are acceptable but are recorded as assumptions.
    - Concurrent provers (`-wp-par`) are sized automatically from your container's CPUs and memory.

@@ -56,6 +56,7 @@ from framac_common import (  # noqa: E402
     load_json_strict,
     normalize_flag_args,
     run_lock,
+    scratch_first_cppflags,
     utc_now,
 )
 from resources import (  # noqa: E402
@@ -1759,6 +1760,11 @@ def prepare_agent(
         "{scratch_module_sources}": scratch_sources_str,
         "{module_sources}": module_sources_str,
         "{cppflags}": eff_cppflags,
+        # What an agent's own oracles use, so that they read its scratch headers. merge_cmd keeps
+        # the module's flags: the parent re-checks the merged tree.
+        "{scratch_cppflags}": scratch_first_cppflags(
+            f"-Iagents/{agent_id}/scratch/work {eff_cppflags}", run_dir, agent_root / "scratch" / "work"
+        ),
         "{ldflags}": eff_ldflags,
         "{security_properties_json}": json.dumps(sec_props),
         "{untrusted_entry_functions_json}": json.dumps(untrusted_entries),

@@ -7,6 +7,7 @@ Shared helpers for the Frama-C pipeline scripts (stdlib only).
   differ between Frama-C releases ("property kind" vs "kind", "Valid under hyp."
   vs "Valid_under_hyp").
 - Safe run-relative path checks used by validators and ingestion.
+- `scratch_first_flags()`: preprocessor flags that read an agent's scratch copy of the source tree.
 - `run_lock()`: an exclusive lock on run-dir state shared by every container of a run.
 """
 
@@ -16,7 +17,9 @@ import contextlib
 import csv
 import json
 import os
+import posixpath
 import re
+import shlex
 import shutil
 import socket
 import tempfile
@@ -327,6 +330,115 @@ def to_run_relative(path: Path, run_dir: Path) -> str:
         return p.resolve().relative_to(Path(run_dir).resolve()).as_posix()
     except ValueError:
         return Path(path).as_posix()
+
+
+# ---------------------------------------------------------------------------
+# Preprocessor flags for a scratch copy of the source tree
+# ---------------------------------------------------------------------------
+
+_INCLUDE_DIR_OPTIONS = ("-I", "-iquote", "-isystem", "-idirafter")
+_FORCE_INCLUDE_OPTIONS = ("-include", "-imacros")
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:/)")
+_TREE_TAIL_RE = re.compile(r"^(?:workspace/work|agents/[^/]+/scratch/work)/(.+)$")
+_SHELL_WORD_RE = re.compile(r"""(?:[^\s"'\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+""", re.DOTALL)
+
+
+def source_tree_relpath(path: str, run_dir: Path, work_dir: Path) -> str | None:
+    """
+    `path` relative to the source tree it is in: `work_dir`, the shared `workspace/work`, any agent's
+    `scratch/work`, or `/target`. None when it is outside them (`workspace/stubs`, libc, tool headers).
+    A relative path is read from the run directory, where the pipeline's commands run.
+    """
+    run_posix = Path(run_dir).as_posix().rstrip("/")
+    work_posix = Path(work_dir).as_posix().rstrip("/")
+    norm = path.replace("\\", "/")
+    if not _ABSOLUTE_PATH_RE.match(norm):
+        norm = f"{run_posix}/{norm}"
+    norm = posixpath.normpath(norm)
+    if norm.startswith(f"{work_posix}/"):
+        return norm[len(work_posix) + 1 :]
+    for root in (run_posix, "/framac-run"):
+        if norm.startswith(f"{root}/"):
+            m = _TREE_TAIL_RE.match(norm[len(root) + 1 :])
+            if m:
+                return m.group(1)
+    if norm.startswith("/target/"):
+        return norm[len("/target/") :]
+    return None
+
+
+def scratch_first_flags(flags: list[str], run_dir: Path, work_dir: Path) -> list[str]:
+    """
+    Preprocessor flags for tools that run on the scratch copy `work_dir`, so that what an agent
+    wrote in its scratch headers is what they read:
+
+    - An include directory of a source tree gets its twin in `work_dir` just before it, with the same
+      option: the search order goes by option (`-iquote` comes before every `-I`). Both copies hold
+      the same files, so the same directory wins as with the original flags, only in `work_dir`.
+    - A `-include` or `-imacros` file under a source tree is replaced by its twin. Adding the twin
+      would read both copies, and the first one's include guard would hide the other.
+
+    Everything else keeps its place and spelling. A path with no twin in `work_dir` stays as it is.
+    """
+    run_dir = Path(run_dir)
+    work_dir = Path(work_dir)
+    out: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(flags):
+        word = flags[i]
+        option = next((o for o in (*_INCLUDE_DIR_OPTIONS, *_FORCE_INCLUDE_OPTIONS) if word.startswith(o)), None)
+        joined = option is not None and len(word) > len(option)
+        if option is None or (not joined and i + 1 >= len(flags)):
+            out.append(word)
+            i += 1
+            continue
+        path = word[len(option) :] if joined else flags[i + 1]
+        spelled = flags[i : i + (1 if joined else 2)]
+        i += len(spelled)
+        if option in _FORCE_INCLUDE_OPTIONS:
+            rel = source_tree_relpath(path, run_dir, work_dir)
+            twin = work_dir / rel if rel is not None else None
+            if twin is None or not twin.is_file():
+                out.extend(spelled)
+            else:
+                twin_arg = to_run_relative(twin, run_dir)
+                out.extend([f"{option}{twin_arg}"] if joined else [option, twin_arg])
+            continue
+        # The `/_` keeps a flag naming the root of a tree inside that tree.
+        rel = source_tree_relpath(f"{path.rstrip('/')}/_", run_dir, work_dir)
+        twin = work_dir / rel[:-1] if rel is not None else None
+        if twin is not None and twin.is_dir():
+            twin_arg = to_run_relative(twin, run_dir)
+            twin_flag = f"{option}{twin_arg}"
+            if twin_flag not in seen and posixpath.normpath(path) != posixpath.normpath(twin_arg):
+                out.append(twin_flag)
+            seen.add(twin_flag)
+        out.extend(spelled)
+    return out
+
+
+def scratch_first_cppflags(cppflags: str, run_dir: Path, work_dir: Path) -> str:
+    """
+    `scratch_first_flags` for a flag string that goes into a shell command. Words it keeps stay as
+    written, because a brief embeds the string in single quotes: re-quoting `-DNAME=\\"x\\"` would
+    change what it means there. A string whose quoting does not parse stays as it is.
+    """
+    try:
+        tokens = shlex.split(cppflags)
+    except ValueError:
+        return cppflags
+    words = _SHELL_WORD_RE.findall(cppflags)
+    if len(words) != len(tokens):
+        return cppflags
+    written = dict(zip(tokens, words, strict=True))
+
+    def spell(token: str) -> str:
+        if token in written:
+            return written[token]
+        return token if shlex.quote(token) == token else '"' + re.sub(r'(["\\$`])', r"\\\1", token) + '"'
+
+    return " ".join(spell(token) for token in scratch_first_flags(tokens, run_dir, work_dir))
 
 
 def resolve_fc_stubs_dir() -> Path | None:
