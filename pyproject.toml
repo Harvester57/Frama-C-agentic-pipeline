@@ -25,6 +25,9 @@ ignore = ["E501"]
 [tool.ruff.lint.isort]
 known-first-party = [
     "acsl_ast",
+    "benchmark",
+    "benchmark_briefs",
+    "benchmark_compare",
     "build_callgraph_dag",
     "cache",
     "checkpoint",

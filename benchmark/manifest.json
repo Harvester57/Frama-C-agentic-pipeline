@@ -1,0 +1,1131 @@
+{
+ "version": 1,
+ "profile": "standard",
+ "defaults": {
+  "fuzz_budget_cpu_s": 60,
+  "eva_timeout_s": 1800
+ },
+ "targets": [
+  {
+   "id": "minmea",
+   "set": "recall",
+   "repo_name": "minmea",
+   "url": "https://github.com/kosma/minmea.git",
+   "revision": "c43c9e7c5ed788122a9d8a5445679e1594f8a030",
+   "checkout": "minmea",
+   "scope": [
+    "minmea.c",
+    "minmea.h"
+   ],
+   "modules": [
+    {
+     "name": "minmea",
+     "harness": {
+      "sources": [
+       "minmea.c"
+      ],
+      "header": "minmea.h",
+      "entry_fn": "minmea_sentence_id",
+      "entry_style": "custom",
+      "max_input_size": 128,
+      "cppflags": "-Iworkspace/work -D_POSIX_C_SOURCE=199309L -D_BSD_SOURCE -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "null_terminate": true,
+      "contract_notes": [
+       "Entry contract: NUL-terminated NMEA sentence of at most 128 bytes; all publics in minmea.h are exercised from the parser trust boundary."
+      ],
+      "call_expr": "const char *s; struct minmea_sentence_gbs gbs; struct minmea_sentence_rmc rmc; struct minmea_sentence_gga gga; struct minmea_sentence_gsa gsa; struct minmea_sentence_gll gll; struct minmea_sentence_gst gst; struct minmea_sentence_gsv gsv; struct minmea_sentence_vtg vtg; struct minmea_sentence_zda zda; char talker[3]; struct tm tmv; struct timespec tsp; enum minmea_sentence_id sid; s = (const char *)fuzz_buf; memset(&gbs,0,sizeof(gbs)); memset(&rmc,0,sizeof(rmc)); memset(&gga,0,sizeof(gga)); memset(&gsa,0,sizeof(gsa)); memset(&gll,0,sizeof(gll)); memset(&gst,0,sizeof(gst)); memset(&gsv,0,sizeof(gsv)); memset(&vtg,0,sizeof(vtg)); memset(&zda,0,sizeof(zda)); memset(talker,0,sizeof(talker)); memset(&tmv,0,sizeof(tmv)); memset(&tsp,0,sizeof(tsp)); (void)minmea_checksum(s); (void)minmea_check(s,false); (void)minmea_check(s,true); sid = minmea_sentence_id(s,false); (void)minmea_sentence(sid); (void)minmea_talker_id(talker,s); (void)minmea_parse_gbs(&gbs,s); (void)minmea_parse_rmc(&rmc,s); (void)minmea_parse_gga(&gga,s); (void)minmea_parse_gsa(&gsa,s); (void)minmea_parse_gll(&gll,s); (void)minmea_parse_gst(&gst,s); (void)minmea_parse_gsv(&gsv,s); (void)minmea_parse_vtg(&vtg,s); (void)minmea_parse_zda(&zda,s); (void)minmea_getdatetime(&tmv,&zda.date,&rmc.time); (void)minmea_gettime(&tsp,&zda.date,&rmc.time);"
+     },
+     "params": {
+      "fuzz_rte_initialized": false
+     }
+    }
+   ]
+  },
+  {
+   "id": "qcbor-dev",
+   "set": "recall",
+   "repo_name": "QCBOR",
+   "url": "https://github.com/laurencelundblade/QCBOR.git",
+   "revision": "9bd08456d46ac5fbaa7822420fd3e25e0e9c486f",
+   "checkout": "qcbor-dev",
+   "scope": [
+    "src",
+    "inc"
+   ],
+   "assets": [
+    {
+     "path": "qcbor/qcbor_isnan_compat.h",
+     "to": "workspace/harnesses/qcbor_isnan_compat.h"
+    }
+   ],
+   "modules": [
+    {
+     "name": "UsefulBuf",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c"
+      ],
+      "header": "UsefulBuf.h",
+      "entry_fn": "UsefulOutBuf_Init",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ UsefulOutBuf ob; uint8_t store[1024]; UsefulInputBuf ib; UsefulBufC in; in.ptr = fuzz_buf; in.len = fuzz_len; UsefulOutBuf_Init(&ob, (UsefulBuf){store, sizeof(store)}); UsefulOutBuf_AppendUsefulBuf(&ob, in); (void)UsefulOutBuf_OutUBuf(&ob); UsefulInputBuf_Init(&ib, in); (void)UsefulInputBuf_GetUint64(&ib); }"
+     },
+     "params": {
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "ieee754",
+     "harness": {
+      "sources": [
+       "workspace/work/src/ieee754.c"
+      ],
+      "header": "ieee754.h",
+      "entry_fn": "IEEE754_DoubleToSmaller",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/src -Iworkspace/work/inc -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "internal_api",
+      "include_source": true,
+      "eva_expr": "{ uint16_t h; uint32_t u; double d; Frama_C_make_unknown((char *)&h, sizeof(h)); Frama_C_make_unknown((char *)&u, sizeof(u)); Frama_C_make_unknown((char *)&d, sizeof(d)); (void)IEEE754_HalfToDouble(h); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d); (void)IEEE754_SingleToHalf(u); }",
+      "fuzz_expr": "{ uint16_t h = 0; uint32_t u = 0; double d = 0.0; if (fuzz_len >= 2) { memcpy(&h, fuzz_buf, 2); } (void)IEEE754_HalfToDouble(h); if (fuzz_len >= 8) { memcpy(&d, fuzz_buf, 8); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d); } else if (fuzz_len == 4) { memcpy(&u, fuzz_buf, 4); (void)IEEE754_SingleToHalf(u); } }"
+     }
+    },
+    {
+     "name": "qcbor_main_decode",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c",
+       "workspace/work/src/ieee754.c",
+       "workspace/work/src/qcbor_main_decode.c",
+       "workspace/work/src/qcbor_number_decode.c",
+       "workspace/work/src/qcbor_spiffy_decode.c",
+       "workspace/work/src/qcbor_tag_decode.c"
+      ],
+      "header": "qcbor.h",
+      "entry_fn": "QCBORDecode_Init",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ QCBORDecodeContext ctx; QCBORItem item; UsefulBufC input; input.ptr = fuzz_buf; input.len = fuzz_len; QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); while (QCBORDecode_GetNext(&ctx, &item) == QCBOR_SUCCESS) { } (void)QCBORDecode_Finish(&ctx); }"
+     },
+     "params": {
+      "eva_recursion_fallback": true,
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "qcbor_main_encode",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c",
+       "workspace/work/src/ieee754.c",
+       "workspace/work/src/qcbor_main_encode.c",
+       "workspace/work/src/qcbor_number_encode.c"
+      ],
+      "header": "qcbor.h",
+      "entry_fn": "QCBOREncode_Init",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "internal_api",
+      "call_expr": "{ QCBOREncodeContext ctx; UsefulBufC out; uint8_t store[2048]; UsefulBufC in; in.ptr = fuzz_buf; in.len = fuzz_len; QCBOREncode_Init(&ctx, (UsefulBuf){store, sizeof(store)}); QCBOREncode_AddBytes(&ctx, in); QCBOREncode_AddInt64(&ctx, (int64_t)fuzz_len); (void)QCBOREncode_Finish(&ctx, &out); }"
+     },
+     "params": {
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "qcbor_number_decode",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c",
+       "workspace/work/src/ieee754.c",
+       "workspace/work/src/qcbor_main_decode.c",
+       "workspace/work/src/qcbor_number_decode.c",
+       "workspace/work/src/qcbor_spiffy_decode.c",
+       "workspace/work/src/qcbor_tag_decode.c"
+      ],
+      "header": "qcbor.h",
+      "entry_fn": "QCBORDecode_GetInt64",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ QCBORDecodeContext ctx; UsefulBufC input; int64_t v = 0; uint64_t u = 0; double d = 0.0; UsefulBufC bn; bool neg = false; int64_t nExp = 0; int64_t nEpoch = 0; uint8_t mant_buf[64]; input.ptr = fuzz_buf; input.len = fuzz_len; QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetInt64(&ctx, &v); QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetUInt64(&ctx, &u); QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetDouble(&ctx, &d); QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetBignum(&ctx, QCBOR_TAG_REQUIREMENT_OPTIONAL_TAG, &bn, &neg); QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetTDecimalFractionBigMantissa(&ctx, QCBOR_TAG_REQUIREMENT_OPTIONAL_TAG, (UsefulBuf){mant_buf, sizeof(mant_buf)}, &bn, &neg, &nExp); QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetTBigFloatBigMantissa(&ctx, QCBOR_TAG_REQUIREMENT_OPTIONAL_TAG, (UsefulBuf){mant_buf, sizeof(mant_buf)}, &bn, &neg, &nExp); QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); QCBORDecode_GetEpochDate(&ctx, QCBOR_TAG_REQUIREMENT_OPTIONAL_TAG, &nEpoch); }"
+     },
+     "params": {
+      "eva_recursion_fallback": true,
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "qcbor_number_encode",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c",
+       "workspace/work/src/ieee754.c",
+       "workspace/work/src/qcbor_main_encode.c",
+       "workspace/work/src/qcbor_number_encode.c"
+      ],
+      "header": "qcbor.h",
+      "entry_fn": "QCBOREncode_AddDouble",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "internal_api",
+      "call_expr": "{ QCBOREncodeContext ctx; UsefulBufC out; uint8_t store[2048]; uint16_t h = 0; float f = 0.0f; double d = 0.0; if (fuzz_len >= 2) { memcpy(&h, fuzz_buf, 2); } f = (float)(h & 0x3ffu) / 4.0f; d = (double)f; QCBOREncode_Init(&ctx, (UsefulBuf){store, sizeof(store)}); QCBOREncode_AddInt64(&ctx, (int64_t)fuzz_len); QCBOREncode_AddDouble(&ctx, d); QCBOREncode_AddFloat(&ctx, f); (void)QCBOREncode_Finish(&ctx, &out); }"
+     },
+     "params": {
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "qcbor_spiffy_decode",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c",
+       "workspace/work/src/ieee754.c",
+       "workspace/work/src/qcbor_main_decode.c",
+       "workspace/work/src/qcbor_number_decode.c",
+       "workspace/work/src/qcbor_spiffy_decode.c",
+       "workspace/work/src/qcbor_tag_decode.c"
+      ],
+      "header": "qcbor.h",
+      "entry_fn": "QCBORDecode_EnterMap",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "untrusted_surface",
+      "extra_includes": [
+       "qcbor_spiffy_decode.h"
+      ],
+      "call_expr": "{ QCBORDecodeContext ctx; QCBORItem item; UsefulBufC input; int64_t v = 0; input.ptr = fuzz_buf; input.len = fuzz_len; QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); if (QCBORDecode_GetNext(&ctx, &item) == QCBOR_SUCCESS) { QCBORDecode_EnterMap(&ctx, &item); QCBORDecode_GetInt64InMapN(&ctx, 0, &v); QCBORDecode_ExitMap(&ctx); } }"
+     },
+     "params": {
+      "eva_recursion_fallback": true,
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "qcbor_tag_decode",
+     "harness": {
+      "sources": [
+       "workspace/work/src/UsefulBuf.c",
+       "workspace/work/src/ieee754.c",
+       "workspace/work/src/qcbor_main_decode.c",
+       "workspace/work/src/qcbor_spiffy_decode.c",
+       "workspace/work/src/qcbor_tag_decode.c"
+      ],
+      "header": "qcbor.h",
+      "entry_fn": "QCBORDecode_GetNthTagOfLast",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/inc/qcbor -Iworkspace/work/inc -Iworkspace/work/src -include workspace/harnesses/qcbor_isnan_compat.h",
+      "ldflags": "-lm",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ QCBORDecodeContext ctx; QCBORItem item; UsefulBufC input; input.ptr = fuzz_buf; input.len = fuzz_len; QCBORDecode_Init(&ctx, input, QCBOR_DECODE_MODE_NORMAL); if (QCBORDecode_GetNext(&ctx, &item) == QCBOR_SUCCESS) { (void)QCBORDecode_GetNthTagOfLast(&ctx, 0); (void)QCBORDecode_GetNthTagOfLast(&ctx, 1); } }"
+     },
+     "params": {
+      "eva_recursion_fallback": true,
+      "fuzz_rte_initialized": false
+     }
+    }
+   ]
+  },
+  {
+   "id": "qcbor-master",
+   "set": "recall",
+   "repo_name": "QCBOR",
+   "url": "https://github.com/laurencelundblade/QCBOR.git",
+   "revision": "572a567d02bcfde42f5863f6a515131cc270798d",
+   "checkout": "qcbor-master",
+   "scope": [
+    "src/ieee754.c",
+    "src/ieee754.h"
+   ],
+   "assets": [
+    {
+     "path": "qcbor/qcbor_isnan_compat.h",
+     "to": "workspace/harnesses/qcbor_isnan_compat.h"
+    }
+   ],
+   "modules": [
+    {
+     "name": "ieee754",
+     "harness": {
+      "sources": [
+       "workspace/work/src/ieee754.c"
+      ],
+      "header": "ieee754.h",
+      "entry_fn": "IEEE754_DoubleToSmaller",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-I. -Iworkspace/work/src -Iworkspace/work/inc",
+      "ldflags": "-lm",
+      "reachability": "internal_api",
+      "include_source": true,
+      "eva_expr": "{ uint16_t h; float f; double d; int b; Frama_C_make_unknown((char *)&h, sizeof(h)); Frama_C_make_unknown((char *)&f, sizeof(f)); Frama_C_make_unknown((char *)&d, sizeof(d)); Frama_C_make_unknown((char *)&b, sizeof(b)); (void)IEEE754_HalfToDouble(h); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d, b); (void)IEEE754_SingleToHalf(f); }",
+      "fuzz_expr": "{ uint16_t h = 0; float f = 0.0f; double d = 0.0; int b = 0; if (fuzz_len >= 2) { memcpy(&h, fuzz_buf, 2); } if (fuzz_len >= 4) { memcpy(&f, fuzz_buf, 4); } if (fuzz_len >= 8) { memcpy(&d, fuzz_buf, 8); } if (fuzz_len >= 1) { b = (int)(fuzz_buf[0] & 1u); } (void)IEEE754_HalfToDouble(h); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d, b); (void)IEEE754_SingleToHalf(f); }"
+     }
+    }
+   ]
+  },
+  {
+   "id": "cryptolib",
+   "set": "recall",
+   "repo_name": "CryptoLib",
+   "url": "https://github.com/nasa/CryptoLib.git",
+   "revision": "5b98c8b2561b22822a9d4e26c959677ed93c815a",
+   "checkout": "cryptolib",
+   "scope": [
+    "src",
+    "include"
+   ],
+   "target_packages": "libgcrypt20-dev libcurl4-openssl-dev libmariadb-dev libmariadb-dev-compat",
+   "compile_commands": "workspace/bench/compile_commands.json",
+   "assets": [
+    {
+     "path": "cryptolib/gcrypt.h",
+     "to": "workspace/stubs/gcrypt.h"
+    },
+    {
+     "path": "cryptolib/mc_log_path.h",
+     "to": "workspace/stubs/mc_log_path.h"
+    },
+    {
+     "path": "cryptolib/compile_commands.json",
+     "to": "workspace/bench/compile_commands.json"
+    }
+   ],
+   "modules": [
+    {
+     "name": "core",
+     "harness": {
+      "sources": [
+       "src/core/crypto.c",
+       "src/core/crypto_aos.c",
+       "src/core/crypto_config.c",
+       "src/core/crypto_error.c",
+       "src/core/crypto_key_mgmt.c",
+       "src/core/crypto_mc.c",
+       "src/core/crypto_print.c",
+       "src/core/crypto_tc.c",
+       "src/core/crypto_tm.c",
+       "src/core/crypto_user.c",
+       "src/crypto/custom_stub/cryptography_interface_custom_stub.template.c",
+       "src/crypto/kmc_stub/cryptography_interface_kmc.stub.c",
+       "src/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c",
+       "src/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c",
+       "src/key/custom_stub/key_interface_custom_stub.template.c",
+       "src/key/internal/key_interface_internal.template.c",
+       "src/key/kmc_stub/key_interface_kmc_stub.template.c",
+       "src/mc/custom_stub/mc_interface_custom_stub.template.c",
+       "src/mc/disabled_stub/mc_interface_disabled_stub.template.c",
+       "src/mc/internal/mc_interface_internal.template.c",
+       "src/sa/custom_stub/sa_interface_custom.stub.c",
+       "src/sa/internal/sa_interface_inmemory.template.c",
+       "src/sa/mariadb_stub/sa_interface_mariadb.stub.c"
+      ],
+      "header": "workspace/work/include/crypto.h",
+      "entry_fn": "Crypto_TC_ProcessSecurity",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/stubs -include mc_log_path.h -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include -I/usr/include -I/usr/include/x86_64-linux-gnu -Iworkspace/work/include -Iworkspace/work/src/../include",
+      "ldflags": "-lgcrypt",
+      "reachability": "untrusted_surface",
+      "contract_notes": [
+       "Untrusted TC transfer frame parser: buffer + in/out length + output TC_t"
+      ],
+      "call_expr": "TC_t tc; memset(&tc, 0, sizeof(tc)); static int crypto_inited = 0; if (!crypto_inited) { Crypto_Config_CryptoLib(KEY_TYPE_INTERNAL, MC_TYPE_INTERNAL, SA_TYPE_INMEMORY, CRYPTOGRAPHY_TYPE_LIBGCRYPT, IV_INTERNAL); Crypto_Config_TC(CRYPTO_TC_CREATE_FECF_TRUE, TC_PROCESS_SDLS_PDUS_TRUE, TC_HAS_PUS_HDR, TC_IGNORE_ANTI_REPLAY_FALSE, TC_IGNORE_SA_STATE_FALSE, TC_UNIQUE_SA_PER_MAP_ID_FALSE, TC_CHECK_FECF_TRUE, 0x3F, SA_INCREMENT_NONTRANSMITTED_IV_TRUE); TCGvcidManagedParameters_t mp; memset(&mp, 0, sizeof(mp)); mp.tfvn = 0; mp.scid = 0x0003; mp.has_fecf = TC_HAS_FECF; mp.has_segmentation_hdr = TC_HAS_SEGMENT_HDRS; mp.max_frame_size = 1024; mp.set_flag = 1; mp.vcid = 0; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 1; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 2; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 4; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); if (Crypto_Init() != CRYPTO_LIB_SUCCESS) { return 0; } crypto_inited = 1; } int ingest_len = (int)fuzz_len; Crypto_TC_ProcessSecurity(fuzz_buf, &ingest_len, &tc);"
+     },
+     "params": {
+      "fuzz_rte_initialized": false
+     }
+    },
+    {
+     "name": "crypto",
+     "harness": {
+      "sources": [
+       "src/crypto/custom_stub/cryptography_interface_custom_stub.template.c",
+       "src/crypto/kmc_stub/cryptography_interface_kmc.stub.c",
+       "src/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c",
+       "src/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c",
+       "src/core/crypto.c",
+       "src/core/crypto_aos.c",
+       "src/core/crypto_config.c",
+       "src/core/crypto_error.c",
+       "src/core/crypto_key_mgmt.c",
+       "src/core/crypto_mc.c",
+       "src/core/crypto_print.c",
+       "src/core/crypto_tc.c",
+       "src/core/crypto_tm.c",
+       "src/core/crypto_user.c",
+       "src/key/custom_stub/key_interface_custom_stub.template.c",
+       "src/key/internal/key_interface_internal.template.c",
+       "src/key/kmc_stub/key_interface_kmc_stub.template.c",
+       "src/mc/custom_stub/mc_interface_custom_stub.template.c",
+       "src/mc/disabled_stub/mc_interface_disabled_stub.template.c",
+       "src/mc/internal/mc_interface_internal.template.c",
+       "src/sa/custom_stub/sa_interface_custom.stub.c",
+       "src/sa/internal/sa_interface_inmemory.template.c",
+       "src/sa/mariadb_stub/sa_interface_mariadb.stub.c"
+      ],
+      "header": "workspace/work/include/cryptography_interface.h",
+      "entry_fn": "get_cryptography_interface_libgcrypt",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/stubs -include mc_log_path.h -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include -I/usr/include -I/usr/include/x86_64-linux-gnu -Iworkspace/work/include -Iworkspace/work/src/../include",
+      "ldflags": "-lgcrypt",
+      "reachability": "internal_api",
+      "contract_notes": [
+       "libgcrypt backend: interface vtable initialization"
+      ],
+      "call_expr": "CryptographyInterface iface = get_cryptography_interface_libgcrypt(); (void)iface->cryptography_init();"
+     }
+    },
+    {
+     "name": "key",
+     "harness": {
+      "sources": [
+       "src/key/custom_stub/key_interface_custom_stub.template.c",
+       "src/key/internal/key_interface_internal.template.c",
+       "src/key/kmc_stub/key_interface_kmc_stub.template.c"
+      ],
+      "header": "workspace/work/include/key_interface.h",
+      "entry_fn": "get_key_interface_internal",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/stubs -include mc_log_path.h -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include -I/usr/include -I/usr/include/x86_64-linux-gnu -Iworkspace/work/include -Iworkspace/work/src/../include",
+      "ldflags": "",
+      "reachability": "internal_api",
+      "contract_notes": [
+       "Internal key backend: key_init through the KeyInterface vtable"
+      ],
+      "call_expr": "KeyInterface iface = get_key_interface_internal(); (void)iface->key_init();"
+     }
+    },
+    {
+     "name": "mc",
+     "harness": {
+      "sources": [
+       "src/mc/custom_stub/mc_interface_custom_stub.template.c",
+       "src/mc/disabled_stub/mc_interface_disabled_stub.template.c",
+       "src/mc/internal/mc_interface_internal.template.c"
+      ],
+      "header": "workspace/work/include/mc_interface.h",
+      "entry_fn": "get_mc_interface_internal",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/stubs -include mc_log_path.h -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include -I/usr/include -I/usr/include/x86_64-linux-gnu -Iworkspace/work/include -Iworkspace/work/src/../include",
+      "ldflags": "",
+      "reachability": "internal_api",
+      "contract_notes": [
+       "Internal MC backend: mc_log through the McInterface vtable"
+      ],
+      "call_expr": "McInterface iface = get_mc_interface_internal(); iface->mc_log((int32_t)fuzz_len);"
+     }
+    },
+    {
+     "name": "sa",
+     "harness": {
+      "sources": [
+       "src/core/crypto.c",
+       "src/core/crypto_print.c",
+       "src/sa/custom_stub/sa_interface_custom.stub.c",
+       "src/sa/internal/sa_interface_inmemory.template.c",
+       "src/sa/mariadb_stub/sa_interface_mariadb.stub.c",
+       "src/core/crypto_aos.c",
+       "src/core/crypto_config.c",
+       "src/core/crypto_error.c",
+       "src/core/crypto_key_mgmt.c",
+       "src/core/crypto_mc.c",
+       "src/core/crypto_tc.c",
+       "src/core/crypto_tm.c",
+       "src/core/crypto_user.c",
+       "src/crypto/custom_stub/cryptography_interface_custom_stub.template.c",
+       "src/crypto/kmc_stub/cryptography_interface_kmc.stub.c",
+       "src/crypto/libgcrypt/cryptography_interface_libgcrypt.template.c",
+       "src/crypto/wolfssl_stub/cryptography_interface_wolfssl.stub.c",
+       "src/key/custom_stub/key_interface_custom_stub.template.c",
+       "src/key/internal/key_interface_internal.template.c",
+       "src/key/kmc_stub/key_interface_kmc_stub.template.c",
+       "src/mc/custom_stub/mc_interface_custom_stub.template.c",
+       "src/mc/disabled_stub/mc_interface_disabled_stub.template.c",
+       "src/mc/internal/mc_interface_internal.template.c"
+      ],
+      "header": "workspace/work/include/sa_interface.h",
+      "entry_fn": "get_sa_interface_inmemory",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/stubs -include mc_log_path.h -DAOS_DEBUG -DCCSDS_DEBUG -DDEBUG -DFECF_DEBUG -DMAC_DEBUG -DOCF_DEBUG -DPDU_DEBUG -DSA_DEBUG -DSA_FILE -DTC_DEBUG -DTM_DEBUG -Dcrypto_EXPORTS -I/framac-run/workspace/work/include -I/framac-run/workspace/work/src/../include -I/usr/include -I/usr/include/x86_64-linux-gnu -Iworkspace/work/include -Iworkspace/work/src/../include",
+      "ldflags": "-lgcrypt",
+      "reachability": "internal_api",
+      "extra_includes": [
+       "crypto.h"
+      ],
+      "contract_notes": [
+       "In-memory SA backend: GVCID lookup driven by fuzzed header fields"
+      ],
+      "call_expr": "SaInterface iface = get_sa_interface_inmemory(); SecurityAssociation_t *sa = NULL; static int crypto_inited = 0; if (!crypto_inited) { Crypto_Config_CryptoLib(KEY_TYPE_INTERNAL, MC_TYPE_INTERNAL, SA_TYPE_INMEMORY, CRYPTOGRAPHY_TYPE_LIBGCRYPT, IV_INTERNAL); Crypto_Config_TC(CRYPTO_TC_CREATE_FECF_TRUE, TC_PROCESS_SDLS_PDUS_TRUE, TC_HAS_PUS_HDR, TC_IGNORE_ANTI_REPLAY_FALSE, TC_IGNORE_SA_STATE_FALSE, TC_UNIQUE_SA_PER_MAP_ID_FALSE, TC_CHECK_FECF_TRUE, 0x3F, SA_INCREMENT_NONTRANSMITTED_IV_TRUE); TCGvcidManagedParameters_t mp; memset(&mp, 0, sizeof(mp)); mp.tfvn = 0; mp.scid = 0x0003; mp.has_fecf = TC_HAS_FECF; mp.has_segmentation_hdr = TC_HAS_SEGMENT_HDRS; mp.max_frame_size = 1024; mp.set_flag = 1; mp.vcid = 0; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 1; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 2; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 4; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); if (Crypto_Init() != CRYPTO_LIB_SUCCESS) { return 0; } crypto_inited = 1; } if (fuzz_len >= 5) { iface->sa_get_operational_sa_from_gvcid((uint8_t)fuzz_buf[0], (uint16_t)fuzz_buf[1], (uint16_t)fuzz_buf[2], (uint8_t)fuzz_buf[3], &sa); }"
+     },
+     "params": {
+      "fuzz_rte_initialized": false
+     }
+    }
+   ]
+  },
+  {
+   "id": "x509-parser",
+   "set": "comparison",
+   "repo_name": "x509-parser",
+   "url": "https://github.com/ANSSI-FR/x509-parser.git",
+   "revision": "6f3bae3c52989180df6af46da1acb0329315b82a",
+   "checkout": "x509-parser",
+   "scope": [
+    "src/x509-parser.c",
+    "src/x509-parser.h",
+    "src/x509-cert-parser.c",
+    "src/x509-cert-parser.h",
+    "src/x509-crl-parser.c",
+    "src/x509-crl-parser.h",
+    "src/x509-common.c",
+    "src/x509-common.h",
+    "src/x509-utils.c",
+    "src/x509-utils.h",
+    "src/x509-config.h"
+   ],
+   "modules": [
+    {
+     "name": "x509-parser",
+     "harness": {
+      "sources": [
+       "src/x509-utils.c",
+       "src/x509-common.c",
+       "src/x509-crl-parser.c",
+       "src/x509-cert-parser.c",
+       "src/x509-parser.c"
+      ],
+      "header": "x509-parser.h",
+      "entry_fn": "parse_x509_cert_relaxed",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/work/src -include workspace/harnesses/x509_no_ikos.h",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ cert_parsing_ctx cert_ctx; crl_parsing_ctx crl_ctx; u32 eaten = 0; (void)parse_x509_cert_relaxed(&cert_ctx, fuzz_buf, (u32)fuzz_len, &eaten); (void)parse_x509_crl_relaxed(&crl_ctx, fuzz_buf, (u32)fuzz_len, &eaten); }"
+     },
+     "params": {
+      "eva_slevel": 1
+     }
+    },
+    {
+     "name": "x509-cert-parser",
+     "harness": {
+      "sources": [
+       "src/x509-utils.c",
+       "src/x509-common.c",
+       "src/x509-cert-parser.c"
+      ],
+      "header": "x509-cert-parser.h",
+      "entry_fn": "parse_x509_cert",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/work/src -include workspace/harnesses/x509_no_ikos.h",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ cert_parsing_ctx ctx; (void)parse_x509_cert(&ctx, fuzz_buf, (u32)fuzz_len); }"
+     },
+     "params": {
+      "eva_slevel": 1
+     }
+    },
+    {
+     "name": "x509-crl-parser",
+     "harness": {
+      "sources": [
+       "src/x509-utils.c",
+       "src/x509-common.c",
+       "src/x509-crl-parser.c"
+      ],
+      "header": "x509-crl-parser.h",
+      "entry_fn": "parse_x509_crl",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/work/src -include workspace/harnesses/x509_no_ikos.h",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ crl_parsing_ctx ctx; (void)parse_x509_crl(&ctx, fuzz_buf, (u32)fuzz_len); }"
+     },
+     "params": {
+      "eva_slevel": 1
+     }
+    },
+    {
+     "name": "x509-utils",
+     "harness": {
+      "sources": [
+       "src/x509-utils.c"
+      ],
+      "header": "x509-utils.h",
+      "entry_fn": "bufs_differ",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/work/src -include workspace/harnesses/x509_no_ikos.h",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ u32 half = (u32)(fuzz_len / 2); if (half > 0) { (void)bufs_differ(fuzz_buf, fuzz_buf + half, half); } }"
+     },
+     "params": {
+      "eva_slevel": 1
+     }
+    },
+    {
+     "name": "x509-common",
+     "harness": {
+      "sources": [
+       "src/x509-utils.c",
+       "src/x509-common.c",
+       "src/x509-cert-parser.c",
+       "src/x509-crl-parser.c"
+      ],
+      "header": "x509-parser.h",
+      "entry_fn": "parse_x509_cert",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/work/src -include workspace/harnesses/x509_no_ikos.h",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ cert_parsing_ctx cert_ctx; crl_parsing_ctx crl_ctx; (void)parse_x509_cert(&cert_ctx, fuzz_buf, (u32)fuzz_len); (void)parse_x509_crl(&crl_ctx, fuzz_buf, (u32)fuzz_len); }"
+     },
+     "params": {
+      "eva_slevel": 1
+     }
+    }
+   ],
+   "assets": [
+    {
+     "path": "x509-parser/x509_no_ikos.h",
+     "to": "workspace/harnesses/x509_no_ikos.h"
+    }
+   ]
+  },
+  {
+   "id": "oscs-jsmn",
+   "set": "comparison",
+   "repo_name": "oscs-jsmn",
+   "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
+   "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
+   "checkout": "oscs",
+   "subdir": "jsmn",
+   "scope": [
+    "jsmn.c",
+    "jsmn.h"
+   ],
+   "modules": [
+    {
+     "name": "jsmn",
+     "harness": {
+      "sources": [
+       "jsmn.c"
+      ],
+      "header": "jsmn.h",
+      "entry_fn": "jsmn_parse",
+      "entry_style": "custom",
+      "max_input_size": 16,
+      "cppflags": "-Iworkspace/work",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ jsmn_parser parser; jsmntok_t tokens[4]; jsmn_init(&parser); (void)jsmn_parse(&parser, (const char *)fuzz_buf, fuzz_len, tokens, 4); }"
+     }
+    }
+   ]
+  },
+  {
+   "id": "oscs-semver",
+   "set": "comparison",
+   "repo_name": "oscs-semver",
+   "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
+   "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
+   "checkout": "oscs",
+   "subdir": "semver",
+   "scope": [
+    "semver.c",
+    "semver.h"
+   ],
+   "modules": [
+    {
+     "name": "semver",
+     "harness": {
+      "sources": [
+       "semver.c"
+      ],
+      "header": "semver.h",
+      "entry_fn": "semver_parse",
+      "entry_style": "custom",
+      "max_input_size": 64,
+      "cppflags": "-Iworkspace/work",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "null_terminate": true,
+      "call_expr": "{ const char *s = (const char *)fuzz_buf; semver_t a; memset(&a, 0, sizeof(a)); (void)semver_is_valid(s); if (semver_parse(s, &a) == 0) { semver_free(&a); } }"
+     }
+    }
+   ]
+  },
+  {
+   "id": "oscs-stmr",
+   "set": "comparison",
+   "repo_name": "oscs-stmr",
+   "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
+   "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
+   "checkout": "oscs",
+   "subdir": "stmr",
+   "scope": [
+    "stmr.c",
+    "stmr.h"
+   ],
+   "modules": [
+    {
+     "name": "stmr",
+     "harness": {
+      "sources": [
+       "stmr.c"
+      ],
+      "header": "stmr.h",
+      "entry_fn": "stem",
+      "entry_style": "custom",
+      "max_input_size": 64,
+      "cppflags": "-Iworkspace/work",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "null_terminate": true,
+      "call_expr": "{ if (fuzz_len > 0) { (void)stem((char *)fuzz_buf, 0, (int)fuzz_len - 1); } }"
+     }
+    }
+   ]
+  },
+  {
+   "id": "oscs-qlz",
+   "set": "comparison",
+   "repo_name": "oscs-qlz",
+   "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
+   "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
+   "checkout": "oscs",
+   "subdir": "qlz",
+   "scope": [
+    "quicklz.c",
+    "quicklz.h"
+   ],
+   "modules": [
+    {
+     "name": "quicklz",
+     "harness": {
+      "sources": [
+       "quicklz.c"
+      ],
+      "header": "quicklz.h",
+      "entry_fn": "qlz_compress",
+      "entry_style": "custom",
+      "max_input_size": 32,
+      "cppflags": "-Iworkspace/work",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ static qlz_state_compress state; static char destination[32 + 400]; memset(&state, 0, sizeof(state)); (void)qlz_compress(fuzz_buf, destination, fuzz_len, &state); }"
+     }
+    }
+   ]
+  },
+  {
+   "id": "oscs-tweetnacl",
+   "set": "comparison",
+   "repo_name": "oscs-tweetnacl",
+   "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
+   "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
+   "checkout": "oscs",
+   "subdir": "tweetnacl-usable",
+   "scope": [
+    "tweetnacl.c",
+    "tweetnacl.h"
+   ],
+   "modules": [
+    {
+     "name": "tweetnacl",
+     "harness": {
+      "sources": [
+       "tweetnacl.c"
+      ],
+      "header": "tweetnacl.h",
+      "entry_fn": "crypto_hash",
+      "entry_style": "custom",
+      "max_input_size": 32,
+      "cppflags": "-Iworkspace/work",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ unsigned char digest[64]; (void)crypto_hash(digest, fuzz_buf, fuzz_len); }"
+     }
+    }
+   ]
+  }
+ ],
+ "bugs": [
+  {
+   "id": "MINMEA-01",
+   "title": "Unvalidated ZDA calendar fields reach minmea_getdatetime, where month - 1 overflows",
+   "severity": "medium",
+   "reachability": "untrusted_surface",
+   "fingerprint": "minmea.c#minmea_getdatetime::signed_overflow::95a4d01721",
+   "file": "minmea.c",
+   "function": "minmea_getdatetime",
+   "alarm_kind": "signed_overflow",
+   "input_hex": "2447505a44412c3030303030302e30302c302c2d323134373438333634382c302c302c30",
+   "input_sha256": "61848121431cff03210bf26e0d4f3e20d6c394f2e5609476163c427756fa6f9c",
+   "replays": [
+    {
+     "target": "minmea",
+     "module": "minmea",
+     "engine": "sanitizers",
+     "required": true,
+     "lines": [
+      656
+     ]
+    },
+    {
+     "target": "minmea",
+     "module": "minmea",
+     "engine": "eacsl",
+     "required": false,
+     "lines": [
+      656
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "minmea_parse_zda stores five 'i' fields into struct minmea_date and struct minmea_sentence_zda without any range validation. It only checks the UTC offset. The documented consumer of that struct is minmea_getdatetime, which performs calendar arithmetic on it. A ZDA sentence whose month field is -2147483648 therefore reaches 'tm->tm_mon = date->month - 1' and evaluates INT_MIN - 1, undefined behaviour (CWE-190). The same path also feeds an unbounded year into the '2000 + date->year - 1900' branch, and minmea_gettime forwards both to timegm().",
+    "root_cause": "Producer/consumer contract gap. minmea_scan's 'i' handler (minmea.c:223) narrows strtol()'s long result into an int and minmea_parse_zda (minmea.c:622-638) copies those ints straight into frame->date without range checks, so day, month and year can be any int value. minmea_getdatetime (minmea.c:645) only rejects the -1 sentinel for year and hours, then computes date->month - 1 and date->year arithmetic, both of which overflow for INT_MIN input.",
+    "intended_behavior": "A parser must either reject calendar fields that are outside the NMEA ranges or the date/time conversion must validate them before doing arithmetic. Neither layer does, so an attacker-controlled sentence produces undefined behaviour inside the library's own recommended call sequence (parse_zda then getdatetime).",
+    "severity_rationale": "untrusted_surface: the month/year values come straight from an NMEA sentence, so any sender can choose them. Demonstrated impact is undefined behaviour plus a corrupt struct tm handed to timegm(); no memory-safety effect was shown, so this stays below high/critical.",
+    "remediation_summary": "Validate the calendar fields where they are produced (minmea_parse_zda) and again where they are consumed (minmea_getdatetime), so neither a hostile sentence nor a hand-built struct can drive the arithmetic out of range.",
+    "remediation_invariant": "-1 <= date->year <= 9999 && -1 <= date->month <= 12 && -1 <= date->day <= 31"
+   }
+  },
+  {
+   "id": "MINMEA-02",
+   "title": "abs(INT_MIN) signed overflow in minmea_parse_zda defeats the timezone-offset range check",
+   "severity": "medium",
+   "reachability": "untrusted_surface",
+   "fingerprint": "minmea.c#minmea_parse_zda::signed_overflow::7c3a91d0f2",
+   "file": "minmea.c",
+   "function": "minmea_parse_zda",
+   "alarm_kind": "signed_overflow",
+   "input_hex": "2447505a44412c3230313533302e30302c30342c30372c323030322c2d323134373438333634382c300d0a",
+   "input_sha256": "01688be0f95a4c64ffdab56a728d51ca3b8ab97752c3d178702542209c9a9e34",
+   "replays": [
+    {
+     "target": "minmea",
+     "module": "minmea",
+     "engine": "sanitizers",
+     "required": true,
+     "lines": [
+      635
+     ]
+    },
+    {
+     "target": "minmea",
+     "module": "minmea",
+     "engine": "eacsl",
+     "required": false,
+     "lines": [
+      635
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "minmea_parse_zda validates the NMEA UTC offset with abs(frame->hour_offset) > 13 on a value produced by minmea_scan's 'i' conversion, which is a plain strtol() result narrowed to int. A sentence carrying the field value -2147483648 makes abs() negate INT_MIN, which is undefined behaviour (CWE-190). The campaign reproduces it under UBSan. On two's-complement targets abs(INT_MIN) evaluates to INT_MIN, so the comparison is false and the out-of-range offset is accepted: the 'check offsets' guard is bypassed and a struct minmea_sentence_zda describing an impossible UTC offset is reported as successfully parsed.",
+    "root_cause": "minmea_scan's 'i' case stores strtol()'s long result into an int (minmea.c:223, 'value = strtol(field, &endptr, 10);'), so the field value -2147483648 arrives unchanged as INT_MIN in frame->hour_offset. minmea_parse_zda then calls abs() on it at minmea.c:635 without excluding INT_MIN, and abs(INT_MIN) is not representable in int.",
+    "intended_behavior": "Reject any ZDA sentence whose UTC offset is outside the NMEA range (|hour_offset| <= 13, 0 <= minute_offset <= 59) and never evaluate an undefined operation while deciding that. The guard must be written so that INT_MIN is compared, not negated.",
+    "severity_rationale": "untrusted_surface: any device or process that writes NMEA sentences into the parser can pick the offset field, so the undefined behaviour and the bypassed offset validation are attacker-controlled. No out-of-bounds access or control-flow corruption was demonstrated (the overflow only corrupts the return value of abs()), so this is not rated high or critical.",
+    "remediation_summary": "Replace the abs()-based guard with two signed comparisons so INT_MIN is compared rather than negated.",
+    "remediation_invariant": "frame->hour_offset >= -13 && frame->hour_offset <= 13"
+   }
+  },
+  {
+   "id": "MINMEA-03",
+   "title": "Unbounded scale*=10 overflow in minmea_scan's fractional ('f') field parser",
+   "severity": "low",
+   "reachability": "untrusted_surface",
+   "fingerprint": "minmea.c#minmea_scan::signed_overflow::e0fa2b9da1",
+   "file": "minmea.c",
+   "function": "minmea_scan",
+   "alarm_kind": "signed_overflow",
+   "input_hex": "243a255a44412c2c362c2c302c2c2c2c2e323132333435363738392c2c",
+   "input_sha256": "6d99a1f718260bc1c349efa0d983ded02b51d54feedcdd699d81978dcdac3ea2",
+   "replays": [
+    {
+     "target": "minmea",
+     "module": "minmea",
+     "engine": "sanitizers",
+     "required": true,
+     "lines": [
+      186
+     ]
+    },
+    {
+     "target": "minmea",
+     "module": "minmea",
+     "engine": "eacsl",
+     "required": false,
+     "lines": [
+      186
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "The 'f' branch of minmea_scan only guards the integer accumulator (value) against overflow. When the integer part of a fractional field stays small (for example a field that starts with '.' or with '0.'), the guard never fires while scale is still multiplied by 10 once per fractional digit. A field with ten or more digits after the decimal point overflows the int_least32_t scale (1000000000 * 10), which is undefined behaviour (CWE-190). All NMEA sentence parsers reach this code through minmea_scan, so the defect is reachable from any 'f' field of any sentence type.",
+    "root_cause": "minmea.c:174 guards only the value accumulator ('value > (INT_LEAST32_MAX-digit) / 10'); minmea.c:185-186 then executes 'scale *= 10' with no bound on scale. scale starts at 1 after the '.' and receives one multiplication per fractional digit, so ten fractional digits reach 10^10 and overflow int_least32_t regardless of the integer part.",
+    "intended_behavior": "Truncate extra fractional precision once either the integer accumulator or the decimal scale can no longer grow without exceeding INT_LEAST32_MAX, and never evaluate an overflowing multiplication.",
+    "severity_rationale": "untrusted_surface undefined behaviour with no demonstrated memory-safety consequence: the overflow only corrupts the fixed-point scale of one parsed field, and minmea_tocoord/minmea_rescale carry their own scale guards, so no out-of-bounds access, leak or termination failure was shown. Rated low rather than medium because the demonstrated impact is UB plus a wrong parsed value, not a denial of service or memory corruption.",
+    "remediation_summary": "Extend the existing overflow guard so it also truncates when scale cannot be multiplied by ten without exceeding INT_LEAST32_MAX.",
+    "remediation_invariant": "scale <= INT_LEAST32_MAX / 10 before every scale *= 10"
+   }
+  },
+  {
+   "id": "QCBOR-01",
+   "title": "C11 signed overflow: INT64_MIN negation in QCBORDecode_ProcessBigNumber",
+   "severity": "medium",
+   "reachability": "untrusted_surface",
+   "fingerprint": "src/qcbor_number_decode.c#QCBORDecode_ProcessBigNumber::signed_overflow::e3d0c960fc",
+   "file": "src/qcbor_number_decode.c",
+   "function": "QCBORDecode_ProcessBigNumber",
+   "alarm_kind": "signed_overflow",
+   "input_hex": "c482003b7fffffffffffffff",
+   "input_sha256": "d5b088e523c926f5fc37b1f9635976fba9789f1bd5aefec9399d9fece28358ab",
+   "replays": [
+    {
+     "target": "qcbor-dev",
+     "module": "qcbor_number_decode",
+     "engine": "eacsl",
+     "required": true,
+     "lines": [
+      1964,
+      2008
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "Decoding a CBOR decimal fraction (tag 4) or bigfloat (tag 5) whose mantissa is the integer -2^63 sets QCBOR_TYPE_INT64 with val.int64 == INT64_MIN. QCBORDecode_ProcessBigNumber then evaluates ABSOLUTE_VALUE(Item.val.int64) at line 1964; the macro expands to -(x) for negative x, and negating INT64_MIN is undefined behavior (C11 6.5.4p2 / 6.2.5p9). The same negation appears at line 2008 when the big-number output is materialized. E-ACSL reproduces rte:signed_overflow '-9223372036854775807 <= Item.val.int64' on a 12-byte decimal-fraction witness (c4 82 00 3b 7f ff ff ff ff ff ff ff).",
+    "root_cause": "ABSOLUTE_VALUE(x) is ((x) < 0 ? -(x) : (x)) (qcbor_private.h:496). For x == INT64_MIN the negation overflows int64_t. Line 2008 computes the same magnitude with 'bIsNegative ? -Item.val.int64 : Item.val.int64'. Both must use unsigned arithmetic.",
+    "intended_behavior": "Compute the magnitude without signed negation, e.g. ((uint64_t)x & 0x8000000000000000ULL) ? 0ULL - (uint64_t)x : (uint64_t)x, or 0ULL - (uint64_t)x for the negative case, so INT64_MIN is handled exactly.",
+    "severity_rationale": "Arithmetic UB in the decoder for untrusted CBOR decimal-fraction/bigfloat input. It feeds the computed bignum length and value and is reachable without any caller mistake. No out-of-bounds access was demonstrated, so it is not high/critical; the untrusted_surface arithmetic-UB anchor gives medium.",
+    "remediation_summary": "Replace both signed negations (ABSOLUTE_VALUE at line 1964 and the ternary at line 2008) with unsigned magnitude arithmetic.",
+    "remediation_invariant": "For every QCBORItem accepted by QCBORDecode_ProcessBigNumber, the magnitude computation is defined for INT64_MIN."
+   }
+  },
+  {
+   "id": "QCBOR-02",
+   "title": "C11 shift UB: negative shift count in IEEE754_DoubleToSingle (dev v2)",
+   "severity": "low",
+   "reachability": "internal_api",
+   "fingerprint": "src/ieee754.c#IEEE754_DoubleToSingle::shift::d355106f76",
+   "file": "src/ieee754.c",
+   "function": "IEEE754_DoubleToSingle",
+   "alarm_kind": "shift",
+   "input_hex": "9a9999999999f13f",
+   "input_sha256": "284d4d3b0cb211ed5539e2454d9100ea83db71e93a67dc61a625467b814c7e0f",
+   "replays": [
+    {
+     "target": "qcbor-dev",
+     "module": "ieee754",
+     "engine": "eacsl",
+     "required": true,
+     "lines": [
+      625
+     ]
+    },
+    {
+     "target": "qcbor-master",
+     "module": "ieee754",
+     "engine": "eacsl",
+     "required": true,
+     "lines": [
+      666
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "On the v2 dev branch, IEEE754_DoubleToSingle(double d) computes nShiftAmount = -97 - unbiasedExponent at line 624 and shifts the significand by it at line 625 before the subnormal-range guard at lines 627-629. For any double that is not convertible to a single normal (e.g. 1.1, whose significand loses bits), the count is negative, so the shift is undefined behavior per C11 6.5.7p3. E-ACSL reproduced rte/shift 0 <= nShiftAmount < 64 with nShiftAmount = -97 on an 8-byte witness; UBSan reports 'shift exponent -97 is negative' at the same line.",
+    "root_cause": "nExponentDifference/nShiftAmount (lines 623-624) are computed unconditionally in the 'not convertible to single normal' branch, and the shift at line 625 executes before the range guard at lines 627-629.",
+    "intended_behavior": "Evaluate the subnormal shift only when the exponent is inside the convertible subnormal window, or clamp/reject the count first; returning 'not convertible' must not require an out-of-range shift.",
+    "severity_rationale": "Confirmed C11 shift UB in an internal conversion API; the shifted value is discarded on the non-convertible path and no memory-safety effect was demonstrated. The dev decode conformance path can reach it from untrusted input, but the confirmed harness entry is internal_api, so the anchor caps severity at low.",
+    "remediation_summary": "Guard the shift with the subnormal exponent range (or clamp nShiftAmount) before evaluating it.",
+    "remediation_invariant": "On every path evaluating the shift at src/ieee754.c:625, 0 <= nShiftAmount < 64."
+   }
+  },
+  {
+   "id": "QCBOR-03",
+   "title": "C11 shift UB: negative shift count in IEEE754_SingleToHalf (dev v2)",
+   "severity": "low",
+   "reachability": "internal_api",
+   "fingerprint": "src/ieee754.c#IEEE754_SingleToHalf::shift::ceaaa12428",
+   "file": "src/ieee754.c",
+   "function": "IEEE754_SingleToHalf",
+   "alarm_kind": "shift",
+   "input_hex": "7a00007a",
+   "input_sha256": "32eb40ee3d36dd74a3d5f79f72053351d25913c237840121e271a779efa8e2de",
+   "replays": [
+    {
+     "target": "qcbor-dev",
+     "module": "ieee754",
+     "engine": "eacsl",
+     "required": true,
+     "lines": [
+      466
+     ]
+    },
+    {
+     "target": "qcbor-master",
+     "module": "ieee754",
+     "engine": "eacsl",
+     "required": true,
+     "lines": [
+      510
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "On the v2 dev branch, IEEE754_SingleToHalf(const uint32_t uSingle) computes nShiftAmount = -1 - unbiasedExponent at line 459 and shifts the significand by it at line 466 before the subnormal-range guard at lines 470-472. For any single-precision value that is not convertible to a half normal (e.g. 1.0e30f, bit pattern 0x7149F2CA), the count is negative, so the shift is undefined behavior per C11 6.5.7p3. E-ACSL reproduced rte/shift 0 <= nShiftAmount < 32 with nShiftAmount = -100 on a 4-byte input; UBSan reports 'shift exponent -100 is negative' at the same line.",
+    "root_cause": "nExponentDifference/nShiftAmount (lines 454-459) are computed unconditionally in the 'not convertible to half normal' branch, and the shift at line 466 executes before the range guard at lines 470-472. The guard cannot prevent the UB because the shift is evaluated first.",
+    "intended_behavior": "Evaluate the subnormal shift only when the exponent is inside the convertible subnormal window, or clamp/reject the count first; returning 'not convertible' must not require an out-of-range shift.",
+    "severity_rationale": "Confirmed C11 shift UB in an internal conversion API; the shifted value is discarded on the non-convertible path and no memory-safety effect was demonstrated. The dev decode conformance path (QCBOR_DECODE_MODE_ONLY_SHORTEST_FLOAT) reaches the same helper from untrusted input, which would raise the reachability if the decode path is exercised; the confirmed harness entry here is internal_api, so the anchor caps severity at low.",
+    "remediation_summary": "Guard the shift with the subnormal exponent range (or clamp nShiftAmount) before evaluating it.",
+    "remediation_invariant": "On every path evaluating the shift at src/ieee754.c:466, 0 <= nShiftAmount < 32."
+   }
+  },
+  {
+   "id": "CRYPTOLIB-01",
+   "title": "One-byte out-of-bounds read of the received TC frame buffer when a minimal 5-byte frame is processed with segmentation headers enabled",
+   "severity": "medium",
+   "reachability": "untrusted_surface",
+   "fingerprint": "src/core/crypto_tc.c#Crypto_TC_Set_Segment_Header::mem_access::74b4df8a1f",
+   "file": "src/core/crypto_tc.c",
+   "function": "Crypto_TC_Set_Segment_Header",
+   "alarm_kind": "mem_access",
+   "input_hex": "0003000424",
+   "input_sha256": "da1ad84542b8766ac1af1267c507be21ce8a2aea69ade94cd1e16e5b346f0f55",
+   "replays": [
+    {
+     "target": "cryptolib",
+     "module": "core",
+     "engine": "eacsl",
+     "required": true,
+     "lines": [
+      1949
+     ]
+    },
+    {
+     "target": "cryptolib",
+     "module": "core",
+     "engine": "sanitizers",
+     "required": false,
+     "lines": [
+      1949
+     ]
+    }
+   ],
+   "verdict": {
+    "description": "Crypto_TC_ProcessSecurity accepts a caller-supplied TC transfer frame of *len_ingest bytes. After parsing the 5-byte primary header and confirming that the 10-bit frame-length field (fl = 4, i.e. fl + 1 == 5) equals *len_ingest, Crypto_TC_ProcessSecurity_Cam resolves the GVCID managed parameters (has_segmentation_hdr == TC_HAS_SEGMENT_HDRS for tfvn 0, scid 0x0003, vcid 0) and calls Crypto_TC_Set_Segment_Header before checking that a segment header byte is actually present. Crypto_TC_Set_Segment_Header then evaluates ingest[*byte_idx] with *byte_idx == 5 while only bytes 0..4 of the frame are valid, an out-of-bounds read one byte past the end of the received frame. The two 5-byte reproducers (00 03 00 04 24 and 04 03 00 04 01) fail the E-ACSL \\valid_read(ingest + *byte_idx) check, and the same inputs produce an AddressSanitizer heap-buffer-overflow (READ of size 1, 0 bytes after a 5-byte region) in an independent sanitizer build of the same harness, so the violation is a genuine target defect and not an E-ACSL artefact. The following SPI presence check at line 2027 would have rejected the too-short frame, so the segment-header read simply happens too early.",
+    "root_cause": "Missing minimum-frame-length validation before the optional segment-header field is read. Crypto_TC_Process_Sanity_Check only enforces *len_ingest >= TC_FRAME_HEADER_SIZE (5), and the frame-length check at crypto_tc.c:2005 only enforces fl + 1 == *len_ingest, so a 5-byte frame with fl == 4 passes both checks even though the configured managed parameters require a 1-byte segment header (TC_SEGMENT_HDR_SIZE). Crypto_TC_ProcessSecurity_Cam then calls Crypto_TC_Set_Segment_Header (crypto_tc.c:2025), which dereferences ingest[5] before the SPI presence check at line 2027 can reject the frame.",
+    "intended_behavior": "A frame whose declared length leaves no room for the mandatory segment header and security header must be rejected with a CRYPTO_LIB_ERR_TC_FRAME_TOO_SHORT (or equivalent) status before any byte past *len_ingest is read. The project's own unit test ERROR_TC_INPUT_FRAME_TOO_SHORT_FOR_SPEC already expects too-short TC frames to return an error instead of being parsed.",
+    "severity_rationale": "Reachability is untrusted_surface: a remote TC sender controls the whole frame, including the 10-bit frame-length field and VCID, and needs only a 5-byte frame (e.g. 00 03 00 04 24) when the receiver is configured with segmentation headers (the same configuration used by the project's own TC process unit tests). The defect is a one-byte out-of-bounds READ, demonstrated by ASan as a heap-buffer-overflow immediately past the received frame. It is rated medium rather than high because no secret-dependent data is shown to be disclosed: the byte lands in TC_t.tc_sec_header.sh, which is only printed under debugging, and the primary impact is a potential process abort (DoS) when the frame buffer ends at a page boundary plus parsing of data outside the authenticated frame. It is not critical because there is no out-of-bounds write or control-flow corruption.",
+    "remediation_summary": "Validate that the received frame is long enough to contain the optional segment header plus the 2-byte SPI before reading the segment header. Add the guard in Crypto_TC_ProcessSecurity_Cam immediately before the Crypto_TC_Set_Segment_Header call, returning CRYPTO_LIB_ERR_TC_FRAME_TOO_SHORT when *len_ingest < byte_idx + (has_segmentation_hdr == TC_HAS_SEGMENT_HDRS ? TC_SEGMENT_HDR_SIZE : 0) + SPI_LEN. The diff is byte-exact against the CRLF-checked-out target sources, so apply it with 'git apply' or 'patch -p1 --binary'; it was dry-run successfully against workspace/baseline/src/core/crypto_tc.c.",
+    "remediation_invariant": "For every call to Crypto_TC_Set_Segment_Header issued from Crypto_TC_ProcessSecurity_Cam: byte_idx <= *len_ingest - TC_SEGMENT_HDR_SIZE when has_segmentation_hdr == TC_HAS_SEGMENT_HDRS, so \\valid_read(ingest + *byte_idx) holds."
+   }
+  }
+ ],
+ "left_out": {
+  "note": "Open Source Case Studies not in the comparison set yet, and why. Each would need a harness with an eva_main in this manifest.",
+  "test suites of many small targets, which a per-module harness does not fit": [
+   "basic-cwe-examples",
+   "bench-moerman2018",
+   "c-testsuite",
+   "cerberus",
+   "itc-benchmarks",
+   "snprintf",
+   "verisec"
+  ],
+  "large, Eva time not measured yet": [
+   "chrony",
+   "gzip124",
+   "hiredis",
+   "libmodbus",
+   "libspng",
+   "libyaml",
+   "mbedtls",
+   "microstrain",
+   "mini-gmp",
+   "miniz",
+   "monocypher",
+   "papabench",
+   "polarssl",
+   "safestringlib"
+  ],
+  "applications with their own main loop or terminal, threads or hardware model, no parser entry point to harness": [
+   "2048",
+   "c-thread-pool",
+   "debie1",
+   "genann",
+   "gnugo",
+   "grayskull",
+   "icpc",
+   "ioccc",
+   "kilo",
+   "line-follower-robot",
+   "matrixmult",
+   "powerwindow",
+   "solitaire",
+   "tsvc"
+  ],
+  "headers or stub-driven examples that need target-specific stubs first": [
+   "c-utils",
+   "kgflags",
+   "khash"
+  ],
+  "not a case study": [
+   "frama-c",
+   "tutorials"
+  ]
+ },
+ "references": {
+  "spec_skill_x509_parser": {
+   "comparable": false,
+   "why_not_comparable": "That tool runs WP without -wp-rte and counts timed-out call-site requires goals as proved, so its numbers are not comparable to our covered. Context only: the comparison never reads this.",
+   "proved_per_call_layer": {
+    "L0": "39/41",
+    "L1": "16/21",
+    "L2": "17/17",
+    "L3": "31/34",
+    "L4": "24/37",
+    "L5": "18/22",
+    "L6": "10/11",
+    "L7": "2/4",
+    "L8": "5/9",
+    "L9": "6/10",
+    "L10": "3/6"
+   },
+   "total": "171/212"
+  }
+ }
+}

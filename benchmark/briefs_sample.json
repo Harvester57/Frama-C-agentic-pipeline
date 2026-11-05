@@ -1,0 +1,188 @@
+{
+ "comment": "Fixed sample of the assert-program dataset. Content digests only: never add file names (docs/benchmark.md).",
+ "salt": "framac-benchmark-v1",
+ "per_corpus": 10,
+ "max_lines": 80,
+ "programs": [
+  {
+   "id": "s-d78118824cd3",
+   "corpus": "autobench",
+   "sha256": "d78118824cd3215b470a6656ca286ad855c231154afd6c6c0c67a03a4fe22015",
+   "lines": 17
+  },
+  {
+   "id": "s-9aabe5a3a3d5",
+   "corpus": "autobench",
+   "sha256": "9aabe5a3a3d55825ce4039db0bb3b604ed66993f3a201d9e75fc5f256bc63849",
+   "lines": 17
+  },
+  {
+   "id": "s-5cffd68a81bb",
+   "corpus": "autobench",
+   "sha256": "5cffd68a81bba2ce0df3955ddc62a1f7978ed9f7a0991d1ac051702d17413cef",
+   "lines": 13
+  },
+  {
+   "id": "s-8c1f60b301f8",
+   "corpus": "autobench",
+   "sha256": "8c1f60b301f8f1d658c9b19eb66d45e5a1e7fb714ef9a87fb353e34e78031fc3",
+   "lines": 15
+  },
+  {
+   "id": "s-4a8de1299cc9",
+   "corpus": "autobench",
+   "sha256": "4a8de1299cc9d7fec0a27b00d54790e8f39b8b30ea5017ae7c8f82bc6c490b5e",
+   "lines": 15
+  },
+  {
+   "id": "s-94260debeadb",
+   "corpus": "autobench",
+   "sha256": "94260debeadbd5cd5a13995a2bc1e8b3b9b5c64c0fc6ff985938449dd4b8722e",
+   "lines": 19
+  },
+  {
+   "id": "s-866cb87347ab",
+   "corpus": "autobench",
+   "sha256": "866cb87347ab4fcffb426d008ea8f99f4944dc1008b7149ff51d90c6ab9c5256",
+   "lines": 16
+  },
+  {
+   "id": "s-8ddeff735bf5",
+   "corpus": "autobench",
+   "sha256": "8ddeff735bf5f7a2682a17a09252375a5ca0b0669ca6cf568db46025cfede431",
+   "lines": 15
+  },
+  {
+   "id": "s-844a9b08828b",
+   "corpus": "autobench",
+   "sha256": "844a9b08828b9ef19bdbe6eb69a531035164cfef937593783342807331a17efd",
+   "lines": 25
+  },
+  {
+   "id": "s-32316a825199",
+   "corpus": "autobench",
+   "sha256": "32316a8251995ea6e76c12896221477ae02cb49ed83d5a2a7ebbeb8f1d768b83",
+   "lines": 26
+  },
+  {
+   "id": "s-6e290f91d953",
+   "corpus": "live24",
+   "sha256": "6e290f91d953ef405e28bce589dbcffb66c7e1380c2846fe77596777edc75b58",
+   "lines": 18
+  },
+  {
+   "id": "s-8202b2cbe678",
+   "corpus": "live24",
+   "sha256": "8202b2cbe678384c9e70d17d2e3475aad5b158cad7f4c773a95c55f913604dc3",
+   "lines": 7
+  },
+  {
+   "id": "s-beca7f904fe9",
+   "corpus": "live24",
+   "sha256": "beca7f904fe9abe4e997d232278c3b98ee8384a9bf5bec61942de14b643de6f5",
+   "lines": 10
+  },
+  {
+   "id": "s-c6f4ba84697e",
+   "corpus": "live24",
+   "sha256": "c6f4ba84697ee9346467b8c99fcc86dcdcd7fcd2c069ee3aa9d6b51b52d862cb",
+   "lines": 46
+  },
+  {
+   "id": "s-4fd507c571f4",
+   "corpus": "live24",
+   "sha256": "4fd507c571f4e44f0552d12b1efef02952178970644c2e241e7f931570a5cf72",
+   "lines": 11
+  },
+  {
+   "id": "s-d0aa554c99d7",
+   "corpus": "live24",
+   "sha256": "d0aa554c99d7844ee8131142532875970d88f5ec24377c3aa66ce32afd167588",
+   "lines": 11
+  },
+  {
+   "id": "s-fd9848cb48cc",
+   "corpus": "live24",
+   "sha256": "fd9848cb48ccb9cccd1042800752f0c8f9477c495b7a95ed9cdb9efd78ad428e",
+   "lines": 11
+  },
+  {
+   "id": "s-eb26e078b18a",
+   "corpus": "live24",
+   "sha256": "eb26e078b18aa13be65a8077447b5979233bd9357f3a678576140dc5a06c9896",
+   "lines": 25
+  },
+  {
+   "id": "s-b1e7e74bbb21",
+   "corpus": "live24",
+   "sha256": "b1e7e74bbb218c595026fd1936e19c568d99bb946e5d71c8a3ca499381896a38",
+   "lines": 23
+  },
+  {
+   "id": "s-eaf2c9bd17e9",
+   "corpus": "live24",
+   "sha256": "eaf2c9bd17e9e0fe4f19af3b310f2bd430a442567aef992dc0a4b659f05fad40",
+   "lines": 17
+  },
+  {
+   "id": "s-5173e8d145d2",
+   "corpus": "live25",
+   "sha256": "5173e8d145d287895057687138584cd8f0b3ecfe2eabedcb6fec1088b2afbb5c",
+   "lines": 17
+  },
+  {
+   "id": "s-d06670612b4d",
+   "corpus": "live25",
+   "sha256": "d06670612b4ddf87f22bfa331dad9d83ecdd846388b3dc6bd010fe75d9d9a1d7",
+   "lines": 45
+  },
+  {
+   "id": "s-90534c3aac1c",
+   "corpus": "live25",
+   "sha256": "90534c3aac1cc65def355430d1cf63a9ae739d9cf646807f55d72ffaf47acef2",
+   "lines": 20
+  },
+  {
+   "id": "s-91e4e9cebe44",
+   "corpus": "live25",
+   "sha256": "91e4e9cebe448cb8d8ecc02d615ffc82a07a3b021a533752795edf114796f0d3",
+   "lines": 19
+  },
+  {
+   "id": "s-a0bce2a91672",
+   "corpus": "live25",
+   "sha256": "a0bce2a91672593c8c3e312a2f55d5f360ed697acd1774b3f60b810b1fe04e3e",
+   "lines": 36
+  },
+  {
+   "id": "s-eca579a5d83c",
+   "corpus": "live25",
+   "sha256": "eca579a5d83cd175ae824e0ea753c711b97ac559eebbe29c3f22ac7566c2dc08",
+   "lines": 25
+  },
+  {
+   "id": "s-0e1a23e7cf46",
+   "corpus": "live25",
+   "sha256": "0e1a23e7cf467c340e7616467a00c9ffb26f1f35a9b45d354ad61007654c7597",
+   "lines": 20
+  },
+  {
+   "id": "s-644f33dd8f62",
+   "corpus": "live25",
+   "sha256": "644f33dd8f626f6af37f38136b2f33589de4401e764555763995a1f389dad5ff",
+   "lines": 19
+  },
+  {
+   "id": "s-dcfdf3111688",
+   "corpus": "live25",
+   "sha256": "dcfdf31116882a43a901a7cbe3ccbe83a1ca237d59dc56ee1093a8a686bf5a3f",
+   "lines": 42
+  },
+  {
+   "id": "s-f3f226633351",
+   "corpus": "live25",
+   "sha256": "f3f22663335120d13ffb1b2c8c281d258cd18caa7e502cc086420ad0f5f8fe56",
+   "lines": 39
+  }
+ ]
+}

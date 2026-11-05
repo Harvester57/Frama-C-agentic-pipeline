@@ -165,6 +165,7 @@ frama-c/
 │   ├── generate_report.py            # Phase 4: Derives REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif
 │   ├── resources.py, cache.py        # Host/container resource broker & content-addressed build/proof caches
 │   ├── sandbox_exec.py               # Inner rlimits, environment allowlist, & process-group timeout runner
+│   ├── benchmark.py, benchmark_*.py  # Repeatable benchmark: recall replay, Eva metrics, baseline comparison, brief A/B
 │   └── validate_artifacts.py, ...    # Schema & semantic validators, checkpointing, fingerprinting, & shared helpers
 ├── schemas/                          # JSON Schemas (findings, candidates, coverage-ledger, run-metadata, agent-result)
 ├── templates/
@@ -174,6 +175,7 @@ frama-c/
 │   ├── eacsl_canary/canary.c         # Self-test canary for `run_eacsl_fuzz.py selftest`
 │   ├── fc_stubs/                     # Bodyless ACSL-annotated prototypes for third-party/host headers
 │   └── acsl/                         # Reusable ACSL templates for external stubs and Security Layers 4-6
+├── benchmark/                        # Benchmark manifest, harness assets, fixed brief sample & stored baseline
 ├── tests/                            # Pytest unit and integration test suite
 └── docs/                             # Architecture, onboarding, security layers, caching, & reference manuals
     ├── bugs-found/                   # Public vulnerability advisories & verification reports per target
@@ -233,6 +235,7 @@ python3 -m mypy scripts tests
 - [Resources, Scheduling & Caching (`./docs/resources-and-caching.md`)](./docs/resources-and-caching.md)
 - [Pipeline v2 Design & Evidence Discipline (`./docs/v2-design.md`)](./docs/v2-design.md)
 - [Implementation Backlog & Verification Checklist (`./docs/backlog.md`)](./docs/backlog.md)
+- [Benchmark: Measuring Changes to Filters, Eva Configuration & Briefs (`./docs/benchmark.md`)](./docs/benchmark.md)
 - [Troubleshooting Guide (`./docs/troubleshooting.md`)](./docs/troubleshooting.md)
 - [Upstream Frama-C 33.0 / 34.0~~dev E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
 - [Frama-C Reference Manuals (`./docs/references/README.md`)](./docs/references/README.md) & [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md)

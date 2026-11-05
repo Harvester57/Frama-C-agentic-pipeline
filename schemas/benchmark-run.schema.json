@@ -1,0 +1,135 @@
+{
+  "$comment": "Contract for one benchmark run file, written by scripts/benchmark.py run and stored as a baseline under benchmark/baselines. Checked by benchmark.py baseline. Metric names are documented in docs/benchmark.md.",
+  "type": "object",
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "minLength": 1},
+    "mode": {"type": "string", "enum": ["deterministic", "deterministic+llm"]},
+    "pipeline": {
+      "type": "object",
+      "properties": {
+        "commit": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]},
+        "content_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": ["commit", "dirty", "content_digest"]
+    },
+    "toolchain": {"type": "object"},
+    "machine": {"type": "object"},
+    "limits": {
+      "type": "object",
+      "properties": {
+        "wp_memlimit_mb": {"type": "integer", "minimum": 1},
+        "fuzz_rss_limit_mb": {"type": "integer", "minimum": 1},
+        "replay_per_input_timeout_s": {"type": "integer", "minimum": 1}
+      },
+      "required": ["wp_memlimit_mb", "fuzz_rss_limit_mb", "replay_per_input_timeout_s"]
+    },
+    "selection": {"type": "object"},
+    "targets": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/definitions/target"}
+    },
+    "recall": {"$ref": "#/definitions/recall"},
+    "briefs": {"type": ["object", "null"]},
+    "totals": {
+      "type": "object",
+      "properties": {
+        "wall_s": {"type": "number", "minimum": 0},
+        "cpu_s": {"type": "number", "minimum": 0}
+      },
+      "required": ["wall_s", "cpu_s"]
+    }
+  },
+  "required": ["schema_version", "run_id", "created_at", "mode", "pipeline", "toolchain", "machine", "limits", "selection", "targets", "recall", "briefs", "totals"],
+  "definitions": {
+    "rate": {
+      "type": "object",
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "undecided": {"type": "integer", "minimum": 0},
+        "over_decided": {"type": ["number", "null"]},
+        "strict": {"type": ["number", "null"]}
+      },
+      "required": ["passed", "failed", "undecided", "over_decided", "strict"]
+    },
+    "target": {
+      "type": "object",
+      "properties": {
+        "set": {"type": "string", "enum": ["recall", "comparison"]},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "harness_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "status": {"type": "string", "enum": ["ok", "partial", "failed"]},
+        "problems": {"type": "array", "items": {"type": "string"}},
+        "stages": {"type": "object"},
+        "wall_s": {"type": "number", "minimum": 0},
+        "cpu_s": {"type": "number", "minimum": 0},
+        "dag": {"type": "object"},
+        "modules": {"type": "object", "additionalProperties": {"$ref": "#/definitions/module"}},
+        "functions_with_unknown": {"type": "array", "items": {"type": "string"}},
+        "functions_with_unknown_count": {"type": "integer", "minimum": 0},
+        "functions_with_unknown_no_unit": {"type": "array", "items": {"type": "string"}},
+        "prover_tasks": {"type": "object"},
+        "units": {
+          "type": "object",
+          "properties": {
+            "total": {"$ref": "#/definitions/rate"},
+            "by_wave": {"type": "object", "additionalProperties": {"$ref": "#/definitions/rate"}},
+            "by_class": {"type": "object", "additionalProperties": {"$ref": "#/definitions/rate"}},
+            "covered": {"type": "array", "items": {"type": "string"}},
+            "candidate": {"type": "array", "items": {"type": "string"}}
+          },
+          "required": ["total", "by_wave", "by_class", "covered", "candidate"]
+        },
+        "candidates": {"type": "object"}
+      },
+      "required": ["set", "revision", "harness_digest", "status", "problems", "stages", "wall_s", "cpu_s", "dag", "modules", "functions_with_unknown", "functions_with_unknown_count", "functions_with_unknown_no_unit", "prover_tasks", "units", "candidates"]
+    },
+    "module": {
+      "type": "object",
+      "properties": {
+        "eva": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/eva"}]},
+        "fuzz": {"type": ["object", "null"]},
+        "build": {"type": ["object", "null"]}
+      },
+      "required": ["eva", "fuzz", "build"]
+    },
+    "eva": {
+      "type": "object",
+      "properties": {
+        "status": {"type": "string", "minLength": 1},
+        "valid": {"type": "integer", "minimum": 0},
+        "unknown": {"type": "integer", "minimum": 0},
+        "invalid": {"type": "integer", "minimum": 0},
+        "dead": {"type": "integer", "minimum": 0},
+        "functions_with_unknown": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["status"]
+    },
+    "recall": {
+      "type": "object",
+      "properties": {
+        "expected": {"type": "integer", "minimum": 0},
+        "retained": {"type": "integer", "minimum": 0},
+        "lost": {"type": "array", "items": {"type": "string"}},
+        "undecided": {"type": "array", "items": {"type": "string"}},
+        "not_run": {"type": "array", "items": {"type": "string"}},
+        "rates": {"$ref": "#/definitions/rate"},
+        "bugs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "status": {"type": "string", "enum": ["retained", "lost", "undecided", "not_run"]},
+              "replays": {"type": "array"}
+            },
+            "required": ["status", "replays"]
+          }
+        }
+      },
+      "required": ["expected", "retained", "lost", "undecided", "not_run", "rates", "bugs"]
+    }
+  }
+}

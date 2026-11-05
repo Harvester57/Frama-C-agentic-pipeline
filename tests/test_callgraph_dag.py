@@ -66,6 +66,32 @@ int (*select_op(int mode))(int, int) {
         assert sig["takes_bounded_buffer"] is True
         assert "on_byte" in sig["fn_ptr_params"]
 
+    def test_macro_call_with_brace_argument_does_not_hide_later_functions(self):
+        # x509-parser: DECL_HASH_ALG(md2, "MD2", P99_PROTECT({ 0x06, 0x08 }));
+        src = """
+int before(void) { return 0; }
+DECLARE_TABLE(md2, "MD2", PROTECT({ 0x06, 0x08 }));
+int after(int x) { return x; }
+static int last(void) { return 1; }
+"""
+        assert [f["name"] for f in extract_functions_from_code(src)] == ["before", "after", "last"]
+
+    def test_statement_expression_argument_does_not_hide_later_functions(self):
+        src = """
+int value = WRAP(({ int y = 1; y; }));
+int after(void) { return value; }
+"""
+        assert [f["name"] for f in extract_functions_from_code(src)] == ["after"]
+
+    def test_extern_c_block_still_exposes_its_functions_and_later_ones(self):
+        src = """
+extern "C" {
+int inner(void) { return 0; }
+}
+int outer(void) { return 1; }
+"""
+        assert [f["name"] for f in extract_functions_from_code(src)] == ["inner", "outer"]
+
 
 class TestStructuralBodyAnalysis:
     """Tests for structural C body inspection (indirect calls, backward goto, allocators, zeroization)."""
