@@ -466,6 +466,11 @@ class TestToolingAndCandidates:
         result = mutate(lambda r: r["targets"]["t"]["modules"]["m"]["fuzz"].update(status="compile_error"))
         assert rows(result, "regression", "fuzz")
 
+    def test_campaign_aborting_without_an_input_warns_but_does_not_fail(self):
+        result = mutate(lambda r: r["targets"]["t"]["modules"]["m"]["fuzz"].update(status="fuzzer_error"))
+        assert not result.failed()
+        assert "without leaving a crash input" in rows(result, "warning", "fuzz")[0].message
+
     def test_campaign_finding_something_is_not_scored(self):
         result = mutate(lambda r: r["targets"]["t"]["modules"]["m"]["fuzz"].update(status="crash_found"))
         assert not result.failed()

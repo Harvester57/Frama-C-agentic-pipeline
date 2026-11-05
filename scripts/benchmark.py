@@ -1539,9 +1539,11 @@ def print_summary(run: dict) -> None:
         for name, module in sorted((target.get("modules") or {}).items()):
             eva = module.get("eva") or {}
             if eva.get("status") == "ok":
+                fuzz = module.get("fuzz") or {}
+                campaign = f"; campaign {fuzz.get('status')} ({fuzz.get('engine')})" if fuzz else ""
                 print(
                     f"    {name}: Valid {eva.get('valid')}, Unknown {eva.get('unknown')}, Invalid {eva.get('invalid')}, "
-                    f"Dead {eva.get('dead')}; {eva.get('functions_with_unknown_count')} function(s) with an Unknown"
+                    f"Dead {eva.get('dead')}; {eva.get('functions_with_unknown_count')} function(s) with an Unknown{campaign}"
                 )
             else:
                 print(f"    {name}: Eva {eva.get('status') or 'no report'} {eva.get('reason') or ''}".rstrip())

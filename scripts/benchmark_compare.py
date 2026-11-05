@@ -385,7 +385,10 @@ def _compare_tooling(tid: str, base: dict, cur: dict, out: Comparison, fuzz_comp
         if weaker:
             out.add("warning", "build", subject, "runtime checks weakened: " + ", ".join(weaker))
         old_fuzz, new_fuzz = (old.get("fuzz") or {}, new.get("fuzz") or {}) if fuzz_comparable else ({}, {})
-        if _fuzz_ran(old_fuzz) and new_fuzz and not _fuzz_ran(new_fuzz):
+        if _fuzz_ran(old_fuzz) and new_fuzz.get("status") == "fuzzer_error":
+            # Campaigns are unseeded, so this may not repeat, but it may also be a crash nobody can replay.
+            out.add("warning", "fuzz", subject, "campaign aborted without leaving a crash input")
+        elif _fuzz_ran(old_fuzz) and new_fuzz and not _fuzz_ran(new_fuzz):
             out.add("regression", "fuzz", subject, f"campaign no longer runs: {new_fuzz.get('status')}")
         elif old_fuzz.get("status") != new_fuzz.get("status") and new_fuzz:
             out.add(

@@ -15,7 +15,7 @@ Run the deterministic part (Phases 0 to 2 plus reproducer replay, no LLM) and co
 python3 scripts/benchmark.py run --compare default
 ```
 
-The command fetches each target at its pinned revision on the host, runs it through the normal wrappers and Make targets, writes one JSON file per run, prints the differences, and exits 1 on a regression. `FRAMAC_BENCH_DIR` or `--work-dir` moves its data (default `~/framac-pipeline/benchmark`). Nothing sizes a machine here: the broker leases CPUs and memory per container, as in any run. The shared cross-run cache is off, so no result comes from an older run.
+The command fetches each target at its pinned revision on the host, runs it through the normal wrappers and Make targets, writes one JSON file per run, prints the differences, and exits 1 on a regression. `FRAMAC_BENCH_DIR` or `--work-dir` moves its data (default `~/framac-pipeline/benchmark`). Nothing sizes a machine here: the broker leases CPUs and memory per container, as in any run. The shared cross-run cache is off, so no result comes from an older run. On a 12-CPU machine the whole command took 44 minutes of wall-clock and an hour of CPU: 22 minutes for recall and 22 for comparison, of which `jsmn` alone took 14.
 
 Narrower runs while you iterate:
 
@@ -101,6 +101,18 @@ What the numbers cannot tell you:
 - **Timeouts depend on machine speed.** An Eva or WP limit reached on a slower machine is a tool failure, not a verdict. Timings warn only beyond a tolerance on the same machine size.
 - **Wall-clock includes queueing** when other jobs share the broker. CPU time does not.
 
+## Known gaps in the stored baseline
+
+Each of these is real behavior of the pipeline today. They show up in every comparison until fixed, and fixing one should read as an improvement:
+
+- **`semver`: Eva does not start.** `-warn-unsigned-downcast` rejects the global initializer at `semver.c:23`, so its module reads `analysis_error`.
+- **Eva stops early on `tweetnacl`, `qlz` and `cryptolib`.** An `Invalid` alarm ends the analyzed path, so most of the code is Dead: `tweetnacl` reaches 5 of 64 functions (an unsigned downcast in `ts64`), `qlz` 5 of 17 (`src - 2` pointer arithmetic), and `cryptolib` 22 of 234 (a self-overlapping `memcpy` during `Crypto_Init`). That is why `eva_site` reads `dead` for CRYPTOLIB-01.
+- **x509-parser has 167 functions with an Unknown and no ledger unit.** `build_callgraph_dag.py` finds no function in `x509-cert-parser.c` or `x509-common.c`, because a file-scope macro call with a brace initializer ends its scan of the file. No prover would be assigned to them.
+- **x509-parser's fuzz builds fall back to the sanitizer engine.** E-ACSL rejects the target's own annotations (`unbounded ranges`, `x509-crl-parser.c:3313`) and cannot find `__fc_builtin.h`, which `x509-parser.c` includes under `__FRAMAC__`. Eva runs at `slevel 1`, as in the target's own Makefile, because the default exceeded 900 s.
+- **Functions defined in headers have no ledger unit** (14 in QCBOR, 1 in minmea), so they get no prover either.
+- **MINMEA-02's fingerprint differs from `docs/bugs-found`**, at the same site. The run summary names it.
+- **Some campaigns abort without a crash artifact** (`fuzzer_error`, exit code -6, on `semver` and on CryptoLib's `crypto` and `sa`), so they leave no reproducer. On `semver` the log ends in E-ACSL's `Use of invalid address`.
+
 ## Phase 3 (optional, LLM-driven)
 
 The deterministic run leaves each target's run directory ready for Phase 3 (`<work-dir>/runs/<run-id>/<target>/run-1`). Drive `/framac-wp` on it from an LLM host, then add its metrics to the run file:
@@ -115,7 +127,7 @@ This adds per-wave function rates, stalls, dispatches, WP containers and goal co
 
 [`../scripts/benchmark_briefs.py`](../scripts/benchmark_briefs.py) uses the 901 small assert programs of the spectool dataset (autobench, live24, live25). The dataset stays outside this repository and its path is always a parameter, because some file names look like student identifiers. [`../benchmark/briefs_sample.json`](../benchmark/briefs_sample.json) holds only content digests, so never add file names to it. The sample is 10 programs per corpus, ranked by a salted digest of their content, so moving or renaming the dataset does not change it.
 
-The unannotated programs give a floor with no LLM. `run --briefs-dataset <dir>` also stores it in the run file.
+The unannotated programs give a floor with no LLM: none of the 30 is proved in the stored baseline, so every program can tell briefs apart. It took 26 minutes, and `run --briefs-dataset <dir>` also stores it in the run file.
 
 ```bash
 python3 scripts/benchmark_briefs.py control --dataset path/to/dataset
@@ -142,4 +154,4 @@ It reports each arm's rates both ways, per corpus, and the paired counts (progra
 
 ## Adding a target
 
-Add an entry to the manifest's `targets` with a full commit id, a `scope`, and one harness per module (named as `build_callgraph_dag.py` names it). Harnesses use `generate_harness.py`'s options, so `call_expr`, or `eva_expr` and `fuzz_expr`, say what Eva and LibFuzzer call. Files the harness needs go under [`../benchmark/assets/`](../benchmark/assets/). `python3 scripts/benchmark.py check-manifest` validates the result. Changing a target's harness, scope or tuning warns in the next comparison, because its counts are no longer like for like.
+Add an entry to the manifest's `targets` with a full commit id, a `scope`, and one harness per module (named as `build_callgraph_dag.py` names it). Harnesses use `generate_harness.py`'s options, so `call_expr`, or `eva_expr` and `fuzz_expr`, say what Eva and LibFuzzer call. Files the harness needs go under [`../benchmark/assets/`](../benchmark/assets/). `python3 scripts/benchmark.py check-manifest` validates the result, and `run --target <id> --phase0-only` checks the harness without the analysis. Changing a target's harness, scope or tuning warns in the next comparison, because its counts are no longer like for like.
