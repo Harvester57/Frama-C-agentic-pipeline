@@ -1582,3 +1582,34 @@ def test_infer_class_shell_unwrapping_and_script_inspection(tmp_path, monkeypatc
     other_script = tmp_path / "other.sh"
     other_script.write_text("#!/bin/bash\necho hello world\n", encoding="utf-8")
     assert R.infer_class(f"bash {other_script}") == "light"
+
+
+def test_infer_class_scans_only_shell_scripts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    body = "python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz\n"
+
+    # Named by a shell, a .sh suffix, or a shell shebang: scanned, whatever the file is called.
+    (tmp_path / "plain").write_text(body, encoding="utf-8")
+    assert R.infer_class("bash ./plain") == "phase-dynamic"
+    (tmp_path / "plain.sh").write_text(body, encoding="utf-8")
+    assert R.infer_class("./plain.sh") == "phase-dynamic"
+    for shebang in ("#!/bin/sh -e", "#!/usr/bin/env bash", "#!/usr/bin/env -S bash -e", "#!/bin/dash"):
+        (tmp_path / "tool").write_text(f"{shebang}\n{body}", encoding="utf-8")
+        assert R.infer_class("./tool") == "phase-dynamic", shebang
+
+    # A file that only mentions the command is not what the job runs.
+    (tmp_path / "driver.py").write_text(f"#!/usr/bin/env python3\nCMD = '''{body}'''\n", encoding="utf-8")
+    assert R.infer_class("python3 ./driver.py next") == "light"
+    assert R.infer_class("./driver.py next") == "light"
+    (tmp_path / "notes.md").write_text(body, encoding="utf-8")
+    assert R.infer_class("cat ./notes.md") == "light"
+    (tmp_path / "shish").write_text(f"#!/usr/bin/shish\n{body}", encoding="utf-8")
+    assert R.infer_class("./shish") == "light"
+
+
+def test_infer_class_ignores_source_of_pipeline_scripts():
+    # The class comes from the command, so running a script by absolute path (as in the image) must not change it.
+    scripts = sorted(Path(R.__file__).parent.glob("*.py"))
+    assert any(R._match_class_patterns(p.read_text(encoding="utf-8", errors="replace")[:65536]) for p in scripts)
+    for path in scripts:
+        assert R.infer_class(f'python3 "{path}" status') == R.infer_class(f"python3 {path.name} status"), path.name
