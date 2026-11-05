@@ -77,6 +77,82 @@ from resources import CLASSES  # noqa: E402
 BASE_DOMAINS = ("cvalue", "equality", "symbolic-locations", "octagon", "gauges")
 DEFAULT_AUTO_LOOP_UNROLL = 32
 _DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_C_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+_PTR_FUNC_DEF_RE = re.compile(
+    r"(?:^|\n)\s*(?:(?:static|inline|__inline__|extern|[A-Za-z_][A-Za-z0-9_]*)\s+)*"
+    r"\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{",
+)
+_FUNC_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_FN_PTR_INIT_RE = re.compile(
+    r"\(\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\([^;={}]+?\)\s*=\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+_BASE_ALLOCATORS = frozenset({"malloc", "calloc", "realloc"})
+_MAX_WRAPPER_BODY_LINES = 25
+
+
+def detect_alloc_wrappers(sources: Iterable[str | Path]) -> list[str]:
+    """
+    Scan slice C sources for small pointer-returning wrapper functions around `malloc`, `calloc`, or
+    `realloc` (including 1-hop static function-pointer tables like `__ares_malloc = default_malloc`).
+    Listing these in `-eva-alloc-functions` lets Frama-C Eva's `by_stack` allocation builtin create
+    distinct dynamic bases at each wrapper's caller site rather than funneling all allocations through
+    the wrapper's single call site.
+    """
+    fn_bodies: dict[str, set[str]] = {}
+    fn_ptr_targets: dict[str, str] = {}
+    for src in sources:
+        path = Path(src)
+        if not path.is_file():
+            continue
+        try:
+            text = _C_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        for m_ptr in _FN_PTR_INIT_RE.finditer(text):
+            fn_ptr_targets[m_ptr.group(1)] = m_ptr.group(2)
+        for m_fn in _PTR_FUNC_DEF_RE.finditer(text):
+            name = m_fn.group(1)
+            if name in _BASE_ALLOCATORS or name in ("if", "while", "for", "switch"):
+                continue
+            brace_start = m_fn.end() - 1
+            depth = 0
+            end_idx = len(text)
+            for idx in range(brace_start, len(text)):
+                ch = text[idx]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = idx
+                        break
+            body = text[brace_start + 1 : end_idx]
+            if body.count("\n") > _MAX_WRAPPER_BODY_LINES:
+                continue
+            callees = {c for c in _FUNC_CALL_RE.findall(body) if c != name}
+            fn_bodies.setdefault(name, set()).update(callees)
+
+    resolved_bodies: dict[str, set[str]] = {}
+    for name, callees in fn_bodies.items():
+        expanded = set(callees)
+        for callee in list(callees):
+            if callee in fn_ptr_targets:
+                expanded.add(fn_ptr_targets[callee])
+        resolved_bodies[name] = expanded
+
+    known_allocs = set(_BASE_ALLOCATORS)
+    wrappers: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, callees in resolved_bodies.items():
+            if name not in wrappers and (callees & known_allocs):
+                wrappers.add(name)
+                known_allocs.add(name)
+                changed = True
+    return sorted(wrappers)
+
+
 # Report files restored from the cache; the .sav is never cached.
 _CACHED_OUTPUTS = {
     "alarms.csv": "csv_file",
@@ -279,11 +355,16 @@ def collect_flows(sav_path: Path, out_dir: Path, timeout: int = FLOWS_TIMEOUT_S)
     return {"status": "ok", "reason": None, "by_function": by_function, "call_edges": parse_callgraph_dot(dot_text)}
 
 
-def eva_domains(extra_domains: list[str] | str | None = None) -> str:
+def eva_domains(extra_domains: list[str] | str | None = None, precision: int | None = None) -> str:
     """`-eva-domains` value: the base domains plus extra ones (e.g. `taint`), deduplicated."""
     if isinstance(extra_domains, str):
         extra_domains = extra_domains.split(",")
-    domains = list(BASE_DOMAINS)
+    if precision is not None and precision < 2:
+        domains = ["cvalue"]
+    elif precision == 2:
+        domains = ["cvalue", "equality", "symbolic-locations"]
+    else:
+        domains = list(BASE_DOMAINS)
     for raw in extra_domains or []:
         dom = raw.strip()
         if not dom:
@@ -369,14 +450,114 @@ def run_eva_on_slice(
     def _finalize(res: dict) -> dict:
         # Never cached: these describe this invocation, and the digest is taken fresh each time.
         res["sources"] = list(sources)
-        res["eva_options"] = options
+        res["eva_options"] = res.get("eva_options") or options
         res["loop_unroll"] = [ref.to_json() for ref in applied]
         res["loop_unroll_dropped"] = [ref.to_json() for ref in dropped]
         res["input_digest"] = input_digest
         return res
 
     def _run() -> dict:
-        return _execute_eva(cmd, eff_sources, main_fn, out_dir, reduced_checks, timeout, path_root=path_root)
+        budget_s = float(timeout) if timeout is not None and timeout > 0 else None
+        started_all = time.monotonic()
+
+        def _remaining(default_s: int = 300) -> int | None:
+            if budget_s is None:
+                return None
+            rem = int(budget_s - (time.monotonic() - started_all))
+            return rem if rem >= 30 else default_s
+
+        can_timeout_fallback = (
+            budget_s is not None and budget_s >= 120 and options.get("precision") is None and not options.get("domains")
+        )
+
+        cur_allow_rec = allow_incomplete_recursion_specs
+        cur_cmd, cur_reduced = cmd, reduced_checks
+        res = _execute_eva(cur_cmd, eff_sources, main_fn, out_dir, cur_reduced, timeout, path_root=path_root)
+
+        # Auto-retry when Frama-C aborts on a recursive call or indirect callback cycle without an ACSL assigns clause.
+        if (
+            res["status"] == "analysis_error"
+            and not cur_allow_rec
+            and _is_missing_assigns_error(out_dir / "eva.log", res.get("error_summary") or [])
+        ):
+            cur_allow_rec = True
+            cur_cmd, cur_reduced = _eva_command(
+                eff_sources,
+                main_fn,
+                out_dir,
+                machdep,
+                eff_cppflags,
+                slevel,
+                warn_invalid_pointer,
+                warn_unsigned,
+                warn_unsigned_downcast,
+                extra_domains,
+                mlevel=mlevel,
+                allow_incomplete_recursion_specs=True,
+                eva_options=options,
+            )
+            res = _execute_eva(
+                cur_cmd,
+                eff_sources,
+                main_fn,
+                out_dir,
+                cur_reduced,
+                _remaining(int(budget_s or 300)),
+                path_root=path_root,
+            )
+            res["auto_recursion_fallback"] = True
+
+        # Fast cvalue fallback when the default 5-domain base run times out.
+        if res["status"] == "analysis_timeout" and can_timeout_fallback:
+            fb_budget = min(900, max(120, int((budget_s or 600) // 4)))
+            for tier_name, fb_opts in _timeout_fallback_tiers(slevel, options):
+                fb_cmd, fb_reduced = _eva_command(
+                    eff_sources,
+                    main_fn,
+                    out_dir,
+                    machdep,
+                    eff_cppflags,
+                    slevel,
+                    warn_invalid_pointer,
+                    warn_unsigned,
+                    warn_unsigned_downcast,
+                    extra_domains,
+                    mlevel=mlevel,
+                    allow_incomplete_recursion_specs=cur_allow_rec,
+                    eva_options=fb_opts,
+                )
+                fb_res = _execute_eva(fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root)
+                if (
+                    fb_res["status"] == "analysis_error"
+                    and not cur_allow_rec
+                    and _is_missing_assigns_error(out_dir / "eva.log", fb_res.get("error_summary") or [])
+                ):
+                    cur_allow_rec = True
+                    fb_cmd, fb_reduced = _eva_command(
+                        eff_sources,
+                        main_fn,
+                        out_dir,
+                        machdep,
+                        eff_cppflags,
+                        slevel,
+                        warn_invalid_pointer,
+                        warn_unsigned,
+                        warn_unsigned_downcast,
+                        extra_domains,
+                        mlevel=mlevel,
+                        allow_incomplete_recursion_specs=True,
+                        eva_options=fb_opts,
+                    )
+                    fb_res = _execute_eva(
+                        fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root
+                    )
+                    fb_res["auto_recursion_fallback"] = True
+                if fb_res["status"] == "ok":
+                    fb_res["eva_options"] = fb_opts
+                    fb_res["timeout_fallback"] = tier_name
+                    return fb_res
+                res = fb_res
+        return res
 
     if not use_cache:
         res = _run()
@@ -426,6 +607,46 @@ def _input_digest(sources: list[str], flags: list[str]) -> str | None:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def _is_missing_assigns_error(log_path: Path, error_summary: list[str]) -> bool:
+    """Whether Frama-C Eva aborted due to a recursive call / callback cycle lacking an ACSL assigns clause."""
+    if any("assigns:missing" in line or "without assigns clause" in line for line in error_summary):
+        return True
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+    except OSError:
+        return False
+    return "[eva:assigns:missing]" in text or "without assigns clause" in text
+
+
+def _timeout_fallback_tiers(slevel: int, base_options: dict) -> list[tuple[str, dict]]:
+    """
+    Fast cvalue-only fallback configurations when the default 5-domain base run exceeds its wall-clock budget.
+    Tier 1 preserves per-callstack allocation (`by_stack`) and `split-return=auto`; Tier 2 drops to `precision=0`
+    and `alloc-builtin=imprecise` if Tier 1 also times out.
+    """
+    tier1 = {
+        **base_options,
+        "precision": 1,
+        "slevel": min(max(10, slevel), 20),
+        "split-return": base_options.get("split-return", "auto"),
+        "widening-delay": 1,
+        "widening-period": 1,
+        "remove-redundant-alarms": True,
+    }
+    tier2 = {
+        **base_options,
+        "precision": 0,
+        "slevel": min(max(5, slevel), 10),
+        "auto-loop-unroll": 2,
+        "split-return": base_options.get("split-return", "auto"),
+        "alloc-builtin": "imprecise",
+        "widening-delay": 1,
+        "widening-period": 1,
+        "remove-redundant-alarms": True,
+    }
+    return [("cvalue_fast", tier1), ("cvalue_imprecise_alloc", tier2)]
+
+
 def _eva_command(
     sources: list[str],
     main_fn: str,
@@ -444,9 +665,16 @@ def _eva_command(
     if mlevel < 0:
         raise ValueError(f"mlevel must be >= 0 (got {mlevel})")
     options = dict(eva_options or {})
+    if "alloc-functions" not in options:
+        detected_allocs = detect_alloc_wrappers(sources)
+        if detected_allocs:
+            options["alloc-functions"] = detected_allocs
+    precision = options.get("precision")
+    eff_precision = precision if isinstance(precision, int) and not isinstance(precision, bool) else None
     # These two always appear on the command line; an option only changes their value.
     slevel = options.pop("slevel", slevel)
-    auto_loop_unroll = options.pop("auto-loop-unroll", DEFAULT_AUTO_LOOP_UNROLL)
+    default_unroll = 0 if (eff_precision is not None and eff_precision < 2) else DEFAULT_AUTO_LOOP_UNROLL
+    auto_loop_unroll = options.pop("auto-loop-unroll", default_unroll)
     domains = list(extra_domains.split(",") if isinstance(extra_domains, str) else (extra_domains or []))
     domains += option_domains(options)
     csv_path = out_dir / "alarms.csv"
@@ -489,7 +717,7 @@ def _eva_command(
             "-then",
             "-eva",
             "-eva-domains",
-            eva_domains(domains),
+            eva_domains(domains, precision=eff_precision),
             "-eva-slevel",
             str(slevel),
             "-eva-auto-loop-unroll",

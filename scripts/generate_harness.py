@@ -1071,11 +1071,31 @@ def _normalize_dag_cppflag(tok: str) -> str:
     return tok
 
 
+def _normalize_cppflags_dirs(cppflags: str) -> str:
+    """Normalize container-absolute `-I/framac-run/...` or `-I/target/...` flags and deduplicate."""
+    tokens = _split_cppflags(cppflags)
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-I" and i + 1 < len(tokens):
+            norm_tok = f"-I{_normalize_run_rel_dir(tokens[i + 1])}"
+            i += 2
+        else:
+            norm_tok = _normalize_dag_cppflag(tok)
+            i += 1
+        if norm_tok.startswith(("-I", "-D", "-U", "-std=")) and norm_tok in out:
+            continue
+        out.append(norm_tok)
+    return " ".join(out) or "-I."
+
+
 def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -> str:
     """
     If `callgraph_dag.json` exists next to `out_dir` (e.g. `workspace/reports/callgraph_dag.json`),
     normalize and merge its discovered `-I`/`-D` flags for `module_name` into `cppflags`.
     """
+    cppflags = _normalize_cppflags_dirs(cppflags)
     dag_candidates = [
         out_dir.parent / "reports" / "callgraph_dag.json",
         Path("workspace/reports/callgraph_dag.json"),
@@ -1114,10 +1134,12 @@ def _merge_dag_harness_sources(
     inspect identifiers referenced in the harness invocation snippets (`entry_fn`,
     `call_expr`, `eva_expr`, `fuzz_expr`), resolve any in-tree functions or header
     `static inline` wrappers via the DAG, and append their module `required_sources`
-    (preserving `workspace/work/` prefix conventions from `sources`).
+    (preserving `workspace/work/` prefix conventions from `sources` and respecting
+    explicit sub-module slices).
     """
-    if include_source or not sources:
-        return list(sources)
+    norm_sources = [_normalize_run_rel_dir(s) for s in sources if isinstance(s, str) and s.strip()]
+    if include_source or not norm_sources:
+        return list(norm_sources)
     dag_candidates = [
         out_dir.parent / "reports" / "callgraph_dag.json",
         Path("workspace/reports/callgraph_dag.json"),
@@ -1134,13 +1156,13 @@ def _merge_dag_harness_sources(
         except (OSError, ValueError):
             continue
     if not dag:
-        return list(sources)
+        return list(norm_sources)
 
     functions_map = dag.get("functions") or {}
     modules_map = dag.get("modules") or {}
     inline_map = dag.get("header_inline_callees") or {}
     if not isinstance(functions_map, dict) or not isinstance(modules_map, dict):
-        return list(sources)
+        return list(norm_sources)
 
     referenced_idents: set[str] = set()
     for snippet in invocation_snippets:
@@ -1157,11 +1179,11 @@ def _merge_dag_harness_sources(
                     target_fns.add(resolved_fn)
 
     if not target_fns:
-        return list(sources)
+        return list(norm_sources)
 
     # Determine whether `sources` uses a prefix like `workspace/work/`
     prefix = ""
-    first_norm = sources[0].replace("\\", "/").strip()
+    first_norm = norm_sources[0]
     if first_norm.startswith("workspace/work/"):
         prefix = "workspace/work/"
     elif (out_dir.parent / "work").is_dir() and first_norm.startswith(
@@ -1169,8 +1191,14 @@ def _merge_dag_harness_sources(
     ):
         prefix = (out_dir.parent / "work").as_posix().rstrip("/") + "/"
 
-    merged = list(sources)
-    seen_norm = {s.replace("\\", "/").strip() for s in merged}
+    def _rel_path(p: str) -> str:
+        clean = _normalize_run_rel_dir(p)
+        return clean[len(prefix) :] if (prefix and clean.startswith(prefix)) else clean
+
+    caller_rel_set = {_rel_path(s) for s in norm_sources}
+    merged = list(norm_sources)
+    seen_rel = set(caller_rel_set)
+
     for fn_name in sorted(target_fns):
         fn_rec = functions_map.get(fn_name)
         if not isinstance(fn_rec, dict):
@@ -1183,14 +1211,12 @@ def _merge_dag_harness_sources(
         elif isinstance(fn_rec.get("file"), str):
             extra_rels.append(fn_rec["file"])
         for rel in extra_rels:
-            rel_clean = rel.replace("\\", "/").strip()
-            if prefix and not rel_clean.startswith(prefix):
-                cand = f"{prefix}{rel_clean}"
-            else:
-                cand = rel_clean
-            if cand not in seen_norm and rel_clean not in seen_norm:
-                merged.append(cand)
-                seen_norm.add(cand)
+            rel_clean = _rel_path(rel)
+            if rel_clean in seen_rel:
+                continue
+            cand = f"{prefix}{rel_clean}" if (prefix and not rel_clean.startswith(prefix)) else rel_clean
+            merged.append(cand)
+            seen_rel.add(rel_clean)
     return merged
 
 

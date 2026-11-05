@@ -685,6 +685,7 @@ def finish(args: argparse.Namespace) -> dict:
 
     tuner = Tuner(args)
     base = tuner.read_trial("base")
+    rungs = [tuner.read_trial(name) for name in args.rungs]
 
     def write(report: dict) -> dict:
         report["module"] = args.module
@@ -693,11 +694,17 @@ def finish(args: argparse.Namespace) -> dict:
         return report
 
     if not base.completed:
-        failed = {"error_summary": [], **base.report}
-        if failed.get("status") == "no_report":
-            failed.update(status="analysis_error", reason="no_report")
-        failed["tuning"] = {"mode": "skipped", "reason": "the base run did not complete"}
-        return write(failed)
+        completed_rungs = [
+            r for r in rungs if r.completed and r.report.get("input_digest") and not degeneration_reason(r.log_text)
+        ]
+        if not completed_rungs:
+            failed = {"error_summary": [], **base.report}
+            if failed.get("status") == "no_report":
+                failed.update(status="analysis_error", reason="no_report")
+            failed["tuning"] = {"mode": "skipped", "reason": "the base run did not complete"}
+            return write(failed)
+        base = min(completed_rungs, key=lambda r: r.score())
+        rungs = [r for r in rungs if r is not base]
     if not base.unknown_rows:
         clean = {**base.report, **base.reach}
         clean["tuning"] = {"mode": "skipped", "reason": "the base run left no Unknown obligations"}
@@ -705,7 +712,6 @@ def finish(args: argparse.Namespace) -> dict:
 
     record = load_params(args.run_dir)["modules"].get(args.module, {}).get("eva_tuned")
     replay = record_is_current(record, args.settings_digest, base.report.get("input_digest"))
-    rungs = [tuner.read_trial(name) for name in args.rungs]
     by_name = {run.name: run for run in rungs}
 
     if replay:

@@ -33,12 +33,15 @@ MAX_INT_OPTION = 1_000_000
 EXTRA_DOMAINS = ("multidim",)
 SPLIT_RETURN_WORDS = ("auto", "full")
 EQUALITY_THROUGH_CALLS = ("none", "formals", "all")
+ALLOC_BUILTIN_MODES = ("imprecise", "by_stack", "fresh", "fresh_weak")
+STD_ALLOC_FUNCTIONS = ("malloc", "calloc", "realloc")
 _SIMPLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+_C_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass(frozen=True)
 class EvaOption:
-    kind: str  # int | bool | enum | split_return | domains
+    kind: str  # int | bool | enum | split_return | domains | func_list
     minimum: int = 0
     maximum: int = MAX_INT_OPTION
     choices: tuple[str, ...] = ()
@@ -49,12 +52,16 @@ EVA_OPTIONS: dict[str, EvaOption] = {
     "min-loop-unroll": EvaOption("int"),
     "auto-loop-unroll": EvaOption("int"),
     "widening-delay": EvaOption("int", minimum=1),
+    "widening-period": EvaOption("int", minimum=1),
     "partition-history": EvaOption("int"),
     "slevel": EvaOption("int"),
     "ilevel": EvaOption("int", minimum=2),
     "plevel": EvaOption("int"),
     "subdivide-non-linear": EvaOption("int"),
+    "unroll-recursive-calls": EvaOption("int"),
     "split-return": EvaOption("split_return"),
+    "alloc-builtin": EvaOption("enum", choices=ALLOC_BUILTIN_MODES),
+    "alloc-functions": EvaOption("func_list"),
     "remove-redundant-alarms": EvaOption("bool"),
     "octagon-through-calls": EvaOption("bool"),
     "equality-through-calls": EvaOption("enum", choices=EQUALITY_THROUGH_CALLS),
@@ -85,6 +92,13 @@ def option_problem(name: str, value: Any) -> str | None:
         if isinstance(value, int) or value in SPLIT_RETURN_WORDS:
             return None
         return f"{name} must be auto, full or an integer return code"
+    if spec.kind == "func_list":
+        if not isinstance(value, list) or not value or not all(isinstance(fn, str) for fn in value):
+            return f"{name} must be a non-empty list of C function names"
+        bad = [fn for fn in value if not _C_IDENT_RE.fullmatch(fn)]
+        if bad or len(set(value)) != len(value):
+            return f"{name} must contain unique valid C identifiers (got {value})"
+        return None
     if not isinstance(value, list) or not value or not all(isinstance(d, str) for d in value):
         return f"{name} must be a non-empty list of domain names"
     unknown = sorted(set(value) - set(EXTRA_DOMAINS))
@@ -122,7 +136,7 @@ def parse_option(text: str) -> tuple[str, Any]:
             value = lowered == "true"
         elif spec.kind == "split_return" and raw.strip() not in SPLIT_RETURN_WORDS:
             value = _parse_int(name, raw)
-        elif spec.kind == "domains":
+        elif spec.kind in ("domains", "func_list"):
             value = [d.strip() for d in raw.split(",") if d.strip()]
     problem = option_problem(name, value)
     if problem:
@@ -162,6 +176,9 @@ def framac_args(options: Mapping[str, Any]) -> list[str]:
             continue
         if spec.kind == "bool":
             args.append(f"-eva-{name}" if value else f"-eva-no-{name}")
+        elif spec.kind == "func_list":
+            funcs = list(dict.fromkeys([*STD_ALLOC_FUNCTIONS, *value]))
+            args.extend([f"-eva-{name}", ",".join(funcs)])
         else:
             args.extend([f"-eva-{name}", str(value)])
     return args
@@ -182,7 +199,7 @@ def merge_options(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[s
         kind = EVA_OPTIONS[name].kind
         if kind == "int" and name in merged:
             merged[name] = max(merged[name], value)
-        elif kind == "domains" and name in merged:
+        elif kind in ("domains", "func_list") and name in merged:
             merged[name] = sorted(set(merged[name]) | set(value))
         else:
             merged[name] = value

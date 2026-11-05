@@ -774,3 +774,39 @@ int main_decode_entry(const unsigned char *buf, unsigned int len) {
             "workspace/work/src/number_decode.c",
             "workspace/work/src/tag_decode.c",
         ]
+
+        # When /framac-run/ prefixes are passed in sources and cppflags,
+        # generate_module_harness normalizes and deduplicates them against required_sources.
+        sliced_dag = {
+            "modules": {
+                "lib": {
+                    "files": ["src/lib/parse.c", "src/lib/buf.c"],
+                    "required_sources": ["src/lib/parse.c", "src/lib/buf.c"],
+                    "cppflags": ["-I/framac-run/workspace/work/include"],
+                }
+            },
+            "functions": {
+                "dns_parse": {"file": "src/lib/parse.c", "module": "lib", "callees": ["buf_read"]},
+                "buf_read": {"file": "src/lib/buf.c", "module": "lib", "callees": []},
+            },
+            "header_inline_callees": {},
+        }
+        (reports_dir / "callgraph_dag.json").write_text(json.dumps(sliced_dag), encoding="utf-8")
+        sliced_res = generate_module_harness(
+            module_name="lib",
+            sources=["/framac-run/workspace/work/src/lib/parse.c"],
+            header_include="none",
+            entry_fn="dns_parse",
+            max_input_size=256,
+            cppflags="-I/framac-run/workspace/work/include",
+            out_dir=harnesses_dir,
+            entry_style="custom",
+            call_expr="dns_parse(fuzz_buf, fuzz_len);",
+            auto_prelude=False,
+        )
+        assert sliced_res["sources"] == [
+            "workspace/work/src/lib/parse.c",
+            "workspace/work/src/lib/buf.c",
+        ]
+        assert sliced_res["cppflags"].count("-Iworkspace/work/include") == 1
+        assert "/framac-run" not in sliced_res["cppflags"]

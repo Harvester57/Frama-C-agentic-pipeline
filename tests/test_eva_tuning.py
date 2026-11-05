@@ -216,6 +216,48 @@ def test_eva_command_carries_options_and_keeps_every_check():
     assert plain[plain.index("-eva-auto-loop-unroll") + 1] == "32"
 
 
+def test_eva_command_low_precision_trims_relational_domains_and_unroll():
+    fast, _ = run_eva_slice._eva_command(
+        ["a.c"],
+        "eva_main",
+        Path("out"),
+        "gcc_x86_64",
+        "-I.",
+        0,
+        True,
+        True,
+        True,
+        "",
+        eva_options={
+            "precision": 0,
+            "alloc-builtin": "imprecise",
+            "widening-period": 1,
+            "unroll-recursive-calls": 2,
+        },
+    )
+    assert fast[fast.index("-eva-domains") + 1] == "cvalue"
+    assert fast[fast.index("-eva-auto-loop-unroll") + 1] == "0"
+    assert fast[fast.index("-eva-alloc-builtin") + 1] == "imprecise"
+    assert fast[fast.index("-eva-widening-period") + 1] == "1"
+    assert fast[fast.index("-eva-unroll-recursive-calls") + 1] == "2"
+
+    med, _ = run_eva_slice._eva_command(
+        ["a.c"],
+        "eva_main",
+        Path("out"),
+        "gcc_x86_64",
+        "-I.",
+        10,
+        True,
+        True,
+        True,
+        "taint",
+        eva_options={"precision": 2},
+    )
+    assert med[med.index("-eva-domains") + 1] == "cvalue,equality,symbolic-locations,taint"
+    assert med[med.index("-eva-auto-loop-unroll") + 1] == "32"
+
+
 # ---------------------------------------------------------------------------
 # Reachability, in the shape planned for run_eva_slice.py
 # ---------------------------------------------------------------------------
@@ -1379,3 +1421,151 @@ def test_make_dry_run_of_the_ladder(tmp_path):
     assert "--eva-option=slevel=500" in out
     assert "--loop-unroll=workspace/work/a.c#f#0=64" in out
     assert "--mirror-root=workspace/eva/cfg/tune/mirrors/" in out
+
+
+# ---------------------------------------------------------------------------
+# Generalizations: custom alloc wrappers, auto recursion fallback, and timeout fallback
+# ---------------------------------------------------------------------------
+
+
+def test_alloc_functions_option_validation_and_formatting():
+    name, val = eo.parse_option("alloc-functions=ares_malloc,ares_realloc")
+    assert name == "alloc-functions" and val == ["ares_malloc", "ares_realloc"]
+    assert eo.format_option(name, val) == "alloc-functions=ares_malloc,ares_realloc"
+    args = eo.framac_args({"alloc-functions": ["ares_malloc", "malloc", "ares_realloc"]})
+    assert args == ["-eva-alloc-functions", "malloc,calloc,realloc,ares_malloc,ares_realloc"]
+    merged = eo.merge_options({"alloc-functions": ["ares_malloc"]}, {"alloc-functions": ["ares_realloc"]})
+    assert merged == {"alloc-functions": ["ares_malloc", "ares_realloc"]}
+    for bad in ("alloc-functions=", "alloc-functions=bad-name", "alloc-functions=a,a"):
+        with pytest.raises(ValueError):
+            eo.parse_option(bad)
+
+
+def test_detect_alloc_wrappers_finds_direct_and_indirect_wrappers(tmp_path):
+    mem_c = tmp_path / "ares_library_init.c"
+    mem_c.write_text(
+        """
+        static void *default_malloc(size_t size) {
+            if (size == 0) return NULL;
+            return malloc(size);
+        }
+        static void *default_realloc(void *p, size_t size) {
+            return realloc(p, size);
+        }
+        static void *(*__ares_malloc)(size_t size) = default_malloc;
+        static void *(*__ares_realloc)(void *ptr, size_t size) = default_realloc;
+        void *ares_malloc(size_t size) {
+            return __ares_malloc(size);
+        }
+        void *ares_realloc(void *ptr, size_t size) {
+            return __ares_realloc(ptr, size);
+        }
+        void *ares_malloc_zero(size_t size) {
+            void *ptr = ares_malloc(size);
+            if (ptr != NULL) memset(ptr, 0, size);
+            return ptr;
+        }
+        int not_an_allocator(size_t size) {
+            return (int)size;
+        }
+        """,
+        encoding="utf-8",
+    )
+    wrappers = run_eva_slice.detect_alloc_wrappers([mem_c])
+    assert wrappers == [
+        "ares_malloc",
+        "ares_malloc_zero",
+        "ares_realloc",
+        "default_malloc",
+        "default_realloc",
+    ]
+    cmd, _ = run_eva_slice._eva_command(
+        [str(mem_c)], "eva_main", tmp_path / "out", "gcc_x86_64", "-I.", 100, True, True, True, None
+    )
+    idx = cmd.index("-eva-alloc-functions")
+    assert (
+        cmd[idx + 1] == "malloc,calloc,realloc,ares_malloc,ares_malloc_zero,ares_realloc,default_malloc,default_realloc"
+    )
+
+
+def test_auto_retry_on_missing_assigns_recursion_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_eva_slice, "_input_digest", lambda sources, flags: "d")
+    calls: list[tuple[list[str], list[str]]] = []
+
+    def fake_execute(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root=None):
+        calls.append((cmd, list(reduced_checks)))
+        if "-eva-warn-key" not in cmd:
+            (out_dir / "eva.log").write_text(
+                "[eva:assigns:missing] a.c:10: Recursive call to parse_node without assigns clause.\n"
+                "[eva] User Error: Deferred error message was emitted during execution. See above messages for more information.\n",
+                encoding="utf-8",
+            )
+            return {
+                "status": "analysis_error",
+                "reason": "exit_1",
+                "error_summary": ["[eva] User Error: Deferred error message was emitted during execution."],
+                "sources": sources,
+                "reduced_checks": reduced_checks,
+            }
+        return {"status": "ok", "sources": sources, "reduced_checks": reduced_checks}
+
+    monkeypatch.setattr(run_eva_slice, "_execute_eva", fake_execute)
+    res = run_eva_slice.run_eva_on_slice(["a.c"], "eva_main", tmp_path / "out", use_cache=False)
+    assert res["status"] == "ok"
+    assert res.get("auto_recursion_fallback") is True
+    assert len(calls) == 2
+    assert "-eva-warn-key" in calls[1][0]
+    assert any("assigns:missing=warning" in item for item in res["reduced_checks"])
+
+
+def test_timeout_fallback_retries_with_fast_cvalue_tier(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_eva_slice, "_input_digest", lambda sources, flags: "d")
+    commands: list[list[str]] = []
+
+    def fake_execute(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root=None):
+        commands.append(cmd)
+        if len(commands) == 1:
+            return {
+                "status": "analysis_timeout",
+                "reason": "timeout",
+                "error_summary": ["exceeded wall-clock limit"],
+                "sources": sources,
+                "reduced_checks": reduced_checks,
+            }
+        return {"status": "ok", "sources": sources, "reduced_checks": reduced_checks}
+
+    monkeypatch.setattr(run_eva_slice, "_execute_eva", fake_execute)
+    res = run_eva_slice.run_eva_on_slice(["a.c"], "eva_main", tmp_path / "out", timeout=300, use_cache=False)
+    assert res["status"] == "ok"
+    assert res.get("timeout_fallback") == "cvalue_fast"
+    assert res["eva_options"]["precision"] == 1
+    assert res["eva_options"]["split-return"] == "auto"
+    assert len(commands) == 2
+    assert commands[0][commands[0].index("-eva-domains") + 1].startswith("cvalue,equality")
+    assert commands[1][commands[1].index("-eva-domains") + 1] == "cvalue"
+
+
+def test_finish_promotes_best_completed_rung_when_base_times_out(tune_run, capsys):
+    write_json(tune_run / pm.TUNE_REPORT_DIR / "m/base.json", {"status": "analysis_timeout"})
+    _write_trial(
+        tune_run,
+        "m",
+        "returns",
+        [_csv_row(1, "Valid"), _csv_row(2)],
+        eva_options={"split-return": "auto", "slevel": 500},
+    )
+    _write_trial(
+        tune_run,
+        "m",
+        "slevel",
+        [_csv_row(1), _csv_row(2, "Valid")],
+        eva_options={"slevel": 1000},
+    )
+    assert et.main(_finish_args(tune_run, ["returns", "slevel"])) == 0
+    capsys.readouterr()
+    report = json.loads((tune_run / "workspace/reports/eva/m.json").read_text(encoding="utf-8"))
+    assert report["status"] == "ok"
+    assert report["unknown_count"] == 0
+    assert report["tuning"]["selected"] in ("returns", "slevel")
