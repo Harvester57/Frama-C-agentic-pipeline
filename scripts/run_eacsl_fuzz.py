@@ -24,6 +24,9 @@ Modes:
 6. `replay-candidates`: replays the reproducers of every unverified candidate on its module's
    binary (built with Make's spec, `pipeline_make.module_build_spec`, so it is the cache entry
    of `make build`) and writes one report per candidate plus index.json.
+7. `coverage`: measures which target functions and code regions a module's corpus executes, by
+   replaying it on a plain Clang source-coverage build (no E-ACSL, no sanitizers). Outcomes:
+   ok | partial | no_inputs | compile_error | coverage_error. Reach only: never proof or a verdict.
 
 All fuzzer, replay and guardrail executions run through scripts/sandbox_exec.py. The shared
 corpus is never written by the guardrail: new units go to a scratch corpus directory.
@@ -45,6 +48,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -52,6 +56,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -97,6 +102,15 @@ from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed  # noqa: E402
 # Below this, a single LibFuzzer worker cannot have its fixed -rss_limit_mb=2048 alongside
 # runtime/fork overhead without risking cgroup OOM kills (sizing model: 512 + int(2048 * 1.25) = 3072).
 FUZZ_MIN_MEMORY_MB = FUZZ_WORKER_OVERHEAD_MB + int(FUZZ_RSS_LIMIT_MB * 1.25)
+
+# `coverage` mode. Time limits only cut a replay short, and the report then says `partial`.
+COVERAGE_BATCH_SIZE = 256
+COVERAGE_MAX_FAILED_INPUTS = 16
+COVERAGE_MAX_TIME_S = 1200
+COVERAGE_TOOL_TIMEOUT_S = 300
+COVERAGE_MAX_UNCOVERED_RANGES = 32
+COVERAGE_EXTERNAL_PREFIXES = ("/usr/", "/lib/", "/opt/framac-pipeline/")
+LLVM_COV_CODE_REGION = 0
 
 
 def fuzz_required_memory_mb(workers: int = 1) -> int:
@@ -955,29 +969,26 @@ def _compile_eacsl_binary_uncached(
     return _finish(0)
 
 
-def compile_sanitizer_binary(
+def _compile_clang_binary(
+    engine: str,
+    instrument_flags: list[str],
+    log_suffix: str,
     sources: list[str],
     out_bin: Path,
-    cppflags: str = "-I.",
-    fuzzer_flag: bool = True,
-    ldflags_extra: str = "",
-    runner=None,
-    use_cache: bool = True,
+    cppflags: str,
+    ldflags_extra: str,
+    runner,
+    use_cache: bool,
 ) -> dict:
-    """
-    Compile a slice directly with Clang + LibFuzzer + ASan + UBSan when E-ACSL cannot instrument.
-    Cached like `compile_eacsl_binary` (binary and compile log) outside agents/*/scratch.
-    """
+    """Compile a slice directly with Clang, cached (binary and compile log) outside agents/*/scratch."""
     out_bin = Path(out_bin)
-    compile_log = out_bin.with_suffix(".sanitizer_compile.log")
-    san_flags = "-fsanitize=fuzzer,address,undefined" if fuzzer_flag else "-fsanitize=address,undefined"
+    compile_log = out_bin.with_suffix(log_suffix)
     cmd = [
         "clang",
         "-g",
         "-O1",
         "-fcommon",
-        san_flags,
-        "-fno-sanitize-recover=all",
+        *instrument_flags,
         *shlex.split(cppflags),
         *sources,
         "-o",
@@ -993,7 +1004,7 @@ def compile_sanitizer_binary(
             encoding="utf-8",
         )
         return {
-            "engine": "sanitizers",
+            "engine": engine,
             "returncode": rc,
             "command": " ".join(cmd),
             "binary": str(out_bin),
@@ -1008,7 +1019,7 @@ def compile_sanitizer_binary(
         res["cache"] = {"hit": False, "key": None}
         return res
     material = {
-        "kind": "sanitizers",
+        "kind": engine,
         "command": cmd,
         "sources": [str(s) for s in sources],
         "out_bin": out_bin.as_posix(),
@@ -1023,6 +1034,59 @@ def compile_sanitizer_binary(
         ok=lambda res: res.get("returncode") == 0,
         runner=runner,
         on_restore=_note_cache_restore,
+    )
+
+
+def compile_sanitizer_binary(
+    sources: list[str],
+    out_bin: Path,
+    cppflags: str = "-I.",
+    fuzzer_flag: bool = True,
+    ldflags_extra: str = "",
+    runner=None,
+    use_cache: bool = True,
+) -> dict:
+    """
+    Compile a slice directly with Clang + LibFuzzer + ASan + UBSan when E-ACSL cannot instrument.
+    Cached like `compile_eacsl_binary` (binary and compile log) outside agents/*/scratch.
+    """
+    san_flags = "-fsanitize=fuzzer,address,undefined" if fuzzer_flag else "-fsanitize=address,undefined"
+    return _compile_clang_binary(
+        "sanitizers",
+        [san_flags, "-fno-sanitize-recover=all"],
+        ".sanitizer_compile.log",
+        sources,
+        out_bin,
+        cppflags,
+        ldflags_extra,
+        runner,
+        use_cache,
+    )
+
+
+def compile_coverage_binary(
+    sources: list[str],
+    out_bin: Path,
+    cppflags: str = "-I.",
+    ldflags_extra: str = "",
+    runner=None,
+    use_cache: bool = True,
+) -> dict:
+    """
+    Compile a slice with Clang source coverage + LibFuzzer's driver, without E-ACSL or sanitizers:
+    regions then map to the target's own source rather than to generated checks, and a check that
+    aborts cannot lose the profile of the inputs replayed before it.
+    """
+    return _compile_clang_binary(
+        "coverage",
+        ["-fprofile-instr-generate", "-fcoverage-mapping", "-fsanitize=fuzzer"],
+        ".coverage_compile.log",
+        sources,
+        out_bin,
+        cppflags,
+        ldflags_extra,
+        runner,
+        use_cache,
     )
 
 
@@ -2192,6 +2256,298 @@ def replay_candidates(
     }
 
 
+def _written_profiles(profile_dir: Path) -> list[str]:
+    """
+    Raw profiles under `profile_dir` that hold data. The profile runtime creates its file empty at
+    process start and fills it at exit, so a target that calls `_exit(0)` returns 0 and leaves an
+    empty file behind.
+    """
+    return sorted(str(f.resolve()) for f in profile_dir.rglob("*.profraw") if f.stat().st_size > 0)
+
+
+def replay_for_coverage(
+    binary: Path,
+    inputs: list[Path],
+    profile_dir: Path,
+    scratch: Path,
+    *,
+    module: str = "",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    max_time: int = COVERAGE_MAX_TIME_S,
+    batch_size: int = COVERAGE_BATCH_SIZE,
+    max_failed: int = COVERAGE_MAX_FAILED_INPUTS,
+) -> dict:
+    """
+    Replay each input once on a coverage build, in batches. A process that dies writes no profile,
+    so a failed batch is split until the failing inputs stand alone and only they lose their
+    coverage. Stops early after `max_failed` failures or `max_time` seconds; the rest is reported
+    as not replayed.
+    """
+    seed = derive_seed(binary, module)
+    pending = deque(inputs[i : i + batch_size] for i in range(0, len(inputs), batch_size))
+    deadline = time.monotonic() + max_time
+    min_wall = 2 * int(per_input_timeout) + 10
+    replayed = 0
+    failed: list[dict] = []
+    batch_no = 0
+    while pending and len(failed) < max_failed:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        batch = pending.popleft()
+        batch_no += 1
+        batch_dir = profile_dir / f"batch-{batch_no}"
+        wall = min(int(per_input_timeout) * len(batch) + 30, max(int(remaining), min_wall))
+        res = run_sandboxed(
+            [
+                str(Path(binary).resolve()),
+                f"-timeout={per_input_timeout}",
+                f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+                f"-seed={seed}",
+                *[str(Path(f).resolve()) for f in batch],
+            ],
+            writable=[scratch, batch_dir],
+            timeout_s=wall,
+            limits=Limits(cpu_seconds=wall * 2),
+            extra_env={"LLVM_PROFILE_FILE": f"{batch_dir.resolve()}/%p.profraw"},
+        )
+        if res.returncode == 0 and not res.timed_out and _written_profiles(batch_dir):
+            replayed += len(batch)
+            continue
+        shutil.rmtree(batch_dir, ignore_errors=True)
+        if len(batch) > 1:
+            middle = len(batch) // 2
+            pending.appendleft(batch[middle:])
+            pending.appendleft(batch[:middle])
+        else:
+            failed.append(
+                {
+                    "input": batch[0].as_posix(),
+                    "sha256": sha256_file(batch[0]),
+                    "returncode": res.returncode,
+                    "timed_out": res.timed_out,
+                    "log_tail": (res.stdout + "\n" + res.stderr)[-1000:],
+                }
+            )
+    return {
+        "seed": seed,
+        "replayed": replayed,
+        "failed_inputs": failed,
+        "not_replayed": sum(len(b) for b in pending),
+    }
+
+
+def _export_coverage(binary: Path, profile_dir: Path, scratch: Path) -> tuple[dict | None, str | None]:
+    """
+    Merge the raw profiles and export them as llvm-cov JSON: (export, None) or (None, error). The
+    LLVM tools run in the sandbox because the target's own process wrote the profiles they parse.
+    """
+    merged = (scratch / "merged.profdata").resolve()
+    export_path = (scratch / "export.json").resolve()
+    limits = Limits(cpu_seconds=COVERAGE_TOOL_TIMEOUT_S * 2)
+    res = run_sandboxed(
+        ["llvm-profdata", "merge", "-sparse", "-o", str(merged), *_written_profiles(profile_dir)],
+        writable=[scratch],
+        timeout_s=COVERAGE_TOOL_TIMEOUT_S,
+        limits=limits,
+    )
+    if res.returncode != 0 or res.timed_out:
+        return None, f"llvm-profdata merge failed ({res.returncode}): {res.stderr[-1000:]}"
+    # llvm-cov export only writes to stdout, which the sandbox truncates, so redirect it to a file.
+    res = run_sandboxed(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$@" > "$0"',
+            str(export_path),
+            "llvm-cov",
+            "export",
+            "-skip-expansions",
+            "-skip-branches",
+            f"-instr-profile={merged}",
+            str(Path(binary).resolve()),
+        ],
+        writable=[scratch],
+        timeout_s=COVERAGE_TOOL_TIMEOUT_S,
+        limits=limits,
+    )
+    if res.returncode != 0 or res.timed_out:
+        return None, f"llvm-cov export failed ({res.returncode}): {res.stderr[-1000:]}"
+    try:
+        return json.loads(export_path.read_text(encoding="utf-8")), None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"llvm-cov export is unreadable: {exc}"
+
+
+def _coverage_file_role(path: str) -> str:
+    """`target`, `harness` (the generated entry point) or `external` (system and pipeline headers)."""
+    if path.startswith(COVERAGE_EXTERNAL_PREFIXES):
+        return "external"
+    if "/workspace/harnesses/" in f"/{path}" or posixpath.basename(path).startswith("harness_"):
+        return "harness"
+    return "target"
+
+
+def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def summarize_coverage_export(export: dict) -> dict:
+    """
+    Per-function reach of the target's own code from an `llvm-cov export` document. Copies of a
+    header's static function in several translation units count as one function: their executions
+    add up, and a region is covered when any copy ran it. Functions are keyed by file as well,
+    because same-named statics in different files are different functions.
+    """
+    merged: dict[tuple[str, int, str], dict] = {}
+    excluded: Counter[str] = Counter()
+    for fn in export["data"][0].get("functions") or []:
+        regions = fn.get("regions") or []
+        filenames = fn.get("filenames") or []
+        if not regions or not filenames:
+            continue
+        main_id = regions[0][5]
+        path = posixpath.normpath(filenames[main_id])
+        role = _coverage_file_role(path)
+        if role != "target":
+            excluded[role] += 1
+            continue
+        name = str(fn.get("name") or "").rpartition(":")[2]
+        entry = merged.setdefault(
+            (normalize_file(path), regions[0][0], name),
+            {"executions": 0, "regions": {}, "main_regions": set()},
+        )
+        entry["executions"] += int(fn.get("count") or 0)
+        # Distinct regions can share a span: each macro expansion has its own file id with the same
+        # file and span, and zero-width regions repeat a point. The ordinal keeps those apart, while
+        # the copies of a function in other translation units still line up region by region.
+        seen: Counter[tuple] = Counter()
+        for line_start, col_start, line_end, col_end, count, file_id, _expanded, kind in regions:
+            if kind == LLVM_COV_CODE_REGION:
+                span = (file_id, filenames[file_id], line_start, col_start, line_end, col_end)
+                key = (*span, seen[span])
+                seen[span] += 1
+                entry["regions"][key] = entry["regions"].get(key, 0) + count
+                if file_id == main_id:
+                    entry["main_regions"].add(key)
+
+    functions: list[dict] = []
+    for (file_, line, name), entry in sorted(merged.items()):
+        covered = sum(1 for count in entry["regions"].values() if count > 0)
+        record: dict = {
+            "function": name,
+            "file": file_,
+            "line": line,
+            "executions": entry["executions"],
+            "regions": {"total": len(entry["regions"]), "covered": covered},
+        }
+        if entry["executions"] > 0:
+            # Only for functions that ran: an unreached one is uncovered from its first line to its last.
+            missed = [(k[2], k[4]) for k in entry["main_regions"] if entry["regions"][k] == 0]
+            record["uncovered_lines"] = _merge_line_ranges(missed)[:COVERAGE_MAX_UNCOVERED_RANGES]
+        functions.append(record)
+    return {
+        "totals": {
+            "functions": {"total": len(functions), "reached": sum(1 for f in functions if f["executions"] > 0)},
+            "regions": {
+                "total": sum(f["regions"]["total"] for f in functions),
+                "covered": sum(f["regions"]["covered"] for f in functions),
+            },
+        },
+        "functions": functions,
+        "excluded_functions": dict(sorted(excluded.items())),
+    }
+
+
+def coverage_report(
+    module: str,
+    sources: list[str],
+    out_bin: Path,
+    corpus_dirs: list[Path],
+    scratch: Path,
+    *,
+    cppflags: str = "-I.",
+    ldflags: str = "",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    max_time: int = COVERAGE_MAX_TIME_S,
+    use_cache: bool = True,
+) -> dict:
+    """
+    Which target functions and regions the corpus executes. `partial` means some inputs failed or
+    were not replayed, so reached counts are lower bounds. The report says what the corpus reached;
+    it decides no verdict and nothing in the ledger reads it.
+    """
+    files, _missing = _collect_inputs(corpus_dirs)
+    report: dict = {
+        "mode": "coverage",
+        "module": module,
+        "status": "coverage_error",
+        "engine": "clang-source-coverage",
+        "generated_at": utc_now(),
+        "sources": list(sources),
+        "corpus_dirs": [Path(d).as_posix() for d in corpus_dirs],
+        "per_input_timeout": per_input_timeout,
+        "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
+        "inputs": {"total": len(files), "replayed": 0, "failed": 0, "not_replayed": len(files)},
+    }
+    if not files:
+        report.update(status="no_inputs", reason="the corpus has no inputs: nothing was measured")
+        return report
+    comp = compile_coverage_binary(sources, out_bin, cppflags, ldflags, use_cache=use_cache)
+    report["compile"] = comp
+    if comp["returncode"] != 0:
+        report.update(status="compile_error", reason="the coverage build failed")
+        return report
+    binary = Path(comp["binary"])
+    report["binary"] = str(binary)
+
+    # Target code writes into this directory: start empty so that old files are never merged.
+    profile_dir = scratch / "profiles"
+    shutil.rmtree(profile_dir, ignore_errors=True)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    replay = replay_for_coverage(
+        binary,
+        files,
+        profile_dir,
+        scratch,
+        module=module,
+        per_input_timeout=per_input_timeout,
+        max_time=max_time,
+    )
+    report["seed"] = replay["seed"]
+    report["failed_inputs"] = replay["failed_inputs"]
+    report["inputs"] = {
+        "total": len(files),
+        "replayed": replay["replayed"],
+        "failed": len(replay["failed_inputs"]),
+        "not_replayed": replay["not_replayed"],
+    }
+    if not replay["replayed"]:
+        report["reason"] = "no input replayed to completion, so there is no profile"
+        return report
+    export, error = _export_coverage(binary, profile_dir, scratch)
+    if export is None:
+        report["reason"] = error
+        return report
+    try:
+        summary = summarize_coverage_export(export)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        report["reason"] = f"unexpected llvm-cov export shape: {exc!r}"
+        return report
+    if not summary["functions"]:
+        report["reason"] = "the coverage mapping lists no function of the target"
+        return report
+    report.update(summary)
+    report["status"] = "partial" if replay["failed_inputs"] or replay["not_replayed"] else "ok"
+    return report
+
+
 def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -> None:
     p.add_argument("--sources", nargs="+", required=sources_required)
     p.add_argument("--machdep", default="gcc_x86_64")
@@ -2249,9 +2605,12 @@ def _build_options(args) -> dict:
     }
 
 
+_SUMMARY_OMITTED = ("compile", "log_tail", "runtime_trace", "eacsl_compile_attempt", "functions", "failed_inputs")
+
+
 def _summary(res: dict) -> dict:
     """What is printed: the report without logs and compiler output (the JSON file has everything)."""
-    out = {k: v for k, v in res.items() if k not in ("compile", "log_tail", "runtime_trace", "eacsl_compile_attempt")}
+    out = {k: v for k, v in res.items() if k not in _SUMMARY_OMITTED}
     if isinstance(out.get("artifacts"), list):
         out["artifacts"] = [
             {k: v for k, v in a.items() if k not in ("replay_log_tail", "attribution")} if isinstance(a, dict) else a
@@ -2374,6 +2733,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_replay.add_argument("--out-json", type=Path, required=True)
 
+    p_cov = sub.add_parser("coverage", help="Measure which target functions a module's corpus executes")
+    p_cov.add_argument("--module", required=True)
+    p_cov.add_argument("--sources", nargs="+", required=True)
+    p_cov.add_argument("--out-bin", type=Path, required=True)
+    p_cov.add_argument("--corpus-dir", type=Path, required=True)
+    p_cov.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="More corpus directories to replay")
+    p_cov.add_argument("--scratch-dir", type=Path, default=None)
+    p_cov.add_argument("--cppflags", default="-I.")
+    p_cov.add_argument("--ldflags", default="", help="Extra linker flags")
+    p_cov.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_cov.add_argument(
+        "--max-time",
+        type=int,
+        default=COVERAGE_MAX_TIME_S,
+        help="Stop replaying after this many seconds; the report is then `partial`",
+    )
+    p_cov.add_argument("--no-cache", action="store_true", help="Do not read or write the run/shared cache")
+    p_cov.add_argument("--out-json", type=Path, required=True)
+
     p_cands = sub.add_parser("replay-candidates", help="Replay the reproducers of every unverified candidate")
     p_cands.add_argument("--candidates", type=Path, default=Path("candidates.json"))
     p_cands.add_argument("--harness-dir", type=Path, default=Path("workspace/harnesses"))
@@ -2428,6 +2806,19 @@ def main(argv: list[str] | None = None) -> int:
             res = _run_campaign_mode(args)
         elif args.mode == "build":
             res = _run_build_mode(args)
+        elif args.mode == "coverage":
+            res = coverage_report(
+                args.module,
+                args.sources,
+                args.out_bin,
+                [args.corpus_dir, *args.extra_corpus],
+                args.scratch_dir or args.out_json.parent / f".scratch_coverage_{args.module}",
+                cppflags=args.cppflags,
+                ldflags=args.ldflags,
+                per_input_timeout=args.per_input_timeout,
+                max_time=args.max_time,
+                use_cache=not args.no_cache,
+            )
         elif args.mode == "replay":
             prepared = None
             if args.binary is None:

@@ -112,7 +112,8 @@ These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/S
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
 
    Write the `build`, `ingest`, standalone `eva` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
-4. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
+4. Measure what each corpus reached, for the report's coverage gaps: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage`.
+5. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue`
 

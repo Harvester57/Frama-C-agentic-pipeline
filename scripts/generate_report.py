@@ -120,7 +120,59 @@ def load_inputs(run_dir: Path) -> dict:
         "ledger": load_json_strict(run_dir / "coverage-ledger.json"),
         "findings": dedupe_findings_for_report(raw_findings, run_dir=run_dir),
         "candidates": load_json_optional(run_dir / "candidates.json", []),
+        "coverage": load_coverage_reports(run_dir),
     }
+
+
+def load_coverage_reports(run_dir: Path) -> list[dict]:
+    """`run_eacsl_fuzz.py coverage` reports by module; an unreadable one is shown as such, not dropped."""
+    reports: list[dict] = []
+    for path in sorted((run_dir / "workspace/reports/coverage").glob("*.json")):
+        try:
+            report = load_json_strict(path)
+        except ArtifactError:
+            report = None
+        if not isinstance(report, dict):
+            report = {"status": "unreadable"}
+        reports.append({**report, "module": str(report.get("module") or path.stem)})
+    return reports
+
+
+def fuzz_reach_lines(reports: list[dict]) -> list[str]:
+    """What each corpus executed: reach only, so a reached function is neither safe nor proven."""
+    if not reports:
+        return ["Fuzz reach was not measured (`pipeline_make.py run coverage`).", ""]
+    lines = [
+        "Fuzz reach (what each corpus executes on a plain coverage build; this is not evidence of safety):",
+        "",
+        "| Module | Status | Inputs replayed | Functions reached | Regions covered |",
+        "| :--- | :--- | ---: | ---: | ---: |",
+    ]
+    unreached: list[str] = []
+    for r in reports:
+        inputs = r.get("inputs") or {}
+        totals = r.get("totals") or {}
+        fns = totals.get("functions") or {}
+        regions = totals.get("regions") or {}
+        lines.append(
+            f"| `{md_escape(r['module'])}` | `{md_escape(str(r.get('status')))}` "
+            f"| {inputs.get('replayed', 0)} / {inputs.get('total', 0)} "
+            f"| {fns.get('reached', 0)} / {fns.get('total', 0)} "
+            f"| {regions.get('covered', 0)} / {regions.get('total', 0)} |"
+        )
+        unreached += [
+            f"- `{md_escape(str(f.get('function')))}` at `{md_escape(str(f.get('file')))}:{f.get('line')}` ({md_escape(r['module'])})"
+            for f in r.get("functions") or []
+            if not f.get("executions")
+        ]
+    lines.append("")
+    if unreached:
+        lines += [f"Functions no replayed input reached ({len(unreached)}):", ""]
+        lines += unreached[:50]
+        if len(unreached) > 50:
+            lines.append(f"- ... and {len(unreached) - 50} more (see workspace/reports/coverage/)")
+        lines.append("")
+    return lines
 
 
 def open_work(data: dict) -> dict:
@@ -317,6 +369,7 @@ def render_report(data: dict) -> str:
         out.append("")
     if not blocked and not reasons:
         out += ["No blocked, deferred, or out-of-scope units.", ""]
+    out += fuzz_reach_lines(data.get("coverage") or [])
 
     hardening = [h for u in ledger for h in u.get("bookkeeping", {}).get("hardening", [])]
     if hardening:
