@@ -107,7 +107,8 @@ Each of these is real behavior of the pipeline today. They show up in every comp
 
 - **`semver`: Eva does not start.** `-warn-unsigned-downcast` rejects the global initializer at `semver.c:23`, so its module reads `analysis_error`.
 - **Eva stops early on `tweetnacl`, `qlz` and `cryptolib`.** An `Invalid` alarm ends the analyzed path, so most of the code is Dead: `tweetnacl` reaches 5 of 64 functions (an unsigned downcast in `ts64`), `qlz` 5 of 17 (`src - 2` pointer arithmetic), and `cryptolib` 22 of 234 (a self-overlapping `memcpy` during `Crypto_Init`). That is why `eva_site` reads `dead` for CRYPTOLIB-01.
-- **x509-parser has 167 functions with an Unknown and no ledger unit.** `build_callgraph_dag.py` finds no function in `x509-cert-parser.c` or `x509-common.c`, because a file-scope macro call with a brace initializer ends its scan of the file. No prover would be assigned to them.
+- **`qlz_compress_core` has an Unknown and no ledger unit.** Braces left unbalanced by `#if` branches end `build_callgraph_dag.py`'s scan of `quicklz.c`, so every function from there on is missing.
+- **`build_callgraph_dag.py` applies every `-D` it finds in a target's makefiles.** x509-parser's IKOS rule would break its builds, so a force-included header in the manifest undoes it.
 - **x509-parser's fuzz builds fall back to the sanitizer engine.** E-ACSL rejects the target's own annotations (`unbounded ranges`, `x509-crl-parser.c:3313`) and cannot find `__fc_builtin.h`, which `x509-parser.c` includes under `__FRAMAC__`. Eva runs at `slevel 1`, as in the target's own Makefile, because the default exceeded 900 s.
 - **Functions defined in headers have no ledger unit** (14 in QCBOR, 1 in minmea), so they get no prover either.
 - **MINMEA-02's fingerprint differs from `docs/bugs-found`**, at the same site. The run summary names it.

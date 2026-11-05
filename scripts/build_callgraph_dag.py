@@ -586,7 +586,6 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
 
     n = len(c_tokens)
     idx = 0
-    brace_depth = 0
     paren_depth = 0
     last_top_boundary = -1
 
@@ -602,19 +601,18 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
             paren_depth = max(0, paren_depth - 1)
             idx += 1
             continue
-        if text == ";" and brace_depth == 0 and paren_depth == 0:
+        if text == ";" and paren_depth == 0:
             last_top_boundary = idx
             idx += 1
             continue
         if text == "}" and paren_depth == 0:
-            brace_depth = max(0, brace_depth - 1)
-            if brace_depth == 0:
-                last_top_boundary = idx
+            last_top_boundary = idx
             idx += 1
             continue
 
         if text == "{":
-            if brace_depth == 0 and paren_depth == 0:
+            # A brace inside parentheses, as in `MACRO(x, ({ ... }))`, is not a top-level body.
+            if paren_depth == 0:
                 header_slice = c_tokens[last_top_boundary + 1 : idx]
                 if (
                     len(header_slice) >= 2
@@ -671,10 +669,6 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
                 # Otherwise (e.g. struct/union/enum or global array initializer), skip past closing '}'
                 last_top_boundary = close_brace
                 idx = close_brace + 1
-                continue
-            else:
-                brace_depth += 1
-                idx += 1
                 continue
 
         idx += 1

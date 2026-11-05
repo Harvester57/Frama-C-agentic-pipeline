@@ -592,6 +592,28 @@
      "params": {
       "eva_slevel": 1
      }
+    },
+    {
+     "name": "x509-common",
+     "harness": {
+      "sources": [
+       "src/x509-utils.c",
+       "src/x509-common.c",
+       "src/x509-cert-parser.c",
+       "src/x509-crl-parser.c"
+      ],
+      "header": "x509-parser.h",
+      "entry_fn": "parse_x509_cert",
+      "entry_style": "custom",
+      "max_input_size": 1500,
+      "cppflags": "-Iworkspace/work/src -include workspace/harnesses/x509_no_ikos.h",
+      "ldflags": "",
+      "reachability": "untrusted_surface",
+      "call_expr": "{ cert_parsing_ctx cert_ctx; crl_parsing_ctx crl_ctx; (void)parse_x509_cert(&cert_ctx, fuzz_buf, (u32)fuzz_len); (void)parse_x509_crl(&crl_ctx, fuzz_buf, (u32)fuzz_len); }"
+     },
+     "params": {
+      "eva_slevel": 1
+     }
     }
    ],
    "assets": [
