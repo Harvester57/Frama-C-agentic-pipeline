@@ -246,6 +246,14 @@ def _oracle_summary(oracle: str, report: dict) -> dict:
     under_hyp = report.get("proven_under_hyp_count")
     if isinstance(failed, int) and isinstance(proven, int) and isinstance(under_hyp, int):
         summary.update(failed=failed, proved=proven + under_hyp)
+    # Goals failing establishment/preservation are INVALID invariants (SESpec's largest-valid-
+    # subset rule): a candidate whose failures are only provability is closer to done than one
+    # carrying invalid invariants, so count them for the rank tiebreak.
+    summary["invalid"] = sum(
+        1
+        for g in report.get("unproven_goals") or []
+        if re.search(r"_(established|preserved)$", str(g.get("annotation") or ""), re.IGNORECASE)
+    )
     return summary
 
 
@@ -269,8 +277,10 @@ def _is_refuted(wp: dict, guard: dict) -> bool:
     return wp["status"] in WP_STATUSES_WITH_SOUNDNESS_VERDICT and not wp["soundness_ok"]
 
 
-def _rank_key(rank: dict) -> tuple[int, int]:
-    return (rank["failed"], -rank["proved"])
+def _rank_key(rank: dict) -> tuple[int, int, int]:
+    # Fewer failed goals first; among equals, fewer INVALID invariants (establishment/preservation
+    # failures, which must be dropped/regenerated) before more proved goals.
+    return (rank["failed"], rank.get("invalid", 0), -rank["proved"])
 
 
 def _highest_proved(state: dict) -> int | None:
@@ -320,7 +330,7 @@ def _evaluate(scratch: Path, state: dict, digest: str, contents: dict[str, bytes
         # existing retry budget bounds that.
         return {"eligible": False, "rank": None, "progress": None, "next_action": "continue"}
 
-    rank = {"failed": wp["failed"], "proved": wp["proved"]}
+    rank = {"failed": wp["failed"], "proved": wp["proved"], "invalid": wp.get("invalid") or 0}
     ranks_higher = state["best_rank"] is None or _rank_key(rank) < _rank_key(state["best_rank"])
     # New annotations add goals, so an iteration can raise both the failed and the proved count and is still moving,
     # while one that improves neither number is a stall. The rank alone still decides which candidate is best.

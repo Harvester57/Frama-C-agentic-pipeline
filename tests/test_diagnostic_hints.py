@@ -141,6 +141,31 @@ def test_wp_hints_loop_dependency_slice_names_the_inner_loop(tmp_path: Path) -> 
     assert not any("Dependency slice" in h for h in derive_wp_diagnostic_hints(res, facts_dir=tmp_path / "empty"))
 
 
+def test_wp_hints_failure_kind_strategy_taxonomy() -> None:
+    """SESpec Alg. 4: each unproven loop goal maps to a repair strategy by its WP name."""
+    res = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "unproven_by_bucket": {"step_b_loop_invariant": [{"kind": "loop_invariant"}]},
+        "unproven_goals": [
+            {"kind": "loop_invariant", "annotation": "typed_f_loop_invariant_bound_established", "line": 4},
+            {"kind": "loop_invariant", "annotation": "typed_f_loop_invariant_acc_preserved", "line": 4},
+            {"kind": "loop_invariant", "annotation": "typed_f_loop_invariant_bad_established", "line": 4},
+            {"kind": "loop_invariant", "annotation": "typed_f_loop_invariant_bad_preserved", "line": 4},
+            {"kind": "loop_invariant", "annotation": "typed_f_loop_invariant_range", "line": 4},
+            {"kind": "loop_variant", "annotation": "typed_f_loop_variant_decreases", "line": 4},
+        ],
+    }
+    hints = derive_wp_diagnostic_hints(res)
+    strat = next((h for h in hints if "Failure-kind repair strategy" in h), None)
+    assert strat is not None, hints
+    assert "weaken `typed_f_loop_invariant_bound`" in strat
+    assert "adjust `typed_f_loop_invariant_acc`" in strat
+    assert "regenerate `typed_f_loop_invariant_bad`" in strat and "BOTH" in strat
+    assert "strengthen `typed_f_loop_invariant_range`" in strat
+    assert "fix progress for `typed_f_loop_variant_decreases`" in strat
+
+
 def test_eacsl_hints_clean_and_failure_modes() -> None:
     assert derive_eacsl_diagnostic_hints({"status": "passed_dynamic_oracle"}) == []
 

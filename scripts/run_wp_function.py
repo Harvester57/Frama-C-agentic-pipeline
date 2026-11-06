@@ -475,6 +475,57 @@ def _innermost_loop_at(record: dict, line: int) -> dict | None:
     return max(cands, key=lambda l: (l.get("parent") is not None, l["line"]))
 
 
+def _goal_failure_strategy(goal: dict) -> tuple[str, str]:
+    """SESpec-style failure kind -> repair strategy for one unproven goal (by its WP name)."""
+    ann = f"{goal.get('kind') or ''} {goal.get('annotation') or ''}".lower()
+    if "established" in ann:
+        return "weaken", "fails establishment"
+    if "preserved" in ann:
+        return "adjust", "fails preservation"
+    if "loop_variant" in ann or "decreases" in ann:
+        return "progress", "termination"
+    if "loop_invariant" in ann:
+        return "strengthen", "provability"
+    return "regenerate", "unclassified"
+
+
+def _loop_goal_strategies(unproven_goals: list[dict]) -> str | None:
+    """
+    One hint mapping each unproven loop goal to its repair strategy (SESpec Alg. 4):
+    established -> weaken, preserved -> adjust, both -> regenerate (invalid invariant,
+    largest valid subset), provability-only -> strengthen, variant/decreases -> progress fix.
+    """
+    per_inv: dict[str, set[str]] = {}
+    variant_goals: list[str] = []
+    for g in unproven_goals:
+        kind = str(g.get("kind") or "")
+        ann = str(g.get("annotation") or "")
+        text = f"{kind} {ann}".lower()
+        if "loop_variant" in text or "decreases" in text:
+            variant_goals.append(ann or kind)
+            continue
+        if "loop_invariant" not in text:
+            continue
+        strat, _ = _goal_failure_strategy(g)
+        base = re.sub(r"_(established|preserved)$", "", ann, flags=re.IGNORECASE) or ann or kind
+        per_inv.setdefault(base, set()).add(strat)
+    if not per_inv and not variant_goals:
+        return None
+    parts: list[str] = []
+    for base, strats in sorted(per_inv.items()):
+        if "weaken" in strats and "adjust" in strats:
+            parts.append(f"regenerate `{base}` (fails BOTH establishment and preservation: invalid, not just weak — drop it)")
+        elif "weaken" in strats:
+            parts.append(f"weaken `{base}` (fails establishment: false before the first iteration — relax it or add a 'requires' holding at loop entry)")
+        elif "adjust" in strats:
+            parts.append(f"adjust `{base}` (fails preservation: not inductive across one iteration, or 'loop assigns' missing/too broad)")
+        else:
+            parts.append(f"strengthen `{base}` (holds but too weak to imply the postcondition at loop exit)")
+    for v in sorted(set(variant_goals)):
+        parts.append(f"fix progress for `{v}` (variant/measure does not strictly decrease — check the measure or add a progress guard, e.g. 'if (consumed == 0) return -1;')")
+    return "Failure-kind repair strategy: " + "; ".join(parts) + "."
+
+
 def _loop_dependency_slice_hint(res: dict, facts_dir: Path | None) -> str | None:
     """InvWeaver-style dependency slice: name the inner/predecessor loop whose exit summary is
     the likely missing fact when a loop preservation goal fails."""
@@ -721,6 +772,9 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "", facts_dir: Path | 
             slice_hint = _loop_dependency_slice_hint(res, facts_dir)
             if slice_hint:
                 _add(slice_hint)
+            strategy_hint = _loop_goal_strategies(unproven_goals)
+            if strategy_hint:
+                _add(strategy_hint)
             if not _LOOP_ESTABLISHED_FAIL_RE.search(full_log) and not _LOOP_PRESERVED_FAIL_RE.search(full_log):
                 _add(
                     "Step B (Loops) has unproven goals: ensure 'loop invariant 0 <= i <= n;' uses '<= n' "
