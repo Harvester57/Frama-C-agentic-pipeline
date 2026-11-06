@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fingerprint import normalize_file, normalize_kind  # noqa: E402
 from framac_common import ArtifactError, load_json_optional, load_json_strict  # noqa: E402
+from mutation_check import classify_open_unit  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
 from workspace_overlay import map_work_to_baseline_line  # noqa: E402
 
@@ -121,6 +122,7 @@ def load_inputs(run_dir: Path) -> dict:
         "findings": dedupe_findings_for_report(raw_findings, run_dir=run_dir),
         "candidates": load_json_optional(run_dir / "candidates.json", []),
         "coverage": load_coverage_reports(run_dir),
+        "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
     }
 
 
@@ -249,6 +251,54 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
             more = f" and {len(names) - 20} more" if len(names) > 20 else ""
             out.append(f"- {label} ({len(names)}): {shown}{more}")
     out.append("")
+    return out
+
+
+def spec_quality_section(data: dict) -> list[str]:
+    """
+    Mutation-based specification quality (COINS/KBSpec) plus the evaluation-duality
+    split of open units into prover-limited vs spec-limited. Empty when no
+    mutation.json exists (the check is opt-in: scripts/mutation_check.py).
+    """
+    out: list[str] = []
+    mutation = data.get("mutation")
+    if isinstance(mutation, dict) and mutation.get("totals"):
+        t = mutation["totals"]
+        out += ["### Specification quality (mutation check)", ""]
+        out.append(
+            f"- Functions checked: {t.get('functions', 0)}; contract mutants: {t.get('spec_mutants', 0)} "
+            f"({t.get('equivalent', 0)} equivalent -> completeness {t.get('completeness')}); "
+            f"implementation mutants: {t.get('impl_mutants', 0)} ({t.get('rejected', 0)} rejected -> "
+            f"precision {t.get('precision')})"
+        )
+        out.append("")
+        for fn, f in sorted((mutation.get("functions") or {}).items()):
+            if f.get("completeness") is None and f.get("precision") is None:
+                continue
+            out.append(
+                f"- `{fn}`: completeness {f.get('completeness')} (spec mutants {f.get('spec_mutants')}, "
+                f"equivalent {f.get('equivalent')}), precision {f.get('precision')} "
+                f"(impl mutants {f.get('impl_mutants')}, rejected {f.get('rejected')})"
+            )
+        out.append("")
+    # Evaluation duality: an open unit is prover-limited (tool/verifier limit) or
+    # spec-limited (the contract genuinely does not hold) — read from its WP report.
+    run_dir = data.get("run_dir")
+    ledger = data.get("ledger") or []
+    open_units = [u for u in ledger if u.get("status") not in ("covered", "excluded", "candidate")]
+    if run_dir is not None and open_units:
+        wp_dir = Path(run_dir) / "workspace" / "reports" / "wp"
+        counts: Counter = Counter()
+        for u in open_units:
+            fn = str(u.get("function") or "")
+            rep = load_json_optional(wp_dir / f"{fn}.json", None) if fn else None
+            counts[classify_open_unit(rep if isinstance(rep, dict) else None)] += 1
+        if counts:
+            out += ["### Open units: prover-limited vs spec-limited", ""]
+            for kind in ("prover_limited", "spec_limited", "unknown"):
+                if counts.get(kind):
+                    out.append(f"- **{kind}**: {counts[kind]}")
+            out.append("")
     return out
 
 
@@ -388,6 +438,7 @@ def render_report(data: dict) -> str:
             out.append(f"- `{k}`: {n}")
         out.append("")
     out += verdict_limits_section(ledger)
+    out += spec_quality_section(data)
 
     out += ["## 6. Coverage gaps", ""]
     blocked = [u for u in ledger if u["status"] == "blocked"]

@@ -83,6 +83,19 @@
           },
           "required": ["total", "by_wave", "by_class", "covered", "candidate"]
         },
+        "mutation": {
+          "type": "object",
+          "description": "Mutation-based spec quality from workspace/reports/mutation.json (optional; empty when the check did not run).",
+          "properties": {
+            "functions": {"type": "integer"},
+            "spec_mutants": {"type": "integer"},
+            "equivalent": {"type": "integer"},
+            "impl_mutants": {"type": "integer"},
+            "rejected": {"type": "integer"},
+            "completeness": {"type": ["number", "null"]},
+            "precision": {"type": ["number", "null"]}
+          }
+        },
         "candidates": {"type": "object"}
       },
       "required": ["set", "revision", "harness_digest", "status", "problems", "stages", "wall_s", "cpu_s", "dag", "modules", "functions_with_unknown", "functions_with_unknown_count", "functions_with_unknown_no_unit", "prover_tasks", "units", "candidates"]

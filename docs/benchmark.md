@@ -69,6 +69,7 @@ Each run writes one JSON file ([`../schemas/benchmark-run.schema.json`](../schem
 | `targets.<t>.functions_with_unknown_no_unit` | The same, but with no ledger unit: no prover would ever be assigned, so those Unknowns silently stay open. |
 | `targets.<t>.prover_tasks` | The tasks really queued, per wave. Lower than the line above when a function has a confirmed bug and is excluded from WP. |
 | `targets.<t>.units` | Proof pass rate per call-graph wave and per obligation class, from the coverage ledger. For `l3_frame`, also read each WP report's `frame_summary`: a unit is frame-error-free only when every assigns/loop-assigns/`\separated` goal is discharged and no missing-assigns warning fired (a full proof with an incomplete frame does not count). |
+| `targets.<t>.mutation` | Optional, when `scripts/mutation_check.py` ran on the run dir: spec-quality totals — `completeness` (1 − equivalent contract mutants / spec mutants) and `precision` (implementation mutants rejected by an Invalid ensures / impl mutants), plus per-function detail in `workspace/reports/mutation.json`. |
 | `targets.<t>.modules_without_harness` | In-scope modules Eva never runs on: their units can only read as tool failures, so widen the harnesses or narrow the scope. |
 | `targets.<t>.candidates` | Candidates by source, and how many await a verifier agent. |
 | `targets.<t>.stages`, `wall_s`, `cpu_s` | Wall-clock per stage, measured on the host, and CPU from each container's cgroup. |

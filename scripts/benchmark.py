@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benchmark_compare import SCHEMA_VERSION, Tolerances, compare_runs, load_run, rate_block, render_text  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
 from minischema import Validator, load_schema  # noqa: E402
+from mutation_check import summarize_mutation  # noqa: E402
 from resources import FUZZ_RSS_LIMIT_MB, WP_MEMLIMIT_MB  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -672,6 +673,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
         "units": summarize_units(ledger),
         "modules_without_harness": modules_without_harness(ledger, target),
         "candidates": summarize_candidates(read_json(run_dir / "candidates.json", []) or []),
+        "mutation": summarize_mutation(run_dir / "workspace" / "reports" / "mutation.json"),
         "problems": problems,
     }
 
