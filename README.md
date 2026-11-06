@@ -201,6 +201,7 @@ See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master 
 | **minmea** | [`kosma/minmea`](https://github.com/kosma/minmea) | **3** (2 Medium, 1 Low) | [`./docs/bugs-found/minmea/README.md`](./docs/bugs-found/minmea/README.md) |
 | **QCBOR** | [`laurencelundblade/QCBOR`](https://github.com/laurencelundblade/QCBOR) | **3** (1 Medium, 2 Low) | [`./docs/bugs-found/qcbor/README.md`](./docs/bugs-found/qcbor/README.md) |
 | **CryptoLib** | [`nasa/CryptoLib`](https://github.com/nasa/CryptoLib) | **1** (1 Medium; +1 C11 hygiene note) | [`./docs/bugs-found/cryptolib/README.md`](./docs/bugs-found/cryptolib/README.md) |
+| **libmnl** | [`netfilter/libmnl`](https://git.netfilter.org/libmnl) | **5** (1 Medium, 4 Low) | [`./docs/bugs-found/libmnl/README.md`](./docs/bugs-found/libmnl/README.md) |
 | **picohttpparser** | [`h2o/picohttpparser`](https://github.com/h2o/picohttpparser) | **0** (11 units proven) | [`./docs/bugs-found/picohttpparser/README.md`](./docs/bugs-found/picohttpparser/README.md) |
 | **Frama-C 33.0 / 34.0~~dev (`e-acsl-gcc`)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **10** (6 Bugs, 4 Limitations/UX) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
 
