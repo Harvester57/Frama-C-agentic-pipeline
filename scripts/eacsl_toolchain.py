@@ -483,9 +483,9 @@ FALLBACK_HEADER_MAP: dict[str, tuple[str, ...]] = {
     "syslog": ("syslog.h",),
 }
 
-_FALLBACK_UNDEFINED_RE = re.compile(r"undefined reference to [`'\"](?P<name>[A-Za-z_]\w*_fallback_\d+)['\"]")
+_FALLBACK_UNDEFINED_RE = re.compile(r"undefined reference to [`'\"](?P<name>[A-Za-z_]\w*(?:_fallback_|_va_)\d+)['\"]")
 _FALLBACK_PROTO_RE = re.compile(
-    r"(?P<ret>(?:[A-Za-z_]\w*[\s\*]+)+?)(?P<name>(?P<base>[A-Za-z_]\w*?)_fallback_(?P<idx>\d+))\s*\((?P<params>[^;{}()]*)\)\s*(?P<end>[;{])"
+    r"(?P<ret>(?:[A-Za-z_]\w*[\s\*]+)+?)(?P<name>(?P<base>[A-Za-z_]\w*?)(?:_fallback_|_va_)(?P<idx>\d+))\s*\((?P<params>[^;{}()]*)\)\s*(?:/\*[\s\S]*?\*/\s*)?(?P<end>[;{])"
 )
 _C_TYPE_WORDS = frozenset(
     {

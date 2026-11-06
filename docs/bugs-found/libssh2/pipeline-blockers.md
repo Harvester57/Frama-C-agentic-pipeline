@@ -241,3 +241,73 @@ Regression tests: `tests/test_callgraph_dag.py` (declarator shapes, macro-wrappe
 foreign-path mapping), `tests/test_pipeline_make.py` (overlay `normalize_source`),
 `tests/test_fuzz_link_repair.py` (undefined-reference repair, keyword filter),
 `tests/test_harness_compat.py` (compat includes, declaring header, arity).
+
+---
+
+## PB-6 — found while resuming after the PB-1..PB-5 fixes (2026-11-06, this run)
+
+- **File:** `scripts/eacsl_toolchain.py` (`_FALLBACK_UNDEFINED_RE`, `_FALLBACK_PROTO_RE`,
+  consumed by `find_variadic_fallbacks` / the link-repair path of `run_eacsl_fuzz.py`).
+- **Severity:** High — after the PB-1..PB-5 fixes, 12/21 modules still failed their E-ACSL
+  build (`eacsl_compile_failed`) and had no binary at all.
+- **Observed:** Frama-C's Variadic translation emits its fallback helpers under **two naming
+  schemes**: `<fn>_fallback_<N>` (e.g. `fcntl_fallback_1..4`) and `<fn>_va_<N>`
+  (e.g. `snprintf_va_1..18`, `fprintf_va_1..4`). The repair only knew the first:
+  - `_FALLBACK_UNDEFINED_RE` matched `[A-Za-z_]\w*_fallback_\d+` — the link error
+    `undefined reference to 'snprintf_va_3'` was not collected;
+  - `_FALLBACK_PROTO_RE` matched `(?P<base>[A-Za-z_]\w*?)_fallback_(?P<idx>\d+)` — the
+    declared-but-undefined `snprintf_va_3` prototype was not found.
+  The repair therefore generated only `fcntl_fallback_1..4`; the retry link still failed on
+  `snprintf_va_3`:
+
+  ```
+  /usr/bin/ld: .../fuzz_transport.instrumented.c:841388:(.text.knownhost_check+0x1287):
+      undefined reference to `snprintf_va_3'
+  clang: error: linker command failed with exit code 1
+  e-acsl-gcc: fatal error: fail to compile/link instrumented code
+  ```
+
+- **Second gap in the same regex:** the Variadic translation writes a trailing
+  `/* format attribute */` comment between the prototype's `)` and `;`:
+
+  ```c
+  int snprintf_va_3(char * restrict __s, size_t __maxlen,
+                    char const * restrict __format, char *param0, int param1) /* format attribute */;
+  ```
+
+  The prototype tail required `\)\s*[;{]` immediately, so even a correctly-named prototype
+  with the comment was skipped.
+- **Fix applied (this run):** both regexes now accept `(?:_fallback_|_va_)\d+`, and the
+  prototype tail tolerates an optional `/* ... */` comment before the end token:
+  `\)\s*(?:/\*[^*]*\*/\s*)?[;{]`.
+- **Verified:** on `fuzz_agent.instrumented.c` the repair now finds all 26 helpers
+  (`fcntl_fallback_1..4`, `fprintf_va_1..4`, `snprintf_va_1..18`); on
+  `fuzz_transport.instrumented.c` 26 including `snprintf_va_3`. With the fix, the build went
+  from 18 sanitizer-only + 3 failed to **21/21 built with 21/21 on the E-ACSL engine**.
+- **Suggested regression test:** a `_va_N`-named declared-but-undefined prototype with a
+  trailing `/* format attribute */` comment must be picked up by `find_variadic_fallbacks`
+  and defined by `generate_fallback_source` (forward mode for `snprintf`/`fprintf` via
+  `FALLBACK_HEADER_MAP`).
+
+### Harness-authoring corrections made during the resume (run-dir artifacts, not pipeline bugs)
+
+1. **comp** — the zlib compression methods are compiled out in this CMake configuration
+   (CMake reports `Compression, using zlib for compression` under *disabled*), so
+   `comp_method_zlib_init/decomp` do not exist at all; the harness entry moved to
+   `comp_method_none_decomp` (the only reachable decompressor in this configuration).
+2. **mac** — `mac_method_hmac_sha1_hash` is guarded by `LIBSSH2_HMAC_SHA1_ENABLE`
+   (undefined in this configuration); the sha1 call was dropped, keeping sha2-256.
+3. **userauth_kbd_packet** — the allocator macro is `SSH2_ALLOC` in this codebase, not
+   `LIBSSH2_ALLOC`.
+4. **scp** — `scp_shell_quotearg` is `static`; the module switched to `--include-source` so
+   both parsers are callable.
+
+## Run-state after the resume (Phase 0-2 complete)
+
+| Item | State |
+| :--- | :--- |
+| Build | 21/21 modules built, 21/21 E-ACSL engine |
+| Phase 1 (fuzz) | 20/21 modules produced crash artifacts; 98 unverified candidates ingested |
+| Phase 2 (Eva) | 27 reports; 7 rte units `candidate` (Eva Invalid), rest covered/planned |
+| Ledger | 938 units: 740 planned, 7 candidate, 182 out_of_scope, 9 deferred; 98 candidates unverified |
+| Next | Crash Verification Gate (98 candidates), then Phase 3 WP scheduler |
