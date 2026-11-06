@@ -142,7 +142,7 @@ frama-c/
 ├── wrappers/
 │   ├── framac-docker.ps1             # Windows PowerShell wrapper (host broker + container hardening)
 │   └── framac-docker.sh              # POSIX/Bash wrapper (host broker + container hardening)
-├── skills/                           # Modular Agent Skills (mirrored in .agents/skills/)
+├── skills/                           # Modular Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ hold symlinks to these)
 │   ├── framac-verify/SKILL.md        # Umbrella end-to-end orchestrator (/framac-verify)
 │   ├── framac-slice/SKILL.md         # Phase 0: Slicing, Call-Graph DAG, stubs & harnesses (/framac-slice)
 │   ├── framac-fuzz/SKILL.md          # Phase 1: Zero-ACSL RTE + E-ACSL + LibFuzzer triage (/framac-fuzz)
@@ -228,7 +228,7 @@ python3 -m mypy scripts tests
 ```
 
 > [!NOTE]
-> If you edit any skill or brief under `skills/framac-*` and have a local `.agents/skills/framac-*` directory, keep both copies synchronized (`tests/test_extract_references.py` verifies that they match byte-for-byte).
+> Edit skills only under `skills/framac-*`. The harness mirrors `.agents/skills/framac-*` and `.claude/skills/framac-*` are symlinks to `skills/framac-*`, so there is nothing to keep synchronized; `tests/test_extract_references.py` verifies the links point at `skills/` and the content matches.
 
 ---
 

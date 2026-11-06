@@ -109,23 +109,32 @@ def test_committed_reference_markdown_is_up_to_date():
 
 
 def test_framac_skills_mirror_is_in_sync():
+    # Every harness mirror (.agents/skills, .claude/skills) must hold one symlink per skill,
+    # pointing at ../skills/<name>: skills are edited once in skills/ and shared everywhere.
     repo_root = DEFAULT_ROOT.parent.parent
     skills_dir = repo_root / "skills"
-    agent_skills_dir = repo_root / ".agents" / "skills"
     primary = {
         p.relative_to(skills_dir).as_posix(): p.read_bytes()
         for p in sorted(skills_dir.rglob("*"))
         if p.is_file() and p.relative_to(skills_dir).parts[0].startswith("framac-")
     }
-    if not agent_skills_dir.is_dir():
-        return
-    mirrored = {
-        p.relative_to(agent_skills_dir).as_posix(): p.read_bytes()
-        for p in sorted(agent_skills_dir.rglob("*"))
-        if p.is_file() and p.relative_to(agent_skills_dir).parts[0].startswith("framac-")
-    }
-    if not mirrored:
-        return
-    assert primary.keys() == mirrored.keys()
-    for rel_path, content in primary.items():
-        assert mirrored[rel_path] == content, f"Skill mirror drift in {rel_path}"
+    skill_names = sorted({Path(k).parts[0] for k in primary})
+    for mirror in (repo_root / ".agents" / "skills", repo_root / ".claude" / "skills"):
+        if not mirror.is_dir():
+            continue
+        entries = sorted(p.name for p in mirror.iterdir())
+        assert entries == skill_names, f"{mirror} must contain exactly the skills/ entries as symlinks"
+        for name in skill_names:
+            link = mirror / name
+            assert link.is_symlink(), f"{link} must be a symlink to skills/{name}"
+            assert link.resolve() == (skills_dir / name).resolve(), f"{link} must point at skills/{name}"
+        # Content through the links matches the primary (rglob does not follow symlinked dirs,
+        # so walk each link's target explicitly).
+        mirrored = {}
+        for name in skill_names:
+            for p in sorted((mirror / name).rglob("*")):
+                if p.is_file():
+                    mirrored[p.resolve().relative_to(skills_dir).as_posix()] = p.read_bytes()
+        assert primary.keys() == mirrored.keys()
+        for rel_path, content in primary.items():
+            assert mirrored[rel_path] == content, f"Skill mirror drift in {rel_path}"
