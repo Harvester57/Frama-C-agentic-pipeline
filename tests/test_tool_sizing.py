@@ -655,3 +655,11 @@ def test_merge_batch_bounds_workers_and_wp_par_by_memory(tmp_path, monkeypatch):
     res = workspace_overlay.merge_agent_batch(run_dir, SPECS, overlay_dir=overlay)
     assert res["ok"] and len(res["merged"]) == 3
     assert set(seen_wp_par) == {1}
+
+
+def test_pointer_cast_goals_are_recognised_from_their_annotation():
+    assert W._is_pointer_cast_goal({"annotation": "\\null == (void *)attr + 4 || \\object_pointer((void *)attr + 4)"})
+    assert W._is_pointer_cast_goal({"annotation": "\\valid_read((struct nlattr const *)p)"})
+    assert not W._is_pointer_cast_goal({"annotation": "\\valid_read(buf + (0 .. len - 1))"})
+    assert not W._is_pointer_cast_goal({"annotation": "(int)x <= 65535"})
+    assert not W._is_pointer_cast_goal({})
