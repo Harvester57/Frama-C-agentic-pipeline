@@ -1812,18 +1812,46 @@ def history_estimate(
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
-    values: list[float] = []
+    loaded_records: list[dict] = []
     for _, path in candidates[:64]:
         rec = _load_json(path, max_bytes=64 * 1024)
-        if not isinstance(rec, dict) or (rec.get("key") or None) != (key or None):
-            continue
-        peak = rec.get("peak_mb")
-        if isinstance(peak, bool) or not isinstance(peak, (int, float)) or peak <= 0:
-            continue
-        values.append(float(peak) * (2.0 if rec.get("oom_killed") else 1.25))
-        if len(values) >= last:
-            break
-    return int(math.ceil(max(values))) if values else None
+        if isinstance(rec, dict):
+            loaded_records.append(rec)
+
+    def _extract_values(match_fn: Callable[[str | None], bool]) -> list[float]:
+        vals: list[float] = []
+        for rec in loaded_records:
+            rec_key = rec.get("key") or None
+            if not match_fn(rec_key):
+                continue
+            peak = rec.get("peak_mb")
+            if isinstance(peak, bool) or not isinstance(peak, (int, float)) or peak <= 0:
+                continue
+            vals.append(float(peak) * (2.0 if rec.get("oom_killed") else 1.25))
+            if len(vals) >= last:
+                break
+        return vals
+
+    # Tier 1: exact match
+    values = _extract_values(lambda rk: rk == (key or None))
+    if values:
+        return int(math.ceil(max(values)))
+
+    # Tier 2 (TU prefix): If no exact match and '#' in key
+    if key and "#" in key:
+        tu_prefix = key.split("#", 1)[0]
+        values = _extract_values(lambda rk: bool(rk and (rk == tu_prefix or rk.startswith(f"{tu_prefix}#"))))
+        if values:
+            return int(math.ceil(max(values)))
+
+    # Tier 3 (Module prefix): If no match and ':' in key
+    if key and ":" in key:
+        mod_prefix = key.split(":", 1)[0]
+        values = _extract_values(lambda rk: bool(rk and (rk == mod_prefix or rk.startswith(f"{mod_prefix}:"))))
+        if values:
+            return int(math.ceil(max(values)))
+
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -285,3 +285,74 @@ def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
     with run_lock("merge", tmp_path, timeout=1, stale_after=60) as lock_dir:
         assert lock_dir == stale and (lock_dir / "owner.json").stat().st_mtime > old
     assert not (tmp_path / ".framac-locks").exists()
+
+
+def test_augment_framac_cppflags_prepends_fc_stubs_and_compat_types(monkeypatch, tmp_path):
+    from framac_common import augment_framac_cppflags
+
+    stubs = tmp_path / "templates" / "fc_stubs"
+    stubs.mkdir(parents=True)
+    compat = stubs / "fc_compat_types.h"
+    compat.write_text("/* compat */", encoding="utf-8")
+
+    import framac_common
+
+    monkeypatch.setattr(framac_common, "resolve_fc_stubs_dir", lambda: stubs)
+
+    user_flags = "-Iworkspace/include -DDEBUG_LEVEL=2 -Ianother/dir"
+    augmented = augment_framac_cppflags(user_flags)
+
+    stubs_posix = stubs.as_posix()
+    compat_posix = compat.as_posix()
+
+    assert f"-I{stubs_posix}" in augmented
+    assert f"-include {compat_posix}" in augmented
+    assert user_flags in augmented
+
+    # Verify prepending: stubs and compat header must appear BEFORE user flags
+    stubs_idx = augmented.index(f"-I{stubs_posix}")
+    compat_idx = augmented.index(f"-include {compat_posix}")
+    user_idx = augmented.index("-Iworkspace/include")
+
+    assert stubs_idx < user_idx, "fc_stubs must precede user include flags"
+    assert compat_idx < user_idx, "fc_compat_types.h must precede user include flags"
+    assert stubs_idx < compat_idx
+
+    # Idempotent when already present
+    aug_again = augment_framac_cppflags(augmented)
+    assert aug_again.count(f"-I{stubs_posix}") == 1
+    assert aug_again.count("fc_compat_types.h") == 1
+
+
+def test_fc_compat_types_guards_and_float_fallbacks():
+    from conftest import ROOT
+
+    compat_path = ROOT / "templates" / "fc_stubs" / "fc_compat_types.h"
+    assert compat_path.is_file()
+    text = compat_path.read_text(encoding="utf-8")
+
+    # Guard check
+    assert "#ifndef __FC_COMPAT_INT_TYPES_DEFINED" in text
+    assert "#define __FC_COMPAT_INT_TYPES_DEFINED 1" in text
+
+    # Float fallback checks under __FRAMAC__
+    for flt in ("_Float32", "_Float64", "_Float32x", "_Float64x", "_Float128"):
+        assert f"#ifndef {flt}" in text, f"Missing guard for {flt}"
+        expected_type = "float" if flt == "_Float32" else "double"
+        assert f"#define {flt} {expected_type}" in text, f"Missing define for {flt}"
+
+
+def test_bsd_string_contracts_include_from_dependencies():
+    from conftest import ROOT
+
+    bsd_path = ROOT / "templates" / "fc_stubs" / "bsd" / "string.h"
+    assert bsd_path.is_file()
+    text = bsd_path.read_text(encoding="utf-8")
+
+    # strlcpy contract checks
+    assert "assigns dst[0 .. size - 1] \\from src[0 .. size - 1], size;" in text
+    assert "assigns \\result \\from src[0 .. size - 1], size;" in text
+
+    # strlcat contract checks
+    assert "assigns dst[0 .. size - 1] \\from dst[0 .. size - 1], src[0 .. size - 1], size;" in text
+    assert "assigns \\result \\from dst[0 .. size - 1], src[0 .. size - 1], size;" in text

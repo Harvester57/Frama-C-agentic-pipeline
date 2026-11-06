@@ -707,7 +707,7 @@ def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
     recipes = [re.sub(r"\s*\\\n\s*", " ", r) for r in re.findall(r"^\t((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE)]
     invocations = 0
     for line in recipes:
-        if line == "$(PM) sweep":  # the coordinator; it leases one `wp` job per function itself
+        if line in ("$(PM) sweep", "$(PY) $(S)/wp_scheduler.py baseline"):  # coordinators; lease wp jobs per function
             continue
         for m in re.finditer(r"\$\(PY\) \$\(S\)/\w+\.py|\$\(PM\)", line):
             invocations += 1
@@ -734,6 +734,7 @@ def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
         "ingest",
         "replay",
         "wp-queue",
+        "wp-baseline",
         "wp-sweep",
         "report",
         "$(BUILD_TARGETS)",
@@ -860,3 +861,158 @@ def test_harness_dual_template_resets_sound_verdict():
     assert "__FRAMAC_EACSL__" in content
     assert "extern int __e_acsl_sound_verdict;" in content
     assert "__e_acsl_sound_verdict = 1;" in content
+
+
+# ---------------------------------------------------------------------------
+# Workstream R1 Tests: Flag normalization, concurrency, pthread, dictionary
+# ---------------------------------------------------------------------------
+
+
+def test_normalizer_joins_W_flag_and_preserves_warning_suppression():
+    # -W with space joined to -Wno-...
+    assert T.normalize_passthrough("-W no-implicit-function-declaration") == "-Wno-implicit-function-declaration"
+    assert T.normalize_passthrough("-W no-unused-variable -W extra") == "-Wno-unused-variable -Wextra"
+    # Bare short option without argument still rejected
+    with pytest.raises(T.UnsafePassthroughError):
+        T.normalize_passthrough("-W")
+
+
+def test_build_eacsl_flag_sets_handles_and_isolates_wno_flags(tmp_path):
+    stubs = tmp_path / "fc_stubs"
+    stubs.mkdir()
+    flags = T.build_eacsl_flag_sets(
+        "-Isrc -Wno-implicit-function-declaration -Wno-attributes -Werror=return-type -DFOO=1",
+        fuzzer=True,
+        fc_stubs=stubs,
+    )
+    front = flags["frontend"].split()
+    back = flags["backend"].split()
+
+    # Frontend must NOT have -W* flags
+    assert not any(t.startswith("-W") for t in front)
+    assert "-DFOO=1" in front
+
+    # Backend must have codegen flags and warning suppression flags
+    assert "-Wno-implicit-function-declaration" in back
+    assert "-Wno-attributes" in back
+    assert "-Werror=return-type" in back
+
+
+def test_slice_has_pthread_detection(tmp_path):
+    # File without pthread_create
+    f1 = tmp_path / "plain.c"
+    f1.write_text("int run(int x) { return x + 1; }\n", encoding="utf-8")
+    assert not T.slice_has_pthread([f1])
+
+    # File with pthread_create reference
+    f2 = tmp_path / "threaded.c"
+    f2.write_text(
+        "#include <pthread.h>\n"
+        "void *worker(void *arg) { return arg; }\n"
+        "void spawn(void) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }\n",
+        encoding="utf-8",
+    )
+    assert T.slice_has_pthread([f2])
+    assert T.slice_has_pthread([str(f1), str(f2)])
+
+    # False positive word checks
+    f3 = tmp_path / "comment.c"
+    f3.write_text("int my_pthread_create_wrapper(void) { return 0; }\n", encoding="utf-8")
+    assert not T.slice_has_pthread([f3])
+
+
+def test_fuzz_init_provides_weak_pthread_create_alias():
+    hook_text = T.resolve_fuzz_init_source().read_text(encoding="utf-8")
+    assert "#include <pthread.h>" not in hook_text, "fuzz_init.c must be self-contained without <pthread.h>"
+    assert "pthread_create" in hook_text
+    assert "__e_acsl_pthread_create" in hook_text
+    assert "__attribute__((weak))" in hook_text
+
+
+def test_two_stage_compile_passes_concurrency_flags_when_pthread_detected(tmp_path, modern_cli):
+    src = tmp_path / "thread_slice.c"
+    src.write_text(
+        "int entry(void) {\n  pthread_create(0, 0, 0, 0);\n  return 0;\n}\n",
+        encoding="utf-8",
+    )
+    fake = FakeEacslGcc()
+    res = R.compile_eacsl_binary(
+        [str(src)],
+        tmp_path / "out" / "fuzz_thread",
+        cppflags="-Isrc",
+        runner=fake,
+    )
+    assert res["returncode"] == 0
+    assert res["concurrency"] is True
+
+    stage1, stage2 = fake.calls
+    fc_flags = stage1[stage1.index("-F") + 1]
+    assert "-e-acsl-concurrency" in fc_flags, "Stage 1 must pass -e-acsl-concurrency"
+
+    backend = stage2[stage2.index("-e") + 1]
+    assert "-DE_ACSL_CONCURRENCY_PTHREAD" in backend, "Stage 2 backend must define E_ACSL_CONCURRENCY_PTHREAD"
+    ldflags = stage2[stage2.index("-l") + 1]
+    assert "-lpthread" in ldflags, "Stage 2 linker flags must include -lpthread"
+
+
+def test_legacy_cli_passes_concurrency_flag_when_pthread_detected(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc.sh", False))
+    monkeypatch.setattr(T.shutil, "which", lambda name: None)
+    calls = []
+
+    def runner(cmd, **kw):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(EACSL_MARKER_BYTES)
+        return _cp(cmd)
+
+    src = tmp_path / "thread_slice.c"
+    src.write_text("int f() { pthread_create(0,0,0,0); }\n", encoding="utf-8")
+    res = R.compile_eacsl_binary([str(src)], tmp_path / "fuzz_mod", runner=runner)
+    assert res["returncode"] == 0
+    assert res["concurrency"] is True
+    assert "--concurrency" in calls[0]
+
+
+def test_libfuzzer_dictionary_sanitizer_escapes_backslashes_and_controls():
+    # Token level sanitization
+    assert R.sanitize_dictionary_token("hello\\nworld") == "hello\\x0aworld"
+    assert R.sanitize_dictionary_token("hello\\r\\n") == "hello\\x0d\\x0a"
+    assert R.sanitize_dictionary_token("tab\\tseparated") == "tab\\x09separated"
+    assert R.sanitize_dictionary_token("null\\0byte") == "null\\x00byte"
+    assert R.sanitize_dictionary_token("valid\\x41\\x42") == "valid\\x41\\x42"
+    assert R.sanitize_dictionary_token("escaped\\\\backslash") == "escaped\\\\backslash"
+    assert R.sanitize_dictionary_token('escaped\\"quote') == 'escaped\\"quote'
+    # Raw backslash not part of valid escape is escaped to \\
+    assert R.sanitize_dictionary_token("raw\\path\\to\\file") == "raw\\\\path\\x09o\\\\file"
+    # Non-printable characters (e.g. 0x01, 0x1F, 0x80)
+    assert R.sanitize_dictionary_token("\x01\x1f\x7f") == "\\x01\\x1f\\x7f"
+
+    # Line and content level sanitization
+    content = (
+        "# LibFuzzer dictionary\n"
+        "\n"
+        'kw_newline="test\\nval"\n'
+        'kw_crlf="header\\r\\n"\n'
+        'kw_hex="valid\\x20token"\n'
+        'kw_raw="C:\\Program Files"\n'
+        'kw_control="\x00\x07bell"\n'
+        "unquoted_key = plain_token\n"
+    )
+    sanitized = R.sanitize_dictionary_content(content)
+    assert 'kw_newline="test\\x0aval"' in sanitized
+    assert 'kw_crlf="header\\x0d\\x0a"' in sanitized
+    assert 'kw_hex="valid\\x20token"' in sanitized
+    assert 'kw_control="\\x00\\x07bell"' in sanitized
+    assert "# LibFuzzer dictionary" in sanitized
+
+
+def test_sanitize_fuzzer_dictionary_file(tmp_path):
+    dict_file = tmp_path / "test.dict"
+    dict_file.write_text('bad_kw="line1\\nline2"\n# comment\n', encoding="utf-8")
+    out_file = tmp_path / "out.dict"
+
+    res_path = R.sanitize_fuzzer_dictionary(dict_file, out_file)
+    assert res_path == out_file
+    out_text = out_file.read_text(encoding="utf-8")
+    assert 'bad_kw="line1\\x0aline2"' in out_text
+    assert "# comment" in out_text

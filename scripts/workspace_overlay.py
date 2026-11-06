@@ -24,6 +24,7 @@ import argparse
 import base64
 import difflib
 import hashlib
+import inspect
 import json
 import os
 import posixpath
@@ -35,6 +36,7 @@ import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -43,7 +45,9 @@ import function_slice  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
+    ConflictingProfileError,
     ScopeViolationError,
+    check_conflicting_acsl_profiles,
     check_frame_preserved,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
@@ -583,25 +587,170 @@ def _resolve_overlay_source(run_dir: Path, work_dir: Path, src: str) -> str:
     return str(in_work)
 
 
-def _collect_existing_header_declarations(work_dir: Path, exclude_rels: set[str]) -> set[str]:
-    """Collect top-level ACSL declaration profile keys from all `.h`/`.acsl` files in `work_dir` except `exclude_rels`."""
-    names: set[str] = set()
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*["<]([^">]+)[">]', re.MULTILINE)
+
+
+def resolve_acsl_vocabulary_path(work_dir: Path | None = None) -> Path | None:
+    """Locate the canonical templates/acsl/acsl_vocabulary.h header."""
+    if work_dir is not None:
+        cand = work_dir / "templates" / "acsl" / "acsl_vocabulary.h"
+        if cand.is_file():
+            return cand
+        cand = work_dir / "acsl_vocabulary.h"
+        if cand.is_file():
+            return cand
+    container_path = Path("/opt/framac-pipeline/templates/acsl/acsl_vocabulary.h")
+    if container_path.is_file():
+        return container_path
+    local_path = Path(__file__).resolve().parent.parent / "templates" / "acsl" / "acsl_vocabulary.h"
+    if local_path.is_file():
+        return local_path
+    return None
+
+
+def _find_transitive_includes(
+    header_rel: str,
+    work_dir: Path,
+    header_text: str | None = None,
+) -> set[str]:
+    """
+    Find all relative paths of headers in `work_dir` transitively included by `header_rel`.
+    `header_text` can be provided if `header_rel` in memory differs from disk.
+    """
     if not work_dir.is_dir():
-        return names
+        return set()
+
+    all_headers: dict[str, list[Path]] = {}
+    for root, _, files in os.walk(work_dir):
+        for fname in files:
+            p = Path(root) / fname
+            if p.suffix.lower() in {".h", ".acsl"}:
+                all_headers.setdefault(p.name, []).append(p)
+
+    norm_root = _normalize_work_relpath(header_rel)
+    visited: set[str] = set()
+    queue: list[tuple[str, str | None]] = [(norm_root, header_text)]
+
+    while queue:
+        current_rel, curr_text = queue.pop(0)
+        curr_path = work_dir / current_rel
+        if curr_text is None:
+            if not curr_path.is_file():
+                continue
+            try:
+                curr_text = curr_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+        for m in _INCLUDE_RE.finditer(curr_text):
+            target = m.group(1).replace("\\", "/").strip()
+            cand = (curr_path.parent / target).resolve()
+            if not cand.is_file():
+                cand = (work_dir / target).resolve()
+            if not cand.is_file():
+                target_fname = Path(target).name
+                candidates = all_headers.get(target_fname, [])
+                if len(candidates) == 1:
+                    cand = candidates[0].resolve()
+                elif len(candidates) > 1:
+                    for c in candidates:
+                        if c.as_posix().endswith(target):
+                            cand = c.resolve()
+                            break
+
+            if cand.is_file():
+                try:
+                    rel = cand.relative_to(work_dir.resolve()).as_posix()
+                except ValueError:
+                    continue
+                if rel != norm_root and rel not in visited:
+                    visited.add(rel)
+                    queue.append((rel, None))
+
+    return visited
+
+
+def _collect_all_header_declarations_with_metadata(
+    work_dir: Path,
+    exclude_rels: set[str] | None = None,
+) -> list[dict]:
+    """Collect all top-level ACSL declarations across all headers in work_dir and acsl_vocabulary.h."""
+    exclude = exclude_rels or set()
+    decls: list[dict] = []
+
+    vocab_p = resolve_acsl_vocabulary_path(work_dir)
+    if vocab_p and vocab_p.is_file():
+        try:
+            vocab_text = vocab_p.read_text(encoding="utf-8", errors="replace")
+            for d in extract_top_level_acsl_declarations(vocab_text, path=vocab_p.name):
+                d_copy = dict(d)
+                d_copy["path"] = vocab_p.name
+                decls.append(d_copy)
+        except Exception:
+            pass
+
+    if not work_dir.is_dir():
+        return decls
+
     for root, _, files in os.walk(work_dir):
         for fname in sorted(files):
             p = Path(root) / fname
             if p.suffix.lower() not in {".h", ".acsl"}:
                 continue
             rel = p.relative_to(work_dir).as_posix()
-            if rel in exclude_rels:
+            if rel in exclude:
                 continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
-                for decl in extract_top_level_acsl_declarations(text, path=rel):
-                    names.add(decl.get("profile_key") or decl["name"])
+                for d in extract_top_level_acsl_declarations(text, path=rel):
+                    d_copy = dict(d)
+                    d_copy["path"] = rel
+                    decls.append(d_copy)
             except Exception:
                 continue
+
+    return decls
+
+
+def _collect_in_scope_header_declarations(
+    work_dir: Path,
+    header_rel: str,
+    header_text: str | None = None,
+) -> set[str]:
+    """
+    Collect top-level ACSL declaration identifiers and profile keys that are in scope
+    for `header_rel`: ONLY declarations from `acsl_vocabulary.h` and transitively included
+    headers in `work_dir`.
+    """
+    names: set[str] = set()
+
+    # 1. Canonical acsl_vocabulary.h
+    vocab_p = resolve_acsl_vocabulary_path(work_dir)
+    if vocab_p and vocab_p.is_file():
+        try:
+            vocab_text = vocab_p.read_text(encoding="utf-8", errors="replace")
+            for d in extract_top_level_acsl_declarations(vocab_text, path=vocab_p.name):
+                names.add(d.get("profile_key") or d["name"])
+                if d.get("full_profile"):
+                    names.add(d["full_profile"])
+        except Exception:
+            pass
+
+    # 2. Transitive includes of header_rel
+    transitive_rels = _find_transitive_includes(header_rel, work_dir, header_text=header_text)
+    for inc_rel in sorted(transitive_rels):
+        p = work_dir / inc_rel
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for d in extract_top_level_acsl_declarations(text, path=inc_rel):
+                names.add(d.get("profile_key") or d["name"])
+                if d.get("full_profile"):
+                    names.add(d["full_profile"])
+        except Exception:
+            continue
+
     return names
 
 
@@ -736,6 +885,23 @@ def infer_prover_wp_flags(
     return flags
 
 
+def _collect_existing_header_declarations(work_dir: Path, exclude_rels: set[str]) -> set[str]:
+    """Collect top-level ACSL declaration profile keys from all `.h`/`.acsl` files in `work_dir` except `exclude_rels`."""
+    names: set[str] = set()
+    for d in _collect_all_header_declarations_with_metadata(work_dir, exclude_rels):
+        names.add(d.get("profile_key") or d["name"])
+    return names
+
+
+def _supports_kwarg(func: Any, kwarg: str) -> bool:
+    """Return True if `func` accepts `kwarg` as a named parameter or via `**kwargs`."""
+    try:
+        sig = inspect.signature(func)
+        return kwarg in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except (ValueError, TypeError):
+        return True
+
+
 def _run_parent_reverify(
     run_dir: Path,
     agent_id: str,
@@ -749,6 +915,7 @@ def _run_parent_reverify(
     ldflags: str = "",
     wp_par: int | None = None,
     allow_partial_wp: bool = False,
+    wp_extra_sources: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
@@ -862,6 +1029,8 @@ def _run_parent_reverify(
             "--out-json",
             str(wp_json),
         ]
+        if wp_extra_sources:
+            cmd.extend(["--extra-sources", *wp_extra_sources])
         proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if proc.returncode != 0 or not wp_json.is_file():
             return False, f"parent WP check failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
@@ -910,6 +1079,7 @@ def merge_agent_overlay(
     journal: bool = True,
     allow_partial_wp: bool = False,
     contract_only: bool = False,
+    wp_extra_sources: list[str] | None = None,
 ) -> dict:
     """
     Validate an agent's scratch overlay (ACSL-only + role/function scope), structurally
@@ -938,6 +1108,7 @@ def merge_agent_overlay(
             journal,
             allow_partial_wp=allow_partial_wp,
             contract_only=contract_only,
+            wp_extra_sources=wp_extra_sources,
         )
         if recovered:
             res["recovered_journal"] = recovered
@@ -983,6 +1154,7 @@ def _merge_agent_overlay_locked(
     journal: bool,
     allow_partial_wp: bool = False,
     contract_only: bool = False,
+    wp_extra_sources: list[str] | None = None,
 ) -> dict:
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid agent_id: {agent_id!r}")
@@ -1110,7 +1282,17 @@ def _merge_agent_overlay_locked(
             )
 
         if is_hdr:
-            existing_names = _collect_existing_header_declarations(shared_work, {rel_str})
+            # 1. Detect conflicting predicate profiles across headers and acsl_vocabulary.h
+            all_existing = _collect_all_header_declarations_with_metadata(shared_work, {rel_str})
+            curr_decls = extract_top_level_acsl_declarations(spliced, path=rel_str)
+            conflicts = check_conflicting_acsl_profiles(curr_decls, all_existing, source_path=rel_str)
+            if conflicts:
+                raise ConflictingProfileError(
+                    f"Conflicting ACSL profile(s) detected during merge of {rel_str}:\n  " + "\n  ".join(conflicts)
+                )
+
+            # 2. Deduplicate ONLY declarations in acsl_vocabulary.h or transitively included headers
+            existing_names = _collect_in_scope_header_declarations(shared_work, rel_str, header_text=spliced)
             spliced, removed_decls = dedup_acsl_declarations(
                 spliced,
                 existing_names,
@@ -1172,18 +1354,41 @@ def _merge_agent_overlay_locked(
                     allow_partial_wp=True,
                 )
             else:
-                ok, reason = _run_parent_reverify(
-                    run_dir,
-                    agent_id,
-                    role,
-                    overlay,
-                    norm_c_file,
-                    function,
-                    module,
-                    sources,
-                    cppflags,
-                    ldflags=ldflags,
-                )
+                reverify_kwargs: dict[str, Any] = {
+                    "ldflags": ldflags,
+                }
+                if wp_extra_sources is not None and _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
+                    reverify_kwargs["wp_extra_sources"] = wp_extra_sources
+                try:
+                    ok, reason = _run_parent_reverify(
+                        run_dir,
+                        agent_id,
+                        role,
+                        overlay,
+                        norm_c_file,
+                        function,
+                        module,
+                        sources,
+                        cppflags,
+                        **reverify_kwargs,
+                    )
+                except TypeError as exc:
+                    if "wp_extra_sources" in str(exc) and "wp_extra_sources" in reverify_kwargs:
+                        reverify_kwargs.pop("wp_extra_sources", None)
+                        ok, reason = _run_parent_reverify(
+                            run_dir,
+                            agent_id,
+                            role,
+                            overlay,
+                            norm_c_file,
+                            function,
+                            module,
+                            sources,
+                            cppflags,
+                            **reverify_kwargs,
+                        )
+                    else:
+                        raise
             if not ok:
                 for rel_str, raw in backups.items():
                     (shared_work / rel_str).write_bytes(raw)
@@ -1252,6 +1457,7 @@ def _enrich_batch_entry(
     default_sources: list[str] | None,
     default_cppflags: str | None,
     default_ldflags: str,
+    default_wp_extra_sources: list[str] | None = None,
 ) -> dict:
     entry = dict(raw_entry)
     agent_id = entry["agent_id"]
@@ -1314,6 +1520,17 @@ def _enrich_batch_entry(
     ldflags = (
         entry.get("ldflags") if entry.get("ldflags") is not None else (default_ldflags or hmeta.get("ldflags") or "")
     )
+    wp_extra_sources = entry.get("wp_extra_sources") or default_wp_extra_sources
+    if wp_extra_sources is None and module:
+        for pfile in (overlay / "build" / "params.json", run_dir / "workspace" / "build" / "params.json"):
+            if pfile.is_file():
+                try:
+                    pdata = json.loads(pfile.read_text(encoding="utf-8"))
+                    wp_extra_sources = pdata.get("modules", {}).get(module, {}).get("wp_extra_sources")
+                    if wp_extra_sources is not None:
+                        break
+                except Exception:
+                    pass
 
     return {
         "agent_id": agent_id,
@@ -1325,6 +1542,7 @@ def _enrich_batch_entry(
         "sources": sources,
         "cppflags": cppflags,
         "ldflags": ldflags,
+        "wp_extra_sources": wp_extra_sources,
     }
 
 
@@ -1351,6 +1569,8 @@ def merge_agent_batch(
     default_role: str | None = None,
     default_module: str | None = None,
     default_sources: list[str] | None = None,
+    default_wp_extra_sources: list[str] | None = None,
+    wp_extra_sources: list[str] | None = None,
 ) -> dict:
     """
     Merge a batch of architect or prover overlays onto `workspace/work/`, deduplicating
@@ -1384,6 +1604,7 @@ def merge_agent_batch(
                 default_role,
                 default_module,
                 default_sources,
+                default_wp_extra_sources=default_wp_extra_sources or wp_extra_sources,
             )
         except BaseException:
             for rel_str, raw in journal_backups.items():
@@ -1416,6 +1637,7 @@ def _splice_batch(run_dir: Path, overlay: Path, items: list[dict]) -> tuple[list
                 ldflags=item["ldflags"],
                 skip_reverify=True,
                 journal=False,
+                wp_extra_sources=item.get("wp_extra_sources"),
             )
             spliced.append((item, res))
         except (OverlayMergeError, AcslError, ScopeViolationError, ArtifactError, UnicodeDecodeError, OSError) as exc:
@@ -1473,19 +1695,22 @@ def _verify_batch_round(
         )
     for i, item in enumerate(items):
         if item["role"] == "prover" and item.get("c_file") and item.get("function"):
+            chk_kwargs: dict[str, Any] = {
+                "agent_id": item["agent_id"],
+                "role": "prover",
+                "c_file": item["c_file"],
+                "function": item["function"],
+                "module": None,
+                "sources": None,
+                "cppflags": item["cppflags"],
+                "ldflags": item["ldflags"],
+            }
+            if item.get("wp_extra_sources") is not None:
+                chk_kwargs["wp_extra_sources"] = item["wp_extra_sources"]
             checks.append(
                 (
                     [i],
-                    {
-                        "agent_id": item["agent_id"],
-                        "role": "prover",
-                        "c_file": item["c_file"],
-                        "function": item["function"],
-                        "module": None,
-                        "sources": None,
-                        "cppflags": item["cppflags"],
-                        "ldflags": item["ldflags"],
-                    },
+                    chk_kwargs,
                 )
             )
     if not checks:
@@ -1506,7 +1731,16 @@ def _verify_batch_round(
     wp_par = wp_parallelism(per_worker_budget)
 
     def _check(kwargs: dict) -> tuple[bool, str]:
-        return _run_parent_reverify(run_dir=run_dir, overlay_dir=overlay, wp_par=wp_par, **kwargs)
+        call_kwargs = dict(kwargs)
+        if call_kwargs.get("wp_extra_sources") is None or not _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
+            call_kwargs.pop("wp_extra_sources", None)
+        try:
+            return _run_parent_reverify(run_dir=run_dir, overlay_dir=overlay, wp_par=wp_par, **call_kwargs)
+        except TypeError as exc:
+            if "wp_extra_sources" in str(exc) and "wp_extra_sources" in call_kwargs:
+                call_kwargs.pop("wp_extra_sources", None)
+                return _run_parent_reverify(run_dir=run_dir, overlay_dir=overlay, wp_par=wp_par, **call_kwargs)
+            raise
 
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="parent-recheck")
     try:
@@ -1550,6 +1784,7 @@ def _merge_agent_batch_locked(
     default_role: str | None,
     default_module: str | None,
     default_sources: list[str] | None,
+    default_wp_extra_sources: list[str] | None = None,
 ) -> dict:
     run_dir = run_dir.resolve()
     overlay = (overlay_dir or (run_dir / "workspace")).resolve()
@@ -1567,6 +1802,7 @@ def _merge_agent_batch_locked(
             default_sources=default_sources,
             default_cppflags=cppflags,
             default_ldflags=ldflags,
+            default_wp_extra_sources=default_wp_extra_sources,
         )
         for e in entries
     ]
@@ -1665,6 +1901,7 @@ def _merge_agent_batch_locked(
             skip_reverify=False,
             verify_hook=indiv_hook,
             journal=False,
+            wp_extra_sources=item.get("wp_extra_sources"),
         )
         if res["ok"]:
             merged_results.append(res)

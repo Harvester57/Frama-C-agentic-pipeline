@@ -25,3 +25,18 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
         __e_acsl_globals_init();
     return 0;
 }
+
+/*
+ * Frama-C 33.0 E-ACSL runtime lacks __e_acsl_pthread_create when concurrency tracking is enabled.
+ * Provide a self-contained weak alias forwarding to pthread_create if available without <pthread.h>.
+ */
+int pthread_create(void *thread, const void *attr, void *(*start_routine)(void *), void *arg) __attribute__((weak));
+
+__attribute__((weak))
+int __e_acsl_pthread_create(void *thread, const void *attr, void *(*start_routine)(void *), void *arg)
+{
+    if (pthread_create)
+        return pthread_create(thread, attr, start_routine, arg);
+    return -1;
+}
+

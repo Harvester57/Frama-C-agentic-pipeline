@@ -83,6 +83,7 @@ from eacsl_toolchain import (  # noqa: E402
     resolve_fuzz_init_source,
     rewrite_sound_verdict_resets,
     select_eacsl_binary,
+    slice_has_pthread,
 )
 from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
 from framac_common import (  # noqa: E402
@@ -622,11 +623,20 @@ def _eacsl_cache_material(
     variadic_translation: bool,
     warn_unsigned_downcast: bool,
     rte_initialized: bool,
+    concurrency: bool | None = None,
 ) -> dict | None:
     """Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse)."""
+    has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
     try:
-        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag)
-        ldflags = normalize_passthrough(f"-fsanitize=fuzzer {ldflags_extra}" if fuzzer_flag else ldflags_extra)
+        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag, concurrency=has_pthread)
+        ld_parts = []
+        if fuzzer_flag:
+            ld_parts.append("-fsanitize=fuzzer")
+        if has_pthread and "-lpthread" not in ldflags_extra.split():
+            ld_parts.append("-lpthread")
+        if ldflags_extra:
+            ld_parts.append(ldflags_extra)
+        ldflags = normalize_passthrough(" ".join(ld_parts))
     except UnsafePassthroughError:
         return None
     eacsl_bin, is_modern = _resolve_eacsl_gcc()
@@ -647,6 +657,7 @@ def _eacsl_cache_material(
         "warn_unsigned_downcast": warn_unsigned_downcast,
         "rte_initialized": rte_initialized,
         "no_constfold": True,
+        "concurrency": has_pthread,
     }
 
 
@@ -665,6 +676,7 @@ def compile_eacsl_binary(
     runner=subprocess.run,
     use_cache: bool = True,
     enable_l2: bool | None = None,
+    concurrency: bool | None = None,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL (see `_compile_eacsl_binary_uncached`).
@@ -692,6 +704,7 @@ def compile_eacsl_binary(
             rte_initialized,
             runner,
             target_fns=target_fns,
+            concurrency=concurrency,
         )
 
     material = None
@@ -708,6 +721,7 @@ def compile_eacsl_binary(
             variadic_translation,
             warn_unsigned_downcast,
             rte_initialized,
+            concurrency=concurrency,
         )
     if material is None:
         res = _build()
@@ -757,6 +771,7 @@ def _compile_eacsl_binary_uncached(
     rte_initialized: bool = True,
     runner=subprocess.run,
     target_fns: list[str] | None = None,
+    concurrency: bool | None = None,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL.
@@ -810,10 +825,19 @@ def _compile_eacsl_binary_uncached(
         compile_log.write_text("\n".join(log_parts) or f"Returncode: {rc}\nReason: {reason}\n", encoding="utf-8")
         return result
 
+    has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
+    result["concurrency"] = has_pthread
     eacsl_bin, is_modern = _resolve_eacsl_gcc()
     try:
-        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag)
-        ldflags = normalize_passthrough(f"-fsanitize=fuzzer {ldflags_extra}" if fuzzer_flag else ldflags_extra)
+        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag, concurrency=has_pthread)
+        ld_parts = []
+        if fuzzer_flag:
+            ld_parts.append("-fsanitize=fuzzer")
+        if has_pthread and "-lpthread" not in ldflags_extra.split():
+            ld_parts.append("-lpthread")
+        if ldflags_extra:
+            ld_parts.append(ldflags_extra)
+        ldflags = normalize_passthrough(" ".join(ld_parts))
     except UnsafePassthroughError as exc:
         result["stderr"] = str(exc)
         log_parts.append(f"Refusing to call e-acsl-gcc: {exc}\n")
@@ -836,6 +860,8 @@ def _compile_eacsl_binary_uncached(
             "-O",
             str(instrumented_c),
         ]
+        if has_pthread:
+            cmd.append("--concurrency")
         if warn_unsigned_downcast:
             cmd.append("--frama-c-extra=-warn-unsigned-downcast")
         if target_fns:
@@ -852,6 +878,8 @@ def _compile_eacsl_binary_uncached(
 
         def _stage1(fns: list[str]) -> tuple[list[str], int, str, str]:
             fc_flags = ["-rte", f"-machdep {machdep}", *EACSL_FC_EXTRA_FLAGS]
+            if has_pthread:
+                fc_flags.append("-e-acsl-concurrency")
             if rte_initialized:
                 fc_flags.append(EACSL_RTE_INITIALIZED_FLAG)
             if warn_unsigned_downcast:
@@ -1175,6 +1203,119 @@ def classify_campaign(returncode: int, timed_out: bool, artifacts: list[dict]) -
     return "fuzzer_error"
 
 
+_DICT_LINE_RE = re.compile(r'^(?P<prefix>(?:[A-Za-z0-9_]+\s*=\s*)?)"(?P<val>.*)"(?P<suffix>\s*(?:#.*)?)$')
+
+
+def sanitize_dictionary_token(raw_val: str) -> str:
+    """
+    Sanitize the string inside a dictionary entry's quotes for LibFuzzer.
+    Converts raw backslashes and invalid escapes to valid hex escapes (\\xHH) or \\\\,
+    and converts non-printable / control bytes to \\xHH.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(raw_val)
+    while i < n:
+        c = raw_val[i]
+        # Check for escape sequences
+        if c == "\\":
+            if i + 1 >= n:
+                # Trailing backslash -> escape it
+                out.append("\\\\")
+                i += 1
+                continue
+            nxt = raw_val[i + 1]
+            if nxt == "\\" or nxt == '"':
+                out.append(c + nxt)
+                i += 2
+                continue
+            if nxt in ("x", "X") and i + 3 < n and all(raw_val[i + k] in "0123456789abcdefABCDEF" for k in (2, 3)):
+                out.append(f"\\x{raw_val[i + 2 : i + 4].lower()}")
+                i += 4
+                continue
+            if nxt == "n":
+                out.append("\\x0a")
+                i += 2
+                continue
+            if nxt == "r":
+                out.append("\\x0d")
+                i += 2
+                continue
+            if nxt == "t":
+                out.append("\\x09")
+                i += 2
+                continue
+            if nxt == "0":
+                out.append("\\x00")
+                i += 2
+                continue
+            # Unknown escape like \a, \b, \p -> escape the backslash
+            out.append("\\\\")
+            i += 1
+            continue
+
+        # Check for non-printable or non-ASCII characters
+        code = ord(c)
+        if code < 32 or code >= 127:
+            out.append(f"\\x{code & 0xFF:02x}")
+        elif c == '"':
+            out.append('\\"')
+        else:
+            out.append(c)
+        i += 1
+
+    return "".join(out)
+
+
+def sanitize_dictionary_line(line: str) -> str:
+    """Sanitize a single line in a LibFuzzer dictionary."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return line
+
+    m = _DICT_LINE_RE.match(line)
+    if m:
+        prefix = m.group("prefix")
+        val = m.group("val")
+        suffix = m.group("suffix")
+        return f'{prefix}"{sanitize_dictionary_token(val)}"{suffix}'
+
+    # Line is not in standard `"..."` format; if it has `name = val` or just `val`
+    if "=" in line:
+        name, _, rest = line.partition("=")
+        rest_val = rest.strip().strip('"')
+        return f'{name.strip()} = "{sanitize_dictionary_token(rest_val)}"'
+    else:
+        rest_val = stripped.strip('"')
+        return f'"{sanitize_dictionary_token(rest_val)}"'
+
+
+def sanitize_dictionary_content(content: str) -> str:
+    """Sanitize all entries in LibFuzzer dictionary content."""
+    lines = content.splitlines(keepends=True)
+    out: list[str] = []
+    for line in lines:
+        ending = "\n" if line.endswith("\n") else ""
+        raw_line = line[:-1] if ending else line
+        out.append(sanitize_dictionary_line(raw_line) + ending)
+    return "".join(out)
+
+
+def sanitize_fuzzer_dictionary(dict_path: Path, out_path: Path | None = None) -> Path:
+    """Read a LibFuzzer dictionary, sanitize entries by escaping backslashes and non-printables, and write out."""
+    dict_path = Path(dict_path)
+    if not dict_path.is_file():
+        return dict_path
+    text = dict_path.read_text(encoding="utf-8", errors="replace")
+    sanitized = sanitize_dictionary_content(text)
+    if out_path is None:
+        out_path = dict_path.with_name(f"{dict_path.stem}.sanitized{dict_path.suffix}")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(sanitized, encoding="utf-8")
+    return out_path
+
+
 def run_fuzz_campaign(
     binary: Path,
     corpus_dir: Path,
@@ -1250,7 +1391,8 @@ def run_fuzz_campaign(
         if eff_jobs > 1:
             cmd.insert(1, f"-jobs={eff_jobs}")
         if dict_file and dict_file.exists():
-            cmd.insert(1, f"-dict={dict_file.resolve()}")
+            sanitized_dict = sanitize_fuzzer_dictionary(dict_file, scratch / f"{dict_file.stem}.sanitized.dict")
+            cmd.insert(1, f"-dict={sanitized_dict.resolve()}")
 
         waves = max(1, (eff_jobs + eff_workers - 1) // eff_workers)
         wall_timeout = max_time * waves + 180
@@ -2292,7 +2434,11 @@ def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
                 sources.append(src)
     tokens = shlex.split(meta.get("cppflags") or "-I.")
     acsl_dir = acsl_include_dir()
-    if acsl_dir is not None and f"-I{acsl_dir.as_posix()}" not in tokens:
+    if (
+        acsl_dir is not None
+        and acsl_dir.as_posix() not in (meta.get("cppflags") or "")
+        and f"-I{acsl_dir.as_posix()}" not in tokens
+    ):
         tokens.append(f"-I{acsl_dir.as_posix()}")
     return {"sources": [*sources, harness], "cppflags": shlex.join(tokens), "ldflags": meta.get("ldflags") or ""}
 

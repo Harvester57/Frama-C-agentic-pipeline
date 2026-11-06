@@ -115,6 +115,7 @@ FUZZ_BUDGET_cfg := 60
 FUZZ_MAX_TIME_cfg :=
 FUZZ_DICT_cfg :=
 FUZZ_NO_RTE_INIT_cfg :=
+FUZZ_ENGINE_cfg := auto
 
 # log
 SOURCES_log := workspace/harnesses/harness_log.c
@@ -130,6 +131,7 @@ FUZZ_BUDGET_log := 60
 FUZZ_MAX_TIME_log :=
 FUZZ_DICT_log :=
 FUZZ_NO_RTE_INIT_log :=
+FUZZ_ENGINE_log := auto
 
 # snmp
 SOURCES_snmp := workspace/work/src/snmp/pdu.c workspace/work/src/snmp/ber.c workspace/harnesses/harness_snmp.c
@@ -145,6 +147,7 @@ FUZZ_BUDGET_snmp := 300
 FUZZ_MAX_TIME_snmp := 30
 FUZZ_DICT_snmp := workspace/dicts/snmp.dict
 FUZZ_NO_RTE_INIT_snmp :=
+FUZZ_ENGINE_snmp := auto
 """
 
 
@@ -805,7 +808,7 @@ def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
         "--class",
         "wp",
         "--key",
-        "src_snmp_ber.c__ber_decode",
+        "snmp:src/snmp/ber.c#ber_decode",
         "--output",
         "workspace/reports/wp-sweep/src_snmp_ber.c__ber_decode.json",
         "--",
@@ -1099,3 +1102,193 @@ def test_normalize_source_resolves_bare_names_in_subdirectory_overlay(tmp_path):
     # Flat overlays keep working.
     (tmp_path / "workspace" / "work" / "flat.c").write_text("int y;\n", encoding="utf-8")
     assert pm.normalize_source("flat.c", tmp_path) == "workspace/work/flat.c"
+
+
+# ---------------------------------------------------------------------------
+# Milestone M4 / Workstream R2 tests
+# ---------------------------------------------------------------------------
+
+
+def test_params_types_and_defaults_r2():
+    assert pm.PARAM_TYPES["fuzz_engine"] is str
+    assert pm.PARAM_TYPES["wp_exclude_files"] is list
+    assert pm.PARAM_TYPES["wp_extra_sources"] is list
+
+    d = pm.default_params("quick")
+    assert d["fuzz_engine"] == "auto"
+    assert d["wp_exclude_files"] == []
+    assert d["wp_extra_sources"] == []
+
+
+def test_param_problem_validation_r2():
+    # fuzz_engine
+    assert pm._param_problem("fuzz_engine", "auto") is None
+    assert pm._param_problem("fuzz_engine", "eacsl") is None
+    assert pm._param_problem("fuzz_engine", "sanitizers") is None
+    assert "one of" in str(pm._param_problem("fuzz_engine", "invalid"))
+    assert "one of" in str(pm._param_problem("fuzz_engine", 123))
+
+    # wp_exclude_files and wp_extra_sources
+    for key in ("wp_exclude_files", "wp_extra_sources"):
+        assert pm._param_problem(key, []) is None
+        assert pm._param_problem(key, ["src/a.c", "src/b.c"]) is None
+        assert "list of file paths" in str(pm._param_problem(key, "src/a.c"))
+        assert "list of file paths" in str(pm._param_problem(key, ["-flag.c"]))
+        assert "list of file paths" in str(pm._param_problem(key, [""]))
+        assert "list of file paths" in str(pm._param_problem(key, ["a\nb.c"]))
+        assert "list of file paths" in str(pm._param_problem(key, [123]))
+
+
+def test_params_set_and_clear_r2(tmp_path):
+    run = _make_run(tmp_path)
+
+    # Set new tunables
+    res = pm.params_set(
+        run,
+        "snmp",
+        fuzz_engine="sanitizers",
+        wp_exclude_files=["src/snmp/ber.c"],
+        wp_extra_sources=["src/util/str.c"],
+    )
+    assert res["overrides"]["fuzz_engine"] == "sanitizers"
+    assert res["overrides"]["wp_exclude_files"] == ["src/snmp/ber.c"]
+    assert res["overrides"]["wp_extra_sources"] == ["src/util/str.c"]
+    assert res["effective"]["fuzz_engine"] == "sanitizers"
+    assert res["effective"]["wp_exclude_files"] == ["src/snmp/ber.c"]
+    assert res["effective"]["wp_extra_sources"] == ["src/util/str.c"]
+
+    # Verify rendering into modules.mk
+    pm.generate(run, templates_dir=ACSL)
+    text = (run / pm.MODULES_MK).read_text(encoding="utf-8")
+    assert "FUZZ_ENGINE_snmp := sanitizers" in text
+
+    # Clear overrides: fuzz_engine="" and [] for lists
+    res2 = pm.params_set(run, "snmp", fuzz_engine="", wp_exclude_files=[], wp_extra_sources=[])
+    assert "fuzz_engine" not in res2["overrides"]
+    assert "wp_exclude_files" not in res2["overrides"]
+    assert "wp_extra_sources" not in res2["overrides"]
+    assert res2["effective"]["fuzz_engine"] == "auto"
+    assert res2["effective"]["wp_exclude_files"] == []
+    assert res2["effective"]["wp_extra_sources"] == []
+
+
+def test_params_cli_r2(tmp_path, capsys):
+    run = _make_run(tmp_path)
+    rc = pm.main(
+        [
+            "--run-dir",
+            str(run),
+            "params",
+            "set",
+            "--module",
+            "snmp",
+            "--fuzz-engine",
+            "eacsl",
+            "--wp-exclude-files",
+            "src/snmp/ber.c",
+            "--wp-extra-sources",
+            "src/util/str.c",
+            "src/util/mem.c",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["overrides"]["fuzz_engine"] == "eacsl"
+    assert out["overrides"]["wp_exclude_files"] == ["src/snmp/ber.c"]
+    assert out["overrides"]["wp_extra_sources"] == ["src/util/str.c", "src/util/mem.c"]
+
+
+def test_linker_collision_avoidance_in_pipeline_make(tmp_path):
+    run = _make_run(tmp_path)
+
+    # Currently cfg/parse.c has "int f(void) { return 0; }" - no main definition
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    assert not any("-Dmain=" in flag for flag in plan.modules["cfg"].cppflags)
+
+    # Now make cfg/parse.c define main()
+    parse_c = run / "workspace/work/src/cfg/parse.c"
+    parse_c.write_text(
+        "/* helper */\nint main(int argc, char **argv) {\n    return 0;\n}\n",
+        encoding="utf-8",
+    )
+
+    plan2 = pm.build_plan(run, templates_dir=ACSL)
+    assert any("-Dmain=__framac_module_main_cfg" in flag for flag in plan2.modules["cfg"].cppflags)
+
+    # Verify modules.mk has the flag
+    pm.generate(run, templates_dir=ACSL)
+    mk_text = (run / pm.MODULES_MK).read_text(encoding="utf-8")
+    assert "-Dmain=__framac_module_main_cfg" in mk_text
+
+
+def test_linker_collision_avoidance_comment_only_main(tmp_path):
+    run = _make_run(tmp_path)
+    parse_c = run / "workspace/work/src/cfg/parse.c"
+    # Comment-only and prototype-only should NOT trigger -Dmain=
+    parse_c.write_text(
+        "/* int main(int argc, char **argv) { return 0; } */\n"
+        "// int main(void) { return 1; }\n"
+        "int main(void);\n"
+        "int real_func(void) { return 0; }\n",
+        encoding="utf-8",
+    )
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    assert not any("-Dmain=" in flag for flag in plan.modules["cfg"].cppflags)
+
+
+def test_linker_collision_avoidance_in_generate_harness(tmp_path):
+    out_dir = tmp_path / "workspace/harnesses"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    main_c = src_dir / "app_main.c"
+    main_c.write_text("int main(int argc, char **argv) { return 0; }\n", encoding="utf-8")
+    (src_dir / "app.h").write_text("int main(int argc, char **argv);\n", encoding="utf-8")
+
+    generate_harness.generate_module_harness(
+        module_name="app",
+        sources=[str(main_c)],
+        header_include="app.h",
+        entry_fn="main",
+        max_input_size=1024,
+        cppflags="-Isrc",
+        out_dir=out_dir,
+        include_source=False,
+    )
+    sidecar_path = out_dir / "harness_app.json"
+    assert sidecar_path.is_file()
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert "-Dmain=__framac_module_main_app" in sidecar["cppflags"]
+
+
+def test_wp_baseline_stage_target_and_deps(tmp_path):
+    run = _make_run(tmp_path)
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    assert pm.STAGE_OF_TARGET["wp-baseline"] == pm.STAGE_OF_TARGET["wp-queue"]
+    assert pm._TARGET_OUTPUTS["wp-baseline"] == "workspace/reports/wp_baseline.json"
+    assert pm._node_deps("wp-baseline", plan) == ["wp-queue"]
+
+
+def test_sweep_propagates_wp_extra_sources(tmp_path):
+    run = _make_run(tmp_path)
+    _sweep_ledger(run)
+    # Configure wp_extra_sources for module snmp
+    pm.params_set(run, "snmp", wp_extra_sources=["src/snmp/util.c", "src/snmp/helper.c"])
+    plan = pm.build_plan(run, templates_dir=ACSL)
+
+    calls = []
+
+    def fake(cmd, log_rel):
+        calls.append(cmd)
+        out_json = cmd[cmd.index("--out-json") + 1]
+        write_json(run / out_json, {"function": cmd[cmd.index("--function") + 1], "status": "all_proven"})
+        return 0
+
+    def fake_script(script, args):
+        return 0, '{"reports": 1, "covered": 1, "blocked": 0}'
+
+    summary = pm.sweep(run, jobs=2, runner=fake, plan=plan, script_runner=fake_script)
+    assert summary["ok"] is True
+    ber = next(c for c in calls if "ber_decode" in c)
+    assert "--extra-sources" in ber
+    idx = ber.index("--extra-sources")
+    assert ber[idx + 1 : idx + 3] == ["src/snmp/util.c", "src/snmp/helper.c"]

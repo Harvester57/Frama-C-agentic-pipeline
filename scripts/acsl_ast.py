@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class AcslError(RuntimeError):
@@ -29,6 +30,10 @@ class AcslSyntaxError(AcslError):
 
 class ScopeViolationError(AcslError):
     """Raised when an agent modifies tokens outside its assigned function or header scope."""
+
+
+class ConflictingProfileError(AcslError):
+    """Raised when an ACSL predicate or logic declaration conflicts with an existing declaration profile."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -804,6 +809,37 @@ _CONTRACT_KWS = frozenset(
         "disjoint",
     }
 )
+_C_TYPE_KEYWORDS = frozenset(
+    {
+        "int",
+        "char",
+        "short",
+        "long",
+        "float",
+        "double",
+        "void",
+        "signed",
+        "unsigned",
+        "bool",
+        "_bool",
+        "integer",
+        "real",
+        "boolean",
+        "size_t",
+        "ssize_t",
+        "uint8_t",
+        "uint16_t",
+        "uint32_t",
+        "uint64_t",
+        "int8_t",
+        "int16_t",
+        "int32_t",
+        "int64_t",
+        "uintptr_t",
+        "intptr_t",
+        "ptrdiff_t",
+    }
+)
 _CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\\n]){1,4}'")
 _STR_LIT_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
 
@@ -815,6 +851,127 @@ class _AcslSegment:
     raw_text: str
     line: int
     arity: int | None = None
+    param_types: tuple[str, ...] | None = None
+
+
+def _normalize_acsl_type(type_str: str) -> str:
+    """Normalize whitespace and type aliases in ACSL parameter type strings."""
+    t = _COMMENT_IN_ACSL_RE.sub(" ", type_str).strip()
+    t = re.sub(r"/\*.*?\*/", " ", t, flags=re.DOTALL)
+    t = re.sub(r"\s*\*\s*", " *", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\buint8_t\b", "unsigned char", t)
+    t = re.sub(r"\bint8_t\b", "signed char", t)
+    t = re.sub(r"\buint16_t\b", "unsigned short", t)
+    t = re.sub(r"\bint16_t\b", "short", t)
+    t = re.sub(r"\buint32_t\b", "unsigned int", t)
+    t = re.sub(r"\bint32_t\b", "int", t)
+    t = re.sub(r"\buint64_t\b", "unsigned long", t)
+    t = re.sub(r"\bint64_t\b", "long", t)
+    return t
+
+
+def _extract_decl_param_types(
+    kind: str,
+    body_after_kw: str,
+    decl_name: str | None,
+) -> tuple[str, ...] | None:
+    """Return the normalized parameter types for `predicate`/`logic`/`inductive` declarations, or None."""
+    if kind not in ("predicate", "logic", "inductive") or not decl_name:
+        return None
+    scrubbed = _COMMENT_IN_ACSL_RE.sub(" ", body_after_kw)
+    pos = -1
+    for m in re.finditer(rf"\b{re.escape(decl_name)}\b", scrubbed):
+        pos = m.end()
+        tail_preview = scrubbed[pos:].lstrip()
+        if not tail_preview or tail_preview[0] in "({=;":
+            break
+    if pos == -1:
+        return None
+    i = pos
+    n = len(scrubbed)
+    # Skip optional `{L1, L2}` label list after the declaration name
+    while i < n and scrubbed[i].isspace():
+        i += 1
+    if i < n and scrubbed[i] == "{":
+        b_depth = 1
+        i += 1
+        while i < n and b_depth > 0:
+            if scrubbed[i] == "{":
+                b_depth += 1
+            elif scrubbed[i] == "}":
+                b_depth -= 1
+            i += 1
+    while i < n and scrubbed[i].isspace():
+        i += 1
+    if i >= n or scrubbed[i] != "(":
+        return ()
+
+    # Scan parameter list `( ... )`
+    p_depth = 1
+    i += 1
+    param_start = i
+    raw_params: list[str] = []
+    while i < n and p_depth > 0:
+        ch = scrubbed[i]
+        if ch in "([<":
+            p_depth += 1
+        elif ch in ")]>":
+            p_depth -= 1
+            if p_depth == 0:
+                raw_params.append(scrubbed[param_start:i])
+                break
+        elif ch == "," and p_depth == 1:
+            raw_params.append(scrubbed[param_start:i])
+            param_start = i + 1
+        i += 1
+
+    parsed_types: list[str] = []
+    for raw in raw_params:
+        cleaned = raw.strip()
+        if not cleaned or cleaned == "void":
+            continue
+        star_pos = cleaned.rfind("*")
+        if star_pos != -1:
+            after = cleaned[star_pos + 1 :].strip()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", after):
+                type_part = cleaned[: star_pos + 1]
+            else:
+                type_part = cleaned
+        else:
+            words = cleaned.split()
+            if len(words) > 1:
+                # Disambiguate anonymous parameter from named parameter:
+                # If the last word is a known type keyword, or if the declaration
+                # is an anonymous struct/union/enum (e.g. "struct token", "const struct token"),
+                # the last word is part of the type, not a variable name.
+                has_tag = False
+                for tag_kw in ("struct", "union", "enum"):
+                    if tag_kw in words:
+                        idx = words.index(tag_kw)
+                        if idx == len(words) - 2:
+                            has_tag = True
+                        break
+
+                if words[-1].lower() in _C_TYPE_KEYWORDS or has_tag:
+                    type_part = cleaned
+                elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", words[-1]):
+                    type_part = " ".join(words[:-1])
+                else:
+                    type_part = cleaned
+            else:
+                type_part = cleaned
+        parsed_types.append(_normalize_acsl_type(type_part))
+
+    return tuple(parsed_types)
+
+
+def _is_acsl_comment_or_whitespace_only(inner: str) -> bool:
+    """Return True if the ACSL annotation interior contains only whitespace and/or comments."""
+    no_comments = _COMMENT_IN_ACSL_RE.sub(" ", inner)
+    no_comments = re.sub(r"/\*.*?\*/", " ", no_comments, flags=re.DOTALL)
+    remainder = re.sub(r"[\s*@]", "", no_comments)
+    return len(remainder) == 0
 
 
 def _extract_decl_arity(kind: str, body_after_kw: str, decl_name: str | None) -> int | None:
@@ -963,10 +1120,12 @@ def _parse_acsl_inner_segments(inner: str, base_line: int) -> list[_AcslSegment]
             return
         decl_name: str | None = None
         decl_arity: int | None = None
+        decl_param_types: tuple[str, ...] | None = None
         if current_kw in _TOP_DECL_KWS and kw_end_offset != -1 and kw_end_offset <= end_pos:
             body_slice = inner[kw_end_offset:end_pos]
             decl_name = _extract_decl_name(current_kw, body_slice)
             decl_arity = _extract_decl_arity(current_kw, body_slice, decl_name)
+            decl_param_types = _extract_decl_param_types(current_kw, body_slice, decl_name)
         segments.append(
             _AcslSegment(
                 kind=current_kw,
@@ -974,6 +1133,7 @@ def _parse_acsl_inner_segments(inner: str, base_line: int) -> list[_AcslSegment]
                 raw_text=inner[seg_start:end_pos],
                 line=seg_line,
                 arity=decl_arity,
+                param_types=decl_param_types,
             )
         )
         seg_start = end_pos
@@ -1154,12 +1314,18 @@ def extract_top_level_acsl_declarations(source: str, path: str = "<input>") -> l
             for seg in _parse_acsl_inner_segments(inner, tok.line):
                 if seg.kind in _TOP_DECL_KWS and seg.name:
                     profile_key = f"{seg.name}/{seg.arity}" if seg.arity is not None else seg.name
+                    param_types = seg.param_types
+                    full_profile = (
+                        f"{seg.name}(" + ", ".join(param_types) + ")" if param_types is not None else profile_key
+                    )
                     decls.append(
                         {
                             "kind": seg.kind,
                             "name": seg.name,
                             "arity": seg.arity,
+                            "param_types": param_types,
                             "profile_key": profile_key,
+                            "full_profile": full_profile,
                             "text": seg.raw_text.strip(),
                             "line": seg.line,
                         }
@@ -1176,16 +1342,20 @@ def dedup_acsl_declarations(
 ) -> tuple[str, list[str]]:
     """
     Remove duplicate top-level ACSL declarations (`predicate`, `logic`, `lemma`, `type`,
-    `axiomatic`, `inductive`, `ghost`) from `target_text` whose identifier name or
-    `name/arity` profile is already in `existing_names` (or duplicated with the same
-    profile earlier in `target_text`), while preserving overloaded declarations with
-    different parameter arities and any declarations already present in `baseline_text`.
+    `axiomatic`, `inductive`, `ghost`) from `target_text` whose identifier name,
+    `name/arity` profile, or full signature is already in `existing_names` (or duplicated
+    earlier in `target_text`), while preserving overloaded declarations with different
+    signatures and any declarations already present in `baseline_text`. Strips ACSL
+    annotation blocks that contain only whitespace and/or comments to prevent empty-annotation
+    errors.
     """
     baseline_profiles: set[str] = set()
     if baseline_text:
         for d in extract_top_level_acsl_declarations(baseline_text, path=path):
             baseline_profiles.add(d["profile_key"])
             baseline_profiles.add(d["name"])
+            if d.get("full_profile"):
+                baseline_profiles.add(d["full_profile"])
 
     seen: set[str] = set(existing_names)
     removed: list[str] = []
@@ -1226,48 +1396,67 @@ def dedup_acsl_declarations(
             for seg in segments:
                 if seg.kind in _TOP_DECL_KWS and seg.name:
                     profile_key = f"{seg.name}/{seg.arity}" if seg.arity is not None else seg.name
-                    if profile_key in baseline_profiles:
+                    full_profile = (
+                        f"{seg.name}(" + ", ".join(seg.param_types) + ")"
+                        if seg.param_types is not None
+                        else profile_key
+                    )
+                    if (
+                        full_profile in baseline_profiles
+                        or profile_key in baseline_profiles
+                        or seg.name in baseline_profiles
+                    ):
+                        seen.add(full_profile)
                         seen.add(profile_key)
                         kept_segments.append(seg)
-                    elif seg.name in seen or profile_key in seen:
+                    elif full_profile in seen or profile_key in seen or seg.name in seen:
                         removed.append(seg.name)
                         removed_in_block = True
                     else:
-                        seen.add(profile_key)
+                        seen.add(full_profile)
                         kept_segments.append(seg)
                 else:
                     kept_segments.append(seg)
 
+            is_empty_or_comments = False
+            rebuilt_inner: str = ""
             if not removed_in_block:
-                out_parts.append(tok.text)
+                if _is_acsl_comment_or_whitespace_only(inner):
+                    is_empty_or_comments = True
+                else:
+                    out_parts.append(tok.text)
             else:
-                has_active = any(s.kind is not None for s in kept_segments)
-                if has_active:
-                    rebuilt_inner = "".join(s.raw_text for s in kept_segments)
+                rebuilt_inner = "".join(s.raw_text for s in kept_segments)
+                if _is_acsl_comment_or_whitespace_only(rebuilt_inner):
+                    is_empty_or_comments = True
+                else:
                     if tok.kind == "acsl_block":
                         out_parts.append(f"/*@{rebuilt_inner}*/")
                     else:
                         out_parts.append(f"//@{rebuilt_inner}")
-                else:
-                    # Entire ACSL block became empty: also trim a single leading newline on the next whitespace token
-                    if idx + 1 < total and tokens[idx + 1].kind == "whitespace":
-                        ws_text = tokens[idx + 1].text
-                        if ws_text.startswith("\r\n"):
-                            tokens[idx + 1] = Token(
-                                "whitespace",
-                                ws_text[2:],
-                                tokens[idx + 1].start + 2,
-                                tokens[idx + 1].end,
-                                tokens[idx + 1].line + 1,
-                            )
-                        elif ws_text.startswith("\n"):
-                            tokens[idx + 1] = Token(
-                                "whitespace",
-                                ws_text[1:],
-                                tokens[idx + 1].start + 1,
-                                tokens[idx + 1].end,
-                                tokens[idx + 1].line + 1,
-                            )
+
+            if is_empty_or_comments:
+                if out_parts and out_parts[-1].isspace() and "\n" not in out_parts[-1]:
+                    if len(out_parts) == 1 or "\n" in out_parts[-2]:
+                        out_parts.pop()
+                if idx + 1 < total and tokens[idx + 1].kind == "whitespace":
+                    ws_text = tokens[idx + 1].text
+                    if ws_text.startswith("\r\n"):
+                        tokens[idx + 1] = Token(
+                            "whitespace",
+                            ws_text[2:],
+                            tokens[idx + 1].start + 2,
+                            tokens[idx + 1].end,
+                            tokens[idx + 1].line + 1,
+                        )
+                    elif ws_text.startswith("\n"):
+                        tokens[idx + 1] = Token(
+                            "whitespace",
+                            ws_text[1:],
+                            tokens[idx + 1].start + 1,
+                            tokens[idx + 1].end,
+                            tokens[idx + 1].line + 1,
+                        )
             idx += 1
             continue
 
@@ -1613,3 +1802,158 @@ def check_frame_preserved(skeleton: dict, acsl_text: str, path: str = "<input>")
                 f"(no assigns clause covering location {a.get('loc')!r} with \\from superset of {sorted(a.get('from') or [])})"
             )
     return errors
+
+
+_CANONICAL_OVERLOADS_CACHE: dict[tuple[str, str, int], set[tuple[str, ...]]] | None = None
+
+
+def _get_canonical_vocabulary_overloads() -> dict[tuple[str, str, int], set[tuple[str, ...]]]:
+    """Return map of (kind, name, arity) -> set of normalized param_types tuples for canonical ACSL overloads."""
+    global _CANONICAL_OVERLOADS_CACHE
+    if _CANONICAL_OVERLOADS_CACHE is not None:
+        return _CANONICAL_OVERLOADS_CACHE
+
+    overloads: dict[tuple[str, str, int], set[tuple[str, ...]]] = {}
+    fallback: dict[tuple[str, str, int], set[tuple[str, ...]]] = {
+        ("predicate", "valid_read_buffer", 2): {
+            ("char *", "integer"),
+            ("unsigned char *", "integer"),
+        },
+        ("predicate", "valid_write_buffer", 2): {
+            ("char *", "integer"),
+            ("unsigned char *", "integer"),
+        },
+    }
+
+    vocab_paths = [
+        Path("/opt/framac-pipeline/templates/acsl/acsl_vocabulary.h"),
+        Path(__file__).resolve().parent.parent / "templates" / "acsl" / "acsl_vocabulary.h",
+    ]
+    extracted = False
+    for vp in vocab_paths:
+        if vp.is_file():
+            try:
+                content = vp.read_text(encoding="utf-8", errors="replace")
+                decls = extract_top_level_acsl_declarations(content, path=vp.name)
+                grouped: dict[tuple[str, str, int], set[tuple[str, ...]]] = {}
+                for d in decls:
+                    k = d.get("kind")
+                    n = d.get("name")
+                    a = d.get("arity")
+                    pt = d.get("param_types")
+                    if k and n and a is not None and pt is not None:
+                        key = (k, n, a)
+                        grouped.setdefault(key, set()).add(pt)
+                for key, sig_set in grouped.items():
+                    if len(sig_set) > 1:
+                        overloads[key] = sig_set
+                extracted = True
+                break
+            except Exception:
+                pass
+
+    if not extracted or not overloads:
+        overloads = fallback
+    else:
+        for key, sigs in fallback.items():
+            overloads.setdefault(key, set()).update(sigs)
+
+    _CANONICAL_OVERLOADS_CACHE = overloads
+    return _CANONICAL_OVERLOADS_CACHE
+
+
+def check_conflicting_acsl_profiles(
+    new_decls: list[dict],
+    existing_decls: list[dict],
+    source_path: str = "<input>",
+) -> list[str]:
+    """
+    Detect conflicting predicate or logic function profiles (e.g. `char*` vs `unsigned char*`).
+    Returns a list of diagnostic error strings if conflicts are found.
+    """
+    conflicts: list[str] = []
+    canonical_overloads = _get_canonical_vocabulary_overloads()
+
+    # 1. Compare new declarations against existing declarations
+    for new_d in new_decls:
+        kind = new_d.get("kind")
+        name = new_d.get("name")
+        arity = new_d.get("arity")
+        param_types = new_d.get("param_types")
+        if kind not in ("predicate", "logic", "inductive") or not name or arity is None or param_types is None:
+            continue
+
+        matching_existing = [
+            d
+            for d in existing_decls
+            if d.get("name") == name
+            and d.get("kind") == kind
+            and d.get("arity") == arity
+            and d.get("param_types") is not None
+        ]
+        if matching_existing:
+            if not any(d["param_types"] == param_types for d in matching_existing):
+                canon_key = (kind, name, arity)
+                if canon_key in canonical_overloads:
+                    valid_sigs = canonical_overloads[canon_key]
+                    if param_types in valid_sigs and all(d["param_types"] in valid_sigs for d in matching_existing):
+                        continue
+
+                first = matching_existing[0]
+                first_loc = f"{first.get('path', '<existing>')}:{first.get('line', '?')}"
+                new_loc = f"{source_path}:{new_d.get('line', '?')}"
+                first_prof = first.get("full_profile") or f"{name}/{arity}"
+                new_prof = new_d.get("full_profile") or f"{name}/{arity}"
+                conflicts.append(
+                    f"Conflicting profile for {kind} '{name}': '{new_prof}' at {new_loc} "
+                    f"conflicts with existing declaration '{first_prof}' at {first_loc}"
+                )
+
+    # 2. Compare declarations within new_decls themselves
+    existing_sigs: set[tuple[str, str, int, tuple[str, ...]]] = {
+        (d["kind"], d["name"], d["arity"], d["param_types"])
+        for d in existing_decls
+        if d.get("kind") and d.get("name") and d.get("arity") is not None and d.get("param_types") is not None
+    }
+
+    n = len(new_decls)
+    for i in range(n):
+        d1 = new_decls[i]
+        kind1 = d1.get("kind")
+        name1 = d1.get("name")
+        arity1 = d1.get("arity")
+        param_types1 = d1.get("param_types")
+        if kind1 not in ("predicate", "logic", "inductive") or not name1 or arity1 is None or param_types1 is None:
+            continue
+        for j in range(i + 1, n):
+            d2 = new_decls[j]
+            if (
+                d2.get("name") == name1
+                and d2.get("kind") == kind1
+                and d2.get("arity") == arity1
+                and d2.get("param_types") is not None
+            ):
+                param_types2 = d2["param_types"]
+                if param_types2 != param_types1:
+                    sig1 = (kind1, name1, arity1, param_types1)
+                    sig2 = (kind1, name1, arity1, param_types2)
+                    # Do not flag as conflict if both are known overloads in existing_decls:
+                    if sig1 in existing_sigs and sig2 in existing_sigs:
+                        continue
+                    # Do not flag as conflict if both match canonical vocabulary overloads:
+                    canon_key = (kind1, name1, arity1)
+                    if canon_key in canonical_overloads:
+                        valid_sigs = canonical_overloads[canon_key]
+                        if param_types1 in valid_sigs and param_types2 in valid_sigs:
+                            continue
+
+                    loc1 = f"{source_path}:{d1.get('line', '?')}"
+                    loc2 = f"{source_path}:{d2.get('line', '?')}"
+                    prof1 = d1.get("full_profile") or f"{name1}/{arity1}"
+                    prof2 = d2.get("full_profile") or f"{name1}/{arity1}"
+                    conflicts.append(
+                        f"Conflicting profile for {kind1} '{name1}': '{prof1}' at {loc1} "
+                        f"conflicts with '{prof2}' at {loc2}"
+                    )
+
+    return conflicts

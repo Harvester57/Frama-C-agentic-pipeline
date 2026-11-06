@@ -17,7 +17,8 @@
   requires valid_dst: size > 0 ==> (dst != \null && \valid(dst + (0 .. size - 1)));
   terminates \true;
   exits \false;
-  assigns dst[0 .. size - 1];
+  assigns dst[0 .. size - 1] \from src[0 .. size - 1], size;
+  assigns \result \from src[0 .. size - 1], size;
   ensures init_dst: size > 0 ==> \initialized(dst);
 */
 size_t strlcpy(char *dst, const char *src, size_t size);
@@ -27,7 +28,8 @@ size_t strlcpy(char *dst, const char *src, size_t size);
   requires valid_dst: size > 0 ==> (dst != \null && \valid(dst + (0 .. size - 1)));
   terminates \true;
   exits \false;
-  assigns dst[0 .. size - 1];
+  assigns dst[0 .. size - 1] \from dst[0 .. size - 1], src[0 .. size - 1], size;
+  assigns \result \from dst[0 .. size - 1], src[0 .. size - 1], size;
 */
 size_t strlcat(char *dst, const char *src, size_t size);
 

@@ -23,6 +23,22 @@
 
 #if defined(__FRAMAC__)
 
+#ifndef _Float32
+#define _Float32 float
+#endif
+#ifndef _Float64
+#define _Float64 double
+#endif
+#ifndef _Float32x
+#define _Float32x double
+#endif
+#ifndef _Float64x
+#define _Float64x double
+#endif
+#ifndef _Float128
+#define _Float128 double
+#endif
+
 #if defined(__FRAMAC_EACSL__)
 
 #include <stdint.h>
@@ -48,8 +64,11 @@ long long int llabs(long long int j);
 #include <stdint.h>
 #include <sys/types.h>
 
+#ifndef __FC_COMPAT_INT_TYPES_DEFINED
+#define __FC_COMPAT_INT_TYPES_DEFINED 1
 #ifndef __GLIBC_INTERNAL_INT_TYPES_DEFINED
 #define __GLIBC_INTERNAL_INT_TYPES_DEFINED 1
+#endif
 #if defined(__INT8_TYPE__) && defined(__UINT8_TYPE__) && defined(__INT16_TYPE__) && defined(__UINT16_TYPE__) \
     && defined(__INT32_TYPE__) && defined(__UINT32_TYPE__) && defined(__INT64_TYPE__) && defined(__UINT64_TYPE__)
 typedef __INT8_TYPE__ __int8_t;
@@ -70,7 +89,7 @@ typedef uint32_t __uint32_t;
 typedef int64_t __int64_t;
 typedef uint64_t __uint64_t;
 #endif
-#endif /* __GLIBC_INTERNAL_INT_TYPES_DEFINED */
+#endif /* __FC_COMPAT_INT_TYPES_DEFINED */
 
 #ifndef __FC_COMPAT_BSD_ALIASES_DEFINED
 #define __FC_COMPAT_BSD_ALIASES_DEFINED 1
@@ -120,6 +139,16 @@ typedef unsigned long u_long;
   @*/
 
 #endif /* __FRAMAC_EACSL__ */
+
+#if defined(__has_include)
+#if __has_include("../acsl/acsl_vocabulary.h")
+#include "../acsl/acsl_vocabulary.h"
+#elif __has_include(<acsl_vocabulary.h>)
+#include <acsl_vocabulary.h>
+#endif
+#else
+#include "../acsl/acsl_vocabulary.h"
+#endif
 
 #endif /* __FRAMAC__ */
 

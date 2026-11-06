@@ -1505,3 +1505,213 @@ def test_deep_and_quick_profile_scheduling(sim):
     deep_tasks = tasks()
     assert "prove:src/e/emit.c#emit_pkt" in deep_tasks
     assert "prove:src/g/glue.c#glue_helper" in deep_tasks
+
+
+def test_cmd_baseline_rolling_pool_and_extra_sources(sim, monkeypatch):
+    sim.build(
+        {
+            "a": ("src/m/a.c", "m", []),
+            "b": ("src/m/b.c", "m", []),
+        }
+    )
+    # Set params with wp_extra_sources
+    write_json(
+        sim.run_dir / "workspace" / "build" / "params.json",
+        {"modules": {"m": {"wp_extra_sources": ["src/m/extra.c"]}}},
+    )
+
+    cmd_calls = []
+
+    def fake_run(cmd, cwd, **kwargs):
+        cmd_calls.append(cmd)
+        fn_idx = cmd.index("--function")
+        fn = cmd[fn_idx + 1]
+        c_idx = cmd.index("--file")
+        c_file = cmd[c_idx + 1]
+        out_idx = cmd.index("--out-json")
+        out_json = Path(cmd[out_idx + 1])
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "function": fn,
+            "file": c_file,
+            "status": "all_proven",
+            "by_obligation_class": {"rte": {"proven": 2, "unproven": 0}},
+            "unproven_goals": [],
+        }
+        write_json(out_json, report)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    ingest_calls = []
+    orig_ingest = S.DEPS.ingest_wp
+
+    def spy_ingest(paths):
+        ingest_calls.extend(paths)
+        return orig_ingest(paths)
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+    monkeypatch.setattr(S.DEPS, "ingest_wp", spy_ingest)
+
+    summary = S.cmd_baseline(run_dir=sim.run_dir, jobs=2)
+
+    assert summary["ok"] is True
+    assert summary["total_tasks"] == 2
+    assert summary["executed"] == 2
+    assert summary["proven"] == 2
+    assert summary["filtered"] == 0
+    assert summary["already_proven"] == 0
+
+    # Verify command line flags
+    a_cmd = next(c for c in cmd_calls if "a" in c[c.index("--function") + 1])
+    assert "--class" in a_cmd and a_cmd[a_cmd.index("--class") + 1] == "wp"
+    assert "--key" in a_cmd and a_cmd[a_cmd.index("--key") + 1] == "m:src/m/a.c#a"
+    assert "--extra-sources" in a_cmd
+    assert a_cmd[a_cmd.index("--extra-sources") + 1] == "src/m/extra.c"
+    assert "--wp-par" in a_cmd and a_cmd[a_cmd.index("--wp-par") + 1] == "auto"
+    assert "--sarif" in a_cmd
+
+    # Verify baseline report on disk
+    baseline_path = sim.run_dir / "workspace" / "reports" / "wp_baseline.json"
+    assert baseline_path.is_file()
+    disk_summary = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert disk_summary["proven"] == 2
+
+    # Verify task state in schedule
+    sched = load(sim.run_dir / "state" / "wp_schedule.json")
+    for t_obj in sched["tasks"].values():
+        assert t_obj["state"] == "done"
+        assert t_obj["outcome"] == "all_proven"
+
+    # Verify incremental ingestion was invoked
+    assert len(ingest_calls) == 2
+
+
+def test_cmd_baseline_wp_exclude_files_filtering(sim, monkeypatch):
+    sim.build(
+        {
+            "a": ("src/m/a.c", "m", []),
+            "b": ("src/m/b.c", "m", []),
+        }
+    )
+    # Filter src/m/a.c
+    write_json(
+        sim.run_dir / "workspace" / "build" / "params.json",
+        {"modules": {"m": {"wp_exclude_files": ["src/m/a.c"]}}},
+    )
+
+    executed_fns = []
+
+    def fake_run(cmd, cwd, **kwargs):
+        fn = cmd[cmd.index("--function") + 1]
+        executed_fns.append(fn)
+        out_json = Path(cmd[cmd.index("--out-json") + 1])
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "function": fn,
+            "file": cmd[cmd.index("--file") + 1],
+            "status": "all_proven",
+            "by_obligation_class": {"rte": {"proven": 2, "unproven": 0}},
+            "unproven_goals": [],
+        }
+        write_json(out_json, report)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+
+    summary = S.cmd_baseline(run_dir=sim.run_dir)
+
+    assert summary["ok"] is True
+    assert summary["total_tasks"] == 2
+    assert summary["filtered"] == 1
+    assert summary["executed"] == 1
+    assert summary["filtered_tasks"][0]["function"] == "a"
+    assert summary["filtered_tasks"][0]["reason"] == "wp_exclude_files"
+    assert executed_fns == ["b"]
+
+    # Verify state for task a is skipped
+    sched = load(sim.run_dir / "state" / "wp_schedule.json")
+    a_task = next(t for t in sched["tasks"].values() if t["function"] == "a")
+    assert a_task["state"] == "skipped"
+    assert a_task["outcome"] == "wp_exclude_files"
+
+
+def test_cmd_baseline_skips_already_proven_unless_recheck_all(sim, monkeypatch):
+    sim.build(
+        {
+            "a": ("src/m/a.c", "m", []),
+            "b": ("src/m/b.c", "m", []),
+        }
+    )
+
+    # Task a already has a report with all_proven
+    a_rep = sim.run_dir / "workspace" / "reports" / "wp" / "a.json"
+    a_rep.parent.mkdir(parents=True, exist_ok=True)
+    write_json(
+        a_rep,
+        {
+            "function": "a",
+            "file": "src/m/a.c",
+            "status": "all_proven",
+            "by_obligation_class": {"rte": {"proven": 2, "unproven": 0}},
+            "unproven_goals": [],
+        },
+    )
+
+    executed_fns = []
+
+    def fake_run(cmd, cwd, **kwargs):
+        fn = cmd[cmd.index("--function") + 1]
+        executed_fns.append(fn)
+        out_json = Path(cmd[cmd.index("--out-json") + 1])
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "function": fn,
+            "file": cmd[cmd.index("--file") + 1],
+            "status": "all_proven",
+            "by_obligation_class": {"rte": {"proven": 2, "unproven": 0}},
+            "unproven_goals": [],
+        }
+        write_json(out_json, report)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+
+    # First run without recheck_all
+    summary1 = S.cmd_baseline(run_dir=sim.run_dir, recheck_all=False)
+    assert summary1["already_proven"] == 1
+    assert summary1["already_proven_tasks"][0]["function"] == "a"
+    assert summary1["executed"] == 1
+    assert executed_fns == ["b"]
+
+    # Second run with recheck_all=True
+    executed_fns.clear()
+    summary2 = S.cmd_baseline(run_dir=sim.run_dir, recheck_all=True)
+    assert summary2["already_proven"] == 0
+    assert summary2["executed"] == 2
+    assert sorted(executed_fns) == ["a", "b"]
+
+
+def test_baseline_cli_subcommand(sim, monkeypatch, capsys):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+
+    def fake_run(cmd, cwd, **kwargs):
+        fn = cmd[cmd.index("--function") + 1]
+        out_json = Path(cmd[cmd.index("--out-json") + 1])
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "function": fn,
+            "file": cmd[cmd.index("--file") + 1],
+            "status": "all_proven",
+            "by_obligation_class": {"rte": {"proven": 2, "unproven": 0}},
+            "unproven_goals": [],
+        }
+        write_json(out_json, report)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+
+    rc = S.main(["baseline", "--run-dir", str(sim.run_dir), "--jobs", "1"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["executed"] == 1
+    assert (sim.run_dir / "workspace" / "reports" / "wp_baseline.json").is_file()
