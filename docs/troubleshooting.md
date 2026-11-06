@@ -95,6 +95,7 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 ### Symptom: `call to undeclared function 'X'` or `invalid application of 'alignof' to an incomplete type`
 - **Cause:** a [`../templates/fc_stubs/`](../templates/fc_stubs/) header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
 - **Fix:** add the prototype and complete the handle with a single dummy member (see [`../templates/fc_stubs/README.md`](../templates/fc_stubs/README.md)). Tool JSONs list missing prototypes under `undeclared_functions`. For Eva/WP this is a soundness issue: Frama-C invents `int X()`.
+- **Target-specific compat headers** (e.g. completing OpenSSL 3 opaque handles `EVP_PKEY`, `BIGNUM`, ... for the fuzz build) must be delivered **source-side**: pass them to `generate_harness.py --compat-include <header>` so the harness `#include`s them after the module header. Never add them to cppflags as `-include`: force-including a header that pulls in system headers re-registers libc properties per merged translation unit and the Frama-C kernel aborts with `trying to register twice property 'assumes nonnull_p'`.
 
 ### Symptom: Instrumentation Aborts With `no function 'X'`
 - **Cause:** `-rte-select` / `-e-acsl-functions` named a function that is absent from the parsed AST (disabled by `#if`, or in a file that failed to parse).

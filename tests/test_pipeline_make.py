@@ -1084,3 +1084,18 @@ def test_perfn_rung_targets_the_functions_with_most_unknowns(tmp_path):
         base_dir / "base.json", {"status": "ok", "input_digest": "d" * 64, "unknown_obligations_by_function": {}}
     )
     assert pm.build_plan(run, templates_dir=ACSL).modules["snmp"].tune_rungs == {}
+
+
+def test_normalize_source_resolves_bare_names_in_subdirectory_overlay(tmp_path):
+    """PB-2: DAG bare names must resolve to workspace/work/src/<name>, not the flat root."""
+    src_dir = tmp_path / "workspace" / "work" / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "misc.c").write_text("int x;\n", encoding="utf-8")
+    assert pm.normalize_source("misc.c", tmp_path) == "workspace/work/src/misc.c"
+    assert pm.normalize_source("src/misc.c", tmp_path) == "workspace/work/src/misc.c"
+    assert pm.normalize_source("workspace/work/src/misc.c", tmp_path) == "workspace/work/src/misc.c"
+    assert pm.normalize_source("/target/src/misc.c", tmp_path) == "workspace/work/src/misc.c"
+    assert pm.normalize_source("/framac-run/workspace/work/src/misc.c", tmp_path) == "workspace/work/src/misc.c"
+    # Flat overlays keep working.
+    (tmp_path / "workspace" / "work" / "flat.c").write_text("int y;\n", encoding="utf-8")
+    assert pm.normalize_source("flat.c", tmp_path) == "workspace/work/flat.c"

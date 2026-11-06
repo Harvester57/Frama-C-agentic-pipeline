@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from build_callgraph_dag import (
@@ -810,3 +811,97 @@ int main_decode_entry(const unsigned char *buf, unsigned int len) {
         ]
         assert sliced_res["cppflags"].count("-Iworkspace/work/include") == 1
         assert "/framac-run" not in sliced_res["cppflags"]
+
+
+class TestParenthesizedDeclarators:
+    """Regression tests for PB-1: function-pointer-returning / parenthesized declarators."""
+
+    def test_all_declarator_shapes_resolve_the_real_name(self) -> None:
+        cases = {
+            "int foo(int a) { return a; }": "foo",
+            "void *bar(size_t n) { return 0; }": "bar",
+            "void *(baz)(size_t c, void **a) { return 0; }": "baz",
+            "int (*qux(int a))(char) { return 0; }": "qux",
+            "void (*(quux)(size_t c, void **a)) { return; }": "quux",
+            "int (corge)(int x) { return x; }": "corge",
+            "static void (*(alloc)(size_t count, void **abstract)) { return; }": "alloc",
+        }
+        for src, expected in cases.items():
+            names = [f["name"] for f in extract_functions_from_code(src, path="<t>")]
+            assert names == [expected], f"{src!r} -> {names}"
+
+    def test_type_keywords_are_never_function_names(self) -> None:
+        src = "static void (*(ssh2_default_alloc)(size_t count, void **abstract)) { return; }\n"
+        names = [f["name"] for f in extract_functions_from_code(src, path="<t>")]
+        assert names == ["ssh2_default_alloc"]
+        assert "void" not in names
+
+    def test_macro_wrapped_definition_resolves_real_name(self) -> None:
+        from build_callgraph_dag import _resolve_macro_wrapped_definitions, extract_macro_definitions
+
+        src = """\
+#define LIBSSH2_ALLOC_FUNC(name) void (*(name)(size_t count, void **abstract))
+static LIBSSH2_ALLOC_FUNC(ssh2_default_alloc) { return 0; }
+static LIBSSH2_ALLOC_FUNC(ssh2_default_free) { return; }
+"""
+        macros = extract_macro_definitions(src, path="<t>")
+        assert macros["LIBSSH2_ALLOC_FUNC"]["params"] == ["name"]
+        items = _resolve_macro_wrapped_definitions(extract_functions_from_code(src, path="<t>"), macros)
+        names = [i["name"] for i in items]
+        assert names == ["ssh2_default_alloc", "ssh2_default_free"]
+        assert "LIBSSH2_ALLOC_FUNC" not in names
+        # The real parameter list comes from the macro body, not the macro argument.
+        assert [t.text for t in items[0]["param_tokens"]][:2] == ["size_t", "count"]
+
+
+class TestForeignPathMapping:
+    """Regression tests for PB-2: compile_commands recorded against another root."""
+
+    def test_map_foreign_path_suffix_match(self, tmp_path: Path) -> None:
+        from build_callgraph_dag import _map_foreign_path
+
+        overlay = tmp_path / "work"
+        (overlay / "src").mkdir(parents=True)
+        (overlay / "src" / "misc.c").write_text("int x;\n", encoding="utf-8")
+        foreign = tmp_path / "target"
+        (foreign / "src").mkdir(parents=True)
+        (foreign / "src" / "misc.c").write_text("int x;\n", encoding="utf-8")
+        assert _map_foreign_path(foreign / "src" / "misc.c", overlay) == "src/misc.c"
+        assert _map_foreign_path(foreign / "elsewhere" / "misc.c", overlay) == "misc.c"
+
+    def test_build_dag_maps_foreign_compile_commands_into_overlay(self, tmp_path: Path) -> None:
+        overlay = tmp_path / "work"
+        (overlay / "src").mkdir(parents=True)
+        (overlay / "src" / "session.c").write_text(
+            "int libssh2_session_init_ex(void) { return ssh2_init_if_needed(); }\n", encoding="utf-8"
+        )
+        (overlay / "src" / "global.c").write_text(
+            "int ssh2_init_if_needed(void) { return 0; }\n", encoding="utf-8"
+        )
+        foreign = tmp_path / "target"
+        (foreign / "src").mkdir(parents=True)
+        (foreign / "src" / "session.c").write_text("int x;\n", encoding="utf-8")
+        (foreign / "src" / "global.c").write_text("int y;\n", encoding="utf-8")
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text(
+            json.dumps(
+                [
+                    {
+                        "directory": str(foreign),
+                        "file": str(foreign / "src" / "session.c"),
+                        "command": "clang -c -Iinclude src/session.c",
+                    },
+                    {
+                        "directory": str(foreign),
+                        "file": str(foreign / "src" / "global.c"),
+                        "command": "clang -c -Iinclude src/global.c",
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        dag = build_dag(overlay, cc)
+        files = {rec["file"] for rec in dag["functions"].values()}
+        assert files == {"src/session.c", "src/global.c"}
+        assert dag["modules"]["session"]["files"] == ["src/session.c"]
+        assert "src/global.c" in dag["modules"]["session"]["required_sources"]

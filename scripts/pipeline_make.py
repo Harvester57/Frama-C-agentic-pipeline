@@ -463,7 +463,16 @@ def normalize_source(raw: str, run_dir: Path) -> str:
     if src.startswith(("/", "workspace/")):
         return src
     # Target-relative (DAG required_sources, most sidecars): the overlay copy in workspace/work.
-    if (run_dir / WORK_DIR / src).is_file() or not (run_dir / src).is_file():
+    work = run_dir / WORK_DIR
+    if (work / src).is_file():
+        return f"{WORK_DIR}/{src}"
+    # The DAG may store bare names (or a stale directory) while the overlay keeps the
+    # sources in a subdirectory (e.g. workspace/work/src/misc.c): resolve by suffix.
+    if work.is_dir():
+        matches = sorted(work.glob(f"**/{src}"), key=lambda p: (len(p.parts), p.as_posix()))
+        if matches:
+            return f"{WORK_DIR}/{matches[0].relative_to(work).as_posix()}"
+    if not (run_dir / src).is_file():
         return f"{WORK_DIR}/{src}"
     return src
 

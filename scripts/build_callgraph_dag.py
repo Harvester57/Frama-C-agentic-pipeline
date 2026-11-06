@@ -300,6 +300,8 @@ def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str,
             "direct_calls": direct_calls,
             "ident_refs": ident_refs | direct_calls,
             "direct_loops": direct_loops,
+            "params": sorted(param_names),
+            "body_text": body_str,
         }
 
     macro_names = set(raw_macros.keys())
@@ -328,6 +330,8 @@ def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str,
             "callees": callees,
             "ident_refs": ident_refs | callees,
             "loop_count": total_loops,
+            "params": info.get("params", []),
+            "body_text": info.get("body_text", ""),
         }
     return resolved
 
@@ -676,6 +680,42 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
     return results
 
 
+def _resolve_macro_wrapped_definitions(
+    items: list[dict], macros: dict[str, dict]
+) -> list[dict]:
+    """
+    Recover the real function name for definitions written through a single-argument
+    function-like macro, e.g. `static LIBSSH2_ALLOC_FUNC(ssh2_default_alloc) { ... }`
+    where the macro expands to `void (*(name)(size_t, void **))`. The raw-text pass
+    otherwise records the macro name itself as the function name.
+    """
+    if not macros:
+        return items
+    out: list[dict] = []
+    for item in items:
+        name = item.get("name", "")
+        macro = macros.get(name)
+        params = (macro or {}).get("params") or []
+        body_text = (macro or {}).get("body_text") or ""
+        param_tokens = item.get("param_tokens") or []
+        if macro and len(params) == 1 and len(param_tokens) == 1 and body_text:
+            arg_text = param_tokens[0].text
+            expanded = re.sub(rf"\b{re.escape(params[0])}\b", lambda _m, repl=arg_text: repl, body_text)
+            try:
+                sub = extract_functions_from_code(expanded + "\n{}\n", path=f"<macro {name}>")
+            except Exception:
+                sub = []
+            if sub and sub[0].get("name") and sub[0]["name"] != name:
+                item = {
+                    **item,
+                    "name": sub[0]["name"],
+                    "decl_tokens": sub[0]["decl_tokens"],
+                    "param_tokens": sub[0]["param_tokens"],
+                }
+        out.append(item)
+    return out
+
+
 def _resolve_declarator(
     c_tokens: list[Token],
     last_top_boundary: int,
@@ -684,35 +724,69 @@ def _resolve_declarator(
 ) -> tuple[str | None, list[Token], list[Token]]:
     """
     Resolve function name and parameter tokens from a top-level declarator.
-    Handles standard `ret fn(params)` and function-pointer returning `ret (*fn(params))(fp_params)`.
+    Handles `ret fn(params)`, `ret *fn(params)`, `ret (*fn)(params)`,
+    `ret (*fn(params))(fp_params)`, and extra-paren-wrapped forms such as
+    `ret (*(fn)(params))` (produced by macros like `void (*(name)(args))`).
+    Type keywords are never accepted as the function name.
     """
     name_idx = open_params - 1
     if name_idx <= last_top_boundary:
         return None, [], []
 
-    candidate = c_tokens[name_idx]
-    if _is_ident(candidate.text):
-        return (
-            candidate.text,
-            c_tokens[open_params + 1 : close_params],
-            c_tokens[last_top_boundary + 1 : name_idx],
-        )
+    # Skip pointer stars between the return type and the declarator.
+    j = name_idx
+    while j > last_top_boundary and c_tokens[j].text == "*":
+        j -= 1
 
-    # Function-pointer returning declarator: `ret_type (*fn_name(params))(fp_params)`
-    if candidate.text == ")":
-        inner_open = _find_matching_backward(c_tokens, name_idx, "(", ")")
-        if inner_open > last_top_boundary:
-            # Look inside inner_open .. name_idx for `fn_name ( params )`
-            inner_close_p = _strip_trailing_attributes(c_tokens, name_idx, inner_open)
-            if inner_close_p > inner_open and c_tokens[inner_close_p].text == ")":
-                inner_open_p = _find_matching_backward(c_tokens, inner_close_p, "(", ")")
-                if inner_open_p > inner_open and _is_ident(c_tokens[inner_open_p - 1].text):
-                    fn_tok = c_tokens[inner_open_p - 1]
-                    return (
-                        fn_tok.text,
-                        c_tokens[inner_open_p + 1 : inner_close_p],
-                        c_tokens[last_top_boundary + 1 : inner_open],
-                    )
+    if j > last_top_boundary:
+        candidate = c_tokens[j]
+        if _is_ident(candidate.text) and candidate.text not in TYPE_MODIFIERS_AND_PRIMITIVES:
+            return (
+                candidate.text,
+                c_tokens[open_params + 1 : close_params],
+                c_tokens[last_top_boundary + 1 : j],
+            )
+        if candidate.text == ")":
+            # Parenthesized declarator before the params: `ret (*fn)(params)` or
+            # `ret (*fn(params))(fp_params)`.
+            inner_open = _find_matching_backward(c_tokens, j, "(", ")")
+            if inner_open > last_top_boundary:
+                # `(*fn(params))(fp)`: the name sits before an inner params group.
+                last_inner_open = -1
+                depth = 0
+                for k in range(inner_open + 1, j):
+                    if c_tokens[k].text == "(":
+                        depth += 1
+                        last_inner_open = k
+                    elif c_tokens[k].text == ")":
+                        depth -= 1
+                if last_inner_open != -1 and depth == 0:
+                    inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")")
+                    return _resolve_declarator(c_tokens, inner_open, last_inner_open, inner_close)
+                # `(*fn)(params)`: the name is the last identifier inside the parens.
+                for k in range(j - 1, inner_open, -1):
+                    if _is_ident(c_tokens[k].text) and c_tokens[k].text not in TYPE_MODIFIERS_AND_PRIMITIVES:
+                        return (
+                            c_tokens[k].text,
+                            c_tokens[open_params + 1 : close_params],
+                            c_tokens[last_top_boundary + 1 : inner_open],
+                        )
+                return None, [], []
+        if candidate.text in TYPE_MODIFIERS_AND_PRIMITIVES:
+            # The params group is wrapped in an extra paren pair, e.g.
+            # `void (*(fn)(params))`: recurse into the group with its last inner
+            # paren group as the real parameter list.
+            last_inner_open = -1
+            depth = 0
+            for k in range(open_params + 1, close_params):
+                if c_tokens[k].text == "(":
+                    depth += 1
+                    last_inner_open = k
+                elif c_tokens[k].text == ")":
+                    depth -= 1
+            if last_inner_open != -1 and depth == 0:
+                inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")")
+                return _resolve_declarator(c_tokens, open_params, last_inner_open, inner_close)
     return None, [], []
 
 
@@ -1414,6 +1488,23 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: list[Path]) -> dict[str
     return result
 
 
+def _map_foreign_path(fpath: Path, target_dir: Path) -> str:
+    """
+    Map a source path that lives outside `target_dir` (e.g. a compile_commands entry
+    recorded against the read-only `/target` mount while the DAG is built over the
+    `workspace/work` overlay) to its target-relative key by longest suffix match.
+    Falls back to the bare file name when nothing matches.
+    """
+    parts = fpath.parts
+    for i in range(len(parts)):
+        suffix = Path(*parts[i:])
+        if suffix.is_absolute():
+            continue
+        if (target_dir / suffix).is_file():
+            return suffix.as_posix()
+    return fpath.name
+
+
 def synthesize_compile_commands(
     target_dir: Path,
     c_files: list[Path],
@@ -1431,7 +1522,7 @@ def synthesize_compile_commands(
         try:
             rel_key = c_res.relative_to(target_resolved).as_posix()
         except ValueError:
-            rel_key = c_res.name
+            rel_key = _map_foreign_path(c_res, target_resolved)
         flags = flags_by_file.get(rel_key, [])
         flag_str = " ".join(flags)
         cmd = f"clang -c {flag_str} {c_res.as_posix()}".strip()
@@ -1512,11 +1603,14 @@ def build_dag(
                 try:
                     rel_key = fpath.relative_to(target_dir).as_posix()
                 except ValueError:
-                    rel_key = fpath.name
+                    # compile_commands recorded against another root (e.g. /target while
+                    # the DAG is built over the workspace/work overlay): map by suffix.
+                    rel_key = _map_foreign_path(fpath, target_dir)
                 rel_parts = Path(rel_key).parts
                 if any(part.startswith(".") for part in rel_parts[:-1]):
                     continue
-                c_files.append(fpath)
+                overlay = target_dir / rel_key
+                c_files.append(overlay if overlay.is_file() else fpath)
                 cmd_str = entry.get("command", "") or " ".join(entry.get("arguments", []))
                 flags = _filter_host_system_flags(re.findall(r"(?:-[IDU]\S+|-std=\S+)", cmd_str))
                 compile_flags_by_file[rel_key] = flags
@@ -1551,7 +1645,7 @@ def build_dag(
         try:
             rel_path = c_file.relative_to(target_dir).as_posix()
         except ValueError:
-            rel_path = c_file.name
+            rel_path = _map_foreign_path(c_file, target_dir)
 
         parts = Path(rel_path).parts
         if len(parts) >= 2 and parts[0] == "src":
@@ -1573,7 +1667,9 @@ def build_dag(
             else:
                 exported_objects[obj["name"]] = obj_rec
 
-        extracted = extract_functions_from_code(raw_code, path=rel_path)
+        extracted = _resolve_macro_wrapped_definitions(
+            extract_functions_from_code(raw_code, path=rel_path), effective_macros
+        )
 
         for item in extracted:
             fn_name = item["name"]

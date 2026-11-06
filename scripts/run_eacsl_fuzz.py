@@ -64,7 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cache  # noqa: E402
 import prover_candidates  # noqa: E402
 from acsl_ast import tokenize_c_acsl  # noqa: E402
-from build_callgraph_dag import extract_functions_from_code  # noqa: E402
+from build_callgraph_dag import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
     EACSL_RTE_INITIALIZED_FLAG,
@@ -339,8 +339,11 @@ def _resolve_function_at_line(file_path: str, line: int) -> str:
         try:
             raw = cpath.read_text(encoding="utf-8", errors="replace")
             for fn in extract_functions_from_code(raw, path=str(cpath)):
+                name = fn.get("name") or ""
+                if name in TYPE_MODIFIERS_AND_PRIMITIVES:
+                    continue
                 if int(fn.get("line", 0)) <= line <= int(fn.get("end_line", 0)):
-                    return fn.get("name") or "unknown_function"
+                    return name or "unknown_function"
         except Exception:
             continue
     return "unknown_function"
@@ -557,7 +560,13 @@ def _discover_slice_functions(
                 raw = p.read_text(encoding="utf-8", errors="replace")
             for fn in extract_functions_from_code(raw, path=str(p)):
                 name = fn.get("name", "")
-                if name and name not in ("eva_main", "LLVMFuzzerTestOneInput", "main"):
+                # Never pass C type keywords to -rte-select: RTE rejects them at option
+                # validation ("no function 'void'"), which aborts the whole instrumentation.
+                if (
+                    name
+                    and name not in ("eva_main", "LLVMFuzzerTestOneInput", "main")
+                    and name not in TYPE_MODIFIERS_AND_PRIMITIVES
+                ):
                     discovered.add(name)
         except Exception:
             continue
@@ -1889,6 +1898,82 @@ def selftest_blocks_eacsl(selftest_json: Path | None, runner=subprocess.run) -> 
     return f"eacsl_selftest_failed: {', '.join(failed) or 'unknown'}"
 
 
+_UNDEFINED_REF_RE = re.compile(r"undefined reference to [`'](?P<sym>[A-Za-z_]\w*)'")
+
+
+def parse_undefined_references(log: str) -> list[str]:
+    """Symbols named in linker `undefined reference to 'X'` diagnostics, in order."""
+    found: list[str] = []
+    for m in _UNDEFINED_REF_RE.finditer(log or ""):
+        sym = m.group("sym")
+        if sym not in found:
+            found.append(sym)
+    return found
+
+
+def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
+    """Map function name -> defining source file from callgraph_dag.json."""
+    try:
+        dag = json.loads(Path(dag_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, str] = {}
+    for key, rec in (dag.get("functions") or {}).items():
+        if isinstance(rec, dict):
+            name = rec.get("name") or str(key).split("#")[-1]
+            file = rec.get("file")
+            if name and file:
+                out.setdefault(str(name), str(file))
+    return out
+
+
+def _normalize_dag_source(file: str, run_dir: Path) -> str:
+    """DAG `file` key as a run-relative overlay path (workspace/work/...), suffix-resolved."""
+    src = file.replace("\\", "/").strip()
+    if src.startswith("/framac-run/"):
+        src = src[len("/framac-run/") :]
+    elif src.startswith("/target/"):
+        src = f"workspace/work/{src[len('/target/') :]}"
+    if src.startswith(("/", "workspace/")):
+        return src
+    work = run_dir / "workspace/work"
+    if (work / src).is_file():
+        return f"workspace/work/{src}"
+    if work.is_dir():
+        matches = sorted(work.glob(f"**/{src}"), key=lambda p: (len(p.parts), p.as_posix()))
+        if matches:
+            return f"workspace/work/{matches[0].relative_to(work).as_posix()}"
+    return f"workspace/work/{src}"
+
+
+def repair_sources_for_link(
+    sources: list[str], log: str, dag_path: Path | str | None, run_dir: Path | str
+) -> tuple[list[str], dict]:
+    """
+    One link-probe repair iteration: map `undefined reference to 'X'` symbols to their
+    defining sources via the DAG and append the missing files. Returns (sources, info).
+    """
+    syms = parse_undefined_references(log)
+    if not syms or not dag_path:
+        return list(sources), {}
+    sym_files = _dag_symbol_files(Path(dag_path))
+    have = {s.replace("\\", "/") for s in sources}
+    added: list[str] = []
+    resolved: list[str] = []
+    for sym in syms:
+        f = sym_files.get(sym)
+        if not f:
+            continue
+        norm = _normalize_dag_source(f, Path(run_dir))
+        if norm not in have:
+            have.add(norm)
+            added.append(norm)
+            resolved.append(sym)
+    if not added:
+        return list(sources), {}
+    return [*sources, *added], {"symbols": resolved, "added_sources": added}
+
+
 def build_module_binary(
     sources: list[str],
     out_bin: Path,
@@ -1904,47 +1989,65 @@ def build_module_binary(
     warn_unsigned_downcast: bool = False,
     rte_initialized: bool = True,
     use_cache: bool = True,
+    dag_path: Path | str | None = None,
 ) -> dict:
     """
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
     `eacsl`, and for `auto` unless a failed selftest for this Frama-C version blocks it; Clang
     ASan+UBSan for `sanitizers` and as the `auto` fallback. Both builds go through the cache.
+    On a link failure with undefined references, one repair iteration appends the defining
+    sources (via `dag_path`) and retries once, recorded under `link_repair`.
     Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt}.
     """
-    eacsl_attempt = None
-    fallback_reason = None
-    comp = None
-    if engine in ("auto", "eacsl"):
-        blocked = selftest_blocks_eacsl(selftest_json) if engine == "auto" else None
-        if blocked:
-            fallback_reason = blocked
-        else:
-            comp = compile_eacsl_binary(
-                sources,
-                out_bin,
-                machdep,
-                cppflags,
-                rte,
-                True,
-                functions=functions,
-                ldflags_extra=ldflags,
-                variadic_translation=variadic_translation,
-                warn_unsigned_downcast=warn_unsigned_downcast,
-                rte_initialized=rte_initialized,
-                use_cache=use_cache,
-            )
-            if comp["returncode"] != 0 and engine == "auto":
-                eacsl_attempt = comp
-                fallback_reason = comp.get("reason") or "eacsl_compile_failed"
-                comp = None
-    if comp is None:
-        comp = compile_sanitizer_binary(sources, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
-    return {
+
+    def _attempt(srcs: list[str]) -> tuple[dict, dict | None, str | None]:
+        eacsl_attempt = None
+        fallback_reason = None
+        comp = None
+        if engine in ("auto", "eacsl"):
+            blocked = selftest_blocks_eacsl(selftest_json) if engine == "auto" else None
+            if blocked:
+                fallback_reason = blocked
+            else:
+                comp = compile_eacsl_binary(
+                    srcs,
+                    out_bin,
+                    machdep,
+                    cppflags,
+                    rte,
+                    True,
+                    functions=functions,
+                    ldflags_extra=ldflags,
+                    variadic_translation=variadic_translation,
+                    warn_unsigned_downcast=warn_unsigned_downcast,
+                    rte_initialized=rte_initialized,
+                    use_cache=use_cache,
+                )
+                if comp["returncode"] != 0 and engine == "auto":
+                    eacsl_attempt = comp
+                    fallback_reason = comp.get("reason") or "eacsl_compile_failed"
+                    comp = None
+        if comp is None:
+            comp = compile_sanitizer_binary(srcs, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
+        return comp, eacsl_attempt, fallback_reason
+
+    comp, eacsl_attempt, fallback_reason = _attempt(sources)
+    link_repair: dict | None = None
+    if comp["returncode"] != 0 and dag_path:
+        log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
+        repaired, info = repair_sources_for_link(sources, log, dag_path, Path.cwd())
+        if info:
+            link_repair = info
+            comp, eacsl_attempt, fallback_reason = _attempt(repaired)
+    result = {
         "compile": comp,
         "engine_used": comp.get("engine", engine),
         "engine_fallback_reason": fallback_reason,
         "eacsl_compile_attempt": eacsl_attempt,
     }
+    if link_repair:
+        result["link_repair"] = link_repair
+    return result
 
 
 def _sanitizer_attribution_builder(
@@ -2907,9 +3010,19 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
         action="store_true",
         help="Do not read or write the run/shared cache",
     )
+    p.add_argument(
+        "--dag",
+        type=Path,
+        default=None,
+        help="callgraph_dag.json used to repair link failures (undefined references -> defining source, one retry)",
+    )
 
 
 def _build_options(args) -> dict:
+    dag = getattr(args, "dag", None)
+    if dag is None:
+        default_dag = Path("workspace/reports/callgraph_dag.json")
+        dag = default_dag if default_dag.is_file() else None
     return {
         "engine": args.engine,
         "selftest_json": args.selftest_json,
@@ -2922,6 +3035,7 @@ def _build_options(args) -> dict:
         "warn_unsigned_downcast": args.warn_unsigned_downcast,
         "rte_initialized": not args.no_rte_initialized,
         "use_cache": not getattr(args, "no_cache", False),
+        "dag_path": dag,
     }
 
 

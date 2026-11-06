@@ -532,6 +532,52 @@ def extract_function_prototype(
     )
 
 
+def _find_declaring_header(entry_fn: str, cppflags: str, exclude: set[str], max_headers: int = 400) -> str | None:
+    """
+    Find a header in the -I directories that declares `entry_fn` (used when the requested
+    --header does not declare the entry function, e.g. a public header while the entry
+    lives in a module-internal header). Returns the header's include name, or None.
+    """
+    for inc_dir in _include_dirs_from_cppflags(cppflags):
+        if not inc_dir.is_dir():
+            continue
+        for h in sorted(inc_dir.glob("*.h"))[:max_headers]:
+            if h.name in exclude:
+                continue
+            try:
+                if extract_function_declaration(entry_fn, str(h), None, cppflags) is not None:
+                    return h.name
+            except Exception:
+                continue
+    return None
+
+
+def _validate_call_expr_arity(entry_fn: str, call_expr: str, sources: list[str], cppflags: str) -> None:
+    """
+    Validate a custom call expression's argument count against the entry function's
+    definition parsed from `sources` (not the DAG's truncated params string, which has
+    cost real runs wrong arities, e.g. crypt_init_chacha20_poly takes 9 parameters).
+    """
+    try:
+        params = extract_function_prototype(entry_fn, None, sources, cppflags)
+    except ValueError:
+        return
+    m = re.search(rf"\b{re.escape(entry_fn)}\s*\(", call_expr)
+    if not m:
+        return
+    open_pos = m.end() - 1
+    close_pos = _find_matching_paren(call_expr, open_pos)
+    if close_pos < 0:
+        return
+    args_raw = call_expr[open_pos + 1 : close_pos].strip()
+    argc = 0 if not args_raw or args_raw == "void" else len(_split_top_level_params(args_raw))
+    if argc != len(params):
+        raise ValueError(
+            f"call_expr passes {argc} argument(s) to {entry_fn!r} but its definition in the sources "
+            f"takes {len(params)}; check the arity against the definition, not the DAG params string"
+        )
+
+
 def _is_c_string_param(param: dict[str, Any], next_param: dict[str, Any] | None) -> bool:
     if not param["is_pointer"] or param.get("is_fn_pointer"):
         return False
@@ -1151,6 +1197,23 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
 _HARNESS_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
 
 
+def _resolve_overlay_source(work_dir: Path, cand: str) -> str:
+    """
+    Resolve a run-relative source path against the `workspace/work` overlay by suffix
+    match, so DAG entries stored as bare names (`misc.c`) or with a stale directory still
+    point at the real overlay file (`workspace/work/src/misc.c`).
+    """
+    p = Path(cand.replace("\\", "/").strip())
+    if p.is_file() or p.is_absolute():
+        return cand
+    if work_dir.is_dir():
+        rel = cand[len("workspace/work/") :] if cand.startswith("workspace/work/") else cand
+        matches = sorted(work_dir.glob(f"**/{rel}"), key=lambda m: (len(m.parts), m.as_posix()))
+        if matches:
+            return f"workspace/work/{matches[0].relative_to(work_dir).as_posix()}"
+    return cand
+
+
 def _merge_dag_harness_sources(
     out_dir: Path,
     sources: list[str],
@@ -1243,6 +1306,7 @@ def _merge_dag_harness_sources(
             if rel_clean in seen_rel:
                 continue
             cand = f"{prefix}{rel_clean}" if (prefix and not rel_clean.startswith(prefix)) else rel_clean
+            cand = _resolve_overlay_source(out_dir.parent / "work", cand)
             merged.append(cand)
             seen_rel.add(rel_clean)
     return merged
@@ -1272,6 +1336,7 @@ def generate_module_harness(
     stubbed_callees: list[str] | None = None,
     extra_includes: list[str] | None = None,
     static_analysis_includes: list[str] | None = None,
+    compat_includes: list[str] | None = None,
     self_harnessed: bool = False,
     call_expr: str | None = None,
     eva_expr: str | None = None,
@@ -1311,6 +1376,17 @@ def generate_module_harness(
         if nh and nh not in norm_extra_includes and nh != norm_header:
             norm_extra_includes.append(nh)
 
+    # Target-compat headers (e.g. completing opaque external handles for E-ACSL's
+    # _Alignof checks) are included source-side, after the module header — never via
+    # `-include` in cppflags: force-including them re-registers libc properties per
+    # merged translation unit and crashes the Frama-C kernel ("trying to register
+    # twice property 'assumes nonnull_p'").
+    norm_compat_includes: list[str] = []
+    for ci in compat_includes or []:
+        nh, norm_cppflags = _normalize_header_include(ci, norm_cppflags)
+        if nh and nh not in norm_compat_includes and nh != norm_header and nh not in norm_extra_includes:
+            norm_compat_includes.append(nh)
+
     norm_static_includes: list[str] = []
     for sa_inc in static_analysis_includes or []:
         raw_sa = (sa_inc or "").replace("\\", "/").strip()
@@ -1338,6 +1414,17 @@ def generate_module_harness(
                 if ws_cand.is_file() or out_ws_cand.is_file() or (out_dir.parent / "work").is_dir():
                     norm_cppflags = _append_cppflag(norm_cppflags, "-Iworkspace/work")
 
+    # The --header must actually declare the entry function. When it does not (e.g. the
+    # public header while the entry lives in a module-internal header), find the header
+    # in the -I directories that does declare it and include it alongside.
+    if norm_header and not effective_self_harnessed:
+        if extract_function_declaration(entry_fn, norm_header, None, norm_cppflags) is None:
+            declaring = _find_declaring_header(
+                entry_fn, norm_cppflags, exclude={norm_header, *norm_extra_includes, *norm_compat_includes}
+            )
+            if declaring:
+                norm_extra_includes.append(declaring)
+
     auto_params: list[dict[str, Any]] | None = None
     auto_needs_nt = False
     if entry_style == "auto_prototype":
@@ -1362,6 +1449,8 @@ def generate_module_harness(
         null_terminate=effective_null_terminate,
         auto_params=auto_params,
     )
+    if call_expr or eva_expr or fuzz_expr:
+        _validate_call_expr_arity(entry_fn, call_expr or eva_expr or fuzz_expr, sources, norm_cppflags)
     sources = _merge_dag_harness_sources(
         out_dir,
         sources,
@@ -1377,6 +1466,8 @@ def generate_module_harness(
         inc_lines.append(f'#include "{norm_header}"')
     for ext_h in norm_extra_includes:
         inc_lines.append(f'#include "{ext_h}"')
+    for ci in norm_compat_includes:
+        inc_lines.append(f'#include "{ci}"')
 
     embedded_fuzzer_in_sources = any(_source_defines_fuzzer_entry(s, norm_cppflags) for s in sources)
     rename_embedded_fuzzer = bool(embedded_fuzzer_in_sources and not effective_self_harnessed)
@@ -1456,6 +1547,7 @@ def generate_module_harness(
         "header": norm_header,
         "extra_includes": norm_extra_includes,
         "static_analysis_includes": norm_static_includes,
+        "compat_includes": norm_compat_includes,
         "cppflags": norm_cppflags,
         "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
@@ -1498,6 +1590,7 @@ def generate_module_harness(
         "header": norm_header,
         "extra_includes": norm_extra_includes,
         "static_analysis_includes": norm_static_includes,
+        "compat_includes": norm_compat_includes,
         "cppflags": norm_cppflags,
         "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
@@ -1585,6 +1678,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Header to force-include via -include in sidecar cppflags so Eva, WP, guardrail, and merge re-checks inherit it (repeatable)",
     )
     parser.add_argument(
+        "--compat-include",
+        action="append",
+        default=[],
+        help=(
+            "Target-compat header (e.g. completing opaque external handles for E-ACSL _Alignof checks) "
+            "to #include source-side in the harness after the module header — never via -include, which "
+            "crashes the Frama-C kernel with duplicate libc property registration (repeatable)"
+        ),
+    )
+    parser.add_argument(
         "--self-harnessed",
         action="store_true",
         help="Target already defines LLVMFuzzerTestOneInput; emit only eva_main in the generated harness",
@@ -1669,6 +1772,7 @@ def main(argv: list[str] | None = None) -> int:
             stubbed_callees=args.stubbed_callee,
             extra_includes=args.extra_include,
             static_analysis_includes=args.static_analysis_include,
+            compat_includes=args.compat_include,
             self_harnessed=args.self_harnessed,
             call_expr=args.call_expr,
             eva_expr=args.eva_expr,
