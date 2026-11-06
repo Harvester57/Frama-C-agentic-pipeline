@@ -398,6 +398,52 @@ def test_link_and_frama_c_log_parsers():
     assert T.parse_missing_functions("no function 'a'\nfunction 'b' not found") == ["a", "b"]
 
 
+def test_parse_undefined_fallbacks_accepts_va_named_helpers():
+    """PB-6: Frama-C's Variadic translation also emits `<fn>_va_<N>` (e.g. snprintf_va_3)."""
+    log = (
+        "/usr/bin/ld: fuzz_transport.instrumented.c:841388: undefined reference to `snprintf_va_3'\n"
+        "/usr/bin/ld: undefined reference to 'fcntl_fallback_2'\n"
+    )
+    assert T.parse_undefined_fallbacks(log) == ["snprintf_va_3", "fcntl_fallback_2"]
+
+
+def test_find_variadic_fallbacks_accepts_va_names_and_trailing_format_comment():
+    """PB-6: `_va_N` prototypes with a trailing `/* format attribute */` comment must be found."""
+    instrumented = (
+        "int snprintf_va_3(char * restrict __s, size_t __maxlen,\n"
+        "                  char const * restrict __format, char *param0, int param1) /* format attribute */;\n"
+        "int fprintf_va_1(void *stream, char const *fmt, int a0) /* format attribute */;\n"
+        "int fcntl_fallback_2(int fd, int cmd, int arg);\n"
+        # Defined in the instrumented source: not a fallback.
+        "int snprintf_va_18(char *s, size_t n, char const *f) { return 0; }\n"
+        # A call statement, not a declaration.
+        "int caller(void) { return snprintf_va_3(0, 0, 0, 0, 0); }\n"
+    )
+    fbs = T.find_variadic_fallbacks(instrumented)
+    by_name = {f["name"]: f for f in fbs}
+    assert set(by_name) == {"snprintf_va_3", "fprintf_va_1", "fcntl_fallback_2"}
+    s3 = by_name["snprintf_va_3"]
+    assert s3["base"] == "snprintf" and s3["index"] == 3 and s3["ret"] == "int"
+    assert s3["params"][0] == "char * restrict __s"
+    assert len(s3["params"]) == 5
+
+
+def test_generate_fallback_source_forwards_va_named_snprintf():
+    """PB-6: a `_va_N` fallback for a mapped base (snprintf -> stdio.h) is forwarded, not ENOSYS."""
+    fbs = T.find_variadic_fallbacks(
+        "int snprintf_va_3(char * restrict __s, size_t __maxlen,\n"
+        "                  char const * restrict __format, char *param0, int param1) /* format attribute */;\n"
+    )
+    assert [f["name"] for f in fbs] == ["snprintf_va_3"]
+    src, records = T.generate_fallback_source(fbs)
+    assert records == [{"name": "snprintf_va_3", "base": "snprintf", "mode": "forward"}]
+    assert "#include <stdio.h>" in src
+    assert (
+        "int snprintf_va_3(char * restrict __s, size_t __maxlen, char const * restrict __format, "
+        "char *param0, int param1) { return snprintf(__s, __maxlen, __format, param0, param1); }" in src
+    )
+
+
 # ---------------------------------------------------------------------------
 # WS5 preprocessed function discovery
 # ---------------------------------------------------------------------------
