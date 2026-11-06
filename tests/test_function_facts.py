@@ -993,6 +993,122 @@ def test_section_omits_the_skeleton_when_disabled(monkeypatch: pytest.MonkeyPatc
     assert "Projected frame skeleton" not in ff.render_section(rec, function="parse_value")
 
 
+def _nested_loop_raw() -> dict:
+    """Bubble-sort-like: outer for + inner while with an in-place swap."""
+    return _raw(
+        "bubble_sort",
+        "m.c:1",
+        formals=[_formal("a", "pointer", "int"), _formal("length")],
+        loops=[
+            _loop(
+                index=0,
+                loc="m.c:5",
+                guard="up < length",
+                writes=[_write("up", "up", "local", False, ["up + 1"])],
+                reads=[_access("length", "length", "local", False)],
+            ),
+            _loop(
+                index=1,
+                parent=0,
+                loc="m.c:8",
+                guard="0 < down && *(a + down) < *(a + (down - 1))",
+                writes=[
+                    _write("*(a + down)", "a", values=["*(a + (down - 1))"]),
+                    _write("*(a + (down - 1))", "a", values=["*(a + down)"]),
+                    _write("down", "down", "local", False, ["down - 1"]),
+                ],
+                reads=[_access("*(a + down)", "a"), _access("*(a + (down - 1))", "a")],
+            ),
+        ],
+        writes=[_access("*(a + down)", "a"), _access("up", "up", "local", False)],
+        reads=[_access("*(a + down)", "a"), _access("length", "length", "local", False)],
+    )
+
+
+def test_loop_var_classes_unchanged_non_inductive_inductive() -> None:
+    rec = _record(_nested_loop_raw(), "void bubble_sort(int *a, int length) { }\n")
+    outer, inner = rec["loops"]
+    assert outer["var_classes"] == {"unchanged": ["length"], "non_inductive": [], "inductive": ["up"]}
+    assert inner["var_classes"]["inductive"] == ["*(a + (down - 1))", "*(a + down)", "down"]
+    assert inner["var_classes"]["unchanged"] == [] and inner["var_classes"]["non_inductive"] == []
+
+
+def test_loop_var_classes_copy_loop() -> None:
+    raw = _raw(
+        "copy_buf",
+        "m.c:2",
+        formals=[_formal("dst", "pointer", "char", char_like=True), _formal("src", "pointer", "char", char_like=True), _formal("n")],
+        loops=[
+            _loop(
+                loc="m.c:4",
+                writes=[_write("*(dst + i)", "dst", values=["*(src + i)"]), _write("i", "i", "local", False, ["i + 1"])],
+                reads=[_access("*(src + i)", "src", loc="m.c:4")],
+            )
+        ],
+        writes=[_access("*(dst + i)", "dst", loc="m.c:4")],
+        reads=[_access("*(src + i)", "src", loc="m.c:4")],
+    )
+    rec = _record(raw, M_C)
+    vc = rec["loops"][0]["var_classes"]
+    assert vc["inductive"] == ["i"]
+    assert vc["non_inductive"] == ["*(dst + i)"]
+    assert vc["unchanged"] == ["*(src + i)"]
+
+
+def test_loop_graph_nested_and_sequential_edges_and_contexts() -> None:
+    rec = _record(_nested_loop_raw(), "void bubble_sort(int *a, int length) { }\n")
+    graph = rec["loop_graph"]
+    kinds = {(e["from"], e["to"], e["kind"]) for e in graph["edges"]}
+    assert ("L0", "L1", "nest") in kinds
+    assert ("L1", "L0", "vd") in kinds  # inner provability -> outer preservation
+    assert ("entry", "L0", "st") in kinds and ("L0", "exit", "st") in kinds
+    outer, inner = rec["loops"]
+    assert inner["assumption_context"]["predecessors"] == ["L0"]
+    assert outer["obligation_context"]["inner_loops"] == ["L1"]
+    assert outer["obligation_context"]["written"] == ["up"]
+
+    two = _record(
+        _raw(
+            "two_loops",
+            "m.c:1",
+            formals=[_formal("a", "pointer", "int"), _formal("b", "pointer", "int"), _formal("n")],
+            loops=[
+                _loop(index=0, loc="m.c:3", writes=[_write("*(a + i)", "a", values=["0"]), _write("i", "i", "local", False, ["i + 1"])]),
+                _loop(index=1, loc="m.c:5", writes=[_write("*(b + i)", "b", values=["*(a + i) + 1"]), _write("i", "i", "local", False, ["i + 1"])],
+                      reads=[_access("*(a + i)", "a")]),
+            ],
+            writes=[_access("*(a + i)", "a"), _access("*(b + i)", "b")],
+            reads=[_access("*(a + i)", "a")],
+        ),
+        "void two_loops(int *a, int *b, int n) { }\n",
+    )
+    kinds = {(e["from"], e["to"], e["kind"]) for e in two["loop_graph"]["edges"]}
+    assert ("L0", "L1", "seq") in kinds and ("L0", "L1", "vd") in kinds
+    assert two["loops"][1]["assumption_context"]["facts_from_predecessors"] == ["a"]
+
+
+def test_section_renders_loop_templates_and_dependency_context() -> None:
+    rec = _record(_nested_loop_raw(), "void bubble_sort(int *a, int length) { }\n")
+    section = ff.render_section(rec, function="bubble_sort")
+    assert "**Loop invariant templates**" in section
+    assert "PLACE_HOLDER_for_up" in section
+    assert "PLACE_HOLDER_for_down" in section
+    # loop-skip conditional from the guard
+    assert "!(up < length) ==> length == \\at(length, Pre);" in section
+    assert "**Loop dependency context**" in section
+    assert "inner loop(s) L8" in section
+
+
+def test_loop_templates_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ff.LOOP_TEMPLATES_ENV, "off")
+    rec = _record(_nested_loop_raw(), "void bubble_sort(int *a, int length) { }\n")
+    assert rec["loop_graph"].get("status") == "disabled"
+    section = ff.render_section(rec, function="bubble_sort")
+    assert "PLACE_HOLDER" not in section and "Loop dependency context" not in section
+    monkeypatch.delenv(ff.LOOP_TEMPLATES_ENV)
+    assert ff.loop_templates_enabled() is True
+
+
 def test_function_level_writes_carry_their_rhs_values() -> None:
     raw = _raw(
         "f",

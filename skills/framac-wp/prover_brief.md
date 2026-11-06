@@ -88,6 +88,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 2. Distinguishing Establishment vs. Preservation Failures:
    - If WP reports **Establishment (`established`) failed**: the invariant is not true *before* the first iteration. Check your initial variable values or add a `requires` precondition.
    - If WP reports **Preservation (`preserved`) failed**: the invariant is too weak to survive an arbitrary iteration `i -> i + 1`, or `loop assigns` is too broad (forgetting `loop assigns` makes WP havoc all memory on every iteration!).
+   - **Loop templates & dependencies (when the Deterministic Function Context shows them):** fill the `PLACE_HOLDER` skeletons per loop — keep the loop-skip conditional `!(guard) ==> v == \at(v, Pre);` — and read the "Loop dependency context": when a preservation goal fails on an outer or sequential loop, the missing fact usually lives in an inner or predecessor loop's exit summary, so strengthen that loop's invariant first (dependency slice), not just the failing one.
 <!-- endif -->
 <!-- if: loops or recursion -->
 3. **Inductive Lemmas Without Coq (Ghost Lemma Functions):**

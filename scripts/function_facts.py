@@ -53,7 +53,8 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 
-FACTS_SCHEMA = 2  # 2: per-function frame_skeleton (AutoFraming-style projected frame clauses)
+FACTS_SCHEMA = 3  # 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates)
+LOOP_TEMPLATES_ENV = "FRAMAC_LOOP_TEMPLATES"
 FACTS_DIR = "workspace/reports/facts"
 CONTEXT_ENV = "FRAMAC_PROVER_CONTEXT"
 CONTEXT_SENTINEL = "<!-- deterministic-context -->"
@@ -273,7 +274,7 @@ def _loop_record(raw: dict, derived: dict[str, str], tokens: list) -> dict:
             }
         )
     guard = raw.get("guard")
-    return {
+    record = {
         "index": raw.get("index"),
         "parent": raw.get("parent"),
         "line": loc["line"],
@@ -295,6 +296,115 @@ def _loop_record(raw: dict, derived: dict[str, str], tokens: list) -> dict:
         "in_place": sorted(in_place),
         "prior_writers": [],
     }
+    record["var_classes"] = _classify_loop_vars(record)
+    return record
+
+
+def _classify_loop_vars(loop: dict) -> dict:
+    """
+    SESpec-style loop-variable classification: unchanged (read, not written), non-inductive
+    (written, RHS independent of the previous value), inductive (self-referential update or
+    in-place moving-index access). Syntactic over kernel-normalized text; a hint, WP judges.
+    """
+    written_scalars = {s.get("var"): s for s in loop.get("scalars") or [] if s.get("var")}
+    mem_writes = loop.get("memory_writes") or []
+    reads = loop.get("reads") or []
+    written_lvals = {w.get("lval") for w in mem_writes if w.get("lval")}
+    written_roots = {w.get("root") for w in mem_writes if w.get("root")}
+    in_place = set(loop.get("in_place") or [])
+
+    inductive: list[str] = []
+    non_inductive: list[str] = []
+    for var, scalar in written_scalars.items():
+        if any(re.search(rf"\b{re.escape(var)}\b", u) for u in scalar.get("updates") or []):
+            inductive.append(var)
+        else:
+            non_inductive.append(var)
+    for w in mem_writes:
+        lval = w.get("lval") or ""
+        root = w.get("root") or ""
+        values = w.get("values") or []
+        self_read = any(
+            (lval and lval in v) or (root and re.search(rf"\b{re.escape(root)}\b", v)) for v in values
+        )
+        name = lval or root
+        if not name:
+            continue
+        if self_read or root in in_place:
+            inductive.append(name)
+        else:
+            non_inductive.append(name)
+
+    unchanged: list[str] = []
+    for r in reads:
+        lval, root = r.get("lval"), r.get("root")
+        if lval:
+            if lval not in written_lvals:
+                unchanged.append(lval)
+        elif root and root not in written_roots and root not in written_scalars:
+            unchanged.append(root)
+    return {
+        "unchanged": sorted(set(unchanged)),
+        "non_inductive": sorted(set(non_inductive)),
+        "inductive": sorted(set(inductive)),
+    }
+
+
+def _loop_graph(record: dict) -> dict:
+    """
+    InvWeaver-style loop-level dependency graph: nodes are entry/exit plus one per loop;
+    state-transition edges (nesting, sequential source order) and verification-dependency
+    edges (inner provability -> outer preservation; earlier provability -> later
+    establishment). Also fills each loop's assumption/obligation context.
+    """
+    loops = record.get("loops") or []
+    edges: list[dict] = []
+    for loop in loops:
+        if loop.get("parent") is not None:
+            edges.append({"from": f"L{loop['parent']}", "to": f"L{loop['index']}", "kind": "nest"})
+            edges.append(
+                {
+                    "from": f"L{loop['index']}",
+                    "to": f"L{loop['parent']}",
+                    "kind": "vd",
+                    "note": "inner exit summary feeds outer preservation",
+                }
+            )
+    by_depth: dict = {}
+    for loop in loops:
+        by_depth.setdefault(loop.get("parent"), []).append(loop)
+    for group in by_depth.values():
+        ordered = sorted(group, key=lambda l: (l.get("line") or 0))
+        for a, b in zip(ordered, ordered[1:]):
+            edges.append({"from": f"L{a['index']}", "to": f"L{b['index']}", "kind": "seq"})
+            edges.append(
+                {
+                    "from": f"L{a['index']}",
+                    "to": f"L{b['index']}",
+                    "kind": "vd",
+                    "note": "earlier loop's exit summary feeds later loop's establishment",
+                }
+            )
+    top = sorted(by_depth.get(None, []), key=lambda l: (l.get("line") or 0))
+    if top:
+        edges.append({"from": "entry", "to": f"L{top[0]['index']}", "kind": "st"})
+        edges.append({"from": f"L{top[-1]['index']}", "to": "exit", "kind": "st"})
+    for loop in loops:
+        lid = f"L{loop.get('index')}"
+        preds = [e["from"] for e in edges if e["to"] == lid and e["kind"] in ("nest", "seq", "st")]
+        succs = [e["to"] for e in edges if e["from"] == lid and e["kind"] in ("nest", "seq", "st")]
+        written = sorted(
+            {w.get("root") for w in loop.get("memory_writes") or [] if w.get("root")}
+            | {s.get("var") for s in loop.get("scalars") or [] if s.get("var")}
+        )
+        prior = sorted({r for p in loop.get("prior_writers") or [] for r in p.get("roots") or []})
+        loop["assumption_context"] = {"predecessors": preds, "facts_from_predecessors": prior}
+        loop["obligation_context"] = {
+            "successors": succs,
+            "inner_loops": [f"L{c.get('index')}" for c in loops if c.get("parent") == loop.get("index")],
+            "written": written,
+        }
+    return {"nodes": ["entry", "exit"] + [f"L{l.get('index')}" for l in loops], "edges": edges}
 
 
 def _link_loops(loops: list[dict]) -> None:
@@ -516,6 +626,7 @@ def _function_record(
         "truncated": bool(raw.get("truncated")),
     }
     record["frame_skeleton"] = frame_skeleton.compute(record)
+    record["loop_graph"] = _loop_graph(record) if loop_templates_enabled() else {"status": "disabled", "edges": []}
     return record
 
 
@@ -842,6 +953,84 @@ def _render_loops(record: dict, mapped, lines: list[str]) -> None:
             )
 
 
+def loop_templates_enabled() -> bool:
+    """FRAMAC_LOOP_TEMPLATES=off: no loop templates/graph, for A/B comparisons."""
+    return (os.environ.get(LOOP_TEMPLATES_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
+
+
+def _render_loop_deps(record: dict, mapped, lines: list[str]) -> None:
+    graph = record.get("loop_graph") or {}
+    if graph.get("status") == "disabled" or not graph.get("edges"):
+        return
+    lines.append(
+        "\n**Loop dependency context** (which loops feed which — when a preservation goal fails, the missing "
+        "fact often lives in a predecessor or inner loop's exit summary, not in the failing loop itself):"
+    )
+    node_line = {f"L{l.get('index')}": f"L{mapped(l['line'])}" for l in record.get("loops") or []}
+
+    def _where(node: str) -> str:
+        return node_line.get(node, node)
+
+    for loop in record.get("loops") or []:
+        ac = loop.get("assumption_context") or {}
+        oc = loop.get("obligation_context") or {}
+        if not ac.get("predecessors") and not oc.get("successors"):
+            continue
+        indent = "   " if loop.get("parent") is not None else ""
+        parts = [f"{indent}L{mapped(loop['line'])}"]
+        if ac.get("predecessors"):
+            note = f" (wrote {', '.join(ac['facts_from_predecessors'])})" if ac.get("facts_from_predecessors") else ""
+            parts.append("assumes from " + ", ".join(_where(p) for p in ac["predecessors"]) + note)
+        if oc.get("inner_loops"):
+            parts.append("must give inner loop(s) " + ", ".join(_where(n) for n in oc["inner_loops"]) + " a usable exit summary")
+        if oc.get("successors"):
+            parts.append("feeds " + ", ".join(_where(s) for s in oc["successors"]))
+        lines.append(" - " + "; ".join(parts))
+
+
+def _render_loop_templates(record: dict, mapped, lines: list[str]) -> None:
+    loops = record.get("loops") or []
+    if not any(any((l.get("var_classes") or {}).values()) for l in loops):
+        return
+    lines.append(
+        "\n**Loop invariant templates** (skeletons projected from the loop analysis — fill each PLACE_HOLDER, "
+        "keep the loop-skip conditional, strengthen as needed; WP judges):"
+    )
+    for pos, loop in enumerate(loops, 1):
+        vc = loop.get("var_classes") or {}
+        if not any(vc.values()):
+            continue
+        indent = "   " if loop.get("parent") is not None else ""
+        head = f"{indent}{pos}. L{mapped(loop['line'])}"
+        if loop.get("guard"):
+            head += f" guard `{_code(loop['guard'])}`"
+        lines.append(head + ":")
+        guard = loop.get("guard")
+        for v in vc["unchanged"]:
+            if guard:
+                lines.append(
+                    f"{indent}   - {_code(f'loop invariant !({guard}) ==> {v} == \\at({v}, Pre);')} "
+                    "(loop skipped: unchanged)"
+                )
+            lines.append(f"{indent}   - {_code(f'loop invariant {v} == \\at({v}, Pre);')} (unchanged)")
+        for v in vc["non_inductive"]:
+            safe = re.sub(r"\W", "_", v)
+            if guard:
+                lines.append(
+                    f"{indent}   - {_code(f'loop invariant ({guard}) ==> ({v} == \\at({v}, Pre) || PLACE_HOLDER_for_{safe});')}"
+                )
+            else:
+                lines.append(
+                    f"{indent}   - {_code(f'loop invariant {v} == \\at({v}, Pre) || PLACE_HOLDER_for_{safe};')}"
+                )
+        for v in vc["inductive"]:
+            safe = re.sub(r"\W", "_", v)
+            if guard:
+                lines.append(f"{indent}   - {_code(f'loop invariant ({guard}) ==> PLACE_HOLDER_for_{safe};')}")
+            else:
+                lines.append(f"{indent}   - {_code(f'loop invariant PLACE_HOLDER_for_{safe};')}")
+
+
 def _render_calls(record: dict, mapped, lines: list[str]) -> None:
     sites = [c for c in record.get("calls") or [] if c.get("indirect")]
     if sites:
@@ -984,6 +1173,9 @@ def render_section(
         lines.append("")
         _render_frame(record, lines)
         _render_loops(record, mapped, lines)
+        if loop_templates_enabled():
+            _render_loop_deps(record, mapped, lines)
+            _render_loop_templates(record, mapped, lines)
         _render_calls(record, mapped, lines)
         _render_callers(record, lines)
         _render_alias(record, lines)

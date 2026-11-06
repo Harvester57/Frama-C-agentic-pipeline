@@ -106,6 +106,41 @@ def test_wp_hints_unproven_buckets_and_loop_established_preserved() -> None:
     assert any("initialization" in h for h in hints)
 
 
+def test_wp_hints_loop_dependency_slice_names_the_inner_loop(tmp_path: Path) -> None:
+    """InvWeaver-style: a preservation failure on an outer loop names the inner loop whose
+    exit summary is the likely missing fact. Fail-open without facts."""
+    import json
+
+    import function_facts as ff
+
+    facts_dir = tmp_path / "facts"
+    facts_dir.mkdir()
+    record = {
+        "loops": [
+            {"index": 0, "parent": None, "line": 5, "assumption_context": {"predecessors": ["entry"]},
+             "obligation_context": {"successors": ["L1", "exit"], "inner_loops": ["L1"], "written": ["up"]}},
+            {"index": 1, "parent": 0, "line": 8, "assumption_context": {"predecessors": ["L0"]},
+             "obligation_context": {"successors": [], "inner_loops": [], "written": ["down"]}},
+        ]
+    }
+    (facts_dir / "m.json").write_text(
+        json.dumps({"schema": ff.FACTS_SCHEMA, "module": "m", "functions": {"m.c#bubble_sort": record}}),
+        encoding="utf-8",
+    )
+    res = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "file": "m.c",
+        "function": "bubble_sort",
+        "unproven_by_bucket": {"step_b_loop_invariant": [{"kind": "loop_invariant", "annotation": "I_2"}]},
+        "unproven_goals": [{"kind": "loop_invariant", "annotation": "I_2 preserved", "line": 6, "status": "Unknown"}],
+    }
+    hints = derive_wp_diagnostic_hints(res, facts_dir=facts_dir)
+    assert any("Dependency slice" in h and "L8" in h and "L5" in h for h in hints), hints
+    # Without facts the hint is absent but nothing breaks.
+    assert not any("Dependency slice" in h for h in derive_wp_diagnostic_hints(res, facts_dir=tmp_path / "empty"))
+
+
 def test_eacsl_hints_clean_and_failure_modes() -> None:
     assert derive_eacsl_diagnostic_hints({"status": "passed_dynamic_oracle"}) == []
 

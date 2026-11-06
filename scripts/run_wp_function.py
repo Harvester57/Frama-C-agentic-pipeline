@@ -447,10 +447,76 @@ def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
         return {}
 
 
-def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
+def _facts_record_for(res: dict, facts_dir: Path | None) -> dict | None:
+    """The function's facts record from `<facts_dir>/*.json`, or None (fail-open)."""
+    if facts_dir is None:
+        facts_dir = Path("workspace/reports/facts")
+    fn = res.get("function") or ""
+    rel = function_facts.work_relative(str(res.get("file") or "")) or str(res.get("file") or "")
+    key = function_facts.function_key(rel, fn)
+    try:
+        for path in sorted(Path(facts_dir).glob("*.json")):
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if doc.get("schema") != function_facts.FACTS_SCHEMA:
+                continue
+            rec = (doc.get("functions") or {}).get(key)
+            if isinstance(rec, dict):
+                return rec
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _innermost_loop_at(record: dict, line: int) -> dict | None:
+    loops = record.get("loops") or []
+    cands = [l for l in loops if isinstance(l.get("line"), int) and l["line"] <= line]
+    if not cands:
+        return None
+    return max(cands, key=lambda l: (l.get("parent") is not None, l["line"]))
+
+
+def _loop_dependency_slice_hint(res: dict, facts_dir: Path | None) -> str | None:
+    """InvWeaver-style dependency slice: name the inner/predecessor loop whose exit summary is
+    the likely missing fact when a loop preservation goal fails."""
+    rec = _facts_record_for(res, facts_dir)
+    if not rec:
+        return None
+    loops = rec.get("loops") or []
+    goals = [
+        g
+        for g in (res.get("unproven_goals") or [])
+        if "preserv" in f"{g.get('kind') or ''} {g.get('annotation') or ''}".lower()
+        or str(g.get("kind") or "") == "loop_invariant"
+    ]
+    for g in goals:
+        line = g.get("line")
+        if not isinstance(line, int):
+            continue
+        loop = _innermost_loop_at(rec, line)
+        if loop is None:
+            continue
+        children = [l for l in loops if l.get("parent") == loop.get("index")]
+        preds = (loop.get("assumption_context") or {}).get("predecessors") or []
+        if children:
+            inner = ", ".join(f"L{l['line']}" for l in children)
+            return (
+                f"Dependency slice: preservation of the loop at L{loop['line']} fails and it has inner loop(s) "
+                f"{inner}; the missing fact is often the inner loop's exit summary — strengthen the inner "
+                "loop's invariant first, not just the failing one."
+            )
+        if preds:
+            return (
+                f"Dependency slice: the loop at L{loop['line']} assumes from {', '.join(preds)}; check the "
+                "predecessor loop's exit summary covers what this loop needs."
+            )
+    return None
+
+
+def derive_wp_diagnostic_hints(res: dict, log_text: str = "", facts_dir: Path | None = None) -> list[str]:
     """
     Generate concise, actionable diagnostic hints for ACSL syntax errors, WP soundness
     aborts, and unproven goal buckets. Returns [] when status == 'all_proven'.
+    `facts_dir` (default workspace/reports/facts) enables loop dependency-slice hints.
     """
     status = res.get("status")
     if status == "all_proven":
@@ -652,6 +718,9 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "") -> list[str]:
                     "or 'loop assigns' is missing/too broad, or the upper bound uses '< n' instead of '<= n' "
                     "(at loop exit 'i == n', so write 'loop invariant 0 <= i <= n;')."
                 )
+            slice_hint = _loop_dependency_slice_hint(res, facts_dir)
+            if slice_hint:
+                _add(slice_hint)
             if not _LOOP_ESTABLISHED_FAIL_RE.search(full_log) and not _LOOP_PRESERVED_FAIL_RE.search(full_log):
                 _add(
                     "Step B (Loops) has unproven goals: ensure 'loop invariant 0 <= i <= n;' uses '<= n' "
