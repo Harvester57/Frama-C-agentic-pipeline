@@ -1197,3 +1197,47 @@ int with_contract_again(void) { return 0; }
     assert "proto_only" not in spans
     for name, span in spans.items():
         assert span == locate_function_span(source, name), name
+
+
+CPLUSPLUS_GUARDED_H = r"""#ifndef LIB_H
+#define LIB_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*@
+  requires \valid_read(p);
+  assigns \nothing;
+*/
+extern int first(const int *p);
+extern void second(void);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif
+"""
+
+
+def test_a_cplusplus_extern_c_guard_does_not_hide_the_prototypes() -> None:
+    """A C library header wraps its whole API in `extern "C" {` under `#ifdef __cplusplus`."""
+    assert [s.function for s in locate_all_prototype_spans(CPLUSPLUS_GUARDED_H)] == ["first", "second"]
+    span = locate_function_span(CPLUSPLUS_GUARDED_H, "first", is_header=True)
+    assert span is not None and span.text.startswith("/*@") and span.text.endswith("extern int first(const int *p);")
+    assert locate_function_span(CPLUSPLUS_GUARDED_H, "second", is_header=True) is not None
+
+
+def test_a_prover_contract_splices_into_a_header_behind_an_extern_c_guard() -> None:
+    agent = CPLUSPLUS_GUARDED_H.replace("  assigns \\nothing;\n", "  requires p != \\null;\n  assigns \\nothing;\n")
+    merged = splice_prover_changes(
+        CPLUSPLUS_GUARDED_H, agent, CPLUSPLUS_GUARDED_H, "first", is_header=True, path="lib.h"
+    )
+    assert "requires p != \\null;" in merged
+    assert merged.count('extern "C" {') == 1 and merged.count('} /* extern "C" */') == 1
+
+
+def test_extern_c_braces_do_not_hide_function_bodies_but_bodies_still_nest() -> None:
+    source = 'extern "C" {\nint f(void) { return 1; }\nint g(void) { return 2; }\n}\n'
+    assert sorted(locate_all_definition_spans(source)) == ["f", "g"]

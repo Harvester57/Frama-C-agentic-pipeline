@@ -359,6 +359,35 @@ def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close
     return -1
 
 
+def _linkage_block_braces(tokens: list[Token]) -> frozenset[int]:
+    """
+    Indices of the `{` and `}` of every `extern "C" { ... }` block.
+
+    The braces of a linkage specification only group declarations: a C library header wraps its whole
+    API in one under `#ifdef __cplusplus`, and counting it as nesting would hide every prototype
+    and top-level ACSL declaration in the file.
+    """
+    skip: set[int] = set()
+    for i, tok in enumerate(tokens):
+        if tok.kind != "c_token" or tok.text != "{":
+            continue
+        j = i - 1
+        while j >= 0 and tokens[j].kind in ("whitespace", "c_comment"):
+            j -= 1
+        if j < 0 or tokens[j].kind != "string" or tokens[j].text not in ('"C"', '"C++"'):
+            continue
+        j -= 1
+        while j >= 0 and tokens[j].kind in ("whitespace", "c_comment"):
+            j -= 1
+        if j < 0 or tokens[j].kind != "c_token" or tokens[j].text != "extern":
+            continue
+        close = _find_matching_delim(tokens, i, "{", "}")
+        skip.add(i)
+        if close != -1:
+            skip.add(close)
+    return frozenset(skip)
+
+
 def locate_function_span(
     source: str, function_name: str, is_header: bool = False, path: str = "<input>"
 ) -> Span | None:
@@ -367,6 +396,7 @@ def locate_function_span(
     ACSL contract block) in a C source file (`is_header=False`) or header file (`is_header=True`).
     """
     tokens = tokenize_c_acsl(source, path=path)
+    linkage = _linkage_block_braces(tokens)
     brace_depth = 0
     paren_depth = 0
     last_top_boundary_idx = -1  # index of last top-level ';', '}', or 'pp_directive'
@@ -375,6 +405,9 @@ def locate_function_span(
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
+        if idx in linkage:
+            idx += 1
+            continue
         if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
             last_top_boundary_idx = idx
             idx += 1
@@ -492,6 +525,7 @@ def _compute_span_start(tokens: list[Token], last_top_boundary_idx: int, fn_name
 def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]:
     """Locate all function prototype spans in a header source file in source order."""
     tokens = tokenize_c_acsl(source, path=path)
+    linkage = _linkage_block_braces(tokens)
     brace_depth = 0
     paren_depth = 0
     last_top_boundary_idx = -1
@@ -501,6 +535,9 @@ def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
+        if idx in linkage:
+            idx += 1
+            continue
         if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
             last_top_boundary_idx = idx
             idx += 1
@@ -584,6 +621,7 @@ def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]
 def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str, Span]:
     """Spans of every function definition in `source`, in one pass; the first one when a name repeats."""
     tokens = tokenize_c_acsl(source, path=path)
+    linkage = _linkage_block_braces(tokens)
     spans: dict[str, Span] = {}
     brace_depth = 0
     paren_depth = 0
@@ -592,6 +630,9 @@ def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str,
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
+        if idx in linkage:
+            idx += 1
+            continue
         if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
             last_top_boundary_idx = idx
         elif tok.kind == "c_token":
@@ -1089,11 +1130,14 @@ def extract_top_level_acsl_declarations(source: str, path: str = "<input>") -> l
     `axiomatic`, `inductive`, `ghost`) outside C `{ ... }` blocks in `source`.
     """
     tokens = tokenize_c_acsl(source, path=path)
+    linkage = _linkage_block_braces(tokens)
     brace_depth = 0
     paren_depth = 0
     decls: list[dict] = []
 
-    for tok in tokens:
+    for tok_idx, tok in enumerate(tokens):
+        if tok_idx in linkage:
+            continue
         if tok.kind == "c_token":
             if tok.text == "{":
                 brace_depth += 1
@@ -1147,6 +1191,7 @@ def dedup_acsl_declarations(
     removed: list[str] = []
 
     tokens = tokenize_c_acsl(target_text, path=path)
+    linkage = _linkage_block_braces(tokens)
     brace_depth = 0
     paren_depth = 0
     out_parts: list[str] = []
@@ -1155,6 +1200,10 @@ def dedup_acsl_declarations(
 
     while idx < total:
         tok = tokens[idx]
+        if idx in linkage:
+            out_parts.append(tok.text)
+            idx += 1
+            continue
         if tok.kind == "c_token":
             if tok.text == "{":
                 brace_depth += 1
