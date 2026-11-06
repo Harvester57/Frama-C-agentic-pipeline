@@ -821,3 +821,129 @@ def test_ingest_eva_cross_module_invalid_alarm_and_reduced_checks(run_dir):
     assert cands[0]["location"]["function"] == "IEEE754_DoubleToSingle"
     assert cands[0]["linked_units"] == ["src/ieee754.c#IEEE754_DoubleToSingle::rte"]
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+# ---------------------------------------------------------------------------
+# Remediation plan P0 (docs/remediation-plan.md): no credit without the evidence it implies
+# ---------------------------------------------------------------------------
+
+
+def _chain_dag():
+    """snmp_parse_pdu -> ber_decode_tag -> ber_decode_len."""
+    fns = copy.deepcopy(DAG["functions"])
+    fns["snmp_parse_pdu"]["internal_callees"] = ["ber_decode_tag"]
+    fns["ber_decode_tag"]["internal_callees"] = ["ber_decode_len"]
+    return {**DAG, "functions": fns}
+
+
+def test_audit_hypotheses_is_transitive_over_conditional_callees(run_dir):
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", _chain_dag())
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    # The caller and the middle callee are WP-proven under hypotheses; the leaf is not proven at all.
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report())
+    write_json(
+        run_dir / "workspace/reports/wp/ber_decode_tag.json",
+        wp_report(
+            function="ber_decode_tag",
+            file="workspace/work/src/snmp/ber.c",
+            by_obligation_class={"rte": {"proven": 2, "proven_under_hyp": 1, "unproven": 0}},
+        ),
+    )
+    L.cmd_ingest_wp(
+        [run_dir / "workspace/reports/wp/snmp_parse_pdu.json", run_dir / "workspace/reports/wp/ber_decode_tag.json"]
+    )
+    res = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
+    assert res == {"discharged": 0, "conditional": 2}
+    pdu = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
+    cch = [a for a in pdu["assumptions"] if a["kind"] == "callee_contract_hypothesis"]
+    # The caller's own callee is WP-covered, but only conditionally: the caller stays conditional too.
+    assert len(cch) == 1 and cch[0]["related_units"] == ["src/snmp/ber.c#ber_decode_tag::rte"]
+    assert not any(e["result"] == "hypotheses_discharged" for e in pdu["evidence"])
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+    # Once the leaf is proven unconditionally, the whole chain discharges.
+    write_json(
+        run_dir / "workspace/reports/wp/ber_decode_len.json",
+        wp_report(
+            function="ber_decode_len",
+            file="workspace/work/src/snmp/ber.c",
+            by_obligation_class={
+                "rte": {"proven": 2, "proven_under_hyp": 0, "unproven": 0},
+                "l2_termination": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+                "l6_secret": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+            },
+        ),
+    )
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/ber_decode_len.json"])
+    res2 = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
+    assert res2 == {"discharged": 2, "conditional": 0}
+    by_id = units_by_id(run_dir)
+    for cid in ("src/snmp/pdu.c#snmp_parse_pdu::rte", "src/snmp/ber.c#ber_decode_tag::rte"):
+        assert not any(
+            a["kind"] in ("valid_under_hyp", "callee_contract_hypothesis") for a in by_id[cid]["assumptions"]
+        )
+
+
+def test_ingest_wp_never_credits_the_unsound_cast_model(run_dir):
+    seed(run_dir)
+    report = wp_report(
+        wp_model="Typed+cast", by_obligation_class={"rte": {"proven": 3, "proven_under_hyp": 0, "unproven": 0}}
+    )
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    unit = _unit(run_dir, "rte")
+    assert unit["status"] == "blocked"
+    assert unit["evidence"][-1]["result"] == "wp_unsound_proof" and not unit["evidence"][-1]["discharging"]
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+@pytest.mark.parametrize("status", ["analysis_error", "acsl_syntax_error", "unproven_goals_remain"])
+def test_ingest_wp_sweep_blocks_units_the_reproof_does_not_reestablish(run_dir, status):
+    seed(run_dir)
+    proven = wp_report(by_obligation_class={"rte": {"proven": 3, "proven_under_hyp": 0, "unproven": 0}})
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", proven)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    assert _unit(run_dir, "rte")["status"] == "covered"
+
+    swept = wp_report(status=status, by_obligation_class={"rte": {"proven": 3, "proven_under_hyp": 0, "unproven": 0}})
+    write_json(run_dir / "workspace/reports/wp-sweep/pdu.json", swept)
+    # Outside the sweep, an analysis error only adds evidence...
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp-sweep/pdu.json"])
+    if status != "unproven_goals_remain":
+        assert _unit(run_dir, "rte")["status"] == "covered"
+    # ...but the trusted re-proof failing to re-establish the unit means it is no longer covered.
+    out = L.cmd_ingest_wp([run_dir / "workspace/reports/wp-sweep/pdu.json"], sweep=True)
+    unit = _unit(run_dir, "rte")
+    assert unit["status"] == "blocked" and unit["unresolved"]
+    assert out["blocked"] >= 1
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_wp_sweep_keeps_units_the_reproof_reestablishes(run_dir):
+    seed(run_dir)
+    proven = wp_report(by_obligation_class={"rte": {"proven": 3, "proven_under_hyp": 0, "unproven": 0}})
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", proven)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    write_json(run_dir / "workspace/reports/wp-sweep/pdu.json", proven)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp-sweep/pdu.json"], sweep=True)
+    assert _unit(run_dir, "rte")["status"] == "covered"
+
+
+def test_ingest_eva_never_credits_unclassified_statuses(run_dir):
+    seed(run_dir)
+    other = {
+        "file": "workspace/work/src/snmp/ber.c",
+        "function": "ber_decode_tag",
+        "line": 7,
+        "kind": "mem_access",
+        "status": "Inconsistent",
+        "status_bucket": "inconsistent",
+        "annotation": "mem_access: \\valid_read(p)",
+    }
+    write_json(run_dir / "workspace/reports/eva/snmp.json", eva_report(other_properties=[other]))
+    out = L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])
+    assert out["covered"] == 0
+    tag = units_by_id(run_dir)["src/snmp/ber.c#ber_decode_tag::rte"]
+    assert tag["status"] == "planned"
+    assert any(e["result"] == "eva_unclassified_status" and "Inconsistent" in e["summary"] for e in tag["evidence"])
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []

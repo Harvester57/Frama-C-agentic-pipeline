@@ -74,6 +74,18 @@ _STATUS_MAP = {
 }
 
 
+# The WP manual (Section "Memory models") calls the `cast` model option "unlimited casts (unsound)":
+# a proof under it is a diagnostic, never evidence.
+WP_UNSOUND_MODEL_ISSUE = "WP memory model with 'cast' (unlimited casts) is unsound; the proof is not evidence"
+
+
+def wp_model_unsound(model: object) -> bool:
+    """Whether a WP memory model string (for example `Typed+cast`) includes the unsound `cast` option."""
+    if not isinstance(model, str):
+        return False
+    return "cast" in {m.strip().lower() for m in re.split(r"[+,]", model) if m.strip()}
+
+
 def wp_limits_problem(limits: object) -> str | None:
     """Why the verdict limits of a WP report (run_wp_function.py) do not allow crediting its proof, or None."""
     if not isinstance(limits, dict):

@@ -71,6 +71,7 @@ from framac_common import (  # noqa: E402
     scratch_first_cppflags,
     source_tree_relpath,
     utc_now,
+    wp_model_unsound,
 )
 from resources import (  # noqa: E402
     FRAMAC_KERNEL_RESERVE_MB,
@@ -880,7 +881,13 @@ def infer_prover_wp_flags(
         flags.append("--no-warn-unsigned-downcast")
     if any("-warn-invalid-pointer OFF" in r for r in reduced):
         flags.append("--no-warn-invalid-pointer")
-    if wp_model and wp_model != "Typed" and re.match(r"^[A-Za-z0-9_+,-]+$", wp_model):
+    # Never carry the unsound `cast` model into a parent re-check or the sweep.
+    if (
+        wp_model
+        and wp_model != "Typed"
+        and re.match(r"^[A-Za-z0-9_+,-]+$", wp_model)
+        and not wp_model_unsound(wp_model)
+    ):
         flags.extend(["--wp-model", wp_model])
     return flags
 

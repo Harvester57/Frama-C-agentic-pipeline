@@ -52,11 +52,13 @@ from framac_common import (  # noqa: E402
     STATUS_UNKNOWN,
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
+    WP_UNSOUND_MODEL_ISSUE,
     augment_framac_cppflags,
     failure_reason,
     normalize_flag_args,
     read_report_csv,
     scan_undeclared_functions,
+    wp_model_unsound,
 )
 from resources import CLASSES, FRAMAC_KERNEL_RESERVE_MB, WP_MEMLIMIT_MB, enforced_memory_mb, wp_parallelism  # noqa: E402
 
@@ -1483,6 +1485,10 @@ def run_wp_on_function(
 
     # Workstream 3: Automatic bitwise/shift solver retry with Typed+ref+int and extended timeout
     model_parts = {m.strip().lower() for m in re.split(r"[+,]", wp_model) if m.strip()}
+    if wp_model_unsound(wp_model):
+        # Whoever chose the model, a proof under `cast` never counts: all_proven becomes unsound_proof.
+        soundness["tier_b_unsound"].append(WP_UNSOUND_MODEL_ISSUE)
+        soundness["ok"] = False
     if (
         retry_bitwise
         and len(unproven_goals) > 0
@@ -1761,7 +1767,14 @@ def run_wp_on_function(
             )
         except Exception as exc:  # a failed probe never changes the real result
             probe = {"status": "probe_error", "reason": f"{type(exc).__name__}: {exc}"}
-        proves_all = probe.get("status") == "all_proven"
+        # The probe's own model is the unsound one, so its only expected soundness issue is that.
+        probe_soundness = probe.get("soundness") or {}
+        proves_all = probe.get("status") == "all_proven" or (
+            probe.get("status") == "unsound_proof"
+            and probe.get("unproven_count") == 0
+            and list(probe_soundness.get("tier_b_unsound") or []) == [WP_UNSOUND_MODEL_ISSUE]
+            and not probe_soundness.get("tier_a_aborts")
+        )
         res["cast_model_probe"] = {
             "wp_model": "Typed+cast",
             "status": probe.get("status"),

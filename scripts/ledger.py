@@ -6,7 +6,7 @@ Subcommands (run with the run directory as working directory):
   seed                     --dag workspace/reports/callgraph_dag.json [--scope PATH ...]
   ingest-fuzz              <workspace/reports/fuzz/*.json ...>
   ingest-eva               <workspace/reports/eva/*.json ...>
-  ingest-wp                <workspace/reports/wp/*.json ...>
+  ingest-wp                <workspace/reports/wp/*.json ...> [--sweep]
   ingest-agent-hypothesis  <agent_result.json> [--module MOD]
   ingest-verifier          <verifier_result.json> [--replay-report <fuzz.json> ...] [--harness-meta <harness_mod.json>]
   transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT] [--expect STATUS ...]
@@ -38,6 +38,7 @@ import cache  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
+    WP_UNSOUND_MODEL_ISSUE,
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
@@ -48,6 +49,7 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
     wp_limits_problem,
+    wp_model_unsound,
 )
 from promote_artifact import PromotionError, promote_file, promote_seeds  # noqa: E402
 from run_wp_function import goal_obligation_class  # noqa: E402
@@ -677,6 +679,9 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         assumed_by_fn: dict[str, list[dict]] = {}
         for alarm in report.get("assumed_properties", []):
             assumed_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
+        other_by_fn: dict[str, list[dict]] = {}
+        for alarm in report.get("other_properties", []):
+            other_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
         props_by_fn: dict[str, list[dict]] = {}
         raw_props_by_file = report.get("functions_with_properties_by_file") or []
         if isinstance(raw_props_by_file, dict):
@@ -705,6 +710,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             unit_assumed = [
                 a for a in assumed_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)
             ]
+            unit_others = [a for a in other_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)]
             if props_by_fn:
                 has_props = any(_alarm_in_file(p, u_file) for p in props_by_fn.get(fn, []))
             elif report_sources:
@@ -747,6 +753,19 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 )
             if unit_invalids:
                 continue
+            if unit_others:
+                # Inconsistent or unrecognized statuses settle nothing: the unit stays open for WP.
+                statuses = sorted({str(a.get("status") or "?") for a in unit_others if isinstance(a, dict)})
+                add_evidence(
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_unclassified_status",
+                    False,
+                    tool_output,
+                    f"{len(unit_others)} property status(es) Eva left unclassified ({', '.join(statuses)[:120]}); "
+                    "not credited.",
+                )
             if unit_unknowns:
                 add_evidence(
                     u,
@@ -757,7 +776,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     tool_output,
                     f"{len(unit_unknowns)} RTE obligation(s) remain Unknown; queued for WP.",
                 )
-            elif has_props and not unit_deads:
+            elif has_props and not unit_deads and not unit_others:
                 summary_msg = "Every RTE obligation in this function is Valid under Eva."
                 if reduced_checks:
                     summary_msg = (
@@ -796,6 +815,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     u["status"] = "covered"
                     u["unresolved"] = []
                     stats["covered"] += 1
+            elif unit_others:
+                pass
             elif unit_deads:
                 add_evidence(
                     u,
@@ -859,9 +880,17 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
 
 
 @ledger_locked
-def cmd_ingest_wp(paths: list[Path]) -> dict:
+def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
+    """
+    Ingest WP reports. With `sweep`, each report is the trusted end-of-run re-proof of its function
+    (`pipeline_make.py sweep`): a WP-covered unit the report does not credit again, whatever the
+    reason (unproven goals, analysis or ACSL error, unmet limits, a missing report), stops counting
+    as covered and becomes `blocked`.
+    """
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "blocked": 0}
+    credited: set[str] = set()
+    sweep_checks: list[tuple[str, str, list[str]]] = []
     for path in paths:
         report = load_json_strict(path)
         if "function" not in report or "status" not in report or report.get("mode") == "guardrail":
@@ -870,6 +899,19 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
         tool_output = rel(str(path))
         fn = report["function"]
         targets = [u for u in units_for_function(units, report.get("file", ""), fn) if u["status"] not in NO_TOUCH]
+        if sweep:
+            wp_covered = [
+                u["coverage_id"]
+                for u in targets
+                if u["status"] == "covered"
+                and any(e.get("phase") == "wp" and e.get("discharging") for e in u.get("evidence") or [])
+            ]
+            sweep_checks.append((str(report["status"]), tool_output, wp_covered))
+        if report["status"] == "all_proven" and wp_model_unsound(report.get("wp_model")):
+            # A report written before run_wp_function.py refused the model itself: same verdict.
+            soundness = dict(report.get("soundness") or {})
+            soundness["tier_b_unsound"] = [*(soundness.get("tier_b_unsound") or []), WP_UNSOUND_MODEL_ISSUE]
+            report = {**report, "status": "unsound_proof", "soundness": soundness}
         if report["status"] == "acsl_syntax_error":
             for u in targets:
                 add_evidence(
@@ -1017,6 +1059,7 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                     )
                 u["status"] = "covered"
                 u["unresolved"] = []
+                credited.add(u["coverage_id"])
                 stats["covered"] += 1
             elif cls in ("rte", "l2_termination", "l3_frame") and all_proven and not counts:
                 ev_result = "wp_no_rte_goals" if cls == "rte" else "wp_qed_simplified"
@@ -1044,6 +1087,7 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                     )
                 u["status"] = "covered"
                 u["unresolved"] = []
+                credited.add(u["coverage_id"])
                 stats["covered"] += 1
             elif counts and not all_proven:
                 add_evidence(
@@ -1070,6 +1114,23 @@ def cmd_ingest_wp(paths: list[Path]) -> dict:
                     tool_output,
                     f"No WP goal could be credited to {cls}{hint}.",
                 )
+    for status, tool_output, wp_covered in sweep_checks:
+        for cid in wp_covered:
+            u = units[cid]
+            if cid in credited or u["status"] != "covered":
+                continue
+            add_evidence(
+                u,
+                "wp",
+                "pipeline_make.py",
+                "wp_sweep_not_reproven",
+                False,
+                tool_output,
+                f"The trusted end-of-run re-proof did not re-establish this unit (WP status: {status}).",
+            )
+            u["status"] = "blocked"
+            u["unresolved"] = [f"wp-sweep re-proof did not re-establish this unit (WP status: {status})"]
+            stats["blocked"] += 1
     commit(units, candidates)
     return stats
 
@@ -1962,8 +2023,8 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
             for e in (unit_obj.get("evidence") or [])
         )
 
-    discharged = 0
-    conditional = 0
+    hyp_kinds = ("valid_under_hyp", "callee_contract_hypothesis")
+    audited: dict[str, list[dict]] = {}
     for u in units.values():
         if u["status"] != "covered" or not _has_wp_discharge(u):
             continue
@@ -1983,9 +2044,38 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
             ]
             same_file = [cu for cu in cand_units if normalize_file(cu["file"]) == u_file]
             callee_units.extend(same_file or cand_units)
+        audited[u["coverage_id"]] = callee_units
 
-        unproven_callees = [cu for cu in callee_units if cu["status"] != "covered" or not _has_wp_discharge(cu)]
-        has_vuh = any(a.get("kind") in ("valid_under_hyp", "callee_contract_hypothesis") for a in u["assumptions"])
+    # Conditionality is transitive: a caller is proven unconditionally only when each callee is, so
+    # a callee that is itself proven under an open hypothesis keeps its callers conditional. Seed the
+    # open set with units whose own callees are not WP-proven, and units that keep a hypothesis no
+    # callee can discharge, then propagate up the call graph to a fixpoint.
+    open_ids: set[str] = set()
+    for cid, callee_units in audited.items():
+        u = units[cid]
+        has_vuh = any(a.get("kind") in hyp_kinds for a in u["assumptions"])
+        if any(cu["status"] != "covered" or not _has_wp_discharge(cu) for cu in callee_units) or (
+            has_vuh and not callee_units
+        ):
+            open_ids.add(cid)
+    changed = True
+    while changed:
+        changed = False
+        for cid, callee_units in audited.items():
+            if cid not in open_ids and any(cu["coverage_id"] in open_ids for cu in callee_units):
+                open_ids.add(cid)
+                changed = True
+
+    discharged = 0
+    conditional = 0
+    for cid, callee_units in audited.items():
+        u = units[cid]
+        unproven_callees = [
+            cu
+            for cu in callee_units
+            if cu["status"] != "covered" or not _has_wp_discharge(cu) or cu["coverage_id"] in open_ids
+        ]
+        has_vuh = any(a.get("kind") in hyp_kinds for a in u["assumptions"])
 
         if unproven_callees:
             rel_ids = sorted({cu["coverage_id"] for cu in unproven_callees})
@@ -1995,7 +2085,8 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
             add_assumption(
                 u,
                 "callee_contract_hypothesis",
-                f"Caller proof relies on callee contract(s) not deductively proven by WP: {', '.join(rel_ids[:5])}.",
+                "Caller proof relies on callee contract(s) not deductively proven by WP, or proven only under "
+                f"open hypotheses: {', '.join(rel_ids[:5])}.",
                 related=rel_ids,
             )
             conditional += 1
@@ -2067,6 +2158,12 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("ingest-fuzz", "ingest-eva", "ingest-wp"):
         p = sub.add_parser(name)
         p.add_argument("reports", nargs="+", type=Path)
+        if name == "ingest-wp":
+            p.add_argument(
+                "--sweep",
+                action="store_true",
+                help="Reports are the trusted wp-sweep re-proof: WP-covered units they do not credit become blocked",
+            )
     p_hyp = sub.add_parser("ingest-agent-hypothesis")
     p_hyp.add_argument("result", type=Path)
     p_hyp.add_argument("--module", default=None)
@@ -2121,7 +2218,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "ingest-eva":
             out = cmd_ingest_eva(args.reports)
         elif args.cmd == "ingest-wp":
-            out = cmd_ingest_wp(args.reports)
+            out = cmd_ingest_wp(args.reports, sweep=args.sweep)
         elif args.cmd == "ingest-agent-hypothesis":
             out = cmd_ingest_agent_hypothesis(args.result, args.module)
         elif args.cmd == "ingest-verifier":

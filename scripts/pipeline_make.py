@@ -1803,6 +1803,8 @@ def sweep(
                 "status": status,
                 "report": out_json,
             }
+            if e.get("eva_only"):
+                row["eva_only"] = True
             results.append(row)
             if status is None:
                 missing.append(row)
@@ -1821,28 +1823,41 @@ def sweep(
             "results": results,
             "generated_at": utc_now(),
         }
+        # A WP-covered function whose re-proof left no report was not re-established either: record
+        # that as its own report, so the ledger stops counting it as covered.
+        missing_reports = []
+        for r in missing:
+            if r.get("eva_only"):
+                continue
+            stub = f"{SWEEP_DIR}/missing/{PurePosixPath(r['report']).name}"
+            atomic_write_json(
+                run_dir / stub,
+                {
+                    "mode": "sweep_missing",
+                    "file": f"{WORK_DIR}/{r['file']}",
+                    "function": r["function"],
+                    "status": "analysis_error",
+                    "reason": f"wp-sweep re-proof wrote no report (rc={r['rc']})",
+                },
+            )
+            missing_reports.append(stub)
         s_runner = script_runner or _script_runner(run_dir)
-        to_ingest = [*(r["report"] for r in regressions), *(r["report"] for r in newly_wp_proven)]
+        to_ingest = [*(r["report"] for r in regressions), *missing_reports, *(r["report"] for r in newly_wp_proven)]
         if to_ingest:
-            # The sweep is the trusted backstop: regressions and newly WP-verified Eva callees reach the ledger.
-            rc, out = s_runner("ledger.py", ["ingest-wp", *to_ingest])
+            # The sweep is the trusted backstop: regressions, functions it could not re-prove and newly
+            # WP-verified Eva callees reach the ledger.
+            rc, out = s_runner("ledger.py", ["ingest-wp", "--sweep", *to_ingest])
             summary["ledger"] = _json_or_tail(out)
             if rc != 0:
                 summary["ok"] = False
                 summary["ledger_error"] = f"ledger.py ingest-wp failed (rc={rc}); regressions not recorded"
-        raw_ledger = load_json_optional(run_dir / LEDGER_JSON, [])
-        has_vuh = any(
-            isinstance(u, dict)
-            and any(
-                isinstance(a, dict) and a.get("kind") in ("valid_under_hyp", "callee_contract_hypothesis")
-                for a in (u.get("assumptions") or [])
-            )
-            for u in (raw_ledger if isinstance(raw_ledger, list) else [])
-        )
-        if has_vuh and summary["ok"]:
-            rc_a, out_a = s_runner("ledger.py", ["audit-hypotheses"])
-            if rc_a == 0:
-                summary["hypothesis_audit"] = _json_or_tail(out_a)
+        # Always resolve callee hypotheses on the final ledger: a regression can turn a callee's proof
+        # conditional, and that must reach every caller above it.
+        rc_a, out_a = s_runner("ledger.py", ["audit-hypotheses"])
+        summary["hypothesis_audit"] = _json_or_tail(out_a)
+        if rc_a != 0:
+            summary["ok"] = False
+            summary["audit_error"] = f"ledger.py audit-hypotheses failed (rc={rc_a})"
         atomic_write_json(run_dir / SWEEP_DIR / "summary.json", summary)
     return summary
 

@@ -17,6 +17,7 @@ from framac_common import (
     scratch_first_cppflags,
     scratch_first_flags,
     source_tree_relpath,
+    wp_model_unsound,
 )
 
 
@@ -356,3 +357,19 @@ def test_bsd_string_contracts_include_from_dependencies():
     # strlcat contract checks
     assert "assigns dst[0 .. size - 1] \\from dst[0 .. size - 1], src[0 .. size - 1], size;" in text
     assert "assigns \\result \\from dst[0 .. size - 1], src[0 .. size - 1], size;" in text
+
+
+@pytest.mark.parametrize(
+    ("model", "unsound"),
+    [
+        ("Typed", False),
+        ("Typed+ref+int", False),
+        ("Typed+nocast", False),
+        ("Typed+cast", True),
+        ("typed+ref+CAST", True),
+        ("Typed,cast", True),
+        (None, False),
+    ],
+)
+def test_wp_model_unsound_flags_only_the_cast_option(model, unsound):
+    assert wp_model_unsound(model) is unsound

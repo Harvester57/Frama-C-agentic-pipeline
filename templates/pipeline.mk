@@ -212,7 +212,10 @@ wp-baseline: wp-queue
 wp-sweep:
 	$(PM) sweep
 
+# The hypothesis audit runs first, so the report never shows a caller as unconditionally proven
+# while a callee below it is not.
 report:
+	$(RUN) --class light --key report -- $(PY) $(S)/ledger.py audit-hypotheses
 	$(RUN) --class light --key report -- $(PY) $(S)/workspace_overlay.py export-diff
 	$(RUN) --class light --key report -- $(PY) $(S)/validate_artifacts.py run-dir .
 	$(RUN) --class light --key report -- $(PY) $(S)/generate_report.py

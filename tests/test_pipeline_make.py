@@ -797,7 +797,10 @@ def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
     assert summary["status"] == "regressions" and summary["ok"] is True and summary["total"] == 2
     assert [r["function"] for r in summary["regressions"]] == ["glue_step"]
     # The regression reaches the ledger, so the function stops counting as covered.
-    assert ledger_calls == [("ledger.py", ["ingest-wp", "workspace/reports/wp-sweep/src_glue_g.c__glue_step.json"])]
+    assert ledger_calls == [
+        ("ledger.py", ["ingest-wp", "--sweep", "workspace/reports/wp-sweep/src_glue_g.c__glue_step.json"]),
+        ("ledger.py", ["audit-hypotheses"]),
+    ]
     assert summary["ledger"]["blocked"] == 1
     assert summary["skipped"][0]["function"] == "evil_entry" and "-fplugin" in summary["skipped"][0]["reason"]
     ber = next(c for c in calls if "ber_decode" in c)
@@ -858,8 +861,36 @@ def test_sweep_reports_missing_reports_and_drops_stale_ones(tmp_path):
     run = _make_run(tmp_path)
     _sweep_ledger(run)
     write_json(run / pm.SWEEP_DIR / "src_snmp_ber.c__ber_decode.json", {"status": "all_proven"})  # earlier sweep
-    summary = pm.sweep(run, jobs=1, runner=lambda cmd, log: 137, plan=pm.build_plan(run, templates_dir=ACSL))
+    ledger_calls = []
+
+    def fake_script(script, args):
+        ledger_calls.append((script, args))
+        return 0, "{}"
+
+    summary = pm.sweep(
+        run,
+        jobs=1,
+        runner=lambda cmd, log: 137,
+        plan=pm.build_plan(run, templates_dir=ACSL),
+        script_runner=fake_script,
+    )
     assert summary["status"] == "incomplete" and summary["ok"] is False and len(summary["missing"]) == 2
+    # A function the sweep could not re-prove is not re-established: it reaches the ledger as such.
+    ingest = next(args for script, args in ledger_calls if args[0] == "ingest-wp")
+    assert ingest[1] == "--sweep" and len(ingest[2:]) == 2
+    for stub in ingest[2:]:
+        assert stub.startswith(f"{pm.SWEEP_DIR}/missing/")
+        doc = json.loads((run / stub).read_text(encoding="utf-8"))
+        assert doc["status"] == "analysis_error" and doc["file"].startswith("workspace/work/")
+    assert ledger_calls[-1] == ("ledger.py", ["audit-hypotheses"])
+
+
+def test_report_target_runs_the_hypothesis_audit_first():
+    mk = (Path(pm.__file__).resolve().parent.parent / "templates" / "pipeline.mk").read_text(encoding="utf-8")
+    recipe = mk.split("\nreport:\n", 1)[1].split("\n\n", 1)[0]
+    lines = [ln.strip() for ln in recipe.splitlines() if ln.strip()]
+    assert "ledger.py audit-hypotheses" in lines[0]
+    assert "generate_report.py" in lines[-1]
 
 
 def test_file_slugs_disambiguate_collisions():

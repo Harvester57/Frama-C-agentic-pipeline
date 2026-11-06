@@ -909,6 +909,8 @@ def summarize_rows(rows: list[dict]) -> dict:
         "invalid_count": len(alarms_by_status["Invalid"]),
         "dead_count": len(alarms_by_status["Dead"]),
         "assumed_count": len(alarms_by_status["Assumed"]),
+        # Inconsistent or unrecognized statuses: neither proof nor alarm, so ingest never credits them.
+        "other_count": len(alarms_by_status["Other"]),
         "discharged_percentage": discharged_pct,
         "surviving_unknown_functions": sorted(unknown_by_function.keys()),
         "unknown_obligations_by_function": dict(unknown_by_function),
@@ -919,6 +921,7 @@ def summarize_rows(rows: list[dict]) -> dict:
         "invalid_alarms": alarms_by_status["Invalid"],
         "dead_alarms": alarms_by_status["Dead"],
         "assumed_properties": alarms_by_status["Assumed"],
+        "other_properties": alarms_by_status["Other"],
     }
 
 
