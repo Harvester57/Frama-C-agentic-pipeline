@@ -265,7 +265,11 @@ def test_rejected_by_the_guardrail_is_never_best_even_with_the_best_proof_ratio(
     assert block["eligible"] is False and block["rank"] is None and block["progress"] is None
     assert block["best"] == 1 and block["best_rank"] == {"failed": 4, "proved": 6, "invalid": 0}
     assert block["next_action"] == "continue"  # the prover must fix it: not a stall
-    assert PC.restore_best(prover.scratch) == {"restored": True, "best": 1, "rank": {"failed": 4, "proved": 6, "invalid": 0}}
+    assert PC.restore_best(prover.scratch) == {
+        "restored": True,
+        "best": 1,
+        "rank": {"failed": 4, "proved": 6, "invalid": 0},
+    }
     assert prover.read() == annotated("a")
     assert load(prover.guard_path)["status"] == PASSED
 
@@ -333,8 +337,18 @@ def test_rank_tiebreak_prefers_fewer_invalid_invariants(prover):
     """SESpec largest-valid-subset: among equal failed counts, a candidate whose failures are
     only provability (invalid=0) outranks one carrying invalid invariants (_established/_preserved)."""
     invalid_goals = [
-        {"obligation_class": "l2_termination", "kind": "loop_invariant", "line": 4, "annotation": "typed_f_loop_invariant_bad_preserved"},
-        {"obligation_class": "l2_termination", "kind": "loop_invariant", "line": 4, "annotation": "typed_f_loop_invariant_worse_established"},
+        {
+            "obligation_class": "l2_termination",
+            "kind": "loop_invariant",
+            "line": 4,
+            "annotation": "typed_f_loop_invariant_bad_preserved",
+        },
+        {
+            "obligation_class": "l2_termination",
+            "kind": "loop_invariant",
+            "line": 4,
+            "annotation": "typed_f_loop_invariant_worse_established",
+        },
     ]
     block = prover.iterate("a", failed=2, proved=3, unproven_goals=invalid_goals)
     assert block["rank"] == {"failed": 2, "proved": 3, "invalid": 2} and block["best"] == 1
@@ -565,7 +579,11 @@ def test_a_rerun_after_an_analysis_error_completes_the_same_candidate(prover):
 def test_a_better_rerun_on_the_same_files_updates_the_reports_of_the_best(prover):
     prover.iterate("a", failed=2, proved=5)
     block = prover.wp(failed=1, proved=6)  # a longer --timeout, say
-    assert (block["candidate"], block["progress"], block["best_rank"]) == (1, True, {"failed": 1, "proved": 6, "invalid": 0})
+    assert (block["candidate"], block["progress"], block["best_rank"]) == (
+        1,
+        True,
+        {"failed": 1, "proved": 6, "invalid": 0},
+    )
     assert load(prover.scratch / f"candidates/best/wp_{FN}.json")["unproven_count"] == 1
 
 
@@ -643,7 +661,11 @@ def test_restore_puts_back_files_reports_and_patch_and_is_idempotent(prover):
     prover.edit(annotated_header("last"), H_REL)
     prover.iterate("last", failed=2, proved=2, guard="code_fault")
 
-    assert PC.restore_best(prover.scratch) == {"restored": True, "best": 1, "rank": {"failed": 1, "proved": 9, "invalid": 0}}
+    assert PC.restore_best(prover.scratch) == {
+        "restored": True,
+        "best": 1,
+        "rank": {"failed": 1, "proved": 9, "invalid": 0},
+    }
     assert prover.read() == annotated("best") and prover.read(H_REL) == annotated_header("best")
     assert PC.tracked_digest(prover.scratch) == prover.state()["best_digest"]
     assert load(prover.wp_path)["marker"] == "best-wp" and load(prover.wp_path) == best_wp
@@ -657,7 +679,11 @@ def test_restore_puts_back_files_reports_and_patch_and_is_idempotent(prover):
     assert (prover.scratch / "base" / C_REL).read_text(encoding="utf-8") == BASE_C
 
     before = tree_bytes(prover.scratch)
-    assert PC.restore_best(prover.scratch) == {"restored": False, "best": 1, "rank": {"failed": 1, "proved": 9, "invalid": 0}}
+    assert PC.restore_best(prover.scratch) == {
+        "restored": False,
+        "best": 1,
+        "rank": {"failed": 1, "proved": 9, "invalid": 0},
+    }
     assert tree_bytes(prover.scratch) == before
     assert not (prover.scratch / ".framac-locks").exists()
 
@@ -1006,7 +1032,11 @@ def test_cli_restore_best_and_status(prover, capsys):
     prover.iterate("b", failed=1, proved=9)
     prover.edit(annotated("unrecorded"))
     assert PC.main(["restore-best", "--agent-id", AID]) == 0
-    assert json.loads(capsys.readouterr().out) == {"restored": True, "best": 1, "rank": {"failed": 1, "proved": 9, "invalid": 0}}
+    assert json.loads(capsys.readouterr().out) == {
+        "restored": True,
+        "best": 1,
+        "rank": {"failed": 1, "proved": 9, "invalid": 0},
+    }
     assert prover.read() == annotated("a")
     assert PC.main(["status", "--agent-id", AID]) == 0
     out = json.loads(capsys.readouterr().out)

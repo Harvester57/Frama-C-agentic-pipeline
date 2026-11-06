@@ -100,14 +100,10 @@ def _copy_loop_record():
 def test_copy_loop_normalizes_loop_write_to_range_and_lifts_read_to_region() -> None:
     skel = fs.compute(_copy_loop_record())
     assert skel["status"] == "ok"
-    assert [s["clause"] for s in skel["separated"]] == [
-        "requires \\separated(dst + (0 .. n - 1), src + (0 .. n - 1));"
-    ]
+    assert [s["clause"] for s in skel["separated"]] == ["requires \\separated(dst + (0 .. n - 1), src + (0 .. n - 1));"]
     by_loc = {a["loc"]: a for a in skel["assigns"]}
     assert by_loc["dst + (0 .. n - 1)"]["from"] == ["n", "src + (0 .. n - 1)"]
-    assert by_loc["dst + (0 .. n - 1)"]["clause"] == (
-        "assigns dst + (0 .. n - 1) \\from n, src + (0 .. n - 1);"
-    )
+    assert by_loc["dst + (0 .. n - 1)"]["clause"] == ("assigns dst + (0 .. n - 1) \\from n, src + (0 .. n - 1);")
     # The global write has no AST value flow: sound superset of the read roots.
     assert by_loc["g"]["source"] == "ast-superset"
     assert by_loc["g"]["from"] == ["n", "src + (0 .. n - 1)"]

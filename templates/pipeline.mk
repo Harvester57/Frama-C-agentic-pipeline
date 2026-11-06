@@ -111,6 +111,7 @@ eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EV
 	$(if $(EVA_MLEVEL_$(1)),--mlevel $(EVA_MLEVEL_$(1))) \
 	$(if $(EVA_TAINT_$(1)),--extra-domains taint) \
 	$(if $(EVA_RECURSION_FALLBACK_$(1)),--allow-incomplete-recursion-specs) \
+	--no-warn-unsigned-downcast \
 	--cppflags=$(CPPFLAGS_$(1))
 
 # One Eva run per module, from the harness's eva_main, with its recorded tuning if it has one.

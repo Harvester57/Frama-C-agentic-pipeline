@@ -944,7 +944,9 @@ def merge_agent_overlay(
         return res
 
 
-def _function_frame_skeleton(overlay: Path, module: str | None, c_file: str | None, function: str | None) -> dict | None:
+def _function_frame_skeleton(
+    overlay: Path, module: str | None, c_file: str | None, function: str | None
+) -> dict | None:
     """The projected frame skeleton of `function` from the module's facts, or None (fail-open)."""
     if not (module and c_file and function):
         return None
@@ -1132,7 +1134,9 @@ def _merge_agent_overlay_locked(
         # spliced files together.
         frame_parts: list[str] = []
         for rel_str in changed_rels:
-            span = locate_function_span(new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str)
+            span = locate_function_span(
+                new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str
+            )
             if span is not None:
                 frame_parts.append(_acsl_text_of_span(span))
         frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")

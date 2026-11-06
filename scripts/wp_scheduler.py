@@ -99,6 +99,9 @@ RESULT_ROLE = {
 NO_TOUCH = ledger.NO_TOUCH
 
 MAX_NEGOTIATIONS_PER_PAIR = 2  # negotiation rounds per (caller, callee) pair
+# Dispatches of one callee's negotiation task: many callers can each ask for a stronger contract the callee cannot
+# be proved to give, and every round costs an agent run for the same stall.
+MAX_NEGOTIATION_ROUNDS_PER_CALLEE = 3
 MAX_MERGE_ATTEMPTS = 2  # a prover whose merge fails twice is blocked
 MAX_ANALYSIS_ERRORS = 2  # a WP analysis_error is retried once, then the units are blocked
 MAX_INVALID_RESULTS = 2  # a malformed result is re-run once with a fresh agent
@@ -2333,6 +2336,22 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
             )
             out.setdefault("negotiations_skipped", []).append({"request": rid, "callee": key, "reason": neg_verdict})
             continue
+        settled = tasks.get(f"negotiate:{key}")
+        if (
+            settled is not None
+            and settled["state"] in TERMINAL
+            and settled.get("outcome") != "applied"
+            and int(settled.get("dispatches") or 0) >= MAX_NEGOTIATION_ROUNDS_PER_CALLEE
+        ):
+            _resolve_request(
+                out["errors"],
+                rid,
+                "rejected_by_callee",
+                f"not dispatched: callee {key} went through {settled['dispatches']} negotiation rounds "
+                f"(cap {MAX_NEGOTIATION_ROUNDS_PER_CALLEE}) without an accepted contract",
+            )
+            out.setdefault("negotiations_capped", []).append({"request": rid, "callee": key})
+            continue
         pair = f"{caller['id']}|{key}"
         count = int(state["negotiation_counts"].get(pair, 0))
         if count >= MAX_NEGOTIATIONS_PER_PAIR:
@@ -2485,13 +2504,84 @@ def _on_analysis_error(state: dict, task: dict, agent_id: str, report_rel: str, 
     out["action"] = "blocked_analysis_error"
 
 
-def _partial_contract_merge_job(task: dict, aid: str, report: dict | None) -> dict | None:
+def _eva_has_invalid(file: str, fn: str) -> bool:
+    """Whether any module's Eva report holds an Invalid alarm for the function."""
+    if not EVA_DIR.is_dir():
+        return False
+    for path in sorted(EVA_DIR.glob("*.json")):
+        data = load_json_optional(path, {}) or {}
+        for alarm in (data.get("invalid_alarms") if isinstance(data, dict) else None) or []:
+            if isinstance(alarm, dict) and alarm.get("function") == fn and eva_alarm_in_file(alarm, file):
+                return True
+    return False
+
+
+# Kinds of the RTE goals WP generates for a body (Frama-C RTE plugin names), as opposed to contract goals
+# (`postcondition`, `precondition`, `assigns clause`, loop goals), which only a proof discharges.
+_RTE_GOAL_KINDS = frozenset(
+    {
+        "pointer_value",
+        "mem_access",
+        "index_bound",
+        "initialization",
+        "pointer_alignment",
+        "dangling_pointer",
+        "signed_overflow",
+        "unsigned_overflow",
+        "signed_downcast",
+        "unsigned_downcast",
+        "division_by_zero",
+        "shift",
+        "float_to_int",
+        "function_pointer",
+    }
+)
+
+
+def _unproven_rte_goals(report: dict) -> list[dict] | None:
+    """The unproven goals when every one is an RTE goal of the body; None when any is a contract goal.
+
+    The kind decides, not WP's bucket: an RTE goal on a `return` expression lands in the postcondition bucket.
+    """
+    goals = report.get("unproven_goals")
+    if not isinstance(goals, list) or not goals:
+        return None
+    if any(not isinstance(g, dict) or g.get("kind") not in _RTE_GOAL_KINDS for g in goals):
+        return None
+    return goals
+
+
+def _eva_backs_unproven_rte(ctx: Ctx, file: str, fn: str, goals: list[dict]) -> bool:
+    """
+    Whether Eva discharged every RTE kind that WP left unproven for the function, and found no Invalid alarm in it.
+    A negotiated contract is merged without a proof of its body only when this holds: the unproven goals are then
+    memory-model limits of WP (e.g. pointer casts), with Eva and the dynamic oracle as the evidence behind them.
+    """
+    if _eva_has_invalid(file, fn):
+        return False
+    kinds = {str(g.get("kind") or "") for g in goals}
+    if not goals or "" in kinds:
+        return False
+    for items in ctx._eva_items_by_fn.get(fn) or []:
+        for alarm in items if isinstance(items, list) else []:
+            if isinstance(alarm, dict) and alarm.get("kind") in kinds and eva_alarm_in_file(alarm, file):
+                return False
+    return True
+
+
+def _partial_contract_merge_job(task: dict, aid: str, report: dict | None, ctx: Ctx | None = None) -> dict | None:
     """
     Return a partial-merge spec when a stalled `prove` task has a sound, assigns-verified
     contract in its scratch overlay that did not fail the E-ACSL dynamic oracle, so callers
     can verify against the callee's contract while the callee itself remains `blocked`.
+
+    A stalled `negotiate` task qualifies only on stronger evidence, because its contract was strengthened on a
+    caller's request: the dynamic oracle must have passed, every unproven goal must be an RTE goal of the body
+    (by kind, whatever bucket WP put it in), and Eva must have discharged those RTE kinds. A strengthened
+    postcondition WP could not prove never merges.
     """
-    if task.get("kind") != "prove" or not isinstance(report, dict):
+    kind = task.get("kind")
+    if kind not in PROVER_KINDS or not isinstance(report, dict):
         return None
     if report.get("status") != "unproven_goals_remain":
         return None
@@ -2504,7 +2594,18 @@ def _partial_contract_merge_job(task: dict, aid: str, report: dict | None) -> di
     if not fn or not c_rel:
         return None
     guard_path = Path("agents") / aid / "scratch" / f"guard_{fn}.json"
-    if guard_path.is_file():
+    if kind == "negotiate":
+        rte_goals = _unproven_rte_goals(report)
+        if rte_goals is None or ctx is None or not _eva_backs_unproven_rte(ctx, c_rel, fn, rte_goals):
+            return None
+        guard_data = load_json_optional(guard_path, {}) or {} if guard_path.is_file() else {}
+        if not isinstance(guard_data, dict) or guard_data.get("status") != "passed_dynamic_oracle":
+            return None
+        # A guardrail that never executed the function says nothing about its contract.
+        reach = guard_data.get("reach") or {}
+        if not reach.get("measured") or int((reach.get("functions") or {}).get(fn) or 0) <= 0:
+            return None
+    elif guard_path.is_file():
         guard_data = load_json_optional(guard_path, {}) or {}
         if isinstance(guard_data, dict) and guard_data.get("status") not in (None, "passed_dynamic_oracle"):
             return None
@@ -2515,10 +2616,22 @@ def _partial_contract_merge_job(task: dict, aid: str, report: dict | None) -> di
         c_text = scratch_c.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    if not acsl_ast.has_function_contract(c_text, fn, is_header=False, path=c_rel):
+    has_contract = acsl_ast.has_function_contract(c_text, fn, is_header=False, path=c_rel)
+    header_rel = norm_path(str(task.get("header") or ""))
+    scratch_h = Path("agents") / aid / "scratch" / "work" / header_rel if header_rel else None
+    if not has_contract and scratch_h is not None and scratch_h.is_file():
+        # Public functions carry their contract on the header prototype.
+        try:
+            h_text = scratch_h.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        has_contract = acsl_ast.has_function_contract(h_text, fn, is_header=True, path=header_rel)
+    if not has_contract:
         return None
     return {
         "task": task["id"],
+        "prove_task": f"prove:{c_rel}#{fn}",
+        "requeue_callers": list(task.get("callers") or []) if kind == "negotiate" else [],
         "agent_id": aid,
         "file": task["file"],
         "function": fn,
@@ -2600,7 +2713,7 @@ def _complete_prover(
             )
         _resolve_negotiation(state, task, False, f"callee prover {aid} returned {status}", out)
         out["action"] = "negotiation_rejected"
-        return None
+        return _partial_contract_merge_job(task, aid, report, ctx)
     # A stalled report that claims all_proven is not parent-verified: never credit it.
     if report_rel and report and report.get("status") != "all_proven":
         out["ingest_wp"] = _try(out["errors"], "ingest-wp", DEPS.ingest_wp, [Path(report_rel)])
@@ -2611,14 +2724,18 @@ def _complete_prover(
     _emit_negotiations(state, ctx, task, [r for r in _requests() if r.get("id") not in before], out)
     if not (report and report.get("wp_allocation_limitation") is True):
         _ensure_breaker(state, task, aid, report_rel, out)
-    out["units"] = _park_units(task, aid, f"prover {aid} returned {status}")
-    _finish(state, task, "blocked", status)  # terminal: its callers are released
+    reason = f"prover {aid} returned {status}"
+    if report and report.get("wp_cast_limitation"):
+        # Goals only the unsound `Typed+cast` model discharges: a WP memory-model limit, not a weak contract.
+        reason = f"wp_typed_cast_limit: remaining goals are not provable in WP Typed (pointer casts); {reason}"
+    out["units"] = _park_units(task, aid, reason)
+    _finish(state, task, "blocked", status, reason=reason)  # terminal: its callers are released
     out["action"] = "blocked"
     # A restored best candidate can be fully proved while the prover stalled on a later, stronger contract. It is not
     # credited above, but its callers still get its contract: the partial merge re-verifies it on the merged tree.
     if restored and report and report.get("status") == "all_proven":
         report = {**report, "status": "unproven_goals_remain"}
-    return _partial_contract_merge_job(task, aid, report)
+    return _partial_contract_merge_job(task, aid, report, ctx)
 
 
 def _complete_architect(state: dict, task: dict, aid: str, res: dict, out: dict) -> dict | None:
@@ -2780,6 +2897,9 @@ def cmd_complete(agent_id: str) -> dict:
             with run_lock("ledger"):
                 state = load_schedule()
                 ptask = state["tasks"].get(partial_merge_job["task"])
+                if ptask is not None and ptask["kind"] == "negotiate":
+                    # The contract belongs to the callee's prove task, whose callers are already released.
+                    ptask = state["tasks"].get(partial_merge_job.get("prove_task") or "") or ptask
                 if ptask is not None:
                     ptask["partial_contract_merged"] = True
                     ptask["partial_merged_at"] = utc_now()
@@ -2787,6 +2907,9 @@ def cmd_complete(agent_id: str) -> dict:
                         out["rechecks_queued"] = _queue_rechecks_for(
                             state, ptask, f"partial contract of {_key(ptask)} merged from {agent_id}"
                         )
+                    out["requeued_callers"] = [
+                        c for c in partial_merge_job.get("requeue_callers") or [] if _requeue_caller(state, c)
+                    ]
                     save_schedule(state)
     if merge_job is None:
         return out

@@ -154,12 +154,16 @@ def check_function(
                     result["spec_mutants"] += 1
                     eq = _is_equivalent(report)
                     result["equivalent"] += int(eq)
-                    result["details"].append({"mutant": name, "kind": "spec", "equivalent": eq, "status": report.get("status")})
+                    result["details"].append(
+                        {"mutant": name, "kind": "spec", "equivalent": eq, "status": report.get("status")}
+                    )
                 else:
                     result["impl_mutants"] += 1
                     rej = _is_rejection(report)
                     result["rejected"] += int(rej)
-                    result["details"].append({"mutant": name, "kind": "impl", "rejected": rej, "status": report.get("status")})
+                    result["details"].append(
+                        {"mutant": name, "kind": "impl", "rejected": rej, "status": report.get("status")}
+                    )
     if result["spec_mutants"]:
         result["completeness"] = round(1 - result["equivalent"] / result["spec_mutants"], 4)
     if result["impl_mutants"]:
@@ -232,7 +236,14 @@ def run_mutation_check(
                 c_file = cand if cand.is_file() else c_file
             if not c_file.is_file():
                 continue
-            doc["functions"][fn] = check_function(c_file, fn, "-I.", run_dir / "workspace" / "reports" / "mutation-wp", wp_runner=wp_runner, max_mutants=max_mutants)
+            doc["functions"][fn] = check_function(
+                c_file,
+                fn,
+                "-I.",
+                run_dir / "workspace" / "reports" / "mutation-wp",
+                wp_runner=wp_runner,
+                max_mutants=max_mutants,
+            )
     totals: dict[str, Any] = {
         "functions": len(doc["functions"]),
         "spec_mutants": sum(f.get("spec_mutants", 0) for f in doc["functions"].values()),

@@ -1037,11 +1037,18 @@ def test_loop_var_classes_copy_loop() -> None:
     raw = _raw(
         "copy_buf",
         "m.c:2",
-        formals=[_formal("dst", "pointer", "char", char_like=True), _formal("src", "pointer", "char", char_like=True), _formal("n")],
+        formals=[
+            _formal("dst", "pointer", "char", char_like=True),
+            _formal("src", "pointer", "char", char_like=True),
+            _formal("n"),
+        ],
         loops=[
             _loop(
                 loc="m.c:4",
-                writes=[_write("*(dst + i)", "dst", values=["*(src + i)"]), _write("i", "i", "local", False, ["i + 1"])],
+                writes=[
+                    _write("*(dst + i)", "dst", values=["*(src + i)"]),
+                    _write("i", "i", "local", False, ["i + 1"]),
+                ],
                 reads=[_access("*(src + i)", "src", loc="m.c:4")],
             )
         ],
@@ -1073,9 +1080,20 @@ def test_loop_graph_nested_and_sequential_edges_and_contexts() -> None:
             "m.c:1",
             formals=[_formal("a", "pointer", "int"), _formal("b", "pointer", "int"), _formal("n")],
             loops=[
-                _loop(index=0, loc="m.c:3", writes=[_write("*(a + i)", "a", values=["0"]), _write("i", "i", "local", False, ["i + 1"])]),
-                _loop(index=1, loc="m.c:5", writes=[_write("*(b + i)", "b", values=["*(a + i) + 1"]), _write("i", "i", "local", False, ["i + 1"])],
-                      reads=[_access("*(a + i)", "a")]),
+                _loop(
+                    index=0,
+                    loc="m.c:3",
+                    writes=[_write("*(a + i)", "a", values=["0"]), _write("i", "i", "local", False, ["i + 1"])],
+                ),
+                _loop(
+                    index=1,
+                    loc="m.c:5",
+                    writes=[
+                        _write("*(b + i)", "b", values=["*(a + i) + 1"]),
+                        _write("i", "i", "local", False, ["i + 1"]),
+                    ],
+                    reads=[_access("*(a + i)", "a")],
+                ),
             ],
             writes=[_access("*(a + i)", "a"), _access("*(b + i)", "b")],
             reads=[_access("*(a + i)", "a")],

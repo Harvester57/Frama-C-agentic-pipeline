@@ -84,7 +84,12 @@ def test_kb_section_for_renders_top_items_and_kill_switch(tmp_path: Path, monkey
     kb_dir.mkdir(parents=True)
     seed = spec_kb.build_seed_kb(_fake_references(tmp_path))
     (kb_dir / "seed.json").write_text(json.dumps(seed), encoding="utf-8")
-    record = {"features": {"loops": True}, "frame_skeleton": {"status": "ok", "separated": [], "assigns": []}, "loops": [], "may_alias": []}
+    record = {
+        "features": {"loops": True},
+        "frame_skeleton": {"status": "ok", "separated": [], "assigns": []},
+        "loops": [],
+        "may_alias": [],
+    }
     section = spec_kb.kb_section_for(overlay, record)
     assert "## Retrieved ACSL Knowledge" in section
     assert "Loop annotations" in section
@@ -120,13 +125,18 @@ def _fake_run(tmp_path: Path) -> Path:
     (agent2 / "scratch" / "candidates" / "c1").mkdir(parents=True)
     (agent2 / "scratch" / "candidates" / "c1" / "wp_g.json").write_text(
         json.dumps(
-            {"function": "g", "unproven_goals": [{"kind": "loop_invariant", "annotation": "typed_g_loop_invariant_bound_preserved"}]}
+            {
+                "function": "g",
+                "unproven_goals": [{"kind": "loop_invariant", "annotation": "typed_g_loop_invariant_bound_preserved"}],
+            }
         ),
         encoding="utf-8",
     )
     (agent2 / "scratch" / "result.json").write_text(json.dumps({"status": "stalled_after_k_retries"}), encoding="utf-8")
     (agent2 / "artifacts").mkdir(parents=True)
-    (agent2 / "artifacts" / "g.patch").write_text("--- a/m.c\n+++ b/m.c\n@@ -1,1 +1,2 @@\n+//@ assert \\true;\n", encoding="utf-8")
+    (agent2 / "artifacts" / "g.patch").write_text(
+        "--- a/m.c\n+++ b/m.c\n@@ -1,1 +1,2 @@\n+//@ assert \\true;\n", encoding="utf-8"
+    )
     return run_dir
 
 
@@ -156,7 +166,9 @@ def test_repair_hints_from_evolved_kb(tmp_path: Path) -> None:
         "status": "unproven_goals_remain",
         "soundness": {"ok": True},
         "unproven_by_bucket": {"step_b_loop_invariant": [{"kind": "loop_invariant"}]},
-        "unproven_goals": [{"kind": "loop_invariant", "annotation": "typed_h_loop_invariant_bound_preserved", "line": 9}],
+        "unproven_goals": [
+            {"kind": "loop_invariant", "annotation": "typed_h_loop_invariant_bound_preserved", "line": 9}
+        ],
     }
     hints = derive_wp_diagnostic_hints(res, kb_dir=kb_dir)
     assert any("Repair pattern from earlier runs" in h and "loop_invariant_bound_preserved" in h for h in hints), hints
@@ -173,7 +185,9 @@ def test_repair_hints_disabled_by_kill_switch(tmp_path: Path, monkeypatch: pytes
         "status": "unproven_goals_remain",
         "soundness": {"ok": True},
         "unproven_by_bucket": {"step_b_loop_invariant": [{"kind": "loop_invariant"}]},
-        "unproven_goals": [{"kind": "loop_invariant", "annotation": "typed_h_loop_invariant_bound_preserved", "line": 9}],
+        "unproven_goals": [
+            {"kind": "loop_invariant", "annotation": "typed_h_loop_invariant_bound_preserved", "line": 9}
+        ],
     }
     assert not any("Repair pattern" in h for h in derive_wp_diagnostic_hints(res, kb_dir=kb_dir))
 

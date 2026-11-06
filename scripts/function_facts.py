@@ -327,9 +327,7 @@ def _classify_loop_vars(loop: dict) -> dict:
         lval = w.get("lval") or ""
         root = w.get("root") or ""
         values = w.get("values") or []
-        self_read = any(
-            (lval and lval in v) or (root and re.search(rf"\b{re.escape(root)}\b", v)) for v in values
-        )
+        self_read = any((lval and lval in v) or (root and re.search(rf"\b{re.escape(root)}\b", v)) for v in values)
         name = lval or root
         if not name:
             continue
@@ -377,7 +375,7 @@ def _loop_graph(record: dict) -> dict:
     for loop in loops:
         by_depth.setdefault(loop.get("parent"), []).append(loop)
     for group in by_depth.values():
-        ordered = sorted(group, key=lambda lp: (lp.get("line") or 0))
+        ordered = sorted(group, key=lambda lp: lp.get("line") or 0)
         for a, b in zip(ordered, ordered[1:], strict=False):
             edges.append({"from": f"L{a['index']}", "to": f"L{b['index']}", "kind": "seq"})
             edges.append(
@@ -388,7 +386,7 @@ def _loop_graph(record: dict) -> dict:
                     "note": "earlier loop's exit summary feeds later loop's establishment",
                 }
             )
-    top = sorted(by_depth.get(None, []), key=lambda lp: (lp.get("line") or 0))
+    top = sorted(by_depth.get(None, []), key=lambda lp: lp.get("line") or 0)
     if top:
         edges.append({"from": "entry", "to": f"L{top[0]['index']}", "kind": "st"})
         edges.append({"from": f"L{top[-1]['index']}", "to": "exit", "kind": "st"})
@@ -985,7 +983,9 @@ def _render_loop_deps(record: dict, mapped, lines: list[str]) -> None:
             note = f" (wrote {', '.join(ac['facts_from_predecessors'])})" if ac.get("facts_from_predecessors") else ""
             parts.append("assumes from " + ", ".join(_where(p) for p in ac["predecessors"]) + note)
         if oc.get("inner_loops"):
-            parts.append("must give inner loop(s) " + ", ".join(_where(n) for n in oc["inner_loops"]) + " a usable exit summary")
+            parts.append(
+                "must give inner loop(s) " + ", ".join(_where(n) for n in oc["inner_loops"]) + " a usable exit summary"
+            )
         if oc.get("successors"):
             parts.append("feeds " + ", ".join(_where(s) for s in oc["successors"]))
         lines.append(" - " + "; ".join(parts))

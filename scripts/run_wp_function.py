@@ -157,6 +157,16 @@ def _is_alloc_limitation_goal(item: dict) -> bool:
     return bool(_WP_ALLOC_UNSUPPORTED_RE.search(text))
 
 
+_POINTER_CAST_RE = re.compile(
+    r"\(\s*(?:const\s+)?(?:struct\s+|union\s+|enum\s+)?[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*\s*\*+\s*\)"
+)
+
+
+def _is_pointer_cast_goal(item: dict) -> bool:
+    """An unproven goal whose annotation casts between pointer types, e.g. `(void *)attr + 4`."""
+    return bool(_POINTER_CAST_RE.search(str(item.get("annotation") or "")))
+
+
 def _locate_agent_scratch_dir(c_file: Path, out_dir: Path) -> Path | None:
     """If `c_file` or `out_dir` is inside `.../agents/<agent_id>/scratch/...`, return that `scratch` dir."""
     for candidate in (c_file, out_dir):
@@ -520,15 +530,23 @@ def _loop_goal_strategies(unproven_goals: list[dict]) -> str | None:
     parts: list[str] = []
     for base, strats in sorted(per_inv.items()):
         if "weaken" in strats and "adjust" in strats:
-            parts.append(f"regenerate `{base}` (fails BOTH establishment and preservation: invalid, not just weak — drop it)")
+            parts.append(
+                f"regenerate `{base}` (fails BOTH establishment and preservation: invalid, not just weak — drop it)"
+            )
         elif "weaken" in strats:
-            parts.append(f"weaken `{base}` (fails establishment: false before the first iteration — relax it or add a 'requires' holding at loop entry)")
+            parts.append(
+                f"weaken `{base}` (fails establishment: false before the first iteration — relax it or add a 'requires' holding at loop entry)"
+            )
         elif "adjust" in strats:
-            parts.append(f"adjust `{base}` (fails preservation: not inductive across one iteration, or 'loop assigns' missing/too broad)")
+            parts.append(
+                f"adjust `{base}` (fails preservation: not inductive across one iteration, or 'loop assigns' missing/too broad)"
+            )
         else:
             parts.append(f"strengthen `{base}` (holds but too weak to imply the postcondition at loop exit)")
     for v in sorted(set(variant_goals)):
-        parts.append(f"fix progress for `{v}` (variant/measure does not strictly decrease — check the measure or add a progress guard, e.g. 'if (consumed == 0) return -1;')")
+        parts.append(
+            f"fix progress for `{v}` (variant/measure does not strictly decrease — check the measure or add a progress guard, e.g. 'if (consumed == 0) return -1;')"
+        )
     return "Failure-kind repair strategy: " + "; ".join(parts) + "."
 
 
@@ -996,6 +1014,7 @@ def run_wp_on_function(
     keep_goals: bool = False,
     wp_blockers: list[str] | None = None,
     ignore_prover_budget: bool = False,
+    retry_cast_probe: bool = True,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     par = resolve_wp_par(wp_par)
@@ -1008,7 +1027,7 @@ def run_wp_on_function(
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
     scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
-    if not artifact_suffix.endswith(("_retry", "_tail")):
+    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe")):
         if _is_synthetic_probe_file(c_file, scratch_dir):
             probe_msg = (
                 f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
@@ -1491,6 +1510,7 @@ def run_wp_on_function(
                 warn_unsigned_downcast=warn_unsigned_downcast,
                 retry_bitwise=False,
                 retry_tail=False,
+                retry_cast_probe=False,
                 smoke_tests=smoke_tests,
                 counter_examples=counter_examples,
                 prop=prop,
@@ -1568,6 +1588,7 @@ def run_wp_on_function(
                         warn_unsigned_downcast=warn_unsigned_downcast,
                         retry_bitwise=False,
                         retry_tail=False,
+                        retry_cast_probe=False,
                         smoke_tests=smoke_tests,
                         counter_examples=counter_examples,
                         prop=prop,
@@ -1653,8 +1674,7 @@ def run_wp_on_function(
         next_focus = "complete"
 
     model_goals = [
-        {"goal": m.group(1).strip(), "prover": m.group(2).strip()}
-        for m in _MODEL_GOAL_RE.finditer(combined_log)
+        {"goal": m.group(1).strip(), "prover": m.group(2).strip()} for m in _MODEL_GOAL_RE.finditer(combined_log)
     ]
 
     res = {
@@ -1703,6 +1723,55 @@ def run_wp_on_function(
         res["unframed_variadic_callees"] = unframed_var_callees
     if all_unproven_are_alloc:
         res["wp_allocation_limitation"] = True
+    if (
+        retry_cast_probe
+        and status == "unproven_goals_remain"
+        and not prop
+        and not dump_goal
+        and soundness["ok"]
+        and not model_parts & {"cast", "nocast", "bytes"}
+        and any(_is_pointer_cast_goal(g) for g in unproven_goals)
+    ):
+        # Diagnostic only: `cast` is the unsound model (WP manual, Section Memory models), so its result is never
+        # promoted. It tells a memory-model limit from a contract that is simply too weak.
+        try:
+            probe = run_wp_on_function(
+                c_file=c_file,
+                fn_name=fn_name,
+                out_dir=out_dir,
+                machdep=machdep,
+                cppflags=cppflags,
+                provers=provers,
+                wp_par=par,
+                timeout=timeout,
+                wp_steps=wp_steps,
+                wp_model="Typed+cast",
+                check_memory_model=check_memory_model,
+                warn_invalid_pointer=warn_invalid_pointer,
+                unsigned_reduced=unsigned_reduced,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+                retry_bitwise=False,
+                retry_tail=False,
+                retry_cast_probe=False,
+                smoke_tests=False,
+                extra_sources=extra_sources,
+                wall_timeout=wall_timeout,
+                artifact_suffix=f"{artifact_suffix}_castprobe",
+                cache_dir="off",
+            )
+        except Exception as exc:  # a failed probe never changes the real result
+            probe = {"status": "probe_error", "reason": f"{type(exc).__name__}: {exc}"}
+        proves_all = probe.get("status") == "all_proven"
+        res["cast_model_probe"] = {
+            "wp_model": "Typed+cast",
+            "status": probe.get("status"),
+            "unproven_count": probe.get("unproven_count"),
+            "proves_all": proves_all,
+            "evidence": False,  # unsound model: never credited as a proof
+        }
+        if proves_all:
+            res["wp_cast_limitation"] = True
+            res["next_synthesis_focus"] = "wp_typed_cast_limitation_stop_now"
     if _WHY3_MEMADDR_ERR_RE.search(combined_log):
         res["wp_why3_memaddr_limitation"] = True
     if soundness.get("macro_loop_warnings"):

@@ -114,9 +114,7 @@ def test_framac_skills_mirror_is_in_sync():
     repo_root = DEFAULT_ROOT.parent.parent
     skills_dir = repo_root / "skills"
     primary = {
-        p.relative_to(skills_dir).as_posix(): p.read_bytes()
-        for p in sorted(skills_dir.rglob("*"))
-        if p.is_file() and p.relative_to(skills_dir).parts[0].startswith("framac-")
+        p.relative_to(skills_dir).as_posix(): p.read_bytes() for p in sorted(skills_dir.rglob("*")) if p.is_file()
     }
     skill_names = sorted({Path(k).parts[0] for k in primary})
     for mirror in (repo_root / ".agents" / "skills", repo_root / ".claude" / "skills"):
@@ -124,10 +122,20 @@ def test_framac_skills_mirror_is_in_sync():
             continue
         entries = sorted(p.name for p in mirror.iterdir())
         assert entries == skill_names, f"{mirror} must contain exactly the skills/ entries as symlinks"
+        symlinks = 0
         for name in skill_names:
             link = mirror / name
-            assert link.is_symlink(), f"{link} must be a symlink to skills/{name}"
-            assert link.resolve() == (skills_dir / name).resolve(), f"{link} must point at skills/{name}"
+            if link.is_symlink():
+                symlinks += 1
+                assert link.resolve() == (skills_dir / name).resolve(), f"{link} must point at skills/{name}"
+            else:
+                # core.symlinks=false (the Windows default): git checks a symlink out as a plain file
+                # holding its target path, which is still what the repository records.
+                assert link.is_file(), f"{link} must be a symlink to skills/{name}"
+                target = link.read_text(encoding="utf-8").strip()
+                assert target == f"../../skills/{name}", f"{link} must point at skills/{name}"
+        if symlinks != len(skill_names):
+            continue  # no real links to walk: the targets were checked above
         # Content through the links matches the primary (rglob does not follow symlinked dirs,
         # so walk each link's target explicitly).
         mirrored = {}

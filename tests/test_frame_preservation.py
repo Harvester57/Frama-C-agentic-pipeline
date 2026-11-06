@@ -48,17 +48,11 @@ def test_extract_frame_clauses_parses_separated_assigns_and_from() -> None:
     )
     clauses = extract_frame_clauses(acsl)
     assert clauses["separated"] == [["buf + (0 .. len - 1)", "out"]]
-    assert clauses["assigns"] == [
-        {"locs": ["*out"], "from": ["buf + (0 .. len - 1)", "len"], "from_nothing": False}
-    ]
+    assert clauses["assigns"] == [{"locs": ["*out"], "from": ["buf + (0 .. len - 1)", "len"], "from_nothing": False}]
 
 
 def test_extract_frame_clauses_skips_loop_assigns_and_handles_nothing() -> None:
-    acsl = (
-        "loop assigns i, acc, dst[0 .. n - 1];\n"
-        "assigns \\nothing;\n"
-        "assigns g \\from \\nothing;\n"
-    )
+    acsl = "loop assigns i, acc, dst[0 .. n - 1];\nassigns \\nothing;\nassigns g \\from \\nothing;\n"
     clauses = extract_frame_clauses(acsl)
     assert clauses["separated"] == []
     assert clauses["assigns"] == [
@@ -73,10 +67,7 @@ def test_extract_frame_clauses_handles_multiple_separated_args() -> None:
 
 
 def test_check_accepts_verbatim_and_stronger_candidates() -> None:
-    verbatim = (
-        "requires \\separated(buf + (0 .. len - 1), out);\n"
-        "assigns *out \\from buf + (0 .. len - 1), len;\n"
-    )
+    verbatim = "requires \\separated(buf + (0 .. len - 1), out);\nassigns *out \\from buf + (0 .. len - 1), len;\n"
     assert check_frame_preserved(SKELETON, verbatim) == []
     stronger = (
         "requires \\separated(buf + (0 .. len - 1), out, other);\n"
@@ -153,11 +144,7 @@ GOOD_H = BASELINE_H.replace(
 
 WEAK_H = BASELINE_H.replace(
     "int parse_payload(const uint8_t *buf, size_t len, int *out);",
-    "/*@\n"
-    "  requires \\valid(out);\n"
-    "  assigns *out;\n"
-    "*/\n"
-    "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+    "/*@\n  requires \\valid(out);\n  assigns *out;\n*/\nint parse_payload(const uint8_t *buf, size_t len, int *out);",
 )
 
 

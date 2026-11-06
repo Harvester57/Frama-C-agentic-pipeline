@@ -160,7 +160,11 @@ def _region(record: dict, root: str, loops: list[dict]) -> tuple[str, bool, str 
         else:
             unknown = True
     if unknown:
-        return root, False, f"access window of `{root}` is not fully entry-expressible; `{root}` alone is an approximation"
+        return (
+            root,
+            False,
+            f"access window of `{root}` is not fully entry-expressible; `{root}` alone is an approximation",
+        )
     if ranges:
         # Deterministic pick: the first range in source order; note when several differ.
         bound, incl = ranges[0]

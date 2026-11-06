@@ -647,6 +647,31 @@ def test_negotiation_requeues_the_caller_and_is_capped_per_pair(sim):
     assert "cap" in reqs[-1]["resolution_note"]
 
 
+def test_a_callee_that_keeps_stalling_is_negotiated_a_bounded_number_of_times(sim):
+    callers = {f"f{i}": (f"src/m/f{i}.c", "m", ["g"]) for i in range(1, 6)}
+    sim.build({**callers, "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    handed = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "prove"]
+    assert len(handed) >= 4, "the sim must hand the callers out together"
+    capped: list[dict] = []
+    for n, task in enumerate(handed[:4], start=1):
+        aid, fn = task["agent_id"], task["function"]
+        sim.prover(aid, fn, f"src/m/{fn}.c", status="stalled_after_k_retries", requests=[request("g", n)])
+        out = S.cmd_complete(aid)
+        capped += out.get("negotiations_capped") or []
+        if n <= 3:
+            assert "negotiate:src/m/g.c#g" in out["new_tasks"]
+            neg = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "negotiate"][0]
+            sim.prover(neg["agent_id"], "g", "src/m/g.c", status="stalled_after_k_retries")
+            assert S.cmd_complete(neg["agent_id"])["action"] == "negotiation_rejected"
+    assert [c["callee"] for c in capped] == ["src/m/g.c#g"]  # the fourth request is refused without a round
+    assert tasks()["negotiate:src/m/g.c#g"]["dispatches"] == 3
+    reqs = load("workspace/reports/strengthen_requests.json")["requests"]
+    assert "cap" in reqs[-1]["resolution_note"] and reqs[-1]["status"] == "rejected_by_callee"
+
+
 def test_requests_arriving_during_a_negotiation_start_a_follow_up_round(sim):
     sim.build({"f": ("src/m/f.c", "m", ["g"]), "h": ("src/m/h.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
     S.cmd_init()
@@ -1304,6 +1329,141 @@ def test_stalled_prover_with_sound_contract_triggers_partial_merge(sim, monkeypa
     assert t_callee["state"] == "blocked"
     assert t_callee.get("partial_contract_merged") is True
     assert "prove:src/m/p.c#caller" in ready()
+
+
+def _negotiate_partial_fixture(
+    sim,
+    *,
+    unproven_kind="pointer_value",
+    guard="passed_dynamic_oracle",
+    guard_reach=12,
+    eva_unknown_kind=None,
+    eva_invalid=False,
+):
+    """A stalled negotiate task whose contract is on the header prototype, with the report/guard/Eva evidence."""
+    aid = "negotiate-callee"
+    task = {
+        "id": "negotiate:src/m/p.c#callee",
+        "kind": "negotiate",
+        "function": "callee",
+        "file": "src/m/p.c",
+        "header": "src/m/m.h",
+        "module": "m",
+        "callers": ["prove:src/m/p.c#caller"],
+    }
+    scratch = sim.run_dir / f"agents/{aid}/scratch"
+    (scratch / "work/src/m").mkdir(parents=True)
+    (scratch / "work/src/m/p.c").write_text("int callee(int x) { return x; }\n", encoding="utf-8")
+    (scratch / "work/src/m/m.h").write_text(
+        "/*@ requires x >= 0;\n  @ assigns \\nothing;\n  @ ensures \\result == x;\n  @*/\nint callee(int x);\n",
+        encoding="utf-8",
+    )
+    write_json(
+        scratch / "guard_callee.json",
+        {"status": guard, "reach": {"measured": True, "functions": {"callee": guard_reach}, "unreached": []}},
+    )
+    # WP files an RTE goal on a `return` expression under the postcondition bucket: the kind decides.
+    goal = {
+        "kind": unproven_kind,
+        "line": 1,
+        "obligation_class": "rte",
+        "diagnostic_bucket": "step_c_contract_postcondition",
+    }
+    report = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "assigns_vcs_proven": True,
+        "unproven_goals": [goal],
+        "unproven_by_bucket": {
+            "step_a_assigns": [],
+            "step_b_loop_invariant": [],
+            "step_c_rte_obligation": [],
+            "step_c_caller_precondition": [],
+            "step_c_contract_postcondition": [goal],
+        },
+    }
+    eva = {
+        "unknown_obligations_by_function": (
+            {"callee": [{"file": "src/m/p.c", "kind": eva_unknown_kind, "function": "callee"}]}
+            if eva_unknown_kind
+            else {}
+        ),
+        "invalid_alarms": [{"file": "src/m/p.c", "kind": "pointer_value", "function": "callee"}] if eva_invalid else [],
+    }
+    write_json(sim.run_dir / "workspace/reports/eva/m.json", eva)
+    return task, aid, report
+
+
+def test_stalled_negotiation_with_rte_only_unproven_goals_merges_its_header_contract(sim):
+    task, aid, report = _negotiate_partial_fixture(sim)
+    job = S._partial_contract_merge_job(task, aid, report, S.Ctx())
+    assert job is not None
+    assert job["prove_task"] == "prove:src/m/p.c#callee"
+    assert job["requeue_callers"] == ["prove:src/m/p.c#caller"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"unproven_kind": "postcondition"},  # a strengthened postcondition WP could not prove
+        {"unproven_kind": "assigns clause"},
+        {"guard": "code_fault"},
+        {"guard_reach": 0},  # passed, but the function never ran: no dynamic evidence for its contract
+        {"eva_unknown_kind": "pointer_value"},  # Eva did not discharge the kind WP left open
+        {"eva_invalid": True},
+    ],
+)
+def test_stalled_negotiation_without_the_stronger_evidence_does_not_merge(sim, kwargs):
+    task, aid, report = _negotiate_partial_fixture(sim, **kwargs)
+    assert S._partial_contract_merge_job(task, aid, report, S.Ctx()) is None
+
+
+def test_stalled_prover_with_a_cast_limitation_is_labelled_in_its_reason(sim):
+    sim.build({"callee": ("src/m/p.c", "m", [])})
+    S.cmd_init()
+    nxt = S.cmd_next("auto", prepare=True)
+    aid = [t for t in nxt["tasks"] if t["task"] == "prove:src/m/p.c#callee"][0]["agent_id"]
+    scratch = sim.run_dir / f"agents/{aid}/scratch"
+    report_rel = f"agents/{aid}/scratch/wp_callee.json"
+    write_json(
+        sim.run_dir / report_rel,
+        {
+            "status": "unproven_goals_remain",
+            "function": "callee",
+            "soundness": {"ok": True},
+            "wp_cast_limitation": True,
+            "cast_model_probe": {"wp_model": "Typed+cast", "proves_all": True, "evidence": False},
+            "unproven_by_bucket": {"step_c_rte_obligation": [{"kind": "pointer_value"}]},
+            "unproven_goals": [{"kind": "pointer_value", "annotation": "\\object_pointer((void *)attr + 4)"}],
+        },
+    )
+    write_json(
+        scratch / "result.json",
+        {
+            "role": "prover",
+            "agent_id": aid,
+            "file": "src/m/p.c",
+            "function": "callee",
+            "status": "stalled_after_k_retries",
+            "patch": None,
+            "evidence": [{"tool_output": report_rel, "result": "unproven_goals_remain"}],
+            "unproven_goals": [{"line": 1, "annotation": "pointer_value"}],
+            "strengthening_requests": [],
+            "boundary_assumptions": [],
+            "fault_hypothesis": None,
+        },
+    )
+    sim.modified[aid] = ["src/m/p.c"]
+    S.cmd_complete(aid)
+    task = tasks()["prove:src/m/p.c#callee"]
+    assert task["state"] == "blocked"
+    assert task["last_reason"].startswith("wp_typed_cast_limit:")
+
+
+def test_stalled_negotiation_needs_a_guard_report(sim):
+    task, aid, report = _negotiate_partial_fixture(sim)
+    (sim.run_dir / f"agents/{aid}/scratch/guard_callee.json").unlink()
+    assert S._partial_contract_merge_job(task, aid, report, S.Ctx()) is None
 
 
 def test_deep_and_quick_profile_scheduling(sim):

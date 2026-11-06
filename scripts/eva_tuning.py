@@ -589,6 +589,7 @@ class Tuner:
             timeout=timeout or a.timeout or TRIAL_TIMEOUT_CEILING_S,
             extra_domains=a.extra_domains,
             allow_incomplete_recursion_specs=a.allow_incomplete_recursion_specs,
+            warn_unsigned_downcast=not a.no_warn_unsigned_downcast,
             eva_options=options,
             loop_unroll=refs,
             # Fixed by the annotation set, so the same set is one cache entry under any trial's name.
@@ -800,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
     p_finish.add_argument("--mlevel", type=int, default=0)
     p_finish.add_argument("--extra-domains", default="")
     p_finish.add_argument("--allow-incomplete-recursion-specs", action="store_true")
+    p_finish.add_argument("--no-warn-unsigned-downcast", action="store_true")
     p_finish.add_argument("--timeout", type=int, default=None, help="Seconds for each loop trial")
     p_finish.add_argument("--settings-digest", required=True, help="Digest of the module settings (pipeline_make.py)")
     p_finish.add_argument("--rungs", nargs="*", default=[], help="Names of the finished rung trials, in ladder order")
