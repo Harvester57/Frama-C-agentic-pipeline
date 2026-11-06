@@ -84,7 +84,12 @@ def test_run_mutation_check_with_injected_runner(tmp_path: Path) -> None:
     def fake_runner(c_file, fn, out_dir, cppflags="-I."):
         calls.append((c_file.name, fn))
         text = Path(c_file).read_text(encoding="utf-8")
-        if "ensures \\true;" in text or "*out < n" in text or "ensures *out >= 0;" not in text or "ensures *out <= n;" not in text:
+        if (
+            "ensures \\true;" in text
+            or "*out < n" in text
+            or "ensures *out >= 0;" not in text
+            or "ensures *out <= n;" not in text
+        ):
             return {"status": "unproven_goals_remain"}  # spec mutant not equivalent
         if "i <= n" in text or "return 1;" in text:
             return {"status": "unproven_goals_remain", "unproven_goals": [{"kind": "ensures", "status": "Invalid"}]}
@@ -118,9 +123,18 @@ def test_report_spec_quality_section(tmp_path: Path) -> None:
     )
     data = {
         "run_dir": run_dir,
-        "meta": {"run_id": "r", "repo": "x", "target": "t", "source_ref": {"vcs": "git", "commit": "c"},
-                 "run_status": "complete", "profile": "default", "scope_paths": [], "budget": None,
-                 "sandbox": {"outer": "o", "inner": "i"}, "prior_runs": []},
+        "meta": {
+            "run_id": "r",
+            "repo": "x",
+            "target": "t",
+            "source_ref": {"vcs": "git", "commit": "c"},
+            "run_status": "complete",
+            "profile": "default",
+            "scope_paths": [],
+            "budget": None,
+            "sandbox": {"outer": "o", "inner": "i"},
+            "prior_runs": [],
+        },
         "ledger": [
             {"coverage_id": "m.c#sum::rte", "status": "open", "function": "sum", "assumptions": []},
             {"coverage_id": "m.c#g::rte", "status": "open", "function": "g", "assumptions": []},

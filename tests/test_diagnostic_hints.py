@@ -117,10 +117,20 @@ def test_wp_hints_loop_dependency_slice_names_the_inner_loop(tmp_path: Path) -> 
     facts_dir.mkdir()
     record = {
         "loops": [
-            {"index": 0, "parent": None, "line": 5, "assumption_context": {"predecessors": ["entry"]},
-             "obligation_context": {"successors": ["L1", "exit"], "inner_loops": ["L1"], "written": ["up"]}},
-            {"index": 1, "parent": 0, "line": 8, "assumption_context": {"predecessors": ["L0"]},
-             "obligation_context": {"successors": [], "inner_loops": [], "written": ["down"]}},
+            {
+                "index": 0,
+                "parent": None,
+                "line": 5,
+                "assumption_context": {"predecessors": ["entry"]},
+                "obligation_context": {"successors": ["L1", "exit"], "inner_loops": ["L1"], "written": ["up"]},
+            },
+            {
+                "index": 1,
+                "parent": 0,
+                "line": 8,
+                "assumption_context": {"predecessors": ["L0"]},
+                "obligation_context": {"successors": [], "inner_loops": [], "written": ["down"]},
+            },
         ]
     }
     (facts_dir / "m.json").write_text(

@@ -253,10 +253,10 @@ def fix_readonly_scalar_globals(c_text: str) -> tuple[str, int]:
     runtime expects. Arrays and structs already carry `&`/a decayed address and
     do not match this pattern. Returns the new text and the number of fixes.
     """
+
     def _repl(match: re.Match[str]) -> str:
         return (
-            f"{match.group('store')}{match.group('indent')}"
-            f"__e_acsl_mark_readonly((void *)(& {match.group('name')}));"
+            f"{match.group('store')}{match.group('indent')}__e_acsl_mark_readonly((void *)(& {match.group('name')}));"
         )
 
     return _READONLY_SCALAR_RE.subn(_repl, c_text)
