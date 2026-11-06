@@ -1579,8 +1579,13 @@ def _unwrap_command(cmd: str) -> str:
 _SHELL_SHEBANG_RE = re.compile(r"#!\s*(?:\S*/)?(?:env\s+(?:-\S+\s+)*)?(?:ba|da)?sh(?:\s|$)")
 
 
-def _extract_script_paths(cmd: str) -> list[tuple[Path, bool]]:
-    """Path-like tokens of `cmd`, each with whether a `bash`/`sh` token names it as the script to run."""
+def _extract_script_paths(cmd: str, base_dir: Path | str | None = None) -> list[tuple[Path, bool]]:
+    """Path-like tokens of `cmd`, each with whether a `bash`/`sh` token names it as the script to run.
+
+    Relative paths are resolved against `base_dir` first (the run directory), because a subagent
+    often writes `agents/<id>/scratch/run_wp.sh` and invokes it from the host wrapper, whose own
+    working directory is the pipeline checkout rather than the run directory.
+    """
     paths: list[tuple[Path, bool]] = []
     token_lists: list[list[str]] = []
     try:
@@ -1588,6 +1593,14 @@ def _extract_script_paths(cmd: str) -> list[tuple[Path, bool]]:
     except ValueError:
         pass
     token_lists.append(cmd.split())
+
+    def resolve(cand: str) -> Path:
+        path = Path(cand)
+        if base_dir and not path.is_absolute():
+            candidate = Path(base_dir) / path
+            if candidate.is_file():
+                return candidate
+        return path
 
     seen: set[str] = set()
     for tokens in token_lists:
@@ -1599,7 +1612,7 @@ def _extract_script_paths(cmd: str) -> list[tuple[Path, bool]]:
                         cand = next_tok.strip("\"'")
                         if cand not in seen:
                             seen.add(cand)
-                            paths.append((Path(cand), True))
+                            paths.append((resolve(cand), True))
                         break
             elif (
                 clean_tok.endswith(".sh")
@@ -1609,11 +1622,11 @@ def _extract_script_paths(cmd: str) -> list[tuple[Path, bool]]:
             ):
                 if clean_tok not in seen:
                     seen.add(clean_tok)
-                    paths.append((Path(clean_tok), False))
+                    paths.append((resolve(clean_tok), False))
     return paths
 
 
-def infer_class(cmd: str) -> str:
+def infer_class(cmd: str, base_dir: Path | str | None = None) -> str:
     """Job class of a container command line (sizing only; never a security decision)."""
     unwrapped = _unwrap_command(cmd or "")
     matched = _match_class_patterns(unwrapped)
@@ -1622,7 +1635,7 @@ def infer_class(cmd: str) -> str:
 
     # Check if the command runs an on-disk shell script file. Other files are not scanned: a pipeline
     # script's own source, or a report passed as an argument, can mention commands it does not run.
-    for p, run_by_shell in _extract_script_paths(unwrapped):
+    for p, run_by_shell in _extract_script_paths(unwrapped, base_dir=base_dir):
         try:
             if p.is_file():
                 content = p.read_text(encoding="utf-8", errors="replace")[:65536]
@@ -3118,7 +3131,7 @@ def cmd_exec(argv: list[str]) -> int:
         parser.error(f"{clash} is managed by the broker; pass --cpus/--memory/--pids-limit to exec instead")
     command = os.environ.get("FRAMAC_CONTAINER_CMD")
     if args.cls in ("", "auto"):
-        cls_name = infer_class(command or "")
+        cls_name = infer_class(command or "", base_dir=args.run_dir)
         cls = CLASSES[cls_name]
         runs_target_code = cls.runs_target_code or not is_known_static_command(command)
     else:

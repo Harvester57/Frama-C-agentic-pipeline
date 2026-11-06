@@ -234,6 +234,34 @@ def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
     return "\n".join(out), count
 
 
+_READONLY_SCALAR_RE = re.compile(
+    r"(?P<store>^[ \t]*__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+UL\);\n"
+    r"[ \t]*__e_acsl_full_init\(\(void \*\)\(& ?(?P=name)\)\);\n)"
+    r"(?P<indent>[ \t]*)__e_acsl_mark_readonly\(\(void \*\)(?P=name)\);",
+    re.MULTILINE,
+)
+
+
+def fix_readonly_scalar_globals(c_text: str) -> tuple[str, int]:
+    """
+    Work around an E-ACSL printer bug on scalar `const` globals: it emits
+    `__e_acsl_mark_readonly((void *)<value>)` instead of taking the address.
+    The value is then treated as an address by the runtime predicate, which
+    aborts before any input is processed (e.g. libcbor's
+    `const uint64_t kMaxEmbeddedInt = 23;` -> invalid address 0x17).
+    Replace the call with the address of the same global, which is what the
+    runtime expects. Arrays and structs already carry `&`/a decayed address and
+    do not match this pattern. Returns the new text and the number of fixes.
+    """
+    def _repl(match: re.Match[str]) -> str:
+        return (
+            f"{match.group('store')}{match.group('indent')}"
+            f"__e_acsl_mark_readonly((void *)(& {match.group('name')}));"
+        )
+
+    return _READONLY_SCALAR_RE.subn(_repl, c_text)
+
+
 _STRTO_CALL_RE = re.compile(r"\b(?:strto\w*|wcsto\w*)\s*\(")
 _SOUND_VERDICT_RESET_RE = re.compile(r"\b__e_acsl_sound_verdict\s*=\s*0\s*;")
 _FUZZER_TEST_ONE_INPUT_DEF_RE = re.compile(

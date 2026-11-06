@@ -72,6 +72,7 @@ from eacsl_toolchain import (  # noqa: E402
     build_eacsl_flag_sets,
     build_fallback_object,
     defines_fuzzer_initialize,
+    fix_readonly_scalar_globals,
     is_eacsl_instrumented,
     mark_wrapper_results_initialized,
     normalize_passthrough,
@@ -894,6 +895,15 @@ def _compile_eacsl_binary_uncached(
                         f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
                         "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n"
                     )
+
+            c_text, n_readonly = fix_readonly_scalar_globals(c_text)
+            if n_readonly:
+                c_modified = True
+                result["readonly_scalar_global_fixes"] = n_readonly
+                log_parts.append(
+                    f"Fixed {n_readonly} E-ACSL readonly mark(s) for scalar const globals "
+                    "(the printer passed the value instead of its address).\n"
+                )
 
             c_text, n_rewrites = rewrite_sound_verdict_resets(c_text)
             if n_rewrites:
