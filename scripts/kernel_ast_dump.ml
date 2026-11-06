@@ -266,7 +266,7 @@ type ctx = {
   mutable loops : loop_rec list; (* newest first *)
   mutable loop_stack : loop_rec list; (* innermost first *)
   mutable calls : json list;
-  mutable writes : (string * access) list;
+  mutable writes : (string * access * string list ref) list; (* lval -> access + RHS values seen *)
   mutable reads : (string * access) list;
   mutable paths : json list;
   mutable n_paths : int;
@@ -299,7 +299,16 @@ let record_write ctx line (lv : lval) (value : string option) =
   let acc = access_of lv line in
   if is_memory_access lv then begin
     let w = ref ctx.writes in
-    if List.length !w < max_items then add_unique w acc.a_lval acc else ctx.truncated <- true;
+    (match List.find_opt (fun (k, _, _) -> k = acc.a_lval) !w with
+     | Some (_, _, vs) ->
+       (* Same lval written again (another path/iteration): keep its other RHS values too. *)
+       (match value with
+        | Some v when (not (List.mem v !vs)) && List.length !vs < 3 -> vs := !vs @ [ v ]
+        | _ -> ())
+     | None ->
+       if List.length !w < max_items then
+         w := (acc.a_lval, acc, ref (match value with Some v -> [ v ] | None -> [])) :: !w
+       else ctx.truncated <- true);
     ctx.writes <- !w
   end;
   let is_temp = match lv with Var v, NoOffset -> v.vtemp | _ -> false in
@@ -662,6 +671,11 @@ let access_json (a : access) =
   O [ ("lval", S a.a_lval); ("base", S a.a_base); ("base_kind", S a.a_kind);
       ("base_temp", B a.a_temp); ("through_pointer", B a.a_ptr); ("loc", S a.a_line) ]
 
+let write_json (a : access) (values : string list) =
+  O [ ("lval", S a.a_lval); ("base", S a.a_base); ("base_kind", S a.a_kind);
+      ("base_temp", B a.a_temp); ("through_pointer", B a.a_ptr); ("loc", S a.a_line);
+      ("values", L (List.map (fun v -> S v) values)) ]
+
 let hashtbl_sorted tbl key_of =
   List.sort (fun a b -> compare (key_of a) (key_of b)) (Hashtbl.fold (fun _ v acc -> v :: acc) tbl [])
 
@@ -725,7 +739,7 @@ let function_json kf =
       ("formals", L (List.map formal_json (Kernel_function.get_formals kf)));
       ("loops", L (List.rev_map loop_json ctx.loops));
       ("calls", L (List.rev ctx.calls));
-      ("writes", L (List.rev_map (fun (_, a) -> access_json a) ctx.writes));
+      ("writes", L (List.rev_map (fun (_, a, vs) -> write_json a !vs) ctx.writes));
       ("reads", L (List.rev_map (fun (_, a) -> access_json a) ctx.reads));
       ("return_paths", L (List.rev ctx.paths));
       ("derived_pointers", L derived);

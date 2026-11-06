@@ -43,10 +43,13 @@ import function_slice  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
     ScopeViolationError,
+    check_frame_preserved,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
+    locate_function_span,
     splice_architect_header,
     splice_prover_changes,
+    tokenize_c_acsl,
     verify_acsl_only,
 )
 from framac_common import (  # noqa: E402
@@ -937,6 +940,26 @@ def merge_agent_overlay(
         return res
 
 
+def _function_frame_skeleton(overlay: Path, module: str | None, c_file: str | None, function: str | None) -> dict | None:
+    """The projected frame skeleton of `function` from the module's facts, or None (fail-open)."""
+    if not (module and c_file and function):
+        return None
+    record = function_facts.load_function_facts(overlay, module, c_file, function)
+    if not isinstance(record, dict):
+        return None
+    skel = record.get("frame_skeleton")
+    return skel if isinstance(skel, dict) else None
+
+
+def _acsl_text_of_span(span) -> str:
+    """The ACSL comment texts inside a function span (its contract and body annotations)."""
+    try:
+        tokens = tokenize_c_acsl(span.text, path=span.function)
+    except AcslError:
+        return ""
+    return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
+
+
 def _merge_agent_overlay_locked(
     run_dir: Path,
     agent_id: str,
@@ -1025,6 +1048,10 @@ def _merge_agent_overlay_locked(
     new_contents: dict[str, str] = {}
     deduplicated_declarations: list[str] = []
 
+    frame_skel = (
+        _function_frame_skeleton(overlay, module, norm_c_file, function) if role == "prover" and function else None
+    )
+
     for rel_str in changed_rels:
         try:
             curr_file = shared_work / rel_str
@@ -1093,6 +1120,20 @@ def _merge_agent_overlay_locked(
         if merged_errs:
             raise AcslError(f"Merged ACSL-only check failed on {rel_str}:\n  " + "\n  ".join(merged_errs))
         new_contents[rel_str] = spliced
+
+    if frame_skel is not None:
+        # The projected frame skeleton is a required minimum: a prover candidate that deletes
+        # or weakens a projected \separated / assigns...\from clause is rejected. The contract
+        # may live in the .c or the .h, so check the ACSL of the function's span across all
+        # spliced files together.
+        frame_parts: list[str] = []
+        for rel_str in changed_rels:
+            span = locate_function_span(new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str)
+            if span is not None:
+                frame_parts.append(_acsl_text_of_span(span))
+        frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
+        if frame_errs:
+            raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
 
     patch_stem = function if role == "prover" and function else Path(norm_header_file or "header").stem
     patch_path = artifacts_dir / f"{patch_stem}.patch"

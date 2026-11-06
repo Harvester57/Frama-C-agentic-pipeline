@@ -49,6 +49,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    - Write `loop assigns i, acc, out_buf[0 .. len - 1];` for every loop, innermost loops first.
 <!-- endif -->
    - **`assigns \nothing;` Purity Rule:** Write `assigns \nothing;` **ONLY** for pure functions whose body has zero pointer dereference writes (`*p = ...`, `p[i] = ...`), zero global variable writes, zero `memset`/`memcpy` calls, and zero `malloc`/`calloc`/`realloc`/`free` calls. Never write `assigns \nothing;` on a function that allocates, frees, or mutates pointed-to memory.
+   - **Projected frame skeleton (when the Deterministic Function Context above shows one):** the `requires \separated(...);` and `assigns ... \from ...;` clauses listed there are a deterministic minimum projected from the kernel AST and Eva's dependence sets. Include each of them verbatim or stronger in the contract — never delete or weaken one (the parent's merge check rejects a candidate that drops a projected clause). WP still judges whether each clause holds; restate Eva-harness locations over the formals as usual.
 <!-- if: indirect_calls -->
    - For functions with indirect calls (`fp(...)` or `ops->cb(...)`), annotate the call site with `//@ calls f1, f2;` or precede it with `//@ assert fp \in {&f1, &f2};` so `-rte` generates guards and WP does not abort on missing `calls`.
 <!-- endif -->

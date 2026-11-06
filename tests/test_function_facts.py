@@ -930,6 +930,85 @@ def test_context_switch_for_ab_comparisons(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 # ---------------------------------------------------------------------------
+# Projected frame skeleton (AutoFraming-style)
+# ---------------------------------------------------------------------------
+
+
+def test_record_carries_a_frame_skeleton() -> None:
+    raw = _raw(
+        "parse_value",
+        "m.c:1",
+        formals=[
+            _formal("buf", "pointer", "uint16_t"),
+            _formal("len"),
+            _formal("eaten", "pointer", "uint16_t"),
+        ],
+        writes=[_access("*eaten", "eaten")],
+        reads=[_access("*(buf + 0)", "buf"), _access("*(buf + 1)", "buf")],
+        return_paths=[
+            {"value": "-1", "conditions": ["len < 2", "buf == (uint16_t *)0", "eaten == (uint16_t *)0"]},
+            {"value": "0", "conditions": []},
+        ],
+    )
+    rec = _record(raw, "int parse_value(const uint16_t *buf, uint16_t len, uint16_t *eaten) {\n  return 0;\n}\n")
+    skel = rec["frame_skeleton"]
+    assert skel["status"] == "ok"
+    assert skel["separated"][0]["clause"] == "requires \\separated(buf + (0 .. 1), eaten);"
+    assert skel["assigns"][0]["clause"] == "assigns *eaten \\from buf + (0 .. 1), len;"
+
+
+def test_section_renders_the_projected_skeleton_as_a_required_minimum() -> None:
+    raw = _raw(
+        "parse_value",
+        "m.c:1",
+        formals=[
+            _formal("buf", "pointer", "uint16_t"),
+            _formal("len"),
+            _formal("eaten", "pointer", "uint16_t"),
+        ],
+        writes=[_access("*eaten", "eaten")],
+        reads=[_access("*(buf + 0)", "buf"), _access("*(buf + 1)", "buf")],
+        return_paths=[{"value": "-1", "conditions": ["len < 2"]}, {"value": "0", "conditions": []}],
+    )
+    rec = _record(raw, "int parse_value(const uint16_t *buf, uint16_t len, uint16_t *eaten) {\n  return 0;\n}\n")
+    section = ff.render_section(rec, function="parse_value")
+    assert "**Projected frame skeleton**" in section
+    assert "`requires \\separated(buf + (0 .. 1), eaten);`" in section
+    assert "`assigns *eaten \\from buf + (0 .. 1), len;`" in section
+    assert "REQUIRED minimum" in section
+    assert "merge check rejects" in section
+
+
+def test_section_omits_the_skeleton_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FRAMAC_FRAME_SKELETON", "off")
+    raw = _raw(
+        "parse_value",
+        "m.c:1",
+        formals=[_formal("buf", "pointer", "uint16_t"), _formal("len"), _formal("eaten", "pointer", "uint16_t")],
+        writes=[_access("*eaten", "eaten")],
+        reads=[_access("*(buf + 0)", "buf")],
+    )
+    rec = _record(raw, "int parse_value(const uint16_t *buf, uint16_t len, uint16_t *eaten) {\n  return 0;\n}\n")
+    assert rec["frame_skeleton"] == {"status": "disabled"}
+    assert "Projected frame skeleton" not in ff.render_section(rec, function="parse_value")
+
+
+def test_function_level_writes_carry_their_rhs_values() -> None:
+    raw = _raw(
+        "f",
+        "m.c:1",
+        formals=[_formal("buf", "pointer", "uint16_t"), _formal("eaten", "pointer", "uint16_t")],
+        writes=[_write("*eaten", "eaten", values=["*(buf + 0) + *(buf + 1)"])],
+        reads=[_access("*(buf + 0)", "buf"), _access("*(buf + 1)", "buf")],
+    )
+    rec = _record(raw, "int f(const uint16_t *buf, uint16_t *eaten) {\n  return 0;\n}\n")
+    assert rec["writes"][0]["values"] == ["*(buf + 0) + *(buf + 1)"]
+    # ... and the skeleton uses them for a precise \from instead of the read-root superset.
+    assert rec["frame_skeleton"]["assigns"][0]["source"] == "ast"
+    assert rec["frame_skeleton"]["assigns"][0]["from"] == ["buf + (0 .. 1)"]
+
+
+# ---------------------------------------------------------------------------
 # The real tools, when they are installed
 # ---------------------------------------------------------------------------
 
@@ -1013,6 +1092,10 @@ def test_real_kernel_dump(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert copy_buf["loops"][0]["guard"] == "i < n"
     assert {w["root"] for w in copy_buf["writes"]} == {"dst", "g_state"}
     assert copy_buf["may_alias"][0]["written"] == ["dst"]
+    # The dump carries RHS expressions on function-level writes (straight-line included).
+    by_root = {w["root"]: w for w in copy_buf["writes"]}
+    assert any("src" in v for v in by_root["dst"].get("values", []))
+    assert any("n" in v for v in by_root["g_state"].get("values", []))
 
     assert fns["m.c#sum_rec"]["recursion"]["calls"][0]["decreasing"][0]["shape"] == "minus_const"
     assert fns["m.c#skip"]["loops"][0]["macro_expanded"] is True

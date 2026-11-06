@@ -1512,6 +1512,14 @@ def run_wp_on_function(
         "unproven_count": len(unproven_goals),
         "dead_count": len(dead_goals),
         "assigns_vcs_proven": assigns_vcs_proven,
+        # Frame-error-free breakdown (AutoFraming criterion): a missing/incomplete assigns
+        # warning, unproven assigns/loop-assigns goals, or unproven \separated goals all
+        # count against the l3_frame unit even when the overall proof succeeds.
+        "frame_summary": {
+            "missing_assigns_warning": bool(_MISSING_ASSIGNS_LINE_RE.search(combined_log)),
+            "assigns_vcs_proven": assigns_vcs_proven,
+            "l3_frame_goals": by_class.get("l3_frame", {}),
+        },
         "soundness": soundness,
         # Non-empty means Frama-C invented `int f()` prototypes: fix the stubs before trusting results.
         "undeclared_functions": scan_undeclared_functions(combined_log),

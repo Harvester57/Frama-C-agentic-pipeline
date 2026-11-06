@@ -1412,3 +1412,134 @@ def is_trivial_predicate(text: str) -> bool:
     if len(parts := _split_top_level(text, "&&")) > 1:
         return all(is_trivial_predicate(p) for p in parts)
     return _is_trivial_relation(text)
+
+
+# ---------------------------------------------------------------------------
+# Frame-skeleton preservation (AutoFraming-style projected frame clauses)
+# ---------------------------------------------------------------------------
+
+_SEPARATED_RE = re.compile(r"\\separated\s*\(")
+_ASSIGNS_RE = re.compile(r"\bassigns\b")
+_LOOP_ASSIGNS_PREFIX_RE = re.compile(r"\bloop\s*$")
+_FROM_RE = re.compile(r"\\from\b")
+_LEADING_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _paren_group_at(text: str, open_idx: int) -> tuple[str, int]:
+    """Inner text of the paren group opening at `open_idx`, and the index after its close."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : i], i + 1
+    return text[open_idx + 1 :], len(text)
+
+
+def _scan_to_semicolon(text: str, start: int) -> int:
+    """Index of the first top-level `;` at or after `start` (ACSL clauses end there)."""
+    top = _top_level_positions(text)
+    for i in range(start, len(text)):
+        if top[i] and text[i] == ";":
+            return i
+    return len(text)
+
+
+def extract_frame_clauses(acsl_text: str) -> dict:
+    """
+    Parse the frame clauses of one ACSL contract text:
+    `\\separated(...)` argument lists and function-level `assigns ... [\\from ...];` clauses
+    (`loop assigns` is not a function frame clause and is skipped). Purely syntactic.
+    """
+    separated: list[list[str]] = []
+    for m in _SEPARATED_RE.finditer(acsl_text):
+        inner, _ = _paren_group_at(acsl_text, m.end() - 1)
+        separated.append(_split_top_level(inner, ","))
+    assigns: list[dict] = []
+    for m in _ASSIGNS_RE.finditer(acsl_text):
+        prefix = acsl_text[max(0, m.start() - 6) : m.start()]
+        if _LOOP_ASSIGNS_PREFIX_RE.search(prefix):
+            continue
+        end = _scan_to_semicolon(acsl_text, m.end())
+        clause = acsl_text[m.end() : end]
+        from_m = _FROM_RE.search(clause)
+        if from_m:
+            locs_text, from_text = clause[: from_m.start()], clause[from_m.end() :]
+        else:
+            locs_text, from_text = clause, ""
+        from_parts = _split_top_level(from_text, ",") if from_text.strip() else []
+        assigns.append(
+            {
+                "locs": _split_top_level(locs_text, ","),
+                "from": from_parts,
+                "from_nothing": bool(from_parts) and all(p == "\\nothing" for p in from_parts),
+            }
+        )
+    return {"separated": separated, "assigns": assigns}
+
+
+def _norm_clause(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def check_frame_preserved(skeleton: dict, acsl_text: str, path: str = "<input>") -> list[str]:
+    """
+    Verify that a candidate contract preserves a projected frame skeleton
+    (frame_skeleton.compute output): every `\\separated` pair must appear in some
+    `\\separated` clause of the candidate (matched on the roots, so a stronger region is
+    accepted), and every skeleton `assigns L \\from S` must be covered by a candidate
+    `assigns` clause listing L with a `\\from` superset of S. Strengthening is allowed;
+    deleting or weakening a projected clause is an error. A disabled/missing skeleton
+    checks nothing (fail-open).
+    """
+    if not isinstance(skeleton, dict) or skeleton.get("status") not in ("ok", "partial"):
+        return []
+    errors: list[str] = []
+    clauses = extract_frame_clauses(acsl_text)
+    for sep in skeleton.get("separated") or []:
+        want = {_norm_clause(r) for r in sep.get("roots") or []}
+        if not want:
+            continue
+        covered = False
+        for args in clauses["separated"]:
+            leading = set()
+            for arg in args:
+                m = _LEADING_IDENT_RE.match(arg.strip())
+                if m:
+                    leading.add(_norm_clause(m.group(0)))
+            if want <= leading:
+                covered = True
+                break
+        if not covered:
+            errors.append(
+                f"{path}: projected frame clause missing or weakened: {sep.get('clause')!r} "
+                f"(no \\separated clause over roots {sorted(sep.get('roots') or [])})"
+            )
+    for a in skeleton.get("assigns") or []:
+        loc = _norm_clause(a.get("loc") or "")
+        want_from = {_norm_clause(f) for f in a.get("from") or []}
+        if not loc:
+            continue
+        covered = False
+        for cl in clauses["assigns"]:
+            locs = {_norm_clause(x) for x in cl["locs"]}
+            if loc not in locs:
+                continue
+            if loc == "\\nothing":
+                covered = True
+                break
+            have = {_norm_clause(x) for x in cl["from"]}
+            if cl["from_nothing"] and not want_from:
+                covered = True
+                break
+            if want_from <= have:
+                covered = True
+                break
+        if not covered:
+            errors.append(
+                f"{path}: projected frame clause missing or weakened: {a.get('clause')!r} "
+                f"(no assigns clause covering location {a.get('loc')!r} with \\from superset of {sorted(a.get('from') or [])})"
+            )
+    return errors

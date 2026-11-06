@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import frame_skeleton  # noqa: E402
 import kernel_ast  # noqa: E402
 from acsl_ast import AcslSyntaxError, Span, locate_all_definition_spans, locate_function_span, tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import DYNAMIC_ALLOC_CALLEES  # noqa: E402
@@ -52,7 +53,7 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 
-FACTS_SCHEMA = 1
+FACTS_SCHEMA = 2  # 2: per-function frame_skeleton (AutoFraming-style projected frame clauses)
 FACTS_DIR = "workspace/reports/facts"
 CONTEXT_ENV = "FRAMAC_PROVER_CONTEXT"
 CONTEXT_SENTINEL = "<!-- deterministic-context -->"
@@ -222,15 +223,18 @@ def _access_records(accesses: list[dict], derived: dict[str, str]) -> list[dict]
         if key in seen:
             continue
         seen.add(key)
-        out.append(
-            {
-                "lval": lval,
-                "root": root,
-                "root_kind": kind,
-                "through_pointer": bool(access.get("through_pointer")),
-                "line": kernel_ast.parse_location(access.get("loc"))["line"],
-            }
-        )
+        record = {
+            "lval": lval,
+            "root": root,
+            "root_kind": kind,
+            "through_pointer": bool(access.get("through_pointer")),
+            "line": kernel_ast.parse_location(access.get("loc"))["line"],
+        }
+        # The kernel dump carries the RHS expressions of writes (loop and straight-line alike).
+        values = [v for v in (_clean_expr(x) for x in access.get("values") or []) if v]
+        if values:
+            record["values"] = values
+        out.append(record)
     return out
 
 
@@ -489,7 +493,7 @@ def _function_record(
                 "line": kernel_ast.parse_location(path.get("loc"))["line"],
             }
         )
-    return {
+    record = {
         "name": name,
         "file": file,
         "kernel_name": kernel_name,
@@ -511,6 +515,8 @@ def _function_record(
         "features": _features(raw, loops, calls, formals, src, recursion),
         "truncated": bool(raw.get("truncated")),
     }
+    record["frame_skeleton"] = frame_skeleton.compute(record)
+    return record
 
 
 def _link_callers(raw_functions: list[dict], records: dict[str, dict]) -> None:
@@ -892,6 +898,28 @@ def _render_alias(record: dict, lines: list[str]) -> None:
     )
 
 
+def _render_skeleton(record: dict, lines: list[str]) -> None:
+    skel = record.get("frame_skeleton") or {}
+    if skel.get("status") not in ("ok", "partial"):
+        return
+    seps = skel.get("separated") or []
+    assigns = skel.get("assigns") or []
+    if not seps and not assigns:
+        return
+    lines.append(
+        "\n**Projected frame skeleton** (deterministic projection of the AST and Eva dependence sets above into "
+        "ACSL frame clauses — a REQUIRED minimum for the contract: include each clause verbatim or stronger, never "
+        "delete or weaken one; the parent's merge check rejects a candidate that drops a clause. WP still judges "
+        "whether each clause holds):"
+    )
+    for sep in seps:
+        lines.append(f"- `{sep['clause']}` — {sep.get('reason', '')}")
+    for a in assigns:
+        lines.append(f"- `{a['clause']}`")
+    for note in skel.get("notes") or []:
+        lines.append(f"- note: {note}")
+
+
 def _render_recursion(record: dict, mapped, lines: list[str]) -> None:
     recursion = record.get("recursion")
     if not recursion:
@@ -959,6 +987,7 @@ def render_section(
         _render_calls(record, mapped, lines)
         _render_callers(record, lines)
         _render_alias(record, lines)
+        _render_skeleton(record, lines)
         _render_recursion(record, mapped, lines)
         _render_returns(record, mapped, lines)
     if has_slice:

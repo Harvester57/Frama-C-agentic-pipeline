@@ -25,6 +25,8 @@ Still to run, preferably on a **fresh run directory**. The old one lives in a te
 
 ## 3. Hardening follow-ups found during the end-to-end run
 
+- [x] **Projected frame skeletons (AutoFraming, arXiv:2610.29046v1):** LLM-synthesized contracts verified fully under WP while their frame clauses stayed unsound (the `parse_value(buf, 2, &buf[1])` aliased-call case). `scripts/frame_skeleton.py` now projects each function's frame into a deterministic skeleton (`\separated` for interfering pointer pairs, `assigns L \from ...` per write) in the facts JSON (schema 2); the prover brief lists it as a required minimum, and `workspace_overlay.py` rejects at merge time any candidate that drops a projected clause (`acsl_ast.check_frame_preserved`). `run_wp_function.py` adds a `frame_summary` so `l3_frame` counts as error-free only with all assigns/separated goals discharged and no missing-assigns warning. `FRAMAC_FRAME_SKELETON=off` for A/B. `kernel_ast_dump.ml` now records RHS expressions on function-level writes (straight-line included), so `\from` footprints are precise instead of the read-root superset. Open follow-up: restate Eva `-deps` footprints over the formals inside the skeleton itself (today they are hints).
+
 - [x] **Shared cache vs hostile targets:** trusted steps read inputs that target code in other containers can rewrite.
   - Closed in [`../scripts/resources.py`](../scripts/resources.py): the host broker keeps `cache_mode="rw"` leases and `runs_target_code=True` leases on the same `run_dir` mutually exclusive in `plan_grant()` and `Broker._acquire()`.
 - [x] **Generated Makefile race:** `pipeline_make.py run` regenerates the Makefile in the shared run directory right before `make` reads it.
