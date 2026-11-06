@@ -53,6 +53,8 @@ from eva_loops import loop_ref_from_json, mirror_id  # noqa: E402
 from eva_options import (  # noqa: E402
     EVA_OPTIONS,
     LADDER,
+    PERFN_MAX_FUNCTIONS,
+    PERFN_SLEVEL,
     format_option,
     loop_unroll_level,
     merge_options,
@@ -610,7 +612,15 @@ def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
         wanted = {rung.name for rung in LADDER}
     plain = mod.rung_options({})
     for rung in LADDER:
-        options = mod.rung_options(dict(rung.options))
+        overlay = dict(rung.options)
+        if rung.name == "perfn":
+            # Per-function slevel for the functions with the most surviving Unknowns (upstream
+            # -eva-slevel-function f:n, repeatable). Deterministic: the base run is re-run first.
+            by_fn = base.get("unknown_obligations_by_function")
+            if isinstance(by_fn, dict) and by_fn:
+                ranked = sorted(by_fn.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+                overlay["slevel-function"] = [f"{fn}:{PERFN_SLEVEL}" for fn, _ in ranked[:PERFN_MAX_FUNCTIONS]]
+        options = mod.rung_options(overlay)
         if rung.name in wanted and options != plain:
             mod.tune_rungs[rung.name] = options
 
@@ -973,6 +983,8 @@ STAGE_OF_TARGET = {
     "fuzz": 2,
     "eva": 2,
     "eva-tune-base": 2,
+    # Troubleshooting aid on top of eva-<mod>; same stage, ordered by the make prerequisite.
+    "flamegraph": 2,
     # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
     "eva-tune": 3,
     "coverage": 3,  # after fuzz, so that it measures the campaign's corpus
@@ -980,17 +992,19 @@ STAGE_OF_TARGET = {
     "facts": 4,
     "ingest": 4,
     "replay": 4,
+    "minimize": 4,
     "wp-queue": 4,
     "wp-sweep": 5,
     "report": 6,
 }
-MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "coverage-", "eva-", "module-", "facts-")
+MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "coverage-", "eva-", "flamegraph-", "module-", "facts-")
 _TARGET_OUTPUTS = {
     "slice-init": DAG_JSON,
     "seed": LEDGER_JSON,
     "selftest": SELFTEST_JSON,
     "ingest": INGESTED_JSON,
     "replay": "workspace/reports/replay/index.json",
+    "minimize": "workspace/reports/minimize/index.json",
     "wp-queue": "workspace/reports/wp_queue.json",
     "wp-sweep": f"{SWEEP_DIR}/summary.json",
     "report": "REPORT.md",
@@ -1023,6 +1037,7 @@ def _target_problem(target: str, plan: Plan) -> str | None:
         "fuzz": plan.fuzz_modules,
         "coverage": plan.fuzz_modules,
         "eva": plan.eva_modules,
+        "flamegraph": plan.eva_modules,
         "module": list(plan.modules),
         "facts": list(plan.modules),
     }[kind]
@@ -1044,6 +1059,8 @@ def _target_nodes(target: str, plan: Plan) -> list[str]:
         return [f"coverage-{m}" for m in plan.fuzz_modules]
     if target == "eva":
         return [f"eva-{m}" for m in plan.eva_modules]
+    if target == "flamegraph":
+        return [f"flamegraph-{m}" for m in plan.eva_modules]
     if target == "eva-tune-base":
         return [f"evabase-{m}" for m in plan.eva_modules]
     if target == "eva-tune":
@@ -1063,6 +1080,8 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
         return deps + ([f"eva-{mod}"] if mod in plan.eva_modules else [])
     if node in ("replay", "wp-queue"):
         return ["ingest"]
+    if node == "minimize":
+        return ["replay"]
     return []
 
 
@@ -1075,6 +1094,7 @@ def _node_output(node: str) -> str | None:
         "fuzz": f"{REPORT_DIRS['fuzz']}/{mod}.json",
         "coverage": f"{COVERAGE_REPORT_DIR}/{mod}.json",
         "eva": f"{REPORT_DIRS['eva']}/{mod}.json",
+        "flamegraph": f"workspace/eva/{mod}/flamegraph.svg",
         "evabase": f"{TUNE_REPORT_DIR}/{mod}/base.json",
         "evatune": f"{REPORT_DIRS['eva']}/{mod}.json",
         "facts": f"{FACTS_DIR}/{mod}.json",

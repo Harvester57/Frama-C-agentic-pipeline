@@ -9,8 +9,14 @@ A failed Frama-C run is reported as status "analysis_error", never as zero alarm
 Inside a run directory, a report with status "ok" is cached (scripts/cache.py, namespace `eva`)
 under the toolchain, the Eva command line (with the output directory factored out, so the same
 analysis is one entry wherever it writes) and the content of every source and header it includes;
-an identical later run restores the report, alarms.csv, red_alarms.csv, eva.log, slice.sarif and
-flows.log instead of re-running Eva (the .sav is not cached).
+an identical later run restores the report, alarms.csv, red_alarms.csv, eva.log, slice.sarif,
+flows.log, flamegraph.txt and nonterm.log instead of re-running Eva (the .sav is not cached).
+
+Every run also writes flamegraph.txt (-eva-flamegraph, render it with `pipeline_make.py run
+flamegraph-<mod>` or scripts/eva_flamegraph.py when a run is slow) and runs the nonterm plug-in
+(-nonterm -nonterm-log), whose warnings land in the report as `nonterm`. The report's
+`repair_hints` field ports upstream make-wrapper's log patterns (recursive call without assigns,
+called function with neither code nor specification) into pipeline actions.
 
 Tuning comes in two forms, both recorded in the report: `--eva-option name=value`, allowlisted by
 eva_options.py, and `--loop-unroll file#function#ordinal=N`, which analyses a scratch mirror of the
@@ -164,6 +170,8 @@ _CACHED_OUTPUTS = {
     "slice.sarif": "sarif_file",
     "flows.log": None,
     "flows.cg.dot": None,
+    "flamegraph.txt": "flamegraph_file",
+    "nonterm.log": "nonterm_log_file",
 }
 # The flows step reads a saved session. It decides nothing but hints, so a slow machine loses
 # those hints at worst (`flows.status`), and the limit is well above what it takes on real modules.
@@ -413,7 +421,16 @@ def run_eva_on_slice(
     sav_path = out_dir / "framac.sav"
     sarif_path = out_dir / "slice.sarif"
     # A report left over from an earlier run must never be read as this run's result.
-    for stale in (csv_path, red_csv, sav_path, sarif_path, out_dir / "flows.log", out_dir / "flows.cg.dot"):
+    for stale in (
+        csv_path,
+        red_csv,
+        sav_path,
+        sarif_path,
+        out_dir / "flows.log",
+        out_dir / "flows.cg.dot",
+        out_dir / "flamegraph.txt",
+        out_dir / "nonterm.log",
+    ):
         if stale.exists():
             stale.unlink()
 
@@ -580,7 +597,12 @@ def run_eva_on_slice(
         return result
 
     # The output files are not part of the analysis: the same analysis is one entry wherever it writes.
-    outputs_in_cmd = {str(out_dir / name): f"<out>/{name}" for name in ("alarms.csv", "red_alarms.csv", "framac.sav")}
+    outputs_in_cmd = {
+        str(out_dir / name): f"<out>/{name}"
+        for name in ("alarms.csv", "red_alarms.csv", "framac.sav", "flamegraph.txt", "nonterm.log")
+    }
+    # The nonterm log is passed with its append prefix, so mask that spelling too.
+    outputs_in_cmd[f"a:{out_dir / 'nonterm.log'}"] = "<out>/nonterm.log"
     material = {
         "kind": "eva",
         "command": [outputs_in_cmd.get(token, token) for token in cmd],
@@ -608,6 +630,63 @@ def _input_digest(sources: list[str], flags: list[str]) -> str | None:
         return None
     blob = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+# Upstream make-wrapper log patterns (docs/upstream/sources/make_wrapper_tips.md), ported as
+# structured repair hints in the report.
+_RE_MISSING_SPEC_RE = re.compile(r"Neither code nor (specification|[^ ]+ assigns clause) for function ([^,]+),")
+_RE_RECURSIVE_CALL_RE = re.compile(r"detected recursive call")
+_NONTERM_WARN_RE = re.compile(
+    r"^\[nonterm:[a-z-]+\] (?P<loc>[^:\n]+:\d+): Warning:\s*\n?\s*(?P<msg>[^\n]+)(?:\n\s+stack: (?P<stack>[^\n]+))?",
+    re.MULTILINE,
+)
+
+
+def extract_repair_hints(log_text: str) -> list[dict]:
+    """
+    Repair hints from Frama-C log patterns ported from upstream make-wrapper
+    (docs/upstream/sources/make_wrapper_tips.md): recursive calls without an assigns clause,
+    and called functions with neither code nor a specification.
+    """
+    hints: list[dict] = []
+    for m in _RE_MISSING_SPEC_RE.finditer(log_text or ""):
+        kind, fname = m.group(1), m.group(2).strip()
+        if kind == "specification":
+            action = (
+                f"add the file defining {fname!r} to the module sources (locate it via "
+                "build_callgraph_dag.py's function index), or add a stub/contract in "
+                "templates/acsl/external_stubs.h"
+            )
+        else:
+            action = (
+                f"add an ACSL assigns clause for {fname!r}, or enable the recursion fallback "
+                "(pipeline_make.py params set --module <mod> --eva-recursion-fallback)"
+            )
+        hints.append({"pattern": "missing_spec", "function": fname, "spec_kind": kind, "action": action})
+    if _RE_RECURSIVE_CALL_RE.search(log_text or ""):
+        hints.append(
+            {
+                "pattern": "recursive_call",
+                "function": None,
+                "action": (
+                    "patch, stub or add an ACSL assigns specification to the recursive call, or enable "
+                    "the recursion fallback (pipeline_make.py params set --module <mod> --eva-recursion-fallback)"
+                ),
+            }
+        )
+    return hints
+
+
+def parse_nonterm_log(log_text: str) -> list[dict]:
+    """Non-terminating loops/statements reported by the nonterm plug-in (-nonterm-log)."""
+    return [
+        {
+            "location": m.group("loc"),
+            "message": m.group("msg").strip(),
+            "stack": (m.group("stack") or "").strip() or None,
+        }
+        for m in _NONTERM_WARN_RE.finditer(log_text or "")
+    ]
 
 
 def _is_missing_assigns_error(log_path: Path, error_summary: list[str]) -> bool:
@@ -728,6 +807,9 @@ def _eva_command(
             *framac_args(options),
             "-eva-report-red-statuses",
             str(red_csv),
+            # Perf profile of the run; render it with scripts/eva_flamegraph.py when a run is slow.
+            "-eva-flamegraph",
+            str(out_dir / "flamegraph.txt"),
             "-then",
             "-metrics",
             "-metrics-eva-cover",
@@ -737,6 +819,12 @@ def _eva_command(
             str(csv_path),
             "-save",
             str(sav_path),
+            # Non-termination analysis on the saved AST (upstream analysis.mk runs it the same way);
+            # its warnings are parsed into the report's `nonterm` field.
+            "-then",
+            "-nonterm",
+            "-nonterm-log",
+            f"a:{out_dir / 'nonterm.log'}",
         ]
     )
     if mlevel > 0:
@@ -885,6 +973,15 @@ def _execute_eva(
     rows = read_report_rows(csv_path, path_root) if csv_path.exists() else []
     summary = summarize_rows(rows)
 
+    flamegraph_path = out_dir / "flamegraph.txt"
+    nonterm_log_path = out_dir / "nonterm.log"
+    try:
+        nonterm_text = (
+            nonterm_log_path.read_text(encoding="utf-8", errors="replace") if nonterm_log_path.is_file() else ""
+        )
+    except OSError:
+        nonterm_text = ""
+
     # A failed Frama-C run or a missing report must never look like "0 alarms".
     reason = None
     if timed_out:
@@ -918,6 +1015,10 @@ def _execute_eva(
         "csv_file": str(csv_path) if csv_path.exists() else None,
         "sav_file": str(sav_path) if sav_path.exists() else None,
         "log_file": str(log_path),
+        "flamegraph_file": str(flamegraph_path) if flamegraph_path.exists() else None,
+        "nonterm_log_file": str(nonterm_log_path) if nonterm_log_path.exists() else None,
+        "nonterm": parse_nonterm_log(nonterm_text),
+        "repair_hints": extract_repair_hints(combined_log),
     }
 
 

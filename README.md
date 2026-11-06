@@ -1,6 +1,6 @@
 # Frama-C Agentic Verification & Hybrid Fuzzing Pipeline
 
-An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 33.0** (`RTE`, `Eva`, `WP`, `E-ACSL`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
+An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 34.0~~dev (Selenium)** (`RTE`, `Eva`, `WP`, `E-ACSL`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
 
 All verification tools execute inside a reproducible, network-isolated **`framac-pipeline` container**, orchestrated by modular **Agent Skills** ([`/framac-verify`](./skills/framac-verify/SKILL.md), [`/framac-slice`](./skills/framac-slice/SKILL.md), [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md), [`/framac-eva`](./skills/framac-eva/SKILL.md), [`/framac-wp`](./skills/framac-wp/SKILL.md)) and deterministic Python helper scripts.
 
@@ -137,7 +137,7 @@ Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contai
 
 ```text
 frama-c/
-├── Dockerfile                        # Ubuntu 24.04 + Opam Frama-C 33.0 + E-ACSL + Alt-Ergo/Z3/CVC5 + Clang/LibFuzzer
+├── Dockerfile                        # Ubuntu 24.04 + Opam Frama-C 34.0~~dev + E-ACSL + Alt-Ergo/Z3/CVC5 + Clang/LibFuzzer
 ├── docker-compose.yml                # Manual container service definition & volume mappings
 ├── wrappers/
 │   ├── framac-docker.ps1             # Windows PowerShell wrapper (host broker + container hardening)
@@ -186,8 +186,8 @@ frama-c/
 ├── tests/                            # Pytest unit and integration test suite
 └── docs/                             # Architecture, onboarding, security layers, caching, & reference manuals
     ├── bugs-found/                   # Public vulnerability advisories & verification reports per target
-    ├── upstream/                     # Upstream Frama-C 33.0 / e-acsl-gcc bug reports & workarounds
-    └── references/                   # Frama-C 33.0 RTE, Eva, WP, ACSL, and E-ACSL reference manuals
+    ├── upstream/                     # Upstream Frama-C 33/34 e-acsl-gcc bug reports & workarounds
+    └── references/                   # Frama-C RTE, Eva, WP, ACSL, and E-ACSL reference manuals (33.0 editions; re-extract from the 34.0 PDFs when published)
 ```
 
 ---

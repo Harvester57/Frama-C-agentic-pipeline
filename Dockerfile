@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
-FROM framac/frama-c:dev@sha256:89ab2bd8e8a133ede99257c0403a2752c872bf2861e1a15911279a322da69cdd
+FROM framac/frama-c:dev@sha256:2296220f5d51cd9842db1d83f0c84390298100bc4efeb1bcab6bad557866f124
 
 LABEL maintainer="Frama-C Agentic Verification Pipeline"
-LABEL description="Self-contained Frama-C (RTE, Eva, WP, E-ACSL, Mdr/SARIF) + SMT Solvers (Alt-Ergo, Z3, CVC5) + Clang/LibFuzzer + Bear container"
+LABEL description="Self-contained Frama-C (RTE, Eva, WP, E-ACSL, Mdr/SARIF) + SMT Solvers (Alt-Ergo, Z3, CVC5) + Clang/LibFuzzer + Bear + cvise (crash-input minimization) container"
 
 USER root
 ENV HOME=/home/opam
@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     cvc5 \
+    cvise \
     git \
     graphviz \
     jq \

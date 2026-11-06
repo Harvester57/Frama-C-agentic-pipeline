@@ -94,7 +94,7 @@ def _offset_expr(lval: str, root: str) -> tuple[str, str] | None:
     return None
 
 
-def _classify_offset(expr: str, loops: list[dict]) -> tuple[str, object]:
+def _classify_offset(expr: str, loops: list[dict]) -> tuple[str, int | tuple[str, bool] | None]:
     """("const", int) | ("range", (bound, inclusive)) | ("unknown", None)."""
     e = expr.strip()
     if _INT_RE.fullmatch(e):
@@ -153,9 +153,9 @@ def _region(record: dict, root: str, loops: list[dict]) -> tuple[str, bool, str 
             consts.append(0)
             continue
         ck, cv = _classify_offset(str(val), loops)
-        if ck == "const":
+        if ck == "const" and isinstance(cv, int):
             consts.append(cv)
-        elif ck == "range":
+        elif ck == "range" and isinstance(cv, tuple):
             ranges.append(cv)
         else:
             unknown = True
@@ -164,13 +164,13 @@ def _region(record: dict, root: str, loops: list[dict]) -> tuple[str, bool, str 
     if ranges:
         # Deterministic pick: the first range in source order; note when several differ.
         bound, incl = ranges[0]
-        hi = bound if incl else f"{bound} - 1"
+        hi_b = bound if incl else f"{bound} - 1"
         note = None
         if len({(b, i) for b, i in ranges}) > 1:
-            note = f"multiple access windows on `{root}`; using the first (`0 .. {hi}`)"
+            note = f"multiple access windows on `{root}`; using the first (`0 .. {hi_b}`)"
         if consts and (min(consts) < 0 or max(consts) > 0):
             note = (note + "; " if note else "") + f"constant offsets on `{root}` folded into the range"
-        return f"{root} + (0 .. {hi})", True, note
+        return f"{root} + (0 .. {hi_b})", True, note
     if consts:
         lo, hi = min(consts), max(consts)
         if lo == 0 and hi == 0:
@@ -317,7 +317,7 @@ def _compute(record: dict) -> dict:
         off = _offset_expr(lval, root)
         if off and off[0] == "expr":
             ck, cv = _classify_offset(str(off[1]), loops)
-            if ck == "range":
+            if ck == "range" and isinstance(cv, tuple):
                 bound, incl = cv
                 hi = bound if incl else f"{bound} - 1"
                 loc = f"{root} + (0 .. {hi})"

@@ -1,6 +1,6 @@
 # Frama-C Reference Manuals
 
-Upstream manuals for the tools the pipeline drives, all for Frama-C 33.0 (Arsenic). They are large (19 to 112 pages each), so treat them as a **last resort**: first use the skill or brief you were given and [`../troubleshooting.md`](../troubleshooting.md). Consult a manual when you need the exact semantics of an option, an ACSL construct, an alarm kind, or a WP/Eva/E-ACSL message, and those sources don't cover it.
+Upstream manuals for the tools the pipeline drives, all for Frama-C 33.0 (Arsenic). The container now runs Frama-C 34.0~~dev (Selenium); re-extract these manuals from the 34.0 PDFs with `scripts/extract_references.py` when they are published (the bundled PDFs stay labeled with their source version). They are large (19 to 112 pages each), so treat them as a **last resort**: first use the skill or brief you were given and [`../troubleshooting.md`](../troubleshooting.md). Consult a manual when you need the exact semantics of an option, an ACSL construct, an alarm kind, or a WP/Eva/E-ACSL message, and those sources don't cover it.
 
 Each `<name>.pdf` has a generated, greppable twin `<name>.md` in the same folder. **Search the `.md`, never read a manual whole.** Don't open a PDF unless the `.md` passage is garbled (see step 4). For E-ACSL, start with the hand-written [`./e-acsl-quickref.md`](./e-acsl-quickref.md), which covers wrapper and plug-in options, runtime output formats, and limitations that change verdicts.
 
@@ -39,6 +39,8 @@ Language specifications are in `acsl/`; one folder per plug-in holds that plug-i
 | [`./rte/frama-c-rte-manual.md`](./rte/frama-c-rte-manual.md) | RTE plug-in, Frama-C 33.0 | The assertion generated for each operation: integer overflow, shifts and division §2.1, pointer validity and `mem_access` §2.2, downcasts §2.3–2.5, initialization §2.7. Undefined behaviours RTE does **not** cover §2.6, §2.8. Options §3 |
 
 The container installs whatever `opam install frama-c` resolves to, so for exact option names and defaults trust the installed tool: `frama-c -version`, `frama-c -wp-help`, `frama-c -eva-help`, `frama-c -rte-help`, `e-acsl-gcc -h`.
+
+Executable upstream examples mined from the Frama-C master archive (Eva/WP/E-ACSL test patterns, the `eva_main` argv stub, make-wrapper repair tips) are vendored in [`../upstream/sources/`](../upstream/sources/README.md) — consult them before writing annotations or flags from scratch.
 
 ## Key facts for this pipeline
 

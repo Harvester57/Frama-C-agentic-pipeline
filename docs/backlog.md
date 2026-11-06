@@ -15,6 +15,17 @@ Still to run, preferably on a **fresh run directory**. The old one lives in a te
 - [ ] `pipeline_make.py run wp-sweep`, then `run report`; `run_metadata.py set-status`; `checkpoint.py complete`.
 - [ ] Check that the final ledger, findings and report are consistent: one finding for the overflow, merged contracts, and swept proofs.
 
+## 1a. Upstream-master mining (Frama-C 35~dev, 2026-11-06) — implemented
+
+Mined the master archive (`/tmp/framac-src/frama-c-master`, vendored snippets in `docs/upstream/sources/`):
+
+- [x] **M1 Eva observability:** every Eva run now writes `flamegraph.txt` (`-eva-flamegraph`) and runs `-nonterm` (`nonterm.log`); both are cached outputs. `pipeline_make.py run flamegraph-<mod>` / `scripts/eva_flamegraph.py` renders SVG+HTML via `frama-c-script flamegraph`. The report carries `nonterm` (parsed warnings) and `repair_hints` (upstream make-wrapper patterns: recursive call, missing spec/assigns). `docs/troubleshooting.md` §3 documents both.
+- [x] **M2 Eva options:** `eva_options.py` allowlist grew to 40 options incl. per-function `-eva-*-function` (`func_value` kind, repeatable) and plain `func_list`s (`builtin`, `use-spec`); new `perfn` ladder rung applies `slevel-function` to the functions with the most Unknowns (`LADDER_VERSION` 2).
+- [x] **M3 argv harness:** `generate_harness.py --entry-style argv` (auto-default for `--entry-fn main`), modeled on upstream `share/libc/eva_stubs.c`; sidecar cppflags get `-Dmain=__framac_target_main` so libFuzzer's main doesn't clash.
+- [x] **M4 cvise minimization:** `cvise` 2.11.0 installed in the Dockerfile (Debian trixie apt) and the image regenerated (`framac-pipeline:latest`). `run_eacsl_fuzz.py minimize` / `minimize-interest` / `minimize-candidates` minimize crash reproducers under the sandbox with a fingerprint-preserving interest test; `pipeline_make.py run minimize` writes `<artifact>.min` + `workspace/reports/minimize/index.json`.
+- [x] **M5 WP witnesses + Layer 6:** `run_wp_function.py --counter-examples` (`-wp-counter-examples`, report field `counter_example_goals`), wired into the parent WP re-check in `workspace_overlay.py`; `layer6_zeroization_and_taint.acsl` documents the upstream `security_status()`/`__fc_private` idiom; briefs updated.
+- [ ] **Watch:** on each base-image bump, diff the master archive's `Changelog` `<next-release>` section and port behavior changes into `docs/troubleshooting.md` §0. `-eva-statistics-file` (new in 35) is a candidate for `run_eva_slice.py` if per-run stats are ever needed beyond `-metrics`.
+
 ## 2. Verification gaps (not testable on this machine)
 
 - [ ] **Podman**, rootless and rootful: per-controller flags, the refusal when memory/pids limits cannot be enforced, and `sandbox.outer: podman-hardened`. Podman is not installed here (it would need installing in WSL Ubuntu).

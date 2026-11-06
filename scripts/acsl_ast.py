@@ -68,6 +68,7 @@ _INVARIANT_CLAUSE_RE = re.compile(r"(?:(loop|type|global|strong)\s+)?\binvariant
 _VACUOUS_FALSE_CLAUSE_RE = re.compile(
     r"\b(requires|assumes|loop\s+invariant)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*:\s*)*(?:\\false|0)\s*;"
 )
+_EMPTY_BEHAVIOR_RE = re.compile(r"\bbehavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*;")
 _STRING_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
 _ESCAPED_CTRL_IN_ACSL_RE = re.compile(r"[\x07\x08\x0c]")
@@ -261,9 +262,28 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
     return errors
 
 
+def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> list[str]:
+    """
+    Frama-C 34+ forbids empty named behaviors (`behavior b: ;`) in function and statement
+    contracts: the kernel aborts with a fatal annot-error ("unexpected token ';'"). Flag them
+    before splicing so a candidate fails the mechanical check instead of the kernel parse.
+    """
+    errors: list[str] = []
+    for tok in tokens:
+        if tok.kind not in ("acsl_block", "acsl_line"):
+            continue
+        scrubbed = _COMMENT_IN_ACSL_RE.sub("", _STRING_IN_ACSL_RE.sub('""', tok.text))
+        for m in _EMPTY_BEHAVIOR_RE.finditer(scrubbed):
+            errors.append(
+                f"{path}:{tok.line}: empty named behavior '{m.group(0).strip()}' is forbidden since Frama-C 34 "
+                "(fatal annot-error: unexpected token ';'); give the behavior at least one clause or remove it"
+            )
+    return errors
+
+
 def find_unsound_acsl_keywords(tokens: list[Token], path: str = "<input>") -> list[str]:
     """Check all ACSL tokens in `tokens` for unsound or hazardous ACSL constructs."""
-    return _check_unsound_acsl(tokens, set(), path)
+    return _check_unsound_acsl(tokens, set(), path) + find_empty_named_behaviors(tokens, path)
 
 
 def verify_acsl_only(
@@ -280,6 +300,7 @@ def verify_acsl_only(
         return [str(exc)]
 
     errors: list[str] = []
+    errors.extend(find_empty_named_behaviors(work_tokens, path))
     if check_unsound:
         base_acsl = {t.text for t in base_tokens if t.kind in ("acsl_block", "acsl_line")}
         errors.extend(_check_unsound_acsl(work_tokens, base_acsl, path))

@@ -648,3 +648,108 @@ def test_guardrail_cli_max_corpus_inputs(tmp_path, monkeypatch):
     )
     assert rc == 0
     assert seen_max_corpus.get("max_corpus_inputs") == 32
+
+
+# ---------------------------------------------------------------------------
+# minimize (cvise/creduce crash-input minimization)
+# ---------------------------------------------------------------------------
+
+
+class FakeCviseSandbox:
+    """Replay semantics for the binary, cvise semantics for the tool: truncate the variant."""
+
+    def __init__(self, tool_name: str = "cvise"):
+        self.tool_name = tool_name
+        self.cvise_calls: list[list[str]] = []
+
+    def __call__(self, cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        if Path(cmd[0]).name == self.tool_name:
+            self.cvise_calls.append(list(cmd))
+            variant = Path(cmd[-1])
+            data = variant.read_bytes()
+            if data.startswith(b"CRASH"):
+                variant.write_bytes(b"CRASH")  # minimized: still crashes, smaller
+                return SandboxResult(0, "", "=== 3 interesting passes\n", False, "rlimits", list(cmd))
+            return SandboxResult(0, "", "=== 0 interesting passes\n", False, "rlimits", list(cmd))
+        data = Path(cmd[-1]).read_bytes()
+        if data.startswith(b"CRASH"):
+            return SandboxResult(1, "", EACSL_FAILURE, False, "rlimits", list(cmd))
+        return SandboxResult(0, "", "Executed 1 inputs\n", False, "rlimits", list(cmd))
+
+
+def test_minimize_input_runs_cvise_and_writes_a_verified_min(tmp_path, monkeypatch):
+    binary = tmp_path / "fuzz_mod.e-acsl"
+    binary.write_bytes(EACSL_MARKER_BYTES)
+    crash = tmp_path / "crash-a"
+    crash.write_bytes(b"CRASH aaaa bbbb cccc")
+    tool = tmp_path / "cvise"
+    tool.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake = FakeCviseSandbox()
+    monkeypatch.setattr(R, "find_creduce", lambda: str(tool))
+    monkeypatch.setattr(R, "run_sandboxed", fake)
+    rep = R.minimize_input(binary, crash, tmp_path / "scratch", module="snmp", fingerprint=FP_PARSE)
+    assert rep["status"] == "ok" and rep["reproduced"] is True
+    assert rep["tool"] == str(tool) and rep["passes"] == 3
+    orig = len(b"CRASH aaaa bbbb cccc")
+    assert rep["original_size_bytes"] == orig and rep["minimized_size_bytes"] == 5
+    assert rep["reduction_pct"] == round(100.0 * (orig - 5) / orig, 2)
+    assert Path(rep["minimized"]).read_bytes() == b"CRASH"
+    # cvise ran with --not-c (raw bytes, not C) and the generated interest script.
+    cmd = fake.cvise_calls[0]
+    assert "--not-c" in cmd and cmd[-2].endswith("interest.sh")
+    interest = Path(cmd[-2]).read_text(encoding="utf-8")
+    assert "minimize-interest" in interest and "--fingerprint" in interest and FP_PARSE in interest
+
+
+def test_minimize_input_reports_missing_tool(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "find_creduce", lambda: None)
+    binary = tmp_path / "b"
+    binary.write_bytes(b"x")
+    crash = tmp_path / "crash-a"
+    crash.write_bytes(b"CRASH")
+    rep = R.minimize_input(binary, crash, tmp_path / "s")
+    assert rep["status"] == "error" and "cvise" in rep["reason"]
+
+
+def test_minimize_interest_exit_codes(tmp_path, monkeypatch):
+    binary = tmp_path / "fuzz_mod.e-acsl"
+    binary.write_bytes(EACSL_MARKER_BYTES)
+    monkeypatch.setattr(R, "run_sandboxed", FakeCviseSandbox())
+    crash = tmp_path / "crash-a"
+    crash.write_bytes(b"CRASH a")
+    ok = tmp_path / "ok"
+    ok.write_bytes(b"fine")
+    base = [
+        "minimize-interest",
+        "--binary",
+        str(binary),
+        "--fingerprint",
+        FP_PARSE,
+        "--scratch-dir",
+        str(tmp_path / "s"),
+    ]
+    assert R.main([*base, str(crash)]) == 0
+    assert R.main([*base, str(ok)]) == 1
+
+
+def test_minimize_candidates_writes_index_and_min_files(run_dir, monkeypatch):
+    fp_b, fp_c = _replay_candidates_run(run_dir)
+    _fake_builds(monkeypatch, run_dir)
+    tool = run_dir / "cvise"
+    tool.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake = FakeCviseSandbox()
+    monkeypatch.setattr(R, "find_creduce", lambda: str(tool))
+    monkeypatch.setattr(R, "run_sandboxed", fake)
+    rc = R.main(["minimize-candidates", "--selftest-json", "none.json"])
+    assert rc == 1  # `ghost` has no build spec -> error, but the others minimize
+    index = json.loads((run_dir / "workspace/reports/minimize/index.json").read_text(encoding="utf-8"))
+    assert index["tool"] == str(tool)
+    by_fp = index["by_fingerprint"]
+    assert set(by_fp) == {FP_PARSE, fp_b, fp_c, "x#y::z::3"}
+    assert by_fp[FP_PARSE]["status"] == "ok"
+    assert by_fp[fp_b]["status"] == "error"  # crash-b does not reproduce: nothing to minimize
+    assert by_fp["x#y::z::3"]["status"] == "error"  # ghost module has no build spec
+    min_file = run_dir / "workspace/crashes/snmp/crash-a.min"
+    assert min_file.read_bytes() == b"CRASH"
+    rep = json.loads(Path(by_fp[FP_PARSE]["report"]).read_text(encoding="utf-8"))
+    assert rep["mode"] == "minimize" and rep["runs"][0]["minimized"].endswith("crash-a.min")

@@ -40,6 +40,7 @@ VALID_ENTRY_STYLES = (
     "c_string",
     "custom",
     "auto_prototype",
+    "argv",
 )
 _WORKSPACE_PREFIXES = (
     "/framac-run/workspace/work/",
@@ -757,6 +758,33 @@ def _build_invocations(
         return eva_call, fuzz_call
     if entry_style == "void_call":
         return f"(void)input_buf; (void)input_len; {entry_fn}();", f"(void)bounded_buf; {entry_fn}();"
+    if entry_style == "argv":
+        # CLI-style entry (main(argc, argv)), modeled on upstream share/libc/eva_stubs.c
+        # (vendored as docs/upstream/sources/eva_stubs.c). Eva side: nondet argc in [0..5] and five
+        # 256-byte argv buffers made unknown. Fuzz side: argv[1] is the input as a NUL-terminated
+        # string. The target's main is renamed via -Dmain=__framac_target_main in the sidecar
+        # cppflags (see generate_module_harness), so libFuzzer's main does not clash at link time;
+        # the -D renames this call and the synthesized declaration consistently.
+        eva_call = (
+            "(void)input_buf; (void)input_len; (void)fuzz_buf; (void)fuzz_len;\n"
+            "    int argc = Frama_C_interval(0, 5);\n"
+            "    char argv0[256], argv1[256], argv2[256], argv3[256], argv4[256];\n"
+            "    char *argv[6] = {argv0, argv1, argv2, argv3, argv4, 0};\n"
+            "    //@ loop unroll 5;\n"
+            "    for (int i = 0; i < 5; i++) {\n"
+            "        Frama_C_make_unknown(argv[i], 255);\n"
+            "        argv[i][255] = 0;\n"
+            "    }\n"
+            f"    {entry_fn}(argc, argv);"
+        )
+        fuzz_call = (
+            "char argv1[MAX_INPUT_SIZE + 1];\n"
+            "    if (size > 0) { memcpy(argv1, bounded_buf, size); }\n"
+            "    argv1[size < MAX_INPUT_SIZE ? size : MAX_INPUT_SIZE] = 0;\n"
+            '    char *argv[2] = {(char *)"prog", argv1};\n'
+            f"    {entry_fn}(2, argv);"
+        )
+        return eva_call, fuzz_call
     raise ValueError(f"invalid entry_style: {entry_style!r}")
 
 
@@ -1317,6 +1345,11 @@ def generate_module_harness(
         _, _, auto_needs_nt = _build_auto_prototype_invocations(entry_fn, auto_params)
 
     effective_null_terminate = bool(null_terminate or entry_style == "c_string" or auto_needs_nt)
+    if entry_style == "argv":
+        # Rename the target's main in every build of this module (Eva and fuzz alike): the harness
+        # calls main(argc, argv), and the -D renames that call together with the target's
+        # definition, so libFuzzer's own main is the only main at link time.
+        norm_cppflags = _append_cppflag(norm_cppflags, "-Dmain=__framac_target_main")
     eva_call, fuzz_call = _build_invocations(
         entry_fn=entry_fn,
         entry_style=entry_style,
@@ -1528,7 +1561,7 @@ def main(argv: list[str] | None = None) -> int:
         "--entry-style",
         choices=list(VALID_ENTRY_STYLES),
         default="buffer_len",
-        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, or auto_prototype",
+        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, auto_prototype, or argv (CLI main(argc, argv); defaults automatically when --entry-fn is main)",
     )
     parser.add_argument(
         "--auto-args",
@@ -1608,6 +1641,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--module, --sources, and --entry-fn are required when generating a harness")
 
     effective_style = "auto_prototype" if args.auto_args else args.entry_style
+    style_explicit = any(a == "--entry-style" or a.startswith("--entry-style=") for a in raw_argv)
+    if not style_explicit and not args.auto_args and args.entry_fn == "main":
+        # CLI-style target: drive main(argc, argv) instead of a (buf, len) entry.
+        effective_style = "argv"
     explicit_reachability = any(a == "--reachability" or a.startswith("--reachability=") for a in raw_argv)
     effective_reachability = (
         "internal_api" if (effective_style == "auto_prototype" and not explicit_reachability) else args.reachability

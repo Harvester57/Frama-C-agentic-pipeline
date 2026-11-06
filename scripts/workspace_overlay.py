@@ -854,6 +854,9 @@ def _run_parent_reverify(
             "--wp-par",
             str(wp_par) if wp_par else "auto",
             *wp_extra_flags,
+            # Witness models for failed goals, so crash verifiers get a concrete counter-example
+            # for any Invalid the merged candidate still carries (report: counter_example_goals).
+            "--counter-examples",
             "--sarif",
             "--ignore-prover-budget",
             "--out-json",

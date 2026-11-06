@@ -6,6 +6,21 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 
 ---
 
+## 0. Frama-C 34 (Selenium) Upgrade Notes
+
+Behavior changes since Frama-C 33 that the pipeline already accounts for:
+
+- **Empty named behaviors are forbidden.** `behavior b: ;` in a function or statement contract is now a fatal `[kernel:annot-error] ... unexpected token ';'` (verified on the dev image). `acsl_ast.py` (`verify_acsl_only` / `find_empty_named_behaviors`) rejects them mechanically before splicing, and `run_wp_function.py` maps the kernel error to a repair hint.
+- **ACSL clause order relaxed.** ACSL extensions may now precede `requires`, and `terminates`/`decreases` may sit anywhere between `requires` and `behavior` (verified: `assigns \nothing; terminates x > 0;` parses). The `exits`/`assigns`/`ensures` order is still enforced. The prover brief's recommended order remains valid.
+- **Array-to-pointer decay removed in comparisons.** The kernel no longer implicitly converts an array to a pointer in `==`/`!=`/`<`/... comparisons, so array operands keep their array type. `kernel_ast_dump.ml` now matches both pointer and array operands when setting the `pointer_compare` feature.
+- **New unsequenced-effect warnings (UB CC.35, upstream #@1219 fixed).** Local definitions with unsequenced side effects (e.g. `int x = i++ + i;`) now produce a `[kernel]` warning. Warnings do not change `-report-csv` statuses; no parser change needed.
+- **Fine-grained `-rte-initialized` configuration fixed.** The option-hook bug that blocked per-function exclusion for `static` functions is fixed: `-rte-initialized=@all,-s` now emits zero initialization assertions for a `static` function `s` (verified with `-print` on the dev image). Prefer per-function exclusion over a global `--no-rte-initialized` (which is recorded in `reduced_checks`).
+- **GCC machine modes partially supported.** `__attribute__((mode(<MODE>)))` is now converted to integer types (partial support), so targets using machine modes parse instead of failing with a syntax error.
+- **`FRAMAC_TESTING` env var.** Frama-C 34+ exposes `FRAMAC_TESTING` (`Cmdline.inside_tests`) to mark test executions and guard extra verifications. Set it only for the repo's own test invocations of `frama-c`, never for production pipeline runs.
+- **Base image is now 35.0~~dev (Bromine).** The pinned `framac/frama-c:dev` digest in the `Dockerfile` reports `35.0~~dev (Bromine)`. As of the master archive used for the upstream mining (2026-11-06), the Changelog's `<next-release>` section is still empty, so no 34→35 behavior changes need porting yet — but re-check `Changelog`/`Changelog_detailed.md` in the master archive on every base-image bump and port any `-`/`!` entries here. Upstream reference snippets mined from that archive live in [`./upstream/sources/`](./upstream/sources/README.md).
+
+---
+
 ## 1. Frama-C Kernel Parsing & Preprocessing Errors
 
 ### Symptom: `[kernel] user error: syntax error` on GCC/Clang Intrinsics or System Headers (`_Float128`, etc.)
@@ -50,7 +65,7 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 - **Fix:**
   - Pass `fuzz_buf` (generated harnesses do), or copy the input into the harness's own buffer with `memcpy`, which E-ACSL marks initialized.
   - If a library-filled buffer is the cause, initialize it before the call (`= {0}` / `memset`) or rerun with `--no-rte-initialized`. That opt-out is recorded in `reduced_checks`, and Eva still reports uninitialized reads statically.
-  - Per-function exclusion (`-rte-initialized=@all,-f`) only works for non-`static` functions in Frama-C 33.
+  - Per-function exclusion (`-rte-initialized=@all,-f`) works for `static` functions too since Frama-C 34 (option-hook bug fixed; in Frama-C 33 it only worked for non-`static` functions).
   - The crash verifier classifies such reports as `harness_induced`.
 
 ### Symptom: Every Input Fails `\initialized(&__retres)` in a `__gen_e_acsl_<fn>` Wrapper
@@ -84,6 +99,9 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
 ### Symptom: Instrumentation Aborts With `no function 'X'`
 - **Cause:** `-rte-select` / `-e-acsl-functions` named a function that is absent from the parsed AST (disabled by `#if`, or in a file that failed to parse).
 - **Fix:** function discovery runs on preprocessed sources. Names Frama-C still rejects are dropped once and listed in `rte_select_dropped`.
+
+### Symptom: A Crash Reproducer Is Large or Hard to Read
+- **Fix:** `python3 /opt/framac-pipeline/scripts/pipeline_make.py run minimize` runs cvise (installed in the container image) on every unverified candidate's reproducer, under the sandbox, accepting only variants that still crash with the same fingerprint. Each crash artifact gets a `<artifact>.min` sibling; `workspace/reports/minimize/index.json` maps fingerprints to the reports. Crash verifiers should replay the `.min` first (`skills/framac-wp/crash_verifier_brief.md`).
 
 ### Symptom: E-ACSL Crash With `failure: null` or a Location Inside the E-ACSL Runtime (`unsafe_initialize`)
 - **Cause:** heap corruption made the E-ACSL RTL crash before it printed the failing assertion.
@@ -119,6 +137,13 @@ If a symptom is not listed here, look it up in the upstream manuals in [`./refer
   1. Check `workspace/eva/<mod>/eva.log` for `missing-spec` warnings. Add a contract stub to `external_stubs.h` for any unmodeled external function so Eva does not widen its return value to `[-inf, +inf]`.
   2. Run `pipeline_make.py run eva-tune`, then read `tuning` in `workspace/reports/eva/<mod>.json`. It tries slevel, unrolling and the other precision options as a fixed ladder, and says what helped and why any run was rejected ([`./resources-and-caching.md`](./resources-and-caching.md), Section 6). If nothing helped, look at the harness: a symbolic input length, for one, leaves every option with the same Unknowns.
   3. For a small fixed-bound parsing loop the ladder did not settle, add `//@ loop unroll 32;` above it in `workspace/work/`. Do not write `loop pragma UNROLL`: the kernel rejects it and the run fails.
+
+### Symptom: An Eva Run Is Slow (or Hangs) on a Module Slice
+- **Fix:** every Eva run writes `workspace/eva/<mod>/flamegraph.txt` (`-eva-flamegraph`). Render it to `flamegraph.svg`/`flamegraph.html` with `python3 /opt/framac-pipeline/scripts/pipeline_make.py run flamegraph-<mod>` (or `scripts/eva_flamegraph.py --dir workspace/eva/<mod>`), then read the widest bars: they name the functions where Eva spends its time. Cross-check `workspace/eva/<mod>/nonterm.log` and the report's `nonterm` field (`workspace/reports/eva/<mod>.json`): a non-terminating loop is the usual cause of a hang, and `-eva-slevel`/`-eva-auto-loop-unroll` tuning (Step 2a of `/framac-eva`) is the usual fix.
+
+### Symptom: `repair_hints` in the Eva Report (recursive call, or function with neither code nor specification)
+- **Cause:** ported from upstream `frama-c-script make-wrapper` (see [`./upstream/sources/make_wrapper_tips.md`](./upstream/sources/make_wrapper_tips.md)). `run_eva_slice.py` matches `detected recursive call` and `Neither code nor (specification|... assigns clause) for function X,` in `eva.log` and lists the matching pipeline action in `repair_hints`.
+- **Fix:** follow the hint's `action`: add the defining file to the module sources (locate it via `build_callgraph_dag.py`'s function index), add a stub/contract in `templates/acsl/external_stubs.h`, or enable the recursion fallback with `pipeline_make.py params set --module <mod> --eva-recursion-fallback` (recorded in `reduced_checks`).
 
 ---
 

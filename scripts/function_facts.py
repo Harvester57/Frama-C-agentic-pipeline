@@ -59,6 +59,9 @@ FACTS_DIR = "workspace/reports/facts"
 CONTEXT_ENV = "FRAMAC_PROVER_CONTEXT"
 CONTEXT_SENTINEL = "<!-- deterministic-context -->"
 
+# ACSL's \at, kept out of f-strings: a backslash inside an f-string is a syntax error before Python 3.12.
+_AT = "\\at"
+
 _TEMP_RE = re.compile(r"\b(?:tmp(?:_\d+)?|__retres)\b")
 _RUN_PREFIX_RE = re.compile(r"^(?:/framac-run/|\./)+")
 _AGENT_WORK_RE = re.compile(r"^agents/[^/]+/scratch/work/")
@@ -374,8 +377,8 @@ def _loop_graph(record: dict) -> dict:
     for loop in loops:
         by_depth.setdefault(loop.get("parent"), []).append(loop)
     for group in by_depth.values():
-        ordered = sorted(group, key=lambda l: (l.get("line") or 0))
-        for a, b in zip(ordered, ordered[1:]):
+        ordered = sorted(group, key=lambda lp: (lp.get("line") or 0))
+        for a, b in zip(ordered, ordered[1:], strict=False):
             edges.append({"from": f"L{a['index']}", "to": f"L{b['index']}", "kind": "seq"})
             edges.append(
                 {
@@ -385,7 +388,7 @@ def _loop_graph(record: dict) -> dict:
                     "note": "earlier loop's exit summary feeds later loop's establishment",
                 }
             )
-    top = sorted(by_depth.get(None, []), key=lambda l: (l.get("line") or 0))
+    top = sorted(by_depth.get(None, []), key=lambda lp: (lp.get("line") or 0))
     if top:
         edges.append({"from": "entry", "to": f"L{top[0]['index']}", "kind": "st"})
         edges.append({"from": f"L{top[-1]['index']}", "to": "exit", "kind": "st"})
@@ -404,7 +407,7 @@ def _loop_graph(record: dict) -> dict:
             "inner_loops": [f"L{c.get('index')}" for c in loops if c.get("parent") == loop.get("index")],
             "written": written,
         }
-    return {"nodes": ["entry", "exit"] + [f"L{l.get('index')}" for l in loops], "edges": edges}
+    return {"nodes": ["entry", "exit"] + [f"L{lp.get('index')}" for lp in loops], "edges": edges}
 
 
 def _link_loops(loops: list[dict]) -> None:
@@ -966,7 +969,7 @@ def _render_loop_deps(record: dict, mapped, lines: list[str]) -> None:
         "\n**Loop dependency context** (which loops feed which — when a preservation goal fails, the missing "
         "fact often lives in a predecessor or inner loop's exit summary, not in the failing loop itself):"
     )
-    node_line = {f"L{l.get('index')}": f"L{mapped(l['line'])}" for l in record.get("loops") or []}
+    node_line = {f"L{lp.get('index')}": f"L{mapped(lp['line'])}" for lp in record.get("loops") or []}
 
     def _where(node: str) -> str:
         return node_line.get(node, node)
@@ -990,7 +993,7 @@ def _render_loop_deps(record: dict, mapped, lines: list[str]) -> None:
 
 def _render_loop_templates(record: dict, mapped, lines: list[str]) -> None:
     loops = record.get("loops") or []
-    if not any(any((l.get("var_classes") or {}).values()) for l in loops):
+    if not any(any((lp.get("var_classes") or {}).values()) for lp in loops):
         return
     lines.append(
         "\n**Loop invariant templates** (skeletons projected from the loop analysis — fill each PLACE_HOLDER, "
@@ -1008,21 +1011,18 @@ def _render_loop_templates(record: dict, mapped, lines: list[str]) -> None:
         guard = loop.get("guard")
         for v in vc["unchanged"]:
             if guard:
-                lines.append(
-                    f"{indent}   - {_code(f'loop invariant !({guard}) ==> {v} == \\at({v}, Pre);')} "
-                    "(loop skipped: unchanged)"
-                )
-            lines.append(f"{indent}   - {_code(f'loop invariant {v} == \\at({v}, Pre);')} (unchanged)")
+                inv = f"loop invariant !({guard}) ==> {v} == {_AT}({v}, Pre);"
+                lines.append(f"{indent}   - {_code(inv)} (loop skipped: unchanged)")
+            inv = f"loop invariant {v} == {_AT}({v}, Pre);"
+            lines.append(f"{indent}   - {_code(inv)} (unchanged)")
         for v in vc["non_inductive"]:
             safe = re.sub(r"\W", "_", v)
             if guard:
-                lines.append(
-                    f"{indent}   - {_code(f'loop invariant ({guard}) ==> ({v} == \\at({v}, Pre) || PLACE_HOLDER_for_{safe});')}"
-                )
+                inv = f"loop invariant ({guard}) ==> ({v} == {_AT}({v}, Pre) || PLACE_HOLDER_for_{safe});"
+                lines.append(f"{indent}   - {_code(inv)}")
             else:
-                lines.append(
-                    f"{indent}   - {_code(f'loop invariant {v} == \\at({v}, Pre) || PLACE_HOLDER_for_{safe};')}"
-                )
+                inv = f"loop invariant {v} == {_AT}({v}, Pre) || PLACE_HOLDER_for_{safe};"
+                lines.append(f"{indent}   - {_code(inv)}")
         for v in vc["inductive"]:
             safe = re.sub(r"\W", "_", v)
             if guard:

@@ -191,6 +191,27 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         assert len(errors) >= 1
         assert any("unsound" in e.lower() or "forbidden" in e.lower() or "syntax hazard" in e.lower() for e in errors)
 
+    def test_verify_acsl_only_rejects_empty_named_behaviors(self) -> None:
+        """Frama-C 34+ forbids empty named behaviors (`behavior b: ;`) in function and statement
+        contracts (fatal annot-error "unexpected token ';'"); the mechanical check flags them pre-splice."""
+        from acsl_ast import find_empty_named_behaviors
+
+        fn_level = "/*@ behavior b: ; */\n" + BASELINE_C
+        errors = verify_acsl_only(BASELINE_C, fn_level, path="parser.c")
+        assert any("empty named behavior" in e for e in errors)
+
+        stmt_level = BASELINE_C.replace(
+            "int parse_magic(const uint8_t *buf, size_t len) {",
+            "int parse_magic(const uint8_t *buf, size_t len) {\n    /*@ behavior b: ; */",
+        )
+        errors = verify_acsl_only(BASELINE_C, stmt_level, path="parser.c")
+        assert any("empty named behavior" in e for e in errors)
+
+        # A non-empty named behavior passes both the splice check and the standalone scan.
+        ok = "/*@ behavior b: assumes len >= 4; */\n" + BASELINE_C
+        assert verify_acsl_only(BASELINE_C, ok, path="parser.c") == []
+        assert find_empty_named_behaviors(tokenize_c_acsl(ok, path="parser.c"), path="parser.c") == []
+
     def test_verify_acsl_only_allows_valid_logic_integer_and_loop_invariant(self) -> None:
         """Valid logic integer functions (including pointer parameters) and loop/type/global invariants pass."""
         valid_acsl = (

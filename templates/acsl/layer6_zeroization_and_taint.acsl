@@ -38,4 +38,18 @@
  * Assert at network emission sink (e.g., syslog_send_packet) that no byte
  * of the outgoing packet is tainted by the secret source:
  *   //@ assert L6_no_secret_leak: !\tainted(syslog_out_buf[0 .. pkt_len - 1]);
+ *
+ * Alternative idiom (upstream plugins/eva/tests/secure_flow, vendored as
+ * docs/upstream/sources/annot11.c + security_macro.h): mark the secret itself
+ * private and assert the public status at the sink, under `-eva-secure-flow`
+ * with `-cpp-extra-args="-include security_macro.h"` defining
+ *   #define __fc_private __attribute__((private))
+ *   #define __fc_public  __attribute__((public))
+ *
+ *   int __fc_private global_key[5];
+ *   //@ assert L6_no_secret_leak: security_status(syslog_out_buf) == public;
+ *
+ * (security_status is registered by Eva's taint domain only, so keep these
+ * annotations in comments here like the rest of this section: a live predicate
+ * using it would not parse under WP.)
  */

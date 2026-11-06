@@ -24,10 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -120,7 +120,7 @@ def check_function(
     contract = _acsl_text_of_span(span)
     brace = _find_body_brace_offset(span.text, path=str(c_file))
     body = span.text[brace:] if brace is not None else span.text
-    result = {
+    result: dict[str, Any] = {
         "function": fn,
         "file": str(c_file),
         "spec_mutants": 0,
@@ -215,7 +215,7 @@ def run_mutation_check(
     wp_dir = run_dir / "workspace" / "reports" / "wp"
     work = run_dir / "workspace" / "work"
     out_path = out_path or run_dir / "workspace" / "reports" / "mutation.json"
-    doc = {"schema": MUTATION_SCHEMA, "generated_at": utc_now(), "functions": {}}
+    doc: dict[str, Any] = {"schema": MUTATION_SCHEMA, "generated_at": utc_now(), "functions": {}}
     if wp_dir.is_dir():
         reports = sorted(wp_dir.glob("*.json"))
         for rep_path in reports[:max_functions]:
@@ -233,7 +233,7 @@ def run_mutation_check(
             if not c_file.is_file():
                 continue
             doc["functions"][fn] = check_function(c_file, fn, "-I.", run_dir / "workspace" / "reports" / "mutation-wp", wp_runner=wp_runner, max_mutants=max_mutants)
-    totals = {
+    totals: dict[str, Any] = {
         "functions": len(doc["functions"]),
         "spec_mutants": sum(f.get("spec_mutants", 0) for f in doc["functions"].values()),
         "equivalent": sum(f.get("equivalent", 0) for f in doc["functions"].values()),

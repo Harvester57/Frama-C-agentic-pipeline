@@ -1169,6 +1169,9 @@ def test_exec_runs_the_engine_and_returns_its_exit_code(tmp_path, fake_engine, m
 
 def test_exec_refuses_target_code_when_memory_or_pids_cannot_be_enforced(tmp_path, fake_engine, monkeypatch, capsys):
     fake_engine(_podman(["cpu", "cpuset"]))
+    # Pin off: on multi-NUMA/L3 hosts FRAMAC_PIN=auto switches --cpus to --cpuset-cpus, which this
+    # test does not assert (it checks the memory/pids refusal, not placement).
+    monkeypatch.setenv("FRAMAC_PIN", "off")
     monkeypatch.setenv(
         "FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module m"
     )

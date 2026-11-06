@@ -362,3 +362,30 @@ Prover Alt-Ergo 2.5.4 returns Timeout (Qed:2ms) (10s)
     assert len(dumps) == 1
     assert "Goal Post-condition 'bound' in 'parse_hdr':" in dumps[0]
     assert "Prove: 0 <= result." in dumps[0]
+
+
+def test_wp_counter_example_model_goals_parse():
+    import run_wp_function as W
+
+    log = (
+        "[wp] [Unsuccess] typed_check_lemma_wrong (CVC4) (Model)\n"
+        "[wp] [Valid] typed_ok (Alt-Ergo)\n"
+        "[wp] [Unsuccess] typed_wrong_ensures (Z3) (Model)\n"
+    )
+    goals = [{"goal": m.group(1).strip(), "prover": m.group(2).strip()} for m in W._MODEL_GOAL_RE.finditer(log)]
+    assert goals == [
+        {"goal": "typed_check_lemma_wrong", "prover": "CVC4"},
+        {"goal": "typed_wrong_ensures", "prover": "Z3"},
+    ]
+
+
+def test_wp_counter_examples_flag_is_threaded():
+    import inspect
+
+    import run_wp_function as W
+
+    sig = inspect.signature(W.run_wp_on_function)
+    assert "counter_examples" in sig.parameters and sig.parameters["counter_examples"].default is False
+    src = inspect.getsource(W)
+    assert 'cmd.append("-wp-counter-examples")' in src
+    assert '"counter_example_goals": model_goals' in src

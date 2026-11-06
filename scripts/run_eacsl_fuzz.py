@@ -2318,6 +2318,264 @@ def replay_candidates(
     }
 
 
+# ---------------------------------------------------------------------------
+# Crash-input minimization with cvise/creduce (upstream share/analysis-scripts/creduce.sh
+# pattern, adapted: the interest test replays each variant on the E-ACSL binary and accepts it
+# only if it still crashes with the same failure fingerprint).
+# ---------------------------------------------------------------------------
+
+
+def find_creduce() -> str | None:
+    """The cvise (Python port of creduce) or creduce binary: $CREDUCE first, then PATH."""
+    env = os.environ.get("CREDUCE")
+    if env and Path(env).is_file():
+        return env
+    for name in ("cvise", "creduce"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _failure_fingerprint(failure: dict | None) -> str | None:
+    if not failure:
+        return None
+    return make_fingerprint(
+        failure.get("file") or "unknown",
+        failure.get("function") or "unknown_function",
+        failure.get("alarm_kind") or failure.get("kind") or "crash",
+        failure.get("predicate") or "",
+    )
+
+
+def minimize_interest(
+    binary: Path,
+    variant: Path,
+    scratch: Path,
+    fingerprint: str | None,
+    *,
+    module: str = "",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+) -> bool:
+    """cvise interest test: the variant still crashes the binary with the same fingerprint."""
+    rep = replay_artifact(binary, variant, scratch, module=module, per_input_timeout=per_input_timeout)
+    if not rep.get("reproduced"):
+        return False
+    fp = _failure_fingerprint(rep.get("failure"))
+    return fp is not None and (fingerprint is None or fp == fingerprint)
+
+
+def minimize_input(
+    binary: Path,
+    input_path: Path,
+    scratch: Path,
+    *,
+    module: str = "",
+    fingerprint: str | None = None,
+    max_time_s: int = 600,
+    jobs: int = 4,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    tool: str | None = None,
+) -> dict:
+    """
+    Minimize one crash input with cvise/creduce, run under the sandbox with a wall-clock cap. The
+    variant file is updated in place as better variants are found, so a timeout still leaves the
+    best-so-far. The result is verified by one final replay before it is reported.
+    """
+    binary = Path(binary)
+    input_path = Path(input_path)
+    scratch = Path(scratch)
+    tool = tool or find_creduce()
+    report: dict = {
+        "mode": "minimize",
+        "input": input_path.as_posix(),
+        "binary": binary.as_posix(),
+        "tool": tool,
+        "fingerprint": fingerprint,
+        "status": "error",
+        "reason": None,
+        "minimized": None,
+        "original_size_bytes": None,
+        "minimized_size_bytes": None,
+        "reduction_pct": None,
+        "reproduced": False,
+        "passes": None,
+        "timed_out": False,
+        "log_tail": "",
+    }
+    if tool is None:
+        report["reason"] = "cvise/creduce not found (set CREDUCE or install the cvise package)"
+        return report
+    if not binary.is_file():
+        report["reason"] = f"binary not found: {binary}"
+        return report
+    if not input_path.is_file():
+        report["reason"] = f"input not found: {input_path}"
+        return report
+    report["original_size_bytes"] = input_path.stat().st_size
+    work = scratch / "creduce"
+    work.mkdir(parents=True, exist_ok=True)
+    variant = work / input_path.name
+    shutil.copyfile(input_path, variant)
+    script_path = Path(__file__).resolve()
+    interest = work / "interest.sh"
+    interest.write_text(
+        "#!/bin/sh\n"
+        f"exec python3 {shlex.quote(str(script_path))} minimize-interest"
+        f" --binary {shlex.quote(str(binary.resolve()))}"
+        f" --fingerprint {shlex.quote(fingerprint or '')}"
+        f" --module {shlex.quote(module)}"
+        f" --per-input-timeout {int(per_input_timeout)}"
+        f" --scratch-dir {shlex.quote(str(scratch.resolve()))}"
+        ' "$1"\n',
+        encoding="utf-8",
+    )
+    interest.chmod(0o755)
+    # --not-c: inputs are raw fuzzer bytes, not C sources, so skip the parsability check.
+    cmd = [tool, "--not-c", "-n", str(max(1, int(jobs))), str(interest), str(variant)]
+    try:
+        res = run_sandboxed(
+            cmd,
+            writable=[work, scratch],
+            timeout_s=max(30, int(max_time_s)),
+            limits=Limits(cpu_seconds=max(60, int(max_time_s)) * max(1, int(jobs))),
+        )
+    except SandboxUnavailable as exc:
+        report["reason"] = f"sandbox_unavailable: {exc}"
+        return report
+    out = res.stdout + "\n" + res.stderr
+    report["timed_out"] = res.timed_out
+    report["log_tail"] = out[-3000:]
+    m = re.search(r"===\s*(\d+)\s+interesting", out)
+    if m:
+        report["passes"] = int(m.group(1))
+    if not variant.is_file() or variant.stat().st_size == 0:
+        report["reason"] = "cvise produced no variant"
+        return report
+    # Verify the best-so-far still reproduces with the same fingerprint before reporting it.
+    check = replay_artifact(binary, variant, scratch, module=module, per_input_timeout=per_input_timeout)
+    report["reproduced"] = bool(check.get("reproduced")) and (
+        fingerprint is None or _failure_fingerprint(check.get("failure")) == fingerprint
+    )
+    minimized = Path(str(input_path) + ".min")
+    shutil.copyfile(variant, minimized)
+    report["minimized"] = minimized.as_posix()
+    report["minimized_size_bytes"] = minimized.stat().st_size
+    orig = report["original_size_bytes"] or 0
+    if orig > 0:
+        report["reduction_pct"] = round(100.0 * (orig - report["minimized_size_bytes"]) / orig, 2)
+    report["status"] = "ok" if report["reproduced"] else "not_reproduced"
+    return report
+
+
+def minimize_candidates(
+    candidates_path: Path,
+    harness_dir: Path,
+    out_dir: Path,
+    *,
+    bin_dir: Path | None = None,
+    engine: str | None = None,
+    selftest_json: Path | None = DEFAULT_SELFTEST_JSON,
+    machdep: str = "gcc_x86_64",
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    max_time_s: int = 600,
+    jobs: int = 4,
+) -> dict:
+    """
+    Minimize the reproducer of every unverified candidate (same selection as replay-candidates),
+    on the module's replay binary. Each minimized input is written next to its artifact as
+    `<artifact>.min`; `index.json` maps each fingerprint to its report.
+    """
+    candidates = load_json_optional(Path(candidates_path), [])
+    todo = [c for c in candidates if isinstance(c, dict) and c.get("status") == "unverified" and _reproducer_paths(c)]
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
+    prepared_by_key: dict[tuple[str, str], dict] = {}
+    index: dict[str, dict] = {}
+    by_status: dict[str, int] = {}
+    tool = find_creduce()
+    for cand in todo:
+        fingerprint = str(cand.get("fingerprint") or "")
+        module = str(cand.get("module") or "")
+        eng = engine or _candidate_engine(cand)
+        key = (module, eng)
+        if key not in prepared_by_key:
+            try:
+                spec = replay_build_spec(module, Path(harness_dir))
+            except (OSError, ValueError, RuntimeError) as exc:
+                prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
+            else:
+                prepared_by_key[key] = prepare_replay_binary(
+                    module,
+                    spec["sources"],
+                    bin_dir / f"fuzz_{module}",
+                    engine=eng,
+                    selftest_json=selftest_json,
+                    machdep=machdep,
+                    cppflags=spec["cppflags"],
+                    ldflags=spec["ldflags"],
+                    rte_initialized=bool(spec.get("rte_initialized", True)),
+                )
+        prepared = prepared_by_key[key]
+        binary = prepared.get("binary") if isinstance(prepared, dict) else None
+        scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
+        if binary is None:
+            report = {
+                "mode": "minimize",
+                "status": "error",
+                "reason": (prepared.get("reason") if isinstance(prepared, dict) else None) or "no binary",
+                "tool": tool,
+            }
+        else:
+            reproducers = _reproducer_paths(cand)
+            reports = [
+                minimize_input(
+                    Path(binary),
+                    rep,
+                    scratch,
+                    module=module,
+                    fingerprint=fingerprint or None,
+                    max_time_s=max_time_s,
+                    jobs=jobs,
+                    per_input_timeout=per_input_timeout,
+                    tool=tool,
+                )
+                for rep in reproducers
+            ]
+            report = {
+                "mode": "minimize",
+                "status": "ok" if any(r["status"] == "ok" for r in reports) else "error",
+                "tool": tool,
+                "fingerprint": fingerprint,
+                "runs": reports,
+            }
+        report["candidate_fingerprint"] = fingerprint
+        report_path = out_dir / f"{_candidate_slug(fingerprint)}.json"
+        atomic_write_json(report_path, report)
+        status = str(report["status"])
+        index[fingerprint] = {"report": report_path.as_posix(), "module": module, "status": status}
+        by_status[status] = by_status.get(status, 0) + 1
+    index_path = out_dir / "index.json"
+    atomic_write_json(
+        index_path,
+        {
+            "generated_at": utc_now(),
+            "candidates_file": Path(candidates_path).as_posix(),
+            "tool": tool,
+            "by_fingerprint": index,
+        },
+    )
+    return {
+        "mode": "minimize-candidates",
+        "status": "error" if by_status.get("error") else "ok",
+        "tool": tool,
+        "candidates": len(todo),
+        "by_status": by_status,
+        "index": index_path.as_posix(),
+    }
+
+
 def _written_profiles(profile_dir: Path) -> list[str]:
     """
     Raw profiles under `profile_dir` that hold data. The profile runtime creates its file empty at
@@ -2835,6 +3093,39 @@ def main(argv: list[str] | None = None) -> int:
     p_cands.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_cands.add_argument("--no-attribution-replay", action="store_true")
 
+    p_min = sub.add_parser("minimize", help="Minimize crash input(s) with cvise/creduce on a given or built binary")
+    _add_build_args(p_min, sources_required=False)
+    p_min.add_argument("--module", required=True)
+    p_min.add_argument("--inputs", type=Path, nargs="+", required=True, help="Crash input files to minimize")
+    p_min.add_argument("--binary", type=Path, default=None, help="Minimize on this binary instead of building one")
+    p_min.add_argument("--out-bin", type=Path, default=None)
+    p_min.add_argument("--fingerprint", default=None, help="Only accept variants crashing with this fingerprint")
+    p_min.add_argument("--max-time", type=int, default=600, help="Wall-clock seconds per input (default: 600)")
+    p_min.add_argument("--jobs", type=int, default=4, help="cvise/creduce parallel jobs (default: 4)")
+    p_min.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_min.add_argument("--scratch-dir", type=Path, default=None)
+    p_min.add_argument("--out-json", type=Path, required=True)
+
+    p_minc = sub.add_parser("minimize-candidates", help="Minimize the reproducers of every unverified candidate")
+    p_minc.add_argument("--candidates", type=Path, default=Path("candidates.json"))
+    p_minc.add_argument("--harness-dir", type=Path, default=Path("workspace/harnesses"))
+    p_minc.add_argument("--out-dir", type=Path, default=Path("workspace/reports/minimize"))
+    p_minc.add_argument("--bin-dir", type=Path, default=None)
+    p_minc.add_argument("--engine", choices=["auto", "eacsl", "sanitizers"], default=None)
+    p_minc.add_argument("--selftest-json", type=Path, default=DEFAULT_SELFTEST_JSON)
+    p_minc.add_argument("--machdep", default="gcc_x86_64")
+    p_minc.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_minc.add_argument("--max-time", type=int, default=600, help="Wall-clock seconds per reproducer (default: 600)")
+    p_minc.add_argument("--jobs", type=int, default=4)
+
+    p_int = sub.add_parser("minimize-interest", help="cvise interest test (called by the generated interest.sh)")
+    p_int.add_argument("--binary", type=Path, required=True)
+    p_int.add_argument("--fingerprint", default="")
+    p_int.add_argument("--module", default="")
+    p_int.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_int.add_argument("--scratch-dir", type=Path, required=True)
+    p_int.add_argument("variant", type=Path)
+
     raw_argv = normalize_flag_args(list(argv) if argv is not None else sys.argv[1:])
     args = parser.parse_args(raw_argv)
     if args.mode == "campaign" and str(args.workers).strip().lower() != "auto":
@@ -2860,6 +3151,79 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "ok" else 1
+
+    if args.mode == "minimize-interest":
+        # Exit 0 iff the variant is still interesting (crashes with the same fingerprint).
+        interesting = minimize_interest(
+            args.binary,
+            args.variant,
+            args.scratch_dir,
+            args.fingerprint or None,
+            module=args.module,
+            per_input_timeout=args.per_input_timeout,
+        )
+        return 0 if interesting else 1
+
+    if args.mode == "minimize-candidates":
+        summary = minimize_candidates(
+            args.candidates,
+            args.harness_dir,
+            args.out_dir,
+            bin_dir=args.bin_dir,
+            engine=args.engine,
+            selftest_json=args.selftest_json,
+            machdep=args.machdep,
+            per_input_timeout=args.per_input_timeout,
+            max_time_s=args.max_time,
+            jobs=args.jobs,
+        )
+        print(json.dumps(summary, indent=2))
+        return 0 if summary["status"] == "ok" else 1
+
+    if args.mode == "minimize":
+        if args.binary is None and not (args.sources and args.out_bin):
+            parser.error("minimize needs --binary, or --sources with --out-bin")
+        prepared = None
+        if args.binary is None:
+            prepared = prepare_replay_binary(
+                args.module,
+                args.sources,
+                args.out_bin,
+                engine=args.engine,
+                selftest_json=args.selftest_json,
+                machdep=args.machdep,
+                cppflags=args.cppflags,
+                ldflags=args.ldflags,
+                rte_initialized=not args.no_rte_initialized,
+            )
+            binary = prepared.get("binary")
+        else:
+            binary = args.binary
+        scratch = args.scratch_dir or args.out_json.parent / f".scratch_minimize_{args.module}"
+        runs = [
+            minimize_input(
+                Path(binary) if binary else Path(""),
+                inp,
+                scratch,
+                module=args.module,
+                fingerprint=args.fingerprint,
+                max_time_s=args.max_time,
+                jobs=args.jobs,
+                per_input_timeout=args.per_input_timeout,
+            )
+            for inp in args.inputs
+        ]
+        res = {
+            "mode": "minimize",
+            "module": args.module,
+            "binary": str(binary) if binary else None,
+            "status": "ok" if any(r["status"] == "ok" for r in runs) else "error",
+            "runs": runs,
+        }
+        args.out_json.parent.mkdir(parents=True, exist_ok=True)
+        args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(_summary(res), indent=2))
+        return 0 if res["status"] == "ok" else 1
 
     digest_before = prover_candidates.digest_before_run(args.out_json) if args.mode == "guardrail" else None
     try:

@@ -31,18 +31,19 @@ EVA_TARGETS    := $(addprefix eva-,$(EVA_MODULES))
 EVA_BASE_TARGETS := $(addprefix evabase-,$(EVA_MODULES))
 EVA_RUNG_TARGETS := $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))
 EVA_TUNE_TARGETS := $(addprefix evatune-,$(EVA_MODULES))
+FLAMEGRAPH_TARGETS := $(addprefix flamegraph-,$(EVA_MODULES))
 FACTS_TARGETS  := $(addprefix facts-,$(MODULES))
 MODULE_TARGETS := $(addprefix module-,$(MODULES))
 
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init seed build selftest fuzz coverage eva eva-tune eva-tune-base facts ingest replay wp-queue wp-sweep report \
+.PHONY: help slice-init seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
-        $(FACTS_TARGETS) $(MODULE_TARGETS)
+        $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init seed build selftest fuzz coverage eva eva-tune facts ingest replay wp-queue wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init seed build selftest fuzz coverage eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -155,6 +156,13 @@ $(EVA_TUNE_TARGETS): evatune-%:
 		--report-dir workspace/reports/eva-tuning/$* --work-dir workspace/eva/$*/tune \
 		--out-json workspace/reports/eva/$*.json
 
+# Render the Eva flamegraph (flamegraph.svg/html) of a module from the flamegraph.txt its eva-<mod>
+# run wrote. Troubleshooting aid for slow runs; never blocks the pipeline, hence the `-`.
+flamegraph: $(FLAMEGRAPH_TARGETS)
+$(FLAMEGRAPH_TARGETS): flamegraph-%: eva-%
+	-$(RUN) --class light --key $* --output workspace/eva/$*/flamegraph.svg -- \
+		$(PY) $(S)/eva_flamegraph.py --dir workspace/eva/$*
+
 # Kernel AST facts of the module's functions, joined with the flows of its Eva report if there is
 # one, for the provers' briefs (cached by content). Hints only: a failure means briefs without
 # facts, never a stopped pipeline, hence the `-`.
@@ -177,6 +185,14 @@ replay: ingest
 	$(RUN) --class replay --key candidates --output workspace/reports/replay/index.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py replay-candidates --candidates candidates.json \
 		--harness-dir workspace/harnesses --out-dir workspace/reports/replay
+
+# Minimizes every unverified candidate's reproducer with cvise/creduce (writes <artifact>.min next
+# to each crash input; indexed by workspace/reports/minimize/index.json). Best run after `replay`;
+# skipped cleanly when cvise is not installed (tool_unavailable).
+minimize: replay
+	-$(RUN) --class replay --key minimize --output workspace/reports/minimize/index.json -- \
+		$(PY) $(S)/run_eacsl_fuzz.py minimize-candidates --candidates candidates.json \
+		--harness-dir workspace/harnesses --out-dir workspace/reports/minimize
 
 wp-queue: ingest facts
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init

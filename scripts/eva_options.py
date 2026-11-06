@@ -16,6 +16,12 @@ change" it. So:
   and runs with different values are never combined.
 
 `multidim` is the only domain that can be added here; the base domains stay enabled.
+
+Per-function overrides (`-eva-*-function`, upstream plugins/eva/src/parameters.ml) are allowed as
+`func_value`: one `func:param` entry, or a list of them (the flag is repeatable upstream, so a list
+emits one flag per entry). They are tuning for a single function, so runs differing only in them are
+still comparable. `builtin`/`use-spec` are plain `func_list`s: unlike `alloc-functions` they do not
+get malloc/calloc/realloc merged in.
 """
 
 from __future__ import annotations
@@ -37,15 +43,19 @@ ALLOC_BUILTIN_MODES = ("imprecise", "by_stack", "fresh", "fresh_weak")
 STD_ALLOC_FUNCTIONS = ("malloc", "calloc", "realloc")
 _SIMPLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _C_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FUNC_VALUE_RE = re.compile(r"^([^:]+):(.+)$")
+_DOMAIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
 class EvaOption:
-    kind: str  # int | bool | enum | split_return | domains | func_list
+    kind: str  # int | bool | enum | split_return | domains | func_list | func_value
     minimum: int = 0
     maximum: int = MAX_INT_OPTION
     choices: tuple[str, ...] = ()
     correctness: bool = False
+    merge_std_alloc: bool = True  # func_list only: prepend malloc/calloc/realloc (alloc-functions)
+    domains: bool = False  # func_value only: the head of each entry is a domain name, not a function
 
 
 EVA_OPTIONS: dict[str, EvaOption] = {
@@ -68,6 +78,27 @@ EVA_OPTIONS: dict[str, EvaOption] = {
     "context-depth": EvaOption("int", minimum=2, correctness=True),
     "precision": EvaOption("int", maximum=11),
     "domains": EvaOption("domains"),
+    # Per-function overrides (`-eva-*-function f:n`, repeatable): tuning for one function only.
+    "slevel-function": EvaOption("func_value"),
+    "partition-history-function": EvaOption("func_value"),
+    "equality-through-calls-function": EvaOption("func_value"),
+    "subdivide-non-linear-function": EvaOption("func_value"),
+    "split-return-function": EvaOption("func_value"),
+    "domains-function": EvaOption("func_value", domains=True),
+    "partition-value": EvaOption("int"),
+    "default-loop-unroll": EvaOption("int"),
+    "context-width": EvaOption("int"),
+    "interprocedural-history": EvaOption("int"),
+    "interprocedural-splits": EvaOption("int"),
+    # Stub externals inside Eva itself (upstream use_spec.i pattern); no std allocators merged in.
+    "builtin": EvaOption("func_list", merge_std_alloc=False),
+    "use-spec": EvaOption("func_list", merge_std_alloc=False),
+    "reduce-on-logic-alarms": EvaOption("bool"),
+    "hierarchical-convergence": EvaOption("bool"),
+    "descending-iteration": EvaOption("bool"),
+    "join-results": EvaOption("bool"),
+    "alloc-returns-null": EvaOption("bool"),
+    "all-rounding-modes-constants": EvaOption("bool"),
 }
 
 
@@ -98,6 +129,23 @@ def option_problem(name: str, value: Any) -> str | None:
         bad = [fn for fn in value if not _C_IDENT_RE.fullmatch(fn)]
         if bad or len(set(value)) != len(value):
             return f"{name} must contain unique valid C identifiers (got {value})"
+        return None
+    if spec.kind == "func_value":
+        entries = value if isinstance(value, list) else [value]
+        if not entries or not all(isinstance(e, str) for e in entries):
+            return f"{name} must be a 'func:param' string or a non-empty list of them"
+        for entry in entries:
+            m = _FUNC_VALUE_RE.match(entry)
+            if not m:
+                return f"{name} entries must be 'func:param' (got {entry!r})"
+            head = m.group(1)
+            if spec.domains:
+                if not _DOMAIN_NAME_RE.fullmatch(head):
+                    return f"{name} entries must start with a domain name (got {head!r})"
+            elif not _C_IDENT_RE.fullmatch(head):
+                return f"{name} entries must start with a C function name (got {head!r})"
+        if len(set(entries)) != len(entries):
+            return f"{name} entries must be unique (got {value})"
         return None
     if not isinstance(value, list) or not value or not all(isinstance(d, str) for d in value):
         return f"{name} must be a non-empty list of domain names"
@@ -136,7 +184,7 @@ def parse_option(text: str) -> tuple[str, Any]:
             value = lowered == "true"
         elif spec.kind == "split_return" and raw.strip() not in SPLIT_RETURN_WORDS:
             value = _parse_int(name, raw)
-        elif spec.kind in ("domains", "func_list"):
+        elif spec.kind in ("domains", "func_list", "func_value"):
             value = [d.strip() for d in raw.split(",") if d.strip()]
     problem = option_problem(name, value)
     if problem:
@@ -177,8 +225,14 @@ def framac_args(options: Mapping[str, Any]) -> list[str]:
         if spec.kind == "bool":
             args.append(f"-eva-{name}" if value else f"-eva-no-{name}")
         elif spec.kind == "func_list":
-            funcs = list(dict.fromkeys([*STD_ALLOC_FUNCTIONS, *value]))
+            funcs = list(value)
+            if spec.merge_std_alloc:
+                funcs = list(dict.fromkeys([*STD_ALLOC_FUNCTIONS, *funcs]))
             args.extend([f"-eva-{name}", ",".join(funcs)])
+        elif spec.kind == "func_value":
+            # The flag is repeatable upstream: one -eva-<name> per entry.
+            for entry in value if isinstance(value, list) else [value]:
+                args.extend([f"-eva-{name}", entry])
         else:
             args.extend([f"-eva-{name}", str(value)])
     return args
@@ -201,6 +255,11 @@ def merge_options(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[s
             merged[name] = max(merged[name], value)
         elif kind in ("domains", "func_list") and name in merged:
             merged[name] = sorted(set(merged[name]) | set(value))
+        elif kind == "func_value" and name in merged:
+            # Both sets of per-function overrides apply: the flag is repeatable.
+            old = merged[name] if isinstance(merged[name], list) else [merged[name]]
+            new = value if isinstance(value, list) else [value]
+            merged[name] = sorted(set(old) | set(new))
         else:
             merged[name] = value
     return merged
@@ -218,7 +277,11 @@ def merge_options(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[s
 # and history stays out of the rung that raises slevel the most. Changing a rung changes results, so
 # bump LADDER_VERSION with it: recorded decisions then no longer apply.
 
-LADDER_VERSION = 1
+LADDER_VERSION = 2
+# At most this many functions get a per-function slevel override in the "perfn" rung: each entry is
+# one -eva-slevel-function flag, and the rung is one whole Eva run like any other.
+PERFN_MAX_FUNCTIONS = 8
+PERFN_SLEVEL = 1000
 # A trial may take this many times the base run, so a slower machine gets proportionally more time
 # and finishes the same trials. The floor keeps very fast modules from cutting a rung off early.
 TRIAL_TIMEOUT_FACTOR = 8
@@ -247,6 +310,10 @@ LADDER: tuple[Rung, ...] = (
     # Eva's own recipe for every knob at once. The pipeline always passes these two explicitly, and
     # -eva-precision never overrides an option set by hand, so they carry its values for level 8.
     Rung("precision", {"precision": 8, "slevel": 500, "auto-loop-unroll": 384}),
+    # Per-function slevel for the functions that still have Unknowns. Its options are not static:
+    # pipeline_make.py fills them from the base run's unknown_obligations_by_function (deterministic,
+    # since the base run is re-run before the rungs), so the rung is declared here with no options.
+    Rung("perfn", {}),
 )
 RUNG_NAMES = tuple(rung.name for rung in LADDER)
 

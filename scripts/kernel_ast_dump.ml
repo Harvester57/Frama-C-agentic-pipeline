@@ -184,9 +184,11 @@ class feature_scan feats = object
     if Ast_types.is_float (Cil.typeOf e) then feats.floats <- true;
     (match e.enode with
      | BinOp ((PlusPI | MinusPI | MinusPP), _, _, _) -> feats.pointer_arith <- true
+     (* Frama-C 34 removed the implicit array-to-pointer conversion in comparisons, so an
+        array operand keeps its array type here; match both pointers and arrays. *)
      | BinOp ((Lt | Gt | Le | Ge | Eq | Ne), a, b, _)
-       when Ast_types.is_ptr (Cil.typeOf a)
-         && Ast_types.is_ptr (Cil.typeOf b)
+       when (Ast_types.is_ptr (Cil.typeOf a) || Ast_types.is_array (Cil.typeOf a))
+         && (Ast_types.is_ptr (Cil.typeOf b) || Ast_types.is_array (Cil.typeOf b))
          && not (Cil.isZero (Cil.stripCasts a) || Cil.isZero (Cil.stripCasts b)) ->
        feats.pointer_compare <- true
      | BinOp ((Div | Mod), _, d, _) when Option.is_none (Cil.isInteger (Cil.stripCasts d)) ->

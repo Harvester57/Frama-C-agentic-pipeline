@@ -39,6 +39,8 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
      ```text
      python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module_name} --inputs <reproducer files> --binary <compile.binary> --out-json agents/{agent_id}/scratch/replay_{module_name}.json
      ```
+   - **Prefer the minimized reproducer:** after `pipeline_make.py run minimize` (cvise/creduce, installed in the container), each crash artifact has a `<artifact>.min` sibling holding the smallest input that still crashes with the same fingerprint; `workspace/reports/minimize/index.json` maps fingerprints to the minimize reports. Replay the `.min` first — it is faster and its failure is the same property — and keep the original as the witness of record.
+   - **WP counter-example witnesses:** for candidates with `origin: "eva"` or `"breaker"` (an `Invalid` WP/Eva goal), the parent re-check runs WP with `--counter-examples`; the WP report's `counter_example_goals` lists the failed goals that have a prover model (`[wp] [Unsuccess] <goal> (<prover>) (Model)`). Re-run `run_wp_function.py --counter-examples --prop <goal> --dump-goal` on the module to extract the model as a concrete witness input shape, and cite it in the verdict.
    - Never rebuild that binary yourself under `workspace/harnesses/`, with these or any other flags.
    - Every input is replayed exactly once, with a fixed seed and per-input timeout. Pass the replay report to the parent; `ingest-verifier --replay-report` checks `confirmed` reproducers against it.
 2. **Audit Harness Legitimacy:**

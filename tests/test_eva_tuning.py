@@ -111,8 +111,14 @@ def test_every_allowlisted_option_parses(text, expected):
     "text",
     [
         # Nothing that turns a check off or changes what is analysed gets in, however it is spelled.
-        "use-spec=f",
         "no-warn-invalid-pointer=true",
+        # Per-function overrides and plain func_lists are typed, never raw tokens.
+        "slevel-function=20:main",
+        "slevel-function=main:",
+        "slevel-function=f:1,f:1",
+        "domains-function=Octagon:f",
+        "use-spec=malloc;rm",
+        "use-spec=",
         "warn-key=*=inactive",
         "stop-at-nth-alarm=1",
         "no-results=true",
@@ -177,9 +183,11 @@ def _extends(later: dict, earlier: dict) -> bool:
 def test_the_ladder_is_not_nested():
     rungs = {rung.name: dict(rung.options) for rung in eo.LADDER}
     assert len(eo.RUNG_NAMES) == len(rungs)
-    composite = eo.RUNG_NAMES[-1]
-    for name, options in rungs.items():
-        for other, other_options in rungs.items():
+    composite = eo.RUNG_NAMES[-2]  # the last rung, "perfn", gets its options from the base run
+    static = {name: options for name, options in rungs.items() if options}
+    assert "perfn" in rungs and not rungs["perfn"]
+    for name, options in static.items():
+        for other, other_options in static.items():
             if name != other and other != composite:
                 assert not _extends(other_options, options), f"{other} simply extends {name}"
     # PARF: history hurts on some programs even with a high slevel, so it never rides along with the top one.
@@ -1007,7 +1015,11 @@ def test_params_cli_parses_eva_options_and_clears_with_an_empty_value(tmp_path, 
     assert json.loads(capsys.readouterr().out)["overrides"]["eva_options"] == {"domains": ["multidim"]}
     assert pm.main([*base, "--eva-option", "no-warn-invalid-pointer=true"]) == 1
     capsys.readouterr()
-    assert pm.main([*base, "--eva-option", "use-spec="]) == 1
+    # `name=` clears a known option; an unknown name is refused even for clearing.
+    assert pm.main([*base, "--eva-option", "use-spec="]) == 0
+    assert "use-spec" not in json.loads(capsys.readouterr().out)["overrides"]["eva_options"]
+    assert pm.main([*base, "--eva-option", "no-warn-invalid-pointer="]) == 1
+    capsys.readouterr()
 
 
 def test_a_tampered_params_file_is_refused(tmp_path):
@@ -1569,3 +1581,68 @@ def test_finish_promotes_best_completed_rung_when_base_times_out(tune_run, capsy
     assert report["status"] == "ok"
     assert report["unknown_count"] == 0
     assert report["tuning"]["selected"] in ("returns", "slevel")
+
+
+def test_eva_command_writes_flamegraph_and_runs_nonterm():
+    cmd, _ = run_eva_slice._eva_command(
+        ["a.c"], "eva_main", Path("out"), "gcc_x86_64", "-I.", 100, True, True, True, ""
+    )
+    assert cmd[cmd.index("-eva-flamegraph") + 1] == str(Path("out") / "flamegraph.txt")
+    # -nonterm runs after -save, on the saved AST, with its log appended to nonterm.log.
+    save_at = cmd.index("-save")
+    assert cmd[save_at + 2 : save_at + 5] == ["-then", "-nonterm", "-nonterm-log"]
+    assert cmd[save_at + 5] == f"a:{Path('out') / 'nonterm.log'}"
+    # The new outputs are cached and masked out of the cache key like the other report files.
+    assert "flamegraph.txt" in run_eva_slice._CACHED_OUTPUTS
+    assert "nonterm.log" in run_eva_slice._CACHED_OUTPUTS
+
+
+def test_repair_hints_port_make_wrapper_patterns():
+    log = (
+        "[eva] detected recursive call\n  stack: f -> g -> f\n"
+        "[kernel] Neither code nor specification for function ext_fn,\n"
+        "[kernel] Neither code nor explicit assigns clause for function rec_fn,\n"
+    )
+    hints = run_eva_slice.extract_repair_hints(log)
+    by_pattern = {h["pattern"]: h for h in hints}
+    assert by_pattern["recursive_call"]["action"].find("--eva-recursion-fallback") != -1
+    spec = [h for h in hints if h.get("function") == "ext_fn"][0]
+    assert spec["spec_kind"] == "specification" and "external_stubs.h" in spec["action"]
+    assigns = [h for h in hints if h.get("function") == "rec_fn"][0]
+    assert "assigns clause" in assigns["action"]
+    assert run_eva_slice.extract_repair_hints("[eva] all good\n") == []
+
+
+def test_parse_nonterm_log_matches_upstream_oracle_format():
+    text = "[nonterm:stmt] n7.i:4: Warning: \n  non-terminating loop\n  stack: main\n[nonterm] Analysis done.\n"
+    assert run_eva_slice.parse_nonterm_log(text) == [
+        {"location": "n7.i:4", "message": "non-terminating loop", "stack": "main"}
+    ]
+    assert run_eva_slice.parse_nonterm_log("") == []
+
+
+def test_per_function_and_plain_func_list_options_round_trip():
+    cases = {
+        "slevel-function=main2:20": ["-eva-slevel-function", "main2:20"],
+        "slevel-function=f:1000,g:2000": ["-eva-slevel-function", "f:1000", "-eva-slevel-function", "g:2000"],
+        "domains-function=octagon:parse+": ["-eva-domains-function", "octagon:parse+"],
+        "use-spec=ext_fn,other": ["-eva-use-spec", "ext_fn,other"],
+        "builtin=my_builtin": ["-eva-builtin", "my_builtin"],
+        "partition-value=4": ["-eva-partition-value", "4"],
+        "default-loop-unroll=64": ["-eva-default-loop-unroll", "64"],
+        "join-results=true": ["-eva-join-results"],
+        "reduce-on-logic-alarms=false": ["-eva-no-reduce-on-logic-alarms"],
+    }
+    for text, expected_args in cases.items():
+        name, value = eo.parse_option(text)
+        assert eo.parse_option(eo.format_option(name, value)) == (name, value)
+        assert eo.framac_args({name: value}) == expected_args
+    # use-spec/builtin do not get the std allocators merged in; alloc-functions still does.
+    assert eo.framac_args({"use-spec": ["f"]}) == ["-eva-use-spec", "f"]
+    assert eo.framac_args({"alloc-functions": ["wrap"]}) == ["-eva-alloc-functions", "malloc,calloc,realloc,wrap"]
+    # Per-function overrides union when a rung refines module settings.
+    assert eo.merge_options({"slevel-function": ["f:100"]}, {"slevel-function": ["g:200"]}) == {
+        "slevel-function": ["f:100", "g:200"]
+    }
+    # They stay tuning: runs differing only in them are still combinable.
+    assert eo.assumption_options({"slevel-function": ["f:1000"], "context-depth": 4}) == {"context-depth": 4}

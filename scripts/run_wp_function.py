@@ -111,6 +111,9 @@ _FPV_DEGEN_RE = re.compile(
     r"^\[wp\] \[(?:Timeout|Unknown|Failed|Stepout)\] ([A-Za-z0-9_]+_assert_rte_pointer_value[A-Za-z0-9_]*) .*\(Degenerated\)",
     re.MULTILINE,
 )
+# With -wp-counter-examples, failed goals carry a witness model: "[wp] [Unsuccess] <goal> (<prover>) (Model)"
+# (upstream plugins/wp/tests/wp_ce oracle format).
+_MODEL_GOAL_RE = re.compile(r"\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout)\] ([^\n(]+?) \(([^)]+)\) \(Model\)")
 _VC_DUMP_RE = re.compile(
     r"-{20,}\n(\s*Goal [^\n]+:.*?)(?=\n-{20,}|\Z)",
     re.DOTALL,
@@ -386,6 +389,8 @@ _CLAUSE_ORDER_ERR_RE = re.compile(
     r"(?:syntax error|unexpected token).*?\b(?:terminates|decreases|exits|assigns|ensures|requires|behavior|loop\s+variant|loop\s+assigns|loop\s+invariant)\b",
     re.IGNORECASE,
 )
+# Frama-C 34+ rejects `behavior b: ;` with: Failure: unexpected token ';'
+_EMPTY_BEHAVIOR_ERR_RE = re.compile(r"unexpected token\s+';'", re.IGNORECASE)
 _C_TYPE_OR_CALL_ERR_RE = re.compile(
     r"unbound logic function|not a logic type|C functions cannot be called|"
     r"\\(?:forall|exists)\s+(?:int|unsigned|size_t|long|short|char|uint\d+_t|int\d+_t)\b",
@@ -470,10 +475,10 @@ def _facts_record_for(res: dict, facts_dir: Path | None) -> dict | None:
 
 def _innermost_loop_at(record: dict, line: int) -> dict | None:
     loops = record.get("loops") or []
-    cands = [l for l in loops if isinstance(l.get("line"), int) and l["line"] <= line]
+    cands = [lp for lp in loops if isinstance(lp.get("line"), int) and lp["line"] <= line]
     if not cands:
         return None
-    return max(cands, key=lambda l: (l.get("parent") is not None, l["line"]))
+    return max(cands, key=lambda lp: (lp.get("parent") is not None, lp["line"]))
 
 
 def _goal_failure_strategy(goal: dict) -> tuple[str, str]:
@@ -547,10 +552,10 @@ def _loop_dependency_slice_hint(res: dict, facts_dir: Path | None) -> str | None
         loop = _innermost_loop_at(rec, line)
         if loop is None:
             continue
-        children = [l for l in loops if l.get("parent") == loop.get("index")]
+        children = [lp for lp in loops if lp.get("parent") == loop.get("index")]
         preds = (loop.get("assumption_context") or {}).get("predecessors") or []
         if children:
-            inner = ", ".join(f"L{l['line']}" for l in children)
+            inner = ", ".join(f"L{lp['line']}" for lp in children)
             return (
                 f"Dependency slice: preservation of the loop at L{loop['line']} fails and it has inner loop(s) "
                 f"{inner}; the missing fact is often the inner loop's exit summary — strengthen the inner "
@@ -595,10 +600,18 @@ def derive_wp_diagnostic_hints(
             )
         if _CLAUSE_ORDER_ERR_RE.search(err_blob):
             _add(
-                "Check Frama-C clause ordering: function contracts MUST follow "
-                "'requires -> terminates/decreases -> exits -> assigns -> ensures -> behavior'; "
-                "loop annotations MUST sit immediately above 'for'/'while'/'do' in order: "
+                "Check Frama-C clause ordering: function contracts follow "
+                "'requires -> terminates/decreases -> exits -> assigns -> ensures -> behavior' "
+                "(since Frama-C 34, terminates/decreases may sit anywhere between requires and behaviors, "
+                "and ACSL extensions may precede requires; the exits/assigns/ensures order is still enforced). "
+                "Loop annotations MUST sit immediately above 'for'/'while'/'do' in order: "
                 "'loop invariant -> loop assigns -> loop variant' ('loop variant' must be last)."
+            )
+        if _EMPTY_BEHAVIOR_ERR_RE.search(err_blob):
+            _add(
+                "Since Frama-C 34 an empty named behavior ('behavior b: ;') is a fatal annot-error "
+                "(\"unexpected token ';'\") in function and statement contracts: give the behavior at least "
+                "one clause (assumes/assigns/ensures/...) or remove it."
             )
         if re.search(r"\binvariant\b", err_blob, re.IGNORECASE) and "loop invariant" not in err_blob.lower():
             _add(
@@ -971,6 +984,7 @@ def run_wp_on_function(
     retry_bitwise: bool = True,
     retry_tail: bool = True,
     smoke_tests: bool = False,
+    counter_examples: bool = False,
     prop: str | None = None,
     dump_goal: bool = False,
     session_dir: Path | None = None,
@@ -1265,6 +1279,10 @@ def run_wp_on_function(
         cmd.extend(["-wp-cache", "update", "-wp-cache-dir", str(wp_cache)])
     if smoke_tests:
         cmd.extend(["-wp-smoke-tests", "-wp-smoke-timeout", str(min(timeout, 5))])
+    if counter_examples:
+        # Witness models for failed goals (upstream wp_ce tests): the report's
+        # counter_example_goals list names them, and crash verifiers use them as witnesses.
+        cmd.append("-wp-counter-examples")
     if prop:
         cmd.append(f"-wp-prop={prop}")
     if dump_goal:
@@ -1474,6 +1492,7 @@ def run_wp_on_function(
                 retry_bitwise=False,
                 retry_tail=False,
                 smoke_tests=smoke_tests,
+                counter_examples=counter_examples,
                 prop=prop,
                 dump_goal=dump_goal,
                 session_dir=session_dir,
@@ -1550,6 +1569,7 @@ def run_wp_on_function(
                         retry_bitwise=False,
                         retry_tail=False,
                         smoke_tests=smoke_tests,
+                        counter_examples=counter_examples,
                         prop=prop,
                         dump_goal=dump_goal,
                         session_dir=session_dir,
@@ -1632,11 +1652,18 @@ def run_wp_on_function(
     else:
         next_focus = "complete"
 
+    model_goals = [
+        {"goal": m.group(1).strip(), "prover": m.group(2).strip()}
+        for m in _MODEL_GOAL_RE.finditer(combined_log)
+    ]
+
     res = {
         "status": status,
         "function": fn_name,
         "file": str(c_file),
         "wp_model": wp_model,
+        "counter_examples": counter_examples,
+        "counter_example_goals": model_goals,
         "total_goals": total_goals,
         "proven_count": len(proven_goals),
         "proven_under_hyp_count": len(under_hyp_goals),
@@ -2016,6 +2043,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable automatic focused tail retry when >=90%% of VCs are proven and only a timeout tail remains",
     )
     parser.add_argument("--smoke-tests", action="store_true", help="Run -wp-smoke-tests vacuity check in this pass")
+    parser.add_argument(
+        "--counter-examples",
+        action="store_true",
+        help="Add -wp-counter-examples: witness models for failed goals, listed in the report's counter_example_goals (crash-verifier input)",
+    )
     parser.add_argument("--prop", default=None, help="Isolate a single named clause (-wp-prop=<name>)")
     parser.add_argument("--dump-goal", action="store_true", help="Dump unsimplified raw VC (-wp-print -wp-no-qed)")
     parser.add_argument(
@@ -2080,6 +2112,7 @@ def main(argv: list[str] | None = None) -> int:
         retry_bitwise=not args.no_retry_bitwise,
         retry_tail=not args.no_retry_tail,
         smoke_tests=args.smoke_tests,
+        counter_examples=args.counter_examples,
         prop=args.prop,
         dump_goal=args.dump_goal,
         session_dir=args.session_dir,

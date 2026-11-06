@@ -1038,3 +1038,49 @@ def test_ingest_publishes_corpora_even_when_fuzz_report_was_already_ingested(tmp
     shared_mod_dir = shared_cache / "corpora" / "snmp"
     assert shared_mod_dir.is_dir()
     assert len(list(shared_mod_dir.iterdir())) == 1
+
+
+def test_perfn_rung_targets_the_functions_with_most_unknowns(tmp_path):
+    run = _make_run(tmp_path, params=SNMP_PARAMS)
+    base_dir = run / pm.TUNE_REPORT_DIR / "snmp"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    unknowns = {
+        fn: [
+            {
+                "directory": "workspace/work/src/snmp",
+                "file": "ber.c",
+                "function": fn,
+                "line": i,
+                "kind": "mem_access",
+                "status": "Unknown",
+                "status_bucket": "unknown",
+                "annotation": "\\valid(p)",
+            }
+        ]
+        for i, fn in enumerate(["ber_decode_len", "ber_decode_tag", "pdu_parse"])
+    }
+    # ber_decode_len has the most obligations, so it leads the per-function slevel list.
+    unknowns["ber_decode_len"] = unknowns["ber_decode_len"] * 3
+    write_json(
+        base_dir / "base.json",
+        {
+            "status": "ok",
+            "input_digest": "d" * 64,
+            "elapsed_s": 12.0,
+            "unknown_obligations_by_function": unknowns,
+            "surviving_unknown_functions": sorted(unknowns),
+        },
+    )
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    rungs = plan.modules["snmp"].tune_rungs
+    assert "perfn" in rungs
+    perfn = rungs["perfn"]["slevel-function"]
+    assert perfn[0] == "ber_decode_len:1000"
+    assert len(perfn) == 3  # PERFN_MAX_FUNCTIONS caps the list only above 8 functions
+    # The rung refines the module settings and never lowers them.
+    assert rungs["perfn"]["slevel"] == 250
+    # A base run without target Unknowns gets no rungs at all.
+    write_json(
+        base_dir / "base.json", {"status": "ok", "input_digest": "d" * 64, "unknown_obligations_by_function": {}}
+    )
+    assert pm.build_plan(run, templates_dir=ACSL).modules["snmp"].tune_rungs == {}

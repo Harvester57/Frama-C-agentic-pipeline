@@ -1,4 +1,4 @@
-# E-ACSL Quick Reference (Frama-C 33.0)
+# E-ACSL Quick Reference (Frama-C 33.0 manual; container runs 34.0~~dev Selenium)
 
 Distilled by hand from the E-ACSL plug-in manual [`./eacsl/e-acsl-manual.md`](./eacsl/e-acsl-manual.md); `§` numbers refer to that manual. Grep its section for details (see [`./README.md`](./README.md)). For which ACSL constructs E-ACSL can execute at all, see Figure 1.1 of [`./acsl/e-acsl-implementation.md`](./acsl/e-acsl-implementation.md).
 
