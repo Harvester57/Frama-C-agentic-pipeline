@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import function_facts  # noqa: E402
 import function_slice  # noqa: E402
+import spec_kb  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
     ScopeViolationError,
@@ -1987,12 +1988,16 @@ def prepare_agent(
 
     tpl = _resolve_brief_template(role)
     context_section = ""
+    kb_section = ""
     prover_context: dict = {}
     if role == "prover":
         context_section, features, prover_context = _prover_context(
             run_dir, overlay, agent_root, agent_id, module, function, norm_c_file, norm_header, eff_cppflags, dag_fns
         )
         tpl = function_facts.render_conditionals(tpl, features)
+        if spec_kb.enabled():
+            record = function_facts.load_function_facts(overlay, module, norm_c_file, function)
+            kb_section = spec_kb.kb_section_for(overlay, record)
     replacements = {
         "{agent_id}": agent_id,
         "{module_name}": module or "unknown",
@@ -2033,6 +2038,7 @@ def prepare_agent(
         rendered = rendered.replace(k, v)
     # After substitution, like what is appended below: source text and reports are data, never placeholders.
     rendered = rendered.replace(function_facts.CONTEXT_SENTINEL + "\n\n", context_section and context_section + "\n")
+    rendered = rendered.replace(spec_kb.KB_SENTINEL + "\n\n", kb_section and kb_section + "\n")
     if role == "prover" and (verifiability != "core_provable" or wp_blockers or wp_notes or profile == "quick"):
         fn_label = function or "this function"
         rendered += (

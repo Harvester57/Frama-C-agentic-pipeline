@@ -19,6 +19,8 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 
 <!-- deterministic-context -->
 
+<!-- spec-kb -->
+
 ## Strict Rules
 
 1. **Pure ACSL Annotations Only (`/*@ ... */`, `//@ ...`):** Never alter executable C tokens, normal C comments, or `#include` directives, and never introduce `admit`, `axiom`, `axiomatic`, `inductive`, or vacuous `\false` assumptions (`requires \false;`, `assumes \false;`, `loop invariant \false;`). The parent runs a mechanical C/ACSL lexical check (`workspace_overlay.py check-acsl-only`) and rejects any non-ACSL modification, vacuous `\false` clause, C integer types in `logic` declarations (`logic int` instead of `logic integer`), or statement-level `invariant` without `loop`.

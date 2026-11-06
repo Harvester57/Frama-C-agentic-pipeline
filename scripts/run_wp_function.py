@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cache  # noqa: E402
 import function_facts  # noqa: E402
 import prover_candidates  # noqa: E402
+import spec_kb  # noqa: E402
 from acsl_ast import find_named_clause, is_trivial_predicate  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_DEAD,
@@ -563,11 +564,15 @@ def _loop_dependency_slice_hint(res: dict, facts_dir: Path | None) -> str | None
     return None
 
 
-def derive_wp_diagnostic_hints(res: dict, log_text: str = "", facts_dir: Path | None = None) -> list[str]:
+def derive_wp_diagnostic_hints(
+    res: dict, log_text: str = "", facts_dir: Path | None = None, kb_dir: Path | None = None
+) -> list[str]:
     """
     Generate concise, actionable diagnostic hints for ACSL syntax errors, WP soundness
     aborts, and unproven goal buckets. Returns [] when status == 'all_proven'.
-    `facts_dir` (default workspace/reports/facts) enables loop dependency-slice hints.
+    `facts_dir` (default workspace/reports/facts) enables loop dependency-slice hints;
+    `kb_dir` (default workspace/reports/kb) enables repair-pattern hints from the
+    evolved specification knowledge base (spec_kb).
     """
     status = res.get("status")
     if status == "all_proven":
@@ -814,6 +819,9 @@ def derive_wp_diagnostic_hints(res: dict, log_text: str = "", facts_dir: Path | 
             f"Frama-C WP does not support variadic function specifications or proof through unframed variadic callees{var_targets}. "
             "Introduce a non-variadic framing stub/contract or isolate the variadic callee in an unverified shell wrapper."
         )
+
+    for repair in spec_kb.repair_hints_for_goals(res, kb_dir or Path("workspace/reports/kb")):
+        _add(repair)
 
     return hints
 
