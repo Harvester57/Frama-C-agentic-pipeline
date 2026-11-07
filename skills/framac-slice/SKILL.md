@@ -106,7 +106,7 @@ Units with the same sources and flags share one parse. Each parse takes a `parse
 
 Read `units.<name>.parse.status`. `gcc_fallback` means Frama-C could not parse the unit: its functions and edges come from GCC's `-fcallgraph-info`, without loops, complexity or signatures, and `parse.error` holds Frama-C's first error. Report every fallback unit to the user with that error; Eva and WP will fail on it the same way. A non-zero exit means the capture is missing, the scratch volume is not mounted, or the dump module did not compile (`kernel_ast.py`): fix that before Step 2.
 
-Until step I5a of `docs/phase0-implementation-plan.md` lands, Step 2 does not read the model yet. Run the capture and the model anyway: the capture is the gate that the target builds, and the model shows what Frama-C cannot parse.
+Step 2 reads the model. Without it (no capture, or a model whose `status` is not `ok`), Step 2 falls back to the lexer and says so in the DAG's `warnings`.
 
 ---
 
@@ -116,7 +116,14 @@ Until step I5a of `docs/phase0-implementation-plan.md` lands, Step 2 does not re
 python3 /opt/framac-pipeline/scripts/build_callgraph_dag.py --target workspace/work --out workspace/reports/callgraph_dag.json --emit-compile-commands workspace/reports/compile_commands.json
 ```
 
-Read `workspace/reports/callgraph_dag.json` and review the structural classifications. `build_callgraph_dag.py` uses a C/ACSL lexical token stream (`tokenize_c_acsl`), Tarjan's SCC algorithm for recursion cycles, and purely structural signature/body analysis (no project-specific keyword hints):
+It reads `workspace/reports/phase0_model.json` from Step 1c (`--model PATH` to point elsewhere, `--no-model` to use the lexer alone). The DAG's functions and call edges are then the model's:
+- one record per function a non-test link unit compiles, under its real name. Files the build does not compile (alternative backends, templates, tests) are left out and listed in `model.lexer_only_functions`; check that list against what the user expects analysed.
+- `internal_callees` holds Frama-C's direct and indirect edges (type-matched function pointers, thread starts, callbacks), and `indirect_callees` holds the indirect ones alone. Waves, the WP scheduler and the hypothesis audit use both.
+- Each function has a `callgraph_source`: `frama_c`, or `gcc_callgraph` for a unit on the GCC fallback, which also carries `callgraph_fallback` (Frama-C's first error) and gets listed in `model.gcc_fallback_units`.
+- Header functions are marked `header`. Only those an entry point of the build reaches (`reached`) get ledger units.
+- `macro_aliases` maps each alias the build defines to the functions it names. The harness generator and the reach gate resolve calls through it.
+
+Modules, tiers, entry points and the per-function analysis below stay the lexer's (C/ACSL token stream `tokenize_c_acsl`, Tarjan's SCC for recursion cycles, structural signature and body analysis, with no project-specific keyword hints). Their function lists are recomputed from the model. Review `workspace/reports/callgraph_dag.json`:
 - Check each module's `required_sources` (the transitive in-repository `.c` file closure needed to compile and analyze the module together with its in-repo sibling callees), `cross_module_callees`, `external_callees`, and auto-discovered `cppflags`.
 - Check `name_collisions` (same-named static functions in different files), `recursion_cycles`, and `indirect_calls` (function-pointer call sites requiring `//@ calls f1, f2;` or `//@ assert fp \in {...};`).
 - Check each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`), and `wp_notes` (e.g., `while (n--)` unsigned wraparound idiom or pointer casts requiring `-wp-model Typed+cast`).

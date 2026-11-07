@@ -340,7 +340,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
     units, candidates = load_state()
     modules = dag.get("modules", {})
     resolved_profile = _resolve_seed_profile(profile, dag_path)
-    added, skipped = 0, []
+    added, skipped, skipped_unreached = 0, [], []
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
         name = fn.get("name", fn_name)
         file = normalize_file(fn.get("file", ""))
@@ -350,6 +350,11 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
         module = fn.get("module") or "unknown"
         tier = modules.get(module, {}).get("tier") or fn.get("tier") or "unclassified"
         wave = fn.get("wave")
+        if fn.get("header") and not fn.get("reached", True):
+            # A static inline header function no entry point reaches: nothing the target runs.
+            skipped_unreached.append(f"{file}#{name}")
+            continue
+        source = fn.get("callgraph_source") or callgraph_source
         in_scope = not scope or any(file == s.rstrip("/") or file.startswith(s.rstrip("/") + "/") for s in scope)
 
         classes = [("rte", "")]
@@ -372,7 +377,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                     module,
                     tier,
                     wave,
-                    callgraph_source,
+                    source,
                     "out_of_scope",
                     ["outside requested scope_paths"],
                     reason,
@@ -385,14 +390,14 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                     module,
                     tier,
                     wave,
-                    callgraph_source,
+                    source,
                     "out_of_scope",
                     ["no_touch_tier: excluded by risk tier classification"],
                     reason,
                 )
             elif tier.startswith("Tier 3"):
                 if resolved_profile == "deep" and cls == "rte":
-                    unit = new_unit(file, name, cls, module, tier, wave, callgraph_source, "planned", None, reason)
+                    unit = new_unit(file, name, cls, module, tier, wave, source, "planned", None, reason)
                 elif resolved_profile == "deep":
                     unit = new_unit(
                         file,
@@ -401,7 +406,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                         module,
                         tier,
                         wave,
-                        callgraph_source,
+                        source,
                         "deferred",
                         ["tier3_not_scheduled: Layers 2-6 are not scheduled for Tier 3 modules in deep profile"],
                         reason,
@@ -414,13 +419,15 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                         module,
                         tier,
                         wave,
-                        callgraph_source,
+                        source,
                         "deferred",
                         ["tier3_not_scheduled: no harness is generated for Tier 3 modules in this profile"],
                         reason,
                     )
             else:
-                unit = new_unit(file, name, cls, module, tier, wave, callgraph_source, "planned", None, reason)
+                unit = new_unit(file, name, cls, module, tier, wave, source, "planned", None, reason)
+            if fn.get("callgraph_fallback"):
+                unit.setdefault("bookkeeping", {})["callgraph_fallback"] = fn["callgraph_fallback"]
             if fn.get("verifiability") or fn.get("wp_blockers") or fn.get("wp_notes"):
                 bk = unit.setdefault("bookkeeping", {})
                 if fn.get("verifiability"):
@@ -432,7 +439,12 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
             units[cid] = unit
             added += 1
     commit(units, candidates)
-    return {"added_units": added, "total_units": len(units), "skipped_unsupported_names": skipped}
+    return {
+        "added_units": added,
+        "total_units": len(units),
+        "skipped_unsupported_names": skipped,
+        "skipped_unreached_header_functions": skipped_unreached,
+    }
 
 
 # ---------------------------------------------------------------- ingestion
@@ -2508,7 +2520,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("seed")
     p.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
     p.add_argument("--scope", action="append", default=[])
-    p.add_argument("--callgraph-source", choices=["frama_c", "regex"], default="regex")
+    p.add_argument("--callgraph-source", choices=["frama_c", "gcc_callgraph", "regex"], default="regex")
     p.add_argument("--profile", choices=["quick", "standard", "deep"], default=None)
     for name in ("ingest-fuzz", "ingest-eva", "ingest-wp"):
         p = sub.add_parser(name)

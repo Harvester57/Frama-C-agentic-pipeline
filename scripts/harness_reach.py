@@ -102,13 +102,32 @@ def header_macro_functions(include_dirs: list[Path], fn_names: set[str]) -> dict
     return {name: fns for name in raw if (fns := _resolve(name, frozenset({name})))}
 
 
-def _functions_by_name(dag: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Index DAG function records by plain name (colliding names are keyed `file#name`)."""
-    by_name: dict[str, list[dict[str, Any]]] = {}
+def _functions_by_name(dag: dict[str, Any]) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    """Index DAG function records, as (DAG key, record), by plain name and by DAG key.
+
+    A colliding name is keyed `file#name` in the DAG, and the model's edges name it by that key.
+    """
+    by_name: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for key, rec in (dag.get("functions") or {}).items():
         if isinstance(rec, dict):
-            by_name.setdefault(str(rec.get("name") or key), []).append(rec)
+            name = str(rec.get("name") or key)
+            by_name.setdefault(name, []).append((key, rec))
+            if key != name:
+                by_name.setdefault(key, []).append((key, rec))
     return by_name
+
+
+def dag_macro_aliases(dag: dict[str, Any]) -> dict[str, set[str]]:
+    """The model's macro aliases (alias -> DAG keys of the functions it expands to)."""
+    raw = dag.get("macro_aliases") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, set[str]] = {}
+    for alias, keys in raw.items():
+        vals = [keys] if isinstance(keys, str) else keys if isinstance(keys, list) else []
+        if found := {str(k) for k in vals if isinstance(k, str)}:
+            out[str(alias)] = found
+    return out
 
 
 def harness_roots(
@@ -127,8 +146,11 @@ def harness_roots(
     return roots
 
 
-def callee_closure(roots: set[str], by_name: dict[str, list[dict[str, Any]]], module: str) -> set[str]:
-    """Transitive in-repo callees of `roots`; a colliding name resolves to its record in `module` first."""
+def callee_closure(roots: set[str], by_name: dict[str, list[tuple[str, dict[str, Any]]]], module: str) -> set[str]:
+    """Transitive in-repo callees of `roots`, as names and DAG keys.
+
+    A colliding plain name resolves to its record in `module` first; a `file#name` key to its record.
+    """
     reached: set[str] = set()
     work = sorted(roots)
     while work:
@@ -137,8 +159,12 @@ def callee_closure(roots: set[str], by_name: dict[str, list[dict[str, Any]]], mo
             continue
         reached.add(name)
         recs = by_name.get(name) or []
-        same_mod = [r for r in recs if r.get("module") == module]
-        for rec in same_mod or recs:
+        same_mod = [kr for kr in recs if kr[1].get("module") == module]
+        for key, rec in same_mod or recs:
+            plain = str(rec.get("name") or key)
+            # The plain name stands for this record only when no other record shares it.
+            idents = (key, plain) if len(by_name.get(plain) or []) == 1 else (key,)
+            work.extend(i for i in idents if i not in reached)
             work.extend(c for c in rec.get("internal_callees") or [] if c not in reached)
     return reached
 
@@ -156,9 +182,11 @@ def check_module(
     mod_fns = [f for f in mod_info.get("functions") or [] if isinstance(f, str)]
     entries = [f for f in mod_info.get("candidate_entry_points") or [] if isinstance(f, str)]
     if not entries:
-        entries = [f for f in mod_fns if not any(r.get("is_static") for r in by_name.get(f) or [])]
+        entries = [f for f in mod_fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
 
     macros = header_macro_functions(include_dirs, fn_names)
+    for alias, keys in dag_macro_aliases(dag).items():
+        macros[alias] = macros.get(alias, set()) | keys
     inline_map = dag.get("header_inline_callees") or {}
     roots = harness_roots(harness_text, fn_names, macros, inline_map if isinstance(inline_map, dict) else {})
     reached = callee_closure(roots, by_name, module)

@@ -1310,10 +1310,16 @@ def _merge_dag_harness_sources(
         if snippet:
             referenced_idents.update(_HARNESS_IDENT_RE.findall(snippet))
 
+    aliases = dag.get("macro_aliases") or {}
     target_fns: set[str] = set()
     for ident in referenced_idents:
         if ident in functions_map:
             target_fns.add(ident)
+        # A macro alias the build defines (the Phase 0 model's): alias -> DAG keys it expands to.
+        alias_keys = aliases.get(ident) if isinstance(aliases, dict) else None
+        for key in [alias_keys] if isinstance(alias_keys, str) else alias_keys or []:
+            if isinstance(key, str) and key in functions_map:
+                target_fns.add(key)
         if isinstance(inline_map, dict) and ident in inline_map:
             for resolved_fn in inline_map.get(ident) or []:
                 if isinstance(resolved_fn, str) and resolved_fn in functions_map:

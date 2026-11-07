@@ -4,6 +4,11 @@ Builds the Function Call-Graph DAG, Topological Verification Waves (Wave 0..K),
 Generic Structural Module Risk-Tier Classification, Per-Function WP Provability
 Analysis (Verified Core vs. Unverified Shell), and Candidate Security Properties
 using deterministic C/ACSL tokenization.
+
+When the Phase 0 model exists (workspace/reports/phase0_model.json, scripts/phase0_model.py), the
+functions and the call edges are the model's: every function the build compiles outside its tests,
+under its real name, with Frama-C's direct and indirect edges and the build's macro aliases. Modules,
+tiers and the per-function analysis stay the lexer's (`model_view`). `--no-model` keeps the lexer's.
 """
 
 from __future__ import annotations
@@ -1725,10 +1730,53 @@ def _discover_header_inline_and_macros(target_dir: Path) -> tuple[dict[str, dict
     return header_macros, header_inline
 
 
+def _lexer_record(
+    item: dict, rel_path: str, module_name: str, macros: dict[str, dict], cppflags: list[str]
+) -> tuple[dict, dict]:
+    """The lexer's record of one extracted definition, and its body analysis (callees, symbol references)."""
+    fn_name = item["name"]
+    sig_info = analyze_signature(item["decl_tokens"], item["param_tokens"])
+    body_info = analyze_body(fn_name, item["body_tokens"], sig_info, macros=macros)
+    record = {
+        "name": fn_name,
+        "file": rel_path,
+        "module": module_name,
+        "line": item["line"],
+        "end_line": item["end_line"],
+        "loc": item["loc"],
+        "is_static": sig_info["is_static"],
+        "is_variadic": sig_info.get("is_variadic", False),
+        "returns_pointer": sig_info["returns_pointer"],
+        "params": sig_info["params_str"],
+        "const_ptr_params": sig_info["const_ptr_params"],
+        "mutable_ptr_params": sig_info["mutable_ptr_params"],
+        "takes_bounded_buffer": sig_info["takes_bounded_buffer"],
+        "writes_bounded_buffer": sig_info["writes_bounded_buffer"],
+        "has_loops": body_info["has_loops"],
+        "loop_count": body_info["loop_count"],
+        "macro_loops": body_info.get("macro_loops", []),
+        "self_recursive": body_info["self_recursive"],
+        "indirect_calls": body_info["indirect_calls"],
+        "has_dynamic_alloc": body_info["has_dynamic_alloc"],
+        "has_backward_goto": body_info["has_backward_goto"],
+        "has_pointer_cast": body_info["has_pointer_cast"],
+        "has_unsigned_wrap_idiom": body_info["has_unsigned_wrap_idiom"],
+        "has_zeroization": body_info["has_zeroization"],
+        "uses_format_or_write": body_info["uses_format_or_write"],
+        "wp_blockers": body_info["wp_blockers"],
+        "wp_notes": body_info["wp_notes"],
+        "verifiability": body_info["verifiability"],
+        "raw_callees": sorted(body_info["direct_callees"]),
+        "cppflags": list(cppflags),
+    }
+    return record, body_info
+
+
 def build_dag(
     target_dir: Path,
     compile_commands_path: Path | None = None,
     emit_compile_commands: Path | None = None,
+    model: dict | None = None,
 ) -> dict:
     target_dir = target_dir.resolve()
     threat_model_path = target_dir / "THREAT_MODEL.md"
@@ -1826,8 +1874,10 @@ def build_dag(
 
         for item in extracted:
             fn_name = item["name"]
-            sig_info = analyze_signature(item["decl_tokens"], item["param_tokens"])
-            body_info = analyze_body(fn_name, item["body_tokens"], sig_info, macros=effective_macros)
+            record, body_info = _lexer_record(
+                item, rel_path, module_name, effective_macros, compile_flags_by_file.get(rel_path, [])
+            )
+            sig_info = record
 
             if fn_name in DISAMBIGUATE_COLLISION_NAMES:
                 if fn_name in functions and functions[fn_name]["file"] != rel_path:
@@ -1864,38 +1914,7 @@ def build_dag(
                     if sig_info["is_static"] and not functions[fn_name].get("is_static", False):
                         continue
 
-            functions[fn_key] = {
-                "name": fn_name,
-                "file": rel_path,
-                "module": module_name,
-                "line": item["line"],
-                "end_line": item["end_line"],
-                "loc": item["loc"],
-                "is_static": sig_info["is_static"],
-                "is_variadic": sig_info.get("is_variadic", False),
-                "returns_pointer": sig_info["returns_pointer"],
-                "params": sig_info["params_str"],
-                "const_ptr_params": sig_info["const_ptr_params"],
-                "mutable_ptr_params": sig_info["mutable_ptr_params"],
-                "takes_bounded_buffer": sig_info["takes_bounded_buffer"],
-                "writes_bounded_buffer": sig_info["writes_bounded_buffer"],
-                "has_loops": body_info["has_loops"],
-                "loop_count": body_info["loop_count"],
-                "macro_loops": body_info.get("macro_loops", []),
-                "self_recursive": body_info["self_recursive"],
-                "indirect_calls": body_info["indirect_calls"],
-                "has_dynamic_alloc": body_info["has_dynamic_alloc"],
-                "has_backward_goto": body_info["has_backward_goto"],
-                "has_pointer_cast": body_info["has_pointer_cast"],
-                "has_unsigned_wrap_idiom": body_info["has_unsigned_wrap_idiom"],
-                "has_zeroization": body_info["has_zeroization"],
-                "uses_format_or_write": body_info["uses_format_or_write"],
-                "wp_blockers": body_info["wp_blockers"],
-                "wp_notes": body_info["wp_notes"],
-                "verifiability": body_info["verifiability"],
-                "raw_callees": sorted(body_info["direct_callees"]),
-                "cppflags": compile_flags_by_file.get(rel_path, []),
-            }
+            functions[fn_key] = record
             def_param_counts[fn_name] = len(_split_param_tokens(item["param_tokens"]))
             call_edges[fn_key] = set(body_info["direct_callees"])
             symbol_edges[fn_key] = set(body_info["symbol_refs"])
@@ -2124,7 +2143,7 @@ def build_dag(
             **tier_info,
         }
 
-    return {
+    dag = {
         "target_dir": str(target_dir),
         "callgraph_source": "regex",
         "total_c_files": len(set(c_files)),
@@ -2137,6 +2156,331 @@ def build_dag(
         "waves": [{"wave": idx, "count": len(w), "functions": w} for idx, w in enumerate(waves)],
         "recursion_cycles": cycles,
         "functions": functions,
+    }
+    if model is None:
+        return dag
+    return model_view(dag, model, target_dir, header_macros, compile_flags_by_file, threat_model_text)
+
+
+# ---------------------------------------------------------------------------------------------------
+# The DAG from the Phase 0 model (docs/phase0-implementation-plan.md step I5a)
+# ---------------------------------------------------------------------------------------------------
+
+DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
+
+
+def load_model(path: Path) -> tuple[dict | None, str | None]:
+    """The Phase 0 model when it exists and succeeded, else (None, why not)."""
+    if not path.is_file():
+        return None, f"{path} not found (run the build capture and phase0_model.py run first)"
+    try:
+        model = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"{path} unreadable: {exc}"
+    if not isinstance(model, dict) or model.get("status") != "ok":
+        return None, f"{path} status {model.get('status') if isinstance(model, dict) else None!r}"
+    return model, None
+
+
+# phase0_model.py's fact sources -> the ledger's callgraph_source values.
+MODEL_SOURCES = {"frama-c-kernel": "frama_c", "gcc-callgraph-info": "gcc_callgraph"}
+_DEFAULT_TIER = "Tier 3 (Internal State / Glue Module)"
+
+
+def _model_key_of(model_fns: dict[str, dict]) -> dict[str, str]:
+    """DAG keys for model ids (`file#name`): the plain name when it is unique, else the id."""
+    names: dict[str, int] = defaultdict(int)
+    for rec in model_fns.values():
+        names[rec["name"]] += 1
+    return {fid: (rec["name"] if names[rec["name"]] == 1 else fid) for fid, rec in model_fns.items()}
+
+
+def _lexer_match(
+    model_fns: dict[str, dict], lexer_fns: dict[str, dict], aliases: dict[str, dict]
+) -> tuple[dict[str, str], list[str]]:
+    """
+    model id -> lexer key for every function both inventories know: by file and name, else through a
+    macro alias defined to it (a definition written `sv crypto_box(...)` under `#define crypto_box
+    crypto_box_curve25519xsalsa20poly1305_tweet` is one function under two names). Also returns the
+    lexer keys left unmatched: code the build does not compile, test code, macro names.
+    """
+    by_id = {f"{r.get('file')}#{r.get('name', k)}": k for k, r in lexer_fns.items() if isinstance(r, dict)}
+    match: dict[str, str] = {fid: by_id[fid] for fid in model_fns if fid in by_id}
+    taken = set(match.values())
+    for k, r in lexer_fns.items():
+        if k in taken or not isinstance(r, dict):
+            continue
+        alias = aliases.get(r.get("name", k)) or {}
+        same_file = [i for i in alias.get("ids") or [] if i in model_fns and model_fns[i]["file"] == r.get("file")]
+        if len(same_file) == 1 and same_file[0] not in match:
+            match[same_file[0]] = k
+            taken.add(k)
+    return match, sorted(k for k in lexer_fns if k not in taken)
+
+
+def _file_records(
+    target_dir: Path, rel_path: str, header_macros: dict[str, dict], flags: list[str], memo: dict[str, dict]
+) -> dict[str, dict]:
+    """The lexer's records of every definition in one file (headers included), by name; memoized."""
+    if rel_path in memo:
+        return memo[rel_path]
+    out: dict[str, dict] = {}
+    path = target_dir / rel_path
+    if path.is_file():
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        macros = {**header_macros, **extract_macro_definitions(raw, path=rel_path)}
+        try:
+            items = _resolve_macro_wrapped_definitions(extract_functions_from_code(raw, path=rel_path), macros)
+        except AcslSyntaxError:
+            items = []
+        for item in items:
+            out.setdefault(item["name"], _lexer_record(item, rel_path, "", macros, flags)[0])
+    memo[rel_path] = out
+    return out
+
+
+def _empty_record(name: str, file: str) -> dict:
+    """A function the lexer cannot see (a GNU nested function, a macro-generated definition)."""
+    return {
+        "name": name,
+        "file": file,
+        "loc": 0,
+        "is_variadic": False,
+        "returns_pointer": False,
+        "params": "",
+        "const_ptr_params": 0,
+        "mutable_ptr_params": 0,
+        "takes_bounded_buffer": False,
+        "writes_bounded_buffer": False,
+        "macro_loops": [],
+        "indirect_calls": [],
+        "has_dynamic_alloc": False,
+        "has_backward_goto": False,
+        "has_pointer_cast": False,
+        "has_unsigned_wrap_idiom": False,
+        "has_zeroization": False,
+        "uses_format_or_write": False,
+        "wp_blockers": [],
+        "wp_notes": [],
+        "verifiability": "core_provable",
+        "raw_callees": [],
+        "cppflags": [],
+    }
+
+
+def model_view(
+    lexer: dict,
+    model: dict,
+    target_dir: Path,
+    header_macros: dict[str, dict],
+    compile_flags_by_file: dict[str, list[str]],
+    threat_model_text: str = "",
+) -> dict:
+    """
+    The DAG with the inventory and the call edges of the Phase 0 model (scripts/phase0_model.py),
+    modules held fixed (step I5a):
+
+    - functions are the model's (every function a non-test link unit compiles, under its real name);
+      their file, lines, storage and loops come from Frama-C, the rest of their record (parameters,
+      WP blockers, security properties) from the lexer's analysis of the same definition;
+    - `internal_callees` are the model's edges, direct and indirect (type-matched function pointers,
+      thread starts, callbacks), so waves, the WP scheduler and the hypothesis audit see them; the
+      indirect ones are also listed in `indirect_callees`;
+    - a function keeps the lexer's module of its file; a header function the module owning most of
+      its unit's sources; modules keep their tier, sources, flags and entry points (translated to
+      the model's keys);
+    - `macro_aliases` maps each alias the model found to the DAG keys of its functions;
+    - header functions are marked `header`, and `reached` when an entry point of the build calls them;
+    - functions of a unit on the GCC fallback carry `callgraph_fallback` (Frama-C's first error).
+    """
+    model_fns: dict[str, dict] = model.get("functions") or {}
+    units: dict[str, dict] = model.get("units") or {}
+    lexer_fns: dict[str, dict] = lexer.get("functions") or {}
+    lexer_modules: dict[str, dict] = lexer.get("modules") or {}
+    aliases: dict[str, dict] = model.get("macro_aliases") or {}
+    key_of = _model_key_of(model_fns)
+    match, dropped = _lexer_match(model_fns, lexer_fns, aliases)
+    new_key_of_lexer = {lk: key_of[fid] for fid, lk in match.items()}
+
+    file_module = {f: m for m, rec in sorted(lexer_modules.items()) for f in rec.get("files") or []}
+    fallback_error = {
+        n: (u.get("parse") or {}).get("error") or "Frama-C could not parse this unit"
+        for n, u in units.items()
+        if (u.get("parse") or {}).get("status") == "gcc_fallback"
+    }
+
+    def module_of(rec: dict) -> str:
+        if rec["file"] in file_module:
+            return file_module[rec["file"]]
+        votes: dict[str, int] = defaultdict(int)
+        for unit in rec.get("units") or []:
+            for src in (units.get(unit) or {}).get("files") or []:
+                if src in file_module:
+                    votes[file_module[src]] += 1
+        if votes:
+            return sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        return Path(rec["file"]).parent.name or Path(rec["file"]).stem
+
+    succ: dict[str, set[str]] = defaultdict(set)
+    indirect: dict[str, set[str]] = defaultdict(set)
+    for e in model.get("edges") or []:
+        caller, callee = key_of.get(e.get("caller")), key_of.get(e.get("callee"))
+        if caller and callee:
+            succ[caller].add(callee)
+            if e.get("kind") == "indirect":
+                indirect[caller].add(callee)
+
+    memo: dict[str, dict] = {}
+    model_names = {r["name"] for r in model_fns.values()}
+    functions: dict[str, dict] = {}
+    for fid, m in sorted(model_fns.items()):
+        key = key_of[fid]
+        flags = compile_flags_by_file.get(m["file"], [])
+        if fid in match:
+            base = dict(lexer_fns[match[fid]])
+        else:
+            base = dict(
+                _file_records(target_dir, m["file"], header_macros, flags, memo).get(m["name"])
+                or _empty_record(m["name"], m["file"])
+            )
+        source = MODEL_SOURCES.get(m.get("source") or "", "frama_c")
+        loops = int(m["loops"]) if source == "frama_c" and m.get("loops") is not None else base.get("loop_count", 0)
+        rec = {
+            **base,
+            "name": m["name"],
+            "file": m["file"],
+            "module": module_of(m),
+            "line": m.get("line") or base.get("line", 0),
+            "end_line": m.get("end_line") or base.get("end_line", m.get("line") or 0),
+            "loc": m.get("lines") or base.get("loc", 0),
+            "is_static": bool(m.get("static")),
+            "has_loops": loops > 0,
+            "loop_count": loops,
+            "wp_notes": [n for n in base.get("wp_notes") or [] if "requires 'decreases" not in n],
+            "cppflags": base.get("cppflags") or flags,
+            "internal_callees": sorted(succ[key] - {key}),
+            "indirect_callees": sorted(indirect[key] - {key}),
+            "self_recursive": key in succ[key],
+            "external_callees": sorted({c for c in base.get("raw_callees") or [] if c not in model_names}),
+            "callgraph_source": source,
+            "units": list(m.get("units") or []),
+            "header": bool(m.get("header")),
+        }
+        errors = sorted({fallback_error[u] for u in m.get("units") or [] if u in fallback_error})
+        if errors:
+            rec["callgraph_fallback"] = errors[0]
+        if m.get("cyclomatic") is not None:
+            rec["cyclomatic"] = m["cyclomatic"]
+        functions[key] = rec
+
+    waves, cycles = compute_topological_waves(functions, succ)
+    in_cycle = {f for c in cycles for f in c}
+    for idx, wave in enumerate(waves):
+        for key in wave:
+            rec = functions[key]
+            rec["wave"] = idx
+            rec["is_recursive"] = key in in_cycle
+            if rec["is_recursive"]:
+                rec["wp_notes"].append("recursive function requires 'decreases <measure>;'")
+            rec["security_properties"] = infer_security_properties(
+                fn_name=rec["name"],
+                sig_info=rec,
+                body_info=rec,
+                is_recursive=rec["is_recursive"],
+                threat_model_text=threat_model_text,
+            )
+    callers: dict[str, set[str]] = defaultdict(set)
+    for caller, callees in succ.items():
+        for callee in callees - {caller}:
+            callers[callee].add(caller)
+    for key, rec in functions.items():
+        rec["internal_callers"] = sorted(callers[key])
+
+    # Header functions get a ledger unit only when an entry point of the build reaches them.
+    reached: set[str] = set()
+    work = [key_of[e] for e in model.get("entry_points") or [] if e in key_of]
+    while work:
+        cur = work.pop()
+        if cur not in reached:
+            reached.add(cur)
+            work.extend(succ[cur] - reached)
+    for key, rec in functions.items():
+        if rec["header"]:
+            rec["reached"] = key in reached
+
+    def translate(keys: list[str]) -> list[str]:
+        out: list[str] = []
+        for k in keys or []:
+            new = new_key_of_lexer.get(k, k if k in functions else None)
+            if new and new not in out:
+                out.append(new)
+        return out
+
+    members: dict[str, list[str]] = defaultdict(list)
+    for key, rec in functions.items():
+        members[rec["module"]].append(key)
+    modules: dict[str, dict] = {}
+    for name in sorted(set(lexer_modules) | set(members)):
+        base_mod = lexer_modules.get(name) or {
+            "module": name,
+            "files": [],
+            "required_sources": [],
+            "cross_module_callees": [],
+            "external_callees": [],
+            "cppflags": [],
+            "tier": _DEFAULT_TIER,
+        }
+        mod = dict(base_mod)
+        fns = sorted(members.get(name, []))
+        mod["functions"] = fns
+        mod["function_count"] = len(fns)
+        fn_set = set(fns)
+        mod["files"] = sorted(
+            set(mod.get("files") or []) | {functions[k]["file"] for k in fns if functions[k]["file"].endswith(".c")}
+        )
+        mod["provable_functions"] = [k for k in fns if functions[k]["verifiability"] != "shell_unverifiable_wp"]
+        mod["shell_unverifiable_functions"] = [
+            k for k in fns if functions[k]["verifiability"] == "shell_unverifiable_wp"
+        ]
+        mod["cross_module_callees"] = translate(mod.get("cross_module_callees") or [])
+        # The lexer's entry points under their model keys (held fixed); a module the lexer did not have
+        # gets the lexer's rule: non-static functions no other function of the module calls.
+        entries = [k for k in translate(mod.get("candidate_entry_points") or []) if k in fn_set]
+        roots = [k for k in fns if not set(functions[k]["internal_callers"]) & fn_set]
+        mod["candidate_entry_points"] = (
+            entries or [k for k in roots if not functions[k]["is_static"]] or roots or fns[:1]
+        )
+        modules[name] = mod
+
+    alias_keys = {
+        alias: sorted(key_of[i] for i in rec.get("ids") or [] if i in key_of) for alias, rec in sorted(aliases.items())
+    }
+    by_name: dict[str, list[str]] = defaultdict(list)
+    for rec in model_fns.values():
+        by_name[rec["name"]].append(rec["file"])
+    warnings = list(lexer.get("warnings") or []) + [
+        f"unit {u}: Frama-C could not parse it, its call graph comes from GCC (-fcallgraph-info): {err}"
+        for u, err in sorted(fallback_error.items())
+    ]
+    return {
+        **lexer,
+        "callgraph_source": "frama_c",
+        "total_c_files": len({r["file"] for r in functions.values() if r["file"].endswith(".c")}),
+        "total_functions": len(functions),
+        "total_waves": len(waves),
+        "name_collisions": [{"function": n, "files": sorted(f)} for n, f in sorted(by_name.items()) if len(f) > 1],
+        "macro_aliases": {a: k for a, k in alias_keys.items() if k},
+        "warnings": warnings,
+        "modules": modules,
+        "waves": [{"wave": i, "count": len(w), "functions": w} for i, w in enumerate(waves)],
+        "recursion_cycles": cycles,
+        "functions": functions,
+        "model": {
+            "generated_at": model.get("generated_at"),
+            "functions": len(model_fns),
+            "lexer_only_functions": dropped,
+            "gcc_fallback_units": sorted(fallback_error),
+        },
     }
 
 
@@ -2151,20 +2495,35 @@ def main() -> int:
         help="Optional output path (in workspace/) to write synthesized compile_commands.json when no build is available",
     )
     parser.add_argument("--out", type=Path, required=True, help="Output JSON path for the DAG")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL,
+        help=f"Phase 0 model (scripts/phase0_model.py) giving the functions and edges (default {DEFAULT_MODEL})",
+    )
+    parser.add_argument("--no-model", action="store_true", help="Lexer inventory and edges only (no model)")
     args = parser.parse_args()
 
+    model, model_note = (None, "disabled (--no-model)") if args.no_model else load_model(args.model)
     cc_path = args.compile_commands or (args.target / "compile_commands.json")
-    dag = build_dag(args.target, cc_path, emit_compile_commands=args.emit_compile_commands)
+    dag = build_dag(args.target, cc_path, emit_compile_commands=args.emit_compile_commands, model=model)
+    if model_note:
+        dag["warnings"] = [*dag.get("warnings", []), f"Phase 0 model not used: {model_note}"]
+        print(f"warning: Phase 0 model not used: {model_note}", file=sys.stderr)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(dag, indent=2) + "\n", encoding="utf-8")
 
     summary = {
         "out": str(args.out),
+        "callgraph_source": dag["callgraph_source"],
         "total_c_files": dag["total_c_files"],
         "total_functions": dag["total_functions"],
         "total_waves": dag["total_waves"],
         "modules": {k: v["tier"] for k, v in dag["modules"].items()},
     }
+    if model is not None:
+        summary["lexer_only_functions"] = len(dag["model"]["lexer_only_functions"])
+        summary["gcc_fallback_units"] = dag["model"]["gcc_fallback_units"]
     print(json.dumps(summary, indent=2))
     return 0
 

@@ -39,7 +39,7 @@
         "module": {"type": "string", "minLength": 1},
         "tier": {"type": "string", "minLength": 1},
         "wave": {"type": ["integer", "null"], "minimum": 0},
-        "callgraph_source": {"type": "string", "enum": ["frama_c", "regex"]},
+        "callgraph_source": {"type": "string", "enum": ["frama_c", "gcc_callgraph", "regex"]},
         "status": {"type": "string", "enum": ["planned", "in_progress", "blocked", "covered", "candidate", "deferred", "out_of_scope", "not_applicable"]},
         "agent_id": {"type": ["string", "null"]},
         "evidence": {"type": "array", "items": {"$ref": "#/definitions/evidence"}},
