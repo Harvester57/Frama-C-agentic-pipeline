@@ -8,9 +8,15 @@ Subcommands (run with the run directory as working directory):
   ingest-eva               <workspace/reports/eva/*.json ...>
   ingest-wp                <workspace/reports/wp/*.json ...> [--sweep]
   ingest-agent-hypothesis  <agent_result.json> [--module MOD]
+                           (fault_hypothesis, proof_gap, breaker crash_found, prover guardrail code_fault)
+  record-boundary-assumptions <agent_result.json>   (prover / architect boundary_assumptions)
   ingest-verifier          <verifier_result.json> [--replay-report <fuzz.json> ...] [--harness-meta <harness_mod.json>]
   transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT] [--expect STATUS ...]
-  summary
+  transition-many          --spec-json JSON|PATH
+  close-remaining          --reason TEXT
+  scaffold-verifier        --fingerprint FP --decision DECISION [...]
+  audit-hypotheses         [--dag workspace/reports/callgraph_dag.json]
+  summary | status
 
 Units are function x obligation class (docs/v2-design.md, Section 5). Every write
 is validated against schemas/ before it is committed atomically; an invalid
@@ -43,6 +49,7 @@ from framac_common import (  # noqa: E402
     RunLockTimeout,
     atomic_write_json,
     eva_alarm_in_file,
+    is_safe_relative_path,
     load_agent_result_json,
     load_json_optional,
     load_json_strict,
@@ -217,7 +224,13 @@ def add_wp_limit_assumptions(unit: dict, limits: dict, function: str) -> None:
     if limits["vacuity"]["status"] == "inconclusive":
         add_assumption(unit, "other", f"The consistency check of {function}'s contract was inconclusive.")
     oracle = limits.get("dynamic_oracle") or {}
-    if oracle.get("exercised") is False:
+    if (limits.get("guardrail_corpus") or {}).get("empty"):
+        add_assumption(
+            unit,
+            "other",
+            f"The guardrail corpus was empty: {function}'s contract was proven but never exercised on a real input.",
+        )
+    elif oracle.get("exercised") is False:
         add_assumption(
             unit,
             "other",
@@ -698,6 +711,9 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         combination = tuning.get("combination") if isinstance(tuning, dict) else None
         upgraded = combination.get("upgraded") if isinstance(combination, dict) else None
         combined_fns = {str(item.get("function")) for item in upgraded or [] if isinstance(item, dict)}
+        # Invalid alarms already turned into a candidate for a scheduled unit; the rest are
+        # ingested after both loops so none is dropped (remediation plan H7).
+        consumed: set[int] = set()
 
         for u in rte_units:
             fn = u["function"]
@@ -720,6 +736,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             has_props = has_props or bool(unit_invalids or unit_unknowns or unit_deads or unit_assumed)
 
             for alarm in unit_invalids:
+                consumed.add(id(alarm))
                 fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
                 upsert_candidate(
                     candidates,
@@ -849,6 +866,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             u_file = u["file"]
             cross_invalids = [a for a in invalid_by_fn.get(fn, []) if _alarm_in_file(a, u_file)]
             for alarm in cross_invalids:
+                consumed.add(id(alarm))
                 fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
                 upsert_candidate(
                     candidates,
@@ -875,8 +893,101 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 )
                 mark_candidate(u, fp)
                 stats["candidates"] += 1
+
+        for alarm in report.get("invalid_alarms", []):
+            if id(alarm) in consumed or not isinstance(alarm, dict):
+                continue
+            consumed.add(id(alarm))
+            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output)
+            stats["candidates"] += 1
     commit(units, candidates)
     return stats
+
+
+def _eva_alarm_path(alarm: dict) -> str:
+    """Repository-relative file of an Eva report row ('' when the row carries no file)."""
+    raw_file = str(alarm.get("file") or "").replace("\\", "/").strip()
+    raw_dir = str(alarm.get("directory") or "").replace("\\", "/").strip().rstrip("/")
+    if raw_file and raw_dir and raw_dir != "." and not raw_file.startswith("/"):
+        raw_file = f"{raw_dir}/{raw_file}"
+    return normalize_file(raw_file) if raw_file else ""
+
+
+def _ingest_unscheduled_eva_invalid(
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    alarm: dict,
+    module: str,
+    tool_output: str,
+) -> None:
+    """
+    An Eva Invalid alarm no scheduled rte unit took (remediation plan H7), mirroring the fuzz path:
+    a deferred (Tier 3) unit of the function is linked and becomes `candidate`; a function with no
+    eligible unit (out_of_scope / not_applicable / unseeded / harness code) still gets an unlinked
+    `needs_validation` candidate rather than being dropped.
+    """
+    fn = str(alarm.get("function") or "")
+    alarm_file = _eva_alarm_path(alarm)
+    linked_units = [
+        u
+        for u in units_for_function(units, alarm_file, fn)
+        if u["obligation_class"] == "rte"
+        and u["status"] not in ("out_of_scope", "not_applicable")
+        and _alarm_in_file(alarm, u["file"])
+    ]
+    kind = alarm.get("kind", "")
+    annotation = alarm.get("annotation", "")
+    line = int(alarm.get("line") or 0)
+    prop = {"kind": kind or "assertion", "predicate": annotation}
+    if linked_units:
+        u_file = linked_units[0]["file"]
+        fp = make_fingerprint(u_file, fn, kind, annotation)
+        upsert_candidate(
+            candidates,
+            fp,
+            "eva",
+            "needs_validation",
+            linked_units[0]["module"] or module,
+            {"file": normalize_file(u_file), "line": line, "function": fn},
+            prop,
+            [],
+            tool_output,
+            [u["coverage_id"] for u in linked_units],
+            # Same note the module / cross-module loops write once the unit is `candidate`, so
+            # re-ingesting the report is a no-op.
+            "Eva Invalid status without a concrete witness input"
+            if linked_units[0]["module"] == module
+            else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
+        )
+        for u in linked_units:
+            add_evidence(
+                u,
+                "eva",
+                "run_eva_slice.py",
+                "eva_invalid",
+                False,
+                tool_output,
+                f"Eva slice '{module}' reports Invalid at line {alarm.get('line')}: {annotation[:200] or kind}",
+            )
+            mark_candidate(u, fp)
+        return
+    file = alarm_file or "unknown"
+    function = fn or "unknown_function"
+    fp = make_fingerprint(file, function, kind, annotation)
+    upsert_candidate(
+        candidates,
+        fp,
+        "eva",
+        "needs_validation",
+        module,
+        {"file": file, "line": line, "function": function},
+        prop,
+        [],
+        tool_output,
+        [],
+        f"Eva Invalid status without a concrete witness input; no ledger unit for {file}#{function}::rte "
+        "(out of scope, not applicable, harness or unseeded code)",
+    )
 
 
 @ledger_locked
@@ -1335,6 +1446,13 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         if existing_cand is None:
             candidates_added += 1
 
+    code_faults_recorded = 0
+    if role == "prover":
+        for report_rel in _prover_code_fault_reports(res, aid):
+            added = _ingest_prover_code_fault(units, candidates, aid, mod, report_rel)
+            code_faults_recorded += 1
+            candidates_added += added
+
     commit(units, candidates, run_dir=Path.cwd())
     return {
         "agent_id": aid,
@@ -1343,7 +1461,183 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         "candidates_added": candidates_added,
         "strengthening_requests_added": strengthening_requests_added,
         "proof_gaps_recorded": 1 if pg is not None else 0,
+        "code_faults_recorded": code_faults_recorded,
     }
+
+
+_MAX_GUARDRAIL_REPORT_BYTES = 8 * 1024 * 1024
+_TEST_UNIT_WRITTEN_RE = re.compile(r"Test unit written to\s+(?P<path>\S+)")
+
+
+def _read_scratch_json(aid: str, src_rel: str) -> Any:
+    """Parse a JSON file under agents/<aid>/scratch/ (None when absent, unsafe, oversized or malformed)."""
+    norm = src_rel.replace("\\", "/")
+    if not is_safe_relative_path(norm) or not norm.startswith(f"agents/{aid}/scratch/"):
+        return None
+    p = Path(norm)
+    try:
+        if p.is_symlink() or not p.is_file() or p.stat().st_size > _MAX_GUARDRAIL_REPORT_BYTES:
+            return None
+        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def _prover_code_fault_reports(res: dict, aid: str) -> list[str]:
+    """
+    The guardrail reports a prover named in `evidence` whose status is `code_fault`: the dual-oracle
+    guardrail reproduced an RTE failure in target code on a real input (prover_brief.md, Oracle 1).
+    """
+    found: list[str] = []
+    for ev in res.get("evidence") or []:
+        src = rel(str(ev.get("tool_output") or ""))
+        if src in found or not src.endswith(".json"):
+            continue
+        report = _read_scratch_json(aid, src)
+        if (
+            isinstance(report, dict)
+            and report.get("status") == "code_fault"
+            and isinstance(report.get("failure"), dict)
+        ):
+            found.append(src)
+    return found
+
+
+def _guardrail_crash_input(report: dict, aid: str) -> str | None:
+    """Run-relative crashing input libFuzzer wrote under agents/<aid>/scratch/ (from `runtime_trace`)."""
+    marker = f"agents/{aid}/scratch/"
+    for m in _TEST_UNIT_WRITTEN_RE.finditer(str(report.get("runtime_trace") or "")):
+        path = m.group("path").replace("\\", "/")
+        idx = path.find(marker)
+        if idx < 0:
+            continue
+        cand = path[idx:]
+        if is_safe_relative_path(cand) and Path(cand).is_file() and not Path(cand).is_symlink():
+            return cand
+    return None
+
+
+def _ingest_prover_code_fault(
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    aid: str,
+    mod: str,
+    report_rel: str,
+) -> int:
+    """
+    Turn a prover's guardrail `code_fault` into a candidate (remediation plan H8), mirroring the breaker
+    `crash_found` branch: the guardrail report is promoted and recorded as the tool output, the crashing
+    input (when libFuzzer wrote one under the agent's scratch) is promoted as a crash reproducer, and the
+    function's units of the failing obligation class are linked and marked `candidate`. Returns 1 when a
+    new candidate was created.
+    """
+    src = Path(report_rel)
+    prom_report = promote_file(
+        Path.cwd(), aid, report_rel, kind="artifact", dest_name=f"code_fault_{src.parent.name}_{src.name}"
+    )
+    tool_out = str(prom_report["dest"])
+    report = load_json_strict(Path(tool_out))
+    failure = report["failure"]
+    ffile = normalize_file(str(failure.get("file") or ""))
+    ffn = str(failure.get("function") or "")
+    if ffn.startswith("__gen_e_acsl_"):
+        ffn = ffn[len("__gen_e_acsl_") :]
+    kind = str(failure.get("alarm_kind") or failure.get("kind") or "assertion")
+    pred = str(failure.get("predicate") or "")
+    exact_fp = make_fingerprint(ffile, ffn, kind, pred)
+    existing_cand = candidates.get(exact_fp) or _find_matching_sink_candidate(candidates, ffile, ffn, kind, pred)
+    fp = existing_cand["fingerprint"] if existing_cand is not None else exact_fp
+    cls = goal_obligation_class({"kind": failure.get("kind", ""), "annotation": pred})
+    fn_units = [
+        u for u in units_for_function(units, ffile, ffn) if u["status"] not in ("out_of_scope", "not_applicable")
+    ]
+    linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
+        u["coverage_id"] for u in fn_units
+    ]
+    crash_rel: str | None = None
+    crash_src = _guardrail_crash_input(report, aid)
+    if crash_src is not None:
+        crash_rel = str(promote_file(Path.cwd(), aid, crash_src, kind="crash", module=mod)["dest"])
+    proposed = "confirmed" if crash_rel else "needs_validation"
+    note = "prover dual-oracle guardrail reproduced an RTE failure on a real input (code_fault)"
+    if crash_rel is None:
+        note += "; the crashing input was not found under the agent scratch, verifier must reproduce"
+    if not linked:
+        note += f"; no ledger unit for {ffile}#{ffn}::{cls} (harness or unseeded code)"
+    upsert_candidate(
+        candidates,
+        fp,
+        "prover",
+        proposed,
+        mod,
+        {"file": ffile or "unknown", "line": int(failure.get("line") or 0), "function": ffn or "unknown_function"},
+        {"kind": kind, "predicate": pred},
+        [crash_rel] if crash_rel else [],
+        tool_out,
+        linked,
+        note,
+    )
+    for cid in linked:
+        add_evidence(
+            units[cid],
+            "wp",
+            aid,
+            "guardrail_code_fault",
+            False,
+            tool_out,
+            f"Guardrail code_fault {kind} at line {failure.get('line')}: {pred[:120]}",
+            {"artifact": crash_rel} if crash_rel else None,
+        )
+        if existing_cand is None or existing_cand.get("status") == "unverified":
+            mark_candidate(units[cid], fp)
+    return 1 if existing_cand is None else 0
+
+
+@ledger_locked
+def cmd_record_boundary_assumptions(result_path: Path) -> dict:
+    """
+    Record an agent's `boundary_assumptions` (remediation plan H8) as `boundary_assumption` entries on
+    the units its work credits. Prover: every unit of its function that is not deferred / out_of_scope /
+    not_applicable. Architect: its result names no function (schema: header, patch, notes), so nothing
+    is recorded and the result says so. Idempotent: an assumption already on a unit is not added again.
+    """
+    res = load_agent_result_json(result_path)
+    errs = validate_agent_result(res)
+    if errs:
+        raise LedgerError("invalid agent-result:\n  " + "\n  ".join(errs[:20]))
+    role = res["role"]
+    if role not in ("prover", "architect"):
+        raise LedgerError(f"record-boundary-assumptions expects a prover or architect result (got {role!r})")
+    descriptions: list[str] = []
+    for text in res.get("boundary_assumptions") or []:
+        d = str(text).strip()
+        if d and d not in descriptions:
+            descriptions.append(d)
+    out: dict[str, Any] = {"agent_id": res["agent_id"], "role": role, "assumptions": len(descriptions)}
+    if role == "architect":
+        out.update(
+            {
+                "units": [],
+                "added": 0,
+                "skipped_reason": "architect result does not name the functions it contracted",
+            }
+        )
+        return out
+    units, candidates = load_state()
+    targets = [u for u in units_for_function(units, res["file"], res["function"]) if u["status"] not in NO_TOUCH]
+    added = 0
+    for u in targets:
+        for d in descriptions:
+            if any(a["kind"] == "boundary_assumption" and a["description"] == d for a in u["assumptions"]):
+                continue
+            add_assumption(u, "boundary_assumption", d)
+            added += 1
+    if added:
+        commit(units, candidates, run_dir=Path.cwd())
+    out.update({"units": sorted(u["coverage_id"] for u in targets), "added": added})
+    if descriptions and not targets:
+        out["skipped_reason"] = f"no schedulable ledger unit for {res['file']}#{res['function']}"
+    return out
 
 
 def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_outputs: list[str]) -> set[str]:
@@ -2167,6 +2461,8 @@ def main(argv: list[str] | None = None) -> int:
     p_hyp = sub.add_parser("ingest-agent-hypothesis")
     p_hyp.add_argument("result", type=Path)
     p_hyp.add_argument("--module", default=None)
+    p_ba = sub.add_parser("record-boundary-assumptions")
+    p_ba.add_argument("result", type=Path)
     p_ver = sub.add_parser("ingest-verifier")
     p_ver.add_argument("result", type=Path)
     p_ver.add_argument("--replay-report", action="append", type=Path, default=[])
@@ -2221,6 +2517,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_ingest_wp(args.reports, sweep=args.sweep)
         elif args.cmd == "ingest-agent-hypothesis":
             out = cmd_ingest_agent_hypothesis(args.result, args.module)
+        elif args.cmd == "record-boundary-assumptions":
+            out = cmd_record_boundary_assumptions(args.result)
         elif args.cmd == "ingest-verifier":
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
         elif args.cmd == "transition":

@@ -353,7 +353,9 @@ def validate_agent_result(data) -> Errors:
                 errors.add("$.fault_hypothesis: must be null when status is all_proven")
             if data.get("proof_gap") is not None:
                 errors.add("$.proof_gap: must be null when status is all_proven")
-        elif not data["unproven_goals"]:
+        elif not data["unproven_goals"] and data["status"] != "blocked":
+            # The brief's blocked exits (a guardrail code_fault, a repeated analysis_error) decide no
+            # goal: they name the report that blocked them in `evidence` (required by the schema).
             errors.add("$.unproven_goals: required when the proof did not complete")
         for idx, ev in enumerate(data["evidence"]):
             _path_ok(errors, f"$.evidence[{idx}].tool_output", ev["tool_output"])

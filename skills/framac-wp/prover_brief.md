@@ -278,4 +278,6 @@ The Frama-C manuals are available as greppable Markdown under `{references_dir}`
 }
 ```
 
+A `blocked` result (a guardrail `code_fault`, a repeated `analysis_error`) may leave `unproven_goals` empty, but its `evidence` must name the report that blocked it.
+
 Set `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) only when you believe a specific input violates a specific goal (which creates a `needs_validation` bug candidate). When a goal stalls due to a WP/SMT limitation (for example `<stdlib.h>` dynamic allocation predicates `\freeable` / `allocates` or nonlinear arithmetic) or an unreachable branch rather than a code bug, leave `fault_hypothesis` as `null` and set `proof_gap` (`{"predicate": "...", "reason": "..."}`; must be `null` when `status` is `"all_proven"`). A stall without either is reported through `unproven_goals` alone.

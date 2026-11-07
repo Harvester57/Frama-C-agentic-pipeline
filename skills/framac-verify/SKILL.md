@@ -89,9 +89,9 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 
 ### Setup
 
-1. `-NewRun` (or `-RunDir <existing>`), then: `python3 /opt/framac-pipeline/scripts/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
-2. Check the measured machine: `python3 /opt/framac-pipeline/scripts/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
-3. If `state/progress.json` exists (`python3 /opt/framac-pipeline/scripts/checkpoint.py load state`), resume from the recorded phase. For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead.
+1. **Resume** (`-RunDir <existing>`): run `python3 /opt/framac-pipeline/scripts/checkpoint.py load state`. If it reports a `phase_done`, resume after that phase and skip step 2 (`run_metadata.py init` refuses an initialized run). For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead.
+2. **New run** (`-NewRun`): `python3 /opt/framac-pipeline/scripts/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
+3. Check the measured machine: `python3 /opt/framac-pipeline/scripts/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
 
 ### Phase 0 — Slicing, DAG, ledger seeding (`/framac-slice`)
 
@@ -126,7 +126,7 @@ Ingestion keeps the fuzz-then-Eva order:
 
 Tune modules with `pipeline_make.py params set` when Eva or fuzzing needs it, then re-run the target.
 
-Checkpoint `phase_done = 2`.
+`run wp-queue` records `phase_done = 2` itself.
 
 ### Crash Verification Gate and Phase 3 (`/framac-wp`)
 
@@ -135,9 +135,9 @@ Execute `skills/framac-wp/SKILL.md`. Its scheduler loop handles everything:
   - `confirmed`: the function's units become `candidate` and are excluded from WP. Optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
   - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run module-<mod>`, then `wp_scheduler.py refresh --module <mod>`.
   - After two attempts, the module's remaining active units become `blocked` (`harness_repair_exhausted`).
-- **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine. (Note: in a `--profile quick` triage-only run where the user explicitly skips Phase 3 WP after the Crash Verification Gate, close remaining `planned` units with `python3 /opt/framac-pipeline/scripts/ledger.py close-remaining --reason "quick_profile_wp_not_scheduled: Phase 3 WP not run in quick profile"`; otherwise run the Phase 3 scheduler loop to completion.)
+- **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine. Under `--profile quick` the scheduler proves only the Tier 1A entry chains and closes every other planned unit itself (`quick_profile_wp_not_scheduled`), so the loop still reaches `done`. Only when the user explicitly skips Phase 3 altogether, close the remaining `planned` units with `python3 /opt/framac-pipeline/scripts/ledger.py close-remaining --reason "quick_profile_wp_not_scheduled: Phase 3 WP not run in quick profile"`; otherwise run the Phase 3 scheduler loop to completion.
 
-Checkpoint `phase_done = 3`.
+Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 3 --from-file state/wp_schedule.json`.
 
 ### Phase 4 — Export, status, and reports
 

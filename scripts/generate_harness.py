@@ -28,7 +28,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_strict, normalize_flag_args, utc_now  # noqa: E402
+from framac_common import (  # noqa: E402
+    atomic_write_json,
+    load_json_optional,
+    load_json_strict,
+    normalize_flag_args,
+    utc_now,
+)
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
@@ -1563,6 +1569,17 @@ def generate_module_harness(
     if prelude.get("reason"):
         prelude_fields["prelude_reason"] = prelude["reason"]
 
+    # A repair that regenerates the harness keeps the count `--record-repair` kept, or the
+    # repair cap would reset on every repair and the loop would never end.
+    previous = load_json_optional(harness_meta_file, {})
+    previous = previous if isinstance(previous, dict) else {}
+    try:
+        repair_attempts = max(0, int(previous.get("repair_attempts") or 0))
+    except (TypeError, ValueError):
+        repair_attempts = 0
+    repair_history = previous.get("repair_history")
+    repair_history = list(repair_history) if isinstance(repair_history, list) else []
+
     sidecar = {
         "module": module_name,
         "harness_file": str(harness_file).replace("\\", "/"),
@@ -1585,9 +1602,9 @@ def generate_module_harness(
         "reachability": reachability,
         "max_input_size": max_input_size,
         "contract_notes": list(contract_notes or []),
-        "repair_attempts": 0,
+        "repair_attempts": repair_attempts,
         "max_repair_attempts": MAX_HARNESS_REPAIR_ATTEMPTS,
-        "repair_history": [],
+        "repair_history": repair_history,
         **prelude_fields,
     }
     atomic_write_json(harness_meta_file, sidecar)

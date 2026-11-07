@@ -66,7 +66,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
      ```text
      python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module {module_name} --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/verify_{module_name} --corpus-dir agents/{agent_id}/scratch/seeds --artifacts-dir agents/{agent_id}/scratch/crashes --max-time 20 --cppflags='{cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/attempt_{module_name}.json
      ```
-   - **If reproduced (`reproducible: true`):** upgrade to `decision: "confirmed"` and attach the reproducer from `agents/{agent_id}/scratch/crashes/` (also pass `--replay-report agents/{agent_id}/scratch/attempt_{module_name}.json` when the parent ingests your verdict).
+   - **If reproduced (`reproducible: true`):** upgrade to `decision: "confirmed"` and attach the reproducer from `agents/{agent_id}/scratch/crashes/` (the parent replays your reproducers itself before ingesting the verdict; your own replay reports are evidence for your analysis, not for the confirmation).
    - **If not reproduced:** return `decision: "needs_validation"` with `origin` set to `"eva_invalid_no_witness"` or `"fault_hypothesis"`, concrete `blockers`, and a specific `validation_plan` (`local` and/or `owner`).
 
 ### Reference Manuals (Last Resort)

@@ -197,8 +197,12 @@ minimize: replay
 		$(PY) $(S)/run_eacsl_fuzz.py minimize-candidates --candidates candidates.json \
 		--harness-dir workspace/harnesses --out-dir workspace/reports/minimize
 
+# Phases 1 and 2 are done once the Phase-3 queue is built from their ingested reports: record it,
+# so a resumed run starts at Phase 3.
 wp-queue: ingest facts
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init
+	$(RUN) --class light --key wp-queue -- $(PY) $(S)/checkpoint.py save-phase state --phase 2 \
+		--from-file workspace/reports/wp_queue.json
 
 # Mechanical Phase-3 WP baseline wave across all queued functions.
 # Not leased itself: wp_scheduler.py only coordinates, and leases one `wp` job per function.

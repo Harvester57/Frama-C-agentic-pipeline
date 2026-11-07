@@ -16,6 +16,9 @@ Modes:
      - code_fault               : an RTE assertion failed; this is a code defect candidate,
                                   not evidence against the contract
      - guardrail_error / compile_error
+   Past `--max-corpus-inputs`, every promoted seed-* / crash-* file is replayed and the rest is
+   a deterministic sample; `corpus_total`, `corpus_replayed`, `corpus_sampled` and
+   `corpus_empty` say what was replayed. A pass on an empty corpus is not a pass on real inputs.
 3. `selftest`: builds the bundled canary through the production path (never cached).
 4. `build`: compiles a module's fuzz binary only (no target code runs). Used by Make.
 5. `replay`: replays given inputs once each on a given or built binary. The report's
@@ -1606,14 +1609,21 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
     """
     status = res.get("status")
     if status == "passed_dynamic_oracle":
+        passed_hints: list[str] = []
+        if res.get("corpus_empty"):
+            passed_hints.append(
+                "The module corpus is empty: this pass replayed no real input, only mutations of an empty one. "
+                "It is not evidence that the contract holds on real inputs; the merged proof records it as an "
+                "open assumption."
+            )
         unreached = (res.get("reach") or {}).get("unreached") or []
-        if not unreached:
-            return []
-        return [
-            f"This pass tested nothing for {', '.join(unreached)}: no replayed input reached it, so its contract "
-            "was not challenged at runtime. The merged proof records this as an open assumption. Keep every "
-            "`requires` as weak as the proof allows, because no runtime check will catch an over-constrained one."
-        ]
+        if unreached:
+            passed_hints.append(
+                f"This pass tested nothing for {', '.join(unreached)}: no replayed input reached it, so its contract "
+                "was not challenged at runtime. The merged proof records this as an open assumption. Keep every "
+                "`requires` as weak as the proof allows, because no runtime check will catch an over-constrained one."
+            )
+        return passed_hints
     if status in ("built", "no_crash"):
         return []
 
@@ -1749,6 +1759,41 @@ def corpus_manifest(corpus_dir: Path) -> list[list[str | int]]:
     return entries
 
 
+# Corpus files a guardrail always replays: promoted seeds (promote_artifact.py names them
+# `seed-<sha256[:16]>`) and crash-derived inputs (libFuzzer artifact prefixes, promoted crashes).
+# They are the targeted inputs; libFuzzer's own units are named by their SHA-1 hex digest.
+TARGETED_CORPUS_PREFIXES = ("seed-", "crash-", "leak-", "timeout-", "oom-", "slow-unit-", "minimized-from-")
+
+
+def select_replay_inputs(names: list[str], limit: int | None) -> tuple[list[str], bool]:
+    """
+    The corpus files a guardrail replays, sorted by name, and whether that is a sample.
+
+    Every targeted file (TARGETED_CORPUS_PREFIXES) is kept, even beyond `limit`. The rest of the
+    budget goes to the other files ordered by the SHA-256 of their name: a deterministic sample,
+    the same on every machine, that does not favour any name prefix. `limit` None or <= 0 keeps all.
+    """
+    unique = sorted(set(names))
+    if limit is None or limit <= 0 or len(unique) <= limit:
+        return unique, False
+    targeted = [n for n in unique if n.startswith(TARGETED_CORPUS_PREFIXES)]
+    others = [n for n in unique if not n.startswith(TARGETED_CORPUS_PREFIXES)]
+    room = max(0, limit - len(targeted))
+    others.sort(key=lambda n: hashlib.sha256(n.encode("utf-8", errors="surrogateescape")).hexdigest())
+    chosen = sorted(targeted + others[:room])
+    return chosen, len(chosen) < len(unique)
+
+
+def corpus_selection_fields(total: int, replayed: int, sampled: bool) -> dict:
+    """The report fields that say which part of the corpus a guardrail replayed."""
+    return {
+        "corpus_total": total,
+        "corpus_replayed": replayed,
+        "corpus_sampled": sampled,
+        "corpus_empty": total == 0,
+    }
+
+
 def run_guardrail_check(
     binary: Path,
     corpus_dir: Path,
@@ -1800,11 +1845,10 @@ def run_guardrail_check(
     seed = derive_seed(binary, module) if seed is None else seed
 
     corpus_entries = corpus_manifest(corpus_dir)
-    replay_manifest = (
-        corpus_entries[:max_corpus_inputs]
-        if (max_corpus_inputs is not None and max_corpus_inputs > 0 and len(corpus_entries) > max_corpus_inputs)
-        else corpus_entries
-    )
+    chosen_names, sampled = select_replay_inputs([str(e[0]) for e in corpus_entries], max_corpus_inputs)
+    chosen_set = set(chosen_names)
+    replay_manifest = [e for e in corpus_entries if e[0] in chosen_set]
+    selection = corpus_selection_fields(len(corpus_entries), len(replay_manifest), sampled)
 
     g_key: str | None = None
     g_material: dict | None = None
@@ -1828,21 +1872,21 @@ def run_guardrail_check(
             if entry is not None:
                 cached = dict(entry.data.get("verdict") or {})
                 if cached.get("status") == "passed_dynamic_oracle":
+                    cached.update(selection)
                     cached["corpus_dir"] = str(corpus_dir)
                     cached["cache"] = {"hit": True, "key": g_key}
+                    cached["diagnostic_hints"] = derive_eacsl_diagnostic_hints(cached)
                     return cached
 
-    corpus_files = [
-        p for p in sorted(corpus_dir.iterdir()) if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
-    ]
     replay_dir = corpus_dir
-    if max_corpus_inputs is not None and max_corpus_inputs > 0 and len(corpus_files) > max_corpus_inputs:
+    if sampled:
         replay_corpus = scratch_dir / "replay_corpus"
         if replay_corpus.is_dir():
             shutil.rmtree(replay_corpus, ignore_errors=True)
         replay_corpus.mkdir(parents=True, exist_ok=True)
-        for f in corpus_files[:max_corpus_inputs]:
-            shutil.copy2(f, replay_corpus / f.name)
+        for name in chosen_names:
+            with contextlib.suppress(OSError):
+                shutil.copy2(corpus_dir / name, replay_corpus / name)
         replay_dir = replay_corpus
 
     cmd = [
@@ -1869,6 +1913,7 @@ def run_guardrail_check(
             "corpus_dir": str(corpus_dir),
             "seed": seed,
             "per_input_timeout": per_input_timeout,
+            **selection,
         }
     )
     if verdict["status"] != "passed_dynamic_oracle":
@@ -3280,7 +3325,16 @@ def main(argv: list[str] | None = None) -> int:
         "--max-corpus-inputs",
         type=int,
         default=64,
-        help="Maximum number of corpus inputs to replay (default: 64)",
+        help=(
+            "Corpus inputs to replay (default: 64). Promoted seed-*/crash-* files are always replayed; the rest "
+            "is a deterministic sample (report: corpus_total, corpus_replayed, corpus_sampled)"
+        ),
+    )
+    p_guard.add_argument(
+        "--reach-functions",
+        nargs="*",
+        default=None,
+        help="Functions whose reach the report measures (default: --functions). Does not narrow instrumentation",
     )
     p_guard.add_argument("--out-json", type=Path, required=True)
 
@@ -3557,7 +3611,7 @@ def main(argv: list[str] | None = None) -> int:
                     use_cache=use_cache,
                     use_verdict_cache=use_verdict_cache,
                     max_corpus_inputs=args.max_corpus_inputs,
-                    functions=args.functions,
+                    functions=args.reach_functions if args.reach_functions else args.functions,
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
                 if "diagnostic_hints" not in res:

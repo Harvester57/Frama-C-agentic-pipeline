@@ -23,18 +23,18 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 
 ## P1 High
 
-| ID | Class | Defect | Remediation |
-|---|---|---|---|
-| H1 | workflow | In the `quick` profile the scheduler only creates prove tasks for the Tier 1A entry chain, but `_is_done` requires no `planned` units, so Phase 3 ends `stuck`. | When the profile is `quick`, have `wp_scheduler.py` close off-chain planned units as `deferred` (`quick_profile_wp_not_scheduled`) at `init`/`_sync`; align `framac-verify` SKILL. |
-| H2 | workflow | A Phase 3 crash (breaker, reproduced hypothesis) can never be `confirmed`: `ingest-verifier` needs a parent replay report, but replay only runs in Phase 2 and the verifier's `attempt_*.json` is never passed. | On `complete` of a verifier for a candidate without a replay report, run `run_eacsl_fuzz.py replay-candidates` for that fingerprint (parent-side, sandboxed) before `ingest-verifier`; fix the brief. |
-| H3 | workflow | The prover brief prescribes `blocked` with `unproven_goals: []` for `code_fault` / repeated `analysis_error`, but `validate_artifacts.py` requires a non-empty list for any non-`all_proven` result, so those results are discarded and the task ends `invalid_result`. | Allow an empty list when `blocked` carries `code_fault`, `analysis_error` or `proof_gap`; align brief example. |
-| H4 | workflow | Regenerating a harness rewrites `repair_attempts: 0`, so the 2-repair cap never triggers. | `generate_harness.py` preserves `repair_attempts` / `repair_history` from an existing sidecar. |
-| H5 | workflow | Resume is broken: Setup runs `run_metadata.py init` before the resume check (init refuses an existing run); no command writes `phase_done` 2/3; slice Step 5 runs `checkpoint.py init` unconditionally and rewinds progress. | Reorder Setup; add `checkpoint.py save-phase` calls (or Make hooks) after ingest and after the scheduler reports `done`; guard `checkpoint init` like Make's `seed`. |
-| H6 | workflow | `wp_scheduler.py baseline` (Make `wp-baseline`, undocumented) closes every prove task it attempts as `done` regardless of WP result. | Close only `all_proven` tasks; leave others `pending` for a prover; document or remove the target. |
-| H7 | recall | Eva `Invalid` alarms in deferred / unseeded functions are dropped at ingest; fuzz crashes in the same functions are kept. | Mirror the fuzz path: link deferred units, create unlinked candidates otherwise. |
-| H8 | recall | A guardrail `code_fault` never becomes a candidate; `boundary_assumptions` (prover, architect) and `suggested_requires` (breaker) are never read. | Ingest `code_fault` as a candidate with the guardrail report as reproducer source; record boundary assumptions on the units the proof credits. |
-| H9 | soundness | The dual-oracle guardrail is weaker than documented: only the first 64 corpus files by name are replayed (promoted `seed-*` sort last); the normal merge path passes `module=None`, so reach is never measured and `limits.dynamic_oracle` never recorded; no mechanical trust-boundary check of `requires` on `untrusted_surface` entries. | Sample the corpus deterministically including seeds; pass module/sources on merge so reach is measured; add a lexical check rejecting value constraints on attacker-controlled parameters in entry-function `requires`. |
-| H10 | isolation | `pipeline_make.py run minimize` is classed static though it runs target code (`resources.py` `_DYNAMIC_MAKE_TARGETS`). | Add `minimize` to the dynamic targets. |
+| ID | Class | Defect | Remediation | Status |
+|---|---|---|---|---|
+| H1 | workflow | In the `quick` profile the scheduler only creates prove tasks for the Tier 1A entry chain, but `_is_done` requires no `planned` units, so Phase 3 ends `stuck`. | When the profile is `quick`, have `wp_scheduler.py` close off-chain planned units as `deferred` (`quick_profile_wp_not_scheduled`) at `init`/`_sync`; align `framac-verify` SKILL. | Fixed |
+| H2 | workflow | A Phase 3 crash (breaker, reproduced hypothesis) can never be `confirmed`: `ingest-verifier` needs a parent replay report, but replay only runs in Phase 2 and the verifier's `attempt_*.json` is never passed. | On `complete` of a verifier for a candidate without a replay report, run `run_eacsl_fuzz.py replay-candidates` for that fingerprint (parent-side, sandboxed) before `ingest-verifier`; fix the brief. | Fixed |
+| H3 | workflow | The prover brief prescribes `blocked` with `unproven_goals: []` for `code_fault` / repeated `analysis_error`, but `validate_artifacts.py` requires a non-empty list for any non-`all_proven` result, so those results are discarded and the task ends `invalid_result`. | Allow an empty list when `blocked` carries `code_fault`, `analysis_error` or `proof_gap`; align brief example. | Fixed |
+| H4 | workflow | Regenerating a harness rewrites `repair_attempts: 0`, so the 2-repair cap never triggers. | `generate_harness.py` preserves `repair_attempts` / `repair_history` from an existing sidecar. | Fixed |
+| H5 | workflow | Resume is broken: Setup runs `run_metadata.py init` before the resume check (init refuses an existing run); no command writes `phase_done` 2/3; slice Step 5 runs `checkpoint.py init` unconditionally and rewinds progress. | Reorder Setup; add `checkpoint.py save-phase` calls (or Make hooks) after ingest and after the scheduler reports `done`; guard `checkpoint init` like Make's `seed`. | Fixed |
+| H6 | workflow | `wp_scheduler.py baseline` (Make `wp-baseline`, undocumented) closes every prove task it attempts as `done` regardless of WP result. | Close only `all_proven` tasks; leave others `pending` for a prover; document or remove the target. | Fixed |
+| H7 | recall | Eva `Invalid` alarms in deferred / unseeded functions are dropped at ingest; fuzz crashes in the same functions are kept. | Mirror the fuzz path: link deferred units, create unlinked candidates otherwise. | Fixed |
+| H8 | recall | A guardrail `code_fault` never becomes a candidate; `boundary_assumptions` (prover, architect) and `suggested_requires` (breaker) are never read. | Ingest `code_fault` as a candidate with the guardrail report as reproducer source; record boundary assumptions on the units the proof credits. | Fixed |
+| H9 | soundness | The dual-oracle guardrail is weaker than documented: only the first 64 corpus files by name are replayed (promoted `seed-*` sort last); the normal merge path passes `module=None`, so reach is never measured and `limits.dynamic_oracle` never recorded; no mechanical trust-boundary check of `requires` on `untrusted_surface` entries. | Sample the corpus deterministically including seeds; pass module/sources on merge so reach is measured; add a lexical check rejecting value constraints on attacker-controlled parameters in entry-function `requires`. | Fixed |
+| H10 | isolation | `pipeline_make.py run minimize` is classed static though it runs target code (`resources.py` `_DYNAMIC_MAKE_TARGETS`). | Add `minimize` to the dynamic targets. | Fixed |
 
 ## P2 Medium
 
@@ -55,6 +55,9 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 | M13 | doc | `wp-sweep` is said to feed the shared proof cache; it runs with `--cache-dir off`. | Fix the docs or publish swept proofs. |
 | M14 | doc | Tamper-evidence via fingerprints (`v2-design.md` §3) is not implemented. | Recompute fingerprints in `validate_artifacts.py`, or reword. |
 | M15 | soundness | `export-diff` copies unproven headers into the "verified" contracts output. | Copy only headers whose contracts back covered units, or rename the output. |
+| M16 | recall | A prover `code_fault` candidate finds its crash input by parsing the guardrail's truncated `runtime_trace`. | Have `run_eacsl_fuzz.py guardrail` write an explicit `crash_input` path into a `code_fault` report. |
+| M17 | soundness | Architect `boundary_assumptions` are not recorded: the architect result does not name the functions it contracted. | Add a `functions` list to the architect result (schema, brief, validator); `ledger.py record-boundary-assumptions` then records them. |
+| M18 | soundness | The trust-boundary check cannot see `global_buffer` entries: the sidecar does not record `global_buf` / `global_len`. | Record them in `generate_harness.py`. |
 
 ## P3 Low (documentation drift)
 
@@ -76,6 +79,5 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 ## Order of work
 
 1. P0 (C1–C5) — done in this change, with tests.
-2. P1 workflow blockers H1–H6 (each independent; H2 and H3 touch `wp_scheduler.py` / `validate_artifacts.py`).
-3. P1 recall and isolation H7–H10.
-4. P2, then a single doc pass for P3.
+2. P1 (H1–H10) — done, with tests. H8 records architect boundary assumptions only once the architect result names its functions (schema change pending, P2).
+3. P2, then a single doc pass for P3.

@@ -143,10 +143,14 @@ def test_ingest_eva_keys_alarms_by_directory_and_file(run_dir):
     }
     elsewhere = {**alarm, "directory": "workspace/work/src/other", "annotation": "j < 4"}
     write_json(run_dir / "workspace/reports/eva/snmp.json", eva_report(invalid_alarms=[alarm, elsewhere]))
-    assert L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])["candidates"] == 1
-    (cand,) = load(run_dir / "candidates.json")
-    assert cand["fingerprint"] == make_fingerprint("src/snmp/ber.c", "ber_decode_len", "index_bound", "i < 8")
+    assert L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])["candidates"] == 2
+    by_fp = {c["fingerprint"]: c for c in load(run_dir / "candidates.json")}
+    cand = by_fp[make_fingerprint("src/snmp/ber.c", "ber_decode_len", "index_bound", "i < 8")]
     assert cand["location"]["file"] == "src/snmp/ber.c"
+    assert cand["linked_units"] == ["src/snmp/ber.c#ber_decode_len::rte"]
+    # The other file's alarm has no unit: it is kept as an unlinked candidate (H7), never linked here.
+    other = by_fp[make_fingerprint("src/other/ber.c", "ber_decode_len", "index_bound", "j < 4")]
+    assert other["location"]["file"] == "src/other/ber.c" and other["linked_units"] == []
 
 
 def test_ingest_eva_analysis_error_never_covers(run_dir):

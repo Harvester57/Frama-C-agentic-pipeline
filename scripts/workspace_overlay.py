@@ -47,10 +47,14 @@ from acsl_ast import (  # noqa: E402
     AcslError,
     ConflictingProfileError,
     ScopeViolationError,
+    TrustBoundaryError,
     check_conflicting_acsl_profiles,
     check_frame_preserved,
     dedup_acsl_declarations,
+    entry_requires_violations,
     extract_top_level_acsl_declarations,
+    function_contract_text,
+    function_param_names,
     locate_function_span,
     splice_architect_header,
     splice_prover_changes,
@@ -923,16 +927,19 @@ def _run_parent_reverify(
     wp_par: int | None = None,
     allow_partial_wp: bool = False,
     wp_extra_sources: list[str] | None = None,
+    reach_functions: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
     caps the WP run's concurrent provers when several re-checks share the job budget (default:
     `auto`, the whole budget). The guardrail binary is built outside the agent's scratch, at a
     path fixed per module build, so an unchanged module is restored from the build cache.
+    `reach_functions`: functions whose reach a module-wide guardrail (no `function`) measures,
+    without narrowing its instrumentation; the report is at `_parent_guard_json(...)`.
     """
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
-    guard_reach = None
+    guard_report: dict | None = None
 
     if module and sources:
         harness = overlay_dir / "harnesses" / f"harness_{module}.c"
@@ -957,7 +964,7 @@ def _run_parent_reverify(
         bin_name = f"guard_{safe_module}_{function}" if function else f"guard_{safe_module}"
         guard_bin = run_dir / "state" / "parent_guard" / f"{safe_module}-{build_tag}" / bin_name
         guard_scratch = run_dir / "agents" / agent_id / "scratch" / "parent_guard"
-        guard_json = run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
+        guard_json = _parent_guard_json(run_dir, agent_id, function, module)
         work_sources = [_resolve_overlay_source(run_dir, work_dir, s) for s in sources]
         if not any(Path(ws).name == harness.name for ws in work_sources):
             work_sources.append(str(harness))
@@ -985,6 +992,8 @@ def _run_parent_reverify(
         ]
         if function:
             cmd.extend(["--functions", function])
+        elif reach_functions:
+            cmd.extend(["--reach-functions", *sorted(set(reach_functions))])
         if not rte_initialized:
             cmd.append("--no-rte-initialized")
         if ldflags:
@@ -998,7 +1007,7 @@ def _run_parent_reverify(
         report = json.loads(guard_json.read_text(encoding="utf-8"))
         if report.get("status") != "passed_dynamic_oracle":
             return False, f"parent guardrail returned status={report.get('status')!r}"
-        guard_reach = report.get("reach")
+        guard_report = report
 
     if role == "prover" and c_file and function:
         norm_c = _normalize_work_relpath(c_file)
@@ -1054,19 +1063,76 @@ def _run_parent_reverify(
                 )
         elif wp_status != "all_proven":
             return False, f"parent WP check on merged tree returned status={wp_status!r}"
-        if isinstance(guard_reach, dict) and guard_reach.get("measured"):
-            wp_report.setdefault("limits", {})["dynamic_oracle"] = {
-                "exercised": function not in (guard_reach.get("unreached") or []),
-                "hits": (guard_reach.get("functions") or {}).get(function),
-                "executed_inputs": guard_reach.get("executed_inputs"),
-            }
+        if guard_report is not None and _apply_guard_limits(wp_report, function, guard_report):
             wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
-        if len(_function_files(run_dir, function) - {norm_c}) == 0:
-            canonical = overlay_dir / "reports" / "wp" / f"{function}.json"
-            canonical.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(wp_json, canonical)
+        _publish_canonical_wp(run_dir, overlay_dir, wp_json, norm_c, function)
 
     return True, "verified"
+
+
+def _parent_guard_json(run_dir: Path, agent_id: str, function: str | None, module: str | None) -> Path:
+    """Where `_run_parent_reverify` writes its guardrail report."""
+    return run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
+
+
+def _publish_canonical_wp(run_dir: Path, overlay_dir: Path, wp_json: Path, norm_c: str, function: str) -> None:
+    """Copy a parent WP report to reports/wp/<function>.json unless the name is ambiguous across files."""
+    if len(_function_files(run_dir, function) - {norm_c}) == 0:
+        canonical = overlay_dir / "reports" / "wp" / f"{function}.json"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(wp_json, canonical)
+
+
+def _apply_guard_limits(wp_report: dict, function: str, guard_report: dict) -> bool:
+    """
+    Record in `wp_report["limits"]` what the parent guardrail established for `function`:
+    `dynamic_oracle` {exercised, hits, executed_inputs} from its reach and `guardrail_corpus`
+    {total, replayed, sampled, empty}. A pass on an empty corpus replayed no real input, so it is
+    recorded as not exercised (an open assumption in the ledger), never as a pass on inputs.
+    Returns whether anything was recorded.
+    """
+    limits = wp_report.setdefault("limits", {})
+    corpus_empty = bool(guard_report.get("corpus_empty"))
+    changed = False
+    if "corpus_total" in guard_report:
+        limits["guardrail_corpus"] = {
+            "total": guard_report.get("corpus_total"),
+            "replayed": guard_report.get("corpus_replayed"),
+            "sampled": bool(guard_report.get("corpus_sampled")),
+            "empty": corpus_empty,
+        }
+        changed = True
+    reach = guard_report.get("reach")
+    if isinstance(reach, dict) and reach.get("measured"):
+        limits["dynamic_oracle"] = {
+            "exercised": function not in (reach.get("unreached") or []) and not corpus_empty,
+            "hits": (reach.get("functions") or {}).get(function),
+            "executed_inputs": reach.get("executed_inputs"),
+        }
+        changed = True
+    elif corpus_empty:
+        limits["dynamic_oracle"] = {
+            "exercised": False,
+            "hits": None,
+            "executed_inputs": reach.get("executed_inputs") if isinstance(reach, dict) else None,
+        }
+        changed = True
+    return changed
+
+
+def _record_batch_reach(run_dir: Path, overlay_dir: Path, item: dict, guard_report: dict) -> None:
+    """Add the module guardrail's limits to a batch prover's parent WP report (and its canonical copy)."""
+    if not item.get("function") or not item.get("c_file"):
+        return
+    wp_json = run_dir / _parent_wp_report_rel(item["agent_id"], item["function"])
+    try:
+        wp_report = json.loads(wp_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(wp_report, dict) or not _apply_guard_limits(wp_report, item["function"], guard_report):
+        return
+    wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
+    _publish_canonical_wp(run_dir, overlay_dir, wp_json, _normalize_work_relpath(item["c_file"]), item["function"])
 
 
 def merge_agent_overlay(
@@ -1142,6 +1208,53 @@ def _acsl_text_of_span(span) -> str:
     except AcslError:
         return ""
     return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
+
+
+TRUST_BOUNDARY_REASON = "trust-boundary check failed"
+
+
+def _untrusted_entry_meta(overlay: Path, module: str | None) -> dict | None:
+    """The harness sidecar of `module` when its entry function is an untrusted_surface entry, else None."""
+    if not module:
+        return None
+    hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
+    if not isinstance(hmeta, dict) or not hmeta.get("entry_fn"):
+        return None
+    # prepare_agent treats a sidecar without `reachability` as untrusted_surface; so does this check.
+    if (hmeta.get("reachability") or "untrusted_surface") != "untrusted_surface":
+        return None
+    return hmeta
+
+
+def entry_trust_boundary_errors(
+    hmeta: dict, rel: str, merged_text: str, agent_text: str, base_text: str, baseline_text: str
+) -> list[str]:
+    """
+    Trust-boundary violations an agent adds to the untrusted_surface entry function's contract in
+    `rel` (docs/v2-design.md §6). Only the entry function is checked, and only when the agent
+    changed its contract; violations already in the target's own baseline ACSL are not the agent's.
+    """
+    entry = str(hmeta.get("entry_fn") or "")
+    if not entry or Path(rel).suffix not in ACSL_CHECK_EXTS:
+        return []
+    is_hdr = rel.endswith(".h")
+    try:
+        if function_contract_text(agent_text, entry, is_hdr, rel) == function_contract_text(
+            base_text, entry, is_hdr, rel
+        ):
+            return []
+        contract = function_contract_text(merged_text, entry, is_hdr, rel)
+        params = set(function_param_names(merged_text, entry, is_hdr, rel))
+        baseline_contract = function_contract_text(baseline_text, entry, is_hdr, rel)
+    except AcslError:
+        return []  # the ACSL-only check reports unparsable files
+    params.update(str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k))
+    nul = bool(hmeta.get("null_terminate")) or hmeta.get("entry_style") in ("c_string", "argv")
+    found = entry_requires_violations(contract, params, nul_terminated=nul)
+    if not found:
+        return []
+    pre_existing = set(entry_requires_violations(baseline_contract, params, nul_terminated=nul))
+    return [f"{rel}: {entry}: {v}" for v in found if v not in pre_existing]
 
 
 def _merge_agent_overlay_locked(
@@ -1231,6 +1344,7 @@ def _merge_agent_overlay_locked(
     # Save backup of shared_work files for atomic rollback
     backups: dict[str, bytes] = {}
     new_contents: dict[str, str] = {}
+    texts_before: dict[str, tuple[str, str, str]] = {}  # rel -> (agent, agent's base, baseline)
     deduplicated_declarations: list[str] = []
 
     frame_skel = (
@@ -1315,6 +1429,7 @@ def _merge_agent_overlay_locked(
         if merged_errs:
             raise AcslError(f"Merged ACSL-only check failed on {rel_str}:\n  " + "\n  ".join(merged_errs))
         new_contents[rel_str] = spliced
+        texts_before[rel_str] = (agent_text, base_snap_text, baseline_text)
 
     if frame_skel is not None:
         # The projected frame skeleton is a required minimum: a prover candidate that deletes
@@ -1331,6 +1446,20 @@ def _merge_agent_overlay_locked(
         frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
+
+    entry_meta = _untrusted_entry_meta(overlay, module)
+    if entry_meta is not None:
+        # On an untrusted_surface entry, `requires` may state memory shape only: a value constraint on
+        # attacker-controlled bytes or lengths would define the bug away (docs/v2-design.md §6).
+        tb_errs: list[str] = []
+        for rel_str in changed_rels:
+            tb_errs.extend(
+                entry_trust_boundary_errors(entry_meta, rel_str, new_contents[rel_str], *texts_before[rel_str])
+            )
+        if tb_errs:
+            raise TrustBoundaryError(
+                f"{TRUST_BOUNDARY_REASON} (untrusted_surface entry requires):\n  " + "\n  ".join(tb_errs)
+            )
 
     patch_stem = function if role == "prover" and function else Path(norm_header_file or "header").stem
     patch_path = artifacts_dir / f"{patch_stem}.patch"
@@ -1684,24 +1813,29 @@ def _verify_batch_round(
         if item.get("module") and item.get("sources"):
             mod_key = (item["module"], tuple(item["sources"]), item["cppflags"], item["ldflags"])
             modules.setdefault(mod_key, []).append(i)
+    # The module guardrail measures the reach of the batch's prover functions, as the single
+    # merge-agent path does per function, so their proofs record `limits.dynamic_oracle`.
+    reach_by_check: dict[int, list[int]] = {}
     for (mod, srcs, cpp, ld), idxs in modules.items():
-        checks.append(
-            (
-                idxs,
-                {
-                    "agent_id": items[idxs[0]]["agent_id"],
-                    "role": "architect",
-                    "c_file": None,
-                    "function": None,
-                    "module": mod,
-                    "sources": list(srcs),
-                    "cppflags": cpp,
-                    "ldflags": ld,
-                },
-            )
-        )
+        provers = [i for i in idxs if _is_prover_check_item(items[i])]
+        mod_kwargs: dict[str, Any] = {
+            "agent_id": items[idxs[0]]["agent_id"],
+            "role": "architect",
+            "c_file": None,
+            "function": None,
+            "module": mod,
+            "sources": list(srcs),
+            "cppflags": cpp,
+            "ldflags": ld,
+        }
+        if provers:
+            mod_kwargs["reach_functions"] = sorted({items[i]["function"] for i in provers})
+            reach_by_check[len(checks)] = provers
+        checks.append((idxs, mod_kwargs))
+    prover_check: dict[int, int] = {}
     for i, item in enumerate(items):
-        if item["role"] == "prover" and item.get("c_file") and item.get("function"):
+        if _is_prover_check_item(item):
+            prover_check[i] = len(checks)
             chk_kwargs: dict[str, Any] = {
                 "agent_id": item["agent_id"],
                 "role": "prover",
@@ -1741,6 +1875,8 @@ def _verify_batch_round(
         call_kwargs = dict(kwargs)
         if call_kwargs.get("wp_extra_sources") is None or not _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
             call_kwargs.pop("wp_extra_sources", None)
+        if "reach_functions" in call_kwargs and not _supports_kwarg(_run_parent_reverify, "reach_functions"):
+            call_kwargs.pop("reach_functions", None)
         try:
             return _run_parent_reverify(run_dir=run_dir, overlay_dir=overlay, wp_par=wp_par, **call_kwargs)
         except TypeError as exc:
@@ -1757,7 +1893,22 @@ def _verify_batch_round(
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+    for ci, prover_idxs in reach_by_check.items():
+        if not outcomes[ci][0]:
+            continue
+        mod_kwargs = checks[ci][1]
+        guard_json = _parent_guard_json(run_dir, mod_kwargs["agent_id"], None, mod_kwargs["module"])
+        guard_report = load_json_optional(guard_json, {})
+        if not isinstance(guard_report, dict) or guard_report.get("status") != "passed_dynamic_oracle":
+            continue
+        for i in prover_idxs:
+            if outcomes[prover_check[i]][0]:
+                _record_batch_reach(run_dir, overlay, items[i], guard_report)
     return [(idxs, reason) for (idxs, _), (ok, reason) in zip(checks, outcomes, strict=True) if not ok]
+
+
+def _is_prover_check_item(item: dict) -> bool:
+    return item.get("role") == "prover" and bool(item.get("c_file")) and bool(item.get("function"))
 
 
 def _rejected_result(item: dict, splice_res: dict, reason: str) -> dict:

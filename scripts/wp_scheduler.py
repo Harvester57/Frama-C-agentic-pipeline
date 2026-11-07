@@ -236,6 +236,7 @@ class Deps:
         self.ingest_wp: Callable[..., dict] = ledger.cmd_ingest_wp
         self.audit_hypotheses: Callable[..., dict] = ledger.cmd_audit_hypotheses
         self.ingest_agent_hypothesis: Callable[..., dict] = ledger.cmd_ingest_agent_hypothesis
+        self.record_boundary_assumptions: Callable[..., dict] = ledger.cmd_record_boundary_assumptions
         self.ingest_verifier: Callable[..., dict] = ledger.cmd_ingest_verifier
         self.resolve_request: Callable[..., dict] = contract_negotiator.cmd_resolve
         self.save_shard: Callable[[str, Path], dict] = _save_shard
@@ -831,6 +832,40 @@ def _park_shell_unverifiable_units(task: dict, fn_units: list[dict], wp_blockers
         _batch_or_individual_transitions(specs, errors=errors, tag="shell_unverifiable_wp")
 
 
+QUICK_OFF_CHAIN_REASON = "quick_profile_wp_not_scheduled: outside the Tier 1A entry chain WP covers in quick"
+
+
+def _park_quick_off_chain(ctx: Ctx, off_chain: list[tuple[str, str]], changes: dict) -> None:
+    """
+    Close the planned units of functions `quick` never gives a prover (docs/v2-design.md Section 9),
+    so the run can reach `done` instead of `stuck`: units with earlier evidence become `blocked`,
+    the others `deferred`, both with the reason, as `ledger.py close-remaining` does.
+    """
+    specs: list[dict] = []
+    for file, fn in off_chain:
+        for u in ctx.fn_units(file, fn):
+            if u["status"] != "planned":
+                continue
+            specs.append(
+                {
+                    "id": u["coverage_id"],
+                    "status": "blocked" if u.get("evidence") else "deferred",
+                    "agent_id": None,
+                    "reason": QUICK_OFF_CHAIN_REASON,
+                    "expected": ["planned"],
+                }
+            )
+    errors: list[str] = []
+    done = set(_batch_or_individual_transitions(specs, errors=errors, tag="quick_off_chain"))
+    for spec in specs:
+        if spec["id"] in done and spec["id"] in ctx.units:
+            ctx.units[spec["id"]]["status"] = spec["status"]
+    if done:
+        changes.setdefault("parked", []).extend(sorted(done))
+    if errors:
+        changes.setdefault("errors", []).extend(errors)
+
+
 def _sync(state: dict, ctx: Ctx) -> dict:
     """
     Bring the task set in line with the ledger and candidates (idempotent): a verify task per
@@ -870,6 +905,7 @@ def _sync(state: dict, ctx: Ctx) -> dict:
     planned = sorted({(norm_path(u["file"]), u["function"]) for u in ctx.units.values() if u["status"] == "planned"})
     if ctx.profile == "quick":
         allowed_quick = ctx.quick_entry_chain(planned)
+        _park_quick_off_chain(ctx, [pair for pair in planned if pair not in allowed_quick], changes)
         planned = [pair for pair in planned if pair in allowed_quick]
     for file, fn in planned:
         tid = f"prove:{file}#{fn}"
@@ -1756,6 +1792,9 @@ def _replay_reports(fingerprint: str, cand: dict) -> list[str]:
         arts: list[Any] = raw_arts if isinstance(raw_arts, list) else []
         if (
             data.get("fingerprint") == fingerprint
+            # run_eacsl_fuzz.py replay-candidates names its reports <slug>-<hash>.json and records
+            # the candidate here, whatever fingerprint the replay itself produced.
+            or data.get("candidate_fingerprint") == fingerprint
             or fingerprint in (data.get("fingerprints") or [])
             or fingerprint in (data.get("candidates") or [])
             or any(isinstance(a, dict) and a.get("fingerprint") == fingerprint for a in arts)
@@ -2818,9 +2857,37 @@ def _merge_architect(job: dict) -> dict:
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def _parent_replay(fp: str, cand: dict, out: dict) -> list[str]:
+    """
+    The parent's own replay reports for a candidate. Phase 2 replays only the candidates known then,
+    so a Phase 3 candidate (breaker crash, reproduced hypothesis) gets its replay here, before its
+    verdict is ingested: `ingest-verifier` confirms only reproducers the parent itself replayed.
+    """
+    replays = _replay_reports(fp, cand)
+    if replays or not cand.get("reproducers"):
+        return replays
+    cmd = [
+        sys.executable or "python3",
+        str(Path(__file__).resolve().parent / "run_eacsl_fuzz.py"),
+        "replay-candidates",
+        "--candidates",
+        "candidates.json",
+        "--harness-dir",
+        HARNESS_DIR.as_posix(),
+        "--out-dir",
+        REPLAY_DIR.as_posix(),
+    ]
+    try:
+        proc = DEPS.run_cmd(cmd, capture_output=True, text=True, check=False, timeout=3600)
+        out["parent_replay"] = {"returncode": getattr(proc, "returncode", None)}
+    except (OSError, subprocess.SubprocessError) as exc:
+        out["parent_replay"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return _replay_reports(fp, cand)
+
+
 def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path: Path, out: dict) -> None:
     fp = task["fingerprint"]
-    replays = _replay_reports(fp, ctx.candidates.get(fp) or {})
+    replays = _parent_replay(fp, ctx.candidates.get(fp) or {}, out)
     meta = HARNESS_DIR / f"harness_{task['module']}.json"
     out["replay_reports"] = replays
     try:
@@ -3071,6 +3138,15 @@ def _on_merged(state: dict, task: dict, aid: str, merged: dict, out: dict) -> No
     entry: dict[str, Any] = {"task": task["id"], "agent_id": aid}
     if rep_path.is_file():
         _try(out["errors"], f"ingest-wp {rep}", DEPS.ingest_wp, [rep_path])
+        # The environment facts the merged proof relies on become assumptions of its units.
+        result_path = Path("agents") / aid / "scratch" / "result.json"
+        if result_path.is_file():
+            _try(
+                out["errors"],
+                f"record-boundary-assumptions {task['id']}",
+                DEPS.record_boundary_assumptions,
+                result_path,
+            )
         if any(state["tasks"].get(f"prove:{c}", {}).get("state") == "blocked" for c in (task.get("callees") or [])):
             _try(out["errors"], f"audit-hypotheses {task['id']}", DEPS.audit_hypotheses)
         entry["checkpoint"] = _try(out["errors"], f"checkpoint {task['id']}", DEPS.save_shard, task["slug"], rep_path)
@@ -3580,7 +3656,7 @@ def cmd_baseline(
                         is_proven = True
                 except Exception:
                     pass
-            if not is_proven and t.get("state") == "done" and t.get("outcome") == "all_proven":
+            if not is_proven and t.get("state") == "done" and t.get("outcome") in ("all_proven", "merged"):
                 is_proven = True
             if is_proven:
                 skipped_proven.append(
@@ -3715,7 +3791,9 @@ def cmd_baseline(
                 out_json_path = res["out_json"]
 
                 with run_lock("ledger", run_dir):
-                    if out_json_path.is_file():
+                    # Only a full proof reaches the ledger: a baseline that fails on code without
+                    # contracts is the prover's starting point, not a verdict that blocks its units.
+                    if out_json_path.is_file() and res["status"] == "all_proven":
                         try:
                             DEPS.ingest_wp([out_json_path])
                         except Exception as exc:
@@ -3736,16 +3814,14 @@ def cmd_baseline(
                                 )
                             else:
                                 task_obj["state"] = "pending"
-                        elif status_str in (
-                            "all_proven",
-                            "unproven",
-                            "wp_aborted",
-                            "unsound_proof",
-                            "acsl_syntax_error",
-                        ):
-                            _finish(state, task_obj, "done", status_str, reason=rep_reason)
+                        elif status_str == "all_proven" and not res.get("ingest_error"):
+                            # The work tree itself is proven, as after a merge: the outcome keeps the
+                            # function in the re-check set when a callee contract changes later.
+                            _finish(state, task_obj, "done", "merged", reason="baseline: all_proven")
                         else:
-                            _finish(state, task_obj, "done", status_str, reason=rep_reason)
+                            # Not proven by the baseline: the task stays open for a prover.
+                            task_obj["state"] = "pending"
+                            task_obj["baseline"] = {"status": status_str, "report": out_json_path.as_posix()}
                         save_schedule(state)
                         _write_wp_queue(state)
 

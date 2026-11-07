@@ -1957,3 +1957,294 @@ def check_conflicting_acsl_profiles(
                     )
 
     return conflicts
+
+
+# ---------------------------------------------------------------------------
+# Trust boundary: preconditions of an untrusted_surface entry function
+# ---------------------------------------------------------------------------
+
+
+class TrustBoundaryError(AcslError):
+    """Raised when an untrusted_surface entry contract constrains attacker-controlled values."""
+
+
+# Built-ins that state memory shape only. Anything inside their argument list is a location, not a value.
+_SHAPE_BUILTINS = (
+    "valid",
+    "valid_read",
+    "separated",
+    "initialized",
+    "freeable",
+    "allocable",
+    "block_length",
+    "offset",
+    "base_addr",
+    "valid_function",
+)
+# Predicates of templates/acsl/acsl_vocabulary.h that state shape only (validity of a range, with
+# the `len >= 0` / `len == 0` guards that come with it). The others (is_printable_ascii,
+# no_crlf_or_nul, buffer_is_zeroed, c_strlen) constrain byte values.
+SHAPE_VOCABULARY_PREDICATES = frozenset({"valid_read_buffer", "valid_write_buffer"})
+# valid_c_string(s) also says that s holds a NUL: a recorded environment fact only when the harness
+# NUL-terminates the input (entry_style c_string / argv, or null_terminate).
+_NUL_TERMINATION_PREDICATES = frozenset({"valid_c_string"})
+_SHAPE_CALL_RE = re.compile(
+    r"\\(?:" + "|".join(_SHAPE_BUILTINS) + r")\b(?:\{[^}]*\})?\s*\(|\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{[^}]*\})?\s*\("
+)
+_BINDER_RE = re.compile(r"\\(?:forall|exists|let)\b")
+_REQUIRES_RE = re.compile(r"(?<![\\\w])requires\b")
+_CLAUSE_LABEL_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)")
+_NULL_CMP_RE = re.compile(r"^(?:([A-Za-z_][A-Za-z0-9_]*)\s*!=\s*\\null|\\null\s*!=\s*([A-Za-z_][A-Za-z0-9_]*))$")
+_NONNEG_RE = re.compile(r"^(?:([A-Za-z_][A-Za-z0-9_]*)\s*>=\s*0|0\s*<=\s*([A-Za-z_][A-Za-z0-9_]*))$")
+_CAPACITY_RE = re.compile(r"\\(?:block_length|offset)\b")
+_C_PARAM_KEYWORDS = frozenset(
+    {
+        "const",
+        "volatile",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "unsigned",
+        "signed",
+        "int",
+        "long",
+        "short",
+        "char",
+        "void",
+        "float",
+        "double",
+        "struct",
+        "union",
+        "enum",
+        "register",
+        "_Bool",
+        "bool",
+    }
+)
+
+
+def _acsl_comment_body(text: str) -> str:
+    """The inside of an ACSL comment: no `/*@`, `*/`, `//@`, leading `@` margins or `//` comments."""
+    if text.startswith("/*@"):
+        text = text[3:]
+        if text.endswith("*/"):
+            text = text[:-2]
+    elif text.startswith("//@"):
+        text = text[3:]
+    text = _COMMENT_IN_ACSL_RE.sub(" ", text)
+    return re.sub(r"(^|\n)\s*@", r"\1 ", text)
+
+
+def _first_top_level_binder(text: str) -> int:
+    top = _top_level_positions(text)
+    for m in _BINDER_RE.finditer(text):
+        if top[m.start()]:
+            return m.start()
+    return len(text)
+
+
+def _scan_clause_end(text: str, start: int) -> int:
+    """End of the ACSL clause starting at `start`: the first top-level `;` not closing a binder."""
+    top = _top_level_positions(text)
+    binders = {m.start() for m in _BINDER_RE.finditer(text, start) if top[m.start()]}
+    pending = 0
+    for i in range(start, len(text)):
+        if i in binders:
+            pending += 1
+        elif top[i] and text[i] == ";":
+            if pending:
+                pending -= 1
+            else:
+                return i
+    return len(text)
+
+
+def extract_requires_clauses(contract_text: str) -> list[str]:
+    """The predicates of every `requires` clause (function and behavior level) in ACSL contract text."""
+    body = " ".join(_acsl_comment_body(contract_text).split())
+    out: list[str] = []
+    top = _top_level_positions(body)
+    for m in _REQUIRES_RE.finditer(body):
+        if not top[m.start()]:
+            continue
+        end = _scan_clause_end(body, m.end())
+        pred = body[m.end() : end]
+        while (lab := _CLAUSE_LABEL_RE.match(pred)) is not None:
+            pred = pred[lab.end() :]
+        pred = pred.strip()
+        if pred:
+            out.append(pred)
+    return out
+
+
+def _split_unbound(text: str, op: str) -> list[str]:
+    """`_split_top_level`, but a top-level binder (`\\forall`, `\\exists`, `\\let`) extends to the end."""
+    limit = _first_top_level_binder(text)
+    parts = _split_top_level(text[:limit], op)
+    if limit < len(text):
+        parts[-1] = (parts[-1] + " " + text[limit:]).strip()
+    return parts
+
+
+def _strip_shape_calls(text: str, shape_names: frozenset[str]) -> str:
+    """`text` with every shape built-in / shape predicate call (name and arguments) removed."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        m = _SHAPE_CALL_RE.search(text, i)
+        if m is None:
+            out.append(text[i:])
+            break
+        name = m.group(1)
+        if name is not None and name not in shape_names:
+            out.append(text[i : m.end()])
+            i = m.end()
+            continue
+        out.append(text[i : m.start()])
+        _, i = _paren_group_at(text, m.end() - 1)
+        out.append(" ")
+    return "".join(out).replace("\\null", " ")
+
+
+def _value_refs(text: str, attackers: frozenset[str], shape_names: frozenset[str]) -> set[str]:
+    """Attacker parameters `text` reads as values (outside shape calls, not as `s.field` / `p->field`)."""
+    rest = _strip_shape_calls(text, shape_names)
+    refs: set[str] = set()
+    for m in _IDENT_RE.finditer(rest):
+        before = rest[: m.start()].rstrip()
+        member = before.endswith(("->", "\\")) or (before.endswith(".") and not before.endswith(".."))
+        if m.group(0) in attackers and not member:
+            refs.add(m.group(0))
+    return refs
+
+
+def _is_single_shape_call(text: str, shape_names: frozenset[str]) -> bool:
+    m = _SHAPE_CALL_RE.match(text)
+    if m is None or (m.group(1) is not None and m.group(1) not in shape_names):
+        return False
+    _, end = _paren_group_at(text, m.end() - 1)
+    return end == len(text)
+
+
+def _constrained_params(pred: str, attackers: frozenset[str], shape_names: frozenset[str]) -> set[str]:
+    """Attacker parameters whose value `pred` constrains (empty when it states memory shape only)."""
+    text = _strip_outer_parens(" ".join(pred.split()))
+    if not text:
+        return set()
+    binder = _BINDER_RE.match(text)
+    if binder is not None:
+        if text.startswith("\\let"):
+            return _value_refs(text, attackers, shape_names)  # a bound name can carry an attacker value
+        end = _scan_clause_end(text, binder.end())
+        return _constrained_params(text[end + 1 :], attackers, shape_names)
+    for op in ("<==>", "^^"):
+        if len(_split_unbound(text, op)) > 1:
+            return _value_refs(text, attackers, shape_names)
+    parts = _split_unbound(text, "==>")
+    if len(parts) > 1:
+        # The antecedents only guard: `len > 0 ==> \valid_read(buf + (0 .. len - 1))` states shape.
+        return _constrained_params(parts[-1], attackers, shape_names)
+    parts = _split_unbound(text, "||")
+    if len(parts) > 1:
+        per_part = [_constrained_params(p, attackers, shape_names) for p in parts]
+        # `len == 0 || \valid_read(...)` states shape: a disjunction constrains only if every disjunct does.
+        return set().union(*per_part) if all(per_part) else set()
+    parts = _split_unbound(text, "&&")
+    if len(parts) > 1:
+        return set().union(*(_constrained_params(p, attackers, shape_names) for p in parts))
+    if _is_single_shape_call(text, shape_names) or text == "\\true":
+        return set()
+    m = _NULL_CMP_RE.match(text) or _NONNEG_RE.match(text)
+    if m is not None:
+        return set()
+    if _CAPACITY_RE.search(text) and _RELATION_RE.search(text):
+        # `\block_length(buf) >= len`: the capacity of a block, a shape fact.
+        return set()
+    return _value_refs(text, attackers, shape_names)
+
+
+def entry_requires_violations(
+    contract_text: str,
+    attacker_params: list[str] | set[str] | frozenset[str],
+    *,
+    nul_terminated: bool = False,
+) -> list[str]:
+    """
+    Trust-boundary check of an untrusted_surface entry function's contract (docs/v2-design.md §6):
+    its `requires` may state memory shape only (`\\valid`, `\\valid_read`, `\\separated`,
+    `\\initialized`, `p != \\null`, `\\block_length`, shape-only vocabulary predicates) and facts
+    that do not involve attacker-controlled parameters. A clause that constrains the value of an
+    attacker parameter or of the bytes it points to (`len <= 64`, `buf[0] == 0x30`,
+    `\\forall integer i; ... ==> buf[i] != 0`, an unknown predicate over `buf`) is a violation.
+
+    Lexical and conservative: what it cannot classify as shape is flagged. Implication antecedents
+    only guard and are not checked; a disjunction violates only if each disjunct does.
+    `nul_terminated`: the harness NUL-terminates the input, so `valid_c_string` is shape here.
+    """
+    attackers = frozenset(p for p in attacker_params if p)
+    if not attackers:
+        return []
+    shape_names = SHAPE_VOCABULARY_PREDICATES | (_NUL_TERMINATION_PREDICATES if nul_terminated else frozenset())
+    out: list[str] = []
+    for pred in extract_requires_clauses(contract_text):
+        params = _constrained_params(pred, attackers, shape_names)
+        if params:
+            out.append(
+                f"requires {pred}; constrains attacker-controlled {', '.join(sorted(params))} "
+                "(an untrusted_surface entry may only state memory shape)"
+            )
+    return out
+
+
+def function_param_names(source: str, function: str, is_header: bool = False, path: str = "<input>") -> list[str]:
+    """Parameter names of `function`'s definition (or prototype, `is_header`); unnamed parameters are skipped."""
+    span = locate_function_span(source, function, is_header=is_header, path=path)
+    if span is None:
+        return []
+    toks = [t for t in tokenize_c_acsl(span.text, path=path) if t.kind == "c_token"]
+    for k, tok in enumerate(toks):
+        if tok.text != function or k + 1 >= len(toks) or toks[k + 1].text != "(":
+            continue
+        depth = 0
+        params: list[list[str]] = [[]]
+        for t in toks[k + 1 :]:
+            if t.text in "([":
+                depth += 1
+                if depth == 1 and t.text == "(":
+                    continue
+            elif t.text in ")]":
+                depth -= 1
+                if depth == 0:
+                    break
+            if depth == 1 and t.text == ",":
+                params.append([])
+                continue
+            params[-1].append(t.text)
+        names: list[str] = []
+        for p in params:
+            if not p or p in (["void"], ["..."]):
+                continue
+            ptr = [i for i in range(len(p) - 2) if p[i] == "(" and p[i + 1] == "*" and _IDENT_RE.fullmatch(p[i + 2])]
+            if ptr:
+                names.append(p[ptr[0] + 2])
+                continue
+            while p and p[-1] == "]" and "[" in p:
+                p = p[: len(p) - 1 - p[::-1].index("[")]
+            if len(p) >= 2 and _IDENT_RE.fullmatch(p[-1]) and p[-1] not in _C_PARAM_KEYWORDS:
+                names.append(p[-1])
+        return names
+    return []
+
+
+def function_contract_text(source: str, function: str, is_header: bool = False, path: str = "<input>") -> str:
+    """The ACSL contract in front of `function`'s definition (or prototype), without body annotations."""
+    span = locate_function_span(source, function, is_header=is_header, path=path)
+    if span is None:
+        return ""
+    parts: list[str] = []
+    for t in tokenize_c_acsl(span.text, path=path):
+        if t.kind == "c_token" and t.text == "{":
+            break
+        if t.kind in ("acsl_block", "acsl_line"):
+            parts.append(t.text)
+    return "\n".join(parts)

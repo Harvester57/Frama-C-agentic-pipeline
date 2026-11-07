@@ -577,8 +577,10 @@ def test_guardrail_caps_corpus_replay_to_max_inputs(tmp_path, monkeypatch):
     assert replay_dir_arg == scratch / "replay_corpus"
     staged_files = sorted(f.name for f in replay_dir_arg.iterdir())
     assert len(staged_files) == 64
-    expected_first_64 = sorted(f"seed_{i:03d}" for i in range(100))[:64]
-    assert staged_files == expected_first_64
+    # A deterministic sample (select_replay_inputs), not the first 64 names in sort order.
+    all_names = [f"seed_{i:03d}" for i in range(100)]
+    assert staged_files == R.select_replay_inputs(all_names, 64)[0]
+    assert verdict["corpus_total"] == 100 and verdict["corpus_replayed"] == 64 and verdict["corpus_sampled"]
 
     # 2. Custom max_corpus_inputs=10
     scratch2 = tmp_path / "scratch2"
@@ -590,7 +592,7 @@ def test_guardrail_caps_corpus_replay_to_max_inputs(tmp_path, monkeypatch):
     assert replay_dir_arg2 == scratch2 / "replay_corpus"
     staged_files2 = sorted(f.name for f in replay_dir_arg2.iterdir())
     assert len(staged_files2) == 10
-    assert staged_files2 == sorted(f"seed_{i:03d}" for i in range(100))[:10]
+    assert staged_files2 == R.select_replay_inputs(all_names, 10)[0]
 
     # 3. Small corpus with 5 files (less than cap) is NOT staged into replay_corpus
     small_corpus = tmp_path / "small_corpus"

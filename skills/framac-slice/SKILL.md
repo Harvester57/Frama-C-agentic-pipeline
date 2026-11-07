@@ -133,7 +133,7 @@ The harness must respect the entry function's declared or documented contract (b
 ```text
 python3 /opt/framac-pipeline/scripts/ledger.py seed --dag workspace/reports/callgraph_dag.json [--profile <quick|standard|deep>] [--scope <repo-relative path>]...
 python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
-python3 /opt/framac-pipeline/scripts/checkpoint.py init state --target /target
+python3 /opt/framac-pipeline/scripts/checkpoint.py init state --target /target   # keeps an existing progress file
 python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json
 python3 /opt/framac-pipeline/scripts/pipeline_make.py gen
 ```

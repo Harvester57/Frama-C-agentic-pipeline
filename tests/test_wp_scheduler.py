@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 from pathlib import Path
@@ -1480,15 +1481,12 @@ def test_deep_and_quick_profile_scheduling(sim):
         unit("src/g/glue.c", "glue_helper", "rte", module="glue", tier=tier3, status="planned"),
         unit("src/e/emit.c", "emit_pkt", "rte", module="emitter", tier=tier1b, status="planned"),
     ]
-    sim.build(
-        functions,
-        units=custom_units,
-        modules={
-            "parser": {"tier": TIER1},
-            "glue": {"tier": tier3, "run_eva": False, "run_eacsl_fuzz": False},
-            "emitter": {"tier": tier1b},
-        },
-    )
+    modules = {
+        "parser": {"tier": TIER1},
+        "glue": {"tier": tier3, "run_eva": False, "run_eacsl_fuzz": False},
+        "emitter": {"tier": tier1b},
+    }
+    sim.build(functions, units=copy.deepcopy(custom_units), modules=modules)
 
     # 1. Quick profile: schedules entry_parse (Tier 1A) and its callee glue_helper, skips unrelated Tier 1B emit_pkt.
     write_json(sim.run_dir / "run-metadata.json", {"profile": "quick"})
@@ -1498,8 +1496,12 @@ def test_deep_and_quick_profile_scheduling(sim):
     assert "prove:src/g/glue.c#glue_helper" in quick_tasks
     assert "prove:src/e/emit.c#emit_pkt" not in quick_tasks
     assert "prove:src/g/glue.c#glue_helper" in ready()
+    # The unit quick never gives a prover is closed with its reason, so the run can reach `done`.
+    emit = next(u for u in load(sim.run_dir / "coverage-ledger.json") if u["function"] == "emit_pkt")
+    assert emit["status"] == "deferred" and emit["unresolved"] == [S.QUICK_OFF_CHAIN_REASON]
 
-    # 2. Deep profile: schedules all planned units including emit_pkt and Tier 3 glue_helper.
+    # 2. Deep profile (a fresh run): schedules all planned units including emit_pkt and Tier 3 glue_helper.
+    sim.build(functions, units=copy.deepcopy(custom_units), modules=modules)
     write_json(sim.run_dir / "run-metadata.json", {"profile": "deep"})
     S.cmd_init()
     deep_tasks = tasks()
@@ -1579,7 +1581,8 @@ def test_cmd_baseline_rolling_pool_and_extra_sources(sim, monkeypatch):
     sched = load(sim.run_dir / "state" / "wp_schedule.json")
     for t_obj in sched["tasks"].values():
         assert t_obj["state"] == "done"
-        assert t_obj["outcome"] == "all_proven"
+        # Proven on the work tree itself, like a merge: kept in the re-check set.
+        assert t_obj["outcome"] == "merged"
 
     # Verify incremental ingestion was invoked
     assert len(ingest_calls) == 2
@@ -1715,3 +1718,63 @@ def test_baseline_cli_subcommand(sim, monkeypatch, capsys):
     assert out["ok"] is True
     assert out["executed"] == 1
     assert (sim.run_dir / "workspace" / "reports" / "wp_baseline.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Remediation plan P1 (docs/remediation-plan.md)
+# ---------------------------------------------------------------------------
+
+
+def test_h6_baseline_leaves_unproven_functions_to_a_prover(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", []), "b": ("src/m/b.c", "m", [])})
+
+    def fake_run(cmd, cwd, **kwargs):
+        fn = cmd[cmd.index("--function") + 1]
+        out_json = Path(cmd[cmd.index("--out-json") + 1])
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        proven = fn == "a"
+        write_json(
+            out_json,
+            {
+                "function": fn,
+                "file": cmd[cmd.index("--file") + 1],
+                "status": "all_proven" if proven else "unproven_goals_remain",
+                "by_obligation_class": {"rte": {"proven": 2, "unproven": 0 if proven else 1}},
+                "unproven_goals": [] if proven else [{"kind": "mem_access", "line": 3, "obligation_class": "rte"}],
+            },
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+    S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+    sched = load(sim.run_dir / "state" / "wp_schedule.json")["tasks"]
+    task_b = sched["prove:src/m/b.c#b"]
+    assert task_b["state"] == "pending" and task_b["baseline"]["status"] == "unproven_goals_remain"
+    # Its units stay planned, so a prover can still claim them.
+    b_units = [u for u in load(sim.run_dir / "coverage-ledger.json") if u["function"] == "b"]
+    assert b_units and all(u["status"] == "planned" for u in b_units)
+    assert sched["prove:src/m/a.c#a"]["outcome"] == "merged"
+
+
+def test_h2_parent_replays_a_phase3_candidate_before_ingesting_its_verdict(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {}})
+    fp = "src/m/f.c#f::mem_access::0123456789"
+    cand = {"fingerprint": fp, "module": "m", "reproducers": ["workspace/crashes/m/crash-1"]}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        out_dir = Path(cmd[cmd.index("--out-dir") + 1])
+        write_json(
+            out_dir / "src_m_f.c_f_mem_access_0123456789-abcdef0123.json",
+            {"candidate_fingerprint": fp, "artifacts": [{"sha256": "x", "reproducible": True, "fingerprint": "other"}]},
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+    out: dict = {}
+    found = S._parent_replay(fp, cand, out)
+    assert len(calls) == 1 and "replay-candidates" in calls[0]
+    assert found == ["workspace/reports/replay/src_m_f.c_f_mem_access_0123456789-abcdef0123.json"]
+    # An existing replay is reused, never run again.
+    assert S._parent_replay(fp, cand, out) == found and len(calls) == 1

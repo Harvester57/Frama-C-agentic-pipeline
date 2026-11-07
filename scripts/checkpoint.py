@@ -20,9 +20,14 @@ def load_json(path: Path) -> dict:
     return load_json_optional(path, {})
 
 
-def cmd_init(state_dir: Path, target_dir: str, mode: str) -> None:
+def cmd_init(state_dir: Path, target_dir: str, mode: str, force: bool = False) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     progress_path = state_dir / "progress.json"
+    existing = load_json(progress_path) if progress_path.exists() else {}
+    if existing and not force:
+        # Re-running Phase 0 on a resumed run must never rewind the recorded progress.
+        print(json.dumps({**existing, "init": "kept_existing"}))
+        return
     progress = {
         "status": "running",
         "mode": mode,
@@ -108,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("state_dir", type=Path)
     p_init.add_argument("--target", default=".")
     p_init.add_argument("--mode", default="verify")
+    p_init.add_argument("--force", action="store_true", help="Reset an existing progress file")
 
     p_load = sub.add_parser("load")
     p_load.add_argument("state_dir", type=Path)
@@ -129,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.action == "init":
-        cmd_init(args.state_dir, args.target, args.mode)
+        cmd_init(args.state_dir, args.target, args.mode, force=args.force)
     elif args.action == "load":
         cmd_load(args.state_dir)
     elif args.action in ("save-phase", "save"):
