@@ -679,6 +679,24 @@ def _wp_discharged(unit: dict) -> bool:
     )
 
 
+_KERNEL_RENAME_RE = re.compile(r"(.+)_\d+")
+
+
+def _kernel_renames(reported: set[str], unit_names: set[str]) -> dict[str, str]:
+    """
+    Eva names -> ledger function names for the copies the Frama-C kernel renamed: a static (often a
+    header `static inline`) defined in several translation units of one analysis keeps its name once
+    and becomes `f_0`, `f_1`... elsewhere. Only a name no unit has, whose stem one does, is mapped; the
+    alarms keep their file, which still has to match the unit's.
+    """
+    out: dict[str, str] = {}
+    for name in reported:
+        m = _KERNEL_RENAME_RE.fullmatch(name)
+        if m and name not in unit_names and m.group(1) in unit_names:
+            out[name] = m.group(1)
+    return out
+
+
 @ledger_locked
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -691,7 +709,13 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         rte_units = [u for u in _module_units(units, module) if u["obligation_class"] == "rte"]
         report_sources = _extract_eva_report_sources(report)
         if report_sources:
-            rte_units = [u for u in rte_units if normalize_file(u["file"]) in report_sources]
+            # A report lists the .c files it analysed; header functions (seeded from the Phase 0 model)
+            # are compiled into them, so they stay, and get evidence only where the report names them.
+            rte_units = [
+                u
+                for u in rte_units
+                if normalize_file(u["file"]) in report_sources or not normalize_file(u["file"]).endswith(".c")
+            ]
 
         if report.get("status") != "ok":
             for u in rte_units:
@@ -730,6 +754,16 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 if isinstance(item, dict) and item.get("function"):
                     props_by_fn.setdefault(str(item["function"]), []).append(item)
         with_props = set(report.get("functions_with_properties", []))
+        unknown_by_fn = dict(unknown_by_fn) if isinstance(unknown_by_fn, dict) else {}
+        for renamed, original in _kernel_renames(
+            {*unknown_by_fn, *invalid_by_fn, *dead_by_fn, *assumed_by_fn, *other_by_fn, *props_by_fn, *with_props},
+            {u["function"] for u in units.values()},
+        ).items():
+            for by_fn in (unknown_by_fn, invalid_by_fn, dead_by_fn, assumed_by_fn, other_by_fn, props_by_fn):
+                if renamed in by_fn:
+                    by_fn[original] = [*(by_fn.get(original) or []), *by_fn.pop(renamed)]
+            if renamed in with_props:
+                with_props.add(original)
         reduced_checks = [str(x) for x in (report.get("reduced_checks") or []) if str(x).strip()]
         tuning = report.get("tuning")
         combination = tuning.get("combination") if isinstance(tuning, dict) else None

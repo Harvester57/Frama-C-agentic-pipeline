@@ -507,6 +507,11 @@ def summarize_eva(report: dict, ledger_rte: set[str], scope: Iterable[str] = (),
             row = row if isinstance(row, dict) else {}
             kinds[row.get("kind") or "unknown"] += 1
             key = _target_function_key(row, _original_function_name(function, analyzed), scope)
+            renamed = _RENAMED_STATIC_RE.fullmatch(function)
+            if key is not None and key not in ledger_rte and renamed:
+                # A renamed copy (`f_0`) of a function whose only analysed copies were renamed.
+                stem = _target_function_key(row, renamed.group(1), scope)
+                key = stem if stem in ledger_rte else key
             if key is None:
                 other.add(function)
             else:

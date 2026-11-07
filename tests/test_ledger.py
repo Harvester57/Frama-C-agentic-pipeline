@@ -526,6 +526,45 @@ def test_ingest_eva_disambiguates_same_named_statics_across_files(run_dir):
     assert by_id["src/b.c#helper::rte"]["evidence"][-1]["result"] == "eva_all_valid"
 
 
+def test_ingest_eva_maps_kernel_renamed_copies_to_their_unit(run_dir):
+    # A header static inline compiled into two files of one analysis: the kernel keeps one copy as
+    # `get` and renames the other `get_0`; here only the renamed copy had properties.
+    dag = {
+        "modules": {"m": {"tier": "Tier 1", "files": ["src/a.c"]}},
+        "functions": {
+            "get": {"name": "get", "file": "inc/u.h", "module": "m", "tier": "Tier 1", "header": True, "reached": True},
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
+    row = {
+        "file": "workspace/work/inc/u.h",
+        "function": "get_0",
+        "line": 3,
+        "kind": "mem_access",
+        "property": "\valid(p)",
+    }
+    rep = eva_report(
+        module="m",
+        sources=["workspace/work/src/a.c"],
+        functions_with_properties=["get_0"],
+        functions_with_properties_by_file={"inc/u.h": ["get_0"]},
+        unknown_obligations=[row],
+        unknown_obligations_by_function={"get_0": [row]},
+        invalid_alarms=[],
+        dead_alarms=[],
+    )
+    write_json(run_dir / "workspace/reports/eva/m.json", rep)
+    L.cmd_ingest_eva([run_dir / "workspace/reports/eva/m.json"])
+    unit = units_by_id(run_dir)["inc/u.h#get::rte"]
+    assert unit["status"] == "planned"
+    assert unit["evidence"][-1]["result"] == "eva_unknown"
+
+
+def test_kernel_renames_only_map_names_without_a_unit():
+    assert L._kernel_renames({"get_0", "get", "rx_1", "x_2"}, {"get", "rx_1", "x"}) == {"get_0": "get", "x_2": "x"}
+
+
 def test_transition_many_commits_atomically_or_rolls_back_all(run_dir):
     seed(run_dir)
     c1 = "src/snmp/pdu.c#snmp_parse_pdu::rte"

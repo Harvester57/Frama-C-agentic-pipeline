@@ -297,6 +297,14 @@ class TestSummarizeEva:
         block = summarize_eva(report, set(), ["src"])
         assert block["functions_with_unknown"] == ["src/a.h#inl", "src/a.h#real_2"]
 
+    def test_only_renamed_copies_analysed_map_to_the_ledger_unit(self):
+        # A header static inline whose analysed copies were all renamed (`inl_0`): the ledger has `inl`.
+        row = {"directory": "workspace/work", "file": "src/a.h", "kind": "mem_access"}
+        report = eva_report(unknown_obligations_by_function={"inl_0": [row], "real_2": [row]})
+        block = summarize_eva(report, {"src/a.h#inl", "src/a.h#real_2"}, ["src"])
+        assert block["functions_with_unknown"] == ["src/a.h#inl", "src/a.h#real_2"]
+        assert block["functions_with_unknown_no_unit"] == []
+
     def test_function_without_a_ledger_unit_is_reported_apart(self):
         # The x509-parser case: Eva reaches code whose functions the DAG never listed.
         block = summarize_eva(eva_report(), {"src/a.c#parse"}, ["src"])
