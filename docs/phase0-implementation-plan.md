@@ -369,7 +369,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I1 | S | done |
 | I2 | L | done |
 | I3 | L | done |
-| I3b | L | not started |
+| I3b | L | done |
 | I4 | S | not started |
 | I5a | M | not started |
 | I5b | L | not started |
@@ -469,6 +469,42 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I3b (2026-11-07)
+
+- **Where the snapshot lives:** the build capture now writes it to the run directory, `workspace/snapshot/` (`root/<absolute path>`, `manifest.json` with the digest), not to the scratch volume. Every container of the run mounts the run directory, so no later step needs `-Scratch`, and the snapshot outlives the volume. `build_capture.json`'s `scratch` block lost its `snapshot` key.
+- **`scripts/target_env.py`** turns the snapshot into flags; without one, every helper returns its input unchanged:
+  - **headers:** `-idirafter <root>/<dir>` for the include directories the flags name outside the project, then gcc's default system directories, each only when the snapshot has it. They are searched last, so Frama-C's libc, the pipeline's stubs (`workspace/stubs/gcrypt.h`) and the image's own headers win.
+  - **libraries:** `-L <dir>`, `-Wl,-rpath,<dir>` and `-Wl,-rpath-link,<dir>` for each directory holding a library, plus `-Wl,--disable-new-dtags`. That gives a DT_RPATH, which also serves the libraries' own dependencies (libgcrypt needs libgpg-error); a DT_RUNPATH would not. The fuzz, replay and guardrail binaries therefore run without the packages installed and without `LD_LIBRARY_PATH`, which `sandbox_exec.py` would drop.
+  - The plan's `<snapshot>/include` and `<snapshot>/lib` became the snapshot's own directories, because the capture keeps absolute paths (`/usr/include/mysql`, `/lib/x86_64-linux-gnu`).
+- **Where it applies:**
+  - `augment_framac_cppflags`, which every Frama-C parse goes through (Eva, WP, `kernel_ast.py`, `function_facts.py`, `function_slice.py`). None of those scripts changed.
+  - `run_eacsl_fuzz.py`: the E-ACSL build (Frama-C front end and link) and the clang sanitizer and coverage builds. The flags are added inside the script, after `pipeline_make.py`'s module flag allowlist, which rejects `-Wl,` in module flags.
+  - `phase0_model.py` uses the same include helper.
+- **Cache:** `cache.toolchain_id()` is the image ID (or the tool versions) plus `+snapshot:<digest>`. Headers were already covered by the dependency manifest (`gcc -M` lists the snapshot headers); the digest adds the libraries a build links against.
+- **Wrappers and compose:**
+  - every non-build step defaults to `framac-analysis:latest`, built with `--target framac-analysis`;
+  - `-TargetPackages` without `-BuildImage` is ignored with a message, so no derived `framac-pipeline:<repo>` is built;
+  - an explicit `-Image` / `FRAMAC_DOCKER_IMAGE` (the monolith) builds from the last stage and still derives, until I10;
+  - compose's `framac-pipeline` service builds the `framac-analysis` stage (`FRAMAC_ANALYSIS_IMAGE` overrides).
+- **Benchmark:** the capture and the model run first, then Phase 0, so Phase 0's Frama-C runs see the snapshot. No stage names a derived image.
+- **Selftest:** `run_eacsl_fuzz.py selftest` (the E-ACSL canary) passes on the bare analysis image: `ok: true`, Frama-C 35.0~~dev (Bromine). The image build still runs only the model selftest. The canary fuzzes, which is too long for an image build.
+- **Docs:** README (two images), `docs/troubleshooting.md` (packages go in the recipe), the slice skill (the snapshot, no `-TargetPackages` outside the capture).
+- **Tests:** `tests/test_target_env.py` (flags, RPATH, the Frama-C and clang paths, the cache key) and wrapper cases in `tests/test_build_capture.py` (the analysis image by default, packages ignored there, the monolith still derived).
+- **Acceptance** (run `i3b-cryptolib-2` on `framac-analysis:latest`, against the monolith run `buildcheck-class2`):
+  - **CryptoLib, Phases 0–2 on the bare image:** capture, model, Phase 0, build-check, fuzz, Eva, replay, ingest, gate and queue all exit 0. The image has no `gcrypt.h` and no libgcrypt package.
+  - **Results against the monolith:** a diff of the benchmark's 320 target metrics shows identical Eva results, identical build gates (all 4 modules E-ACSL), and unchanged recall. Only wall times and fuzzing differ:
+    - the campaign seed derives from the binary's hash, which the RPATH changes, so the crash sets differ, as they do between any two campaigns;
+    - the monolith's `sa` campaign recorded 2 unattributed crashes that its own replay marked `not_reproduced`. Both inputs exit 0 on the analysis binary;
+    - the analysis run found one more `core` crash site (`Crypto_TC_ProcessSecurity_Cam`): 7 candidates against 8, 112 wave-0 prover tasks against 111.
+  - **Libraries at run time:** `readelf` shows `RPATH /framac-run/workspace/snapshot/root/lib/x86_64-linux-gnu:…/usr/lib/x86_64-linux-gnu` on `fuzz_crypto.e-acsl`, and `ldd` resolves `libgcrypt.so.20` and `libgpg-error.so.0` there.
+  - **E-ACSL canary:** passes on the bare image.
+  - **No derived Frama-C image:** the runs built only `framac-build:CryptoLib`. `framac-pipeline:CryptoLib` predates them, and no stage names it.
+- **Run conditions:** the host crashed twice during the full benchmark's build stage (the Windows machine itself, not a container), so the stages after Phase 0 were run one container at a time through the wrapper (`bench/logs/<stage>.log`). The first two runs stopped mid-build and are not results.
+- **Left for other steps:**
+  - generated headers in the build tree (`config.h`) do not reach the analyses, which read `workspace/work`; no benchmark target needs them;
+  - the other 9 targets were not rerun on the analysis image. Only CryptoLib's pipeline modules link a target package; minmea's recipe package (`check`) is in its snapshot, for its test executable. The first full benchmark after I3b (I5a's re-baseline) covers them;
+  - the monolith and its `-TargetPackages` derivation go in I10.
 
 ### I3 (2026-11-07)
 
