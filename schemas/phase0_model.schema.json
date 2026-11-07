@@ -1,0 +1,146 @@
+{
+  "$comment": "Contract for workspace/reports/phase0_model.json, written by scripts/phase0_model.py run (plan step I3). Function ids are `file#name`, the file relative to the target root. Every function, edge and alias carries its source.",
+  "type": "object",
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["ok", "error"]},
+    "error": {"type": "string"},
+    "capture": {"type": "string"},
+    "capture_generated_at": {"type": ["string", "null"]},
+    "tree": {"type": "string"},
+    "snapshot": {
+      "type": "object",
+      "properties": {"root": {"type": ["string", "null"]}, "digest": {"type": ["string", "null"]}},
+      "required": ["root", "digest"]
+    },
+    "dump_module": {
+      "type": "object",
+      "properties": {"status": {"type": "string", "enum": ["ok", "compile_failed"]}},
+      "required": ["status"]
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kind": {"type": "string", "enum": ["executable", "shared_lib", "static_lib", "unlinked"]},
+          "test": {"type": "boolean"},
+          "files": {"type": "array", "items": {"type": "string"}},
+          "links": {"type": "array", "items": {"type": "string"}},
+          "cppflags": {"type": ["array", "null"], "items": {"type": "string"}},
+          "entry_points": {"type": ["array", "null"], "items": {"type": "string", "pattern": "#"}},
+          "embedded_api": {"type": ["array", "null"], "items": {"type": "string", "pattern": "#"}},
+          "parse": {
+            "type": "object",
+            "properties": {
+              "status": {"type": "string", "enum": ["ok", "gcc_fallback", "skipped_test", "no_sources"]},
+              "job": {"type": "string"},
+              "seconds": {"type": "number", "minimum": 0},
+              "error": {"$comment": "Frama-C's first error, when the unit fell back to GCC", "type": "string"}
+            },
+            "required": ["status"]
+          },
+          "concurrent": {"$comment": "the unit starts threads (pthread_create, thrd_create)", "type": "boolean"}
+        },
+        "required": ["kind", "test", "files", "links", "parse", "concurrent"]
+      }
+    },
+    "functions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "file": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "kernel_names": {"$comment": "unit -> Frama-C's name (same-named statics are renamed per parse)", "type": "object", "additionalProperties": {"type": "string"}},
+          "units": {"type": "array", "items": {"type": "string"}},
+          "line": {"type": "integer", "minimum": 0},
+          "end_line": {"type": "integer", "minimum": 0},
+          "lines": {"type": ["integer", "null"], "minimum": 1},
+          "static": {"type": "boolean"},
+          "inline": {"type": "boolean"},
+          "header": {"$comment": "defined in a project header: belongs to every unit compiling it", "type": "boolean"},
+          "included": {"$comment": "defined in a .c file another source includes", "type": "boolean"},
+          "signature": {"type": "string"},
+          "loops": {"type": ["integer", "null"], "minimum": 0},
+          "cyclomatic": {"type": ["integer", "null"], "minimum": 1},
+          "address_taken": {"type": "boolean"},
+          "source": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info"]}
+        },
+        "required": ["file", "name", "kernel_names", "units", "line", "static", "header", "signature", "address_taken", "source"]
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "caller": {"type": "string", "pattern": "#"},
+          "callee": {"type": "string", "pattern": "#"},
+          "kind": {"type": "string", "enum": ["direct", "indirect"]},
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info", "type-match", "thread-spawn", "callback-arg"]}
+          }
+        },
+        "required": ["caller", "callee", "kind", "sources"]
+      }
+    },
+    "indirect_sites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "unit": {"type": "string"},
+          "units": {"type": "array", "items": {"type": "string"}},
+          "caller": {"type": "string", "pattern": "#"},
+          "expr": {"type": ["string", "null"]},
+          "signature": {"$comment": "null when the GCC fallback found the site: no candidates then", "type": ["string", "null"]},
+          "loc": {"type": ["string", "null"]},
+          "candidates": {"type": "array", "items": {"type": "string", "pattern": "#"}}
+        },
+        "required": ["unit", "caller", "signature", "candidates"]
+      }
+    },
+    "externals": {"type": "array", "items": {"type": "string"}},
+    "macro_aliases": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "function": {"type": "string"},
+          "ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "#"}},
+          "via": {"type": "array", "items": {"type": "string"}},
+          "defined_in": {"type": "string"},
+          "source": {"const": "preprocessor"}
+        },
+        "required": ["function", "ids", "via", "defined_in", "source"]
+      }
+    },
+    "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "entry_points_source": {"type": "string"},
+    "thread_entries": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "parse_jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": {"type": "string"},
+          "units": {"type": "array", "items": {"type": "string"}},
+          "sources": {"type": "array", "items": {"type": "string"}},
+          "status": {"type": "string", "enum": ["ok", "parse_failed"]},
+          "seconds": {"type": "number", "minimum": 0},
+          "error": {"type": "string"},
+          "gcc_fallback": {"type": "object"}
+        },
+        "required": ["key", "units", "sources", "status", "seconds"]
+      }
+    },
+    "seconds": {"type": "number", "minimum": 0},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["schema_version", "generated_at", "status", "capture", "warnings"],
+  "additionalProperties": false
+}

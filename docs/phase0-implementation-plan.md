@@ -368,7 +368,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I0 | M | done |
 | I1 | S | done |
 | I2 | L | done |
-| I3 | L | not started |
+| I3 | L | done |
 | I3b | L | not started |
 | I4 | S | not started |
 | I5a | M | not started |
@@ -469,6 +469,43 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I3 (2026-11-07)
+
+- **Dump** (`scripts/phase0_dump.ml`, schema 2, compiled by `kernel_ast.compile_dump_module`): per function the location, first and last line, storage, `inline`, signature, loops, cyclomatic complexity and calls (direct with the functions passed as arguments, indirect with the callee expression and type); `declared` and `address_taken` per parse.
+  - Lines come from `Filepos.line`: `to_lexing_loc` gives lines of the preprocessed file.
+  - Complexity is 1 + `if`s + switch cases − 1, computed in the dump in the same pass as the calls. The plan's `-metrics -metrics-by-function` is not used: it would be a second Frama-C pass for two numbers.
+- **Model** (`scripts/phase0_model.py run`, report `workspace/reports/phase0_model.json`, schema `schemas/phase0_model.schema.json`):
+  - one parse job per distinct (sources, flags) set over the non-test units, run in parallel, each under a `parse` lease (new class: 1 CPU, 2 GiB, 30 min); logs in `workspace/reports/phase0_model/`;
+  - target headers from the snapshot with `-idirafter`, behind the compile's own `-I`s, plus the pipeline's stubs and compat header;
+  - function ids `file#name`; the Frama-C kernel name (`skip_ws_0`) is kept per unit;
+  - an undefined callee resolves to a global of the unit or a unit it links, then of a unit that links it, else it is external; indirect sites resolve by signature against address-taken functions of the programs containing the unit; `pthread_create` and `thrd_create` give thread entries and mark the unit `concurrent`; other functions passed to externals give `callback-arg` edges;
+  - macro aliases from `gcc -E -dD` per translation unit, chains up to 16 deep;
+  - **GCC fallback:** a unit whose parse fails is compiled with `-fcallgraph-info` and its status is `gcc_fallback` with Frama-C's first error. Its functions have no loops, complexity or signatures, and its indirect sites no candidates.
+  - `phase0_model.py selftest` runs at image build in both Frama-C images.
+- **Wiring:** `resources.py` infers `phase-static` for `phase0_model.py run` and `parse` for `selftest`. The benchmark's `capture` stage runs the model on the scratch volume before removing it and records `build_capture.model` in the run entry; only a failed model adds a note. The slice skill has a Step 1c.
+- **Tests:** `tests/test_phase0_model.py`, 13 unit tests on recorded dumps and `.ci` files, and 11 Docker tests (`FRAMAC_DOCKER_TESTS=1`): the 9 reproducers against their truth files, the features fixture `tests/fixtures/phase0/model/features/` (a GNU nested function forces the fallback; an alias chain; a header `static inline` in two units), and the selftest.
+- **Acceptance** (run `i3-model`, Frama-C 35):
+  - the 9 reproducers match their truth on every class (functions, direct and indirect edges, entry points, thread entries, units);
+  - all 10 benchmark targets parse with Frama-C, with no fallback;
+  - the fallback gives edges and the flag on the features fixture;
+  - the model's time is within the build time + 2× the lexer's `dag` step on every target:
+
+  | Target | Units parsed (test skipped) | Functions | Edges | Model | Build | `dag` |
+  | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+  | CryptoLib | 1 (16) | 232 | 415 | 3.3 s | 3.7 s | no step |
+  | minmea | 2 (1) | 23 | 25 | 0.9 s | 3.1 s | 0.3 s |
+  | oscs-jsmn | 1 | 6 | 7 | 0.6 s | 0.2 s | 0.4 s |
+  | oscs-qlz | 4 | 22 | 29 | 0.7 s | 0.3 s | 0.3 s |
+  | oscs-semver | 1 (1) | 33 | 33 | 0.6 s | 0.3 s | 0.2 s |
+  | oscs-stmr | 1 (1) | 15 | 30 | 0.6 s | 0.3 s | 0.2 s |
+  | oscs-tweetnacl | 1 | 64 | 111 | 0.8 s | 0.3 s | 0.3 s |
+  | qcbor-dev | 1 (1) | 755 | 1,132 | 1.9 s | 1.2 s | 2.9 s |
+  | qcbor-master | 1 (1) | 562 | 802 | 1.2 s | 1.0 s | 2.1 s |
+  | x509-parser | 3 | 212 | 513 | 1.5 s | 1.6 s | 0.9 s |
+
+  tweetnacl is the closest (0.81 s against 0.83 s): its times are small enough that container start-up dominates.
+- **Left for other steps:** nothing reads the model yet (I5a); I3b moves the parse to the analysis image.
 
 ### I1 (2026-11-07)
 

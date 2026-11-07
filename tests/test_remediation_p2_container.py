@@ -53,6 +53,7 @@ NOT_FORWARDED = {
     "FRAMAC_RESERVE_MEMORY",
     # test hooks and internal plumbing
     "FRAMAC_AST_DUMP_OUT",
+    "FRAMAC_P0_DUMP_OUT",
     "FRAMAC_PROBE_MEMO_S",
     "FRAMAC_PROBE_ROOT",
 }

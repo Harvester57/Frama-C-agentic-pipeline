@@ -946,7 +946,8 @@ def summarize_capture(report: dict | None) -> dict:
 def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str, stages: dict[str, dict]) -> dict:
     """
     The build capture stage: build_capture.py in the build image (derived with the recipe's packages, or
-    the target's), on the run's scratch volume. The volume is removed afterwards: nothing reads it yet.
+    the target's), on the run's scratch volume; then the Phase 0 model (phase0_model.py) over that volume,
+    in the pipeline image. The volume is removed afterwards: nothing later reads it yet.
     """
     if not spec.get("build"):
         return {"status": "no_recipe"}
@@ -962,11 +963,49 @@ def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str
         build_image=True,
         scratch=True,
     )
-    drop = wrapper_argv(mount, run_dir, repo) + (["-RemoveScratch"] if _is_windows() else ["--remove-scratch"])
-    subprocess.run(drop, capture_output=True, check=False)
     summary = summarize_capture(read_json(run_dir / "workspace" / "reports" / "build_capture.json"))
     stages["capture"]["status"] = summary["status"]
+    if summary["status"] == "ok":
+        kwargs: dict[str, Any] = {"image": f"framac-pipeline:{repo}"} if packages else {}
+        stages["model"] = run_stage(
+            "model",
+            f"python3 {CONTAINER_SCRIPTS}/phase0_model.py run",
+            mount,
+            run_dir,
+            repo,
+            cls="phase-static",
+            scratch=True,
+            **kwargs,
+        )
+        summary["model"] = summarize_model(read_json(run_dir / "workspace" / "reports" / "phase0_model.json"))
+        stages["model"]["status"] = summary["model"]["status"]
+    drop = wrapper_argv(mount, run_dir, repo) + (["-RemoveScratch"] if _is_windows() else ["--remove-scratch"])
+    subprocess.run(drop, capture_output=True, check=False)
     return summary
+
+
+def summarize_model(model: dict | None) -> dict:
+    """What the run file records of the Phase 0 model: parse outcome per unit, size, and its cost."""
+    if not model:
+        return {"status": "no_report"}
+    out: dict[str, Any] = {"status": model.get("status")}
+    if model.get("status") != "ok":
+        out["error"] = model.get("error")
+        return out
+    parses = Counter((u.get("parse") or {}).get("status") for u in (model.get("units") or {}).values())
+    edges = Counter(e.get("kind") for e in model.get("edges") or [])
+    out.update(
+        parses=dict(sorted((str(k), v) for k, v in parses.items())),
+        gcc_fallback=sorted(n for n, u in (model.get("units") or {}).items() if u["parse"]["status"] == "gcc_fallback"),
+        functions=len(model.get("functions") or {}),
+        direct_edges=edges.get("direct", 0),
+        indirect_edges=edges.get("indirect", 0),
+        macro_aliases=len(model.get("macro_aliases") or {}),
+        thread_entries=len(model.get("thread_entries") or []),
+        parse_s=round(sum(j.get("seconds") or 0 for j in model.get("parse_jobs") or []), 2),
+        seconds=model.get("seconds"),
+    )
+    return out
 
 
 def run_target(
@@ -1019,6 +1058,10 @@ def run_target(
     capture = run_capture(spec, mount, run_dir, repo, packages, stages)
     if capture["status"] != "ok":
         notes.append(f"capture: {capture['status']}: {capture.get('first_error') or 'see bench/logs/capture.log'}")
+    # A unit on the GCC fallback is flagged in the run file (build_capture.model.gcc_fallback), not a failure.
+    model = capture.get("model") or {}
+    if capture["status"] == "ok" and model.get("status") != "ok":
+        notes.append(f"model: {model.get('status')}: {model.get('error') or 'see bench/logs/model.log'}")
     if ok and not phase0_only:
         # build-check builds every module and records the E-ACSL gate the fuzz targets check.
         stage("build", f"{py}/pipeline_make.py build-check")

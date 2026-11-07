@@ -49,12 +49,13 @@ Every container invocation belongs to a class. The class sets its CPU range, its
 | `light` | no | 1, never queued | 1 GiB | ledger, validators, checkpoints, `wp_scheduler.py next`, any command not listed below |
 | `wp` | no | 1–8 | 768 MiB + 1000 MiB per prover | `run_wp_function.py` |
 | `eva` | no | 1 | 2 GiB | `run_eva_slice.py`, a direct `frama-c` call (parse or annotation check) |
+| `parse` | no | 1 | 2 GiB | one Frama-C parse of a link unit by `phase0_model.py run` (it takes the lease itself), `phase0_model.py selftest` |
 | `build` | no | 1–4 | 2 GiB | `run_eacsl_fuzz.py build` |
 | `guardrail` | yes | 1–2 | 2 GiB | `run_eacsl_fuzz.py guardrail` |
 | `fuzz` | yes | 1–16 | 512 MiB + 2.5 GiB per worker | `run_eacsl_fuzz.py campaign` |
 | `replay`, `selftest` | yes | 1 | 1 GiB | crash replays, corpus coverage (`run_eacsl_fuzz.py coverage`), the E-ACSL canary, other `sandbox_exec.py run` commands |
 | `verify` | yes | elastic | elastic | `merge-agent`, `merge-batch`, `wp_scheduler.py complete/merge-pending` |
-| `phase-static` / `phase-dynamic` | no / yes | elastic | elastic | `pipeline_make.py run …`; `phase-dynamic` also covers the target's own build under `sandbox_exec.py run -- bear -- make` (or `cmake`, `ninja`, `meson`, `configure`) |
+| `phase-static` / `phase-dynamic` | no / yes | elastic | elastic | `pipeline_make.py run …`, `pipeline_make.py build-check`, `phase0_model.py run`; `phase-dynamic` also covers the target's own build under `sandbox_exec.py run -- bear -- make` (or `cmake`, `ninja`, `meson`, `configure`) |
 
 The wrapper infers the class from the command; `--class` (`-Class`) overrides it. Inference only sizes jobs. It is never a security decision (Section 5). A command the inference does not recognise runs as `light`, with 1 CPU and 1 GiB; give a heavy ad-hoc command an explicit `--class`.
 

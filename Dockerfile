@@ -142,6 +142,8 @@ RUN chmod -R a+rX /opt/framac-pipeline \
     && chmod a+x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh \
     && mkdir -p /home/opam/.cache /framac-run \
     && chmod 1777 /home/opam /home/opam/.cache /framac-run
+# The Phase 0 model's dump module must compile and load against this kernel.
+RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
 
 WORKDIR /framac-run
 ENTRYPOINT ["/bin/bash", "-lc"]
@@ -246,6 +248,8 @@ RUN chmod -R a+rX /opt/framac-pipeline \
     && chmod a+x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh \
     && mkdir -p /home/opam/.cache /framac-run \
     && chmod 1777 /home/opam /home/opam/.cache /framac-run
+# The Phase 0 model's dump module must compile and load against this kernel.
+RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
 
 WORKDIR /framac-run
 

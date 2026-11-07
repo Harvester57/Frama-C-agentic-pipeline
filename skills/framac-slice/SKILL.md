@@ -84,7 +84,29 @@ Phase 0 needs the target's own build: what it compiles, links and exports. A tar
 
 3. **Stop and ask.** Exit code 3 and `"status": "needs_build_recipe"` mean the build failed, built no C file, or has no recipe. The checkpoint records the same status. Show the user `diagnostics`: `first_error`, `missing_headers`, `candidate_packages` (a heuristic) and `packages_not_installed`. Ask for a corrected command, packages or flags, record them with `set-build`, and run the capture again. A successful capture clears the status, and Phase 0 continues.
 
-Until step I3 of `docs/phase0-implementation-plan.md` lands, Step 2 does not read the capture yet. Run the capture anyway: it is the gate that the target builds.
+### Step 1c — Frama-C Model
+
+Parse every non-test link unit of the capture with Frama-C, on the same scratch volume, in the pipeline image:
+
+```powershell
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Scratch -Class phase-static `
+  "python3 /opt/framac-pipeline/scripts/phase0_model.py run"
+```
+
+```bash
+./wrappers/framac-docker.sh --target "<target-dir>" --run-dir "<run-dir>" --scratch --class phase-static \
+  -- "python3 /opt/framac-pipeline/scripts/phase0_model.py run"
+```
+
+Units with the same sources and flags share one parse. Each parse takes a `parse` lease from the broker (`--no-broker` skips it, `--jobs N` caps the parallel parses). Target headers come from the capture's snapshot. The result is `workspace/reports/phase0_model.json`, validated against `schemas/phase0_model.schema.json`:
+- **functions:** keyed `file#name`, so same-named statics stay apart, with lines, loops, cyclomatic complexity, storage, the units that contain them, and the Frama-C kernel name per unit; `static inline` functions in headers belong to every unit that compiles them;
+- **edges:** direct calls, indirect calls matched by signature against address-taken functions of the same program, thread spawns (`pthread_create`, `thrd_create`) and callbacks passed to external functions; each edge carries its sources;
+- **macro_aliases:** `#define a b` chains in project headers that end at a defined function;
+- **thread_entries**, units marked `concurrent`, and `externals`.
+
+Read `units.<name>.parse.status`. `gcc_fallback` means Frama-C could not parse the unit: its functions and edges come from GCC's `-fcallgraph-info`, without loops, complexity or signatures, and `parse.error` holds Frama-C's first error. Report every fallback unit to the user with that error; Eva and WP will fail on it the same way. A non-zero exit means the capture is missing, the scratch volume is not mounted, or the dump module did not compile (`kernel_ast.py`): fix that before Step 2.
+
+Until step I5a of `docs/phase0-implementation-plan.md` lands, Step 2 does not read the model yet. Run the capture and the model anyway: the capture is the gate that the target builds, and the model shows what Frama-C cannot parse.
 
 ---
 

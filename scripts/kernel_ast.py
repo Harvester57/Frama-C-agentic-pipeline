@@ -68,11 +68,13 @@ def _failed(status: str, reason: str) -> dict:
     return {"status": status, "reason": reason[-_NOTE_LIMIT:], "functions": []}
 
 
-def compile_dump_module(work_dir: Path, runner: Callable | None = None) -> tuple[Path | None, str]:
+def compile_dump_module(
+    work_dir: Path, runner: Callable | None = None, dump_source: Path = DUMP_SOURCE
+) -> tuple[Path | None, str]:
     """(path of the .cmxs, "") or (None, reason). `work_dir` must be private to this process."""
     run = runner or subprocess.run
-    source = work_dir / DUMP_SOURCE.name
-    shutil.copyfile(DUMP_SOURCE, source)
+    source = work_dir / dump_source.name
+    shutil.copyfile(dump_source, source)
     target = source.with_suffix(".cmxs")
     # Alerts and warnings stay off: a deprecation in a future kernel must not stop the dump.
     cmd = [
@@ -102,7 +104,7 @@ def compile_dump_module(work_dir: Path, runner: Callable | None = None) -> tuple
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return None, f"cannot run ocamlfind: {exc}"
     if proc.returncode != 0 or not target.is_file():
-        return None, f"kernel_ast_dump.ml does not compile against this kernel: {proc.stdout or ''}{proc.stderr or ''}"
+        return None, f"{dump_source.name} does not compile against this kernel: {proc.stdout or ''}{proc.stderr or ''}"
     return target, ""
 
 

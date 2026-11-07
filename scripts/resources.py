@@ -108,6 +108,8 @@ CLASSES: dict[str, JobClass] = {
     "light": JobClass("light", False, 1, 1, 1024, 0, gated=False, idempotent=True),
     "wp": JobClass("wp", False, 1, 8, FRAMAC_KERNEL_RESERVE_MB, WP_MEMLIMIT_MB, idempotent=True, wall_timeout_s=3600),
     "eva": JobClass("eva", False, 1, 1, 2048, 0, idempotent=True, wall_timeout_s=7200),
+    # One Frama-C parse of a link unit for the Phase 0 model (phase0_model.py): one kernel, no analysis.
+    "parse": JobClass("parse", False, 1, 1, 2048, 0, idempotent=True, wall_timeout_s=1800),
     "build": JobClass("build", False, 1, 4, 2048, 0, idempotent=True, wall_timeout_s=3600),
     "guardrail": JobClass("guardrail", True, 1, 2, 2048, 0, wall_timeout_s=1800),
     "fuzz": JobClass(
@@ -1487,6 +1489,9 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"pipeline_make\.py\s+(?:\S+\s+)*?sweep(?:\s|$)", "phase-static"),
     # build-check runs `run build` (E-ACSL instrumentation of whole modules), so it is sized like it.
     (r"pipeline_make\.py\s+(?:\S+\s+)*?build-check(?:\s|$)", "phase-static"),
+    # The Phase 0 model runs its unit parses in parallel, each under a `parse` lease.
+    (r"phase0_model\.py\s+(?:\S+\s+)*?run(?:\s|$)", "phase-static"),
+    (r"phase0_model\.py\s+(?:\S+\s+)*?selftest(?:\s|$)", "parse"),
     (r"build_callgraph_dag\.py\b", "eva"),
     (r"extract_references\.py\b", "build"),
     # The target's own build under the sandbox (bear -- make, cmake, ninja ...): target code, sized like a phase.
