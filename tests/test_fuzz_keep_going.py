@@ -188,3 +188,85 @@ def test_fork_mode_command_and_replay_cap(tmp_path, monkeypatch):
     assert res["fork"] == 2
     assert res["artifacts_omitted"]["not_replayed"] == 5
     assert len(res["artifacts"]) == R.MAX_REPLAYED_CRASHES
+
+
+# --- both engines -----------------------------------------------------------------------------
+
+
+def test_merge_engine_campaigns_keeps_every_artifact_and_the_worst_status():
+    runs = {
+        "sanitizers": {
+            "status": "crash_found",
+            "returncode": 1,
+            "artifacts": [{"kind": "crash", "engine": "sanitizers"}],
+        },
+        "eacsl": {"status": "clean", "returncode": 0, "artifacts": [], "keep_going": {"mode": "fork"}},
+    }
+    out = R.merge_engine_campaigns(runs)
+    assert out["status"] == "crash_found"
+    assert out["engines"]["sanitizers"]["artifacts"] == 1 and out["engines"]["eacsl"]["keep_going"] == {"mode": "fork"}
+    # An engine that did not finish is never hidden behind the other engine's clean run.
+    runs["sanitizers"] = {"status": "fuzzer_error", "returncode": 2, "artifacts": []}
+    assert R.merge_engine_campaigns(runs)["status"] == "fuzzer_error"
+    runs["sanitizers"] = {"status": "clean", "returncode": 0, "artifacts": []}
+    assert R.merge_engine_campaigns(runs)["status"] == "clean"
+
+
+def _dual_campaign(tmp_path, monkeypatch, engine: str, san_rc: int = 0) -> tuple[dict, list]:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src.c").write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    (tmp_path / "harness_mod.c").write_text("int h;\n", encoding="utf-8")
+    monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
+
+    def fake_build(sources, out_bin, **opts):
+        eng = "eacsl" if opts.get("engine") in ("auto", "eacsl") else "sanitizers"
+        rc = san_rc if eng == "sanitizers" else 0
+        return {
+            "compile": {"returncode": rc, "binary": f"bin.{eng}"},
+            "engine_used": eng,
+            "engine_fallback_reason": None,
+            "eacsl_compile_attempt": None,
+        }
+
+    calls: list = []
+
+    def fake_campaign(binary, corpus, artifacts, max_time, *a, **k):
+        calls.append((str(binary), max_time))
+        return {"status": "clean", "returncode": 0, "artifacts": []}
+
+    monkeypatch.setattr(R, "build_module_binary", fake_build)
+    monkeypatch.setattr(R, "run_fuzz_campaign", fake_campaign)
+    out_json = tmp_path / "out.json"
+    argv = ["campaign", "--module", "mod", "--sources", "src.c", "harness_mod.c", "--out-bin", "fuzz_mod"]
+    argv += ["--corpus-dir", "corpus", "--artifacts-dir", "crashes", "--workers", "1", "--max-time", "100"]
+    argv += ["--no-cache", "--no-attribution-replay", "--no-auto-dict", "--engine", engine, "--out-json", str(out_json)]
+    R.main(argv)
+    import json
+
+    return json.loads(out_json.read_text(encoding="utf-8")), calls
+
+
+def test_auto_fuzzes_with_sanitizers_then_eacsl_half_the_time_each(tmp_path, monkeypatch):
+    report, calls = _dual_campaign(tmp_path, monkeypatch, "auto")
+    assert calls == [("bin.sanitizers", 50), ("bin.eacsl", 50)]
+    assert report["engine_used"] == R.DUAL_ENGINE and set(report["engines"]) == {"sanitizers", "eacsl"}
+    assert report["status"] == "clean"
+
+
+def test_explicit_engine_or_failed_sanitizer_build_fuzzes_with_one_engine(tmp_path, monkeypatch):
+    report, calls = _dual_campaign(tmp_path, monkeypatch, "eacsl")
+    assert calls == [("bin.eacsl", 100)] and report["engine_used"] == "eacsl"
+    report, calls = _dual_campaign(tmp_path, monkeypatch, "auto", san_rc=1)
+    assert calls == [("bin.eacsl", 100)] and report["dual_engine_skipped"] == "sanitizer build failed"
+
+
+def test_candidate_engine_of_a_dual_report_is_the_artifact_engine(tmp_path):
+    report = tmp_path / "mod.json"
+    report.write_text(
+        '{"engine_used": "eacsl+sanitizers", "artifacts": ['
+        '{"fingerprint": "a", "engine": "sanitizers"}, {"fingerprint": "b", "engine": "eacsl"}]}',
+        encoding="utf-8",
+    )
+    assert R._candidate_engine({"fingerprint": "a", "tool_outputs": [str(report)]}) == "sanitizers"
+    assert R._candidate_engine({"fingerprint": "b", "tool_outputs": [str(report)]}) == "eacsl"
+    assert R._candidate_engine({"fingerprint": "c", "tool_outputs": [str(report)]}) == "auto"

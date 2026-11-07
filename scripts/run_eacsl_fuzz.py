@@ -152,6 +152,8 @@ MIN_FUZZ_WALL_S = 30
 # inputs are replayed and this many listed per fingerprint. Fixed, never derived from the machine.
 MAX_REPLAYED_CRASHES = 64
 MAX_ARTIFACTS_PER_FINGERPRINT = 3
+# engine_used of a campaign that fuzzed with ASan+UBSan and then E-ACSL (`--engine auto`).
+DUAL_ENGINE = "eacsl+sanitizers"
 _DISPATCH_SWITCH_RE = re.compile(r"switch \(harness_selector % (\d+)U\)")
 
 SANITIZER_RUNTIME_ENV = {
@@ -1361,6 +1363,40 @@ def run_campaign_rounds(
         "rounds": rounds,
     }
     return out
+
+
+def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
+    """
+    One report for a module fuzzed with several engines, in the order run: every artifact (each
+    carries its `engine`), the most severe status, and each engine's own outcome under `engines`.
+    """
+    artifacts: list[dict] = []
+    engines: dict[str, dict] = {}
+    for engine, run in runs.items():
+        artifacts.extend(run.get("artifacts") or [])
+        engines[engine] = {
+            key: run[key]
+            for key in ("status", "returncode", "timed_out", "keep_going", "artifacts_omitted", "fork")
+            if key in run
+        }
+        engines[engine]["artifacts"] = len(run.get("artifacts") or [])
+    statuses = [r.get("status") for r in runs.values()]
+    if "insufficient_memory" in statuses:
+        status = "insufficient_memory"
+    elif all(st in ("clean", "fuzzer_error") for st in statuses) and "fuzzer_error" in statuses:
+        status = "fuzzer_error"  # a run that did not complete is never reported as clean
+    else:
+        status = classify_campaign(0, False, artifacts)
+    last = list(runs.values())[-1]
+    return {
+        "status": status,
+        "returncode": last.get("returncode"),
+        "timed_out": any(bool(r.get("timed_out")) for r in runs.values()),
+        "sandbox": last.get("sandbox"),
+        "artifacts": artifacts,
+        "engines": engines,
+        "log_tail": "\n".join(f"--- {e}\n{(r.get('log_tail') or '')[-2000:]}" for e, r in runs.items()),
+    }
 
 
 def classify_campaign(returncode: int, timed_out: bool, artifacts: list[dict]) -> str:
@@ -2865,7 +2901,11 @@ def _candidate_slug(fingerprint: str) -> str:
 
 
 def _candidate_engine(cand: dict) -> str:
-    """The engine of the campaign that found the candidate (its report's engine_used), else auto."""
+    """
+    The engine that found the candidate: its report's engine_used, or for a campaign that used
+    both engines, the `engine` of the report's artifact with the candidate's fingerprint; else auto.
+    """
+    fingerprint = cand.get("fingerprint")
     for rel in cand.get("tool_outputs") or []:
         try:
             data = json.loads(Path(rel).read_text(encoding="utf-8"))
@@ -2874,6 +2914,11 @@ def _candidate_engine(cand: dict) -> str:
         engine = data.get("engine_used") if isinstance(data, dict) else None
         if engine in ("eacsl", "sanitizers"):
             return engine
+        if engine == DUAL_ENGINE:
+            for art in data.get("artifacts") or []:
+                if isinstance(art, dict) and art.get("fingerprint") == fingerprint:
+                    if art.get("engine") in ("eacsl", "sanitizers"):
+                        return art["engine"]
     return "auto"
 
 
@@ -3528,7 +3573,10 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
         "--engine",
         choices=["auto", "eacsl", "sanitizers"],
         default="auto",
-        help="Instrumentation engine: 'auto' tries E-ACSL first and falls back to Clang ASan+UBSan on compile error",
+        help=(
+            "Instrumentation engine: 'auto' tries E-ACSL first and falls back to Clang ASan+UBSan on compile "
+            "error; a campaign with 'auto' and a working E-ACSL build fuzzes with both, half the time each"
+        ),
     )
     p.add_argument("--functions", nargs="*", default=None, help="Explicit target functions to instrument in E-ACSL")
     p.add_argument(
@@ -4099,44 +4147,74 @@ def _run_campaign_mode(args) -> dict:
             auto=not getattr(args, "no_auto_dict", False),
         )
 
-        def _campaign(binary: Path, seconds: int, fork: bool) -> dict:
-            return run_fuzz_campaign(
+        n_cases = dispatch_case_count(args.sources)
+
+        def _engine_campaign(engine: str, binary: Path, seconds: int) -> dict:
+            attribution = attribution_builder if engine == "eacsl" else None
+
+            def _campaign(binary: Path, seconds: int, fork: bool) -> dict:
+                return run_fuzz_campaign(
+                    binary,
+                    args.corpus_dir,
+                    args.artifacts_dir,
+                    seconds,
+                    dict_file,
+                    args.per_input_timeout,
+                    extra_corpus=args.extra_corpus,
+                    attribution_builder=attribution,
+                    jobs=jobs,
+                    workers=workers,
+                    fork=fork,
+                )
+
+            def _rebuild(mask: int) -> tuple[Path | None, dict]:
+                opts = _build_options(args)
+                # Same engine as the round before, so every round checks the same properties.
+                opts["engine"] = engine
+                opts["cppflags"] = f"{opts['cppflags'] or ''} -D{DISPATCH_SKIP_MACRO}={mask:#x}ULL".strip()
+                rebuilt = build_module_binary(args.sources, args.out_bin, **opts)
+                ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine
+                return (Path(rebuilt["compile"]["binary"]) if ok else None), rebuilt
+
+            out = run_campaign_rounds(
                 binary,
-                args.corpus_dir,
-                args.artifacts_dir,
                 seconds,
-                dict_file,
-                args.per_input_timeout,
-                extra_corpus=args.extra_corpus,
-                attribution_builder=attribution_builder,
-                jobs=jobs,
-                workers=workers,
-                fork=fork,
+                campaign=_campaign,
+                rebuild=_rebuild,
+                n_cases=n_cases,
+                keep_going=not args.stop_on_first_crash,
             )
+            for art in out.get("artifacts") or []:
+                art["engine"] = engine
+            return out
 
-        def _rebuild(mask: int) -> tuple[Path | None, dict]:
-            opts = _build_options(args)
-            # Same engine as the first build, so every round checks the same properties.
-            opts["engine"] = engine_used
-            opts["cppflags"] = f"{opts['cppflags'] or ''} -D{DISPATCH_SKIP_MACRO}={mask:#x}ULL".strip()
-            rebuilt = build_module_binary(args.sources, args.out_bin, **opts)
-            ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine_used
-            return (Path(rebuilt["compile"]["binary"]) if ok else None), rebuilt
-
-        fuzz = run_campaign_rounds(
-            Path(comp["binary"]),
-            max_time,
-            campaign=_campaign,
-            rebuild=_rebuild,
-            n_cases=dispatch_case_count(args.sources),
-            keep_going=not args.stop_on_first_crash,
-        )
+        # `auto` with a working E-ACSL build fuzzes with both engines, half the time each: ASan+UBSan
+        # first (faster, and it catches what E-ACSL does not check, such as overlapping memcpy), then
+        # E-ACSL on the grown corpus, which replays every corpus input under its contract checks.
+        second = None
+        if args.engine == "auto" and engine_used == "eacsl":
+            san = build_module_binary(args.sources, args.out_bin, **{**_build_options(args), "engine": "sanitizers"})
+            if san["compile"]["returncode"] == 0 and san["engine_used"] == "sanitizers":
+                second = san
+            else:
+                res["dual_engine_skipped"] = "sanitizer build failed"
+        if second is None:
+            fuzz = _engine_campaign(engine_used, Path(comp["binary"]), max_time)
+            res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
+        else:
+            share = max(MIN_FUZZ_WALL_S, max_time // 2)
+            runs = {
+                "sanitizers": _engine_campaign("sanitizers", Path(second["compile"]["binary"]), share),
+                "eacsl": _engine_campaign("eacsl", Path(comp["binary"]), share),
+            }
+            fuzz = merge_engine_campaigns(runs)
+            res.update({"sources": args.sources, "engine_used": DUAL_ENGINE, "compile": comp, **fuzz})
+            res["sanitizer_compile"] = second["compile"]
         published = (
             cache.publish_corpus(args.module, args.corpus_dir)
             if args.module and use_cache and fuzz.get("status") != "insufficient_memory"
             else 0
         )
-        res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
         res["dictionary"] = dict_info
         if warm_started or published:
             res["corpus_cache"] = {"warm_started": warm_started, "published": published}

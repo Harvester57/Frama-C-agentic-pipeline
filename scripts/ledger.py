@@ -448,6 +448,11 @@ def fuzz_engine_note(report: dict) -> str:
         reason = report.get("engine_fallback_reason")
         suffix = f"; E-ACSL fallback reason: {reason}" if reason else ""
         return f"Clang ASan+UBSan + LibFuzzer (no E-ACSL contract checks, no intra-object bounds checks{suffix})"
+    if report.get("engine_used") == "eacsl+sanitizers":
+        reduced = (
+            f"; E-ACSL reduced checks: {', '.join(report['reduced_checks'])}" if report.get("reduced_checks") else ""
+        )
+        return f"Clang ASan+UBSan + LibFuzzer, then E-ACSL + LibFuzzer (each artifact names its engine{reduced})"
     if report.get("reduced_checks"):
         return f"E-ACSL + LibFuzzer (reduced checks: {', '.join(report['reduced_checks'])})"
     return "E-ACSL + LibFuzzer"
