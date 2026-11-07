@@ -17,6 +17,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -35,9 +36,8 @@ import phase0b  # noqa: E402
 def run_old(target: Path, out: Path) -> dict:
     """The current extractor, as Phase 0 runs it today (no compile_commands), converted to the model."""
     out.mkdir(parents=True, exist_ok=True)
-    work = out / "work-old"
-    if work.exists():
-        shutil.rmtree(work)
+    # Container-local scratch, as for phase0b, so both are timed on the same filesystem.
+    work = Path(tempfile.mkdtemp(prefix="p0-old-")) / "work"
     shutil.copytree(target, work, symlinks=True, ignore=shutil.ignore_patterns(".git"))
     dag_path = out / "callgraph_dag.json"
     t0 = time.monotonic()
@@ -50,6 +50,7 @@ def run_old(target: Path, out: Path) -> dict:
         timeout=1800,
     )
     seconds = round(time.monotonic() - t0, 2)
+    shutil.rmtree(work.parent, ignore_errors=True)
     if proc.returncode != 0 or not dag_path.is_file():
         return {"status": "failed", "error": (proc.stderr or proc.stdout)[-800:], "seconds": seconds}
     return old_to_model(json.loads(dag_path.read_text(encoding="utf-8")), seconds)

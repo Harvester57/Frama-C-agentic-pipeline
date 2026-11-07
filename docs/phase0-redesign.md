@@ -174,11 +174,11 @@ Two fixes came from running real code, and both are in `phase0b.py`:
 
 No target needed the GCC fallback. Every unit parsed in Frama-C.
 
-**Cost**: 1.6 s to 115 s, against 0.3 s to 4 s for the lexer. Frama-C parsing dominates. An executable unit re-parses the libraries it links (qcbortest parses all of QCBOR again). Acceptance criterion 2 ("same order of time") is not met yet. The planned remedies are:
+**Cost**: 1.0 s to 16.5 s per target, against 0.1 s to 1.9 s for the lexer. Both were measured with their scratch tree inside the container.
 
-- parse each source once per flag set;
-- run units in parallel under the resource broker;
-- skip test executables unless they are in scope.
+The new figure includes the target's own build, which is 4.3 s of QCBOR's total and most of minmea's (CMake configure). That build is work Phase 1's build-check does anyway. Frama-C parsing is about half of what remains. An executable unit re-parses the project libraries it links, so qcbortest parses all of QCBOR again. Parsing each source once per flag set, and running units in parallel, would cut that.
+
+A first run had its scratch tree on the Windows bind mount and measured up to 115 s. File I/O, not the method, caused that. Next to Phase 1 and Phase 2 (60 to 900 CPU-seconds of fuzzing and up to 1800 s of Eva per module), the added Phase 0 time is negligible. Acceptance criterion 2 is met in practice.
 
 ## 8. Open questions
 

@@ -297,6 +297,8 @@ def build_inventory(execs: list[dict], work: Path) -> dict:
                 if hit:
                     links.append(hit)
                     break
+        if not own and not links:
+            continue  # a build-system probe (CMake try-compile, configure test): no project source
         units[path] = {
             "kind": art["kind"],
             "files": sorted({c["source"] for c in own}),
@@ -488,9 +490,11 @@ def gcc_unit(work: Path, out: Path, name: str, compiles: list[dict]) -> dict[str
 # --- 6. Model -------------------------------------------------------------------------------------
 
 
-def extract(target: Path, out: Path, build: str, timeout: int) -> dict:
+def extract(target: Path, out: Path, build: str, timeout: int, keep_work: bool = False) -> dict:
     out.mkdir(parents=True, exist_ok=True)
-    work = out / "work"
+    # The build and Frama-C run in container-local scratch: on a host bind mount (Windows, OneDrive)
+    # file I/O dominated the measured time. keep_work keeps the tree under <out>/work instead.
+    work = out / "work" if keep_work else Path(tempfile.mkdtemp(prefix="p0-work-")) / "work"
     t0 = time.monotonic()
     model: dict = {"schema": 1, "extractor": "phase0b", "target": str(target)}
     model["build"] = capture_build(target, work, out, build, timeout)
@@ -672,6 +676,8 @@ def extract(target: Path, out: Path, build: str, timeout: int) -> dict:
     model["cg_overapprox_extra_edges"] = len(cg_extra)
     model["seconds"] = round(time.monotonic() - t0, 2)
     (out / "model.json").write_text(json.dumps(model, indent=1) + "\n", encoding="utf-8")
+    if not keep_work:
+        shutil.rmtree(work.parent, ignore_errors=True)
     return model
 
 
@@ -683,8 +689,9 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--build", default="make")
     e.add_argument("--timeout", type=int, default=900)
+    e.add_argument("--keep-work", action="store_true", help="keep the built tree under <out>/work")
     a = p.parse_args(argv)
-    m = extract(a.target.resolve(), a.out.resolve(), a.build, a.timeout)
+    m = extract(a.target.resolve(), a.out.resolve(), a.build, a.timeout, a.keep_work)
     summary = {
         "build": m["build"]["status"],
         "units": {n: (u["kind"], u.get("frama_c", {}).get("status")) for n, u in m["units"].items()},
