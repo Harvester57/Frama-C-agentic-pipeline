@@ -147,6 +147,8 @@ For each module with `gaps`:
 
 Move on only when `check` exits 0. Its `exempt` entries are the accepted, documented gaps.
 
+The check records its result in `workspace/reports/phase0_gates.json`, together with a digest of each harness. Make enforces it: `seed` runs the check first (`reach-gate`), and the `build-`, `fuzz-`, `coverage-` and `eva-` targets of a module stop with the reason when the module failed it or when its harness changed after the check ran. After any harness repair, run `check` again.
+
 ---
 
 ## Step 5 — Seed the Coverage Ledger and Checkpoint
@@ -163,3 +165,5 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check
 `pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`). Check its JSON for modules excluded with a reason before moving on.
 
 `pipeline_make.py build-check` builds every fuzzed module (`run build`, cached, so Phase 1 reuses it) and exits 1 unless each one was instrumented with E-ACSL. The Frama-C kernel parse in Step 4 uses Frama-C's own libc, but the E-ACSL build runs with `-no-frama-c-stdlib` against the host headers, so a harness can pass Step 4 and still fall back to ASan/UBSan, losing the E-ACSL checks. For each failing module, `workspace/reports/build_check.json` gives `status` (`eacsl_fallback`, `build_failed`, `not_built`), the `compile_log`, and its `first_error`. Fix the cause (usually a host header Frama-C cannot parse: put a minimal stub under `workspace/harnesses/include/` on the sidecar's `-I` path, ahead of `-idirafter /usr/include`), regenerate the harness, and rerun. Only when E-ACSL cannot work for the module, record that choice with `pipeline_make.py params set --module <mod> --fuzz-engine sanitizers`, which the check accepts.
+
+`build-check` records its result in the same `phase0_gates.json`. `fuzz-<mod>` refuses a module that failed it, and `wp-queue` refuses the run until every module passes both gates. Run `build-check` again after a repair.

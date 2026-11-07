@@ -8,6 +8,9 @@
  "targets": [
   {
    "id": "minmea",
+   "reach_exempt_modules": {
+    "example": "example, test or command-line program of the project, not library API"
+   },
    "set": "recall",
    "repo_name": "minmea",
    "url": "https://github.com/kosma/minmea.git",
@@ -45,6 +48,13 @@
   },
   {
    "id": "qcbor-dev",
+   "reach_exempt_modules": {
+    "cmd_line_main": "example, test or command-line program of the project, not library API",
+    "example": "example, test or command-line program of the project, not library API",
+    "tag-examples": "example, test or command-line program of the project, not library API",
+    "test": "example, test or command-line program of the project, not library API",
+    "ub-example": "example, test or command-line program of the project, not library API"
+   },
    "set": "recall",
    "repo_name": "QCBOR",
    "url": "https://github.com/laurencelundblade/QCBOR.git",
@@ -63,6 +73,7 @@
    "modules": [
     {
      "name": "UsefulBuf",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c"
@@ -82,6 +93,7 @@
     },
     {
      "name": "ieee754",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/ieee754.c"
@@ -100,6 +112,7 @@
     },
     {
      "name": "qcbor_main_decode",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c",
@@ -125,6 +138,7 @@
     },
     {
      "name": "qcbor_main_encode",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c",
@@ -147,6 +161,7 @@
     },
     {
      "name": "qcbor_number_decode",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c",
@@ -172,6 +187,7 @@
     },
     {
      "name": "qcbor_number_encode",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c",
@@ -194,6 +210,7 @@
     },
     {
      "name": "qcbor_spiffy_decode",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c",
@@ -222,6 +239,7 @@
     },
     {
      "name": "qcbor_tag_decode",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/UsefulBuf.c",
@@ -248,6 +266,15 @@
   },
   {
    "id": "qcbor-master",
+   "reach_exempt_modules": {
+    "cmd_line_main": "example, test or command-line program of the project, not library API",
+    "example": "example, test or command-line program of the project, not library API",
+    "test": "example, test or command-line program of the project, not library API",
+    "ub-example": "example, test or command-line program of the project, not library API",
+    "UsefulBuf": "not in this revision's recall harness: its known bugs (QCBOR-02, QCBOR-03) are in ieee754",
+    "qcbor_decode": "not in this revision's recall harness: its known bugs (QCBOR-02, QCBOR-03) are in ieee754",
+    "qcbor_encode": "not in this revision's recall harness: its known bugs (QCBOR-02, QCBOR-03) are in ieee754"
+   },
    "set": "recall",
    "repo_name": "QCBOR",
    "url": "https://github.com/laurencelundblade/QCBOR.git",
@@ -266,6 +293,7 @@
    "modules": [
     {
      "name": "ieee754",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "workspace/work/src/ieee754.c"
@@ -314,6 +342,7 @@
    "modules": [
     {
      "name": "core",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "src/core/crypto.c",
@@ -358,6 +387,7 @@
     },
     {
      "name": "crypto",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "src/crypto/custom_stub/cryptography_interface_custom_stub.template.c",
@@ -399,6 +429,7 @@
     },
     {
      "name": "key",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "src/key/custom_stub/key_interface_custom_stub.template.c",
@@ -420,6 +451,7 @@
     },
     {
      "name": "mc",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "src/mc/custom_stub/mc_interface_custom_stub.template.c",
@@ -490,6 +522,9 @@
   },
   {
    "id": "x509-parser",
+   "reach_exempt_modules": {
+    "main": "example, test or command-line program of the project, not library API"
+   },
    "set": "comparison",
    "repo_name": "x509-parser",
    "url": "https://github.com/ANSSI-FR/x509-parser.git",
@@ -511,6 +546,8 @@
    "modules": [
     {
      "name": "x509-parser",
+     "fuzz_engine_reason": "E-ACSL instrumentation fails on this slice (eacsl_instrumentation_failed): sanitizers are the recorded choice",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "src/x509-utils.c",
@@ -529,11 +566,13 @@
       "call_expr": "{ cert_parsing_ctx cert_ctx; crl_parsing_ctx crl_ctx; u32 eaten = 0; (void)parse_x509_cert_relaxed(&cert_ctx, fuzz_buf, (u32)fuzz_len, &eaten); (void)parse_x509_crl_relaxed(&crl_ctx, fuzz_buf, (u32)fuzz_len, &eaten); }"
      },
      "params": {
-      "eva_slevel": 1
+      "eva_slevel": 1,
+      "fuzz_engine": "sanitizers"
      }
     },
     {
      "name": "x509-cert-parser",
+     "fuzz_engine_reason": "E-ACSL instrumentation fails on this slice (eacsl_instrumentation_failed): sanitizers are the recorded choice",
      "harness": {
       "sources": [
        "src/x509-utils.c",
@@ -550,11 +589,13 @@
       "call_expr": "{ cert_parsing_ctx ctx; (void)parse_x509_cert(&ctx, fuzz_buf, (u32)fuzz_len); }"
      },
      "params": {
-      "eva_slevel": 1
+      "eva_slevel": 1,
+      "fuzz_engine": "sanitizers"
      }
     },
     {
      "name": "x509-crl-parser",
+     "fuzz_engine_reason": "E-ACSL instrumentation fails on this slice (eacsl_instrumentation_failed): sanitizers are the recorded choice",
      "harness": {
       "sources": [
        "src/x509-utils.c",
@@ -571,7 +612,8 @@
       "call_expr": "{ crl_parsing_ctx ctx; (void)parse_x509_crl(&ctx, fuzz_buf, (u32)fuzz_len); }"
      },
      "params": {
-      "eva_slevel": 1
+      "eva_slevel": 1,
+      "fuzz_engine": "sanitizers"
      }
     },
     {
@@ -595,6 +637,8 @@
     },
     {
      "name": "x509-common",
+     "fuzz_engine_reason": "E-ACSL instrumentation fails on this slice (eacsl_instrumentation_failed): sanitizers are the recorded choice",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "src/x509-utils.c",
@@ -612,7 +656,8 @@
       "call_expr": "{ cert_parsing_ctx cert_ctx; crl_parsing_ctx crl_ctx; (void)parse_x509_cert(&cert_ctx, fuzz_buf, (u32)fuzz_len); (void)parse_x509_crl(&crl_ctx, fuzz_buf, (u32)fuzz_len); }"
      },
      "params": {
-      "eva_slevel": 1
+      "eva_slevel": 1,
+      "fuzz_engine": "sanitizers"
      }
     }
    ],
@@ -625,6 +670,10 @@
   },
   {
    "id": "oscs-jsmn",
+   "reach_exempt_modules": {
+    "example": "example, test or command-line program of the project, not library API",
+    "test": "example, test or command-line program of the project, not library API"
+   },
    "set": "comparison",
    "repo_name": "oscs-jsmn",
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
@@ -656,6 +705,10 @@
   },
   {
    "id": "oscs-semver",
+   "reach_exempt_modules": {
+    "semver_test": "example, test or command-line program of the project, not library API",
+    "semver_unit": "example, test or command-line program of the project, not library API"
+   },
    "set": "comparison",
    "repo_name": "oscs-semver",
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
@@ -669,6 +722,7 @@
    "modules": [
     {
      "name": "semver",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "semver.c"
@@ -688,6 +742,9 @@
   },
   {
    "id": "oscs-stmr",
+   "reach_exempt_modules": {
+    "test": "example, test or command-line program of the project, not library API"
+   },
    "set": "comparison",
    "repo_name": "oscs-stmr",
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
@@ -720,6 +777,12 @@
   },
   {
    "id": "oscs-qlz",
+   "reach_exempt_modules": {
+    "compress_file": "example, test or command-line program of the project, not library API",
+    "decompress_file": "example, test or command-line program of the project, not library API",
+    "stream_compress": "example, test or command-line program of the project, not library API",
+    "stream_decompress": "example, test or command-line program of the project, not library API"
+   },
    "set": "comparison",
    "repo_name": "oscs-qlz",
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
@@ -733,6 +796,7 @@
    "modules": [
     {
      "name": "quicklz",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "quicklz.c"
@@ -751,6 +815,10 @@
   },
   {
    "id": "oscs-tweetnacl",
+   "reach_exempt_modules": {
+    "main": "example, test or command-line program of the project, not library API",
+    "randombytes": "OS entropy wrapper: takes no input, nothing to fuzz"
+   },
    "set": "comparison",
    "repo_name": "oscs-tweetnacl",
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
@@ -764,6 +832,7 @@
    "modules": [
     {
      "name": "tweetnacl",
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
       "sources": [
        "tweetnacl.c"

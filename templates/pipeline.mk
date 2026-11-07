@@ -22,6 +22,9 @@ TARGET_DIR ?= /target
 
 RUN := $(PY) $(S)/resources.py run
 PM  := $(PY) $(S)/pipeline_make.py
+# Phase 0 gate stamp check (phase0_gates.py): a recipe that consumes harnesses runs it first, so it
+# stops with the reason when the module failed the reach gate or build-check (or they never ran).
+GATE := $(PY) $(S)/phase0_gates.py check
 SELFTEST_JSON := workspace/reports/eacsl_selftest.json
 
 BUILD_TARGETS  := $(addprefix build-,$(FUZZ_MODULES))
@@ -38,12 +41,12 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
+.PHONY: help slice-init reach-gate seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init seed build selftest fuzz coverage eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init reach-gate seed build selftest fuzz coverage eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -55,9 +58,14 @@ slice-init:
 	$(RUN) --class light --key slice-init -- $(PY) $(S)/build_callgraph_dag.py --target workspace/work \
 		--out workspace/reports/callgraph_dag.json --emit-compile-commands workspace/reports/compile_commands.json
 
+# Phase 0 gate: every DAG entry point of each harnessed module is reached by its harness, or exempted
+# with a reason (harness_reach.py exempt). It records workspace/reports/phase0_gates.json.
+reach-gate:
+	$(RUN) --class light --key reach-gate -- $(PY) $(S)/harness_reach.py check
+
 # Ledger seed (scope paths from run-metadata.json), validation, checkpoint of phase 0. The
 # checkpoint is initialized only once, so seeding again never rewinds the recorded progress.
-seed:
+seed: reach-gate
 	$(RUN) --class light --key seed -- $(PY) $(S)/ledger.py seed --dag workspace/reports/callgraph_dag.json $(SEED_SCOPE_ARGS)
 	$(RUN) --class light --key seed -- $(PY) $(S)/validate_artifacts.py run-dir .
 	test -f state/progress.json || $(RUN) --class light --key seed -- $(PY) $(S)/checkpoint.py init state --target $(TARGET_DIR)
@@ -70,6 +78,7 @@ seed:
 # runs target code), so it does not depend on the selftest.
 build: $(BUILD_TARGETS)
 $(BUILD_TARGETS): build-%:
+	$(GATE) --module $* --need reach
 	$(RUN) --class build --key $* --output workspace/build/$*.build.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py build --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
@@ -86,6 +95,7 @@ selftest:
 # allows; FUZZ_MAX_TIME_<mod> overrides the wall time.
 fuzz: $(FUZZ_TARGETS)
 $(FUZZ_TARGETS): fuzz-%: selftest build-%
+	$(GATE) --module $* --need reach,build_check
 	$(RUN) --class fuzz --key $* --output workspace/reports/fuzz/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py campaign --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
@@ -100,6 +110,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 # on fuzz-% would start a new campaign, because every target is phony.
 coverage: $(COVERAGE_TARGETS)
 $(COVERAGE_TARGETS): coverage-%:
+	$(GATE) --module $* --need reach
 	$(RUN) --class replay --key $* --output workspace/reports/coverage/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py coverage --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/cov_$* --corpus-dir workspace/corpus/$* \
@@ -138,6 +149,7 @@ eva_plain_cmd = $(PY) $(S)/run_eva_slice.py $(call eva_args,$(1)) --out-dir work
 eva: $(EVA_TARGETS)
 $(foreach m,$(EVA_MODULES),$(if $(EVA_REPLAY_$(m)),$(eval eva-$(m): evabase-$(m) $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))))
 $(EVA_TARGETS): eva-%:
+	$(GATE) --module $* --need reach
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
 		$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*))
 
@@ -146,6 +158,7 @@ $(EVA_TARGETS): eva-%:
 # which writes the module's report and records the decision in params.json.
 eva-tune-base: $(EVA_BASE_TARGETS)
 $(EVA_BASE_TARGETS): evabase-%:
+	$(GATE) --module $* --need reach
 	@rm -f workspace/reports/eva-tuning/$*/base.json
 	$(RUN) --class eva --key $* --output workspace/reports/eva-tuning/$*/base.json -- \
 		$(PY) $(S)/run_eva_slice.py $(call eva_args,$*) --out-dir workspace/eva/$*/tune/base \
@@ -155,6 +168,7 @@ $(EVA_BASE_TARGETS): evabase-%:
 
 define EVA_RUNG_RULE
 evarung-$(1)--$(2):
+	$$(GATE) --module $(1) --need reach
 	@rm -f workspace/reports/eva-tuning/$(1)/$(2).json
 	-$$(RUN) --class eva --key $(1) --output workspace/reports/eva-tuning/$(1)/$(2).json -- \
 		$$(PY) $$(S)/run_eva_slice.py $$(call eva_args,$(1)) --out-dir workspace/eva/$(1)/tune/$(2) \
@@ -167,6 +181,7 @@ $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),$(eval $(call EVA_
 eva-tune: $(EVA_TUNE_TARGETS)
 $(foreach m,$(EVA_MODULES),$(eval evatune-$(m): $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r))))
 $(EVA_TUNE_TARGETS): evatune-%:
+	$(GATE) --module $* --need reach
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
 		$(call eva_finish_cmd,$*)
 
@@ -214,6 +229,7 @@ minimize: replay
 # Phases 1 and 2 are done once the Phase-3 queue is built from their ingested reports: record it,
 # so a resumed run starts at Phase 3.
 wp-queue: ingest facts
+	$(GATE) --need reach,build_check
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/checkpoint.py save-phase state --phase 2 \
 		--from-file workspace/reports/wp_queue.json

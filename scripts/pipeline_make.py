@@ -49,6 +49,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import phase0_gates  # noqa: E402
 from eva_loops import loop_ref_from_json, mirror_id  # noqa: E402
 from eva_options import (  # noqa: E402
     EVA_OPTIONS,
@@ -1086,6 +1087,7 @@ def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
 # for example, `run fuzz eva ingest` ingests only after every campaign and Eva run has finished.
 STAGE_OF_TARGET = {
     "slice-init": 0,
+    "reach-gate": 1,
     "seed": 1,
     "build": 2,
     "selftest": 2,
@@ -1986,6 +1988,7 @@ def build_check(
     if not results:
         out["error"] = "no fuzzed module in the plan: run `pipeline_make.py gen` first"
     atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
+    phase0_gates.record_build_check(run_dir, out)  # the stamp fuzz-<mod> and wp-queue check
     return out
 
 

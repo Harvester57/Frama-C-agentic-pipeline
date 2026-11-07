@@ -1367,6 +1367,10 @@ def test_build_check_fails_on_an_eacsl_fallback_and_names_the_error(tmp_path):
     assert "linux/types.h:12: User Error" in mods["log"]["first_error"] and "__int128" in mods["log"]["first_error"]
     assert mods["snmp"]["status"] == "not_built"
     assert json.loads((run / pm.BUILD_CHECK_JSON).read_text(encoding="utf-8"))["ok"] is False
+    # The gate stamp the fuzz targets check: log fails it with its first error, cfg passes.
+    gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))["build_check"]
+    assert gates["ok"] is False and gates["modules"]["cfg"]["ok"] is True
+    assert "__int128" in gates["modules"]["log"]["first_error"]
 
     # Choosing sanitizers for a module is a recorded decision, so it passes.
     _build_report(run, "snmp", "eacsl")

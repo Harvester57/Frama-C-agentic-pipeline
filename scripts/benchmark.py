@@ -874,7 +874,14 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
     modules = []
     for module in target["modules"]:
         params = {"fuzz_budget": budget, "eva_timeout": timeout, **(module.get("params") or {})}
-        modules.append({"name": module["name"], "harness": module["harness"], "params": params})
+        modules.append(
+            {
+                "name": module["name"],
+                "harness": module["harness"],
+                "params": params,
+                "reach_gaps_accepted": module.get("reach_gaps_accepted"),
+            }
+        )
     return {
         "id": target["id"],
         "repo": target["repo_name"],
@@ -883,6 +890,7 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
         "modules": modules,
         "assets": target.get("assets") or [],
         "compile_commands": target.get("compile_commands"),
+        "reach_exempt_modules": target.get("reach_exempt_modules") or {},
         "replays": replays,
     }
 
@@ -935,7 +943,8 @@ def run_target(
         ok = False
         notes.append("phase0: see bench/phase0.json")
     if ok and not phase0_only:
-        stage("build", f"{py}/pipeline_make.py run build")
+        # build-check builds every module and records the E-ACSL gate the fuzz targets check.
+        stage("build", f"{py}/pipeline_make.py build-check")
         if run_fuzz:
             stage("fuzz", f"{py}/pipeline_make.py run fuzz")
         stage("eva", f"{py}/pipeline_make.py run eva")
@@ -1079,6 +1088,28 @@ def _harness_argv(module: dict) -> list[str]:
     return argv
 
 
+def apply_reach_exemptions(spec: dict, harness_dir: Path = Path("workspace/harnesses")) -> dict:
+    """
+    Record the manifest's reach exemptions before the gate runs: modules it names in
+    `reach_exempt_modules` (example and test programs), and every entry point the gate reports as
+    unreached for a module with `reach_gaps_accepted` (a pinned recall harness drives only the entry
+    points of the known bugs). Each exemption carries the manifest's reason.
+    """
+    import harness_reach  # container side, like pipeline_make
+
+    for module, reason in sorted((spec.get("reach_exempt_modules") or {}).items()):
+        harness_reach.record_exempt(harness_dir, module, None, str(reason))
+    accepted = {m["name"]: m["reach_gaps_accepted"] for m in spec["modules"] if m.get("reach_gaps_accepted")}
+    functions = 0
+    if accepted:
+        report = harness_reach.run_check(Path("workspace/reports/callgraph_dag.json"), harness_dir, sorted(accepted))
+        for row in report["modules"]:
+            for fn in row.get("gaps") or []:
+                harness_reach.record_exempt(harness_dir, row["module"], fn, str(accepted[row["module"]]))
+                functions += 1
+    return {"modules_exempted": len(spec.get("reach_exempt_modules") or {}), "functions_exempted": functions}
+
+
 def inner_phase0() -> int:
     """Phase 0 for a pinned harness spec: what /framac-slice does, with every judgment call already recorded."""
     import pipeline_make  # the container step needs the Make layer; the host never does
@@ -1144,6 +1175,15 @@ def inner_phase0() -> int:
                     except (ValueError, RuntimeError) as exc:  # includes framac_common.ArtifactError
                         steps.append({"name": f"params:{module['name']}", "rc": 1, "error": str(exc)})
                         ok = False
+        if ok:
+            # The manifest's recorded exemptions, then the reach gate itself (it writes the stamp the
+            # build, fuzz and Eva targets check).
+            try:
+                steps.append({"name": "reach_exemptions", "rc": 0, **apply_reach_exemptions(spec)})
+            except (ValueError, RuntimeError, OSError) as exc:
+                steps.append({"name": "reach_exemptions", "rc": 1, "error": str(exc)})
+                ok = False
+            ok = step("reach_gate", [py, script("harness_reach.py"), "check"]) and ok
         if ok:
             ok = (
                 step(

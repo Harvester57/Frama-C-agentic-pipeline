@@ -38,6 +38,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import phase0_gates  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     atomic_write_json,
@@ -290,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
     if str(args.out) != "-":
         args.out.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(args.out, report)
+        # The gate stamp the Make recipes check (phase0_gates.py); `--out -` is a dry look.
+        phase0_gates.record_reach(Path("."), report, partial=bool(args.module))
     print(json.dumps(report, indent=2))
     return 0 if report["passed"] else 1
 

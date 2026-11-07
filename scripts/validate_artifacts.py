@@ -399,6 +399,35 @@ def validate_agent_result(data) -> Errors:
 
 # ----------------------------------------------------------------- run dir
 
+PHASE0_GATES = "workspace/reports/phase0_gates.json"
+
+
+def validate_phase0_gates(data: Any) -> Errors:
+    """
+    The Phase 0 gate stamp (phase0_gates.py): its shape. Reports older than a failed gate are not
+    errors: a harness repair fails the gate again while the previous campaign's report is still there.
+    """
+    errors = Errors()
+    if not isinstance(data, dict):
+        errors.add("$: must be an object")
+        return errors
+    for section, flag, row_flag in (("reach", "passed", "passed"), ("build_check", "ok", "ok")):
+        entry = data.get(section)
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get(flag), bool):
+            errors.add(f"$.{section}.{flag}: must be a boolean")
+            continue
+        modules = entry.get("modules")
+        if not isinstance(modules, dict) or not all(
+            isinstance(r, dict) and isinstance(r.get(row_flag), bool) for r in modules.values()
+        ):
+            errors.add(f"$.{section}.modules: must map each module to an object with a boolean {row_flag!r}")
+            continue
+        if entry[flag] != all(r[row_flag] for r in modules.values()):
+            errors.add(f"$.{section}.{flag}: must be true exactly when every module passed")
+    return errors
+
 
 def validate_run_dir(run_dir: Path) -> Errors:
     errors = Errors()
@@ -470,6 +499,16 @@ def validate_run_dir(run_dir: Path) -> Errors:
         open_units = [cid for cid, u in ledger.items() if u["status"] in ("planned", "in_progress")]
         if open_units:
             errors.add(f"run-metadata.json: run cannot be complete with {len(open_units)} planned/in_progress units")
+
+    gates_path = run_dir / PHASE0_GATES
+    if gates_path.is_file():
+        try:
+            gates = load_json_strict(gates_path)
+        except ArtifactError as exc:
+            errors.add(f"{PHASE0_GATES}: {exc}")
+        else:
+            for e in validate_phase0_gates(gates):
+                errors.add(f"{PHASE0_GATES}: {e}")
 
     snap_rel = (meta.get("snapshot_manifest") if meta else None) or "state/snapshot-manifest.json"
     snap_path = run_dir / snap_rel
