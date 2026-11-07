@@ -10,7 +10,9 @@ a gate (docs/phase0-implementation-plan.md, step I1):
                or exempted with a reason. Recorded with a digest of the module's harness files, so
                a harness regenerated after the check fails the gate until the check runs again.
   build_check  pipeline_make.py build-check: every fuzzed module builds with E-ACSL, or its
-               sanitizer engine is a recorded choice (params set --fuzz-engine sanitizers).
+               sanitizer engine is a recorded choice (params set --fuzz-engine sanitizers). The check
+               judges the module's current build report when there is one: Make rebuilds a module
+               as a prerequisite of fuzz-<mod>, so that is the binary the campaign uses.
 
     phase0_gates.py check [--module M] [--need reach,build_check]
 
@@ -97,7 +99,12 @@ def record_reach(run_dir: Path, report: dict[str, Any], partial: bool = False) -
 def record_build_check(run_dir: Path, out: dict[str, Any]) -> dict[str, Any]:
     """Store a pipeline_make.py build-check result."""
     modules = {
-        str(name): {"ok": bool(r.get("ok")), "status": r.get("status"), "first_error": r.get("first_error")}
+        str(name): {
+            "ok": bool(r.get("ok")),
+            "status": r.get("status"),
+            "fuzz_engine": r.get("fuzz_engine"),
+            "first_error": r.get("first_error"),
+        }
         for name, r in (out.get("modules") or {}).items()
         if isinstance(r, dict)
     }
@@ -114,6 +121,27 @@ def _section_ok(section: str, entry: dict[str, Any]) -> bool:
     return bool(entry.get("passed") if section == "reach" else entry.get("ok"))
 
 
+def current_build_status(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, str] | None:
+    """
+    The build-check verdict on the module's current build report (workspace/build/<mod>.build.json),
+    or None when there is none. Make rebuilds a module as a prerequisite of fuzz-<mod> before the
+    gate runs, so the report the campaign will use can be newer than build-check's stamp.
+    """
+    try:
+        report = load_json_optional(run_dir / "workspace" / "build" / f"{module}.build.json", None)
+    except ArtifactError:
+        return None
+    if not isinstance(report, dict):
+        return None
+    if (report.get("compile") or {}).get("returncode") != 0:
+        return False, "build_failed"
+    if report.get("engine_used") == "eacsl":
+        return True, "eacsl"
+    if row.get("fuzz_engine") == "sanitizers":
+        return True, "sanitizers_chosen"
+    return False, "eacsl_fallback"
+
+
 def check(run_dir: Path, module: str | None = None, need: tuple[str, ...] = SECTIONS) -> list[str]:
     """Reasons the gate fails for `module` (or for every module when None); empty when it passes."""
     run_dir = Path(run_dir)
@@ -127,8 +155,12 @@ def check(run_dir: Path, module: str | None = None, need: tuple[str, ...] = SECT
         raw_modules = entry.get("modules")
         modules: dict[str, Any] = raw_modules if isinstance(raw_modules, dict) else {}
         if module is None:
-            if not _section_ok(section, entry):
-                failed = sorted(m for m, r in modules.items() if not (r.get("passed") or r.get("ok")))
+            if section == "build_check":
+                failed = sorted(m for m, r in modules.items() if not _build_ok(run_dir, m, r)[0])
+                if failed or (not modules and not entry.get("ok")):
+                    reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
+            elif not _section_ok(section, entry):
+                failed = sorted(m for m, r in modules.items() if not r.get("passed"))
                 reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
             continue
         row = modules.get(module)
@@ -143,10 +175,18 @@ def check(run_dir: Path, module: str | None = None, need: tuple[str, ...] = SECT
                 reasons.append(f"reach gate failed for {module}: {detail}")
             elif row.get("harness_digest") != harness_digest(run_dir, module):
                 reasons.append(f"the harness of {module} changed after the reach gate ran; run it again")
-        elif not row.get("ok"):
-            first = f" ({row['first_error']})" if row.get("first_error") else ""
-            reasons.append(f"build-check failed for {module}: {row.get('status')}{first}")
+        else:
+            ok, status = _build_ok(run_dir, module, row)
+            if not ok:
+                first = f" ({row['first_error']})" if row.get("first_error") and status == row.get("status") else ""
+                reasons.append(f"build-check failed for {module}: {status}{first}")
     return reasons
+
+
+def _build_ok(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, str]:
+    """The current build report's verdict when there is one, else the one build-check recorded."""
+    current = current_build_status(run_dir, module, row)
+    return current if current is not None else (bool(row.get("ok")), str(row.get("status")))
 
 
 def main(argv: list[str] | None = None) -> int:

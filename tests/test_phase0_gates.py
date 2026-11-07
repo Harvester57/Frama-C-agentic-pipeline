@@ -86,6 +86,39 @@ def test_build_check_gate_covers_fuzzed_modules_only(tmp_path):
     assert "log" in phase0_gates.check(tmp_path, None, ("build_check",))[0]
 
 
+def _build_report(run: Path, module: str, engine: str, returncode: int = 0) -> None:
+    path = run / "workspace" / "build" / f"{module}.build.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"engine_used": engine, "compile": {"returncode": returncode}}), encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_build_gate_judges_the_build_the_campaign_will_use(tmp_path):
+    # build-check saw an intermittent E-ACSL fallback; Make rebuilt the module (a prerequisite of
+    # fuzz-<mod>) before the gate ran, this time with E-ACSL: the campaign uses that build.
+    phase0_gates.record_build_check(
+        tmp_path,
+        {"ok": False, "modules": {"crypto": {"ok": False, "status": "eacsl_fallback", "fuzz_engine": "auto"}}},
+    )
+    _build_report(tmp_path, "crypto", "eacsl")
+    assert phase0_gates.check(tmp_path, "crypto", ("build_check",)) == []
+    assert phase0_gates.check(tmp_path, None, ("build_check",)) == []
+    # The other way round: a passed stamp, then a rebuild that fell back.
+    _build_report(tmp_path, "crypto", "sanitizers")
+    phase0_gates.record_build_check(
+        tmp_path, {"ok": True, "modules": {"crypto": {"ok": True, "status": "eacsl", "fuzz_engine": "auto"}}}
+    )
+    assert "eacsl_fallback" in phase0_gates.check(tmp_path, "crypto", ("build_check",))[0]
+    # Sanitizers as the recorded choice pass; a failed compile never does.
+    phase0_gates.record_build_check(
+        tmp_path,
+        {"ok": True, "modules": {"crypto": {"ok": True, "status": "sanitizers_chosen", "fuzz_engine": "sanitizers"}}},
+    )
+    assert phase0_gates.check(tmp_path, "crypto", ("build_check",)) == []
+    _build_report(tmp_path, "crypto", "sanitizers", returncode=1)
+    assert "build_failed" in phase0_gates.check(tmp_path, "crypto", ("build_check",))[0]
+
+
 @pytest.mark.unit
 def test_cli_exit_codes(tmp_path, capsys):
     assert phase0_gates.main(["check", "--run-dir", str(tmp_path), "--module", "m"]) == 1
