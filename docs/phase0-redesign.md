@@ -180,6 +180,43 @@ The new figure includes the target's own build, which is 4.3 s of QCBOR's total 
 
 A first run had its scratch tree on the Windows bind mount and measured up to 115 s. File I/O, not the method, caused that. Next to Phase 1 and Phase 2 (60 to 900 CPU-seconds of fuzzing and up to 1800 s of Eva per module), the added Phase 0 time is negligible. Acceptance criterion 2 is met in practice.
 
+### A/B through Phases 0–2 (2026-11-07)
+
+`poc/phase0/ab.py` runs the benchmark's own Phases 0–2 twice per target: on the lexer DAG, then on the `dag_view.py` view of the new model. Fuzzing was off and Eva and replay on. The harnesses (from the manifest), the modules and the tiers are held fixed, so only the inventory and the call edges differ.
+
+Each cell is lexer → new view:
+
+| Metric | minmea | qcbor-master | x509-parser | jsmn | semver | stmr | qlz | tweetnacl |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ledger functions | 22 → 23 | 389 → 709 | 213 → 212 | 27 → 6 | 64 → 60 | 17 → 17 | 18 → 22 | 64 → 64 |
+| Units with Eva evidence | 18 → 22 | 12 → 12 | 211 → 210 | 6 → 6 | 33 → 33 | 15 → 15 | 14 → 18 | 61 → 61 |
+| Eva-analysed functions with no ledger unit | 1 → 0 | 0 → 0 | 0 → 0 | 0 → 0 | 0 → 0 | 0 → 0 | 4 → 0 | 12 → 0 |
+| Planned RTE units Eva never saw | 0 → 3 | 1 → 1 | 9 → 8 | 0 → 0 | 12 → 12 | 1 → 1 | 7 → 7 | 34 → 22 |
+| Phase 3 queue | 9 → 13 | 5 → 5 | 209 → 208 | 3 → 3 | 30 → 30 | 13 → 13 | 14 → 18 | 60 → 60 |
+| Candidate units | 5 → 5 | 2 → 2 | 0 → 0 | 0 → 0 | 0 → 0 | 0 → 0 | 0 → 1 | 1 → 1 |
+| Bugs retained | 3 → 3 | 2 → 2 | – | – | – | – | – | – |
+| Phase 0 wall s | 5.8 → 8.9 | 7.5 → 16.1 | 8.4 → 17.9 | 4.2 → 5.1 | 4.1 → 5.2 | 3.8 → 5.5 | 4.5 → 8.3 | 4.8 → 6.5 |
+
+qcbor-dev failed Phase 0 in both modes. The cause is an unrelated bug on `main`: `generate_harness.py` checks the arity of a call expression with a splitter that ignores braces, so `UsefulOutBuf_Init(&ob, (UsefulBuf){store, sizeof(store)})` counts as 3 arguments. x509-parser's `x509-parser` module fails Eva identically in both modes.
+
+What it shows:
+
+- **The ledger loses Eva results today.** Under the lexer, Eva analysed functions that have no ledger unit to record the result on. This happens to 4 core functions of qlz (`qlz_compress`, `qlz_decompress` and their cores) and to 12 tweetnacl functions under their real symbol names. With the new view every such function has a unit:
+  - minmea gains 4 units with Eva evidence and 4 Phase 3 tasks;
+  - qlz gains 4 units with Eva evidence and 4 Phase 3 tasks.
+- **Lexer units that no analysis can match disappear.** tweetnacl's 12 macro-named units (`crypto_box`...) never received evidence, so Eva-unseen planned units fall from 34 to 22.
+- **An existing finding now lands on a unit.** The Eva Invalid in `qlz_compress_core` (`ptr_value`, line 382) is a candidate in both runs. With the lexer it has no unit, so the ledger never marks anything `candidate` and never excludes the function from WP. With the new view it does both.
+- **Unchanged:**
+  - the known bugs (all retained in both modes);
+  - Eva results on the functions both inventories share;
+  - targets where the inventories already agree (stmr, semver).
+- **Inventory size changes that need a design decision:**
+  - QCBOR's extra 320 units are header `static inline` functions. They are seeded, but they are out of scope or unreached here, so they add no work.
+  - jsmn and semver lose units for example and test files their default build doesn't compile.
+- **A compatibility gap for migration.** Manifest harnesses call functions through macro aliases (tweetnacl's `crypto_hash`). `generate_harness.py` looks those names up in the DAG and doesn't find them under the real symbol, so it skips its DAG-based source expansion. Here that only dropped `randombytes.c`, which `crypto_hash` never calls. The new DAG should carry macro aliases, or consumers should resolve names through the preprocessor.
+
+Verdict: on this benchmark the redesign changes no bug outcome. What it changes is the bookkeeping: Eva results that the lexer inventory silently dropped are now recorded on a unit. These results come from 2 of the 9 targets plus minmea's header functions, so it is a correctness gain in what the ledger and the report claim. It doesn't show more bugs found. A benchmark with bugs behind function pointers or configuration macros is still needed to test that.
+
 ## 8. Open questions
 
 - How often do real targets build in the container without manual help? The PoC's benchmark targets give a first number.
@@ -189,3 +226,4 @@ A first run had its scratch tree on the Windows bind mount and measured up to 11
 - Header `static inline` functions: one ledger unit per header definition, or only those reached from a unit's entry points? QCBOR doubles its inventory otherwise.
 - Which build targets to capture: the default target skips examples (jsmn) but builds tests (QCBOR). Probably "all buildable artifacts, tests marked as such".
 - Libraries compiled directly into an executable (tweetnacl): fall back to globals declared in project headers as entry points, as for static libraries.
+- Macro aliases (`#define crypto_hash crypto_hash_sha512_tweet`): record them in the DAG view so that consumers resolving source-level names (`generate_harness.py`, briefs) keep working.

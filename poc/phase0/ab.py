@@ -62,7 +62,10 @@ def eva_functions(run_dir: Path, modules: list[str]) -> set[str]:
         )
         for item in items:
             if isinstance(item, dict) and item.get("function"):
-                out.add(f"{benchmark.normalize_file(str(item.get('file', '')))}#{item['function']}")
+                directory, name = str(item.get("directory") or ""), str(item.get("file") or "")
+                path = benchmark.normalize_file(f"{directory}/{name}" if directory and directory != "." else name)
+                path = path.removeprefix("workspace/work/")
+                out.add(f"{path}#{item['function']}")
     return out
 
 
@@ -177,6 +180,25 @@ def render(results: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def rescore(paths: list[Path], out: Path) -> int:
+    """Merge result files (later ones win per target) and recompute ledger metrics from the run directories."""
+    manifest = benchmark.load_manifest()
+    by_id = {t["id"]: t for t in manifest["targets"]}
+    merged: dict = {}
+    for path in paths:
+        for tid, modes in json.loads(path.read_text(encoding="utf-8")).items():
+            merged[tid] = modes
+    for tid, modes in merged.items():
+        for m in modes.values():
+            if m.get("run_dir") and Path(m["run_dir"]).is_dir():
+                m["ledger"] = ledger_metrics(Path(m["run_dir"]), by_id[tid])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.with_suffix(".json").write_text(json.dumps(merged, indent=1) + "\n", encoding="utf-8")
+    out.with_suffix(".md").write_text(render(merged), encoding="utf-8")
+    print(out.with_suffix(".md"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Phase 0 A/B on the benchmark targets")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -185,7 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--work-dir", type=Path, default=HERE / "out" / "checkouts")
     r.add_argument("--out", type=Path, default=HERE / "out" / "ab")
     r.add_argument("--fuzz", action="store_true", help="also run Phase 1 campaigns (off: Eva and replay only)")
+    s = sub.add_parser("rescore", help="recompute the ledger metrics of earlier runs and merge them (later files win)")
+    s.add_argument("results", type=Path, nargs="+")
+    s.add_argument("--out", type=Path, default=HERE / "out" / "ab" / "ab-merged")
     a = p.parse_args(argv)
+    if a.cmd == "rescore":
+        return rescore(a.results, a.out)
     manifest = benchmark.load_manifest()
     builds = json.loads((HERE / "targets.json").read_text(encoding="utf-8"))
     ids = a.target or list(builds)

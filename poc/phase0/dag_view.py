@@ -60,16 +60,18 @@ def build_view(model: dict, lexer: dict, harness_modules: list[dict], waves_fn: 
     unit_files = {n: u.get("files") or [] for n, u in (model.get("units") or {}).items()}
 
     def module_of(fid: str, rec: dict) -> str:
+        # The lexer's module first: harnesses share sources (a parser harness compiles its helpers'
+        # files too), so harness ownership would move functions between modules.
         f = rec["file"]
-        if f in harness_of_file:
-            return harness_of_file[f]
         if f in file_lex_module:
             return file_lex_module[f]
+        if f in harness_of_file:
+            return harness_of_file[f]
         # A function defined in a header: the module owning most of the sources of its unit.
         votes: Counter = Counter()
         for unit in rec.get("units") or []:
             for src in unit_files.get(unit, []):
-                mod = harness_of_file.get(src) or file_lex_module.get(src)
+                mod = file_lex_module.get(src) or harness_of_file.get(src)
                 if mod:
                     votes[mod] += 1
         return votes.most_common(1)[0][0] if votes else (Path(f).parent.name or Path(f).stem)
