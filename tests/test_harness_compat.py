@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from generate_harness import generate_module_harness
+from generate_harness import _split_top_level_params, _validate_call_expr_arity, generate_module_harness
 
 
 def _mini_target(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -21,9 +21,7 @@ def _mini_target(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     pub = inc / "pub.h"
     pub.write_text("#ifndef PUB_H\n#define PUB_H\nint public_api(int x);\n#endif\n", encoding="utf-8")
     priv = inc / "priv.h"
-    priv.write_text(
-        "#ifndef PRIV_H\n#define PRIV_H\nint my_entry(int a, int b, int c);\n#endif\n", encoding="utf-8"
-    )
+    priv.write_text("#ifndef PRIV_H\n#define PRIV_H\nint my_entry(int a, int b, int c);\n#endif\n", encoding="utf-8")
     mod = src / "mod.c"
     mod.write_text("int my_entry(int a, int b, int c) { return a + b + c; }\n", encoding="utf-8")
     compat = tmp_path / "compat.h"
@@ -107,3 +105,37 @@ def test_call_expr_arity_validated_against_definition(tmp_path: Path) -> None:
         auto_prelude=False,
     )
     assert res["module"] == "mod"
+
+
+def test_split_top_level_params_keeps_brace_groups_together() -> None:
+    # Compound literal (qcbor-dev UsefulOutBuf_Init) and a nested-brace initializer.
+    assert _split_top_level_params("&ob, (UsefulBuf){store, sizeof(store)}") == [
+        "&ob",
+        "(UsefulBuf){store, sizeof(store)}",
+    ]
+    assert _split_top_level_params("(struct pair[]){{1, 2}, {3, 4}}, n") == ["(struct pair[]){{1, 2}, {3, 4}}", "n"]
+    # Declared parameter lists are split as before.
+    assert _split_top_level_params("int a, void (*cb)(int, char *), char buf[N], ...") == [
+        "int a",
+        "void (*cb)(int, char *)",
+        "char buf[N]",
+    ]
+
+
+def test_call_expr_arity_counts_compound_literal_as_one_argument(tmp_path: Path) -> None:
+    mod = tmp_path / "ub.c"
+    mod.write_text(
+        "typedef struct { void *ptr; unsigned long len; } UsefulBuf;\n"
+        "typedef struct { UsefulBuf UB; } UsefulOutBuf;\n"
+        "void UsefulOutBuf_Init(UsefulOutBuf *me, UsefulBuf Storage) { me->UB = Storage; }\n",
+        encoding="utf-8",
+    )
+    # Two arguments, the second a compound literal with commas inside its braces: accepted.
+    _validate_call_expr_arity(
+        "UsefulOutBuf_Init", "UsefulOutBuf_Init(&ob, (UsefulBuf){store, sizeof(store)});", [str(mod)], ""
+    )
+    _validate_call_expr_arity(
+        "UsefulOutBuf_Init", "UsefulOutBuf_Init(&ob, (UsefulBuf){.ptr = {0}, .len = {1}});", [str(mod)], ""
+    )
+    with pytest.raises(ValueError, match="passes 1 argument"):
+        _validate_call_expr_arity("UsefulOutBuf_Init", "UsefulOutBuf_Init((UsefulBuf){store, 1});", [str(mod)], "")
