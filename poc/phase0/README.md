@@ -15,6 +15,8 @@ imported by the pipeline, and nothing in `scripts/` changes: the current extract
 | `targets.json` | Build command of each benchmark target. |
 | `dag_view.py` | Writes the model as a `callgraph_dag.json` the current pipeline reads. It holds modules, tiers and the lexer's per-function analysis fixed, and changes only the inventory and the edges. |
 | `ab.py`, `ab_inner.py` | The A/B. It runs the benchmark's own Phases 0–2 twice per target, once on the lexer DAG and once on the `dag_view.py` view, with the manifest's harnesses unchanged. It then compares the ledgers, Eva coverage, the Phase 3 queue and the known bugs. The command is `python -I poc/phase0/ab.py run [--target ID] [--fuzz]`, and results go to `out/ab/`. |
+| `seeded/` | Seven libraries, each with one verified bug reachable only through one lexer weakness, plus decoys (see its README). |
+| `seeded.py`, `seeded_inner.py` | The seeded-bug benchmark. It runs Phase 0 in lexer mode or new mode (link units as modules), then a fixed mechanical harness policy, then the pipeline's build, fuzz, Eva and ingest, all through the real wrapper. It scores each bug as found, flagged or missed, and each decoy as fired or not. The commands are `python -I poc/phase0/seeded.py run [--project ...]` and `... score <results.json>`; results go to `out/seeded/`. |
 | `run.ps1`, `run.sh` | Run everything in `framac-pipeline:latest`, repository mounted read-only, network off. Results go to `out/` (ignored by git). |
 
 ## Running

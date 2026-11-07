@@ -664,7 +664,21 @@ def extract(target: Path, out: Path, build: str, timeout: int, keep_work: bool =
                     else set(globals_.values())
                 )
             u["entry_points"] = sorted(entries)
-            u.pop("compiles", None)
+            # The unit's preprocessing flags, paths relative to the target root (merged over its files).
+            unit_flags: list[str] = []
+            for c in u.pop("compiles", None) or []:
+                toks = [t.replace(f"{work}/", "") for t in c["flags"]]
+                i = 0
+                while i < len(toks):
+                    tok = toks[i]
+                    if tok in ("-I", "-iquote", "-isystem", "-idirafter") and i + 1 < len(toks):
+                        tok, i = f"{tok}{toks[i + 1]}", i + 1
+                    elif tok in ("-include", "-imacros") and i + 1 < len(toks):
+                        tok, i = f"{tok} {toks[i + 1]}", i + 1
+                    if tok not in unit_flags:
+                        unit_flags.append(tok)
+                    i += 1
+            u["cppflags"] = unit_flags
 
     model["units"] = units
     model["functions"] = dict(sorted(functions.items()))

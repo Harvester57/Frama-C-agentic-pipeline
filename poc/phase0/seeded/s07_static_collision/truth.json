@@ -1,0 +1,25 @@
+{
+  "description": "Frame parser whose static helper at() is buggy in src/frame.c and safe under the same name in src/stats.c",
+  "mechanism": "static_collision",
+  "build": "make",
+  "bugs": [
+    {
+      "id": "S07-1",
+      "mechanism": "static_collision",
+      "file": "src/frame.c",
+      "function": "at",
+      "line": 10,
+      "kind": "mem_access",
+      "trigger": "frame_parse: kind byte 1..4 and header length byte greater than the input length; header_digest runs before the hlen > len check and at() tests i <= n, reading buf[len]"
+    }
+  ],
+  "decoys": [],
+  "entry_points": [
+    "src/frame.c#frame_parse",
+    "src/frame.c#frame_digest",
+    "src/frame.c#frame_kind_name",
+    "src/stats.c#frame_stats",
+    "src/stats.c#frame_payload_sum"
+  ],
+  "lexer_expected": "Bookkeeping/control case. The lexer reports a name collision for 'at' and keeps one record, src/stats.c#at (the safe one): src/frame.c#at disappears from the inventory and header_digest's edge points to stats.c's at. Modules and entry points are still right (frame: frame_parse, frame_digest, frame_kind_name; stats: frame_stats, frame_payload_sum) and the frame harness compiles src/frame.c, so fuzzing should still find S07-1; per-function attribution (Eva/WP results for 'at') is wrong."
+}

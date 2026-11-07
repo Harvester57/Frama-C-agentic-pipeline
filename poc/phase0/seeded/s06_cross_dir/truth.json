@@ -1,0 +1,32 @@
+{
+  "description": "Config message parser in src/ using a base64 decoder and byte helpers in compat/",
+  "mechanism": "cross_dir",
+  "build": "make",
+  "bugs": [
+    {
+      "id": "S06-1",
+      "mechanism": "cross_dir",
+      "file": "compat/b64.c",
+      "function": "b64_decode",
+      "line": 33,
+      "kind": "mem_access",
+      "trigger": "msg_parse or msg_peer_ip: field ip= followed by 8 or more base64 characters; b64_decode checks o >= cap before writing a 3-byte group, so the second group overflows uint8_t ip[4] (stack). Also msg_b64 with 22 or more groups into cap 64 (heap)"
+    }
+  ],
+  "decoys": [
+    {
+      "id": "S06-D1",
+      "kind": "harness_induced",
+      "file": "compat/b64.c",
+      "function": "load_be32",
+      "line": 53,
+      "why": "internal helper (declared in compat/compat.h, not include/), only called on a 4-byte buffer after a successful 4-byte decode; called directly on a short buffer it reads out of bounds"
+    }
+  ],
+  "entry_points": [
+    "src/msg.c#msg_parse",
+    "src/msg.c#msg_peer_ip",
+    "src/msg.c#msg_b64"
+  ],
+  "lexer_expected": "Control case. The lexer resolves the direct call parse_ip -> b64_decode, so module 'msg' has required_sources [compat/b64.c, src/msg.c] and S06-1 is reachable from msg_parse; module 'compat' also exposes b64_decode directly. It offers load_be32 as a 'compat' entry point, whose harness crashes at compat/b64.c:53 (false positive, verified)."
+}

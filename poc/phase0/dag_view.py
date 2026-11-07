@@ -159,6 +159,116 @@ def build_view(model: dict, lexer: dict, harness_modules: list[dict], waves_fn: 
     }
 
 
+def unit_module_name(unit: str) -> str:
+    """A link artifact as a module name usable in Make targets and file names: `lib/libkv.a` -> `libkv_a`."""
+    return "".join(ch if ch.isalnum() else "_" for ch in Path(unit).name).strip("_") or "unit"
+
+
+def build_unit_view(model: dict, waves_fn: Any) -> dict:
+    """
+    The full redesign as a DAG: modules are the build's link units (libraries first), each with its
+    own sources, the sources of the project libraries it links, its flags and its API entry points.
+    Executables keep `main` as their only entry point. Tiers are uniform (Tier 1A): this view tests
+    the inventory, not the tier heuristic.
+    """
+    units = model.get("units") or {}
+    fns = model.get("functions") or {}
+    names = Counter(r["name"] for r in fns.values())
+    key_of = {fid: (r["name"] if names[r["name"]] == 1 else fid) for fid, r in fns.items()}
+    succ: dict[str, set[str]] = defaultdict(set)
+    for e in model.get("edges") or []:
+        if e["caller"] in key_of and e["callee"] in key_of:
+            succ[key_of[e["caller"]]].add(key_of[e["callee"]])
+
+    order = sorted(units, key=lambda u: (units[u].get("kind") != "static_lib", units[u].get("kind") != "shared_lib", u))
+    module_of_file: dict[str, str] = {}
+    for u in order:
+        for f in units[u].get("files") or []:
+            module_of_file.setdefault(f, unit_module_name(u))
+
+    functions: dict[str, dict] = {}
+    for fid, r in sorted(fns.items()):
+        key = key_of[fid]
+        home = module_of_file.get(r["file"]) or unit_module_name((r.get("units") or ["unit"])[0])
+        loops = int(r.get("loops") or 0)
+        functions[key] = {
+            "name": r["name"],
+            "file": r["file"],
+            "module": home,
+            "line": r.get("line", 0),
+            "is_static": bool(r.get("static")),
+            "has_loops": loops > 0,
+            "loop_count": loops,
+            "verifiability": "core_provable",
+            "wp_blockers": [],
+            "wp_notes": [],
+            "security_properties": [],
+            "internal_callees": sorted(succ[key] - {key}),
+            "self_recursive": key in succ[key],
+            "external_callees": [],
+            "callgraph_source": r.get("source", "phase0b"),
+        }
+    for key, rec in functions.items():
+        rec["internal_callers"] = sorted(k for k, s in succ.items() if key in s and k != key)
+    waves, cycles = waves_fn(functions, {k: set(v) for k, v in succ.items()})
+    in_cycle = {f for c in cycles for f in c}
+    for idx, wave in enumerate(waves):
+        for key in wave:
+            functions[key]["wave"] = idx
+            functions[key]["is_recursive"] = key in in_cycle
+
+    modules: dict[str, dict] = {}
+    for u in order:
+        name = unit_module_name(u)
+        if name in modules:
+            continue
+        rec = units[u]
+        sources, seen, stack = list(rec.get("files") or []), {u}, list(rec.get("links") or [])
+        while stack:
+            lk = stack.pop()
+            if lk in seen or lk not in units:
+                continue
+            seen.add(lk)
+            sources += [f for f in units[lk].get("files") or [] if f not in sources]
+            stack += units[lk].get("links") or []
+        members = sorted(k for k, r in functions.items() if r["module"] == name)
+        entry = sorted(key_of[e] for e in rec.get("entry_points") or [] if e in key_of)
+        modules[name] = {
+            "module": name,
+            "unit": u,
+            "kind": rec.get("kind"),
+            "files": sorted(rec.get("files") or []),
+            "required_sources": sources,
+            "cross_module_callees": [],
+            "external_callees": [],
+            "cppflags": list(rec.get("cppflags") or []),
+            "function_count": len(members),
+            "functions": members,
+            "provable_functions": members,
+            "shell_unverifiable_functions": [],
+            "candidate_entry_points": entry,
+            "tier": "Tier 1A (Untrusted Binary / Network Parser)",
+            "recommended_strategy": "RTE + E-ACSL + LibFuzzer -> Module Eva -> Full Wavefront WP + Security Contracts",
+            "run_wp_full": True,
+            "run_eva": True,
+            "run_eacsl_fuzz": True,
+        }
+    return {
+        "target_dir": model.get("target"),
+        "callgraph_source": "phase0b",
+        "total_c_files": len({r["file"] for r in functions.values() if r["file"].endswith(".c")}),
+        "total_functions": len(functions),
+        "total_waves": len(waves),
+        "name_collisions": [],
+        "header_inline_callees": {},
+        "warnings": [],
+        "modules": modules,
+        "waves": [{"wave": i, "count": len(w), "functions": w} for i, w in enumerate(waves)],
+        "recursion_cycles": cycles,
+        "functions": functions,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="phase0b model -> callgraph_dag.json (A/B view)")
     p.add_argument("--model", type=Path, required=True)
