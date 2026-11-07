@@ -511,6 +511,7 @@ def test_cache_mount_mode_allowlist_is_exact(monkeypatch):
     s = "python3 /opt/framac-pipeline/scripts"
     for cmd in (
         f"{s}/pipeline_make.py run build",
+        f"{s}/pipeline_make.py build-check",
         f"{s}/pipeline_make.py run eva",
         f"{s}/pipeline_make.py run wp-sweep",
         f"{s}/cache.py gc",
@@ -521,6 +522,7 @@ def test_cache_mount_mode_allowlist_is_exact(monkeypatch):
         assert R.cache_mount_mode(cmd, False) == "ro", cmd
     for cmd in (
         f"{s}/pipeline_make.py run build eva",
+        f"{s}/pipeline_make.py build-check; touch x",
         f"{s}/pipeline_make.py run fuzz",
         f"{s}/cache.py gc; rm -rf /",
         f"{s}/cache.py gc && touch x",
@@ -1514,6 +1516,13 @@ def test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name():
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py replay --module build") == "replay"
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py selftest --module build") == "selftest"
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py build --module build") == "build"
+
+
+def test_infer_class_sizes_build_check_like_run_build():
+    # build-check runs `run build`; as `light` (1 GiB) Frama-C was killed instrumenting CryptoLib's crypto.
+    for cmd in ("python3 $S/pipeline_make.py build-check", "python3 $S/pipeline_make.py --run-dir . build-check"):
+        assert R.infer_class(cmd) == R.infer_class("python3 $S/pipeline_make.py run build") == "phase-static", cmd
+    assert R.infer_class("python3 $S/pipeline_make.py gen") == "light"
 
 
 def test_exec_auto_downgrades_cache_mode_when_target_code_lease_is_active_on_run_dir(

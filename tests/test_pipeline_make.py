@@ -1378,6 +1378,34 @@ def test_build_check_fails_on_an_eacsl_fallback_and_names_the_error(tmp_path):
     out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
     assert out["ok"] is True and out["modules"]["log"]["status"] == "sanitizers_chosen"
 
+
+def test_build_check_names_the_error_of_the_attempt_that_failed_last(tmp_path):
+    # CryptoLib's crypto: the first attempt's unknown -rte-select name was dropped by the retry, which
+    # then died without a message (out of memory). Reporting the first error hid the real cause.
+    run = _make_run(tmp_path)
+    for mod in ("cfg", "snmp"):
+        _build_report(run, mod, "eacsl")
+    log = (
+        "Command: e-acsl-gcc -F -rte-select a,mc_log x.c\nReturncode: 1\n--- STDOUT ---\n"
+        "[rte] User Error: incorrect argument for option -rte-select (no function 'mc_log').\n"
+        "--- STDERR ---\ne-acsl-gcc: fatal error: aborted by Frama-C\n"
+        "Command: e-acsl-gcc -F -rte-select a x.c\nReturncode: 1\n--- STDOUT ---\n"
+        "[rte:annot] annotating function a\n--- STDERR ---\ne-acsl-gcc: fatal error: aborted by Frama-C\n"
+    )
+    _build_report(run, "log", "sanitizers", log_text=log)
+    first = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)["modules"]["log"]
+    assert "mc_log" not in first["first_error"]
+    assert "aborted by Frama-C" in first["first_error"] and "lack of memory" in first["first_error"]
+
+    # A real error in the last attempt is reported as it is; an attempt that succeeded is skipped.
+    log = (
+        "Command: e-acsl-gcc x.c\nReturncode: 1\n--- STDOUT ---\nx.c:3: User Error: bad\n"
+        "Command: clang x.c\nReturncode: 0\n--- STDOUT ---\nwarning: error: in a comment\n"
+    )
+    _build_report(run, "log", "sanitizers", log_text=log)
+    first = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)["modules"]["log"]
+    assert first["first_error"].startswith("x.c:3: User Error: bad") and "memory" not in first["first_error"]
+
     _build_report(run, "cfg", "eacsl", returncode=1)
     assert pm.build_check(run, runner=lambda t, r: (2, {}), templates_dir=ACSL)["modules"]["cfg"]["status"] == (
         "build_failed"

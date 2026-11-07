@@ -1915,16 +1915,32 @@ BUILD_CHECK_JSON = "workspace/reports/build_check.json"
 _BUILD_ERROR_RE = re.compile(r"User Error|\berror:|Fatal error", re.IGNORECASE)
 
 
+_SILENT_ABORT_RE = re.compile(r"aborted by Frama-C", re.IGNORECASE)
+
+
 def _first_build_error(log_path: Path) -> str | None:
-    """The first error line of a compile log and the two lines after it, or None."""
+    """
+    The first error line of the compile log's last failed command and the two lines after it, or None.
+
+    The log holds one `Command:` section per attempt. An earlier attempt's error can be one the
+    build already recovered from (the retry that drops unknown -rte-select names), so only the
+    attempt that failed last explains the fallback. When Frama-C stopped there without a message of
+    its own, it was most likely killed (out of memory), and the excerpt says so.
+    """
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return None
-    for i, line in enumerate(lines):
+    starts = [i for i, line in enumerate(lines) if line.startswith("Command: ")] or [0]
+    sections = [lines[a:b] for a, b in zip(starts, [*starts[1:], len(lines)], strict=True)]
+    failed = [s for s in sections if not any(line.strip() == "Returncode: 0" for line in s[:3])]
+    section = (failed or sections)[-1]
+    for i, line in enumerate(section):
         if _BUILD_ERROR_RE.search(line):
-            excerpt = " ".join(s.strip() for s in lines[i : i + 3] if s.strip())
-            return excerpt[:400]
+            excerpt = " ".join(s.strip() for s in section[i : i + 3] if s.strip())[:400]
+            if _SILENT_ABORT_RE.search(line):
+                excerpt += " (Frama-C stopped without an error message: most likely killed for lack of memory)"
+            return excerpt
     return None
 
 

@@ -1485,6 +1485,8 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?selftest(?:\s|$)", "selftest"),
     (r"run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", "build"),
     (r"pipeline_make\.py\s+(?:\S+\s+)*?sweep(?:\s|$)", "phase-static"),
+    # build-check runs `run build` (E-ACSL instrumentation of whole modules), so it is sized like it.
+    (r"pipeline_make\.py\s+(?:\S+\s+)*?build-check(?:\s|$)", "phase-static"),
     (r"build_callgraph_dag\.py\b", "eva"),
     (r"extract_references\.py\b", "build"),
     # The target's own build under the sandbox (bear -- make, cmake, ninja ...): target code, sized like a phase.
@@ -1655,6 +1657,7 @@ def infer_class(cmd: str, base_dir: Path | str | None = None) -> str:
 CACHE_RW_ALLOWLIST: frozenset[tuple[str, ...]] = frozenset(
     {
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "build"),
+        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "build-check"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "eva"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "eva-tune"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "facts"),
