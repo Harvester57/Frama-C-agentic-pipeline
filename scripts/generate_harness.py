@@ -47,6 +47,7 @@ VALID_ENTRY_STYLES = (
     "custom",
     "auto_prototype",
     "argv",
+    "dispatch",
 )
 _WORKSPACE_PREFIXES = (
     "/framac-run/workspace/work/",
@@ -737,6 +738,29 @@ def _build_auto_prototype_invocations(
     return eva_stmt, fuzz_stmt, needs_null_terminate
 
 
+def _build_dispatch_invocation(cases: list[str]) -> str:
+    """
+    One harness that drives several API calls: the first input byte selects a case and the
+    rest of the input is the case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one
+    analysis covers every case. Cases must not `return` (the fuzz side frees its buffer after).
+    """
+    stmts = [c.strip() for c in cases if c and c.strip()]
+    if not stmts:
+        raise ValueError("entry_style 'dispatch' requires at least one --dispatch-case")
+    # Joined with a newline plus 4 spaces under the template's indent, so nested lines carry 4 more.
+    lines = [
+        "if (fuzz_len > 0) {",
+        "    uint8_t harness_selector = fuzz_buf[0];",
+        "    fuzz_buf += 1;",
+        "    fuzz_len -= 1;",
+        f"    switch (harness_selector % {len(stmts)}U) {{",
+    ]
+    for i, stmt in enumerate(stmts):
+        lines.append(f"    case {i}U: {{ {stmt} }} break;")
+    lines += ["    default: break;", "    }", "}"]
+    return "\n    ".join(lines)
+
+
 def _build_invocations(
     entry_fn: str,
     entry_style: str,
@@ -748,7 +772,13 @@ def _build_invocations(
     fuzz_expr: str | None = None,
     null_terminate: bool = False,
     auto_params: list[dict[str, Any]] | None = None,
+    dispatch_cases: list[str] | None = None,
 ) -> tuple[str, str]:
+    if entry_style == "dispatch":
+        stmt = _build_dispatch_invocation(dispatch_cases or [])
+        if null_terminate:
+            return _wrap_null_terminated(stmt, stmt)
+        return stmt, stmt
     if entry_style == "auto_prototype":
         eva_stmt, fuzz_stmt, auto_nt = _build_auto_prototype_invocations(entry_fn, auto_params or [])
         if null_terminate or auto_nt:
@@ -1354,6 +1384,7 @@ def generate_module_harness(
     prelude_clang: str | None = None,
     prelude_runner: Callable[..., Any] | None = None,
     ldflags: str = "",
+    dispatch_cases: list[str] | None = None,
 ) -> dict[str, Any]:
     if auto_args:
         entry_style = "auto_prototype"
@@ -1454,8 +1485,10 @@ def generate_module_harness(
         fuzz_expr=fuzz_expr,
         null_terminate=effective_null_terminate,
         auto_params=auto_params,
+        dispatch_cases=dispatch_cases,
     )
-    arity_expr = call_expr or eva_expr or fuzz_expr
+    norm_dispatch_cases = [c.strip() for c in dispatch_cases or [] if c and c.strip()]
+    arity_expr = call_expr or eva_expr or fuzz_expr or " ".join(norm_dispatch_cases)
     if arity_expr:
         _validate_call_expr_arity(entry_fn, arity_expr, sources, norm_cppflags)
     sources = _merge_dag_harness_sources(
@@ -1466,6 +1499,7 @@ def generate_module_harness(
         call_expr,
         eva_expr,
         fuzz_expr,
+        *norm_dispatch_cases,
     )
 
     inc_lines: list[str] = []
@@ -1580,6 +1614,9 @@ def generate_module_harness(
         repair_attempts = 0
     repair_history = previous.get("repair_history")
     repair_history = list(repair_history) if isinstance(repair_history, list) else []
+    # Gaps accepted at the reachability gate (harness_reach.py exempt) survive regeneration too.
+    reach_exempt = previous.get("reach_exempt")
+    reach_exempt = dict(reach_exempt) if isinstance(reach_exempt, dict) else {}
 
     sidecar = {
         "module": module_name,
@@ -1602,6 +1639,7 @@ def generate_module_harness(
         "call_expr": call_expr,
         "eva_expr": eva_expr,
         "fuzz_expr": fuzz_expr,
+        "dispatch_cases": norm_dispatch_cases if entry_style == "dispatch" else [],
         "include_source": include_source,
         "stubbed_callees": sorted(set(stubbed_callees or [])),
         "reachability": reachability,
@@ -1610,6 +1648,7 @@ def generate_module_harness(
         "repair_attempts": repair_attempts,
         "max_repair_attempts": MAX_HARNESS_REPAIR_ATTEMPTS,
         "repair_history": repair_history,
+        "reach_exempt": reach_exempt,
         **prelude_fields,
     }
     atomic_write_json(harness_meta_file, sidecar)
@@ -1699,7 +1738,7 @@ def main(argv: list[str] | None = None) -> int:
         "--entry-style",
         choices=list(VALID_ENTRY_STYLES),
         default="buffer_len",
-        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, auto_prototype, or argv (CLI main(argc, argv); defaults automatically when --entry-fn is main)",
+        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, auto_prototype, argv (CLI main(argc, argv); defaults automatically when --entry-fn is main), or dispatch (first input byte selects one of the --dispatch-case statements)",
     )
     parser.add_argument(
         "--auto-args",
@@ -1749,6 +1788,15 @@ def main(argv: list[str] | None = None) -> int:
         "--fuzz-expr",
         default=None,
         help="Custom LibFuzzer invocation statements (overrides --call-expr for LLVMFuzzerTestOneInput)",
+    )
+    parser.add_argument(
+        "--dispatch-case",
+        action="append",
+        default=[],
+        help=(
+            "One API-call case for --entry-style=dispatch (repeatable): C statements using fuzz_buf and "
+            "fuzz_len (the input after the selector byte); must respect the callee's contract and never return"
+        ),
     )
     parser.add_argument(
         "--null-terminate", action="store_true", help="Guarantee fuzz_buf is NUL-terminated in both Eva and LibFuzzer"
@@ -1826,6 +1874,7 @@ def main(argv: list[str] | None = None) -> int:
             auto_args=args.auto_args,
             auto_prelude=args.auto_prelude,
             ldflags=args.ldflags,
+            dispatch_cases=args.dispatch_case,
         )
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

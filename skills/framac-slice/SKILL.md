@@ -98,7 +98,7 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 
 ```text
-python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom|argv> [--auto-args] [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
+python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom|argv|dispatch> [--auto-args] [--dispatch-case '<stmts>']... [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
 ```
 
 The sidecar `harness_<mod>.json` is the single source of truth for later phases: `sources`, `cppflags`, `ldflags`, `include_source`. `pipeline_make.py gen` builds every module's fuzz, Eva and build recipes from it, so put the module's real link flags in `--ldflags` here rather than on later command lines. Flags outside the build allowlist (for example `-fplugin`, `-B`, `-fuse-ld`, `-Wl,`) exclude the module from the Make phases. `gen` reports them.
@@ -112,6 +112,7 @@ Supported `--entry-style` modes and options in `generate_harness.py`:
 - `auto_prototype` (or `--auto-args`): inspects the C declaration of `--entry-fn` in `--header` or `--sources`, automatically synthesizes Eva (`Frama_C_make_unknown`) and LibFuzzer (`fuzz_buf + fuzz_off`) argument unpacking for arbitrary multi-argument internal functions (buffer+length pairs, C strings, output buffers, pointers, and scalars), and defaults `reachability` to `internal_api`.
 - `custom`: executes arbitrary C statements passed via `--call-expr '<stmts using fuzz_buf and fuzz_len>'` (or separate `--eva-expr` and `--fuzz-expr`), with optional `--null-terminate` and repeatable `--extra-include <hdr.h>`.
 - `argv`: CLI-style targets whose entry is `main(int argc, char **argv)` — the default when `--entry-fn main` is given without an explicit `--entry-style`. Eva side emulates `argc`/`argv` with `Frama_C_interval(0, 5)` and five unknown 256-byte buffers (upstream `share/libc/eva_stubs.c`, vendored as `docs/upstream/sources/eva_stubs.c`); the LibFuzzer side passes the input as `argv[1]` NUL-terminated. The sidecar `cppflags` get `-Dmain=__framac_target_main`, renaming the target's `main` in every build so libFuzzer's own `main` does not clash at link time.
+- `dispatch`: one harness for an API library with many entry points. Each repeatable `--dispatch-case '<stmts>'` drives one API call; the first input byte selects the case and the rest of the input is that case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one analysis covers every case. Each case must build its arguments within the callee's contract (for a builder: a real buffer, its real size as `buflen`, and the setup calls the API documents, such as writing the message header first) and must never `return`. Pass the module's main parser as `--entry-fn`. The sidecar records the cases in `dispatch_cases`.
 - Note: Passing a workspace path like `--header workspace/work/src/Mod/Mod.h` automatically adds `-Iworkspace/work/src/Mod` to `cppflags` and emits `#include "Mod.h"`.
 - If `entry_fn` is `static` inside its `.c` file, pass `--include-source` so the harness includes the `.c` translation unit directly instead of compiling it twice.
 - If a dynamic LibFuzzer binary cannot link an external third-party library symbol at link time, pass `--stubbed-callee <fn>` so it is recorded in `harness_<mod>.json` (`stubbed_callees`) and any linker stub is guarded by `#ifndef __FRAMAC__`.
@@ -125,6 +126,24 @@ Module headers are often not self-sufficient (for example `Events.h` uses `Boole
 - Never define `LLVMFuzzerInitialize` in a harness, including in `custom` statements. E-ACSL builds link `templates/eacsl_runtime/fuzz_init.c`, which defines it to initialize the E-ACSL runtime; a second definition is refused with `eacsl_init_hook_conflict`.
 
 The harness must respect the entry function's declared or documented contract (buffer sizes, non-NULL arguments, length limits). A crash caused by a harness that violates that contract is `rejected` as harness-induced, so get this right before fuzzing. Verify that every generated harness parses cleanly with the Frama-C kernel (`frama-c -machdep gcc_x86_64 ... -kernel-warn-key annot-error=abort`).
+
+### Step 4b — Harness Reachability Gate
+
+A harness that calls one entry point leaves the rest of the module's API unexercised: Phase 1 never fuzzes it, Phase 2 marks it dead (`harness gap`), and Phase 3 breakers cannot reach it. Gate every harness before seeding the ledger:
+
+```text
+python3 /opt/framac-pipeline/scripts/harness_reach.py check
+```
+
+It reads `workspace/reports/callgraph_dag.json` and each `harness_<mod>.json` / `harness_<mod>.c`, takes the DAG functions the harness names (directly, through a header macro such as a `for_each` iterator, or through a header `static inline` wrapper) and their transitive in-repo callees, and checks that every `candidate_entry_points` function of the module is reached. A Tier 1A/1B/2 module without a harness fails with `no_harness`. The report goes to `workspace/reports/harness_reach.json`; exit code 1 means a gap.
+
+For each module with `gaps`:
+
+1. Regenerate its harness with `--entry-style dispatch`, one `--dispatch-case` per unreached entry point (several related calls may share a case, for example building a message then parsing it). Keep the existing parser call as a case. Do not cover a gap by violating a callee's contract: a crash from such a case is `rejected` as harness-induced.
+2. Re-run `harness_reach.py check`.
+3. An entry point that cannot be driven from bytes (it needs a live kernel socket, a real file descriptor, or a process-global the harness cannot set up safely) gets a recorded reason instead: `harness_reach.py exempt --module <mod> --function <fn> --reason '<why>'`. A Tier 1A/1B/2 module that needs no harness at all (example programs, test drivers) gets `harness_reach.py exempt --module <mod> --reason '<why>'`. Exemptions survive harness regeneration. Never exempt an entry point only because writing its case is tedious.
+
+Move on only when `check` exits 0. Its `exempt` entries are the accepted, documented gaps.
 
 ---
 

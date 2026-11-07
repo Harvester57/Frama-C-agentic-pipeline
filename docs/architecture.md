@@ -33,7 +33,9 @@ flowchart TD
 
     subgraph P1["Phase 1: Zero-ACSL Dynamic Triage (/framac-fuzz)"]
         M1 & M2 & M3 --> F["Generate Dual Harness (generate_harness.py)<br/>LLVMFuzzerTestOneInput + eva_main"]
-        F --> G["RTE + E-ACSL two-stage build, -fsanitize=fuzzer<br/>(run_eacsl_fuzz.py campaign)"]
+        F --> FR{"Reachability Gate (harness_reach.py)<br/>every DAG entry point reached or exempted?"}
+        FR -- "No: add dispatch cases" --> F
+        FR -- "Yes" --> G["RTE + E-ACSL two-stage build, -fsanitize=fuzzer<br/>(run_eacsl_fuzz.py campaign)"]
         G --> H{"Runtime Crash /<br/>RTE Triggered?"}
         H -- "Yes (True Bug)" --> I["Emit Concrete Crash Reproducer<br/>& Exclude Broken Function from Proof Queue"]
     end
