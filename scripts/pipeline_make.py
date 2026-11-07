@@ -1909,6 +1909,86 @@ def sweep(
 # ---------------------------------------------------------------------------
 
 
+BUILD_CHECK_JSON = "workspace/reports/build_check.json"
+_BUILD_ERROR_RE = re.compile(r"User Error|\berror:|Fatal error", re.IGNORECASE)
+
+
+def _first_build_error(log_path: Path) -> str | None:
+    """The first error line of a compile log and the two lines after it, or None."""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for i, line in enumerate(lines):
+        if _BUILD_ERROR_RE.search(line):
+            excerpt = " ".join(s.strip() for s in lines[i : i + 3] if s.strip())
+            return excerpt[:400]
+    return None
+
+
+def build_check(
+    run_dir: Path | str = ".",
+    runner: Callable[..., tuple[int, Any]] | None = None,
+    templates_dir: Path | str | None = None,
+) -> dict:
+    """
+    Phase 0 gate: build every fuzzed module (`run build`) and require the E-ACSL engine.
+
+    A module whose build fell back to ASan/UBSan, or failed, fails the check with the first
+    compiler error of its E-ACSL attempt. Fuzzing it would lose the E-ACSL checks without anyone
+    deciding so. A module whose `fuzz_engine` param is `sanitizers` passes: that is a recorded choice
+    (`params set --module M --fuzz-engine sanitizers`). Writes workspace/reports/build_check.json.
+    """
+    run_dir = Path(run_dir)
+    plan = build_plan(run_dir, templates_dir)
+    modules = [plan.modules[name] for name in plan.fuzz_modules]
+    build_rc, _ = (runner or run_targets)(["build"], run_dir)
+    results: dict[str, dict] = {}
+    for mod in sorted(modules, key=lambda m: m.name):
+        chosen = str(mod.params.get("fuzz_engine") or "auto")
+        entry: dict[str, Any] = {"fuzz_engine": chosen}
+        report_path = run_dir / BUILD_DIR / f"{mod.name}.build.json"
+        try:
+            report = load_json_optional(report_path, None)
+        except ArtifactError as exc:
+            report = None
+            entry["error"] = str(exc)
+        if not isinstance(report, dict):
+            entry.update({"status": "not_built", "ok": False})
+            results[mod.name] = entry
+            continue
+        engine = report.get("engine_used")
+        entry["engine_used"] = engine
+        compiled = (report.get("compile") or {}).get("returncode") == 0
+        if not compiled:
+            entry["status"] = "build_failed"
+        elif engine == "eacsl":
+            entry["status"] = "eacsl"
+        elif chosen == "sanitizers":
+            entry["status"] = "sanitizers_chosen"
+        else:
+            entry["status"] = "eacsl_fallback"
+            entry["fallback_reason"] = report.get("engine_fallback_reason")
+        entry["ok"] = entry["status"] in ("eacsl", "sanitizers_chosen")
+        if not entry["ok"]:
+            attempt = report.get("eacsl_compile_attempt") or report.get("compile") or {}
+            log = attempt.get("compile_log")
+            if log:
+                entry["compile_log"] = log
+                entry["first_error"] = _first_build_error(run_dir / log)
+        results[mod.name] = entry
+    out = {
+        "ok": bool(results) and all(r["ok"] for r in results.values()),
+        "build_returncode": build_rc,
+        "modules": results,
+        "generated_at": utc_now(),
+    }
+    if not results:
+        out["error"] = "no fuzzed module in the plan: run `pipeline_make.py gen` first"
+    atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
+    return out
+
+
 def _normalize_flag_args(argv: list[str]) -> list[str]:
     """`--fuzz-dict -x` would be read as an option by argparse: bind such values with `=`."""
     from framac_common import normalize_flag_args
@@ -2017,6 +2097,10 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--jobs", type=int, default=None, help="Override make -j (default: this container's CPUs)")
     p_ing = sub.add_parser("ingest", help="Ingest new fuzz/Eva reports (fuzz first), then validate")
     p_ing.add_argument("--module", default=None)
+    sub.add_parser(
+        "build-check",
+        help="Phase 0: build every fuzzed module and fail unless E-ACSL instrumented it (or sanitizers were chosen)",
+    )
     sub.add_parser("sweep-list", help="WP-covered proof units of the ledger, as (file, function)")
     p_sweep = sub.add_parser("sweep", help="Trusted re-proof of the sweep list without the per-run WP cache")
     p_sweep.add_argument("--jobs", type=int, default=None)
@@ -2056,6 +2140,9 @@ def main(argv: list[str] | None = None) -> int:
             rc, out = run_targets(args.targets, run_dir, jobs=args.jobs)
         elif args.cmd == "ingest":
             out = ingest(run_dir, args.module)
+            rc = 0 if out["ok"] else 1
+        elif args.cmd == "build-check":
+            out = build_check(run_dir)
             rc = 0 if out["ok"] else 1
         elif args.cmd == "sweep-list":
             entries, skipped = sweep_list(run_dir)

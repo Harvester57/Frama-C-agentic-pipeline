@@ -157,6 +157,9 @@ python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
 python3 /opt/framac-pipeline/scripts/checkpoint.py init state --target /target   # keeps an existing progress file
 python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json
 python3 /opt/framac-pipeline/scripts/pipeline_make.py gen
+python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check
 ```
 
 `pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`). Check its JSON for modules excluded with a reason before moving on.
+
+`pipeline_make.py build-check` builds every fuzzed module (`run build`, cached, so Phase 1 reuses it) and exits 1 unless each one was instrumented with E-ACSL. The Frama-C kernel parse in Step 4 uses Frama-C's own libc, but the E-ACSL build runs with `-no-frama-c-stdlib` against the host headers, so a harness can pass Step 4 and still fall back to ASan/UBSan, losing the E-ACSL checks. For each failing module, `workspace/reports/build_check.json` gives `status` (`eacsl_fallback`, `build_failed`, `not_built`), the `compile_log`, and its `first_error`. Fix the cause (usually a host header Frama-C cannot parse: put a minimal stub under `workspace/harnesses/include/` on the sidecar's `-I` path, ahead of `-idirafter /usr/include`), regenerate the harness, and rerun. Only when E-ACSL cannot work for the module, record that choice with `pipeline_make.py params set --module <mod> --fuzz-engine sanitizers`, which the check accepts.

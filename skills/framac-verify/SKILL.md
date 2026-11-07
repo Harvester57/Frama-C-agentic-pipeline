@@ -98,6 +98,7 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 Execute `skills/framac-slice/SKILL.md`:
 - It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`).
 - It gates every harness on reachability (`harness_reach.py check`): each module's DAG entry points must be reached, or exempted with a recorded reason, before the ledger is seeded.
+- It requires every fuzzed module to build with E-ACSL (`pipeline_make.py build-check`), unless `--fuzz-engine sanitizers` was chosen for that module, so Phase 1 never falls back to ASan/UBSan silently.
 - It ends with `ledger.py seed`, which creates one unit per function × obligation class. Tier 3 and out-of-scope work is seeded `deferred` / `out_of_scope` with reasons.
 - Then `pipeline_make.py gen` writes the Makefile for the next phases.
 

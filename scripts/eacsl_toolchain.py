@@ -39,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import resolve_fc_stubs_dir  # noqa: E402
 
-EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double")
+# Frama-C has no 128-bit integer type, and host headers such as <linux/types.h> declare
+# `__int128` typedefs only when the compiler predefines __SIZEOF_INT128__.
+EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double", "-U__SIZEOF_INT128__")
 EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-function-declaration")
 # Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
 # leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full

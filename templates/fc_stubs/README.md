@@ -47,3 +47,8 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   the real function when it can; otherwise the call fails with `ENOSYS`, which is recorded in
   `variadic_fallbacks` as a coverage caveat. Never add those definitions to the instrumented
   sources: each definition shifts the fallback numbering.
+- Host headers can use compiler types Frama-C rejects. The E-ACSL frontend therefore gets
+  `-U__SIZEOF_INT128__` (`EACSL_DEFINES`), so `<linux/types.h>` skips its `__int128` typedefs.
+- [`./errno.h`](./errno.h) maps `errno` to a tracked global under `__FRAMAC_EACSL__` only:
+  glibc's thread-local errno is not E-ACSL-tracked memory, so every `errno = ...` would abort the
+  runtime. errno values set by the real libc are not visible through it.

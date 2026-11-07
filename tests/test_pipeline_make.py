@@ -1324,3 +1324,57 @@ def test_sweep_propagates_wp_extra_sources(tmp_path):
     assert "--extra-sources" in ber
     idx = ber.index("--extra-sources")
     assert ber[idx + 1 : idx + 3] == ["src/snmp/util.c", "src/snmp/helper.c"]
+
+
+# ---------------------------------------------------------------------------
+# build-check
+# ---------------------------------------------------------------------------
+
+
+def _build_report(run: Path, mod: str, engine: str, returncode: int = 0, log_text: str | None = None) -> None:
+    report: dict[str, Any] = {
+        "mode": "build",
+        "module": mod,
+        "engine_used": engine,
+        "compile": {"returncode": returncode},
+    }
+    if engine != "eacsl":
+        log = f"workspace/harnesses/fuzz_{mod}.compile.log"
+        (run / log).write_text(log_text or "", encoding="utf-8")
+        report["engine_fallback_reason"] = "eacsl_instrumentation_failed"
+        report["eacsl_compile_attempt"] = {"returncode": 1, "compile_log": log}
+    write_json(run / pm.BUILD_DIR / f"{mod}.build.json", report)
+
+
+def test_build_check_fails_on_an_eacsl_fallback_and_names_the_error(tmp_path):
+    run = _make_run(tmp_path)
+    calls: list[list[str]] = []
+    _build_report(run, "cfg", "eacsl")
+    _build_report(
+        run,
+        "log",
+        "sanitizers",
+        log_text="[kernel] warning: x\n[kernel] /usr/include/linux/types.h:12: User Error: \n  signed __int128\nmore\n",
+    )
+    # snmp has no build report.
+
+    out = pm.build_check(run, runner=lambda targets, run_dir: calls.append(targets) or (0, {}), templates_dir=ACSL)
+    assert calls == [["build"]]
+    assert out["ok"] is False
+    mods = out["modules"]
+    assert mods["cfg"]["status"] == "eacsl" and mods["cfg"]["ok"] is True
+    assert mods["log"]["status"] == "eacsl_fallback"
+    assert "linux/types.h:12: User Error" in mods["log"]["first_error"] and "__int128" in mods["log"]["first_error"]
+    assert mods["snmp"]["status"] == "not_built"
+    assert json.loads((run / pm.BUILD_CHECK_JSON).read_text(encoding="utf-8"))["ok"] is False
+
+    # Choosing sanitizers for a module is a recorded decision, so it passes.
+    _build_report(run, "snmp", "eacsl")
+    pm.params_set(run, "log", fuzz_engine="sanitizers")
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    assert out["ok"] is True and out["modules"]["log"]["status"] == "sanitizers_chosen"
+
+    _build_report(run, "cfg", "eacsl", returncode=1)
+    assert pm.build_check(run, runner=lambda t, r: (2, {}), templates_dir=ACSL)["modules"]["cfg"]["status"] == (
+        "build_failed"
+    )
