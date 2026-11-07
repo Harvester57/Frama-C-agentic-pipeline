@@ -17,13 +17,14 @@ Revised on 2026-11-07 after a review against the code:
   - concurrency in the report;
   - a size estimate per step.
 - **CodeQL:** later the same day, it moved to its own image, keeping the main image free of it.
+- **Two images:** a build image runs the target's build and tests. The Frama-C image runs everything else and no longer needs target packages: it uses a snapshot of the target's headers and libraries exported by the build. The new step I3b does the switch. The monolith stays until I10.
 
 ## Decisions (2026-11-07)
 
 | Question | Decision |
 | :--- | :--- |
 | How the work lands | Everything stays on `phase0-redesign` and merges to `main` once, at the end. `main` is merged into the branch at the start of each step, starting with `156adfa`. |
-| Image dependencies | MetAcsl and `strace` go into the main image. CodeQL gets its own image (`framac-codeql`), off by default and never part of the main image, because of its licence and size. |
+| Images | Two images on a common base (same Debian release, same gcc), defined in one multi-stage Dockerfile. **Build image:** build systems, `bear`, `strace`, common `-dev` libraries, and per-target packages through small derived images. It runs the target's own build and its tests. **Frama-C image:** Frama-C, MetAcsl, the provers, and the compilers instrumented builds need (gcc, clang, libFuzzer), with no target packages. It runs everything else: parse, Eva, WP, E-ACSL and sanitizer builds, fuzzing, replay, coverage. **Snapshot:** the target's headers and libraries reach the Frama-C image through a snapshot the build exports. **CodeQL** gets its own image derived from the build image, off by default. The monolithic image stays until I10. |
 | Target does not build | Phase 0 **stops**. It records `needs_build_recipe` with diagnostics, and the parent agent asks the user for a build command, packages or flags. There is no inventory from the lexer. |
 | Frama-C cannot parse a unit | The GCC call-graph fallback runs, flagged in the ledger and the report. Fuzzing with sanitizers still runs; Eva and WP on that unit are reported blocked. Phase 0 stops only if no unit parses. |
 | The lexer | Deleted at the end. `build_callgraph_dag.py` keeps only the DAG-view writer. |
@@ -62,19 +63,23 @@ Defaults taken where nothing was asked (open to change):
   - merge `main` (`156adfa`) into `phase0-redesign`;
   - copy `poc/phase0/reproducers/` and `poc/phase0/seeded/` to `tests/fixtures/phase0/`;
   - add a pytest helper that runs a fixture through Docker (skipped when Docker is absent);
-  - **image:**
-    - add `strace`;
-    - **CodeQL image** (`Dockerfile.codeql`, tag `framac-codeql`):
-      - built `FROM` the main image, adding the CodeQL CLI and the C/C++ query packs at pinned versions;
-      - CodeQL extracts C by tracing the build, so it needs the same compilers, build recipe and target packages; building it `FROM` the main image keeps those identical, while the main image itself never contains CodeQL;
-      - it runs through the existing wrapper with `-Image` / `FRAMAC_DOCKER_IMAGE`, with the same mounts, hardening and disabled network;
-      - unused until I7;
-    - **MetAcsl feasibility test:** build the release that targets Frama-C 34, or the development branch, against the image's `34.0~~dev` kernel, and run it on a 20-line example through WP and E-ACSL. Record go or no-go for I9;
+  - **images**, as stages of one multi-stage Dockerfile, while the monolithic image stays the default:
+    - **base:** Debian release, gcc, Python, the hardening user;
+    - **build image** (`framac-build`): base plus make, CMake, Meson, Ninja, `bear`, `strace`, `pkg-config` and a set of common `-dev` libraries;
+    - **Frama-C image** (`framac-analysis`): base plus Frama-C, the provers, clang and libFuzzer, without build systems or target packages;
+    - check that both report the same `gcc -dumpfullversion` and the same glibc;
+  - **CodeQL image** (`Dockerfile.codeql`, tag `framac-codeql`):
+    - built `FROM` the build image, adding the CodeQL CLI and the C/C++ query packs at pinned versions;
+    - CodeQL extracts C by tracing the build, so it needs exactly what the build image has, and neither the main image nor the Frama-C image ever contains it;
+    - it runs through the existing wrapper with `-Image` / `FRAMAC_DOCKER_IMAGE`, with the same mounts, hardening and disabled network;
+    - unused until I7;
+    - **MetAcsl feasibility test,** in the Frama-C image: build the release that targets Frama-C 34, or the development branch, against the image's `34.0~~dev` kernel, and run it on a 20-line example through WP and E-ACSL. Record go or no-go for I9;
   - record a branch benchmark baseline with qcbor-dev included, now that it passes Phase 0.
 - **Owns:** `Dockerfile`, `Dockerfile.codeql`, `tests/fixtures/phase0/`, `tests/conftest.py` helpers, `benchmark/baselines/`.
 - **Acceptance:**
-  - the main image builds and contains no CodeQL;
-  - the CodeQL image builds from it and answers `codeql version`;
+  - the monolithic, build and Frama-C images build, with identical gcc and glibc in the last two;
+  - no image other than the CodeQL image contains CodeQL;
+  - the CodeQL image builds from the build image and answers `codeql version`;
   - the MetAcsl result is recorded in this file;
   - the suite passes, and the baseline covers all 10 targets.
 
@@ -104,19 +109,24 @@ Defaults taken where nothing was asked (open to change):
     - `run-metadata.json` gets a `build` block: command, packages, environment, working directory, and the test command used in I6;
     - it is set by the user, or proposed by the agent and confirmed by the user;
     - the checkpoint records `needs_build_recipe`, so a resumed run starts again at the capture.
-  - **`scripts/build_capture.py`,** promoted from `phase0b.py`'s capture code:
-    - runs the build under `bear intercept` in a scratch copy, through `sandbox_exec.py` (`phase-dynamic`);
+  - **`scripts/build_capture.py`,** promoted from `phase0b.py`'s capture code, runs in the **build image**. It:
+    - runs the build under `bear intercept` in a scratch copy on a per-run named Docker volume, through `sandbox_exec.py` (`phase-dynamic`). A named volume, not a host bind mount, because file I/O on a Windows/OneDrive mount made the PoC's QCBOR extraction 7× slower;
     - parses compile, link and archive steps;
     - drops build-system probes;
     - derives link units, marks test units, and reads per-file flags (`-I -D -U -include -imacros -iquote -isystem -std`);
-    - takes exports from `nm -D` and version scripts, and public headers from `make install DESTDIR=` with a fallback to headers outside the source directories.
-  - **Output:** `workspace/reports/build_capture.json`, with a schema.
+    - takes exports from `nm -D` and version scripts, and public headers from `make install DESTDIR=` with a fallback to headers outside the source directories;
+    - **exports a snapshot** of what the analysis side needs from the target's environment, with a digest:
+      - **headers:** every header the compiler's dependency lists (`gcc -M`) name outside the project and outside libc. libc headers are told apart with `dpkg -S` (`libc6-dev`, `linux-libc-dev`), because Frama-C's own libc replaces them;
+      - **libraries:** the static and shared libraries the link steps resolved (`-l` through `gcc -print-file-name`), plus the shared libraries those need (`ldd` on the built artifacts);
+      - **generated headers** (`config.h` from configure or CMake) stay in the build tree on the volume.
+  - **Wrappers** (PowerShell, sh, compose): create and mount the per-run volume, and pick the build image for build steps and the monolithic image for the rest. That changes in I3b.
+  - **Output:** `workspace/reports/build_capture.json`, with a schema; the snapshot under `snapshot/` on the volume.
   - **Stop and ask:** a failed build writes `needs_build_recipe` with the first error, missing headers and candidate `-dev` packages. The slice and verify skills tell the agent to ask the user and resume.
   - **Benchmark:** every target gets a `build` recipe in the manifest:
     - tweetnacl's Makefile is a symlink stub on a Windows checkout, so it gets an explicit `cc` command;
     - CryptoLib gets CMake plus its packages;
     - minmea gets CMake with tests enabled and the `check` package.
-- **Owns:** `scripts/build_capture.py`, `schemas/build_capture.schema.json`, `scripts/run_metadata.py` (build block), `scripts/checkpoint.py` (status), `benchmark/manifest.json` (recipes), `scripts/benchmark.py` (recipe passing), `skills/framac-slice` (recipe section).
+- **Owns:** `scripts/build_capture.py`, `schemas/build_capture.schema.json`, `scripts/run_metadata.py` (build block), `scripts/checkpoint.py` (status), `wrappers/` and `docker-compose.yml` (volume, build image), `benchmark/manifest.json` (recipes), `scripts/benchmark.py` (recipe passing), `skills/framac-slice` (recipe section).
 - **Tests:**
   - unit tests on recorded `bear` event files (compile+link in one command, `ar`, `-l` resolution, probes, joined vs. separate flags);
   - integration tests on all reproducers (units and entry points as in their truth files).
@@ -136,6 +146,7 @@ Defaults taken where nothing was asked (open to change):
     - loops.
   - **`scripts/phase0_model.py`:**
     - parses each unit with its per-file flags, each source once per flag set, units in parallel under the resource broker (new class `parse`), test units skipped;
+    - finds the target's headers in the snapshot (`-idirafter`) and the generated headers in the build tree, so the parse runs in the Frama-C image without target packages;
     - collects metrics (`-metrics -metrics-by-function`: lines, cyclomatic complexity);
     - extracts macro aliases (`gcc -E -dD` per translation unit, keeping `#define a b` where `b` is a defined function and the definition is in a project file);
     - marks thread entries and concurrent units;
@@ -153,6 +164,26 @@ Defaults taken where nothing was asked (open to change):
   - all benchmark targets parse;
   - the GCC fallback produces edges and a flag;
   - Phase 0 wall time ≤ build time + 2× the lexer's time on every benchmark target.
+
+### I3b. The Frama-C image without target packages (L, after I3, parallel with I4 and I5a)
+
+- **Goal:** one Frama-C image for every target. Target packages live only in the build image.
+- **Why a snapshot, not a split by job:** Make runs inside a single container, and every Make target is phony. A recipe therefore cannot switch to another image partway through (that would need Docker inside the container, which is ruled out). So every stage that needs Frama-C (E-ACSL builds, the guardrail, Phase 3) stays whole in the Frama-C image and gets the target's environment from the snapshot.
+- **Work:**
+  - **Builds** (`run_eacsl_fuzz.py`: E-ACSL, sanitizer and coverage builds; the guardrail):
+    - compile with `-idirafter <snapshot>/include`;
+    - link against `<snapshot>/lib` with an rpath, so fuzzing, replay and the guardrail run the binaries without installed packages;
+    - use the generated headers from the build tree.
+  - **Analyses:** Eva (`run_eva_slice.py`), WP (`run_wp_function.py`), `kernel_ast.py` and `function_facts.py` parse with the same snapshot include path.
+  - **Selftest:** the E-ACSL canary and a snapshot check run on the bare Frama-C image.
+  - **Cache keys** (`cache.py`): the snapshot digest replaces the derived-image identity, so a target's Eva and WP results stay reusable while its headers and libraries are unchanged.
+  - **Wrappers:** the Frama-C image becomes the default for every non-build step. Derived `framac-pipeline:<repo>` images are no longer built; derived images exist only for the build image.
+  - **Seed harvesting (I6)** runs the target's tests in the build image, where they were built.
+- **Owns:** `scripts/run_eacsl_fuzz.py` (snapshot flags), `scripts/run_eva_slice.py`, `scripts/run_wp_function.py`, `scripts/kernel_ast.py`, `scripts/function_facts.py` (include path only), `scripts/cache.py` (key), `wrappers/` and `docker-compose.yml` (image choice).
+- **Acceptance:**
+  - CryptoLib, which needs packages, runs Phases 0–2 on the bare Frama-C image, with results identical to the monolith;
+  - the E-ACSL canary passes on the bare image;
+  - no derived Frama-C image is built for any benchmark target.
 
 ### I4. Narrowing function-pointer edges with Alias (S, parallel with I5a)
 
@@ -180,7 +211,7 @@ Defaults taken where nothing was asked (open to change):
   - recall is unchanged;
   - the baseline is re-recorded with the unit changes explained, matching the PoC's A/B.
 
-### I5b. Link units as modules (L, after I1 and I5a)
+### I5b. Link units as modules (L, after I1, I3b and I5a)
 
 - **Goal:** modules are the build's link units, and harnesses are written against units and their API.
 - **Work:**
@@ -211,6 +242,7 @@ Defaults taken where nothing was asked (open to change):
     - run the recipe's test command in the sandbox (no network, capped time);
     - record the buffers and scalars each API call receives;
     - write them in each harness's case format, selector byte included.
+  - **Where it runs:** test builds and test runs happen in the build image, where the target's packages are.
   - **Secondary seeds:** data files the tests open for reading inside the target tree (`strace -f -e trace=openat`), capped by size and count.
   - **Corpus wiring:** seeds go to `workspace/seeds/<module>/` and reach `campaign` through `--extra-corpus`, which exists but is not wired.
   - **Dictionary:** `fuzz_dictionary.py` adds integer and string values of macros from the unit's preprocessed sources.
@@ -235,7 +267,7 @@ Defaults taken where nothing was asked (open to change):
   - **CodeQL (optional):**
     - enabled per run in `run-metadata.json` when the user declares the target open-source;
     - runs in the CodeQL image: database creation replays the build recipe under CodeQL's tracer, then the taint queries write `workspace/reports/codeql_trust.json`;
-    - a target with packages gets a CodeQL image derived from its own derived image (`framac-codeql:<repo>`), built by the wrapper like today's `framac-pipeline:<repo>`;
+    - a target with packages gets a CodeQL image derived from its derived build image (`framac-codeql:<repo>`), built by the wrapper;
     - its source-to-sink flows can mark additional internal functions untrusted;
     - it never removes a default or a threat-model decision.
   - **Consumers:**
@@ -291,6 +323,7 @@ Defaults taken where nothing was asked (open to change):
 - **Goal:** one Phase 0, documented, on `main`.
 - **Work:**
   - delete the lexer analysis from `build_callgraph_dag.py`, its tests and its schema fields;
+  - retire the monolithic image: the build and Frama-C images become the only ones, plus CodeQL's;
   - update the docs: `architecture.md`, `v2-design.md`, `troubleshooting.md`, the README, and the slice, verify and fuzz skills;
   - final full run: benchmark (all sets), reproducers and seeded set;
   - merge `phase0-redesign` into `main`.
@@ -304,14 +337,15 @@ Defaults taken where nothing was asked (open to change):
 
 ```text
 I0 ─┬─▶ I1 ───────────────────────────┐
-    └─▶ I2 ─▶ I3 ─┬─▶ I4              ▼
+    └─▶ I2 ─▶ I3 ─┬─▶ I3b ──────────┐  ▼
+                  ├─▶ I4             ▼
                   └─▶ I5a ─────────▶ I5b ─┬─▶ I6 ──────────────┐
                                           └─▶ I7 ─┬─▶ I8 ──────┤
                                                   └─▶ I9 ──────┴─▶ I10
 ```
 
 - **I1 and I2** are independent, and I1 must land before I5b changes harness modules.
-- **I4** runs next to I5a; it touches only the Alias option of the model.
+- **I3b, I4 and I5a** run side by side after I3. Their files are disjoint: I3b covers build flags, analysis include paths, cache keys and wrappers; I4 the Alias option; I5a the DAG, the ledger seed and aliases.
 - **I6 and I7** own disjoint files once I5b is in, and can be parallel subagent or session work. So can I8 and I9.
 
 ## Risks
@@ -323,6 +357,8 @@ I0 ─┬─▶ I1 ────────────────────�
 - **MetAcsl against a development Frama-C:** I0 decides go or no-go before any I9 work.
 - **CodeQL image:** it is pinned, has its own selftest, and is never pushed or shared. Because it is built `FROM` the main image, it must be rebuilt whenever the main image changes; the wrapper checks the base image digest.
 - **Frama-C upgrades** can break the dump module. Mitigation: the I3 selftest runs at image build.
+- **An incomplete snapshot.** Some libraries load plugins or data files at run time (`dlopen`, certificate stores), which `ldd` doesn't see. Mitigation: the I3b acceptance run on CryptoLib, a replay of every crash candidate on the build image when the snapshot is suspect, and an explicit `snapshot_extra` list in the build recipe.
+- **Drift between the two images.** A different gcc or glibc would change which `#if` branches are taken or break the E-ACSL runtime. Mitigation: a common base stage, and the I0 check of compiler and glibc versions run as a selftest on every image build.
 - **A long-lived branch:** `main` keeps moving (for example `156adfa`). Mitigation: merge `main` at the start of each step and run the gates after the merge.
 
 ## Status
@@ -333,6 +369,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I1 | S | not started |
 | I2 | L | not started |
 | I3 | L | not started |
+| I3b | L | not started |
 | I4 | S | not started |
 | I5a | M | not started |
 | I5b | L | not started |
