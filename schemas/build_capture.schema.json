@@ -1,0 +1,163 @@
+{
+  "$comment": "Contract for workspace/reports/build_capture.json, written by scripts/build_capture.py run (plan step I2). Paths of the target's files are relative to the target root; scratch, compiler and system paths are absolute paths in the build container (the scratch volume is mounted at the same path wherever it is used).",
+  "type": "object",
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["ok", "needs_build_recipe", "error"]},
+    "target": {"type": "string", "minLength": 1},
+    "error": {"type": "string"},
+    "scratch": {
+      "type": "object",
+      "properties": {
+        "root": {"type": "string"},
+        "tree": {"type": "string"},
+        "snapshot": {"type": "string"}
+      },
+      "required": ["root", "tree", "snapshot"]
+    },
+    "recipe": {
+      "type": ["object", "null"],
+      "properties": {
+        "command": {"type": "string", "minLength": 1},
+        "workdir": {"type": "string", "minLength": 1},
+        "packages": {"type": "array", "items": {"type": "string"}},
+        "env": {"type": "object", "additionalProperties": {"type": "string"}},
+        "test_command": {"type": ["string", "null"]},
+        "install_command": {"type": ["string", "null"]},
+        "snapshot_extra": {"type": "array", "items": {"type": "string"}},
+        "origin": {"type": "string"}
+      },
+      "required": ["command", "workdir", "packages", "env", "test_command", "origin"]
+    },
+    "build": {
+      "type": ["object", "null"],
+      "properties": {
+        "returncode": {"type": "integer"},
+        "timed_out": {"type": "boolean"},
+        "seconds": {"type": "number", "minimum": 0},
+        "jobs": {"type": "integer", "minimum": 1},
+        "attempts": {
+          "$comment": "One per build run: a build that fails in parallel is retried once with one job.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "jobs": {"type": "integer", "minimum": 1},
+              "returncode": {"type": "integer"},
+              "seconds": {"type": "number", "minimum": 0}
+            },
+            "required": ["jobs", "returncode", "seconds"]
+          }
+        },
+        "tree_files": {"type": "integer", "minimum": 0},
+        "executions": {"type": "integer", "minimum": 0},
+        "probes_dropped": {"type": "integer", "minimum": 0},
+        "log": {"type": "string"},
+        "events": {"type": "string"}
+      },
+      "required": ["returncode", "timed_out", "seconds", "executions", "log", "events"]
+    },
+    "diagnostics": {
+      "$comment": "Set when status is needs_build_recipe: what the agent shows the user when it asks for a recipe.",
+      "type": ["object", "null"],
+      "properties": {
+        "first_error": {"type": "string"},
+        "context": {"type": "array", "items": {"type": "string"}},
+        "missing_headers": {"type": "array", "items": {"type": "string"}},
+        "missing_commands": {"type": "array", "items": {"type": "string"}},
+        "candidate_packages": {"type": "array", "items": {"type": "string"}},
+        "packages_not_installed": {"type": "array", "items": {"type": "string"}},
+        "proposed_recipe": {"type": ["object", "null"]},
+        "heuristic": {"type": "string"},
+        "log_tail": {"type": "string"}
+      },
+      "required": ["first_error", "missing_headers", "candidate_packages", "packages_not_installed"]
+    },
+    "compiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source": {"type": "string", "minLength": 1},
+          "object": {"type": "string", "minLength": 1},
+          "cwd": {"type": "string", "minLength": 1},
+          "compiler": {"type": "string"},
+          "arguments": {"type": "array", "items": {"type": "string"}},
+          "flags": {"$comment": "-I -iquote -isystem -idirafter -include -imacros (value as next token, relative to the target root), -D -U (joined), -std=", "type": "array", "items": {"type": "string"}},
+          "system_flags": {"$comment": "include options naming directories or files outside the tree (absolute)", "type": "array", "items": {"type": "string"}},
+          "headers": {"$comment": "project headers the compiler's dependency list names (generated ones included)", "type": "array", "items": {"type": "string"}}
+        },
+        "required": ["source", "object", "cwd", "compiler", "arguments", "flags", "system_flags", "headers"]
+      }
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kind": {"type": "string", "enum": ["executable", "shared_lib", "static_lib", "unlinked"]},
+          "test": {"type": "boolean"},
+          "test_reason": {"type": ["string", "null"], "enum": ["name", "directory", "test_sources", "name_and_sources", null]},
+          "files": {"type": "array", "items": {"type": "string"}},
+          "objects": {"type": "array", "items": {"type": "string"}},
+          "links": {"type": "array", "items": {"type": "string"}},
+          "external_libs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {"ref": {"type": "string"}, "libdirs": {"type": "array", "items": {"type": "string"}}},
+              "required": ["ref", "libdirs"]
+            }
+          },
+          "compiler": {"type": ["string", "null"]},
+          "cppflags": {"type": "array", "items": {"type": "string"}},
+          "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+          "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"type": "string", "pattern": "#"}}
+        },
+        "required": ["kind", "test", "test_reason", "files", "objects", "links", "external_libs", "cppflags", "entry_points", "embedded_api"]
+      }
+    },
+    "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "public_headers": {
+      "type": ["object", "null"],
+      "properties": {
+        "method": {"type": ["string", "null"], "enum": ["install", "outside_source_dirs", "consumers", null]},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "install": {"type": "string"}
+      },
+      "required": ["method", "files"]
+    },
+    "snapshot": {
+      "type": ["object", "null"],
+      "properties": {
+        "root": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "files": {"type": "integer", "minimum": 0},
+        "headers": {"type": "array", "items": {"$ref": "#/definitions/system_file"}},
+        "libraries": {"type": "array", "items": {"$ref": "#/definitions/system_file"}},
+        "excluded": {"type": "object"},
+        "packages": {"type": "array", "items": {"type": "string"}},
+        "extra": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["root", "digest", "files", "headers", "libraries", "packages"]
+    },
+    "test_rule": {"type": "string"},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "seconds": {"type": "number", "minimum": 0}
+  },
+  "required": ["schema_version", "generated_at", "status", "target", "warnings"],
+  "additionalProperties": false,
+  "definitions": {
+    "system_file": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "package": {"type": ["string", "null"]},
+        "class": {"type": "string", "enum": ["package", "unowned"]},
+        "via": {"type": "string", "enum": ["link", "needed"]}
+      },
+      "required": ["path", "package", "class"]
+    }
+  }
+}

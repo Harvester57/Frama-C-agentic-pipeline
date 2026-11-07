@@ -1,0 +1,12 @@
+{"rid":"1","started":{"execution":{"executable":"/usr/bin/make","arguments":["make"],"working_dir":"/s/tree","environment":{}},"pid":10,"ppid":1}}
+{"rid":"2","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-std=c99","-Iinclude","-c","-o","src/a.o","src/a.c"],"working_dir":"/s/tree","environment":{}},"pid":11,"ppid":10}}
+{"rid":"3","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-std=c99","-I../include","-c","b.c"],"working_dir":"/s/tree/src","environment":{}},"pid":12,"ppid":10}}
+{"rid":"4","started":{"execution":{"executable":"/usr/bin/ar","arguments":["ar","rcs","libab.a","src/a.o","src/b.o"],"working_dir":"/s/tree","environment":{}},"pid":13,"ppid":10}}
+{"rid":"5","started":{"execution":{"executable":"/usr/bin/ranlib","arguments":["ranlib","libab.a"],"working_dir":"/s/tree","environment":{}},"pid":14,"ppid":10}}
+{"rid":"6","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-std=c99","-Iinclude","-c","-o","src/c.o","src/c.c"],"working_dir":"/s/tree","environment":{}},"pid":15,"ppid":10}}
+{"rid":"7","started":{"execution":{"executable":"/usr/bin/x86_64-linux-gnu-gcc-ar-14","arguments":["x86_64-linux-gnu-gcc-ar-14","--plugin","/usr/libexec/gcc/x86_64-linux-gnu/14/liblto_plugin.so","rcs","lib/libextra.a","src/c.o"],"working_dir":"/s/tree","environment":{}},"pid":16,"ppid":10}}
+{"rid":"8","started":{"execution":{"executable":"/usr/bin/ar","arguments":["ar","--plugin","/usr/libexec/gcc/x86_64-linux-gnu/14/liblto_plugin.so","rcs","lib/libextra.a","src/c.o"],"working_dir":"/s/tree","environment":{}},"pid":17,"ppid":16}}
+{"rid":"9","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-std=c99","-Iinclude","-c","-o","tools/t.o","tools/t.c"],"working_dir":"/s/tree","environment":{}},"pid":18,"ppid":10}}
+{"rid":"10","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","tool","tools/t.o","libab.a","-Llib","-lextra"],"working_dir":"/s/tree","environment":{}},"pid":19,"ppid":10}}
+{"rid":"11","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-c","-o","extra/orphan.o","extra/orphan.c"],"working_dir":"/s/tree","environment":{}},"pid":20,"ppid":10}}
+{"rid":"12","started":{"execution":{"executable":"/usr/bin/ar","arguments":["ar","t","libab.a"],"working_dir":"/s/tree","environment":{}},"pid":21,"ppid":10}}

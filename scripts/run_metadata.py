@@ -5,6 +5,9 @@ Creates and updates run-metadata.json (parent-only).
   init        --repo NAME [--target /target] [--profile standard] [--scope PATH ...]
               [--budget N] [--prior-run PATH ...]
   set-status  --status in_progress|complete|incomplete [--reason TEXT] [--snapshot]
+  set-build   --command CMD [--workdir DIR] [--package PKG]... [--env KEY=VALUE]...
+              [--test-command CMD] [--install-command CMD] [--snapshot-extra PATH]...
+              [--origin user|agent_confirmed|benchmark]
   snapshot    [--run-dir DIR] [--out PATH]
   show
 
@@ -13,6 +16,13 @@ target's git metadata without modifying it. Toolchain versions and the available
 sandbox mode are recorded so later runs can decide whether carried evidence is
 still comparable, together with the host path of the run dir (FRAMAC_RUN_HOST) and
 the resources the container measured (scripts/resources.py probe).
+
+`set-build` records the target's build recipe (the `build` block) that build_capture.py
+runs: a shell command run from the working directory (relative to the target root),
+the Debian packages the derived build image needs, extra environment, the test command
+(seed harvesting) and, optionally, an install command ({destdir} is replaced by the
+staging directory) and extra snapshot paths. The user gives the recipe, or confirms
+one the agent proposed (`--origin agent_confirmed`). Setting it again replaces it.
 """
 
 from __future__ import annotations
@@ -168,6 +178,60 @@ def inner_sandbox() -> str:
             return "unknown"
     except Exception:
         return "unknown"
+
+
+BUILD_ORIGINS = ("user", "agent_confirmed", "benchmark")
+_PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+$")
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The sandbox sets these, and bear's interception needs its own LD_PRELOAD.
+RESERVED_BUILD_ENV = frozenset({"PATH", "HOME", "TMPDIR", "LD_PRELOAD", "LANG", "LC_ALL"})
+
+
+def normalize_build_recipe(raw: dict) -> dict:
+    """The `build` block with every field present, or ArtifactError listing what is wrong."""
+    recipe = {
+        "command": str(raw.get("command") or "").strip(),
+        "workdir": str(raw.get("workdir") or ".").strip().replace("\\", "/") or ".",
+        "packages": sorted(dict.fromkeys(str(p) for p in raw.get("packages") or [])),
+        "env": {str(k): str(v) for k, v in (raw.get("env") or {}).items()},
+        "test_command": (str(raw["test_command"]).strip() or None) if raw.get("test_command") else None,
+        "install_command": (str(raw["install_command"]).strip() or None) if raw.get("install_command") else None,
+        "snapshot_extra": [str(p) for p in raw.get("snapshot_extra") or []],
+        "origin": str(raw.get("origin") or "user"),
+    }
+    if raw.get("updated_at"):
+        recipe["updated_at"] = str(raw["updated_at"])
+    if isinstance(raw.get("packages"), str):
+        recipe["packages"] = sorted(dict.fromkeys(raw["packages"].split()))
+    errors = validate_build_recipe(recipe)
+    if errors:
+        raise ArtifactError("invalid build recipe:\n  " + "\n  ".join(errors))
+    return recipe
+
+
+def validate_build_recipe(recipe: dict) -> list[str]:
+    errors: list[str] = []
+    if not recipe.get("command"):
+        errors.append("build.command: a non-empty shell command is required")
+    if "\x00" in str(recipe.get("command") or ""):
+        errors.append("build.command: contains a NUL byte")
+    workdir = recipe.get("workdir") or "."
+    if workdir != "." and not is_safe_relative_path(workdir):
+        errors.append(f"build.workdir: {workdir!r} must be a relative path inside the target")
+    for pkg in recipe.get("packages") or []:
+        if not _PACKAGE_RE.match(pkg):
+            errors.append(f"build.packages: {pkg!r} is not a Debian package name")
+    for key in recipe.get("env") or {}:
+        if not _ENV_KEY_RE.match(key):
+            errors.append(f"build.env: {key!r} is not a variable name")
+        elif key in RESERVED_BUILD_ENV or key.startswith("INTERCEPT_"):
+            errors.append(f"build.env: {key} is set by the sandbox and cannot be overridden")
+    for path in recipe.get("snapshot_extra") or []:
+        if not path.startswith("/"):
+            errors.append(f"build.snapshot_extra: {path!r} must be an absolute path in the build image")
+    if recipe.get("origin") not in BUILD_ORIGINS:
+        errors.append(f"build.origin: must be one of {', '.join(BUILD_ORIGINS)}")
+    return errors
 
 
 def write(meta: dict, path: Path = META) -> None:
@@ -385,6 +449,17 @@ def cmd_set_status(status: str, reason: str | None, snapshot: bool = False) -> d
     return meta
 
 
+def cmd_set_build(raw: dict) -> dict:
+    """Record (or replace) the build recipe of an initialized run."""
+    meta = load_json_strict(META)
+    recipe = normalize_build_recipe(raw)
+    recipe["updated_at"] = utc_now()
+    meta["build"] = recipe
+    meta["updated_at"] = recipe["updated_at"]
+    write(meta)
+    return meta
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage run-metadata.json and run snapshot manifests.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -406,6 +481,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument("--reason", default=None)
         p.add_argument("--snapshot", action="store_true", help="Also emit state/snapshot-manifest.json")
+    p = sub.add_parser("set-build", help="Record the target's build recipe (build_capture.py runs it)")
+    p.add_argument("--command", required=True, help="shell command, run with sh -c from --workdir")
+    p.add_argument("--workdir", default=".", help="working directory, relative to the target root")
+    p.add_argument("--package", action="append", default=[], help="Debian package for the derived build image")
+    p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument("--test-command", default=None, help="command that runs the target's tests")
+    p.add_argument("--install-command", default=None, help="install command; {destdir} is the staging dir")
+    p.add_argument("--snapshot-extra", action="append", default=[], help="absolute path added to the snapshot")
+    p.add_argument("--origin", choices=list(BUILD_ORIGINS), default="user")
     p = sub.add_parser("snapshot", help="Write state/snapshot-manifest.json for the run directory")
     p.add_argument("--run-dir", type=Path, default=Path("."))
     p.add_argument("--out", type=Path, default=None)
@@ -416,6 +500,22 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_init(args.repo, args.target, args.profile, args.scope, args.budget, args.prior_run, args.run_id)
         elif args.cmd in ("set-status", "finalize"):
             out = cmd_set_status(args.status, args.reason, snapshot=args.snapshot)
+        elif args.cmd == "set-build":
+            bad = [item for item in args.env if "=" not in item]
+            if bad:
+                raise ArtifactError(f"--env expects KEY=VALUE, got {bad[0]!r}")
+            out = cmd_set_build(
+                {
+                    "command": args.command,
+                    "workdir": args.workdir,
+                    "packages": args.package,
+                    "env": dict(item.split("=", 1) for item in args.env),
+                    "test_command": args.test_command,
+                    "install_command": args.install_command,
+                    "snapshot_extra": args.snapshot_extra,
+                    "origin": args.origin,
+                }
+            )
         elif args.cmd == "snapshot":
             out = cmd_snapshot(args.run_dir, args.out)
         else:

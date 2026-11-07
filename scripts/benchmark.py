@@ -760,9 +760,21 @@ def _is_windows() -> bool:
 
 
 def wrapper_argv(
-    target: Path, run_dir: Path, repo: str, *, cls: str | None = None, packages: str = "", image: str | None = None
+    target: Path,
+    run_dir: Path,
+    repo: str,
+    *,
+    cls: str | None = None,
+    packages: str = "",
+    image: str | None = None,
+    build_image: bool = False,
+    scratch: bool = False,
 ) -> list[str]:
-    """The wrapper command for this OS. The shared cross-run cache stays off: a benchmark must not reuse old results."""
+    """
+    The wrapper command for this OS. The shared cross-run cache stays off: a benchmark must not reuse old results.
+    `build_image` runs the stage in the build image (framac-build, or framac-build:<repo> with packages),
+    `scratch` mounts the run's scratch volume at /framac-scratch.
+    """
     if _is_windows():
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if not shell:
@@ -789,6 +801,8 @@ def wrapper_argv(
         argv += ["-Class", cls] if cls else []
         argv += ["-TargetPackages", packages] if packages else []
         argv += ["-Image", image] if image else []
+        argv += ["-BuildImage"] if build_image else []
+        argv += ["-Scratch"] if scratch else []
         return argv
     argv = ["bash", str(PIPELINE_ROOT / "wrappers" / "framac-docker.sh")]
     argv += [
@@ -804,6 +818,8 @@ def wrapper_argv(
     ]
     argv += ["--class", cls] if cls else []
     argv += ["--target-packages", packages] if packages else []
+    argv += ["--build-image"] if build_image else []
+    argv += ["--scratch"] if scratch else []
     return argv
 
 
@@ -817,12 +833,16 @@ def run_stage(
     cls: str | None = None,
     packages: str = "",
     image: str | None = None,
+    build_image: bool = False,
+    scratch: bool = False,
 ) -> dict:
     """Run one command in a fresh container; rc, wall time and the CPU time the container recorded."""
     log_path = run_dir / BENCH_SUBDIR / "logs" / f"{name}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     before = _history_files(run_dir)
-    argv = wrapper_argv(target, run_dir, repo, cls=cls, packages=packages, image=image)
+    argv = wrapper_argv(
+        target, run_dir, repo, cls=cls, packages=packages, image=image, build_image=build_image, scratch=scratch
+    )
     argv += [command] if _is_windows() else ["--", command]
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     if image and not _is_windows():
@@ -891,8 +911,62 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
         "assets": target.get("assets") or [],
         "compile_commands": target.get("compile_commands"),
         "reach_exempt_modules": target.get("reach_exempt_modules") or {},
+        # The build recipe build_capture.py runs (its `--recipe-file bench/spec.json` reads this block).
+        "build": {**target["build"], "origin": "benchmark"} if target.get("build") else None,
         "replays": replays,
     }
+
+
+def summarize_capture(report: dict | None) -> dict:
+    """What the run file records of the build capture (its output is consumed from step I3 on)."""
+    if not report:
+        return {"status": "no_report"}
+    out: dict[str, Any] = {"status": report.get("status")}
+    if report.get("status") == "ok":
+        units = report.get("units") or {}
+        kinds = Counter(u.get("kind") for u in units.values() if not u.get("test"))
+        out.update(
+            units=len(units),
+            test_units=sum(1 for u in units.values() if u.get("test")),
+            kinds=dict(sorted((str(k), v) for k, v in kinds.items())),
+            compiles=len(report.get("compiles") or []),
+            entry_points=len(report.get("entry_points") or []),
+            snapshot_files=(report.get("snapshot") or {}).get("files"),
+            snapshot_digest=(report.get("snapshot") or {}).get("digest"),
+            build_s=(report.get("build") or {}).get("seconds"),
+            seconds=report.get("seconds"),
+        )
+    else:
+        diag = report.get("diagnostics") or {}
+        out["first_error"] = diag.get("first_error") or report.get("error")
+        out["candidate_packages"] = diag.get("candidate_packages") or []
+    return out
+
+
+def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str, stages: dict[str, dict]) -> dict:
+    """
+    The build capture stage: build_capture.py in the build image (derived with the recipe's packages, or
+    the target's), on the run's scratch volume. The volume is removed afterwards: nothing reads it yet.
+    """
+    if not spec.get("build"):
+        return {"status": "no_recipe"}
+    recipe_packages = " ".join((spec["build"] or {}).get("packages") or []) or packages
+    stages["capture"] = run_stage(
+        "capture",
+        f"python3 {CONTAINER_SCRIPTS}/build_capture.py run --recipe-file {BENCH_SUBDIR}/spec.json",
+        mount,
+        run_dir,
+        repo,
+        cls="phase-dynamic",
+        packages=recipe_packages,
+        build_image=True,
+        scratch=True,
+    )
+    drop = wrapper_argv(mount, run_dir, repo) + (["-RemoveScratch"] if _is_windows() else ["--remove-scratch"])
+    subprocess.run(drop, capture_output=True, check=False)
+    summary = summarize_capture(read_json(run_dir / "workspace" / "reports" / "build_capture.json"))
+    stages["capture"]["status"] = summary["status"]
+    return summary
 
 
 def run_target(
@@ -942,6 +1016,9 @@ def run_target(
     if ok and (read_json(run_dir / BENCH_SUBDIR / "phase0.json", {}) or {}).get("ok") is not True:
         ok = False
         notes.append("phase0: see bench/phase0.json")
+    capture = run_capture(spec, mount, run_dir, repo, packages, stages)
+    if capture["status"] != "ok":
+        notes.append(f"capture: {capture['status']}: {capture.get('first_error') or 'see bench/logs/capture.log'}")
     if ok and not phase0_only:
         # build-check builds every module and records the E-ACSL gate the fuzz targets check.
         stage("build", f"{py}/pipeline_make.py build-check")
@@ -974,6 +1051,7 @@ def run_target(
         "cpu_s": round(sum(s["cpu_s"] for s in stages.values()), 1),
         **metrics,
     }
+    entry["build_capture"] = capture
     entry["_replay"] = annotate_replays(read_json(run_dir / BENCH_SUBDIR / "replay.json", {}) or {}, spec, run_dir)
     entry["_gate"] = read_json(run_dir / BENCH_SUBDIR / "gate.json", {}) or {}
     entry["_metadata"] = {

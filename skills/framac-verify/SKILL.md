@@ -89,13 +89,14 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 
 ### Setup
 
-1. **Resume** (`-RunDir <existing>`): run `python3 /opt/framac-pipeline/scripts/checkpoint.py load state`. If it reports a `phase_done`, resume after that phase and skip step 2 (`run_metadata.py init` refuses an initialized run). For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead.
+1. **Resume** (`-RunDir <existing>`): run `python3 /opt/framac-pipeline/scripts/checkpoint.py load state`. If it reports a `phase_done`, resume after that phase and skip step 2 (`run_metadata.py init` refuses an initialized run). For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead. If `status` is `needs_build_recipe`, the target did not build: show the user `diagnostics` from `workspace/reports/build_capture.json`, record the corrected recipe with `run_metadata.py set-build`, and resume Phase 0 at the build capture (`/framac-slice` Step 1b).
 2. **New run** (`-NewRun`): `python3 /opt/framac-pipeline/scripts/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
 3. Check the measured machine: `python3 /opt/framac-pipeline/scripts/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
 
 ### Phase 0 — Slicing, DAG, ledger seeding (`/framac-slice`)
 
 Execute `skills/framac-slice/SKILL.md`:
+- It captures the target's own build from a recipe the user gave or confirmed (`build_capture.py`, in the build image). A target that does not build stops the run with `needs_build_recipe` until the user fixes the recipe.
 - It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`).
 - It gates every harness on reachability (`harness_reach.py check`): each module's DAG entry points must be reached, or exempted with a recorded reason, before the ledger is seeded.
 - It requires every fuzzed module to build with E-ACSL (`pipeline_make.py build-check`), unless `--fuzz-engine sanitizers` was chosen for that module, so Phase 1 never falls back to ASan/UBSan silently.

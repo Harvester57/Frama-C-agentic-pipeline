@@ -64,6 +64,20 @@
     Writable shared cache for the allowlisted trusted commands. This is the default; it is kept for
     compatibility. FRAMAC_CACHE_RW=off mounts the shared cache read-only for every command.
 
+.PARAMETER BuildImage
+    Run the command in the build image (framac-build:latest; the target's own build and its tests, e.g.
+    scripts/build_capture.py) instead of the monolith. With -TargetPackages, the derived build image
+    framac-build:<repo> is built (--target framac-build) and used. -Image still overrides the image name.
+    Every other command keeps the monolith (framac-pipeline:latest) as before.
+
+.PARAMETER Scratch
+    Create (once) and mount the run's named volume framac-scratch-<repo>-<run id>-<hash of the run dir>
+    at /framac-scratch: the build capture's scratch tree and snapshot live there, not on the host bind
+    mount. Every container of the run started with -Scratch sees the same volume at the same path.
+
+.PARAMETER RemoveScratch
+    Remove the run's scratch volume and exit (no command needed).
+
 .PARAMETER Command
     Command string executed inside the container (bash -lc) with /framac-run as working directory.
     When referencing $S (the /opt/framac-pipeline/scripts shorthand), wrap the command in single
@@ -102,6 +116,15 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$BuildIfMissing,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$BuildImage,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Scratch,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$RemoveScratch,
 
     [Parameter(Mandatory = $false)]
     [string]$Cpus = $(if ($env:FRAMAC_CPUS) { $env:FRAMAC_CPUS } else { [string][Environment]::ProcessorCount }),
@@ -156,15 +179,17 @@ if ($Command -and $Command.Count -gt 0 -and $Command[0] -match '^-[A-Za-z]') {
     [Console]::Error.WriteLine(
         "[framac-docker] ERROR: unknown wrapper option '$($Command[0])'. " +
         "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
+        "-BuildImage, -Scratch, -RemoveScratch, " +
         "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -ScriptFile, -Command."
     )
     exit 2
 }
 
-if (-not $ScriptFile -and (-not $Command -or $Command.Count -eq 0)) {
+if (-not $RemoveScratch -and -not $ScriptFile -and (-not $Command -or $Command.Count -eq 0)) {
     [Console]::Error.WriteLine(
         "[framac-docker] ERROR: either a command or -ScriptFile is required. " +
         "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
+        "-BuildImage, -Scratch, -RemoveScratch, " +
         "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -ScriptFile, -Command."
     )
     exit 2
@@ -358,30 +383,63 @@ if ($selinuxEnforcing) {
     }
 }
 
+# ---- Scratch volume: one named volume per run directory (repo, run id, and a hash of the run path) ----
+$ScratchVolume = ""
+if ($Scratch -or $RemoveScratch) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($ResolvedRun))
+    $runHash = (-join ($hashBytes | ForEach-Object { $_.ToString("x2") })).Substring(0, 12)
+    $ScratchVolume = "framac-scratch-$RepoName-$(Split-Path -Leaf $ResolvedRun)-$runHash"
+}
+if ($RemoveScratch) {
+    & $EngineName volume rm "-f" "$ScratchVolume" | Out-Null
+    [Console]::Error.WriteLine("[framac-docker] removed scratch volume $ScratchVolume")
+    exit $LASTEXITCODE
+}
+
 # ---- Image ----
+# Build steps (-BuildImage) run in the build image (Dockerfile stage framac-build); everything else in the monolith.
+$imageTarget = @()
+if ($BuildImage) {
+    if (-not $PSBoundParameters.ContainsKey("Image")) { $Image = "framac-build:latest" }
+    $imageTarget = @("--target", "framac-build")
+}
 $imageExists = & $EngineName images "-q" "$Image" 2>$null
 if (-not $imageExists) {
     if ($BuildIfMissing) {
         [Console]::Error.WriteLine("[framac-docker] Building image $Image with $EngineName from $PipelineRoot...")
         # Only stdout is piped: `2>&1` would turn the build's stderr progress into errors under "Stop".
-        & $EngineName build "-t" "$Image" "$PipelineRoot" | ForEach-Object { [Console]::Error.WriteLine("$_") }
+        & $EngineName build @imageTarget "-t" "$Image" "$PipelineRoot" | ForEach-Object { [Console]::Error.WriteLine("$_") }
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to build image $Image"
         }
     } else {
-        throw "Image '$Image' not found. Run with -BuildIfMissing or execute: $EngineName build -t `"$Image`" `"$PipelineRoot`""
+        throw "Image '$Image' not found. Run with -BuildIfMissing or execute: $EngineName build $($imageTarget -join ' ') -t `"$Image`" `"$PipelineRoot`""
     }
 }
 
 if ($TargetPackages) {
     $DerivedImage = "framac-pipeline:$RepoName"
+    if ($BuildImage) { $DerivedImage = "framac-build:$RepoName" }
     [Console]::Error.WriteLine("[framac-docker] Building derived image $DerivedImage with target packages: $TargetPackages")
-    & $EngineName build "-t" "$DerivedImage" "--build-arg" "TARGET_APT_PACKAGES=$TargetPackages" "$PipelineRoot" |
+    & $EngineName build @imageTarget "-t" "$DerivedImage" "--build-arg" "TARGET_APT_PACKAGES=$TargetPackages" "$PipelineRoot" |
         ForEach-Object { [Console]::Error.WriteLine("$_") }
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to build derived image $DerivedImage"
     }
     $Image = $DerivedImage
+}
+
+if ($Scratch) {
+    & $EngineName volume inspect "$ScratchVolume" *> $null
+    if ($LASTEXITCODE -ne 0) {
+        & $EngineName volume create "--label" "framac.scratch=1" "$ScratchVolume" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Failed to create scratch volume $ScratchVolume" }
+        # A new volume's root belongs to root: open it (sticky, like /tmp) for the non-root job user.
+        & $EngineName run "--rm" "--network" "none" "-v" "${ScratchVolume}:/framac-scratch" "--entrypoint" "/bin/chmod" "$Image" "1777" "/framac-scratch" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Failed to initialize scratch volume $ScratchVolume" }
+    }
+    [Console]::Error.WriteLine("[framac-docker] scratch volume: $ScratchVolume at /framac-scratch")
 }
 $ImageId = ""
 try {
@@ -455,6 +513,7 @@ $mountArgs = @(
     "-v", "${PipelineRoot}/skills:/opt/framac-pipeline/skills:ro$z",
     "-v", "${PipelineRoot}/docs/references:/opt/framac-pipeline/docs/references:ro$z"
 )
+if ($Scratch) { $mountArgs += @("-v", "${ScratchVolume}:/framac-scratch") }
 
 if ($useBroker) {
     # resources.py exec leases CPUs/memory for the job class and inserts --name, --label, --init, the limits,

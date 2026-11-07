@@ -56,6 +56,36 @@ The broker sizes a sandboxed `bear`, `make`, `cmake`, `ninja`, `meson` or `confi
 
 For CMake: `cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"` inside the same scratch copy. Pass the result to Step 2 with `--compile-commands`. If the target depends on additional Debian/Ubuntu `-dev` packages not in the base image, pass `--target-packages "<pkg1> <pkg2>"` (or `-TargetPackages` in PowerShell) to the Docker wrapper so the real headers and libraries are installed into a cached derived image before container privileges are dropped.
 
+### Step 1b — Build Recipe and Build Capture
+
+Phase 0 needs the target's own build: what it compiles, links and exports. A target that does not build stops Phase 0 until the user gives a working recipe. There is no fallback inventory.
+
+1. **Recipe.** Read `build` in `run-metadata.json` (`run_metadata.py show`). If it is missing, propose one (`python3 /opt/framac-pipeline/scripts/build_capture.py propose` reads the build files) and ask the user to confirm or correct it: the build command, the Debian packages it needs, extra environment or flags, the working directory, and the command that runs the tests. Never record a recipe the user has not given or confirmed. Then record it:
+
+   ```text
+   python3 /opt/framac-pipeline/scripts/run_metadata.py set-build --command "<cmd>" [--workdir <dir>] [--package <pkg>]... [--env KEY=VALUE]... [--test-command "<cmd>"] [--origin user|agent_confirmed]
+   ```
+
+2. **Capture.** Run it in the build image, on the run's scratch volume, sized as `phase-dynamic`. Pass the recipe's packages as target packages, so the wrapper builds the derived build image `framac-build:<repo>`:
+
+   ```powershell
+   & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch -Class phase-dynamic `
+     [-TargetPackages "<pkg1> <pkg2>"] "python3 /opt/framac-pipeline/scripts/build_capture.py run"
+   ```
+
+   ```bash
+   ./wrappers/framac-docker.sh --target "<target-dir>" --run-dir "<run-dir>" --build-image --scratch --class phase-dynamic \
+     [--target-packages "<pkg1> <pkg2>"] -- "python3 /opt/framac-pipeline/scripts/build_capture.py run"
+   ```
+
+   The build runs under `bear` through `sandbox_exec.py`, in a copy of the target on the volume. A build that fails with parallel jobs is retried once with one job. The result is `workspace/reports/build_capture.json`:
+   - **units:** link units, with their files, links, per-file flags and entry points; test executables are marked `test`;
+   - **snapshot:** the headers and libraries outside the project and libc, under `/framac-scratch/snapshot/`, with a digest.
+
+3. **Stop and ask.** Exit code 3 and `"status": "needs_build_recipe"` mean the build failed, built no C file, or has no recipe. The checkpoint records the same status. Show the user `diagnostics`: `first_error`, `missing_headers`, `candidate_packages` (a heuristic) and `packages_not_installed`. Ask for a corrected command, packages or flags, record them with `set-build`, and run the capture again. A successful capture clears the status, and Phase 0 continues.
+
+Until step I3 of `docs/phase0-implementation-plan.md` lands, Step 2 does not read the capture yet. Run the capture anyway: it is the gate that the target builds.
+
 ---
 
 ## Step 2 — Build the Call-Graph DAG, Topological Waves & Risk Tiers
