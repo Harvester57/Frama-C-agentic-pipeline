@@ -1,0 +1,11 @@
+{
+  "minmea": {"build": "cmake -S . -B build -DMINMEA_ENABLE_TESTING=OFF && cmake --build build"},
+  "qcbor-dev": {"build": "make"},
+  "qcbor-master": {"build": "make"},
+  "x509-parser": {"build": "make"},
+  "oscs-jsmn": {"build": "make"},
+  "oscs-semver": {"build": "make"},
+  "oscs-stmr": {"build": "make"},
+  "oscs-qlz": {"build": "make"},
+  "oscs-tweetnacl": {"build": "cc -o main main.c tweetnacl.c randombytes.c", "note": "its Makefile is a git symlink, a plain text stub on a Windows checkout"}
+}

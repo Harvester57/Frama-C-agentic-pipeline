@@ -1,0 +1,45 @@
+{
+  "description": "Function-pointer calls: handler table in a global initializer, sink.write struct field assigned at runtime, bsearch/qsort comparators",
+  "build": "make",
+  "functions": [
+    "src/handlers.c#h_ping",
+    "src/handlers.c#h_echo",
+    "src/handlers.c#h_sum",
+    "src/handlers.c#h_reset",
+    "src/dispatch.c#cmp_op",
+    "src/dispatch.c#cmp_name",
+    "src/dispatch.c#proto_parse",
+    "src/dispatch.c#proto_dispatch",
+    "src/dispatch.c#proto_list_ops",
+    "tools/msgtool.c#write_plain",
+    "tools/msgtool.c#write_hex",
+    "tools/msgtool.c#main"
+  ],
+  "not_compiled": [],
+  "edges": [
+    {"caller": "src/dispatch.c#proto_dispatch", "callee": "src/dispatch.c#cmp_op", "kind": "indirect"},
+    {"caller": "src/dispatch.c#proto_dispatch", "callee": "src/handlers.c#h_ping", "kind": "indirect"},
+    {"caller": "src/dispatch.c#proto_dispatch", "callee": "src/handlers.c#h_echo", "kind": "indirect"},
+    {"caller": "src/dispatch.c#proto_dispatch", "callee": "src/handlers.c#h_sum", "kind": "indirect"},
+    {"caller": "src/dispatch.c#proto_list_ops", "callee": "src/dispatch.c#cmp_name", "kind": "indirect"},
+    {"caller": "src/dispatch.c#proto_list_ops", "callee": "tools/msgtool.c#write_plain", "kind": "indirect"},
+    {"caller": "src/dispatch.c#proto_list_ops", "callee": "tools/msgtool.c#write_hex", "kind": "indirect"},
+    {"caller": "src/handlers.c#h_ping", "callee": "tools/msgtool.c#write_plain", "kind": "indirect"},
+    {"caller": "src/handlers.c#h_ping", "callee": "tools/msgtool.c#write_hex", "kind": "indirect"},
+    {"caller": "src/handlers.c#h_echo", "callee": "tools/msgtool.c#write_plain", "kind": "indirect"},
+    {"caller": "src/handlers.c#h_echo", "callee": "tools/msgtool.c#write_hex", "kind": "indirect"},
+    {"caller": "src/handlers.c#h_sum", "callee": "tools/msgtool.c#write_plain", "kind": "indirect"},
+    {"caller": "src/handlers.c#h_sum", "callee": "tools/msgtool.c#write_hex", "kind": "indirect"},
+    {"caller": "tools/msgtool.c#main", "callee": "src/dispatch.c#proto_list_ops", "kind": "direct"},
+    {"caller": "tools/msgtool.c#main", "callee": "src/dispatch.c#proto_parse", "kind": "direct"},
+    {"caller": "tools/msgtool.c#main", "callee": "src/dispatch.c#proto_dispatch", "kind": "direct"}
+  ],
+  "externals": ["snprintf", "strcmp", "bsearch", "qsort", "strlen", "fwrite", "fputc", "fprintf", "fread"],
+  "units": {
+    "libproto.a": {"kind": "static_lib", "files": ["src/handlers.c", "src/dispatch.c"], "links": []},
+    "msgtool": {"kind": "executable", "files": ["tools/msgtool.c"], "links": ["libproto.a"]}
+  },
+  "entry_points": ["src/dispatch.c#proto_parse", "src/dispatch.c#proto_dispatch", "src/dispatch.c#proto_list_ops", "tools/msgtool.c#main"],
+  "thread_entries": [],
+  "notes": "Comparators passed to bsearch/qsort are modelled like pthread_create: an indirect edge from the function that calls bsearch/qsort to the comparator. sink.write is assigned in main to write_hex or write_plain depending on argv, so every out->write call site reaches both. h_reset is compiled and non-static but never referenced (not in the table): no edge reaches it and it is not an entry point. h_* are declared in the internal src/handlers.h, not the public include/proto.h."
+}
