@@ -366,8 +366,8 @@ I0 ─┬─▶ I1 ────────────────────�
 | Step | Size | Status |
 | :--- | :--- | :--- |
 | I0 | M | done |
-| I1 | S | not started |
-| I2 | L | not started |
+| I1 | S | done |
+| I2 | L | done |
 | I3 | L | not started |
 | I3b | L | not started |
 | I4 | S | not started |
@@ -469,3 +469,21 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I1 (2026-11-07)
+
+- **The stamp:** `scripts/phase0_gates.py` keeps `workspace/reports/phase0_gates.json`.
+  - `harness_reach.py check` writes the reach section, with a digest of each harness, so a harness regenerated after the check fails the gate until the check runs again.
+  - `pipeline_make.py build-check` writes the build section.
+- **Make:**
+  - `seed` depends on a new `reach-gate` target;
+  - the `build-`, `coverage-`, `eva-`, `evabase-`, `evarung-` and `evatune-` recipes check the reach gate first;
+  - `fuzz-` checks both gates, and `wp-queue` checks both for every module.
+- **The build gate reads the module's current build report** when there is one. Make rebuilds a module as a prerequisite of `fuzz-<mod>` before the gate line runs, and the first version, which read only the stamp, blocked a CryptoLib campaign whose rebuild had succeeded.
+- **`validate_artifacts.py`** checks the stamp's shape only. Reports older than a failed gate are allowed, because the harness-repair loop produces exactly that.
+- **Benchmark:**
+  - the manifest records `reach_exempt_modules` (example, test and CLI programs, with reasons) and `reach_gaps_accepted` (pinned recall harnesses), and `inner_phase0` records them before running the gate;
+  - the build stage runs `build-check`;
+  - the four x509 modules whose E-ACSL instrumentation fails record `fuzz_engine: sanitizers`, with a reason.
+- **Checked end to end:** minmea, qcbor-master and x509-parser match the I0 baseline. CryptoLib keeps its 195 Phase 3 tasks.
+- **Found, not fixed:** CryptoLib's `crypto` module falls back from E-ACSL on its first build in a run (`-rte-select: no function 'mc_log'`, 2 of 2 runs) and builds with E-ACSL when rebuilt in the fuzz stage. The old `run build` stage hid this because a fallback wasn't an error. Now `build-check` returns 1 and the target reads "partial". It needs its own investigation, in `run_eacsl_fuzz.py`'s `-rte-select` drop-and-retry.
