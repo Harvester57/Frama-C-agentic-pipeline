@@ -115,11 +115,19 @@ class call_scan (calls : json list ref) = object
     Cil.DoChildren
 end
 
+class loop_count (n : int ref) = object
+  inherit Visitor.frama_c_inplace
+  method! vstmt s =
+    (match s.skind with Loop _ -> incr n | _ -> ());
+    Cil.DoChildren
+end
+
 let function_json kf =
   let vi = Kernel_function.get_vi kf in
   let f = Kernel_function.get_definition kf in
-  let calls = ref [] in
+  let calls = ref [] and loops = ref 0 in
   ignore (Visitor.visitFramacFunction (new call_scan calls) f);
+  ignore (Visitor.visitFramacFunction (new loop_count loops) f);
   (* The definition's location: vi.vdecl is the first declaration, often a header prototype. *)
   let def_loc = Cil_datatype.Global.loc (Kernel_function.get_global kf) in
   O
@@ -128,6 +136,7 @@ let function_json kf =
       ("loc", S (loc_s def_loc));
       ("static", B (vi.vstorage = Static));
       ("signature", S (signature vi.vtype));
+      ("loops", I !loops);
       ("calls", L (List.rev !calls)) ]
 
 let run () =

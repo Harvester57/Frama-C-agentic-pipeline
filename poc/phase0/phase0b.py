@@ -491,6 +491,7 @@ def gcc_unit(work: Path, out: Path, name: str, compiles: list[dict]) -> dict[str
 
 
 def extract(target: Path, out: Path, build: str, timeout: int, keep_work: bool = False) -> dict:
+    out = out.resolve()  # the build and Frama-C run in another directory
     out.mkdir(parents=True, exist_ok=True)
     # The build and Frama-C run in container-local scratch: on a host bind mount (Windows, OneDrive)
     # file I/O dominated the measured time. keep_work keeps the tree under <out>/work instead.
@@ -577,6 +578,7 @@ def extract(target: Path, out: Path, build: str, timeout: int, keep_work: bool =
                             "frama-c-kernel",
                             fn["signature"],
                         )
+                        functions[fid]["loops"] = int(fn.get("loops") or 0)
                 taken = {k for k in dump.get("address_taken", []) if k in defined_k}
                 sig_of = {fn["kernel_name"]: fn["signature"] for fn in dump["functions"]}
                 for fn in dump["functions"]:
