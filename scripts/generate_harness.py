@@ -334,15 +334,19 @@ def _parse_c_param(raw_param: str, index: int) -> dict[str, Any]:
 
 
 def _split_top_level_params(params_raw: str) -> list[str]:
-    """Split a C parameter list on commas at top-level parenthesis/bracket depth 0."""
+    """
+    Split a C parameter or argument list on commas at top-level depth 0, counting
+    parentheses, brackets and braces (so a compound-literal argument such as
+    `(UsefulBuf){buf, sizeof(buf)}` stays one argument).
+    """
     parts: list[str] = []
     cur: list[str] = []
     depth = 0
     for ch in params_raw:
-        if ch in ("(", "["):
+        if ch in ("(", "[", "{"):
             depth += 1
             cur.append(ch)
-        elif ch in (")", "]"):
+        elif ch in (")", "]", "}"):
             if depth > 0:
                 depth -= 1
             cur.append(ch)
