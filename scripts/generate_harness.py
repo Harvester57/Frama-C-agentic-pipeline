@@ -49,6 +49,8 @@ VALID_ENTRY_STYLES = (
     "argv",
     "dispatch",
 )
+# Compile-time bit mask of dispatch cases a fuzz build skips (run_eacsl_fuzz.py campaign rounds).
+DISPATCH_SKIP_MACRO = "FRAMAC_FUZZ_SKIP_CASES"
 _WORKSPACE_PREFIXES = (
     "/framac-run/workspace/work/",
     "/framac-run/workspace/baseline/",
@@ -743,17 +745,25 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
     One harness that drives several API calls: the first input byte selects a case and the
     rest of the input is the case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one
     analysis covers every case. Cases must not `return` (the fuzz side frees its buffer after).
+
+    A campaign that already crashed in some cases rebuilds with -DFRAMAC_FUZZ_SKIP_CASES=<bit mask>
+    (bit i skips case i, cases 0..63) so the known crash stops ending every run. Eva never sees it.
     """
     stmts = [c.strip() for c in cases if c and c.strip()]
     if not stmts:
         raise ValueError("entry_style 'dispatch' requires at least one --dispatch-case")
+    n = len(stmts)
     # Joined with a newline plus 4 spaces under the template's indent, so nested lines carry 4 more.
     lines = [
         "if (fuzz_len > 0) {",
         "    uint8_t harness_selector = fuzz_buf[0];",
         "    fuzz_buf += 1;",
         "    fuzz_len -= 1;",
-        f"    switch (harness_selector % {len(stmts)}U) {{",
+        f"#ifdef {DISPATCH_SKIP_MACRO}",
+        f"    if ((harness_selector % {n}U) >= 64U"
+        f" || ((((unsigned long long)({DISPATCH_SKIP_MACRO})) >> (harness_selector % {n}U)) & 1ULL) == 0ULL)",
+        "#endif",
+        f"    switch (harness_selector % {n}U) {{",
     ]
     for i, stmt in enumerate(stmts):
         lines.append(f"    case {i}U: {{ {stmt} }} break;")

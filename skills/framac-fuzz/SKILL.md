@@ -70,6 +70,11 @@ Campaigns need no judgment, so they run from the generated Makefile, not from on
 
 Each campaign writes only its own module's corpus, crash directory, and report (`workspace/reports/fuzz/<mod>.json`). The fuzz budget is CPU-seconds per module from the profile (quick 60, standard 120, deep 900). Wall time = budget / workers, at least 30 s, so a larger node finishes sooner at equal or greater effort. `-rss_limit_mb` stays fixed at 2048 on every machine, so `oom_found` means the same thing everywhere.
 
+A campaign keeps going after a crash, so one shallow bug does not hide the others in its module:
+- **Dispatch harnesses** run in rounds. Each case an input crashed (or timed out) in (the input's first byte modulo the case count) is skipped from the next round on. The skip uses a rebuild with `-DFRAMAC_FUZZ_SKIP_CASES=<bit mask>`, with the same engine. Rounds share the campaign's wall time and end when a round finds no new crashing case, every case is skipped, less than 30 s are left, or a rebuild fails. A skipped case is not fuzzed for the rest of the campaign, so a second bug in the same case can still be hidden; the report's `keep_going.rounds` lists what each round skipped and found.
+- **Other harnesses** (and dispatch harnesses generated before the skip macro existed) run in libFuzzer fork mode with `-ignore_crashes=1` (`keep_going.mode: fork`). The same bug is then saved many times: at most 64 crash inputs are replayed, and at most 3 artifacts are listed per fingerprint (`artifacts_omitted` counts the rest).
+- `--stop-on-first-crash` restores the old behavior: one campaign that ends at the first crash.
+
 For a single module in guidance mode, the underlying command is:
 
 ```text
@@ -103,7 +108,7 @@ For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickr
 
 | Status | Meaning |
 | :--- | :--- |
-| `crash_found` | At least one `crash-*` artifact. Each artifact was replayed once (`reproducible`), its E-ACSL failure parsed (`failure`: file, line, function, kind, predicate), and fingerprinted. |
+| `crash_found` | At least one `crash-*` artifact in any round. Each listed artifact was replayed once (`reproducible`), its E-ACSL failure parsed (`failure`: file, line, function, kind, predicate), and fingerprinted. |
 | `timeout_found` / `oom_found` | Per-input timeout or RSS limit hit. A termination/DoS lead, not a memory-safety bug. |
 | `clean` | No failure within the time budget. The corpus in `workspace/corpus/<mod>/` becomes the dynamic anti-hallucination corpus for `/framac-wp`. Fuzzing is not proof. |
 | `fuzzer_error` / `compile_error` / `sandbox_unavailable` | The campaign did not run to completion. Never read this as clean. |

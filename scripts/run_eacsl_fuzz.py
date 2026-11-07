@@ -10,6 +10,10 @@ Modes:
    Without `--dict` (and unless `--no-auto-dict`), the target sources' literals plus fixed numeric
    boundary tokens (scripts/fuzz_dictionary.py) become workspace/dicts/<module>.dict, passed as
    `-dict=`; the report's `dictionary` records `{path, auto, entries}` or why there is none.
+   A campaign keeps going after a crash (unless `--stop-on-first-crash`): a `dispatch` harness
+   reruns for the time left with the crashed cases skipped (-DFRAMAC_FUZZ_SKIP_CASES=<mask>),
+   any other harness runs in libFuzzer fork mode with `-ignore_crashes=1`; `keep_going` in the
+   report records the rounds, and duplicates of one fingerprint are listed at most 3 times.
 2. `guardrail`: the dynamic anti-hallucination oracle used inside `/framac-wp`.
    Replays the module corpus (plus a short mutation burst) against a binary compiled with
    the proposed ACSL contract. Outcomes:
@@ -107,6 +111,7 @@ from framac_common import (  # noqa: E402
     scan_undeclared_functions,
     utc_now,
 )
+from generate_harness import DISPATCH_SKIP_MACRO  # noqa: E402
 from resources import (  # noqa: E402
     CLASSES,
     FUZZ_RSS_LIMIT_MB,
@@ -143,6 +148,11 @@ DEFAULT_PER_INPUT_TIMEOUT_S = 10
 GUARDRAIL_PER_INPUT_TIMEOUT_S = 30
 DEFAULT_MAX_TIME_S = 60
 MIN_FUZZ_WALL_S = 30
+# Keep-going campaigns: a fork-mode run saves the same bug over and over, so only this many crash
+# inputs are replayed and this many listed per fingerprint. Fixed, never derived from the machine.
+MAX_REPLAYED_CRASHES = 64
+MAX_ARTIFACTS_PER_FINGERPRINT = 3
+_DISPATCH_SWITCH_RE = re.compile(r"switch \(harness_selector % (\d+)U\)")
 
 SANITIZER_RUNTIME_ENV = {
     "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
@@ -1203,6 +1213,156 @@ def replay_artifact(
     }
 
 
+def _collapse_duplicate_artifacts(artifacts: list[dict]) -> tuple[list[dict], int]:
+    """At most MAX_ARTIFACTS_PER_FINGERPRINT entries per fingerprint, in order; and how many were dropped."""
+    kept: list[dict] = []
+    per_fp: Counter = Counter()
+    dropped = 0
+    for a in artifacts:
+        fp = a.get("fingerprint")
+        if fp:
+            per_fp[fp] += 1
+            if per_fp[fp] > MAX_ARTIFACTS_PER_FINGERPRINT:
+                dropped += 1
+                continue
+        kept.append(a)
+    return kept, dropped
+
+
+def dispatch_case_count(sources: list[str]) -> int | None:
+    """
+    The number of cases of a `dispatch` harness among `sources` that a build can skip with
+    -D<DISPATCH_SKIP_MACRO> (generate_harness.py), or None: no such harness, or one generated
+    before the macro existed.
+    """
+    for src in sources:
+        try:
+            text = Path(src).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if DISPATCH_SKIP_MACRO not in text:
+            continue
+        m = _DISPATCH_SWITCH_RE.search(text)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def artifact_dispatch_case(artifact: dict, n_cases: int) -> int | None:
+    """The dispatch case an artifact's input selects (its first byte modulo `n_cases`), or None if empty."""
+    try:
+        with open(artifact["artifact"], "rb") as fh:
+            first = fh.read(1)
+    except (OSError, KeyError):
+        return None
+    return first[0] % n_cases if first else None
+
+
+def run_campaign_rounds(
+    binary: Path,
+    max_time: int,
+    *,
+    campaign,
+    rebuild,
+    n_cases: int | None,
+    keep_going: bool = True,
+) -> dict:
+    """
+    A campaign that keeps going after a crash, within `max_time` seconds of fuzzing in all.
+
+    `campaign(binary, max_time, fork)` runs one libFuzzer campaign (run_fuzz_campaign) and
+    `rebuild(mask)` returns (binary, build record) for a build skipping the dispatch cases set in
+    `mask`, binary None when the build failed.
+
+    - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
+      the next round on, so a shallow bug stops ending every run and the other cases get the rest of
+      the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
+      MIN_FUZZ_WALL_S seconds are left, or a rebuild fails.
+    - Any other harness runs once in fork mode with crashes ignored.
+    - Without `keep_going`, one campaign that stops at the first crash, as before.
+    """
+    if not keep_going:
+        return campaign(binary, max_time, False)
+    if n_cases is None:
+        res = campaign(binary, max_time, True)
+        res["keep_going"] = {"mode": "fork"}
+        return res
+
+    skipped: set[int] = set()
+    rounds: list[dict] = []
+    collected: list[dict] = []
+    spent = 0.0
+    last: dict = {}
+    while True:
+        budget = max(MIN_FUZZ_WALL_S, int(max_time - spent))
+        started = time.monotonic()
+        last = campaign(binary, budget, False)
+        spent += time.monotonic() - started
+        arts = last.get("artifacts") or []
+        collected.extend(arts)
+        crashed = sorted(
+            {
+                c
+                for a in arts
+                if a.get("kind") in ("crash", "leak", "timeout", "oom") and not a.get("pre_existing")
+                for c in [artifact_dispatch_case(a, n_cases)]
+                if c is not None
+            }
+        )
+        rnd = {
+            "skipped_cases": sorted(skipped),
+            "max_time": budget,
+            "status": last.get("status"),
+            "returncode": last.get("returncode"),
+            "artifacts": len(arts),
+            "crashed_cases": crashed,
+        }
+        rounds.append(rnd)
+        new = [c for c in crashed if c not in skipped and c < 64]
+        if last.get("status") == "insufficient_memory" or not new:
+            break
+        if max_time - spent < MIN_FUZZ_WALL_S:
+            rnd["stopped"] = "time_budget_spent"
+            break
+        skipped.update(new)
+        if len(skipped) >= n_cases:
+            rnd["stopped"] = "every_case_skipped"
+            break
+        mask = sum(1 << c for c in skipped)
+        next_binary, build = rebuild(mask)
+        if next_binary is None:
+            comp = (build or {}).get("compile") or {}
+            rnd["stopped"] = "rebuild_failed"
+            rnd["rebuild_log_tail"] = str(comp.get("log_tail") or comp.get("stderr") or "")[-2000:]
+            break
+        binary = next_binary
+
+    seen: set[str] = set()
+    unique = []
+    for a in collected:
+        key = a.get("sha256") or a.get("artifact")
+        if key not in seen:
+            seen.add(key)
+            unique.append(a)
+    merged, dropped = _collapse_duplicate_artifacts(unique)
+    out = dict(last)
+    out["artifacts"] = merged
+    if last.get("status") != "insufficient_memory":
+        out["status"] = classify_campaign(last.get("returncode") or 0, bool(last.get("timed_out")), merged)
+    if dropped:
+        omitted = dict(out.get("artifacts_omitted") or {})
+        omitted["duplicates"] = omitted.get("duplicates", 0) + dropped
+        out["artifacts_omitted"] = omitted
+    out["keep_going"] = {
+        "mode": "dispatch_rounds",
+        "dispatch_cases": n_cases,
+        "skipped_cases": sorted(skipped),
+        "fuzz_seconds": round(spent, 1),
+        "rounds": rounds,
+    }
+    return out
+
+
 def classify_campaign(returncode: int, timed_out: bool, artifacts: list[dict]) -> str:
     kinds = {a["kind"] for a in artifacts}
     if "crash" in kinds or "leak" in kinds:
@@ -1431,10 +1591,16 @@ def run_fuzz_campaign(
     attribution_builder=None,
     jobs: int = 1,
     workers: int = 1,
+    fork: bool = False,
 ) -> dict:
     """
     `corpus_dir` receives new units (writable); `extra_corpus` directories are read-only
     seed inputs (e.g. the shared module corpus when a breaker works in its own scratch).
+
+    `fork` runs libFuzzer's fork mode with `-ignore_crashes=1` instead of -jobs/-workers: a crash
+    is saved and fuzzing goes on until `max_time`. The same bug is then usually saved many times,
+    so at most MAX_REPLAYED_CRASHES crash inputs are replayed and the report lists at most
+    MAX_ARTIFACTS_PER_FINGERPRINT per fingerprint (`artifacts_omitted` counts the rest).
 
     `attribution_builder` is an optional zero-argument callable returning the path of a
     Clang ASan+UBSan build of the same slice (or None). It is called at most once, only when
@@ -1489,15 +1655,22 @@ def run_fuzz_campaign(
         elif eff_jobs > 1 and eff_workers == 1:
             eff_workers = eff_jobs
 
-        if eff_workers > 1:
-            cmd.insert(1, f"-workers={eff_workers}")
-        if eff_jobs > 1:
-            cmd.insert(1, f"-jobs={eff_jobs}")
+        extra_env = dict(SANITIZER_RUNTIME_ENV)
+        if fork:
+            # Fork mode keeps its per-job directories under TMPDIR; keep them in the scratch.
+            cmd[1:1] = [f"-fork={eff_workers}", "-ignore_crashes=1"]
+            extra_env["TMPDIR"] = str(scratch.resolve())
+            waves = 1
+        else:
+            if eff_workers > 1:
+                cmd.insert(1, f"-workers={eff_workers}")
+            if eff_jobs > 1:
+                cmd.insert(1, f"-jobs={eff_jobs}")
+            waves = max(1, (eff_jobs + eff_workers - 1) // eff_workers)
         if dict_file and dict_file.exists():
             sanitized_dict = sanitize_fuzzer_dictionary(dict_file, scratch / f"{dict_file.stem}.sanitized.dict")
             cmd.insert(1, f"-dict={sanitized_dict.resolve()}")
 
-        waves = max(1, (eff_jobs + eff_workers - 1) // eff_workers)
         wall_timeout = max_time * waves + 180
         cpu_mult = max(2, eff_workers + 1)
         res = run_sandboxed(
@@ -1505,7 +1678,7 @@ def run_fuzz_campaign(
             writable=[scratch, corpus_dir, artifacts_dir],
             timeout_s=wall_timeout,
             limits=Limits(cpu_seconds=wall_timeout * cpu_mult),
-            extra_env=SANITIZER_RUNTIME_ENV,
+            extra_env=extra_env,
         )
         MAX_WORKER_LOG_BYTES = 1024 * 1024
         worker_logs: list[str] = []
@@ -1561,10 +1734,18 @@ def run_fuzz_campaign(
                     attribution_state["binary"] = None
             return attribution_state["binary"]
 
+        crash_like = sum(1 for p, _ in selected_files if _artifact_kind(p.name) in ("crash", "leak"))
+        replayed = 0
+        unreplayed = 0
         for p, pre_existing in selected_files:
             kind = _artifact_kind(p.name)
             if not kind:
                 continue
+            if kind in ("crash", "leak"):
+                if replayed >= MAX_REPLAYED_CRASHES:
+                    unreplayed += 1
+                    continue
+                replayed += 1
             entry = {
                 "artifact": str(p),
                 "kind": kind,
@@ -1578,7 +1759,8 @@ def run_fuzz_campaign(
                 entry["pre_existing"] = True
             if kind in ("crash", "leak"):
                 replay = replay_artifact(binary, p, scratch, per_input_timeout=per_input_timeout)
-                failure = replay["failure"] or parse_runtime_failure(combined_out)
+                # The campaign log names one failure; it can only stand for this input if it is the only one.
+                failure = replay["failure"] or (parse_runtime_failure(combined_out) if crash_like == 1 else None)
                 entry["reproducible"] = replay["reproduced"]
                 entry["replay_log_tail"] = replay["log_tail"]
                 entry["failure_source"] = "primary" if failure else None
@@ -1605,8 +1787,9 @@ def run_fuzz_campaign(
                     )
             artifacts.append(entry)
 
+        artifacts, omitted = _collapse_duplicate_artifacts(artifacts)
         status = classify_campaign(res.returncode, res.timed_out, artifacts)
-        return {
+        out = {
             "status": status,
             "returncode": res.returncode,
             "timed_out": res.timed_out,
@@ -1614,6 +1797,11 @@ def run_fuzz_campaign(
             "artifacts": artifacts,
             "log_tail": combined_out[-4000:],
         }
+        if fork:
+            out["fork"] = eff_workers
+        if omitted or unreplayed:
+            out["artifacts_omitted"] = {"duplicates": omitted, "not_replayed": unreplayed}
+        return out
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -3452,6 +3640,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not replay unattributed E-ACSL crashes on a sanitizer build",
     )
+    p_camp.add_argument(
+        "--stop-on-first-crash",
+        action="store_true",
+        help=(
+            "End the campaign at the first crash (default: keep going: a dispatch harness reruns "
+            f"with the crashed cases skipped via -D{DISPATCH_SKIP_MACRO}, any other in libFuzzer fork mode)"
+        ),
+    )
     p_camp.add_argument("--module", default="")
     p_camp.add_argument("--out-json", type=Path, required=True)
 
@@ -3902,17 +4098,38 @@ def _run_campaign_mode(args) -> dict:
             args.corpus_dir,
             auto=not getattr(args, "no_auto_dict", False),
         )
-        fuzz = run_fuzz_campaign(
+
+        def _campaign(binary: Path, seconds: int, fork: bool) -> dict:
+            return run_fuzz_campaign(
+                binary,
+                args.corpus_dir,
+                args.artifacts_dir,
+                seconds,
+                dict_file,
+                args.per_input_timeout,
+                extra_corpus=args.extra_corpus,
+                attribution_builder=attribution_builder,
+                jobs=jobs,
+                workers=workers,
+                fork=fork,
+            )
+
+        def _rebuild(mask: int) -> tuple[Path | None, dict]:
+            opts = _build_options(args)
+            # Same engine as the first build, so every round checks the same properties.
+            opts["engine"] = engine_used
+            opts["cppflags"] = f"{opts['cppflags'] or ''} -D{DISPATCH_SKIP_MACRO}={mask:#x}ULL".strip()
+            rebuilt = build_module_binary(args.sources, args.out_bin, **opts)
+            ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine_used
+            return (Path(rebuilt["compile"]["binary"]) if ok else None), rebuilt
+
+        fuzz = run_campaign_rounds(
             Path(comp["binary"]),
-            args.corpus_dir,
-            args.artifacts_dir,
             max_time,
-            dict_file,
-            args.per_input_timeout,
-            extra_corpus=args.extra_corpus,
-            attribution_builder=attribution_builder,
-            jobs=jobs,
-            workers=workers,
+            campaign=_campaign,
+            rebuild=_rebuild,
+            n_cases=dispatch_case_count(args.sources),
+            keep_going=not args.stop_on_first_crash,
         )
         published = (
             cache.publish_corpus(args.module, args.corpus_dir)
