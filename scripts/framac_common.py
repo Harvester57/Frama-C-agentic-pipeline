@@ -74,6 +74,10 @@ _STATUS_MAP = {
 }
 
 
+# A prover's wall-clock budget per profile (docs/v2-design.md Section 9): the brief states it and the
+# scheduler enforces it, so both read it here. FRAMAC_PROVER_WALL_BUDGET_S overrides it.
+PROVER_WALL_BUDGET_S = {"quick": 600, "standard": 900, "deep": 1800}
+
 # The WP manual (Section "Memory models") calls the `cast` model option "unlimited casts (unsound)":
 # a proof under it is a diagnostic, never evidence.
 WP_UNSOUND_MODEL_ISSUE = "WP memory model with 'cast' (unlimited casts) is unsound; the proof is not evidence"

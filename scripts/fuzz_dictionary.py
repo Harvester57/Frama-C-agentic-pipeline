@@ -234,11 +234,8 @@ def build_dictionary(
     return tokens
 
 
-def write_dictionary(out_path: Path | str, tokens: list[str]) -> None:
-    """Write tokens to a file in standard libFuzzer/AFL dictionary syntax."""
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
+def render_dictionary(tokens: list[str]) -> str:
+    """Render tokens in standard libFuzzer/AFL dictionary syntax (deterministic: no timestamps or paths)."""
     lines = [
         "# Frama-C Pipeline Fuzzer Dictionary",
         "# Auto-generated with extreme numeric boundaries and extracted string literals",
@@ -249,7 +246,14 @@ def write_dictionary(out_path: Path | str, tokens: list[str]) -> None:
         lines.append(f'"{tok}"')
 
     lines.append("")
-    out.write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
+
+
+def write_dictionary(out_path: Path | str, tokens: list[str]) -> None:
+    """Write tokens to a file in standard libFuzzer/AFL dictionary syntax."""
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_dictionary(tokens), encoding="utf-8", newline="\n")
 
 
 def main() -> int:

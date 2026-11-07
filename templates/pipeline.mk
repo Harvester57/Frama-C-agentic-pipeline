@@ -116,14 +116,30 @@ eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EV
 	--no-warn-unsigned-downcast \
 	--cppflags=$(CPPFLAGS_$(1))
 
-# One Eva run per module, from the harness's eva_main, with its recorded tuning if it has one.
+# The tuning decision of module $(1): its finished base run and rungs, the recorded loop trials and the
+# per-obligation combination (eva_tuning.py finish). It writes the module's report, and copies the
+# flamegraph.txt of the run the report rests on to workspace/eva/$(1)/.
+eva_finish_cmd = $(PY) $(S)/eva_tuning.py finish $(call eva_args,$(1)) \
+	$(if $(ENTRY_FN_$(1)),--entry-fn=$(ENTRY_FN_$(1))) \
+	--settings-digest $(EVA_TUNE_DIGEST_$(1)) --rungs $(EVA_TUNE_RUNGS_$(1)) --loop-unroll $(EVA_LOOP_UNROLL_$(1)) \
+	$(if $(EVA_TUNE_TIMEOUT_$(1)),--timeout $(EVA_TUNE_TIMEOUT_$(1))) \
+	--report-dir workspace/reports/eva-tuning/$(1) --work-dir workspace/eva/$(1)/tune \
+	--flamegraph-out workspace/eva/$(1)/flamegraph.txt \
+	--out-json workspace/reports/eva/$(1).json
+
+# One Eva run per module, from the harness's eva_main. A module with a current tuning decision
+# (EVA_REPLAY_<mod>) replays it instead: its base run and recorded rungs (cached by content), then
+# `finish --replay-only`, so its report is the one `eva-tune` writes, never a single less precise run.
+# A decision found stale against the new base run gives the base run's report and is not re-recorded.
+eva_plain_cmd = $(PY) $(S)/run_eva_slice.py $(call eva_args,$(1)) --out-dir workspace/eva/$(1) \
+	$(EVA_OPTIONS_$(1)) $(EVA_LOOPS_$(1)) \
+	$(if $(EVA_TIMEOUT_$(1)),--timeout $(EVA_TIMEOUT_$(1))) \
+	--out-json workspace/reports/eva/$(1).json
 eva: $(EVA_TARGETS)
+$(foreach m,$(EVA_MODULES),$(if $(EVA_REPLAY_$(m)),$(eval eva-$(m): evabase-$(m) $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))))
 $(EVA_TARGETS): eva-%:
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
-		$(PY) $(S)/run_eva_slice.py $(call eva_args,$*) --out-dir workspace/eva/$* \
-		$(EVA_OPTIONS_$*) $(EVA_LOOPS_$*) \
-		$(if $(EVA_TIMEOUT_$*),--timeout $(EVA_TIMEOUT_$*)) \
-		--out-json workspace/reports/eva/$*.json
+		$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*))
 
 # Eva ladder: the module's own settings first; `pipeline_make.py run` then regenerates modules.mk, so
 # only modules left with Unknowns get rungs. A rung is optional, so a failed one never blocks `finish`,
@@ -152,17 +168,15 @@ eva-tune: $(EVA_TUNE_TARGETS)
 $(foreach m,$(EVA_MODULES),$(eval evatune-$(m): $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r))))
 $(EVA_TUNE_TARGETS): evatune-%:
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
-		$(PY) $(S)/eva_tuning.py finish $(call eva_args,$*) \
-		$(if $(ENTRY_FN_$*),--entry-fn=$(ENTRY_FN_$*)) \
-		--settings-digest $(EVA_TUNE_DIGEST_$*) --rungs $(EVA_TUNE_RUNGS_$*) --loop-unroll $(EVA_LOOP_UNROLL_$*) \
-		$(if $(EVA_TUNE_TIMEOUT_$*),--timeout $(EVA_TUNE_TIMEOUT_$*)) \
-		--report-dir workspace/reports/eva-tuning/$* --work-dir workspace/eva/$*/tune \
-		--out-json workspace/reports/eva/$*.json
+		$(call eva_finish_cmd,$*)
 
-# Render the Eva flamegraph (flamegraph.svg/html) of a module from the flamegraph.txt its eva-<mod>
-# run wrote. Troubleshooting aid for slow runs; never blocks the pipeline, hence the `-`.
+# Render the Eva flamegraph (flamegraph.svg/html) of a module from the workspace/eva/<mod>/flamegraph.txt
+# its last eva-<mod> or eva-tune left. It never runs Eva (that would replace the module's report), so it
+# fails when there is no flamegraph.txt yet. Rendering is a troubleshooting aid, hence the `-`.
 flamegraph: $(FLAMEGRAPH_TARGETS)
-$(FLAMEGRAPH_TARGETS): flamegraph-%: eva-%
+$(FLAMEGRAPH_TARGETS): flamegraph-%:
+	@test -f workspace/eva/$*/flamegraph.txt || { \
+		echo "flamegraph-$*: workspace/eva/$*/flamegraph.txt not found: run eva-$* or eva-tune first" >&2; exit 1; }
 	-$(RUN) --class light --key $* --output workspace/eva/$*/flamegraph.svg -- \
 		$(PY) $(S)/eva_flamegraph.py --dir workspace/eva/$*
 

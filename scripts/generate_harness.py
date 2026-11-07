@@ -1455,8 +1455,9 @@ def generate_module_harness(
         null_terminate=effective_null_terminate,
         auto_params=auto_params,
     )
-    if call_expr or eva_expr or fuzz_expr:
-        _validate_call_expr_arity(entry_fn, call_expr or eva_expr or fuzz_expr, sources, norm_cppflags)
+    arity_expr = call_expr or eva_expr or fuzz_expr
+    if arity_expr:
+        _validate_call_expr_arity(entry_fn, arity_expr, sources, norm_cppflags)
     sources = _merge_dag_harness_sources(
         out_dir,
         sources,
@@ -1592,6 +1593,10 @@ def generate_module_harness(
         "ldflags": norm_ldflags,
         "entry_fn": entry_fn,
         "entry_style": entry_style,
+        # The globals a `global_buffer` entry writes the input into: workspace_overlay's trust-boundary
+        # check treats them as entry parameters. Null for every other entry style.
+        "global_buf": global_buf if entry_style == "global_buffer" else None,
+        "global_len": (global_len or None) if entry_style == "global_buffer" else None,
         "self_harnessed": effective_self_harnessed,
         "null_terminate": effective_null_terminate,
         "call_expr": call_expr,

@@ -373,6 +373,8 @@ def validate_agent_result(data) -> Errors:
             errors.add("$.fault_hypothesis: a reproduced crash is not a hypothesis; set null")
     elif role == "architect":
         _under_agent_dir(errors, "$.patch", aid, data["patch"])
+        for idx, item in enumerate(data.get("functions") or []):
+            _path_ok(errors, f"$.functions[{idx}].file", item.get("file"))
     elif role == "crash_verifier":
         record = data["record"]
         for e in validate_findings([record]):

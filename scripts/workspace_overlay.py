@@ -55,6 +55,7 @@ from acsl_ast import (  # noqa: E402
     extract_top_level_acsl_declarations,
     function_contract_text,
     function_param_names,
+    locate_all_prototype_spans,
     locate_function_span,
     splice_architect_header,
     splice_prover_changes,
@@ -62,6 +63,7 @@ from acsl_ast import (  # noqa: E402
     verify_acsl_only,
 )
 from framac_common import (  # noqa: E402
+    PROVER_WALL_BUDGET_S,
     ArtifactError,
     atomic_write_json,
     eva_alarm_in_file,
@@ -2360,12 +2362,10 @@ def prepare_agent(
         env_wall = (os.environ.get("FRAMAC_PROVER_WALL_BUDGET_S") or "").strip()
         if env_wall.isdigit() and int(env_wall) > 0:
             max_wall_clock_s = int(env_wall)
-        elif profile == "quick" or verifiability == "shell_unverifiable_wp":
+        elif verifiability == "shell_unverifiable_wp":
             max_wall_clock_s = 300
-        elif profile == "deep":
-            max_wall_clock_s = 1800
         else:
-            max_wall_clock_s = 900
+            max_wall_clock_s = PROVER_WALL_BUDGET_S.get(profile, PROVER_WALL_BUDGET_S["standard"])
         max_wp_invocations = effective_max_retries + 2
         budget_payload = {
             "agent_id": agent_id,
@@ -2564,11 +2564,53 @@ def export_diff(overlay_dir: Path, out_patch: Path) -> dict:
 
     out_patch.parent.mkdir(parents=True, exist_ok=True)
     out_patch.write_text("\n".join(diff_chunks), encoding="utf-8")
+    manifest = _contracts_manifest(overlay_dir, work_dir, [m for m in modified_files if m.endswith((".h", ".acsl"))])
+    atomic_write_json(contracts_dir / "MANIFEST.json", manifest)
     return {
         "patch_file": str(out_patch),
         "modified_files": modified_files,
         "modified_count": len(modified_files),
+        "contracts_manifest": (contracts_dir / "MANIFEST.json").as_posix(),
+        "contracts_by_status": manifest["by_status"],
     }
+
+
+def _contracts_manifest(overlay_dir: Path, work_dir: Path, headers: list[str]) -> dict:
+    """
+    What each exported header contract is worth: the patch carries every merged contract (callers were
+    proven against them), but only a contract whose function is `covered` in the ledger is proven. Each
+    contracted prototype gets its function's status: `proven` (every unit covered, no open assumption),
+    `proven_under_assumptions`, or `unproven` (a contract other proofs rely on, not established itself).
+    """
+    ledger_units = load_json_optional(overlay_dir.parent / "coverage-ledger.json", [])
+    by_fn: dict[str, list[dict]] = {}
+    for u in ledger_units if isinstance(ledger_units, list) else []:
+        if isinstance(u, dict) and u.get("status") not in ("deferred", "out_of_scope", "not_applicable"):
+            by_fn.setdefault(str(u.get("function")), []).append(u)
+
+    def status_of(fn: str) -> str:
+        units = by_fn.get(fn) or []
+        if not units or any(u.get("status") != "covered" for u in units):
+            return "unproven"
+        return "proven_under_assumptions" if any(u.get("assumptions") for u in units) else "proven"
+
+    entries: dict[str, list[dict]] = {}
+    counts: dict[str, int] = {}
+    for rel_str in headers:
+        try:
+            source = (work_dir / rel_str).read_text(encoding="utf-8", errors="replace")
+            spans = locate_all_prototype_spans(source, path=rel_str)
+        except (OSError, AcslError):
+            spans = []
+        rows = []
+        for span in spans:
+            if "/*@" not in span.text and "//@" not in span.text:
+                continue
+            st = status_of(span.function)
+            counts[st] = counts.get(st, 0) + 1
+            rows.append({"function": span.function, "status": st})
+        entries[rel_str] = rows
+    return {"generated_at": utc_now(), "headers": entries, "by_status": counts}
 
 
 def apply_in_place(overlay_dir: Path, target_dir: Path) -> dict:

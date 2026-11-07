@@ -38,26 +38,26 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 
 ## P2 Medium
 
-| ID | Class | Defect | Remediation |
-|---|---|---|---|
-| M1 | degradation | Auto-dictionary described in `framac-fuzz` SKILL (and `--no-auto-dict`) is not implemented. | Implement in `run_eacsl_fuzz.py campaign`, or remove from the skill. |
-| M2 | degradation | Eva tuning is lost: `eva-<mod>` does not reproduce the per-obligation combination; a stale settings digest silently falls back to base; `run eva`, `module-<mod>` and `flamegraph-<mod>` overwrite the combined report. | Make `eva-<mod>` replay `eva-tune` when a current decision exists; warn on stale digest; decouple `flamegraph-<mod>` from `eva-%`. |
-| M3 | recall | Fuzz and Eva fingerprints can disagree on the alarm kind (`normalize_kind` scans the predicate before the label). | Prefer the label kind when present on both sides. |
-| M4 | degradation | Skill command lines miss the rw-cache allowlist (`run ingest replay wp-queue`) or use `$S`. | Split the commands as in `framac-verify`; replace `$S`. |
-| M5 | degradation | `FRAMAC_FRAME_SKELETON`, `FRAMAC_LOOP_TEMPLATES`, `FRAMAC_SPEC_KB` are not forwarded by either wrapper. | Add to both knob lists. |
-| M6 | isolation | The PowerShell wrapper and docker-compose run the container as root; the POSIX wrapper sets `--user`. | Set `--user` on Linux hosts in PS1 and in compose. |
-| M7 | doc | Quick-profile prover wall budget: brief 300 s, scheduler 600 s. | Use one constant. |
-| M8 | doc | Gate granularity: call-cone gating only applies to modules without a sidecar; exhausted repairs block only linked units. | Align SKILL text (or implement cone gating). |
-| M9 | workflow | Final record re-verification (standard/deep) is described but not implemented. | Add a scheduler step or remove the claim. |
-| M10 | soundness | `covered` from a pre-repair harness survives a repair that widens reached contexts. | On `refresh --module`, re-plan Eva-covered units of the module. |
-| M11 | degradation | `docs/references` is not in the image (mounted only by wrappers). | Copy into the image. |
-| M12 | degradation | The Eva guidance command omits `--no-warn-unsigned-downcast`. | Add the flag to the skill. |
-| M13 | doc | `wp-sweep` is said to feed the shared proof cache; it runs with `--cache-dir off`. | Fix the docs or publish swept proofs. |
-| M14 | doc | Tamper-evidence via fingerprints (`v2-design.md` §3) is not implemented. | Recompute fingerprints in `validate_artifacts.py`, or reword. |
-| M15 | soundness | `export-diff` copies unproven headers into the "verified" contracts output. | Copy only headers whose contracts back covered units, or rename the output. |
-| M16 | recall | A prover `code_fault` candidate finds its crash input by parsing the guardrail's truncated `runtime_trace`. | Have `run_eacsl_fuzz.py guardrail` write an explicit `crash_input` path into a `code_fault` report. |
-| M17 | soundness | Architect `boundary_assumptions` are not recorded: the architect result does not name the functions it contracted. | Add a `functions` list to the architect result (schema, brief, validator); `ledger.py record-boundary-assumptions` then records them. |
-| M18 | soundness | The trust-boundary check cannot see `global_buffer` entries: the sidecar does not record `global_buf` / `global_len`. | Record them in `generate_harness.py`. |
+| ID | Class | Defect | Remediation | Status |
+|---|---|---|---|---|
+| M1 | degradation | Auto-dictionary described in `framac-fuzz` SKILL (and `--no-auto-dict`) is not implemented. | Implement in `run_eacsl_fuzz.py campaign`, or remove from the skill. | Fixed |
+| M2 | degradation | Eva tuning is lost: `eva-<mod>` does not reproduce the per-obligation combination; a stale settings digest silently falls back to base; `run eva`, `module-<mod>` and `flamegraph-<mod>` overwrite the combined report. | Make `eva-<mod>` replay `eva-tune` when a current decision exists; warn on stale digest; decouple `flamegraph-<mod>` from `eva-%`. | Fixed |
+| M3 | recall | Fuzz and Eva fingerprints can disagree on the alarm kind (`normalize_kind` scans the predicate before the label). | Prefer the label kind when present on both sides. | Fixed |
+| M4 | degradation | Skill command lines miss the rw-cache allowlist (`run ingest replay wp-queue`) or use `$S`. | Split the commands as in `framac-verify`; replace `$S`. | Fixed |
+| M5 | degradation | `FRAMAC_FRAME_SKELETON`, `FRAMAC_LOOP_TEMPLATES`, `FRAMAC_SPEC_KB` are not forwarded by either wrapper. | Add to both knob lists. | Fixed |
+| M6 | isolation | The PowerShell wrapper and docker-compose run the container as root; the POSIX wrapper sets `--user`. | Set `--user` on Linux hosts in PS1 and in compose. | Fixed |
+| M7 | doc | Quick-profile prover wall budget: brief 300 s, scheduler 600 s. | Use one constant. | Fixed |
+| M8 | doc | Gate granularity: call-cone gating only applies to modules without a sidecar; exhausted repairs block only linked units. | Align SKILL text (or implement cone gating). | Docs aligned |
+| M9 | workflow | Final record re-verification (standard/deep) is described but not implemented. | Add a scheduler step or remove the claim. | Docs aligned (instruction, not mechanised) |
+| M10 | soundness | `covered` from a pre-repair harness survives a repair that widens reached contexts. | On `refresh --module`, re-plan Eva-covered units of the module. | Fixed |
+| M11 | degradation | `docs/references` is not in the image (mounted only by wrappers). | Copy into the image. | Fixed |
+| M12 | degradation | The Eva guidance command omits `--no-warn-unsigned-downcast`. | Add the flag to the skill. | Fixed |
+| M13 | doc | `wp-sweep` is said to feed the shared proof cache; it runs with `--cache-dir off`. | Fix the docs or publish swept proofs. | Docs aligned (publishing swept proofs still open) |
+| M14 | doc | Tamper-evidence via fingerprints (`v2-design.md` §3) is not implemented. | Recompute fingerprints in `validate_artifacts.py`, or reword. | Docs aligned (no fingerprint recompute) |
+| M15 | soundness | `export-diff` copies unproven headers into the "verified" contracts output. | Copy only headers whose contracts back covered units, or rename the output. | Fixed |
+| M16 | recall | A prover `code_fault` candidate finds its crash input by parsing the guardrail's truncated `runtime_trace`. | Have `run_eacsl_fuzz.py guardrail` write an explicit `crash_input` path into a `code_fault` report. | Fixed |
+| M17 | soundness | Architect `boundary_assumptions` are not recorded: the architect result does not name the functions it contracted. | Add a `functions` list to the architect result (schema, brief, validator); `ledger.py record-boundary-assumptions` then records them. | Fixed |
+| M18 | soundness | The trust-boundary check cannot see `global_buffer` entries: the sidecar does not record `global_buf` / `global_len`. | Record them in `generate_harness.py`. | Fixed |
 
 ## P3 Low (documentation drift)
 
@@ -80,4 +80,5 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 
 1. P0 (C1–C5) — done in this change, with tests.
 2. P1 (H1–H10) — done, with tests. H8 records architect boundary assumptions only once the architect result names its functions (schema change pending, P2).
-3. P2, then a single doc pass for P3.
+3. P2 (M1–M18) — done, with tests; M8, M9, M13 and M14 were settled by aligning the docs with the code.
+4. A single doc pass for P3.

@@ -134,7 +134,7 @@ Execute `skills/framac-wp/SKILL.md`. Its scheduler loop handles everything:
 - **Gate.** Verifier tasks for every `unverified` candidate (`skills/framac-wp/crash_verifier_brief.md`):
   - `confirmed`: the function's units become `candidate` and are excluded from WP. Optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
   - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run module-<mod>`, then `wp_scheduler.py refresh --module <mod>`.
-  - After two attempts, the module's remaining active units become `blocked` (`harness_repair_exhausted`).
+  - After two attempts, the candidate's linked units become `blocked` (`harness_repair_exhausted`). Regenerating the harness keeps the recorded attempts.
 - **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine. Under `--profile quick` the scheduler proves only the Tier 1A entry chains and closes every other planned unit itself (`quick_profile_wp_not_scheduled`), so the loop still reaches `done`. Only when the user explicitly skips Phase 3 altogether, close the remaining `planned` units with `python3 /opt/framac-pipeline/scripts/ledger.py close-remaining --reason "quick_profile_wp_not_scheduled: Phase 3 WP not run in quick profile"`; otherwise run the Phase 3 scheduler loop to completion.
 
 Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 3 --from-file state/wp_schedule.json`.

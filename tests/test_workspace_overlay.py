@@ -379,7 +379,7 @@ def test_prepare_agent_scales_max_retries_by_profile(tmp_path):
     src.mkdir(parents=True)
     (src / "m.c").write_text("int f(int x) { return x; }\n", encoding="utf-8")
 
-    for profile, expected_retries, expected_wall in (("quick", 2, 300), ("standard", 4, 900), ("deep", 6, 1800)):
+    for profile, expected_retries, expected_wall in (("quick", 2, 600), ("standard", 4, 900), ("deep", 6, 1800)):
         run_dir = tmp_path / f"run_{profile}"
         WO.init_overlay(target, run_dir / "workspace")
         (run_dir / "run-metadata.json").write_text(json.dumps({"profile": profile}), encoding="utf-8")

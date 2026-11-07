@@ -70,7 +70,9 @@ _LABEL_RE = re.compile(
     r"^\s*(?:(?:assert|check|admit)\s+|(?:assert|check|admit|rte|eva|e-acsl|wp)\s*:\s*)+",
     re.IGNORECASE,
 )
-_KIND_LABEL_RE = re.compile(r"^\s*(?:rte/)?(?:" + "|".join(KNOWN_ALARM_KINDS) + r")\s*:\s*", re.IGNORECASE)
+# Longest first, so `is_nan_or_infinite` is never read as `is_nan`.
+_KINDS_ALT = "|".join(sorted(KNOWN_ALARM_KINDS, key=len, reverse=True))
+_KIND_LABEL_RE = re.compile(r"^\s*(?:rte/)?(?:" + _KINDS_ALT + r")\s*:(?!:)\s*", re.IGNORECASE)
 # Frama-C prints ACSL with Unicode symbols unless -no-unicode; E-ACSL reports and Eva/WP CSVs differ.
 _UNICODE_ACSL = {
     "≤": "<=",
@@ -123,15 +125,67 @@ def normalize_file(path: str) -> str:
 
 
 def detect_alarm_kind(predicate: str) -> str:
+    """
+    The first known alarm kind named anywhere in a short label or kind string (`rte/mem_access`,
+    `Assertion rte/index_bound`). Not for a predicate body: an identifier such as `shift` matches.
+    """
     text = (predicate or "").lower()
     for kind in KNOWN_ALARM_KINDS:
-        if re.search(r"(?<![a-z_])" + re.escape(kind) + r"(?![a-z_])", text):
+        if re.search(r"(?<![a-z0-9_])" + re.escape(kind) + r"(?![a-z0-9_])", text):
             return kind
     return ""
 
 
+# A kind used as a label inside a predicate: `rte/shift` anywhere, or `shift:` (not `::`, not `?:`).
+_LABELLED_KIND_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_])rte/(" + _KINDS_ALT + r")(?![A-Za-z0-9_]))"
+    r"|(?:(?<![A-Za-z0-9_\\])(" + _KINDS_ALT + r")\s*:(?!:))",
+    re.IGNORECASE,
+)
+
+
+def _strip_generic_labels(text: str) -> str:
+    previous = None
+    while previous != text:
+        previous = text
+        text = _LABEL_RE.sub("", text)
+    return text
+
+
+def leading_alarm_kind(predicate: str) -> str:
+    """The alarm kind of a leading `<kind>:` label (after `assert`, `rte:` ...), or ''."""
+    text = _strip_generic_labels((predicate or "").strip())
+    m = re.match(r"^\s*(?:rte/)?(" + _KINDS_ALT + r")\s*:(?!:)", text, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+
+def detect_predicate_alarm_kind(predicate: str) -> str:
+    """
+    An alarm kind found in a predicate only where it is used as a label (`rte/<kind>`, `<kind>:`),
+    never a C identifier that happens to share its name (`p + shift`, `index`, `overlap(a, b)`).
+    """
+    leading = leading_alarm_kind(predicate)
+    if leading:
+        return leading
+    text = predicate or ""
+    for m in _LABELLED_KIND_RE.finditer(text):
+        if m.group(1):
+            return m.group(1).lower()
+        # `c ? shift : 0` and `f(a, overlap: ...)`-like operands are expressions, not labels.
+        before = text[: m.start()].rstrip()
+        if not before or before[-1] not in "?+-*/%<>=!&|^,([{~":
+            return m.group(2).lower()
+    return ""
+
+
 def normalize_kind(kind: str, predicate: str = "") -> str:
-    alarm = detect_alarm_kind(predicate) or detect_alarm_kind(kind)
+    """
+    The property kind of a fingerprint, in order of reliability: an explicit `<kind>:` label on the
+    predicate, then the caller's kind when it names a known alarm kind, then a kind used as a label
+    inside the predicate, then the normalized ACSL kind. Fuzz passes the predicate without its label
+    and Eva with it, so the label and the kind argument must win over words inside the predicate.
+    """
+    alarm = leading_alarm_kind(predicate) or detect_alarm_kind(kind) or detect_predicate_alarm_kind(predicate)
     if alarm:
         return "ptr_value" if alarm == "pointer_value" else alarm
     k = re.sub(r"[^a-z0-9]+", "_", (kind or "").lower()).strip("_")
@@ -155,6 +209,8 @@ def normalize_predicate(predicate: str) -> str:
     text = (predicate or "").strip()
     for symbol, ascii_form in _UNICODE_ACSL.items():
         text = text.replace(symbol, ascii_form)
+    # Labels go before hashing, whichever side kept them: E-ACSL reports the label apart from the
+    # predicate, Eva's annotation carries it (`mem_access: \valid_read(p)`).
     previous = None
     while previous != text:
         previous = text

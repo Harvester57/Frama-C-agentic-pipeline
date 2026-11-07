@@ -46,8 +46,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -677,21 +680,52 @@ def build_record(
     }
 
 
+def publish_flamegraph(report: dict, dest: Path | None) -> None:
+    """
+    Copy the flamegraph.txt of the run a module's report rests on to `dest` (workspace/eva/<mod>/), where
+    `flamegraph-<mod>` renders it; remove a stale one when that run left none.
+    """
+    if dest is None:
+        return
+    src = report.get("flamegraph_file")
+    src_path = Path(src) if isinstance(src, str) and src else None
+    if src_path is None or not src_path.is_file():
+        dest.unlink(missing_ok=True)
+        return
+    if src_path.resolve() == dest.resolve():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".tmp_flamegraph_")
+    os.close(fd)
+    try:
+        shutil.copyfile(src_path, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def finish(args: argparse.Namespace) -> dict:
     """
     Decide for one module from its finished trials: write the module's report (the only one the ledger
     reads) and the evidence, and record the decision in params.json unless this was a replay of it.
+
+    With `replay_only` (what `eva-<mod>` runs for a module with a recorded decision) it never searches:
+    a decision that does not match this base run (settings or sources changed) gives the base run's
+    report, the same a plain Eva run of the base options writes, and nothing is recorded.
     """
     from pipeline_make import load_params, record_eva_tuning
 
     tuner = Tuner(args)
     base = tuner.read_trial("base")
     rungs = [tuner.read_trial(name) for name in args.rungs]
+    flamegraph_out = Path(args.flamegraph_out) if getattr(args, "flamegraph_out", None) else None
 
     def write(report: dict) -> dict:
         report["module"] = args.module
         atomic_write_json(Path(args.out_json), report)
         atomic_write_json(tuner.report_dir / "decision.json", report.get("tuning") or {})
+        publish_flamegraph(report, flamegraph_out)
         return report
 
     if not base.completed:
@@ -713,6 +747,14 @@ def finish(args: argparse.Namespace) -> dict:
 
     record = load_params(args.run_dir)["modules"].get(args.module, {}).get("eva_tuned")
     replay = record_is_current(record, args.settings_digest, base.report.get("input_digest"))
+    if getattr(args, "replay_only", False) and not replay:
+        stale = {**base.report, **base.reach}
+        stale["tuning"] = {
+            "mode": "skipped",
+            "reason": "the recorded decision does not match this base run (settings or sources changed): "
+            "run eva-tune to tune again",
+        }
+        return write(stale)
     by_name = {run.name: run for run in rungs}
 
     if replay:
@@ -810,6 +852,16 @@ def main(argv: list[str] | None = None) -> int:
     p_finish.add_argument("--work-dir", required=True)
     p_finish.add_argument("--run-dir", type=Path, default=Path("."))
     p_finish.add_argument("--out-json", required=True)
+    p_finish.add_argument(
+        "--flamegraph-out",
+        default=None,
+        help="Copy the flamegraph.txt of the run the report rests on here (workspace/eva/<mod>/flamegraph.txt)",
+    )
+    p_finish.add_argument(
+        "--replay-only",
+        action="store_true",
+        help="Replay a current recorded decision, never search: a stale one gives the base run's report (eva-<mod>)",
+    )
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
     report = finish(args)

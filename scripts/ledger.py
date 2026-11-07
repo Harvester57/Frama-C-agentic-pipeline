@@ -655,6 +655,13 @@ def _extract_eva_report_sources(report: dict) -> set[str] | None:
     return files or None
 
 
+def _wp_discharged(unit: dict) -> bool:
+    """Whether a WP proof, not only Eva, discharges this unit."""
+    return any(
+        isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging") for e in unit.get("evidence") or []
+    )
+
+
 @ledger_locked
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -854,6 +861,31 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     tool_output,
                     "Eva reported no property for this function (trivial or not reached).",
                 )
+            established = has_props and not unit_unknowns and not unit_deads and not unit_others
+            if not established and u["status"] == "covered" and not _wp_discharged(u):
+                # This unit was covered by an earlier Eva run alone (for example under the harness a repair
+                # replaced): the current report no longer establishes it, so it is open again.
+                u["status"] = "planned"
+                u["agent_id"] = None
+                u["unresolved"] = []
+                u["assumptions"] = [
+                    a
+                    for a in u["assumptions"]
+                    if not (
+                        a.get("kind") == "boundary_assumption"
+                        and str(a.get("description") or "").startswith(("Eva result holds", "Eva slice '"))
+                    )
+                ]
+                add_evidence(
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    "eva_cover_withdrawn",
+                    False,
+                    tool_output,
+                    "A later Eva report of this module no longer proves every RTE obligation here; back to planned.",
+                )
+                stats["reopened"] = stats.get("reopened", 0) + 1
 
         # Ingest cross-module Invalid alarms when a slice compiles sibling source files.
         cross_rte_units = [
@@ -1506,6 +1538,12 @@ def _prover_code_fault_reports(res: dict, aid: str) -> list[str]:
 def _guardrail_crash_input(report: dict, aid: str) -> str | None:
     """Run-relative crashing input libFuzzer wrote under agents/<aid>/scratch/ (from `runtime_trace`)."""
     marker = f"agents/{aid}/scratch/"
+    # The guardrail names the input itself; the truncated trace is the fallback for older reports.
+    explicit = str(report.get("crash_input") or "").replace("\\", "/")
+    if explicit.startswith(marker) and is_safe_relative_path(explicit):
+        p = Path(explicit)
+        if p.is_file() and not p.is_symlink():
+            return explicit
     for m in _TEST_UNIT_WRITTEN_RE.finditer(str(report.get("runtime_trace") or "")):
         path = m.group("path").replace("\\", "/")
         idx = path.find(marker)
@@ -1597,9 +1635,10 @@ def _ingest_prover_code_fault(
 def cmd_record_boundary_assumptions(result_path: Path) -> dict:
     """
     Record an agent's `boundary_assumptions` (remediation plan H8) as `boundary_assumption` entries on
-    the units its work credits. Prover: every unit of its function that is not deferred / out_of_scope /
-    not_applicable. Architect: its result names no function (schema: header, patch, notes), so nothing
-    is recorded and the result says so. Idempotent: an assumption already on a unit is not added again.
+    the units its work credits: every unit that is not deferred / out_of_scope / not_applicable of the
+    prover's function, or of each function an architect lists in `functions` (an architect result
+    without that list records nothing and says so). Idempotent: an assumption already on a unit is
+    not added again.
     """
     res = load_agent_result_json(result_path)
     errs = validate_agent_result(res)
@@ -1615,6 +1654,10 @@ def cmd_record_boundary_assumptions(result_path: Path) -> dict:
             descriptions.append(d)
     out: dict[str, Any] = {"agent_id": res["agent_id"], "role": role, "assumptions": len(descriptions)}
     if role == "architect":
+        functions = [(str(f["file"]), str(f["function"])) for f in res.get("functions") or []]
+    else:
+        functions = [(str(res["file"]), str(res["function"]))]
+    if not functions:
         out.update(
             {
                 "units": [],
@@ -1624,7 +1667,12 @@ def cmd_record_boundary_assumptions(result_path: Path) -> dict:
         )
         return out
     units, candidates = load_state()
-    targets = [u for u in units_for_function(units, res["file"], res["function"]) if u["status"] not in NO_TOUCH]
+    targets = [
+        u
+        for file, function in functions
+        for u in units_for_function(units, file, function)
+        if u["status"] not in NO_TOUCH
+    ]
     added = 0
     for u in targets:
         for d in descriptions:
@@ -1636,7 +1684,8 @@ def cmd_record_boundary_assumptions(result_path: Path) -> dict:
         commit(units, candidates, run_dir=Path.cwd())
     out.update({"units": sorted(u["coverage_id"] for u in targets), "added": added})
     if descriptions and not targets:
-        out["skipped_reason"] = f"no schedulable ledger unit for {res['file']}#{res['function']}"
+        names = ", ".join(f"{file}#{function}" for file, function in functions)
+        out["skipped_reason"] = f"no schedulable ledger unit for {names}"
     return out
 
 

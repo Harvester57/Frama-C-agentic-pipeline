@@ -102,6 +102,18 @@
         "patch": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
         "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/evidence_item"}},
         "boundary_assumptions": {"type": "array", "items": {"$ref": "#/definitions/text"}},
+        "functions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file": {"$ref": "#/definitions/relpath"},
+              "function": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}
+            },
+            "required": ["file", "function"],
+            "additionalProperties": false
+          }
+        },
         "notes": {"type": "string"}
       },
       "required": ["role", "agent_id", "header", "status", "patch", "evidence", "boundary_assumptions", "notes"],

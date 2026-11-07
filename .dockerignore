@@ -10,6 +10,9 @@
 !schemas/**
 !skills/
 !skills/**
+# Only the greppable Frama-C manuals from docs/ (do not re-include docs/ itself: that would pull in all of it)
+!docs/references/
+!docs/references/**
 
 # Exclude Python bytecode/caches inside allowed directories
 **/__pycache__/

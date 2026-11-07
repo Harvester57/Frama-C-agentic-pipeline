@@ -415,6 +415,17 @@ $hardeningArgs = @(
     "--cap-drop", "ALL",
     "--security-opt", "no-new-privileges"
 )
+# As in framac-docker.sh: on a Linux/macOS host, rootful Docker runs the job as the calling user so the run
+# directory never collects root-owned files. Windows Docker Desktop bind mounts are not uid-owned, and
+# Podman (rootless) maps the caller to the container's root already.
+if ($OuterSandbox -eq "docker-hardened" -and ($IsLinux -or $IsMacOS)) {
+    $hostUid = ([string](& id -u | Select-Object -First 1)).Trim()
+    $hostGid = ([string](& id -g | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $hostUid -notmatch '^\d+$' -or $hostGid -notmatch '^\d+$') {
+        throw "Could not determine the host uid/gid with 'id -u' / 'id -g'."
+    }
+    $hardeningArgs += @("--user", "${hostUid}:${hostGid}")
+}
 $envArgs = @(
     "-e", "PYTHONIOENCODING=utf-8",
     "-e", "S=/opt/framac-pipeline/scripts",
@@ -428,8 +439,10 @@ $envArgs = @(
     "-e", "FRAMAC_TARGET_DIRTY=$TargetDirty"
 )
 # Pipeline knobs that scripts read inside the container: forwarded when set on the host.
+# Keep this list identical to framac-docker.sh and docker-compose.yml (tests/test_remediation_p2_container.py).
 foreach ($knob in @("FRAMAC_CACHE", "FRAMAC_CACHE_MAX", "FRAMAC_MAX_AGENTS", "FRAMAC_SCHEDULER", "FRAMAC_LOCK_TIMEOUT",
-                    "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_PROVER_WALL_BUDGET_S", "FRAMAC_PROVER_CONTEXT", "FRAMAC_RESOURCES_VERBOSE")) {
+                    "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_PROVER_WALL_BUDGET_S", "FRAMAC_PROVER_CONTEXT",
+                    "FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB", "FRAMAC_RESOURCES_VERBOSE")) {
     $knobValue = [Environment]::GetEnvironmentVariable($knob)
     if ($knobValue) { $envArgs += @("-e", "$knob=$knobValue") }
 }

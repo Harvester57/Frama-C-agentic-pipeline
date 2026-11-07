@@ -73,12 +73,21 @@ RUN if [ -n "${TARGET_APT_PACKAGES}" ]; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Copy pipeline scripts, templates, schemas, and skills into /opt/framac-pipeline for container-internal access
+# Copy pipeline scripts, templates, schemas, skills and the greppable Frama-C manuals (docs/references,
+# read by agents at /opt/framac-pipeline/docs/references) into /opt/framac-pipeline, so the published
+# image is complete without the wrappers' bind mounts (which may still mount over these directories).
 COPY scripts/ /opt/framac-pipeline/scripts/
 COPY templates/ /opt/framac-pipeline/templates/
 COPY schemas/ /opt/framac-pipeline/schemas/
 COPY skills/ /opt/framac-pipeline/skills/
-RUN chmod +x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh
+COPY docs/references/ /opt/framac-pipeline/docs/references/
+# Jobs run as an arbitrary non-root uid (the wrappers pass --user <host uid>:<host gid>; compose uses
+# FRAMAC_UID/FRAMAC_GID): everything they read must be world-readable, and HOME plus the default working
+# directory must be writable by any uid (sticky, like /tmp), since that uid has no passwd entry or home.
+RUN chmod -R a+rX /opt/framac-pipeline \
+    && chmod a+x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh \
+    && mkdir -p /home/opam/.cache /framac-run \
+    && chmod 1777 /home/opam /home/opam/.cache /framac-run
 
 WORKDIR /framac-run
 

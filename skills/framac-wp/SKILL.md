@@ -32,7 +32,7 @@ How resources are measured and how caches work: [resources-and-caching.md](../..
    - its callees have an initial contract in `workspace/work/` (speculative contract-first dispatch; callers do not wait for callee body proofs);
    - internal static callees without any contract are proven first (Option A);
    - leaf and internal static functions run concurrently with module architects (`arch:<module>`);
-   - verify tasks gate only functions within their direct call cone; safe functions remain unblocked.
+   - a module's open verify tasks gate the provers of that module (the finer call-cone gating applies only to a module without a harness sidecar); provers of other modules are not blocked.
 
    Tasks are prioritized by caller height, then Eva unknown count, then function name.
 2. **Crash Verification Gate.** Every `unverified` candidate becomes a `verify` task for a fresh Crash Verifier subagent.
@@ -135,9 +135,10 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
 2. In `standard` and `deep` profiles, if any finding record in `findings.json` was upgraded or had its root cause or severity altered during Phase 3, re-verify it with a fresh `crash_verifier_brief.md` subagent.
 3. Re-prove every merged function on the final tree: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run wp-sweep`, written exactly so, with the full path. This is the trusted sweep:
    - it does not read the per-run WP cache;
-   - it feeds the shared proof cache for later runs;
+   - it runs WP with no proof cache at all (`--cache-dir off`), so nothing an agent wrote into a cache can answer it;
+   - a WP-covered function it cannot re-establish (unproven goals, analysis or ACSL error, unmet limits, no report) has those units `blocked` (`ledger.py ingest-wp --sweep`);
    - it ingests regressions into the ledger;
-   - it runs `python3 /opt/framac-pipeline/scripts/ledger.py audit-hypotheses --dag workspace/reports/callgraph_dag.json` (also run during `pipeline_make.py run report`) to resolve `callee_contract_hypothesis` / `valid_under_hyp` assumptions against callee `rte` and `l3_frame` statuses in the ledger (`discharged`, `refuted`, or `open`).
+   - it runs `python3 /opt/framac-pipeline/scripts/ledger.py audit-hypotheses --dag workspace/reports/callgraph_dag.json` (also run first by `pipeline_make.py run report`) to resolve `callee_contract_hypothesis` / `valid_under_hyp` assumptions against the callees' ledger units: a caller is discharged only when every callee is WP-covered with no open hypothesis of its own, transitively down the call graph; otherwise it keeps a `callee_contract_hypothesis` naming the open callees.
 
    If `workspace/reports/wp-sweep/summary.json` reports `regressions`, those functions' units are now `blocked`. Find out why (usually a later callee contract change) before marking the run complete.
-4. Run `python3 /opt/framac-pipeline/scripts/workspace_overlay.py export-diff` to write `workspace/reports/verified_acsl.patch` and copy verified `.h` files to `workspace/contracts/`.
+4. Run `python3 /opt/framac-pipeline/scripts/workspace_overlay.py export-diff` to write `workspace/reports/verified_acsl.patch` and copy the contracted `.h` files to `workspace/contracts/`. The patch carries every merged contract; `workspace/contracts/MANIFEST.json` says which are proven, proven under assumptions, or unproven (relied on by other proofs, not established themselves).

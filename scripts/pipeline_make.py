@@ -345,6 +345,9 @@ class ModulePlan:
     tune_rungs: dict[str, dict] = field(default_factory=dict)
     tune_timeout: int | None = None
     loop_unroll: int = field(default_factory=lambda: loop_unroll_level(None))
+    # A recorded decision current for these settings and the last base run's inputs: `eva-<mod>` then
+    # replays the tuning (base run, recorded rungs, combination) instead of one run of the selected options.
+    eva_replay: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -359,6 +362,7 @@ class ModulePlan:
             "dag_cppflags_missing": self.dag_cppflags_missing,
             "params": self.params,
             "tune_rungs": list(self.tune_rungs),
+            "eva_replay": self.eva_replay,
             "warnings": self.warnings,
         }
 
@@ -638,6 +642,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         mod.warnings.append("no module sources: neither the sidecar nor the DAG lists any")
     if mod.eva:
         _plan_tuning(plan, mod)
+        _tuning_warning(mod)
     try:
         _module_block(mod)
     except ValueError as exc:
@@ -675,6 +680,7 @@ def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
     record = mod.params.get("eva_tuned")
     if record is not None and record_is_current(record, mod.settings_digest, base.get("input_digest")):
         wanted = set(recorded_rungs(record))
+        mod.eva_replay = True
     else:
         wanted = {rung.name for rung in LADDER}
     plain = mod.rung_options({})
@@ -690,6 +696,30 @@ def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
         options = mod.rung_options(overlay)
         if rung.name in wanted and options != plain:
             mod.tune_rungs[rung.name] = options
+
+
+TUNING_WARNING_PREFIX = "Eva tuning: "
+
+
+def _tuning_warning(mod: ModulePlan) -> None:
+    """
+    Say when a recorded decision is not what `eva-<mod>` will reproduce, so a less precise report
+    never replaces the tuned one silently (it also reaches `gen` and `run` output as a plan warning).
+    """
+    record = mod.params.get("eva_tuned")
+    if not record or mod.eva_replay:
+        return
+    if mod.tuned is None:
+        mod.warnings.append(
+            TUNING_WARNING_PREFIX + f"the recorded decision is stale (the module's Eva settings changed since): "
+            f"eva-{mod.name} falls back to the base options; run eva-tune to tune again"
+        )
+    else:
+        mod.warnings.append(
+            TUNING_WARNING_PREFIX + "the recorded decision cannot be replayed (no base run with Unknowns on "
+            f"these sources yet, or the sources changed since): eva-{mod.name} runs the selected options "
+            "without the per-obligation combination; run eva-tune to replay or tune again"
+        )
 
 
 def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = None) -> Plan:
@@ -766,6 +796,9 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
             plan.modules[name] = _plan_module(plan, name, dag_modules[name])
         except _Excluded as exc:
             plan.excluded[name] = str(exc)
+            continue
+        # Tuning warnings change what a report means, so they are surfaced at the top of `gen` and `run`.
+        warnings.extend(f"{name}: {w}" for w in plan.modules[name].warnings if w.startswith(TUNING_WARNING_PREFIX))
     for name in sorted(set(params_doc["modules"]) - set(dag_modules)):
         if dag_modules:
             warnings.append(f"params.json tunes {name!r}, which is not a DAG module")
@@ -825,6 +858,7 @@ def _eva_tuning_lines(mod: ModulePlan) -> list[str]:
         _assign(f"EVA_TUNE_TIMEOUT_{n}", _opt(mod.tune_timeout)),
         _assign(f"EVA_LOOP_UNROLL_{n}", mk_quote(str(mod.loop_unroll))),
         _assign(f"EVA_TUNE_RUNGS_{n}", " ".join(mod.tune_rungs)),
+        _assign(f"EVA_REPLAY_{n}", "1" if mod.eva_replay else ""),
     ]
     for rung, options in mod.tune_rungs.items():
         lines.append(_assign(f"EVA_RUNG_OPTIONS_{n}__{rung}", _option_words(options)))
@@ -1056,10 +1090,10 @@ STAGE_OF_TARGET = {
     "fuzz": 2,
     "eva": 2,
     "eva-tune-base": 2,
-    # Troubleshooting aid on top of eva-<mod>; same stage, ordered by the make prerequisite.
-    "flamegraph": 2,
     # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
     "eva-tune": 3,
+    # Renders the flamegraph.txt an earlier Eva run left (it never runs Eva), so after eva and eva-tune.
+    "flamegraph": 4,
     "coverage": 3,  # after fuzz, so that it measures the campaign's corpus
     # After eva-tune, which rewrites the Eva report the facts read.
     "facts": 4,
@@ -1096,6 +1130,8 @@ def _stage(target: str) -> int | None:
         return STAGE_OF_TARGET[target]
     if target.startswith("facts-") and target.partition("-")[2]:
         return STAGE_OF_TARGET["facts"]  # it reads the Eva report, so it follows the Eva stages of the invocation
+    if target.startswith("flamegraph-") and target.partition("-")[2]:
+        return STAGE_OF_TARGET["flamegraph"]
     if target.startswith(MODULE_TARGET_PREFIXES) and target.partition("-")[2]:
         return STAGE_OF_TARGET["coverage"] if target.startswith("coverage-") else 2
     return None
@@ -1153,6 +1189,8 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
     if kind == "module":
         deps = [f"fuzz-{mod}"] if mod in plan.fuzz_modules else []
         return deps + ([f"eva-{mod}"] if mod in plan.eva_modules else [])
+    if kind == "eva" and mod in plan.modules and plan.modules[mod].eva_replay:
+        return [f"evabase-{mod}"]  # the recorded rungs are optional, as in eva-tune
     if node in ("replay", "wp-queue"):
         return ["ingest"]
     if node == "minimize":

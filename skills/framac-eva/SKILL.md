@@ -32,7 +32,7 @@ Eva runs need no judgment, so they run from the generated Makefile (`docs/resour
 For a single module in guidance mode, the underlying command is:
 
 ```text
-python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --main eva_main --out-dir workspace/eva/<mod> --slevel <slevel_or_100> --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/eva/<mod>.json
+python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --main eva_main --out-dir workspace/eva/<mod> --slevel <slevel_or_100> --no-warn-unsigned-downcast --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/eva/<mod>.json
 ```
 
 - A Frama-C failure is reported as `status: "analysis_error"` (exit code 1), never as zero alarms.
@@ -53,7 +53,9 @@ python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <
 5. **Per-loop analysis:** for loops in functions that still have Unknowns, it unrolls one loop nest at a time on a scratch mirror (never in `workspace/work/`) and keeps the annotation only if Unknowns fall and no obligation turns Dead.
 6. **Combination:** an obligation any admissible run proves counts as proved, because a Valid status means no execution can violate that property first (`docs/resources-and-caching.md`, Section 6). Invalid from any complete run always reaches the report, and Dead never counts as proof.
 
-The result replaces `workspace/reports/eva/<mod>.json`, with a `tuning` block saying what was tried, what was rejected and why. The decision goes into `workspace/build/params.json`, so `run eva` uses it from then on and another machine's `run eva-tune` replays only the recorded runs. A machine that finishes fewer runs leaves more units `planned`.
+The result replaces `workspace/reports/eva/<mod>.json`, with a `tuning` block saying what was tried, what was rejected and why. The decision goes into `workspace/build/params.json`. While it is current (same module settings, same inputs as the last base run), `eva-<mod>` — and so `run eva` and `module-<mod>` — replays it instead of running Eva once: the base run, the recorded rungs and loop trials (all cached by content), then the same per-obligation combination, so the report is the one `run eva-tune` writes (`tuning.mode: "replay"`) and the decision is never re-recorded. Another machine's `run eva-tune` also replays only the recorded runs. A machine that finishes fewer runs leaves more units `planned`.
+
+When the decision no longer applies, `gen` and `run` print a warning (`<mod>: Eva tuning: ...`, in the top-level `warnings` and the module's own): after a change to the module's Eva settings, `eva-<mod>` falls back to the base options; when the sources changed, or there is no base run yet, it runs the selected options once, without the combination. If the base run of a replay shows the sources changed, the report is that base run's (`tuning.mode: "skipped"`). In every case, `run eva-tune` tunes again.
 
 To search again, for example after changing what a loop does: `python3 /opt/framac-pipeline/scripts/pipeline_make.py params set --module <mod> --eva-retune`. A change to the sources or to the module's other Eva settings already triggers a new search.
 
@@ -67,7 +69,7 @@ To search again, for example after changing what a loop does: `python3 /opt/fram
 - For any other precision lever, or an alarm or message you do not understand, grep the Eva manual through `docs/references/` (see `docs/references/README.md`) rather than reading it: loops §6.4, case splitting and partitioning §6.5, domains §6.7, what each alarm checks §3.2, log messages §3.3, FAQ §10.
 
 ### Observability and repair hints in every Eva report
-- Every run writes `workspace/eva/<mod>/flamegraph.txt` (`-eva-flamegraph`) and `nonterm.log` (`-nonterm`); the report (`workspace/reports/eva/<mod>.json`) carries them as `flamegraph_file`, `nonterm_log_file`, and the parsed `nonterm` warnings. For a slow or hanging run, render the flamegraph with `python3 /opt/framac-pipeline/scripts/pipeline_make.py run flamegraph-<mod>` (or `scripts/eva_flamegraph.py --dir workspace/eva/<mod>`) and read the widest bars — they name the functions where Eva spends its time.
+- Every run writes `flamegraph.txt` (`-eva-flamegraph`) and `nonterm.log` (`-nonterm`) in its output directory; the report (`workspace/reports/eva/<mod>.json`) carries them as `flamegraph_file`, `nonterm_log_file`, and the parsed `nonterm` warnings. A plain `eva-<mod>` writes them in `workspace/eva/<mod>/`; a tuned module's runs are under `workspace/eva/<mod>/tune/<run>/`, and `eva-tune` (or its replay) copies the `flamegraph.txt` of the run the report rests on to `workspace/eva/<mod>/flamegraph.txt`. For a slow or hanging run, render it with `python3 /opt/framac-pipeline/scripts/pipeline_make.py run flamegraph-<mod>` (or `scripts/eva_flamegraph.py --dir workspace/eva/<mod>`) and read the widest bars — they name the functions where Eva spends its time. `flamegraph-<mod>` never runs Eva, so it cannot replace the module's report: it fails, saying so, when `workspace/eva/<mod>/flamegraph.txt` does not exist yet (run `eva-<mod>` or `eva-tune` first), and in one `run` it comes after `eva` and `eva-tune`.
 - The report's `repair_hints` field ports upstream `make-wrapper` log patterns (`docs/upstream/sources/make_wrapper_tips.md`): a `recursive_call` hint means patch/stub/specify the recursive call or use `--eva-recursion-fallback`; a `missing_spec` hint names the function and points at the defining file (via `build_callgraph_dag.py`'s index) or `templates/acsl/external_stubs.h`.
 - Upstream reference examples worth reading when tuning by hand are vendored in `docs/upstream/sources/`: `loopinv.c` (`-eva-slevel-function`), `partitioning-annots.c` (`//@ loop unroll N;`, `-eva-partition-value/-history`), `use_spec.i` (`-eva-use-spec` to override a function with a spec inside Eva), `taint.c`/`multi_taint.c` (Layer 6 taint annotations).
 
@@ -88,7 +90,8 @@ To search again, for example after changing what a loop does: `python3 /opt/fram
 After `fuzz`, `eva` and `eva-tune` have finished:
 
 ```text
-python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest replay wp-queue
+python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest
+python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue
 ```
 
 `wp-queue` first runs `facts`: per-function facts for the prover briefs, from the kernel AST and the read and write sets in each Eva report (`workspace/reports/facts/<mod>.json`, cached by content). They are hints, and a failure only means briefs without them. Write `python3 /opt/framac-pipeline/scripts/pipeline_make.py run facts` as its own step after `eva` when you want them to fill the shared cross-run cache.

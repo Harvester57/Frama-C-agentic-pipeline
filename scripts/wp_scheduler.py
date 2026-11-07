@@ -56,6 +56,7 @@ import prover_candidates  # noqa: E402
 import resources  # noqa: E402
 import workspace_overlay  # noqa: E402
 from framac_common import (  # noqa: E402
+    PROVER_WALL_BUDGET_S,
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
@@ -115,11 +116,7 @@ MERGE_BATCH_TRIGGER = 4  # queued results of one module that fire a merge
 MERGE_MAX_WAIT_S = 300.0  # the oldest queued result never waits longer than this
 HISTORY_LIMIT = 400
 REOPENABLE_SKIPS = frozenset({"candidate", "no_open_units"})
-DEFAULT_WALL_BUDGET_S = {
-    "quick": 600,
-    "standard": 900,
-    "deep": 1800,
-}
+DEFAULT_WALL_BUDGET_S = PROVER_WALL_BUDGET_S
 
 
 def _agent_wall_budget_s() -> int:
@@ -3014,6 +3011,14 @@ def cmd_complete(agent_id: str) -> dict:
             if merged.get("ok"):
                 _finish(state, task, "done", "merged")
                 out.update(action="merged", modified_files=merged.get("modified_files") or [])
+                arch_result = Path("agents") / agent_id / "scratch" / "result.json"
+                if arch_result.is_file():
+                    out["boundary_assumptions"] = _try(
+                        out["errors"],
+                        f"record-boundary-assumptions {task['id']}",
+                        DEPS.record_boundary_assumptions,
+                        arch_result,
+                    )
                 if merged.get("modified_files"):
                     out["rechecks_queued"] = _queue_rechecks_for_module(
                         state, Ctx(), task["module"], f"architect {agent_id} changed module contracts"

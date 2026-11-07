@@ -4,12 +4,20 @@
 # call and sets --cpus/--memory/--pids-limit per job class. The static limits below are only a
 # reasonable default for an interactive container; scripts inside still size themselves from the
 # container's cgroup limits.
+#
+# Required: TARGET_REPO_PATH (target repository, mounted read-only) and FRAMAC_RUN_DIR (run directory
+# outside the target). Recommended on Linux/macOS: FRAMAC_UID=$(id -u) FRAMAC_GID=$(id -g), so the job
+# runs as you and the run directory never collects root-owned files (default 1000:1000). FRAMAC_RUN_ID
+# must match run-<N> (scripts/run_metadata.py init); set it to the run directory's name (default run-1).
+# The pipeline knobs listed under `environment` are forwarded only when set in your shell, as the
+# wrappers do.
 services:
   framac-pipeline:
     build:
       context: .
       dockerfile: Dockerfile
     image: framac-pipeline:latest
+    user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"
     working_dir: /framac-run
     network_mode: none
     cap_drop:
@@ -22,7 +30,25 @@ services:
     environment:
       - PYTHONIOENCODING=utf-8
       - OPAMROOT=/home/opam/.opam
+      - S=/opt/framac-pipeline/scripts
       - FRAMAC_OUTER_SANDBOX=docker-hardened
+      - FRAMAC_RUN_ID=${FRAMAC_RUN_ID:-run-1}
+      - FRAMAC_RUN_HOST=${FRAMAC_RUN_DIR}
+      - FRAMAC_TARGET_HOST=${TARGET_REPO_PATH}
+      # Pipeline knobs read inside the container (same list as the wrappers): passed through when set.
+      - FRAMAC_CACHE
+      - FRAMAC_CACHE_MAX
+      - FRAMAC_MAX_AGENTS
+      - FRAMAC_SCHEDULER
+      - FRAMAC_LOCK_TIMEOUT
+      - FRAMAC_LOCK_STALE
+      - FRAMAC_WP_WALL_TIMEOUT
+      - FRAMAC_PROVER_WALL_BUDGET_S
+      - FRAMAC_PROVER_CONTEXT
+      - FRAMAC_FRAME_SKELETON
+      - FRAMAC_LOOP_TEMPLATES
+      - FRAMAC_SPEC_KB
+      - FRAMAC_RESOURCES_VERBOSE
     volumes:
       - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro
       - ${FRAMAC_RUN_DIR:?set FRAMAC_RUN_DIR to a run directory outside the target}:/framac-run

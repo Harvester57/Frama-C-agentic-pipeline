@@ -76,6 +76,9 @@ Write your annotation diff to `agents/{agent_id}/scratch/{module_name}_header.pa
   "patch": "agents/{agent_id}/scratch/{module_name}_header.patch",
   "evidence": [{"tool_output": "agents/{agent_id}/scratch/header_guard_{module_name}.json", "result": "passed_dynamic_oracle"}],
   "boundary_assumptions": [],
+  "functions": [{"file": "<repo-relative .c file>", "function": "<name>"}],
   "notes": ""
 }
 ```
+
+List in `functions` every function whose contract you wrote or changed: the parent records your `boundary_assumptions` on those functions' ledger units.

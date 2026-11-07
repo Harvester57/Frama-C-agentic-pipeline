@@ -7,6 +7,9 @@ Modes:
    Outcomes: crash_found | timeout_found | oom_found | clean | fuzzer_error | compile_error.
    Each crash artifact is replayed once to check reproducibility and to extract the
    E-ACSL failing predicate, which yields a stable fingerprint (scripts/fingerprint.py).
+   Without `--dict` (and unless `--no-auto-dict`), the target sources' literals plus fixed numeric
+   boundary tokens (scripts/fuzz_dictionary.py) become workspace/dicts/<module>.dict, passed as
+   `-dict=`; the report's `dictionary` records `{path, auto, entries}` or why there is none.
 2. `guardrail`: the dynamic anti-hallucination oracle used inside `/framac-wp`.
    Replays the module corpus (plus a short mutation burst) against a binary compiled with
    the proposed ACSL contract. Outcomes:
@@ -16,6 +19,8 @@ Modes:
      - code_fault               : an RTE assertion failed; this is a code defect candidate,
                                   not evidence against the contract
      - guardrail_error / compile_error
+   Every report has `crash_input`: the run-relative path of the input libFuzzer wrote under the
+   scratch -artifact_prefix on a failing replay, or null.
    Past `--max-corpus-inputs`, every promoted seed-* / crash-* file is replayed and the rest is
    a deterministic sample; `corpus_total`, `corpus_replayed`, `corpus_sampled` and
    `corpus_empty` say what was replayed. A pass on an empty corpus is not a pass on real inputs.
@@ -65,6 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import fuzz_dictionary  # noqa: E402
 import prover_candidates  # noqa: E402
 from acsl_ast import tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
@@ -88,7 +94,12 @@ from eacsl_toolchain import (  # noqa: E402
     select_eacsl_binary,
     slice_has_pthread,
 )
-from fingerprint import detect_alarm_kind, make_fingerprint, normalize_file  # noqa: E402
+from fingerprint import (  # noqa: E402
+    detect_alarm_kind,
+    detect_predicate_alarm_kind,
+    make_fingerprint,
+    normalize_file,
+)
 from framac_common import (  # noqa: E402
     atomic_write_json,
     load_json_optional,
@@ -430,7 +441,8 @@ def parse_eacsl_failure(text: str) -> dict | None:
         function = _resolve_function_at_line(file_, line_)
     label, predicate = _failing_predicate(text, hit.end())
     kind = hit.group("kind").strip().lower().replace(" ", "_")
-    alarm = detect_alarm_kind(label) or detect_alarm_kind(predicate)
+    # A label names the alarm; inside the predicate only a label-like use counts, never an identifier.
+    alarm = detect_alarm_kind(label) or detect_predicate_alarm_kind(predicate)
     explicit_rte_prefix = label.lower().startswith("rte") or predicate.lower().startswith("rte")
     has_rte_marker = bool(alarm) or explicit_rte_prefix
     on_acsl_line = _is_acsl_annotation_line(file_, line_)
@@ -1319,6 +1331,94 @@ def sanitize_fuzzer_dictionary(dict_path: Path, out_path: Path | None = None) ->
     return out_path
 
 
+AUTO_DICT_DIR = Path("workspace/dicts")
+
+
+def _dict_stem(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._") or "module"
+
+
+def auto_dictionary_path(module: str, corpus_dir: Path) -> Path:
+    """Where `campaign` writes its auto-dictionary: workspace/dicts/<module>.dict, else next to the corpus."""
+    if module:
+        return AUTO_DICT_DIR / f"{_dict_stem(module)}.dict"
+    corpus_dir = Path(corpus_dir)
+    return corpus_dir.parent / f"{_dict_stem(corpus_dir.name)}.auto.dict"
+
+
+def dictionary_target_sources(sources: list[str] | list[Path]) -> list[Path]:
+    """The campaign's target sources for literal extraction: existing files, the harness excluded, sorted."""
+    out: set[Path] = set()
+    for s in sources or []:
+        p = Path(s)
+        if p.name.startswith("harness_") or not p.is_file():
+            continue
+        out.add(p)
+    return sorted(out, key=lambda p: p.as_posix())
+
+
+def build_auto_dictionary(sources: list[str] | list[Path], out_path: Path) -> dict:
+    """
+    Extract a libFuzzer dictionary from the campaign's target sources (scripts/fuzz_dictionary.py, in-process)
+    and write it atomically to `out_path`. Never raises: an empty or failed extraction returns
+    `path: None` and a `reason`, and the campaign proceeds without a dictionary. The content depends only on
+    the target sources' text (files sorted, tokens in a fixed order), so the same slice gives the same file.
+    """
+    out_path = Path(out_path)
+    info: dict = {"path": None, "auto": True, "entries": 0}
+    targets = dictionary_target_sources(sources)
+    info["source_files"] = len(targets)
+    if not targets:
+        info["reason"] = "no readable target sources besides the harness"
+        return info
+    try:
+        tokens = fuzz_dictionary.build_dictionary(sources=list(targets))
+    except Exception as exc:  # never fail the campaign over a dictionary
+        info["reason"] = f"extraction failed: {type(exc).__name__}: {exc}"
+        return info
+    if not tokens:
+        info["reason"] = "extraction produced no tokens"
+        return info
+    content = fuzz_dictionary.render_dictionary(tokens)
+    tmp: Path | None = None
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), prefix=".tmp_", suffix=".dict")
+        tmp = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        os.replace(tmp, out_path)
+        tmp = None
+    except OSError as exc:
+        info["reason"] = f"could not write {out_path.as_posix()}: {exc}"
+        return info
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+    info.update(
+        {
+            "path": out_path.as_posix(),
+            "entries": len(tokens),
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        }
+    )
+    return info
+
+
+def resolve_campaign_dictionary(
+    explicit: Path | None, sources: list[str], module: str, corpus_dir: Path, auto: bool = True
+) -> tuple[Path | None, dict]:
+    """The dictionary a campaign passes to libFuzzer as -dict=, and the report's `dictionary` record."""
+    if explicit is not None:
+        p = Path(explicit)
+        return p, {"path": p.as_posix(), "auto": False, "exists": p.is_file()}
+    if not auto:
+        return None, {"path": None, "auto": False, "reason": "disabled by --no-auto-dict"}
+    info = build_auto_dictionary(sources, auto_dictionary_path(module, corpus_dir))
+    return (Path(info["path"]) if info.get("path") else None), info
+
+
 def run_fuzz_campaign(
     binary: Path,
     corpus_dir: Path,
@@ -1794,6 +1894,65 @@ def corpus_selection_fields(total: int, replayed: int, sampled: bool) -> dict:
     }
 
 
+_CRASH_KIND_ORDER = {"crash": 0, "leak": 1, "timeout": 2, "oom": 3}
+
+
+def _prefix_artifacts(prefix_dir: Path) -> dict[str, tuple[int, str]]:
+    """libFuzzer artifacts (crash-/leak-/timeout-/oom-...) directly under an -artifact_prefix directory."""
+    out: dict[str, tuple[int, str]] = {}
+    if not prefix_dir.is_dir():
+        return out
+    for p in prefix_dir.iterdir():
+        if p.is_file() and not p.is_symlink() and _artifact_kind(p.name):
+            with contextlib.suppress(OSError):
+                out[p.name] = (p.stat().st_mtime_ns, sha256_file(p))
+    return out
+
+
+def _run_relative(path: Path) -> str:
+    """`path` relative to the run directory (the cwd) in POSIX form, else its absolute POSIX form."""
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def guardrail_crash_input(prefix_dir: Path, before: dict[str, tuple[int, str]], output: str) -> str | None:
+    """
+    The crashing input a guardrail replay wrote under its -artifact_prefix directory, run-relative, or None.
+
+    Decided from the directory listing: a file is this run's when it is new or changed since `before`, or when
+    libFuzzer's "Test unit written to" line names it at this prefix (a content-addressed rewrite of identical
+    bytes can keep the old mtime). Several candidates: crash before leak/timeout/oom, the one libFuzzer named
+    first, then by name, so the choice is deterministic.
+    """
+    prefix_dir = Path(prefix_dir)
+    after = _prefix_artifacts(prefix_dir)
+    if not after:
+        return None
+    resolved_prefix = prefix_dir.resolve()
+    named: list[str] = []
+    for m in _TEST_UNIT_WRITTEN_RE.finditer(output or ""):
+        raw = m.group("path").strip()
+        try:
+            same_dir = Path(raw).parent.resolve() == resolved_prefix
+        except (OSError, ValueError):
+            same_dir = False
+        name = Path(raw).name
+        if same_dir and name in after and name not in named:
+            named.append(name)
+    fresh = {name for name, meta in after.items() if before.get(name) != meta} | set(named)
+    if not fresh:
+        return None
+
+    def rank(name: str) -> tuple[int, int, str]:
+        kind = _artifact_kind(name) or ""
+        return (_CRASH_KIND_ORDER.get(kind, 9), named.index(name) if name in named else len(named), name)
+
+    return _run_relative(prefix_dir / min(fresh, key=rank))
+
+
 def run_guardrail_check(
     binary: Path,
     corpus_dir: Path,
@@ -1835,6 +1994,7 @@ def run_guardrail_check(
             "reason": f"{binary} is not E-ACSL-instrumented; refusing to report a vacuous dynamic-oracle pass.",
             "failure": None,
             "corpus_dir": str(corpus_dir),
+            "crash_input": None,
         }
         err_verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(err_verdict)
         return err_verdict
@@ -1874,6 +2034,7 @@ def run_guardrail_check(
                 if cached.get("status") == "passed_dynamic_oracle":
                     cached.update(selection)
                     cached["corpus_dir"] = str(corpus_dir)
+                    cached["crash_input"] = None
                     cached["cache"] = {"hit": True, "key": g_key}
                     cached["diagnostic_hints"] = derive_eacsl_diagnostic_hints(cached)
                     return cached
@@ -1901,11 +2062,18 @@ def run_guardrail_check(
         str(scratch_corpus.resolve()),
         str(replay_dir.resolve()),
     ]
+    artifacts_before = _prefix_artifacts(scratch_dir)
     res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
     reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
     verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
+    crash_input = (
+        None
+        if verdict["status"] == "passed_dynamic_oracle"
+        else guardrail_crash_input(scratch_dir, artifacts_before, combined_out)
+    )
     verdict.update(
         {
+            "crash_input": crash_input,
             "reach": reach,
             "returncode": res.returncode,
             "timed_out": res.timed_out,
@@ -3265,6 +3433,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_camp.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_camp.add_argument("--dict", type=Path, default=None)
+    p_camp.add_argument(
+        "--no-auto-dict",
+        action="store_true",
+        help=(
+            "Without --dict, do not extract a dictionary from the target sources "
+            "(default: write workspace/dicts/<module>.dict with scripts/fuzz_dictionary.py and fuzz with it)"
+        ),
+    )
     p_camp.add_argument("--jobs", type=int, default=None, help="LibFuzzer -jobs=<N> (default: the number of workers)")
     p_camp.add_argument(
         "--workers",
@@ -3596,7 +3772,13 @@ def main(argv: list[str] | None = None) -> int:
                 use_cache=use_cache,
             )
             if comp["returncode"] != 0:
-                res = {"mode": "guardrail", "status": "compile_error", "reason": comp.get("reason"), "compile": comp}
+                res = {
+                    "mode": "guardrail",
+                    "status": "compile_error",
+                    "reason": comp.get("reason"),
+                    "compile": comp,
+                    "crash_input": None,
+                }
                 res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
             else:
                 scratch = args.scratch_dir or args.out_bin.parent / f"{args.out_bin.name}_guard_scratch"
@@ -3618,6 +3800,8 @@ def main(argv: list[str] | None = None) -> int:
                     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     except SandboxUnavailable as exc:
         res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
+        if args.mode == "guardrail":
+            res["crash_input"] = None
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
@@ -3711,12 +3895,19 @@ def _run_campaign_mode(args) -> dict:
             )
 
         warm_started = cache.warm_start_corpus(args.module, args.corpus_dir) if (args.module and use_cache) else 0
+        dict_file, dict_info = resolve_campaign_dictionary(
+            args.dict,
+            args.sources,
+            args.module,
+            args.corpus_dir,
+            auto=not getattr(args, "no_auto_dict", False),
+        )
         fuzz = run_fuzz_campaign(
             Path(comp["binary"]),
             args.corpus_dir,
             args.artifacts_dir,
             max_time,
-            args.dict,
+            dict_file,
             args.per_input_timeout,
             extra_corpus=args.extra_corpus,
             attribution_builder=attribution_builder,
@@ -3729,6 +3920,7 @@ def _run_campaign_mode(args) -> dict:
             else 0
         )
         res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
+        res["dictionary"] = dict_info
         if warm_started or published:
             res["corpus_cache"] = {"warm_started": warm_started, "published": published}
         if engine_used == "eacsl" and comp.get("reduced_checks"):
