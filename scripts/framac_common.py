@@ -100,6 +100,19 @@ def wp_limits_problem(limits: object) -> str | None:
     return None
 
 
+# A run directory holds run-metadata.json and coverage-ledger.json at its top, and its overlay root
+# (workspace/) holds overlay_meta.json. A directory with one of them is pipeline output that someone
+# copied into a target (a results folder kept next to the source), never target source: scanning it
+# would add a phantom module and put a previous run's annotated headers on the include path.
+PIPELINE_OUTPUT_MARKERS = ("run-metadata.json", "coverage-ledger.json", "overlay_meta.json")
+
+
+def is_pipeline_output_dir(path: Path | str) -> bool:
+    """True when `path` is the top of a pipeline run directory or overlay copied into a target."""
+    p = Path(path)
+    return any((p / marker).is_file() for marker in PIPELINE_OUTPUT_MARKERS)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

@@ -67,6 +67,7 @@ from framac_common import (  # noqa: E402
     ArtifactError,
     atomic_write_json,
     eva_alarm_in_file,
+    is_pipeline_output_dir,
     is_safe_agent_id,
     is_safe_relative_path,
     load_agent_result_json,
@@ -199,9 +200,14 @@ def init_overlay(target_dir: Path, overlay_dir: Path, force: bool = False) -> di
 
     to_copy: list[tuple[Path, Path]] = []
     stale: list[str] = []
+    skipped_output: list[str] = []
     for root, dirs, files in os.walk(target_dir):
         rel_root = Path(root).relative_to(target_dir)
         dirs[:] = [d for d in dirs if not d.startswith(".framac") and d not in {".git", "__pycache__", "build_framac"}]
+        # Run results kept inside the target are not source: copying them would hand their
+        # annotated headers and harnesses to this run.
+        skipped_output += [(rel_root / d).as_posix() for d in dirs if is_pipeline_output_dir(Path(root) / d)]
+        dirs[:] = [d for d in dirs if not is_pipeline_output_dir(Path(root) / d)]
         for fname in files:
             src_file = Path(root) / fname
             rel_path = rel_root / fname
@@ -236,6 +242,7 @@ def init_overlay(target_dir: Path, overlay_dir: Path, force: bool = False) -> di
         "work_dir": str(work_dir),
         "baseline_dir": str(baseline_dir),
         "copied_count": len(copied_files),
+        "skipped_pipeline_output": sorted(skipped_output),
     }
     (overlay_dir / "overlay_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return meta

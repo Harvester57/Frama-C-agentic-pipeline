@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
+from framac_common import is_pipeline_output_dir  # noqa: E402
 
 C_KEYWORDS = {
     "if",
@@ -1505,6 +1506,28 @@ _INCLUDE_DIRECTIVE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MUL
 _SYSTEM_INCLUDE_PREFIXES = ("-I/usr/include", "-I/usr/local/include", "-I/lib/", "-isystem/usr/")
 
 
+_SKIPPED_WALK_DIRS = frozenset({"build", "CMakeFiles", "__pycache__"})
+
+
+def _keep_walk_dir(root: str, name: str) -> bool:
+    """Walk filter: skip hidden and build directories, and pipeline output copied into the target."""
+    return not name.startswith(".") and name not in _SKIPPED_WALK_DIRS and not is_pipeline_output_dir(Path(root) / name)
+
+
+def find_pipeline_output_dirs(target_dir: Path) -> list[str]:
+    """Target-relative directories the source walks skip because they hold pipeline output."""
+    found: list[str] = []
+    for root, dirs, _ in os.walk(target_dir):
+        kept: list[str] = []
+        for d in dirs:
+            if is_pipeline_output_dir(Path(root) / d):
+                found.append((Path(root) / d).relative_to(target_dir).as_posix())
+            elif not d.startswith(".") and d not in _SKIPPED_WALK_DIRS:
+                kept.append(d)
+        dirs[:] = kept
+    return sorted(found)
+
+
 def _filter_host_system_flags(flags: list[str]) -> list[str]:
     """Strip host system include directories (-I/usr/include*) so Frama-C keeps __fc_libc."""
     out: list[str] = []
@@ -1531,7 +1554,7 @@ def discover_in_tree_cppflags(target_dir: Path, c_files: list[Path]) -> dict[str
     makefile_defines: list[str] = []
 
     for root, dirs, files in os.walk(target_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}]
+        dirs[:] = [d for d in dirs if _keep_walk_dir(root, d)]
         root_path = Path(root).resolve()
         for f in sorted(files):
             fp = root_path / f
@@ -1672,7 +1695,7 @@ def _discover_header_inline_and_macros(target_dir: Path) -> tuple[dict[str, dict
     header_fns_raw: dict[str, tuple[str, dict]] = {}
     h_files: list[Path] = []
     for root, dirs, files in os.walk(target_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}]
+        dirs[:] = [d for d in dirs if _keep_walk_dir(root, d)]
         for fname in sorted(files):
             if fname.endswith(".h"):
                 h_files.append((Path(root) / fname).resolve())
@@ -1742,7 +1765,7 @@ def build_dag(
     all_source_files: list[Path] = []
     c_files_needed = not c_files
     for root, dirs, files in os.walk(target_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"build", "CMakeFiles", "__pycache__"}]
+        dirs[:] = [d for d in dirs if _keep_walk_dir(root, d)]
         for f in sorted(files):
             suffix = Path(f).suffix.lower()
             if suffix in (".c", ".h"):
@@ -1931,7 +1954,10 @@ def build_dag(
         fn_object_files[fn_key] |= r_files
 
     # Pre-flight warnings: walk both .h and .c files to extract prototypes
-    warnings: list[str] = []
+    warnings: list[str] = [
+        f"skipped pipeline output directory inside the target: {rel} (move run results out of the target tree)"
+        for rel in find_pipeline_output_dirs(target_dir)
+    ]
     proto_files = sorted(set(all_source_files) | set(c_files))
     for src_file in proto_files:
         try:

@@ -43,6 +43,8 @@ python3 /opt/framac-pipeline/scripts/workspace_overlay.py init --target /target 
 
 The target is never modified. If the overlay already exists and the target changed since it was captured, `init` fails: start a new run directory instead of resuming.
 
+Pipeline output kept inside the target (a folder holding `run-metadata.json`, `coverage-ledger.json`, or `overlay_meta.json`, such as a previous run's results) is not source. `init` does not copy it and lists it in `overlay_meta.json` as `skipped_pipeline_output`, and `build_callgraph_dag.py` skips it with a warning. If either reports one, tell the user so they can move it out of the target tree.
+
 If the target has no `compile_commands.json` (or has an out-of-tree build system where running `bear` is impractical), `build_callgraph_dag.py` in Step 2 automatically discovers all in-repository header directories and can emit a synthesized `compile_commands.json` via `--emit-compile-commands workspace/reports/compile_commands.json` while stripping any host `/usr/include` paths. If you do want to capture build flags from the target's native build, do so in a disposable full copy run through `sandbox_exec.py` (rlimits, env allowlist, timeout):
 
 ```text
