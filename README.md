@@ -65,16 +65,22 @@ flowchart LR
 
 From the repository root:
 
+Two images: the analysis image runs every Frama-C, E-ACSL, fuzzing and proof step, and the build image runs the target's own build. The wrappers build either one on first use with `-BuildIfMissing` (`--build-if-missing`).
+
 ```powershell
 # Windows (PowerShell)
 $env:PYTHONIOENCODING="utf-8"
-docker build "-t" "framac-pipeline:latest" .
+docker build --target framac-analysis "-t" "framac-analysis:latest" .
+docker build --target framac-build "-t" "framac-build:latest" .
 ```
 
 ```bash
 # Linux / macOS (POSIX)
-docker build -t framac-pipeline:latest .
+docker build --target framac-analysis -t framac-analysis:latest .
+docker build --target framac-build -t framac-build:latest .
 ```
+
+The analysis image holds none of the target's packages. Name them in the build recipe: the build capture installs them in a derived build image and copies the headers and libraries the build used to the run's snapshot, where the analysis image reads them. The single-image setup (`docker build -t framac-pipeline:latest .`, the Dockerfile's last stage) still works with `-Image framac-pipeline:latest` (`FRAMAC_DOCKER_IMAGE`) until it is removed.
 
 ### 2. Initialize a Run and Verify the E-ACSL Canary
 

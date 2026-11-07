@@ -27,7 +27,7 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 - **Cause:** The target C file or its `-I` flags pulled in host `/usr/include` headers containing glibc/compiler-specific extensions (`_Float128`, `__builtin_va_arg_pack`, inline assembly `__asm__`, or SIMD intrinsics) instead of Frama-C's standard library (`__fc_libc`).
 - **Fix:**
   1. Never pass `-I/usr/include` or `-I/usr/local/include` in `CPPFLAGS`. `build_callgraph_dag.py` automatically strips host system include paths from `compile_commands.json` so Frama-C uses its portable `__fc_libc` headers.
-  2. If the target requires third-party system headers (e.g., `<bsd/string.h>`, `<openssl/evp.h>`), pass `--target-packages "<pkg>"` (`-TargetPackages` in PowerShell) to `framac-docker` so the real `-dev` package is installed in the container image.
+  2. If the target requires third-party system headers (e.g., `<bsd/string.h>`, `<openssl/evp.h>`), add the `-dev` package to the build recipe and rerun the build capture (`--build-image --target-packages "<pkg>"`, `-BuildImage -TargetPackages` in PowerShell). The capture copies the headers and libraries to the run's snapshot (`workspace/snapshot/`), and the analysis image reads them from there (`-idirafter`, after Frama-C's libc). The analysis image itself never gets target packages. Check `snapshot.headers` in `workspace/reports/build_capture.json`.
   3. Ensure `-machdep gcc_x86_64` (already the default in `run_eva_slice.py`, `run_wp_function.py`, and `run_eacsl_fuzz.py`, which every Make recipe calls) is active so GNU C extensions supported by Frama-C are enabled.
   4. Guard hardware inline assembly or unsupported compiler intrinsics with `#ifndef __FRAMAC__ ... #else ... #endif` in the `workspace/work/` shadow tree.
 

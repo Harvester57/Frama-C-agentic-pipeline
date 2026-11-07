@@ -625,6 +625,18 @@ _REAL_SUBPROCESS_RUN = subprocess.run
 
 
 def toolchain_id(runner: Callable | None = None) -> str:
+    """
+    The image (or tool versions) plus the digest of the run's target snapshot (scripts/target_env.py):
+    the analysis image is the same for every target, and the snapshot is what it links against.
+    """
+    from target_env import snapshot_digest
+
+    snap = snapshot_digest()
+    base = _image_or_tools_id(runner)
+    return f"{base}+snapshot:{snap}" if snap else base
+
+
+def _image_or_tools_id(runner: Callable | None = None) -> str:
     """FRAMAC_IMAGE_ID when set, else a digest of the tool versions (memoized per process)."""
     image = (os.environ.get("FRAMAC_IMAGE_ID") or "").strip()
     if image:

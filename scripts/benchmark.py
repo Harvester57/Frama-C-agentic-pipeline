@@ -946,8 +946,9 @@ def summarize_capture(report: dict | None) -> dict:
 def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str, stages: dict[str, dict]) -> dict:
     """
     The build capture stage: build_capture.py in the build image (derived with the recipe's packages, or
-    the target's), on the run's scratch volume; then the Phase 0 model (phase0_model.py) over that volume,
-    in the pipeline image. The volume is removed afterwards: nothing later reads it yet.
+    the target's), on the run's scratch volume, writing the run's snapshot; then the Phase 0 model
+    (phase0_model.py) over that volume, in the analysis image. The volume is removed afterwards: later
+    stages read the snapshot from the run directory, not the build tree.
     """
     if not spec.get("build"):
         return {"status": "no_recipe"}
@@ -966,7 +967,6 @@ def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str
     summary = summarize_capture(read_json(run_dir / "workspace" / "reports" / "build_capture.json"))
     stages["capture"]["status"] = summary["status"]
     if summary["status"] == "ok":
-        kwargs: dict[str, Any] = {"image": f"framac-pipeline:{repo}"} if packages else {}
         stages["model"] = run_stage(
             "model",
             f"python3 {CONTAINER_SCRIPTS}/phase0_model.py run",
@@ -975,7 +975,6 @@ def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str
             repo,
             cls="phase-static",
             scratch=True,
-            **kwargs,
         )
         summary["model"] = summarize_model(read_json(run_dir / "workspace" / "reports" / "phase0_model.json"))
         stages["model"]["status"] = summary["model"]["status"]
@@ -1039,22 +1038,17 @@ def run_target(
     started = time.monotonic()
     _say(f"{tid}: {mount.name} at {target['revision'][:12]}")
 
-    def stage(name: str, command: str, cls: str | None = None, *, first: bool = False) -> bool:
-        # A derived image is built once; later stages name it, so no stage pays for `docker build`.
-        kwargs: dict[str, Any] = {"packages": packages} if first and packages else {}
-        if packages and not first:
-            kwargs["image"] = f"framac-pipeline:{repo}"
-        info = run_stage(name, command, mount, run_dir, repo, cls=cls, **kwargs)
+    def stage(name: str, command: str, cls: str | None = None) -> bool:
+        # Every stage after the capture runs in the analysis image: target packages reach it only
+        # through the run's snapshot (workspace/snapshot/), never through a derived image.
+        info = run_stage(name, command, mount, run_dir, repo, cls=cls)
         stages[name] = info
         if info["rc"] != 0:
             notes.append(f"stage {name}: rc={info['rc']}")
         return info["rc"] == 0
 
     py = f"python3 {CONTAINER_SCRIPTS}"
-    ok = stage("phase0", f"{py}/benchmark.py inner-phase0", "eva", first=True)
-    if ok and (read_json(run_dir / BENCH_SUBDIR / "phase0.json", {}) or {}).get("ok") is not True:
-        ok = False
-        notes.append("phase0: see bench/phase0.json")
+    # The capture comes first: it writes the snapshot every later Frama-C and compiler step reads.
     capture = run_capture(spec, mount, run_dir, repo, packages, stages)
     if capture["status"] != "ok":
         notes.append(f"capture: {capture['status']}: {capture.get('first_error') or 'see bench/logs/capture.log'}")
@@ -1062,6 +1056,10 @@ def run_target(
     model = capture.get("model") or {}
     if capture["status"] == "ok" and model.get("status") != "ok":
         notes.append(f"model: {model.get('status')}: {model.get('error') or 'see bench/logs/model.log'}")
+    ok = stage("phase0", f"{py}/benchmark.py inner-phase0", "eva")
+    if ok and (read_json(run_dir / BENCH_SUBDIR / "phase0.json", {}) or {}).get("ok") is not True:
+        ok = False
+        notes.append("phase0: see bench/phase0.json")
     if ok and not phase0_only:
         # build-check builds every module and records the E-ACSL gate the fuzz targets check.
         stage("build", f"{py}/pipeline_make.py build-check")

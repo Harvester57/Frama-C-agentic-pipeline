@@ -11,10 +11,9 @@
       "type": "object",
       "properties": {
         "root": {"type": "string"},
-        "tree": {"type": "string"},
-        "snapshot": {"type": "string"}
+        "tree": {"type": "string"}
       },
-      "required": ["root", "tree", "snapshot"]
+      "required": ["root", "tree"]
     },
     "recipe": {
       "type": ["object", "null"],

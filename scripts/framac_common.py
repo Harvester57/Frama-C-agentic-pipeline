@@ -514,8 +514,11 @@ def augment_framac_cppflags(cppflags: str) -> str:
     (Eva and WP) so third-party headers (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`)
     and glibc internal integer typedefs (`__int32_t`, etc.) resolve cleanly without
     shadowing `__fc_libc`, ensuring stubs and compatibility headers precede target headers.
+    The target's system headers come last, from the run's snapshot (scripts/target_env.py).
     """
-    base = (cppflags or "-I.").strip()
+    from target_env import with_include_flags
+
+    base = with_include_flags((cppflags or "-I.").strip())
     fc_stubs = resolve_fc_stubs_dir()
     if fc_stubs is None:
         return base

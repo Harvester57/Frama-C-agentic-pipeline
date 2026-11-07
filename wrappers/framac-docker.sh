@@ -11,10 +11,12 @@
 # --build-image runs the command in the build image (framac-build:latest, Dockerfile stage framac-build:
 # the target's own build and tests, e.g. scripts/build_capture.py); with --target-packages the derived
 # build image framac-build:<repo> is built and used. FRAMAC_DOCKER_IMAGE still overrides the name.
-# Every other command keeps the monolith (framac-pipeline:latest) as before.
+# Every other command runs in the analysis image (framac-analysis:latest), which holds no target package:
+# the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written by the
+# build capture), so --target-packages only derives the build image. FRAMAC_DOCKER_IMAGE=framac-pipeline:latest
+# selects the monolith, which --target-packages still derives as framac-pipeline:<repo>.
 # --scratch creates (once) and mounts the run's named volume framac-scratch-<repo>-<run id>-<hash of
-# the run dir> at /framac-scratch (the build capture's scratch tree and snapshot); --remove-scratch
-# removes it and exits.
+# the run dir> at /framac-scratch (the build capture's scratch tree); --remove-scratch removes it and exits.
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
 # /opt/framac-pipeline/{scripts,templates,schemas,skills,docs/references} (read-only) and, on the
@@ -48,7 +50,7 @@ export PYTHONIOENCODING="utf-8"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-$(pwd)}"
-IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-pipeline:latest}"
+IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-analysis:latest}"
 BUILD_IMAGE=0
 SCRATCH=0
 REMOVE_SCRATCH=0
@@ -243,11 +245,18 @@ if [[ ${REMOVE_SCRATCH} -eq 1 ]]; then
     exit 0
 fi
 
-# Build steps (--build-image) run in the build image (Dockerfile stage framac-build); everything else in the monolith.
+# Build steps (--build-image) run in the build image (Dockerfile stage framac-build); everything else in the
+# analysis image (stage framac-analysis). An explicit FRAMAC_DOCKER_IMAGE is built from the last stage, the monolith.
 IMAGE_TARGET=()
 if [[ ${BUILD_IMAGE} -eq 1 ]]; then
     IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-build:latest}"
     IMAGE_TARGET=(--target framac-build)
+elif [[ -z "${FRAMAC_DOCKER_IMAGE:-}" ]]; then
+    IMAGE_TARGET=(--target framac-analysis)
+    if [[ -n "${TARGET_PACKAGES}" ]]; then
+        echo "[framac-docker] --target-packages ignored: the analysis image reads the target's headers and libraries from the run's snapshot (pass them to the --build-image capture)" >&2
+        TARGET_PACKAGES=""
+    fi
 fi
 if [[ -z "$("${ENGINE}" images -q "${IMAGE}" 2>/dev/null)" ]]; then
     if [[ ${BUILD} -eq 1 ]]; then

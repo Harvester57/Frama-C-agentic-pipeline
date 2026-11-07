@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cache  # noqa: E402
 import fuzz_dictionary  # noqa: E402
 import prover_candidates  # noqa: E402
+import target_env  # noqa: E402
 from acsl_ast import tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
@@ -714,6 +715,8 @@ def compile_eacsl_binary(
     then names the cache entry). The result carries `cache: {"hit": bool, "key": str | None}`.
     """
     out_bin = Path(out_bin)
+    cppflags = target_env.with_include_flags(cppflags)
+    ldflags_extra = target_env.with_link_flags(ldflags_extra)
     target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
 
     def _build() -> dict:
@@ -1058,6 +1061,8 @@ def _compile_clang_binary(
     """Compile a slice directly with Clang, cached (binary and compile log) outside agents/*/scratch."""
     out_bin = Path(out_bin)
     compile_log = out_bin.with_suffix(log_suffix)
+    cppflags = target_env.with_include_flags(cppflags)
+    ldflags_extra = target_env.with_link_flags(ldflags_extra)
     cmd = [
         "clang",
         "-g",

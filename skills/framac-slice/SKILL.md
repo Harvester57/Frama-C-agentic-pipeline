@@ -54,7 +54,7 @@ python3 /opt/framac-pipeline/scripts/sandbox_exec.py run --writable workspace/bu
 
 The broker sizes a sandboxed `bear`, `make`, `cmake`, `ninja`, `meson` or `configure` command like a whole phase (`phase-dynamic`), and `FRAMAC_JOB_CPUS` is the CPU count it leased. `$FRAMAC_JOB_CPUS` must reach the container unexpanded: in the PowerShell wrapper's double-quoted command write `` `$FRAMAC_JOB_CPUS ``.
 
-For CMake: `cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"` inside the same scratch copy. Pass the result to Step 2 with `--compile-commands`. If the target depends on additional Debian/Ubuntu `-dev` packages not in the base image, pass `--target-packages "<pkg1> <pkg2>"` (or `-TargetPackages` in PowerShell) to the Docker wrapper so the real headers and libraries are installed into a cached derived image before container privileges are dropped.
+For CMake: `cmake -B build "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"` inside the same scratch copy. Pass the result to Step 2 with `--compile-commands`. Additional Debian `-dev` packages belong in the build recipe (Step 1b): the capture installs them in the build image and copies the headers and libraries the build used to the run's snapshot, where every later step reads them.
 
 ### Step 1b — Build Recipe and Build Capture
 
@@ -80,13 +80,13 @@ Phase 0 needs the target's own build: what it compiles, links and exports. A tar
 
    The build runs under `bear` through `sandbox_exec.py`, in a copy of the target on the volume. A build that fails with parallel jobs is retried once with one job. The result is `workspace/reports/build_capture.json`:
    - **units:** link units, with their files, links, per-file flags and entry points; test executables are marked `test`;
-   - **snapshot:** the headers and libraries outside the project and libc, under `/framac-scratch/snapshot/`, with a digest.
+   - **snapshot:** the headers and libraries outside the project and libc, copied to the run's `workspace/snapshot/` with a digest. The analysis image, where every later step runs, has none of the target's packages: Frama-C, E-ACSL, the sanitizer and coverage builds read the target's headers from there (`-idirafter`, searched last) and link its libraries from there (with an RPATH, so the fuzz binaries run without the packages). Do not pass `-TargetPackages` to any step other than the capture: the wrapper ignores it there. Run the capture before Step 2, and again after a recipe change.
 
 3. **Stop and ask.** Exit code 3 and `"status": "needs_build_recipe"` mean the build failed, built no C file, or has no recipe. The checkpoint records the same status. Show the user `diagnostics`: `first_error`, `missing_headers`, `candidate_packages` (a heuristic) and `packages_not_installed`. Ask for a corrected command, packages or flags, record them with `set-build`, and run the capture again. A successful capture clears the status, and Phase 0 continues.
 
 ### Step 1c — Frama-C Model
 
-Parse every non-test link unit of the capture with Frama-C, on the same scratch volume, in the pipeline image:
+Parse every non-test link unit of the capture with Frama-C, on the same scratch volume, in the analysis image:
 
 ```powershell
 & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Scratch -Class phase-static `

@@ -54,6 +54,7 @@ NOT_FORWARDED = {
     # test hooks and internal plumbing
     "FRAMAC_AST_DUMP_OUT",
     "FRAMAC_P0_DUMP_OUT",
+    "FRAMAC_SNAPSHOT_DIR",
     "FRAMAC_PROBE_MEMO_S",
     "FRAMAC_PROBE_ROOT",
 }

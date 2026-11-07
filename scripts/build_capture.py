@@ -27,7 +27,8 @@ the run's named Docker volume at /framac-scratch:
      visibility (shared libraries); global functions declared in the public headers (static libraries).
      Public headers come from `make install DESTDIR=` (or `cmake --install`) when that works, else the
      headers outside the source directories, else the project headers the library's consumers include;
-  6. a snapshot for the analysis image under <scratch>/snapshot/root/ (absolute paths kept), with a digest:
+  6. a snapshot for the analysis image under <run>/workspace/snapshot/root/ (absolute paths kept), with a
+     digest, read by scripts/target_env.py:
      the headers the compiler's dependency lists (`cc -M` per TU) name outside the project and outside libc
      and the toolchain (told apart with `dpkg -S`: libc6-dev, linux-libc-dev, gcc's own headers), the
      libraries the link steps name (`-l` through `cc -print-file-name`, absolute inputs) and their shared
@@ -64,6 +65,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import target_env  # noqa: E402
 from framac_common import atomic_write_json, is_pipeline_output_dir, load_json_optional, utc_now  # noqa: E402
 
 SCHEMA_VERSION = 1
@@ -1303,7 +1305,7 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
         "generated_at": utc_now(),
         "status": STATUS_NEEDS_RECIPE,
         "target": str(target),
-        "scratch": {"root": str(scratch), "tree": str(tree), "snapshot": str(scratch / "snapshot")},
+        "scratch": {"root": str(scratch), "tree": str(tree)},
         "recipe": None,
         "build": None,
         "diagnostics": None,
@@ -1501,13 +1503,18 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
         for c in entries
     ]
     report["build"]["probes_dropped"] = cap["probes_dropped"]
-    report["snapshot"] = build_snapshot(scratch, tree, units, system_headers, recipe, report["warnings"])
+    snapshot = Path.cwd() / target_env.SNAPSHOT_REL
+    report["snapshot"] = build_snapshot(snapshot, tree, units, system_headers, recipe, report["warnings"])
 
 
 def build_snapshot(
-    scratch: Path, tree: Path, units: dict, system_headers: set[str], recipe: dict, warnings: list[str]
+    snapshot: Path, tree: Path, units: dict, system_headers: set[str], recipe: dict, warnings: list[str]
 ) -> dict:
-    """Headers, libraries and their shared dependencies outside the project and libc, copied with a digest."""
+    """
+    Headers, libraries and their shared dependencies outside the project and libc, copied with a digest
+    to the run's snapshot (<run>/workspace/snapshot): every container of the run mounts the run
+    directory, so the analysis image finds them there (scripts/target_env.py).
+    """
     t = str(tree)
     libs: dict[str, str] = {}  # path -> how it was found
     for name, u in units.items():
@@ -1547,9 +1554,9 @@ def build_snapshot(
     ]
     exported = {e["path"]: e for e in headers + libraries if e["class"] in ("package", "unowned")}
     exported.update({p: {"path": p} for p in extra_files})
-    summary = export_snapshot(scratch / "snapshot", exported)
+    summary = export_snapshot(snapshot, exported)
     return {
-        "root": str(scratch / "snapshot" / "root"),
+        "root": (snapshot / "root").as_posix(),
         "digest": summary["digest"],
         "files": summary["files"],
         "headers": [h for h in headers if h["class"] in ("package", "unowned")],

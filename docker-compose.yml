@@ -20,12 +20,17 @@
 # `docker compose run --rm --user 0 --entrypoint chmod framac-build 1777 /framac-scratch`.
 # Target packages need a derived build image: `docker build --target framac-build --build-arg
 # TARGET_APT_PACKAGES="..." -t framac-build:<repo> .` and FRAMAC_BUILD_IMAGE=framac-build:<repo>.
+# The framac-pipeline service runs the analysis image (stage framac-analysis), which holds no target
+# package: the build capture writes the target's headers and libraries to the run's snapshot
+# (workspace/snapshot/), and every Frama-C, E-ACSL and sanitizer step reads them from there.
+# FRAMAC_ANALYSIS_IMAGE=framac-pipeline:latest selects the monolith (build it without --target).
 services:
   framac-pipeline:
     build:
       context: .
       dockerfile: Dockerfile
-    image: framac-pipeline:latest
+      target: framac-analysis
+    image: ${FRAMAC_ANALYSIS_IMAGE:-framac-analysis:latest}
     user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"
     working_dir: /framac-run
     network_mode: none

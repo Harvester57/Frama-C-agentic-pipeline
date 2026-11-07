@@ -498,9 +498,16 @@ class TestWrappersAndBenchmark:
             str(tmp_path / "run_1"),
         ]
         cases: tuple[tuple[list[str], str, bool], ...] = (
-            ([], "framac-pipeline:latest", False),
+            ([], "framac-analysis:latest", False),
             (["-BuildImage", "-Scratch"], "framac-build:latest", True),
             (["-BuildImage", "-TargetPackages", "check", "-NoBroker"], "framac-build:target_repo", False),
+            # The analysis image never gets target packages; the monolith, named explicitly, still does.
+            (["-TargetPackages", "check", "-NoBroker"], "framac-analysis:latest", False),
+            (
+                ["-Image", "framac-pipeline:latest", "-TargetPackages", "check", "-NoBroker"],
+                "framac-pipeline:target_repo",
+                False,
+            ),
         )
         for extra, image, scratch in cases:
             proc = subprocess.run([*base, *extra, "true"], env=env, capture_output=True, text=True)

@@ -8,8 +8,9 @@ Stdlib only.
                         [--out workspace/reports/phase0_model.json] [--jobs N] [--no-broker]
     phase0_model.py selftest
 
-`run` reads the build capture (scripts/build_capture.py) and the scratch tree and snapshot it names, so
-it runs in a container started with the wrapper's -Scratch (sh: --scratch), in the Frama-C image:
+`run` reads the build capture (scripts/build_capture.py), the scratch tree it names and the run's
+snapshot (scripts/target_env.py), so it runs in a container started with the wrapper's -Scratch
+(sh: --scratch), in the analysis image:
 
   1. parse jobs: one per link unit that is not a test unit, over the unit's own sources with each file's
      own flags. Units that compile the same sources with the same flags share one parse. Jobs run in
@@ -66,6 +67,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_capture as bc  # noqa: E402
+import target_env  # noqa: E402
 from framac_common import atomic_write_json, augment_framac_cppflags, load_json_optional, utc_now  # noqa: E402
 from kernel_ast import compile_dump_module  # noqa: E402
 
@@ -79,8 +81,6 @@ MACHDEP = "gcc_x86_64"
 GCC_TIMEOUT_S = 300
 ERROR_CHARS = 400
 THREAD_SPAWNERS = {"pthread_create": 2, "thrd_create": 1}
-# System include directories gcc searches by default: their target headers come from the snapshot.
-DEFAULT_SYSTEM_DIRS = ("/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include")
 SOURCE_FRAMAC = "frama-c-kernel"
 SOURCE_GCC = "gcc-callgraph-info"
 
@@ -133,20 +133,7 @@ def snapshot_dirs(snapshot_root: str | None, system_flags: Iterable[str]) -> lis
     directories the compile named outside the tree, then gcc's default system directories, each only
     when the snapshot has it. Searched after Frama-C's libc, so a libc header never comes from there.
     """
-    if not snapshot_root:
-        return []
-    dirs: list[str] = []
-    toks = list(system_flags)
-    for i, tok in enumerate(toks):
-        if tok in ("-I", "-isystem", "-idirafter", "-iquote") and i + 1 < len(toks):
-            dirs.append(toks[i + 1])
-    dirs += list(DEFAULT_SYSTEM_DIRS)
-    out: list[str] = []
-    for d in dirs:
-        snap = posixpath.join(snapshot_root, d.lstrip("/"))
-        if os.path.isdir(snap) and snap not in out:
-            out += ["-idirafter", snap]
-    return out
+    return target_env.include_flags(snapshot_root, system_flags)
 
 
 def framac_file_flags(flags: list[str], tree: str) -> list[str]:

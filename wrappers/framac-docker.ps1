@@ -66,14 +66,16 @@
 
 .PARAMETER BuildImage
     Run the command in the build image (framac-build:latest; the target's own build and its tests, e.g.
-    scripts/build_capture.py) instead of the monolith. With -TargetPackages, the derived build image
+    scripts/build_capture.py) instead of the analysis image. With -TargetPackages, the derived build image
     framac-build:<repo> is built (--target framac-build) and used. -Image still overrides the image name.
-    Every other command keeps the monolith (framac-pipeline:latest) as before.
+    Every other command runs in the analysis image (framac-analysis:latest), which holds no target
+    package: the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written
+    by the build capture), so -TargetPackages only derives the build image. -Image framac-pipeline:latest
+    selects the monolith, which -TargetPackages still derives as framac-pipeline:<repo>.
 
 .PARAMETER Scratch
     Create (once) and mount the run's named volume framac-scratch-<repo>-<run id>-<hash of the run dir>
-    at /framac-scratch: the build capture's scratch tree and snapshot live there, not on the host bind
-    mount. Every container of the run started with -Scratch sees the same volume at the same path.
+    at /framac-scratch: the build capture's scratch tree lives there, not on the host bind mount. Every container of the run started with -Scratch sees the same volume at the same path.
 
 .PARAMETER RemoveScratch
     Remove the run's scratch volume and exit (no command needed).
@@ -109,7 +111,7 @@ param(
     [string]$RepoName,
 
     [Parameter(Mandatory = $false)]
-    [string]$Image = "framac-pipeline:latest",
+    [string]$Image = "framac-analysis:latest",
 
     [Parameter(Mandatory = $false)]
     [string]$TargetPackages = "",
@@ -398,11 +400,15 @@ if ($RemoveScratch) {
 }
 
 # ---- Image ----
-# Build steps (-BuildImage) run in the build image (Dockerfile stage framac-build); everything else in the monolith.
+# Build steps (-BuildImage) run in the build image (Dockerfile stage framac-build); everything else in the
+# analysis image (stage framac-analysis). An explicit -Image is built from the Dockerfile's last stage, the monolith.
 $imageTarget = @()
+$explicitImage = $PSBoundParameters.ContainsKey("Image")
 if ($BuildImage) {
-    if (-not $PSBoundParameters.ContainsKey("Image")) { $Image = "framac-build:latest" }
+    if (-not $explicitImage) { $Image = "framac-build:latest" }
     $imageTarget = @("--target", "framac-build")
+} elseif (-not $explicitImage) {
+    $imageTarget = @("--target", "framac-analysis")
 }
 $imageExists = & $EngineName images "-q" "$Image" 2>$null
 if (-not $imageExists) {
@@ -418,6 +424,11 @@ if (-not $imageExists) {
     }
 }
 
+if ($TargetPackages -and -not $BuildImage -and -not $explicitImage) {
+    # The analysis image never gets target packages: the run's snapshot carries them.
+    [Console]::Error.WriteLine("[framac-docker] -TargetPackages ignored: the analysis image reads the target's headers and libraries from the run's snapshot (pass them to the -BuildImage capture)")
+    $TargetPackages = ""
+}
 if ($TargetPackages) {
     $DerivedImage = "framac-pipeline:$RepoName"
     if ($BuildImage) { $DerivedImage = "framac-build:$RepoName" }
