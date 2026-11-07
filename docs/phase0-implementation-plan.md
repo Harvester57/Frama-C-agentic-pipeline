@@ -2,16 +2,31 @@
 
 This plan turns the target Phase 0 in [`phase0-redesign.md`](phase0-redesign.md) into implementation steps. The proof of concept in `poc/phase0/` validated the core of that design.
 
+Revised on 2026-11-07 after a review against the code:
+
+- **Gates (I1):** the gates now produce a stamp the later targets require. Making `gen` depend on build-check was circular.
+- **Saved-parse reuse:** the plan claimed Eva and WP could load Phase 0's saved parse. They can't, because they parse the harness or spliced contracts too. The remaining performance work moved into I3, and the old I7 is gone.
+- **Seed inputs (I6):** they come from recording the API calls the tests make. Our targets' test inputs are inline literals, not files.
+- **Trust boundary (I7):** library API is untrusted by default, and the input-path pass applies to executables. Threat models are written for three benchmark targets.
+- **Contract check:** the old I11 is dropped. It relied on `requires` clauses that only exist after Phase 3.
+- **I5 split:** I5a switches the inventory with modules held fixed. I5b makes link units the modules and maps sub-module reports back to their unit at ingest.
+- **Added:**
+  - build recipes for the benchmark;
+  - all image changes in I0, with a MetAcsl feasibility test;
+  - a selftest for the dump module;
+  - concurrency in the report;
+  - a size estimate per step.
+
 ## Decisions (2026-11-07)
 
 | Question | Decision |
 | :--- | :--- |
-| How the work lands | Everything stays on `phase0-redesign` and merges to `main` once, at the end. `main` is merged into the branch regularly, starting with `156adfa`. |
-| Image dependencies | MetAcsl, the CodeQL CLI (downloaded at image build, off by default) and `strace` (for test-input harvesting) may be added. |
+| How the work lands | Everything stays on `phase0-redesign` and merges to `main` once, at the end. `main` is merged into the branch at the start of each step, starting with `156adfa`. |
+| Image dependencies | MetAcsl, the CodeQL CLI (downloaded at image build, off by default) and `strace` may be added. |
 | Target does not build | Phase 0 **stops**. It records `needs_build_recipe` with diagnostics, and the parent agent asks the user for a build command, packages or flags. There is no inventory from the lexer. |
 | Frama-C cannot parse a unit | The GCC call-graph fallback runs, flagged in the ledger and the report. Fuzzing with sanitizers still runs; Eva and WP on that unit are reported blocked. Phase 0 stops only if no unit parses. |
 | The lexer | Deleted at the end. `build_callgraph_dag.py` keeps only the DAG-view writer. |
-| Seed inputs from tests | The project's test suite runs inside the sandbox with file-access tracing. The data files the tests read become seed inputs. |
+| Seed inputs from tests | The project's test suite runs inside the sandbox. The arguments the tests pass to the API are recorded as seeds, and the data files they read are kept as a secondary source. |
 | Threat model | A structured, machine-readable block in `THREAT_MODEL.md` (input sources, secrets, auth gates, output sinks). If it is missing, Phase 0 records `no_threat_model` rather than guessing. |
 | Benchmark baseline | Re-recorded at each step that changes units, after review. Recall of known bugs must never drop, and every change in unit counts is explained in the step's notes. |
 
@@ -25,11 +40,12 @@ Defaults taken where nothing was asked (open to change):
 
 ## Rules for every step
 
-- **Ownership.** Each step lists the files it owns. Steps that can run in parallel own disjoint files.
+- **Ownership.** Each step lists the files it owns. Steps that run in parallel own disjoint files. The Dockerfile belongs to I0 only.
+- **Size.** S is about a day of focused work, M a few days, L a week or more.
 - **Tests.**
   - Unit tests go in `tests/`, stdlib only, with recorded fixtures.
   - Docker-backed integration tests carry the `integration`/`slow` markers.
-  - The 9 reproducers and the 7 seeded projects move to `tests/fixtures/phase0/` in I0 and become the integration fixtures.
+  - The 9 reproducers and the 7 seeded projects become the integration fixtures in I0.
 - **Acceptance gates for every step, besides its own:**
   - `ruff`, `ruff format --check`, `mypy scripts tests` and the full pytest suite pass;
   - the reproducers score 1.00 wherever the step touches inventory;
@@ -38,33 +54,51 @@ Defaults taken where nothing was asked (open to change):
 
 ## Steps
 
-### I0. Branch groundwork
+### I0. Branch groundwork and image (M)
 
-- **Goal:** start from current `main` with the PoC's assets usable as test fixtures.
+- **Goal:** start from current `main` with the fixtures and every image dependency in place, and know whether MetAcsl can be used.
 - **Work:**
   - merge `main` (`156adfa`) into `phase0-redesign`;
   - copy `poc/phase0/reproducers/` and `poc/phase0/seeded/` to `tests/fixtures/phase0/`;
   - add a pytest helper that runs a fixture through Docker (skipped when Docker is absent);
-  - record a branch benchmark baseline with qcbor-dev included now that it passes Phase 0.
-- **Owns:** `tests/fixtures/phase0/`, `tests/conftest.py` helpers, `benchmark/baselines/`.
-- **Acceptance:** the suite passes, and the baseline is recorded with all 10 targets.
+  - **image:**
+    - add `strace`;
+    - download the CodeQL CLI at a pinned version, unused until I7;
+    - **MetAcsl feasibility test:** build the release that targets Frama-C 34, or the development branch, against the image's `34.0~~dev` kernel, and run it on a 20-line example through WP and E-ACSL. Record go or no-go for I9;
+  - record a branch benchmark baseline with qcbor-dev included, now that it passes Phase 0.
+- **Owns:** `Dockerfile`, `tests/fixtures/phase0/`, `tests/conftest.py` helpers, `benchmark/baselines/`.
+- **Acceptance:**
+  - the image builds;
+  - the CodeQL CLI answers `codeql version`;
+  - the MetAcsl result is recorded in this file;
+  - the suite passes, and the baseline covers all 10 targets.
 
-### I1. Phase 0 gates become Make dependencies
+### I1. Phase 0 gates that cannot be skipped (S, parallel with I2)
 
-- **Goal:** the reach gate and build-check can no longer be skipped. This step needs no new analysis.
+- **Goal:** fuzzing, Eva and Phase 3 never start on harnesses that failed the reach gate or the E-ACSL build check.
 - **Work:**
-  - `pipeline.mk`: `seed` and `gen` depend on `reach-gate` (`harness_reach.py check`) and `build-check`;
-  - `pipeline_make.py`: `gen` refuses modules that failed either gate, unless the module is exempted;
-  - `validate_artifacts.py` checks both reports;
-  - update the slice and verify skills.
-- **Owns:** `templates/pipeline.mk`, `scripts/pipeline_make.py` (gate wiring only), `scripts/validate_artifacts.py`, `skills/framac-slice`, `skills/framac-verify`.
-- **Acceptance:** a run with a reach gap or an E-ACSL fallback stops before seeding. The benchmark is unchanged.
+  - **Stamp:** `harness_reach.py check` and `pipeline_make.py build-check` each write their result to `workspace/reports/phase0_gates.json`.
+  - **`pipeline.mk`:**
+    - `seed` depends on the reach gate (it runs after harness generation and needs no Makefile);
+    - `fuzz`, `eva` and `wp-queue` depend on a passing stamp;
+    - build-check stays after `gen`, as today, because it builds through the generated Makefile.
+  - **`pipeline_make.py gen`:** the per-module `fuzz-`/`eva-` targets of a module that failed either gate print why and exit non-zero, unless the module is exempted.
+  - **Benchmark:** `inner_phase0` calls the reach gate before `ledger.py seed`. The manifest records the exemptions its pinned harnesses need, each with a reason.
+  - `validate_artifacts.py` checks the stamp. Update the slice and verify skills.
+- **Owns:** `templates/pipeline.mk` (gate targets), `scripts/pipeline_make.py` (stamp and gate checks), `scripts/harness_reach.py` (stamp), `scripts/validate_artifacts.py`, `scripts/benchmark.py` (`inner_phase0` gate call), `benchmark/manifest.json` (exemptions), `skills/framac-slice`, `skills/framac-verify`.
+- **Acceptance:**
+  - a run with a reach gap or an E-ACSL fallback stops before fuzzing;
+  - the benchmark passes with its exemptions listed;
+  - recall is unchanged.
 
-### I2. Build recipe and build capture
+### I2. Build recipe and build capture (L, parallel with I1)
 
 - **Goal:** Phase 0 knows exactly what the build compiles, links and exports, or stops and asks.
 - **Work:**
-  - **Build recipe:** `run-metadata.json` gets a `build` block (command, packages, environment, working directory). It is set by the user or proposed by the agent and confirmed by the user, and recorded for resume.
+  - **Build recipe:**
+    - `run-metadata.json` gets a `build` block: command, packages, environment, working directory, and the test command used in I6;
+    - it is set by the user, or proposed by the agent and confirmed by the user;
+    - the checkpoint records `needs_build_recipe`, so a resumed run starts again at the capture.
   - **`scripts/build_capture.py`,** promoted from `phase0b.py`'s capture code:
     - runs the build under `bear intercept` in a scratch copy, through `sandbox_exec.py` (`phase-dynamic`);
     - parses compile, link and archive steps;
@@ -72,19 +106,23 @@ Defaults taken where nothing was asked (open to change):
     - derives link units, marks test units, and reads per-file flags (`-I -D -U -include -imacros -iquote -isystem -std`);
     - takes exports from `nm -D` and version scripts, and public headers from `make install DESTDIR=` with a fallback to headers outside the source directories.
   - **Output:** `workspace/reports/build_capture.json`, with a schema.
-  - **Stop and ask:** a failed build writes `phase0.status = needs_build_recipe` with the first error, missing headers and candidate `-dev` packages. The slice skill tells the agent to ask the user.
-- **Owns:** `scripts/build_capture.py`, `schemas/build_capture.schema.json`, `scripts/run_metadata.py` (build block), `skills/framac-slice` (recipe section).
+  - **Stop and ask:** a failed build writes `needs_build_recipe` with the first error, missing headers and candidate `-dev` packages. The slice and verify skills tell the agent to ask the user and resume.
+  - **Benchmark:** every target gets a `build` recipe in the manifest:
+    - tweetnacl's Makefile is a symlink stub on a Windows checkout, so it gets an explicit `cc` command;
+    - CryptoLib gets CMake plus its packages;
+    - minmea gets CMake with tests enabled and the `check` package.
+- **Owns:** `scripts/build_capture.py`, `schemas/build_capture.schema.json`, `scripts/run_metadata.py` (build block), `scripts/checkpoint.py` (status), `benchmark/manifest.json` (recipes), `scripts/benchmark.py` (recipe passing), `skills/framac-slice` (recipe section).
 - **Tests:**
   - unit tests on recorded `bear` event files (compile+link in one command, `ar`, `-l` resolution, probes, joined vs. separate flags);
   - integration tests on all reproducers (units and entry points as in their truth files).
 - **Acceptance:**
   - reproducer units and entry points match their truth files 100%;
-  - the benchmark targets build, CryptoLib with its packages;
-  - a target with a broken build stops with a usable diagnostic.
+  - all 10 benchmark targets build from their recipes;
+  - a target with a broken build stops with a usable diagnostic and resumes after the recipe is fixed.
 
-### I3. Frama-C model
+### I3. Frama-C model (L)
 
-- **Goal:** one Frama-C parse per link unit gives the inventory and the call graph, named as Eva and WP will name them.
+- **Goal:** one Frama-C parse per link unit gives the inventory and the call graph, named as Eva and WP will name them, at about the cost of the build.
 - **Work:**
   - **`scripts/phase0_dump.ml`,** promoted from `p0_dump.ml`, reports:
     - definition locations, storage and signatures;
@@ -92,14 +130,15 @@ Defaults taken where nothing was asked (open to change):
     - functions passed as arguments (threads, callbacks);
     - loops.
   - **`scripts/phase0_model.py`:**
-    - parses each unit with its per-file flags and saves the session (`workspace/framac/<unit>.sav`);
+    - parses each unit with its per-file flags, each source once per flag set, units in parallel under the resource broker (new class `parse`), test units skipped;
     - collects metrics (`-metrics -metrics-by-function`: lines, cyclomatic complexity);
-    - extracts macro aliases (`gcc -E -dM` per translation unit, keeping `#define a b` where `b` is a defined function);
+    - extracts macro aliases (`gcc -E -dD` per translation unit, keeping `#define a b` where `b` is a defined function and the definition is in a project file);
     - marks thread entries and concurrent units;
     - links header `static inline` functions to the units that compile them.
   - **GCC fallback:** for a unit Frama-C cannot parse, `-fcallgraph-info`, flagged with the first Frama-C error.
+  - **Dump selftest** (like `kernel_ast.py selftest`), run at image build and by the slice skill's setup.
   - **Output:** `workspace/reports/phase0_model.json` with a schema. Every fact carries its source.
-- **Owns:** `scripts/phase0_model.py`, `scripts/phase0_dump.ml`, `schemas/phase0_model.schema.json`.
+- **Owns:** `scripts/phase0_model.py`, `scripts/phase0_dump.ml`, `schemas/phase0_model.schema.json`, `scripts/resources.py` (class `parse`).
 - **Tests:**
   - unit tests on recorded dumps (static collisions, aliases, thread spawns, header inline functions);
   - integration tests on all reproducers;
@@ -107,98 +146,103 @@ Defaults taken where nothing was asked (open to change):
 - **Acceptance:**
   - reproducers score 1.00 on every class;
   - all benchmark targets parse;
-  - the GCC fallback produces edges and a flag on the forced failure.
+  - the GCC fallback produces edges and a flag;
+  - Phase 0 wall time ≤ build time + 2× the lexer's time on every benchmark target.
 
-### I4. Narrowing function-pointer edges with Alias (parallel with I5)
+### I4. Narrowing function-pointer edges with Alias (S, parallel with I5a)
 
 - **Goal:** fewer spurious indirect edges, without losing true ones.
-- **Work:** run `-alias` in the I3 parse and intersect its targets with the signature match. Measure on the benchmark targets (x509-parser has 163 indirect edges) and on the reproducers and seeded projects. Adopt it only if precision rises with recall unchanged on fixtures where indirect edges are exact (r03, r08, r09, s02).
-- **Owns:** the Alias part of `scripts/phase0_model.py` (coordinate with I5 on the model schema only).
+- **Work:** run `-alias` in the I3 parse and intersect its targets with the signature match. Measure on the benchmark targets (x509-parser has 163 indirect edges) and on the reproducers and seeded projects. Adopt it only if precision rises with recall unchanged on r03, r08, r09 and s02, where the indirect edges are exact.
+- **Owns:** the Alias option of `scripts/phase0_model.py`.
 - **Acceptance:** a measured report in `docs/phase0-redesign.md`. Alias is adopted or rejected with the numbers.
 
-### I5. Switch the pipeline to the model
+### I5a. Switch the inventory, modules held fixed (M)
 
-- **Goal:** every Phase 0 consumer reads the model. Modules become link units.
+- **Goal:** the bookkeeping gains the A/B showed, with low risk. Every function the build compiles gets a ledger unit under its real name. Modules don't change yet.
 - **Work:**
-  - **`build_callgraph_dag.py`** writes the DAG view from the model:
-    - modules = units, or sub-modules after I9;
-    - `required_sources` = unit sources plus the sources of linked libraries;
-    - `cppflags` per unit;
-    - API entry points, aliases, and provenance per function.
-
-    The lexer code stays until I12, unused.
-  - **Harness sub-modules:** a sidecar may name a harness module inside a unit (`unit` field), so a unit can have several harnesses, as QCBOR's 8 harnesses do today. `pipeline_make.py` maps each sidecar to its unit's sources and flags.
+  - **`build_callgraph_dag.py`** writes the DAG from the model, as the PoC's `dag_view.py` held-module view does:
+    - functions, edges (direct and indirect) and macro aliases from the model;
+    - modules, tiers and per-function analysis still from the lexer.
   - **`ledger.py seed`:**
-    - units only for functions in non-test units;
+    - no units for functions only in test units;
     - header `static inline` functions only when reached;
-    - `callgraph_source` per unit, and fallback units flagged.
-  - **`harness_reach.py`:** checks units, API entry points and aliases.
-  - **`generate_harness.py`:** resolves aliases and uses the unit flags, including `-include`.
-  - **`wp_scheduler.py` and `audit-hypotheses`:** use indirect edges.
-  - **Benchmark manifest:** module names move to unit or sub-module names. Recall is checked, and the baseline re-recorded.
-  - **Seeded benchmark:** joins `scripts/benchmark.py` as a `phase0` set, using the PoC's mechanical harness policy as a deterministic check.
-- **Owns:** `scripts/build_callgraph_dag.py`, `scripts/ledger.py` (seed), `scripts/harness_reach.py`, `scripts/generate_harness.py` (aliases, unit flags), `scripts/pipeline_make.py` (modules), `scripts/wp_scheduler.py` (edges), `benchmark/manifest.json`, `scripts/benchmark.py`.
+    - `callgraph_source` per function, and fallback units flagged.
+  - **Aliases:** `generate_harness.py` and `harness_reach.py` resolve macro aliases, so harness code naming `crypto_hash` still resolves.
+  - **Indirect edges:** `wp_scheduler.py` and `audit-hypotheses` use them.
+- **Owns:** `scripts/build_callgraph_dag.py`, `scripts/ledger.py` (seed), `scripts/generate_harness.py` (aliases), `scripts/harness_reach.py` (aliases), `scripts/wp_scheduler.py` (edges).
+- **Acceptance:**
+  - on the benchmark, Eva-analysed functions with no ledger unit reach 0 on every target;
+  - recall is unchanged;
+  - the baseline is re-recorded with the unit changes explained, matching the PoC's A/B.
+
+### I5b. Link units as modules (L, after I1 and I5a)
+
+- **Goal:** modules are the build's link units, and harnesses are written against units and their API.
+- **Work:**
+  - **DAG view:**
+    - modules = units, or sub-modules after I8;
+    - `required_sources` = unit sources plus the sources of linked libraries;
+    - per-unit flags;
+    - API entry points.
+  - **Harness sub-modules:** a sidecar may name a harness module inside a unit (`unit` field), so a unit keeps several harnesses, as QCBOR's 8 do today. `pipeline_make.py` maps each sidecar to its unit's sources and flags.
+  - **Ingest mapping:** `ledger.py ingest-eva` and `ingest-fuzz`, candidate linking and `wp_scheduler.py` resolve a report's module to its unit through the sidecar. Today they match `unit.module == report.module` (`ledger.py:442`, `:679`), which would credit nothing for a sub-module report.
+  - **Concurrency:** units that start threads are marked in the ledger. The report says their Eva and WP results assume sequential execution.
+  - **Benchmark manifest:** a script migrates module names to unit and sub-module names.
+  - **Seeded benchmark:** the seeded set joins `scripts/benchmark.py` as a `phase0` set, with the PoC's mechanical harness policy as a deterministic check.
+  - **Slice skill:** its harness section (step 4) targets link units and their API entry points.
+- **Owns:** `scripts/build_callgraph_dag.py` (modules), `scripts/pipeline_make.py` (modules), `scripts/ledger.py` (ingest mapping, concurrency), `scripts/wp_scheduler.py` (module map), `scripts/generate_report.py` (concurrency), `benchmark/manifest.json`, `scripts/benchmark.py`, `skills/framac-slice`.
 - **Acceptance:**
   - benchmark recall unchanged;
-  - Eva-analysed functions with no ledger unit: 0 on every target;
+  - every sub-module report credits its unit's functions;
   - the seeded set finds 7/7 bugs and fires 0 decoys;
-  - baseline re-recorded with the unit changes explained.
+  - baseline re-recorded.
 
-### I6. Hand-off to Phase 1 (parallel with I7 and I8)
+### I6. Hand-off to Phase 1 (L, parallel with I7)
 
-- **Goal:** fuzzing starts from real inputs and gets a fair budget, and Phase 1 coverage reaches back into Phase 0.
+- **Goal:** fuzzing starts from realistic inputs and gets a fair budget, and Phase 1 coverage reaches back into Phase 0.
 - **Work:**
-  - **Test-input harvesting:**
-    - run the project's tests (`make test`/`check`, `ctest`, or a command in the build recipe) in the sandbox under `strace -f -e trace=openat`;
-    - keep the regular files the tests open for reading inside the target tree, excluding sources, objects and binaries, capped by size and count;
-    - store them in `workspace/seeds/<unit>/`.
-  - **Seed adaptation:** each harness gets the seeds in its own format. A dispatch harness gets one copy per buffer-taking case, prefixed with that case's selector byte. They are passed to `campaign` through `--extra-corpus`, which exists but is not wired.
-  - **Dictionary:** `fuzz_dictionary.py` adds integer and string values of macros from the unit's `gcc -E -dM`.
+  - **Seeds from recorded API calls** (`scripts/seed_harvest.py`):
+    - rebuild the test executables with `-Wl,--wrap=<api_fn>` recorders, generated from the model's API and signatures;
+    - run the recipe's test command in the sandbox (no network, capped time);
+    - record the buffers and scalars each API call receives;
+    - write them in each harness's case format, selector byte included.
+  - **Secondary seeds:** data files the tests open for reading inside the target tree (`strace -f -e trace=openat`), capped by size and count.
+  - **Corpus wiring:** seeds go to `workspace/seeds/<module>/` and reach `campaign` through `--extra-corpus`, which exists but is not wired.
+  - **Dictionary:** `fuzz_dictionary.py` adds integer and string values of macros from the unit's preprocessed sources.
   - **Fuzz budget:** set per harness case, capped per unit and profile.
   - **Dynamic reach gate:** after `coverage-<mod>`, an API entry point with zero executions reopens the reach gate (`reach-dynamic` target). The parent then repairs the harness or records an exemption.
-  - **Image:** add `strace`.
-- **Owns:** `scripts/seed_harvest.py` (new), `scripts/fuzz_dictionary.py`, `templates/pipeline.mk` (fuzz and coverage recipes), `scripts/pipeline_make.py` (budget), `scripts/harness_reach.py` (dynamic mode), `Dockerfile` (strace), `skills/framac-fuzz`.
+- **Owns:** `scripts/seed_harvest.py` (new), `scripts/fuzz_dictionary.py`, `templates/pipeline.mk` (fuzz and coverage recipes), `scripts/pipeline_make.py` (budget), `scripts/harness_reach.py` (dynamic mode), `skills/framac-fuzz`.
 - **Acceptance:**
-  - on minmea and QCBOR, seeds come from their tests;
+  - on minmea (79 inline test sentences) and QCBOR (347 inline test arrays), seeds are recorded from the test runs;
   - coverage per entry point after a quick campaign is at least today's;
-  - a seeded fixture whose bug needs a structured input is found with seeds and missed without;
+  - a seeded fixture whose bug needs a well-formed input is found with seeds and missed without;
   - an unreached entry point reopens the gate.
 
-### I7. Performance and reuse of the parse (parallel with I6 and I8)
+### I7. Trust boundary (M, parallel with I6)
 
-- **Goal:** Phase 0 costs about what the build costs, and later phases stop re-parsing.
-- **Work:**
-  - parse each source once per flag set;
-  - parse units in parallel under the resource broker (new class `parse`);
-  - skip test units;
-  - Eva, WP, `kernel_ast.py` and `function_facts.py` load the saved session when the digest of sources and flags matches, and parse otherwise.
-- **Owns:** `scripts/phase0_model.py` (scheduling), `scripts/resources.py` (class), `scripts/run_eva_slice.py`, `scripts/run_wp_function.py`, `scripts/kernel_ast.py`, `scripts/function_facts.py` (load path only).
-- **Acceptance:**
-  - Phase 0 wall time ≤ build time + 2× the lexer's on every benchmark target;
-  - Eva and WP parse time measurably lower;
-  - results identical with and without the saved session.
-
-### I8. Trust boundary (parallel with I6 and I7)
-
-- **Goal:** `untrusted_surface` is derived from evidence, not a default.
+- **Goal:** `untrusted_surface` follows a stated rule and the threat model, not a default buried in harness generation.
 - **Work:**
   - **Threat-model schema:** the structured `THREAT_MODEL.md` block (`input_sources`, `secrets`, `auth_gates`, `output_sinks`) with a validator. A missing block records `no_threat_model` on every unit.
-  - **Input-path pass** on the model:
-    - **input functions:** `read`, `recv`, `recvfrom`, `fread`, `fgets`, `getline`, `getenv`, argv of `main`, plus the threat model's `input_sources`;
-    - **untrusted:** the API functions and callers on a call path to an input function, and every API function of a unit the threat model marks as exposed;
-    - **output:** `trust` per function in the model.
+  - **Rules:**
+    - **library units:** every API function is untrusted unless the threat model marks the library, or specific functions, as called only by trusted code;
+    - **executables:** functions reached in the call graph from an input reader are untrusted. Input readers are `read`, `recv`, `recvfrom`, `fread`, `fgets`, `getline`, `getenv`, `main` with argv, and the threat model's `input_sources`;
+    - **output:** `trust` per function in the model, with its source (`default`, `call_graph`, `threat_model`, `codeql`).
   - **CodeQL (optional):**
-    - downloaded at image build;
     - enabled per run in `run-metadata.json` when the user declares the target open-source;
-    - its source-to-sink facts refine `trust` and never widen it silently, recorded with `source: codeql`.
+    - its source-to-sink flows can mark additional internal functions untrusted;
+    - it never removes a default or a threat-model decision.
   - **Consumers:**
     - the sidecar's `reachability` defaults from `trust`;
     - the trust-boundary check in `acsl_ast.py` reads it;
     - the report shows the trust source per entry point.
-- **Owns:** `scripts/trust.py` (new), `schemas/threat_model.schema.json`, `Dockerfile` (CodeQL), `scripts/generate_harness.py` (reachability default only), `scripts/acsl_ast.py` (trust lookup only), `scripts/generate_report.py` (trust column).
-- **Acceptance:** the reproducers and seeded projects get a `trust` truth field, which matches; CodeQL off changes nothing; CodeQL on adds `source: codeql` facts on minmea.
+  - **Threat models** for minmea, QCBOR and x509-parser, stored as benchmark assets, so I7–I9 can be measured on real code.
+- **Owns:** `scripts/trust.py` (new), `schemas/threat_model.schema.json`, `benchmark/assets/*/THREAT_MODEL.md`, `scripts/generate_harness.py` (reachability default), `scripts/acsl_ast.py` (trust lookup), `scripts/generate_report.py` (trust column).
+- **Acceptance:**
+  - the reproducers and seeded projects get a `trust` truth field, which matches;
+  - CodeQL off changes nothing;
+  - CodeQL on adds `source: codeql` facts on minmea without removing any.
 
-### I9. Tiers and unit split (after I8)
+### I8. Tiers and unit split (M, after I7)
 
 - **Goal:** tiers that tell units apart, and units small enough for Eva.
 - **Work:**
@@ -215,11 +259,10 @@ Defaults taken where nothing was asked (open to change):
   - quick profile time drops with recall unchanged;
   - Eva converges on CryptoLib's largest unit after the split.
 
-### I10. Security layers via MetAcsl (after I8)
+### I9. Security layers via MetAcsl (L, after I7, only if I0's test passed)
 
 - **Goal:** L3–L6 obligations come from what the threat model requires, not from what the code already does.
 - **Work:**
-  - **Image:** install MetAcsl at a pinned version.
   - **Property generation**, from the structured threat model:
     - **L4:** auth gates become "only gate functions write the auth state, and privileged functions require it";
     - **L5:** output sinks become sanitization properties on writers;
@@ -228,23 +271,15 @@ Defaults taken where nothing was asked (open to change):
   - **Ledger:** new obligation classes keyed to the properties.
   - **Phase 3 briefs:** say which MetAcsl-generated annotations a prover must discharge.
   - Retire the per-function pattern matching of the old L5/L6 inference.
-- **Owns:** `scripts/security_props.py` (new), `templates/metacsl/`, `Dockerfile` (MetAcsl), `scripts/ledger.py` (classes), `skills/framac-wp` (briefs).
+  - **If I0 recorded no-go:** generate the same properties as plain per-function ACSL templates from the threat model. L4 then loses its program-wide form.
+- **Owns:** `scripts/security_props.py` (new), `templates/metacsl/`, `scripts/ledger.py` (classes), `skills/framac-wp` (briefs).
 - **Acceptance:**
   - a fixture with a secret that is never wiped produces an unproven L6 unit;
   - a fixture with a correct wipe proves it;
+  - the benchmark threat models produce properties on their targets;
   - the existing L5/L6 templates are covered or explicitly dropped.
 
-### I11. Mechanical harness contract check (after I5)
-
-- **Goal:** harness-induced crashes are caught before they reach crash verifiers.
-- **Work:**
-  - before fuzzing, build each harness with E-ACSL checking the entry functions' `requires` clauses, taken from contract notes, existing ACSL and the I10 properties;
-  - replay the corpus;
-  - a precondition violation in a case is reported as a harness defect (`harness_contract_violation`), not a candidate, and sent back to the parent agent.
-- **Owns:** `scripts/run_eacsl_fuzz.py` (new `contract-check` mode), `templates/pipeline.mk` (target), `skills/framac-fuzz`.
-- **Acceptance:** the seeded decoys built to crash only outside their contract (`be16_at`, `load_be32`), when harnessed directly, are reported as harness defects. No real bug is reclassified.
-
-### I12. Lexer removal, docs, and the single merge
+### I10. Lexer removal, docs, and the single merge (M)
 
 - **Goal:** one Phase 0, documented, on `main`.
 - **Work:**
@@ -255,34 +290,46 @@ Defaults taken where nothing was asked (open to change):
 - **Owns:** everything touched above, for cleanup only.
 - **Acceptance:**
   - every gate above passes on the merged tree;
-  - the remediation-style status table in this file is complete;
+  - the status table below is complete;
   - `poc/phase0/` is kept as history or removed (decide then).
 
 ## Order and parallelism
 
 ```text
-I0 ─▶ I1 ─▶ I2 ─▶ I3 ─▶ I5 ─┬─▶ I6 ─────────────┐
-                    │         ├─▶ I7 ─────────────┤
-                    └─▶ I4    ├─▶ I8 ─┬─▶ I9 ─────┤
-                              │       └─▶ I10 ────┤
-                              └─▶ I11 ────────────┴─▶ I12
+I0 ─┬─▶ I1 ───────────────────────────┐
+    └─▶ I2 ─▶ I3 ─┬─▶ I4              ▼
+                  └─▶ I5a ─────────▶ I5b ─┬─▶ I6 ──────────────┐
+                                          └─▶ I7 ─┬─▶ I8 ──────┤
+                                                  └─▶ I9 ──────┴─▶ I10
 ```
 
-- **I1** is independent of the analysis work and comes first because it is small and protects everything after it.
-- **I4** can run next to I5; it touches only the Alias part of the model.
-- **I6, I7 and I8** own disjoint files once I5 is in, and can be parallel subagent or session work.
-- **I11** needs I5. It improves once I10 provides more `requires` clauses, but doesn't depend on it.
+- **I1 and I2** are independent, and I1 must land before I5b changes harness modules.
+- **I4** runs next to I5a; it touches only the Alias option of the model.
+- **I6 and I7** own disjoint files once I5b is in, and can be parallel subagent or session work. So can I8 and I9.
 
 ## Risks
 
 - **Build recipes for real targets.** Stop-and-ask moves effort onto the user for targets that don't build out of the box. Mitigation: candidate packages in the diagnostic, and the recipe recorded for resume and reuse.
 - **Running test suites inside the sandbox** runs more target code, and some suites need a network or services. Mitigation: a time and resource cap, no network, and failures are non-fatal (seeds are an improvement, not a requirement).
-- **The harness format change in I5** touches every benchmark harness spec. Mitigation: sub-modules keep today's harness granularity; the manifest is migrated by script, not by hand.
-- **MetAcsl and CodeQL versions:** pin both, and add a selftest like the E-ACSL canary.
-- **Frama-C upgrades** can break the dump module. Mitigation: a selftest (as `kernel_ast.py selftest`) runs at image build.
+- **API-call recording** with `-Wl,--wrap` only catches calls that cross object files. Calls inside a library's own object, or inlined under LTO, are not recorded. Tests call the API from their own objects, so this covers the intended case; it is measured in I6.
+- **The harness format change in I5b** touches every benchmark harness spec. Mitigation: sub-modules keep today's harness granularity, and the manifest is migrated by script.
+- **MetAcsl against a development Frama-C:** I0 decides go or no-go before any I9 work. CodeQL is pinned and has its own selftest.
+- **Frama-C upgrades** can break the dump module. Mitigation: the I3 selftest runs at image build.
+- **A long-lived branch:** `main` keeps moving (for example `156adfa`). Mitigation: merge `main` at the start of each step and run the gates after the merge.
 
 ## Status
 
-| Step | Status |
-| :--- | :--- |
-| I0–I12 | not started |
+| Step | Size | Status |
+| :--- | :--- | :--- |
+| I0 | M | not started |
+| I1 | S | not started |
+| I2 | L | not started |
+| I3 | L | not started |
+| I4 | S | not started |
+| I5a | M | not started |
+| I5b | L | not started |
+| I6 | L | not started |
+| I7 | M | not started |
+| I8 | M | not started |
+| I9 | L | not started |
+| I10 | M | not started |
