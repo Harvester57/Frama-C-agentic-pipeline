@@ -52,3 +52,11 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
 - [`./errno.h`](./errno.h) maps `errno` to a tracked global under `__FRAMAC_EACSL__` only:
   glibc's thread-local errno is not E-ACSL-tracked memory, so every `errno = ...` would abort the
   runtime. errno values set by the real libc are not visible through it.
+
+## Libc contract overrides (Eva / WP)
+
+- `getsockopt`: `__fc_libc`'s behavior `other_options` requires `\valid(((char*)optval)+(0..))`,
+  an unbounded range that no object satisfies, so every call with a non-null `optval` was
+  Invalid. [`./fc_compat_types.h`](./fc_compat_types.h), force-included before any other header,
+  renames the libc declaration and declares `getsockopt` with `optval` bounded by `*optlen`.
+  Define `FC_STUBS_KEEP_LIBC_GETSOCKOPT` to keep the libc contract.

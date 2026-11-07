@@ -99,6 +99,31 @@ typedef unsigned int u_int;
 typedef unsigned long u_long;
 #endif /* __FC_COMPAT_BSD_ALIASES_DEFINED */
 
+/*
+ * getsockopt with a satisfiable contract. __fc_libc's behavior other_options requires
+ * \valid(((char*)optval)+(0..)), an unbounded range no object satisfies, so Eva marks every
+ * non-null call Invalid and the caller non-terminating. This header is force-included before
+ * any other, so renaming the libc declaration here keeps its contract off the real name, whoever
+ * includes <sys/socket.h> later. The replacement bounds optval by *optlen, as getsockopt(2)
+ * writes at most *optlen bytes; a caller passing an *optlen larger than its buffer is still
+ * flagged. Define FC_STUBS_KEEP_LIBC_GETSOCKOPT to keep __fc_libc's contract.
+ */
+#ifndef FC_STUBS_KEEP_LIBC_GETSOCKOPT
+#define getsockopt __fc_libc_getsockopt_unbounded
+#include <sys/socket.h>
+#undef getsockopt
+/*@
+  requires valid_sockfd: 0 <= sockfd < __FC_MAX_OPEN_SOCKETS;
+  requires valid_optlen: \valid(optlen);
+  requires optval_null_or_valid: optval == \null || \valid((char *)optval + (0 .. *optlen - 1));
+  assigns ((char *)optval)[0 .. *optlen - 1], *optlen, \result
+          \from indirect:sockfd, indirect:level, indirect:optname, indirect:*optlen,
+                indirect:__fc_sockfds[sockfd];
+  ensures result_ok_or_error: \result == 0 || \result == -1;
+*/
+extern int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
+#endif /* FC_STUBS_KEEP_LIBC_GETSOCKOPT */
+
 #endif /* __FRAMAC_EACSL__ */
 
 /*
