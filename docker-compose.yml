@@ -11,6 +11,15 @@
 # must match run-<N> (scripts/run_metadata.py init); set it to the run directory's name (default run-1).
 # The pipeline knobs listed under `environment` are forwarded only when set in your shell, as the
 # wrappers do.
+#
+# Build steps (the target's own build and its tests, e.g. scripts/build_capture.py) run in the build
+# image: `docker compose run --rm framac-build "<command>"`. Both services mount the run's scratch
+# volume at /framac-scratch; its name is framac-scratch-${FRAMAC_SCRATCH_ID}, so set FRAMAC_SCRATCH_ID
+# to something unique per run (for example <repo>-run-<N>; the wrappers add a hash of the run dir).
+# A new volume belongs to root; open it once for the job user:
+# `docker compose run --rm --user 0 --entrypoint chmod framac-build 1777 /framac-scratch`.
+# Target packages need a derived build image: `docker build --target framac-build --build-arg
+# TARGET_APT_PACKAGES="..." -t framac-build:<repo> .` and FRAMAC_BUILD_IMAGE=framac-build:<repo>.
 services:
   framac-pipeline:
     build:
@@ -57,3 +66,41 @@ services:
       - ./schemas:/opt/framac-pipeline/schemas:ro
       - ./skills:/opt/framac-pipeline/skills:ro
       - ./docs/references:/opt/framac-pipeline/docs/references:ro
+      - scratch:/framac-scratch
+
+  framac-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: framac-build
+    image: ${FRAMAC_BUILD_IMAGE:-framac-build:latest}
+    user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"
+    working_dir: /framac-run
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
+    cpus: 4
+    mem_limit: 8g
+    pids_limit: 4096
+    environment:
+      - PYTHONIOENCODING=utf-8
+      - S=/opt/framac-pipeline/scripts
+      - FRAMAC_OUTER_SANDBOX=docker-hardened
+      - FRAMAC_RUN_ID=${FRAMAC_RUN_ID:-run-1}
+      - FRAMAC_RUN_HOST=${FRAMAC_RUN_DIR}
+      - FRAMAC_TARGET_HOST=${TARGET_REPO_PATH}
+    volumes:
+      - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro
+      - ${FRAMAC_RUN_DIR:?set FRAMAC_RUN_DIR to a run directory outside the target}:/framac-run
+      - ./scripts:/opt/framac-pipeline/scripts:ro
+      - ./templates:/opt/framac-pipeline/templates:ro
+      - ./schemas:/opt/framac-pipeline/schemas:ro
+      - ./skills:/opt/framac-pipeline/skills:ro
+      - ./docs/references:/opt/framac-pipeline/docs/references:ro
+      - scratch:/framac-scratch
+
+volumes:
+  scratch:
+    name: framac-scratch-${FRAMAC_SCRATCH_ID:-default}

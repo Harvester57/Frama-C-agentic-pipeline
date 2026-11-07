@@ -3,9 +3,18 @@
 #
 #   framac-docker.sh [--target DIR] (--run-dir DIR | --new-run) [--repo NAME]
 #                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
+#                    [--build-image] [--scratch] [--remove-scratch]
 #                    [--allow-run-dir-in-target] [--engine docker|podman|auto]
 #                    [--class CLASS] [--no-broker] [--cpus N] [--memory SIZE] [--pids-limit N]
 #                    [--cache-dir DIR|off] [--cache-rw] [--script-file FILE] -- <command...>
+#
+# --build-image runs the command in the build image (framac-build:latest, Dockerfile stage framac-build:
+# the target's own build and tests, e.g. scripts/build_capture.py); with --target-packages the derived
+# build image framac-build:<repo> is built and used. FRAMAC_DOCKER_IMAGE still overrides the name.
+# Every other command keeps the monolith (framac-pipeline:latest) as before.
+# --scratch creates (once) and mounts the run's named volume framac-scratch-<repo>-<run id>-<hash of
+# the run dir> at /framac-scratch (the build capture's scratch tree and snapshot); --remove-scratch
+# removes it and exits.
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
 # /opt/framac-pipeline/{scripts,templates,schemas,skills,docs/references} (read-only) and, on the
@@ -40,6 +49,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-$(pwd)}"
 IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-pipeline:latest}"
+BUILD_IMAGE=0
+SCRATCH=0
+REMOVE_SCRATCH=0
 ENGINE_PREF="${FRAMAC_CONTAINER_ENGINE:-auto}"
 CPUS="${FRAMAC_CPUS:-}"
 MEMORY="${FRAMAC_MEMORY:-}"
@@ -66,6 +78,9 @@ while [[ $# -gt 0 ]]; do
         --repo) REPO="$2"; shift 2 ;;
         --target-packages) TARGET_PACKAGES="$2"; shift 2 ;;
         --build-if-missing) BUILD=1; shift ;;
+        --build-image) BUILD_IMAGE=1; shift ;;
+        --scratch) SCRATCH=1; shift ;;
+        --remove-scratch) REMOVE_SCRATCH=1; shift ;;
         --agents) AGENTS="$2"; shift 2 ;;
         --cpus) CPUS="$2"; shift 2 ;;
         --memory) MEMORY="$2"; shift 2 ;;
@@ -86,7 +101,7 @@ while [[ $# -gt 0 ]]; do
         -*)
             echo "[framac-docker] ERROR: unknown wrapper option '$1'." \
                  "Valid options: --target, --run-dir, --new-run, --repo, --target-packages, --build-if-missing," \
-                 "--allow-run-dir-in-target, --engine, --class, --no-broker, --cpus, --memory, --pids-limit," \
+                 "--build-image, --scratch, --remove-scratch, --allow-run-dir-in-target, --engine, --class, --no-broker, --cpus, --memory, --pids-limit," \
                  "--cache-dir, --cache-rw, --script-file, -- <command...>" >&2
             exit 2 ;;
         *) break ;;
@@ -216,10 +231,28 @@ if [[ -r /sys/fs/selinux/enforce && "$(cat /sys/fs/selinux/enforce 2>/dev/null)"
     esac
 fi
 
+# ---- Scratch volume: one named volume per run directory (repo, run id, and a hash of the run path) ----
+SCRATCH_VOLUME=""
+if [[ ${SCRATCH} -eq 1 || ${REMOVE_SCRATCH} -eq 1 ]]; then
+    RUN_HASH="$(printf '%s' "${RESOLVED_RUN}" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)"
+    SCRATCH_VOLUME="framac-scratch-${REPO}-$(basename "${RESOLVED_RUN}")-${RUN_HASH}"
+fi
+if [[ ${REMOVE_SCRATCH} -eq 1 ]]; then
+    "${ENGINE}" volume rm -f "${SCRATCH_VOLUME}" >/dev/null
+    echo "[framac-docker] removed scratch volume ${SCRATCH_VOLUME}" >&2
+    exit 0
+fi
+
+# Build steps (--build-image) run in the build image (Dockerfile stage framac-build); everything else in the monolith.
+IMAGE_TARGET=()
+if [[ ${BUILD_IMAGE} -eq 1 ]]; then
+    IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-build:latest}"
+    IMAGE_TARGET=(--target framac-build)
+fi
 if [[ -z "$("${ENGINE}" images -q "${IMAGE}" 2>/dev/null)" ]]; then
     if [[ ${BUILD} -eq 1 ]]; then
         echo "[framac-docker] Building ${IMAGE}..." >&2
-        "${ENGINE}" build -t "${IMAGE}" "${PIPELINE_ROOT}" >&2
+        "${ENGINE}" build ${IMAGE_TARGET[@]+"${IMAGE_TARGET[@]}"} -t "${IMAGE}" "${PIPELINE_ROOT}" >&2
     else
         echo "[framac-docker] image ${IMAGE} not found (use --build-if-missing)" >&2; exit 2
     fi
@@ -227,9 +260,21 @@ fi
 
 if [[ -n "${TARGET_PACKAGES}" ]]; then
     DERIVED_IMAGE="framac-pipeline:${REPO}"
+    [[ ${BUILD_IMAGE} -eq 1 ]] && DERIVED_IMAGE="framac-build:${REPO}"
     echo "[framac-docker] Building derived image ${DERIVED_IMAGE} with target packages: ${TARGET_PACKAGES}" >&2
-    "${ENGINE}" build -t "${DERIVED_IMAGE}" --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}" >&2
+    "${ENGINE}" build ${IMAGE_TARGET[@]+"${IMAGE_TARGET[@]}"} -t "${DERIVED_IMAGE}" \
+        --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}" >&2
     IMAGE="${DERIVED_IMAGE}"
+fi
+
+if [[ ${SCRATCH} -eq 1 ]]; then
+    if ! "${ENGINE}" volume inspect "${SCRATCH_VOLUME}" >/dev/null 2>&1; then
+        "${ENGINE}" volume create --label framac.scratch=1 "${SCRATCH_VOLUME}" >/dev/null
+        # A new volume's root belongs to root: open it (sticky, like /tmp) for the non-root job user.
+        "${ENGINE}" run --rm --network none -v "${SCRATCH_VOLUME}:/framac-scratch" --entrypoint /bin/chmod \
+            "${IMAGE}" 1777 /framac-scratch >/dev/null
+    fi
+    echo "[framac-docker] scratch volume: ${SCRATCH_VOLUME} at /framac-scratch" >&2
 fi
 IMAGE_ID="$( ("${ENGINE}" image inspect -f '{{.Id}}' "${IMAGE}" 2>/dev/null | head -n 1) || true)"
 
@@ -270,6 +315,7 @@ MOUNT_ARGS=(-v "${RESOLVED_TARGET}:/target:ro${ZT}"
             -v "${PIPELINE_ROOT}/schemas:/opt/framac-pipeline/schemas:ro${Z}"
             -v "${PIPELINE_ROOT}/skills:/opt/framac-pipeline/skills:ro${Z}"
             -v "${PIPELINE_ROOT}/docs/references:/opt/framac-pipeline/docs/references:ro${Z}")
+[[ ${SCRATCH} -eq 1 ]] && MOUNT_ARGS+=(-v "${SCRATCH_VOLUME}:/framac-scratch")
 
 if [[ -n "${SCRIPT_FILE}" ]]; then
     if [[ ! -f "${SCRIPT_FILE}" ]]; then
