@@ -365,7 +365,7 @@ I0 ─┬─▶ I1 ────────────────────�
 
 | Step | Size | Status |
 | :--- | :--- | :--- |
-| I0 | M | done except the baseline (running) |
+| I0 | M | done |
 | I1 | S | not started |
 | I2 | L | not started |
 | I3 | L | not started |
@@ -407,4 +407,7 @@ I0 ─┬─▶ I1 ────────────────────�
   - Every PoC measurement in `phase0-redesign.md` §7 was taken on that Frama-C 34 image.
   - The monolith is rebuilt from the current Dockerfile, and the old image is kept as `framac-pipeline:fc34-20261105`.
   - The branch baseline is recorded on Frama-C 35.
+- **Baseline** `benchmark/baselines/phase0-i0.json` (run `phase0-i0-fc35`, Frama-C 35 Bromine, 2,721 s wall, 5,008 s CPU).
+  - All 10 targets ran and 7/7 known bugs were retained. x509-parser is partial, because Eva crashes on its `x509-parser` module (as before).
+  - The run warns that some functions with an Eva Unknown have no ledger unit: 11 on qcbor-dev and 1 each on CryptoLib, qlz and tweetnacl. That is the gap I5a is meant to close, so these warnings are its measurable target.
 - **Pre-existing, not addressed here:** mypy reports 18 errors in `scripts/run_eacsl_fuzz.py`, `tests/test_harness_reach.py` and `tests/test_pipeline_make.py`, all files that came from `main` and that I0 doesn't touch.
