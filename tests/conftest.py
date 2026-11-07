@@ -1,5 +1,8 @@
 import copy
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,6 +12,38 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from fingerprint import make_fingerprint  # noqa: E402
+
+PHASE0_FIXTURES = ROOT / "tests" / "fixtures" / "phase0"
+DOCKER_IMAGE = os.environ.get("FRAMAC_TEST_IMAGE", "framac-pipeline:latest")
+
+
+@pytest.fixture
+def docker_fixture_run():
+    """
+    Run a shell command in the pipeline image on a copy of a fixture project (mounted read-only,
+    network off), as `run(fixture_dir, command) -> CompletedProcess`. Opt-in, as these tests start
+    containers: set FRAMAC_DOCKER_TESTS=1. Skipped when Docker or the image is missing.
+    """
+    if os.environ.get("FRAMAC_DOCKER_TESTS") != "1":
+        pytest.skip("Docker-backed test: set FRAMAC_DOCKER_TESTS=1")
+    if not shutil.which("docker"):
+        pytest.skip("docker not found")
+    probe = subprocess.run(["docker", "image", "inspect", DOCKER_IMAGE], capture_output=True, check=False)
+    if probe.returncode != 0:
+        pytest.skip(f"image {DOCKER_IMAGE} not built")
+
+    def run(fixture: Path, command: str, timeout: int = 600) -> subprocess.CompletedProcess:
+        argv = [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", f"{fixture.resolve()}:/fixture:ro",
+            "--entrypoint", "sh", DOCKER_IMAGE,
+            "-c", f"cp -r /fixture /tmp/p && cd /tmp/p && {command}",
+        ]  # fmt: skip
+        return subprocess.run(
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False
+        )
+
+    return run
 
 
 @pytest.fixture(autouse=True)

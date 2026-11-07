@@ -1,0 +1,53 @@
+{
+  "description": "Modules must be link units: src/ mixes a library and two executables (two mains), and the library also spans extra/",
+  "build": "make",
+  "functions": [
+    "src/csv.c#csv_init",
+    "src/csv.c#csv_next_field",
+    "src/field.c#csv_field_copy",
+    "src/field.c#csv_field_to_long",
+    "extra/quote.c#csv_unquote",
+    "extra/quote.c#csv_needs_quote",
+    "extra/quote.c#csv_quote",
+    "src/csvstat.c#report",
+    "src/csvstat.c#main",
+    "src/csvcut.c#parse_cols",
+    "src/csvcut.c#emit_row",
+    "src/csvcut.c#main"
+  ],
+  "not_compiled": [],
+  "edges": [
+    {"caller": "src/field.c#csv_field_copy", "callee": "extra/quote.c#csv_unquote", "kind": "direct"},
+    {"caller": "src/field.c#csv_field_to_long", "callee": "src/field.c#csv_field_copy", "kind": "direct"},
+    {"caller": "extra/quote.c#csv_quote", "callee": "extra/quote.c#csv_needs_quote", "kind": "direct"},
+    {"caller": "src/csvstat.c#main", "callee": "src/csv.c#csv_init", "kind": "direct"},
+    {"caller": "src/csvstat.c#main", "callee": "src/csv.c#csv_next_field", "kind": "direct"},
+    {"caller": "src/csvstat.c#main", "callee": "src/field.c#csv_field_to_long", "kind": "direct"},
+    {"caller": "src/csvstat.c#main", "callee": "src/csvstat.c#report", "kind": "direct"},
+    {"caller": "src/csvcut.c#main", "callee": "src/csvcut.c#parse_cols", "kind": "direct"},
+    {"caller": "src/csvcut.c#main", "callee": "src/csv.c#csv_init", "kind": "direct"},
+    {"caller": "src/csvcut.c#main", "callee": "src/csv.c#csv_next_field", "kind": "direct"},
+    {"caller": "src/csvcut.c#main", "callee": "src/csvcut.c#emit_row", "kind": "direct"},
+    {"caller": "src/csvcut.c#emit_row", "callee": "src/field.c#csv_field_copy", "kind": "direct"},
+    {"caller": "src/csvcut.c#emit_row", "callee": "extra/quote.c#csv_quote", "kind": "direct"}
+  ],
+  "externals": ["memcpy", "strtol", "strtoul", "printf", "fprintf", "fread", "putchar", "fputs"],
+  "units": {
+    "libcsv.a": {"kind": "static_lib", "files": ["src/csv.c", "src/field.c", "extra/quote.c"], "links": []},
+    "csvstat": {"kind": "executable", "files": ["src/csvstat.c"], "links": ["libcsv.a"]},
+    "csvcut": {"kind": "executable", "files": ["src/csvcut.c"], "links": ["libcsv.a"]}
+  },
+  "entry_points": [
+    "src/csv.c#csv_init",
+    "src/csv.c#csv_next_field",
+    "src/field.c#csv_field_copy",
+    "src/field.c#csv_field_to_long",
+    "extra/quote.c#csv_unquote",
+    "extra/quote.c#csv_needs_quote",
+    "extra/quote.c#csv_quote",
+    "src/csvstat.c#main",
+    "src/csvcut.c#main"
+  ],
+  "thread_entries": [],
+  "notes": "The library's public header is src/csv.h (every function it declares is API). src/ contains two `main` definitions belonging to different executables; they must not collide. extra/quote.c is a library object, not a separate module; csv_unquote is called from src/field.c."
+}

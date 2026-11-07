@@ -365,7 +365,7 @@ I0 ─┬─▶ I1 ────────────────────�
 
 | Step | Size | Status |
 | :--- | :--- | :--- |
-| I0 | M | not started |
+| I0 | M | done except the baseline (running) |
 | I1 | S | not started |
 | I2 | L | not started |
 | I3 | L | not started |
@@ -378,3 +378,33 @@ I0 ─┬─▶ I1 ────────────────────�
 | I8 | M | not started |
 | I9 | L | not started |
 | I10 | M | not started |
+
+## Step notes
+
+### I0 (2026-11-07)
+
+- **Branch:** `main` (`156adfa`, the harness brace fix) merged into `phase0-redesign`.
+- **Fixtures:**
+  - the 9 reproducers and the 7 seeded projects are in `tests/fixtures/phase0/`;
+  - `tests/test_phase0_fixtures.py` checks their ground truth against the sources on every run;
+  - the Docker-backed build checks are opt-in: set `FRAMAC_DOCKER_TESTS=1`. A `docker_fixture_run` fixture in `tests/conftest.py` runs them, and all 16 projects build in the image.
+- **Images:**
+
+  | Image | Size | Contents |
+  | :--- | ---: | :--- |
+  | `framac-build` | 1.3 GB | `debian:trixie-slim` pinned by digest |
+  | `framac-analysis` | 6.8 GB | the Frama-C base without build systems or target libraries |
+  | `framac-pipeline` (monolith) | | unchanged default target, plus MetAcsl |
+  | `framac-codeql` | 2.0 GB | built from `framac-build`; C/C++ bundle v2.27.3, pinned by SHA-256 |
+
+  - `scripts/image_toolchain.py` reports the same Debian 13.7, gcc 14.2.0 (14.2.0-19) and glibc 2.41-12+deb13u4 in the build and analysis images.
+  - Neither the monolith nor the analysis image contains CodeQL.
+- **MetAcsl: go.**
+  - The 0.11 release on opam does not compile against Frama-C 35: it predates `Fileloc.t`.
+  - The development branch at `4d5d0e9` (2026-10-15) builds. It is pinned in the analysis image and the monolith, and loads for a non-root user.
+  - On a 20-line example ("only `login` writes `auth_ok`"), WP leaves exactly the planted violation (`backdoor`) unproven. E-ACSL passes the run that only calls `login` and reports the meta-property failing on the run that reaches `backdoor`.
+- **Stale local image found:** the local `framac-pipeline:latest` (2026-11-05) still ran Frama-C 34 (Selenium). `487c0a2` had moved the pinned base to Frama-C 35 (Bromine) a day later.
+  - Every PoC measurement in `phase0-redesign.md` §7 was taken on that Frama-C 34 image.
+  - The monolith is rebuilt from the current Dockerfile, and the old image is kept as `framac-pipeline:fc34-20261105`.
+  - The branch baseline is recorded on Frama-C 35.
+- **Pre-existing, not addressed here:** mypy reports 18 errors in `scripts/run_eacsl_fuzz.py`, `tests/test_harness_reach.py` and `tests/test_pipeline_make.py`, all files that came from `main` and that I0 doesn't touch.

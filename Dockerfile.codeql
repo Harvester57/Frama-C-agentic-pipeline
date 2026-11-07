@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+#
+# CodeQL image (optional, off by default): the build image plus the CodeQL CLI and its C/C++ query
+# packs. CodeQL extracts C by tracing the target's build, so it needs exactly the build image's
+# compilers, build tools and target packages; neither the monolith nor the analysis image ever
+# contains CodeQL. The CodeQL licence allows it for open-source code only: this image is built
+# locally and never pushed or shared (docs/phase0-implementation-plan.md, steps I0 and I7).
+#
+#   docker build --target framac-build -t framac-build .
+#   docker build -f Dockerfile.codeql -t framac-codeql .
+# For a target with packages, pass its derived build image: --build-arg BUILD_IMAGE=framac-build:<repo>
+ARG BUILD_IMAGE=framac-build
+FROM ${BUILD_IMAGE}
+
+# The C/C++-only bundle of github/codeql-action (CLI + cpp query packs), pinned with its digest.
+ARG CODEQL_VERSION=2.27.3
+ARG CODEQL_SHA256=5ee1dca3f98dd46788c0a719f5d8b6da625b0722bf1aba28655ab880da81dc73
+
+LABEL description="Frama-C pipeline CodeQL image: build image + CodeQL ${CODEQL_VERSION} (C/C++ bundle); local use only"
+
+RUN curl -fsSL -o /tmp/codeql.tar.zst \
+        "https://github.com/github/codeql-action/releases/download/codeql-bundle-v${CODEQL_VERSION}/codeql-bundle-cpp-linux64.tar.zst" \
+    && echo "${CODEQL_SHA256}  /tmp/codeql.tar.zst" | sha256sum -c - \
+    && tar --zstd -xf /tmp/codeql.tar.zst -C /opt \
+    && rm -f /tmp/codeql.tar.zst \
+    && chmod -R a+rX /opt/codeql \
+    && ln -s /opt/codeql/codeql /usr/local/bin/codeql \
+    && codeql version --format=terse

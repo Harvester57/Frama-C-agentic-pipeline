@@ -1,0 +1,32 @@
+{
+  "description": "TLV device-record parser whose name buffer size comes from config.h, force-included by the Makefile with -include",
+  "mechanism": "force_include",
+  "build": "make",
+  "bugs": [
+    {
+      "id": "S04-1",
+      "mechanism": "force_include",
+      "file": "src/tlv.c",
+      "function": "tlv_parse",
+      "line": 31,
+      "kind": "mem_access",
+      "trigger": "tlv_parse: a type-1 record with length byte 48..64 and that many printable bytes; the length is checked against the protocol limit TLV_NAME_MAX (64) but config.h shrinks char name[TLV_NAME_BUF] to 48 (stack overflow in memcpy, or in the NUL store when the length is 48)"
+    }
+  ],
+  "decoys": [
+    {
+      "id": "S04-D1",
+      "kind": "harness_induced",
+      "file": "lib/bytes.c",
+      "function": "be16_at",
+      "line": 6,
+      "why": "internal helper in lib/ (not in include/), always called after an l == 2 length check; called directly with an arbitrary offset it reads out of bounds"
+    }
+  ],
+  "entry_points": [
+    "src/tlv.c#tlv_parse",
+    "src/tlv.c#tlv_get_name",
+    "src/tlv.c#tlv_get_id"
+  ],
+  "lexer_expected": "The lexer keeps only -I/-D flags and never sees -include config.h (no source includes it), so module 'tlv' compiles with the header default TLV_NAME_BUF 128 and S04-1 cannot trigger (verified: the repro does not abort without -include config.h). It also offers be16_at and all_printable as entry points of module 'lib'; the be16_at harness crashes at lib/bytes.c:6 (false positive, verified)."
+}

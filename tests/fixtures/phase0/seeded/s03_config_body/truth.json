@@ -1,0 +1,32 @@
+{
+  "description": "Escaped-packet decoder with three pkt_unescape bodies; the Makefile selects the FAST_UNESCAPE one through $(addprefix -D,$(FEATURES))",
+  "mechanism": "config_body",
+  "build": "make",
+  "bugs": [
+    {
+      "id": "S03-1",
+      "mechanism": "config_body",
+      "file": "src/unescape.c",
+      "function": "pkt_unescape",
+      "line": 13,
+      "kind": "mem_access",
+      "trigger": "pkt_decode or pkt_unescape: input whose last byte is 0x7D (escape); the FAST_UNESCAPE body reads in[i++] one byte past the input"
+    }
+  ],
+  "decoys": [
+    {
+      "id": "S03-D1",
+      "kind": "not_compiled",
+      "file": "src/unescape.c",
+      "function": "pkt_unescape",
+      "line": 33,
+      "why": "LEGACY_UNESCAPE body (built only by 'make legacy') ignores cap and overflows the 64-byte body buffer of pkt_decode when more than 64 bytes unescape; the default build compiles the FAST_UNESCAPE body instead"
+    }
+  ],
+  "entry_points": [
+    "src/packet.c#pkt_decode",
+    "src/unescape.c#pkt_unescape",
+    "src/unescape.c#pkt_escape_cost"
+  ],
+  "lexer_expected": "discover_in_tree_cppflags regex-scans the Makefile for literal -D tokens: it misses -DFAST_UNESCAPE (built by $(addprefix -D,$(FEATURES))) and picks up -DLEGACY_UNESCAPE from the non-default 'legacy' target, so both modules get cppflags [-DLEGACY_UNESCAPE]. The harness then compiles the legacy body: S03-1 is missed (verified: the repro does not abort under the lexer flags) and S03-D1 fires on any pkt_decode input of more than 65 plain bytes (false positive, verified)."
+}

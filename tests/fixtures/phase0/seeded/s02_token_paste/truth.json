@@ -1,0 +1,22 @@
+{
+  "description": "Request dispatcher whose opcode table registers handlers through token pasting (HANDLER(rev) -> h_rev) defined in another file",
+  "mechanism": "token_paste",
+  "build": "make",
+  "bugs": [
+    {
+      "id": "S02-1",
+      "mechanism": "token_paste",
+      "file": "src/handlers.c",
+      "function": "h_rev",
+      "line": 45,
+      "kind": "mem_access",
+      "trigger": "proto_reply (or the last request of proto_run): opcode byte 0x04 followed by 1..64 payload bytes; h_rev reads p[n - i] with i = 0, one byte past the payload"
+    }
+  ],
+  "decoys": [],
+  "entry_points": [
+    "src/dispatch.c#proto_reply",
+    "src/dispatch.c#proto_run"
+  ],
+  "lexer_expected": "The lexer sees no reference from src/dispatch.c to h_* (the names exist only after h_##name pasting in the static ops[] table), so module 'dispatch' has required_sources [src/dispatch.c] and its harness fails to link (undefined h_ping, h_echo, h_sum, h_rev, h_upper; verified): S02-1 is missed through the real API. It offers the five handlers as entry points of module 'handlers'. They take an internal struct reply * (not an API shape), so a direct harness either cannot build them or must invent the reply buffer; a NULL or wrongly sized buf crashes any handler (false positives), and only a correctly sized one could reach S02-1 by accident."
+}

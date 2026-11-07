@@ -1,0 +1,47 @@
+{
+  "description": "Entry points are the public API (exported RB_API symbols of the shared lib), including API functions also called internally; internal non-static helpers called from another directory are not entry points",
+  "build": "make",
+  "functions": [
+    "lib/core/ringbuf.c#rb_init",
+    "lib/core/ringbuf.c#rb_used",
+    "lib/core/ringbuf.c#rb_free_space",
+    "lib/core/ringbuf.c#rb_write",
+    "lib/core/ringbuf.c#rb_read",
+    "lib/core/line.c#rb_peek_line",
+    "lib/util/wrap.c#rb_util_advance",
+    "lib/util/wrap.c#rb_util_span",
+    "tools/rbcat.c#main"
+  ],
+  "not_compiled": [],
+  "edges": [
+    {"caller": "lib/core/ringbuf.c#rb_free_space", "callee": "lib/core/ringbuf.c#rb_used", "kind": "direct"},
+    {"caller": "lib/core/ringbuf.c#rb_write", "callee": "lib/core/ringbuf.c#rb_free_space", "kind": "direct"},
+    {"caller": "lib/core/ringbuf.c#rb_write", "callee": "lib/util/wrap.c#rb_util_span", "kind": "direct"},
+    {"caller": "lib/core/ringbuf.c#rb_write", "callee": "lib/util/wrap.c#rb_util_advance", "kind": "direct"},
+    {"caller": "lib/core/ringbuf.c#rb_read", "callee": "lib/core/ringbuf.c#rb_used", "kind": "direct"},
+    {"caller": "lib/core/ringbuf.c#rb_read", "callee": "lib/util/wrap.c#rb_util_span", "kind": "direct"},
+    {"caller": "lib/core/ringbuf.c#rb_read", "callee": "lib/util/wrap.c#rb_util_advance", "kind": "direct"},
+    {"caller": "lib/core/line.c#rb_peek_line", "callee": "lib/util/wrap.c#rb_util_advance", "kind": "direct"},
+    {"caller": "tools/rbcat.c#main", "callee": "lib/core/ringbuf.c#rb_init", "kind": "direct"},
+    {"caller": "tools/rbcat.c#main", "callee": "lib/core/ringbuf.c#rb_free_space", "kind": "direct"},
+    {"caller": "tools/rbcat.c#main", "callee": "lib/core/ringbuf.c#rb_write", "kind": "direct"},
+    {"caller": "tools/rbcat.c#main", "callee": "lib/core/line.c#rb_peek_line", "kind": "direct"},
+    {"caller": "tools/rbcat.c#main", "callee": "lib/core/ringbuf.c#rb_read", "kind": "direct"}
+  ],
+  "externals": ["memcpy", "fread", "printf", "fprintf"],
+  "units": {
+    "libringbuf.so": {"kind": "shared_lib", "files": ["lib/core/ringbuf.c", "lib/core/line.c", "lib/util/wrap.c"], "links": []},
+    "rbcat": {"kind": "executable", "files": ["tools/rbcat.c"], "links": ["libringbuf.so"]}
+  },
+  "entry_points": [
+    "lib/core/ringbuf.c#rb_init",
+    "lib/core/ringbuf.c#rb_used",
+    "lib/core/ringbuf.c#rb_free_space",
+    "lib/core/ringbuf.c#rb_write",
+    "lib/core/ringbuf.c#rb_read",
+    "lib/core/line.c#rb_peek_line",
+    "tools/rbcat.c#main"
+  ],
+  "thread_entries": [],
+  "notes": "rb_used and rb_free_space are public (exported, declared in include/ringbuf.h) yet have internal callers. rb_util_advance/rb_util_span are non-static but hidden (-fvisibility=hidden, internal header lib/util/wrap.h) and are only called from lib/core/, another directory: not entry points. `nm -D libringbuf.so` shows exactly the six rb_* API symbols as exported T."
+}
