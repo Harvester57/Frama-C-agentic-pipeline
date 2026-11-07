@@ -1,0 +1,6 @@
+{"rid":"1","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-fPIC","-fvisibility=hidden","-Iinclude","-c","-o","lib/x.o","lib/x.c"],"working_dir":"/s/tree","environment":{}},"pid":11,"ppid":10}}
+{"rid":"2","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-shared","-fPIC","-o","libx.so","lib/x.o","-Wl,-soname,libx.so.1"],"working_dir":"/s/tree","environment":{}},"pid":12,"ppid":10}}
+{"rid":"3","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-Iinclude","-c","-o","app.o","app.c"],"working_dir":"/s/tree","environment":{}},"pid":13,"ppid":10}}
+{"rid":"4","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","app","app.o","-L.","-lx","-L/opt/vendor/lib","-lvendor","-pthread","-Wl,-rpath,$ORIGIN"],"working_dir":"/s/tree","environment":{}},"pid":14,"ppid":10}}
+{"rid":"5","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","app2","app.o","build/../libx.so"],"working_dir":"/s/tree","environment":{}},"pid":15,"ppid":10}}
+{"rid":"6","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","bin/app3","app.o","-l:libx.so","-L."],"working_dir":"/s/tree","environment":{}},"pid":16,"ppid":10}}

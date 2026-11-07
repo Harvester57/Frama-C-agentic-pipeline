@@ -411,3 +411,61 @@ I0 ─┬─▶ I1 ────────────────────�
   - All 10 targets ran and 7/7 known bugs were retained. x509-parser is partial, because Eva crashes on its `x509-parser` module (as before).
   - The run warns that some functions with an Eva Unknown have no ledger unit: 11 on qcbor-dev and 1 each on CryptoLib, qlz and tweetnacl. That is the gap I5a is meant to close, so these warnings are its measurable target.
 - **Pre-existing, not addressed here:** mypy reports 18 errors in `scripts/run_eacsl_fuzz.py`, `tests/test_harness_reach.py` and `tests/test_pipeline_make.py`, all files that came from `main` and that I0 doesn't touch.
+
+### I2 (2026-11-07)
+
+- **Recipe:** `run_metadata.py set-build` records the `build` block in `run-metadata.json`:
+  - command, working directory, packages, environment, test command, optional install command and `snapshot_extra`, and `origin` (`user`, `agent_confirmed`, `benchmark`);
+  - it is validated (Debian package names, a relative working directory; `PATH`, `HOME`, `LD_PRELOAD` and bear's variables are reserved);
+  - `schemas/run-metadata.schema.json` gained the `build` property, because that schema has `additionalProperties: false`.
+- **Capture** (`scripts/build_capture.py`, report `workspace/reports/build_capture.json`, schema `schemas/build_capture.schema.json`). It runs in the build image, on the run's scratch volume, and promotes the PoC's capture code. Decisions where the plan was open:
+  - **Test units:** a name rule, not the test command. A unit is `test` when its name has the word test, tests, check or unittest; or it sits in a test directory; or all its own sources are test sources; or its name ends in `test` and one of its sources is a test source. Running the test command is left to I6.
+  - **Parallel builds:** the build runs with `-j` from the broker's CPU lease. If that fails, it is retried once with one job on a fresh copy, with a warning. x509-parser's Makefile needs that: it is not parallel-safe.
+  - **Shared dependencies:** `DT_NEEDED` is read with `readelf` and resolved through `ldconfig -p`, recursively. This is what `ldd` reports, without running the dynamic loader on target binaries.
+  - **Snapshot:** files are copied under `snapshot/root/<absolute path>`, with a digest over (path, SHA-256). It leaves out `libc6`, `libc6-dev`, `linux-libc-dev` and the compiler's own packages (`gcc-*`, `libgcc*`, and so on). It keeps packaged and unowned files.
+  - **Public headers** (static libraries) are tried in this order:
+    1. `make install DESTDIR=` or `cmake --install`, tried only when a static library exists and the build has an install target. QCBOR and minmea use it.
+    2. Headers outside every source directory.
+    3. The project headers the library's consumers include, from the `cc -M` lists.
+    4. All project headers.
+  - **Executables:** the entry point is `main`, as in the truth files. A library compiled straight into an executable gets `embedded_api`: the globals of its other files declared in the project headers the executable includes. For example, tweetnacl has 26.
+  - **No recipe:** the status is `needs_build_recipe`, with a `proposed_recipe` taken from the build files. The agent proposes, and the user confirms.
+- **Stop and ask:**
+  - the capture exits 3 with `diagnostics`: first error and context, missing headers and commands, candidate packages, and recipe packages that are not installed;
+  - `checkpoint.py` keeps `status: needs_build_recipe` (with `phase_done` unchanged) until a capture succeeds;
+  - candidate packages come from tables of headers, pkg-config modules, CMake packages and commands, else `lib<name>-dev`;
+  - shown on `tests/fixtures/build_capture/broken/`: `make` stops on `<check.h>` with candidate `check`, and resumes with `make lib`.
+- **Wrappers:**
+  - `-BuildImage` / `--build-image` runs in `framac-build:latest`, or in `framac-build:<repo>` with target packages (`--target framac-build`);
+  - `-Scratch` / `--scratch` creates once and mounts `framac-scratch-<repo>-<run id>-<12 hex of the run path>` at `/framac-scratch`, and opens a new volume with `chmod 1777`;
+  - `-RemoveScratch` / `--remove-scratch` removes it;
+  - compose has a `framac-build` service, and both services mount the volume;
+  - defaults are unchanged.
+- **Benchmark:**
+  - every target has a `build` recipe in the manifest;
+  - `target_spec` passes it on;
+  - `run_target` runs a `capture` stage right after `phase0` (build image, scratch volume, `phase-dynamic`), records `build_capture` in the run entry, and removes the volume, since nothing reads it before I3;
+  - the recipe is not part of `harness_digest`, so baselines stay comparable.
+- **Recipes and results** (all 10 build; times are the build under bear):
+
+  | Target | Recipe | Units (test) | Entry points | Snapshot | Build |
+  | :--- | :--- | :--- | ---: | :--- | ---: |
+  | minmea | CMake, tests on, package `check` (works) | 3 (1) | 18 | check, subunit: 6 files | 2.9 s |
+  | qcbor-dev | `make` | 2 (1, `qcbortest`) | 171 | none | 1.5 s |
+  | qcbor-master | `make` | 2 (1) | 114 | none | 1.2 s |
+  | CryptoLib | CMake with the options of `support/scripts/build_internal.sh` except `CODECOV`, and its 4 packages | 17 (16 unit tests) | 193 | libgcrypt, libgpg-error, mariadb headers: 12 files | 5.4 s |
+  | x509-parser | `make` (serial retry) | 3 | 64 | none | 1.7 s |
+  | oscs-jsmn | `make` | 1 | 2 | none | 0.2 s |
+  | oscs-semver | `make test semver.o && ar rcs libsemver.a semver.o` | 2 (1) | 22 | none | 0.3 s |
+  | oscs-stmr | `make && ar rcs libstmr.a stmr.o` | 2 (1) | 1 | none | 0.2 s |
+  | oscs-qlz | `make` | 4 executables | 4 | none | 0.3 s |
+  | oscs-tweetnacl | `cc -o main main.c tweetnacl.c randombytes.c` | 1 | 1 (+26 embedded) | none | 0.3 s |
+
+  - CryptoLib's library compiles the same 23 files as the pinned `compile_commands.json` asset.
+  - semver's and stmr's default targets build only a test executable, which the test rule marks `test`. Their recipes therefore also archive the library object, so each target keeps a non-test unit.
+- **Reproducers:** units (name, kind, files, links) and entry points match all 9 truth files (`FRAMAC_DOCKER_TESTS=1 pytest tests/test_build_capture.py -m integration`).
+- **Left for other steps:**
+  - registering `build_capture.json` in `validate_artifacts.py` (I1 owns that file; the capture validates its own report against the schema);
+  - adding `build_capture` to `known-first-party` in `pyproject.toml`;
+  - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
+  - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.

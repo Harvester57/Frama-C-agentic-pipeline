@@ -13,6 +13,13 @@
    "url": "https://github.com/kosma/minmea.git",
    "revision": "c43c9e7c5ed788122a9d8a5445679e1594f8a030",
    "checkout": "minmea",
+   "build": {
+    "command": "cmake -S . -B build && cmake --build build",
+    "packages": [
+     "check"
+    ],
+    "test_command": "ctest --test-dir build -R '^tests$' --output-on-failure"
+   },
    "scope": [
     "minmea.c",
     "minmea.h"
@@ -50,6 +57,10 @@
    "url": "https://github.com/laurencelundblade/QCBOR.git",
    "revision": "9bd08456d46ac5fbaa7822420fd3e25e0e9c486f",
    "checkout": "qcbor-dev",
+   "build": {
+    "command": "make",
+    "test_command": "./qcbortest"
+   },
    "scope": [
     "src",
     "inc"
@@ -253,6 +264,10 @@
    "url": "https://github.com/laurencelundblade/QCBOR.git",
    "revision": "572a567d02bcfde42f5863f6a515131cc270798d",
    "checkout": "qcbor-master",
+   "build": {
+    "command": "make",
+    "test_command": "./qcbortest"
+   },
    "scope": [
     "src/ieee754.c",
     "src/ieee754.h"
@@ -291,6 +306,16 @@
    "url": "https://github.com/nasa/CryptoLib.git",
    "revision": "5b98c8b2561b22822a9d4e26c959677ed93c815a",
    "checkout": "cryptolib",
+   "build": {
+    "command": "cmake -S . -B build/internal -DDEBUG=1 -DMC_INTERNAL=1 -DTEST=1 -DSA_FILE=1 -DCRYPTO_LIBGCRYPT=1 -DKEY_INTERNAL=1 -DSA_INTERNAL=1 && cmake --build build/internal",
+    "packages": [
+     "libcurl4-openssl-dev",
+     "libgcrypt20-dev",
+     "libmariadb-dev",
+     "libmariadb-dev-compat"
+    ],
+    "test_command": "ctest --test-dir build/internal --output-on-failure"
+   },
    "scope": [
     "src",
     "include"
@@ -495,6 +520,10 @@
    "url": "https://github.com/ANSSI-FR/x509-parser.git",
    "revision": "6f3bae3c52989180df6af46da1acb0329315b82a",
    "checkout": "x509-parser",
+   "build": {
+    "command": "make",
+    "test_command": null
+   },
    "scope": [
     "src/x509-parser.c",
     "src/x509-parser.h",
@@ -630,6 +659,10 @@
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
    "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
    "checkout": "oscs",
+   "build": {
+    "command": "make",
+    "test_command": "make test"
+   },
    "subdir": "jsmn",
    "scope": [
     "jsmn.c",
@@ -661,6 +694,10 @@
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
    "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
    "checkout": "oscs",
+   "build": {
+    "command": "make test semver.o && ar rcs libsemver.a semver.o",
+    "test_command": "./test"
+   },
    "subdir": "semver",
    "scope": [
     "semver.c",
@@ -693,6 +730,10 @@
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
    "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
    "checkout": "oscs",
+   "build": {
+    "command": "make && ar rcs libstmr.a stmr.o",
+    "test_command": "./test"
+   },
    "subdir": "stmr",
    "scope": [
     "stmr.c",
@@ -725,6 +766,10 @@
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
    "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
    "checkout": "oscs",
+   "build": {
+    "command": "make",
+    "test_command": null
+   },
    "subdir": "qlz",
    "scope": [
     "quicklz.c",
@@ -756,6 +801,10 @@
    "url": "https://git.frama-c.com/pub/open-source-case-studies.git",
    "revision": "168321b6306abdacee95b22c9c94996f1174ab2c",
    "checkout": "oscs",
+   "build": {
+    "command": "cc -o main main.c tweetnacl.c randombytes.c",
+    "test_command": null
+   },
    "subdir": "tweetnacl-usable",
    "scope": [
     "tweetnacl.c",

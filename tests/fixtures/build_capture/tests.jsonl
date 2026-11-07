@@ -1,0 +1,8 @@
+{"rid":"1","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-c","-o","src/lib.o","src/lib.c"],"working_dir":"/s/tree","environment":{}},"pid":11,"ppid":10}}
+{"rid":"2","started":{"execution":{"executable":"/usr/bin/ar","arguments":["ar","rcs","libp.a","src/lib.o"],"working_dir":"/s/tree","environment":{}},"pid":12,"ppid":10}}
+{"rid":"3","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","tests/runner","tests/t1.c","tests/t2.c","libp.a"],"working_dir":"/s/tree","environment":{}},"pid":13,"ppid":10}}
+{"rid":"4","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","unit_test","u.c","libp.a"],"working_dir":"/s/tree","environment":{}},"pid":14,"ppid":10}}
+{"rid":"5","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","projtest","test/a.c","cmd_main.c","libp.a"],"working_dir":"/s/tree","environment":{}},"pid":15,"ppid":10}}
+{"rid":"6","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","latest","latest.c","libp.a"],"working_dir":"/s/tree","environment":{}},"pid":16,"ppid":10}}
+{"rid":"7","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","harness","check_parser.c","libp.a"],"working_dir":"/s/tree","environment":{}},"pid":17,"ppid":10}}
+{"rid":"8","started":{"execution":{"executable":"/usr/bin/cc","arguments":["cc","-o","tool","tool.c","libp.a"],"working_dir":"/s/tree","environment":{}},"pid":18,"ppid":10}}

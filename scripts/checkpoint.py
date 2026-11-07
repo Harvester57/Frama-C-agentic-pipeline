@@ -2,6 +2,11 @@
 """
 Atomic JSON state and wave/shard checkpointing for Frama-C agentic skills.
 Stores state in <state-dir>/progress.json and phase/wave payload files.
+
+`status` is running | complete, or a blocking status a step records when the run must stop and wait
+for the user: `needs_build_recipe` (written by build_capture.py when the target does not build, with
+the report path and first error under `blocked`). `phase_done` is not advanced by a blocked step, so a
+resumed run starts again at that step; the step clears the status when it succeeds.
 """
 
 from __future__ import annotations
@@ -94,6 +99,46 @@ def cmd_save_shard(state_dir: Path, phase: int, shard_id: str, from_file: Path) 
     progress["updated_at"] = utc_now()
     atomic_write_json(progress_path, progress)
     print(json.dumps({"shard": shard_id, "file": str(shard_file)}))
+
+
+def _new_progress(target_dir: str = "/target", mode: str = "verify") -> dict:
+    return {
+        "status": "running",
+        "mode": mode,
+        "target_dir": target_dir,
+        "phase_done": -1,
+        "current_wave": 0,
+        "waves_done": [],
+        "shards_done": {},
+    }
+
+
+def mark_blocked(state_dir: Path, status: str, detail: dict) -> dict:
+    """
+    Record that the run stopped and waits for the user (e.g. `needs_build_recipe` from the build capture).
+    `phase_done` is unchanged, so a resumed run starts again at the step that stopped.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = state_dir / "progress.json"
+    progress = load_json(progress_path) or _new_progress()
+    progress["status"] = status
+    progress["blocked"] = {"status": status, **detail, "at": utc_now()}
+    progress["updated_at"] = utc_now()
+    atomic_write_json(progress_path, progress)
+    return progress
+
+
+def clear_blocked(state_dir: Path, status: str) -> dict | None:
+    """Clear a `mark_blocked` status once the step that stopped succeeds (no-op otherwise)."""
+    progress_path = state_dir / "progress.json"
+    progress = load_json(progress_path)
+    if not progress or progress.get("status") != status:
+        return None
+    progress["status"] = "running"
+    progress.pop("blocked", None)
+    progress["updated_at"] = utc_now()
+    atomic_write_json(progress_path, progress)
+    return progress
 
 
 def cmd_complete(state_dir: Path) -> None:
