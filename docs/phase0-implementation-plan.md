@@ -16,13 +16,14 @@ Revised on 2026-11-07 after a review against the code:
   - a selftest for the dump module;
   - concurrency in the report;
   - a size estimate per step.
+- **CodeQL:** later the same day, it moved to its own image, keeping the main image free of it.
 
 ## Decisions (2026-11-07)
 
 | Question | Decision |
 | :--- | :--- |
 | How the work lands | Everything stays on `phase0-redesign` and merges to `main` once, at the end. `main` is merged into the branch at the start of each step, starting with `156adfa`. |
-| Image dependencies | MetAcsl, the CodeQL CLI (downloaded at image build, off by default) and `strace` may be added. |
+| Image dependencies | MetAcsl and `strace` go into the main image. CodeQL gets its own image (`framac-codeql`), off by default and never part of the main image, because of its licence and size. |
 | Target does not build | Phase 0 **stops**. It records `needs_build_recipe` with diagnostics, and the parent agent asks the user for a build command, packages or flags. There is no inventory from the lexer. |
 | Frama-C cannot parse a unit | The GCC call-graph fallback runs, flagged in the ledger and the report. Fuzzing with sanitizers still runs; Eva and WP on that unit are reported blocked. Phase 0 stops only if no unit parses. |
 | The lexer | Deleted at the end. `build_callgraph_dag.py` keeps only the DAG-view writer. |
@@ -63,13 +64,17 @@ Defaults taken where nothing was asked (open to change):
   - add a pytest helper that runs a fixture through Docker (skipped when Docker is absent);
   - **image:**
     - add `strace`;
-    - download the CodeQL CLI at a pinned version, unused until I7;
+    - **CodeQL image** (`Dockerfile.codeql`, tag `framac-codeql`):
+      - built `FROM` the main image, adding the CodeQL CLI and the C/C++ query packs at pinned versions;
+      - CodeQL extracts C by tracing the build, so it needs the same compilers, build recipe and target packages; building it `FROM` the main image keeps those identical, while the main image itself never contains CodeQL;
+      - it runs through the existing wrapper with `-Image` / `FRAMAC_DOCKER_IMAGE`, with the same mounts, hardening and disabled network;
+      - unused until I7;
     - **MetAcsl feasibility test:** build the release that targets Frama-C 34, or the development branch, against the image's `34.0~~dev` kernel, and run it on a 20-line example through WP and E-ACSL. Record go or no-go for I9;
   - record a branch benchmark baseline with qcbor-dev included, now that it passes Phase 0.
-- **Owns:** `Dockerfile`, `tests/fixtures/phase0/`, `tests/conftest.py` helpers, `benchmark/baselines/`.
+- **Owns:** `Dockerfile`, `Dockerfile.codeql`, `tests/fixtures/phase0/`, `tests/conftest.py` helpers, `benchmark/baselines/`.
 - **Acceptance:**
-  - the image builds;
-  - the CodeQL CLI answers `codeql version`;
+  - the main image builds and contains no CodeQL;
+  - the CodeQL image builds from it and answers `codeql version`;
   - the MetAcsl result is recorded in this file;
   - the suite passes, and the baseline covers all 10 targets.
 
@@ -229,6 +234,8 @@ Defaults taken where nothing was asked (open to change):
     - **output:** `trust` per function in the model, with its source (`default`, `call_graph`, `threat_model`, `codeql`).
   - **CodeQL (optional):**
     - enabled per run in `run-metadata.json` when the user declares the target open-source;
+    - runs in the CodeQL image: database creation replays the build recipe under CodeQL's tracer, then the taint queries write `workspace/reports/codeql_trust.json`;
+    - a target with packages gets a CodeQL image derived from its own derived image (`framac-codeql:<repo>`), built by the wrapper like today's `framac-pipeline:<repo>`;
     - its source-to-sink flows can mark additional internal functions untrusted;
     - it never removes a default or a threat-model decision.
   - **Consumers:**
@@ -236,7 +243,7 @@ Defaults taken where nothing was asked (open to change):
     - the trust-boundary check in `acsl_ast.py` reads it;
     - the report shows the trust source per entry point.
   - **Threat models** for minmea, QCBOR and x509-parser, stored as benchmark assets, so I7–I9 can be measured on real code.
-- **Owns:** `scripts/trust.py` (new), `schemas/threat_model.schema.json`, `benchmark/assets/*/THREAT_MODEL.md`, `scripts/generate_harness.py` (reachability default), `scripts/acsl_ast.py` (trust lookup), `scripts/generate_report.py` (trust column).
+- **Owns:** `scripts/trust.py` (new), `scripts/codeql_trust.py` (new), `wrappers/` (CodeQL image derivation), `schemas/threat_model.schema.json`, `benchmark/assets/*/THREAT_MODEL.md`, `scripts/generate_harness.py` (reachability default), `scripts/acsl_ast.py` (trust lookup), `scripts/generate_report.py` (trust column).
 - **Acceptance:**
   - the reproducers and seeded projects get a `trust` truth field, which matches;
   - CodeQL off changes nothing;
@@ -313,7 +320,8 @@ I0 ─┬─▶ I1 ────────────────────�
 - **Running test suites inside the sandbox** runs more target code, and some suites need a network or services. Mitigation: a time and resource cap, no network, and failures are non-fatal (seeds are an improvement, not a requirement).
 - **API-call recording** with `-Wl,--wrap` only catches calls that cross object files. Calls inside a library's own object, or inlined under LTO, are not recorded. Tests call the API from their own objects, so this covers the intended case; it is measured in I6.
 - **The harness format change in I5b** touches every benchmark harness spec. Mitigation: sub-modules keep today's harness granularity, and the manifest is migrated by script.
-- **MetAcsl against a development Frama-C:** I0 decides go or no-go before any I9 work. CodeQL is pinned and has its own selftest.
+- **MetAcsl against a development Frama-C:** I0 decides go or no-go before any I9 work.
+- **CodeQL image:** it is pinned, has its own selftest, and is never pushed or shared. Because it is built `FROM` the main image, it must be rebuilt whenever the main image changes; the wrapper checks the base image digest.
 - **Frama-C upgrades** can break the dump module. Mitigation: the I3 selftest runs at image build.
 - **A long-lived branch:** `main` keeps moving (for example `156adfa`). Mitigation: merge `main` at the start of each step and run the gates after the merge.
 
