@@ -12,7 +12,7 @@ description: >-
   parallel, runs the Dual-Oracle Guardrail, spawns non-blocking Adversarial
   Breakers on stalled proofs, and verifies all crash/hypothesis candidates
   through independent Crash Verifier subagents.
-argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--function <fn>] [--max-agents N] [--max-retries K]"
+argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--max-agents N]"
 ---
 
 # /framac-wp
@@ -44,7 +44,7 @@ How resources are measured and how caches work: [resources-and-caching.md](../..
    - Finished provers are merged eagerly or in micro-batches per module (`merge-pending`).
    - Merges re-run the guardrail and WP on the merged tree, with per-function WP re-checks executed in parallel.
    - High-spec machines ($\ge 32$ CPUs, $\ge 64$ CPUs) scale concurrency up to 32 and 64 concurrent agents, while per-process limits remain strictly invariant (`WP_MEMLIMIT_MB=1000`, `FUZZ_RSS_LIMIT_MB=2048`).
-5. **Adversarial Breakers.** A prover that stalls after `K` retries (default `K = 4`) gets a breaker ([breaker_brief.md](./breaker_brief.md)). The breaker never blocks the callers. Its seeds and fault hypotheses go through the Crash Verification Gate.
+5. **Adversarial Breakers.** A prover may iterate `K` times (2 under `quick` or for a `shell_unverifiable_wp` function, 4 under `standard`, 6 under `deep`; the brief states it). Any prover that ends without a full proof gets a breaker ([breaker_brief.md](./breaker_brief.md)). The breaker never blocks the callers. Its seeds and fault hypotheses go through the Crash Verification Gate.
 6. **Contract negotiation.** A strengthening request becomes a `negotiate` task as soon as it is ingested, capped per caller/callee pair. The caller is requeued once it resolves. Any merge that changes a contract re-checks the callers already merged (cached).
 
 ## Ownership & Isolation Rules

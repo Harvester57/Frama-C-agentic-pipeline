@@ -128,6 +128,14 @@ def test_framac_skills_mirror_is_in_sync():
             if link.is_symlink():
                 symlinks += 1
                 assert link.resolve() == (skills_dir / name).resolve(), f"{link} must point at skills/{name}"
+            elif link.is_dir():
+                # A harness that cannot load a plain-file symlink needs a real copy; it must stay
+                # byte-identical to skills/<name>, so an edit made in only one place fails here.
+                copied = {
+                    p.relative_to(link).as_posix(): p.read_bytes() for p in sorted(link.rglob("*")) if p.is_file()
+                }
+                expected = {k.split("/", 1)[1]: v for k, v in primary.items() if Path(k).parts[0] == name}
+                assert copied == expected, f"{link} is a copy that differs from skills/{name}"
             else:
                 # core.symlinks=false (the Windows default): git checks a symlink out as a plain file
                 # holding its target path, which is still what the repository records.

@@ -94,7 +94,7 @@ int parse_ber_length(const uint8_t *buf, size_t max_len);
 ```
 whereas Caller `B` needs to know that `\result <= (int)max_len` to prove that advancing `buf + \result` stays in bounds.
 
-Instead of allowing Caller Subagent `B` to edit Callee `A`'s contract directly (which could break `A`'s proof or cause race conditions between parallel subagents), `B` invokes [`../scripts/contract_negotiator.py`](../scripts/contract_negotiator.py):
+Instead of allowing Caller Subagent `B` to edit Callee `A`'s contract directly (which could break `A`'s proof or cause race conditions between parallel subagents), `B` lists the clause it needs in the `strengthening_requests` of its result. The parent records it when it completes `B` (`wp_scheduler.py complete`), through [`../scripts/contract_negotiator.py`](../scripts/contract_negotiator.py); the record is equivalent to:
 
 ```bash
 python3 /opt/framac-pipeline/scripts/contract_negotiator.py request \
@@ -109,5 +109,5 @@ python3 /opt/framac-pipeline/scripts/contract_negotiator.py request \
 As soon as the request is ingested (`wp_scheduler.py complete`), the scheduler emits a `negotiate` task for `A`. Requests are capped per caller/callee pair, and `B` is requeued once the request is resolved:
 1. The orchestrator dispatches Callee Subagent `A` to evaluate the requested `ensures \result <= (int)max_len;` clause.
 2. Subagent `A` tests the stronger clause against **Oracle 1 (`E-ACSL guardrail`)** and **Oracle 2 (`WP` on `parse_ber_length`)**.
-3. **Outcome 1 (True in `A`):** Both oracles pass. Subagent `A` commits the stronger `ensures` clause to `include/ber_decode.h` and marks the request `verified_and_applied`. Caller `B`'s proof now succeeds automatically.
+3. **Outcome 1 (True in `A`):** Both oracles pass. Subagent `A` returns the stronger `ensures` clause in its scratch patch; the parent merges it into `include/ber_decode.h`, re-verifies it, marks the request `verified_and_applied`, and requeues Caller `B`.
 4. **Outcome 2 (False in `A`):** `parse_ber_length` does *not* actually enforce `\result <= max_len`! That immediately reveals either a missing bounds check inside `parse_ber_length` or a missing bounds check in `snmpv3_parse_pdu`.

@@ -61,18 +61,20 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 
 ## P3 Low (documentation drift)
 
-- Agent cap: "capped by `FRAMAC_MAX_AGENTS` (16)" — the default is 16/32/64 by CPU count, and the env var replaces it.
-- Skill argument hints with no command behind them: `framac-wp` `--max-retries`, `--function`; `framac-verify` `--module`, `--fuzz-time`, `--max-agents`.
-- K is 2/4/6 by profile; breakers spawn on any non-proven result.
-- Role names in `v2-design.md` (`header_architect`, `coverage_critic`) vs schema (`architect`, `critic`).
-- `agentic-swarm.md` negotiation flow (caller-driven) vs implementation (parent-driven).
-- `eva-tune` under quick: Eva SKILL says skip, `framac-verify` runs it, the code does not gate.
-- Fuzz status `insufficient_memory` is undocumented.
-- Every Make Eva-covered unit gets a misleading "recursive or missing assigns" assumption text because `-no-warn-unsigned-downcast` counts as a reduced check.
-- README lists 5 schemas (6 exist), omits `python-*` skills, describes skill mirrors as symlinks (the working tree now has copies, which `tests/test_extract_references.py` rejects).
-- `architecture.md` mentions `phase0..3.json` checkpoint files.
-- `docker-compose.yml` sets no `FRAMAC_RUN_ID`, so `run_metadata.py init` rejects its run directory name.
-- Unused Make variable `PROFILE`; `_node_deps("wp-queue")` omits `facts`.
+All fixed:
+
+- Agent cap: `framac-verify` now states the 16/32/64 default by CPU count, that `FRAMAC_MAX_AGENTS` replaces it, and how `--max-agents` reaches `wp_scheduler.py step`.
+- Skill argument hints: each one maps to a real command (`--module` to per-module targets and `--scope`, `--fuzz-time` / `--time` to `params set --fuzz-max-time`, `--dict` to `params set --fuzz-dict`, `--slevel` to `params set --eva-slevel`); `framac-wp` no longer advertises `--function` or `--max-retries`.
+- K is stated as 2/4/6 by profile, and breakers spawn on any prover result without a full proof.
+- Role names in `v2-design.md` match the schema (`architect`, `critic`).
+- `agentic-swarm.md` describes the parent-driven negotiation flow.
+- `eva-tune` under quick: `framac-verify` now skips it, as the Eva skill says.
+- Fuzz status `insufficient_memory` is in the `framac-fuzz` status table.
+- The Eva-covered assumption names the recursion fallback only when that reduced check is in force.
+- README: 6 schemas, the `python-*` skills, and the mirror rule; `tests/test_extract_references.py` accepts a byte-identical copy as a mirror (a checkout without symlink support needs one) and fails on any drift.
+- `architecture.md` lists the checkpoint files that are actually written (phase 0, 2, 3).
+- `docker-compose.yml` sets a valid `FRAMAC_RUN_ID` (done with M6).
+- `PROFILE` in `modules.mk` and `_node_deps("wp-queue")` are documented as intended.
 
 ---
 
@@ -81,4 +83,4 @@ Classes: `soundness` (overstated assurance), `workflow` (termination, resume, lo
 1. P0 (C1–C5) — done in this change, with tests.
 2. P1 (H1–H10) — done, with tests. H8 records architect boundary assumptions only once the architect result names its functions (schema change pending, P2).
 3. P2 (M1–M18) — done, with tests; M8, M9, M13 and M14 were settled by aligning the docs with the code.
-4. A single doc pass for P3.
+4. P3 — done.

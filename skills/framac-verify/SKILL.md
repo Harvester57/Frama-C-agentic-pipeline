@@ -45,11 +45,11 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 ## Arguments
 
 - `<target-dir>` (required): Path to the target C repository.
-- `--module <name>`: Verify only a specific module slice (repeatable).
+- `--module <name>`: Verify only a specific module slice (repeatable). Seed with `--scope` set to the module's `required_sources`, and run its per-module Make targets (`pipeline_make.py run build-<mod> fuzz-<mod> eva-<mod>`, or `module-<mod>`, which also ingests) instead of the all-module ones.
 - `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
 - `--scope <path>`: Restrict to repository-relative paths (repeatable). Everything else is seeded `out_of_scope`.
-- `--max-agents <N>`: Cap on concurrent LLM subagents. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), itself capped by `FRAMAC_MAX_AGENTS` (16).
-- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst. Default: the profile's CPU-second budget (quick 60, standard 120, deep 900) divided by the workers the machine allows.
+- `--max-agents <N>`: Cap on concurrent LLM subagents: pass it as `wp_scheduler.py step --max-agents <N>`. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), capped at 16, or 32 on 32+ CPUs and 64 on 64+ CPUs; `FRAMAC_MAX_AGENTS` replaces that cap.
+- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget (quick 60, standard 120, deep 900) divided by the workers the machine allows.
 - `--run-dir <dir>`: Resume an existing run directory instead of creating a new one.
 
 ## Resources
@@ -110,7 +110,7 @@ These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/S
 3. Run `fuzz` and `eva` in the foreground (sequentially gives standalone `eva` a writable `rw` `/framac-cache` mount; if your harness supports concurrent background wrapper calls, you may run `fuzz` and `python3 $S/pipeline_make.py run eva` concurrently with `ro` cache):
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
-   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (the deterministic Eva ladder, for modules that still have Unknowns; `skills/framac-eva/SKILL.md`, Step 2a)
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (the deterministic Eva ladder, for modules that still have Unknowns; `skills/framac-eva/SKILL.md`, Step 2a). Skip it under `--profile quick`, which allows no extra Eva runs.
 
    Write the `build`, `ingest`, standalone `eva`, `eva-tune` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
 4. Measure what each corpus reached, for the report's coverage gaps: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage`.

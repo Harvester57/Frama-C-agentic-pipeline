@@ -10,7 +10,7 @@ description: >-
   uninitialized reads, signed overflows, and Layer 4-6 ACSL security contract
   violations. Crashes become fingerprinted candidates, not
   findings, until independently verified.
-argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--time <seconds>] [--dict <file>]"
+argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--time <seconds> (params set --fuzz-max-time)] [--dict <file> (params set --fuzz-dict)]"
 ---
 
 # /framac-fuzz
@@ -107,6 +107,7 @@ For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickr
 | `timeout_found` / `oom_found` | Per-input timeout or RSS limit hit. A termination/DoS lead, not a memory-safety bug. |
 | `clean` | No failure within the time budget. The corpus in `workspace/corpus/<mod>/` becomes the dynamic anti-hallucination corpus for `/framac-wp`. Fuzzing is not proof. |
 | `fuzzer_error` / `compile_error` / `sandbox_unavailable` | The campaign did not run to completion. Never read this as clean. |
+| `insufficient_memory` | The job's memory lease is below what LibFuzzer needs at the fixed `-rss_limit_mb` (the report's `error_summary` gives both numbers). Nothing ran; never read this as clean. Give the container engine more memory, or lower the pool's concurrency. |
 | `not_run` | No report was produced for an expected module (the job was killed or excluded). Written by `ingest` so the gap is recorded, never silent. |
 
 `workspace/reports/coverage/<mod>.json` says which of the target's functions and code regions the corpus executes, measured by replaying `workspace/corpus/<mod>/` on a plain Clang source-coverage build (`run_eacsl_fuzz.py coverage`, no E-ACSL and no sanitizers). `functions[]` has `executions`, `regions` and, for a function that ran, `uncovered_lines`. `make` replays the corpus as it stands, so run `coverage` again after a corpus changes.

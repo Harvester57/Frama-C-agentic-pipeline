@@ -109,7 +109,7 @@ run-<N>/
 ├── REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif   # Derived reports
 ├── state/
 │   ├── progress.json                         # Phase resume pointer
-│   ├── phase0.json ... phase3.json           # Phase completion snapshots
+│   ├── phase0.json, phase2.json, phase3.json # Phase completion snapshots (Phase 0 seed, `run wp-queue`, end of Phase 3)
 │   ├── phase3_shards/<fn>.json               # Per-function WP completion shards
 │   ├── wp_schedule.json                      # Phase-3 task graph (wp_scheduler.py)
 │   ├── merge-journal.json                    # Present only while a merge is in flight

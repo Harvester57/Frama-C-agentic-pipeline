@@ -822,11 +822,18 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     f"Eva result holds for calling contexts reachable from eva_main of module '{module}'.",
                 )
                 if reduced_checks:
+                    # Say what each reduced check means only when it is the one in force: most runs only
+                    # carry -no-warn-unsigned-downcast (C11 modular conversions).
+                    recursion = any("assigns" in rc or "recursi" in rc for rc in reduced_checks)
                     add_assumption(
                         u,
                         "boundary_assumption",
-                        f"Eva slice '{module}' ran with reduced checks ({', '.join(reduced_checks)}); "
-                        "recursive or missing assigns specifications were treated as warnings.",
+                        f"Eva slice '{module}' ran with reduced checks ({', '.join(reduced_checks)})"
+                        + (
+                            "; recursive or missing assigns specifications were treated as warnings."
+                            if recursion
+                            else "."
+                        ),
                     )
                 if fn in combined_fns:
                     add_assumption(

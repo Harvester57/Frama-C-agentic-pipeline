@@ -142,7 +142,7 @@ frama-c/
 ├── wrappers/
 │   ├── framac-docker.ps1             # Windows PowerShell wrapper (host broker + container hardening)
 │   └── framac-docker.sh              # POSIX/Bash wrapper (host broker + container hardening)
-├── skills/                           # Modular Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ hold symlinks to these)
+├── skills/                           # Modular Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ mirror them)
 │   ├── framac-verify/SKILL.md        # Umbrella end-to-end orchestrator (/framac-verify)
 │   ├── framac-slice/SKILL.md         # Phase 0: Slicing, Call-Graph DAG, stubs & harnesses (/framac-slice)
 │   ├── framac-fuzz/SKILL.md          # Phase 1: Zero-ACSL RTE + E-ACSL + LibFuzzer triage (/framac-fuzz)
@@ -150,6 +150,8 @@ frama-c/
 │   └── framac-wp/                    # Phase 3: Dependency-driven parallel WP swarm (/framac-wp)
 │       ├── SKILL.md
 │       └── *_brief.md                # Subagent briefs (header_architect, prover, breaker, crash_verifier)
+│   ├── python-patterns/SKILL.md      # Conventions for the pipeline's Python scripts
+│   └── python-testing/SKILL.md       # Pytest conventions for tests/
 ├── scripts/                          # Stdlib-only Python 3.10+ pipeline scripts
 │   ├── build_callgraph_dag.py        # Phase 0: Call-Graph DAG, Risk Tiers, & Layer 2-6 property inference
 │   ├── generate_harness.py           # Phase 0: Dual-use Eva + LibFuzzer harness & sidecar generator
@@ -174,7 +176,7 @@ frama-c/
 │   ├── sandbox_exec.py               # Inner rlimits, environment allowlist, & process-group timeout runner
 │   ├── benchmark.py, benchmark_*.py  # Repeatable benchmark: recall replay, Eva metrics, baseline comparison, brief A/B
 │   └── validate_artifacts.py, ...    # Schema & semantic validators, checkpointing, fingerprinting, & shared helpers
-├── schemas/                          # JSON Schemas (findings, candidates, coverage-ledger, run-metadata, agent-result)
+├── schemas/                          # JSON Schemas (findings, candidates, coverage-ledger, run-metadata, agent-result, benchmark-run)
 ├── templates/
 │   ├── pipeline.mk                   # Make rules for build, selftest, fuzz, eva, ingest, replay, wp-sweep, report
 │   ├── harness_dual.c.template       # Dual-use Eva + LibFuzzer C harness template
@@ -229,7 +231,7 @@ python3 -m mypy scripts tests
 ```
 
 > [!NOTE]
-> Edit skills only under `skills/framac-*`. The harness mirrors `.agents/skills/framac-*` and `.claude/skills/framac-*` are symlinks to `skills/framac-*`, so there is nothing to keep synchronized; `tests/test_extract_references.py` verifies the links point at `skills/` and the content matches.
+> Edit skills only under `skills/`. The repository records the harness mirrors `.agents/skills/*` and `.claude/skills/*` as symlinks to `skills/*`. Where a checkout cannot use them (Windows with `core.symlinks=false`, where a harness needs real files), the mirror may be a real copy instead; `tests/test_extract_references.py` accepts a link, git's plain-file form of a link, or a copy, and fails when a copy differs from `skills/` by a single byte.
 
 ---
 

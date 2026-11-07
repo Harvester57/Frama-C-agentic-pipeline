@@ -8,7 +8,7 @@ description: >-
   separates Invalid (red), Unknown (orange), dead, and assumed statuses, emits
   per-slice SARIF, and records results in the coverage ledger, including the
   queue of surviving Unknown functions for Phase 3 (/framac-wp).
-argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--slevel <N>]"
+argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--slevel <N> (params set --eva-slevel)]"
 ---
 
 # /framac-eva
@@ -36,7 +36,7 @@ python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <
 ```
 
 - A Frama-C failure is reported as `status: "analysis_error"` (exit code 1), never as zero alarms.
-- A run that exceeds the profile's wall-clock limit (`--timeout`) is reported as `status: "analysis_timeout"`.
+- A run that exceeds its wall-clock limit (`--timeout`, from `params set --eva-timeout`; otherwise the broker's fixed Eva job limit) is reported as `status: "analysis_timeout"`.
 
 `run_eva_slice.py` runs `-rte -then -eva` on purpose. Eva's own alarms would find the same errors, but RTE supplies the full list of obligations, which Eva then marks Valid, Unknown, Invalid or Dead. The ledger's `covered` rule and the Dead (harness-gap) bucket depend on that list. Do not drop `-rte` from this phase, and do not add `-rte-initialized`: Eva already reports uninitialized reads (see `docs/references/README.md`, "Key facts").
 
