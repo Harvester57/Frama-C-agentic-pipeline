@@ -175,6 +175,34 @@ def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
     assert generate_harness._split_cppflags(merged)[:2] == ["-DA=x y", "-DN=4"]
 
 
+def test_cluster_and_freely_named_harnesses_take_their_units_flags(tmp_path: Path) -> None:
+    """An I8 cluster or a harness with its own name gets its unit's flags and -include (defect 7)."""
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "harnesses").mkdir()
+    expected = ["-I.", "-Iworkspace/work/include", "-include", "workspace/work/config.h"]
+    dag = {
+        "module_kind": "link_unit",
+        "modules": {
+            "libtlv_a": {"cppflags": ["-Iworkspace/work/include"], "force_includes": ["workspace/work/config.h"]}
+        },
+        "unit_of_lexer_module": {"tlv": "libtlv_a"},
+        "lexer_modules": {"tlv": {"cppflags": ["-DLEGACY"]}},
+        "submodules": {"libtlv_a_c1": {"module": "libtlv_a_c1", "unit": "libtlv_a", "kind": "cluster"}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    harnesses = tmp_path / "harnesses"
+    # A cluster of the split unit: through the DAG's submodules.
+    cluster = generate_harness._merge_dag_module_cppflags("libtlv_a_c1", harnesses, "-I.")
+    assert cluster.split() == expected
+    # A harness named freely: through its unit (given, from the sidecar, or inferred).
+    free = generate_harness._merge_dag_module_cppflags("tlv_dispatch", harnesses, "-I.", "libtlv_a")
+    assert free.split() == expected
+    # Without a unit there is nothing to take.
+    assert generate_harness._merge_dag_module_cppflags("tlv_dispatch", harnesses, "-I.") == "-I."
+
+
 def test_modules_are_the_non_test_link_units() -> None:
     dag = _units()
     assert dag["module_kind"] == "link_unit"

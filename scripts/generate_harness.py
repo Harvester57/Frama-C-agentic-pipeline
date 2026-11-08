@@ -1218,10 +1218,28 @@ def _normalize_cppflags_dirs(cppflags: str) -> str:
     return " ".join(shlex.quote(t) for t in out) or "-I."
 
 
-def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -> str:
+def _dag_module_info(dag: dict, module_name: str, unit: str | None = None) -> dict | None:
+    """
+    The DAG record whose build flags a harness takes: its module's when it is a DAG module, else its
+    link unit's (step I5b: the build's own flags, which a path module's scan can contradict). The unit
+    is `unit` (given, the sidecar's, or inferred), else the path module's or the cluster's unit.
+    """
+    modules = dag.get("modules") or {}
+    if isinstance(modules.get(module_name), dict):
+        return modules[module_name]
+    split = (dag.get("submodules") or {}).get(module_name)
+    for name in (unit, (dag.get("unit_of_lexer_module") or {}).get(module_name), (split or {}).get("unit")):
+        if name and isinstance(modules.get(name), dict):
+            return modules[name]
+    lexer = (dag.get("lexer_modules") or {}).get(module_name)
+    return lexer if isinstance(lexer, dict) else None
+
+
+def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, unit: str | None = None) -> str:
     """
     If `callgraph_dag.json` exists next to `out_dir` (e.g. `workspace/reports/callgraph_dag.json`),
-    normalize and merge its discovered `-I`/`-D` flags for `module_name` into `cppflags`.
+    normalize and merge its discovered `-I`/`-D` flags and force-included files for `module_name` (its
+    link unit's, `_dag_module_info`) into `cppflags`.
     """
     cppflags = _normalize_cppflags_dirs(cppflags)
     dag_candidates = [
@@ -1236,11 +1254,7 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
         except (OSError, ValueError):
             continue
         dag = dag if isinstance(dag, dict) else {}
-        # A sub-module of a link unit takes its unit's flags (step I5b): the build's own, which the
-        # lexer's Makefile scan can contradict.
-        modules = dag.get("modules") or {}
-        unit = (dag.get("unit_of_lexer_module") or {}).get(module_name)
-        mod_info = modules.get(module_name) or modules.get(unit) or (dag.get("lexer_modules") or {}).get(module_name)
+        mod_info = _dag_module_info(dag, module_name, unit)
         if not isinstance(mod_info, dict):
             continue
         for raw_flag in mod_info.get("cppflags") or []:
@@ -1505,8 +1519,20 @@ def generate_module_harness(
     harness_meta_file = out_dir / f"harness_{module_name}.json"
     norm_ldflags = (ldflags or "").strip()
 
+    # A repair that regenerates the harness keeps what its previous sidecar recorded (see below).
+    previous = load_json_optional(harness_meta_file, {})
+    previous = previous if isinstance(previous, dict) else {}
+    # The link unit this harness module belongs to (step I5b; scripts/module_map.py): given, kept from
+    # the previous sidecar, else inferred from the DAG. Null without link units (path modules). The
+    # harness takes its unit's build flags, so a cluster or a freely named harness gets them too.
+    unit = (
+        unit
+        or previous.get("unit")
+        or _infer_harness_unit(out_dir, module_name, entry_fn, call_expr, eva_expr, fuzz_expr, *(dispatch_cases or []))
+    )
+
     norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
-    norm_cppflags = _merge_dag_module_cppflags(module_name, out_dir, norm_cppflags)
+    norm_cppflags = _merge_dag_module_cppflags(module_name, out_dir, norm_cppflags, unit)
     norm_extra_includes: list[str] = []
     for ext_inc in extra_includes or []:
         nh, norm_cppflags = _normalize_header_include(ext_inc, norm_cppflags)
@@ -1706,8 +1732,6 @@ def generate_module_harness(
 
     # A repair that regenerates the harness keeps the count `--record-repair` kept, or the
     # repair cap would reset on every repair and the loop would never end.
-    previous = load_json_optional(harness_meta_file, {})
-    previous = previous if isinstance(previous, dict) else {}
     try:
         repair_attempts = max(0, int(previous.get("repair_attempts") or 0))
     except (TypeError, ValueError):
@@ -1717,13 +1741,6 @@ def generate_module_harness(
     # Gaps accepted at the reachability gate (harness_reach.py exempt) survive regeneration too.
     reach_exempt = previous.get("reach_exempt")
     reach_exempt = dict(reach_exempt) if isinstance(reach_exempt, dict) else {}
-    # The link unit this harness module belongs to (step I5b; scripts/module_map.py): given, kept from
-    # the previous sidecar, else inferred from the DAG. Null without link units (lexer modules).
-    unit = (
-        unit
-        or previous.get("unit")
-        or _infer_harness_unit(out_dir, module_name, entry_fn, call_expr, eva_expr, fuzz_expr, *(dispatch_cases or []))
-    )
 
     sidecar = {
         "module": module_name,
