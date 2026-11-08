@@ -1,6 +1,34 @@
 {
   "$comment": "Contract for workspace/reports/phase0_model.json, written by scripts/phase0_model.py run (plan step I3). Function ids are `file#name`, the file relative to the target root. Every function, edge and alias carries its source.",
   "type": "object",
+  "definitions": {
+    "function_trust": {
+      "$comment": "Step I7 (scripts/trust.py): value, the deciding rule, every rule marking it untrusted, whether attacker data reaches its parameters directly, and why.",
+      "type": "object",
+      "properties": {
+        "value": {"type": "string", "enum": ["untrusted", "trusted"]},
+        "source": {"type": "string", "enum": ["default", "call_graph", "threat_model", "codeql"]},
+        "sources": {"type": "array", "items": {"type": "string", "enum": ["default", "call_graph", "threat_model", "codeql"]}},
+        "boundary": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "overridden": {"$comment": "rules a threat-model trusted_callers decision overrode", "type": "array", "items": {"type": "string"}}
+      },
+      "required": ["value", "source", "sources", "boundary", "reasons"],
+      "additionalProperties": false
+    },
+    "unit_trust": {
+      "type": "object",
+      "properties": {
+        "threat_model": {"type": "string", "enum": ["ok", "no_threat_model", "invalid_threat_model"]},
+        "functions": {"type": "integer", "minimum": 0},
+        "untrusted": {"type": "integer", "minimum": 0},
+        "boundary": {"type": "integer", "minimum": 0},
+        "api": {"type": "integer", "minimum": 0}
+      },
+      "required": ["threat_model", "functions", "untrusted", "boundary", "api"],
+      "additionalProperties": false
+    }
+  },
   "properties": {
     "schema_version": {"const": 1},
     "generated_at": {"type": "string", "minLength": 1},
@@ -41,7 +69,8 @@
             },
             "required": ["status"]
           },
-          "concurrent": {"$comment": "the unit starts threads (pthread_create, thrd_create)", "type": "boolean"}
+          "concurrent": {"$comment": "the unit starts threads (pthread_create, thrd_create)", "type": "boolean"},
+          "trust": {"$ref": "#/definitions/unit_trust"}
         },
         "required": ["kind", "test", "files", "links", "parse", "concurrent"]
       }
@@ -66,7 +95,9 @@
           "loops": {"type": ["integer", "null"], "minimum": 0},
           "cyclomatic": {"type": ["integer", "null"], "minimum": 1},
           "address_taken": {"type": "boolean"},
-          "source": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info"]}
+          "source": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info"]},
+          "external_calls": {"$comment": "functions it calls that no unit of its program defines (libc, packages)", "type": "array", "items": {"type": "string"}},
+          "trust": {"$ref": "#/definitions/function_trust"}
         },
         "required": ["file", "name", "kernel_names", "units", "line", "static", "header", "signature", "address_taken", "source"]
       }
@@ -165,6 +196,29 @@
       }
     },
     "seconds": {"type": "number", "minimum": 0},
+    "trust": {
+      "$comment": "Step I7 (scripts/trust.py): the threat model and CodeQL used, counts, warnings.",
+      "type": "object",
+      "properties": {
+        "generated_at": {"type": "string"},
+        "threat_model": {
+          "type": "object",
+          "properties": {
+            "status": {"type": "string", "enum": ["ok", "no_threat_model", "invalid_threat_model"]},
+            "path": {"type": ["string", "null"]},
+            "sha256": {"type": ["string", "null"]},
+            "reason": {"type": ["string", "null"]},
+            "errors": {"type": "array", "items": {"type": "string"}}
+          },
+          "required": ["status"]
+        },
+        "codeql": {"type": "object", "properties": {"status": {"type": "string"}}, "required": ["status"]},
+        "input_readers": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "object"},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["threat_model", "codeql", "summary", "warnings"]
+    },
     "warnings": {"type": "array", "items": {"type": "string"}}
   },
   "required": ["schema_version", "generated_at", "status", "capture", "warnings"],

@@ -12,10 +12,15 @@ Every place that matches a harness module against a DAG module or a ledger unit'
 through `ModuleMap`, so a sub-module's report credits its unit's functions. Without the model the DAG
 modules are the lexer's, every harness module is its own unit, and the mapping is the identity.
 
+Sub-modules come from two places: the lexer modules of a unit (the benchmark's harnesses are written
+per lexer module), and the clusters of a unit too large for one Eva run (step I8, scripts/unit_split.py:
+the DAG's `submodules`, each with its `unit`, `functions` and entry points).
+
 A harness module's *scope* is the code it answers for at the reachability gate: the whole unit for a
-unit-named harness; for a sub-module, the functions of the lexer module of the same name (the
-benchmark's harnesses are written per lexer module), else `scope_files` from its sidecar, else the
-functions of the sources its sidecar lists.
+unit-named harness; for a sub-module, the functions of the lexer module of the same name, else of the
+split cluster of that name, else `scope_files` from its sidecar, else the functions of the sources its
+sidecar lists. Its tier and run flags come from the same record (the lexer module's or the cluster's,
+both set from its functions' tiers by scripts/tiers.py), else from its unit.
 """
 
 from __future__ import annotations
@@ -60,6 +65,12 @@ class ModuleMap:
         self.lexer_modules: dict[str, dict] = self.dag.get("lexer_modules") or {}
         self.functions: dict[str, dict] = self.dag.get("functions") or {}
         self._unit_of_lexer: dict[str, str] = self.dag.get("unit_of_lexer_module") or {}
+        # Step I8: clusters of split units (scripts/unit_split.py).
+        self.split_submodules: dict[str, dict] = {
+            n: r
+            for n, r in (self.dag.get("submodules") or {}).items()
+            if isinstance(r, dict) and r.get("unit") in self.modules
+        }
 
     @classmethod
     def load(cls, run_dir: Path | str = ".") -> ModuleMap:
@@ -77,7 +88,10 @@ class ModuleMap:
             return declared
         if module in self.modules:
             return module
-        return self._unit_of_lexer.get(module, module)
+        if module in self._unit_of_lexer:
+            return self._unit_of_lexer[module]
+        split = self.split_submodules.get(module)
+        return str(split["unit"]) if split else module
 
     def same_unit(self, a: str, b: str) -> bool:
         return self.unit_of(a) == self.unit_of(b)
@@ -104,6 +118,8 @@ class ModuleMap:
         in_unit = set((self.modules.get(unit) or {}).get("functions") or []) or set(self.functions)
         if module in self.lexer_modules:
             return sorted(k for k in in_unit if (self.functions.get(k) or {}).get("lexer_module") == module)
+        if module in self.split_submodules:
+            return sorted(k for k in self.split_submodules[module].get("functions") or [] if k in in_unit)
         sidecar = self.sidecars.get(module) or {}
         files = {_norm(f) for f in sidecar.get("scope_files") or sidecar.get("sources") or [] if isinstance(f, str)}
         return sorted(k for k in in_unit if _norm((self.functions.get(k) or {}).get("file") or "") in files)
@@ -121,18 +137,30 @@ class ModuleMap:
         """The DAG module record (tier, run flags, sources, flags) a harness module runs under."""
         return self.modules.get(self.unit_of(module)) or self.modules.get(module) or {}
 
+    def submodule_record(self, module: str) -> dict | None:
+        """The record a sub-module takes its tier and run flags from: its lexer module's, else its cluster's."""
+        if not self.is_submodule(module):
+            return None
+        for rec in (self.lexer_modules.get(module), self.split_submodules.get(module)):
+            if isinstance(rec, dict) and rec.get("tier"):
+                return rec
+        return None
+
+    def splits(self, unit: str) -> list[str]:
+        """The clusters a split unit was cut into (scripts/unit_split.py), in DAG order."""
+        return [n for n, r in self.split_submodules.items() if r.get("unit") == unit]
+
     def tier_of(self, module: str) -> str | None:
-        """A sub-module keeps the tier of its lexer module (tiers change in step I8); else the unit's."""
-        lexer = self.lexer_modules.get(module)
-        if self.is_submodule(module) and isinstance(lexer, dict) and lexer.get("tier"):
-            return str(lexer["tier"])
+        """A sub-module's tier is its lexer module's or its cluster's (scripts/tiers.py); else the unit's."""
+        sub = self.submodule_record(module)
+        if sub is not None:
+            return str(sub["tier"])
         tier = self.unit_record(module).get("tier")
         return str(tier) if tier else None
 
     def run_flags(self, module: str) -> dict[str, bool]:
         """`run_eva`, `run_eacsl_fuzz`, `run_wp_full` for a harness module, from the same record as its tier."""
-        lexer = self.lexer_modules.get(module)
-        rec = lexer if self.is_submodule(module) and isinstance(lexer, dict) else self.unit_record(module)
+        rec = self.submodule_record(module) or self.unit_record(module)
         return {
             k: bool(rec.get(k, True if k == "run_eva" else False)) for k in ("run_eva", "run_eacsl_fuzz", "run_wp_full")
         }
@@ -151,6 +179,8 @@ def infer_unit(dag: dict | None, module: str, referenced_functions: list[str] | 
         return module
     if module in mm._unit_of_lexer:
         return mm._unit_of_lexer[module]
+    if module in mm.split_submodules:
+        return str(mm.split_submodules[module]["unit"])
     votes: dict[str, int] = {}
     for fn in referenced_functions or []:
         mod = (mm.functions.get(fn) or {}).get("module")

@@ -108,6 +108,35 @@ Read `units.<name>.parse.status`. `gcc_fallback` means Frama-C could not parse t
 
 Step 2 reads the model. Without it (no capture, or a model whose `status` is not `ok`), Step 2 falls back to the lexer and says so in the DAG's `warnings`.
 
+### Step 1d — Trust Boundary
+
+The model already holds each function's `trust` (`scripts/trust.py`, run by `phase0_model.py`): `untrusted` or `trusted`, the deciding rule (`source`), and `boundary` when attacker data reaches the parameters directly. The rules:
+- **Library API:** every API function of a library unit is untrusted (`default`, boundary).
+- **Input path:** a function calling an input reader (`read`, `recv`, `recvfrom`, `fread`, `fgets`, `getline`, `getenv` and close relatives), `main` with argv, and the threat model's `input_sources` are input roots. Every function they reach in the call graph is untrusted (`call_graph`).
+- **Threat model:** `trusted_callers` marks functions (or a unit's API) called only by trusted code. It wins over the other rules and keeps what it overrode under `overridden`.
+- **Everything else** is trusted (`default`).
+
+The threat model is the fenced `framac-threat-model` JSON block of THREAT_MODEL.md, validated against `schemas/threat_model.schema.json` (`input_sources`, `trusted_callers`, `secrets`, `auth_gates`, `output_sinks`). It is read from `workspace/THREAT_MODEL.md`, else the target's own. Check it before the model runs:
+
+```text
+python3 /opt/framac-pipeline/scripts/trust.py check-threat-model [PATH]
+```
+
+Exit 0 means valid, 1 means no file or no block (every unit records `no_threat_model`), and 2 means invalid (fix the listed errors). Report `no_threat_model` to the user: the default rules then decide alone. Run `trust.py run` again after changing the threat model, then rebuild the DAG (Step 2).
+
+**CodeQL (optional).** CodeQL may add untrusted marks (`codeql`); it never removes one. It runs only when the user declares the target open source, because CodeQL's licence covers open-source code only. Ask the user; never assume it. Then:
+
+```powershell
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Class phase-static `
+  "python3 /opt/framac-pipeline/scripts/run_metadata.py set-codeql --enable --open-source --declared-by user"
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Scratch -CodeQL -TargetPackages "<pkgs>" -Class phase-dynamic `
+  "python3 /opt/framac-pipeline/scripts/codeql_trust.py run && python3 /opt/framac-pipeline/scripts/trust.py run"
+```
+
+(sh: `--codeql`.) `-CodeQL` runs in `framac-codeql:<repo>`: the target's derived build image plus the CodeQL CLI copied from `framac-codeql:latest`. It is built locally and never pushed. `codeql_trust.py` replays the build recipe under CodeQL's tracer and writes `workspace/reports/codeql_trust.json`. Then `trust.py run` merges its facts.
+
+Consumers: the harness sidecar's `reachability` defaults from trust (`untrusted_surface` at a boundary, else `internal_api`; `reachability_source` records `trust:<rule>`). The contract trust-boundary check applies to every boundary function. The report lists the trust source of each entry point.
+
 ---
 
 ## Step 2 — Build the Call-Graph DAG, Topological Waves & Risk Tiers
@@ -125,18 +154,26 @@ It reads `workspace/reports/phase0_model.json` from Step 1c (`--model PATH` to p
 
 With the model, the DAG's `modules` are the build's non-test **link units** (`module_kind: "link_unit"`): one module per library or executable, named after its artifact (`lib/libkv.a` -> `libkv_a`), libraries first. A unit module carries its `kind`, `files`, `required_sources` (its own files plus those of the project libraries it links), `cppflags`, `concurrent` (the build links a thread library or the code starts threads) and `candidate_entry_points` (its API: exported functions, `main` for an executable, an executable's embedded API). A source file belongs to the first unit that compiles it. Code no non-test unit compiles keeps its lexer module.
 
-Tiers and the per-function analysis stay the lexer's (C/ACSL token stream `tokenize_c_acsl`, Tarjan's SCC for recursion cycles, structural signature and body analysis, with no project-specific keyword hints). The lexer's modules are kept under `lexer_modules`, `unit_of_lexer_module` maps each to its unit, and every function keeps its `lexer_module` and that module's `tier`. A unit's `tier` and `run_*` flags are the most demanding of its lexer modules'; the ledger seeds each function with its own tier. Review `workspace/reports/callgraph_dag.json`:
+The per-function analysis stays the lexer's (C/ACSL token stream `tokenize_c_acsl`, Tarjan's SCC for recursion cycles, structural signature and body analysis, with no project-specific keyword hints). The lexer's modules are kept under `lexer_modules`, `unit_of_lexer_module` maps each to its unit, and every function keeps its `lexer_module`.
+
+**Tiers** (`scripts/tiers.py`) are set per function from its trust (Step 1d) and its structure, in the table's order below: a function is on an *untrusted path* when it is untrusted, when the threat model's `trusted_callers` overrode an untrusted mark on it, or when an untrusted function reaches it in the call graph. Each function records `tier`, `tier_reasons` and `untrusted_path`. A module (link unit, lexer module, split sub-module) takes the most demanding tier among its functions, with that tier's `run_*` flags, `tier_counts`, `deferred_profiles`, and the lexer's old tier as `lexer_tier`. The DAG's `tiers` block counts the functions per tier. Without trust in the model (a model from before Step 1d), the lexer's module tiers stay and `tiers.source` is `lexer`. `python3 /opt/framac-pipeline/scripts/tiers.py summary` lists each module's tier and every Tier 3 function with its reason: check them, since a Tier 3 function is not analysed under `quick`.
+
+**Unit split** (`scripts/unit_split.py`): a link unit whose entry points reach more than 400 functions or 15,000 lines of function bodies (what one harness driving its whole API gives Eva) is split into sub-modules for Eva and harnesses. Each API entry point starts a cluster of the functions it reaches; clusters sharing more than half of the smaller one merge; clusters under 10 functions (getters, setters) are packed with the cluster they share most with, else one of the same file, within the function limit. Each cluster becomes `submodules.<unit>__<file stem>` (`unit`, `anchors` = its entry points, `functions`, `lines`, its tier and run flags); the unit records `split` (reason, sub-modules, `unclustered` functions no entry point reaches) and the DAG `unit_split` (thresholds and one row per unit). `--split-max-functions` / `--split-max-lines` change the thresholds; `unit_split.py show` prints the clusters for other thresholds without writing the DAG.
+
+Review `workspace/reports/callgraph_dag.json`:
 - Check each module's `required_sources` (the transitive in-repository `.c` file closure needed to compile and analyze the module together with its in-repo sibling callees), `cross_module_callees`, `external_callees`, and auto-discovered `cppflags`.
 - Check `name_collisions` (same-named static functions in different files), `recursion_cycles`, and `indirect_calls` (function-pointer call sites requiring `//@ calls f1, f2;` or `//@ assert fp \in {...};`).
 - Check each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`), and `wp_notes` (e.g., `while (n--)` unsigned wraparound idiom or pointer casts requiring `-wp-model Typed+cast`).
 - Record any tier override with a source-backed reason.
 
-| Risk Tier | Code Archetype (Structural Signature & Body Profile) | Verification Route |
+| Risk Tier (checked in this order) | Function rule (`tiers.py`) | Verification Route |
 | :--- | :--- | :--- |
-| **Tier 1A** | Untrusted Binary / Buffer Parser (`const uint8_t*/char*` + `size_t` reader with loops and no heap allocation) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layers 1-6) |
-| **Tier 1B** | Structured Packet / Buffer Emitter (mutable output buffer + capacity writer or formatting calls) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layer 5 Sanitization) |
-| **Tier 2** | Recursive or Heap-Allocating Module (`recursion_cycles` or `malloc`/`calloc`/`realloc`/`free` in call tree) | Phase 1 (`E-ACSL + Fuzz` with dictionary) + Phase 2 (`Eva`) + WP on non-allocating validators |
-| **Tier 3** | Internal Glue & State Machines | Seeded `deferred` in `quick`/`standard` profiles; `rte` units seeded `planned` for WP in `deep` profile |
+| **Tier 3** | No untrusted path; or an internal scalar helper on one: not on the trust boundary, no loop, no pointer parameter, pointer return or pointer cast, no indirect call, not variadic, cyclomatic complexity at most 2 | Phase 2 (`Eva`) only, no fuzzing; `rte` units `planned` and Layers 2-6 `deferred` in `standard`/`deep`. **Deferred under `quick`:** a Tier 3 module is excluded from the Make phases and every unit of a Tier 3 function is seeded `deferred` |
+| **Tier 2** | On an untrusted path, and allocates on the heap or is recursive | Phase 1 (`E-ACSL + Fuzz` with dictionary) + Phase 2 (`Eva`) + WP on non-allocating validators |
+| **Tier 1B** | On an untrusted path, and writes a bounded output buffer it does not read from, or formats into one (emitter) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layer 5 Sanitization) |
+| **Tier 1A** | Any other function on an untrusted path (parsers, validators, the trust boundary itself) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layers 1-6) |
+
+A module's route is that of its most demanding function, so a harness module holding one Tier 1A function is fuzzed even when the rest of its scope is Tier 3.
 
 ---
 
@@ -164,7 +201,7 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom|argv|dispatch> [--auto-args] [--dispatch-case '<stmts>']... [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
 ```
 
-With link units, a harness module is either a unit itself or a **sub-module** of one: a library with several entry families gets one harness per family, named after the lexer module it drives (QCBOR's `decode`, `encode`... inside `libqcbor_a`). The sidecar records its `unit` (`--unit <unit>`; inferred from the DAG when omitted). A sub-module keeps its lexer module's tier, flags and sources; its reports, corpus and candidates stay under its own name and credit its unit's functions. A sub-module whose name is not a lexer module answers for the files in its sidecar's `scope_files` (else `sources`).
+With link units, a harness module is either a unit itself or a **sub-module** of one: a library with several entry families gets one harness per family, named after the lexer module it drives (QCBOR's `decode`, `encode`... inside `libqcbor_a`). The sidecar records its `unit` (`--unit <unit>`; inferred from the DAG when omitted). A sub-module keeps its lexer module's sources, and takes its tier and flags from its lexer module's functions; its reports, corpus and candidates stay under its own name and credit its unit's functions. A unit the DAG split (`split`, Step 2) gets one harness per cluster instead, named as the cluster (`libcryptolib_so__crypto_tc`) with `--unit <unit>` and one dispatch case per anchor; its scope is the cluster's functions and its tier the cluster's. A sub-module whose name is neither a lexer module nor a cluster answers for the files in its sidecar's `scope_files` (else `sources`).
 
 The sidecar `harness_<mod>.json` is the single source of truth for later phases: `sources`, `cppflags`, `ldflags`, `include_source`. `pipeline_make.py gen` builds every module's fuzz, Eva and build recipes from it, so put the module's real link flags in `--ldflags` here rather than on later command lines. Flags outside the build allowlist (for example `-fplugin`, `-B`, `-fuse-ld`, `-Wl,`) exclude the module from the Make phases. `gen` reports them.
 
@@ -174,7 +211,7 @@ Supported `--entry-style` modes and options in `generate_harness.py`:
 - `global_buffer`: copies fuzz/symbolic bytes into `--global-buf <name>` (and optional `--global-len <name>`) before calling `entry_fn()`.
 - `struct_arg`: populates a stack struct of `--struct-type <Type>` with fuzz/symbolic bytes before calling `entry_fn(&target_arg)`.
 - `void_call`: invokes `entry_fn()` directly after initializing any globals.
-- `auto_prototype` (or `--auto-args`): inspects the C declaration of `--entry-fn` in `--header` or `--sources`, automatically synthesizes Eva (`Frama_C_make_unknown`) and LibFuzzer (`fuzz_buf + fuzz_off`) argument unpacking for arbitrary multi-argument internal functions (buffer+length pairs, C strings, output buffers, pointers, and scalars), and defaults `reachability` to `internal_api`.
+- `auto_prototype` (or `--auto-args`): inspects the C declaration of `--entry-fn` in `--header` or `--sources`, automatically synthesizes Eva (`Frama_C_make_unknown`) and LibFuzzer (`fuzz_buf + fuzz_off`) argument unpacking for arbitrary multi-argument internal functions (buffer+length pairs, C strings, output buffers, pointers, and scalars), and defaults `reachability` to `internal_api` when the entry function has no trust in the DAG (Step 1d).
 - `custom`: executes arbitrary C statements passed via `--call-expr '<stmts using fuzz_buf and fuzz_len>'` (or separate `--eva-expr` and `--fuzz-expr`), with optional `--null-terminate` and repeatable `--extra-include <hdr.h>`.
 - `argv`: CLI-style targets whose entry is `main(int argc, char **argv)` — the default when `--entry-fn main` is given without an explicit `--entry-style`. Eva side emulates `argc`/`argv` with `Frama_C_interval(0, 5)` and five unknown 256-byte buffers (upstream `share/libc/eva_stubs.c`, vendored as `docs/upstream/sources/eva_stubs.c`); the LibFuzzer side passes the input as `argv[1]` NUL-terminated. The sidecar `cppflags` get `-Dmain=__framac_target_main`, renaming the target's `main` in every build so libFuzzer's own `main` does not clash at link time.
 - `dispatch`: one harness for an API library with many entry points. Each repeatable `--dispatch-case '<stmts>'` drives one API call; the first input byte selects the case and the rest of the input is that case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one analysis covers every case. Each case must build its arguments within the callee's contract (for a builder: a real buffer, its real size as `buflen`, and the setup calls the API documents, such as writing the message header first) and must never `return`. Pass the module's main parser as `--entry-fn`. The sidecar records the cases in `dispatch_cases`. The fuzz campaign skips a case once it has crashed, by rebuilding with `-DFRAMAC_FUZZ_SKIP_CASES`, so keep unrelated API calls in separate cases: a skipped case is not fuzzed for the rest of the campaign.

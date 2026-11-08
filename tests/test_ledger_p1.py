@@ -22,7 +22,7 @@ def assert_valid(run_dir):
 
 
 def test_eva_invalid_in_deferred_unit_becomes_linked_candidate(run_dir):
-    seed(run_dir)  # glue_init is Tier 3: its rte unit is deferred.
+    seed(run_dir, "quick")  # glue_init is Tier 3: its rte unit is deferred under quick.
     alarm = {
         "file": "workspace/work/src/glue/init.c",
         "function": "glue_init",
@@ -73,7 +73,7 @@ def test_eva_invalid_without_eligible_unit_becomes_unlinked_candidate(run_dir, f
 
 
 def test_eva_valid_unknown_dead_unchanged_for_deferred_units(run_dir):
-    seed(run_dir)
+    seed(run_dir, "quick")
     rep = eva_report(
         invalid_alarms=[],
         unknown_obligations_by_function={"glue_init": [{"line": 1}]},
@@ -262,7 +262,7 @@ def test_record_boundary_assumptions_architect_names_no_function(run_dir):
 
 
 def test_record_boundary_assumptions_skips_deferred_units(run_dir):
-    seed(run_dir)
+    seed(run_dir, "quick")
     aid = "prover-glue"
     write_json(run_dir / "agents" / aid / "scratch" / "wp.json", {})
     res_path = run_dir / "agents" / aid / "scratch" / "result.json"

@@ -50,5 +50,25 @@
     "tools/pooltool.c#main"
   ],
   "thread_entries": ["src/pool.c#worker_main", "tools/pooltool.c#progress_main"],
-  "notes": "worker_main runs in up to 8 threads concurrently with main/pool_submit; progress_main runs concurrently with both and calls pool_progress, which reads p->jobs under stats_lock. q_* are internal (src/queue.h). A sequential analysis from main alone misses worker_main/line_hash/q_pop entirely unless the pthread_create edges are modelled."
+  "notes": "worker_main runs in up to 8 threads concurrently with main/pool_submit; progress_main runs concurrently with both and calls pool_progress, which reads p->jobs under stats_lock. q_* are internal (src/queue.h). A sequential analysis from main alone misses worker_main/line_hash/q_pop entirely unless the pthread_create edges are modelled.",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "src/pool.c#line_hash": ["call_graph"],
+      "src/pool.c#pool_create": ["default", "call_graph"],
+      "src/pool.c#pool_finish": ["default", "call_graph"],
+      "src/pool.c#pool_progress": ["default", "call_graph"],
+      "src/pool.c#pool_submit": ["default", "call_graph"],
+      "src/pool.c#worker_main": ["call_graph"],
+      "src/queue.c#q_close": ["call_graph"],
+      "src/queue.c#q_destroy": ["call_graph"],
+      "src/queue.c#q_init": ["call_graph"],
+      "src/queue.c#q_pop": ["call_graph"],
+      "src/queue.c#q_push": ["call_graph"],
+      "tools/pooltool.c#main": ["call_graph"],
+      "tools/pooltool.c#progress_main": ["call_graph"]
+    },
+    "boundary": ["src/pool.c#pool_create", "src/pool.c#pool_finish", "src/pool.c#pool_progress", "src/pool.c#pool_submit", "tools/pooltool.c#main"],
+    "trusted": []
+  }
 }

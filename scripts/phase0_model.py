@@ -7,6 +7,7 @@ Stdlib only.
     phase0_model.py run [--capture workspace/reports/build_capture.json]
                         [--out workspace/reports/phase0_model.json] [--jobs N] [--no-broker]
                         [--alias | --no-alias]
+                        [--threat-model PATH]
     phase0_model.py selftest
 
 `run` reads the build capture (scripts/build_capture.py), the scratch tree it names and the run's
@@ -26,14 +27,19 @@ snapshot (scripts/target_env.py), so it runs in a container started with the wra
      and direct edges, with indirect call sites left unresolved, flagged with Frama-C's first error;
   5. model-wide resolution, as the linker sees it:
      - a call to a function the unit does not define resolves to a global of the same name in a unit
-       it links, else in a unit that links it, else it is an external;
+       it links, else in a unit that links it, else it is an external (kept per caller under
+       `external_calls`: the input readers it calls decide its trust);
      - an indirect call site resolves to every address-taken function of the same signature in the
        programs (executables, shared libraries, unconsumed static libraries) that contain the unit;
      - a project function passed to pthread_create/thrd_create is a thread entry, and its unit is
        concurrent; one passed to another external (qsort, signal) is a callback;
   6. macro aliases: `cc -E -dD` per translation unit, keeping each object-like `#define a b` written in
      a project file whose value resolves (through other such aliases) to a defined function;
-  7. entry points, link units and the test marking come from the build capture.
+  7. entry points, link units and the test marking come from the build capture;
+  8. trust (step I7, scripts/trust.py): each function's `trust` (untrusted or trusted, the deciding rule,
+     whether it is on the trust boundary) from the library API, the input readers' call graph and the
+     structured threat model (THREAT_MODEL.md, --threat-model); a missing one records `no_threat_model`.
+     `trust.py run` redoes it after a CodeQL run.
 
 With `--alias` (plan step I4; off by default, see docs/phase0-redesign.md §7 "Alias narrowing"), each
 parse also loads scripts/phase0_alias.ml, which runs Frama-C's Alias plugin on the same AST and reports,
@@ -471,6 +477,7 @@ class ModelBuilder:
         self.edges: dict[tuple[str, str, str], set[str]] = defaultdict(set)
         self.indirect_sites: list[dict] = []
         self.externals: set[str] = set()
+        self.external_calls: dict[str, set[str]] = defaultdict(set)  # caller id -> external names it calls
         self.thread_entries: set[str] = set()
         self.concurrent: set[str] = set()
         # Per unit: kernel name -> id, source name -> id of its globals, address-taken ids with signatures.
@@ -629,6 +636,8 @@ class ModelBuilder:
                 self.edges[(caller, callee, "direct")].add(source)
                 continue
             self.externals.add(name)
+            if name:
+                self.external_calls[caller].add(name)
             for fid in call.get("resolved_args") or []:
                 if not fid:
                     continue
@@ -832,7 +841,8 @@ def build_model(
                 rec["parse"]["error"] = j["error"]
         rec["concurrent"] = name in builder.concurrent
         units_out[name] = rec
-    for f in builder.functions.values():
+    for fid, f in builder.functions.items():
+        f["external_calls"] = sorted(builder.external_calls.get(fid, ()))
         f["units"] = sorted(f["units"])
         f["kernel_names"] = dict(sorted(f["kernel_names"].items()))
     model.update(
@@ -853,6 +863,16 @@ def build_model(
         seconds=round(time.monotonic() - t0, 2),
     )
     return model, 0
+
+
+def annotate_trust(model: dict, threat_model: Path | None = None) -> None:
+    """Each function's trust (scripts/trust.py, step I7), without CodeQL: `trust.py run` adds it later."""
+    try:
+        import trust
+
+        trust.annotate_model(model, threat_model)
+    except Exception as exc:  # noqa: BLE001 - the inventory stands without the trust annotation
+        model["warnings"].append(f"trust: not annotated ({type(exc).__name__}: {exc})")
 
 
 def _default_jobs() -> int:
@@ -933,6 +953,7 @@ def main(argv: list[str] | None = None) -> int:
         default=ALIAS_DEFAULT,
         help="Narrow indirect sites' type match with Frama-C's Alias plugin (default: %(default)s)",
     )
+    r.add_argument("--threat-model", type=Path, default=None, help="THREAT_MODEL.md (default: trust.py's search order)")
     sub.add_parser("selftest", help="Check the dump module against this kernel")
     a = p.parse_args(argv)
     if a.cmd == "selftest":
@@ -940,6 +961,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2))
         return 0 if res["ok"] else 1
     model, rc = build_model(a.capture, a.out, a.jobs, broker=not a.no_broker, alias=a.alias)
+    if model.get("status") == "ok":
+        annotate_trust(model, a.threat_model)
     problems = validate_model(model)
     if problems:
         model["warnings"].append(f"schema: {problems[:5]}")

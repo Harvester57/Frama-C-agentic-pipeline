@@ -49,5 +49,24 @@
     "src/csvcut.c#main"
   ],
   "thread_entries": [],
-  "notes": "The library's public header is src/csv.h (every function it declares is API). src/ contains two `main` definitions belonging to different executables; they must not collide. extra/quote.c is a library object, not a separate module; csv_unquote is called from src/field.c."
+  "notes": "The library's public header is src/csv.h (every function it declares is API). src/ contains two `main` definitions belonging to different executables; they must not collide. extra/quote.c is a library object, not a separate module; csv_unquote is called from src/field.c.",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "extra/quote.c#csv_needs_quote": ["default", "call_graph"],
+      "extra/quote.c#csv_quote": ["default", "call_graph"],
+      "extra/quote.c#csv_unquote": ["default", "call_graph"],
+      "src/csv.c#csv_init": ["default", "call_graph"],
+      "src/csv.c#csv_next_field": ["default", "call_graph"],
+      "src/csvcut.c#emit_row": ["call_graph"],
+      "src/csvcut.c#main": ["call_graph"],
+      "src/csvcut.c#parse_cols": ["call_graph"],
+      "src/csvstat.c#main": ["call_graph"],
+      "src/csvstat.c#report": ["call_graph"],
+      "src/field.c#csv_field_copy": ["default", "call_graph"],
+      "src/field.c#csv_field_to_long": ["default", "call_graph"]
+    },
+    "boundary": ["extra/quote.c#csv_needs_quote", "extra/quote.c#csv_quote", "extra/quote.c#csv_unquote", "src/csv.c#csv_init", "src/csv.c#csv_next_field", "src/csvcut.c#main", "src/csvstat.c#main", "src/field.c#csv_field_copy", "src/field.c#csv_field_to_long"],
+    "trusted": []
+  }
 }

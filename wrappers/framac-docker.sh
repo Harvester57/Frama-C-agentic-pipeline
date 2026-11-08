@@ -3,7 +3,7 @@
 #
 #   framac-docker.sh [--target DIR] (--run-dir DIR | --new-run) [--repo NAME]
 #                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
-#                    [--build-image] [--scratch] [--remove-scratch]
+#                    [--build-image | --codeql] [--scratch] [--remove-scratch]
 #                    [--allow-run-dir-in-target] [--engine docker|podman|auto]
 #                    [--class CLASS] [--no-broker] [--cpus N] [--memory SIZE] [--pids-limit N]
 #                    [--cache-dir DIR|off] [--cache-rw] [--script-file FILE] -- <command...>
@@ -15,6 +15,11 @@
 # the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written by the
 # build capture), so --target-packages only derives the build image. FRAMAC_DOCKER_IMAGE=framac-pipeline:latest
 # selects the monolith, which --target-packages still derives as framac-pipeline:<repo>.
+# --codeql runs the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py, plan step
+# I7): framac-codeql:latest (Dockerfile.codeql: the build image plus the pinned CodeQL CLI). With
+# --target-packages, framac-build:<repo> is derived first, then framac-codeql:<repo> from it, copying
+# /opt/codeql out of framac-codeql:latest (wrappers/codeql-derived.Dockerfile, no download); it carries both
+# base image ids as labels and is rebuilt when either changes. Local only: never push or share it.
 # --scratch creates (once) and mounts the run's named volume framac-scratch-<repo>-<run id>-<hash of
 # the run dir> at /framac-scratch (the build capture's scratch tree); --remove-scratch removes it and exits.
 #
@@ -52,6 +57,7 @@ PIPELINE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-$(pwd)}"
 IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-analysis:latest}"
 BUILD_IMAGE=0
+CODEQL=0
 SCRATCH=0
 REMOVE_SCRATCH=0
 ENGINE_PREF="${FRAMAC_CONTAINER_ENGINE:-auto}"
@@ -81,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --target-packages) TARGET_PACKAGES="$2"; shift 2 ;;
         --build-if-missing) BUILD=1; shift ;;
         --build-image) BUILD_IMAGE=1; shift ;;
+        --codeql) CODEQL=1; shift ;;
         --scratch) SCRATCH=1; shift ;;
         --remove-scratch) REMOVE_SCRATCH=1; shift ;;
         --agents) AGENTS="$2"; shift 2 ;;
@@ -103,7 +110,7 @@ while [[ $# -gt 0 ]]; do
         -*)
             echo "[framac-docker] ERROR: unknown wrapper option '$1'." \
                  "Valid options: --target, --run-dir, --new-run, --repo, --target-packages, --build-if-missing," \
-                 "--build-image, --scratch, --remove-scratch, --allow-run-dir-in-target, --engine, --class, --no-broker, --cpus, --memory, --pids-limit," \
+                 "--build-image, --codeql, --scratch, --remove-scratch, --allow-run-dir-in-target, --engine, --class, --no-broker, --cpus, --memory, --pids-limit," \
                  "--cache-dir, --cache-rw, --script-file, -- <command...>" >&2
             exit 2 ;;
         *) break ;;
@@ -248,7 +255,14 @@ fi
 # Build steps (--build-image) run in the build image (Dockerfile stage framac-build); everything else in the
 # analysis image (stage framac-analysis). An explicit FRAMAC_DOCKER_IMAGE is built from the last stage, the monolith.
 IMAGE_TARGET=()
-if [[ ${BUILD_IMAGE} -eq 1 ]]; then
+if [[ ${BUILD_IMAGE} -eq 1 && ${CODEQL} -eq 1 ]]; then
+    echo "[framac-docker] use either --build-image or --codeql" >&2; exit 2
+fi
+if [[ ${CODEQL} -eq 1 ]]; then
+    # The CodeQL image extends the build image: the build image (or its derived image) is resolved first.
+    IMAGE="framac-build:latest"
+    IMAGE_TARGET=(--target framac-build)
+elif [[ ${BUILD_IMAGE} -eq 1 ]]; then
     IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-build:latest}"
     IMAGE_TARGET=(--target framac-build)
 elif [[ -z "${FRAMAC_DOCKER_IMAGE:-}" ]]; then
@@ -269,11 +283,38 @@ fi
 
 if [[ -n "${TARGET_PACKAGES}" ]]; then
     DERIVED_IMAGE="framac-pipeline:${REPO}"
-    [[ ${BUILD_IMAGE} -eq 1 ]] && DERIVED_IMAGE="framac-build:${REPO}"
+    [[ ${BUILD_IMAGE} -eq 1 || ${CODEQL} -eq 1 ]] && DERIVED_IMAGE="framac-build:${REPO}"
     echo "[framac-docker] Building derived image ${DERIVED_IMAGE} with target packages: ${TARGET_PACKAGES}" >&2
     "${ENGINE}" build ${IMAGE_TARGET[@]+"${IMAGE_TARGET[@]}"} -t "${DERIVED_IMAGE}" \
         --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}" >&2
     IMAGE="${DERIVED_IMAGE}"
+fi
+
+if [[ ${CODEQL} -eq 1 ]]; then
+    CODEQL_SOURCE="framac-codeql:latest"
+    if [[ -z "$("${ENGINE}" images -q "${CODEQL_SOURCE}" 2>/dev/null)" ]]; then
+        if [[ ${BUILD} -ne 1 ]]; then
+            echo "[framac-docker] image ${CODEQL_SOURCE} not found (use --build-if-missing; it downloads the pinned CodeQL bundle)" >&2; exit 2
+        fi
+        echo "[framac-docker] Building ${CODEQL_SOURCE} from Dockerfile.codeql" >&2
+        "${ENGINE}" build -f "${PIPELINE_ROOT}/Dockerfile.codeql" -t "${CODEQL_SOURCE}" "${PIPELINE_ROOT}" >&2
+    fi
+    if [[ "${IMAGE}" != "framac-build:latest" ]]; then
+        # A target with packages: framac-codeql:<repo> = its derived build image + /opt/codeql of framac-codeql:latest.
+        CODEQL_IMAGE="framac-codeql:${REPO}"
+        BASE_ID="$("${ENGINE}" image inspect -f '{{.Id}}' "${IMAGE}")"
+        SOURCE_ID="$("${ENGINE}" image inspect -f '{{.Id}}' "${CODEQL_SOURCE}")"
+        LABELS="$("${ENGINE}" image inspect -f '{{index .Config.Labels "framac.codeql.base"}} {{index .Config.Labels "framac.codeql.source"}}' "${CODEQL_IMAGE}" 2>/dev/null || true)"
+        if [[ "${LABELS}" != "${BASE_ID} ${SOURCE_ID}" ]]; then
+            echo "[framac-docker] Building ${CODEQL_IMAGE} from ${IMAGE} and ${CODEQL_SOURCE} (local only, never pushed)" >&2
+            "${ENGINE}" build -t "${CODEQL_IMAGE}" --build-arg "BUILD_IMAGE=${IMAGE}" --build-arg "CODEQL_IMAGE=${CODEQL_SOURCE}" \
+                --label "framac.codeql.base=${BASE_ID}" --label "framac.codeql.source=${SOURCE_ID}" \
+                - < "${PIPELINE_ROOT}/wrappers/codeql-derived.Dockerfile" >&2
+        fi
+        IMAGE="${CODEQL_IMAGE}"
+    else
+        IMAGE="${CODEQL_SOURCE}"
+    fi
 fi
 
 if [[ ${SCRATCH} -eq 1 ]]; then

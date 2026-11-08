@@ -1,0 +1,5 @@
+name: framac/trust
+version: 0.0.1
+# Resolved from the CodeQL bundle's own packs: no download (the container has no network).
+dependencies:
+  codeql/cpp-all: "*"

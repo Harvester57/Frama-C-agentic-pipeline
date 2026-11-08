@@ -37,7 +37,7 @@ Defaults taken where nothing was asked (open to change):
 - **Header `static inline` functions** get a ledger unit only when reached from an entry point.
 - **Test executables** are units marked `test`. They get no harness and no ledger unit.
 - **Libraries compiled straight into an executable:** the globals declared in project headers are their API.
-- **Unit split threshold:** calibrated on the benchmark. The starting guess is 150 functions or 5k lines.
+- **Unit split threshold:** calibrated on the benchmark. The starting guess was 150 functions or 5k lines; I8 calibrated it to 400 reached functions or 15k lines.
 - **Fuzz budget** scales with the number of harness cases, up to a cap per unit set by the profile.
 
 ## Rules for every step
@@ -374,8 +374,8 @@ I0 ─┬─▶ I1 ────────────────────�
 | I5a | M | done |
 | I5b | L | done |
 | I6 | L | done |
-| I7 | M | not started |
-| I8 | M | not started |
+| I7 | M | done |
+| I8 | M | done |
 | I9 | L | not started |
 | I10 | M | not started |
 
@@ -469,6 +469,97 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I7 (2026-11-08)
+
+- **Threat model:**
+  - **Format:** the fenced `framac-threat-model` JSON block of THREAT_MODEL.md, validated against `schemas/threat_model.schema.json`.
+  - **Fields:** `input_sources` (role `entry` or `reader`), `trusted_callers` (a unit's API with `except`, or named functions, with a reason), `secrets`, `auth_gates` and `output_sinks`.
+  - **Lookup order:** `--threat-model`, then `workspace/THREAT_MODEL.md` (the benchmark copies its asset there), then the target's own file.
+  - **Missing or invalid:** a missing block records `no_threat_model` on every unit, and an invalid one records `invalid_threat_model` with its errors.
+  - **Checking:** `trust.py check-threat-model` validates the block, and checks its references against the model.
+- **Rules** (`scripts/trust.py`, run by `phase0_model.py` before validation):
+  - **Library API:** the library API, and an executable's `embedded_api`, are untrusted (`default`, boundary).
+  - **Input readers:** a function calling an input reader is an input root. The model now records each function's unresolved callees under `external_calls`, which is how these callers are found. Further roots are `main` with parameters (a boundary) and the threat model's input sources. Everything they reach is untrusted (`call_graph`).
+  - **Trusted callers:** `trusted_callers` wins over the other rules and keeps the rules it overrode under `overridden`.
+  - **Output:** each function's `trust` holds `value`, `source`, `sources`, `boundary` and `reasons`. Each unit gets counts, and the model gets a top-level `trust` block. The DAG copies all three, and its modules gain `entry_trust`.
+- **CodeQL (optional):**
+  - **Opt-in:** `run_metadata.py set-codeql --enable --open-source` turns it on, and enabling without `--open-source` is refused.
+  - **Facts:** `codeql_trust.py run` replays the recipe under the tracer in `run_sandboxed`, then runs `templates/codeql/trust/untrusted_functions.ql` (IR taint tracking from `FlowSource` to any parameter, plus the functions holding a source). It writes `workspace/reports/codeql_trust.json`.
+  - **Effect:** `trust.py run` merges the facts as `codeql` marks. They only add marks.
+  - **Image:** the wrappers' `-CodeQL` / `--codeql` derive `framac-codeql:<repo>` from `framac-build:<repo>` plus `/opt/codeql` of `framac-codeql:latest` (`wrappers/codeql-derived.Dockerfile`, no download). The image is labelled with both base ids, rebuilt when either changes, and never pushed.
+  - **Offline:** pack resolution works offline.
+- **Consumers:**
+  - **Harness sidecar:** `reachability` comes from trust (`untrusted_surface` at a boundary, else `internal_api`), and `reachability_source` records `trust:<rule>`. The old entry-style default applies only without trust.
+  - **Contract check:** `acsl_ast.is_trust_boundary` feeds the merge's trust-boundary check, which now also covers a boundary function that no harness enters through, and `prepare_agent`'s reachability.
+  - **Report:** section 1 gains a "Trust boundary" table with the source per entry point.
+- **Threat models:**
+  - **minmea:** parsers, checks and `minmea_to*` as entries.
+  - **qcbor-dev:** decode entries, the IEEE754 NaN helpers as trusted callers, and `QCBOREncode_Finish` as a sink. It is not attached to qcbor-master, which lacks 4 of the names.
+  - **x509-parser:** the 4 `parse_x509_*` functions as entries, `mmap` as a reader, and the rest of both libraries' API as trusted callers.
+  - **Manifest:** the manifest pins each file's sha256.
+  - **Harness digest:** the threat models are not part of `harness_digest`.
+- **Acceptance:**
+  - **Fixtures:** all 16 fixtures (9 reproducers, 7 seeded) carry a `trust` truth field, and capture + model match it exactly: untrusted set, sources and boundary (`FRAMAC_DOCKER_TESTS=1 pytest tests/test_trust.py -m integration`).
+  - **CodeQL off:** the model's trust is identical to a run without the CodeQL facts file.
+  - **CodeQL on, minmea** (runs `i7-minmea-off` and `i7-minmea-codeql`):
+    - CodeQL 2.27.3 ran in 77 s and produced 20 rows.
+    - The facts cover 12 of the 23 functions. None of these functions is decided by `codeql`, because all 23 were already untrusted.
+    - No function changed value or boundary, and no source was lost.
+    - The 2 unmatched facts are CMake's compiler-id `main`s.
+- **Left:**
+  - **Pre-I7 models:** recorded models from before this step lack `external_calls`, so readers are not seen and a warning says so.
+  - **Header inline functions:** a public header's `static inline` functions are API only when the threat model lists them.
+  - **CodeQL noise:** CodeQL facts outside the model (CMake probes) are counted as unmatched, not filtered.
+  - **`known-first-party`:** `trust` and `codeql_trust` were not added to it (I6 edits `pyproject.toml`).
+
+### I8 (2026-11-08)
+
+- **Tiers** (`scripts/tiers.py`, applied by `build_callgraph_dag.py` to the unit view):
+  - **Untrusted path:** a function that is untrusted, overridden by `trusted_callers`, or reached from an untrusted function.
+  - **Rule order:** no untrusted path → Tier 3 (with a reason for an unreached header function); heap or recursive → Tier 2; scalar helper → Tier 3; writes a bounded buffer while formatting or without taking one → Tier 1B; otherwise Tier 1A.
+  - **Scalar helper:** no loops, no pointer parameters or result, no casts to pointers, no indirect calls, not variadic, no allocation, not recursive, cyclomatic ≤ 2, and not a boundary function that takes parameters. So an API getter without parameters is Tier 3, as the lexer had it.
+  - **Records:** each function gets `tier`, `tier_reasons`, `untrusted_path` and `lexer_tier`. Units, lexer sub-modules and clusters take the highest tier, and the DAG gets a `tiers` block of counts. Without trust the lexer tiers stay (`tiers.source: lexer`).
+  - **Profiles:** Tier 3 is deferred under quick. `pipeline_make` excludes the module with a reason, `expected()` skips it, the ledger defers it, and the benchmark does not count its missing Eva report as a problem. Outside quick, Tier 3 keeps RTE and defers Layers 2-6. `benchmark.py run --profile` overrides the manifest's profile.
+- **Unit split** (`scripts/unit_split.py`):
+  - **Size:** the functions and lines that a link unit's entry points reach.
+  - **Clusters:** each entry point's reach set starts a cluster. The most-overlapping pair above 50% is merged until none is left, then clusters under 10 functions are packed together.
+  - **Sub-modules:** clusters become DAG `submodules` (`kind: cluster`, anchors, functions, tier, run flags). `ModuleMap` resolves them for scope, tier and run flags, and the seeded dispatch policy writes one harness per cluster. Pinned harnesses are unaffected.
+  - **CLI:** `--split-max-functions` and `--split-max-lines` on `build_callgraph_dag.py`, and `unit_split.py show`.
+- **Calibration:**
+  - **Pinned harnesses:** Eva's worst is 205 s for QCBOR's spiffy decode (102 functions). x509 analyses 209 functions in 73 s.
+  - **CryptoLib, mechanical dispatch harness over the whole unit** (143 cases): it converges in 61 s. Forcing a split at 150 functions gives 5 clusters, each converging in 15–45 s, but the Eva stage wall time rises from 94 s to 272 s.
+  - **QCBOR:** the mechanical harness is uninformative (7.5 s whole).
+  - **Limits:** 400 reached functions or 15k lines. No benchmark unit splits at these limits (QCBOR-dev 373 / 9.6k, CryptoLib 231 / 12.7k), because Eva converges on every unit whole.
+- **Tier counts** (1A/1B/2/3, i8 DAGs):
+
+  | Target | 1A | 1B | 2 | 3 |
+  | :--- | ---: | ---: | ---: | ---: |
+  | minmea | 23 | 0 | 0 | 0 |
+  | qcbor-dev | 342 | 8 | 4 | 401 |
+  | qcbor-master | 269 | 2 | 3 | 288 |
+  | cryptolib | 141 | 38 | 18 | 35 |
+  | x509 | 204 | 3 | 0 | 5 |
+  | jsmn | 6 | 0 | 0 | 0 |
+  | semver | 28 | 2 | 3 | 0 |
+  | stmr | 12 | 1 | 1 | 1 |
+  | qlz | 15 | 1 | 4 | 2 |
+  | tweetnacl | 48 | 3 | 0 | 13 |
+
+  - **What Tier 3 holds:** QCBOR's Tier 3 is mostly unreached header inline functions (382 and 274), plus scalar helpers. CryptoLib's is interface getters, init, shutdown and config functions without parameters, the unit-test inits and `mc_log`. TweetNaCl's is `main`, `hexdump` and the SHA scalar helpers.
+  - **Known bugs and pinned harnesses:** every known-bug function is Tier 1A, and so is every pinned harness module except CryptoLib's `mc`. `mc` is Tier 3 as before, so it was already not fuzzed; under quick it is now deferred. No recall harness lost fuzzing.
+- **Runs** (quick against standard):
+  - **CryptoLib:** 578 s against 861 s wall (Eva stage 70 s against 252 s). CRYPTOLIB-01 is undecided in both, as in i5b1, because E-ACSL falls back (see Left).
+  - **minmea:** quick retains 3/3.
+  - **QCBOR:** quick retains all decided entries, with no problems: qcbor-dev 3/3 (QCBOR-01 to 03) and qcbor-master 2/2. Against the pre-I8 standard runs (i5b1): qcbor-dev takes 2232 s CPU against 2619 s, but 1010 s wall against 895 s, because replay and queue ran under concurrent benchmark load. qcbor-master is unchanged at 266 s / 282 s, since its harness modules are all Tier 1. Across the runs, recall is 6/7 retained, and CRYPTOLIB-01 is undecided as it was before I8.
+  - **`qcbor_err_to_str`:** it is now Tier 1A (an API function with a parameter), so the reach gate asks for it. It is exempt in the manifest for both QCBOR targets, outside `harness_digest`.
+- **Left:**
+  - **CryptoLib E-ACSL:** the link-unit build loses the quoting of `-DMC_LOG_PATH="log.txt"` through E-ACSL, so fuzzing falls back. This is the same in i5b1 (I5b or I6 area).
+  - **Header inline API:** a public header's inline functions count as having no untrusted path unless the threat model lists them (the I7 gap).
+  - **Seeded set:** not run with I8. Its API functions take parameters, so they stay Tier 1 and fuzzed.
+  - **Mechanical dispatch:** cases with undeclared callees or gcrypt types break the harness parse. The calibration filtered them in a scratch driver only.
+  - **Baseline:** not re-recorded, since no all-target run was made.
+  - **Branch:** carries cherry-picks of I5b fixes (`9632a0a`, `1af992e`, `9cad8d7`) that are also on phase0-redesign.
 
 ### I6 (2026-11-08)
 

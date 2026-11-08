@@ -39,5 +39,22 @@
   },
   "entry_points": ["src/decode.c#frame_decode", "src/checksum.c#frame_checksum", "tools/framecat.c#main"],
   "thread_entries": [],
-  "notes": "frame_checksum (checksum.c) and plat_read_file (platform.c) each have a second, NOT compiled definition in the other #if branch; the compiled bodies call crc32_init and posix_read_all, never adler32/win_read_all. check_ext_flags is compiled only because the Makefile passes -DPROTO_VERSION=2 (the header default is 1). frame_decompress is declared in include/frame.h only under WITH_COMPRESSION, so it is not an entry point. src/platform.c is linked directly into the framecat executable, not into the library; plat_read_file is not public API."
+  "notes": "frame_checksum (checksum.c) and plat_read_file (platform.c) each have a second, NOT compiled definition in the other #if branch; the compiled bodies call crc32_init and posix_read_all, never adler32/win_read_all. check_ext_flags is compiled only because the Makefile passes -DPROTO_VERSION=2 (the header default is 1). frame_decompress is declared in include/frame.h only under WITH_COMPRESSION, so it is not an entry point. src/platform.c is linked directly into the framecat executable, not into the library; plat_read_file is not public API.",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "src/checksum.c#crc32_init": ["call_graph"],
+      "src/checksum.c#frame_checksum": ["default", "call_graph"],
+      "src/decode.c#check_ext_flags": ["call_graph"],
+      "src/decode.c#frame_decode": ["default", "call_graph"],
+      "src/decode.c#rd16": ["call_graph"],
+      "src/decode.c#rd32": ["call_graph"],
+      "src/platform.c#plat_read_file": ["default", "call_graph"],
+      "src/platform.c#posix_read_all": ["call_graph"],
+      "tools/framecat.c#main": ["call_graph"],
+      "tools/framecat.c#type_name": ["call_graph"]
+    },
+    "boundary": ["src/checksum.c#frame_checksum", "src/decode.c#frame_decode", "src/platform.c#plat_read_file", "tools/framecat.c#main"],
+    "trusted": []
+  }
 }

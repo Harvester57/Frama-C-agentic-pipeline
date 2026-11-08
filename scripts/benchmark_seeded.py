@@ -29,9 +29,11 @@ Harness policy (deterministic; a function of the DAG and the overlay's sources o
   - one harness module per DAG module (a link unit with the model, a lexer module without it), named as
     the module: a `dispatch` harness with one case per callable entry point (the module's
     `candidate_entry_points`, minus `main` and static functions), at most MAX_CASES cases;
-  - when a link unit has more than MAX_CASES callable entry points, it is split into sub-modules, one per
-    lexer module holding some of them (named as that lexer module, `--unit` the unit), each with its own
-    entry points (still at most MAX_CASES; the rest are recorded as excluded);
+  - a link unit the DAG split (step I8, scripts/unit_split.py) gets one sub-module per cluster (named as
+    the cluster, `--unit` the unit), each with the callable entry points the cluster is anchored on;
+  - otherwise, when a link unit has more than MAX_CASES callable entry points, it is split into
+    sub-modules, one per lexer module holding some of them (named as that lexer module, `--unit` the
+    unit), each with its own entry points (still at most MAX_CASES; the rest are recorded as excluded);
   - every harness compiles the unit's `required_sources` (C files only, minus the files defining `main`)
     with the unit's DAG `cppflags` (paths moved under workspace/work/);
   - each case's arguments come from the function's prototype (its declaring header in the overlay, else
@@ -175,7 +177,15 @@ def plan_harnesses(dag: dict, max_cases: int = MAX_CASES) -> dict[str, dict]:
             else:
                 callable_keys.append(key)
         groups: dict[str, list[str]] = {unit: callable_keys}
-        if link_units and len(callable_keys) > max_cases:
+        clusters = {
+            n: c
+            for n, c in (dag.get("submodules") or {}).items()
+            if isinstance(c, dict) and c.get("unit") == unit and link_units
+        }
+        by_cluster = {n: [k for k in c.get("anchors") or [] if k in callable_keys] for n, c in clusters.items()}
+        if any(by_cluster.values()):
+            groups = {n: keys for n, keys in by_cluster.items() if keys}
+        elif link_units and len(callable_keys) > max_cases:
             groups = {}
             for key in callable_keys:
                 lexer = str((fns.get(key) or {}).get("lexer_module") or "")
@@ -192,8 +202,14 @@ def plan_harnesses(dag: dict, max_cases: int = MAX_CASES) -> dict[str, dict]:
             own_excluded = dict(excluded) if module == unit else {}
             for key in keys[max_cases:]:
                 own_excluded[key] = f"beyond the policy's {max_cases}-case limit"
+            cluster_rec = clusters.get(module)
             plans[module] = {
                 **base,
+                **(
+                    {"run_flags": {k: bool(cluster_rec.get(k)) for k in ("run_eva", "run_eacsl_fuzz")}}
+                    if cluster_rec
+                    else {}
+                ),
                 "submodule": module != unit,
                 "entries": keys[:max_cases],
                 "excluded": own_excluded,

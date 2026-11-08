@@ -139,6 +139,13 @@ def validate_manifest(manifest: dict, assets_dir: Path = ASSETS_DIR) -> list[str
         for asset in target.get("assets", []):
             if not (assets_dir / asset["path"]).is_file():
                 problems.append(f"{tid}: missing asset {asset['path']}")
+        tm = target.get("threat_model")
+        if tm is not None:
+            tm_path = assets_dir / str(tm.get("path"))
+            if not tm_path.is_file():
+                problems.append(f"{tid}: missing threat model {tm.get('path')}")
+            elif sha256_hex(tm_path.read_bytes()) != tm.get("sha256"):
+                problems.append(f"{tid}: threat model {tm.get('path')} does not match its sha256")
     seen: set[str] = set()
     for bug in manifest.get("bugs", []):
         bid = bug["id"]
@@ -634,6 +641,23 @@ def modules_without_harness(ledger: list[dict], target: dict, dag: dict | None =
     return sorted(active - harnessed)
 
 
+def _profile_deferred_modules(run_dir: Path, names: list[str]) -> dict[str, str]:
+    """Harness modules the run's profile defers by tier (step I8: Tier 3 under quick), with the reason."""
+    from module_map import ModuleMap
+    from tiers import is_deferred
+
+    profile = (read_json(run_dir / "run-metadata.json", {}) or {}).get("profile")
+    if not profile:
+        return {}
+    mm = ModuleMap.load(run_dir)
+    out: dict[str, str] = {}
+    for name in names:
+        tier = mm.tier_of(name) or ""
+        if is_deferred(tier, profile):
+            out[name] = f"{tier.split(' (')[0]} deferred under the {profile} profile"
+    return out
+
+
 def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] | None = None) -> dict:
     """Everything the run file records about one target, read back from its run directory."""
     ledger = read_json(run_dir / "coverage-ledger.json", []) or []
@@ -644,6 +668,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
     modules: dict[str, dict] = {}
     with_unknown: set[str] = set()
     problems = list(phase_notes or [])
+    deferred = _profile_deferred_modules(run_dir, [m["name"] for m in target["modules"]])
     for module in target["modules"]:
         name = module["name"]
         eva_report = read_json(run_dir / "workspace" / "reports" / "eva" / f"{name}.json")
@@ -655,7 +680,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
             with_unknown.update(eva_block.get("functions_with_unknown") or [])
             if eva_block["status"] != "ok":
                 problems.append(f"eva {name}: {eva_block['status']}")
-        else:
+        elif name not in deferred:
             problems.append(f"eva {name}: no report")
         entry: dict = {
             "eva": eva_block,
@@ -666,6 +691,8 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
             entry["build"]["wall_s"] = build_wall[name]
         if entry["fuzz"] and name in fuzz_wall:
             entry["fuzz"]["wall_s"] = fuzz_wall[name]
+        if name in deferred:
+            entry["deferred"] = deferred[name]
         modules[name] = entry
     dag = read_json(run_dir / "workspace" / "reports" / "callgraph_dag.json", {}) or {}
     return {
@@ -1054,6 +1081,12 @@ def summarize_model(model: dict | None) -> dict:
         indirect_edges=edges.get("indirect", 0),
         macro_aliases=len(model.get("macro_aliases") or {}),
         thread_entries=len(model.get("thread_entries") or []),
+        # Step I7: the threat model and CodeQL the trust annotation used, and its counts per rule.
+        trust={
+            "threat_model": ((model.get("trust") or {}).get("threat_model") or {}).get("status"),
+            "codeql": ((model.get("trust") or {}).get("codeql") or {}).get("status"),
+            "by_source": ((model.get("trust") or {}).get("summary") or {}).get("by_source"),
+        },
         parse_s=round(sum(j.get("seconds") or 0 for j in model.get("parse_jobs") or []), 2),
         seconds=model.get("seconds"),
     )
@@ -1101,6 +1134,11 @@ def run_target(
         return info["rc"] == 0
 
     py = f"python3 {CONTAINER_SCRIPTS}"
+    # A target's threat model (step I7) is supplied with the run, where trust.py looks first; it is
+    # not part of harness_digest, as it changes no harness and no count the baselines compare.
+    if target.get("threat_model"):
+        (run_dir / "workspace").mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ASSETS_DIR / target["threat_model"]["path"], run_dir / "workspace" / "THREAT_MODEL.md")
     # The capture comes first: it writes the snapshot every later Frama-C and compiler step reads.
     capture = run_capture(spec, mount, run_dir, repo, packages, stages)
     if capture["status"] != "ok":
@@ -1858,6 +1896,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     problems = validate_manifest(manifest)
     if problems:
         raise BenchmarkError("manifest problems: " + "; ".join(problems))
+    if getattr(args, "profile", None):
+        # The run's profile (run-metadata.json); it is part of harness_digest, so compare flags it.
+        manifest = {**manifest, "profile": args.profile}
     work_dir = Path(args.work_dir).resolve()
     targets = select_targets(manifest, args.set or ["all"], args.target or [])
     run_id = args.run_id or new_run_id()
@@ -1888,6 +1929,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "targets": sorted(results),
         "targets_not_run": not_run,
         "fuzz": not args.no_fuzz,
+        "profile": manifest.get("profile", "standard"),
         "left_out": manifest.get("left_out") or {},
     }
     run = build_run_file(manifest, run_id, results, selection, limits, work_dir)
@@ -2041,6 +2083,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--eva-timeout", type=int, default=None, help="Eva wall-clock seconds per module (default: the manifest's)"
+    )
+    p_run.add_argument(
+        "--profile",
+        choices=["quick", "standard", "deep"],
+        default=None,
+        help="Pipeline profile of the runs (default: the manifest's); quick defers Tier 3 modules",
     )
     p_run.add_argument(
         "--compare", default=None, help="Baseline name or file; print the differences and exit 1 on a regression"

@@ -19,5 +19,17 @@
     "src/sdf.c#sdf_checksum",
     "src/sdf.c#sdf_parse"
   ],
-  "lexer_expected": "Control case for step I6, not a lexer weakness: modules and entry points are right for both Phase 0s. The checksum is compared through an XOR with zero, so libFuzzer's compare tables cannot repair it, and a header with a valid checksum, version and extension count is out of reach of a short campaign from an empty corpus. The unit tests (tests/test_sdf.c, `./sdf_test`) parse sealed frames with short names: a seed recorded from them needs one length byte changed to reach the bug."
+  "lexer_expected": "Control case for step I6, not a lexer weakness: modules and entry points are right for both Phase 0s. The checksum is compared through an XOR with zero, so libFuzzer's compare tables cannot repair it, and a header with a valid checksum, version and extension count is out of reach of a short campaign from an empty corpus. The unit tests (tests/test_sdf.c, `./sdf_test`) parse sealed frames with short names: a seed recorded from them needs one length byte changed to reach the bug.",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone (the unit-test executable is test code), so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/sdf.c#sdf_checksum": [
+        "default"
+      ],
+      "src/sdf.c#sdf_parse": [
+        "default"
+      ]
+    },
+    "boundary": ["src/sdf.c#sdf_checksum", "src/sdf.c#sdf_parse"]
+  }
 }

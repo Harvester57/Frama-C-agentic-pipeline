@@ -101,7 +101,7 @@ Execute `skills/framac-slice/SKILL.md`:
 - It gates every harness on reachability (`harness_reach.py check`): each module's DAG entry points must be reached, or exempted with a recorded reason, before the ledger is seeded.
 - It requires every fuzzed module to build with E-ACSL (`pipeline_make.py build-check`), unless `--fuzz-engine sanitizers` was chosen for that module, so Phase 1 never falls back to ASan/UBSan silently.
 - Both gates are enforced, not just instructions. They record `workspace/reports/phase0_gates.json`, and the Make targets that consume harnesses check it first: `build-`, `fuzz-`, `coverage-` and `eva-` per module, and `wp-queue` for the whole run. Each stops with the reason instead of running on a failed or stale gate.
-- It ends with `ledger.py seed`, which creates one unit per function × obligation class. Tier 3 and out-of-scope work is seeded `deferred` / `out_of_scope` with reasons.
+- It ends with `ledger.py seed`, which creates one unit per function × obligation class. Out-of-scope work, Layers 2-6 of Tier 3 functions, and all Tier 3 work under `quick`, are seeded `out_of_scope` / `deferred` with reasons; under `quick` the Tier 3 modules are also left out of the Make phases.
 - Then `pipeline_make.py gen` writes the Makefile for the next phases.
 
 Checkpoint `phase_done = 0`.

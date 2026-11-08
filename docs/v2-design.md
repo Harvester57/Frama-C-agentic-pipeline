@@ -167,9 +167,9 @@ Implemented roles in [`../schemas/agent-result.schema.json`](../schemas/agent-re
 
 | Profile | Scope |
 |---|---|
-| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget, 600 s prover wall budget); WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
+| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget, 600 s prover wall budget); Tier 3 modules and units deferred (no fuzzing, Eva or WP; `scripts/tiers.py`); WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
 | `standard` | All phases on Tier 1A, 1B, and Tier 2 validators (120 CPU-s fuzz budget, 900 s prover wall budget); the parent re-verifies changed finding records before reporting. |
-| `deep` | Extended budgets (900 CPU-s fuzz budget, 1800 s prover wall budget, higher retry limit `K`); Tier 3 `rte` units scheduled instead of deferred. |
+| `deep` | Extended budgets (900 CPU-s fuzz budget, 1800 s prover wall budget, higher retry limit `K`). Tier 3 `rte` units are scheduled in `standard` and `deep`, deferred only in `quick` (step I8). |
 
 - Profiles change breadth, never the evidence bar.
 - **Budget** (optional, in agent invocations or wall-clock budgets via `FRAMAC_PROVER_WALL_BUDGET_S`) bounds prover/breaker execution. Exhaustion sets `run_status: incomplete` with a reason.

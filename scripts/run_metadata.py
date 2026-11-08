@@ -8,6 +8,7 @@ Creates and updates run-metadata.json (parent-only).
   set-build   --command CMD [--workdir DIR] [--package PKG]... [--env KEY=VALUE]...
               [--test-command CMD] [--install-command CMD] [--snapshot-extra PATH]...
               [--origin user|agent_confirmed|benchmark]
+  set-codeql  [--enable --open-source] [--declared-by user|benchmark] [--note TEXT]
   snapshot    [--run-dir DIR] [--out PATH]
   show
 
@@ -23,6 +24,10 @@ the Debian packages the derived build image needs, extra environment, the test c
 (seed harvesting) and, optionally, an install command ({destdir} is replaced by the
 staging directory) and extra snapshot paths. The user gives the recipe, or confirms
 one the agent proposed (`--origin agent_confirmed`). Setting it again replaces it.
+
+`set-codeql` turns the optional CodeQL trust facts (codeql_trust.py, plan step I7) on or off. They
+stay off unless the user declares the target open source (`--enable --open-source`), as CodeQL's
+licence requires.
 """
 
 from __future__ import annotations
@@ -460,6 +465,25 @@ def cmd_set_build(raw: dict) -> dict:
     return meta
 
 
+def cmd_set_codeql(enable: bool, open_source: bool, declared_by: str, note: str | None) -> dict:
+    """
+    Turn the optional CodeQL trust facts on or off for this run (plan step I7). CodeQL's licence
+    covers open-source code only, so enabling needs the user's declaration that the target is open
+    source; codeql_trust.py refuses to run without it.
+    """
+    if enable and not open_source:
+        raise ArtifactError("CodeQL needs --open-source: the user declares that the target is open source")
+    meta = load_json_strict(META)
+    block: dict = {"enabled": bool(enable), "open_source": bool(open_source), "declared_by": declared_by}
+    if note:
+        block["note"] = note
+    block["updated_at"] = utc_now()
+    meta["codeql"] = block
+    meta["updated_at"] = block["updated_at"]
+    write(meta)
+    return meta
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage run-metadata.json and run snapshot manifests.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -490,6 +514,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--install-command", default=None, help="install command; {destdir} is the staging dir")
     p.add_argument("--snapshot-extra", action="append", default=[], help="absolute path added to the snapshot")
     p.add_argument("--origin", choices=list(BUILD_ORIGINS), default="user")
+    p = sub.add_parser("set-codeql", help="Enable or disable the optional CodeQL trust facts (open-source targets)")
+    p.add_argument("--enable", action="store_true", help="run codeql_trust.py for this run (default: off)")
+    p.add_argument("--open-source", action="store_true", help="the user declares that the target is open source")
+    p.add_argument("--declared-by", choices=["user", "benchmark"], default="user")
+    p.add_argument("--note", default=None, help="e.g. the target's licence")
     p = sub.add_parser("snapshot", help="Write state/snapshot-manifest.json for the run directory")
     p.add_argument("--run-dir", type=Path, default=Path("."))
     p.add_argument("--out", type=Path, default=None)
@@ -516,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
                     "origin": args.origin,
                 }
             )
+        elif args.cmd == "set-codeql":
+            out = cmd_set_codeql(args.enable, args.open_source, args.declared_by, args.note)
         elif args.cmd == "snapshot":
             out = cmd_snapshot(args.run_dir, args.out)
         else:

@@ -28,5 +28,20 @@
   },
   "entry_points": ["src/lexer.c#kv_next", "src/emit.c#kv_emit", "tools/main.c#main"],
   "thread_entries": [],
-  "notes": "skip_ws in lexer.c and emit.c have different signatures/semantics; put exists in emit.c (static) and tools/main.c (static). A name-keyed extractor loses one of each pair and mis-resolves kv_emit->skip_ws or main->put."
+  "notes": "skip_ws in lexer.c and emit.c have different signatures/semantics; put exists in emit.c (static) and tools/main.c (static). A name-keyed extractor loses one of each pair and mis-resolves kv_emit->skip_ws or main->put.",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "src/emit.c#kv_emit": ["default", "call_graph"],
+      "src/emit.c#put": ["call_graph"],
+      "src/emit.c#skip_ws": ["call_graph"],
+      "src/lexer.c#is_key_char": ["call_graph"],
+      "src/lexer.c#kv_next": ["default", "call_graph"],
+      "src/lexer.c#skip_ws": ["call_graph"],
+      "tools/main.c#main": ["call_graph"],
+      "tools/main.c#put": ["call_graph"]
+    },
+    "boundary": ["src/emit.c#kv_emit", "src/lexer.c#kv_next", "tools/main.c#main"],
+    "trusted": []
+  }
 }

@@ -1,0 +1,90 @@
+{
+  "$comment": "The structured block of a target's THREAT_MODEL.md (plan step I7): a fenced code block whose info string is `framac-threat-model` (or `json framac-threat-model`) holding one JSON object. scripts/trust.py reads it. A function is named `name` or `file#name` (file relative to the target root); `unit` is a link unit of the build capture, by its full name or its file name (`build/libfoo.a` or `libfoo.a`). The four lists are required and may be empty: an empty list states that the target has none.",
+  "type": "object",
+  "definitions": {
+    "function_ref": {"type": "string", "pattern": "^(?:[A-Za-z0-9_./+-]+\\.[A-Za-z0-9]+#)?[A-Za-z_][A-Za-z0-9_]*$"},
+    "description": {"type": "string", "minLength": 1, "visibleContent": true}
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "target": {"type": "string", "minLength": 1},
+    "summary": {"$ref": "#/definitions/description"},
+    "input_sources": {
+      "$comment": "Where attacker-controlled data enters. role `entry`: the function's parameters (the ones in `params`, or all) carry attacker data, so it is an untrusted entry point. role `reader`: the function returns or fills attacker data for its caller, like read(2); its callers and everything they reach are on the input path. A reader may be an external function (not defined in the target).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "function": {"$ref": "#/definitions/function_ref"},
+          "role": {"type": "string", "enum": ["entry", "reader"]},
+          "params": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["function", "role", "description"],
+        "additionalProperties": false
+      }
+    },
+    "trusted_callers": {
+      "$comment": "Functions only trusted code calls: their preconditions may constrain values, and they are not untrusted entry points even when the library exports them. Either a `unit` (its API, minus `except`) or a list of `functions`.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "unit": {"type": "string", "minLength": 1},
+          "except": {"type": "array", "items": {"$ref": "#/definitions/function_ref"}},
+          "functions": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_ref"}},
+          "reason": {"$ref": "#/definitions/description"}
+        },
+        "required": ["reason"],
+        "additionalProperties": false
+      }
+    },
+    "secrets": {
+      "$comment": "Data that must not leak and must be wiped (security layer L6, step I9).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "kind": {"type": "string", "enum": ["global", "parameter", "field", "return"]},
+          "function": {"$ref": "#/definitions/function_ref"},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["name", "kind", "description"],
+        "additionalProperties": false
+      }
+    },
+    "auth_gates": {
+      "$comment": "Checks that must pass before privileged functions run (security layer L4, step I9).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "function": {"$ref": "#/definitions/function_ref"},
+          "state": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.>-]*$"},
+          "protects": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_ref"}},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["function", "protects", "description"],
+        "additionalProperties": false
+      }
+    },
+    "output_sinks": {
+      "$comment": "Where the target's output leaves it (security layer L5, step I9).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "function": {"$ref": "#/definitions/function_ref"},
+          "kind": {"type": "string", "enum": ["network", "file", "log", "terminal", "ipc", "buffer", "other"]},
+          "params": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["function", "kind", "description"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "input_sources", "secrets", "auth_gates", "output_sinks"],
+  "additionalProperties": false
+}

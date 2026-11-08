@@ -2163,6 +2163,39 @@ def _constrained_params(pred: str, attackers: frozenset[str], shape_names: froze
     return _value_refs(text, attackers, shape_names)
 
 
+def function_trust_records(workspace: Path | str) -> dict:
+    """
+    The run's function records carrying `trust` (scripts/trust.py, plan step I7): the DAG's
+    (`<workspace>/reports/callgraph_dag.json`), else the Phase 0 model's. Empty when neither has trust.
+    """
+    import json
+
+    reports = Path(workspace) / "reports"
+    for path in (reports / "callgraph_dag.json", reports / "phase0_model.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        records = data.get("functions") if isinstance(data, dict) else None
+        if isinstance(records, dict) and any(isinstance(r, dict) and "trust" in r for r in records.values()):
+            return records
+    return {}
+
+
+def is_trust_boundary(records: dict, function: str, file: str | None = None) -> bool | None:
+    """
+    Whether attacker data reaches `function`'s parameters directly (its trust is `untrusted` with
+    `boundary`): then its `requires` may state memory shape only (`entry_requires_violations`).
+    None when the run has no trust for it.
+    """
+    from trust import function_trust
+
+    trust = function_trust(records, function, file)
+    if trust is None:
+        return None
+    return trust.get("value") == "untrusted" and bool(trust.get("boundary"))
+
+
 def entry_requires_violations(
     contract_text: str,
     attacker_params: list[str] | set[str] | frozenset[str],

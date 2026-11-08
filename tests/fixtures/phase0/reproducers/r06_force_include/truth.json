@@ -27,5 +27,18 @@
   },
   "entry_points": ["src/tlv.c#tlv_walk", "src/version.c#tlv_version", "tools/tlvdump.c#main"],
   "thread_entries": [],
-  "notes": "config.h (project root) is only reachable via -include; without it src/tlv.c hits #error and src/version.c fails on TLV_VERSION_STRING. ENABLE_NESTED=1 makes walk_nested (and the walk_level<->walk_nested recursion) compiled; ENABLE_STRICT=0 excludes tag_known. tlvdefs.h is found only via -iquote src/internal; endian_compat.h only via -isystem vendor/include (it defines a macro, no functions)."
+  "notes": "config.h (project root) is only reachable via -include; without it src/tlv.c hits #error and src/version.c fails on TLV_VERSION_STRING. ENABLE_NESTED=1 makes walk_nested (and the walk_level<->walk_nested recursion) compiled; ENABLE_STRICT=0 excludes tag_known. tlvdefs.h is found only via -iquote src/internal; endian_compat.h only via -isystem vendor/include (it defines a macro, no functions).",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "src/tlv.c#read_header": ["call_graph"],
+      "src/tlv.c#tlv_walk": ["default", "call_graph"],
+      "src/tlv.c#walk_level": ["call_graph"],
+      "src/tlv.c#walk_nested": ["call_graph"],
+      "src/version.c#tlv_version": ["default", "call_graph"],
+      "tools/tlvdump.c#main": ["call_graph"]
+    },
+    "boundary": ["src/tlv.c#tlv_walk", "src/version.c#tlv_version", "tools/tlvdump.c#main"],
+    "trusted": []
+  }
 }

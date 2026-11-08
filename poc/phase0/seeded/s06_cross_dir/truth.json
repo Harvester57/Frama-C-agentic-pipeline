@@ -28,5 +28,14 @@
     "src/msg.c#msg_peer_ip",
     "src/msg.c#msg_b64"
   ],
-  "lexer_expected": "Control case. The lexer resolves the direct call parse_ip -> b64_decode, so module 'msg' has required_sources [compat/b64.c, src/msg.c] and S06-1 is reachable from msg_parse; module 'compat' also exposes b64_decode directly. It offers load_be32 as a 'compat' entry point, whose harness crashes at compat/b64.c:53 (false positive, verified)."
+  "lexer_expected": "Control case. The lexer resolves the direct call parse_ip -> b64_decode, so module 'msg' has required_sources [compat/b64.c, src/msg.c] and S06-1 is reachable from msg_parse; module 'compat' also exposes b64_decode directly. It offers load_be32 as a 'compat' entry point, whose harness crashes at compat/b64.c:53 (false positive, verified).",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/msg.c#msg_b64": ["default"],
+      "src/msg.c#msg_parse": ["default"],
+      "src/msg.c#msg_peer_ip": ["default"]
+    },
+    "boundary": ["src/msg.c#msg_b64", "src/msg.c#msg_parse", "src/msg.c#msg_peer_ip"]
+  }
 }

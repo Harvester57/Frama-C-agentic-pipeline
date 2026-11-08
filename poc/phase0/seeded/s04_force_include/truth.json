@@ -28,5 +28,14 @@
     "src/tlv.c#tlv_get_name",
     "src/tlv.c#tlv_get_id"
   ],
-  "lexer_expected": "The lexer keeps only -I/-D flags and never sees -include config.h (no source includes it), so module 'tlv' compiles with the header default TLV_NAME_BUF 128 and S04-1 cannot trigger (verified: the repro does not abort without -include config.h). It also offers be16_at and all_printable as entry points of module 'lib'; the be16_at harness crashes at lib/bytes.c:6 (false positive, verified)."
+  "lexer_expected": "The lexer keeps only -I/-D flags and never sees -include config.h (no source includes it), so module 'tlv' compiles with the header default TLV_NAME_BUF 128 and S04-1 cannot trigger (verified: the repro does not abort without -include config.h). It also offers be16_at and all_printable as entry points of module 'lib'; the be16_at harness crashes at lib/bytes.c:6 (false positive, verified).",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/tlv.c#tlv_get_id": ["default"],
+      "src/tlv.c#tlv_get_name": ["default"],
+      "src/tlv.c#tlv_parse": ["default"]
+    },
+    "boundary": ["src/tlv.c#tlv_get_id", "src/tlv.c#tlv_get_name", "src/tlv.c#tlv_parse"]
+  }
 }

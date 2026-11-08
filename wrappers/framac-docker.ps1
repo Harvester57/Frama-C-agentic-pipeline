@@ -73,6 +73,14 @@
     by the build capture), so -TargetPackages only derives the build image. -Image framac-pipeline:latest
     selects the monolith, which -TargetPackages still derives as framac-pipeline:<repo>.
 
+.PARAMETER CodeQL
+    Run the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py; docs/phase0-implementation-plan.md
+    step I7): framac-codeql:latest, the build image plus the pinned CodeQL CLI (Dockerfile.codeql). With -TargetPackages,
+    the derived build image framac-build:<repo> is built first, then framac-codeql:<repo> from it, copying /opt/codeql
+    out of framac-codeql:latest (no download: wrappers/codeql-derived.Dockerfile). The derived image is labelled with
+    both base image ids and rebuilt when either changes. It is a local image: never push or share it (CodeQL's
+    licence covers open-source code only).
+
 .PARAMETER Scratch
     Create (once) and mount the run's named volume framac-scratch-<repo>-<run id>-<hash of the run dir>
     at /framac-scratch: the build capture's scratch tree lives there, not on the host bind mount. Every container of the run started with -Scratch sees the same volume at the same path.
@@ -121,6 +129,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$BuildImage,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$CodeQL,
 
     [Parameter(Mandatory = $false)]
     [switch]$Scratch,
@@ -181,7 +192,7 @@ if ($Command -and $Command.Count -gt 0 -and $Command[0] -match '^-[A-Za-z]') {
     [Console]::Error.WriteLine(
         "[framac-docker] ERROR: unknown wrapper option '$($Command[0])'. " +
         "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
-        "-BuildImage, -Scratch, -RemoveScratch, " +
+        "-BuildImage, -CodeQL, -Scratch, -RemoveScratch, " +
         "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -ScriptFile, -Command."
     )
     exit 2
@@ -191,7 +202,7 @@ if (-not $RemoveScratch -and -not $ScriptFile -and (-not $Command -or $Command.C
     [Console]::Error.WriteLine(
         "[framac-docker] ERROR: either a command or -ScriptFile is required. " +
         "Valid options: -TargetDir, -RunDir, -NewRun, -RepoName, -Image, -TargetPackages, -BuildIfMissing, " +
-        "-BuildImage, -Scratch, -RemoveScratch, " +
+        "-BuildImage, -CodeQL, -Scratch, -RemoveScratch, " +
         "-Cpus, -Memory, -PidsLimit, -Class, -Engine, -NoBroker, -CacheDir, -CacheRw, -AllowRunDirInTarget, -ScriptFile, -Command."
     )
     exit 2
@@ -404,7 +415,14 @@ if ($RemoveScratch) {
 # analysis image (stage framac-analysis). An explicit -Image is built from the Dockerfile's last stage, the monolith.
 $imageTarget = @()
 $explicitImage = $PSBoundParameters.ContainsKey("Image")
-if ($BuildImage) {
+if ($CodeQL -and $BuildImage) { throw "Use either -CodeQL or -BuildImage, not both." }
+$codeqlBase = ""
+if ($CodeQL) {
+    # The CodeQL image extends the build image: the build image (or its derived image) is resolved first.
+    $codeqlBase = "framac-build:latest"
+    $Image = "framac-build:latest"
+    $imageTarget = @("--target", "framac-build")
+} elseif ($BuildImage) {
     if (-not $explicitImage) { $Image = "framac-build:latest" }
     $imageTarget = @("--target", "framac-build")
 } elseif (-not $explicitImage) {
@@ -424,14 +442,14 @@ if (-not $imageExists) {
     }
 }
 
-if ($TargetPackages -and -not $BuildImage -and -not $explicitImage) {
+if ($TargetPackages -and -not $BuildImage -and -not $CodeQL -and -not $explicitImage) {
     # The analysis image never gets target packages: the run's snapshot carries them.
     [Console]::Error.WriteLine("[framac-docker] -TargetPackages ignored: the analysis image reads the target's headers and libraries from the run's snapshot (pass them to the -BuildImage capture)")
     $TargetPackages = ""
 }
 if ($TargetPackages) {
     $DerivedImage = "framac-pipeline:$RepoName"
-    if ($BuildImage) { $DerivedImage = "framac-build:$RepoName" }
+    if ($BuildImage -or $CodeQL) { $DerivedImage = "framac-build:$RepoName" }
     [Console]::Error.WriteLine("[framac-docker] Building derived image $DerivedImage with target packages: $TargetPackages")
     & $EngineName build @imageTarget "-t" "$DerivedImage" "--build-arg" "TARGET_APT_PACKAGES=$TargetPackages" "$PipelineRoot" |
         ForEach-Object { [Console]::Error.WriteLine("$_") }
@@ -439,6 +457,37 @@ if ($TargetPackages) {
         throw "Failed to build derived image $DerivedImage"
     }
     $Image = $DerivedImage
+}
+
+if ($CodeQL) {
+    $codeqlBase = $Image
+    $codeqlSource = "framac-codeql:latest"
+    if (-not (& $EngineName images "-q" $codeqlSource 2>$null)) {
+        if (-not $BuildIfMissing) {
+            throw "Image '$codeqlSource' not found. Run with -BuildIfMissing (downloads the pinned CodeQL bundle) or execute: $EngineName build -f `"$PipelineRoot/Dockerfile.codeql`" -t $codeqlSource `"$PipelineRoot`""
+        }
+        [Console]::Error.WriteLine("[framac-docker] Building $codeqlSource from Dockerfile.codeql (downloads the pinned CodeQL bundle)")
+        & $EngineName build "-f" "$PipelineRoot/Dockerfile.codeql" "-t" $codeqlSource "$PipelineRoot" | ForEach-Object { [Console]::Error.WriteLine("$_") }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to build image $codeqlSource" }
+    }
+    if ($codeqlBase -ne "framac-build:latest") {
+        # A target with packages: framac-codeql:<repo> = its derived build image + /opt/codeql of framac-codeql:latest.
+        $codeqlImage = "framac-codeql:$RepoName"
+        $baseId = ([string](& $EngineName image inspect "-f" "{{.Id}}" $codeqlBase 2>$null | Select-Object -First 1)).Trim()
+        $sourceId = ([string](& $EngineName image inspect "-f" "{{.Id}}" $codeqlSource 2>$null | Select-Object -First 1)).Trim()
+        $labels = ""
+        try { $labels = ([string](& $EngineName image inspect "-f" "{{index .Config.Labels `"framac.codeql.base`"}} {{index .Config.Labels `"framac.codeql.source`"}}" $codeqlImage 2>$null | Select-Object -First 1)).Trim() } catch {}
+        if ($LASTEXITCODE -ne 0 -or $labels -ne "$baseId $sourceId") {
+            [Console]::Error.WriteLine("[framac-docker] Building $codeqlImage from $codeqlBase and $codeqlSource (local only, never pushed)")
+            $dockerfile = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot "codeql-derived.Dockerfile"))
+            $dockerfile | & $EngineName build "-t" $codeqlImage "--build-arg" "BUILD_IMAGE=$codeqlBase" "--build-arg" "CODEQL_IMAGE=$codeqlSource" `
+                "--label" "framac.codeql.base=$baseId" "--label" "framac.codeql.source=$sourceId" "-" | ForEach-Object { [Console]::Error.WriteLine("$_") }
+            if ($LASTEXITCODE -ne 0) { throw "Failed to build derived image $codeqlImage" }
+        }
+        $Image = $codeqlImage
+    } else {
+        $Image = $codeqlSource
+    }
 }
 
 if ($Scratch) {
