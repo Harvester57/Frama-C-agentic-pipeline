@@ -268,7 +268,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - `-TargetPackages` only derives the build image;
   - `-Scratch`, `-RemoveScratch` and `-CodeQL` were added.
 - **Benchmark:**
-  - baselines `phase0-i5a`, `phase0-i5b`, `phase0-i9`, `phase0-i10` (latest);
+  - baselines `phase0-i5a`, `phase0-i5b`, `phase0-i9`, `phase0-i10`, `phase0-r1` (latest, the validation run on the fixed tree: `docs/progress/validation-r1-2026-11-08.md`);
   - `benchmark.py seeded` runs the 8 seeded projects;
   - `harness_digest` leaves out the recipe, threat model, seeds and security props, so `compare` doesn't flag changes to those;
   - it still hashes the now-unused `compile_commands` asset, which was kept so digests don't change.
@@ -346,7 +346,7 @@ These are opportunities, not defects:
 6. **Security properties:** `security_props.json` must exist before `ledger.py seed`. Make's `seed` depends on `security-props`; a manual sequence must keep that order.
 7. **Images:** build and tests run in the build image, everything else in the analysis image. No `framac-pipeline:<tag>` image exists any more.
 8. **Benchmark:**
-   - compare against `phase0-i10`;
+   - compare against `phase0-r1`;
    - recall must not drop;
    - explain every unit-count change;
    - run `benchmark.py seeded` when you touch inventory, harnesses, ingest or gates.
