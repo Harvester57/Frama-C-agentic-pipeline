@@ -56,9 +56,9 @@ def load(path):
     return json.loads(open(path, encoding="utf-8").read())
 
 
-def seed(run_dir):
+def seed(run_dir, profile=None):
     write_json(run_dir / "workspace/reports/callgraph_dag.json", DAG)
-    return L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    return L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex", profile=profile)
 
 
 def units_by_id(run_dir):
@@ -73,10 +73,19 @@ def test_seed_policy(run_dir):
     assert units["src/snmp/ber.c#ber_decode_len::l2_termination"]["status"] == "planned"
     assert units["src/snmp/ber.c#ber_decode_len::l6_secret"]["inference_reason"] == "touches auth_key"
     assert "src/snmp/ber.c#ber_decode_tag::l2_termination" not in units
-    glue = units["src/glue/init.c#glue_init::rte"]
-    assert glue["status"] == "deferred" and glue["unresolved"][0].startswith("tier3_not_scheduled")
+    # Step I8: Tier 3 RTE is planned outside the quick profile (standard here).
+    assert units["src/glue/init.c#glue_init::rte"]["status"] == "planned"
     # Seeding again is idempotent.
     assert seed(run_dir)["added_units"] == 0
+
+
+def test_seed_quick_defers_tier3(run_dir):
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", DAG)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex", profile="quick")
+    units = units_by_id(run_dir)
+    glue = units["src/glue/init.c#glue_init::rte"]
+    assert glue["status"] == "deferred" and glue["unresolved"][0].startswith("tier3_not_scheduled")
+    assert units["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "planned"
 
 
 def test_seed_scope_marks_out_of_scope(run_dir):

@@ -1845,6 +1845,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     problems = validate_manifest(manifest)
     if problems:
         raise BenchmarkError("manifest problems: " + "; ".join(problems))
+    if getattr(args, "profile", None):
+        # The run's profile (run-metadata.json); it is part of harness_digest, so compare flags it.
+        manifest = {**manifest, "profile": args.profile}
     work_dir = Path(args.work_dir).resolve()
     targets = select_targets(manifest, args.set or ["all"], args.target or [])
     run_id = args.run_id or new_run_id()
@@ -1875,6 +1878,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "targets": sorted(results),
         "targets_not_run": not_run,
         "fuzz": not args.no_fuzz,
+        "profile": manifest.get("profile", "standard"),
         "left_out": manifest.get("left_out") or {},
     }
     run = build_run_file(manifest, run_id, results, selection, limits, work_dir)
@@ -2028,6 +2032,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--eva-timeout", type=int, default=None, help="Eva wall-clock seconds per module (default: the manifest's)"
+    )
+    p_run.add_argument(
+        "--profile",
+        choices=["quick", "standard", "deep"],
+        default=None,
+        help="Pipeline profile of the runs (default: the manifest's); quick defers Tier 3 modules",
     )
     p_run.add_argument(
         "--compare", default=None, help="Baseline name or file; print the differences and exit 1 on a regression"

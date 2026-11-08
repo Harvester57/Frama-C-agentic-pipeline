@@ -7,8 +7,11 @@ using deterministic C/ACSL tokenization.
 
 When the Phase 0 model exists (workspace/reports/phase0_model.json, scripts/phase0_model.py), the
 functions and the call edges are the model's: every function the build compiles outside its tests,
-under its real name, with Frama-C's direct and indirect edges and the build's macro aliases. Modules,
-tiers and the per-function analysis stay the lexer's (`model_view`). `--no-model` keeps the lexer's.
+under its real name, with Frama-C's direct and indirect edges and the build's macro aliases. Its
+modules are the build's link units (`unit_view`, step I5b), each function's tier comes from its trust
+and structure (scripts/tiers.py, step I8), and units too large for one Eva run are split into
+sub-modules (scripts/unit_split.py, step I8). The per-function analysis stays the lexer's.
+`--no-model` keeps the lexer's modules and tiers.
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import tiers  # noqa: E402
+import unit_split  # noqa: E402
 from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
 from framac_common import is_pipeline_output_dir  # noqa: E402
 
@@ -1778,6 +1783,8 @@ def build_dag(
     emit_compile_commands: Path | None = None,
     model: dict | None = None,
     units: bool = True,
+    split_max_functions: int = unit_split.MAX_FUNCTIONS,
+    split_max_lines: int = unit_split.MAX_LINES,
 ) -> dict:
     target_dir = target_dir.resolve()
     threat_model_path = target_dir / "THREAT_MODEL.md"
@@ -2163,7 +2170,10 @@ def build_dag(
     held = model_view(dag, model, target_dir, header_macros, compile_flags_by_file, threat_model_text)
     root = target_dir.as_posix()
     root = root[len("/framac-run/") :] if root.startswith("/framac-run/") else root
-    return unit_view(held, model, root=root) if units else held
+    view = unit_view(held, model, root=root) if units else held
+    # Step I8: tiers per function from trust, then oversized units split into sub-modules.
+    tiers.apply(view)
+    return unit_split.apply(view, split_max_functions, split_max_lines)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -2498,8 +2508,8 @@ def model_view(
 # ---------------------------------------------------------------------------------------------------
 
 _UNIT_KIND_ORDER = {"static_lib": 0, "shared_lib": 1}
-# Most to least demanding; a unit takes the most demanding tier among its lexer modules, while each
-# function keeps its own lexer module's tier (tiers change in step I8, not here).
+# Most to least demanding; a unit takes the most demanding tier among its lexer modules, and each
+# function its lexer module's tier, until scripts/tiers.py (step I8) sets them from trust.
 _TIER_RANK = ("Tier 1A", "Tier 1B", "Tier 2", "Tier 3")
 _RESERVED_MODULE_NAMES = frozenset({"tune", "tune-base"})
 
@@ -2578,7 +2588,8 @@ def unit_view(dag: dict, model: dict, root: str = "") -> dict:
     - a source file belongs to the first unit that compiles it, a header function to the first unit
       it is compiled into;
     - each function keeps the lexer module it had (`lexer_module`) and that module's `tier`; a unit's
-      tier and run flags are the most demanding of its lexer modules' (tiers change in step I8);
+      tier and run flags are the most demanding of its lexer modules' (build_dag then sets both from
+      trust, scripts/tiers.py, when the model has it);
     - the lexer modules are kept under `lexer_modules`, and `unit_of_lexer_module` maps each to the
       unit holding most of its functions. Harnesses stay per lexer module as sub-modules of a unit
       (their sidecar's `unit`; scripts/module_map.py).
@@ -2726,6 +2737,18 @@ def main() -> int:
     )
     parser.add_argument("--no-model", action="store_true", help="Lexer inventory and edges only (no model)")
     parser.add_argument(
+        "--split-max-functions",
+        type=int,
+        default=unit_split.MAX_FUNCTIONS,
+        help=f"Split a link unit with more functions than this (default {unit_split.MAX_FUNCTIONS})",
+    )
+    parser.add_argument(
+        "--split-max-lines",
+        type=int,
+        default=unit_split.MAX_LINES,
+        help=f"Split a link unit with more lines of function bodies than this (default {unit_split.MAX_LINES})",
+    )
+    parser.add_argument(
         "--held-modules",
         action="store_true",
         help="With the model, keep the lexer's modules instead of the build's link units (step I5a's view)",
@@ -2735,7 +2758,13 @@ def main() -> int:
     model, model_note = (None, "disabled (--no-model)") if args.no_model else load_model(args.model)
     cc_path = args.compile_commands or (args.target / "compile_commands.json")
     dag = build_dag(
-        args.target, cc_path, emit_compile_commands=args.emit_compile_commands, model=model, units=not args.held_modules
+        args.target,
+        cc_path,
+        emit_compile_commands=args.emit_compile_commands,
+        model=model,
+        units=not args.held_modules,
+        split_max_functions=args.split_max_functions,
+        split_max_lines=args.split_max_lines,
     )
     if model_note:
         dag["warnings"] = [*dag.get("warnings", []), f"Phase 0 model not used: {model_note}"]
@@ -2751,6 +2780,10 @@ def main() -> int:
         "total_waves": dag["total_waves"],
         "modules": {k: v["tier"] for k, v in dag["modules"].items()},
     }
+    if dag.get("submodules"):
+        summary["submodules"] = {k: v["tier"] for k, v in dag["submodules"].items()}
+    if isinstance(dag.get("tiers"), dict):
+        summary["tiers"] = dag["tiers"].get("functions") or dag["tiers"].get("source")
     if model is not None:
         summary["lexer_only_functions"] = len(dag["model"]["lexer_only_functions"])
         summary["gcc_fallback_units"] = dag["model"]["gcc_fallback_units"]

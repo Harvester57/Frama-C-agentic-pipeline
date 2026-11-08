@@ -80,6 +80,7 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
+from tiers import is_deferred  # noqa: E402
 from workspace_overlay import infer_prover_wp_flags  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -471,13 +472,16 @@ class Plan:
         """
         Modules that should have a `kind` ("fuzz" or "eva") report, mapped to the reason a
         missing one gets in its stub: every module the DAG schedules for that phase, except Tier 3
-        modules without a harness (they are deferred by design). A link unit whose harnesses are
-        sub-modules expects nothing under its own name: its sub-modules do.
+        modules without a harness (they are deferred by design) and modules whose tier the profile
+        defers (Tier 3 under quick, step I8). A link unit whose harnesses are sub-modules expects
+        nothing under its own name: its sub-modules do.
         """
         flag = "run_eacsl_fuzz" if kind == "fuzz" else "run_eva"
         out: dict[str, str] = {}
         for name, dag_mod in sorted(self.records.items()):
             if not dag_mod.get(flag) or not MODULE_RE.match(name):
+                continue
+            if is_deferred(str(dag_mod.get("tier") or ""), self.profile):
                 continue
             if name in self.modules:
                 out[name] = f"{kind}-{name} produced no report"
@@ -653,6 +657,9 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         raise _Excluded(f"no harness sidecar ({HARNESS_DIR}/harness_{name}.json)")
     if not (plan.run_dir / HARNESS_DIR / f"harness_{name}.c").is_file():
         raise _Excluded(f"harness source {HARNESS_DIR}/harness_{name}.c is missing")
+    tier = str(dag_mod.get("tier") or "")
+    if is_deferred(tier, plan.profile):
+        raise _Excluded(f"{tier.split(' (')[0]} is deferred under the {plan.profile} profile (scripts/tiers.py)")
 
     sources, origin = _module_sources(plan.run_dir, name, sidecar, dag_mod)
     for src in sources:

@@ -344,7 +344,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
     modules = dag.get("modules", {})
-    # With link units (step I5b) a unit keeps its lexer module's tier until step I8 sets tiers per unit.
+    # With link units (step I5b) each function has its own tier (scripts/tiers.py, step I8).
     link_units = dag.get("module_kind") == "link_unit"
     resolved_profile = _resolve_seed_profile(profile, dag_path)
     added, skipped, deferred_unreached = 0, [], []
@@ -406,9 +406,10 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                     reason,
                 )
             elif tier.startswith("Tier 3"):
-                if resolved_profile == "deep" and cls == "rte":
+                # Step I8 (scripts/tiers.py): Tier 3 is deferred under quick; otherwise its RTE is planned.
+                if resolved_profile != "quick" and cls == "rte":
                     unit = new_unit(file, name, cls, module, tier, wave, source, "planned", None, reason)
-                elif resolved_profile == "deep":
+                elif resolved_profile != "quick":
                     unit = new_unit(
                         file,
                         name,
@@ -418,7 +419,9 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                         wave,
                         source,
                         "deferred",
-                        ["tier3_not_scheduled: Layers 2-6 are not scheduled for Tier 3 modules in deep profile"],
+                        [
+                            f"tier3_not_scheduled: Layers 2-6 are not scheduled for Tier 3 in the {resolved_profile} profile"
+                        ],
                         reason,
                     )
                 else:
@@ -431,7 +434,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                         wave,
                         source,
                         "deferred",
-                        ["tier3_not_scheduled: no harness is generated for Tier 3 modules in this profile"],
+                        ["tier3_not_scheduled: Tier 3 is deferred under the quick profile"],
                         reason,
                     )
             else:
