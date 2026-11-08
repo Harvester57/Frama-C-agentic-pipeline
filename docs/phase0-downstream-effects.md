@@ -3,6 +3,7 @@
 Read this before you change Phase 1 (fuzzing), Phase 2 (Eva), the Pre-WP crash gate, Phase 3 (WP), the report, the Make flow or the benchmark. It records what Phase 0 now produces, what each later phase reads from it, what changed downstream, the traps, and the defects known today.
 
 - **State described:** branch `phase0-redesign` at `2cfaa48` (2026-11-08), with steps I0–I10 of [phase0-implementation-plan.md](phase0-implementation-plan.md) done. It is not yet merged into `main`.
+- **Updated for the remediation** ([phase0-remediation-plan.md](phase0-remediation-plan.md), steps R1–R10, `c689c1b`..`28101de`): §8 gives each defect's fix, and the statements the R steps made wrong were corrected in place. Line numbers elsewhere are still those of `2cfaa48`.
 - **Sources:** a read of the code in four areas (Phase 1, Eva and the ledger, the WP gate and Phase 3, orchestration), and the plan's step notes. Line numbers are as of that commit. Each defect in §8 was checked in the code.
 - **Background:** [phase0-redesign.md](phase0-redesign.md) explains why, and the plan's "Step notes" say what each step did.
 
@@ -33,15 +34,24 @@ Read this before you change Phase 1 (fuzzing), Phase 2 (Eva), the Pre-WP crash g
 | `workspace/reports/build_capture.json` | units (files, links, flags, entry points, embedded API), `cc -M` header lists, status | `phase0_model.py`, `build_callgraph_dag.py` (unit `-I`), `seed_harvest.py`, `benchmark.py` |
 | `workspace/snapshot/manifest.json` and `root/` | digest, headers, libraries | `target_env.py`: `-idirafter`, `-L`, RPATH; `cache.toolchain_id` (`+snapshot:<digest>`) |
 | `workspace/reports/phase0_model.json` | `functions` (`file#name`, signature, formals, `external_calls`, `indirect_sites`, trust), `units[].parse.status`, `trust` | the DAG, `trust.py`, `security_props.py`, `seed_harvest.py`, `generate_report.py`, `acsl_ast.py` |
-| `workspace/reports/callgraph_dag.json` | `module_kind`; `modules{tier, run_eacsl_fuzz, run_eva, required_sources, cppflags, force_includes, candidate_entry_points, concurrent}`; `lexer_modules`, `unit_of_lexer_module`; `submodules`; `functions{name, file, module, lexer_module, tier, tier_reasons, untrusted_path, trust, wave, header, reached, callgraph_source, callgraph_fallback, internal_callees, indirect_callees, verifiability, wp_blockers, wp_notes, security_properties}`; `tiers` | `pipeline_make.py`, `module_map.py`, `ledger.py`, `wp_scheduler.py`, `workspace_overlay.py`, `run_wp_function.py`, `harness_reach.py`, `benchmark.py` |
+| `workspace/reports/callgraph_dag.json` | `module_kind`; `modules{tier, run_eacsl_fuzz, run_eva, required_sources, cppflags, force_includes, candidate_entry_points, concurrent}`; `lexer_modules`, `unit_of_lexer_module`; `submodules`; `functions{name, file, module, lexer_module, tier, tier_reasons, untrusted_path, trust, wave, header, reached, callgraph_source, callgraph_fallback, internal_callees, verifiability, wp_blockers, wp_notes, security_properties}`; `tiers`; `schema_version` (R4). R4 dropped `indirect_callees`, `cross_module_callees`, `entry_trust`, `provable_functions` and `shell_unverifiable_functions` (D9) | `pipeline_make.py`, `module_map.py`, `ledger.py`, `wp_scheduler.py`, `workspace_overlay.py`, `run_wp_function.py`, `harness_reach.py`, `benchmark.py` |
 | `workspace/reports/security_props.json` | `obligations["file#name"]` (class, property) | `ledger.py` seed, `run_wp_function.py`, `workspace_overlay.py` (prover brief) |
-| `workspace/harnesses/harness_<mod>.json` (sidecar) | `unit`, `sources`, `cppflags`, `ldflags`, `include_source`, `dispatch_cases`, `max_input_size`, `reach_exempt`, `entry_fn`, `reachability` | `module_map.py`, `pipeline_make.py`, `run_eacsl_fuzz.py`, `harness_reach.py`, `workspace_overlay.py` |
+| `workspace/harnesses/harness_<mod>.json` (sidecar, `schemas/harness_sidecar.schema.json` since R5) | `unit`, `sources`, `scope_files`, `cppflags`, `ldflags`, `include_source`, `header`, `dispatch_cases`, `max_input_size`, `reach_exempt`, `entry_fn`, `reachability`, `api_harness`, `api_cases`, `api_skipped` | `module_map.py`, `pipeline_make.py`, `run_eacsl_fuzz.py`, `harness_reach.py`, `workspace_overlay.py` |
 | `workspace/seeds/<mod>/` | seed inputs | `fuzz-%` and `coverage-%` through `--extra-corpus` (`templates/pipeline.mk`) |
 | `workspace/reports/phase0_gates.json` | reach (passed, gaps, `harness_digest`), `build_check` (ok, `fuzz_engine`) | `phase0_gates.check` from `pipeline.mk`; `validate_artifacts.py` |
 
 The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept for compatibility. They now mean **path modules**: files grouped by directory (`src/<dir>/…` → `<dir>`, `src/f.c` → `f`), with header functions placed by vote. There is no lexer behind them.
 
 ## 3. Concepts every phase must handle
+
+**Glossary: the word `unit`.** The same field name means two different things:
+
+| Where | `unit` means | Example |
+| :--- | :--- | :--- |
+| model `units{…}` keys, model `functions[*].units`, DAG `modules[*].unit`, model `indirect_sites[].unit` | a **capture path**: the link unit as the build capture names it (its output file) | `lib/libkv.a` |
+| DAG `submodules[*].unit`, harness sidecar `unit`, `unit_of_lexer_module` values | a **DAG module name**: the key of `modules` that the link unit became (`build_callgraph_dag.unit_module_name`) | `libkv_a` |
+
+The ledger's `module` is also a DAG module name, and a ledger *unit* (`file#function::class`) is a third, unrelated sense: one obligation of one function. `ModuleMap` takes DAG module names, never capture paths.
 
 ### 3.1 Units and harness modules
 
@@ -65,7 +75,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 - **Model ids are always `file#name`.** DAG keys are the plain name, unless two functions share it, and then `file#name`. Code that indexes the DAG by plain name silently misses colliding functions (§8).
 - **Ledger units are `file#function::class`.** They are matched by (file, plain name), and a unique name is the fallback.
 - **Crash fingerprints are `normalized_file#plain_function::kind::digest`.**
-- **Kernel renames:** Frama-C renames colliding statics (`f_0`). Eva ingest maps rows back by file and line range; fuzz ingest does not.
+- **Kernel renames:** Frama-C renames colliding statics (`f_0`). Eva ingest maps rows back by file and line range. Fuzz ingest does too since R2, and maps a location without a line back through the model's `kernel_names`.
 
 ### 3.3 Flags and sources
 
@@ -73,7 +83,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 - **What the harness generator merges from the DAG:**
   - the unit's `-I`, `-D`, `-U` flags and its `force_includes` (`generate_harness._merge_dag_module_cppflags`);
   - **not** `-D` values with quotes, spaces or backslashes, nor `-std=`, because later stages split and re-join flag strings. The harness spec must state these itself.
-- **One configuration per file:** a file compiled by several units with different flags is analysed only in the first unit's configuration. qlz's four executables are the known case.
+- **One configuration per file:** a file compiled by several units with different flags is analysed only in the first unit's configuration. qlz's four executables are the known case. This is a recorded limit (defect 14, decision D5), not planned work.
 - **Header `static inline` functions** have one DAG record, homed in the first unit that compiles them. They are analysed, credited and proved under that unit only.
 - **Source closures are smaller and exact:**
   - a path module's `required_sources` is the closure of model edges from its own functions;
@@ -107,8 +117,8 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 ### 3.6 Security properties (MetAcsl)
 
 - **Classes:** `l3_frame`, `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped` and `l6_no_leak`, beside `rte` and `l2_termination`.
-  - The old classes `l4_auth`, `l5_output` and `l6_secret` stay in the schemas and `generate_report.CLASSES`.
-  - The DAG emits only Layer 2 now, so the seed never creates the old classes.
+  - The pre-I9 Layer 4-6 classes are gone from the ledger, the schemas, `generate_report.CLASSES` and WP's goal classes (D8: R2, R4, R7). A ledger from before I9 no longer loads; such a run directory cannot be resumed with the new DAG anyway.
+  - The DAG emits only Layer 2.
 - **`security_props.json` must exist before `ledger.py seed`.**
   - If it appears later, WP produces meta goals with no ledger unit.
   - An unproven meta goal blocks `all_proven`.
@@ -131,9 +141,10 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - `fuzz-%` checks `reach` and `build_check`;
   - `seed` depends on `reach-gate`;
   - `reach-dynamic-%` runs after `coverage-%`, and reopens the gate for an entry point no input executed.
-- **The gate digest covers only the harness `.json` and `.c`.**
-  - A rebuilt DAG with new entry points doesn't invalidate a passed gate, so run `reach-gate` again after it.
+- **The gate digests cover the harness `.json` and `.c`, and the DAG** (the DAG since R1).
+  - A rebuilt DAG fails the gate until `reach-gate` (`harness_reach.py check`) runs again.
   - Any sidecar edit clears that module's dynamic gaps.
+- **Phase 0 is done only after `pipeline_make.py build-check`** (R1): it records the phase 0 checkpoint when every Phase 0 gate passed; `seed` no longer does. Guidance-mode `run_eva_slice.py --module` and `run_eacsl_fuzz.py campaign --module` refuse a module whose gate failed when the run directory has a gate stamp (R1, R6).
 
 ## 4. Phase 1: fuzzing, coverage, replay
 
@@ -151,7 +162,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - 60, 120 or 900 CPU-seconds per case (quick, standard, deep);
   - capped per unit at 480, 1200 or 7200, scaled down in proportion with at least 30 each;
   - recorded as `fuzz_budget_source`.
-- **Seeds:** `fuzz-%` writes `workspace/seeds/<mod>` and passes it as `--extra-corpus`, and so does `coverage-%`. The single-module command in `skills/framac-fuzz/SKILL.md` leaves this out.
+- **Seeds:** `fuzz-%` writes `workspace/seeds/<mod>` and passes it as `--extra-corpus`, and so does `coverage-%`. The single-module commands in `skills/framac-fuzz/SKILL.md` do the same (R10).
 - **Whole-API harness (`generate_harness.py --api`):**
   - one dispatch case per entry point of the module's scope, built from the model's signatures, formals and `param_sizes`;
   - plus sequence cases from the recorded traces;
@@ -162,13 +173,13 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - `workspace/seed_records/traces.jsonl` keeps each process's calls in order, with pointer addresses.
 - **Dynamic reach gate:** an entry point with 0 executions reopens the gate. The gap stays until the harness digest changes. It reads only the sidecar's exemptions, not `reach_exempt_modules.json`.
 - **Ingest:** clean or error evidence goes only to units in the harness module's scope, and candidates name the report's harness module.
-- **Replay** of a candidate that names a unit builds `harness_module_for(unit)`, which is the first sub-module. The ledger picks a candidate's harness by the scope of the crashing function, so the two can disagree (§8).
+- **Replay** of a candidate builds the harness whose scope holds the candidate's function (`harness_module_for_function`), as the ledger picks it (defect 8; R6 did the same for the fallback path without `pipeline_make`).
 
 **Watch out:**
 - **E-ACSL still uses the old tokenizer:** its `-rte-select` list and crash-to-function resolution go through `c_definitions.extract_functions_from_code`, not the model.
 - **Concurrency:** E-ACSL detects it by scanning sources (`slice_has_pthread`), not from the DAG's `concurrent`.
 - **GCC-fallback units:** the DAG gives them `fuzz_engine: sanitizers`, which the Make plan applies, so `build_check` accepts them without a manual `params set` (defect 6).
-- **Coverage:** `COVERAGE_EXTERNAL_PREFIXES` doesn't list the snapshot root, so code in snapshot headers counts as target code.
+- **Coverage:** code under the snapshot root (`workspace/snapshot/root/`) counts as external code, not target code (defect 10, R6).
 - **Colliding names:** seed records are keyed by plain name and pooled across units, and link repair (`_dag_symbol_files`) takes the first file per name.
 
 **Not used yet:** trust, `untrusted_path`, `security_props` (MetAcsl properties are never checked at run time), `no_threat_model`, and the fallback flag.
@@ -195,7 +206,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 **Watch out:**
 - **Ingest order:** fuzz before Eva.
 - **A report's `module` must be the harness module.** The units it may credit are those of `ModuleMap.unit_of(report module)`. Header files are owned even when absent from the report's `sources`.
-- **Re-seeding only adds units.** Existing units keep their module, tier, status and fallback fields, and units of vanished functions stay. After a Phase 0 change, use a fresh ledger or a new run.
+- **Plain re-seeding only adds units.** Existing units keep their module, tier, status and fallback fields, and units of vanished functions stay. After a Phase 0 change, `ledger.py seed --refresh` (R2) re-derives every unit without evidence (planned, deferred, out of scope) from the current DAG: it adds new units, retires units whose function left the DAG as `out_of_scope`, never touches a unit with evidence, and reports what changed.
 - **Ingest is keyed by the digest of the report bytes.** A `ModuleMap` change does not re-attribute reports already ingested.
 - **Old run directories:** a ledger with `callgraph_source: regex` fails validation, so `generate_report` aborts on such a run. The enum is now `frama_c` or `gcc_callgraph`.
 - **`concurrent` comes from a header function's home unit only.** Other concurrent units that compile it are missed.
@@ -203,7 +214,6 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 
 **Not used yet:**
 - trust, `untrusted_path` and `no_threat_model`;
-- the "fallback unit blocked" decision: those units stay `planned` with only `bookkeeping.callgraph_fallback`;
 - Eva's own `flows.call_edges`, which are never merged back into the DAG;
 - MetAcsl classes in Eva ingest, which handles `rte` only.
 
@@ -228,9 +238,9 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 - **More indirect edges:**
   - more `needs_calls_annotation` functions;
   - more dependencies, possibly spurious recursion groups, and a bigger quick chain. On x509-parser, about 41 of 163 type-matched edges are spurious, since Alias narrowing is off.
-- **Coarser gating:**
-  - any open verify task of any sub-module blocks every prover in the unit;
-  - there is one header architect per unit, and it covers the first sub-module's header only.
+- **Gating by sub-module scope (defect 13, fixed in R7):**
+  - a sub-module's open verify task blocks only the provers of the functions in its own scope (and the callers whose call cone it lies in);
+  - each distinct `header` among a unit's harness sidecars gets its own architect.
 - **More prove tasks:** one per function with any planned unit. With `security_props.json`, `l3_frame` units queue functions whose RTE work Eva already covered (198 on qcbor-dev).
 - **Trust boundary from trust:**
   - harness entries not at the boundary become `internal_api` and escape the boundary check;
@@ -244,7 +254,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 - **The brief and the merge check disagree.** The brief marks every function of a unit `untrusted_surface` when any sidecar has no `entry_fn`; the merge check skips such sidecars.
 - **Gate and repair:** they must go through `ModuleMap`. A verify task's module is a harness module, not the unit.
 - **GCC-fallback units** have no signatures, so they get no `internal_variadic` blocker, and their WP parse will probably fail again.
-- **`Typed+cast`:** a proof under it never counts (`run_wp_function.py:1519`), yet `docs/troubleshooting.md:217` still recommends it. That was stale before the redesign too.
+- **`Typed+cast`:** a proof under it never counts (`run_wp_function.wp_model_unsound`); it runs only as the diagnostic `cast_model_probe`. `docs/troubleshooting.md` no longer recommends it (R10).
 
 **Not used yet:**
 - trust and `untrusted_path` for priority (the queue orders by chain height, then Eva Unknowns);
@@ -260,8 +270,8 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - deferral by tier.
   - `pipeline_make` never reads the model, the capture, trust or `security_props.json`.
 - **Report:**
-  - new: a "Trust boundary" section (with the `no_threat_model` reason), concurrency notes, and the MetAcsl classes;
-  - not yet: fallback units, tiers, seeds, the security-props summary, the build recipe, the unit split, dynamic reach gaps;
+  - new: a "Trust boundary" section (with the `no_threat_model` reason), concurrency notes, the MetAcsl classes, and a "Phase 0 parse" section listing GCC-fallback units with their first Frama-C error and deferred units (R4, D2);
+  - not yet: tiers, seeds, the security-props summary, the build recipe, the unit split, dynamic reach gaps;
   - SARIF is unchanged.
 - **Cache:** the toolchain id carries `+snapshot:<digest>`. Unit flags reach cache keys through the sidecar, and headers through the dependency manifest. No key holds a model or capture digest, and none is needed while the sidecar holds the flags.
 - **Schemas:**
@@ -269,7 +279,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - the ledger, agent-result and findings schemas gained five classes;
   - `run-metadata` gained `build` and `codeql`;
   - `regex` left the ledger's `callgraph_source` enum.
-  - `validate_artifacts` doesn't schema-check the model, the capture or `security_props.json`.
+  - since R5, schemas also cover the DAG, harness sidecars, `build_check.json`, the dynamic reach report, `seed_harvest.json` and `traces.jsonl` lines, and `validate_artifacts.py run-dir` checks the capture, the model, `security_props.json` and those artifacts when present. Producers record schema problems as warnings, and `run-dir` fails on them.
 - **Wrappers:**
   - the default image is `framac-analysis:latest`;
   - `-BuildImage` runs `framac-build[:<repo>]`;
@@ -282,11 +292,12 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - a manifest harness `{"generate": "api"}` uses the whole-API generator (oscs-tweetnacl does, with no accepted gaps);
   - the seeds stage runs even without a test command;
   - `harness_digest` leaves out the recipe, threat model, seeds and security props, so `compare` doesn't flag changes to those;
-  - it still hashes the now-unused `compile_commands` asset, which was kept so digests don't change.
+  - the unused `compile_commands` field and CryptoLib's asset are gone, also from `harness_digest` (R9, D7), so digests changed and V re-records the baseline;
+  - both benchmarks run `coverage` and `reach-dynamic` before replay and ingest, and the seeded corpus is `tests/fixtures/phase0/seeded/` (R9, D6).
 
 ## 8. Known defects and gaps
 
-All of these were checked in the code. Defects 1-8 and 15-20 are fixed on `phase0-redesign` (commit in the Status column); 9-14 stay open. Defects 15-20 came from a second audit of Phase 0 (2026-11-08). The fixes were unit-tested only: no pipeline or benchmark run has checked them yet.
+All of these were checked in the code. Defects 1-8 and 15-20 are fixed on `phase0-redesign` (commit in the Status column), and 9-13 by the remediation steps R1-R7 ([phase0-remediation-plan.md](phase0-remediation-plan.md)); 14 is a recorded limit (decision D5). Defects 15-20 came from a second audit of Phase 0 (2026-11-08). The fixes were unit-tested only: the validation run V (baseline `phase0-r2`) checks them together.
 
 | # | Severity | Where | Problem | Fix direction | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -298,12 +309,12 @@ All of these were checked in the code. Defects 1-8 and 15-20 are fixed on `phase
 | 6 | Decision not enforced | `phase0_model.py:875-889`, ledger, Make | "Stop if no unit parses": the model stays `ok` when every unit fell back to GCC. "Fallback unit: Eva and WP blocked": only `bookkeeping.callgraph_fallback` is set. No automatic sanitizer fallback either. | Model status `no_unit_parsed`; mark fallback units blocked in the ledger and report; set `fuzz_engine: sanitizers` for them. | Fixed, `5e89cfc`: model status `no_unit_parsed`, exit 4; fallback units get `run_eva`/`run_wp_full` false and `fuzz_engine: sanitizers`; the seed defers their functions' Eva/WP units with `callgraph_fallback: <reason>`, which report section 6 groups. |
 | 7 | Missing flags | `generate_harness._merge_dag_module_cppflags` | An I8 cluster (in `submodules`, not `lexer_modules`) or a freely named harness gets neither its unit's flags nor its `force_includes`. | Resolve the unit through `ModuleMap.unit_of` or the `--unit` argument. | Fixed, `188dfdb`. |
 | 8 | Inconsistent | `run_eacsl_fuzz.py:2997`, `ledger.py:1510` | Replay builds a unit's first sub-module. The ledger picks the harness whose scope holds the crashing function. | Replay through `harness_module_for_function`. | Fixed, `85ef0a9`: replay, minimize and the benchmark replay build the harness holding the candidate's function. |
-| 9 | Imprecise | `trust.py:508-535`, `workspace_overlay.py:1408` | The boundary check passes the name without the file, so same-named functions merge, with "untrusted wins". Conservative, but noisy. | Pass the file. |
-| 10 | Imprecise | `run_eacsl_fuzz.py:135` | Snapshot headers count as target code in coverage. | Add the snapshot root to `COVERAGE_EXTERNAL_PREFIXES`. |
-| 11 | Imprecise | fuzz ingest | Kernel-renamed statics (`f_0`) are not mapped back, unlike in Eva ingest. | Reuse the line-range placement. |
-| 12 | Stale state | `ledger.py:416-418`, `phase0_gates.py:45-55` | Re-seeding never refreshes existing units, and the reach-gate digest ignores the DAG. | Document it (done here); consider a DAG digest in the gate key and a `--refresh` seed. |
-| 13 | Coarse | `wp_scheduler.py:673-679`, `:1367` | One header architect per unit, for the first sub-module's header only; gating is per unit. | Per-harness headers; gate per sub-module scope. |
-| 14 | Limit | flags | One configuration per file shared by several units (qlz). | Run each unit's configuration (I8 split, or a later step). |
+| 9 | Imprecise | `trust.py:508-535`, `workspace_overlay.py:1408` | The boundary check passes the name without the file, so same-named functions merge, with "untrusted wins". Conservative, but noisy. | Pass the file. | Fixed, `152970e` (R3): the merge's boundary check and `prepare_agent` pass the function's file; same-named functions keep their own trust. |
+| 10 | Imprecise | `run_eacsl_fuzz.py:135` | Snapshot headers count as target code in coverage. | Add the snapshot root to `COVERAGE_EXTERNAL_PREFIXES`. | Fixed, `b3298c1` (R6). |
+| 11 | Imprecise | fuzz ingest | Kernel-renamed statics (`f_0`) are not mapped back, unlike in Eva ingest. | Reuse the line-range placement. | Fixed, `ea9be7b` (R2): line-range placement, else the model's `kernel_names`. |
+| 12 | Stale state | `ledger.py:416-418`, `phase0_gates.py:45-55` | Re-seeding never refreshes existing units, and the reach-gate digest ignores the DAG. | Document it (done here); consider a DAG digest in the gate key and a `--refresh` seed. | Fixed: the reach rows record the DAG digest (`c689c1b`, R1); `ledger.py seed --refresh` (`ea9be7b`, R2). |
+| 13 | Coarse | `wp_scheduler.py:673-679`, `:1367` | One header architect per unit, for the first sub-module's header only; gating is per unit. | Per-harness headers; gate per sub-module scope. | Fixed, `3c68074` (R7). |
+| 14 | Limit | flags | One configuration per file shared by several units (qlz). | Run each unit's configuration (I8 split, or a later step). | Recorded as a limit (D5): qlz is the only benchmark target with the shape. Revisit with one parse per (file, configuration) and per-unit DAG views when a target needs it. |
 | 15 | Broken | `pipeline_make.build_check`, `validate_artifacts.validate_phase0_gates` | A plan with nothing to fuzz recorded `build_check.ok: false` with no modules, which failed validation and `wp-queue`: an Eva-only run could not finish. | Pass a plan with modules but nothing to fuzz; keep failing a plan with no module. | Fixed, `60107a9`. |
 | 16 | Gate bypass | `phase0_gates.check` (whole run), `wp_scheduler.py init`, `benchmark.py` | The whole-run gate trusted the stored reach flag (a harness changed since passed) and the recorded build rows (a module build-check never built passed). `wp_scheduler.py init` checked no gate, and the benchmark checkpointed Phase 2 whatever `wp-queue` returned. | Check digests run-wide; `wp-queue` passes the plan's `MODULES` and `FUZZ_MODULES`; `init` checks the gates; drop the benchmark's checkpoint. | Fixed, `60107a9`. |
 | 17 | Lost facts | `phase0_model.ModelBuilder.add_function` | The first parse to see a function kept its record, so a function also compiled by an earlier-sorting GCC-fallback unit lost its signature, formals, loops and writes (and with them its L2/L3 units and WP blockers). | A Frama-C record replaces a GCC one. | Fixed, `f43368a`. |
@@ -311,14 +322,14 @@ All of these were checked in the code. Defects 1-8 and 15-20 are fixed on `phase
 | 19 | Missing API | `build_callgraph_dag` (`reached`), `seed_harvest.plan_recorder` | The model's top-level `entry_points` leaves out `embedded_api`, so header functions reached only from it were deferred as unreached, and it was never recorded for seeds. | `model_api`: entry points plus the non-test units' embedded API. | Fixed, `b440e1e`. |
 | 20 | Silent drop | `phase0_model` (capture ids) | A function defined in a `#include`d `.c`, or a header function without `-g`, has another id in the capture than in the model; trust, the unit view and the reach gate dropped it without a warning. | `reconcile_api_ids` maps it to the unit's only external function of that name, or warns. | Fixed, `003be49`. |
 
-**Stale docs and briefs:**
+**Stale docs and briefs** (as found by the audit; R7 fixed the WP briefs and `run_wp_function.py`, R9 `docs/benchmark.md`, and R10 the rest):
 - `skills/framac-eva/SKILL.md`:
   - Step 4 states the old "all Valid → covered" rule;
   - lines 67 and 74 point to Layer 6 `\tainted`, an idiom I9 dropped;
   - Step 1 never mentions units.
 - `skills/framac-fuzz/SKILL.md:96`: the campaign command has no `--extra-corpus workspace/seeds/<mod>`.
 - `skills/framac-wp/breaker_brief.md:29`: uses `g_sec_auth_verified` from the deleted Layer 4 template.
-- `skills/framac-wp/prover_brief.md:155` and `run_wp_function.py:75-76`: name the old classes `l4_auth`, `l5_output` and `l6_secret`.
+- `skills/framac-wp/prover_brief.md:155` and `run_wp_function.py:75-76`: name the old pre-I9 Layer 4-6 classes.
 - `docs/troubleshooting.md:217`: recommends `Typed+cast`.
 - `docs/resources-and-caching.md`:
   - line 251 documents `slice-init`;

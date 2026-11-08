@@ -10,7 +10,7 @@ The demo run (two modules, a planted `table[8]` overflow) reached the header arc
 
 Still to run, preferably on a **fresh run directory**. The old one lives in a temporary scratchpad, and its candidate fingerprint predates the fingerprint fix.
 - [ ] `wp_scheduler.py complete --agent-id arch-util` / `arch-parser`, then `merge-pending` (architect merge with the parent re-check).
-- [ ] The prover round: `prove:src/util/sum.c#checksum`, plus `prove:src/parser/parser.c#parse_record` for its planned `l2_termination` / `l6_secret` units, which dispatch may refuse because the function's `rte` unit is a `candidate`. Then `complete` and `merge-pending` for each.
+- [ ] The prover round: `prove:src/util/sum.c#checksum`, plus `prove:src/parser/parser.c#parse_record` for its planned `l2_termination` unit (the old run's pre-I9 Layer 6 unit no longer loads since remediation D8, another reason for a fresh run), which dispatch may refuse because the function's `rte` unit is a `candidate`. Then `complete` and `merge-pending` for each.
 - [ ] Breaker and negotiation tasks, if a prover stalls or files strengthening requests.
 - [ ] `pipeline_make.py run wp-sweep`, then `run report`; `run_metadata.py set-status`; `checkpoint.py complete`.
 - [ ] Check that the final ledger, findings and report are consistent: one finding for the overflow, merged contracts, and swept proofs.

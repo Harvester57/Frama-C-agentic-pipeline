@@ -90,8 +90,9 @@ Crash verification runs right after Phases 1 and 2, before WP:
 Unit = **function x obligation class**. ID: `<rel-file>#<function>::<class>`. Using the file in the ID keeps same-named `static` functions in different files distinct. The classes:
 
 - `rte` and `l2_termination`;
-- `l3_frame`, and the MetAcsl classes `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped` and `l6_no_leak` ([`./security-properties.md`](./security-properties.md));
-- `l4_auth`, `l5_output` and `l6_secret` for clauses a prover names `L4_*`, `L5_*` or `L6_*` by hand.
+- `l3_frame`, and the MetAcsl classes `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped` and `l6_no_leak` ([`./security-properties.md`](./security-properties.md)).
+
+A clause a prover names `L4_*`, `L5_*` or `L6_*` by hand gets no class of its own (see the layer naming convention below).
 
 Seeding (`ledger.py seed`, from the DAG of the Phase 0 model):
 
@@ -120,7 +121,7 @@ Evidence entries name their phase (`fuzz`, `eva`, `wp`, `audit`, `verifier`), pr
 
 **Assumptions.** A `covered` unit carries an explicit `assumptions` list: `requires` clauses whose call sites are not verified (linked to those call sites' units), stub contracts relied on, and `Valid_under_hyp` goals whose hypotheses are callee contracts. In per-function WP (`-wp-fct`), `Valid_under_hyp` is expected: callee contracts are hypotheses proven in their own sessions. They are only acceptable when every hypothesis is a callee contract whose own unit is `covered`. The proof audit (M3) resolves this; until then they are listed as open assumptions. The report separates "proven unconditionally" from "proven under N open assumptions". Verifying a caller later discharges its assumption automatically.
 
-**Layer naming convention.** WP goals map to obligation classes by name: RTE goals -> `rte`; `loop variant` / `decreases` -> `l2_termination`; `assigns` / `\separated` goals -> `l3_frame`; goals of the generated MetAcsl annotations (`<property>: meta:`) -> the property's class; hand-named clauses `L4_*`, `L5_*`, `L6_*` -> `l4_auth`, `l5_output`, `l6_secret`. Unnamed security clauses cannot be credited to a layer unit.
+**Layer naming convention.** WP goals map to obligation classes by name: RTE goals -> `rte`; `loop variant` / `decreases` -> `l2_termination`; `assigns` / `\separated` goals -> `l3_frame`; goals of the generated MetAcsl annotations (`L4_auth_state_*`, `L4_auth_required_*`, `L5_sanitized_*`, `L6_wiped_*`, `L6_no_leak_*`, annotated `<property>: meta:`) -> the property's class; everything else -> `rte` (`run_wp_function.goal_obligation_class`). A clause a prover names `L4_*`, `L5_*` or `L6_*` by hand is classed by its kind like any other clause (`rte`, or `l3_frame` for a frame clause), so only the generated goals credit a Layer 4-6 unit.
 
 **Projected frame skeletons (AutoFraming-style, arXiv:2610.29046v1).** `function_facts.py` projects each function's frame information (kernel-AST writes/reads/loops, `may_alias` pairs, Eva `-deps` footprints) into a deterministic `frame_skeleton` in the facts JSON (schema 2): `requires \separated(rho_p, rho_q);` for interfering pointer pairs only (aliasing that can change a caller-visible write; type-compatible pointees only, so `int *` vs `double *` is never separated), and `assigns L \from r1, ..., rm;` per caller-visible write (loop-indexed writes normalized to their whole range; `\from \nothing` when nothing influences the write). The skeleton is rendered into the prover brief as a REQUIRED minimum — provers may strengthen, never delete or weaken — and `workspace_overlay.py` enforces it mechanically at merge time (`acsl_ast.check_frame_preserved` rejects a candidate whose contract drops a projected clause; fail-open when facts are missing). `FRAMAC_FRAME_SKELETON=off` disables the projection for A/B runs. `run_wp_function.py` reports a `frame_summary` (missing-assigns warning, assigns-VC status, `l3_frame` goal counts) so an `l3_frame` unit is frame-error-free only when WP discharges every assigns/loop-assigns/separated goal and no missing-assigns warning fired — a full proof with a missing frame clause does not count.
 
@@ -182,7 +183,7 @@ Implemented roles in [`../schemas/agent-result.schema.json`](../schemas/agent-re
 
 | Profile | Scope |
 |---|---|
-| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget per harness case, at most 480 per link unit; 600 s prover wall budget); Tier 3 modules and units deferred (no fuzzing, Eva or WP; `scripts/tiers.py`); WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
+| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget per harness case, at most 480 per link unit; 600 s prover wall budget); Tier 3 deferred (`scripts/tiers.py`): Make leaves out whole Tier 3 modules (no fuzzing or Eva for them), and the ledger seeds every Tier 3 function's units `deferred` (no WP). A Tier 3 function inside a module of a higher tier is still analysed by that module's fuzz and Eva runs, but Eva results on its deferred units are skipped, except an Invalid, which makes the unit a `candidate`; WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
 | `standard` | All phases on Tier 1A, 1B, and Tier 2 validators (120 CPU-s fuzz budget per harness case, at most 1200 per link unit; 900 s prover wall budget); the parent re-verifies changed finding records before reporting. |
 | `deep` | Extended budgets (900 CPU-s fuzz budget per harness case, at most 7200 per link unit; 1800 s prover wall budget; higher retry limit `K`). Tier 3 `rte` units are scheduled in `standard` and `deep`, deferred only in `quick` (step I8). |
 

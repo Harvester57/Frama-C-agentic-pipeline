@@ -7,7 +7,7 @@ This plan covers what the 2026-11-08 audits of Phase 0 left open after the pre-m
 - **What the step notes of [`phase0-implementation-plan.md`](phase0-implementation-plan.md) left open.**
 - **Stale docs, briefs and comments.**
 
-Known limits of the design (Alias, seeds, MetAcsl) are listed under [Backlog](#backlog-not-planned) and are not part of the steps.
+Known limits of the design (Alias, seeds, MetAcsl, one configuration per shared file) are listed under [Backlog](#backlog-not-planned) and are not part of the steps.
 
 Locations come from the audits and were checked on `phase0-redesign` at `fc25f85`. Line numbers drift: search for the named function.
 
@@ -25,8 +25,8 @@ Taken by the user as recommended. The steps below follow them.
 | D6 | `poc/phase0/` | (a) Remove; (b) keep as history. | **(a),** after `benchmark_seeded.CORPUS` points at `tests/fixtures/phase0/seeded/`. The two copies differ only in the README and in `s08_wellformed_input/truth.json`, which gained the `trust` truth. Check the scorer accepts the fixture copy first (R9). |
 | D7 | The manifest's unused `compile_commands` field and CryptoLib's `compile_commands.json` asset | (a) Remove with the next baseline; (b) keep. | **(a),** in the same change as the baseline re-record, because both feed `harness_digest`. |
 | D1′ (2026-11-08, evening) | D1 revisited: the API-reach work (`c5a8381`..`684052f`) landed after V, so the validated tree is no longer the head. | (a) Merge `c5ee34e` now, the rest after a second V; (b) land R1–R10 on the branch, one V on the result, then merge everything. | **(b).** One validation covers today's work and the R steps; `main` stays untouched until it passes. V re-records the baseline as `phase0-r2`. |
-| D8 | Must ledgers from before I9 (classes `l4_auth`, `l5_output`, `l6_secret`) still load? | (a) No: drop the classes; (b) yes: keep them in the schema enums and the report. | **(a).** A pre-redesign run directory cannot be resumed with the new DAG and units anyway. R2, R4 and R10 drop them everywhere. |
-| D9 | Open items the steps left to the implementer | — | Taken as the steps recommend: R4 keeps a model or DAG field only if the report or the benchmark shows it and drops the rest; R5 writes and keeps `scope_files` (also through `--api`); R7 drops the DAG's never-produced `header`/`headers`/`skipped` reads; R8 documents the pinned-digest alignment of the two base stages. |
+| D8 | Must ledgers from before I9 (with its three hand-named Layer 4-6 classes) still load? | (a) No: drop the classes; (b) yes: keep them in the schema enums and the report. | **(a).** A pre-redesign run directory cannot be resumed with the new DAG and units anyway. R2, R4 and R10 drop them everywhere. |
+| D9 | Open items the steps left to the implementer | — | Taken as the steps recommend: R4 keeps a model or DAG field only if the report or the benchmark shows it and drops the rest (as done: the model drops `included`; the DAG drops `provable_functions`, `shell_unverifiable_functions`, `indirect_callees`, `cross_module_callees` and `entry_trust`, the last three in `f0cbf3c` after `27f443d` had kept them for the skill; `thread_entries`, `parse_jobs` and `alias` stay for the benchmark and the report); R5 writes and keeps `scope_files` (also through `--api`); R7 drops the DAG's never-produced `header`/`headers`/`skipped` reads; R8 documents the pinned-digest alignment of the two base stages. |
 
 ## Rules for every step
 
@@ -89,7 +89,7 @@ These are the same as the implementation plan's rules:
     - it refuses when the reach gate failed (`phase0_gates.check(need=("reach",))`), as `wp_scheduler.py init` does since `60107a9`;
     - it refuses when `security_props.json` is missing while the model has a threat model, rather than seeding without the MetAcsl classes.
   - **Stale-DAG fallbacks:** `audit-hypotheses` warns when it falls back to the first same-named record (a callee key with no DAG record).
-  - **Old classes:** drop the dead `l4_auth`, `l5_output` and `l6_secret` maps (`LAYER_TO_CLASS`, `ledger.py:81`, `:84`, `:1474`). The ledger schema enums keep them while old ledgers may be read (decided in R10).
+  - **Old classes:** drop the dead maps of the pre-I9 Layer 4-6 classes (`LAYER_TO_CLASS`, `ledger.py:81`, `:84`, `:1474`). The ledger schema enums keep them while old ledgers may be read (decided in R10; D8 then dropped them everywhere).
 - **Owns:** `scripts/ledger.py`, `schemas/coverage-ledger.schema.json`.
 - **Tests:**
   - fuzz ingest of a `f_0` candidate;
@@ -249,7 +249,7 @@ These are the same as the implementation plan's rules:
     - `docs/phase0-implementation-plan.md` (`--no-model` in the I5a note: mark it historical).
   - **Comments** that say the DAG is keyed by plain name, or that a missing model gives lexer modules: `module_map.py`, `wp_scheduler.py`, `workspace_overlay.py`, `harness_reach._module_entries`, `pipeline_make.py`. This step goes after R1–R7 have merged, since it touches their files.
   - **Test fixture:** `tests/test_wp_scheduler.py` builds an old-shape DAG (plain keys, `name_collisions`, no link units). Move it to the link-unit shape.
-  - **Old classes:** decide whether ledgers from before I9 must still load. If not, drop `l4_auth`, `l5_output` and `l6_secret` from the schemas and `generate_report`, with R2 and R4.
+  - **Old classes:** decide whether ledgers from before I9 must still load. If not, drop the pre-I9 Layer 4-6 classes from the schemas and `generate_report`, with R2 and R4 (decided: D8).
   - **Records:**
     - the decisions D2–D5 go into the implementation plan's decision table;
     - a short glossary in `phase0-downstream-effects.md` §3: `unit` is a capture path in `modules[*].unit` and `indirect_sites[].unit`, but a DAG module name in `submodules[*].unit` and sidecars;
@@ -313,19 +313,20 @@ These are known limits of the design, recorded in the step notes. None is a defe
 - **CodeQL:** facts outside the model (CMake probes) are counted as unmatched rather than filtered.
 - **Mechanical dispatch** (seeded set): cases with undeclared callees or gcrypt types are not filtered.
 - **Pre-I7 models:** a warning only. R4's version helper makes this uniform.
+- **One configuration per shared source file (defect 14, D5):** a file compiled by several units with different flags is parsed, analysed and proved only in the first unit's configuration, so the other units' `#if` branches and `-D` values go unchecked. qlz's four executables are the only benchmark target with the shape. The fix, when a target needs it: one parse per (file, configuration) and per-unit DAG views.
 
 ## Status
 
 | Step | Size | Status |
 | :--- | :--- | :--- |
-| R1 | M | open |
-| R2 | M | open |
-| R3 | S | open |
-| R4 | M | open |
-| R5 | M | open |
-| R6 | S | open |
-| R7 | M | open |
-| R8 | M | open |
-| R9 | M | open |
-| R10 | S | open |
-| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second runs after R1–R10 (D1′) and records `phase0-r2` |
+| R1 | M | done, `c689c1b` |
+| R2 | M | done, `ea9be7b` |
+| R3 | S | done, `152970e` |
+| R4 | M | done, `27f443d` + `f0cbf3c` (the three DAG fields D9 drops) |
+| R5 | M | done, `630e09e` |
+| R6 | S | done, `b3298c1` |
+| R7 | M | done, `3c68074` |
+| R8 | M | done, `47d7c89` |
+| R9 | M | done, `28101de` |
+| R10 | S | done |
+| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second, pending, runs after R1–R10 (D1′) and records `phase0-r2` |

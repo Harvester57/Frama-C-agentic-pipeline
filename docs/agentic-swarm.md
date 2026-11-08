@@ -19,22 +19,22 @@ Concurrency is never a fixed number:
 LLM subagents are used only where judgment is needed.
 
 ### Level 1: Module-Level Parallelism without Subagents (Phase 1 `/framac-fuzz` & Phase 2 `/framac-eva`)
-Independent modules (`snmpv3`, `syslog`, `xml`, `ipc`, etc.) share no internal state during slice verification, and their fuzz and Eva runs need no reasoning.
+Independent harness modules share no internal state during slice verification, and their fuzz and Eva runs need no reasoning. A harness module is a link unit of the build (`libqcbor_a`, the DAG's modules) or a sub-module of one (QCBOR has 8 harnesses inside `libqcbor_a`): a path module (the sources of one directory), a cluster of a unit too large for one Eva run, or a harness scoped by its sidecar's `scope_files` or `sources`. Make targets, reports and corpora are per harness module; the ledger groups functions by link unit (`scripts/module_map.py`).
 - A generated Makefile (`pipeline_make.py`) runs them. Each recipe is admitted by CPU and memory inside one container per phase.
 - Fuzzing (CPU-bound) and Eva (single-threaded, memory-bound) can run either **sequentially in the foreground** (giving standalone `eva` a writable `rw` `/framac-cache` mount) or **concurrently in the background** as two wrapper calls (where `eva` mounts `/framac-cache` read-only while `fuzz` runs target code). Ingestion keeps the fuzz-then-Eva order.
 - Each campaign runs as many LibFuzzer workers as its lease allows. Builds and Eva results are cached by content, so a harness repair re-runs only what changed.
 
 ### Level 2: Speculative Header Decoupling (architects)
 Bottom-up verification would otherwise have to wait for leaf functions before callers.
-- A **Speculative Interface Architect Subagent** per `.h` header ([`../skills/framac-wp/header_architect_brief.md`](../skills/framac-wp/header_architect_brief.md)) writes baseline `requires`, `assigns`, and `ensures` contracts.
+- A **Speculative Interface Architect Subagent** per `.h` header named by a harness sidecar (`header`; a unit whose harnesses name two headers gets two architects) ([`../skills/framac-wp/header_architect_brief.md`](../skills/framac-wp/header_architect_brief.md)) writes baseline `requires`, `assigns`, and `ensures` contracts.
 - It validates them dynamically against the Phase 1 fuzzer corpus using `run_eacsl_fuzz.py guardrail`.
 - Because `frama-c -wp -wp-fct <caller>` trusts the `.h` contract of any function `<callee>` it calls, a caller only waits for its callees' own provers, never for a global wave.
 
 ### Level 3: Dependency-Driven Function Provers (no waves)
 `wp_scheduler.py` keeps a ready queue instead of global waves. A function's prover is dispatched as soon as all of these are done:
 - its callees are merged (recursion cycles become ready together);
-- the architects of its own module and of every callee's module;
-- the gate of every fuzz/Eva slice covering its file.
+- the architects of its own unit and of every callee's unit (a leaf or static function that touches no module header skips them);
+- the gate of every fuzz/Eva slice covering its file; a sub-module's open candidates hold only the functions in its own scope, and the callers whose call cone they lie in.
 
 Ordering and merging:
 - Functions with the longest chains of callers waiting on them go first, so the critical path starts early.

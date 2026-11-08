@@ -462,7 +462,12 @@ _COVERAGE_OK = ("ok", "partial")
 
 
 def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str]:
-    """The entry points the reach gate holds a harness module to (as `check_module` does)."""
+    """
+    The entry points the reach gate holds a harness module to (as `check_module` does): for a sub-module,
+    its unit's entry points within its scope (`ModuleMap.scope_entry_points`); for a unit, its DAG
+    `candidate_entry_points`, else its non-static functions. All are DAG keys: the plain name, or
+    `file#name` when the name collides.
+    """
     if mm.units_are_link_units and mm.unit_of(module) != module:
         return mm.scope_entry_points(module)
     info = (dag.get("modules") or {}).get(module) or {}

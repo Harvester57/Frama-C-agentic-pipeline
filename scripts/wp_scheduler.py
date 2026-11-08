@@ -536,8 +536,9 @@ class Ctx:
         self.mm = ModuleMap(self.dag, self.sidecars)
         self.eva_unknowns, self._eva_items_by_fn = self._load_eva()
 
-        # DAG function records, by (file, name) and by bare name (`functions` is keyed by bare name;
-        # a qualified `file#name` key is accepted too).
+        # DAG function records, by (file, name) and by bare name. `functions` is keyed by the bare name,
+        # or by `file#name` when several functions share the name (build_callgraph_dag): both key forms
+        # land under the record's own file and name.
         self.dag_by_key: dict[tuple[str, str], dict] = {}
         self.dag_by_name: dict[str, list[dict]] = defaultdict(list)
         for key, rec in sorted((self.dag.get("functions") or {}).items()):
@@ -574,8 +575,9 @@ class Ctx:
                 if u.get("tier"):
                     self.unit_tier.setdefault(mod_str, str(u["tier"]))
 
-        # Every definition of a name: {name: {file: module}}. Static functions in different files
-        # share a name; the DAG keeps one of them and lists the others in name_collisions.
+        # Every definition of a name: {name: {file: module}}, from the ledger and the DAG. The DAG keeps
+        # one record per definition (`file#name` keys when a name collides) and lists each colliding
+        # name's files in `name_collisions`, which also places a definition no record or unit covers.
         self.defs: dict[str, dict[str, str]] = defaultdict(dict)
         for (file, fn), fn_units in sorted(self.units_by_fn.items()):
             self.defs[fn].setdefault(file, fn_units[0].get("module") or self.file_module.get(file, ""))
@@ -656,7 +658,7 @@ class Ctx:
     def inert(self, mod: str) -> bool:
         """
         Tier-3 modules, and modules with neither fuzz nor Eva, run no slice of their own: their gate
-        work counts as done. A sub-module answers from its own record (its lexer module's or its
+        work counts as done. A sub-module answers from its own record (its path module's or its
         split cluster's, scripts/module_map.py), else from its unit's.
         """
         if self.mm.is_submodule(mod):
@@ -724,7 +726,8 @@ class Ctx:
     def callees(self, file: str, fn: str) -> list[str]:
         rec = self.dag_by_key.get((file, fn))
         if rec is None:
-            # A same-named function the DAG did not keep: over-approximate with the kept record.
+            # A function with no DAG record of its own (a ledger unit from an older DAG, or a path
+            # spelled differently): over-approximate with the first record of that name.
             recs = self.dag_by_name.get(fn) or []
             rec = recs[0] if recs else {}
         return sorted({str(c) for c in rec.get("internal_callees") or [] if c})

@@ -2,6 +2,8 @@
 
 Status: proposal, being validated by the proof of concept in `poc/phase0/` before anything changes in `scripts/` (first results in §7).
 
+> **Later note (2026-11-08):** this design was implemented in steps I0–I10 of [phase0-implementation-plan.md](phase0-implementation-plan.md), and `poc/phase0/` was removed in remediation step R9 (decision D6). The paths below are those of the proof of concept: its reproducers and seeded corpus now live in `tests/fixtures/phase0/reproducers/` and `tests/fixtures/phase0/seeded/` (8 projects, run by `benchmark.py seeded`), and its scripts (`run.ps1`, `ab.py`, `seeded.py`) are gone.
+
 ## 1. Why
 
 Phase 0 has to give later phases four things:
@@ -219,7 +221,7 @@ Verdict: on this benchmark the redesign changes no bug outcome. What it changes 
 
 ### Seeded-bug benchmark: does Phase 0 change what is found? (2026-11-07)
 
-The benchmark targets above can't answer this question: their harnesses are written by hand and their bugs sit on obvious paths. `poc/phase0/seeded/` holds 7 small libraries. Each has one real, verified bug that is reachable only through one lexer weakness, plus decoys:
+The benchmark targets above can't answer this question: their harnesses are written by hand and their bugs sit on obvious paths. `poc/phase0/seeded/` (now `tests/fixtures/phase0/seeded/`) holds 7 small libraries. Each has one real, verified bug that is reachable only through one lexer weakness, plus decoys:
 - code that is never compiled;
 - internal helpers that crash only when called outside their contract.
 

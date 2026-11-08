@@ -9,17 +9,24 @@ candidates) is either a unit itself or a sub-module of one, such as QCBOR's 8 ha
 `libqcbor_a`. Its sidecar names its unit in `unit`.
 
 Every place that matches a harness module against a DAG module or a ledger unit's `module` goes
-through `ModuleMap`, so a sub-module's report credits its unit's functions. Without the model the DAG
-modules are the lexer's, every harness module is its own unit, and the mapping is the identity.
+through `ModuleMap`, so a sub-module's report credits its unit's functions. There is no DAG without
+the model (scripts/build_callgraph_dag.py), so its modules are always link units (`module_kind:
+"link_unit"`). A name `ModuleMap` does not know maps to itself, so under a DAG without link units (an
+old run directory, a test fixture) each harness module is its own unit.
 
-Sub-modules come from two places: the lexer modules of a unit (the benchmark's harnesses are written
-per lexer module), and the clusters of a unit too large for one Eva run (step I8, scripts/unit_split.py:
-the DAG's `submodules`, each with its `unit`, `functions` and entry points).
+Sub-modules come from two places: the path modules of a unit (the sources grouped by directory, kept
+under the DAG's `lexer_modules` and `unit_of_lexer_module`, a name left from the token lexer that drew
+them before the model; the benchmark's harnesses are written per path module), and the clusters of a
+unit too large for one Eva run (step I8, scripts/unit_split.py: the DAG's `submodules`, each with its
+`unit`, `functions` and entry points).
+
+DAG function keys are the plain name, or `file#name` when two functions share the name, so code that
+looks a function up goes through its DAG key or its (file, name), never the plain name alone.
 
 A harness module's *scope* is the code it answers for at the reachability gate: the whole unit for a
-unit-named harness; for a sub-module, the functions of the lexer module of the same name, else of the
+unit-named harness; for a sub-module, the functions of the path module of the same name, else of the
 split cluster of that name, else `scope_files` from its sidecar, else the functions of the sources its
-sidecar lists. Its tier and run flags come from the same record (the lexer module's or the cluster's,
+sidecar lists. Its tier and run flags come from the same record (the path module's or the cluster's,
 both set from its functions' tiers by scripts/tiers.py), else from its unit.
 
 `scope_files` is written by generate_harness.py (`--scope-file`, repeatable) and kept when the harness
@@ -141,7 +148,7 @@ class ModuleMap:
         return self.modules.get(self.unit_of(module)) or self.modules.get(module) or {}
 
     def submodule_record(self, module: str) -> dict | None:
-        """The record a sub-module takes its tier and run flags from: its lexer module's, else its cluster's."""
+        """The record a sub-module takes its tier and run flags from: its path module's, else its cluster's."""
         if not self.is_submodule(module):
             return None
         for rec in (self.lexer_modules.get(module), self.split_submodules.get(module)):
@@ -154,7 +161,7 @@ class ModuleMap:
         return [n for n, r in self.split_submodules.items() if r.get("unit") == unit]
 
     def tier_of(self, module: str) -> str | None:
-        """A sub-module's tier is its lexer module's or its cluster's (scripts/tiers.py); else the unit's."""
+        """A sub-module's tier is its path module's or its cluster's (scripts/tiers.py); else the unit's."""
         sub = self.submodule_record(module)
         if sub is not None:
             return str(sub["tier"])
@@ -193,7 +200,7 @@ def infer_unit(
 ) -> str | None:
     """
     The unit a new harness module belongs to (generate_harness.py writes it into the sidecar): the
-    module itself when it is a DAG module, else the unit holding its lexer module's functions, else the
+    module itself when it is a DAG module, else the unit holding its path module's functions, else the
     unit holding most of the functions the harness calls. Each reference votes by DAG key: a plain name
     stands for every function of that name (narrowed to the harness's `sources`), and a name whose
     functions sit in several units votes for none. None without link units.

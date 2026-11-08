@@ -1,6 +1,6 @@
 # Phase 0 implementation plan
 
-This plan turns the target Phase 0 in [`phase0-redesign.md`](phase0-redesign.md) into implementation steps. The proof of concept in `poc/phase0/` validated the core of that design.
+This plan turns the target Phase 0 in [`phase0-redesign.md`](phase0-redesign.md) into implementation steps. The proof of concept in `poc/phase0/` validated the core of that design. (`poc/phase0/` was removed in remediation step R9, decision D6: its reproducers and seeded corpus live in `tests/fixtures/phase0/`, and only its `.gitignore` stays, for the benchmark's work directory `poc/phase0/out/`.)
 
 Revised on 2026-11-07 after a review against the code:
 
@@ -26,11 +26,14 @@ Revised on 2026-11-07 after a review against the code:
 | How the work lands | Everything stays on `phase0-redesign` and merges to `main` once, at the end. `main` is merged into the branch at the start of each step, starting with `156adfa`. |
 | Images | Two images on a common base (same Debian release, same gcc), defined in one multi-stage Dockerfile. **Build image:** build systems, `bear`, `strace`, common `-dev` libraries, and per-target packages through small derived images. It runs the target's own build and its tests. **Frama-C image:** Frama-C, MetAcsl, the provers, and the compilers instrumented builds need (gcc, clang, libFuzzer), with no target packages. It runs everything else: parse, Eva, WP, E-ACSL and sanitizer builds, fuzzing, replay, coverage. **Snapshot:** the target's headers and libraries reach the Frama-C image through a snapshot the build exports. **CodeQL** gets its own image derived from the build image, off by default. The monolithic image stays until I10. |
 | Target does not build | Phase 0 **stops**. It records `needs_build_recipe` with diagnostics, and the parent agent asks the user for a build command, packages or flags. There is no inventory from the lexer. |
-| Frama-C cannot parse a unit | The GCC call-graph fallback runs, flagged in the ledger and the report. Fuzzing with sanitizers still runs; Eva and WP on that unit are reported blocked. Phase 0 stops only if no unit parses. |
+| Frama-C cannot parse a unit | The GCC call-graph fallback runs, flagged in the ledger and the report. Fuzzing with sanitizers still runs (`fuzz_engine: sanitizers`). Eva and WP do not run on that unit (`run_eva` and `run_wp_full` false): the seed defers their units with `unresolved: callgraph_fallback: <first Frama-C error>` rather than marking them `blocked`, which needs evidence, and REPORT.md's "Phase 0 parse" section lists each fallback unit, its first Frama-C error and what was deferred (remediation D2, reworded from "reported blocked"). Phase 0 stops only if no unit parses (`no_unit_parsed`). |
 | The lexer | Deleted at the end. `build_callgraph_dag.py` keeps only the DAG-view writer. |
 | Seed inputs from tests | The project's test suite runs inside the sandbox. The arguments the tests pass to the API are recorded as seeds, and the data files they read are kept as a secondary source. |
 | Threat model | A structured, machine-readable block in `THREAT_MODEL.md` (input sources, secrets, auth gates, output sinks). If it is missing, Phase 0 records `no_threat_model` rather than guessing. |
 | Benchmark baseline | Re-recorded at each step that changes units, after review. Recall of known bugs must never drop, and every change in unit counts is explained in the step's notes. |
+| Input readers and trust (remediation D3, 2026-11-08) | The input-path rule applies to every unit, not only to executables: a function that calls an input reader (`trust.INPUT_READERS`), and every function it reaches, is untrusted in a library too. It is more conservative than the rule I7 planned, and libraries that read files are real. |
+| Scalar helpers and tiers (remediation D4, 2026-11-08) | A function on an untrusted path that is straight-line scalar glue (no loop, no pointer parameter or result, no indirect call, allocation or recursion, not variadic, cyclomatic complexity at most 2, and off the trust boundary or without parameters) goes to Tier 3 (`tiers.is_scalar_helper`). The plan did not have this rule; it keeps parameterless getters out of Tier 1. |
+| One configuration per shared source file (remediation D5, 2026-11-08) | A source file compiled by several units with different flags is analysed once, in the first unit's configuration (defect 14; qlz's four executables are the only benchmark case). Recorded as a limit in the remediation plan's [backlog](phase0-remediation-plan.md#backlog-not-planned). A parse per (file, configuration) with per-unit DAG views is the fix when a target needs it. |
 
 Defaults taken where nothing was asked (open to change):
 
@@ -331,7 +334,7 @@ Defaults taken where nothing was asked (open to change):
 - **Acceptance:**
   - every gate above passes on the merged tree;
   - the status table below is complete;
-  - `poc/phase0/` is kept as history or removed (decide then).
+  - `poc/phase0/` is kept as history or removed (decide then). Decided later: removed (remediation D6, step R9).
 
 ## Order and parallelism
 
@@ -415,9 +418,9 @@ I0 ─┬─▶ I1 ────────────────────�
   - `main(int, char **)` goes from 1B to 1A, with the same run flags.
 - **Left:**
   - ~~retire the monolithic image~~: done in I10c;
-  - decide whether to keep or remove `poc/phase0/`;
+  - decide whether to keep or remove `poc/phase0/` (later: removed, remediation D6, step R9);
   - the single merge into `main`, which waits for the user;
-  - the manifest's `compile_commands` field and CryptoLib's `compile_commands` asset are now unused, and were kept so the harness digests don't change.
+  - the manifest's `compile_commands` field and CryptoLib's `compile_commands` asset are now unused, and were kept so the harness digests don't change (later: removed, remediation D7, step R9).
 
 ### I10a (2026-11-08)
 
@@ -754,7 +757,7 @@ I0 ─┬─▶ I1 ────────────────────�
 ### I5a (2026-11-08)
 
 - **DAG from the model** (`build_callgraph_dag.py`):
-  - **Input:** it reads `workspace/reports/phase0_model.json` when it exists with `status: ok`. `--model` points elsewhere and `--no-model` keeps the lexer. A missing or failed model falls back to the lexer, with a warning in the DAG's `warnings`.
+  - **Input:** it reads `workspace/reports/phase0_model.json` when it exists with `status: ok`. `--model` points elsewhere and `--no-model` keeps the lexer. A missing or failed model falls back to the lexer, with a warning in the DAG's `warnings`. *(Historical: I10a removed the lexer and `--no-model`. Without a successful model there is no DAG: `build_callgraph_dag.py` exits 2 and Phase 0 stops with `needs_build_recipe`.)*
   - **`model_view`, the PoC's held-module view promoted:**
     - **Functions:** keyed by plain name, or `file#name` when the name collides. Name, file, lines, storage, loops and cyclomatic complexity come from the model; parameters, WP blockers and security properties come from the lexer's analysis of the same definition.
     - **Definitions the lexer cannot match:** a definition behind a macro alias is matched through the alias in the same file. Otherwise the file is re-lexed, and a definition the lexer cannot see at all gets an empty record.

@@ -12,6 +12,7 @@ import pytest
 import checkpoint
 import ledger as L
 import phase0_gates
+import validate_artifacts
 import workspace_overlay
 import wp_scheduler as S
 from conftest import evidence, unit, write_json
@@ -97,34 +98,97 @@ class Sim:
 
     # ----------------------------------------------------------------- run setup
 
-    def build(self, functions, *, units=None, extra_units=(), collisions=(), sidecars=None, modules=None):
-        """functions: {name: (file, module, [callees])}; one planned rte unit each unless `units` is given."""
+    def build(self, functions, *, units=None, extra_units=(), sidecars=None, modules=None):
+        """
+        functions: {name or `file#name`: (file, module, [callees])}; one planned rte unit each unless
+        `units` is given. The DAG has the link-unit shape build_callgraph_dag.py writes: each module is
+        a link unit (`module_kind: "link_unit"`, `unit` its capture path), a function is keyed by its
+        plain name, or by `file#name` when several functions share the name (`name_collisions` lists
+        their files), and each function keeps its path module (`lexer_module`, its source directory).
+        Callees are DAG keys, as the model's edges give them; a plain name of a colliding function is
+        accepted too, as the scheduler resolves it (every definition, or the caller's own file's).
+        """
+        entries = [
+            (key.rpartition("#")[2], file, module, list(callees)) for key, (file, module, callees) in functions.items()
+        ]
+        files_of: dict[str, list[str]] = {}
+        for name, file, _module, _callees in entries:
+            files_of.setdefault(name, []).append(file)
         dag_fns: dict[str, dict] = {}
         mods: dict[str, dict] = {}
-        for name, (file, module, callees) in functions.items():
-            dag_fns[name] = {"name": name, "file": file, "module": module, "internal_callees": list(callees), "wave": 0}
-            mod = mods.setdefault(module, {"tier": TIER1, "files": [], "run_eva": True, "run_eacsl_fuzz": True})
+        path_mods: dict[str, dict] = {}
+        votes: dict[str, dict[str, int]] = {}
+        for name, file, module, callees in entries:
+            key = name if len(files_of[name]) == 1 else f"{file}#{name}"
+            path_mod = file.split("/")[1] if file.startswith("src/") and file.count("/") >= 2 else Path(file).stem
+            dag_fns[key] = {
+                "name": name,
+                "file": file,
+                "module": module,
+                "lexer_module": path_mod,
+                "internal_callees": callees,
+                "wave": 0,
+            }
+            mod = mods.setdefault(
+                module,
+                {
+                    "module": module,
+                    "unit": f"build/lib{module}.a",
+                    "kind": "static_library",
+                    "tier": TIER1,
+                    "files": [],
+                    "functions": [],
+                    "lexer_modules": [],
+                    "run_eva": True,
+                    "run_eacsl_fuzz": True,
+                },
+            )
+            mod["functions"].append(key)
             if file not in mod["files"]:
                 mod["files"].append(file)
-        for name, rec in dag_fns.items():
-            rec["internal_callers"] = sorted(n for n, other in dag_fns.items() if name in other["internal_callees"])
+            if path_mod not in mod["lexer_modules"]:
+                mod["lexer_modules"].append(path_mod)
+            path_rec = path_mods.setdefault(path_mod, {"module": path_mod, "tier": TIER1, "files": [], "functions": []})
+            path_rec["functions"].append(key)
+            if file not in path_rec["files"]:
+                path_rec["files"].append(file)
+            votes.setdefault(path_mod, {}).setdefault(module, 0)
+            votes[path_mod][module] += 1
+        for key, rec in dag_fns.items():
+            name = rec["name"]
+            rec["internal_callers"] = sorted(
+                k
+                for k, other in dag_fns.items()
+                if key in other["internal_callees"] or name in other["internal_callees"]
+            )
         for name, mod in mods.items():
-            mod["required_sources"] = sorted(mod["files"])
+            mod["files"].sort()
+            mod["functions"].sort()
+            mod["required_sources"] = list(mod["files"])
+            mod["function_count"] = len(mod["functions"])
+            mod["candidate_entry_points"] = list(mod["functions"])
             mod.update((modules or {}).get(name, {}))
-        modules = mods
         write_json(
             self.run_dir / "workspace/reports/callgraph_dag.json",
             {
+                "schema_version": 1,
+                "module_kind": "link_unit",
+                "callgraph_source": "frama_c",
+                "warnings": [],
                 "functions": dag_fns,
-                "modules": modules,
-                "name_collisions": list(collisions),
+                "modules": mods,
+                "lexer_modules": path_mods,
+                "unit_of_lexer_module": {
+                    p: sorted(v.items(), key=lambda kv: (-kv[1], kv[0]))[0][0] for p, v in sorted(votes.items())
+                },
+                "name_collisions": [
+                    {"function": n, "files": sorted(f)} for n, f in sorted(files_of.items()) if len(f) > 1
+                ],
                 "recursion_cycles": [],
             },
         )
         if units is None:
-            units = [
-                unit(file, name, "rte", module=module, tier=TIER1) for name, (file, module, _) in functions.items()
-            ]
+            units = [unit(file, name, "rte", module=module, tier=TIER1) for name, file, module, _ in entries]
         all_units = sorted([*units, *extra_units], key=lambda u: u["coverage_id"])
         write_json(self.run_dir / "coverage-ledger.json", all_units)
         write_json(self.run_dir / "candidates.json", [])
@@ -133,6 +197,7 @@ class Sim:
                 self.run_dir / f"workspace/harnesses/harness_{mod}.json",
                 {
                     "module": mod,
+                    **({"unit": mod} if mod in mods else {}),
                     "sources": [],
                     "cppflags": "-I.",
                     "repair_attempts": 0,
@@ -292,6 +357,21 @@ def sim(run_dir, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_the_fixture_dag_has_the_producers_link_unit_shape(sim):
+    sim.build(
+        {
+            "src/a/x.c#helper": ("src/a/x.c", "a", []),
+            "src/b/y.c#helper": ("src/b/y.c", "b", []),
+            "top": ("src/a/z.c", "a", ["src/a/x.c#helper"]),
+        }
+    )
+    dag = load(sim.run_dir / "workspace/reports/callgraph_dag.json")
+    assert validate_artifacts.validate_dag(dag) == []
+    assert dag["module_kind"] == "link_unit" and dag["unit_of_lexer_module"] == {"a": "a", "b": "b"}
+    assert dag["functions"]["src/a/x.c#helper"]["internal_callers"] == ["top"]
+    assert dag["modules"]["a"]["functions"] == ["src/a/x.c#helper", "top"]
+
+
 def test_chain_runs_callees_first_and_callers_wait_for_the_merge(sim, capsys):
     sim.build({"a": ("src/m/a.c", "m", ["b"]), "b": ("src/m/b.c", "m", ["c"]), "c": ("src/m/c.c", "m", [])})
     checkpoint.cmd_init(Path("state"), "/target", "verify")
@@ -371,18 +451,22 @@ def test_recursion_group_is_ready_together_and_its_callers_wait_for_every_member
 def test_name_collisions_resolve_same_file_statics_and_otherwise_wait_for_every_definition(sim):
     sim.build(
         {
-            "helper": ("src/a/x.c", "a", []),
+            "src/a/x.c#helper": ("src/a/x.c", "a", []),
+            "src/b/y.c#helper": ("src/b/y.c", "b", []),
             "top": ("src/c/z.c", "c", ["helper"]),
             "local": ("src/b/y.c", "b", ["helper"]),
+            "keyed": ("src/c/w.c", "c", ["src/b/y.c#helper"]),
         },
-        extra_units=[unit("src/b/y.c", "helper", "rte", module="b", tier=TIER1)],
-        collisions=[{"function": "helper", "files": ["src/a/x.c", "src/b/y.c"]}],
     )
+    dag = load(sim.run_dir / "workspace/reports/callgraph_dag.json")
+    assert {"src/a/x.c#helper", "src/b/y.c#helper"} <= set(dag["functions"]) and "helper" not in dag["functions"]
+    assert dag["name_collisions"] == [{"function": "helper", "files": ["src/a/x.c", "src/b/y.c"]}]
     S.cmd_init()
     t = tasks()
     ha, hb = "prove:src/a/x.c#helper", "prove:src/b/y.c#helper"
     assert {ha, hb} <= set(t["prove:src/c/z.c#top"]["deps"])  # ambiguous: every same-named function
     assert hb in t["prove:src/b/y.c#local"]["deps"] and ha not in t["prove:src/b/y.c#local"]["deps"]  # static wins
+    assert hb in t["prove:src/c/w.c#keyed"]["deps"] and ha not in t["prove:src/c/w.c#keyed"]["deps"]  # a DAG key
     slug_b = t[hb]["slug"]
     assert t[ha]["slug"] == "helper" and slug_b.startswith("helper_") and slug_b != "helper"
 
@@ -393,7 +477,11 @@ def test_name_collisions_resolve_same_file_statics_and_otherwise_wait_for_every_
     assert units()["src/b/y.c#helper::rte"]["status"] == "in_progress"  # the other static is untouched
     assert S.cmd_next("auto", prepare=True)["tasks"] == []
     sim.finish(f"prove-{slug_b}", "helper", "src/b/y.c")
-    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/b/y.c#local", "prove:src/c/z.c#top"]
+    assert sorted(ids(S.cmd_next("auto", prepare=True))) == [
+        "prove:src/b/y.c#local",
+        "prove:src/c/w.c#keyed",
+        "prove:src/c/z.c#top",
+    ]
 
 
 def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_module(sim):

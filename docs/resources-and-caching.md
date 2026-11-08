@@ -186,7 +186,7 @@ With rootful Docker on a Linux or macOS host, both wrappers run the container as
 | Function facts of a module (`facts`) | toolchain identity + flags + dependency manifest + digest of the Eva flows | `workspace/reports/facts/<module>.json` |
 | Parsed translation units for reading slices (`slice-index`) | digest of the preprocessed C, ignoring line markers and whitespace | the declaration and macro index, shared by every prover of a file, because ACSL-only merges leave those tokens unchanged |
 
-**Toolchain identity** is the image ID, plus a digest of `scripts/` and `templates/`, which are bind-mounted and change without an image rebuild.
+**Toolchain identity** is the image ID (or a digest of the tool versions when `FRAMAC_IMAGE_ID` is unset), plus `+snapshot:<digest>` when the run has a target snapshot (`workspace/snapshot/manifest.json`: the target's headers and libraries the analysis image compiles and links against, `cache.toolchain_id`), plus a digest of `scripts/` and `templates/`, which are bind-mounted and change without an image rebuild.
 
 The **dependency manifest** is the union of the include sets that `gcc -M` (with Frama-C's defines) and `clang -M` report for the effective flags, each file hashed. A header change anywhere in the closure invalidates the entry, including headers found next to the including file, through `../`, `-imacros` or computed includes. Output path and cwd are part of the key because crash attribution reads paths embedded in the binary.
 
@@ -238,8 +238,8 @@ python3 $S/pipeline_make.py gen                                         # once, 
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run build         # trusted: fills the shared store
 python3 $S/pipeline_make.py run fuzz                                    # \ run these two at the same time,
 python3 $S/pipeline_make.py run eva                                     # /  as two background wrapper calls (ro alongside fuzz; use /opt/framac-pipeline/scripts/pipeline_make.py run eva when running Eva standalone with rw shared cache)
-python3 $S/pipeline_make.py run coverage                                # after fuzz: what each corpus reached
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune      # trusted: the Eva ladder, for modules that still have Unknowns
+python3 $S/pipeline_make.py run coverage reach-dynamic                  # after fuzz: what each corpus reached; reopens the reach gate for unexecuted entry points
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest        # trusted: ingests reports and publishes evolved fuzz corpora to /framac-cache/corpora/<module>
 python3 $S/pipeline_make.py run replay wp-queue
 ```
@@ -251,11 +251,14 @@ The trusted steps are spelled out in full: only that exact command line gets a w
 | `slice-init` | the shadow overlay (`/framac-slice` Step 1); the build capture, the Phase 0 model and the seed recording run between it and `dag`, through the wrapper | static |
 | `dag` | the call-graph DAG from the Phase 0 model (`workspace/reports/phase0_model.json`, status `ok`) | static |
 | `security-props` | the MetAcsl security properties (`workspace/reports/security_props.json`); `seed` depends on it | static |
-| `seed` | after `reach-gate` and `security-props`: ledger seed, validation, checkpoint (initialized once, never rewound) | static |
-| `build` (`build-<mod>`) | E-ACSL / sanitizer compile of every fuzzable module | static |
+| `reach-gate` | the static Phase 0 reach gate (`harness_reach.py check`): every DAG entry point of each harnessed module is reached by its harness or exempted; records `workspace/reports/phase0_gates.json` with the digests of each harness and of the DAG, so a harness or DAG changed afterwards fails the gate until it runs again | static |
+| `seed` | after `reach-gate` and `security-props`: ledger seed, validation, and `state/progress.json` (initialized once, never rewound). The phase 0 checkpoint is recorded later, by `pipeline_make.py build-check` once every Phase 0 gate passed | static |
+| `seeds` | writes each module's seed inputs (`workspace/seeds/<mod>/`) in its harness's case format from the calls recorded by `seed_harvest.py record` (`seed_harvest.py write`); `fuzz-<mod>` rewrites its own before each campaign, and a failure never stops the pipeline | static |
+| `build` (`build-<mod>`) | E-ACSL / sanitizer compile of every fuzzable module, after the module's reach gate check | static |
 | `selftest` | the E-ACSL toolchain canary | dynamic |
-| `fuzz` (`fuzz-<mod>`) | one campaign per module; each depends on `selftest` and its `build-<mod>` | dynamic |
-| `coverage` (`coverage-<mod>`) | replays each module's corpus on a Clang source-coverage build and writes per-function reach to `workspace/reports/coverage/<mod>.json`; it starts no campaign, and nothing in the ledger reads it | dynamic |
+| `fuzz` (`fuzz-<mod>`) | one campaign per module, with its seeds as a read-only extra corpus; each depends on `selftest` and its `build-<mod>`, and checks the module's reach gate and build-check first | dynamic |
+| `coverage` (`coverage-<mod>`) | replays each module's corpus and seeds on a Clang source-coverage build and writes per-function reach to `workspace/reports/coverage/<mod>.json`; it starts no campaign | dynamic |
+| `reach-dynamic` (`reach-dynamic-<mod>`) | after `coverage-<mod>`: an API entry point of the module that no input executed reopens the reach gate (`harness_reach.py dynamic`), so the module's next `fuzz-`/`eva-` target stops until the harness is repaired or the entry point exempted | static |
 | `facts` (`facts-<mod>`) | kernel AST facts of the module's functions, joined with its Eva report's read and write sets, for the prover briefs; `wp-queue` depends on it, and a failure never stops the pipeline | static |
 | `eva` (`eva-<mod>`) | one Eva run per module; a module with a current tuning decision replays it (base run plus recorded rungs, combined by `eva_tuning.py finish --replay-only`), so the report equals `run eva-tune`'s | static |
 | `eva-tune` | the Eva ladder: base run, then rungs, selection, per-loop analysis and combination for modules left with Unknowns; rewrites the module's Eva report and records the decision | static |

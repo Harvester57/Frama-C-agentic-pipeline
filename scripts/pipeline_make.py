@@ -460,7 +460,8 @@ class Plan:
     seed_scope_args: str | None  # None: a scope path cannot be written to the makefile
     # Every module the plan considers, with the DAG record it runs under: each harness module whose
     # unit is a DAG module (a sub-module's record carries its own tier and run flags), plus each DAG
-    # module without any harness. Without link units these are exactly the DAG modules.
+    # module without any harness. Under a DAG without link units (an old run directory or a test fixture:
+    # build_callgraph_dag.py always writes link units) these are exactly the DAG modules.
     records: dict[str, dict] = field(default_factory=dict)
     mm: ModuleMap = field(default_factory=lambda: ModuleMap(None))
     modules: dict[str, ModulePlan] = field(default_factory=dict)
@@ -985,7 +986,7 @@ def _unit_note(plan: Plan, unit: str) -> str:
 def _harness_record(mm: ModuleMap, name: str, dag_modules: dict[str, dict]) -> dict:
     """
     The DAG record a harness module runs under: its own DAG module's, or for a sub-module of a link
-    unit, its lexer module's record when the DAG kept one (the sources and flags its harness was
+    unit, its path module's record (the DAG's `lexer_modules`) when it has one (the sources and flags its harness was
     generated against), else the unit's, with the sub-module's own tier and run flags.
     """
     unit = mm.unit_of(name)

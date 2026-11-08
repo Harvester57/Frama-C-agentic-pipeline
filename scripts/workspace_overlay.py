@@ -578,11 +578,12 @@ def _prover_header(
 
 # ------------------------------------------- link units and harness sub-modules (step I5b)
 #
-# A ledger unit's `module` is a DAG module: with the Phase 0 model, a link unit (`libqcbor_a`) whose
-# harnesses are sub-modules (`harness_qcbor_main_decode.json`, sidecar `unit`). Whatever needs a
-# sidecar, a harness, a corpus or a per-harness report "for a unit" resolves it here: the unit's own
-# harness when it has one, else its sub-modules (flags and sources: their union). Without link units
-# the DAG modules are the harness modules and every helper is the identity.
+# A ledger unit's `module` is a DAG module, which is a link unit (`libqcbor_a`; there is no DAG without
+# the Phase 0 model) whose harnesses may be sub-modules (`harness_qcbor_main_decode.json`, sidecar
+# `unit`). Whatever needs a sidecar, a harness, a corpus or a per-harness report "for a unit" resolves
+# it here: the unit's own harness when it has one, else its sub-modules (flags and sources: their
+# union). Under a DAG without link units (an old run directory, a test fixture) the DAG modules are the
+# harness modules and every helper is the identity.
 
 _MODULE_MAP_CACHE: dict[tuple, ModuleMap] = {}
 # Flags whose argument is the next word: kept together when flag strings are merged.

@@ -94,7 +94,8 @@ For a single module in guidance mode, check the module's Phase 0 gate first, the
 
 ```text
 python3 /opt/framac-pipeline/scripts/phase0_gates.py check --module <mod> --need reach,build_check
-python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
+python3 /opt/framac-pipeline/scripts/seed_harvest.py write --module <mod>
+python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --extra-corpus workspace/seeds/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
 ```
 
 The gate check exits 1 with the reasons when the module failed the reach gate or build-check, or its harness or the DAG changed since the reach check: repair the harness and re-run the gate (`/framac-slice` Steps 4b and 5); never fuzz around it. `campaign --module <mod>` enforces the same check itself whenever the run directory has a gate stamp (`workspace/reports/phase0_gates.json`): it refuses the module with the reasons and writes no report. A campaign outside a run directory is not gated.
