@@ -3,7 +3,7 @@
 Repeatable benchmark of this pipeline: measures what a change to its filters, Eva configuration or
 briefs actually does, instead of assuming it. See docs/benchmark.md.
 
-Host commands (stdlib only; tools run in the framac-pipeline container, so targets are fetched here):
+Host commands (stdlib only; tools run in the pipeline containers, so targets are fetched here):
   check-manifest                 validate benchmark/manifest.json
   fetch [--set S] [--target T]   clone the selected targets at their pinned revisions
   run [--compare NAME|FILE]      Phases 0 to 2 plus reproducer replay, no LLM; writes one JSON per run

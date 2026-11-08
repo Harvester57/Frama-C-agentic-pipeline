@@ -1567,7 +1567,7 @@ def run_targets(
         if found is None:
             return 2, {
                 "ok": False,
-                "error": "make not found: `pipeline_make.py run` runs inside the framac-pipeline container",
+                "error": "make not found: `pipeline_make.py run` runs inside the analysis container",
             }
         make_bin, make_runner = found, _subprocess_make_runner
     jobs = max(1, int(jobs or _make_jobs()))

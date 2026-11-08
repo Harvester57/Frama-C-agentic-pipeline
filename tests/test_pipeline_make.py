@@ -950,7 +950,7 @@ def test_generate_harness_cli_accepts_a_single_ldflag(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# GNU make (integration: needs make, e.g. inside the framac-pipeline container)
+# GNU make (integration: needs make, e.g. inside the analysis container)
 # ---------------------------------------------------------------------------
 
 

@@ -1395,7 +1395,7 @@ def test_a_report_without_tuning_ingests_exactly_as_before(run_dir):
 
 
 # ---------------------------------------------------------------------------
-# GNU make (integration: needs make, e.g. inside the framac-pipeline container)
+# GNU make (integration: needs make, e.g. inside the analysis container)
 # ---------------------------------------------------------------------------
 
 

@@ -90,10 +90,9 @@ docker build --target framac-build -t framac-build:latest .
 
 The analysis image holds none of the target's packages. Name them in the build recipe: the build capture installs them in a derived build image (`framac-build:<repo>`) and copies the headers and libraries the build used to the run's snapshot (`workspace/snapshot/`), where the analysis image reads them.
 
-Two more images are optional:
+One more image is optional: **CodeQL** (`docker build -f Dockerfile.codeql -t framac-codeql:latest .`), off by default. It adds untrusted marks from CodeQL's taint queries, and runs only when the user declares the target open source.
 
-- **CodeQL** (`docker build -f Dockerfile.codeql -t framac-codeql:latest .`), off by default. It adds untrusted marks from CodeQL's taint queries, and runs only when the user declares the target open source.
-- **The monolith** (`docker build -t framac-pipeline:latest .`, the Dockerfile's last stage) still works with `-Image framac-pipeline:latest` (`FRAMAC_DOCKER_IMAGE`). It is slated for removal: use the two images.
+`-Image` (`FRAMAC_DOCKER_IMAGE`) only renames the analysis image, or the build image with `-BuildImage`. The monolithic `framac-pipeline` image is gone.
 
 ### 2. Initialize a Run and Verify the E-ACSL Canary
 
@@ -157,7 +156,7 @@ Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contai
 ```text
 frama-c/
 ├── Dockerfile                        # Stages framac-build (Debian trixie, build systems, bear, strace), framac-analysis
-│                                     # (Frama-C 35.0~~dev, MetAcsl, E-ACSL, Alt-Ergo/Z3/CVC5, Clang/LibFuzzer), and the monolith
+│                                     # (Frama-C 35.0~~dev, MetAcsl, E-ACSL, Alt-Ergo/Z3/CVC5, Clang/LibFuzzer), the last stage
 ├── Dockerfile.codeql                 # Optional CodeQL image, built from framac-build
 ├── docker-compose.yml                # Manual container service definition & volume mappings
 ├── wrappers/

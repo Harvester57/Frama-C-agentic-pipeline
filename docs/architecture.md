@@ -74,7 +74,7 @@ flowchart TD
 
 Design and measurements: [`./phase0-redesign.md`](./phase0-redesign.md) and [`./phase0-implementation-plan.md`](./phase0-implementation-plan.md).
 
-- **Images.** The build image (`framac-build`) runs the target's own build and tests. The analysis image (`framac-analysis`) runs everything else and holds no target packages. The CodeQL image is optional and off by default. The monolithic `framac-pipeline` image still works but is slated for removal.
+- **Images.** The build image (`framac-build`) runs the target's own build and tests. The analysis image (`framac-analysis`) runs everything else and holds no target packages. The CodeQL image is optional and off by default. There are no other images: the monolithic `framac-pipeline` image was removed in step I10.
 - **Build capture** (`build_capture.py`, build image, scratch volume). The target's build runs under `bear` from a recipe the user gave or confirmed. It gives the link units, per-file flags, test units, API entry points, and a snapshot of the target's headers and libraries in `workspace/snapshot/`. A build that fails stops Phase 0 with `needs_build_recipe` until the user fixes the recipe.
 - **Frama-C model** (`phase0_model.py`, analysis image). One Frama-C parse per distinct set of sources and flags gives the functions (`file#name`), direct and indirect edges, macro aliases, thread entries and each function's trust. A unit Frama-C cannot parse falls back to GCC's `-fcallgraph-info`, and is flagged. Alias narrowing of indirect edges exists but is off by default.
 - **Trust** (`trust.py`). Library API and functions reached from input readers are untrusted, unless the structured threat model says otherwise. Optional CodeQL facts can only add untrusted marks.
