@@ -133,7 +133,8 @@ _PATH_OPTS = ("-I", "-iquote", "-isystem", "-idirafter", "-include", "-imacros")
 _PP_VALUE_OPTS = ("-include", "-imacros", "-iquote", "-isystem", "-idirafter", "-I", "-D", "-U")
 _SOURCE_SUFFIXES = (".c",)
 _OBJECT_SUFFIXES = (".o", ".lo", ".obj")
-_SHARED_RE = re.compile(r"\.so(?:\.\d+)*$")
+# A shared library by name: `.so`, then any version suffix, numeric or not (`libpng18.so.18.0.git`).
+_SHARED_RE = re.compile(r"\.so(?:\.[0-9A-Za-z_+-]+)*$")
 _DEP_FLAGS_NOARG = {"-MD", "-MMD", "-MP", "-M", "-MM", "-MG"}
 _DEP_FLAGS_ARG = {"-MF", "-MT", "-MQ"}
 _LINK_ONLY_NOARG = {"-shared", "-static", "-rdynamic", "-pie", "-no-pie", "-static-pie", "-s", "-nostartfiles"}

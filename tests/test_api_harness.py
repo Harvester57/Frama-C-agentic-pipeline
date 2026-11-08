@@ -275,6 +275,31 @@ def test_write_uses_the_sidecar_layout(tmp_path, monkeypatch):
     assert [p.read_bytes() for p in Path("workspace/seeds/lib").iterdir()] == [b"\x00hi"]
 
 
+def test_case_probe_finds_the_headers_the_build_generated(tmp_path, monkeypatch):
+    # Without them a target header fails first (libpng: pnglibconf.h), on no case's line, and the
+    # probe drops nothing: no case was checked.
+    import subprocess
+
+    snap = tmp_path / "snapshot"
+    (snap / "generated/build").mkdir(parents=True)
+    (snap / "manifest.json").write_text(json.dumps({"digest": "d", "files": {}, "generated_dirs": ["build"]}))
+    monkeypatch.setenv("FRAMAC_SNAPSHOT_DIR", str(snap))
+    harness = tmp_path / "harness_lib.c"
+    harness.write_text("    case 0U: { f(); break; }\n    case 1U: { g(1); break; }\n")
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr=f"{harness.name}:2:15: error: too many arguments\n"
+        )
+
+    monkeypatch.setattr(ah.subprocess, "run", fake_run)
+    assert ah.failing_cases(harness, "-Iworkspace/work", clang="clang") == {1}
+    argv = seen[0]
+    assert argv[argv.index("-idirafter") + 1] == (snap / "generated/build").as_posix()
+
+
 # --- benchmark ------------------------------------------------------------------------------------------
 
 

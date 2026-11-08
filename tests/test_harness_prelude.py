@@ -260,6 +260,25 @@ class TestResolvePreludeHeaders:
         assert res["status"] == "skipped"
         assert "file not found" in res["reason"]
 
+    def test_clang_finds_the_headers_the_build_generated(
+        self, tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """libpng's png.h includes the generated pnglibconf.h, which only the run snapshot has."""
+        snap = tree["root"] / "snapshot"
+        (snap / "generated/build").mkdir(parents=True)
+        (snap / "generated/build/pnglibconf.h").write_text("#define PNG_LIBCONF 1\n", encoding="utf-8")
+        (snap / "manifest.json").write_text(json.dumps({"digest": "d", "files": {}, "generated_dirs": ["build"]}))
+        monkeypatch.setenv("FRAMAC_SNAPSHOT_DIR", str(snap))
+        runner = ScriptedClang([])
+        cppflags = f"-I{tree['src'].as_posix()}"
+
+        res = resolve_prelude_headers(tree["harness"], cppflags, "Events.h", clang="clang", runner=runner)
+
+        assert res["status"] == "clean"
+        cmd = runner.calls[0]
+        assert cmd[cmd.index("-idirafter") + 1] == (snap / "generated/build").as_posix()
+        assert cmd[-1] == str(tree["harness"])
+
     def test_separated_include_flag_is_parsed(self, tree: dict[str, Path]) -> None:
         """(i) `-I dir` (separate token) is searched just like `-Idir`."""
         other = tree["root"] / "inc dir"

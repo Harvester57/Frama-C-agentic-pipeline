@@ -1064,7 +1064,13 @@ def resolve_prelude_headers(
     Returns a dict with `status` ("clean" | "resolved" | "unresolved" |
     "skipped"), `prelude_headers` (basenames as included), `unresolved_symbols`,
     `iterations` (number of clang runs) and, when skipped, `reason`.
+
+    clang also gets the run snapshot's `-idirafter` options (scripts/target_env.py), as every other
+    compile of the target does: a header the build generated (libpng's `pnglibconf.h`) is only there.
+    They are not searched for definitions and not recorded in the sidecar.
     """
+    from target_env import with_include_flags
+
     harness_file = Path(harness_file)
     result: dict[str, Any] = {
         "status": "skipped",
@@ -1097,7 +1103,7 @@ def resolve_prelude_headers(
         "-ferror-limit=0",
         "-x",
         "c",
-        *_split_cppflags(cppflags),
+        *_split_cppflags(with_include_flags(cppflags)),
         str(harness_file),
     ]
     prelude: list[str] = []
@@ -1422,6 +1428,12 @@ def _merge_dag_harness_sources(
     caller_rel_set = {_rel_path(s) for s in norm_sources}
     merged = list(norm_sources)
     seen_rel = set(caller_rel_set)
+    # The unit module owning each source (a link-unit DAG's `files` partition the sources).
+    owner_of: dict[str, str] = {}
+    for mod_key, info in modules_map.items():
+        for f in (info.get("files") if isinstance(info, dict) else None) or []:
+            if isinstance(f, str):
+                owner_of.setdefault(f, str(mod_key))
 
     for fn_name in sorted(target_fns):
         fn_rec = functions_map.get(fn_name)
@@ -1431,10 +1443,25 @@ def _merge_dag_harness_sources(
         mod_info = modules_map.get(mod_name) if isinstance(mod_name, str) else None
         # With link units (step I5b) a callee's sources are its lexer module's closure, as before,
         # not its whole unit's: a unit can hold files only some builds compile (x509-parser.c's
-        # Frama-C-only `main`), and a harness should pull in what its callees need.
+        # Frama-C-only `main`), and a harness should pull in what its callees need. A lexer module is
+        # a directory, though, and can span units (libpng's contrib/ holds eight programs, each with
+        # its own `main`): a file another unit owns is dropped unless the function's unit links it.
+        # The project libraries the unit links come in whole, as the build links them: the model
+        # parses each unit apart, so no call edge leads from a program into its library.
+        unit_list = (
+            [s for s in mod_info["required_sources"] if isinstance(s, str)]
+            if isinstance(mod_info, dict) and isinstance(mod_info.get("required_sources"), list)
+            else []
+        )
+        unit_sources = set(unit_list)
         lexer_info = (dag.get("lexer_modules") or {}).get(fn_rec.get("lexer_module") or "")
         if isinstance(lexer_info, dict) and isinstance(lexer_info.get("required_sources"), list):
-            mod_info = lexer_info
+            closure = [s for s in lexer_info["required_sources"] if isinstance(s, str)]
+            kept = [s for s in closure if owner_of.get(s) in (None, mod_name) or s in unit_sources]
+            fn_file = fn_rec.get("file")
+            kept = kept or ([fn_file] if isinstance(fn_file, str) else [])
+            kept += [s for s in unit_list if owner_of.get(s) not in (None, mod_name) and s not in kept]
+            mod_info = {"required_sources": kept}
         extra_rels: list[str] = []
         if isinstance(mod_info, dict) and isinstance(mod_info.get("required_sources"), list):
             extra_rels.extend(s for s in mod_info["required_sources"] if isinstance(s, str))

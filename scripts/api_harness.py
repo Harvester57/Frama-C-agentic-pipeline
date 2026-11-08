@@ -499,14 +499,17 @@ def failing_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> s
     """
     Selectors of the dispatch cases the compiler refuses (each case is one line of the harness), or
     None when no compiler ran. A case the target's headers cannot spell (an incomplete struct) is
-    dropped instead of failing the whole harness.
+    dropped instead of failing the whole harness. The compiler gets the run snapshot's include options
+    (scripts/target_env.py), so the headers the build generated are found as in every other compile.
     """
     import shlex
+
+    from target_env import with_include_flags
 
     exe = clang or shutil.which("clang") or shutil.which("gcc")
     if not exe:
         return None
-    argv = [exe, "-fsyntax-only", "-w", "-x", "c", *shlex.split(cppflags), str(harness_c)]
+    argv = [exe, "-fsyntax-only", "-w", "-x", "c", *shlex.split(with_include_flags(cppflags)), str(harness_c)]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     except (OSError, subprocess.TimeoutExpired):

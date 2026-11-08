@@ -93,6 +93,28 @@ class TestRecordedEvents:
         }
         assert units["app"]["external_libs"] == [{"ref": "-lvendor", "libdirs": ["/opt/vendor/lib"]}]
 
+    def test_shared_library_with_a_non_numeric_version_suffix_is_linked(self):
+        # libpng's CMake build: a development version names the library `libpng18.so.18.0.git`, and the
+        # executables link it by that name from the build directory.
+        def cc(*args: str) -> dict:
+            return {"exe": "/usr/bin/cc", "args": ["cc", *args], "cwd": f"{TREE}/build"}
+
+        execs = [
+            cc("-fPIC", "-I", TREE, "-c", "-o", "CMakeFiles/png.dir/png.c.o", f"{TREE}/png.c"),
+            cc("-fPIC", "-shared", "-o", "libpng18.so.18.0.git", "CMakeFiles/png.dir/png.c.o"),
+            cc("-I", TREE, "-c", "-o", "CMakeFiles/pngfix.dir/pngfix.c.o", f"{TREE}/contrib/tools/pngfix.c"),
+            cc("CMakeFiles/pngfix.dir/pngfix.c.o", "-o", "pngfix", "libpng18.so.18.0.git", "-lm"),
+        ]
+        units = bc.derive_units(bc.classify_executions(execs, TREE), TREE)
+        assert shape(units) == {
+            "build/libpng18.so.18.0.git": ("shared_lib", ["png.c"], []),
+            "build/pngfix": ("executable", ["contrib/tools/pngfix.c"], ["build/libpng18.so.18.0.git"]),
+        }
+        for name in ("libx.so", "libx.so.1", "libx.so.1.2.3", "libpng18.so.18.0.git", "libx.so.1.0-rc1"):
+            assert bc._SHARED_RE.search(name), name
+        for name in ("x.c", "x.o", "libx.a", "x.sock", "libso.c"):
+            assert not bc._SHARED_RE.search(name), name
+
     def test_build_system_probes_are_dropped(self):
         cap = capture_of("probes")
         assert list(cap["compiles"]) == ["build/CMakeFiles/foo.dir/foo.c.o"]

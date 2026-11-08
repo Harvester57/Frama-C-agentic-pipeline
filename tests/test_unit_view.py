@@ -175,6 +175,38 @@ def test_harness_sources_resolve_a_colliding_callee_name(tmp_path: Path) -> None
     assert merged == ["tools/cli.c"]
 
 
+def test_harness_sources_keep_to_the_unit_when_a_lexer_module_spans_programs(tmp_path: Path) -> None:
+    # libpng: contrib/ is one lexer module holding several programs, each its own unit with its own
+    # `main`. A harness for one program must not pull in the others, and gets the whole library the
+    # program links (the model parses each unit apart: no call edge leads into the library).
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "harnesses").mkdir()
+    progs = ("contrib/tools/pngfix.c", "contrib/libtests/pngvalid.c")
+    lib = ["png.c", "pngrutil.c"]
+    dag = {
+        "module_kind": "link_unit",
+        "functions": {
+            f"{p}#main": {"name": "main", "module": Path(p).stem, "lexer_module": "contrib", "file": p} for p in progs
+        },
+        "modules": {
+            "libpng_a": {"files": lib, "required_sources": lib},
+            "pngfix": {"files": [progs[0]], "required_sources": [progs[0], *lib]},
+            "pngvalid": {"files": [progs[1]], "required_sources": [progs[1], *lib]},
+        },
+        "lexer_modules": {"contrib": {"required_sources": sorted(progs)}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_harness_sources(tmp_path / "harnesses", [progs[0]], False, "main")
+    assert merged == [progs[0], *lib]
+    # A program that links no project library gets its own file only.
+    dag["modules"]["pngfix"]["required_sources"] = [progs[0]]
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_harness_sources(tmp_path / "harnesses", [progs[0]], False, "main")
+    assert merged == [progs[0]]
+
+
 def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
     import generate_harness
 
