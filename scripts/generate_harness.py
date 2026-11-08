@@ -87,7 +87,7 @@ def _normalize_run_rel_dir(dir_str: str) -> str:
 def _append_cppflag(cppflags: str, flag: str) -> str:
     existing = _split_cppflags(cppflags)
     if flag not in existing:
-        return f"{cppflags} {flag}".strip()
+        return f"{cppflags} {shlex.quote(flag)}".strip()
     return cppflags.strip()
 
 
@@ -1214,7 +1214,8 @@ def _normalize_cppflags_dirs(cppflags: str) -> str:
         if norm_tok.startswith(("-I", "-D", "-U", "-std=")) and norm_tok in out:
             continue
         out.append(norm_tok)
-    return " ".join(out) or "-I."
+    # Quoted so a value such as -DLOG_PATH="log.txt" keeps its quotes through later shlex splits.
+    return " ".join(shlex.quote(t) for t in out) or "-I."
 
 
 def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -> str:
