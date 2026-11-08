@@ -87,7 +87,7 @@ def _normalize_run_rel_dir(dir_str: str) -> str:
 def _append_cppflag(cppflags: str, flag: str) -> str:
     existing = _split_cppflags(cppflags)
     if flag not in existing:
-        return f"{cppflags} {flag}".strip()
+        return f"{cppflags} {shlex.quote(flag)}".strip()
     return cppflags.strip()
 
 
@@ -1214,7 +1214,8 @@ def _normalize_cppflags_dirs(cppflags: str) -> str:
         if norm_tok.startswith(("-I", "-D", "-U", "-std=")) and norm_tok in out:
             continue
         out.append(norm_tok)
-    return " ".join(out) or "-I."
+    # Quoted so a value such as -DLOG_PATH="log.txt" keeps its quotes through later shlex splits.
+    return " ".join(shlex.quote(t) for t in out) or "-I."
 
 
 def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -> str:
@@ -1248,6 +1249,15 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
             norm_flag = _normalize_dag_cppflag(raw_flag.strip())
             if norm_flag.startswith(("-I", "-D", "-U", "-std=")):
                 cppflags = _append_cppflag(cppflags, norm_flag)
+        # The unit's force-included files (`-include config.h` in the build): without them the
+        # harness compiles different code than the build does.
+        tokens = _split_cppflags(cppflags)
+        forced = {tokens[i + 1] for i, t in enumerate(tokens[:-1]) if t in ("-include", "-imacros")}
+        for raw in mod_info.get("force_includes") or []:
+            path = _normalize_run_rel_dir(str(raw))
+            if isinstance(raw, str) and raw.strip() and path not in forced:
+                cppflags = f"{cppflags} -include {path}".strip()
+                forced.add(path)
         break
     return cppflags
 
@@ -1375,6 +1385,12 @@ def _merge_dag_harness_sources(
             continue
         mod_name = fn_rec.get("module")
         mod_info = modules_map.get(mod_name) if isinstance(mod_name, str) else None
+        # With link units (step I5b) a callee's sources are its lexer module's closure, as before,
+        # not its whole unit's: a unit can hold files only some builds compile (x509-parser.c's
+        # Frama-C-only `main`), and a harness should pull in what its callees need.
+        lexer_info = (dag.get("lexer_modules") or {}).get(fn_rec.get("lexer_module") or "")
+        if isinstance(lexer_info, dict) and isinstance(lexer_info.get("required_sources"), list):
+            mod_info = lexer_info
         extra_rels: list[str] = []
         if isinstance(mod_info, dict) and isinstance(mod_info.get("required_sources"), list):
             extra_rels.extend(s for s in mod_info["required_sources"] if isinstance(s, str))

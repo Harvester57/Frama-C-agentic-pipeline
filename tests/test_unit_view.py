@@ -106,6 +106,59 @@ def test_unit_cppflags_are_single_tokens() -> None:
     )
     assert flags == ["-DA", "-Iinc", "-Isys", "-std=c99", "-Ilex"]
     assert forced == ["config.h"]
+    # Rooted like the lexer's flags (relative to the run directory).
+    flags, forced = bcd.unit_cppflags(
+        ["-include", "config.h", "-I", "include", "-Ilib", "-I.", "-I/usr/inc"],
+        ["-Iworkspace/work/lib"],
+        "workspace/work",
+    )
+    assert flags == ["-Iworkspace/work/include", "-Iworkspace/work/lib", "-Iworkspace/work", "-I/usr/inc"]
+    assert forced == ["workspace/work/config.h"]
+
+
+def test_harness_sources_follow_the_callees_lexer_module(tmp_path: Path) -> None:
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "harnesses").mkdir()
+    dag = {
+        "module_kind": "link_unit",
+        "functions": {"u_len": {"module": "libkv_a", "lexer_module": "util", "file": "src/util.c"}},
+        "modules": {"libkv_a": {"required_sources": ["src/util.c", "src/decode.c", "src/fc_main.c"]}},
+        "lexer_modules": {"util": {"required_sources": ["src/util.c", "src/str.c"]}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_harness_sources(tmp_path / "harnesses", ["src/harness_util.c"], False, "u_len")
+    assert merged == ["src/harness_util.c", "src/util.c", "src/str.c"]
+
+
+def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "harnesses").mkdir()
+    dag = {
+        "module_kind": "link_unit",
+        "modules": {
+            "libtlv_a": {"cppflags": ["-Iworkspace/work/include"], "force_includes": ["workspace/work/config.h"]}
+        },
+        "unit_of_lexer_module": {"tlv": "libtlv_a"},
+        "lexer_modules": {"tlv": {"cppflags": ["-DLEGACY"]}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    for module in ("libtlv_a", "tlv"):
+        flags = generate_harness._merge_dag_module_cppflags(module, tmp_path / "harnesses", "-I.")
+        assert flags.split() == ["-I.", "-Iworkspace/work/include", "-include", "workspace/work/config.h"]
+    again = generate_harness._merge_dag_module_cppflags(
+        "tlv", tmp_path / "harnesses", "-include workspace/work/config.h"
+    )
+    assert again.count("config.h") == 1
+    # A quoted macro value survives the merge (CryptoLib's -DMC_LOG_PATH="log.txt").
+    modules: dict = dag["modules"]  # type: ignore[assignment]
+    modules["libtlv_a"]["cppflags"] = ['-DLOG="log.txt"']
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_module_cppflags("tlv", tmp_path / "harnesses", "-DA='x y'")
+    assert generate_harness._split_cppflags(merged)[:2] == ["-DA=x y", '-DLOG="log.txt"']
 
 
 def test_modules_are_the_non_test_link_units() -> None:
