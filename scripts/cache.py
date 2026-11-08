@@ -53,7 +53,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
-from build_callgraph_dag import C_KEYWORDS  # noqa: E402
+from c_definitions import C_KEYWORDS  # noqa: E402
 from framac_common import RunLockTimeout, run_lock, utc_now  # noqa: E402
 
 CACHE_SCHEMA_VERSION = 1

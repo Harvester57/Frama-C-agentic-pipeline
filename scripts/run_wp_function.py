@@ -470,7 +470,7 @@ def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
     if not c_file.is_file():
         return {}
     try:
-        from build_callgraph_dag import extract_functions_from_code, extract_macro_definitions
+        from c_definitions import extract_functions_from_code, extract_macro_definitions
 
         raw_code = c_file.read_text(encoding="utf-8", errors="replace")
         macros = extract_macro_definitions(raw_code, path=str(c_file))

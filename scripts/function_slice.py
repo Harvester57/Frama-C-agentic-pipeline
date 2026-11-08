@@ -64,7 +64,7 @@ from acsl_ast import (  # noqa: E402
     locate_function_span,
     tokenize_c_acsl,
 )
-from build_callgraph_dag import (  # noqa: E402
+from c_definitions import (  # noqa: E402
     _DEFINE_RE,
     _find_matching_backward,
     _find_matching_forward,
@@ -123,7 +123,7 @@ _ATTRIBUTE_WORDS = frozenset(
     {"__attribute__", "__attribute", "__declspec", "_declspec", "__asm__", "__asm", "asm", "_Alignas"}
 )
 _TYPE_GROUP_WORDS = frozenset({"typeof", "__typeof__", "__typeof", "_Atomic"})
-# Words that are never a declared name or a reference. C_KEYWORDS (build_callgraph_dag) holds the
+# Words that are never a declared name or a reference. C_KEYWORDS (c_definitions) holds the
 # statement keywords; TYPE_MODIFIERS_AND_PRIMITIVES cannot serve here because it lists size_t and
 # u8, which projects really do declare with typedef.
 _C_WORDS = frozenset(

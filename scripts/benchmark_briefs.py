@@ -198,7 +198,7 @@ def missing_annotations(original: str, answer: str) -> list[str]:
 
 
 def defined_functions(text: str) -> list[str]:
-    from build_callgraph_dag import extract_functions_from_code
+    from c_definitions import extract_functions_from_code
 
     return [f["name"] for f in extract_functions_from_code(text, path="answer.c")]
 

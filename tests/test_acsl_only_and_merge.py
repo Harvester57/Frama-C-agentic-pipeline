@@ -242,7 +242,7 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         stub_tokens = tokenize_c_acsl(stubs_text)
         assert find_unsound_acsl_keywords(stub_tokens, path="external_stubs.h") == []
 
-        from build_callgraph_dag import extract_functions_from_code
+        from c_definitions import extract_functions_from_code
         from framac_common import augment_framac_cppflags
 
         fc_stubs_dir = repo_root / "templates" / "fc_stubs"
