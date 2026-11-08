@@ -812,6 +812,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 # A harness reaches this header function after all: it is work again.
                 u["status"] = "planned"
                 u["unresolved"] = []
+            if u["status"] == "deferred":
+                continue  # still unreached: no evidence on a deferred unit
 
             for alarm in unit_invalids:
                 consumed.add(id(alarm))

@@ -575,6 +575,7 @@ def test_ingest_eva_replans_an_unreached_header_unit_a_harness_reaches(run_dir):
             },
         },
     }
+    dag["functions"]["put"] = {**dag["functions"]["get"], "name": "put"}
     write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
     L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
     assert units_by_id(run_dir)["inc/u.h#get::rte"]["status"] == "deferred"
@@ -592,6 +593,9 @@ def test_ingest_eva_replans_an_unreached_header_unit_a_harness_reaches(run_dir):
     L.cmd_ingest_eva([run_dir / "workspace/reports/eva/m.json"])
     unit = units_by_id(run_dir)["inc/u.h#get::rte"]
     assert unit["status"] == "covered" and unit["unresolved"] == []
+    # One the harness does not reach stays deferred, without evidence (the ledger write validates it).
+    other = units_by_id(run_dir)["inc/u.h#put::rte"]
+    assert other["status"] == "deferred" and other["evidence"] == []
 
 
 def test_kernel_renames_only_map_names_without_a_unit():
