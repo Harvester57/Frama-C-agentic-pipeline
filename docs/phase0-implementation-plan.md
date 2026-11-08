@@ -381,6 +381,29 @@ I0 ─┬─▶ I1 ────────────────────�
 
 ## Step notes
 
+### I10a (2026-11-08)
+
+- **Lexer deleted.** `build_callgraph_dag.py` goes from 2,764 to 971 lines and builds the DAG from the Phase 0 model only. Without a model it stops with exit 2 (`needs_build_recipe`). Gone: the token lexer and body analysis, the Makefile and `compile_commands.json` flag discovery, `--compile-commands`, `--emit-compile-commands`, `--no-model`, the pre-flight warnings (multidimensional array parameters, prototype/definition parameter counts) and the regex call graph (`callgraph_source: regex` left the ledger schema and `ledger.py`).
+  - The C definition finder that per-file tools still use (WP runner, fuzz linker, slicer, benchmark briefs, cache) moved unchanged to `scripts/c_definitions.py` (438 lines). `run_wp_function.py`'s variadic check reads the parameter tokens directly.
+  - `tests/test_callgraph_dag.py` (1,022 lines) is replaced by tests of the model facts (194 lines) and `tests/test_c_definitions.py`.
+- **Partition kept:** the path-module rule (`src/<dir>/…` → `<dir>`, `src/f.c` → `f`, `<dir>/…` → `<dir>`, `f.c` → `f`) and the header-function vote are unchanged, and so are the keys `lexer_modules`, `lexer_module` and `unit_of_lexer_module`. Path modules with no function (test and example directories outside the build) are no longer listed.
+- **Fields, from the model:**
+  - `params`, `is_variadic`, `returns_pointer`, `const_ptr_params`, `mutable_ptr_params`, `takes_bounded_buffer`, `writes_bounded_buffer`: the canonical `signature` and the `formals` kinds (dump schema 3). Frama-C's `__va_params` formal marks a variadic definition. A model without `formals` (before I9) counts every pointer as writable and infers no buffer direction. A byte buffer is one level of indirection to `char`/`void`, so `char **argv` is not one.
+  - `external_callees`, `has_dynamic_alloc`, `uses_format_or_write`: the model's `external_calls` (I7). `indirect_calls`: the model's `indirect_sites`.
+  - `wp_blockers`, `wp_notes`, `verifiability`, `security_properties` (L2 only): the same rules on these facts.
+  - `required_sources`, `cross_module_callees`, `candidate_entry_points` of path modules: the model's edges (the closure starts at the module's own non-header functions).
+  - `cppflags`: the build's flags per unit, plus `-I` for each source's directory and the directories of the project headers it includes (`build_capture.json`'s `cc -M` lists; `--capture`, default next to the model). This replaces the lexer's Makefile `-I` discovery. Path modules take the union of their units' flags.
+  - **Dropped:** `has_pointer_cast`, `macro_loops`, `irreducible_goto`, `container_of`, `volatile_or_asm`, `header_inline_callees` (the model has the header functions themselves), `model.lexer_only_functions`, `lexer_tier`.
+- **Tiers** (`tiers.py`): the lexer fallback is gone. Without trust (a model before I7) every function is taken as on an untrusted path, so only the structure decides, and `tiers.source` is `structure`. `retier_modules` is public.
+- **Equivalence** (`build_dag` before, at `e073f4d`, and after, on the same saved models, all of `i5b3-*`, `i5b4-*`, `i8-p0-*`, `i9m1-*`, and the 16 reproducers and seeded projects captured and modelled with this branch):
+  - **Same everywhere:** link-unit modules, their files, functions, entry points, `required_sources` and `force_includes`; split sub-modules; `unit_of_lexer_module`; every function's module, path module, callees, wave and recursion.
+  - **Unit `cppflags`:** CryptoLib loses 9 `-I` of stub and alternative-backend directories, which came from the manifest's `compile_commands.json` asset rather than the build. Units whose sources sit at the project root gain `-I<root>` (r06, s04).
+  - **Path modules:** CryptoLib's follow the real build's sources (libgcrypt, internal) instead of the asset's stubs. `required_sources` gain the callees the lexer missed behind macros (qlz, tweetnacl, qcbor, r07, r09, s01, s02) and lose its name-resolution guesses (qcbor `qcbor_main_decode`, r09 `chunked`). Their `cppflags`, which only feed `pipeline_make`'s `dag_cppflags_missing` warning, are the build's (s03 now says `-DFAST_UNESCAPE`, as the build does, not the Makefile's `-DLEGACY_UNESCAPE`).
+  - **Function tiers**, on models with formals (i9m1, fixtures): `main(int, char **)` and other `**` parameters go 1B → 1A (same run flags); r07's macro-generated getters go 3 → 1A (the lexer saw no parameters); r09 `trim` stays 1A; CryptoLib's 13 `get_*_interface` getters go 3 → 1A (a typedef'd pointer return the lexer could not see; the scalar-helper rule excludes pointer returns). tweetnacl `S`, `neq25519`, `par25519` and qlz `qlz_decompress` go 3 → 1A. On i8 models (no formals) all 1B functions become 1A. On i5b models (no trust, no `external_calls`) the tiers are structural and the `dynamic_allocation` blockers are lost.
+  - **Verifiability:** functions with indirect calls the lexer did not see become `needs_calls_annotation` (qcbor `StringAllocator_*`, `QCBOREncode_CloseMap`; r09 `chunk_feed`, `httpp_feed`, `parse_header_line`, `parse_request_line`). On models without formals, `minmea_scan` is no longer known to be variadic.
+- **Not done:** the manifest's `compile_commands` field and CryptoLib's `compile_commands.json` asset are now unused (kept so the harness digest does not change).
+- **Tests:** `python -m pytest -q`: 2,045 passed, 100 skipped. With `FRAMAC_DOCKER_TESTS=1`, the Phase 0, capture, trust, security, unit-view, DAG, tiers, slice and facts tests: 429 passed, 12 skipped (no gcc or Frama-C on the host); the reproducers still match their truth on every class (1.00). Fixtures, seeded scoring, `pipeline_make` and `harness_reach`: 146 passed, 1 skipped. ruff clean; mypy keeps only the known `run_eacsl_fuzz.py:1352` error.
+
 ### I0 (2026-11-07)
 
 - **Branch:** `main` (`156adfa`, the harness brace fix) merged into `phase0-redesign`.
