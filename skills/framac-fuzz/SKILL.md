@@ -90,11 +90,14 @@ A campaign keeps going after a crash, so one shallow bug does not hide the other
 - **Other harnesses** (and dispatch harnesses generated before the skip macro existed) run in libFuzzer fork mode with `-ignore_crashes=1` (`keep_going.mode: fork`). The same bug is then saved many times: at most 64 crash inputs are replayed, and at most 3 artifacts are listed per fingerprint (`artifacts_omitted` counts the rest).
 - `--stop-on-first-crash` restores the old behavior: one campaign that ends at the first crash.
 
-For a single module in guidance mode, the underlying command is:
+For a single module in guidance mode, check the module's Phase 0 gate first, then run the underlying command:
 
 ```text
+python3 /opt/framac-pipeline/scripts/phase0_gates.py check --module <mod> --need reach,build_check
 python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
 ```
+
+The gate check exits 1 with the reasons when the module failed the reach gate or build-check, or its harness or the DAG changed since the reach check: repair the harness and re-run the gate (`/framac-slice` Steps 4b and 5); never fuzz around it. `campaign --module <mod>` enforces the same check itself whenever the run directory has a gate stamp (`workspace/reports/phase0_gates.json`): it refuses the module with the reasons and writes no report. A campaign outside a run directory is not gated.
 
 `run_eacsl_fuzz.py` supports `--engine {auto,eacsl,sanitizers}` (default `auto` in `campaign` mode):
 - **Two-stage E-ACSL build.** Stage 1 instruments only (`e-acsl-gcc -n -F <frama-c flags> -E <frontend>`). It receives all preprocessor flags (`-I`, `-D`, `-include`), the `fc_stubs` directory first, `fc_compat_types.h` and `-D__FRAMAC_EACSL__`. Without `-n`, `e-acsl-gcc` also links the original main-less harness and fails. Stage 2 compiles the self-contained `<out-bin>.instrumented.c` with `e-acsl-gcc -C -e <codegen flags only>`.
@@ -139,7 +142,7 @@ For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickr
 | `partial` | Some inputs failed or were not replayed (`failed_inputs`, `inputs`), so the counts are lower bounds. A failing input is a lead to replay on the fuzz binary, not a candidate. |
 | `no_inputs` / `compile_error` / `coverage_error` / `sandbox_unavailable` | Nothing was measured. Never read this as no reach. |
 
-`reach-dynamic-<mod>` (after `coverage-<mod>`) is the dynamic half of the reach gate: an entry point the gate holds the module to, and that its corpus never executed, fails the module in `phase0_gates.json` (`dynamic: entry points never executed by the corpus`; rows in `workspace/reports/harness_reach_dynamic.json`). Fuzz and Eva of that module then stop at the gate, and `reach-gate` keeps the gap while the harness is the one coverage measured. Repair the harness (its digest changes), or exempt the entry point with `harness_reach.py exempt --module <mod> --function <fn> --reason <why>`.
+`reach-dynamic-<mod>` (after `coverage-<mod>`) is the dynamic half of the reach gate: an entry point the gate holds the module to, and that its corpus never executed, fails the module in `phase0_gates.json` (`dynamic: entry points never executed by the corpus`; rows in `workspace/reports/harness_reach_dynamic.json`). Fuzz and Eva of that module then stop at the gate, and `reach-gate` keeps the gap while the harness is the one coverage measured. Repair the harness (its digest changes), or exempt the entry point with `harness_reach.py exempt --module <mod> --function <fn> --reason <why>`, naming it by its DAG key (`file#name` when the name collides) or by its plain name when no other DAG function has it; the static and the dynamic gate match it the same way.
 
 Read `executions: 0` before tuning. The harness may simply not call that function, which a better dictionary or budget cannot fix: repair the harness instead. If the harness does call it, the corpus is stuck behind an input check, and `uncovered_lines` on the callers shows where. This report is reach only: it is not proof, the ledger does not read it, and a reached function is not a safe one.
 

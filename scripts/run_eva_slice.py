@@ -22,6 +22,11 @@ Tuning comes in two forms, both recorded in the report: `--eva-option name=value
 eva_options.py, and `--loop-unroll file#function#ordinal=N`, which analyses a scratch mirror of the
 sources (eva_loops.py) and maps its paths back, so workspace/work is never touched.
 
+Inside a run directory with a Phase 0 gate stamp (workspace/reports/phase0_gates.json), a run for
+`--module M` first checks M's reach gate (phase0_gates.py check --module M --need reach) and refuses
+to run, exit 1 and no report, when M failed it or its harness or the DAG changed since: guidance-mode
+runs never analyse a harness the gate stopped, as the Make recipes never do.
+
 After a successful run, read and write sets are taken from the saved session in a separate
 Frama-C process (`-load framac.sav -deps -inout -input -out-external -cg`), so they can neither
 change Eva's status nor its timing. The report carries them as `flows`, by kernel function name:
@@ -60,6 +65,7 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import phase0_gates  # noqa: E402
 from eva_loops import LoopRef, parse_loop_ref, prepare_mirror, strip_mirror  # noqa: E402
 from eva_options import extra_domains as option_domains  # noqa: E402
 from eva_options import framac_args, options_problem, parse_option  # noqa: E402
@@ -72,6 +78,7 @@ from framac_common import (  # noqa: E402
     STATUS_UNKNOWN,
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
+    ArtifactError,
     augment_framac_cppflags,
     failure_reason,
     normalize_flag_args,
@@ -1025,6 +1032,22 @@ def _execute_eva(
     }
 
 
+EVA_GATE_NEED = ("reach",)
+
+
+def phase0_gate_reasons(module: str, run_dir: Path = Path(".")) -> list[str]:
+    """
+    Why the Phase 0 gate stops an Eva run of `module` (the reach gate, as the Make Eva recipes check
+    it), or [] when it passes or the run directory has no gate stamp (a scratch copy, guidance mode).
+    """
+    if not module or not (run_dir / phase0_gates.GATES_JSON).is_file():
+        return []
+    try:
+        return phase0_gates.check(run_dir, module, EVA_GATE_NEED)
+    except (ArtifactError, OSError, ValueError) as exc:
+        return [f"cannot read {phase0_gates.GATES_JSON}: {exc}"]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Frama-C Eva + RTE on a module slice.")
     parser.add_argument("--sources", nargs="+", required=True)
@@ -1106,6 +1129,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     if args.mlevel < 0:
         parser.error("--mlevel must be >= 0")
+    gate = phase0_gate_reasons(args.module)
+    if gate:
+        print(json.dumps({"status": "gate_failed", "module": args.module, "reasons": gate}, indent=2))
+        for reason in gate:
+            print(f"phase0 gate: {reason}", file=sys.stderr)
+        return 1
 
     res = run_eva_on_slice(
         sources=args.sources,

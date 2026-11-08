@@ -90,7 +90,7 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 
 ### Setup
 
-1. **Resume** (`-RunDir <existing>`): run `python3 /opt/framac-pipeline/scripts/checkpoint.py load state`. If it reports a `phase_done`, resume after that phase and skip step 2 (`run_metadata.py init` refuses an initialized run). For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead. If `status` is `needs_build_recipe`, the target did not build: show the user `diagnostics` from `workspace/reports/build_capture.json`, record the corrected recipe with `run_metadata.py set-build`, and resume Phase 0 at the build capture (`/framac-slice` Step 1b).
+1. **Resume** (`-RunDir <existing>`): run `python3 /opt/framac-pipeline/scripts/checkpoint.py load state`. If it reports a `phase_done` of 0 or more, resume after that phase and skip step 2 (`run_metadata.py init` refuses an initialized run). If `phase_done` is unset (`-1`, or no progress file in an initialized run), Phase 0 is not done: skip step 2, resume Phase 0 at the first step whose output is missing, and in any case re-run `pipeline_make.py gen` and `pipeline_make.py build-check`, so its gates are checked on the current harnesses and DAG before anything consumes them (`build-check` records `phase_done = 0` when they pass). For Phase 3, use `wp_scheduler.py init --reconcile`. Re-initializing the overlay on a changed target fails by design: start a new run instead. If `status` is `needs_build_recipe`, the target did not build: show the user `diagnostics` from `workspace/reports/build_capture.json`, record the corrected recipe with `run_metadata.py set-build`, and resume Phase 0 at the build capture (`/framac-slice` Step 1b).
 2. **New run** (`-NewRun`): `python3 /opt/framac-pipeline/scripts/run_metadata.py init --repo <repo> --profile <profile> [--scope <path>]...` (it also records the measured resources).
 3. Check the measured machine: `python3 /opt/framac-pipeline/scripts/resources.py recommend`. Read its `warnings`, for example a run directory on a network filesystem.
 
@@ -102,15 +102,15 @@ Execute `skills/framac-slice/SKILL.md`:
 - It records the API calls the tests make (`seed_harvest.py record`, build image) as fuzzing seeds. Without a test command, the calls come from the project's non-test executables, each run once with no arguments.
 - Trust comes from the build, the call graph and the structured threat model (`THREAT_MODEL.md`). A missing threat model is recorded as `no_threat_model`: tell the user. CodeQL is off unless the user declares the target open source.
 - The DAG's modules are the build's link units; harnesses may be sub-modules of a unit. Tiers come from trust; Tier 3 is deferred under `quick`.
-- It generates the MetAcsl security properties (Layers 3-6) from the threat model (`security_props.py`).
+- It generates the MetAcsl security properties (Layers 3-6) from the threat model (`security_props.py run`, once per run).
 - It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`).
 - It gates every harness on reachability (`harness_reach.py check`): each module's DAG entry points must be reached, or exempted with a recorded reason, before the ledger is seeded.
-- It requires every fuzzed module to build with E-ACSL (`pipeline_make.py build-check`), unless `--fuzz-engine sanitizers` was chosen for that module, so Phase 1 never falls back to ASan/UBSan silently.
-- Both gates are enforced, not just instructions. They record `workspace/reports/phase0_gates.json`, and the Make targets that consume harnesses check it first: `build-`, `fuzz-`, `coverage-` and `eva-` per module, and `wp-queue` and `wp_scheduler.py init` for the whole run. Each stops with the reason instead of running on a failed or stale gate.
-- It ends with `ledger.py seed`, which creates one unit per function × obligation class. Out-of-scope work, Layers 2-6 of Tier 3 functions, and all Tier 3 work under `quick`, are seeded `out_of_scope` / `deferred` with reasons; under `quick` the Tier 3 modules are also left out of the Make phases.
+- It seeds the ledger (`ledger.py seed`), which creates one unit per function × obligation class. Out-of-scope work, Layers 2-6 of Tier 3 functions, and all Tier 3 work under `quick`, are seeded `out_of_scope` / `deferred` with reasons; under `quick` the Tier 3 modules are also left out of the Make phases.
 - Then `pipeline_make.py gen` writes the Makefile for the next phases.
+- Last, `pipeline_make.py build-check` requires every fuzzed module to build with E-ACSL, unless `--fuzz-engine sanitizers` was chosen for that module, so Phase 1 never falls back to ASan/UBSan silently.
+- Both gates are enforced, not just instructions. They record `workspace/reports/phase0_gates.json`, with digests of each harness and of the DAG, and the Make targets that consume harnesses check it first: `build-`, `fuzz-`, `coverage-` and `eva-` per module, and `wp-queue` and `wp_scheduler.py init` for the whole run. Each stops with the reason instead of running on a failed or stale gate (a harness or DAG changed since the check). Guidance-mode commands check it too: `run_eva_slice.py --module <mod>` and `run_eacsl_fuzz.py campaign --module <mod>` refuse a module whose gate failed when the run directory has the stamp.
 
-Checkpoint `phase_done = 0`.
+Phase 0 is done when `build-check` passes: it records `phase_done = 0` itself, only when every Phase 0 gate holds for the whole plan (its JSON's `phase0_checkpoint`). Seeding does not record it, so a run stopped between the seed and a passing `build-check` resumes in Phase 0. Never save the Phase 0 checkpoint by hand.
 
 ### Phases 1 and 2 — Fuzzing and abstract interpretation (Make, no subagents)
 

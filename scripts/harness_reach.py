@@ -14,7 +14,8 @@ harness reaches statically:
 
 An entry point the harness does not reach fails the gate unless the sidecar
 records why it cannot be harnessed (`reach_exempt`, written by the `exempt`
-subcommand). Static reach over-approximates (a call behind an impossible branch
+subcommand), by its DAG key or by its plain name when no other DAG function has
+it (the static and the dynamic gate match alike). Static reach over-approximates (a call behind an impossible branch
 counts); Phase 1/2 measure the dynamic reach.
 
 With link units as DAG modules (step I5b, scripts/module_map.py), a harness that is a
@@ -45,6 +46,7 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +132,30 @@ def _functions_by_name(dag: dict[str, Any]) -> dict[str, list[tuple[str, dict[st
     return by_name
 
 
+def exemption_matcher(exempt: dict[str, str], functions: dict[str, Any]) -> Callable[[str], str | None]:
+    """
+    How both gates find an entry point's exemption: `match(entry)` is the recorded reason, or None.
+    An exemption names the entry point by its DAG key (`name`, or `file#name` when the name collides),
+    or by its plain name when exactly one DAG function has that name.
+    """
+    counts: dict[str, int] = {}
+    for key, rec in functions.items():
+        name = str(rec.get("name") or key) if isinstance(rec, dict) else str(key)
+        counts[name] = counts.get(name, 0) + 1
+
+    def match(entry: str) -> str | None:
+        if entry in exempt:
+            return exempt[entry]
+        rec = functions.get(entry)
+        plain = str(rec.get("name") or "") if isinstance(rec, dict) else ""
+        plain = plain or entry.rpartition("#")[2]
+        if plain != entry and plain in exempt and counts.get(plain, 0) == 1:
+            return exempt[plain]
+        return None
+
+    return match
+
+
 def dag_macro_aliases(dag: dict[str, Any]) -> dict[str, set[str]]:
     """The model's macro aliases (alias -> DAG keys of the functions it expands to)."""
     raw = dag.get("macro_aliases") or {}
@@ -212,8 +238,10 @@ def check_module(
 
     exempt_raw = sidecar.get("reach_exempt")
     exempt = {str(k): str(v) for k, v in exempt_raw.items()} if isinstance(exempt_raw, dict) else {}
+    match = exemption_matcher(exempt, dag.get("functions") or {})
     unreached = sorted(f for f in entries if f not in reached)
-    gaps = [f for f in unreached if f not in exempt]
+    exempted = {f: why for f in unreached if (why := match(f)) is not None}
+    gaps = [f for f in unreached if f not in exempted]
     row: dict[str, Any] = {
         "module": module,
         "tier": tier,
@@ -224,7 +252,7 @@ def check_module(
         "functions_reached": sum(1 for f in mod_fns if f in reached),
         "roots": sorted(roots & set(mod_fns)) + sorted(roots - set(mod_fns)),
         "unreached_entry_points": unreached,
-        "exempt": {f: exempt[f] for f in unreached if f in exempt},
+        "exempt": exempted,
         "gaps": gaps,
         "passed": not gaps,
     }
@@ -289,14 +317,15 @@ def check_unit(
         if isinstance(raw, dict):
             for fn, why in raw.items():
                 sidecar_exempt.setdefault(str(fn), str(why))
+    match = exemption_matcher(sidecar_exempt, mm.functions)
     exempt: dict[str, str] = {}
     for e in unharnessed:
         if lexer_of[e] in module_exempt:
             exempt[e] = f"module {lexer_of[e]}: {module_exempt[lexer_of[e]]}"
         elif unit_key:
             exempt[e] = f"unit {unit}: {module_exempt[unit]}"
-        elif e in sidecar_exempt:
-            exempt[e] = sidecar_exempt[e]
+        elif (why := match(e)) is not None:
+            exempt[e] = why
     gaps = [e for e in unharnessed if e not in exempt]
     if not harness_modules:
         if gaps:
@@ -474,14 +503,14 @@ def check_dynamic(module: str, dag: dict[str, Any], mm: ModuleMap, coverage: dic
     sidecar = mm.sidecars.get(module) or {}
     raw = sidecar.get("reach_exempt")
     exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    match = exemption_matcher(exempt, dag.get("functions") or {})
     runs = _executions(coverage)
     executed: dict[str, int] = {}
     never: list[str] = []
     for e in _module_entries(module, dag, mm):
-        name = str(((dag.get("functions") or {}).get(e) or {}).get("name") or e.rpartition("#")[2])
         n = _entry_executions(e, dag, runs) or 0
         executed[e] = n
-        if not n and e not in exempt and name not in exempt:
+        if not n and match(e) is None:
             never.append(e)
     return {
         "module": module,
@@ -512,7 +541,7 @@ def run_dynamic(dag_path: Path, harness_dir: Path, modules: list[str], coverage_
     return {"generated_at": utc_now(), "dag": str(dag_path).replace("\\", "/"), "modules": rows}
 
 
-def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path) -> None:
+def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path, dag_path: Path | None = None) -> None:
     """
     Merge the rows into the dynamic report (with each module's harness digest) and reopen the reach
     gate of every module with a gap. A module without a gap leaves the gate as the static check left it.
@@ -528,18 +557,30 @@ def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path) -> None:
     failed = [r for r in report["modules"] if r.get("passed") is False]
     if failed:
         rows = [{**r, "error": "dynamic: entry points never executed by the corpus"} for r in failed]
-        phase0_gates.record_reach(run_dir, {"modules": rows}, partial=True)
+        phase0_gates.record_reach(run_dir, {"modules": rows}, partial=True, dag_path=dag_path)
 
 
-def apply_dynamic(report: dict[str, Any], dynamic_path: Path, harness_dir: Path, run_dir: Path) -> None:
+def apply_dynamic(
+    report: dict[str, Any],
+    dynamic_path: Path,
+    harness_dir: Path,
+    run_dir: Path,
+    dag: dict[str, Any] | None = None,
+) -> None:
     """
     Keep a dynamic gap failing at the static check while the harness is the one coverage measured (same
     digest) and the entry point is not exempted since: a repaired harness or an exemption clears it.
+    Exemptions match as in the static check (`exemption_matcher`), against `dag` (default: the
+    report's own DAG).
     """
     dyn = load_json_optional(dynamic_path, {})
     rows = dyn.get("modules") if isinstance(dyn, dict) else None
     if not isinstance(rows, dict):
         return
+    if dag is None:
+        loaded = load_json_optional(Path(str(report.get("dag") or DEFAULT_DAG)), {})
+        dag = loaded if isinstance(loaded, dict) else {}
+    functions = dag.get("functions") or {}
     for row in report["modules"]:
         d = rows.get(row.get("module"))
         if not isinstance(d, dict) or not d.get("gaps") or not row.get("passed"):
@@ -548,8 +589,9 @@ def apply_dynamic(report: dict[str, Any], dynamic_path: Path, harness_dir: Path,
             continue
         sidecar = load_json_optional(harness_dir / f"harness_{row['module']}.json", {})
         raw = sidecar.get("reach_exempt") if isinstance(sidecar, dict) else None
-        exempt = raw if isinstance(raw, dict) else {}
-        gaps = [g for g in d["gaps"] if g not in exempt and g.rpartition("#")[2] not in exempt]
+        exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        match = exemption_matcher(exempt, functions)
+        gaps = [g for g in d["gaps"] if match(g) is None]
         if gaps:
             row.update(passed=False, gaps=gaps, error="dynamic: entry points never executed by the corpus")
     report["passed"] = all(r.get("passed") for r in report["modules"])
@@ -582,7 +624,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "dynamic":
             dyn = run_dynamic(args.dag, args.harness_dir, args.module, args.coverage_dir)
-            record_dynamic(Path("."), dyn, args.out)
+            record_dynamic(Path("."), dyn, args.out, dag_path=args.dag)
             print(json.dumps(dyn, indent=2))
             if any(r.get("passed") is None for r in dyn["modules"]):
                 return 2
@@ -605,8 +647,9 @@ def main(argv: list[str] | None = None) -> int:
     if str(args.out) != "-":
         args.out.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(args.out, report)
-        # The gate stamp the Make recipes check (phase0_gates.py); `--out -` is a dry look.
-        phase0_gates.record_reach(Path("."), report, partial=bool(args.module))
+        # The gate stamp the Make recipes check (phase0_gates.py), with the digest of the DAG checked
+        # against, so a DAG rebuilt afterwards fails the gate; `--out -` is a dry look.
+        phase0_gates.record_reach(Path("."), report, partial=bool(args.module), dag_path=args.dag)
     print(json.dumps(report, indent=2))
     return 0 if report["passed"] else 1
 

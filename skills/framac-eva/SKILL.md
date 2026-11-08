@@ -29,12 +29,14 @@ Eva runs need no judgment, so they run from the generated Makefile (`docs/resour
 2. Run every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva` (run in the foreground after `fuzz` so `eva` gets a writable `rw` `/framac-cache` mount, or concurrently in the background with `ro` cache if your host harness supports background wrapper calls). Results with status `ok` are cached by content, so an unchanged module is not re-analyzed. Write this command exactly as shown, with the full path: only this exact command line may also fill the shared cross-run cache (`docs/resources-and-caching.md`, Section 5).
 3. Tune every module that still has Unknowns, before ingesting: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (Step 2a). Each surviving Unknown costs a prover task in Phase 3, so this pays for itself. Skip it only when the budget allows no extra Eva runs at all, as under the `quick` profile.
 
-For a single module in guidance mode, the underlying command is:
+For a single module in guidance mode, check the module's Phase 0 gate first, then run the underlying command:
 
 ```text
+python3 /opt/framac-pipeline/scripts/phase0_gates.py check --module <mod> --need reach
 python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --main eva_main --out-dir workspace/eva/<mod> --slevel <slevel_or_100> --no-warn-unsigned-downcast --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/eva/<mod>.json
 ```
 
+- The gate check exits 1 with the reasons when the module failed the reach gate, or its harness or the DAG changed since the check: repair the harness and re-run `harness_reach.py check` (`/framac-slice` Step 4b); never analyse around it. `run_eva_slice.py --module <mod>` enforces the same check itself whenever the run directory has a gate stamp (`workspace/reports/phase0_gates.json`): it prints `status: "gate_failed"` with the reasons, exits 1 and writes no report. A scratch copy without a stamp is not gated.
 - A Frama-C failure is reported as `status: "analysis_error"` (exit code 1), never as zero alarms.
 - A run that exceeds its wall-clock limit (`--timeout`, from `params set --eva-timeout`; otherwise the broker's fixed Eva job limit) is reported as `status: "analysis_timeout"`.
 

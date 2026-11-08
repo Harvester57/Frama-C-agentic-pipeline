@@ -71,18 +71,19 @@ security-props:
 	$(RUN) --class light --key security-props -- $(PY) $(S)/security_props.py run
 
 # Phase 0 gate: every DAG entry point of each harnessed module is reached by its harness, or exempted
-# with a reason (harness_reach.py exempt). It records workspace/reports/phase0_gates.json.
+# with a reason (harness_reach.py exempt). It records workspace/reports/phase0_gates.json, with the
+# digests of each harness and of the DAG: a harness or DAG changed afterwards fails the gate until it runs again.
 reach-gate:
 	$(RUN) --class light --key reach-gate -- $(PY) $(S)/harness_reach.py check
 
-# Ledger seed (scope paths from run-metadata.json), validation, checkpoint of phase 0. The
-# checkpoint is initialized only once, so seeding again never rewinds the recorded progress.
+# Ledger seed (scope paths from run-metadata.json), validation, and the progress file (initialized
+# only once, so seeding again never rewinds the recorded progress). Phase 0 is not done yet: its last
+# gate is `pipeline_make.py build-check` (after `gen`), which records the phase 0 checkpoint when
+# every Phase 0 gate passed.
 seed: reach-gate security-props
 	$(RUN) --class light --key seed -- $(PY) $(S)/ledger.py seed --dag workspace/reports/callgraph_dag.json $(SEED_SCOPE_ARGS)
 	$(RUN) --class light --key seed -- $(PY) $(S)/validate_artifacts.py run-dir .
 	test -f state/progress.json || $(RUN) --class light --key seed -- $(PY) $(S)/checkpoint.py init state --target $(TARGET_DIR)
-	$(RUN) --class light --key seed -- $(PY) $(S)/checkpoint.py save-phase state --phase 0 \
-		--from-file workspace/reports/callgraph_dag.json
 
 # --- Phases 1 and 2 --------------------------------------------------------------------------
 

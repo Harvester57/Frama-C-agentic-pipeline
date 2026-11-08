@@ -133,3 +133,11 @@ def test_seed_runs_after_the_security_properties() -> None:
     text = TEMPLATE.read_text(encoding="utf-8")
     m = re.search(r"^seed:([^\n]*)$", text, re.MULTILINE)
     assert m is not None and "security-props" in m.group(1).split()
+
+
+def test_seed_does_not_record_phase_0() -> None:
+    # Phase 0's last gate is build-check (after gen): it records the checkpoint, the seed never does.
+    seed = recipe_commands("seed")
+    assert not any("save-phase" in line for line in seed)
+    assert any("checkpoint.py init state" in line for line in seed)  # the progress file, never rewound
+    assert "save-phase" not in TEMPLATE.read_text(encoding="utf-8").split("# --- Phases 1 and 2", 1)[0]

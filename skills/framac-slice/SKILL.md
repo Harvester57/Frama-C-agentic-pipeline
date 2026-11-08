@@ -254,24 +254,24 @@ A module's route is that of its most demanding function, so a harness module hol
 
 ## Step 3 — Stub External Libraries & Generate Security Properties
 
-For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
-1. Check `required_sources` and `external_callees` in `callgraph_dag.json`.
-   - **In-repository callees (`cross_module_callees`):** Compile the sibling `.c` files listed in `required_sources` together in the slice rather than stubbing them, so call chains into sibling modules remain reachable for fuzzing, Eva, and WP.
-   - **True external library calls (`external_callees`):** Under Frama-C (`__FRAMAC__`), external functions **must remain bodyless prototypes** (declared in real target headers, `/opt/framac-pipeline/templates/fc_stubs/` for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, or `/opt/framac-pipeline/templates/acsl/external_stubs.h`) with optional ACSL contracts (`requires`, `assigns`, `ensures`). **Never** give an external function a dummy C body like `{ return 0; }` under Frama-C: a C body hides the open assumption from the ledger (`Considered valid` / `STATUS_ASSUMED`) and makes callers falsely appear proven under `return 0;`.
-   - **Network/IPC boundary stubs for dynamic fuzzing:** If a module reads input through a blocking socket/port helper (e.g., `RECEIVE_MESSAGE`), put `extern` declarations in a `.h` file and function definitions in a single `.c` file (never define functions in a force-included header across multiple TUs), and inject `fuzz_buf` on **every** call (never gate injection on a `static int calls` counter, which would block all LibFuzzer iterations after the first).
-2. Generate the Layer 3–6 properties from the threat model before seeding the ledger:
+For each `Tier 1A`, `Tier 1B`, and `Tier 2` module, check `required_sources` and `external_callees` in `callgraph_dag.json`:
+- **In-repository callees (`cross_module_callees`):** Compile the sibling `.c` files listed in `required_sources` together in the slice rather than stubbing them, so call chains into sibling modules remain reachable for fuzzing, Eva, and WP.
+- **True external library calls (`external_callees`):** Under Frama-C (`__FRAMAC__`), external functions **must remain bodyless prototypes** (declared in real target headers, `/opt/framac-pipeline/templates/fc_stubs/` for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, or `/opt/framac-pipeline/templates/acsl/external_stubs.h`) with optional ACSL contracts (`requires`, `assigns`, `ensures`). **Never** give an external function a dummy C body like `{ return 0; }` under Frama-C: a C body hides the open assumption from the ledger (`Considered valid` / `STATUS_ASSUMED`) and makes callers falsely appear proven under `return 0;`.
+- **Network/IPC boundary stubs for dynamic fuzzing:** If a module reads input through a blocking socket/port helper (e.g., `RECEIVE_MESSAGE`), put `extern` declarations in a `.h` file and function definitions in a single `.c` file (never define functions in a force-included header across multiple TUs), and inject `fuzz_buf` on **every** call (never gate injection on a `static int calls` counter, which would block all LibFuzzer iterations after the first).
 
-   ```text
-   python3 /opt/framac-pipeline/scripts/security_props.py run
-   ```
+Then, once per run (not per module), generate the Layer 3–6 properties from the threat model before seeding the ledger:
 
-   It reads `workspace/reports/phase0_model.json` and the threat model (Step 1d's lookup) and writes `workspace/reports/security_props.json`:
-   - **L3:** an `l3_frame` unit for every function that writes through a pointer;
-   - **L4:** auth gates become MetAcsl `\writing` and `\precond` properties (`l4_auth_state`, `l4_auth_required`);
-   - **L5:** output sinks become sanitization properties (`l5_sanitized`);
-   - **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`).
+```text
+python3 /opt/framac-pipeline/scripts/security_props.py run
+```
 
-   Each property is rendered from `templates/metacsl/` and lists the functions where its generated annotations land; those are the ledger units. Nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. `ledger.py seed` (Step 5) reads the file when it exists. See [security-properties.md](../../docs/security-properties.md).
+It reads `workspace/reports/phase0_model.json` and the threat model (Step 1d's lookup) and writes `workspace/reports/security_props.json` for the whole run:
+- **L3:** an `l3_frame` unit for every function that writes through a pointer;
+- **L4:** auth gates become MetAcsl `\writing` and `\precond` properties (`l4_auth_state`, `l4_auth_required`);
+- **L5:** output sinks become sanitization properties (`l5_sanitized`);
+- **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`).
+
+Each property is rendered from `templates/metacsl/` and lists the functions where its generated annotations land; those are the ledger units. Nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. `ledger.py seed` (Step 5) reads the file when it exists; the Makefile's `seed` target runs `security-props` first. See [security-properties.md](../../docs/security-properties.md).
 
 ---
 
@@ -343,26 +343,27 @@ For each module with `gaps`:
 
 1. Regenerate its harness with `--api` (every entry point the model can call), or with `--entry-style dispatch`, one `--dispatch-case` per unreached entry point (several related calls may share a case, for example building a message then parsing it). Keep the existing parser call as a case. Do not cover a gap by violating a callee's contract: a crash from such a case is `rejected` as harness-induced.
 2. Re-run `harness_reach.py check`.
-3. An entry point that cannot be driven from bytes (it needs a live kernel socket, a real file descriptor, or a process-global the harness cannot set up safely) gets a recorded reason instead: `harness_reach.py exempt --module <mod> --function <fn> --reason '<why>'`. A Tier 1A/1B/2 module that needs no harness at all (example programs, test drivers) gets `harness_reach.py exempt --module <mod> --reason '<why>'`. Exemptions survive harness regeneration. Never exempt an entry point only because writing its case is tedious.
+3. An entry point that cannot be driven from bytes (it needs a live kernel socket, a real file descriptor, or a process-global the harness cannot set up safely) gets a recorded reason instead: `harness_reach.py exempt --module <mod> --function <fn> --reason '<why>'`. Name the function by its DAG key (`file#name` when the name collides) or by its plain name when no other DAG function has it; the static and the dynamic gate match it the same way. A Tier 1A/1B/2 module that needs no harness at all (example programs, test drivers) gets `harness_reach.py exempt --module <mod> --reason '<why>'`. Exemptions survive harness regeneration. Never exempt an entry point only because writing its case is tedious.
 
 Move on only when `check` exits 0. Its `exempt` entries are the accepted, documented gaps.
 
-The check records its result in `workspace/reports/phase0_gates.json`, together with a digest of each harness. Make enforces it: `seed` runs the check first (`reach-gate`), and the `build-`, `fuzz-`, `coverage-` and `eva-` targets of a module stop with the reason when the module failed it or when its harness changed after the check ran. After any harness repair, run `check` again.
+The check records its result in `workspace/reports/phase0_gates.json`, together with a digest of each harness and of the DAG. Make enforces it: `seed` runs the check first (`reach-gate`), and the `build-`, `fuzz-`, `coverage-` and `eva-` targets of a module stop with the reason when the module failed it, or when its harness or the DAG changed after the check ran. After any harness repair or DAG rebuild, run `check` again.
 
 Phase 1 reopens the gate: after `coverage-<mod>`, `reach-dynamic-<mod>` fails the module when its corpus never executed an entry point the gate holds it to (`/framac-fuzz` Step 3). Repair the harness or exempt the entry point the same way.
 
 ---
 
-## Step 5 — Seed the Coverage Ledger and Checkpoint
+## Step 5 — Seed the Coverage Ledger, Build-Check and Checkpoint
 
 ```text
 python3 /opt/framac-pipeline/scripts/ledger.py seed --dag workspace/reports/callgraph_dag.json [--profile <quick|standard|deep>] [--scope <repo-relative path>]... [--security-props workspace/reports/security_props.json]
 python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .
 python3 /opt/framac-pipeline/scripts/checkpoint.py init state --target /target   # keeps an existing progress file
-python3 /opt/framac-pipeline/scripts/checkpoint.py save-phase state --phase 0 --from-file workspace/reports/callgraph_dag.json
 python3 /opt/framac-pipeline/scripts/pipeline_make.py gen
-python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check
+python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check   # Phase 0's last gate; records phase_done = 0
 ```
+
+The Makefile's `seed` target (`pipeline_make.py run seed`) runs the first three lines after the reach gate and `security-props`. Seeding does not record Phase 0 as done: `build-check` is its last gate, and it records the checkpoint (`checkpoint.py save-phase state --phase 0`) itself, only when it passes and the reach gate holds for every module of the plan, with each harness and the DAG unchanged since the check. Its JSON says so under `phase0_checkpoint` (`saved`, or the gate `reasons` that kept it from saving). Never save the Phase 0 checkpoint by hand.
 
 `ledger.py seed` creates one unit per function × obligation class, keyed by link unit:
 - each unit takes its function's `callgraph_source`; units on the GCC fallback carry `bookkeeping.callgraph_fallback`, and those of a function whose link unit is on the fallback (`eva_wp_blocked`) are seeded `deferred` with a `callgraph_fallback:` reason, since Eva and WP cannot run on them; the report lists them under "Units not worked in this run";
@@ -373,6 +374,8 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check
 
 `pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`), one record per harness module. Check its JSON for modules excluded with a reason before moving on. Under `quick`, Tier 3 modules are excluded with a reason.
 
-`pipeline_make.py build-check` builds every fuzzed module (`run build`, cached, so Phase 1 reuses it) and exits 1 unless each one was instrumented with E-ACSL. The Frama-C kernel parse in Step 4 uses Frama-C's own libc, but the E-ACSL build runs with `-no-frama-c-stdlib` against the host headers, so a harness can pass Step 4 and still fall back to ASan/UBSan, losing the E-ACSL checks. For each failing module, `workspace/reports/build_check.json` gives `status` (`eacsl_fallback`, `build_failed`, `not_built`), the `compile_log`, and its `first_error`. Fix the cause (usually a host header Frama-C cannot parse: put a minimal stub under `workspace/harnesses/include/` on the sidecar's `-I` path, ahead of `-idirafter /usr/include`), regenerate the harness, and rerun. Only when E-ACSL cannot work for the module, record that choice with `pipeline_make.py params set --module <mod> --fuzz-engine sanitizers`, which the check accepts.
+`pipeline_make.py build-check` builds every fuzzed module (`run build`, cached, so Phase 1 reuses it) and exits 1 unless each one was instrumented with E-ACSL. The Frama-C kernel parse in Step 4 uses Frama-C's own libc, but the E-ACSL build runs with `-no-frama-c-stdlib` against the host headers, so a harness can pass Step 4 and still fall back to ASan/UBSan, losing the E-ACSL checks. For each failing module, `workspace/reports/build_check.json` gives `status` (`eacsl_fallback`, `build_failed`, `not_built`), the `compile_log`, and its `first_error`; a `not_built` module gives its `reason`, which is the reach gate's when that gate stopped its build (repair the harness first, Step 4b). Fix the cause (usually a host header Frama-C cannot parse: put a minimal stub under `workspace/harnesses/include/` on the sidecar's `-I` path, ahead of `-idirafter /usr/include`), regenerate the harness, and rerun. Only when E-ACSL cannot work for the module, record that choice with `pipeline_make.py params set --module <mod> --fuzz-engine sanitizers`, which the check accepts.
 
-`build-check` records its result in the same `phase0_gates.json`. `fuzz-<mod>` refuses a module that failed it, and `wp-queue` refuses the run until every module of the plan passes both gates, with each harness unchanged since the reach check; `wp_scheduler.py init` refuses the same way. A plan with nothing to fuzz passes `build-check`. Run `build-check` again after a repair.
+`build-check` records its result in the same `phase0_gates.json`. `fuzz-<mod>` refuses a module that failed it, and `wp-queue` refuses the run until every module of the plan passes both gates, with each harness and the DAG unchanged since the reach check; `wp_scheduler.py init` refuses the same way. A plan with nothing to fuzz passes `build-check`. Run `build-check` again after a repair: that is also what records the Phase 0 checkpoint once everything passes.
+
+`gen` warns (top-level `warnings`) when a fuzz budget does not fit the profile's per-unit cap: a `params.json` budget above the cap is kept as recorded, and a unit with so many campaigns that the 30-second minimum per campaign exceeds the cap gets more than the cap. Lower the budgets with `params set --module <mod> --fuzz-budget <cpu-seconds>` if that is not intended.

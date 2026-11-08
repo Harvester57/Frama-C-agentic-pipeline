@@ -7,8 +7,9 @@ The two Phase 0 gates write their results here, and the Make recipes that consum
 a gate (docs/phase0-implementation-plan.md, step I1):
 
   reach        harness_reach.py check: every DAG entry point of a module is reached by its harness,
-               or exempted with a reason. Recorded with a digest of the module's harness files, so
-               a harness regenerated after the check fails the gate until the check runs again.
+               or exempted with a reason. Recorded with a digest of the module's harness files and
+               of the call-graph DAG, so a harness regenerated or a DAG rebuilt after the check fails
+               the gate until the check runs again.
   build_check  pipeline_make.py build-check: every fuzzed module builds with E-ACSL, or its
                sanitizer engine is a recorded choice (params set --fuzz-engine sanitizers). The check
                judges the module's current build report when there is one: Make rebuilds a module
@@ -17,7 +18,7 @@ a gate (docs/phase0-implementation-plan.md, step I1):
     phase0_gates.py check [--module M] [--need reach,build_check] [--modules "A B"] [--fuzzed "A"]
 
 exits 0 when the gate passes and 1 with the reasons otherwise. Without --module, every module of
-each needed section must pass, with its harness unchanged since the reach check; --modules and
+each needed section must pass, with its harness and the DAG unchanged since the reach check; --modules and
 --fuzzed (wp-queue passes the plan's) also require a row for each module they name.
 """
 
@@ -36,6 +37,7 @@ from framac_common import ArtifactError, atomic_write_json, load_json_optional, 
 
 GATES_JSON = "workspace/reports/phase0_gates.json"
 HARNESS_DIR = "workspace/harnesses"
+DAG_JSON = "workspace/reports/callgraph_dag.json"
 SECTIONS = ("reach", "build_check")
 HOW_TO_RUN = {
     "reach": "python3 $S/harness_reach.py check",
@@ -56,6 +58,15 @@ def harness_digest(run_dir: Path, module: str) -> str | None:
     return h.hexdigest() if found else None
 
 
+def dag_digest(run_dir: Path, dag_path: Path | None = None) -> str | None:
+    """sha256 of the call-graph DAG (the run's own unless `dag_path`), or None when it is missing."""
+    path = Path(dag_path) if dag_path is not None else Path(run_dir) / DAG_JSON
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def load_gates(run_dir: Path) -> dict[str, Any]:
     data = load_json_optional(run_dir / GATES_JSON, {})
     return data if isinstance(data, dict) else {}
@@ -69,12 +80,17 @@ def _store(run_dir: Path, section: str, entry: dict[str, Any]) -> dict[str, Any]
     return gates
 
 
-def record_reach(run_dir: Path, report: dict[str, Any], partial: bool = False) -> dict[str, Any]:
+def record_reach(
+    run_dir: Path, report: dict[str, Any], partial: bool = False, dag_path: Path | None = None
+) -> dict[str, Any]:
     """
     Store a harness_reach.py report. A `partial` report (check limited with --module) updates only
-    its modules; the section passes only while every recorded module does.
+    its modules; the section passes only while every recorded module does. Each row records the
+    digest of the DAG it was checked against (`dag_path`, default the run's), so a DAG rebuilt after
+    the check fails the gate for that row until the check runs again.
     """
     run_dir = Path(run_dir)
+    dag = dag_digest(run_dir, dag_path)
     modules: dict[str, Any] = {}
     if partial:
         prior = load_gates(run_dir).get("reach")
@@ -88,6 +104,7 @@ def record_reach(run_dir: Path, report: dict[str, Any], partial: bool = False) -
             "error": row.get("error"),
             "exempt": row.get("exempt"),
             "harness_digest": harness_digest(run_dir, name),
+            "dag_digest": dag,
         }
     entry = {
         "passed": all(m["passed"] for m in modules.values()),
@@ -105,6 +122,7 @@ def record_build_check(run_dir: Path, out: dict[str, Any]) -> dict[str, Any]:
             "status": r.get("status"),
             "fuzz_engine": r.get("fuzz_engine"),
             "first_error": r.get("first_error"),
+            "reason": r.get("reason"),
         }
         for name, r in (out.get("modules") or {}).items()
         if isinstance(r, dict)
@@ -153,13 +171,14 @@ def check(
     """
     Reasons the gate fails for `module` (or for the whole run when None); empty when it passes.
 
-    For the whole run, every recorded module must pass, and a harness changed since the reach check
-    fails it. `modules_expected` (every module of the plan) and `fuzzed_expected` (its fuzzed ones)
+    For the whole run, every recorded module must pass, and a harness or a DAG changed since the
+    reach check fails it (for one module, its own row). `modules_expected` (every module of the plan) and `fuzzed_expected` (its fuzzed ones)
     name the modules each section must have checked: a harness added after the check, or a module
     build-check never built, fails the gate instead of passing unseen.
     """
     run_dir = Path(run_dir)
     gates = load_gates(run_dir)
+    current_dag = dag_digest(run_dir)
     reasons: list[str] = []
     for section in need:
         entry = gates.get(section)
@@ -185,6 +204,11 @@ def check(
                 )
                 if stale:
                     reasons.append(f"the harness of {', '.join(stale)} changed after the reach gate ran; run it again")
+                dag_stale = sorted(
+                    m for m, r in modules.items() if r.get("passed") and r.get("dag_digest") != current_dag
+                )
+                if dag_stale:
+                    reasons.append(_dag_changed(", ".join(dag_stale)))
                 expected = modules_expected
             unchecked = sorted({m for m in expected or [] if m} - set(modules))
             if unchecked:
@@ -202,12 +226,19 @@ def check(
                 reasons.append(f"reach gate failed for {module}: {detail}")
             elif row.get("harness_digest") != harness_digest(run_dir, module):
                 reasons.append(f"the harness of {module} changed after the reach gate ran; run it again")
+            elif row.get("dag_digest") != current_dag:
+                reasons.append(_dag_changed(module))
         else:
             ok, status = _build_ok(run_dir, module, row)
             if not ok:
-                first = f" ({row['first_error']})" if row.get("first_error") and status == row.get("status") else ""
+                detail = row.get("first_error") or row.get("reason")
+                first = f" ({detail})" if detail and status == row.get("status") else ""
                 reasons.append(f"build-check failed for {module}: {status}{first}")
     return reasons
+
+
+def _dag_changed(modules: str) -> str:
+    return f"the call-graph DAG changed after the reach gate ran for {modules}; run `{HOW_TO_RUN['reach']}` again"
 
 
 def _build_ok(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, str]:

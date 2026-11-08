@@ -15,6 +15,8 @@ Subcommands (run from the run directory):
   run <targets...>             make -f workspace/build/Makefile -j<this container's CPUs> -k --output-sync=target
                                (`eva-tune` is the Eva ladder: docs/resources-and-caching.md, Section 6)
   ingest [--module M]          ingest new fuzz then Eva reports, stubbing missing ones; validate
+  build-check [--target D]     Phase 0's last gate: every fuzzed module builds with E-ACSL; once
+                               every Phase 0 gate passed, records the Phase 0 checkpoint (state/)
   sweep-list                   the ledger's WP-covered proof units, as (file, function)
   sweep [--jobs N]             re-prove them without the per-run WP cache, one leased WP job each
 
@@ -934,6 +936,8 @@ def allocate_fuzz_budgets(plan: Plan) -> None:
     harness case, with the campaigns of one link unit together capped at FUZZ_UNIT_CAP_BY_PROFILE
     (scaled down in proportion, at least MIN_FUZZ_BUDGET_S each). The plan records how each budget was
     set in the module's params (`fuzz_budget_source`: params, cases or unit_cap; `fuzz_cases`).
+    A params.json budget above the unit cap is kept, with a tuning warning; so is a unit that the
+    MIN_FUZZ_BUDGET_S floor keeps above its cap. Both warnings reach `gen` and `run` output.
     """
     per_case = FUZZ_BUDGET_BY_PROFILE.get(plan.profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE])
     cap = FUZZ_UNIT_CAP_BY_PROFILE.get(plan.profile, FUZZ_UNIT_CAP_BY_PROFILE[DEFAULT_PROFILE])
@@ -943,18 +947,34 @@ def allocate_fuzz_budgets(plan: Plan) -> None:
             continue
         if "fuzz_budget" in (plan.params_doc.get("modules", {}).get(name) or {}):
             mod.params["fuzz_budget_source"] = "params"
+            budget = mod.params.get("fuzz_budget")
+            if isinstance(budget, int) and budget > cap:
+                warning = (
+                    f"fuzz budget: params.json sets {budget} CPU-seconds, above the {cap} the {plan.profile} "
+                    f"profile allows one link unit; kept as recorded (`params set --module {name} "
+                    "--fuzz-budget 0` returns to the profile default)"
+                )
+                mod.warnings.append(warning)
+                plan.warnings.append(f"{name}: {warning}")
             continue
         mod.params["fuzz_cases"] = harness_case_count(plan.mm.sidecars.get(name))
         mod.params["fuzz_budget"] = per_case * mod.params["fuzz_cases"]
         mod.params["fuzz_budget_source"] = "cases"
         by_unit.setdefault(plan.mm.unit_of(name), []).append(mod)
-    for mods in by_unit.values():
+    for unit, mods in by_unit.items():
         total = sum(m.params["fuzz_budget"] for m in mods)
         if total <= cap:
             continue
         for m in mods:
             m.params["fuzz_budget"] = max(MIN_FUZZ_BUDGET_S, m.params["fuzz_budget"] * cap // total)
             m.params["fuzz_budget_source"] = "unit_cap"
+        scaled = sum(m.params["fuzz_budget"] for m in mods)
+        if scaled > cap:
+            plan.warnings.append(
+                f"fuzz budget: link unit {unit} gets {scaled} CPU-seconds over {len(mods)} campaigns, above its "
+                f"{cap} cap under the {plan.profile} profile, because each campaign keeps at least "
+                f"{MIN_FUZZ_BUDGET_S}; set `fuzz_budget` per module with `params set` to stay within the cap"
+            )
 
 
 def _unit_note(plan: Plan, unit: str) -> str:
@@ -1868,11 +1888,12 @@ def ingest(
 # ---------------------------------------------------------------------------
 
 
-def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
+def sweep_list(run_dir: Path | str = ".", warnings: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """
     The ledger's covered proof units, one entry per (file, function): units whose status is
     `covered` with discharging WP evidence, plus any Eva-covered callee in `callgraph_dag.json`
     called by a WP-covered caller that carries a `valid_under_hyp` assumption. Returns (entries, skipped).
+    A callee matched by name only (a stale DAG without the callee's record) is appended to `warnings`.
     """
     run_path = Path(run_dir)
     ledger = load_json_optional(run_path / LEDGER_JSON, [])
@@ -1945,6 +1966,12 @@ def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
                         chosen = [u for u in cand_units if u.get("file") == callee_file]
                     else:  # an old DAG without the callee's record: prefer the caller's file
                         chosen = [u for u in cand_units if u.get("file") == c_file] or cand_units
+                        if chosen and warnings is not None:
+                            files = sorted({str(u.get("file")) for u in chosen})
+                            warnings.append(
+                                f"{c_file}#{c_fn}: the DAG has no record of callee {callee_key!r}; matched the "
+                                f"Eva-covered unit(s) of the same name in {', '.join(files)} (rebuild the DAG)"
+                            )
                     for u in chosen:
                         uf, ufn = u.get("file"), u.get("function")
                         if not (
@@ -2015,7 +2042,8 @@ def sweep(
     runner = runner or _sweep_runner(run_dir)
     py, scripts = sys.executable or "python3", SCRIPTS_DIR.as_posix()
     with run_lock("wp-sweep", run_dir=run_dir):
-        entries, skipped = sweep_list(run_dir)
+        list_warnings: list[str] = []
+        entries, skipped = sweep_list(run_dir, list_warnings)
         slugs = _file_slugs({e["file"] for e in entries})
         tasks: list[tuple[dict, str, list[str]]] = []
         for e in entries:
@@ -2091,7 +2119,7 @@ def sweep(
                 regressions.append(row)
             elif e.get("eva_only"):
                 newly_wp_proven.append(row)
-        summary = {
+        summary: dict[str, Any] = {
             "ok": not missing,
             "status": "incomplete" if missing else ("regressions" if regressions else "ok"),
             "total": len(tasks),
@@ -2102,6 +2130,8 @@ def sweep(
             "results": results,
             "generated_at": utc_now(),
         }
+        if list_warnings:
+            summary["warnings"] = list_warnings
         # A WP-covered function whose re-proof left no report was not re-established either: record
         # that as its own report, so the ledger stops counting it as covered.
         missing_reports = []
@@ -2179,10 +2209,41 @@ def _first_build_error(log_path: Path) -> str | None:
     return None
 
 
+PHASE0_STATE_DIR = "state"
+DEFAULT_TARGET_DIR = "/target"
+
+
+def record_phase0_checkpoint(
+    run_dir: Path,
+    plan: Plan,
+    script_runner: ScriptRunner | None = None,
+    target_dir: str = DEFAULT_TARGET_DIR,
+) -> dict:
+    """
+    Record `phase_done = 0` once Phase 0's last gate passed: build-check, and the reach gate of every
+    module of the plan with its harness and the DAG unchanged since. `checkpoint.py init` runs first
+    when the run has no progress file yet (it never rewinds an existing one).
+    """
+    reasons = phase0_gates.check(run_dir, None, phase0_gates.SECTIONS, list(plan.modules), list(plan.fuzz_modules))
+    if reasons:
+        return {"saved": False, "reasons": reasons}
+    s_runner = script_runner or _script_runner(run_dir)
+    if not (run_dir / PHASE0_STATE_DIR / "progress.json").is_file():
+        rc, out = s_runner("checkpoint.py", ["init", PHASE0_STATE_DIR, "--target", target_dir])
+        if rc != 0:
+            return {"saved": False, "error": f"checkpoint.py init failed (rc={rc})", "output": _json_or_tail(out)}
+    rc, out = s_runner("checkpoint.py", ["save-phase", PHASE0_STATE_DIR, "--phase", "0", "--from-file", DAG_JSON])
+    if rc != 0:
+        return {"saved": False, "error": f"checkpoint.py save-phase failed (rc={rc})", "output": _json_or_tail(out)}
+    return {"saved": True, "phase_done": 0}
+
+
 def build_check(
     run_dir: Path | str = ".",
     runner: Callable[..., tuple[int, Any]] | None = None,
     templates_dir: Path | str | None = None,
+    script_runner: ScriptRunner | None = None,
+    target_dir: str = DEFAULT_TARGET_DIR,
 ) -> dict:
     """
     Phase 0 gate: build every fuzzed module (`run build`) and require the E-ACSL engine.
@@ -2190,7 +2251,10 @@ def build_check(
     A module whose build fell back to ASan/UBSan, or failed, fails the check with the first
     compiler error of its E-ACSL attempt. Fuzzing it would lose the E-ACSL checks without anyone
     deciding so. A module whose `fuzz_engine` param is `sanitizers` passes: that is a recorded choice
-    (`params set --module M --fuzz-engine sanitizers`). Writes workspace/reports/build_check.json.
+    (`params set --module M --fuzz-engine sanitizers`). A module the reach gate stops (its `build-<mod>`
+    recipe refuses it) is `not_built` with the gate's reason, whatever build report an earlier run left.
+    Writes workspace/reports/build_check.json. Build-check is Phase 0's last gate: when it passes and
+    the reach gate holds for the whole plan, it records the Phase 0 checkpoint (`phase0_checkpoint`).
     """
     run_dir = Path(run_dir)
     plan = build_plan(run_dir, templates_dir)
@@ -2208,14 +2272,20 @@ def build_check(
             out["note"] = "no module of the plan is fuzzed: nothing to build"
         else:
             out["error"] = "no module in the plan: run `pipeline_make.py gen` first"
-        atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
-        phase0_gates.record_build_check(run_dir, out)
-        return out
+        return _finish_build_check(run_dir, plan, out, script_runner, target_dir)
     build_rc, _ = (runner or run_targets)(["build"], run_dir)
+    # The reach gate as `build-<mod>` saw it. Without a reach stamp at all (a run that never seeded)
+    # the recipes stopped too, but there is no gate reason to give beyond the missing report.
+    reach_ran = isinstance(phase0_gates.load_gates(run_dir).get("reach"), dict)
     results: dict[str, dict] = {}
     for mod in sorted(modules, key=lambda m: m.name):
         chosen = str(mod.params.get("fuzz_engine") or "auto")
         entry: dict[str, Any] = {"fuzz_engine": chosen}
+        gate = phase0_gates.check(run_dir, mod.name, ("reach",)) if reach_ran else []
+        if gate:
+            entry.update({"status": "not_built", "ok": False, "reason": "reach gate: " + "; ".join(gate)})
+            results[mod.name] = entry
+            continue
         report_path = run_dir / BUILD_DIR / f"{mod.name}.build.json"
         try:
             report = load_json_optional(report_path, None)
@@ -2224,6 +2294,7 @@ def build_check(
             entry["error"] = str(exc)
         if not isinstance(report, dict):
             entry.update({"status": "not_built", "ok": False})
+            entry.setdefault("reason", f"no build report ({BUILD_DIR}/{mod.name}.build.json)")
             results[mod.name] = entry
             continue
         engine = report.get("engine_used")
@@ -2252,8 +2323,17 @@ def build_check(
         "modules": results,
         "generated_at": utc_now(),
     }
-    atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
+    return _finish_build_check(run_dir, plan, out, script_runner, target_dir)
+
+
+def _finish_build_check(
+    run_dir: Path, plan: Plan, out: dict, script_runner: ScriptRunner | None, target_dir: str
+) -> dict:
+    """Write build_check.json and the gate stamp, then the Phase 0 checkpoint when Phase 0 passed."""
     phase0_gates.record_build_check(run_dir, out)  # the stamp fuzz-<mod> and wp-queue check
+    if out["ok"]:
+        out["phase0_checkpoint"] = record_phase0_checkpoint(run_dir, plan, script_runner, target_dir)
+    atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
     return out
 
 
@@ -2365,9 +2445,15 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--jobs", type=int, default=None, help="Override make -j (default: this container's CPUs)")
     p_ing = sub.add_parser("ingest", help="Ingest new fuzz/Eva reports (fuzz first), then validate")
     p_ing.add_argument("--module", default=None)
-    sub.add_parser(
+    p_bc = sub.add_parser(
         "build-check",
-        help="Phase 0: build every fuzzed module and fail unless E-ACSL instrumented it (or sanitizers were chosen)",
+        help="Phase 0: build every fuzzed module and fail unless E-ACSL instrumented it (or sanitizers were "
+        "chosen); records the Phase 0 checkpoint once every Phase 0 gate passed",
+    )
+    p_bc.add_argument(
+        "--target",
+        default=DEFAULT_TARGET_DIR,
+        help=f"Target directory recorded when the checkpoint is new (default: {DEFAULT_TARGET_DIR})",
     )
     sub.add_parser("sweep-list", help="WP-covered proof units of the ledger, as (file, function)")
     p_sweep = sub.add_parser("sweep", help="Trusted re-proof of the sweep list without the per-run WP cache")
@@ -2410,11 +2496,12 @@ def main(argv: list[str] | None = None) -> int:
             out = ingest(run_dir, args.module)
             rc = 0 if out["ok"] else 1
         elif args.cmd == "build-check":
-            out = build_check(run_dir)
-            rc = 0 if out["ok"] else 1
+            out = build_check(run_dir, target_dir=args.target)
+            rc = 0 if out["ok"] and "error" not in out.get("phase0_checkpoint", {}) else 1
         elif args.cmd == "sweep-list":
-            entries, skipped = sweep_list(run_dir)
-            out = {"count": len(entries), "units": entries, "skipped": skipped}
+            list_warnings: list[str] = []
+            entries, skipped = sweep_list(run_dir, list_warnings)
+            out = {"count": len(entries), "units": entries, "skipped": skipped, "warnings": list_warnings}
         else:
             out = sweep(run_dir, jobs=args.jobs)
             rc = 0 if out["ok"] else 1
