@@ -106,6 +106,7 @@ from fingerprint import (  # noqa: E402
     normalize_file,
 )
 from framac_common import (  # noqa: E402
+    ArtifactError,
     atomic_write_json,
     load_json_optional,
     normalize_flag_args,
@@ -132,7 +133,10 @@ COVERAGE_MAX_FAILED_INPUTS = 16
 COVERAGE_MAX_TIME_S = 1200
 COVERAGE_TOOL_TIMEOUT_S = 300
 COVERAGE_MAX_UNCOVERED_RANGES = 32
-COVERAGE_EXTERNAL_PREFIXES = ("/usr/", "/lib/", "/opt/framac-pipeline/")
+# The build capture's snapshot of the build image's libraries and headers (build_capture.py) is not
+# target code either: under the run directory's mount, or relative to it.
+COVERAGE_SNAPSHOT_ROOT = "workspace/snapshot/root/"
+COVERAGE_EXTERNAL_PREFIXES = ("/usr/", "/lib/", "/opt/framac-pipeline/", f"/framac-run/{COVERAGE_SNAPSHOT_ROOT}")
 LLVM_COV_CODE_REGION = 0
 
 
@@ -2876,11 +2880,13 @@ def acsl_include_dir() -> Path | None:
     return None
 
 
-def _unit_harness_module(module: str, harness_dir: Path) -> str:
+def _unit_harness_module(module: str, harness_dir: Path, file: str | None = None, function: str | None = None) -> str:
     """
     The harness module standing for a link unit's name (an Eva candidate may carry its unit, step
-    I5b): the module itself when it has a sidecar, else the unit's first sub-module, read from the
-    DAG next to the harness directory (workspace/reports/callgraph_dag.json).
+    I5b): the module itself when it has a sidecar, else the sub-module whose scope holds
+    `file`#`function` (workspace_overlay.harness_module_for_function, as pipeline_make and the
+    ledger pick it), else the unit's first sub-module. The DAG is read next to the harness
+    directory (workspace/reports/callgraph_dag.json).
     """
     harness_dir = Path(harness_dir)
     if (harness_dir / f"harness_{module}.json").is_file():
@@ -2888,20 +2894,23 @@ def _unit_harness_module(module: str, harness_dir: Path) -> str:
     from module_map import ModuleMap, load_sidecars
 
     dag = load_json_optional(harness_dir.parent / "reports" / "callgraph_dag.json", None)
-    return (
-        ModuleMap(dag if isinstance(dag, dict) else None, load_sidecars(harness_dir)).harness_module_for(module)
-        or module
-    )
+    mm = ModuleMap(dag if isinstance(dag, dict) else None, load_sidecars(harness_dir))
+    try:
+        from workspace_overlay import harness_module_for_function
+    except ImportError:
+        return mm.harness_module_for(module) or module
+    return harness_module_for_function(mm, module, file, function) or module
 
 
-def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
+def _sidecar_build_spec(module: str, harness_dir: Path, file: str | None = None, function: str | None = None) -> dict:
     """
     Fallback build spec when scripts/pipeline_make.py cannot be imported: the harness sidecar's
     sources (the harness alone when it `include_source`s the target) plus the harness, and its
     cppflags plus -I<templates>/acsl (once), as in the documented campaign command. A link unit's
-    name resolves to its harness module, returned in `harness_module`.
+    name resolves to the harness module whose scope holds the candidate's `file`#`function` (else
+    its first one), returned in `harness_module`.
     """
-    requested, module = module, _unit_harness_module(module, harness_dir)
+    requested, module = module, _unit_harness_module(module, harness_dir, file, function)
     sidecar = Path(harness_dir) / f"harness_{module}.json"
     meta = load_json_optional(sidecar, None)
     if not isinstance(meta, dict):
@@ -2946,7 +2955,7 @@ def replay_build_spec(
     try:
         import pipeline_make  # imported lazily: replays work without the Make layer
     except ImportError:
-        return _sidecar_build_spec(module, harness_dir)
+        return _sidecar_build_spec(module, harness_dir, file, function)
     return pipeline_make.module_build_spec(module, Path("."), file, function)
 
 
@@ -3474,8 +3483,11 @@ def _export_coverage(binary: Path, profile_dir: Path, scratch: Path) -> tuple[di
 
 
 def _coverage_file_role(path: str) -> str:
-    """`target`, `harness` (the generated entry point) or `external` (system and pipeline headers)."""
-    if path.startswith(COVERAGE_EXTERNAL_PREFIXES):
+    """
+    `target`, `harness` (the generated entry point) or `external` (system and pipeline headers, and
+    the build capture's snapshot of the build image, wherever the run directory is mounted).
+    """
+    if path.startswith(COVERAGE_EXTERNAL_PREFIXES) or f"/{COVERAGE_SNAPSHOT_ROOT}" in f"/{path}":
         return "external"
     if "/workspace/harnesses/" in f"/{path}" or posixpath.basename(path).startswith("harness_"):
         return "harness"
@@ -3950,6 +3962,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "replay" and args.binary is None and not (args.sources and args.out_bin):
         parser.error("replay needs --binary, or --sources with --out-bin")
 
+    if args.mode == "campaign":
+        gate_reasons = campaign_gate_reasons(Path("."), args.module)
+        if gate_reasons:
+            for reason in gate_reasons:
+                print(f"phase0 gate: {reason}", file=sys.stderr)
+            refused = {"mode": "campaign", "module": args.module, "status": "gate_failed", "reasons": gate_reasons}
+            print(json.dumps(refused, indent=2))
+            return 1
+
     if args.mode == "replay-candidates":
         summary = replay_candidates(
             args.candidates,
@@ -4165,6 +4186,27 @@ def _run_build_mode(args) -> dict:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
+
+
+CAMPAIGN_GATE_NEED = ("reach", "build_check")
+
+
+def campaign_gate_reasons(run_dir: Path, module: str) -> list[str]:
+    """
+    Why the Phase 0 gate refuses a campaign on `module` (empty when it may run), checked as
+    `phase0_gates.py check --module <mod> --need reach,build_check` checks it before Make's fuzz
+    recipe. Only when the run directory has a gate stamp: a campaign outside a pipeline run (no
+    workspace/reports/phase0_gates.json) or without --module is not gated. The report is not
+    written on a refusal, so nothing ingests a campaign that did not run.
+    """
+    import phase0_gates  # imported lazily: campaigns outside a run directory do not need it
+
+    if not module or not (Path(run_dir) / phase0_gates.GATES_JSON).is_file():
+        return []
+    try:
+        return phase0_gates.check(Path(run_dir), module, CAMPAIGN_GATE_NEED)
+    except (ArtifactError, OSError, ValueError) as exc:
+        return [f"cannot read {phase0_gates.GATES_JSON}: {exc}"]
 
 
 def _run_campaign_mode(args) -> dict:
