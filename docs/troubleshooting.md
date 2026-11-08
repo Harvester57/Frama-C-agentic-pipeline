@@ -21,12 +21,64 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 
 ---
 
-## 1. Frama-C Kernel Parsing & Preprocessing Errors
+## 1. Phase 0: Build Capture, Frama-C Model & Gates
+
+### Symptom: `"status": "needs_build_recipe"` (Exit Code 3 From `build_capture.py run`)
+- **Cause:** the target's build failed, built no C file, or has no recipe. Phase 0 has no inventory without a build, so it stops here. The checkpoint keeps the same status until a capture succeeds.
+- **Fix:**
+  1. Read `diagnostics` in `workspace/reports/build_capture.json`: `first_error` with its context, `missing_headers`, `candidate_packages` (a heuristic from headers, pkg-config modules, CMake packages and commands) and `packages_not_installed`.
+  2. Ask the user for a corrected command, packages or flags. Never record a recipe the user has not given or confirmed.
+  3. Record it with `run_metadata.py set-build ... --package <pkg>` and rerun the capture with `-BuildImage -Scratch -TargetPackages "<pkgs>"` (`--build-image --scratch --target-packages`). A success clears the status.
+- **Without a recipe at all:** `build_capture.py propose` prints one guessed from the build files, as a starting point for the user.
+
+### Symptom: The Build Capture Times Out (1800 s) on a Build That Works by Hand
+- **Cause:** a parallel build under `bear` can sit idle until the capture's timeout. A failed parallel build is retried once with one job, but a timeout is not: it ends as `needs_build_recipe`.
+- **Fix:** rerun the capture through the broker (no `-NoBroker`), which sizes the build's jobs from its lease, or put `-j1` in the recipe's command. A build that is not parallel-safe (x509-parser's Makefile) gets the serial retry automatically.
+
+### Symptom: A Unit's `parse.status` Is `gcc_fallback` in `phase0_model.json`
+- **Cause:** Frama-C could not parse the unit with its build flags. Its functions and edges come from GCC's `-fcallgraph-info` instead, without loops, complexity, signatures or indirect-call candidates. `parse.error` holds Frama-C's first error, and the ledger flags the unit's functions (`bookkeeping.callgraph_fallback`).
+- **Fix:** read `parse.error` and the log under `workspace/reports/phase0_model/`. The usual causes are the ones in Section 2 (host headers, compiler extensions); fix the cause, then rerun `phase0_model.py run`. Eva and WP will fail on that unit the same way until it parses. Fuzzing still works.
+
+### Symptom: The Model Fails With the Dump Module (`kernel_ast.py` Compile Error)
+- **Cause:** the image's Frama-C changed in a way `scripts/phase0_dump.ml` does not compile against.
+- **Fix:** run `python3 /opt/framac-pipeline/scripts/phase0_model.py selftest`. The image build runs it too, so a Frama-C upgrade that breaks the dump module fails the image build first.
+
+### Symptom: Every Unit Records `no_threat_model` (or `invalid_threat_model`)
+- **Cause:** the target has no `THREAT_MODEL.md` with a fenced `framac-threat-model` JSON block (or the block does not validate against `schemas/threat_model.schema.json`).
+- **Fix:** `python3 /opt/framac-pipeline/scripts/trust.py check-threat-model [PATH]` lists the errors (exit 2) or reports the missing block (exit 1). Put a corrected copy at `workspace/THREAT_MODEL.md` (it wins over the target's own), then run `trust.py run`, rebuild the DAG and rerun `security_props.py run`. Without a threat model, trust follows the default rules and only Layer 3 properties are generated.
+
+### Symptom: The Reach Gate Fails (`harness_reach.py check` Exit 1, or `make` Stops at `reach-gate`)
+- **Cause:** a harness does not reach one of its module's API entry points, a Tier 1A/1B/2 module has no harness (`no_harness`), or a harness changed after the check ran (its digest no longer matches `phase0_gates.json`).
+- **Fix:** add a `--dispatch-case` per unreached entry point and rerun `check`, or record a reason with `harness_reach.py exempt` (`/framac-slice` Step 4b). A sub-module is checked only against the unit's entry points in its own scope; entry points no harness's scope holds are reported as the unit's gaps.
+
+### Symptom: `dynamic: entry points never executed by the corpus` in `phase0_gates.json`
+- **Cause:** after `coverage-<mod>`, `reach-dynamic-<mod>` found an entry point the gate holds the module to that no input executed. Fuzz and Eva of that module stop at the gate until it is fixed.
+- **Fix:** read `executions: 0` in `workspace/reports/coverage/<mod>.json`. If the harness never calls the function, add a case. If it does, the corpus is stuck behind an input check: seeds, a dictionary or a larger budget may help. Or exempt the entry point with a reason. The gap stays while the harness is unchanged.
+
+### Symptom: A Harness Misses a Build Flag (`-include config.h`, a Quoted `-D`, `-std=`)
+- **Cause:** harnesses take the unit's flags from the DAG. The unit's `-include` files are kept apart (`force_includes`) and applied by `generate_harness.py`. Quoted `-D` values (`-DLOG_PATH="log.txt"`) and the build's `-std=` are not copied, because later stages split and re-join flag strings (and a C89 `-std` rejects the C99 harness).
+- **Fix:** state such flags in the harness's `--cppflags` yourself.
+
+### Symptom: A File Compiled by Several Units With Different Flags Is Analysed in One Configuration Only
+- **Cause:** a source file belongs to the first unit that compiles it, with that unit's flags (qlz's four executables build `quicklz.c` with different settings).
+- **Fix:** none automatic yet. To analyse another configuration, write a harness whose flags state it.
+
+### Symptom: No Seeds, or a Harness Case Without Seeds
+- **Cause:** the recipe has no test command; the tests call the API through header `static inline` functions or nested library calls, which the `-Wl,--wrap` recorders do not see; or the harness's case layout (overlapping slots, structs deeper than one `{ptr, len}` level) cannot be filled.
+- **Fix:** read `workspace/reports/seed_harvest.json` and `workspace/reports/seeds/<mod>.json`. Seeds are an improvement, never a requirement: the campaign runs from its own corpus without them.
+
+### Symptom: A Generated Header (`config.h`) Is Missing in Eva, WP or the E-ACSL Build
+- **Cause:** generated headers stay in the build tree on the scratch volume. The model reads them there, but the later analyses read `workspace/work`, which holds only the target's source tree.
+- **Fix:** none automatic yet. Copy the generated header into a harness include directory (`workspace/harnesses/include/`) on the sidecar's `-I` path.
+
+---
+
+## 2. Frama-C Kernel Parsing & Preprocessing Errors
 
 ### Symptom: `[kernel] user error: syntax error` on GCC/Clang Intrinsics or System Headers (`_Float128`, etc.)
 - **Cause:** The target C file or its `-I` flags pulled in host `/usr/include` headers containing glibc/compiler-specific extensions (`_Float128`, `__builtin_va_arg_pack`, inline assembly `__asm__`, or SIMD intrinsics) instead of Frama-C's standard library (`__fc_libc`).
 - **Fix:**
-  1. Never pass `-I/usr/include` or `-I/usr/local/include` in `CPPFLAGS`. `build_callgraph_dag.py` automatically strips host system include paths from `compile_commands.json` so Frama-C uses its portable `__fc_libc` headers.
+  1. Never pass `-I/usr/include` or `-I/usr/local/include` in harness flags. Frama-C must use its portable `__fc_libc` headers: the target's own system headers reach it from the snapshot through `-idirafter`, searched after Frama-C's libc.
   2. If the target requires third-party system headers (e.g., `<bsd/string.h>`, `<openssl/evp.h>`), add the `-dev` package to the build recipe and rerun the build capture (`--build-image --target-packages "<pkg>"`, `-BuildImage -TargetPackages` in PowerShell). The capture copies the headers and libraries to the run's snapshot (`workspace/snapshot/`), and the analysis image reads them from there (`-idirafter`, after Frama-C's libc). The analysis image itself never gets target packages. Check `snapshot.headers` in `workspace/reports/build_capture.json`.
   3. Ensure `-machdep gcc_x86_64` (already the default in `run_eva_slice.py`, `run_wp_function.py`, and `run_eacsl_fuzz.py`, which every Make recipe calls) is active so GNU C extensions supported by Frama-C are enabled.
   4. Guard hardware inline assembly or unsupported compiler intrinsics with `#ifndef __FRAMAC__ ... #else ... #endif` in the `workspace/work/` shadow tree.
@@ -37,7 +89,7 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 
 ---
 
-## 2. E-ACSL + LibFuzzer Build & Runtime Issues
+## 3. E-ACSL + LibFuzzer Build & Runtime Issues
 
 ### Symptom: `e-acsl-gcc` Fails on `__fc_builtin.h`, `__fc_libc/stdlib.h` (`\old(endptr)`), or Unknown Legacy Flag `--rte=`
 - **Cause:**
@@ -130,7 +182,7 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 
 ---
 
-## 3. Eva Abstract Interpretation Precision Issues
+## 4. Eva Abstract Interpretation Precision Issues
 
 ### Symptom: Eva Reports High `Unknown` (Orange) Alarm Counts (> 30%) on a Module Slice
 - **Cause:** Loop widening or path merging occurred before precision could stabilize, or an external helper function had no ACSL contract (`builtins:missing-spec`).
@@ -148,7 +200,7 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 
 ---
 
-## 4. Deductive Verification (`WP`) Issues
+## 5. Deductive Verification (`WP`) Issues
 
 ### Quick Symptom-to-Fix Reference
 

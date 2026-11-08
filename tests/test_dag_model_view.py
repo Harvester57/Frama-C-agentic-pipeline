@@ -36,7 +36,7 @@ H_H = """\
 static inline int hin(int x) { return x; }
 static inline int hdead(int x) { return x - 1; }
 """
-# Never compiled by the build (an alternative backend): the lexer sees it, the model does not.
+# Never compiled by the build (an alternative backend): the model does not see it.
 T_C = "int template_only(int x) { return x; }\n"
 
 
@@ -105,13 +105,11 @@ def _model(fallback: bool = False) -> dict:
     }
 
 
-def _dag(target: Path, model: dict | None) -> dict:
-    return bcd.build_dag(target, target / "compile_commands.json", model=model)
+def _dag(target: Path, model: dict) -> dict:
+    return bcd.build_dag(target, model, units=False)
 
 
 def test_functions_and_edges_come_from_the_model(target: Path) -> None:
-    lexer = _dag(target, None)
-    assert "template_only" in lexer["functions"]
     dag = _dag(target, _model())
 
     assert dag["callgraph_source"] == "frama_c"
@@ -124,14 +122,14 @@ def test_functions_and_edges_come_from_the_model(target: Path) -> None:
         "hin",
         "hdead",
     }
-    assert "template_only" in dag["model"]["lexer_only_functions"]
+    assert "template_only" not in dag["functions"]
     run = dag["functions"]["api_run"]
     assert run["internal_callees"] == ["cb", "hin", "src/a.c#helper"]
     assert run["indirect_callees"] == ["cb"]
     assert run["callgraph_source"] == "frama_c"
     assert run["has_loops"] and run["loop_count"] == 1
     assert dag["functions"]["src/b.c#helper"]["internal_callers"] == ["api_other"]
-    # The lexer's analysis of the same definition is kept.
+    # The signature facts come from the model.
     assert "params" in run
     # The indirect edge orders the waves: cb is below api_run.
     assert dag["functions"]["cb"]["wave"] < run["wave"]
@@ -147,12 +145,12 @@ def test_header_functions_are_reached_only_from_entry_points(target: Path) -> No
 
 
 def test_modules_are_held_and_recounted(target: Path) -> None:
-    lexer = _dag(target, None)
     dag = _dag(target, _model())
-    for name, mod in dag["modules"].items():
+    # Header functions join the module of the files compiling them.
+    assert set(dag["modules"]) == {"a", "b"}
+    for mod in dag["modules"].values():
         assert mod["function_count"] == len(mod["functions"])
-        if name in lexer["modules"]:
-            assert mod["tier"] == lexer["modules"][name]["tier"]
+        assert mod["tier"]
     every = [k for m in dag["modules"].values() for k in m["functions"]]
     assert sorted(every) == sorted(dag["functions"])
     for mod in dag["modules"].values():
@@ -186,7 +184,7 @@ def test_seed_uses_the_model_view(target: Path, tmp_path: Path, monkeypatch: pyt
     run = tmp_path / "run"
     (run / "workspace/reports").mkdir(parents=True)
     monkeypatch.chdir(run)
-    out = ledger.cmd_seed(dag_path, [], "regex")
+    out = ledger.cmd_seed(dag_path, [], "frama_c")
     units, _ = ledger.load_state()
     fns = {(u["file"], u["function"]) for u in units.values()}
     assert ("include/h.h", "hin") in fns

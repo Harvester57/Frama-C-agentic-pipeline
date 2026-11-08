@@ -69,7 +69,7 @@ def test_function_tiers_follow_the_rules():
     mod = d["modules"]["libx_a"]
     assert mod["tier"] == T.TIER_1A and mod["run_eacsl_fuzz"] and mod["deferred_profiles"] == []
     assert mod["tier_counts"] == {"Tier 1A": 2, "Tier 1B": 1, "Tier 2": 1, "Tier 3": 2}
-    assert mod["lexer_tier"] == T.TIER_1A
+    assert "lexer_tier" not in mod
 
 
 def test_a_parameterless_getter_on_the_trust_boundary_is_tier_3():
@@ -130,12 +130,13 @@ def test_module_tier_is_the_highest_of_its_functions_and_tier3_defers_under_quic
     assert ModuleMap(d).tier_of("x") == T.TIER_3
 
 
-def test_without_trust_the_lexer_tiers_stay():
-    d = dag({"a": fn("a", trust=None)})
+def test_without_trust_only_the_structure_decides():
+    d = dag({"a": fn("a", trust=None), "add": fn("add", trust=None, cyclomatic=1, has_loops=False, const_ptr_params=0)})
     T.apply(d)
-    assert d["functions"]["a"]["tier"] == T.TIER_1A
-    assert d["tiers"]["source"] == "lexer"
-    assert "tier_counts" not in d["modules"]["libx_a"]
+    assert d["functions"]["a"]["tier"] == T.TIER_1A and d["functions"]["a"]["untrusted_path"]
+    assert d["functions"]["add"]["tier"] == T.TIER_3
+    assert d["tiers"]["source"] == "structure"
+    assert d["modules"]["libx_a"]["tier_counts"] == {"Tier 1A": 1, "Tier 3": 1}
 
 
 def test_highest_and_rank():

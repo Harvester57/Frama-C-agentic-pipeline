@@ -147,15 +147,13 @@ def harness_roots(
     harness_text: str,
     fn_names: set[str],
     macros: dict[str, set[str]],
-    inline_map: dict[str, list[str]],
 ) -> set[str]:
-    """DAG functions the harness names directly, through a header macro, or through an inline wrapper."""
+    """DAG functions the harness names directly or through a header macro (inline wrappers are DAG functions)."""
     roots: set[str] = set()
     for ident in set(_IDENT_RE.findall(_strip_c_comments(harness_text))):
         if ident in fn_names:
             roots.add(ident)
         roots |= macros.get(ident, set())
-        roots |= {f for f in inline_map.get(ident) or [] if f in fn_names}
     return roots
 
 
@@ -209,8 +207,7 @@ def check_module(
     macros = header_macro_functions(include_dirs, fn_names)
     for alias, keys in dag_macro_aliases(dag).items():
         macros[alias] = macros.get(alias, set()) | keys
-    inline_map = dag.get("header_inline_callees") or {}
-    roots = harness_roots(harness_text, fn_names, macros, inline_map if isinstance(inline_map, dict) else {})
+    roots = harness_roots(harness_text, fn_names, macros)
     reached = callee_closure(roots, by_name, unit)
 
     exempt_raw = sidecar.get("reach_exempt")

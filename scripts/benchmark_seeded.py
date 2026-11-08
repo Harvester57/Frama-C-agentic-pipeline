@@ -415,13 +415,11 @@ def inner(repo: str, fuzz_budget: int) -> int:
                 WORK,
                 "--out",
                 str(DAG),
-                "--emit-compile-commands",
-                "workspace/reports/compile_commands.json",
             ],
         )
         if ok:
             dag = benchmark.read_json(DAG, {}) or {}
-            result["module_kind"] = dag.get("module_kind") or "lexer"
+            result["module_kind"] = dag.get("module_kind") or "path"
             result["dag_warnings"] = [w for w in dag.get("warnings") or [] if "model" in str(w).lower()]
             try:
                 result["policy"] = apply_policy(dag, step)

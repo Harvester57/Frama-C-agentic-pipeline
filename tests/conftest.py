@@ -70,7 +70,7 @@ def unit(file, function, cls, status="planned", **kw):
         "module": kw.pop("module", "snmp"),
         "tier": kw.pop("tier", "Tier 1A (Untrusted Binary / Network Parser)"),
         "wave": kw.pop("wave", 0),
-        "callgraph_source": "regex",
+        "callgraph_source": "frama_c",
         "status": status,
         "agent_id": None,
         "evidence": [],

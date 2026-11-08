@@ -1343,7 +1343,6 @@ def _merge_dag_harness_sources(
 
     functions_map = dag.get("functions") or {}
     modules_map = dag.get("modules") or {}
-    inline_map = dag.get("header_inline_callees") or {}
     if not isinstance(functions_map, dict) or not isinstance(modules_map, dict):
         return list(norm_sources)
 
@@ -1362,10 +1361,6 @@ def _merge_dag_harness_sources(
         for key in [alias_keys] if isinstance(alias_keys, str) else alias_keys or []:
             if isinstance(key, str) and key in functions_map:
                 target_fns.add(key)
-        if isinstance(inline_map, dict) and ident in inline_map:
-            for resolved_fn in inline_map.get(ident) or []:
-                if isinstance(resolved_fn, str) and resolved_fn in functions_map:
-                    target_fns.add(resolved_fn)
 
     if not target_fns:
         return list(norm_sources)

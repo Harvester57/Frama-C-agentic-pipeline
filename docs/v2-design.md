@@ -47,7 +47,8 @@ Runs live **outside the target** by default:
 Two layers, of which only the first is an isolation boundary:
 
 1. **Outer container** (wrappers): the sole isolation boundary. `--network none`, `--cap-drop ALL`, `--security-opt no-new-privileges`, Docker's default seccomp and AppArmor profiles (neither is relaxed), CPU/memory/PID limits, target read-only, only the run directory writable, environment limited to an explicit allowlist. `SYS_PTRACE` is removed. The legacy `-NoInnerSandbox` / `-AllowDegradedSandbox` (`--no-inner-sandbox` / `--allow-degraded-sandbox`) flags fail hard with exit code 2.
-2. **Inner resource layer** ([`../scripts/sandbox_exec.py`](../scripts/sandbox_exec.py)): every target-controlled binary (LibFuzzer campaigns, guardrail replays, reproducers, later target builds) runs with a cleared environment plus allowlist, rlimits on CPU, file size, open files, and processes (optional address space; core dumps disabled), and a wall-clock timeout that SIGKILLs the whole process group. Runs record `sandbox: "rlimits"`. This layer provides no filesystem or namespace isolation inside the container.
+   The same hardening applies to every image the wrapper selects: the build image (the target's build and tests), the analysis image (everything else) and the optional CodeQL image.
+2. **Inner resource layer** ([`../scripts/sandbox_exec.py`](../scripts/sandbox_exec.py)): every target-controlled binary (LibFuzzer campaigns, guardrail replays, reproducers, the target's build under `bear`, its test suite during seed recording) runs with a cleared environment plus allowlist, rlimits on CPU, file size, open files, and processes (optional address space; core dumps disabled), and a wall-clock timeout that SIGKILLs the whole process group. Runs record `sandbox: "rlimits"`. This layer provides no filesystem or namespace isolation inside the container.
 
 **Residual risk.** Target-controlled binaries can write anywhere in `/framac-run` that the container user can write, including `coverage-ledger.json`, `candidates.json`, and `findings.json`. Authoritative state is schema-validated on every write and cross-checked by `validate_artifacts.py run-dir` (linked units exist, finding fingerprints appear on their units, confirmed reproducers match their sha256 and size), so tampering that breaks those invariants surfaces as a validation failure. It is not prevented, and a tamper that keeps every file schema-valid and consistent is not detected: fingerprints are not recomputed from their predicates. This is acceptable for auditing non-adversarial production code; deliberately hostile targets are out of scope.
 
@@ -65,7 +66,7 @@ Rules:
 
 - A WP stall is **not** a finding. It is a `blocked` ledger unit with its unproven goals, attempts, and the residual E-ACSL guard. It becomes a `needs_validation` candidate only when a concrete `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) is stated. When a goal stalls due to a WP/SMT limitation (for example `<stdlib.h>` dynamic allocation predicates `\freeable` / `allocates`, nonlinear arithmetic, or an unreachable branch established by caller invariants) rather than a suspected bug, the prover or breaker records `"proof_gap": {"predicate": "...", "reason": "..."}` instead (`status = "blocked"` in the ledger, with no candidate created).
 - `Invalid_but_dead` Eva statuses are dead-code evidence, never a candidate.
-- **Reachability** is a recorded field: `untrusted_surface` (the harness entry corresponds to an untrusted input surface identified by reconnaissance) or `internal_api`. It caps severity.
+- **Reachability** is a recorded field: `untrusted_surface` (the harness entry is a trust-boundary function in the Phase 0 model's `trust`: library API, input path or the threat model's input sources) or `internal_api`. The sidecar records where it came from (`reachability_source`). It caps severity.
 - **Severity anchors** (confirmed only, never above the demonstrated effect):
   - `critical`: untrusted_surface + out-of-bounds write / control-flow corruption, or Layer 4 authentication bypass.
   - `high`: untrusted_surface out-of-bounds read of secrets, Layer 6 secret leak, Layer 5 injection into a security-relevant sink.
@@ -86,13 +87,23 @@ Crash verification runs right after Phases 1 and 2, before WP:
 
 ## 5. Coverage Ledger
 
-Unit = **function x obligation class**. ID: `<rel-file>#<function>::<class>` with class in `rte`, `l2_termination`, `l3_frame`, `l4_auth`, `l5_output`, `l6_secret`. Using the file in the ID keeps same-named `static` functions in different files distinct.
+Unit = **function x obligation class**. ID: `<rel-file>#<function>::<class>`. Using the file in the ID keeps same-named `static` functions in different files distinct. The classes:
 
-Seeding:
+- `rte` and `l2_termination`;
+- `l3_frame`, and the MetAcsl classes `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped` and `l6_no_leak` ([`./security-properties.md`](./security-properties.md));
+- `l4_auth`, `l5_output` and `l6_secret` for clauses a prover names `L4_*`, `L5_*` or `L6_*` by hand.
 
-- `rte` for every function; `l2_termination` only for functions with loops; `l3`-`l6` only where reconnaissance or inference assigns them.
+Seeding (`ledger.py seed`, from the DAG of the Phase 0 model):
+
+- One unit per function a non-test link unit compiles, grouped by link unit. Functions found only in test units get none.
+- `rte` for every function; `l2_termination` only for functions with loops.
+- From `workspace/reports/security_props.json` (`security_props.py run`): `l3_frame` for every function that writes through a pointer, and the MetAcsl classes where the threat model puts a property instance. Without a threat model only `l3_frame` is seeded.
+- Header `static inline` functions no entry point of the build reaches are seeded `deferred` (`header_unreached`).
+- Units of a function on the GCC call-graph fallback carry `bookkeeping.callgraph_fallback`; units of a concurrent link unit carry `bookkeeping.concurrent`, and the report says their Eva and WP results assume sequential execution.
 - Work that the profile or tier does not schedule is seeded as `deferred` or `out_of_scope` with a reason. Nothing is silently omitted.
 - The coverage critic may propose missing `l3`-`l6` units.
+
+**Module mapping.** A harness module (its reports, corpus, candidates) is a link unit or a sub-module of one. Ingest maps each report to its unit through `module_map.py`, so a sub-module's report credits its unit's functions. Eva rows go to the function whose line range holds them. A unit keeps one Eva verdict per harness module, and is `covered` only with at least one `valid` and no `invalid` or `unknown` from any module.
 
 State table (validator-enforced):
 
@@ -109,7 +120,7 @@ Evidence entries name their phase (`fuzz`, `eva`, `wp`, `audit`, `verifier`), pr
 
 **Assumptions.** A `covered` unit carries an explicit `assumptions` list: `requires` clauses whose call sites are not verified (linked to those call sites' units), stub contracts relied on, and `Valid_under_hyp` goals whose hypotheses are callee contracts. In per-function WP (`-wp-fct`), `Valid_under_hyp` is expected: callee contracts are hypotheses proven in their own sessions. They are only acceptable when every hypothesis is a callee contract whose own unit is `covered`. The proof audit (M3) resolves this; until then they are listed as open assumptions. The report separates "proven unconditionally" from "proven under N open assumptions". Verifying a caller later discharges its assumption automatically.
 
-**Layer naming convention.** WP goals map to obligation classes by name: RTE goals -> `rte`; `loop variant` / `decreases` -> `l2_termination`; `assigns` / `\separated` goals -> `l3_frame`; named clauses `L4_*`, `L5_*`, `L6_*` (for example `ensures L5_no_crlf: no_crlf_or_nul(out, \result);`) -> the matching layer. Unnamed security clauses cannot be credited to a layer unit.
+**Layer naming convention.** WP goals map to obligation classes by name: RTE goals -> `rte`; `loop variant` / `decreases` -> `l2_termination`; `assigns` / `\separated` goals -> `l3_frame`; goals of the generated MetAcsl annotations (`<property>: meta:`) -> the property's class; hand-named clauses `L4_*`, `L5_*`, `L6_*` -> `l4_auth`, `l5_output`, `l6_secret`. Unnamed security clauses cannot be credited to a layer unit.
 
 **Projected frame skeletons (AutoFraming-style, arXiv:2610.29046v1).** `function_facts.py` projects each function's frame information (kernel-AST writes/reads/loops, `may_alias` pairs, Eva `-deps` footprints) into a deterministic `frame_skeleton` in the facts JSON (schema 2): `requires \separated(rho_p, rho_q);` for interfering pointer pairs only (aliasing that can change a caller-visible write; type-compatible pointees only, so `int *` vs `double *` is never separated), and `assigns L \from r1, ..., rm;` per caller-visible write (loop-indexed writes normalized to their whole range; `\from \nothing` when nothing influences the write). The skeleton is rendered into the prover brief as a REQUIRED minimum — provers may strengthen, never delete or weaken — and `workspace_overlay.py` enforces it mechanically at merge time (`acsl_ast.check_frame_preserved` rejects a candidate whose contract drops a projected clause; fail-open when facts are missing). `FRAMAC_FRAME_SKELETON=off` disables the projection for A/B runs. `run_wp_function.py` reports a `frame_summary` (missing-assigns warning, assigns-VC status, `l3_frame` goal counts) so an `l3_frame` unit is frame-error-free only when WP discharges every assigns/loop-assigns/separated goal and no missing-assigns warning fired — a full proof with a missing frame clause does not count.
 
@@ -155,10 +166,14 @@ Implemented roles in [`../schemas/agent-result.schema.json`](../schemas/agent-re
 
 ## 8. Reconnaissance and Call Graph (M4)
 
-- **Current implementation:** `build_callgraph_dag.py` uses a C/ACSL lexical token stream (`tokenize_c_acsl`), Tarjan's SCC algorithm for recursion cycles, `compile_commands.json` flag extraction, and structural signature/body classification (`verifiability`, `wp_blockers`, `wp_notes`, risk tiers, and Layers 2-6 property inference).
+- **Current implementation** (Phase 0; [`./phase0-implementation-plan.md`](./phase0-implementation-plan.md)):
+  - **Build capture** (`build_capture.py`): the target's own build under `bear`, in the build image, from a recipe the user gave or confirmed. It gives link units, per-file flags, test units, the API (exports, public headers, `main`, an executable's embedded API) and a snapshot of the target's headers and libraries. A target that does not build stops with `needs_build_recipe`; there is no inventory without a build.
+  - **Frama-C model** (`phase0_model.py` with `phase0_dump.ml`): one parse per distinct set of sources and flags. Functions are named as Eva and WP name them (`file#name`), with direct calls, indirect calls matched by signature against address-taken functions, thread spawns, callbacks, macro aliases, loops and cyclomatic complexity. Every fact carries its source. A unit Frama-C cannot parse gets GCC's `-fcallgraph-info` edges (`callgraph_source: gcc_callgraph`), flagged with Frama-C's first error. Alias narrowing of indirect edges is optional and off by default: it was measured and found unsound for reassigned global pointers.
+  - **Trust** (`trust.py`): library API and functions reached from input readers are untrusted; the structured threat model (`schemas/threat_model.schema.json`) adds input sources and trusted callers. Optional CodeQL facts (`codeql_trust.py`, open-source targets only) can add untrusted marks, never remove one.
+  - **DAG view** (`build_callgraph_dag.py`): link units as modules, Tarjan's SCC for recursion cycles, bottom-up waves, tiers from trust (`tiers.py`), and the split of units too large for one Eva run (`unit_split.py`).
 - **Planned M4 roadmap:**
   - Parallel recon agents (entry surfaces and untrusted inputs; principals, authentication, and secret handling; build and harness feasibility) returning structured facts to override the baseline module table with source-backed reasons.
-  - Authoritative Frama-C kernel AST call graph merged with Eva-resolved function-pointer edges after Phase 2. The extraction exists and is shared with the prover facts: `kernel_ast.call_graph()` gives the kernel's direct edges, indirect call sites and recursion cycles, and `run_eva_slice.py` reports Eva-resolved edges (`flows.call_edges`). `build_callgraph_dag.py` does not use them yet: its `callgraph_source` stays `regex`.
+  - Eva-resolved function-pointer edges merged into the call graph after Phase 2. `run_eva_slice.py` reports them (`flows.call_edges`), but the DAG keeps the model's signature-matched edges.
   - A C/ACSL companion file giving each vulnerability class a hunting move, ACSL property pattern, and validation rules.
 
 ---
@@ -167,9 +182,9 @@ Implemented roles in [`../schemas/agent-result.schema.json`](../schemas/agent-re
 
 | Profile | Scope |
 |---|---|
-| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget, 600 s prover wall budget); Tier 3 modules and units deferred (no fuzzing, Eva or WP; `scripts/tiers.py`); WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
-| `standard` | All phases on Tier 1A, 1B, and Tier 2 validators (120 CPU-s fuzz budget, 900 s prover wall budget); the parent re-verifies changed finding records before reporting. |
-| `deep` | Extended budgets (900 CPU-s fuzz budget, 1800 s prover wall budget, higher retry limit `K`). Tier 3 `rte` units are scheduled in `standard` and `deep`, deferred only in `quick` (step I8). |
+| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget per harness case, at most 480 per link unit; 600 s prover wall budget); Tier 3 modules and units deferred (no fuzzing, Eva or WP; `scripts/tiers.py`); WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
+| `standard` | All phases on Tier 1A, 1B, and Tier 2 validators (120 CPU-s fuzz budget per harness case, at most 1200 per link unit; 900 s prover wall budget); the parent re-verifies changed finding records before reporting. |
+| `deep` | Extended budgets (900 CPU-s fuzz budget per harness case, at most 7200 per link unit; 1800 s prover wall budget; higher retry limit `K`). Tier 3 `rte` units are scheduled in `standard` and `deep`, deferred only in `quick` (step I8). |
 
 - Profiles change breadth, never the evidence bar.
 - **Budget** (optional, in agent invocations or wall-clock budgets via `FRAMAC_PROVER_WALL_BUDGET_S`) bounds prover/breaker execution. Exhaustion sets `run_status: incomplete` with a reason.
@@ -209,5 +224,5 @@ Implemented roles in [`../schemas/agent-result.schema.json`](../schemas/agent-re
 | **M1 Foundation** | Implemented | Run directory outside the target; hardened wrappers + `sandbox_exec.py` resource layer (rlimits, env allowlist, timeout); findings, candidates, ledger, metadata, and agent-result schemas; stdlib-only validators with pytest; fingerprints; status-classification fixes (fuzz outcomes, guardrail RTE vs contract, Eva dead/assumed buckets, CSV column normalization); ledger seeding and phase ingestion; report and SARIF derived from findings + ledger. |
 | **M2 Verification & Isolation** | Implemented | Crash verifier brief ([`../skills/framac-wp/crash_verifier_brief.md`](../skills/framac-wp/crash_verifier_brief.md)) + gate (`ledger.py ingest-verifier` & `ingest-agent-hypothesis`); per-agent scratch overlays (`workspace_overlay.py init-agent`) and structural function-span patch merge + re-verification (`merge-agent`, `merge-batch`); safe artifact/seed/crash promotion (`promote_artifact.py`); lexical pure-ACSL annotation-only check (`acsl_ast.py`); harness legitimacy (exact-size `malloc(size)` + `size == 0` sentinel buffers and `harness_<mod>.json` sidecars). |
 | **M3 Proof Audit** | Partial (deterministic checks implemented; LLM auditor planned) | Implemented: `ledger.py audit-hypotheses`, `run_wp_function.py --smoke-tests`, lexical `admit`/`axiom`/`\false` rejection, `proof_gap` vs `fault_hypothesis` distinction, and entry-function `requires` rules. Planned: standalone LLM proof-auditor subagent for L4-L6 contracts. |
-| **M4 Recon & Critics** | Planned | Recon subagents and [`./architecture.md`](./architecture.md) overrides; Frama-C kernel AST call graph + Eva function-pointer edges; C/ACSL companion file; per-phase coverage critic subagents. |
+| **M4 Recon & Critics** | Partial (Phase 0 build capture, Frama-C call graph, trust and threat model implemented; recon agents and critics planned) | Implemented: build-derived inventory and link units, the Frama-C model's call graph with signature-matched indirect edges, trust from the build and the structured threat model. Planned: recon subagents and [`./architecture.md`](./architecture.md) overrides; Eva function-pointer edges in the DAG; C/ACSL companion file; per-phase coverage critic subagents. |
 | **M5 Profiles, Caches & Carry-Forward** | Partial (profiles, guidance mode, shared caches & snapshots implemented; ledger carry-forward planned) | Implemented: `quick` / `standard` / `deep` profiles, Guidance Mode, content-addressed per-run and cross-run caches (`cache.py`), warm-start corpora, and snapshot manifests (`run_metadata.py snapshot`). Planned: automated per-unit ledger carry-forward across runs, and publishing swept WP proofs. |

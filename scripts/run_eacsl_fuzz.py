@@ -78,7 +78,7 @@ import fuzz_dictionary  # noqa: E402
 import prover_candidates  # noqa: E402
 import target_env  # noqa: E402
 from acsl_ast import tokenize_c_acsl  # noqa: E402
-from build_callgraph_dag import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
+from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
     EACSL_RTE_INITIALIZED_FLAG,

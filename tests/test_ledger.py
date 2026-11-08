@@ -10,7 +10,7 @@ from fingerprint import make_fingerprint
 from validate_artifacts import validate_candidates, validate_ledger
 
 DAG: dict[str, Any] = {
-    "callgraph_source": "regex",
+    "callgraph_source": "frama_c",
     "modules": {
         "snmp": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"},
         "glue": {"tier": "Tier 3 (Internal State / Glue Module)"},
@@ -58,7 +58,7 @@ def load(path):
 
 def seed(run_dir, profile=None):
     write_json(run_dir / "workspace/reports/callgraph_dag.json", DAG)
-    return L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex", profile=profile)
+    return L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c", profile=profile)
 
 
 def units_by_id(run_dir):
@@ -81,7 +81,7 @@ def test_seed_policy(run_dir):
 
 def test_seed_quick_defers_tier3(run_dir):
     write_json(run_dir / "workspace/reports/callgraph_dag.json", DAG)
-    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex", profile="quick")
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c", profile="quick")
     units = units_by_id(run_dir)
     glue = units["src/glue/init.c#glue_init::rte"]
     assert glue["status"] == "deferred" and glue["unresolved"][0].startswith("tier3_not_scheduled")
@@ -90,7 +90,7 @@ def test_seed_quick_defers_tier3(run_dir):
 
 def test_seed_scope_marks_out_of_scope(run_dir):
     write_json(run_dir / "dag.json", DAG)
-    L.cmd_seed(run_dir / "dag.json", ["src/snmp/pdu.c"], "regex")
+    L.cmd_seed(run_dir / "dag.json", ["src/snmp/pdu.c"], "frama_c")
     units = units_by_id(run_dir)
     assert units["src/snmp/pdu.c#snmp_parse_pdu::rte"]["status"] == "planned"
     assert units["src/snmp/ber.c#ber_decode_tag::rte"]["status"] == "out_of_scope"
@@ -722,7 +722,7 @@ def test_audit_hypotheses_discharges_proven_callees_and_flags_unverified_callees
         },
     }
     write_json(run_dir / "workspace/reports/callgraph_dag.json", dag_with_callees)
-    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
 
     # snmp_parse_pdu is proven by WP with valid_under_hyp
     write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report())
@@ -815,7 +815,7 @@ def test_seed_deep_profile_schedules_tier3_rte_and_defers_tier3_layers(run_dir):
             "scope_paths": [],
         },
     )
-    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
     units = units_by_id(run_dir)
     assert units["src/glue/init.c#glue_init::rte"]["status"] == "planned"
     assert units["src/glue/init.c#glue_init::rte"]["unresolved"] == []
@@ -826,7 +826,7 @@ def test_seed_deep_profile_schedules_tier3_rte_and_defers_tier3_layers(run_dir):
 
 def test_ingest_eva_cross_module_invalid_alarm_and_reduced_checks(run_dir):
     dag = {
-        "callgraph_source": "regex",
+        "callgraph_source": "frama_c",
         "modules": {
             "example": {"tier": "Tier 1B (Structured Packet / Buffer Emitter)"},
             "ieee754": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"},
@@ -851,7 +851,7 @@ def test_ingest_eva_cross_module_invalid_alarm_and_reduced_checks(run_dir):
         },
     }
     write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
-    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
 
     rep = {
         "status": "ok",
@@ -919,7 +919,7 @@ def _chain_dag():
 
 def test_audit_hypotheses_is_transitive_over_conditional_callees(run_dir):
     write_json(run_dir / "workspace/reports/callgraph_dag.json", _chain_dag())
-    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "regex")
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
     # The caller and the middle callee are WP-proven under hypotheses; the leaf is not proven at all.
     write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report())
     write_json(

@@ -470,7 +470,7 @@ def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
     if not c_file.is_file():
         return {}
     try:
-        from build_callgraph_dag import extract_functions_from_code, extract_macro_definitions
+        from c_definitions import extract_functions_from_code, extract_macro_definitions
 
         raw_code = c_file.read_text(encoding="utf-8", errors="replace")
         macros = extract_macro_definitions(raw_code, path=str(c_file))
@@ -973,14 +973,14 @@ def _check_internal_variadic(
 
     if c_file.is_file():
         try:
-            from build_callgraph_dag import analyze_body, analyze_signature, extract_functions_from_code
+            from c_definitions import extract_functions_from_code
 
             raw_code = c_file.read_text(encoding="utf-8", errors="replace")
             for item in extract_functions_from_code(raw_code, path=str(c_file)):
                 if item["name"] == fn_name:
-                    sig = analyze_signature(item["decl_tokens"], item["param_tokens"])
-                    body = analyze_body(fn_name, item["body_tokens"], sig)
-                    if "internal_variadic" in body.get("wp_blockers", []):
+                    # `...` may come as one token or as three `.` tokens.
+                    params = "".join(t.text for t in item["param_tokens"] if t.text.strip())
+                    if "..." in params:
                         return True, f"Target function '{fn_name}' in '{c_file}' has variadic parameter '...'"
         except Exception:
             pass
