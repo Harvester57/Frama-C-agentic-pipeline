@@ -114,6 +114,25 @@ def test_plan_recorder_skips_main_static_and_unsupported():
     assert skipped == {"var": "variadic", "inl": "static or header inline: not a linked symbol"}
 
 
+def test_plan_recorder_records_an_executables_embedded_api():
+    # tweetnacl's shape: the library is compiled straight into the executable, whose only export
+    # is main; its API is the unit's embedded_api, which the recorder must wrap too.
+    model = {
+        "entry_points": ["main.c#main"],
+        "units": {
+            "main": {"kind": "executable", "test": False, "embedded_api": ["nacl.c#crypto_box"]},
+            "t": {"kind": "executable", "test": True, "embedded_api": ["t.c#helper"]},
+        },
+        "functions": {
+            "main.c#main": {"name": "main", "signature": "int()"},
+            "nacl.c#crypto_box": {"name": "crypto_box", "signature": "int(char *, int)"},
+            "t.c#helper": {"name": "helper", "signature": "int(char *)"},
+        },
+    }
+    plans, _ = sh.plan_recorder(model)
+    assert [p["name"] for p in plans] == ["crypto_box"]
+
+
 def test_strace_opened_and_data_files(tmp_path):
     tree = tmp_path / "tree"
     (tree / "tests" / "data").mkdir(parents=True)

@@ -631,6 +631,21 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
     return modules
 
 
+def model_api(model: dict) -> list[str]:
+    """
+    The model's API: its entry points (exports and `main`) plus each non-test unit's embedded API,
+    the globals of a library compiled straight into an executable. Trust and the unit view already
+    count both; the model's top-level `entry_points` holds only the first.
+    """
+    embedded = [
+        e
+        for u in (model.get("units") or {}).values()
+        if isinstance(u, dict) and not u.get("test")
+        for e in u.get("embedded_api") or []
+    ]
+    return sorted({*(model.get("entry_points") or []), *embedded})
+
+
 def model_view(model: dict, capture: dict | None = None, root: str = "", sources: SourceLines | None = None) -> dict:
     """
     The DAG of the Phase 0 model (scripts/phase0_model.py) with path modules as its modules:
@@ -766,9 +781,10 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
     for key, rec in functions.items():
         rec["internal_callers"] = sorted(callers[key])
 
-    # Header functions get a ledger unit only when an entry point of the build reaches them.
+    # Header functions get a ledger unit only when an entry point of the build reaches them. An
+    # executable's embedded API (a library compiled straight into it) is API too, as for trust.
     reached: set[str] = set()
-    work = [key_of[e] for e in model.get("entry_points") or [] if e in key_of]
+    work = [key_of[e] for e in model_api(model) if e in key_of]
     while work:
         cur = work.pop()
         if cur not in reached:

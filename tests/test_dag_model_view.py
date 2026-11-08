@@ -155,6 +155,21 @@ def test_header_functions_are_reached_only_from_entry_points(target: Path) -> No
     assert "reached" not in dag["functions"]["api_run"]
 
 
+def test_an_executables_embedded_api_reaches_header_functions(target: Path) -> None:
+    # hdead is reached only from api_other, which is embedded API of an executable (a library
+    # compiled straight into it), not an export: it is API all the same, so hdead is reached.
+    model = _model()
+    model["edges"].append({"caller": "src/b.c#api_other", "callee": "include/h.h#hdead", "kind": "direct"})
+    model["entry_points"] = ["src/a.c#api_run"]
+    model["units"]["tool"] = {"kind": "executable", "test": False, "files": [], "embedded_api": ["src/b.c#api_other"]}
+    assert bcd.model_api(model) == ["src/a.c#api_run", "src/b.c#api_other"]
+    dag = _dag(target, model)
+    assert dag["functions"]["hdead"]["reached"]
+    # A test unit's embedded API is not the build's API.
+    model["units"]["tool"]["test"] = True
+    assert not _dag(target, model)["functions"]["hdead"]["reached"]
+
+
 def test_modules_are_held_and_recounted(target: Path) -> None:
     dag = _dag(target, _model())
     # Header functions join the module of the files compiling them.
