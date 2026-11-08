@@ -1,0 +1,45 @@
+{
+  "$comment": "Contract for workspace/reports/build_check.json, written by scripts/pipeline_make.py build-check: Phase 0's last gate (each fuzzed module builds with E-ACSL, or the sanitizers by recorded choice). `ok` is true exactly when every module row is ok (and, with no module, when the plan has one); validate_artifacts.py checks that. `phase0_checkpoint` is present when `ok` (remediation R1).",
+  "type": "object",
+  "properties": {
+    "ok": {"type": "boolean"},
+    "build_returncode": {"type": ["integer", "null"]},
+    "generated_at": {"type": "string", "minLength": 1},
+    "note": {"type": "string"},
+    "warnings": {"$comment": "schema problems the producer recorded (validate_artifacts.schema_warning); run-dir fails on them", "type": "array", "items": {"type": "string"}},
+    "error": {"type": "string"},
+    "modules": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "ok": {"type": "boolean"},
+          "status": {"type": "string", "enum": ["eacsl", "sanitizers_chosen", "eacsl_fallback", "build_failed", "not_built"]},
+          "fuzz_engine": {"type": "string"},
+          "engine_used": {"type": ["string", "null"]},
+          "reason": {"type": "string"},
+          "error": {"type": "string"},
+          "fallback_reason": {"type": ["string", "null"]},
+          "compile_log": {"type": "string"},
+          "first_error": {"type": ["string", "null"]}
+        },
+        "required": ["ok", "status", "fuzz_engine"],
+        "additionalProperties": false
+      }
+    },
+    "phase0_checkpoint": {
+      "type": "object",
+      "properties": {
+        "saved": {"type": "boolean"},
+        "phase_done": {"const": 0},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "error": {"type": "string"},
+        "output": {}
+      },
+      "required": ["saved"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["ok", "build_returncode", "modules", "generated_at"],
+  "additionalProperties": false
+}

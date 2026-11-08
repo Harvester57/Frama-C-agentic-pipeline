@@ -672,8 +672,23 @@ def _in_process(script, args):
     return rc, buf.getvalue()
 
 
+def _producer_shaped(run: Path) -> None:
+    """Complete the hand-written DAG and sidecars with the fields their producers always write."""
+    dag = json.loads((run / pm.DAG_JSON).read_text(encoding="utf-8"))
+    dag.update(callgraph_source="frama_c", warnings=[], functions=dag.get("functions") or {})
+    for mod in dag["modules"].values():
+        mod.setdefault("functions", [])
+    write_json(run / pm.DAG_JSON, dag)
+    for path in (run / pm.HARNESS_DIR).glob("harness_*.json"):
+        side = json.loads(path.read_text(encoding="utf-8"))
+        side.setdefault("harness_file", path.with_suffix(".c").relative_to(run).as_posix())
+        side.setdefault("entry_style", "buffer_len")
+        write_json(path, side)
+
+
 def test_ingest_stubs_are_accepted_by_the_real_ledger(run_dir):
     _make_run(run_dir)
+    _producer_shaped(run_dir)
     write_json(run_dir / "run-metadata.json", metadata())
     write_json(
         run_dir / "coverage-ledger.json",

@@ -1,0 +1,100 @@
+{
+  "$comment": "Contract for workspace/harnesses/harness_<module>.json, written by scripts/generate_harness.py (and, for `--api`, completed by scripts/api_harness.py with `api_harness`, `api_cases` and `api_skipped`). Kept up to date by `--record-repair` and harness_reach.py exempt. Read by pipeline_make.py (recipes), run_eacsl_fuzz.py, module_map.py (unit, scope), harness_reach.py (reach_exempt), seed_harvest.py write (api_cases) and the WP side. Fields a consumer reads are typed; the producer may add more.",
+  "type": "object",
+  "definitions": {
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "slot": {
+      "$comment": "Input bytes feeding one argument: `call` is the position of the call in the case, `param` its argument index, `size` the bytes read (null: the scalar's size is unknown).",
+      "type": "object",
+      "properties": {
+        "call": {"type": "integer", "minimum": 0},
+        "param": {"type": "integer", "minimum": 0},
+        "size": {"type": ["integer", "null"], "minimum": 1},
+        "kind": {"type": "string", "enum": ["int", "struct", "bytes", "pointee"]}
+      },
+      "required": ["call", "param", "size", "kind"],
+      "additionalProperties": false
+    },
+    "rest": {
+      "$comment": "The argument that takes the rest of the input, after the slots.",
+      "type": "object",
+      "properties": {
+        "call": {"type": "integer", "minimum": 0},
+        "param": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["bytes", "string"]}
+      },
+      "required": ["call", "param", "kind"],
+      "additionalProperties": false
+    },
+    "single_case": {
+      "type": "object",
+      "properties": {
+        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "kind": {"const": "single"},
+        "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 1},
+        "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
+        "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
+        "entry": {"$comment": "the DAG key of the API entry point the case calls", "type": "string", "minLength": 1}
+      },
+      "required": ["selector", "kind", "calls", "slots", "rest", "entry"],
+      "additionalProperties": false
+    },
+    "sequence_case": {
+      "type": "object",
+      "properties": {
+        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "kind": {"const": "sequence"},
+        "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 2},
+        "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
+        "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]}
+      },
+      "required": ["selector", "kind", "calls", "slots", "rest"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "module": {"type": "string", "minLength": 1},
+    "unit": {"$comment": "the link unit (DAG module) this harness module belongs to; null without link units", "type": ["string", "null"]},
+    "harness_file": {"type": "string", "minLength": 1},
+    "sources": {"$ref": "#/definitions/strings"},
+    "scope_files": {"$comment": "files whose functions a sub-module answers for at the reach gate (generate_harness.py --scope-file, kept on regeneration); empty means `sources`", "$ref": "#/definitions/strings"},
+    "header": {"type": ["string", "null"]},
+    "extra_includes": {"$ref": "#/definitions/strings"},
+    "static_analysis_includes": {"$ref": "#/definitions/strings"},
+    "compat_includes": {"$ref": "#/definitions/strings"},
+    "cppflags": {"type": "string"},
+    "ldflags": {"type": "string"},
+    "entry_fn": {"type": "string", "minLength": 1},
+    "entry_style": {"type": "string", "enum": ["buffer_len", "c_string", "global_buffer", "struct_arg", "void_call", "custom", "auto_prototype", "argv", "dispatch"]},
+    "global_buf": {"type": ["string", "null"]},
+    "global_len": {"type": ["string", "null"]},
+    "self_harnessed": {"type": "boolean"},
+    "null_terminate": {"type": "boolean"},
+    "call_expr": {"type": ["string", "null"]},
+    "eva_expr": {"type": ["string", "null"]},
+    "fuzz_expr": {"type": ["string", "null"]},
+    "dispatch_cases": {"$ref": "#/definitions/strings"},
+    "include_source": {"type": "boolean"},
+    "stubbed_callees": {"$ref": "#/definitions/strings"},
+    "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api"]},
+    "reachability_source": {"type": "string"},
+    "max_input_size": {"type": "integer", "minimum": 1},
+    "contract_notes": {"$ref": "#/definitions/strings"},
+    "repair_attempts": {"type": "integer", "minimum": 0},
+    "max_repair_attempts": {"type": "integer", "minimum": 0},
+    "repair_history": {"type": "array", "items": {"type": "object"}},
+    "reach_exempt": {"type": "object", "additionalProperties": {"type": "string"}},
+    "prelude_headers": {"$ref": "#/definitions/strings"},
+    "prelude_status": {"type": ["string", "null"]},
+    "prelude_unresolved": {"$ref": "#/definitions/strings"},
+    "prelude_reason": {"type": "string"},
+    "api_harness": {"const": true},
+    "api_cases": {
+      "type": "array",
+      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}]}
+    },
+    "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason", "type": "object", "additionalProperties": {"type": "string"}},
+    "warnings": {"$ref": "#/definitions/strings"}
+  },
+  "required": ["module", "harness_file", "sources", "cppflags", "entry_fn", "entry_style"]
+}

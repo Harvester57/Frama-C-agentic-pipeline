@@ -9,7 +9,14 @@ Subcommands:
   metadata      <run-metadata.json>
   snapshot      <snapshot-manifest.json> [--run-dir DIR]
   agent-result  <result.json>
+  dag | sidecar | build-check | reach-dynamic | seed-harvest | build-capture | phase0-model
+  | security-props  <artifact.json>    (Phase 0 artifacts, remediation R5)
+  traces        <traces.jsonl>
   run-dir       <run-dir>             (all present artifacts + cross-file consistency)
+
+`run-dir` also checks the Phase 0 artifacts present under workspace/ (PHASE0_ARTIFACTS, the harness
+sidecars and workspace/seed_records/traces.jsonl), and fails on the schema problems their producers
+recorded in `warnings` (schema_warning: producers write the artifact anyway).
 
 Each check runs the JSON Schema contract in schemas/ and then semantic checks
 that a schema cannot express (state table, fingerprint consistency, trace
@@ -431,7 +438,240 @@ def validate_phase0_gates(data: Any) -> Errors:
     return errors
 
 
+# ------------------------------------------------------- Phase 0 artifacts
+
+# One self-validation policy (remediation R5): a producer writes its artifact even when it does not
+# match its schema, and records the problems in its `warnings` with this prefix (schema_warning);
+# `run-dir` fails on such a warning as on a schema error found now.
+SCHEMA_WARNING_PREFIX = "schema: "
+_RECORDED_SCHEMA_RE = re.compile(r"^schema:|does not match its schema")
+
+
+def schema_problems(name: str, data: Any) -> list[str]:
+    """The problems of `data` against schemas/<name>.schema.json."""
+    return list(Validator(get_schema(name)).errors(data))
+
+
+def schema_warning(name: str, data: Any) -> str | None:
+    """The warning a producer records when its artifact does not match its schema, else None."""
+    try:
+        problems = schema_problems(name, data)
+    except (ArtifactError, OSError, ValueError) as exc:
+        return f"{SCHEMA_WARNING_PREFIX}cannot check against schemas/{name}.schema.json: {exc}"
+    return f"{SCHEMA_WARNING_PREFIX}{'; '.join(problems[:5])}" if problems else None
+
+
+def recorded_schema_warnings(data: Any) -> list[str]:
+    """The schema warnings a producer recorded in the artifact's `warnings`."""
+    warnings = data.get("warnings") if isinstance(data, dict) else None
+    if not isinstance(warnings, list):
+        return []
+    return [w for w in warnings if isinstance(w, str) and _RECORDED_SCHEMA_RE.search(w)]
+
+
+def _schema_check(name: str, data: Any) -> Errors:
+    errors = Errors()
+    for e in schema_problems(name, data):
+        errors.add(e)
+    for w in recorded_schema_warnings(data):
+        errors.add(f"$.warnings: the producer recorded a schema problem: {w}")
+    return errors
+
+
+def validate_build_capture(data: Any) -> Errors:
+    return _schema_check("build_capture", data)
+
+
+def validate_phase0_model(data: Any) -> Errors:
+    return _schema_check("phase0_model", data)
+
+
+def validate_security_props(data: Any) -> Errors:
+    return _schema_check("security_props", data)
+
+
+def validate_seed_harvest(data: Any) -> Errors:
+    return _schema_check("seed_harvest", data)
+
+
+def validate_dynamic_reach(data: Any) -> Errors:
+    errors = _schema_check("harness_reach_dynamic", data)
+    if errors:
+        return errors
+    for name, row in data["modules"].items():
+        where = f"$.modules[{name!r}]"
+        if row["module"] != name:
+            errors.add(f"{where}.module: must equal its key")
+        if row["passed"] != (not row["gaps"]):
+            errors.add(f"{where}.passed: must be true exactly when there is no gap")
+        if row["entry_points"] != len(row["executions"]):
+            errors.add(f"{where}.entry_points: must count the entries of `executions`")
+    return errors
+
+
+def validate_build_check(data: Any) -> Errors:
+    errors = _schema_check("build_check", data)
+    if errors:
+        return errors
+    rows = data["modules"]
+    expected = all(r["ok"] for r in rows.values()) and not (not rows and data.get("error"))
+    if data["ok"] != expected:
+        errors.add("$.ok: must be true exactly when every module is ok and no error was recorded")
+    for name, row in rows.items():
+        if row["ok"] != (row["status"] in ("eacsl", "sanitizers_chosen")):
+            errors.add(f"$.modules[{name!r}].ok: must be true exactly for status eacsl or sanitizers_chosen")
+    return errors
+
+
+def validate_sidecar(data: Any, module: str | None = None) -> Errors:
+    """A harness sidecar; `module` is the name its file gives it (harness_<module>.json)."""
+    errors = _schema_check("harness_sidecar", data)
+    if errors:
+        return errors
+    if module is not None and data["module"] != module:
+        errors.add(f"$.module: {data['module']!r} does not match the file name (harness_{module}.json)")
+    cases = data.get("api_cases") or []
+    if [c["selector"] for c in cases] != list(range(len(cases))):
+        errors.add("$.api_cases: selectors must number the cases 0, 1, ... in order")
+    if cases and data["entry_style"] != "dispatch":
+        errors.add("$.api_cases: an API harness is a dispatch harness")
+    if data.get("entry_style") == "dispatch" and cases and len(cases) != len(data.get("dispatch_cases") or []):
+        errors.add("$.api_cases: one layout per dispatch case")
+    return errors
+
+
+DAG_NO_VERSION = (
+    "no schema_version: the DAG predates the GCC-fallback blocking (defect 6; build_callgraph_dag.py "
+    "block_fallback_units), so a unit Frama-C cannot parse may still be routed to Eva and WP: rebuild it"
+)
+
+
+def validate_dag(data: Any) -> Errors:
+    """The call-graph DAG: its schema, its version, and the links ModuleMap and the gates follow."""
+    errors = _schema_check("callgraph_dag", data)
+    if errors:
+        return errors
+    if data.get("module_kind") == "link_unit" and "schema_version" not in data:
+        errors.add(f"$: {DAG_NO_VERSION}")
+    functions: dict[str, dict] = data["functions"]
+    modules: dict[str, dict] = data["modules"]
+    for section in ("modules", "lexer_modules", "submodules"):
+        for name, rec in (data.get(section) or {}).items():
+            where = f"$.{section}[{name!r}]"
+            for field in ("functions", "candidate_entry_points"):
+                unknown = [k for k in rec.get(field) or [] if k not in functions]
+                if unknown:
+                    errors.add(f"{where}.{field}: not in $.functions: {unknown[:5]}")
+            if section == "submodules" and rec["unit"] not in modules:
+                errors.add(f"{where}.unit: {rec['unit']!r} is not a module")
+    for path_mod, unit in (data.get("unit_of_lexer_module") or {}).items():
+        if unit not in modules:
+            errors.add(f"$.unit_of_lexer_module[{path_mod!r}]: {unit!r} is not a module")
+    for key, rec in functions.items():
+        if rec["module"] not in modules:
+            errors.add(f"$.functions[{key!r}].module: {rec['module']!r} is not a module")
+        for field in ("internal_callees", "internal_callers"):
+            unknown = [k for k in rec[field] if k not in functions]
+            if unknown:
+                errors.add(f"$.functions[{key!r}].{field}: not in $.functions: {unknown[:5]}")
+    for name, rec in modules.items():
+        if rec.get("callgraph_fallback") and data.get("module_kind") == "link_unit" and "schema_version" in data:
+            if rec.get("run_eva") is not False or rec.get("run_wp_full") is not False:
+                errors.add(f"$.modules[{name!r}]: a unit on the GCC fallback must have run_eva and run_wp_full false")
+            blocked = [k for k in rec["functions"] if not functions[k].get("eva_wp_blocked")]
+            if blocked:
+                errors.add(
+                    f"$.modules[{name!r}]: functions of a unit on the GCC fallback lack eva_wp_blocked: {blocked[:5]}"
+                )
+    return errors
+
+
+def validate_traces(path: Path) -> Errors:
+    """workspace/seed_records/traces.jsonl: one trace object per line."""
+    errors = Errors()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        errors.add(f"cannot read: {exc}")
+        return errors
+    for no, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError as exc:
+            errors.add(f"line {no}: not JSON: {exc}")
+            continue
+        for e in schema_problems("seed_trace", rec):
+            errors.add(f"line {no}: {e}")
+    return errors
+
+
+REPORTS = "workspace/reports"
+HARNESS_DIR = "workspace/harnesses"
+TRACES_JSONL = "workspace/seed_records/traces.jsonl"
+PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
+    (f"{REPORTS}/build_capture.json", validate_build_capture),
+    (f"{REPORTS}/phase0_model.json", validate_phase0_model),
+    (f"{REPORTS}/security_props.json", validate_security_props),
+    (f"{REPORTS}/callgraph_dag.json", validate_dag),
+    (f"{REPORTS}/build_check.json", validate_build_check),
+    (f"{REPORTS}/harness_reach_dynamic.json", validate_dynamic_reach),
+    (f"{REPORTS}/seed_harvest.json", validate_seed_harvest),
+)
+
+
+def validate_phase0_artifacts(run_dir: Path) -> Errors:
+    """The Phase 0 artifacts present in a run directory, each against its schema (see PHASE0_ARTIFACTS)."""
+    errors = Errors()
+    for rel, fn in PHASE0_ARTIFACTS:
+        path = run_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        for e in fn(data):
+            errors.add(f"{rel}: {e}")
+    harness_dir = run_dir / HARNESS_DIR
+    for path in sorted(harness_dir.glob("harness_*.json")) if harness_dir.is_dir() else []:
+        rel = f"{HARNESS_DIR}/{path.name}"
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        for e in validate_sidecar(data, path.stem[len("harness_") :]):
+            errors.add(f"{rel}: {e}")
+    traces = run_dir / TRACES_JSONL
+    if traces.is_file():
+        for e in validate_traces(traces):
+            errors.add(f"{TRACES_JSONL}: {e}")
+    return errors
+
+
+PHASE0_COMMANDS: dict[str, Any] = {
+    "dag": validate_dag,
+    "sidecar": validate_sidecar,
+    "build-check": validate_build_check,
+    "reach-dynamic": validate_dynamic_reach,
+    "seed-harvest": validate_seed_harvest,
+    "build-capture": validate_build_capture,
+    "phase0-model": validate_phase0_model,
+    "security-props": validate_security_props,
+}
+
+
 def validate_run_dir(run_dir: Path) -> Errors:
+    errors = _validate_run_dir_core(run_dir)
+    for e in validate_phase0_artifacts(run_dir):
+        errors.add(e)
+    return errors
+
+
+def _validate_run_dir_core(run_dir: Path) -> Errors:
     errors = Errors()
     loaded = {}
     validators: tuple[tuple[str, Any, bool], ...] = (
@@ -552,6 +792,9 @@ def main(argv=None) -> int:
     for name in ("candidates", "metadata", "agent-result"):
         p = sub.add_parser(name)
         p.add_argument("path", type=Path)
+    for name in (*PHASE0_COMMANDS, "traces"):
+        p = sub.add_parser(name)
+        p.add_argument("path", type=Path)
     p = sub.add_parser("run-dir")
     p.add_argument("path", type=Path)
     args = parser.parse_args(argv)
@@ -559,6 +802,16 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "run-dir":
             return _emit(validate_run_dir(args.path))
+        if args.cmd == "traces":
+            if not args.path.is_file():
+                raise ArtifactError(f"{args.path}: not found")
+            return _emit(validate_traces(args.path))
+        if args.cmd in PHASE0_COMMANDS:
+            data = load_json_strict(args.path)
+            if args.cmd == "sidecar":
+                stem = args.path.stem
+                return _emit(validate_sidecar(data, stem[len("harness_") :] if stem.startswith("harness_") else None))
+            return _emit(PHASE0_COMMANDS[args.cmd](data))
         if args.cmd == "agent-result":
             data = load_agent_result_json(args.path)
             return _emit(validate_agent_result(data))

@@ -40,7 +40,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_optional  # noqa: E402
+from framac_common import load_json_optional  # noqa: E402
 from seed_harvest import _CHAR_POINTEES, _LEN_SCALARS, classify_type, split_signature  # noqa: E402
 
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
@@ -423,11 +423,19 @@ def plan(
     unit: str | None,
     max_input_size: int,
     traces: list[list[dict]] | None = None,
+    scope_files: list[str] | None = None,
 ) -> dict[str, Any]:
-    """The cases of a module's API harness: {entries, cases, layouts, skipped}."""
+    """
+    The cases of a module's API harness: {entries, cases, layouts, skipped}. `scope_files` (the
+    sidecar's) give a sub-module that is neither a lexer module nor a cluster its scope.
+    """
     from module_map import ModuleMap
 
-    mm = ModuleMap(dag, {module: {"unit": unit}} if unit else {})
+    sidecar: dict[str, Any] = {
+        **({"unit": unit} if unit else {}),
+        **({"scope_files": scope_files} if scope_files else {}),
+    }
+    mm = ModuleMap(dag, {module: sidecar} if sidecar else {})
     entries = mm.scope_entry_points(module)
     if not entries:
         info = (dag.get("modules") or {}).get(module) or {}
@@ -533,9 +541,13 @@ def generate(
     dag_path: Path | None = None,
     model_path: Path = MODEL_JSON,
     traces_path: Path = TRACES_JSONL,
+    scope_files: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Write harness_<module>.{c,json} for the module's whole API; the generate_harness result plus counts."""
-    from generate_harness import generate_module_harness
+    """
+    Write harness_<module>.{c,json} for the module's whole API; the generate_harness result plus counts.
+    `scope_files` (`--scope-file`) default to the previous sidecar's, and are kept in the new one.
+    """
+    from generate_harness import _norm_scope_files, generate_module_harness, previous_scope_files, write_sidecar
 
     dag_file = dag_path or (out_dir.parent / "reports" / "callgraph_dag.json")
     dag = load_json_optional(dag_file, None)
@@ -544,7 +556,13 @@ def generate(
     model = load_json_optional(model_path, None)
     if not isinstance(model, dict) or model.get("status") != "ok":
         raise ApiHarnessError(f"--api needs the Phase 0 model ({model_path})")
-    p = plan(dag, model, module, unit, max_input_size, load_traces(traces_path))
+    previous = load_json_optional(out_dir / f"harness_{module}.json", {})
+    scope = (
+        _norm_scope_files(scope_files)
+        if scope_files is not None
+        else previous_scope_files(previous if isinstance(previous, dict) else {})
+    )
+    p = plan(dag, model, module, unit, max_input_size, load_traces(traces_path), scope)
     if not p["cases"]:
         raise ApiHarnessError(f"module {module!r}: no API entry point the generator can call: {p['skipped']}")
     functions = dag.get("functions") or {}
@@ -570,6 +588,7 @@ def generate(
             ldflags=ldflags,
             extra_includes=extra_includes,
             auto_prelude=auto_prelude,
+            scope_files=scope,
         )
         if not probe:
             break
@@ -591,7 +610,7 @@ def generate(
     sidecar["api_harness"] = True
     sidecar["api_cases"] = layouts
     sidecar["api_skipped"] = skipped
-    atomic_write_json(sidecar_path, sidecar)
+    write_sidecar(sidecar_path, sidecar)
     result.update(
         api_cases=len(layouts),
         api_entries=sum(1 for lay in layouts if lay.get("entry")),

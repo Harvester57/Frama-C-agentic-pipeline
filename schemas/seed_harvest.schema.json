@@ -1,0 +1,88 @@
+{
+  "$comment": "Contract for workspace/reports/seed_harvest.json, written by scripts/seed_harvest.py record (plan step I6): how the target's tests (`source: test_command`) or, without a test command, its own executables (`source: executables`) were relinked with recorders and run, and what they recorded into workspace/seed_records/ (calls.jsonl, traces.jsonl, files/). A status other than ok is a reason, never a failure of Phase 0: seeds are optional. `traces` counts the distinct traces written to traces.jsonl.",
+  "type": "object",
+  "definitions": {
+    "run": {
+      "type": "object",
+      "properties": {
+        "returncode": {"type": ["integer", "null"]},
+        "timed_out": {"type": "boolean"},
+        "seconds": {"type": "number", "minimum": 0},
+        "log_tail": {"type": "string"}
+      },
+      "required": ["returncode", "timed_out", "seconds", "log_tail"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["ok", "error", "no_model", "no_capture", "no_build_tree", "no_test_units", "no_test_command", "not_relinked", "no_calls_recorded"]},
+    "error": {"type": "string"},
+    "source": {"type": "string", "enum": ["test_command", "executables"]},
+    "test_command": {"type": ["string", "null"]},
+    "test_units": {"type": "array", "items": {"type": "string"}},
+    "executables": {"type": "array", "items": {"type": "string"}},
+    "functions": {
+      "type": "object",
+      "properties": {
+        "planned": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "object", "additionalProperties": {"type": "string"}}
+      },
+      "required": ["planned", "skipped"],
+      "additionalProperties": false
+    },
+    "relink": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "enum": ["relinked", "not_built", "no_link_command", "no_api_function", "recorder_compile_failed", "relink_failed"]},
+          "wrapped": {"type": "array", "items": {"type": "string"}},
+          "log": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "runs": {"$comment": "the executables run once without arguments (source executables)", "type": "object", "additionalProperties": {"$ref": "#/definitions/run"}},
+    "test": {"$comment": "the test command's run (source test_command)", "$ref": "#/definitions/run"},
+    "traces": {"type": "integer", "minimum": 0},
+    "calls": {
+      "type": "object",
+      "properties": {
+        "recorded": {"type": "integer", "minimum": 0},
+        "unique": {"type": "integer", "minimum": 0},
+        "unparsed_lines": {"type": "integer", "minimum": 0},
+        "by_function": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+      },
+      "required": ["recorded", "unique", "unparsed_lines", "by_function"],
+      "additionalProperties": false
+    },
+    "files": {
+      "type": "object",
+      "properties": {
+        "opened_in_tree": {"type": "integer", "minimum": 0},
+        "kept": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "bytes": {"type": "integer", "minimum": 0},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            },
+            "required": ["path", "bytes", "sha256"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["opened_in_tree", "kept"],
+      "additionalProperties": false
+    },
+    "records": {"type": "string"},
+    "seconds": {"type": "number", "minimum": 0},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["schema_version", "generated_at", "status", "warnings"],
+  "additionalProperties": false
+}

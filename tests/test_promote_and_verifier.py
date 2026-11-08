@@ -434,7 +434,13 @@ class TestVerifierIngestionAndHypotheses:
         write_json(
             harness_meta_path,
             {
+                # The fields generate_harness.py always writes (validate_run_dir checks the sidecar).
                 "module": "snmp",
+                "harness_file": "workspace/harnesses/harness_snmp.c",
+                "sources": ["src/snmp/ber.c"],
+                "cppflags": "-I.",
+                "entry_fn": "ber_decode_tag",
+                "entry_style": "buffer_len",
                 "repair_attempts": 1,
                 "max_repair_attempts": 2,
             },
@@ -473,7 +479,8 @@ class TestVerifierIngestionAndHypotheses:
         cands[0]["status"] = "unverified"
         write_json(run_dir / "candidates.json", cands)
         write_json(run_dir / "findings.json", [])
-        write_json(harness_meta_path, {"module": "snmp", "repair_attempts": 2, "max_repair_attempts": 2})
+        meta = json.loads(harness_meta_path.read_text(encoding="utf-8"))
+        write_json(harness_meta_path, {**meta, "repair_attempts": 2, "max_repair_attempts": 2})
 
         ledger.cmd_ingest_verifier(res_path, harness_meta_path=harness_meta_path)
         units2 = json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))

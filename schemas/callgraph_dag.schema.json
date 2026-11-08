@@ -1,0 +1,152 @@
+{
+  "$comment": "Contract for workspace/reports/callgraph_dag.json, written by scripts/build_callgraph_dag.py from the Phase 0 model (plan steps I5a/I5b, I7, I8; remediation R4). Strict on what consumers read (scripts/module_map.py, pipeline_make.py, harness_reach.py, ledger.py, wp_scheduler.py): the module, sub-module and function maps, their membership lists, run flags and fallback markers. Other fields stay open: the producer adds facts over time. `schema_version` is stamped by block_fallback_units (DAG_SCHEMA_VERSION): a link-unit DAG without it predates the GCC-fallback blocking (defect 6), which validate_artifacts.py run-dir reports.",
+  "type": "object",
+  "definitions": {
+    "keys": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "module": {
+      "$comment": "A DAG module: a link unit (module_kind link_unit) or a path module. `functions` are DAG keys.",
+      "type": "object",
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "kind": {"type": ["string", "null"]},
+        "concurrent": {"type": "boolean"},
+        "callgraph_fallback": {"$comment": "Frama-C's first error for a unit on the GCC fallback", "type": "string", "minLength": 1},
+        "files": {"$ref": "#/definitions/strings"},
+        "required_sources": {"$ref": "#/definitions/strings"},
+        "external_callees": {"$ref": "#/definitions/strings"},
+        "cppflags": {"$ref": "#/definitions/strings"},
+        "force_includes": {"$ref": "#/definitions/strings"},
+        "function_count": {"type": "integer", "minimum": 0},
+        "functions": {"$ref": "#/definitions/keys"},
+        "candidate_entry_points": {"$ref": "#/definitions/keys"},
+        "lexer_modules": {"$ref": "#/definitions/strings"},
+        "threat_model": {"type": ["string", "object", "null"]},
+        "split": {
+          "type": "object",
+          "properties": {
+            "reason": {"type": "string"},
+            "submodules": {"$ref": "#/definitions/strings"},
+            "unclustered": {"$ref": "#/definitions/keys"}
+          },
+          "required": ["submodules"]
+        },
+        "tier": {"type": "string", "minLength": 1},
+        "run_eva": {"type": "boolean"},
+        "run_wp_full": {"type": "boolean"},
+        "run_eacsl_fuzz": {"type": "boolean"},
+        "fuzz_engine": {"type": "string", "enum": ["sanitizers"]},
+        "recommended_strategy": {"type": "string"},
+        "tier_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "deferred_profiles": {"$ref": "#/definitions/strings"}
+      },
+      "required": ["functions"]
+    },
+    "submodule": {
+      "$comment": "A cluster of a split link unit (scripts/unit_split.py).",
+      "type": "object",
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "kind": {"const": "cluster"},
+        "anchors": {"$ref": "#/definitions/keys"},
+        "candidate_entry_points": {"$ref": "#/definitions/keys"},
+        "functions": {"$ref": "#/definitions/keys"},
+        "function_count": {"type": "integer", "minimum": 0},
+        "lines": {"type": "integer", "minimum": 0},
+        "files": {"$ref": "#/definitions/strings"},
+        "tier": {"type": "string", "minLength": 1},
+        "run_eva": {"type": "boolean"},
+        "run_wp_full": {"type": "boolean"},
+        "run_eacsl_fuzz": {"type": "boolean"},
+        "fuzz_engine": {"type": "string", "enum": ["sanitizers"]},
+        "recommended_strategy": {"type": "string"},
+        "tier_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "deferred_profiles": {"$ref": "#/definitions/strings"}
+      },
+      "required": ["unit", "functions"]
+    },
+    "function": {
+      "$comment": "A function, keyed by plain name, or `file#name` when the name collides.",
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "file": {"type": "string", "minLength": 1},
+        "module": {"type": "string", "minLength": 1},
+        "lexer_module": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 0},
+        "end_line": {"type": "integer", "minimum": 0},
+        "loc": {"type": "integer", "minimum": 0},
+        "is_static": {"type": "boolean"},
+        "header": {"type": "boolean"},
+        "reached": {"type": "boolean"},
+        "units": {"$ref": "#/definitions/strings"},
+        "internal_callees": {"$ref": "#/definitions/keys"},
+        "internal_callers": {"$ref": "#/definitions/keys"},
+        "external_callees": {"$ref": "#/definitions/strings"},
+        "wave": {"type": "integer", "minimum": 0},
+        "is_recursive": {"type": "boolean"},
+        "self_recursive": {"type": "boolean"},
+        "callgraph_source": {"type": "string", "enum": ["frama_c", "gcc_callgraph"]},
+        "callgraph_fallback": {"$comment": "Frama-C's first error for a unit compiling it", "type": "string", "minLength": 1},
+        "eva_wp_blocked": {"$comment": "why Eva and WP cannot run on it (its home unit is on the GCC fallback)", "type": "string", "minLength": 1},
+        "tier": {"type": "string", "minLength": 1},
+        "tier_reasons": {"$ref": "#/definitions/strings"},
+        "untrusted_path": {"type": "boolean"},
+        "trust": {"type": "object"},
+        "wp_blockers": {"$ref": "#/definitions/strings"},
+        "wp_notes": {"$ref": "#/definitions/strings"},
+        "security_properties": {"type": "array", "items": {"type": "object"}}
+      },
+      "required": ["name", "file", "module", "internal_callees", "internal_callers"]
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "module_kind": {"const": "link_unit"},
+    "callgraph_source": {"type": "string"},
+    "target_dir": {"type": "string"},
+    "total_c_files": {"type": "integer", "minimum": 0},
+    "total_functions": {"type": "integer", "minimum": 0},
+    "total_waves": {"type": "integer", "minimum": 0},
+    "warnings": {"$ref": "#/definitions/strings"},
+    "modules": {"type": "object", "additionalProperties": {"$ref": "#/definitions/module"}},
+    "lexer_modules": {"type": "object", "additionalProperties": {"$ref": "#/definitions/module"}},
+    "unit_of_lexer_module": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "submodules": {"type": "object", "additionalProperties": {"$ref": "#/definitions/submodule"}},
+    "functions": {"type": "object", "additionalProperties": {"$ref": "#/definitions/function"}},
+    "waves": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "wave": {"type": "integer", "minimum": 0},
+          "count": {"type": "integer", "minimum": 0},
+          "functions": {"$ref": "#/definitions/keys"}
+        },
+        "required": ["wave", "functions"]
+      }
+    },
+    "recursion_cycles": {"type": "array", "items": {"$ref": "#/definitions/keys"}},
+    "name_collisions": {
+      "type": "array",
+      "items": {"type": "object", "properties": {"function": {"type": "string"}, "files": {"$ref": "#/definitions/strings"}}, "required": ["function", "files"]}
+    },
+    "macro_aliases": {"type": "object", "additionalProperties": {"$ref": "#/definitions/keys"}},
+    "model": {
+      "type": "object",
+      "properties": {
+        "generated_at": {"type": ["string", "null"]},
+        "schema_version": {"type": "integer", "minimum": 1},
+        "functions": {"type": "integer", "minimum": 0},
+        "gcc_fallback_units": {"$ref": "#/definitions/strings"},
+        "missing_features": {"$ref": "#/definitions/strings"}
+      }
+    },
+    "tiers": {"type": "object"},
+    "unit_split": {"type": "object"},
+    "trust": {"type": "object"}
+  },
+  "required": ["callgraph_source", "modules", "functions", "warnings"]
+}

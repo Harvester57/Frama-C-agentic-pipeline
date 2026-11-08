@@ -21,6 +21,9 @@ unit-named harness; for a sub-module, the functions of the lexer module of the s
 split cluster of that name, else `scope_files` from its sidecar, else the functions of the sources its
 sidecar lists. Its tier and run flags come from the same record (the lexer module's or the cluster's,
 both set from its functions' tiers by scripts/tiers.py), else from its unit.
+
+`scope_files` is written by generate_harness.py (`--scope-file`, repeatable) and kept when the harness
+is regenerated, `--api` included; an empty list means the sidecar's `sources`.
 """
 
 from __future__ import annotations
@@ -166,11 +169,34 @@ class ModuleMap:
         }
 
 
-def infer_unit(dag: dict | None, module: str, referenced_functions: list[str] | None = None) -> str | None:
+def _dag_keys(mm: ModuleMap, ref: str, files: set[str]) -> list[str]:
+    """
+    The DAG keys a function reference names: the key itself, else every function of that name (a
+    static defined in several files is keyed `file#name`), narrowed to the given source files when
+    some of them define it.
+    """
+    if ref in mm.functions:
+        return [ref]
+    keys = [
+        k for k, r in mm.functions.items() if isinstance(r, dict) and (r.get("name") or k.rpartition("#")[2]) == ref
+    ]
+    if files and len(keys) > 1:
+        keys = [k for k in keys if _norm(str(mm.functions[k].get("file") or "")) in files] or keys
+    return keys
+
+
+def infer_unit(
+    dag: dict | None,
+    module: str,
+    referenced_functions: list[str] | None = None,
+    sources: list[str] | None = None,
+) -> str | None:
     """
     The unit a new harness module belongs to (generate_harness.py writes it into the sidecar): the
     module itself when it is a DAG module, else the unit holding its lexer module's functions, else the
-    unit holding most of the functions the harness calls. None without link units.
+    unit holding most of the functions the harness calls. Each reference votes by DAG key: a plain name
+    stands for every function of that name (narrowed to the harness's `sources`), and a name whose
+    functions sit in several units votes for none. None without link units.
     """
     mm = ModuleMap(dag)
     if not mm.units_are_link_units:
@@ -181,9 +207,12 @@ def infer_unit(dag: dict | None, module: str, referenced_functions: list[str] | 
         return mm._unit_of_lexer[module]
     if module in mm.split_submodules:
         return str(mm.split_submodules[module]["unit"])
+    files = {_norm(f) for f in sources or [] if isinstance(f, str)}
     votes: dict[str, int] = {}
-    for fn in referenced_functions or []:
-        mod = (mm.functions.get(fn) or {}).get("module")
-        if isinstance(mod, str) and mod in mm.modules:
-            votes[mod] = votes.get(mod, 0) + 1
+    for ref in dict.fromkeys(referenced_functions or []):
+        mods = [(mm.functions.get(k) or {}).get("module") for k in _dag_keys(mm, ref, files)]
+        units = {m for m in mods if isinstance(m, str) and m in mm.modules}
+        if len(units) == 1:
+            unit = units.pop()
+            votes[unit] = votes.get(unit, 0) + 1
     return sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0] if votes else None

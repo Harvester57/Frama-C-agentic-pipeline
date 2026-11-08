@@ -1,0 +1,30 @@
+{
+  "$comment": "Contract for workspace/reports/harness_reach_dynamic.json, written by scripts/harness_reach.py dynamic (record_dynamic): per harness module, the gate's entry points the fuzz corpus executed (from the coverage report) and those it never did (`gaps`), with the digest of the harness measured. Rows merge across runs; a module whose coverage was missing is not recorded. harness_reach.py check (apply_dynamic) keeps a gap failing while the harness digest is unchanged.",
+  "type": "object",
+  "properties": {
+    "generated_at": {"type": "string", "minLength": 1},
+    "warnings": {"$comment": "schema problems the producer recorded (validate_artifacts.schema_warning); run-dir fails on them", "type": "array", "items": {"type": "string"}},
+    "modules": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "module": {"type": "string", "minLength": 1},
+          "mode": {"const": "dynamic"},
+          "coverage_status": {"type": ["string", "null"]},
+          "corpus_inputs": {"type": ["integer", "null"], "minimum": 0},
+          "entry_points": {"type": "integer", "minimum": 0},
+          "entry_points_executed": {"type": "integer", "minimum": 0},
+          "executions": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+          "gaps": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "passed": {"type": "boolean"},
+          "harness_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+        },
+        "required": ["module", "mode", "entry_points", "entry_points_executed", "executions", "gaps", "passed", "harness_digest"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["generated_at", "modules"],
+  "additionalProperties": false
+}

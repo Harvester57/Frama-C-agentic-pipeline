@@ -1288,8 +1288,10 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
 _HARNESS_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
 
 
-def _infer_harness_unit(out_dir: Path, module_name: str, *snippets: str | None) -> str | None:
-    """The link unit of a new harness module, from the run's DAG (module_map.infer_unit)."""
+def _infer_harness_unit(
+    out_dir: Path, module_name: str, *snippets: str | None, sources: list[str] | None = None
+) -> str | None:
+    """The link unit of a new harness module, from the run's DAG (module_map.infer_unit, by DAG key)."""
     from module_map import infer_unit
 
     for dag_path in (out_dir.parent / "reports" / "callgraph_dag.json", Path("workspace/reports/callgraph_dag.json")):
@@ -1299,7 +1301,7 @@ def _infer_harness_unit(out_dir: Path, module_name: str, *snippets: str | None) 
             except (OSError, ValueError):
                 continue
             idents = sorted({i for s in snippets if s for i in _HARNESS_IDENT_RE.findall(s)})
-            return infer_unit(dag if isinstance(dag, dict) else None, module_name, idents)
+            return infer_unit(dag if isinstance(dag, dict) else None, module_name, idents, sources)
     return None
 
 
@@ -1449,10 +1451,29 @@ def _merge_dag_harness_sources(
     return merged
 
 
-def _trust_reachability(out_dir: Path, entry_fn: str) -> tuple[str, str] | None:
+def _entry_file(functions: dict, entry_fn: str, sources: list[str]) -> str | None:
+    """
+    The file (as the DAG names it) of the entry function the harness calls: the one among the harness's
+    sources defining a function of that name, when exactly one does. None otherwise.
+    """
+    srcs = [s for s in _norm_scope_files(sources) if s]
+    name = entry_fn.split("#")[-1]
+    files = set()
+    for key, rec in functions.items():
+        if not isinstance(rec, dict) or (rec.get("name") or str(key).split("#")[-1]) != name:
+            continue
+        f = str(rec.get("file") or "").replace("\\", "/")
+        if f and any(s == f or s.endswith("/" + f) or f.endswith("/" + s) for s in srcs):
+            files.add(f)
+    return files.pop() if len(files) == 1 else None
+
+
+def _trust_reachability(out_dir: Path, entry_fn: str, sources: list[str] | None = None) -> tuple[str, str] | None:
     """
     The entry function's reachability from its trust (scripts/trust.py, step I7), read from the run's
-    DAG: (`untrusted_surface` at a trust boundary, else `internal_api`; `trust:<deciding rule>`).
+    DAG: (`untrusted_surface` at a trust boundary, else `internal_api`; `trust:<deciding rule>`). The
+    entry function's own record decides when the harness's `sources` name its file, so a same-named
+    function elsewhere keeps its own trust; otherwise same-named records merge (untrusted wins).
     None when the DAG or the function's trust is missing.
     """
     from trust import function_trust, reachability_of
@@ -1467,7 +1488,10 @@ def _trust_reachability(out_dir: Path, entry_fn: str) -> tuple[str, str] | None:
         functions = dag.get("functions") if isinstance(dag, dict) else None
         if not isinstance(functions, dict):
             continue
-        trust = function_trust(functions, entry_fn)
+        entry_file = _entry_file(functions, entry_fn, sources or [])
+        trust = function_trust(functions, entry_fn, entry_file) if entry_file else None
+        if trust is None:
+            trust = function_trust(functions, entry_fn)
         if trust is None:
             for key in (dag.get("macro_aliases") or {}).get(entry_fn) or []:
                 trust = trust or function_trust(functions, key)
@@ -1516,13 +1540,14 @@ def generate_module_harness(
     ldflags: str = "",
     dispatch_cases: list[str] | None = None,
     unit: str | None = None,
+    scope_files: list[str] | None = None,
 ) -> dict[str, Any]:
     if auto_args:
         entry_style = "auto_prototype"
     # Reachability: explicit, else from the entry function's trust (step I7), else from the entry style.
     reachability_source = "explicit"
     if reachability is None:
-        from_trust = _trust_reachability(out_dir, entry_fn)
+        from_trust = _trust_reachability(out_dir, entry_fn, sources)
         if from_trust is not None:
             reachability, reachability_source = from_trust
         else:
@@ -1552,8 +1577,13 @@ def generate_module_harness(
     unit = (
         unit
         or previous.get("unit")
-        or _infer_harness_unit(out_dir, module_name, entry_fn, call_expr, eva_expr, fuzz_expr, *(dispatch_cases or []))
+        or _infer_harness_unit(
+            out_dir, module_name, entry_fn, call_expr, eva_expr, fuzz_expr, *(dispatch_cases or []), sources=sources
+        )
     )
+    # The files whose functions a sub-module answers for at the reach gate (module_map.scope_functions):
+    # given, else kept from the previous sidecar; empty means the sidecar's `sources`.
+    scope = previous_scope_files(previous) if scope_files is None else _norm_scope_files(scope_files)
 
     norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
     norm_cppflags = _merge_dag_module_cppflags(module_name, out_dir, norm_cppflags, unit)
@@ -1771,6 +1801,7 @@ def generate_module_harness(
         "unit": unit,
         "harness_file": str(harness_file).replace("\\", "/"),
         "sources": list(sources),
+        "scope_files": scope,
         "header": norm_header,
         "extra_includes": norm_extra_includes,
         "static_analysis_includes": norm_static_includes,
@@ -1801,7 +1832,7 @@ def generate_module_harness(
         "reach_exempt": reach_exempt,
         **prelude_fields,
     }
-    atomic_write_json(harness_meta_file, sidecar)
+    write_sidecar(harness_meta_file, sidecar)
 
     if (
         prelude.get("status") == "unresolved"
@@ -1834,8 +1865,46 @@ def generate_module_harness(
         "include_source": include_source,
         "reachability": reachability,
         "reachability_source": reachability_source,
+        "scope_files": scope,
         **prelude_fields,
     }
+
+
+def _norm_scope_files(files: list[str]) -> list[str]:
+    """Scope files as module_map compares them: run-relative, `/`-separated, without `workspace/work/`."""
+    out: list[str] = []
+    for f in files:
+        p = str(f).strip().replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        p = p[len("workspace/work/") :] if p.startswith("workspace/work/") else p
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def previous_scope_files(previous: dict[str, Any]) -> list[str]:
+    """The `scope_files` a previous sidecar recorded (empty when it has none)."""
+    raw = previous.get("scope_files")
+    return _norm_scope_files([f for f in raw if isinstance(f, str)]) if isinstance(raw, list) else []
+
+
+SIDECAR_SCHEMA = "harness_sidecar"
+
+
+def write_sidecar(path: Path, sidecar: dict[str, Any]) -> dict[str, Any]:
+    """
+    Write a harness sidecar after checking it against schemas/harness_sidecar.schema.json: schema
+    problems go to its `warnings` (validate_artifacts.py run-dir fails on them), never stop the write.
+    """
+    from validate_artifacts import schema_warning
+
+    sidecar.pop("warnings", None)
+    warning = schema_warning(SIDECAR_SCHEMA, sidecar)
+    if warning:
+        sidecar["warnings"] = [warning]
+    atomic_write_json(path, sidecar)
+    return sidecar
 
 
 def record_harness_repair(harness_meta_path: Path, reason: str) -> dict[str, Any]:
@@ -1847,7 +1916,7 @@ def record_harness_repair(harness_meta_path: Path, reason: str) -> dict[str, Any
     history = list(meta.get("repair_history") or [])
     history.append({"attempt": attempts, "reason": reason, "timestamp": utc_now()})
     meta["repair_history"] = history
-    atomic_write_json(harness_meta_path, meta)
+    write_sidecar(harness_meta_path, meta)
     return {
         "module": meta.get("module"),
         "repair_attempts": attempts,
@@ -1971,6 +2040,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--contract-note", action="append", default=[], help="Entry contract note (repeatable)")
     parser.add_argument(
+        "--scope-file",
+        action="append",
+        default=None,
+        help=(
+            "Source file whose functions this harness module answers for at the reach gate, when it is a "
+            "sub-module that is neither a lexer module nor a split cluster (repeatable; recorded as the "
+            "sidecar's `scope_files`; default: the previous sidecar's, else the --sources)"
+        ),
+    )
+    parser.add_argument(
         "--no-auto-prelude",
         dest="auto_prelude",
         action="store_false",
@@ -2019,6 +2098,7 @@ def main(argv: list[str] | None = None) -> int:
                 extra_includes=args.extra_include,
                 reachability=args.reachability,
                 auto_prelude=args.auto_prelude,
+                scope_files=args.scope_file,
             )
         except (ApiHarnessError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
@@ -2067,6 +2147,7 @@ def main(argv: list[str] | None = None) -> int:
             ldflags=args.ldflags,
             dispatch_cases=args.dispatch_case,
             unit=args.unit,
+            scope_files=args.scope_file,
         )
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

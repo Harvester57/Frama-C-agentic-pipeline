@@ -1,0 +1,35 @@
+{
+  "$comment": "Contract for one line of workspace/seed_records/traces.jsonl, written by scripts/seed_harvest.py record (_collect): the calls one traced process made to the API, in order (at most MAX_TRACE_CALLS, more than one). Each call has the bytes recorded per argument (`args`: index -> [kind, offset, hex]), the pointer addresses that link calls within the process (`addrs`), and the largest buffer recorded per argument (`sizes`). Read by api_harness.py (sequence cases) and seed_harvest.py write (sequence seeds).",
+  "type": "object",
+  "properties": {
+    "pid": {"type": "string", "minLength": 1},
+    "calls": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "properties": {
+          "fn": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "args": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": ["string", "integer"]}
+              }
+            }
+          },
+          "addrs": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]+$"}},
+          "sizes": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+        },
+        "required": ["fn", "args", "addrs", "sizes"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["pid", "calls"],
+  "additionalProperties": false
+}
