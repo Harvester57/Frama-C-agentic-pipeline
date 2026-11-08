@@ -220,7 +220,7 @@ def test_record_boundary_assumptions_prover_is_idempotent(run_dir, capsys):
     out = L.cmd_record_boundary_assumptions(res_path)
     ids = [
         "src/snmp/ber.c#ber_decode_len::l2_termination",
-        "src/snmp/ber.c#ber_decode_len::l6_secret",
+        "src/snmp/ber.c#ber_decode_len::l6_wiped",
         "src/snmp/ber.c#ber_decode_len::rte",
     ]
     assert out["units"] == ids and out["added"] == 6

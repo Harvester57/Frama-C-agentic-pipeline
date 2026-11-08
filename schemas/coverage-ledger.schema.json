@@ -4,7 +4,7 @@
   "maxItems": 200000,
   "items": {"$ref": "#/definitions/unit"},
   "definitions": {
-    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret|l4_auth_state|l4_auth_required|l5_sanitized|l6_wiped|l6_no_leak)$"},
+    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth_state|l4_auth_required|l5_sanitized|l6_wiped|l6_no_leak)$"},
     "evidence": {
       "type": "object",
       "properties": {
@@ -35,7 +35,7 @@
         "coverage_id": {"$ref": "#/definitions/coverage_id"},
         "file": {"type": "string", "minLength": 1},
         "function": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
-        "obligation_class": {"type": "string", "enum": ["rte", "l2_termination", "l3_frame", "l4_auth", "l5_output", "l6_secret", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"]},
+        "obligation_class": {"type": "string", "enum": ["rte", "l2_termination", "l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"]},
         "module": {"type": "string", "minLength": 1},
         "tier": {"type": "string", "minLength": 1},
         "wave": {"type": ["integer", "null"], "minimum": 0},

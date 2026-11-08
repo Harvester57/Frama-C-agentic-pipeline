@@ -22,7 +22,7 @@ DAG: dict[str, Any] = {
             "module": "snmp",
             "wave": 0,
             "has_loops": True,
-            "security_properties": [{"layer": 2, "reason": "loops"}, {"layer": 6, "reason": "touches auth_key"}],
+            "security_properties": [{"layer": 2, "reason": "loops"}],
         },
         "ber_decode_tag": {
             "name": "ber_decode_tag",
@@ -56,8 +56,19 @@ def load(path):
     return json.loads(open(path, encoding="utf-8").read())
 
 
+# security_props.py's report: one MetAcsl class (it needs an explicit WP goal to be credited).
+SECURITY_PROPS: dict[str, Any] = {
+    "obligations": {
+        "src/snmp/ber.c#ber_decode_len": [
+            {"class": "l6_wiped", "property": "L6_wiped_auth_key", "reason": "touches auth_key"}
+        ]
+    }
+}
+
+
 def seed(run_dir, profile=None):
     write_json(run_dir / "workspace/reports/callgraph_dag.json", DAG)
+    write_json(run_dir / "workspace/reports/security_props.json", SECURITY_PROPS)
     return L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c", profile=profile)
 
 
@@ -71,7 +82,9 @@ def test_seed_policy(run_dir):
     assert out["added_units"] == 6
     assert units["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "planned"
     assert units["src/snmp/ber.c#ber_decode_len::l2_termination"]["status"] == "planned"
-    assert units["src/snmp/ber.c#ber_decode_len::l6_secret"]["inference_reason"] == "touches auth_key"
+    l6 = units["src/snmp/ber.c#ber_decode_len::l6_wiped"]
+    assert l6["inference_reason"] == "touches auth_key"
+    assert l6["bookkeeping"]["security_properties"] == ["L6_wiped_auth_key"]
     assert "src/snmp/ber.c#ber_decode_tag::l2_termination" not in units
     # Step I8: Tier 3 RTE is planned outside the quick profile (standard here).
     assert units["src/glue/init.c#glue_init::rte"]["status"] == "planned"
@@ -277,19 +290,19 @@ def test_ingest_wp_does_not_credit_a_class_of_trivial_clauses(run_dir):
     seed(run_dir)
     units = load(run_dir / "coverage-ledger.json")
     l5 = copy.deepcopy(next(u for u in units if u["function"] == "snmp_parse_pdu" and u["obligation_class"] == "rte"))
-    l5.update(obligation_class="l5_output", coverage_id=l5["coverage_id"].replace("::rte", "::l5_output"))
+    l5.update(obligation_class="l5_sanitized", coverage_id=l5["coverage_id"].replace("::rte", "::l5_sanitized"))
     write_json(run_dir / "coverage-ledger.json", [*units, l5])
     report = wp_report(
         by_obligation_class={
             "rte": {"proven": 3, "proven_under_hyp": 0, "unproven": 0},
-            "l5_output": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+            "l5_sanitized": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
         },
     )
-    report["limits"].update(trivial_layer_clauses=["L5_no_crlf"], classes_without_real_clause=["l5_output"])
+    report["limits"].update(trivial_layer_clauses=["L5_no_crlf"], classes_without_real_clause=["l5_sanitized"])
     write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
     L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
     assert _unit(run_dir, "rte")["status"] == "covered"
-    l5 = _unit(run_dir, "l5_output")
+    l5 = _unit(run_dir, "l5_sanitized")
     assert l5["status"] != "covered"
     assert l5["evidence"][-1]["result"] == "wp_trivial_clause_only"
 
@@ -337,8 +350,8 @@ def test_ingest_wp_proven_with_hypotheses_and_unproven(run_dir):
     assert l2["status"] == "blocked" and "loop variant" in l2["unresolved"][0]
     # The function is not fully proven, so its RTE unit is not credited.
     assert units["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "planned"
-    l6 = units["src/snmp/ber.c#ber_decode_len::l6_secret"]
-    assert l6["status"] == "planned" and "L6_" in l6["evidence"][-1]["summary"]
+    l6 = units["src/snmp/ber.c#ber_decode_len::l6_wiped"]
+    assert l6["status"] == "planned" and "l6_wiped" in l6["evidence"][-1]["summary"]
 
 
 def test_transition_rules(run_dir):
@@ -689,11 +702,11 @@ def test_ingest_fuzz_publishes_corpus_to_shared_cache_when_rw(run_dir, tmp_path,
     assert len(list(shared_mod_dir.iterdir())) == 2
 
 
-def test_ingest_wp_credits_qed_simplified_l2_and_l3_but_requires_explicit_l4_to_l6(run_dir):
+def test_ingest_wp_credits_qed_simplified_l2_and_l3_but_requires_explicit_metacsl_classes(run_dir):
     seed(run_dir)
-    # ber_decode_len has rte, l2_termination, and l6_secret units.
+    # ber_decode_len has rte, l2_termination, and l6_wiped units.
     # If WP reports status="all_proven" with only rte goals (e.g. Qed simplified l2_termination),
-    # l2_termination is credited with wp_qed_simplified, while l6_secret stays planned.
+    # l2_termination is credited with wp_qed_simplified, while l6_wiped stays planned.
     write_json(
         run_dir / "workspace/reports/wp/ber_decode_len.json",
         wp_report(
@@ -707,7 +720,7 @@ def test_ingest_wp_credits_qed_simplified_l2_and_l3_but_requires_explicit_l4_to_
     assert by_id["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "covered"
     assert by_id["src/snmp/ber.c#ber_decode_len::l2_termination"]["status"] == "covered"
     assert by_id["src/snmp/ber.c#ber_decode_len::l2_termination"]["evidence"][-1]["result"] == "wp_qed_simplified"
-    assert by_id["src/snmp/ber.c#ber_decode_len::l6_secret"]["status"] == "planned"
+    assert by_id["src/snmp/ber.c#ber_decode_len::l6_wiped"]["status"] == "planned"
 
 
 def test_audit_hypotheses_discharges_proven_callees_and_flags_unverified_callees(run_dir):
@@ -746,7 +759,6 @@ def test_audit_hypotheses_discharges_proven_callees_and_flags_unverified_callees
                 file="workspace/work/src/snmp/ber.c",
                 by_obligation_class={
                     "rte": {"proven": 2, "proven_under_hyp": 0, "unproven": 0},
-                    "l6_secret": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
                 },
             ),
         )
@@ -934,7 +946,7 @@ def test_audit_hypotheses_is_transitive_over_conditional_callees(run_dir):
         [run_dir / "workspace/reports/wp/snmp_parse_pdu.json", run_dir / "workspace/reports/wp/ber_decode_tag.json"]
     )
     res = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
-    assert res == {"discharged": 0, "conditional": 2}
+    assert res == {"discharged": 0, "conditional": 2, "warnings": []}
     pdu = units_by_id(run_dir)["src/snmp/pdu.c#snmp_parse_pdu::rte"]
     cch = [a for a in pdu["assumptions"] if a["kind"] == "callee_contract_hypothesis"]
     # The caller's own callee is WP-covered, but only conditionally: the caller stays conditional too.
@@ -951,13 +963,12 @@ def test_audit_hypotheses_is_transitive_over_conditional_callees(run_dir):
             by_obligation_class={
                 "rte": {"proven": 2, "proven_under_hyp": 0, "unproven": 0},
                 "l2_termination": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
-                "l6_secret": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
             },
         ),
     )
     L.cmd_ingest_wp([run_dir / "workspace/reports/wp/ber_decode_len.json"])
     res2 = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
-    assert res2 == {"discharged": 2, "conditional": 0}
+    assert res2 == {"discharged": 2, "conditional": 0, "warnings": []}
     by_id = units_by_id(run_dir)
     for cid in ("src/snmp/pdu.c#snmp_parse_pdu::rte", "src/snmp/ber.c#ber_decode_tag::rte"):
         assert not any(
@@ -986,7 +997,7 @@ def test_audit_hypotheses_resolves_colliding_callee_keys(run_dir):
     )
     L.cmd_ingest_wp([run_dir / "workspace/reports/wp/api.json"])
     res = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
-    assert res == {"discharged": 0, "conditional": 1}
+    assert res == {"discharged": 0, "conditional": 1, "warnings": []}
     cch = [
         a for a in units_by_id(run_dir)["src/c.c#api::rte"]["assumptions"] if a["kind"] == "callee_contract_hypothesis"
     ]

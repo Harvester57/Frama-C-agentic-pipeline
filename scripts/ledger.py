@@ -4,7 +4,10 @@ Coverage ledger, candidate, and verifier verdict management (parent-only writer)
 
 Subcommands (run with the run directory as working directory):
   seed                     --dag workspace/reports/callgraph_dag.json [--scope PATH ...]
-                           [--security-props workspace/reports/security_props.json]
+                           [--security-props workspace/reports/security_props.json] [--refresh]
+                           (refuses while the reach gate fails, or while the model has a threat
+                           model and security_props.json is missing; --refresh re-derives the
+                           units without evidence from the current DAG)
   ingest-fuzz              <workspace/reports/fuzz/*.json ...>
   ingest-eva               <workspace/reports/eva/*.json ...>
   ingest-wp                <workspace/reports/wp/*.json ...> [--sweep]
@@ -46,6 +49,7 @@ from typing import Any, TypeVar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
@@ -78,11 +82,12 @@ LEDGER = Path("coverage-ledger.json")
 CANDIDATES = Path("candidates.json")
 FINDINGS = Path("findings.json")
 
-LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame", 4: "l4_auth", 5: "l5_output", 6: "l6_secret"}
+# The DAG's own layer facts (build_callgraph_dag.py). Layers 4-6 are the MetAcsl classes below.
+LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame"}
 # Step I9: classes keyed to the MetAcsl properties of scripts/security_props.py.
 SECURITY_CLASSES = ("l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
-LAYER_CLASSES = ("l4_auth", "l5_output", "l6_secret", *SECURITY_CLASSES[1:])
 DEFAULT_SECURITY_PROPS = Path("workspace/reports/security_props.json")
+MODEL_JSON = Path("workspace/reports/phase0_model.json")
 UNIT_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*$")
 FN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NO_TOUCH = {"deferred", "out_of_scope", "not_applicable"}
@@ -361,29 +366,36 @@ def _load_security_obligations(path: Path | None) -> tuple[dict[str, list[dict]]
     return data["obligations"], "ok"
 
 
-@ledger_locked
-def cmd_seed(
+def _derive_units(
+    dag: dict,
     dag_path: Path,
     scope: list[str],
     callgraph_source: str,
-    profile: str | None = None,
-    security_props: Path | None = None,
-) -> dict:
-    dag = load_json_strict(dag_path)
-    units, candidates = load_state()
-    obligations, sec_status = _load_security_obligations(security_props)
-    sec_matched: set[str] = set()
+    profile: str | None,
+    obligations: dict[str, list[dict]] | None,
+) -> tuple[dict[str, dict], dict[str, str], list[str], set[str], set[tuple[str, str]]]:
+    """
+    Every unit the DAG derives, whatever the ledger already holds: coverage id -> unit; the ids
+    deferred for an unreached header (`unreached`) or the GCC fallback (`fallback`); the names
+    skipped as unsupported; the functions security_props.py's obligations matched; and the DAG's
+    (file, name) pairs.
+    """
     modules = dag.get("modules", {})
     # With link units (step I5b) each function has its own tier (scripts/tiers.py, step I8).
     link_units = dag.get("module_kind") == "link_unit"
     resolved_profile = _resolve_seed_profile(profile, dag_path)
-    added, skipped, deferred_unreached, deferred_fallback = 0, [], [], []
+    derived: dict[str, dict] = {}
+    tags: dict[str, str] = {}
+    skipped: list[str] = []
+    sec_matched: set[str] = set()
+    dag_fns: set[tuple[str, str]] = set()
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
         name = fn.get("name", fn_name)
         file = normalize_file(fn.get("file", ""))
         if not FN_RE.match(name) or not UNIT_PATH_RE.match(file):
             skipped.append(f"{file}#{name}")
             continue
+        dag_fns.add((file, name))
         module = fn.get("module") or "unknown"
         if link_units:
             tier = fn.get("tier") or modules.get(module, {}).get("tier") or "unclassified"
@@ -416,7 +428,7 @@ def cmd_seed(
 
         for cls, reason in classes:
             cid = unit_id(file, name, cls)
-            if cid in units:
+            if cid in derived:
                 continue
             if not in_scope:
                 unit = new_unit(
@@ -482,11 +494,11 @@ def cmd_seed(
                 # Its unit is on the GCC fallback: Eva and WP cannot run on it, fuzzing still does.
                 unit["status"] = "deferred"
                 unit["unresolved"] = [f"{CALLGRAPH_FALLBACK}: {fn['eva_wp_blocked']}"]
-                deferred_fallback.append(cid)
+                tags[cid] = "fallback"
             if unreached_header and unit["status"] == "planned":
                 unit["status"] = "deferred"
                 unit["unresolved"] = [HEADER_UNREACHED]
-                deferred_unreached.append(cid)
+                tags[cid] = "unreached"
             if sec_names.get(cls):
                 unit.setdefault("bookkeeping", {})["security_properties"] = sorted(set(sec_names[cls]))
             if fn.get("callgraph_fallback"):
@@ -502,21 +514,152 @@ def cmd_seed(
                     bk["wp_blockers"] = fn["wp_blockers"]
                 if fn.get("wp_notes"):
                     bk["wp_notes"] = fn["wp_notes"]
-            units[cid] = unit
-            added += 1
-    commit(units, candidates)
+            derived[cid] = unit
+    return derived, tags, skipped, sec_matched, dag_fns
+
+
+# What `seed --refresh` may re-derive: a unit in one of these statuses that carries no evidence.
+REFRESHABLE = frozenset({"planned", "deferred", "out_of_scope"})
+# The bookkeeping keys the seed writes (a refresh replaces them; any other key is kept).
+SEED_BOOKKEEPING = (
+    "security_properties",
+    "callgraph_fallback",
+    "concurrent",
+    "verifiability",
+    "wp_blockers",
+    "wp_notes",
+)
+LEFT_DAG = "left_dag: the function is no longer in the call-graph DAG"
+CLASS_NOT_DERIVED = "class_not_derived: the call-graph DAG no longer derives this obligation class for the function"
+REFRESH_LIST_MAX = 50
+
+
+def _has_evidence(unit: dict) -> bool:
+    """Whether a phase has worked on the unit: what `seed --refresh` never rewrites."""
+    return bool(
+        unit.get("evidence")
+        or unit.get("result_fingerprints")
+        or unit.get("attempts")
+        or unit.get("assumptions")
+        or unit.get("agent_id")
+    )
+
+
+def _rederived(unit: dict, new: dict | None, reason: str) -> dict:
+    """The unit as the current DAG derives it (`new`), or retired `out_of_scope` with `reason`."""
+    out = copy.deepcopy(unit)
+    if new is None:
+        out["status"] = "out_of_scope"
+        out["unresolved"] = [reason]
+        out["agent_id"] = None
+        return out
+    for key in ("module", "tier", "wave", "callgraph_source", "status", "unresolved", "agent_id"):
+        out[key] = copy.deepcopy(new[key])
+    if "inference_reason" in new:
+        out["inference_reason"] = new["inference_reason"]
+    else:
+        out.pop("inference_reason", None)
+    bk = {k: v for k, v in (out.get("bookkeeping") or {}).items() if k not in SEED_BOOKKEEPING}
+    bk.update(copy.deepcopy(new.get("bookkeeping") or {}))
+    if bk:
+        out["bookkeeping"] = bk
+    else:
+        out.pop("bookkeeping", None)
+    return out
+
+
+def _refresh_units(
+    units: dict[str, dict], derived: dict[str, dict], added: set[str], dag_fns: set[tuple[str, str]]
+) -> dict:
+    """
+    Re-derive the ledger's units without evidence (planned, deferred, out of scope) from the
+    current DAG; a unit the DAG no longer derives is retired `out_of_scope` with the reason. A unit
+    with evidence is never touched: it is counted under `kept_with_evidence` when the DAG changed it.
+    """
+    changed: dict[str, list[str]] = {"updated": [], "retired": [], "kept_with_evidence": []}
+    for cid in sorted(units):
+        if cid in added:
+            continue
+        unit = units[cid]
+        new = derived.get(cid)
+        reason = LEFT_DAG if (normalize_file(unit["file"]), unit["function"]) not in dag_fns else CLASS_NOT_DERIVED
+        target = _rederived(unit, new, reason)
+        if target == unit:
+            continue
+        if unit["status"] not in REFRESHABLE or _has_evidence(unit):
+            changed["kept_with_evidence"].append(cid)
+            continue
+        units[cid] = target
+        changed["updated" if new is not None else "retired"].append(cid)
     return {
-        "added_units": added,
+        "added": len(added),
+        **{k: len(v) for k, v in changed.items()},
+        "units": {"added": sorted(added)[:REFRESH_LIST_MAX], **{k: v[:REFRESH_LIST_MAX] for k, v in changed.items()}},
+    }
+
+
+@ledger_locked
+def cmd_seed(
+    dag_path: Path,
+    scope: list[str],
+    callgraph_source: str,
+    profile: str | None = None,
+    security_props: Path | None = None,
+    refresh: bool = False,
+) -> dict:
+    """
+    Add the units the DAG derives that the ledger lacks; an existing unit is never rewound. With
+    `refresh` (a Phase 0 re-run on a changed target), the units without evidence also follow the
+    current DAG (`_refresh_units`), and the result reports what changed.
+    """
+    dag = load_json_strict(dag_path)
+    units, candidates = load_state()
+    obligations, sec_status = _load_security_obligations(security_props)
+    derived, tags, skipped, sec_matched, dag_fns = _derive_units(
+        dag, dag_path, scope, callgraph_source, profile, obligations
+    )
+    added = [cid for cid in sorted(derived) if cid not in units]
+    for cid in added:
+        units[cid] = derived[cid]
+    changes = _refresh_units(units, derived, set(added), dag_fns) if refresh else None
+    commit(units, candidates)
+    out: dict[str, Any] = {
+        "added_units": len(added),
         "total_units": len(units),
         "skipped_unsupported_names": skipped,
-        "deferred_unreached_header_units": len(deferred_unreached),
-        "deferred_callgraph_fallback_units": len(deferred_fallback),
+        "deferred_unreached_header_units": sum(1 for cid in added if tags.get(cid) == "unreached"),
+        "deferred_callgraph_fallback_units": sum(1 for cid in added if tags.get(cid) == "fallback"),
         "security_props": {
             "status": sec_status,
             "functions": len(sec_matched),
             "unmatched": sorted(set(obligations or {}) - sec_matched)[:20],
         },
     }
+    if changes is not None:
+        out["refresh"] = changes
+    return out
+
+
+def seed_input_problems(security_props: Path | None = None, run_dir: Path = Path(".")) -> list[str]:
+    """
+    Why the seed must not run yet: a failed or stale reach gate (as `wp_scheduler.py init`), or a
+    model with a threat model but no security_props.py report, which would leave out the MetAcsl
+    classes. Empty when the inputs are ready.
+    """
+    reasons = [f"Phase 0 reach gate: {r}" for r in phase0_gates.check(run_dir, need=("reach",))]
+    model = load_json_optional(run_dir / MODEL_JSON, None)
+    trust_block = model.get("trust") if isinstance(model, dict) else None
+    threat = trust_block.get("threat_model") if isinstance(trust_block, dict) else None
+    if isinstance(threat, dict) and threat.get("status") == "ok":
+        path = security_props or DEFAULT_SECURITY_PROPS
+        _, status = _load_security_obligations(path)
+        if status != "ok":
+            what = "is missing" if status == "absent" else "is not a security_props.py report"
+            reasons.append(
+                f"{path.as_posix()} {what} while the model has a threat model: run "
+                "`security_props.py run` first, or the seed leaves out the MetAcsl classes"
+            )
+    return reasons
 
 
 # ---------------------------------------------------------------- ingestion
@@ -562,6 +705,10 @@ def fuzz_engine_note(report: dict) -> str:
 def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
     mm = ModuleMap.load(".")
+    # A failure lands on the function its line lies in, as Eva rows do (a renamed static, `f_0`,
+    # still credits `f`); the reported name, through the model's kernel_names, only without a line.
+    index = _dag_line_index(dag=mm.dag)
+    kernel = _model_kernel_names()
     stats: dict[str, Any] = {"reports": 0, "candidates": 0}
     ingested_modules: list[str] = []
     for path in paths:
@@ -610,21 +757,26 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
             if failure and art.get("fingerprint"):
                 fp = art["fingerprint"]
                 file = normalize_file(failure["file"])
+                # The fingerprint and the location keep the reported name: replay and minimization
+                # match the failures they reproduce against it.
                 function = failure["function"]
+                link_unit = str((mm.modules.get(mm.unit_of(module)) or {}).get("unit") or mm.unit_of(module))
+                source_fn = _located_function(file, failure.get("line"), function, index, kernel, link_unit)
                 cls = goal_obligation_class(
                     {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
                 )
                 linked = [
                     u["coverage_id"]
-                    for u in units_for_function(units, file, function)
+                    for u in units_for_function(units, file, source_fn)
                     if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
                 ]
                 proposed = "confirmed" if art.get("reproducible") else "needs_validation"
-                note = None if art.get("reproducible") else "crash did not reproduce on replay"
+                notes = [] if art.get("reproducible") else ["crash did not reproduce on replay"]
+                if source_fn != function:
+                    notes.append(f"reported in {function}, which is {source_fn} in the source")
                 if not linked:
-                    note = (
-                        note + "; " if note else ""
-                    ) + f"no ledger unit for {file}#{function}::{cls} (harness or unseeded code)"
+                    notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
+                note = "; ".join(notes) or None
                 upsert_candidate(
                     candidates,
                     fp,
@@ -809,6 +961,54 @@ def _dag_line_index(dag_path: Path = DAG_REPORT, dag: dict | None = None) -> dic
                 (line, end, str(rec.get("name") or key))
             )
     return out
+
+
+def _model_kernel_names(model_path: Path = MODEL_JSON) -> dict[tuple[str, str], dict[str, str]]:
+    """
+    (file, kernel name) -> {link unit: source name} for every function the Frama-C kernel renamed in
+    some unit's parse (the model's `kernel_names`: a same-named static becomes `f_0`).
+    """
+    try:
+        model = load_json_optional(model_path, None)
+    except ArtifactError:
+        return {}
+    out: dict[tuple[str, str], dict[str, str]] = {}
+    fns = model.get("functions") if isinstance(model, dict) else None
+    for rec in fns.values() if isinstance(fns, dict) else []:
+        if not isinstance(rec, dict) or not isinstance(rec.get("kernel_names"), dict):
+            continue
+        name, file = str(rec.get("name") or ""), normalize_file(str(rec.get("file") or ""))
+        for unit, kernel in rec["kernel_names"].items():
+            if name and isinstance(kernel, str) and kernel != name:
+                out.setdefault((file, kernel), {})[str(unit)] = name
+    return out
+
+
+def _located_function(
+    file: str,
+    line: object,
+    reported: str,
+    index: dict[str, list[tuple[int, int, str]]],
+    kernel: dict[tuple[str, str], dict[str, str]],
+    link_unit: str,
+) -> str:
+    """
+    The DAG function a failure at `file`:`line` lies in, by line range (as Eva ingest places its
+    rows). Only a location the line cannot place uses the reported name, mapped back to its source
+    name when the kernel renamed it (the report's link unit first).
+    """
+    spans = index.get(file)
+    if spans and isinstance(line, int) and line > 0:
+        inside = [s for s in spans if s[0] <= line <= s[1]]
+        if inside:
+            return min(inside, key=lambda s: s[1] - s[0])[2]
+    names = kernel.get((file, reported))
+    if names:
+        if link_unit in names:
+            return names[link_unit]
+        if len(set(names.values())) == 1:
+            return next(iter(names.values()))
+    return reported
 
 
 def _eva_row_function(row: object, index: dict[str, list[tuple[int, int, str]]], reported: str) -> str:
@@ -1469,11 +1669,6 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"Goals of class {cls} are proven, but the function proof is incomplete; not credited.",
                 )
             else:
-                hint = (
-                    f" (layer clauses must be named {cls[:2].upper()}_*)"
-                    if cls in ("l4_auth", "l5_output", "l6_secret")
-                    else ""
-                )
                 add_evidence(
                     u,
                     "wp",
@@ -1481,7 +1676,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     "wp_no_credited_goals",
                     False,
                     tool_output,
-                    f"No WP goal could be credited to {cls}{hint}.",
+                    f"No WP goal could be credited to {cls}.",
                 )
     for status, tool_output, wp_covered in sweep_checks:
         for cid in wp_covered:
@@ -2624,6 +2819,8 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
 
     hyp_kinds = ("valid_under_hyp", "callee_contract_hypothesis")
     audited: dict[str, list[dict]] = {}
+    # Name-only resolutions: a stale DAG (no record for the caller, or a callee key without one).
+    warnings: set[str] = set()
     for u in units.values():
         if u["status"] != "covered" or not _has_wp_discharge(u):
             continue
@@ -2632,6 +2829,10 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
         callee_names = callees_by_key.get((u_file, u_fn))
         if callee_names is None:
             callee_names = callees_by_name.get(u_fn, [])
+            if u_fn in callees_by_name:
+                warnings.add(
+                    f"{u_file}#{u_fn} has no DAG record: its callees are those of the first record named {u_fn}"
+                )
 
         callee_units: list[dict] = []
         for cfile, cname in callee_names:
@@ -2641,6 +2842,8 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
             else:
                 # An old DAG without the callee's record: by name, the caller's file first.
                 pool = units_by_fn_name.get(cname, [])
+                if pool:
+                    warnings.add(f"callee {cname} of {u_file}#{u_fn} has no DAG record: its units are matched by name")
             cand_units = [
                 cu
                 for cu in pool
@@ -2711,7 +2914,9 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
             discharged += 1
 
     commit(units, candidates)
-    return {"discharged": discharged, "conditional": conditional}
+    for warning in sorted(warnings):
+        print(f"audit-hypotheses: warning: {warning}; rebuild the DAG", file=sys.stderr)
+    return {"discharged": discharged, "conditional": conditional, "warnings": sorted(warnings)}
 
 
 def cmd_summary() -> dict:
@@ -2765,6 +2970,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=f"scripts/security_props.py's report (default {DEFAULT_SECURITY_PROPS}, used when present)",
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Also re-derive the units without evidence from the current DAG (a Phase 0 re-run on a changed target)",
     )
     for name in ("ingest-fuzz", "ingest-eva", "ingest-wp"):
         p = sub.add_parser(name)
@@ -2825,7 +3035,13 @@ def main(argv: list[str] | None = None) -> int:
     out: object
     try:
         if args.cmd == "seed":
-            out = cmd_seed(args.dag, args.scope, args.callgraph_source, args.profile, args.security_props)
+            problems = seed_input_problems(args.security_props)
+            if problems:
+                print(json.dumps({"ok": False, "error": "seed inputs not ready", "reasons": problems}, indent=2))
+                return 1
+            out = cmd_seed(
+                args.dag, args.scope, args.callgraph_source, args.profile, args.security_props, refresh=args.refresh
+            )
         elif args.cmd == "ingest-fuzz":
             out = cmd_ingest_fuzz(args.reports)
         elif args.cmd == "ingest-eva":
