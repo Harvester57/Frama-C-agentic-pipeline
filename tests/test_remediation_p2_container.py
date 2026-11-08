@@ -59,6 +59,7 @@ NOT_FORWARDED = {
     "FRAMAC_SNAPSHOT_DIR",
     "FRAMAC_PROBE_MEMO_S",
     "FRAMAC_PROBE_ROOT",
+    "FRAMAC_SECURITY_PROPS",  # run_wp_function.py override; the default is the run's workspace/reports file
 }
 AB_SWITCHES = ("FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB")
 

@@ -1,0 +1,73 @@
+{
+  "$comment": "Contract for workspace/reports/security_props.json, written by scripts/security_props.py run (plan step I9): the MetAcsl security properties the threat model requires (L4-L6), the frame obligations (L3), and the ledger obligations per function (`file#name`).",
+  "type": "object",
+  "definitions": {
+    "class": {"type": "string", "enum": ["l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"]}
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "threat_model": {
+      "type": "object",
+      "properties": {
+        "status": {"type": "string", "enum": ["ok", "no_threat_model", "invalid_threat_model"]},
+        "path": {"type": ["string", "null"]},
+        "sha256": {"type": ["string", "null"]},
+        "reason": {"type": ["string", "null"]}
+      },
+      "required": ["status"]
+    },
+    "preamble": {"$comment": "ACSL every meta file starts with (templates/metacsl/preamble.acsl)", "type": "string"},
+    "properties": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "pattern": "^L[4-6]_(auth_state|auth_required|sanitized|wiped|no_leak)_[A-Za-z0-9_]+$"},
+          "layer": {"type": "integer", "minimum": 4, "maximum": 6},
+          "kind": {"type": "string", "enum": ["auth_state", "auth_required", "sanitized", "wiped", "no_leak"]},
+          "obligation_class": {"$ref": "#/definitions/class"},
+          "acsl": {"$comment": "the meta-property annotation(s), ready to parse", "type": "string", "minLength": 1},
+          "instances": {"$comment": "functions whose WP proof holds the generated annotations: the ledger units", "type": "array", "items": {"type": "string", "pattern": "#"}},
+          "sources": {"$comment": "files defining the globals the property names, parsed with every WP run that loads it", "type": "array", "items": {"type": "string"}},
+          "notes": {"type": "array", "items": {"type": "string"}},
+          "targets": {"type": "string"},
+          "threat_model": {"$comment": "the threat-model item the property comes from", "type": "object"},
+          "direct_writers": {"type": "array", "items": {"type": "string"}},
+          "entry_points": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["name", "layer", "kind", "obligation_class", "acsl", "instances", "sources", "notes"],
+        "additionalProperties": false
+      }
+    },
+    "frame": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {"function": {"type": "string", "pattern": "#"}, "reason": {"type": "string"}},
+        "required": ["function", "reason"],
+        "additionalProperties": false
+      }
+    },
+    "obligations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "class": {"$ref": "#/definitions/class"},
+            "property": {"type": "string"},
+            "reason": {"type": "string"}
+          },
+          "required": ["class", "property", "reason"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "summary": {"type": "object"},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["schema_version", "generated_at", "threat_model", "preamble", "properties", "frame", "obligations", "summary", "warnings"],
+  "additionalProperties": false
+}

@@ -2560,6 +2560,12 @@ def prepare_agent(
                         sec_props.append(sp)
                 if fmeta.get("is_entry") or fn_name in entry_fns:
                     untrusted_entries.append(fn_name)
+    # Step I9: the MetAcsl properties whose generated annotations this function must discharge.
+    sec_doc = load_json_optional(overlay / "reports" / "security_props.json", None) if function else None
+    if isinstance(sec_doc, dict) and norm_c_file and function:
+        import security_props
+
+        sec_props = [*sec_props, *security_props.brief_entries(sec_doc, norm_c_file, function)]
 
     def _untrusted_for(meta: dict) -> bool:
         if meta.get("reachability") == "internal_api":

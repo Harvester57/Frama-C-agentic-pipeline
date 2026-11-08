@@ -1,0 +1,106 @@
+{
+ "status": "all_proven",
+ "function": "session_close",
+ "file": "session.c",
+ "wp_model": "Typed",
+ "counter_examples": false,
+ "counter_example_goals": [],
+ "total_goals": 8,
+ "proven_count": 8,
+ "proven_under_hyp_count": 0,
+ "unproven_count": 0,
+ "dead_count": 0,
+ "assigns_vcs_proven": true,
+ "frame_summary": {
+  "missing_assigns_warning": false,
+  "assigns_vcs_proven": true,
+  "l3_frame_goals": {
+   "proven": 1,
+   "proven_under_hyp": 0,
+   "unproven": 0
+  }
+ },
+ "soundness": {
+  "ok": true,
+  "tier_a_aborts": [],
+  "tier_b_unsound": [],
+  "checked_memory_model_functions": [],
+  "skipped_rte_guards": [
+   "invalid function pointer calls (\\valid_function not supported)",
+   "unaligned pointers (\\aligned not supported)"
+  ],
+  "assumed_function_pointer_goals": [],
+  "reduced_checks": []
+ },
+ "undeclared_functions": [],
+ "by_obligation_class": {
+  "rte": {
+   "proven": 4,
+   "proven_under_hyp": 0,
+   "unproven": 0
+  },
+  "l2_termination": {
+   "proven": 2,
+   "proven_under_hyp": 0,
+   "unproven": 0
+  },
+  "l3_frame": {
+   "proven": 1,
+   "proven_under_hyp": 0,
+   "unproven": 0
+  },
+  "l6_wiped": {
+   "proven": 1,
+   "proven_under_hyp": 0,
+   "unproven": 0
+  }
+ },
+ "next_synthesis_focus": "complete",
+ "unproven_by_bucket": {
+  "step_a_assigns": [],
+  "step_b_loop_invariant": [],
+  "step_c_rte_obligation": [],
+  "step_c_caller_precondition": [],
+  "step_c_contract_postcondition": []
+ },
+ "unproven_goals": [],
+ "proven_under_hyp_goals": [],
+ "layer_goals": [
+  {
+   "file": "security_meta_session_close.c",
+   "function": "session_close",
+   "line": 6,
+   "kind": "postcondition",
+   "status": "Valid",
+   "annotation": "L6_wiped_session_key: meta: \\forall integer i; 0 <= i < sizeof(session_key) / sizeof(session_key[0]) ==> session_key[i] == 0",
+   "obligation_class": "l6_wiped"
+  }
+ ],
+ "sarif_file": null,
+ "security_props": {
+  "props": "workspace/reports/security_props.json",
+  "function_id": "session.c#session_close",
+  "properties": [
+   "L6_wiped_session_key"
+  ],
+  "extra_sources": []
+ },
+ "wp_vc_stats": {
+  "proved": 12,
+  "total": 12,
+  "timeouts": 0
+ },
+ "limits": {
+  "vacuity": {
+   "status": "consistent",
+   "doomed": [],
+   "dead_goals": 0
+  },
+  "missing_spec_callees": [],
+  "trivial_layer_clauses": [],
+  "unchecked_layer_clauses": [
+   "L6_wiped_session_key"
+  ],
+  "classes_without_real_clause": []
+ }
+}

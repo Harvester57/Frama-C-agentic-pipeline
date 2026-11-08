@@ -47,7 +47,9 @@
         "properties": {
           "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "kind": {"type": "string", "enum": ["global", "parameter", "field", "return"]},
-          "function": {"$ref": "#/definitions/function_ref"},
+          "function": {"$comment": "where the secret is released (kind global) or held (parameter, field): its wipe is checked when this function returns (step I9)", "$ref": "#/definitions/function_ref"},
+          "size": {"$comment": "step I9: number of elements to wipe, a C expression over constants and the function's parameters (`len`, `32`); default sizeof for arrays", "type": "string", "pattern": "^[A-Za-z0-9_ ()*+/.>-]+$"},
+          "object": {"$comment": "step I9, kind field: the parameter or global holding the field", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["name", "kind", "description"],
@@ -77,7 +79,8 @@
         "properties": {
           "function": {"$ref": "#/definitions/function_ref"},
           "kind": {"type": "string", "enum": ["network", "file", "log", "terminal", "ipc", "buffer", "other"]},
-          "params": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
+          "params": {"$comment": "step I9: the parameters carrying the output (default: the pointer parameters)", "type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
+          "length": {"$comment": "step I9: the parameter giving the number of elements `params` point to", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "kind", "description"],

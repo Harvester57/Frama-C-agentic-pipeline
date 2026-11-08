@@ -1286,8 +1286,10 @@ def infer_security_properties(
     threat_model_text: str,
 ) -> list[dict]:
     """
-    Infer candidate Security Layers (Layers 2-6) from structural C properties
-    and explicit THREAT_MODEL.md references (without hardcoded domain keyword lists).
+    Layer 2 (termination) from the function's loops or recursion. Layers 3-6 are no longer inferred
+    here: step I9 generates them from the structured threat model (scripts/security_props.py, MetAcsl)
+    instead of matching patterns in each function, so `fn_name`, `sig_info` and `threat_model_text`
+    are unused and kept for the callers.
     """
     props: list[dict] = []
 
@@ -1308,39 +1310,6 @@ def infer_security_properties(
                 "category": "Termination / Anti-DoS",
                 "template": "decreases",
                 "reason": "Recursive function requires a strict decreasing measure.",
-            }
-        )
-
-    # Layer 5: Structured Output Buffer Formatting / Serialization
-    if sig_info["writes_bounded_buffer"] and body_info["uses_format_or_write"]:
-        props.append(
-            {
-                "layer": 5,
-                "category": "Output Grammar & Sanitization (Anti-Injection)",
-                "template": "templates/acsl/layer5_output_sanitization.acsl",
-                "reason": f"Function '{fn_name}' formats or serializes data into a bounded mutable output buffer.",
-            }
-        )
-
-    # Layer 6: Memory / Secret Zeroization
-    if body_info["has_zeroization"]:
-        props.append(
-            {
-                "layer": 6,
-                "category": "Secret Zeroization & Non-Interference (Taint)",
-                "template": "templates/acsl/layer6_zeroization_and_taint.acsl",
-                "reason": f"Function '{fn_name}' performs explicit memory zeroization.",
-            }
-        )
-
-    # Explicit Threat Model citation
-    if threat_model_text and re.search(rf"\b{re.escape(fn_name)}\b", threat_model_text):
-        props.append(
-            {
-                "layer": 4,
-                "category": "Threat-Model Cited Entry/Boundary Function",
-                "template": "THREAT_MODEL.md",
-                "reason": f"Function '{fn_name}' is explicitly referenced in THREAT_MODEL.md.",
             }
         )
 

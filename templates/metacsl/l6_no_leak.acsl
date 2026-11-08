@@ -1,0 +1,18 @@
+/*
+ * L6, secrets: never flow to output sinks. Two direct-flow checks:
+ *   calling  at every call of a sink, each of its pointer arguments is separated from the secret
+ *            (in every function for a global secret, in the owning function for a parameter);
+ *   reading  a sink defined in the target, and everything it calls, never reads the secret.
+ * A copy of the secret into another buffer that then reaches a sink is an indirect flow these
+ * checks do not see (Eva's taint domain does; see docs/security-properties.md).
+ */
+//# calling
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\calling),
+      ${predicate};
+*/
+//# reading
+/*@ meta \prop, \name(${name}), \targets(\callees({${sinks}})), \context(\reading),
+      \separated(\read, ${region});
+*/
+//# call_clause
+\tguard(\called == ${sink} ==> \fguard(\separated(\called_arg(${param}), ${region})))

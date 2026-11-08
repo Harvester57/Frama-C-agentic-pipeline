@@ -377,8 +377,8 @@ int decode_stream(const uint8_t *buf, size_t len, uint8_t *scratch, size_t scrat
         assert dec_stream["verifiability"] == "core_provable"
         assert dec_stream["wp_blockers"] == []
         layers = {p["layer"] for p in dec_stream["security_properties"]}
-        assert 2 in layers  # loop termination
-        assert 6 in layers  # structural memory zeroization
+        # Loop termination only: Layers 3-6 come from the threat model via security_props.py (I9).
+        assert layers == {2}
         assert infer_security_properties is not None
 
     def test_cross_module_required_sources_and_compile_commands_synthesis(self, tmp_path: Path) -> None:

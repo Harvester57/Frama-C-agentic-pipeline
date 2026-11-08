@@ -1,0 +1,31 @@
+/*
+ * L5, output sinks: what leaves the target through a sink is sanitized.
+ *   emit    network, file, log, terminal, ipc and other sinks: checked at every call of the sink
+ *           (context \calling, so it holds for a sink the target only declares), which puts the
+ *           obligation on the writers, the sink's callers:
+ *             text   (log, terminal) no CR or LF before the terminating NUL: no log or terminal
+ *                    injection (CWE-117, CWE-93);
+ *             bytes  (a `length` parameter) every byte handed over is initialized: no disclosure of
+ *                    uninitialized memory (CWE-457, CWE-200);
+ *             object (no length) the object the parameter points to is initialized.
+ *   buffer  a sink that returns its output in a buffer: the out-parameters are initialized when it
+ *           returns (a postcondition of the sink, which the target must define).
+ * The clauses use \fguard: a parameter of the wrong type makes the property \false (unproven), never
+ * silently \true.
+ */
+//# emit
+/*@ meta \prop, \name(${name}), \targets(\ALL), \context(\calling),
+      \tguard(\called == ${sink} ==> (${predicate}));
+*/
+//# buffer
+/*@ meta \prop, \name(${name}), \targets({${sink}}), \context(\postcond),
+      ${predicate};
+*/
+//# text
+\fguard(L5_no_crlf(\called_arg(${param})))
+//# bytes
+\fguard(\initialized(\called_arg(${param}) + (0 .. \called_arg(${length}) - 1)))
+//# object
+\fguard(\initialized(\called_arg(${param})))
+//# out_object
+\fguard(\initialized(\formal(${param})))

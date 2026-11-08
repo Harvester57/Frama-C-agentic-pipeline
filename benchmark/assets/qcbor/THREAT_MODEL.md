@@ -35,7 +35,7 @@ buffer the application supplies; its output then leaves the application.
   "secrets": [],
   "auth_gates": [],
   "output_sinks": [
-    {"function": "QCBOREncode_Finish", "kind": "buffer", "description": "Returns the encoded CBOR the application sends or stores."}
+    {"function": "QCBOREncode_Finish", "kind": "buffer", "params": ["pEncodedCBOR"], "description": "Returns the encoded CBOR the application sends or stores."}
   ]
 }
 ```
