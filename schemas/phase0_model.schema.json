@@ -119,6 +119,20 @@
             "additionalProperties": false
           },
           "external_calls": {"$comment": "functions it calls that no unit of its program defines (libc, packages)", "type": "array", "items": {"type": "string"}},
+          "param_sizes": {
+            "$comment": "argument index -> bytes of the object the parsed callers pass there (an array, an object's address), when the call site shows it",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "min": {"type": "integer", "minimum": 1},
+                "max": {"type": "integer", "minimum": 1},
+                "sites": {"type": "integer", "minimum": 1}
+              },
+              "required": ["min", "max", "sites"],
+              "additionalProperties": false
+            }
+          },
           "trust": {"$ref": "#/definitions/function_trust"}
         },
         "required": ["file", "name", "kernel_names", "units", "line", "static", "header", "signature", "address_taken", "source"]

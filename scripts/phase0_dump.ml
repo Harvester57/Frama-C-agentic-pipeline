@@ -132,6 +132,41 @@ let formals_json kf =
           O [ ("name", S v.vorig_name); ("kind", S kind) ])
        formals)
 
+(* Bytes of a type, when it has a size. *)
+let bytes_of t =
+  try
+    let b = Cil.bitsSizeOf t in
+    if b > 0 && b mod 8 = 0 then Some (b / 8) else None
+  with _ -> None
+
+let const_int e = try Option.map Z.to_int (Cil.constFoldToInt e) with _ -> None
+
+(* Bytes left, from where a pointer argument points to the end of the object it points into, when the
+   expression shows it: an array (`buf`, `&buf[4]`, `buf + 4`), an object's address (`&key`). Fixed-size
+   buffers passed without a length (a key, a nonce) get their size from the callers this way. *)
+let rec arg_size (e : exp) =
+  match (Cil.stripCasts e).enode with
+  | StartOf lv -> bytes_of (Cil.typeOfLval lv)
+  | AddrOf lv ->
+    (match Cil.removeOffsetLval lv with
+     | parent, Index (i, NoOffset) ->
+       (match bytes_of (Cil.typeOfLval parent), bytes_of (Cil.typeOfLval lv), const_int i with
+        | Some whole, Some elt, Some k when k >= 0 && whole - k * elt > 0 -> Some (whole - k * elt)
+        | _ -> None)
+     | _ -> if Ast_types.is_fun (Cil.typeOfLval lv) then None else bytes_of (Cil.typeOfLval lv))
+  | BinOp (PlusPI, p, off, t) ->
+    (match arg_size p, bytes_of (Ast_types.direct_pointed_type (Ast_types.unroll t)), const_int off with
+     | Some whole, Some elt, Some k when k >= 0 && whole - k * elt > 0 -> Some (whole - k * elt)
+     | _ -> None)
+  | _ -> None
+
+let arg_sizes args =
+  O
+    (List.concat
+       (List.mapi
+          (fun i a -> match (try arg_size a with _ -> None) with Some n -> [ (string_of_int i, I n) ] | None -> [])
+          args))
+
 (* Calls, loops, decisions, writes and the last line of a function body, in one pass. *)
 class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) (last : int ref) (w : writes) =
 object
@@ -171,7 +206,7 @@ object
           in
           calls :=
             O [ ("kernel_name", S f.vname); ("name", S f.vorig_name); ("indirect", B false);
-                ("function_args", L fn_args); ("loc", S (loc_s loc)) ]
+                ("function_args", L fn_args); ("arg_sizes", arg_sizes args); ("loc", S (loc_s loc)) ]
             :: !calls
         | Mem e ->
           let called = Cil.typeOfLval (Mem e, NoOffset) in

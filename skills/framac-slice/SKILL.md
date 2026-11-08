@@ -114,7 +114,7 @@ How it runs:
 - `python3 /opt/framac-pipeline/scripts/phase0_model.py selftest` checks the dump module against the image's kernel. The image build runs it; run it again if the model fails to load its module.
 
 The result is `workspace/reports/phase0_model.json`, validated against `schemas/phase0_model.schema.json`. Every fact carries its source:
-- **functions:** keyed `file#name`, so same-named statics stay apart. Each has its lines, loops, cyclomatic complexity, storage, formals, the pointers and globals it writes, the units that contain it, and the Frama-C kernel name per unit. `static inline` functions in headers belong to every unit that compiles them.
+- **functions:** keyed `file#name`, so same-named statics stay apart. Each has its lines, loops, cyclomatic complexity, storage, formals, the pointers and globals it writes, the units that contain it, and the Frama-C kernel name per unit. `param_sizes` gives, per argument index, the bytes of the objects the parsed callers pass there when the call site shows them (`buf`, `&buf[4]`, `buf + 4`, `&key`): `min`, `max` and the number of sites. The API harness and the seed recorder size fixed-size buffers passed without a length (keys, nonces) from it. `static inline` functions in headers belong to every unit that compiles them.
 - **edges:** direct calls; indirect calls matched by signature against the address-taken functions of the same program; thread spawns (`pthread_create`, `thrd_create`); callbacks passed to external functions. Each edge carries its sources.
 - **macro_aliases:** `#define a b` chains in project files that end at a defined function.
 - **thread_entries**, units marked `concurrent`, `externals`, and each function's unresolved callees (`external_calls`).

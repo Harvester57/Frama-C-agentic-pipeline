@@ -60,6 +60,28 @@ def test_plan_function_kinds():
     assert sh.plan_function("u", "unsigned long(uint8_t *,size_t)")["params"][0]["record"] == "b"
 
 
+def test_plan_function_records_known_size_pointers_from_the_model():
+    sig = "int(unsigned char *,unsigned char *,unsigned long long,unsigned char *,unsigned char *)"
+    sizes = {"0": {"min": 64, "max": 80, "sites": 2}, "3": {"min": 24, "max": 24, "sites": 1}, "4": {"max": 32}}
+    p = sh.plan_function("box", sig, sizes)
+    # the (buffer, length) pair stays a pair; lone pointers (output, key, nonce) get the callers' largest size
+    assert [x["record"] for x in p["params"]] == ["a", "b", "i", "a", "a"]
+    assert [x.get("size") for x in p["params"]] == [80, None, None, 24, 32]
+    src = sh.wrapper_source([p], [])
+    assert "fc_mem(3, 'a', a3, (size_t)24);" in src and "fc_mem(4, 'a', a4, (size_t)32);" in src
+    # a scalar pointee with a known array size is recorded whole; no size, no change
+    assert sh.plan_function("g", "void(long *)", {"0": {"max": 128}})["params"][0]["record"] == "a"
+    assert sh.plan_function("g", "void(long *)")["params"][0]["record"] == "p"
+    big = sh.plan_function("h", "void(struct s *)", {"0": {"max": 10**9}})["params"][0]
+    assert big["record"] == "a" and big["size"] == sh.MAX_VALUE_BYTES
+
+
+def test_layout_seed_reads_sized_pointers():
+    layout = {"selector": 2, "slots": [{"call": 0, "param": 1, "kind": "pointee", "size": 4}], "rest": None}
+    calls = [{"1": [["a", 0, "01020304"]]}]
+    assert sh.layout_seed(layout, calls) == b"\x02\x01\x02\x03\x04"
+
+
 def test_wrapper_source_records_outermost_calls():
     plans = [
         sh.plan_function("kv", "int(unsigned int,unsigned char *,unsigned long)"),

@@ -138,6 +138,30 @@ def test_indirect_sites_match_address_taken_functions_of_the_same_signature_acro
     )
 
 
+@pytest.mark.unit
+def test_param_sizes_aggregate_what_the_callers_pass_in_and_across_units():
+    b = _builder(LIB_EXE)
+    key = {**_call("kv_seal"), "arg_sizes": {"0": 32, "2": 24}, "loc": "src/emit.c:3"}
+    b.add_dump(
+        ["libkv.a"],
+        {
+            "functions": [
+                _fn("kv_seal", "kv_seal", "src/lexer.c", 1),
+                _fn("kv_emit", "kv_emit", "src/emit.c", 2, [key]),
+            ]
+        },
+    )
+    # resolved across units: the executable's call reaches the library's function
+    far = {**_call("kv_seal"), "arg_sizes": {"0": 64, "1": 0}, "loc": "tools/main.c:7"}
+    b.add_dump(["kvfmt"], {"functions": [_fn("main", "main", "tools/main.c", 5, [far, _call("kv_seal")])]})
+    b.resolve()
+    assert b.param_sizes("src/lexer.c#kv_seal") == {
+        "0": {"min": 32, "max": 64, "sites": 2},
+        "2": {"min": 24, "max": 24, "sites": 1},
+    }
+    assert b.param_sizes("src/emit.c#kv_emit") == {}
+
+
 def _alias_report(sites_by_caller, status="ok"):
     return {
         "schema": 1,

@@ -550,6 +550,26 @@ class ModelBuilder:
         # Step I9: defined global variables (`file#name`) and the formals of declared functions.
         self.global_vars: dict[str, dict] = {}
         self.declared_formals: dict[str, list] = {}
+        # Callee id -> (caller id, call location, argument index, bytes): what the callers pass.
+        self.arg_sites: dict[str, set[tuple[str, str, str, int]]] = defaultdict(set)
+
+    def _record_arg_sizes(self, caller: str, callee: str, call: dict) -> None:
+        sizes = call.get("arg_sizes")
+        if not isinstance(sizes, dict):
+            return
+        for idx, n in sizes.items():
+            if isinstance(n, int) and n > 0:
+                self.arg_sites[callee].add((caller, str(call.get("loc") or ""), str(idx), n))
+
+    def param_sizes(self, fid: str) -> dict[str, dict]:
+        """Per argument index: the smallest and largest object the callers pass, and over how many sites."""
+        by_idx: dict[str, list[int]] = defaultdict(list)
+        for _caller, _loc, idx, n in self.arg_sites.get(fid, ()):
+            by_idx[idx].append(n)
+        return {
+            i: {"min": min(v), "max": max(v), "sites": len(v)}
+            for i, v in sorted(by_idx.items(), key=lambda kv: int(kv[0]))
+        }
 
     def add_function(self, fid: str, unit: str, record: dict) -> None:
         rec = self.functions.get(fid)
@@ -664,6 +684,7 @@ class ModelBuilder:
                     # A project function passed to a project function is called through a pointer
                     # there: that indirect site's type match covers it.
                     self.edges[(caller, callee, "direct")].add(SOURCE_FRAMAC)
+                    self._record_arg_sizes(caller, callee, call)
                     continue
                 args = [kmap.get(a) for a in call.get("function_args") or []]
                 for u in units:
@@ -728,6 +749,7 @@ class ModelBuilder:
             source = SOURCE_GCC if call.get("gcc") else SOURCE_FRAMAC
             if callee:
                 self.edges[(caller, callee, "direct")].add(source)
+                self._record_arg_sizes(caller, callee, call)
                 continue
             self.externals.add(name)
             if name:
@@ -939,6 +961,11 @@ def build_model(
         f["external_calls"] = sorted(builder.external_calls.get(fid, ()))
         f["units"] = sorted(f["units"])
         f["kernel_names"] = dict(sorted(f["kernel_names"].items()))
+        sizes = builder.param_sizes(fid)
+        if sizes:
+            # Fixed-size buffers passed without a length (keys, nonces): the harness and the seed
+            # recorder size them from what the project's own callers pass.
+            f["param_sizes"] = sizes
     model["warnings"].extend(reconcile_api_ids(units_out, builder.functions))
     # Phase 0 stops when Frama-C parses no unit: every later phase but fuzzing needs its AST. The
     # model is still written whole, so the fallback errors can be shown to the user.

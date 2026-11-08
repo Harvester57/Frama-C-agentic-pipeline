@@ -211,8 +211,12 @@ def classify_type(t: str) -> dict[str, Any]:
     return {"kind": "unsupported", "why": f"type {n!r}"}
 
 
-def plan_function(name: str, signature: str) -> dict[str, Any]:
-    """The recorder plan of one API function: return and parameter types and what to record of each."""
+def plan_function(name: str, signature: str, sizes: dict | None = None) -> dict[str, Any]:
+    """
+    The recorder plan of one API function: return and parameter types and what to record of each.
+    `sizes` is the model's `param_sizes`: a pointer with no length next to it whose callers pass a
+    known-size object (a key, a nonce, an array of scalars) is recorded with that many bytes ('a').
+    """
     parts = split_signature(signature)
     if parts is None:
         return {"name": name, "supported": False, "why": f"signature {signature!r} not understood"}
@@ -240,6 +244,10 @@ def plan_function(name: str, signature: str) -> dict[str, Any]:
             p["record"] = "p"
         else:
             p["record"] = None
+        known = (sizes or {}).get(str(i))
+        if p["record"] in (None, "p") and isinstance(known, dict) and int(known.get("max") or 0) > 0:
+            p["record"] = "a"
+            p["size"] = min(int(known["max"]), MAX_VALUE_BYTES)
     structs = sorted({p["ctype"] for p in [ret, *params] if p["kind"] == "struct"})
     return {"name": name, "supported": True, "ret": ret, "params": params, "structs": structs}
 
@@ -438,6 +446,8 @@ def _record_stmt(i: int, p: dict[str, Any], params: list[dict[str, Any]]) -> str
         return f"fc_mem({i}, 'b', {a}, (size_t)a{i + 1});"
     if kind == "p":
         return f"fc_mem({i}, 'p', {a}, sizeof({p['pointee']}));"
+    if kind == "a":
+        return f"fc_mem({i}, 'a', {a}, (size_t){int(p['size'])});"
     return None
 
 
@@ -609,7 +619,7 @@ def plan_recorder(model: dict) -> tuple[list[dict], dict[str, str]]:
         if rec.get("static") or (rec.get("inline") and rec.get("header")):
             skipped[name] = "static or header inline: not a linked symbol"
             continue
-        plan = plan_function(name, str(rec.get("signature") or ""))
+        plan = plan_function(name, str(rec.get("signature") or ""), rec.get("param_sizes"))
         if plan["supported"]:
             plans.append(plan)
         else:
@@ -1118,7 +1128,7 @@ def load_calls(records: Path = RECORDS_DIR) -> list[dict]:
 
 
 # The recorded value kinds each layout slot of an API harness (scripts/api_harness.py) reads.
-_LAYOUT_KINDS = {"int": ("i", "f"), "struct": ("t",), "bytes": ("a", "b", "p", "s"), "pointee": ("p",)}
+_LAYOUT_KINDS = {"int": ("i", "f"), "struct": ("t",), "bytes": ("a", "b", "p", "s"), "pointee": ("p", "a")}
 
 
 def _fit(value: bytes, size: int | None) -> bytes:
