@@ -493,6 +493,20 @@ def _original_function_name(function: str, analyzed: set[str]) -> str:
     return match.group(1) if match and match.group(1) in analyzed else function
 
 
+def cost_profile_line(eva: dict) -> str | None:
+    """`Eva timed out ...; most time in: M 26% (self), ...` for an Eva block with a cost profile, else None."""
+    profile = eva.get("cost_profile")
+    if not isinstance(profile, dict):
+        return None
+    head = (
+        f"Eva timed out and fell back to {eva['timeout_fallback']}" if eva.get("timeout_fallback") else "Eva timed out"
+    )
+    parts = [f"{e['function']} {round(100 * e['share'])}%" for e in profile.get("self") or []]
+    callers = [f"{e['function']} {round(100 * e['share'])}%" for e in profile.get("inclusive") or []]
+    line = f"{head}; most time in: {', '.join(parts) or 'nothing recorded'}"
+    return line + (f" (with callees: {', '.join(callers[:3])})" if callers else "")
+
+
 def summarize_eva(report: dict, ledger_rte: set[str], scope: Iterable[str] = (), run_dir: Path | None = None) -> dict:
     """
     One module's Eva block. A function with an Unknown costs a prover task only if the ledger has a
@@ -504,6 +518,11 @@ def summarize_eva(report: dict, ledger_rte: set[str], scope: Iterable[str] = (),
         "reason": report.get("reason"),
         "error_summary": [str(x)[:300] for x in (report.get("error_summary") or [])[:3]],
     }
+    # A run that timed out (or fell back to a cheaper analysis): which functions cost it the time.
+    if report.get("timeout_fallback"):
+        block["timeout_fallback"] = report["timeout_fallback"]
+    if isinstance(report.get("cost_profile"), dict):
+        block["cost_profile"] = report["cost_profile"]
     if status != "ok":
         return block
     in_scope: set[str] = set()
@@ -1940,6 +1959,9 @@ def print_summary(run: dict) -> None:
                 )
             else:
                 print(f"    {name}: Eva {eva.get('status') or 'no report'} {eva.get('reason') or ''}".rstrip())
+            slow = cost_profile_line(eva)
+            if slow:
+                print(f"      {slow}")
     not_run = (run.get("selection") or {}).get("targets_not_run") or {}
     for tid, reason in sorted(not_run.items()):
         print(f"  {tid}: NOT RUN ({reason})")

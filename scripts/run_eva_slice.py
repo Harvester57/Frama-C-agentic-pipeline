@@ -66,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 import phase0_gates  # noqa: E402
+from eva_flamegraph import cost_profile  # noqa: E402
 from eva_loops import LoopRef, parse_loop_ref, prepare_mirror, strip_mirror  # noqa: E402
 from eva_options import extra_domains as option_domains  # noqa: E402
 from eva_options import framac_args, options_problem, parse_option  # noqa: E402
@@ -534,7 +535,9 @@ def run_eva_on_slice(
             )
             res["auto_recursion_fallback"] = True
 
-        # Fast cvalue fallback when the default 5-domain base run times out.
+        # Fast cvalue fallback when the default 5-domain base run times out. Each fallback writes its
+        # flamegraph.txt over the timed-out run's, so keep the profile that says why it was slow.
+        timed_out_profile = res.get("cost_profile")
         if res["status"] == "analysis_timeout" and can_timeout_fallback:
             fb_budget = min(900, max(120, int((budget_s or 600) // 4)))
             for tier_name, fb_opts in _timeout_fallback_tiers(slevel, options):
@@ -582,8 +585,14 @@ def run_eva_on_slice(
                 if fb_res["status"] == "ok":
                     fb_res["eva_options"] = fb_opts
                     fb_res["timeout_fallback"] = tier_name
+                    own = cost_profile(out_dir / "flamegraph.txt")
+                    profile = timed_out_profile or ({"run": "fallback", **own} if own else None)
+                    if profile:
+                        fb_res["cost_profile"] = profile
                     return fb_res
                 res = fb_res
+            if timed_out_profile:
+                res["cost_profile"] = timed_out_profile
         return res
 
     if not use_cache:
@@ -1007,7 +1016,10 @@ def _execute_eva(
             if not error_summary:  # a SIGKILL leaves no log line behind
                 error_summary = [f"Frama-C Eva produced no report ({reason}, exit code {returncode})"]
 
+    # Where a run that hit its time limit spent that time (eva_flamegraph.cost_profile).
+    profile = cost_profile(flamegraph_path) if timed_out else None
     return {
+        **({"cost_profile": {"run": "timed_out", **profile}} if profile else {}),
         "status": status,
         "reason": reason,
         "returncode": returncode,
@@ -1171,6 +1183,8 @@ def main(argv: list[str] | None = None) -> int:
                 "assumed_count": res["assumed_count"],
                 "discharged_percentage": res["discharged_percentage"],
                 "surviving_unknown_functions": res["surviving_unknown_functions"],
+                **({"timeout_fallback": res["timeout_fallback"]} if res.get("timeout_fallback") else {}),
+                **({"cost_profile": res["cost_profile"]} if res.get("cost_profile") else {}),
             },
             indent=2,
         )
