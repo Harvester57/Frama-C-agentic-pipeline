@@ -42,8 +42,10 @@ Results so far (21:15, HEAD `9b67328`):
 | x509-parser | 0 | 200 s | status ok → partial: `x509-common` executed 7 of 51 API entry points (gate reopened); queue rc=1 |
 | cryptolib | 0 | 1028 s | status ok → partial: `reach-dynamic-core` "no coverage (coverage_error)" |
 | qcbor-master | 0 | 181 s | no regression |
-| qcbor-dev | — | — | running |
-| oscs-tweetnacl | — | — | pending |
+| qcbor-dev | 0 | — | status ok → partial: `reach-dynamic` gaps (API entry points not executed); queue rc=1 |
+| oscs-tweetnacl | 0 | 1900 s | status ok → partial: coverage and queue rc=1. Same as the api2 rerun: the API harness now analyses much more code (Unknown 4 → 96, +897 properties, 18 functions queued for WP), and five more units are covered. The Invalid alarm `R::unsigned_overflow` is gone: check that it was not a real bug. Wall-clock ×12 (153 s → 1900 s) |
+
+V finished at 21:4x. Five targets are partial, all at the new `reach-dynamic` gate (R9). On three of them, x509, qcbor-dev and tweetnacl, `queue` also exits 1. **The baseline `phase0-r2` is not recorded yet:** these failures need a diagnosis first.
 
 Each "partial" comes from the `coverage` stage, which since R9 (`28101de`) also runs `reach-dynamic`. The `r1v` runs predate R9 and never ran that gate, so these are new checks failing, not lost results. Each still needs a diagnosis before the baseline:
 - qlz: the campaign stops at its first crash, and there are no recorded seeds (`no_calls_recorded`), so the coverage binary has no inputs. The error row is also missing from `harness_reach_dynamic.json` (`modules: {}`).
