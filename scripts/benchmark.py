@@ -641,6 +641,23 @@ def modules_without_harness(ledger: list[dict], target: dict, dag: dict | None =
     return sorted(active - harnessed)
 
 
+def _profile_deferred_modules(run_dir: Path, names: list[str]) -> dict[str, str]:
+    """Harness modules the run's profile defers by tier (step I8: Tier 3 under quick), with the reason."""
+    from module_map import ModuleMap
+    from tiers import is_deferred
+
+    profile = (read_json(run_dir / "run-metadata.json", {}) or {}).get("profile")
+    if not profile:
+        return {}
+    mm = ModuleMap.load(run_dir)
+    out: dict[str, str] = {}
+    for name in names:
+        tier = mm.tier_of(name) or ""
+        if is_deferred(tier, profile):
+            out[name] = f"{tier.split(' (')[0]} deferred under the {profile} profile"
+    return out
+
+
 def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] | None = None) -> dict:
     """Everything the run file records about one target, read back from its run directory."""
     ledger = read_json(run_dir / "coverage-ledger.json", []) or []
@@ -651,6 +668,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
     modules: dict[str, dict] = {}
     with_unknown: set[str] = set()
     problems = list(phase_notes or [])
+    deferred = _profile_deferred_modules(run_dir, [m["name"] for m in target["modules"]])
     for module in target["modules"]:
         name = module["name"]
         eva_report = read_json(run_dir / "workspace" / "reports" / "eva" / f"{name}.json")
@@ -662,7 +680,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
             with_unknown.update(eva_block.get("functions_with_unknown") or [])
             if eva_block["status"] != "ok":
                 problems.append(f"eva {name}: {eva_block['status']}")
-        else:
+        elif name not in deferred:
             problems.append(f"eva {name}: no report")
         entry: dict = {
             "eva": eva_block,
@@ -673,6 +691,8 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
             entry["build"]["wall_s"] = build_wall[name]
         if entry["fuzz"] and name in fuzz_wall:
             entry["fuzz"]["wall_s"] = fuzz_wall[name]
+        if name in deferred:
+            entry["deferred"] = deferred[name]
         modules[name] = entry
     dag = read_json(run_dir / "workspace" / "reports" / "callgraph_dag.json", {}) or {}
     return {

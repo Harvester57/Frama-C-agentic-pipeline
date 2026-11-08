@@ -173,3 +173,12 @@ def test_pipeline_make_defers_a_harnessed_tier3_module_under_quick_only(tmp_path
     assert quick.expected("eva") == {}
     standard = _quick_run(tmp_path / "s", "standard")
     assert "glue" in standard.modules and standard.modules["glue"].eva and not standard.modules["glue"].fuzz
+
+
+def test_benchmark_reports_a_deferred_module_without_a_missing_report_problem(tmp_path):
+    import benchmark as B
+
+    _quick_run(tmp_path, "quick")
+    metrics = B.collect_target_metrics(tmp_path, {"modules": [{"name": "glue"}], "scope": []})
+    assert metrics["modules"]["glue"]["deferred"] == "Tier 3 deferred under the quick profile"
+    assert not any("glue" in p for p in metrics["problems"])

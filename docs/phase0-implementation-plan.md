@@ -37,7 +37,7 @@ Defaults taken where nothing was asked (open to change):
 - **Header `static inline` functions** get a ledger unit only when reached from an entry point.
 - **Test executables** are units marked `test`. They get no harness and no ledger unit.
 - **Libraries compiled straight into an executable:** the globals declared in project headers are their API.
-- **Unit split threshold:** calibrated on the benchmark. The starting guess is 150 functions or 5k lines.
+- **Unit split threshold:** calibrated on the benchmark. The starting guess was 150 functions or 5k lines; I8 calibrated it to 400 reached functions or 15k lines.
 - **Fuzz budget** scales with the number of harness cases, up to a cap per unit set by the profile.
 
 ## Rules for every step
@@ -375,7 +375,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I5b | L | not started |
 | I6 | L | not started |
 | I7 | M | done |
-| I8 | M | not started |
+| I8 | M | done |
 | I9 | L | not started |
 | I10 | M | not started |
 
@@ -512,6 +512,54 @@ I0 ─┬─▶ I1 ────────────────────�
   - **Header inline functions:** a public header's `static inline` functions are API only when the threat model lists them.
   - **CodeQL noise:** CodeQL facts outside the model (CMake probes) are counted as unmatched, not filtered.
   - **`known-first-party`:** `trust` and `codeql_trust` were not added to it (I6 edits `pyproject.toml`).
+
+### I8 (2026-11-08)
+
+- **Tiers** (`scripts/tiers.py`, applied by `build_callgraph_dag.py` to the unit view):
+  - **Untrusted path:** a function that is untrusted, overridden by `trusted_callers`, or reached from an untrusted function.
+  - **Rule order:** no untrusted path → Tier 3 (with a reason for an unreached header function); heap or recursive → Tier 2; scalar helper → Tier 3; writes a bounded buffer while formatting or without taking one → Tier 1B; otherwise Tier 1A.
+  - **Scalar helper:** no loops, no pointer parameters or result, no casts to pointers, no indirect calls, not variadic, no allocation, not recursive, cyclomatic ≤ 2, and not a boundary function that takes parameters. So an API getter without parameters is Tier 3, as the lexer had it.
+  - **Records:** each function gets `tier`, `tier_reasons`, `untrusted_path` and `lexer_tier`. Units, lexer sub-modules and clusters take the highest tier, and the DAG gets a `tiers` block of counts. Without trust the lexer tiers stay (`tiers.source: lexer`).
+  - **Profiles:** Tier 3 is deferred under quick. `pipeline_make` excludes the module with a reason, `expected()` skips it, the ledger defers it, and the benchmark does not count its missing Eva report as a problem. Outside quick, Tier 3 keeps RTE and defers Layers 2-6. `benchmark.py run --profile` overrides the manifest's profile.
+- **Unit split** (`scripts/unit_split.py`):
+  - **Size:** the functions and lines that a link unit's entry points reach.
+  - **Clusters:** each entry point's reach set starts a cluster. The most-overlapping pair above 50% is merged until none is left, then clusters under 10 functions are packed together.
+  - **Sub-modules:** clusters become DAG `submodules` (`kind: cluster`, anchors, functions, tier, run flags). `ModuleMap` resolves them for scope, tier and run flags, and the seeded dispatch policy writes one harness per cluster. Pinned harnesses are unaffected.
+  - **CLI:** `--split-max-functions` and `--split-max-lines` on `build_callgraph_dag.py`, and `unit_split.py show`.
+- **Calibration:**
+  - **Pinned harnesses:** Eva's worst is 205 s for QCBOR's spiffy decode (102 functions). x509 analyses 209 functions in 73 s.
+  - **CryptoLib, mechanical dispatch harness over the whole unit** (143 cases): it converges in 61 s. Forcing a split at 150 functions gives 5 clusters, each converging in 15–45 s, but the Eva stage wall time rises from 94 s to 272 s.
+  - **QCBOR:** the mechanical harness is uninformative (7.5 s whole).
+  - **Limits:** 400 reached functions or 15k lines. No benchmark unit splits at these limits (QCBOR-dev 373 / 9.6k, CryptoLib 231 / 12.7k), because Eva converges on every unit whole.
+- **Tier counts** (1A/1B/2/3, i8 DAGs):
+
+  | Target | 1A | 1B | 2 | 3 |
+  | :--- | ---: | ---: | ---: | ---: |
+  | minmea | 23 | 0 | 0 | 0 |
+  | qcbor-dev | 342 | 8 | 4 | 401 |
+  | qcbor-master | 269 | 2 | 3 | 288 |
+  | cryptolib | 141 | 38 | 18 | 35 |
+  | x509 | 204 | 3 | 0 | 5 |
+  | jsmn | 6 | 0 | 0 | 0 |
+  | semver | 28 | 2 | 3 | 0 |
+  | stmr | 12 | 1 | 1 | 1 |
+  | qlz | 15 | 1 | 4 | 2 |
+  | tweetnacl | 48 | 3 | 0 | 13 |
+
+  - **What Tier 3 holds:** QCBOR's Tier 3 is mostly unreached header inline functions (382 and 274), plus scalar helpers. CryptoLib's is interface getters, init, shutdown and config functions without parameters, the unit-test inits and `mc_log`. TweetNaCl's is `main`, `hexdump` and the SHA scalar helpers.
+  - **Known bugs and pinned harnesses:** every known-bug function is Tier 1A, and so is every pinned harness module except CryptoLib's `mc`. `mc` is Tier 3 as before, so it was already not fuzzed; under quick it is now deferred. No recall harness lost fuzzing.
+- **Runs** (quick against standard):
+  - **CryptoLib:** 578 s against 861 s wall (Eva stage 70 s against 252 s). CRYPTOLIB-01 is undecided in both, as in i5b1, because E-ACSL falls back (see Left).
+  - **minmea:** quick retains 3/3.
+  - **QCBOR:** quick retains all decided entries, with no problems: qcbor-dev 3/3 (QCBOR-01 to 03) and qcbor-master 2/2. Against the pre-I8 standard runs (i5b1): qcbor-dev takes 2232 s CPU against 2619 s, but 1010 s wall against 895 s, because replay and queue ran under concurrent benchmark load. qcbor-master is unchanged at 266 s / 282 s, since its harness modules are all Tier 1. Across the runs, recall is 6/7 retained, and CRYPTOLIB-01 is undecided as it was before I8.
+  - **`qcbor_err_to_str`:** it is now Tier 1A (an API function with a parameter), so the reach gate asks for it. It is exempt in the manifest for both QCBOR targets, outside `harness_digest`.
+- **Left:**
+  - **CryptoLib E-ACSL:** the link-unit build loses the quoting of `-DMC_LOG_PATH="log.txt"` through E-ACSL, so fuzzing falls back. This is the same in i5b1 (I5b or I6 area).
+  - **Header inline API:** a public header's inline functions count as having no untrusted path unless the threat model lists them (the I7 gap).
+  - **Seeded set:** not run with I8. Its API functions take parameters, so they stay Tier 1 and fuzzed.
+  - **Mechanical dispatch:** cases with undeclared callees or gcrypt types break the harness parse. The calibration filtered them in a scratch driver only.
+  - **Baseline:** not re-recorded, since no all-target run was made.
+  - **Branch:** carries cherry-picks of I5b fixes (`9632a0a`, `1af992e`, `9cad8d7`) that are also on phase0-redesign.
 
 ### I5a (2026-11-08)
 
