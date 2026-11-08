@@ -45,6 +45,23 @@ Results so far (21:15, HEAD `9b67328`):
 | qcbor-dev | 0 | — | status ok → partial: `reach-dynamic` gaps (API entry points not executed); queue rc=1 |
 | oscs-tweetnacl | 0 | 1900 s | status ok → partial: coverage and queue rc=1. Same as the api2 rerun: the API harness now analyses much more code (Unknown 4 → 96, +897 properties, 18 functions queued for WP), and five more units are covered. The Invalid alarm `R::unsigned_overflow` is gone: check that it was not a real bug. Wall-clock ×12 (153 s → 1900 s) |
 
+## Diagnosis of the partial targets (commit `bd3f909`)
+
+Four pipeline bugs, all fixed with tests:
+
+1. **Keep-going stopped after the first crash** (tweetnacl). A round after a crash needed 30 s left (`MIN_FUZZ_WALL_S`), and campaigns are sized at exactly 30 s, so a crash at 0.2 s ended fuzzing with an empty corpus. Later rounds now run down to 5 s (`MIN_ROUND_WALL_S`).
+2. **llvm-cov "truncated coverage data"** (cryptolib core, crypto, sa). LLVM 19 writes an unreadable coverage mapping when a header is included inside a function body (`crypto.c:1674`, `#include <malloc.h>` in `Crypto_check_buffer_size`); reproduced with a 6-line file. On that error the coverage build is redone with those headers included first. Checked on the r2v run directory: core, crypto and sa now measure.
+3. **Lost rows in the dynamic reach report** (cryptolib `sa`). Make runs `reach-dynamic-<m>` in parallel, and both `harness_reach_dynamic.json` and the reach gate were read, merged and written without the run lock. Both now hold it.
+4. **Unmeasured modules left no trace** (qlz, cryptolib `mc`). They are now listed under `unmeasured` with the reason.
+
+Not pipeline bugs:
+- **qlz:** every input, the empty one included, crashes on a misaligned store at `quicklz.c:161` (3871 crashes, coverage 0), so no corpus can grow. That is a real target finding; its reach stays unmeasurable.
+- **x509-parser and qcbor-dev:** real reach gaps. `x509-common` reaches its 51 functions only through `parse_x509_cert` and `parse_x509_crl`, and 30 s of fuzzing does not get deep into the DER parser. qcbor's tag callbacks run only through indirect calls. The gate reports this as designed: in a real run an agent repairs the harness or records an exemption.
+- **`queue` rc=1** on x509, qcbor-dev and tweetnacl comes from the reach gate those gaps reopen.
+- **tweetnacl's missing Invalid** `R::unsigned_overflow` is not a bug: `R` (`tweetnacl.c:488`) is a 64-bit rotate, and unsigned overflow is defined behaviour. r1v's narrow harness gave "Invalid or unreachable"; the wider r2v harness gives "Unknown".
+
+Re-run `r3v` of the five targets with the fixes: running.
+
 V finished at 21:4x. Five targets are partial, all at the new `reach-dynamic` gate (R9). On three of them, x509, qcbor-dev and tweetnacl, `queue` also exits 1. **The baseline `phase0-r2` is not recorded yet:** these failures need a diagnosis first.
 
 Each "partial" comes from the `coverage` stage, which since R9 (`28101de`) also runs `reach-dynamic`. The `r1v` runs predate R9 and never ran that gate, so these are new checks failing, not lost results. Each still needs a diagnosis before the baseline:
