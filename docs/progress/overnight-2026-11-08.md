@@ -139,3 +139,34 @@ Both run from the I7 branch, in their own worktrees:
 - Accept I5b on round 3.
 - Merge I6 and I7, then run the merged benchmark.
 - Merge I8 and I9 when they report.
+## Report 5
+
+### I5b accepted, I4/I6/I7/I8/I9 merged
+
+- **I5b done:** baseline `phase0-i5b` (rounds 3 and 4).
+  - Recall 7/7. Seeded set 7/7 bugs, 0/4 decoys.
+  - 0 regressions against I5a. x509-parser's `x509-parser` module now completes Eva.
+  - jsmn, qlz and semver relied on Makefile macros the library build doesn't use; their harness specs now state them.
+- **I4 (Alias):** measured, not adopted, off by default. The exact projects already score 1.00, and Alias is unsound with reassigned globals.
+- **Merged into `phase0-redesign`**, in order:
+  - I4;
+  - I6 (seeds from tests, dynamic reach gate, s08);
+  - I7 (trust, threat models, CodeQL);
+  - I8 (tiers from trust, unit split);
+  - I9 (MetAcsl security properties).
+- **Conflicts:** only in the plan document and in four code hunks. The redesign's I5b harness-flag rules won over I8's older cherry-picks, and `phase0_model` keeps both `--alias` and `--threat-model`. s08 got its trust truth, which I7 added for the other fixtures.
+- **Gates on the merged tree:**
+  - ruff clean;
+  - pytest 2047 passed, 100 skipped;
+  - mypy: one error, already there on Nov 7 (`run_eacsl_fuzz.py:1352`).
+- **Running now:** the full 10-target benchmark plus the seeded set on the merged tree (`i9m1-*`, `seeded-i9m1`). Next: compare with `phase0-i5b` and record the baseline.
+
+### I10 started in two worktrees
+
+- **I10a (`phase0-i10a`):** deletes the regex lexer, so the DAG comes from the model only.
+  - The path-based module partition stays, because the benchmark's harness modules are named after it.
+  - Acceptance: identical DAG views on the saved benchmark runs, or each difference explained.
+- **I10b (`phase0-i10b`):** brings the docs and the slice, verify and fuzz skills up to date with I0–I9.
+- **Left for you:**
+  - retiring the monolithic image (the tests' Docker image is still `framac-pipeline:latest`);
+  - the single merge of `phase0-redesign` into `main`.
