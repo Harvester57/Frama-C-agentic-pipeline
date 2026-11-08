@@ -6,14 +6,23 @@ Generates libFuzzer and AFL-compatible dictionary files containing:
 2. Hexadecimal representation strings.
 3. Escaped byte sequence tokens (single bytes and 16/32/64-bit words).
 4. String literals extracted from C source files.
+5. The values of object-like macros the project defines, read from the preprocessed sources
+   (`cc -E -dD` with the unit's flags, so only the macros the build actually sees): integers as
+   decimal text and as little- and big-endian bytes of the smallest width that holds them, strings
+   as their content (step I6). Macros from system headers and the compiler are left out.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import posixpath
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 # Add scripts directory to path if run standalone
@@ -203,12 +212,138 @@ def collect_source_files(paths: list[Path | str]) -> list[Path]:
     return sorted(files)
 
 
+MAX_MACRO_TOKENS = 1000
+MACRO_TIMEOUT_S = 60
+_LINEMARK_RE = re.compile(r'^#\s*(?:line\s+)?\d+\s+"((?:\\.|[^"\\])*)"')
+_DEFINE_RE = re.compile(r"^#\s*define\s+([A-Za-z_]\w*)(?:[ \t]+(.*))?$")
+_INT_RE = re.compile(r"^([+-]?)(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)[uUlL]*$")
+_CAST_RE = re.compile(r"^\(\s*(?:(?:const|unsigned|signed|long|short|int|char|struct|enum)\s+)*[A-Za-z_]\w*\s*\)\s*")
+_C_STRING_RE = re.compile(r'^"((?:\\.|[^"\\])*)"$')
+
+
+def parse_dd_output(text: str, cwd: str | None = None) -> list[tuple[str, str, str]]:
+    """(name, value, file) of each object-like #define in `cc -E -dD` output, file from the line markers."""
+    current = ""
+    out: list[tuple[str, str, str]] = []
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            continue
+        m = _LINEMARK_RE.match(line)
+        if m:
+            current = m.group(1)
+            continue
+        d = _DEFINE_RE.match(line)
+        if d and not line[d.end(1) :].startswith("("):
+            out.append((d.group(1), (d.group(2) or "").strip(), current))
+    return out
+
+
+def is_project_file(path: str, cwd: str) -> bool:
+    """A macro's file is the project's: relative, or under the run directory; never <built-in> or /usr."""
+    if not path or path.startswith("<"):
+        return False
+    if not posixpath.isabs(path) and not os.path.isabs(path):  # container paths are POSIX, on any host
+        return True
+    root = cwd.rstrip("/") + "/"
+    return path.startswith(root) and "/frama-c/" not in path and "/workspace/snapshot/" not in path
+
+
+def _strip_value(value: str) -> str:
+    v = value.strip()
+    for _ in range(4):
+        v = _CAST_RE.sub("", v).strip()
+        if v.startswith("(") and v.endswith(")") and v.count("(") == 1:
+            v = v[1:-1].strip()
+    return v
+
+
+def _int_bytes(n: int) -> list[str]:
+    """Little- and big-endian byte tokens of the smallest width holding n (two's complement when negative)."""
+    for width in (1, 2, 4, 8):
+        lo, hi = -(1 << (8 * width - 1)), (1 << (8 * width)) - 1
+        if lo <= n <= hi:
+            raw = (n & ((1 << (8 * width)) - 1)).to_bytes(width, "little")
+            le = "".join(f"\\x{b:02x}" for b in raw)
+            be = "".join(f"\\x{b:02x}" for b in reversed(raw))
+            return [le] if width == 1 else [le, be]
+    return []
+
+
+def macro_value_tokens(defs: list[tuple[str, str, str]], cwd: str) -> list[str]:
+    """Dictionary tokens from macro values defined in project files."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for _name, value, file in defs:
+        if not is_project_file(file, cwd):
+            continue
+        v = _strip_value(value)
+        found: list[str] = []
+        m = _INT_RE.match(v)
+        if m:
+            sign, digits = m.groups()
+            low = digits.lower()
+            base = (
+                16
+                if low.startswith("0x")
+                else 2
+                if low.startswith("0b")
+                else 8
+                if low.startswith("0") and len(low) > 1
+                else 10
+            )
+            n = int(low[2:] if base in (16, 2) else low, base) * (-1 if sign == "-" else 1)
+            found = [str(n), *_int_bytes(n)]
+        else:
+            s = _C_STRING_RE.match(v)
+            if s and 1 <= len(s.group(1)) <= 128:
+                found = [s.group(1)]
+        for tok in found:
+            if tok not in seen:
+                seen.add(tok)
+                tokens.append(tok)
+        if len(tokens) >= MAX_MACRO_TOKENS:
+            break
+    return tokens[:MAX_MACRO_TOKENS]
+
+
+def preprocessed_macro_tokens(sources: Sequence[Path | str], cppflags: str, compiler: str | None = None) -> list[str]:
+    """Macro value tokens of each C source preprocessed with the unit's flags; a source that fails is skipped."""
+    cc = compiler or shutil.which("gcc") or shutil.which("cc") or shutil.which("clang")
+    if not cc:
+        return []
+    try:
+        flags = shlex.split(cppflags or "")
+    except ValueError:
+        return []
+    cwd = os.getcwd()
+    defs: list[tuple[str, str, str]] = []
+    for src in sources:
+        if not str(src).endswith(".c"):
+            continue
+        try:
+            p = subprocess.run(
+                [cc, "-E", "-dD", *flags, str(src)],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=MACRO_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if p.returncode == 0:
+            defs += parse_dd_output(p.stdout, cwd)
+    return macro_value_tokens(defs, cwd)
+
+
 def build_dictionary(
     sources: list[Path | str] | None = None,
     include_numeric: bool = True,
     include_strings: bool = True,
+    cppflags: str | None = None,
 ) -> list[str]:
-    """Build unified fuzzer dictionary tokens from numeric boundaries and sources."""
+    """Build unified fuzzer dictionary tokens from numeric boundaries and sources (and, with
+    `cppflags`, the project's macro values from the preprocessed sources)."""
     tokens: list[str] = []
     seen: set[str] = set()
 
@@ -230,6 +365,10 @@ def build_dictionary(
                     add_token(str_tok)
             except OSError:
                 continue
+
+    if cppflags is not None and sources:
+        for macro_tok in preprocessed_macro_tokens(collect_source_files(sources), cppflags):
+            add_token(macro_tok)
 
     return tokens
 
@@ -280,6 +419,11 @@ def main() -> int:
         help="Output dictionary file path.",
     )
     parser.add_argument(
+        "--cppflags",
+        default=None,
+        help="Preprocess the C sources with these flags and add the project's macro values.",
+    )
+    parser.add_argument(
         "--no-numeric",
         action="store_true",
         help="Omit extreme numeric boundary tokens.",
@@ -297,6 +441,7 @@ def main() -> int:
         sources=all_sources,
         include_numeric=not args.no_numeric,
         include_strings=not args.no_strings,
+        cppflags=args.cppflags,
     )
 
     write_dictionary(args.out_dict, tokens)
