@@ -82,7 +82,7 @@
           "sources": {
             "type": "array",
             "minItems": 1,
-            "items": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info", "type-match", "thread-spawn", "callback-arg"]}
+            "items": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info", "type-match", "thread-spawn", "callback-arg", "alias"]}
           }
         },
         "required": ["caller", "callee", "kind", "sources"]
@@ -99,7 +99,10 @@
           "expr": {"type": ["string", "null"]},
           "signature": {"$comment": "null when the GCC fallback found the site: no candidates then", "type": ["string", "null"]},
           "loc": {"type": ["string", "null"]},
-          "candidates": {"type": "array", "items": {"type": "string", "pattern": "#"}}
+          "candidates": {"$comment": "the type match, narrowed by Alias when narrowing is alias", "type": "array", "items": {"type": "string", "pattern": "#"}},
+          "narrowing": {"type": "string", "enum": ["alias", "none"]},
+          "narrowing_reason": {"$comment": "alias, or why the full type match stays: disabled, gcc_fallback, alias_<status> (failed, timeout, crashed, unavailable), no_state, no_targets, error, unmatched, disjoint (Alias names none of the type match), no_candidates (empty type match)", "type": "string"},
+          "dropped": {"$comment": "type-match candidates Alias ruled out", "type": "array", "items": {"type": "string", "pattern": "#"}}
         },
         "required": ["unit", "caller", "signature", "candidates"]
       }
@@ -122,6 +125,20 @@
     "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
     "entry_points_source": {"type": "string"},
     "thread_entries": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "alias": {
+      "$comment": "plan step I4: narrowing of indirect sites with Frama-C's Alias plugin (phase0_model.py --alias)",
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "module": {"type": "string", "enum": ["ok", "compile_failed"]},
+        "error": {"type": "string"},
+        "timeout_s": {"type": "integer", "minimum": 1},
+        "sites": {"$comment": "indirect sites per narrowing_reason", "type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "dropped_candidates": {"type": "integer", "minimum": 0},
+        "seconds": {"type": "number", "minimum": 0}
+      },
+      "required": ["enabled"]
+    },
     "parse_jobs": {
       "type": "array",
       "items": {
@@ -133,7 +150,16 @@
           "status": {"type": "string", "enum": ["ok", "parse_failed"]},
           "seconds": {"type": "number", "minimum": 0},
           "error": {"type": "string"},
-          "gcc_fallback": {"type": "object"}
+          "gcc_fallback": {"type": "object"},
+          "alias": {
+            "type": "object",
+            "properties": {
+              "status": {"type": "string", "enum": ["ok", "failed", "timeout", "crashed", "unavailable"]},
+              "error": {"type": "string"},
+              "seconds": {"type": "number", "minimum": 0}
+            },
+            "required": ["status"]
+          }
         },
         "required": ["key", "units", "sources", "status", "seconds"]
       }
