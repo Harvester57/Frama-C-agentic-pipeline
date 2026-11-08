@@ -173,7 +173,7 @@ Consumers of trust:
 
 ### Step 1e — Seeds From the Tests
 
-When the recipe has a test command, record the arguments the tests pass to the API. Run it in the build image, on the same scratch volume, after the model:
+Record the arguments the target's own programs pass to the API. With a test command these are the tests; without one, the project's non-test executables (demos, tools). Run it in the build image, on the same scratch volume, after the model:
 
 ```powershell
 & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch -Class phase-dynamic `
@@ -185,7 +185,7 @@ When the recipe has a test command, record the arguments the tests pass to the A
   [--target-packages "<pkg1> <pkg2>"] -- "python3 /opt/framac-pipeline/scripts/seed_harvest.py record"
 ```
 
-It relinks each test executable with `-Wl,--wrap` recorders for the model's API functions, runs the test command in the sandbox (no network, capped time) under `strace`, and keeps:
+It relinks each test executable with `-Wl,--wrap` recorders for the model's API functions, runs the test command in the sandbox (no network, capped time) under `strace`, and keeps what is listed below. Without a test command it relinks each non-test executable that defines API functions instead and runs it once, with no arguments, empty stdin and a 60 s cap. The report's `source` says which (`test_command` or `executables`), and `runs` gives each executable's exit status. It keeps:
 - the arguments of each outermost API call, in `workspace/seed_records/calls.jsonl`;
 - up to 64 small data files the tests opened inside the target tree.
 

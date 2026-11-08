@@ -1060,9 +1060,10 @@ def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str
         )
         summary["model"] = summarize_model(read_json(run_dir / "workspace" / "reports" / "phase0_model.json"))
         stages["model"]["status"] = summary["model"]["status"]
-        if summary["model"]["status"] == "ok" and (spec["build"] or {}).get("test_command"):
-            # Seeds from the tests (step I6): the test executables of the build tree on the volume,
-            # relinked with API recorders, run in the build image. The fuzz recipes write them out.
+        if summary["model"]["status"] == "ok":
+            # Seeds (step I6): the test executables of the build tree on the volume (or, with no test
+            # command, its other executables), relinked with API recorders, run in the build image.
+            # The fuzz recipes write them out.
             stages["seeds"] = run_stage(
                 "seeds",
                 f"python3 {CONTAINER_SCRIPTS}/seed_harvest.py record --recipe-file {BENCH_SUBDIR}/spec.json",
@@ -1091,6 +1092,7 @@ def summarize_seeds(report: dict | None) -> dict:
         "calls": calls.get("unique", 0),
         "functions": len(calls.get("by_function") or {}),
         "files": len((report.get("files") or {}).get("kept") or []),
+        "source": report.get("source"),
         "test_rc": (report.get("test") or {}).get("returncode"),
         "seconds": report.get("seconds"),
     }

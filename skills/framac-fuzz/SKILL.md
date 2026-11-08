@@ -77,13 +77,13 @@ Each campaign writes only its own module's corpus, crash directory, and report (
 
 Wall time = budget / workers, at least 30 s, so a larger node finishes sooner at equal or greater effort. `-rss_limit_mb` stays fixed at 2048 on every machine, so `oom_found` means the same thing everywhere.
 
-**Seeds from the tests.** Phase 0 records the API calls the target's tests make (`/framac-slice` Step 1e: `seed_harvest.py record`, build image, scratch volume, only when the recipe has a test command):
+**Seeds from the tests.** Phase 0 records the API calls the target's tests make (`/framac-slice` Step 1e: `seed_harvest.py record`, build image, scratch volume; without a test command, the project's non-test executables run once with no arguments instead):
 - each test executable is relinked with `-Wl,--wrap` recorders for the model's API functions and run in the sandbox (no network, capped time) under `strace`;
 - the arguments of each outermost API call (buffers with their length, strings, scalars, pointees, `{ptr, len}` struct members) go to `workspace/seed_records/calls.jsonl`, with up to 64 small data files the tests opened.
 
 Before each campaign, `seed_harvest.py write --module <mod>` turns them into `workspace/seeds/<mod>/seed-*` in the harness's own case format, read from `harness_<mod>.c`: the dispatch selector byte, the fixed-size slots in order, then the data. Data files become whole-input seeds for the cases that take the whole buffer. `workspace/reports/seeds/<mod>.json` says what each case got. The `seeds` Make target writes them for every module.
 
-The campaign and `coverage` read the seeds as a read-only extra corpus (`--extra-corpus`). No test command, a failing test suite, or no recorded call just means fewer or no seeds, never an error. Calls made through header `static inline` functions are not recorded, so their harness cases start from an empty corpus.
+The campaign and `coverage` read the seeds as a read-only extra corpus (`--extra-corpus`). No test command and no executable that calls the API, a failing test suite, or no recorded call just means fewer or no seeds, never an error. Calls made through header `static inline` functions are not recorded, so their harness cases start from an empty corpus.
 
 A campaign keeps going after a crash, so one shallow bug does not hide the others in its module:
 - **Dispatch harnesses** run in rounds. Each case an input crashed (or timed out) in (the input's first byte modulo the case count) is skipped from the next round on. The skip uses a rebuild with `-DFRAMAC_FUZZ_SKIP_CASES=<bit mask>`, with the same engine. Rounds share the campaign's wall time and end when a round finds no new crashing case, every case is skipped, less than 30 s are left, or a rebuild fails. A skipped case is not fuzzed for the rest of the campaign, so a second bug in the same case can still be hidden; the report's `keep_going.rounds` lists what each round skipped and found.

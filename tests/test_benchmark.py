@@ -418,6 +418,7 @@ class TestSmallSummaries:
             "status": "ok",
             "calls": {"unique": 11, "by_function": {"sdf_parse": 7, "sdf_checksum": 4}},
             "files": {"kept": [{"path": "data/a.bin"}]},
+            "source": "test_command",
             "test": {"returncode": 0},
             "seconds": 0.25,
         }
@@ -426,6 +427,7 @@ class TestSmallSummaries:
             "calls": 11,
             "functions": 2,
             "files": 1,
+            "source": "test_command",
             "test_rc": 0,
             "seconds": 0.25,
         }

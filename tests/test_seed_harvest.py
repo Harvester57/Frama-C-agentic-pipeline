@@ -293,4 +293,82 @@ def test_record_without_test_command(tmp_path, monkeypatch):
     (tmp_path / "run-metadata.json").write_text(json.dumps({"build": {"command": "make"}}))
     assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
     report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
-    assert report["status"] == "no_test_command"
+    assert report["status"] == "no_model" and report["source"] == "executables"
+
+
+def _record_fixture(tmp_path, monkeypatch, units: dict, recipe: dict) -> list[list[str]]:
+    """A model, a capture and a build tree; relinking and running are stubbed and logged."""
+    monkeypatch.chdir(tmp_path)
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+    tree = tmp_path / "scratch" / "tree"
+    tree.mkdir(parents=True)
+    for name in units:
+        (tree / name).write_bytes(b"\x7fELF")
+    (tmp_path / "run-metadata.json").write_text(json.dumps({"build": recipe}))
+    model = {
+        "status": "ok",
+        "entry_points": ["lib#f"],
+        "functions": {"lib#f": {"name": "f", "signature": "int (const unsigned char *, unsigned long)"}},
+        "units": {},
+    }
+    (reports / "phase0_model.json").write_text(json.dumps(model))
+    capture = {"status": "ok", "scratch": {"tree": str(tree)}, "units": units, "compiles": []}
+    (reports / "build_capture.json").write_text(json.dumps(capture))
+    ran: list[list[str]] = []
+
+    class Res:
+        returncode = 0
+        timed_out = False
+        stdout = stderr = ""
+
+    def sandboxed(argv, cwd, scratch, timeout, env):
+        ran.append([str(a) for a in argv])
+        return Res()
+
+    monkeypatch.setattr(sh, "link_commands", lambda ev, t: {n: {"args": ["cc", "-o", n], "cwd": str(t)} for n in units})
+    monkeypatch.setattr(sh, "defined_functions", lambda exe: {"f"})
+    monkeypatch.setattr(sh, "_run", lambda argv, cwd, timeout: (0, ""))
+    monkeypatch.setattr(sh, "_compile_wrappers", lambda cc, fl, plans, where, c, o, w: (True, plans, ""))
+    monkeypatch.setattr(sh, "_sandboxed", sandboxed)
+    return ran
+
+
+def test_record_without_test_command_runs_the_non_test_executables(tmp_path, monkeypatch):
+    units = {
+        "demo": {"kind": "executable", "objects": []},
+        "unit_test": {"kind": "executable", "test": True, "objects": []},
+        "libx.a": {"kind": "static_lib", "objects": []},
+    }
+    ran = _record_fixture(tmp_path, monkeypatch, units, {"command": "make"})
+    assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
+    report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
+    assert report["source"] == "executables" and report["executables"] == ["demo"]
+    assert report["relink"]["demo"]["status"] == "relinked" and "unit_test" not in report["relink"]
+    # one relink, then the demo itself with no arguments
+    assert ran[0][0] == "cc" and any(a == "-Wl,--wrap=f" for a in ran[0])
+    assert ran[1] == [str(tmp_path / "scratch" / "tree" / "demo")]
+    assert report["runs"]["demo"]["returncode"] == 0
+    assert report["status"] == "no_calls_recorded"
+
+
+def test_record_with_a_test_command_runs_only_the_tests(tmp_path, monkeypatch):
+    units = {
+        "demo": {"kind": "executable", "objects": []},
+        "unit_test": {"kind": "executable", "test": True, "objects": []},
+    }
+    ran = _record_fixture(tmp_path, monkeypatch, units, {"command": "make", "test_command": "make check"})
+    monkeypatch.setattr(sh.shutil, "which", lambda name: None)
+    assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
+    report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
+    assert report["source"] == "test_command" and report["test_units"] == ["unit_test"]
+    assert "demo" not in report["relink"] and "runs" not in report
+    assert ran[-1] == ["sh", "-c", "make check"]
+
+
+def test_record_without_test_command_or_executables(tmp_path, monkeypatch):
+    units = {"libx.a": {"kind": "static_lib", "objects": []}}
+    _record_fixture(tmp_path, monkeypatch, units, {"command": "make"})
+    assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
+    report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
+    assert report["status"] == "no_test_command" and report["executables"] == []

@@ -85,6 +85,7 @@ MAX_FILES = 64  # secondary seeds: data files the tests open
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SEEDS_PER_MODULE = 2000
 WRAP_LIMIT = 4000  # functions one recorder can wrap
+EXECUTABLE_TIMEOUT_S = 60  # one run of a non-test executable, when the recipe has no test command
 SEED_PREFIX = "seed-"
 
 _SCALARS = {
@@ -690,9 +691,7 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
     recipe = recipe or _load_recipe()
     command = (recipe or {}).get("test_command")
     report["test_command"] = command
-    if not command:
-        report["status"] = "no_test_command"
-        return report, 0
+    report["source"] = "test_command" if command else "executables"
     model = load_json_optional(MODEL_JSON, None)
     capture = load_json_optional(CAPTURE_JSON, None)
     if not isinstance(model, dict) or model.get("status") != "ok":
@@ -708,11 +707,21 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         report["warnings"].append(f"{tree} not found: run build_capture.py on this scratch volume first")
         return report, 0
     units = capture.get("units") or {}
-    tests = {n: u for n, u in units.items() if u.get("test") and u.get("kind") == "executable"}
-    report["test_units"] = sorted(tests)
-    if not tests:
-        report["status"] = "no_test_units"
-        return report, 0
+    if command:
+        tests = {n: u for n, u in units.items() if u.get("test") and u.get("kind") == "executable"}
+        report["test_units"] = sorted(tests)
+        if not tests:
+            report["status"] = "no_test_units"
+            return report, 0
+    else:
+        # No test command: the project's own programs (demos, tools) are the only callers of its API
+        # that ship with it. Each one that defines API functions is relinked and run once, with no
+        # arguments and empty stdin; whatever it passes to the API becomes a seed.
+        tests = {n: u for n, u in units.items() if not u.get("test") and u.get("kind") == "executable"}
+        report["executables"] = sorted(tests)
+        if not tests:
+            report["status"] = "no_test_command"
+            return report, 0
 
     plans, skipped = plan_recorder(model)
     links = link_commands(EVENTS_JSONL, tree)
@@ -775,6 +784,10 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         return report, 0
 
     cwd = tree / str((recipe or {}).get("workdir") or ".")
+    if not command:
+        _run_executables(report, relinked, tree, cwd, scratch, args.timeout, dict((recipe or {}).get("env") or {}))
+        _collect(report, out_dir, [], tree, started)
+        return report, 0
     strace_log = work / "strace.txt"
     test_argv = ["sh", "-c", command]
     if shutil.which("strace"):
@@ -799,6 +812,31 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         opened = strace_opened(strace_log.read_text(encoding="utf-8", errors="replace"), tree)
     _collect(report, out_dir, opened, tree, started)
     return report, 0
+
+
+def _run_executables(
+    report: dict, relinked: dict, tree: Path, cwd: Path, scratch: Path, timeout: int, env: dict[str, str]
+) -> None:
+    """Run each relinked non-test executable once, no arguments, empty stdin, a short time cap."""
+    cap = max(1, min(timeout, EXECUTABLE_TIMEOUT_S))
+    runs: dict[str, Any] = {}
+    for name, info in sorted(relinked.items()):
+        if info.get("status") != "relinked":
+            continue
+        t0 = time.monotonic()
+        res = _sandboxed([str(tree / name)], cwd, scratch, cap, env)
+        runs[name] = {
+            "returncode": res.returncode,
+            "timed_out": res.timed_out,
+            "seconds": round(time.monotonic() - t0, 2),
+            "log_tail": ((res.stdout or "") + (res.stderr or ""))[-1000:],
+        }
+    report["runs"] = runs
+    failed = sorted(n for n, r in runs.items() if r["returncode"] != 0)
+    if failed:
+        report["warnings"].append(
+            f"{', '.join(failed)} exited non-zero without arguments: calls recorded before that are kept"
+        )
 
 
 def _compile_wrappers(
