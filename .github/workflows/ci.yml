@@ -170,12 +170,16 @@ jobs:
           }
           $global:LASTEXITCODE = 0
 
+  # Both images, then what the image build no longer runs (it keeps only the Phase 0 model selftest):
+  # the toolchain check (same Debian release, gcc and glibc: the two Debian bases are aligned by pinned
+  # digests, not by a shared stage), the E-ACSL canary, and the snapshot check (a capture in the build
+  # image read back by the analysis image) with the scratch volume's non-root access.
   container-canary:
-    name: Container Build & E-ACSL Canary Selftest
+    name: Container Build, Toolchain, E-ACSL Canary & Snapshot Checks
     needs:
       - lint-and-typecheck
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
     steps:
@@ -195,6 +199,15 @@ jobs:
         with:
           driver: docker
 
+      - name: Build the build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: framac-build
+          load: true
+          tags: framac-build:latest
+
       - name: Build the analysis image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -204,6 +217,26 @@ jobs:
           load: true
           tags: framac-analysis:latest
 
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade "pytest>=8.0,<10.0"
+
+      - name: Check both images share the Debian release, gcc and glibc
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in framac-build framac-analysis; do
+            docker run --rm --network none --entrypoint python3 "${image}:latest" \
+              /opt/framac-pipeline/scripts/image_toolchain.py > "${RUNNER_TEMP}/${image}.json"
+            cat "${RUNNER_TEMP}/${image}.json"
+          done
+          python scripts/image_toolchain.py compare \
+            "${RUNNER_TEMP}/framac-build.json" "${RUNNER_TEMP}/framac-analysis.json"
+
       - name: Run sandbox probe, E-ACSL canary and kernel AST selftests in hardened container
         shell: bash
         run: |
@@ -212,3 +245,8 @@ jobs:
             --target templates/eacsl_canary \
             --new-run \
             -- "frama-c -version && python3 /opt/framac-pipeline/scripts/sandbox_exec.py probe && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest && python3 /opt/framac-pipeline/scripts/kernel_ast.py selftest"
+
+      - name: Snapshot check and non-root scratch volume
+        env:
+          FRAMAC_DOCKER_TESTS: "1"
+        run: python -m pytest -q -p no:cacheprovider tests/test_r8_images.py

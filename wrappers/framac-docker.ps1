@@ -496,9 +496,8 @@ if ($Scratch) {
     if ($LASTEXITCODE -ne 0) {
         & $EngineName volume create "--label" "framac.scratch=1" "$ScratchVolume" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Failed to create scratch volume $ScratchVolume" }
-        # A new volume's root belongs to root: open it (sticky, like /tmp) for the non-root job user.
-        & $EngineName run "--rm" "--network" "none" "-v" "${ScratchVolume}:/framac-scratch" "--entrypoint" "/bin/chmod" "$Image" "1777" "/framac-scratch" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Failed to initialize scratch volume $ScratchVolume" }
+        # No chmod: both images create /framac-scratch with mode 1777, and the engine copies that mode to
+        # the new, empty volume on its first mount, so the non-root job user can write it.
     }
     [Console]::Error.WriteLine("[framac-docker] scratch volume: $ScratchVolume at /framac-scratch")
 }

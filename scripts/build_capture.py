@@ -33,7 +33,9 @@ the run's named Docker volume at /framac-scratch:
      and the toolchain (told apart with `dpkg -S`: libc6-dev, linux-libc-dev, gcc's own headers), the
      libraries the link steps name (`-l` through `cc -print-file-name`, absolute inputs) and their shared
      dependencies (DT_NEEDED read with readelf and resolved through `ldconfig -p`, recursively: what ldd
-     reports, without running the dynamic loader on target binaries). Generated headers stay in the tree.
+     reports, without running the dynamic loader on target binaries). The headers the build generated in
+     the tree (`config.h`: named in a dependency list, absent from the target) are copied to
+     <run>/workspace/snapshot/generated/<tree-relative path>, with the include directories that find them.
 
 The report is workspace/reports/build_capture.json (schemas/build_capture.schema.json). A build that fails
 (or compiles no C file, or has no recipe) stops Phase 0: status `needs_build_recipe` with the first error,
@@ -1053,8 +1055,50 @@ def shared_closure(start: Iterable[Path], ldconfig: dict[str, str]) -> dict[str,
     return {k: [v] for k, v in sorted(resolved.items())}
 
 
-def export_snapshot(snapshot: Path, files: dict[str, dict]) -> dict:
-    """Copy the exported files under <snapshot>/root/<absolute path>; digest over (path, sha256)."""
+def generated_headers(compiles: Iterable[dict], target: Path) -> list[str]:
+    """
+    Project headers the build generated (`config.h` from configure or CMake): named in a compile's
+    dependency list, inside the tree, and absent from the read-only target.
+    """
+    named = {h for c in compiles for h in c.get("headers") or [] if h.endswith(".h") and not posixpath.isabs(h)}
+    return sorted(h for h in named if not (target / h).is_file())
+
+
+def generated_include_dirs(headers: list[str], compiles: Iterable[dict]) -> list[str]:
+    """
+    Tree-relative directories the analyses search for the generated headers: each header's own directory
+    (`#include "config.h"`), then the compiles' project include directories that hold one below them
+    (`-Ibuild` for `#include <gen/version.h>`). '.' is the tree root.
+    """
+    out: list[str] = []
+    for h in headers:
+        d = posixpath.dirname(h) or "."
+        if d not in out:
+            out.append(d)
+    for c in compiles:
+        toks = c.get("flags") or []
+        for i, tok in enumerate(toks):
+            if tok not in ("-I", "-iquote", "-isystem", "-idirafter") or i + 1 >= len(toks):
+                continue
+            d = posixpath.normpath(toks[i + 1])
+            if posixpath.isabs(d) or d.startswith(".."):
+                continue
+            if d not in out and any(d == "." or h.startswith(d + "/") for h in headers):
+                out.append(d)
+    return out
+
+
+def export_snapshot(
+    snapshot: Path,
+    files: dict[str, dict],
+    generated: dict[str, Path] | None = None,
+    generated_dirs: list[str] | None = None,
+) -> dict:
+    """
+    Copy the exported files under <snapshot>/root/<absolute path> and the build's generated headers under
+    <snapshot>/generated/<tree-relative path>; digest over (path, sha256), the generated headers keyed
+    `generated/<path>` (a snapshot without one keeps the digest it always had).
+    """
     root = snapshot / "root"
     if snapshot.exists():
         shutil.rmtree(snapshot)
@@ -1068,9 +1112,23 @@ def export_snapshot(snapshot: Path, files: dict[str, dict]) -> dict:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dest)
         manifest[path] = sha256_file(dest)
-    digest = hashlib.sha256("".join(f"{p}\0{h}\n" for p, h in sorted(manifest.items())).encode()).hexdigest()
-    atomic_write_json(snapshot / "manifest.json", {"digest": digest, "files": manifest})
-    return {"digest": digest, "files": len(manifest)}
+    gen: dict[str, str] = {}
+    for rel in sorted(generated or {}):
+        src = (generated or {})[rel]
+        if not src.is_file():
+            continue
+        dest = snapshot / target_env.GENERATED_REL / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+        gen[rel] = sha256_file(dest)
+    material = sorted([*manifest.items(), *((f"{target_env.GENERATED_REL}/{r}", h) for r, h in gen.items())])
+    digest = hashlib.sha256("".join(f"{p}\0{h}\n" for p, h in material).encode()).hexdigest()
+    data: dict[str, Any] = {"digest": digest, "files": manifest}
+    if gen:
+        data["generated"] = gen
+        data["generated_dirs"] = list(generated_dirs or [])
+    atomic_write_json(snapshot / "manifest.json", data)
+    return {"digest": digest, "files": len(manifest) + len(gen), "generated": len(gen)}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1336,7 +1394,8 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
     missing_pkgs = packages_missing(recipe["packages"])
     events = scratch / "events.jsonl"
     jobs = job_count()
-    # A Makefile that is not parallel-safe fails under -j: retry once with one job, on a fresh copy, unless
+    # A Makefile that is not parallel-safe fails under -j, or stalls (CryptoLib under `bear` without the
+    # broker's lease): after a non-zero exit or a timeout, retry once with one job, on a fresh copy, unless
     # the recipe sets the parallelism itself.
     plan = [jobs]
     if jobs > 1 and not {"MAKEFLAGS", "CMAKE_BUILD_PARALLEL_LEVEL"} & set(recipe["env"]):
@@ -1359,12 +1418,15 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
         )
         build_seconds = round(time.monotonic() - t0, 2)
         log = (res.stdout or "") + (res.stderr or "")
-        attempts.append({"jobs": j, "returncode": res.returncode, "seconds": build_seconds})
-        if (res.returncode == 0 and not res.timed_out) or res.timed_out:
+        attempts.append(
+            {"jobs": j, "returncode": res.returncode, "timed_out": bool(res.timed_out), "seconds": build_seconds}
+        )
+        if res.returncode == 0 and not res.timed_out:
             break
-    if len(attempts) > 1 and res.returncode == 0:
+    if len(attempts) > 1 and res.returncode == 0 and not res.timed_out:
+        how = "timed out" if attempts[0]["timed_out"] else "failed"
         report["warnings"].append(
-            f"the build failed with {jobs} jobs and succeeded with one (not parallel-safe); "
+            f"the build {how} with {jobs} jobs and succeeded with one (not parallel-safe); "
             "see workspace/reports/build_capture/build-parallel.log"
         )
     (logs / "build.log").write_text(log, encoding="utf-8")
@@ -1504,16 +1566,35 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     ]
     report["build"]["probes_dropped"] = cap["probes_dropped"]
     snapshot = Path.cwd() / target_env.SNAPSHOT_REL
-    report["snapshot"] = build_snapshot(snapshot, tree, units, system_headers, recipe, report["warnings"])
+    generated = generated_headers(entries, Path(report["target"]))
+    report["snapshot"] = build_snapshot(
+        snapshot,
+        tree,
+        units,
+        system_headers,
+        recipe,
+        report["warnings"],
+        generated=generated,
+        generated_dirs=generated_include_dirs(generated, entries),
+    )
 
 
 def build_snapshot(
-    snapshot: Path, tree: Path, units: dict, system_headers: set[str], recipe: dict, warnings: list[str]
+    snapshot: Path,
+    tree: Path,
+    units: dict,
+    system_headers: set[str],
+    recipe: dict,
+    warnings: list[str],
+    generated: list[str] | None = None,
+    generated_dirs: list[str] | None = None,
 ) -> dict:
     """
     Headers, libraries and their shared dependencies outside the project and libc, copied with a digest
     to the run's snapshot (<run>/workspace/snapshot): every container of the run mounts the run
-    directory, so the analysis image finds them there (scripts/target_env.py).
+    directory, so the analysis image finds them there (scripts/target_env.py). The headers the build
+    generated in the tree (`generated`, tree-relative) go with them: the analyses read the target, not
+    the scratch tree, and would miss `config.h`.
     """
     t = str(tree)
     libs: dict[str, str] = {}  # path -> how it was found
@@ -1554,8 +1635,8 @@ def build_snapshot(
     ]
     exported = {e["path"]: e for e in headers + libraries if e["class"] in ("package", "unowned")}
     exported.update({p: {"path": p} for p in extra_files})
-    summary = export_snapshot(snapshot, exported)
-    return {
+    summary = export_snapshot(snapshot, exported, {h: tree / h for h in generated or []}, generated_dirs)
+    result: dict[str, Any] = {
         "root": (snapshot / "root").as_posix(),
         "digest": summary["digest"],
         "files": summary["files"],
@@ -1569,6 +1650,9 @@ def build_snapshot(
         "packages": sorted({e["package"] for e in exported.values() if e.get("package")}),
         "extra": extra,
     }
+    if summary["generated"]:
+        result["generated"] = {"headers": sorted(generated or []), "include_dirs": list(generated_dirs or [])}
+    return result
 
 
 # ---------------------------------------------------------------------------------------------------

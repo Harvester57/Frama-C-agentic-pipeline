@@ -16,8 +16,8 @@
 # image: `docker compose run --rm framac-build "<command>"`. Both services mount the run's scratch
 # volume at /framac-scratch; its name is framac-scratch-${FRAMAC_SCRATCH_ID}, so set FRAMAC_SCRATCH_ID
 # to something unique per run (for example <repo>-run-<N>; the wrappers add a hash of the run dir).
-# A new volume belongs to root; open it once for the job user:
-# `docker compose run --rm --user 0 --entrypoint chmod framac-build 1777 /framac-scratch`.
+# Both images create /framac-scratch with mode 1777, which a new volume takes on its first mount, so
+# the job user can write it without a manual step.
 # Target packages need a derived build image: `docker build --target framac-build --build-arg
 # TARGET_APT_PACKAGES="..." -t framac-build:<repo> .` and FRAMAC_BUILD_IMAGE=framac-build:<repo>.
 # The framac-pipeline service runs the analysis image (stage framac-analysis), which holds no target

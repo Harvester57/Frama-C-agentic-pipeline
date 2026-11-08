@@ -316,9 +316,8 @@ fi
 if [[ ${SCRATCH} -eq 1 ]]; then
     if ! "${ENGINE}" volume inspect "${SCRATCH_VOLUME}" >/dev/null 2>&1; then
         "${ENGINE}" volume create --label framac.scratch=1 "${SCRATCH_VOLUME}" >/dev/null
-        # A new volume's root belongs to root: open it (sticky, like /tmp) for the non-root job user.
-        "${ENGINE}" run --rm --network none -v "${SCRATCH_VOLUME}:/framac-scratch" --entrypoint /bin/chmod \
-            "${IMAGE}" 1777 /framac-scratch >/dev/null
+        # No chmod: both images create /framac-scratch with mode 1777, and the engine copies that mode to
+        # the new, empty volume on its first mount, so the non-root job user can write it.
     fi
     echo "[framac-docker] scratch volume: ${SCRATCH_VOLUME} at /framac-scratch" >&2
 fi

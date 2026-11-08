@@ -10,6 +10,9 @@ them from there instead:
   - headers: `-idirafter <root>/<dir>` for the include directories a compile names outside the tree
     and for gcc's default system directories, searched last, so Frama-C's libc and the image's own
     headers always win;
+  - generated headers: the headers the build generated in its tree (`config.h`), which the target
+    does not have, under `generated/<tree-relative path>` with the manifest's `generated_dirs`;
+    `-idirafter <snapshot>/generated/<dir>` for each, before the system directories;
   - libraries: `-L <root>/<dir>` with an RPATH (not RUNPATH: it also serves the libraries' own
     dependencies), so fuzzing, replay and the guardrail run the binaries without installed packages.
 
@@ -28,6 +31,8 @@ from pathlib import Path
 
 SNAPSHOT_REL = "workspace/snapshot"
 CONTAINER_SNAPSHOT_DIR = f"/framac-run/{SNAPSHOT_REL}"
+# The build's generated headers, by tree-relative path, inside the snapshot directory.
+GENERATED_REL = "generated"
 # System include directories gcc searches by default: their target headers come from the snapshot.
 DEFAULT_SYSTEM_DIRS = ("/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include")
 _INCLUDE_DIR_OPTIONS = ("-I", "-isystem", "-idirafter", "-iquote")
@@ -79,6 +84,22 @@ def include_flags(root: str | None, flags: Iterable[str]) -> list[str]:
     return out
 
 
+def generated_include_flags(d: Path | None = None) -> list[str]:
+    """`-idirafter` options for the build's generated-header directories in the snapshot (manifest order)."""
+    d = d or snapshot_dir()
+    if d is None:
+        return []
+    base = d / GENERATED_REL
+    out: list[str] = []
+    for rel in _manifest(d).get("generated_dirs") or []:
+        if not isinstance(rel, str) or posixpath.isabs(rel) or ".." in rel.split("/"):
+            continue
+        path = base if rel in ("", ".") else base / rel
+        if path.is_dir() and path.as_posix() not in out[1::2]:
+            out += ["-idirafter", path.as_posix()]
+    return out
+
+
 def library_dirs(d: Path | None = None) -> list[str]:
     """Snapshot directories holding a library, in manifest order (`/lib/...` and `/usr/lib/...` alike)."""
     d = d or snapshot_dir()
@@ -107,7 +128,10 @@ def link_flags(d: Path | None = None) -> list[str]:
 
 
 def with_include_flags(cppflags: str) -> str:
-    """`cppflags` followed by the snapshot's `-idirafter` options for them."""
+    """
+    `cppflags` followed by the snapshot's `-idirafter` options for them: the build's generated headers
+    first, then the target's system headers.
+    """
     d = snapshot_dir()
     if d is None:
         return cppflags
@@ -115,7 +139,10 @@ def with_include_flags(cppflags: str) -> str:
         words = shlex.split(cppflags or "")
     except ValueError:
         return cppflags
-    extra = include_flags((d / "root").as_posix(), words)
+    present = {words[i + 1] for i, w in enumerate(words[:-1]) if w == "-idirafter"}
+    gen = generated_include_flags(d)
+    extra = [t for i in range(0, len(gen), 2) if gen[i + 1] not in present for t in gen[i : i + 2]]
+    extra += include_flags((d / "root").as_posix(), words)
     return f"{cppflags} {shlex.join(extra)}".strip() if extra else cppflags
 
 

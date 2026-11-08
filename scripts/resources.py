@@ -1477,6 +1477,11 @@ def recommend(max_agents: int | None = None, pool: Budget | None = None) -> dict
 
 
 _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
+    # Phase 0 steps that run the target's own build or programs in the build image: target code, sized
+    # like a phase (the capture's build, the seed recording's tests or executables, CodeQL's traced build).
+    (r"build_capture\.py\s+(?:[^\s;&|]+\s+)*?run(?:\s|$)", "phase-dynamic"),
+    (r"seed_harvest\.py\s+(?:[^\s;&|]+\s+)*?record(?:\s|$)", "phase-dynamic"),
+    (r"codeql_trust\.py\s+(?:[^\s;&|]+\s+)*?run(?:\s|$)", "phase-dynamic"),
     (r"run_wp_function\.py", "wp"),
     (r"run_eva_slice\.py", "eva"),
     (r"eva_tuning\.py", "eva"),
