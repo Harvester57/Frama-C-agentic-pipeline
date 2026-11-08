@@ -23,8 +23,8 @@ import run_wp_function as rwf
 import security_props as sp
 import trust
 from acsl_ast import tokenize_c_acsl
-from conftest import write_json
-from test_phase0_model import BUILD_IMAGE, PIPELINE_IMAGE, model_run  # noqa: F401  (Docker fixture)
+from conftest import ANALYSIS_IMAGE, write_json
+from test_phase0_model import model_run  # noqa: F401  (Docker fixture)
 
 ROOT = Path(__file__).resolve().parent.parent
 FIX = ROOT / "tests" / "fixtures" / "security_props"
@@ -419,7 +419,7 @@ def test_wipe_acceptance_in_the_image(model_run, tmp_path, variant, proven):  # 
         "-v", f"{fixture.resolve()}:/target:ro", "-v", f"{run.resolve()}:/framac-run", "-w", "/framac-run",
         "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
         "-v", f"{ROOT / 'schemas'}:/opt/framac-pipeline/schemas:ro",
-        PIPELINE_IMAGE, "-c",
+        ANALYSIS_IMAGE, "-c",
         "python3 /opt/framac-pipeline/scripts/run_wp_function.py --file /target/session.c --function session_close "
         "--out-dir workspace/wp --cppflags=-I/target --timeout 10 --out-json workspace/reports/wp/session_close.json",
     ]  # fmt: skip

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,13 +16,12 @@ import benchmark
 import build_capture as bc
 import checkpoint
 import run_metadata
-from conftest import PHASE0_FIXTURES, ROOT
+from conftest import BUILD_IMAGE, PHASE0_FIXTURES, ROOT, require_docker_images
 from framac_common import ArtifactError
 from test_sandbox_and_overlay import _engine_run_args, _fake_engine
 
 FIXTURES = ROOT / "tests" / "fixtures" / "build_capture"
 TREE = "/s/tree"
-BUILD_IMAGE = os.environ.get("FRAMAC_TEST_BUILD_IMAGE", "framac-build:latest")
 
 
 def capture_of(name: str) -> dict:
@@ -481,9 +480,10 @@ class TestWrappersAndBenchmark:
         for flag in ("$BuildImage", "$Scratch", "$RemoveScratch", '"framac-build"', "/framac-scratch"):
             assert flag in ps1, flag
         assert "target: framac-build" in compose and "scratch:/framac-scratch" in compose
-        # The monolithic image is gone (plan step I10): no wrapper names or derives it.
+        # The monolithic image is gone (plan step I10): no wrapper names or derives it (compose keeps the
+        # service name framac-pipeline, which runs the analysis image).
         for text in (sh, ps1, compose):
-            assert "framac-pipeline:" not in text
+            assert not re.search(r"framac-pipeline:[\w$<{]", text)
 
     def test_ps1_runs_build_steps_in_the_build_image_with_the_scratch_volume(self, tmp_path):
         pwsh = shutil.which("pwsh") or shutil.which("powershell")
@@ -506,7 +506,11 @@ class TestWrappersAndBenchmark:
             (["-BuildImage", "-TargetPackages", "check", "-NoBroker"], "framac-build:target_repo", False),
             # The analysis image never gets target packages, under its default name or another one.
             (["-TargetPackages", "check", "-NoBroker"], "framac-analysis:latest", False),
-            (["-Image", "framac-analysis:other", "-TargetPackages", "check", "-NoBroker"], "framac-analysis:other", False),
+            (
+                ["-Image", "framac-analysis:other", "-TargetPackages", "check", "-NoBroker"],
+                "framac-analysis:other",
+                False,
+            ),
         )
         for extra, image, scratch in cases:
             proc = subprocess.run([*base, *extra, "true"], env=env, capture_output=True, text=True)
@@ -530,12 +534,7 @@ def build_image_run():
     Run build_capture.py in the build image on a fixture mounted read-only at /target (network off),
     as `run(fixture, run_dir, shell_command) -> CompletedProcess`. Opt-in: FRAMAC_DOCKER_TESTS=1.
     """
-    if os.environ.get("FRAMAC_DOCKER_TESTS") != "1":
-        pytest.skip("Docker-backed test: set FRAMAC_DOCKER_TESTS=1")
-    if not shutil.which("docker"):
-        pytest.skip("docker not found")
-    if subprocess.run(["docker", "image", "inspect", BUILD_IMAGE], capture_output=True, check=False).returncode:
-        pytest.skip(f"image {BUILD_IMAGE} not built")
+    require_docker_images(BUILD_IMAGE)
 
     def run(fixture: Path, run_dir: Path, command: str, timeout: int = 600) -> subprocess.CompletedProcess:
         run_dir.mkdir(parents=True, exist_ok=True)
