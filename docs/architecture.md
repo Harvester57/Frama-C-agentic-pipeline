@@ -19,11 +19,16 @@ This document details the macro-level and micro-level architecture of the Frama-
 
 ```mermaid
 flowchart TD
-    subgraph P0["Phase 0: Shadow Overlay, Build Graph & Module Slicing (/framac-slice)"]
+    subgraph P0["Phase 0: Build Capture, Frama-C Model & Module Slicing (/framac-slice)"]
         A["Target C Codebase (e.g. 90,000 LoC)"] --> B["Initialize run workspace/ Shadow Copy<br/>(workspace_overlay.py init)"]
-        B --> C["Build Call-Graph DAG & Topological Waves 0..K<br/>(build_callgraph_dag.py)"]
-        C --> D["Stub External Boundaries (__fc_libc + external_stubs.h)<br/>& Infer Layer 2-6 Security Properties"]
-        D --> E{"Classify Modules by<br/>Risk Tier & Structure"}
+        B --> BC{"Build Capture in the build image<br/>(build_capture.py: bear, link units, API, snapshot)"}
+        BC -- "Build fails" --> ASK["Stop: needs_build_recipe<br/>Ask the user, then resume"]
+        BC -- "OK" --> MO["Frama-C Model per Link Unit<br/>(phase0_model.py; GCC fallback per unit)<br/>+ Trust (trust.py, THREAT_MODEL.md)"]
+        MO --> SD["Seeds from the Tests<br/>(seed_harvest.py record, build image)"]
+        MO --> C["DAG View: Link-Unit Modules, Waves 0..K,<br/>Tiers from Trust, Unit Split<br/>(build_callgraph_dag.py, tiers.py, unit_split.py)"]
+        MO --> SP["MetAcsl Layer 3-6 Properties<br/>(security_props.py)"]
+        C --> D["Stub External Boundaries<br/>(__fc_libc + external_stubs.h)"]
+        D --> E{"Route Modules by<br/>Risk Tier"}
     end
 
     E -- "Tier 1A: Untrusted Binary Parser<br/>(e.g. SNMPv3 ASN.1/BER)" --> M1["Module Slice: Binary Parser"]
@@ -35,7 +40,9 @@ flowchart TD
         M1 & M2 & M3 --> F["Generate Dual Harness (generate_harness.py)<br/>LLVMFuzzerTestOneInput + eva_main"]
         F --> FR{"Reachability Gate (harness_reach.py)<br/>every DAG entry point reached or exempted?"}
         FR -- "No: add dispatch cases" --> F
-        FR -- "Yes" --> G["RTE + E-ACSL two-stage build, -fsanitize=fuzzer<br/>(run_eacsl_fuzz.py campaign)"]
+        FR -- "Yes" --> G["RTE + E-ACSL two-stage build, -fsanitize=fuzzer<br/>seeded from the tests (run_eacsl_fuzz.py campaign)"]
+        G --> DR{"Dynamic Reach Gate (harness_reach.py dynamic)<br/>every entry point executed by the corpus?"}
+        DR -- "No: repair or exempt" --> F
         G --> H{"Runtime Crash /<br/>RTE Triggered?"}
         H -- "Yes (True Bug)" --> I["Emit Concrete Crash Reproducer<br/>& Exclude Broken Function from Proof Queue"]
     end
@@ -62,6 +69,19 @@ flowchart TD
 
     Q & S & I & T2_DONE --> Z["Phase 4: Validate ledger + findings, derive REPORT.md,<br/>FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, verified_acsl.patch, & report.sarif"]
 ```
+
+### Phase 0 in short
+
+Design and measurements: [`./phase0-redesign.md`](./phase0-redesign.md) and [`./phase0-implementation-plan.md`](./phase0-implementation-plan.md).
+
+- **Images.** The build image (`framac-build`) runs the target's own build and tests. The analysis image (`framac-analysis`) runs everything else and holds no target packages. The CodeQL image is optional and off by default. The monolithic `framac-pipeline` image still works but is slated for removal.
+- **Build capture** (`build_capture.py`, build image, scratch volume). The target's build runs under `bear` from a recipe the user gave or confirmed. It gives the link units, per-file flags, test units, API entry points, and a snapshot of the target's headers and libraries in `workspace/snapshot/`. A build that fails stops Phase 0 with `needs_build_recipe` until the user fixes the recipe.
+- **Frama-C model** (`phase0_model.py`, analysis image). One Frama-C parse per distinct set of sources and flags gives the functions (`file#name`), direct and indirect edges, macro aliases, thread entries and each function's trust. A unit Frama-C cannot parse falls back to GCC's `-fcallgraph-info`, and is flagged. Alias narrowing of indirect edges exists but is off by default.
+- **Trust** (`trust.py`). Library API and functions reached from input readers are untrusted, unless the structured threat model says otherwise. Optional CodeQL facts can only add untrusted marks.
+- **DAG view** (`build_callgraph_dag.py`). Modules are the build's link units. Harnesses may be sub-modules of a unit, and `module_map.py` maps every report back to its unit. Tiers come from trust (`tiers.py`), and units too large for one Eva run are split into clusters (`unit_split.py`).
+- **Seeds** (`seed_harvest.py`). The API calls the target's tests make are recorded in the build image and written as seeds in each harness's case format.
+- **Security properties** (`security_props.py`). The threat model's auth gates, output sinks and secrets become MetAcsl properties (Layers 4 to 6), and pointer writers get Layer 3 frame units.
+- **Gates.** The reach gate and the E-ACSL build check write `workspace/reports/phase0_gates.json`, and Make refuses to fuzz, run Eva or queue WP on a module that failed one. Coverage after fuzzing reopens the reach gate for entry points no input executed.
 
 ---
 
@@ -121,17 +141,28 @@ run-<N>/
 ├── workspace/
 │   ├── baseline/                             # Clean read-only snapshot of original C/H files
 │   ├── work/                                 # Active shadow tree (ACSL annotations only)
+│   ├── snapshot/                             # The target's headers and libraries from the build (root/, manifest.json)
 │   ├── harnesses/                            # Generated harness_<mod>.c, harness_<mod>.json, and E-ACSL binaries
 │   ├── build/                                # Generated Makefile, modules.mk, params.json (pipeline_make.py)
+│   ├── seed_records/                         # API calls recorded from the target's tests (calls.jsonl)
+│   ├── seeds/<mod>/                          # Seeds in the harness's case format (read-only extra corpus)
 │   ├── corpus/<mod>/                         # LibFuzzer seed and coverage corpus per module (parent-owned)
 │   ├── crashes/<mod>/                        # crash-* inputs triggering E-ACSL assertions
 │   ├── contracts/                            # Exported verified .h and .acsl contract headers
 │   └── reports/
-│       ├── callgraph_dag.json                # Call-Graph DAG, waves, risk tiers, & security properties
+│       ├── build_capture.json                # Link units, flags, API, snapshot digest, or needs_build_recipe diagnostics
+│       ├── phase0_model.json                 # Frama-C model: functions, edges, units, trust, parse status per unit
+│       ├── codeql_trust.json                 # Optional CodeQL trust facts
+│       ├── seed_harvest.json                 # What the seed recording kept
+│       ├── security_props.json               # MetAcsl Layer 3-6 properties and their instances
+│       ├── callgraph_dag.json                # DAG view: link-unit modules, waves, tiers, unit split
+│       ├── phase0_gates.json                 # Reach gate and E-ACSL build check, per module
+│       ├── harness_reach.json                # Static reach gate report (harness_reach_dynamic.json after coverage)
 │       ├── strengthen_requests.json          # Caller-Callee contract negotiation ledger
 │       ├── wp_queue.json                     # Ordered Phase-3 queue (written by wp_scheduler.py init)
 │       ├── verified_acsl.patch               # Unified diff of all verified ACSL annotations
 │       ├── fuzz/<mod>.json                   # Phase 1 campaign outputs (fingerprinted failures)
+│       ├── coverage/<mod>.json               # Functions and regions each corpus executes
 │       ├── eva/<mod>.json                    # Phase 2 Eva + RTE status buckets & per-slice .sarif
 │       ├── replay/<fp>.json                  # Deterministic replays of candidate reproducers
 │       ├── wp/<fn>.json                      # Phase 3 per-function WP results by obligation class
