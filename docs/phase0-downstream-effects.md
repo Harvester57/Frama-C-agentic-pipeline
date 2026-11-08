@@ -159,7 +159,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 **Watch out:**
 - **E-ACSL still uses the old tokenizer:** its `-rte-select` list and crash-to-function resolution go through `c_definitions.extract_functions_from_code`, not the model.
 - **Concurrency:** E-ACSL detects it by scanning sources (`slice_has_pthread`), not from the DAG's `concurrent`.
-- **GCC-fallback units:** E-ACSL will fail there too, and `build_check` then blocks fuzzing. The plan says sanitizer fuzzing still runs on them, but today someone must run `params set --fuzz-engine sanitizers` by hand.
+- **GCC-fallback units:** the DAG gives them `fuzz_engine: sanitizers`, which the Make plan applies, so `build_check` accepts them without a manual `params set` (defect 6).
 - **Coverage:** `COVERAGE_EXTERNAL_PREFIXES` doesn't list the snapshot root, so code in snapshot headers counts as target code.
 - **Colliding names:** seed records are keyed by plain name and pooled across units, and link repair (`_dag_symbol_files`) takes the first file per name.
 
@@ -275,7 +275,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 
 ## 8. Known defects and gaps
 
-All of these were checked in the code. Defects 1-8 are fixed on `phase0-redesign` (commit in the Status column); 9-14 stay open. The fixes were unit-tested only: no pipeline or benchmark run has checked them yet.
+All of these were checked in the code. Defects 1-8 and 15-20 are fixed on `phase0-redesign` (commit in the Status column); 9-14 stay open. Defects 15-20 came from a second audit of Phase 0 (2026-11-08). The fixes were unit-tested only: no pipeline or benchmark run has checked them yet.
 
 | # | Severity | Where | Problem | Fix direction | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -293,6 +293,12 @@ All of these were checked in the code. Defects 1-8 are fixed on `phase0-redesign
 | 12 | Stale state | `ledger.py:416-418`, `phase0_gates.py:45-55` | Re-seeding never refreshes existing units, and the reach-gate digest ignores the DAG. | Document it (done here); consider a DAG digest in the gate key and a `--refresh` seed. |
 | 13 | Coarse | `wp_scheduler.py:673-679`, `:1367` | One header architect per unit, for the first sub-module's header only; gating is per unit. | Per-harness headers; gate per sub-module scope. |
 | 14 | Limit | flags | One configuration per file shared by several units (qlz). | Run each unit's configuration (I8 split, or a later step). |
+| 15 | Broken | `pipeline_make.build_check`, `validate_artifacts.validate_phase0_gates` | A plan with nothing to fuzz recorded `build_check.ok: false` with no modules, which failed validation and `wp-queue`: an Eva-only run could not finish. | Pass a plan with modules but nothing to fuzz; keep failing a plan with no module. | Fixed, `60107a9`. |
+| 16 | Gate bypass | `phase0_gates.check` (whole run), `wp_scheduler.py init`, `benchmark.py` | The whole-run gate trusted the stored reach flag (a harness changed since passed) and the recorded build rows (a module build-check never built passed). `wp_scheduler.py init` checked no gate, and the benchmark checkpointed Phase 2 whatever `wp-queue` returned. | Check digests run-wide; `wp-queue` passes the plan's `MODULES` and `FUZZ_MODULES`; `init` checks the gates; drop the benchmark's checkpoint. | Fixed, `60107a9`. |
+| 17 | Lost facts | `phase0_model.ModelBuilder.add_function` | The first parse to see a function kept its record, so a function also compiled by an earlier-sorting GCC-fallback unit lost its signature, formals, loops and writes (and with them its L2/L3 units and WP blockers). | A Frama-C record replaces a GCC one. | Fixed, `f43368a`. |
+| 18 | Name lookup | `pipeline_make.sweep_list`, `generate_harness._merge_dag_harness_sources` | Plain-name lookups of DAG keys, as in defect 3: a colliding Eva-only callee was left out of the WP sweep, and a colliding callee's sources were not merged into a harness. | Resolve keys through their DAG record; for harness sources, the definition in the harness's sources, else the only external one. | Fixed, `2747d3f`. |
+| 19 | Missing API | `build_callgraph_dag` (`reached`), `seed_harvest.plan_recorder` | The model's top-level `entry_points` leaves out `embedded_api`, so header functions reached only from it were deferred as unreached, and it was never recorded for seeds. | `model_api`: entry points plus the non-test units' embedded API. | Fixed, `b440e1e`. |
+| 20 | Silent drop | `phase0_model` (capture ids) | A function defined in a `#include`d `.c`, or a header function without `-g`, has another id in the capture than in the model; trust, the unit view and the reach gate dropped it without a warning. | `reconcile_api_ids` maps it to the unit's only external function of that name, or warns. | Fixed, `003be49`. |
 
 **Stale docs and briefs:**
 - `skills/framac-eva/SKILL.md`:
