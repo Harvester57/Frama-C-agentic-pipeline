@@ -170,3 +170,39 @@ Both run from the I7 branch, in their own worktrees:
 - **Left for you:**
   - retiring the monolithic image (the tests' Docker image is still `framac-pipeline:latest`);
   - the single merge of `phase0-redesign` into `main`.
+
+## Report 6
+
+### The merged tree holds up
+
+- **`phase0-i9`** (merged I4–I9, runs `i9m1-*`) against `phase0-i5b`:
+  - 0 regressions, every known bug retained;
+  - CryptoLib `mc_initialize` newly covered;
+  - seeded set: **8/8 bugs, 0/4 decoys**, now including s08 from I6.
+- **The I6 dynamic reach gate** didn't block any benchmark stage: all 10 targets finished with rc=0.
+
+### I10: lexer gone, docs updated
+
+- **Lexer removal (I10a):**
+  - `build_callgraph_dag.py` went from 2,764 to 971 lines. The DAG now comes from the Frama-C model only. With no model it stops with `needs_build_recipe`.
+  - The file-path module partition is kept, so harness names don't change.
+  - On every saved run, rebuilding the DAG gives identical link units, sub-modules, entry points, sources and waves. Every other difference is explained in the plan's I10a note.
+- **Docs (I10b):** the README, architecture, v2-design, troubleshooting, onboarding, benchmark and security-properties docs, and the slice, verify and fuzz skills, now describe Phase 0 as built.
+- **Baseline `phase0-i10`** (runs `i10m1-*`) against `phase0-i9`:
+  - 0 regressions; seeded set 8/8, 0/4.
+  - **One warning, explained: CryptoLib `mc` Eva checks 43 properties, down from 689.** The lexer's guesses had pulled 19 sources into that harness. The model's edges need its 3 own files, and Eva now has 0 undeclared functions, against 1. The old properties were mostly in unreachable code. Ledger coverage is unchanged.
+- **Two tier changes I accepted; please glance:** the model sees real types, so CryptoLib's 13 `get_*_interface` getters go from Tier 3 to 1A, and `main(int, char **)` goes from 1B to 1A.
+- **Gates:**
+  - ruff clean;
+  - pytest 2045 passed, 100 skipped;
+  - mypy: only the Nov 7 error.
+
+### Running now
+
+- **I10c**, in its own worktree: retiring the monolithic image. The Docker tests still default to `framac-pipeline:latest`.
+
+### Left for you
+
+- **The single merge of `phase0-redesign` into `main`.** Everything is local; nothing is pushed.
+- **Keep or remove `poc/phase0/`.**
+- **The manifest's unused `compile_commands` asset.** I kept it so the harness digests don't change.
