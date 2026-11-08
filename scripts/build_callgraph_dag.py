@@ -73,6 +73,9 @@ HARNESS_ENTRYPOINT_NAMES = frozenset(
     }
 )
 
+# The formal Frama-C gives a variadic definition's `...`.
+VA_PARAMS = "__va_params"
+
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
 CAPTURE_NAME = "build_capture.json"
 
@@ -231,7 +234,8 @@ def _model_key_of(model_fns: dict[str, dict]) -> dict[str, str]:
 # Canonical types of the dump (typedefs unrolled, qualifiers dropped): `unsigned char *`, `unsigned long`.
 _BYTE_POINTEES = frozenset({"char", "unsigned char", "signed char", "void"})
 _INTEGER_WORDS = frozenset({"char", "short", "int", "long", "unsigned", "signed"})
-_FN_POINTER_RE = re.compile(r"\(\s*\*")
+# `int (*)(int)`, not a pointer to an array (`long (*)[16]`).
+_FN_POINTER_RE = re.compile(r"\(\s*\*[^()]*\)\s*\(")
 _ARRAY_RE = re.compile(r"\[[^\]]*\]")
 
 
@@ -279,13 +283,17 @@ def split_signature(signature: str) -> tuple[str, list[str], bool]:
 def signature_facts(m: dict) -> dict:
     """
     What the signature says about a function: its parameter types, pointer parameters (const or not,
-    from the dump's `formals`; a pointer of unknown constness counts as writable), whether it takes a
-    bounded input buffer (a const or byte pointer plus an integer) or writes one (a writable byte
-    pointer plus an integer), its pointer result and whether it is variadic. A function pointer
-    parameter is not a pointer parameter.
+    from the dump's `formals`), whether it takes a bounded input buffer (a const pointer plus an
+    integer) or writes one (a writable byte pointer plus an integer), its pointer result and whether it
+    is variadic. A function pointer parameter is not a pointer parameter. Without `formals` (a model
+    from before dump schema 3) a pointer's constness is unknown: it counts as a pointer parameter, and
+    no buffer direction is inferred.
     """
     ret, args, variadic = split_signature(str(m.get("signature") or ""))
     formals = m.get("formals") if isinstance(m.get("formals"), list) else None
+    if formals and args and str((formals[-1] or {}).get("name")) == VA_PARAMS:
+        # Frama-C's variadic translation: `f(int n, ...)` is defined as `f(int n, void * const *__va_params)`.
+        formals, args, variadic = formals[:-1], args[:-1], True
     kinds = [str((f or {}).get("kind") or "") for f in formals] if formals and len(formals) == len(args) else None
     const_ptr = mutable_ptr = byte_in = byte_out = integers = 0
     for i, arg in enumerate(args):
@@ -294,7 +302,9 @@ def signature_facts(m: dict) -> dict:
         if "*" in arg or "[" in arg:
             pointee = " ".join(_ARRAY_RE.sub(" ", arg).replace("*", " ").split())
             byte = pointee in _BYTE_POINTEES
-            if kinds and kinds[i] == "const_pointer":
+            if kinds is None:
+                mutable_ptr += 1  # constness unknown (a dump before schema 3): no buffer direction
+            elif kinds[i] == "const_pointer":
                 const_ptr += 1
                 byte_in += byte
             else:
@@ -477,8 +487,9 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
     """
     One record per path module: its sources and functions, the sources its functions' callees need
     (`required_sources`: its own files except those defining `main` or a harness entry point, plus the
-    files of the project functions it reaches in other modules), its flags (those of the units compiling
-    those sources) and its entry points (non-static functions no other function of the module calls).
+    files of the project functions its own definitions reach in other modules, through header
+    functions), its flags (those of the units compiling those sources) and its entry points
+    (non-static functions no other function of the module calls).
     """
     members: dict[str, list[str]] = defaultdict(list)
     for key, rec in functions.items():
@@ -496,7 +507,11 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
         fn_set = set(fns)
         mod_files = set(own_files.get(name, []))
         effective = (mod_files - main_files) or mod_files
-        closure, work = set(fns), list(fns)
+        # From the module's own definitions, through header functions (inline wrappers) to what they call:
+        # a header function shared by the unit is assigned to one module, and must not pull in every
+        # file its callers' modules need.
+        start = [k for k in fns if not functions[k]["header"]]
+        closure, work = set(start), list(start)
         while work:
             for callee in functions[work.pop()].get("internal_callees") or []:
                 if callee not in closure:
@@ -505,7 +520,8 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
         cross = sorted(
             k
             for k in closure - fn_set
-            if functions[k]["file"] not in mod_files
+            if not functions[k]["header"]
+            and functions[k]["file"] not in mod_files
             and functions[k]["file"] not in main_files
             and functions[k].get("name") != "main"
             and functions[k].get("name") not in HARNESS_ENTRYPOINT_NAMES
