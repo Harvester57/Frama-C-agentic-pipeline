@@ -37,7 +37,8 @@ def test_eva_invalid_in_deferred_unit_becomes_linked_candidate(run_dir):
     (cand,) = load(run_dir / "candidates.json")
     assert cand["fingerprint"] == fp
     assert cand["origin"] == "eva" and cand["proposed_verdict"] == "needs_validation"
-    assert cand["module"] == "glue"
+    # The harness that found it (the Tier 3 module has none): replay and verification go through it.
+    assert cand["module"] == "snmp"
     assert cand["linked_units"] == ["src/glue/init.c#glue_init::rte"]
     glue = units_by_id(run_dir)["src/glue/init.c#glue_init::rte"]
     assert glue["status"] == "candidate" and glue["result_fingerprints"] == [fp]

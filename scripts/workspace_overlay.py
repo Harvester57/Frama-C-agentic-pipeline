@@ -62,6 +62,7 @@ from acsl_ast import (  # noqa: E402
     tokenize_c_acsl,
     verify_acsl_only,
 )
+from fingerprint import normalize_file  # noqa: E402
 from framac_common import (  # noqa: E402
     PROVER_WALL_BUDGET_S,
     ArtifactError,
@@ -80,6 +81,7 @@ from framac_common import (  # noqa: E402
     utc_now,
     wp_model_unsound,
 )
+from module_map import ModuleMap, load_sidecars  # noqa: E402
 from resources import (  # noqa: E402
     FRAMAC_KERNEL_RESERVE_MB,
     WP_MEMLIMIT_MB,
@@ -572,10 +574,171 @@ def _prover_header(
     return holders[0] if len(holders) == 1 else resolved
 
 
+# ------------------------------------------- link units and harness sub-modules (step I5b)
+#
+# A ledger unit's `module` is a DAG module: with the Phase 0 model, a link unit (`libqcbor_a`) whose
+# harnesses are sub-modules (`harness_qcbor_main_decode.json`, sidecar `unit`). Whatever needs a
+# sidecar, a harness, a corpus or a per-harness report "for a unit" resolves it here: the unit's own
+# harness when it has one, else its sub-modules (flags and sources: their union). Without link units
+# the DAG modules are the harness modules and every helper is the identity.
+
+_MODULE_MAP_CACHE: dict[tuple, ModuleMap] = {}
+# Flags whose argument is the next word: kept together when flag strings are merged.
+_FLAGS_WITH_ARG = frozenset(
+    {"-include", "-imacros", "-isystem", "-iquote", "-idirafter", "-I", "-D", "-U", "-L", "-l", "-x", "-Xlinker"}
+)
+
+
+def _stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def module_map_for(overlay: Path) -> ModuleMap:
+    """The ModuleMap of a workspace overlay (`reports/callgraph_dag.json`, `harnesses/`), reused while unchanged."""
+    overlay = Path(overlay)
+    dag_path = overlay / "reports" / "callgraph_dag.json"
+    hdir = overlay / "harnesses"
+    sidecar_stamps = tuple((p.name, _stamp(p)) for p in sorted(hdir.glob("harness_*.json"))) if hdir.is_dir() else ()
+    key = (str(overlay.resolve()), _stamp(dag_path), sidecar_stamps)
+    mm = _MODULE_MAP_CACHE.get(key)
+    if mm is None:
+        try:
+            dag = load_json_optional(dag_path, {})
+        except ArtifactError:
+            dag = {}
+        mm = ModuleMap(dag if isinstance(dag, dict) else {}, load_sidecars(hdir))
+        _MODULE_MAP_CACHE.clear()
+        _MODULE_MAP_CACHE[key] = mm
+    return mm
+
+
+def harness_modules_of(mm: ModuleMap, module: str | None) -> list[str]:
+    """
+    The harness modules (sidecars) standing for `module`: for a DAG module, every harness of its unit
+    (its own included); for a harness module, itself. Empty when nothing has a sidecar.
+    """
+    if not module:
+        return []
+    if module in mm.modules:
+        subs = mm.submodules(module)
+        if subs:
+            return subs
+    return [module] if module in mm.sidecars else []
+
+
+def scope_keys(mm: ModuleMap, module: str) -> set[tuple[str, str]] | None:
+    """
+    (file, function) of what a sub-module harness answers for (ModuleMap.scope_functions); None
+    when the harness answers for its whole unit: a unit's own harness, any harness without link
+    units, or a sub-module whose scope comes out empty.
+    """
+    if not mm.is_submodule(module):
+        return None
+    out: set[tuple[str, str]] = set()
+    for key in mm.scope_functions(module):
+        rec = mm.functions.get(key) or {}
+        out.add((normalize_file(str(rec.get("file") or "")), str(rec.get("name") or key)))
+    return out or None
+
+
+def harness_module_for_function(
+    mm: ModuleMap, module: str | None, file: str | None = None, function: str | None = None
+) -> str | None:
+    """
+    The harness module to build, replay or read per-harness reports of on behalf of `module` (a
+    ledger unit's module): `module` itself when it is a harness module or has its own harness, else
+    the sub-module whose scope holds `file#function`, else the unit's first sub-module.
+    """
+    if not module or module not in mm.modules or module in mm.sidecars:
+        return module
+    subs = mm.submodules(module)
+    if not subs:
+        return module
+    if file and function:
+        key = (normalize_file(file), function)
+        for sub in subs:
+            scope = scope_keys(mm, sub)
+            if scope and key in scope:
+                return sub
+    return mm.harness_module_for(module) or module
+
+
+def merge_flags(values: list[str | None]) -> str:
+    """Every distinct flag (with its argument) of several flag strings, first-seen order."""
+    present = [v for v in values if v]
+    if len(set(present)) <= 1:
+        return present[0] if present else ""
+    groups: list[tuple[str, ...]] = []
+    for value in present:
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            words = value.split()
+        i = 0
+        while i < len(words):
+            group = (words[i], words[i + 1]) if words[i] in _FLAGS_WITH_ARG and i + 1 < len(words) else (words[i],)
+            i += len(group)
+            if group not in groups:
+                groups.append(group)
+    return " ".join(shlex.quote(w) for g in groups for w in g)
+
+
+def merged_sidecar(mm: ModuleMap, module: str | None) -> dict:
+    """
+    The sidecar standing for `module`: its own; for a unit with several harnesses, their union
+    (`sources`, `headers`, `cppflags`, `ldflags`; the first `header`), naming them in
+    `harness_modules`. Per-harness fields (entry function, repair counts) are not merged: use
+    `harness_modules_of` for those.
+    """
+    mods = harness_modules_of(mm, module)
+    metas = [mm.sidecars[m] for m in mods if isinstance(mm.sidecars.get(m), dict)]
+    if len(metas) <= 1:
+        return dict(metas[0]) if metas else {}
+    sources: list[str] = []
+    headers: list[str] = []
+    for meta in metas:
+        sources += [s for s in meta.get("sources") or [] if isinstance(s, str) and s not in sources]
+        headers += [h for h in meta.get("headers") or [] if isinstance(h, str) and h not in headers]
+    merged: dict[str, Any] = {
+        "module": module,
+        "harness_modules": mods,
+        "sources": sources,
+        "cppflags": merge_flags([m.get("cppflags") for m in metas]),
+        "ldflags": merge_flags([m.get("ldflags") for m in metas]),
+    }
+    header = next((m["header"] for m in metas if m.get("header")), None)
+    if header:
+        merged["header"] = header
+    if headers:
+        merged["headers"] = headers
+    return merged
+
+
+def module_param(modules_params: dict, mm: ModuleMap, module: str | None, key: str) -> list | None:
+    """
+    A list parameter of `workspace/build/params.json` for `module`: its own entry, else the union over
+    its unit's harness modules (None when no entry sets it).
+    """
+    if not module or not isinstance(modules_params, dict):
+        return None
+    own = (modules_params.get(module) or {}).get(key)
+    if own is not None:
+        return own
+    out: list | None = None
+    for sub in harness_modules_of(mm, module):
+        vals = (modules_params.get(sub) or {}).get(key)
+        if vals is not None:
+            out = [*(out or []), *(v for v in vals if v not in (out or []))]
+    return out
+
+
 def _module_header_flags(overlay: Path, module: str | None, cppflags: str | None) -> str:
     """The flags a header name is resolved with: the caller's, then the module's own."""
-    meta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {}) if module else {}
-    own = meta.get("cppflags") if isinstance(meta, dict) else None
+    own = merged_sidecar(module_map_for(overlay), module).get("cppflags") if module else None
     return " ".join(f for f in (cppflags, own) if f)
 
 
@@ -951,8 +1114,10 @@ def _run_parent_reverify(
     guard_report: dict | None = None
 
     if module and sources:
-        harness = overlay_dir / "harnesses" / f"harness_{module}.c"
-        corpus = overlay_dir / "corpus" / module
+        # A link unit is built through one of its harnesses (the one answering for `function`).
+        hmod = harness_module_for_function(module_map_for(overlay_dir), module, c_file, function) or module
+        harness = overlay_dir / "harnesses" / f"harness_{hmod}.c"
+        corpus = overlay_dir / "corpus" / hmod
         # The parent re-check must use the same reduced checks as the module's build:
         # a module fuzzed with -no-rte-initialized would otherwise re-trip the E-ACSL
         # by-value-struct initialization artifact here and be misread as code_fault.
@@ -961,7 +1126,7 @@ def _run_parent_reverify(
             import pipeline_make  # imported lazily; the overlay also works without the Make layer
 
             _plan = pipeline_make.build_plan(run_dir)
-            _eff = pipeline_make.effective_params(pipeline_make.load_params(run_dir), module, _plan.profile)
+            _eff = pipeline_make.effective_params(pipeline_make.load_params(run_dir), hmod, _plan.profile)
             rte_initialized = bool(_eff.get("fuzz_rte_initialized", True))
         except Exception:
             rte_initialized = True
@@ -969,7 +1134,7 @@ def _run_parent_reverify(
         if function:
             build_tag_items.append(function)
         build_tag = hashlib.sha256(json.dumps(build_tag_items).encode()).hexdigest()[:10]
-        safe_module = re.sub(r"[^A-Za-z0-9_.-]+", "_", module)
+        safe_module = re.sub(r"[^A-Za-z0-9_.-]+", "_", hmod)
         bin_name = f"guard_{safe_module}_{function}" if function else f"guard_{safe_module}"
         guard_bin = run_dir / "state" / "parent_guard" / f"{safe_module}-{build_tag}" / bin_name
         guard_scratch = run_dir / "agents" / agent_id / "scratch" / "parent_guard"
@@ -994,7 +1159,7 @@ def _run_parent_reverify(
             # `--opt=value`: argparse rejects a separate value that starts with '-' (e.g. `-I.`).
             f"--cppflags={cppflags}",
             "--module",
-            module,
+            hmod,
             "--no-verdict-cache",
             "--out-json",
             str(guard_json),
@@ -1197,13 +1362,29 @@ def merge_agent_overlay(
         return res
 
 
+def _load_function_facts(overlay: Path, module: str | None, c_file: str | None, function: str | None) -> dict | None:
+    """
+    A function's facts (`reports/facts/<harness module>.json`): the module's own report, then that
+    of the harness answering for the function, then those of its unit's other harnesses.
+    """
+    if not (module and c_file and function):
+        return None
+    mm = module_map_for(overlay)
+    first = harness_module_for_function(mm, module, c_file, function)
+    for name in dict.fromkeys([module, *([first] if first else []), *harness_modules_of(mm, module)]):
+        record = function_facts.load_function_facts(overlay, name, c_file, function)
+        if record is not None:
+            return record
+    return None
+
+
 def _function_frame_skeleton(
     overlay: Path, module: str | None, c_file: str | None, function: str | None
 ) -> dict | None:
     """The projected frame skeleton of `function` from the module's facts, or None (fail-open)."""
     if not (module and c_file and function):
         return None
-    record = function_facts.load_function_facts(overlay, module, c_file, function)
+    record = _load_function_facts(overlay, module, c_file, function)
     if not isinstance(record, dict):
         return None
     skel = record.get("frame_skeleton")
@@ -1222,17 +1403,26 @@ def _acsl_text_of_span(span) -> str:
 TRUST_BOUNDARY_REASON = "trust-boundary check failed"
 
 
-def _untrusted_entry_meta(overlay: Path, module: str | None) -> dict | None:
-    """The harness sidecar of `module` when its entry function is an untrusted_surface entry, else None."""
+def _untrusted_entry_metas(overlay: Path, module: str | None) -> list[dict]:
+    """
+    The harness sidecars standing for `module` (all of its unit's harnesses for a link unit) whose
+    entry function is an untrusted_surface entry. Each sidecar is read from disk, so a malformed one
+    fails the merge instead of being skipped.
+    """
     if not module:
-        return None
-    hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
-    if not isinstance(hmeta, dict) or not hmeta.get("entry_fn"):
-        return None
-    # prepare_agent treats a sidecar without `reachability` as untrusted_surface; so does this check.
-    if (hmeta.get("reachability") or "untrusted_surface") != "untrusted_surface":
-        return None
-    return hmeta
+        return []
+    names = harness_modules_of(module_map_for(overlay), module)
+    if (overlay / "harnesses" / f"harness_{module}.json").is_file() and module not in names:
+        names = [module, *names]
+    out: list[dict] = []
+    for name in names:
+        hmeta = load_json_optional(overlay / "harnesses" / f"harness_{name}.json", {})
+        if not isinstance(hmeta, dict) or not hmeta.get("entry_fn"):
+            continue
+        # prepare_agent treats a sidecar without `reachability` as untrusted_surface; so does this check.
+        if (hmeta.get("reachability") or "untrusted_surface") == "untrusted_surface":
+            out.append(hmeta)
+    return out
 
 
 def entry_trust_boundary_errors(
@@ -1334,8 +1524,8 @@ def _merge_agent_overlay_locked(
                 if len(stem_matches) == 1:
                     norm_header_file = stem_matches[0]
                 elif module:
-                    hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
-                    if isinstance(hmeta, dict) and hmeta.get("header"):
+                    hmeta = merged_sidecar(module_map_for(overlay), module)
+                    if hmeta.get("header"):
                         mod_hdr = _prover_header(
                             run_dir, shared_work, norm_c_file, function, str(hmeta["header"]), header_flags
                         )
@@ -1456,15 +1646,19 @@ def _merge_agent_overlay_locked(
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
 
-    entry_meta = _untrusted_entry_meta(overlay, module)
-    if entry_meta is not None:
+    entry_metas = _untrusted_entry_metas(overlay, module)
+    if entry_metas:
         # On an untrusted_surface entry, `requires` may state memory shape only: a value constraint on
         # attacker-controlled bytes or lengths would define the bug away (docs/v2-design.md §6).
+        # A link unit has one entry per harness: every one of them is checked.
         tb_errs: list[str] = []
-        for rel_str in changed_rels:
-            tb_errs.extend(
-                entry_trust_boundary_errors(entry_meta, rel_str, new_contents[rel_str], *texts_before[rel_str])
-            )
+        for entry_meta in entry_metas:
+            for rel_str in changed_rels:
+                for err in entry_trust_boundary_errors(
+                    entry_meta, rel_str, new_contents[rel_str], *texts_before[rel_str]
+                ):
+                    if err not in tb_errs:
+                        tb_errs.append(err)
         if tb_errs:
             raise TrustBoundaryError(
                 f"{TRUST_BOUNDARY_REASON} (untrusted_surface entry requires):\n  " + "\n  ".join(tb_errs)
@@ -1648,9 +1842,8 @@ def _enrich_batch_entry(
             if not c_file:
                 c_file = matches[0].get("file")
 
-    hmeta: dict = {}
-    if module:
-        hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
+    mm = module_map_for(overlay)
+    hmeta: dict = merged_sidecar(mm, module) if module else {}
     sources = entry.get("sources") or default_sources or hmeta.get("sources")
     cppflags = entry.get("cppflags") or default_cppflags or hmeta.get("cppflags") or "-I."
     if role == "prover" and not header_file and isinstance(hmeta, dict) and hmeta.get("header"):
@@ -1671,7 +1864,7 @@ def _enrich_batch_entry(
             if pfile.is_file():
                 try:
                     pdata = json.loads(pfile.read_text(encoding="utf-8"))
-                    wp_extra_sources = pdata.get("modules", {}).get(module, {}).get("wp_extra_sources")
+                    wp_extra_sources = module_param(pdata.get("modules", {}), mm, module, "wp_extra_sources")
                     if wp_extra_sources is not None:
                         break
                 except Exception:
@@ -2135,7 +2328,7 @@ def _prover_context(
         return "", None, {"enabled": True, "facts": False, "slice": "no_target"}
     work_dir = agent_root / "scratch" / "work"
     context_dir = agent_root / "scratch" / "context"
-    record = function_facts.load_function_facts(overlay, module, c_file, function)
+    record = _load_function_facts(overlay, module, c_file, function)
     slice_result = function_slice.build_slice(
         run_dir,
         work_dir,
@@ -2251,9 +2444,14 @@ def prepare_agent(
                     module = c["module"]
                 break
 
-    hmeta: dict = {}
-    if module:
-        hmeta = load_json_optional(overlay / "harnesses" / f"harness_{module}.json", {})
+    # A link unit's harnesses (sub-modules): their merged sidecar gives the sources and flags, and
+    # each one's entry function and reachability count (see `reachability` below).
+    mm = module_map_for(overlay)
+    hmeta: dict = merged_sidecar(mm, module) if module else {}
+    harness_names = harness_modules_of(mm, module)
+    harness_metas = [mm.sidecars[m] for m in harness_names if isinstance(mm.sidecars.get(m), dict)] or (
+        [hmeta] if hmeta else []
+    )
 
     if not norm_header:
         if norm_c_file:
@@ -2271,12 +2469,12 @@ def prepare_agent(
     scratch_sources_list: list[str] = []
     module_sources_list: list[str] = []
     merge_sources_list: list[str] = []
-    harness_name = f"harness_{module}.c" if module else ""
+    harness_files = {f"harness_{m}.c" for m in [*([module] if module else []), *harness_names]}
     for raw_s in raw_sources:
         norm_s = re.sub(r"^/framac-run/", "", (raw_s or "").replace("\\", "/").strip())
         if not norm_s:
             continue
-        if harness_name and Path(norm_s).name == harness_name:
+        if Path(norm_s).name in harness_files:
             continue
         stripped = _normalize_work_relpath(norm_s)
         is_in_work = (
@@ -2305,7 +2503,13 @@ def prepare_agent(
     else:
         norm_header = _resolve_include_header(run_dir, overlay / "work", norm_header, header_flags)
 
-    eva_report = load_json_optional(overlay / "reports" / "eva" / f"{module}.json", {}) if module else {}
+    # Eva reports are per harness: a link unit's are those of its harnesses.
+    eva_reports = [
+        rep
+        for name in dict.fromkeys([*([module] if module else []), *harness_names])
+        for rep in [load_json_optional(overlay / "reports" / "eva" / f"{name}.json", {})]
+        if isinstance(rep, dict) and rep
+    ]
     wp_report_rel: str | None = None
     wp_data: dict = {}
     if wp_report:
@@ -2315,15 +2519,15 @@ def prepare_agent(
     elif function:
         wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
 
-    unknown_obligations = []
-    if isinstance(eva_report, dict) and function:
-        raw_unknowns = eva_report.get("unknown_obligations_by_function", {}).get(function, [])
-        if norm_c_file:
-            unknown_obligations = [
-                a for a in raw_unknowns if not isinstance(a, dict) or eva_alarm_in_file(a, norm_c_file)
-            ]
-        else:
-            unknown_obligations = list(raw_unknowns)
+    unknown_obligations: list = []
+    for eva_report in eva_reports if function else []:
+        raw_unknowns = (eva_report.get("unknown_obligations_by_function") or {}).get(function, [])
+        rows = [
+            a for a in raw_unknowns if not (norm_c_file and isinstance(a, dict)) or eva_alarm_in_file(a, norm_c_file)
+        ]
+        # Another harness's report of the same unit repeats rows the first one listed.
+        seen = list(unknown_obligations)
+        unknown_obligations += [a for a in rows if a not in seen]
 
     unproven_goals = wp_data.get("unproven_goals", []) if isinstance(wp_data, dict) else []
     if not unproven_goals and unknown_obligations:
@@ -2336,19 +2540,24 @@ def prepare_agent(
         sec_props = fn_meta.get("security_properties", [])
         wave_index = fn_meta.get("wave", 0)
     elif module:
+        entry_fns = {m.get("entry_fn") for m in harness_metas if m.get("entry_fn")}
         for fn_name, fmeta in dag_fns.items():
             if fmeta.get("module") == module:
                 for sp in fmeta.get("security_properties", []):
                     if sp not in sec_props:
                         sec_props.append(sp)
-                if fmeta.get("is_entry") or fn_name == hmeta.get("entry_fn"):
+                if fmeta.get("is_entry") or fn_name in entry_fns:
                     untrusted_entries.append(fn_name)
 
-    reachability = "untrusted_surface"
-    if hmeta.get("reachability") == "internal_api":
-        reachability = "internal_api"
-    elif function and hmeta.get("entry_fn") and function != hmeta.get("entry_fn"):
-        reachability = "internal_api"
+    def _untrusted_for(meta: dict) -> bool:
+        if meta.get("reachability") == "internal_api":
+            return False
+        return not (function and meta.get("entry_fn") and function != meta.get("entry_fn"))
+
+    # Untrusted when any harness of the unit enters through this function (or names no entry).
+    reachability = (
+        "untrusted_surface" if not harness_metas or any(_untrusted_for(m) for m in harness_metas) else "internal_api"
+    )
 
     coverage_ids = [u["coverage_id"] for u in fn_units if u.get("status") not in ("out_of_scope", "not_applicable")]
 
@@ -2405,7 +2614,7 @@ def prepare_agent(
         )
         tpl = function_facts.render_conditionals(tpl, features)
         if spec_kb.enabled():
-            record = function_facts.load_function_facts(overlay, module, norm_c_file, function)
+            record = _load_function_facts(overlay, module, norm_c_file, function)
             kb_section = spec_kb.kb_section_for(overlay, record)
     replacements = {
         "{agent_id}": agent_id,

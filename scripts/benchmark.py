@@ -10,6 +10,8 @@ Host commands (stdlib only; tools run in the framac-pipeline container, so targe
   compare BASELINE CURRENT       print the differences between two runs
   baseline --run FILE            store a run as a baseline under benchmark/baselines/
   measure-llm --run-file FILE    add Phase 3 metrics after an LLM host has driven /framac-wp on a run dir
+  migrate-units --dag T=FILE     record in the manifest the link unit of each harness module (step I5b)
+  seeded [--project P]           the phase0 set: seeded-bug projects (scripts/benchmark_seeded.py)
 
 Commands that run inside the container, from the run directory (started by `run`):
   inner-phase0, inner-replay, inner-gate
@@ -620,9 +622,14 @@ def _job_wall_seconds(run_dir: Path, cls: str) -> dict[str, float]:
     return totals
 
 
-def modules_without_harness(ledger: list[dict], target: dict) -> list[str]:
-    """In-scope modules no harness covers: Eva never runs on them, so their units can only read as tool failures."""
+def modules_without_harness(ledger: list[dict], target: dict, dag: dict | None = None) -> list[str]:
+    """
+    In-scope modules no harness covers: Eva never runs on them, so their units can only read as tool
+    failures. With link units (step I5b) a harness module covers the unit it belongs to.
+    """
     harnessed = {m["name"] for m in target["modules"]}
+    unit_of = (dag or {}).get("unit_of_lexer_module") or {}
+    harnessed |= {unit_of[m] for m in harnessed if m in unit_of}
     active = {str(u.get("module")) for u in ledger if unit_bucket(u) != "excluded"}
     return sorted(active - harnessed)
 
@@ -685,7 +692,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
         ),
         "prover_tasks": summarize_queue(read_json(run_dir / "workspace" / "reports" / "wp_queue.json")),
         "units": summarize_units(ledger),
-        "modules_without_harness": modules_without_harness(ledger, target),
+        "modules_without_harness": modules_without_harness(ledger, target, dag),
         "candidates": summarize_candidates(read_json(run_dir / "candidates.json", []) or []),
         "mutation": summarize_mutation(run_dir / "workspace" / "reports" / "mutation.json"),
         "problems": problems,
@@ -914,6 +921,7 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
                 "harness": module["harness"],
                 "params": params,
                 "reach_gaps_accepted": module.get("reach_gaps_accepted"),
+                "unit": module.get("unit"),
             }
         )
     return {
@@ -1218,7 +1226,52 @@ def _harness_argv(module: dict) -> list[str]:
         argv.append("--null-terminate")
     if h.get("include_source"):
         argv.append("--include-source")
+    if module.get("unit"):
+        argv.append(f"--unit={module['unit']}")
     return argv
+
+
+def unit_of_harness_module(dag: dict, name: str) -> str | None:
+    """The link unit a manifest harness module falls in, per a DAG (None without link units or when unknown)."""
+    if dag.get("module_kind") != "link_unit":
+        return None
+    if name in (dag.get("modules") or {}):
+        return name
+    return (dag.get("unit_of_lexer_module") or {}).get(name)
+
+
+def unit_mismatches(spec_modules: list[dict], dag: dict) -> list[str]:
+    """Manifest modules whose recorded `unit` is not the one the DAG puts them in."""
+    out = []
+    for module in spec_modules:
+        want = module.get("unit")
+        got = unit_of_harness_module(dag, module["name"])
+        if want and dag.get("module_kind") == "link_unit" and got != want:
+            out.append(f"{module['name']}: manifest unit {want!r}, DAG unit {got!r}")
+    return out
+
+
+def migrate_units(manifest: dict, dags: dict[str, dict]) -> dict[str, dict[str, str]]:
+    """
+    Record each harness module's link unit (`unit`) in the manifest from a link-unit DAG of its target.
+    Harness module names do not change: a module whose name is a lexer module becomes a sub-module of
+    the unit holding its functions. Returns {target: {module: unit}} for what was recorded.
+    """
+    changed: dict[str, dict[str, str]] = {}
+    for target in manifest["targets"]:
+        dag = dags.get(target["id"])
+        if dag is None:
+            continue
+        if dag.get("module_kind") != "link_unit":
+            raise BenchmarkError(f"{target['id']}: the DAG has no link units (built without the Phase 0 model?)")
+        for module in target["modules"]:
+            unit = unit_of_harness_module(dag, module["name"])
+            if unit is None:
+                raise BenchmarkError(f"{target['id']}: module {module['name']!r} is in no link unit of the DAG")
+            if module.get("unit") != unit:
+                module["unit"] = unit
+                changed.setdefault(target["id"], {})[module["name"]] = unit
+    return changed
 
 
 def apply_reach_exemptions(spec: dict, harness_dir: Path = Path("workspace/harnesses")) -> dict:
@@ -1294,9 +1347,11 @@ def inner_phase0() -> int:
             ok = step("dag", dag_args)
         if ok:
             dag = read_json(Path("workspace/reports/callgraph_dag.json"), {}) or {}
-            known = set(dag.get("modules") or {})
+            # A harness module is a DAG module or, with link units (step I5b), a lexer module of one.
+            known = {*(dag.get("modules") or {}), *(dag.get("unit_of_lexer_module") or {})}
             result["missing_modules"] = [m["name"] for m in spec["modules"] if m["name"] not in known]
-            ok = not result["missing_modules"]
+            result["unit_mismatches"] = unit_mismatches(spec["modules"], dag)
+            ok = not result["missing_modules"] and not result["unit_mismatches"]
         if ok:
             for module in spec["modules"]:
                 ok = step(f"harness:{module['name']}", _harness_argv(module)) and ok
@@ -1351,7 +1406,7 @@ def inner_phase0() -> int:
             )
     result["ok"] = bool(ok)
     write_json(Path(BENCH_SUBDIR) / "phase0.json", result)
-    print(json.dumps({"ok": result["ok"], "missing_modules": result["missing_modules"]}))
+    print(json.dumps({k: result.get(k) for k in ("ok", "missing_modules", "unit_mismatches")}))
     return 0 if ok else 1
 
 
@@ -1897,9 +1952,34 @@ def cmd_measure_llm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_migrate_units(args: argparse.Namespace) -> int:
+    dags: dict[str, dict] = {}
+    for item in args.dag:
+        tid, sep, path = item.partition("=")
+        if not sep:
+            raise BenchmarkError(f"--dag wants TARGET=FILE, got {item!r}")
+        dag = read_json(Path(path))
+        if not isinstance(dag, dict):
+            raise BenchmarkError(f"{path}: not a DAG")
+        dags[tid] = dag
+    manifest = load_manifest(args.manifest)
+    changed = migrate_units(manifest, dags)
+    if changed and not args.dry_run:
+        Path(args.manifest).write_bytes(json.dumps(manifest, indent=1).encode("utf-8"))
+    print(json.dumps(changed, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Repeatable benchmark of the Frama-C pipeline (docs/benchmark.md).")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    # The phase0 set has its own runner and options (scripts/benchmark_seeded.py run --help).
+    sub.add_parser("seeded", help="The phase0 set: seeded-bug projects (benchmark_seeded.py run; see its --help)")
+    raw = sys.argv[1:] if argv is None else list(argv)
+    if raw[:1] == ["seeded"]:
+        import benchmark_seeded
+
+        return benchmark_seeded.main(["run", *raw[1:]])
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -1981,6 +2061,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_llm.add_argument("--out", required=True)
     p_llm.set_defaults(func=cmd_measure_llm)
+
+    p_mig = sub.add_parser(
+        "migrate-units", help="Record each harness module's link unit in the manifest, from link-unit DAGs"
+    )
+    p_mig.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    p_mig.add_argument(
+        "--dag", action="append", required=True, help="TARGET=callgraph_dag.json of a run with link units (repeatable)"
+    )
+    p_mig.add_argument("--dry-run", action="store_true")
+    p_mig.set_defaults(func=cmd_migrate_units)
 
     for name, func in (("inner-phase0", inner_phase0), ("inner-replay", inner_replay), ("inner-gate", inner_gate)):
         sub.add_parser(name, help="Container-side step, started by `run`").set_defaults(inner=func)

@@ -58,6 +58,7 @@ from framac_common import (  # noqa: E402
     wp_limits_problem,
     wp_model_unsound,
 )
+from module_map import ModuleMap  # noqa: E402
 from promote_artifact import PromotionError, promote_file, promote_seeds  # noqa: E402
 from run_wp_function import goal_obligation_class  # noqa: E402
 from validate_artifacts import (  # noqa: E402
@@ -66,6 +67,7 @@ from validate_artifacts import (  # noqa: E402
     validate_findings,
     validate_ledger,
 )
+from workspace_overlay import harness_module_for_function, scope_keys  # noqa: E402
 
 LEDGER = Path("coverage-ledger.json")
 CANDIDATES = Path("candidates.json")
@@ -342,6 +344,8 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
     modules = dag.get("modules", {})
+    # With link units (step I5b) a unit keeps its lexer module's tier until step I8 sets tiers per unit.
+    link_units = dag.get("module_kind") == "link_unit"
     resolved_profile = _resolve_seed_profile(profile, dag_path)
     added, skipped, deferred_unreached = 0, [], []
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
@@ -351,7 +355,11 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
             skipped.append(f"{file}#{name}")
             continue
         module = fn.get("module") or "unknown"
-        tier = modules.get(module, {}).get("tier") or fn.get("tier") or "unclassified"
+        if link_units:
+            tier = fn.get("tier") or modules.get(module, {}).get("tier") or "unclassified"
+        else:
+            tier = modules.get(module, {}).get("tier") or fn.get("tier") or "unclassified"
+        concurrent = link_units and bool(modules.get(module, {}).get("concurrent"))
         wave = fn.get("wave")
         # A header (static inline) function no entry point of the build reaches: deferred until a
         # harness reaches it (Eva ingest re-plans it then). Public inline API is such a function.
@@ -434,6 +442,9 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                 deferred_unreached.append(cid)
             if fn.get("callgraph_fallback"):
                 unit.setdefault("bookkeeping", {})["callgraph_fallback"] = fn["callgraph_fallback"]
+            if concurrent:
+                # The link unit starts threads: Eva and WP results assume sequential execution.
+                unit.setdefault("bookkeeping", {})["concurrent"] = True
             if fn.get("verifiability") or fn.get("wp_blockers") or fn.get("wp_notes"):
                 bk = unit.setdefault("bookkeeping", {})
                 if fn.get("verifiability"):
@@ -456,8 +467,24 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
 # ---------------------------------------------------------------- ingestion
 
 
-def _module_units(units: dict[str, dict], module: str) -> list[dict]:
-    return [u for u in units.values() if u["module"] == module and u["status"] not in NO_TOUCH]
+def _module_units(units: dict[str, dict], module: str, scope: set[tuple[str, str]] | None = None) -> list[dict]:
+    """Open units of DAG module `module`, limited to `scope` ((file, function) pairs) when given."""
+    return [
+        u
+        for u in units.values()
+        if u["module"] == module
+        and u["status"] not in NO_TOUCH
+        and (scope is None or (normalize_file(u["file"]), u["function"]) in scope)
+    ]
+
+
+def _report_scope(mm: ModuleMap, module: str) -> tuple[str, set[tuple[str, str]] | None]:
+    """
+    The DAG module (unit) a harness module's report credits and the functions it answers for: a
+    sub-module of a link unit answers for its own scope (its lexer module's functions, as its report
+    did before step I5b), a unit's own harness for the whole unit (None).
+    """
+    return mm.unit_of(module), scope_keys(mm, module)
 
 
 def fuzz_engine_note(report: dict) -> str:
@@ -479,6 +506,7 @@ def fuzz_engine_note(report: dict) -> str:
 @ledger_locked
 def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
+    mm = ModuleMap.load(".")
     stats: dict[str, Any] = {"reports": 0, "candidates": 0}
     ingested_modules: list[str] = []
     for path in paths:
@@ -487,7 +515,8 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
         status = report.get("status", "unknown")
-        mod_units = _module_units(units, module)
+        # A sub-module's campaign speaks for the functions in its scope, within its link unit.
+        mod_units = _module_units(units, *_report_scope(mm, module))
         engine_note = fuzz_engine_note(report)
 
         if status == "clean":
@@ -711,9 +740,10 @@ EVA_BLOCKING = frozenset({"invalid", "unknown", "other"})
 _EVA_ASSUMPTION_PREFIXES = ("Eva result holds", "Eva slice '")
 
 
-def _dag_line_index(dag_path: Path = DAG_REPORT) -> dict[str, list[tuple[int, int, str]]]:
+def _dag_line_index(dag_path: Path = DAG_REPORT, dag: dict | None = None) -> dict[str, list[tuple[int, int, str]]]:
     """file -> (first line, last line, function name) of every DAG function with a known extent."""
-    dag = load_json_optional(dag_path, {})
+    if dag is None:
+        dag = load_json_optional(dag_path, {})
     out: dict[str, list[tuple[int, int, str]]] = {}
     for key, rec in ((dag or {}).get("functions") or {}).items() if isinstance(dag, dict) else []:
         if not isinstance(rec, dict):
@@ -749,26 +779,34 @@ def _unit_eva_verdicts(unit: dict) -> dict:
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "candidates": 0}
-    index = _dag_line_index()
+    mm = ModuleMap.load(".")
+    index = _dag_line_index(dag=mm.dag)
     unit_names = {u["function"] for u in units.values()}
     touched: set[str] = set()
     for path in paths:
         report = load_json_strict(path)
         stats["reports"] += 1
         tool_output = rel(str(path))
+        # `module` is the report's harness module; verdicts and candidates stay keyed by it. With link
+        # units it is a unit or a sub-module of one, and its report speaks for the unit's functions.
         module = report.get("module") or path.stem
+        unit_module, scope = _report_scope(mm, module)
         report_sources = _extract_eva_report_sources(report)
 
-        def owned(u: dict, module: str = module, report_sources: set[str] | None = report_sources) -> bool:
-            if u["obligation_class"] != "rte" or u["module"] != module:
+        def owned(u: dict, unit_module: str = unit_module, report_sources: set[str] | None = report_sources) -> bool:
+            if u["obligation_class"] != "rte" or u["module"] != unit_module:
                 return False
             if report_sources and normalize_file(u["file"]) not in report_sources:
                 # A report lists the .c files it analysed; header functions are compiled into them.
                 return not normalize_file(u["file"]).endswith(".c")
             return True
 
+        def answers(u: dict, scope: set[tuple[str, str]] | None = scope) -> bool:
+            """Owned and in the harness's scope: what it records even when it analysed nothing there."""
+            return owned(u) and (scope is None or (normalize_file(u["file"]), u["function"]) in scope)
+
         if report.get("status") != "ok":
-            for u in _module_units(units, module):
+            for u in _module_units(units, unit_module, scope):
                 if owned(u):
                     add_evidence(
                         u,
@@ -845,7 +883,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 continue
             own = owned(u)
             fn = u["function"]
-            if not own and fn not in reported_fns:
+            if not answers(u) and fn not in reported_fns:
                 continue
             u_file = u["file"]
             unit_invalids = [a for a in invalid_by_fn.get(fn, []) if isinstance(a, dict) and _alarm_in_file(a, u_file)]
@@ -860,8 +898,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             else:
                 has_props = own and fn in with_props
             has_props = has_props or bool(unit_invalids or unit_unknowns or unit_deads or unit_assumed or unit_others)
-            if not own and not has_props:
-                continue  # another module's slice that never analysed this function
+            if not answers(u) and not has_props:
+                continue  # another harness's slice that never analysed this function
             if has_props and u["status"] == "deferred":
                 # A harness reaches this header function after all: it is work again.
                 u["status"] = "planned"
@@ -879,7 +917,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     fp,
                     "eva",
                     "needs_validation",
-                    u["module"] or module,
+                    # The harness module: a candidate is replayed and verified through its harness.
+                    module,
                     {"file": normalize_file(u_file), "line": int(alarm.get("line") or 0), "function": fn},
                     {"kind": alarm.get("kind") or "assertion", "predicate": alarm.get("annotation", "")},
                     [],
@@ -1003,7 +1042,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             if id(alarm) in consumed or not isinstance(alarm, dict):
                 continue
             consumed.add(id(alarm))
-            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output)
+            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output, unit_module)
             stats["candidates"] += 1
 
     # Each touched unit's Eva status, from every module's verdict: covered only when some module's
@@ -1079,13 +1118,16 @@ def _ingest_unscheduled_eva_invalid(
     alarm: dict,
     module: str,
     tool_output: str,
+    unit_module: str | None = None,
 ) -> None:
     """
     An Eva Invalid alarm no scheduled rte unit took (remediation plan H7), mirroring the fuzz path:
     a deferred (Tier 3) unit of the function is linked and becomes `candidate`; a function with no
     eligible unit (out_of_scope / not_applicable / unseeded / harness code) still gets an unlinked
-    `needs_validation` candidate rather than being dropped.
+    `needs_validation` candidate rather than being dropped. `module` is the report's harness module
+    (the candidate's), `unit_module` the DAG module it belongs to (default: the same).
     """
+    unit_module = unit_module or module
     fn = str(alarm.get("function") or "")
     alarm_file = _eva_alarm_path(alarm)
     linked_units = [
@@ -1107,7 +1149,7 @@ def _ingest_unscheduled_eva_invalid(
             fp,
             "eva",
             "needs_validation",
-            linked_units[0]["module"] or module,
+            module,
             {"file": normalize_file(u_file), "line": line, "function": fn},
             prop,
             [],
@@ -1116,7 +1158,7 @@ def _ingest_unscheduled_eva_invalid(
             # Same note the module / cross-module loops write once the unit is `candidate`, so
             # re-ingesting the report is a no-op.
             "Eva Invalid status without a concrete witness input"
-            if linked_units[0]["module"] == module
+            if linked_units[0]["module"] == unit_module
             else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
         )
         for u in linked_units:
@@ -1411,10 +1453,22 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
 
 
 def _infer_module_for_function(units: dict[str, dict], file: str, function: str) -> str:
+    """The DAG module (with link units: the unit) of a function's ledger units."""
     matched = units_for_function(units, file, function)
     if matched:
         return matched[0].get("module") or "unknown"
     return "unknown"
+
+
+def _candidate_harness_module(mm: ModuleMap, cand: dict) -> str:
+    """
+    The harness module a candidate is replayed and verified through (its sidecar, build, fuzz
+    report). Candidates name their harness module; one recorded before step I5b may name a link
+    unit instead, which resolves to the unit's harness answering for the candidate's function.
+    """
+    module = cand.get("module") or "unknown"
+    loc = cand.get("location") or {}
+    return harness_module_for_function(mm, module, loc.get("file"), loc.get("function")) or module
 
 
 def _find_matching_sink_candidate(
@@ -1462,7 +1516,11 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
     aid = res["agent_id"]
     file = normalize_file(res["file"])
     fn = res["function"]
-    mod = module or _infer_module_for_function(units, file, fn)
+    # A harness module: seeds and crashes go to its corpus, the candidate is verified through it.
+    mod = harness_module_for_function(
+        ModuleMap.load("."), module or _infer_module_for_function(units, file, fn), file, fn
+    )
+    mod = mod or "unknown"
 
     seeds_promoted: list[dict] = []
     if role == "breaker" and res.get("seeds"):
@@ -1923,7 +1981,7 @@ def cmd_ingest_verifier(
     if cand_fp not in candidates:
         raise LedgerError(f"unknown candidate_fingerprint: {cand_fp}")
     cand = candidates[cand_fp]
-    module = cand.get("module") or "unknown"
+    module = _candidate_harness_module(ModuleMap.load(run_dir), cand)
 
     reproducible_shas = _collect_reproducible_shas(
         run_dir,
@@ -2253,7 +2311,7 @@ def cmd_scaffold_verifier(
     if cand_fp not in candidates:
         raise LedgerError(f"unknown candidate_fingerprint: {cand_fp}")
     cand = candidates[cand_fp]
-    module = cand.get("module") or "unknown"
+    module = _candidate_harness_module(ModuleMap.load("."), cand)
     loc = cand.get("location") or {}
     prop = cand.get("property") or {}
 

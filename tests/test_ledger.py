@@ -887,7 +887,8 @@ def test_ingest_eva_cross_module_invalid_alarm_and_reduced_checks(run_dir):
     assert len(ieee_u["result_fingerprints"]) == 1
     cands = load(run_dir / "candidates.json")
     assert len(cands) == 1
-    assert cands[0]["module"] == "ieee754"
+    # The harness module whose slice found it: the candidate is replayed and verified through it.
+    assert cands[0]["module"] == "example"
     assert cands[0]["location"]["file"] == "src/ieee754.c"
     assert cands[0]["location"]["function"] == "IEEE754_DoubleToSingle"
     assert cands[0]["linked_units"] == ["src/ieee754.c#IEEE754_DoubleToSingle::rte"]

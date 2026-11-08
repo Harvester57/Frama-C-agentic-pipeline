@@ -17,6 +17,13 @@ records why it cannot be harnessed (`reach_exempt`, written by the `exempt`
 subcommand). Static reach over-approximates (a call behind an impossible branch
 counts); Phase 1/2 measure the dynamic reach.
 
+With link units as DAG modules (step I5b, scripts/module_map.py), a harness that is a
+sub-module of a unit answers for the unit's entry points in its scope (its lexer
+module's functions), with callees followed across the whole unit. The unit itself
+gets a row only for its Tier 1/2 entry points that lie in no harness module's scope
+(or all of them when it has no harness): each is a gap unless its lexer module (or
+the unit) is exempt in reach_exempt_modules.json, or a sidecar of the unit exempts it.
+
 Subcommands:
   check   [--module M]... [--out FILE]   gate every harnessed module (exit 1 on a gap)
   exempt  --module M [--function F] --reason R
@@ -47,6 +54,7 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 from generate_harness import _include_dirs_from_cppflags, _strip_c_comments  # noqa: E402
+from module_map import ModuleMap, load_sidecars  # noqa: E402
 
 DEFAULT_DAG = Path("workspace/reports/callgraph_dag.json")
 DEFAULT_HARNESS_DIR = Path("workspace/harnesses")
@@ -175,29 +183,38 @@ def check_module(
     sidecar: dict[str, Any],
     harness_text: str,
     include_dirs: list[Path],
+    mm: ModuleMap | None = None,
 ) -> dict[str, Any]:
     by_name = _functions_by_name(dag)
     fn_names = set(by_name)
+    unit = mm.unit_of(module) if mm is not None else module
     mod_info = (dag.get("modules") or {}).get(module) or {}
-    mod_fns = [f for f in mod_info.get("functions") or [] if isinstance(f, str)]
-    entries = [f for f in mod_info.get("candidate_entry_points") or [] if isinstance(f, str)]
-    if not entries:
-        entries = [f for f in mod_fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
+    tier = mod_info.get("tier")
+    if mm is not None and unit != module:
+        # A sub-module of a link unit: the unit's entry points in its scope, callees across the unit.
+        mod_fns = mm.scope_functions(module)
+        entries = mm.scope_entry_points(module)
+        tier = mm.tier_of(module)
+    else:
+        mod_fns = [f for f in mod_info.get("functions") or [] if isinstance(f, str)]
+        entries = [f for f in mod_info.get("candidate_entry_points") or [] if isinstance(f, str)]
+        if not entries:
+            entries = [f for f in mod_fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
 
     macros = header_macro_functions(include_dirs, fn_names)
     for alias, keys in dag_macro_aliases(dag).items():
         macros[alias] = macros.get(alias, set()) | keys
     inline_map = dag.get("header_inline_callees") or {}
     roots = harness_roots(harness_text, fn_names, macros, inline_map if isinstance(inline_map, dict) else {})
-    reached = callee_closure(roots, by_name, module)
+    reached = callee_closure(roots, by_name, unit)
 
     exempt_raw = sidecar.get("reach_exempt")
     exempt = {str(k): str(v) for k, v in exempt_raw.items()} if isinstance(exempt_raw, dict) else {}
     unreached = sorted(f for f in entries if f not in reached)
     gaps = [f for f in unreached if f not in exempt]
-    return {
+    row: dict[str, Any] = {
         "module": module,
-        "tier": mod_info.get("tier"),
+        "tier": tier,
         "harness_file": sidecar.get("harness_file"),
         "entry_points": len(entries),
         "entry_points_reached": len(entries) - len(unreached),
@@ -209,6 +226,9 @@ def check_module(
         "gaps": gaps,
         "passed": not gaps,
     }
+    if unit != module:
+        row["unit"] = unit
+    return row
 
 
 def _harness_path(sidecar: dict[str, Any], sidecar_path: Path) -> Path:
@@ -216,6 +236,96 @@ def _harness_path(sidecar: dict[str, Any], sidecar_path: Path) -> Path:
     if isinstance(declared, str) and Path(declared).is_file():
         return Path(declared)
     return sidecar_path.with_suffix(".c")
+
+
+def _is_harnessed_tier(tier: Any) -> bool:
+    return str(tier or "").startswith(HARNESSED_TIER_PREFIXES)
+
+
+def check_unit(
+    unit: str,
+    mm: ModuleMap,
+    harness_modules: list[str],
+    module_exempt: dict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    The gate row of a link unit for its Tier 1/2 entry points outside every harness module's scope
+    (all of them without a harness), or None when it has nothing to answer for: a unit-named harness
+    covers the whole unit, and Tier 3 code without a harness is deferred by design.
+    """
+    info = mm.modules.get(unit) or {}
+    tier = info.get("tier")
+    if not harness_modules and unit in module_exempt and _is_harnessed_tier(tier):
+        return {"module": unit, "tier": tier, "passed": True, "exempt": str(module_exempt[unit])}
+    if unit in harness_modules:
+        return None
+    covered: set[str] = set()
+    for h in harness_modules:
+        covered.update(mm.scope_functions(h))
+    entries = [e for e in info.get("candidate_entry_points") or [] if isinstance(e, str)]
+    lexer_of = {e: str((mm.functions.get(e) or {}).get("lexer_module") or "") for e in entries}
+
+    def fn_tier(e: str) -> Any:
+        rec = mm.functions.get(e) or {}
+        return rec.get("tier") or (mm.lexer_modules.get(lexer_of[e]) or {}).get("tier") or tier
+
+    unharnessed = [e for e in entries if e not in covered and _is_harnessed_tier(fn_tier(e))]
+    if not entries and not harness_modules and _is_harnessed_tier(tier):
+        # No API entry point to place: the whole unit needs a harness or an exemption, as a module did.
+        lexers = [str(m) for m in info.get("lexer_modules") or []]
+        if lexers and all(m in module_exempt for m in lexers):
+            return {"module": unit, "tier": tier, "passed": True, "exempt": _exempt_note(lexers, module_exempt)}
+        return {"module": unit, "tier": tier, "passed": False, "error": "no_harness"}
+    if not unharnessed:
+        return None
+    # The unit's name exempts it unless it also names one of the DAG's lexer modules (tweetnacl's
+    # executable `main` holds the lexer module `main`): that key then exempts that lexer module only.
+    unit_key = unit in module_exempt and (not harness_modules or unit not in mm.lexer_modules)
+    sidecar_exempt: dict[str, str] = {}
+    for h in harness_modules:
+        raw = (mm.sidecars.get(h) or {}).get("reach_exempt")
+        if isinstance(raw, dict):
+            for fn, why in raw.items():
+                sidecar_exempt.setdefault(str(fn), str(why))
+    exempt: dict[str, str] = {}
+    for e in unharnessed:
+        if lexer_of[e] in module_exempt:
+            exempt[e] = f"module {lexer_of[e]}: {module_exempt[lexer_of[e]]}"
+        elif unit_key:
+            exempt[e] = f"unit {unit}: {module_exempt[unit]}"
+        elif e in sidecar_exempt:
+            exempt[e] = sidecar_exempt[e]
+    gaps = [e for e in unharnessed if e not in exempt]
+    if not harness_modules:
+        if gaps:
+            return {
+                "module": unit,
+                "tier": tier,
+                "passed": False,
+                "error": "no_harness",
+                "unharnessed_entry_points": unharnessed,
+                "gaps": gaps,
+            }
+        lexers = sorted({lexer_of[e] for e in unharnessed})
+        return {"module": unit, "tier": tier, "passed": True, "exempt": _exempt_note(lexers, module_exempt, unit)}
+    return {
+        "module": unit,
+        "tier": tier,
+        "harness_modules": harness_modules,
+        "entry_points": len(entries),
+        "unharnessed_entry_points": unharnessed,
+        "exempt": exempt,
+        "gaps": gaps,
+        "passed": not gaps,
+    }
+
+
+def _exempt_note(lexers: list[str], module_exempt: dict[str, Any], unit: str | None = None) -> str:
+    """Why a unit without a harness passes: the exemptions of the lexer modules holding its entry points."""
+    parts = [f"{m}: {module_exempt[m]}" for m in lexers if m in module_exempt]
+    if unit is not None and len(parts) < len(lexers):
+        parts.append(f"{unit}: {module_exempt.get(unit, 'sidecar exemptions')}")
+    return "every entry point is in an exempt module (" + "; ".join(parts) + ")"
 
 
 def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> dict[str, Any]:
@@ -226,6 +336,8 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
     wanted = set(modules or [])
     module_exempt = load_json_optional(harness_dir / MODULE_EXEMPT_FILE, {})
     module_exempt = module_exempt if isinstance(module_exempt, dict) else {}
+    mm = ModuleMap(dag, load_sidecars(harness_dir))
+    link_units = mm.units_are_link_units
     results: list[dict[str, Any]] = []
     harnessed: set[str] = set()
     for sidecar_path in sorted(harness_dir.glob("harness_*.json")):
@@ -236,7 +348,7 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
         harnessed.add(module)
         if wanted and module not in wanted:
             continue
-        if module not in dag_modules:
+        if (mm.unit_of(module) if link_units else module) not in dag_modules:
             results.append({"module": module, "passed": True, "skipped": "module_not_in_dag"})
             continue
         harness_file = _harness_path(sidecar, sidecar_path)
@@ -246,7 +358,16 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
             results.append({"module": module, "passed": False, "error": f"harness_unreadable: {exc}"})
             continue
         include_dirs = _include_dirs_from_cppflags(str(sidecar.get("cppflags") or ""))
-        results.append(check_module(module, dag, sidecar, harness_text, include_dirs))
+        results.append(check_module(module, dag, sidecar, harness_text, include_dirs, mm=mm if link_units else None))
+    if link_units:
+        for unit in sorted(dag_modules):
+            if wanted and unit not in wanted:
+                continue
+            subs = sorted(h for h in harnessed if mm.unit_of(h) == unit)
+            row = check_unit(unit, mm, subs, module_exempt)
+            if row is not None:
+                results.append(row)
+        return _report(dag_path, results)
     for module, info in sorted(dag_modules.items()):
         if module in harnessed or (wanted and module not in wanted) or not isinstance(info, dict):
             continue
@@ -258,6 +379,10 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
             )
         else:
             results.append({"module": module, "tier": info.get("tier"), "passed": False, "error": "no_harness"})
+    return _report(dag_path, results)
+
+
+def _report(dag_path: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "generated_at": utc_now(),
         "dag": str(dag_path).replace("\\", "/"),
@@ -266,7 +391,14 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
     }
 
 
-def record_exempt(harness_dir: Path, module: str, function: str | None, reason: str) -> dict[str, Any]:
+def record_exempt(
+    harness_dir: Path, module: str, function: str | None, reason: str, dag_path: Path | None = None
+) -> dict[str, Any]:
+    """
+    Record an exemption: a whole module (a lexer module or link unit name) without `function`, else
+    one entry point in the module's sidecar. A link unit without a harness of its own records an entry
+    point it leaves unharnessed in the sidecar of its first sub-module (read from `dag_path`).
+    """
     if function is None:
         path = harness_dir / MODULE_EXEMPT_FILE
         exempt_modules = load_json_optional(path, {})
@@ -276,6 +408,10 @@ def record_exempt(harness_dir: Path, module: str, function: str | None, reason: 
         atomic_write_json(path, dict(sorted(exempt_modules.items())))
         return {"module": module, "function": None, "reason": reason}
     sidecar_path = harness_dir / f"harness_{module}.json"
+    if not sidecar_path.is_file() and dag_path is not None and dag_path.is_file():
+        stand_in = ModuleMap(load_json_strict(dag_path), load_sidecars(harness_dir)).harness_module_for(module)
+        if stand_in:
+            sidecar_path = harness_dir / f"harness_{stand_in}.json"
     sidecar = load_json_strict(sidecar_path)
     if not isinstance(sidecar, dict):
         raise ValueError(f"{sidecar_path}: not a harness sidecar object")
@@ -297,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("--out", type=Path, default=DEFAULT_OUT, help="Report path ('-' for stdout only)")
     p_ex = sub.add_parser("exempt", help="Record why an entry point cannot be harnessed")
     p_ex.add_argument("--harness-dir", type=Path, default=DEFAULT_HARNESS_DIR)
+    p_ex.add_argument("--dag", type=Path, default=DEFAULT_DAG, help="To place a link unit's exemption")
     p_ex.add_argument("--module", required=True)
     p_ex.add_argument(
         "--function", default=None, help="Entry point to exempt; omit to exempt a module without a harness"
@@ -309,7 +446,10 @@ def main(argv: list[str] | None = None) -> int:
             if not args.reason.strip():
                 raise ValueError("--reason must not be empty")
             print(
-                json.dumps(record_exempt(args.harness_dir, args.module, args.function, args.reason.strip()), indent=2)
+                json.dumps(
+                    record_exempt(args.harness_dir, args.module, args.function, args.reason.strip(), args.dag),
+                    indent=2,
+                )
             )
             return 0
         report = run_check(args.dag, args.harness_dir, args.module)

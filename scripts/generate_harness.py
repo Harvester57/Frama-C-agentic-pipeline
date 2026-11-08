@@ -60,6 +60,9 @@ _WORKSPACE_PREFIXES = (
 )
 
 
+_C_IDENT_JUNK = re.compile(r"\W")  # a module name in a C identifier
+
+
 def resolve_template_dir() -> Path:
     if DEFAULT_TEMPLATE_DIR.exists():
         return DEFAULT_TEMPLATE_DIR
@@ -1231,7 +1234,12 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
             dag = json.loads(dag_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        mod_info = ((dag.get("modules") or {}) if isinstance(dag, dict) else {}).get(module_name)
+        dag = dag if isinstance(dag, dict) else {}
+        # A sub-module of a link unit takes its unit's flags (step I5b): the build's own, which the
+        # lexer's Makefile scan can contradict.
+        modules = dag.get("modules") or {}
+        unit = (dag.get("unit_of_lexer_module") or {}).get(module_name)
+        mod_info = modules.get(module_name) or modules.get(unit) or (dag.get("lexer_modules") or {}).get(module_name)
         if not isinstance(mod_info, dict):
             continue
         for raw_flag in mod_info.get("cppflags") or []:
@@ -1245,6 +1253,21 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
 
 
 _HARNESS_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+
+
+def _infer_harness_unit(out_dir: Path, module_name: str, *snippets: str | None) -> str | None:
+    """The link unit of a new harness module, from the run's DAG (module_map.infer_unit)."""
+    from module_map import infer_unit
+
+    for dag_path in (out_dir.parent / "reports" / "callgraph_dag.json", Path("workspace/reports/callgraph_dag.json")):
+        if dag_path.is_file():
+            try:
+                dag = json.loads(dag_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            idents = sorted({i for s in snippets if s for i in _HARNESS_IDENT_RE.findall(s)})
+            return infer_unit(dag if isinstance(dag, dict) else None, module_name, idents)
+    return None
 
 
 def _resolve_overlay_source(work_dir: Path, cand: str) -> str:
@@ -1405,6 +1428,7 @@ def generate_module_harness(
     prelude_runner: Callable[..., Any] | None = None,
     ldflags: str = "",
     dispatch_cases: list[str] | None = None,
+    unit: str | None = None,
 ) -> dict[str, Any]:
     if auto_args:
         entry_style = "auto_prototype"
@@ -1591,7 +1615,7 @@ def generate_module_harness(
             break
 
     if has_main_def:
-        main_flag = f"-Dmain=__framac_module_main_{module_name}"
+        main_flag = f"-Dmain=__framac_module_main_{_C_IDENT_JUNK.sub('_', module_name)}"
         if "-Dmain=" not in norm_cppflags:
             norm_cppflags = f"{norm_cppflags} {main_flag}".strip() if norm_cppflags else main_flag
 
@@ -1637,9 +1661,17 @@ def generate_module_harness(
     # Gaps accepted at the reachability gate (harness_reach.py exempt) survive regeneration too.
     reach_exempt = previous.get("reach_exempt")
     reach_exempt = dict(reach_exempt) if isinstance(reach_exempt, dict) else {}
+    # The link unit this harness module belongs to (step I5b; scripts/module_map.py): given, kept from
+    # the previous sidecar, else inferred from the DAG. Null without link units (lexer modules).
+    unit = (
+        unit
+        or previous.get("unit")
+        or _infer_harness_unit(out_dir, module_name, entry_fn, call_expr, eva_expr, fuzz_expr, *(dispatch_cases or []))
+    )
 
     sidecar = {
         "module": module_name,
+        "unit": unit,
         "harness_file": str(harness_file).replace("\\", "/"),
         "sources": list(sources),
         "header": norm_header,
@@ -1737,6 +1769,11 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = _bind_flag_values(list(argv) if argv is not None else sys.argv[1:])
     parser = argparse.ArgumentParser(description="Generate Dual-Use Eva + E-ACSL LibFuzzer Harness.")
     parser.add_argument("--module", help="Module slice identifier (e.g. snmpv3)")
+    parser.add_argument(
+        "--unit",
+        default=None,
+        help="Link unit (DAG module) this harness belongs to when it is a sub-module (default: inferred)",
+    )
     parser.add_argument("--sources", nargs="+", help="List of C source files in the module slice")
     parser.add_argument("--header", default=None, help="Optional module header to include in harness (or 'none')")
     parser.add_argument("--entry-fn", help="Target entry function accepting (buf, len) or LLVMFuzzerTestOneInput")
@@ -1895,6 +1932,7 @@ def main(argv: list[str] | None = None) -> int:
             auto_prelude=args.auto_prelude,
             ldflags=args.ldflags,
             dispatch_cases=args.dispatch_case,
+            unit=args.unit,
         )
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

@@ -15,7 +15,7 @@ import harness_reach
 import phase0_gates
 import pipeline_make
 import validate_artifacts
-from test_harness_reach import _run_dir, _write_harness
+from test_harness_reach import _run_dir, _unit_run, _write_harness
 
 ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_MK = ROOT / "templates" / "pipeline.mk"
@@ -65,6 +65,21 @@ def test_a_partial_reach_check_updates_only_its_modules(tmp_path, monkeypatch):
     assert gates["modules"]["tools"]["passed"] is False and gates["passed"] is False
     assert phase0_gates.check(run, "api", ("reach",)) == []
     assert "tools" in phase0_gates.check(run, None, ("reach",))[0]
+
+
+@pytest.mark.unit
+def test_reach_stamp_is_per_harness_module_with_link_units(tmp_path, monkeypatch):
+    # Sub-modules are stamped under their own names; the unit's row (an unharnessed API entry point)
+    # fails the whole-run check without blocking a sub-module's own recipes.
+    harnesses = {"decode": "dec_run(); dec_peek();", "encode": "enc_run();"}
+    _, hdir = _unit_run(tmp_path, monkeypatch, harnesses, exempt={"kvtool": "cli", "kvdemo": "ex"})
+    assert _reach(tmp_path, hdir) == 1
+    gates = phase0_gates.load_gates(tmp_path)["reach"]["modules"]
+    assert gates["decode"]["passed"] and gates["decode"]["harness_digest"]
+    assert not gates["libkv_a"]["passed"] and gates["libkv_a"]["harness_digest"] is None
+    assert phase0_gates.check(tmp_path, "decode", ("reach",)) == []
+    assert "libkv_a" in phase0_gates.check(tmp_path, None, ("reach",))[0]
+    assert "u_len" in phase0_gates.check(tmp_path, "libkv_a", ("reach",))[0]
 
 
 @pytest.mark.unit

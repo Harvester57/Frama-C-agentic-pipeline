@@ -1777,6 +1777,7 @@ def build_dag(
     compile_commands_path: Path | None = None,
     emit_compile_commands: Path | None = None,
     model: dict | None = None,
+    units: bool = True,
 ) -> dict:
     target_dir = target_dir.resolve()
     threat_model_path = target_dir / "THREAT_MODEL.md"
@@ -2159,7 +2160,8 @@ def build_dag(
     }
     if model is None:
         return dag
-    return model_view(dag, model, target_dir, header_macros, compile_flags_by_file, threat_model_text)
+    held = model_view(dag, model, target_dir, header_macros, compile_flags_by_file, threat_model_text)
+    return unit_view(held, model) if units else held
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -2484,6 +2486,198 @@ def model_view(
     }
 
 
+# ---------------------------------------------------------------------------------------------------
+# Link units as modules (docs/phase0-implementation-plan.md step I5b)
+# ---------------------------------------------------------------------------------------------------
+
+_UNIT_KIND_ORDER = {"static_lib": 0, "shared_lib": 1}
+# Most to least demanding; a unit takes the most demanding tier among its lexer modules, while each
+# function keeps its own lexer module's tier (tiers change in step I8, not here).
+_TIER_RANK = ("Tier 1A", "Tier 1B", "Tier 2", "Tier 3")
+_RESERVED_MODULE_NAMES = frozenset({"tune", "tune-base"})
+
+
+def unit_module_name(unit: str) -> str:
+    """A link artifact as a module name usable in Make targets and file names: `lib/libkv.a` -> `libkv_a`."""
+    name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in Path(unit).name).strip("_") or "unit"
+    return name if name not in _RESERVED_MODULE_NAMES else f"{name}_unit"
+
+
+def _tier_rank(tier: str | None) -> int:
+    for idx, prefix in enumerate(_TIER_RANK):
+        if (tier or "").startswith(prefix):
+            return idx
+    return len(_TIER_RANK)
+
+
+_DIR_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter")
+_FORCE_INCLUDE_FLAGS = ("-include", "-imacros")
+
+
+def unit_cppflags(unit_flags: list[str], lexer_flags: list[str]) -> tuple[list[str], list[str]]:
+    """
+    A unit's compile flags, one token each, and its force-included files (`-include f` / `-imacros f`,
+    which take two tokens and so are kept apart). Flags are the build's own (`-I inc` joined to `-Iinc`;
+    `-isystem`/`-iquote`/`-idirafter` directories as `-I`), plus the include directories the lexer found
+    in the unit's lexer modules. The lexer's macro definitions are left out: they come from scanning
+    Makefiles and can contradict the build (both `-DFAST` and `-DLEGACY` from two branches of a Makefile).
+    """
+    out: list[str] = []
+    forced: list[str] = []
+    tokens = [str(t) for t in unit_flags]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok in _FORCE_INCLUDE_FLAGS and nxt is not None:
+            forced.append(nxt)
+            i += 2
+            continue
+        if tok in (*_DIR_FLAGS, "-D", "-U") and nxt is not None:
+            tok = ("-I" if tok in _DIR_FLAGS else tok) + nxt
+            i += 1
+        else:
+            for opt in _DIR_FLAGS[1:]:
+                if tok.startswith(opt) and len(tok) > len(opt):
+                    tok = "-I" + tok[len(opt) :]
+        if tok not in out:
+            out.append(tok)
+        i += 1
+    out += [f for f in dict.fromkeys(lexer_flags) if f.startswith("-I") and f not in out]
+    return out, list(dict.fromkeys(forced))
+
+
+def unit_view(dag: dict, model: dict) -> dict:
+    """
+    The model-based DAG (`model_view`) with the build's link units as its modules (step I5b):
+
+    - one module per non-test link unit, libraries first: its own sources plus those of the project
+      libraries it links (`required_sources`), its compile flags, its API entry points (exported
+      functions, `main` for an executable, and an executable's embedded API), `concurrent`;
+    - a source file belongs to the first unit that compiles it, a header function to the first unit
+      it is compiled into;
+    - each function keeps the lexer module it had (`lexer_module`) and that module's `tier`; a unit's
+      tier and run flags are the most demanding of its lexer modules' (tiers change in step I8);
+    - the lexer modules are kept under `lexer_modules`, and `unit_of_lexer_module` maps each to the
+      unit holding most of its functions. Harnesses stay per lexer module as sub-modules of a unit
+      (their sidecar's `unit`; scripts/module_map.py).
+    """
+    units = {n: u for n, u in (model.get("units") or {}).items() if not u.get("test")}
+    if not units:
+        return dag
+    order = sorted(units, key=lambda u: (_UNIT_KIND_ORDER.get(units[u].get("kind") or "", 2), u))
+    names: dict[str, str] = {}
+    for u in order:
+        base = unit_module_name(u)
+        name, n = base, 2
+        while name in names.values():
+            name, n = f"{base}_{n}", n + 1
+        names[u] = name
+    unit_of_file: dict[str, str] = {}
+    for u in order:
+        for f in units[u].get("files") or []:
+            unit_of_file.setdefault(f, u)
+
+    lexer_modules: dict[str, dict] = dag.get("modules") or {}
+    functions: dict[str, dict] = dag.get("functions") or {}
+    model_fns: dict[str, dict] = model.get("functions") or {}
+    key_of = _model_key_of(model_fns)
+
+    def home(rec: dict) -> str | None:
+        if rec["file"] in unit_of_file:
+            return unit_of_file[rec["file"]]
+        compiled_in = [u for u in order if u in set(rec.get("units") or [])]
+        return compiled_in[0] if compiled_in else None
+
+    members: dict[str, list[str]] = defaultdict(list)
+    lexer_votes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for key, rec in functions.items():
+        lexer_mod = str(rec.get("module") or "")
+        rec["lexer_module"] = lexer_mod or None
+        rec["tier"] = (lexer_modules.get(lexer_mod) or {}).get("tier") or _DEFAULT_TIER
+        u = home(rec)
+        if u is None:
+            continue  # stays in its lexer module (kept below)
+        rec["module"] = names[u]
+        members[u].append(key)
+        if lexer_mod:
+            lexer_votes[lexer_mod][names[u]] += 1
+
+    modules: dict[str, dict] = {}
+    folded: list[str] = []
+    for u in order:
+        rec = units[u]
+        name = names[u]
+        sources, seen, stack = list(rec.get("files") or []), {u}, list(rec.get("links") or [])
+        while stack:
+            lk = stack.pop()
+            if lk in seen or lk not in units:
+                continue
+            seen.add(lk)
+            sources += [f for f in units[lk].get("files") or [] if f not in sources]
+            stack += units[lk].get("links") or []
+        fns = sorted(members.get(u, []))
+        if not fns:
+            # Every source belongs to an earlier unit (x509-parser's .so builds its .a's files).
+            folded.append(f"unit {u}: compiles only sources of an earlier unit, analysed there")
+            continue
+        fn_set = set(fns)
+        lexer_names = sorted({functions[k]["lexer_module"] for k in fns if functions[k].get("lexer_module")})
+        tier_src = [lexer_modules[m] for m in lexer_names if m in lexer_modules]
+        best = min(tier_src, key=lambda m: _tier_rank(m.get("tier")), default={})
+        api = [*(rec.get("entry_points") or []), *(rec.get("embedded_api") or [])]
+        entries = [k for k in dict.fromkeys(key_of[e] for e in api if e in key_of) if k in fn_set]
+        flags, forced = unit_cppflags(
+            list(rec.get("cppflags") or []),
+            [f for m in tier_src for f in m.get("cppflags") or [] if isinstance(f, str)],
+        )
+        modules[name] = {
+            "module": name,
+            "unit": u,
+            "kind": rec.get("kind"),
+            "concurrent": bool(rec.get("concurrent")),
+            "files": sorted(f for f in sources if unit_of_file.get(f) == u),
+            "required_sources": sources,
+            "cross_module_callees": sorted(
+                {c for k in fns for c in functions[k].get("internal_callees") or [] if c not in fn_set}
+            ),
+            "external_callees": sorted({c for k in fns for c in functions[k].get("external_callees") or []}),
+            "cppflags": flags,
+            "force_includes": forced,
+            "function_count": len(fns),
+            "functions": fns,
+            "provable_functions": [k for k in fns if functions[k].get("verifiability") != "shell_unverifiable_wp"],
+            "shell_unverifiable_functions": [
+                k for k in fns if functions[k].get("verifiability") == "shell_unverifiable_wp"
+            ],
+            "candidate_entry_points": entries or [k for k in fns if not functions[k].get("is_static")],
+            "lexer_modules": lexer_names,
+            "tier": best.get("tier") or _DEFAULT_TIER,
+            "recommended_strategy": best.get("recommended_strategy"),
+            "run_wp_full": any(m.get("run_wp_full") for m in tier_src),
+            "run_eva": any(m.get("run_eva") for m in tier_src) or not tier_src,
+            "run_eacsl_fuzz": any(m.get("run_eacsl_fuzz") for m in tier_src),
+        }
+    # Functions no unit compiles (none in a successful model) keep their lexer module.
+    for key, rec in functions.items():
+        if rec["module"] not in modules:
+            base_mod = dict(lexer_modules.get(rec["module"]) or {"module": rec["module"], "tier": _DEFAULT_TIER})
+            mod = modules.setdefault(rec["module"], {**base_mod, "functions": [], "lexer_modules": [rec["module"]]})
+            mod["functions"] = sorted({*mod["functions"], key})
+            mod["function_count"] = len(mod["functions"])
+
+    return {
+        **dag,
+        "module_kind": "link_unit",
+        "warnings": [*(dag.get("warnings") or []), *folded],
+        "modules": modules,
+        "lexer_modules": lexer_modules,
+        "unit_of_lexer_module": {
+            m: sorted(v.items(), key=lambda kv: (-kv[1], kv[0]))[0][0] for m, v in sorted(lexer_votes.items())
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build Call-Graph DAG and Topological Waves for Frama-C.")
     parser.add_argument("--target", type=Path, required=True, help="Target C repository or overlay work directory")
@@ -2502,11 +2696,18 @@ def main() -> int:
         help=f"Phase 0 model (scripts/phase0_model.py) giving the functions and edges (default {DEFAULT_MODEL})",
     )
     parser.add_argument("--no-model", action="store_true", help="Lexer inventory and edges only (no model)")
+    parser.add_argument(
+        "--held-modules",
+        action="store_true",
+        help="With the model, keep the lexer's modules instead of the build's link units (step I5a's view)",
+    )
     args = parser.parse_args()
 
     model, model_note = (None, "disabled (--no-model)") if args.no_model else load_model(args.model)
     cc_path = args.compile_commands or (args.target / "compile_commands.json")
-    dag = build_dag(args.target, cc_path, emit_compile_commands=args.emit_compile_commands, model=model)
+    dag = build_dag(
+        args.target, cc_path, emit_compile_commands=args.emit_compile_commands, model=model, units=not args.held_modules
+    )
     if model_note:
         dag["warnings"] = [*dag.get("warnings", []), f"Phase 0 model not used: {model_note}"]
         print(f"warning: Phase 0 model not used: {model_note}", file=sys.stderr)
