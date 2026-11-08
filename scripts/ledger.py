@@ -334,13 +334,16 @@ def _resolve_seed_profile(profile: str | None, dag_path: Path) -> str:
     return "standard"
 
 
+HEADER_UNREACHED = "header_unreached: no entry point of the build reaches this header function"
+
+
 @ledger_locked
 def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: str | None = None) -> dict:
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
     modules = dag.get("modules", {})
     resolved_profile = _resolve_seed_profile(profile, dag_path)
-    added, skipped, skipped_unreached = 0, [], []
+    added, skipped, deferred_unreached = 0, [], []
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
         name = fn.get("name", fn_name)
         file = normalize_file(fn.get("file", ""))
@@ -350,10 +353,9 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
         module = fn.get("module") or "unknown"
         tier = modules.get(module, {}).get("tier") or fn.get("tier") or "unclassified"
         wave = fn.get("wave")
-        if fn.get("header") and not fn.get("reached", True):
-            # A static inline header function no entry point reaches: nothing the target runs.
-            skipped_unreached.append(f"{file}#{name}")
-            continue
+        # A header (static inline) function no entry point of the build reaches: deferred until a
+        # harness reaches it (Eva ingest re-plans it then). Public inline API is such a function.
+        unreached_header = bool(fn.get("header")) and not fn.get("reached", True)
         source = fn.get("callgraph_source") or callgraph_source
         in_scope = not scope or any(file == s.rstrip("/") or file.startswith(s.rstrip("/") + "/") for s in scope)
 
@@ -426,6 +428,10 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                     )
             else:
                 unit = new_unit(file, name, cls, module, tier, wave, source, "planned", None, reason)
+            if unreached_header and unit["status"] == "planned":
+                unit["status"] = "deferred"
+                unit["unresolved"] = [HEADER_UNREACHED]
+                deferred_unreached.append(cid)
             if fn.get("callgraph_fallback"):
                 unit.setdefault("bookkeeping", {})["callgraph_fallback"] = fn["callgraph_fallback"]
             if fn.get("verifiability") or fn.get("wp_blockers") or fn.get("wp_notes"):
@@ -443,7 +449,7 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
         "added_units": added,
         "total_units": len(units),
         "skipped_unsupported_names": skipped,
-        "skipped_unreached_header_functions": skipped_unreached,
+        "deferred_unreached_header_units": len(deferred_unreached),
     }
 
 
@@ -707,6 +713,16 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
         rte_units = [u for u in _module_units(units, module) if u["obligation_class"] == "rte"]
+        # Unreached header units too: Eva re-plans them when the harness reaches them after all.
+        rte_units += [
+            u
+            for u in units.values()
+            if report.get("status") == "ok"
+            and u["module"] == module
+            and u["obligation_class"] == "rte"
+            and u["status"] == "deferred"
+            and u.get("unresolved") == [HEADER_UNREACHED]
+        ]
         report_sources = _extract_eva_report_sources(report)
         if report_sources:
             # A report lists the .c files it analysed; header functions (seeded from the Phase 0 model)
@@ -792,6 +808,10 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             else:
                 has_props = fn in with_props
             has_props = has_props or bool(unit_invalids or unit_unknowns or unit_deads or unit_assumed)
+            if has_props and u["status"] == "deferred" and u.get("unresolved") == [HEADER_UNREACHED]:
+                # A harness reaches this header function after all: it is work again.
+                u["status"] = "planned"
+                u["unresolved"] = []
 
             for alarm in unit_invalids:
                 consumed.add(id(alarm))

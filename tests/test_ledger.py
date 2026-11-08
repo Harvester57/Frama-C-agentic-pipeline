@@ -561,6 +561,39 @@ def test_ingest_eva_maps_kernel_renamed_copies_to_their_unit(run_dir):
     assert unit["evidence"][-1]["result"] == "eva_unknown"
 
 
+def test_ingest_eva_replans_an_unreached_header_unit_a_harness_reaches(run_dir):
+    dag = {
+        "modules": {"m": {"tier": "Tier 1", "files": ["src/a.c"]}},
+        "functions": {
+            "get": {
+                "name": "get",
+                "file": "inc/u.h",
+                "module": "m",
+                "tier": "Tier 1",
+                "header": True,
+                "reached": False,
+            },
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
+    assert units_by_id(run_dir)["inc/u.h#get::rte"]["status"] == "deferred"
+    rep = eva_report(
+        module="m",
+        sources=["workspace/work/src/a.c"],
+        functions_with_properties=["get"],
+        functions_with_properties_by_file={"inc/u.h": ["get"]},
+        unknown_obligations=[],
+        unknown_obligations_by_function={},
+        invalid_alarms=[],
+        dead_alarms=[],
+    )
+    write_json(run_dir / "workspace/reports/eva/m.json", rep)
+    L.cmd_ingest_eva([run_dir / "workspace/reports/eva/m.json"])
+    unit = units_by_id(run_dir)["inc/u.h#get::rte"]
+    assert unit["status"] == "covered" and unit["unresolved"] == []
+
+
 def test_kernel_renames_only_map_names_without_a_unit():
     assert L._kernel_renames({"get_0", "get", "rx_1", "x_2"}, {"get", "rx_1", "x"}) == {"get_0": "get", "x_2": "x"}
 

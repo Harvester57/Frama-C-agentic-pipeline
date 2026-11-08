@@ -190,10 +190,12 @@ def test_seed_uses_the_model_view(target: Path, tmp_path: Path, monkeypatch: pyt
     units, _ = ledger.load_state()
     fns = {(u["file"], u["function"]) for u in units.values()}
     assert ("include/h.h", "hin") in fns
-    assert ("include/h.h", "hdead") not in fns
-    assert out["skipped_unreached_header_functions"] == ["include/h.h#hdead"]
-    assert ("src/a.c", "helper") in fns and ("src/b.c", "helper") in fns
     by_fn = {(u["file"], u["function"], u["obligation_class"]): u for u in units.values()}
+    dead = by_fn[("include/h.h", "hdead", "rte")]
+    assert dead["status"] == "deferred" and dead["unresolved"] == [ledger.HEADER_UNREACHED]
+    assert by_fn[("include/h.h", "hin", "rte")]["status"] == "planned"
+    assert out["deferred_unreached_header_units"] == 1
+    assert ("src/a.c", "helper") in fns and ("src/b.c", "helper") in fns
     assert by_fn[("src/a.c", "api_run", "rte")]["callgraph_source"] == "frama_c"
     other = by_fn[("src/b.c", "api_other", "rte")]
     assert other["callgraph_source"] == "gcc_callgraph"
