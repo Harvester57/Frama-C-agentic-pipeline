@@ -222,20 +222,21 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         assert errors == []
 
     def test_templates_acsl_are_pure_acsl(self, repo_root: Path) -> None:
-        """All Layer 4-6 .acsl template files contain zero executable C tokens or #includes, and external_stubs.h has zero ACSL hazards."""
+        """The Layer 3-6 MetAcsl templates (I9) contain zero executable C tokens or #includes, and external_stubs.h has zero ACSL hazards."""
         from acsl_ast import find_unsound_acsl_keywords
+        from security_props import load_template
 
         acsl_dir = repo_root / "templates" / "acsl"
-        for name in (
-            "layer4_auth_state_machine.acsl",
-            "layer5_output_sanitization.acsl",
-            "layer6_zeroization_and_taint.acsl",
-        ):
-            text = (acsl_dir / name).read_text(encoding="utf-8")
+        metacsl = sorted((repo_root / "templates" / "metacsl").glob("*.acsl"))
+        assert metacsl
+        for path in metacsl:
+            # Annotation sections are /*@ ... */ blocks; clause sections are bare predicates spliced into one.
+            sections = load_template(path.stem, path.parent).values()
+            text = "\n".join(s if s.startswith("/*@") else f"/*@ predicate _clause = {s}; */" for s in sections)
             tokens = tokenize_c_acsl(text)
             c_tokens = [t for t in tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line", "c_comment")]
-            assert c_tokens == [], f"{name} contains non-ACSL C tokens: {c_tokens[:5]}"
-            assert find_unsound_acsl_keywords(tokens, path=name) == []
+            assert c_tokens == [], f"{path.name} contains non-ACSL C tokens: {c_tokens[:5]}"
+            assert find_unsound_acsl_keywords(tokens, path=path.name) == []
 
         stubs_text = (acsl_dir / "external_stubs.h").read_text(encoding="utf-8")
         stub_tokens = tokenize_c_acsl(stubs_text)

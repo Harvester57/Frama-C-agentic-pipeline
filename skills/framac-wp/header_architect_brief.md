@@ -10,13 +10,13 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
 - **Isolated Scratch Header Path:** `agents/{agent_id}/scratch/work/{header_file}`
 - **Isolated Scratch Module Sources:** `{scratch_module_sources}`
 - **Module Harness & Fuzzer Corpus:** `workspace/harnesses/harness_{module_name}.c` and `workspace/corpus/{module_name}/` (read-only for you)
-- **Inferred Security Properties (from `callgraph_dag.json`):** `{security_properties_json}`
+- **Security Properties (Layer 2 from `callgraph_dag.json`; Layers 3–6 generated from the threat model as MetAcsl meta-properties, `workspace/reports/security_props.json`):** `{security_properties_json}`
 - **Untrusted entry functions in this header:** `{untrusted_entry_functions_json}`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
 
 ## Strict Rules
 
-1. **Pure-ACSL Header-Only Edits:** Only add ACSL `/*@ ... */` or `//@ ...` annotations inside `agents/{agent_id}/scratch/work/{header_file}`. Copy pure-ACSL predicate and ghost state blocks from `/opt/framac-pipeline/templates/acsl/layer*.acsl` directly inside `/*@ ... */` blocks. Do NOT add `#include` directives, `#ifndef` / `#define` preprocessor guards, C functions, or modify any C token (`workspace_overlay.py check-acsl-only` enforces this mechanically; shared top-level ACSL `predicate`/`logic` declarations across headers are deduplicated automatically by `merge-agent`), and never introduce `admit`, `axiom`, `axiomatic`, or `inductive`, or use C integer types (`int`, `size_t`) in `logic` signatures (use `integer`).
+1. **Pure-ACSL Header-Only Edits:** Only add ACSL `/*@ ... */` or `//@ ...` annotations inside `agents/{agent_id}/scratch/work/{header_file}`. Do NOT add `#include` directives, `#ifndef` / `#define` preprocessor guards, C functions, or modify any C token (`workspace_overlay.py check-acsl-only` enforces this mechanically; shared top-level ACSL `predicate`/`logic` declarations across headers are deduplicated automatically by `merge-agent`), and never introduce `admit`, `axiom`, `axiomatic`, or `inductive`, or use C integer types (`int`, `size_t`) in `logic` signatures (use `integer`).
 2. **Enforced Clause Order & Named Clauses:**
    - Every function contract MUST follow Frama-C's required clause ordering:
      `requires` -> `terminates` / `decreases` -> `exits` -> `assigns` -> `ensures` -> `behavior`.
@@ -27,7 +27,7 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
    - Termination and non-exit clauses (`terminates \true; exits \false;`) before `assigns`.
    - Frame conditions (`assigns \nothing;` for pure parsers/checkers, or `assigns *out_pdu;` / `assigns out_buf[0 .. cap - 1];`).
    - **Prefer conservative `ensures` over speculative postconditions:** only state `ensures` clauses that clearly hold from the implementation (such as basic return-code bounds `ensures status: \result == 0 || \result == -1;`). Avoid speculative `ensures` clauses that guess internal struct invariants before bottom-up provers verify the callees; each bottom-up function prover can strengthen or refine its own prototype contract in `{header_file}` when needed.
-   - Applicable Layer 4 (Ghost Auth State), Layer 5 (Output Sanitization), or Layer 6 (Secret Zeroization) postconditions, named `L4_*`, `L5_*`, `L6_*`. When declaring Layer 4 ghost globals in a shared `.h` header, use tentative definitions without `= 0` (`/*@ ghost int g_sec_auth_verified; */`) so multi-TU E-ACSL builds link without duplicate-symbol errors.
+   - Contracts that let the MetAcsl-generated Layer 4–6 annotations prove: an exact `assigns` for every function with an `l3_frame` property, and the `ensures` a caller needs to meet a generated `requires` (for example the gate's postcondition on the auth state for `L4_auth_required_*`). Never copy the meta-properties themselves into the header; extra layer clauses are named `L4_*`, `L5_*`, `L6_*`.
 4. **Trust boundary:** on untrusted entry functions, `requires` may state memory shape only (validity, separation, non-NULL for non-attacker pointers). Never constrain attacker-controlled values or lengths; list environment assumptions in `boundary_assumptions`.
 5. **Common Header Contract Traps (WP + E-ACSL Intersection Cheat Sheet):**
 

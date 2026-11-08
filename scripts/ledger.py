@@ -4,6 +4,7 @@ Coverage ledger, candidate, and verifier verdict management (parent-only writer)
 
 Subcommands (run with the run directory as working directory):
   seed                     --dag workspace/reports/callgraph_dag.json [--scope PATH ...]
+                           [--security-props workspace/reports/security_props.json]
   ingest-fuzz              <workspace/reports/fuzz/*.json ...>
   ingest-eva               <workspace/reports/eva/*.json ...>
   ingest-wp                <workspace/reports/wp/*.json ...> [--sweep]
@@ -18,7 +19,11 @@ Subcommands (run with the run directory as working directory):
   audit-hypotheses         [--dag workspace/reports/callgraph_dag.json]
   summary | status
 
-Units are function x obligation class (docs/v2-design.md, Section 5). Every write
+Units are function x obligation class (docs/v2-design.md, Section 5). The security classes come
+from scripts/security_props.py (step I9) when its report exists: l3_frame for every function writing
+through a pointer, and one class per MetAcsl property kind (l4_auth_state, l4_auth_required,
+l5_sanitized, l6_wiped, l6_no_leak) on the functions holding its generated annotations; each such unit
+names the properties it must discharge under `bookkeeping.security_properties`. Every write
 is validated against schemas/ before it is committed atomically; an invalid
 result is never written. Every read-modify-write holds the run-wide `ledger` lock
 (framac_common.run_lock), so concurrent containers of one run never lose updates.
@@ -74,6 +79,10 @@ CANDIDATES = Path("candidates.json")
 FINDINGS = Path("findings.json")
 
 LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame", 4: "l4_auth", 5: "l5_output", 6: "l6_secret"}
+# Step I9: classes keyed to the MetAcsl properties of scripts/security_props.py.
+SECURITY_CLASSES = ("l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
+LAYER_CLASSES = ("l4_auth", "l5_output", "l6_secret", *SECURITY_CLASSES[1:])
+DEFAULT_SECURITY_PROPS = Path("workspace/reports/security_props.json")
 UNIT_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*$")
 FN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NO_TOUCH = {"deferred", "out_of_scope", "not_applicable"}
@@ -339,10 +348,29 @@ def _resolve_seed_profile(profile: str | None, dag_path: Path) -> str:
 HEADER_UNREACHED = "header_unreached: no entry point of the build reaches this header function"
 
 
+def _load_security_obligations(path: Path | None) -> tuple[dict[str, list[dict]] | None, str]:
+    """security_props.py's obligations per `file#name`, and a status (`ok`, `absent`, `invalid`)."""
+    path = path or DEFAULT_SECURITY_PROPS
+    if not path.is_file():
+        return None, "absent"
+    data = load_json_optional(path, None)
+    if not isinstance(data, dict) or not isinstance(data.get("obligations"), dict):
+        return None, "invalid"
+    return data["obligations"], "ok"
+
+
 @ledger_locked
-def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: str | None = None) -> dict:
+def cmd_seed(
+    dag_path: Path,
+    scope: list[str],
+    callgraph_source: str,
+    profile: str | None = None,
+    security_props: Path | None = None,
+) -> dict:
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
+    obligations, sec_status = _load_security_obligations(security_props)
+    sec_matched: set[str] = set()
     modules = dag.get("modules", {})
     # With link units (step I5b) a unit keeps its lexer module's tier until step I8 sets tiers per unit.
     link_units = dag.get("module_kind") == "link_unit"
@@ -374,6 +402,15 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
             cls = LAYER_TO_CLASS.get(prop.get("layer"))
             if cls and cls not in [c for c, _ in classes]:
                 classes.append((cls, prop.get("reason", "")))
+        sec_names: dict[str, list[str]] = {}
+        for ob in (obligations or {}).get(f"{file}#{name}") or []:
+            cls = ob.get("class")
+            if cls not in SECURITY_CLASSES:
+                continue
+            sec_matched.add(f"{file}#{name}")
+            sec_names.setdefault(cls, []).append(str(ob.get("property")))
+            if cls not in [c for c, _ in classes]:
+                classes.append((cls, str(ob.get("reason") or "")))
 
         for cls, reason in classes:
             cid = unit_id(file, name, cls)
@@ -440,6 +477,8 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
                 unit["status"] = "deferred"
                 unit["unresolved"] = [HEADER_UNREACHED]
                 deferred_unreached.append(cid)
+            if sec_names.get(cls):
+                unit.setdefault("bookkeeping", {})["security_properties"] = sorted(set(sec_names[cls]))
             if fn.get("callgraph_fallback"):
                 unit.setdefault("bookkeeping", {})["callgraph_fallback"] = fn["callgraph_fallback"]
             if concurrent:
@@ -461,6 +500,11 @@ def cmd_seed(dag_path: Path, scope: list[str], callgraph_source: str, profile: s
         "total_units": len(units),
         "skipped_unsupported_names": skipped,
         "deferred_unreached_header_units": len(deferred_unreached),
+        "security_props": {
+            "status": sec_status,
+            "functions": len(sec_matched),
+            "unmatched": sorted(set(obligations or {}) - sec_matched)[:20],
+        },
     }
 
 
@@ -2685,6 +2729,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scope", action="append", default=[])
     p.add_argument("--callgraph-source", choices=["frama_c", "gcc_callgraph", "regex"], default="regex")
     p.add_argument("--profile", choices=["quick", "standard", "deep"], default=None)
+    p.add_argument(
+        "--security-props",
+        type=Path,
+        default=None,
+        help=f"scripts/security_props.py's report (default {DEFAULT_SECURITY_PROPS}, used when present)",
+    )
     for name in ("ingest-fuzz", "ingest-eva", "ingest-wp"):
         p = sub.add_parser(name)
         p.add_argument("reports", nargs="+", type=Path)
@@ -2744,7 +2794,7 @@ def main(argv: list[str] | None = None) -> int:
     out: object
     try:
         if args.cmd == "seed":
-            out = cmd_seed(args.dag, args.scope, args.callgraph_source, args.profile)
+            out = cmd_seed(args.dag, args.scope, args.callgraph_source, args.profile, args.security_props)
         elif args.cmd == "ingest-fuzz":
             out = cmd_ingest_fuzz(args.reports)
         elif args.cmd == "ingest-eva":

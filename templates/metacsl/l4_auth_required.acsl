@@ -1,0 +1,14 @@
+/*
+ * L4, auth gates: privileged functions require the authentication state.
+ * Context \precond: a `requires` on each protected function, which WP proves at every call site,
+ * so the obligation lands on the callers. A protected function no project code calls is an entry
+ * point: its external callers must pass the gate, which no proof in the target can show.
+ */
+//# global
+/*@ meta \prop, \name(${name}), \targets({${protects}}), \context(\precond),
+      ${state} != 0;
+*/
+//# formal
+/*@ meta \prop, \name(${name}), \targets({${protects}}), \context(\precond),
+      \fguard(${state} != 0);
+*/

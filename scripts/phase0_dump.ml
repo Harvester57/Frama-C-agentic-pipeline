@@ -93,8 +93,48 @@ class addr_scan = object
     Cil.DoChildren
 end
 
-(* Calls, loops, decisions and the last line of a function body, in one pass. *)
-class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) (last : int ref) = object
+(* The variable a pointer expression is based on (`p`, `p + i`, `(char * )p`), if any. *)
+let rec base_var (e : exp) =
+  match (Cil.stripCasts e).enode with
+  | Lval (Var v, NoOffset) -> Some v
+  | BinOp ((PlusPI | MinusPI), e1, _, _) -> base_var e1
+  | _ -> None
+
+(* Writes of a function body (step I9, the frame and security obligations): writes through a
+   pointer, the formals they go through, and the globals written directly. *)
+type writes = { mutable pointer : int; mutable params : string list; mutable globals : string list }
+
+let add_unique x l = if List.mem x l then l else x :: l
+
+let record_write (w : writes) ((host, _) : lval) =
+  match host with
+  | Mem e ->
+    w.pointer <- w.pointer + 1;
+    (match base_var e with
+     | Some v when v.vformal -> w.params <- add_unique v.vorig_name w.params
+     | _ -> ())
+  | Var v when v.vglob && not (is_fun_var v) -> w.globals <- add_unique v.vorig_name w.globals
+  | Var _ -> ()
+
+(* Formals with their pointer kind: `pointer` (non-const pointee: may be written), `const_pointer`. *)
+let formals_json kf =
+  let formals = try Kernel_function.get_formals kf with _ -> [] in
+  L
+    (List.map
+       (fun (v : varinfo) ->
+          let t = Ast_types.unroll v.vtype in
+          let kind =
+            if Ast_types.is_ptr t then
+              if Ast_types.C.has_qualifier "const" (Ast_types.direct_pointed_type t) then "const_pointer" else "pointer"
+            else if Ast_types.is_array t then "pointer"
+            else "value"
+          in
+          O [ ("name", S v.vorig_name); ("kind", S kind) ])
+       formals)
+
+(* Calls, loops, decisions, writes and the last line of a function body, in one pass. *)
+class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) (last : int ref) (w : writes) =
+object
   inherit Visitor.frama_c_inplace
   method! vstmt s =
     let _, l = lines (Cil_datatype.Stmt.loc s) in
@@ -108,6 +148,9 @@ class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) 
      | _ -> ());
     Cil.DoChildren
   method! vinst i =
+    (match i with
+     | Set (lv, _, _) | Call (Some lv, _, _, _) -> record_write w lv
+     | _ -> ());
     let site =
       match i with
       | Call (_, lhost, args, loc) -> Some (lhost, args, loc)
@@ -147,7 +190,9 @@ let function_json kf =
   let def_loc = Cil_datatype.Global.loc (Kernel_function.get_global kf) in
   let first, def_last = lines def_loc in
   let calls = ref [] and loops = ref 0 and decisions = ref 0 and last = ref def_last in
-  ignore (Visitor.visitFramacFunction (new body_scan calls loops decisions last) f);
+  let w = { pointer = 0; params = []; globals = [] } in
+  ignore (Visitor.visitFramacFunction (new body_scan calls loops decisions last w) f);
+  let names l = L (List.map (fun s -> S s) (List.sort compare l)) in
   O
     [ ("kernel_name", S vi.vname);
       ("name", S vi.vorig_name);
@@ -159,6 +204,8 @@ let function_json kf =
       ("signature", S (signature vi.vtype));
       ("loops", I !loops);
       ("cyclomatic", I (1 + !decisions));
+      ("formals", formals_json kf);
+      ("writes", O [ ("pointer", I w.pointer); ("params", names w.params); ("globals", names w.globals) ]);
       ("calls", L (List.rev !calls)) ]
 
 let run () =
@@ -173,12 +220,24 @@ let run () =
         if Kernel_function.is_definition kf then functions := function_json kf :: !functions
         else
           declared :=
-            O [ ("kernel_name", S vi.vname); ("name", S vi.vorig_name); ("signature", S (signature vi.vtype)) ]
+            O [ ("kernel_name", S vi.vname); ("name", S vi.vorig_name); ("signature", S (signature vi.vtype));
+                ("formals", formals_json kf) ]
             :: !declared);
     let taken = Hashtbl.fold (fun k () acc -> S k :: acc) address_taken [] in
+    (* Defined global variables, where the security properties that name them are anchored (I9). *)
+    let globals =
+      List.filter_map
+        (function
+          | GVar (vi, _, loc) when not (is_fun_var vi) ->
+            Some
+              (O [ ("name", S vi.vorig_name); ("loc", S (loc_s loc)); ("static", B (vi.vstorage = Static));
+                   ("type", S (canon vi.vtype)) ])
+          | _ -> None)
+        (Ast.get ()).globals
+    in
     let doc =
-      O [ ("schema", I 2); ("functions", L (List.rev !functions)); ("declared", L !declared);
-          ("address_taken", L taken) ]
+      O [ ("schema", I 3); ("functions", L (List.rev !functions)); ("declared", L !declared);
+          ("address_taken", L taken); ("globals", L globals) ]
     in
     let b = Buffer.create 65536 in
     write b doc;

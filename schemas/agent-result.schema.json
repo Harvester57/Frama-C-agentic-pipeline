@@ -11,7 +11,7 @@
     "text": {"type": "string", "minLength": 1, "visibleContent": true},
     "agent_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
     "relpath": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\][^\\\\]*$"},
-    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret)$"},
+    "coverage_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z0-9_]+::(rte|l2_termination|l3_frame|l4_auth|l5_output|l6_secret|l4_auth_state|l4_auth_required|l5_sanitized|l6_wiped|l6_no_leak)$"},
     "evidence_item": {
       "type": "object",
       "properties": {
@@ -146,7 +146,7 @@
             "properties": {
               "file": {"$ref": "#/definitions/relpath"},
               "function": {"$ref": "#/definitions/text"},
-              "obligation_class": {"type": "string", "enum": ["rte", "l2_termination", "l3_frame", "l4_auth", "l5_output", "l6_secret"]},
+              "obligation_class": {"type": "string", "enum": ["rte", "l2_termination", "l3_frame", "l4_auth", "l5_output", "l6_secret", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"]},
               "reason": {"$ref": "#/definitions/text"}
             },
             "required": ["file", "function", "obligation_class", "reason"],

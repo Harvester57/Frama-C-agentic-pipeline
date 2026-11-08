@@ -1,0 +1,525 @@
+{
+ "capture": "workspace/reports/build_capture.json",
+ "dump_module": {
+  "status": "ok"
+ },
+ "edges": [
+  {
+   "callee": "session.c#session_admin",
+   "caller": "session.c#session_dispatch",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  }
+ ],
+ "entry_points": [
+  "session.c#session_admin",
+  "session.c#session_close",
+  "session.c#session_copy_state",
+  "session.c#session_dispatch",
+  "session.c#session_login",
+  "session.c#session_reset",
+  "session.c#session_set_key",
+  "session.c#session_status"
+ ],
+ "entry_points_source": "build_capture",
+ "external_formals": {
+  "log_line": [
+   {
+    "kind": "const_pointer",
+    "name": "msg"
+   }
+  ]
+ },
+ "externals": [
+  "log_line"
+ ],
+ "functions": {
+  "session.c#session_admin": {
+   "address_taken": false,
+   "cyclomatic": 1,
+   "end_line": 26,
+   "external_calls": [
+    "log_line"
+   ],
+   "file": "session.c",
+   "formals": [],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_admin"
+   },
+   "line": 23,
+   "lines": 4,
+   "loops": 0,
+   "name": "session_admin",
+   "signature": "void()",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [],
+    "params": [],
+    "pointer": 0
+   }
+  },
+  "session.c#session_close": {
+   "address_taken": false,
+   "cyclomatic": 1,
+   "end_line": 57,
+   "external_calls": [],
+   "file": "session.c",
+   "formals": [],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_close"
+   },
+   "line": 54,
+   "lines": 4,
+   "loops": 0,
+   "name": "session_close",
+   "signature": "void()",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [
+     "session_open"
+    ],
+    "params": [],
+    "pointer": 0
+   }
+  },
+  "session.c#session_copy_state": {
+   "address_taken": false,
+   "cyclomatic": 1,
+   "end_line": 51,
+   "external_calls": [],
+   "file": "session.c",
+   "formals": [
+    {
+     "kind": "pointer",
+     "name": "out"
+    }
+   ],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_copy_state"
+   },
+   "line": 47,
+   "lines": 5,
+   "loops": 0,
+   "name": "session_copy_state",
+   "signature": "unsigned long(unsigned char *)",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [],
+    "params": [
+     "out"
+    ],
+    "pointer": 1
+   }
+  },
+  "session.c#session_dispatch": {
+   "address_taken": false,
+   "cyclomatic": 3,
+   "end_line": 32,
+   "external_calls": [],
+   "file": "session.c",
+   "formals": [
+    {
+     "kind": "value",
+     "name": "cmd"
+    }
+   ],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_dispatch"
+   },
+   "line": 28,
+   "lines": 5,
+   "loops": 0,
+   "name": "session_dispatch",
+   "signature": "void(int)",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [],
+    "params": [],
+    "pointer": 0
+   }
+  },
+  "session.c#session_login": {
+   "address_taken": false,
+   "cyclomatic": 7,
+   "end_line": 13,
+   "external_calls": [],
+   "file": "session.c",
+   "formals": [
+    {
+     "kind": "const_pointer",
+     "name": "pw"
+    },
+    {
+     "kind": "value",
+     "name": "n"
+    }
+   ],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_login"
+   },
+   "line": 9,
+   "lines": 5,
+   "loops": 0,
+   "name": "session_login",
+   "signature": "int(unsigned char *,unsigned long)",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of libsession.a",
+     "threat-model input source"
+    ],
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [
+     "auth_ok"
+    ],
+    "params": [],
+    "pointer": 0
+   }
+  },
+  "session.c#session_reset": {
+   "address_taken": false,
+   "cyclomatic": 1,
+   "end_line": 44,
+   "external_calls": [],
+   "file": "session.c",
+   "formals": [],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_reset"
+   },
+   "line": 40,
+   "lines": 5,
+   "loops": 0,
+   "name": "session_reset",
+   "signature": "void()",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [
+     "auth_ok",
+     "session_open"
+    ],
+    "params": [],
+    "pointer": 0
+   }
+  },
+  "session.c#session_set_key": {
+   "address_taken": false,
+   "cyclomatic": 2,
+   "end_line": 20,
+   "external_calls": [],
+   "file": "session.c",
+   "formals": [
+    {
+     "kind": "const_pointer",
+     "name": "k"
+    }
+   ],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_set_key"
+   },
+   "line": 15,
+   "lines": 6,
+   "loops": 1,
+   "name": "session_set_key",
+   "signature": "void(unsigned char *)",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [
+     "session_key",
+     "session_open"
+    ],
+    "params": [],
+    "pointer": 0
+   }
+  },
+  "session.c#session_status": {
+   "address_taken": false,
+   "cyclomatic": 2,
+   "end_line": 37,
+   "external_calls": [
+    "log_line"
+   ],
+   "file": "session.c",
+   "formals": [],
+   "header": false,
+   "included": false,
+   "inline": false,
+   "kernel_names": {
+    "libsession.a": "session_status"
+   },
+   "line": 34,
+   "lines": 4,
+   "loops": 0,
+   "name": "session_status",
+   "signature": "void()",
+   "source": "frama-c-kernel",
+   "static": false,
+   "trust": {
+    "boundary": true,
+    "reasons": [
+     "API of libsession.a"
+    ],
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "value": "untrusted"
+   },
+   "units": [
+    "libsession.a"
+   ],
+   "writes": {
+    "globals": [],
+    "params": [],
+    "pointer": 0
+   }
+  }
+ },
+ "global_variables": {
+  "session.c#auth_ok": {
+   "file": "session.c",
+   "name": "auth_ok",
+   "static": false,
+   "type": "int",
+   "units": [
+    "libsession.a"
+   ]
+  },
+  "session.c#session_key": {
+   "file": "session.c",
+   "name": "session_key",
+   "static": true,
+   "type": "unsigned char [16]",
+   "units": [
+    "libsession.a"
+   ]
+  },
+  "session.c#session_open": {
+   "file": "session.c",
+   "name": "session_open",
+   "static": true,
+   "type": "int",
+   "units": [
+    "libsession.a"
+   ]
+  }
+ },
+ "indirect_sites": [],
+ "macro_aliases": {},
+ "schema_version": 1,
+ "snapshot": {
+  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "root": "/framac-run/workspace/snapshot/root"
+ },
+ "status": "ok",
+ "thread_entries": [],
+ "tree": "/framac-scratch/tree",
+ "trust": {
+  "codeql": {
+   "status": "off"
+  },
+  "generated_at": "2026-11-08T04:16:56.433247+00:00",
+  "input_readers": [
+   "fgetc",
+   "fgets",
+   "fread",
+   "fscanf",
+   "getc",
+   "getchar",
+   "getdelim",
+   "getenv",
+   "getline",
+   "pread",
+   "read",
+   "readv",
+   "recv",
+   "recvfrom",
+   "recvmsg",
+   "scanf",
+   "secure_getenv"
+  ],
+  "summary": {
+   "boundary": 8,
+   "by_source": {
+    "untrusted:default": 7,
+    "untrusted:threat_model": 1
+   },
+   "overridden": 0,
+   "trusted": 0,
+   "untrusted": 8,
+   "with_codeql": 0
+  },
+  "threat_model": {
+   "errors": [],
+   "path": "/target/THREAT_MODEL.md",
+   "reason": null,
+   "sha256": "68359bf76b8eba002fc8dbcbd15e79fba66b5fcc08e68dfe045837dfe6f319b1",
+   "status": "ok"
+  },
+  "warnings": []
+ },
+ "units": {
+  "libsession.a": {
+   "concurrent": false,
+   "cppflags": [
+    "-std=c99"
+   ],
+   "embedded_api": [],
+   "entry_points": [
+    "session.c#session_admin",
+    "session.c#session_close",
+    "session.c#session_copy_state",
+    "session.c#session_dispatch",
+    "session.c#session_login",
+    "session.c#session_reset",
+    "session.c#session_set_key",
+    "session.c#session_status"
+   ],
+   "files": [
+    "session.c"
+   ],
+   "kind": "static_lib",
+   "links": [],
+   "parse": {
+    "job": "4e9b0ce3af52cfd7",
+    "seconds": 0.44,
+    "status": "ok"
+   },
+   "test": false,
+   "trust": {
+    "api": 8,
+    "boundary": 8,
+    "functions": 8,
+    "threat_model": "ok",
+    "untrusted": 8
+   }
+  }
+ },
+ "warnings": []
+}

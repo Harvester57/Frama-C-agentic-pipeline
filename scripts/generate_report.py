@@ -35,7 +35,19 @@ from validate_artifacts import validate_run_dir  # noqa: E402
 from workspace_overlay import map_work_to_baseline_line  # noqa: E402
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-CLASSES = ["rte", "l2_termination", "l3_frame", "l4_auth", "l5_output", "l6_secret"]
+CLASSES = [
+    "rte",
+    "l2_termination",
+    "l3_frame",
+    "l4_auth_state",
+    "l4_auth_required",
+    "l5_sanitized",
+    "l6_wiped",
+    "l6_no_leak",
+    "l4_auth",
+    "l5_output",
+    "l6_secret",
+]
 
 
 def md_escape(text: str) -> str:

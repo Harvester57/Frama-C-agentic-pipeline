@@ -376,7 +376,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I6 | L | not started |
 | I7 | M | done |
 | I8 | M | not started |
-| I9 | L | not started |
+| I9 | L | done |
 | I10 | M | not started |
 
 ## Step notes
@@ -512,6 +512,39 @@ I0 ─┬─▶ I1 ────────────────────�
   - **Header inline functions:** a public header's `static inline` functions are API only when the threat model lists them.
   - **CodeQL noise:** CodeQL facts outside the model (CMake probes) are counted as unmatched, not filtered.
   - **`known-first-party`:** `trust` and `codeql_trust` were not added to it (I6 edits `pyproject.toml`).
+
+### I9 (2026-11-08)
+
+- **Generator** (`scripts/security_props.py run`, schema `schemas/security_props.schema.json`): reads the Phase 0 model and the structured threat model (the `trust.py` lookup) and writes `workspace/reports/security_props.json`. Each property is rendered from `templates/metacsl/*.acsl` and lists its `instances`, the functions where its generated annotations land; those are the ledger units.
+  - **L3:** an `l3_frame` unit for every function that writes through a pointer (the dump's new `writes` facts, or a call to a libc memory writer).
+  - **L4:** per auth gate, `L4_auth_state_<gate>` (`\writing` on every other function: `\separated(\written, &state)`) and `L4_auth_required_<gate>` (`\precond` on the protected functions, proved at their call sites). A state rooted in a parameter uses `\tguard`/`\fguard`.
+  - **L5:** per output sink, `L5_sanitized_<sink>`: `\calling` with `\tguard(\called == sink ==> ...)`, because `\precond` on an undefined sink generates nothing. Log and terminal sinks get `L5_no_crlf` on their text parameters, other sinks get `\initialized` bytes (over `length` when given). A `buffer` sink gets a `\postcond` on its out-parameters.
+  - **L6:** per secret, `L6_wiped_<secret>` (`\postcond` of its release function, element count from `size` or `sizeof`) and `L6_no_leak_<secret>` (`\calling`: no sink argument points into it; `\reading` for sinks the target defines).
+  - **Threat model schema:** secrets gain `size` and `object`, sinks gain `length`.
+- **Model:** `phase0_dump.ml` (dump schema 3) records each function's `formals` and `writes {pointer, params, globals}`, the declared functions' formals and the globals with their types. `phase0_model.py` carries them as `formals`, `writes`, `external_formals` and `global_variables`.
+- **WP** (`run_wp_function.py --security-props`, default the run's file, `none` turns it off; `FRAMAC_SECURITY_PROPS`): writes the function's meta file, appends it and the files defining the named globals to the sources, and runs `-meta -meta-warn-key unknown-func=inactive -then-last -wp`. The report CSV drops generated assertion names, so goals are mapped back by their line in the meta file and annotated `<property>: meta:`. They are counted in the classes `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped` and `l6_no_leak` (plus `l3_frame`). The report carries `security_props`.
+- **Ledger:** `ledger.py seed --security-props` adds the classes per instance with `bookkeeping.security_properties`. The ledger, agent-result and findings schemas and `generate_report.py` know the classes. `workspace_overlay.py` puts the function's entries (annotation and what to discharge) in the prover brief. The skills are updated: `framac-slice` Step 3 runs the generator, and `framac-wp` explains the goals.
+- **Old inference retired:** `build_callgraph_dag.py`'s `infer_security_properties` now keeps only L2. This is a minimal edit, localized to that function. `templates/acsl/layer4_auth_state_machine.acsl`, `layer5_output_sanitization.acsl` and `layer6_zeroization_and_taint.acsl` were removed. Their ghost auth state, CRLF predicate and zeroization are covered by L4, L5 and L6 above. Their Eva taint idiom is dropped: no-leak is checked for direct flows only, see `docs/security-properties.md`.
+- **QCBOR asset:** the sink in `benchmark/assets/qcbor/THREAT_MODEL.md` names its out-parameter (`params: ["pEncodedCBOR"]`), and the manifest sha256 is updated.
+- **Acceptance** (fixtures `tests/fixtures/security_props/`, MetAcsl in `framac-pipeline:latest`; `FRAMAC_DOCKER_TESTS=1 pytest tests/test_security_props.py -m integration`):
+  - **Unwiped key:** `session_close` reports `l6_wiped` with 0 proven and 1 unproven, and status `unproven_goals_remain`. The ledger unit is `blocked`.
+  - **Wiped key (loop with invariants):** `l6_wiped` is proven and the status is `all_proven`. The ledger unit is `covered`.
+  - **Other fixture functions:**
+    - The extra writer of the auth state leaves `l4_auth_state` unproven, and a pointer writer proves it.
+    - The call of the protected function behind the check proves `l4_auth_required`.
+    - `l6_no_leak` proves.
+  - **Benchmarks:**
+    - **qcbor-dev:** 755 functions. The one property is `L5_sanitized_QCBOREncode_Finish`; WP generates its goal, which is unproven because the error path leaves `pEncodedCBOR` unset. There are 198 `l3_frame` functions.
+    - **minmea:** 9 `l3_frame` functions.
+    - **x509-parser:** 116 `l3_frame` functions.
+    - minmea and x509-parser declare no secrets, gates or sinks, so they get frames only.
+- **Left:**
+  - **Pipeline integration:** `benchmark.py` and the pipeline Make flow do not call `security_props.py run` yet; it is documented in the `framac-slice` skill.
+  - **L5 on literals:** `L5_no_crlf` on a string literal does not prove, even with alt-ergo, z3 and cvc5 at 10 s.
+  - **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop does.
+  - **Indirect leaks:** no-leak sees direct flows only, and copies need Eva taint.
+  - **L3 over-approximation:** a libc-writer call counts as a pointer write even when the destination is local.
+  - **Return secrets:** `return`-kind secrets give a warning and no property.
 
 ### I5a (2026-11-08)
 

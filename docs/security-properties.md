@@ -8,14 +8,16 @@ This pipeline extends Frama-C verification across **six distinct security layers
 
 ## Overview of the 6 Security Verification Layers
 
-| Layer | Security Property Class | CWE Mapping | ACSL / Frama-C Mechanism | Template File |
+| Layer | Security Property Class | CWE Mapping | ACSL / Frama-C Mechanism | Source |
 | :---: | :--- | :--- | :--- | :--- |
 | **1** | **Memory Safety & AoRTE** (Out-of-bounds read/write, integer overflow, uninitialized read, div-by-zero, null deref) | CWE-119, CWE-125, CWE-190, CWE-457, CWE-787 | `-rte` + `\valid`, `\valid_read`, `\initialized` | Built-in (`-rte`) |
 | **2** | **Availability & Anti-DoS** (Guaranteed loop & recursion termination; no zero-advance TLV loops) | CWE-835, CWE-674 | `loop variant`, `decreases` | Built-in (`/framac-wp`) |
-| **3** | **Memory Isolation & Sandboxing** (Strict side-effect footprints; parser cannot mutate global auth/config state) | CWE-471, CWE-668 | `assigns`, `loop assigns`, `\separated` | Built-in (`/framac-wp`) |
-| **4** | **Authentication & Access-Control State Machines** (No privileged PDU execution without HMAC + VACM pass) | CWE-287, CWE-285, CWE-306 | `/*@ ghost ... */` state variables & transitions | [`layer4_auth_state_machine.acsl`](../templates/acsl/layer4_auth_state_machine.acsl) |
-| **5** | **Output Grammar & Sanitization** (No CRLF log injection, delimiter breakout, or NUL truncation) | CWE-93, CWE-117, CWE-74 | Quantified character-class `ensures` predicates | [`layer5_output_sanitization.acsl`](../templates/acsl/layer5_output_sanitization.acsl) |
-| **6** | **Confidentiality, Zeroization & Non-Interference** (Key wiping on exit; XML secrets never flow to Syslog) | CWE-226, CWE-532, CWE-200 | `buffer_is_zeroed` + `-eva-domains taint` / `-inout` | [`layer6_zeroization_and_taint.acsl`](../templates/acsl/layer6_zeroization_and_taint.acsl) |
+| **3** | **Memory Isolation** (every function writing through a pointer has a proven frame) | CWE-471, CWE-668 | `assigns`, `loop assigns`, `\separated` | `scripts/security_props.py` (class `l3_frame`) |
+| **4** | **Authentication gates** (only the gate writes the auth state; privileged functions require it) | CWE-287, CWE-285, CWE-306 | MetAcsl `\writing` and `\precond` meta-properties | threat model `auth_gates`, [`templates/metacsl/l4_*.acsl`](../templates/metacsl/) |
+| **5** | **Output sanitization** (no CR/LF reaches a log or terminal sink; no uninitialized byte reaches any sink) | CWE-93, CWE-117, CWE-457, CWE-200 | MetAcsl `\calling` (writers) or `\postcond` (buffer sinks) | threat model `output_sinks`, [`templates/metacsl/l5_sanitized.acsl`](../templates/metacsl/l5_sanitized.acsl) |
+| **6** | **Secrets** (wiped when released; never handed to or read by an output sink) | CWE-226, CWE-532, CWE-200 | MetAcsl `\postcond`, `\calling` and `\reading` | threat model `secrets`, [`templates/metacsl/l6_*.acsl`](../templates/metacsl/) |
+
+Layers 3 to 6 come from what the structured threat model (the `framac-threat-model` block of `THREAT_MODEL.md`, `schemas/threat_model.schema.json`) requires, not from patterns in the code (plan step I9). `scripts/security_props.py run` turns it into MetAcsl meta-properties, each with the functions that hold its generated annotations; those are the ledger units (`l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped`, `l6_no_leak`). `run_wp_function.py` loads the properties of the function under proof and runs `-meta -then-last -wp`, so a prover discharges the generated `assert`, `requires` and `ensures` named `<property>: meta:` like any other goal. Without a threat model only Layer 3 is generated.
 
 ---
 
@@ -44,43 +46,39 @@ If `ber_decode_element` can return `0` and the caller forgets `if (consumed == 0
 
 ## Layer 3: Strict Memory Isolation (`assigns` & `\separated`)
 
-A parser function should never be able to overwrite global configuration state or alias its output struct with its input packet buffer.
-By requiring `assigns *pdu_out;` and `requires \separated(buf + (0 .. len - 1), pdu_out);` on `snmpv3_parse_pdu()`, WP proves across the entire call tree beneath `snmpv3_parse_pdu()` that **no global variable, static state, or unrelated heap object can be mutated**.
+Every function that writes through a pointer (the Phase 0 dump records the writes, and a call to a libc writer such as `memcpy` counts) gets an `l3_frame` unit: its contract needs an `assigns` clause naming exactly what it writes, which WP proves. A parser with `assigns *pdu_out;` and `requires \separated(buf + (0 .. len - 1), pdu_out);` cannot mutate global configuration state or alias its output with its input.
 
 ---
 
-## Layer 4: Authentication & Protocol State Machines (`ghost` Variables)
+## Layer 4: Authentication Gates
 
-Using [`../templates/acsl/layer4_auth_state_machine.acsl`](../templates/acsl/layer4_auth_state_machine.acsl), security state transitions are tracked via ACSL ghost variables (`g_sec_auth_verified` and `g_sec_acl_authorized`), which have **zero runtime cost in production builds** (since they live inside `/*@ ... */` comments) but are:
-1. **Compiled into active C assertions during `E-ACSL + LibFuzzer` runs**, turning any authentication bypass path into an immediate `SIGABRT` crash for the fuzzer.
-2. **Checked across all control-flow paths by `Frama-C WP`**, proving mathematically that `snmpv3_execute_pdu()` cannot be invoked on an `authPriv` or `authNoPriv` packet unless both `snmpv3_usm_verify_hmac()` and `snmpv3_vacm_check_access()` returned `0` (`SUCCESS`) on the current packet.
+An auth gate `{"function": "login", "state": "auth_ok", "protects": ["admin"]}` becomes two meta-properties:
 
----
-
-## Layer 5: Output Grammar & Sanitization Invariants
-
-Using [`../templates/acsl/layer5_output_sanitization.acsl`](../templates/acsl/layer5_output_sanitization.acsl), emitters such as Syslog RFC 5424 formatters are annotated with quantified output grammar contracts:
 ```c
-/*@
-  requires out_cap > 0 && \valid(out_buf + (0 .. out_cap - 1));
-  requires \valid_read(msg + (0 .. msg_len - 1));
-  requires \separated(out_buf + (0 .. out_cap - 1), msg + (0 .. msg_len - 1));
-  assigns out_buf[0 .. out_cap - 1];
-  ensures 0 <= \result < out_cap;
-  ensures no_crlf_or_nul(out_buf, \result);
-  ensures syslog_sd_value_escaped(out_buf, \result);
+/*@ meta \prop, \name(L4_auth_state_login), \targets(\diff(\ALL, {login})), \context(\writing),
+      \separated(\written, &auth_ok);
+    meta \prop, \name(L4_auth_required_login), \targets({admin}), \context(\precond),
+      auth_ok != 0;
 */
-size_t syslog_format_sd_param(char *out_buf, size_t out_cap, const char *msg, size_t msg_len);
 ```
-- **In `WP`:** Proves no byte in `out_buf[0 .. \result - 1]` can ever equal `\r`, `\n`, `\0`, or an unescaped `]` / `"`.
-- **In `E-ACSL + LibFuzzer`:** The universal quantifier `\forall integer k; 0 <= k < \result` is compiled into a fast bounded C verification loop at function exit, allowing LibFuzzer to hunt for escaping edge cases automatically.
+
+MetAcsl puts an assertion before every write of every other function (a write of `auth_ok` outside the gate becomes `\false`), and a `requires` on `admin` that WP proves at each call site. A state that hangs off a parameter (`ctx->authed`) is checked in the functions that have that parameter.
 
 ---
 
-## Layer 6: Secret Zeroization & Information Flow (`Taint`)
+## Layer 5: Output Sanitization
 
-Using [`../templates/acsl/layer6_zeroization_and_taint.acsl`](../templates/acsl/layer6_zeroization_and_taint.acsl):
-1. **Zeroization on All Exit Paths:**
-   Adding `ensures buffer_is_zeroed(ctx->priv_key, KEY_LEN);` forces WP to verify that even when an early `if (err) return -1;` branch is taken, transient key material is scrubbed before the function returns.
-2. **Non-Interference / Taint Tracking (`-eva-domains taint`):**
-   Marking sensitive XML configuration fields with `//@ taint cfg->usm_priv_key[0 .. 31];` and asserting `//@ assert !\tainted(syslog_buf[0 .. pkt_len - 1]);` at the Syslog network sink guarantees that secret credentials never leak into diagnostic log packets.
+An output sink is checked where data reaches it. For a `log` or `terminal` sink, each text parameter must hold no CR or LF before its terminating NUL (`L5_no_crlf`, log injection); for the other kinds, every byte handed over must be initialized (with the sink's `length` parameter, else the object pointed to). These are `\calling` properties, so they also hold for a sink the target only declares (`syslog`, `send`). A `buffer` sink (the output is returned in an out-parameter, like `QCBOREncode_Finish`) gets a postcondition: its out-parameters are initialized when it returns.
+
+Output grammars specific to a format (RFC 5424 structured-data escaping, delimiter breakout) are not generated: a prover adds them as named `L5_*` clauses where the threat model calls for them.
+
+---
+
+## Layer 6: Secrets
+
+A secret `{"name": "session_key", "kind": "global", "function": "session_close"}` becomes:
+
+1. **`L6_wiped_session_key`:** a postcondition of the release function: every element is zero when it returns, on every path (`size` sets the element count of a pointer secret; arrays default to `sizeof`). A `memset` the compiler may drop as a dead store still proves: use `explicit_bzero` or a volatile write in the code.
+2. **`L6_no_leak_session_key`:** at every call of an output sink, no argument points into the secret (`\calling`), and a sink the target defines never reads it (`\reading`).
+
+The no-leak check sees direct flows only. A copy of the secret into a buffer that later reaches a sink needs Eva's taint domain (`-eva-domains taint`, `//@ taint ...;` at the source and `//@ assert !\tainted(...);` at the sink, or the upstream `__fc_private` / `security_status` idiom vendored in `docs/upstream/sources/`), which the pipeline does not generate.

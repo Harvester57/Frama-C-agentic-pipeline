@@ -1,0 +1,16 @@
+/*
+ * L6, secrets: wiped before release. A postcondition of the release function (the secret's
+ * `function` in the threat model): every element of the secret is zero when it returns, on every
+ * path. A wipe the compiler may remove (memset of a dead buffer) still proves here: pair it with
+ * explicit_bzero or a volatile write in the code.
+ *   array   `count` elements: the threat model's `size`, else sizeof(x) / sizeof(x[0])
+ *   scalar  a global scalar
+ */
+//# property
+/*@ meta \prop, \name(${name}), \targets({${function}}), \context(\postcond),
+      ${predicate};
+*/
+//# array
+\fguard(\forall integer i; 0 <= i < ${count} ==> ${lv}[i] == 0)
+//# scalar
+\fguard(${lv} == 0)

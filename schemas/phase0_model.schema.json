@@ -2,6 +2,16 @@
   "$comment": "Contract for workspace/reports/phase0_model.json, written by scripts/phase0_model.py run (plan step I3). Function ids are `file#name`, the file relative to the target root. Every function, edge and alias carries its source.",
   "type": "object",
   "definitions": {
+    "formals": {
+      "$comment": "Step I9: a function's parameters; kind `pointer` (the pointee may be written: non-const pointer or array), `const_pointer` or `value`.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "kind": {"type": "string", "enum": ["pointer", "const_pointer", "value"]}},
+        "required": ["name", "kind"],
+        "additionalProperties": false
+      }
+    },
     "function_trust": {
       "$comment": "Step I7 (scripts/trust.py): value, the deciding rule, every rule marking it untrusted, whether attacker data reaches its parameters directly, and why.",
       "type": "object",
@@ -96,6 +106,18 @@
           "cyclomatic": {"type": ["integer", "null"], "minimum": 1},
           "address_taken": {"type": "boolean"},
           "source": {"type": "string", "enum": ["frama-c-kernel", "gcc-callgraph-info"]},
+          "formals": {"$ref": "#/definitions/formals"},
+          "writes": {
+            "$comment": "Step I9: writes of its body: through a pointer (count), the formals they go through, globals written directly",
+            "type": "object",
+            "properties": {
+              "pointer": {"type": "integer", "minimum": 0},
+              "params": {"type": "array", "items": {"type": "string"}},
+              "globals": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["pointer", "params", "globals"],
+            "additionalProperties": false
+          },
           "external_calls": {"$comment": "functions it calls that no unit of its program defines (libc, packages)", "type": "array", "items": {"type": "string"}},
           "trust": {"$ref": "#/definitions/function_trust"}
         },
@@ -136,6 +158,23 @@
       }
     },
     "externals": {"type": "array", "items": {"type": "string"}},
+    "external_formals": {"$comment": "Step I9: the formals of external functions, from their prototypes", "type": "object", "additionalProperties": {"$ref": "#/definitions/formals"}},
+    "global_variables": {
+      "$comment": "Step I9: defined global variables, `file#name`, where security properties naming them are anchored",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "file": {"type": "string"},
+          "static": {"type": "boolean"},
+          "type": {"$comment": "the canonical C type (typedefs unrolled, qualifiers dropped)", "type": "string"},
+          "units": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["name", "file", "static", "units"],
+        "additionalProperties": false
+      }
+    },
     "macro_aliases": {
       "type": "object",
       "additionalProperties": {

@@ -176,12 +176,7 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
    - **In-repository callees (`cross_module_callees`):** Compile the sibling `.c` files listed in `required_sources` together in the slice rather than stubbing them, so call chains into sibling modules remain reachable for fuzzing, Eva, and WP.
    - **True external library calls (`external_callees`):** Under Frama-C (`__FRAMAC__`), external functions **must remain bodyless prototypes** (declared in real target headers, `/opt/framac-pipeline/templates/fc_stubs/` for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, or `/opt/framac-pipeline/templates/acsl/external_stubs.h`) with optional ACSL contracts (`requires`, `assigns`, `ensures`). **Never** give an external function a dummy C body like `{ return 0; }` under Frama-C: a C body hides the open assumption from the ledger (`Considered valid` / `STATUS_ASSUMED`) and makes callers falsely appear proven under `return 0;`.
    - **Network/IPC boundary stubs for dynamic fuzzing:** If a module reads input through a blocking socket/port helper (e.g., `RECEIVE_MESSAGE`), put `extern` declarations in a `.h` file and function definitions in a single `.c` file (never define functions in a force-included header across multiple TUs), and inject `fuzz_buf` on **every** call (never gate injection on a `static int calls` counter, which would block all LibFuzzer iterations after the first).
-2. Inspect each function's `security_properties` array and attach the corresponding template headers from `/opt/framac-pipeline/templates/acsl/`:
-   - `layer4_auth_state_machine.acsl` for authentication / access-control gates (`g_sec_auth_verified`, `g_sec_acl_authorized`).
-   - `layer5_output_sanitization.acsl` for structured output formatters (`no_crlf_or_nul`, `is_printable_ascii`).
-   - `layer6_zeroization_and_taint.acsl` for key/secret zeroization (`buffer_is_zeroed`) and Eva taint annotations.
-
-   Name every layer clause `L4_*`, `L5_*`, or `L6_*` (for example `ensures L5_no_crlf: no_crlf_or_nul(out, \result);`). Unnamed clauses cannot be credited to a layer unit.
+2. Generate the Layer 3–6 properties from the threat model before seeding the ledger: `python3 /opt/framac-pipeline/scripts/security_props.py run` (reads `workspace/reports/phase0_model.json` and the target's `THREAT_MODEL.md`, writes `workspace/reports/security_props.json`), then `ledger.py seed ... --security-props workspace/reports/security_props.json`. Auth gates, output sinks and secrets become MetAcsl meta-properties (`templates/metacsl/`) whose generated annotations are ledger units; nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. See [security-properties.md](../../docs/security-properties.md).
 
 ---
 

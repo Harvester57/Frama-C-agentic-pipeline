@@ -1,0 +1,16 @@
+/*
+ * L4, auth gates: only the gate function writes the authentication state.
+ * Context \writing over every function but the gate: before each write, the written location is
+ * separated from the state. A helper the gate delegates the write to must be a gate of its own.
+ *   global  the state is a global lvalue (`auth_ok`, `session.authed`): program-wide
+ *   formal  the state hangs off a parameter (`ctx->authed`): checked in the functions that have a
+ *           parameter of that name (\tguard: \true elsewhere)
+ */
+//# global
+/*@ meta \prop, \name(${name}), \targets(\diff(\ALL, {${gate}})), \context(\writing),
+      \separated(\written, &${state});
+*/
+//# formal
+/*@ meta \prop, \name(${name}), \targets(\diff(\ALL, {${gate}})), \context(\writing),
+      \tguard(\separated(\written, &${state}));
+*/

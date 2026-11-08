@@ -103,6 +103,8 @@ _SELFTEST_FILES = {
         "int twice(int x) { return 2 * x; }\n"
         "int apply(int (*f)(int), int x) { return f(x); }\n"
         "int run_a(int x) { return apply(twice, helper(x)); }\n"
+        "int counter;\n"
+        "void fill(int *p, int n) { for (int i = 0; i < n; i++) p[i] = 0; counter++; }\n"
     ),
     "b.c": (
         "static int helper(int x) { return x - 1; }\n"
@@ -126,6 +128,21 @@ def tree_rel(path: str, tree: str) -> str | None:
         return None
     p = path if posixpath.isabs(path) else posixpath.join(tree, path)
     return bc.tree_rel(posixpath.normpath(p), tree)
+
+
+def _body_facts(fn: dict) -> dict:
+    """The dump's formals and writes (schema 3, step I9), when the dump module recorded them."""
+    out: dict[str, Any] = {}
+    if isinstance(fn.get("formals"), list):
+        out["formals"] = fn["formals"]
+    w = fn.get("writes")
+    if isinstance(w, dict):
+        out["writes"] = {
+            "pointer": int(w.get("pointer") or 0),
+            "params": list(w.get("params") or []),
+            "globals": list(w.get("globals") or []),
+        }
+    return out
 
 
 def parse_location(loc: str) -> tuple[str, int] | None:
@@ -405,6 +422,9 @@ class ModelBuilder:
         self.globals: dict[str, dict[str, str]] = defaultdict(dict)
         self.taken: dict[str, set[str]] = defaultdict(set)
         self.pending_calls: list[tuple[str, str, dict]] = []  # (unit, caller id, call)
+        # Step I9: defined global variables (`file#name`) and the formals of declared functions.
+        self.global_vars: dict[str, dict] = {}
+        self.declared_formals: dict[str, list] = {}
 
     def add_function(self, fid: str, unit: str, record: dict) -> None:
         rec = self.functions.get(fid)
@@ -450,10 +470,30 @@ class ModelBuilder:
                         "cyclomatic": int(fn.get("cyclomatic") or 1),
                         "address_taken": False,
                         "source": SOURCE_FRAMAC,
+                        **_body_facts(fn),
                     },
                 )
                 if not fn.get("static"):
                     self.globals[u].setdefault(fn["name"], fid)
+        for g in dump.get("globals") or []:
+            gloc = parse_location(g.get("loc", ""))
+            grel = tree_rel(gloc[0], self.tree) if gloc else None
+            # `__fc_*`: Frama-C's own globals (string literals), not the project's.
+            if grel is not None and g.get("name") and not str(g["name"]).startswith("__fc_"):
+                rec = self.global_vars.setdefault(
+                    f"{grel}#{g['name']}",
+                    {
+                        "name": g["name"],
+                        "file": grel,
+                        "static": bool(g.get("static")),
+                        "type": str(g.get("type") or ""),
+                        "units": [],
+                    },
+                )
+                rec["units"] = sorted(set(rec["units"]) | set(units))
+        for d in dump.get("declared") or []:
+            if d.get("name") and d.get("formals") is not None:
+                self.declared_formals.setdefault(d["name"], d["formals"])
         for k in dump.get("address_taken") or []:
             if k in kmap:
                 self.functions[kmap[k]]["address_taken"] = True
@@ -707,6 +747,10 @@ def build_model(
         ],
         indirect_sites=sorted(builder.indirect_sites, key=lambda s: (s["caller"], s.get("loc") or "")),
         externals=sorted(builder.externals),
+        external_formals={
+            n: builder.declared_formals[n] for n in sorted(builder.externals) if n in builder.declared_formals
+        },
+        global_variables=dict(sorted(builder.global_vars.items())),
         macro_aliases=builder.aliases(defines),
         entry_points=sorted({e for u in units_out.values() if not u.get("test") for e in u.get("entry_points") or []}),
         entry_points_source="build_capture",
@@ -773,7 +817,7 @@ def selftest(runner: Runner | None = None) -> dict:
         )
         builder.add_dump(["selftest"], res["dump"])
         builder.resolve()
-    want_fns = {"a.c#helper", "b.c#helper", "a.c#twice", "a.c#apply", "a.c#run_a", "b.c#run_b"}
+    want_fns = {"a.c#helper", "b.c#helper", "a.c#twice", "a.c#apply", "a.c#run_a", "b.c#run_b", "a.c#fill"}
     edges = {(a, b, k) for (a, b, k) in builder.edges}
     want_edges = {
         ("a.c#run_a", "a.c#helper", "direct"),
@@ -788,6 +832,11 @@ def selftest(runner: Runner | None = None) -> dict:
         problems.append(f"edges missing {sorted(want_edges - edges)}")
     if loops != 1:
         problems.append(f"run_b loops {loops}")
+    writes = builder.functions.get("a.c#fill", {}).get("writes") or {}
+    if writes.get("params") != ["p"] or writes.get("globals") != ["counter"] or not writes.get("pointer"):
+        problems.append(f"fill writes {writes}")
+    if "a.c#counter" not in builder.global_vars:
+        problems.append(f"globals {sorted(builder.global_vars)}")
     return {"ok": not problems, "status": "ok" if not problems else "unexpected_dump", "reason": "; ".join(problems)}
 
 
