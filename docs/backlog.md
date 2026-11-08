@@ -30,11 +30,12 @@ Mined the master archive (`/tmp/framac-src/frama-c-master`, vendored snippets in
 
 A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions. F1–F16 come from reading the code and have not been reproduced on a target yet (F4 has since been fixed in `684052f`); F17 (E-ACSL false alarms on libc out-parameters) and D4 come from the libmnl, minmea and x509-parser runs. The list, with evidence, remediations, confirming tests and a suggested order, is in [`./phase1-review.md`](./phase1-review.md).
 
-- [x] Decide D1 (2026-11-08): per-engine normalized fingerprints first (option A: F1, F4, F8), then candidates grouped by statement site (option D: F5). Still open within D1: whether to link one bug seen at two statements (LIBMNL-04).
+- [x] Decide D1 (2026-11-08): per-engine normalized fingerprints first (option A: F1, F4, F8), then candidates grouped by statement site (option D: F5), with one bug seen at two statements linked by a cross-engine replay.
 - [x] Decide D3 (2026-11-08): extract failure parsing and identity from `run_eacsl_fuzz.py` first (option B, with D1 step 1), then split by consumer (option C: sandbox seam, builds, crash replay, coverage, guardrail).
-- [ ] Decide D2: what a module that fails the dynamic reach gate gets (leave the WP queue, re-fuzz, or exemption), before fixing F2.
-- [ ] Decide D4 (E-ACSL's share of each campaign) after fixing F17 and checking the seeded benchmark for bugs only E-ACSL can catch.
-- [ ] Work through the suggested order in `phase1-review.md`, updating each defect's status there.
+- [x] Decide D2 (2026-11-08): a module that fails the dynamic reach gate keeps its units out of the WP queue; the run goes on.
+- [x] Plan the fixes: [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md) (steps S0–S13 and V, branch `phase1-remediation`), with the decisions on leaks (in scope), F17 (initialization wrappers) and the rest.
+- [ ] Decide D4 (E-ACSL's share of each campaign) in plan step S10, after fixing F17 and checking the seeded benchmark for bugs only E-ACSL can catch.
+- [ ] Work through the plan's steps, updating its status table and each defect's status in `phase1-review.md`.
 
 ## 2. Verification gaps (not testable on this machine)
 
