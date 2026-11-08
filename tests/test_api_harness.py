@@ -297,6 +297,26 @@ def test_summarize_api_reach_counts_exemptions_apart(tmp_path):
     assert summarize_api_reach(None) is None
 
 
+def test_summarize_api_reach_does_not_count_a_units_view_twice():
+    # tweetnacl: the harness row holds 25 entry points; the unit's view lists 27 (the same 25, main,
+    # and randombytes, which no harness holds and an exemption waves through)
+    reach = {
+        "modules": [
+            {"module": "tweetnacl", "entry_points": 25, "entry_points_reached": 25, "exempt": {}},
+            {
+                "module": "main",
+                "harness_modules": ["tweetnacl"],
+                "entry_points": 27,
+                "unharnessed_entry_points": ["randombytes"],
+                "exempt": {"randombytes": "OS entropy"},
+            },
+        ]
+    }
+    out = summarize_api_reach(reach)
+    assert out is not None
+    assert (out["entry_points"], out["reached"], out["exempt"]) == (26, 25, 1)
+
+
 def _run(api: dict | None) -> dict:
     target = {"revision": "r", "harness_digest": "h", "status": "ok", "problems": [], "wall_s": 1.0, "cpu_s": 1.0}
     if api is not None:

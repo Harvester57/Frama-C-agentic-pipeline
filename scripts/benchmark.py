@@ -652,9 +652,15 @@ def summarize_api_reach(reach: dict | None, seeds_dir: Path | None = None) -> di
     rows = [r for r in reach.get("modules") or [] if isinstance(r, dict)]
     out: dict[str, Any] = {"entry_points": 0, "reached": 0, "exempt": 0, "modules": {}}
     for row in rows:
-        total = int(row.get("entry_points") or 0)
-        reached = int(row.get("entry_points_reached") or 0)
         exempt = len(row.get("exempt") or {}) if isinstance(row.get("exempt"), dict) else 0
+        if "harness_modules" in row:
+            # A unit's view: its entry points held by harnesses are counted on those harnesses' rows;
+            # only the ones no harness holds (reached by none) are added here.
+            total = len(row.get("unharnessed_entry_points") or [])
+            reached = 0
+        else:
+            total = int(row.get("entry_points") or 0)
+            reached = int(row.get("entry_points_reached") or 0)
         out["entry_points"] += total
         out["reached"] += reached
         out["exempt"] += exempt
