@@ -514,6 +514,15 @@ class ModelBuilder:
         rec = self.functions.get(fid)
         if rec is None:
             rec = self.functions[fid] = {**record, "units": [], "kernel_names": {}}
+        elif rec.get("source") == SOURCE_GCC and record.get("source") == SOURCE_FRAMAC:
+            # A function compiled by a unit on the GCC fallback and by one Frama-C parsed (a shared
+            # source, a header function): the parse knows its signature, formals, loops, writes and
+            # last line, which the fallback cannot. Its record wins, whichever job came first.
+            keep = {"units": rec["units"], "kernel_names": rec["kernel_names"]}
+            address_taken = bool(rec.get("address_taken"))
+            rec.clear()
+            rec.update(record, **keep)
+            rec["address_taken"] = address_taken or bool(record.get("address_taken"))
         if unit not in rec["units"]:
             rec["units"].append(unit)
         if record.get("kernel_name"):

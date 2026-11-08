@@ -427,6 +427,32 @@ def test_gcc_fallback_reads_callgraph_info(tmp_path, monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("gcc_first", [True, False])
+def test_a_framac_record_wins_over_the_gcc_fallback_for_a_shared_function(gcc_first):
+    # src/shared.c is compiled by a unit on the GCC fallback (liba, sorted first) and by one Frama-C
+    # parses (libb). The parse's facts (loops, signature, last line) must survive either order.
+    b = _builder({"liba.a": {"kind": "static_lib", "files": ["src/shared.c"], "links": []},
+                  "libb.a": {"kind": "static_lib", "files": ["src/shared.c"], "links": []}})  # fmt: skip
+    gcc = {
+        "functions": {"src/shared.c#sum": {"file": "src/shared.c", "name": "sum", "line": 4, "static": False}},
+        "indirect": [],
+        "edges": [],
+    }
+    dump = {"functions": [_fn("sum", "sum", "src/shared.c", 4, loops=1, cyclomatic=3, signature="int(int *, int)")]}
+    if gcc_first:
+        b.add_gcc(["liba.a"], gcc)
+        b.add_dump(["libb.a"], dump)
+    else:
+        b.add_dump(["libb.a"], dump)
+        b.add_gcc(["liba.a"], gcc)
+    rec = b.functions["src/shared.c#sum"]
+    assert rec["source"] == pm.SOURCE_FRAMAC
+    assert (rec["loops"], rec["cyclomatic"], rec["end_line"]) == (1, 3, 6)
+    assert rec["signature"] == "int(int *, int)"
+    assert sorted(rec["units"]) == ["liba.a", "libb.a"] and rec["kernel_names"] == {"libb.a": "sum"}
+
+
+@pytest.mark.unit
 def test_units_with_the_same_sources_and_flags_share_one_parse_and_tests_are_skipped():
     c1 = {"source": "src/a.c", "object": "a.o", "flags": ["-I", "include"], "system_flags": []}
     c1_pic = {**c1, "object": "a.pic.o"}
