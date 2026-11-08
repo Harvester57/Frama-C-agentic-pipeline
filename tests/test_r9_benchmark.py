@@ -158,7 +158,7 @@ def test_phase0_runs_the_post_stages_only_after_a_passing_phase0(tmp_path, monke
 def test_inner_phase0_steps_leave_the_phase0_checkpoint_to_build_check():
     # R1: Phase 0 is recorded by `pipeline_make.py build-check`, not by the benchmarks' Phase 0 steps.
     for module in (benchmark, bs):
-        source = Path(module.__file__).read_text(encoding="utf-8")
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
         assert '"save-phase"' not in source and "checkpoint_phase0" not in source
 
 

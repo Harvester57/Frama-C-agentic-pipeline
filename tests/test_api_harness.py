@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -151,7 +152,7 @@ def test_chains_group_calls_by_shared_pointers():
 
 
 def test_sequence_case_passes_shared_buffers_between_calls():
-    records = {
+    records: dict[str, Any] = {
         "keypair": {
             "signature": "int(unsigned char *,unsigned char *)",
             "formals": _formals("pointer", "pointer"),
@@ -183,7 +184,7 @@ def test_sequence_case_passes_shared_buffers_between_calls():
 
 
 def test_single_case_gives_a_variable_length_call_spare_outputs():
-    rec = {
+    rec: dict[str, Any] = {
         "signature": "int(unsigned char *,unsigned char *,unsigned long long,unsigned char *)",
         "formals": _formals("pointer", "const_pointer", "value", "const_pointer"),
         "param_sizes": {"0": {"max": 64}, "3": {"max": 24}},
