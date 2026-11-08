@@ -108,6 +108,35 @@ Read `units.<name>.parse.status`. `gcc_fallback` means Frama-C could not parse t
 
 Step 2 reads the model. Without it (no capture, or a model whose `status` is not `ok`), Step 2 falls back to the lexer and says so in the DAG's `warnings`.
 
+### Step 1d — Trust Boundary
+
+The model already holds each function's `trust` (`scripts/trust.py`, run by `phase0_model.py`): `untrusted` or `trusted`, the deciding rule (`source`), and `boundary` when attacker data reaches the parameters directly. The rules:
+- **Library API:** every API function of a library unit is untrusted (`default`, boundary).
+- **Input path:** a function calling an input reader (`read`, `recv`, `recvfrom`, `fread`, `fgets`, `getline`, `getenv` and close relatives), `main` with argv, and the threat model's `input_sources` are input roots. Every function they reach in the call graph is untrusted (`call_graph`).
+- **Threat model:** `trusted_callers` marks functions (or a unit's API) called only by trusted code. It wins over the other rules and keeps what it overrode under `overridden`.
+- **Everything else** is trusted (`default`).
+
+The threat model is the fenced `framac-threat-model` JSON block of THREAT_MODEL.md, validated against `schemas/threat_model.schema.json` (`input_sources`, `trusted_callers`, `secrets`, `auth_gates`, `output_sinks`). It is read from `workspace/THREAT_MODEL.md`, else the target's own. Check it before the model runs:
+
+```text
+python3 /opt/framac-pipeline/scripts/trust.py check-threat-model [PATH]
+```
+
+Exit 0 means valid, 1 means no file or no block (every unit records `no_threat_model`), and 2 means invalid (fix the listed errors). Report `no_threat_model` to the user: the default rules then decide alone. Run `trust.py run` again after changing the threat model, then rebuild the DAG (Step 2).
+
+**CodeQL (optional).** CodeQL may add untrusted marks (`codeql`); it never removes one. It runs only when the user declares the target open source, because CodeQL's licence covers open-source code only. Ask the user; never assume it. Then:
+
+```powershell
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Class phase-static `
+  "python3 /opt/framac-pipeline/scripts/run_metadata.py set-codeql --enable --open-source --declared-by user"
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Scratch -CodeQL -TargetPackages "<pkgs>" -Class phase-dynamic `
+  "python3 /opt/framac-pipeline/scripts/codeql_trust.py run && python3 /opt/framac-pipeline/scripts/trust.py run"
+```
+
+(sh: `--codeql`.) `-CodeQL` runs in `framac-codeql:<repo>`: the target's derived build image plus the CodeQL CLI copied from `framac-codeql:latest`. It is built locally and never pushed. `codeql_trust.py` replays the build recipe under CodeQL's tracer and writes `workspace/reports/codeql_trust.json`. Then `trust.py run` merges its facts.
+
+Consumers: the harness sidecar's `reachability` defaults from trust (`untrusted_surface` at a boundary, else `internal_api`; `reachability_source` records `trust:<rule>`). The contract trust-boundary check applies to every boundary function. The report lists the trust source of each entry point.
+
 ---
 
 ## Step 2 — Build the Call-Graph DAG, Topological Waves & Risk Tiers
@@ -174,7 +203,7 @@ Supported `--entry-style` modes and options in `generate_harness.py`:
 - `global_buffer`: copies fuzz/symbolic bytes into `--global-buf <name>` (and optional `--global-len <name>`) before calling `entry_fn()`.
 - `struct_arg`: populates a stack struct of `--struct-type <Type>` with fuzz/symbolic bytes before calling `entry_fn(&target_arg)`.
 - `void_call`: invokes `entry_fn()` directly after initializing any globals.
-- `auto_prototype` (or `--auto-args`): inspects the C declaration of `--entry-fn` in `--header` or `--sources`, automatically synthesizes Eva (`Frama_C_make_unknown`) and LibFuzzer (`fuzz_buf + fuzz_off`) argument unpacking for arbitrary multi-argument internal functions (buffer+length pairs, C strings, output buffers, pointers, and scalars), and defaults `reachability` to `internal_api`.
+- `auto_prototype` (or `--auto-args`): inspects the C declaration of `--entry-fn` in `--header` or `--sources`, automatically synthesizes Eva (`Frama_C_make_unknown`) and LibFuzzer (`fuzz_buf + fuzz_off`) argument unpacking for arbitrary multi-argument internal functions (buffer+length pairs, C strings, output buffers, pointers, and scalars), and defaults `reachability` to `internal_api` when the entry function has no trust in the DAG (Step 1d).
 - `custom`: executes arbitrary C statements passed via `--call-expr '<stmts using fuzz_buf and fuzz_len>'` (or separate `--eva-expr` and `--fuzz-expr`), with optional `--null-terminate` and repeatable `--extra-include <hdr.h>`.
 - `argv`: CLI-style targets whose entry is `main(int argc, char **argv)` — the default when `--entry-fn main` is given without an explicit `--entry-style`. Eva side emulates `argc`/`argv` with `Frama_C_interval(0, 5)` and five unknown 256-byte buffers (upstream `share/libc/eva_stubs.c`, vendored as `docs/upstream/sources/eva_stubs.c`); the LibFuzzer side passes the input as `argv[1]` NUL-terminated. The sidecar `cppflags` get `-Dmain=__framac_target_main`, renaming the target's `main` in every build so libFuzzer's own `main` does not clash at link time.
 - `dispatch`: one harness for an API library with many entry points. Each repeatable `--dispatch-case '<stmts>'` drives one API call; the first input byte selects the case and the rest of the input is that case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one analysis covers every case. Each case must build its arguments within the callee's contract (for a builder: a real buffer, its real size as `buflen`, and the setup calls the API documents, such as writing the message header first) and must never `return`. Pass the module's main parser as `--entry-fn`. The sidecar records the cases in `dispatch_cases`. The fuzz campaign skips a case once it has crashed, by rebuilding with `-DFRAMAC_FUZZ_SKIP_CASES`, so keep unrelated API calls in separate cases: a skipped case is not fuzzed for the rest of the campaign.
