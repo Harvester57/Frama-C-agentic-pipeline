@@ -57,3 +57,85 @@ Three agents are working on disjoint files:
 - **The seeded-bug set as a benchmark set:** `scripts/benchmark_seeded.py`.
 
 **Next:** review and merge their work, run the full benchmark plus the seeded set, then commit I5b.
+## Report 3
+
+### I5a: done (`3813532`)
+
+Baseline `phase0-i5a` comes from run 4:
+- Eva-analysed functions with no ledger unit: 0 on every target.
+- `covered_with_unknown`: 0 on every target.
+- Recall: 7/7.
+
+Against `phase0-i0`, `compare` shows one regression, and it is the soundness fix working. On qcbor-dev, `UsefulInputBuf_GetBytes` and `IEEE754_AssembleDouble` used to count as covered because one module proved them. Other modules' Eva runs leave Unknowns in them, so they are no longer covered. For example, `UsefulInputBuf_GetBytes` is valid from `UsefulBuf` but unknown from 4 decode modules.
+
+### I5b: merged into `phase0-redesign`, benchmark running
+
+The three agents' work is reviewed and merged (`f6733b8`, merge `03225f6`). The suite passes: 1937 tests.
+
+Fixes I made while integrating:
+- **Model flags:** they came as split tokens (`-I inc`), which produced a stray `-I`. They are now single tokens, and force includes are kept apart.
+- **Conflicting macros:** the lexer's Makefile `-D` flags could contradict the build's own (`-DFAST` alongside `-DLEGACY`). A unit now uses the build's macros plus the lexer's include directories, and a sub-module uses its unit's flags.
+- **CryptoLib `sa`:** the unit's exported API adds 2 entry points to its scope that the pinned harness doesn't drive. They are recorded as accepted gaps, the same as for the other pinned modules.
+- **`-Dmain` rename:** now a valid identifier for module names that contain `-`, which affected x509.
+
+What the agents' end-to-end check on qcbor-dev showed:
+- all 8 sub-module reports credit `libqcbor_a`;
+- re-ingesting changes nothing;
+- the lexer-module path gives identical results.
+
+**Seeded set:** `benchmark.py seeded` runs it, and its first project, s01, passed (bug found, decoy quiet). The full set (7 projects) and the 10-target benchmark (`i5b1-*`) are running now.
+
+### I4: done, Alias not adopted (branch `phase0-i4`, `dbd0e38`; merged after the I5b runs)
+
+On r03, r08, r09 and s02 the type match is already exact, so precision has no room to rise, and the adoption rule can't be met.
+- **x509-parser:** indirect edges go from 163 to 122. All 41 dropped edges are spurious mix-ups between fields of the same type in its `const` tables.
+- **The catch:** Alias narrows a global function pointer to its initializer even when another function reassigns it. A new fixture shows a true edge lost this way.
+- **The option stays off by default.** Worth a follow-up: trust Alias only for pointers read from `const` globals.
+- **Cost:** at most 1.5 s per parse.
+
+### I6 and I7: started
+
+They run in parallel, each in its own worktree with its own agent:
+- **I6:** seeds from recorded test API calls, the dictionary, per-case budgets, and the dynamic reach gate.
+- **I7:** threat-model schema, trust rules, optional CodeQL, and threat models for minmea, QCBOR and x509.
+## Report 4
+
+### I5b: seeded set passes, benchmark on round 3
+
+- **Seeded set: 7/7 bugs found, 0/4 decoys fired (PASS).**
+  - The first full run found 6/7. s04_force_include was missed because the build's `-include config.h` never reached the harness.
+  - Fix: unit flags and force includes are now relative to the run directory, and generate_harness applies the force includes.
+- **10-target benchmark, rounds 1 and 2:** each round exposed a way the build's own unit flags, newly fed into harnesses by I5b, break something. All are fixed on `phase0-i5b` and merged:
+  - **CryptoLib, quoted macro:** `-DMC_LOG_PATH="log.txt"` lost its quotes, so E-ACSL and Eva failed. The pipeline splits and re-joins flag strings in several places, so the fix is to leave quoted `-D` values and `-std=` out of DAG-merged harness flags. The harness spec states such flags itself.
+  - **semver, `-std=c89`:** the build's flag rejects the generated (C99) harness.
+  - **x509-parser, sources:** a callee pulled in its whole unit's sources, including `x509-parser.c`, whose Frama-C-only `main` includes `__fc_builtin.h`. Callees bring their lexer module's closure again.
+  - **x509-parser, `-Dmain` rename:** with the identifier fix, the `x509-parser` module runs Eva for the first time since I0. Round 2 has 200 failed units there, where it used to record a tool failure.
+- **Round 2 otherwise:**
+  - 0 functions without a unit and 0 covered-with-Unknown on every target.
+  - QCBOR and minmea recall: 6/6.
+- **Round 3** (all fixes) is running with CryptoLib and semver first.
+
+### I6 and I7: done on their branches, not merged yet
+
+- **I6** (`phase0-i6`):
+  - **Seeds from the test suites:** minmea gives 214 unique API calls (64 seeds); qcbor-dev gives 3821 calls (708 seeds per decode harness).
+  - **Coverage:** never lower than before.
+  - **New fixture s08:** its bug needs a well-formed checksum. It is found with seeds and missed without.
+  - **Dynamic reach gate:** it reopens three QCBOR modules whose entry points never execute.
+  - **Also:** a per-case fuzz budget, and macro values added to the dictionary.
+- **I7** (`phase0-i7`):
+  - **Threat models:** a threat-model schema, plus threat models for minmea, qcbor-dev and x509-parser.
+  - **Trust rules:** library API, input-reader reachability, and `trusted_callers`.
+  - **Truth:** 16/16 fixtures match their new `trust` truth field.
+  - **CodeQL** runs fully offline (`framac-codeql:minmea`): it adds `codeql` sources to 12 minmea functions and removes nothing. With it off, nothing changes.
+
+### I8 and I9: started
+
+Both run from the I7 branch, in their own worktrees:
+- **I8:** trust- and complexity-based tiers, and unit split.
+- **I9:** MetAcsl security properties from the threat model. I0 recorded MetAcsl as a go.
+
+**Next:**
+- Accept I5b on round 3.
+- Merge I6 and I7, then run the merged benchmark.
+- Merge I8 and I9 when they report.
