@@ -139,6 +139,13 @@ def validate_manifest(manifest: dict, assets_dir: Path = ASSETS_DIR) -> list[str
         for asset in target.get("assets", []):
             if not (assets_dir / asset["path"]).is_file():
                 problems.append(f"{tid}: missing asset {asset['path']}")
+        tm = target.get("threat_model")
+        if tm is not None:
+            tm_path = assets_dir / str(tm.get("path"))
+            if not tm_path.is_file():
+                problems.append(f"{tid}: missing threat model {tm.get('path')}")
+            elif sha256_hex(tm_path.read_bytes()) != tm.get("sha256"):
+                problems.append(f"{tid}: threat model {tm.get('path')} does not match its sha256")
     seen: set[str] = set()
     for bug in manifest.get("bugs", []):
         bid = bug["id"]
@@ -1023,6 +1030,12 @@ def summarize_model(model: dict | None) -> dict:
         indirect_edges=edges.get("indirect", 0),
         macro_aliases=len(model.get("macro_aliases") or {}),
         thread_entries=len(model.get("thread_entries") or []),
+        # Step I7: the threat model and CodeQL the trust annotation used, and its counts per rule.
+        trust={
+            "threat_model": ((model.get("trust") or {}).get("threat_model") or {}).get("status"),
+            "codeql": ((model.get("trust") or {}).get("codeql") or {}).get("status"),
+            "by_source": ((model.get("trust") or {}).get("summary") or {}).get("by_source"),
+        },
         parse_s=round(sum(j.get("seconds") or 0 for j in model.get("parse_jobs") or []), 2),
         seconds=model.get("seconds"),
     )
@@ -1070,6 +1083,11 @@ def run_target(
         return info["rc"] == 0
 
     py = f"python3 {CONTAINER_SCRIPTS}"
+    # A target's threat model (step I7) is supplied with the run, where trust.py looks first; it is
+    # not part of harness_digest, as it changes no harness and no count the baselines compare.
+    if target.get("threat_model"):
+        (run_dir / "workspace").mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ASSETS_DIR / target["threat_model"]["path"], run_dir / "workspace" / "THREAT_MODEL.md")
     # The capture comes first: it writes the snapshot every later Frama-C and compiler step reads.
     capture = run_capture(spec, mount, run_dir, repo, packages, stages)
     if capture["status"] != "ok":

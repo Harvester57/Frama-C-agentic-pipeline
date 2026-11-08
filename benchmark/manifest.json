@@ -51,7 +51,11 @@
       "fuzz_rte_initialized": false
      }
     }
-   ]
+   ],
+   "threat_model": {
+    "path": "minmea/THREAT_MODEL.md",
+    "sha256": "1a9002a20fa8b4e410f22450b58c2443c2f380bf70df5f4dee9afa097a3b6b01"
+   }
   },
   {
    "id": "qcbor-dev",
@@ -273,7 +277,11 @@
       "fuzz_rte_initialized": false
      }
     }
-   ]
+   ],
+   "threat_model": {
+    "path": "qcbor/THREAT_MODEL.md",
+    "sha256": "f6b99deb6b6f773bbaa5e60ff3479eee009ff43e867c387ca928aecbc9728c7a"
+   }
   },
   {
    "id": "qcbor-master",
@@ -696,7 +704,11 @@
      "path": "x509-parser/x509_no_ikos.h",
      "to": "workspace/harnesses/x509_no_ikos.h"
     }
-   ]
+   ],
+   "threat_model": {
+    "path": "x509-parser/THREAT_MODEL.md",
+    "sha256": "c6d095450a956a9c994938efa122264017f5e23a1ce170ce1fd372521037b121"
+   }
   },
   {
    "id": "oscs-jsmn",
