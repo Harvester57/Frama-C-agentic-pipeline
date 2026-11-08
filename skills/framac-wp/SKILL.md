@@ -31,15 +31,15 @@ How resources are measured and how caches work: [resources-and-caching.md](../..
 1. **Continuous reactive sliding-window loop (not wave barriers).** A function's prover starts as soon as:
    - its callees have an initial contract in `workspace/work/` (speculative contract-first dispatch; callers do not wait for callee body proofs);
    - internal static callees without any contract are proven first (Option A);
-   - leaf and internal static functions run concurrently with module architects (`arch:<module>`);
-   - a module's open verify tasks gate the provers of that module (the finer call-cone gating applies only to a module without a harness sidecar); provers of other modules are not blocked.
+   - leaf and internal static functions run concurrently with module architects (`arch:<module>`, one per harness header: a unit whose harnesses name two headers gets a second `arch:<harness>`);
+   - a module's open verify tasks gate the provers of that module (the finer call-cone gating applies only to a module without a harness sidecar); provers of other modules are not blocked. In a link unit with sub-module harnesses, a sub-module's candidates and repairs gate only the provers whose call cone meets that sub-module's scope (its own functions); the unit's own harness gates them all.
 
    Tasks are prioritized by caller height, then Eva unknown count, then function name.
 2. **Crash Verification Gate.** Every `unverified` candidate becomes a `verify` task for a fresh Crash Verifier subagent.
    - `confirmed` marks the function's units `candidate`; they are excluded from WP.
    - `rejected` / `harness_induced`, with repairs left, creates a `repair` task for you, the parent (up to 2 per module): fix the harness, re-run the module, refresh the scheduler.
    - A gate opens once its candidates are verified and its repairs are done. New candidates (from breakers) or repairs reopen it.
-3. **Speculative Interface Architects & Tolerant Header Splice.** One architect per module header ([header_architect_brief.md](./header_architect_brief.md)). It writes baseline contracts in its scratch overlay. A tolerant 3-way AST declaration merger (`splice_architect_header`) cleanly splices non-overlapping function contracts and predicates into headers, enabling provers and architects to work on module headers concurrently.
+3. **Speculative Interface Architects & Tolerant Header Splice.** One architect per header named by a harness sidecar of the module (`workspace/harnesses/harness_<harness>.json`, field `header`) ([header_architect_brief.md](./header_architect_brief.md)). It writes baseline contracts in its scratch overlay. A tolerant 3-way AST declaration merger (`splice_architect_header`) cleanly splices non-overlapping function contracts and predicates into headers, enabling provers and architects to work on module headers concurrently.
 4. **Function Provers & Sliding-Window Dispatch.** Several functions of the same `.c` or `.h` can be proved at once: each prover edits its own `agents/<id>/scratch/work/`, and the parent splices only that function's spans.
    - Finished provers are merged eagerly or in micro-batches per module (`merge-pending`).
    - Merges re-run the guardrail and WP on the merged tree, with per-function WP re-checks executed in parallel.

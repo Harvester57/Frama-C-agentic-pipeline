@@ -18,8 +18,9 @@ Subcommands (run with the run directory as working directory; each prints one JS
   requeue        --agent-id ID | --stale-minutes N
   status
 
-Tasks: verify:<fingerprint>, repair:<module> (parent work), arch:<module>, prove:<file>#<function>,
-breaker:<file>#<function>, negotiate:<file>#<callee>, plus virtual gate:<module> nodes.
+Tasks: verify:<fingerprint>, repair:<module> (parent work), arch:<module> (one per harness header:
+arch:<harness> for a unit's further headers), prove:<file>#<function>, breaker:<file>#<function>,
+negotiate:<file>#<callee>, plus virtual gate:<module> nodes.
 
 State lives in state/wp_schedule.json and is only read and written under the run-wide `ledger`
 lock. Merges run outside that lock: they take the `merge` lock themselves, and the lock order is
@@ -653,9 +654,18 @@ class Ctx:
         return str((self.modules.get(mod) or {}).get("tier") or self.unit_tier.get(mod) or "")
 
     def inert(self, mod: str) -> bool:
-        """Tier-3 and skipped modules run no fuzz/Eva slice of their own: their gate work counts as done."""
-        rec = self.modules.get(mod) or {}
-        if self.tier(mod).startswith("Tier 3") or rec.get("skipped"):
+        """
+        Tier-3 modules, and modules with neither fuzz nor Eva, run no slice of their own: their gate
+        work counts as done. A sub-module answers from its own record (its lexer module's or its
+        split cluster's, scripts/module_map.py), else from its unit's.
+        """
+        if self.mm.is_submodule(mod):
+            rec = self.mm.submodule_record(mod) or self.mm.unit_record(mod)
+            tier = self.mm.tier_of(mod) or ""
+        else:
+            rec = self.modules.get(mod) or {}
+            tier = self.tier(mod)
+        if tier.startswith("Tier 3"):
             return True
         return rec.get("run_eacsl_fuzz") is False and rec.get("run_eva") is False
 
@@ -671,13 +681,35 @@ class Ctx:
         """The harness to build, repair or replay for `mod` (for a unit: the one answering for `fn`)."""
         return workspace_overlay.harness_module_for_function(self.mm, mod, file, fn)
 
+    def headers(self, mod: str) -> list[tuple[str, str]]:
+        """
+        (harness module, header) for each distinct `header` among `mod`'s harness sidecars, in
+        harness order: each one gets its own architect (defect 13). The DAG carries no header.
+        """
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for harness in self.harness_modules(mod):
+            value = (self.sidecars.get(harness) or {}).get("header")
+            if not value:
+                continue
+            header = norm_path(str(value))
+            if header and header not in seen:
+                seen.add(header)
+                out.append((harness, header))
+        return out
+
     def header(self, mod: str) -> str | None:
-        side = self.sidecar(mod)
-        rec = self.modules.get(mod) or {}
-        for value in (side.get("header"), rec.get("header"), *(rec.get("headers") or [])):
-            if value:
-                return norm_path(str(value))
-        return None
+        """`mod`'s first header (see `headers`)."""
+        found = self.headers(mod)
+        return found[0][1] if found else None
+
+    def harness_scope(self, harness: str) -> set[tuple[str, str]] | None:
+        """(file, function) a sub-module harness answers for; None for a whole unit (module_map scope)."""
+        cache: dict[str, set[tuple[str, str]] | None] = self.__dict__.setdefault("_harness_scopes", {})
+        if harness not in cache:
+            scope = workspace_overlay.scope_keys(self.mm, harness)
+            cache[harness] = None if scope is None else {(norm_path(f), fn) for f, fn in scope}
+        return cache[harness]
 
     def contributors(self, mod: str) -> list[str]:
         """Modules whose fuzz/Eva slice compiles one of `mod`'s files (their candidates gate `mod`)."""
@@ -883,6 +915,58 @@ def _park_quick_off_chain(ctx: Ctx, off_chain: list[tuple[str, str]], changes: d
         changes.setdefault("errors", []).extend(errors)
 
 
+def _arch_task_id(tasks: dict, mod: str, harness: str, header: str) -> str:
+    """`arch:<module>` for a module's first architect (the id before defect 13), then `arch:<harness>`."""
+    for tid in (f"arch:{mod}", f"arch:{harness}"):
+        if tid not in tasks:
+            return tid
+    return f"arch:{mod}#{_short_hash(header)}"
+
+
+def _sync_architects(state: dict, ctx: Ctx, mod: str, changes: dict[str, list[str]]) -> None:
+    """
+    One architect per header of `mod`'s harness sidecars (a unit with two harnesses and two headers
+    gets two). A pending architect whose header left the sidecars takes a new header, or is skipped.
+    """
+    tasks = state["tasks"]
+    wanted = ctx.headers(mod)
+    if not wanted:
+        return
+    mine = [tasks[tid] for tid in sorted(tasks) if tasks[tid]["kind"] == "arch" and tasks[tid]["module"] == mod]
+    by_header = {t.get("header"): t for t in mine}
+    missing = [(h, hdr) for h, hdr in wanted if hdr not in by_header]
+    wanted_headers = {hdr for _, hdr in wanted}
+    for task in mine:
+        if task["state"] != "pending" or task.get("header") in wanted_headers:
+            continue
+        if missing:
+            harness, header = missing.pop(0)
+            task.update(header=header, harness_module=harness)
+            by_header[header] = task
+        else:
+            _finish(
+                state, task, "skipped", "header_gone", reason=f"no harness sidecar of {mod} names {task.get('header')}"
+            )
+            changes["skipped"].append(task["id"])
+    for harness, header in wanted:
+        task = by_header.get(header)
+        if task is None:
+            tid = _arch_task_id(tasks, mod, harness, header)
+            _new_task(
+                state,
+                tid,
+                "arch",
+                tid[len("arch:") :],
+                module=mod,
+                header=header,
+                harness_module=harness,
+                invalid_results=0,
+            )
+            changes["created"].append(tid)
+        elif task["state"] == "pending":
+            task["harness_module"] = harness
+
+
 def _sync(state: dict, ctx: Ctx) -> dict:
     """
     Bring the task set in line with the ledger and candidates (idempotent): a verify task per
@@ -1017,13 +1101,7 @@ def _sync(state: dict, ctx: Ctx) -> dict:
 
     prove_modules = sorted({t["module"] for t in tasks.values() if t["kind"] == "prove" and t["state"] != "skipped"})
     for mod in prove_modules:
-        tid = f"arch:{mod}"
-        header = ctx.header(mod)
-        if header and tid not in tasks:
-            _new_task(state, tid, "arch", mod, module=mod, header=header, invalid_results=0)
-            changes["created"].append(tid)
-        elif header and tid in tasks and tasks[tid]["state"] == "pending":
-            tasks[tid]["header"] = header
+        _sync_architects(state, ctx, mod, changes)
 
     gate_modules = sorted({t["module"] for t in tasks.values() if t["kind"] in ("prove", "arch")})
     state["gates"] = {
@@ -1078,7 +1156,7 @@ def callee_has_contract(
     Check whether `cname` in `cfile` (module `cmod`) has an ACSL function contract in workspace/work/.
     Inspects:
     1. Sibling header: workspace/work/<stem>.h (both prototype and inline definition)
-    2. Module header(s): workspace/work/<header> from ctx.header, ctx.modules, and ctx.sidecars
+    2. Module header(s): workspace/work/<header> for each harness sidecar's `header` and `headers`
     3. C source definition / prototype: workspace/work/<cfile>
     """
     cfile_norm = norm_path(cfile)
@@ -1114,19 +1192,9 @@ def callee_has_contract(
     # 2. Check module header(s)
     mod = cmod or ctx.file_module.get(cfile_norm)
     if mod:
-        cand_headers: set[str] = set()
-        primary_h = ctx.header(mod)
-        if primary_h:
-            cand_headers.add(norm_path(primary_h))
-        m_rec = ctx.modules.get(mod) or {}
-        if m_rec.get("header"):
-            cand_headers.add(norm_path(str(m_rec["header"])))
-        for h in m_rec.get("headers") or []:
-            cand_headers.add(norm_path(str(h)))
-        s_rec = ctx.sidecar(mod)
-        if s_rec.get("header"):
-            cand_headers.add(norm_path(str(s_rec["header"])))
-        for h in s_rec.get("headers") or []:
+        # Every harness's header and the headers its sidecar lists (the DAG carries none).
+        cand_headers: set[str] = {header for _, header in ctx.headers(mod)}
+        for h in ctx.sidecar(mod).get("headers") or []:
             cand_headers.add(norm_path(str(h)))
 
         for h_rel in sorted(cand_headers):
@@ -1156,24 +1224,15 @@ def touches_module_header(
     module: str | None,
     work_dir: Path | None = None,
 ) -> bool:
-    """Check whether `fn` has a prototype or declaration in the module header."""
+    """Check whether `fn` has a prototype or declaration in one of the module's harness headers."""
     if not module:
         return False
-    cand_headers: list[str] = []
-    primary = ctx.header(module)
-    if primary:
-        cand_headers.append(norm_path(primary))
-    m_rec = ctx.modules.get(module) or {}
-    if m_rec.get("header"):
-        cand_headers.append(norm_path(str(m_rec["header"])))
-    for h in m_rec.get("headers") or []:
-        cand_headers.append(norm_path(str(h)))
-
+    cand_headers = [header for _, header in ctx.headers(module)]
     if not cand_headers:
         return False
 
     root = Path(work_dir) if work_dir is not None else Path.cwd()
-    for hdr_rel in dict.fromkeys(cand_headers):
+    for hdr_rel in cand_headers:
         hdr_path = root / "workspace" / "work" / hdr_rel
         if not hdr_path.is_file():
             hdr_path = root / hdr_rel
@@ -1239,6 +1298,11 @@ def _call_cone(file: str, fn: str, ctx: Ctx | None = None) -> set[tuple[str, str
 def _compute_deps(state: dict, ctx: Ctx) -> None:
     tasks = state["tasks"]
     prove_by_key = {_key(t): tid for tid, t in tasks.items() if t["kind"] == "prove"}
+    # A module's architects: one per header of its harnesses (defect 13).
+    arch_of: dict[str, list[str]] = defaultdict(list)
+    for tid in sorted(tasks):
+        if tasks[tid]["kind"] == "arch" and tasks[tid]["state"] != "skipped":
+            arch_of[tasks[tid]["module"]].append(tid)
     for tid in sorted(tasks):
         task = tasks[tid]
         if task["kind"] == "prove":
@@ -1259,16 +1323,15 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
                     if not has_contract:
                         if key in prove_by_key:
                             deps.add(prove_by_key[key])
-                        if cmod and f"arch:{cmod}" in tasks:
-                            deps.add(f"arch:{cmod}")
+                        if cmod:
+                            deps.update(arch_of.get(cmod, ()))
 
-            # Omit arch:<module> for leaf and static functions that do not touch the module header
+            # Omit the module's architects for leaf and static functions that do not touch a module header
             touches_hdr = touches_module_header(ctx, task["file"], task["function"], task.get("module"))
             is_leaf = len(callees) == 0
             is_static = is_static_fn(ctx, task["file"], task["function"])
             if not ((is_leaf or is_static) and not touches_hdr):
-                if f"arch:{task['module']}" in tasks:
-                    deps.add(f"arch:{task['module']}")
+                deps.update(arch_of.get(task["module"], ()))
 
             task["deps"] = sorted(deps)
             task["callees"] = sorted(callees)
@@ -1356,9 +1419,11 @@ def _gate_blockers(
 ) -> set[str]:
     """
     Verify and repair tasks blocking a gate or a task.
-    When task is None or kind != 'prove': coarse module gating for arch:<module>, _chain_heights, and cmd_status.
+    When task is None (or neither prove nor arch): coarse module gating for _chain_heights and cmd_status.
     When task has kind == 'prove': fine-grained gating blocking only on verify tasks in task's call cone,
-    external contributor slices, and active repair tasks for the module.
+    external contributor slices, and the verify and repair tasks of the module's harnesses whose scope
+    meets the call cone (a sub-module's candidates do not hold another sub-module's functions).
+    When task has kind == 'arch': the repairs of its own harness and of the unit.
     """
     by_module = index[0]
     by_file = index[1]
@@ -1367,13 +1432,17 @@ def _gate_blockers(
     # The module and its harnesses: a link unit's verify and repair tasks name its sub-modules.
     own = {module, *(gate_rec.get("harness_modules") or [])}
 
-    # Active repair tasks on the module always block
-    active_repairs = {
-        tid for mod in own for tid in by_module.get(mod, set()) if state["tasks"].get(tid, {}).get("kind") == "repair"
-    }
+    def repairs(mods: Iterable[str]) -> set[str]:
+        tasks = state["tasks"]
+        return {tid for mod in mods for tid in by_module.get(mod, set()) if tasks.get(tid, {}).get("kind") == "repair"}
 
     if task is not None and task.get("kind") == "arch":
-        return set(active_repairs)
+        # An architect waits for the repair of its own harness (and of the unit's), not of its siblings.
+        harness = task.get("harness_module")
+        return repairs({module, harness} if harness else own)
+
+    # Active repair tasks on the module always block
+    active_repairs = repairs(own)
 
     if task is None or task.get("kind") != "prove":
         # Coarse module gate for _chain_heights, and cmd_status reporting
@@ -1386,7 +1455,28 @@ def _gate_blockers(
         return out
 
     # Fine-grained gate for prove:<fn>
-    out = set(active_repairs)
+    fn_file, fn_name = str(task.get("file") or ""), str(task.get("function") or "")
+    cone_memo: list[set[tuple[str, str]]] = []
+
+    def cone() -> set[tuple[str, str]]:
+        if not cone_memo:
+            cone_memo.append(_call_cone(fn_file, fn_name, ctx))
+        return cone_memo[0]
+
+    def in_cone() -> set[str]:
+        return {tid for cfile, cfn in cone() for tid in by_fn.get((cfile, cfn), ())}
+
+    # Sub-module scope (defect 13): a sub-module harness answers for its own functions, so its
+    # candidates and repairs hold only the provers whose call cone meets that scope. The unit's own
+    # harness answers for the whole unit. Without the inputs (no ctx), every harness counts.
+    relevant = set(own)
+    if ctx is not None:
+        relevant = {module}
+        for mod in own - {module}:
+            scope = ctx.harness_scope(mod)
+            if scope is None or scope & cone():
+                relevant.add(mod)
+    out = repairs(relevant)
 
     # 1. External contributor slices covering this module's files:
     # If another slice compiles this module's sources, verify tasks from that contributor slice hold the gate.
@@ -1395,16 +1485,18 @@ def _gate_blockers(
         out |= by_module.get(ext_mod, set())
 
     # 2. Harness-induced candidates:
-    # If the module has a harness sidecar (harness_<module>.json, or a sub-module's for a link unit),
-    # any candidate in that module may trigger a harness rejection and repair:module, holding the gate.
-    if any((HARNESS_DIR / f"harness_{mod}.json").is_file() for mod in own):
-        for mod in own:
+    # If the module has a harness sidecar (harness_<module>.json, or a relevant sub-module's for a link
+    # unit), any candidate of that harness may trigger a harness rejection and repair:<harness>, holding
+    # the gate.
+    if any((HARNESS_DIR / f"harness_{mod}.json").is_file() for mod in relevant):
+        for mod in relevant:
             out |= by_module.get(mod, set())
+        # An out-of-scope sub-module's candidate still holds the provers whose call cone it lies in.
+        if own - relevant:
+            out |= {tid for tid in in_cone() if state["tasks"][tid].get("module") in own - relevant}
     else:
         # Fine-grained: only verify tasks whose candidate belongs to this function or its transitive callees
-        cone = _call_cone(task.get("file") or "", task.get("function") or "", ctx)
-        for cfile, cfn in cone:
-            out |= by_fn.get((cfile, cfn), set())
+        out |= in_cone()
 
     return out
 

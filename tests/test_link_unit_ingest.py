@@ -327,8 +327,12 @@ def test_scheduler_gates_a_unit_on_its_sub_modules_candidates(run_dir):
         },
     }
     index = S._blocker_index(state)
+    # Defect 13: the candidate's sub-module (encode) does not gate a function outside its scope...
     prove = {"kind": "prove", "file": "src/dec.c", "function": "dec_run"}
-    assert S._gate_blockers(state, "libx_a", index, task=prove, ctx=ctx) == {"verify:fp"}
+    assert S._gate_blockers(state, "libx_a", index, task=prove, ctx=ctx) == set()
+    # ...but still gates the functions of its own scope.
+    prove_enc = {"kind": "prove", "file": "src/enc.c", "function": "enc_run"}
+    assert S._gate_blockers(state, "libx_a", index, task=prove_enc, ctx=ctx) == {"verify:fp"}
     assert S._gate_blockers(state, "libx_a", index) == {"verify:fp"}
     # An older verify task naming the unit runs through the harness of its function.
     old = dict(verify, module="libx_a")

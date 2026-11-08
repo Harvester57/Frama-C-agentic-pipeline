@@ -26,7 +26,7 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
 1. **Trace Reachability from `LLVMFuzzerTestOneInput` to `{function_name}`:**
    Read `workspace/harnesses/harness_{module_name}.c` and the call chain leading to `{function_name}`. Identify the exact byte offsets, magic headers, TLV tags, or lengths required for an input buffer to reach the line of the unproven assertion.
 2. **Calculate the Boundary-Breaking Payload:**
-   Inspect the unproven assertion (e.g., `rte: signed_overflow: offset + len <= 2147483647`, `rte: mem_access: \valid_read(buf + i)`, or Layer 4 `g_sec_auth_verified == 1`):
+   Inspect the unproven assertion (e.g., `rte: signed_overflow: offset + len <= 2147483647`, `rte: mem_access: \valid_read(buf + i)`, or a MetAcsl Layer 4 goal such as `L4_auth_required_session_login: meta: auth_ok != 0`):
    - Write a short Python script that generates 3–5 surgical seed files in `agents/{agent_id}/scratch/seeds/` that satisfy all outer header checks and place extreme boundary values (`0x7FFFFFFF`, `0xFFFFFFFF`, `0x00`, unescaped `\r\n`, or unauthenticated `sec_level` flags) at the exact offset read by `{function_name}`.
 3. **Run a Targeted E-ACSL + LibFuzzer Campaign (sandboxed):**
    ```text

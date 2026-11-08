@@ -294,8 +294,8 @@ def test_wp_goal_classes_for_generated_names():
         cls({"kind": "user assertion", "annotation": "L4_auth_state_g: meta: \\separated(p, &ok)"}) == "l4_auth_state"
     )
     assert cls({"kind": "user assertion", "annotation": "L5_sanitized_log: meta: L5_no_crlf(m)"}) == "l5_sanitized"
-    # A prover's own named clause keeps its layer class.
-    assert cls({"kind": "postcondition", "annotation": "L6_zeroed: buffer_is_zeroed(k, 16)"}) == "l6_secret"
+    # A prover's own named clause is classed by its kind (D8: the pre-I9 layer classes are gone).
+    assert cls({"kind": "postcondition", "annotation": "L6_zeroed: buffer_is_zeroed(k, 16)"}) == "rte"
 
 
 @pytest.mark.unit

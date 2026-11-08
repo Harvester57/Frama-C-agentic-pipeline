@@ -360,7 +360,7 @@ def test_real_trivial_layer_clause_is_flagged(tmp_path):
         "/*@ requires \\valid(o); assigns *o; ensures L5_no_crlf: \\true; */\nvoid f(char *o){ *o = '\\n'; }\n",
     )
     assert res["status"] == "all_proven"
-    assert res["limits"]["classes_without_real_clause"] == ["l5_output"]
+    assert res["limits"]["classes_without_real_clause"] == []
 
 
 @needs_framac
