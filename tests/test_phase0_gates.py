@@ -169,7 +169,7 @@ def test_every_harness_consuming_recipe_checks_its_gate_first(target_line, need)
 @pytest.mark.unit
 def test_seed_runs_the_reach_gate_and_wp_queue_needs_both():
     text = PIPELINE_MK.read_text(encoding="utf-8")
-    assert re.search(r"^seed: reach-gate$", text, re.MULTILINE)
+    assert re.search(r"^seed: reach-gate security-props$", text, re.MULTILINE)
     assert "harness_reach.py check" in _recipe(text, "reach-gate:")[0]
     assert _recipe(text, "wp-queue: ingest facts")[0] == "\t$(GATE) --need reach,build_check"
     assert "\t$$(GATE) --module $(1) --need reach" in text  # the Eva tuning rungs

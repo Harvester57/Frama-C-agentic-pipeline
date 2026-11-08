@@ -112,7 +112,7 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 - **`security_props.json` must exist before `ledger.py seed`.**
   - If it appears later, WP produces meta goals with no ledger unit.
   - An unproven meta goal blocks `all_proven`.
-- **Nothing in Make or the benchmark runs `security_props.py run` yet** (§8). An agent runs it by hand, following the `framac-slice` skill.
+- **The `security-props` Make target runs `security_props.py run`,** and `seed` depends on it; the benchmarks run it as a stage before `seed` (fixed defect 5, §8).
 - **Known limits (I9 notes):**
   - `L5_no_crlf` on string literals doesn't prove;
   - `memset` wipes don't prove under Typed;
@@ -275,18 +275,18 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 
 ## 8. Known defects and gaps
 
-All of these were checked in the code.
+All of these were checked in the code. Defects 1-8 are fixed on `phase0-redesign` (commit in the Status column); 9-14 stay open. The fixes were unit-tested only: no pipeline or benchmark run has checked them yet.
 
-| # | Severity | Where | Problem | Fix direction |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | Broken | `templates/pipeline.mk:57-60` `slice-init` | Passes `--emit-compile-commands`, which I10a removed: the target fails, and it runs no capture or model step. No test runs the recipe. | Rewrite `slice-init` as capture → model → DAG, or drop it and document the skill's sequence; add a test that runs the recipe. |
-| 2 | Regression | `build_callgraph_dag.py` `wp_facts` | goto, `container_of`, volatile and inline-asm functions are no longer WP blockers, so WP spends full budgets on them. | Get these facts from the kernel model (Frama-C knows gotos, volatile accesses and asm), restore the blockers, and add a test. |
-| 3 | Soundness | `ledger.py:2580-2622` `audit-hypotheses` | Callees are looked up by plain function name. A colliding callee's DAG key is `file#name`, matches nothing and is dropped, so a caller can be discharged unconditionally over an unproven callee. | Resolve callees by `(file, name)` the way `wp_scheduler.resolve` does; add a `file#name` test. |
-| 4 | Wrong brief | `workspace_overlay.py:2429-2562` `prepare_agent` | `dag_fns.get(function)` by plain name finds nothing for colliding names. The brief then gets every L2 property of the module and `wave_index=0`. It also reads `is_entry`, which nothing produces. | Look up by `file#name` first; drop `is_entry`. |
-| 5 | Not wired | Make and benchmark | `security_props.py run` is never called, so MetAcsl obligations exist only when an agent runs it before `ledger.py seed`. | Add a `security-props` target before `seed`, and to the benchmark stages. |
-| 6 | Decision not enforced | `phase0_model.py:875-889`, ledger, Make | "Stop if no unit parses": the model stays `ok` when every unit fell back to GCC. "Fallback unit: Eva and WP blocked": only `bookkeeping.callgraph_fallback` is set. No automatic sanitizer fallback either. | Model status `no_unit_parsed`; mark fallback units blocked in the ledger and report; set `fuzz_engine: sanitizers` for them. |
-| 7 | Missing flags | `generate_harness._merge_dag_module_cppflags` | An I8 cluster (in `submodules`, not `lexer_modules`) or a freely named harness gets neither its unit's flags nor its `force_includes`. | Resolve the unit through `ModuleMap.unit_of` or the `--unit` argument. |
-| 8 | Inconsistent | `run_eacsl_fuzz.py:2997`, `ledger.py:1510` | Replay builds a unit's first sub-module. The ledger picks the harness whose scope holds the crashing function. | Replay through `harness_module_for_function`. |
+| # | Severity | Where | Problem | Fix direction | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | Broken | `templates/pipeline.mk:57-60` `slice-init` | Passes `--emit-compile-commands`, which I10a removed: the target fails, and it runs no capture or model step. No test runs the recipe. | Rewrite `slice-init` as capture → model → DAG, or drop it and document the skill's sequence; add a test that runs the recipe. | Fixed, `cf9c2cd`: `slice-init` only creates the overlay; a new `dag` target builds the DAG. Capture and model stay agent steps (they need the confirmed recipe). `test_phase0_make_recipes.py` runs the recipes. |
+| 2 | Regression | `build_callgraph_dag.py` `wp_facts` | goto, `container_of`, volatile and inline-asm functions are no longer WP blockers, so WP spends full budgets on them. | Get these facts from the kernel model (Frama-C knows gotos, volatile accesses and asm), restore the blockers, and add a test. | Fixed, `516bea0`: `source_facts` tokenizes each function's body from the model's line span and restores `irreducible_goto`, `container_of` and `volatile_or_asm`. |
+| 3 | Soundness | `ledger.py:2580-2622` `audit-hypotheses` | Callees are looked up by plain function name. A colliding callee's DAG key is `file#name`, matches nothing and is dropped, so a caller can be discharged unconditionally over an unproven callee. | Resolve callees by `(file, name)` the way `wp_scheduler.resolve` does; add a `file#name` test. | Fixed, `5eb31ff`. |
+| 4 | Wrong brief | `workspace_overlay.py:2429-2562` `prepare_agent` | `dag_fns.get(function)` by plain name finds nothing for colliding names. The brief then gets every L2 property of the module and `wave_index=0`. It also reads `is_entry`, which nothing produces. | Look up by `file#name` first; drop `is_entry`. | Fixed, `5eb31ff`: `dag_function_record`. |
+| 5 | Not wired | Make and benchmark | `security_props.py run` is never called, so MetAcsl obligations exist only when an agent runs it before `ledger.py seed`. | Add a `security-props` target before `seed`, and to the benchmark stages. | Fixed, `cf9c2cd`. |
+| 6 | Decision not enforced | `phase0_model.py:875-889`, ledger, Make | "Stop if no unit parses": the model stays `ok` when every unit fell back to GCC. "Fallback unit: Eva and WP blocked": only `bookkeeping.callgraph_fallback` is set. No automatic sanitizer fallback either. | Model status `no_unit_parsed`; mark fallback units blocked in the ledger and report; set `fuzz_engine: sanitizers` for them. | Fixed, `5e89cfc`: model status `no_unit_parsed`, exit 4; fallback units get `run_eva`/`run_wp_full` false and `fuzz_engine: sanitizers`; the seed defers their functions' Eva/WP units with `callgraph_fallback: <reason>`, which report section 6 groups. |
+| 7 | Missing flags | `generate_harness._merge_dag_module_cppflags` | An I8 cluster (in `submodules`, not `lexer_modules`) or a freely named harness gets neither its unit's flags nor its `force_includes`. | Resolve the unit through `ModuleMap.unit_of` or the `--unit` argument. | Fixed, `188dfdb`. |
+| 8 | Inconsistent | `run_eacsl_fuzz.py:2997`, `ledger.py:1510` | Replay builds a unit's first sub-module. The ledger picks the harness whose scope holds the crashing function. | Replay through `harness_module_for_function`. | Fixed, `85ef0a9`: replay, minimize and the benchmark replay build the harness holding the candidate's function. |
 | 9 | Imprecise | `trust.py:508-535`, `workspace_overlay.py:1408` | The boundary check passes the name without the file, so same-named functions merge, with "untrusted wins". Conservative, but noisy. | Pass the file. |
 | 10 | Imprecise | `run_eacsl_fuzz.py:135` | Snapshot headers count as target code in coverage. | Add the snapshot root to `COVERAGE_EXTERNAL_PREFIXES`. |
 | 11 | Imprecise | fuzz ingest | Kernel-renamed statics (`f_0`) are not mapped back, unlike in Eva ingest. | Reuse the line-range placement. |
@@ -337,7 +337,7 @@ These are opportunities, not defects:
 3. **Flags:** take them from the sidecar. If the DAG's flags matter, regenerate the harness; don't merge at build time.
 4. **Header functions:** expect one home unit per header function and one configuration per file.
 5. **Old runs:** after changing what Phase 0 emits, start from a new run or a fresh ledger, and rerun `reach-gate`.
-6. **Security properties:** run `security_props.py` before `ledger.py seed` (until defect 5 is fixed).
+6. **Security properties:** `security_props.json` must exist before `ledger.py seed`. Make's `seed` depends on `security-props`; a manual sequence must keep that order.
 7. **Images:** build and tests run in the build image, everything else in the analysis image. No `framac-pipeline:<tag>` image exists any more.
 8. **Benchmark:**
    - compare against `phase0-i10`;
@@ -360,10 +360,6 @@ These are opportunities, not defects:
 | Images and wrappers | `test_build_capture.py`, `test_image_toolchain.py`, `test_remediation_p2_container.py` |
 | Benchmark | `test_benchmark.py`, `test_benchmark_compare.py`, `test_benchmark_seeded.py` |
 
-**Not covered by any test:**
-- the `slice-init` recipe;
-- stopping when no unit parses;
-- blocking a fallback unit;
-- `audit-hypotheses` with `file#name` callees;
-- `prepare_agent` with `file#name` keys;
-- `_check_internal_variadic`.
+The defect 1-8 fixes added tests for the `slice-init`, `dag` and `security-props` recipes (`test_phase0_make_recipes.py`), stopping when no unit parses (`test_phase0_model.py`), source WP blockers and blocking a fallback unit (`test_dag_model_view.py`, `test_pipeline_make.py`), `audit-hypotheses` with `file#name` callees (`test_ledger.py`), `prepare_agent` with `file#name` keys (`test_workspace_overlay.py`), cluster flags (`test_unit_view.py`) and replay on a sub-module (`test_pipeline_make.py`).
+
+**Not covered by any test:** `_check_internal_variadic`.
