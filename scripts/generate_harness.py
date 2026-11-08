@@ -1248,6 +1248,15 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
             norm_flag = _normalize_dag_cppflag(raw_flag.strip())
             if norm_flag.startswith(("-I", "-D", "-U", "-std=")):
                 cppflags = _append_cppflag(cppflags, norm_flag)
+        # The unit's force-included files (`-include config.h` in the build): without them the
+        # harness compiles different code than the build does.
+        tokens = _split_cppflags(cppflags)
+        forced = {tokens[i + 1] for i, t in enumerate(tokens[:-1]) if t in ("-include", "-imacros")}
+        for raw in mod_info.get("force_includes") or []:
+            path = _normalize_run_rel_dir(str(raw))
+            if isinstance(raw, str) and raw.strip() and path not in forced:
+                cppflags = f"{cppflags} -include {path}".strip()
+                forced.add(path)
         break
     return cppflags
 
