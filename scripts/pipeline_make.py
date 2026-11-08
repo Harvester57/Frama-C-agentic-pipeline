@@ -81,7 +81,7 @@ from framac_common import (  # noqa: E402
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 from tiers import is_deferred  # noqa: E402
-from workspace_overlay import infer_prover_wp_flags  # noqa: E402
+from workspace_overlay import harness_module_for_function, infer_prover_wp_flags  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 CONTAINER_TEMPLATES_DIR = Path("/opt/framac-pipeline/templates")
@@ -981,18 +981,22 @@ def _harness_record(mm: ModuleMap, name: str, dag_modules: dict[str, dict]) -> d
     return rec
 
 
-def module_build_spec(module: str, run_dir: Path | str = ".") -> dict:
+def module_build_spec(
+    module: str, run_dir: Path | str = ".", file: str | None = None, function: str | None = None
+) -> dict:
     """
     Sources, cppflags and ldflags of a runnable module's fuzz build, exactly as the Makefile's
     build and fuzz recipes pass them (other builders of the same binary should use this, so their
     builds share the cache entry). ValueError when the module cannot run from Make. A link unit
-    without a harness of its own resolves to its first sub-module, named in `harness_module`.
+    without a harness of its own resolves to the sub-module whose scope holds `file`#`function`
+    (the harness the ledger verifies a candidate through), else its first one, named in
+    `harness_module`.
     """
     plan = build_plan(run_dir)
     requested = module
     if module not in plan.records:
         # A link unit's name (an Eva candidate may carry one): the harness module that stands for it.
-        module = plan.mm.harness_module_for(module) or module
+        module = harness_module_for_function(plan.mm, module, file, function) or module
     mod = plan.modules.get(module)
     if mod is None:
         raise ValueError(f"module {module!r} is not runnable: {plan.excluded.get(module, 'not in the DAG')}")

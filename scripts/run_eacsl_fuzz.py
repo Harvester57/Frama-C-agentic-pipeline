@@ -2913,20 +2913,26 @@ def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
     return spec
 
 
-def replay_build_spec(module: str, harness_dir: Path = Path("workspace/harnesses")) -> dict:
+def replay_build_spec(
+    module: str,
+    harness_dir: Path = Path("workspace/harnesses"),
+    file: str | None = None,
+    function: str | None = None,
+) -> dict:
     """
     Sources, cppflags and ldflags of a module's fuzz binary. Inside the pipeline this is
     `pipeline_make.module_build_spec`: exactly what `make build` and the fuzz recipe pass, so a
     replay reuses their cache entry and never rebuilds workspace/harnesses/fuzz_<mod> with other
     flags or sources (ValueError when Make cannot build the module). The harness sidecar decides
     only when pipeline_make cannot be imported. A candidate's module may be a link unit: the spec
-    is then its harness module's, named in `harness_module` (the binary is fuzz_<harness_module>).
+    is then its harness module's, the one whose scope holds the crashing `file`#`function` (as the
+    ledger picks it), named in `harness_module` (the binary is fuzz_<harness_module>).
     """
     try:
         import pipeline_make  # imported lazily: replays work without the Make layer
     except ImportError:
         return _sidecar_build_spec(module, harness_dir)
-    return pipeline_make.module_build_spec(module, Path("."))
+    return pipeline_make.module_build_spec(module, Path("."), file, function)
 
 
 def _candidate_slug(fingerprint: str) -> str:
@@ -2989,21 +2995,31 @@ def replay_candidates(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
+    specs: dict[tuple[str, str, str], dict | str] = {}
     prepared_by_key: dict[tuple[str, str], dict] = {}
     index: dict[str, dict] = {}
     by_status: dict[str, int] = {}
     for cand in todo:
         fingerprint = str(cand.get("fingerprint") or "")
         module = str(cand.get("module") or "")
+        loc = cand.get("location") if isinstance(cand.get("location"), dict) else {}
+        file, function = str(loc.get("file") or ""), str(loc.get("function") or "")
         eng = engine or _candidate_engine(cand)
-        key = (module, eng)
-        if key not in prepared_by_key:
+        # A candidate naming a link unit replays on the harness whose scope holds its function.
+        skey = (module, file, function)
+        if skey not in specs:
             try:
-                spec = replay_build_spec(module, Path(harness_dir))
+                specs[skey] = replay_build_spec(module, Path(harness_dir), file or None, function or None)
             except (OSError, ValueError, RuntimeError) as exc:
-                prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
-            else:
-                harness_module = str(spec.get("harness_module") or module)
+                specs[skey] = f"no build spec for module {module!r}: {exc}"
+        spec = specs[skey]
+        if isinstance(spec, str):
+            key = (f"!{module}", eng)
+            prepared_by_key.setdefault(key, {"binary": None, "reason": spec})
+        else:
+            harness_module = str(spec.get("harness_module") or module)
+            key = (harness_module, eng)
+            if key not in prepared_by_key:
                 prepared_by_key[key] = prepare_replay_binary(
                     harness_module,
                     spec["sources"],
@@ -3222,6 +3238,7 @@ def minimize_candidates(
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
     prepared_by_key: dict[tuple[str, str], dict] = {}
+    specs: dict[tuple[str, str, str], dict | str] = {}
     index: dict[str, dict] = {}
     by_status: dict[str, int] = {}
     tool = find_creduce()
@@ -3229,14 +3246,23 @@ def minimize_candidates(
         fingerprint = str(cand.get("fingerprint") or "")
         module = str(cand.get("module") or "")
         eng = engine or _candidate_engine(cand)
-        key = (module, eng)
-        if key not in prepared_by_key:
+        location = cand.get("location") if isinstance(cand.get("location"), dict) else {}
+        where = (module, str(location.get("file") or ""), str(location.get("function") or ""))
+        if where not in specs:
             try:
-                spec = replay_build_spec(module, Path(harness_dir))
+                specs[where] = replay_build_spec(
+                    module, Path(harness_dir), file=where[1] or None, function=where[2] or None
+                )
             except (OSError, ValueError, RuntimeError) as exc:
-                prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
+                specs[where] = f"no build spec for module {module!r}: {exc}"
+        spec = specs[where]
+        # Minimized on the harness holding the crashing function (the unit's own one otherwise).
+        key = (str(spec.get("harness_module") or module), eng) if isinstance(spec, dict) else ("!" + module, eng)
+        if key not in prepared_by_key:
+            if isinstance(spec, str):
+                prepared_by_key[key] = {"binary": None, "reason": spec}
             else:
-                harness_module = str(spec.get("harness_module") or module)
+                harness_module = key[0]
                 prepared_by_key[key] = prepare_replay_binary(
                     harness_module,
                     spec["sources"],

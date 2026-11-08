@@ -1625,6 +1625,46 @@ def test_replay_of_a_unit_candidate_builds_its_harness_module(tmp_path, monkeypa
     assert built == [("decode", "workspace/harnesses/fuzz_decode")]
 
 
+def test_replay_of_a_unit_candidate_builds_the_harness_holding_its_function(tmp_path, monkeypatch):
+    """Replay picks the harness the ledger verifies the candidate through, not the first one (defect 8)."""
+    import run_eacsl_fuzz as fuzz
+
+    run = _unit_run(tmp_path)
+    dag = json.loads((run / pm.DAG_JSON).read_text(encoding="utf-8"))
+    dag["functions"] = {
+        "dec_run": {"name": "dec_run", "file": "src/decode.c", "module": "libkv_a", "lexer_module": "decode"},
+        "enc_run": {"name": "enc_run", "file": "src/encode.c", "module": "libkv_a", "lexer_module": "encode"},
+    }
+    dag["modules"]["libkv_a"]["functions"] = ["dec_run", "enc_run"]
+    write_json(run / pm.DAG_JSON, dag)
+    monkeypatch.chdir(run)
+    hdir = Path(pm.HARNESS_DIR)
+    assert fuzz.replay_build_spec("libkv_a", hdir, "src/encode.c", "enc_run")["harness_module"] == "encode"
+    assert fuzz.replay_build_spec("libkv_a", hdir)["harness_module"] == "decode"
+
+    built: list[str] = []
+
+    def fake_prepare(module, sources, out_bin, **kwargs):
+        built.append(module)
+        return {"binary": None, "reason": "not built in this test"}
+
+    monkeypatch.setattr(fuzz, "prepare_replay_binary", fake_prepare)
+    (run / "crash-1").write_bytes(b"x")
+    cands = run / "candidates.json"
+    loc = {"file": "src/encode.c", "function": "enc_run", "line": 1}
+    write_json(
+        cands,
+        [
+            {"fingerprint": f"fp{i}", "module": "libkv_a", "status": "unverified", "location": loc,
+             "reproducers": [{"input": "crash-1"}]}
+            for i in (1, 2)
+        ],
+    )  # fmt: skip
+    fuzz.replay_candidates(cands, hdir, run / "replay", selftest_json=None)
+    # Both candidates replay on encode's binary, built once.
+    assert built == ["encode"]
+
+
 # ---------------------------------------------------------------------------
 # fuzz budget per harness case, reach-dynamic (step I6)
 # ---------------------------------------------------------------------------

@@ -1497,9 +1497,25 @@ def inner_replay() -> int:
     import run_eacsl_fuzz as fuzz
 
     spec = _load_spec()
+    # A bug replays on the harness holding its function, which for a link unit split into
+    # sub-modules is not the unit's own harness. Items are grouped by that harness.
+    builds: dict[tuple[str, str, str], dict | str] = {}
     groups: dict[tuple[str, str], list[dict]] = {}
     for item in spec["replays"]:
-        groups.setdefault((item["module"], item["engine"]), []).append(item)
+        where = (item["module"], str(item.get("file") or ""), str(item.get("function") or ""))
+        if where not in builds:
+            try:
+                builds[where] = fuzz.replay_build_spec(
+                    item["module"], Path("workspace/harnesses"), file=where[1] or None, function=where[2] or None
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                builds[where] = f"{type(exc).__name__}: {exc}"
+        build_of = builds[where]
+        harness = (
+            str(build_of.get("harness_module") or item["module"]) if isinstance(build_of, dict) else item["module"]
+        )
+        item["_build"] = build_of
+        groups.setdefault((harness, item["engine"]), []).append(item)
     results: list[dict] = []
     for (module, engine), items in sorted(groups.items()):
         started = time.monotonic()
@@ -1507,7 +1523,9 @@ def inner_replay() -> int:
         failure_reason = None
         report: dict = {}
         try:
-            build = fuzz.replay_build_spec(module, Path("workspace/harnesses"))
+            build = items[0]["_build"]
+            if isinstance(build, str):
+                raise RuntimeError(build)
             prepared = fuzz.prepare_replay_binary(
                 module,
                 build["sources"],
@@ -1546,7 +1564,8 @@ def inner_replay() -> int:
             results.append(
                 {
                     "bug": item["bug"],
-                    "module": module,
+                    "module": item["module"],
+                    "harness_module": module,
                     "engine": engine,
                     "required": item["required"],
                     "outcome": outcome,
