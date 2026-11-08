@@ -145,6 +145,36 @@ def test_harness_sources_follow_the_callees_lexer_module(tmp_path: Path) -> None
     assert merged == ["src/harness_util.c", "src/util.c", "src/str.c"]
 
 
+def test_harness_sources_resolve_a_colliding_callee_name(tmp_path: Path) -> None:
+    # u_len is defined in src/util.c (external) and as a static in tools/cli.c, so the DAG keys
+    # both `file#name`: the harness's call names the external one, whose sources must be merged.
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "harnesses").mkdir()
+    dag = {
+        "module_kind": "link_unit",
+        "functions": {
+            "src/util.c#u_len": {"name": "u_len", "module": "libkv_a", "lexer_module": "util", "file": "src/util.c"},
+            "tools/cli.c#u_len": {
+                "name": "u_len",
+                "module": "kvtool",
+                "lexer_module": "tools",
+                "file": "tools/cli.c",
+                "is_static": True,
+            },
+        },
+        "modules": {"libkv_a": {"required_sources": ["src/util.c"]}, "kvtool": {"required_sources": ["tools/cli.c"]}},
+        "lexer_modules": {"util": {"required_sources": ["src/util.c", "src/str.c"]}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_harness_sources(tmp_path / "harnesses", ["src/harness_util.c"], False, "u_len")
+    assert merged == ["src/harness_util.c", "src/util.c", "src/str.c"]
+    # A harness built on tools/cli.c means that file's static.
+    merged = generate_harness._merge_dag_harness_sources(tmp_path / "harnesses", ["tools/cli.c"], False, "u_len")
+    assert merged == ["tools/cli.c"]
+
+
 def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
     import generate_harness
 

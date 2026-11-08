@@ -1929,12 +1929,23 @@ def sweep_list(run_dir: Path | str = ".") -> tuple[list[dict], list[dict]]:
                 if fn_n and fn_n not in callees_by_name:
                     callees_by_name[fn_n] = clean_c
 
+            def _ref(key: str) -> tuple[str, str]:
+                # A callee is a DAG key: the plain name, or `file#name` when the name collides.
+                meta = dag_fns.get(key)
+                if isinstance(meta, dict) and meta.get("name"):
+                    return str(meta.get("file") or ""), str(meta["name"])
+                return (key.split("#", 1)[0], key.split("#", 1)[1]) if "#" in key else ("", key)
+
             for c_file, c_fn in vuh_callers:
                 c_names = callees_map.get((c_file, c_fn)) or callees_by_name.get(c_fn, [])
-                for callee_name in c_names:
+                for callee_key in c_names:
+                    callee_file, callee_name = _ref(callee_key)
                     cand_units = eva_covered_by_fn.get(callee_name, [])
-                    same_file = [u for u in cand_units if u.get("file") == c_file]
-                    for u in same_file or cand_units:
+                    if callee_file:
+                        chosen = [u for u in cand_units if u.get("file") == callee_file]
+                    else:  # an old DAG without the callee's record: prefer the caller's file
+                        chosen = [u for u in cand_units if u.get("file") == c_file] or cand_units
+                    for u in chosen:
                         uf, ufn = u.get("file"), u.get("function")
                         if not (
                             isinstance(uf, str)

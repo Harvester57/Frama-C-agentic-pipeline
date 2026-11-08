@@ -1365,11 +1365,35 @@ def _merge_dag_harness_sources(
         if snippet:
             referenced_idents.update(_HARNESS_IDENT_RE.findall(snippet))
 
+    # A name defined in several files is keyed `file#name` in the DAG, never by the name alone.
+    colliding: dict[str, list[str]] = {}
+    for key, rec in functions_map.items():
+        if "#" in str(key) and isinstance(rec, dict) and rec.get("name"):
+            colliding.setdefault(str(rec["name"]), []).append(str(key))
+
+    def _colliding_keys(ident: str) -> list[str]:
+        """The definition the harness means: one in its sources, else the only external one."""
+        keys = sorted(colliding.get(ident) or [])
+        in_sources = [
+            k
+            for k in keys
+            if any(
+                s == functions_map[k].get("file") or s.endswith("/" + str(functions_map[k].get("file")))
+                for s in norm_sources
+            )
+        ]
+        if in_sources:
+            return in_sources
+        external = [k for k in keys if not functions_map[k].get("is_static")]
+        return external if len(external) == 1 else []
+
     aliases = dag.get("macro_aliases") or {}
     target_fns: set[str] = set()
     for ident in referenced_idents:
         if ident in functions_map:
             target_fns.add(ident)
+        else:
+            target_fns.update(_colliding_keys(ident))
         # A macro alias the build defines (the Phase 0 model's): alias -> DAG keys it expands to.
         alias_keys = aliases.get(ident) if isinstance(aliases, dict) else None
         for key in [alias_keys] if isinstance(alias_keys, str) else alias_keys or []:

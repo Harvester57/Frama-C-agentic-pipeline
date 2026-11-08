@@ -776,6 +776,36 @@ def test_sweep_list_includes_eva_only_callee_when_caller_has_valid_under_hyp(tmp
     assert by_fn["pdu_parse"]["eva_only"] is True
 
 
+def test_sweep_list_resolves_a_colliding_callee_key(tmp_path):
+    # pdu_parse is also defined in another file, so the DAG keys it `file#name`. Matching the key
+    # against plain function names found nothing, and the Eva-only callee was left out of the sweep.
+    _sweep_ledger(tmp_path)
+    led = json.loads((tmp_path / "coverage-ledger.json").read_text(encoding="utf-8"))
+    for u in led:
+        if u["function"] == "ber_decode":
+            u["assumptions"] = [{"kind": "valid_under_hyp", "summary": "proved under callee hypotheses"}]
+    write_json(tmp_path / "coverage-ledger.json", led)
+    write_json(
+        tmp_path / pm.DAG_JSON,
+        {
+            "modules": DAG_MODULES,
+            "functions": {
+                "ber_decode": {
+                    "name": "ber_decode",
+                    "file": "src/snmp/ber.c",
+                    "module": "snmp",
+                    "internal_callees": ["src/snmp/pdu.c#pdu_parse"],
+                },
+                "src/snmp/pdu.c#pdu_parse": {"name": "pdu_parse", "file": "src/snmp/pdu.c", "module": "snmp"},
+                "src/other/pdu.c#pdu_parse": {"name": "pdu_parse", "file": "src/other/pdu.c", "module": "snmp"},
+            },
+        },
+    )
+    entries, _ = pm.sweep_list(tmp_path)
+    swept = [(e["file"], e["function"]) for e in entries if e.get("eva_only")]
+    assert swept == [("src/snmp/pdu.c", "pdu_parse")]
+
+
 def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
     run = _make_run(tmp_path)
     _sweep_ledger(run)
