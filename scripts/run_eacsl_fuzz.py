@@ -2572,7 +2572,7 @@ def repair_sources_for_link(
     sources: list[str], log: str, dag_path: Path | str | None, run_dir: Path | str
 ) -> tuple[list[str], dict]:
     """
-    One link-probe repair iteration: map `undefined reference to 'X'` symbols to their
+    One link-repair round: map `undefined reference to 'X'` symbols to their
     defining sources via the DAG and append the missing files. Returns (sources, info).
     """
     syms = parse_undefined_references(log)
@@ -2617,9 +2617,13 @@ def build_module_binary(
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
     `eacsl`, and for `auto` unless a failed selftest for this Frama-C version blocks it; Clang
     ASan+UBSan for `sanitizers` and as the `auto` fallback. Both builds go through the cache.
-    On a link failure with undefined references, one repair iteration appends the defining
-    sources (via `dag_path`) and retries once, recorded under `link_repair`.
-    Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt}.
+    On a link failure with undefined references, repair rounds append the defining sources (via
+    `dag_path`) and relink while a round adds a file: linking takes whole files, so a file added
+    for one symbol can need still more files. The rounds are bounded by the number of files the
+    DAG names and recorded under `link_repair` (`symbols` and `added_sources` over all rounds,
+    `rounds` one entry each).
+    Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt, sources}, where
+    `sources` is what was compiled last (the input plus any repair).
     """
 
     def _attempt(srcs: list[str]) -> tuple[dict, dict | None, str | None]:
@@ -2653,22 +2657,32 @@ def build_module_binary(
             comp = compile_sanitizer_binary(srcs, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
         return comp, eacsl_attempt, fallback_reason
 
-    comp, eacsl_attempt, fallback_reason = _attempt(sources)
-    link_repair: dict | None = None
+    current = list(sources)
+    comp, eacsl_attempt, fallback_reason = _attempt(current)
+    rounds: list[dict] = []
     if comp["returncode"] != 0 and dag_path:
-        log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
-        repaired, info = repair_sources_for_link(sources, log, dag_path, Path.cwd())
-        if info:
-            link_repair = info
-            comp, eacsl_attempt, fallback_reason = _attempt(repaired)
+        # Each round adds at least one file the DAG names, so this many rounds always suffice.
+        max_rounds = max(1, len(set(_dag_symbol_files(Path(dag_path)).values())))
+        while comp["returncode"] != 0 and len(rounds) < max_rounds:
+            log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
+            current, info = repair_sources_for_link(current, log, dag_path, Path.cwd())
+            if not info:
+                break
+            rounds.append(info)
+            comp, eacsl_attempt, fallback_reason = _attempt(current)
     result = {
         "compile": comp,
         "engine_used": comp.get("engine", engine),
         "engine_fallback_reason": fallback_reason,
         "eacsl_compile_attempt": eacsl_attempt,
+        "sources": current,
     }
-    if link_repair:
-        result["link_repair"] = link_repair
+    if rounds:
+        result["link_repair"] = {
+            "symbols": [sym for r in rounds for sym in r["symbols"]],
+            "added_sources": [src for r in rounds for src in r["added_sources"]],
+            "rounds": rounds,
+        }
     return result
 
 
@@ -2812,7 +2826,7 @@ def prepare_replay_binary(
     prepared["binary"] = Path(comp["binary"])
     if attribution and build["engine_used"] == "eacsl":
         prepared["attribution_builder"] = _sanitizer_attribution_builder(
-            sources,
+            build.get("sources") or sources,
             Path(out_bin),
             build_options.get("cppflags", "-I."),
             build_options.get("ldflags", ""),
@@ -4285,6 +4299,8 @@ def _run_build_mode(args) -> dict:
         res["engine_fallback_reason"] = build["engine_fallback_reason"]
     if build["eacsl_compile_attempt"] is not None:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
+    if build.get("link_repair"):
+        res["link_repair"] = build["link_repair"]
     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 
@@ -4357,7 +4373,7 @@ def _run_campaign_mode(args) -> dict:
         attribution_builder = None
         if engine_used == "eacsl" and not args.no_attribution_replay:
             attribution_builder = _sanitizer_attribution_builder(
-                args.sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
+                build.get("sources") or args.sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
             )
 
         warm_started = cache.warm_start_corpus(args.module, args.corpus_dir) if (args.module and use_cache) else 0
@@ -4448,6 +4464,8 @@ def _run_campaign_mode(args) -> dict:
         res["engine_fallback_reason"] = build["engine_fallback_reason"]
     if build["eacsl_compile_attempt"] is not None:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
+    if build.get("link_repair"):
+        res["link_repair"] = build["link_repair"]
     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 
