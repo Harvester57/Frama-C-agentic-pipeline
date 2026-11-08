@@ -251,10 +251,62 @@ Two policy and scoring fixes happened during the run, and both apply equally to 
 - the policy now accepts a bare `unsigned` parameter;
 - the scorer tells a bug and a decoy apart by line when both are in the same function (s03).
 
+### Alias narrowing of indirect edges (2026-11-08, plan step I4)
+
+`phase0_model.py run --alias` loads a second module, `scripts/phase0_alias.ml`, into the same Frama-C run as the dump. It runs Frama-C 35's Alias plugin (`Alias.Analysis.compute`, a Steensgaard-style may-alias analysis, field-sensitive) on the same AST. Then, for each indirect call `(*e)(...)`, it reads the function variables in the vertex of `*e` in the state before the call. That set is the one the plugin itself uses to resolve the call. The model intersects each site's type match with that set.
+
+A site keeps its full type match, with the reason recorded in `narrowing_reason`, in these cases:
+- Alias failed, timed out (300 s, fixed), crashed or did not compile;
+- Alias has no state before the call;
+- the pointer's vertex holds no function;
+- Alias names only functions outside the type match.
+
+Every site records `narrowing` (`alias` or `none`), its reason and the candidates it `dropped`. The edges a narrowed site keeps carry the source `alias`.
+
+Measured with one build capture per project, then the model with Alias off and on, twice each, alternating, on the same build tree (`framac-analysis:latest`, Frama-C 35). Times are the model's own `seconds`, median of the two runs. Sites are counted per parse, so a source parsed for two units counts twice.
+
+| Project | Indirect sites | Narrowed by Alias | Why the others kept their type match | Indirect edges off → on | Precision off → on | Recall off → on | Model s off → on |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
+| r03 | 5 | 0 | no target: 5 (pointers read through `bsearch`'s result, struct fields set in `main`) | 13 → 13 | 1.00 → 1.00 | 1.00 → 1.00 | 0.63 → 0.82 |
+| r08 | 0 | 0 | (thread spawns only, not type-matched) | 2 → 2 | 1.00 → 1.00 | 1.00 → 1.00 | 0.62 → 0.80 |
+| r09 | 5 | 0 | no target: 5 (callback fields set in `main`) | 5 → 5 | 1.00 → 1.00 | 1.00 → 1.00 | 0.71 → 0.92 |
+| s02 | 1 | 1 (to the same 5 handlers) | | 5 → 5 | 1.00 → 1.00 | 1.00 → 1.00 | 0.58 → 0.77 |
+| other 12 reproducers and seeded | 0 | 0 | | 0 → 0 | | | +0.13 to +0.19 |
+| x509-parser | 20 | 14 | no target: 4; empty type match: 2 | **163 → 122** | | | 1.67 → 3.27 |
+| qcbor-dev | 14 | 0 | no target: 11; empty type match: 3 | 26 → 26 | | | 2.02 → 2.58 |
+| qcbor-master | 8 | 0 | no target: 7; empty type match: 1 | 10 → 10 | | | 1.20 → 1.48 |
+| CryptoLib | 262 | 0 | no target: 262 | 142 → 142 | | | 4.88 → 5.25 |
+| minmea, jsmn, semver, stmr, qlz, tweetnacl | 0 | 0 | | 0 → 0 | | | +0.16 to +0.20 |
+
+Precision and recall are computed on the four projects whose indirect edges are exact. For r03, r08 and r09 the edges come from their truth files. s02's truth file lists no edges, so its single site, `run_op` → the five `ops[]` handlers, was read from the source. Everything else in the model is identical with Alias off and on, on every project: functions, direct edges, externals and thread entries.
+
+**Cost.** Alias itself takes at most 1.45 s per parse (x509-parser, each of its 3 parses), 0.59 s on CryptoLib, 0.37 s on qcbor-dev and under 0.05 s elsewhere. The fixed cost is the second module's compilation, about 0.15 s per model run. On x509-parser the model's wall time doubles, from 1.7 s to 3.3 s. Elsewhere it grows by 0.15 to 0.55 s.
+
+**What Alias narrows.** It narrows only on x509-parser: 41 of 163 edges are dropped (25 %). Read against the source, every dropped edge is spurious. The algorithm tables are `static const` global initializers (`DECL_PUBKEY_ALG` and similar macros) with several function-pointer fields of the same type. The type match joins those fields, while field-sensitive Alias keeps them apart:
+- `alg->parse_pubkey` keeps the 12 `parse_pubkey_*` and drops the 14 `parse_algoid_pubkey_params_*`;
+- `talg->parse_algoid_pubkey_params` does the reverse;
+- the CRL extension and CRL entry extension tables separate in the same way (12 + 3).
+
+**Where Alias gives nothing.** Every site of the reproducers, the seeded projects and QCBOR that reads a pointer set in another function gets no target. This covers struct fields assigned in `main` and pointers passed as parameters. Alias analyses each function from the global initializers plus the summaries of the functions it calls, so a value written in another function never reaches the call. Those sites keep their type match.
+
+**Where Alias is wrong.** The same design makes it unsound for a global pointer that has an initializer and is reassigned in another function. The fixture `tests/fixtures/phase0/model/alias/` shows it:
+
+```c
+static fn g = a;
+void set_g(void) { g = b; }
+int fire(int x) { return g(x); }
+```
+
+Alias answers `{a}` for `fire`, so the true edge `fire → b` would be dropped. No measured project has this pattern, so recall did not move. But nothing in the model can detect when a site falls into it.
+
+**Decision: not adopted. `--alias` stays off by default.** The adoption rule asked for higher precision with unchanged recall on r03, r08, r09 and s02. Recall is unchanged (1.00), but precision cannot rise there: the type match is already exact on all four (1.00). Alias narrows one site of those projects (s02), to the same set. Its only measured gain is x509-parser's 41 spurious edges, which are a real precision gain on a real target. Against that stands a demonstrated unsound case that would silently drop a true edge. The option and its per-site provenance remain available.
+
+A variant worth measuring later: trust Alias only when the called pointer is read from a `const` global. Every x509-parser table is `static const`, so that covers all 14 narrowed sites, and it excludes the unsound case.
+
 ## 8. Open questions
 
 - How often do real targets build in the container without manual help? The PoC's benchmark targets give a first number.
-- How precise is the type-based indirect over-approximation on real code, and is Alias worth its cost? Measured in the PoC.
+- How precise is the type-based indirect over-approximation on real code, and is Alias worth its cost? Measured in step I4 (§7, "Alias narrowing"): exact on the exact projects, 41 spurious edges of 163 on x509-parser; Alias not adopted because it is unsound for reassigned global pointers. Open: a `const`-table-only variant.
 - Large units: clustering criterion and size limit for Eva slices.
 - Header-only and macro-heavy libraries: is the public-header heuristic enough for static libraries? (It worked on all reproducers once headers are read after preprocessing.)
 - Header `static inline` functions: one ledger unit per header definition, or only those reached from a unit's entry points? QCBOR doubles its inventory otherwise.

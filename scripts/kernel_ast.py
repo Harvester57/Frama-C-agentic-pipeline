@@ -69,9 +69,15 @@ def _failed(status: str, reason: str) -> dict:
 
 
 def compile_dump_module(
-    work_dir: Path, runner: Callable | None = None, dump_source: Path = DUMP_SOURCE
+    work_dir: Path,
+    runner: Callable | None = None,
+    dump_source: Path = DUMP_SOURCE,
+    packages: Iterable[str] = ("frama-c.kernel",),
 ) -> tuple[Path | None, str]:
-    """(path of the .cmxs, "") or (None, reason). `work_dir` must be private to this process."""
+    """
+    (path of the .cmxs, "") or (None, reason). `work_dir` must be private to this process. `packages`
+    are the findlib packages the module compiles against (a plugin's API, `unix`).
+    """
     run = runner or subprocess.run
     source = work_dir / dump_source.name
     shutil.copyfile(dump_source, source)
@@ -86,7 +92,7 @@ def compile_dump_module(
         "-w",
         "-a",
         "-package",
-        "frama-c.kernel",
+        ",".join(packages),
         source.name,
         "-o",
         target.name,

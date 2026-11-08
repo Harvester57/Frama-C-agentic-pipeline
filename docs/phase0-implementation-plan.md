@@ -370,7 +370,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I2 | L | done |
 | I3 | L | done |
 | I3b | L | done |
-| I4 | S | not started |
+| I4 | S | done (Alias measured, not adopted: off by default) |
 | I5a | M | not started |
 | I5b | L | not started |
 | I6 | L | not started |
@@ -469,6 +469,29 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I4 (2026-11-08)
+
+- **Option:** `phase0_model.py run --alias` (`--no-alias` is the default, `ALIAS_DEFAULT = False`).
+  - **The module:** `scripts/phase0_alias.ml` is a second module in the same Frama-C run as the dump, compiled against `frama-c-alias.core` and `unix` (`kernel_ast.compile_dump_module` gained a `packages` argument; its default is unchanged).
+  - **What it reports:** it runs `Alias.Analysis.compute` under a fixed 300 s SIGALRM budget and catches the plugin's fatal errors. For each indirect call it reports the functions in the vertex of `*e` before the call, which is the set Alias itself resolves the call with.
+  - **Failures:** it writes its own file after the dump has written its own, so a failure, time-out or crash of Alias never loses the dump. A run whose exit code is non-zero after a complete dump is a parse that succeeded with Alias `crashed`.
+- **Model:** sites are matched to the dump's by caller, location and expression. Each site's type match is intersected with Alias's targets; targets defined in another unit are resolved by name, like an undefined callee.
+  - **Fields on every site:** `narrowing` (`alias`/`none`), `narrowing_reason` and `dropped`.
+  - **Reasons a site keeps its full type match:** `disabled`, `gcc_fallback`, `alias_<status>` (failed, timeout, crashed, unavailable), `no_state`, `no_targets`, `error`, `unmatched`, `disjoint` (Alias names none of the candidates) and `no_candidates`.
+  - **Where results are recorded:** kept edges of a narrowed site gain the source `alias`. `parse_jobs[].alias` records the analysis status and time, and the top-level `alias` block records the counts per reason. The schema follows.
+- **Tests:** 7 new unit tests (10 cases) in `tests/test_phase0_model.py`, on recorded dumps and Alias reports: narrowing; every failure status; unmatched and disjoint sites; targets in a linked unit; the off mode; reading the report; loading the module when Alias crashes. There is also one Docker test on the new fixture `tests/fixtures/phase0/model/alias/`, which asserts the narrowing, the no-target fallback and the unsound case.
+- **Measured** (`docs/phase0-redesign.md` §7, "Alias narrowing"; each project captured once, then the model off and on twice):
+  - **Exact projects:** r03, r08, r09 and s02 are unchanged, at precision 1.00 and recall 1.00 both ways. The type match is already exact there. Alias finds no target for the r03 and r09 sites, whose pointers are set in `main` or passed as parameters, and narrows s02's site to the same 5 handlers.
+  - **x509-parser:** 163 → 122 indirect edges. All 41 dropped edges are spurious: they join different function-pointer fields of the same type in the `static const` algorithm and extension tables.
+  - **Other targets:** no change on CryptoLib (142 edges, all 262 sites without a target) or on the QCBOR targets, and the other targets have no type-matched site.
+  - **Cost:** at most 1.45 s of Alias per parse. The model's time goes from 1.7 to 3.3 s on x509-parser and grows by +0.15 to +0.55 s elsewhere.
+- **Decision: not adopted.** Precision cannot rise on the four exact projects (it is already 1.00).
+  - **Unsound case:** Alias analyses each function from the global initializers only, so a global pointer with an initializer that another function reassigns is narrowed to its initializer. On the fixture, the true edge `fire → b` is dropped.
+  - **Follow-up:** trust Alias only on pointers read from `const` globals. That covers all of x509-parser's narrowed sites.
+- **Run conditions:** another benchmark ran on the machine at the same time. The target measurements therefore ran without the host broker (`-NoBroker`).
+  - **CryptoLib without the broker:** its capture stalled. Its parallel CMake build under `bear` sat idle until the capture's 1800 s timeout, which ends as `needs_build_recipe` with no serial retry. It was measured again with the broker, and the capture succeeded. CryptoLib has 262 sites, all without an Alias target, so its 142 edges stay 142.
+  - **Left for another step:** the stalled parallel build under `bear`, and the missing serial retry after a time-out, belong to I2's capture.
 
 ### I3b (2026-11-07)
 

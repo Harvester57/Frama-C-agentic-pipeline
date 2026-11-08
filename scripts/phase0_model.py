@@ -6,6 +6,7 @@ Stdlib only.
 
     phase0_model.py run [--capture workspace/reports/build_capture.json]
                         [--out workspace/reports/phase0_model.json] [--jobs N] [--no-broker]
+                        [--alias | --no-alias]
     phase0_model.py selftest
 
 `run` reads the build capture (scripts/build_capture.py), the scratch tree it names and the run's
@@ -34,6 +35,17 @@ snapshot (scripts/target_env.py), so it runs in a container started with the wra
      a project file whose value resolves (through other such aliases) to a defined function;
   7. entry points, link units and the test marking come from the build capture.
 
+With `--alias` (plan step I4; off by default, see docs/phase0-redesign.md §7 "Alias narrowing"), each
+parse also loads scripts/phase0_alias.ml, which runs Frama-C's Alias plugin on the same AST and reports,
+per indirect call site, the functions the called pointer may point to. A site's type-match candidates
+are then intersected with them. A site keeps its full type match, with the reason recorded, when Alias
+fails, times out (ALIAS_TIMEOUT_S), crashes, has no state there, finds no function in the pointer's
+target, or names only functions outside the type match. Every site records which narrowing applied
+(`narrowing`, `narrowing_reason`, `dropped`), and the edges a narrowed site keeps carry the source
+`alias` next to `type-match`. Alias is flow-sensitive within a function but starts each function from
+the global initializers only, so a function pointer reassigned in another function or another unit is
+narrowed to its initializer: that is why it stays off by default.
+
 Functions are identified as `file#name` (paths relative to the target root): same-named statics stay
 apart, and a function defined in a project header (static inline) belongs to every unit compiling it.
 Every function, edge and alias carries its source. The output is workspace/reports/phase0_model.json
@@ -58,7 +70,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -83,6 +95,14 @@ ERROR_CHARS = 400
 THREAD_SPAWNERS = {"pthread_create": 2, "thrd_create": 1}
 SOURCE_FRAMAC = "frama-c-kernel"
 SOURCE_GCC = "gcc-callgraph-info"
+SOURCE_ALIAS = "alias"
+ALIAS_SOURCE = Path(__file__).resolve().parent / "phase0_alias.ml"
+ALIAS_PACKAGES = ("frama-c.kernel", "frama-c-alias.core", "unix")
+ALIAS_OUT_ENV = "FRAMAC_P0_ALIAS_OUT"
+ALIAS_TIMEOUT_ENV = "FRAMAC_P0_ALIAS_TIMEOUT"
+# Fixed, not sized from the machine: it decides which sites are narrowed.
+ALIAS_TIMEOUT_S = 300
+ALIAS_DEFAULT = False  # I4: measured, not adopted (docs/phase0-redesign.md §7)
 
 _LOC_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+)(?:-\d+)?(?::\d+(?:-\d+)?)?$")
 _LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?\d+\s+"(?P<file>[^"]*)"')
@@ -220,11 +240,17 @@ def framac_parse(
     log_dir: Path,
     broker: bool,
     runner: Runner | None = None,
+    alias_module: Path | None = None,
 ) -> dict:
-    """{status: ok, dump, seconds} or {status: parse_failed, error, seconds}."""
+    """
+    {status: ok, dump, seconds} or {status: parse_failed, error, seconds}. With `alias_module`, the
+    same run loads it and `alias` holds its report, or {status: crashed, error} when the run produced
+    the dump but no Alias report.
+    """
     compiles = job["compiles"]
     with tempfile.TemporaryDirectory(prefix="framac-p0-") as tmp:
         out = Path(tmp) / "dump.json"
+        alias_out = Path(tmp) / "alias.json"
         spec = []
         system: list[str] = []
         for c in compiles:
@@ -246,19 +272,42 @@ def framac_parse(
         if spec:
             cmd.append("-cpp-extra-args-per-file=" + ",".join(spec))
         cmd += sorted({posixpath.join(tree, c["source"]) for c in compiles})
-        cmd += ["-load-module", str(module)]
         env = dict(os.environ, **{DUMP_OUT_ENV: str(out)})
+        if alias_module is None:
+            cmd += ["-load-module", str(module)]
+        else:
+            # The dump's extension runs first and writes its file before Alias starts.
+            cmd += ["-load-module", f"{module},{alias_module}"]
+            env.update({ALIAS_OUT_ENV: str(alias_out), ALIAS_TIMEOUT_ENV: str(ALIAS_TIMEOUT_S)})
         t0 = time.monotonic()
         rc, log = run_tool(leased(cmd, f"p0-{job['key']}", broker), tree, parse_timeout(), env, runner)
         seconds = round(time.monotonic() - t0, 2)
         _write_log(log_dir, job["key"], "framac", cmd, log)
-        if rc != 0 or not out.is_file():
+        # A run that crashed in Alias after the dump was written still parsed: the dump is complete
+        # (written to a temporary name, then renamed).
+        if not out.is_file() or (rc != 0 and alias_module is None):
             return {"status": "parse_failed", "error": first_error(log), "seconds": seconds}
         try:
             dump = json.loads(out.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             return {"status": "parse_failed", "error": f"unreadable dump: {exc}", "seconds": seconds}
-    return {"status": "ok", "dump": dump, "seconds": seconds}
+        res: dict[str, Any] = {"status": "ok", "dump": dump, "seconds": seconds}
+        if alias_module is not None:
+            res["alias"] = read_alias_report(alias_out, rc, log)
+    return res
+
+
+def read_alias_report(path: Path, rc: int, log: str) -> dict:
+    """The Alias module's report, or {status: crashed, error} when the run ended without one."""
+    if path.is_file():
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(doc, dict):
+                return doc
+        except (OSError, ValueError) as exc:
+            return {"status": "crashed", "error": f"unreadable Alias report: {exc}"}
+    reason = first_error(log) if rc != 0 else "no Alias report"
+    return {"status": "crashed", "error": f"exit {rc}: {reason}"[:ERROR_CHARS]}
 
 
 def gcc_callgraph(job: dict, tree: str, snapshot_root: str | None, log_dir: Path, runner: Runner | None = None) -> dict:
@@ -362,6 +411,37 @@ def plan_jobs(capture: dict) -> tuple[list[dict], dict[str, str]]:
     return list(jobs.values()), unit_job
 
 
+def alias_site_queues(alias: dict | None) -> dict[str, list[dict]]:
+    """An Alias report's sites per caller kernel name, in the dump's order."""
+    if not alias or alias.get("status") != "ok":
+        return {}
+    return {f["kernel_name"]: list(f.get("sites") or []) for f in alias.get("functions") or []}
+
+
+def match_alias_site(alias: dict, queues: dict[str, list[dict]], caller: str, call: dict, kmap: dict) -> dict:
+    """
+    Alias's answer for one indirect call of the dump: {status, ids, names}. `status` is the site's
+    (`targets`, `no_state`, `no_targets`, `error`), `alias_<status>` when the analysis itself did not
+    finish, or `unmatched` when the report has no site at that location. Targets defined in the parse
+    are ids; the others are names, resolved like an undefined callee.
+    """
+    if alias.get("status") != "ok":
+        return {"status": f"alias_{alias.get('status') or 'missing'}"}
+    queue = queues.get(caller) or []
+    for i, s in enumerate(queue):
+        if s.get("loc") == call.get("loc") and s.get("expr") == call.get("expr"):
+            queue.pop(i)
+            break
+    else:
+        return {"status": "unmatched"}
+    out: dict[str, Any] = {"status": s.get("status") or "error"}
+    if out["status"] == "targets":
+        names = s.get("targets") or []
+        out["ids"] = sorted({kmap[n] for n in names if n in kmap})
+        out["names"] = sorted({n for n in names if n not in kmap})
+    return out
+
+
 def closures(units: dict) -> dict[str, set[str]]:
     """Each unit with the project libraries it links, transitively."""
     out: dict[str, set[str]] = {}
@@ -409,8 +489,13 @@ class ModelBuilder:
             rec["kernel_names"][unit] = record["kernel_name"]
         rec.pop("kernel_name", None)
 
-    def add_dump(self, units: list[str], dump: dict) -> None:
+    def add_dump(self, units: list[str], dump: dict, alias: dict | None = None) -> None:
+        """
+        One parse's dump. `alias` is that parse's Alias report (scripts/phase0_alias.ml) when the
+        model runs with Alias, else None: its sites match the dump's indirect calls in order.
+        """
         own_files = {u: set(self.units[u].get("files") or []) for u in units}
+        alias_sites = alias_site_queues(alias)
         kmap: dict[str, str] = {}
         sig: dict[str, str] = {}
         for fn in dump.get("functions") or []:
@@ -460,17 +545,18 @@ class ModelBuilder:
                 continue
             for call in fn.get("calls") or []:
                 if call.get("indirect"):
-                    self.indirect_sites.append(
-                        {
-                            "unit": units[0],
-                            "units": list(units),
-                            "caller": caller,
-                            "expr": call.get("expr"),
-                            "signature": call.get("signature"),
-                            "loc": call.get("loc"),
-                            "candidates": [],
-                        }
-                    )
+                    site: dict[str, Any] = {
+                        "unit": units[0],
+                        "units": list(units),
+                        "caller": caller,
+                        "expr": call.get("expr"),
+                        "signature": call.get("signature"),
+                        "loc": call.get("loc"),
+                        "candidates": [],
+                    }
+                    if alias is not None:
+                        site["_alias"] = match_alias_site(alias, alias_sites, fn["kernel_name"], call, kmap)
+                    self.indirect_sites.append(site)
                     continue
                 callee = kmap.get(call.get("kernel_name", ""))
                 if callee:
@@ -553,7 +639,9 @@ class ModelBuilder:
                 else:
                     self.edges[(caller, fid, "indirect")].add("callback-arg")
         for site in self.indirect_sites:
+            alias = site.pop("_alias", None)
             if site.get("signature") is None:
+                site.update(narrowing="none", narrowing_reason="gcc_fallback", dropped=[])
                 continue
             pool: set[str] = set()
             for prog in self.programs:
@@ -561,9 +649,40 @@ class ModelBuilder:
                     for u in prog:
                         pool |= self.taken.get(u, set())
             cands = sorted(f for f in pool if self.functions[f]["signature"] == site["signature"])
-            site["candidates"] = cands
-            for c in cands:
-                self.edges[(site["caller"], c, "indirect")].add("type-match")
+            kept, reason = self._narrow(site, cands, alias)
+            site["candidates"] = kept
+            site.update(
+                narrowing="alias" if reason == "alias" else "none",
+                narrowing_reason=reason,
+                dropped=sorted(set(cands) - set(kept)),
+            )
+            for c in kept:
+                sources = self.edges[(site["caller"], c, "indirect")]
+                sources.add("type-match")
+                if reason == "alias":
+                    sources.add(SOURCE_ALIAS)
+
+    def _narrow(self, site: dict, cands: list[str], alias: dict | None) -> tuple[list[str], str]:
+        """
+        The candidates a site keeps and why: `alias` when Alias's targets narrowed the type match,
+        else the reason the full type match stays (`disabled`, `alias_<status>`, `no_targets`, ...).
+        """
+        if alias is None:
+            return cands, "disabled"
+        if not cands:
+            return cands, "no_candidates"
+        if alias["status"] != "targets":
+            return cands, alias["status"]
+        targets: set[str] = set(alias.get("ids") or [])
+        for name in alias.get("names") or []:
+            fid = self._lookup_global(site["unit"], name) or self.globals.get(site["unit"], {}).get(name)
+            if fid:
+                targets.add(fid)
+        kept = [c for c in cands if c in targets]
+        if not kept:
+            # Alias names functions, none of the call's type: a cast. Trust the type match.
+            return cands, "disjoint"
+        return kept, "alias"
 
     def aliases(self, defines: Iterable[dict]) -> dict[str, dict]:
         """Macro aliases whose value resolves, through other aliases, to defined functions."""
@@ -596,6 +715,7 @@ def build_model(
     jobs_n: int | None = None,
     broker: bool = True,
     runner: Runner | None = None,
+    alias: bool = ALIAS_DEFAULT,
 ) -> tuple[dict, int]:
     t0 = time.monotonic()
     model: dict[str, Any] = {
@@ -630,10 +750,21 @@ def build_model(
             model["dump_module"] = {"status": "compile_failed"}
             return model, 1
         model["dump_module"] = {"status": "ok"}
+        alias_module: Path | None = None
+        alias_info: dict[str, Any] = {"enabled": alias}
+        if alias:
+            alias_module, why = compile_dump_module(
+                Path(tmp), runner=runner, dump_source=ALIAS_SOURCE, packages=ALIAS_PACKAGES
+            )
+            alias_info.update(module="ok" if alias_module else "compile_failed", timeout_s=ALIAS_TIMEOUT_S)
+            if alias_module is None:
+                alias_info["error"] = why[-ERROR_CHARS:]
+                model["warnings"].append("Alias module does not compile: indirect sites keep their type match")
+        model["alias"] = alias_info
         workers = max(1, jobs_n or _default_jobs())
 
         def one(job: dict) -> dict:
-            res = framac_parse(job, tree, snapshot_root, module, log_dir, broker, runner)
+            res = framac_parse(job, tree, snapshot_root, module, log_dir, broker, runner, alias_module)
             if res["status"] != "ok":
                 res["gcc"] = gcc_callgraph(job, tree, snapshot_root, log_dir, runner)
             return res
@@ -656,7 +787,17 @@ def build_model(
             "seconds": res["seconds"],
         }
         if res["status"] == "ok":
-            builder.add_dump(job["units"], res["dump"])
+            report = res.get("alias") or ({"status": "unavailable"} if alias else None)
+            if report is not None:
+                entry["alias"] = {
+                    k: report[k] for k in ("status", "error", "seconds") if report.get(k) not in (None, "")
+                }
+                if report.get("status") not in ("ok", "unavailable"):
+                    model["warnings"].append(
+                        f"{', '.join(job['units'])}: Alias {report.get('status')} ({report.get('error', '')}); "
+                        "its indirect sites keep their type match"
+                    )
+            builder.add_dump(job["units"], res["dump"], report)
         else:
             entry["error"] = res["error"]
             g = res["gcc"]
@@ -665,6 +806,13 @@ def build_model(
             model["warnings"].append(f"{', '.join(job['units'])}: Frama-C cannot parse ({res['error']}); GCC fallback")
         parse_jobs.append(entry)
     builder.resolve()
+    if alias:
+        reasons = Counter(s["narrowing_reason"] for s in builder.indirect_sites)
+        model["alias"].update(
+            sites=dict(sorted(reasons.items())),
+            dropped_candidates=sum(len(s["dropped"]) for s in builder.indirect_sites),
+            seconds=round(sum((j.get("alias") or {}).get("seconds") or 0 for j in parse_jobs), 3),
+        )
     by_key = {j["key"]: j for j in parse_jobs}
     units_out: dict[str, dict] = {}
     for name, u in sorted((capture.get("units") or {}).items()):
@@ -779,13 +927,19 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", type=Path, default=Path(DEFAULT_OUT))
     r.add_argument("--jobs", type=int, default=None, help="Parallel parses (default: this container's CPUs)")
     r.add_argument("--no-broker", action="store_true", help="Run Frama-C without a parse lease (tests, debugging)")
+    r.add_argument(
+        "--alias",
+        action=argparse.BooleanOptionalAction,
+        default=ALIAS_DEFAULT,
+        help="Narrow indirect sites' type match with Frama-C's Alias plugin (default: %(default)s)",
+    )
     sub.add_parser("selftest", help="Check the dump module against this kernel")
     a = p.parse_args(argv)
     if a.cmd == "selftest":
         res = selftest()
         print(json.dumps(res, indent=2))
         return 0 if res["ok"] else 1
-    model, rc = build_model(a.capture, a.out, a.jobs, broker=not a.no_broker)
+    model, rc = build_model(a.capture, a.out, a.jobs, broker=not a.no_broker, alias=a.alias)
     problems = validate_model(model)
     if problems:
         model["warnings"].append(f"schema: {problems[:5]}")
@@ -797,6 +951,7 @@ def main(argv: list[str] | None = None) -> int:
         "functions": len(model.get("functions") or {}),
         "edges": len(model.get("edges") or []),
         "macro_aliases": len(model.get("macro_aliases") or {}),
+        "alias": {k: v for k, v in (model.get("alias") or {}).items() if k in ("enabled", "module", "sites")},
         "seconds": model.get("seconds"),
         "warnings": model["warnings"][:10],
     }

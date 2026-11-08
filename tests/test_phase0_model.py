@@ -139,6 +139,164 @@ def test_indirect_sites_match_address_taken_functions_of_the_same_signature_acro
     )
 
 
+def _alias_report(sites_by_caller, status="ok"):
+    return {
+        "schema": 1,
+        "status": status,
+        "error": "" if status == "ok" else "boom",
+        "seconds": 0.01,
+        "functions": [{"kernel_name": k, "sites": sites} for k, sites in sites_by_caller.items()],
+    }
+
+
+def _alias_site(status, targets=(), expr="f", loc="x"):
+    site = {"expr": expr, "loc": loc, "status": status}
+    if targets:
+        site["targets"] = list(targets)
+    return site
+
+
+ALIAS_UNITS = {"libcb.a": {"kind": "static_lib", "files": ["src/cb.c"], "links": []}}
+
+
+def _alias_dump():
+    """fire: one site; disp: two sites with the same expression at different lines. a, b, c: int(int)."""
+    return {
+        "functions": [
+            _fn("a", "a", "src/cb.c", 1),
+            _fn("b", "b", "src/cb.c", 2),
+            _fn("c", "c", "src/cb.c", 3),
+            _fn("fire", "fire", "src/cb.c", 5, [_indirect(expr="g")]),
+            _fn(
+                "disp",
+                "disp",
+                "src/cb.c",
+                9,
+                [{**_indirect(expr="t.f"), "loc": "l10"}, {**_indirect(expr="t.f"), "loc": "l11"}],
+            ),  # fmt: skip
+        ],
+        "address_taken": ["a", "b", "c"],
+    }
+
+
+def _sites(b):
+    return {(s["caller"], s.get("loc")): s for s in b.indirect_sites}
+
+
+@pytest.mark.unit
+def test_alias_narrows_the_type_match_and_records_why_each_site_kept_or_lost_candidates():
+    b = _builder(ALIAS_UNITS)
+    report = _alias_report(
+        {
+            "fire": [_alias_site("targets", ["a"], expr="g")],
+            # Reported out of order: matched by location and expression, not position.
+            "disp": [
+                _alias_site("no_targets", expr="t.f", loc="l11"),
+                _alias_site("targets", ["b", "c"], expr="t.f", loc="l10"),
+            ],  # fmt: skip
+        }
+    )
+    b.add_dump(["libcb.a"], _alias_dump(), report)
+    b.resolve()
+    s = _sites(b)
+    fire = s[("src/cb.c#fire", "x")]
+    assert fire["candidates"] == ["src/cb.c#a"] and fire["narrowing"] == "alias"
+    assert fire["dropped"] == ["src/cb.c#b", "src/cb.c#c"]
+    assert s[("src/cb.c#disp", "l10")]["candidates"] == ["src/cb.c#b", "src/cb.c#c"]
+    kept = s[("src/cb.c#disp", "l11")]
+    assert kept["narrowing"] == "none" and kept["narrowing_reason"] == "no_targets" and len(kept["candidates"]) == 3
+    assert b.edges[("src/cb.c#fire", "src/cb.c#a", "indirect")] == {"type-match", "alias"}
+    assert ("src/cb.c#fire", "src/cb.c#b", "indirect") not in b.edges
+    # disp's second site keeps a through the type match alone.
+    assert b.edges[("src/cb.c#disp", "src/cb.c#a", "indirect")] == {"type-match"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["failed", "timeout", "crashed", "unavailable"])
+def test_alias_failure_keeps_every_type_match_with_the_reason(status):
+    b = _builder(ALIAS_UNITS)
+    b.add_dump(["libcb.a"], _alias_dump(), {"status": status, "error": "boom"})
+    b.resolve()
+    for site in b.indirect_sites:
+        assert site["narrowing"] == "none" and site["narrowing_reason"] == f"alias_{status}"
+        assert len(site["candidates"]) == 3 and site["dropped"] == []
+
+
+@pytest.mark.unit
+def test_alias_sites_that_do_not_match_or_name_no_candidate_keep_the_type_match():
+    b = _builder(ALIAS_UNITS)
+    report = _alias_report(
+        {
+            "fire": [_alias_site("targets", ["printf_like"], expr="g")],  # outside the type match: a cast
+            "disp": [_alias_site("no_state", expr="t.f", loc="l10")],  # l11 missing from the report
+        }
+    )
+    b.add_dump(["libcb.a"], _alias_dump(), report)
+    b.resolve()
+    s = _sites(b)
+    assert s[("src/cb.c#fire", "x")]["narrowing_reason"] == "disjoint"
+    assert s[("src/cb.c#disp", "l10")]["narrowing_reason"] == "no_state"
+    assert s[("src/cb.c#disp", "l11")]["narrowing_reason"] == "unmatched"
+    assert all(len(site["candidates"]) == 3 for site in b.indirect_sites)
+
+
+@pytest.mark.unit
+def test_alias_targets_defined_in_a_linked_unit_resolve_by_name():
+    units = {
+        "liblib.a": {"kind": "static_lib", "files": ["src/lib.c"], "links": []},
+        "tool": {"kind": "executable", "files": ["tools/main.c"], "links": ["liblib.a"]},
+    }
+    b = _builder(units)
+    b.add_dump(["liblib.a"], {"functions": [_fn("on_a", "on_a", "src/lib.c", 1), _fn("on_b", "on_b", "src/lib.c", 3)],
+                              "address_taken": ["on_a", "on_b"]})  # fmt: skip
+    b.add_dump(
+        ["tool"],
+        {"functions": [_fn("main", "main", "tools/main.c", 1, [_indirect()])], "address_taken": []},
+        _alias_report({"main": [_alias_site("targets", ["on_b"])]}),
+    )
+    b.resolve()
+    site = b.indirect_sites[0]
+    assert site["candidates"] == ["src/lib.c#on_b"] and site["dropped"] == ["src/lib.c#on_a"]
+
+
+@pytest.mark.unit
+def test_without_alias_sites_record_that_no_narrowing_ran():
+    b = _builder(ALIAS_UNITS)
+    b.add_dump(["libcb.a"], _alias_dump())
+    b.resolve()
+    assert {(s["narrowing"], s["narrowing_reason"]) for s in b.indirect_sites} == {("none", "disabled")}
+    assert all(src == {"type-match"} for (_, _, k), src in b.edges.items() if k == "indirect")
+
+
+@pytest.mark.unit
+def test_alias_report_reading(tmp_path):
+    path = tmp_path / "alias.json"
+    assert pm.read_alias_report(path, 0, "")["status"] == "crashed"
+    crashed = pm.read_alias_report(path, 2, "[alias] failure: Stack overflow\n")
+    assert crashed["status"] == "crashed" and "exit 2" in crashed["error"]
+    path.write_text(json.dumps(_alias_report({})), encoding="utf-8")
+    assert pm.read_alias_report(path, 0, "")["status"] == "ok"
+
+
+@pytest.mark.unit
+def test_framac_parse_loads_the_alias_module_and_keeps_the_dump_when_alias_crashes(tmp_path):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw["env"]
+        Path(kw["env"][pm.DUMP_OUT_ENV]).write_text(json.dumps({"functions": []}), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 3, "", "[alias] failure: Stack overflow\n")
+
+    job = {"key": "k", "compiles": [{"source": "a.c", "flags": [], "system_flags": []}]}
+    res = pm.framac_parse(job, TREE, None, Path("/m/dump.cmxs"), tmp_path, False, fake_run, Path("/m/alias.cmxs"))
+    assert seen["cmd"][seen["cmd"].index("-load-module") + 1] == f"{Path('/m/dump.cmxs')},{Path('/m/alias.cmxs')}"
+    assert seen["env"][pm.ALIAS_TIMEOUT_ENV] == str(pm.ALIAS_TIMEOUT_S)
+    assert res["status"] == "ok" and res["alias"]["status"] == "crashed"
+    # Without Alias, a failing run is a failed parse, as before.
+    res = pm.framac_parse(job, TREE, None, Path("/m/dump.cmxs"), tmp_path, False, fake_run)
+    assert res["status"] == "parse_failed" and "alias" not in res
+
+
 @pytest.mark.unit
 def test_thread_spawns_and_callbacks_passed_to_externals():
     units = {"libpool.a": {"kind": "static_lib", "files": ["src/pool.c"], "links": []}}
@@ -361,7 +519,7 @@ def model_run():
             timeout=timeout, check=False,
         )  # fmt: skip
 
-    def run(fixture: Path, run_dir: Path, build: str) -> dict:
+    def run(fixture: Path, run_dir: Path, build: str, model_args: str = "") -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
         vol = f"p0model-test-{uuid.uuid4().hex[:12]}"
         volumes.append(vol)
@@ -380,7 +538,7 @@ def model_run():
              f"{py}/build_capture.py run --scratch /framac-scratch --recipe-file '' --command '{build}'"]
         )  # fmt: skip
         assert cap.returncode == 0, cap.stdout + cap.stderr
-        mod = docker([*common, "--entrypoint", "sh", PIPELINE_IMAGE, "-c", f"{py}/phase0_model.py run"])
+        mod = docker([*common, "--entrypoint", "sh", PIPELINE_IMAGE, "-c", f"{py}/phase0_model.py run {model_args}"])
         assert mod.returncode == 0, mod.stdout + mod.stderr
         return json.loads((run_dir / pm.DEFAULT_OUT).read_text(encoding="utf-8"))
 
@@ -435,6 +593,27 @@ def test_gcc_fallback_aliases_and_header_inline_on_the_features_fixture(model_ru
     alias = model["macro_aliases"]["crypto_hash"]
     assert alias["ids"] == ["src/hash.c#crypto_hash_sha512_tweet"] and alias["via"] == ["crypto_hash_sha512"]
     assert any("GCC fallback" in w for w in model["warnings"])
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_alias_narrowing_on_the_alias_fixture(model_run, tmp_path):
+    model = model_run(FIXTURES / "model" / "alias", tmp_path / "run", "make", "--alias")
+    assert not pm.validate_model(model)
+    assert model["alias"]["enabled"] and model["alias"]["module"] == "ok"
+    assert all(j["alias"]["status"] == "ok" for j in model["parse_jobs"])
+    sites = {s["caller"]: s for s in model["indirect_sites"]}
+    every = ["src/cb.c#a", "src/cb.c#b", "src/cb.c#c"]
+    assert sites["src/cb.c#pick"]["candidates"] == ["src/cb.c#a", "src/cb.c#c"]
+    assert sites["src/cb.c#pick"]["narrowing"] == "alias" and sites["src/cb.c#pick"]["dropped"] == ["src/cb.c#b"]
+    assert sites["src/cb.c#apply"]["candidates"] == every
+    assert sites["src/cb.c#apply"]["narrowing_reason"] == "no_targets"
+    # The unsoundness that keeps Alias off by default: set_g makes g point to b.
+    assert sites["src/cb.c#fire"]["candidates"] == ["src/cb.c#a"]
+    assert sites["src/cb.c#fire"]["dropped"] == ["src/cb.c#b", "src/cb.c#c"]
+    off = model_run(FIXTURES / "model" / "alias", tmp_path / "run-off", "make")
+    assert {s["narrowing_reason"] for s in off["indirect_sites"]} == {"disabled"}
+    assert off["alias"] == {"enabled": False}
 
 
 @pytest.mark.integration
