@@ -137,6 +137,12 @@ def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
         "tlv", tmp_path / "harnesses", "-include workspace/work/config.h"
     )
     assert again.count("config.h") == 1
+    # A quoted macro value survives the merge (CryptoLib's -DMC_LOG_PATH="log.txt").
+    modules: dict = dag["modules"]  # type: ignore[assignment]
+    modules["libtlv_a"]["cppflags"] = ['-DLOG="log.txt"']
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_module_cppflags("tlv", tmp_path / "harnesses", "-DA='x y'")
+    assert generate_harness._split_cppflags(merged)[:2] == ["-DA=x y", '-DLOG="log.txt"']
 
 
 def test_modules_are_the_non_test_link_units() -> None:
