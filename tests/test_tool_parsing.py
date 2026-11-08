@@ -7,6 +7,7 @@ from run_eacsl_fuzz import (
     parse_eacsl_failure,
     parse_runtime_failure,
     parse_sanitizer_failure,
+    stable_ubsan_message,
 )
 from run_eva_slice import extract_error_summary
 from run_wp_function import (
@@ -107,6 +108,10 @@ SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/LibPtfCom/PtfMsg.c:9
     assert f_ub["function"] == "CheckMessageValidity"
     assert f_ub["alarm_kind"] == "signed_overflow"
     assert f_ub["is_rte"] is True
+    assert (
+        f_ub["predicate"] == "rte: signed_overflow: signed integer overflow: N + N cannot be represented in type 'int'"
+    )
+    assert f_ub["message"] == "signed integer overflow: 2147483640 + 100 cannot be represented in type 'int'"
 
     asan_log = """=================================================================
 ==42==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014 at pc 0x55555558a123 bp 0x7fffffffd100 sp 0x7fffffffd0f8
@@ -157,6 +162,40 @@ def test_ubsan_resolves_function_from_source_line_without_stacktrace(tmp_path, m
     assert parsed["line"] == 7
     assert parsed["function"] == "SendEvent"
     assert parsed["alarm_kind"] == "index_bound"
+
+
+def test_ubsan_runtime_values_leave_the_predicate_and_the_fingerprint():
+    from fingerprint import make_fingerprint
+
+    cases = {
+        "left shift of negative value -2806": "left shift of negative value N",
+        "signed integer overflow: -2147483648 - 1 cannot be represented in type 'int'": (
+            "signed integer overflow: N - N cannot be represented in type 'int'"
+        ),
+        "index 1025 out of bounds for type 'char[1024]'": "index N out of bounds for type 'char[1024]'",
+        "shift exponent 40 is too large for 32-bit type 'int32_t'": (
+            "shift exponent N is too large for N-bit type 'int32_t'"
+        ),
+        "load of misaligned address 0x7ffd1a2b for type 'uint32_t', which requires 4 byte alignment": (
+            "load of misaligned address N for type 'uint32_t', which requires N byte alignment"
+        ),
+        "1.5e+10 is outside the range of representable values of type 'int'": (
+            "N is outside the range of representable values of type 'int'"
+        ),
+        "negation of -2147483648 cannot be represented in type 'int'; cast to an unsigned type": (
+            "negation of N cannot be represented in type 'int'; cast to an unsigned type"
+        ),
+    }
+    for raw, stable in cases.items():
+        assert stable_ubsan_message(raw) == stable
+
+    def fp(value: int) -> str:
+        log = f"tweetnacl.c:282:9: runtime error: left shift of negative value {value}\n"
+        f = parse_sanitizer_failure(log)
+        assert f is not None
+        return make_fingerprint(f["file"], "car25519", f["alarm_kind"], f["predicate"])
+
+    assert fp(-2806) == fp(-19345)
 
 
 def test_campaign_classification():

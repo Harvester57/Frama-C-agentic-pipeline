@@ -27,7 +27,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| **Fingerprint** | `minmea.c#minmea_getdatetime::signed_overflow::95a4d01721` |
+| **Fingerprint** | `minmea.c#minmea_getdatetime::signed_overflow::b7030b5601` |
 | **Status** | Confirmed (Unreported) |
 | **Upstream Ticket** | Pending / Not yet filed |
 | **Severity** | **Medium** (C11 signed integer overflow reachable from untrusted NMEA 0183 sentence input; corrupts `struct tm` handed to `timegm()`) |
@@ -203,7 +203,7 @@ Replace `abs(frame->hour_offset) > 13` with explicit signed range comparisons:
 
 | Field | Value |
 | :--- | :--- |
-| **Fingerprint** | `minmea.c#minmea_scan::signed_overflow::e0fa2b9da1` |
+| **Fingerprint** | `minmea.c#minmea_scan::signed_overflow::d8e58750af` |
 | **Status** | Confirmed (Unreported) |
 | **Upstream Ticket** | Pending / Not yet filed |
 | **Severity** | **Low** (C11 signed integer overflow reachable from any NMEA sentence parser that scans a floating-point `'f'` field; corrupts the fixed-point scale of the parsed field) |

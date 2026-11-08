@@ -231,6 +231,19 @@ _UBSAN_RE = re.compile(
     r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+)(?::\d+)?:\s*runtime error:\s*(?P<pred>[^\n]+)",
     re.IGNORECASE,
 )
+# A runtime value in a UBSan message: an integer, a hex address, a float. Not inside a quoted type.
+_UBSAN_VALUE_RE = re.compile(r"(?<![\w.])[-+]?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)(?![\w.])")
+
+
+def stable_ubsan_message(message: str) -> str:
+    """
+    A UBSan message with its runtime values replaced by `N`: `left shift of negative value -2806`
+    and `... -19345` are one defect, and the predicate feeds the fingerprint. Quoted type names
+    (`'char[1024]'`) are static and stay.
+    """
+    parts = re.split(r"('[^']*')", message)
+    return "".join(p if p.startswith("'") else _UBSAN_VALUE_RE.sub("N", p) for p in parts)
+
 
 # ASan header:
 #   ==123==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x...
@@ -515,7 +528,9 @@ def parse_sanitizer_failure(text: str) -> dict | None:
             "kind": "ubsan_runtime_error",
             "alarm_kind": alarm,
             "is_rte": True,
-            "predicate": f"rte: {alarm}: {pred}",
+            # Values out of the predicate (it is fingerprinted); the message as printed stays apart.
+            "predicate": f"rte: {alarm}: {stable_ubsan_message(pred)}",
+            "message": pred,
         }
 
     asan = _ASAN_ERR_RE.search(text)
