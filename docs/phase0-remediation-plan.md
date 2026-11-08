@@ -24,6 +24,9 @@ Taken by the user as recommended. The steps below follow them.
 | D5 | Defect 14: one configuration per source file shared by several units (qlz's four executables). | (a) One parse per (file, configuration) and per-unit DAG views; (b) document as a limit. | **(b) now.** qlz is the only benchmark target with the shape. Revisit with (a) when a target needs it (R10 records it). |
 | D6 | `poc/phase0/` | (a) Remove; (b) keep as history. | **(a),** after `benchmark_seeded.CORPUS` points at `tests/fixtures/phase0/seeded/`. The two copies differ only in the README and in `s08_wellformed_input/truth.json`, which gained the `trust` truth. Check the scorer accepts the fixture copy first (R9). |
 | D7 | The manifest's unused `compile_commands` field and CryptoLib's `compile_commands.json` asset | (a) Remove with the next baseline; (b) keep. | **(a),** in the same change as the baseline re-record, because both feed `harness_digest`. |
+| D1′ (2026-11-08, evening) | D1 revisited: the API-reach work (`c5a8381`..`684052f`) landed after V, so the validated tree is no longer the head. | (a) Merge `c5ee34e` now, the rest after a second V; (b) land R1–R10 on the branch, one V on the result, then merge everything. | **(b).** One validation covers today's work and the R steps; `main` stays untouched until it passes. V re-records the baseline as `phase0-r2`. |
+| D8 | Must ledgers from before I9 (classes `l4_auth`, `l5_output`, `l6_secret`) still load? | (a) No: drop the classes; (b) yes: keep them in the schema enums and the report. | **(a).** A pre-redesign run directory cannot be resumed with the new DAG and units anyway. R2, R4 and R10 drop them everywhere. |
+| D9 | Open items the steps left to the implementer | — | Taken as the steps recommend: R4 keeps a model or DAG field only if the report or the benchmark shows it and drops the rest; R5 writes and keeps `scope_files` (also through `--api`); R7 drops the DAG's never-produced `header`/`headers`/`skipped` reads; R8 documents the pinned-digest alignment of the two base stages. |
 
 ## Rules for every step
 
@@ -151,7 +154,8 @@ These are the same as the implementation plan's rules:
   - **One self-validation policy:** producers write their artifact and record schema problems as warnings; `validate_artifacts run-dir` fails on them. Today `build_capture` and `phase0_model` warn, `security_props` exits 2, and `trust.py run` does not validate. R3 aligns `security_props` and `trust`.
   - **Sidecar `scope_files`:** `module_map.py` reads it and the slice skill documents it, but `generate_harness.py` never writes it, and a regeneration drops it. Either `generate_harness.py` writes and keeps it (`--scope-file`), or the read and the doc go. Recommendation: write it, because sub-module scope is otherwise only the lexer module or the sources.
   - **`infer_unit`:** vote by DAG key, not plain name (`module_map.py`).
-- **Owns:** `schemas/` (new files), `scripts/validate_artifacts.py`, `scripts/module_map.py`, `scripts/generate_harness.py`.
+  - **Since the API-reach work (`c5a8381`..`684052f`):** the sidecar schema covers `api_harness`, `api_cases` (each case's `selector`, `kind`, `calls`, `slots`, `rest`, `entry`) and `api_skipped`; a schema for `seed_harvest.json` (with `source`, `executables`, `runs`, `traces`) and one for the lines of `workspace/seed_records/traces.jsonl`; `scope_files` survives a regeneration through `generate_harness.py --api` too.
+- **Owns:** `schemas/` (new files), `scripts/validate_artifacts.py`, `scripts/module_map.py`, `scripts/generate_harness.py`, `scripts/api_harness.py` (sidecar writing only).
 - **Tests:**
   - each schema accepts the producer's output on the recorded fixtures and rejects a broken one;
   - `validate run-dir` catches a DAG with a wrong shape;
@@ -216,7 +220,7 @@ These are the same as the implementation plan's rules:
     - This explains QCBOR-02/03 reading `retained (partial)` with qcbor-dev's `ieee754` replay `not_run` in every baseline since `phase0-i5a`.
     - Re-check those two bugs on qcbor-dev in V.
   - **D7:** remove the manifest's `compile_commands` and CryptoLib's asset, with the baseline re-record.
-  - **D6:** `CORPUS` points at `tests/fixtures/phase0/seeded/`, then `poc/phase0/` goes.
+  - **D6:** `CORPUS` points at `tests/fixtures/phase0/seeded/`, then the tracked files of `poc/phase0/` go (`git rm`). `poc/phase0/out/` is the benchmark's untracked work directory (checkouts, runs, results) and stays; move the default work directory out of `poc/` only if nothing else points at it.
   - **`docs/benchmark.md`:**
     - the latest baseline;
     - `--compare default`, whose `default.json` is the pre-redesign `dagfix-2`;
@@ -324,4 +328,4 @@ These are known limits of the design, recorded in the step notes. None is a defe
 | R8 | M | open |
 | R9 | M | open |
 | R10 | S | open |
-| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second, after R1–R9, waits for the user |
+| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second runs after R1–R10 (D1′) and records `phase0-r2` |
