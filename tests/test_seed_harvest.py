@@ -291,6 +291,7 @@ def test_collect_writes_ordered_traces_and_dedups_calls_without_addresses(tmp_pa
     keypair, box = traces[0]
     assert keypair["addrs"] == {"0": "100", "1": "200"} and box["addrs"]["3"] == "100"
     assert box["sizes"] == {"0": 1, "1": 2, "3": 2}
+    assert sh.trace_call({"fn": "f", "args": {"0": [["p", 0, "00"]], "1": [["s", 0, "6869"]]}})["sizes"] == {}
     import api_harness
 
     assert api_harness.chains(traces[0]) == [[0, 1]]

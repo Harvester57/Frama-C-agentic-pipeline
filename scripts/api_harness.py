@@ -128,6 +128,30 @@ class _Case:
         return " ".join(body)
 
 
+def _is_pair(params: list[dict], i: int) -> bool:
+    """A byte pointer followed by a length: a (buffer, length) pair."""
+    p = params[i]
+    nxt = params[i + 1] if i + 1 < len(params) else None
+    charlike = p.get("pointee") in _CHAR_POINTEES or p.get("pointee") == ""
+    return p["kind"] == "ptr" and charlike and nxt is not None and nxt["kind"] == "int" and nxt["ctype"] in _LEN_SCALARS
+
+
+def _variable_length(params: list[dict], formals: list[dict], rec: dict, shared: dict[int, str]) -> bool:
+    """
+    Whether the call reads an input pair of no known size, so its length comes from the fuzz input. A
+    lone output pointer of such a call (crypto_box's `c`, sized by `mlen`) may receive that many bytes,
+    whatever size its call sites showed: it gets a spare buffer.
+    """
+    return any(
+        _is_pair(params, i) and i not in shared and _is_input(formals, i) and param_size(rec, i) is None
+        for i in range(len(params))
+    )
+
+
+def _lone_output(params: list[dict], formals: list[dict], i: int) -> bool:
+    return params[i]["kind"] == "ptr" and not _is_pair(params, i) and not _is_input(formals, i)
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -139,6 +163,7 @@ def _bind_call(
 ) -> str:
     """The declarations and slots of one call's arguments (added to `case`); returns the call statement."""
     shared = shared or {}
+    varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
     i = 0
     n = len(params)
@@ -174,7 +199,7 @@ def _bind_call(
         if p["kind"] == "ptr":
             pointee = p.get("pointee") or "void"
             is_input = _is_input(formals, i)
-            size = param_size(rec, i)
+            size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
             charlike = pointee in _CHAR_POINTEES or pointee == ""
             pair = charlike and nxt is not None and nxt["kind"] == "int" and nxt["ctype"] in _LEN_SCALARS
             if pair and nxt is not None and (i + 1) not in shared:
@@ -216,6 +241,9 @@ def _bind_call(
                 )
                 if is_input:
                     case.slot(v, size, call, i, "bytes", addr=False)
+                args.append(f"({p['type']}){v}")
+            elif varlen and _lone_output(params, formals, i):
+                case.decls.append(f"static unsigned char {v}[{case.spare}]; memset({v}, 0, sizeof({v}));")
                 args.append(f"({p['type']}){v}")
             else:
                 case.decls.append(f"{pointee} {v}; memset(&{v}, 0, sizeof({v}));")
@@ -311,6 +339,32 @@ def chains(trace: list[dict]) -> list[list[int]]:
     return [g for g in groups.values() if len(g) > 1]
 
 
+def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], addr: str) -> int:
+    """
+    The size of a buffer shared by the calls of a chain: the largest the model gives any of its uses,
+    0 (a spare buffer) when no use has one or a use is the lone output of a variable-length call. The
+    bytes the trace recorded are not a size: they are what one run passed, often less than the object.
+    """
+    sizes: list[int] = []
+    for j in chain:
+        rec = records.get(trace[j]["fn"]) or {}
+        params, _ = plan_params(str(rec.get("signature") or ""))
+        formals = list(rec.get("formals") or [])
+        for i_s, a in (trace[j].get("addrs") or {}).items():
+            if a != addr:
+                continue
+            i = int(i_s)
+            if (
+                params
+                and i < len(params)
+                and _lone_output(params, formals, i)
+                and _variable_length(params, formals, rec, {})
+            ):
+                return 0
+            sizes.append(param_size(rec, i) or 0)
+    return max(sizes, default=0)
+
+
 def sequence_case(
     trace: list[dict], chain: list[int], records: dict[str, dict], spare: int
 ) -> tuple[str | None, dict | None, str | None]:
@@ -347,16 +401,7 @@ def sequence_case(
                 continue
             if addr not in buffers:
                 var = f"s{len(buffers)}"
-                # The largest size the model gives any use of this address, or the trace recorded.
-                size = max(
-                    [
-                        param_size(records.get(trace[j]["fn"]) or {}, int(i)) or 0
-                        for j in chain
-                        for i, a in (trace[j].get("addrs") or {}).items()
-                        if a == addr
-                    ]
-                    + [int((call.get("sizes") or {}).get(idx_s) or 0)]
-                )
+                size = _shared_size(trace, chain, records, addr)
                 case.decls.append(
                     f"{_storage(size or None)}unsigned char {var}[{size or spare}]; memset({var}, 0, sizeof({var}));"
                 )
@@ -415,7 +460,10 @@ def plan(
         cases.append(stmt)
         layouts.append({**layout, "entry": key})
     seq_seen: set[tuple[str, ...]] = set()
-    for trace in traces or []:
+    for full in traces or []:
+        # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
+        # produced comes from the input instead, and the rest of the chain stays.
+        trace = [c for c in full if c.get("fn") in records]
         for chain in chains(trace):
             sig = tuple(trace[k]["fn"] for k in chain)
             if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:

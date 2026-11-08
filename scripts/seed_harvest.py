@@ -538,7 +538,8 @@ def trace_call(rec: dict[str, Any]) -> dict[str, Any]:
     """A trace entry: the call with its pointer addresses and the bytes recorded per argument."""
     sizes: dict[str, int] = {}
     for idx, vals in rec["args"].items():
-        lens = [len(hexv) // 2 for kind, _off, hexv in vals if kind in ("a", "b", "p", "s")]
+        # Buffers only: a 'p' record is one pointee and an 's' record a string's length, not the object.
+        lens = [len(hexv) // 2 for kind, _off, hexv in vals if kind in ("a", "b")]
         if lens:
             sizes[idx] = max(lens)
     return {"fn": rec["fn"], "args": rec["args"], "addrs": rec.get("addrs") or {}, "sizes": sizes}

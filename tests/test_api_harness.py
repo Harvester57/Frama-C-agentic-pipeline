@@ -170,6 +170,31 @@ def test_sequence_case_passes_shared_buffers_between_calls():
     assert layout["calls"] == ["keypair", "box"] and layout["kind"] == "sequence"
     # keypair writes the shared buffers; box takes the rest of the input as its message.
     assert layout["rest"] == {"call": 1, "param": 1, "kind": "bytes"}
+    # box's output receives mlen bytes, mlen from the input: a spare buffer, even with a call-site size
+    # or a recorded size from the trace
+    records["box"]["param_sizes"]["0"] = {"max": 64}
+    trace = _trace()
+    trace[2] = {**trace[2], "sizes": {"0": 1}}
+    stmt, _, _ = ah.sequence_case(trace, [0, 2], records, SPARE)
+    assert stmt is not None and f"static unsigned char c1a0[{SPARE}];" in stmt
+    shared_out = [{"fn": "box", "args": {}, "addrs": {"0": "500"}}, {"fn": "box", "args": {}, "addrs": {"1": "500"}}]
+    stmt, _, _ = ah.sequence_case(shared_out, [0, 1], records, SPARE)
+    assert stmt is not None and f"static unsigned char s0[{SPARE}];" in stmt
+
+
+def test_single_case_gives_a_variable_length_call_spare_outputs():
+    rec = {
+        "signature": "int(unsigned char *,unsigned char *,unsigned long long,unsigned char *)",
+        "formals": _formals("pointer", "const_pointer", "value", "const_pointer"),
+        "param_sizes": {"0": {"max": 64}, "3": {"max": 24}},
+    }
+    stmt, layout, _ = ah.single_case("box", rec, SPARE)
+    assert stmt is not None and layout is not None
+    assert f"static unsigned char c0a0[{SPARE}];" in stmt and "unsigned char c0a3[24];" in stmt
+    # with a known-size input there is no variable length: the output keeps its call-site size
+    rec["param_sizes"]["1"] = {"max": 16}
+    stmt, _, _ = ah.single_case("box", rec, SPARE)
+    assert stmt is not None and "unsigned char c0a0[64];" in stmt
 
 
 def test_plan_adds_sequence_cases_from_traces():
@@ -182,6 +207,12 @@ def test_plan_adds_sequence_cases_from_traces():
     p = ah.plan(dag, model, "lib", "lib", 64, [_trace(), _trace()])
     kinds = [lay["kind"] for lay in p["layouts"]]
     assert kinds == ["single", "single", "single", "sequence"]
+    # A call into another module (randombytes filling the nonce) drops out; the chain stays.
+    entropy = {"fn": "randombytes", "args": {}, "addrs": {"0": "700"}}
+    traced = [entropy, *_trace()]
+    traced[3] = {**traced[3], "addrs": {**traced[3]["addrs"], "2": "700"}}
+    p = ah.plan(dag, model, "lib", "lib", 64, [traced])
+    assert [lay["calls"] for lay in p["layouts"] if lay["kind"] == "sequence"] == [["keypair", "box"]]
 
 
 # --- seeds from layouts --------------------------------------------------------------------------------
