@@ -29,6 +29,11 @@ Subcommands:
   exempt  --module M [--function F] --reason R
           record an accepted gap: one entry point (in the module's sidecar), or a whole
           module that needs no harness (in reach_exempt_modules.json)
+  dynamic [--module M]...                 dynamic reach (step I6, after `coverage-<mod>`): an entry
+          point of the gate that the module's corpus never executed (workspace/reports/coverage)
+          reopens the gate for that module (exit 1). The rows go to harness_reach_dynamic.json with
+          the harness digest, and `check` keeps such a gap failing until the harness changes or the
+          entry point is exempted; exit 2 when a module has no usable coverage report.
 
 Exit code 0 when the gate passes, 1 when a module has an unexempted gap, 2 on
 usage/IO problems.
@@ -423,6 +428,136 @@ def record_exempt(
     return {"module": module, "function": function, "reason": reason, "reach_exempt": sidecar["reach_exempt"]}
 
 
+DEFAULT_DYNAMIC_OUT = Path("workspace/reports/harness_reach_dynamic.json")
+COVERAGE_DIR = Path("workspace/reports/coverage")
+_COVERAGE_OK = ("ok", "partial")
+
+
+def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str]:
+    """The entry points the reach gate holds a harness module to (as `check_module` does)."""
+    if mm.units_are_link_units and mm.unit_of(module) != module:
+        return mm.scope_entry_points(module)
+    info = (dag.get("modules") or {}).get(module) or {}
+    entries = [f for f in info.get("candidate_entry_points") or [] if isinstance(f, str)]
+    if not entries:
+        by_name = _functions_by_name(dag)
+        fns = [f for f in info.get("functions") or [] if isinstance(f, str)]
+        entries = [f for f in fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
+    return entries
+
+
+def _executions(coverage: dict[str, Any]) -> dict[str, list[tuple[str, int]]]:
+    """Function name -> [(file, executions)] of a coverage report."""
+    out: dict[str, list[tuple[str, int]]] = {}
+    for row in coverage.get("functions") or []:
+        if isinstance(row, dict) and isinstance(row.get("function"), str):
+            out.setdefault(row["function"], []).append((str(row.get("file") or ""), int(row.get("executions") or 0)))
+    return out
+
+
+def _entry_executions(key: str, dag: dict[str, Any], runs: dict[str, list[tuple[str, int]]]) -> int | None:
+    """Executions of a DAG function in the coverage report, or None when the report does not list it."""
+    rec = (dag.get("functions") or {}).get(key) or {}
+    name = str(rec.get("name") or key.rpartition("#")[2])
+    rows = runs.get(name)
+    if not rows:
+        return None
+    file_ = str(rec.get("file") or (key.partition("#")[0] if "#" in key else "")).replace("\\", "/")
+    if file_ and len(rows) > 1:
+        rows = [r for r in rows if r[0].replace("\\", "/").endswith(file_)] or rows
+    return sum(n for _, n in rows)
+
+
+def check_dynamic(module: str, dag: dict[str, Any], mm: ModuleMap, coverage: dict[str, Any]) -> dict[str, Any]:
+    """
+    The dynamic reach row of a harness module: its gate entry points the corpus never executed, minus
+    those its sidecar exempts. An entry point the coverage build does not list (a header inline
+    function no translation unit instantiated) counts as never executed.
+    """
+    sidecar = mm.sidecars.get(module) or {}
+    raw = sidecar.get("reach_exempt")
+    exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    runs = _executions(coverage)
+    executed: dict[str, int] = {}
+    never: list[str] = []
+    for e in _module_entries(module, dag, mm):
+        name = str(((dag.get("functions") or {}).get(e) or {}).get("name") or e.rpartition("#")[2])
+        n = _entry_executions(e, dag, runs) or 0
+        executed[e] = n
+        if not n and e not in exempt and name not in exempt:
+            never.append(e)
+    return {
+        "module": module,
+        "mode": "dynamic",
+        "coverage_status": coverage.get("status"),
+        "corpus_inputs": (coverage.get("inputs") or {}).get("replayed"),
+        "entry_points": len(executed),
+        "entry_points_executed": sum(1 for n in executed.values() if n),
+        "executions": dict(sorted(executed.items())),
+        "gaps": never,
+        "passed": not never,
+    }
+
+
+def run_dynamic(dag_path: Path, harness_dir: Path, modules: list[str], coverage_dir: Path) -> dict[str, Any]:
+    dag = load_json_strict(dag_path)
+    if not isinstance(dag, dict):
+        raise ValueError(f"{dag_path}: not a call-graph DAG object")
+    mm = ModuleMap(dag, load_sidecars(harness_dir))
+    rows: list[dict[str, Any]] = []
+    for module in modules or sorted(mm.sidecars):
+        cov = load_json_optional(coverage_dir / f"{module}.json", None)
+        if not isinstance(cov, dict) or cov.get("status") not in _COVERAGE_OK:
+            status = cov.get("status") if isinstance(cov, dict) else "missing"
+            rows.append({"module": module, "mode": "dynamic", "passed": None, "error": f"no coverage ({status})"})
+            continue
+        rows.append(check_dynamic(module, dag, mm, cov))
+    return {"generated_at": utc_now(), "dag": str(dag_path).replace("\\", "/"), "modules": rows}
+
+
+def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path) -> None:
+    """
+    Merge the rows into the dynamic report (with each module's harness digest) and reopen the reach
+    gate of every module with a gap. A module without a gap leaves the gate as the static check left it.
+    """
+    prior = load_json_optional(out, {})
+    by_module = dict((prior or {}).get("modules") or {}) if isinstance(prior, dict) else {}
+    for row in report["modules"]:
+        if row.get("passed") is None:
+            continue
+        by_module[row["module"]] = {**row, "harness_digest": phase0_gates.harness_digest(run_dir, row["module"])}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(out, {"generated_at": report["generated_at"], "modules": dict(sorted(by_module.items()))})
+    failed = [r for r in report["modules"] if r.get("passed") is False]
+    if failed:
+        rows = [{**r, "error": "dynamic: entry points never executed by the corpus"} for r in failed]
+        phase0_gates.record_reach(run_dir, {"modules": rows}, partial=True)
+
+
+def apply_dynamic(report: dict[str, Any], dynamic_path: Path, harness_dir: Path, run_dir: Path) -> None:
+    """
+    Keep a dynamic gap failing at the static check while the harness is the one coverage measured (same
+    digest) and the entry point is not exempted since: a repaired harness or an exemption clears it.
+    """
+    dyn = load_json_optional(dynamic_path, {})
+    rows = dyn.get("modules") if isinstance(dyn, dict) else None
+    if not isinstance(rows, dict):
+        return
+    for row in report["modules"]:
+        d = rows.get(row.get("module"))
+        if not isinstance(d, dict) or not d.get("gaps") or not row.get("passed"):
+            continue
+        if d.get("harness_digest") != phase0_gates.harness_digest(run_dir, str(row["module"])):
+            continue
+        sidecar = load_json_optional(harness_dir / f"harness_{row['module']}.json", {})
+        raw = sidecar.get("reach_exempt") if isinstance(sidecar, dict) else None
+        exempt = raw if isinstance(raw, dict) else {}
+        gaps = [g for g in d["gaps"] if g not in exempt and g.rpartition("#")[2] not in exempt]
+        if gaps:
+            row.update(passed=False, gaps=gaps, error="dynamic: entry points never executed by the corpus")
+    report["passed"] = all(r.get("passed") for r in report["modules"])
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 0 harness reachability gate.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -439,9 +574,22 @@ def main(argv: list[str] | None = None) -> int:
         "--function", default=None, help="Entry point to exempt; omit to exempt a module without a harness"
     )
     p_ex.add_argument("--reason", required=True)
+    p_dyn = sub.add_parser("dynamic", help="Reopen the gate for entry points the corpus never executed")
+    p_dyn.add_argument("--dag", type=Path, default=DEFAULT_DAG)
+    p_dyn.add_argument("--harness-dir", type=Path, default=DEFAULT_HARNESS_DIR)
+    p_dyn.add_argument("--coverage-dir", type=Path, default=COVERAGE_DIR)
+    p_dyn.add_argument("--module", action="append", default=[], help="Harness module (repeatable; default all)")
+    p_dyn.add_argument("--out", type=Path, default=DEFAULT_DYNAMIC_OUT)
     args = parser.parse_args(argv)
 
     try:
+        if args.cmd == "dynamic":
+            dyn = run_dynamic(args.dag, args.harness_dir, args.module, args.coverage_dir)
+            record_dynamic(Path("."), dyn, args.out)
+            print(json.dumps(dyn, indent=2))
+            if any(r.get("passed") is None for r in dyn["modules"]):
+                return 2
+            return 0 if all(r.get("passed") for r in dyn["modules"]) else 1
         if args.cmd == "exempt":
             if not args.reason.strip():
                 raise ValueError("--reason must not be empty")
@@ -453,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         report = run_check(args.dag, args.harness_dir, args.module)
+        apply_dynamic(report, DEFAULT_DYNAMIC_OUT, args.harness_dir, Path("."))
     except (ArtifactError, OSError, ValueError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         return 2

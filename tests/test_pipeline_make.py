@@ -1601,3 +1601,42 @@ def test_replay_of_a_unit_candidate_builds_its_harness_module(tmp_path, monkeypa
     )
     fuzz.replay_candidates(cands, hdir, run / "replay", selftest_json=None)
     assert built == [("decode", "workspace/harnesses/fuzz_decode")]
+
+
+# ---------------------------------------------------------------------------
+# fuzz budget per harness case, reach-dynamic (step I6)
+# ---------------------------------------------------------------------------
+
+
+def test_fuzz_budget_per_case_capped_per_unit(tmp_path):
+    sidecars = {k: dict(v) for k, v in SIDECARS.items()}
+    sidecars["log"]["dispatch_cases"] = ["(void)log_emit(fuzz_buf, fuzz_len);", "(void)log_flush();", "  "]
+    run = _make_run(tmp_path, sidecars=sidecars, params=SNMP_PARAMS)
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    per_case = pm.FUZZ_BUDGET_BY_PROFILE["quick"]
+    log, cfg, snmp = (plan.modules[m].params for m in ("log", "cfg", "snmp"))
+    assert (log["fuzz_cases"], log["fuzz_budget"], log["fuzz_budget_source"]) == (2, 2 * per_case, "cases")
+    assert (cfg["fuzz_cases"], cfg["fuzz_budget"]) == (1, per_case)
+    assert (snmp["fuzz_budget"], snmp["fuzz_budget_source"]) == (300, "params")
+
+    sidecars["log"]["dispatch_cases"] = [f"(void)f{i}();" for i in range(40)]
+    plan = pm.build_plan(_make_run(tmp_path, sidecars=sidecars, params=SNMP_PARAMS), templates_dir=ACSL)
+    log = plan.modules["log"].params
+    assert log["fuzz_budget_source"] == "unit_cap" and log["fuzz_cases"] == 40
+    assert log["fuzz_budget"] == pm.FUZZ_UNIT_CAP_BY_PROFILE["quick"]
+    assert pm.harness_case_count(None) == 1 and pm.harness_case_count({"dispatch_cases": "x"}) == 1
+
+
+def test_reach_dynamic_runs_after_coverage(tmp_path):
+    run = _make_run(tmp_path)
+    pm.generate(run, templates_dir=ACSL)
+    fake = FakeMake()
+    rc, out = pm.run_targets(["reach-dynamic", "coverage", "fuzz"], run, jobs=1, make_runner=fake, templates_dir=ACSL)
+    assert [c[7:] for c in fake.calls] == [["fuzz"], ["coverage"], ["reach-dynamic"]]
+    nodes = out["targets"]["reach-dynamic"]["nodes"]
+    assert set(nodes) == {"reach-dynamic-cfg", "reach-dynamic-log", "reach-dynamic-snmp"}
+    assert nodes["reach-dynamic-log"]["output"] == "workspace/reports/harness_reach_dynamic.json"
+    rc, out = pm.run_targets(["reach-dynamic-log"], run, jobs=1, make_runner=fake, templates_dir=ACSL)
+    assert "reach-dynamic-log" in out["targets"]
+    rc, out = pm.run_targets(["reach-dynamic-nope"], run, jobs=1, make_runner=fake, templates_dir=ACSL)
+    assert rc != 0

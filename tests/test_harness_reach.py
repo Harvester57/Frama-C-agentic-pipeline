@@ -412,3 +412,56 @@ def test_unit_entry_point_exemption_lands_in_a_sub_module_sidecar(tmp_path, monk
     }
     report = harness_reach.run_check(dag, hdir, None)
     assert report["passed"] is True and _rows(report)["libkv_a"]["exempt"] == {"u_len": "internal helper"}
+
+
+# --- dynamic reach (step I6) ----------------------------------------------------------------
+
+
+def _coverage(run: Path, executions: dict[str, int], status: str = "ok") -> Path:
+    cdir = run / "workspace" / "reports" / "coverage"
+    cdir.mkdir(parents=True, exist_ok=True)
+    rows = [{"function": f, "file": "src/api.c", "line": 1, "executions": n} for f, n in executions.items()]
+    (cdir / "api.json").write_text(json.dumps({"status": status, "functions": rows, "inputs": {"replayed": 3}}))
+    return cdir
+
+
+def test_unexecuted_entry_point_reopens_the_gate_until_the_harness_changes(tmp_path, monkeypatch, capsys):
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);")
+    harness_reach.record_exempt(hdir, "api", "rec_print", "debug output")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+
+    # The corpus never got past the guard in front of rec_put: the static gate passed, the dynamic one fails.
+    _coverage(run, {"rec_parse": 40, "rec_put": 0, "rec_ok": 12})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+    dyn = json.loads((run / "workspace/reports/harness_reach_dynamic.json").read_text())["modules"]["api"]
+    assert dyn["gaps"] == ["rec_put"] and dyn["executions"] == {"rec_parse": 40, "rec_print": 0, "rec_put": 0}
+    assert dyn["harness_digest"] == phase0_gates.harness_digest(run, "api")
+    [reason] = phase0_gates.check(run, "api", ("reach",))
+    assert "never executed" in reason
+
+    # The static check keeps the gap while the harness is the one coverage measured...
+    capsys.readouterr()
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1
+    assert phase0_gates.check(run, "api", ("reach",))
+    # ...and a repaired harness clears it.
+    _write_harness(
+        run,
+        "rec_put(fuzz_buf, fuzz_len, fuzz_len ? fuzz_buf[0] : 0); rec_parse(fuzz_buf, fuzz_len);",
+        reach_exempt={"rec_print": "debug output"},
+    )
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+
+    # An executed entry point, or an exempted one, passes; no coverage report is a usage error.
+    _coverage(run, {"rec_parse": 40, "rec_put": 2})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    _coverage(run, {"rec_parse": 40})
+    harness_reach.record_exempt(hdir, "api", "rec_put", "writer, not reachable from input")
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    _coverage(run, {}, status="error")
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 2
