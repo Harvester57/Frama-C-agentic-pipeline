@@ -19,7 +19,9 @@ Subcommands (run from the run directory):
   sweep [--jobs N]             re-prove them without the per-run WP cache, one leased WP job each
 
 modules.mk is derived from workspace/reports/callgraph_dag.json, the harness sidecars
-(workspace/harnesses/harness_<mod>.json), params.json and run-metadata.json. Every value is a
+(workspace/harnesses/harness_<mod>.json), params.json and run-metadata.json. Make targets, reports
+and params are per *harness module*: a DAG module, or a sub-module of a link unit (its sidecar's
+`unit`, scripts/module_map.py), which runs under its unit's sources and flags with its own tier. Every value is a
 shell word escaped for make, and every flag must pass an allowlist, so a sidecar can neither
 inject shell commands nor load compiler plug-ins into the trusted builds. `run` regenerates it
 before each make invocation, so tuning and harness repairs apply without a separate `gen`.
@@ -77,6 +79,7 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
 )
+from module_map import ModuleMap, load_sidecars  # noqa: E402
 from workspace_overlay import infer_prover_wp_flags  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -136,6 +139,9 @@ _PREFIX_FLAGS = ("-std=", "-O", "-g", "-W")
 # file-writing -gen-* options, and Frama-C's module loader (-load*, which -l* would match).
 _DENIED_PREFIXES = ("-Wl,", "-Wa,", "-Wp,", "-gen-", "-load")
 _SPACE_RE = re.compile(r"\s")
+
+
+_C_IDENT_JUNK = re.compile(r"\W")  # a module name in a C identifier
 
 
 def check_flags(tokens: list[str]) -> list[str]:
@@ -200,6 +206,38 @@ def with_acsl(tokens: list[str], acsl_dir: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Make quoting
 # ---------------------------------------------------------------------------
+
+
+def _flag_groups(tokens: list[str]) -> list[tuple[str, ...]]:
+    """Tokens as flags with their separate value (`-include x` is one group)."""
+    groups: list[tuple[str, ...]] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] in _VALUE_FLAGS and i + 1 < len(tokens):
+            groups.append((tokens[i], tokens[i + 1]))
+            i += 2
+        else:
+            groups.append((tokens[i],))
+            i += 1
+    return groups
+
+
+def union_flags(flag_lists: list[list[str]]) -> list[str]:
+    """Flags of several harness modules in order, each once; only the first `-Dmain=` rename is kept."""
+    seen: set[tuple[str, ...]] = set()
+    has_main = False
+    out: list[str] = []
+    for tokens in flag_lists:
+        for group in _flag_groups(tokens):
+            if "".join(group).startswith("-Dmain="):
+                if has_main:
+                    continue
+                has_main = True
+            if group in seen:
+                continue
+            seen.add(group)
+            out.extend(group)
+    return out
 
 
 def mk_quote(value: str) -> str:
@@ -411,6 +449,11 @@ class Plan:
     sidecars: set[str]
     params_doc: dict
     seed_scope_args: str | None  # None: a scope path cannot be written to the makefile
+    # Every module the plan considers, with the DAG record it runs under: each harness module whose
+    # unit is a DAG module (a sub-module's record carries its own tier and run flags), plus each DAG
+    # module without any harness. Without link units these are exactly the DAG modules.
+    records: dict[str, dict] = field(default_factory=dict)
+    mm: ModuleMap = field(default_factory=lambda: ModuleMap(None))
     modules: dict[str, ModulePlan] = field(default_factory=dict)
     excluded: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -428,11 +471,12 @@ class Plan:
         """
         Modules that should have a `kind` ("fuzz" or "eva") report, mapped to the reason a
         missing one gets in its stub: every module the DAG schedules for that phase, except Tier 3
-        modules without a harness (they are deferred by design).
+        modules without a harness (they are deferred by design). A link unit whose harnesses are
+        sub-modules expects nothing under its own name: its sub-modules do.
         """
         flag = "run_eacsl_fuzz" if kind == "fuzz" else "run_eva"
         out: dict[str, str] = {}
-        for name, dag_mod in sorted(self.dag_modules.items()):
+        for name, dag_mod in sorted(self.records.items()):
             if not dag_mod.get(flag) or not MODULE_RE.match(name):
                 continue
             if name in self.modules:
@@ -443,17 +487,52 @@ class Plan:
                 out[name] = f"excluded from the Make phases: {self.excluded.get(name, 'not runnable')}"
         return out
 
+    def unit_harness_modules(self, module: str | None) -> list[str]:
+        """
+        The harness modules standing for a ledger unit's `module`: none when it has a harness of its
+        own (or is no DAG module), else the sub-modules of the link unit.
+        """
+        if not module or module in self.mm.sidecars or module not in self.dag_modules:
+            return []
+        return [s for s in self.mm.submodules(module) if s != module]
+
     def wp_cppflags_for(self, module: str | None) -> tuple[list[str] | None, str]:
         """
         cppflags of any ledger module for the WP sweep: the sidecar's, exactly as the parent
         re-check proved the merged function with (`-I.` without a sidecar), or (None, reason).
+        A link unit whose harnesses are sub-modules takes the union of theirs (a function of the
+        unit compiles under any of them; the first `-Dmain=` rename wins).
         """
         if module in self.modules:
             return self.modules[module].base_cppflags, ""
+        subs = self.unit_harness_modules(module)
+        if subs:
+            groups: list[list[str]] = []
+            problems: list[str] = []
+            for sub in subs:
+                try:
+                    if sub in self.modules:
+                        groups.append(self.modules[sub].base_cppflags)
+                    else:
+                        groups.append(_module_base_cppflags(self.run_dir, sub))
+                except _Excluded as exc:
+                    problems.append(f"{sub}: {exc}")
+            if not groups:
+                return None, "no sub-module of the unit has usable cppflags: " + "; ".join(problems)
+            return union_flags(groups), ""
         try:
             return _module_base_cppflags(self.run_dir, module or ""), ""
         except _Excluded as exc:
             return None, str(exc)
+
+    def wp_extra_sources_for(self, module: str | None) -> list[str]:
+        """`wp_extra_sources` of a ledger unit's module: its own params plus its sub-modules'."""
+        out: list[str] = []
+        for name in [module or "", *self.unit_harness_modules(module)]:
+            for src in self.params_doc.get("modules", {}).get(name, {}).get("wp_extra_sources", []) or []:
+                if src not in out:
+                    out.append(src)
+        return out
 
     def summary(self) -> dict:
         return {
@@ -603,7 +682,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
             break
 
     if has_main_def:
-        main_flag = f"-Dmain=__framac_module_main_{name}"
+        main_flag = f"-Dmain=__framac_module_main_{_C_IDENT_JUNK.sub('_', name)}"
         if not any(tok.startswith("-Dmain=") for tok in base):
             base.append(main_flag)
 
@@ -756,6 +835,7 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         params_doc = {"version": 1, "modules": {}}
 
     dag_modules: dict[str, dict] = {}
+    dag_doc: dict | None = None
     dag_path = run_dir / DAG_JSON
     if dag_path.is_file():
         try:
@@ -764,6 +844,7 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
             if not isinstance(mods, dict):
                 raise ArtifactError(f"{DAG_JSON} has no 'modules' object")
             dag_modules = {str(k): v for k, v in mods.items() if isinstance(v, dict)}
+            dag_doc = dag
         except ArtifactError as exc:
             errors.append(f"callgraph DAG unusable: {exc}")
     else:
@@ -775,9 +856,17 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         if harness_dir.is_dir()
         else set()
     )
-    for name in sorted(sidecars - set(dag_modules)):
-        if dag_modules:
+    mm = ModuleMap(dag_doc, load_sidecars(harness_dir))
+    records: dict[str, dict] = {}
+    for name in sorted(sidecars):
+        if mm.unit_of(name) in dag_modules:
+            records[name] = _harness_record(mm, name, dag_modules)
+        elif dag_modules:
             warnings.append(f"harness sidecar for {name!r} ignored: no such module in the DAG")
+    harnessed_units = {mm.unit_of(name) for name in records}
+    for name, dag_mod in dag_modules.items():
+        if name not in harnessed_units and name not in records:
+            records[name] = dag_mod  # no harness: excluded below, then stubbed or deferred by `expected`
 
     templates = str(templates_dir) if templates_dir is not None else resolve_templates_dir().as_posix()
     plan = Plan(
@@ -789,34 +878,64 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         sidecars=sidecars,
         params_doc=params_doc,
         seed_scope_args=seed_scope_args,
+        records=dict(sorted(records.items())),
+        mm=mm,
         warnings=warnings,
         errors=errors,
     )
-    for name in sorted(dag_modules):
+    for name in plan.records:
         try:
-            plan.modules[name] = _plan_module(plan, name, dag_modules[name])
+            plan.modules[name] = _plan_module(plan, name, plan.records[name])
         except _Excluded as exc:
             plan.excluded[name] = str(exc)
             continue
         # Tuning warnings change what a report means, so they are surfaced at the top of `gen` and `run`.
         warnings.extend(f"{name}: {w}" for w in plan.modules[name].warnings if w.startswith(TUNING_WARNING_PREFIX))
-    for name in sorted(set(params_doc["modules"]) - set(dag_modules)):
-        if dag_modules:
+    for name in sorted(set(params_doc["modules"]) - set(plan.records)):
+        if name in dag_modules:
+            warnings.append(f"params.json tunes {name!r}, {_unit_note(plan, name)}")
+        elif dag_modules:
             warnings.append(f"params.json tunes {name!r}, which is not a DAG module")
     return plan
+
+
+def _unit_note(plan: Plan, unit: str) -> str:
+    subs = ", ".join(plan.unit_harness_modules(unit))
+    return f"a link unit whose harness modules are its sub-modules ({subs}): only its WP settings apply"
+
+
+def _harness_record(mm: ModuleMap, name: str, dag_modules: dict[str, dict]) -> dict:
+    """
+    The DAG record a harness module runs under: its own DAG module's, or for a sub-module of a link
+    unit, its lexer module's record when the DAG kept one (the sources and flags its harness was
+    generated against), else the unit's, with the sub-module's own tier and run flags.
+    """
+    unit = mm.unit_of(name)
+    if unit == name:
+        return dag_modules[name]
+    lexer = mm.lexer_modules.get(name)
+    base = lexer if isinstance(lexer, dict) else dag_modules[unit]
+    return {**base, "tier": mm.tier_of(name) or base.get("tier"), **mm.run_flags(name)}
 
 
 def module_build_spec(module: str, run_dir: Path | str = ".") -> dict:
     """
     Sources, cppflags and ldflags of a runnable module's fuzz build, exactly as the Makefile's
     build and fuzz recipes pass them (other builders of the same binary should use this, so their
-    builds share the cache entry). ValueError when the module cannot run from Make.
+    builds share the cache entry). ValueError when the module cannot run from Make. A link unit
+    without a harness of its own resolves to its first sub-module, named in `harness_module`.
     """
     plan = build_plan(run_dir)
+    requested = module
+    if module not in plan.records:
+        # A link unit's name (an Eva candidate may carry one): the harness module that stands for it.
+        module = plan.mm.harness_module_for(module) or module
     mod = plan.modules.get(module)
     if mod is None:
         raise ValueError(f"module {module!r} is not runnable: {plan.excluded.get(module, 'not in the DAG')}")
     return {
+        # Only for a unit resolved to one of its harness modules: the binary is fuzz_<harness_module>.
+        **({"harness_module": module} if module != requested else {}),
         "sources": list(mod.sources),
         "cppflags": shlex.join(mod.cppflags),
         "ldflags": shlex.join(mod.ldflags),
@@ -1028,7 +1147,9 @@ def params_set(
         atomic_write_json(run_dir / PARAMS_JSON, doc)
     plan = build_plan(run_dir)
     warnings = []
-    if plan.dag_modules and module not in plan.dag_modules:
+    if module in plan.dag_modules and module not in plan.records:
+        warnings.append(f"{module!r} is {_unit_note(plan, module)}; tune the sub-modules")
+    elif plan.dag_modules and module not in plan.records:
         warnings.append(f"{module!r} is not a module of the callgraph DAG")
     if (
         entry.get("fuzz_dict")
@@ -1059,9 +1180,10 @@ def record_eva_tuning(run_dir: Path | str, module: str, record: dict) -> None:
 
 def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
     plan = build_plan(run_dir)
-    names = sorted(set(plan.dag_modules) | set(plan.params_doc["modules"]))
+    names = sorted(set(plan.records) | set(plan.params_doc["modules"]))
     if module is not None:
         names = [module]
+    units = plan.mm.units_are_link_units
     return {
         "ok": not plan.errors,
         "profile": plan.profile,
@@ -1071,7 +1193,8 @@ def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
                 "effective": effective_params(plan.params_doc, name, plan.profile),
                 "overrides": plan.params_doc["modules"].get(name, {}),
                 "runnable": name in plan.modules,
-                "in_dag": name in plan.dag_modules,
+                "in_dag": name in plan.dag_modules or name in plan.records,
+                **({"unit": plan.mm.unit_of(name)} if units else {}),
             }
             for name in names
         },
@@ -1162,6 +1285,8 @@ def _target_problem(target: str, plan: Plan) -> str | None:
         return f"module {mod} is excluded: {plan.excluded[mod]}"
     if mod in plan.modules:
         return f"module {mod} has no {kind} target: the DAG does not schedule it"
+    if plan.unit_harness_modules(mod):
+        return f"{mod} is a link unit: use the targets of its harness modules ({', '.join(plan.unit_harness_modules(mod))})"
     return f"unknown module {mod!r}"
 
 
@@ -1795,7 +1920,7 @@ def sweep(
                 c_file=e["file"],
                 function=e["function"],
             )
-            extra_sources = plan.params_doc.get("modules", {}).get(e["module"], {}).get("wp_extra_sources", [])
+            extra_sources = plan.wp_extra_sources_for(e["module"])
             cmd = [
                 py,
                 f"{scripts}/resources.py",

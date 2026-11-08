@@ -123,7 +123,9 @@ It reads `workspace/reports/phase0_model.json` from Step 1c (`--model PATH` to p
 - Header functions are marked `header`. Only those an entry point of the build reaches (`reached`) get ledger units.
 - `macro_aliases` maps each alias the build defines to the functions it names. The harness generator and the reach gate resolve calls through it.
 
-Modules, tiers, entry points and the per-function analysis below stay the lexer's (C/ACSL token stream `tokenize_c_acsl`, Tarjan's SCC for recursion cycles, structural signature and body analysis, with no project-specific keyword hints). Their function lists are recomputed from the model. Review `workspace/reports/callgraph_dag.json`:
+With the model, the DAG's `modules` are the build's non-test **link units** (`module_kind: "link_unit"`): one module per library or executable, named after its artifact (`lib/libkv.a` -> `libkv_a`), libraries first. A unit module carries its `kind`, `files`, `required_sources` (its own files plus those of the project libraries it links), `cppflags`, `concurrent` (the build links a thread library or the code starts threads) and `candidate_entry_points` (its API: exported functions, `main` for an executable, an executable's embedded API). A source file belongs to the first unit that compiles it. Code no non-test unit compiles keeps its lexer module.
+
+Tiers and the per-function analysis stay the lexer's (C/ACSL token stream `tokenize_c_acsl`, Tarjan's SCC for recursion cycles, structural signature and body analysis, with no project-specific keyword hints). The lexer's modules are kept under `lexer_modules`, `unit_of_lexer_module` maps each to its unit, and every function keeps its `lexer_module` and that module's `tier`. A unit's `tier` and `run_*` flags are the most demanding of its lexer modules'; the ledger seeds each function with its own tier. Review `workspace/reports/callgraph_dag.json`:
 - Check each module's `required_sources` (the transitive in-repository `.c` file closure needed to compile and analyze the module together with its in-repo sibling callees), `cross_module_callees`, `external_callees`, and auto-discovered `cppflags`.
 - Check `name_collisions` (same-named static functions in different files), `recursion_cycles`, and `indirect_calls` (function-pointer call sites requiring `//@ calls f1, f2;` or `//@ assert fp \in {...};`).
 - Check each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`), and `wp_notes` (e.g., `while (n--)` unsigned wraparound idiom or pointer casts requiring `-wp-model Typed+cast`).
@@ -162,6 +164,8 @@ For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom|argv|dispatch> [--auto-args] [--dispatch-case '<stmts>']... [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
 ```
 
+With link units, a harness module is either a unit itself or a **sub-module** of one: a library with several entry families gets one harness per family, named after the lexer module it drives (QCBOR's `decode`, `encode`... inside `libqcbor_a`). The sidecar records its `unit` (`--unit <unit>`; inferred from the DAG when omitted). A sub-module keeps its lexer module's tier, flags and sources; its reports, corpus and candidates stay under its own name and credit its unit's functions. A sub-module whose name is not a lexer module answers for the files in its sidecar's `scope_files` (else `sources`).
+
 The sidecar `harness_<mod>.json` is the single source of truth for later phases: `sources`, `cppflags`, `ldflags`, `include_source`. `pipeline_make.py gen` builds every module's fuzz, Eva and build recipes from it, so put the module's real link flags in `--ldflags` here rather than on later command lines. Flags outside the build allowlist (for example `-fplugin`, `-B`, `-fuse-ld`, `-Wl,`) exclude the module from the Make phases. `gen` reports them.
 
 Supported `--entry-style` modes and options in `generate_harness.py`:
@@ -196,7 +200,7 @@ A harness that calls one entry point leaves the rest of the module's API unexerc
 python3 /opt/framac-pipeline/scripts/harness_reach.py check
 ```
 
-It reads `workspace/reports/callgraph_dag.json` and each `harness_<mod>.json` / `harness_<mod>.c`, takes the DAG functions the harness names (directly, through a header macro such as a `for_each` iterator, or through a header `static inline` wrapper) and their transitive in-repo callees, and checks that every `candidate_entry_points` function of the module is reached. A Tier 1A/1B/2 module without a harness fails with `no_harness`. The report goes to `workspace/reports/harness_reach.json`; exit code 1 means a gap.
+It reads `workspace/reports/callgraph_dag.json` and each `harness_<mod>.json` / `harness_<mod>.c`, takes the DAG functions the harness names (directly, through a header macro such as a `for_each` iterator, or through a header `static inline` wrapper) and their transitive in-repo callees, and checks that every `candidate_entry_points` function of the module is reached. A sub-module is checked against the unit's entry points in its own scope; entry points of a unit that no harness module's scope holds are reported as the unit's gaps. A Tier 1A/1B/2 module without a harness fails with `no_harness`. The report goes to `workspace/reports/harness_reach.json`; exit code 1 means a gap.
 
 For each module with `gaps`:
 

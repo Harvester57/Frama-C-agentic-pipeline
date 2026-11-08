@@ -253,3 +253,162 @@ def test_cli_exit_codes_and_report(tmp_path, monkeypatch, capsys):
     assert (
         harness_reach.main(["check", "--dag", str(run / "missing.json"), "--harness-dir", str(hdir), "--out", "-"]) == 2
     )
+
+
+# --- link units as DAG modules (step I5b) ---------------------------------------------------
+
+T2 = "Tier 2 (Recursive Heap / Tree Parser)"
+T3 = "Tier 3 (Internal State / Glue Module)"
+
+
+def _ufn(name: str, unit: str, lexer: str, tier: str, callees=(), static=False) -> dict:
+    return {
+        "name": name,
+        "file": f"src/{lexer}.c",
+        "module": unit,
+        "lexer_module": lexer,
+        "tier": tier,
+        "is_static": static,
+        "internal_callees": list(callees),
+    }
+
+
+def _unit_dag(exe: str = "kvtool", exe_lexer: str = "tool") -> dict:
+    """libkv_a (lexer modules decode, encode, util, errs), an executable and an example program."""
+    functions = {
+        "dec_run": _ufn("dec_run", "libkv_a", "decode", TIER_1A, ["dec_step", "u_len"]),
+        "dec_step": _ufn("dec_step", "libkv_a", "decode", TIER_1A, static=True),
+        "dec_peek": _ufn("dec_peek", "libkv_a", "decode", TIER_1A),
+        "enc_run": _ufn("enc_run", "libkv_a", "encode", T2),
+        "u_len": _ufn("u_len", "libkv_a", "util", TIER_1A),
+        "err_str": _ufn("err_str", "libkv_a", "errs", T3),
+        "main": _ufn("main", exe, exe_lexer, TIER_1A, ["dec_run"]),
+        "rnd": _ufn("rnd", exe, "rnd", TIER_1A),
+        "demo_main": _ufn("demo_main", "kvdemo", "example", TIER_1A),
+    }
+    lexer_tiers = {"decode": TIER_1A, "encode": T2, "util": TIER_1A, "errs": T3, exe_lexer: TIER_1A}
+    lexer_tiers.update({"rnd": TIER_1A, "example": TIER_1A})
+    units = {"libkv_a": ["decode", "encode", "util", "errs"], exe: [exe_lexer, "rnd"], "kvdemo": ["example"]}
+    modules = {
+        u: {
+            "module": u,
+            "tier": TIER_1A,
+            "functions": sorted(k for k, f in functions.items() if f["module"] == u),
+            "candidate_entry_points": sorted(
+                k for k, f in functions.items() if f["module"] == u and not f["is_static"]
+            ),
+            "lexer_modules": lexers,
+        }
+        for u, lexers in units.items()
+    }
+    return {
+        "module_kind": "link_unit",
+        "modules": modules,
+        "functions": functions,
+        "lexer_modules": {m: {"module": m, "tier": t} for m, t in lexer_tiers.items()},
+        "unit_of_lexer_module": {m: u for u, lexers in units.items() for m in lexers},
+        "header_inline_callees": {},
+    }
+
+
+def _unit_run(tmp_path: Path, monkeypatch, harnesses: dict[str, str], dag: dict | None = None, exempt=None, units=None):
+    (tmp_path / "workspace/reports").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    dag_path = tmp_path / "workspace/reports/callgraph_dag.json"
+    dag_path.write_text(json.dumps(dag or _unit_dag()), encoding="utf-8")
+    hdir = tmp_path / "workspace/harnesses"
+    hdir.mkdir(parents=True)
+    for name, call in harnesses.items():
+        (hdir / f"harness_{name}.c").write_text(f"void drive(void) {{ {call} }}\n", encoding="utf-8")
+        sidecar = {"module": name, "harness_file": f"workspace/harnesses/harness_{name}.c", "cppflags": "-I."}
+        unit = (units or {"decode": "libkv_a", "encode": "libkv_a"}).get(name)
+        if unit:
+            sidecar["unit"] = unit
+        (hdir / f"harness_{name}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    if exempt:
+        (hdir / harness_reach.MODULE_EXEMPT_FILE).write_text(json.dumps(exempt), encoding="utf-8")
+    return dag_path, hdir
+
+
+def _rows(report: dict) -> dict[str, dict]:
+    return {m["module"]: m for m in report["modules"]}
+
+
+def test_sub_module_is_gated_on_the_unit_api_in_its_scope(tmp_path, monkeypatch):
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run();", "encode": "enc_run();"})
+    rows = _rows(harness_reach.run_check(dag, hdir, ["decode"]))
+    assert list(rows) == ["decode"]  # --module limits the check to the named harness module
+    dec = rows["decode"]
+    assert dec["unit"] == "libkv_a" and dec["tier"] == TIER_1A
+    assert dec["entry_points"] == 2 and dec["gaps"] == ["dec_peek"]  # enc_run, u_len are other scopes
+    assert dec["functions"] == 3 and dec["functions_reached"] == 2
+    assert rows["decode"]["passed"] is False
+
+
+def test_unit_row_reports_api_outside_every_harness_scope(tmp_path, monkeypatch):
+    harnesses = {"decode": "dec_run(); dec_peek();", "encode": "enc_run();"}
+    dag, hdir = _unit_run(tmp_path, monkeypatch, harnesses, exempt={"tool": "cli", "rnd": "entropy", "example": "ex"})
+    report = harness_reach.run_check(dag, hdir, None)
+    rows = _rows(report)
+    assert rows["decode"]["passed"] and rows["encode"]["passed"]
+    # u_len (lexer module util, reached by the decode harness but in no harness scope) is a unit gap;
+    # err_str is Tier 3 code, deferred by design.
+    lib = rows["libkv_a"]
+    assert lib["harness_modules"] == ["decode", "encode"]
+    assert lib["unharnessed_entry_points"] == ["u_len"] and lib["gaps"] == ["u_len"]
+    assert report["passed"] is False
+    # Units without a harness made of exempt lexer modules pass as exempt.
+    assert (
+        rows["kvtool"]["passed"]
+        and "tool: cli" in rows["kvtool"]["exempt"]
+        and "rnd: entropy" in rows["kvtool"]["exempt"]
+    )
+    assert rows["kvdemo"]["passed"] and "example: ex" in rows["kvdemo"]["exempt"]
+
+    # The lexer module's key exempts its entry points at unit level; so does the unit's name.
+    (hdir / harness_reach.MODULE_EXEMPT_FILE).write_text(
+        json.dumps({"tool": "cli", "rnd": "entropy", "example": "ex", "util": "helpers"}), encoding="utf-8"
+    )
+    rows = _rows(harness_reach.run_check(dag, hdir, None))
+    assert rows["libkv_a"]["passed"] and rows["libkv_a"]["exempt"] == {"u_len": "module util: helpers"}
+    (hdir / harness_reach.MODULE_EXEMPT_FILE).write_text(
+        json.dumps({"kvtool": "cli", "kvdemo": "ex", "libkv_a": "pinned"}), encoding="utf-8"
+    )
+    report = harness_reach.run_check(dag, hdir, None)
+    rows = _rows(report)
+    assert rows["libkv_a"]["exempt"] == {"u_len": "unit libkv_a: pinned"}
+    assert rows["kvtool"]["exempt"] == "cli"  # a unit without a harness, exempt by name as a module was
+    assert report["passed"] is True
+
+
+def test_unit_without_harness_or_exemption_fails_no_harness(tmp_path, monkeypatch):
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run(); dec_peek();"}, exempt={"example": "ex"})
+    rows = _rows(harness_reach.run_check(dag, hdir, None))
+    tool = rows["kvtool"]
+    assert tool["error"] == "no_harness" and tool["gaps"] == ["main", "rnd"]
+    assert rows["kvdemo"]["passed"]
+    # An executable whose name is also one of its lexer modules (tweetnacl's `main`): with a harness
+    # in the unit, that key exempts the lexer module only, never the rest of the unit.
+    dag2, hdir2 = _unit_run(
+        tmp_path / "b",
+        monkeypatch,
+        {"nacl": "main();"},
+        dag=_unit_dag(exe="main", exe_lexer="main"),
+        exempt={"main": "cli", "example": "ex"},
+        units={"nacl": "main"},
+    )
+    rows = _rows(harness_reach.run_check(dag2, hdir2, None))
+    assert rows["main"]["exempt"] == {"main": "module main: cli"} and rows["main"]["gaps"] == ["rnd"]
+
+
+def test_unit_entry_point_exemption_lands_in_a_sub_module_sidecar(tmp_path, monkeypatch):
+    harnesses = {"decode": "dec_run(); dec_peek();", "encode": "enc_run();"}
+    dag, hdir = _unit_run(tmp_path, monkeypatch, harnesses, exempt={"kvtool": "cli", "kvdemo": "ex"})
+    assert harness_reach.run_check(dag, hdir, None)["passed"] is False
+    out = harness_reach.record_exempt(hdir, "libkv_a", "u_len", "internal helper", dag)
+    assert out["reach_exempt"] == {"u_len": "internal helper"}
+    assert json.loads((hdir / "harness_decode.json").read_text(encoding="utf-8"))["reach_exempt"] == {
+        "u_len": "internal helper"
+    }
+    report = harness_reach.run_check(dag, hdir, None)
+    assert report["passed"] is True and _rows(report)["libkv_a"]["exempt"] == {"u_len": "internal helper"}

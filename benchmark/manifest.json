@@ -539,6 +539,7 @@
       ],
       "call_expr": "SaInterface iface = get_sa_interface_inmemory(); SecurityAssociation_t *sa = NULL; static int crypto_inited = 0; if (!crypto_inited) { Crypto_Config_CryptoLib(KEY_TYPE_INTERNAL, MC_TYPE_INTERNAL, SA_TYPE_INMEMORY, CRYPTOGRAPHY_TYPE_LIBGCRYPT, IV_INTERNAL); Crypto_Config_TC(CRYPTO_TC_CREATE_FECF_TRUE, TC_PROCESS_SDLS_PDUS_TRUE, TC_HAS_PUS_HDR, TC_IGNORE_ANTI_REPLAY_FALSE, TC_IGNORE_SA_STATE_FALSE, TC_UNIQUE_SA_PER_MAP_ID_FALSE, TC_CHECK_FECF_TRUE, 0x3F, SA_INCREMENT_NONTRANSMITTED_IV_TRUE); TCGvcidManagedParameters_t mp; memset(&mp, 0, sizeof(mp)); mp.tfvn = 0; mp.scid = 0x0003; mp.has_fecf = TC_HAS_FECF; mp.has_segmentation_hdr = TC_HAS_SEGMENT_HDRS; mp.max_frame_size = 1024; mp.set_flag = 1; mp.vcid = 0; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 1; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 2; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); mp.vcid = 4; Crypto_Config_Add_TC_Gvcid_Managed_Parameters(mp); if (Crypto_Init() != CRYPTO_LIB_SUCCESS) { return 0; } crypto_inited = 1; } if (fuzz_len >= 5) { iface->sa_get_operational_sa_from_gvcid((uint8_t)fuzz_buf[0], (uint16_t)fuzz_buf[1], (uint16_t)fuzz_buf[2], (uint8_t)fuzz_buf[3], &sa); }"
      },
+     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "params": {
       "fuzz_rte_initialized": false
      }

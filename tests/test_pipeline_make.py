@@ -1410,3 +1410,194 @@ def test_build_check_names_the_error_of_the_attempt_that_failed_last(tmp_path):
     assert pm.build_check(run, runner=lambda t, r: (2, {}), templates_dir=ACSL)["modules"]["cfg"]["status"] == (
         "build_failed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Link units as DAG modules (step I5b): harness sub-modules
+# ---------------------------------------------------------------------------
+
+T1A = "Tier 1A (Untrusted Binary / Network Parser)"
+T2 = "Tier 2 (Recursive Heap / Tree Parser)"
+T3 = "Tier 3 (Internal State / Glue Module)"
+
+
+def _unit_run(run: Path, params: dict | None = None) -> Path:
+    """libkv_a holds the harness sub-modules decode, encode and extra; kvtool and glue_exe have no harness."""
+    flags = {"run_eacsl_fuzz": True, "run_eva": True}
+    dag = {
+        "module_kind": "link_unit",
+        "modules": {
+            "libkv_a": {
+                "tier": T1A,
+                **flags,
+                "required_sources": ["src/decode.c", "src/encode.c", "src/util.c"],
+                "cppflags": ["-DLIB"],
+            },
+            "kvtool": {"tier": T1A, **flags, "required_sources": ["tools/main.c"], "cppflags": []},
+            "glue_exe": {"tier": T3, "run_eacsl_fuzz": False, "run_eva": True, "required_sources": ["glue/g.c"]},
+        },
+        "lexer_modules": {
+            "decode": {"tier": T1A, **flags, "required_sources": ["src/decode.c", "src/util.c"], "cppflags": ["-DDEC"]},
+            "encode": {"tier": T2, "run_eacsl_fuzz": False, "run_eva": True, "required_sources": ["src/encode.c"]},
+        },
+        "unit_of_lexer_module": {"decode": "libkv_a", "encode": "libkv_a"},
+        "functions": {},
+    }
+    sidecars = {
+        "decode": {"unit": "libkv_a", "sources": [], "cppflags": "-I. -Iworkspace/work/src -DDEC", "entry_fn": "d"},
+        "encode": {
+            "unit": "libkv_a",
+            "sources": ["src/encode.c"],
+            "cppflags": "-I. -include workspace/harnesses/compat.h -Dmain=__framac_module_main_encode",
+        },
+        "extra": {"unit": "libkv_a", "sources": [], "cppflags": "-I. -Iworkspace/work/src"},
+    }
+    write_json(run / "run-metadata.json", {**metadata(), "profile": "quick", "scope_paths": ["src"]})
+    write_json(run / pm.DAG_JSON, dag)
+    for name, data in sidecars.items():
+        write_json(run / pm.HARNESS_DIR / f"harness_{name}.json", {"module": name, **data})
+        (run / pm.HARNESS_DIR / f"harness_{name}.c").write_text("int harness;\n", encoding="utf-8")
+    for src in ("src/decode.c", "src/encode.c", "src/util.c", "tools/main.c", "glue/g.c"):
+        path = run / "workspace/work" / src
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    if params is not None:
+        write_json(run / pm.PARAMS_JSON, params)
+    return run
+
+
+def test_link_unit_plan_runs_the_harness_sub_modules(tmp_path):
+    plan = pm.build_plan(_unit_run(tmp_path), templates_dir=ACSL)
+
+    assert sorted(plan.modules) == ["decode", "encode", "extra"]
+    assert plan.excluded == {
+        "glue_exe": "no harness sidecar (workspace/harnesses/harness_glue_exe.json)",
+        "kvtool": "no harness sidecar (workspace/harnesses/harness_kvtool.json)",
+    }
+    assert not [w for w in plan.warnings if "ignored" in w]
+    # A sub-module keeps its lexer module's tier and run flags; one without a lexer module takes its unit's.
+    dec, enc, extra = plan.modules["decode"], plan.modules["encode"], plan.modules["extra"]
+    assert (dec.tier, dec.fuzz, dec.eva) == (T1A, True, True)
+    assert (enc.tier, enc.fuzz, enc.eva) == (T2, False, True)
+    assert (extra.tier, extra.fuzz, extra.eva) == (T1A, True, True)
+    # Without sidecar sources: the lexer module's sources (what its harness was built against), else the unit's.
+    assert dec.sources == [
+        "workspace/work/src/decode.c",
+        "workspace/work/src/util.c",
+        "workspace/harnesses/harness_decode.c",
+    ]
+    assert dec.dag_cppflags_missing == []
+    assert extra.sources == [
+        "workspace/work/src/decode.c",
+        "workspace/work/src/encode.c",
+        "workspace/work/src/util.c",
+        "workspace/harnesses/harness_extra.c",
+    ]
+    assert extra.dag_cppflags_missing == ["-DLIB"]
+    assert plan.fuzz_modules == ["decode", "extra"] and plan.eva_modules == ["decode", "encode", "extra"]
+
+
+def test_link_unit_reports_are_expected_per_sub_module(tmp_path):
+    run = _unit_run(tmp_path)
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    excluded = "excluded from the Make phases: no harness sidecar (workspace/harnesses/harness_kvtool.json)"
+    # No report under the unit's name; the Tier 3 executable without a harness is deferred.
+    assert plan.expected("fuzz") == {
+        "decode": "fuzz-decode produced no report",
+        "extra": "fuzz-extra produced no report",
+        "kvtool": excluded,
+    }
+    assert plan.expected("eva") == {
+        "decode": "eva-decode produced no report",
+        "encode": "eva-encode produced no report",
+        "extra": "eva-extra produced no report",
+        "kvtool": excluded,
+    }
+    res = pm.ingest(run, runner=FakeScripts(), plan=plan)
+    assert "workspace/reports/eva/encode.json" in res["stubs"]
+    assert not (run / "workspace/reports/eva/libkv_a.json").exists()
+    assert not (run / "workspace/reports/fuzz/glue_exe.json").exists()
+
+
+def test_link_unit_wp_flags_and_build_spec_resolve_to_harness_modules(tmp_path):
+    params = {
+        "version": 1,
+        "modules": {
+            "decode": {"wp_extra_sources": ["workspace/work/src/util.c"]},
+            "libkv_a": {"wp_extra_sources": ["workspace/work/src/x.c", "workspace/work/src/util.c"]},
+        },
+    }
+    run = _unit_run(tmp_path, params=params)
+    plan = pm.build_plan(run, templates_dir=ACSL)
+
+    # A ledger unit's module is the link unit: the union of its sub-modules' sidecar flags.
+    flags, reason = plan.wp_cppflags_for("libkv_a")
+    assert reason == ""
+    assert flags == [
+        "-I.",
+        "-Iworkspace/work/src",
+        "-DDEC",
+        "-include",
+        "workspace/harnesses/compat.h",
+        "-Dmain=__framac_module_main_encode",
+    ]
+    assert plan.wp_cppflags_for("decode") == (["-I.", "-Iworkspace/work/src", "-DDEC"], "")
+    assert plan.wp_cppflags_for("kvtool") == (["-I."], "")  # no harness anywhere: as before
+    assert plan.wp_extra_sources_for("libkv_a") == ["workspace/work/src/x.c", "workspace/work/src/util.c"]
+
+    spec = pm.module_build_spec("libkv_a", run)
+    assert spec["harness_module"] == "decode" and spec["sources"][-1] == "workspace/harnesses/harness_decode.c"
+    assert "harness_module" not in pm.module_build_spec("extra", run)
+    problem = pm._target_problem("fuzz-libkv_a", plan)
+    assert problem is not None and "link unit" in problem
+
+
+def test_link_unit_params_are_per_harness_module(tmp_path):
+    run = _unit_run(tmp_path)
+    assert pm.params_set(run, "decode", eva_slevel=200)["warnings"] == []
+    warned = pm.params_set(run, "libkv_a", eva_slevel=200)["warnings"]
+    assert len(warned) == 1 and "sub-modules (decode, encode, extra)" in warned[0]
+    assert pm.params_set(run, "nowhere", eva_slevel=200)["warnings"] == [
+        "'nowhere' is not a module of the callgraph DAG"
+    ]
+    shown = pm.params_show(run)["modules"]
+    assert shown["decode"]["in_dag"] and shown["decode"]["unit"] == "libkv_a" and shown["decode"]["runnable"]
+    assert shown["libkv_a"]["unit"] == "libkv_a" and not shown["libkv_a"]["runnable"]
+    assert any("params.json tunes 'libkv_a', a link unit" in w for w in pm.build_plan(run).warnings)
+
+
+def test_union_flags_keeps_value_flags_whole_and_one_main_rename():
+    assert pm.union_flags(
+        [
+            ["-I.", "-include", "a.h", "-Dmain=__m_a"],
+            ["-I.", "-include", "b.h", "-include", "a.h", "-Dmain=__m_b", "-DX"],
+        ]
+    ) == ["-I.", "-include", "a.h", "-Dmain=__m_a", "-include", "b.h", "-DX"]
+
+
+def test_replay_of_a_unit_candidate_builds_its_harness_module(tmp_path, monkeypatch):
+    import run_eacsl_fuzz as fuzz
+
+    run = _unit_run(tmp_path)
+    monkeypatch.chdir(run)
+    hdir = Path(pm.HARNESS_DIR)
+    fallback = fuzz._sidecar_build_spec("libkv_a", hdir)
+    assert fallback["harness_module"] == "decode" and fallback["sources"] == ["workspace/harnesses/harness_decode.c"]
+    assert "harness_module" not in fuzz._sidecar_build_spec("encode", hdir)
+    assert fuzz.replay_build_spec("libkv_a", hdir)["harness_module"] == "decode"
+
+    built: list[tuple[str, str]] = []
+
+    def fake_prepare(module, sources, out_bin, **kwargs):
+        built.append((module, Path(out_bin).as_posix()))
+        return {"binary": None, "reason": "not built in this test"}
+
+    monkeypatch.setattr(fuzz, "prepare_replay_binary", fake_prepare)
+    (run / "crash-1").write_bytes(b"x")
+    cands = run / "candidates.json"
+    write_json(
+        cands,
+        [{"fingerprint": "fp1", "module": "libkv_a", "status": "unverified", "reproducers": [{"input": "crash-1"}]}],
+    )
+    fuzz.replay_candidates(cands, hdir, run / "replay", selftest_json=None)
+    assert built == [("decode", "workspace/harnesses/fuzz_decode")]

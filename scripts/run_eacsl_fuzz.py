@@ -2856,12 +2856,32 @@ def acsl_include_dir() -> Path | None:
     return None
 
 
+def _unit_harness_module(module: str, harness_dir: Path) -> str:
+    """
+    The harness module standing for a link unit's name (an Eva candidate may carry its unit, step
+    I5b): the module itself when it has a sidecar, else the unit's first sub-module, read from the
+    DAG next to the harness directory (workspace/reports/callgraph_dag.json).
+    """
+    harness_dir = Path(harness_dir)
+    if (harness_dir / f"harness_{module}.json").is_file():
+        return module
+    from module_map import ModuleMap, load_sidecars
+
+    dag = load_json_optional(harness_dir.parent / "reports" / "callgraph_dag.json", None)
+    return (
+        ModuleMap(dag if isinstance(dag, dict) else None, load_sidecars(harness_dir)).harness_module_for(module)
+        or module
+    )
+
+
 def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
     """
     Fallback build spec when scripts/pipeline_make.py cannot be imported: the harness sidecar's
     sources (the harness alone when it `include_source`s the target) plus the harness, and its
-    cppflags plus -I<templates>/acsl (once), as in the documented campaign command.
+    cppflags plus -I<templates>/acsl (once), as in the documented campaign command. A link unit's
+    name resolves to its harness module, returned in `harness_module`.
     """
+    requested, module = module, _unit_harness_module(module, harness_dir)
     sidecar = Path(harness_dir) / f"harness_{module}.json"
     meta = load_json_optional(sidecar, None)
     if not isinstance(meta, dict):
@@ -2882,7 +2902,10 @@ def _sidecar_build_spec(module: str, harness_dir: Path) -> dict:
         and f"-I{acsl_dir.as_posix()}" not in tokens
     ):
         tokens.append(f"-I{acsl_dir.as_posix()}")
-    return {"sources": [*sources, harness], "cppflags": shlex.join(tokens), "ldflags": meta.get("ldflags") or ""}
+    spec = {"sources": [*sources, harness], "cppflags": shlex.join(tokens), "ldflags": meta.get("ldflags") or ""}
+    if module != requested:
+        spec["harness_module"] = module
+    return spec
 
 
 def replay_build_spec(module: str, harness_dir: Path = Path("workspace/harnesses")) -> dict:
@@ -2891,7 +2914,8 @@ def replay_build_spec(module: str, harness_dir: Path = Path("workspace/harnesses
     `pipeline_make.module_build_spec`: exactly what `make build` and the fuzz recipe pass, so a
     replay reuses their cache entry and never rebuilds workspace/harnesses/fuzz_<mod> with other
     flags or sources (ValueError when Make cannot build the module). The harness sidecar decides
-    only when pipeline_make cannot be imported.
+    only when pipeline_make cannot be imported. A candidate's module may be a link unit: the spec
+    is then its harness module's, named in `harness_module` (the binary is fuzz_<harness_module>).
     """
     try:
         import pipeline_make  # imported lazily: replays work without the Make layer
@@ -2974,10 +2998,11 @@ def replay_candidates(
             except (OSError, ValueError, RuntimeError) as exc:
                 prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
             else:
+                harness_module = str(spec.get("harness_module") or module)
                 prepared_by_key[key] = prepare_replay_binary(
-                    module,
+                    harness_module,
                     spec["sources"],
-                    bin_dir / f"fuzz_{module}",
+                    bin_dir / f"fuzz_{harness_module}",
                     attribution=attribution,
                     engine=eng,
                     selftest_json=selftest_json,
@@ -3206,10 +3231,11 @@ def minimize_candidates(
             except (OSError, ValueError, RuntimeError) as exc:
                 prepared_by_key[key] = {"binary": None, "reason": f"no build spec for module {module!r}: {exc}"}
             else:
+                harness_module = str(spec.get("harness_module") or module)
                 prepared_by_key[key] = prepare_replay_binary(
-                    module,
+                    harness_module,
                     spec["sources"],
-                    bin_dir / f"fuzz_{module}",
+                    bin_dir / f"fuzz_{harness_module}",
                     engine=eng,
                     selftest_json=selftest_json,
                     machdep=machdep,

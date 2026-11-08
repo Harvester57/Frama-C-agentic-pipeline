@@ -67,6 +67,7 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
 )
+from module_map import ModuleMap  # noqa: E402
 from promote_artifact import promote_file  # noqa: E402
 from validate_artifacts import validate_agent_result  # noqa: E402
 
@@ -188,8 +189,10 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
     Re-run the parent WP check of one already-merged function on the current workspace/work/ tree
     (its callee contracts changed). Holds the `merge` lock so no merge splices files underneath it.
     """
-    side = load_json_optional(run_dir / HARNESS_DIR / f"harness_{module}.json", {}) if module else {}
-    cppflags = (side.get("cppflags") if isinstance(side, dict) else None) or "-I."
+    # A link unit's flags: the union over its harnesses' sidecars (workspace_overlay.merged_sidecar).
+    mm = workspace_overlay.module_map_for(run_dir / "workspace")
+    side = workspace_overlay.merged_sidecar(mm, module) if module else {}
+    cppflags = side.get("cppflags") or "-I."
     report = run_dir / "agents" / agent_id / "scratch" / "parent_wp" / f"{function}.json"
     report.parent.mkdir(parents=True, exist_ok=True)
     extra_sources = None
@@ -200,7 +203,7 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
         if params_file.is_file():
             try:
                 pdata = json.loads(params_file.read_text(encoding="utf-8"))
-                extra_sources = pdata.get("modules", {}).get(module, {}).get("wp_extra_sources")
+                extra_sources = workspace_overlay.module_param(pdata.get("modules", {}), mm, module, "wp_extra_sources")
             except Exception:
                 pass
     with run_lock("merge", run_dir):
@@ -527,6 +530,8 @@ class Ctx:
             str(k): v for k, v in (self.dag.get("modules") or {}).items() if isinstance(v, dict)
         }
         self.sidecars = self._load_sidecars()
+        # Link units (step I5b): a DAG module's harnesses may be sub-modules with their own sidecars.
+        self.mm = ModuleMap(self.dag, self.sidecars)
         self.eva_unknowns, self._eva_items_by_fn = self._load_eva()
 
         # DAG function records, by (file, name) and by bare name (`functions` is keyed by bare name;
@@ -588,7 +593,8 @@ class Ctx:
         for mod in sorted(all_modules):
             files = set(self.module_files.get(mod, set()))
             files |= {norm_path(f) for f in (self.modules.get(mod) or {}).get("required_sources") or []}
-            for src in (self.sidecars.get(mod) or {}).get("sources") or []:
+            # A unit's slice: the sources of every harness of the unit.
+            for src in self.sidecar(mod).get("sources") or []:
                 nf = norm_path(str(src))
                 if nf and not nf.startswith("workspace/") and not Path(nf).name.startswith("harness_"):
                     files.add(nf)
@@ -652,8 +658,20 @@ class Ctx:
             return True
         return rec.get("run_eacsl_fuzz") is False and rec.get("run_eva") is False
 
+    def harness_modules(self, mod: str) -> list[str]:
+        """The harness modules (sidecars) standing for `mod`: a unit's harnesses, or `mod` itself."""
+        return workspace_overlay.harness_modules_of(self.mm, mod)
+
+    def sidecar(self, mod: str) -> dict:
+        """`mod`'s sidecar; for a link unit, its harnesses' merged (sources and flags: their union)."""
+        return workspace_overlay.merged_sidecar(self.mm, mod)
+
+    def harness_module(self, mod: str | None, file: str | None = None, fn: str | None = None) -> str | None:
+        """The harness to build, repair or replay for `mod` (for a unit: the one answering for `fn`)."""
+        return workspace_overlay.harness_module_for_function(self.mm, mod, file, fn)
+
     def header(self, mod: str) -> str | None:
-        side = self.sidecars.get(mod) or {}
+        side = self.sidecar(mod)
         rec = self.modules.get(mod) or {}
         for value in (side.get("header"), rec.get("header"), *(rec.get("headers") or [])):
             if value:
@@ -663,7 +681,8 @@ class Ctx:
     def contributors(self, mod: str) -> list[str]:
         """Modules whose fuzz/Eva slice compiles one of `mod`'s files (their candidates gate `mod`)."""
         files = self.module_files.get(mod, set())
-        out = {mod}
+        # A unit's own harnesses (sub-modules) always contribute: their candidates are its functions'.
+        out = {mod, *self.harness_modules(mod)}
         for other, slice_files in self.slice_files.items():
             if other != mod and not self.inert(other) and slice_files & files:
                 out.add(other)
@@ -1011,6 +1030,7 @@ def _sync(state: dict, ctx: Ctx) -> dict:
             "module": mod,
             "contributors": ctx.contributors(mod),
             "files": sorted(ctx.module_files.get(mod, set())),
+            "harness_modules": ctx.harness_modules(mod),
         }
         for mod in gate_modules
     }
@@ -1102,7 +1122,7 @@ def callee_has_contract(
             cand_headers.add(norm_path(str(m_rec["header"])))
         for h in m_rec.get("headers") or []:
             cand_headers.add(norm_path(str(h)))
-        s_rec = ctx.sidecars.get(mod) or {}
+        s_rec = ctx.sidecar(mod)
         if s_rec.get("header"):
             cand_headers.add(norm_path(str(s_rec["header"])))
         for h in s_rec.get("headers") or []:
@@ -1342,10 +1362,13 @@ def _gate_blockers(
     by_module = index[0]
     by_file = index[1]
     by_fn = index[2] if len(index) > 2 else {}
+    gate_rec = state.get("gates", {}).get(f"gate:{module}") or {}
+    # The module and its harnesses: a link unit's verify and repair tasks name its sub-modules.
+    own = {module, *(gate_rec.get("harness_modules") or [])}
 
     # Active repair tasks on the module always block
     active_repairs = {
-        tid for tid in by_module.get(module, set()) if state["tasks"].get(tid, {}).get("kind") == "repair"
+        tid for mod in own for tid in by_module.get(mod, set()) if state["tasks"].get(tid, {}).get("kind") == "repair"
     }
 
     if task is not None and task.get("kind") == "arch":
@@ -1355,7 +1378,7 @@ def _gate_blockers(
         # Coarse module gate for _chain_heights, and cmd_status reporting
         gate = state.get("gates", {}).get(f"gate:{module}") or {"contributors": [module], "files": []}
         out = set(active_repairs)
-        for mod in set(gate.get("contributors") or []) | {module}:
+        for mod in set(gate.get("contributors") or []) | own:
             out |= by_module.get(mod, set())
         for file in gate.get("files") or []:
             out |= by_file.get(file, set())
@@ -1366,17 +1389,16 @@ def _gate_blockers(
 
     # 1. External contributor slices covering this module's files:
     # If another slice compiles this module's sources, verify tasks from that contributor slice hold the gate.
-    gate = state.get("gates", {}).get(f"gate:{module}") or {}
-    external_contributors = set(gate.get("contributors") or []) - {module}
+    external_contributors = set(gate_rec.get("contributors") or []) - own
     for ext_mod in external_contributors:
         out |= by_module.get(ext_mod, set())
 
     # 2. Harness-induced candidates:
-    # If the module has a harness sidecar (harness_<module>.json), any candidate in that module
-    # may trigger a harness rejection and repair:module, holding the gate for the module.
-    harness_path = HARNESS_DIR / f"harness_{module}.json"
-    if harness_path.is_file():
-        out |= by_module.get(module, set())
+    # If the module has a harness sidecar (harness_<module>.json, or a sub-module's for a link unit),
+    # any candidate in that module may trigger a harness rejection and repair:module, holding the gate.
+    if any((HARNESS_DIR / f"harness_{mod}.json").is_file() for mod in own):
+        for mod in own:
+            out |= by_module.get(mod, set())
     else:
         # Fine-grained: only verify tasks whose candidate belongs to this function or its transitive callees
         cone = _call_cone(task.get("file") or "", task.get("function") or "", ctx)
@@ -1845,7 +1867,7 @@ def _describe(task: dict, ctx: Ctx | None = None) -> dict:
         cand = (ctx.candidates.get(task["fingerprint"]) if ctx else None) or {}
         out["candidate_fingerprint"] = task["fingerprint"]
         out["replay_reports"] = _replay_reports(task["fingerprint"], cand)
-        meta = HARNESS_DIR / f"harness_{task['module']}.json"
+        meta = HARNESS_DIR / f"harness_{_verify_harness_module(task, ctx)}.json"
         out["harness_meta"] = meta.as_posix() if meta.is_file() else None
     elif task["kind"] == "negotiate":
         by_id = {r.get("id"): r for r in _requests()}
@@ -1858,6 +1880,21 @@ def _describe(task: dict, ctx: Ctx | None = None) -> dict:
     if task.get("wall_budget_s") is not None:
         out["wall_budget_s"] = int(task["wall_budget_s"])
     return out
+
+
+def _verify_harness_module(task: dict, ctx: Ctx | None = None) -> str:
+    """
+    The harness module a verify task's candidate runs through: the task's module (the candidate's
+    harness module); a link unit recorded on an older candidate resolves to its harness.
+    """
+    mod = str(task.get("module") or "unknown")
+    mm = ctx.mm if ctx is not None else workspace_overlay.module_map_for(Path("workspace"))
+    return (
+        workspace_overlay.harness_module_for_function(
+            mm, mod, task.get("location_file"), task.get("location_function") or task.get("function")
+        )
+        or mod
+    )
 
 
 def _describe_repair(task: dict) -> dict:
@@ -2693,8 +2730,13 @@ def _partial_contract_merge_job(task: dict, aid: str, report: dict | None, ctx: 
     }
 
 
+def _job_sidecar(module: str | None) -> dict:
+    """The sidecar a merge of `module` builds with (a link unit's: its harnesses' merged)."""
+    return workspace_overlay.merged_sidecar(workspace_overlay.module_map_for(Path("workspace")), module)
+
+
 def _merge_partial_prover(job: dict) -> dict:
-    side = load_json_optional(HARNESS_DIR / f"harness_{job['module']}.json", {}) or {}
+    side = _job_sidecar(job["module"])
     try:
         return DEPS.merge_agent_overlay(
             Path.cwd(),
@@ -2838,7 +2880,7 @@ def _is_architect_analysis_error(merged: dict, task: dict, aid: str) -> bool:
 
 
 def _merge_architect(job: dict) -> dict:
-    side = load_json_optional(HARNESS_DIR / f"harness_{job['module']}.json", {}) or {}
+    side = _job_sidecar(job["module"])
     try:
         return DEPS.merge_agent_overlay(
             Path.cwd(),
@@ -2885,7 +2927,8 @@ def _parent_replay(fp: str, cand: dict, out: dict) -> list[str]:
 def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path: Path, out: dict) -> None:
     fp = task["fingerprint"]
     replays = _parent_replay(fp, ctx.candidates.get(fp) or {}, out)
-    meta = HARNESS_DIR / f"harness_{task['module']}.json"
+    harness_mod = _verify_harness_module(task, ctx)
+    meta = HARNESS_DIR / f"harness_{harness_mod}.json"
     out["replay_reports"] = replays
     try:
         ing = DEPS.ingest_verifier(result_path, [Path(p) for p in replays], meta if meta.is_file() else None)
@@ -2905,7 +2948,8 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
         r.get("verdict") == "rejected" and r.get("rejection_class") == "harness_induced" for r in records
     )
     if harness_induced and not ing.get("harness_exhausted"):
-        _ensure_repair(state, task["module"], f"harness_induced: {fp}", out)
+        # The harness to repair (`pipeline_make.py run module-<harness>`), never a bare link unit.
+        _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out)
     _finish(state, task, "done", str(ing.get("decision")))
     out.update(action="ingested", decision=ing.get("decision"), harness_exhausted=ing.get("harness_exhausted"))
 
@@ -2927,7 +2971,13 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
                 aid,
                 artifact,
                 kind="seed",
-                module=task["module"],
+                # The corpus of the harness answering for the function (a link unit has several).
+                module=workspace_overlay.harness_module_for_function(
+                    workspace_overlay.module_map_for(Path("workspace")),
+                    task["module"],
+                    task.get("file"),
+                    task.get("function"),
+                ),
             )
     _finish(state, task, "done", res["status"])
     out["action"] = "ingested"
@@ -3630,6 +3680,7 @@ def cmd_baseline(
     if params_doc is None:
         params_doc = load_json_optional(run_dir / "build" / "params.json", {})
     modules_params = params_doc.get("modules", {}) if isinstance(params_doc, dict) else {}
+    sweep_mm = workspace_overlay.module_map_for(run_dir / "workspace")
 
     filtered: list[dict] = []
     skipped_proven: list[dict] = []
@@ -3643,7 +3694,12 @@ def cmd_baseline(
         if not c_file or not fn:
             continue
 
-        mod_params = modules_params.get(mod, {})
+        mod_params = dict(modules_params.get(mod) or {})
+        for key in ("wp_exclude_files", "wp_extra_sources"):
+            if key not in mod_params:  # a link unit: its harnesses' entries
+                vals = workspace_overlay.module_param(modules_params, sweep_mm, mod, key)
+                if vals is not None:
+                    mod_params[key] = vals
         exclude_pats = mod_params.get("wp_exclude_files", [])
         if _matches_exclude(c_file, exclude_pats):
             filtered.append({"task": tid, "file": c_file, "function": fn, "module": mod, "reason": "wp_exclude_files"})
@@ -3703,7 +3759,7 @@ def cmd_baseline(
 
         norm_c = norm_path(c_file)
         c_file_path = (work_dir / norm_c) if (work_dir / norm_c).is_file() else (run_dir / norm_c)
-        hmeta = load_json_optional(run_dir / "workspace" / "harnesses" / f"harness_{mod}.json", {})
+        hmeta = workspace_overlay.merged_sidecar(sweep_mm, mod)
         if not hmeta:
             hmeta = load_json_optional(run_dir / "harnesses" / f"harness_{mod}.json", {})
         cppflags = (hmeta.get("cppflags") if isinstance(hmeta, dict) else None) or "-I."

@@ -873,5 +873,51 @@ def test_modules_without_harness_ignores_excluded_units():
 
 
 @pytest.mark.unit
+def test_a_sub_module_harness_covers_its_link_unit():
+    ledger = [
+        {**unit("a.c#a::rte", "planned"), "module": "libkv_a"},
+        {**unit("t.c#main::rte", "planned"), "module": "kvtool"},
+    ]
+    dag = {"unit_of_lexer_module": {"decode": "libkv_a", "tool": "kvtool"}}
+    target = {"modules": [{"name": "decode"}]}
+    assert benchmark.modules_without_harness(ledger, target, dag) == ["kvtool"]
+    assert benchmark.modules_without_harness(ledger, target) == ["kvtool", "libkv_a"]
+
+
+@pytest.mark.unit
+def test_migrate_units_records_each_harness_modules_unit(tmp_path: Path):
+    dag = {
+        "module_kind": "link_unit",
+        "modules": {"libkv_a": {}, "kvtool": {}},
+        "unit_of_lexer_module": {"decode": "libkv_a", "encode": "libkv_a"},
+    }
+    manifest: dict = {
+        "targets": [
+            {"id": "kv", "modules": [{"name": "decode"}, {"name": "encode", "unit": "libkv_a"}, {"name": "kvtool"}]},
+            {"id": "other", "modules": [{"name": "x"}]},
+        ]
+    }
+    changed = benchmark.migrate_units(manifest, {"kv": dag})
+    assert changed == {"kv": {"decode": "libkv_a", "kvtool": "kvtool"}}
+    assert [m.get("unit") for m in manifest["targets"][0]["modules"]] == ["libkv_a", "libkv_a", "kvtool"]
+    assert "unit" not in manifest["targets"][1]["modules"][0]
+    assert benchmark.unit_mismatches(manifest["targets"][0]["modules"], dag) == []
+    moved = {**dag, "unit_of_lexer_module": {"decode": "kvtool", "encode": "libkv_a"}}
+    assert benchmark.unit_mismatches(manifest["targets"][0]["modules"], moved) == [
+        "decode: manifest unit 'libkv_a', DAG unit 'kvtool'"
+    ]
+    # A lexer-module DAG (no model) neither migrates nor mismatches.
+    assert benchmark.unit_mismatches(manifest["targets"][0]["modules"], {"modules": {}}) == []
+    with pytest.raises(BenchmarkError):
+        benchmark.migrate_units(manifest, {"kv": {"modules": {}}})
+    with pytest.raises(BenchmarkError):
+        benchmark.migrate_units({"targets": [{"id": "kv", "modules": [{"name": "nowhere"}]}]}, {"kv": dag})
+    argv = benchmark._harness_argv(
+        {"name": "decode", "unit": "libkv_a", "harness": {"sources": ["a.c"], "header": "a.h", "entry_fn": "f"}}
+    )
+    assert "--unit=libkv_a" in argv
+
+
+@pytest.mark.unit
 def test_wave_with_only_excluded_units_has_no_row():
     assert summarize_units([unit(status="deferred", wave=7)])["by_wave"] == {}

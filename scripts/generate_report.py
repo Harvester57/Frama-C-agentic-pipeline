@@ -254,6 +254,27 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     return out
 
 
+def concurrency_lines(ledger: list[dict]) -> list[str]:
+    """
+    One sentence per link unit that starts threads (`bookkeeping.concurrent`, set by `ledger.py
+    seed`): Eva and WP analyse each function as if no other thread ran, so their results there
+    assume sequential execution.
+    """
+    modules = sorted(
+        {str(u.get("module") or "unknown") for u in ledger if (u.get("bookkeeping") or {}).get("concurrent")}
+    )
+    if not modules:
+        return []
+    out = ["Concurrency:", ""]
+    out += [
+        f"- `{md_escape(m)}` starts threads: its Eva and WP results assume sequential execution "
+        "(no interleaving with its other threads was analysed)."
+        for m in modules
+    ]
+    out.append("")
+    return out
+
+
 def spec_quality_section(data: dict) -> list[str]:
     """
     Mutation-based specification quality (COINS/KBSpec) plus the evaluation-duality
@@ -438,6 +459,7 @@ def render_report(data: dict) -> str:
             out.append(f"- `{k}`: {n}")
         out.append("")
     out += verdict_limits_section(ledger)
+    out += concurrency_lines(ledger)
     out += spec_quality_section(data)
 
     out += ["## 6. Coverage gaps", ""]
