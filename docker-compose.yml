@@ -23,7 +23,7 @@
 # The framac-pipeline service runs the analysis image (stage framac-analysis), which holds no target
 # package: the build capture writes the target's headers and libraries to the run's snapshot
 # (workspace/snapshot/), and every Frama-C, E-ACSL and sanitizer step reads them from there.
-# FRAMAC_ANALYSIS_IMAGE=framac-pipeline:latest selects the monolith (build it without --target).
+# FRAMAC_ANALYSIS_IMAGE renames the analysis image.
 services:
   framac-pipeline:
     build:

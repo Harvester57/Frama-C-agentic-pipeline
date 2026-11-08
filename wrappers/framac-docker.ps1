@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Executes Frama-C, E-ACSL, Clang/LibFuzzer, or pipeline helper scripts inside the hardened framac-pipeline container.
+    Executes Frama-C, E-ACSL, Clang/LibFuzzer, or pipeline helper scripts inside a hardened pipeline container.
 
 .DESCRIPTION
     Mount layout:
@@ -70,8 +70,12 @@
     framac-build:<repo> is built (--target framac-build) and used. -Image still overrides the image name.
     Every other command runs in the analysis image (framac-analysis:latest), which holds no target
     package: the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written
-    by the build capture), so -TargetPackages only derives the build image. -Image framac-pipeline:latest
-    selects the monolith, which -TargetPackages still derives as framac-pipeline:<repo>.
+    by the build capture), so -TargetPackages only derives the build image.
+
+.PARAMETER Image
+    Name of the image to run: the analysis image (default framac-analysis:latest), or the build image with
+    -BuildImage. A missing image is built from the matching Dockerfile stage (framac-analysis or
+    framac-build) with -BuildIfMissing.
 
 .PARAMETER CodeQL
     Run the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py; docs/phase0-implementation-plan.md
@@ -412,8 +416,8 @@ if ($RemoveScratch) {
 
 # ---- Image ----
 # Build steps (-BuildImage) run in the build image (Dockerfile stage framac-build); everything else in the
-# analysis image (stage framac-analysis). An explicit -Image is built from the Dockerfile's last stage, the monolith.
-$imageTarget = @()
+# analysis image (stage framac-analysis). -Image only renames the image; it is built from the same stage.
+$imageTarget = @("--target", "framac-analysis")
 $explicitImage = $PSBoundParameters.ContainsKey("Image")
 if ($CodeQL -and $BuildImage) { throw "Use either -CodeQL or -BuildImage, not both." }
 $codeqlBase = ""
@@ -425,8 +429,6 @@ if ($CodeQL) {
 } elseif ($BuildImage) {
     if (-not $explicitImage) { $Image = "framac-build:latest" }
     $imageTarget = @("--target", "framac-build")
-} elseif (-not $explicitImage) {
-    $imageTarget = @("--target", "framac-analysis")
 }
 $imageExists = & $EngineName images "-q" "$Image" 2>$null
 if (-not $imageExists) {
@@ -442,14 +444,13 @@ if (-not $imageExists) {
     }
 }
 
-if ($TargetPackages -and -not $BuildImage -and -not $CodeQL -and -not $explicitImage) {
+if ($TargetPackages -and -not $BuildImage -and -not $CodeQL) {
     # The analysis image never gets target packages: the run's snapshot carries them.
     [Console]::Error.WriteLine("[framac-docker] -TargetPackages ignored: the analysis image reads the target's headers and libraries from the run's snapshot (pass them to the -BuildImage capture)")
     $TargetPackages = ""
 }
 if ($TargetPackages) {
-    $DerivedImage = "framac-pipeline:$RepoName"
-    if ($BuildImage -or $CodeQL) { $DerivedImage = "framac-build:$RepoName" }
+    $DerivedImage = "framac-build:$RepoName"
     [Console]::Error.WriteLine("[framac-docker] Building derived image $DerivedImage with target packages: $TargetPackages")
     & $EngineName build @imageTarget "-t" "$DerivedImage" "--build-arg" "TARGET_APT_PACKAGES=$TargetPackages" "$PipelineRoot" |
         ForEach-Object { [Console]::Error.WriteLine("$_") }

@@ -195,13 +195,14 @@ jobs:
         with:
           driver: docker
 
-      - name: Build hardened framac-pipeline container image
+      - name: Build the analysis image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./Dockerfile
+          target: framac-analysis
           load: true
-          tags: framac-pipeline:latest
+          tags: framac-analysis:latest
 
       - name: Run sandbox probe, E-ACSL canary and kernel AST selftests in hardened container
         shell: bash

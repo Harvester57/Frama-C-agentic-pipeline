@@ -76,6 +76,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          target: framac-analysis
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

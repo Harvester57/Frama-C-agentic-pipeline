@@ -481,6 +481,9 @@ class TestWrappersAndBenchmark:
         for flag in ("$BuildImage", "$Scratch", "$RemoveScratch", '"framac-build"', "/framac-scratch"):
             assert flag in ps1, flag
         assert "target: framac-build" in compose and "scratch:/framac-scratch" in compose
+        # The monolithic image is gone (plan step I10): no wrapper names or derives it.
+        for text in (sh, ps1, compose):
+            assert "framac-pipeline:" not in text
 
     def test_ps1_runs_build_steps_in_the_build_image_with_the_scratch_volume(self, tmp_path):
         pwsh = shutil.which("pwsh") or shutil.which("powershell")
@@ -501,13 +504,9 @@ class TestWrappersAndBenchmark:
             ([], "framac-analysis:latest", False),
             (["-BuildImage", "-Scratch"], "framac-build:latest", True),
             (["-BuildImage", "-TargetPackages", "check", "-NoBroker"], "framac-build:target_repo", False),
-            # The analysis image never gets target packages; the monolith, named explicitly, still does.
+            # The analysis image never gets target packages, under its default name or another one.
             (["-TargetPackages", "check", "-NoBroker"], "framac-analysis:latest", False),
-            (
-                ["-Image", "framac-pipeline:latest", "-TargetPackages", "check", "-NoBroker"],
-                "framac-pipeline:target_repo",
-                False,
-            ),
+            (["-Image", "framac-analysis:other", "-TargetPackages", "check", "-NoBroker"], "framac-analysis:other", False),
         )
         for extra, image, scratch in cases:
             proc = subprocess.run([*base, *extra, "true"], env=env, capture_output=True, text=True)
