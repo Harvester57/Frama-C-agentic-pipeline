@@ -2293,7 +2293,9 @@ def model_view(
       the model's keys);
     - `macro_aliases` maps each alias the model found to the DAG keys of its functions;
     - header functions are marked `header`, and `reached` when an entry point of the build calls them;
-    - functions of a unit on the GCC fallback carry `callgraph_fallback` (Frama-C's first error).
+    - functions of a unit on the GCC fallback carry `callgraph_fallback` (Frama-C's first error);
+    - each function carries the model's `trust` (scripts/trust.py: untrusted or trusted, the deciding
+      rule, `boundary`), and the DAG the model's `trust` block.
     """
     model_fns: dict[str, dict] = model.get("functions") or {}
     units: dict[str, dict] = model.get("units") or {}
@@ -2373,6 +2375,8 @@ def model_view(
             rec["callgraph_fallback"] = errors[0]
         if m.get("cyclomatic") is not None:
             rec["cyclomatic"] = m["cyclomatic"]
+        if isinstance(m.get("trust"), dict):
+            rec["trust"] = m["trust"]  # step I7 (scripts/trust.py)
         functions[key] = rec
 
     waves, cycles = compute_topological_waves(functions, succ)
@@ -2483,6 +2487,7 @@ def model_view(
             "lexer_only_functions": dropped,
             "gcc_fallback_units": sorted(fallback_error),
         },
+        **({"trust": model["trust"]} if isinstance(model.get("trust"), dict) else {}),
     }
 
 
@@ -2657,6 +2662,13 @@ def unit_view(dag: dict, model: dict) -> dict:
             "run_wp_full": any(m.get("run_wp_full") for m in tier_src),
             "run_eva": any(m.get("run_eva") for m in tier_src) or not tier_src,
             "run_eacsl_fuzz": any(m.get("run_eacsl_fuzz") for m in tier_src),
+            # Step I7: the threat model's status for the unit, and each entry point's trust.
+            "threat_model": (rec.get("trust") or {}).get("threat_model"),
+            "entry_trust": {
+                k: {t: functions[k]["trust"].get(t) for t in ("value", "source", "boundary")}
+                for k in (entries or [])
+                if isinstance(functions[k].get("trust"), dict)
+            },
         }
     # Functions no unit compiles (none in a successful model) keep their lexer module.
     for key, rec in functions.items():

@@ -43,5 +43,21 @@
     "tools/rbcat.c#main"
   ],
   "thread_entries": [],
-  "notes": "rb_used and rb_free_space are public (exported, declared in include/ringbuf.h) yet have internal callers. rb_util_advance/rb_util_span are non-static but hidden (-fvisibility=hidden, internal header lib/util/wrap.h) and are only called from lib/core/, another directory: not entry points. `nm -D libringbuf.so` shows exactly the six rb_* API symbols as exported T."
+  "notes": "rb_used and rb_free_space are public (exported, declared in include/ringbuf.h) yet have internal callers. rb_util_advance/rb_util_span are non-static but hidden (-fvisibility=hidden, internal header lib/util/wrap.h) and are only called from lib/core/, another directory: not entry points. `nm -D libringbuf.so` shows exactly the six rb_* API symbols as exported T.",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "lib/core/line.c#rb_peek_line": ["default", "call_graph"],
+      "lib/core/ringbuf.c#rb_free_space": ["default", "call_graph"],
+      "lib/core/ringbuf.c#rb_init": ["default", "call_graph"],
+      "lib/core/ringbuf.c#rb_read": ["default", "call_graph"],
+      "lib/core/ringbuf.c#rb_used": ["default", "call_graph"],
+      "lib/core/ringbuf.c#rb_write": ["default", "call_graph"],
+      "lib/util/wrap.c#rb_util_advance": ["call_graph"],
+      "lib/util/wrap.c#rb_util_span": ["call_graph"],
+      "tools/rbcat.c#main": ["call_graph"]
+    },
+    "boundary": ["lib/core/line.c#rb_peek_line", "lib/core/ringbuf.c#rb_free_space", "lib/core/ringbuf.c#rb_init", "lib/core/ringbuf.c#rb_read", "lib/core/ringbuf.c#rb_used", "lib/core/ringbuf.c#rb_write"],
+    "trusted": []
+  }
 }

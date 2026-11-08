@@ -123,6 +123,7 @@ def load_inputs(run_dir: Path) -> dict:
         "candidates": load_json_optional(run_dir / "candidates.json", []),
         "coverage": load_coverage_reports(run_dir),
         "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
+        "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
     }
 
 
@@ -254,6 +255,55 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     return out
 
 
+TRUST_ROWS_MAX = 60
+
+
+def trust_lines(model: dict | None) -> list[str]:
+    """
+    The trust boundary (scripts/trust.py, plan step I7): the threat model and CodeQL used, then each
+    unit's entry points with their trust and the rule that decided it. Empty without a model with trust.
+    """
+    if not isinstance(model, dict) or not isinstance(model.get("trust"), dict):
+        return []
+    block = model["trust"]
+    tm = block.get("threat_model") or {}
+    cq = block.get("codeql") or {}
+    functions = model.get("functions") or {}
+    tm_text = f"`{tm.get('status')}`" + (f" (`{md_escape(str(tm.get('path')))}`)" if tm.get("path") else "")
+    if tm.get("status") != "ok" and tm.get("reason"):
+        tm_text += f": {md_escape(str(tm['reason']))}"
+    cq_text = f"`{cq.get('status')}`" + (f", {cq.get('facts')} fact(s)" if cq.get("facts") is not None else "")
+    out = ["### Trust boundary", "", f"- **Threat model:** {tm_text}", f"- **CodeQL:** {cq_text}"]
+    by_source = (block.get("summary") or {}).get("by_source") or {}
+    if by_source:
+        out.append(
+            "- **Functions:** " + ", ".join(f"{n} {k.replace(':', ' by ')}" for k, n in sorted(by_source.items()))
+        )
+    rows: list[str] = []
+    for unit, u in sorted((model.get("units") or {}).items()):
+        if u.get("test"):
+            continue
+        for fid in dict.fromkeys([*(u.get("entry_points") or []), *(u.get("embedded_api") or [])]):
+            t = (functions.get(fid) or {}).get("trust")
+            if not isinstance(t, dict):
+                continue
+            also = [x for x in t.get("sources") or [] if x != t.get("source")]
+            source = t.get("source", "") + (f" (also {', '.join(also)})" if also else "")
+            if t.get("overridden"):
+                source += f" (overrides {', '.join(t['overridden'])})"
+            rows.append(
+                f"| `{md_escape(unit)}` | `{md_escape(fid)}` | {t.get('value')}"
+                f"{' (boundary)' if t.get('boundary') else ''} | {md_escape(source)} |"
+            )
+    if rows:
+        out += ["", "| Unit | Entry point | Trust | Source |", "| :--- | :--- | :--- | :--- |"]
+        out += rows[:TRUST_ROWS_MAX]
+        if len(rows) > TRUST_ROWS_MAX:
+            out.append(f"| ... | {len(rows) - TRUST_ROWS_MAX} more (see workspace/reports/phase0_model.json) | | |")
+    out.append("")
+    return out
+
+
 def concurrency_lines(ledger: list[dict]) -> list[str]:
     """
     One sentence per link unit that starts threads (`bookkeeping.concurrent`, set by `ledger.py
@@ -376,6 +426,7 @@ def render_report(data: dict) -> str:
     if work["open_units"]:
         out.append(f"**{len(work['open_units'])} coverage unit(s) are still planned or in progress.**")
         out.append("")
+    out += trust_lines(data.get("model"))
 
     out += ["## 2. Summary", ""]
     sev = Counter(r["severity"] for r in confirmed)

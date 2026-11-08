@@ -28,5 +28,14 @@
     "src/unescape.c#pkt_unescape",
     "src/unescape.c#pkt_escape_cost"
   ],
-  "lexer_expected": "discover_in_tree_cppflags regex-scans the Makefile for literal -D tokens: it misses -DFAST_UNESCAPE (built by $(addprefix -D,$(FEATURES))) and picks up -DLEGACY_UNESCAPE from the non-default 'legacy' target, so both modules get cppflags [-DLEGACY_UNESCAPE]. The harness then compiles the legacy body: S03-1 is missed (verified: the repro does not abort under the lexer flags) and S03-D1 fires on any pkt_decode input of more than 65 plain bytes (false positive, verified)."
+  "lexer_expected": "discover_in_tree_cppflags regex-scans the Makefile for literal -D tokens: it misses -DFAST_UNESCAPE (built by $(addprefix -D,$(FEATURES))) and picks up -DLEGACY_UNESCAPE from the non-default 'legacy' target, so both modules get cppflags [-DLEGACY_UNESCAPE]. The harness then compiles the legacy body: S03-1 is missed (verified: the repro does not abort under the lexer flags) and S03-D1 fires on any pkt_decode input of more than 65 plain bytes (false positive, verified).",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/packet.c#pkt_decode": ["default"],
+      "src/unescape.c#pkt_escape_cost": ["default"],
+      "src/unescape.c#pkt_unescape": ["default"]
+    },
+    "boundary": ["src/packet.c#pkt_decode", "src/unescape.c#pkt_escape_cost", "src/unescape.c#pkt_unescape"]
+  }
 }

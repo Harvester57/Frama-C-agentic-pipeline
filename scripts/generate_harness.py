@@ -1391,6 +1391,35 @@ def _merge_dag_harness_sources(
     return merged
 
 
+def _trust_reachability(out_dir: Path, entry_fn: str) -> tuple[str, str] | None:
+    """
+    The entry function's reachability from its trust (scripts/trust.py, step I7), read from the run's
+    DAG: (`untrusted_surface` at a trust boundary, else `internal_api`; `trust:<deciding rule>`).
+    None when the DAG or the function's trust is missing.
+    """
+    from trust import function_trust, reachability_of
+
+    for dag_path in (out_dir.parent / "reports" / "callgraph_dag.json", Path("workspace/reports/callgraph_dag.json")):
+        if not dag_path.is_file():
+            continue
+        try:
+            dag = json.loads(dag_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        functions = dag.get("functions") if isinstance(dag, dict) else None
+        if not isinstance(functions, dict):
+            continue
+        trust = function_trust(functions, entry_fn)
+        if trust is None:
+            for key in (dag.get("macro_aliases") or {}).get(entry_fn) or []:
+                trust = trust or function_trust(functions, key)
+        reach = reachability_of(trust)
+        if reach and trust is not None:
+            return reach, f"trust:{trust.get('source')}"
+        return None
+    return None
+
+
 _FUZZ_FN_BLOCK_RE = re.compile(
     r"/\*\s*\n\s*\*\s*LibFuzzer Entry Point.*?^int LLVMFuzzerTestOneInput\(const uint8_t \*data, size_t size\)\s*\{.*?^\}",
     re.DOTALL | re.MULTILINE,
@@ -1432,8 +1461,15 @@ def generate_module_harness(
 ) -> dict[str, Any]:
     if auto_args:
         entry_style = "auto_prototype"
+    # Reachability: explicit, else from the entry function's trust (step I7), else from the entry style.
+    reachability_source = "explicit"
     if reachability is None:
-        reachability = "internal_api" if entry_style == "auto_prototype" else "untrusted_surface"
+        from_trust = _trust_reachability(out_dir, entry_fn)
+        if from_trust is not None:
+            reachability, reachability_source = from_trust
+        else:
+            reachability = "internal_api" if entry_style == "auto_prototype" else "untrusted_surface"
+            reachability_source = "entry_style"
     if reachability not in ("untrusted_surface", "internal_api"):
         raise ValueError(f"invalid reachability: {reachability!r}")
     if entry_style not in VALID_ENTRY_STYLES:
@@ -1695,6 +1731,7 @@ def generate_module_harness(
         "include_source": include_source,
         "stubbed_callees": sorted(set(stubbed_callees or [])),
         "reachability": reachability,
+        "reachability_source": reachability_source,
         "max_input_size": max_input_size,
         "contract_notes": list(contract_notes or []),
         "repair_attempts": repair_attempts,
@@ -1735,6 +1772,7 @@ def generate_module_harness(
         "null_terminate": effective_null_terminate,
         "include_source": include_source,
         "reachability": reachability,
+        "reachability_source": reachability_source,
         **prelude_fields,
     }
 
@@ -1788,8 +1826,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reachability",
         choices=["untrusted_surface", "internal_api"],
-        default="untrusted_surface",
-        help="Reachability classification of the entry function",
+        default=None,
+        help=(
+            "Reachability classification of the entry function (default: from its trust in the DAG, "
+            "untrusted_surface at a trust boundary; without trust, internal_api for auto_prototype, "
+            "else untrusted_surface)"
+        ),
     )
     parser.add_argument(
         "--entry-style",
@@ -1898,10 +1940,8 @@ def main(argv: list[str] | None = None) -> int:
     if not style_explicit and not args.auto_args and args.entry_fn == "main":
         # CLI-style target: drive main(argc, argv) instead of a (buf, len) entry.
         effective_style = "argv"
-    explicit_reachability = any(a == "--reachability" or a.startswith("--reachability=") for a in raw_argv)
-    effective_reachability = (
-        "internal_api" if (effective_style == "auto_prototype" and not explicit_reachability) else args.reachability
-    )
+    # None: generate_module_harness takes it from the entry function's trust, else from the entry style.
+    effective_reachability = args.reachability
 
     try:
         result = generate_module_harness(

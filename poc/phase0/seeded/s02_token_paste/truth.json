@@ -18,5 +18,13 @@
     "src/dispatch.c#proto_reply",
     "src/dispatch.c#proto_run"
   ],
-  "lexer_expected": "The lexer sees no reference from src/dispatch.c to h_* (the names exist only after h_##name pasting in the static ops[] table), so module 'dispatch' has required_sources [src/dispatch.c] and its harness fails to link (undefined h_ping, h_echo, h_sum, h_rev, h_upper; verified): S02-1 is missed through the real API. It offers the five handlers as entry points of module 'handlers'. They take an internal struct reply * (not an API shape), so a direct harness either cannot build them or must invent the reply buffer; a NULL or wrongly sized buf crashes any handler (false positives), and only a correctly sized one could reach S02-1 by accident."
+  "lexer_expected": "The lexer sees no reference from src/dispatch.c to h_* (the names exist only after h_##name pasting in the static ops[] table), so module 'dispatch' has required_sources [src/dispatch.c] and its harness fails to link (undefined h_ping, h_echo, h_sum, h_rev, h_upper; verified): S02-1 is missed through the real API. It offers the five handlers as entry points of module 'handlers'. They take an internal struct reply * (not an API shape), so a direct harness either cannot build them or must invent the reply buffer; a NULL or wrongly sized buf crashes any handler (false positives), and only a correctly sized one could reach S02-1 by accident.",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/dispatch.c#proto_reply": ["default"],
+      "src/dispatch.c#proto_run": ["default"]
+    },
+    "boundary": ["src/dispatch.c#proto_reply", "src/dispatch.c#proto_run"]
+  }
 }

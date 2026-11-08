@@ -21,5 +21,16 @@
     "src/stats.c#frame_stats",
     "src/stats.c#frame_payload_sum"
   ],
-  "lexer_expected": "Bookkeeping/control case. The lexer reports a name collision for 'at' and keeps one record, src/stats.c#at (the safe one): src/frame.c#at disappears from the inventory and header_digest's edge points to stats.c's at. Modules and entry points are still right (frame: frame_parse, frame_digest, frame_kind_name; stats: frame_stats, frame_payload_sum) and the frame harness compiles src/frame.c, so fuzzing should still find S07-1; per-function attribution (Eva/WP results for 'at') is wrong."
+  "lexer_expected": "Bookkeeping/control case. The lexer reports a name collision for 'at' and keeps one record, src/stats.c#at (the safe one): src/frame.c#at disappears from the inventory and header_digest's edge points to stats.c's at. Modules and entry points are still right (frame: frame_parse, frame_digest, frame_kind_name; stats: frame_stats, frame_payload_sum) and the frame harness compiles src/frame.c, so fuzzing should still find S07-1; per-function attribution (Eva/WP results for 'at') is wrong.",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/frame.c#frame_digest": ["default"],
+      "src/frame.c#frame_kind_name": ["default"],
+      "src/frame.c#frame_parse": ["default"],
+      "src/stats.c#frame_payload_sum": ["default"],
+      "src/stats.c#frame_stats": ["default"]
+    },
+    "boundary": ["src/frame.c#frame_digest", "src/frame.c#frame_kind_name", "src/frame.c#frame_parse", "src/stats.c#frame_payload_sum", "src/stats.c#frame_stats"]
+  }
 }

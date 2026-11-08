@@ -27,5 +27,13 @@
     "src/record.c#rec_parse",
     "src/record.c#rec_sum"
   ],
-  "lexer_expected": "The lexer inventories no function in src/readers.c (read_u8/u16/u32 and read_label come from macro invocations with no top-level braces), so module 'record' lists them as external callees and its required_sources is only src/record.c: the rec_parse/rec_sum harness fails to link (undefined read_u8, read_u16, read_u32, read_label; verified) and S01-1 is missed. It also walks src/dump_legacy.c and offers rec_dump_legacy as the entry point of module 'dump_legacy'; that harness crashes at line 15 (false positive, verified)."
+  "lexer_expected": "The lexer inventories no function in src/readers.c (read_u8/u16/u32 and read_label come from macro invocations with no top-level braces), so module 'record' lists them as external callees and its required_sources is only src/record.c: the rec_parse/rec_sum harness fails to link (undefined read_u8, read_u16, read_u32, read_label; verified) and S01-1 is missed. It also walks src/dump_legacy.c and offers rec_dump_legacy as the entry point of module 'dump_legacy'; that harness crashes at line 15 (false positive, verified).",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/record.c#rec_parse": ["default"],
+      "src/record.c#rec_sum": ["default"]
+    },
+    "boundary": ["src/record.c#rec_parse", "src/record.c#rec_sum"]
+  }
 }

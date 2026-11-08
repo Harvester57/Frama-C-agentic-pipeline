@@ -21,5 +21,16 @@
     "src/kv.c#kv_get",
     "src/kv.c#kv_count"
   ],
-  "lexer_expected": "The lexer's candidate_entry_points for module 'kv' are the non-static functions with no caller in the module: kv_count, kv_load, kv_find, kv_get. kv_key_equals has an internal caller (find_slot) and is dropped, so no harness passes it an arbitrary slot and S05-1 is missed."
+  "lexer_expected": "The lexer's candidate_entry_points for module 'kv' are the non-static functions with no caller in the module: kv_count, kv_load, kv_find, kv_get. kv_key_equals has an internal caller (find_slot) and is dropped, so no harness passes it an arbitrary slot and S05-1 is missed.",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone, so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/kv.c#kv_count": ["default"],
+      "src/kv.c#kv_find": ["default"],
+      "src/kv.c#kv_get": ["default"],
+      "src/kv.c#kv_key_equals": ["default"],
+      "src/kv.c#kv_load": ["default"]
+    },
+    "boundary": ["src/kv.c#kv_count", "src/kv.c#kv_find", "src/kv.c#kv_get", "src/kv.c#kv_key_equals", "src/kv.c#kv_load"]
+  }
 }

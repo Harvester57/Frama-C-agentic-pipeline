@@ -41,5 +41,23 @@
   },
   "entry_points": ["src/dispatch.c#proto_parse", "src/dispatch.c#proto_dispatch", "src/dispatch.c#proto_list_ops", "tools/msgtool.c#main"],
   "thread_entries": [],
-  "notes": "Comparators passed to bsearch/qsort are modelled like pthread_create: an indirect edge from the function that calls bsearch/qsort to the comparator. sink.write is assigned in main to write_hex or write_plain depending on argv, so every out->write call site reaches both. h_reset is compiled and non-static but never referenced (not in the table): no edge reaches it and it is not an entry point. h_* are declared in the internal src/handlers.h, not the public include/proto.h."
+  "notes": "Comparators passed to bsearch/qsort are modelled like pthread_create: an indirect edge from the function that calls bsearch/qsort to the comparator. sink.write is assigned in main to write_hex or write_plain depending on argv, so every out->write call site reaches both. h_reset is compiled and non-static but never referenced (not in the table): no edge reaches it and it is not an entry point. h_* are declared in the internal src/handlers.h, not the public include/proto.h.",
+  "trust": {
+    "rule": "step I7, no threat model: library API and an executable's embedded API untrusted (default, boundary); functions reached in the call graph from a function calling an input reader or from main with argv untrusted (call_graph; main with argv is a boundary); every other function trusted (default)",
+    "untrusted": {
+      "src/dispatch.c#cmp_name": ["call_graph"],
+      "src/dispatch.c#cmp_op": ["call_graph"],
+      "src/dispatch.c#proto_dispatch": ["default", "call_graph"],
+      "src/dispatch.c#proto_list_ops": ["default", "call_graph"],
+      "src/dispatch.c#proto_parse": ["default", "call_graph"],
+      "src/handlers.c#h_echo": ["call_graph"],
+      "src/handlers.c#h_ping": ["call_graph"],
+      "src/handlers.c#h_sum": ["call_graph"],
+      "tools/msgtool.c#main": ["call_graph"],
+      "tools/msgtool.c#write_hex": ["call_graph"],
+      "tools/msgtool.c#write_plain": ["call_graph"]
+    },
+    "boundary": ["src/dispatch.c#proto_dispatch", "src/dispatch.c#proto_list_ops", "src/dispatch.c#proto_parse", "tools/msgtool.c#main"],
+    "trusted": ["src/handlers.c#h_reset"]
+  }
 }
