@@ -739,6 +739,10 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
         errors = sorted({fallback_error[u] for u in m.get("units") or [] if u in fallback_error})
         if errors:
             rec["callgraph_fallback"] = errors[0]
+            if all(u in fallback_error for u in m.get("units") or []):
+                # No unit compiling it parses: Eva and WP cannot run on it (unit_view decides by the
+                # function's home unit instead).
+                rec["eva_wp_blocked"] = fallback_blocked_reason(errors[0])
         if m.get("cyclomatic") is not None:
             rec["cyclomatic"] = m["cyclomatic"]
         if isinstance(m.get("trust"), dict):
@@ -812,6 +816,40 @@ _UNIT_KIND_ORDER = {"static_lib": 0, "shared_lib": 1}
 _RESERVED_MODULE_NAMES = frozenset({"tune", "tune-base"})
 
 
+def fallback_blocked_reason(error: str) -> str:
+    """Why Eva and WP cannot run on a function of a unit Frama-C could not parse (its first error)."""
+    return f"Frama-C cannot parse its link unit, so Eva and WP cannot run on it: {error[:200]}"
+
+
+def block_fallback_units(dag: dict) -> dict:
+    """
+    A link unit on the GCC fallback (Frama-C could not parse it): fuzzing runs with the sanitizers,
+    since E-ACSL needs the Frama-C parse, and Eva and WP are blocked. Its record, its path modules'
+    and its clusters' (the records its harnesses run under) get `run_eva` and `run_wp_full` false and
+    `fuzz_engine: sanitizers`. Its functions carry the reason in `eva_wp_blocked`.
+    """
+    modules: dict[str, dict] = dag.get("modules") or {}
+    fallback = {name: str(rec["callgraph_fallback"]) for name, rec in modules.items() if rec.get("callgraph_fallback")}
+    if not fallback:
+        return dag
+    unit_of_path = dag.get("unit_of_lexer_module") or {}
+    records = [modules[n] for n in fallback]
+    records += [rec for m, rec in (dag.get("lexer_modules") or {}).items() if unit_of_path.get(m) in fallback]
+    records += [rec for rec in (dag.get("submodules") or {}).values() if rec.get("unit") in fallback]
+    for rec in records:
+        if isinstance(rec, dict):
+            rec.update(run_eva=False, run_wp_full=False, fuzz_engine="sanitizers")
+    for name, error in sorted(fallback.items()):
+        dag.setdefault("warnings", []).append(
+            f"module {name}: on the GCC fallback, fuzzed with the sanitizers; Eva and WP are blocked"
+        )
+        for key in modules[name].get("functions") or []:
+            rec = (dag.get("functions") or {}).get(key)
+            if isinstance(rec, dict):
+                rec["eva_wp_blocked"] = fallback_blocked_reason(error)
+    return dag
+
+
 def unit_module_name(unit: str) -> str:
     """A link artifact as a module name usable in Make targets and file names: `lib/libkv.a` -> `libkv_a`."""
     name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in Path(unit).name).strip("_") or "unit"
@@ -868,6 +906,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
         u = home(rec)
         if u is None:
             continue  # stays in its path module (kept below)
+        # Eva and WP run per unit: the home unit's parse decides (block_fallback_units sets it back).
+        rec.pop("eva_wp_blocked", None)
         rec["module"] = names[u]
         members[u].append(key)
         if path_mod:
@@ -900,6 +940,11 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "unit": u,
             "kind": rec.get("kind"),
             "concurrent": bool(rec.get("concurrent")),
+            **(
+                {"callgraph_fallback": (rec.get("parse") or {}).get("error") or "Frama-C could not parse this unit"}
+                if (rec.get("parse") or {}).get("status") == "gcc_fallback"
+                else {}
+            ),
             "files": sorted(f for f in sources if unit_of_file.get(f) == u),
             "required_sources": sources,
             "cross_module_callees": sorted(
@@ -971,7 +1016,9 @@ def build_dag(
         view = unit_view(view, model, root=root, capture=capture)
     # Step I8: tiers per function from trust, then oversized units split into sub-modules.
     tiers.apply(view)
-    return unit_split.apply(view, split_max_functions, split_max_lines)
+    view = unit_split.apply(view, split_max_functions, split_max_lines)
+    # The plan's decision for a unit Frama-C cannot parse: sanitizer fuzzing, Eva and WP blocked.
+    return block_fallback_units(view) if units else view
 
 
 def main() -> int:
@@ -1015,7 +1062,8 @@ def main() -> int:
     model, why = load_model(args.model)
     if model is None:
         print(
-            f"error: no Phase 0 model: {why}. Phase 0 stops here (needs_build_recipe): the target must build.",
+            f"error: no Phase 0 model: {why}. Phase 0 stops here: the target must build (needs_build_recipe) "
+            "and Frama-C must parse at least one of its units (no_unit_parsed).",
             file=sys.stderr,
         )
         return 2

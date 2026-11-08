@@ -42,7 +42,7 @@
   "properties": {
     "schema_version": {"const": 1},
     "generated_at": {"type": "string", "minLength": 1},
-    "status": {"type": "string", "enum": ["ok", "error"]},
+    "status": {"type": "string", "enum": ["ok", "error", "no_unit_parsed"]},
     "error": {"type": "string"},
     "capture": {"type": "string"},
     "capture_generated_at": {"type": ["string", "null"]},

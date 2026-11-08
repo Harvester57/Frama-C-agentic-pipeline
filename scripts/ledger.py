@@ -346,6 +346,8 @@ def _resolve_seed_profile(profile: str | None, dag_path: Path) -> str:
 
 
 HEADER_UNREACHED = "header_unreached: no entry point of the build reaches this header function"
+# The prefix of a unit deferred because its link unit is on the GCC fallback (Eva and WP blocked).
+CALLGRAPH_FALLBACK = "callgraph_fallback"
 
 
 def _load_security_obligations(path: Path | None) -> tuple[dict[str, list[dict]] | None, str]:
@@ -375,7 +377,7 @@ def cmd_seed(
     # With link units (step I5b) each function has its own tier (scripts/tiers.py, step I8).
     link_units = dag.get("module_kind") == "link_unit"
     resolved_profile = _resolve_seed_profile(profile, dag_path)
-    added, skipped, deferred_unreached = 0, [], []
+    added, skipped, deferred_unreached, deferred_fallback = 0, [], [], []
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
         name = fn.get("name", fn_name)
         file = normalize_file(fn.get("file", ""))
@@ -476,6 +478,11 @@ def cmd_seed(
                     )
             else:
                 unit = new_unit(file, name, cls, module, tier, wave, source, "planned", None, reason)
+            if fn.get("eva_wp_blocked") and unit["status"] == "planned":
+                # Its unit is on the GCC fallback: Eva and WP cannot run on it, fuzzing still does.
+                unit["status"] = "deferred"
+                unit["unresolved"] = [f"{CALLGRAPH_FALLBACK}: {fn['eva_wp_blocked']}"]
+                deferred_fallback.append(cid)
             if unreached_header and unit["status"] == "planned":
                 unit["status"] = "deferred"
                 unit["unresolved"] = [HEADER_UNREACHED]
@@ -503,6 +510,7 @@ def cmd_seed(
         "total_units": len(units),
         "skipped_unsupported_names": skipped,
         "deferred_unreached_header_units": len(deferred_unreached),
+        "deferred_callgraph_fallback_units": len(deferred_fallback),
         "security_props": {
             "status": sec_status,
             "functions": len(sec_matched),

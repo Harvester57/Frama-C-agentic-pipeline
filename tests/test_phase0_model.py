@@ -484,6 +484,46 @@ def test_build_model_reports_a_missing_capture_or_tree(tmp_path):
 
 
 @pytest.mark.unit
+def test_build_model_stops_when_no_unit_parses(tmp_path, monkeypatch):
+    """Phase 0 stops when Frama-C parses no unit (defect 6): status no_unit_parsed, exit 4."""
+    tree = tmp_path / "tree"
+    (tree / "src").mkdir(parents=True)
+    (tree / "src" / "a.c").write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    capture = {
+        "status": "ok",
+        "scratch": {"tree": str(tree)},
+        "compiles": [{"source": "src/a.c", "object": "a.o", "flags": [], "system_flags": []}],
+        "units": {
+            "liba.a": {"kind": "static_lib", "test": False, "objects": ["a.o"], "files": ["src/a.c"], "links": []}
+        },
+    }
+    cap = tmp_path / "cap.json"
+    cap.write_text(json.dumps(capture), encoding="utf-8")
+    monkeypatch.setattr(pm, "compile_dump_module", lambda *a, **k: (tmp_path / "dump.cmxs", ""))
+    monkeypatch.setattr(pm, "macro_aliases", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pm,
+        "framac_parse",
+        lambda *a, **k: {"status": "parse_failed", "error": "src/a.c:1: syntax error", "seconds": 0.1},
+    )
+    monkeypatch.setattr(
+        pm,
+        "gcc_callgraph",
+        lambda *a, **k: {"status": "ok", "errors": [], "functions": {}, "edges": [], "indirect": []},
+    )
+    model, rc = pm.build_model(cap, tmp_path / "out.json", broker=False)
+    assert rc == pm.NO_UNIT_PARSED_RC == 4
+    assert model["status"] == "no_unit_parsed" and "liba.a" in model["error"]
+    assert model["units"]["liba.a"]["parse"] == {
+        "status": "gcc_fallback",
+        "job": model["units"]["liba.a"]["parse"]["job"],
+        "seconds": 0.1,
+        "error": "src/a.c:1: syntax error",
+    }
+    assert not pm.validate_model(model)
+
+
+@pytest.mark.unit
 def test_parse_class_and_container_class():
     assert resources.CLASSES["parse"].runs_target_code is False
     assert resources.CLASSES["parse"].max_cpus == 1

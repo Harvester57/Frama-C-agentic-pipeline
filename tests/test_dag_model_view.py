@@ -82,21 +82,32 @@ def _model(fallback: bool = False) -> dict:
         "include/h.h#hdead": _fn("include/h.h", "hdead", 2, static=True, inline=True, header=True),
     }
     if fallback:
-        fns["src/b.c#helper"]["source"] = "gcc-callgraph-info"
-        fns["src/b.c#api_other"]["source"] = "gcc-callgraph-info"
+        # src/b.c is its own unit, libb, which Frama-C cannot parse.
+        for fid in ("src/b.c#helper", "src/b.c#api_other"):
+            fns[fid].update(source="gcc-callgraph-info", units=["libb"])
     edges = [
         {"caller": "src/a.c#api_run", "callee": "src/a.c#helper", "kind": "direct"},
         {"caller": "src/a.c#api_run", "callee": "src/a.c#cb", "kind": "indirect"},
         {"caller": "src/a.c#api_run", "callee": "include/h.h#hin", "kind": "direct"},
         {"caller": "src/b.c#api_other", "callee": "src/b.c#helper", "kind": "direct"},
     ]
-    parse = {"status": "gcc_fallback", "error": "b.c:1: syntax error"} if fallback else {"status": "ok"}
+    units = {"lib": {"kind": "library", "test": False, "files": ["src/a.c", "src/b.c"], "parse": {"status": "ok"}}}
+    if fallback:
+        units = {
+            "lib": {"kind": "library", "test": False, "files": ["src/a.c"], "parse": {"status": "ok"}},
+            "libb": {
+                "kind": "library",
+                "test": False,
+                "files": ["src/b.c"],
+                "parse": {"status": "gcc_fallback", "error": "b.c:1: syntax error"},
+            },
+        }
     return {
         "status": "ok",
         "generated_at": "2026-11-08T00:00:00Z",
         "functions": fns,
         "edges": edges,
-        "units": {"lib": {"kind": "library", "test": False, "files": ["src/a.c", "src/b.c"], "parse": parse}},
+        "units": units,
         "macro_aliases": {
             "run_api": {"function": "api_run", "ids": ["src/a.c#api_run"], "via": "define", "defined_in": "x.h"}
         },
@@ -159,10 +170,28 @@ def test_modules_are_held_and_recounted(target: Path) -> None:
 
 def test_fallback_units_are_flagged(target: Path) -> None:
     dag = _dag(target, _model(fallback=True))
-    assert dag["model"]["gcc_fallback_units"] == ["lib"]
+    assert dag["model"]["gcc_fallback_units"] == ["libb"]
     assert dag["functions"]["api_other"]["callgraph_source"] == "gcc_callgraph"
     assert dag["functions"]["api_other"]["callgraph_fallback"] == "b.c:1: syntax error"
+    assert "b.c:1: syntax error" in dag["functions"]["api_other"]["eva_wp_blocked"]
+    assert "eva_wp_blocked" not in dag["functions"]["api_run"]
     assert any("GCC" in w for w in dag["warnings"])
+
+
+def test_fallback_link_units_are_fuzzed_with_sanitizers_and_blocked_for_eva_and_wp(target: Path) -> None:
+    """The plan's decision for a unit Frama-C cannot parse (defect 6)."""
+    dag = bcd.build_dag(target, _model(fallback=True))
+    assert dag["module_kind"] == "link_unit"
+    libb = dag["modules"]["libb"]
+    assert libb["callgraph_fallback"] == "b.c:1: syntax error"
+    assert libb["run_eva"] is False and libb["run_wp_full"] is False and libb["fuzz_engine"] == "sanitizers"
+    assert dag["modules"]["lib"]["run_eva"] is True and "fuzz_engine" not in dag["modules"]["lib"]
+    # The harnesses of its path module run under the same flags.
+    assert dag["unit_of_lexer_module"]["b"] == "libb"
+    assert dag["lexer_modules"]["b"]["run_eva"] is False and dag["lexer_modules"]["b"]["fuzz_engine"] == "sanitizers"
+    assert all("eva_wp_blocked" in dag["functions"][k] for k in libb["functions"])
+    assert not any("eva_wp_blocked" in dag["functions"][k] for k in dag["modules"]["lib"]["functions"])
+    assert any("libb" in w and "sanitizers" in w for w in dag["warnings"])
 
 
 BLOCKERS_C = """\
@@ -253,9 +282,13 @@ def test_seed_uses_the_model_view(target: Path, tmp_path: Path, monkeypatch: pyt
     assert out["deferred_unreached_header_units"] == 1
     assert ("src/a.c", "helper") in fns and ("src/b.c", "helper") in fns
     assert by_fn[("src/a.c", "api_run", "rte")]["callgraph_source"] == "frama_c"
+    assert by_fn[("src/a.c", "api_run", "rte")]["status"] == "planned"
     other = by_fn[("src/b.c", "api_other", "rte")]
     assert other["callgraph_source"] == "gcc_callgraph"
     assert other["bookkeeping"]["callgraph_fallback"] == "b.c:1: syntax error"
+    # Eva and WP cannot run on a unit Frama-C cannot parse: its units wait, with the reason (defect 6).
+    assert other["status"] == "deferred" and other["unresolved"][0].startswith(f"{ledger.CALLGRAPH_FALLBACK}: ")
+    assert out["deferred_callgraph_fallback_units"] == 2
 
 
 def test_harness_reach_follows_keys_and_aliases(target: Path) -> None:

@@ -124,10 +124,10 @@ The result is `workspace/reports/phase0_model.json`, validated against `schemas/
 
 Read `units.<name>.parse.status`:
 - `ok`: Frama-C parsed the unit.
-- `gcc_fallback`: Frama-C could not parse the unit. Its functions and edges come from GCC's `-fcallgraph-info`, without loops, complexity or signatures, and `parse.error` holds Frama-C's first error. The ledger flags its units (`bookkeeping.callgraph_fallback`). Fuzzing still works on it; Eva and WP will fail on it the same way. Report every fallback unit to the user with that error.
+- `gcc_fallback`: Frama-C could not parse the unit. Its functions and edges come from GCC's `-fcallgraph-info`, without loops, complexity or signatures, and `parse.error` holds Frama-C's first error. Its harnesses are fuzzed with the sanitizers (E-ACSL needs the Frama-C parse), and Eva and WP are blocked on it: the ledger seeds its units `deferred` with a `callgraph_fallback:` reason (Step 2, Step 5). Report every fallback unit to the user with that error.
 - `skipped_test` (a test unit) and `no_sources` (no compiled source of its own).
 
-If no unit parses with Frama-C, stop Phase 0 and report it to the user. A non-zero exit means the capture is missing, the scratch volume is not mounted, or the dump module did not compile (`kernel_ast.py`): fix that before going on. Step 2 needs a model whose `status` is `ok`.
+If no unit parses with Frama-C, the model's `status` is `no_unit_parsed` and the command exits 4: stop Phase 0 and report each unit's `parse.error` to the user. Exit 1 means the capture is missing, the scratch volume is not mounted, or the dump module did not compile (`kernel_ast.py`): fix that before going on. Step 2 needs a model whose `status` is `ok`.
 
 ### Step 1d — Trust Boundary
 
@@ -204,7 +204,7 @@ python3 /opt/framac-pipeline/scripts/build_callgraph_dag.py --target workspace/w
 It reads `workspace/reports/phase0_model.json` from Step 1c (`--model PATH` to point elsewhere). Its functions and call edges are the model's:
 - One record per function a non-test link unit compiles, under its real name, keyed by plain name or `file#name` when the name collides. Files the build does not compile (alternative backends, templates, tests, examples) are not in the DAG.
 - `internal_callees` holds Frama-C's direct and indirect edges (type-matched function pointers, thread starts, callbacks), and `indirect_callees` holds the indirect ones alone. Waves, the WP scheduler, the reach gate and the hypothesis audit use both.
-- Each function has a `callgraph_source`: `frama_c`, or `gcc_callgraph` for a unit on the GCC fallback. A fallback function also carries `callgraph_fallback` (Frama-C's first error), and its unit is listed in `model.gcc_fallback_units`.
+- Each function has a `callgraph_source`: `frama_c`, or `gcc_callgraph` for a unit on the GCC fallback. A fallback function also carries `callgraph_fallback` (Frama-C's first error), and its unit is listed in `model.gcc_fallback_units`. The fallback unit's record, and those of its path modules and clusters, get `run_eva` and `run_wp_full` false and `fuzz_engine: sanitizers`, and the functions it holds get `eva_wp_blocked` (the reason). A `params set --fuzz-engine` still wins over the DAG's engine.
 - Header functions are marked `header`. Only those an entry point of the build reaches (`reached`) get active ledger units; the others are seeded `deferred` (`header_unreached`).
 - `macro_aliases` maps each alias the build defines to the functions it names. The harness generator and the reach gate resolve calls through it.
 
@@ -358,11 +358,11 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check
 ```
 
 `ledger.py seed` creates one unit per function × obligation class, keyed by link unit:
-- each unit takes its function's `callgraph_source`; units on the GCC fallback carry `bookkeeping.callgraph_fallback`;
+- each unit takes its function's `callgraph_source`; units on the GCC fallback carry `bookkeeping.callgraph_fallback`, and those of a function whose link unit is on the fallback (`eva_wp_blocked`) are seeded `deferred` with a `callgraph_fallback:` reason, since Eva and WP cannot run on them; the report lists them under "Units not worked in this run";
 - functions found only in test units get no unit;
 - unreached header functions are seeded `deferred` (`header_unreached`);
 - concurrent units carry `bookkeeping.concurrent`;
-- the security properties of Step 3 add their classes per instance (`--security-props`, default `workspace/reports/security_props.json` when it exists).
+- the security properties of Step 3 add their classes per instance (`--security-props`, default `workspace/reports/security_props.json` when it exists). The Makefile's `seed` target runs `security-props` first, so the file is current.
 
 `pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`), one record per harness module. Check its JSON for modules excluded with a reason before moving on. Under `quick`, Tier 3 modules are excluded with a reason.
 

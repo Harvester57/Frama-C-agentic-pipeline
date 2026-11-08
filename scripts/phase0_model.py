@@ -56,7 +56,9 @@ Functions are identified as `file#name` (paths relative to the target root): sam
 apart, and a function defined in a project header (static inline) belongs to every unit compiling it.
 Every function, edge and alias carries its source. The output is workspace/reports/phase0_model.json
 (schemas/phase0_model.schema.json). A failure is a status in the model, never a crash: the command exits
-0 when the model was written, 1 when no model could be built (missing capture, dump module error).
+0 when the model was written, 1 when no model could be built (missing capture, dump module error), and
+4 when Frama-C parsed none of the units (status `no_unit_parsed`: the model is written for its errors,
+and Phase 0 stops there).
 
 `selftest` compiles the dump module and checks it on a two-file program (a static collision, a
 callback, an indirect call); the image build runs it, so a kernel upgrade that breaks the dump fails
@@ -98,6 +100,8 @@ LOG_DIR = "workspace/reports/phase0_model"
 MACHDEP = "gcc_x86_64"
 GCC_TIMEOUT_S = 300
 ERROR_CHARS = 400
+# Exit code when Frama-C parsed no unit (build_capture.py uses 3 for needs_build_recipe).
+NO_UNIT_PARSED_RC = 4
 THREAD_SPAWNERS = {"pthread_create": 2, "thrd_create": 1}
 SOURCE_FRAMAC = "frama-c-kernel"
 SOURCE_GCC = "gcc-callgraph-info"
@@ -885,8 +889,20 @@ def build_model(
         f["external_calls"] = sorted(builder.external_calls.get(fid, ()))
         f["units"] = sorted(f["units"])
         f["kernel_names"] = dict(sorted(f["kernel_names"].items()))
+    # Phase 0 stops when Frama-C parses no unit: every later phase but fuzzing needs its AST. The
+    # model is still written whole, so the fallback errors can be shown to the user.
+    parsed = [n for n, u in units_out.items() if u["parse"]["status"] == "ok"]
+    rc, status = 0, "ok"
+    if not parsed:
+        rc, status = NO_UNIT_PARSED_RC, "no_unit_parsed"
+        failed = sorted(n for n, u in units_out.items() if u["parse"]["status"] == "gcc_fallback")
+        model["error"] = (
+            f"Frama-C parsed none of the units ({', '.join(failed)}): see each unit's parse.error"
+            if failed
+            else "the capture has no non-test unit with sources to parse"
+        )
     model.update(
-        status="ok",
+        status=status,
         units=units_out,
         functions=dict(sorted(builder.functions.items())),
         edges=[
@@ -906,7 +922,7 @@ def build_model(
         parse_jobs=parse_jobs,
         seconds=round(time.monotonic() - t0, 2),
     )
-    return model, 0
+    return model, rc
 
 
 def annotate_trust(model: dict, threat_model: Path | None = None) -> None:

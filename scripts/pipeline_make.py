@@ -711,6 +711,14 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     except ValueError:
         dag_flags = []
 
+    params = effective_params(plan.params_doc, name, plan.profile)
+    dag_engine = dag_mod.get("fuzz_engine")
+    if dag_engine and "fuzz_engine" not in (plan.params_doc.get("modules", {}).get(name) or {}):
+        # A unit on the GCC fallback: E-ACSL needs the Frama-C parse, so the DAG asks for the
+        # sanitizers, unless a recorded param says otherwise.
+        if _param_problem("fuzz_engine", dag_engine) is None:
+            params["fuzz_engine"] = dag_engine
+
     mod = ModulePlan(
         name=name,
         tier=str(dag_mod.get("tier") or "unclassified"),
@@ -722,7 +730,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         base_cppflags=base,
         cppflags=with_acsl(base, plan.acsl_dir),
         ldflags=ldflags,
-        params=effective_params(plan.params_doc, name, plan.profile),
+        params=params,
         # Discovered by build_callgraph_dag.py but not in the sidecar: what to pass to
         # generate_harness.py --cppflags if the module does not build.
         dag_cppflags_missing=[t for t in dag_flags if t not in _joined_forms(base)],
@@ -965,7 +973,12 @@ def _harness_record(mm: ModuleMap, name: str, dag_modules: dict[str, dict]) -> d
         return dag_modules[name]
     lexer = mm.lexer_modules.get(name)
     base = lexer if isinstance(lexer, dict) else dag_modules[unit]
-    return {**base, "tier": mm.tier_of(name) or base.get("tier"), **mm.run_flags(name)}
+    rec = {**base, "tier": mm.tier_of(name) or base.get("tier"), **mm.run_flags(name)}
+    fallback = (dag_modules.get(unit) or {}).get("callgraph_fallback")
+    if fallback:
+        # The unit is on the GCC fallback (build_callgraph_dag.block_fallback_units): so is the harness.
+        rec.update(run_eva=False, run_wp_full=False, fuzz_engine="sanitizers", callgraph_fallback=fallback)
+    return rec
 
 
 def module_build_spec(module: str, run_dir: Path | str = ".") -> dict:
@@ -1240,7 +1253,16 @@ def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
         "defaults": default_params(plan.profile),
         "modules": {
             name: {
-                "effective": effective_params(plan.params_doc, name, plan.profile),
+                # A runnable module's fuzz engine is its plan's (the DAG asks for the sanitizers on a
+                # unit on the GCC fallback).
+                "effective": {
+                    **effective_params(plan.params_doc, name, plan.profile),
+                    **(
+                        {"fuzz_engine": plan.modules[name].params["fuzz_engine"]}
+                        if name in plan.modules and "fuzz_engine" in plan.modules[name].params
+                        else {}
+                    ),
+                },
                 "overrides": plan.params_doc["modules"].get(name, {}),
                 "runnable": name in plan.modules,
                 "in_dag": name in plan.dag_modules or name in plan.records,

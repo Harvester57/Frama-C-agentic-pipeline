@@ -1566,6 +1566,28 @@ def test_link_unit_params_are_per_harness_module(tmp_path):
     assert any("params.json tunes 'libkv_a', a link unit" in w for w in pm.build_plan(run).warnings)
 
 
+def test_a_fallback_unit_fuzzes_with_sanitizers_and_runs_no_eva(tmp_path):
+    """A unit Frama-C cannot parse (defect 6): its harnesses fuzz with the sanitizers, no Eva."""
+    import build_callgraph_dag as bcd
+
+    run = _unit_run(tmp_path, params={"version": 1, "modules": {"extra": {"fuzz_engine": "eacsl"}}})
+    dag = json.loads((run / pm.DAG_JSON).read_text(encoding="utf-8"))
+    dag["modules"]["libkv_a"]["callgraph_fallback"] = "src/decode.c:3: syntax error"
+    write_json(run / pm.DAG_JSON, bcd.block_fallback_units(dag))
+    plan = pm.build_plan(run, templates_dir=ACSL)
+
+    dec, extra = plan.modules["decode"], plan.modules["extra"]
+    assert (dec.fuzz, dec.eva, dec.params["fuzz_engine"]) == (True, False, "sanitizers")
+    # encode was Eva-only: nothing is left to run for it.
+    assert "neither fuzzing nor Eva" in plan.excluded["encode"]
+    # A recorded param still wins over the DAG's choice.
+    assert (extra.eva, extra.params["fuzz_engine"]) == (False, "eacsl")
+    assert plan.eva_modules == [] and plan.fuzz_modules == ["decode", "extra"]
+    # No Eva report is expected from the blocked unit's harnesses.
+    assert not {"decode", "encode", "extra"} & set(plan.expected("eva"))
+    assert pm.params_show(run)["modules"]["decode"]["effective"]["fuzz_engine"] == "sanitizers"
+
+
 def test_union_flags_keeps_value_flags_whole_and_one_main_rename():
     assert pm.union_flags(
         [
