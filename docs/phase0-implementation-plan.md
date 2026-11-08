@@ -372,7 +372,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I3b | L | done |
 | I4 | S | done (Alias measured, not adopted: off by default) |
 | I5a | M | done |
-| I5b | L | not started |
+| I5b | L | done |
 | I6 | L | not started |
 | I7 | M | not started |
 | I8 | M | not started |
@@ -492,6 +492,59 @@ I0 ─┬─▶ I1 ────────────────────�
 - **Run conditions:** another benchmark ran on the machine at the same time. The target measurements therefore ran without the host broker (`-NoBroker`).
   - **CryptoLib without the broker:** its capture stalled. Its parallel CMake build under `bear` sat idle until the capture's 1800 s timeout, which ends as `needs_build_recipe` with no serial retry. It was measured again with the broker, and the capture succeeded. CryptoLib has 262 sites, all without an Alias target, so its 142 edges stay 142.
   - **Left for another step:** the stalled parallel build under `bear`, and the missing serial retry after a time-out, belong to I2's capture.
+
+### I5b (2026-11-08)
+
+- **DAG modules are link units** (`build_callgraph_dag.unit_view`, `module_kind: "link_unit"`):
+  - **Which units:** one module per non-test library or executable, named after its artifact (`lib/libkv.a` → `libkv_a`), libraries first. A source file belongs to the first unit that compiles it; a header function belongs to the first unit it is compiled into.
+  - **What a unit module carries:**
+    - its own files, plus the files of the project libraries it links (`required_sources`);
+    - its API (`candidate_entry_points`: exported functions, `main`, and an executable's embedded API);
+    - `concurrent`.
+  - **Flags** (`unit_cppflags`): the build's own flags as single tokens, relative to the run directory like the lexer's. Force includes are kept apart in `force_includes`. The lexer's include directories are added, but not its Makefile `-D` flags, which can contradict the build.
+  - **Tiers don't change until I8:** each function keeps its lexer module's `tier`, and a unit takes the most demanding one. The lexer modules stay under `lexer_modules`, and `unit_of_lexer_module` maps each to its unit.
+- **Harness sub-modules** (`scripts/module_map.py`):
+  - **Naming:** a harness module keeps its name and is either a unit itself or a sub-module of one. The sidecar's `unit` records which, and `generate_harness.py` infers it or takes `--unit`.
+  - **Scope:** a sub-module answers for its lexer module's functions, else its `scope_files`, else its sources.
+  - **Run settings:** a sub-module keeps its lexer module's tier and run flags.
+  - **Every comparison goes through `ModuleMap.unit_of`:**
+    - **Make plan** (`pipeline_make`): one record per harness module. A unit whose only harnesses are sub-modules gets no unit-named targets. WP flags for a unit are the union of its sub-modules' flags.
+    - **Reach gate:** a sub-module is checked against the unit's entry points in its scope. Entry points in no harness's scope are reported as the unit's gaps.
+    - **Eva and fuzz ingest:**
+      - verdicts are kept per harness module;
+      - "no property", error and clean-campaign evidence is recorded only within a sub-module's scope;
+      - candidates name the report's harness module.
+    - **WP scheduler and overlay:** they use merged sidecars and repair through a harness module. The trust-boundary check reads every sub-module sidecar.
+    - **Replay of a unit candidate:** it goes through `harness_module_for`.
+- **Concurrency:** a unit with `concurrent` gets `bookkeeping.concurrent`, and the report says its Eva and WP results assume sequential execution.
+- **Benchmark:**
+  - `migrate-units` records each harness module's unit in the manifest (all 25 modules mapped). Phase 0 stops on a mismatch, and `--unit` is passed to the harness generator.
+  - `modules_without_harness` counts a unit as harnessed through its sub-modules.
+  - **The seeded set is a benchmark set:** `benchmark.py seeded`, in `scripts/benchmark_seeded.py`, runs the pipeline's own Phase 0 with the PoC's mechanical dispatch-harness policy, then build, fuzz, Eva, ingest and scoring.
+- **Fixes the benchmark runs exposed** (each one a way the build's unit flags, newly fed into harnesses, broke something):
+  - **s04 (the force include):** the build's `-include config.h` never reached the harness, and the bug went unfound. Unit flags are now relative to the run directory, and the harness generator applies `force_includes`.
+  - **CryptoLib:** `-DMC_LOG_PATH="log.txt"` reached the compiler unquoted, because later stages split and re-join flag strings. Quoted `-D` values and the build's `-std=` (semver's `-std=c89` rejects the C99 harness) are no longer merged from the DAG. The harness spec states such flags itself.
+  - **x509-parser sources:** a callee pulled in its whole unit's sources, including `x509-parser.c`, whose Frama-C-only `main` includes `__fc_builtin.h`. Callees bring their lexer module's closure again.
+  - **The `-Dmain` rename** is now a valid identifier for module names with `-`. With it, x509-parser's `x509-parser` module completes Eva for the first time since I0.
+- **The lexer's Makefile macros, pinned:** dropping them changed what three harnesses analyse. jsmn's `JSMN_STRICT`/`JSMN_PARENT_LINKS`, qlz's streaming configuration and semver's `DEBUG=1` come from Makefile targets the library build doesn't use. The three specs now state them, so the benchmark stays like for like with I5a.
+  - **Open problem:** a file compiled by several units with different flags (qlz's four executables) is analysed in one configuration only, the first unit's. Covering each configuration is left to I8's unit split or a later step.
+- **Tests:**
+  - `tests/test_unit_view.py`: the view, flags, force includes, sources, ModuleMap and `infer_unit`;
+  - `tests/test_link_unit_ingest.py`: 16 cases;
+  - sub-module plan, reach and replay cases in `test_pipeline_make.py`, `test_harness_reach.py` and `test_phase0_gates.py`;
+  - `tests/test_benchmark_seeded.py`;
+  - migration and harness counting in `test_benchmark.py`.
+- **Acceptance** (baseline `benchmark/baselines/phase0-i5b.json`: runs `i5b3-*`, plus `i5b4-*` for jsmn, qlz and semver with the pinned macros):
+  - **Recall:** 7/7 retained.
+  - **Seeded set:** 7/7 bugs found, 0/4 decoys fired (`seeded-20261108T033946Z`).
+  - **Every sub-module report credits its unit:** on qcbor-dev all 8 reports credit `libqcbor_a`. 0 functions without a unit and 0 covered units with an Unknown on every target.
+  - **Against `phase0-i5a`:**
+    - x509-parser goes from partial to ok;
+    - x509-parser's `x509-parser` module completes Eva, which adds 2 functions with an Unknown (`parse_x509_cert_relaxed`, `parse_x509_crl_relaxed`);
+    - 0 regressions; every other Eva, unit and candidate count is unchanged;
+    - warnings say only that the harness specs changed, through the `unit` field and the pinned macros.
+  - **Wall times:** about 1.5 to 2 times longer in these runs. Other steps' agents ran Docker builds at the same time, and CPU times are comparable.
+- **Run history:** round 1 found the quoting, `-std`, source and force-include problems, and round 2 confirmed the fixes except CryptoLib's quoting downstream. Round 3 is the first clean run.
 
 ### I5a (2026-11-08)
 

@@ -49,7 +49,8 @@
      },
      "params": {
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libminmea_a"
     }
    ]
   },
@@ -100,7 +101,8 @@
      },
      "params": {
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "ieee754",
@@ -119,7 +121,8 @@
       "include_source": true,
       "eva_expr": "{ uint16_t h; uint32_t u; double d; Frama_C_make_unknown((char *)&h, sizeof(h)); Frama_C_make_unknown((char *)&u, sizeof(u)); Frama_C_make_unknown((char *)&d, sizeof(d)); (void)IEEE754_HalfToDouble(h); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d); (void)IEEE754_SingleToHalf(u); }",
       "fuzz_expr": "{ uint16_t h = 0; uint32_t u = 0; double d = 0.0; if (fuzz_len >= 2) { memcpy(&h, fuzz_buf, 2); } (void)IEEE754_HalfToDouble(h); if (fuzz_len >= 8) { memcpy(&d, fuzz_buf, 8); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d); } else if (fuzz_len == 4) { memcpy(&u, fuzz_buf, 4); (void)IEEE754_SingleToHalf(u); } }"
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "qcbor_main_decode",
@@ -145,7 +148,8 @@
      "params": {
       "eva_recursion_fallback": true,
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "qcbor_main_encode",
@@ -168,7 +172,8 @@
      },
      "params": {
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "qcbor_number_decode",
@@ -194,7 +199,8 @@
      "params": {
       "eva_recursion_fallback": true,
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "qcbor_number_encode",
@@ -217,7 +223,8 @@
      },
      "params": {
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "qcbor_spiffy_decode",
@@ -246,7 +253,8 @@
      "params": {
       "eva_recursion_fallback": true,
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     },
     {
      "name": "qcbor_tag_decode",
@@ -271,7 +279,8 @@
      "params": {
       "eva_recursion_fallback": true,
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libqcbor_a"
     }
    ]
   },
@@ -323,7 +332,8 @@
       "include_source": true,
       "eva_expr": "{ uint16_t h; float f; double d; int b; Frama_C_make_unknown((char *)&h, sizeof(h)); Frama_C_make_unknown((char *)&f, sizeof(f)); Frama_C_make_unknown((char *)&d, sizeof(d)); Frama_C_make_unknown((char *)&b, sizeof(b)); (void)IEEE754_HalfToDouble(h); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d, b); (void)IEEE754_SingleToHalf(f); }",
       "fuzz_expr": "{ uint16_t h = 0; float f = 0.0f; double d = 0.0; int b = 0; if (fuzz_len >= 2) { memcpy(&h, fuzz_buf, 2); } if (fuzz_len >= 4) { memcpy(&f, fuzz_buf, 4); } if (fuzz_len >= 8) { memcpy(&d, fuzz_buf, 8); } if (fuzz_len >= 1) { b = (int)(fuzz_buf[0] & 1u); } (void)IEEE754_HalfToDouble(h); (void)IEEE754_DoubleToSingle(d); (void)IEEE754_DoubleToSmaller(d, b); (void)IEEE754_SingleToHalf(f); }"
-     }
+     },
+     "unit": "libqcbor_a"
     }
    ]
   },
@@ -408,7 +418,8 @@
      },
      "params": {
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libcryptolib_so"
     },
     {
      "name": "crypto",
@@ -450,7 +461,8 @@
        "libgcrypt backend: interface vtable initialization"
       ],
       "call_expr": "CryptographyInterface iface = get_cryptography_interface_libgcrypt(); (void)iface->cryptography_init();"
-     }
+     },
+     "unit": "libcryptolib_so"
     },
     {
      "name": "key",
@@ -472,7 +484,8 @@
        "Internal key backend: key_init through the KeyInterface vtable"
       ],
       "call_expr": "KeyInterface iface = get_key_interface_internal(); (void)iface->key_init();"
-     }
+     },
+     "unit": "libcryptolib_so"
     },
     {
      "name": "mc",
@@ -494,7 +507,8 @@
        "Internal MC backend: mc_log through the McInterface vtable"
       ],
       "call_expr": "McInterface iface = get_mc_interface_internal(); iface->mc_log((int32_t)fuzz_len);"
-     }
+     },
+     "unit": "libcryptolib_so"
     },
     {
      "name": "sa",
@@ -542,7 +556,8 @@
      "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "params": {
       "fuzz_rte_initialized": false
-     }
+     },
+     "unit": "libcryptolib_so"
     }
    ]
   },
@@ -598,7 +613,8 @@
      "params": {
       "eva_slevel": 1,
       "fuzz_engine": "sanitizers"
-     }
+     },
+     "unit": "x509_parser_a"
     },
     {
      "name": "x509-cert-parser",
@@ -621,7 +637,8 @@
      "params": {
       "eva_slevel": 1,
       "fuzz_engine": "sanitizers"
-     }
+     },
+     "unit": "x509_parser_a"
     },
     {
      "name": "x509-crl-parser",
@@ -644,7 +661,8 @@
      "params": {
       "eva_slevel": 1,
       "fuzz_engine": "sanitizers"
-     }
+     },
+     "unit": "x509_parser_a"
     },
     {
      "name": "x509-utils",
@@ -663,7 +681,8 @@
      },
      "params": {
       "eva_slevel": 1
-     }
+     },
+     "unit": "x509_parser_a"
     },
     {
      "name": "x509-common",
@@ -688,7 +707,8 @@
      "params": {
       "eva_slevel": 1,
       "fuzz_engine": "sanitizers"
-     }
+     },
+     "unit": "x509_parser_a"
     }
    ],
    "assets": [
@@ -729,11 +749,12 @@
       "entry_fn": "jsmn_parse",
       "entry_style": "custom",
       "max_input_size": 16,
-      "cppflags": "-Iworkspace/work",
+      "cppflags": "-Iworkspace/work -DJSMN_STRICT=1 -DJSMN_PARENT_LINKS=1",
       "ldflags": "",
       "reachability": "untrusted_surface",
       "call_expr": "{ jsmn_parser parser; jsmntok_t tokens[4]; jsmn_init(&parser); (void)jsmn_parse(&parser, (const char *)fuzz_buf, fuzz_len, tokens, 4); }"
-     }
+     },
+     "unit": "libjsmn_a"
     }
    ]
   },
@@ -769,12 +790,13 @@
       "entry_fn": "semver_parse",
       "entry_style": "custom",
       "max_input_size": 64,
-      "cppflags": "-Iworkspace/work",
+      "cppflags": "-Iworkspace/work -DDEBUG=1",
       "ldflags": "",
       "reachability": "untrusted_surface",
       "null_terminate": true,
       "call_expr": "{ const char *s = (const char *)fuzz_buf; semver_t a; memset(&a, 0, sizeof(a)); (void)semver_is_valid(s); if (semver_parse(s, &a) == 0) { semver_free(&a); } }"
-     }
+     },
+     "unit": "libsemver_a"
     }
    ]
   },
@@ -813,7 +835,8 @@
       "reachability": "untrusted_surface",
       "null_terminate": true,
       "call_expr": "{ if (fuzz_len > 0) { (void)stem((char *)fuzz_buf, 0, (int)fuzz_len - 1); } }"
-     }
+     },
+     "unit": "libstmr_a"
     }
    ]
   },
@@ -851,11 +874,12 @@
       "entry_fn": "qlz_compress",
       "entry_style": "custom",
       "max_input_size": 32,
-      "cppflags": "-Iworkspace/work",
+      "cppflags": "-Iworkspace/work -DQLZ_COMPRESSION_LEVEL=3 -DQLZ_STREAMING_BUFFER=10000",
       "ldflags": "",
       "reachability": "untrusted_surface",
       "call_expr": "{ static qlz_state_compress state; static char destination[32 + 400]; memset(&state, 0, sizeof(state)); (void)qlz_compress(fuzz_buf, destination, fuzz_len, &state); }"
-     }
+     },
+     "unit": "qlz_compress"
     }
    ]
   },
@@ -895,7 +919,8 @@
       "ldflags": "",
       "reachability": "untrusted_surface",
       "call_expr": "{ unsigned char digest[64]; (void)crypto_hash(digest, fuzz_buf, fuzz_len); }"
-     }
+     },
+     "unit": "main"
     }
    ]
   }
