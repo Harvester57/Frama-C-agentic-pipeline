@@ -5,11 +5,13 @@ description: >-
   hunting per module slice by generating RTE assertions (-rte -rte-initialized),
   compiling them with E-ACSL into runtime shadow-memory and arithmetic checks,
   and fuzzing the resulting binary with Clang LibFuzzer inside the hardened
-  framac-pipeline container under sandbox_exec.py (rlimits, env allowlist,
-  timeout). Catches intra-struct sub-object overflows, use-after-free,
-  uninitialized reads, signed overflows, and Layer 4-6 ACSL security contract
-  violations. Crashes become fingerprinted candidates, not
-  findings, until independently verified.
+  analysis container under sandbox_exec.py (rlimits, env allowlist,
+  timeout), starting from seeds recorded from the target's own tests. Catches
+  intra-struct sub-object overflows, use-after-free, uninitialized reads,
+  signed overflows, and ACSL contract violations. Measures per-function
+  coverage and reopens the reach gate for API entry points no input executed.
+  Crashes become fingerprinted candidates, not findings, until independently
+  verified.
 argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--time <seconds> (params set --fuzz-max-time)] [--dict <file> (params set --fuzz-dict)]"
 ---
 
@@ -29,7 +31,9 @@ Dynamic bug-hunting stage that pairs **Frama-C RTE + E-ACSL** with **Clang LibFu
 
 Read `workspace/reports/callgraph_dag.json` and `workspace/harnesses/`. If Phase 0 has not been run yet, execute `/framac-slice <target-dir>` first.
 
-Select all modules with `run_eacsl_fuzz: true` (or the specific `--module <name>` passed by the user).
+Campaigns run per **harness module**: a link unit, or a sub-module of one (`unit` in `harness_<mod>.json`). Each one's reports, corpus and crashes stay under its own name and credit its unit's functions. Select all harness modules whose tier has `run_eacsl_fuzz: true` (or the specific `--module <name>` passed by the user). `pipeline_make.py gen` lists them; under `quick`, Tier 3 modules are excluded with a reason.
+
+Everything below runs in the analysis image (the wrapper's default). The target's headers and libraries come from the run's snapshot (`workspace/snapshot/`, written by the build capture): builds add `-idirafter` for its headers and link its libraries with an RPATH, so fuzz, replay and coverage binaries run without the target's packages and without `LD_LIBRARY_PATH`. Never pass `-TargetPackages` here.
 
 ---
 
@@ -71,7 +75,15 @@ Campaigns need no judgment, so they run from the generated Makefile, not from on
 
 Each campaign writes only its own module's corpus, crash directory, and report (`workspace/reports/fuzz/<mod>.json`). The fuzz budget is CPU-seconds per harness case from the profile (quick 60, standard 120, deep 900): a dispatch harness with N cases gets N shares, any other harness one. The campaigns of one link unit together get at most 480 / 1200 / 7200 CPU-seconds (quick / standard / deep); above that each is scaled down in proportion, never below 30. `gen` records `fuzz_cases` and `fuzz_budget_source` (`cases`, `unit_cap`, or `params` when `params set --fuzz-budget` fixed it).
 
-**Seeds.** When the recipe has a test command, `seed_harvest.py record` (benchmark capture stage, build image, scratch volume) relinks each test executable with `-Wl,--wrap` recorders for the model's API functions, runs the test suite in the sandbox (no network, capped time) under `strace`, and keeps the arguments of each outermost API call (buffers with their length, strings, scalars, pointees, `{ptr, len}` struct members) in `workspace/seed_records/calls.jsonl`, plus up to 64 small data files the tests opened. Before each campaign, `seed_harvest.py write --module <mod>` turns them into `workspace/seeds/<mod>/seed-*` in the harness's own case format, read from `harness_<mod>.c`: the dispatch selector byte, the fixed-size slots in order, then the data (`workspace/reports/seeds/<mod>.json` says what each case got). The campaign and `coverage` read the seeds as a read-only extra corpus (`--extra-corpus`). A failing test suite still yields seeds and only adds a warning; no test command, or no recorded call, just means no seeds. Wall time = budget / workers, at least 30 s, so a larger node finishes sooner at equal or greater effort. `-rss_limit_mb` stays fixed at 2048 on every machine, so `oom_found` means the same thing everywhere.
+Wall time = budget / workers, at least 30 s, so a larger node finishes sooner at equal or greater effort. `-rss_limit_mb` stays fixed at 2048 on every machine, so `oom_found` means the same thing everywhere.
+
+**Seeds from the tests.** Phase 0 records the API calls the target's tests make (`/framac-slice` Step 1e: `seed_harvest.py record`, build image, scratch volume, only when the recipe has a test command):
+- each test executable is relinked with `-Wl,--wrap` recorders for the model's API functions and run in the sandbox (no network, capped time) under `strace`;
+- the arguments of each outermost API call (buffers with their length, strings, scalars, pointees, `{ptr, len}` struct members) go to `workspace/seed_records/calls.jsonl`, with up to 64 small data files the tests opened.
+
+Before each campaign, `seed_harvest.py write --module <mod>` turns them into `workspace/seeds/<mod>/seed-*` in the harness's own case format, read from `harness_<mod>.c`: the dispatch selector byte, the fixed-size slots in order, then the data. Data files become whole-input seeds for the cases that take the whole buffer. `workspace/reports/seeds/<mod>.json` says what each case got. The `seeds` Make target writes them for every module.
+
+The campaign and `coverage` read the seeds as a read-only extra corpus (`--extra-corpus`). No test command, a failing test suite, or no recorded call just means fewer or no seeds, never an error. Calls made through header `static inline` functions are not recorded, so their harness cases start from an empty corpus.
 
 A campaign keeps going after a crash, so one shallow bug does not hide the others in its module:
 - **Dispatch harnesses** run in rounds. Each case an input crashed (or timed out) in (the input's first byte modulo the case count) is skipped from the next round on. The skip uses a rebuild with `-DFRAMAC_FUZZ_SKIP_CASES=<bit mask>`, with the same engine. Rounds share the campaign's wall time and end when a round finds no new crashing case, every case is skipped, less than 30 s are left, or a rebuild fails. A skipped case is not fuzzed for the rest of the campaign, so a second bug in the same case can still be hidden; the report's `keep_going.rounds` lists what each round skipped and found.

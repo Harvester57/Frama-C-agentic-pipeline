@@ -9,8 +9,9 @@ description: >-
   Verification Gate, and Phase 3 (/framac-wp: isolated parallel ACSL synthesis
   for AoRTE + Layers 1-6, dispatched by a dependency-driven scheduler). Sizes
   every invocation from the measured machine, runs deterministic per-module
-  work through Make, and caches builds, Eva results and proofs. Runs every tool in the hardened
-  framac-pipeline container with the target mounted read-only and a run
+  work through Make, and caches builds, Eva results and proofs. Runs every tool in hardened
+  containers (the build image for the target's build and tests, the analysis
+  image for everything else) with the target mounted read-only and a run
   directory outside the target; classifies results into a validated coverage
   ledger and verdict records (confirmed / needs_validation / rejected); emits
   REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, and report.sarif.
@@ -31,7 +32,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 
 ## Core Principles
 
-1. **Hardened container only.** Every Frama-C, E-ACSL, Clang/LibFuzzer, and helper-script invocation runs through `wrappers/framac-docker.ps1` (Windows) or `wrappers/framac-docker.sh` (POSIX). The container has no network, keeps Docker's default seccomp and AppArmor profiles, the target is mounted read-only at `/target`, and the run directory is the working directory `/framac-run`. Target-controlled binaries additionally run through `scripts/sandbox_exec.py` (rlimits, env allowlist, timeout); outside the container (non-POSIX host) they do not run.
+1. **Hardened container only.** Every Frama-C, E-ACSL, Clang/LibFuzzer, and helper-script invocation runs through `wrappers/framac-docker.ps1` (Windows) or `wrappers/framac-docker.sh` (POSIX). The wrapper picks the image: the analysis image `framac-analysis:latest` by default, the build image (`-BuildImage`) for the target's build and tests, the CodeQL image (`-CodeQL`) only when the user enabled it. The monolithic `framac-pipeline:latest` image is slated for removal; do not select it. The container has no network, keeps Docker's default seccomp and AppArmor profiles, the target is mounted read-only at `/target`, and the run directory is the working directory `/framac-run`. Target-controlled binaries additionally run through `scripts/sandbox_exec.py` (rlimits, env allowlist, timeout); outside the container (non-POSIX host) they do not run.
 2. **Run directory outside the target.** Default `~/framac-pipeline/<repo>/run-<N>/` (`-NewRun`). A run directory inside the target is allowed only when explicitly requested and git-ignored.
 3. **The parent is the only writer of shared state**: `run-metadata.json`, `coverage-ledger.json`, `candidates.json`, `findings.json`, `workspace/work/`, `workspace/corpus/`, and `workspace/crashes/`. Subagents work in isolated scratch overlays (`agents/<agent-id>/scratch/`), write their final JSON result to `agents/<agent-id>/scratch/result.json` (which `wp_scheduler.py complete --agent-id <agent-id>` reads and validates against `schemas/agent-result.schema.json`), and return **one JSON object**. Discard malformed or prose-wrapped results; do not repair them.
 4. **Pure-ACSL & Function-Scope Isolation.** After stripping ACSL comments (`/*@ ... */`, `//@ ...`), `workspace/work/` must match `workspace/baseline/` token-for-token (`workspace_overlay.py check-acsl-only`). Prover patches are structurally spliced per function (`workspace_overlay.py merge-agent`) and re-verified by the parent before commit.
@@ -49,7 +50,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 - `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
 - `--scope <path>`: Restrict to repository-relative paths (repeatable). Everything else is seeded `out_of_scope`.
 - `--max-agents <N>`: Cap on concurrent LLM subagents: pass it as `wp_scheduler.py step --max-agents <N>`. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), capped at 16, or 32 on 32+ CPUs and 64 on 64+ CPUs; `FRAMAC_MAX_AGENTS` replaces that cap.
-- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget (quick 60, standard 120, deep 900) divided by the workers the machine allows.
+- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget per harness case (quick 60, standard 120, deep 900), capped per link unit (480 / 1200 / 7200), divided by the workers the machine allows.
 - `--run-dir <dir>`: Resume an existing run directory instead of creating a new one.
 
 ## Resources
@@ -96,7 +97,12 @@ Create the run directory once with `-NewRun` (the wrapper prints the path) and p
 ### Phase 0 — Slicing, DAG, ledger seeding (`/framac-slice`)
 
 Execute `skills/framac-slice/SKILL.md`:
-- It captures the target's own build from a recipe the user gave or confirmed (`build_capture.py`, in the build image). A target that does not build stops the run with `needs_build_recipe` until the user fixes the recipe.
+- It captures the target's own build from a recipe the user gave or confirmed (`build_capture.py`, in the build image), and exports a snapshot of the target's headers and libraries to `workspace/snapshot/`, so the analysis image needs no target packages. A target that does not build stops the run with `needs_build_recipe` until the user fixes the recipe. There is no inventory without a build.
+- It parses every link unit with Frama-C into `workspace/reports/phase0_model.json` (`phase0_model.py`): functions, direct and indirect edges, API entry points, and each function's trust. A unit Frama-C cannot parse gets the GCC call-graph fallback, which is flagged; report such units to the user.
+- When the recipe has a test command, it records the API calls the tests make (`seed_harvest.py record`, build image) as fuzzing seeds.
+- Trust comes from the build, the call graph and the structured threat model (`THREAT_MODEL.md`). A missing threat model is recorded as `no_threat_model`: tell the user. CodeQL is off unless the user declares the target open source.
+- The DAG's modules are the build's link units; harnesses may be sub-modules of a unit. Tiers come from trust; Tier 3 is deferred under `quick`.
+- It generates the MetAcsl security properties (Layers 3-6) from the threat model (`security_props.py`).
 - It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`).
 - It gates every harness on reachability (`harness_reach.py check`): each module's DAG entry points must be reached, or exempted with a recorded reason, before the ledger is seeded.
 - It requires every fuzzed module to build with E-ACSL (`pipeline_make.py build-check`), unless `--fuzz-engine sanitizers` was chosen for that module, so Phase 1 never falls back to ASan/UBSan silently.
@@ -117,7 +123,7 @@ These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/S
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (the deterministic Eva ladder, for modules that still have Unknowns; `skills/framac-eva/SKILL.md`, Step 2a). Skip it under `--profile quick`, which allows no extra Eva runs.
 
    Write the `build`, `ingest`, standalone `eva`, `eva-tune` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
-4. Measure what each corpus reached, for the report's coverage gaps: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage`.
+4. Measure what each corpus reached, for the report's coverage gaps, and reopen the reach gate for API entry points no input executed: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage reach-dynamic`. A module that fails the dynamic reach gate stops at its next `fuzz-`/`eva-` target: repair its harness or exempt the entry point (`skills/framac-fuzz/SKILL.md`, Step 3), then re-run the module.
 5. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue`
