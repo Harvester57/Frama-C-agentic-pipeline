@@ -56,7 +56,7 @@ python3 /opt/framac-pipeline/scripts/run_eva_slice.py --module <mod> --sources <
 `run eva-tune` searches for a better configuration of each module. It is deterministic and cached: do not try options by hand first.
 
 1. It runs the module's own settings as the **base run**. A module with no Unknown left stops there.
-2. Otherwise it runs a fixed **ladder** of configurations, side by side, each changing one concern: `slevel`, `unroll`, `history`, `values`, `relational`, `returns`, plus the all-round `precision`. They are not nested, because no knob helps every program.
+2. Otherwise it runs a fixed **ladder** of configurations, side by side, each changing one concern: `slevel`, `unroll`, `history`, `values`, `relational`, `returns`, the all-round `precision`, and `perfn` (a per-function `slevel` for the functions with the most Unknowns left by the base run). They are not nested, because no knob helps every program.
 3. A **guard** rejects any run that did not complete, turned any obligation Dead, gave one an inconsistent status, reached fewer functions, lost the entry function, made a function non-terminating, degenerated, or analysed different inputs. A collapse in coverage removes alarms too, so a low alarm count alone proves nothing.
 4. **Selection** takes the fewest functions with an Unknown, then the fewest Unknowns, then ladder order. Elapsed time plays no part.
 5. **Per-loop analysis:** for loops in functions that still have Unknowns, it unrolls one loop nest at a time on a scratch mirror (never in `workspace/work/`) and keeps the annotation only if Unknowns fall and no obligation turns Dead.

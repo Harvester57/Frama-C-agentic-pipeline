@@ -329,4 +329,4 @@ These are known limits of the design, recorded in the step notes. None is a defe
 | R8 | M | done, `47d7c89` |
 | R9 | M | done, `28101de` |
 | R10 | S | done |
-| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second, pending, runs after R1–R10 (D1′) and records `phase0-r2` |
+| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second (`r2v`, after R1–R10, D1′) ran: five targets partial at `reach-dynamic`, four pipeline bugs fixed in `bd3f909`, `r3v` reruns the partial targets (`docs/progress/remediation-2026-11-08.md`); baseline `phase0-r2` not recorded yet |

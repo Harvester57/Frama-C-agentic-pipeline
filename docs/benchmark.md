@@ -85,7 +85,7 @@ Each run writes one JSON file ([`../schemas/benchmark-run.schema.json`](../schem
 | Field | Meaning |
 | :--- | :--- |
 | `recall` | Bugs retained, lost, undecided, not run. `rates` as below. Per bug: each replay's outcome, the observed fingerprint, the gate result, what Eva says at the bug's line (`eva_site`), and whether the campaign found it unaided (`found_by_campaign`). |
-| `targets.<t>.modules.<m>.eva` | Valid, Unknown, Invalid, Dead and Considered valid counts, properties checked, statements and functions reached, Unknown by kind, reduced checks. |
+| `targets.<t>.modules.<m>.eva` | Valid, Unknown, Invalid, Dead and Considered valid counts, properties checked, statements and functions reached, Unknown by kind, reduced checks. For a run that timed out, `timeout_fallback` (the cheaper settings the retry used) and `cost_profile` (the functions that took the time); the run summary then prints `Eva timed out and fell back to <tier>; most time in: ...`. |
 | `targets.<t>.functions_with_unknown` | In-scope functions with at least one Unknown. Each one costs a prover task, so this matters more than the raw alarm count. |
 | `targets.<t>.functions_with_unknown_no_unit` | The same, but with no ledger unit: no prover would ever be assigned, so those Unknowns silently stay open. 0 on every target since Phase 0 inventories what the build compiles. |
 | `targets.<t>.covered_with_unknown` | Units the ledger reads `covered` although some harness module's Eva report leaves an Unknown in them. Must stay empty: `compare` counts a new entry as a regression. |

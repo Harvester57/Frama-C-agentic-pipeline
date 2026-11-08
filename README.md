@@ -205,8 +205,10 @@ frama-c/
 │   ├── sandbox_exec.py               # Inner rlimits, environment allowlist, & process-group timeout runner
 │   ├── benchmark.py, benchmark_*.py  # Repeatable benchmark: recall replay, Eva metrics, baseline comparison, brief A/B
 │   └── validate_artifacts.py, ...    # Schema & semantic validators, checkpointing, fingerprinting, & shared helpers
-├── schemas/                          # JSON Schemas (findings, candidates, coverage-ledger, run-metadata, agent-result,
-│                                     # benchmark-run, build_capture, phase0_model, threat_model, security_props)
+├── schemas/                          # JSON Schemas, one per shared artifact (findings, candidates, coverage-ledger,
+│                                     # run-metadata, agent-result, benchmark-run, build_capture, build_check,
+│                                     # callgraph_dag, harness_reach_dynamic, harness_sidecar, phase0_model,
+│                                     # security_props, seed_harvest, seed_trace, threat_model)
 ├── templates/
 │   ├── pipeline.mk                   # Make rules for build, selftest, fuzz, eva, ingest, replay, wp-sweep, report
 │   ├── harness_dual.c.template       # Dual-use Eva + LibFuzzer C harness template
@@ -221,7 +223,7 @@ frama-c/
 └── docs/                             # Architecture, onboarding, security layers, caching, & reference manuals
     ├── bugs-found/                   # Public vulnerability advisories & verification reports per target
     ├── upstream/                     # Upstream Frama-C 33/34 e-acsl-gcc bug reports & workarounds
-    └── references/                   # Frama-C RTE, Eva, WP, ACSL, and E-ACSL reference manuals (33.0 editions; re-extract from the 34.0 PDFs when published)
+    └── references/                   # Frama-C RTE, Eva, WP, ACSL, and E-ACSL reference manuals (33.0 editions; re-extract from the 35.0 PDFs when published)
 ```
 
 ---
@@ -274,6 +276,7 @@ python3 -m mypy scripts tests
 - [Slicing & Onboarding 90k+ LoC Codebases (`./docs/slicing-and-onboarding.md`)](./docs/slicing-and-onboarding.md)
 - [Phase 0 Redesign & Implementation Plan (`./docs/phase0-redesign.md`, `./docs/phase0-implementation-plan.md`)](./docs/phase0-implementation-plan.md)
 - [Phase 0 Redesign: Effects on the Other Phases (`./docs/phase0-downstream-effects.md`)](./docs/phase0-downstream-effects.md)
+- [Plans & Reviews: Remediation Plan, Phase 0 Remediation, Phase 1 Review & Remediation (`./docs/remediation-plan.md`, `./docs/phase0-remediation-plan.md`, `./docs/phase1-review.md`, `./docs/phase1-remediation-plan.md`)](./docs/remediation-plan.md)
 - [Proving Security Properties Beyond Memory Safety (`./docs/security-properties.md`)](./docs/security-properties.md)
 - [Multi-Agent Swarm & Dual-Oracle Guardrail (`./docs/agentic-swarm.md`)](./docs/agentic-swarm.md)
 - [Resources, Scheduling & Caching (`./docs/resources-and-caching.md`)](./docs/resources-and-caching.md)

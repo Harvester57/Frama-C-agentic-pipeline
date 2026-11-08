@@ -2,7 +2,7 @@
 
 Read this before you change Phase 1 (fuzzing), Phase 2 (Eva), the Pre-WP crash gate, Phase 3 (WP), the report, the Make flow or the benchmark. It records what Phase 0 now produces, what each later phase reads from it, what changed downstream, the traps, and the defects known today.
 
-- **State described:** branch `phase0-redesign` at `2cfaa48` (2026-11-08), with steps I0–I10 of [phase0-implementation-plan.md](phase0-implementation-plan.md) done. It is not yet merged into `main`.
+- **State described:** branch `phase0-redesign` at `2cfaa48` (2026-11-08), with steps I0–I10 of [phase0-implementation-plan.md](phase0-implementation-plan.md) done. It is merged into `main`.
 - **Updated for the remediation** ([phase0-remediation-plan.md](phase0-remediation-plan.md), steps R1–R10, `c689c1b`..`28101de`): §8 gives each defect's fix, and the statements the R steps made wrong were corrected in place. Line numbers elsewhere are still those of `2cfaa48`.
 - **Sources:** a read of the code in four areas (Phase 1, Eva and the ledger, the WP gate and Phase 3, orchestration), and the plan's step notes. Line numbers are as of that commit. Each defect in §8 was checked in the code.
 - **Background:** [phase0-redesign.md](phase0-redesign.md) explains why, and the plan's "Step notes" say what each step did.

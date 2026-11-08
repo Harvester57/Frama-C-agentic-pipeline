@@ -117,16 +117,17 @@ Phase 0 is done when `build-check` passes: it records `phase_done = 0` itself, o
 These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/SKILL.md`, `skills/framac-eva/SKILL.md`):
 1. Regenerate the Makefile in the foreground if harnesses changed since Phase 0: `python3 /opt/framac-pipeline/scripts/pipeline_make.py gen`.
 2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`.
-3. Run `fuzz` and `eva` in the foreground (sequentially gives standalone `eva` a writable `rw` `/framac-cache` mount; if your harness supports concurrent background wrapper calls, you may run `fuzz` and `python3 $S/pipeline_make.py run eva` concurrently with `ro` cache):
+3. Run `fuzz` and `eva` in the foreground (sequentially gives standalone `eva` a writable `rw` `/framac-cache` mount; if your harness supports concurrent background wrapper calls, you may run `fuzz` and `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva` concurrently with `ro` cache):
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (the deterministic Eva ladder, for modules that still have Unknowns; `skills/framac-eva/SKILL.md`, Step 2a). Skip it under `--profile quick`, which allows no extra Eva runs.
 
    Write the `build`, `ingest`, standalone `eva`, `eva-tune` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
-4. Measure what each corpus reached, for the report's coverage gaps, and reopen the reach gate for API entry points no input executed: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage reach-dynamic`. A module that fails the dynamic reach gate stops at its next `fuzz-`/`eva-` target: repair its harness or exempt the entry point (`skills/framac-fuzz/SKILL.md`, Step 3), then re-run the module.
+4. Measure what each corpus reached, for the report's coverage gaps, and reopen the reach gate for API entry points no input executed: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage reach-dynamic`. A module that fails the dynamic reach gate stops at its next `fuzz-`/`eva-` target, and `wp-queue` refuses the whole run until every module passes. Repair its harness or exempt the entry point (`skills/framac-fuzz/SKILL.md`, Step 3), re-run the reach gate (`python3 /opt/framac-pipeline/scripts/pipeline_make.py run reach-gate`), then re-run the module (`run module-<mod>`, then `run coverage-<mod> reach-dynamic-<mod>`). A module whose coverage could not be measured is listed under `unmeasured` instead: `reach-dynamic` exits non-zero but does not reopen the gate (`skills/framac-fuzz/SKILL.md`, Step 3).
 5. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue`
+   - Optional, when crash reproducers are large or hard to read: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run minimize` (cvise/creduce; each artifact gets a `.min` sibling that verifiers replay first).
 
 Ingestion keeps the fuzz-then-Eva order:
 - crashes become fingerprinted candidates;
@@ -143,7 +144,7 @@ Tune modules with `pipeline_make.py params set` when Eva or fuzzing needs it, th
 Execute `skills/framac-wp/SKILL.md`. Its scheduler loop handles everything:
 - **Gate.** Verifier tasks for every `unverified` candidate (`skills/framac-wp/crash_verifier_brief.md`):
   - `confirmed`: the function's units become `candidate` and are excluded from WP. Optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
-  - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run module-<mod>`, then `wp_scheduler.py refresh --module <mod>`.
+  - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run reach-gate` (the repaired harness has a new digest, which `build-`/`fuzz-<mod>` refuse until the gate records it), then `pipeline_make.py run module-<mod>`, then `wp_scheduler.py refresh --module <mod>`. The repair task lists these actions in this order. A whole-run `reach-gate` exits 1 while another module still has a gap; it still records this module's row.
   - After two attempts, the candidate's linked units become `blocked` (`harness_repair_exhausted`). Regenerating the harness keeps the recorded attempts.
 - **Phase 3.** Architects, provers, breakers and negotiations are dispatched as soon as their dependencies are done. Their number follows the measured machine. Under `--profile quick` the scheduler proves only the Tier 1A entry chains and closes every other planned unit itself (`quick_profile_wp_not_scheduled`), so the loop still reaches `done`. Only when the user explicitly skips Phase 3 altogether, close the remaining `planned` units with `python3 /opt/framac-pipeline/scripts/ledger.py close-remaining --reason "quick_profile_wp_not_scheduled: Phase 3 WP not run in quick profile"`; otherwise run the Phase 3 scheduler loop to completion.
 
@@ -156,7 +157,7 @@ Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipel
 3. Set the terminal status:
    - `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status complete` only if no candidate is unverified and no unit is `planned`/`in_progress`;
    - otherwise `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status incomplete --reason <exact reason>`.
-4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
+4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `ledger.py audit-hypotheses` (so no caller shows as unconditionally proven while a callee is not), `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
 5. Mark the checkpoint complete: `python3 /opt/framac-pipeline/scripts/checkpoint.py complete state`.
 6. `--in-place` is a separate host-side step after the user reviews the report: `python <pipeline>\scripts\workspace_overlay.py apply-in-place --overlay <run-dir>\workspace --target <target-dir>`.
 

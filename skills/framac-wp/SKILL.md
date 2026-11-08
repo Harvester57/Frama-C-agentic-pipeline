@@ -75,7 +75,7 @@ All commands run through the wrapper with `-TargetDir <target-dir> -RunDir <run-
 
 ### Step 1 — Build the task graph
 
-Run this once, after `pipeline_make.py run ingest replay wp-queue` (which already calls it):
+`pipeline_make.py run ingest replay wp-queue` already runs `init`. Run it by hand only to resume a run (`--reconcile`, below):
 
 ```text
 python3 /opt/framac-pipeline/scripts/wp_scheduler.py init
@@ -83,7 +83,7 @@ python3 /opt/framac-pipeline/scripts/wp_scheduler.py init
 
 When resuming a run that was interrupted, or one started before the scheduler existed, use `init --reconcile`. It returns `in_progress` units with no live agent to `planned` and reports briefs that need re-rendering.
 
-`init` (with or without `--reconcile`) checks the Phase 0 gates first (`workspace/reports/phase0_gates.json`) and exits 1 with the reasons when a gate failed, has not run, or a harness changed since the reach check. Repair the harness and re-run the gate (`/framac-slice` Step 5); never start Phase 3 around it.
+`init` (with or without `--reconcile`) checks the Phase 0 gates first (`workspace/reports/phase0_gates.json`) and exits 1 with the reasons when a gate failed, has not run, or a harness changed since the reach check. Repair the harness and re-run the gate that failed (`/framac-slice` Step 4b for the reach gate, Step 5 for build-check); never start Phase 3 around it.
 
 ### Step 2 — The reactive continuous loop (sliding window)
 
@@ -103,7 +103,7 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
         python3 /opt/framac-pipeline/scripts/generate_harness.py --record-repair workspace/harnesses/harness_<mod>.json --reason "<reason>"
         ```
      2. Fix `workspace/harnesses/harness_<mod>.c`, or regenerate it with `--auto-args` / `--entry-style auto_prototype` for an internal multi-argument function.
-     3. Run the task's listed `actions`, typically `pipeline_make.py run module-<mod>`.
+     3. Run the task's listed `actions` in order: `pipeline_make.py run reach-gate` first (the repaired harness has a new digest, which `build-`/`fuzz-<mod>` refuse until the gate records it; a whole-run `reach-gate` exits 1 while another module still has a gap, but records this one), then `pipeline_make.py run module-<mod>`.
      4. Then run `wp_scheduler.py refresh --module <mod>`.
 
 2. **Execute or spawn each task** using its rendered `brief_file`. Two kinds carry extra context, which `--prepare` already renders into the brief:

@@ -630,7 +630,11 @@ def test_harness_induced_rejection_creates_a_repair_that_holds_the_gate(sim):
 
     nxt = S.cmd_next("auto", prepare=True)
     assert nxt["tasks"] == [] and [p["task"] for p in nxt["parent_tasks"]] == ["repair:m"]
-    assert any("--record-repair workspace/harnesses/harness_m.json" in a for a in nxt["parent_tasks"][0]["actions"])
+    actions = nxt["parent_tasks"][0]["actions"]
+    assert any("--record-repair workspace/harnesses/harness_m.json" in a for a in actions)
+    # The repaired harness has a new digest: the reach gate records it before module-m's targets run.
+    gate = next(i for i, a in enumerate(actions) if a.endswith("pipeline_make.py run reach-gate"))
+    assert gate < next(i for i, a in enumerate(actions) if a.endswith("pipeline_make.py run module-m"))
     S.cmd_refresh("m")
     assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m/f.c#f", "prove:src/m/h.c#h"]
 

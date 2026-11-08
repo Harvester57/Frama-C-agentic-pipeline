@@ -2003,6 +2003,9 @@ def _describe_repair(task: dict) -> dict:
         actions.append(
             f"repair workspace/harnesses/harness_{mod}.c (or regenerate it with --auto-args / --entry-style auto_prototype)"
         )
+    # A repaired harness has a new digest, so `build-`/`fuzz-<mod>` refuse it until the reach gate
+    # records it again; build-check needs no re-run (the gate reads the current build report).
+    actions.append(f"python3 {SCRIPTS}/pipeline_make.py run reach-gate")
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run module-{mod}")
     actions.append(f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}")
     return {
