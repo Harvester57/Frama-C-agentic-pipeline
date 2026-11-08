@@ -1111,6 +1111,11 @@ def main() -> int:
         dag["warnings"] = [*dag.get("warnings", []), note]
         print(f"warning: {note}", file=sys.stderr)
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    from validate_artifacts import schema_warning
+
+    problem = schema_warning("callgraph_dag", dag)  # R5: recorded, `validate_artifacts run-dir` fails on it
+    if problem:
+        dag["warnings"] = [*dag.get("warnings", []), problem]
     args.out.write_text(json.dumps(dag, indent=2) + "\n", encoding="utf-8")
 
     summary = {

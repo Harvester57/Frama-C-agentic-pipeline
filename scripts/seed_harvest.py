@@ -1410,6 +1410,11 @@ def main(argv: list[str] | None = None) -> int:
         }
         code = 1
     a.out.parent.mkdir(parents=True, exist_ok=True)
+    from validate_artifacts import schema_warning
+
+    problem = schema_warning("seed_harvest", report)  # R5: recorded, `validate_artifacts run-dir` fails on it
+    if problem:
+        report["warnings"] = [*(report.get("warnings") or []), problem]
     atomic_write_json(a.out, report)
     summary = {k: report.get(k) for k in ("status", "test_units", "calls", "error")}
     summary["files"] = len((report.get("files") or {}).get("kept") or [])

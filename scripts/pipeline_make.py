@@ -2333,6 +2333,12 @@ def _finish_build_check(
     phase0_gates.record_build_check(run_dir, out)  # the stamp fuzz-<mod> and wp-queue check
     if out["ok"]:
         out["phase0_checkpoint"] = record_phase0_checkpoint(run_dir, plan, script_runner, target_dir)
+    from validate_artifacts import SCHEMA_WARNING_PREFIX, schema_warning
+
+    # R5's policy: schema problems are recorded as warnings, and `validate_artifacts run-dir` fails on them.
+    warnings = [w for w in out.get("warnings") or [] if not str(w).startswith(SCHEMA_WARNING_PREFIX)]
+    problem = schema_warning("build_check", {**out, "warnings": warnings})
+    out["warnings"] = [*warnings, problem] if problem else warnings
     atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
     return out
 

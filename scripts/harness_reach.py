@@ -450,7 +450,9 @@ def record_exempt(
     exempt = dict(exempt) if isinstance(exempt, dict) else {}
     exempt[function] = reason
     sidecar["reach_exempt"] = dict(sorted(exempt.items()))
-    atomic_write_json(sidecar_path, sidecar)
+    from generate_harness import write_sidecar
+
+    write_sidecar(sidecar_path, sidecar)  # checks the sidecar's schema (R5)
     return {"module": module, "function": function, "reason": reason, "reach_exempt": sidecar["reach_exempt"]}
 
 
@@ -553,7 +555,13 @@ def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path, dag_path: P
             continue
         by_module[row["module"]] = {**row, "harness_digest": phase0_gates.harness_digest(run_dir, row["module"])}
     out.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(out, {"generated_at": report["generated_at"], "modules": dict(sorted(by_module.items()))})
+    from validate_artifacts import schema_warning
+
+    doc: dict[str, Any] = {"generated_at": report["generated_at"], "modules": dict(sorted(by_module.items()))}
+    problem = schema_warning("harness_reach_dynamic", doc)  # R5: recorded, `validate_artifacts run-dir` fails on it
+    if problem:
+        doc["warnings"] = [problem]
+    atomic_write_json(out, doc)
     failed = [r for r in report["modules"] if r.get("passed") is False]
     if failed:
         rows = [{**r, "error": "dynamic: entry points never executed by the corpus"} for r in failed]
