@@ -11,9 +11,11 @@ Known limits of the design (Alias, seeds, MetAcsl) are listed under [Backlog](#b
 
 Locations come from the audits and were checked on `phase0-redesign` at `fc25f85`. Line numbers drift: search for the named function.
 
-## Decisions to take first
+## Decisions (2026-11-08)
 
-| # | Question | Options | Recommendation |
+Taken by the user as recommended. The steps below follow them.
+
+| # | Question | Options | Decision |
 | :--- | :--- | :--- | :--- |
 | D1 | When does `phase0-redesign` merge to `main`? | (a) Run the validation benchmark on today's tree, merge, then land these steps; (b) hold the merge until R1–R9 are in. | **(a).** Today's tree carries I0–I10 and 20 fixes; nothing below blocks using it. The steps stay small and land one by one. |
 | D2 | GCC-fallback units: the implementation plan says Eva and WP are "reported blocked"; the code seeds them `deferred` (`unresolved: callgraph_fallback: …`). | (a) Keep `deferred` and reword the decision; (b) make them `blocked`, which `validate_artifacts` only accepts with evidence. | **(a),** with a report section that lists fallback units and their first Frama-C error (R4). |
