@@ -339,6 +339,13 @@ class TestProverTasks:
         result = compare_runs(base, make_run())
         assert "now have a ledger unit" in rows(result, "improvement", "prover_tasks")[0].message
 
+    def test_a_unit_covered_over_an_unknown_is_a_regression(self):
+        result = mutate(lambda r: r["targets"]["t"].update(covered_with_unknown=["a.c#f"]))
+        assert "a.c#f" in rows(result, "regression", "units")[0].message
+        base = make_run()
+        base["targets"]["t"]["covered_with_unknown"] = ["a.c#f"]
+        assert rows(compare_runs(base, make_run()), "improvement", "units")
+
 
 @pytest.mark.unit
 class TestUnits:

@@ -703,62 +703,107 @@ def _kernel_renames(reported: set[str], unit_names: set[str]) -> dict[str, str]:
     return out
 
 
+DAG_REPORT = Path("workspace/reports/callgraph_dag.json")
+# One module's Eva verdict on one function, kept per unit in bookkeeping.eva_verdicts (module ->
+# verdict). A module's newest report replaces its verdicts; the unit's Eva status is decided from all
+# of them, so the order reports arrive in, and which of them are new, does not matter.
+EVA_BLOCKING = frozenset({"invalid", "unknown", "other"})
+_EVA_ASSUMPTION_PREFIXES = ("Eva result holds", "Eva slice '")
+
+
+def _dag_line_index(dag_path: Path = DAG_REPORT) -> dict[str, list[tuple[int, int, str]]]:
+    """file -> (first line, last line, function name) of every DAG function with a known extent."""
+    dag = load_json_optional(dag_path, {})
+    out: dict[str, list[tuple[int, int, str]]] = {}
+    for key, rec in ((dag or {}).get("functions") or {}).items() if isinstance(dag, dict) else []:
+        if not isinstance(rec, dict):
+            continue
+        line, end = rec.get("line"), rec.get("end_line")
+        if isinstance(line, int) and isinstance(end, int) and 0 < line <= end:
+            out.setdefault(normalize_file(str(rec.get("file") or "")), []).append(
+                (line, end, str(rec.get("name") or key))
+            )
+    return out
+
+
+def _eva_row_function(row: object, index: dict[str, list[tuple[int, int, str]]], reported: str) -> str:
+    """
+    The DAG function an Eva row lies in, by file and line: exact even when the kernel renamed the
+    function (`f_0`) or the row names a caller's inlined copy. Falls back to the name Eva reported.
+    """
+    if isinstance(row, dict):
+        line = row.get("line")
+        spans = index.get(_eva_alarm_path(row)) if index else None
+        if spans and isinstance(line, int) and line > 0:
+            inside = [s for s in spans if s[0] <= line <= s[1]]
+            if inside:
+                return min(inside, key=lambda s: s[1] - s[0])[2]
+    return reported
+
+
+def _unit_eva_verdicts(unit: dict) -> dict:
+    return unit.setdefault("bookkeeping", {}).setdefault("eva_verdicts", {})
+
+
 @ledger_locked
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
     stats = {"reports": 0, "covered": 0, "candidates": 0}
+    index = _dag_line_index()
+    unit_names = {u["function"] for u in units.values()}
+    touched: set[str] = set()
     for path in paths:
         report = load_json_strict(path)
         stats["reports"] += 1
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
-        rte_units = [u for u in _module_units(units, module) if u["obligation_class"] == "rte"]
-        # Unreached header units too: Eva re-plans them when the harness reaches them after all.
-        rte_units += [
-            u
-            for u in units.values()
-            if report.get("status") == "ok"
-            and u["module"] == module
-            and u["obligation_class"] == "rte"
-            and u["status"] == "deferred"
-            and u.get("unresolved") == [HEADER_UNREACHED]
-        ]
         report_sources = _extract_eva_report_sources(report)
-        if report_sources:
-            # A report lists the .c files it analysed; header functions (seeded from the Phase 0 model)
-            # are compiled into them, so they stay, and get evidence only where the report names them.
-            rte_units = [
-                u
-                for u in rte_units
-                if normalize_file(u["file"]) in report_sources or not normalize_file(u["file"]).endswith(".c")
-            ]
+
+        def owned(u: dict, module: str = module, report_sources: set[str] | None = report_sources) -> bool:
+            if u["obligation_class"] != "rte" or u["module"] != module:
+                return False
+            if report_sources and normalize_file(u["file"]) not in report_sources:
+                # A report lists the .c files it analysed; header functions are compiled into them.
+                return not normalize_file(u["file"]).endswith(".c")
+            return True
 
         if report.get("status") != "ok":
-            for u in rte_units:
-                add_evidence(
-                    u,
-                    "eva",
-                    "run_eva_slice.py",
-                    "eva_analysis_error",
-                    False,
-                    tool_output,
-                    "Eva did not complete; no property statuses are available.",
-                )
+            for u in _module_units(units, module):
+                if owned(u):
+                    add_evidence(
+                        u,
+                        "eva",
+                        "run_eva_slice.py",
+                        "eva_analysis_error",
+                        False,
+                        tool_output,
+                        "Eva did not complete; no property statuses are available.",
+                    )
             continue
 
-        unknown_by_fn = report.get("unknown_obligations_by_function", {})
-        invalid_by_fn: dict[str, list[dict]] = {}
-        for alarm in report.get("invalid_alarms", []):
-            invalid_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
-        dead_by_fn: dict[str, list[dict]] = {}
-        for alarm in report.get("dead_alarms", []):
-            dead_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
-        assumed_by_fn: dict[str, list[dict]] = {}
-        for alarm in report.get("assumed_properties", []):
-            assumed_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
-        other_by_fn: dict[str, list[dict]] = {}
-        for alarm in report.get("other_properties", []):
-            other_by_fn.setdefault(alarm.get("function", ""), []).append(alarm)
+        # This module's newest report replaces every verdict its earlier ones gave.
+        for u in units.values():
+            verdicts = (u.get("bookkeeping") or {}).get("eva_verdicts")
+            if isinstance(verdicts, dict) and module in verdicts:
+                del verdicts[module]
+                touched.add(u["coverage_id"])
+
+        def by_function(rows: object, reported: str | None = None) -> dict[str, list]:
+            out: dict[str, list] = {}
+            for row in rows if isinstance(rows, list) else []:
+                name = reported if reported is not None else str((row or {}).get("function") or "")
+                out.setdefault(_eva_row_function(row, index, name), []).append(row)
+            return out
+
+        unknown_by_fn: dict[str, list] = {}
+        raw_unknown = report.get("unknown_obligations_by_function") or {}
+        for fn_name, rows in raw_unknown.items() if isinstance(raw_unknown, dict) else []:
+            for key, found in by_function(rows, str(fn_name)).items():
+                unknown_by_fn.setdefault(key, []).extend(found)
+        invalid_by_fn = by_function(report.get("invalid_alarms", []))
+        dead_by_fn = by_function(report.get("dead_alarms", []))
+        assumed_by_fn = by_function(report.get("assumed_properties", []))
+        other_by_fn = by_function(report.get("other_properties", []))
         props_by_fn: dict[str, list[dict]] = {}
         raw_props_by_file = report.get("functions_with_properties_by_file") or []
         if isinstance(raw_props_by_file, dict):
@@ -770,50 +815,61 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 if isinstance(item, dict) and item.get("function"):
                     props_by_fn.setdefault(str(item["function"]), []).append(item)
         with_props = set(report.get("functions_with_properties", []))
-        unknown_by_fn = dict(unknown_by_fn) if isinstance(unknown_by_fn, dict) else {}
+        # Names no row's line placed (the property lists carry none): the kernel's renamed copies.
         for renamed, original in _kernel_renames(
             {*unknown_by_fn, *invalid_by_fn, *dead_by_fn, *assumed_by_fn, *other_by_fn, *props_by_fn, *with_props},
-            {u["function"] for u in units.values()},
+            unit_names,
         ).items():
             for by_fn in (unknown_by_fn, invalid_by_fn, dead_by_fn, assumed_by_fn, other_by_fn, props_by_fn):
                 if renamed in by_fn:
                     by_fn[original] = [*(by_fn.get(original) or []), *by_fn.pop(renamed)]
             if renamed in with_props:
                 with_props.add(original)
+        reported_fns = {*unknown_by_fn, *invalid_by_fn, *dead_by_fn, *assumed_by_fn, *other_by_fn, *props_by_fn}
         reduced_checks = [str(x) for x in (report.get("reduced_checks") or []) if str(x).strip()]
         tuning = report.get("tuning")
         combination = tuning.get("combination") if isinstance(tuning, dict) else None
         upgraded = combination.get("upgraded") if isinstance(combination, dict) else None
         combined_fns = {str(item.get("function")) for item in upgraded or [] if isinstance(item, dict)}
-        # Invalid alarms already turned into a candidate for a scheduled unit; the rest are
-        # ingested after both loops so none is dropped (remediation plan H7).
+        # Invalid alarms already turned into a candidate for a unit; the rest are ingested after the
+        # loop so none is dropped (remediation plan H7).
         consumed: set[int] = set()
 
-        for u in rte_units:
+        def in_file(rows: list, u_file: str) -> list:
+            return [a for a in rows if not isinstance(a, dict) or _alarm_in_file(a, u_file)]
+
+        for u in units.values():
+            if u["obligation_class"] != "rte" or u["status"] in ("out_of_scope", "not_applicable"):
+                continue
+            if u["status"] == "deferred" and u.get("unresolved") != [HEADER_UNREACHED]:
+                continue
+            own = owned(u)
             fn = u["function"]
+            if not own and fn not in reported_fns:
+                continue
             u_file = u["file"]
-            unit_invalids = [a for a in invalid_by_fn.get(fn, []) if _alarm_in_file(a, u_file)]
-            unit_unknowns = [
-                a for a in (unknown_by_fn.get(fn) or []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)
-            ]
-            unit_deads = [a for a in dead_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)]
-            unit_assumed = [
-                a for a in assumed_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)
-            ]
-            unit_others = [a for a in other_by_fn.get(fn, []) if not isinstance(a, dict) or _alarm_in_file(a, u_file)]
+            unit_invalids = [a for a in invalid_by_fn.get(fn, []) if isinstance(a, dict) and _alarm_in_file(a, u_file)]
+            unit_unknowns = in_file(unknown_by_fn.get(fn) or [], u_file)
+            unit_deads = in_file(dead_by_fn.get(fn, []), u_file)
+            unit_assumed = in_file(assumed_by_fn.get(fn, []), u_file)
+            unit_others = in_file(other_by_fn.get(fn, []), u_file)
             if props_by_fn:
                 has_props = any(_alarm_in_file(p, u_file) for p in props_by_fn.get(fn, []))
             elif report_sources:
                 has_props = fn in with_props and (normalize_file(u_file) in report_sources)
             else:
-                has_props = fn in with_props
-            has_props = has_props or bool(unit_invalids or unit_unknowns or unit_deads or unit_assumed)
-            if has_props and u["status"] == "deferred" and u.get("unresolved") == [HEADER_UNREACHED]:
+                has_props = own and fn in with_props
+            has_props = has_props or bool(unit_invalids or unit_unknowns or unit_deads or unit_assumed or unit_others)
+            if not own and not has_props:
+                continue  # another module's slice that never analysed this function
+            if has_props and u["status"] == "deferred":
                 # A harness reaches this header function after all: it is work again.
                 u["status"] = "planned"
                 u["unresolved"] = []
             if u["status"] == "deferred":
                 continue  # still unreached: no evidence on a deferred unit
+            touched.add(u["coverage_id"])
+            where = "" if own else f"Eva slice '{module}' (another module's harness): "
 
             for alarm in unit_invalids:
                 consumed.add(id(alarm))
@@ -823,13 +879,15 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     fp,
                     "eva",
                     "needs_validation",
-                    module,
+                    u["module"] or module,
                     {"file": normalize_file(u_file), "line": int(alarm.get("line") or 0), "function": fn},
                     {"kind": alarm.get("kind") or "assertion", "predicate": alarm.get("annotation", "")},
                     [],
                     tool_output,
                     [u["coverage_id"]],
-                    "Eva Invalid status without a concrete witness input",
+                    "Eva Invalid status without a concrete witness input"
+                    if own
+                    else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
                 )
                 add_evidence(
                     u,
@@ -838,7 +896,12 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "eva_invalid",
                     False,
                     tool_output,
-                    f"Eva reports Invalid at line {alarm.get('line')}: {alarm.get('annotation', '')[:200] or alarm.get('kind', '')}",
+                    (
+                        f"Eva reports Invalid at line {alarm.get('line')}: "
+                        if own
+                        else f"Eva slice '{module}' reports Invalid at line {alarm.get('line')}: "
+                    )
+                    + (alarm.get("annotation", "")[:200] or alarm.get("kind", "")),
                 )
                 mark_candidate(u, fp)
                 stats["candidates"] += 1
@@ -848,6 +911,19 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "stub_contract",
                     f"{len(unit_assumed)} property status(es) 'Considered valid' (libc/stub specifications) under Eva.",
                 )
+            if unit_invalids:
+                verdict = "invalid"
+            elif unit_others:
+                verdict = "other"
+            elif unit_unknowns:
+                verdict = "unknown"
+            elif has_props and not unit_deads:
+                verdict = "valid"
+            elif unit_deads:
+                verdict = "dead"
+            else:
+                verdict = "none"
+            _unit_eva_verdicts(u)[module] = verdict
             if unit_invalids:
                 continue
             if unit_others:
@@ -860,8 +936,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "eva_unclassified_status",
                     False,
                     tool_output,
-                    f"{len(unit_others)} property status(es) Eva left unclassified ({', '.join(statuses)[:120]}); "
-                    "not credited.",
+                    f"{where}{len(unit_others)} property status(es) Eva left unclassified "
+                    f"({', '.join(statuses)[:120]}); not credited.",
                 )
             if unit_unknowns:
                 add_evidence(
@@ -871,29 +947,13 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "eva_unknown",
                     False,
                     tool_output,
-                    f"{len(unit_unknowns)} RTE obligation(s) remain Unknown; queued for WP.",
+                    f"{where}{len(unit_unknowns)} RTE obligation(s) remain Unknown; queued for WP.",
                 )
-            elif has_props and not unit_deads and not unit_others:
-                summary_msg = "Every RTE obligation in this function is Valid under Eva."
+            elif verdict == "valid":
+                summary_msg = "Every RTE obligation in this function is Valid under Eva"
                 if reduced_checks:
-                    summary_msg = (
-                        f"Every RTE obligation in this function is Valid under Eva "
-                        f"(reduced_checks: {', '.join(reduced_checks)})."
-                    )
-                add_evidence(
-                    u,
-                    "eva",
-                    "run_eva_slice.py",
-                    "eva_all_valid",
-                    True,
-                    tool_output,
-                    summary_msg,
-                )
-                add_assumption(
-                    u,
-                    "boundary_assumption",
-                    f"Eva result holds for calling contexts reachable from eva_main of module '{module}'.",
-                )
+                    summary_msg += f" (reduced_checks: {', '.join(reduced_checks)})"
+                add_evidence(u, "eva", "run_eva_slice.py", "eva_all_valid", True, tool_output, f"{where}{summary_msg}.")
                 if reduced_checks:
                     # Say what each reduced check means only when it is the one in force: most runs only
                     # carry -no-warn-unsigned-downcast (C11 modular conversions).
@@ -915,10 +975,6 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                         f"Eva slice '{module}': some obligations here are discharged by per-obligation combination "
                         "of tuning runs, each Valid in a complete run of the same sources and harness.",
                     )
-                if u["status"] in ("planned", "blocked"):
-                    u["status"] = "covered"
-                    u["unresolved"] = []
-                    stats["covered"] += 1
             elif unit_others:
                 pass
             elif unit_deads:
@@ -929,7 +985,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "eva_dead",
                     False,
                     tool_output,
-                    "Properties are dead under the module harness: function not reached from eva_main (harness gap).",
+                    f"{where}Properties are dead under the module harness: function not reached from eva_main "
+                    "(harness gap).",
                 )
             else:
                 add_evidence(
@@ -941,70 +998,6 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     tool_output,
                     "Eva reported no property for this function (trivial or not reached).",
                 )
-            established = has_props and not unit_unknowns and not unit_deads and not unit_others
-            if not established and u["status"] == "covered" and not _wp_discharged(u):
-                # This unit was covered by an earlier Eva run alone (for example under the harness a repair
-                # replaced): the current report no longer establishes it, so it is open again.
-                u["status"] = "planned"
-                u["agent_id"] = None
-                u["unresolved"] = []
-                u["assumptions"] = [
-                    a
-                    for a in u["assumptions"]
-                    if not (
-                        a.get("kind") == "boundary_assumption"
-                        and str(a.get("description") or "").startswith(("Eva result holds", "Eva slice '"))
-                    )
-                ]
-                add_evidence(
-                    u,
-                    "eva",
-                    "run_eva_slice.py",
-                    "eva_cover_withdrawn",
-                    False,
-                    tool_output,
-                    "A later Eva report of this module no longer proves every RTE obligation here; back to planned.",
-                )
-                stats["reopened"] = stats.get("reopened", 0) + 1
-
-        # Ingest cross-module Invalid alarms when a slice compiles sibling source files.
-        cross_rte_units = [
-            u
-            for u in units.values()
-            if u["obligation_class"] == "rte" and u["module"] != module and u["status"] not in NO_TOUCH
-        ]
-        for u in cross_rte_units:
-            fn = u["function"]
-            u_file = u["file"]
-            cross_invalids = [a for a in invalid_by_fn.get(fn, []) if _alarm_in_file(a, u_file)]
-            for alarm in cross_invalids:
-                consumed.add(id(alarm))
-                fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
-                upsert_candidate(
-                    candidates,
-                    fp,
-                    "eva",
-                    "needs_validation",
-                    u["module"] or module,
-                    {"file": normalize_file(u_file), "line": int(alarm.get("line") or 0), "function": fn},
-                    {"kind": alarm.get("kind") or "assertion", "predicate": alarm.get("annotation", "")},
-                    [],
-                    tool_output,
-                    [u["coverage_id"]],
-                    f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
-                )
-                add_evidence(
-                    u,
-                    "eva",
-                    "run_eva_slice.py",
-                    "eva_invalid",
-                    False,
-                    tool_output,
-                    f"Eva slice '{module}' reports Invalid at line {alarm.get('line')}: "
-                    f"{alarm.get('annotation', '')[:200] or alarm.get('kind', '')}",
-                )
-                mark_candidate(u, fp)
-                stats["candidates"] += 1
 
         for alarm in report.get("invalid_alarms", []):
             if id(alarm) in consumed or not isinstance(alarm, dict):
@@ -1012,6 +1005,61 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             consumed.add(id(alarm))
             _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output)
             stats["candidates"] += 1
+
+    # Each touched unit's Eva status, from every module's verdict: covered only when some module's
+    # harness proves every RTE obligation in it and none leaves one Unknown, Invalid or unclassified.
+    for cid in sorted(touched):
+        u = units[cid]
+        verdicts = (u.get("bookkeeping") or {}).get("eva_verdicts") or {}
+        valid = sorted(m for m, v in verdicts.items() if v == "valid")
+        blocking = sorted(m for m, v in verdicts.items() if v in EVA_BLOCKING)
+        established = bool(valid) and not blocking
+        u["assumptions"] = [
+            a
+            for a in u["assumptions"]
+            if not (
+                a.get("kind") == "boundary_assumption"
+                and str(a.get("description") or "").startswith("Eva result holds")
+            )
+        ]
+        if established:
+            names = ", ".join(f"'{m}'" for m in valid)
+            add_assumption(
+                u,
+                "boundary_assumption",
+                f"Eva result holds for calling contexts reachable from eva_main of module{'s' if len(valid) > 1 else ''} {names}.",
+            )
+            if u["status"] in ("planned", "blocked"):
+                u["status"] = "covered"
+                u["unresolved"] = []
+                stats["covered"] += 1
+            continue
+        u["assumptions"] = [
+            a
+            for a in u["assumptions"]
+            if not (
+                a.get("kind") == "boundary_assumption"
+                and str(a.get("description") or "").startswith(_EVA_ASSUMPTION_PREFIXES)
+            )
+        ]
+        if u["status"] == "covered" and not _wp_discharged(u):
+            # Covered by Eva alone, and a module's report no longer establishes it (a repaired harness
+            # reaching new contexts, or another module's harness leaving obligations open): open again.
+            u["status"] = "planned"
+            u["agent_id"] = None
+            u["unresolved"] = []
+            why = ", ".join(f"'{m}'" for m in blocking) or "none proves it"
+            add_evidence(
+                u,
+                "eva",
+                "run_eva_slice.py",
+                "eva_cover_withdrawn",
+                False,
+                (u["evidence"][-1] or {}).get("tool_output") if u["evidence"] else None,
+                f"Eva no longer proves every RTE obligation here (module(s) leaving obligations open: {why}); "
+                "back to planned.",
+            )
+            stats["reopened"] = stats.get("reopened", 0) + 1
     commit(units, candidates)
     return stats
 
@@ -1072,6 +1120,7 @@ def _ingest_unscheduled_eva_invalid(
             else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
         )
         for u in linked_units:
+            _unit_eva_verdicts(u)[module] = "invalid"
             add_evidence(
                 u,
                 "eva",

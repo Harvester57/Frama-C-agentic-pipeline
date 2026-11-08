@@ -674,6 +674,15 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
         "functions_with_unknown": sorted(with_unknown),
         "functions_with_unknown_count": len(with_unknown),
         "functions_with_unknown_no_unit": sorted(with_unknown - ledger_rte),
+        # Eva alone marked these covered while some module's Eva run leaves an Unknown in them.
+        "covered_with_unknown": sorted(
+            f"{u['file']}#{u['function']}"
+            for u in ledger
+            if u.get("obligation_class") == "rte"
+            and u.get("status") == "covered"
+            and f"{u['file']}#{u['function']}" in with_unknown
+            and not any(e.get("phase") == "wp" and e.get("discharging") for e in u.get("evidence") or [])
+        ),
         "prover_tasks": summarize_queue(read_json(run_dir / "workspace" / "reports" / "wp_queue.json")),
         "units": summarize_units(ledger),
         "modules_without_harness": modules_without_harness(ledger, target),
@@ -1699,6 +1708,11 @@ def print_summary(run: dict) -> None:
         if target.get("functions_with_unknown_no_unit"):
             print(
                 f"    WARNING: {len(target['functions_with_unknown_no_unit'])} function(s) with an Unknown have no ledger unit, so no prover is assigned"
+            )
+        if target.get("covered_with_unknown"):
+            print(
+                f"    WARNING: {len(target['covered_with_unknown'])} unit(s) covered by Eva although an Eva run leaves an Unknown in them: "
+                + ", ".join(target["covered_with_unknown"][:5])
             )
         if target.get("modules_without_harness"):
             print(f"    In scope with no harness: {', '.join(target['modules_without_harness'])}")

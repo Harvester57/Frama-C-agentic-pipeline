@@ -307,6 +307,18 @@ def _compare_unit_gaps(tid: str, base: dict, cur: dict, out: Comparison) -> None
             tid,
             f"{len(before - after)} function(s) with an Unknown now have a ledger unit",
         )
+    # A unit covered while an Eva run leaves an Unknown in its function claims more than Eva showed.
+    before = set(base.get("covered_with_unknown") or [])
+    after = set(cur.get("covered_with_unknown") or [])
+    if after - before:
+        out.add(
+            "regression",
+            "units",
+            tid,
+            "covered although an Eva run leaves an Unknown in them: " + ", ".join(sorted(after - before)),
+        )
+    if before - after:
+        out.add("improvement", "units", tid, f"{len(before - after)} unit(s) no longer covered over an Unknown")
 
 
 def _module_total(target: dict) -> int:

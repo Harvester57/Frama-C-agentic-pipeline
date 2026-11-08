@@ -562,20 +562,11 @@ def test_ingest_eva_maps_kernel_renamed_copies_to_their_unit(run_dir):
 
 
 def test_ingest_eva_replans_an_unreached_header_unit_a_harness_reaches(run_dir):
+    get = {"name": "get", "file": "inc/u.h", "module": "m", "tier": "Tier 1", "header": True, "reached": False}
     dag = {
         "modules": {"m": {"tier": "Tier 1", "files": ["src/a.c"]}},
-        "functions": {
-            "get": {
-                "name": "get",
-                "file": "inc/u.h",
-                "module": "m",
-                "tier": "Tier 1",
-                "header": True,
-                "reached": False,
-            },
-        },
+        "functions": {"get": get, "put": {**get, "name": "put"}},
     }
-    dag["functions"]["put"] = {**dag["functions"]["get"], "name": "put"}
     write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
     L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
     assert units_by_id(run_dir)["inc/u.h#get::rte"]["status"] == "deferred"
