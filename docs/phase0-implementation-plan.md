@@ -371,7 +371,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I3 | L | done |
 | I3b | L | done |
 | I4 | S | not started |
-| I5a | M | not started |
+| I5a | M | done |
 | I5b | L | not started |
 | I6 | L | not started |
 | I7 | M | not started |
@@ -469,6 +469,65 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I5a (2026-11-08)
+
+- **DAG from the model** (`build_callgraph_dag.py`):
+  - **Input:** it reads `workspace/reports/phase0_model.json` when it exists with `status: ok`. `--model` points elsewhere and `--no-model` keeps the lexer. A missing or failed model falls back to the lexer, with a warning in the DAG's `warnings`.
+  - **`model_view`, the PoC's held-module view promoted:**
+    - **Functions:** keyed by plain name, or `file#name` when the name collides. Name, file, lines, storage, loops and cyclomatic complexity come from the model; parameters, WP blockers and security properties come from the lexer's analysis of the same definition.
+    - **Definitions the lexer cannot match:** a definition behind a macro alias is matched through the alias in the same file. Otherwise the file is re-lexed, and a definition the lexer cannot see at all gets an empty record.
+    - **Edges:** `internal_callees` holds the model's edges, direct and indirect, and `indirect_callees` holds the indirect ones alone. Waves, recursion, callers, security properties and the module function lists are recomputed from them.
+    - **Held fixed:** modules, tiers, sources, flags and entry points stay the lexer's, translated to the new keys.
+  - **New fields:**
+    - per function: `callgraph_source` (`frama_c`, or `gcc_callgraph` with `callgraph_fallback` on a fallback unit), `units`, `header`, and `reached` for header functions;
+    - per DAG: `macro_aliases` (alias to keys) and a `model` block holding `lexer_only_functions` and `gcc_fallback_units`.
+  - **Indirect edges:** `wp_scheduler.py`, `audit-hypotheses`, `harness_reach.callee_closure` and `pipeline_make.py` read `internal_callees`, so they use the indirect edges without any change to those files.
+- **Ledger:**
+  - **Seed:** each unit takes its function's `callgraph_source`, and the schema enum and the CLI gain `gcc_callgraph`. Fallback units carry `bookkeeping.callgraph_fallback`. Functions found only in test units never reach the DAG, so they get no unit.
+  - **Unreached header functions** are seeded `deferred` with `unresolved: [header_unreached: …]`, which departs from the plan's "only when reached". Public `static inline` API is not a linked symbol, so no entry point of the build reaches it, yet harnesses call it. One example is QCBOR's `UsefulInputBuf_GetDouble` in `UsefulBuf.h`. Eva ingest re-plans such a unit when the report gives it properties, and adds nothing to one Eva doesn't reach.
+  - **Eva ingest, two fixes the benchmark exposed:**
+    - Header units were dropped because they are not among the report's `.c` sources. They now stay.
+    - The kernel renames a static defined in several translation units to `f_0`, `f_1`. Such a name now maps to its unit when no unit has the renamed name and one has its stem; the alarm's file must still match. The benchmark's no-unit count applies the same rule.
+  - **Eva status from every module's report** (`3d6f38a`, a soundness fix found reviewing I5a):
+    - **The problem:** a unit took its Eva status from whichever report was ingested last, so it could read covered while another module's harness left an Unknown in it.
+    - **Row placement:** each Eva row now goes to the DAG function whose line range holds it (`_dag_line_index`). That is exact for renamed copies and inlined rows. The name is used only for a row without a line.
+    - **Verdicts:** a unit records one verdict per module (`bookkeeping.eva_verdicts`), and a module's newer report replaces its old verdicts.
+    - **Covered** is decided once, from all of them: at least one `valid`, and no `invalid`, `unknown` or unclassified verdict. The boundary assumption names every proving module, and the result doesn't depend on ingest order.
+    - **Policy kept:** a function can be covered from other modules even when its own module failed Eva.
+    - **Benchmark:** a new `covered_with_unknown` metric, and `compare` counts a new entry there as a regression.
+- **Aliases:**
+  - `harness_reach.py` indexes functions by DAG key as well as by name, so `file#name` edges resolve, and adds `macro_aliases` to the header macros.
+  - `generate_harness.py` resolves aliases when it merges DAG sources.
+- **Docs:** the slice skill's Step 2 describes the model-based DAG and `lexer_only_functions`.
+- **Tests:** `tests/test_dag_model_view.py` (the view, fallback, seed, aliases and keys), the rename and re-plan cases in `tests/test_ledger.py`, the renamed-copy case in `tests/test_benchmark.py`, and `tests/test_eva_cross_module.py` (both ingest orders, incremental ingest, superseding report, line placement, header reached from another module).
+- **Acceptance** (baseline `benchmark/baselines/phase0-i5a.json`; runs `i5a4-*`, one target at a time, all on `framac-analysis:latest`):
+  - **No Eva result lost:** Eva-analysed functions with no ledger unit fall to 0 on every target, from 11 on qcbor-dev and 1 each on CryptoLib, qlz and tweetnacl. Functions with an Unknown are unchanged on every target, at the same counts.
+  - **No covered unit has an Unknown:** `covered_with_unknown` is 0 on every target.
+  - **Recall:** 7/7 known bugs retained.
+  - **One regression in `compare` against `phase0-i0`, which is intended:** qcbor-dev loses covered on `UsefulInputBuf_GetBytes` and `IEEE754_AssembleDouble`. Before, one module's `valid` was enough for these; now other modules' Unknowns count against them too (`qcbor_number_decode` and others leave one).
+  - **Unit changes against I0, matching the PoC's A/B where it measured them:**
+
+    | Target | DAG functions | Prover tasks | Why |
+    | :--- | ---: | ---: | :--- |
+    | minmea | 22 → 23 | 9 → 12 | as in the PoC; excluded units 5 → 2 (test and example code is no longer seeded); `minmea_isfield` covered |
+    | qcbor-dev | 522 → 755 | 255 → 312 | header inline functions the harnesses reach; 37 units newly covered (mostly header functions) and 2 no longer covered (see above); 74 more excluded (unreached header functions, deferred) |
+    | qcbor-master | 389 → 562 | 5 → 5 | header inline functions; the 119 more excluded are unreached ones, deferred |
+    | CryptoLib | 232 → 232 | 195 → 194 | `mc_log` now carries its renamed copy's Unknowns; `sa_get_from_spi` covered |
+    | x509-parser | 213 → 212 | 209 → 208 | as in the PoC |
+    | jsmn | 27 → 6 | 3 → 3 | example files the build does not compile; excluded 28 → 0 |
+    | semver | 64 → 33 | 30 → 30 | test and example code; excluded 36 → 0 (the PoC's 60 predates I2's library-only recipe) |
+    | stmr | 17 → 15 | 12 → 12 | test code; excluded 5 → 0 |
+    | qlz | 18 → 22 | 13 → 17 | as in the PoC: the 4 core functions get units, and the `qlz_compress_core` Invalid now lands on one (candidates 1 → 2) |
+    | tweetnacl | 64 → 64 | 60 → 60 | macro-named units replaced by the real symbols |
+
+  - **Comparison warnings:** `compare` flags "harness, scope or tuning changed" on 7 targets. That comes from I1's manifest edits (`reach_gaps_accepted`, and x509-parser's `params` and `fuzz_engine_reason`), not from I5a. x509-parser's `x509-parser` module still fails Eva, as at I0.
+- **Run history:** four full runs were needed.
+  - Run 1 exposed the two ingest gaps.
+  - Run 2 showed the unreached public inline API.
+  - Run 3 had qcbor-dev's ingest refuse evidence on 381 deferred header units, fixed in `22f276f`.
+  - Run 4 is the first after the cross-module fix (`3d6f38a`), and is the recorded baseline.
+- **Left for other steps:** modules are still the lexer's (I5b); `lexer_only_functions` is reported but not acted on; the lexer remains as a fallback until I10.
 
 ### I3b (2026-11-07)
 
