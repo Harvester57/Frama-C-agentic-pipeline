@@ -324,4 +324,4 @@ These are known limits of the design, recorded in the step notes. None is a defe
 | R8 | M | open |
 | R9 | M | open |
 | R10 | S | open |
-| V | — | waits for the user |
+| V | — | first run done on the pre-R tree (`docs/progress/validation-r1-2026-11-08.md`, baseline `phase0-r1`); the second, after R1–R9, waits for the user |

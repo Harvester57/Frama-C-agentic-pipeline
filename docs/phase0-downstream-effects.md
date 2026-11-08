@@ -152,6 +152,14 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
   - capped per unit at 480, 1200 or 7200, scaled down in proportion with at least 30 each;
   - recorded as `fuzz_budget_source`.
 - **Seeds:** `fuzz-%` writes `workspace/seeds/<mod>` and passes it as `--extra-corpus`, and so does `coverage-%`. The single-module command in `skills/framac-fuzz/SKILL.md` leaves this out.
+- **Whole-API harness (`generate_harness.py --api`):**
+  - one dispatch case per entry point of the module's scope, built from the model's signatures, formals and `param_sizes`;
+  - plus sequence cases from the recorded traces;
+  - its sidecar carries `api_cases` (each case's input layout), which `seed_harvest.py write` reads instead of parsing the C, and `api_skipped`.
+- **Seed sources:**
+  - with no test command, Phase 0 records the calls of the project's non-test executables, each run once with no arguments (report `source: executables`);
+  - lone pointers sized by `param_sizes` are recorded (kind `a`);
+  - `workspace/seed_records/traces.jsonl` keeps each process's calls in order, with pointer addresses.
 - **Dynamic reach gate:** an entry point with 0 executions reopens the gate. The gap stays until the harness digest changes. It reads only the sidecar's exemptions, not `reach_exempt_modules.json`.
 - **Ingest:** clean or error evidence goes only to units in the harness module's scope, and candidates name the report's harness module.
 - **Replay** of a candidate that names a unit builds `harness_module_for(unit)`, which is the first sub-module. The ledger picks a candidate's harness by the scope of the crashing function, so the two can disagree (§8).
@@ -270,6 +278,9 @@ The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept fo
 - **Benchmark:**
   - baselines `phase0-i5a`, `phase0-i5b`, `phase0-i9`, `phase0-i10`, `phase0-r1` (latest, the validation run on the fixed tree: `docs/progress/validation-r1-2026-11-08.md`);
   - `benchmark.py seeded` runs the 8 seeded projects;
+  - each target records `api_reach`: entry points held, reached and exempted, and seeds written, from the reach gate's report. `compare` flags fewer reached entry points as a regression;
+  - a manifest harness `{"generate": "api"}` uses the whole-API generator (oscs-tweetnacl does, with no accepted gaps);
+  - the seeds stage runs even without a test command;
   - `harness_digest` leaves out the recipe, threat model, seeds and security props, so `compare` doesn't flag changes to those;
   - it still hashes the now-unused `compile_commands` asset, which was kept so digests don't change.
 

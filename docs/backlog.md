@@ -26,6 +26,16 @@ Mined the master archive (`/tmp/framac-src/frama-c-master`, vendored snippets in
 - [x] **M5 WP witnesses + Layer 6:** `run_wp_function.py --counter-examples` (`-wp-counter-examples`, report field `counter_example_goals`), wired into the parent WP re-check in `workspace_overlay.py`; `layer6_zeroization_and_taint.acsl` documents the upstream `security_status()`/`__fc_private` idiom; briefs updated.
 - [ ] **Watch:** on each base-image bump, diff the master archive's `Changelog` `<next-release>` section and port behavior changes into `docs/troubleshooting.md` §0. `-eva-statistics-file` (new in 35) is a candidate for `run_eva_slice.py` if per-run stats are ever needed beyond `-metrics`.
 
+## 1b. Phase 1 review (2026-11-08) — open
+
+A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions. F1–F16 come from reading the code and have not been reproduced on a target yet (F4 has since been fixed in `684052f`); F17 (E-ACSL false alarms on libc out-parameters) and D4 come from the libmnl, minmea and x509-parser runs. The list, with evidence, remediations, confirming tests and a suggested order, is in [`./phase1-review.md`](./phase1-review.md).
+
+- [x] Decide D1 (2026-11-08): per-engine normalized fingerprints first (option A: F1, F4, F8), then candidates grouped by statement site (option D: F5). Still open within D1: whether to link one bug seen at two statements (LIBMNL-04).
+- [x] Decide D3 (2026-11-08): extract failure parsing and identity from `run_eacsl_fuzz.py` first (option B, with D1 step 1), then split by consumer (option C: sandbox seam, builds, crash replay, coverage, guardrail).
+- [ ] Decide D2: what a module that fails the dynamic reach gate gets (leave the WP queue, re-fuzz, or exemption), before fixing F2.
+- [ ] Decide D4 (E-ACSL's share of each campaign) after fixing F17 and checking the seeded benchmark for bugs only E-ACSL can catch.
+- [ ] Work through the suggested order in `phase1-review.md`, updating each defect's status there.
+
 ## 2. Verification gaps (not testable on this machine)
 
 - [ ] **Podman**, rootless and rootful: per-controller flags, the refusal when memory/pids limits cannot be enforced, and `sandbox.outer: podman-hardened`. Podman is not installed here (it would need installing in WSL Ubuntu).
