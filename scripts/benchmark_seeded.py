@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-The benchmark's `phase0` set: the seeded-bug projects of poc/phase0/seeded/ (step I5b). Each project is a
+The benchmark's `phase0` set: the seeded-bug projects of tests/fixtures/phase0/seeded/ (step I5b). Each project is a
 small library with one verified bug that Phases 1-2 find only when Phase 0 reports the right sources,
 flags and entry points, and decoys that a wrong Phase 0 turns into false positives (see that
 directory's README and each project's truth.json). Acceptance: 7/7 bugs found, 0 decoys fired.
@@ -17,10 +17,11 @@ Host side (`run`), per project, every stage through the real wrapper (scripts/be
   2. the build capture and the Phase 0 model (benchmark.run_capture: build_capture.py, phase0_model.py),
      with the project's `build` command from truth.json as the recipe;
   3. `inner` (below) in the analysis image;
-  4. pipeline_make.py build-check, run fuzz, run eva, run ingest, as `benchmark.py run` does.
+  4. pipeline_make.py build-check (which checkpoints Phase 0 when it passes), run fuzz, run eva, run
+     coverage reach-dynamic, run ingest, as `benchmark.py run` does.
 
 Container side (`inner`): Phase 0 as `benchmark.py inner-phase0` runs it (run metadata, overlay, DAG from
-the model, so its modules are link units, reach gate, ledger seed, validation, checkpoints, Make
+the model, so its modules are link units, reach gate, ledger seed, validation, checkpoint state, Make
 generation), with the manifest's pinned harnesses replaced by the fixed mechanical harness policy below,
 so only what Phase 0 reports decides what gets fuzzed and analysed.
 
@@ -74,7 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import benchmark  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
-CORPUS = benchmark.PIPELINE_ROOT / "poc" / "phase0" / "seeded"
+CORPUS = benchmark.PIPELINE_ROOT / "tests" / "fixtures" / "phase0" / "seeded"
 CONTAINER_SELF = f"{benchmark.CONTAINER_SCRIPTS}/benchmark_seeded.py"
 PM = f"python3 {benchmark.CONTAINER_SCRIPTS}/pipeline_make.py"
 DEFAULT_FUZZ_BUDGET = 30
@@ -94,11 +95,13 @@ _LEN_RE = re.compile(r"\b(size_t|unsigned|int|long|u?int(?:16|32|64)_t)\b")
 _RENAMED_RE = re.compile(r"(.+)_\d+")
 
 # Host-side stages after Phase 0, as `benchmark.py run` runs them (no replay, gate or queue: the seeded
-# set has no manifest reproducers and stops at Phase 2).
+# set has no manifest reproducers and stops at Phase 2). `coverage reach-dynamic` runs before ingest, as
+# /framac-verify does.
 POST_STAGES = (
     ("build", f"{PM} build-check"),
     ("fuzz", f"{PM} run fuzz"),
     ("eva", f"{PM} run eva"),
+    ("coverage", f"{PM} run coverage reach-dynamic"),
     ("ingest", f"{PM} run ingest"),
 )
 
@@ -443,10 +446,8 @@ def inner(repo: str, fuzz_budget: int) -> int:
                 and step("seed", [py, script("ledger.py"), "seed", "--dag", str(DAG), "--profile", PROFILE])
                 and step("validate", [py, script("validate_artifacts.py"), "run-dir", "."])
                 and step("checkpoint", [py, script("checkpoint.py"), "init", "state", "--target", "/target"])
-                and step(
-                    "checkpoint_phase0",
-                    [py, script("checkpoint.py"), "save-phase", "state", "--phase", "0", "--from-file", str(DAG)],
-                )
+                # Phase 0 is checkpointed by the build stage (pipeline_make.py build-check), once its
+                # last gate passed, not here.
                 and step("make_gen", [py, script("pipeline_make.py"), "gen"])
             )
     result["ok"] = bool(ok)
@@ -710,7 +711,6 @@ def project_spec(proj: Path, truth: dict, seeds: bool = True) -> dict:
         "scope": [],
         "modules": [],
         "assets": [],
-        "compile_commands": None,
         "reach_exempt_modules": {},
         "build": {"command": truth.get("build") or "make", "test_command": test, "origin": "benchmark"},
         "replays": [],

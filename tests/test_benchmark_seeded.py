@@ -347,5 +347,5 @@ def test_projects_and_specs_come_from_the_corpus():
     assert s08["build"]["test_command"] == "./sdf_test"
     assert bs.project_spec(projects[7], _truth("s08_wellformed_input"), seeds=False)["build"]["test_command"] is None
     plan = bs.stage_plan(projects[3], 45)
-    assert [s[0] for s in plan] == ["phase0", "build", "fuzz", "eva", "ingest"]
+    assert [s[0] for s in plan] == ["phase0", "build", "fuzz", "eva", "coverage", "ingest"]
     assert plan[0][1].endswith("benchmark_seeded.py inner --repo s04-force-include --fuzz-budget 45")

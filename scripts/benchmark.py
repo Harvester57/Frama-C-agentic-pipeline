@@ -197,7 +197,6 @@ def harness_digest(target: dict, manifest: dict, assets_dir: Path = ASSETS_DIR) 
         "profile": manifest.get("profile"),
         "scope": target.get("scope"),
         "modules": target.get("modules"),
-        "compile_commands": target.get("compile_commands"),
         "assets": {
             a["path"]: sha256_hex((assets_dir / a["path"]).read_bytes())
             for a in sorted(target.get("assets", []), key=lambda x: x["path"])
@@ -997,7 +996,6 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
         "scope": target.get("scope") or [],
         "modules": modules,
         "assets": target.get("assets") or [],
-        "compile_commands": target.get("compile_commands"),
         "reach_exempt_modules": target.get("reach_exempt_modules") or {},
         # The build recipe build_capture.py runs (its `--recipe-file bench/spec.json` reads this block).
         "build": {**target["build"], "origin": "benchmark"} if target.get("build") else None,
@@ -1134,6 +1132,36 @@ def summarize_model(model: dict | None) -> dict:
     return out
 
 
+def capture_ok(capture: dict) -> bool:
+    """Whether the build capture and the Phase 0 model both succeeded: Phase 0 runs only then."""
+    return capture.get("status") == "ok" and (capture.get("model") or {}).get("status") == "ok"
+
+
+def post_phase0_stages(*, run_fuzz: bool, replays: bool) -> list[tuple[str, str, str | None]]:
+    """
+    (stage, container command, wrapper class) after Phase 0, in the order /framac-verify runs them.
+    build-check builds every module, records the E-ACSL gate the fuzz targets check and, when it
+    passes, the Phase 0 checkpoint. `coverage reach-dynamic` measures what each corpus reached and
+    reopens the reach gate for entry points no input executed, before ingest. wp-queue checks both
+    Phase 0 gates, then checkpoints Phase 2, so an LLM host can continue the run directory with
+    /framac-wp; a refused gate leaves Phase 2 unrecorded.
+    """
+    pm = f"python3 {CONTAINER_SCRIPTS}/pipeline_make.py"
+    bench = f"python3 {CONTAINER_SCRIPTS}/benchmark.py"
+    out: list[tuple[str, str, str | None]] = [("build", f"{pm} build-check", None)]
+    if run_fuzz:
+        out.append(("fuzz", f"{pm} run fuzz", None))
+    out.append(("eva", f"{pm} run eva", None))
+    out.append(("coverage", f"{pm} run coverage reach-dynamic", None))
+    if replays:
+        out.append(("replay", f"{bench} inner-replay", "phase-dynamic"))
+    out.append(("ingest", f"{pm} run ingest", None))
+    if replays:
+        out.append(("gate", f"{bench} inner-gate", "light"))
+    out.append(("queue", f"{pm} run replay wp-queue", None))
+    return out
+
+
 def run_target(
     target: dict,
     manifest: dict,
@@ -1188,24 +1216,16 @@ def run_target(
     model = capture.get("model") or {}
     if capture["status"] == "ok" and model.get("status") != "ok":
         notes.append(f"model: {model.get('status')}: {model.get('error') or 'see bench/logs/model.log'}")
-    ok = stage("phase0", f"{py}/benchmark.py inner-phase0", "eva")
-    if ok and (read_json(run_dir / BENCH_SUBDIR / "phase0.json", {}) or {}).get("ok") is not True:
-        ok = False
-        notes.append("phase0: see bench/phase0.json")
+    # A failed capture or model stops the target here, as in benchmark_seeded.py: Phase 0 needs both.
+    ok = capture_ok(capture)
+    if ok:
+        ok = stage("phase0", f"{py}/benchmark.py inner-phase0", "eva")
+        if ok and (read_json(run_dir / BENCH_SUBDIR / "phase0.json", {}) or {}).get("ok") is not True:
+            ok = False
+            notes.append("phase0: see bench/phase0.json")
     if ok and not phase0_only:
-        # build-check builds every module and records the E-ACSL gate the fuzz targets check.
-        stage("build", f"{py}/pipeline_make.py build-check")
-        if run_fuzz:
-            stage("fuzz", f"{py}/pipeline_make.py run fuzz")
-        stage("eva", f"{py}/pipeline_make.py run eva")
-        if spec["replays"]:
-            stage("replay", f"{py}/benchmark.py inner-replay", "phase-dynamic")
-        stage("ingest", f"{py}/pipeline_make.py run ingest")
-        if spec["replays"]:
-            stage("gate", f"{py}/benchmark.py inner-gate", "light")
-        # wp-queue checks both Phase 0 gates, then checkpoints Phase 2, so an LLM host can continue
-        # this run directory with /framac-wp. A refused gate leaves Phase 2 unrecorded.
-        stage("queue", f"{py}/pipeline_make.py run replay wp-queue")
+        for name, command, cls in post_phase0_stages(run_fuzz=run_fuzz, replays=bool(spec["replays"])):
+            stage(name, command, cls)
     metrics = collect_target_metrics(run_dir, target, notes)
     metadata = read_json(run_dir / "run-metadata.json", {}) or {}
     entry = {
@@ -1521,19 +1541,8 @@ def inner_phase0() -> int:
                 )
                 and step("validate", [py, script("validate_artifacts.py"), "run-dir", "."])
                 and step("checkpoint", [py, script("checkpoint.py"), "init", "state", "--target", "/target"])
-                and step(
-                    "checkpoint_phase0",
-                    [
-                        py,
-                        script("checkpoint.py"),
-                        "save-phase",
-                        "state",
-                        "--phase",
-                        "0",
-                        "--from-file",
-                        "workspace/reports/callgraph_dag.json",
-                    ],
-                )
+                # Phase 0 is checkpointed by the build stage (pipeline_make.py build-check), once its
+                # last gate passed, not here.
                 and step("make_gen", [py, script("pipeline_make.py"), "gen"])
             )
     result["ok"] = bool(ok)
@@ -1948,14 +1957,52 @@ def resolve_baseline(name_or_path: str) -> Path:
     raise BenchmarkError(f"no baseline {name_or_path!r}: neither a file nor {candidate}")
 
 
+def _replay_key(replay: dict) -> tuple[str, str, str]:
+    return (str(replay.get("target")), str(replay.get("module")), str(replay.get("engine")))
+
+
+def merge_bug(old: dict | None, new: dict) -> dict:
+    """
+    One recall bug's entry from an earlier and a later run: per (target, module, engine), a replay the
+    later run ran replaces the earlier one, and a replay it did not run keeps the earlier outcome. The
+    status is then decided again over the merged replays, so a per-target run keeps the other target's.
+    """
+
+    def ran(entry: dict) -> bool:
+        return any(r.get("outcome", "not_run") != "not_run" for r in entry.get("replays") or [])
+
+    if not old or (old.get("status") == "not_run" and not ran(old)):
+        return json.loads(json.dumps(new))
+    if new.get("status") == "not_run" and not ran(new):
+        return json.loads(json.dumps(old))
+    if not ran(old) or not ran(new):  # an entry without replay records: the later decision wins whole
+        return json.loads(json.dumps(new))
+    replays: dict[tuple[str, str, str], dict] = {_replay_key(r): r for r in old.get("replays") or []}
+    for replay in new.get("replays") or []:
+        key = _replay_key(replay)
+        if replay.get("outcome") != "not_run" or key not in replays:
+            replays[key] = replay
+    spec = {
+        "replays": [
+            {"target": t, "module": m, "engine": e, "required": bool(r.get("required"))}
+            for (t, m, e), r in replays.items()
+        ]
+    }
+    outcomes = {key: r for key, r in replays.items() if r.get("outcome") != "not_run"}
+    return json.loads(json.dumps({**old, **new, **decide_bug(spec, outcomes)}))
+
+
 def merge_runs(runs: list[dict]) -> dict:
-    """A baseline from several runs (a slow target can be re-baselined alone): later runs win, per target and per bug."""
+    """
+    A baseline from several runs (a slow target can be re-baselined alone): later runs win per target,
+    and per bug replay by replay (merge_bug), so a later per-target run keeps the other targets' replays.
+    """
     merged = json.loads(json.dumps(runs[0]))
     for run in runs[1:]:
         merged["targets"].update(run.get("targets") or {})
-        merged["recall"]["bugs"].update(
-            {k: v for k, v in run["recall"]["bugs"].items() if v.get("status") != "not_run"}
-        )
+        bugs = merged["recall"]["bugs"]
+        for bug_id, entry in (run["recall"]["bugs"] or {}).items():
+            bugs[bug_id] = merge_bug(bugs.get(bug_id), entry)
         for key in ("pipeline", "toolchain", "machine", "limits", "created_at", "run_id"):
             merged[key] = run.get(key, merged.get(key))
         if run.get("briefs"):

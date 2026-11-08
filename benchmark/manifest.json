@@ -369,7 +369,6 @@
     "include"
    ],
    "target_packages": "libgcrypt20-dev libcurl4-openssl-dev libmariadb-dev libmariadb-dev-compat",
-   "compile_commands": "workspace/bench/compile_commands.json",
    "assets": [
     {
      "path": "cryptolib/gcrypt.h",
@@ -378,10 +377,6 @@
     {
      "path": "cryptolib/mc_log_path.h",
      "to": "workspace/stubs/mc_log_path.h"
-    },
-    {
-     "path": "cryptolib/compile_commands.json",
-     "to": "workspace/bench/compile_commands.json"
     }
    ],
    "modules": [

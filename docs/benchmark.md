@@ -5,16 +5,18 @@ Measures what a change to the pipeline's filters, Eva configuration or briefs ac
 - **Repository Root:** [`../README.md`](../README.md)
 - **Runner:** [`../scripts/benchmark.py`](../scripts/benchmark.py), comparison rules in [`../scripts/benchmark_compare.py`](../scripts/benchmark_compare.py)
 - **What it runs:** [`../benchmark/manifest.json`](../benchmark/manifest.json)
-- **Stored baselines:** [`../benchmark/baselines/`](../benchmark/baselines/): `default.json`, and one per Phase 0 step that changed units (`phase0-i0`, `phase0-i5a`, `phase0-i5b`, the latest). Compare a Phase 0 change against the latest `phase0-*`.
-- **Seeded set:** [`../scripts/benchmark_seeded.py`](../scripts/benchmark_seeded.py), on the projects in [`../poc/phase0/seeded/`](../poc/phase0/seeded/)
+- **Stored baselines:** [`../benchmark/baselines/`](../benchmark/baselines/): one per Phase 0 step that changed units (`phase0-i0`, `phase0-i5a`, `phase0-i5b`, `phase0-i9`, `phase0-i10`, `phase0-r1`). The latest is `phase0-r1`: compare against it. `default.json` is the pre-redesign baseline (run `dagfix-2`), kept as history: its modules are lexer modules, so nearly every count differs from a run of today's pipeline.
+- **Seeded set:** [`../scripts/benchmark_seeded.py`](../scripts/benchmark_seeded.py), on the projects in [`../tests/fixtures/phase0/seeded/`](../tests/fixtures/phase0/seeded/)
 
 ## Usage
 
-Run the deterministic part (Phases 0 to 2 plus reproducer replay, no LLM) and compare it with the stored baseline:
+Run the deterministic part (Phases 0 to 2 plus reproducer replay, no LLM) and compare it with the latest stored baseline:
 
 ```bash
-python3 scripts/benchmark.py run --compare default
+python3 scripts/benchmark.py run --compare phase0-r1
 ```
+
+`--compare default` compares with `default.json`, the pre-redesign `dagfix-2` run: use it only to see what the redesign changed, not as a regression check.
 
 The command fetches each target at its pinned revision on the host, runs it through the normal wrappers and Make targets, writes one JSON file per run, prints the differences, and exits 1 on a regression. Each target goes through these stages:
 
@@ -22,30 +24,30 @@ The command fetches each target at its pinned revision on the host, runs it thro
 2. `model`: the Frama-C model in the analysis image (`phase0_model.py`).
 3. `seeds`: when the recipe has a `test_command`, the API calls the tests make (`seed_harvest.py record`, build image). The scratch volume is then removed.
 4. `phase0`: overlay, DAG, the manifest's harnesses, the reach gate and the ledger seed.
-5. `build` (`build-check`), `fuzz`, `eva`, `replay`, `ingest`, `gate` and `queue`.
+5. `build` (`build-check`, which records the Phase 0 checkpoint when it passes), `fuzz`, `eva`, `coverage` (`run coverage reach-dynamic`, which `/framac-verify` also runs before ingest), `replay`, `ingest`, `gate` and `queue`.
 
-The run file records the capture, the model and the seeds under each target's `build_capture`. A capture that fails ends the target as `needs_build_recipe`; a unit on the GCC fallback is flagged, not a failure. `FRAMAC_BENCH_DIR` or `--work-dir` moves its data (default `~/framac-pipeline/benchmark`). Nothing sizes a machine here: the broker leases CPUs and memory per container, as in any run. The shared cross-run cache is off, so no result comes from an older run. On a 12-CPU machine the whole command took 44 minutes of wall-clock and an hour of CPU: 22 minutes for recall and 22 for comparison, of which `jsmn` alone took 14.
+The run file records the capture, the model and the seeds under each target's `build_capture`. A failed capture (`needs_build_recipe`) or a failed model ends the target there, before `phase0`; a unit on the GCC fallback is flagged, not a failure. `FRAMAC_BENCH_DIR` or `--work-dir` moves its data (default `~/framac-pipeline/benchmark`). Nothing sizes a machine here: the broker leases CPUs and memory per container, as in any run. The shared cross-run cache is off, so no result comes from an older run. On a 12-CPU machine the whole command took 44 minutes of wall-clock and an hour of CPU: 22 minutes for recall and 22 for comparison, of which `jsmn` alone took 14.
 
 Narrower runs while you iterate:
 
 ```bash
-python3 scripts/benchmark.py run --set recall --no-fuzz --compare default
+python3 scripts/benchmark.py run --set recall --no-fuzz --compare phase0-r1
 ```
 
 ```bash
-python3 scripts/benchmark.py run --target minmea --target oscs-stmr --compare default
+python3 scripts/benchmark.py run --target minmea --target oscs-stmr --compare phase0-r1
 ```
 
 `--profile quick|standard|deep` overrides the manifest's profile. Under `quick`, Tier 3 modules are deferred and their missing Eva reports are not counted as problems.
 
-Compare two run files later, or store a run as the baseline after you accept its differences. Several runs can be merged (later runs win, per target and per bug), so a slow target can be re-baselined alone. Storing refuses a run that loses a bug unless you pass `--force`.
+Compare two run files later, or store a run as the baseline after you accept its differences. Several runs can be merged, so a slow target can be re-baselined alone: later runs win per target and, within a bug, per replay. A replay the later run did not run keeps its earlier outcome, and the bug's status is decided again over the merged replays (QCBOR-02 and QCBOR-03 replay on two targets). Storing refuses a run that loses a bug unless you pass `--force`.
 
 ```bash
-python3 scripts/benchmark.py compare default path/to/run.json --verbose
+python3 scripts/benchmark.py compare phase0-r1 path/to/run.json --verbose
 ```
 
 ```bash
-python3 scripts/benchmark.py baseline --run path/to/run.json --name default
+python3 scripts/benchmark.py baseline --run path/to/run.json --name phase0-<step>
 ```
 
 A selection that skips a bug or target reports it as `not_compared`, never as a pass or a loss. `compare --require-all` turns a bug that did not run into a failure.
@@ -133,7 +135,6 @@ Each of these is real behavior of the pipeline today. They show up in every comp
 - **Macros from Makefile targets the library build does not use are pinned in the harness specs.** jsmn's `JSMN_STRICT`/`JSMN_PARENT_LINKS`, qlz's streaming configuration and semver's `DEBUG=1` are stated in their specs, so the analysed configuration stays the one the older baselines measured.
 - **A file compiled by several units with different flags is analysed in one configuration only**, the first unit's (qlz's four executables).
 - **x509-parser's fuzz builds fall back to the sanitizer engine.** E-ACSL rejects the target's own annotations (`unbounded ranges`, `x509-crl-parser.c:3313`) and cannot find `__fc_builtin.h`, which `x509-parser.c` includes under `__FRAMAC__`. Eva runs at `slevel 1`, as in the target's own Makefile, because the default exceeded 900 s.
-- **CRYPTOLIB-01 reads `undecided`.** The link-unit build loses the quoting of `-DMC_LOG_PATH="log.txt"` through E-ACSL, so CryptoLib's fuzzing falls back from E-ACSL.
 - **Unreached header `static inline` functions are seeded `deferred`** (most of QCBOR's Tier 3). Eva ingest re-plans one when a harness reaches it.
 - **MINMEA-02's fingerprint differs from `docs/bugs-found`**, at the same site. The run summary names it.
 - **Some campaigns abort without a crash artifact** (`fuzzer_error`, exit code -6, on `semver` and on CryptoLib's `crypto` and `sa`), so they leave no reproducer. On `semver` the log ends in E-ACSL's `Use of invalid address`.
