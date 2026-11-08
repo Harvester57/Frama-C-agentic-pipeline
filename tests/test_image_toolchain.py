@@ -35,12 +35,12 @@ def test_compare_cli_exit_code(tmp_path, capsys):
 
 
 @pytest.mark.unit
-def test_dockerfile_defines_the_three_images_with_the_monolith_last():
+def test_dockerfile_defines_the_build_and_analysis_images_with_the_analysis_image_last():
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     stages = re.findall(r"^FROM \S+ AS (\S+)$", text, re.MULTILINE)
-    assert stages == ["framac-build", "framac-analysis", "framac-pipeline"]
+    assert stages == ["framac-build", "framac-analysis"]
     # The analysis image carries no build system or target library; the build image no Frama-C.
-    analysis = text.split("AS framac-analysis", 1)[1].split("AS framac-pipeline", 1)[0]
+    analysis = text.split("AS framac-analysis", 1)[1]
     for absent in ("cmake", "bear", "ninja-build", "libssl-dev", "TARGET_APT_PACKAGES"):
         assert absent not in analysis, absent
     assert re.search(r"^FROM \$\{DEBIAN_BASE\} AS framac-build$", text, re.MULTILINE)

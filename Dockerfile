@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 #
-# Three images from one file (docs/phase0-implementation-plan.md, decision "Images"):
-#   docker build -t framac-pipeline .                              the monolith, default (last stage)
+# Two images from one file (docs/phase0-implementation-plan.md, decision "Images"); the optional third
+# image has its own Dockerfile:
 #   docker build --target framac-analysis -t framac-analysis .     Frama-C, provers, instrumented builds
 #   docker build --target framac-build -t framac-build .           the target's build and tests
 # The build and analysis images share the Debian release, gcc and glibc (checked by
 # scripts/image_toolchain.py), so flags captured in one mean the same in the other and binaries
-# link against the same libc. Until step I3b the monolith stays the image every wrapper uses.
+# link against the same libc. The analysis image is the last stage, so a build without --target makes it.
 ARG FRAMAC_BASE=framac/frama-c:dev@sha256:2296220f5d51cd9842db1d83f0c84390298100bc4efeb1bcab6bad557866f124
 # MetAcsl, built from source: its 0.11 release does not compile against Frama-C 35 (Fileloc.t), the
 # development branch does (feasibility test of 2026-11-07, plan step I0).
@@ -58,7 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# Target packages (a derived image per target, as for the monolith).
+# Target packages (a derived image per target, framac-build:<repo>).
 ARG TARGET_APT_PACKAGES=""
 RUN if [ -n "${TARGET_APT_PACKAGES}" ]; then \
         apt-get update && \
@@ -138,109 +138,6 @@ COPY templates/ /opt/framac-pipeline/templates/
 COPY schemas/ /opt/framac-pipeline/schemas/
 COPY skills/ /opt/framac-pipeline/skills/
 COPY docs/references/ /opt/framac-pipeline/docs/references/
-RUN chmod -R a+rX /opt/framac-pipeline \
-    && chmod a+x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh \
-    && mkdir -p /home/opam/.cache /framac-run \
-    && chmod 1777 /home/opam /home/opam/.cache /framac-run
-# The Phase 0 model's dump module must compile and load against this kernel.
-RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
-
-WORKDIR /framac-run
-ENTRYPOINT ["/bin/bash", "-lc"]
-
-# --- Monolith (default): everything in one image, as before the split ---------------------------
-FROM ${FRAMAC_BASE} AS framac-pipeline
-
-LABEL maintainer="Frama-C Agentic Verification Pipeline"
-LABEL description="Self-contained Frama-C (RTE, Eva, WP, E-ACSL, Mdr/SARIF) + SMT Solvers (Alt-Ergo, Z3, CVC5) + Clang/LibFuzzer + Bear + cvise (crash-input minimization) container"
-
-USER root
-ENV HOME=/home/opam
-ENV DEBIAN_FRONTEND=noninteractive
-ENV OPAMYES=1
-ENV OPAMROOT=/home/opam/.opam
-ENV PYTHONIOENCODING=utf-8
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
-ENV PATH="/home/opam/.opam/5.5/bin:${PATH}"
-ENV FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"
-ENV WHY3CONFIG="/home/opam/.why3.conf"
-ENV S="/opt/framac-pipeline/scripts"
-
-# Install system dependencies, Clang + LibFuzzer, Bear, and SMT solvers (Z3, CVC5)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    autoconf \
-    automake \
-    bear \
-    build-essential \
-    ca-certificates \
-    clang \
-    cmake \
-    curl \
-    cvc5 \
-    cvise \
-    git \
-    graphviz \
-    jq \
-    libbsd-dev \
-    libclang-rt-dev \
-    libevent-dev \
-    libgmp-dev \
-    libjson-c-dev \
-    libmpfr-dev \
-    libpcap-dev \
-    libsnmp-dev \
-    libsqlite3-dev \
-    libssl-dev \
-    libxml2-dev \
-    llvm \
-    m4 \
-    ninja-build \
-    pkg-config \
-    python3 \
-    python3-pip \
-    python3-venv \
-    time \
-    unzip \
-    wget \
-    z3 \
-    zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && chmod a+rx /home/opam /root \
-    && chmod -R a+rX /home/opam/.opam \
-    && printf 'export PATH="/home/opam/.opam/5.5/bin:${PATH}"\nexport FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"\nexport WHY3CONFIG="/home/opam/.why3.conf"\n' > /etc/profile.d/framac.sh \
-    && chmod 644 /etc/profile.d/framac.sh \
-    && python3 -c "from pathlib import Path; p = Path('/home/opam/.opam/5.5/share/why3/provers-detection-data.conf'); p.write_text(p.read_text().replace(')$', ')'))" \
-    && why3 config detect -C /home/opam/.why3.conf \
-    && cp -f /home/opam/.why3.conf /root/.why3.conf \
-    && chmod 644 /home/opam/.why3.conf /root/.why3.conf
-
-# MetAcsl (program-wide ACSL properties, Layers 4-6), pinned to a commit of its development branch.
-ARG METACSL_COMMIT
-RUN git init -q /tmp/metacsl \
-    && git -C /tmp/metacsl fetch -q --depth 1 https://git.frama-c.com/pub/meta.git "${METACSL_COMMIT}" \
-    && git -C /tmp/metacsl checkout -q FETCH_HEAD \
-    && cd /tmp/metacsl && opam exec -- sh -c 'dune build @install && dune install' \
-    && cd / && rm -rf /tmp/metacsl \
-    && chmod -R a+rX /home/opam/.opam \
-    && frama-c -plugins | grep -q MetAcsl
-
-# Optional target-specific apt packages (built via --target-packages / -TargetPackages before dropping capabilities)
-ARG TARGET_APT_PACKAGES=""
-RUN if [ -n "${TARGET_APT_PACKAGES}" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends ${TARGET_APT_PACKAGES} && \
-        rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# Copy pipeline scripts, templates, schemas, skills and the greppable Frama-C manuals (docs/references,
-# read by agents at /opt/framac-pipeline/docs/references) into /opt/framac-pipeline, so the published
-# image is complete without the wrappers' bind mounts (which may still mount over these directories).
-COPY scripts/ /opt/framac-pipeline/scripts/
-COPY templates/ /opt/framac-pipeline/templates/
-COPY schemas/ /opt/framac-pipeline/schemas/
-COPY skills/ /opt/framac-pipeline/skills/
-COPY docs/references/ /opt/framac-pipeline/docs/references/
 # Jobs run as an arbitrary non-root uid (the wrappers pass --user <host uid>:<host gid>; compose uses
 # FRAMAC_UID/FRAMAC_GID): everything they read must be world-readable, and HOME plus the default working
 # directory must be writable by any uid (sticky, like /tmp), since that uid has no passwd entry or home.
@@ -252,5 +149,4 @@ RUN chmod -R a+rX /opt/framac-pipeline \
 RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
 
 WORKDIR /framac-run
-
 ENTRYPOINT ["/bin/bash", "-lc"]
