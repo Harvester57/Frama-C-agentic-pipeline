@@ -8,7 +8,10 @@ data, decided by a stated rule, the target's threat model and, optionally, CodeQ
     trust.py check-threat-model [PATH] [--model workspace/reports/phase0_model.json]
 
 `run` annotates the Phase 0 model in place (phase0_model.py already does it once when it writes the
-model; run it again after a CodeQL run or a threat-model change, then rebuild the DAG). The rules,
+model; run it again after a CodeQL run, then rebuild the DAG). It takes the threat model the model
+recorded (path and sha256) and stops when that file changed, went missing or appeared since: re-run
+the model, or give `--threat-model PATH` to annotate it with that file, which the model then records.
+It validates the model it rewrites; schema problems become the model's `schema:` warning. The rules,
 in this order:
 
   1. library API: every API function of a library unit (its exports) and an executable's embedded
@@ -43,9 +46,11 @@ block holds the threat model's path, digest, errors and warnings, the CodeQL sta
 source.
 
 The threat model is the fenced block `framac-threat-model` of THREAT_MODEL.md, validated against
-schemas/threat_model.schema.json. It is looked for, in order: --threat-model, workspace/THREAT_MODEL.md
-(supplied with the run, e.g. a benchmark asset), the target's own THREAT_MODEL.md (the model's scratch
-tree, workspace/work/, /target).
+schemas/threat_model.schema.json. The model's first annotation looks for it, in order: --threat-model,
+workspace/THREAT_MODEL.md (supplied with the run, e.g. a benchmark asset), the target's own
+THREAT_MODEL.md (the model's scratch tree, workspace/work/, /target). The model records the file's
+path and sha256 (`trust.threat_model`); `trust.py run` and security_props.py read that file, never
+search again, and refuse it once its sha256 differs.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from phase0_model import model_features, validate_model  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
@@ -184,7 +190,11 @@ def load_threat_model(path: Path | None) -> dict:
 
 
 def find_threat_model(explicit: Path | None, model: dict | None = None) -> Path | None:
-    """The threat model file: explicit, else run-supplied, else the target's own."""
+    """
+    The threat model file: explicit, else run-supplied, else the target's own. Only the first
+    annotation of a model searches: later readers take the file the model recorded
+    (`recorded_threat_model`).
+    """
     if explicit is not None:
         return explicit
     cands = [Path("workspace") / THREAT_MODEL_NAME]
@@ -193,6 +203,43 @@ def find_threat_model(explicit: Path | None, model: dict | None = None) -> Path 
         cands.append(Path(tree) / THREAT_MODEL_NAME)
     cands += [Path("workspace/work") / THREAT_MODEL_NAME, Path("/target") / THREAT_MODEL_NAME]
     return next((c for c in cands if c.is_file()), None)
+
+
+RERUN_MODEL = (
+    "re-run the model (phase0_model.py run, or trust.py run --threat-model PATH to annotate it with this "
+    "file), then build_callgraph_dag.py and security_props.py run"
+)
+
+
+def recorded_threat_model(model: dict) -> tuple[dict | None, str | None]:
+    """
+    The threat model the model's trust annotation used, so trust, the DAG and the security properties
+    share one: (load_threat_model's result for the path and sha256 in `model.trust.threat_model`, None),
+    or (None, why) when the model has no trust annotation, or when that file is gone, changed since the
+    model was built, or appeared where the model recorded none.
+    """
+    trust_block = model.get("trust")
+    rec = trust_block.get("threat_model") if isinstance(trust_block, dict) else None
+    if not isinstance(rec, dict):
+        return None, "the model has no trust annotation (`trust.threat_model`): run trust.py run"
+    path = rec.get("path")
+    if not path:
+        found = find_threat_model(None, model)
+        if found is not None:
+            return None, f"{found} appeared after the model was built without a threat model: {RERUN_MODEL}"
+        out = load_threat_model(None)
+        out.update(status=rec.get("status") or STATUS_NONE, reason=rec.get("reason") or out["reason"])
+        return out, None
+    file = Path(str(path))
+    if not file.is_file():
+        return None, f"threat model {path}, which the model recorded, is missing: {RERUN_MODEL}"
+    threat = load_threat_model(file)
+    if threat.get("sha256") != rec.get("sha256"):
+        return None, (
+            f"threat model {path} changed since the model was built (sha256 {str(rec.get('sha256'))[:12]} -> "
+            f"{str(threat.get('sha256'))[:12]}): {RERUN_MODEL}"
+        )
+    return threat, None
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -356,7 +403,7 @@ def compute_trust(model: dict, threat: dict | None = None, codeql: dict | None =
             marks.add(fid, "default", f"{what} of {unit}", boundary=True)
     # Rule 2: input roots, then the call graph.
     roots: dict[str, str] = {}
-    if not any("external_calls" in f for f in idx.functions.values()) and idx.functions:
+    if idx.functions and not model_features(model)["external_calls"]:
         warnings.append("the model records no external calls (made before step I7): input readers are not seen")
     for fid, f in sorted(idx.functions.items()):
         readers = sorted(set(f.get("external_calls") or []) & INPUT_READERS)
@@ -471,9 +518,16 @@ def annotate_model(
     threat_path: Path | None = None,
     codeql_path: Path | None = None,
     metadata: dict | None = None,
+    threat: dict | None = None,
 ) -> dict:
-    """Add `trust` to the model's functions and units and a top-level `trust` block; returns the block."""
-    threat = load_threat_model(find_threat_model(threat_path, model))
+    """
+    Add `trust` to the model's functions and units and a top-level `trust` block; returns the block.
+    The threat model is `threat` (load_threat_model's result) when given, else the file
+    find_threat_model gives for `threat_path`. The block records its path and sha256: every later
+    reader takes that file (`recorded_threat_model`).
+    """
+    if threat is None:
+        threat = load_threat_model(find_threat_model(threat_path, model))
     codeql = None
     codeql_state: dict[str, Any] = {"status": "off"}
     if codeql_enabled(metadata):
@@ -552,21 +606,35 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not isinstance(model, dict) or model.get("status") != "ok":
         print(json.dumps({"ok": False, "error": f"{args.model}: no model with status ok (run phase0_model.py)"}))
         return 1
+    # The threat model: --threat-model when given (a new choice, recorded in the model), else the one the
+    # model recorded, unchanged; a model never annotated searches as phase0_model.py does.
+    threat: dict | None = None
+    recorded = model["trust"].get("threat_model") if isinstance(model.get("trust"), dict) else None
+    if args.threat_model is None and isinstance(recorded, dict):
+        threat, why = recorded_threat_model(model)
+        if threat is None:
+            print(json.dumps({"ok": False, "error": f"{args.model}: {why}"}))
+            return 1
     metadata = load_json_optional(args.metadata, None)
-    block = annotate_model(model, args.threat_model, args.codeql, metadata if isinstance(metadata, dict) else None)
-    atomic_write_json(args.model, model)
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "threat_model": block["threat_model"],
-                "codeql": block["codeql"],
-                "summary": block["summary"],
-                "warnings": block["warnings"][:10],
-            },
-            indent=1,
-        )
+    block = annotate_model(
+        model, args.threat_model, args.codeql, metadata if isinstance(metadata, dict) else None, threat=threat
     )
+    # The model's own schema problems are warnings (validate_artifacts.py run-dir fails on them).
+    problems = list(validate_model(model))
+    model["warnings"] = [w for w in model.get("warnings") or [] if not str(w).startswith("schema: ")]
+    if problems:
+        model["warnings"].append(f"schema: {problems[:5]}")
+    atomic_write_json(args.model, model)
+    out = {
+        "ok": True,
+        "threat_model": block["threat_model"],
+        "codeql": block["codeql"],
+        "summary": block["summary"],
+        "warnings": block["warnings"][:10],
+    }
+    if problems:
+        out["schema"] = problems[:5]
+    print(json.dumps(out, indent=1))
     return 0
 
 

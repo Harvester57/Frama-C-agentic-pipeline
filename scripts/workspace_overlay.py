@@ -1432,18 +1432,24 @@ def _acsl_text_of_span(span) -> str:
 TRUST_BOUNDARY_REASON = "trust-boundary check failed"
 
 
-def _untrusted_entry_metas(overlay: Path, module: str | None, function: str | None = None) -> list[dict]:
+def _untrusted_entry_metas(
+    overlay: Path, module: str | None, function: str | None = None, file: str | None = None
+) -> list[dict]:
     """
     The harness sidecars standing for `module` (all of its unit's harnesses for a link unit) whose
     entry function is an untrusted_surface entry. Each sidecar is read from disk, so a malformed one
     fails the merge instead of being skipped. `function` is checked too when its trust (step I7)
     puts it on the trust boundary and no harness enters through it: a dispatch harness drives
-    several API functions but names one entry.
+    several API functions but names one entry. Its trust is that of `function` in `file` (a
+    same-named static elsewhere keeps its own), and the entry records the file.
     """
     out = _sidecar_untrusted_entries(overlay, module)
     if function and not any(m.get("entry_fn") == function for m in out):
-        if is_trust_boundary(function_trust_records(overlay), function):
-            out.append({"entry_fn": function, "reachability": "untrusted_surface", "trust_boundary": True})
+        if is_trust_boundary(function_trust_records(overlay), function, file):
+            entry: dict = {"entry_fn": function, "reachability": "untrusted_surface", "trust_boundary": True}
+            if file:
+                entry["file"] = file
+            out.append(entry)
     return out
 
 
@@ -1471,11 +1477,16 @@ def entry_trust_boundary_errors(
     Trust-boundary violations an agent adds to the untrusted_surface entry function's contract in
     `rel` (docs/v2-design.md §6). Only the entry function is checked, and only when the agent
     changed its contract; violations already in the target's own baseline ACSL are not the agent's.
+    An entry that records its `file` (one the function's trust put on the boundary) is checked in
+    that source and in headers, never in another source's same-named static.
     """
     entry = str(hmeta.get("entry_fn") or "")
     if not entry or Path(rel).suffix not in ACSL_CHECK_EXTS:
         return []
     is_hdr = rel.endswith(".h")
+    entry_file = _normalize_work_relpath(str(hmeta.get("file") or ""))
+    if entry_file and not is_hdr and _normalize_work_relpath(rel) != entry_file:
+        return []
     try:
         if function_contract_text(agent_text, entry, is_hdr, rel) == function_contract_text(
             base_text, entry, is_hdr, rel
@@ -1685,7 +1696,7 @@ def _merge_agent_overlay_locked(
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
 
-    entry_metas = _untrusted_entry_metas(overlay, module, function)
+    entry_metas = _untrusted_entry_metas(overlay, module, function, norm_c_file)
     if entry_metas:
         # On an untrusted_surface entry, `requires` may state memory shape only: a value constraint on
         # attacker-controlled bytes or lengths would define the bug away (docs/v2-design.md §6).
@@ -2603,7 +2614,7 @@ def prepare_agent(
         "untrusted_surface"
         if not harness_metas
         or any(_untrusted_for(m) for m in harness_metas)
-        or (function and is_trust_boundary(function_trust_records(overlay), function))
+        or (function and is_trust_boundary(function_trust_records(overlay), function, norm_c_file))
         else "internal_api"
     )
 

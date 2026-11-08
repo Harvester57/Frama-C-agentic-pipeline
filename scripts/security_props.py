@@ -4,13 +4,16 @@ Security layers L3-L6 (docs/phase0-implementation-plan.md step I9): the obligati
 requires, as MetAcsl meta-properties, and the frame obligation of every function that writes through a
 pointer. Stdlib only.
 
-    security_props.py run [--model workspace/reports/phase0_model.json] [--threat-model PATH]
+    security_props.py run [--model workspace/reports/phase0_model.json]
                           [--out workspace/reports/security_props.json]
     security_props.py meta-file --function FILE#NAME [--props PATH] --out META.c
 
 `run` reads the Phase 0 model (scripts/phase0_model.py, with the dump's `writes`, `formals` and
-`global_variables`) and the structured threat model (THREAT_MODEL.md's `framac-threat-model` block, the
-same lookup as scripts/trust.py), and writes security_props.json (schemas/security_props.schema.json):
+`global_variables`) and the structured threat model (THREAT_MODEL.md's `framac-threat-model` block):
+the file the model's trust annotation recorded (`trust.threat_model`, path and sha256), so the
+properties and the trust come from one threat model (a model without a trust annotation: trust.py's
+search order, with a warning). It writes security_props.json
+(schemas/security_props.schema.json), with its own schema problems as a `schema:` warning:
 
   L3  frame: every function that writes through a pointer (the dump's `writes`, or a call to a libc
       memory writer such as memcpy) needs an `assigns` clause WP proves (class l3_frame);
@@ -35,7 +38,10 @@ to the property names they must discharge.
 property with an instance there) and prints the extra sources the properties need (the files defining
 the globals they name). run_wp_function.py --security-props does the same itself.
 
-Without a threat model (or with an invalid one) only L3 is generated and the status says why.
+Without a threat model only L3 is generated and the status says why. `run` writes nothing and exits:
+  1  no model with status ok, or a recorded threat model that changed, went missing or appeared
+     since the model was built (re-run the model);
+  2  the model recorded an invalid threat model (the errors are printed).
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from phase0_model import MODEL_FEATURES, model_features  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
@@ -183,7 +190,8 @@ class _Model:
         self.globals_by_name: dict[str, list[dict]] = defaultdict(list)
         for g in (model.get("global_variables") or {}).values():
             self.globals_by_name[str(g.get("name"))].append(g)
-        self.has_writes = any("writes" in f for f in self.functions.values())
+        self.features = model_features(model)
+        self.has_writes = self.features["writes"]
 
     def resolve(self, ref: str) -> list[str]:
         if "#" in ref:
@@ -266,10 +274,11 @@ class _Gen:
         self.properties: list[dict] = []
         self.warnings: list[str] = []
         self.names: set[str] = set()
-        if model.get("functions") and not self.m.has_writes:
-            self.warnings.append(
-                "the model has no write facts (made before step I9): L3 uses pointer parameters, L4 the state's direct writers are unknown"
-            )
+        if model.get("functions"):
+            # The facts this generator reads (phase0_model.MODEL_FEATURES says what each one's absence loses).
+            for feature in ("external_calls", "formals", "writes"):
+                if not self.m.features[feature]:
+                    self.warnings.append(f"the model has {MODEL_FEATURES[feature]}")
 
     # -- helpers ------------------------------------------------------------------------------------
 
@@ -835,25 +844,51 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not isinstance(model, dict) or model.get("status") != "ok":
         print(json.dumps({"ok": False, "error": f"{args.model}: no model with status ok (run phase0_model.py)"}))
         return 1
-    threat = trust.load_threat_model(trust.find_threat_model(args.threat_model, model))
+    # The threat model the model's trust used (its recorded path and sha256), never a new search. A model
+    # without the trust feature (trust.py failed, or an old model) has no record: look it up as trust.py
+    # would, and say so.
+    note = None
+    if model_features(model)["trust"]:
+        threat, why = trust.recorded_threat_model(model)
+    else:
+        threat, why = trust.load_threat_model(trust.find_threat_model(None, model)), None
+        note = f"the model has {MODEL_FEATURES['trust']}; threat model looked up as trust.py does: {threat['path']}"
+    if threat is None:
+        print(json.dumps({"ok": False, "error": f"{args.model}: {why}"}))
+        return 1
+    if threat["status"] == trust.STATUS_INVALID:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"invalid threat model {threat['path']}: fix it (trust.py check-threat-model), then "
+                    f"{trust.RERUN_MODEL}",
+                    "threat_model": trust.STATUS_INVALID,
+                    "errors": threat["errors"],
+                },
+                indent=1,
+            )
+        )
+        return 2
     doc = generate(model, threat)
+    if note:
+        doc["warnings"].insert(0, note)
+    # Own schema problems are warnings in the artifact (validate_artifacts.py run-dir fails on them).
     problems = validate(doc)
     if problems:
         doc["warnings"].append(f"schema: {problems[:5]}")
     atomic_write_json(args.out, doc)
-    print(
-        json.dumps(
-            {
-                "ok": not problems,
-                "out": str(args.out),
-                "threat_model": doc["threat_model"]["status"],
-                "summary": doc["summary"],
-                "warnings": doc["warnings"][:10],
-            },
-            indent=1,
-        )
-    )
-    return 0 if not problems else 2
+    out = {
+        "ok": True,
+        "out": str(args.out),
+        "threat_model": doc["threat_model"]["status"],
+        "summary": doc["summary"],
+        "warnings": doc["warnings"][:10],
+    }
+    if problems:
+        out["schema"] = problems[:5]
+    print(json.dumps(out, indent=1))
+    return 0
 
 
 def cmd_meta_file(args: argparse.Namespace) -> int:
@@ -877,7 +912,6 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="Write workspace/reports/security_props.json")
     r.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    r.add_argument("--threat-model", type=Path, default=None)
     r.add_argument("--out", type=Path, default=DEFAULT_OUT)
     m = sub.add_parser("meta-file", help="The MetAcsl file of one function's WP run")
     m.add_argument("--function", required=True, help="file#name (or a bare name)")

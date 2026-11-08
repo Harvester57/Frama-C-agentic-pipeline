@@ -2166,7 +2166,9 @@ def _constrained_params(pred: str, attackers: frozenset[str], shape_names: froze
 def function_trust_records(workspace: Path | str) -> dict:
     """
     The run's function records carrying `trust` (scripts/trust.py, plan step I7): the DAG's
-    (`<workspace>/reports/callgraph_dag.json`), else the Phase 0 model's. Empty when neither has trust.
+    (`<workspace>/reports/callgraph_dag.json`, keyed by plain name, or `file#name` when the name
+    collides), else the Phase 0 model's (keyed `file#name`). Each record has its `name` and `file`, so
+    same-named functions keep their own trust. Empty when neither has trust.
     """
     import json
 
@@ -2186,11 +2188,15 @@ def is_trust_boundary(records: dict, function: str, file: str | None = None) -> 
     """
     Whether attacker data reaches `function`'s parameters directly (its trust is `untrusted` with
     `boundary`): then its `requires` may state memory shape only (`entry_requires_violations`).
-    None when the run has no trust for it.
+    With `file`, the record of `function` in that file decides, so a same-named static elsewhere
+    keeps its own trust; a file no record names falls back to every same-named record (untrusted
+    wins). None when the run has no trust for it.
     """
     from trust import function_trust
 
-    trust = function_trust(records, function, file)
+    trust = function_trust(records, function, file) if file else None
+    if trust is None:
+        trust = function_trust(records, function)
     if trust is None:
         return None
     return trust.get("value") == "untrusted" and bool(trust.get("boundary"))

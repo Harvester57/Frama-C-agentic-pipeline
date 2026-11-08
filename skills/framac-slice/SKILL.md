@@ -152,7 +152,9 @@ python3 /opt/framac-pipeline/scripts/trust.py check-threat-model [PATH]
 - Exit 1: no file or no block. Every unit records `no_threat_model`. Report it to the user: the default rules then decide alone, and Step 3 generates only Layer 3.
 - Exit 2: invalid. Fix the listed errors.
 
-After changing the threat model, run `trust.py run`, then rebuild the DAG (Step 2) and the security properties (Step 3).
+The model looks for the threat model once, in the order above (`phase0_model.py run --threat-model PATH` names another file), and records its path and sha256 under `trust.threat_model`. `trust.py run` and `security_props.py run` read that recorded file and never search again, so trust and the security properties always come from the same threat model. They stop when the file changed, went missing, or appeared since the model was built. After changing the threat model, re-run the model (or `trust.py run --threat-model PATH`, which annotates the model with that file and records it), then rebuild the DAG (Step 2) and the security properties (Step 3).
+
+Each function's trust belongs to its `file#name`: two same-named statics keep their own trust in the model, the DAG and the contract trust-boundary check of a merge.
 
 **CodeQL (optional, off by default).** CodeQL may add untrusted marks (`codeql`); it never removes one. It runs only when the user declares the target open source, because CodeQL's licence covers open-source code only. Ask the user; never assume it. Then:
 
@@ -265,13 +267,17 @@ Then, once per run (not per module), generate the Layer 3–6 properties from th
 python3 /opt/framac-pipeline/scripts/security_props.py run
 ```
 
-It reads `workspace/reports/phase0_model.json` and the threat model (Step 1d's lookup) and writes `workspace/reports/security_props.json` for the whole run:
+It reads `workspace/reports/phase0_model.json` and the threat model the model recorded (Step 1d; a model without a trust annotation uses Step 1d's search order, with a warning), and writes `workspace/reports/security_props.json` for the whole run:
 - **L3:** an `l3_frame` unit for every function that writes through a pointer;
 - **L4:** auth gates become MetAcsl `\writing` and `\precond` properties (`l4_auth_state`, `l4_auth_required`);
 - **L5:** output sinks become sanitization properties (`l5_sanitized`);
 - **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`).
 
-Each property is rendered from `templates/metacsl/` and lists the functions where its generated annotations land; those are the ledger units. Nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. `ledger.py seed` (Step 5) reads the file when it exists; the Makefile's `seed` target runs `security-props` first. See [security-properties.md](../../docs/security-properties.md).
+Each property is rendered from `templates/metacsl/` and lists the functions where its generated annotations land; those are the ledger units. Nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. It writes nothing and stops the run when:
+- the model recorded an invalid threat model: exit 2 with the errors. Fix it, then re-run the model;
+- the recorded threat model changed, went missing or appeared since the model was built: exit 1. Re-run the model as Step 1d says.
+
+Schema problems in its own output are recorded as a `schema:` warning in the file. `ledger.py seed` (Step 5) reads the file when it exists; the Makefile's `seed` target runs `security-props` first. See [security-properties.md](../../docs/security-properties.md).
 
 ---
 
