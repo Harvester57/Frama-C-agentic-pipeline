@@ -377,7 +377,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I7 | M | done |
 | I8 | M | done |
 | I9 | L | done |
-| I10 | M | in progress: lexer removed, docs updated, baseline phase0-i10; left: monolith retirement, merge to main |
+| I10 | M | done except the merge to main (waits for the user): lexer removed, docs updated, monolith retired, baseline phase0-i10 |
 
 ## Step notes
 
@@ -414,7 +414,7 @@ I0 ─┬─▶ I1 ────────────────────�
   - CryptoLib's 13 `get_*_interface` getters go from 3 to 1A;
   - `main(int, char **)` goes from 1B to 1A, with the same run flags.
 - **Left:**
-  - retire the monolithic image (the Docker-backed tests still use `framac-pipeline:latest`);
+  - ~~retire the monolithic image~~: done in I10c;
   - decide whether to keep or remove `poc/phase0/`;
   - the single merge into `main`, which waits for the user;
   - the manifest's `compile_commands` field and CryptoLib's `compile_commands` asset are now unused, and were kept so the harness digests don't change.

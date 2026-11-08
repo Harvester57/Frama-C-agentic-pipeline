@@ -206,3 +206,22 @@ Both run from the I7 branch, in their own worktrees:
 - **The single merge of `phase0-redesign` into `main`.** Everything is local; nothing is pushed.
 - **Keep or remove `poc/phase0/`.**
 - **The manifest's unused `compile_commands` asset.** I kept it so the harness digests don't change.
+
+## Report 7 (final)
+
+- **Monolithic image retired (I10c), merged:**
+  - The Dockerfile's last stage is now `framac-analysis`.
+  - `-Image` only renames the analysis or build image.
+  - The Docker tests run on the build image (fixture `make`, capture) or the analysis image (everything else).
+  - The analysis image needed nothing added: every tool the pipeline uses is in it, with the same clang and gcc as the build image.
+  - Docker-backed suite: 2104 passed, 41 skipped, 0 failed, the same as on the monolith. A wrapper smoke run on s01 found its bug.
+- **CI:** `.github/workflows/ci.yml` built the monolith while the wrapper looked for `framac-analysis:latest`. It now builds the analysis stage.
+- **`phase0-redesign` now has every step I0–I10 except the merge into `main`.** pytest: 2045 passed, ruff clean, mypy only the Nov 7 error.
+
+### Decisions waiting for you
+
+1. **Merge `phase0-redesign` into `main`** (local only, nothing pushed).
+2. **Delete the unused local image tags:** `framac-pipeline:latest`, `framac-pipeline:CryptoLib`, `framac-pipeline:pre-gcrypt-20261107` and `framac-pipeline:fc34-20261105`.
+3. **Keep or remove `poc/phase0/`.**
+4. **The tier changes from real types:** CryptoLib getters go from Tier 3 to 1A, and `main(int, char **)` from 1B to 1A.
+5. **Clean up the step worktrees:** `frama-c-i4` … `frama-c-i10c`. Their branches are all merged.
