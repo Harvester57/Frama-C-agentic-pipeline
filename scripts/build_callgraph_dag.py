@@ -2161,7 +2161,9 @@ def build_dag(
     if model is None:
         return dag
     held = model_view(dag, model, target_dir, header_macros, compile_flags_by_file, threat_model_text)
-    return unit_view(held, model) if units else held
+    root = target_dir.as_posix()
+    root = root[len("/framac-run/") :] if root.startswith("/framac-run/") else root
+    return unit_view(held, model, root=root) if units else held
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -2519,14 +2521,24 @@ _DIR_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter")
 _FORCE_INCLUDE_FLAGS = ("-include", "-imacros")
 
 
-def unit_cppflags(unit_flags: list[str], lexer_flags: list[str]) -> tuple[list[str], list[str]]:
+def unit_cppflags(unit_flags: list[str], lexer_flags: list[str], root: str = "") -> tuple[list[str], list[str]]:
     """
     A unit's compile flags, one token each, and its force-included files (`-include f` / `-imacros f`,
     which take two tokens and so are kept apart). Flags are the build's own (`-I inc` joined to `-Iinc`;
     `-isystem`/`-iquote`/`-idirafter` directories as `-I`), plus the include directories the lexer found
     in the unit's lexer modules. The lexer's macro definitions are left out: they come from scanning
     Makefiles and can contradict the build (both `-DFAST` and `-DLEGACY` from two branches of a Makefile).
+    The model's paths are relative to the project root; with `root` (the DAG's target directory as the
+    lexer writes it, e.g. `workspace/work`) relative directories and files are made relative to the run
+    directory, like the lexer's.
     """
+
+    def rooted(path: str) -> str:
+        if not root or path.startswith("/") or path.startswith(root.rstrip("/") + "/"):
+            return path
+        path = path[2:] if path.startswith("./") else path
+        return root.rstrip("/") if path in ("", ".") else f"{root.rstrip('/')}/{path}"
+
     out: list[str] = []
     forced: list[str] = []
     tokens = [str(t) for t in unit_flags]
@@ -2535,16 +2547,20 @@ def unit_cppflags(unit_flags: list[str], lexer_flags: list[str]) -> tuple[list[s
         tok = tokens[i]
         nxt = tokens[i + 1] if i + 1 < len(tokens) else None
         if tok in _FORCE_INCLUDE_FLAGS and nxt is not None:
-            forced.append(nxt)
+            forced.append(rooted(nxt))
             i += 2
             continue
-        if tok in (*_DIR_FLAGS, "-D", "-U") and nxt is not None:
-            tok = ("-I" if tok in _DIR_FLAGS else tok) + nxt
+        if tok in _DIR_FLAGS and nxt is not None:
+            tok = "-I" + rooted(nxt)
+            i += 1
+        elif tok in ("-D", "-U") and nxt is not None:
+            tok += nxt
             i += 1
         else:
-            for opt in _DIR_FLAGS[1:]:
+            for opt in _DIR_FLAGS:
                 if tok.startswith(opt) and len(tok) > len(opt):
-                    tok = "-I" + tok[len(opt) :]
+                    tok = "-I" + rooted(tok[len(opt) :])
+                    break
         if tok not in out:
             out.append(tok)
         i += 1
@@ -2552,7 +2568,7 @@ def unit_cppflags(unit_flags: list[str], lexer_flags: list[str]) -> tuple[list[s
     return out, list(dict.fromkeys(forced))
 
 
-def unit_view(dag: dict, model: dict) -> dict:
+def unit_view(dag: dict, model: dict, root: str = "") -> dict:
     """
     The model-based DAG (`model_view`) with the build's link units as its modules (step I5b):
 
@@ -2635,6 +2651,7 @@ def unit_view(dag: dict, model: dict) -> dict:
         flags, forced = unit_cppflags(
             list(rec.get("cppflags") or []),
             [f for m in tier_src for f in m.get("cppflags") or [] if isinstance(f, str)],
+            root,
         )
         modules[name] = {
             "module": name,

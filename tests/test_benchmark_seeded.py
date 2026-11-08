@@ -48,6 +48,8 @@ def test_harness_cppflags_moves_paths_under_the_overlay():
     )
     assert bs.harness_cppflags("-I ./src -I") == "-Iworkspace/work/src"  # a dangling option is dropped
     assert bs.harness_cppflags([]) == "-I."
+    # DAG flags already relative to the run directory stay as they are.
+    assert bs.harness_cppflags(["-Iworkspace/work/lib", "-Iworkspace/work"]) == "-Iworkspace/work/lib -Iworkspace/work"
 
 
 @pytest.mark.unit

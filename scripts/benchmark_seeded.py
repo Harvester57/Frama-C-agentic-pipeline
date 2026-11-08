@@ -128,7 +128,8 @@ def harness_cppflags(flags: list[str] | str) -> str:
                 i += 1
             else:
                 val = tok[len(opt) :]
-            path = val if val.startswith("/") else f"{WORK}/{val.removeprefix('./')}".rstrip("/")
+            already = val.startswith("/") or val == WORK or val.startswith(f"{WORK}/")
+            path = val if already else f"{WORK}/{val.removeprefix('./')}".rstrip("/")
             item = shlex.quote(f"-I{path}") if opt == "-I" else f"{opt} {shlex.quote(path)}"
         else:
             item = shlex.quote(tok)
