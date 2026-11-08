@@ -367,10 +367,12 @@ def test_header_inline_functions_belong_to_every_unit_compiling_them():
 
 
 @pytest.mark.unit
-def test_a_c_file_included_by_another_source_is_marked():
+def test_a_function_of_a_c_file_included_by_another_source_is_kept_without_the_dropped_included_flag():
+    # R4/D9: nothing read `included`, so the model no longer records it.
     b = _builder({"libu.a": {"kind": "static_lib", "files": ["src/unity.c"], "links": []}})
     b.add_dump(["libu.a"], {"functions": [_fn("impl", "impl", "src/impl.c", 1)]})
-    assert b.functions["src/impl.c#impl"]["included"] is True
+    assert b.functions["src/impl.c#impl"]["units"] == ["libu.a"]
+    assert "included" not in b.functions["src/impl.c#impl"]
 
 
 @pytest.mark.unit

@@ -7,7 +7,7 @@ Stdlib only.
     phase0_model.py run [--capture workspace/reports/build_capture.json]
                         [--out workspace/reports/phase0_model.json] [--jobs N] [--no-broker]
                         [--alias | --no-alias]
-                        [--threat-model PATH]
+                        [--threat-model PATH] [--state state]
     phase0_model.py selftest
 
 `run` reads the build capture (scripts/build_capture.py), the scratch tree it names and the run's
@@ -24,7 +24,8 @@ snapshot (scripts/target_env.py), so it runs in a container started with the wra
      after Frama-C's own libc), the generated headers from the build tree, so no target package is
      needed where the parse runs;
   4. a job Frama-C cannot parse falls back to GCC `-fcallgraph-info` on its compile commands: functions
-     and direct edges, with indirect call sites left unresolved, flagged with Frama-C's first error;
+     and direct edges, with indirect call sites left unresolved, flagged with Frama-C's first error.
+     The paths GCC prints resolve against the compile's directory, then the tree (as in step 6);
   5. model-wide resolution, as the linker sees it:
      - a call to a function the unit does not define resolves to a global of the same name in a unit
        it links, else in a unit that links it, else it is an external (kept per caller under
@@ -58,7 +59,13 @@ Every function, edge and alias carries its source. The output is workspace/repor
 (schemas/phase0_model.schema.json). A failure is a status in the model, never a crash: the command exits
 0 when the model was written, 1 when no model could be built (missing capture, dump module error), and
 4 when Frama-C parsed none of the units (status `no_unit_parsed`: the model is written for its errors,
-and Phase 0 stops there).
+and Phase 0 stops there). Like the build capture's `needs_build_recipe`, `no_unit_parsed` is recorded in
+the checkpoint (`--state`, scripts/checkpoint.py) with each unit's first error, so a resumed run shows
+them and restarts at the model; a model that parses clears it.
+
+Version 2 of the model (`schema_version`) records `external_calls`, `kernel_names`, `formals`, `writes`
+and `param_sizes` on its functions. Consumers ask `model_features(model)` which of these a model has,
+so a version 1 model is recognized the same way everywhere.
 
 `selftest` compiles the dump module and checks it on a two-file program (a static collision, a
 callback, an indirect call); the image build runs it, so a kernel upgrade that breaks the dump fails
@@ -91,7 +98,10 @@ import target_env  # noqa: E402
 from framac_common import atomic_write_json, augment_framac_cppflags, load_json_optional, utc_now  # noqa: E402
 from kernel_ast import compile_dump_module  # noqa: E402
 
-SCHEMA_VERSION = 1
+# 2: every function record carries `external_calls`, `kernel_names` and `param_sizes` when callers pass
+# sizes, and the parsed ones `formals` and `writes` (dump schema 3). Version 1 models may lack any of
+# them: read them through `model_features`.
+SCHEMA_VERSION = 2
 DUMP_SOURCE = Path(__file__).resolve().parent / "phase0_dump.ml"
 DUMP_OUT_ENV = "FRAMAC_P0_DUMP_OUT"
 DEFAULT_CAPTURE = "workspace/reports/build_capture.json"
@@ -102,6 +112,7 @@ GCC_TIMEOUT_S = 300
 ERROR_CHARS = 400
 # Exit code when Frama-C parsed no unit (build_capture.py uses 3 for needs_build_recipe).
 NO_UNIT_PARSED_RC = 4
+STATUS_NO_UNIT_PARSED = "no_unit_parsed"
 THREAD_SPAWNERS = {"pthread_create": 2, "thrd_create": 1}
 SOURCE_FRAMAC = "frama-c-kernel"
 SOURCE_GCC = "gcc-callgraph-info"
@@ -139,19 +150,84 @@ _SELFTEST_FILES = {
 
 
 # ---------------------------------------------------------------------------------------------------
+# Versions: what a model records
+# ---------------------------------------------------------------------------------------------------
+
+# The per-function facts later steps rely on, and what a consumer loses without each.
+MODEL_FEATURES: dict[str, str] = {
+    "external_calls": "no external calls (made before step I7): no dynamic_allocation blocker, no Tier 2 by "
+    "allocation, no format/write detection, no input readers for trust",
+    "formals": "no formals (dump before schema 3): pointer constness unknown, no bounded-buffer direction, "
+    "so no Tier 1B by output buffer",
+    "writes": "no write facts (dump before schema 3): Layer 3 frames fall back to pointer parameters, Layer 4 "
+    "state writers are unknown",
+    "trust": "no trust annotation (trust.py not run or failed): every function is taken as on an untrusted "
+    "path, so only the structure decides tiers",
+    "kernel_names": "no kernel names: a kernel-renamed static (f_0) cannot be mapped back to its file#name",
+    "param_sizes": "no caller argument sizes (made before 55df295): harnesses and seeds size fixed buffers "
+    "from defaults",
+}
+
+
+def model_features(model: dict | None) -> dict[str, bool]:
+    """
+    Which of `MODEL_FEATURES` the model records, the same way for every consumer (the DAG, trust,
+    security properties). A version 2 model has them all but `trust`, which trust.py adds after the
+    build; a version 1 model is read for them: a feature is present when any function (a Frama-C-parsed
+    one for `formals` and `writes`, which the GCC fallback never has) carries it. `trust` is present when
+    the model has the `trust` block or a function its `trust`. A model with no function has none.
+    """
+    if not isinstance(model, dict):
+        return dict.fromkeys(MODEL_FEATURES, False)
+    fns = [f for f in (model.get("functions") or {}).values() if isinstance(f, dict)]
+    parsed = [f for f in fns if f.get("source") != SOURCE_GCC]
+    try:
+        version = int(model.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    current = version >= 2 and bool(fns)
+    return {
+        "external_calls": current or any("external_calls" in f for f in fns),
+        "formals": current or any("formals" in f for f in parsed),
+        "writes": current or any("writes" in f for f in parsed),
+        "trust": isinstance(model.get("trust"), dict) or any(isinstance(f.get("trust"), dict) for f in fns),
+        "kernel_names": current or any("kernel_names" in f for f in fns),
+        "param_sizes": current or any("param_sizes" in f for f in fns),
+    }
+
+
+def missing_features(model: dict | None) -> list[str]:
+    """`MODEL_FEATURES` the model lacks, in their order."""
+    have = model_features(model)
+    return [name for name in MODEL_FEATURES if not have[name]]
+
+
+# ---------------------------------------------------------------------------------------------------
 # Paths and flags
 # ---------------------------------------------------------------------------------------------------
 
 
-def tree_rel(path: str, tree: str) -> str | None:
+def tree_rel(path: str, tree: str, cwd: str | None = None) -> str | None:
     """
-    A Frama-C or gcc location path relative to the tree (absolute, or relative to the tree, where the
-    tools run), or None. Frama-C prints its own files under symbolic roots (`FRAMAC_SHARE/libc/...`).
+    A Frama-C or gcc location path relative to the tree, or None. A relative path is resolved against
+    the directory the tool ran in (`cwd`, absolute: GCC prints `-I../include` headers relative to the
+    compile's directory), then against the tree (where Frama-C runs); the first that exists inside the
+    tree wins, else the first inside it. Frama-C prints its own files under symbolic roots
+    (`FRAMAC_SHARE/libc/...`).
     """
     if not path or path.startswith(("FRAMAC_", "<")):
         return None
-    p = path if posixpath.isabs(path) else posixpath.join(tree, path)
-    return bc.tree_rel(posixpath.normpath(p), tree)
+    if posixpath.isabs(path):
+        return bc.tree_rel(posixpath.normpath(path), tree)
+    found: list[str] = []
+    for base in dict.fromkeys(b for b in (cwd, tree) if b):
+        rel = bc.tree_rel(posixpath.normpath(posixpath.join(base, path)), tree)
+        if rel is not None and rel not in found:
+            found.append(rel)
+    for rel in found:
+        if os.path.exists(posixpath.join(tree, rel)):
+            return rel
+    return found[0] if found else None
 
 
 def _body_facts(fn: dict) -> dict:
@@ -354,7 +430,8 @@ def gcc_callgraph(job: dict, tree: str, snapshot_root: str | None, log_dir: Path
             argv = bc.compile_argv(c["arguments"], posixpath.join(tree, c["source"]), f"{base}.o")
             cmd = ["gcc", *argv[1:-4], *snapshot_dirs(snapshot_root, c["system_flags"]), *argv[-4:]]
             cmd += ["-fcallgraph-info", "-dumpbase", base]
-            rc, log = run_tool(cmd, bc.absolute(c["cwd"], tree), GCC_TIMEOUT_S, runner=runner)
+            cwd = bc.absolute(c["cwd"], tree)
+            rc, log = run_tool(cmd, cwd, GCC_TIMEOUT_S, runner=runner)
             logs.append(f"$ {shlex.join(cmd)}\n{log}")
             ci = Path(f"{base}.ci")
             if rc != 0 or not ci.is_file():
@@ -365,7 +442,7 @@ def gcc_callgraph(job: dict, tree: str, snapshot_root: str | None, log_dir: Path
             ids: dict[str, str] = {}  # node title -> id, for the functions defined in this translation unit
             for title, label, file, line in _CI_NODE.findall(text):
                 labels[title] = label
-                rel = tree_rel(file, tree) if file else None
+                rel = tree_rel(file, tree, cwd) if file else None
                 if rel is not None:
                     ids[title] = f"{rel}#{label}"
                     functions[ids[title]] = {"file": rel, "name": label, "line": int(line), "static": ":" in title}
@@ -385,19 +462,21 @@ def macro_aliases(compile: dict, tree: str, snapshot_root: str | None, runner: R
     """Object-like `#define a b` (b an identifier) written in a project file, from `gcc -E -dD`."""
     argv = bc.compile_argv(compile["arguments"], posixpath.join(tree, compile["source"]), "/dev/null")
     cmd = ["gcc", *argv[1:-4], *snapshot_dirs(snapshot_root, compile["system_flags"]), "-E", "-dD", argv[-3]]
-    rc, out = run_tool(cmd, bc.absolute(compile["cwd"], tree), GCC_TIMEOUT_S, runner=runner)
+    cwd = bc.absolute(compile["cwd"], tree)
+    rc, out = run_tool(cmd, cwd, GCC_TIMEOUT_S, runner=runner)
     if rc != 0:
         return []
-    return parse_defines(out, tree)
+    return parse_defines(out, tree, cwd)
 
 
-def parse_defines(text: str, tree: str) -> list[dict]:
+def parse_defines(text: str, tree: str, cwd: str | None = None) -> list[dict]:
+    """The defines of `gcc -E -dD` output; line-marker paths resolve against `cwd`, then the tree."""
     found: list[dict] = []
     current: str | None = None
     for line in text.splitlines():
         m = _LINE_MARKER_RE.match(line)
         if m:
-            current = tree_rel(m.group("file"), tree) if not m.group("file").startswith("<") else None
+            current = tree_rel(m.group("file"), tree, cwd) if not m.group("file").startswith("<") else None
             continue
         if current is None:
             continue
@@ -595,7 +674,6 @@ class ModelBuilder:
         One parse's dump. `alias` is that parse's Alias report (scripts/phase0_alias.ml) when the
         model runs with Alias, else None: its sites match the dump's indirect calls in order.
         """
-        own_files = {u: set(self.units[u].get("files") or []) for u in units}
         alias_sites = alias_site_queues(alias)
         kmap: dict[str, str] = {}
         sig: dict[str, str] = {}
@@ -609,7 +687,6 @@ class ModelBuilder:
             sig[fn["kernel_name"]] = fn.get("signature") or ""
             first, last = int(fn.get("first_line") or loc[1]), int(fn.get("last_line") or loc[1])
             for u in units:
-                header = rel.endswith(".h")
                 self.add_function(
                     fid,
                     u,
@@ -622,8 +699,7 @@ class ModelBuilder:
                         "lines": max(1, last - first + 1),
                         "static": bool(fn.get("static")),
                         "inline": bool(fn.get("inline")),
-                        "header": header,
-                        "included": not header and rel not in own_files[u],
+                        "header": rel.endswith(".h"),
                         "signature": fn.get("signature") or "",
                         "loops": int(fn.get("loops") or 0),
                         "cyclomatic": int(fn.get("cyclomatic") or 1),
@@ -705,7 +781,6 @@ class ModelBuilder:
                         "static": info["static"],
                         "inline": False,
                         "header": info["file"].endswith(".h"),
-                        "included": False,
                         "signature": "",
                         "loops": None,
                         "cyclomatic": None,
@@ -972,7 +1047,7 @@ def build_model(
     parsed = [n for n, u in units_out.items() if u["parse"]["status"] == "ok"]
     rc, status = 0, "ok"
     if not parsed:
-        rc, status = NO_UNIT_PARSED_RC, "no_unit_parsed"
+        rc, status = NO_UNIT_PARSED_RC, STATUS_NO_UNIT_PARSED
         failed = sorted(n for n, u in units_out.items() if u["parse"]["status"] == "gcc_fallback")
         model["error"] = (
             f"Frama-C parsed none of the units ({', '.join(failed)}): see each unit's parse.error"
@@ -1082,6 +1157,33 @@ def selftest(runner: Runner | None = None) -> dict:
     return {"ok": not problems, "status": "ok" if not problems else "unexpected_dump", "reason": "; ".join(problems)}
 
 
+def unit_errors(model: dict) -> dict[str, str]:
+    """Frama-C's first error per unit on the GCC fallback."""
+    return {
+        name: str((u.get("parse") or {}).get("error") or "")
+        for name, u in sorted((model.get("units") or {}).items())
+        if (u.get("parse") or {}).get("status") == "gcc_fallback"
+    }
+
+
+def record_checkpoint(state: Path, model: dict, out: Path) -> None:
+    """
+    `no_unit_parsed` blocks the run as the build capture's `needs_build_recipe` does: the checkpoint
+    records the status with each unit's first error, `phase_done` stays, and a resume restarts at the
+    model. A model that parses clears it.
+    """
+    import checkpoint
+
+    if model.get("status") == STATUS_NO_UNIT_PARSED:
+        checkpoint.mark_blocked(
+            state,
+            STATUS_NO_UNIT_PARSED,
+            {"report": str(out), "error": model.get("error"), "units": unit_errors(model)},
+        )
+    else:
+        checkpoint.clear_blocked(state, STATUS_NO_UNIT_PARSED)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Phase 0 model: inventory and call graph from Frama-C parses")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1097,6 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Narrow indirect sites' type match with Frama-C's Alias plugin (default: %(default)s)",
     )
     r.add_argument("--threat-model", type=Path, default=None, help="THREAT_MODEL.md (default: trust.py's search order)")
+    r.add_argument("--state", default="state", help="checkpoint directory ('' to leave it alone)")
     sub.add_parser("selftest", help="Check the dump module against this kernel")
     a = p.parse_args(argv)
     if a.cmd == "selftest":
@@ -1110,6 +1213,8 @@ def main(argv: list[str] | None = None) -> int:
     if problems:
         model["warnings"].append(f"schema: {problems[:5]}")
     atomic_write_json(a.out, model)
+    if a.state and model.get("status") in ("ok", STATUS_NO_UNIT_PARSED):
+        record_checkpoint(Path(a.state), model, a.out)
     summary = {
         "status": model["status"],
         "error": model.get("error"),

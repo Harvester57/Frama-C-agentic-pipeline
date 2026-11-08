@@ -1,5 +1,5 @@
 {
-  "$comment": "Contract for workspace/reports/phase0_model.json, written by scripts/phase0_model.py run (plan step I3). Function ids are `file#name`, the file relative to the target root. Every function, edge and alias carries its source.",
+  "$comment": "Contract for workspace/reports/phase0_model.json, written by scripts/phase0_model.py run (plan step I3). Function ids are `file#name`, the file relative to the target root. Every function, edge and alias carries its source. Version 2 records external_calls, kernel_names, formals, writes and param_sizes on its functions; version 1 models stay valid and consumers read which facts they have with phase0_model.model_features. Fields (remediation R4, D9: kept when the report, the benchmark or a skill step shows them): thread_entries and parse_jobs are kept (the benchmark counts thread entries and sums parse seconds); alias is kept (the report summarizes an --alias run); a function's `included` (a .c file another source includes) is dropped: nothing read it.",
   "type": "object",
   "definitions": {
     "formals": {
@@ -40,7 +40,7 @@
     }
   },
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "generated_at": {"type": "string", "minLength": 1},
     "status": {"type": "string", "enum": ["ok", "error", "no_unit_parsed"]},
     "error": {"type": "string"},
@@ -100,7 +100,6 @@
           "static": {"type": "boolean"},
           "inline": {"type": "boolean"},
           "header": {"$comment": "defined in a project header: belongs to every unit compiling it", "type": "boolean"},
-          "included": {"$comment": "defined in a .c file another source includes", "type": "boolean"},
           "signature": {"type": "string"},
           "loops": {"type": ["integer", "null"], "minimum": 0},
           "cyclomatic": {"type": ["integer", "null"], "minimum": 1},

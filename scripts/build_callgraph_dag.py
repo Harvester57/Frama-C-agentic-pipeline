@@ -23,6 +23,18 @@ Writes the call-graph DAG (workspace/reports/callgraph_dag.json) from the Phase 
 
 Without a successful model there is no DAG: Phase 0 stops, and the parent agent asks for a build
 recipe (`needs_build_recipe`, docs/phase0-implementation-plan.md).
+
+**Versions.** The DAG records `schema_version` (DAG_SCHEMA_VERSION), stamped by `block_fallback_units`:
+a DAG without it predates the GCC-fallback blocking (defect 6), and its fallback units may still run
+Eva and WP. A model that lacks one of the facts above (a version 1 model: `phase0_model.model_features`)
+gives one DAG warning per missing fact, saying what the DAG cannot derive without it (the
+`dynamic_allocation` blocker and Tier 2, format/write detection, buffer direction, trust).
+
+**Fields kept and dropped** (docs/phase0-remediation-plan.md R4, D9: a field stays when the report, the
+benchmark or a skill step reads it). Kept: per function `indirect_callees` (the slice skill's review of
+function-pointer sites); per module `cross_module_callees` (Step 3 of the slice skill) and `entry_trust`
+(Step 1d). Dropped: per module `provable_functions` and `shell_unverifiable_functions`, which nothing
+read; each function's `verifiability` says the same.
 """
 
 from __future__ import annotations
@@ -78,6 +90,9 @@ HARNESS_ENTRYPOINT_NAMES = frozenset(
 VA_PARAMS = "__va_params"
 
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
+# 1: GCC-fallback units blocked from Eva and WP (defect 6, `block_fallback_units`). A DAG without
+# `schema_version` predates it.
+DAG_SCHEMA_VERSION = 1
 CAPTURE_NAME = "build_capture.json"
 
 # phase0_model.py's fact sources -> the ledger's callgraph_source values.
@@ -622,10 +637,6 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
             "cppflags": flags,
             "function_count": len(fns),
             "functions": fns,
-            "provable_functions": [k for k in fns if functions[k]["verifiability"] != "shell_unverifiable_wp"],
-            "shell_unverifiable_functions": [
-                k for k in fns if functions[k]["verifiability"] == "shell_unverifiable_wp"
-            ],
             "candidate_entry_points": [k for k in roots if not functions[k]["is_static"]] or roots or fns[:1],
         }
     return modules
@@ -644,6 +655,15 @@ def model_api(model: dict) -> list[str]:
         for e in u.get("embedded_api") or []
     ]
     return sorted({*(model.get("entry_points") or []), *embedded})
+
+
+def missing_model_features(model: dict) -> dict[str, str]:
+    """The facts a model lacks (`phase0_model.model_features`), each with what the DAG loses without it."""
+    from phase0_model import MODEL_FEATURES, missing_features
+
+    if not model.get("functions"):
+        return {}
+    return {name: MODEL_FEATURES[name] for name in missing_features(model)}
 
 
 def model_view(model: dict, capture: dict | None = None, root: str = "", sources: SourceLines | None = None) -> dict:
@@ -800,6 +820,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
     by_name: dict[str, list[str]] = defaultdict(list)
     for m in model_fns.values():
         by_name[m["name"]].append(m["file"])
+    missing = missing_model_features(model)
     return {
         "callgraph_source": "frama_c",
         "total_c_files": len({r["file"] for r in functions.values() if r["file"].endswith(".c")}),
@@ -808,8 +829,14 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
         "name_collisions": [{"function": n, "files": sorted(f)} for n, f in sorted(by_name.items()) if len(f) > 1],
         "macro_aliases": {a: k for a, k in alias_keys.items() if k},
         "warnings": [
-            f"unit {u}: Frama-C could not parse it, its call graph comes from GCC (-fcallgraph-info): {err}"
-            for u, err in sorted(fallback_error.items())
+            *(
+                f"model (schema_version {model.get('schema_version', 1)}): {why}; re-run phase0_model.py"
+                for why in missing.values()
+            ),
+            *(
+                f"unit {u}: Frama-C could not parse it, its call graph comes from GCC (-fcallgraph-info): {err}"
+                for u, err in sorted(fallback_error.items())
+            ),
         ],
         "modules": _path_module_records(functions, file_module, flags_of),
         "waves": [{"wave": i, "count": len(w), "functions": w} for i, w in enumerate(waves)],
@@ -817,8 +844,10 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
         "functions": functions,
         "model": {
             "generated_at": model.get("generated_at"),
+            "schema_version": model.get("schema_version", 1),
             "functions": len(model_fns),
             "gcc_fallback_units": sorted(fallback_error),
+            "missing_features": list(missing),
         },
         **({"trust": model["trust"]} if isinstance(model.get("trust"), dict) else {}),
     }
@@ -842,8 +871,10 @@ def block_fallback_units(dag: dict) -> dict:
     A link unit on the GCC fallback (Frama-C could not parse it): fuzzing runs with the sanitizers,
     since E-ACSL needs the Frama-C parse, and Eva and WP are blocked. Its record, its path modules'
     and its clusters' (the records its harnesses run under) get `run_eva` and `run_wp_full` false and
-    `fuzz_engine: sanitizers`. Its functions carry the reason in `eva_wp_blocked`.
+    `fuzz_engine: sanitizers`. Its functions carry the reason in `eva_wp_blocked`. Stamps the DAG's
+    `schema_version`, so a consumer can tell a DAG that went through this from one that predates it.
     """
+    dag["schema_version"] = DAG_SCHEMA_VERSION
     modules: dict[str, dict] = dag.get("modules") or {}
     fallback = {name: str(rec["callgraph_fallback"]) for name, rec in modules.items() if rec.get("callgraph_fallback")}
     if not fallback:
@@ -971,10 +1002,6 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "force_includes": forced,
             "function_count": len(fns),
             "functions": fns,
-            "provable_functions": [k for k in fns if functions[k].get("verifiability") != "shell_unverifiable_wp"],
-            "shell_unverifiable_functions": [
-                k for k in fns if functions[k].get("verifiability") == "shell_unverifiable_wp"
-            ],
             "candidate_entry_points": entries or [k for k in fns if not functions[k].get("is_static")],
             "lexer_modules": sorted({functions[k]["lexer_module"] for k in fns if functions[k].get("lexer_module")}),
             # Step I7: the threat model's status for the unit, and each entry point's trust.

@@ -44,10 +44,9 @@ CLASSES = [
     "l5_sanitized",
     "l6_wiped",
     "l6_no_leak",
-    "l4_auth",
-    "l5_output",
-    "l6_secret",
 ]
+# The ledger's prefix for a unit deferred because its link unit is on the GCC fallback (ledger.py).
+CALLGRAPH_FALLBACK = "callgraph_fallback"
 
 
 def md_escape(text: str) -> str:
@@ -316,6 +315,58 @@ def trust_lines(model: dict | None) -> list[str]:
     return out
 
 
+def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
+    """
+    Link units Frama-C could not parse (decision D2): their call graph comes from GCC, they are fuzzed
+    with the sanitizers, and their Eva and WP units are deferred (`callgraph_fallback: ...` in the
+    ledger). One row per unit: Frama-C's first error and what was deferred. With `--alias`, the model's
+    Alias narrowing is summarized after it. Empty when no unit fell back and Alias was off.
+    """
+    if not isinstance(model, dict):
+        return []
+    units = model.get("units") or {}
+    functions = model.get("functions") or {}
+    fallback = {
+        name: str((u.get("parse") or {}).get("error") or "no error recorded")
+        for name, u in sorted(units.items())
+        if isinstance(u, dict) and (u.get("parse") or {}).get("status") == "gcc_fallback"
+    }
+    raw_alias = model.get("alias")
+    alias: dict = raw_alias if isinstance(raw_alias, dict) else {}
+    if not fallback and not alias.get("enabled"):
+        return []
+    out = ["### Phase 0 parse", ""]
+    if fallback:
+        deferred: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for u in ledger:
+            if u.get("status") == "deferred" and str((u.get("unresolved") or [""])[0]).startswith(CALLGRAPH_FALLBACK):
+                deferred[(str(u.get("file")), str(u.get("function")))].append(u)
+        out += [
+            "Link units Frama-C could not parse: their call graph comes from GCC (`-fcallgraph-info`), they are "
+            "fuzzed with the sanitizers, and their Eva and WP work is deferred.",
+            "",
+            "| Unit | First Frama-C error | Functions | Deferred units |",
+            "| :--- | :--- | ---: | :--- |",
+        ]
+        for name, error in fallback.items():
+            fns = {
+                (str(f.get("file")), str(f.get("name"))) for f in functions.values() if name in (f.get("units") or [])
+            }
+            classes = Counter(str(u.get("obligation_class")) for key in fns for u in deferred.get(key, []))
+            shown = ", ".join(f"{n} `{c}`" for c, n in sorted(classes.items())) or "none"
+            out.append(f"| `{md_escape(name)}` | {md_escape(error)[:240]} | {len(fns)} | {shown} |")
+        out.append("")
+    if alias.get("enabled"):
+        sites = alias.get("sites") or {}
+        text = ", ".join(f"{n} {k}" for k, n in sorted(sites.items())) or "no indirect site"
+        out += [
+            f"- **Alias narrowing** (`--alias`): module `{alias.get('module')}`; indirect sites by reason: {text}; "
+            f"{alias.get('dropped_candidates', 0)} type-match candidate(s) dropped.",
+            "",
+        ]
+    return out
+
+
 def concurrency_lines(ledger: list[dict]) -> list[str]:
     """
     One sentence per link unit that starts threads (`bookkeeping.concurrent`, set by `ledger.py
@@ -439,6 +490,7 @@ def render_report(data: dict) -> str:
         out.append(f"**{len(work['open_units'])} coverage unit(s) are still planned or in progress.**")
         out.append("")
     out += trust_lines(data.get("model"))
+    out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]
     sev = Counter(r["severity"] for r in confirmed)

@@ -4,9 +4,12 @@ Atomic JSON state and wave/shard checkpointing for Frama-C agentic skills.
 Stores state in <state-dir>/progress.json and phase/wave payload files.
 
 `status` is running | complete, or a blocking status a step records when the run must stop and wait
-for the user: `needs_build_recipe` (written by build_capture.py when the target does not build, with
-the report path and first error under `blocked`). `phase_done` is not advanced by a blocked step, so a
-resumed run starts again at that step; the step clears the status when it succeeds.
+for the user, with the details under `blocked`:
+  - `needs_build_recipe`: build_capture.py, when the target does not build (report path, first error);
+  - `no_unit_parsed`: phase0_model.py, when Frama-C parses none of the units (report path, and each
+    unit's first Frama-C error under `units`).
+`blocked.resume_at` names the step a resumed run restarts at. `phase_done` is not advanced by a blocked
+step, so a resumed run starts again at that step; the step clears the status when it succeeds.
 """
 
 from __future__ import annotations
@@ -54,6 +57,22 @@ def cmd_load(state_dir: Path) -> None:
         return
     data = load_json(progress_path)
     print(json.dumps(data))
+    for line in blocked_lines(data):
+        print(line, file=sys.stderr)
+
+
+def blocked_lines(progress: dict) -> list[str]:
+    """What a resume shows for a blocked run: the status, the step it restarts at, each unit's error."""
+    blocked = progress.get("blocked") if isinstance(progress.get("blocked"), dict) else None
+    if not blocked or progress.get("status") != blocked.get("status"):
+        return []
+    lines = [f"blocked: {blocked.get('status')}; a resumed run restarts at {blocked.get('resume_at') or 'that step'}"]
+    for key in ("error", "first_error"):
+        if blocked.get(key):
+            lines.append(f"  {blocked[key]}")
+    for unit, err in sorted((blocked.get("units") or {}).items()):
+        lines.append(f"  {unit}: {err}")
+    return lines
 
 
 def cmd_save_phase(state_dir: Path, phase: int, from_file: Path | None) -> None:
@@ -113,16 +132,25 @@ def _new_progress(target_dir: str = "/target", mode: str = "verify") -> dict:
     }
 
 
+# Blocking statuses -> the step (and its command) a resumed run restarts at.
+BLOCKING_STEPS = {
+    "needs_build_recipe": "build_capture.py run",
+    "no_unit_parsed": "phase0_model.py run",
+}
+
+
 def mark_blocked(state_dir: Path, status: str, detail: dict) -> dict:
     """
-    Record that the run stopped and waits for the user (e.g. `needs_build_recipe` from the build capture).
-    `phase_done` is unchanged, so a resumed run starts again at the step that stopped.
+    Record that the run stopped and waits for the user (`needs_build_recipe` from the build capture,
+    `no_unit_parsed` from the model). `phase_done` is unchanged, so a resumed run starts again at the
+    step that stopped (`blocked.resume_at`).
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     progress_path = state_dir / "progress.json"
     progress = load_json(progress_path) or _new_progress()
     progress["status"] = status
-    progress["blocked"] = {"status": status, **detail, "at": utc_now()}
+    resume = {"resume_at": BLOCKING_STEPS[status]} if status in BLOCKING_STEPS else {}
+    progress["blocked"] = {"status": status, **resume, **detail, "at": utc_now()}
     progress["updated_at"] = utc_now()
     atomic_write_json(progress_path, progress)
     return progress
