@@ -82,6 +82,9 @@ def test_signature_facts_with_formals() -> None:
     )
     assert other["mutable_ptr_params"] == 2 and not other["writes_bounded_buffer"]
     assert other["params"] == ["struct s *", "long (*)[16]", "int (*)(int)"]
+    # A pointer to pointers (an advanced cursor) is not a byte buffer either.
+    cursor = bcd.signature_facts({"signature": "void(char **,unsigned long)", "formals": _formals("pointer", "value")})
+    assert cursor["mutable_ptr_params"] == 1 and not cursor["writes_bounded_buffer"]
     getter = bcd.signature_facts({"signature": "struct iface *(void)", "formals": []})
     assert getter["returns_pointer"] and getter["params"] == []
 

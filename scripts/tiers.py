@@ -14,11 +14,10 @@ structure, and a module takes the most demanding tier among its functions:
     indirect edges). The library API is untrusted by default (I7), so a library's internal helpers
     are on an untrusted path through the API that calls them;
   - **Tier 3** (deferred under the quick profile): no untrusted path; or scalar glue on one: no loop,
-    no pointer parameter, no pointer return unless without parameters (an interface getter returning
-    its table), no indirect call, no allocation or recursion, not variadic, at most one decision
-    (cyclomatic complexity <= SCALAR_MAX_CYCLOMATIC), and either off the trust boundary or without
-    parameters (an exported getter or init function: attacker data reaches a boundary function only
-    through its parameters);
+    no pointer parameter or pointer return, no indirect call, no allocation or recursion, not
+    variadic, at most one decision (cyclomatic complexity <= SCALAR_MAX_CYCLOMATIC), and either off
+    the trust boundary or without parameters (an exported getter or init function: attacker data
+    reaches a boundary function only through its parameters);
   - **Tier 2**: on an untrusted path, and allocates on the heap or is recursive;
   - **Tier 1B**: on an untrusted path and writes a bounded output buffer it does not read from
     (an emitter), or formats into one;
@@ -164,7 +163,7 @@ def is_scalar_helper(rec: dict) -> bool:
         not (trust.get("boundary") and has_params(rec))
         and not rec.get("has_loops")
         and _ptr_params(rec) == 0
-        and not (rec.get("returns_pointer") and has_params(rec))
+        and not rec.get("returns_pointer")
         and not rec.get("indirect_calls")
         and not rec.get("is_variadic")
         and not rec.get("has_dynamic_alloc")

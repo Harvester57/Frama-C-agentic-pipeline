@@ -301,7 +301,8 @@ def signature_facts(m: dict) -> dict:
             continue
         if "*" in arg or "[" in arg:
             pointee = " ".join(_ARRAY_RE.sub(" ", arg).replace("*", " ").split())
-            byte = pointee in _BYTE_POINTEES
+            # A byte buffer is one level of indirection to bytes: `char **` is a pointer to pointers.
+            byte = pointee in _BYTE_POINTEES and arg.count("*") + arg.count("[") == 1
             if kinds is None:
                 mutable_ptr += 1  # constness unknown (a dump before schema 3): no buffer direction
             elif kinds[i] == "const_pointer":
