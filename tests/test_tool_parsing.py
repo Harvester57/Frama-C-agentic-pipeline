@@ -335,8 +335,7 @@ def test_wp_goal_to_obligation_class():
     )
     # D8: the pre-I9 layer classes are gone; a hand-named L5/L6 clause is classed by its kind.
     assert (
-        goal_obligation_class({"kind": "postcondition", "annotation": "L6_key_wiped: buffer_is_zeroed(k, 32)"})
-        == "rte"
+        goal_obligation_class({"kind": "postcondition", "annotation": "L6_key_wiped: buffer_is_zeroed(k, 32)"}) == "rte"
     )
     assert goal_obligation_class({"kind": "loop variant", "annotation": "n - i"}) == "l2_termination"
     assert goal_obligation_class({"kind": "assigns", "annotation": "assigns out[0..n-1]"}) == "l3_frame"

@@ -58,6 +58,7 @@ from framac_common import (  # noqa: E402
     atomic_write_json,
     load_json_optional,
     load_json_strict,
+    run_lock,
     utc_now,
 )
 from generate_harness import _include_dirs_from_cppflags, _strip_c_comments  # noqa: E402
@@ -553,20 +554,33 @@ def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path, dag_path: P
     Merge the rows into the dynamic report (with each module's harness digest) and reopen the reach
     gate of every module with a gap. A module without a gap leaves the gate as the static check left it.
     """
-    prior = load_json_optional(out, {})
-    by_module = dict((prior or {}).get("modules") or {}) if isinstance(prior, dict) else {}
-    for row in report["modules"]:
-        if row.get("passed") is None:
-            continue
-        by_module[row["module"]] = {**row, "harness_digest": phase0_gates.harness_digest(run_dir, row["module"])}
-    out.parent.mkdir(parents=True, exist_ok=True)
     from validate_artifacts import schema_warning
 
-    doc: dict[str, Any] = {"generated_at": report["generated_at"], "modules": dict(sorted(by_module.items()))}
-    problem = schema_warning("harness_reach_dynamic", doc)  # R5: recorded, `validate_artifacts run-dir` fails on it
-    if problem:
-        doc["warnings"] = [problem]
-    atomic_write_json(out, doc)
+    measured = {
+        row["module"]: {**row, "harness_digest": phase0_gates.harness_digest(run_dir, row["module"])}
+        for row in report["modules"]
+        if row.get("passed") is not None
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Make runs one `dynamic --module <m>` per module in parallel: merge under the lock, or the last
+    # writer drops the rows the others stored (cryptolib r2v lost `sa`).
+    with run_lock("harness_reach_dynamic", run_dir):
+        prior = load_json_optional(out, {})
+        by_module = dict((prior or {}).get("modules") or {}) if isinstance(prior, dict) else {}
+        unmeasured = dict((prior or {}).get("unmeasured") or {}) if isinstance(prior, dict) else {}
+        for row in report["modules"]:
+            if row.get("passed") is None:
+                unmeasured[row["module"]] = str(row.get("error") or "no coverage")
+            else:
+                unmeasured.pop(row["module"], None)
+                by_module[row["module"]] = measured[row["module"]]
+        doc: dict[str, Any] = {"generated_at": report["generated_at"], "modules": dict(sorted(by_module.items()))}
+        if unmeasured:
+            doc["unmeasured"] = dict(sorted(unmeasured.items()))
+        problem = schema_warning("harness_reach_dynamic", doc)  # R5: recorded, `validate_artifacts run-dir` fails on it
+        if problem:
+            doc["warnings"] = [problem]
+        atomic_write_json(out, doc)
     failed = [r for r in report["modules"] if r.get("passed") is False]
     if failed:
         rows = [{**r, "error": "dynamic: entry points never executed by the corpus"} for r in failed]

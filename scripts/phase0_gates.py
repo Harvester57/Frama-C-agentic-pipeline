@@ -91,14 +91,10 @@ def record_reach(
     """
     run_dir = Path(run_dir)
     dag = dag_digest(run_dir, dag_path)
-    modules: dict[str, Any] = {}
-    if partial:
-        prior = load_gates(run_dir).get("reach")
-        if isinstance(prior, dict) and isinstance(prior.get("modules"), dict):
-            modules = dict(prior["modules"])
+    rows: dict[str, Any] = {}
     for row in report.get("modules") or []:
         name = str(row.get("module"))
-        modules[name] = {
+        rows[name] = {
             "passed": bool(row.get("passed")),
             "gaps": list(row.get("gaps") or []),
             "error": row.get("error"),
@@ -106,12 +102,23 @@ def record_reach(
             "harness_digest": harness_digest(run_dir, name),
             "dag_digest": dag,
         }
-    entry = {
-        "passed": all(m["passed"] for m in modules.values()),
-        "generated_at": utc_now(),
-        "modules": dict(sorted(modules.items())),
-    }
-    return _store(run_dir, "reach", entry)
+    # Read the prior rows under the lock: Make runs one partial check per module in parallel
+    # (reach-dynamic-<m>), and a read outside it loses the rows another one stores meanwhile.
+    with run_lock("phase0_gates", run_dir):
+        gates = load_gates(run_dir)
+        modules: dict[str, Any] = {}
+        if partial:
+            prior = gates.get("reach")
+            if isinstance(prior, dict) and isinstance(prior.get("modules"), dict):
+                modules = dict(prior["modules"])
+        modules.update(rows)
+        gates["reach"] = {
+            "passed": all(m["passed"] for m in modules.values()),
+            "generated_at": utc_now(),
+            "modules": dict(sorted(modules.items())),
+        }
+        atomic_write_json(run_dir / GATES_JSON, gates)
+    return gates
 
 
 def record_build_check(run_dir: Path, out: dict[str, Any]) -> dict[str, Any]:

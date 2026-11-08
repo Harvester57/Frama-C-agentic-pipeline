@@ -153,6 +153,10 @@ DEFAULT_PER_INPUT_TIMEOUT_S = 10
 GUARDRAIL_PER_INPUT_TIMEOUT_S = 30
 DEFAULT_MAX_TIME_S = 60
 MIN_FUZZ_WALL_S = 30
+# A keep-going round after a crash runs on what is left of the campaign's time, down to this floor.
+# Below MIN_FUZZ_WALL_S on purpose: a campaign sized at that minimum must still get a second round
+# when its first one crashed within a second. Fixed, never derived from the machine.
+MIN_ROUND_WALL_S = 5
 # Keep-going campaigns: a fork-mode run saves the same bug over and over, so only this many crash
 # inputs are replayed and this many listed per fingerprint. Fixed, never derived from the machine.
 MAX_REPLAYED_CRASHES = 64
@@ -1303,7 +1307,7 @@ def run_campaign_rounds(
     - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
       the next round on, so a shallow bug stops ending every run and the other cases get the rest of
       the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
-      MIN_FUZZ_WALL_S seconds are left, or a rebuild fails.
+      MIN_ROUND_WALL_S seconds are left, or a rebuild fails.
     - Any other harness runs once in fork mode with crashes ignored.
     - Without `keep_going`, one campaign that stops at the first crash, as before.
     """
@@ -1320,7 +1324,7 @@ def run_campaign_rounds(
     spent = 0.0
     last: dict = {}
     while True:
-        budget = max(MIN_FUZZ_WALL_S, int(max_time - spent))
+        budget = max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))
         started = time.monotonic()
         last = campaign(binary, budget, False)
         spent += time.monotonic() - started
@@ -1347,7 +1351,7 @@ def run_campaign_rounds(
         new = [c for c in crashed if c not in skipped and c < 64]
         if last.get("status") == "insufficient_memory" or not new:
             break
-        if max_time - spent < MIN_FUZZ_WALL_S:
+        if max_time - spent < MIN_ROUND_WALL_S:
             rnd["stopped"] = "time_budget_spent"
             break
         skipped.update(new)
@@ -3440,6 +3444,80 @@ def replay_for_coverage(
     }
 
 
+COVERAGE_TRUNCATED_MAPPING = "truncated coverage data"
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]')
+
+
+def _includes_inside_braces(text: str) -> list[tuple[str, str]]:
+    """(delimiter, header) of every `#include` written inside braces, comments and literals skipped."""
+    found: list[tuple[str, str]] = []
+    depth = 0
+    in_comment = False
+    for line in text.splitlines():
+        if not in_comment and depth > 0:
+            m = _INCLUDE_RE.match(line)
+            if m:
+                found.append((m.group(1), m.group(2)))
+                continue
+        i, n = 0, len(line)
+        while i < n:
+            if in_comment:
+                end = line.find("*/", i)
+                if end < 0:
+                    break
+                in_comment, i = False, end + 2
+                continue
+            c = line[i]
+            if line.startswith("//", i):
+                break
+            if line.startswith("/*", i):
+                in_comment, i = True, i + 2
+                continue
+            if c in "\"'":
+                i += 1
+                while i < n and line[i] != c:
+                    i += 2 if line[i] == "\\" else 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth = max(0, depth - 1)
+            i += 1
+    return found
+
+
+def in_function_includes(sources: list[str], cppflags: str = "") -> list[str]:
+    """
+    The headers the sources include inside a function body, as `-include` operands: a quoted one by
+    its path next to its source, an angle one by name. A header that does not preprocess on its own
+    with `cppflags` (one for another platform, under an #if not taken) is left out.
+    """
+    out: list[str] = []
+    probed: set[str] = set()
+    for src in sources:
+        try:
+            text = Path(src).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for delim, header in _includes_inside_braces(text):
+            name = header
+            if delim == '"' and (Path(src).parent / header).is_file():
+                name = (Path(src).parent / header).as_posix()
+            if name in probed:
+                continue
+            probed.add(name)
+            probe = subprocess.run(
+                ["clang", "-E", "-x", "c", *shlex.split(cppflags), "-include", name, "-o", os.devnull, "-"],
+                input="",
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if probe.returncode == 0:
+                out.append(name)
+    return out
+
+
 def _export_coverage(binary: Path, profile_dir: Path, scratch: Path) -> tuple[dict | None, str | None]:
     """
     Merge the raw profiles and export them as llvm-cov JSON: (export, None) or (None, error). The
@@ -3605,42 +3683,55 @@ def coverage_report(
     if not files:
         report.update(status="no_inputs", reason="the corpus has no inputs: nothing was measured")
         return report
-    comp = compile_coverage_binary(sources, out_bin, cppflags, ldflags, use_cache=use_cache)
-    report["compile"] = comp
-    if comp["returncode"] != 0:
-        report.update(status="compile_error", reason="the coverage build failed")
-        return report
-    binary = Path(comp["binary"])
-    report["binary"] = str(binary)
+    pre_included: list[str] = []
+    while True:
+        flags = " ".join([cppflags, *(f"-include {shlex.quote(h)}" for h in pre_included)])
+        comp = compile_coverage_binary(sources, out_bin, flags, ldflags, use_cache=use_cache)
+        report["compile"] = comp
+        if comp["returncode"] != 0:
+            report.update(status="compile_error", reason="the coverage build failed")
+            return report
+        binary = Path(comp["binary"])
+        report["binary"] = str(binary)
 
-    # Target code writes into this directory: start empty so that old files are never merged.
-    profile_dir = scratch / "profiles"
-    shutil.rmtree(profile_dir, ignore_errors=True)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    replay = replay_for_coverage(
-        binary,
-        files,
-        profile_dir,
-        scratch,
-        module=module,
-        per_input_timeout=per_input_timeout,
-        max_time=max_time,
-    )
-    report["seed"] = replay["seed"]
-    report["failed_inputs"] = replay["failed_inputs"]
-    report["inputs"] = {
-        "total": len(files),
-        "replayed": replay["replayed"],
-        "failed": len(replay["failed_inputs"]),
-        "not_replayed": replay["not_replayed"],
-    }
-    if not replay["replayed"]:
-        report["reason"] = "no input replayed to completion, so there is no profile"
-        return report
-    export, error = _export_coverage(binary, profile_dir, scratch)
-    if export is None:
+        # Target code writes into this directory: start empty so that old files are never merged.
+        profile_dir = scratch / "profiles"
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        replay = replay_for_coverage(
+            binary,
+            files,
+            profile_dir,
+            scratch,
+            module=module,
+            per_input_timeout=per_input_timeout,
+            max_time=max_time,
+        )
+        report["seed"] = replay["seed"]
+        report["failed_inputs"] = replay["failed_inputs"]
+        report["inputs"] = {
+            "total": len(files),
+            "replayed": replay["replayed"],
+            "failed": len(replay["failed_inputs"]),
+            "not_replayed": replay["not_replayed"],
+        }
+        if not replay["replayed"]:
+            report["reason"] = "no input replayed to completion, so there is no profile"
+            return report
+        export, error = _export_coverage(binary, profile_dir, scratch)
+        if export is not None:
+            break
         report["reason"] = error
-        return report
+        if pre_included or COVERAGE_TRUNCATED_MAPPING not in str(error):
+            return report
+        # LLVM 19 writes a coverage mapping llvm-cov cannot read when a header is included inside a
+        # function body (cryptolib: `#include <malloc.h>` in Crypto_check_buffer_size). Including those
+        # headers first makes the in-body include expand to nothing behind its include guard.
+        pre_included = in_function_includes(sources, cppflags)
+        if not pre_included:
+            return report
+        report["pre_included"] = pre_included
+    report.pop("reason", None)
     try:
         summary = summarize_coverage_export(export)
     except (KeyError, IndexError, TypeError, ValueError) as exc:

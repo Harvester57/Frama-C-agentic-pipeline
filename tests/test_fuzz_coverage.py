@@ -343,6 +343,79 @@ def test_report_surfaces_export_failures(tmp_path, monkeypatch):
     assert "boom" in report["reason"]
 
 
+def _truncated_then_ok(tmp_path, monkeypatch, pre_included: list[str]):
+    """A first export LLVM cannot read (cryptolib r2v), then a readable one; records the build flags."""
+    _corpus(tmp_path, b"a")
+    flags: list[str] = []
+
+    def compile_(sources, out_bin, cppflags="-I.", ldflags_extra="", runner=None, use_cache=True):
+        flags.append(cppflags)
+        return {"engine": "coverage", "returncode": 0, "binary": str(tmp_path / "cov_m"), "cache": {"hit": False}}
+
+    good = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
+    results = iter([(None, f"llvm-cov export failed (1): error: {R.COVERAGE_TRUNCATED_MAPPING}"), (good, None)])
+    monkeypatch.setattr(R, "compile_coverage_binary", compile_)
+    monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
+    monkeypatch.setattr(R, "_export_coverage", lambda *a: next(results))
+    monkeypatch.setattr(R, "in_function_includes", lambda sources, cppflags="": pre_included)
+    return _report(tmp_path, cppflags="-Iinc"), flags
+
+
+def test_report_rebuilds_with_in_function_headers_included_first_when_llvm_cov_cannot_read_the_mapping(
+    tmp_path, monkeypatch
+):
+    report, flags = _truncated_then_ok(tmp_path, monkeypatch, ["malloc.h"])
+    assert flags == ["-Iinc", "-Iinc -include malloc.h"]
+    assert report["status"] == "ok" and report["pre_included"] == ["malloc.h"]
+    assert "reason" not in report
+
+
+def test_report_keeps_the_export_error_when_no_header_is_included_inside_a_function(tmp_path, monkeypatch):
+    report, flags = _truncated_then_ok(tmp_path, monkeypatch, [])
+    assert flags == ["-Iinc"]
+    assert report["status"] == "coverage_error" and R.COVERAGE_TRUNCATED_MAPPING in report["reason"]
+
+
+def test_includes_inside_braces_skip_file_scope_comments_and_literals():
+    text = "\n".join(
+        [
+            '#include "crypto.h"',
+            "/* { */ int x = '{'; const char *s = \"{\";",
+            "int f(void) {",
+            "#if defined(__linux__)",
+            "#include <malloc.h>",
+            "#elif defined(__APPLE__)",
+            "  #  include <malloc/malloc.h>",
+            "#endif",
+            '#include "local.h"',
+            "  return 0; // }",
+            "}",
+            "#include <string.h>",
+        ]
+    )
+    assert R._includes_inside_braces(text) == [("<", "malloc.h"), ("<", "malloc/malloc.h"), ('"', "local.h")]
+
+
+def test_in_function_includes_keeps_only_headers_that_preprocess(tmp_path, monkeypatch):
+    src = tmp_path / "crypto.c"
+    src.write_text(
+        'int f(void) {\n#include <malloc.h>\n#include <malloc/malloc.h>\n#include "local.h"\nreturn 0; }\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "local.h").write_text("", encoding="utf-8")
+    probed: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        probed.append(cmd)
+        return R.subprocess.CompletedProcess(cmd, 1 if "malloc/malloc.h" in cmd else 0, "", "")
+
+    monkeypatch.setattr(R.subprocess, "run", fake_run)
+    got = R.in_function_includes([str(src), str(src)], "-Iinc")
+    assert got == ["malloc.h", (tmp_path / "local.h").as_posix()]
+    assert all(cmd[:4] == ["clang", "-E", "-x", "c"] and "-Iinc" in cmd for cmd in probed)
+    assert len(probed) == 3  # the second copy of the source probes nothing new
+
+
 def test_report_rejects_an_export_without_target_functions(tmp_path, monkeypatch):
     harness_only = _export(_fn("h", "/r/workspace/harnesses/harness_m.c", 1, [_region(1, 2, 1)]))
     report = _measured(tmp_path, monkeypatch, b"a", export=harness_only)

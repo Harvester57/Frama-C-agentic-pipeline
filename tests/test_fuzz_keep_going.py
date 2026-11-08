@@ -134,7 +134,7 @@ def test_rounds_stop_when_every_case_is_skipped_or_a_rebuild_fails(tmp_path):
 
 
 def test_rounds_share_one_time_budget(tmp_path, monkeypatch):
-    clock = iter([0.0, 590.0])
+    clock = iter([0.0, 597.0])
     monkeypatch.setattr(R.time, "monotonic", lambda: next(clock))
 
     def campaign(binary, seconds, fork):
@@ -144,6 +144,29 @@ def test_rounds_share_one_time_budget(tmp_path, monkeypatch):
         Path("b"), 600, campaign=campaign, rebuild=lambda m: pytest.fail("no time left"), n_cases=3
     )
     assert res["keep_going"]["rounds"][-1]["stopped"] == "time_budget_spent"
+
+
+def test_a_minimum_size_campaign_that_crashes_at_once_still_gets_a_second_round(tmp_path, monkeypatch):
+    # oscs-tweetnacl (r2v): a 30 s campaign crashed after 0.2 s and stopped, so its corpus stayed empty.
+    clock = iter([0.0, 0.2, 0.2, 29.0])
+    monkeypatch.setattr(R.time, "monotonic", lambda: next(clock))
+    budgets: list[int] = []
+    plan = [[_art(tmp_path / "crash-0", b"\x00", "fp")], []]
+
+    def campaign(binary, seconds, fork):
+        budgets.append(seconds)
+        arts = plan[len(budgets) - 1]
+        return {"status": "crash_found" if arts else "clean", "returncode": 1 if arts else 0, "artifacts": arts}
+
+    res = R.run_campaign_rounds(
+        Path("b"),
+        R.MIN_FUZZ_WALL_S,
+        campaign=campaign,
+        rebuild=lambda m: (Path("b1"), {"compile": {"returncode": 0}}),
+        n_cases=3,
+    )
+    assert budgets == [R.MIN_FUZZ_WALL_S, R.MIN_FUZZ_WALL_S - 1]  # int(30 - 0.2) = 29
+    assert [r["crashed_cases"] for r in res["keep_going"]["rounds"]] == [[0], []]
 
 
 def test_non_dispatch_harness_uses_fork_mode_and_stop_on_first_crash_runs_once():
