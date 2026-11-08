@@ -5,7 +5,8 @@ Measures what a change to the pipeline's filters, Eva configuration or briefs ac
 - **Repository Root:** [`../README.md`](../README.md)
 - **Runner:** [`../scripts/benchmark.py`](../scripts/benchmark.py), comparison rules in [`../scripts/benchmark_compare.py`](../scripts/benchmark_compare.py)
 - **What it runs:** [`../benchmark/manifest.json`](../benchmark/manifest.json)
-- **Stored baseline:** [`../benchmark/baselines/default.json`](../benchmark/baselines/default.json)
+- **Stored baselines:** [`../benchmark/baselines/`](../benchmark/baselines/): `default.json`, and one per Phase 0 step that changed units (`phase0-i0`, `phase0-i5a`, `phase0-i5b`, the latest). Compare a Phase 0 change against the latest `phase0-*`.
+- **Seeded set:** [`../scripts/benchmark_seeded.py`](../scripts/benchmark_seeded.py), on the projects in [`../poc/phase0/seeded/`](../poc/phase0/seeded/)
 
 ## Usage
 
@@ -15,7 +16,15 @@ Run the deterministic part (Phases 0 to 2 plus reproducer replay, no LLM) and co
 python3 scripts/benchmark.py run --compare default
 ```
 
-The command fetches each target at its pinned revision on the host, runs it through the normal wrappers and Make targets, writes one JSON file per run, prints the differences, and exits 1 on a regression. `FRAMAC_BENCH_DIR` or `--work-dir` moves its data (default `~/framac-pipeline/benchmark`). Nothing sizes a machine here: the broker leases CPUs and memory per container, as in any run. The shared cross-run cache is off, so no result comes from an older run. On a 12-CPU machine the whole command took 44 minutes of wall-clock and an hour of CPU: 22 minutes for recall and 22 for comparison, of which `jsmn` alone took 14.
+The command fetches each target at its pinned revision on the host, runs it through the normal wrappers and Make targets, writes one JSON file per run, prints the differences, and exits 1 on a regression. Each target goes through these stages:
+
+1. `capture`: the manifest's `build` recipe under `bear` in the build image, on a scratch volume (`build_capture.py`).
+2. `model`: the Frama-C model in the analysis image (`phase0_model.py`).
+3. `seeds`: when the recipe has a `test_command`, the API calls the tests make (`seed_harvest.py record`, build image). The scratch volume is then removed.
+4. `phase0`: overlay, DAG, the manifest's harnesses, the reach gate and the ledger seed.
+5. `build` (`build-check`), `fuzz`, `eva`, `replay`, `ingest`, `gate` and `queue`.
+
+The run file records the capture, the model and the seeds under each target's `build_capture`. A capture that fails ends the target as `needs_build_recipe`; a unit on the GCC fallback is flagged, not a failure. `FRAMAC_BENCH_DIR` or `--work-dir` moves its data (default `~/framac-pipeline/benchmark`). Nothing sizes a machine here: the broker leases CPUs and memory per container, as in any run. The shared cross-run cache is off, so no result comes from an older run. On a 12-CPU machine the whole command took 44 minutes of wall-clock and an hour of CPU: 22 minutes for recall and 22 for comparison, of which `jsmn` alone took 14.
 
 Narrower runs while you iterate:
 
@@ -26,6 +35,8 @@ python3 scripts/benchmark.py run --set recall --no-fuzz --compare default
 ```bash
 python3 scripts/benchmark.py run --target minmea --target oscs-stmr --compare default
 ```
+
+`--profile quick|standard|deep` overrides the manifest's profile. Under `quick`, Tier 3 modules are deferred and their missing Eva reports are not counted as problems.
 
 Compare two run files later, or store a run as the baseline after you accept its differences. Several runs can be merged (later runs win, per target and per bug), so a slow target can be re-baselined alone. Storing refuses a run that loses a bug unless you pass `--force`.
 
@@ -55,6 +66,14 @@ Each bug replays on the engine that confirmed it. MINMEA-01 to 03 need the sanit
 
 The Spec-Skill paper's per-call-layer x509-parser results are in the manifest's `references` as context only. That tool runs WP without `-wp-rte` and counts timed-out call-site `requires` goals as proved, so its numbers mean something else than our `covered`. The comparison never reads them.
 
+**Phase 0 (seeded bugs).** Small libraries (`s01` to `s08`), each with one verified bug that Phases 1 and 2 find only when Phase 0 reports the right sources, flags and entry points, plus decoys that a wrong Phase 0 turns into false positives. `s08` needs a well-formed input, so it is found only with the seeds recorded from its tests. A fixed mechanical harness policy replaces the manifest's harnesses (one dispatch harness per link unit or split cluster, one case per callable entry point), so Phase 0 alone decides what gets fuzzed and analysed. The run passes when every bug is found and no decoy fires.
+
+```bash
+python3 scripts/benchmark.py seeded [--project s04_force_include] [--fuzz-budget 30] [--no-seeds] [--dry-run]
+```
+
+`benchmark.py seeded` passes its arguments to `benchmark_seeded.py run`. Results go to `<work-dir>/results/<run-id>.json` and `.md`; `benchmark_seeded.py score RESULTS.json` re-scores existing run directories.
+
 **Low-cost briefs.** A fixed sample of 30 small assert programs to A/B prover briefs. See [below](#ab-testing-prover-briefs).
 
 ## Metrics
@@ -66,7 +85,9 @@ Each run writes one JSON file ([`../schemas/benchmark-run.schema.json`](../schem
 | `recall` | Bugs retained, lost, undecided, not run. `rates` as below. Per bug: each replay's outcome, the observed fingerprint, the gate result, what Eva says at the bug's line (`eva_site`), and whether the campaign found it unaided (`found_by_campaign`). |
 | `targets.<t>.modules.<m>.eva` | Valid, Unknown, Invalid, Dead and Considered valid counts, properties checked, statements and functions reached, Unknown by kind, reduced checks. |
 | `targets.<t>.functions_with_unknown` | In-scope functions with at least one Unknown. Each one costs a prover task, so this matters more than the raw alarm count. |
-| `targets.<t>.functions_with_unknown_no_unit` | The same, but with no ledger unit: no prover would ever be assigned, so those Unknowns silently stay open. |
+| `targets.<t>.functions_with_unknown_no_unit` | The same, but with no ledger unit: no prover would ever be assigned, so those Unknowns silently stay open. 0 on every target since Phase 0 inventories what the build compiles. |
+| `targets.<t>.covered_with_unknown` | Units the ledger reads `covered` although some harness module's Eva report leaves an Unknown in them. Must stay empty: `compare` counts a new entry as a regression. |
+| `targets.<t>.build_capture` | The capture's status, units and snapshot, the model's parse status and GCC fallback units, and the seeds recorded. |
 | `targets.<t>.prover_tasks` | The tasks really queued, per wave. Lower than the line above when a function has a confirmed bug and is excluded from WP. |
 | `targets.<t>.units` | Proof pass rate per call-graph wave and per obligation class, from the coverage ledger. For `l3_frame`, also read each WP report's `frame_summary`: a unit is frame-error-free only when every assigns/loop-assigns/`\separated` goal is discharged and no missing-assigns warning fired (a full proof with an incomplete frame does not count). |
 | `targets.<t>.mutation` | Optional, when `scripts/mutation_check.py` ran on the run dir: spec-quality totals — `completeness` (1 − equivalent contract mutants / spec mutants) and `precision` (implementation mutants rejected by an Invalid ensures / impl mutants), plus per-function detail in `workspace/reports/mutation.json`. |
@@ -98,7 +119,7 @@ Fewer Unknowns counts as an improvement only if coverage held: the same properti
 
 What the numbers cannot tell you:
 
-- **Fuzz campaigns are not seeded**, and a campaign's wall time depends on the workers its lease allows. What they find is reported, never scored. A unit a campaign turned into a candidate warns instead of counting as a lost proof.
+- **Fuzz campaigns are not deterministic** (their random seed changes with the binary), and a campaign's wall time depends on the workers its lease allows. What they find is reported, never scored. A unit a campaign turned into a candidate warns instead of counting as a lost proof.
 - **Timeouts depend on machine speed.** An Eva or WP limit reached on a slower machine is a tool failure, not a verdict. Timings warn only beyond a tolerance on the same machine size.
 - **Wall-clock includes queueing** when other jobs share the broker. CPU time does not.
 
@@ -108,10 +129,11 @@ Each of these is real behavior of the pipeline today. They show up in every comp
 
 - **`semver`: Eva does not start.** `-warn-unsigned-downcast` rejects the global initializer at `semver.c:23`, so its module reads `analysis_error`.
 - **Eva stops early on `tweetnacl`, `qlz` and `cryptolib`.** An `Invalid` alarm ends the analyzed path, so most of the code is Dead: `tweetnacl` reaches 5 of 64 functions (an unsigned downcast in `ts64`), `qlz` 5 of 17 (`src - 2` pointer arithmetic), and `cryptolib` 22 of 234 (a self-overlapping `memcpy` during `Crypto_Init`). That is why `eva_site` reads `dead` for CRYPTOLIB-01.
-- **`qlz_compress_core` has an Unknown and no ledger unit.** Braces left unbalanced by `#if` branches end `build_callgraph_dag.py`'s scan of `quicklz.c`, so every function from there on is missing.
-- **`build_callgraph_dag.py` applies every `-D` it finds in a target's makefiles.** x509-parser's IKOS rule would break its builds, so a force-included header in the manifest undoes it.
+- **Macros from Makefile targets the library build does not use are pinned in the harness specs.** jsmn's `JSMN_STRICT`/`JSMN_PARENT_LINKS`, qlz's streaming configuration and semver's `DEBUG=1` are stated in their specs, so the analysed configuration stays the one the older baselines measured.
+- **A file compiled by several units with different flags is analysed in one configuration only**, the first unit's (qlz's four executables).
 - **x509-parser's fuzz builds fall back to the sanitizer engine.** E-ACSL rejects the target's own annotations (`unbounded ranges`, `x509-crl-parser.c:3313`) and cannot find `__fc_builtin.h`, which `x509-parser.c` includes under `__FRAMAC__`. Eva runs at `slevel 1`, as in the target's own Makefile, because the default exceeded 900 s.
-- **Functions defined in headers have no ledger unit** (14 in QCBOR, 1 in minmea), so they get no prover either.
+- **CRYPTOLIB-01 reads `undecided`.** The link-unit build loses the quoting of `-DMC_LOG_PATH="log.txt"` through E-ACSL, so CryptoLib's fuzzing falls back from E-ACSL.
+- **Unreached header `static inline` functions are seeded `deferred`** (most of QCBOR's Tier 3). Eva ingest re-plans one when a harness reaches it.
 - **MINMEA-02's fingerprint differs from `docs/bugs-found`**, at the same site. The run summary names it.
 - **Some campaigns abort without a crash artifact** (`fuzzer_error`, exit code -6, on `semver` and on CryptoLib's `crypto` and `sa`), so they leave no reproducer. On `semver` the log ends in E-ACSL's `Use of invalid address`.
 
@@ -160,4 +182,11 @@ It reports each arm's rates both ways, per corpus, and the paired counts (progra
 
 ## Adding a target
 
-Add an entry to the manifest's `targets` with a full commit id, a `scope`, and one harness per module (named as `build_callgraph_dag.py` names it). Harnesses use `generate_harness.py`'s options, so `call_expr`, or `eva_expr` and `fuzz_expr`, say what Eva and LibFuzzer call. Files the harness needs go under [`../benchmark/assets/`](../benchmark/assets/). `python3 scripts/benchmark.py check-manifest` validates the result, and `run --target <id> --phase0-only` checks the harness without the analysis. Changing a target's harness, scope or tuning warns in the next comparison, because its counts are no longer like for like.
+Add an entry to the manifest's `targets` with:
+
+- a full commit id and a `scope`;
+- a `build` recipe (command, packages, working directory, optionally `test_command` for seeds);
+- one harness per harness module, with its link `unit` (a module is the unit itself or a sub-module of it). Harnesses use `generate_harness.py`'s options, so `call_expr`, or `eva_expr` and `fuzz_expr`, say what Eva and LibFuzzer call;
+- optionally a `threat_model` (a file under [`../benchmark/assets/`](../benchmark/assets/), pinned by sha256) and the reach-gate exemptions its harnesses need (`reach_exempt_modules`, `reach_gaps_accepted`), each with a reason.
+
+Files the harness needs go under `benchmark/assets/`. `python3 scripts/benchmark.py check-manifest` validates the result, and `run --target <id> --phase0-only` checks the build and the harness without the analysis. Phase 0 stops when a harness's `unit` does not match the DAG. `python3 scripts/benchmark.py migrate-units --dag <target>=<callgraph_dag.json>` fills in each module's `unit` from the DAG of a run (`--dry-run` prints the changes). Changing a target's harness, scope or tuning warns in the next comparison, because its counts are no longer like for like. The recipe and the threat model are not part of the harness digest.
