@@ -377,9 +377,30 @@ I0 ─┬─▶ I1 ────────────────────�
 | I7 | M | done |
 | I8 | M | done |
 | I9 | L | done |
-| I10 | M | not started |
+| I10 | M | in progress: lexer removed, docs updated, baseline phase0-i10; left: monolith retirement, merge to main |
 
 ## Step notes
+
+### I10 status and the merged tree (2026-11-08)
+
+- **Merged into `phase0-redesign`:** I4, I6, I7, I8, I9, then I10a (lexer removal) and I10b (docs and the slice, verify and fuzz skills).
+- **Baseline `phase0-i9`** (runs `i9m1-*`, the merged I4–I9 tree) against `phase0-i5b`:
+  - 0 regressions, every known bug retained;
+  - CryptoLib `mc_initialize` newly covered;
+  - warnings only say the harness tuning changed (seeds, per-case budget);
+  - seeded set: 8/8 bugs, 0/4 decoys (`seeded-i9m1`).
+- **Baseline `phase0-i10`** (runs `i10m1-*`, after the lexer removal) against `phase0-i9`:
+  - 0 regressions;
+  - seeded set: 8/8 bugs, 0/4 decoys (`seeded-i10m1`).
+  - **One warning, explained: CryptoLib's `mc` Eva checks 43 properties, down from 689.** The lexer's name-resolution guesses gave the `mc` path module 19 required sources (core, crypto, key and sa backends). The model's edges give its 3 own files. Eva now reports 0 undeclared functions, against 1 before. The old properties were mostly in code the harness never reaches: 3628 dead and 1947 assumed, against 19 and 194 now. Ledger unit coverage is unchanged.
+- **Tier changes from the model's real types**, accepted as they are (details under I10a):
+  - CryptoLib's 13 `get_*_interface` getters go from 3 to 1A;
+  - `main(int, char **)` goes from 1B to 1A, with the same run flags.
+- **Left:**
+  - retire the monolithic image (the Docker-backed tests still use `framac-pipeline:latest`);
+  - decide whether to keep or remove `poc/phase0/`;
+  - the single merge into `main`, which waits for the user;
+  - the manifest's `compile_commands` field and CryptoLib's `compile_commands` asset are now unused, and were kept so the harness digests don't change.
 
 ### I10a (2026-11-08)
 
