@@ -108,7 +108,10 @@ def test_parse_record_line():
             "2": [["i", 0, "0200000000000000"]],
             "4": [["n", 8, "ff"]],
         },
+        "addrs": {},
     }
+    rec = sh.parse_record_line("kv 1b=6162 1x=7ffd10a0 3x=55aa")
+    assert rec == {"fn": "kv", "args": {"1": [["b", 0, "6162"]]}, "addrs": {"1": "7ffd10a0", "3": "55aa"}}
     assert sh.parse_record_line("not a record!") is None
     assert sh.parse_record_line("kv 0q") is None
 
@@ -257,6 +260,40 @@ def test_auto_prototype_layout():
         {"fn": "f", "args": {"0": [["i", 0, "0100"]], "1": [["b", 0, "aabb"]], "3": [["p", 0, "0200000000000000"]]}}
     ]
     assert sh.seeds_for_case(None, b, calls) == [b"\x01\x00" + b"\x02" + b"\x00" * 7 + b"\xaa\xbb"]
+
+
+def test_wrapper_source_records_pointer_addresses():
+    src = sh.wrapper_source(
+        [sh.plan_function("kv", "int(unsigned int,unsigned char *,unsigned long,void (*)(int))")], []
+    )
+    assert "fc_addr(1, a1);" in src and "fc_addr(0," not in src and "fc_addr(3," not in src
+    assert "void fc_addr(int idx, const void *p) {" in sh.runtime_source(1)
+
+
+def test_collect_writes_ordered_traces_and_dedups_calls_without_addresses(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out_dir = tmp_path / "calls"
+    out_dir.mkdir()
+    # process 7: keypair fills pk/sk, box uses them; the same calls at other addresses in process 8
+    (out_dir / "calls-7.txt").write_text(
+        "keypair 0a=0000 1a=0000 0x=100 1x=200\nbox 0a=00 1b=6869 3a=0000 0x=300 1x=400 3x=100\n"
+    )
+    (out_dir / "calls-8.txt").write_text(
+        "keypair 0a=0000 1a=0000 0x=900 1x=a00\nbox 0a=00 1b=6869 3a=0000 0x=b00 1x=c00 3x=900\n"
+    )
+    (out_dir / "calls-9.txt").write_text("keypair 0a=0000 1a=0000 0x=1\n")  # one call: no trace
+    report: dict = {"status": "error"}
+    sh._collect(report, out_dir, [], tmp_path / "tree", 0.0)
+    calls = [json.loads(x) for x in (tmp_path / "workspace" / "seed_records" / "calls.jsonl").read_text().splitlines()]
+    assert [c["fn"] for c in calls] == ["keypair", "box"] and "addrs" not in calls[0]
+    traces = sh.load_traces(tmp_path / "workspace" / "seed_records")
+    assert report["traces"] == 1 and len(traces) == 1  # process 8 has the same shape as 7
+    keypair, box = traces[0]
+    assert keypair["addrs"] == {"0": "100", "1": "200"} and box["addrs"]["3"] == "100"
+    assert box["sizes"] == {"0": 1, "1": 2, "3": 2}
+    import api_harness
+
+    assert api_harness.chains(traces[0]) == [[0, 1]]
 
 
 def test_write_module_and_records(tmp_path, monkeypatch):

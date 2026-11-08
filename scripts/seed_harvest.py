@@ -85,6 +85,8 @@ MAX_FILES = 64  # secondary seeds: data files the tests open
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SEEDS_PER_MODULE = 2000
 WRAP_LIMIT = 4000  # functions one recorder can wrap
+MAX_TRACE_CALLS = 256  # calls kept, in order, of one process's trace
+MAX_TRACES = 512  # distinct traces kept (one per process)
 EXECUTABLE_TIMEOUT_S = 60  # one run of a non-test executable, when the recipe has no test command
 SEED_PREFIX = "seed-"
 
@@ -371,6 +373,14 @@ void fc_mem(int idx, char kind, const void *p, size_t n) {
     free(tmp);
 }
 
+/* A pointer argument's address: calls passing the same address share that buffer (call traces). */
+void fc_addr(int idx, const void *p) {
+    char tok[48];
+    if (p == NULL) return;
+    int k = snprintf(tok, sizeof tok, " %%dx=%%lx", idx, (unsigned long)(uintptr_t)p);
+    if (k > 0) fc_put(tok, (size_t)k);
+}
+
 /* A NUL-terminated string: copied safely up to FC_CAP bytes, without the NUL. */
 void fc_str(int idx, const void *p) {
     fc_head(idx, 's', 0, 0);
@@ -463,6 +473,7 @@ def wrapper_source(plans: list[dict[str, Any]], headers: list[str]) -> str:
         "void fc_raw(int idx, char kind, const void *p, size_t n);",
         "void fc_mem(int idx, char kind, const void *p, size_t n);",
         "void fc_str(int idx, const void *p);",
+        "void fc_addr(int idx, const void *p);",
         "void fc_struct(int idx, const void *p, size_t n);",
         "void fc_end(void);",
         "",
@@ -472,6 +483,7 @@ def wrapper_source(plans: list[dict[str, Any]], headers: list[str]) -> str:
         decl = ", ".join(f"{p['ctype']} a{i}" for i, p in enumerate(params)) or "void"
         call = ", ".join(f"a{i}" for i in range(len(params)))
         rec = [s for i, p in enumerate(params) if (s := _record_stmt(i, p, params))]
+        rec += [f"fc_addr({i}, a{i});" for i, p in enumerate(params) if p["kind"] == "ptr"]
         lines.append(f"extern {ret['ctype']} __real_{name}({decl});")
         lines.append(f"{ret['ctype']} __wrap_{name}({decl}) {{")
         lines.append(f'    if (fc_enter({k})) {{ fc_begin("{name}"); {" ".join(rec)} fc_end(); }}')
@@ -499,11 +511,15 @@ _TOKEN_RE = re.compile(r"(\d+)([a-z])(\d*)=([0-9a-f]*|-)")
 
 
 def parse_record_line(line: str) -> dict[str, Any] | None:
-    """One recorder line: `name 0s=68656c6c6f 1i=0a000000 2n0=...` -> {fn, args: {idx: [[kind, off, hex]]}}."""
+    """
+    One recorder line: `name 0s=68656c6c6f 1i=0a000000 2n0=... 0x=7ffd10` -> {fn, args: {idx: [[kind,
+    off, hex]]}, addrs: {idx: hex address}}. Addresses (`x`) only link calls within one process.
+    """
     parts = line.strip().split(" ")
     if not parts or not _IDENT_RE.match(parts[0]):
         return None
     args: dict[str, list[list[Any]]] = {}
+    addrs: dict[str, str] = {}
     for tok in parts[1:]:
         m = _TOKEN_RE.fullmatch(tok)
         if not m:
@@ -511,8 +527,21 @@ def parse_record_line(line: str) -> dict[str, Any] | None:
         idx, kind, off, hexv = m.groups()
         if hexv == "-":
             continue
+        if kind == "x":
+            addrs[idx] = hexv
+            continue
         args.setdefault(idx, []).append([kind, int(off) if off else 0, hexv])
-    return {"fn": parts[0], "args": args}
+    return {"fn": parts[0], "args": args, "addrs": addrs}
+
+
+def trace_call(rec: dict[str, Any]) -> dict[str, Any]:
+    """A trace entry: the call with its pointer addresses and the bytes recorded per argument."""
+    sizes: dict[str, int] = {}
+    for idx, vals in rec["args"].items():
+        lens = [len(hexv) // 2 for kind, _off, hexv in vals if kind in ("a", "b", "p", "s")]
+        if lens:
+            sizes[idx] = max(lens)
+    return {"fn": rec["fn"], "args": rec["args"], "addrs": rec.get("addrs") or {}, "sizes": sizes}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -883,23 +912,42 @@ def _collect(report: dict, out_dir: Path, opened: list[str], tree: Path, started
         shutil.rmtree(RECORDS_DIR)
     (RECORDS_DIR / "files").mkdir(parents=True)
     seen: set[str] = set()
+    seen_traces: set[str] = set()
     per_fn: dict[str, int] = {}
     total = unique = bad = 0
-    with (RECORDS_DIR / "calls.jsonl").open("w", encoding="utf-8", newline="\n") as out:
+    with (
+        (RECORDS_DIR / "calls.jsonl").open("w", encoding="utf-8", newline="\n") as out,
+        (RECORDS_DIR / "traces.jsonl").open("w", encoding="utf-8", newline="\n") as tr_out,
+    ):
+        # One file per process, its calls in order: the trace of that process.
         for path in sorted(out_dir.glob("calls-*.txt")) if out_dir.is_dir() else []:
+            trace: list[dict] = []
             for line in path.read_text(encoding="ascii", errors="replace").splitlines():
                 rec = parse_record_line(line)
                 if rec is None:
                     bad += 1
                     continue
                 total += 1
-                key = hashlib.sha256(line.strip().encode()).hexdigest()
+                if len(trace) < MAX_TRACE_CALLS:
+                    trace.append(trace_call(rec))
+                # Addresses differ between runs: the same arguments are the same call.
+                call = {"fn": rec["fn"], "args": rec["args"]}
+                text = json.dumps(call, separators=(",", ":"), sort_keys=True)
+                key = hashlib.sha256(text.encode()).hexdigest()
                 if key in seen or per_fn.get(rec["fn"], 0) >= MAX_UNIQUE_CALLS_PER_FUNCTION:
                     continue
                 seen.add(key)
                 per_fn[rec["fn"]] = per_fn.get(rec["fn"], 0) + 1
                 unique += 1
-                out.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                out.write(json.dumps(call, separators=(",", ":")) + "\n")
+            if len(trace) > 1 and len(seen_traces) < MAX_TRACES:
+                shape = json.dumps([[c["fn"], c["args"]] for c in trace], separators=(",", ":"), sort_keys=True)
+                digest = hashlib.sha256(shape.encode()).hexdigest()
+                if digest not in seen_traces:
+                    seen_traces.add(digest)
+                    tr_out.write(
+                        json.dumps({"pid": path.stem.split("-", 1)[-1], "calls": trace}, separators=(",", ":")) + "\n"
+                    )
     files: list[dict] = []
     for p in opened:
         path = Path(p)
@@ -909,6 +957,7 @@ def _collect(report: dict, out_dir: Path, opened: list[str], tree: Path, started
         digest = hashlib.sha256(data).hexdigest()
         (RECORDS_DIR / "files" / digest[:32]).write_bytes(data)
         files.append({"path": path.relative_to(tree).as_posix(), "bytes": len(data), "sha256": digest})
+    report["traces"] = len(seen_traces)
     report["calls"] = {
         "recorded": total,
         "unique": unique,

@@ -186,7 +186,8 @@ Record the arguments the target's own programs pass to the API. With a test comm
 ```
 
 It relinks each test executable with `-Wl,--wrap` recorders for the model's API functions, runs the test command in the sandbox (no network, capped time) under `strace`, and keeps what is listed below. Without a test command it relinks each non-test executable that defines API functions instead and runs it once, with no arguments, empty stdin and a 60 s cap. The report's `source` says which (`test_command` or `executables`), and `runs` gives each executable's exit status. It keeps:
-- the arguments of each outermost API call, in `workspace/seed_records/calls.jsonl`;
+- the arguments of each outermost API call, in `workspace/seed_records/calls.jsonl` (deduplicated; a lone pointer whose callers pass a known-size object, per the model's `param_sizes`, is recorded with that many bytes);
+- each process's calls in order, with each pointer argument's address and the bytes recorded per argument, in `workspace/seed_records/traces.jsonl` (processes with more than one call; same-shaped traces once). `--api` turns calls that share an address (a key pair, then the box that uses it) into sequence cases;
 - up to 64 small data files the tests opened inside the target tree.
 
 The report is `workspace/reports/seed_harvest.json`. A failing test suite is a warning, not an error: seeds are an improvement, never a requirement. Calls through header `static inline` functions are not recorded. The fuzz recipes turn the records into seeds in each harness's own format (`/framac-fuzz`).
