@@ -1558,7 +1558,7 @@ def dictionary_target_sources(sources: list[str] | list[Path]) -> list[Path]:
     return sorted(out, key=lambda p: p.as_posix())
 
 
-def build_auto_dictionary(sources: list[str] | list[Path], out_path: Path) -> dict:
+def build_auto_dictionary(sources: list[str] | list[Path], out_path: Path, cppflags: str | None = None) -> dict:
     """
     Extract a libFuzzer dictionary from the campaign's target sources (scripts/fuzz_dictionary.py, in-process)
     and write it atomically to `out_path`. Never raises: an empty or failed extraction returns
@@ -1573,7 +1573,7 @@ def build_auto_dictionary(sources: list[str] | list[Path], out_path: Path) -> di
         info["reason"] = "no readable target sources besides the harness"
         return info
     try:
-        tokens = fuzz_dictionary.build_dictionary(sources=list(targets))
+        tokens = fuzz_dictionary.build_dictionary(sources=list(targets), cppflags=cppflags)
     except Exception as exc:  # never fail the campaign over a dictionary
         info["reason"] = f"extraction failed: {type(exc).__name__}: {exc}"
         return info
@@ -1608,7 +1608,12 @@ def build_auto_dictionary(sources: list[str] | list[Path], out_path: Path) -> di
 
 
 def resolve_campaign_dictionary(
-    explicit: Path | None, sources: list[str], module: str, corpus_dir: Path, auto: bool = True
+    explicit: Path | None,
+    sources: list[str],
+    module: str,
+    corpus_dir: Path,
+    auto: bool = True,
+    cppflags: str | None = None,
 ) -> tuple[Path | None, dict]:
     """The dictionary a campaign passes to libFuzzer as -dict=, and the report's `dictionary` record."""
     if explicit is not None:
@@ -1616,7 +1621,7 @@ def resolve_campaign_dictionary(
         return p, {"path": p.as_posix(), "auto": False, "exists": p.is_file()}
     if not auto:
         return None, {"path": None, "auto": False, "reason": "disabled by --no-auto-dict"}
-    info = build_auto_dictionary(sources, auto_dictionary_path(module, corpus_dir))
+    info = build_auto_dictionary(sources, auto_dictionary_path(module, corpus_dir), cppflags)
     return (Path(info["path"]) if info.get("path") else None), info
 
 
@@ -4176,6 +4181,7 @@ def _run_campaign_mode(args) -> dict:
             args.module,
             args.corpus_dir,
             auto=not getattr(args, "no_auto_dict", False),
+            cppflags=args.cppflags,
         )
 
         n_cases = dispatch_case_count(args.sources)

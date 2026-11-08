@@ -1,0 +1,23 @@
+{
+  "description": "Sealed frame parser: a header guarded by a magic, a Fletcher-16 checksum and a version, then typed extensions; the name extension's length is checked against the wrong bound",
+  "mechanism": "wellformed_input",
+  "build": "make",
+  "test": "./sdf_test",
+  "bugs": [
+    {
+      "id": "S08-1",
+      "mechanism": "wellformed_input",
+      "file": "src/sdf.c",
+      "function": "ext_name",
+      "line": 18,
+      "kind": "mem_access",
+      "trigger": "sdf_parse on a frame with a valid header (magic SDF1, Fletcher-16 of the first 10 bytes in bytes 10-11, version 2, 1..8 extensions) whose name extension (type 1) is 9..32 bytes long: ext_name checks the length against SDF_NAME_MAX (32) and copies it into an 8-byte stack buffer"
+    }
+  ],
+  "decoys": [],
+  "entry_points": [
+    "src/sdf.c#sdf_checksum",
+    "src/sdf.c#sdf_parse"
+  ],
+  "lexer_expected": "Control case for step I6, not a lexer weakness: modules and entry points are right for both Phase 0s. The checksum is compared through an XOR with zero, so libFuzzer's compare tables cannot repair it, and a header with a valid checksum, version and extension count is out of reach of a short campaign from an empty corpus. The unit tests (tests/test_sdf.c, `./sdf_test`) parse sealed frames with short names: a seed recorded from them needs one length byte changed to reach the bug."
+}

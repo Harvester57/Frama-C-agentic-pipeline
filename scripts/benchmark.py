@@ -1000,9 +1000,40 @@ def run_capture(spec: dict, mount: Path, run_dir: Path, repo: str, packages: str
         )
         summary["model"] = summarize_model(read_json(run_dir / "workspace" / "reports" / "phase0_model.json"))
         stages["model"]["status"] = summary["model"]["status"]
+        if summary["model"]["status"] == "ok" and (spec["build"] or {}).get("test_command"):
+            # Seeds from the tests (step I6): the test executables of the build tree on the volume,
+            # relinked with API recorders, run in the build image. The fuzz recipes write them out.
+            stages["seeds"] = run_stage(
+                "seeds",
+                f"python3 {CONTAINER_SCRIPTS}/seed_harvest.py record --recipe-file {BENCH_SUBDIR}/spec.json",
+                mount,
+                run_dir,
+                repo,
+                cls="phase-dynamic",
+                packages=recipe_packages,
+                build_image=True,
+                scratch=True,
+            )
+            summary["seeds"] = summarize_seeds(read_json(run_dir / "workspace" / "reports" / "seed_harvest.json"))
+            stages["seeds"]["status"] = summary["seeds"]["status"]
     drop = wrapper_argv(mount, run_dir, repo) + (["-RemoveScratch"] if _is_windows() else ["--remove-scratch"])
     subprocess.run(drop, capture_output=True, check=False)
     return summary
+
+
+def summarize_seeds(report: dict | None) -> dict:
+    """What the run file records of seed_harvest.py record: calls and data files kept."""
+    if not report:
+        return {"status": "no_report"}
+    calls = report.get("calls") or {}
+    return {
+        "status": report.get("status"),
+        "calls": calls.get("unique", 0),
+        "functions": len(calls.get("by_function") or {}),
+        "files": len((report.get("files") or {}).get("kept") or []),
+        "test_rc": (report.get("test") or {}).get("returncode"),
+        "seconds": report.get("seconds"),
+    }
 
 
 def summarize_model(model: dict | None) -> dict:

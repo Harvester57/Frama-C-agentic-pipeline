@@ -412,6 +412,24 @@ class TestSmallSummaries:
         }
         assert summarize_fuzz(None) is None
 
+    def test_seed_harvest_summary(self):
+        assert benchmark.summarize_seeds(None) == {"status": "no_report"}
+        report = {
+            "status": "ok",
+            "calls": {"unique": 11, "by_function": {"sdf_parse": 7, "sdf_checksum": 4}},
+            "files": {"kept": [{"path": "data/a.bin"}]},
+            "test": {"returncode": 0},
+            "seconds": 0.25,
+        }
+        assert benchmark.summarize_seeds(report) == {
+            "status": "ok",
+            "calls": 11,
+            "functions": 2,
+            "files": 1,
+            "test_rc": 0,
+            "seconds": 0.25,
+        }
+
     def test_fuzz_collects_fingerprints_once(self):
         block = summarize_fuzz(
             {"status": "crash_found", "artifacts": [{"fingerprint": "x"}, {"fingerprint": "x"}, {"fingerprint": None}]}

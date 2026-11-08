@@ -25,6 +25,7 @@ modules for the library are unchanged; checked).
 | `s05_api_internal` | api_internal | S05-1 `src/kv.c:50` `kv_key_equals`: public, no `slot < 8` check (global out of bounds); internal callers pass only valid slots | none | The entry points of module `kv` are `kv_count`, `kv_load`, `kv_find` and `kv_get`. `kv_key_equals` is dropped because `find_slot` calls it. |
 | `s06_cross_dir` | cross_dir (control) | S06-1 `compat/b64.c:33` `b64_decode`: checks `o >= cap` and then writes 3 bytes; `ip=` + 8 base64 chars overflows `ip[4]` | D1 harness_induced: `compat/b64.c#load_be32` | Correct sources (`compat/b64.c` + `src/msg.c`), so the bug is reachable. Offers `b64_decode` and `load_be32` (module `compat`); `load_be32` crashes when called directly. |
 | `s07_static_collision` | static_collision (control) | S07-1 `src/frame.c:10` static `at`: `i <= n` reads `buf[len]` when the header length byte is greater than the input length | none | Reports the `at` collision and keeps only `src/stats.c#at` (the safe one); `header_digest` → `at` points to the wrong file. Modules and entry points are right, so the bug is still reachable. |
+| `s08_wellformed_input` | wellformed_input (control, step I6) | S08-1 `src/sdf.c:18` `ext_name`: the name extension's length is checked against `SDF_NAME_MAX` (32) and copied into an 8-byte stack buffer; reachable only behind a valid header (magic `SDF1`, Fletcher-16 compared through an XOR with zero, version 2, 1..8 extensions) | none | Modules and entry points are right. The checksum defeats libFuzzer's compare tables, so a short campaign from an empty corpus misses the bug; seeds recorded from `./sdf_test` (sealed frames with short names) are one length byte away from it. |
 
 Per mechanism, what the correct extractor must do:
 
@@ -32,6 +33,7 @@ Per mechanism, what the correct extractor must do:
 - **config_body**: compile with `-DFAST_UNESCAPE` and without `-DLEGACY_UNESCAPE`.
 - **force_include**: compile with `-include config.h`.
 - **api_internal**: take entry points from `include/` (so `kv_key_equals` is one).
+- **wellformed_input**: record seeds from the project's tests (`truth.json` `test`).
 - **Decoys**: never offer a D1 helper (not declared in `include/`) or a function that is not compiled.
 
 ## Verification (framac-pipeline:latest)
@@ -50,3 +52,4 @@ Decoys and lexer-flag builds:
 - s03 (lexer flags `-DLEGACY_UNESCAPE`): S03-1 exits 0 and `decoy-D1.bin` overflows at `unescape.c:33`. With the real flags `-DFAST_UNESCAPE`, `decoy-D1.bin` exits 0. Both bodies define `pkt_unescape`, so `nm` cannot tell them apart; `size src/unescape.o` differs between `make` (328) and `make legacy` (346).
 - s04 (no `-include config.h`): S04-1 exits 0. `be16_at(1000, buf4, 4)` overflows at `bytes.c:6`.
 - s06: `load_be32` on a 1-byte buffer overflows at `b64.c:53`.
+- s08: `make` also builds `sdf_test`, which prints `OK` and exits 0; `repro/S08-1.bin` aborts with a stack-buffer-overflow at `sdf.c:18` in `ext_name`, and `benign-1.bin` exits 0. Random inputs were not run: the checksum rejects them before the bug.

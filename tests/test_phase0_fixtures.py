@@ -24,7 +24,7 @@ def _truth(project: Path) -> dict:
 
 def test_fixture_sets_are_present():
     assert len(REPRODUCERS) == 9
-    assert len(SEEDED) == 7
+    assert len(SEEDED) == 8
 
 
 @pytest.mark.unit

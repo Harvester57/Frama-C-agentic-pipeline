@@ -373,7 +373,7 @@ I0 ─┬─▶ I1 ────────────────────�
 | I4 | S | done (Alias measured, not adopted: off by default) |
 | I5a | M | done |
 | I5b | L | done |
-| I6 | L | not started |
+| I6 | L | done |
 | I7 | M | not started |
 | I8 | M | not started |
 | I9 | L | not started |
@@ -469,6 +469,26 @@ I0 ─┬─▶ I1 ────────────────────�
   - adding `build_capture` to `known-first-party` in `pyproject.toml`;
   - `resources.py` inferring `phase-dynamic` for `build_capture.py run` (callers pass the class);
   - a `/framac-scratch` directory in the images, which would make the wrapper's `chmod` and compose's manual step unnecessary.
+
+### I6 (2026-11-08)
+
+- **Seeds** (`scripts/seed_harvest.py`):
+  - **record** runs in the benchmark capture stage (build image, scratch volume) when the recipe has a `test_command`. For each test executable of the capture it compiles `__wrap_<fn>` recorders for the model's API (skipping `main`, statics, header inlines, variadics and types it cannot name) and relinks from the bear link command with `-Wl,--wrap=`. It then runs the test command in the sandbox under `strace -f -e trace=openat`. Only outermost API calls are kept (a depth counter), with memory copied through a pipe so a bad pointer gives EFAULT, not a crash. Caps: 2000 calls and 1000 unique calls per function, 64 KiB per value, 64 MiB of records, 64 data files of at most 1 MiB. A failing test suite is a warning.
+  - **write** reads each harness's case layout from `harness_<mod>.c` (dispatch cases, `fuzz_buf` aliases, `memcpy` slots, `{ptr, len}` structs) and writes `workspace/seeds/<mod>/seed-*`: selector byte, slots, then data. Data files become whole-input seeds for the cases that take the whole buffer. It runs before each `fuzz-<mod>` and from the `seeds` target; `fuzz` and `coverage` read the directory with `--extra-corpus`.
+  - **Measured:** minmea, 214 unique calls over 16 functions, 64 seeds. QCBOR (`qcbor-dev`), 3821 unique calls over 129 functions, 708 seeds for each decode module and 299 for `UsefulBuf`. The encoder and `ieee754` harnesses get none: their calls go through header inlines or nested library calls, and the `ieee754` harness reads overlapping slots.
+- **s08 fixture** (`s08_wellformed_input`): the bug sits behind a header checksummed with Fletcher-16 and compared through an XOR, which libFuzzer's compare tables cannot repair. With seeds, S08-1 is found (`i6-s08-seeds-1`, fuzz CPU 132 s). Without seeds it is missed (`i6-s08-noseeds-1`, `--no-seeds`, 387 s of fuzz CPU). The macro dictionary was on in both runs.
+- **Dictionary:** with `--cppflags`, `fuzz_dictionary.py` adds object-like macro values of project files from `cc -E -dD` (decimal, LE/BE bytes, strings), at most 1000 tokens.
+- **Budget:** `FUZZ_BUDGET_BY_PROFILE` is per harness case. A unit's campaigns are capped at 480/1200/7200 CPU-seconds (quick/standard/deep), scaled down in proportion, minimum 30 each. `params.json` still wins. The modules record `fuzz_cases` and `fuzz_budget_source`.
+- **Dynamic reach** (`harness_reach.py dynamic`, `reach-dynamic-<mod>` after `coverage-<mod>`): an unexempted entry point with zero executions fails the module's reach row in `phase0_gates.json`. `check` keeps the gap while the harness digest is unchanged.
+  - On `qcbor-dev` it reopened the gate for `UsefulBuf` (`UsefulOutBuf_Flush`, `UsefulOutBuf_InsertUsefulBuf`), `qcbor_main_decode` (`QCBORDecode_Private_ConsumeItem`) and `qcbor_tag_decode` (six tag callbacks and `QCBOR_Private_BigNumConformance`). minmea passed, with 17/17 entry points executed.
+- **Coverage per entry point vs today** (the i5b1 corpus replayed on the same coverage build in the i6 run directory): no entry point covers fewer regions.
+  - minmea: 404 covered regions vs 403 (`minmea_gettime` 7 vs 6).
+  - QCBOR: equal region counts in all 8 modules. The quick campaigns plateau at the harness's reach.
+- **Not done:**
+  - Seeds for header-inline API: the recorder only wraps linked symbols.
+  - Struct members deeper than one `{ptr, len}` level.
+  - Seeds for the encoder harnesses.
+  - The skip-without-compiler test of the macro dictionary runs only where a C compiler exists.
 
 ### I4 (2026-11-08)
 

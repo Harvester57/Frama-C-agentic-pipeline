@@ -106,7 +106,13 @@ TUNE_REPORT_DIR = "workspace/reports/eva-tuning"
 _RESERVED_MODULES = frozenset({"tune", "tune-base"})
 
 DEFAULT_PROFILE = "standard"
-FUZZ_BUDGET_BY_PROFILE = {"quick": 60, "standard": 120, "deep": 900}  # CPU-seconds per campaign
+# CPU-seconds of fuzzing per harness case (a campaign gets one share per dispatch case; a harness without
+# cases counts as one), and the most one link unit's campaigns may get together: a unit with more cases
+# than the cap allows has its campaigns scaled down in proportion, never below MIN_FUZZ_BUDGET_S each.
+# params.json's fuzz_budget for a module replaces all of this for that module.
+FUZZ_BUDGET_BY_PROFILE = {"quick": 60, "standard": 120, "deep": 900}
+FUZZ_UNIT_CAP_BY_PROFILE = {"quick": 480, "standard": 1200, "deep": 7200}
+MIN_FUZZ_BUDGET_S = 30
 DEFAULT_EVA_SLEVEL = 100
 MODULE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}$")
 FUNCTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -891,12 +897,49 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
             continue
         # Tuning warnings change what a report means, so they are surfaced at the top of `gen` and `run`.
         warnings.extend(f"{name}: {w}" for w in plan.modules[name].warnings if w.startswith(TUNING_WARNING_PREFIX))
+    allocate_fuzz_budgets(plan)
     for name in sorted(set(params_doc["modules"]) - set(plan.records)):
         if name in dag_modules:
             warnings.append(f"params.json tunes {name!r}, {_unit_note(plan, name)}")
         elif dag_modules:
             warnings.append(f"params.json tunes {name!r}, which is not a DAG module")
     return plan
+
+
+def harness_case_count(sidecar: dict | None) -> int:
+    """Cases of a harness: its dispatch cases, else 1."""
+    cases = (sidecar or {}).get("dispatch_cases")
+    n = len([c for c in cases if isinstance(c, str) and c.strip()]) if isinstance(cases, list) else 0
+    return max(1, n)
+
+
+def allocate_fuzz_budgets(plan: Plan) -> None:
+    """
+    The fuzz budget of each fuzzed module without a params.json override: FUZZ_BUDGET_BY_PROFILE per
+    harness case, with the campaigns of one link unit together capped at FUZZ_UNIT_CAP_BY_PROFILE
+    (scaled down in proportion, at least MIN_FUZZ_BUDGET_S each). The plan records how each budget was
+    set in the module's params (`fuzz_budget_source`: params, cases or unit_cap; `fuzz_cases`).
+    """
+    per_case = FUZZ_BUDGET_BY_PROFILE.get(plan.profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE])
+    cap = FUZZ_UNIT_CAP_BY_PROFILE.get(plan.profile, FUZZ_UNIT_CAP_BY_PROFILE[DEFAULT_PROFILE])
+    by_unit: dict[str, list[ModulePlan]] = {}
+    for name, mod in plan.modules.items():
+        if not mod.fuzz:
+            continue
+        if "fuzz_budget" in (plan.params_doc.get("modules", {}).get(name) or {}):
+            mod.params["fuzz_budget_source"] = "params"
+            continue
+        mod.params["fuzz_cases"] = harness_case_count(plan.mm.sidecars.get(name))
+        mod.params["fuzz_budget"] = per_case * mod.params["fuzz_cases"]
+        mod.params["fuzz_budget_source"] = "cases"
+        by_unit.setdefault(plan.mm.unit_of(name), []).append(mod)
+    for mods in by_unit.values():
+        total = sum(m.params["fuzz_budget"] for m in mods)
+        if total <= cap:
+            continue
+        for m in mods:
+            m.params["fuzz_budget"] = max(MIN_FUZZ_BUDGET_S, m.params["fuzz_budget"] * cap // total)
+            m.params["fuzz_budget_source"] = "unit_cap"
 
 
 def _unit_note(plan: Plan, unit: str) -> str:
@@ -1222,6 +1265,9 @@ STAGE_OF_TARGET = {
     # Renders the flamegraph.txt an earlier Eva run left (it never runs Eva), so after eva and eva-tune.
     "flamegraph": 4,
     "coverage": 3,  # after fuzz, so that it measures the campaign's corpus
+    "seeds": 2,
+    # Reads the coverage reports, so after coverage (its per-module targets depend on coverage-<mod>).
+    "reach-dynamic": 4,
     # After eva-tune, which rewrites the Eva report the facts read.
     "facts": 4,
     "ingest": 4,
@@ -1233,6 +1279,7 @@ STAGE_OF_TARGET = {
     "report": 6,
 }
 MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "coverage-", "eva-", "flamegraph-", "module-", "facts-")
+REACH_DYNAMIC_PREFIX = "reach-dynamic-"
 _TARGET_OUTPUTS = {
     "slice-init": DAG_JSON,
     "seed": LEDGER_JSON,
@@ -1259,6 +1306,8 @@ def _stage(target: str) -> int | None:
         return STAGE_OF_TARGET["facts"]  # it reads the Eva report, so it follows the Eva stages of the invocation
     if target.startswith("flamegraph-") and target.partition("-")[2]:
         return STAGE_OF_TARGET["flamegraph"]
+    if target.startswith(REACH_DYNAMIC_PREFIX) and target[len(REACH_DYNAMIC_PREFIX) :]:
+        return STAGE_OF_TARGET["reach-dynamic"]
     if target.startswith(MODULE_TARGET_PREFIXES) and target.partition("-")[2]:
         return STAGE_OF_TARGET["coverage"] if target.startswith("coverage-") else 2
     return None
@@ -1270,6 +1319,8 @@ def _target_problem(target: str, plan: Plan) -> str | None:
     if target in STAGE_OF_TARGET:
         return None
     kind, _, mod = target.partition("-")
+    if target.startswith(REACH_DYNAMIC_PREFIX):
+        kind, mod = "coverage", target[len(REACH_DYNAMIC_PREFIX) :]
     allowed = {
         "build": plan.fuzz_modules,
         "fuzz": plan.fuzz_modules,
@@ -1297,6 +1348,8 @@ def _target_nodes(target: str, plan: Plan) -> list[str]:
         return [f"fuzz-{m}" for m in plan.fuzz_modules]
     if target == "coverage":
         return [f"coverage-{m}" for m in plan.fuzz_modules]
+    if target == "reach-dynamic":
+        return [f"{REACH_DYNAMIC_PREFIX}{m}" for m in plan.fuzz_modules]
     if target == "eva":
         return [f"eva-{m}" for m in plan.eva_modules]
     if target == "flamegraph":
@@ -1312,6 +1365,8 @@ def _target_nodes(target: str, plan: Plan) -> list[str]:
 
 def _node_deps(node: str, plan: Plan) -> list[str]:
     """Prerequisites as declared in templates/pipeline.mk (to tell skipped from failed)."""
+    if node.startswith(REACH_DYNAMIC_PREFIX):
+        return [f"coverage-{node[len(REACH_DYNAMIC_PREFIX) :]}"]
     kind, _, mod = node.partition("-")
     if kind == "fuzz" and mod:
         return ["selftest", f"build-{mod}"]
@@ -1334,6 +1389,8 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
 def _node_output(node: str) -> str | None:
     if node in _TARGET_OUTPUTS:
         return _TARGET_OUTPUTS[node]
+    if node.startswith(REACH_DYNAMIC_PREFIX):
+        return "workspace/reports/harness_reach_dynamic.json"
     kind, _, mod = node.partition("-")
     return {
         "build": f"{BUILD_DIR}/{mod}.build.json",

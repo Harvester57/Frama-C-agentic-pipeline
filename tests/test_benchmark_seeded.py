@@ -337,11 +337,15 @@ def test_rescore_resolves_run_dirs_against_the_work_dir(tmp_path):
 @pytest.mark.unit
 def test_projects_and_specs_come_from_the_corpus():
     projects = bs.projects_in(SEEDED)
-    assert [p.name for p in projects][:2] == ["s01_macro_fn", "s02_token_paste"] and len(projects) == 7
+    assert [p.name for p in projects][:2] == ["s01_macro_fn", "s02_token_paste"] and len(projects) == 8
     with pytest.raises(bs.benchmark.BenchmarkError):
         bs.projects_in(SEEDED, ["s99_nope"])
     spec = bs.project_spec(projects[3], _truth("s04_force_include"))
-    assert spec["build"] == {"command": "make", "origin": "benchmark"} and spec["repo"] == "s04-force-include"
+    assert spec["build"] == {"command": "make", "test_command": None, "origin": "benchmark"}
+    assert spec["repo"] == "s04-force-include"
+    s08 = bs.project_spec(projects[7], _truth("s08_wellformed_input"))
+    assert s08["build"]["test_command"] == "./sdf_test"
+    assert bs.project_spec(projects[7], _truth("s08_wellformed_input"), seeds=False)["build"]["test_command"] is None
     plan = bs.stage_plan(projects[3], 45)
     assert [s[0] for s in plan] == ["phase0", "build", "fuzz", "eva", "ingest"]
     assert plan[0][1].endswith("benchmark_seeded.py inner --repo s04-force-include --fuzz-budget 45")

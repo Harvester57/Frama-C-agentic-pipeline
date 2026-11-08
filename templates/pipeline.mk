@@ -30,6 +30,7 @@ SELFTEST_JSON := workspace/reports/eacsl_selftest.json
 BUILD_TARGETS  := $(addprefix build-,$(FUZZ_MODULES))
 FUZZ_TARGETS   := $(addprefix fuzz-,$(FUZZ_MODULES))
 COVERAGE_TARGETS := $(addprefix coverage-,$(FUZZ_MODULES))
+REACH_DYNAMIC_TARGETS := $(addprefix reach-dynamic-,$(FUZZ_MODULES))
 EVA_TARGETS    := $(addprefix eva-,$(EVA_MODULES))
 EVA_BASE_TARGETS := $(addprefix evabase-,$(EVA_MODULES))
 EVA_RUNG_TARGETS := $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))
@@ -41,12 +42,12 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init reach-gate seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
-        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
+.PHONY: help slice-init reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
+        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init reach-gate seed build selftest fuzz coverage eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -91,14 +92,24 @@ selftest:
 	$(RUN) --class selftest --key selftest --output $(SELFTEST_JSON) -- \
 		$(PY) $(S)/run_eacsl_fuzz.py selftest --out-json $(SELFTEST_JSON)
 
+# Seed inputs recorded from the target's tests (seed_harvest.py record, run in the build image after
+# the build capture) in each harness's case format: workspace/seeds/<mod>/. Rewritten from the records
+# before every campaign, so a repaired harness gets seeds in its new format. Seeds are an improvement,
+# never a requirement, hence the `-`.
+seeds:
+	-$(RUN) --class light --key seeds -- $(PY) $(S)/seed_harvest.py write
+
 # One campaign per module. Its effort is a CPU-second budget spread over the workers the lease
-# allows; FUZZ_MAX_TIME_<mod> overrides the wall time.
+# allows (pipeline_make.py: per harness case, capped per unit and profile); FUZZ_MAX_TIME_<mod>
+# overrides the wall time. The module's seeds are a read-only extra corpus.
 fuzz: $(FUZZ_TARGETS)
 $(FUZZ_TARGETS): fuzz-%: selftest build-%
 	$(GATE) --module $* --need reach,build_check
+	-$(RUN) --class light --key $* -- $(PY) $(S)/seed_harvest.py write --module $*
 	$(RUN) --class fuzz --key $* --output workspace/reports/fuzz/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py campaign --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
+		--extra-corpus workspace/seeds/$* \
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
 		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) \
@@ -114,9 +125,17 @@ $(COVERAGE_TARGETS): coverage-%:
 	$(RUN) --class replay --key $* --output workspace/reports/coverage/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py coverage --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/cov_$* --corpus-dir workspace/corpus/$* \
+		--extra-corpus workspace/seeds/$* \
 		--scratch-dir workspace/coverage/$* \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--out-json workspace/reports/coverage/$*.json
+
+# Dynamic reach gate: after coverage-<mod>, an API entry point of the module that its corpus never
+# executed reopens the reach gate (phase0_gates.json), so fuzz-<mod> and Eva stop until the parent
+# repairs the harness or exempts the entry point (`reach-gate` keeps the gap while the harness is unchanged).
+reach-dynamic: $(REACH_DYNAMIC_TARGETS)
+$(REACH_DYNAMIC_TARGETS): reach-dynamic-%: coverage-%
+	$(RUN) --class light --key reach-dynamic -- $(PY) $(S)/harness_reach.py dynamic --module $*
 
 # What every Eva run of module $(1) has in common: the rest is tuning, and tuning never changes what
 # is checked, so runs differing only in that can be compared and combined (eva_tuning.py).
