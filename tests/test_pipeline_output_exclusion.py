@@ -35,6 +35,29 @@ def _target_with_results(tmp_path: Path, marker: str) -> Path:
     return target
 
 
+# The build's model of the target: the results folder is never compiled, so it is not in it.
+MODEL = {
+    "status": "ok",
+    "units": {"api": {"kind": "executable", "files": ["src/api.c"], "cppflags": ["-Iinclude"]}},
+    "functions": {
+        "src/api.c#api_parse": {
+            "file": "src/api.c",
+            "name": "api_parse",
+            "line": 2,
+            "end_line": 2,
+            "lines": 1,
+            "loops": 0,
+            "cyclomatic": 2,
+            "signature": "int(unsigned char *,unsigned int)",
+            "source": "frama-c-kernel",
+            "units": ["api"],
+        }
+    },
+    "edges": [],
+    "entry_points": ["src/api.c#api_parse"],
+}
+
+
 @pytest.mark.parametrize("marker", PIPELINE_OUTPUT_MARKERS)
 def test_marker_identifies_pipeline_output(tmp_path, marker):
     (tmp_path / marker).write_text("{}", encoding="utf-8")
@@ -45,7 +68,7 @@ def test_marker_identifies_pipeline_output(tmp_path, marker):
 @pytest.mark.parametrize("marker", PIPELINE_OUTPUT_MARKERS)
 def test_dag_skips_results_folder_and_warns(tmp_path, marker):
     target = _target_with_results(tmp_path, marker)
-    dag = build_dag(target)
+    dag = build_dag(target, MODEL, {"compiles": [{"source": "src/api.c", "headers": ["include/api.h"]}]})
     files = {rec["file"] for rec in dag["functions"].values()}
     assert files == {"src/api.c"}
     assert "old_harness" not in dag["functions"]

@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-import build_callgraph_dag as bcd
 import generate_harness
 import pipeline_make as pm
 from pipeline_make import _param_problem, _source_defines_main
@@ -131,111 +130,7 @@ class TestMainCollisionDetection:
 
 
 # ===========================================================================
-# 2. Stress-test callgraph DAG prototype extraction and pre-flight warnings
-# ===========================================================================
-
-
-class TestCallgraphDAGPreFlightWarnings:
-    """Stress-test prototype extraction, VLA detection, and param count mismatch."""
-
-    def test_multidimensional_vla_parameters(self, tmp_path: Path, capsys):
-        """Multidimensional arrays (2+ bracket pairs) must trigger pre-flight warnings."""
-        src_dir = tmp_path / "src"
-        src_dir.mkdir(parents=True)
-
-        (src_dir / "matrix.h").write_text(
-            """\
-int foo(int x[2][3]);
-void bar(int a[N][M][K]);
-int unsized_multi(double buf[][10]);
-int single_dim(int x[10]);
-int two_single_dims(int a[10], int b[20]);
-""",
-            encoding="utf-8",
-        )
-        (src_dir / "matrix.c").write_text(
-            """\
-#include "matrix.h"
-int foo(int x[2][3]) { return x[0][0]; }
-void bar(int a[N][M][K]) {}
-int unsized_multi(double buf[][10]) { return 0; }
-int single_dim(int x[10]) { return x[0]; }
-int two_single_dims(int a[10], int b[20]) { return a[0] + b[0]; }
-""",
-            encoding="utf-8",
-        )
-
-        dag = bcd.build_dag(tmp_path)
-        err = capsys.readouterr().err
-
-        vla_warns = [w for w in dag["warnings"] if "multidimensional array/VLA" in w]
-        warned_fns = [w.split("'")[1] for w in vla_warns]
-
-        # foo, bar, unsized_multi must trigger warning
-        assert "foo" in warned_fns
-        assert "bar" in warned_fns
-        assert "unsized_multi" in warned_fns
-
-        # 1D arrays must NOT trigger warning
-        assert "single_dim" not in warned_fns
-        assert "two_single_dims" not in warned_fns
-
-        # Warnings must be printed to stderr
-        assert "pre-flight warning: multidimensional array/VLA" in err
-
-    def test_parameter_count_mismatches(self, tmp_path: Path, capsys):
-        """Mismatches between prototype and definition param count must trigger warnings."""
-        src_dir = tmp_path / "src"
-        src_dir.mkdir(parents=True)
-
-        (src_dir / "proto.h").write_text(
-            """\
-int f_mismatch(int a, int b);
-int f_match(int a, int b);
-int f_void_proto(void);
-int f_empty_proto();
-void f_no_def_in_c(int a, int b);
-""",
-            encoding="utf-8",
-        )
-        (src_dir / "proto.c").write_text(
-            """\
-#include "proto.h"
-int f_mismatch(int a, int b, int c) { return a + b + c; }
-int f_match(int x, int y) { return x * y; }
-int f_void_proto() { return 42; }
-int f_empty_proto(void) { return 43; }
-int f_no_proto_at_all(int a) { return a; }
-""",
-            encoding="utf-8",
-        )
-
-        dag = bcd.build_dag(tmp_path)
-
-        mismatch_warns = [w for w in dag["warnings"] if "parameter count mismatch" in w]
-        assert len(mismatch_warns) == 1
-        assert "f_mismatch" in mismatch_warns[0]
-        assert "prototype has 2 parameter(s)" in mismatch_warns[0]
-        assert "definition has 3 parameter(s)" in mismatch_warns[0]
-
-        # Neither f_void_proto nor f_empty_proto should be in mismatch_warns
-        assert not any("f_void_proto" in w for w in mismatch_warns)
-        assert not any("f_empty_proto" in w for w in mismatch_warns)
-        assert not any("f_match" in w for w in mismatch_warns)
-        assert not any("f_no_def_in_c" in w for w in mismatch_warns)
-        assert not any("f_no_proto_at_all" in w for w in mismatch_warns)
-
-    def test_function_pointer_param_not_split(self):
-        """Function pointer parameters with commas must not be mistakenly split into multiple params."""
-        code = "int reg_cb(void (*callback)(int a, int b), int flags);"
-        protos = bcd.extract_prototypes_from_code(code)
-        assert len(protos) == 1
-        params = bcd._split_param_tokens(protos[0]["param_tokens"])
-        assert len(params) == 2  # callback and flags, not 3
-
-
-# ===========================================================================
-# 3. Stress-test `pipeline_make.py` parameters
+# 2. Stress-test `pipeline_make.py` parameters
 # ===========================================================================
 
 

@@ -14,60 +14,53 @@ sys.path.insert(0, str(SCRIPTS))
 
 import build_callgraph_dag as bcd  # noqa: E402
 import module_map  # noqa: E402
+import tiers  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
-T1A = "Tier 1A (Binary Parser)"
-T2 = "Tier 2 (Heap/Tree Parser)"
-T3 = "Tier 3 (Internal State / Glue Module)"
-
-
-def _fn(module: str, file: str, *, static: bool = False, callees: list[str] | None = None) -> dict:
-    return {
-        "module": module,
-        "file": file,
-        "is_static": static,
-        "internal_callees": callees or [],
-        "external_callees": [],
-    }
-
-
-def _lexer_dag() -> dict:
-    """The I5a view: lexer modules `decode`, `encode`, `util` (in the library) and `tool` (an executable)."""
-    functions = {
-        "dec_run": _fn("decode", "src/decode.c", callees=["dec_step", "u_len"]),
-        "dec_step": _fn("decode", "src/decode.c", static=True),
-        "enc_run": _fn("encode", "src/encode.c", callees=["u_len"]),
-        "u_len": _fn("util", "src/util.c"),
-        "main": _fn("tool", "tools/main.c", callees=["dec_run"]),
-        "t_case": _fn("tests", "tests/t.c"),
-    }
-    modules = {
-        "decode": {"tier": T1A, "cppflags": ["-DDEC"], "run_eva": True, "run_eacsl_fuzz": True, "run_wp_full": True},
-        "encode": {"tier": T2, "cppflags": ["-DENC"], "run_eva": True, "run_eacsl_fuzz": True, "run_wp_full": False},
-        "util": {"tier": T3, "cppflags": [], "run_eva": True, "run_eacsl_fuzz": False, "run_wp_full": False},
-        "tool": {"tier": T3, "cppflags": [], "run_eva": True, "run_eacsl_fuzz": False, "run_wp_full": False},
-        "tests": {"tier": T3, "cppflags": [], "run_eva": True, "run_eacsl_fuzz": False, "run_wp_full": False},
-    }
-    for name, mod in modules.items():
-        mod["module"] = name
-        mod["functions"] = sorted(k for k, f in functions.items() if f["module"] == name)
-    return {"functions": functions, "modules": modules}
+T1A, T2, T3 = tiers.TIER_1A, tiers.TIER_2, tiers.TIER_3
+# The tiers the step I8 rules would give; set by hand so that these tests only exercise the views.
+TIERS = {"dec_run": T1A, "dec_step": T1A, "enc_run": T2, "u_len": T3, "main": T3, "t_case": T3}
 
 
 def _model() -> dict:
-    def mf(file: str, name: str) -> dict:
-        return {"file": file, "name": name}
+    """Path modules `decode`, `encode`, `util` (in the library), `tools` (an executable) and `tests`."""
+
+    def mf(file: str, name: str, line: int, static: bool = False) -> dict:
+        return {
+            "file": file,
+            "name": name,
+            "line": line,
+            "end_line": line + 2,
+            "lines": 3,
+            "static": static,
+            "loops": 0,
+            "cyclomatic": 1,
+            "signature": "int(int)",
+            "source": "frama-c-kernel",
+            "units": [UNIT_OF[file]],
+        }
+
+    def edge(caller: str, callee: str) -> dict:
+        return {"caller": caller, "callee": callee, "kind": "direct"}
 
     return {
+        "status": "ok",
         "functions": {
-            "src/decode.c#dec_run": mf("src/decode.c", "dec_run"),
-            "src/decode.c#dec_step": mf("src/decode.c", "dec_step"),
-            "src/encode.c#enc_run": mf("src/encode.c", "enc_run"),
-            "src/util.c#u_len": mf("src/util.c", "u_len"),
-            "tools/main.c#main": mf("tools/main.c", "main"),
-            "tests/t.c#t_case": mf("tests/t.c", "t_case"),
+            "src/decode.c#dec_run": mf("src/decode.c", "dec_run", 1),
+            "src/decode.c#dec_step": mf("src/decode.c", "dec_step", 5, static=True),
+            "src/encode.c#enc_run": mf("src/encode.c", "enc_run", 1),
+            "src/util.c#u_len": mf("src/util.c", "u_len", 1),
+            "tools/main.c#main": mf("tools/main.c", "main", 1),
+            "tests/t.c#t_case": mf("tests/t.c", "t_case", 1),
         },
+        "edges": [
+            edge("src/decode.c#dec_run", "src/decode.c#dec_step"),
+            edge("src/decode.c#dec_run", "src/util.c#u_len"),
+            edge("src/encode.c#enc_run", "src/util.c#u_len"),
+            edge("tools/main.c#main", "src/decode.c#dec_run"),
+        ],
+        "entry_points": ["tools/main.c#main"],
         "units": {
             # Listed executable-first to check that libraries own shared files.
             "kvtool": {
@@ -89,8 +82,28 @@ def _model() -> dict:
     }
 
 
+UNIT_OF = {
+    "src/decode.c": "lib/libkv.a",
+    "src/encode.c": "lib/libkv.a",
+    "src/util.c": "lib/libkv.a",
+    "tools/main.c": "kvtool",
+    "tests/t.c": "kvtest",
+}
+
+
+def _tiered(dag: dict) -> dict:
+    for key, rec in dag["functions"].items():
+        rec["tier"] = TIERS[key]
+    return tiers.retier_modules(dag)
+
+
+def _path_dag() -> dict:
+    """The I5a view: path modules as the modules."""
+    return _tiered(bcd.model_view(_model()))
+
+
 def _units() -> dict:
-    return bcd.unit_view(_lexer_dag(), _model())
+    return _tiered(bcd.unit_view(bcd.model_view(_model()), _model()))
 
 
 def test_unit_module_names_are_make_safe() -> None:
@@ -102,14 +115,14 @@ def test_unit_module_names_are_make_safe() -> None:
 def test_unit_cppflags_are_single_tokens() -> None:
     flags, forced = bcd.unit_cppflags(
         ["-DA", "-I", "inc", "-include", "config.h", "-isystem", "sys", "-std=c99", "-I", "inc"],
-        ["-Ilex", "-DLEGACY", "-Iinc"],
+        ["src", "inc"],
     )
-    assert flags == ["-DA", "-Iinc", "-Isys", "-std=c99", "-Ilex"]
+    assert flags == ["-DA", "-Iinc", "-Isys", "-std=c99", "-Isrc"]
     assert forced == ["config.h"]
-    # Rooted like the lexer's flags (relative to the run directory).
+    # Rooted at the DAG's target directory (relative to the run directory).
     flags, forced = bcd.unit_cppflags(
         ["-include", "config.h", "-I", "include", "-Ilib", "-I.", "-I/usr/inc"],
-        ["-Iworkspace/work/lib"],
+        ["lib", ""],
         "workspace/work",
     )
     assert flags == ["-Iworkspace/work/include", "-Iworkspace/work/lib", "-Iworkspace/work", "-I/usr/inc"]
@@ -171,9 +184,9 @@ def test_modules_are_the_non_test_link_units() -> None:
     assert lib["functions"] == ["dec_run", "dec_step", "enc_run", "u_len"]
     assert lib["lexer_modules"] == ["decode", "encode", "util"]
     assert lib["candidate_entry_points"] == ["dec_run", "enc_run", "u_len"]
-    # The build's flags only: the lexer's Makefile -D flags can contradict them.
-    assert lib["cppflags"] == ["-DLIB"] and lib["force_includes"] == []
-    # The most demanding tier and run flags of its lexer modules.
+    # The build's flags, then the sources' directories (no capture here, so no header directories).
+    assert lib["cppflags"] == ["-DLIB", "-Isrc"] and lib["force_includes"] == []
+    # The most demanding tier and run flags of its functions.
     assert lib["tier"] == T1A and lib["run_wp_full"] and lib["run_eacsl_fuzz"]
     # An executable needs the sources of the libraries it links.
     assert tool["functions"] == ["main"] and tool["candidate_entry_points"] == ["main"]
@@ -192,14 +205,14 @@ def test_functions_keep_their_lexer_module_and_tier() -> None:
     assert dag["unit_of_lexer_module"] == {
         "decode": "libkv_a",
         "encode": "libkv_a",
-        "tool": "kvtool",
+        "tools": "kvtool",
         "util": "libkv_a",
     }
-    assert set(dag["lexer_modules"]) == {"decode", "encode", "util", "tool", "tests"}
+    assert set(dag["lexer_modules"]) == {"decode", "encode", "util", "tools", "tests"}
 
 
 def test_without_units_the_dag_is_unchanged() -> None:
-    dag = _lexer_dag()
+    dag = _path_dag()
     assert bcd.unit_view(copy.deepcopy(dag), {"units": {}}) == dag
 
 
@@ -216,7 +229,7 @@ def test_module_map_resolves_sub_modules_to_their_unit() -> None:
     mm = module_map.ModuleMap(_units(), _sidecars())
     assert mm.units_are_link_units
     assert mm.unit_of("decode") == "libkv_a" and mm.unit_of("kvtool") == "kvtool"
-    assert mm.unit_of("util") == "libkv_a"  # no sidecar: through the lexer module
+    assert mm.unit_of("util") == "libkv_a"  # no sidecar: through the path module
     assert mm.unit_of("nowhere") == "nowhere"
     assert mm.same_unit("decode", "encode") and not mm.same_unit("decode", "kvtool")
     assert mm.submodules("libkv_a") == ["decode", "encode", "extra"]
@@ -239,10 +252,10 @@ def test_module_map_scope_tier_and_flags() -> None:
 
 
 def test_module_map_is_the_identity_without_link_units() -> None:
-    dag = _lexer_dag()
+    dag = _path_dag()
     mm = module_map.ModuleMap(dag, {"decode": {"sources": ["src/decode.c"]}})
     assert not mm.units_are_link_units
-    for m in ("decode", "encode", "tool", "unknown"):
+    for m in ("decode", "encode", "tools", "unknown"):
         assert mm.unit_of(m) == m
     assert mm.submodules("decode") == ["decode"] and not mm.is_submodule("decode")
     assert mm.scope_functions("decode") == ["dec_run", "dec_step"]

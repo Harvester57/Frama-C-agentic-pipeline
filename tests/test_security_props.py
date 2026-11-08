@@ -386,16 +386,16 @@ def test_brief_entries_name_what_to_discharge():
 
 @pytest.mark.unit
 def test_dag_no_longer_infers_layers_4_to_6():
-    from build_callgraph_dag import infer_security_properties
+    from build_callgraph_dag import termination_properties
 
-    body = {
+    rec = {
         "has_loops": False,
         "loop_count": 0,
         "writes_bounded_buffer": True,
         "uses_format_or_write": True,
         "has_zeroization": True,
     }
-    assert infer_security_properties("f", body, body, False, "f is in the threat model") == []
+    assert termination_properties(rec) == []
 
 
 # ---------------------------------------------------------------------------------------------------
