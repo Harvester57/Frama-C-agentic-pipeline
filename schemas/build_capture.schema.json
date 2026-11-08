@@ -37,13 +37,14 @@
         "seconds": {"type": "number", "minimum": 0},
         "jobs": {"type": "integer", "minimum": 1},
         "attempts": {
-          "$comment": "One per build run: a build that fails in parallel is retried once with one job.",
+          "$comment": "One per build run: a build that fails or times out in parallel is retried once with one job.",
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
               "jobs": {"type": "integer", "minimum": 1},
               "returncode": {"type": "integer"},
+              "timed_out": {"type": "boolean"},
               "seconds": {"type": "number", "minimum": 0}
             },
             "required": ["jobs", "returncode", "seconds"]
@@ -137,7 +138,15 @@
         "libraries": {"type": "array", "items": {"$ref": "#/definitions/system_file"}},
         "excluded": {"type": "object"},
         "packages": {"type": "array", "items": {"type": "string"}},
-        "extra": {"type": "array", "items": {"type": "string"}}
+        "extra": {"type": "array", "items": {"type": "string"}},
+        "generated": {
+          "$comment": "Headers the build generated (named by cc -M, absent from the target), copied into the snapshot.",
+          "type": "object",
+          "properties": {
+            "headers": {"type": "array", "items": {"type": "string"}},
+            "include_dirs": {"type": "array", "items": {"type": "string"}}
+          }
+        }
       },
       "required": ["root", "digest", "files", "headers", "libraries", "packages"]
     },

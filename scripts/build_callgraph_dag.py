@@ -30,11 +30,12 @@ Eva and WP. A model that lacks one of the facts above (a version 1 model: `phase
 gives one DAG warning per missing fact, saying what the DAG cannot derive without it (the
 `dynamic_allocation` blocker and Tier 2, format/write detection, buffer direction, trust).
 
-**Fields kept and dropped** (docs/phase0-remediation-plan.md R4, D9: a field stays when the report, the
-benchmark or a skill step reads it). Kept: per function `indirect_callees` (the slice skill's review of
-function-pointer sites); per module `cross_module_callees` (Step 3 of the slice skill) and `entry_trust`
-(Step 1d). Dropped: per module `provable_functions` and `shell_unverifiable_functions`, which nothing
-read; each function's `verifiability` says the same.
+**Fields dropped** (docs/phase0-remediation-plan.md R4, D9: a field stays only when the report or the
+benchmark shows it; the skills describe what the pipeline gives, not the reverse). Per function
+`indirect_callees`: `internal_callees` holds the indirect edges, and `wp_notes`/`verifiability` name the
+sites that need `//@ calls`. Per module `cross_module_callees` (`required_sources` already holds the
+sibling sources), `entry_trust` (each function's `trust` holds it), `provable_functions` and
+`shell_unverifiable_functions` (each function's `verifiability`).
 """
 
 from __future__ import annotations
@@ -632,7 +633,6 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
             "module": name,
             "files": sorted(mod_files),
             "required_sources": required,
-            "cross_module_callees": cross,
             "external_callees": sorted({c for k in fns for c in functions[k]["external_callees"]}),
             "cppflags": flags,
             "function_count": len(fns),
@@ -674,8 +674,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
       with their facts (see the module docstring), and the source WP blockers (`source_facts`) when
       `sources` can read the function's lines;
     - `internal_callees` are the model's edges, direct and indirect (type-matched function pointers,
-      thread starts, callbacks), so waves, the WP scheduler and the hypothesis audit see them; the
-      indirect ones are also listed in `indirect_callees`;
+      thread starts, callbacks), so waves, the WP scheduler and the hypothesis audit see them;
     - a function's path module (`lexer_module`, and `module` in this view) is its file's, and a header
       function's is the one owning most of the sources of the units compiling it;
     - `macro_aliases` maps each alias the model found to the DAG keys of its functions;
@@ -728,13 +727,10 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             flags_of.setdefault(f, flags)
 
     succ: dict[str, set[str]] = defaultdict(set)
-    indirect: dict[str, set[str]] = defaultdict(set)
     for e in model.get("edges") or []:
         caller, callee = key_of.get(e.get("caller")), key_of.get(e.get("callee"))
         if caller and callee:
             succ[caller].add(callee)
-            if e.get("kind") == "indirect":
-                indirect[caller].add(callee)
     site_exprs: dict[str, list[str]] = defaultdict(list)
     for site in model.get("indirect_sites") or []:
         expr = str(site.get("expr") or "")
@@ -761,7 +757,6 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             **signature_facts(m),
             **call_facts(m, site_exprs.get(fid, [])),
             "internal_callees": sorted(succ[key] - {key}),
-            "indirect_callees": sorted(indirect[key] - {key}),
             "self_recursive": key in succ[key],
             "callgraph_source": source,
             "units": list(m.get("units") or []),
@@ -994,9 +989,6 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             ),
             "files": sorted(f for f in sources if unit_of_file.get(f) == u),
             "required_sources": sources,
-            "cross_module_callees": sorted(
-                {c for k in fns for c in functions[k].get("internal_callees") or [] if c not in fn_set}
-            ),
             "external_callees": sorted({c for k in fns for c in functions[k].get("external_callees") or []}),
             "cppflags": flags,
             "force_includes": forced,
@@ -1004,13 +996,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "functions": fns,
             "candidate_entry_points": entries or [k for k in fns if not functions[k].get("is_static")],
             "lexer_modules": sorted({functions[k]["lexer_module"] for k in fns if functions[k].get("lexer_module")}),
-            # Step I7: the threat model's status for the unit, and each entry point's trust.
+            # Step I7: the threat model's status for the unit (each function's `trust` holds its own).
             "threat_model": (rec.get("trust") or {}).get("threat_model"),
-            "entry_trust": {
-                k: {t: functions[k]["trust"].get(t) for t in ("value", "source", "boundary")}
-                for k in (entries or [])
-                if isinstance(functions[k].get("trust"), dict)
-            },
         }
     # Functions no unit compiles (none in a successful model) keep their path module.
     for key, rec in functions.items():

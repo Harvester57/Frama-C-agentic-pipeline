@@ -250,7 +250,6 @@ def test_modules_are_the_non_test_link_units() -> None:
     assert tool["functions"] == ["main"] and tool["candidate_entry_points"] == ["main"]
     assert tool["required_sources"] == ["tools/main.c", "src/decode.c", "src/encode.c", "src/util.c"]
     assert tool["files"] == ["tools/main.c"]
-    assert "dec_run" in tool["cross_module_callees"]
 
 
 def test_functions_keep_their_lexer_module_and_tier() -> None:

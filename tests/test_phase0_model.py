@@ -643,7 +643,6 @@ def model_run():
             "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
             "-v", f"{ROOT / 'schemas'}:/opt/framac-pipeline/schemas:ro", "-w", "/framac-run",
         ]  # fmt: skip
-        docker([*common, "--user", "root", "--entrypoint", "sh", BUILD_IMAGE, "-c", "chmod 1777 /framac-scratch"])
         py = "python3 /opt/framac-pipeline/scripts"
         cap = docker(
             [*common, BUILD_IMAGE,

@@ -258,8 +258,8 @@ def test_the_dag_records_its_schema_version_and_drops_unread_module_fields(tmp_p
     assert dag["schema_version"] == bcd.DAG_SCHEMA_VERSION
     mod = dag["modules"]["liba_a"]
     assert "provable_functions" not in mod and "shell_unverifiable_functions" not in mod
-    assert {"cross_module_callees", "entry_trust"} <= set(mod)
-    assert "indirect_callees" in dag["functions"]["grow"]
+    assert not {"cross_module_callees", "entry_trust"} & set(mod)
+    assert "indirect_callees" not in dag["functions"]["grow"]
     # A DAG that never went through block_fallback_units (held modules) has no version.
     assert "schema_version" not in bcd.build_dag(tmp_path, _v2_model(), units=False)
     assert bcd.block_fallback_units({"modules": {}})["schema_version"] == bcd.DAG_SCHEMA_VERSION

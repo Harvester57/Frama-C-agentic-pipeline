@@ -136,7 +136,6 @@ def test_functions_and_edges_come_from_the_model(target: Path) -> None:
     assert "template_only" not in dag["functions"]
     run = dag["functions"]["api_run"]
     assert run["internal_callees"] == ["cb", "hin", "src/a.c#helper"]
-    assert run["indirect_callees"] == ["cb"]
     assert run["callgraph_source"] == "frama_c"
     assert run["has_loops"] and run["loop_count"] == 1
     assert dag["functions"]["src/b.c#helper"]["internal_callers"] == ["api_other"]

@@ -70,7 +70,7 @@ Phase 0 needs the target's own build: what it compiles, links and exports. A tar
 2. **Capture.** Run it in the build image, on the run's scratch volume, sized as `phase-dynamic`. Pass the recipe's packages as target packages, so the wrapper builds the derived build image `framac-build:<repo>`:
 
    ```powershell
-   & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch -Class phase-dynamic `
+   & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch `
      [-TargetPackages "<pkg1> <pkg2>"] "python3 /opt/framac-pipeline/scripts/build_capture.py run"
    ```
 
@@ -110,7 +110,7 @@ Parse every non-test link unit of the capture with Frama-C, on the same scratch 
 How it runs:
 - Units with the same sources and flags share one parse.
 - Each parse takes a `parse` lease from the broker (`--no-broker` skips it, `--jobs N` caps the parallel parses).
-- Target headers come from the capture's snapshot, generated headers (`config.h`) from the build tree on the volume.
+- Target headers come from the capture's snapshot, and so do the headers the build generated (`config.h`): the capture copies them into the snapshot's `generated/` and every analysis adds that directory with `-idirafter`.
 - `python3 /opt/framac-pipeline/scripts/phase0_model.py selftest` checks the dump module against the image's kernel. The image build runs it; run it again if the model fails to load its module.
 
 The result is `workspace/reports/phase0_model.json`, validated against `schemas/phase0_model.schema.json`. Every fact carries its source:
@@ -159,7 +159,7 @@ After changing the threat model, run `trust.py run`, then rebuild the DAG (Step 
 ```powershell
 & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Class phase-static `
   "python3 /opt/framac-pipeline/scripts/run_metadata.py set-codeql --enable --open-source --declared-by user"
-& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Scratch -CodeQL -TargetPackages "<pkgs>" -Class phase-dynamic `
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -Scratch -CodeQL -TargetPackages "<pkgs>" `
   "python3 /opt/framac-pipeline/scripts/codeql_trust.py run && python3 /opt/framac-pipeline/scripts/trust.py run"
 ```
 
@@ -176,7 +176,7 @@ Consumers of trust:
 Record the arguments the target's own programs pass to the API. With a test command these are the tests; without one, the project's non-test executables (demos, tools). Run it in the build image, on the same scratch volume, after the model:
 
 ```powershell
-& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch -Class phase-dynamic `
+& ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch `
   [-TargetPackages "<pkg1> <pkg2>"] "python3 /opt/framac-pipeline/scripts/seed_harvest.py record"
 ```
 
@@ -204,7 +204,7 @@ python3 /opt/framac-pipeline/scripts/build_callgraph_dag.py --target workspace/w
 
 It reads `workspace/reports/phase0_model.json` from Step 1c (`--model PATH` to point elsewhere). Its functions and call edges are the model's:
 - One record per function a non-test link unit compiles, under its real name, keyed by plain name or `file#name` when the name collides. Files the build does not compile (alternative backends, templates, tests, examples) are not in the DAG.
-- `internal_callees` holds Frama-C's direct and indirect edges (type-matched function pointers, thread starts, callbacks), and `indirect_callees` holds the indirect ones alone. Waves, the WP scheduler, the reach gate and the hypothesis audit use both.
+- `internal_callees` holds Frama-C's direct and indirect edges (type-matched function pointers, thread starts, callbacks). Waves, the WP scheduler, the reach gate and the hypothesis audit use them.
 - Each function has a `callgraph_source`: `frama_c`, or `gcc_callgraph` for a unit on the GCC fallback. A fallback function also carries `callgraph_fallback` (Frama-C's first error), and its unit is listed in `model.gcc_fallback_units`. The fallback unit's record, and those of its path modules and clusters, get `run_eva` and `run_wp_full` false and `fuzz_engine: sanitizers`, and the functions it holds get `eva_wp_blocked` (the reason). A `params set --fuzz-engine` still wins over the DAG's engine.
 - Header functions are marked `header`. Only those an entry point of the build reaches (`reached`) get active ledger units; the others are seeded `deferred` (`header_unreached`).
 - `macro_aliases` maps each alias the build defines to the functions it names. The harness generator and the reach gate resolve calls through it.
@@ -215,7 +215,7 @@ It reads `workspace/reports/phase0_model.json` from Step 1c (`--model PATH` to p
 - `cppflags`: the build's own flags, as single tokens, relative to the run directory;
 - `force_includes`: the build's `-include` headers, kept apart (the harness generator applies them);
 - `candidate_entry_points`: its API (exported functions, `main` for an executable, an executable's embedded API);
-- `entry_trust` and `threat_model` (Step 1d);
+- `threat_model`: the threat model's status for the unit (Step 1d; each function's `trust` holds its own mark);
 - `concurrent`: the code starts threads. The report then says that the unit's Eva and WP results assume sequential execution.
 
 Each unit's files are also partitioned by directory into smaller **directory modules**. They name the harness sub-modules of Step 4.
@@ -235,8 +235,8 @@ Each function records `tier`, `tier_reasons` and `untrusted_path`. A module (lin
 Each cluster becomes `submodules.<unit>__<file stem>` (`unit`, `anchors` = its entry points, `functions`, `lines`, its tier and run flags). The unit records `split` (reason, sub-modules, `unclustered` functions no entry point reaches), and the DAG records `unit_split` (thresholds and one row per unit). `--split-max-functions` / `--split-max-lines` change the thresholds; `unit_split.py show` prints the clusters for other thresholds without writing the DAG. No benchmark unit splits at the default limits.
 
 Review `workspace/reports/callgraph_dag.json`:
-- Each module's `required_sources`, `cross_module_callees`, `external_callees`, `cppflags` and `force_includes`.
-- `recursion_cycles`, and functions with `indirect_callees` (function-pointer call sites; WP needs `//@ calls f1, f2;` or `//@ assert fp \in {...};` there).
+- Each module's `required_sources`, `external_callees`, `cppflags` and `force_includes`.
+- `recursion_cycles`.
 - Each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`) and `wp_notes` (indirect calls that need `//@ calls`, recursion that needs `decreases`). They are derived from the model's signature, formals, external calls and indirect sites, and from the definition's source lines in the work tree: a backward `goto`, `container_of`, `volatile` and inline assembly. The source check skips comments and strings but does not see inside the macros a function uses.
 - `model.gcc_fallback_units` and the DAG's `warnings`.
 - Record any tier override with a source-backed reason.
@@ -255,7 +255,7 @@ A module's route is that of its most demanding function, so a harness module hol
 ## Step 3 — Stub External Libraries & Generate Security Properties
 
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module, check `required_sources` and `external_callees` in `callgraph_dag.json`:
-- **In-repository callees (`cross_module_callees`):** Compile the sibling `.c` files listed in `required_sources` together in the slice rather than stubbing them, so call chains into sibling modules remain reachable for fuzzing, Eva, and WP.
+- **In-repository callees:** Compile the sibling `.c` files listed in `required_sources` together in the slice rather than stubbing them, so call chains into sibling modules remain reachable for fuzzing, Eva, and WP.
 - **True external library calls (`external_callees`):** Under Frama-C (`__FRAMAC__`), external functions **must remain bodyless prototypes** (declared in real target headers, `/opt/framac-pipeline/templates/fc_stubs/` for `bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, or `/opt/framac-pipeline/templates/acsl/external_stubs.h`) with optional ACSL contracts (`requires`, `assigns`, `ensures`). **Never** give an external function a dummy C body like `{ return 0; }` under Frama-C: a C body hides the open assumption from the ledger (`Considered valid` / `STATUS_ASSUMED`) and makes callers falsely appear proven under `return 0;`.
 - **Network/IPC boundary stubs for dynamic fuzzing:** If a module reads input through a blocking socket/port helper (e.g., `RECEIVE_MESSAGE`), put `extern` declarations in a `.h` file and function definitions in a single `.c` file (never define functions in a force-included header across multiple TUs), and inject `fuzz_buf` on **every** call (never gate injection on a `static int calls` counter, which would block all LibFuzzer iterations after the first).
 
