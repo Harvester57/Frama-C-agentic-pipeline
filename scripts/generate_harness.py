@@ -1247,8 +1247,17 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str) -
             if not isinstance(raw_flag, str) or not raw_flag.strip():
                 continue
             norm_flag = _normalize_dag_cppflag(raw_flag.strip())
-            if norm_flag.startswith(("-I", "-D", "-U", "-std=")):
-                cppflags = _append_cppflag(cppflags, norm_flag)
+            if not norm_flag.startswith(("-I", "-D", "-U", "-std=")):
+                continue
+            # Not carried into the harness: a macro value with quotes or spaces (later stages split
+            # and re-join flag strings, and `-DLOG="log.txt"` reaches the compiler as `log.txt`), and,
+            # with link units, the build's `-std=` (the harness code is ours, and needs C99 or later
+            # where a build may say -std=c89). The harness spec supplies such flags itself.
+            if norm_flag.startswith("-D") and any(c in norm_flag for c in "\"' \\"):
+                continue
+            if norm_flag.startswith("-std=") and dag.get("module_kind") == "link_unit":
+                continue
+            cppflags = _append_cppflag(cppflags, norm_flag)
         # The unit's force-included files (`-include config.h` in the build): without them the
         # harness compiles different code than the build does.
         tokens = _split_cppflags(cppflags)
