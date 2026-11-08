@@ -236,7 +236,7 @@ Each cluster becomes `submodules.<unit>__<file stem>` (`unit`, `anchors` = its e
 Review `workspace/reports/callgraph_dag.json`:
 - Each module's `required_sources`, `cross_module_callees`, `external_callees`, `cppflags` and `force_includes`.
 - `recursion_cycles`, and functions with `indirect_callees` (function-pointer call sites; WP needs `//@ calls f1, f2;` or `//@ assert fp \in {...};` there).
-- Each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `dynamic_allocation`) and `wp_notes` (indirect calls that need `//@ calls`, recursion that needs `decreases`). They are derived from the model's signature, formals, external calls and indirect sites; goto, `container_of`, volatile and inline-asm patterns are no longer flagged in Phase 0.
+- Each function's `verifiability` (`core_provable`, `needs_calls_annotation`, or `shell_unverifiable_wp`), `wp_blockers` (`fuzz_or_eva_harness_entrypoint`, `internal_variadic`, `irreducible_goto`, `dynamic_allocation`, `container_of`, `volatile_or_asm`) and `wp_notes` (indirect calls that need `//@ calls`, recursion that needs `decreases`). They are derived from the model's signature, formals, external calls and indirect sites, and from the definition's source lines in the work tree: a backward `goto`, `container_of`, `volatile` and inline assembly. The source check skips comments and strings but does not see inside the macros a function uses.
 - `model.gcc_fallback_units` and the DAG's `warnings`.
 - Record any tier override with a source-backed reason.
 

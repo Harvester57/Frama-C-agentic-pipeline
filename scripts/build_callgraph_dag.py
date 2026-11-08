@@ -9,7 +9,8 @@ Writes the call-graph DAG (workspace/reports/callgraph_dag.json) from the Phase 
   leaves) and recursion cycles.
 - **Per-function facts, all from the model:** lines, storage, loops and cyclomatic complexity; from the
   signature, the parameters, pointer parameters, pointer result and variadic; from the external calls,
-  allocation and formatting; the indirect call sites; trust (scripts/trust.py). From these, the WP
+  allocation and formatting; the indirect call sites; trust (scripts/trust.py). From the source lines
+  of each definition, backward gotos, `container_of`, volatile and inline assembly. From these, the WP
   blockers and notes, and the termination obligation (Layer 2).
 - **Modules:** the build's link units (`unit_view`, step I5b), libraries first: their sources plus the
   sources of the project libraries they link, the build's flags, their API entry points. Units too
@@ -335,11 +336,85 @@ def call_facts(m: dict, indirect_exprs: list[str]) -> dict:
     }
 
 
+# Source tokens that make a function a WP shell: a volatile access or inline assembly.
+VOLATILE_OR_ASM_TOKENS = frozenset({"volatile", "__volatile", "__volatile__", "asm", "__asm", "__asm__"})
+# Words followed by `:` that are not statement labels, and words `goto` cannot name.
+_NOT_LABELS = frozenset({"default", "case", "goto", "return", "break", "continue", "else", "do"})
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def source_facts(text: str) -> dict[str, bool]:
+    """
+    WP blockers in a function's source text (its definition's lines in the model): a backward goto
+    (a loop WP cannot attach an invariant to), `container_of` (a cast from a member back to its
+    struct), and a volatile access or inline assembly. These are the rules of the token lexer the
+    DAG used before step I10a, applied to the model's line span of the function; the kernel AST
+    cannot give them, as `container_of` is a macro and Frama-C adds gotos of its own. Comments and
+    string literals are skipped; code inside macros the function calls is not seen.
+    """
+    from acsl_ast import AcslError, tokenize_c_acsl
+
+    out = {"has_backward_goto": False, "has_container_of": False, "has_volatile_or_asm": False}
+    try:
+        tokens = [t for t in tokenize_c_acsl(text) if t.kind in ("c_token", "string")]
+    except AcslError:
+        return out
+    start = next((i for i, t in enumerate(tokens) if t.text == "{"), None)
+    if start is None:
+        return out
+    body = tokens[start:]
+    labels: dict[str, int] = {}
+    gotos: list[tuple[str, int]] = []
+    for i, tok in enumerate(body):
+        t = tok.text
+        if t in VOLATILE_OR_ASM_TOKENS:
+            out["has_volatile_or_asm"] = True
+        elif t == "container_of":
+            out["has_container_of"] = True
+        elif t == "goto" and i + 1 < len(body) and _IDENT_RE.match(body[i + 1].text):
+            gotos.append((body[i + 1].text, i))
+        elif (
+            _IDENT_RE.match(t)
+            and t not in _NOT_LABELS
+            and i + 1 < len(body)
+            and body[i + 1].text == ":"
+            and body[i - 1].text in (";", "{", "}", ":")
+        ):
+            labels.setdefault(t, i)
+    out["has_backward_goto"] = any(label in labels and labels[label] < at for label, at in gotos)
+    return out
+
+
+class SourceLines:
+    """Lines of the project files under `root`, read once each; a missing file gives no text."""
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self._lines: dict[str, list[str] | None] = {}
+
+    def span(self, rel: str, first: int, last: int) -> str | None:
+        if self.root is None or first <= 0:
+            return None
+        if PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
+            return None
+        if rel not in self._lines:
+            try:
+                path = self.root / rel
+                self._lines[rel] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except (OSError, ValueError):
+                self._lines[rel] = None
+        lines = self._lines[rel]
+        if lines is None:
+            return None
+        return "\n".join(lines[first - 1 : max(first, last)])
+
+
 def wp_facts(name: str, rec: dict) -> dict:
     """
-    WP blockers (a harness entry point, a variadic definition, heap allocation: the function goes to
-    the unverifiable shell), notes for the prover, and the verifiability class. Recursion is noted once
-    the cycles are known.
+    WP blockers (a harness entry point, a variadic definition, a backward goto, heap allocation,
+    `container_of`, a volatile access or inline assembly: the function goes to the unverifiable
+    shell), notes for the prover, and the verifiability class. Recursion is noted once the cycles
+    are known.
     """
     blockers: list[str] = []
     notes: list[str] = []
@@ -349,8 +424,14 @@ def wp_facts(name: str, rec: dict) -> dict:
     if rec["is_variadic"]:
         blockers.append("internal_variadic")
         notes.append("internal variadic function: Frama-C WP does not support variadic function specifications")
+    if rec.get("has_backward_goto"):
+        blockers.append("irreducible_goto")
     if rec["has_dynamic_alloc"]:
         blockers.append("dynamic_allocation")
+    if rec.get("has_container_of"):
+        blockers.append("container_of")
+    if rec.get("has_volatile_or_asm"):
+        blockers.append("volatile_or_asm")
     if rec["indirect_calls"]:
         notes.append(f"indirect call(s) {rec['indirect_calls']} require '//@ calls <targets>;'")
     if blockers:
@@ -550,12 +631,13 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
     return modules
 
 
-def model_view(model: dict, capture: dict | None = None, root: str = "") -> dict:
+def model_view(model: dict, capture: dict | None = None, root: str = "", sources: SourceLines | None = None) -> dict:
     """
     The DAG of the Phase 0 model (scripts/phase0_model.py) with path modules as its modules:
 
     - functions are the model's (every function a non-test link unit compiles, under its real name),
-      with their facts (see the module docstring);
+      with their facts (see the module docstring), and the source WP blockers (`source_facts`) when
+      `sources` can read the function's lines;
     - `internal_callees` are the model's edges, direct and indirect (type-matched function pointers,
       thread starts, callbacks), so waves, the WP scheduler and the hypothesis audit see them; the
       indirect ones are also listed in `indirect_callees`;
@@ -650,6 +732,9 @@ def model_view(model: dict, capture: dict | None = None, root: str = "") -> dict
             "units": list(m.get("units") or []),
             "header": bool(m.get("header")),
         }
+        text = sources.span(str(m["file"]), int(rec["line"]), int(rec["end_line"])) if sources else None
+        if text is not None:
+            rec.update(source_facts(text))
         rec.update(wp_facts(m["name"], rec))
         errors = sorted({fallback_error[u] for u in m.get("units") or [] if u in fallback_error})
         if errors:
@@ -876,7 +961,7 @@ def build_dag(
     """The DAG of `model` over the project tree `target_dir` (the run's workspace/work overlay)."""
     target_dir = target_dir.resolve()
     root = _run_root(target_dir)
-    view = model_view(model, capture, root)
+    view = model_view(model, capture, root, SourceLines(target_dir))
     view = {"target_dir": str(target_dir), **view}
     view["warnings"] = [
         f"skipped pipeline output directory inside the target: {rel} (move run results out of the target tree)"

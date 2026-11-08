@@ -165,6 +165,64 @@ def test_fallback_units_are_flagged(target: Path) -> None:
     assert any("GCC" in w for w in dag["warnings"])
 
 
+BLOCKERS_C = """\
+int retry(int n) {
+again:
+    if (n-- > 0) goto again;
+    return n;
+}
+int cleanup(int n) {
+    if (n < 0) goto out;   /* a forward goto: not a blocker */
+    n++;
+out:
+    return n; // goto out; volatile asm in a comment
+}
+struct item { int key; struct node link; };
+struct item *owner(struct node *p) {
+    return container_of(p, struct item, link);
+}
+void zero(unsigned char *p, int n) {
+    volatile unsigned char *q = p;
+    while (n--) *q++ = 0;
+}
+void fence(void) {
+    __asm__ __volatile__("" ::: "memory");
+}
+int quoted(void) {
+    const char *s = "goto volatile container_of";
+    return s[0];
+}
+"""
+
+
+def test_source_wp_blockers_come_back(tmp_path: Path) -> None:
+    """Backward gotos, container_of, volatile and asm make a function a WP shell (defect 2)."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/k.c").write_text(BLOCKERS_C, encoding="utf-8")
+    spans = {"retry": (1, 5), "cleanup": (6, 11), "owner": (13, 15), "zero": (16, 19), "fence": (20, 22)}
+    spans["quoted"] = (23, 26)
+    fns = {f"src/k.c#{n}": _fn("src/k.c", n, a, end_line=b, units=["lib"]) for n, (a, b) in spans.items()}
+    model = {
+        "status": "ok",
+        "functions": fns,
+        "edges": [],
+        "units": {"lib": {"kind": "library", "test": False, "files": ["src/k.c"], "parse": {"status": "ok"}}},
+        "entry_points": [],
+    }
+    fn = bcd.build_dag(tmp_path, model, units=False)["functions"]
+    assert fn["retry"]["wp_blockers"] == ["irreducible_goto"]
+    assert fn["owner"]["wp_blockers"] == ["container_of"]
+    assert fn["zero"]["wp_blockers"] == ["volatile_or_asm"]
+    assert fn["fence"]["wp_blockers"] == ["volatile_or_asm"]
+    for name in ("retry", "owner", "zero", "fence"):
+        assert fn[name]["verifiability"] == "shell_unverifiable_wp", name
+    for name in ("cleanup", "quoted"):
+        assert fn[name]["wp_blockers"] == [] and fn[name]["verifiability"] == "core_provable", name
+    # Without the sources (a file the work tree lacks), no source blocker is guessed.
+    (tmp_path / "src/k.c").unlink()
+    assert bcd.build_dag(tmp_path, model, units=False)["functions"]["retry"]["wp_blockers"] == []
+
+
 def test_load_model_refuses_a_failed_model(tmp_path: Path) -> None:
     missing, why = bcd.load_model(tmp_path / "none.json")
     assert missing is None and "not found" in str(why)
