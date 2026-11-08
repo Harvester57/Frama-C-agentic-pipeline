@@ -679,8 +679,13 @@ def projects_in(corpus: Path, only: list[str] | None = None) -> list[Path]:
     return projects
 
 
-def project_spec(proj: Path, truth: dict) -> dict:
-    """bench/spec.json for one project: what build_capture.py reads (`--recipe-file`), no host path."""
+def project_spec(proj: Path, truth: dict, seeds: bool = True) -> dict:
+    """
+    bench/spec.json for one project: what build_capture.py reads (`--recipe-file`), no host path. The
+    project's `test` command (truth.json) becomes the recipe's test command, from which seed_harvest.py
+    records seeds (step I6), unless `seeds` is off.
+    """
+    test = truth.get("test") if seeds else None
     return {
         "id": proj.name,
         "repo": repo_name(proj),
@@ -690,7 +695,7 @@ def project_spec(proj: Path, truth: dict) -> dict:
         "assets": [],
         "compile_commands": None,
         "reach_exempt_modules": {},
-        "build": {"command": truth.get("build") or "make", "origin": "benchmark"},
+        "build": {"command": truth.get("build") or "make", "test_command": test, "origin": "benchmark"},
         "replays": [],
     }
 
@@ -707,7 +712,7 @@ def stage_plan(proj: Path, fuzz_budget: int) -> list[tuple[str, str, str | None]
     ]
 
 
-def run_project(proj: Path, work_dir: Path, run_id: str, fuzz_budget: int) -> dict:
+def run_project(proj: Path, work_dir: Path, run_id: str, fuzz_budget: int, seeds: bool = True) -> dict:
     truth = json.loads((proj / "truth.json").read_text(encoding="utf-8"))
     base = work_dir / "runs" / run_id / proj.name
     mount = (base / "target").resolve()
@@ -716,7 +721,7 @@ def run_project(proj: Path, work_dir: Path, run_id: str, fuzz_budget: int) -> di
         raise benchmark.BenchmarkError(f"{base} already exists: pass a new --run-id")
     shutil.copytree(proj, mount, ignore=shutil.ignore_patterns(*TARGET_EXCLUDES))
     (run_dir / benchmark.BENCH_SUBDIR).mkdir(parents=True)
-    spec = project_spec(proj, truth)
+    spec = project_spec(proj, truth, seeds)
     benchmark.write_json(run_dir / benchmark.BENCH_SUBDIR / "spec.json", spec)
     repo = spec["repo"]
     stages: dict[str, dict] = {}
@@ -765,6 +770,7 @@ def run_seeded(
     projects: list[str] | None = None,
     fuzz_budget: int = DEFAULT_FUZZ_BUDGET,
     corpus: Path = CORPUS,
+    seeds: bool = True,
 ) -> dict:
     """Run the set; write and return the results document (<work-dir>/results/<run-id>.{json,md})."""
     work_dir = work_dir.resolve()
@@ -778,11 +784,12 @@ def run_seeded(
         "pipeline": benchmark.pipeline_identity(),
         "fuzz_budget": fuzz_budget,
         "max_cases": MAX_CASES,
+        "seeds": seeds,
         "projects": {},
     }
     for proj in selected:
         try:
-            doc["projects"][proj.name] = run_project(proj, work_dir, run_id, fuzz_budget)
+            doc["projects"][proj.name] = run_project(proj, work_dir, run_id, fuzz_budget, seeds)
         except (benchmark.BenchmarkError, OSError, ValueError) as exc:  # one project failing keeps the others
             truth = json.loads((proj / "truth.json").read_text(encoding="utf-8"))
             doc["projects"][proj.name] = {
@@ -830,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--project", action="append", default=[], help="Only this project (repeatable)")
     p_run.add_argument("--fuzz-budget", type=int, default=DEFAULT_FUZZ_BUDGET, help="CPU-seconds per fuzz campaign")
     p_run.add_argument("--run-id", default=None)
+    p_run.add_argument("--no-seeds", action="store_true", help="Do not record seeds from the projects' tests")
     p_run.add_argument("--dry-run", action="store_true", help="Print the stages and wrapper commands; run nothing")
     p_score = sub.add_parser("score", help="Re-score an existing results file from its run directories")
     common(p_score)
@@ -851,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run(projects_in(args.corpus, args.project), work_dir.resolve(), run_id, args.fuzz_budget)
             return 0
         else:
-            doc = run_seeded(work_dir, args.run_id, args.project, args.fuzz_budget, args.corpus)
+            doc = run_seeded(work_dir, args.run_id, args.project, args.fuzz_budget, args.corpus, not args.no_seeds)
             print(f"Results: {work_dir.resolve() / 'results' / (doc['run_id'] + '.md')}")
     except (benchmark.BenchmarkError, OSError, ValueError) as exc:
         print(f"benchmark_seeded: {exc}", file=sys.stderr)
