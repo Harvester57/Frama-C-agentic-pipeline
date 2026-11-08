@@ -259,7 +259,7 @@ minimize: replay
 # Phases 1 and 2 are done once the Phase-3 queue is built from their ingested reports: record it,
 # so a resumed run starts at Phase 3.
 wp-queue: ingest facts
-	$(GATE) --need reach,build_check
+	$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/checkpoint.py save-phase state --phase 2 \
 		--from-file workspace/reports/wp_queue.json

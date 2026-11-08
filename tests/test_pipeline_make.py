@@ -16,6 +16,7 @@ import pytest
 
 import generate_harness
 import ledger
+import phase0_gates
 import pipeline_make as pm
 import validate_artifacts
 from conftest import evidence, metadata, unit, write_json
@@ -1358,7 +1359,11 @@ def test_build_check_fails_on_an_eacsl_fallback_and_names_the_error(tmp_path):
     )
     # snmp has no build report.
 
-    out = pm.build_check(run, runner=lambda targets, run_dir: calls.append(targets) or (0, {}), templates_dir=ACSL)
+    def runner(targets: list[str], run_dir: Path) -> tuple[int, dict]:
+        calls.append(targets)
+        return 0, {}
+
+    out = pm.build_check(run, runner=runner, templates_dir=ACSL)
     assert calls == [["build"]]
     assert out["ok"] is False
     mods = out["modules"]
@@ -1377,6 +1382,30 @@ def test_build_check_fails_on_an_eacsl_fallback_and_names_the_error(tmp_path):
     pm.params_set(run, "log", fuzz_engine="sanitizers")
     out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
     assert out["ok"] is True and out["modules"]["log"]["status"] == "sanitizers_chosen"
+
+
+def test_build_check_passes_a_plan_with_nothing_to_fuzz(tmp_path, monkeypatch):
+    # An Eva-only plan (or every module deferred under quick) has nothing to build-check: the gate
+    # passes and the stamp validates, instead of blocking the run's validation and wp-queue.
+    run = _make_run(tmp_path)
+    monkeypatch.setattr(pm.Plan, "fuzz_modules", property(lambda self: []))
+
+    def runner(targets: list[str], run_dir: Path) -> tuple[int, dict]:
+        raise AssertionError("nothing to build")
+
+    out = pm.build_check(run, runner=runner, templates_dir=ACSL)
+    assert out["ok"] is True and out["modules"] == {} and "nothing to build" in out["note"]
+    assert phase0_gates.check(run, None, ("build_check",)) == []
+    gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))
+    assert not validate_artifacts.validate_phase0_gates(gates)
+    # A plan with no module at all still fails, with how to fix it, and the failed stamp validates.
+    empty = pm.Plan(run, "quick", "", False, {}, set(), {}, None)
+    monkeypatch.setattr(pm, "build_plan", lambda run_dir, templates_dir=None: empty)
+    out = pm.build_check(run, runner=runner, templates_dir=ACSL)
+    assert out["ok"] is False and "gen" in out["error"]
+    assert phase0_gates.check(run, None, ("build_check",))
+    gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))
+    assert not validate_artifacts.validate_phase0_gates(gates)
 
 
 def test_build_check_names_the_error_of_the_attempt_that_failed_last(tmp_path):

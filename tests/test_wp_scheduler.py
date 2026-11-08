@@ -11,6 +11,7 @@ import pytest
 
 import checkpoint
 import ledger as L
+import phase0_gates
 import workspace_overlay
 import wp_scheduler as S
 from conftest import evidence, unit, write_json
@@ -982,6 +983,11 @@ def test_real_overlay_prepare_and_merge_round_trip(sim, monkeypatch):
 
 def test_status_and_cli(sim, capsys):
     sim.build({"a": ("src/m/a.c", "m", ["b"]), "b": ("src/m/b.c", "m", [])})
+    # init refuses to start Phase 3 without passed Phase 0 gates.
+    assert S.main(["init"]) == 1
+    capsys.readouterr()
+    phase0_gates.record_reach(sim.run_dir, {"modules": []})
+    phase0_gates.record_build_check(sim.run_dir, {"ok": True, "modules": {}})
     assert S.main(["init"]) == 0
     capsys.readouterr()
     assert S.main(["status"]) == 0

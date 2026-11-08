@@ -1162,13 +1162,9 @@ def run_target(
         stage("ingest", f"{py}/pipeline_make.py run ingest")
         if spec["replays"]:
             stage("gate", f"{py}/benchmark.py inner-gate", "light")
+        # wp-queue checks both Phase 0 gates, then checkpoints Phase 2, so an LLM host can continue
+        # this run directory with /framac-wp. A refused gate leaves Phase 2 unrecorded.
         stage("queue", f"{py}/pipeline_make.py run replay wp-queue")
-        # As /framac-verify does after Phase 2, so an LLM host can continue this run directory with /framac-wp.
-        stage(
-            "checkpoint",
-            f"{py}/checkpoint.py save-phase state --phase 2 --from-file workspace/reports/callgraph_dag.json",
-            "light",
-        )
     metrics = collect_target_metrics(run_dir, target, notes)
     metadata = read_json(run_dir / "run-metadata.json", {}) or {}
     entry = {

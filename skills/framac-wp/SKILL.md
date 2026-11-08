@@ -83,6 +83,8 @@ python3 /opt/framac-pipeline/scripts/wp_scheduler.py init
 
 When resuming a run that was interrupted, or one started before the scheduler existed, use `init --reconcile`. It returns `in_progress` units with no live agent to `planned` and reports briefs that need re-rendering.
 
+`init` (with or without `--reconcile`) checks the Phase 0 gates first (`workspace/reports/phase0_gates.json`) and exits 1 with the reasons when a gate failed, has not run, or a harness changed since the reach check. Repair the harness and re-run the gate (`/framac-slice` Step 5); never start Phase 3 around it.
+
 ### Step 2 — The reactive continuous loop (sliding window)
 
 Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` reports `"done": true`:

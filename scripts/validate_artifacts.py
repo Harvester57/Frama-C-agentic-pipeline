@@ -424,8 +424,10 @@ def validate_phase0_gates(data: Any) -> Errors:
         ):
             errors.add(f"$.{section}.modules: must map each module to an object with a boolean {row_flag!r}")
             continue
-        if entry[flag] != all(r[row_flag] for r in modules.values()):
-            errors.add(f"$.{section}.{flag}: must be true exactly when every module passed")
+        # A build-check that found no module in the plan records why (`error`) and fails.
+        expected = all(r[row_flag] for r in modules.values()) and not (not modules and entry.get("error"))
+        if entry[flag] != expected:
+            errors.add(f"$.{section}.{flag}: must be true exactly when every module passed and no error was recorded")
     return errors
 
 

@@ -101,6 +101,42 @@ def test_build_check_gate_covers_fuzzed_modules_only(tmp_path):
     assert "log" in phase0_gates.check(tmp_path, None, ("build_check",))[0]
 
 
+@pytest.mark.unit
+def test_the_whole_run_gate_refuses_stale_and_unchecked_modules(tmp_path, monkeypatch, capsys):
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 0); rec_print(0, 0);")
+    harness_reach.record_exempt(hdir, "tools", None, "example programs")
+    assert _reach(run, hdir) == 0
+    assert phase0_gates.check(run, None, ("reach",), ["api"]) == []
+    # A harness the reach check never saw (added after it ran) fails wp-queue's whole-run check.
+    assert "reach: late not checked" in phase0_gates.check(run, None, ("reach",), ["api", "late"])[0]
+    # So does a harness changed since the check, which only the per-module check used to notice.
+    (hdir / "harness_api.c").write_text("/* regenerated */\n", encoding="utf-8")
+    assert "harness of api changed" in phase0_gates.check(run, None, ("reach",))[0]
+
+    # Build-check covers the fuzzed modules the plan names; one it never built fails the run.
+    phase0_gates.record_build_check(run, {"ok": True, "modules": {"api": {"ok": True, "status": "eacsl"}}})
+    assert phase0_gates.check(run, None, ("build_check",), fuzzed_expected=["api"]) == []
+    reasons = phase0_gates.check(run, None, ("build_check",), fuzzed_expected=["api", "late"])
+    assert reasons == [f"build_check: late not checked; run `{phase0_gates.HOW_TO_RUN['build_check']}` again"]
+    argv = ["check", "--run-dir", str(run), "--need", "build_check", "--modules", "api", "--fuzzed", "api late"]
+    assert phase0_gates.main(argv) == 1
+    assert phase0_gates.main(["check", "--run-dir", str(run), "--need", "build_check", "--fuzzed", "api"]) == 0
+    with pytest.raises(SystemExit):
+        phase0_gates.main(["check", "--run-dir", str(run), "--module", "api", "--fuzzed", "api"])
+    capsys.readouterr()
+
+
+@pytest.mark.unit
+def test_wp_scheduler_init_refuses_a_failed_gate(tmp_path, monkeypatch, capsys):
+    import wp_scheduler
+
+    monkeypatch.chdir(tmp_path)
+    assert wp_scheduler.main(["init"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "Phase 0 gate" and any("has not run" in r for r in out["reasons"])
+
+
 def _build_report(run: Path, module: str, engine: str, returncode: int = 0) -> None:
     path = run / "workspace" / "build" / f"{module}.build.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,7 +207,9 @@ def test_seed_runs_the_reach_gate_and_wp_queue_needs_both():
     text = PIPELINE_MK.read_text(encoding="utf-8")
     assert re.search(r"^seed: reach-gate security-props$", text, re.MULTILINE)
     assert "harness_reach.py check" in _recipe(text, "reach-gate:")[0]
-    assert _recipe(text, "wp-queue: ingest facts")[0] == "\t$(GATE) --need reach,build_check"
+    assert _recipe(text, "wp-queue: ingest facts")[0] == (
+        '\t$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"'
+    )
     assert "\t$$(GATE) --module $(1) --need reach" in text  # the Eva tuning rungs
     assert "reach-gate" in pipeline_make.STAGE_OF_TARGET
 
@@ -185,6 +223,12 @@ def test_stamp_validation():
     assert not validate_artifacts.validate_phase0_gates(ok)
     assert validate_artifacts.validate_phase0_gates({"reach": {"passed": True, "modules": {"b": {"passed": False}}}})
     assert validate_artifacts.validate_phase0_gates({"build_check": {"ok": "yes", "modules": {}}})
+    # Nothing to fuzz passes; no module in the plan at all fails with its error.
+    assert not validate_artifacts.validate_phase0_gates({"build_check": {"ok": True, "modules": {}}})
+    assert not validate_artifacts.validate_phase0_gates(
+        {"build_check": {"ok": False, "modules": {}, "error": "no module in the plan"}}
+    )
+    assert validate_artifacts.validate_phase0_gates({"build_check": {"ok": False, "modules": {}}})
     assert validate_artifacts.validate_phase0_gates([])
 
 

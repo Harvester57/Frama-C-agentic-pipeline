@@ -14,10 +14,11 @@ a gate (docs/phase0-implementation-plan.md, step I1):
                judges the module's current build report when there is one: Make rebuilds a module
                as a prerequisite of fuzz-<mod>, so that is the binary the campaign uses.
 
-    phase0_gates.py check [--module M] [--need reach,build_check]
+    phase0_gates.py check [--module M] [--need reach,build_check] [--modules "A B"] [--fuzzed "A"]
 
 exits 0 when the gate passes and 1 with the reasons otherwise. Without --module, every module of
-each needed section must pass.
+each needed section must pass, with its harness unchanged since the reach check; --modules and
+--fuzzed (wp-queue passes the plan's) also require a row for each module they name.
 """
 
 from __future__ import annotations
@@ -142,8 +143,21 @@ def current_build_status(run_dir: Path, module: str, row: dict[str, Any]) -> tup
     return False, "eacsl_fallback"
 
 
-def check(run_dir: Path, module: str | None = None, need: tuple[str, ...] = SECTIONS) -> list[str]:
-    """Reasons the gate fails for `module` (or for every module when None); empty when it passes."""
+def check(
+    run_dir: Path,
+    module: str | None = None,
+    need: tuple[str, ...] = SECTIONS,
+    modules_expected: list[str] | None = None,
+    fuzzed_expected: list[str] | None = None,
+) -> list[str]:
+    """
+    Reasons the gate fails for `module` (or for the whole run when None); empty when it passes.
+
+    For the whole run, every recorded module must pass, and a harness changed since the reach check
+    fails it. `modules_expected` (every module of the plan) and `fuzzed_expected` (its fuzzed ones)
+    name the modules each section must have checked: a harness added after the check, or a module
+    build-check never built, fails the gate instead of passing unseen.
+    """
     run_dir = Path(run_dir)
     gates = load_gates(run_dir)
     reasons: list[str] = []
@@ -159,9 +173,22 @@ def check(run_dir: Path, module: str | None = None, need: tuple[str, ...] = SECT
                 failed = sorted(m for m, r in modules.items() if not _build_ok(run_dir, m, r)[0])
                 if failed or (not modules and not entry.get("ok")):
                     reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
-            elif not _section_ok(section, entry):
-                failed = sorted(m for m, r in modules.items() if not r.get("passed"))
-                reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
+                expected = fuzzed_expected
+            else:
+                if not _section_ok(section, entry):
+                    failed = sorted(m for m, r in modules.items() if not r.get("passed"))
+                    reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
+                stale = sorted(
+                    m
+                    for m, r in modules.items()
+                    if r.get("passed") and r.get("harness_digest") != harness_digest(run_dir, m)
+                )
+                if stale:
+                    reasons.append(f"the harness of {', '.join(stale)} changed after the reach gate ran; run it again")
+                expected = modules_expected
+            unchecked = sorted({m for m in expected or [] if m} - set(modules))
+            if unchecked:
+                reasons.append(f"{section}: {', '.join(unchecked)} not checked; run `{HOW_TO_RUN[section]}` again")
             continue
         row = modules.get(module)
         if section == "build_check" and row is None:
@@ -196,13 +223,29 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--run-dir", type=Path, default=Path("."))
     c.add_argument("--module", default=None)
     c.add_argument("--need", default=",".join(SECTIONS), help="Comma-separated sections: reach, build_check")
+    c.add_argument(
+        "--modules", default=None, help="Whole run: the plan's modules (space-separated), each needing a reach row"
+    )
+    c.add_argument(
+        "--fuzzed",
+        default=None,
+        help="Whole run: the plan's fuzzed modules (space-separated), each needing a build row",
+    )
     a = p.parse_args(argv)
     need = tuple(s.strip() for s in a.need.split(",") if s.strip())
     unknown = [s for s in need if s not in SECTIONS]
     if unknown:
         p.error(f"unknown gate section(s): {', '.join(unknown)}")
+    if a.module and (a.modules is not None or a.fuzzed is not None):
+        p.error("--modules and --fuzzed apply to the whole run, not with --module")
     try:
-        reasons = check(a.run_dir, a.module, need)
+        reasons = check(
+            a.run_dir,
+            a.module,
+            need,
+            None if a.modules is None else a.modules.split(),
+            None if a.fuzzed is None else a.fuzzed.split(),
+        )
     except (ArtifactError, OSError, ValueError) as exc:
         reasons = [f"cannot read {GATES_JSON}: {exc}"]
     print(json.dumps({"ok": not reasons, "module": a.module, "need": list(need), "reasons": reasons}))

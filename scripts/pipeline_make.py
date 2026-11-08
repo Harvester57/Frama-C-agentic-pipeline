@@ -2184,6 +2184,22 @@ def build_check(
     run_dir = Path(run_dir)
     plan = build_plan(run_dir, templates_dir)
     modules = [plan.modules[name] for name in plan.fuzz_modules]
+    if not modules:
+        # Nothing to fuzz (an Eva-only plan, or every module deferred under quick) passes the gate;
+        # a plan with no module at all means `gen` has not run, or the DAG has no runnable module.
+        out: dict[str, Any] = {
+            "ok": bool(plan.modules),
+            "build_returncode": None,
+            "modules": {},
+            "generated_at": utc_now(),
+        }
+        if plan.modules:
+            out["note"] = "no module of the plan is fuzzed: nothing to build"
+        else:
+            out["error"] = "no module in the plan: run `pipeline_make.py gen` first"
+        atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
+        phase0_gates.record_build_check(run_dir, out)
+        return out
     build_rc, _ = (runner or run_targets)(["build"], run_dir)
     results: dict[str, dict] = {}
     for mod in sorted(modules, key=lambda m: m.name):
@@ -2220,13 +2236,11 @@ def build_check(
                 entry["first_error"] = _first_build_error(run_dir / log)
         results[mod.name] = entry
     out = {
-        "ok": bool(results) and all(r["ok"] for r in results.values()),
+        "ok": all(r["ok"] for r in results.values()),
         "build_returncode": build_rc,
         "modules": results,
         "generated_at": utc_now(),
     }
-    if not results:
-        out["error"] = "no fuzzed module in the plan: run `pipeline_make.py gen` first"
     atomic_write_json(run_dir / BUILD_CHECK_JSON, out)
     phase0_gates.record_build_check(run_dir, out)  # the stamp fuzz-<mod> and wp-queue check
     return out

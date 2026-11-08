@@ -52,6 +52,7 @@ import acsl_ast  # noqa: E402
 import checkpoint  # noqa: E402
 import contract_negotiator  # noqa: E402
 import ledger  # noqa: E402
+import phase0_gates  # noqa: E402
 import prover_candidates  # noqa: E402
 import resources  # noqa: E402
 import workspace_overlay  # noqa: E402
@@ -3969,6 +3970,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "init":
+            # Phase 3 never starts on a failed or stale Phase 0 gate, whoever calls init (wp-queue
+            # checks it too, with the plan's module lists).
+            gate_reasons = phase0_gates.check(Path("."))
+            if gate_reasons:
+                print(json.dumps({"ok": False, "error": "Phase 0 gate", "reasons": gate_reasons}, indent=2))
+                return 1
             out = cmd_init(args.reconcile)
         elif args.cmd == "baseline":
             out = cmd_baseline(run_dir=args.run_dir, jobs=args.jobs, recheck_all=args.recheck_all)
