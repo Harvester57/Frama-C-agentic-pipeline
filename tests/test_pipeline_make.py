@@ -1662,6 +1662,37 @@ def test_a_fallback_unit_fuzzes_with_sanitizers_and_runs_no_eva(tmp_path):
     assert pm.params_show(run)["modules"]["decode"]["effective"]["fuzz_engine"] == "sanitizers"
 
 
+def test_a_unit_e_acsl_cannot_build_fuzzes_with_sanitizers_and_build_check_says_why(tmp_path):
+    """libpng: its unit calls setjmp/longjmp (build_callgraph_dag.route_nonlocal_jumps); Eva still runs."""
+    run = _unit_run(tmp_path, params={"version": 1, "modules": {"extra": {"fuzz_engine": "eacsl"}}})
+    dag = json.loads((run / pm.DAG_JSON).read_text(encoding="utf-8"))
+    why = "calls setjmp/longjmp (png_safe_execute): E-ACSL cannot build or track it, ASan can"
+    # Only the unit record says so: its harness modules (a path module's, a freely named one) follow it.
+    dag["modules"]["libkv_a"].update(fuzz_engine="sanitizers", fuzz_engine_reason=why)
+    write_json(run / pm.DAG_JSON, dag)
+    plan = pm.build_plan(run, templates_dir=ACSL)
+
+    dec, extra = plan.modules["decode"], plan.modules["extra"]
+    assert (dec.fuzz, dec.eva, dec.params["fuzz_engine"], dec.engine_reason) == (True, True, "sanitizers", why)
+    assert dec.to_json()["engine_reason"] == why
+    # A recorded param still wins, and then the DAG gives no reason.
+    assert (extra.params["fuzz_engine"], extra.engine_reason) == ("eacsl", None)
+
+    for mod in ("decode", "extra"):
+        _build_report(run, mod, "sanitizers" if mod == "decode" else "eacsl")
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    assert out["modules"]["decode"] == {
+        "fuzz_engine": "sanitizers",
+        "engine_used": "sanitizers",
+        "status": "sanitizers_chosen",
+        "reason": why,
+        "ok": True,
+    }
+    gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))["build_check"]
+    assert gates["modules"]["decode"]["reason"] == why
+    assert not validate_artifacts.validate_phase0_gates(gates)
+
+
 def test_union_flags_keeps_value_flags_whole_and_one_main_rename():
     assert pm.union_flags(
         [

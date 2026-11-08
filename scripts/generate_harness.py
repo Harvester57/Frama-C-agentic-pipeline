@@ -1298,6 +1298,30 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
     return cppflags
 
 
+def _merge_dag_module_ldflags(module_name: str, out_dir: Path, ldflags: str, unit: str | None = None) -> str:
+    """
+    `ldflags` followed by the libraries the module's link unit links from outside the project (the
+    DAG's `ldflags`, `-lz -lm`), those not already given. The sidecar carries them to every build.
+    """
+    for dag_path in (out_dir.parent / "reports" / "callgraph_dag.json", Path("workspace/reports/callgraph_dag.json")):
+        if not dag_path.is_file():
+            continue
+        try:
+            dag = json.loads(dag_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        mod_info = _dag_module_info(dag if isinstance(dag, dict) else {}, module_name, unit)
+        if not isinstance(mod_info, dict):
+            continue
+        try:
+            given = shlex.split(ldflags)
+        except ValueError:
+            return ldflags
+        extra = [o for o in mod_info.get("ldflags") or [] if isinstance(o, str) and o.strip() and o not in given]
+        return shlex.join([*given, *extra]) if extra else ldflags
+    return ldflags
+
+
 _HARNESS_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
 
 
@@ -1621,6 +1645,7 @@ def generate_module_harness(
 
     norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
     norm_cppflags = _merge_dag_module_cppflags(module_name, out_dir, norm_cppflags, unit)
+    norm_ldflags = _merge_dag_module_ldflags(module_name, out_dir, norm_ldflags, unit)
     norm_extra_includes: list[str] = []
     for ext_inc in extra_includes or []:
         nh, norm_cppflags = _normalize_header_include(ext_inc, norm_cppflags)

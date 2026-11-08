@@ -2524,11 +2524,16 @@ def parse_undefined_references(log: str) -> list[str]:
 
 
 def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
-    """Map function name -> defining source file from callgraph_dag.json."""
+    """
+    Map function name -> defining source file from callgraph_dag.json: its functions, then the
+    functions only the build compiles (`build_only_functions`: code Frama-C's preprocessing hides,
+    which the sanitizer build links).
+    """
     try:
         dag = json.loads(Path(dag_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    dag = dag if isinstance(dag, dict) else {}
     out: dict[str, str] = {}
     for key, rec in (dag.get("functions") or {}).items():
         if isinstance(rec, dict):
@@ -2536,6 +2541,11 @@ def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
             file = rec.get("file")
             if name and file:
                 out.setdefault(str(name), str(file))
+    build_only = dag.get("build_only_functions")
+    for file, names in (build_only if isinstance(build_only, dict) else {}).items():
+        for name in names if isinstance(names, list) else []:
+            if isinstance(name, str) and name:
+                out.setdefault(name, str(file))
     return out
 
 

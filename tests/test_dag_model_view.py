@@ -208,6 +208,119 @@ def test_fallback_link_units_are_fuzzed_with_sanitizers_and_blocked_for_eva_and_
     assert any("libb" in w and "sanitizers" in w for w in dag["warnings"])
 
 
+def test_link_options_name_the_build_libraries() -> None:
+    assert bcd.link_option("-lm") == "-lm"
+    assert bcd.link_option("/usr/lib/x86_64-linux-gnu/libz.so") == "-lz"
+    assert bcd.link_option("/opt/vendor/lib/libbar.a") == "-lbar"
+    # A versioned file, or one without the lib prefix: the file itself.
+    assert bcd.link_option("/usr/lib/libfoo.so.1") == "-l:libfoo.so.1"
+    assert bcd.link_option("/opt/x/plugin.so") == "-l:plugin.so"
+
+
+def _capture(**compile_fields: dict) -> dict:
+    """libpng's shape: a static archive (no link line) and a shared library built from the same files."""
+    return {
+        "units": {
+            "lib": {"kind": "static_lib", "test": False, "files": ["src/a.c", "src/b.c"], "objects": ["a.o", "b.o"]},
+            "lib.so": {
+                "kind": "shared_lib",
+                "test": False,
+                "files": ["src/a.c", "src/b.c"],
+                "objects": ["a.pic.o", "b.pic.o"],
+                "external_libs": [{"ref": "/usr/lib/x86_64-linux-gnu/libz.so", "libdirs": []}, {"ref": "-lm"}],
+            },
+            "tool": {
+                "kind": "executable",
+                "test": False,
+                "files": ["tool.c"],
+                "objects": ["tool.o"],
+                "links": ["lib.so"],
+                "external_libs": [{"ref": "-lpthread"}, {"ref": "-lm"}],
+            },
+            "unit_test": {"kind": "executable", "test": True, "files": ["t.c"], "objects": ["t.o"], "links": ["lib"]},
+        },
+        "compiles": [
+            {"source": src, "object": obj, **compile_fields.get(src, {})}
+            for src, obj in (("src/a.c", "a.o"), ("src/b.c", "b.o"), ("t.c", "t.o"))
+        ],
+    }
+
+
+def test_a_static_library_takes_the_link_libraries_of_its_shared_sibling() -> None:
+    options = bcd.unit_link_options(_capture())
+    assert options["lib"] == ["-lz", "-lm"]
+    assert options["lib.so"] == ["-lz", "-lm"]
+    # Its own, then those of the project library it links; a library named twice keeps its last place.
+    assert options["tool"] == ["-lpthread", "-lz", "-lm"]
+    # No sibling compiles its sources: the units linking it give theirs.
+    cap = _capture()
+    cap["units"]["lib"]["files"] = ["src/only_static.c"]
+    cap["units"]["tool"]["links"] = ["lib"]
+    assert bcd.unit_link_options(cap)["lib"] == ["-lpthread", "-lm"]
+    assert bcd.unit_link_options(None) == {}
+
+
+def test_link_unit_modules_carry_their_link_libraries(target: Path) -> None:
+    dag = bcd.build_dag(target, _model(), _capture())
+    assert dag["modules"]["lib"]["ldflags"] == ["-lz", "-lm"]
+    assert "fuzz_engine" not in dag["modules"]["lib"]
+
+
+def test_a_unit_calling_setjmp_is_fuzzed_with_the_sanitizers(target: Path) -> None:
+    model = _model(fallback=True)
+    model["functions"]["src/a.c#api_run"]["external_calls"] = ["longjmp"]
+    model["functions"]["src/a.c#helper"]["external_calls"] = ["_setjmp"]
+    model["externals"] = ["_setjmp", "longjmp"]
+    dag = bcd.build_dag(target, model)
+    lib = dag["modules"]["lib"]
+    assert lib["fuzz_engine"] == "sanitizers"
+    assert "calls setjmp/longjmp (api_run, helper)" in lib["fuzz_engine_reason"]
+    # Its path module's record, which its harnesses run under, follows; Eva and WP still run.
+    assert dag["lexer_modules"]["a"]["fuzz_engine"] == "sanitizers"
+    assert lib.get("run_eva", True) is not False
+    # The GCC-fallback unit keeps its own reason.
+    assert dag["modules"]["libb"]["fuzz_engine_reason"] == bcd.FALLBACK_ENGINE_REASON
+    assert any("module lib: calls setjmp/longjmp" in w for w in dag["warnings"])
+
+
+def test_a_unit_including_setjmp_h_is_fuzzed_with_the_sanitizers(target: Path) -> None:
+    # E-ACSL stops on glibc's setjmp declaration even when nothing calls it (pngstest including png.h).
+    dag = bcd.build_dag(target, _model(), _capture(**{"src/b.c": {"includes_setjmp_h": True}}))
+    lib = dag["modules"]["lib"]
+    assert lib["fuzz_engine"] == "sanitizers"
+    assert lib["fuzz_engine_reason"].startswith("includes setjmp.h (src/b.c)")
+    assert "fuzz_engine" not in bcd.build_dag(target, _model(), _capture())["modules"]["lib"]
+
+
+def test_functions_only_the_build_defines_are_listed_and_warned(target: Path) -> None:
+    built = {
+        "src/a.c": {
+            "defined_functions": [
+                "src/a.c#api_run",
+                "src/a.c#helper",
+                "src/a.c#helper.part.0",  # a compiler clone
+                "src/a.c#hin",  # a header inline without debug info: placed in its includer
+                "src/a.c#simd_filter",
+            ]
+        },
+        "src/b.c": {"defined_functions": ["src/b.c#api_other", "src/b.c#simd_init"]},
+        # A test unit's file: the model never parses it.
+        "t.c": {"defined_functions": ["t.c#main"]},
+    }
+    assert bcd.build_only_functions(_model(), _capture(**built)) == {
+        "src/a.c": ["simd_filter"],
+        "src/b.c": ["simd_init"],
+    }
+    dag = bcd.build_dag(target, _model(), _capture(**built))
+    assert dag["build_only_functions"] == {"src/a.c": ["simd_filter"], "src/b.c": ["simd_init"]}
+    assert any(
+        w.startswith("src/b.c: the build defines 1 function(s) Frama-C's parse lacks (simd_init)")
+        for w in dag["warnings"]
+    )
+    # A capture from before the comparison has no `defined_functions`: nothing to report.
+    assert "build_only_functions" not in bcd.build_dag(target, _model(), _capture())
+
+
 BLOCKERS_C = """\
 int retry(int n) {
 again:

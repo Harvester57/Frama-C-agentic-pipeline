@@ -265,6 +265,32 @@ def test_cluster_and_freely_named_harnesses_take_their_units_flags(tmp_path: Pat
     assert generate_harness._merge_dag_module_cppflags("tlv_dispatch", harnesses, "-I.") == "-I."
 
 
+def test_harness_ldflags_take_the_units_link_libraries(tmp_path: Path) -> None:
+    """libpng's harnesses linked without zlib: the unit's libraries now come from the DAG."""
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    harnesses = tmp_path / "harnesses"
+    harnesses.mkdir()
+    dag = {
+        "module_kind": "link_unit",
+        "modules": {"libpng18_a": {"ldflags": ["-lz", "-lm"]}},
+        "unit_of_lexer_module": {"png": "libpng18_a"},
+        "submodules": {"libpng18_a__png": {"module": "libpng18_a__png", "unit": "libpng18_a", "kind": "cluster"}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    for module in ("libpng18_a", "png", "libpng18_a__png"):
+        assert generate_harness._merge_dag_module_ldflags(module, harnesses, "") == "-lz -lm"
+    # Given flags stay first, and a library already given is not repeated.
+    assert generate_harness._merge_dag_module_ldflags("png", harnesses, "-lm -lbsd") == "-lm -lbsd -lz"
+    assert generate_harness._merge_dag_module_ldflags("free_api", harnesses, "", "libpng18_a") == "-lz -lm"
+    # Without a unit, or a DAG from before the field, nothing changes.
+    assert generate_harness._merge_dag_module_ldflags("free_api", harnesses, "-lm") == "-lm"
+    dag["modules"] = {"libpng18_a": {}}
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    assert generate_harness._merge_dag_module_ldflags("png", harnesses, "") == ""
+
+
 def test_modules_are_the_non_test_link_units() -> None:
     dag = _units()
     assert dag["module_kind"] == "link_unit"

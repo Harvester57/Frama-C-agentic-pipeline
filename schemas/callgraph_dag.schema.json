@@ -18,6 +18,7 @@
         "external_callees": {"$ref": "#/definitions/strings"},
         "cppflags": {"$ref": "#/definitions/strings"},
         "force_includes": {"$ref": "#/definitions/strings"},
+        "ldflags": {"$comment": "link options for the libraries the unit links from outside the project (build_callgraph_dag.unit_link_options)", "$ref": "#/definitions/keys"},
         "function_count": {"type": "integer", "minimum": 0},
         "functions": {"$ref": "#/definitions/keys"},
         "candidate_entry_points": {"$ref": "#/definitions/keys"},
@@ -37,6 +38,7 @@
         "run_wp_full": {"type": "boolean"},
         "run_eacsl_fuzz": {"type": "boolean"},
         "fuzz_engine": {"type": "string", "enum": ["sanitizers"]},
+        "fuzz_engine_reason": {"$comment": "why the DAG chose `fuzz_engine`: the GCC fallback, or setjmp/longjmp (route_nonlocal_jumps)", "type": "string", "minLength": 1},
         "recommended_strategy": {"type": "string"},
         "tier_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
         "deferred_profiles": {"$ref": "#/definitions/strings"}
@@ -61,6 +63,7 @@
         "run_wp_full": {"type": "boolean"},
         "run_eacsl_fuzz": {"type": "boolean"},
         "fuzz_engine": {"type": "string", "enum": ["sanitizers"]},
+        "fuzz_engine_reason": {"type": "string", "minLength": 1},
         "recommended_strategy": {"type": "string"},
         "tier_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
         "deferred_profiles": {"$ref": "#/definitions/strings"}
@@ -134,6 +137,11 @@
       "items": {"type": "object", "properties": {"function": {"type": "string"}, "files": {"$ref": "#/definitions/strings"}}, "required": ["function", "files"]}
     },
     "macro_aliases": {"type": "object", "additionalProperties": {"$ref": "#/definitions/keys"}},
+    "build_only_functions": {
+      "$comment": "per source file, the functions the build's objects define that Frama-C's parse lacks (build_callgraph_dag.build_only_functions); the link repair places their symbols",
+      "type": "object",
+      "additionalProperties": {"$ref": "#/definitions/keys"}
+    },
     "model": {
       "type": "object",
       "properties": {

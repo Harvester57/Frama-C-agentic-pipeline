@@ -387,6 +387,8 @@ class ModulePlan:
     cppflags: list[str]  # build, campaign and Eva: base_cppflags plus the ACSL template headers
     ldflags: list[str]
     params: dict
+    # Why `params["fuzz_engine"]` came from the DAG (build_callgraph_dag: the GCC fallback, setjmp/longjmp).
+    engine_reason: str | None = None
     dag_cppflags_missing: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # Rungs of the Eva ladder this module runs next, with their options; empty until its base run left Unknowns.
@@ -409,6 +411,7 @@ class ModulePlan:
             "ldflags": shlex.join(self.ldflags),
             "dag_cppflags_missing": self.dag_cppflags_missing,
             "params": self.params,
+            **({"engine_reason": self.engine_reason} if self.engine_reason else {}),
             "tune_rungs": list(self.tune_rungs),
             "eva_replay": self.eva_replay,
             "warnings": self.warnings,
@@ -716,11 +719,14 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
 
     params = effective_params(plan.params_doc, name, plan.profile)
     dag_engine = dag_mod.get("fuzz_engine")
+    engine_reason: str | None = None
     if dag_engine and "fuzz_engine" not in (plan.params_doc.get("modules", {}).get(name) or {}):
-        # A unit on the GCC fallback: E-ACSL needs the Frama-C parse, so the DAG asks for the
-        # sanitizers, unless a recorded param says otherwise.
+        # A unit on the GCC fallback (E-ACSL needs the Frama-C parse) or calling setjmp/longjmp: the
+        # DAG asks for the sanitizers, unless a recorded param says otherwise.
         if _param_problem("fuzz_engine", dag_engine) is None:
             params["fuzz_engine"] = dag_engine
+            reason = dag_mod.get("fuzz_engine_reason")
+            engine_reason = str(reason) if reason else "the call-graph DAG chose it"
 
     mod = ModulePlan(
         name=name,
@@ -734,6 +740,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         cppflags=with_acsl(base, plan.acsl_dir),
         ldflags=ldflags,
         params=params,
+        engine_reason=engine_reason,
         # Discovered by build_callgraph_dag.py but not in the sidecar: what to pass to
         # generate_harness.py --cppflags if the module does not build.
         dag_cppflags_missing=[t for t in dag_flags if t not in _joined_forms(base)],
@@ -995,10 +1002,14 @@ def _harness_record(mm: ModuleMap, name: str, dag_modules: dict[str, dict]) -> d
     lexer = mm.lexer_modules.get(name)
     base = lexer if isinstance(lexer, dict) else dag_modules[unit]
     rec = {**base, "tier": mm.tier_of(name) or base.get("tier"), **mm.run_flags(name)}
-    fallback = (dag_modules.get(unit) or {}).get("callgraph_fallback")
+    unit_rec = dag_modules.get(unit) or {}
+    fallback = unit_rec.get("callgraph_fallback")
     if fallback:
         # The unit is on the GCC fallback (build_callgraph_dag.block_fallback_units): so is the harness.
         rec.update(run_eva=False, run_wp_full=False, fuzz_engine="sanitizers", callgraph_fallback=fallback)
+    if unit_rec.get("fuzz_engine"):
+        # The unit's engine (the fallback, or setjmp/longjmp: route_nonlocal_jumps) is its harnesses'.
+        rec.update(fuzz_engine=unit_rec["fuzz_engine"], fuzz_engine_reason=unit_rec.get("fuzz_engine_reason"))
     return rec
 
 
@@ -2252,7 +2263,8 @@ def build_check(
     A module whose build fell back to ASan/UBSan, or failed, fails the check with the first
     compiler error of its E-ACSL attempt. Fuzzing it would lose the E-ACSL checks without anyone
     deciding so. A module whose `fuzz_engine` param is `sanitizers` passes: that is a recorded choice
-    (`params set --module M --fuzz-engine sanitizers`). A module the reach gate stops (its `build-<mod>`
+    (`params set --module M --fuzz-engine sanitizers`), or the DAG's for its unit (the GCC fallback,
+    setjmp/longjmp), whose reason the row gives. A module the reach gate stops (its `build-<mod>`
     recipe refuses it) is `not_built` with the gate's reason, whatever build report an earlier run left.
     Writes workspace/reports/build_check.json. Build-check is Phase 0's last gate: when it passes and
     the reach gate holds for the whole plan, it records the Phase 0 checkpoint (`phase0_checkpoint`).
@@ -2307,6 +2319,8 @@ def build_check(
             entry["status"] = "eacsl"
         elif chosen == "sanitizers":
             entry["status"] = "sanitizers_chosen"
+            if mod.engine_reason:
+                entry["reason"] = mod.engine_reason
         else:
             entry["status"] = "eacsl_fallback"
             entry["fallback_reason"] = report.get("engine_fallback_reason")

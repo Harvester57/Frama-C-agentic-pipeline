@@ -1491,8 +1491,14 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
             r = tree_rel(d, t)
             (project if r is not None else system).append(r if r is not None else d)
         c["headers"] = sorted(set(project))
+        # E-ACSL builds against glibc, whose setjmp.h Frama-C rejects (build_callgraph_dag.route_nonlocal_jumps).
+        c["includes_setjmp_h"] = any(posixpath.basename(d) == "setjmp.h" for d in system)
         system_headers |= set(system)
     fn_of = {c["object"]: function_ids(c, syms[c["object"]], t) for c in entries}
+    for c in entries:
+        # What the compiler emitted, for the DAG to compare with what Frama-C parsed: code behind a
+        # macro the compiler defines and Frama-C does not (`__SSE2__`) is in the build only.
+        c["defined_functions"] = sorted({info["id"] for info in fn_of[c["object"]].values()})
     project_headers = sorted({h for c in entries for h in c["headers"] if h.endswith(".h")})
     project_headers = sorted(set(project_headers) | {p.relative_to(tree).as_posix() for p in tree.rglob("*.h")})
 
@@ -1562,7 +1568,21 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     report["units"] = {n: units[n] for n in sorted(units)}
     report["entry_points"] = sorted({e for u in units.values() if not u["test"] for e in u["entry_points"]})
     report["compiles"] = [
-        {k: c[k] for k in ("source", "object", "cwd", "compiler", "arguments", "flags", "system_flags", "headers")}
+        {
+            k: c[k]
+            for k in (
+                "source",
+                "object",
+                "cwd",
+                "compiler",
+                "arguments",
+                "flags",
+                "system_flags",
+                "headers",
+                "includes_setjmp_h",
+                "defined_functions",
+            )
+        }
         for c in entries
     ]
     report["build"]["probes_dropped"] = cap["probes_dropped"]

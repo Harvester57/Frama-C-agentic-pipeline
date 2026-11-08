@@ -20,6 +20,9 @@ Writes the call-graph DAG (workspace/reports/callgraph_dag.json) from the Phase 
   lexer drew them, with `unit_of_lexer_module`. A harness named after one is a sub-module of its unit
   (scripts/module_map.py).
 - **Tiers:** per function from trust and structure, per module the most demanding (scripts/tiers.py).
+- **The build against the parse:** the functions the build's objects define that Frama-C's parse lacks
+  (`build_only_functions`, with a warning per file), and the units fuzzed with the sanitizers because
+  E-ACSL cannot build them (`route_nonlocal_jumps`: setjmp/longjmp).
 
 Without a successful model there is no DAG: Phase 0 stops, and the parent agent asks for a build
 recipe (`needs_build_recipe`, docs/phase0-implementation-plan.md).
@@ -861,26 +864,39 @@ def fallback_blocked_reason(error: str) -> str:
     return f"Frama-C cannot parse its link unit, so Eva and WP cannot run on it: {error[:200]}"
 
 
+FALLBACK_ENGINE_REASON = "Frama-C cannot parse the unit, and E-ACSL needs its parse"
+# setjmp/longjmp under their glibc, builtin and fortified names.
+NONLOCAL_JUMP_RE = re.compile(r"^(?:__builtin_|_{0,2})(?:sig)?(?:set|long)jmp(?:_chk)?$")
+
+
+def _unit_records(dag: dict, units: set[str]) -> list[dict]:
+    """The records the harnesses of these unit modules run under: the units', their path modules', their clusters'."""
+    modules: dict[str, dict] = dag.get("modules") or {}
+    unit_of_path = dag.get("unit_of_lexer_module") or {}
+    records = [modules[n] for n in sorted(units) if n in modules]
+    records += [rec for m, rec in (dag.get("lexer_modules") or {}).items() if unit_of_path.get(m) in units]
+    records += [rec for rec in (dag.get("submodules") or {}).values() if rec.get("unit") in units]
+    return [rec for rec in records if isinstance(rec, dict)]
+
+
 def block_fallback_units(dag: dict) -> dict:
     """
     A link unit on the GCC fallback (Frama-C could not parse it): fuzzing runs with the sanitizers,
     since E-ACSL needs the Frama-C parse, and Eva and WP are blocked. Its record, its path modules'
     and its clusters' (the records its harnesses run under) get `run_eva` and `run_wp_full` false and
-    `fuzz_engine: sanitizers`. Its functions carry the reason in `eva_wp_blocked`. Stamps the DAG's
-    `schema_version`, so a consumer can tell a DAG that went through this from one that predates it.
+    `fuzz_engine: sanitizers` with its `fuzz_engine_reason`. Its functions carry the reason in
+    `eva_wp_blocked`. Stamps the DAG's `schema_version`, so a consumer can tell a DAG that went through
+    this from one that predates it.
     """
     dag["schema_version"] = DAG_SCHEMA_VERSION
     modules: dict[str, dict] = dag.get("modules") or {}
     fallback = {name: str(rec["callgraph_fallback"]) for name, rec in modules.items() if rec.get("callgraph_fallback")}
     if not fallback:
         return dag
-    unit_of_path = dag.get("unit_of_lexer_module") or {}
-    records = [modules[n] for n in fallback]
-    records += [rec for m, rec in (dag.get("lexer_modules") or {}).items() if unit_of_path.get(m) in fallback]
-    records += [rec for rec in (dag.get("submodules") or {}).values() if rec.get("unit") in fallback]
-    for rec in records:
-        if isinstance(rec, dict):
-            rec.update(run_eva=False, run_wp_full=False, fuzz_engine="sanitizers")
+    for rec in _unit_records(dag, set(fallback)):
+        rec.update(
+            run_eva=False, run_wp_full=False, fuzz_engine="sanitizers", fuzz_engine_reason=FALLBACK_ENGINE_REASON
+        )
     for name, error in sorted(fallback.items()):
         dag.setdefault("warnings", []).append(
             f"module {name}: on the GCC fallback, fuzzed with the sanitizers; Eva and WP are blocked"
@@ -890,6 +906,148 @@ def block_fallback_units(dag: dict) -> dict:
             if isinstance(fn_rec, dict):
                 fn_rec["eva_wp_blocked"] = fallback_blocked_reason(error)
     return dag
+
+
+def _first_few(items: list[str], n: int = 3) -> str:
+    return ", ".join(items[:n]) + (f" and {len(items) - n} more" if len(items) > n else "")
+
+
+def route_nonlocal_jumps(dag: dict, capture: dict | None = None) -> dict:
+    """
+    A link unit whose code includes `setjmp.h` or calls setjmp/longjmp is fuzzed with the sanitizers.
+    E-ACSL builds against glibc (`e-acsl-gcc -no-frama-c-stdlib`), whose `setjmp.h` declares setjmp
+    as a function, which Frama-C rejects (CERT MSC38-C): the build is bound to fail. And Frama-C's
+    libc declares the pair unsupported: E-ACSL's memory tracking cannot follow a longjmp out of
+    instrumented frames, while ASan can. The unit's code is what its harnesses compile, its
+    `required_sources` (the project libraries it links included): a source the capture saw include
+    `setjmp.h` (`includes_setjmp_h`), or with a function calling the pair. The unit's records
+    (`_unit_records`) get `fuzz_engine: sanitizers` with the reason; a unit already on the sanitizers
+    (the GCC fallback) keeps its own.
+    """
+    modules: dict[str, dict] = dag.get("modules") or {}
+    functions: dict[str, dict] = dag.get("functions") or {}
+    callers_of: dict[str, list[str]] = defaultdict(list)
+    for key, fn in functions.items():
+        if isinstance(fn, dict) and any(NONLOCAL_JUMP_RE.match(str(c)) for c in fn.get("external_callees") or []):
+            callers_of[str(fn.get("file") or "")].append(str(fn.get("name") or key))
+    including = {
+        str(c["source"])
+        for c in (capture or {}).get("compiles") or []
+        if isinstance(c, dict) and c.get("includes_setjmp_h") and c.get("source")
+    }
+    if not callers_of and not including:
+        return dag
+    for name, mod in sorted(modules.items()):
+        if not isinstance(mod, dict) or mod.get("fuzz_engine"):
+            continue
+        sources = mod.get("required_sources") or sorted(
+            {str(functions[k].get("file")) for k in mod.get("functions") or [] if k in functions}
+        )
+        callers = sorted({c for f in sources for c in callers_of.get(f, [])})
+        files = sorted(f for f in set(sources) if f in including)
+        if callers:
+            reason = f"calls setjmp/longjmp ({_first_few(callers)}): E-ACSL cannot build or track it, ASan can"
+        elif files:
+            reason = (
+                f"includes setjmp.h ({_first_few(files)}), whose setjmp declaration Frama-C rejects "
+                "(CERT MSC38-C): E-ACSL cannot build it"
+            )
+        else:
+            continue
+        for rec in _unit_records(dag, {name}):
+            rec.setdefault("fuzz_engine", "sanitizers")
+            rec.setdefault("fuzz_engine_reason", reason)
+        dag.setdefault("warnings", []).append(f"module {name}: {reason}; fuzzed with the sanitizers")
+    return dag
+
+
+_C_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def build_only_functions(model: dict, capture: dict | None) -> dict[str, list[str]]:
+    """
+    Per source file, the functions the build's objects define (the capture's `defined_functions`)
+    that Frama-C's parse lacks: code behind a macro the compiler defines and Frama-C's preprocessing
+    does not (libpng's SSE2 code under `__SSE2__`). Eva, WP and E-ACSL never see it; the sanitizer
+    build compiles and links it. Compiles of test units only are left out, as in the model. A name the
+    model has in that file or in a header counts as known: without debug info `nm` places a header's
+    inline function in the source including it.
+    """
+    model_fns: dict[str, dict] = model.get("functions") or {}
+    known = set(model_fns)
+    in_headers = {str(f.get("name")) for f in model_fns.values() if isinstance(f, dict) and f.get("header")}
+    names_in: dict[str, set[str]] = defaultdict(set)
+    for f in model_fns.values():
+        if isinstance(f, dict):
+            names_in[str(f.get("file"))].add(str(f.get("name")))
+    cap_units = (capture or {}).get("units") or {}
+    analysed = {
+        o for u in cap_units.values() if isinstance(u, dict) and not u.get("test") for o in u.get("objects") or []
+    }
+    out: dict[str, set[str]] = defaultdict(set)
+    for c in (capture or {}).get("compiles") or []:
+        if not isinstance(c, dict) or (cap_units and c.get("object") not in analysed):
+            continue
+        for fid in c.get("defined_functions") or []:
+            file, _, name = str(fid).rpartition("#")
+            # Compiler clones (`f.part.0`, `f.cold`) are not functions of the source.
+            if fid in known or not _C_IDENT_RE.fullmatch(name) or name in in_headers or name in names_in[file]:
+                continue
+            out[file].add(name)
+    return {f: sorted(n) for f, n in sorted(out.items())}
+
+
+_LIB_FILE_RE = re.compile(r"lib(.+?)\.(?:a|so)")
+
+
+def link_option(ref: str) -> str:
+    """A library the build links, as a link option: `-lm` as is, a library file by name (`libz.so` -> `-lz`)."""
+    if ref.startswith("-l"):
+        return ref
+    base = PurePosixPath(ref).name
+    m = _LIB_FILE_RE.fullmatch(base)
+    # `-l:` names the file itself: a versioned `libfoo.so.1`, or a library without the lib prefix.
+    return f"-l{m.group(1)}" if m else f"-l:{base}"
+
+
+def unit_link_options(capture: dict | None) -> dict[str, list[str]]:
+    """
+    Each link unit's libraries from outside the project (the capture's `external_libs`) as link
+    options, with those of the project units it links, in link order. A static library records none
+    (`ar` links nothing): it takes those of the units that compile its sources (its shared sibling),
+    else of the units that link it.
+    """
+    cap_units: dict[str, dict] = {n: u for n, u in ((capture or {}).get("units") or {}).items() if isinstance(u, dict)}
+
+    def recorded(u: dict) -> list[str]:
+        return [
+            link_option(str(e["ref"])) for e in u.get("external_libs") or [] if isinstance(e, dict) and e.get("ref")
+        ]
+
+    own = {n: recorded(u) for n, u in cap_units.items()}
+    for n, u in sorted(cap_units.items()):
+        if u.get("kind") != "static_lib" or own[n]:
+            continue
+        files = set(u.get("files") or [])
+        donors = [
+            m for m, v in sorted(cap_units.items()) if m != n and v.get("kind") != "static_lib" and not v.get("test")
+        ]
+        siblings = [m for m in donors if files & set(cap_units[m].get("files") or [])]
+        users = [m for m in donors if n in (cap_units[m].get("links") or [])]
+        own[n] = list(dict.fromkeys(opt for m in siblings or users for opt in own[m]))
+    out: dict[str, list[str]] = {}
+    for n in cap_units:
+        options, seen, stack = list(own[n]), {n}, list(cap_units[n].get("links") or [])
+        while stack:
+            lk = stack.pop(0)
+            if lk in seen or lk not in cap_units:
+                continue
+            seen.add(lk)
+            options += own[lk]
+            stack += cap_units[lk].get("links") or []
+        # A library named twice keeps its last place: a static archive goes after the code using it.
+        out[n] = list(reversed(dict.fromkeys(reversed(options))))
+    return out
 
 
 def unit_module_name(unit: str) -> str:
@@ -903,8 +1061,9 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
     The model's DAG (`model_view`) with the build's link units as its modules (step I5b):
 
     - one module per non-test link unit, libraries first: its own sources plus those of the project
-      libraries it links (`required_sources`), its compile flags (`unit_cppflags`), its API entry points
-      (exported functions, `main` for an executable, and an executable's embedded API), `concurrent`;
+      libraries it links (`required_sources`), its compile flags (`unit_cppflags`), the libraries it
+      links from outside the project (`ldflags`, `unit_link_options`), its API entry points (exported
+      functions, `main` for an executable, and an executable's embedded API), `concurrent`;
     - a source file belongs to the first unit that compiles it, a header function to the first unit
       it is compiled into;
     - each function keeps its path module (`lexer_module`); the path modules are kept under
@@ -957,6 +1116,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
 
     modules: dict[str, dict] = {}
     folded: list[str] = []
+    link_options = unit_link_options(capture)
     for u in order:
         rec = units[u]
         name = names[u]
@@ -992,6 +1152,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "external_callees": sorted({c for k in fns for c in functions[k].get("external_callees") or []}),
             "cppflags": flags,
             "force_includes": forced,
+            "ldflags": link_options.get(u, []),
             "function_count": len(fns),
             "functions": fns,
             "candidate_entry_points": entries or [k for k in fns if not functions[k].get("is_static")],
@@ -1042,13 +1203,23 @@ def build_dag(
         f"skipped pipeline output directory inside the target: {rel} (move run results out of the target tree)"
         for rel in find_pipeline_output_dirs(target_dir)
     ] + view["warnings"]
+    build_only = build_only_functions(model, capture)
+    if build_only:
+        view["build_only_functions"] = build_only
+        for file, names in build_only.items():
+            shown = ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+            view["warnings"].append(
+                f"{file}: the build defines {len(names)} function(s) Frama-C's parse lacks ({shown}), code "
+                "behind a macro the compiler defines and Frama-C does not: Eva, WP and E-ACSL do not see it"
+            )
     if units:
         view = unit_view(view, model, root=root, capture=capture)
     # Step I8: tiers per function from trust, then oversized units split into sub-modules.
     tiers.apply(view)
     view = unit_split.apply(view, split_max_functions, split_max_lines)
     # The plan's decision for a unit Frama-C cannot parse: sanitizer fuzzing, Eva and WP blocked.
-    return block_fallback_units(view) if units else view
+    # Then a unit E-ACSL cannot build (setjmp.h, setjmp/longjmp calls): sanitizer fuzzing.
+    return route_nonlocal_jumps(block_fallback_units(view), capture) if units else view
 
 
 def main() -> int:
@@ -1067,8 +1238,8 @@ def main() -> int:
         "--capture",
         type=Path,
         default=None,
-        help=f"Build capture (scripts/build_capture.py) giving the headers each source includes "
-        f"(default: {CAPTURE_NAME} next to the model)",
+        help=f"Build capture (scripts/build_capture.py) giving the headers each source includes, the "
+        f"libraries each unit links and the functions the build defines (default: {CAPTURE_NAME} next to the model)",
     )
     parser.add_argument(
         "--split-max-functions",
@@ -1107,7 +1278,10 @@ def main() -> int:
         split_max_lines=args.split_max_lines,
     )
     if capture_note:
-        note = f"build capture not used, harness include directories are the sources' only: {capture_note}"
+        note = (
+            "build capture not used: harness include directories are the sources' only, units carry no "
+            f"link libraries, and the build is not compared with the parse: {capture_note}"
+        )
         dag["warnings"] = [*dag.get("warnings", []), note]
         print(f"warning: {note}", file=sys.stderr)
     args.out.parent.mkdir(parents=True, exist_ok=True)

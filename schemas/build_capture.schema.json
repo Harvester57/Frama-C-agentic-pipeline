@@ -86,7 +86,9 @@
           "arguments": {"type": "array", "items": {"type": "string"}},
           "flags": {"$comment": "-I -iquote -isystem -idirafter -include -imacros (value as next token, relative to the target root), -D -U (joined), -std=", "type": "array", "items": {"type": "string"}},
           "system_flags": {"$comment": "include options naming directories or files outside the tree (absolute)", "type": "array", "items": {"type": "string"}},
-          "headers": {"$comment": "project headers the compiler's dependency list names (generated ones included)", "type": "array", "items": {"type": "string"}}
+          "headers": {"$comment": "project headers the compiler's dependency list names (generated ones included)", "type": "array", "items": {"type": "string"}},
+          "includes_setjmp_h": {"$comment": "the dependency list names a setjmp.h: E-ACSL cannot build it (build_callgraph_dag.route_nonlocal_jumps)", "type": "boolean"},
+          "defined_functions": {"$comment": "functions the object defines (nm), as `file#name` ids: compared with the model by build_callgraph_dag (build_only_functions)", "type": "array", "items": {"type": "string"}}
         },
         "required": ["source", "object", "cwd", "compiler", "arguments", "flags", "system_flags", "headers"]
       }

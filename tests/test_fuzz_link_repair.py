@@ -68,6 +68,30 @@ def test_repair_sources_for_link_resolves_bare_dag_names(tmp_path: Path) -> None
     assert info["symbols"] == ["ssh2_init_if_needed"]
 
 
+def test_repair_places_symbols_only_the_build_defines(tmp_path: Path) -> None:
+    """libpng's png_target_init: under __SSE2__, which Frama-C does not define, so not in the DAG's functions."""
+    work = tmp_path / "workspace" / "work"
+    work.mkdir(parents=True)
+    (work / "png.c").write_text("int a;\n", encoding="utf-8")
+    (work / "pngsimd.c").write_text("int b;\n", encoding="utf-8")
+    dag_path = tmp_path / "callgraph_dag.json"
+    dag_path.write_text(
+        json.dumps(
+            {
+                "functions": {"png_init_io": {"name": "png_init_io", "file": "png.c"}},
+                "build_only_functions": {"pngsimd.c": ["png_target_init", "png_init_io"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    log = "undefined reference to `png_target_init'\n"
+    repaired, info = R.repair_sources_for_link(["workspace/work/png.c"], log, dag_path, tmp_path)
+    assert repaired == ["workspace/work/png.c", "workspace/work/pngsimd.c"]
+    assert info["symbols"] == ["png_target_init"]
+    # The DAG's own functions win over the build-only list.
+    assert R._dag_symbol_files(dag_path)["png_init_io"] == "png.c"
+
+
 def test_discover_slice_functions_never_returns_type_keywords(tmp_path: Path) -> None:
     """PB-1: a function-pointer-returning definition must not yield 'void' for -rte-select."""
     src = tmp_path / "session.c"

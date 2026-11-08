@@ -604,6 +604,31 @@ def test_reproducer_units_and_entry_points_match_the_truth(build_image_run, tmp_
 
 @pytest.mark.integration
 @pytest.mark.slow
+def test_compiles_record_setjmp_h_and_the_functions_the_build_defines(build_image_run, tmp_path):
+    """libpng's two blind spots: setjmp.h (E-ACSL cannot build it) and code only the compiler's macros enable."""
+    fixture = tmp_path / "target"
+    fixture.mkdir()
+    (fixture / "jump.c").write_text(
+        "#include <setjmp.h>\nstatic jmp_buf env;\nint jump(void) { return setjmp(env); }\n", encoding="utf-8"
+    )
+    (fixture / "simd.c").write_text(
+        "int plain(int x) { return x; }\n#ifdef __SSE2__\nint filter_sse2(int x) { return x + 1; }\n#endif\n",
+        encoding="utf-8",
+    )
+    build = "cc -c jump.c -o jump.o && cc -c simd.c -o simd.o && ar rcs libk.a jump.o simd.o"
+    proc = build_image_run(fixture, tmp_path / "run", f"{CAPTURE} --recipe-file '' --command '{build}'")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    report = json.loads((tmp_path / "run" / "workspace/reports/build_capture.json").read_text(encoding="utf-8"))
+    assert not bc.validate_report(report)
+    by_source = {c["source"]: c for c in report["compiles"]}
+    assert by_source["jump.c"]["includes_setjmp_h"] is True
+    assert by_source["simd.c"]["includes_setjmp_h"] is False
+    assert by_source["jump.c"]["defined_functions"] == ["jump.c#jump"]
+    assert by_source["simd.c"]["defined_functions"] == ["simd.c#filter_sse2", "simd.c#plain"]
+
+
+@pytest.mark.integration
+@pytest.mark.slow
 def test_broken_build_stops_with_a_diagnostic_and_resumes_after_the_recipe_is_fixed(build_image_run, tmp_path):
     fixture = FIXTURES / "broken"
     run = tmp_path / "run-1"
