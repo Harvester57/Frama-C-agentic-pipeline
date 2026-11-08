@@ -2730,7 +2730,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("seed")
     p.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
     p.add_argument("--scope", action="append", default=[])
-    p.add_argument("--callgraph-source", choices=["frama_c", "gcc_callgraph", "regex"], default="regex")
+    p.add_argument("--callgraph-source", choices=["frama_c", "gcc_callgraph"], default="frama_c")
     p.add_argument("--profile", choices=["quick", "standard", "deep"], default=None)
     p.add_argument(
         "--security-props",

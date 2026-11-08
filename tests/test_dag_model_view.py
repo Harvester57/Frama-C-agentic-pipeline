@@ -186,7 +186,7 @@ def test_seed_uses_the_model_view(target: Path, tmp_path: Path, monkeypatch: pyt
     run = tmp_path / "run"
     (run / "workspace/reports").mkdir(parents=True)
     monkeypatch.chdir(run)
-    out = ledger.cmd_seed(dag_path, [], "regex")
+    out = ledger.cmd_seed(dag_path, [], "frama_c")
     units, _ = ledger.load_state()
     fns = {(u["file"], u["function"]) for u in units.values()}
     assert ("include/h.h", "hin") in fns

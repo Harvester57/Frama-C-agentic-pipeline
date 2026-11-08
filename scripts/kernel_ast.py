@@ -7,8 +7,8 @@ scripts/kernel_ast_dump.ml is compiled into a private temporary directory and lo
 the C/ACSL lexer cannot see: the code after macro expansion, resolved types and call targets.
 
 This is the shared kernel entry point: function_facts.py builds per-function prover facts on it,
-and call_graph() is what an authoritative kernel call graph (v2-design M4) can replace the lexer's
-`callgraph_source: regex` with. Functions are identified by (file, original name) because the
+and call_graph() gives the kernel's call graph of one module's sources (Phase 0's comes from
+scripts/phase0_model.py). Functions are identified by (file, original name) because the
 kernel renames same-named statics (`helper`, `helper_0`).
 
 A failure here is never an analysis failure: every problem comes back as a `status`, and consumers

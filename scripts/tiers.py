@@ -14,7 +14,7 @@ structure, and a module takes the most demanding tier among its functions:
     indirect edges). The library API is untrusted by default (I7), so a library's internal helpers
     are on an untrusted path through the API that calls them;
   - **Tier 3** (deferred under the quick profile): no untrusted path; or scalar glue on one: no loop,
-    no pointer parameter, pointer return or pointer cast, no indirect call, no allocation or
+    no pointer parameter or pointer return, no indirect call, no allocation or
     recursion, not variadic, at most one decision (cyclomatic complexity <= SCALAR_MAX_CYCLOMATIC),
     and either off the trust boundary or without parameters (an exported getter or init function:
     attacker data reaches a boundary function only through its parameters);
@@ -28,13 +28,14 @@ untrusted path -> 3". Heap and recursion are tested first because Tier 2's route
 the non-allocating validators) is the one WP can follow on such code; "complex" is read as "not an
 internal scalar helper", the only untrusted-path code put in Tier 3.
 
-Each function records `tier`, `tier_reasons` and `untrusted_path`; each module (link unit, lexer module,
+Each function records `tier`, `tier_reasons` and `untrusted_path`; each module (link unit, path module,
 split sub-module) records `tier`, `recommended_strategy`, the run flags of that tier (`run_eacsl_fuzz`,
 `run_eva`, `run_wp_full`), `tier_counts` and `deferred_profiles` (["quick"] for Tier 3). A module with
-no function keeps its tier. The lexer's tier of a module stays under `lexer_tier`.
+no function keeps its tier, or gets Tier 3's when it has none.
 
-Without trust in the DAG (no Phase 0 model, or a model from before I7) nothing changes: the lexer's
-tiers stay, and the DAG's `tiers.source` says so.
+Without trust in the DAG (a model from before I7, or trust.py failed) every function is taken to be on
+an untrusted path, so only the structure decides (Tier 3 is then scalar glue only), and the DAG's
+`tiers.source` says `structure`.
 """
 
 from __future__ import annotations
@@ -58,8 +59,7 @@ SCALAR_MAX_CYCLOMATIC = 2
 # The profiles under which a tier's modules are not run (no fuzzing, no Eva) and its ledger units deferred.
 DEFERRED_PROFILES: dict[str, list[str]] = {"Tier 3": ["quick"]}
 
-# The route of each tier (the slice skill's tier table); the run flags are those of the lexer's
-# classify_module_tier, so a module keeps its phases when its tier stays the same.
+# The route of each tier (the slice skill's tier table).
 ROUTE: dict[str, dict[str, Any]] = {
     TIER_1A: {
         "recommended_strategy": "RTE + E-ACSL + LibFuzzer -> Module Eva -> Full Wavefront WP + Security Contracts",
@@ -162,10 +162,8 @@ def is_scalar_helper(rec: dict) -> bool:
     return (
         not (trust.get("boundary") and has_params(rec))
         and not rec.get("has_loops")
-        and not rec.get("macro_loops")
         and _ptr_params(rec) == 0
         and not rec.get("returns_pointer")
-        and not rec.get("has_pointer_cast")
         and not rec.get("indirect_calls")
         and not rec.get("is_variadic")
         and not rec.get("has_dynamic_alloc")
@@ -198,7 +196,7 @@ def function_tier(rec: dict, path_reason: str | None) -> tuple[str, list[str]]:
     if writes and (rec.get("uses_format_or_write") or not rec.get("takes_bounded_buffer")):
         return TIER_1B, [path_reason, "writes a bounded output buffer (emitter)"]
     shape = []
-    if rec.get("has_loops") or rec.get("macro_loops"):
+    if rec.get("has_loops"):
         shape.append("loops")
     if _ptr_params(rec):
         shape.append("pointer parameters")
@@ -229,39 +227,50 @@ def _retier_modules(functions: dict[str, dict], modules: dict[str, dict], member
         if not isinstance(mod, dict):
             continue
         keys = member_of(name, mod)
-        if not keys:
-            continue
-        mod.setdefault("lexer_tier", mod.get("tier"))
-        mod.update(module_fields(functions, keys, mod.get("tier")))
+        if keys:
+            mod.update(module_fields(functions, keys, mod.get("tier")))
+        else:
+            for k, v in module_fields(functions, [], mod.get("tier")).items():
+                mod.setdefault(k, v)
+
+
+def retier_modules(dag: dict) -> dict:
+    """
+    Set every module's tier and run flags from its functions' tiers: link units (or path modules),
+    the path modules of a link-unit DAG (`lexer_modules`, by each function's `lexer_module`), and split
+    sub-modules. In place, and returned.
+    """
+    functions: dict[str, dict] = dag.get("functions") or {}
+    _retier_modules(functions, dag.get("modules") or {}, lambda _n, m: list(m.get("functions") or []))
+    path_modules = dag.get("lexer_modules")
+    if isinstance(path_modules, dict) and dag.get("module_kind") == "link_unit":
+        by_path: dict[str, list[str]] = {}
+        for key, rec in functions.items():
+            if rec.get("lexer_module"):
+                by_path.setdefault(str(rec["lexer_module"]), []).append(key)
+        _retier_modules(functions, path_modules, lambda n, _m: by_path.get(n, []))
+    _retier_modules(functions, dag.get("submodules") or {}, lambda _n, m: list(m.get("functions") or []))
+    return dag
 
 
 def apply(dag: dict) -> dict:
     """Set per-function and per-module tiers in `dag` (in place, and returned). See the module docstring."""
     functions: dict[str, dict] = dag.get("functions") or {}
-    if not functions or not has_trust(dag):
-        dag["tiers"] = {"source": "lexer", "note": "no trust in the DAG (step I7): the lexer's module tiers are kept"}
-        return dag
-    path = untrusted_path(functions)
+    trusted = has_trust(dag)
+    if trusted:
+        path = untrusted_path(functions)
+    else:
+        path = {k: "no trust in the DAG (step I7): every function taken as on an untrusted path" for k in functions}
     for key, rec in functions.items():
-        rec.setdefault("lexer_tier", rec.get("tier"))
         tier, reasons = function_tier(rec, path.get(key))
         rec["tier"] = tier
         rec["tier_reasons"] = reasons
         rec["untrusted_path"] = key in path
-
-    _retier_modules(functions, dag.get("modules") or {}, lambda _n, m: list(m.get("functions") or []))
-    lexer_modules = dag.get("lexer_modules")
-    if isinstance(lexer_modules, dict) and dag.get("module_kind") == "link_unit":
-        by_lexer: dict[str, list[str]] = {}
-        for key, rec in functions.items():
-            if rec.get("lexer_module"):
-                by_lexer.setdefault(str(rec["lexer_module"]), []).append(key)
-        _retier_modules(functions, lexer_modules, lambda n, _m: by_lexer.get(n, []))
-    _retier_modules(functions, dag.get("submodules") or {}, lambda _n, m: list(m.get("functions") or []))
+    retier_modules(dag)
 
     counts = Counter(str(r["tier"]).split(" (")[0] for r in functions.values())
     dag["tiers"] = {
-        "source": "trust",
+        "source": "trust" if trusted else "structure",
         "functions": {p: counts[p] for p in _PREFIXES},
         "untrusted_path": len(path),
         "tier3_no_untrusted_path": sum(1 for k in functions if k not in path),
@@ -283,7 +292,7 @@ def summary(dag: dict) -> dict[str, Any]:
 
     def mods(records: dict) -> dict[str, Any]:
         return {
-            n: {"tier": m.get("tier"), "lexer_tier": m.get("lexer_tier"), "tier_counts": m.get("tier_counts")}
+            n: {"tier": m.get("tier"), "tier_counts": m.get("tier_counts")}
             for n, m in sorted((records or {}).items())
             if isinstance(m, dict)
         }

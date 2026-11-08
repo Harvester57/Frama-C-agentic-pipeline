@@ -1401,6 +1401,7 @@ def inner_phase0() -> int:
                 dest = Path(asset["to"])
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(Path(BENCH_SUBDIR) / "assets" / asset["path"], dest)
+            # The DAG comes from the Phase 0 model; without one (the target did not build) this step fails.
             dag_args = [
                 py,
                 script("build_callgraph_dag.py"),
@@ -1409,10 +1410,6 @@ def inner_phase0() -> int:
                 "--out",
                 "workspace/reports/callgraph_dag.json",
             ]
-            if spec.get("compile_commands"):
-                dag_args += ["--compile-commands", spec["compile_commands"]]
-            else:
-                dag_args += ["--emit-compile-commands", "workspace/reports/compile_commands.json"]
             ok = step("dag", dag_args)
         if ok:
             dag = read_json(Path("workspace/reports/callgraph_dag.json"), {}) or {}

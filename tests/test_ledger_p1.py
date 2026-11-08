@@ -59,7 +59,7 @@ def test_eva_invalid_in_deferred_unit_becomes_linked_candidate(run_dir):
 )
 def test_eva_invalid_without_eligible_unit_becomes_unlinked_candidate(run_dir, file, function):
     write_json(run_dir / "workspace/reports/callgraph_dag.json", DAG)
-    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", ["src/snmp/pdu.c", "src/glue"], "regex")
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", ["src/snmp/pdu.c", "src/glue"], "frama_c")
     alarm = {"file": file, "function": function, "line": 3, "kind": "index_bound", "annotation": "i < 4"}
     write_json(run_dir / "workspace/reports/eva/snmp.json", eva_report(invalid_alarms=[alarm]))
     assert L.cmd_ingest_eva([run_dir / "workspace/reports/eva/snmp.json"])["candidates"] == 1
