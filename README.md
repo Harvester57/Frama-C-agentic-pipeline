@@ -273,6 +273,7 @@ python3 -m mypy scripts tests
 - [Architecture & Dataflow (`./docs/architecture.md`)](./docs/architecture.md)
 - [Slicing & Onboarding 90k+ LoC Codebases (`./docs/slicing-and-onboarding.md`)](./docs/slicing-and-onboarding.md)
 - [Phase 0 Redesign & Implementation Plan (`./docs/phase0-redesign.md`, `./docs/phase0-implementation-plan.md`)](./docs/phase0-implementation-plan.md)
+- [Phase 0 Redesign: Effects on the Other Phases (`./docs/phase0-downstream-effects.md`)](./docs/phase0-downstream-effects.md)
 - [Proving Security Properties Beyond Memory Safety (`./docs/security-properties.md`)](./docs/security-properties.md)
 - [Multi-Agent Swarm & Dual-Oracle Guardrail (`./docs/agentic-swarm.md`)](./docs/agentic-swarm.md)
 - [Resources, Scheduling & Caching (`./docs/resources-and-caching.md`)](./docs/resources-and-caching.md)
