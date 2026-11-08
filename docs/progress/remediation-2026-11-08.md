@@ -25,4 +25,27 @@ Checks at `9b67328`: ruff, `ruff format --check`, `mypy scripts tests` clean; un
 
 Script: rebuild both images → `FRAMAC_DOCKER_TESTS=1 python -m pytest` → seeded set (`seeded-r2v`) → the ten benchmark targets (`r2v-<target>`), each compared with `r1v-<target>`. Baseline `phase0-r2` is recorded once V passes. The merge into `main` waits for the user's go-ahead.
 
-Results: (filled in as each stage finishes)
+Results so far (21:15, HEAD `9b67328`):
+
+- Images: both built.
+- Docker tests (`FRAMAC_DOCKER_TESTS=1`): 2290 passed, 41 skipped (236 s).
+- Seeded set (`seeded-r2v`): bugs found 8/8, decoys fired 0/4.
+- Targets, `r2v` against `r1v` (`benchmark_compare.py`):
+
+| Target | rc | Wall | Compare |
+| :--- | :--- | :--- | :--- |
+| minmea | 0 | 191 s | MINMEA-01/02/03 still found; fingerprints changed (the harness changed) |
+| oscs-jsmn | 0 | 407 s | no regression |
+| oscs-semver | 0 | 180 s | no regression |
+| oscs-stmr | 0 | 143 s | no regression |
+| oscs-qlz | 0 | 118 s | status ok → partial: `reach-dynamic-quicklz` "no coverage (no_inputs)" |
+| x509-parser | 0 | 200 s | status ok → partial: `x509-common` executed 7 of 51 API entry points (gate reopened); queue rc=1 |
+| cryptolib | 0 | 1028 s | status ok → partial: `reach-dynamic-core` "no coverage (coverage_error)" |
+| qcbor-master | 0 | 181 s | no regression |
+| qcbor-dev | — | — | running |
+| oscs-tweetnacl | — | — | pending |
+
+Each "partial" comes from the `coverage` stage, which since R9 (`28101de`) also runs `reach-dynamic`. The `r1v` runs predate R9 and never ran that gate, so these are new checks failing, not lost results. Each still needs a diagnosis before the baseline:
+- qlz: the campaign stops at its first crash, and there are no recorded seeds (`no_calls_recorded`), so the coverage binary has no inputs. The error row is also missing from `harness_reach_dynamic.json` (`modules: {}`).
+- x509: a real reach gap. 44 entry points of `x509-common` were never executed.
+- cryptolib: the coverage build or run of `core` failed.
