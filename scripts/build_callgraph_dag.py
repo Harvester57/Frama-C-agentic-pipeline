@@ -844,9 +844,9 @@ def block_fallback_units(dag: dict) -> dict:
             f"module {name}: on the GCC fallback, fuzzed with the sanitizers; Eva and WP are blocked"
         )
         for key in modules[name].get("functions") or []:
-            rec = (dag.get("functions") or {}).get(key)
-            if isinstance(rec, dict):
-                rec["eva_wp_blocked"] = fallback_blocked_reason(error)
+            fn_rec = (dag.get("functions") or {}).get(key)
+            if isinstance(fn_rec, dict):
+                fn_rec["eva_wp_blocked"] = fallback_blocked_reason(error)
     return dag
 
 

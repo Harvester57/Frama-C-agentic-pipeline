@@ -3002,7 +3002,8 @@ def replay_candidates(
     for cand in todo:
         fingerprint = str(cand.get("fingerprint") or "")
         module = str(cand.get("module") or "")
-        loc = cand.get("location") if isinstance(cand.get("location"), dict) else {}
+        loc = cand.get("location")
+        loc = loc if isinstance(loc, dict) else {}
         file, function = str(loc.get("file") or ""), str(loc.get("function") or "")
         eng = engine or _candidate_engine(cand)
         # A candidate naming a link unit replays on the harness whose scope holds its function.
@@ -3246,7 +3247,8 @@ def minimize_candidates(
         fingerprint = str(cand.get("fingerprint") or "")
         module = str(cand.get("module") or "")
         eng = engine or _candidate_engine(cand)
-        location = cand.get("location") if isinstance(cand.get("location"), dict) else {}
+        location = cand.get("location")
+        location = location if isinstance(location, dict) else {}
         where = (module, str(location.get("file") or ""), str(location.get("function") or ""))
         if where not in specs:
             try:
