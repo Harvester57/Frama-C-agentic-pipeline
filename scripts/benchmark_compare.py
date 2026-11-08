@@ -234,6 +234,11 @@ def _compare_eva_module(subject: str, base: dict, cur: dict, out: Comparison) ->
     elif du > 0:
         message = f"Unknown {_fmt_delta(base.get('unknown', 0), cur.get('unknown', 0))}"
         grew = cur.get("total", 0) - base.get("total", 0)
+        # More code analyzed calls more of the libc, whose specs are Considered valid: a rise smaller
+        # than the growth in properties checked is that, not assumptions hiding alarms.
+        assumed_rise = cur.get("assumed", 0) - base.get("assumed", 0)
+        if assumed_rise <= grew:
+            reasons = [r for r in reasons if not r.startswith("Considered valid rose")]
         if grew >= du and not reasons:
             out.add("changed", "eva", subject, f"{message} with {grew:+d} properties checked (more code analyzed)")
         else:

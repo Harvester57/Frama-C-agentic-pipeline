@@ -262,6 +262,15 @@ class TestEvaCounts:
         assert rows(result, "regression", "eva") == []
         assert rows(result, "changed", "eva")
 
+    def test_more_code_calling_more_libc_is_still_not_a_regression(self):
+        # tweetnacl's whole-API harness: +869 properties, +5 Considered valid (libc specs)
+        base_assumed = mod_eva(make_run()).get("assumed", 0)
+        result = mutate(lambda r: mod_eva(r).update(unknown=12, valid=98, total=110, assumed=base_assumed + 5))
+        assert rows(result, "regression", "eva") == []
+        # an assumed rise beyond the growth in checked code stays suspect
+        result = mutate(lambda r: mod_eva(r).update(unknown=12, valid=98, total=110, assumed=base_assumed + 50))
+        assert rows(result, "regression", "eva")
+
     def test_counts_have_zero_tolerance(self):
         assert mutate(lambda r: mod_eva(r).update(unknown=9, valid=91)).diffs
 
