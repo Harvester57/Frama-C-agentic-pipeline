@@ -5,9 +5,9 @@ Stdlib only.
 
     unit_split.py show [--dag workspace/reports/callgraph_dag.json] [--max-functions N] [--max-lines N]
 
-A unit is split when it has more than MAX_FUNCTIONS functions or MAX_LINES lines of function bodies
-(calibrated on CryptoLib's and QCBOR's Eva times, see the plan's I8 notes). Clustering is anchored on
-the unit's API entry points:
+A unit is split when its entry points reach more than MAX_FUNCTIONS functions or MAX_LINES lines of
+function bodies (what one harness driving its whole API gives Eva; calibrated on CryptoLib's and
+QCBOR's Eva times, see the plan's I8 notes). Clustering is anchored on the unit's API entry points:
 
   1. each entry point starts a cluster: the functions of the unit it reaches in the call graph
      (direct and indirect edges);
@@ -50,10 +50,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import tiers  # noqa: E402
 
-# Calibrated in step I8 (plan notes): Eva on a harness reaching ~100-200 functions finishes in 1-4
-# minutes on the benchmark, far inside the 30-minute cap; a whole CryptoLib unit does not.
-MAX_FUNCTIONS = 150
-MAX_LINES = 5000
+# Calibrated in step I8 (plan notes): the slowest benchmark harnesses cost Eva about 2 s per reached
+# function (QCBOR's spiffy decode, 102 functions, 205 s) and 0.05 s per line; a harness driving all of
+# CryptoLib's API (231 reached functions, 12.7k lines) converges in 61 s. These limits keep a unit's
+# Eva run at half the 30-minute cap at the worst observed rate.
+MAX_FUNCTIONS = 400
+MAX_LINES = 15000
 OVERLAP = 0.5
 MIN_FUNCTIONS = 10
 _NAME_JUNK = re.compile(r"[^A-Za-z0-9_]+")
@@ -186,12 +188,18 @@ def apply(
         taken = set(modules) | set(dag.get("lexer_modules") or {})
         for unit, rec in sorted(modules.items()):
             keys = [k for k in rec.get("functions") or [] if k in functions]
-            n_fns, n_lines = unit_size(functions, keys)
-            row: dict[str, Any] = {"functions": n_fns, "lines": n_lines, "split": False}
+            entries = [e for e in rec.get("candidate_entry_points") or [] if e in functions]
+            # The size a whole-unit harness gives Eva: what the entry points reach (all without any).
+            within = set(keys)
+            reached: set[str] = set()
+            for e in entries:
+                if e in within and e not in reached:
+                    reached |= reach(functions, e, within)
+            n_fns, n_lines = unit_size(functions, sorted(reached) if entries else keys)
+            row: dict[str, Any] = {"functions": len(keys), "reached": n_fns, "lines": n_lines, "split": False}
             rows[unit] = row
             if n_fns <= max_functions and n_lines <= max_lines:
                 continue
-            entries = [e for e in rec.get("candidate_entry_points") or [] if e in functions]
             clusters = cluster(functions, keys, entries, max_functions, overlap, min_functions)
             if len(clusters) < 2:
                 row["note"] = "above the threshold, but its entry points form a single cluster"
@@ -219,7 +227,7 @@ def apply(
             unclustered = sorted(set(keys) - covered)
             why = []
             if n_fns > max_functions:
-                why.append(f"{n_fns} functions > {max_functions}")
+                why.append(f"{n_fns} reached functions > {max_functions}")
             if n_lines > max_lines:
                 why.append(f"{n_lines} lines > {max_lines}")
             rec["split"] = {"reason": ", ".join(why), "submodules": names, "unclustered": unclustered}

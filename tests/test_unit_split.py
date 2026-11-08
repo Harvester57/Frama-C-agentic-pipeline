@@ -69,7 +69,7 @@ def big_dag() -> dict:
 def test_a_unit_under_the_threshold_is_not_split():
     d = U.apply(big_dag())
     assert d["submodules"] == {}
-    assert d["unit_split"]["units"]["libbig_a"] == {"functions": 28, "lines": 280, "split": False}
+    assert d["unit_split"]["units"]["libbig_a"] == {"functions": 28, "reached": 27, "lines": 270, "split": False}
 
 
 def test_clusters_are_anchored_on_entry_points_merged_on_overlap_and_small_ones_packed():
@@ -85,13 +85,13 @@ def test_clusters_are_anchored_on_entry_points_merged_on_overlap_and_small_ones_
     assert tc["tier"] == T.TIER_1A and tc["run_eacsl_fuzz"]
     split = d["modules"]["libbig_a"]["split"]
     assert split["submodules"] == ["libbig_a__tc", "libbig_a__tm"]
-    assert split["unclustered"] == ["orphan"] and split["reason"] == "28 functions > 20"
+    assert split["unclustered"] == ["orphan"] and split["reason"] == "27 reached functions > 20"
 
 
 def test_a_line_count_above_the_threshold_splits_too():
     d = U.apply(big_dag(), max_functions=1000, max_lines=100, min_functions=5)
     assert d["unit_split"]["units"]["libbig_a"]["split"]
-    assert "280 lines > 100" in d["modules"]["libbig_a"]["split"]["reason"]
+    assert "270 lines > 100" in d["modules"]["libbig_a"]["split"]["reason"]
 
 
 def test_overlap_merging_ignores_size_but_packing_respects_it():
