@@ -39,7 +39,7 @@ $env:PYTHONIOENCODING="utf-8"
 
 Always use full `/opt/framac-pipeline/scripts/<script>.py` paths inside `"<command>"` so host PowerShell does not expand `$S`.
 
-**Images.** Commands run in the analysis image (`framac-analysis:latest`: Frama-C, MetAcsl, the provers, clang and libFuzzer, no target packages) unless a step says otherwise. `-BuildImage` (`--build-image`) runs in the build image (`framac-build`), which runs the target's own build and tests. `-CodeQL` (`--codeql`) runs in the optional CodeQL image. The monolithic image `framac-pipeline:latest` (`-Image`, `FRAMAC_DOCKER_IMAGE`) still works but is slated for removal: do not use it for new runs.
+**Images.** Commands run in the analysis image (`framac-analysis:latest`: Frama-C, MetAcsl, the provers, clang and libFuzzer, no target packages) unless a step says otherwise. `-BuildImage` (`--build-image`) runs in the build image (`framac-build`), which runs the target's own build and tests. `-CodeQL` (`--codeql`) runs in the optional CodeQL image. There is no other image.
 
 ## Step 1 — Initialize the Shadow Overlay Workspace
 

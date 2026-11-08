@@ -381,6 +381,23 @@ I0 ─┬─▶ I1 ────────────────────�
 
 ## Step notes
 
+### I10c (2026-11-08)
+
+- **Monolith retired.** The Dockerfile has two stages, `framac-build` and `framac-analysis`. The analysis image is the last stage, so a build without `--target` makes it. CodeQL keeps its own Dockerfile.
+- **Nothing added to the analysis image.** Against the monolith it lacks only build systems (`bear`, `cmake`, `ninja`), target `-dev` libraries, `pip`/`venv` and `wget`. The pipeline runs none of them there: the build capture and seed harvest run in the build image, and the snapshot carries the target's headers and libraries. Checked in both containers as a non-root uid: Frama-C 35 with E-ACSL, Eva, WP, MetAcsl and Alias; Alt-Ergo, Z3, CVC5 in `why3`; clang with libFuzzer and ASan; `make`, `cvise`, `dot`, `llvm-cov`; every script imports; the sandbox probe and the E-ACSL, kernel AST and Phase 0 model selftests pass.
+- **Wrappers:**
+  - `-Image` / `FRAMAC_DOCKER_IMAGE` only renames the analysis image, or the build image with `-BuildImage`. A missing image is built from that stage;
+  - `-TargetPackages` derives only `framac-build:<repo>`. No wrapper names `framac-pipeline:<tag>` any more (test in `tests/test_build_capture.py`).
+- **CI and CD** build `--target framac-analysis` (CI tags `framac-analysis:latest`, the wrapper's default). The compose service keeps its name `framac-pipeline` and runs the analysis image.
+- **Tests:** `tests/conftest.py` names both images: `ANALYSIS_IMAGE` (`FRAMAC_TEST_IMAGE`, default `framac-analysis:latest`) and `BUILD_IMAGE` (`FRAMAC_TEST_BUILD_IMAGE`, default `framac-build:latest`), with one skip helper.
+  - Fixture builds (`docker_fixture_run`) and the build capture run in the build image;
+  - the Phase 0 model, its selftest and the WP wipe acceptance run in the analysis image.
+- **Results:**
+  - `python -m pytest -q`: 2,045 passed, 100 skipped. ruff clean; mypy keeps only the known `run_eacsl_fuzz.py:1352` error.
+  - With `FRAMAC_DOCKER_TESTS=1`: 2,104 passed, 41 skipped, the same as the old suite on the monolith (`03f6568`, monolith rebuilt from it). The 59 Docker-backed tests pass in both. The skips are the same, all host tools (gcc, make, Frama-C on Windows).
+  - Wrapper smoke run, with no `-Image`: `benchmark.py seeded --project s01_macro_fn` (`i10c-smoke`), capture, model, Phase 0, build check, fuzz, Eva, ingest all rc 0; 1/1 bug found, 0/1 decoys. The container ran `framac-analysis:latest` with the worktree's scripts mounted.
+- **Left to the user:** the old local tags `framac-pipeline:latest`, `framac-pipeline:CryptoLib`, `framac-pipeline:pre-gcrypt-20261107` and `framac-pipeline:fc34-20261105` can be deleted.
+
 ### I10 status and the merged tree (2026-11-08)
 
 - **Merged into `phase0-redesign`:** I4, I6, I7, I8, I9, then I10a (lexer removal) and I10b (docs and the slice, verify and fuzz skills).

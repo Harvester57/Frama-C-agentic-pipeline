@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Executes a command inside the hardened framac-pipeline container.
+# Executes a command inside a hardened pipeline container.
 #
 #   framac-docker.sh [--target DIR] (--run-dir DIR | --new-run) [--repo NAME]
 #                    [--target-packages "pkg1 pkg2"] [--build-if-missing]
@@ -13,8 +13,8 @@
 # build image framac-build:<repo> is built and used. FRAMAC_DOCKER_IMAGE still overrides the name.
 # Every other command runs in the analysis image (framac-analysis:latest), which holds no target package:
 # the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written by the
-# build capture), so --target-packages only derives the build image. FRAMAC_DOCKER_IMAGE=framac-pipeline:latest
-# selects the monolith, which --target-packages still derives as framac-pipeline:<repo>.
+# build capture), so --target-packages only derives the build image. FRAMAC_DOCKER_IMAGE only renames the
+# image: a missing one is built from the matching stage (framac-analysis or framac-build) with --build-if-missing.
 # --codeql runs the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py, plan step
 # I7): framac-codeql:latest (Dockerfile.codeql: the build image plus the pinned CodeQL CLI). With
 # --target-packages, framac-build:<repo> is derived first, then framac-codeql:<repo> from it, copying
@@ -253,8 +253,8 @@ if [[ ${REMOVE_SCRATCH} -eq 1 ]]; then
 fi
 
 # Build steps (--build-image) run in the build image (Dockerfile stage framac-build); everything else in the
-# analysis image (stage framac-analysis). An explicit FRAMAC_DOCKER_IMAGE is built from the last stage, the monolith.
-IMAGE_TARGET=()
+# analysis image (stage framac-analysis). FRAMAC_DOCKER_IMAGE only renames the image; it is built from the same stage.
+IMAGE_TARGET=(--target framac-analysis)
 if [[ ${BUILD_IMAGE} -eq 1 && ${CODEQL} -eq 1 ]]; then
     echo "[framac-docker] use either --build-image or --codeql" >&2; exit 2
 fi
@@ -265,12 +265,9 @@ if [[ ${CODEQL} -eq 1 ]]; then
 elif [[ ${BUILD_IMAGE} -eq 1 ]]; then
     IMAGE="${FRAMAC_DOCKER_IMAGE:-framac-build:latest}"
     IMAGE_TARGET=(--target framac-build)
-elif [[ -z "${FRAMAC_DOCKER_IMAGE:-}" ]]; then
-    IMAGE_TARGET=(--target framac-analysis)
-    if [[ -n "${TARGET_PACKAGES}" ]]; then
-        echo "[framac-docker] --target-packages ignored: the analysis image reads the target's headers and libraries from the run's snapshot (pass them to the --build-image capture)" >&2
-        TARGET_PACKAGES=""
-    fi
+elif [[ -n "${TARGET_PACKAGES}" ]]; then
+    echo "[framac-docker] --target-packages ignored: the analysis image reads the target's headers and libraries from the run's snapshot (pass them to the --build-image capture)" >&2
+    TARGET_PACKAGES=""
 fi
 if [[ -z "$("${ENGINE}" images -q "${IMAGE}" 2>/dev/null)" ]]; then
     if [[ ${BUILD} -eq 1 ]]; then
@@ -282,8 +279,7 @@ if [[ -z "$("${ENGINE}" images -q "${IMAGE}" 2>/dev/null)" ]]; then
 fi
 
 if [[ -n "${TARGET_PACKAGES}" ]]; then
-    DERIVED_IMAGE="framac-pipeline:${REPO}"
-    [[ ${BUILD_IMAGE} -eq 1 || ${CODEQL} -eq 1 ]] && DERIVED_IMAGE="framac-build:${REPO}"
+    DERIVED_IMAGE="framac-build:${REPO}"
     echo "[framac-docker] Building derived image ${DERIVED_IMAGE} with target packages: ${TARGET_PACKAGES}" >&2
     "${ENGINE}" build ${IMAGE_TARGET[@]+"${IMAGE_TARGET[@]}"} -t "${DERIVED_IMAGE}" \
         --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}" >&2

@@ -10,7 +10,7 @@ Conventions and idioms enforced across `scripts/` and `tests/` in this repositor
 ## 1. Runtime & Dependency Rules
 
 - **Target version:** Python **3.10+** (`target-version = "py310"` in `pyproject.toml`).
-- **Stdlib-only in `scripts/`:** All pipeline helper scripts under `scripts/` execute both on the host (for the resource broker) and inside the hardened `framac-pipeline` container without third-party PyPI dependencies. Use only the Python standard library (`pathlib`, `json`, `subprocess`, `hashlib`, `argparse`, `dataclasses`, `shlex`, `tempfile`, `os`, `sys`, `typing`).
+- **Stdlib-only in `scripts/`:** All pipeline helper scripts under `scripts/` execute both on the host (for the resource broker) and inside the hardened pipeline containers without third-party PyPI dependencies. Use only the Python standard library (`pathlib`, `json`, `subprocess`, `hashlib`, `argparse`, `dataclasses`, `shlex`, `tempfile`, `os`, `sys`, `typing`).
   - Only `scripts/extract_references.py` (a host-only PDF-to-Markdown maintainer utility) may optionally import `pymupdf` / `pypdf`.
   - Schema validation uses the stdlib-only validator in `scripts/minischema.py` (`validate(instance, schema)`).
 - **UTF-8 everywhere:** Always pass `encoding="utf-8"` (and `errors="replace"` when decoding untrusted tool/compiler logs) to `Path.read_text`, `Path.write_text`, `open`, and `subprocess.run`. Set `$env:PYTHONIOENCODING="utf-8"` when invoking Python from PowerShell.

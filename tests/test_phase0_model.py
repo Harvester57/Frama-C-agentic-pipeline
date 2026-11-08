@@ -5,8 +5,6 @@ tests run the build capture and the model on the reproducers and the features fi
 """
 
 import json
-import os
-import shutil
 import subprocess
 import sys
 import uuid
@@ -16,6 +14,7 @@ import pytest
 
 import phase0_model as pm
 import resources
+from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, require_docker_images
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "phase0"
@@ -494,23 +493,14 @@ def test_parse_class_and_container_class():
 
 
 # ---------------------------------------------------------------------------------------------------
-# Docker-backed: build capture in the build image, then the model in the pipeline image
+# Docker-backed: build capture in the build image, then the model in the analysis image
 # ---------------------------------------------------------------------------------------------------
-
-PIPELINE_IMAGE = os.environ.get("FRAMAC_TEST_IMAGE", "framac-pipeline:latest")
-BUILD_IMAGE = os.environ.get("FRAMAC_TEST_BUILD_IMAGE", "framac-build:latest")
 
 
 @pytest.fixture
 def model_run():
     """`run(fixture, run_dir, build_command) -> model`: capture and model on one scratch volume."""
-    if os.environ.get("FRAMAC_DOCKER_TESTS") != "1":
-        pytest.skip("Docker-backed test: set FRAMAC_DOCKER_TESTS=1")
-    if not shutil.which("docker"):
-        pytest.skip("docker not found")
-    for image in (PIPELINE_IMAGE, BUILD_IMAGE):
-        if subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False).returncode:
-            pytest.skip(f"image {image} not built")
+    require_docker_images(ANALYSIS_IMAGE, BUILD_IMAGE)
     volumes: list[str] = []
 
     def docker(args: list[str], timeout: int = 900) -> subprocess.CompletedProcess:
@@ -538,7 +528,7 @@ def model_run():
              f"{py}/build_capture.py run --scratch /framac-scratch --recipe-file '' --command '{build}'"]
         )  # fmt: skip
         assert cap.returncode == 0, cap.stdout + cap.stderr
-        mod = docker([*common, "--entrypoint", "sh", PIPELINE_IMAGE, "-c", f"{py}/phase0_model.py run {model_args}"])
+        mod = docker([*common, "--entrypoint", "sh", ANALYSIS_IMAGE, "-c", f"{py}/phase0_model.py run {model_args}"])
         assert mod.returncode == 0, mod.stdout + mod.stderr
         return json.loads((run_dir / pm.DEFAULT_OUT).read_text(encoding="utf-8"))
 
@@ -619,11 +609,10 @@ def test_alias_narrowing_on_the_alias_fixture(model_run, tmp_path):
 @pytest.mark.integration
 @pytest.mark.slow
 def test_selftest_passes_in_the_image():
-    if os.environ.get("FRAMAC_DOCKER_TESTS") != "1":
-        pytest.skip("Docker-backed test: set FRAMAC_DOCKER_TESTS=1")
+    require_docker_images(ANALYSIS_IMAGE)
     proc = subprocess.run(
         ["docker", "run", "--rm", "--network", "none",
-         "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro", "--entrypoint", "sh", PIPELINE_IMAGE,
+         "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro", "--entrypoint", "sh", ANALYSIS_IMAGE,
          "-c", "python3 /opt/framac-pipeline/scripts/phase0_model.py selftest"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, check=False,
     )  # fmt: skip

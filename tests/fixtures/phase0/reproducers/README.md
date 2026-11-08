@@ -35,10 +35,11 @@ builds with `make` (`$(CC)`, `-O0 -g`, libc and pthread only). Each has a
 ## Verifying
 
 ```sh
-docker run --rm --network none -v "<this dir>:/r:ro" --entrypoint sh framac-pipeline:latest \
+docker run --rm --network none -v "<this dir>:/r:ro" --entrypoint sh framac-build:latest \
   -c 'cp -r /r/r01_static_collision /tmp/p && cd /tmp/p && make && nm -A $(find . -name "*.o")'
 ```
 
-All nine projects build in `framac-pipeline:latest` with no errors or warnings
+All nine projects build in the build image (`framac-build:latest`; first checked
+in the monolithic image, since removed) with no errors or warnings
 (`-Wall -Wextra`). For every project, `functions` matches the `T`/`t` symbols
 of the object files exactly.

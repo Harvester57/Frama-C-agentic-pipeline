@@ -14,29 +14,39 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from fingerprint import make_fingerprint  # noqa: E402
 
 PHASE0_FIXTURES = ROOT / "tests" / "fixtures" / "phase0"
-DOCKER_IMAGE = os.environ.get("FRAMAC_TEST_IMAGE", "framac-pipeline:latest")
+# The images the Docker-backed tests (FRAMAC_DOCKER_TESTS=1) run in: the analysis image (Frama-C, the
+# provers, E-ACSL; stage framac-analysis) and the build image (the target's own build and tests; stage
+# framac-build). Override either name with FRAMAC_TEST_IMAGE / FRAMAC_TEST_BUILD_IMAGE.
+ANALYSIS_IMAGE = os.environ.get("FRAMAC_TEST_IMAGE", "framac-analysis:latest")
+BUILD_IMAGE = os.environ.get("FRAMAC_TEST_BUILD_IMAGE", "framac-build:latest")
+
+
+def require_docker_images(*images: str) -> None:
+    """Skip unless FRAMAC_DOCKER_TESTS=1, Docker is on PATH and every image is built."""
+    if os.environ.get("FRAMAC_DOCKER_TESTS") != "1":
+        pytest.skip("Docker-backed test: set FRAMAC_DOCKER_TESTS=1")
+    if not shutil.which("docker"):
+        pytest.skip("docker not found")
+    for image in images:
+        if subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False).returncode:
+            pytest.skip(f"image {image} not built")
 
 
 @pytest.fixture
 def docker_fixture_run():
     """
-    Run a shell command in the pipeline image on a copy of a fixture project (mounted read-only,
-    network off), as `run(fixture_dir, command) -> CompletedProcess`. Opt-in, as these tests start
-    containers: set FRAMAC_DOCKER_TESTS=1. Skipped when Docker or the image is missing.
+    Run a shell command in the build image on a copy of a fixture project (mounted read-only, network
+    off), as `run(fixture_dir, command) -> CompletedProcess`: the fixtures are targets, built by their own
+    Makefile. Opt-in, as these tests start containers: set FRAMAC_DOCKER_TESTS=1. Skipped when Docker or
+    the image is missing.
     """
-    if os.environ.get("FRAMAC_DOCKER_TESTS") != "1":
-        pytest.skip("Docker-backed test: set FRAMAC_DOCKER_TESTS=1")
-    if not shutil.which("docker"):
-        pytest.skip("docker not found")
-    probe = subprocess.run(["docker", "image", "inspect", DOCKER_IMAGE], capture_output=True, check=False)
-    if probe.returncode != 0:
-        pytest.skip(f"image {DOCKER_IMAGE} not built")
+    require_docker_images(BUILD_IMAGE)
 
     def run(fixture: Path, command: str, timeout: int = 600) -> subprocess.CompletedProcess:
         argv = [
             "docker", "run", "--rm", "--network", "none",
             "-v", f"{fixture.resolve()}:/fixture:ro",
-            "--entrypoint", "sh", DOCKER_IMAGE,
+            "--entrypoint", "sh", BUILD_IMAGE,
             "-c", f"cp -r /fixture /tmp/p && cd /tmp/p && {command}",
         ]  # fmt: skip
         return subprocess.run(

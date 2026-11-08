@@ -2,7 +2,7 @@
 Phase 0 redesign fixtures (tests/fixtures/phase0): the reproducers (one Phase 0 defect each, with an
 exact ground truth) and the seeded-bug projects (one verified bug each, plus decoys). These checks keep
 the ground truth consistent with the sources; the Docker-backed ones (opt-in) check that every project
-still builds in the pipeline image.
+still builds in the build image.
 """
 
 import json
@@ -69,6 +69,6 @@ def test_seeded_truth_points_at_real_code(project):
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.parametrize("project", REPRODUCERS + SEEDED, ids=lambda p: p.name)
-def test_fixture_builds_in_the_pipeline_image(project, docker_fixture_run):
+def test_fixture_builds_in_the_build_image(project, docker_fixture_run):
     proc = docker_fixture_run(project, "make")
     assert proc.returncode == 0, proc.stdout[-1500:] + proc.stderr[-1500:]

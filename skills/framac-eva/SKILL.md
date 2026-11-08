@@ -3,7 +3,7 @@ name: framac-eva
 description: >-
   Phase 2 of the Frama-C verification pipeline. Runs whole-slice Abstract
   Interpretation (Frama-C Eva + RTE) from each module's eva_main() harness
-  inside the hardened framac-pipeline container. Automatically discharges
+  inside the hardened analysis container. Automatically discharges
   80-90% of RTE obligations via value/octagon/symbolic-location domains,
   separates Invalid (red), Unknown (orange), dead, and assumed statuses, emits
   per-slice SARIF, and records results in the coverage ledger, including the

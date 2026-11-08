@@ -36,7 +36,11 @@ Per mechanism, what the correct extractor must do:
 - **wellformed_input**: record seeds from the project's tests (`truth.json` `test`).
 - **Decoys**: never offer a D1 helper (not declared in `include/`) or a function that is not compiled.
 
-## Verification (framac-pipeline:latest)
+## Verification
+
+First done in the monolithic image `framac-pipeline:latest`, since removed. The build image
+(`framac-build:latest`) has the same gcc, clang and make, and `tests/test_phase0_fixtures.py`
+builds every project there (`FRAMAC_DOCKER_TESTS=1`).
 
 For every project:
 

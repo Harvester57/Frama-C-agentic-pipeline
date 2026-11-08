@@ -1148,7 +1148,7 @@ def test_function_level_writes_carry_their_rhs_values() -> None:
 
 needs_framac = pytest.mark.skipif(
     shutil.which("frama-c") is None or shutil.which("ocamlfind") is None,
-    reason="needs Frama-C and ocamlfind (inside the framac-pipeline image)",
+    reason="needs Frama-C and ocamlfind (inside the analysis image)",
 )
 
 REAL_SOURCE = """
