@@ -1013,12 +1013,15 @@ def _insert_prelude_includes(
     harness_file: Path,
     header_include: str,
     new_headers: list[tuple[str, str | None]],
+    anchor: str | None = None,
 ) -> None:
     """
     Insert `#include "<hdr>"` lines into the harness. Each entry is (header,
     before) where `before` is an already-included prelude header that depends
     on `header` (it must therefore come first), or None to insert directly
-    before the module header line (preserving discovery order).
+    before the module header line (preserving discovery order). Without a module
+    header line, the headers go before `anchor`, the first line of the harness's
+    header slot (a declaration synthesized from the sources needs them too).
     """
     lines = harness_file.read_text(encoding="utf-8").splitlines(keepends=True)
     module_line = f'#include "{header_include}"'
@@ -1034,6 +1037,8 @@ def _insert_prelude_includes(
         idx = _find(f'#include "{before}"') if before else None
         if idx is None:
             idx = _find(module_line)
+        if idx is None and anchor and anchor.strip():
+            idx = _find(anchor.strip())
         if idx is None:
             # Module header line not found: insert before the first quoted include, else at the top.
             idx = next((i for i, line in enumerate(lines) if line.lstrip().startswith('#include "')), 0)
@@ -1048,6 +1053,7 @@ def resolve_prelude_headers(
     max_iterations: int = DEFAULT_PRELUDE_MAX_ITERATIONS,
     clang: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
+    anchor: str | None = None,
 ) -> dict[str, Any]:
     """
     Make the harness self-sufficient by auto-including the headers that define
@@ -1058,7 +1064,8 @@ def resolve_prelude_headers(
     and `use of undeclared identifier` diagnostics, searches *.h files in the
     -I directories for a definition (typedef, closing `} X;`, `#define X`, enum
     constant) and rewrites the harness so the defining headers are included
-    before `#include "<header_include>"`. Repeats up to `max_iterations`
+    before `#include "<header_include>"` (without one, before the `anchor` line:
+    the first line of the harness's header slot). Repeats up to `max_iterations`
     rewrite rounds, re-running clang after each one.
 
     Returns a dict with `status` ("clean" | "resolved" | "unresolved" |
@@ -1187,7 +1194,7 @@ def resolve_prelude_headers(
             result["reason"] = "no defining header found in -I directories"
             return result
 
-        _insert_prelude_includes(harness_file, module_line_include, new_headers)
+        _insert_prelude_includes(harness_file, module_line_include, new_headers, anchor)
         for hdr_name, before in new_headers:
             if before and before in prelude:
                 prelude.insert(prelude.index(before), hdr_name)
@@ -1800,6 +1807,9 @@ def generate_module_harness(
             max_iterations=prelude_max_iterations,
             clang=prelude_clang,
             runner=prelude_runner or subprocess.run,
+            # The header slot's first line: without a --header, the declaration synthesized from
+            # the sources sits there, and the headers defining its types must come before it.
+            anchor=inc_lines[0],
         )
     else:
         prelude = {"status": "disabled", "prelude_headers": [], "unresolved_symbols": [], "iterations": 0}

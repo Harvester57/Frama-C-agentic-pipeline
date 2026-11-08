@@ -378,6 +378,35 @@ class TestGenerateModuleHarnessPrelude:
         # The clang probe used the normalized cppflags (module header dir added via -I).
         assert f"-I{tree['src'].as_posix()}" in runner.calls[0]
 
+    def test_without_header_the_prelude_precedes_the_synthesized_declaration(self, tree: dict[str, Path]) -> None:
+        """libpng `--api` without --header: `png_uint_32 f(void);` needs pngconf.h above it."""
+        (tree["src"] / "png.c").write_text("png_uint_32 png_access_version_number(void) { return 1; }\n")
+        (tree["src"] / "pngconf.h").write_text("typedef unsigned int png_uint_32;\n", encoding="utf-8")
+        harness = tree["out"] / "harness_png.c"
+        decl = "png_uint_32 png_access_version_number(void);"
+
+        def clang(_: int, text: str) -> str:
+            lines = [line.strip() for line in text.splitlines()]
+            inc = next((i for i, line in enumerate(lines) if line.startswith('#include "pngconf.h"')), None)
+            return "" if inc is not None and inc < lines.index(decl) else diag(harness, "type", "png_uint_32")
+
+        res = generate_module_harness(
+            module_name="png",
+            sources=[str(tree["src"] / "png.c")],
+            header_include=None,
+            entry_fn="png_access_version_number",
+            max_input_size=256,
+            cppflags=f"-I{tree['src'].as_posix()}",
+            out_dir=tree["out"],
+            entry_style="void_call",
+            prelude_clang="clang",
+            prelude_runner=ScriptedClang(dynamic=clang),
+        )
+
+        assert res["prelude_status"] == "resolved" and res["prelude_headers"] == ["pngconf.h"]
+        text = harness.read_text(encoding="utf-8")
+        assert _include_index(text, "pngconf.h") < text.splitlines().index(decl)
+
     def test_unresolved_raises_after_writing_sidecar(self, tree: dict[str, Path]) -> None:
         runner = ScriptedClang([diag(tree["events_h"], "type", "Nowhere_T")])
 
