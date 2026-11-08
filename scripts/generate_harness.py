@@ -1980,6 +1980,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--api",
+        action="store_true",
+        help=(
+            "Generate a dispatch harness for the module's whole API from the Phase 0 model "
+            "(scripts/api_harness.py): one case per API entry point, plus recorded call sequences; "
+            "--sources and --entry-fn come from the DAG"
+        ),
+    )
+    parser.add_argument(
         "--record-repair", type=Path, default=None, help="Path to harness_<mod>.json to record a repair"
     )
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
@@ -1991,6 +2000,30 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         res = record_harness_repair(args.record_repair, args.reason.strip())
         print(json.dumps(res, indent=2))
+        return 0
+
+    if args.api:
+        if not args.module:
+            parser.error("--api requires --module")
+        from api_harness import ApiHarnessError, generate
+
+        try:
+            result = generate(
+                module=args.module,
+                header=args.header,
+                max_input_size=args.max_size,
+                cppflags=args.cppflags,
+                out_dir=args.out_dir,
+                unit=args.unit,
+                ldflags=args.ldflags,
+                extra_includes=args.extra_include,
+                reachability=args.reachability,
+                auto_prelude=args.auto_prelude,
+            )
+        except (ApiHarnessError, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        print(json.dumps(result, indent=2))
         return 0
 
     if not (args.module and args.sources and args.entry_fn):

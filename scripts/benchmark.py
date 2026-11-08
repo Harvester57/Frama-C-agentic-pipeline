@@ -641,6 +641,35 @@ def modules_without_harness(ledger: list[dict], target: dict, dag: dict | None =
     return sorted(active - harnessed)
 
 
+def summarize_api_reach(reach: dict | None, seeds_dir: Path | None = None) -> dict | None:
+    """
+    The API entry points the harnesses reach, from the reach gate's report: how many the modules hold,
+    how many a harness reaches, and how many an exemption (a pinned harness's accepted gaps, an example
+    program) waves through. With the seed summaries, the seed inputs written per module.
+    """
+    if not isinstance(reach, dict):
+        return None
+    rows = [r for r in reach.get("modules") or [] if isinstance(r, dict)]
+    out: dict[str, Any] = {"entry_points": 0, "reached": 0, "exempt": 0, "modules": {}}
+    for row in rows:
+        total = int(row.get("entry_points") or 0)
+        reached = int(row.get("entry_points_reached") or 0)
+        exempt = len(row.get("exempt") or {}) if isinstance(row.get("exempt"), dict) else 0
+        out["entry_points"] += total
+        out["reached"] += reached
+        out["exempt"] += exempt
+        out["modules"][str(row.get("module"))] = {"entry_points": total, "reached": reached, "exempt": exempt}
+    if seeds_dir is not None and seeds_dir.is_dir():
+        seeds = 0
+        for path in sorted(seeds_dir.glob("*.json")):
+            summary = read_json(path, {}) or {}
+            seeds += int(summary.get("seeds") or 0)
+            if str(path.stem) in out["modules"]:
+                out["modules"][path.stem]["seeds"] = int(summary.get("seeds") or 0)
+        out["seeds"] = seeds
+    return out
+
+
 def _profile_deferred_modules(run_dir: Path, names: list[str]) -> dict[str, str]:
     """Harness modules the run's profile defers by tier (step I8: Tier 3 under quick), with the reason."""
     from module_map import ModuleMap
@@ -720,6 +749,10 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
         "prover_tasks": summarize_queue(read_json(run_dir / "workspace" / "reports" / "wp_queue.json")),
         "units": summarize_units(ledger),
         "modules_without_harness": modules_without_harness(ledger, target, dag),
+        "api_reach": summarize_api_reach(
+            read_json(run_dir / "workspace" / "reports" / "harness_reach.json"),
+            run_dir / "workspace" / "reports" / "seeds",
+        ),
         "candidates": summarize_candidates(read_json(run_dir / "candidates.json", []) or []),
         "mutation": summarize_mutation(run_dir / "workspace" / "reports" / "mutation.json"),
         "problems": problems,
@@ -1254,8 +1287,35 @@ def _load_spec() -> dict:
 
 
 def _harness_argv(module: dict) -> list[str]:
-    """generate_harness.py arguments from a manifest entry. Flag values use `=` so a leading '-' stays a value."""
+    """
+    generate_harness.py arguments from a manifest entry. Flag values use `=` so a leading '-' stays a
+    value. `"generate": "api"` asks for the generated whole-API harness (scripts/api_harness.py) instead
+    of a pinned one: its cases, sources and entry come from the model and the DAG.
+    """
     h = module["harness"]
+    if h.get("generate") == "api":
+        argv = [
+            sys.executable,
+            str(SCRIPTS_DIR / "generate_harness.py"),
+            "--api",
+            "--module",
+            module["name"],
+            "--max-size",
+            str(h.get("max_input_size", 4096)),
+            f"--cppflags={h.get('cppflags', '-I.')}",
+            f"--ldflags={h.get('ldflags', '')}",
+            "--out-dir",
+            "workspace/harnesses",
+        ]
+        if h.get("header"):
+            argv += ["--header", h["header"]]
+        for include in h.get("extra_includes") or []:
+            argv += ["--extra-include", include]
+        if h.get("reachability"):
+            argv += ["--reachability", h["reachability"]]
+        if module.get("unit"):
+            argv.append(f"--unit={module['unit']}")
+        return argv
     argv = [
         sys.executable,
         str(SCRIPTS_DIR / "generate_harness.py"),

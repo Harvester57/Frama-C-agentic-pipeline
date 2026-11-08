@@ -72,6 +72,18 @@
         "functions_with_unknown_count": {"type": "integer", "minimum": 0},
         "functions_with_unknown_no_unit": {"type": "array", "items": {"type": "string"}},
         "prover_tasks": {"type": "object"},
+        "api_reach": {
+          "type": ["object", "null"],
+          "description": "API entry points the harnesses reach, from the reach gate's report (exemptions counted apart), and the seed inputs written.",
+          "properties": {
+            "entry_points": {"type": "integer", "minimum": 0},
+            "reached": {"type": "integer", "minimum": 0},
+            "exempt": {"type": "integer", "minimum": 0},
+            "seeds": {"type": "integer", "minimum": 0},
+            "modules": {"type": "object"}
+          },
+          "required": ["entry_points", "reached", "exempt", "modules"]
+        },
         "units": {
           "type": "object",
           "properties": {

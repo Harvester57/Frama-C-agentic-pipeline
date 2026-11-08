@@ -449,6 +449,34 @@ def _compare_candidates(tid: str, base: dict, cur: dict, out: Comparison) -> Non
         out.add("info", "candidates", tid, f"candidates awaiting a verifier agent {_fmt_delta(old_open, new_open)}")
 
 
+def _compare_api_reach(tid: str, base: dict, cur: dict, out: Comparison) -> None:
+    """
+    API entry points the harnesses reach (the reach gate's count, before exemptions). Fewer is a
+    regression even when the gate passes: an exemption accepts a gap, it does not fuzz the function.
+    """
+    old, new = base.get("api_reach"), cur.get("api_reach")
+    if not isinstance(new, dict):
+        return
+    if not isinstance(old, dict):
+        out.add(
+            "not_compared",
+            "api_reach",
+            tid,
+            f"not in the baseline; now {new.get('reached')}/{new.get('entry_points')} entry points reached",
+        )
+        return
+    was, now = old.get("reached"), new.get("reached")
+    total = f"{old.get('entry_points')} -> {new.get('entry_points')}"
+    if isinstance(was, int) and isinstance(now, int) and was != now:
+        severity = "regression" if now < was else "improvement"
+        out.add(severity, "api_reach", tid, f"API entry points reached {_fmt_delta(was, now)} (of {total})")
+    if old.get("exempt") != new.get("exempt"):
+        out.add("info", "api_reach", tid, f"entry points exempted {old.get('exempt')} -> {new.get('exempt')}")
+    old_seeds, new_seeds = old.get("seeds"), new.get("seeds")
+    if isinstance(old_seeds, int) and isinstance(new_seeds, int) and old_seeds != new_seeds:
+        out.add("info", "api_reach", tid, f"seed inputs {_fmt_delta(old_seeds, new_seeds)}")
+
+
 def _compare_time(tid: str, base: dict, cur: dict, out: Comparison, tol: Tolerances, same_machine: bool) -> None:
     for key, label in (("wall_s", "wall-clock"), ("cpu_s", "CPU")):
         old, new = base.get(key), cur.get(key)
@@ -489,6 +517,7 @@ def _compare_target(
     if isinstance(old_tasks, int) and isinstance(new_tasks, int) and old_tasks != new_tasks:
         out.add("info", "prover_tasks", tid, f"queued prover tasks {_fmt_delta(old_tasks, new_tasks)}")
     _compare_units(tid, base, cur, out, suspect)
+    _compare_api_reach(tid, base, cur, out)
     _compare_candidates(tid, base, cur, out)
     if fuzz_comparable:
         _compare_time(tid, base, cur, out, tol, same_machine)

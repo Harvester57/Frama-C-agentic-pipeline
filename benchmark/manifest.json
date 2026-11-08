@@ -920,19 +920,13 @@
    "modules": [
     {
      "name": "tweetnacl",
-     "reach_gaps_accepted": "pinned recall harness: it drives the entry points of the target's known bugs; the module's other API entry points are not fuzzed in this benchmark",
      "harness": {
-      "sources": [
-       "tweetnacl.c"
-      ],
+      "generate": "api",
       "header": "tweetnacl.h",
-      "entry_fn": "crypto_hash",
-      "entry_style": "custom",
-      "max_input_size": 32,
+      "max_input_size": 4096,
       "cppflags": "-Iworkspace/work",
       "ldflags": "",
-      "reachability": "untrusted_surface",
-      "call_expr": "{ unsigned char digest[64]; (void)crypto_hash(digest, fuzz_buf, fuzz_len); }"
+      "reachability": "untrusted_surface"
      },
      "unit": "main"
     }

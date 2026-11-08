@@ -1079,6 +1079,149 @@ def load_calls(records: Path = RECORDS_DIR) -> list[dict]:
     return out
 
 
+# The recorded value kinds each layout slot of an API harness (scripts/api_harness.py) reads.
+_LAYOUT_KINDS = {"int": ("i", "f"), "struct": ("t",), "bytes": ("a", "b", "p", "s"), "pointee": ("p",)}
+
+
+def _fit(value: bytes, size: int | None) -> bytes:
+    if size is None:
+        return value
+    return value[:size].ljust(size, b"\0")
+
+
+def _recorded(args: dict, param: int, kinds: tuple[str, ...]) -> bytes | None:
+    hits = sorted((off, hexv) for kind, off, hexv in args.get(str(param)) or [] if kind in kinds)
+    return bytes.fromhex(hits[0][1]) if hits else None
+
+
+def layout_seed(layout: dict, call_args: list[dict]) -> bytes | None:
+    """
+    One seed for an API harness case from the recorded arguments of its calls (one dict per call of
+    the case, in order): the selector byte, each slot's value (fitted to its size; zeros when the
+    call did not record it), then the rest of the input. None when nothing recorded feeds the case,
+    or a slot of unknown size has no recorded value.
+    """
+    out = bytearray([int(layout["selector"])])
+    fed = False
+    for slot in layout.get("slots") or []:
+        args = call_args[slot["call"]] if slot["call"] < len(call_args) else {}
+        v = _recorded(args, int(slot["param"]), _LAYOUT_KINDS.get(slot["kind"], ()))
+        if v is None:
+            if slot.get("size") is None:
+                return None
+            v = b""
+        else:
+            fed = True
+        out += _fit(v, slot.get("size"))
+    rest = layout.get("rest")
+    if rest:
+        args = call_args[rest["call"]] if rest["call"] < len(call_args) else {}
+        v = _recorded(args, int(rest["param"]), ("b", "s", "a"))
+        if v is not None:
+            out += v
+            fed = True
+    return bytes(out) if fed else None
+
+
+def layout_seeds(layouts: list[dict], calls: list[dict], traces: list[list[dict]]) -> dict[int, list[bytes]]:
+    """Seeds per selector of an API harness: single cases from recorded calls, sequences from traces."""
+    by_fn: dict[str, list[dict]] = {}
+    for rec in calls:
+        by_fn.setdefault(rec["fn"], []).append(rec)
+    out: dict[int, list[bytes]] = {}
+    for lay in layouts:
+        made: list[bytes] = []
+        if lay.get("kind") == "sequence":
+            want = list(lay.get("calls") or [])
+            for trace in traces:
+                fns = [c.get("fn") for c in trace]
+                for start in range(len(fns)):
+                    picked: list[dict] = []
+                    k = start
+                    for fn in want:
+                        while k < len(fns) and fns[k] != fn:
+                            k += 1
+                        if k == len(fns):
+                            break
+                        picked.append(trace[k].get("args") or {})
+                        k += 1
+                    if len(picked) == len(want):
+                        seed = layout_seed(lay, picked)
+                        if seed is not None:
+                            made.append(seed)
+                        break
+        else:
+            for rec in by_fn.get((lay.get("calls") or [""])[0], []):
+                seed = layout_seed(lay, [rec.get("args") or {}])
+                if seed is not None:
+                    made.append(seed)
+        out[int(lay["selector"])] = made
+    return out
+
+
+def load_traces(records: Path = RECORDS_DIR) -> list[list[dict]]:
+    path = records / "traces.jsonl"
+    out: list[list[dict]] = []
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("calls"), list):
+            out.append([c for c in rec["calls"] if isinstance(c, dict)])
+    return out
+
+
+def write_layout_module(module: str, sidecar: dict, calls: list[dict], traces: list[list[dict]]) -> dict:
+    """Seeds of an API harness from its sidecar's case layouts (`api_cases`)."""
+    layouts = [lay for lay in sidecar.get("api_cases") or [] if isinstance(lay, dict) and "selector" in lay]
+    max_size = int(sidecar.get("max_input_size") or 0) or 1 << 20
+    seeds: dict[str, bytes] = {}
+    too_large = 0
+    per_case: dict[str, dict[str, Any]] = {}
+    for sel, made in sorted(layout_seeds(layouts, calls, traces).items()):
+        lay = next(lay for lay in layouts if int(lay["selector"]) == sel)
+        per_case[str(sel)] = {"functions": list(lay.get("calls") or []), "kind": lay.get("kind"), "from_calls": 0}
+        for s in made:
+            if len(s) > max_size:
+                too_large += 1
+                continue
+            if hashlib.sha256(s).hexdigest() not in seeds:
+                per_case[str(sel)]["from_calls"] += 1
+            seeds.setdefault(hashlib.sha256(s).hexdigest(), s)
+    return _store_seeds(module, seeds, too_large, max_size, True, per_case)
+
+
+def _store_seeds(
+    module: str, seeds: dict[str, bytes], too_large: int, max_size: int, dispatch: bool, per_case: dict
+) -> dict:
+    out_dir = SEEDS_DIR / module
+    if out_dir.is_dir():
+        for old in out_dir.glob(f"{SEED_PREFIX}*"):
+            old.unlink()
+    kept = list(seeds.items())[:MAX_SEEDS_PER_MODULE]
+    if kept:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for digest, data in kept:
+            (out_dir / f"{SEED_PREFIX}{digest[:16]}").write_bytes(data)
+    summary = {
+        "module": module,
+        "generated_at": utc_now(),
+        "seeds": len(kept),
+        "dropped_over_cap": max(0, len(seeds) - MAX_SEEDS_PER_MODULE),
+        "dropped_too_large": too_large,
+        "max_input_size": max_size,
+        "dispatch": dispatch,
+        "cases": per_case,
+        "dir": out_dir.as_posix(),
+    }
+    SEED_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(SEED_REPORTS_DIR / f"{module}.json", summary)
+    return summary
+
+
 def write_module(module: str, sidecar: dict, harness_c: str, calls: list[dict], files: list[bytes]) -> dict:
     """Write workspace/seeds/<module>/ from the records; the module's summary."""
     functions = {c["fn"] for c in calls}
@@ -1109,33 +1252,13 @@ def write_module(module: str, sidecar: dict, harness_c: str, calls: list[dict], 
                 continue
             per_case["all" if sel is None else str(sel)]["from_files"] += 1
             seeds.setdefault(hashlib.sha256(s).hexdigest(), s)
-    out_dir = SEEDS_DIR / module
-    if out_dir.is_dir():
-        for old in out_dir.glob(f"{SEED_PREFIX}*"):
-            old.unlink()
-    kept = list(seeds.items())[:MAX_SEEDS_PER_MODULE]
-    if kept:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for digest, data in kept:
-            (out_dir / f"{SEED_PREFIX}{digest[:16]}").write_bytes(data)
-    summary = {
-        "module": module,
-        "generated_at": utc_now(),
-        "seeds": len(kept),
-        "dropped_over_cap": max(0, len(seeds) - MAX_SEEDS_PER_MODULE),
-        "dropped_too_large": too_large,
-        "max_input_size": max_size,
-        "dispatch": cases[0][0] is not None if cases else False,
-        "cases": per_case,
-        "dir": out_dir.as_posix(),
-    }
-    SEED_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(SEED_REPORTS_DIR / f"{module}.json", summary)
-    return summary
+    dispatch = cases[0][0] is not None if cases else False
+    return _store_seeds(module, seeds, too_large, max_size, dispatch, per_case)
 
 
 def write(modules: list[str]) -> dict:
     calls = load_calls()
+    traces = load_traces()
     files = (
         [p.read_bytes() for p in sorted((RECORDS_DIR / "files").glob("*"))] if (RECORDS_DIR / "files").is_dir() else []
     )
@@ -1155,7 +1278,10 @@ def write(modules: list[str]) -> dict:
                     old.unlink()
             out["modules"][module] = {"seeds": 0, "reason": "no records (seed_harvest.py record has not run)"}
             continue
-        summary = write_module(module, sidecar, c_path.read_text(encoding="utf-8", errors="replace"), calls, files)
+        if sidecar.get("api_cases"):
+            summary = write_layout_module(module, sidecar, calls, traces)
+        else:
+            summary = write_module(module, sidecar, c_path.read_text(encoding="utf-8", errors="replace"), calls, files)
         out["modules"][module] = {k: summary[k] for k in ("seeds", "dropped_too_large")}
     return out
 
