@@ -485,6 +485,47 @@ def closures(units: dict) -> dict[str, set[str]]:
     return out
 
 
+def reconcile_api_ids(units: dict[str, dict], functions: dict[str, dict]) -> list[str]:
+    """
+    Map each unit's `entry_points` and `embedded_api` ids to the model's, in place; returns warnings.
+
+    The capture names a function by its compiled source (or the header `nm -l` gives), the model
+    by where Frama-C places its definition. They differ for a function defined in a `#include`d
+    `.c`, or in a header when the build has no `-g`. Such an id matches no model function, and
+    trust, the unit view and the reach gate would then drop that API function without a word. It
+    is mapped to the unit's only external function of that name, or kept with a warning.
+    """
+    by_unit_name: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for fid, f in functions.items():
+        for unit in f.get("units") or []:
+            if not f.get("static"):
+                by_unit_name[(unit, str(f.get("name")))].append(fid)
+    warnings: list[str] = []
+    for name, rec in units.items():
+        if rec.get("test") or (rec.get("parse") or {}).get("status") not in ("ok", "gcc_fallback"):
+            continue
+        for field in ("entry_points", "embedded_api"):
+            ids = rec.get(field)
+            if not ids:
+                continue
+            fixed: list[str] = []
+            for fid in ids:
+                hits = [fid] if fid in functions else sorted(by_unit_name.get((name, fid.rsplit("#", 1)[-1]), []))
+                if len(hits) == 1:
+                    if hits[0] != fid:
+                        warnings.append(f"{name}: {field} {fid} is {hits[0]} in the model")
+                    fixed.append(hits[0])
+                else:
+                    warnings.append(
+                        f"{name}: {field} {fid} names no function of the model"
+                        + (f" (candidates: {', '.join(hits)})" if hits else "")
+                        + "; trust, tiers and the reach gate leave it out"
+                    )
+                    fixed.append(fid)
+            rec[field] = list(dict.fromkeys(fixed))
+    return warnings
+
+
 class ModelBuilder:
     """Merges the parse results of all jobs into one model, resolving across units as the linker does."""
 
@@ -898,6 +939,7 @@ def build_model(
         f["external_calls"] = sorted(builder.external_calls.get(fid, ()))
         f["units"] = sorted(f["units"])
         f["kernel_names"] = dict(sorted(f["kernel_names"].items()))
+    model["warnings"].extend(reconcile_api_ids(units_out, builder.functions))
     # Phase 0 stops when Frama-C parses no unit: every later phase but fuzzing needs its AST. The
     # model is still written whole, so the fallback errors can be shown to the user.
     parsed = [n for n, u in units_out.items() if u["parse"]["status"] == "ok"]

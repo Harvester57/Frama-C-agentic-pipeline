@@ -427,6 +427,36 @@ def test_gcc_fallback_reads_callgraph_info(tmp_path, monkeypatch):
 
 
 @pytest.mark.unit
+def test_capture_api_ids_are_mapped_to_where_the_model_places_the_function():
+    # lib.c #includes impl.c: the capture files kv_get under lib.c (the compiled source), Frama-C
+    # under impl.c. Unmapped, trust and the reach gate would drop that API function silently.
+    functions = {
+        "src/impl.c#kv_get": {"name": "kv_get", "units": ["libkv.a"], "static": False},
+        "src/lib.c#kv_put": {"name": "kv_put", "units": ["libkv.a"], "static": False},
+        "src/a.c#dup": {"name": "dup", "units": ["libkv.a"], "static": False},
+        "src/b.c#dup": {"name": "dup", "units": ["libkv.a"], "static": False},
+    }
+    units = {
+        "libkv.a": {
+            "parse": {"status": "ok"},
+            "entry_points": ["src/lib.c#kv_get", "src/lib.c#kv_put", "src/lib.c#dup", "src/lib.c#gone"],
+        },
+        "kvtest": {"test": True, "parse": {"status": "skipped_test"}, "entry_points": ["t.c#main"]},
+    }
+    warnings = pm.reconcile_api_ids(units, functions)
+    assert units["libkv.a"]["entry_points"] == [
+        "src/impl.c#kv_get",
+        "src/lib.c#kv_put",
+        "src/lib.c#dup",
+        "src/lib.c#gone",
+    ]
+    assert units["kvtest"]["entry_points"] == ["t.c#main"]
+    assert any("src/lib.c#kv_get is src/impl.c#kv_get" in w for w in warnings)
+    assert any("src/lib.c#dup names no function" in w and "src/a.c#dup, src/b.c#dup" in w for w in warnings)
+    assert any("src/lib.c#gone names no function" in w for w in warnings)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("gcc_first", [True, False])
 def test_a_framac_record_wins_over_the_gcc_fallback_for_a_shared_function(gcc_first):
     # src/shared.c is compiled by a unit on the GCC fallback (liba, sorted first) and by one Frama-C
