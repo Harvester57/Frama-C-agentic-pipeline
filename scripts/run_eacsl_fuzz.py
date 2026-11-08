@@ -1347,7 +1347,7 @@ def run_campaign_rounds(
     seen: set[str] = set()
     unique = []
     for a in collected:
-        key = a.get("sha256") or a.get("artifact")
+        key = str(a.get("sha256") or a.get("artifact") or "")
         if key not in seen:
             seen.add(key)
             unique.append(a)

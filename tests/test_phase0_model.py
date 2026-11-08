@@ -436,7 +436,7 @@ def test_capture_api_ids_are_mapped_to_where_the_model_places_the_function():
         "src/a.c#dup": {"name": "dup", "units": ["libkv.a"], "static": False},
         "src/b.c#dup": {"name": "dup", "units": ["libkv.a"], "static": False},
     }
-    units = {
+    units: dict[str, dict] = {
         "libkv.a": {
             "parse": {"status": "ok"},
             "entry_points": ["src/lib.c#kv_get", "src/lib.c#kv_put", "src/lib.c#dup", "src/lib.c#gone"],

@@ -90,8 +90,8 @@ def test_signature_facts_with_formals() -> None:
 
 
 def test_signature_facts_see_frama_cs_variadic_translation() -> None:
-    rec = {"signature": "_Bool(char *,char *,void **)", "formals": [*_formals("pointer", "const_pointer")]}
-    rec["formals"].append({"name": bcd.VA_PARAMS, "kind": "pointer"})
+    formals = [*_formals("pointer", "const_pointer"), {"name": bcd.VA_PARAMS, "kind": "pointer"}]
+    rec = {"signature": "_Bool(char *,char *,void **)", "formals": formals}
     facts = bcd.signature_facts(rec)
     assert facts["is_variadic"] and facts["params"] == ["char *", "char *"]
     assert bcd.signature_facts({"signature": "int(int,...)"})["is_variadic"]

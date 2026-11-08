@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -141,7 +142,7 @@ def test_dispatch_harness_sidecar_records_cases_and_keeps_exemptions(tmp_path, m
         "rec_parse(fuzz_buf, fuzz_len);",
         "uint8_t out[64]; (void)rec_put(out, sizeof(out), fuzz_len > 0 ? fuzz_buf[0] : 0);",
     ]
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         module_name="api",
         sources=["workspace/work/src/api.c"],
         header_include="api.h",
