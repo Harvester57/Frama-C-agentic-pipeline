@@ -116,6 +116,22 @@ def test_unit_cppflags_are_single_tokens() -> None:
     assert forced == ["workspace/work/config.h"]
 
 
+def test_harness_sources_follow_the_callees_lexer_module(tmp_path: Path) -> None:
+    import generate_harness
+
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "harnesses").mkdir()
+    dag = {
+        "module_kind": "link_unit",
+        "functions": {"u_len": {"module": "libkv_a", "lexer_module": "util", "file": "src/util.c"}},
+        "modules": {"libkv_a": {"required_sources": ["src/util.c", "src/decode.c", "src/fc_main.c"]}},
+        "lexer_modules": {"util": {"required_sources": ["src/util.c", "src/str.c"]}},
+    }
+    (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
+    merged = generate_harness._merge_dag_harness_sources(tmp_path / "harnesses", ["src/harness_util.c"], False, "u_len")
+    assert merged == ["src/harness_util.c", "src/util.c", "src/str.c"]
+
+
 def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
     import generate_harness
 

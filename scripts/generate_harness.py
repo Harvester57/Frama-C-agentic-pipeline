@@ -1385,6 +1385,12 @@ def _merge_dag_harness_sources(
             continue
         mod_name = fn_rec.get("module")
         mod_info = modules_map.get(mod_name) if isinstance(mod_name, str) else None
+        # With link units (step I5b) a callee's sources are its lexer module's closure, as before,
+        # not its whole unit's: a unit can hold files only some builds compile (x509-parser.c's
+        # Frama-C-only `main`), and a harness should pull in what its callees need.
+        lexer_info = (dag.get("lexer_modules") or {}).get(fn_rec.get("lexer_module") or "")
+        if isinstance(lexer_info, dict) and isinstance(lexer_info.get("required_sources"), list):
+            mod_info = lexer_info
         extra_rels: list[str] = []
         if isinstance(mod_info, dict) and isinstance(mod_info.get("required_sources"), list):
             extra_rels.extend(s for s in mod_info["required_sources"] if isinstance(s, str))
