@@ -279,7 +279,7 @@ def test_gen_without_dag_still_writes_a_makefile(tmp_path):
     write_json(tmp_path / "run-metadata.json", metadata())
     out = pm.generate(tmp_path, templates_dir=ACSL)
     assert out["ok"] is True and out["dag"] == "missing" and out["modules"] == {}
-    assert any("slice-init" in w for w in out["warnings"])
+    assert any("dag target" in w for w in out["warnings"])
     text = (tmp_path / pm.MODULES_MK).read_text(encoding="utf-8")
     assert "FUZZ_MODULES :=\n" in text and "SEED_SCOPE_ARGS :=\n" in text
 

@@ -861,7 +861,7 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         except ArtifactError as exc:
             errors.append(f"callgraph DAG unusable: {exc}")
     else:
-        warnings.append(f"{DAG_JSON} missing: no module targets until slice-init has run")
+        warnings.append(f"{DAG_JSON} missing: no module targets until the dag target has run")
 
     harness_dir = run_dir / HARNESS_DIR
     sidecars = (
@@ -1259,36 +1259,43 @@ def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
 # Targets run in pipeline order: each stage is one make invocation (parallel inside), so that,
 # for example, `run fuzz eva ingest` ingests only after every campaign and Eva run has finished.
 STAGE_OF_TARGET = {
+    # The overlay; the build capture and the Phase 0 model run outside Make between it and the DAG.
     "slice-init": 0,
-    "reach-gate": 1,
-    "seed": 1,
-    "build": 2,
-    "selftest": 2,
-    "fuzz": 2,
-    "eva": 2,
-    "eva-tune-base": 2,
+    "dag": 1,
+    "security-props": 2,
+    "reach-gate": 2,
+    "seed": 2,
+    "build": 3,
+    "selftest": 3,
+    "fuzz": 3,
+    "eva": 3,
+    "eva-tune-base": 3,
     # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
-    "eva-tune": 3,
+    "eva-tune": 4,
     # Renders the flamegraph.txt an earlier Eva run left (it never runs Eva), so after eva and eva-tune.
-    "flamegraph": 4,
-    "coverage": 3,  # after fuzz, so that it measures the campaign's corpus
-    "seeds": 2,
+    "flamegraph": 5,
+    "coverage": 4,  # after fuzz, so that it measures the campaign's corpus
+    "seeds": 3,
     # Reads the coverage reports, so after coverage (its per-module targets depend on coverage-<mod>).
-    "reach-dynamic": 4,
+    "reach-dynamic": 5,
     # After eva-tune, which rewrites the Eva report the facts read.
-    "facts": 4,
-    "ingest": 4,
-    "replay": 4,
-    "minimize": 4,
-    "wp-queue": 4,
-    "wp-baseline": 4,
-    "wp-sweep": 5,
-    "report": 6,
+    "facts": 5,
+    "ingest": 5,
+    "replay": 5,
+    "minimize": 5,
+    "wp-queue": 5,
+    "wp-baseline": 5,
+    "wp-sweep": 6,
+    "report": 7,
 }
+# Phase 0 targets that write what the plan reads: they run even when the current DAG is unusable.
+PHASE0_INPUT_TARGETS = frozenset({"slice-init", "dag", "security-props"})
 MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "coverage-", "eva-", "flamegraph-", "module-", "facts-")
 REACH_DYNAMIC_PREFIX = "reach-dynamic-"
 _TARGET_OUTPUTS = {
-    "slice-init": DAG_JSON,
+    "slice-init": "workspace/overlay_meta.json",
+    "dag": DAG_JSON,
+    "security-props": "workspace/reports/security_props.json",
     "seed": LEDGER_JSON,
     "selftest": SELFTEST_JSON,
     "ingest": INGESTED_JSON,
@@ -1316,12 +1323,12 @@ def _stage(target: str) -> int | None:
     if target.startswith(REACH_DYNAMIC_PREFIX) and target[len(REACH_DYNAMIC_PREFIX) :]:
         return STAGE_OF_TARGET["reach-dynamic"]
     if target.startswith(MODULE_TARGET_PREFIXES) and target.partition("-")[2]:
-        return STAGE_OF_TARGET["coverage"] if target.startswith("coverage-") else 2
+        return STAGE_OF_TARGET["coverage"] if target.startswith("coverage-") else STAGE_OF_TARGET["build"]
     return None
 
 
 def _target_problem(target: str, plan: Plan) -> str | None:
-    if plan.errors and target != "slice-init":
+    if plan.errors and target not in PHASE0_INPUT_TARGETS:
         return "; ".join(plan.errors)
     if target in STAGE_OF_TARGET:
         return None
@@ -1382,6 +1389,8 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
         return deps + ([f"eva-{mod}"] if mod in plan.eva_modules else [])
     if kind == "eva" and mod in plan.modules and plan.modules[mod].eva_replay:
         return [f"evabase-{mod}"]  # the recorded rungs are optional, as in eva-tune
+    if node == "seed":
+        return ["reach-gate", "security-props"]
     if node in ("replay", "wp-queue"):
         # wp-queue also depends on facts in pipeline.mk, but facts recipes never fail the build (`-`),
         # so they can never be the reason wp-queue was skipped.

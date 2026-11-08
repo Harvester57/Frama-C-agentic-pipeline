@@ -248,7 +248,10 @@ The trusted steps are spelled out in full: only that exact command line gets a w
 
 | Target | Does | Trust |
 |---|---|---|
-| `slice-init`, `seed` | overlay + call graph; ledger seed, validation, checkpoint (initialized once, never rewound) | static |
+| `slice-init` | the shadow overlay (`/framac-slice` Step 1); the build capture, the Phase 0 model and the seed recording run between it and `dag`, through the wrapper | static |
+| `dag` | the call-graph DAG from the Phase 0 model (`workspace/reports/phase0_model.json`, status `ok`) | static |
+| `security-props` | the MetAcsl security properties (`workspace/reports/security_props.json`); `seed` depends on it | static |
+| `seed` | after `reach-gate` and `security-props`: ledger seed, validation, checkpoint (initialized once, never rewound) | static |
 | `build` (`build-<mod>`) | E-ACSL / sanitizer compile of every fuzzable module | static |
 | `selftest` | the E-ACSL toolchain canary | dynamic |
 | `fuzz` (`fuzz-<mod>`) | one campaign per module; each depends on `selftest` and its `build-<mod>` | dynamic |

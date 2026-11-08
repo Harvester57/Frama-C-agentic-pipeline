@@ -42,22 +42,33 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
+.PHONY: help slice-init dag security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init dag security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
 # --- Phase 0 ---------------------------------------------------------------------------------
 
-# Shadow overlay of the read-only target, then the call-graph DAG of the work tree.
+# Shadow overlay of the read-only target (/framac-slice Step 1). The build capture, the Phase 0 model,
+# CodeQL and the seed recording come next: they run in other images or on the scratch volume, through
+# the wrapper (/framac-slice Steps 1b-1e), not from this Makefile.
 slice-init:
 	$(RUN) --class light --key slice-init -- $(PY) $(S)/workspace_overlay.py init --target $(TARGET_DIR) --overlay workspace
-	$(RUN) --class light --key slice-init -- $(PY) $(S)/build_callgraph_dag.py --target workspace/work \
-		--out workspace/reports/callgraph_dag.json --emit-compile-commands workspace/reports/compile_commands.json
+
+# The call-graph DAG of the work tree, from the Phase 0 model (workspace/reports/phase0_model.json,
+# whose status must be ok).
+dag:
+	$(RUN) --class light --key dag -- $(PY) $(S)/build_callgraph_dag.py --target workspace/work \
+		--out workspace/reports/callgraph_dag.json
+
+# The MetAcsl security properties (Layers 3-6) from the model and the threat model. The ledger seed
+# reads them, so they are written before it.
+security-props:
+	$(RUN) --class light --key security-props -- $(PY) $(S)/security_props.py run
 
 # Phase 0 gate: every DAG entry point of each harnessed module is reached by its harness, or exempted
 # with a reason (harness_reach.py exempt). It records workspace/reports/phase0_gates.json.
@@ -66,7 +77,7 @@ reach-gate:
 
 # Ledger seed (scope paths from run-metadata.json), validation, checkpoint of phase 0. The
 # checkpoint is initialized only once, so seeding again never rewinds the recorded progress.
-seed: reach-gate
+seed: reach-gate security-props
 	$(RUN) --class light --key seed -- $(PY) $(S)/ledger.py seed --dag workspace/reports/callgraph_dag.json $(SEED_SCOPE_ARGS)
 	$(RUN) --class light --key seed -- $(PY) $(S)/validate_artifacts.py run-dir .
 	test -f state/progress.json || $(RUN) --class light --key seed -- $(PY) $(S)/checkpoint.py init state --target $(TARGET_DIR)

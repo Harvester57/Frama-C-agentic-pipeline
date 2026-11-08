@@ -1439,8 +1439,10 @@ def inner_phase0() -> int:
                 ok = False
             ok = step("reach_gate", [py, script("harness_reach.py"), "check"]) and ok
         if ok:
+            # The MetAcsl security properties (step I9) before the seed, which adds their classes.
             ok = (
-                step(
+                step("security_props", [py, script("security_props.py"), "run"])
+                and step(
                     "seed",
                     [
                         py,

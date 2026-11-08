@@ -437,8 +437,10 @@ def inner(repo: str, fuzz_budget: int) -> int:
                     ok = False
             ok = step("reach_gate", [py, script("harness_reach.py"), "check"]) and ok
         if ok:
+            # The MetAcsl security properties (step I9) before the seed, which adds their classes.
             ok = (
-                step("seed", [py, script("ledger.py"), "seed", "--dag", str(DAG), "--profile", PROFILE])
+                step("security_props", [py, script("security_props.py"), "run"])
+                and step("seed", [py, script("ledger.py"), "seed", "--dag", str(DAG), "--profile", PROFILE])
                 and step("validate", [py, script("validate_artifacts.py"), "run-dir", "."])
                 and step("checkpoint", [py, script("checkpoint.py"), "init", "state", "--target", "/target"])
                 and step(

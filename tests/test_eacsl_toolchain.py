@@ -772,6 +772,8 @@ def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
     phony = set(m_phony.group(1).replace("\\", " ").split())
     assert {
         "slice-init",
+        "dag",
+        "security-props",
         "seed",
         "build",
         "selftest",
