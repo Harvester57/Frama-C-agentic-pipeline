@@ -965,6 +965,49 @@ def test_audit_hypotheses_is_transitive_over_conditional_callees(run_dir):
         )
 
 
+def test_audit_hypotheses_resolves_colliding_callee_keys(run_dir):
+    """A callee keyed `file#name` (its name collides) is the callee audited, not dropped (defect 3)."""
+    fn = {"module": "m", "tier": "Tier 1", "wave": 0, "has_loops": False, "security_properties": []}
+    dag = {
+        "modules": {"m": {"tier": "Tier 1"}},
+        "functions": {
+            "src/a.c#helper": {**fn, "name": "helper", "file": "src/a.c"},
+            "src/b.c#helper": {**fn, "name": "helper", "file": "src/b.c"},
+            "api": {**fn, "name": "api", "file": "src/c.c", "wave": 1, "internal_callees": ["src/b.c#helper"]},
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
+    # The caller is proven with no hypothesis of its own: its proof still assumes helper's contract.
+    proven = {"rte": {"proven": 2, "proven_under_hyp": 0, "unproven": 0}}
+    write_json(
+        run_dir / "workspace/reports/wp/api.json",
+        wp_report(function="api", file="workspace/work/src/c.c", by_obligation_class=proven),
+    )
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/api.json"])
+    res = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
+    assert res == {"discharged": 0, "conditional": 1}
+    cch = [
+        a for a in units_by_id(run_dir)["src/c.c#api::rte"]["assumptions"] if a["kind"] == "callee_contract_hypothesis"
+    ]
+    assert len(cch) == 1 and cch[0]["related_units"] == ["src/b.c#helper::rte"]
+
+    # Proving the other file's helper changes nothing; proving the callee itself discharges the caller.
+    for file in ("src/a.c", "src/b.c"):
+        write_json(
+            run_dir / "workspace/reports/wp/helper.json",
+            wp_report(function="helper", file=f"workspace/work/{file}", by_obligation_class=proven),
+        )
+        L.cmd_ingest_wp([run_dir / "workspace/reports/wp/helper.json"])
+        res = L.cmd_audit_hypotheses(run_dir / "workspace/reports/callgraph_dag.json")
+        if file == "src/a.c":
+            assert res["conditional"] == 1, res
+    assert res["conditional"] == 0
+    api = units_by_id(run_dir)["src/c.c#api::rte"]
+    assert not any(a["kind"] == "callee_contract_hypothesis" for a in api["assumptions"])
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
 def test_ingest_wp_never_credits_the_unsound_cast_model(run_dir):
     seed(run_dir)
     report = wp_report(

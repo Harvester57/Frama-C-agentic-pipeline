@@ -398,6 +398,58 @@ def test_prepare_agent_scales_max_retries_by_profile(tmp_path):
         assert budget["max_wall_clock_s"] == expected_wall
 
 
+def test_dag_function_record_resolves_colliding_names():
+    """A colliding name is keyed `file#name` in the DAG; the brief must find it (defect 4)."""
+    fns = {
+        "src/a.c#helper": {"name": "helper", "file": "src/a.c", "wave": 0},
+        "src/b.c#helper": {"name": "helper", "file": "src/b.c", "wave": 3},
+        "api": {"name": "api", "file": "src/c.c", "wave": 4},
+    }
+    assert WO.dag_function_record(fns, "helper", "workspace/work/src/b.c")["wave"] == 3
+    assert WO.dag_function_record(fns, "helper", "src/a.c")["wave"] == 0
+    assert WO.dag_function_record(fns, "src/b.c#helper")["wave"] == 3
+    assert WO.dag_function_record(fns, "helper") == {}  # ambiguous without a file
+    assert WO.dag_function_record(fns, "api")["wave"] == 4
+    assert WO.dag_function_record(fns, "api", "src/other.c") == {}  # a same-named function the DAG lacks
+    assert WO.dag_function_record(fns, None) == {}
+
+
+def test_prepare_agent_brief_of_a_colliding_function(tmp_path):
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    (target / "src" / "a.c").write_text("static int helper(int x) { return x; }\n", encoding="utf-8")
+    (target / "src" / "b.c").write_text("static int helper(int x) { return x + 1; }\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    WO.init_overlay(target, run_dir / "workspace")
+    (run_dir / "run-metadata.json").write_text(json.dumps({"profile": "standard"}), encoding="utf-8")
+    loop_prop = {"layer": 2, "category": "Termination / Anti-DoS", "template": "only_in_a_c_helper"}
+    dag = {
+        "modules": {"m": {"tier": "Tier 1A"}},
+        "functions": {
+            "src/a.c#helper": {
+                "name": "helper",
+                "file": "src/a.c",
+                "module": "m",
+                "wave": 0,
+                "security_properties": [loop_prop],
+            },
+            "src/b.c#helper": {
+                "name": "helper",
+                "file": "src/b.c",
+                "module": "m",
+                "wave": 3,
+                "security_properties": [],
+            },
+        },
+    }
+    (run_dir / "workspace" / "reports" / "callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
+    WO.prepare_agent(run_dir=run_dir, agent_id="prove-helper-b", role="prover", c_file="src/b.c", function="helper")
+    brief = (run_dir / "agents" / "prove-helper-b" / "brief.md").read_text(encoding="utf-8")
+    assert "Topological Wave: `3`" in brief
+    # Not the module's properties: only src/a.c's helper has this one.
+    assert "only_in_a_c_helper" not in brief
+
+
 # ---------------------------------------------------------------------------
 # An agent's oracles read its scratch headers (the layout is QCBOR's)
 # ---------------------------------------------------------------------------

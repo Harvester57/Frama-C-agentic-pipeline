@@ -2576,23 +2576,37 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
     dag = load_json_optional(dag_path, {}) if dag_path else {}
     dag_fns = dag.get("functions", {}) if isinstance(dag, dict) else {}
 
-    callees_by_key: dict[tuple[str, str], list[str]] = {}
-    callees_by_name: dict[str, list[str]] = {}
-    for key, fmeta in dag_fns.items() if isinstance(dag_fns, dict) else []:
+    dag_fns = dag_fns if isinstance(dag_fns, dict) else {}
+
+    def _ref(key: str) -> tuple[str, str]:
+        """(file, name) of a DAG key: its record's, else the key itself (`file#name` or a plain name)."""
+        fmeta = dag_fns.get(key)
+        file_part, sep, name_part = str(key).partition("#")
+        if isinstance(fmeta, dict) and fmeta.get("name"):
+            return normalize_file(fmeta.get("file") or (file_part if sep else "")), str(fmeta["name"])
+        return (normalize_file(file_part), name_part) if sep else ("", str(key))
+
+    # A DAG key is the plain name, or `file#name` when the name collides: callees are resolved to
+    # (file, name) through their own records, never matched by name alone.
+    callees_by_key: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    callees_by_name: dict[str, list[tuple[str, str]]] = {}
+    for key, fmeta in dag_fns.items():
         if not isinstance(fmeta, dict):
             continue
-        fn_name = str(fmeta.get("name") or (key.split("#", 1)[-1] if "#" in str(key) else key))
-        fn_file = normalize_file(fmeta.get("file") or (key.split("#", 1)[0] if "#" in str(key) else ""))
+        fn_file, fn_name = _ref(key)
         raw_callees = fmeta.get("internal_callees") or fmeta.get("direct_callees") or fmeta.get("callees") or []
-        clean_callees = [str(c) for c in raw_callees if isinstance(c, str) and c and c != fn_name]
+        refs = [_ref(c) for c in raw_callees if isinstance(c, str) and c and c != key]
+        clean_callees = [r for r in refs if r != (fn_file, fn_name)]
         if fn_file and fn_name:
             callees_by_key[(fn_file, fn_name)] = clean_callees
         if fn_name and fn_name not in callees_by_name:
             callees_by_name[fn_name] = clean_callees
 
     units_by_fn_name: dict[str, list[dict]] = {}
+    units_by_ref: dict[tuple[str, str], list[dict]] = {}
     for u in units.values():
         units_by_fn_name.setdefault(u["function"], []).append(u)
+        units_by_ref.setdefault((normalize_file(u["file"]), u["function"]), []).append(u)
 
     def _has_wp_discharge(unit_obj: dict) -> bool:
         return any(
@@ -2612,15 +2626,21 @@ def cmd_audit_hypotheses(dag_path: Path = Path("workspace/reports/callgraph_dag.
             callee_names = callees_by_name.get(u_fn, [])
 
         callee_units: list[dict] = []
-        for cname in callee_names:
+        for cfile, cname in callee_names:
+            if cfile:
+                # The callee's own units: same file and name, whatever its DAG key.
+                pool = units_by_ref.get((cfile, cname), [])
+            else:
+                # An old DAG without the callee's record: by name, the caller's file first.
+                pool = units_by_fn_name.get(cname, [])
             cand_units = [
                 cu
-                for cu in units_by_fn_name.get(cname, [])
+                for cu in pool
                 if cu["status"] not in ("out_of_scope", "not_applicable")
                 and not (normalize_file(cu["file"]) == u_file and cu["function"] == u_fn)
             ]
             same_file = [cu for cu in cand_units if normalize_file(cu["file"]) == u_file]
-            callee_units.extend(same_file or cand_units)
+            callee_units.extend(cand_units if cfile else (same_file or cand_units))
         audited[u["coverage_id"]] = callee_units
 
     # Conditionality is transitive: a caller is proven unconditionally only when each callee is, so

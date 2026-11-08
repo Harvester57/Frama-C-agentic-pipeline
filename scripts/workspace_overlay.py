@@ -647,6 +647,33 @@ def scope_keys(mm: ModuleMap, module: str) -> set[tuple[str, str]] | None:
     return out or None
 
 
+def dag_function_record(dag_fns: dict, function: str | None, c_file: str | None = None) -> dict:
+    """
+    The DAG record of `function` (defined in `c_file` when given). The DAG keys a function by its
+    plain name, or by `file#name` when the name collides; `function` may also be that key. Without
+    `c_file`, a colliding name resolves only when one record has it. {} when nothing matches.
+    """
+    if not function or not isinstance(dag_fns, dict):
+        return {}
+    want = _normalize_work_relpath(c_file) if c_file else None
+
+    def file_ok(rec: dict) -> bool:
+        return not want or not rec.get("file") or _normalize_work_relpath(str(rec["file"])) == want
+
+    direct = dag_fns.get(function)
+    if isinstance(direct, dict) and file_ok(direct):
+        return direct
+    name = function.rpartition("#")[2] if "#" in function else function
+    matches = [
+        rec
+        for key, rec in dag_fns.items()
+        if isinstance(rec, dict) and str(rec.get("name") or str(key).rpartition("#")[2]) == name and file_ok(rec)
+    ]
+    if want:
+        matches = [rec for rec in matches if rec.get("file")] or matches
+    return matches[0] if len(matches) == 1 else {}
+
+
 def harness_module_for_function(
     mm: ModuleMap, module: str | None, file: str | None = None, function: str | None = None
 ) -> str | None:
@@ -2426,11 +2453,7 @@ def prepare_agent(
     norm_c_file = _normalize_work_relpath(c_file) if c_file else None
     norm_header = _normalize_work_relpath(header_file) if header_file else None
 
-    # The DAG keys functions by bare name: when c_file names another definition (a same-named
-    # static elsewhere), the DAG entry describes that other function, not this one.
-    fn_meta: dict = dag_fns.get(function, {}) if function and isinstance(dag_fns.get(function), dict) else {}
-    if norm_c_file and fn_meta.get("file") and _normalize_work_relpath(fn_meta["file"]) != norm_c_file:
-        fn_meta = {}
+    fn_meta = dag_function_record(dag_fns, function, norm_c_file)
     if not norm_c_file and fn_meta.get("file"):
         norm_c_file = _normalize_work_relpath(fn_meta["file"])
     if not module and fn_meta.get("module"):
@@ -2551,14 +2574,16 @@ def prepare_agent(
     if fn_meta:
         sec_props = fn_meta.get("security_properties", [])
         wave_index = fn_meta.get("wave", 0)
-    elif module:
+    elif module and not function:
+        # A module-level agent (an architect without a function): every function of the module.
         entry_fns = {m.get("entry_fn") for m in harness_metas if m.get("entry_fn")}
-        for fn_name, fmeta in dag_fns.items():
-            if fmeta.get("module") == module:
+        for fn_key, fmeta in dag_fns.items():
+            if isinstance(fmeta, dict) and fmeta.get("module") == module:
                 for sp in fmeta.get("security_properties", []):
                     if sp not in sec_props:
                         sec_props.append(sp)
-                if fmeta.get("is_entry") or fn_name in entry_fns:
+                fn_name = str(fmeta.get("name") or fn_key)
+                if fn_name in entry_fns:
                     untrusted_entries.append(fn_name)
     # Step I9: the MetAcsl properties whose generated annotations this function must discharge.
     sec_doc = load_json_optional(overlay / "reports" / "security_props.json", None) if function else None
