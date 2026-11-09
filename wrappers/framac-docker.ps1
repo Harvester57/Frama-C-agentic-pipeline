@@ -620,7 +620,8 @@ $envArgs = @(
 # Keep this list identical to framac-docker.sh and docker-compose.yml (tests/test_remediation_p2_container.py).
 foreach ($knob in @("FRAMAC_CACHE", "FRAMAC_CACHE_MAX", "FRAMAC_MAX_AGENTS", "FRAMAC_SCHEDULER", "FRAMAC_LOCK_TIMEOUT",
                     "FRAMAC_LOCK_STALE", "FRAMAC_WP_WALL_TIMEOUT", "FRAMAC_PROVER_WALL_BUDGET_S", "FRAMAC_PROVER_CONTEXT",
-                    "FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB", "FRAMAC_RESOURCES_VERBOSE")) {
+                    "FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB", "FRAMAC_RESOURCES_VERBOSE",
+                    "FRAMAC_MUTATION_STUB")) {
     $knobValue = [Environment]::GetEnvironmentVariable($knob)
     if ($knobValue) { $envArgs += @("-e", "$knob=$knobValue") }
 }
