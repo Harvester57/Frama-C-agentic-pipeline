@@ -412,18 +412,32 @@ def test_record_without_test_command_runs_the_non_test_executables(tmp_path, mon
     assert report["status"] == "no_calls_recorded"
 
 
-def test_record_with_a_test_command_runs_only_the_tests(tmp_path, monkeypatch):
+def test_record_with_a_test_command_relinks_every_executable_and_runs_the_command(tmp_path, monkeypatch):
     units = {
         "demo": {"kind": "executable", "objects": []},
         "unit_test": {"kind": "executable", "test": True, "objects": []},
+        "libx.a": {"kind": "static_lib", "objects": []},
     }
     ran = _record_fixture(tmp_path, monkeypatch, units, {"command": "make", "test_command": "make check"})
     monkeypatch.setattr(sh.shutil, "which", lambda name: None)
     assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
     report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
     assert report["source"] == "test_command" and report["test_units"] == ["unit_test"]
-    assert "demo" not in report["relink"] and "runs" not in report
-    assert ran[-1] == ["sh", "-c", "make check"]
+    assert report["executables"] == ["demo", "unit_test"]
+    assert {n: i["status"] for n, i in report["relink"].items()} == {"demo": "relinked", "unit_test": "relinked"}
+    # The command runs once; the executables are not run on their own.
+    assert "runs" not in report and ran[-1] == ["sh", "-c", "make check"]
+
+
+def test_record_with_a_test_command_and_no_unit_named_as_a_test(tmp_path, monkeypatch):
+    """libpng: ctest runs `pngtest`, `pngvalid`, ...; the name rule calls none of them a test."""
+    units = {"pngtest": {"kind": "executable", "objects": []}, "pngvalid": {"kind": "executable", "objects": []}}
+    ran = _record_fixture(tmp_path, monkeypatch, units, {"command": "make", "test_command": "ctest"})
+    monkeypatch.setattr(sh.shutil, "which", lambda name: None)
+    assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
+    report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
+    assert report["test_units"] == [] and report["executables"] == ["pngtest", "pngvalid"]
+    assert report["status"] != "no_test_units" and ran[-1] == ["sh", "-c", "ctest"]
 
 
 def test_record_without_test_command_or_executables(tmp_path, monkeypatch):

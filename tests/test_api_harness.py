@@ -307,6 +307,109 @@ def test_case_probe_finds_the_headers_the_build_generated(tmp_path, monkeypatch)
     assert argv[argv.index("-idirafter") + 1] == (snap / "generated/build").as_posix()
 
 
+def _generate_fixture(tmp_path, monkeypatch, names: list[str]) -> tuple[Path, list[list[str]]]:
+    """A DAG and a model with one `int <name>(int)` per name; harness writes are faked and logged."""
+    import generate_harness
+
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "workspace" / "harnesses"
+    out.mkdir(parents=True)
+    dag = _dag({n: _fn(n) for n in names}, names)
+    model = _model(**{n: {"signature": "int(int)", "formals": _formals("value")} for n in names})
+    (tmp_path / "dag.json").write_text(json.dumps(dag))
+    (tmp_path / "model.json").write_text(json.dumps(model))
+    writes: list[list[str]] = []
+
+    def fake_generate(**kw):
+        cases = list(kw["dispatch_cases"])
+        writes.append(cases)
+        assert kw["fail_on_compile_error"] is False  # the probe judges compile errors
+        harness = out / f"harness_{kw['module_name']}.c"
+        harness.write_text("".join(f"    case {i}U: {{ {c} }} break;\n" for i, c in enumerate(cases)))
+        meta = out / f"harness_{kw['module_name']}.json"
+        meta.write_text(json.dumps({"module": kw["module_name"], "dispatch_cases": cases}))
+        return {"harness_file": str(harness), "harness_meta": str(meta), "cppflags": ""}
+
+    monkeypatch.setattr(generate_harness, "generate_module_harness", fake_generate)
+    monkeypatch.setattr(ah, "probe_layouts", lambda *a, **k: None)  # no struct to lay out
+    return out, writes
+
+
+def _gen(out: Path) -> dict:
+    return ah.generate(
+        "lib",
+        None,
+        64,
+        "",
+        out,
+        unit="lib",
+        dag_path=Path("dag.json"),
+        model_path=Path("model.json"),
+        traces_path=Path("none/traces.jsonl"),
+    )
+
+
+def test_case_probe_drops_every_failing_case_and_rewrites_the_harness(tmp_path, monkeypatch):
+    """pngwutil: more failing cases than one compile reports; the sidecar must match the harness left."""
+    names = ["ok_a", "bad_1", "bad_2", "ok_b", "bad_3", "bad_4", "bad_5"]
+    out, writes = _generate_fixture(tmp_path, monkeypatch, names)
+
+    def probe(harness_c, cppflags, clang=None):
+        lines = Path(harness_c).read_text().splitlines()
+        bad = [i for i, line in enumerate(lines) if "bad_" in line]
+        return {i: "error" for i in bad[:2]}, []  # a capped compiler: two failing cases per compile
+
+    monkeypatch.setattr(ah, "probe_cases", probe)
+    res = _gen(out)
+
+    assert len(writes) == 4  # 5 bad cases, 2 per round, then the clean write
+    assert all("bad_" not in c for c in writes[-1])
+    meta = json.loads((out / "harness_lib.json").read_text())
+    assert [lay["calls"] for lay in meta["api_cases"]] == [["ok_a"], ["ok_b"]]
+    assert [lay["selector"] for lay in meta["api_cases"]] == [0, 1]
+    assert len(meta["dispatch_cases"]) == len(meta["api_cases"]) == res["api_cases"]
+    assert set(meta["api_skipped"]) == {f"bad_{i}" for i in range(1, 6)}
+
+
+def test_case_probe_fails_on_errors_outside_the_cases_and_keeps_the_previous_harness(tmp_path, monkeypatch):
+    out, writes = _generate_fixture(tmp_path, monkeypatch, ["a", "b"])
+    (out / "harness_lib.c").write_text("previous")
+    (out / "harness_lib.json").write_text('{"previous": true}')
+    monkeypatch.setattr(ah, "probe_cases", lambda h, c, clang=None: ({}, ["harness_lib.c:3:1: error: x"]))
+
+    with pytest.raises(ah.ApiHarnessError, match="does not compile outside its cases"):
+        _gen(out)
+    assert (out / "harness_lib.c").read_text() == "previous"
+    assert (out / "harness_lib.json").read_text() == '{"previous": true}'
+
+
+def test_no_compiling_case_leaves_no_harness(tmp_path, monkeypatch):
+    out, _ = _generate_fixture(tmp_path, monkeypatch, ["bad_1", "bad_2"])
+    monkeypatch.setattr(ah, "probe_cases", lambda h, c, clang=None: ({0: "error", 1: "error"}, []))
+
+    with pytest.raises(ah.ApiHarnessError, match="no API case compiles"):
+        _gen(out)
+    assert not (out / "harness_lib.c").exists() and not (out / "harness_lib.json").exists()
+
+
+def test_case_probe_lifts_the_error_cap_and_reports_unlocated_errors(tmp_path, monkeypatch):
+    import subprocess
+
+    harness = tmp_path / "harness_lib.c"
+    harness.write_text("    case 0U: { f(); } break;\n")
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="clang: error: unknown argument\n")
+
+    monkeypatch.setattr(ah.subprocess, "run", fake_run)
+    assert ah.probe_cases(harness, "", clang="/usr/bin/clang-18") == ({}, ["clang: error: unknown argument"])
+    assert "-ferror-limit=0" in seen[0]
+    ah.probe_cases(harness, "", clang="/usr/bin/gcc")
+    assert "-fmax-errors=0" in seen[1] and "-ferror-limit=0" not in seen[1]
+
+
 # --- benchmark ------------------------------------------------------------------------------------------
 
 

@@ -74,6 +74,22 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 - **Cause:** the recipe has no test command; the tests call the API through header `static inline` functions or nested library calls, which the `-Wl,--wrap` recorders do not see; or the harness's case layout (overlapping slots, structs deeper than one `{ptr, len}` level) cannot be filled.
 - **Fix:** read `workspace/reports/seed_harvest.json` and `workspace/reports/seeds/<mod>.json`. Seeds are an improvement, never a requirement: the campaign runs from its own corpus without them.
 
+### Symptom: `seed_harvest.py record` Returns `no_test_units` Although the Recipe Has a Test Command
+- **Cause:** only executables the name rule calls tests were relinked with recorders. libpng's `ctest` runs `pngtest`, `pngvalid`, `pngstest`, ..., none of which the rule recognizes (libpng `a70313dbb`, run-3; `docs/progress/2026-11-09-libpng-harness-generation-bugs.md`, defect D).
+- **Fix:** **fixed** in `scripts/seed_harvest.py` (`record`): with a test command every executable is relinked and the test command decides which ones run; `test_units` still lists the ones named as tests, and `executables` lists all of them.
+
+### Symptom: A Harness Line Like `break int main(void);`, or `too many arguments to function call, expected 0, have 2` on `main`
+- **Cause:** the `main` prototype synthesizer read a statement keyword from a preceding macro continuation (`png-fix-itxt.c`'s `GETBREAK`) as the return type; and the default `argv` entry style calls `main(2, argv)` on a `main(void)` (libpng `pngfix-itxt`, `pnggetset`; defects B and C of the report above).
+- **Fix:** B is **fixed** in `scripts/generate_harness.py`: preprocessor continuations are stripped and statement keywords cut from the head. C is handled by failing early (`_check_argv_entry`) with what to do: exempt the module with `harness_reach.py exempt`, or give `--entry-style` with `--call-expr`. **Open pipeline bug:** there is no stdin-fed entry style yet, so programs that read stdin cannot be harnessed.
+
+### Symptom: `--api` Harness Fails With `unresolved identifiers after automatic prelude resolution: jmp_buf, FILE`, or Leaves Partial `harness_<mod>.{c,json}` After Exit 1
+- **Cause:** the auto-prelude knew no header for standard-library names the target's headers use without including them; a failed generation left its half-written files, which `gen` and the reach gate can pick up; the case probe stopped at clang's 20-error cap, so more failing cases needed several rounds (libpng `pngwutil`, `pngset`, `pngget*`; defect E and "partial files" of the report above).
+- **Fix:** **fixed** in `scripts/generate_harness.py` and `scripts/api_harness.py`: the prelude includes the standard header of such names (`_STD_HEADER_OF`); generation restores the previous harness files on any failure (`harness_files_kept_on_failure`) and fails on a harness that still does not compile after the prelude (`fail_on_compile_error`); the probe lifts the error cap and fails on errors outside the cases instead of dropping cases for them. **Open pipeline bug:** `--api` still does not default `--header` to the unit's `public_headers` from the build capture; give `--header` by hand.
+
+### Symptom: Every `--api` Case of a Module Is Dropped (`no API case compiles`) on Opaque Handles (`png_const_structrp`)
+- **Cause:** the generator declared an opaque struct, reached through a pointer typedef, as a by-value stack object (libpng `pngget*` clusters; defect A of the report above).
+- **Fix:** **open, not re-verified on libpng.** `18bc5e9` (initializer calls for struct pointers, layout probing) may cover it; re-run Phase 0 Step 4 on libpng to check before closing.
+
 ### Symptom: A Generated Header (`config.h`) Is Missing in Eva, WP or the E-ACSL Build
 - **Cause:** generated headers stay in the build tree on the scratch volume. The model reads them there, but the later analyses read `workspace/work`, which holds only the target's source tree.
 - **Fix:** none automatic yet. Copy the generated header into a harness include directory (`workspace/harnesses/include/`) on the sidecar's `-I` path.

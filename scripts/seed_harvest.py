@@ -19,7 +19,8 @@ seed inputs for each harness module, in the byte layout that harness reads.
      API call (string and buffer contents, scalars, the `(ptr, len)` pairs inside a struct passed by
      value, the pointee of a pointer to a scalar) and calls `__real_<fn>`. Memory is copied through a
      pipe, so a bad pointer is recorded as missing, never a crash;
-  3. each test executable is linked again from the build's own link command (bear's events) with the
+  3. each executable (every one, not only those named as tests: the test command decides which run)
+     is linked again from the build's own link command (bear's events) with the
      recorder and `-Wl,--wrap=<fn>` for each API function it defines. Calls between object files are
      recorded: the tests call the API from their own objects. Calls inside one object file, and API
      functions that are header `static inline`, are not;
@@ -772,8 +773,12 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         return report, 0
     units = capture.get("units") or {}
     if command:
-        tests = {n: u for n, u in units.items() if u.get("test") and u.get("kind") == "executable"}
-        report["test_units"] = sorted(tests)
+        # Every executable is relinked, not only the units the name rule calls tests: the test command
+        # decides which ones run (libpng's ctest runs `pngtest`, `pngvalid`, ... none named as a test).
+        # One it does not run records nothing.
+        report["test_units"] = sorted(n for n, u in units.items() if u.get("test") and u.get("kind") == "executable")
+        tests = {n: u for n, u in units.items() if u.get("kind") == "executable"}
+        report["executables"] = sorted(tests)
         if not tests:
             report["status"] = "no_test_units"
             return report, 0

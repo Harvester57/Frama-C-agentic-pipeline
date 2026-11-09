@@ -154,3 +154,61 @@ def test_argv_harness_compiles_with_gcc(tmp_path):
     # is not on this host, so only check the harness text carries the builtin include guard.
     text = harness.read_text(encoding="utf-8")
     assert '#include "__fc_builtin.h"' in text
+
+
+# png-fix-itxt.c: K&R-style `int\nmain(void)` right after a macro whose last continuation line ends
+# in `break`.
+NO_ARG_MAIN_C = """\
+#include <stdio.h>
+
+/* Read one character, break on EOF */
+#define GETBREAK inchar=getchar(); \
+                 c=(inchar & 0xffU);\
+                 if (inchar != c) break
+int
+main(void)
+{
+   int inchar; unsigned char c;
+   for (;;) { GETBREAK; }
+   return 0;
+}
+"""
+
+
+def test_declaration_after_a_macro_with_continuation_lines(tmp_path):
+    src = tmp_path / "png-fix-itxt.c"
+    src.write_text(NO_ARG_MAIN_C, encoding="utf-8")
+    assert generate_harness.extract_function_declaration("main", None, [str(src)]) == "int main(void);"
+    assert generate_harness.extract_function_prototype("main", None, [str(src)]) == []
+
+
+def test_declaration_head_drops_statement_keywords(tmp_path):
+    src = tmp_path / "f.c"
+    # A stray statement keyword left before a definition (an unbalanced macro) is not a return type.
+    src.write_text("return\nunsigned long\nf(int x)\n{ return x; }\n", encoding="utf-8")
+    assert generate_harness.extract_function_declaration("f", None, [str(src)]) == "unsigned long f(int x);"
+
+
+def test_argv_style_refuses_a_main_without_parameters(tmp_path):
+    src = tmp_path / "png-fix-itxt.c"
+    src.write_text(NO_ARG_MAIN_C, encoding="utf-8")
+    out = tmp_path / "harnesses"
+    try:
+        generate_module_harness(
+            module_name="png_fix_itxt",
+            sources=[str(src)],
+            header_include=None,
+            entry_fn="main",
+            max_input_size=256,
+            cppflags="-I.",
+            out_dir=out,
+            entry_style="argv",
+            auto_prelude=False,
+        )
+    except ValueError as exc:
+        assert "takes no arguments" in str(exc)
+        assert "harness_reach.py exempt --module png_fix_itxt" in str(exc)
+    else:
+        raise AssertionError("an argv harness for main(void) must not be written")
+    assert not (out / "harness_png_fix_itxt.c").exists()
+    assert not (out / "harness_png_fix_itxt.json").exists()

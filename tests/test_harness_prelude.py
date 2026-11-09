@@ -408,7 +408,7 @@ class TestGenerateModuleHarnessPrelude:
         text = harness.read_text(encoding="utf-8")
         assert _include_index(text, "pngconf.h") < text.splitlines().index(decl)
 
-    def test_unresolved_raises_after_writing_sidecar(self, tree: dict[str, Path]) -> None:
+    def test_unresolved_raises_and_leaves_no_harness(self, tree: dict[str, Path]) -> None:
         runner = ScriptedClang([diag(tree["events_h"], "type", "Nowhere_T")])
 
         with pytest.raises(ValueError) as excinfo:
@@ -418,9 +418,53 @@ class TestGenerateModuleHarnessPrelude:
         assert "Nowhere_T" in msg
         assert "--extra-include" in msg
         assert "--no-auto-prelude" in msg
-        sidecar = json.loads((tree["out"] / "harness_events.json").read_text(encoding="utf-8"))
-        assert sidecar["prelude_status"] == "unresolved"
-        assert sidecar["prelude_unresolved"] == ["Nowhere_T"]
+        # A failed generation leaves nothing new behind for the reach gate or `pipeline_make.py gen`:
+        # no sidecar, and the harness file as the fixture wrote it.
+        assert not (tree["out"] / "harness_events.json").exists()
+        assert tree["harness"].read_text(encoding="utf-8") == HARNESS_TEXT
+
+    def test_failed_generation_keeps_the_previous_harness(self, tree: dict[str, Path]) -> None:
+        good = self._gen(tree, auto_prelude=False)
+        before = {p.name: p.read_bytes() for p in (Path(good["harness_file"]), Path(good["harness_meta"]))}
+        runner = ScriptedClang([diag(tree["events_h"], "type", "Nowhere_T")])
+
+        with pytest.raises(ValueError):
+            self._gen(tree, prelude_clang="clang", prelude_runner=runner)
+
+        assert {n: (tree["out"] / n).read_bytes() for n in before} == before
+
+    def test_a_compile_error_left_after_the_prelude_fails_the_generation(self, tree: dict[str, Path]) -> None:
+        harness = tree["out"] / "harness_events.c"
+        runner = ScriptedClang([f"{harness.as_posix()}:40:63: error: variable has incomplete type 'struct s'\n"])
+
+        with pytest.raises(ValueError, match="does not compile: clang compile error: .*incomplete type"):
+            self._gen(tree, prelude_clang="clang", prelude_runner=runner)
+        assert harness.read_text(encoding="utf-8") == HARNESS_TEXT
+        assert not (tree["out"] / "harness_events.json").exists()
+
+        # A caller that judges compile errors itself (api_harness.py's case probe) gets the harness.
+        runner = ScriptedClang([f"{harness.as_posix()}:40:63: error: variable has incomplete type 'struct s'\n"])
+        res = self._gen(tree, prelude_clang="clang", prelude_runner=runner, fail_on_compile_error=False)
+        assert res["prelude_status"] == "error" and harness.exists()
+
+    def test_standard_types_resolve_to_system_headers(self, tree: dict[str, Path]) -> None:
+        """`jmp_buf` / `FILE` in a synthesized declaration: no project header defines them."""
+        harness = tree["out"] / "harness_events.c"
+
+        def clang(_: int, text: str) -> str:
+            out = ""
+            if "#include <setjmp.h>" not in text:
+                out += diag(harness, "type", "jmp_buf")
+            if "#include <stdio.h>" not in text:
+                out += diag(harness, "type", "FILE")
+            return out
+
+        res = self._gen(tree, prelude_clang="clang", prelude_runner=ScriptedClang(dynamic=clang))
+
+        assert res["prelude_status"] == "resolved"
+        assert res["prelude_headers"] == ["<setjmp.h>", "<stdio.h>"]
+        text = harness.read_text(encoding="utf-8")
+        assert text.index("#include <setjmp.h>") < text.index('#include "Events.h"')
 
     def test_auto_prelude_disabled(self, tree: dict[str, Path]) -> None:
         runner = ScriptedClang([diag(tree["events_h"], "type", "Nowhere_T")])

@@ -67,7 +67,6 @@ MODEL_JSON = Path("workspace/reports/phase0_model.json")
 TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
 MAX_SEQUENCE_CASES = 16
 MAX_CASES = 255  # one selector byte
-MAX_PROBE_ROUNDS = 3
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
 MAX_DIAGNOSTIC_CHARS = 300
 POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
@@ -949,14 +948,20 @@ _ERR_LINE_RE = re.compile(
 )
 
 
-def case_diagnostics(harness_c: Path, cppflags: str, clang: str | None = None) -> dict[int, str] | None:
+def _no_error_limit(exe: str) -> str:
+    """The option that lifts the compiler's error cap (clang stops at 20 errors, gcc has no cap by default)."""
+    return "-ferror-limit=0" if "clang" in Path(exe).name else "-fmax-errors=0"
+
+
+def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tuple[dict[int, str], list[str]] | None:
     """
-    The dispatch cases the compiler refuses (each case is one line of the harness), each with the
-    compiler's first error on its line (`file:line: error: message`, trimmed), or None when no
-    compiler ran or no error falls on a case. A case the target's headers cannot spell (an incomplete
-    struct, a function the headers do not declare) is dropped instead of failing the whole harness.
-    The compiler gets the run snapshot's include options (scripts/target_env.py), so the headers the
-    build generated are found as in every other compile.
+    Compile the harness once: (the dispatch cases the compiler refuses, each with the compiler's first
+    error on its line (`file:line: error: message`, trimmed); the errors on no case line), or None when
+    no compiler ran. Each case is one line of the harness, so an error maps to its case by line. A case
+    the target's headers cannot spell (an incomplete struct, a function the headers do not declare) is
+    dropped instead of failing the whole harness. The error cap is lifted: every failing case is found
+    in one compile. The compiler gets the run snapshot's include options (scripts/target_env.py), so
+    the headers the build generated are found as in every other compile.
     """
     import shlex
 
@@ -965,28 +970,51 @@ def case_diagnostics(harness_c: Path, cppflags: str, clang: str | None = None) -
     exe = clang or shutil.which("clang") or shutil.which("gcc")
     if not exe:
         return None
-    argv = [exe, "-fsyntax-only", "-w", "-x", "c", *shlex.split(with_include_flags(cppflags)), str(harness_c)]
+    argv = [
+        exe,
+        "-fsyntax-only",
+        "-w",
+        _no_error_limit(exe),
+        "-x",
+        "c",
+        *shlex.split(with_include_flags(cppflags)),
+        str(harness_c),
+    ]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode == 0:
-        return {}
+        return {}, []
     lines = harness_c.read_text(encoding="utf-8", errors="replace").splitlines()
     case_of_line = {}
     for no, text in enumerate(lines, start=1):
         m = _CASE_LINE_RE.match(text)
         if m:
             case_of_line[no] = int(m.group(1))
+    output = (proc.stdout or "") + (proc.stderr or "")
     bad: dict[int, str] = {}
-    for m in _ERR_LINE_RE.finditer((proc.stdout or "") + (proc.stderr or "")):
+    other: list[str] = []
+    for m in _ERR_LINE_RE.finditer(output):
         line = int(m.group("line"))
         if Path(m.group("file")).name == harness_c.name and line in case_of_line:
             diag = f"{harness_c.name}:{line}: error: {m.group('msg').strip()}"
             if len(diag) > MAX_DIAGNOSTIC_CHARS:
                 diag = diag[: MAX_DIAGNOSTIC_CHARS - 3] + "..."
             bad.setdefault(case_of_line[line], diag)
-    return bad if bad else None
+        else:
+            other.append(m.group(0).strip())
+    if not bad and not other:
+        # A failed compile with no located error (a fatal one, a driver error): not a case's fault.
+        other.append(output.strip().splitlines()[0] if output.strip() else f"exit code {proc.returncode}")
+    return bad, other
+
+
+def case_diagnostics(harness_c: Path, cppflags: str, clang: str | None = None) -> dict[int, str] | None:
+    """The dispatch cases the compiler refuses with their first error (`probe_cases`), or None when none
+    is refused or no compiler ran."""
+    probed = probe_cases(harness_c, cppflags, clang)
+    return probed[0] or None if probed is not None else None
 
 
 def failing_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> set[int] | None:
@@ -1019,7 +1047,13 @@ def generate(
     `scope_files` (`--scope-file`) default to the previous sidecar's, and are kept in the new one.
     `struct_layouts`/`visible` replace the layout probe (`probe_layouts`), which runs with `probe`.
     """
-    from generate_harness import _norm_scope_files, generate_module_harness, previous_scope_files, write_sidecar
+    from generate_harness import (
+        _norm_scope_files,
+        generate_module_harness,
+        harness_files_kept_on_failure,
+        previous_scope_files,
+        write_sidecar,
+    )
 
     dag_file = dag_path or (out_dir.parent / "reports" / "callgraph_dag.json")
     dag = load_json_optional(dag_file, None)
@@ -1046,55 +1080,69 @@ def generate(
     cases, layouts, skipped = list(p["cases"]), list(p["layouts"]), dict(p["skipped"])
     result: dict[str, Any] = {}
     # Struct layouts come from the first harness written (its headers and prelude): the cases are
-    # planned again with them before the compile probe.
+    # planned again with them before the compile probe. Each later round drops at least one case, so
+    # the loop ends; the harness is written again after every drop, so the one left on disk is the one
+    # whose cases the sidecar lists. Failed generation leaves the previous harness files as they were
+    # (generate_harness.harness_files_kept_on_failure).
     need_layouts = probe and struct_layouts is None
-    for _ in range(MAX_PROBE_ROUNDS + 1):
-        result = generate_module_harness(
-            module_name=module,
-            sources=sources,
-            header_include=header,
-            entry_fn=first,
-            max_input_size=max_input_size,
-            cppflags=cppflags,
-            out_dir=out_dir,
-            reachability=reachability,
-            entry_style="dispatch",
-            dispatch_cases=cases,
-            unit=unit,
-            ldflags=ldflags,
-            extra_includes=extra_includes,
-            auto_prelude=auto_prelude,
-            scope_files=scope,
-        )
-        if not probe:
-            break
-        if need_layouts:
-            need_layouts = False
-            probed = probe_layouts(Path(result["harness_file"]), result["cppflags"])
-            if probed is not None:
-                p = plan(dag, model, module, unit, max_input_size, traces, scope, probed[0], probed[1])
-                if p["cases"]:
-                    cases, layouts, skipped = list(p["cases"]), list(p["layouts"]), dict(p["skipped"])
-                    continue
-        bad = case_diagnostics(Path(result["harness_file"]), result["cppflags"])
-        if not bad:
-            break
-        keep = [i for i in range(len(cases)) if i not in bad]
-        for i, diag in sorted(bad.items()):
-            if layouts[i].get("entry"):
-                skipped[layouts[i]["entry"]] = f"the case does not compile with the target's headers: {diag}"
-        if not keep:
-            raise ApiHarnessError(f"module {module!r}: no API case compiles: {sorted(skipped.items())}")
-        cases = [cases[i] for i in keep]
-        layouts = [layouts[i] for i in keep]
-        for sel, lay in enumerate(layouts):
-            lay["selector"] = sel
-    sidecar_path = Path(result["harness_meta"])
-    sidecar = load_json_optional(sidecar_path, {}) or {}
-    sidecar["api_harness"] = True
-    sidecar["api_cases"] = layouts
-    sidecar["api_skipped"] = skipped
-    write_sidecar(sidecar_path, sidecar)
+    with harness_files_kept_on_failure(out_dir, module):
+        while True:
+            # While the probe drops cases, a compile error is the probe's to judge; without the
+            # probe, generate_module_harness fails on it itself.
+            result = generate_module_harness(
+                module_name=module,
+                sources=sources,
+                header_include=header,
+                entry_fn=first,
+                max_input_size=max_input_size,
+                cppflags=cppflags,
+                out_dir=out_dir,
+                reachability=reachability,
+                entry_style="dispatch",
+                dispatch_cases=cases,
+                unit=unit,
+                ldflags=ldflags,
+                extra_includes=extra_includes,
+                auto_prelude=auto_prelude,
+                scope_files=scope,
+                fail_on_compile_error=not probe,
+            )
+            if not probe:
+                break
+            if need_layouts:
+                need_layouts = False
+                layouts_probed = probe_layouts(Path(result["harness_file"]), result["cppflags"])
+                if layouts_probed is not None:
+                    p = plan(dag, model, module, unit, max_input_size, traces, scope, *layouts_probed)
+                    if p["cases"]:
+                        cases, layouts, skipped = list(p["cases"]), list(p["layouts"]), dict(p["skipped"])
+                        continue
+            probed = probe_cases(Path(result["harness_file"]), result["cppflags"])
+            if probed is None:
+                break  # no compiler: the cases stay unchecked
+            bad, other = probed
+            if other:
+                raise ApiHarnessError(
+                    f"module {module!r}: the harness does not compile outside its cases: {'; '.join(other[:3])}"
+                )
+            if not bad:
+                break
+            keep = [i for i in range(len(cases)) if i not in bad]
+            for i, diag in sorted(bad.items()):
+                if layouts[i].get("entry"):
+                    skipped[layouts[i]["entry"]] = f"the case does not compile with the target's headers: {diag}"
+            if not keep:
+                raise ApiHarnessError(f"module {module!r}: no API case compiles: {sorted(skipped.items())}")
+            cases = [cases[i] for i in keep]
+            layouts = [layouts[i] for i in keep]
+            for sel, lay in enumerate(layouts):
+                lay["selector"] = sel
+        sidecar_path = Path(result["harness_meta"])
+        sidecar = load_json_optional(sidecar_path, {}) or {}
+        sidecar["api_harness"] = True
+        sidecar["api_cases"] = layouts
+        sidecar["api_skipped"] = skipped
+        write_sidecar(sidecar_path, sidecar)
     result.update(
         api_cases=len(layouts),
         api_entries=sum(1 for lay in layouts if lay.get("entry")),

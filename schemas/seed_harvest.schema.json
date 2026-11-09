@@ -1,5 +1,5 @@
 {
-  "$comment": "Contract for workspace/reports/seed_harvest.json, written by scripts/seed_harvest.py record (plan step I6): how the target's tests (`source: test_command`) or, without a test command, its own executables (`source: executables`) were relinked with recorders and run, and what they recorded into workspace/seed_records/ (calls.jsonl, traces.jsonl, files/). A status other than ok is a reason, never a failure of Phase 0: seeds are optional. `traces` counts the distinct traces written to traces.jsonl.",
+  "$comment": "Contract for workspace/reports/seed_harvest.json, written by scripts/seed_harvest.py record (plan step I6): how the target's executables run by its test command (`source: test_command`; every executable is relinked, `test_units` lists those named as tests) or, without a test command, its own executables (`source: executables`) were relinked with recorders and run, and what they recorded into workspace/seed_records/ (calls.jsonl, traces.jsonl, files/). A status other than ok is a reason, never a failure of Phase 0: seeds are optional. `traces` counts the distinct traces written to traces.jsonl.",
   "type": "object",
   "definitions": {
     "run": {

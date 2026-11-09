@@ -15,6 +15,8 @@ with --no-auto-prelude.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import json
 import os
 import re
@@ -22,7 +24,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -138,7 +140,13 @@ _PARAM_DECL_RE = re.compile(
 )
 _FN_PTR_PARAM_RE = re.compile(r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*\((?P<args>.*)\)$")
 _FN_TYPE_PARAM_RE = re.compile(r"^(?P<head>[^(]+)\((?P<args>.*)\)$")
-_C_PP_DIRECTIVE_RE = re.compile(r"^[ \t]*#[^\n]*(?:\\\r?\n[^\n]*)*", re.MULTILINE)
+# A directive with its continuation lines: a backslash before the newline continues it (a `[^\n]*`
+# would take that backslash and stop at the first line, leaving a macro's body in the text).
+_C_PP_DIRECTIVE_RE = re.compile(r"^[ \t]*#(?:\\\r?\n|[^\n])*", re.MULTILINE)
+# Statement keywords cannot start a declaration: a head that has one kept text of a statement.
+_C_STATEMENT_KEYWORDS = frozenset(
+    {"break", "case", "continue", "default", "do", "else", "for", "goto", "if", "return", "switch", "while"}
+)
 _CPP_GUARD_RE = re.compile(
     r"#[ \t]*if(?:def)?[ \t]+(?:defined[ \t]*\([ \t]*)?__cplusplus\b.*?#[ \t]*endif\b",
     re.DOTALL,
@@ -491,7 +499,11 @@ def extract_function_declaration(
             trailing = text[close_pos + 1 :].lstrip()
             if not trailing.startswith((";", "{")):
                 continue
-            head = " ".join(m.group("head").split())
+            words = m.group("head").split()
+            cut = max((k + 1 for k, w in enumerate(words) if w in _C_STATEMENT_KEYWORDS), default=0)
+            head = " ".join(words[cut:])
+            if head == entry_fn:
+                head = f"int {entry_fn}"
             head = re.sub(r"\b(?:static|inline|__inline__|__inline)\b\s*", "", head).strip() or f"int {entry_fn}"
             params_raw = " ".join(text[open_pos + 1 : close_pos].split()).strip() or "void"
             return f"{head}({params_raw});"
@@ -1152,6 +1164,41 @@ def _parse_symbol_diagnostics(output: str) -> dict[str, list[str]]:
     return found
 
 
+# Identifiers the C library and POSIX define, and the system header that does: they are never in a
+# project header, so the -I search cannot find them (a declaration synthesized without --header that
+# names `jmp_buf` or `FILE`). Used only when no project header defines the identifier.
+_STD_HEADER_OF: dict[str, str] = {
+    **dict.fromkeys(("jmp_buf", "sigjmp_buf"), "<setjmp.h>"),
+    **dict.fromkeys(("FILE", "fpos_t", "EOF", "BUFSIZ"), "<stdio.h>"),
+    **dict.fromkeys(("va_list",), "<stdarg.h>"),
+    **dict.fromkeys(("size_t", "ptrdiff_t", "wchar_t", "NULL", "max_align_t"), "<stddef.h>"),
+    **dict.fromkeys(
+        (
+            *(f"{u}int{w}{n}_t" for u in ("", "u") for w in ("", "_least", "_fast") for n in (8, 16, 32, 64)),
+            *(f"{u}INT{n}_MAX" for u in ("", "U") for n in (8, 16, 32, 64)),
+            "intptr_t",
+            "uintptr_t",
+            "intmax_t",
+            "uintmax_t",
+            "SIZE_MAX",
+        ),
+        "<stdint.h>",
+    ),
+    **dict.fromkeys(("bool", "true", "false"), "<stdbool.h>"),
+    **dict.fromkeys(("CHAR_BIT", "INT_MAX", "INT_MIN", "UINT_MAX", "LONG_MAX", "LONG_MIN", "ULONG_MAX"), "<limits.h>"),
+    **dict.fromkeys(("time_t", "clock_t"), "<time.h>"),
+    **dict.fromkeys(("ssize_t", "off_t", "pid_t", "mode_t", "uid_t", "gid_t"), "<sys/types.h>"),
+    **dict.fromkeys(("errno",), "<errno.h>"),
+    **dict.fromkeys(("sig_atomic_t",), "<signal.h>"),
+    **dict.fromkeys(("wint_t", "mbstate_t"), "<wchar.h>"),
+    **dict.fromkeys(("socklen_t",), "<sys/socket.h>"),
+    **dict.fromkeys(
+        ("pthread_t", "pthread_mutex_t", "pthread_cond_t", "pthread_once_t", "pthread_key_t", "pthread_attr_t"),
+        "<pthread.h>",
+    ),
+}
+
+
 def _insert_prelude_includes(
     harness_file: Path,
     header_include: str,
@@ -1185,7 +1232,8 @@ def _insert_prelude_includes(
         if idx is None:
             # Module header line not found: insert before the first quoted include, else at the top.
             idx = next((i for i, line in enumerate(lines) if line.lstrip().startswith('#include "')), 0)
-        lines.insert(idx, f'#include "{hdr}" /* auto-prelude */\n')
+        spelled = hdr if hdr.startswith("<") else f'"{hdr}"'
+        lines.insert(idx, f"#include {spelled} /* auto-prelude */\n")
     harness_file.write_text("".join(lines), encoding="utf-8")
 
 
@@ -1298,6 +1346,7 @@ def resolve_prelude_headers(
 
         # Collect candidate definitions for every unresolved symbol.
         candidates: dict[str, list[Path]] = {}
+        std_headers: dict[str, str] = {}
         for sym, failing_files in symbols.items():
             failing_names = {Path(f.replace("\\", "/")).name for f in failing_files}
             cands: list[Path] = []
@@ -1310,6 +1359,8 @@ def resolve_prelude_headers(
                 if _header_defines_symbol(_header_text(hdr), sym):
                     cands.append(hdr)
             candidates[sym] = cands
+            if not cands and sym in _STD_HEADER_OF and _STD_HEADER_OF[sym] not in prelude:
+                std_headers[sym] = _STD_HEADER_OF[sym]
 
         coverage: dict[Path, int] = {}
         for cands in candidates.values():
@@ -1321,7 +1372,12 @@ def resolve_prelude_headers(
         unresolved: list[str] = []
         for sym, cands in candidates.items():
             if not cands:
-                unresolved.append(sym)
+                std = std_headers.get(sym)
+                if std is None:
+                    unresolved.append(sym)
+                elif std not in chosen_names:
+                    chosen_names.append(std)
+                    new_headers.append((std, None))
                 continue
             best = sorted(cands, key=lambda p: (-coverage[p], len(str(p)), str(p)))[0]
             if best.name in chosen_names:
@@ -1709,7 +1765,67 @@ _FUZZ_FN_BLOCK_RE = re.compile(
 )
 
 
-def generate_module_harness(
+def _check_argv_entry(module_name: str, entry_fn: str, sources: list[str], cppflags: str) -> None:
+    """
+    An argv entry calls `main(argc, argv)`: a `main(void)` takes no arguments, so the input cannot
+    reach it that way (it reads stdin, a fixed file, or nothing). Fail with what to do instead of
+    writing a harness that does not compile. A main whose definition is not found is left to the
+    compiler.
+    """
+    try:
+        params = extract_function_prototype(entry_fn, None, sources, cppflags)
+    except ValueError:
+        return
+    if params:
+        return
+    raise ValueError(
+        f"{entry_fn}() of module {module_name!r} takes no arguments: an argv harness cannot pass it the "
+        "input. If the program reads no input, or only stdin (no stdin entry style yet), record the gap: "
+        f"harness_reach.py exempt --module {module_name} --reason '<why>'; otherwise give --entry-style "
+        "with --call-expr."
+    )
+
+
+@contextlib.contextmanager
+def harness_files_kept_on_failure(out_dir: Path, module_name: str) -> Iterator[None]:
+    """
+    Run a harness generation so that a failure leaves harness_<module>.{c,json} as they were before
+    it (the previous files back, or none): a half-written harness must not reach the reach gate or
+    `pipeline_make.py gen`. Nested uses restore to the state the outermost one saw.
+    """
+    paths = [out_dir / f"harness_{module_name}.c", out_dir / f"harness_{module_name}.json"]
+    saved: dict[Path, bytes | None] = {}
+    for path in paths:
+        try:
+            saved[path] = path.read_bytes()
+        except OSError:
+            saved[path] = None
+    try:
+        yield
+    except BaseException:
+        for path, data in saved.items():
+            try:
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(data)
+            except OSError:
+                pass
+        raise
+
+
+def generate_module_harness(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """
+    Write harness_<module>.{c,json} (_generate_module_harness has the parameters). A generation that
+    fails, including a harness that does not compile once the prelude is resolved
+    (`fail_on_compile_error`, on by default), leaves the previous files as they were.
+    """
+    bound = inspect.signature(_generate_module_harness).bind(*args, **kwargs)
+    with harness_files_kept_on_failure(Path(bound.arguments["out_dir"]), str(bound.arguments["module_name"])):
+        return _generate_module_harness(*args, **kwargs)
+
+
+def _generate_module_harness(
     module_name: str,
     sources: list[str],
     header_include: str | None,
@@ -1744,6 +1860,7 @@ def generate_module_harness(
     scope_files: list[str] | None = None,
     target_fuzzer: str | None = None,
     target_fuzzer_id: str | None = None,
+    fail_on_compile_error: bool = True,
 ) -> dict[str, Any]:
     # A target fuzz module (--target-fuzzer): the harness calls the target's own fuzz function, renamed
     # by -D (see the rename path below), on its own copy of the input. It answers for its fuzzer file only.
@@ -1886,6 +2003,7 @@ def generate_module_harness(
 
     effective_null_terminate = bool(null_terminate or entry_style == "c_string" or auto_needs_nt)
     if entry_style == "argv":
+        _check_argv_entry(module_name, entry_fn, sources, norm_cppflags)
         # Rename the target's main in every build of this module (Eva and fuzz alike): the harness
         # calls main(argc, argv), and the -D renames that call together with the target's
         # definition, so libFuzzer's own main is the only main at link time.
@@ -2105,6 +2223,11 @@ def generate_module_harness(
             f"{', '.join(prelude_fields['prelude_unresolved'])}. "
             "Pass the defining root header manually (--header <root>.h --extra-include <mod>.h), "
             "add its directory to --cppflags with -I, or disable resolution with --no-auto-prelude."
+        )
+    if fail_on_compile_error and prelude.get("status") == "error":
+        # The harness was written but clang refuses it: a harness that cannot be built is not a harness.
+        raise ValueError(
+            f"harness for module {module_name!r} does not compile: {prelude.get('reason') or 'clang error'}"
         )
 
     return {
