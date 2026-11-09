@@ -164,11 +164,12 @@ eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EV
 
 # The tuning decision of module $(1): its finished base run and rungs, the recorded loop trials and the
 # per-obligation combination (eva_tuning.py finish). It writes the module's report, and copies the
-# flamegraph.txt of the run the report rests on to workspace/eva/$(1)/.
+# flamegraph.txt of the run the report rests on (the base run's, when that is a rung) to workspace/eva/$(1)/.
 eva_finish_cmd = $(PY) $(S)/eva_tuning.py finish $(call eva_args,$(1)) \
 	$(if $(ENTRY_FN_$(1)),--entry-fn=$(ENTRY_FN_$(1))) \
 	--settings-digest $(EVA_TUNE_DIGEST_$(1)) --rungs $(EVA_TUNE_RUNGS_$(1)) --loop-unroll $(EVA_LOOP_UNROLL_$(1)) \
 	$(if $(EVA_TUNE_TIMEOUT_$(1)),--timeout $(EVA_TUNE_TIMEOUT_$(1))) \
+	$(if $(EVA_TUNE_SKIP_$(1)),--skip-search $(EVA_TUNE_SKIP_$(1))) \
 	--report-dir workspace/reports/eva-tuning/$(1) --work-dir workspace/eva/$(1)/tune \
 	--flamegraph-out workspace/eva/$(1)/flamegraph.txt \
 	--out-json workspace/reports/eva/$(1).json
@@ -189,8 +190,13 @@ $(EVA_TARGETS): eva-%:
 		$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*))
 
 # Eva ladder: the module's own settings first; `pipeline_make.py run` then regenerates modules.mk, so
-# only modules left with Unknowns get rungs. A rung is optional, so a failed one never blocks `finish`,
-# which writes the module's report and records the decision in params.json.
+# only modules left with Unknowns get rungs, and none when the base run was too slow for any rung to
+# finish (EVA_TUNE_SKIP_<mod>, a plan warning). A rung is optional, so a failed one never blocks `finish`,
+# which writes the module's report and records the decision in params.json. Each rung has its own
+# resource-history key, <mod>:<rung>, so its memory lease follows its own measured peak; until it has
+# one, the key falls back to the largest of the module's (resources.py history_estimate). A rung that
+# times out stays a timeout: the less precise fallback tiers are of no use against the base run. Rungs
+# write no flamegraph.txt either (+7% wall time, gigabytes on long runs): the base run's is published.
 eva-tune-base: $(EVA_BASE_TARGETS)
 $(EVA_BASE_TARGETS): evabase-%:
 	$(GATE) --module $* --need reach
@@ -205,9 +211,9 @@ define EVA_RUNG_RULE
 evarung-$(1)--$(2):
 	$$(GATE) --module $(1) --need reach
 	@rm -f workspace/reports/eva-tuning/$(1)/$(2).json
-	-$$(RUN) --class eva --key $(1) --output workspace/reports/eva-tuning/$(1)/$(2).json -- \
+	-$$(RUN) --class eva --key $(1):$(2) --output workspace/reports/eva-tuning/$(1)/$(2).json -- \
 		$$(PY) $$(S)/run_eva_slice.py $$(call eva_args,$(1)) --out-dir workspace/eva/$(1)/tune/$(2) \
-		$$(EVA_RUNG_OPTIONS_$(1)__$(2)) \
+		$$(EVA_RUNG_OPTIONS_$(1)__$(2)) --no-timeout-fallback --no-flamegraph \
 		$$(if $$(EVA_TUNE_TIMEOUT_$(1)),--timeout $$(EVA_TUNE_TIMEOUT_$(1))) \
 		--out-json workspace/reports/eva-tuning/$(1)/$(2).json
 endef

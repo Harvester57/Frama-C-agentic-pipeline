@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Render an Eva flamegraph (SVG + HTML) from a module's flamegraph.txt, written by every Eva run
-(-eva-flamegraph, see run_eva_slice.py). Use it to find where a slow Eva run spends its time:
+Render an Eva flamegraph (SVG + HTML) from a module's flamegraph.txt, written by the module's base
+and plain Eva runs (-eva-flamegraph, see run_eva_slice.py; tuning rungs and loop trials skip it).
+Use it to find where a slow Eva run spends its time:
 
     python3 /opt/framac-pipeline/scripts/eva_flamegraph.py --dir workspace/eva/<mod>
     python3 /opt/framac-pipeline/scripts/pipeline_make.py run flamegraph-<mod>
@@ -20,6 +21,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -27,21 +29,13 @@ from typing import Any
 COST_PROFILE_TOP = 5
 
 
-def cost_profile(flamegraph_txt: Path, top: int = COST_PROFILE_TOP) -> dict[str, Any] | None:
-    """
-    The functions that cost Eva the most, from a `-eva-flamegraph` file (folded stacks, one
-    `root;caller;callee <time>` line per sample). `self`: time spent in the function itself;
-    `inclusive`: with its callees, the root left out since it is the whole run. Each entry gives the
-    function and its share of the run's total time. None when the file is missing, unreadable or
-    empty. A run killed at its time limit still leaves a usable file: Eva writes it as it goes.
-    """
-    try:
-        lines = flamegraph_txt.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    own: defaultdict[str, float] = defaultdict(float)
-    inclusive: defaultdict[str, float] = defaultdict(float)
-    roots: set[str] = set()
+def _fold(
+    lines: Iterable[str],
+    own: defaultdict[str, float],
+    inclusive: defaultdict[str, float],
+    roots: set[str],
+) -> None:
+    """Add each `root;caller;callee <time>` sample to the self and inclusive times."""
     for line in lines:
         stack, _, raw = line.rstrip().rpartition(" ")
         try:
@@ -55,6 +49,25 @@ def cost_profile(flamegraph_txt: Path, top: int = COST_PROFILE_TOP) -> dict[str,
         own[frames[-1]] += t
         for f in set(frames):  # a recursive function counts once per sample
             inclusive[f] += t
+
+
+def cost_profile(flamegraph_txt: Path, top: int = COST_PROFILE_TOP) -> dict[str, Any] | None:
+    """
+    The functions that cost Eva the most, from a `-eva-flamegraph` file (folded stacks, one
+    `root;caller;callee <time>` line per sample). `self`: time spent in the function itself;
+    `inclusive`: with its callees, the root left out since it is the whole run. Each entry gives the
+    function and its share of the run's total time. None when the file is missing, unreadable or
+    empty. A run killed at its time limit still leaves a usable file: Eva writes it as it goes.
+    """
+    own: defaultdict[str, float] = defaultdict(float)
+    inclusive: defaultdict[str, float] = defaultdict(float)
+    roots: set[str] = set()
+    try:
+        # Read line by line: a long run writes gigabytes (2.5 GB for QCBOR run-5's base run).
+        with flamegraph_txt.open(encoding="utf-8", errors="replace") as handle:
+            _fold(handle, own, inclusive, roots)
+    except OSError:
+        return None
     total = sum(own.values())
     if total <= 0:
         return None

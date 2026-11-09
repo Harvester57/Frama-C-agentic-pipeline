@@ -197,7 +197,7 @@ def _golden_modules_mk(run: Path) -> str:
             f"ENTRY_FN_{mod} := {entry}\nEVA_OPTIONS_{mod} :=\nEVA_LOOPS_{mod} :=\nEVA_BASE_OPTIONS_{mod} :=\n"
             f"EVA_TUNE_DIGEST_{mod} := {plan.modules[mod].settings_digest}\n"
             f"EVA_TUNE_TIMEOUT_{mod} :=\nEVA_LOOP_UNROLL_{mod} := 256\nEVA_TUNE_RUNGS_{mod} :=\n"
-            f"EVA_REPLAY_{mod} :=",
+            f"EVA_TUNE_SKIP_{mod} :=\nEVA_REPLAY_{mod} :=",
         )
     return text
 

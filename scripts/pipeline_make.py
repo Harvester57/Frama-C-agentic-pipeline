@@ -70,6 +70,7 @@ from eva_options import (  # noqa: E402
     settings_digest,
     trial_timeout,
     tuned_record_problem,
+    tuning_skip_reason,
 )
 from framac_common import (  # noqa: E402
     ArtifactError,
@@ -394,6 +395,8 @@ class ModulePlan:
     # Rungs of the Eva ladder this module runs next, with their options; empty until its base run left Unknowns.
     tune_rungs: dict[str, dict] = field(default_factory=dict)
     tune_timeout: int | None = None
+    # Why the ladder is not searched although the base run left Unknowns (eva_options.tuning_skip_reason).
+    tune_skip: str | None = None
     loop_unroll: int = field(default_factory=lambda: loop_unroll_level(None))
     # A recorded decision current for these settings and the last base run's inputs: `eva-<mod>` then
     # replays the tuning (base run, recorded rungs, combination) instead of one run of the selected options.
@@ -416,6 +419,7 @@ class ModulePlan:
             "params": self.params,
             **({"engine_reason": self.engine_reason} if self.engine_reason else {}),
             "tune_rungs": list(self.tune_rungs),
+            **({"tune_skip": self.tune_skip} if self.tune_skip else {}),
             "eva_replay": self.eva_replay,
             "warnings": self.warnings,
         }
@@ -813,9 +817,15 @@ def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
     mod.tune_timeout = trial_timeout(base.get("elapsed_s"), mod.params.get("eva_timeout"))
     record = mod.params.get("eva_tuned")
     if record is not None and record_is_current(record, mod.settings_digest, base.get("input_digest")):
+        # Recorded rungs finished here before: they replay (from the cache) whatever the base run took.
         wanted = set(recorded_rungs(record))
         mod.eva_replay = True
     else:
+        skip = tuning_skip_reason(base.get("elapsed_s"), mod.tune_timeout, mod.params.get("eva_timeout"))
+        if skip:
+            mod.tune_skip = skip
+            mod.warnings.append(TUNING_WARNING_PREFIX + skip)
+            return
         wanted = {rung.name for rung in LADDER}
     plain = mod.rung_options({})
     for rung in LADDER:
@@ -1105,6 +1115,7 @@ def _eva_tuning_lines(mod: ModulePlan) -> list[str]:
         _assign(f"EVA_TUNE_TIMEOUT_{n}", _opt(mod.tune_timeout)),
         _assign(f"EVA_LOOP_UNROLL_{n}", mk_quote(str(mod.loop_unroll))),
         _assign(f"EVA_TUNE_RUNGS_{n}", " ".join(mod.tune_rungs)),
+        _assign(f"EVA_TUNE_SKIP_{n}", mk_quote(mod.tune_skip) if mod.tune_skip else ""),
         _assign(f"EVA_REPLAY_{n}", "1" if mod.eva_replay else ""),
     ]
     for rung, options in mod.tune_rungs.items():

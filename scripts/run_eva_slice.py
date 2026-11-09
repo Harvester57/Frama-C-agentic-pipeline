@@ -12,9 +12,12 @@ analysis is one entry wherever it writes) and the content of every source and he
 an identical later run restores the report, alarms.csv, red_alarms.csv, eva.log, slice.sarif,
 flows.log, flamegraph.txt and nonterm.log instead of re-running Eva (the .sav is not cached).
 
-Every run also writes flamegraph.txt (-eva-flamegraph, render it with `pipeline_make.py run
-flamegraph-<mod>` or scripts/eva_flamegraph.py when a run is slow) and runs the nonterm plug-in
-(-nonterm -nonterm-log), whose warnings land in the report as `nonterm`. The report's
+A run writes flamegraph.txt (-eva-flamegraph, render it with `pipeline_make.py run
+flamegraph-<mod>` or scripts/eva_flamegraph.py when a run is slow) unless called with
+--no-flamegraph, as tuning rungs and loop trials are. The cost follows the profile's size: +7% wall
+time on libmnl `attr` (6.8 MB), within noise on QCBOR run-4 (1.1 MB), and QCBOR run-5's base run
+wrote 2.5 GB; only the module's base and plain runs have their profile read. Every run also runs
+the nonterm plug-in (-nonterm -nonterm-log), whose warnings land in the report as `nonterm`. The report's
 `repair_hints` field ports upstream make-wrapper's log patterns (recursive call without assigns,
 called function with neither code nor specification) into pipeline actions.
 
@@ -38,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -413,10 +417,14 @@ def run_eva_on_slice(
     eva_options: dict | None = None,
     loop_unroll: Iterable[LoopRef] | None = None,
     mirror_root: str | None = None,
+    timeout_fallback: bool = True,
+    flamegraph: bool = True,
 ) -> dict:
     """
     `eva_options` are allowlisted tuning values; `loop_unroll` analyses a mirror of the sources at
-    `mirror_root` instead (default: under `out_dir`), with those loops annotated.
+    `mirror_root` instead (default: under `out_dir`), with those loops annotated. `timeout_fallback`
+    False keeps a timeout a timeout (tuning trials: a less precise fallback result cannot help there).
+    `flamegraph` False leaves out -eva-flamegraph (tuning trials: nobody reads their profile).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -438,6 +446,7 @@ def run_eva_on_slice(
         out_dir / "flows.cg.dot",
         out_dir / "flamegraph.txt",
         out_dir / "nonterm.log",
+        out_dir / "eva.timed_out.log",
     ):
         if stale.exists():
             stale.unlink()
@@ -473,6 +482,7 @@ def run_eva_on_slice(
         mlevel=mlevel,
         allow_incomplete_recursion_specs=allow_incomplete_recursion_specs,
         eva_options=options,
+        flamegraph=flamegraph,
     )
 
     def _finalize(res: dict) -> dict:
@@ -495,7 +505,11 @@ def run_eva_on_slice(
             return rem if rem >= 30 else default_s
 
         can_timeout_fallback = (
-            budget_s is not None and budget_s >= 120 and options.get("precision") is None and not options.get("domains")
+            timeout_fallback
+            and budget_s is not None
+            and budget_s >= 120
+            and options.get("precision") is None
+            and not options.get("domains")
         )
 
         cur_allow_rec = allow_incomplete_recursion_specs
@@ -523,6 +537,7 @@ def run_eva_on_slice(
                 mlevel=mlevel,
                 allow_incomplete_recursion_specs=True,
                 eva_options=options,
+                flamegraph=flamegraph,
             )
             res = _execute_eva(
                 cur_cmd,
@@ -539,7 +554,11 @@ def run_eva_on_slice(
         # flamegraph.txt over the timed-out run's, so keep the profile that says why it was slow.
         timed_out_profile = res.get("cost_profile")
         if res["status"] == "analysis_timeout" and can_timeout_fallback:
+            timed_out = res
+            # The fallback runs write eva.log over the timed-out run's: keep the one that explains it.
+            _keep_timed_out_log(timed_out, out_dir)
             fb_budget = min(900, max(120, int((budget_s or 600) // 4)))
+            tried: list[dict] = []
             for tier_name, fb_opts in _timeout_fallback_tiers(slevel, options):
                 fb_cmd, fb_reduced = _eva_command(
                     eff_sources,
@@ -555,6 +574,7 @@ def run_eva_on_slice(
                     mlevel=mlevel,
                     allow_incomplete_recursion_specs=cur_allow_rec,
                     eva_options=fb_opts,
+                    flamegraph=flamegraph,
                 )
                 fb_res = _execute_eva(fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root)
                 if (
@@ -577,6 +597,7 @@ def run_eva_on_slice(
                         mlevel=mlevel,
                         allow_incomplete_recursion_specs=True,
                         eva_options=fb_opts,
+                        flamegraph=flamegraph,
                     )
                     fb_res = _execute_eva(
                         fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root
@@ -590,9 +611,9 @@ def run_eva_on_slice(
                     if profile:
                         fb_res["cost_profile"] = profile
                     return fb_res
-                res = fb_res
-            if timed_out_profile:
-                res["cost_profile"] = timed_out_profile
+                tried.append({"tier": tier_name, "status": fb_res["status"], "elapsed_s": fb_res.get("elapsed_s")})
+            # No tier completed: the result is the timed-out run's, which names the limit it hit.
+            res = _with_failed_fallbacks(timed_out, tried, fb_budget)
         return res
 
     if not use_cache:
@@ -623,6 +644,9 @@ def run_eva_on_slice(
         "kind": "eva",
         "command": [outputs_in_cmd.get(token, token) for token in cmd],
         "sources": list(eff_sources),
+        # A fallback tier's result is cached under the command that timed out: never reuse it where
+        # the fallback is off. Only added when off, so existing entries keep their keys.
+        **({} if timeout_fallback else {"timeout_fallback": False}),
     }
     return _finalize(
         cache.memoize(
@@ -716,6 +740,35 @@ def _is_missing_assigns_error(log_path: Path, error_summary: list[str]) -> bool:
     return "[eva:assigns:missing]" in text or "without assigns clause" in text
 
 
+def _keep_timed_out_log(res: dict, out_dir: Path) -> None:
+    """Move a timed-out run's eva.log aside (eva.timed_out.log) before a fallback run reuses the name."""
+    log = out_dir / "eva.log"
+    kept = out_dir / "eva.timed_out.log"
+    try:
+        if log.is_file():
+            os.replace(log, kept)
+            res["log_file"] = str(kept)
+    except OSError:
+        pass
+
+
+def _with_failed_fallbacks(timed_out: dict, tried: list[dict], fb_budget: int) -> dict:
+    """
+    The timed-out run's result when no fallback tier completed: its own limit stays in the first
+    error line, and the tiers tried are named after it (each had `fb_budget` seconds).
+    """
+    res = dict(timed_out)
+    if tried:
+        res["timeout_fallback_tried"] = tried
+        names = ", ".join(f"{t['tier']} ({t['status']})" for t in tried)
+        res["error_summary"] = [
+            *(timed_out.get("error_summary") or [])[:1],
+            f"no fallback tier completed (each limited to {fb_budget} s): {names}",
+            *(timed_out.get("error_summary") or [])[1:],
+        ]
+    return res
+
+
 def _timeout_fallback_tiers(slevel: int, base_options: dict) -> list[tuple[str, dict]]:
     """
     Fast cvalue-only fallback configurations when the default 5-domain base run exceeds its wall-clock budget.
@@ -759,6 +812,7 @@ def _eva_command(
     mlevel: int = 0,
     allow_incomplete_recursion_specs: bool = False,
     eva_options: dict | None = None,
+    flamegraph: bool = True,
 ) -> tuple[list[str], list[str]]:
     if mlevel < 0:
         raise ValueError(f"mlevel must be >= 0 (got {mlevel})")
@@ -824,8 +878,7 @@ def _eva_command(
             "-eva-report-red-statuses",
             str(red_csv),
             # Perf profile of the run; render it with scripts/eva_flamegraph.py when a run is slow.
-            "-eva-flamegraph",
-            str(out_dir / "flamegraph.txt"),
+            *(["-eva-flamegraph", str(out_dir / "flamegraph.txt")] if flamegraph else []),
             "-then",
             "-metrics",
             "-metrics-eva-cover",
@@ -1126,6 +1179,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Unroll this loop N times, on a scratch mirror of the sources. Repeatable.",
     )
     parser.add_argument(
+        "--no-timeout-fallback",
+        action="store_true",
+        help="On a timeout, do not retry with the faster, less precise cvalue tiers (tuning rungs).",
+    )
+    parser.add_argument(
+        "--no-flamegraph",
+        action="store_true",
+        help="Do not write flamegraph.txt (-eva-flamegraph): tuning rungs, whose profile nobody reads.",
+    )
+    parser.add_argument(
         "--mirror-root",
         default=None,
         help="Where --loop-unroll writes its mirror (default: under --out-dir).",
@@ -1165,6 +1228,8 @@ def main(argv: list[str] | None = None) -> int:
         eva_options=options,
         loop_unroll=loop_unroll,
         mirror_root=args.mirror_root,
+        timeout_fallback=not args.no_timeout_fallback,
+        flamegraph=not args.no_flamegraph,
     )
     res["module"] = args.module
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

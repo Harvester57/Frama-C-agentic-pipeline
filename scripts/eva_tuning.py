@@ -597,6 +597,10 @@ class Tuner:
             loop_unroll=refs,
             # Fixed by the annotation set, so the same set is one cache entry under any trial's name.
             mirror_root=(self.work_dir / "mirrors" / mirror_id(refs)).as_posix() if refs else None,
+            # A less precise fallback result cannot help against the base run: a timeout stays one.
+            timeout_fallback=False,
+            # Nobody reads a trial's profile; the base run's is the one published.
+            flamegraph=False,
         )
         result["module"] = a.module
         atomic_write_json(self.report_dir / f"{name}.json", result)
@@ -680,16 +684,21 @@ def build_record(
     }
 
 
-def publish_flamegraph(report: dict, dest: Path | None) -> None:
+def publish_flamegraph(report: dict, dest: Path | None, base_report: dict | None = None) -> None:
     """
     Copy the flamegraph.txt of the run a module's report rests on to `dest` (workspace/eva/<mod>/), where
-    `flamegraph-<mod>` renders it; remove a stale one when that run left none.
+    `flamegraph-<mod>` renders it. Rungs and loop trials write none (--no-flamegraph), so a report that
+    rests on one publishes the base run's profile; remove a stale one when neither left any.
     """
     if dest is None:
         return
-    src = report.get("flamegraph_file")
-    src_path = Path(src) if isinstance(src, str) and src else None
-    if src_path is None or not src_path.is_file():
+    src_path = None
+    for candidate in (report, base_report or {}):
+        src = candidate.get("flamegraph_file")
+        if isinstance(src, str) and src and Path(src).is_file():
+            src_path = Path(src)
+            break
+    if src_path is None:
         dest.unlink(missing_ok=True)
         return
     if src_path.resolve() == dest.resolve():
@@ -725,7 +734,7 @@ def finish(args: argparse.Namespace) -> dict:
         report["module"] = args.module
         atomic_write_json(Path(args.out_json), report)
         atomic_write_json(tuner.report_dir / "decision.json", report.get("tuning") or {})
-        publish_flamegraph(report, flamegraph_out)
+        publish_flamegraph(report, flamegraph_out, base.report)
         return report
 
     if not base.completed:
@@ -744,6 +753,13 @@ def finish(args: argparse.Namespace) -> dict:
         clean = {**base.report, **base.reach}
         clean["tuning"] = {"mode": "skipped", "reason": "the base run left no Unknown obligations"}
         return write(clean)
+    skip = getattr(args, "skip_search", None)
+    if skip:
+        # The planner found the base run too slow for any rung or loop trial to finish here: no search,
+        # nothing recorded, so a faster machine or a raised eva_timeout tunes it later.
+        slow = {**base.report, **base.reach}
+        slow["tuning"] = {"mode": "skipped", "reason": skip}
+        return write(slow)
 
     record = load_params(args.run_dir)["modules"].get(args.module, {}).get("eva_tuned")
     replay = record_is_current(record, args.settings_digest, base.report.get("input_digest"))
@@ -847,6 +863,12 @@ def main(argv: list[str] | None = None) -> int:
     p_finish.add_argument("--timeout", type=int, default=None, help="Seconds for each loop trial")
     p_finish.add_argument("--settings-digest", required=True, help="Digest of the module settings (pipeline_make.py)")
     p_finish.add_argument("--rungs", nargs="*", default=[], help="Names of the finished rung trials, in ladder order")
+    p_finish.add_argument(
+        "--skip-search",
+        default=None,
+        metavar="REASON",
+        help="Do not search (no rungs, no loop trials): the report is the base run's, with this reason",
+    )
     p_finish.add_argument("--loop-unroll", type=int, default=DEFAULT_LOOP_UNROLL)
     p_finish.add_argument("--report-dir", required=True)
     p_finish.add_argument("--work-dir", required=True)

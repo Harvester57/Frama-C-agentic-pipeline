@@ -288,6 +288,11 @@ TRIAL_TIMEOUT_FACTOR = 8
 LOOP_TRIAL_TIMEOUT_FACTOR = 2
 TRIAL_TIMEOUT_FLOOR_S = 600
 TRIAL_TIMEOUT_CEILING_S = 7200
+# The ladder is not searched when the base run times this margin already reaches a rung's limit: no
+# rung could finish. Measured rung/base elapsed ratios (libmnl run-6, libpng run-2): the cheapest rungs
+# (values, relational, perfn) take 0.84-1.2x the base run, the others 3-10x. QCBOR run-5 (base 6,964 s,
+# limit 7,200 s) timed out on `relational` and queued about 15 h more of rungs bound to time out too.
+TUNING_SKIP_MARGIN = 1.25
 DEFAULT_LOOP_UNROLL = 256
 
 
@@ -333,6 +338,29 @@ def trial_timeout(base_elapsed_s: float | None, module_timeout: int | None = Non
         return int(module_timeout)
     scaled = TRIAL_TIMEOUT_FACTOR * float(base_elapsed_s or 0)
     return int(min(TRIAL_TIMEOUT_CEILING_S, max(TRIAL_TIMEOUT_FLOOR_S, scaled)))
+
+
+def tuning_skip_reason(
+    base_elapsed_s: float | None, rung_timeout_s: int | None, module_timeout: int | None = None
+) -> str | None:
+    """
+    Why the ladder is not worth searching on this machine, or None: the base run took so long that
+    even the cheapest rung (TUNING_SKIP_MARGIN x the base run) would reach the rung limit. Skipping
+    every rung is the limit case of a machine that completes fewer rungs, so it is sound.
+    """
+    if not base_elapsed_s or not rung_timeout_s or base_elapsed_s <= 0:
+        return None
+    if float(base_elapsed_s) * TUNING_SKIP_MARGIN < rung_timeout_s:
+        return None
+    needed = int(float(base_elapsed_s) * TUNING_SKIP_MARGIN) + 1
+    limit = "the module's eva_timeout" if module_timeout else f"the {TRIAL_TIMEOUT_CEILING_S} s rung ceiling"
+    return (
+        f"ladder skipped: the base run took {float(base_elapsed_s):.0f} s, so even the cheapest rung "
+        f"(about {TUNING_SKIP_MARGIN}x the base run) would reach the {int(rung_timeout_s)} s rung limit "
+        f"({limit}); the report is the base run's. To tune anyway, give each rung at least {needed} s "
+        f"(pipeline_make.py params set --module <mod> --eva-timeout {needed}), or make the base run "
+        "faster (fewer harness cases per module)"
+    )
 
 
 def loop_trial_timeout(rung_elapsed_s: float | None) -> int:

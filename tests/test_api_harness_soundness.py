@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 SPARE = ah.spare_bytes(64)
 
 # QCBOR's slices: struct q_useful_buf_c { const void *ptr; size_t len; } and its writable twin.
-UBC = {
+UBC: dict[str, Any] = {
     "what": "struct",
     "size": 16,
     "align": 8,
@@ -122,12 +122,12 @@ def test_nested_fields_scalars_and_lone_pointers():
 # --- A2: contexts initialized first ------------------------------------------------------------------
 
 
-DECODE_INIT = {
+DECODE_INIT: dict[str, Any] = {
     "name": "QCBORDecode_Init",
     "signature": "void(struct _QCBORDecodeContext *,struct q_useful_buf_c,enum __anonenum_QCBORDecodeMode_7)",
     "formals": _formals("pointer", "value", "value"),
 }
-GET_INT = {
+GET_INT: dict[str, Any] = {
     "name": "QCBORDecode_GetInt64",
     "signature": "void(struct _QCBORDecodeContext *,long *)",
     "formals": _formals("pointer", "pointer"),
@@ -141,7 +141,7 @@ def _init_api(traces: list[list[dict]] | None = None) -> ah.ApiInfo:
         "signature": "void(struct _QCBORDecodeContext *)",
         "formals": _formals("pointer"),
     }
-    funcs = {
+    funcs: dict[str, dict] = {
         "a#QCBORDecode_Init": DECODE_INIT,
         "a#QCBORDecode_InitWithMemPool": other,
         "a#QCBORDecode_GetInt64": GET_INT,
@@ -183,7 +183,7 @@ def test_traces_choose_the_initializer_and_types_without_one_stay_zeroed():
 
 
 def test_initializer_candidates_need_a_writable_struct_first_parameter_and_a_callable_symbol():
-    funcs = {
+    funcs: dict[str, dict] = {
         "h#Foo_Init": {
             "name": "Foo_Init",
             "signature": "void(struct foo *)",
@@ -215,7 +215,7 @@ def test_enum_after_a_char_pointer_is_not_a_length():
     assert sh.is_length(sh.classify_type("size_t")) and sh.is_length(sh.classify_type("unsigned int"), "flags")
     assert sh.is_length(sh.classify_type("int"), "nBytes") and sh.is_length(sh.classify_type("int"), None)
     assert not sh.is_length(sh.classify_type("int"), "flags")
-    rec = {
+    rec: dict[str, Any] = {
         "signature": "void(struct _QCBORDecodeContext *,char *,enum QCBORDecodeTagReq,struct q_useful_buf)",
         "formals": _formals("pointer", "const_pointer", "value", "value", names=("pMe", "szLabel", "uTagReq")),
     }
@@ -305,7 +305,7 @@ def test_seeds_take_the_initializers_arguments_from_the_trace():
 
 
 def test_sequence_initializer_gets_slices_by_the_same_rules():
-    records = {"QCBORDecode_Init": DECODE_INIT, "QCBORDecode_GetInt64": GET_INT}
+    records: dict[str, dict] = {"QCBORDecode_Init": DECODE_INIT, "QCBORDecode_GetInt64": GET_INT}
     trace = [
         {"fn": "QCBORDecode_Init", "args": {}, "addrs": {"0": "100"}},
         {"fn": "QCBORDecode_GetInt64", "args": {}, "addrs": {"0": "100", "1": "300"}},

@@ -6,6 +6,7 @@ import copy
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -185,7 +186,7 @@ def test_harness_sources_keep_to_the_unit_when_a_lexer_module_spans_programs(tmp
     (tmp_path / "harnesses").mkdir()
     progs = ("contrib/tools/pngfix.c", "contrib/libtests/pngvalid.c")
     lib = ["png.c", "pngrutil.c"]
-    dag = {
+    dag: dict[str, Any] = {
         "module_kind": "link_unit",
         "functions": {
             f"{p}#main": {"name": "main", "module": Path(p).stem, "lexer_module": "contrib", "file": p} for p in progs
