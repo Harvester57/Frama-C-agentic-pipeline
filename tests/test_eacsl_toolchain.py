@@ -65,6 +65,37 @@ def test_flag_sets_keep_preprocessor_flags_on_frontend_only(tmp_path):
     assert "-g" not in back and "-std=gnu99" in back
 
 
+def test_flag_sets_route_glibc_fp_classification_away_from_gcc_builtins(tmp_path):
+    # QCBOR run-4: glibc expanded isnan to __builtin_isnan, Frama-C printed a K&R prototype for it,
+    # and clang refused the instrumented file ("cannot redeclare builtin function").
+    stubs = tmp_path / "fc_stubs"
+    (stubs / T.EACSL_STUBS_SUBDIR).mkdir(parents=True)
+    flags = T.build_eacsl_flag_sets("-Isrc -I/other", fc_stubs=stubs)
+    front, back = flags["frontend"].split(), flags["backend"].split()
+    assert "-D__SUPPORT_SNAN__" in front and "-D__SUPPORT_SNAN__" not in back
+    shim = f"-I{stubs.as_posix()}/{T.EACSL_STUBS_SUBDIR}"
+    assert front.index(shim) < front.index(f"-I{stubs.as_posix()}") < front.index("-Isrc")
+    assert not any(t.startswith("-I") for t in back)
+    # No shim directory (an older template tree): nothing to point at.
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert "/eacsl" not in T.build_eacsl_flag_sets("-Isrc", fc_stubs=bare)["frontend"]
+
+
+def test_eacsl_math_shim_maps_type_generic_dispatch_and_signbit_for_eacsl_only():
+    shim = REPO / "templates" / "fc_stubs" / T.EACSL_STUBS_SUBDIR / "math.h"
+    text = shim.read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith(("*", "/*")))
+    assert code.lstrip().startswith("#include_next <math.h>")
+    guarded = code.split("#if defined(__FRAMAC_EACSL__) && defined(__GLIBC__)", 1)[1]
+    # _Generic over float / long double / default only: Frama-C sees _Float32 as float and the
+    # frontend maps _Float128 to double, so glibc's own selection has duplicate types.
+    assert "#define __MATH_TG(TG_ARG, FUNC, ARGS) _Generic((TG_ARG), float: FUNC##f ARGS" in guarded
+    assert "_Float" not in guarded and "?" not in guarded
+    assert "#define signbit(x) __MATH_TG((x), __signbit, (x))" in guarded
+    assert "__builtin" not in guarded and "{" not in code  # macros only (fc_stubs README rule 1)
+
+
 def test_flag_sets_reject_paths_with_spaces(tmp_path):
     with pytest.raises(T.UnsafePassthroughError):
         T.build_eacsl_flag_sets("-I '/my src'", fc_stubs=None)

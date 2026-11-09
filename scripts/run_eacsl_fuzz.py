@@ -11,9 +11,12 @@ Modes:
    boundary tokens (scripts/fuzz_dictionary.py) become workspace/dicts/<module>.dict, passed as
    `-dict=`; the report's `dictionary` records `{path, auto, entries}` or why there is none.
    A campaign keeps going after a crash (unless `--stop-on-first-crash`): a `dispatch` harness
-   reruns for the time left with the crashed cases skipped (-DFRAMAC_FUZZ_SKIP_CASES=<mask>),
-   any other harness runs in libFuzzer fork mode with `-ignore_crashes=1`; `keep_going` in the
-   report records the rounds, and duplicates of one fingerprint are listed at most 3 times.
+   reruns for the time left with the crashed cases skipped (-DFRAMAC_FUZZ_SKIP_CASES=<mask> for
+   cases 0..63, -DFRAMAC_FUZZ_SKIP_CASES_<k> for 64k..64k+63), any other harness runs in libFuzzer
+   fork mode with `-ignore_crashes=1`. When a round's new crashes cannot be skipped (a harness
+   generated before every case was skippable, or a failed rebuild), the round records why and the
+   time left goes to fork mode. `keep_going` in the report records the rounds, and duplicates of
+   one fingerprint are listed at most 3 times.
 2. `guardrail`: the dynamic anti-hallucination oracle used inside `/framac-wp`.
    Replays the module corpus (plus a short mutation burst) against a binary compiled with
    the proposed ACSL contract. Outcomes:
@@ -39,6 +42,8 @@ Modes:
 7. `coverage`: measures which target functions and code regions a module's corpus executes, by
    replaying it on a plain Clang source-coverage build (no E-ACSL, no sanitizers). Outcomes:
    ok | partial | no_inputs | compile_error | coverage_error. Reach only: never proof or a verdict.
+   The replay goes on past failing inputs until `--max-time`; inputs whose sha256 matches a file
+   under `--known-crashes-dir` (default workspace/crashes/<module>) replay last (`known_crash`).
 
 All fuzzer, replay and guardrail executions run through scripts/sandbox_exec.py. The shared
 corpus is never written by the guardrail: new units go to a scratch corpus directory.
@@ -113,7 +118,7 @@ from framac_common import (  # noqa: E402
     scan_undeclared_functions,
     utc_now,
 )
-from generate_harness import DISPATCH_SKIP_MACRO, TARGET_EMBEDDED_PREFIX  # noqa: E402
+from generate_harness import DISPATCH_SKIP_ALL_MARKER, DISPATCH_SKIP_MACRO, TARGET_EMBEDDED_PREFIX  # noqa: E402
 from resources import (  # noqa: E402
     CLASSES,
     FUZZ_RSS_LIMIT_MB,
@@ -129,7 +134,9 @@ FUZZ_MIN_MEMORY_MB = FUZZ_WORKER_OVERHEAD_MB + int(FUZZ_RSS_LIMIT_MB * 1.25)
 
 # `coverage` mode. Time limits only cut a replay short, and the report then says `partial`.
 COVERAGE_BATCH_SIZE = 256
-COVERAGE_MAX_FAILED_INPUTS = 16
+# Failing inputs never end the replay (only COVERAGE_MAX_TIME_S does); this many are listed in
+# `failed_inputs` with their log tail, the rest only counted. Fixed, never derived from the machine.
+COVERAGE_LISTED_FAILED_INPUTS = 16
 COVERAGE_MAX_TIME_S = 1200
 COVERAGE_TOOL_TIMEOUT_S = 300
 COVERAGE_MAX_UNCOVERED_RANGES = 32
@@ -1290,6 +1297,33 @@ def dispatch_case_count(sources: list[str]) -> int | None:
     return None
 
 
+def dispatch_skippable_cases(sources: list[str], n_cases: int) -> int:
+    """
+    How many of a dispatch harness's `n_cases` (cases 0..result-1) a build can skip: all of them for
+    a harness whose guard carries DISPATCH_SKIP_ALL_MARKER, cases 0..63 for one generated before.
+    """
+    for src in sources:
+        try:
+            text = Path(src).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if DISPATCH_SKIP_MACRO in text and _DISPATCH_SWITCH_RE.search(text):
+            return n_cases if DISPATCH_SKIP_ALL_MARKER in text else min(n_cases, 64)
+    return min(n_cases, 64)
+
+
+def dispatch_skip_cppflags(mask: int) -> str:
+    """The -D flags that skip the cases set in `mask`: word 0 always, word k (cases 64k..) when not 0."""
+    flags = [f"-D{DISPATCH_SKIP_MACRO}={mask & (2**64 - 1):#x}ULL"]
+    k = 1
+    while mask >> (64 * k):
+        word = (mask >> (64 * k)) & (2**64 - 1)
+        if word:
+            flags.append(f"-D{DISPATCH_SKIP_MACRO}_{k}={word:#x}ULL")
+        k += 1
+    return " ".join(flags)
+
+
 def artifact_dispatch_case(artifact: dict, n_cases: int) -> int | None:
     """The dispatch case an artifact's input selects (its first byte modulo `n_cases`), or None if empty."""
     try:
@@ -1308,6 +1342,7 @@ def run_campaign_rounds(
     rebuild,
     n_cases: int | None,
     keep_going: bool = True,
+    skippable: int | None = None,
 ) -> dict:
     """
     A campaign that keeps going after a crash, within `max_time` seconds of fuzzing in all.
@@ -1319,7 +1354,10 @@ def run_campaign_rounds(
     - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
       the next round on, so a shallow bug stops ending every run and the other cases get the rest of
       the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
-      MIN_ROUND_WALL_S seconds are left, or a rebuild fails.
+      MIN_ROUND_WALL_S seconds are left, a round's new crashing cases cannot be skipped
+      (`unskippable_case`: cases `skippable` and above, for a harness generated before every case
+      was skippable), or a rebuild fails. In the last two, the time left runs in fork mode with
+      crashes ignored on the last binary built (`fork_fallback`).
     - Any other harness runs once in fork mode with crashes ignored.
     - Without `keep_going`, one campaign that stops at the first crash, as before.
     """
@@ -1329,12 +1367,14 @@ def run_campaign_rounds(
         res = campaign(binary, max_time, True)
         res["keep_going"] = {"mode": "fork"}
         return res
+    skippable = n_cases if skippable is None else min(skippable, n_cases)
 
     skipped: set[int] = set()
     rounds: list[dict] = []
     collected: list[dict] = []
     spent = 0.0
     last: dict = {}
+    fallback_reason: str | None = None
     while True:
         budget = max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))
         started = time.monotonic()
@@ -1360,11 +1400,16 @@ def run_campaign_rounds(
             "crashed_cases": crashed,
         }
         rounds.append(rnd)
-        new = [c for c in crashed if c not in skipped and c < 64]
-        if last.get("status") == "insufficient_memory" or not new:
+        fresh = [c for c in crashed if c not in skipped]
+        new = [c for c in fresh if c < skippable]
+        if last.get("status") == "insufficient_memory" or not fresh:
             break
         if max_time - spent < MIN_ROUND_WALL_S:
             rnd["stopped"] = "time_budget_spent"
+            break
+        if not new:
+            rnd["stopped"] = fallback_reason = "unskippable_case"
+            rnd["unskippable_cases"] = fresh
             break
         skipped.update(new)
         if len(skipped) >= n_cases:
@@ -1374,10 +1419,28 @@ def run_campaign_rounds(
         next_binary, build = rebuild(mask)
         if next_binary is None:
             comp = (build or {}).get("compile") or {}
-            rnd["stopped"] = "rebuild_failed"
+            rnd["stopped"] = fallback_reason = "rebuild_failed"
             rnd["rebuild_log_tail"] = str(comp.get("log_tail") or comp.get("stderr") or "")[-2000:]
             break
         binary = next_binary
+
+    fallback: dict | None = None
+    left = int(max_time - spent)
+    if fallback_reason and left >= MIN_ROUND_WALL_S:
+        # The cases still crashing cannot be skipped: the time left goes to fork mode, which keeps
+        # fuzzing past each crash, on the last binary built (its skipped cases stay skipped).
+        started = time.monotonic()
+        last = campaign(binary, left, True)
+        spent += time.monotonic() - started
+        arts = last.get("artifacts") or []
+        collected.extend(arts)
+        fallback = {
+            "reason": fallback_reason,
+            "max_time": left,
+            "status": last.get("status"),
+            "returncode": last.get("returncode"),
+            "artifacts": len(arts),
+        }
 
     seen: set[str] = set()
     unique = []
@@ -1398,10 +1461,13 @@ def run_campaign_rounds(
     out["keep_going"] = {
         "mode": "dispatch_rounds",
         "dispatch_cases": n_cases,
+        "skippable_cases": skippable,
         "skipped_cases": sorted(skipped),
         "fuzz_seconds": round(spent, 1),
         "rounds": rounds,
     }
+    if fallback is not None:
+        out["keep_going"]["fork_fallback"] = fallback
     return out
 
 
@@ -3465,22 +3531,45 @@ def replay_for_coverage(
     per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
     max_time: int = COVERAGE_MAX_TIME_S,
     batch_size: int = COVERAGE_BATCH_SIZE,
-    max_failed: int = COVERAGE_MAX_FAILED_INPUTS,
+    listed_failed: int = COVERAGE_LISTED_FAILED_INPUTS,
+    last_inputs: list[Path] | None = None,
 ) -> dict:
     """
     Replay each input once on a coverage build, in batches. A process that dies writes no profile,
-    so a failed batch is split until the failing inputs stand alone and only they lose their
-    coverage. Stops early after `max_failed` failures or `max_time` seconds; the rest is reported
-    as not replayed.
+    so the failing input is taken out of its batch and the rest of the batch runs again: libFuzzer
+    prints `Running: <input>` before each input and `Executed <input>` after, so the input it was
+    running when it died is known, and one rerun per failure suffices. When the output does not name
+    it, the batch is split in two until the failing input stands alone. Failures never end the
+    replay; only `max_time` does, and what is left is reported as not replayed. The first
+    `listed_failed` failures are listed with their log tail, the rest only counted (`failed`).
+    `last_inputs` (inputs expected to fail) replay after every other input, in batches of their own.
     """
     seed = derive_seed(binary, module)
-    pending = deque(inputs[i : i + batch_size] for i in range(0, len(inputs), batch_size))
+    pending = deque(
+        group[i : i + batch_size] for group in (inputs, last_inputs or []) for i in range(0, len(group), batch_size)
+    )
     deadline = time.monotonic() + max_time
     min_wall = 2 * int(per_input_timeout) + 10
     replayed = 0
     failed: list[dict] = []
+    n_failed = 0
     batch_no = 0
-    while pending and len(failed) < max_failed:
+
+    def _fail(path: Path, res) -> None:
+        nonlocal n_failed
+        n_failed += 1
+        if len(failed) < listed_failed:
+            failed.append(
+                {
+                    "input": path.as_posix(),
+                    "sha256": sha256_file(path),
+                    "returncode": res.returncode,
+                    "timed_out": res.timed_out,
+                    "log_tail": (res.stdout + "\n" + res.stderr)[-1000:],
+                }
+            )
+
+    while pending:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -3505,26 +3594,48 @@ def replay_for_coverage(
             replayed += len(batch)
             continue
         shutil.rmtree(batch_dir, ignore_errors=True)
-        if len(batch) > 1:
-            middle = len(batch) // 2
-            pending.appendleft(batch[middle:])
-            pending.appendleft(batch[:middle])
-        else:
-            failed.append(
-                {
-                    "input": batch[0].as_posix(),
-                    "sha256": sha256_file(batch[0]),
-                    "returncode": res.returncode,
-                    "timed_out": res.timed_out,
-                    "log_tail": (res.stdout + "\n" + res.stderr)[-1000:],
-                }
-            )
+        if len(batch) == 1:
+            _fail(batch[0], res)
+            continue
+        culprit = _input_running_at_exit(res.stdout + "\n" + res.stderr, batch)
+        if culprit is not None:
+            _fail(batch[culprit], res)
+            rest = batch[:culprit] + batch[culprit + 1 :]
+            if rest:
+                pending.appendleft(rest)
+            continue
+        middle = len(batch) // 2
+        pending.appendleft(batch[middle:])
+        pending.appendleft(batch[:middle])
     return {
         "seed": seed,
         "replayed": replayed,
         "failed_inputs": failed,
+        "failed": n_failed,
         "not_replayed": sum(len(b) for b in pending),
     }
+
+
+_RUNNING_RE = re.compile(r"^(?:Running: (?P<run>.+?)|Executed (?P<done>.+?) in \d+ ms)\s*$", re.MULTILINE)
+
+
+def _input_running_at_exit(output: str, batch: list[Path]) -> int | None:
+    """
+    The index in `batch` of the input libFuzzer was running when its process ended (its last
+    `Running: <input>` line has no `Executed <input>` after it), or None when the output does not say.
+    """
+    last_running: str | None = None
+    for m in _RUNNING_RE.finditer(output or ""):
+        if m.group("run") is not None:
+            last_running = m.group("run")
+        elif m.group("done") == last_running:
+            last_running = None
+    if last_running is None:
+        return None
+    for i, path in enumerate(batch):
+        if str(Path(path).resolve()) == last_running:
+            return i
+    return None
 
 
 COVERAGE_TRUNCATED_MAPPING = "truncated coverage data"
@@ -3744,13 +3855,25 @@ def coverage_report(
     per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
     max_time: int = COVERAGE_MAX_TIME_S,
     use_cache: bool = True,
+    known_crash_dirs: list[Path] | None = None,
 ) -> dict:
     """
     Which target functions and regions the corpus executes. `partial` means some inputs failed or
     were not replayed, so reached counts are lower bounds. The report says what the corpus reached;
     it decides no verdict and nothing in the ledger reads it.
+
+    Corpus directories replay in the order given. An input whose content is a file under
+    `known_crash_dirs` (the campaign's crash artifacts) replays last, in batches of its own, so
+    inputs that crash the fuzz binary cannot use up the time of the rest (`inputs.known_crash`
+    counts them). They still replay: a crash an E-ACSL or sanitizer check caught can run to the end
+    on the plain coverage build and add coverage.
     """
     files, _missing = _collect_inputs(corpus_dirs)
+    known = _known_crash_digests(known_crash_dirs or [])
+    known_files = [f for f in files if known and sha256_file(f) in known]
+    if known_files:
+        known_set = set(known_files)
+        files = [f for f in files if f not in known_set]
     report: dict = {
         "mode": "coverage",
         "module": module,
@@ -3761,9 +3884,17 @@ def coverage_report(
         "corpus_dirs": [Path(d).as_posix() for d in corpus_dirs],
         "per_input_timeout": per_input_timeout,
         "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
-        "inputs": {"total": len(files), "replayed": 0, "failed": 0, "not_replayed": len(files)},
+        "inputs": {
+            "total": len(files) + len(known_files),
+            "replayed": 0,
+            "failed": 0,
+            "not_replayed": len(files) + len(known_files),
+            "known_crash": len(known_files),
+        },
     }
-    if not files:
+    if known_crash_dirs:
+        report["known_crash_dirs"] = [Path(d).as_posix() for d in known_crash_dirs]
+    if not files and not known_files:
         report.update(status="no_inputs", reason="the corpus has no inputs: nothing was measured")
         return report
     pre_included: list[str] = []
@@ -3789,14 +3920,18 @@ def coverage_report(
             module=module,
             per_input_timeout=per_input_timeout,
             max_time=max_time,
+            last_inputs=known_files,
         )
         report["seed"] = replay["seed"]
         report["failed_inputs"] = replay["failed_inputs"]
+        # `failed_inputs` lists the first failures only; the counts below are complete.
+        report["failed_inputs_unlisted"] = replay["failed"] - len(replay["failed_inputs"])
         report["inputs"] = {
-            "total": len(files),
+            "total": len(files) + len(known_files),
             "replayed": replay["replayed"],
-            "failed": len(replay["failed_inputs"]),
+            "failed": replay["failed"],
             "not_replayed": replay["not_replayed"],
+            "known_crash": len(known_files),
         }
         if not replay["replayed"]:
             report["reason"] = "no input replayed to completion, so there is no profile"
@@ -3824,8 +3959,22 @@ def coverage_report(
         report["reason"] = "the coverage mapping lists no function of the target"
         return report
     report.update(summary)
-    report["status"] = "partial" if replay["failed_inputs"] or replay["not_replayed"] else "ok"
+    report["status"] = "partial" if replay["failed"] or replay["not_replayed"] else "ok"
     return report
+
+
+def _known_crash_digests(dirs: list[Path]) -> set[str]:
+    """sha256 of every file under `dirs` (crash artifacts: workspace/crashes/<module>/); missing dirs give none."""
+    digests: set[str] = set()
+    for d in dirs:
+        root = Path(d)
+        if not root.is_dir():
+            continue
+        for f in root.rglob("*"):
+            with contextlib.suppress(OSError):
+                if f.is_file():
+                    digests.add(sha256_file(f))
+    return digests
 
 
 def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -> None:
@@ -4068,6 +4217,13 @@ def main(argv: list[str] | None = None) -> int:
         default=COVERAGE_MAX_TIME_S,
         help="Stop replaying after this many seconds; the report is then `partial`",
     )
+    p_cov.add_argument(
+        "--known-crashes-dir",
+        type=Path,
+        nargs="*",
+        default=None,
+        help="Crash artifacts whose inputs replay last (default: workspace/crashes/<module>; none when empty)",
+    )
     p_cov.add_argument("--no-cache", action="store_true", help="Do not read or write the run/shared cache")
     p_cov.add_argument("--out-json", type=Path, required=True)
 
@@ -4253,6 +4409,11 @@ def main(argv: list[str] | None = None) -> int:
                 per_input_timeout=args.per_input_timeout,
                 max_time=args.max_time,
                 use_cache=not args.no_cache,
+                known_crash_dirs=(
+                    [Path("workspace/crashes") / args.module]
+                    if args.known_crashes_dir is None
+                    else args.known_crashes_dir
+                ),
             )
         elif args.mode == "replay":
             prepared = None
@@ -4446,6 +4607,7 @@ def _run_campaign_mode(args) -> dict:
         )
 
         n_cases = dispatch_case_count(args.sources)
+        skippable = dispatch_skippable_cases(args.sources, n_cases) if n_cases is not None else None
 
         def _engine_campaign(engine: str, binary: Path, seconds: int) -> dict:
             attribution = attribution_builder if engine == "eacsl" else None
@@ -4469,7 +4631,7 @@ def _run_campaign_mode(args) -> dict:
                 opts = _build_options(args)
                 # Same engine as the round before, so every round checks the same properties.
                 opts["engine"] = engine
-                opts["cppflags"] = f"{opts['cppflags'] or ''} -D{DISPATCH_SKIP_MACRO}={mask:#x}ULL".strip()
+                opts["cppflags"] = f"{opts['cppflags'] or ''} {dispatch_skip_cppflags(mask)}".strip()
                 rebuilt = build_module_binary(args.sources, args.out_bin, **opts)
                 ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine
                 return (Path(rebuilt["compile"]["binary"]) if ok else None), rebuilt
@@ -4481,6 +4643,7 @@ def _run_campaign_mode(args) -> dict:
                 rebuild=_rebuild,
                 n_cases=n_cases,
                 keep_going=not args.stop_on_first_crash,
+                skippable=skippable,
             )
             for art in out.get("artifacts") or []:
                 art["engine"] = engine

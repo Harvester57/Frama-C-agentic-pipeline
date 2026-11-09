@@ -1,5 +1,5 @@
 {
-  "$comment": "Contract for workspace/reports/harness_reach_dynamic.json, written by scripts/harness_reach.py dynamic (record_dynamic): per harness module, the gate's entry points the fuzz corpus executed (from the coverage report) and those it never did (`gaps`), with the digest of the harness measured. Rows merge across runs; a module whose coverage was missing or unusable gets no row, only its reason under `unmeasured` (dropped once it is measured). harness_reach.py check (apply_dynamic) keeps a gap failing while the harness digest is unchanged.",
+  "$comment": "Contract for workspace/reports/harness_reach_dynamic.json, written by scripts/harness_reach.py dynamic (record_dynamic): per harness module, the gate's entry points the fuzz corpus executed (from the coverage report) and those it never did (`gaps`), with the digest of the harness measured. Rows merge across runs; a module whose coverage was missing or unusable, or left inputs unreplayed (`inputs.not_replayed` > 0), gets no row (an earlier row is dropped), only its reason under `unmeasured` (dropped once it is measured). harness_reach.py check (apply_dynamic) keeps a gap failing while the harness digest is unchanged.",
   "type": "object",
   "properties": {
     "generated_at": {"type": "string", "minLength": 1},
@@ -18,6 +18,7 @@
           "entry_points_executed": {"type": "integer", "minimum": 0},
           "executions": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
           "gaps": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "failed_inputs": {"$comment": "inputs that crashed the coverage replay when every input was replayed (inputs.failed); the reach stands", "type": "integer", "minimum": 1},
           "passed": {"type": "boolean"},
           "harness_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
         },

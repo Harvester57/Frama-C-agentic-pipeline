@@ -58,6 +58,64 @@ def test_dispatch_harness_can_skip_cases_at_compile_time(tmp_path):
             assert proc.returncode == 0, proc.stderr
 
 
+def _harness_n(tmp_path: Path, n: int) -> Path:
+    cases = [f"sink = {i};" for i in range(n)]
+    _, fuzz = _build_invocations("f", "dispatch", dispatch_cases=cases)
+    path = tmp_path / f"harness_{n}.c"
+    path.write_text(
+        "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\nstatic int sink = -1;\n"
+        f"static int run(uint8_t *fuzz_buf, size_t fuzz_len) {{\n    sink = -1;\n    {fuzz}\n    return sink;\n}}\n"
+        "int main(void) {\n    for (int b = 0; b < 256; b++) {\n"
+        '        uint8_t in[2] = {(uint8_t)b, 0};\n        printf("%d %d\\n", b, run(in, 2));\n    }\n'
+        "    return 0;\n}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_every_case_of_a_large_dispatch_harness_is_skippable(tmp_path):
+    # QCBOR run-4: 115 of 179 cases could never be skipped, so the rounds ended with time left.
+    harness = _harness_n(tmp_path, 179)
+    text = harness.read_text(encoding="utf-8")
+    assert R.dispatch_case_count([str(harness)]) == 179
+    assert R.dispatch_skippable_cases([str(harness)], 179) == 179
+    assert f"#define {DISPATCH_SKIP_MACRO}_2 0ULL" in text and f"{DISPATCH_SKIP_MACRO}_3" not in text
+    skip = {3, 70, 113, 178}
+    flags = R.dispatch_skip_cppflags(sum(1 << c for c in skip)).split()
+    assert flags == [
+        f"-D{DISPATCH_SKIP_MACRO}=0x8ULL",
+        f"-D{DISPATCH_SKIP_MACRO}_1={(1 << (70 - 64)) | (1 << (113 - 64)):#x}ULL",
+        f"-D{DISPATCH_SKIP_MACRO}_2={1 << (178 - 128):#x}ULL",
+    ]
+    # Word 0 is always given, so a build skipping only cases >= 64 still defines the macro.
+    assert R.dispatch_skip_cppflags(1 << 100).split()[0] == f"-D{DISPATCH_SKIP_MACRO}=0x0ULL"
+
+    clang = shutil.which("clang")
+    if not clang:
+        return
+    exe = tmp_path / "h.exe"
+    proc = subprocess.run(
+        [clang, "-Wall", "-Werror", *flags, str(harness), "-o", str(exe)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.split("\n")
+    ran = {int(b): int(r) for b, r in (line.split() for line in out if line)}
+    for b, r in ran.items():
+        assert r == (-1 if b % 179 in skip else b % 179), b
+
+
+def test_a_harness_generated_before_every_case_was_skippable_skips_cases_below_64_only(tmp_path):
+    old = tmp_path / "old.c"
+    old.write_text(
+        f"#ifdef {DISPATCH_SKIP_MACRO}\n    if ((harness_selector % 179U) >= 64U || 1)\n#endif\n"
+        "    switch (harness_selector % 179U) {}\n",
+        encoding="utf-8",
+    )
+    assert R.dispatch_case_count([str(old)]) == 179
+    assert R.dispatch_skippable_cases([str(old)], 179) == 64
+    assert R.dispatch_skippable_cases([str(_harness(tmp_path))], 3) == 3
+
+
 def test_artifact_case_is_first_byte_modulo_cases(tmp_path):
     a = _art(tmp_path / "crash-a", b"\x07rest", "fp")
     assert R.artifact_dispatch_case(a, 3) == 1
@@ -131,6 +189,46 @@ def test_rounds_stop_when_every_case_is_skipped_or_a_rebuild_fails(tmp_path):
     last = res["keep_going"]["rounds"][-1]
     assert last["stopped"] == "rebuild_failed" and "boom" in last["rebuild_log_tail"]
     assert res["status"] == "crash_found"
+    # The time left after a failed rebuild runs in fork mode on the last binary built.
+    assert res["keep_going"]["fork_fallback"]["reason"] == "rebuild_failed"
+
+
+def test_unskippable_cases_end_the_rounds_with_a_reason_and_the_rest_runs_in_fork_mode(tmp_path):
+    calls: list[tuple[str, int, bool]] = []
+    masks: list[int] = []
+    plan = [
+        [_art(tmp_path / "crash-1", bytes([5]), "a"), _art(tmp_path / "crash-2", bytes([70]), "b")],
+        [_art(tmp_path / "crash-3", bytes([70]), "b"), _art(tmp_path / "crash-4", bytes([113]), "c")],
+        [_art(tmp_path / "crash-5", bytes([150]), "d")],
+    ]
+
+    def campaign(binary, seconds, fork):
+        calls.append((str(binary), seconds, fork))
+        arts = plan[len(calls) - 1]
+        return {"status": "crash_found", "returncode": 1, "artifacts": arts}
+
+    def rebuild(mask):
+        masks.append(mask)
+        return Path(f"bin{len(masks)}"), {"compile": {"returncode": 0}}
+
+    # An old harness: only cases 0..63 of 179 can be skipped.
+    res = R.run_campaign_rounds(Path("bin0"), 600, campaign=campaign, rebuild=rebuild, n_cases=179, skippable=64)
+    kg = res["keep_going"]
+    assert masks == [1 << 5]
+    assert kg["skippable_cases"] == 64
+    assert kg["rounds"][-1]["stopped"] == "unskippable_case"
+    assert kg["rounds"][-1]["unskippable_cases"] == [70, 113]
+    assert calls[-1][0] == "bin1" and calls[-1][2] is True
+    assert kg["fork_fallback"]["reason"] == "unskippable_case" and kg["fork_fallback"]["artifacts"] == 1
+    assert {a["fingerprint"] for a in res["artifacts"]} == {"a", "b", "c", "d"}
+
+    # A current harness skips cases >= 64 like any other.
+    calls.clear()
+    masks.clear()
+    plan[2] = []
+    res = R.run_campaign_rounds(Path("bin0"), 600, campaign=campaign, rebuild=rebuild, n_cases=179)
+    assert masks == [(1 << 5) | (1 << 70), (1 << 5) | (1 << 70) | (1 << 113)]
+    assert not any(c[2] for c in calls) and "fork_fallback" not in res["keep_going"]
 
 
 def test_rounds_share_one_time_budget(tmp_path, monkeypatch):

@@ -419,12 +419,99 @@ def test_unit_entry_point_exemption_lands_in_a_sub_module_sidecar(tmp_path, monk
 # --- dynamic reach (step I6) ----------------------------------------------------------------
 
 
-def _coverage(run: Path, executions: dict[str, int], status: str = "ok") -> Path:
+def _coverage(run: Path, executions: dict[str, int], status: str = "ok", inputs: dict | None = None) -> Path:
     cdir = run / "workspace" / "reports" / "coverage"
     cdir.mkdir(parents=True, exist_ok=True)
     rows = [{"function": f, "file": "src/api.c", "line": 1, "executions": n} for f, n in executions.items()]
-    (cdir / "api.json").write_text(json.dumps({"status": status, "functions": rows, "inputs": {"replayed": 3}}))
+    doc = {"status": status, "functions": rows, "inputs": inputs or {"replayed": 3}}
+    (cdir / "api.json").write_text(json.dumps(doc))
     return cdir
+
+
+def _dynamic_doc(run: Path) -> dict:
+    return json.loads((run / "workspace/reports/harness_reach_dynamic.json").read_text())
+
+
+def test_partial_coverage_with_unreplayed_inputs_is_unmeasured_and_clears_a_stale_failure(
+    tmp_path, monkeypatch, capsys
+):
+    # QCBOR run-4: the replay stopped after 16 failing inputs, 1,971 of 2,240 never ran, and the gaps of
+    # that lower bound failed the module and blocked wp-queue.
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);")
+    harness_reach.record_exempt(hdir, "api", "rec_print", "debug output")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    # An earlier, complete measurement failed the module.
+    _coverage(run, {"rec_parse": 40, "rec_put": 0})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+    assert phase0_gates.check(run, "api", ("reach",))
+
+    inputs = {"total": 2240, "replayed": 253, "failed": 16, "not_replayed": 1971}
+    _coverage(run, {"rec_parse": 40, "rec_put": 0}, status="partial", inputs=inputs)
+    capsys.readouterr()
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 2
+    [row] = json.loads(capsys.readouterr().out)["modules"]
+    assert row["passed"] is None and row["error"] == "partial coverage: 1971 of 2240 inputs not replayed"
+    assert row["executions"] == {"rec_parse": 40, "rec_print": 0, "rec_put": 0}
+    assert row["gaps_lower_bound"] == ["rec_put"] and "gaps" not in row
+    doc = _dynamic_doc(run)
+    assert doc["modules"] == {} and doc["unmeasured"] == {"api": row["error"]}
+    # The stale dynamic failure is gone: the gate is what the static check says, and `check` agrees.
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+
+
+def test_replayed_corpus_with_failing_inputs_is_a_measurement(tmp_path, monkeypatch):
+    import phase0_gates
+    from validate_artifacts import validate_dynamic_reach
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);")
+    harness_reach.record_exempt(hdir, "api", "rec_print", "debug output")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    inputs = {"total": 20, "replayed": 20, "failed": 4, "not_replayed": 0}
+    _coverage(run, {"rec_parse": 40, "rec_put": 0}, status="partial", inputs=inputs)
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+    doc = _dynamic_doc(run)
+    assert doc["modules"]["api"]["failed_inputs"] == 4 and doc["modules"]["api"]["gaps"] == ["rec_put"]
+    assert validate_dynamic_reach(doc) == [] and "warnings" not in doc
+    assert phase0_gates.check(run, "api", ("reach",))
+    # The corpus later executes everything: the dynamic failure is lifted without a manual reach-gate.
+    _coverage(run, {"rec_parse": 40, "rec_put": 3}, inputs={"total": 25, "replayed": 25, "not_replayed": 0})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    assert "failed_inputs" not in _dynamic_doc(run)["modules"]["api"]
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+
+
+def test_unresolved_prelude_fails_the_static_gate(tmp_path, monkeypatch):
+    # QCBOR run-4: generate_harness wrote harness and sidecar, then raised; the gate passed the harness.
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(
+        run,
+        "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);",
+        reach_exempt={"rec_print": "debug output"},
+        prelude_status="unresolved",
+        prelude_unresolved=["UsefulBufC", "QCBORItem"],
+    )
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1
+    [reason] = phase0_gates.check(run, "api", ("reach",))
+    assert "harness_prelude_unresolved: UsefulBufC, QCBORItem" in reason
+    # A resolved prelude passes.
+    _write_harness(
+        run,
+        "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);",
+        reach_exempt={"rec_print": "debug output"},
+        prelude_status="resolved",
+        prelude_unresolved=[],
+    )
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
 
 
 def test_unexecuted_entry_point_reopens_the_gate_until_the_harness_changes(tmp_path, monkeypatch, capsys):

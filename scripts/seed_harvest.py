@@ -132,6 +132,9 @@ _LEN_SCALARS = {
     "long long",
     "unsigned long long",
 }
+_UNSIGNED_LEN_SCALARS = {"unsigned short", "unsigned int", "unsigned long", "unsigned long long"}
+# A signed integer is a length only when its formal says so: `len`, `size`, `count`, `nBytes`, `n`.
+_LEN_NAME_RE = re.compile(r"[Ll]en|[Ss]ize|[Cc]ount|[Cc]nt|[Bb]ytes|^n(?:[A-Z_0-9]|$)|^num|^N$")
 _CHAR_POINTEES = {"char", "signed char", "unsigned char", "void"}
 _QUALIFIERS_RE = re.compile(r"\b(?:const|volatile|restrict|__restrict|__restrict__)\b")
 _TAG_RE = re.compile(r"^(struct|union|enum)\s+([A-Za-z_]\w*)$")
@@ -206,18 +209,36 @@ def classify_type(t: str) -> dict[str, Any]:
     if m:
         what, tag = m.groups()
         if what == "enum":
-            return {"kind": "int", "ctype": "int"}
+            return {"kind": "int", "ctype": "int", "enum": True}
         if tag.startswith("__anon"):
             return {"kind": "unsupported", "why": f"anonymous {what} by value"}
         return {"kind": "struct", "ctype": f"{what} {tag}", "tag": tag, "what": what}
     return {"kind": "unsupported", "why": f"type {n!r}"}
 
 
-def plan_function(name: str, signature: str, sizes: dict | None = None) -> dict[str, Any]:
+def is_length(p: dict[str, Any], name: str | None = None) -> bool:
+    """
+    Whether a classified parameter can be the length of the byte pointer before it: an unsigned
+    integer (size_t), or a signed one whose formal name says length (or is unknown). Never an enum
+    (QCBOR's `const char *szLabel, enum QCBORDecodeTagReq uTagReq` is a C string and a tag rule).
+    """
+    if p.get("kind") != "int" or p.get("enum"):
+        return False
+    ctype = p.get("ctype")
+    if ctype in _UNSIGNED_LEN_SCALARS:
+        return True
+    return ctype in _LEN_SCALARS and (name is None or bool(_LEN_NAME_RE.search(name)))
+
+
+def plan_function(
+    name: str, signature: str, sizes: dict | None = None, names: list[str | None] | None = None
+) -> dict[str, Any]:
     """
     The recorder plan of one API function: return and parameter types and what to record of each.
     `sizes` is the model's `param_sizes`: a pointer with no length next to it whose callers pass a
     known-size object (a key, a nonce, an array of scalars) is recorded with that many bytes ('a').
+    `names` are the formals' names (the model's `formals`), which decide whether a signed integer
+    after a byte pointer is its length.
     """
     parts = split_signature(signature)
     if parts is None:
@@ -238,7 +259,8 @@ def plan_function(name: str, signature: str, sizes: dict | None = None) -> dict[
             continue
         pointee = p["pointee"]
         nxt = params[i + 1] if i + 1 < len(params) else None
-        if pointee in _CHAR_POINTEES and nxt is not None and nxt.get("ctype") in _LEN_SCALARS:
+        nxt_name = names[i + 1] if names is not None and i + 1 < len(names) else None
+        if pointee in _CHAR_POINTEES and nxt is not None and is_length(nxt, nxt_name):
             p["record"] = "b"  # (buffer, length) pair: the next argument is its length
         elif pointee in ("char", "signed char"):
             p["record"] = "s"
@@ -649,7 +671,9 @@ def plan_recorder(model: dict) -> tuple[list[dict], dict[str, str]]:
         if rec.get("static") or (rec.get("inline") and rec.get("header")):
             skipped[name] = "static or header inline: not a linked symbol"
             continue
-        plan = plan_function(name, str(rec.get("signature") or ""), rec.get("param_sizes"))
+        formals = rec.get("formals") if isinstance(rec.get("formals"), list) else None
+        names = [f.get("name") if isinstance(f, dict) else None for f in formals] if formals is not None else None
+        plan = plan_function(name, str(rec.get("signature") or ""), rec.get("param_sizes"), names)
         if plan["supported"]:
             plans.append(plan)
         else:
@@ -1192,18 +1216,48 @@ def _recorded(args: dict, param: int, kinds: tuple[str, ...]) -> bytes | None:
     return bytes.fromhex(hits[0][1]) if hits else None
 
 
+def _pair_recorded(args: dict, param: int, off: int) -> bytes | None:
+    """The memory of the (pointer, length) pair at byte `off` of a struct argument (the recorder's 'n')."""
+    for kind, o, hexv in args.get(str(param)) or []:
+        if kind == "n" and int(o) == off:
+            return bytes.fromhex(hexv)
+    return None
+
+
+def _slot_value(slot: dict, args: dict) -> bytes | None:
+    """
+    A slot's recorded value. A struct field slot (api_harness.py `_fill_fields`) never takes a recorded
+    pointer: `field` takes the struct's raw bytes at a scalar field, `field_bytes` the memory a pair
+    pointed to, `field_len` that memory's length (clamped to the slot's `max`).
+    """
+    kind, param = slot["kind"], int(slot["param"])
+    if kind == "field":
+        raw = _recorded(args, param, ("t",))
+        off, size = int(slot.get("off") or 0), int(slot.get("size") or 0)
+        return raw[off : off + size] if raw is not None and len(raw) >= off + size else None
+    if kind == "field_bytes":
+        return _pair_recorded(args, param, int(slot.get("off") or 0))
+    if kind == "field_len":
+        data = _pair_recorded(args, param, int(slot.get("off") or 0))
+        if data is None:
+            return None
+        n = min(len(data), int(slot.get("max") or len(data)))
+        return n.to_bytes(int(slot.get("size") or 8), "little")
+    return _recorded(args, param, _LAYOUT_KINDS.get(kind, ()))
+
+
 def layout_seed(layout: dict, call_args: list[dict]) -> bytes | None:
     """
     One seed for an API harness case from the recorded arguments of its calls (one dict per call of
-    the case, in order): the selector byte, each slot's value (fitted to its size; zeros when the
-    call did not record it), then the rest of the input. None when nothing recorded feeds the case,
-    or a slot of unknown size has no recorded value.
+    the case, in order, then one per initializer call of `inits`): the selector byte, each slot's
+    value (fitted to its size; zeros when the call did not record it), then the rest of the input.
+    None when nothing recorded feeds the case, or a slot of unknown size has no recorded value.
     """
     out = bytearray([int(layout["selector"])])
     fed = False
     for slot in layout.get("slots") or []:
         args = call_args[slot["call"]] if slot["call"] < len(call_args) else {}
-        v = _recorded(args, int(slot["param"]), _LAYOUT_KINDS.get(slot["kind"], ()))
+        v = _slot_value(slot, args)
         if v is None:
             if slot.get("size") is None:
                 return None
@@ -1214,15 +1268,48 @@ def layout_seed(layout: dict, call_args: list[dict]) -> bytes | None:
     rest = layout.get("rest")
     if rest:
         args = call_args[rest["call"]] if rest["call"] < len(call_args) else {}
-        v = _recorded(args, int(rest["param"]), ("b", "s", "a"))
+        if "off" in rest:
+            v = _pair_recorded(args, int(rest["param"]), int(rest["off"]))
+        else:
+            v = _recorded(args, int(rest["param"]), ("b", "s", "a"))
         if v is not None:
             out += v
             fed = True
     return bytes(out) if fed else None
 
 
+def _init_args(lay: dict, call_args: list[dict], trace: list[dict] | None, at: list[int]) -> list[dict]:
+    """
+    `call_args` followed by the recorded arguments of each initializer call of the case (`inits`):
+    in a trace, the last call of that initializer before the call it serves, on the same object
+    (its first argument's address); else nothing ({}).
+    """
+    out = list(call_args)
+    for init in lay.get("inits") or []:
+        k = int(init.get("call") or 0)
+        while len(out) <= k:
+            out.append({})
+        target = init.get("for") or {}
+        c = int(target.get("call") or 0)
+        if trace is None or c >= len(at):
+            continue
+        j = at[c]
+        addr = (trace[j].get("addrs") or {}).get(str(target.get("param")))
+        for t in range(j - 1, -1, -1):
+            prev = trace[t]
+            if prev.get("fn") == init.get("fn") and addr and (prev.get("addrs") or {}).get("0") == addr:
+                out[k] = prev.get("args") or {}
+                break
+    return out
+
+
 def layout_seeds(layouts: list[dict], calls: list[dict], traces: list[list[dict]]) -> dict[int, list[bytes]]:
-    """Seeds per selector of an API harness: single cases from recorded calls, sequences from traces."""
+    """
+    Seeds per selector of an API harness: single cases from recorded calls, sequences from traces. A
+    case that initializes an object first takes that initializer's arguments from the trace call that
+    initialized the same object; a recorded call no trace holds pairs with the initializer's recorded
+    calls in turn (their inputs, a CBOR document for a decoder, are what the case decodes).
+    """
     by_fn: dict[str, list[dict]] = {}
     for rec in calls:
         by_fn.setdefault(rec["fn"], []).append(rec)
@@ -1235,6 +1322,7 @@ def layout_seeds(layouts: list[dict], calls: list[dict], traces: list[list[dict]
                 fns = [c.get("fn") for c in trace]
                 for start in range(len(fns)):
                     picked: list[dict] = []
+                    at: list[int] = []
                     k = start
                     for fn in want:
                         while k < len(fns) and fns[k] != fn:
@@ -1242,15 +1330,37 @@ def layout_seeds(layouts: list[dict], calls: list[dict], traces: list[list[dict]
                         if k == len(fns):
                             break
                         picked.append(trace[k].get("args") or {})
+                        at.append(k)
                         k += 1
                     if len(picked) == len(want):
-                        seed = layout_seed(lay, picked)
+                        seed = layout_seed(lay, _init_args(lay, picked, trace, at))
                         if seed is not None:
                             made.append(seed)
                         break
         else:
-            for rec in by_fn.get((lay.get("calls") or [""])[0], []):
-                seed = layout_seed(lay, [rec.get("args") or {}])
+            fn = (lay.get("calls") or [""])[0]
+            inits = list(lay.get("inits") or [])
+            traced: set[str] = set()
+            if inits:
+                for trace in traces:
+                    for j, c in enumerate(trace):
+                        if c.get("fn") != fn:
+                            continue
+                        args = c.get("args") or {}
+                        traced.add(json.dumps(args, sort_keys=True))
+                        seed = layout_seed(lay, _init_args(lay, [args], trace, [j]))
+                        if seed is not None:
+                            made.append(seed)
+            for n, rec in enumerate(by_fn.get(fn, [])):
+                args = rec.get("args") or {}
+                if json.dumps(args, sort_keys=True) in traced:
+                    continue
+                call_args = _init_args(lay, [args], None, [])
+                for init in inits:
+                    pool = by_fn.get(str(init.get("fn")), [])
+                    if pool:
+                        call_args[int(init["call"])] = pool[n % len(pool)].get("args") or {}
+                seed = layout_seed(lay, call_args)
                 if seed is not None:
                     made.append(seed)
         out[int(lay["selector"])] = made

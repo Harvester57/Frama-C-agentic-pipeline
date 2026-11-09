@@ -49,8 +49,11 @@ VALID_ENTRY_STYLES = (
     "argv",
     "dispatch",
 )
-# Compile-time bit mask of dispatch cases a fuzz build skips (run_eacsl_fuzz.py campaign rounds).
+# Compile-time bit mask of dispatch cases a fuzz build skips (run_eacsl_fuzz.py campaign rounds):
+# DISPATCH_SKIP_MACRO holds cases 0..63, DISPATCH_SKIP_MACRO_<k> cases 64k..64k+63. A harness whose
+# guard carries DISPATCH_SKIP_ALL_MARKER reads every word; one generated before it reads cases 0..63 only.
 DISPATCH_SKIP_MACRO = "FRAMAC_FUZZ_SKIP_CASES"
+DISPATCH_SKIP_ALL_MARKER = "every dispatch case skippable"
 _WORKSPACE_PREFIXES = (
     "/framac-run/workspace/work/",
     "/framac-run/workspace/baseline/",
@@ -862,12 +865,23 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
     analysis covers every case. Cases must not `return` (the fuzz side frees its buffer after).
 
     A campaign that already crashed in some cases rebuilds with -DFRAMAC_FUZZ_SKIP_CASES=<bit mask>
-    (bit i skips case i, cases 0..63) so the known crash stops ending every run. Eva never sees it.
+    (bit i skips case i, cases 0..63) and -DFRAMAC_FUZZ_SKIP_CASES_<k>=<mask> for cases 64k..64k+63,
+    so the known crash stops ending every run. A word not given skips nothing. Eva never sees it.
     """
     stmts = [c.strip() for c in cases if c and c.strip()]
     if not stmts:
         raise ValueError("entry_style 'dispatch' requires at least one --dispatch-case")
     n = len(stmts)
+    case = f"(harness_selector % {n}U)"
+    n_words = (n + 63) // 64
+    # The mask word of the selected case: word k for cases 64k..64k+63 (no comma, so the -D values
+    # never pass through a comma-separated option list).
+    word = f"(unsigned long long)({DISPATCH_SKIP_MACRO}_{n_words - 1})" if n_words > 1 else ""
+    for k in range(n_words - 2, -1, -1):
+        name = DISPATCH_SKIP_MACRO if k == 0 else f"{DISPATCH_SKIP_MACRO}_{k}"
+        word = f"({case} < {64 * (k + 1)}U ? (unsigned long long)({name}) : {word})"
+    if n_words == 1:
+        word = f"((unsigned long long)({DISPATCH_SKIP_MACRO}))"
     # Joined with a newline plus 4 spaces under the template's indent, so nested lines carry 4 more.
     lines = [
         "if (fuzz_len > 0) {",
@@ -875,8 +889,16 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
         "    fuzz_buf += 1;",
         "    fuzz_len -= 1;",
         f"#ifdef {DISPATCH_SKIP_MACRO}",
-        f"    if ((harness_selector % {n}U) >= 64U"
-        f" || ((((unsigned long long)({DISPATCH_SKIP_MACRO})) >> (harness_selector % {n}U)) & 1ULL) == 0ULL)",
+        f"    /* {DISPATCH_SKIP_ALL_MARKER}: {DISPATCH_SKIP_MACRO}_<k> holds cases 64k..64k+63 */",
+    ]
+    for k in range(1, n_words):
+        lines += [
+            f"#ifndef {DISPATCH_SKIP_MACRO}_{k}",
+            f"#define {DISPATCH_SKIP_MACRO}_{k} 0ULL",
+            "#endif",
+        ]
+    lines += [
+        f"    if ((({word} >> ({case} & 63U)) & 1ULL) == 0ULL)",
         "#endif",
         f"    switch (harness_selector % {n}U) {{",
     ]

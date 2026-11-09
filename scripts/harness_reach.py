@@ -39,7 +39,12 @@ Subcommands:
           point of the gate that the module's corpus never executed (workspace/reports/coverage)
           reopens the gate for that module (exit 1). The rows go to harness_reach_dynamic.json with
           the harness digest, and `check` keeps such a gap failing until the harness changes or the
-          entry point is exempted; exit 2 when a module has no usable coverage report.
+          entry point is exempted; exit 2 when a module has no usable coverage report, or one with
+          inputs it never replayed (`inputs.not_replayed`: its gaps are only a lower bound). Such a
+          module is listed under `unmeasured`, and a gate an earlier dynamic run failed is re-checked.
+
+A sidecar whose automatic prelude left identifiers unresolved (`prelude_status: unresolved`) fails
+`check` (`harness_prelude_unresolved: <symbols>`): generate_harness.py wrote that harness and then failed.
 
 Exit code 0 when the gate passes, 1 when a module has an unexempted gap, 2 on
 usage/IO problems.
@@ -310,6 +315,18 @@ def _harness_path(sidecar: dict[str, Any], sidecar_path: Path) -> Path:
     return sidecar_path.with_suffix(".c")
 
 
+def _prelude_failure(sidecar: dict[str, Any]) -> str | None:
+    """
+    Why the harness generation failed, or None. generate_harness.py writes the harness and its sidecar
+    before it raises on identifiers the automatic prelude could not resolve (QCBOR run-4): such a harness
+    does not compile, so it fails the gate instead of passing on its names.
+    """
+    if sidecar.get("prelude_status") != "unresolved":
+        return None
+    symbols = [str(s) for s in sidecar.get("prelude_unresolved") or [] if s]
+    return "harness_prelude_unresolved: " + (", ".join(symbols) or "unknown identifiers")
+
+
 def _is_harnessed_tier(tier: Any) -> bool:
     return str(tier or "").startswith(HARNESSED_TIER_PREFIXES)
 
@@ -429,6 +446,9 @@ def run_check(
             continue
         if (mm.unit_of(module) if link_units or tf else module) not in dag_modules:
             results.append({"module": module, "passed": True, "skipped": "module_not_in_dag"})
+            continue
+        if (failed := _prelude_failure(sidecar)) is not None:
+            results.append({"module": module, "tier": mm.tier_of(module), "passed": False, "error": failed})
             continue
         harness_file = _harness_path(sidecar, sidecar_path)
         try:
@@ -576,7 +596,7 @@ def check_dynamic(module: str, dag: dict[str, Any], mm: ModuleMap, coverage: dic
         executed[e] = n
         if not n and match(e) is None:
             never.append(e)
-    return {
+    row: dict[str, Any] = {
         "module": module,
         "mode": "dynamic",
         "coverage_status": coverage.get("status"),
@@ -587,6 +607,32 @@ def check_dynamic(module: str, dag: dict[str, Any], mm: ModuleMap, coverage: dic
         "gaps": never,
         "passed": not never,
     }
+    if failed_inputs := _input_count(coverage, "failed"):
+        # Every input was replayed and only these crashed (crash candidates already): the reach stands.
+        row["failed_inputs"] = failed_inputs
+    return row
+
+
+def _input_count(coverage: dict[str, Any], key: str) -> int:
+    """`inputs.<key>` of a coverage report (total, replayed, failed, not_replayed), 0 when absent."""
+    inputs = coverage.get("inputs")
+    try:
+        return max(0, int((inputs or {}).get(key) or 0)) if isinstance(inputs, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def partial_coverage_reason(coverage: dict[str, Any]) -> str | None:
+    """
+    Why a coverage report cannot decide the dynamic gate, or None. Inputs the replay never ran
+    (`inputs.not_replayed`) make every gap a lower bound (QCBOR run-4: 1,971 of 2,240 inputs not replayed,
+    76 "gaps"), so the module is unmeasured, not failed.
+    """
+    missing = _input_count(coverage, "not_replayed")
+    if not missing:
+        return None
+    total = _input_count(coverage, "total")
+    return f"partial coverage: {missing} of {total or '?'} inputs not replayed"
 
 
 def run_dynamic(dag_path: Path, harness_dir: Path, modules: list[str], coverage_dir: Path) -> dict[str, Any]:
@@ -601,14 +647,26 @@ def run_dynamic(dag_path: Path, harness_dir: Path, modules: list[str], coverage_
             status = cov.get("status") if isinstance(cov, dict) else "missing"
             rows.append({"module": module, "mode": "dynamic", "passed": None, "error": f"no coverage ({status})"})
             continue
-        rows.append(check_dynamic(module, dag, mm, cov))
+        row = check_dynamic(module, dag, mm, cov)
+        if (reason := partial_coverage_reason(cov)) is not None:
+            # Keep what was measured for the reader; the gaps are only a lower bound and decide nothing.
+            row.update(passed=None, error=reason, gaps_lower_bound=row.pop("gaps"))
+        rows.append(row)
     return {"generated_at": utc_now(), "dag": str(dag_path).replace("\\", "/"), "modules": rows}
 
 
-def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path, dag_path: Path | None = None) -> None:
+def record_dynamic(
+    run_dir: Path,
+    report: dict[str, Any],
+    out: Path,
+    dag_path: Path | None = None,
+    harness_dir: Path | None = None,
+) -> None:
     """
     Merge the rows into the dynamic report (with each module's harness digest) and reopen the reach
-    gate of every module with a gap. A module without a gap leaves the gate as the static check left it.
+    gate of every module with a gap. A module without a gap, or unmeasured now, gets the gate the static
+    check gives it: its row from an earlier dynamic run is dropped, and a gate an earlier dynamic run
+    failed is checked again (`_restore_static_gate`).
     """
     from validate_artifacts import schema_warning
 
@@ -627,6 +685,8 @@ def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path, dag_path: P
         for row in report["modules"]:
             if row.get("passed") is None:
                 unmeasured[row["module"]] = str(row.get("error") or "no coverage")
+                # A row an earlier run measured would keep its gaps failing at `check` (apply_dynamic).
+                by_module.pop(row["module"], None)
             else:
                 unmeasured.pop(row["module"], None)
                 by_module[row["module"]] = measured[row["module"]]
@@ -639,8 +699,41 @@ def record_dynamic(run_dir: Path, report: dict[str, Any], out: Path, dag_path: P
         atomic_write_json(out, doc)
     failed = [r for r in report["modules"] if r.get("passed") is False]
     if failed:
-        rows = [{**r, "error": "dynamic: entry points never executed by the corpus"} for r in failed]
+        rows = [{**r, "error": DYNAMIC_GAP_ERROR} for r in failed]
         phase0_gates.record_reach(run_dir, {"modules": rows}, partial=True, dag_path=dag_path)
+    cleared = [str(r["module"]) for r in report["modules"] if r.get("passed") is not False]
+    _restore_static_gate(run_dir, cleared, out, dag_path, harness_dir)
+
+
+DYNAMIC_GAP_ERROR = "dynamic: entry points never executed by the corpus"
+
+
+def _restore_static_gate(
+    run_dir: Path, modules: list[str], dynamic_path: Path, dag_path: Path | None, harness_dir: Path | None
+) -> None:
+    """
+    Re-run the static check for each of `modules` whose reach gate an earlier dynamic run failed: the
+    corpus now executes every entry point, or the new measurement cannot decide (unmeasured), so the
+    old dynamic failure no longer stands. Without this, a module that moved from failed to unmeasured
+    kept the stale failure until someone re-ran `reach-gate` by hand.
+    """
+    reach = phase0_gates.load_gates(run_dir).get("reach")
+    rows = reach.get("modules") if isinstance(reach, dict) else None
+    if not isinstance(rows, dict):
+        return
+    stale = [m for m in modules if str((rows.get(m) or {}).get("error") or "").startswith("dynamic:")]
+    if not stale:
+        return
+    dag_file = Path(dag_path) if dag_path is not None else run_dir / DEFAULT_DAG
+    hdir = Path(harness_dir) if harness_dir is not None else run_dir / DEFAULT_HARNESS_DIR
+    try:
+        report = run_check(dag_file, hdir, stale, run_dir=run_dir)
+        dag = load_json_strict(dag_file)
+    except (ArtifactError, OSError, ValueError):
+        return  # no DAG to check against: the failure stays until `reach-gate` runs
+    report["modules"] = [r for r in report["modules"] if r.get("module") in stale]
+    apply_dynamic(report, dynamic_path, hdir, run_dir, dag=dag if isinstance(dag, dict) else {})
+    phase0_gates.record_reach(run_dir, report, partial=True, dag_path=dag_file)
 
 
 def apply_dynamic(
@@ -676,7 +769,7 @@ def apply_dynamic(
         match = exemption_matcher(exempt, functions)
         gaps = [g for g in d["gaps"] if match(g) is None]
         if gaps:
-            row.update(passed=False, gaps=gaps, error="dynamic: entry points never executed by the corpus")
+            row.update(passed=False, gaps=gaps, error=DYNAMIC_GAP_ERROR)
     report["passed"] = all(r.get("passed") for r in report["modules"])
 
 
@@ -707,7 +800,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "dynamic":
             dyn = run_dynamic(args.dag, args.harness_dir, args.module, args.coverage_dir)
-            record_dynamic(Path("."), dyn, args.out, dag_path=args.dag)
+            record_dynamic(Path("."), dyn, args.out, dag_path=args.dag, harness_dir=args.harness_dir)
             print(json.dumps(dyn, indent=2))
             if any(r.get("passed") is None for r in dyn["modules"]):
                 return 2

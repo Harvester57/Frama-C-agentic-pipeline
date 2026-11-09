@@ -49,6 +49,12 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   sources: each definition shifts the fallback numbering.
 - Host headers can use compiler types Frama-C rejects. The E-ACSL frontend therefore gets
   `-U__SIZEOF_INT128__` (`EACSL_DEFINES`), so `<linux/types.h>` skips its `__int128` typedefs.
+- glibc's `<math.h>` turns `isnan`, `isinf`, `isfinite`, `isnormal`, `fpclassify` and `signbit`
+  into `__builtin_*` calls Frama-C does not know (it prints K&R prototypes that clang then
+  rejects), or into a `__MATH_TG` `_Generic` Frama-C rejects ("multiple compatible types").
+  The E-ACSL frontend therefore gets `-D__SUPPORT_SNAN__` (glibc then uses the library forms)
+  and [`./eacsl/math.h`](./eacsl/math.h), which `#include_next`s glibc's header and redefines
+  `__MATH_TG` and `signbit` under `__FRAMAC_EACSL__`. Eva and WP never see either.
 - [`./errno.h`](./errno.h) maps `errno` to a tracked global under `__FRAMAC_EACSL__` only:
   glibc's thread-local errno is not E-ACSL-tracked memory, so every `errno = ...` would abort the
   runtime. errno values set by the real libc are not visible through it.

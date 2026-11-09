@@ -238,13 +238,60 @@ def test_replay_treats_an_empty_profile_as_a_failed_input(tmp_path, monkeypatch)
     assert res["failed_inputs"][0]["returncode"] == 0
 
 
-def test_replay_stops_after_too_many_failures_and_reports_the_rest(tmp_path, monkeypatch):
+def test_replay_goes_on_past_any_number_of_failures_and_lists_the_first_few(tmp_path, monkeypatch):
+    # QCBOR run-4: 16 crashing seeds ended the replay with 1,971 of 2,240 inputs never replayed.
     monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
-    files = _corpus(tmp_path, *[b"CRASH"] * 8)
-    res, _ = _replay(tmp_path, files, max_failed=2)
-    assert len(res["failed_inputs"]) == 2
-    assert res["replayed"] == 0
-    assert res["not_replayed"] == 6
+    files = _corpus(tmp_path, *[b"CRASH"] * 8, b"ok", b"ok")
+    res, _ = _replay(tmp_path, files, listed_failed=2)
+    assert res["failed"] == 8
+    assert len(res["failed_inputs"]) == 2 and "log_tail" in res["failed_inputs"][0]
+    assert res["replayed"] == 2
+    assert res["not_replayed"] == 0
+
+
+class RunningSandbox(CoverageSandbox):
+    """Like CoverageSandbox, with libFuzzer's `Running:`/`Executed` lines up to the first CRASH."""
+
+    def __call__(self, cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        res = super().__call__(cmd, writable, timeout_s, cwd, limits, extra_env)
+        lines = ["Running 3 inputs 1 time(s) each."]
+        for a in [a for a in cmd[1:] if not a.startswith("-")]:
+            lines.append(f"Running: {a}")
+            if Path(a).read_bytes().startswith(b"CRASH"):
+                lines.append("==1== ERROR: libFuzzer: deadly signal")
+                break
+            lines.append(f"Executed {a} in 1 ms")
+        return SandboxResult(res.returncode, "", "\n".join(lines), res.timed_out, res.sandbox, res.command)
+
+
+def test_replay_takes_out_the_input_running_at_the_crash_and_reruns_the_rest_once(tmp_path, monkeypatch):
+    fake = RunningSandbox()
+    monkeypatch.setattr(R, "run_sandboxed", fake)
+    files = _corpus(tmp_path, b"ok", b"CRASH", b"ok", b"CRASH", b"ok")
+    res, _ = _replay(tmp_path, files)
+    names = [f.name for f in files]
+    # One run per failure, no bisection: the crashing input is named by the output.
+    assert fake.batches == [names, [names[0], *names[2:]], [names[0], names[2], names[4]]]
+    assert [f["input"] for f in res["failed_inputs"]] == [files[1].as_posix(), files[3].as_posix()]
+    assert (res["replayed"], res["failed"], res["not_replayed"]) == (3, 2, 0)
+
+
+def test_input_running_at_exit_needs_a_running_line_without_executed(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    ra, rb = str(a.resolve()), str(b.resolve())
+    assert R._input_running_at_exit(f"Running: {ra}\nExecuted {ra} in 2 ms\nRunning: {rb}\nboom", [a, b]) == 1
+    assert R._input_running_at_exit(f"Running: {ra}\nExecuted {ra} in 2 ms\n", [a, b]) is None
+    assert R._input_running_at_exit("Running 2 inputs 1 time(s) each.\n", [a, b]) is None
+    assert R._input_running_at_exit(f"Running: {tmp_path / 'other'}\n", [a, b]) is None
+
+
+def test_replay_runs_last_inputs_after_the_rest_in_batches_of_their_own(tmp_path, monkeypatch):
+    fake = CoverageSandbox()
+    monkeypatch.setattr(R, "run_sandboxed", fake)
+    files = _corpus(tmp_path, b"ok", b"ok", b"ok")
+    res, _ = _replay(tmp_path, files[:1], batch_size=4, last_inputs=files[1:])
+    assert fake.batches == [[files[0].name], [files[1].name, files[2].name]]
+    assert res["replayed"] == 3
 
 
 def test_replay_stops_at_the_deadline_and_reports_the_rest(tmp_path, monkeypatch):
@@ -319,7 +366,7 @@ def _measured(tmp_path, monkeypatch, *contents, export=None, export_error=None):
 def test_report_ok_has_per_function_records_and_input_counts(tmp_path, monkeypatch):
     report = _measured(tmp_path, monkeypatch, b"a", b"b")
     assert report["status"] == "ok"
-    assert report["inputs"] == {"total": 2, "replayed": 2, "failed": 0, "not_replayed": 0}
+    assert report["inputs"] == {"total": 2, "replayed": 2, "failed": 0, "not_replayed": 0, "known_crash": 0}
     assert report["totals"]["functions"] == {"total": 1, "reached": 1}
     assert report["functions"][0]["function"] == "f"
 
@@ -327,8 +374,27 @@ def test_report_ok_has_per_function_records_and_input_counts(tmp_path, monkeypat
 def test_report_is_partial_when_an_input_failed(tmp_path, monkeypatch):
     report = _measured(tmp_path, monkeypatch, b"a", b"CRASH")
     assert report["status"] == "partial"
-    assert report["inputs"] == {"total": 2, "replayed": 1, "failed": 1, "not_replayed": 0}
+    assert report["inputs"] == {"total": 2, "replayed": 1, "failed": 1, "not_replayed": 0, "known_crash": 0}
+    assert report["failed_inputs_unlisted"] == 0
     assert report["totals"]["functions"]["reached"] == 1
+
+
+def test_report_replays_known_crashes_last_and_counts_them(tmp_path, monkeypatch):
+    crashes = tmp_path / "crashes"
+    crashes.mkdir()
+    (crashes / "crash-0123").write_bytes(b"CRASH seed")
+    fake = CoverageSandbox()
+    _corpus(tmp_path, b"CRASH seed", b"a", b"b")
+    monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
+    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(
+        R, "_export_coverage", lambda *a: (_export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)])), None)
+    )
+    report = _report(tmp_path, known_crash_dirs=[crashes, tmp_path / "missing"])
+    assert fake.batches[0] == ["input-001", "input-002"]
+    assert fake.batches[-1] == ["input-000"]
+    assert report["inputs"] == {"total": 3, "replayed": 2, "failed": 1, "not_replayed": 0, "known_crash": 1}
+    assert report["status"] == "partial"
 
 
 def test_report_without_any_profile_claims_no_coverage(tmp_path, monkeypatch):

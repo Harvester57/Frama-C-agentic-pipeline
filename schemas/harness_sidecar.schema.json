@@ -4,26 +4,45 @@
   "definitions": {
     "strings": {"type": "array", "items": {"type": "string"}},
     "slot": {
-      "$comment": "Input bytes feeding one argument: `call` is the position of the call in the case, `param` its argument index, `size` the bytes read (null: the scalar's size is unknown).",
+      "$comment": "Input bytes feeding one argument: `call` is the position of the call in the case (initializer calls of `inits` come after the case's `calls`), `param` its argument index, `size` the bytes read (null: the scalar's size is unknown). The field kinds fill one field of a struct argument that holds pointers, never a pointer itself: `field` a scalar or pointer-free field at byte `off`, `field_bytes` the storage of the (pointer, length) pair at `off`, `field_len` that pair's length, clamped to `max` bytes.",
       "type": "object",
       "properties": {
         "call": {"type": "integer", "minimum": 0},
         "param": {"type": "integer", "minimum": 0},
         "size": {"type": ["integer", "null"], "minimum": 1},
-        "kind": {"type": "string", "enum": ["int", "struct", "bytes", "pointee"]}
+        "kind": {"type": "string", "enum": ["int", "struct", "bytes", "pointee", "field", "field_bytes", "field_len"]},
+        "off": {"type": "integer", "minimum": 0},
+        "max": {"type": "integer", "minimum": 1}
       },
       "required": ["call", "param", "size", "kind"],
       "additionalProperties": false
     },
     "rest": {
-      "$comment": "The argument that takes the rest of the input, after the slots.",
+      "$comment": "The argument that takes the rest of the input, after the slots; `off`: the byte offset of the (pointer, length) field pair of a struct argument that takes it.",
       "type": "object",
       "properties": {
         "call": {"type": "integer", "minimum": 0},
         "param": {"type": "integer", "minimum": 0},
-        "kind": {"type": "string", "enum": ["bytes", "string"]}
+        "kind": {"type": "string", "enum": ["bytes", "string"]},
+        "off": {"type": "integer", "minimum": 0}
       },
       "required": ["call", "param", "kind"],
+      "additionalProperties": false
+    },
+    "init": {
+      "$comment": "An initializer the case calls first on a struct object of call `for.call`, argument `for.param`; `call` numbers its slots.",
+      "type": "object",
+      "properties": {
+        "fn": {"type": "string", "minLength": 1},
+        "call": {"type": "integer", "minimum": 0},
+        "for": {
+          "type": "object",
+          "properties": {"call": {"type": "integer", "minimum": 0}, "param": {"type": "integer", "minimum": 0}},
+          "required": ["call", "param"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["fn", "call", "for"],
       "additionalProperties": false
     },
     "single_case": {
@@ -34,7 +53,9 @@
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 1},
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
         "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
-        "entry": {"$comment": "the DAG key of the API entry point the case calls", "type": "string", "minLength": 1}
+        "entry": {"$comment": "the DAG key of the API entry point the case calls", "type": "string", "minLength": 1},
+        "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
       },
       "required": ["selector", "kind", "calls", "slots", "rest", "entry"],
       "additionalProperties": false
@@ -46,7 +67,9 @@
         "kind": {"const": "sequence"},
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 2},
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
-        "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]}
+        "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
+        "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
       },
       "required": ["selector", "kind", "calls", "slots", "rest"],
       "additionalProperties": false

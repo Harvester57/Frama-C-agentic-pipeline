@@ -104,7 +104,14 @@ def test_scalars_structs_and_pointers_to_objects():
     assert stmt is not None and layout is not None
     assert "struct cfg c0a1;" in stmt and "struct ctx c0a2;" in stmt and "unsigned long c0a3;" in stmt
     assert "(void)run(c0a0, c0a1, &c0a2, &c0a3, 0);" in stmt
-    assert [(s["param"], s["kind"], s["size"]) for s in layout["slots"]] == [(0, "int", 4), (1, "struct", None)]
+    # Without a layout the struct by value may hold pointers: zeroed, with the reason in the notes.
+    assert [(s["param"], s["kind"], s["size"]) for s in layout["slots"]] == [(0, "int", 4)]
+    assert "struct cfg" in layout["notes"][0] and "zeroed" in layout["notes"][0]
+    # A pointer-free layout reads it from the input, at its known size.
+    api = ah.ApiInfo(structs={"struct cfg": {"what": "struct", "size": 8, "pointers": False, "fields": []}})
+    _, layout, _ = ah.single_case("run", rec, SPARE, api)
+    assert layout is not None
+    assert [(s["param"], s["kind"], s["size"]) for s in layout["slots"]] == [(0, "int", 4), (1, "struct", 8)]
 
 
 @pytest.mark.parametrize(

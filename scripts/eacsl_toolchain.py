@@ -41,7 +41,14 @@ from framac_common import resolve_fc_stubs_dir  # noqa: E402
 
 # Frama-C has no 128-bit integer type, and host headers such as <linux/types.h> declare
 # `__int128` typedefs only when the compiler predefines __SIZEOF_INT128__.
-EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double", "-U__SIZEOF_INT128__")
+# glibc's <math.h> expands isnan, isinf, isfinite, isnormal and fpclassify to GCC builtins unless
+# __SUPPORT_SNAN__ is defined; Frama-C does not know the builtins and prints K&R prototypes for them,
+# which clang refuses ("cannot redeclare builtin function '__builtin_isnan'", QCBOR run-4). With it,
+# glibc calls __isnan, __isinf, __finite, __fpclassify. signbit is mapped by EACSL_STUBS_SUBDIR's math.h.
+EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double", "-U__SIZEOF_INT128__", "-D__SUPPORT_SNAN__")
+# Header shims for the E-ACSL frontend only (templates/fc_stubs/eacsl): first on its include path,
+# never on the Eva/WP path (which gets templates/fc_stubs itself) nor on the backend compile.
+EACSL_STUBS_SUBDIR = "eacsl"
 EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-function-declaration")
 # Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
 # leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full
@@ -141,6 +148,8 @@ def build_eacsl_flag_sets(
     front: list[str] = list(EACSL_DEFINES)
     if stubs is not None:
         stubs_posix = Path(stubs).as_posix()
+        if (Path(stubs) / EACSL_STUBS_SUBDIR).is_dir():
+            front.append(f"-I{stubs_posix}/{EACSL_STUBS_SUBDIR}")
         if f"-I{stubs_posix}" not in joined_user:
             front.append(f"-I{stubs_posix}")
         if "fc_compat_types.h" not in joined_user:
