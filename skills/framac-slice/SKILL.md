@@ -68,7 +68,7 @@ Phase 0 needs the target's own build: what it compiles, links and exports. A tar
    python3 /opt/framac-pipeline/scripts/run_metadata.py set-build --command "<cmd>" [--workdir <dir>] [--package <pkg>]... [--env KEY=VALUE]... [--test-command "<cmd>"] [--install-command "<cmd>"] [--snapshot-extra <abs path>]... [--origin user|agent_confirmed]
    ```
 
-2. **Capture.** Run it in the build image, on the run's scratch volume, sized as `phase-dynamic`. Pass the recipe's packages as target packages, so the wrapper builds the derived build image `framac-build:<repo>`:
+2. **Capture.** Run it in the build image, on the run's scratch volume, sized as `phase-dynamic`. Pass the recipe's packages as target packages, so the wrapper builds the derived build image `framac-build:<repo key>` (the repository name plus a hash of the target path, so two targets with the same folder name never share it):
 
    ```powershell
    & ".\wrappers\framac-docker.ps1" -TargetDir "<target-dir>" -RunDir "<run-dir>" -BuildImage -Scratch `
@@ -167,7 +167,7 @@ Each function's trust belongs to its `file#name`: two same-named statics keep th
   "python3 /opt/framac-pipeline/scripts/codeql_trust.py run && python3 /opt/framac-pipeline/scripts/trust.py run"
 ```
 
-(sh: `--codeql`.) `-CodeQL` runs in `framac-codeql:<repo>`: the target's derived build image plus the CodeQL CLI copied from `framac-codeql:latest`. It is built locally and never pushed. `codeql_trust.py` replays the build recipe under CodeQL's tracer and writes `workspace/reports/codeql_trust.json`. Then `trust.py run` merges its facts.
+(sh: `--codeql`.) `-CodeQL` runs in `framac-codeql:<repo key>`: the target's derived build image plus the CodeQL CLI copied from `framac-codeql:latest`. It is built locally and never pushed. `codeql_trust.py` replays the build recipe under CodeQL's tracer and writes `workspace/reports/codeql_trust.json`. Then `trust.py run` merges its facts.
 
 Consumers of trust:
 - the harness sidecar's `reachability` (`untrusted_surface` at a boundary, else `internal_api`; `reachability_source` records `trust:<rule>`);

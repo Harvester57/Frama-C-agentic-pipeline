@@ -18,6 +18,8 @@
 # to something unique per run (for example <repo>-run-<N>; the wrappers add a hash of the run dir).
 # Both images create /framac-scratch with mode 1777, which a new volume takes on its first mount, so
 # the job user can write it without a manual step.
+# Containers carry the labels framac.repo (FRAMAC_REPO_KEY, default "manual") and framac.run
+# (FRAMAC_RUN_ID), as the wrappers' containers do (there: <repo>-<target path hash>, <run id>-<run dir hash>).
 # Target packages need a derived build image: `docker build --target framac-build --build-arg
 # TARGET_APT_PACKAGES="..." -t framac-build:<repo> .` and FRAMAC_BUILD_IMAGE=framac-build:<repo>.
 # The framac-pipeline service runs the analysis image (stage framac-analysis), which holds no target
@@ -31,6 +33,9 @@ services:
       dockerfile: Dockerfile
       target: framac-analysis
     image: ${FRAMAC_ANALYSIS_IMAGE:-framac-analysis:latest}
+    labels:
+      framac.repo: ${FRAMAC_REPO_KEY:-manual}
+      framac.run: ${FRAMAC_RUN_ID:-run-1}
     user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"
     working_dir: /framac-run
     network_mode: none
@@ -79,6 +84,9 @@ services:
       dockerfile: Dockerfile
       target: framac-build
     image: ${FRAMAC_BUILD_IMAGE:-framac-build:latest}
+    labels:
+      framac.repo: ${FRAMAC_REPO_KEY:-manual}
+      framac.run: ${FRAMAC_RUN_ID:-run-1}
     user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"
     working_dir: /framac-run
     network_mode: none

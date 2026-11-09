@@ -8,7 +8,7 @@
 #
 #   docker build --target framac-build -t framac-build .
 #   docker build -f Dockerfile.codeql -t framac-codeql .
-# For a target with packages, pass its derived build image: --build-arg BUILD_IMAGE=framac-build:<repo>
+# For a target with packages, pass its derived build image: --build-arg BUILD_IMAGE=framac-build:<repo key>
 ARG BUILD_IMAGE=framac-build
 FROM ${BUILD_IMAGE}
 

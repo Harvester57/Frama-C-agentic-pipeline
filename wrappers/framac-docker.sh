@@ -10,18 +10,24 @@
 #
 # --build-image runs the command in the build image (framac-build:latest, Dockerfile stage framac-build:
 # the target's own build and tests, e.g. scripts/build_capture.py); with --target-packages the derived
-# build image framac-build:<repo> is built and used. FRAMAC_DOCKER_IMAGE still overrides the name.
+# build image framac-build:<repo key> is built and used. FRAMAC_DOCKER_IMAGE still overrides the name.
 # Every other command runs in the analysis image (framac-analysis:latest), which holds no target package:
 # the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written by the
 # build capture), so --target-packages only derives the build image. FRAMAC_DOCKER_IMAGE only renames the
 # image: a missing one is built from the matching stage (framac-analysis or framac-build) with --build-if-missing.
 # --codeql runs the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py, plan step
 # I7): framac-codeql:latest (Dockerfile.codeql: the build image plus the pinned CodeQL CLI). With
-# --target-packages, framac-build:<repo> is derived first, then framac-codeql:<repo> from it, copying
+# --target-packages, framac-build:<repo key> is derived first, then framac-codeql:<repo key> from it, copying
 # /opt/codeql out of framac-codeql:latest (wrappers/codeql-derived.Dockerfile, no download); it carries both
 # base image ids as labels and is rebuilt when either changes. Local only: never push or share it.
 # --scratch creates (once) and mounts the run's named volume framac-scratch-<repo>-<run id>-<hash of
 # the run dir> at /framac-scratch (the build capture's scratch tree); --remove-scratch removes it and exits.
+#
+# Run identity: the repo key <repo>-<12 hex of sha256(resolved target path)> tells apart two targets with
+# the same folder name (derived image tags, cache partition); the run tag <run id>-<12 hex of sha256(resolved
+# run dir)> tells apart runs. Both reach the container and the host broker as FRAMAC_REPO_KEY / FRAMAC_RUN_TAG,
+# and label every container (and the scratch volume) as framac.repo / framac.run. --new-run claims run-<N>
+# with a mkdir that fails when the directory exists, so concurrent wrappers never share a run.
 #
 # Mounts: /target (read-only), /framac-run (run dir, read-write, working dir),
 # /opt/framac-pipeline/{scripts,templates,schemas,skills,docs/references} (read-only) and, on the
@@ -195,18 +201,39 @@ REPO="${REPO:-$(basename "${RESOLVED_TARGET}")}"
 if [[ ! "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "[framac-docker] invalid repo name '${REPO}' (use --repo)" >&2; exit 2
 fi
+# First 12 hex digits of the SHA-256 of a string (the scratch volume's run hash, the repo key's target hash).
+short_hash() { printf '%s' "$1" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12; }
+# Repo key: the display name plus a hash of the resolved target path, so two targets with the same folder
+# name never share a derived image tag or a cache partition. A Docker tag holds at most 128 characters:
+# the name part is cut to fit, the hash is kept.
+REPO_KEY="${REPO:0:115}-$(short_hash "${RESOLVED_TARGET}")"
 
 if [[ ${NEW_RUN} -eq 1 ]]; then
     [[ -n "${RUN_DIR}" ]] && { echo "[framac-docker] use --run-dir or --new-run, not both" >&2; exit 2; }
     BASE="${HOME}/framac-pipeline/${REPO}"
     mkdir -p "${BASE}"
+    # new-run allocation: start after the highest run-<N>, claim it with a mkdir that fails when the
+    # directory exists (no -p), and on a lost race try the next number.
     MAX=0
     for d in "${BASE}"/run-*; do
         [[ -d "$d" ]] || continue
         n="${d##*/run-}"
         [[ "$n" =~ ^[0-9]+$ ]] && (( n > MAX )) && MAX=$n
     done
-    RUN_DIR="${BASE}/run-$((MAX + 1))"
+    N=$((MAX + 1))
+    ATTEMPTS=0
+    until mkdir "${BASE}/run-${N}" 2>/dev/null; do
+        if [[ ! -e "${BASE}/run-${N}" ]]; then
+            echo "[framac-docker] cannot create run dir ${BASE}/run-${N}" >&2; exit 2
+        fi
+        ATTEMPTS=$((ATTEMPTS + 1))
+        if (( ATTEMPTS >= 1000 )); then
+            echo "[framac-docker] no free run-<N> under ${BASE} after ${ATTEMPTS} attempts" >&2; exit 2
+        fi
+        N=$((N + 1))
+    done
+    RUN_DIR="${BASE}/run-${N}"
+    # end new-run allocation
 fi
 [[ -z "${RUN_DIR}" ]] && { echo "[framac-docker] specify --run-dir DIR or --new-run" >&2; exit 2; }
 mkdir -p "${RUN_DIR}"
@@ -219,7 +246,11 @@ case "${RESOLVED_RUN}/" in
             exit 2
         fi ;;
 esac
+RUN_ID="$(basename "${RESOLVED_RUN}")"
+RUN_HASH="$(short_hash "${RESOLVED_RUN}")"
+RUN_TAG="${RUN_ID}-${RUN_HASH}"
 echo "[framac-docker] run dir: ${RESOLVED_RUN}" >&2
+echo "[framac-docker] run identity: ${REPO_KEY} / ${RUN_TAG}" >&2
 
 # ---- SELinux: relabel pipeline-owned mounts; the target needs an explicit choice ----
 Z=""
@@ -243,8 +274,7 @@ fi
 # ---- Scratch volume: one named volume per run directory (repo, run id, and a hash of the run path) ----
 SCRATCH_VOLUME=""
 if [[ ${SCRATCH} -eq 1 || ${REMOVE_SCRATCH} -eq 1 ]]; then
-    RUN_HASH="$(printf '%s' "${RESOLVED_RUN}" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)"
-    SCRATCH_VOLUME="framac-scratch-${REPO}-$(basename "${RESOLVED_RUN}")-${RUN_HASH}"
+    SCRATCH_VOLUME="framac-scratch-${REPO}-${RUN_ID}-${RUN_HASH}"
 fi
 if [[ ${REMOVE_SCRATCH} -eq 1 ]]; then
     "${ENGINE}" volume rm -f "${SCRATCH_VOLUME}" >/dev/null
@@ -279,7 +309,7 @@ if [[ -z "$("${ENGINE}" images -q "${IMAGE}" 2>/dev/null)" ]]; then
 fi
 
 if [[ -n "${TARGET_PACKAGES}" ]]; then
-    DERIVED_IMAGE="framac-build:${REPO}"
+    DERIVED_IMAGE="framac-build:${REPO_KEY}"
     echo "[framac-docker] Building derived image ${DERIVED_IMAGE} with target packages: ${TARGET_PACKAGES}" >&2
     "${ENGINE}" build ${IMAGE_TARGET[@]+"${IMAGE_TARGET[@]}"} -t "${DERIVED_IMAGE}" \
         --build-arg "TARGET_APT_PACKAGES=${TARGET_PACKAGES}" "${PIPELINE_ROOT}" >&2
@@ -296,8 +326,8 @@ if [[ ${CODEQL} -eq 1 ]]; then
         "${ENGINE}" build -f "${PIPELINE_ROOT}/Dockerfile.codeql" -t "${CODEQL_SOURCE}" "${PIPELINE_ROOT}" >&2
     fi
     if [[ "${IMAGE}" != "framac-build:latest" ]]; then
-        # A target with packages: framac-codeql:<repo> = its derived build image + /opt/codeql of framac-codeql:latest.
-        CODEQL_IMAGE="framac-codeql:${REPO}"
+        # A target with packages: framac-codeql:<repo key> = its derived build image + /opt/codeql of framac-codeql:latest.
+        CODEQL_IMAGE="framac-codeql:${REPO_KEY}"
         BASE_ID="$("${ENGINE}" image inspect -f '{{.Id}}' "${IMAGE}")"
         SOURCE_ID="$("${ENGINE}" image inspect -f '{{.Id}}' "${CODEQL_SOURCE}")"
         LABELS="$("${ENGINE}" image inspect -f '{{index .Config.Labels "framac.codeql.base"}} {{index .Config.Labels "framac.codeql.source"}}' "${CODEQL_IMAGE}" 2>/dev/null || true)"
@@ -315,7 +345,8 @@ fi
 
 if [[ ${SCRATCH} -eq 1 ]]; then
     if ! "${ENGINE}" volume inspect "${SCRATCH_VOLUME}" >/dev/null 2>&1; then
-        "${ENGINE}" volume create --label framac.scratch=1 "${SCRATCH_VOLUME}" >/dev/null
+        "${ENGINE}" volume create --label framac.scratch=1 --label "framac.repo=${REPO_KEY}" \
+            --label "framac.run=${RUN_TAG}" "${SCRATCH_VOLUME}" >/dev/null
         # No chmod: both images create /framac-scratch with mode 1777, and the engine copies that mode to
         # the new, empty volume on its first mount, so the non-root job user can write it.
     fi
@@ -323,7 +354,6 @@ if [[ ${SCRATCH} -eq 1 ]]; then
 fi
 IMAGE_ID="$( ("${ENGINE}" image inspect -f '{{.Id}}' "${IMAGE}" 2>/dev/null | head -n 1) || true)"
 
-RUN_ID="$(basename "${RESOLVED_RUN}")"
 TARGET_COMMIT="$(git -C "${RESOLVED_TARGET}" rev-parse HEAD 2>/dev/null || true)"
 TARGET_DIRTY=""
 if [[ -n "${TARGET_COMMIT}" ]]; then
@@ -338,11 +368,13 @@ HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privilege
 if [[ "${OUTER_SANDBOX}" == "docker-hardened" ]]; then
     HARDENING+=(--user "$(id -u):$(id -g)")
 fi
+# Run identity labels on every container, on both paths (the broker adds only its own framac.lease label).
+LABEL_ARGS=(--label "framac.repo=${REPO_KEY}" --label "framac.run=${RUN_TAG}")
 ENV_ARGS=(-e PYTHONIOENCODING=utf-8 -e "S=/opt/framac-pipeline/scripts"
           -e "FRAMAC_OUTER_SANDBOX=${OUTER_SANDBOX}"
           -e "FRAMAC_TARGET_HOST=${RESOLVED_TARGET}"
           -e "FRAMAC_REFERENCES_HOST=${PIPELINE_ROOT}/docs/references"
-          -e "FRAMAC_REPO=${REPO}"
+          -e "FRAMAC_REPO=${REPO}" -e "FRAMAC_REPO_KEY=${REPO_KEY}" -e "FRAMAC_RUN_TAG=${RUN_TAG}"
           -e "FRAMAC_RUN_ID=${RUN_ID}" -e "FRAMAC_RUN_HOST=${RESOLVED_RUN}"
           -e "FRAMAC_TARGET_COMMIT=${TARGET_COMMIT}"
           -e "FRAMAC_TARGET_DIRTY=${TARGET_DIRTY}")
@@ -377,7 +409,7 @@ else
 fi
 
 if [[ ${NO_BROKER} -eq 1 ]]; then
-    exec "${ENGINE}" run "${HARDENING[@]}" --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}" \
+    exec "${ENGINE}" run "${HARDENING[@]}" "${LABEL_ARGS[@]}" --cpus "${CPUS}" --memory "${MEMORY}" --pids-limit "${PIDS}" \
         ${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"} "${ENV_ARGS[@]}" -e "FRAMAC_IMAGE_ID=${IMAGE_ID}" \
         "${MOUNT_ARGS[@]}" -w /framac-run "${IMAGE}" "${CMD_STRING}"
 fi
@@ -387,7 +419,9 @@ fi
 # The command string travels in FRAMAC_CONTAINER_CMD and becomes the entry shim's argument.
 export FRAMAC_CONTAINER_CMD="${CMD_STRING}"
 export FRAMAC_IMAGE_ID="${IMAGE_ID}"
-export FRAMAC_REPO="${REPO}"   # partitions the shared cache per repository
+export FRAMAC_REPO="${REPO}"   # display name of the repository
+export FRAMAC_REPO_KEY="${REPO_KEY}"   # partitions the shared cache per target (name + path hash)
+export FRAMAC_RUN_TAG="${RUN_TAG}"
 EXEC_ARGS=(exec --run-dir "${RESOLVED_RUN}")
 [[ -n "${JOB_CLASS}" ]] && EXEC_ARGS+=(--class "${JOB_CLASS}")
 [[ -n "${CPUS}" ]] && EXEC_ARGS+=(--cpus "${CPUS}")
@@ -396,5 +430,5 @@ EXEC_ARGS=(exec --run-dir "${RESOLVED_RUN}")
 [[ -n "${CACHE_DIR}" ]] && EXEC_ARGS+=(--cache-dir "${CACHE_DIR}")
 [[ ${CACHE_RW} -eq 1 ]] && EXEC_ARGS+=(--cache-rw)
 exec "${PYTHON}" "${PIPELINE_ROOT}/scripts/resources.py" "${EXEC_ARGS[@]}" -- \
-    "${ENGINE}" run "${HARDENING[@]}" ${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"} "${ENV_ARGS[@]}" "${MOUNT_ARGS[@]}" \
+    "${ENGINE}" run "${HARDENING[@]}" "${LABEL_ARGS[@]}" ${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"} "${ENV_ARGS[@]}" "${MOUNT_ARGS[@]}" \
     -w /framac-run --entrypoint /bin/bash "${IMAGE}" /opt/framac-pipeline/scripts/container_entry.sh

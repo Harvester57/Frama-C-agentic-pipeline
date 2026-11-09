@@ -26,6 +26,8 @@ Leases (one protocol, two brokers):
 
 Knobs: FRAMAC_POOL_CPUS / FRAMAC_POOL_MEMORY (caps), FRAMAC_RESERVE_CPUS / FRAMAC_RESERVE_MEMORY
 (absolute or N%), FRAMAC_PIN=auto|on|off, FRAMAC_BROKER_DIR, FRAMAC_CACHE_DIR (or 'off'),
+FRAMAC_CACHE_VOLUME=auto|on|off (shared cache in the named volume framac-cache-<repo key> instead of a
+bind mount; auto when the engine runs in a VM or is remote, or the cache dir is on a network fs),
 FRAMAC_ALLOW_UNENFORCED_LIMITS=1, FRAMAC_MAX_AGENTS, FRAMAC_RESOURCES_VERBOSE=1. Containers receive
 FRAMAC_JOB_CPUS/_MEM_MB/_CLASS[/_KEY], FRAMAC_POOL_CPUS/_MEM_MB, FRAMAC_IMAGE_ID, FRAMAC_CACHE_MODE and,
 when the shared store is mounted, FRAMAC_SHARED_CACHE_DIR. Test hooks: FRAMAC_PROBE_ROOT (fake
@@ -2085,8 +2087,21 @@ def _run_dir_conflict(a: dict, b: dict) -> bool:
 
 
 def _queue(entries: list[dict]) -> list[dict]:
+    """
+    Waiting gated tickets in service order: the run (run dir) holding the fewest granted gated
+    leases first, then FIFO. Concurrent runs, of the same target or of different ones, so share
+    the pool instead of one run's burst of tickets holding every other run behind it.
+    """
     waiting = [e for e in entries if e.get("state") == "waiting" and e.get("gated", True)]
-    return sorted(waiting, key=lambda e: (int(e.get("seq") or 0), str(e.get("id"))))
+    held: dict[str | None, int] = {}
+    for e in entries:
+        if e.get("state") == "granted" and e.get("gated", True):
+            rd = _norm_run_dir(e.get("run_dir"))
+            held[rd] = held.get(rd, 0) + 1
+    return sorted(
+        waiting,
+        key=lambda e: (held.get(_norm_run_dir(e.get("run_dir")), 0), int(e.get("seq") or 0), str(e.get("id"))),
+    )
 
 
 def plan_grant(
@@ -2099,8 +2114,9 @@ def plan_grant(
     """
     Grant for ticket `me` now, or None to keep waiting. CPUs are elastic:
     clamp(free // (1 + waiting), min, min(max or pool, max(min, pool // 2))), lowered until the
-    memory (base + per_cpu x cpus, raised by history) fits. Tickets are served FIFO; a later
-    ticket is granted first (backfill) only when the head of the queue still fits afterwards.
+    memory (base + per_cpu x cpus, raised by history) fits. Tickets are served in `_queue` order
+    (the run holding the fewest grants first, then FIFO); a later ticket is granted first
+    (backfill) only when the head of the queue still fits afterwards.
     A `cache_mode='rw'` ticket and a `runs_target_code=True` ticket on the same `run_dir` are
     mutually exclusive.
     """
@@ -3005,11 +3021,14 @@ def build_engine_argv(
     selinux: bool = False,
     command: str | None = None,
     image_id: str | None = None,
+    cache_volume: str | None = None,
 ) -> list[str]:
     """
     `<engine> run <lease flags> <caller's flags...> [command]`. Inserted right after `run`: the
     lease's --name/--label, --init, the CPU/memory/pids limits (each only when the engine can
-    enforce it), the job and pool environment, and the shared cache mount.
+    enforce it), the job and pool environment, and the shared cache mount: the named volume
+    `cache_volume` when given (no SELinux relabel: the engine labels its own volumes), else the
+    host directory `cache_host`.
     """
     if len(engine_argv) < 2 or engine_argv[1] != "run":
         raise ValueError("the engine command line must start with '<engine> run'")
@@ -3041,7 +3060,8 @@ def build_engine_argv(
     env += [("FRAMAC_POOL_CPUS", str(int(pool_cpus))), ("FRAMAC_POOL_MEM_MB", str(int(pool_mem_mb)))]
     if image_id:
         env.append(("FRAMAC_IMAGE_ID", image_id))
-    mounted = cache_mode in ("ro", "rw") and bool(cache_host)
+    source = cache_volume or (str(cache_host) if cache_host else None)
+    mounted = cache_mode in ("ro", "rw") and bool(source)
     env.append(("FRAMAC_CACHE_MODE", cache_mode if mounted else "off"))
     if mounted:
         env.append(("FRAMAC_SHARED_CACHE_DIR", CONTAINER_CACHE_MOUNT))  # read by scripts/cache.py
@@ -3049,9 +3069,9 @@ def build_engine_argv(
         flags += ["-e", f"{name}={value}"]
     if mounted:
         opts = [] if cache_mode == "rw" else ["ro"]
-        if selinux:
+        if selinux and not cache_volume:
             opts.append("z")
-        flags += ["-v", f"{cache_host}:{CONTAINER_CACHE_MOUNT}" + (":" + ",".join(opts) if opts else "")]
+        flags += ["-v", f"{source}:{CONTAINER_CACHE_MOUNT}" + (":" + ",".join(opts) if opts else "")]
     tail = list(engine_argv[2:]) + ([command] if command is not None else [])
     return [engine_argv[0], "run", *flags, *tail]
 
@@ -3089,24 +3109,171 @@ def build_engine_update_argv(
 _REPO_PARTITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-def _cache_plan(cache_dir: str | None, cache_rw: bool, command: str | None) -> tuple[Path | None, str]:
+def cache_partition() -> str | None:
+    """
+    This repository's partition of the shared cache: FRAMAC_REPO_KEY (the wrappers' repo name plus
+    a hash of the target path, so two targets with the same folder name never share a store),
+    else FRAMAC_REPO. A repository's runs only ever read entries its own runs' trusted steps wrote.
+    """
+    repo = (os.environ.get("FRAMAC_REPO_KEY") or os.environ.get("FRAMAC_REPO") or "").strip()
+    if not repo:
+        return None
+    return repo if _REPO_PARTITION_RE.fullmatch(repo) else hashlib.sha256(repo.encode()).hexdigest()[:16]
+
+
+def cache_volume_wanted(
+    eng: EngineInfo | None,
+    host_path: Path | str,
+    *,
+    setting: str | None = None,
+    fstype: str | None = None,
+    windows_remote: bool = False,
+) -> tuple[bool, str]:
+    """
+    Whether the shared cache goes in a named volume instead of a bind mount of `host_path`, and why.
+    FRAMAC_CACHE_VOLUME=on|off forces it; auto (default) picks the volume when a bind mount would be
+    slow or wrong: the engine is remote (the path names a directory on another machine), runs in a
+    VM (Docker Desktop, a Podman machine: bind mounts cross the VM boundary over 9p/virtiofs/gRPC
+    FUSE), or the path is on a network or virtualized filesystem (NFS, CIFS, 9p as for /mnt/c in
+    WSL2, ...). The cache holds many small files, which is where those mounts are slowest.
+    """
+    raw = (setting if setting is not None else os.environ.get("FRAMAC_CACHE_VOLUME") or "auto").strip().lower()
+    if raw in ("on", "1", "yes", "true"):
+        return True, "FRAMAC_CACHE_VOLUME=on"
+    if raw in ("off", "0", "no", "false"):
+        return False, "FRAMAC_CACHE_VOLUME=off"
+    if eng is not None and eng.ok and eng.remote:
+        return True, "the container engine is remote"
+    if eng is not None and eng.ok and eng.vm_backed:
+        return True, f"{eng.kind} runs containers in a VM, so a bind mount crosses the VM boundary"
+    if windows_remote:
+        return True, f"{host_path} is on a network drive"
+    if is_network_fs(fstype):
+        return True, f"{host_path} is on {fstype} (network or virtualized filesystem)"
+    return False, "local disk"
+
+
+def cache_volume_name(partition: str | None) -> str:
+    """`framac-cache-<partition>` (Docker volume names allow [A-Za-z0-9][A-Za-z0-9_.-]*)."""
+    return f"framac-cache-{partition}" if partition else "framac-cache-shared"
+
+
+@dataclass(frozen=True)
+class CachePlan:
+    """Where the shared cache comes from: a host directory (`host`) or a named volume (`volume`)."""
+
+    mode: str  # off | ro | rw
+    host: Path | None = None
+    volume: str | None = None
+    reason: str = ""
+
+    @property
+    def source(self) -> str | None:
+        return self.volume or (str(self.host) if self.host else None)
+
+
+def _cache_plan(
+    cache_dir: str | None,
+    cache_rw: bool,
+    command: str | None,
+    eng: EngineInfo | None = None,
+    volume_setting: str | None = None,
+) -> CachePlan:
     raw = cache_dir if cache_dir is not None else (os.environ.get("FRAMAC_CACHE_DIR") or None)
     mode = cache_mount_mode(command or "", cache_rw, raw)
     if mode == "off":
-        return None, "off"
+        return CachePlan("off")
     path = Path(raw).expanduser() if raw else Path.home() / ".cache" / "framac-pipeline"
-    repo = (os.environ.get("FRAMAC_REPO") or "").strip()
-    if repo:
-        # One store per repository (the wrappers' repo name): a repository's runs only ever read
-        # entries that its own runs' trusted steps wrote.
-        part = repo if _REPO_PARTITION_RE.fullmatch(repo) else hashlib.sha256(repo.encode()).hexdigest()[:16]
+    part = cache_partition()
+    if part:
         path = path / "repos" / part
+    probe_path = path
+    while not probe_path.exists() and probe_path.parent != probe_path:  # fs type of the nearest existing ancestor
+        probe_path = probe_path.parent
+    want, reason = cache_volume_wanted(
+        eng,
+        path,
+        setting=volume_setting,
+        fstype=None if os.name == "nt" else fs_type(probe_path),
+        windows_remote=os.name == "nt" and _windows_remote_path(path),
+    )
+    if want:
+        return CachePlan(mode, volume=cache_volume_name(part), reason=reason)
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         _say(f"shared cache disabled: cannot create {path}: {exc}")
-        return None, "off"
-    return path.resolve(), mode
+        return CachePlan("off")
+    return CachePlan(mode, host=path.resolve(), reason=reason)
+
+
+def ensure_cache_volume(
+    engine_bin: str,
+    name: str,
+    image: str | None,
+    lock_dir: Path,
+    *,
+    labels: Mapping[str, str] | None = None,
+    timeout: float = 300.0,
+) -> str | None:
+    """
+    Create the named cache volume once and make its root writable by the job user (mode 1777, as
+    the images create /framac-cache and /framac-scratch); returns why it cannot be used, else None.
+    Serialized by a lock in the broker dir, so a concurrent job never mounts a volume whose
+    root is not yet initialized. The one-off init container runs `chmod` as root with no network,
+    no capabilities (root owns the new directory) and no target code.
+    """
+    lock = FileLock(lock_dir / "cache-volume.lock")
+    lock.acquire()
+    try:
+
+        def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+
+        try:
+            if run([engine_bin, "volume", "inspect", name]).returncode == 0:
+                return None
+            if not image:
+                return f"cannot initialize volume {name}: no image id (FRAMAC_IMAGE_ID)"
+            create = [engine_bin, "volume", "create", "--label", "framac.cache=1"]
+            for k, v in (labels or {}).items():
+                create += ["--label", f"{k}={v}"]
+            res = run([*create, name])
+            if res.returncode != 0:
+                return f"cannot create volume {name}: {(res.stderr or res.stdout).strip()}"
+            init = [
+                engine_bin,
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--user",
+                "0:0",
+                "--label",
+                "framac.cache-init=1",
+                *(arg for k, v in (labels or {}).items() for arg in ("--label", f"{k}={v}")),
+                "-v",
+                f"{name}:{CONTAINER_CACHE_MOUNT}",
+                "--entrypoint",
+                "/bin/chmod",
+                image,
+                "1777",
+                CONTAINER_CACHE_MOUNT,
+            ]
+            res = run(init)
+            if res.returncode != 0:
+                run([engine_bin, "volume", "rm", "-f", name])  # retried, from scratch, by the next job
+                return f"cannot initialize volume {name}: {(res.stderr or res.stdout).strip()}"
+            _say(f"created shared cache volume {name}")
+            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"cannot prepare volume {name}: {exc}"
+    finally:
+        lock.release()
 
 
 def _cpuset_placer(pool: Pool) -> Callable[[int, set[int]], list[int] | None]:
@@ -3218,7 +3385,17 @@ def cmd_exec(argv: list[str]) -> int:
         "no",
         "false",
     )
-    cache_host, cache_mode = _cache_plan(args.cache_dir, cache_rw, command)
+    cache = _cache_plan(args.cache_dir, cache_rw, command, eng)
+    if cache.volume and not args.dry_run:
+        labels = {k: v for k, v in (("framac.repo", cache_partition() or ""),) if v}
+        problem = ensure_cache_volume(
+            engine_bin, cache.volume, os.environ.get("FRAMAC_IMAGE_ID") or None, broker_dir, labels=labels
+        )
+        if problem:
+            _say(f"{problem}; bind-mounting the cache directory instead")
+            cache = _cache_plan(args.cache_dir, cache_rw, command, eng, volume_setting="off")
+    # The host only reads the cache through a bind mount; a volume lives in the engine.
+    cache_host, cache_mode = cache.host, cache.mode
 
     def pool_fn() -> Pool:
         return probe("host", engine=eng, run_dir=run_dir, cache_dir=cache_host, broker_dir=broker_dir)
@@ -3255,6 +3432,9 @@ def cmd_exec(argv: list[str]) -> int:
             "scope": "host",
             "run_dir": str(run_dir),
             "cache_mode": cache_mode,
+            "cache_volume": cache.volume,
+            "repo": os.environ.get("FRAMAC_REPO_KEY") or os.environ.get("FRAMAC_REPO") or None,
+            "run": os.environ.get("FRAMAC_RUN_TAG") or None,
             "runs_target_code": runs_target_code,
         },
     )
@@ -3279,6 +3459,7 @@ def cmd_exec(argv: list[str]) -> int:
             selinux=selinux_enforcing(),
             command=command,
             image_id=os.environ.get("FRAMAC_IMAGE_ID") or None,
+            cache_volume=cache.volume if cache_mode != "off" else None,
         )
         if lease.waited or os.environ.get("FRAMAC_RESOURCES_VERBOSE") == "1":
             _say(
@@ -3296,6 +3477,8 @@ def cmd_exec(argv: list[str]) -> int:
                         "mem_mb": lease.mem_mb,
                         "cpu_set": lease.cpu_set,
                         "cache_mode": cache_mode,
+                        "cache_volume": cache.volume,
+                        "cache_reason": cache.reason,
                     },
                     indent=2,
                 )
@@ -3357,6 +3540,10 @@ def _status(scope: str, broker_dir: str | None, gc: bool, engine: str | None = N
         "pid",
         "host",
         "container",
+        "repo",
+        "run",
+        "run_dir",
+        "cache_volume",
         "created_at",
         "granted_at",
         "seq",

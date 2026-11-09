@@ -28,6 +28,11 @@
 
     Engine: -Engine or FRAMAC_CONTAINER_ENGINE = docker | podman | auto (docker when usable).
 
+    Run identity: the repo key <repo>-<12 hex of sha256(resolved target path)> tells apart two targets with
+    the same folder name (derived image tags, cache partition); the run tag <run id>-<12 hex of sha256(resolved
+    run dir)> tells apart runs. Both reach the container and the host broker as FRAMAC_REPO_KEY /
+    FRAMAC_RUN_TAG, and label every container (and the scratch volume) as framac.repo / framac.run.
+
     The legacy -NoInnerSandbox and -AllowDegradedSandbox switches are still declared so that old command
     lines bind, but bubblewrap has been removed and either switch now fails hard (exit code 2) before Docker
     runs. Drop them from your command line.
@@ -39,7 +44,9 @@
     Existing or new run directory. Must be outside the target unless -AllowRunDirInTarget is given and git ignores it.
 
 .PARAMETER NewRun
-    Create the next ~/framac-pipeline/<repo>/run-<N> directory and use it.
+    Create the next ~/framac-pipeline/<repo>/run-<N> directory and use it. The number is claimed under a lock
+    file in ~/framac-pipeline/<repo>/ and with a create that fails when the directory exists, so concurrent
+    wrappers never share a run.
 
 .PARAMETER RepoName
     Stable repository identifier. Defaults to the target directory name.
@@ -67,7 +74,7 @@
 .PARAMETER BuildImage
     Run the command in the build image (framac-build:latest; the target's own build and its tests, e.g.
     scripts/build_capture.py) instead of the analysis image. With -TargetPackages, the derived build image
-    framac-build:<repo> is built (--target framac-build) and used. -Image still overrides the image name.
+    framac-build:<repo key> is built (--target framac-build) and used. -Image still overrides the image name.
     Every other command runs in the analysis image (framac-analysis:latest), which holds no target
     package: the target's headers and libraries come from the run's snapshot (workspace/snapshot/, written
     by the build capture), so -TargetPackages only derives the build image.
@@ -80,7 +87,7 @@
 .PARAMETER CodeQL
     Run the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py; docs/phase0-implementation-plan.md
     step I7): framac-codeql:latest, the build image plus the pinned CodeQL CLI (Dockerfile.codeql). With -TargetPackages,
-    the derived build image framac-build:<repo> is built first, then framac-codeql:<repo> from it, copying /opt/codeql
+    the derived build image framac-build:<repo key> is built first, then framac-codeql:<repo key> from it, copying /opt/codeql
     out of framac-codeql:latest (no download: wrappers/codeql-derived.Dockerfile). The derived image is labelled with
     both base image ids and rebuilt when either changes. It is a local image: never push or share it (CodeQL's
     licence covers open-source code only).
@@ -263,6 +270,17 @@ function Find-HostPython {
     return $null
 }
 
+# First 12 hex digits of the SHA-256 of a string (the scratch volume's run hash, the repo key's target hash).
+function Get-ShortHash([string]$Text) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
+    } finally {
+        $sha.Dispose()
+    }
+    return (-join ($hashBytes | ForEach-Object { $_.ToString("x2") })).Substring(0, 12)
+}
+
 function Resolve-ContainerEngine([string]$Preference) {
     $pref = if ($Preference) { $Preference.ToLowerInvariant() } else { "auto" }
     if ($pref -eq "docker" -or $pref -eq "podman") {
@@ -341,17 +359,54 @@ if (-not $RepoName) {
 if ($RepoName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
     throw "RepoName '$RepoName' must match ^[A-Za-z0-9][A-Za-z0-9._-]*$ (pass -RepoName explicitly)."
 }
+# Repo key: the display name plus a hash of the resolved target path, so two targets with the same folder
+# name never share a derived image tag or a cache partition. A Docker tag holds at most 128 characters:
+# the name part is cut to fit, the hash is kept.
+$repoPart = if ($RepoName.Length -gt 115) { $RepoName.Substring(0, 115) } else { $RepoName }
+$RepoKey = "$repoPart-$(Get-ShortHash $ResolvedTarget)"
 
 # ---- Resolve the run directory (outside the target by default) ----
 if ($NewRun) {
     if ($RunDir) { throw "Use either -RunDir or -NewRun, not both." }
     $base = Join-Path (Join-Path $HOME "framac-pipeline") $RepoName
     New-Item -ItemType Directory -Force -Path $base | Out-Null
-    $max = 0
-    Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.Name -match '^run-(\d+)$') { $n = [int]$Matches[1]; if ($n -gt $max) { $max = $n } }
+    # new-run allocation: New-Item and .NET check for an existing directory before creating it, which is not
+    # atomic, so concurrent wrappers serialize on an exclusive lock file in the base directory; inside it,
+    # start after the highest run-<N>, create it without -Force and try the next number when it exists.
+    $lockPath = Join-Path $base ".new-run.lock"
+    $lock = $null
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not $lock) {
+        try {
+            $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        } catch [System.IO.IOException] {
+            if ((Get-Date) -gt $deadline) { throw "Timed out waiting for the new-run lock $lockPath." }
+            Start-Sleep -Milliseconds (Get-Random -Minimum 20 -Maximum 100)
+        }
     }
-    $RunDir = Join-Path $base ("run-{0}" -f ($max + 1))
+    try {
+        $max = 0
+        Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Name -match '^run-(\d+)$') { $n = [int]$Matches[1]; if ($n -gt $max) { $max = $n } }
+        }
+        $n = $max + 1
+        $RunDir = $null
+        for ($attempt = 0; $attempt -lt 1000 -and -not $RunDir; $attempt++) {
+            $candidate = Join-Path $base ("run-{0}" -f $n)
+            try {
+                New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+                $RunDir = $candidate
+            } catch {
+                if (-not (Test-Path -LiteralPath $candidate)) { throw }
+                $n++
+            }
+        }
+        if (-not $RunDir) { throw "No free run-<N> under $base after 1000 attempts." }
+    } finally {
+        $lock.Dispose()
+    }
+    # end new-run allocation
 }
 if (-not $RunDir) {
     throw "Specify -RunDir <path> (existing run) or -NewRun (creates ~/framac-pipeline/$RepoName/run-<N>)."
@@ -370,7 +425,11 @@ if ($ResolvedRun.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase
     }
 }
 # Status lines go to stderr (as in framac-docker.sh): stdout carries only the command's output.
+$RunId = Split-Path -Leaf $ResolvedRun
+$runHash = Get-ShortHash $ResolvedRun
+$RunTag = "$RunId-$runHash"
 [Console]::Error.WriteLine("[framac-docker] run dir: $ResolvedRun")
+[Console]::Error.WriteLine("[framac-docker] run identity: $RepoKey / $RunTag")
 
 # ---- SELinux (Linux hosts): relabel pipeline-owned mounts; the target needs an explicit choice ----
 $z = ""
@@ -403,10 +462,7 @@ if ($selinuxEnforcing) {
 # ---- Scratch volume: one named volume per run directory (repo, run id, and a hash of the run path) ----
 $ScratchVolume = ""
 if ($Scratch -or $RemoveScratch) {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($ResolvedRun))
-    $runHash = (-join ($hashBytes | ForEach-Object { $_.ToString("x2") })).Substring(0, 12)
-    $ScratchVolume = "framac-scratch-$RepoName-$(Split-Path -Leaf $ResolvedRun)-$runHash"
+    $ScratchVolume = "framac-scratch-$RepoName-$RunId-$runHash"
 }
 if ($RemoveScratch) {
     & $EngineName volume rm "-f" "$ScratchVolume" | Out-Null
@@ -450,7 +506,7 @@ if ($TargetPackages -and -not $BuildImage -and -not $CodeQL) {
     $TargetPackages = ""
 }
 if ($TargetPackages) {
-    $DerivedImage = "framac-build:$RepoName"
+    $DerivedImage = "framac-build:$RepoKey"
     [Console]::Error.WriteLine("[framac-docker] Building derived image $DerivedImage with target packages: $TargetPackages")
     & $EngineName build @imageTarget "-t" "$DerivedImage" "--build-arg" "TARGET_APT_PACKAGES=$TargetPackages" "$PipelineRoot" |
         ForEach-Object { [Console]::Error.WriteLine("$_") }
@@ -472,8 +528,8 @@ if ($CodeQL) {
         if ($LASTEXITCODE -ne 0) { throw "Failed to build image $codeqlSource" }
     }
     if ($codeqlBase -ne "framac-build:latest") {
-        # A target with packages: framac-codeql:<repo> = its derived build image + /opt/codeql of framac-codeql:latest.
-        $codeqlImage = "framac-codeql:$RepoName"
+        # A target with packages: framac-codeql:<repo key> = its derived build image + /opt/codeql of framac-codeql:latest.
+        $codeqlImage = "framac-codeql:$RepoKey"
         $baseId = ([string](& $EngineName image inspect "-f" "{{.Id}}" $codeqlBase 2>$null | Select-Object -First 1)).Trim()
         $sourceId = ([string](& $EngineName image inspect "-f" "{{.Id}}" $codeqlSource 2>$null | Select-Object -First 1)).Trim()
         $labels = ""
@@ -494,7 +550,8 @@ if ($CodeQL) {
 if ($Scratch) {
     & $EngineName volume inspect "$ScratchVolume" *> $null
     if ($LASTEXITCODE -ne 0) {
-        & $EngineName volume create "--label" "framac.scratch=1" "$ScratchVolume" | Out-Null
+        & $EngineName volume create "--label" "framac.scratch=1" "--label" "framac.repo=$RepoKey" `
+            "--label" "framac.run=$RunTag" "$ScratchVolume" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Failed to create scratch volume $ScratchVolume" }
         # No chmod: both images create /framac-scratch with mode 1777, and the engine copies that mode to
         # the new, empty volume on its first mount, so the non-root job user can write it.
@@ -507,7 +564,6 @@ try {
     if ($LASTEXITCODE -eq 0 -and $inspected) { $ImageId = ([string]($inspected | Select-Object -First 1)).Trim() }
 } catch {}
 
-$RunId = Split-Path -Leaf $ResolvedRun
 if ($ScriptFile) {
     $resolvedScript = (Resolve-Path $ScriptFile).Path
     $CmdString = [System.IO.File]::ReadAllText($resolvedScript, [System.Text.Encoding]::UTF8).Replace("`r`n", "`n")
@@ -544,6 +600,8 @@ if ($OuterSandbox -eq "docker-hardened" -and ($IsLinux -or $IsMacOS)) {
     }
     $hardeningArgs += @("--user", "${hostUid}:${hostGid}")
 }
+# Run identity labels on every container, on both paths (the broker adds only its own framac.lease label).
+$labelArgs = @("--label", "framac.repo=$RepoKey", "--label", "framac.run=$RunTag")
 $envArgs = @(
     "-e", "PYTHONIOENCODING=utf-8",
     "-e", "S=/opt/framac-pipeline/scripts",
@@ -551,6 +609,8 @@ $envArgs = @(
     "-e", "FRAMAC_TARGET_HOST=$ResolvedTarget",
     "-e", "FRAMAC_REFERENCES_HOST=$PipelineRoot/docs/references",
     "-e", "FRAMAC_REPO=$RepoName",
+    "-e", "FRAMAC_REPO_KEY=$RepoKey",
+    "-e", "FRAMAC_RUN_TAG=$RunTag",
     "-e", "FRAMAC_RUN_ID=$RunId",
     "-e", "FRAMAC_RUN_HOST=$ResolvedRun",
     "-e", "FRAMAC_TARGET_COMMIT=$TargetCommit",
@@ -581,7 +641,9 @@ if ($useBroker) {
     # FRAMAC_CONTAINER_CMD (no PowerShell -> Python -> engine re-quoting) and becomes the entry shim's argument.
     $env:FRAMAC_CONTAINER_CMD = $CmdString
     $env:FRAMAC_IMAGE_ID = $ImageId
-    $env:FRAMAC_REPO = $RepoName  # partitions the shared cache per repository
+    $env:FRAMAC_REPO = $RepoName  # display name of the repository
+    $env:FRAMAC_REPO_KEY = $RepoKey  # partitions the shared cache per target (name + path hash)
+    $env:FRAMAC_RUN_TAG = $RunTag
     $pyExe = $hostPython[0]
     $pyPre = @()
     if ($hostPython.Count -gt 1) { $pyPre = @($hostPython[1..($hostPython.Count - 1)]) }
@@ -592,13 +654,13 @@ if ($useBroker) {
     if ($PSBoundParameters.ContainsKey("PidsLimit") -or $env:FRAMAC_PIDS_LIMIT) { $execArgs += @("--pids-limit", "$PidsLimit") }
     if ($CacheDir) { $execArgs += @("--cache-dir", $CacheDir) }
     if ($CacheRw) { $execArgs += "--cache-rw" }
-    $execArgs += @("--", $EngineName, "run") + $hardeningArgs + $selinuxArgs + $envArgs + $mountArgs
+    $execArgs += @("--", $EngineName, "run") + $hardeningArgs + $labelArgs + $selinuxArgs + $envArgs + $mountArgs
     $execArgs += @("-w", "/framac-run", "--entrypoint", "/bin/bash", "$Image", "/opt/framac-pipeline/scripts/container_entry.sh")
     & $pyExe @pyPre @execArgs
     exit $LASTEXITCODE
 }
 
-$dockerArgs = @("run") + $hardeningArgs + @(
+$dockerArgs = @("run") + $hardeningArgs + $labelArgs + @(
     "--cpus", "$Cpus",
     "--memory", "$Memory",
     "--pids-limit", "$PidsLimit"

@@ -9,7 +9,7 @@ Build capture (Phase 0, docs/phase0-implementation-plan.md step I2): run the tar
                          [--out workspace/reports/build_capture.json] [--state state] [--timeout 1800]
     build_capture.py propose [--target /target]
 
-`run` runs in the build image (framac-build, or framac-build:<repo> when the recipe names packages),
+`run` runs in the build image (framac-build, or framac-build:<repo key> when the recipe names packages),
 started by the wrapper with -BuildImage -Scratch (sh: --build-image --scratch), so the scratch tree is on
 the run's named Docker volume at /framac-scratch:
 
