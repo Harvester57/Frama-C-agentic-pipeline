@@ -9,12 +9,18 @@ Unit tests for scripts/acsl_ast.py:
 
 from __future__ import annotations
 
+import pytest
+
 from acsl_ast import (
+    ScopeViolationError,
     _extract_decl_param_types,
     _is_acsl_comment_or_whitespace_only,
+    added_top_level_acsl_declarations,
     check_conflicting_acsl_profiles,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
+    splice_prover_changes,
+    verify_acsl_only,
 )
 
 
@@ -295,3 +301,59 @@ int some_fn(void);
         conflicts_mixed = check_conflicting_acsl_profiles(mixed_decls, [], source_path="mixed.h")
         assert len(conflicts_mixed) >= 1
         assert any("valid_read_buffer" in c and "int *" in c for c in conflicts_mixed)
+
+
+# ---------------------------------------------------------------------------
+# Top-level declarations a prover adds outside its function (prover brief, Step B: Inductive Lemmas)
+# ---------------------------------------------------------------------------
+
+_BASE = "/*@ requires n >= 0;\n  @ assigns \nothing;\n  @ ensures \result == n;\n  @*/\nint f(int n) { return n; }\n"
+_GHOST = (
+    "/*@ ghost\n"
+    "  /@ requires n >= 0;\n"
+    "   @ decreases n;\n"
+    "   @ assigns \nothing;\n"
+    "   @ ensures n >= 0;\n"
+    "   @/\n"
+    "  void lem(int n) { if (n <= 0) return; lem(n - 1); }\n"
+    "*/\n"
+)
+
+
+class TestTopLevelAdditions:
+    def test_a_ghost_function_with_its_own_contract_is_one_named_declaration(self) -> None:
+        decls = extract_top_level_acsl_declarations(_GHOST + _BASE)
+        assert [(d["kind"], d["name"], d["line"]) for d in decls] == [("ghost", "lem", 1)]
+        assert decls[0]["text"].endswith("lem(n - 1); }")
+
+    def test_a_ghost_variable_is_still_named(self) -> None:
+        decls = extract_top_level_acsl_declarations("/*@ ghost int counter = 0; */\n" + _BASE)
+        assert [(d["kind"], d["name"]) for d in decls] == [("ghost", "counter")]
+
+    def test_added_declarations_count_repeats_and_ignore_base_ones(self) -> None:
+        pred = "/*@ predicate pos(integer x) = x > 0; */\n"
+        assert added_top_level_acsl_declarations(_BASE, _GHOST + _BASE) == ["ghost lem"]
+        assert added_top_level_acsl_declarations(pred + _BASE, pred + _GHOST + _BASE) == ["ghost lem"]
+        assert added_top_level_acsl_declarations(pred + _BASE, pred + pred + _BASE) == ["predicate pos"]
+        assert added_top_level_acsl_declarations(_BASE, _BASE) == []
+
+    def test_splice_refuses_a_ghost_function_and_names_it(self) -> None:
+        agent = _GHOST + _BASE
+        assert verify_acsl_only(_BASE, agent) == []
+        with pytest.raises(ScopeViolationError, match=r"top-level ACSL declaration\(s\) outside 'f': ghost lem;"):
+            splice_prover_changes(_BASE, agent, _BASE, "f")
+
+    def test_splice_refuses_a_top_level_predicate_and_names_it(self) -> None:
+        agent = "/*@ predicate pos(integer x) = x > 0; */\n" + _BASE
+        with pytest.raises(ScopeViolationError, match=r"outside 'f': predicate pos;"):
+            splice_prover_changes(_BASE, agent, _BASE, "f", path="m.c")
+
+    def test_a_contract_only_edit_still_splices(self) -> None:
+        agent = _BASE.replace("requires n >= 0;", "requires n >= 0;\n  @ requires n <= 100;")
+        assert splice_prover_changes(_BASE, agent, _BASE, "f") == agent
+
+    def test_another_edit_outside_the_span_keeps_the_old_message(self) -> None:
+        base = "int g(void) { return 0; }\n" + _BASE
+        agent = "int g(void) { /*@ assert \true; */ return 0; }\n" + _BASE
+        with pytest.raises(ScopeViolationError, match=r"agent modified content outside assigned function 'f'$"):
+            splice_prover_changes(base, agent, base, "f")

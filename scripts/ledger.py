@@ -205,6 +205,10 @@ def commit(
             pass
 
 
+# details.gap_kind of a proof_gap whose reason starts with "inductive lemma required" (prover brief, Step B: Inductive Lemmas).
+INDUCTIVE_LEMMA_GAP = "inductive_lemma_required"
+
+
 def add_evidence(
     unit: dict,
     phase: str,
@@ -1808,6 +1812,12 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             tool_out = str(prom_res["dest"])
         phase = "breaker" if role == "breaker" else "wp"
         gap_note = f"proof_gap: {pg['predicate']}: {pg['reason']}"
+        # Counted per target in REPORT.md (prover brief, Step B: Inductive Lemmas): the input to the shared-lemma-library decision.
+        gap_details = (
+            {"gap_kind": INDUCTIVE_LEMMA_GAP}
+            if str(pg["reason"]).lstrip().lower().startswith("inductive lemma required")
+            else None
+        )
         for cid in linked:
             u = units[cid]
             add_evidence(
@@ -1818,6 +1828,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
                 False,
                 tool_out,
                 f"Proof gap on {pg['predicate'][:120]}: {pg['reason'][:140]}",
+                gap_details,
             )
             u["status"] = "blocked"
             u["agent_id"] = None

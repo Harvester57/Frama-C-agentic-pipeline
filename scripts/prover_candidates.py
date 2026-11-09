@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from acsl_ast import added_top_level_acsl_declarations  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     atomic_write_json,
@@ -68,6 +69,8 @@ COMPARABLE_WP_STATUSES = frozenset({"all_proven", "unproven_goals_remain"})
 GUARDRAIL_REFUTATIONS = frozenset({"rejected_overconstrained", "code_fault"})
 WP_STATUSES_WITH_SOUNDNESS_VERDICT = frozenset({"unsound_proof", "unproven_goals_remain"})
 NO_PROGRESS_FOCUS = "no_progress_restore_best_and_finish"
+# The candidate adds top-level ACSL declarations outside the function: merge-agent refuses the whole patch.
+SCOPE_VIOLATION_FOCUS = "remove_top_level_acsl_declarations"
 
 # Far above what a holder needs (milliseconds), and above the 120 s after which run_lock breaks a dead holder's lock.
 LOCK_TIMEOUT_S = 300.0
@@ -209,6 +212,32 @@ def digest_before_run(out_json: Path | str) -> str | None:
         return None
 
 
+def top_level_additions(scratch: Path, budget: dict) -> list[str]:
+    """
+    `"<kind> <name>"` for each top-level ACSL declaration (ghost function, predicate, lemma, ...) that scratch/work
+    adds over the pristine scratch/base in the tracked files. merge-agent refuses such a patch (prover brief, Step B: Inductive Lemmas).
+    Fail-open: any error gives [].
+    """
+    try:
+        rels = _tracked_rels(budget)
+        if rels is None:
+            return []
+        pending: list[str] = []
+        for rel in rels:
+            work = _read_regular(scratch, f"work/{rel}")
+            if work is None:
+                continue
+            base = _read_regular(scratch, f"base/{rel}") or b""
+            pending.extend(
+                added_top_level_acsl_declarations(
+                    base.decode("utf-8", "surrogateescape"), work.decode("utf-8", "surrogateescape"), path=rel
+                )
+            )
+        return pending
+    except Exception:
+        return []
+
+
 def _new_state(scratch: Path, function: str | None) -> dict:
     return {
         "schema": SCHEMA_VERSION,
@@ -284,6 +313,8 @@ def _is_eligible(wp: dict, guard: dict) -> bool:
         and wp["soundness_ok"]
         and wp["failed"] is not None
         and wp["failed"] + wp["proved"] > 0
+        # Unmergeable: merge-agent refuses top-level declarations outside the function. Absent in older states.
+        and wp.get("scope_ok", True)
     )
 
 
@@ -422,30 +453,37 @@ def note_oracle(out_json: Path, oracle: str, report: dict, digest_before: str | 
         name = _report_name(oracle, function)
         _write_under(scratch, f"{CANDIDATES_DIR}/c{cand['id']}/{name}", _report_bytes(report))
         cand[oracle] = _oracle_summary(oracle, report)
+        pending = top_level_additions(scratch, budget)
+        if cand["wp"] is not None:
+            cand["wp"]["scope_ok"] = not pending
 
         evaluated = cand["wp"] is not None and cand["guardrail"] is not None
         if evaluated:
             verdict = _evaluate(scratch, state, digest, contents)
+            if pending:
+                # Even an all_proven candidate cannot be merged: the prover must remove the declarations.
+                verdict["next_action"] = "continue"
         else:
             verdict = {"eligible": None, "rank": None, "progress": None, "next_action": "wait_for_other_oracle"}
         wp, guard = cand["wp"] or {}, cand["guardrail"] or {}
-        state["history"].append(
-            {
-                "id": cand["id"],
-                "digest": digest,
-                "oracle": oracle,
-                "at": utc_now(),
-                "wp_status": wp.get("status"),
-                "guardrail_status": guard.get("status"),
-                "failed": wp.get("failed"),
-                "proved": wp.get("proved"),
-                "evaluated": evaluated,
-                "eligible": verdict["eligible"],
-                "progress": verdict["progress"],
-            }
-        )
+        entry = {
+            "id": cand["id"],
+            "digest": digest,
+            "oracle": oracle,
+            "at": utc_now(),
+            "wp_status": wp.get("status"),
+            "guardrail_status": guard.get("status"),
+            "failed": wp.get("failed"),
+            "proved": wp.get("proved"),
+            "evaluated": evaluated,
+            "eligible": verdict["eligible"],
+            "progress": verdict["progress"],
+        }
+        if pending:
+            entry["scope_violation_pending"] = pending
+        state["history"].append(entry)
         atomic_write_json(scratch / STATE_FILE, state)
-        return {
+        block = {
             "recorded": True,
             "candidate": cand["id"],
             "evaluated": evaluated,
@@ -456,6 +494,10 @@ def note_oracle(out_json: Path, oracle: str, report: dict, digest_before: str | 
             "progress": verdict["progress"],
             "next_action": verdict["next_action"],
         }
+        if pending:
+            block["scope_violation_pending"] = pending
+            block["next_synthesis_focus"] = SCOPE_VIOLATION_FOCUS
+        return block
 
 
 def add_candidate_block(summary: dict, out_json: Path, oracle: str, report: dict, digest_before: str | None) -> None:
@@ -468,7 +510,9 @@ def add_candidate_block(summary: dict, out_json: Path, oracle: str, report: dict
     if block is None:
         return
     summary["candidate"] = block
-    if block["next_action"] == "restore_best_and_finish":
+    if block.get("scope_violation_pending"):
+        summary["next_synthesis_focus"] = SCOPE_VIOLATION_FOCUS
+    elif block["next_action"] == "restore_best_and_finish":
         summary["next_synthesis_focus"] = NO_PROGRESS_FOCUS
 
 

@@ -315,3 +315,33 @@ def test_reporting_semantics_wp_vs_eva_and_sarif_levels(tmp_path):
     assert levels_by_sev["medium"] == "warning"
     assert levels_by_sev["low"] == "note"
     assert levels_by_sev["needs_validation"] == "warning"
+
+
+def test_report_counts_inductive_lemma_gaps_per_function(tmp_path):
+    build_run(tmp_path)
+    ledger_path = tmp_path / "coverage-ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    for u in ledger:
+        if u["coverage_id"] == "src/snmp/pdu.c#snmp_parse_pdu::l2_termination":
+            u["evidence"].append(
+                {
+                    "phase": "wp",
+                    "producer": "prove-snmp_parse_pdu",
+                    "result": "proof_gap",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/eva/snmp.json",
+                    "summary": "Proof gap on n == count(p): inductive lemma required: count is recursive",
+                    "details": {"gap_kind": "inductive_lemma_required"},
+                }
+            )
+    write_json(ledger_path, ledger)
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "### Open units: prover-limited vs spec-limited" in report
+    assert "- **inductive lemma required**: 1 function(s): `snmp_parse_pdu`" in report
+
+
+def test_report_has_no_inductive_lemma_line_without_such_gaps(tmp_path):
+    build_run(tmp_path)
+    generate(tmp_path, tmp_path)
+    assert "inductive lemma required" not in (tmp_path / "REPORT.md").read_text(encoding="utf-8")
