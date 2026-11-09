@@ -67,7 +67,7 @@ NOT_FORWARDED = {
     "FRAMAC_PROBE_ROOT",
     "FRAMAC_SECURITY_PROPS",  # run_wp_function.py override; the default is the run's workspace/reports file
 }
-AB_SWITCHES = ("FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB", "FRAMAC_NEGOTIATE_EVIDENCE")
+AB_SWITCHES = ("FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB", "FRAMAC_MUTATION_STUB", "FRAMAC_NEGOTIATE_EVIDENCE")
 
 
 def _read(rel: str) -> str:
@@ -150,7 +150,11 @@ def test_ps1_forwards_the_ab_switches_and_sets_user_only_off_windows(tmp_path):
         pytest.skip("pwsh/powershell not available")
     log_file, env = _fake_engine(tmp_path)
     env.update(
-        FRAMAC_FRAME_SKELETON="off", FRAMAC_LOOP_TEMPLATES="off", FRAMAC_SPEC_KB="off", FRAMAC_NEGOTIATE_EVIDENCE="off"
+        FRAMAC_FRAME_SKELETON="off",
+        FRAMAC_LOOP_TEMPLATES="off",
+        FRAMAC_SPEC_KB="off",
+        FRAMAC_NEGOTIATE_EVIDENCE="off",
+        FRAMAC_MUTATION_STUB="off",
     )
     base = [
         pwsh,

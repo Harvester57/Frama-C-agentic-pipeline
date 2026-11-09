@@ -18,7 +18,83 @@ from conftest import (
 )
 from fingerprint import make_fingerprint
 from framac_common import ArtifactError
-from generate_report import generate
+from generate_report import generate, spec_quality_section
+
+
+def _spec_quality(totals: dict, functions: dict) -> str:
+    return "\n".join(spec_quality_section({"mutation": {"totals": totals, "functions": functions}}))
+
+
+_MUTATION_TOTALS = {
+    "functions": 3,
+    "spec_mutants": 4,
+    "equivalent": 1,
+    "completeness": 0.75,
+    "impl_mutants": 4,
+    "rejected": 3,
+    "precision": 0.6667,
+}
+_MUTATION_FUNCTIONS: dict[str, dict] = {
+    "f": {
+        "completeness": 1.0,
+        "precision": 1.0,
+        "spec_mutants": 2,
+        "equivalent": 0,
+        "impl_mutants": 2,
+        "rejected": 2,
+        "trivial_body_rejected": True,
+    },
+    "g": {
+        "completeness": 0.5,
+        "precision": 0.0,
+        "spec_mutants": 2,
+        "equivalent": 1,
+        "impl_mutants": 1,
+        "rejected": 0,
+        "trivial_body_rejected": False,
+    },
+    "h": {"completeness": None, "precision": 1.0, "impl_mutants": 1, "rejected": 1, "trivial_body_rejected": None},
+}
+
+
+def test_spec_quality_trivial_stub_line_with_accepted_functions():
+    totals = {
+        **_MUTATION_TOTALS,
+        "trivial_body_checked": 2,
+        "trivial_body_accepted": 1,
+        "trivial_body_accepted_functions": ["g"],
+    }
+    text = _spec_quality(totals, _MUTATION_FUNCTIONS)
+    assert (
+        "- Trivial-stub check: 2 functions checked, 1 accept a body that does nothing: `g` "
+        "(their contracts constrain no result)"
+    ) in text
+    lines = {line.split("`")[1]: line for line in text.splitlines() if line.startswith("- `")}
+    assert lines["f"].endswith("trivial stub rejected: yes")
+    assert lines["g"].endswith("trivial stub rejected: no")
+    assert lines["h"].endswith("trivial stub rejected: n/a")
+
+
+def test_spec_quality_trivial_stub_line_without_accepted_functions():
+    totals = {
+        **_MUTATION_TOTALS,
+        "trivial_body_checked": 2,
+        "trivial_body_accepted": 0,
+        "trivial_body_accepted_functions": [],
+    }
+    text = _spec_quality(totals, _MUTATION_FUNCTIONS)
+    assert "- Trivial-stub check: 2 functions checked, 0 accept a body that does nothing\n" in text + "\n"
+    assert "constrain no result" not in text
+
+
+def test_spec_quality_without_the_stub_mentions_no_stub():
+    # FRAMAC_MUTATION_STUB=off: neither the totals key nor the per-function key exists.
+    plain = {
+        k: {kk: vv for kk, vv in v.items() if kk != "trivial_body_rejected"} for k, v in _MUTATION_FUNCTIONS.items()
+    }
+    text = _spec_quality(_MUTATION_TOTALS, plain)
+    assert "Trivial-stub" not in text and "trivial stub" not in text
+    assert "Specification quality (mutation check)" in text
 
 
 def build_run(run, status="incomplete", reason="candidate_validation_not_run", unverified=True):

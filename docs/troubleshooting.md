@@ -376,3 +376,9 @@ The full guide is [`./resources-and-caching.md`](./resources-and-caching.md) (Se
 - **An ad-hoc command is OOM-killed at 1 GiB:** commands the broker does not recognise run as `light` (1 CPU, 1 GiB). Pass `-Class` / `--class` (for example `build` or `phase-dynamic`).
 - **`RunLockTimeout`:** another container held the run's `ledger` or `merge` lock for longer than `FRAMAC_LOCK_TIMEOUT`. A holder whose heartbeat stopped (`FRAMAC_LOCK_STALE`, default 120 s) is broken automatically, and an interrupted merge is rolled back from `state/merge-journal.json` by the next merge.
 - **Need the previous static behavior:** `FRAMAC_BROKER=off` (`-NoBroker`) for container sizing, `FRAMAC_SCHEDULER=waves` for Phase 3 dispatch.
+
+### Symptom: `test_sh_new_run_allocation_is_atomic_under_concurrency` fails on Windows with `child_copy: cygheap read copy failed ... Win32 error 299` or return code `3221225794`
+
+- **Seen:** 2026-11-09, full `python -m pytest tests -n auto` in the formal-discovery Tier 4 worktree while five other sessions ran their own suites on the same Windows host. Failed twice in the full suite; `tests/test_run_identity_wrappers.py` passes alone (`-n 0`).
+- **Cause:** not a pipeline defect. The test starts many Git Bash (`bash.exe`) processes at once; under heavy host load Cygwin's `fork` fails (Win32 error 299, or `0xC0000142` STATUS_DLL_INIT_FAILED as the return code), so `mkdir` in `framac-docker.sh`'s run allocation never runs. The atomicity being tested is not involved.
+- **Fix:** none needed in the pipeline. Re-run the file alone (`python -m pytest tests/test_run_identity_wrappers.py -n 0`) when the host is busy. **Open test gap:** the test could skip or retry on a Cygwin fork failure instead of reporting it as an allocation race.

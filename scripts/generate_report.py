@@ -425,15 +425,28 @@ def spec_quality_section(data: dict) -> list[str]:
             f"implementation mutants: {t.get('impl_mutants', 0)} ({t.get('rejected', 0)} rejected -> "
             f"precision {t.get('precision')})"
         )
+        if "trivial_body_checked" in t:
+            accepted = t.get("trivial_body_accepted_functions") or []
+            line = (
+                f"- Trivial-stub check: {t.get('trivial_body_checked', 0)} functions checked, "
+                f"{len(accepted)} accept a body that does nothing"
+            )
+            if accepted:
+                line += ": " + ", ".join(f"`{fn}`" for fn in accepted) + " (their contracts constrain no result)"
+            out.append(line)
         out.append("")
         for fn, f in sorted((mutation.get("functions") or {}).items()):
             if f.get("completeness") is None and f.get("precision") is None:
                 continue
-            out.append(
+            line = (
                 f"- `{fn}`: completeness {f.get('completeness')} (spec mutants {f.get('spec_mutants')}, "
                 f"equivalent {f.get('equivalent')}), precision {f.get('precision')} "
                 f"(impl mutants {f.get('impl_mutants')}, rejected {f.get('rejected')})"
             )
+            if "trivial_body_rejected" in f:
+                stub = f["trivial_body_rejected"]
+                line += f", trivial stub rejected: {'n/a' if stub is None else ('yes' if stub else 'no')}"
+            out.append(line)
         out.append("")
     # Evaluation duality: an open unit is prover-limited (tool/verifier limit) or
     # spec-limited (the contract genuinely does not hold) — read from its WP report.
