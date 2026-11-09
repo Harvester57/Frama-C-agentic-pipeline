@@ -1486,6 +1486,118 @@ def test_build_check_names_the_error_of_the_attempt_that_failed_last(tmp_path):
     )
 
 
+def _attempt(stdout: str, stderr: str = "e-acsl-gcc: fatal error: aborted by Frama-C\n") -> str:
+    return f"Command: e-acsl-gcc -n x.c\nReturncode: 1\n--- STDOUT ---\n{stdout}--- STDERR ---\n{stderr}"
+
+
+ALIAS_WARNING = (
+    "[kernel] Warning: -e-acsl-assert-print-data is a deprecated alias for option -e-acsl-O-valid.\n"
+    "  Please use -e-acsl-O-valid instead.\n"
+)
+# nettle run-3 (Frama-C 35.0~~dev), shortened: each excerpt used to be the e-acsl-gcc wrap-up, blamed on memory.
+REGISTER_LOG = _attempt(
+    ALIAS_WARNING + "[kernel] Failure: Taking the address of a register variable with &[ i ]\n[kernel:backtrace] \n"
+    '  Raised at Fclib__Log.Register.fatal.finally in file "src/lib/utils/log.ml", line 1157\n'
+    "[kernel] Frama-C aborted: internal error (Taking the address of a register variable with &[ i ]).\n"
+)
+GMP_LOG = _attempt(
+    "[e-acsl] /usr/include/x86_64-linux-gnu/gmp.h:1759: Warning: \n"
+    "  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.\n[kernel:backtrace] \n"
+    '  Raised at E_ACSL__Smart_stmt.rtl_call in file "plugins/e-acsl/src/code_generator/smart_stmt.ml", line 137\n'
+    '[kernel] Unexpected error (E_ACSL__Rtl.Symbols.Unregistered("__gmpz_clear")).\n'
+)
+UNION_LOG = _attempt(
+    "[kernel] workspace/work/block-internal.h:49: User Error: \n"
+    "  implicit cast: cast from union nettle_block16 to void *\n[kernel] Frama-C aborted: invalid user input.\n"
+)
+LINK_LOG = (
+    "Command: e-acsl-gcc -n x.c\nReturncode: 0\n--- STDOUT ---\n"
+    "Command: e-acsl-gcc -C -O fuzz_m fuzz_m.instrumented.c\nReturncode: 1\n--- STDOUT ---\n--- STDERR ---\n"
+    "e_acsl_rtl_error.c:190:21: warning: initializer overrides prior initialization [-Winitializer-overrides]\n"
+    "/usr/bin/ld: /usr/bin/ld: DWARF error: mangled line number section (bad file number)\n"
+    "/tmp/fuzz_m.o: in function `f':\nfuzz_m.instrumented.c:3:(.text.f+0x7): undefined reference to `table'\n"
+    "clang: error: linker command failed with exit code 1 (use -v to see invocation)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("log", "start"),
+    [
+        (REGISTER_LOG, "[kernel] Failure: Taking the address of a register variable with &[ i ]"),
+        (GMP_LOG, '[kernel] Unexpected error (E_ACSL__Rtl.Symbols.Unregistered("__gmpz_clear")).'),
+        (UNION_LOG, "[kernel] workspace/work/block-internal.h:49: User Error: implicit cast: cast from union"),
+        (LINK_LOG, "fuzz_m.instrumented.c:3:(.text.f+0x7): undefined reference to `table'"),
+        # A crash with no message line: the backtrace, and no claim about memory.
+        (
+            _attempt('[kernel:backtrace] \n  Raised at E_ACSL__Env.do_new_var in file "env.ml"\n'),
+            "Raised at E_ACSL__Env",
+        ),
+        (_attempt(ALIAS_WARNING + "[kernel] warning: error: in a warning\n"), "e-acsl-gcc: fatal error: aborted by"),
+    ],
+)
+def test_first_error_skips_warnings_and_wrap_ups_for_the_line_that_explains_the_failure(tmp_path, log, start):
+    path = tmp_path / "fuzz_m.compile.log"
+    path.write_text(log, encoding="utf-8")
+    first = pm._first_build_error(path)
+    assert first.startswith(start), first
+    assert "deprecated alias" not in first and "DWARF" not in first
+    assert ("lack of memory" in first) == start.startswith("e-acsl-gcc")
+
+
+def _failed_build(run: Path, mod: str, log_text: str, fallback: bool) -> None:
+    log = f"workspace/harnesses/fuzz_{mod}.compile.log"
+    (run / log).write_text(log_text, encoding="utf-8")
+    attempt = {"returncode": 1, "compile_log": log}
+    report: dict[str, Any] = {"mode": "build", "module": mod}
+    if fallback:  # auto fell back to the sanitizers: eacsl_fallback
+        report.update(engine_used="sanitizers", compile={"returncode": 0}, eacsl_compile_attempt=attempt)
+    else:
+        report.update(engine_used="eacsl", compile=attempt)
+    write_json(run / pm.BUILD_DIR / f"{mod}.build.json", report)
+
+
+def test_build_check_names_known_eacsl_failures_and_the_command_but_never_switches_engines(tmp_path):
+    run = _make_run(tmp_path)
+    _failed_build(run, "cfg", GMP_LOG, fallback=True)
+    _failed_build(run, "log", UNION_LOG, fallback=False)
+    _failed_build(run, "snmp", REGISTER_LOG, fallback=False)  # fixed at the source: no reason code
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    mods = out["modules"]
+    assert out["ok"] is False
+    assert (mods["cfg"]["status"], mods["cfg"]["reason_code"]) == ("eacsl_fallback", "eacsl_gmp_symbol_unregistered")
+    assert (mods["log"]["status"], mods["log"]["reason_code"]) == ("build_failed", "eacsl_static_const_union")
+    for mod in ("cfg", "log"):
+        assert mods[mod]["ok"] is False and mods[mod]["fuzz_engine"] == "auto"
+        assert (
+            mods[mod]["next_step"] == f"python3 $S/pipeline_make.py params set --module {mod} --fuzz-engine sanitizers"
+        )
+        assert "E-ACSL bug" in mods[mod]["reason"] and "recorded choice" in mods[mod]["reason"]
+    assert not {"reason_code", "next_step", "reason"} & set(mods["snmp"])
+    assert "register variable" in mods["snmp"]["first_error"]
+    assert not validate_artifacts.validate_build_check(out) and out["warnings"] == []
+    # The gate stamp keeps them, so a refused fuzz-<mod> names the command too.
+    gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))["build_check"]
+    assert gates["modules"]["log"]["next_step"] == mods["log"]["next_step"]
+    assert not validate_artifacts.validate_phase0_gates(gates)
+    (reason,) = phase0_gates.check(run, "log", ("build_check",))
+    assert "eacsl_static_const_union" in reason and mods["log"]["next_step"] in reason
+
+    # Running the printed command is the recorded choice the gate accepts (cfg's sanitizers build exists).
+    argv = shlex.split(mods["cfg"]["next_step"])
+    assert argv[:4] == ["python3", "$S/pipeline_make.py", "params", "set"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert pm.main(["--run-dir", str(run), *argv[2:]]) == 0
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    assert out["modules"]["cfg"]["status"] == "sanitizers_chosen" and out["modules"]["cfg"]["ok"] is True
+    assert out["modules"]["log"]["ok"] is False
+
+
+def test_known_eacsl_failure_codes_match_the_build_check_schema():
+    schema = json.loads((REPO / "schemas" / "build_check.schema.json").read_text(encoding="utf-8"))
+    row = schema["properties"]["modules"]["additionalProperties"]["properties"]
+    assert row["reason_code"]["enum"] == [code for code, _, _ in pm.KNOWN_EACSL_FAILURES]
+
+
 # ---------------------------------------------------------------------------
 # Link units as DAG modules (step I5b): harness sub-modules
 # ---------------------------------------------------------------------------

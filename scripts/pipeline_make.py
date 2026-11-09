@@ -2348,20 +2348,51 @@ def sweep(
 
 
 BUILD_CHECK_JSON = "workspace/reports/build_check.json"
-_BUILD_ERROR_RE = re.compile(r"User Error|\berror:|Fatal error", re.IGNORECASE)
-
-
+# A line that says why the build failed: a compiler, linker or Frama-C error, or an OCaml failure or
+# uncaught exception (`[kernel] Failure: ...`, `[kernel] Unexpected error (...)`).
+_BUILD_ERROR_RE = re.compile(
+    r"User Error|\berror:|Fatal error|\bFailure:|Unexpected error|aborted: internal error|undefined reference to",
+    re.IGNORECASE,
+)
+# The start of an OCaml backtrace: Frama-C crashed, even when it printed no message of its own.
+_BACKTRACE_RE = re.compile(r"^\s*Raised at ")
+# Lines that only say that an earlier step failed: e-acsl-gcc's and the clang driver's wrap-ups.
+_WRAP_UP_RE = re.compile(r"fatal error: aborted by Frama-C|linker command failed", re.IGNORECASE)
+# Diagnostics that do not fail a build: warnings (`[kernel] Warning: ... error ...`), and GNU ld's
+# `DWARF error: mangled line number section` about clang's line tables, after which it goes on linking.
+_NOT_AN_ERROR_RE = re.compile(r"\bwarning\b\s*:|DWARF error:", re.IGNORECASE)
 _SILENT_ABORT_RE = re.compile(r"aborted by Frama-C", re.IGNORECASE)
 
+# E-ACSL failures with no source-level fix (docs/troubleshooting.md, Section 1): build-check names the
+# failure and the command that records the sanitizers choice, and never switches the engine itself.
+KNOWN_EACSL_FAILURES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        "eacsl_gmp_symbol_unregistered",
+        re.compile(r'E_ACSL__Rtl\.Symbols\.Unregistered\("__gmpz_'),
+        "E-ACSL cannot instrument code that includes <gmp.h> when it also needs GMP of its own (a check on an "
+        "integer range wider than 64 bits): it does not find its own __gmpz_* functions (E-ACSL bug)",
+    ),
+    (
+        "eacsl_static_const_union",
+        re.compile(r"implicit cast: cast from union \w+ to void \*"),
+        "E-ACSL cannot instrument a `static const` union (local or file scope, initialized or not): its "
+        "code casts the union to void * (E-ACSL bug)",
+    ),
+)
 
-def _first_build_error(log_path: Path) -> str | None:
+
+def sanitizers_command(module: str) -> str:
+    """The command that records the choice to fuzz `module` with ASan/UBSan instead of E-ACSL."""
+    return f"python3 $S/pipeline_make.py params set --module {module} --fuzz-engine sanitizers"
+
+
+def _last_failed_attempt(log_path: Path) -> list[str] | None:
     """
-    The first error line of the compile log's last failed command and the two lines after it, or None.
+    The lines of the compile log's last failed command, or None when the log cannot be read.
 
     The log holds one `Command:` section per attempt. An earlier attempt's error can be one the
     build already recovered from (the retry that drops unknown -rte-select names), so only the
-    attempt that failed last explains the fallback. When Frama-C stopped there without a message of
-    its own, it was most likely killed (out of memory), and the excerpt says so.
+    attempt that failed last explains the failure.
     """
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -2370,13 +2401,63 @@ def _first_build_error(log_path: Path) -> str | None:
     starts = [i for i, line in enumerate(lines) if line.startswith("Command: ")] or [0]
     sections = [lines[a:b] for a, b in zip(starts, [*starts[1:], len(lines)], strict=True)]
     failed = [s for s in sections if not any(line.strip() == "Returncode: 0" for line in s[:3])]
-    section = (failed or sections)[-1]
+    return (failed or sections)[-1]
+
+
+def _is_error_line(line: str) -> bool:
+    error = _BUILD_ERROR_RE.search(line)
+    if not error:
+        return False
+    noise = _NOT_AN_ERROR_RE.search(line)
+    return not (noise and noise.start() < error.start())
+
+
+def _first_build_error(log_path: Path) -> str | None:
+    """
+    An excerpt of the line that explains the compile log's last failed command, with the two lines
+    after it, or None.
+
+    The first error line wins; warnings and GNU ld's DWARF complaints are skipped even when they
+    contain `error`. Failing that, the start of an OCaml backtrace (Frama-C crashed); failing that,
+    the wrap-up line (`e-acsl-gcc: fatal error: aborted by Frama-C`). When that wrap-up is all
+    Frama-C left, it was most likely killed (out of memory), and the excerpt says so.
+    """
+    section = _last_failed_attempt(log_path)
+    if section is None:
+        return None
+
+    def _excerpt(at: int) -> str:
+        return " ".join(s.strip() for s in section[at : at + 3] if s.strip())[:400]
+
+    backtrace = wrap_up = None
     for i, line in enumerate(section):
-        if _BUILD_ERROR_RE.search(line):
-            excerpt = " ".join(s.strip() for s in section[i : i + 3] if s.strip())[:400]
-            if _SILENT_ABORT_RE.search(line):
-                excerpt += " (Frama-C stopped without an error message: most likely killed for lack of memory)"
-            return excerpt
+        if line.startswith("Command: "):
+            continue
+        if _WRAP_UP_RE.search(line):
+            wrap_up = i if wrap_up is None else wrap_up
+        elif _is_error_line(line):
+            return _excerpt(i)
+        elif backtrace is None and _BACKTRACE_RE.match(line):
+            backtrace = i
+    if backtrace is not None:
+        return _excerpt(backtrace)
+    if wrap_up is None:
+        return None
+    excerpt = _excerpt(wrap_up)
+    if _SILENT_ABORT_RE.search(section[wrap_up]):
+        excerpt += " (Frama-C stopped without an error message: most likely killed for lack of memory)"
+    return excerpt
+
+
+def known_eacsl_failure(log_path: Path) -> tuple[str, str] | None:
+    """(reason code, explanation) when the log's last failed command shows a KNOWN_EACSL_FAILURES signature."""
+    section = _last_failed_attempt(log_path)
+    if section is None:
+        return None
+    text = "\n".join(section)
+    for code, signature, why in KNOWN_EACSL_FAILURES:
+        if signature.search(text):
+            return code, why
     return None
 
 
@@ -2421,7 +2502,10 @@ def build_check(
 
     A module whose build fell back to ASan/UBSan, or failed, fails the check with the first
     compiler error of its E-ACSL attempt. Fuzzing it would lose the E-ACSL checks without anyone
-    deciding so. A module whose `fuzz_engine` param is `sanitizers` passes: that is a recorded choice
+    deciding so. When the error is a known E-ACSL limitation with no source-level fix
+    (KNOWN_EACSL_FAILURES), the row adds its `reason_code` and, as `next_step`, the `params set`
+    command that records the sanitizers choice; the module still fails until someone runs it.
+    A module whose `fuzz_engine` param is `sanitizers` passes: that is a recorded choice
     (`params set --module M --fuzz-engine sanitizers`), or the DAG's for its unit (the GCC fallback,
     setjmp/longjmp), whose reason the row gives. A module the reach gate stops (its `build-<mod>`
     recipe refuses it) is `not_built` with the gate's reason, whatever build report an earlier run left.
@@ -2490,6 +2574,14 @@ def build_check(
             if log:
                 entry["compile_log"] = log
                 entry["first_error"] = _first_build_error(run_dir / log)
+                known = known_eacsl_failure(run_dir / log)
+                if known:
+                    entry["reason_code"], why = known
+                    entry["reason"] = (
+                        f"{why}. Fuzzing the module with the sanitizers instead loses the E-ACSL checks "
+                        "(sub-object overflow, \\initialized); build-check accepts it only as a recorded choice"
+                    )
+                    entry["next_step"] = sanitizers_command(mod.name)
         results[mod.name] = entry
     out = {
         "ok": all(r["ok"] for r in results.values()),

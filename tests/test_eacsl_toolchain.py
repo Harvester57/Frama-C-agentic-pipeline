@@ -82,6 +82,26 @@ def test_flag_sets_route_glibc_fp_classification_away_from_gcc_builtins(tmp_path
     assert "/eacsl" not in T.build_eacsl_flag_sets("-Isrc", fc_stubs=bare)["frontend"]
 
 
+def test_full_memory_tracking_drops_register_on_the_eacsl_frontend_only(tmp_path):
+    # nettle arcfour.c: full tracking registers every local by address, and the kernel aborts on
+    # `register uint8_t i, j;` ("Taking the address of a register variable").
+    assert T.EACSL_FULL_MTRACKING_FLAG in T.EACSL_FC_EXTRA_FLAGS
+    assert T.uses_full_mtracking(True) and not T.uses_full_mtracking(False)
+    flags = T.build_eacsl_flag_sets("-Isrc -DFOO", fc_stubs=None, full_mtracking=True)
+    front, back = flags["frontend"].split(), flags["backend"].split()
+    assert "-Dregister=" in front and "-Dregister=" not in back
+    assert front.index("-Dregister=") < front.index("-Isrc")
+    assert "-Dregister=" not in T.build_eacsl_flag_sets("-Isrc", fc_stubs=None)["frontend"]
+    assert "-Dregister=" not in T.EACSL_DEFINES  # preprocess_source and the legacy CLI never get it
+
+
+def test_register_define_stays_in_the_eacsl_build():
+    # Harness cppflags also feed Eva and WP: no harness generator, Make template or other phase adds it.
+    files = [*(REPO / "scripts").glob("*.py"), *(REPO / "templates").rglob("*.*")]
+    owners = sorted(p.name for p in files if p.is_file() and b"-Dregister=" in p.read_bytes())
+    assert owners == ["eacsl_toolchain.py", "run_eacsl_fuzz.py"]
+
+
 def test_eacsl_math_shim_maps_type_generic_dispatch_and_signbit_for_eacsl_only():
     shim = REPO / "templates" / "fc_stubs" / T.EACSL_STUBS_SUBDIR / "math.h"
     text = shim.read_text(encoding="utf-8")
@@ -183,6 +203,11 @@ def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path
     assert stage2[-1].endswith("fuzz_mod.instrumented.c")
     assert res["binary"].endswith("fuzz_mod.e-acsl")
     assert res["undeclared_functions"] == []
+    # Full tracking: `register` is dropped on the frontend only, and the build report says so.
+    assert "-Dregister=" in stage1[stage1.index("-E") + 1].split() and "-Dregister=" not in backend.split()
+    assert res["full_mtracking_defines"] == ["-Dregister="] and "-Dregister=" in res["frontend_flags"]
+    assert "-Dregister=" in Path(res["compile_log"]).read_text(encoding="utf-8")
+    assert "alignas_rewrites" not in res  # nothing to rewrite in this instrumented file
 
 
 def test_slice_defining_llvmfuzzerinitialize_is_refused(tmp_path, modern_cli):
@@ -443,6 +468,58 @@ def test_the_build_marks_formals_initialized_without_reducing_checks(tmp_path, m
     assert res["formal_inits"] == 7 and res["reduced_checks"] == ["-no-rte-initialized"]
 
 
+# What the Frama-C 35 printer makes of `alignas` (checked in framac-analysis): members get it after
+# the declarator, which clang rejects; globals and locals get it before, which is valid C.
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        ("   uint64_t u64[2] _Alignas(16) ;", "   uint64_t u64[2] __attribute__((__aligned__(16))) ;"),
+        (
+            "   uint32_t keys[4 * (10 + 1)] _Alignas(16) ;",
+            "   uint32_t keys[4 * (10 + 1)] __attribute__((__aligned__(16))) ;",
+        ),
+        ("   char c _Alignas(_Alignof(uint64_t)) ;", "   char c __attribute__((__aligned__(_Alignof(uint64_t)))) ;"),
+        ("   int a _Alignas(2 * 16) ;", "   int a __attribute__((__aligned__(2 * 16))) ;"),
+        ("   int (*fp)(int ) _Alignas(16) ;", "   int (*fp)(int ) __attribute__((__aligned__(16))) ;"),
+        (
+            "   uint64_t x _Alignas(16)  __attribute__((__unused__));",
+            "   uint64_t x __attribute__((__aligned__(16)))  __attribute__((__unused__));",
+        ),
+        ("static unsigned char  _Alignas(32)gbuf[64];", None),
+        ("int _Alignas(16) gx = 3;", None),
+        ("  char  _Alignas(64)loc[8];", None),
+        ("   int x  __attribute__((__aligned__(16)));", None),
+    ],
+)
+def test_member_alignas_printed_after_the_declarator_becomes_an_aligned_attribute(printed, expected):
+    text, count = T.rewrite_trailing_alignas(f"union blk {{\n{printed}\n}};\n")
+    assert count == (expected is not None)
+    assert text == f"union blk {{\n{expected or printed}\n}};\n"
+    assert T.rewrite_trailing_alignas(text) == (text, 0)  # idempotent
+
+
+ALIGNAS_C = """union nettle_block16 {
+   uint8_t b[16] ;
+   uint64_t u64[2] _Alignas(16) ;
+};
+struct aes128_ctx {
+   uint32_t keys[4 * (10 + 1)] _Alignas(16) ;
+};
+int entry(int x)
+{
+  return x;
+}
+"""
+
+
+def test_the_build_rewrites_member_alignas_and_counts_it(tmp_path, modern_cli):
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=FakeEacslGcc(ALIGNAS_C))
+    assert res["returncode"] == 0 and res["alignas_rewrites"] == 2
+    text = (tmp_path / "fuzz_mod.instrumented.c").read_text(encoding="utf-8")
+    assert "_Alignas" not in text and text.count("__attribute__((__aligned__(16)))") == 2
+    assert "Rewrote 2 _Alignas(N)" in Path(res["compile_log"]).read_text(encoding="utf-8")
+
+
 def test_rte_initialized_opt_out_is_recorded(tmp_path, modern_cli):
     fake = FakeEacslGcc()
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", rte_initialized=False, runner=fake)
@@ -554,6 +631,8 @@ def test_legacy_cli_also_normalizes(tmp_path, monkeypatch):
     assert res["returncode"] == 0
     cflag = next(a for a in calls[0] if a.startswith("--cflag="))
     assert " -g " not in f" {cflag[len('--cflag=') :]} "
+    # The one-command CLI runs without full memory tracking, so `register` stays.
+    assert "-Dregister=" not in cflag and "full_mtracking_defines" not in res
 
 
 # ---------------------------------------------------------------------------
@@ -1263,3 +1342,79 @@ def test_sanitize_fuzzer_dictionary_file(tmp_path):
     out_text = out_file.read_text(encoding="utf-8")
     assert 'bad_kw="line1\\x0aline2"' in out_text
     assert "# comment" in out_text
+
+
+# ---------------------------------------------------------------------------
+# The two nettle build fixes, end to end in the analysis image (FRAMAC_DOCKER_TESTS=1)
+# ---------------------------------------------------------------------------
+
+REGISTER_ALIGNAS_C = r"""#include <stdalign.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+union blk { alignas(16) uint64_t u64[2]; uint8_t b[16]; };
+
+static unsigned sum(const uint8_t *src, size_t n)
+{
+    register size_t i;
+    register unsigned s = 0;
+    for (i = 0; i < n; i++)
+        s += src[i];
+    return s;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (data == NULL || size > 64)
+        return 0;
+    uint8_t *copy = (uint8_t *)malloc(size > 0 ? size : 1U);
+    if (copy == NULL)
+        return 0;
+    if (size > 0)
+        memcpy(copy, data, size);
+    union blk x;
+    x.u64[0] = sum(copy, size);
+    x.u64[1] = 0;
+    free(copy);
+    return x.b[15];
+}
+"""
+
+IMAGE_BUILD_SCRIPT = r"""set -e
+cp -r /fixture /tmp/w && cd /tmp/w
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/repo/scripts")
+import run_eacsl_fuzz as R
+res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
+keys = ("returncode", "reason", "binary", "alignas_rewrites", "full_mtracking_defines")
+print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
+EOF
+cp out/fuzz_mod.instrumented.c layout.c
+printf '\n_Static_assert(_Alignof(union blk) == 16, "blk");\n' >> layout.c
+clang -fsyntax-only -w layout.c && echo LAYOUT_OK
+./out/fuzz_mod.e-acsl -runs=50 > run.log 2>&1 && echo RUN_OK || tail -20 run.log
+"""
+
+
+@pytest.mark.integration
+def test_register_locals_and_member_alignas_build_and_run_in_the_analysis_image(tmp_path):
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mod.c").write_text(REGISTER_ALIGNAS_C, encoding="utf-8")
+    argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro"]
+    argv += ["-v", f"{REPO}:/repo:ro", ANALYSIS_IMAGE, IMAGE_BUILD_SCRIPT]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    out = proc.stdout + proc.stderr
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    assert line, out[-4000:]
+    res = json.loads(line[len("RESULT ") :])
+    assert res["returncode"] == 0, out[-4000:]
+    assert res["full_mtracking_defines"] == ["-Dregister="] and res["alignas_rewrites"] == 1
+    assert res["binary"].endswith(".e-acsl")
+    assert "LAYOUT_OK" in proc.stdout, out[-4000:]  # the rewrite kept the 16-byte alignment
+    assert "RUN_OK" in proc.stdout, out[-4000:]

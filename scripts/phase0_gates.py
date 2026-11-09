@@ -166,6 +166,7 @@ def record_build_check(run_dir: Path, out: dict[str, Any]) -> dict[str, Any]:
             "fuzz_engine": r.get("fuzz_engine"),
             "first_error": r.get("first_error"),
             "reason": r.get("reason"),
+            **{k: r[k] for k in ("reason_code", "next_step") if r.get(k)},
         }
         for name, r in (out.get("modules") or {}).items()
         if isinstance(r, dict)
@@ -274,8 +275,14 @@ def check(
         else:
             ok, status = _build_ok(run_dir, module, row)
             if not ok:
+                same = status == row.get("status")
                 detail = row.get("first_error") or row.get("reason")
-                first = f" ({detail})" if detail and status == row.get("status") else ""
+                first = f" ({detail})" if detail and same else ""
+                if same and row.get("next_step"):
+                    first += (
+                        f"; {row.get('reason_code')}: E-ACSL cannot instrument it, "
+                        f"to fuzz it with the sanitizers run `{row['next_step']}`"
+                    )
                 reasons.append(f"build-check failed for {module}: {status}{first}")
     return reasons
 
