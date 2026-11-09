@@ -274,6 +274,90 @@ def test_rejected_by_the_guardrail_is_never_best_even_with_the_best_proof_ratio(
     assert load(prover.guard_path)["status"] == PASSED
 
 
+def _failure(predicate: str, **extra: Any) -> dict:
+    return {
+        "file": "/framac-run/agents/prove-f/scratch/work/src/m/f.c",
+        "line": 1,
+        "function": FN,
+        "kind": "precondition",
+        "alarm_kind": None,
+        "is_rte": False,
+        "label": "pos",
+        "predicate": predicate,
+        **extra,
+    }
+
+
+def guard_report(prover: Prover, tag: str, status: str, failure: dict | None) -> None:
+    """One candidate whose guardrail report carries a parsed E-ACSL failure."""
+    prover.edit(annotated(tag))
+    digest = PC.tracked_digest(prover.scratch)
+    report = {"mode": "guardrail", "status": status, "reason": f"why {tag}", "failure": failure}
+    write_json(prover.guard_path, report)
+    note(prover.guard_path, "guardrail", report, digest)
+
+
+def test_a_refuting_guardrail_keeps_its_reason_and_the_trimmed_failure(prover):
+    guard_report(prover, "a", "rejected_overconstrained", _failure("x >= 0"))
+    summary = prover.state()["candidates"][PC.tracked_digest(prover.scratch)]["guardrail"]
+    assert summary == {
+        "status": "rejected_overconstrained",
+        "reason": "why a",
+        "failure": {
+            "function": FN,
+            "line": 1,
+            "kind": "precondition",
+            "label": "pos",
+            "predicate": "x >= 0",
+            "is_rte": False,
+        },
+    }
+    guard_report(prover, "b", PASSED, None)
+    assert prover.state()["candidates"][PC.tracked_digest(prover.scratch)]["guardrail"] == {"status": PASSED}
+
+
+def test_refuted_clauses_dedupes_by_predicate_and_ignores_code_faults(prover):
+    guard_report(prover, "a", "rejected_overconstrained", _failure("x >= 0"))
+    guard_report(prover, "b", "rejected_overconstrained", _failure("x >= 0", line=7))
+    guard_report(prover, "c", "code_fault", _failure("rte: x + 1 <= 2147483647", is_rte=True))
+    guard_report(prover, "d", "rejected_overconstrained", _failure("10 / x > 0", annotation_rte=True))
+    guard_report(prover, "e", "rejected_overconstrained", _failure("10 / x > 0"))
+    guard_report(prover, "f", "rejected_overconstrained", None)
+    clauses = PC.refuted_clauses(prover.scratch)
+    assert [(c["predicate"], c["annotation_rte"], c["candidate"]) for c in clauses] == [
+        ("x >= 0", False, 1),
+        ("10 / x > 0", True, 4),
+        ("10 / x > 0", False, 5),
+    ]
+    assert clauses[0] == {
+        "predicate": "x >= 0",
+        "label": "pos",
+        "line": 1,
+        "kind": "precondition",
+        "annotation_rte": False,
+        "candidate": 1,
+    }
+    assert PC.status(prover.scratch)["refuted_clauses"] == clauses
+
+
+def test_refuted_clauses_reads_the_report_of_a_summary_recorded_before_failures_were_kept(prover):
+    guard_report(prover, "a", "rejected_overconstrained", _failure("x >= 0"))
+    state = prover.state()
+    for cand in state["candidates"].values():
+        cand["guardrail"] = {"status": "rejected_overconstrained"}
+    write_json(prover.scratch / PC.STATE_FILE, state)
+    assert [c["predicate"] for c in PC.refuted_clauses(prover.scratch)] == ["x >= 0"]
+
+
+def test_refuted_clauses_is_empty_on_a_missing_or_malformed_state(prover):
+    assert PC.refuted_clauses(prover.scratch) == []
+    (prover.scratch / PC.CANDIDATES_DIR).mkdir(parents=True)
+    (prover.scratch / PC.STATE_FILE).write_text("{not json", encoding="utf-8")
+    assert PC.refuted_clauses(prover.scratch) == []
+    write_json(prover.scratch / PC.STATE_FILE, {"schema": PC.SCHEMA_VERSION, "candidates": {"d": {"id": 1}}})
+    assert PC.refuted_clauses(prover.scratch) == []
+
+
 @pytest.mark.parametrize(
     ("guard", "wp"),
     [

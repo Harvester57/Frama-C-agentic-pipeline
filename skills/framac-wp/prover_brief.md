@@ -19,6 +19,8 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 
 <!-- deterministic-context -->
 
+A `Known Dead Ends` section, when present, lists clauses already refuted on this function or rejected by a callee; never re-add them.
+
 <!-- spec-kb -->
 
 ## Strict Rules

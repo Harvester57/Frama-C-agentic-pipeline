@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import function_facts  # noqa: E402
 import function_slice  # noqa: E402
+import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
@@ -1392,6 +1393,41 @@ def merge_agent_overlay(
         return res
 
 
+def _callee_names(fn_meta: dict) -> list[str]:
+    """The function's callees from its call graph record, as plain names (`file#fn` keys lose the file)."""
+    for key in ("internal_callees", "direct_callees", "callees"):
+        raw = fn_meta.get(key)
+        if isinstance(raw, list) and raw:
+            return sorted({str(c).rsplit("#", 1)[-1] for c in raw if c})
+    return []
+
+
+def _earlier_refutations(run_dir: Path, agent_id: str, function: str | None, c_file: str | None) -> list[dict]:
+    """
+    Clauses the guardrail refuted on earlier provers of the same function and file in this run. A re-dispatch gets a
+    fresh agent id (wp_scheduler._assign_agent), so the earlier attempts live in other agents' scratch directories.
+    """
+    agents = run_dir / "agents"
+    if not function or not agents.is_dir():
+        return []
+    out: list[dict] = []
+    for agent in sorted(agents.iterdir()):
+        scratch = agent / "scratch"
+        if agent.name == agent_id or not (scratch / prover_candidates.STATE_FILE).is_file():
+            continue
+        try:
+            budget = json.loads((scratch / prover_candidates.BUDGET_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(budget, dict) or budget.get("function") != function:
+            continue
+        if c_file and _normalize_work_relpath(str(budget.get("file") or "")) != c_file:
+            continue
+        for clause in prover_candidates.refuted_clauses(scratch):
+            out.append({**clause, "kind": "guardrail_refutation", "function": function, "source": agent.name})
+    return out
+
+
 def _load_function_facts(overlay: Path, module: str | None, c_file: str | None, function: str | None) -> dict | None:
     """
     A function's facts (`reports/facts/<harness module>.json`): the module's own report, then that
@@ -2676,6 +2712,14 @@ def prepare_agent(
         if spec_kb.enabled():
             record = _load_function_facts(overlay, module, norm_c_file, function)
             kb_section = spec_kb.kb_section_for(overlay, record)
+    if role in ("prover", "breaker") and spec_kb.enabled():
+        # Dead ends: clauses refuted on this function (earlier dispatches included) and rejected callee requests.
+        kb_section += spec_kb.obstructions_section_for(
+            overlay,
+            function,
+            _callee_names(fn_meta),
+            _earlier_refutations(run_dir, agent_id, function, norm_c_file),
+        )
     replacements = {
         "{agent_id}": agent_id,
         "{module_name}": module or "unknown",

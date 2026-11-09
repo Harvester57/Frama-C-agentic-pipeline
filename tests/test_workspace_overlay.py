@@ -16,6 +16,8 @@ import pytest
 
 import cache
 import pipeline_make
+import prover_candidates
+import spec_kb
 import workspace_overlay as WO
 from conftest import ROOT
 from eacsl_toolchain import build_eacsl_flag_sets
@@ -448,6 +450,101 @@ def test_prepare_agent_brief_of_a_colliding_function(tmp_path):
     assert "Topological Wave: `3`" in brief
     # Not the module's properties: only src/a.c's helper has this one.
     assert "only_in_a_c_helper" not in brief
+
+
+def _dead_end_run(tmp_path: Path) -> Path:
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    (target / "src" / "p.c").write_text(
+        "int parse_hdr(int x) { return x; }\nint parse(int x) { return parse_hdr(x); }\n", encoding="utf-8"
+    )
+    run_dir = tmp_path / "run"
+    WO.init_overlay(target, run_dir / "workspace")
+    (run_dir / "run-metadata.json").write_text(json.dumps({"profile": "standard"}), encoding="utf-8")
+    dag = {
+        "modules": {"m": {"tier": "Tier 1A"}},
+        "functions": {
+            "parse": {"name": "parse", "file": "src/p.c", "module": "m", "internal_callees": ["src/p.c#parse_hdr"]},
+            "parse_hdr": {"name": "parse_hdr", "file": "src/p.c", "module": "m"},
+        },
+    }
+    (run_dir / "workspace" / "reports" / "callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
+    return run_dir
+
+
+def _store_dead_ends(run_dir: Path) -> None:
+    kb = spec_kb.kb_dir_of(run_dir / "workspace")
+    kb.mkdir(parents=True, exist_ok=True)
+    items = [
+        {
+            "id": "guard:parse:1",
+            "kind": "guardrail_refutation",
+            "function": "parse",
+            "predicate": "x <= 64",
+            "line": 2,
+            "label": "small",
+            "annotation_rte": False,
+            "source": "prove-parse",
+            "candidate": 2,
+        },
+        {
+            "id": "req:r1",
+            "kind": "rejected_strengthening",
+            "callee_function": "parse_hdr",
+            "caller_function": "parse",
+            "needed_clause": "ensures \\result >= 0;",
+            "resolution_note": "x may be negative",
+        },
+    ]
+    (kb / spec_kb.OBSTRUCTIONS_FILE).write_text(json.dumps({"schema": 1, "items": items}), encoding="utf-8")
+
+
+def _brief(run_dir: Path, agent_id: str, role: str) -> str:
+    WO.prepare_agent(run_dir=run_dir, agent_id=agent_id, role=role, c_file="src/p.c", function="parse")
+    return (run_dir / "agents" / agent_id / "brief.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("role", ["prover", "breaker"])
+def test_prover_and_breaker_briefs_list_known_dead_ends(tmp_path, monkeypatch, role):
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    run_dir = _dead_end_run(tmp_path)
+    assert "Known Dead Ends (Do Not Repeat)\n" not in _brief(run_dir, f"{role}-before", role)
+    _store_dead_ends(run_dir)
+    brief = _brief(run_dir, f"{role}-parse", role)
+    assert spec_kb.KB_SENTINEL not in brief
+    assert "## Known Dead Ends (Do Not Repeat)" in brief
+    assert "`x <= 64` (line 2, label `small`): failed under E-ACSL" in brief
+    assert "Callee `parse_hdr`: `ensures \\result >= 0;` was requested by `parse`" in brief
+    monkeypatch.setenv(spec_kb.KB_ENV, "off")
+    off = _brief(run_dir, f"{role}-off", role)
+    assert "## Known Dead Ends" not in off and spec_kb.KB_SENTINEL not in off
+
+
+def test_a_redispatched_prover_sees_the_refutations_of_its_earlier_attempt(tmp_path, monkeypatch):
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    run_dir = _dead_end_run(tmp_path)
+    _brief(run_dir, "prove-parse", "prover")
+    scratch = run_dir / "agents" / "prove-parse" / "scratch"
+    state = {
+        "schema": prover_candidates.SCHEMA_VERSION,
+        "function": "parse",
+        "candidates": {
+            "d1": {
+                "id": 1,
+                "guardrail": {
+                    "status": "rejected_overconstrained",
+                    "failure": {"predicate": "x != 0", "line": 2, "label": "nz"},
+                },
+            },
+        },
+    }
+    (scratch / "candidates").mkdir(parents=True)
+    (scratch / prover_candidates.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+    brief = _brief(run_dir, "prove-parse-2", "prover")
+    assert (
+        "`x != 0` (line 2, label `nz`): failed under E-ACSL on a corpus input (candidate 1 of agent prove-parse)"
+        in brief
+    )
 
 
 # ---------------------------------------------------------------------------

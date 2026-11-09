@@ -258,3 +258,143 @@ def test_brief_gets_kb_section_via_prepare_agent(tmp_path: Path, monkeypatch: py
     )
     brief2 = (run_dir / prep2["brief_file"]).read_text(encoding="utf-8")
     assert "Retrieved ACSL Knowledge" not in brief2
+
+
+# ---------------------------------------------------------------------------
+# Obstructions: dead ends not to repeat
+# ---------------------------------------------------------------------------
+
+
+def _write(path: Path, doc: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _guard(run_dir: Path, agent: str, cand: int, status: str, predicate: str, **failure: object) -> None:
+    scratch = run_dir / "agents" / agent / "scratch"
+    _write(scratch / ".prover_budget.json", {"function": "parse", "file": "src/p.c"})
+    _write(
+        scratch / "candidates" / f"c{cand}" / "guard_parse.json",
+        {
+            "status": status,
+            "failure": {
+                "function": "parse",
+                "line": 12,
+                "kind": "postcondition",
+                "label": "bound",
+                "predicate": predicate,
+                **failure,
+            },
+        },
+    )
+
+
+def _obstruction_run(tmp_path: Path) -> Path:
+    run_dir = tmp_path / "run"
+    _guard(run_dir, "prove-parse", 3, "rejected_overconstrained", "\\result <= 64")
+    _guard(run_dir, "prove-parse-2", 1, "rejected_overconstrained", "\\result <= 64")
+    _guard(run_dir, "prove-parse-2", 2, "code_fault", "rte: mem_access: \\valid_read(p)", is_rte=True)
+    _guard(run_dir, "prove-parse-3", 1, "rejected_overconstrained", "n / d > 0", annotation_rte=True)
+    _write(
+        run_dir / "workspace" / "reports" / "strengthen_requests.json",
+        {
+            "requests": [
+                {
+                    "id": "r1",
+                    "status": "rejected_by_callee",
+                    "caller_function": "read_pkt",
+                    "callee_function": "parse_hdr",
+                    "callee_file": "src/h.c",
+                    "needed_clause": "ensures \\result <= 64;",
+                    "resolution_note": "the header length field is attacker-controlled: no bound holds",
+                },
+                {
+                    "id": "r2",
+                    "status": "rejected_by_callee",
+                    "caller_function": "read_pkt",
+                    "callee_function": "missing",
+                    "needed_clause": "ensures \\result > 0;",
+                    "resolution_note": "not dispatched: callee not found in the ledger or the call graph",
+                },
+                {
+                    "id": "r3",
+                    "status": "pending",
+                    "caller_function": "read_pkt",
+                    "callee_function": "parse_hdr",
+                    "needed_clause": "ensures \\result >= 0;",
+                },
+            ]
+        },
+    )
+    return run_dir
+
+
+def test_mine_obstructions_merges_refutations_and_keeps_only_real_rejections(tmp_path: Path) -> None:
+    run_dir = _obstruction_run(tmp_path)
+    doc = spec_kb.mine_obstructions(run_dir)
+    out = spec_kb.kb_dir_of(run_dir / "workspace") / spec_kb.OBSTRUCTIONS_FILE
+    assert json.loads(out.read_text(encoding="utf-8"))["schema"] == spec_kb.OBSTRUCTION_SCHEMA
+    items = doc["items"]
+    guards = [it for it in items if it["kind"] == "guardrail_refutation"]
+    reqs = [it for it in items if it["kind"] == "rejected_strengthening"]
+    assert len(guards) == 2  # the code_fault is a code defect candidate, not a dead end
+    bound = next(it for it in guards if it["predicate"] == "\\result <= 64")
+    assert bound["seen"] == 2 and bound["function"] == "parse" and bound["file"] == "src/p.c"
+    assert bound["annotation_rte"] is False and bound["id"].startswith("guard:parse:")
+    assert next(it for it in guards if it["predicate"] == "n / d > 0")["annotation_rte"] is True
+    assert [it["id"] for it in reqs] == ["req:r1"]
+    # Mining again sees no new source: nothing is counted twice.
+    again = spec_kb.mine_obstructions(run_dir)
+    assert next(it for it in again["items"] if it["id"] == bound["id"])["seen"] == 2
+
+
+def test_mine_run_fills_the_obstruction_store_and_never_raises(tmp_path: Path) -> None:
+    run_dir = _obstruction_run(tmp_path)
+    (run_dir / "agents" / "prove-parse" / "scratch" / "candidates" / "c9").mkdir()
+    (run_dir / "agents" / "prove-parse" / "scratch" / "candidates" / "c9" / "guard_parse.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+    spec_kb.mine_run(run_dir)
+    out = spec_kb.kb_dir_of(run_dir / "workspace") / spec_kb.OBSTRUCTIONS_FILE
+    assert len(json.loads(out.read_text(encoding="utf-8"))["items"]) == 3
+    assert spec_kb.mine_obstructions(tmp_path / "nowhere", tmp_path / "o.json")["items"] == []
+
+
+def test_obstructions_for_filters_by_function_and_callee_and_caps(tmp_path: Path) -> None:
+    run_dir = _obstruction_run(tmp_path)
+    overlay = run_dir / "workspace"
+    spec_kb.mine_obstructions(run_dir)
+    got = spec_kb.obstructions_for(overlay, "parse", ["src/h.c#parse_hdr"])
+    assert [it["kind"] for it in got] == ["guardrail_refutation"] * 2 + ["rejected_strengthening"]
+    assert spec_kb.obstructions_for(overlay, "other", ["parse_hdr"])[0]["id"] == "req:r1"
+    assert spec_kb.obstructions_for(overlay, "other", ["other_callee"]) == []
+    extra = [
+        {"kind": "guardrail_refutation", "function": "parse", "predicate": f"x > {i}", "candidate": i}
+        for i in range(20)
+    ]
+    capped = spec_kb.obstructions_for(overlay, "parse", ["parse_hdr"], extra)
+    assert len(capped) == spec_kb.MAX_OBSTRUCTIONS_RENDERED
+    assert capped[0]["predicate"] == "x > 0"
+
+
+def test_obstructions_for_reads_live_rejections_before_any_mining(tmp_path: Path) -> None:
+    run_dir = _obstruction_run(tmp_path)
+    got = spec_kb.obstructions_for(run_dir / "workspace", "read_pkt", ["parse_hdr"])
+    assert [it["id"] for it in got] == ["req:r1"]
+
+
+def test_obstructions_section_renders_both_wordings_and_honours_the_kill_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = _obstruction_run(tmp_path)
+    overlay = run_dir / "workspace"
+    spec_kb.mine_obstructions(run_dir)
+    text = spec_kb.obstructions_section_for(overlay, "parse", ["parse_hdr"])
+    assert text.startswith("## Known Dead Ends (Do Not Repeat)")
+    assert "`\\result <= 64` (line 12, label `bound`): failed under E-ACSL on a corpus input (candidate" in text
+    assert "`n / d > 0` (line 12, label `bound`): evaluated an undefined term at runtime" in text
+    assert "Callee `parse_hdr`: `ensures \\result <= 64;` was requested by `read_pkt` and could not be proven" in text
+    assert "not dispatched" not in text and "valid_read" not in text
+    assert spec_kb.obstructions_section_for(overlay, "unrelated", []) == ""
+    monkeypatch.setenv(spec_kb.KB_ENV, "off")
+    assert spec_kb.obstructions_section_for(overlay, "parse", ["parse_hdr"]) == ""
