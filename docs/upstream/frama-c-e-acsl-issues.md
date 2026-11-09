@@ -37,6 +37,7 @@ patches together.
 | 10 | `e-acsl-gcc -G clang` overwrites `CFLAGS` | **Present** | **Yes, medium** | Drops `-std=c99`, `-m<bits>`, `-g -O2`, `--rt-debug` flags; the `--rt-debug` backtrace comes out empty. File together with 12 | [clang-cflags](frama-c-eacsl-gcc-clang-cflags.md) |
 | 12 | `e-acsl-gcc` compiles with `-std=c99` but without the `-D_DEFAULT_SOURCE` Frama-C preprocessed with | **Present** | **Yes, medium** | With gcc 14, any program calling `strdup`, `strtok_r`, `fileno`, … fails to build; clang works only because of Issue 10 | [default-source](frama-c-eacsl-gcc-default-source.md) |
 | 13 | Formals registered with `__e_acsl_store_block` but never marked initialized | **Present** (also 34) | **Yes, high** | Any `\initialized` on a by-value struct field fails on every call, with or without `-rte`. Same bug as closed #177, which fails again. Same family as 8: file together | [formal-params-initialized](frama-c-eacsl-formal-params-initialized.md) |
+| 14 | `<==>` over a labelled term (`\old`, `\at`, a formal in `ensures`) aborts with `labels pre-analysis was not performed` | **Present** (regression; 34 works) | **Yes, high** | A common postcondition shape (`(\result != 0) <==> (b->n == 0)`) cannot be instrumented at all; fix not validated yet | [iff-labelled-term](frama-c-eacsl-iff-labelled-term.md) |
 | 2 | `-O` builds plain + `.e-acsl`; `-X`/`--oexec-e-acsl` absent from `-h` | Unchanged | No | Documented behaviour (`man e-acsl-gcc` describes `-O`, `-X`, `--oexec-e-acsl`; `-h` says it lists only basic options) | — |
 | 6 | RTL abort in `unsafe_initialize` has no target location | Unchanged | No | `--rt-debug` already prints a backtrace naming the target function; its failure under clang is Issue 10 | — |
 | 7 | Unknown names in `-rte-select`/`-e-acsl-functions` abort | Unchanged | No | Same convention as `-wp-fct`; deliberate kernel-wide behaviour | — |
@@ -632,6 +633,33 @@ reads that member. Today that check fails on every call anyway. A scalar argumen
 at the call site. A more precise variant, which copies the argument's initialization state the way
 temporal analysis passes its per-parameter metadata, is described but not implemented. Patch and
 results: [frama-c-eacsl-formal-params-initialized.md](frama-c-eacsl-formal-params-initialized.md).
+
+---
+
+## Issue 14: `<==>` over a labelled term aborts the translation
+
+**Status in Frama-C 35.** **Present**, regression: `34.0~~dev (Selenium)` works. Found 2026-11-09
+when the parent guardrail of a carried-forward libmnl proof (`mnl_nlmsg_batch_is_empty`) returned
+`compile_error`.
+
+**Observed.** `ensures (\result != 0) <==> (b->n == 0);` stops E-ACSL with
+`Failure: labels pre-analysis was not performed on construct \old(b)`. Any `<==>` whose operands
+contain `\old`, `\at(..., L)`, or a formal parameter in a postcondition (read as `\old(formal)`)
+fails, in a contract or a body `assert`. The same predicate as two `==>`, or with `^^`, works.
+None of the loop-invariant cases we tried fail.
+
+**Root cause.** The `Piff` case of `Translate_predicates.to_exp` now deep-copies both operands
+(`Terms.Id.deep_copy_predicate`) and re-runs the RTE pre-analysis on the copies, but not the labels
+pre-analysis. That pre-analysis runs once per file and keys labelled terms by identity, so the
+copies' `\old` / `\at` terms have no entry. 34 reused the operands without copying.
+
+**Workaround.** None in the pipeline yet: a contract of this shape cannot pass the parent guardrail
+on 35, and the merge is refused (`parent guardrail returned status='compile_error'`). Writing the
+equivalence as two implications avoids it.
+
+**Proposed fix (not validated).** Translate each operand once and combine the C expressions, as the
+interlang `Piff` case already does. Reproducer, table of failing shapes and the 34/35 source diff:
+[frama-c-eacsl-iff-labelled-term.md](frama-c-eacsl-iff-labelled-term.md).
 
 ---
 
