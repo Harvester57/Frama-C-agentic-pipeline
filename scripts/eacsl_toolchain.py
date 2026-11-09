@@ -53,7 +53,10 @@ EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-f
 # Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
 # leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full
 # tracking fixes that; it needs the runtime initialized by templates/eacsl_runtime/fuzz_init.c.
-EACSL_FC_EXTRA_FLAGS = ("-e-acsl-assert-print-data", "-e-acsl-full-mtracking")
+# Failure reports print the values involved by default (-e-acsl-O-print-values, on at O <= 3).
+# Never pass the deprecated -e-acsl-assert-print-data: Frama-C 34+ aliases it to -e-acsl-O-valid,
+# which re-instruments proven annotations (docs/upstream/frama-c-eacsl-assert-print-data-alias.md).
+EACSL_FC_EXTRA_FLAGS = ("-e-acsl-full-mtracking",)
 # RTE emits no initialization assertions unless asked, so uninitialized reads would go unchecked.
 # Reads of memory written outside instrumented code (libFuzzer's `data`, external libraries) fail
 # these checks: harnesses must copy the input into their own buffer, as generated harnesses do.

@@ -168,7 +168,9 @@ def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path
     # --no-constfold: prevent CIL constant folding from zero-folding block-scope static const arrays.
     assert stage1[1:3] == ["-n", "--no-constfold"]
     fc_flags = stage1[stage1.index("-F") + 1]
-    assert "-e-acsl-assert-print-data" in fc_flags and "-e-acsl-full-mtracking" in fc_flags
+    assert "-e-acsl-full-mtracking" in fc_flags
+    # Deprecated alias of -e-acsl-O-valid on Frama-C 34+, not of -e-acsl-O-print-values.
+    assert "assert-print-data" not in fc_flags
     assert "-rte-initialized @all" in fc_flags and res["reduced_checks"] == []
     assert "-include stub.h" in stage1[stage1.index("-E") + 1]
     backend = stage2[stage2.index("-e") + 1]
@@ -447,6 +449,18 @@ def test_rte_initialized_opt_out_is_recorded(tmp_path, modern_cli):
     assert res["returncode"] == 0
     assert "-rte-initialized" not in fake.calls[0][fake.calls[0].index("-F") + 1]
     assert res["reduced_checks"] == ["-no-rte-initialized"]
+
+
+def test_variadic_opt_out_uses_the_kernel_option(tmp_path, modern_cli):
+    fake = FakeEacslGcc()
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", variadic_translation=False, runner=fake)
+    assert res["returncode"] == 0
+    fc_flags = fake.calls[0][fake.calls[0].index("-F") + 1].split()
+    # Frama-C 34+ moved Variadic into the kernel and rejects the plug-in spelling -variadic-no-translation.
+    assert "-no-variadic-translation" in fc_flags and "-variadic-no-translation" not in fc_flags
+    default = FakeEacslGcc()
+    R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "default_mod", runner=default)
+    assert "variadic" not in default.calls[0][default.calls[0].index("-F") + 1]
 
 
 def test_campaign_cli_threads_no_rte_initialized(tmp_path, monkeypatch):

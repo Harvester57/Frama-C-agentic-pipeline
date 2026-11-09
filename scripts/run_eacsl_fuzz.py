@@ -958,7 +958,9 @@ def _compile_eacsl_binary_uncached(
             if warn_unsigned_downcast:
                 fc_flags.append("-warn-unsigned-downcast")
             if not variadic_translation:
-                fc_flags.append("-variadic-no-translation")
+                # Kernel option since Frama-C 34; the old Variadic plug-in spelling
+                # -variadic-no-translation is rejected as unknown.
+                fc_flags.append("-no-variadic-translation")
             if fns:
                 fn_csv = ",".join(fns)
                 fc_flags.append(f"-rte-select {fn_csv}")
@@ -4013,7 +4015,7 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
     p.add_argument(
         "--no-variadic-translation",
         action="store_true",
-        help="Pass -variadic-no-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)",
+        help="Pass -no-variadic-translation to Frama-C (no <fn>_fallback_<N> symbols are emitted)",
     )
     p.add_argument(
         "--warn-unsigned-downcast",

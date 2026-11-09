@@ -153,7 +153,7 @@ Behavior changes since Frama-C 33 that the pipeline already accounts for:
 
 ### Symptom: `undefined reference to 'open_fallback_N'` at Link Time
 - **Cause:** in host-header mode, the Variadic translation emits `<fn>_fallback_<N>` for variadic calls without a libc specification (`open`, `fcntl`, `ioctl`, ...), and the E-ACSL RTL does not define them.
-- **Fix:** automatic. The script generates `<out-bin>_fallbacks/eacsl_fallbacks.c`, which forwards to the real function (or fails with `ENOSYS` when the signature or header is unknown, recorded as `mode: enosys`), compiles it to a link-only object, and retries the link once. Never add these definitions to the instrumented sources: each definition shifts the fallback numbering. `--no-variadic-translation` passes `-variadic-no-translation` to Frama-C instead.
+- **Fix:** automatic. The script generates `<out-bin>_fallbacks/eacsl_fallbacks.c`, which forwards to the real function (or fails with `ENOSYS` when the signature or header is unknown, recorded as `mode: enosys`), compiles it to a link-only object, and retries the link once. Never add these definitions to the instrumented sources: each definition shifts the fallback numbering. `--no-variadic-translation` passes `-no-variadic-translation` to Frama-C instead (no fallbacks are emitted).
 
 ### Symptom: `call to undeclared function 'X'` or `invalid application of 'alignof' to an incomplete type`
 - **Cause:** a [`../templates/fc_stubs/`](../templates/fc_stubs/) header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
