@@ -16,7 +16,9 @@ A run writes flamegraph.txt (-eva-flamegraph, render it with `pipeline_make.py r
 flamegraph-<mod>` or scripts/eva_flamegraph.py when a run is slow) unless called with
 --no-flamegraph, as tuning rungs and loop trials are. The cost follows the profile's size: +7% wall
 time on libmnl `attr` (6.8 MB), within noise on QCBOR run-4 (1.1 MB), and QCBOR run-5's base run
-wrote 2.5 GB; only the module's base and plain runs have their profile read. Every run also runs
+wrote 2.5 GB; only the module's base and plain runs have their profile read. Eva writes one line per
+analysed call; the run folds identical stacks into one line (eva_flamegraph.fold_flamegraph) before
+the file is read, cached or copied. Every run also runs
 the nonterm plug-in (-nonterm -nonterm-log), whose warnings land in the report as `nonterm`. The report's
 `repair_hints` field ports upstream make-wrapper's log patterns (recursive call without assigns,
 called function with neither code nor specification) into pipeline actions.
@@ -70,7 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 import phase0_gates  # noqa: E402
-from eva_flamegraph import cost_profile  # noqa: E402
+from eva_flamegraph import cost_profile, fold_flamegraph  # noqa: E402
 from eva_loops import LoopRef, parse_loop_ref, prepare_mirror, strip_mirror  # noqa: E402
 from eva_options import extra_domains as option_domains  # noqa: E402
 from eva_options import framac_args, options_problem, parse_option  # noqa: E402
@@ -1069,6 +1071,10 @@ def _execute_eva(
             if not error_summary:  # a SIGKILL leaves no log line behind
                 error_summary = [f"Frama-C Eva produced no report ({reason}, exit code {returncode})"]
 
+    # One line per distinct stack instead of one per analysed call, before anything reads, caches or
+    # copies it (eva_flamegraph.fold_flamegraph: lossless for every reader).
+    if flamegraph_path.is_file():
+        fold_flamegraph(flamegraph_path)
     # Where a run that hit its time limit spent that time (eva_flamegraph.cost_profile).
     profile = cost_profile(flamegraph_path) if timed_out else None
     return {

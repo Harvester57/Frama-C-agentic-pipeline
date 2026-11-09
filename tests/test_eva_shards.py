@@ -385,9 +385,9 @@ def test_an_obligation_is_valid_only_when_no_reaching_shard_doubts_it(tmp_path, 
     assert report["elapsed_s"] == 20.0 and report["entry_reached"] is True
     assert report["eva_coverage"]["functions_analyzed"] == 3
     assert report["tuning"]["mode"] == "skipped" and report["module"] == "m"
-    # Every shard's profile, concatenated: their sum is the module's Eva work.
+    # Every shard's profile, concatenated and folded: their sum is the module's Eva work.
     fg = (run / "workspace/eva/m/flamegraph.txt").read_text(encoding="utf-8")
-    assert "eva_main;shard0 1.0" in fg and "eva_main;shard1 1.0" in fg
+    assert fg.splitlines() == ["eva_main;shard0 1", "eva_main;shard1 1"]
     assert report["flamegraph_file"].endswith("flamegraph.txt") and report["log_file"] is None
 
 

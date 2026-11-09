@@ -42,6 +42,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from eva_flamegraph import fold_flamegraph  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_NEVER_TRIED,
     ArtifactError,
@@ -479,6 +480,8 @@ def concat_flamegraphs(sources: list[Path], dest: Path) -> bool:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+    # Shards share stacks (eva_main and common callees): merge them as one run's profile is.
+    fold_flamegraph(dest)
     return True
 
 

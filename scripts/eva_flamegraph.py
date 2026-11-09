@@ -12,6 +12,10 @@ so it works headless inside the container. Exit code 0 when flamegraph.svg was (
 
 `cost_profile` reads the same file without rendering it: run_eva_slice.py puts it in the report of
 a run that timed out or fell back, so the slow functions are named without anyone opening the graph.
+
+`fold_flamegraph` merges identical stacks in place. Eva writes one line per analysed call, never
+merged (2.5 GB, 7.1 M lines for QCBOR run-5's base run); every reader adds times per stack, so one
+line per distinct stack with the summed time loses nothing for any of them.
 """
 
 from __future__ import annotations
@@ -20,6 +24,8 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
+import zlib
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
@@ -27,6 +33,93 @@ from typing import Any
 
 # How many functions each list of a cost profile names. Fixed: it shapes the report, not a result.
 COST_PROFILE_TOP = 5
+
+# Input bytes folded in memory at once; a larger file is split into buckets by stack first. Fixed: it
+# bounds memory (a few hundred MB per bucket at most), and the folded file is the same whatever it is.
+FOLD_BUCKET_BYTES = 64 * 1024 * 1024
+# At most this many bucket files open at once, whatever the file's size.
+FOLD_MAX_BUCKETS = 256
+
+
+def _format_time(t: float) -> str:
+    """A time flamegraph.pl reads: plain decimal, never an exponent; integral sums stay integers."""
+    if t == int(t):
+        return str(int(t))
+    return f"{t:.6f}".rstrip("0").rstrip(".")
+
+
+def _parse_sample(line: str) -> tuple[str, float] | None:
+    stack, _, raw = line.rstrip().rpartition(" ")
+    try:
+        t = float(raw)
+    except ValueError:
+        return None
+    if not stack or t < 0 or t != t:
+        return None
+    return stack, t
+
+
+def _fold_lines(lines: Iterable[str], out: Any) -> None:
+    sums: defaultdict[str, float] = defaultdict(float)
+    for line in lines:
+        sample = _parse_sample(line)
+        if sample is not None:
+            sums[sample[0]] += sample[1]
+    for stack in sorted(sums):
+        out.write(f"{stack} {_format_time(round(sums[stack], 6))}\n")
+
+
+def fold_flamegraph(path: Path, bucket_bytes: int = FOLD_BUCKET_BYTES) -> bool:
+    """
+    Merge identical stacks of a `-eva-flamegraph` file in place: one `stack <summed time>` line per
+    distinct stack, sorted by stack. Lines no reader uses (no time, negative time) are dropped. Reads
+    as a stream; a file over `bucket_bytes` is first split into buckets by a hash of the stack, so
+    memory stays bounded. Returns False when the file is missing or cannot be rewritten (left as is).
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    n = max(1, min(FOLD_MAX_BUCKETS, -(-size // max(1, bucket_bytes))))
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_fold_")
+    buckets: list[Path] = []
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as out:
+            if n == 1:
+                with path.open(encoding="utf-8", errors="replace") as handle:
+                    _fold_lines(handle, out)
+            else:
+                handles = []
+                try:
+                    for _ in range(n):
+                        bfd, bname = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_fold_bucket_")
+                        buckets.append(Path(bname))
+                        handles.append(os.fdopen(bfd, "w", encoding="utf-8", newline="\n"))
+                    with path.open(encoding="utf-8", errors="replace") as handle:
+                        for line in handle:
+                            sample = _parse_sample(line)
+                            if sample is None:
+                                continue
+                            k = zlib.crc32(sample[0].encode("utf-8")) % n
+                            handles[k].write(f"{sample[0]} {line.rstrip().rpartition(' ')[2]}\n")
+                finally:
+                    for h in handles:
+                        h.close()
+                for bpath in buckets:
+                    with bpath.open(encoding="utf-8") as handle:
+                        _fold_lines(handle, out)
+        os.replace(tmp, path)
+    except OSError:
+        Path(tmp).unlink(missing_ok=True)
+        return False
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    finally:
+        for bpath in buckets:
+            bpath.unlink(missing_ok=True)
+    return True
 
 
 def _fold(
