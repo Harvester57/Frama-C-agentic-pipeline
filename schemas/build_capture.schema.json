@@ -88,7 +88,8 @@
           "system_flags": {"$comment": "include options naming directories or files outside the tree (absolute)", "type": "array", "items": {"type": "string"}},
           "headers": {"$comment": "project headers the compiler's dependency list names (generated ones included)", "type": "array", "items": {"type": "string"}},
           "includes_setjmp_h": {"$comment": "the dependency list names a setjmp.h: E-ACSL cannot build it (build_callgraph_dag.route_nonlocal_jumps)", "type": "boolean"},
-          "defined_functions": {"$comment": "functions the object defines (nm), as `file#name` ids: compared with the model by build_callgraph_dag (build_only_functions)", "type": "array", "items": {"type": "string"}}
+          "defined_functions": {"$comment": "functions the object defines (nm), as `file#name` ids: compared with the model by build_callgraph_dag (build_only_functions)", "type": "array", "items": {"type": "string"}},
+          "probe_errors": {"$comment": "why the dependency (`deps`) or symbol (`symbols`) probe of this compile failed; {} when both ran, so empty `headers`/`defined_functions` mean the object includes/defines nothing. Absent in captures that predate it", "type": "object", "properties": {"deps": {"type": "string"}, "symbols": {"type": "string"}}, "additionalProperties": false}
         },
         "required": ["source", "object", "cwd", "compiler", "arguments", "flags", "system_flags", "headers"]
       }

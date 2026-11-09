@@ -388,6 +388,25 @@ def concurrency_lines(ledger: list[dict]) -> list[str]:
     return out
 
 
+def model_only_lines(ledger: list[dict]) -> list[str]:
+    """
+    The functions only Frama-C's configuration compiles (`bookkeeping.model_only`, from the DAG's
+    `model_only`): Eva and WP results on them describe code the real build does not contain, and no
+    fuzz harness runs them.
+    """
+    marked: dict[str, str] = {}
+    for u in ledger:
+        why = (u.get("bookkeeping") or {}).get("model_only")
+        if why:
+            marked.setdefault(f"{u.get('function') or 'unknown'} ({u.get('file') or '?'})", str(why))
+    if not marked:
+        return []
+    out = ["Functions the real build does not compile:", ""]
+    out += [f"- {md_escape(fn)}: {md_escape(why)}." for fn, why in sorted(marked.items())]
+    out.append("")
+    return out
+
+
 def spec_quality_section(data: dict) -> list[str]:
     """
     Mutation-based specification quality (COINS/KBSpec) plus the evaluation-duality
@@ -575,6 +594,7 @@ def render_report(data: dict) -> str:
         out.append("")
     out += verdict_limits_section(ledger)
     out += concurrency_lines(ledger)
+    out += model_only_lines(ledger)
     out += spec_quality_section(data)
 
     out += ["## 6. Coverage gaps", ""]

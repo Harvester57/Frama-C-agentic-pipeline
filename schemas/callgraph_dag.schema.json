@@ -94,6 +94,7 @@
         "callgraph_source": {"type": "string", "enum": ["frama_c", "gcc_callgraph"]},
         "callgraph_fallback": {"$comment": "Frama-C's first error for a unit compiling it", "type": "string", "minLength": 1},
         "eva_wp_blocked": {"$comment": "why Eva and WP cannot run on it (its home unit is on the GCC fallback)", "type": "string", "minLength": 1},
+        "model_only": {"$comment": "why the real build does not define it although Frama-C's parse does (build_callgraph_dag.model_only_functions): kept out of harness sources and reach-gate entry points", "type": "string", "minLength": 1},
         "tier": {"type": "string", "minLength": 1},
         "tier_reasons": {"$ref": "#/definitions/strings"},
         "untrusted_path": {"type": "boolean"},
@@ -139,6 +140,11 @@
     "macro_aliases": {"type": "object", "additionalProperties": {"$ref": "#/definitions/keys"}},
     "build_only_functions": {
       "$comment": "per source file, the functions the build's objects define that Frama-C's parse lacks (build_callgraph_dag.build_only_functions); the link repair places their symbols",
+      "type": "object",
+      "additionalProperties": {"$ref": "#/definitions/keys"}
+    },
+    "model_only_functions": {
+      "$comment": "per file, the DAG keys of the functions Frama-C's parse has and the real build does not define (`model_only` on each function)",
       "type": "object",
       "additionalProperties": {"$ref": "#/definitions/keys"}
     },

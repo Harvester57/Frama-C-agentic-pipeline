@@ -217,6 +217,14 @@ def callee_closure(roots: set[str], by_name: dict[str, list[tuple[str, dict[str,
     return reached
 
 
+def built_entries(entries: list[str], functions: dict[str, Any]) -> list[str]:
+    """
+    `entries` without the functions the real build does not define (`model_only` in the DAG: nettle's
+    getopt under Frama-C's libc). No harness built with glibc can reach them, so none answers for them.
+    """
+    return [e for e in entries if not (functions.get(e) or {}).get("model_only")]
+
+
 def check_module(
     module: str,
     dag: dict[str, Any],
@@ -270,6 +278,7 @@ def check_module(
         entries = [f for f in mod_info.get("candidate_entry_points") or [] if isinstance(f, str)]
         if not entries:
             entries = [f for f in mod_fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
+    entries = built_entries(entries, dag.get("functions") or {})
 
     macros = header_macro_functions(include_dirs, fn_names)
     for alias, keys in dag_macro_aliases(dag).items():
@@ -351,7 +360,7 @@ def check_unit(
     covered: set[str] = set()
     for h in harness_modules:
         covered.update(mm.scope_functions(h))
-    entries = [e for e in info.get("candidate_entry_points") or [] if isinstance(e, str)]
+    entries = built_entries([e for e in info.get("candidate_entry_points") or [] if isinstance(e, str)], mm.functions)
     lexer_of = {e: str((mm.functions.get(e) or {}).get("lexer_module") or "") for e in entries}
 
     def fn_tier(e: str) -> Any:
@@ -546,14 +555,14 @@ def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str
     if isinstance((mm.sidecars.get(module) or {}).get("target_fuzzer"), dict):
         return []
     if mm.units_are_link_units and mm.unit_of(module) != module:
-        return mm.scope_entry_points(module)
+        return built_entries(mm.scope_entry_points(module), dag.get("functions") or {})
     info = (dag.get("modules") or {}).get(module) or {}
     entries = [f for f in info.get("candidate_entry_points") or [] if isinstance(f, str)]
     if not entries:
         by_name = _functions_by_name(dag)
         fns = [f for f in info.get("functions") or [] if isinstance(f, str)]
         entries = [f for f in fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
-    return entries
+    return built_entries(entries, dag.get("functions") or {})
 
 
 def _executions(coverage: dict[str, Any]) -> dict[str, list[tuple[str, int]]]:

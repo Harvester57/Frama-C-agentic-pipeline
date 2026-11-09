@@ -1281,30 +1281,42 @@ def build_env(recipe: dict, jobs: int) -> dict[str, str]:
     return env
 
 
-def compile_symbols(entry: dict, tree: str, tmp: Path, index: int) -> dict[str, tuple[str, str | None]]:
-    """Defined symbols of one compile's object (recompiled into tmp for a compile-and-link command)."""
+def _probe_error(what: str, rc: int, err: str) -> str:
+    """A failed probe as one line: what failed, its exit code and the first line of its stderr."""
+    first = next((ln.strip() for ln in err.splitlines() if ln.strip()), "")
+    return f"{what} exited {rc}" + (f": {first[:200]}" if first else "")
+
+
+def compile_symbols(
+    entry: dict, tree: str, tmp: Path, index: int
+) -> tuple[dict[str, tuple[str, str | None]], str | None]:
+    """
+    Defined symbols of one compile's object (recompiled into tmp for a compile-and-link command), and
+    why the probe failed (None when it ran): an object that defines nothing gives ({}, None).
+    """
     cwd = absolute(entry["cwd"], tree)
     if entry["implicit"]:
         obj = tmp / f"implicit-{index}.o"
         src = absolute(entry["source"], tree)
-        rc, _, _ = run_tool(compile_argv(entry["arguments"], src, str(obj)), cwd=cwd, timeout=300)
+        rc, _, err = run_tool(compile_argv(entry["arguments"], src, str(obj)), cwd=cwd, timeout=300)
         if rc != 0:
-            return {}
+            return {}, _probe_error("recompiling the object", rc, err)
     else:
         obj = Path(absolute(entry["object"], tree))
     if not obj.is_file():
-        return {}
-    rc, out, _ = run_tool(["nm", "--defined-only", "-l", str(obj)], timeout=TOOL_TIMEOUT_S)
+        return {}, f"no object file {entry['object']} after the build"
+    rc, out, err = run_tool(["nm", "--defined-only", "-l", str(obj)], timeout=TOOL_TIMEOUT_S)
     if rc != 0:
-        rc, out, _ = run_tool(["nm", "--defined-only", str(obj)], timeout=TOOL_TIMEOUT_S)
-    return parse_nm(out) if rc == 0 else {}
+        rc, out, err = run_tool(["nm", "--defined-only", str(obj)], timeout=TOOL_TIMEOUT_S)
+    return (parse_nm(out), None) if rc == 0 else ({}, _probe_error("nm", rc, err))
 
 
-def compile_deps(entry: dict, tree: str) -> list[str]:
+def compile_deps(entry: dict, tree: str) -> tuple[list[str], str | None]:
+    """The compiler's dependency list (`-M`) of one compile, and why the probe failed (None when it ran)."""
     cwd = absolute(entry["cwd"], tree)
     src = absolute(entry["source"], tree)
-    rc, out, _ = run_tool(deps_argv(entry["arguments"], src), cwd=cwd, timeout=300)
-    return parse_make_deps(out, cwd) if rc == 0 else []
+    rc, out, err = run_tool(deps_argv(entry["arguments"], src), cwd=cwd, timeout=300)
+    return (parse_make_deps(out, cwd), None) if rc == 0 else ([], _probe_error("the dependency probe (-M)", rc, err))
 
 
 def function_ids(entry: dict, syms: dict[str, tuple[str, str | None]], tree: str) -> dict[str, dict]:
@@ -1475,13 +1487,29 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     tmp.mkdir(parents=True)
     entries = sorted(compiles.values(), key=lambda c: c["object"])
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        deps = dict(zip([c["object"] for c in entries], pool.map(lambda c: compile_deps(c, t), entries), strict=True))
-        syms = dict(
+        dep_probes = dict(
+            zip([c["object"] for c in entries], pool.map(lambda c: compile_deps(c, t), entries), strict=True)
+        )
+        sym_probes = dict(
             zip(
                 [c["object"] for c in entries],
                 pool.map(lambda ic: compile_symbols(ic[1], t, tmp, ic[0]), enumerate(entries)),
                 strict=True,
             )
+        )
+    deps = {o: d for o, (d, _) in dep_probes.items()}
+    syms = {o: s for o, (s, _) in sym_probes.items()}
+    failed_probes = 0
+    for c in entries:
+        # Empty `headers`/`defined_functions` mean "compiled to nothing" only when the probe ran:
+        # build_callgraph_dag.model_only_functions trusts an empty symbol list only then.
+        errors = {"deps": dep_probes[c["object"]][1], "symbols": sym_probes[c["object"]][1]}
+        c["probe_errors"] = {k: v for k, v in errors.items() if v}
+        failed_probes += bool(c["probe_errors"])
+    if failed_probes:
+        report["warnings"].append(
+            f"{failed_probes} compile(s) whose dependency or symbol probe failed (compiles[].probe_errors): "
+            "their headers or defined functions are unknown, not empty"
         )
     system_headers: set[str] = set()
     for c in entries:
@@ -1581,6 +1609,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
                 "headers",
                 "includes_setjmp_h",
                 "defined_functions",
+                "probe_errors",
             )
         }
         for c in entries
