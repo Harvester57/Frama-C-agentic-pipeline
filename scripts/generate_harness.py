@@ -1667,7 +1667,9 @@ def _merge_dag_harness_sources(
 
     for fn_name in sorted(target_fns):
         fn_rec = functions_map.get(fn_name)
-        if not isinstance(fn_rec, dict):
+        if not isinstance(fn_rec, dict) or fn_rec.get("model_only"):
+            # A function the real build does not define (nettle's getopt, which glibc provides): its
+            # model file is not one the build compiles, and the harness links the build's definition.
             continue
         mod_name = fn_rec.get("module")
         mod_info = modules_map.get(mod_name) if isinstance(mod_name, str) else None

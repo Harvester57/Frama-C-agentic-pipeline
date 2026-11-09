@@ -580,18 +580,137 @@ def include_dirs(sources: list[str], capture: dict | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------------
+# What the real build compiles (the capture) against what Frama-C parsed (the model)
+# ---------------------------------------------------------------------------------------------------
+# Frama-C parses with its own libc (no `__GLIBC__`), the build and every harness build with glibc: a
+# wrapper like nettle's getopt.c (`#include "lib/getopt.c"` unless glibc already has getopt) compiles to
+# an empty object in the build, while the model attributes getopt's functions to lib/getopt.c.
+
+
+class CompiledSources:
+    """
+    The capture's compiled sources (`compiles[].source`) and, for every other file a compile's
+    dependency list (`compiles[].headers`, `cc -M`) names, the compiled sources including it.
+    """
+
+    def __init__(self, capture: dict | None) -> None:
+        compiles = [c for c in (capture or {}).get("compiles") or [] if isinstance(c, dict) and c.get("source")]
+        self.known = bool(compiles)
+        self.sources: set[str] = {str(c["source"]) for c in compiles}
+        self.includers: dict[str, list[str]] = defaultdict(list)
+        for c in compiles:
+            for dep in c.get("headers") or []:
+                if str(c["source"]) not in self.includers[str(dep)]:
+                    self.includers[str(dep)].append(str(c["source"]))
+        # An includer's failed dependency probe hides what it includes: "no compile includes it" is unsure.
+        self.deps_complete = not any((c.get("probe_errors") or {}).get("deps") for c in compiles)
+
+    def is_compiled(self, file: str) -> bool:
+        """Whether the build compiles `file`, as a source or included by one. True without a capture."""
+        return not self.known or file in self.sources or bool(self.includers.get(file)) or not self.deps_complete
+
+    def map(self, files: list[str]) -> list[str]:
+        """
+        `files` as the build compiles them: a compiled source stays; another file (a `.c` the model
+        attributes functions to) becomes the compiled source including it, one already in `files` when
+        there is one; a file no compile includes is dropped. Unchanged without a capture.
+        """
+        if not self.known:
+            return list(files)
+        wanted = set(files)
+        out: list[str] = []
+        for f in files:
+            if f in self.sources:
+                picks = [f]
+            else:
+                inc = self.includers.get(f) or []
+                picks = [s for s in inc if s in wanted][:1] or inc[:1]
+            out += [s for s in picks if s not in out]
+        return out
+
+
+def _symbols_known(c: dict) -> bool:
+    """Whether a compile's `defined_functions` is what its object defines: its symbol probe ran."""
+    if "probe_errors" in c:
+        return not (c.get("probe_errors") or {}).get("symbols")
+    # A capture that predates `probe_errors`: an empty list may be a failed probe.
+    return bool(c.get("defined_functions"))
+
+
+def model_only_functions(model: dict, capture: dict | None) -> dict[str, str]:
+    """
+    The model's functions the real build does not define (model id -> why): code Frama-C's
+    configuration compiles and the build's does not (nettle's getopt, behind `__GLIBC__`).
+
+    - A function whose file no compile compiles or includes (`CompiledSources`): its file is not in
+      the build at all. Not decided when a compile's dependency probe failed.
+    - A non-static function of a source the build compiles that none of its units' objects define
+      (`defined_functions`, `nm`). Only when every compile of those units had a working symbol probe;
+      static functions are left out, the compiler inlines them away.
+
+    Header functions are never marked. Without a capture, nothing is.
+    """
+    compiled = CompiledSources(capture)
+    if not compiled.known:
+        return {}
+    compiles = {
+        str(c.get("object")): c
+        for c in (capture or {}).get("compiles") or []
+        if isinstance(c, dict) and c.get("object")
+    }
+    defined: dict[str, set[str] | None] = {}
+    for name, u in ((capture or {}).get("units") or {}).items():
+        if not isinstance(u, dict):
+            continue
+        objs = [compiles[o] for o in u.get("objects") or [] if o in compiles]
+        if not objs or not all(_symbols_known(c) for c in objs):
+            defined[name] = None
+            continue
+        defined[name] = {str(fid).rpartition("#")[2] for c in objs for fid in c.get("defined_functions") or []}
+    out: dict[str, str] = {}
+    for fid, f in (model.get("functions") or {}).items():
+        if not isinstance(f, dict) or f.get("header"):
+            continue
+        file = str(f.get("file") or "")
+        if not compiled.is_compiled(file):
+            out[fid] = (
+                f"{file} is not compiled by the build: no compile's source, and no compile's dependency list "
+                "includes it (code only Frama-C's configuration compiles, e.g. without __GLIBC__)"
+            )
+            continue
+        if f.get("static"):
+            continue
+        units = [u for u in f.get("units") or [] if u in defined]
+        if not units or any(defined[u] is None for u in units):
+            continue
+        if all(str(f.get("name")) not in (defined[u] or set()) for u in units):
+            out[fid] = (
+                f"the build's objects of {', '.join(units)} do not define it (nm): code only Frama-C's "
+                "configuration compiles, e.g. without __GLIBC__"
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------
 # The DAG from the Phase 0 model, path modules as modules (docs/phase0-implementation-plan.md step I5a)
 # ---------------------------------------------------------------------------------------------------
 
 
-def _path_module_records(functions: dict[str, dict], files: dict[str, str], flags_of: dict[str, list[str]]) -> dict:
+def _path_module_records(
+    functions: dict[str, dict],
+    files: dict[str, str],
+    flags_of: dict[str, list[str]],
+    compiled: CompiledSources | None = None,
+) -> dict:
     """
     One record per path module: its sources and functions, the sources its functions' callees need
     (`required_sources`: its own files except those defining `main` or a harness entry point, plus the
     files of the project functions its own definitions reach in other modules, through header
-    functions), its flags (those of the units compiling those sources) and its entry points
-    (non-static functions no other function of the module calls).
+    functions; as the build compiles them, `CompiledSources.map`), its flags (those of the units
+    compiling those sources) and its entry points (non-static functions no other function of the module
+    calls, never a `model_only` one).
     """
+    compiled = compiled or CompiledSources(None)
     members: dict[str, list[str]] = defaultdict(list)
     for key, rec in functions.items():
         members[rec["lexer_module"]].append(key)
@@ -628,10 +747,12 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
             and functions[k].get("name") not in HARNESS_ENTRYPOINT_NAMES
         )
         required = sorted(effective | {functions[k]["file"] for k in cross if functions[k]["file"].endswith(".c")})
+        required = sorted(compiled.map(required))
         flags: list[str] = []
         for src in required:
             flags += [f for f in flags_of.get(src) or [] if f not in flags]
-        roots = [k for k in fns if not set(functions[k]["internal_callers"]) & fn_set]
+        live = [k for k in fns if not functions[k].get("model_only")]
+        roots = [k for k in live if not set(functions[k]["internal_callers"]) & fn_set]
         modules[name] = {
             "module": name,
             "files": sorted(mod_files),
@@ -640,7 +761,7 @@ def _path_module_records(functions: dict[str, dict], files: dict[str, str], flag
             "cppflags": flags,
             "function_count": len(fns),
             "functions": fns,
-            "candidate_entry_points": [k for k in roots if not functions[k]["is_static"]] or roots or fns[:1],
+            "candidate_entry_points": [k for k in roots if not functions[k]["is_static"]] or roots or live[:1],
         }
     return modules
 
@@ -683,12 +804,17 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
     - `macro_aliases` maps each alias the model found to the DAG keys of its functions;
     - header functions are marked `header`, and `reached` when an entry point of the build calls them;
     - functions of a unit on the GCC fallback carry `callgraph_fallback` (Frama-C's first error);
-    - each function carries the model's `trust` (scripts/trust.py), and the DAG the model's `trust` block.
+    - each function carries the model's `trust` (scripts/trust.py), and the DAG the model's `trust` block;
+    - a function the real build does not define carries `model_only` (`model_only_functions`), listed
+      per file under `model_only_functions` with a warning per file; module `required_sources` hold
+      only files the build compiles (`CompiledSources`).
     """
     model_fns: dict[str, dict] = model.get("functions") or {}
     units: dict[str, dict] = model.get("units") or {}
     aliases: dict[str, dict] = model.get("macro_aliases") or {}
     key_of = _model_key_of(model_fns)
+    compiled = CompiledSources(capture)
+    model_only = model_only_functions(model, capture)
     fallback_error = {
         n: (u.get("parse") or {}).get("error") or "Frama-C could not parse this unit"
         for n, u in units.items()
@@ -780,6 +906,8 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             rec["cyclomatic"] = m["cyclomatic"]
         if isinstance(m.get("trust"), dict):
             rec["trust"] = m["trust"]  # step I7 (scripts/trust.py)
+        if fid in model_only:
+            rec["model_only"] = model_only[fid]
         functions[key] = rec
 
     waves, cycles = compute_topological_waves(functions, succ)
@@ -819,6 +947,10 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
     for m in model_fns.values():
         by_name[m["name"]].append(m["file"])
     missing = missing_model_features(model)
+    model_only_by_file: dict[str, list[str]] = defaultdict(list)
+    for key, rec in sorted(functions.items()):
+        if rec.get("model_only"):
+            model_only_by_file[rec["file"]].append(key)
     return {
         "callgraph_source": "frama_c",
         "total_c_files": len({r["file"] for r in functions.values() if r["file"].endswith(".c")}),
@@ -835,8 +967,15 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
                 f"unit {u}: Frama-C could not parse it, its call graph comes from GCC (-fcallgraph-info): {err}"
                 for u, err in sorted(fallback_error.items())
             ),
+            *(
+                f"{file}: the real build does not define {len(keys)} function(s) Frama-C's parse has "
+                f"({_first_few(keys)}): kept out of harness sources and reach-gate entry points "
+                f"(model_only: {functions[keys[0]]['model_only']})"
+                for file, keys in sorted(model_only_by_file.items())
+            ),
         ],
-        "modules": _path_module_records(functions, file_module, flags_of),
+        **({"model_only_functions": dict(sorted(model_only_by_file.items()))} if model_only_by_file else {}),
+        "modules": _path_module_records(functions, file_module, flags_of, compiled),
         "waves": [{"wave": i, "count": len(w), "functions": w} for i, w in enumerate(waves)],
         "recursion_cycles": cycles,
         "functions": functions,
@@ -988,10 +1127,19 @@ def build_only_functions(model: dict, capture: dict | None) -> dict[str, list[st
     for c in (capture or {}).get("compiles") or []:
         if not isinstance(c, dict) or (cap_units and c.get("object") not in analysed):
             continue
+        # `nm` places the functions of an included `.c` (nettle's eccdata.c includes mini-gmp.c) in the
+        # compiled source: the model's names in the files this compile includes count as known.
+        included = {n for dep in c.get("headers") or [] for n in names_in.get(str(dep), ())}
         for fid in c.get("defined_functions") or []:
             file, _, name = str(fid).rpartition("#")
             # Compiler clones (`f.part.0`, `f.cold`) are not functions of the source.
-            if fid in known or not _C_IDENT_RE.fullmatch(name) or name in in_headers or name in names_in[file]:
+            if (
+                fid in known
+                or not _C_IDENT_RE.fullmatch(name)
+                or name in in_headers
+                or name in names_in[file]
+                or name in included
+            ):
                 continue
             out[file].add(name)
     return {f: sorted(n) for f, n in sorted(out.items())}
@@ -1093,6 +1241,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
     functions: dict[str, dict] = dag.get("functions") or {}
     model_fns: dict[str, dict] = model.get("functions") or {}
     key_of = _model_key_of(model_fns)
+    compiled = CompiledSources(capture)
 
     def home(rec: dict) -> str | None:
         if rec["file"] in unit_of_file:
@@ -1133,9 +1282,10 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             # Every source belongs to an earlier unit (x509-parser's .so builds its .a's files).
             folded.append(f"unit {u}: compiles only sources of an earlier unit, analysed there")
             continue
-        fn_set = set(fns)
+        fn_set = {k for k in fns if not functions[k].get("model_only")}  # entry points the build defines
         api = [*(rec.get("entry_points") or []), *(rec.get("embedded_api") or [])]
         entries = [k for k in dict.fromkeys(key_of[e] for e in api if e in key_of) if k in fn_set]
+        sources = compiled.map(sources)
         flags, forced = unit_cppflags(list(rec.get("cppflags") or []), include_dirs(sources, capture), root)
         modules[name] = {
             "module": name,
@@ -1155,7 +1305,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "ldflags": link_options.get(u, []),
             "function_count": len(fns),
             "functions": fns,
-            "candidate_entry_points": entries or [k for k in fns if not functions[k].get("is_static")],
+            "candidate_entry_points": entries or [k for k in fns if k in fn_set and not functions[k].get("is_static")],
             "lexer_modules": sorted({functions[k]["lexer_module"] for k in fns if functions[k].get("lexer_module")}),
             # Step I7: the threat model's status for the unit (each function's `trust` holds its own).
             "threat_model": (rec.get("trust") or {}).get("threat_model"),

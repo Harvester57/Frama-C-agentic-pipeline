@@ -506,6 +506,10 @@ def _derive_units(
             if concurrent:
                 # The link unit starts threads: Eva and WP results assume sequential execution.
                 unit.setdefault("bookkeeping", {})["concurrent"] = True
+            if fn.get("model_only"):
+                # Only Frama-C's configuration compiles it: Eva and WP may analyse it, but the real
+                # build (and so every fuzz harness) does not contain it.
+                unit.setdefault("bookkeeping", {})["model_only"] = fn["model_only"]
             if fn.get("verifiability") or fn.get("wp_blockers") or fn.get("wp_notes"):
                 bk = unit.setdefault("bookkeeping", {})
                 if fn.get("verifiability"):
@@ -525,6 +529,7 @@ SEED_BOOKKEEPING = (
     "security_properties",
     "callgraph_fallback",
     "concurrent",
+    "model_only",
     "verifiability",
     "wp_blockers",
     "wp_notes",
