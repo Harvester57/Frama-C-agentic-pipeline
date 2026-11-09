@@ -940,6 +940,83 @@ def test_report_target_runs_the_hypothesis_audit_first():
     assert "generate_report.py" in lines[-1]
 
 
+def test_wp_replay_runs_after_the_phase3_gate_and_before_the_scheduler_init():
+    mk = (REPO / "templates" / "pipeline.mk").read_text(encoding="utf-8")
+    replay = [ln.strip() for ln in mk.split("\nwp-replay: ingest facts\n", 1)[1].split("\n\n", 1)[0].splitlines()]
+    assert replay[0].startswith("$(GATE) --need reach,build_check")
+    assert replay[1].startswith("-$(RUN) --class wp --key wp-replay") and replay[1].endswith("$(PM) wp-replay")
+    queue = mk.split("\nwp-queue: ingest facts wp-replay\n", 1)[1].split("\n\n", 1)[0]
+    assert "wp_scheduler.py init" in queue
+    assert " wp-replay " in mk.split(".PHONY:", 1)[1].split("\n", 1)[0]
+    assert pm.STAGE_OF_TARGET["wp-replay"] == pm.STAGE_OF_TARGET["wp-queue"] == pm.STAGE_OF_TARGET["ingest"]
+    assert pm._node_output("wp-replay") == "workspace/reports/proof-carry/summary.json"
+    assert pm._node_deps("wp-replay", None) == ["ingest"]  # type: ignore[arg-type]
+
+
+def test_wp_replay_switched_off_writes_a_skipped_summary(tmp_path, monkeypatch):
+    run = _make_run(tmp_path)
+    monkeypatch.setenv("FRAMAC_PROOF_CARRY", "off")
+    out = pm.wp_replay(run)
+    assert out["ok"] is True and out["skipped"] is True
+    assert json.loads((run / "workspace/reports/proof-carry/summary.json").read_text(encoding="utf-8"))["skipped"]
+
+
+def _sweep_proven_ber(run: Path) -> None:
+    (run / "workspace/work/src/snmp/ber.c").write_text(
+        "/*@ assigns \\nothing; */\nint ber_decode(int a) { return a; }\n", encoding="utf-8"
+    )
+
+
+def _fake_sweep_runner(run: Path):
+    def fake(cmd, log_rel):
+        out_json = cmd[cmd.index("--out-json") + 1]
+        status = "all_proven" if "ber_decode" in out_json else "partial_proof"
+        write_json(run / out_json, {"function": cmd[cmd.index("--function") + 1], "status": status})
+        return 0
+
+    return fake
+
+
+def test_sweep_publishes_reproven_functions_to_the_proofs_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMAC_IMAGE_ID", "test-image")
+    monkeypatch.delenv("FRAMAC_CACHE_MODE", raising=False)
+    monkeypatch.delenv("FRAMAC_PROOF_CARRY", raising=False)
+    run = _make_run(tmp_path)
+    _sweep_ledger(run)
+    _sweep_proven_ber(run)
+    summary = pm.sweep(
+        run,
+        jobs=1,
+        runner=_fake_sweep_runner(run),
+        plan=pm.build_plan(run, templates_dir=ACSL),
+        script_runner=lambda script, args: (0, "{}"),
+    )
+    assert summary["published_proofs"] == 1
+    published = {r["function"]: r["published"] for r in summary["results"]}
+    assert published == {"ber_decode": True, "glue_step": False}  # glue_step regressed
+    entries = list((run / "state/cache/proofs").rglob("contract.json"))
+    assert len(entries) == 1
+    assert json.loads(entries[0].read_text(encoding="utf-8"))["function"] == "ber_decode"
+
+
+def test_sweep_publishes_nothing_with_proof_carry_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMAC_IMAGE_ID", "test-image")
+    monkeypatch.setenv("FRAMAC_PROOF_CARRY", "off")
+    run = _make_run(tmp_path)
+    _sweep_ledger(run)
+    _sweep_proven_ber(run)
+    summary = pm.sweep(
+        run,
+        jobs=1,
+        runner=_fake_sweep_runner(run),
+        plan=pm.build_plan(run, templates_dir=ACSL),
+        script_runner=lambda script, args: (0, "{}"),
+    )
+    assert summary["published_proofs"] == 0
+    assert all(r["published"] is False for r in summary["results"])
+    assert not (run / "state/cache/proofs").exists()
+
+
 def test_file_slugs_disambiguate_collisions():
     slugs = pm._file_slugs({"src/a_b.c", "src/a/b.c", "src/c.c"})
     assert slugs["src/c.c"] == "src_c.c"

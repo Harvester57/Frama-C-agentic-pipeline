@@ -3862,6 +3862,13 @@ def cmd_status() -> dict:
         "done": done,
     }
     out["stuck"] = not done and not ready and not running and not merge_queue and not state.get("rechecks")
+    # Read-only: covered units whose contract `wp-replay` carried forward from an earlier run and re-proved.
+    out["carried_forward"] = sum(
+        1
+        for u in ctx.units.values()
+        if u.get("status") == "covered"
+        and any(e.get("result") == "carried_forward_reproven" for e in u.get("evidence") or [])
+    )
     return out
 
 

@@ -19,6 +19,8 @@ Subcommands (run with the run directory as working directory):
   transition-many          --spec-json JSON|PATH
   close-remaining          --reason TEXT
   scaffold-verifier        --fingerprint FP --decision DECISION [...]
+  mark-carried             --report <wp report> --entry <restored proofs entry> --key KEY
+                           (scripts/proof_carry.py: evidence of a re-proven carried contract)
   audit-hypotheses         [--dag workspace/reports/callgraph_dag.json]
   summary | status
 
@@ -1708,6 +1710,40 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
     return stats
 
 
+@ledger_locked
+def cmd_mark_carried(report: Path, entry: str, key: str) -> dict:
+    """
+    Record that the covered units a WP report just credited (`ingest-wp <report>`) were carried
+    forward from an earlier run's wp-sweep (scripts/proof_carry.py) and re-proven on the current
+    tree: their discharging WP evidence from that report becomes `carried_forward_reproven`, with
+    the restored cache entry (`entry`, run-relative) and its key under `details.proof_carry`. The
+    credit itself still comes from the re-proof; this only names where the contract came from.
+    """
+    units, candidates = load_state()
+    tool_output = rel(str(report))
+    marked: list[str] = []
+    for cid in sorted(units):
+        u = units[cid]
+        if u["status"] != "covered":
+            continue
+        for ev in u.get("evidence") or []:
+            if ev.get("phase") == "wp" and ev.get("discharging") and ev.get("tool_output") == tool_output:
+                ev["result"] = "carried_forward_reproven"
+                ev["producer"] = "proof_carry.py"
+                if not str(ev.get("summary") or "").startswith("Carried forward"):
+                    ev["summary"] = (
+                        "Carried forward from an earlier run's wp-sweep and re-proven on the current tree: "
+                        f"{ev.get('summary') or ''}"
+                    ).strip()
+                details = ev.setdefault("details", {})
+                details["proof_carry"] = {"entry": rel(entry), "key": key}
+                if cid not in marked:
+                    marked.append(cid)
+    if marked:
+        commit(units, candidates)
+    return {"report": tool_output, "marked": marked}
+
+
 # --------------------------------------------- M2 hypotheses & crash verifier
 
 
@@ -3042,6 +3078,12 @@ def main(argv: list[str] | None = None) -> int:
     p_scaf.add_argument("--line", type=int, default=None, help="Override 1-based source line")
     p_scaf.add_argument("--severity", choices=["critical", "high", "medium", "low"], default="high")
     p_scaf.add_argument("--out", type=Path, default=None, help="Write scaffolded crash_verifier JSON to this path")
+    p_mc = sub.add_parser(
+        "mark-carried", help="Label the units a WP report credited as carried forward (scripts/proof_carry.py)"
+    )
+    p_mc.add_argument("--report", required=True, type=Path)
+    p_mc.add_argument("--entry", required=True, help="Restored proofs cache entry, run-relative")
+    p_mc.add_argument("--key", required=True)
     p_audit = sub.add_parser("audit-hypotheses", help="Resolve valid_under_hyp assumptions against callgraph_dag.json")
     p_audit.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
     sub.add_parser("summary")
@@ -3064,6 +3106,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_ingest_eva(args.reports)
         elif args.cmd == "ingest-wp":
             out = cmd_ingest_wp(args.reports, sweep=args.sweep)
+        elif args.cmd == "mark-carried":
+            out = cmd_mark_carried(args.report, args.entry, args.key)
         elif args.cmd == "ingest-agent-hypothesis":
             out = cmd_ingest_agent_hypothesis(args.result, args.module)
         elif args.cmd == "record-boundary-assumptions":

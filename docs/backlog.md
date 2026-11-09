@@ -90,6 +90,12 @@ A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions.
 - [x] Warm-start fuzz corpora across runs ([`../scripts/cache.py`](../scripts/cache.py): `shared_corpus_dir`, `warm_start_corpus`, `publish_corpus`; wired into `_run_campaign_mode` in [`../scripts/run_eacsl_fuzz.py`](../scripts/run_eacsl_fuzz.py), `cmd_ingest_fuzz` in [`../scripts/ledger.py`](../scripts/ledger.py), and `ingest` in [`../scripts/pipeline_make.py`](../scripts/pipeline_make.py)).
 - [x] Snapshot manifests for run directories ([`../schemas/run-metadata.schema.json`](../schemas/run-metadata.schema.json), [`../scripts/run_metadata.py`](../scripts/run_metadata.py): `build_snapshot_manifest`, `verify_prior_run_snapshot`, `snapshot` subcommand, and `--snapshot` on `set-status`; [`../scripts/validate_artifacts.py`](../scripts/validate_artifacts.py): `validate_snapshot_manifest` and `snapshot` subcommand).
 - [x] `ledger.cmd_transition_many` (one batched commit per scheduler round), batched unit transitions in [`../scripts/wp_scheduler.py`](../scripts/wp_scheduler.py), and a shared argv helper (`framac_common.normalize_flag_args`) for the scripts.
+- [x] Cross-run proof carry-forward (formal-discovery Tier 6, M5 "publishing swept WP proofs"): `proofs` namespace in [`../scripts/cache.py`](../scripts/cache.py), publishing from `wp-sweep` and the `wp-replay` Make target in [`../scripts/pipeline_make.py`](../scripts/pipeline_make.py), [`../scripts/proof_carry.py`](../scripts/proof_carry.py), `ledger.py mark-carried`, `carried_forward` in `wp_scheduler.py status`, one line in `REPORT.md`; A/B switch `FRAMAC_PROOF_CARRY`. Plan and deviations: [`formal-discovery/tier-6-proof-carry-forward.md`](./formal-discovery/tier-6-proof-carry-forward.md).
+  - [ ] Measure it: run a target twice with `FRAMAC_CACHE_MODE=rw` and compare with `benchmark_compare.py` (the plan's acceptance; not done).
+  - [ ] Replay is sequential (merges hold the run-wide merge lock); a batched replay through `merge_agent_batch` would share one module guardrail per round.
+  - [ ] The key digests the C tokens of the whole file, so any C change elsewhere in the file is a miss; a per-definition digest (`c_definitions.py`) plus the file's types and globals would hit more often.
+  - [ ] Declarations added by an architect merge for a replay stay in the header when the prover merge that follows is rejected (harmless, but the Header Architect then sees them).
+  - [ ] Per-unit ledger carry-forward of verdicts and findings (M5) is still open.
 
 ## 5. Housekeeping
 

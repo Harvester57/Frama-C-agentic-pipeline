@@ -170,6 +170,7 @@ run-<N>/
 │       ├── eva/<mod>.json                    # Phase 2 Eva + RTE status buckets & per-slice .sarif
 │       ├── replay/<fp>.json                  # Deterministic replays of candidate reproducers
 │       ├── wp/<fn>.json                      # Phase 3 per-function WP results by obligation class
-│       └── wp-sweep/                         # End-of-run re-proof of merged functions
+│       ├── proof-carry/summary.json          # wp-replay: cached proofs re-applied and re-proven before Phase 3
+│       └── wp-sweep/                         # End-of-run re-proof of merged functions (publishes the proofs cache)
 └── agents/<agent-id>/scratch/                # The only place a subagent may write (parent_wp/ holds the parent re-check)
 ```

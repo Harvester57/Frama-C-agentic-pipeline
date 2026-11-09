@@ -70,6 +70,7 @@ services:
       - FRAMAC_NEGOTIATE_EVIDENCE
       - FRAMAC_MUTATION_STUB
       - FRAMAC_CANDIDATE_RANK
+      - FRAMAC_PROOF_CARRY
       - FRAMAC_RESOURCES_VERBOSE
     volumes:
       - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro

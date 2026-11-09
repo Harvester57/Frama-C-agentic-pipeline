@@ -83,6 +83,8 @@ The deterministic side prepares what a prover would otherwise have to work out b
 - **A reading slice** ([`../scripts/function_slice.py`](../scripts/function_slice.py)): the target's body, callee prototypes with their current contracts, and only the types, macros and globals the target references, resolved with the real compile flags. It is built from the agent's snapshot and is reading context only. The proof target stays the real file, because a slice can differ from the compiled program.
 - **A brief assembled for the function:** string, float, union and pointer-walking guidance, and similar parts, appear only for functions with those features. Every strict rule stays. Without facts, the whole brief is rendered.
 
+A function may not reach a prover at all: when an earlier run's `wp-sweep` published its contract and the inputs it depends on are unchanged, `wp-replay` re-applies that contract (with its loop annotations) through the parent merge and re-proves it on the current tree before the scheduler is initialized ([`../scripts/proof_carry.py`](../scripts/proof_carry.py); [`./resources-and-caching.md`](./resources-and-caching.md#5-caches), Section 5). Units it credits never become prove tasks; a rejected or missing proof leaves the function to its prover as before.
+
 These are hints. Eva's locations hold only under the harness (`a[0..15]`, not `out[0 .. n - 1]`), so the prover restates them over the formals, and WP remains the only judge of `assigns`.
 
 ---

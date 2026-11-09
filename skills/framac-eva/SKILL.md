@@ -118,4 +118,6 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue
 
 **`replay`:** replays every unverified candidate's reproducers into `workspace/reports/replay/`, so the crash verifiers start from facts.
 
+**`wp-replay`:** runs first, as a prerequisite of `wp-queue`, after the Phase 3 gate. It re-applies the contracts an earlier run's `wp-sweep` published (the `proofs` cache) to the functions that still have planned units, and re-proves each on this tree through the parent merge (guardrail and WP); only a passing re-proof credits units (evidence `carried_forward_reproven`), so those functions get no prover. Its summary is `workspace/reports/proof-carry/summary.json`; it never fails the run, and `FRAMAC_PROOF_CARRY=off` skips it.
+
 **`wp-queue`:** runs `wp_scheduler.py init`. That builds the Phase-3 task graph from the planned units, the call graph and the candidates, and writes `workspace/reports/wp_queue.json`. Nothing is written by hand.

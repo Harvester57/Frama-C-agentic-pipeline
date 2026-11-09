@@ -74,6 +74,7 @@ AB_SWITCHES = (
     "FRAMAC_NEGOTIATE_EVIDENCE",
     "FRAMAC_MUTATION_STUB",
     "FRAMAC_CANDIDATE_RANK",
+    "FRAMAC_PROOF_CARRY",
 )
 # The value that turns each switch to its baseline side.
 AB_BASELINE = {name: "off" for name in AB_SWITCHES} | {"FRAMAC_CANDIDATE_RANK": "legacy"}

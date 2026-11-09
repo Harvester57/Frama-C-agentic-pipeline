@@ -8,8 +8,9 @@ Stores:
           after the run store when FRAMAC_CACHE_MODE is `ro` or `rw`; written only with `rw`.
 Namespaces: `eacsl-build` (E-ACSL and sanitizer builds), `eva` (Eva reports), `facts` (per-function
 prover facts), `slice-index` (parsed translation units for reading slices), `guardrail` (run-local
-dynamic oracle verdicts) and `wp`, which is Frama-C's own `-wp-cache-dir` (counted and collected
-here, never read or written by this module).
+dynamic oracle verdicts), `proofs` (contracts `wp-sweep` re-proved, written and replayed by
+proof_carry.py; a hit is always re-proved before it credits anything) and `wp`, which is Frama-C's
+own `-wp-cache-dir` (counted and collected here, never read or written by this module).
 
 Enablement: FRAMAC_CACHE=off disables every cache. Otherwise caches are on when the working
 directory is a run directory (it holds run-metadata.json) or FRAMAC_CACHE=on, so unit tests and
@@ -64,7 +65,7 @@ DEPS_TIMEOUT_S = 120
 SHARED_DEFAULT_DIR = Path("/framac-cache")
 # Frama-C preprocesses with these defined; headers guarded by them belong in the manifest.
 FRAMAC_DEP_DEFINES = ("-D__FRAMAC__", "-D__FC_MACHDEP_X86_64")
-NAMESPACES = ("eacsl-build", "eva", "facts", "slice-index", "guardrail", "wp")
+NAMESPACES = ("eacsl-build", "eva", "facts", "slice-index", "guardrail", "proofs", "wp")
 CORPUS_MAX_FILES = 256
 CORPUS_MAX_FILE_BYTES = 64 * 1024
 CORPUS_MAX_TOTAL_BYTES = 4 * 1024 * 1024
