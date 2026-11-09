@@ -582,6 +582,26 @@ def _break_stale_lock(lock_dir: Path) -> None:
     shutil.rmtree(tomb, ignore_errors=True)
 
 
+# How long a Windows pending-delete directory may keep failing mkdir before we give up. A
+# directory another holder is removing lingers in that state until its last handle closes:
+# mkdir on it (or inside it) fails with FileExistsError or PermissionError instead of
+# FileNotFoundError, and pathlib's exist_ok re-raises because is_dir() is already false.
+_TRANSIENT_FS_WINDOW = 5.0
+
+
+def _ensure_lock_parent(parent: Path) -> None:
+    """Create `parent`, riding out a concurrent release that is removing it right now."""
+    give_up = time.monotonic() + _TRANSIENT_FS_WINDOW
+    while True:
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            return
+        except (FileExistsError, PermissionError):
+            if time.monotonic() >= give_up:
+                raise
+            time.sleep(0.01)
+
+
 @contextlib.contextmanager
 def run_lock(
     name: str = "ledger",
@@ -610,18 +630,29 @@ def run_lock(
 
     wait_limit = timeout if timeout is not None else _env_seconds("FRAMAC_LOCK_TIMEOUT", 1800.0)
     stale = stale_after if stale_after is not None else _env_seconds("FRAMAC_LOCK_STALE", 120.0)
-    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_lock_parent(lock_dir.parent)
     deadline = time.monotonic() + wait_limit
     delay = 0.02
+    denied_since: float | None = None
     while True:
         try:
             os.mkdir(lock_dir)
             break
         except FileNotFoundError:
             # A releasing holder removed the empty .framac-locks/ parent between our calls.
-            lock_dir.parent.mkdir(parents=True, exist_ok=True)
+            denied_since = None
+            _ensure_lock_parent(lock_dir.parent)
+            continue
+        except PermissionError:
+            # Windows: lock_dir or its parent is pending delete by a releasing holder.
+            now = time.monotonic()
+            denied_since = denied_since if denied_since is not None else now
+            if now - denied_since >= _TRANSIENT_FS_WINDOW:
+                raise
+            time.sleep(0.01)
             continue
         except FileExistsError:
+            denied_since = None
             age = _lock_age(lock_dir)
             if age is not None and age > stale:
                 _break_stale_lock(lock_dir)

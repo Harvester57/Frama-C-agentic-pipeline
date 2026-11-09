@@ -288,6 +288,53 @@ def test_run_lock_excludes_other_processes_and_breaks_stale_locks(tmp_path):
     assert not (tmp_path / ".framac-locks").exists()
 
 
+def test_run_lock_survives_concurrent_acquire_release_cycles(tmp_path):
+    """
+    Every release removes the empty .framac-locks/ parent. With holders of different lock names
+    cycling at once, acquirers keep racing a parent that is being deleted; on Windows a
+    pending-delete directory makes mkdir fail with FileExistsError or PermissionError instead
+    of FileNotFoundError. No cycle may crash, and each lock must still exclude: every
+    read-increment-write of its counter survives.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from conftest import ROOT
+
+    names, per_name, cycles = 4, 3, 100
+    script = (
+        "import pathlib, sys\n"
+        "from framac_common import run_lock\n"
+        "run, name = pathlib.Path(sys.argv[1]), sys.argv[2]\n"
+        "counter = run / f'{name}.count'\n"
+        "for _ in range(int(sys.argv[3])):\n"
+        "    with run_lock(name, run, timeout=60):\n"
+        "        counter.write_text(str(int(counter.read_text()) + 1))\n"
+    )
+    for n in range(names):
+        (tmp_path / f"n{n}.count").write_text("0", encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts")}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path), f"n{i % names}", str(cycles)],
+            env=env,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(names * per_name)
+    ]
+    errors = []
+    for proc in procs:
+        _, err = proc.communicate(timeout=180)
+        if proc.returncode:
+            errors.append(err)
+    assert not errors, "\n".join(errors)
+    for n in range(names):
+        assert int((tmp_path / f"n{n}.count").read_text()) == per_name * cycles
+    assert not (tmp_path / ".framac-locks").exists()
+
+
 def test_augment_framac_cppflags_prepends_fc_stubs_and_compat_types(monkeypatch, tmp_path):
     from framac_common import augment_framac_cppflags
 
