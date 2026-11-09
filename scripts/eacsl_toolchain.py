@@ -56,7 +56,15 @@ EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-f
 # Failure reports print the values involved by default (-e-acsl-O-print-values, on at O <= 3).
 # Never pass the deprecated -e-acsl-assert-print-data: Frama-C 34+ aliases it to -e-acsl-O-valid,
 # which re-instruments proven annotations (docs/upstream/frama-c-eacsl-assert-print-data-alias.md).
-EACSL_FC_EXTRA_FLAGS = ("-e-acsl-full-mtracking",)
+EACSL_FULL_MTRACKING_FLAG = "-e-acsl-full-mtracking"
+EACSL_FC_EXTRA_FLAGS = (EACSL_FULL_MTRACKING_FLAG,)
+# Full tracking registers every local with `__e_acsl_store_block(&local, ...)`, and the kernel aborts
+# on a `register` local ("Taking the address of a register variable", Cil.mkAddrOf; nettle arcfour.c:
+# `register uint8_t i, j;`). Dropping the storage class changes nothing for a local whose address is
+# never taken. E-ACSL frontend only: never on the harness cppflags, which Eva and WP read too. A
+# global register variable (`register T x asm("reg")`) would change meaning; Frama-C does not parse
+# those anyway.
+EACSL_FULL_MTRACKING_DEFINES = ("-Dregister=",)
 # RTE emits no initialization assertions unless asked, so uninitialized reads would go unchecked.
 # Reads of memory written outside instrumented code (libFuzzer's `data`, external libraries) fail
 # these checks: harnesses must copy the input into their own buffer, as generated harnesses do.
@@ -140,15 +148,19 @@ def build_eacsl_flag_sets(
     fuzzer: bool = True,
     fc_stubs: Path | None | str = "auto",
     concurrency: bool = False,
+    full_mtracking: bool = False,
 ) -> dict[str, str]:
     """
     frontend: passed to `-E` (Frama-C preprocessing of the original sources).
     backend:  passed to `-e` (Clang compile of the self-contained instrumented file).
+    `full_mtracking` adds EACSL_FULL_MTRACKING_DEFINES to the frontend (see `uses_full_mtracking`).
     """
     stubs = resolve_fc_stubs_dir() if fc_stubs == "auto" else (Path(fc_stubs) if fc_stubs else None)
     pre, forced, other = split_preprocessor_flags(cppflags)
     joined_user = " ".join(pre + forced)
     front: list[str] = list(EACSL_DEFINES)
+    if full_mtracking:
+        front.extend(EACSL_FULL_MTRACKING_DEFINES)
     if stubs is not None:
         stubs_posix = Path(stubs).as_posix()
         if (Path(stubs) / EACSL_STUBS_SUBDIR).is_dir():
@@ -171,6 +183,11 @@ def build_eacsl_flag_sets(
         "frontend": normalize_passthrough(shlex.join(front)),
         "backend": normalize_passthrough(shlex.join(backend)),
     }
+
+
+def uses_full_mtracking(modern_cli: bool) -> bool:
+    """Whether instrumentation runs with full memory tracking: the two-stage CLI (Frama-C 33+) passes EACSL_FC_EXTRA_FLAGS."""
+    return modern_cli and EACSL_FULL_MTRACKING_FLAG in EACSL_FC_EXTRA_FLAGS
 
 
 def is_eacsl_instrumented(path: Path) -> bool:
@@ -469,6 +486,55 @@ def fix_readonly_scalar_globals(c_text: str) -> tuple[str, int]:
         )
 
     return _READONLY_SCALAR_RE.subn(_repl, c_text)
+
+
+_ALIGNAS_RE = re.compile(r"\b_Alignas\s*\(")
+_ATTRIBUTE_RE = re.compile(r"\s*__attribute__\s*\(")
+
+
+def _ends_declarator(line: str, at: int) -> bool:
+    """True if `line[at:]` is what may follow a whole declarator: attributes, then `;`, `,` or `=`."""
+    while m := _ATTRIBUTE_RE.match(line, at):
+        close_at = _matching_paren(line, m.end() - 1)
+        if close_at < 0:
+            return False
+        at = close_at + 1
+    rest = line[at:].lstrip()
+    return rest[:1] in (";", ",", "=")
+
+
+def rewrite_trailing_alignas(c_text: str) -> tuple[str, int]:
+    """
+    Work around a Frama-C kernel printer bug (35.0~~dev): it prints the alignment specifier of a
+    struct or union member after the declarator (`alignas(16) uint64_t u64[2];` becomes
+    `uint64_t u64[2] _Alignas(16) ;`), which clang rejects with "expected ';' at end of declaration
+    list" (nettle's `union nettle_block16`). Rewrite each `_Alignas(N)` that ends a declarator (only
+    attributes, then `;`, `,` or `=` follow it) as `__attribute__((__aligned__(N)))`: clang accepts
+    that form after the declarator, and it keeps the alignment, so the instrumented build has the
+    target's layout. Frama-C prints an `aligned` attribute in that place itself. An `_Alignas` before
+    the declarator, as globals and locals print, is valid and stays. Never `-D_Alignas(x)=`: that
+    drops the alignment. Returns the new text and the number of rewrites.
+    """
+    count = 0
+    lines = c_text.split("\n")
+    for idx, line in enumerate(lines):
+        if "_Alignas" not in line:
+            continue
+        pieces: list[str] = []
+        pos = 0
+        for m in _ALIGNAS_RE.finditer(line):
+            if m.start() < pos:
+                continue
+            close_at = _matching_paren(line, m.end() - 1)
+            if close_at < 0 or not _ends_declarator(line, close_at + 1):
+                continue
+            alignment = line[m.end() : close_at].strip()
+            pieces.extend([line[pos : m.start()], f"__attribute__((__aligned__({alignment})))"])
+            pos = close_at + 1
+            count += 1
+        if pieces:
+            lines[idx] = "".join(pieces) + line[pos:]
+    return "\n".join(lines), count
 
 
 _STRTO_CALL_RE = re.compile(r"\b(?:strto\w*|wcsto\w*)\s*\(")

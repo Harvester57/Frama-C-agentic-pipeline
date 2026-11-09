@@ -21,7 +21,9 @@
           "error": {"type": "string"},
           "fallback_reason": {"type": ["string", "null"]},
           "compile_log": {"type": "string"},
-          "first_error": {"type": ["string", "null"]}
+          "first_error": {"type": ["string", "null"]},
+          "reason_code": {"$comment": "a known E-ACSL failure with no source-level fix (pipeline_make.KNOWN_EACSL_FAILURES); `reason` explains it", "type": "string", "enum": ["eacsl_gmp_symbol_unregistered", "eacsl_static_const_union"]},
+          "next_step": {"$comment": "with reason_code: the exact command that records the sanitizers choice; build-check never runs it itself", "type": "string", "minLength": 1}
         },
         "required": ["ok", "status", "fuzz_engine"],
         "additionalProperties": false

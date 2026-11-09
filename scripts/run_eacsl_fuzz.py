@@ -86,6 +86,7 @@ from acsl_ast import tokenize_c_acsl  # noqa: E402
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
+    EACSL_FULL_MTRACKING_DEFINES,
     EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
     build_eacsl_flag_sets,
@@ -102,8 +103,10 @@ from eacsl_toolchain import (  # noqa: E402
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
     rewrite_sound_verdict_resets,
+    rewrite_trailing_alignas,
     select_eacsl_binary,
     slice_has_pthread,
+    uses_full_mtracking,
 )
 from fingerprint import (  # noqa: E402
     detect_alarm_kind,
@@ -698,8 +701,11 @@ def _eacsl_cache_material(
 ) -> dict | None:
     """Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse)."""
     has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
+    eacsl_bin, is_modern = _resolve_eacsl_gcc()
     try:
-        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag, concurrency=has_pthread)
+        flags = build_eacsl_flag_sets(
+            cppflags, fuzzer=fuzzer_flag, concurrency=has_pthread, full_mtracking=uses_full_mtracking(is_modern)
+        )
         ld_parts = []
         if fuzzer_flag:
             ld_parts.append("-fsanitize=fuzzer")
@@ -710,7 +716,6 @@ def _eacsl_cache_material(
         ldflags = normalize_passthrough(" ".join(ld_parts))
     except UnsafePassthroughError:
         return None
-    eacsl_bin, is_modern = _resolve_eacsl_gcc()
     return {
         "kind": "eacsl",
         "eacsl_gcc": [eacsl_bin, is_modern],
@@ -856,7 +861,10 @@ def _compile_eacsl_binary_uncached(
     `-n` matters: without it `e-acsl-gcc` also links the original sources, which fails on a
     main-less fuzz harness. Fuzz builds use full memory tracking and link
     templates/eacsl_runtime/fuzz_init.c, whose LLVMFuzzerInitialize initializes the runtime that
-    an instrumented main() would. Uninitialized reads are checked (`-rte-initialized @all`)
+    an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
+    (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
+    is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
+    `wrapper_result_inits`, `formal_inits`, ...). Uninitialized reads are checked (`-rte-initialized @all`)
     unless `rte_initialized` is False, which is recorded in `reduced_checks`. Stage 1 is retried
     once without functions Frama-C reports as unknown; stage 2 is retried once with a generated
     link-only object when Variadic `<fn>_fallback_<N>` symbols are undefined.
@@ -901,8 +909,11 @@ def _compile_eacsl_binary_uncached(
     has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
     result["concurrency"] = has_pthread
     eacsl_bin, is_modern = _resolve_eacsl_gcc()
+    full_mtracking = uses_full_mtracking(is_modern)
     try:
-        flags = build_eacsl_flag_sets(cppflags, fuzzer=fuzzer_flag, concurrency=has_pthread)
+        flags = build_eacsl_flag_sets(
+            cppflags, fuzzer=fuzzer_flag, concurrency=has_pthread, full_mtracking=full_mtracking
+        )
         ld_parts = []
         if fuzzer_flag:
             ld_parts.append("-fsanitize=fuzzer")
@@ -917,6 +928,12 @@ def _compile_eacsl_binary_uncached(
         return _finish(2, "eacsl_argv_unsafe")
     result["frontend_flags"] = flags["frontend"]
     result["backend_flags"] = flags["backend"]
+    if full_mtracking:
+        result["full_mtracking_defines"] = list(EACSL_FULL_MTRACKING_DEFINES)
+        log_parts.append(
+            f"Frontend defines {' '.join(EACSL_FULL_MTRACKING_DEFINES)}: full memory tracking takes the address "
+            "of every local, which the kernel refuses for a `register` local.\n"
+        )
     if target_fns is None:
         target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
 
@@ -996,6 +1013,16 @@ def _compile_eacsl_binary_uncached(
         if instrumented_c.is_file():
             c_text = instrumented_c.read_text(encoding="utf-8", errors="replace")
             c_modified = False
+
+            # Without this, clang rejects a member the kernel printed as `T m _Alignas(N) ;`.
+            c_text, n_alignas = rewrite_trailing_alignas(c_text)
+            if n_alignas:
+                c_modified = True
+                result["alignas_rewrites"] = n_alignas
+                log_parts.append(
+                    f"Rewrote {n_alignas} _Alignas(N) printed after a declarator as __attribute__((__aligned__(N))) "
+                    "(the Frama-C printer misplaces member alignment; the alignment is kept).\n"
+                )
 
             if rte_initialized:
                 # Without this, any `ensures` reading \result fails \initialized(&__retres) on every input.
