@@ -422,6 +422,7 @@ def test_report_has_no_inductive_lemma_line_without_such_gaps(tmp_path):
     generate(tmp_path, tmp_path)
     assert "inductive lemma required" not in (tmp_path / "REPORT.md").read_text(encoding="utf-8")
 
+
 def test_report_counts_functions_carried_forward_and_reproven(tmp_path):
     build_run(tmp_path)
     report = generate(tmp_path, tmp_path) and (tmp_path / "REPORT.md").read_text(encoding="utf-8")

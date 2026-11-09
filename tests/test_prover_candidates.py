@@ -1512,6 +1512,8 @@ def test_the_candidate_block_hook_sets_the_scope_focus(prover):
     assert summary["next_synthesis_focus"] == PC.SCOPE_VIOLATION_FOCUS
     assert summary["candidate"]["scope_violation_pending"] == ["ghost lem"]
 
+
+# ---------------------------------------------------------------------------
 # Trivial-annotation-aware rank (FRAMAC_CANDIDATE_RANK)
 # ---------------------------------------------------------------------------
 

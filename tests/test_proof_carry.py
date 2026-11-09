@@ -212,7 +212,7 @@ def test_publish_keeps_body_annotations(tmp_path):
     assert ok
     entry = cache.lookup(pc.NS, key, a)
     assert entry is not None
-    doc =json.loads((entry.path / "files/contract.json").read_text(encoding="utf-8"))
+    doc = json.loads((entry.path / "files/contract.json").read_text(encoding="utf-8"))
     assert "loop invariant r == a + i;" in doc["span_c"] and "requires a < 10;" in doc["contract_c"]
 
 

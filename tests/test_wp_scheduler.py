@@ -2067,6 +2067,7 @@ def test_dispatched_negotiate_brief_kwargs_name_the_stalled_callers_report(sim, 
     assert kw["caller_evidence"][0]["report"] == "agents/prove-f/artifacts/wp_f.json"
     assert "caller_evidence_goals" in neg
 
+
 def test_status_counts_units_carried_forward_from_an_earlier_run(sim):
     write_json(sim.run_dir / "workspace/reports/wp/c.json", {})
     carried = {
