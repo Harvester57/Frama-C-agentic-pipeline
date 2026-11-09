@@ -1073,8 +1073,11 @@ def generate(
     if not p["cases"]:
         raise ApiHarnessError(f"module {module!r}: no API entry point the generator can call: {p['skipped']}")
     functions = dag.get("functions") or {}
+    dag_mod = (dag.get("modules") or {}).get(module) or {}
+    req_sources = dag_mod.get("required_sources") or []
     sources = sorted(
         {str((functions.get(k) or {}).get("file")) for k in p["entries"] if (functions.get(k) or {}).get("file")}
+        | {str(s) for s in req_sources if s}
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
     cases, layouts, skipped = list(p["cases"]), list(p["layouts"]), dict(p["skipped"])

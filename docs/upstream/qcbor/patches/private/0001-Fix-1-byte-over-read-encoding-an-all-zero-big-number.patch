@@ -1,0 +1,81 @@
+From 193bea9bddd5283a2edd732306a83ab7cb7b6968 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:20:03 +0100
+Subject: [PATCH 1/2] Fix 1-byte over-read encoding an all-zero big number
+
+QCBOREncode_Private_SkipLeadingZeros() turned an all-zero big number
+into a one-byte big number by setting NLZ.len to 1. But
+UsefulBuf_SkipLeading() had already advanced NLZ.ptr past the last
+byte, so every consumer read the byte just after the caller's big
+number:
+
+- QCBOREncode_AddTBigNumberNoPreferred() copies it into the output,
+  e.g. c2 41 a5 instead of c2 41 00 for 00 00 00 00 followed by a5;
+- QCBOREncode_AddTBigNumber() encodes it as the integer value;
+- negative numbers subtract one from it.
+
+Point at the last byte of the big number instead. The existing test
+vectors are string literals, whose terminating NUL hid the read; add
+a test whose big number is followed by a non-zero byte.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_number_encode.c |  7 +++++--
+ test/qcbor_encode_tests.c | 20 ++++++++++++++++++++
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/qcbor_number_encode.c b/src/qcbor_number_encode.c
+index dc75a3c..5392c46 100644
+--- a/src/qcbor_number_encode.c
++++ b/src/qcbor_number_encode.c
+@@ -324,11 +324,14 @@ QCBOREncode_Private_SkipLeadingZeros(const UsefulBufC BigNumber)
+    UsefulBufC NLZ;
+    NLZ = UsefulBuf_SkipLeading(BigNumber, 0x00);
+ 
+-   /* An all-zero string reduces to one 0, not an empty string. */
++   /* An all-zero string reduces to one 0, not an empty string. That 0
++    * is the last byte of BigNumber. UsefulBuf_SkipLeading() left
++    * NLZ.ptr just past the end of BigNumber, so NLZ.len can't simply
++    * be set to 1. */
+    if(NLZ.len == 0 &&
+       BigNumber.len > 0 &&
+       UsefulBufC_NTH_BYTE(BigNumber, 0) == 0x00) {
+-      NLZ.len = 1;
++      NLZ = UsefulBuf_Tail(BigNumber, BigNumber.len - 1);
+    }
+ 
+    return NLZ;
+diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
+index 5daffca..e9068ee 100644
+--- a/test/qcbor_encode_tests.c
++++ b/test/qcbor_encode_tests.c
+@@ -1118,6 +1118,26 @@ int32_t BigNumEncodeTests(void)
+       return -2;
+    }
+ 
++   /* An all-zero big number that is not followed by a zero byte. In
++    * the test cases above it is a string literal, whose terminating
++    * NUL hides a read one byte past the end. */
++   static const uint8_t spZeroThenFF[] = {0x00, 0x00, 0xff};
++   const UsefulBufC ZeroNotNULTerminated = {spZeroThenFF, 2};
++
++   QCBOREncode_Init(&Enc, UsefulBuf_FROM_BYTE_ARRAY(spBigBuf));
++   QCBOREncode_AddTBigNumberNoPreferred(&Enc, QCBOR_ENCODE_AS_TAG, false, ZeroNotNULTerminated);
++   QCBOREncode_Finish(&Enc, &EncodedBigNumber);
++   if(UsefulBuf_Compare(EncodedBigNumber, UsefulBuf_FROM_SZ_LITERAL("\xC2\x41\x00"))) {
++      return -3;
++   }
++
++   QCBOREncode_Init(&Enc, UsefulBuf_FROM_BYTE_ARRAY(spBigBuf));
++   QCBOREncode_AddTBigNumber(&Enc, QCBOR_ENCODE_AS_TAG, false, ZeroNotNULTerminated);
++   QCBOREncode_Finish(&Enc, &EncodedBigNumber);
++   if(UsefulBuf_Compare(EncodedBigNumber, UsefulBuf_FROM_SZ_LITERAL("\x00"))) {
++      return -4;
++   }
++
+    return 0;
+ }
+ 
+-- 
+2.56.0.windows.4
+

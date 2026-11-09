@@ -239,7 +239,7 @@ See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master 
 | **CryptoLib** | [`nasa/CryptoLib`](https://github.com/nasa/CryptoLib) | **1** (1 Medium; +1 C11 hygiene note) | [`./docs/bugs-found/cryptolib/README.md`](./docs/bugs-found/cryptolib/README.md) |
 | **libmnl** | [`netfilter/libmnl`](https://git.netfilter.org/libmnl) | **5** (1 Medium, 4 Low) | [`./docs/bugs-found/libmnl/README.md`](./docs/bugs-found/libmnl/README.md) |
 | **picohttpparser** | [`h2o/picohttpparser`](https://github.com/h2o/picohttpparser) | **0** (11 units proven) | [`./docs/bugs-found/picohttpparser/README.md`](./docs/bugs-found/picohttpparser/README.md) |
-| **Frama-C 33.0 / 34.0~~dev (`e-acsl-gcc`)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **10** (6 Bugs, 4 Limitations/UX) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
+| **Frama-C 33.0 – 35.0~~dev (E-ACSL, `e-acsl-gcc`, Variadic)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **9** to file (8 Bugs, 1 Limitation; 4 more not filed) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
 
 ---
 
@@ -264,6 +264,8 @@ python3 -m ruff format --check scripts tests
 python3 -m mypy scripts tests
 ```
 
+Add `-n auto` to run the tests in parallel (pytest-xdist); see [`tests/README.md`](./tests/README.md).
+
 > [!NOTE]
 > Edit skills only under `skills/`. The repository records the harness mirrors `.agents/skills/*` and `.claude/skills/*` as symlinks to `skills/*`. Where a checkout cannot use them (Windows with `core.symlinks=false`, where a harness needs real files), the mirror may be a real copy instead; `tests/test_extract_references.py` accepts a link, git's plain-file form of a link, or a copy, and fails when a copy differs from `skills/` by a single byte.
 
@@ -284,6 +286,6 @@ python3 -m mypy scripts tests
 - [Implementation Backlog & Verification Checklist (`./docs/backlog.md`)](./docs/backlog.md)
 - [Benchmark: Measuring Changes to Filters, Eva Configuration & Briefs (`./docs/benchmark.md`)](./docs/benchmark.md)
 - [Troubleshooting Guide (`./docs/troubleshooting.md`)](./docs/troubleshooting.md)
-- [Upstream Frama-C 33.0 / 34.0~~dev E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
+- [Upstream Frama-C 33.0 – 35.0~~dev E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
 - [Frama-C Reference Manuals (`./docs/references/README.md`)](./docs/references/README.md) & [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md)
 - [Third-Party Header Stubs Guide (`./templates/fc_stubs/README.md`)](./templates/fc_stubs/README.md)

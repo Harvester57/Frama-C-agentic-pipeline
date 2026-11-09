@@ -1,0 +1,127 @@
+From 18da27c0515da7bf7387535dc6152cf2c3f85efd Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:23:23 +0100
+Subject: [PATCH 5/7] Don't write an indeterminate epoch date or days on decode
+ error
+
+QCBORDecode_GetTEpochDate(), QCBORDecode_GetTEpochDays() and their
+InMapN/InMapSZ variants copy Item.val into the caller's output
+unconditionally. On error that value is indeterminate:
+
+- if an error is already latched, Item is never written;
+- if the label is not found, Item is a copy of the search template,
+  whose val was never set.
+
+MemorySanitizer confirms all six functions write uninitialized stack
+memory into *pnTime or *pnDays. QCBOR v1 assigned the output only on
+success, and the other getters in this file (big numbers, MIME,
+strings) do not write garbage on error either.
+
+Assign the output only on success, and test that a failed get leaves
+it unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_tag_decode.c    | 24 ++++++++++++++++++------
+ test/qcbor_decode_tests.c | 15 +++++++++++++++
+ 2 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/src/qcbor_tag_decode.c b/src/qcbor_tag_decode.c
+index 1895f4c..6ebd959 100644
+--- a/src/qcbor_tag_decode.c
++++ b/src/qcbor_tag_decode.c
+@@ -890,7 +890,9 @@ QCBORDecode_GetTEpochDate(QCBORDecodeContext          *pMe,
+                                      QCBORDecode_DateEpochTagCB,
+                                      uOffset,
+                                      &Item);
+-   *pnTime = Item.val.epochDate.nSeconds;
++   if(pMe->uLastError == QCBOR_SUCCESS) {
++      *pnTime = Item.val.epochDate.nSeconds;
++   }
+ }
+ 
+ 
+@@ -916,7 +918,9 @@ QCBORDecode_GetTEpochDateInMapN(QCBORDecodeContext          *pMe,
+                                      QCBORDecode_DateEpochTagCB,
+                                      uOffset,
+                                      &Item);
+-   *pnTime = Item.val.epochDate.nSeconds;
++   if(pMe->uLastError == QCBOR_SUCCESS) {
++      *pnTime = Item.val.epochDate.nSeconds;
++   }
+ }
+ 
+ 
+@@ -942,7 +946,9 @@ QCBORDecode_GetTEpochDateInMapSZ(QCBORDecodeContext          *pMe,
+                                      QCBORDecode_DateEpochTagCB,
+                                      uOffset,
+                                      &Item);
+-   *pnTime = Item.val.epochDate.nSeconds;
++   if(pMe->uLastError == QCBOR_SUCCESS) {
++      *pnTime = Item.val.epochDate.nSeconds;
++   }
+ }
+ 
+ 
+@@ -963,7 +969,9 @@ QCBORDecode_GetTEpochDays(QCBORDecodeContext          *pMe,
+                                      QCBORDecode_DaysEpochTagCB,
+                                      uOffset,
+                                      &Item);
+-   *pnDays = Item.val.epochDays;
++   if(pMe->uLastError == QCBOR_SUCCESS) {
++      *pnDays = Item.val.epochDays;
++   }
+ }
+ 
+ 
+@@ -989,7 +997,9 @@ QCBORDecode_GetTEpochDaysInMapN(QCBORDecodeContext          *pMe,
+                                      QCBORDecode_DaysEpochTagCB,
+                                      uOffset,
+                                      &Item);
+-   *pnDays = Item.val.epochDays;
++   if(pMe->uLastError == QCBOR_SUCCESS) {
++      *pnDays = Item.val.epochDays;
++   }
+ }
+ 
+ 
+@@ -1015,7 +1025,9 @@ QCBORDecode_GetTEpochDaysInMapSZ(QCBORDecodeContext          *pMe,
+                                      QCBORDecode_DaysEpochTagCB,
+                                      uOffset,
+                                      &Item);
+-   *pnDays = Item.val.epochDays;
++   if(pMe->uLastError == QCBOR_SUCCESS) {
++      *pnDays = Item.val.epochDays;
++   }
+ }
+ 
+ 
+diff --git a/test/qcbor_decode_tests.c b/test/qcbor_decode_tests.c
+index ee36606..d4d69a1 100644
+--- a/test/qcbor_decode_tests.c
++++ b/test/qcbor_decode_tests.c
+@@ -3752,6 +3752,21 @@ int32_t SpiffyDateDecodeTest(void)
+       return 108;
+    }
+ 
++   // A failed get leaves the output unchanged
++   nEpochDate6 = 42;
++   QCBORDecode_GetTEpochDateInMapN(&DC, 99999, QCBOR_TAG_REQUIREMENT_NOT_A_TAG,
++                                  &nEpochDate6);
++   uError = QCBORDecode_GetAndResetError(&DC);
++   if(uError != QCBOR_ERR_LABEL_NOT_FOUND || nEpochDate6 != 42) {
++      return 1081;
++   }
++   QCBORDecode_GetTEpochDaysInMapSZ(&DC, "no-label", QCBOR_TAG_REQUIREMENT_NOT_A_TAG,
++                                   &nEpochDate6);
++   uError = QCBORDecode_GetAndResetError(&DC);
++   if(uError != QCBOR_ERR_LABEL_NOT_FOUND || nEpochDate6 != 42) {
++      return 1082;
++   }
++
+    // Fail to get a string date by string label
+    QCBORDecode_GetTDateStringInMapSZ(&DC, "no-label",
+                                     QCBOR_TAG_REQUIREMENT_NOT_A_TAG,
+-- 
+2.56.0.windows.4
+

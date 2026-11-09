@@ -168,6 +168,10 @@ Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipel
 - `FRAMAC_BROKER=off` (or `-NoBroker`): the wrapper's previous static sizing.
 - `FRAMAC_SCHEDULER=waves`: wave-by-wave dispatch with barriers.
 
+## Recording pipeline bugs
+
+When a run hits a bug, gap or workaround in the pipeline itself (a script, generator, gate, wrapper, skill or brief), add or update a `### Symptom:` entry in `docs/troubleshooting.md` in the same session, with the exact error, the target and run, the diagnosed cause, the workaround, and whether it is fixed (file and change) or an open pipeline bug. Do not leave it only in chat or in the progress report. Rules and format: `AGENTS.md`, "Recording pipeline bugs in `docs/troubleshooting.md`". Subagents put the entry in their result; the parent writes it before the run ends.
+
 ## Anti-patterns
 
 Reporting a harness-induced crash as a bug; proving a function under a `requires` that excludes attacker-controlled values at the trust boundary; counting `Valid_under_hyp` as unconditional proof; treating `Invalid_but_dead` as a bug; treating a WP stall as a finding; agents editing shared headers, the shared corpus, or ledgers; executable C changes in the ACSL work tree; running target-controlled binaries outside `sandbox_exec.py`; writing report prose by hand; claiming complete coverage from a profile, tier, or budget cut.

@@ -1,0 +1,99 @@
+From 7b3c839cd965816c5ff9b0f283f8fb962a23b1a2 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:38:39 +0100
+Subject: [PATCH 2/2] Reject uMinLen > 8 in QCBOREncode_EncodeHead()
+
+QCBOREncode_EncodeHead() is public and its uMinLen is documented only
+as the minimum number of bytes to encode the argument. A CBOR head
+argument is at most 8 bytes; with uMinLen 9 or more the encoding loop
+indexes aIterate[] past its 4 entries and keeps pre-decrementing
+pByte, writing before the start of Buffer. UBSan reports
+'index 4 out of bounds for type const uint8_t[4]' and ASan a
+global-buffer-overflow read; with a stack buffer from
+UsefulBuf_MAKE_STACK_UB() the program can then crash on return. No
+caller in QCBOR passes more than 8.
+
+Return NULLUsefulBufC for uMinLen > 8, as for a too-small buffer, and
+document the limit.
+
+Also fix the EXTRA_ENCODE_HEAD_CHECK sanity check, which referred to
+buffer.ptr instead of Buffer.ptr and did not compile.
+
+This is the 1.x version of the same fix for the dev branch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inc/qcbor/qcbor_encode.h  | 6 ++++--
+ src/qcbor_encode.c        | 9 ++++++++-
+ test/qcbor_encode_tests.c | 9 +++++++++
+ 3 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/inc/qcbor/qcbor_encode.h b/inc/qcbor/qcbor_encode.h
+index 8c7ac4f..4901ad2 100644
+--- a/inc/qcbor/qcbor_encode.h
++++ b/inc/qcbor/qcbor_encode.h
+@@ -2187,10 +2187,12 @@ QCBOREncode_SubString(QCBOREncodeContext *pCtx, const size_t uStart);
+  *                     values 0xffff and smaller will be encoded in 4
+  *                     bytes. This is used primarily when encoding a
+  *                     float or double put into uNumber as the leading
+- *                     zero bytes for them must be encoded.
++ *                     zero bytes for them must be encoded. It
++ *                     must be 8 or less.
+  * @param uNumber      The numeric argument part of the CBOR head.
+  * @return             Pointer and length of the encoded head or
+- *                     @ref NULLUsefulBufC if the output buffer is too small.
++ *                     @ref NULLUsefulBufC if the output buffer is too small
++ *                     or @c uMinLen is more than 8.
+  *
+  * Callers do not to need to call this for normal CBOR encoding. Note
+  * that it doesn't even take a @ref QCBOREncodeContext argument.
+diff --git a/src/qcbor_encode.c b/src/qcbor_encode.c
+index 9a73aeb..d46680b 100644
+--- a/src/qcbor_encode.c
++++ b/src/qcbor_encode.c
+@@ -420,6 +420,13 @@ QCBOREncode_EncodeHead(UsefulBuf Buffer,
+         return NULLUsefulBufC;
+     }
+ 
++   /* The argument of a CBOR head is at most 8 bytes. A larger
++    * uMinLen would run the loop below past the end of aIterate[] and
++    * write before the start of Buffer. */
++   if(uMinLen > sizeof(uint64_t)) {
++      return NULLUsefulBufC;
++   }
++
+    /* Pointer to last valid byte in the buffer */
+    uint8_t * const pBufferEnd = &((uint8_t *)Buffer.ptr)[QCBOR_HEAD_BUFFER_SIZE-1];
+ 
+@@ -491,7 +498,7 @@ QCBOREncode_EncodeHead(UsefulBuf Buffer,
+     * pointer math in this function is not going wrong. Turn it on and
+     * run the whole test suite to perform the check.
+     */
+-   if(pBufferEnd - pByte > 9 || pBufferEnd - pByte < 1 || pByte < (uint8_t *)buffer.ptr) {
++   if(pBufferEnd - pByte > 9 || pBufferEnd - pByte < 1 || pByte < (uint8_t *)Buffer.ptr) {
+       return NULLUsefulBufC;
+    }
+ #endif /* EXTRA_ENCODE_HEAD_CHECK */
+diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
+index b10c9fc..d7788e6 100644
+--- a/test/qcbor_encode_tests.c
++++ b/test/qcbor_encode_tests.c
+@@ -3066,6 +3066,15 @@ int32_t QCBORHeadTest(void)
+       return -3;
+    }
+ 
++   // ---- uMinLen of 8 is the maximum; more is an error ----
++   encoded = QCBOREncode_EncodeHead(RightSize,
++                                    CBOR_MAJOR_TYPE_POSITIVE_INT,
++                                    9,
++                                    0);
++   if(!UsefulBuf_IsNULLC(encoded)) {
++      return -4;
++   }
++
+    return 0;
+ }
+ 
+-- 
+2.56.0.windows.4
+

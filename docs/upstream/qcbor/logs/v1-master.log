@@ -1,0 +1,31 @@
+######## QCBOR 1.x master 1d06057, unpatched
+===== float_shift_v1 (UBSan)
+/orig/src/ieee754.c:666:93: runtime error: shift exponent -93 is negative
+/orig/src/ieee754.c:510:87: runtime error: shift exponent -1 is negative
+finish=0
+===== encodehead (ASan)
+==26==ERROR: AddressSanitizer: global-buffer-overflow on address 0x59915a407844 at pc 0x59915a3eeb4c bp 0x7fff40a22e70 sp 0x7fff40a22e68
+    #0 0x59915a3eeb4b in QCBOREncode_EncodeHead /orig/src/qcbor_encode.c:468:39
+    #1 0x59915a3da9a6 in main /repro/encodehead.c:9:21
+0x59915a407844 is located 0 bytes after global variable 'QCBOREncode_EncodeHead.aIterate' defined in '/orig/src/qcbor_encode.c:460' (0x59915a407840) of size 4
+===== test suite, ASan + recoverable UBSan: distinct UB sites
+exit=0
+      1 /orig/inc/qcbor/UsefulBuf.h:1859:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:106:18: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:106:27: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/UsefulBuf.c:86:42: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/ieee754.c:510:87: runtime error: shift exponent -17 is negative
+      1 src/ieee754.c:666:93: runtime error: shift exponent -100 is negative
+SUMMARY: 76 tests run; 0 tests failed
+######## QCBOR 1.x master 1d06057 + patches/v1
+===== float_shift_v1 (UBSan)
+finish=0
+===== encodehead (ASan)
+len=0
+===== test suite, ASan + recoverable UBSan: distinct UB sites
+exit=0
+      1 /fix/inc/qcbor/UsefulBuf.h:1859:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:106:18: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:106:27: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/UsefulBuf.c:86:42: runtime error: null pointer passed as argument 2, which is declared to never be null
+SUMMARY: 76 tests run; 0 tests failed

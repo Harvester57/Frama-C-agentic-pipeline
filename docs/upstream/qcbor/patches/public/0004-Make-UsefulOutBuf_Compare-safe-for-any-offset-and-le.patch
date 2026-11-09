@@ -1,0 +1,183 @@
+From 075172e280ef2eb1a24e85ca18384699fe7f8c76 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:22:43 +0100
+Subject: [PATCH 4/7] Make UsefulOutBuf_Compare() safe for any offset and
+ length
+
+UsefulBuf.h says no data is read beyond the buffer's end, whatever
+the offsets. But the implementation added the offsets and lengths to
+the buffer pointer before clamping to the data length:
+
+- an offset near SIZE_MAX wraps the pointer to just before the
+  buffer, and the loop then reads there: Compare(SIZE_MAX, 2, 0, 2)
+  reads the byte before the buffer (ASan: heap-buffer-overflow,
+  1 byte before the region);
+- a length near SIZE_MAX wraps the end pointer and gives a wrong
+  result: Compare(0, SIZE_MAX, 0, 10) on 10 bytes returns -1, not 0;
+- any offset more than one past the end is already undefined pointer
+  arithmetic (C11 6.5.6p8), even without wrapping.
+
+Clamp offsets and lengths to the data length first and index from
+the buffer start. Results are unchanged for all existing tests.
+
+Also correct the documentation: the @return line had the sign
+backwards relative to the code and to the rest of the text, and a
+string starting past the end is treated as empty, as the existing
+tests expect, not "the function returns zero".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inc/qcbor/UsefulBuf.h  | 15 ++++++-----
+ src/UsefulBuf.c        | 59 ++++++++++++++++++++----------------------
+ test/UsefulBuf_Tests.c | 16 ++++++++++++
+ 3 files changed, 52 insertions(+), 38 deletions(-)
+
+diff --git a/inc/qcbor/UsefulBuf.h b/inc/qcbor/UsefulBuf.h
+index a604b61..ed969df 100644
+--- a/inc/qcbor/UsefulBuf.h
++++ b/inc/qcbor/UsefulBuf.h
+@@ -1660,8 +1660,9 @@ static UsefulBuf UsefulOutBuf_RetrieveOutputStorage(UsefulOutBuf *pUOutBuf);
+  * @param[in] uStart2   Offset of second bytes to compare.
+  * @param[in] uLen2     Length of second bytes to compare.
+  *
+- * @return  0 for equality, positive if uStart1 is lexographically larger,
+- *          negative if uStart2 is lexographically larger.
++ * @return  0 for equality, positive if the string at @c uStart1
++ *          lexicographically precedes the one at @c uStart2, negative
++ *          if it follows it.
+  *
+  * This looks into bytes that have been output at the offsets
+  * @c start1 and @c start2. It compares bytes at those two starting
+@@ -1680,11 +1681,11 @@ static UsefulBuf UsefulOutBuf_RetrieveOutputStorage(UsefulOutBuf *pUOutBuf);
+  * the second is "abc", a positive value is returned. The empty string
+  * is always the smallest and sorts ahead of all others.
+  *
+- * If either starting offset is beyond the end of the output buffer,
+- * the function returns zero.  It is the caller’s responsibility to
+- * ensure that offsets are within bounds so that a valid comparison is
+- * performed. No data will ever be read beyond the buffer’s end,
+- * making the function safe regardless of the provided offsets.
++ * A string whose starting offset is at or beyond the end of the
++ * output data is empty. It is the caller’s responsibility to ensure
++ * that offsets are within bounds so that a meaningful comparison is
++ * performed. No data is ever read outside the output data, making
++ * the function safe regardless of the provided offsets and lengths.
+  *
+  * This is a relatively odd function in that it works on data in the
+  * output buffer. It is employed by QCBOR to sort CBOR-encoded maps
+diff --git a/src/UsefulBuf.c b/src/UsefulBuf.c
+index 8dca463..508302b 100644
+--- a/src/UsefulBuf.c
++++ b/src/UsefulBuf.c
+@@ -721,53 +721,50 @@ UsefulInputBuf_Compare(UsefulInputBuf *pUInBuf,
+ /*
+  * Public function -- see UsefulBuf.h
+  *
+- * Code Reviewers: THIS FUNCTION DOES POINTER MATH
++ * This works on offsets and lengths, not on pointers, so no pointer
++ * outside the buffer is ever formed, whatever the offsets and lengths
++ * passed in. Adding them to the buffer pointer first could go past
++ * the end of the buffer or wrap around below its start.
+  */
+ int UsefulOutBuf_Compare(UsefulOutBuf *pMe,
+                          const size_t uStart1, const size_t uLen1,
+                          const size_t uStart2, const size_t uLen2)
+ {
+    const uint8_t *pBase;
+-   const uint8_t *pEnd;
+-   const uint8_t *p1;
+-   const uint8_t *p2;
+-   const uint8_t *p1Start;
+-   const uint8_t *p2Start;
+-   const uint8_t *p1End;
+-   const uint8_t *p2End;
+-   int            uComparison;
++   size_t         uDataLen;
+    size_t         uComparedLen1;
+    size_t         uComparedLen2;
++   size_t         uIndex;
++   int            uComparison;
+ 
+-   pBase   = pMe->UB.ptr;
+-   pEnd    = (const uint8_t *)pBase + pMe->data_len;
+-   p1Start = pBase + uStart1;
+-   p2Start = pBase + uStart2;
+-   p1End   = p1Start + uLen1;
+-   p2End   = p2Start + uLen2;
++   pBase    = pMe->UB.ptr;
++   uDataLen = pMe->data_len;
++
++   /* Effectively truncate each string to the data in the output
++    * buffer. A string that starts at or past the end is empty. */
++   uComparedLen1 = 0;
++   if(uStart1 < uDataLen) {
++      uComparedLen1 = uDataLen - uStart1;
++      if(uLen1 < uComparedLen1) {
++         uComparedLen1 = uLen1;
++      }
++   }
++   uComparedLen2 = 0;
++   if(uStart2 < uDataLen) {
++      uComparedLen2 = uDataLen - uStart2;
++      if(uLen2 < uComparedLen2) {
++         uComparedLen2 = uLen2;
++      }
++   }
+ 
+    uComparison = 0;
+-   for(p1 = p1Start, p2 = p2Start;
+-       p1 < pEnd && p2 < pEnd && p1 < p1End && p2 < p2End;
+-       p1++, p2++) {
+-      uComparison = *p2 - *p1;
++   for(uIndex = 0; uIndex < uComparedLen1 && uIndex < uComparedLen2; uIndex++) {
++      uComparison = pBase[uStart2 + uIndex] - pBase[uStart1 + uIndex];
+       if(uComparison != 0) {
+          break;
+       }
+    }
+ 
+-   /* Loop might have terminated because strings were off
+-    * the end of the buffer. Compute actual lengths compared.
+-    */
+-   uComparedLen1 = uLen1;
+-   if(p1 >= pEnd) {
+-      uComparedLen1 = (size_t)(p1 - p1Start);
+-   }
+-   uComparedLen2 = uLen2;
+-   if(p2 >= pEnd) {
+-      uComparedLen2 = (size_t)(p2 - p2Start);
+-   }
+-
+    if(uComparison == 0) {
+       /* All bytes were equal, now check the lengths */
+       if(uComparedLen2 > uComparedLen1) {
+diff --git a/test/UsefulBuf_Tests.c b/test/UsefulBuf_Tests.c
+index 10aba73..2d8289d 100644
+--- a/test/UsefulBuf_Tests.c
++++ b/test/UsefulBuf_Tests.c
+@@ -1428,6 +1428,22 @@ const char * UOBExtraTests(void)
+       return "another unequal length compare";
+    }
+ 
++   /* Offsets and lengths that would wrap around if added to a pointer */
++   nCompare = UsefulOutBuf_Compare(&UOB, SIZE_MAX, 2, 0, 2);
++   if(nCompare != 1) {
++      return "Comparison with wrapping offset";
++   }
++
++   nCompare = UsefulOutBuf_Compare(&UOB, 0, 2, SIZE_MAX, 2);
++   if(nCompare != -1) {
++      return "Comparison with wrapping offset 2";
++   }
++
++   nCompare = UsefulOutBuf_Compare(&UOB, 0, SIZE_MAX, 0, 10);
++   if(nCompare != 0) {
++      return "Comparison with wrapping length";
++   }
++
+ 
+    /* Test UsefulOutBuf_Swap() */
+ 
+-- 
+2.56.0.windows.4
+

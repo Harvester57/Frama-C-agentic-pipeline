@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from extract_references import (
     DEFAULT_ROOT,
     Section,
@@ -108,49 +110,52 @@ def test_committed_reference_markdown_is_up_to_date():
     assert stale_outputs(DEFAULT_ROOT) == []
 
 
-def test_framac_skills_mirror_is_in_sync():
-    # Every harness mirror (.agents/skills, .claude/skills) must hold one symlink per skill,
-    # pointing at ../skills/<name>: skills are edited once in skills/ and shared everywhere.
+@pytest.mark.parametrize("harness", [".agents", ".claude"])
+def test_framac_skills_mirror_is_in_sync(harness):
+    # Every harness mirror (.agents/skills for agents that read AGENTS.md, .claude/skills for
+    # Claude Code) must hold one symlink per skill, pointing at ../skills/<name>: skills are edited
+    # once in skills/ and shared everywhere. One test per mirror, so a stale copy names its harness.
     repo_root = DEFAULT_ROOT.parent.parent
     skills_dir = repo_root / "skills"
     primary = {
         p.relative_to(skills_dir).as_posix(): p.read_bytes() for p in sorted(skills_dir.rglob("*")) if p.is_file()
     }
     skill_names = sorted({Path(k).parts[0] for k in primary})
-    for mirror in (repo_root / ".agents" / "skills", repo_root / ".claude" / "skills"):
-        if not mirror.is_dir():
-            continue
-        entries = sorted(p.name for p in mirror.iterdir())
-        assert entries == skill_names, f"{mirror} must contain exactly the skills/ entries as symlinks"
-        symlinks = 0
-        for name in skill_names:
-            link = mirror / name
-            if link.is_symlink():
-                symlinks += 1
-                assert link.resolve() == (skills_dir / name).resolve(), f"{link} must point at skills/{name}"
-            elif link.is_dir():
-                # A harness that cannot load a plain-file symlink needs a real copy; it must stay
-                # byte-identical to skills/<name>, so an edit made in only one place fails here.
-                copied = {
-                    p.relative_to(link).as_posix(): p.read_bytes() for p in sorted(link.rglob("*")) if p.is_file()
-                }
-                expected = {k.split("/", 1)[1]: v for k, v in primary.items() if Path(k).parts[0] == name}
-                assert copied == expected, f"{link} is a copy that differs from skills/{name}"
-            else:
-                # core.symlinks=false (the Windows default): git checks a symlink out as a plain file
-                # holding its target path, which is still what the repository records.
-                assert link.is_file(), f"{link} must be a symlink to skills/{name}"
-                target = link.read_text(encoding="utf-8").strip()
-                assert target == f"../../skills/{name}", f"{link} must point at skills/{name}"
-        if symlinks != len(skill_names):
-            continue  # no real links to walk: the targets were checked above
-        # Content through the links matches the primary (rglob does not follow symlinked dirs,
-        # so walk each link's target explicitly).
-        mirrored = {}
-        for name in skill_names:
-            for p in sorted((mirror / name).rglob("*")):
-                if p.is_file():
-                    mirrored[p.resolve().relative_to(skills_dir).as_posix()] = p.read_bytes()
-        assert primary.keys() == mirrored.keys()
-        for rel_path, content in primary.items():
-            assert mirrored[rel_path] == content, f"Skill mirror drift in {rel_path}"
+    mirror = repo_root / harness / "skills"
+    if not mirror.is_dir():
+        pytest.skip(f"{harness}/skills is not checked out")
+    entries = sorted(p.name for p in mirror.iterdir())
+    assert entries == skill_names, f"{mirror} must contain exactly the skills/ entries as symlinks"
+    symlinks = 0
+    for name in skill_names:
+        link = mirror / name
+        if link.is_symlink():
+            symlinks += 1
+            assert link.resolve() == (skills_dir / name).resolve(), f"{link} must point at skills/{name}"
+        elif link.is_dir():
+            # A harness that cannot load a plain-file symlink needs a real copy; it must stay
+            # byte-identical to skills/<name>, so an edit made in only one place fails here.
+            copied = {p.relative_to(link).as_posix(): p.read_bytes() for p in sorted(link.rglob("*")) if p.is_file()}
+            expected = {k.split("/", 1)[1]: v for k, v in primary.items() if Path(k).parts[0] == name}
+            stale = sorted(k for k in copied.keys() | expected.keys() if copied.get(k) != expected.get(k))
+            assert not stale, (
+                f"{link} is a stale copy of skills/{name}: {', '.join(stale)} differ; refresh it from skills/{name}"
+            )
+        else:
+            # core.symlinks=false (the Windows default): git checks a symlink out as a plain file
+            # holding its target path, which is still what the repository records.
+            assert link.is_file(), f"{link} must be a symlink to skills/{name}"
+            target = link.read_text(encoding="utf-8").strip()
+            assert target == f"../../skills/{name}", f"{link} must point at skills/{name}"
+    if symlinks != len(skill_names):
+        return  # no real links to walk: the targets were checked above
+    # Content through the links matches the primary (rglob does not follow symlinked dirs,
+    # so walk each link's target explicitly).
+    mirrored = {}
+    for name in skill_names:
+        for p in sorted((mirror / name).rglob("*")):
+            if p.is_file():
+                mirrored[p.resolve().relative_to(skills_dir).as_posix()] = p.read_bytes()
+    assert primary.keys() == mirrored.keys()
+    for rel_path, content in primary.items():
+        assert mirrored[rel_path] == content, f"Skill mirror drift in {rel_path}"

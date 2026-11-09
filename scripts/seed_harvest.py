@@ -138,6 +138,7 @@ _UNSIGNED_LEN_SCALARS = {"unsigned short", "unsigned int", "unsigned long", "uns
 _LEN_NAME_RE = re.compile(r"[Ll]en|[Ss]ize|[Cc]ount|[Cc]nt|[Bb]ytes|^n(?:[A-Z_0-9]|$)|^num|^N$")
 _CHAR_POINTEES = {"char", "signed char", "unsigned char", "void"}
 _QUALIFIERS_RE = re.compile(r"\b(?:const|volatile|restrict|__restrict|__restrict__)\b")
+_ATTR_RE = re.compile(r"\b__attribute__\s*\(\(.*?\)\)")
 _TAG_RE = re.compile(r"^(struct|union|enum)\s+([A-Za-z_]\w*)$")
 _IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
 
@@ -152,12 +153,13 @@ class SeedError(RuntimeError):
 
 
 def _norm_type(t: str) -> str:
-    return " ".join(_QUALIFIERS_RE.sub(" ", t).split()).replace(" *", "*").replace("*", " *").strip()
+    cleaned = _ATTR_RE.sub(" ", _QUALIFIERS_RE.sub(" ", t))
+    return " ".join(cleaned.split()).replace(" *", "*").replace("*", " *").strip()
 
 
 def split_signature(sig: str) -> tuple[str, list[str], bool] | None:
     """(return type, parameter types, variadic) of a model signature such as `int(char *,_Bool)`."""
-    sig = (sig or "").strip()
+    sig = _ATTR_RE.sub("", (sig or "").strip()).strip()
     i = sig.find("(")
     if i <= 0 or not sig.endswith(")") or sig[i:].startswith("(*"):
         return None

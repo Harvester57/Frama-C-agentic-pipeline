@@ -9,13 +9,15 @@ Testing conventions for the `tests/` suite in this repository.
 
 ## 1. Running the Test Suite
 
+Always run tests in parallel with pytest-xdist: pass `-n auto` to every run of more than a single test (the full suite takes about a minute in parallel, several minutes serially). Use `-n 0` only to debug one failing test (`pdb`, clean output, or to check whether a failure appears only in parallel). With `FRAMAC_DOCKER_TESTS=1`, cap the workers (`-n 4`), as each worker starts its own containers. See `tests/README.md` for the other variants.
+
 From PowerShell on Windows (always set `PYTHONIOENCODING="utf-8"` and double-quote flags containing `=` or `.`):
 
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
-python -m pytest tests
+python -m pytest tests -n auto
 python -m pytest tests/test_validators.py -k "test_name"
-python -m pytest "-m" "not slow" tests
+python -m pytest "-m" "not slow" tests -n auto
 ```
 
 `pyproject.toml` configures `pythonpath = ["scripts", "tests"]` and `--strict-markers`, so tests import pipeline modules directly by name (e.g., `import ledger`, `import resources`, `import workspace_overlay`).

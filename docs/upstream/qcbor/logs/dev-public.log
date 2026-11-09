@@ -1,0 +1,231 @@
+===== C1 all-zero big number
+----- bignum_zero.plain 
+NoPreferred(+, 00 00 00 00)   expect c2 41 00  err=0  c2 41 a5 
+Preferred(+, 00 00 00 00)     expect 00        err=0  18 a5 
+NoPreferred(+, heap 00)       expect c2 41 00  err=0  c2 41 00 
+exit=0
+----- bignum_zero.asan 
+=================================================================
+==177==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000011 at pc 0x6412a7a56417 bp 0x7ffca3bcf0e0 sp 0x7ffca3bce8a0
+READ of size 1 at 0x502000000011 thread T0
+    #0 0x6412a7a56416 in __asan_memmove (/build/split-public/bignum_zero.asan+0xcb416) (BuildId: cba2e5d7d853fdec950ab01a060fb057c551df66)
+    #1 0x6412a7a9e302 in UsefulOutBuf_AppendUsefulBuf /qcbor/src/UsefulBuf.c:523:10
+
+0x502000000011 is located 0 bytes after 1-byte region [0x502000000010,0x502000000011)
+allocated by thread T0 here:
+    #0 0x6412a7a58193 in malloc (/build/split-public/bignum_zero.asan+0xcd193) (BuildId: cba2e5d7d853fdec950ab01a060fb057c551df66)
+    #1 0x6412a7a99a5f in main /repro/bignum_zero.c:36:21
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow (/build/split-public/bignum_zero.asan+0xcb416) (BuildId: cba2e5d7d853fdec950ab01a060fb057c551df66) in __asan_memmove
+Shadow bytes around the buggy address:
+  0x501ffffffd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x501ffffffe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x501ffffffe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x501fffffff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x501fffffff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x502000000000: fa fa[01]fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x502000000080: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x502000000100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x502000000180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x502000000200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x502000000280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+exit=1
+===== NEW borrowed positive big number
+----- bignum_borrowed.plain 
+NoPreferred(BORROWED, +258)    expect 42 01 02   err=0  42 01 02 
+Preferred(BORROWED, +2^64)     expect 49 01 00 .. err=0  49 01 00 00 00 00 00 00 00 00 
+NoPreferred(TAG, +258)         expect c2 42 01 02 err=0  c2 42 01 02 
+NoPreferred(BORROWED, -258)    expect 42 01 01   err=0  42 01 01 
+OnlyPreferred: Preferred(TAG, +2^64)             err=0  c2 49 01 00 00 00 00 00 00 00 00 
+OnlyPreferred: Preferred(TAG, -(2^64+2))         err=0  c3 49 01 00 00 00 00 00 00 00 01 
+exit=0
+===== NEW negative zero big number
+----- bignum_negzero.plain 
+Preferred(-, 00)         err=0  00 
+NoPreferred(-, 00)       err=0  c2 41 00 
+Preferred(-, empty)      err=0  00 
+NoPreferred(-, empty)    err=0  c2 40 
+exit=0
+===== C2 float shifts (UBSan, recoverable)
+----- float_shift.ubsan enc-double
+finish=0
+exit=0
+----- float_shift.ubsan enc-float
+finish=0
+exit=0
+----- float_shift.ubsan dec-single
+finish=0
+exit=0
+----- float_shift.ubsan dec-double
+finish=0
+exit=0
+===== C3 UsefulOutBuf_Compare
+----- outbuf_compare.asan 
+Compare(10,1, 0,1)       = 1 (doc says 0)
+Compare(SIZE_MAX,2, 0,2) = 1
+exit=0
+----- outbuf_compare.asanonly 
+Compare(10,1, 0,1)       = 1 (doc says 0)
+Compare(SIZE_MAX,2, 0,2) = 1
+exit=0
+===== C4 epoch outputs (MSan)
+----- epoch_uninit.msan latched
+error=67
+output unchanged
+exit=0
+----- epoch_uninit.msan days-latched
+error=67
+output unchanged
+exit=0
+----- epoch_uninit.msan notfound-n
+error=68
+output unchanged
+exit=0
+----- epoch_uninit.msan notfound-sz
+error=68
+output unchanged
+exit=0
+----- epoch_uninit.msan days-notfound
+error=68
+output unchanged
+exit=0
+===== EncodeHead uMinLen > 8
+----- encodehead.asan 
+len=0
+exit=0
+----- encodehead.asanonly 
+len=0
+exit=0
+===== QCBOR-01 INT64_MIN
+----- int64min.asan 
+error=0 neg=1 len=8
+exit=0
+===== NEW GetArray/GetMap on empty container
+----- getarray_empty.plain top
+top    error=0  len=4702111234474983745 (expect 1)
+exit=0
+----- getarray_empty.plain nested
+nested error=0  len=0 (expect 1)
+exit=0
+----- getarray_empty.plain map
+map    error=0  len=4702111234474983745 (expect 1)
+exit=0
+----- getarray_empty.plain indef
+indef  error=0  len=0 (expect 1)
+exit=0
+----- getarray_empty.msan top
+==267==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5bbc5df54012 in Run /repro/getarray_empty.c:40:4
+    #1 0x5bbc5df54012 in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x5bbc5df5400b in Run /repro/getarray_empty.c:40:88
+    #1 0x5bbc5df5400b in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x5bbc5df577c1 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2551:22
+    #1 0x5bbc5df53f3e in Run /qcbor/inc/qcbor/qcbor_spiffy_decode.h
+
+  Uninitialized value was created by an allocation of 'End' in the stack frame
+    #0 0x5bbc5df572c3 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2488:4
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /repro/getarray_empty.c:40:4 in Run
+Exiting
+exit=1
+----- getarray_empty.msan nested
+==272==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x555555620012 in Run /repro/getarray_empty.c:40:4
+    #1 0x555555620012 in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x55555562000b in Run /repro/getarray_empty.c:40:88
+    #1 0x55555562000b in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x5555556237c1 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2551:22
+    #1 0x55555561ff3e in Run /qcbor/inc/qcbor/qcbor_spiffy_decode.h
+
+  Uninitialized value was created by an allocation of 'End' in the stack frame
+    #0 0x5555556232c3 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2488:4
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /repro/getarray_empty.c:40:4 in Run
+Exiting
+exit=1
+----- getarray_empty.msan map
+==277==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x555555620012 in Run /repro/getarray_empty.c:40:4
+    #1 0x555555620012 in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x55555562000b in Run /repro/getarray_empty.c:40:88
+    #1 0x55555562000b in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x5555556237c1 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2551:22
+    #1 0x55555561ff3e in Run /qcbor/inc/qcbor/qcbor_spiffy_decode.h
+
+  Uninitialized value was created by an allocation of 'End' in the stack frame
+    #0 0x5555556232c3 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2488:4
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /repro/getarray_empty.c:40:4 in Run
+Exiting
+exit=1
+----- getarray_empty.msan indef
+==282==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x555555620012 in Run /repro/getarray_empty.c:40:4
+    #1 0x555555620012 in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x55555562000b in Run /repro/getarray_empty.c:40:88
+    #1 0x55555562000b in main /repro/getarray_empty.c:46:4
+
+  Uninitialized value was stored to memory at
+    #0 0x5555556237c1 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2551:22
+    #1 0x55555561ff3e in Run /qcbor/inc/qcbor/qcbor_spiffy_decode.h
+
+  Uninitialized value was created by an allocation of 'End' in the stack frame
+    #0 0x5555556232c3 in QCBORDecode_Private_GetArrayOrMap /qcbor/src/qcbor_main_decode.c:2488:4
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /repro/getarray_empty.c:40:4 in Run
+Exiting
+exit=1
+===== QCBOR test suite, ASan + recoverable UBSan: distinct UB sites
+exit=0
+      1 /qcbor/inc/qcbor/UsefulBuf.h:2196:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:102:42: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/UsefulBuf.c:122:18: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:122:27: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/UsefulBuf.c:506:56: runtime error: applying zero offset to null pointer
+SUMMARY: 89 tests run; 0 tests failed
+===== QCBOR test suite (asan)
+exit=1
+/qcbor/inc/qcbor/UsefulBuf.h:2196:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /qcbor/inc/qcbor/UsefulBuf.h:2196:11 
+/qcbor/inc/qcbor/UsefulBuf.h:2196:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+/usr/include/string.h:61:62: note: nonnull attribute specified here
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /qcbor/inc/qcbor/UsefulBuf.h:2196:11 
+===== QCBOR test suite (msan)
+exit=0
+DecodeFailureTests PASSED
+StringDecoderModeFailTest PASSED
+ExponentAndMantissaDecodeFailTests PASSED
+SUMMARY: 89 tests run; 0 tests failed
+StreamTest PASSED
+EncodeIndefiniteStringsTest PASSED
+SUMMARY: 89 tests run; 0 tests failed

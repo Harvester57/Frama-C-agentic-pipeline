@@ -1,0 +1,127 @@
+From 5752fbc4f5e99a7cb132da172068252d655e8869 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:21:37 +0100
+Subject: [PATCH 3/7] Don't shift by an out-of-range amount in float conversion
+
+IEEE754_SingleToHalf() and IEEE754_DoubleToSingle() computed the
+subnormal significand before checking that the exponent is in the
+subnormal range. For other exponents the shift amount is negative or
+at least the width of the type, which is undefined behavior (C11
+6.5.7p3). The result was then discarded by the range check, so with
+common compilers the output is right, but:
+
+- UBSan reports it, and a build with -fsanitize=shift and trapping
+  aborts. It happens for most values: any float that is not exactly
+  a half (e.g. 1.1f, shift -1) and any double that is not exactly a
+  float (e.g. 0.1, shift -93).
+- It is reached by QCBOREncode_AddFloat() and QCBOREncode_AddDouble()
+  with preferred serialization, and by decoding untrusted input with
+  QCBOR_DECODE_MODE_ONLY_SHORTEST_FLOAT (part of
+  QCBOR_DECODE_MODE_PREFERRED, CDE and dCBOR), e.g. fa 3f 8c cc cd.
+- QCBOR's own test suite triggers it.
+
+Check the exponent range first and shift only inside it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ieee754.c | 73 +++++++++++++++++++++++++++++----------------------
+ 1 file changed, 42 insertions(+), 31 deletions(-)
+
+diff --git a/src/ieee754.c b/src/ieee754.c
+index 662a97d..68788f4 100644
+--- a/src/ieee754.c
++++ b/src/ieee754.c
+@@ -458,27 +458,32 @@ IEEE754_SingleToHalf(const uint32_t uSingle)
+           * a half-precision significand */
+          nShiftAmount = nExponentDifference + (SINGLE_NUM_SIGNIFICAND_BITS - HALF_NUM_SIGNIFICAND_BITS);
+ 
+-         /* Must add 1 in to the possible significand because there is
+-          * an implied 1 for normal values and not for subnormal
+-          * values. See equations here:
+-          * https://en.wikipedia.org/wiki/Single-precision_floating-point_format#Exponent_encoding
+-          */
+-         uHalfSignificand = (uSingleSignificand + (1 << SINGLE_NUM_SIGNIFICAND_BITS)) >> nShiftAmount;
++         /* --- DO NOT CONVERT, unless it is a half subnormal --- */
++         result.uSize   = IEEE754_UNION_IS_SINGLE;
++         result.uValue  = uSingle;
+ 
+-         /* If only zero bits get shifted out, this can be converted
+-          * to subnormal */
++         /* The exponent must be in the half subnormal range. Check
++          * this before shifting: outside that range nShiftAmount is
++          * negative or 32 or more, and a shift by such an amount is
++          * undefined behavior. Inside it, nShiftAmount is 14 to 23. */
+          if(nSingleUnbiasedExponent < HALF_EXPONENT_MIN &&
+-            nSingleUnbiasedExponent >= HALF_EXPONENT_MIN - HALF_NUM_SIGNIFICAND_BITS &&
+-            uHalfSignificand << nShiftAmount == uSingleSignificand + (1 << SINGLE_NUM_SIGNIFICAND_BITS)) {
+-            /* --- CONVERTABLE TO HALF SUBNORMAL --- */
+-            result.uSize  = IEEE754_UNION_IS_HALF;
+-            result.uValue = IEEE754_AssembleHalf(nIsNegative,
+-                                                 uHalfSignificand,
+-                                                 HALF_EXPONENT_ZERO);
+-         } else {
+-            /* --- DO NOT CONVERT --- */
+-            result.uSize   = IEEE754_UNION_IS_SINGLE;
+-            result.uValue  = uSingle;
++            nSingleUnbiasedExponent >= HALF_EXPONENT_MIN - HALF_NUM_SIGNIFICAND_BITS) {
++            /* Must add 1 in to the possible significand because there is
++             * an implied 1 for normal values and not for subnormal
++             * values. See equations here:
++             * https://en.wikipedia.org/wiki/Single-precision_floating-point_format#Exponent_encoding
++             */
++            uHalfSignificand = (uSingleSignificand + (1 << SINGLE_NUM_SIGNIFICAND_BITS)) >> nShiftAmount;
++
++            /* If only zero bits get shifted out, this can be converted
++             * to subnormal */
++            if(uHalfSignificand << nShiftAmount == uSingleSignificand + (1 << SINGLE_NUM_SIGNIFICAND_BITS)) {
++               /* --- CONVERTABLE TO HALF SUBNORMAL --- */
++               result.uSize  = IEEE754_UNION_IS_HALF;
++               result.uValue = IEEE754_AssembleHalf(nIsNegative,
++                                                    uHalfSignificand,
++                                                    HALF_EXPONENT_ZERO);
++            }
+          }
+       }
+    }
+@@ -622,20 +627,26 @@ IEEE754_DoubleToSingle(const double d)
+           */
+          nExponentDifference = -(nDoubleUnbiasedExponent - SINGLE_EXPONENT_MIN);
+          nShiftAmount        = nExponentDifference + (DOUBLE_NUM_SIGNIFICAND_BITS - SINGLE_NUM_SIGNIFICAND_BITS);
+-         uSingleSignificand  = (uDoubleSignificand + (1ULL << DOUBLE_NUM_SIGNIFICAND_BITS)) >> nShiftAmount;
+ 
++         /* --- CAN NOT BE CONVERTED, unless it is a single subnormal --- */
++         Result.uSize   = IEEE754_UNION_IS_DOUBLE;
++         Result.uValue  = uDouble;
++
++         /* The exponent must be in the single subnormal range. Check
++          * this before shifting: outside that range nShiftAmount is
++          * negative or 64 or more, and a shift by such an amount is
++          * undefined behavior. Inside it, nShiftAmount is 30 to 52. */
+          if(nDoubleUnbiasedExponent < SINGLE_EXPONENT_MIN &&
+-            nDoubleUnbiasedExponent >= SINGLE_EXPONENT_MIN - SINGLE_NUM_SIGNIFICAND_BITS &&
+-            uSingleSignificand << nShiftAmount == uDoubleSignificand + (1ULL << DOUBLE_NUM_SIGNIFICAND_BITS)) {
+-            /* --- IS CONVERTABLE TO SINGLE SUBNORMAL --- */
+-            Result.uSize  = IEEE754_UNION_IS_SINGLE;
+-            Result.uValue = IEEE754_AssembleSingle(nIsNegative,
+-                                                   uSingleSignificand,
+-                                                   SINGLE_EXPONENT_ZERO);
+-         } else {
+-            /* --- CAN NOT BE CONVERTED --- */
+-            Result.uSize   = IEEE754_UNION_IS_DOUBLE;
+-            Result.uValue  = uDouble;
++            nDoubleUnbiasedExponent >= SINGLE_EXPONENT_MIN - SINGLE_NUM_SIGNIFICAND_BITS) {
++            uSingleSignificand = (uDoubleSignificand + (1ULL << DOUBLE_NUM_SIGNIFICAND_BITS)) >> nShiftAmount;
++
++            if(uSingleSignificand << nShiftAmount == uDoubleSignificand + (1ULL << DOUBLE_NUM_SIGNIFICAND_BITS)) {
++               /* --- IS CONVERTABLE TO SINGLE SUBNORMAL --- */
++               Result.uSize  = IEEE754_UNION_IS_SINGLE;
++               Result.uValue = IEEE754_AssembleSingle(nIsNegative,
++                                                      uSingleSignificand,
++                                                      SINGLE_EXPONENT_ZERO);
++            }
+          }
+       }
+    }
+-- 
+2.56.0.windows.4
+

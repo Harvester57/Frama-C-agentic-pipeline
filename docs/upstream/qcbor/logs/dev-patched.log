@@ -1,0 +1,130 @@
+===== C1 all-zero big number
+----- bignum_zero.plain 
+NoPreferred(+, 00 00 00 00)   expect c2 41 00  err=0  c2 41 00 
+Preferred(+, 00 00 00 00)     expect 00        err=0  00 
+NoPreferred(+, heap 00)       expect c2 41 00  err=0  c2 41 00 
+exit=0
+----- bignum_zero.asan 
+NoPreferred(+, 00 00 00 00)   expect c2 41 00  err=0  c2 41 00 
+Preferred(+, 00 00 00 00)     expect 00        err=0  00 
+NoPreferred(+, heap 00)       expect c2 41 00  err=0  c2 41 00 
+exit=0
+===== NEW borrowed positive big number
+----- bignum_borrowed.plain 
+NoPreferred(BORROWED, +258)    expect 42 01 02   err=0  42 01 02 
+Preferred(BORROWED, +2^64)     expect 49 01 00 .. err=0  49 01 00 00 00 00 00 00 00 00 
+NoPreferred(TAG, +258)         expect c2 42 01 02 err=0  c2 42 01 02 
+NoPreferred(BORROWED, -258)    expect 42 01 01   err=0  42 01 01 
+OnlyPreferred: Preferred(TAG, +2^64)             err=0  c2 49 01 00 00 00 00 00 00 00 00 
+OnlyPreferred: Preferred(TAG, -(2^64+2))         err=0  c3 49 01 00 00 00 00 00 00 00 01 
+exit=0
+===== NEW negative zero big number
+----- bignum_negzero.plain 
+Preferred(-, 00)         err=0  00 
+NoPreferred(-, 00)       err=0  c2 41 00 
+Preferred(-, empty)      err=0  00 
+NoPreferred(-, empty)    err=0  c2 40 
+exit=0
+===== C2 float shifts (UBSan, recoverable)
+----- float_shift.ubsan enc-double
+finish=0
+exit=0
+----- float_shift.ubsan enc-float
+finish=0
+exit=0
+----- float_shift.ubsan dec-single
+finish=0
+exit=0
+----- float_shift.ubsan dec-double
+finish=0
+exit=0
+===== C3 UsefulOutBuf_Compare
+----- outbuf_compare.asan 
+Compare(10,1, 0,1)       = 1 (doc says 0)
+Compare(SIZE_MAX,2, 0,2) = 1
+exit=0
+----- outbuf_compare.asanonly 
+Compare(10,1, 0,1)       = 1 (doc says 0)
+Compare(SIZE_MAX,2, 0,2) = 1
+exit=0
+===== C4 epoch outputs (MSan)
+----- epoch_uninit.msan latched
+error=67
+output unchanged
+exit=0
+----- epoch_uninit.msan days-latched
+error=67
+output unchanged
+exit=0
+----- epoch_uninit.msan notfound-n
+error=68
+output unchanged
+exit=0
+----- epoch_uninit.msan notfound-sz
+error=68
+output unchanged
+exit=0
+----- epoch_uninit.msan days-notfound
+error=68
+output unchanged
+exit=0
+===== EncodeHead uMinLen > 8
+----- encodehead.asan 
+len=0
+exit=0
+----- encodehead.asanonly 
+len=0
+exit=0
+===== QCBOR-01 INT64_MIN
+----- int64min.asan 
+error=0 neg=1 len=8
+exit=0
+===== NEW GetArray/GetMap on empty container
+----- getarray_empty.plain top
+top    error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.plain nested
+nested error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.plain map
+map    error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.plain indef
+indef  error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.msan top
+top    error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.msan nested
+nested error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.msan map
+map    error=0  len=1 (expect 1)
+exit=0
+----- getarray_empty.msan indef
+indef  error=0  len=1 (expect 1)
+exit=0
+===== QCBOR test suite, ASan + recoverable UBSan: distinct UB sites
+exit=0
+      1 /qcbor/inc/qcbor/UsefulBuf.h:2196:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:102:42: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/UsefulBuf.c:122:18: runtime error: null pointer passed as argument 1, which is declared to never be null
+      1 src/UsefulBuf.c:122:27: runtime error: null pointer passed as argument 2, which is declared to never be null
+      1 src/UsefulBuf.c:506:56: runtime error: applying zero offset to null pointer
+SUMMARY: 89 tests run; 0 tests failed
+===== QCBOR test suite (asan)
+exit=1
+/qcbor/inc/qcbor/UsefulBuf.h:2196:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /qcbor/inc/qcbor/UsefulBuf.h:2196:11 
+/qcbor/inc/qcbor/UsefulBuf.h:2196:11: runtime error: null pointer passed as argument 1, which is declared to never be null
+/usr/include/string.h:61:62: note: nonnull attribute specified here
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /qcbor/inc/qcbor/UsefulBuf.h:2196:11 
+===== QCBOR test suite (msan)
+exit=0
+DecodeFailureTests PASSED
+StringDecoderModeFailTest PASSED
+ExponentAndMantissaDecodeFailTests PASSED
+SUMMARY: 89 tests run; 0 tests failed
+StreamTest PASSED
+EncodeIndefiniteStringsTest PASSED
+SUMMARY: 89 tests run; 0 tests failed

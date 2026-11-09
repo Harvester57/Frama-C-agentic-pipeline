@@ -1,0 +1,120 @@
+From 8cfca88d216f21ac0094f28a726487c91e25689b Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:20:54 +0100
+Subject: [PATCH 2/7] Encode a negative zero big number as zero
+
+QCBOREncode_AddTBigNumber() and QCBOREncode_AddTBigNumberNoPreferred()
+with bNegative true and a big number of value zero (empty or all
+zero bytes) applied the offset of one to zero and produced three
+different wrong values:
+
+  AddTBigNumber(-, 00)           3b ff ff ff ff ff ff ff ff  (-2^64)
+  AddTBigNumber(-, empty)        3b ff ff ff ff ff ff ff ff  (-2^64)
+  AddTBigNumberNoPreferred(-, 00)    c3 41 ff                (-256)
+  AddTBigNumberNoPreferred(-, empty) c3 40                   (-1)
+
+No error was set. The test cases named "error for no negative 0" did
+not test the negative side.
+
+Treat a zero big number as non-negative, so it encodes as 0, and test
+the negative side of the zero cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_number_encode.c | 18 ++++++++++++++----
+ test/qcbor_encode_tests.c | 20 ++++++++++++++------
+ 2 files changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/src/qcbor_number_encode.c b/src/qcbor_number_encode.c
+index ab233af..afa576b 100644
+--- a/src/qcbor_number_encode.c
++++ b/src/qcbor_number_encode.c
+@@ -366,6 +366,7 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
+ {
+    uint64_t     uInt;
+    bool         bIs2exp64;
++   bool         bIsNegative;
+     UsefulBufC  BigNumberNLZ;
+    enum QCBORPrivateMajorType uMajorType;
+ 
+@@ -378,10 +379,19 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
+ 
+    BigNumberNLZ = QCBOREncode_Private_SkipLeadingZeros(BigNumber);
+ 
++   /* Zero has no sign. A "negative zero" would otherwise go through
++    * the offset of one below and come out as -1, -256 or -2^64
++    * depending on its length and on preferred serialization. Leading
++    * zeros are gone, so the number is zero if it is empty or starts
++    * with a zero byte. */
++   bIsNegative = bNegative &&
++                 BigNumberNLZ.len > 0 &&
++                 UsefulBufC_NTH_BYTE(BigNumberNLZ, 0) != 0x00;
++
+    static const uint8_t twoExp64[] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    bIs2exp64 = ! UsefulBuf_Compare(BigNumberNLZ, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(twoExp64));
+ 
+-   if(bPreferred && (BigNumberNLZ.len <= 8 || (bNegative && bIs2exp64))) {
++   if(bPreferred && (BigNumberNLZ.len <= 8 || (bIsNegative && bIs2exp64))) {
+       if(bIs2exp64) {
+          /* 2^64 is a 9 byte big number. Since negative numbers are offset
+           * by one in CBOR, it can be encoded as a type 1 negative. The
+@@ -391,14 +401,14 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
+          uInt = UINT64_MAX;
+       } else {
+          uInt = QCBOREncode_Private_BigNumberToUInt(BigNumberNLZ);
+-         if(bNegative) {
++         if(bIsNegative) {
+             uInt--;
+          }
+       }
+-      uMajorType = bNegative ? QCBOR_MT_NEGATIVE_INT : QCBOR_MT_POSITIVE_INT;
++      uMajorType = bIsNegative ? QCBOR_MT_NEGATIVE_INT : QCBOR_MT_POSITIVE_INT;
+       QCBOREncode_Private_AppendCBORHead(pMe, uMajorType, uInt, 0);
+    } else {
+-      if(bNegative) {
++      if(bIsNegative) {
+          QCBOREncode_Private_AddTNegativeBigNumber(pMe, uTagRequirement, BigNumberNLZ);
+       } else {
+          /* Not QCBOREncode_AddTBigNumberRaw(): its usage guard for
+diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
+index f6876c4..9df3caf 100644
+--- a/test/qcbor_encode_tests.c
++++ b/test/qcbor_encode_tests.c
+@@ -1029,20 +1029,28 @@ struct BigNumEncodeTest BigNumEncodeTestCases[] = {
+       {"\x39\x01\xff", 3},
+    },
+    {
+-      "0 and error for no negative 0",
++      "0; negative 0 is 0",
+       {"\x00", 1},
+       {"\xC2\x41\x00", 3},
+       {"\x00", 1},
+-      NULLUsefulBufCConst,
+-      NULLUsefulBufCConst
++      {"\xC2\x41\x00", 3},
++      {"\x00", 1}
+    },
+    {
+-      "leading zeros -- 0 and error for no negative 0",
++      "leading zeros -- 0; negative 0 is 0",
+       {"\x00\x00\x00\x00", 4},
+       {"\xC2\x41\x00", 3},
+       {"\x00", 1},
+-      NULLUsefulBufCConst,
+-      NULLUsefulBufCConst
++      {"\xC2\x41\x00", 3},
++      {"\x00", 1}
++   },
++   {
++      "empty string is 0; negative 0 is 0",
++      {"", 0},
++      {"\xC2\x40", 2},
++      {"\x00", 1},
++      {"\xC2\x40", 2},
++      {"\x00", 1}
+    }
+ 
+ };
+-- 
+2.56.0.windows.4
+

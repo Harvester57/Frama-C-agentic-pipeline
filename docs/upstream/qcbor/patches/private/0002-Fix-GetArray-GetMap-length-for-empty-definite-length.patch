@@ -1,0 +1,106 @@
+From 71d3dd1b79a91989ba74b95bb13dc131ae5d91e4 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:24:48 +0100
+Subject: [PATCH 2/2] Fix GetArray()/GetMap() length for empty definite-length
+ arrays and maps
+
+QCBORDecode_GetArray() and QCBORDecode_GetMap() take the end of the
+returned encoded CBOR from End.uEndOffset, which
+QCBORDecode_Private_NestLevelAscender() records when the target level
+closes. An empty definite-length array or map is never descended
+into, so its level never closes and End.uEndOffset is never set.
+pEncodedCBOR->len is then computed from an uninitialized stack value:
+
+  80          GetArray       -> len 4702111234474983745
+  a0          GetMap         -> same
+  82 80 01    EnterArray, GetArray -> indeterminate
+  9f 80 ff    EnterArray, GetArray -> indeterminate
+
+MemorySanitizer reports all four. pEncodedCBOR->ptr is valid, so a
+caller that copies or hashes pEncodedCBOR reads far past the input.
+The input is untrusted CBOR. Introduced with ItemEndTracker in
+33cf49e (#431).
+
+Record the end right after the head of an empty definite-length
+array or map that is at the target level, before the ascender can
+consume breaks of enclosing indefinite-length levels.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_main_decode.c   | 11 +++++++++++
+ test/qcbor_decode_tests.c | 37 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/src/qcbor_main_decode.c b/src/qcbor_main_decode.c
+index 8c8759d..29cc1b1 100644
+--- a/src/qcbor_main_decode.c
++++ b/src/qcbor_main_decode.c
+@@ -1931,6 +1931,17 @@ QCBORDecode_Private_GetNextMapOrArray(QCBORDecodeContext    *pMe,
+        * reached, then it ascends nesting levels, possibly all the way
+        * to the top level.
+        */
++      if(pEnd != NULL &&
++         QCBORItem_IsEmptyDefiniteLengthMapOrArray(*pDecodedItem) &&
++         pDecodedItem->uNestingLevel + 1 == pEnd->uTargetLevel) {
++         /* An empty definite-length map or array is not descended
++          * into, so QCBORDecode_Private_NestLevelAscender() never sees
++          * its level close and never records its end. It ends right
++          * after its head. Record that before the ascender possibly
++          * consumes breaks of enclosing levels. */
++         pEnd->uEndOffset = UsefulInputBuf_Tell(&(pMe->InBuf));
++      }
++
+       QCBORError uAscendErr;
+       uAscendErr = QCBORDecode_Private_NestLevelAscender(pMe, pEnd);
+       if(uAscendErr != QCBOR_SUCCESS) {
+diff --git a/test/qcbor_decode_tests.c b/test/qcbor_decode_tests.c
+index ee36606..28c082f 100644
+--- a/test/qcbor_decode_tests.c
++++ b/test/qcbor_decode_tests.c
+@@ -13434,6 +13434,43 @@ int32_t GetMapAndArrayTest(void)
+       return 109;
+    }
+ 
++   /* Empty definite-length arrays and maps, at the top level and
++    * nested. Their level is never entered, so their end is not
++    * found by ascending out of it. */
++   QCBORDecode_Init(&DCtx, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyArray), 0);
++   QCBORDecode_GetArray(&DCtx, &Item, &ReturnedEncodedCBOR);
++   if(QCBORDecode_GetError(&DCtx) != QCBOR_SUCCESS ||
++      UsefulBuf_Compare(ReturnedEncodedCBOR, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyArray))) {
++      return 110;
++   }
++
++   QCBORDecode_Init(&DCtx, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyMap), 0);
++   QCBORDecode_GetMap(&DCtx, &Item, &ReturnedEncodedCBOR);
++   if(QCBORDecode_GetError(&DCtx) != QCBOR_SUCCESS ||
++      UsefulBuf_Compare(ReturnedEncodedCBOR, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyMap))) {
++      return 111;
++   }
++
++   static const uint8_t spEmptyInDefinite[] = {0x82, 0x80, 0x01};
++   QCBORDecode_Init(&DCtx, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyInDefinite), 0);
++   QCBORDecode_EnterArray(&DCtx, NULL);
++   QCBORDecode_GetArray(&DCtx, &Item, &ReturnedEncodedCBOR);
++   if(QCBORDecode_GetError(&DCtx) != QCBOR_SUCCESS ||
++      UsefulBuf_Compare(ReturnedEncodedCBOR, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyArray))) {
++      return 112;
++   }
++
++#ifndef QCBOR_DISABLE_INDEFINITE_LENGTH_ARRAYS
++   static const uint8_t spEmptyInIndefinite[] = {0x9f, 0x80, 0xff};
++   QCBORDecode_Init(&DCtx, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyInIndefinite), 0);
++   QCBORDecode_EnterArray(&DCtx, NULL);
++   QCBORDecode_GetArray(&DCtx, &Item, &ReturnedEncodedCBOR);
++   if(QCBORDecode_GetError(&DCtx) != QCBOR_SUCCESS ||
++      UsefulBuf_Compare(ReturnedEncodedCBOR, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spEmptyArray))) {
++      return 113;
++   }
++#endif /* ! QCBOR_DISABLE_INDEFINITE_LENGTH_ARRAYS */
++
+    return 0;
+ }
+ #endif /* ! QCBOR_DISABLE_NON_INTEGER_LABELS */
+-- 
+2.56.0.windows.4
+

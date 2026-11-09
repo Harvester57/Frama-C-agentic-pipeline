@@ -1,0 +1,88 @@
+From bb4420805efa413f0557490cc2d158af002a837c Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:20:26 +0100
+Subject: [PATCH 1/7] Fix encoding of positive big numbers that are not type 0
+ integers
+
+QCBOREncode_Private_AddTBigNumberMain() output a positive big number
+with
+
+   QCBOREncode_AddTBigNumberRaw(pMe, false, uTagRequirement, BigNumberNLZ);
+
+which passes false as uTagRequirement and uTagRequirement as
+bNegative. With QCBOR_ENCODE_AS_TAG (0) both happen to be right. With
+QCBOR_ENCODE_AS_BORROWED (1) the result is tag 3, a negative big
+number: +258 is encoded as c3 42 01 02, which is -259. This affects
+QCBOREncode_AddTBigNumberNoPreferred() for any positive value and
+QCBOREncode_AddTBigNumber() for positive values of 2^64 and up.
+
+Going through QCBOREncode_AddTBigNumberRaw() also applied its usage
+guard, so QCBOREncode_AddTBigNumber() of a positive value of 2^64 or
+more failed with QCBOR_ERR_NOT_PREFERRED under
+QCBOR_ENCODE_CONFIG_ONLY_PREFERRED_BIG_NUMBERS, although a big number
+is the preferred serialization of such a value. The negative side
+did not have this problem.
+
+Output the tag and the byte string directly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_number_encode.c |  9 ++++++++-
+ test/qcbor_encode_tests.c | 21 +++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/qcbor_number_encode.c b/src/qcbor_number_encode.c
+index dc75a3c..ab233af 100644
+--- a/src/qcbor_number_encode.c
++++ b/src/qcbor_number_encode.c
+@@ -401,7 +401,14 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
+       if(bNegative) {
+          QCBOREncode_Private_AddTNegativeBigNumber(pMe, uTagRequirement, BigNumberNLZ);
+       } else {
+-         QCBOREncode_AddTBigNumberRaw(pMe, false, uTagRequirement,BigNumberNLZ);
++         /* Not QCBOREncode_AddTBigNumberRaw(): its usage guard for
++          * QCBOR_ENCODE_CONFIG_ONLY_PREFERRED_BIG_NUMBERS doesn't apply
++          * here. Either preferred serialization was not requested (and
++          * the guard above already ran) or the number is too large for
++          * a type 0 integer, and the big number is its preferred
++          * serialization. */
++         QCBOREncode_Private_BigNumberTag(pMe, uTagRequirement, false);
++         QCBOREncode_AddBytes(pMe, BigNumberNLZ);
+       }
+    }
+ }
+diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
+index 5daffca..f6876c4 100644
+--- a/test/qcbor_encode_tests.c
++++ b/test/qcbor_encode_tests.c
+@@ -1118,6 +1118,27 @@ int32_t BigNumEncodeTests(void)
+       return -2;
+    }
+ 
++   /* A positive big number with QCBOR_ENCODE_AS_BORROWED has no tag
++    * number at all. */
++   static const uint8_t sp258[] = {0x01, 0x02};
++   QCBOREncode_Init(&Enc, UsefulBuf_FROM_BYTE_ARRAY(spBigBuf));
++   QCBOREncode_AddTBigNumberNoPreferred(&Enc, QCBOR_ENCODE_AS_BORROWED, false, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(sp258));
++   QCBOREncode_Finish(&Enc, &EncodedBigNumber);
++   if(UsefulBuf_Compare(EncodedBigNumber, UsefulBuf_FROM_SZ_LITERAL("\x42\x01\x02"))) {
++      return -5;
++   }
++
++   /* The preferred serialization of 2^64 is a tag 2 big number, so it
++    * is allowed with QCBOR_ENCODE_CONFIG_ONLY_PREFERRED_BIG_NUMBERS. */
++   static const uint8_t sp2exp64[] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
++   QCBOREncode_Init(&Enc, UsefulBuf_FROM_BYTE_ARRAY(spBigBuf));
++   QCBOREncode_Config(&Enc, QCBOR_ENCODE_CONFIG_ONLY_PREFERRED_BIG_NUMBERS);
++   QCBOREncode_AddTBigNumber(&Enc, QCBOR_ENCODE_AS_TAG, false, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(sp2exp64));
++   if(QCBOREncode_Finish(&Enc, &EncodedBigNumber) != QCBOR_SUCCESS ||
++      UsefulBuf_Compare(EncodedBigNumber, UsefulBuf_FROM_SZ_LITERAL("\xC2\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00"))) {
++      return -6;
++   }
++
+    return 0;
+ }
+ 
+-- 
+2.56.0.windows.4
+

@@ -1,0 +1,52 @@
+From b19f9d131b9189816e7242a019e8008c70a96f21 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Mon, 9 Nov 2026 15:25:29 +0100
+Subject: [PATCH 7/7] Don't negate INT64_MIN in QCBORDecode_ProcessBigNumber()
+
+For a QCBOR_TYPE_INT64 item, QCBORDecode_ProcessBigNumber() computes
+the magnitude with ABSOLUTE_VALUE(Item.val.int64) and with
+-Item.val.int64, both in int64_t. For INT64_MIN, the CBOR negative
+integer 3b 7f ff ff ff ff ff ff ff, the negation overflows, which is
+undefined behavior (C11 6.5p5). It is reached from untrusted input,
+e.g. the decimal fraction c4 82 00 3b 7f ff ff ff ff ff ff ff through
+QCBORDecode_GetTDecimalFractionBigMantissa(), and by the existing test
+case in qcbor_decode_tests.c, so UBSan flags the test suite.
+
+Negate in uint64_t, which gives 2^63 for INT64_MIN, the value the
+wrapping negation produced on common compilers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_number_decode.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/qcbor_number_decode.c b/src/qcbor_number_decode.c
+index e017ddb..37b8eda 100644
+--- a/src/qcbor_number_decode.c
++++ b/src/qcbor_number_decode.c
+@@ -1961,7 +1961,9 @@ QCBORDecode_ProcessBigNumber(const QCBORItem Item,
+          break;
+ 
+       case QCBOR_TYPE_INT64:
+-         uLen = QCBORDecode_Private_CountNonZeroBytes((uint64_t)ABSOLUTE_VALUE(Item.val.int64));
++         /* Negate as unsigned: -INT64_MIN overflows int64_t */
++         uLen = QCBORDecode_Private_CountNonZeroBytes(bIsNegative ? 0 - (uint64_t)Item.val.int64 :
++                                                                    (uint64_t)Item.val.int64);
+          break;
+ 
+       case QCBOR_TYPE_UINT64:
+@@ -2004,8 +2006,9 @@ QCBORDecode_ProcessBigNumber(const QCBORItem Item,
+          break;
+ 
+       case QCBOR_TYPE_INT64:
+-         /* Offset of 1 for negative numbers already performed */
+-         uIntTmp = (uint64_t)(bIsNegative ? -Item.val.int64 : Item.val.int64);
++         /* Offset of 1 for negative numbers already performed.
++          * Negate as unsigned: -INT64_MIN overflows int64_t. */
++         uIntTmp = bIsNegative ? 0 - (uint64_t)Item.val.int64 : (uint64_t)Item.val.int64;
+          *pBigNumber = QCBORDecode_Private_UIntToBigNumber(uIntTmp, BigNumberBuf);
+          break;
+ 
+-- 
+2.56.0.windows.4
+

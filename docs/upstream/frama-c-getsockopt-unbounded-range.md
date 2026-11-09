@@ -28,7 +28,11 @@ The sibling `setsockopt` already bounds its buffer correctly:
 
 - Reproduced with Frama-C `34.0~~dev (Selenium)`.
 - The same text is in the public GitHub snapshot up to 20.0 (Calcium, 2019), so the
-  issue is at least five years old. I could not read the current GitLab master.
+  issue is at least five years old.
+- The contract is unchanged on `master` at `ad24dca` (2026-11-02), `share/libc/sys/socket.h:397-398`,
+  and in `35.0~~dev (Bromine)`. The Eva and WP runs below were made on 34. On 35, the same contract
+  also aborts E-ACSL under `e-acsl-gcc -L`; see
+  [frama-c-eacsl-unbounded-range-abort.md](frama-c-eacsl-unbounded-range-abort.md).
 
 ## Reproduction
 
