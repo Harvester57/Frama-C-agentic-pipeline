@@ -71,6 +71,8 @@ Every single iteration of the Function Prover Subagent ([`../skills/framac-wp/pr
 
 Both oracles record each iteration in the prover's scratch directory ([`../scripts/prover_candidates.py`](../scripts/prover_candidates.py)). Candidates that pass the guardrail are ranked by fewest unproven goals, then most proved goals. Only those compete, because a stronger `requires` can raise the proof ratio by excluding inputs. The tracker tells the prover to stop when an iteration improves neither number. Before a stalled prover's report and partial contract are used, `wp_scheduler.py complete` restores its best candidate.
 
+A candidate that adds a top-level ACSL declaration outside the prover's function (a file-scope `/*@ ghost ... */` function, a `predicate`, a `lemma`) is never ranked: `merge-agent` would refuse the whole patch. The tracker diffs the declarations of `scratch/work` against `scratch/base` after every oracle run and lists them as `scope_violation_pending` in the first `candidate` block, with `next_synthesis_focus: "remove_top_level_acsl_declarations"`. A prover whose goal needs an inductive lemma stops with `proof_gap.reason` starting `inductive lemma required`; the ledger tags it `gap_kind: "inductive_lemma_required"` and `REPORT.md` counts those functions ([`./formal-discovery/tier-3-rule3-ghost-lemma.md`](./formal-discovery/tier-3-rule3-ghost-lemma.md)).
+
 ### What a Prover Starts From
 
 The deterministic side prepares what a prover would otherwise have to work out by reading code:

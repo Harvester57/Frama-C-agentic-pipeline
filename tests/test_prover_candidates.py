@@ -1332,3 +1332,85 @@ def test_complete_of_a_negotiating_prover_restores_too(sim, monkeypatch):
 
     assert out["best_candidate"]["best"] == 1 and out["action"] == "negotiation_rejected"
     assert prover.read() == annotated("best")
+
+
+# ---------------------------------------------------------------------------
+# Top-level ACSL declarations outside the function (prover brief, Step B: Inductive Lemmas)
+# ---------------------------------------------------------------------------
+
+GHOST_LEMMA = (
+    "/*@ ghost\n"
+    "  /@ requires n >= 0;\n"
+    "   @ decreases n;\n"
+    "   @ assigns \nothing;\n"
+    "   @ ensures n >= 0;\n"
+    "   @/\n"
+    "  void lem(int n) { if (n <= 0) return; lem(n - 1); }\n"
+    "*/\n"
+)
+
+
+@pytest.mark.parametrize("first", ["wp", "guard"])
+def test_a_ghost_function_is_pending_on_the_first_iteration_and_never_best(prover, first):
+    prover.edit(GHOST_LEMMA + annotated("a"))
+    runs = [prover.wp, prover.guard] if first == "wp" else [prover.guard, prover.wp]
+    kwargs = {"status": "all_proven", "failed": 0, "proved": 9}
+    waiting = runs[0](**kwargs) if first == "wp" else runs[0]()
+    assert waiting["scope_violation_pending"] == ["ghost lem"]
+    assert waiting["next_action"] == "wait_for_other_oracle"
+    block = runs[1](**kwargs) if first == "guard" else runs[1]()
+    assert block["scope_violation_pending"] == ["ghost lem"]
+    assert block["next_synthesis_focus"] == PC.SCOPE_VIOLATION_FOCUS
+    assert block["evaluated"] is True
+    assert block["eligible"] is False
+    assert block["next_action"] == "continue"
+    assert block["best"] is None
+    assert not (prover.scratch / "candidates/best").exists()
+    history = prover.state()["history"]
+    assert [h.get("scope_violation_pending") for h in history] == [["ghost lem"], ["ghost lem"]]
+
+
+def test_removing_the_ghost_function_makes_the_candidate_eligible_again(prover):
+    prover.edit(GHOST_LEMMA + annotated("a"))
+    prover.guard()
+    assert prover.wp(status="all_proven", failed=0, proved=9)["best"] is None
+    block = prover.iterate("a", status="all_proven", failed=0, proved=9)
+    assert "scope_violation_pending" not in block
+    assert block["next_action"] == "finished"
+    assert block["best"] == 2
+
+
+def test_a_predicate_added_in_the_header_is_pending(prover):
+    prover.edit("/*@ predicate pos(integer x) = x > 0; */\n" + BASE_H, rel=H_REL)
+    prover.edit(annotated("a"))
+    assert prover.guard()["scope_violation_pending"] == ["predicate pos"]
+
+
+def test_declarations_already_in_base_are_not_pending(prover):
+    for tree in ("base", "work"):
+        (prover.scratch / tree / C_REL).write_text(GHOST_LEMMA + BASE_C, encoding="utf-8")
+    prover.edit(GHOST_LEMMA + annotated("a"))
+    assert "scope_violation_pending" not in prover.guard()
+
+
+def test_top_level_additions_fails_open(prover, monkeypatch):
+    prover.edit(GHOST_LEMMA + annotated("a"))
+    budget = load(prover.scratch / ".prover_budget.json")
+    assert PC.top_level_additions(prover.scratch, budget) == ["ghost lem"]
+
+    def boom(*_a: Any, **_k: Any) -> list[str]:
+        raise RuntimeError("parser crash")
+
+    monkeypatch.setattr(PC, "added_top_level_acsl_declarations", boom)
+    assert PC.top_level_additions(prover.scratch, budget) == []
+
+
+def test_the_candidate_block_hook_sets_the_scope_focus(prover):
+    prover.edit(GHOST_LEMMA + annotated("a"))
+    digest = PC.tracked_digest(prover.scratch)
+    report = {"mode": "guardrail", "status": PASSED}
+    write_json(prover.guard_path, report)
+    summary: dict[str, Any] = {}
+    PC.add_candidate_block(summary, prover.guard_path, "guardrail", report, digest)
+    assert summary["next_synthesis_focus"] == PC.SCOPE_VIOLATION_FOCUS
+    assert summary["candidate"]["scope_violation_pending"] == ["ghost lem"]

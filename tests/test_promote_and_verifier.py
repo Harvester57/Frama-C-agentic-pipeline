@@ -1577,4 +1577,40 @@ class TestHarnessLegitimacyAndMetadata:
         assert units[0]["result_fingerprints"] == []
         assert any(e["result"] == "proof_gap" for e in units[0]["evidence"])
         assert any("proof_gap: \\valid_read" in u for u in units[0]["unresolved"])
+        assert all("details" not in e for e in units[0]["evidence"] if e["result"] == "proof_gap")
+        assert validate_run_dir(run_dir) == []
+
+    def test_ingest_inductive_lemma_proof_gap_records_its_gap_kind(self, run_dir: Path) -> None:
+        """A stall on an inductive lemma (prover brief, Step B) is tagged so REPORT.md can count it per target."""
+        write_json(run_dir / "run-metadata.json", metadata("in_progress"))
+        write_json(run_dir / "coverage-ledger.json", [unit("src/m.c", "sum", "rte", status="planned", evidence=[])])
+        write_json(run_dir / "candidates.json", [])
+        scratch = run_dir / "agents" / "prove-sum" / "scratch"
+        scratch.mkdir(parents=True)
+        (scratch / "wp.json").write_text("{}", encoding="utf-8")
+        res_path = scratch / "result.json"
+        write_json(
+            res_path,
+            {
+                "role": "prover",
+                "agent_id": "prove-sum",
+                "file": "src/m.c",
+                "function": "sum",
+                "status": "stalled_after_k_retries",
+                "patch": None,
+                "evidence": [{"tool_output": "agents/prove-sum/scratch/wp.json", "result": "wp_timeout"}],
+                "unproven_goals": ["rte: signed_overflow"],
+                "strengthening_requests": [],
+                "boundary_assumptions": [],
+                "fault_hypothesis": None,
+                "proof_gap": {
+                    "predicate": "s == sum_to(a, i)",
+                    "reason": "inductive lemma required: sum_to is recursive over i",
+                },
+            },
+        )
+        ledger.cmd_ingest_agent_hypothesis(res_path, module="m")
+        units = json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))
+        gaps = [e for e in units[0]["evidence"] if e["result"] == "proof_gap"]
+        assert [e["details"] for e in gaps] == [{"gap_kind": ledger.INDUCTIVE_LEMMA_GAP}]
         assert validate_run_dir(run_dir) == []

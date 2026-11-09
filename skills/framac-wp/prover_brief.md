@@ -94,9 +94,9 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    - **Failure-kind repair strategy:** classify each unproven loop goal by its WP name: `_established` fails => weaken the invariant or add a `requires` that holds at loop entry; `_preserved` fails => adjust it (not inductive across one iteration, or `loop assigns` missing/too broad); failing BOTH => the invariant is invalid — drop and regenerate it (largest valid subset), never keep it; only provability/postcondition goals fail => strengthen the invariant; `loop_variant` / `decreases` goals fail => fix the measure or add a progress guard (e.g. `if (consumed == 0) return -1;`).
 <!-- endif -->
 <!-- if: loops or recursion -->
-3. **Inductive Lemmas Without Coq (Ghost Lemma Functions):**
-   - Never write an unproven global `lemma foo: ...;` expecting SMT solvers to do induction automatically (`run_wp_function.py` flags unproven global lemmas as `unsound_proof`).
-   - Instead, write a `/*@ ghost ... */` recursive C function with `requires`, `decreases n;`, `assigns \nothing;`, and `ensures`, whose body steps the base case (`if (n <= 0) return;`) and recursive step (`lemma_fn(n - 1);`). WP proves each recursive call inducts cleanly with Alt-Ergo/Z3/CVC5.
+3. **Inductive Lemmas: Stop, Do Not Work Around Them:**
+   - Never write a global `lemma` and never write a file-scope `/*@ ghost ... */` function. An unproven `lemma` makes the proof `unsound_proof`; a ghost function sits outside your function's span and `merge-agent` refuses the whole patch (`ScopeViolationError`), and nothing proves the ghost function's own contract under `-wp-fct`.
+   - When a goal needs an inductive argument that WP cannot do inline (a `loop invariant` over a recursively defined quantity, a lemma about a `predicate`), stop with `status: "stalled_after_k_retries"` and `proof_gap: {"predicate": "<the goal's predicate>", "reason": "inductive lemma required: <one line>"}`. Do not work around it with `axiomatic`, `admit`, a ghost function inside the body, or a weaker clause.
 <!-- endif -->
 
 ### Step C — Preconditions (`requires`), Postconditions (`ensures`), and RTE Discharge
@@ -242,6 +242,8 @@ Run wrapper commands in the **foreground** and wait for completion: either run *
 ### Keep Your Best Candidate, Not Your Last
 
 Both oracles record each iteration under `agents/{agent_id}/scratch/candidates/` and print a `candidate` block. On the same files, the first to finish says `next_action: "wait_for_other_oracle"`; the second says `evaluated: true` and carries the verdict.
+
+- `scope_violation_pending` lists top-level ACSL declarations you added outside your function (`ghost lem`, `predicate p`, ...); the output also says `next_synthesis_focus: "remove_top_level_acsl_declarations"` and `next_action: "continue"`, even for an `all_proven` candidate. Remove them before the next iteration, the merge will refuse them (Strict Rule 2; Step B, Inductive Lemmas). Such a candidate is never kept as your best.
 
 - The best candidate passes the guardrail and has the fewest unproven goals, then the most proved goals. A candidate the guardrail rejects is never compared, however good its proof ratio: a stronger `requires` can raise that ratio by excluding inputs.
 - `next_action: "continue"`: keep iterating.

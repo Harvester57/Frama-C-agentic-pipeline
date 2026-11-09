@@ -37,6 +37,11 @@ A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions.
 - [ ] Decide D4 (E-ACSL's share of each campaign) in plan step S10, after fixing F17 and checking the seeded benchmark for bugs only E-ACSL can catch.
 - [ ] Work through the plan's steps, updating its status table and each defect's status in `phase1-review.md`.
 
+## 1c. Formal-discovery tiers ([`./formal-discovery-plan.md`](./formal-discovery-plan.md))
+
+- [x] **Tier 3, Rule 3 / ghost-lemma remediation** ([`./formal-discovery/tier-3-rule3-ghost-lemma.md`](./formal-discovery/tier-3-rule3-ghost-lemma.md)): the prover brief no longer asks for file-scope ghost lemma functions, which `merge-agent` always refused; `prover_candidates.py` reports `scope_violation_pending` on the first iteration; the splice error names the added declarations; `inductive lemma required` proof gaps are counted in `REPORT.md`. Not yet measured on a benchmark run.
+- [ ] **Tier 7, shared lemma and predicate library:** the only way for provers to contribute lemmas; decide from the Tier 3 `inductive lemma required` counts.
+
 ## 2. Verification gaps (not testable on this machine)
 
 - [ ] **Podman**, rootless and rootful: per-controller flags, the refusal when memory/pids limits cannot be enforced, and `sandbox.outer: podman-hardened`. Podman is not installed here (it would need installing in WSL Ubuntu).

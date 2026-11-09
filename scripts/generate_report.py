@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fingerprint import normalize_file, normalize_kind  # noqa: E402
 from framac_common import ArtifactError, load_json_optional, load_json_strict  # noqa: E402
+from ledger import INDUCTIVE_LEMMA_GAP  # noqa: E402
 from mutation_check import classify_open_unit  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
 from workspace_overlay import map_work_to_baseline_line  # noqa: E402
@@ -439,19 +440,36 @@ def spec_quality_section(data: dict) -> list[str]:
     run_dir = data.get("run_dir")
     ledger = data.get("ledger") or []
     open_units = [u for u in ledger if u.get("status") not in ("covered", "excluded", "candidate")]
+    counts: Counter = Counter()
     if run_dir is not None and open_units:
         wp_dir = Path(run_dir) / "workspace" / "reports" / "wp"
-        counts: Counter = Counter()
         for u in open_units:
             fn = str(u.get("function") or "")
             rep = load_json_optional(wp_dir / f"{fn}.json", None) if fn else None
             counts[classify_open_unit(rep if isinstance(rep, dict) else None)] += 1
-        if counts:
-            out += ["### Open units: prover-limited vs spec-limited", ""]
-            for kind in ("prover_limited", "spec_limited", "unknown"):
-                if counts.get(kind):
-                    out.append(f"- **{kind}**: {counts[kind]}")
-            out.append("")
+    # Proofs a prover gave up on because they need an inductive lemma it may not write (prover brief, Step B: Inductive Lemmas).
+    lemma_gap_fns = sorted(
+        {
+            str(u.get("function") or "?")
+            for u in open_units
+            if any(
+                (ev.get("details") or {}).get("gap_kind") == INDUCTIVE_LEMMA_GAP
+                for ev in u.get("evidence") or []
+                if isinstance(ev, dict)
+            )
+        }
+    )
+    if counts or lemma_gap_fns:
+        out += ["### Open units: prover-limited vs spec-limited", ""]
+        for kind in ("prover_limited", "spec_limited", "unknown"):
+            if counts.get(kind):
+                out.append(f"- **{kind}**: {counts[kind]}")
+        if lemma_gap_fns:
+            out.append(
+                f"- **inductive lemma required**: {len(lemma_gap_fns)} function(s): "
+                + ", ".join(f"`{fn}`" for fn in lemma_gap_fns)
+            )
+        out.append("")
     return out
 
 
