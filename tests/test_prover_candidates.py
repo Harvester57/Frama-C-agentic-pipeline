@@ -1638,3 +1638,24 @@ def test_a_state_written_before_the_trivial_aware_rank_still_compares(prover):
     assert (block["progress"], block["best"]) == (False, 1)
     block = iterate_source(prover, with_trivial("c", 0), failed=2, proved=11)
     assert (block["progress"], block["best"]) == (True, 3)
+
+
+def test_complete_mines_the_spec_kb_and_a_mining_failure_is_only_an_error(sim, monkeypatch):
+    prover = dispatch(sim)
+    spy_on_merge(monkeypatch, prover)
+    prover.iterate("best", failed=1, proved=9)
+    write_result(prover, patch=f"agents/{AID}/scratch/{FN}.patch")
+    calls: list[Path] = []
+
+    def boom(run_dir):
+        calls.append(Path(run_dir))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(S.DEPS, "mine_kb", boom)
+    out = S.cmd_complete(AID)
+    assert calls == [Path.cwd()]
+    assert out["errors"] == ["spec_kb mine: OSError: disk full"]
+    # The task was completed all the same.
+    assert out["action"] == "blocked"
+    # A stale second complete mines nothing.
+    assert S.cmd_complete(AID)["action"] == "already_completed" and len(calls) == 1

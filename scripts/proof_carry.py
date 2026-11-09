@@ -45,6 +45,7 @@ import cache  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
     AcslSyntaxError,
+    check_frame_preserved,
     extract_top_level_acsl_declarations,
     function_contract_text,
     locate_function_span,
@@ -262,6 +263,29 @@ def _acsl_names(span_text: str, path: str) -> set[str]:
     return names
 
 
+def _acsl_of(span_text: str, path: str) -> str:
+    try:
+        tokens = tokenize_c_acsl(span_text, path=path)
+    except AcslSyntaxError:
+        return ""
+    return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
+
+
+def frame_gate_errors(
+    overlay: Path, module: str | None, file: str, function: str, spans: list[tuple[str, str]]
+) -> list[str]:
+    """
+    The merge gate's frame-preservation errors for this contract (workspace_overlay applies the same check when
+    the replay merges it): a contract the gate always rejects is not worth publishing. Fail-open without facts.
+    """
+    import workspace_overlay
+
+    skel = workspace_overlay._function_frame_skeleton(overlay, module, file, function)
+    if skel is None:
+        return []
+    return check_frame_preserved(skel, "\n".join(_acsl_of(text, path) for path, text in spans), path=file)
+
+
 def _referenced_decls(sources: list[tuple[str, str]], names: set[str]) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -317,6 +341,10 @@ def publish_proof(
             span_h_text = span_h.text
             contract_h = function_contract_text(h_text, function, True, header)
         sources.append((header, h_text))
+    spans = [(file, span_c.text)] + ([(header or "", span_h_text)] if span_h_text else [])
+    frame_errs = frame_gate_errors(overlay, module, file, function, spans)
+    if frame_errs:
+        return False, "the replay merge gate would reject it: " + "; ".join(frame_errs)[:300]
     names = _acsl_names(span_c.text, file) | (_acsl_names(span_h_text, header or "") if span_h_text else set())
     names.discard(function)
     doc = {
@@ -461,6 +489,28 @@ def _remove_agent(run_dir: Path, agent_id: str) -> None:
     shutil.rmtree(run_dir / "agents" / agent_id, ignore_errors=True)
 
 
+# Source trees of an agent (scratch/work, scratch/base, candidates/*/work): large, and the
+# rejected contract is already in the restored cache entry next to the kept evidence.
+_EVIDENCE_SKIP_DIRS = frozenset({"work", "base"})
+
+
+def _keep_evidence(run_dir: Path, agent_id: str, dest: Path) -> bool:
+    """Copy an agent's reports and logs (not its source trees) to `dest` before it is removed."""
+    src = run_dir / "agents" / agent_id
+    if not src.is_dir():
+        return False
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        return {n for n in names if n in _EVIDENCE_SKIP_DIRS and (Path(directory) / n).is_dir()}
+
+    shutil.rmtree(dest, ignore_errors=True)
+    try:
+        shutil.copytree(src, dest, ignore=ignore)
+    except OSError:
+        return False
+    return True
+
+
 def _snapshot_files(work: Path, wp_report: Path, rels: list[str | None]) -> dict[Path, bytes | None]:
     """Bytes of the tree files a replay may change (None: absent), for _restore_files."""
     paths = [work / r for r in rels if r] + [wp_report]
@@ -558,9 +608,18 @@ def replay(
     next_n = 1
 
     def reject(item: dict, why: str, agents: list[str] | None = None) -> None:
+        row = {"file": item["file"], "function": item["function"], "reason": why[:400]}
+        if agents:
+            # Keep the guardrail and WP reports and the logs: the summary's reason is cut at 400 characters.
+            dest = run_dir / STATE_REL / _slug(item["file"], item["function"]) / "rejected"
+            kept = [aid for aid in agents if _keep_evidence(run_dir, aid, dest / aid)]
+            if kept:
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "reason.txt").write_text(why + "\n", encoding="utf-8")
+                row["evidence"] = (dest.relative_to(run_dir)).as_posix()
         for aid in agents or []:
             _remove_agent(run_dir, aid)
-        summary["rejected"].append({"file": item["file"], "function": item["function"], "reason": why[:400]})
+        summary["rejected"].append(row)
 
     for item in items:
         file, fn, module = item["file"], item["function"], item.get("module")
@@ -682,12 +741,12 @@ def replay(
             continue
         rep = res.get("parent_wp_report")
         if not rep:
-            undo(item, "merged without a parent WP report")
+            undo(item, "merged without a parent WP report", agents)
             continue
         ok, detail = ingest(rep)
         if not ok:
             summary["ok"] = False
-            undo(item, f"ledger ingest-wp failed: {detail}")
+            undo(item, f"ledger ingest-wp failed: {detail}", agents)
             continue
         entry_rel = contract_path.relative_to(run_dir).as_posix()
         credited = mark(rep, entry_rel, key)

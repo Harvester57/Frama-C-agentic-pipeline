@@ -56,6 +56,7 @@ import ledger  # noqa: E402
 import phase0_gates  # noqa: E402
 import prover_candidates  # noqa: E402
 import resources  # noqa: E402
+import spec_kb  # noqa: E402
 import workspace_overlay  # noqa: E402
 from framac_common import (  # noqa: E402
     PROVER_WALL_BUDGET_S,
@@ -249,6 +250,7 @@ class Deps:
         self.resolve_request: Callable[..., dict] = contract_negotiator.cmd_resolve
         self.save_shard: Callable[[str, Path], dict] = _save_shard
         self.restore_best: Callable[[Path], dict | None] = prover_candidates.restore_best
+        self.mine_kb: Callable[[Path], dict] = spec_kb.mine_after_complete
         self.now: Callable[[], float] = time.time
         self.run_cmd: Callable[..., Any] = subprocess.run
 
@@ -3229,7 +3231,20 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
 
 
 def cmd_complete(agent_id: str) -> dict:
-    """Validate agents/<id>/scratch/result.json and dispatch it by role (ledger functions in-process)."""
+    """
+    Validate agents/<id>/scratch/result.json and dispatch it by role (ledger functions in-process),
+    then mine the finished agents into the spec KB (spec_kb.mine_after_complete; never fails the command).
+    """
+    out = _complete_agent(agent_id)
+    if out.get("action") not in ("stale_agent", "already_completed"):
+        try:
+            out["spec_kb"] = DEPS.mine_kb(Path.cwd())
+        except Exception as exc:  # the KB is advisory: a mining failure never blocks the schedule
+            out.setdefault("errors", []).append(f"spec_kb mine: {type(exc).__name__}: {exc}")
+    return out
+
+
+def _complete_agent(agent_id: str) -> dict:
     merge_job: dict | None = None
     partial_merge_job: dict | None = None
     with run_lock("ledger"):

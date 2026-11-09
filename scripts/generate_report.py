@@ -434,6 +434,12 @@ def spec_quality_section(data: dict) -> list[str]:
             if accepted:
                 line += ": " + ", ".join(f"`{fn}`" for fn in accepted) + " (their contracts constrain no result)"
             out.append(line)
+        unchecked = sorted(fn for fn, f in (mutation.get("functions") or {}).items() if f.get("error"))
+        if t.get("preprocessing_failed") or unchecked:
+            line = f"- Mutants that failed to preprocess (setup, not the contract): {t.get('preprocessing_failed', 0)}"
+            if unchecked:
+                line += "; not checked: " + ", ".join(f"`{fn}`" for fn in unchecked)
+            out.append(line)
         out.append("")
         for fn, f in sorted((mutation.get("functions") or {}).items()):
             if f.get("completeness") is None and f.get("precision") is None:

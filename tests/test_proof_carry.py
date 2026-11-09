@@ -216,6 +216,23 @@ def test_publish_keeps_body_annotations(tmp_path):
     assert "loop invariant r == a + i;" in doc["span_c"] and "requires a < 10;" in doc["contract_c"]
 
 
+def test_a_contract_the_frame_gate_rejects_is_not_published(tmp_path, monkeypatch):
+    # Tier 6 A/B: mnl_attr_get_str's swept contract predates the frame skeleton, so every replay was rejected with
+    # `projected frame clause missing or weakened`. The sweep now checks that before publishing.
+    import workspace_overlay
+
+    a = _make_run(tmp_path / "a", C_PROVEN, HEADER_PROVEN)
+    skel = {"status": "ok", "assigns": [{"loc": "*p", "from": [], "clause": "assigns *p;"}]}
+    monkeypatch.setattr(workspace_overlay, "_function_frame_skeleton", lambda *a, **k: skel)
+    ok, why = _publish(a, "inc")
+    assert ok is False and why.startswith("the replay merge gate would reject it: ")
+    assert "assigns *p;" in why
+    # A skeleton the contract keeps (assigns \nothing in the header) publishes.
+    keep = {"status": "ok", "assigns": [{"loc": "\\nothing", "from": [], "clause": "assigns \\nothing;"}]}
+    monkeypatch.setattr(workspace_overlay, "_function_frame_skeleton", lambda *a, **k: keep)
+    assert _publish(a, "inc")[0] is True
+
+
 def test_nothing_published_for_unproven_eva_only_or_switched_off(tmp_path, monkeypatch):
     a = _make_run(tmp_path / "a", C_PROVEN, HEADER_PROVEN)
     assert _publish(a, "inc", status="unproven_goals_remain") == (False, "sweep report is not all_proven")
@@ -353,6 +370,34 @@ def test_failed_reproof_leaves_units_planned_and_removes_the_agent(tmp_path, mon
     assert not any(p.name.startswith("carry-") for p in (run / "agents").iterdir())
     units = json.loads((run / "coverage-ledger.json").read_text(encoding="utf-8"))
     assert {u["status"] for u in units} == {"planned"}
+
+
+def test_a_rejected_replay_keeps_its_reports_and_full_reason(tmp_path, monkeypatch):
+    # Tier 6 A/B: reject() deleted the agent with its guardrail JSON and logs, leaving a reason cut at 400 chars.
+    _seed_store(tmp_path)
+    run = _make_run(tmp_path / "run2", C_FRESH, HEADER_FRESH, _planned_units())
+    ingest, mark = _ledger_calls(run, monkeypatch)
+    summary = pc.replay(run, FakePlan(), merge=FakeMerge(run, fail={"inc"}), ingest=ingest, mark=mark)
+    row = summary["rejected"][0]
+    kept = run / row["evidence"]
+    assert row["evidence"] == "state/proof-carry/" + pc._slug("src/m.c", "inc") + "/rejected"
+    assert "timeout" in (kept / "reason.txt").read_text(encoding="utf-8")
+    agents = sorted(d.name for d in kept.iterdir() if d.is_dir())
+    assert agents and all(a.startswith("carry-") for a in agents)
+    prover = kept / agents[-1]
+    assert (prover / "scratch" / "wp_inc.json").is_file()
+    # The source trees are left out: the contract itself is in the restored cache entry.
+    assert not any(d.name in ("work", "base") for d in prover.rglob("*") if d.is_dir())
+    assert not any(p.name.startswith("carry-") for p in (run / "agents").iterdir())
+
+
+def test_a_rejection_before_any_agent_records_no_evidence(tmp_path, monkeypatch):
+    _seed_store(tmp_path)
+    h = HEADER_FRESH.replace("int inc(int a);", "/*@ predicate small(integer x) = x < 5; */\nint inc(int a);")
+    run = _make_run(tmp_path / "run2", C_FRESH, h, _planned_units())
+    ingest, mark = _ledger_calls(run, monkeypatch)
+    summary = pc.replay(run, FakePlan(), merge=FakeMerge(run), ingest=ingest, mark=mark)
+    assert "evidence" not in summary["rejected"][0]
 
 
 def test_failed_prover_merge_also_undoes_the_header_declarations(tmp_path, monkeypatch):

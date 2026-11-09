@@ -398,3 +398,40 @@ def test_obstructions_section_renders_both_wordings_and_honours_the_kill_switch(
     assert spec_kb.obstructions_section_for(overlay, "unrelated", []) == ""
     monkeypatch.setenv(spec_kb.KB_ENV, "off")
     assert spec_kb.obstructions_section_for(overlay, "parse", ["parse_hdr"]) == ""
+
+
+def test_mine_run_counts_each_agent_once(tmp_path: Path) -> None:
+    # The scheduler mines after every `complete`: an agent mined before must not vote again.
+    run_dir = _fake_run(tmp_path)
+    spec_kb.mine_run(run_dir)
+    evolved = spec_kb.mine_run(run_dir)
+    item = {it["id"]: it for it in evolved["items"]}["err:loop_invariant:loop_invariant_bound_preserved"]
+    assert item["helpful"] == 1 and item["harmful"] == 1
+    assert evolved["mined_agents"] == ["prover-1", "prover-2"]
+
+
+def test_finished_only_leaves_a_running_agent_for_later(tmp_path: Path) -> None:
+    run_dir = _fake_run(tmp_path)
+    result = run_dir / "agents" / "prover-2" / "scratch" / "result.json"
+    saved = result.read_text(encoding="utf-8")
+    result.unlink()
+    evolved = spec_kb.mine_run(run_dir, finished_only=True)
+    assert evolved["mined_agents"] == ["prover-1"]
+    result.write_text(saved, encoding="utf-8")
+    evolved = spec_kb.mine_run(run_dir, finished_only=True)
+    item = {it["id"]: it for it in evolved["items"]}["err:loop_invariant:loop_invariant_bound_preserved"]
+    assert evolved["mined_agents"] == ["prover-1", "prover-2"] and item["harmful"] == 1
+
+
+def test_mine_after_complete_fills_both_stores_unless_switched_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = _fake_run(tmp_path)
+    monkeypatch.setenv("FRAMAC_SPEC_KB", "off")
+    assert spec_kb.mine_after_complete(run_dir) == {"skipped": "FRAMAC_SPEC_KB=off"}
+    assert not (run_dir / "workspace" / "reports" / "kb").exists()
+    monkeypatch.delenv("FRAMAC_SPEC_KB")
+    out = spec_kb.mine_after_complete(run_dir)
+    assert out["mined_agents"] == 2 and out["evolved_items"] >= 1
+    kb = run_dir / "workspace" / "reports" / "kb"
+    assert (kb / "evolved.json").is_file() and (kb / spec_kb.OBSTRUCTIONS_FILE).is_file()

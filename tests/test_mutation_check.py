@@ -447,3 +447,52 @@ def test_run_mutation_check_without_a_ledger_keeps_the_default_flags(tmp_path: P
     doc = mc.run_mutation_check(_fake_run(tmp_path), wp_runner=runner)
     assert seen == {"-I."}
     assert doc["functions"]["sum"]["cppflags_source"].startswith("default")
+
+
+def _cpp_failure() -> dict:
+    return {
+        "status": "acsl_syntax_error",
+        "syntax_check": {
+            "syntax_ok": False,
+            "errors": [
+                "m.c:1:10: fatal error: libmnl/libmnl.h: No such file or directory",
+                "[kernel] User Error: failed to run: gcc -E -C -I. m.c",
+            ],
+        },
+    }
+
+
+def test_a_preprocessing_failure_is_named_and_leaves_the_function_unscored(tmp_path: Path) -> None:
+    c_file = _write(tmp_path, "m.c", SRC)
+    f = mc.check_function(c_file, "sum", "-I.", tmp_path / "out", wp_runner=lambda *a, **k: _cpp_failure())
+    tried = [d for d in f["details"] if d.get("status") is not None]
+    assert tried and all(d["failure"] == "preprocessing_failed" for d in tried)
+    assert f["preprocessing_failed"] == len(tried)
+    assert f["completeness"] is None and f["precision"] is None
+    assert f["error"].startswith("preprocessing failed for every mutant: m.c:1:10: fatal error")
+
+
+def test_an_acsl_error_is_not_a_preprocessing_failure(tmp_path: Path) -> None:
+    c_file = _write(tmp_path, "m.c", SRC)
+
+    def runner(c_file, fn, out_dir, cppflags="-I."):
+        if "ensures \\true;" in Path(c_file).read_text(encoding="utf-8"):
+            return {
+                "status": "acsl_syntax_error",
+                "syntax_check": {"errors": ["[kernel:annot-error] m.c:2: unbound logic variable x"]},
+            }
+        return {"status": "all_proven"}
+
+    f = mc.check_function(c_file, "sum", "-I.", tmp_path / "out", wp_runner=runner)
+    na = next(d for d in f["details"] if d["mutant"] == "ensures-true")
+    assert na["failure"] == "acsl_syntax_error"
+    assert f["preprocessing_failed"] == 0 and "error" not in f
+
+
+def test_report_lists_functions_whose_mutants_failed_to_preprocess(tmp_path: Path) -> None:
+    run_dir = _fake_run(tmp_path)
+    doc = mc.run_mutation_check(run_dir, wp_runner=lambda *a, **k: _cpp_failure())
+    assert doc["totals"]["preprocessing_failed"] > 0
+    section = "\n".join(gr.spec_quality_section({"run_dir": run_dir, "ledger": [], "mutation": doc}))
+    assert "failed to preprocess (setup, not the contract)" in section
+    assert "not checked: `sum`" in section

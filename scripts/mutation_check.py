@@ -25,7 +25,11 @@ rejected. A timeout at equal budget is possible but rare; the per-mutant
 `verdict` (`invalid` / `unknown`) keeps the two cases apart for anyone auditing
 the number. A mutant whose WP run yields no goal results (analysis_error,
 acsl_syntax_error, wp_aborted, a runner exception) is `not_applicable` and is
-left out of the denominator instead of counting as accepted.
+left out of the denominator instead of counting as accepted. Its detail carries a
+`failure`: `preprocessing_failed` when the C preprocessor stopped the run (a
+missing header, wrong include flags: the setup is at fault, not the mutant; run_wp
+reports it as acsl_syntax_error), else the WP status. A function whose every
+mutant failed to preprocess gets an `error` instead of a score.
 
 Runs only on functions whose parent WP report (workspace/reports/wp/<fn>.json)
 is all_proven, writes workspace/reports/mutation.json, and generate_report.py
@@ -233,6 +237,19 @@ def _is_rejection(report: dict) -> tuple[bool, str]:
     return False, "rte_only"
 
 
+_PREPROCESS_HINT_RE = re.compile(r"failed to run: .*-E\b|preprocess", re.IGNORECASE)
+
+
+def _failure_kind(report: dict) -> str:
+    """Why a mutant's WP run yielded no goal results: `preprocessing_failed`, or its status."""
+    status = str(report.get("status") or "error")
+    if status == "acsl_syntax_error":
+        errors = (report.get("syntax_check") or {}).get("errors") or []
+        if any(run_wp_function._CPP_ERROR_RE.match(str(e)) or _PREPROCESS_HINT_RE.search(str(e)) for e in errors):
+            return "preprocessing_failed"
+    return status
+
+
 def _is_equivalent(report: dict) -> bool:
     """The mutant contract still proves against the unchanged code."""
     return report.get("status") == "all_proven"
@@ -291,6 +308,7 @@ def check_function(
         "rejected": 0,
         "completeness": None,
         "precision": None,
+        "preprocessing_failed": 0,
         "details": [],
     }
     impl = impl_mutants(body, max_mutants)
@@ -312,6 +330,7 @@ def check_function(
         else:
             stub_name = stub[0]
             impl = [stub, *impl]  # the stub does not count against max_mutants
+    first_preprocess_error = ""
     with tempfile.TemporaryDirectory(prefix="framac-mutation-") as tmp:
         tmp_path = Path(tmp)
         for kind, mutants in (
@@ -342,15 +361,13 @@ def check_function(
                         eq = _is_equivalent(report)
                         result["equivalent"] += int(eq)
                         verdict = "equivalent" if eq else "distinguished"
-                    result["details"].append(
-                        {
-                            "mutant": name,
-                            "kind": "spec",
-                            "equivalent": eq,
-                            "verdict": verdict,
-                            "status": report.get("status"),
-                        }
-                    )
+                    detail = {
+                        "mutant": name,
+                        "kind": "spec",
+                        "equivalent": eq,
+                        "verdict": verdict,
+                        "status": report.get("status"),
+                    }
                 else:
                     rej, verdict = _is_rejection(report)
                     if verdict == "not_applicable":
@@ -360,19 +377,29 @@ def check_function(
                         result["rejected"] += int(rej)
                     if name == stub_name:
                         result["trivial_body_rejected"] = None if verdict == "not_applicable" else rej
-                    result["details"].append(
-                        {
-                            "mutant": name,
-                            "kind": "impl",
-                            "rejected": rej,
-                            "verdict": verdict,
-                            "status": report.get("status"),
-                        }
-                    )
+                    detail = {
+                        "mutant": name,
+                        "kind": "impl",
+                        "rejected": rej,
+                        "verdict": verdict,
+                        "status": report.get("status"),
+                    }
+                if verdict == "not_applicable":
+                    detail["failure"] = _failure_kind(report)
+                    if detail["failure"] == "preprocessing_failed":
+                        result["preprocessing_failed"] += 1
+                        first_preprocess_error = first_preprocess_error or next(
+                            iter((report.get("syntax_check") or {}).get("errors") or []), ""
+                        )
+                result["details"].append(detail)
     if result["spec_mutants"]:
         result["completeness"] = round(1 - result["equivalent"] / result["spec_mutants"], 4)
     if result["impl_mutants"]:
         result["precision"] = round(result["rejected"] / result["impl_mutants"], 4)
+    tried = result["preprocessing_failed"] + result["spec_mutants"] + result["impl_mutants"]
+    if result["preprocessing_failed"] and result["preprocessing_failed"] == tried:
+        # Not a score of zero: the check never ran (missing header, wrong include flags).
+        result["error"] = f"preprocessing failed for every mutant: {str(first_preprocess_error)[:300]}"
     return result
 
 
@@ -513,6 +540,7 @@ def run_mutation_check(
         "rejected": sum(f.get("rejected", 0) for f in doc["functions"].values()),
         "spec_not_applicable": sum(f.get("spec_not_applicable", 0) for f in doc["functions"].values()),
         "impl_not_applicable": sum(f.get("impl_not_applicable", 0) for f in doc["functions"].values()),
+        "preprocessing_failed": sum(f.get("preprocessing_failed", 0) for f in doc["functions"].values()),
     }
     if stub_enabled():
         checked = [fn for fn, f in doc["functions"].items() if f.get("trivial_body_rejected") is not None]

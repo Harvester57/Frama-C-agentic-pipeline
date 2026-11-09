@@ -25,6 +25,9 @@ A third store records dead ends (`<overlay>/reports/kb/obstructions.json`, fille
 requests a callee prover tried and could not prove. They have no helpfulness triplet, so
 they are never pruned by the evolved KB's top-L ranking. Prover and breaker briefs get a
 "Known Dead Ends (Do Not Repeat)" section from them (`obstructions_section_for`).
+
+Both mined stores are filled during the run: wp_scheduler.py `complete` calls
+`mine_after_complete` after every accepted result, and `mine_run` scores each agent once.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from framac_common import atomic_write_json, load_json_optional, run_lock, utc_now  # noqa: E402
 
 KB_ENV = "FRAMAC_SPEC_KB"
 KB_SENTINEL = "<!-- spec-kb -->"
@@ -274,22 +277,31 @@ def _added_acsl_lines(patch_text: str) -> list[str]:
     return out
 
 
-def mine_run(run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOLVED) -> dict:
+def mine_run(
+    run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOLVED, finished_only: bool = False
+) -> dict:
     """
     Update the evolved KB from a run directory: for each agent with a result, pair the error
     signatures seen in its candidate WP reports with the ACSL lines its merged patch added,
     and update each item's helpfulness triplet (helpful on all_proven, harmful on a stall).
     Keeps the top-L items by helpful-harmful. Never raises on a malformed run dir.
+    Each agent is mined once (`mined_agents`), so mining again after every task never counts an
+    agent twice. `finished_only` (the scheduler's mode) leaves agents without a result.json for a
+    later call instead of scoring them neutral now.
     """
     run_dir = Path(run_dir)
     kb_path = kb_path or kb_dir_of(run_dir / "workspace") / "evolved.json"
     evolved = load_json_optional(kb_path, {"schema": KB_SCHEMA, "kind": "evolved", "items": []})
     items = {it.get("id"): it for it in evolved.get("items") or [] if isinstance(it, dict)}
+    mined = {str(a) for a in evolved.get("mined_agents") or []}
     agents = run_dir / "agents"
     if agents.is_dir():
         for agent in sorted(agents.iterdir()):
-            if not agent.is_dir():
+            if not agent.is_dir() or agent.name in mined:
                 continue
+            if finished_only and not (agent / "scratch" / "result.json").is_file():
+                continue
+            mined.add(agent.name)
             result = load_json_optional(agent / "scratch" / "result.json", {})
             status = str(result.get("status") or "")
             errors: set[str] = set()
@@ -341,6 +353,7 @@ def mine_run(run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOL
                 item["keywords"] = sorted(_keywords(sig + " " + str(item.get("fix") or fix_blob)))
     ranked = sorted(items.values(), key=lambda it: (-(it.get("helpful", 0) - it.get("harmful", 0)), str(it.get("id"))))
     evolved["items"] = ranked[:top_l]
+    evolved["mined_agents"] = sorted(mined)
     evolved["updated_at"] = utc_now()
     try:
         atomic_write_json(kb_path, evolved)
@@ -348,6 +361,25 @@ def mine_run(run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOL
         pass
     mine_obstructions(run_dir, Path(kb_path).parent / OBSTRUCTIONS_FILE)
     return evolved
+
+
+def mine_after_complete(run_dir: Path) -> dict:
+    """
+    The scheduler's step after each `complete`: mine the finished agents into the evolved KB and the
+    obstruction store, so dead ends and repairs reach later briefs of other functions. Under its own
+    run lock (completes run concurrently). FRAMAC_SPEC_KB=off mines nothing.
+    """
+    if not enabled():
+        return {"skipped": f"{KB_ENV}=off"}
+    run_dir = Path(run_dir)
+    with run_lock("spec-kb", run_dir=run_dir):
+        evolved = mine_run(run_dir, finished_only=True)
+    obstructions = load_json_optional(kb_dir_of(run_dir / "workspace") / OBSTRUCTIONS_FILE, {})
+    return {
+        "evolved_items": len(evolved.get("items") or []),
+        "mined_agents": len(evolved.get("mined_agents") or []),
+        "obstructions": len(obstructions.get("items") or []) if isinstance(obstructions, dict) else 0,
+    }
 
 
 # ---------------------------------------------------------------------------
