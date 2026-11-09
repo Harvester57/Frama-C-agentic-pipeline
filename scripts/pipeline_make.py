@@ -60,6 +60,8 @@ from eva_options import (  # noqa: E402
     LADDER,
     PERFN_MAX_FUNCTIONS,
     PERFN_SLEVEL,
+    TRIAL_TIMEOUT_CEILING_S,
+    TUNING_SKIP_MARGIN,
     format_option,
     loop_unroll_level,
     merge_options,
@@ -72,6 +74,7 @@ from eva_options import (  # noqa: E402
     tuned_record_problem,
     tuning_skip_reason,
 )
+from eva_shards import MAX_SHARDS, SHARD_DIR, harness_shardable, make_plan, plan_problem, shard_cppflags  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     RunLockTimeout,
@@ -283,6 +286,7 @@ PARAM_TYPES: dict[str, type] = {
     "eva_recursion_fallback": bool,
     "eva_options": dict,
     "eva_tuned": dict,
+    "eva_shards": int,
     "fuzz_budget": int,
     "fuzz_max_time": int,
     "fuzz_dict": str,
@@ -302,6 +306,8 @@ def default_params(profile: str) -> dict:
         "eva_recursion_fallback": False,
         "eva_options": {},
         "eva_tuned": None,
+        # None: shard when the last single run was too slow to tune (eva_shards.py); 1: never; k: k shards.
+        "eva_shards": None,
         "fuzz_budget": FUZZ_BUDGET_BY_PROFILE.get(profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE]),
         "fuzz_max_time": None,
         "fuzz_dict": None,
@@ -327,6 +333,8 @@ def _param_problem(key: str, value: Any) -> str | None:
             return None if 0 <= value <= 1_000_000 else "must be between 0 and 1000000"
         if key == "eva_mlevel":
             return None if 0 <= value <= 1_000 else "must be between 0 and 1000"
+        if key == "eva_shards":
+            return None if 1 <= value <= MAX_SHARDS else f"must be between 1 (never shard) and {MAX_SHARDS}"
         return None if value > 0 else "must be positive"
     if key == "fuzz_engine":
         return (
@@ -403,6 +411,9 @@ class ModulePlan:
     eva_replay: bool = False
     # Why the module never runs Eva although its DAG record schedules it (a target fuzz module), or None.
     eva_off: str | None = None
+    # The dispatch cases each Eva shard keeps (eva_shards.py), from SHARD_DIR/<mod>/plan.json; empty
+    # when the module runs as one Eva run.
+    shards: list[list[int]] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -421,6 +432,7 @@ class ModulePlan:
             "tune_rungs": list(self.tune_rungs),
             **({"tune_skip": self.tune_skip} if self.tune_skip else {}),
             "eva_replay": self.eva_replay,
+            **({"eva_shards": [list(s) for s in self.shards]} if self.shards else {}),
             "warnings": self.warnings,
         }
 
@@ -779,8 +791,10 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     if origin == "dag" and len(sources) == 1:
         mod.warnings.append("no module sources: neither the sidecar nor the DAG lists any")
     if mod.eva:
-        _plan_tuning(plan, mod)
-        _tuning_warning(mod)
+        _plan_shards(plan, mod, sidecar)
+        if not mod.shards:
+            _plan_tuning(plan, mod)
+            _tuning_warning(mod)
     try:
         _module_block(mod)
     except ValueError as exc:
@@ -864,6 +878,101 @@ def _tuning_warning(mod: ModulePlan) -> None:
             f"these sources yet, or the sources changed since): eva-{mod.name} runs the selected options "
             "without the per-obligation combination; run eva-tune to replay or tune again"
         )
+
+
+SHARD_WARNING_PREFIX = "Eva sharding: "
+
+
+def _shard_basis(plan: Plan, name: str) -> tuple[str, dict, Path | None] | None:
+    """
+    The module's last single run, that the shard plan is predicted from: (report path, report, its
+    flamegraph.txt). The tuning base run first, then the module's report. A merged sharded report
+    counts with the sum of its shards' times and their concatenated flamegraph.
+    """
+    for rel in (f"{TUNE_REPORT_DIR}/{name}/base.json", f"{REPORT_DIRS['eva']}/{name}.json"):
+        path = plan.run_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            report = load_json_strict(path, max_bytes=1 << 31)
+        except ArtifactError:
+            continue
+        if not isinstance(report, dict):
+            continue
+        sharded = report.get("eva_shards")
+        if isinstance(sharded, dict) and isinstance(sharded.get("total_s"), (int, float)):
+            report = {**report, "elapsed_s": sharded["total_s"]}
+        if report.get("status") not in ("ok", "analysis_timeout"):
+            continue
+        if not isinstance(report.get("elapsed_s"), (int, float)) or report["elapsed_s"] <= 0:
+            continue
+        fg = report.get("flamegraph_file")
+        flamegraph = plan.run_dir / fg if isinstance(fg, str) and fg else None
+        return rel, report, flamegraph if flamegraph is not None and flamegraph.is_file() else None
+    return None
+
+
+def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
+    """
+    Whether `eva-<mod>` runs as shards (eva_shards.py), and which cases each keeps: the recorded plan
+    while it fits these settings and cases, else a new one when the last single run was too slow for
+    the ladder to finish (or params.json sets eva_shards). The plan is recorded so it never moves.
+    """
+    forced = mod.params.get("eva_shards")
+    if forced == 1:
+        return
+    raw = (sidecar or {}).get("dispatch_cases")
+    cases = [c for c in raw if isinstance(c, str) and c.strip()] if isinstance(raw, list) else []
+    if len(cases) < 2:
+        if forced:
+            mod.warnings.append(SHARD_WARNING_PREFIX + "eva_shards is set, but the harness has fewer than 2 cases")
+        return
+    try:
+        harness = (plan.run_dir / HARNESS_DIR / f"harness_{mod.name}.c").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if not harness_shardable(harness):
+        if forced:
+            mod.warnings.append(
+                SHARD_WARNING_PREFIX + "eva_shards is set, but the harness predates sharding (no per-case "
+                "guards): generate it again"
+            )
+        return
+    plan_path = plan.run_dir / SHARD_DIR / mod.name / "plan.json"
+    try:
+        record = load_json_optional(plan_path, None)
+    except ArtifactError:
+        record = None
+    problem = plan_problem(record, len(cases), mod.settings_digest, forced)
+    if problem is not None:
+        basis = _shard_basis(plan, mod.name)
+        module_timeout = mod.params.get("eva_timeout")
+        limit_s = (module_timeout or TRIAL_TIMEOUT_CEILING_S) / TUNING_SKIP_MARGIN
+        if basis is None:
+            if not forced:
+                return
+            rel, total_s, flamegraph = None, limit_s, None
+        else:
+            rel, report, flamegraph = basis
+            total_s = float(report["elapsed_s"])
+            timed_out = report.get("status") == "analysis_timeout" or bool(report.get("timeout_fallback"))
+            slow = timed_out or tuning_skip_reason(total_s, trial_timeout(total_s, module_timeout), module_timeout)
+            if not forced and not slow:
+                return
+            if timed_out:
+                total_s = max(total_s, limit_s * TUNING_SKIP_MARGIN)
+        record = make_plan(cases, flamegraph, total_s, limit_s, mod.settings_digest, forced, rel)
+        if record["k"] < 2:
+            return
+        atomic_write_json(plan_path, record)
+    assert isinstance(record, dict)
+    mod.shards = [list(s) for s in record["shards"]]
+    predicted = record.get("predicted_makespan_s")
+    mod.warnings.append(
+        SHARD_WARNING_PREFIX + f"eva-{mod.name} runs as {len(mod.shards)} shards "
+        f"({SHARD_DIR}/{mod.name}/plan.json, predicted {predicted} s for the slowest); the ladder does "
+        "not run per shard yet"
+    )
 
 
 def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = None) -> Plan:
@@ -953,8 +1062,13 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         except _Excluded as exc:
             plan.excluded[name] = str(exc)
             continue
-        # Tuning warnings change what a report means, so they are surfaced at the top of `gen` and `run`.
-        warnings.extend(f"{name}: {w}" for w in plan.modules[name].warnings if w.startswith(TUNING_WARNING_PREFIX))
+        # Tuning and sharding warnings change what a report means, so they are surfaced at the top of
+        # `gen` and `run`.
+        warnings.extend(
+            f"{name}: {w}"
+            for w in plan.modules[name].warnings
+            if w.startswith((TUNING_WARNING_PREFIX, SHARD_WARNING_PREFIX))
+        )
     allocate_fuzz_budgets(plan)
     for name in sorted(set(params_doc["modules"]) - set(plan.records)):
         if name in dag_modules:
@@ -1120,6 +1234,10 @@ def _eva_tuning_lines(mod: ModulePlan) -> list[str]:
     ]
     for rung, options in mod.tune_rungs.items():
         lines.append(_assign(f"EVA_RUNG_OPTIONS_{n}__{rung}", _option_words(options)))
+    lines.append(_assign(f"EVA_SHARDS_{n}", " ".join(str(i) for i in range(len(mod.shards)))))
+    for i, cases in enumerate(mod.shards):
+        flags = mk_quote(shlex.join([*mod.cppflags, *shard_cppflags(cases)]))
+        lines.append(_assign(f"EVA_SHARD_CPPFLAGS_{n}__{i}", flags))
     return lines
 
 
@@ -1213,7 +1331,7 @@ def generate(run_dir: Path | str = ".", templates_dir: Path | str | None = None)
 # params set / show
 # ---------------------------------------------------------------------------
 
-_CLEARED_BY_ZERO = ("eva_mlevel", "eva_timeout", "fuzz_budget", "fuzz_max_time")
+_CLEARED_BY_ZERO = ("eva_mlevel", "eva_timeout", "eva_shards", "fuzz_budget", "fuzz_max_time")
 
 
 def parse_eva_option_updates(texts: list[str]) -> dict[str, Any]:
@@ -1235,8 +1353,8 @@ def params_set(
     run_dir: Path | str = ".", module: str = "", reset: bool = False, eva_retune: bool = False, **updates: Any
 ) -> dict:
     """
-    Update one module's overrides. 0 clears eva_mlevel, eva_timeout, fuzz_budget (back to the profile
-    default) and fuzz_max_time; an empty fuzz_dict clears the dictionary; `reset` drops every
+    Update one module's overrides. 0 clears eva_mlevel, eva_timeout, eva_shards (back to sharding only a
+    module too slow to tune), fuzz_budget (back to the profile default) and fuzz_max_time; an empty fuzz_dict clears the dictionary; `reset` drops every
     earlier override first. `eva_options` updates individual options (None clears one). `eva_retune`
     forgets the recorded tuning decision, so `eva-tune` searches the ladder again; a change to any
     other setting Eva analyses under makes that decision stale by itself. ValueError on an invalid value.
@@ -1499,12 +1617,14 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
     return []
 
 
-def _node_output(node: str) -> str | None:
+def _node_output(node: str, plan: Plan | None = None) -> str | None:
     if node in _TARGET_OUTPUTS:
         return _TARGET_OUTPUTS[node]
     if node.startswith(REACH_DYNAMIC_PREFIX):
         return "workspace/reports/harness_reach_dynamic.json"
     kind, _, mod = node.partition("-")
+    if kind == "evabase" and plan is not None and mod in plan.modules and plan.modules[mod].shards:
+        return f"{REPORT_DIRS['eva']}/{mod}.json"  # a sharded module's base run is its merged shards
     return {
         "build": f"{BUILD_DIR}/{mod}.build.json",
         "fuzz": f"{REPORT_DIRS['fuzz']}/{mod}.json",
@@ -1634,7 +1754,7 @@ def _node_status(node: str, plan: Plan, run_dir: Path, failed: set[str], cache: 
         ):
             status = "skipped"  # a prerequisite failed, so make never ran this recipe
         else:
-            out = _node_output(node)
+            out = _node_output(node, plan)
             status = "ok" if out is None or (run_dir / out).exists() else "no_output"
         cache[node] = status
     return cache[node]
@@ -1707,7 +1827,7 @@ def run_targets(
             if not runnable:
                 continue
             nodes = {n for t in runnable for n in _target_nodes(t, plan)}
-            outputs = {n: _node_output(n) for n in nodes}
+            outputs = {n: _node_output(n, plan) for n in nodes}
             before = {out: _output_state(run_dir, out) for out in outputs.values() if out}
             eff_makefile = str(priv_makefile) if priv_makefile is not None else MAKEFILE
             cmd = [
@@ -1733,7 +1853,7 @@ def run_targets(
                 entries = {}
                 for node in _target_nodes(target, plan):
                     info: dict = {"status": _node_status(node, plan, run_dir, failed, cache)}
-                    out = outputs.get(node) or _node_output(node)
+                    out = outputs.get(node) or _node_output(node, plan)
                     if out:
                         after = _output_state(run_dir, out)
                         info.update(
@@ -2427,6 +2547,12 @@ def main(argv: list[str] | None = None) -> int:
     taint.add_argument("--no-eva-taint", dest="eva_taint", action="store_false")
     p_set.set_defaults(eva_taint=None)
     p_set.add_argument("--eva-timeout", type=int, default=None, help="Eva wall-clock seconds (0 clears)")
+    p_set.add_argument(
+        "--eva-shards",
+        type=int,
+        default=None,
+        help="Run Eva as this many shards by dispatch case (1: never; 0 clears: shard when too slow to tune)",
+    )
     eva_rec = p_set.add_mutually_exclusive_group()
     eva_rec.add_argument(
         "--eva-recursion-fallback",
@@ -2536,6 +2662,7 @@ def main(argv: list[str] | None = None) -> int:
                 eva_mlevel=args.eva_mlevel,
                 eva_taint=args.eva_taint,
                 eva_timeout=args.eva_timeout,
+                eva_shards=args.eva_shards,
                 eva_recursion_fallback=args.eva_recursion_fallback,
                 eva_options=parse_eva_option_updates(args.eva_option) if args.eva_option else None,
                 eva_retune=args.eva_retune,

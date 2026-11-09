@@ -54,6 +54,9 @@ VALID_ENTRY_STYLES = (
 # guard carries DISPATCH_SKIP_ALL_MARKER reads every word; one generated before it reads cases 0..63 only.
 DISPATCH_SKIP_MACRO = "FRAMAC_FUZZ_SKIP_CASES"
 DISPATCH_SKIP_ALL_MARKER = "every dispatch case skippable"
+# Eva sharding (eva_shards.py): a shard is built with -DFRAMAC_EVA_SHARD and -DFRAMAC_EVA_SHARD_CASE_<k>
+# for each case it keeps. Without FRAMAC_EVA_SHARD every case is there, as before.
+EVA_SHARD_MACRO = "FRAMAC_EVA_SHARD"
 _WORKSPACE_PREFIXES = (
     "/framac-run/workspace/work/",
     "/framac-run/workspace/baseline/",
@@ -867,6 +870,10 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
     A campaign that already crashed in some cases rebuilds with -DFRAMAC_FUZZ_SKIP_CASES=<bit mask>
     (bit i skips case i, cases 0..63) and -DFRAMAC_FUZZ_SKIP_CASES_<k>=<mask> for cases 64k..64k+63,
     so the known crash stops ending every run. A word not given skips nothing. Eva never sees it.
+
+    Each case also sits in `#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_<k>)`: an
+    Eva shard keeps only its cases in the source (eva_shards.py). The preprocessor keeps line numbers, so
+    an obligation has the same (file, line) in every shard that keeps it.
     """
     stmts = [c.strip() for c in cases if c and c.strip()]
     if not stmts:
@@ -903,7 +910,13 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
         f"    switch (harness_selector % {n}U) {{",
     ]
     for i, stmt in enumerate(stmts):
-        lines.append(f"    case {i}U: {{ {stmt} }} break;")
+        # An Eva shard keeps only its own cases (eva_shards.py): the others leave the source, so Eva never
+        # enters them, where a run-time test on the unknown selector would still take every branch.
+        lines += [
+            f"#if !defined({EVA_SHARD_MACRO}) || defined({EVA_SHARD_MACRO}_CASE_{i})",
+            f"    case {i}U: {{ {stmt} }} break;",
+            "#endif",
+        ]
     lines += ["    default: break;", "    }", "}"]
     return "\n    ".join(lines)
 

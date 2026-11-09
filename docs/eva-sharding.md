@@ -1,6 +1,8 @@
 # Design note: sharding a module's Eva run by dispatch case
 
-Status: design only, nothing implemented. Written 2026-11-09 from QCBOR run-5.
+Status: implemented without per-shard tuning (`scripts/eva_shards.py`, 2026-11-09). Written the same day
+from QCBOR run-5. "Implementation" at the end lists where the code departs from this design, and the
+measurements on QCBOR run-4.
 
 ## Problem
 
@@ -163,3 +165,65 @@ default.
    the soundness argument above, not assumed.
 3. Measure on run-5 the sum and maximum of shard times, the per-shard peaks, and the post-Eva steps.
    Then replace the estimates in the table above with the measurements.
+
+## Implementation
+
+What `scripts/eva_shards.py`, `pipeline_make.py` and `templates/pipeline.mk` do, where it differs from
+the design above:
+
+- **Guards keep cases, not skip them.** Each case is wrapped in
+  `#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_<k>)`. A shard defines
+  `FRAMAC_EVA_SHARD` and the cases it keeps, which is about 22 defines for a 179-case harness in 8
+  shards instead of about 157. A build without `FRAMAC_EVA_SHARD` (the fuzz build, an unsharded Eva
+  run) keeps every case. Harnesses generated before this have no guards and are never sharded.
+- **When.** A module is sharded only when its last single run was too slow for the ladder
+  (`tuning_skip_reason`), or when `params set --eva-shards <k>` asks for it (1 means never, 0 means
+  automatic). There is no ladder per shard yet, so a module that can still be tuned stays one run:
+  sharding it would trade precision for wall time.
+- **The plan** is recorded in `workspace/reports/eva-shards/<mod>/plan.json`, with the settings digest
+  and case count it is valid for. It is recomputed only when those change, or when the forced count
+  changes. Case costs come from the slow run's `flamegraph.txt`: depth-1 callees of `eva_main`, shared
+  callees split evenly, and `eva_main`'s own time and calls outside the switch spread over every case.
+  Without a profile, every case costs the same.
+- **Not here.** A shard has no say on an obligation when the function is missing from its
+  `[metrics:eva:reached-stmts]` list *and* every row it has for the obligation is Never tried. An
+  obligation no shard reaches keeps the first shard's Never tried rows, so it stays Unknown as the
+  single run reports it, where the table above said Dead.
+- **Rows.** For each obligation key, the merged CSV keeps the rows of the shard with the worst status:
+  invalid, then other, unknown, assumed, valid, dead.
+- **A failed shard** makes the module's report not ok, with the shard named in `reason` and
+  `error_summary`, the same as a failed single run. Its obligations are not reported as Unknown one by
+  one.
+- **Identity.** Shards must agree on `main_fn`, sources, reduced checks and assumption options.
+  `input_digest` differs by construction; the merged report's is a digest of the shards' digests.
+- **Profiles and flows.** The shards' `flamegraph.txt` files are concatenated into
+  `workspace/eva/<mod>/flamegraph.txt`, so a later re-plan reads the whole module's work. Flows are
+  merged as described above.
+
+**Measured on QCBOR run-4 `libqcbor_a`** (179 cases, harness guarded by hand, one 32-core machine
+with another analysis running). Eva time is from the reports; wall time is the whole `make` target,
+including the steps after Eva.
+
+| Run | Eva makespan | Sum of shard Eva times | `make` wall time | Valid / Unknown / Invalid / Dead |
+|---|---|---|---|---|
+| single | 55.3 s | 55.3 s | 90 s | 4574 / 532 / 19 / 5284 |
+| 1 shard, every case | 51.3 s | 51.3 s | 88 s | identical rows |
+| 2 shards | 23.0 s | 37.7 s | 38 s | 4574 / 532 / 19 / 5284 |
+| 4 shards | 13.7 s (predicted 14.0 s) | 41.1 s | 23 s | 4574 / 532 / 19 / 5284 |
+
+- No obligation the single run proved Valid became anything but Valid or Dead.
+- No Invalid was lost.
+- The status counts are identical.
+- On this small module the shards gained no precision.
+- The sum of the shard times is *below* the single run's: fewer cases means fewer states to join.
+
+About 1,180 obligation keys differ in spelling between the single run and the 2- and 4-shard runs, with
+the same statuses on both sides. They are all in harness code (`eva_main`, `LLVMFuzzerTestOneInput`).
+The kernel numbers same-named locals of the harness's cases (`fuzz_off_0`, `c0a1_0`), and a shard with
+fewer cases needs fewer suffixes. Each case is on its own line in exactly one shard, so no two shards
+disagree on such a key, and harness code has no ledger units.
+
+**Not done yet:**
+- The ladder per shard, and the per-shard records it needs in `params.json`.
+- A cheaper first-run memory lease for shards.
+- Measurements on QCBOR run-5, the module this was designed for.

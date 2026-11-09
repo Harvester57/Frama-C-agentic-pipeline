@@ -35,6 +35,7 @@ EVA_TARGETS    := $(addprefix eva-,$(EVA_MODULES))
 EVA_BASE_TARGETS := $(addprefix evabase-,$(EVA_MODULES))
 EVA_RUNG_TARGETS := $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))
 EVA_TUNE_TARGETS := $(addprefix evatune-,$(EVA_MODULES))
+EVA_SHARD_TARGETS := $(foreach m,$(EVA_MODULES),$(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i)))
 FLAMEGRAPH_TARGETS := $(addprefix flamegraph-,$(EVA_MODULES))
 FACTS_TARGETS  := $(addprefix facts-,$(MODULES))
 MODULE_TARGETS := $(addprefix module-,$(MODULES))
@@ -43,7 +44,7 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
 .PHONY: help slice-init dag security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
-        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) \
+        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) $(EVA_SHARD_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
@@ -154,13 +155,14 @@ $(REACH_DYNAMIC_TARGETS): reach-dynamic-%: coverage-%
 	$(RUN) --class light --key reach-dynamic -- $(PY) $(S)/harness_reach.py dynamic --module $*
 
 # What every Eva run of module $(1) has in common: the rest is tuning, and tuning never changes what
-# is checked, so runs differing only in that can be compared and combined (eva_tuning.py).
+# is checked, so runs differing only in that can be compared and combined (eva_tuning.py). $(2), when
+# given, replaces the module's cppflags (a shard's: the module's plus the cases it keeps).
 eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EVA_SLEVEL_$(1)) \
 	$(if $(EVA_MLEVEL_$(1)),--mlevel $(EVA_MLEVEL_$(1))) \
 	$(if $(EVA_TAINT_$(1)),--extra-domains taint) \
 	$(if $(EVA_RECURSION_FALLBACK_$(1)),--allow-incomplete-recursion-specs) \
 	--no-warn-unsigned-downcast \
-	--cppflags=$(CPPFLAGS_$(1))
+	--cppflags=$(if $(2),$(2),$(CPPFLAGS_$(1)))
 
 # The tuning decision of module $(1): its finished base run and rungs, the recorded loop trials and the
 # per-obligation combination (eva_tuning.py finish). It writes the module's report, and copies the
@@ -184,10 +186,35 @@ eva_plain_cmd = $(PY) $(S)/run_eva_slice.py $(call eva_args,$(1)) --out-dir work
 	--out-json workspace/reports/eva/$(1).json
 eva: $(EVA_TARGETS)
 $(foreach m,$(EVA_MODULES),$(if $(EVA_REPLAY_$(m)),$(eval eva-$(m): evabase-$(m) $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))))
+$(foreach m,$(EVA_MODULES),$(if $(EVA_SHARDS_$(m)),$(eval eva-$(m): $(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i)))))
 $(EVA_TARGETS): eva-%:
 	$(GATE) --module $* --need reach
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
-		$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*))
+		$(if $(EVA_SHARDS_$*),$(call eva_merge_cmd,$*),$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*)))
+
+# Eva sharding (eva_shards.py, docs/eva-sharding.md): a module whose last single run was too slow for
+# the ladder (or with eva_shards in params.json) runs as EVA_SHARDS_<mod> shards, each keeping only some
+# dispatch cases (-DFRAMAC_EVA_SHARD_CASE_<k>, workspace/reports/eva-shards/<mod>/plan.json). Each shard is
+# the module's plain run otherwise, with its own resource-history key <mod>:shard<i>; until a shard has a
+# peak of its own, its lease falls back to the module's largest. A failed shard never blocks the merge,
+# which then writes an incomplete report naming it. eva-<mod>, evabase-<mod> and evatune-<mod> all merge
+# the shards (cached by content), so the module's report is the same whichever ran last.
+define EVA_SHARD_RULE
+evashard-$(1)--$(2):
+	$$(GATE) --module $(1) --need reach
+	@rm -f workspace/reports/eva-shards/$(1)/shard$(2).json
+	-$$(RUN) --class eva --key $(1):shard$(2) --output workspace/reports/eva-shards/$(1)/shard$(2).json -- \
+		$$(PY) $$(S)/run_eva_slice.py $$(call eva_args,$(1),$$(EVA_SHARD_CPPFLAGS_$(1)__$(2))) \
+		--out-dir workspace/eva/$(1)/shards/$(2) \
+		$$(EVA_OPTIONS_$(1)) $$(EVA_LOOPS_$(1)) \
+		$$(if $$(EVA_TIMEOUT_$(1)),--timeout $$(EVA_TIMEOUT_$(1))) \
+		--out-json workspace/reports/eva-shards/$(1)/shard$(2).json
+endef
+$(foreach m,$(EVA_MODULES),$(foreach i,$(EVA_SHARDS_$(m)),$(eval $(call EVA_SHARD_RULE,$(m),$(i)))))
+eva_merge_cmd = $(PY) $(S)/eva_shards.py merge --module $(1) --shard-dir workspace/reports/eva-shards/$(1) \
+	$(if $(ENTRY_FN_$(1)),--entry-fn=$(ENTRY_FN_$(1))) \
+	--csv-out workspace/eva/$(1)/alarms.csv --flamegraph-out workspace/eva/$(1)/flamegraph.txt \
+	--out-json workspace/reports/eva/$(1).json
 
 # Eva ladder: the module's own settings first; `pipeline_make.py run` then regenerates modules.mk, so
 # only modules left with Unknowns get rungs, and none when the base run was too slow for any rung to
@@ -197,15 +224,18 @@ $(EVA_TARGETS): eva-%:
 # one, the key falls back to the largest of the module's (resources.py history_estimate). A rung that
 # times out stays a timeout: the less precise fallback tiers are of no use against the base run. Rungs
 # write no flamegraph.txt either (+7% wall time, gigabytes on long runs): the base run's is published.
+# A sharded module has no single base run and no rungs: its base run is its shards, merged.
+eva_base_run = --output workspace/reports/eva-tuning/$(1)/base.json -- $(PY) $(S)/run_eva_slice.py $(call eva_args,$(1)) \
+	--out-dir workspace/eva/$(1)/tune/base $(EVA_BASE_OPTIONS_$(1)) \
+	$(if $(EVA_TIMEOUT_$(1)),--timeout $(EVA_TIMEOUT_$(1))) \
+	--out-json workspace/reports/eva-tuning/$(1)/base.json
 eva-tune-base: $(EVA_BASE_TARGETS)
+$(foreach m,$(EVA_MODULES),$(if $(EVA_SHARDS_$(m)),$(eval evabase-$(m): $(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i)))))
 $(EVA_BASE_TARGETS): evabase-%:
 	$(GATE) --module $* --need reach
-	@rm -f workspace/reports/eva-tuning/$*/base.json
-	$(RUN) --class eva --key $* --output workspace/reports/eva-tuning/$*/base.json -- \
-		$(PY) $(S)/run_eva_slice.py $(call eva_args,$*) --out-dir workspace/eva/$*/tune/base \
-		$(EVA_BASE_OPTIONS_$*) \
-		$(if $(EVA_TIMEOUT_$*),--timeout $(EVA_TIMEOUT_$*)) \
-		--out-json workspace/reports/eva-tuning/$*/base.json
+	$(if $(EVA_SHARDS_$*),,@rm -f workspace/reports/eva-tuning/$*/base.json)
+	$(RUN) --class eva --key $* \
+		$(if $(EVA_SHARDS_$*),--output workspace/reports/eva/$*.json -- $(call eva_merge_cmd,$*),$(call eva_base_run,$*))
 
 define EVA_RUNG_RULE
 evarung-$(1)--$(2):
@@ -220,11 +250,11 @@ endef
 $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),$(eval $(call EVA_RUNG_RULE,$(m),$(r)))))
 
 eva-tune: $(EVA_TUNE_TARGETS)
-$(foreach m,$(EVA_MODULES),$(eval evatune-$(m): $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r))))
+$(foreach m,$(EVA_MODULES),$(eval evatune-$(m): $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)) $(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i))))
 $(EVA_TUNE_TARGETS): evatune-%:
 	$(GATE) --module $* --need reach
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
-		$(call eva_finish_cmd,$*)
+		$(if $(EVA_SHARDS_$*),$(call eva_merge_cmd,$*),$(call eva_finish_cmd,$*))
 
 # Render the Eva flamegraph (flamegraph.svg/html) of a module from the workspace/eva/<mod>/flamegraph.txt
 # its last eva-<mod> or eva-tune left. It never runs Eva (that would replace the module's report), so it

@@ -42,6 +42,7 @@ known-first-party = [
     "eva_flamegraph",
     "eva_loops",
     "eva_options",
+    "eva_shards",
     "eva_tuning",
     "extract_references",
     "fingerprint",
