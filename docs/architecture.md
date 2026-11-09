@@ -146,6 +146,8 @@ run-<N>/
 │   ├── build/                                # Generated Makefile, modules.mk, params.json (pipeline_make.py)
 │   ├── seed_records/                         # API calls recorded from the target's tests (calls.jsonl)
 │   ├── seeds/<mod>/                          # Seeds in the harness's case format (read-only extra corpus)
+│   ├── fuzz_assets/corpora/<id>/             # Fuzz corpora the target ships, imported content-addressed
+│   ├── imported_corpus/<mod>/                # Those corpora per harness module (second read-only extra corpus)
 │   ├── corpus/<mod>/                         # LibFuzzer seed and coverage corpus per module (parent-owned)
 │   ├── crashes/<mod>/                        # crash-* inputs triggering E-ACSL assertions
 │   ├── contracts/                            # Exported verified .h and .acsl contract headers
@@ -154,6 +156,8 @@ run-<N>/
 │       ├── phase0_model.json                 # Frama-C model: functions, edges, units, trust, parse status per unit
 │       ├── codeql_trust.json                 # Optional CodeQL trust facts
 │       ├── seed_harvest.json                 # What the seed recording kept
+│       ├── fuzz_assets.json                  # The target's own fuzzers, corpora and their mappings
+│       ├── imported_corpus/<mod>.json        # What each harness case got from the imported corpora
 │       ├── security_props.json               # MetAcsl Layer 3-6 properties and their instances
 │       ├── callgraph_dag.json                # DAG view: link-unit modules, waves, tiers, unit split
 │       ├── phase0_gates.json                 # Reach gate and E-ACSL build check, per module

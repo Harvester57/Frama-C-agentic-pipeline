@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -522,3 +523,36 @@ class TestGenerateModuleHarnessPrelude:
         h2_text = (out_dir / "harness_canary_wrap.c").read_text(encoding="utf-8")
         assert "#define LLVMFuzzerTestOneInput __framac_target_embedded_LLVMFuzzerTestOneInput" in h2_text
         assert "#undef LLVMFuzzerTestOneInput" in h2_text
+
+    def test_embedded_fuzzer_initialize_is_renamed_too(self, tmp_path: Path) -> None:
+        """A source's own LLVMFuzzerInitialize is renamed like its LLVMFuzzerTestOneInput (E-ACSL init hook)."""
+        work = tmp_path / "workspace" / "work"
+        work.mkdir(parents=True)
+        canary_c = work / "canary.c"
+        canary_c.write_text(
+            "#include <stdint.h>\n#include <stddef.h>\n"
+            "int canary_process(const uint8_t *data, size_t len) { return (int)len; }\n"
+            "int LLVMFuzzerInitialize(int *argc, char ***argv) { (void)argc; (void)argv; return 0; }\n"
+            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return canary_process(data, size); }\n",
+            encoding="utf-8",
+        )
+        out_dir = tmp_path / "workspace" / "harnesses"
+        common: dict[str, Any] = {
+            "sources": [str(canary_c)],
+            "header_include": "none",
+            "entry_fn": "canary_process",
+            "max_input_size": 64,
+            "cppflags": "",
+            "out_dir": out_dir,
+            "auto_prelude": False,
+        }
+        generate_module_harness(module_name="inc", include_source=True, **common)
+        inc_text = (out_dir / "harness_inc.c").read_text(encoding="utf-8")
+        assert "#define LLVMFuzzerInitialize __framac_target_embedded_LLVMFuzzerInitialize" in inc_text
+        assert "#undef LLVMFuzzerInitialize" in inc_text
+        assert inc_text.index('#include "canary.c"') < inc_text.index("#undef LLVMFuzzerInitialize")
+
+        res = generate_module_harness(module_name="sep", include_source=False, **common)
+        assert "-DLLVMFuzzerInitialize=__framac_target_embedded_LLVMFuzzerInitialize" in res["cppflags"]
+        assert "-DLLVMFuzzerTestOneInput=__framac_target_embedded_LLVMFuzzerTestOneInput" in res["cppflags"]
+        assert "int LLVMFuzzerInitialize(" not in (out_dir / "harness_sep.c").read_text(encoding="utf-8")

@@ -7,6 +7,7 @@ description: >-
   build), parses every link unit with Frama-C into the Phase 0 model
   (functions, direct and indirect call edges, API entry points, GCC fallback
   for units Frama-C cannot parse), records seed inputs from the target's tests,
+  imports the fuzz targets and corpora the target ships,
   marks the trust boundary from the build and the structured threat model,
   writes the call-graph DAG (link units as modules, bottom-up waves, risk tiers
   from trust, unit split), generates the MetAcsl security properties (Layers
@@ -197,6 +198,31 @@ The report is `workspace/reports/seed_harvest.json`. A failing test suite is a w
 
 Remove the scratch volume once the capture, the model, CodeQL and the seed recording are done: run the wrapper with `-RemoveScratch` (`--remove-scratch`) and no command. Later steps read the snapshot from the run directory, not the volume.
 
+### Step 1f — The Target's Own Fuzz Targets and Corpora
+
+Many projects ship libFuzzer fuzz targets (files defining `LLVMFuzzerTestOneInput`, often under `fuzz/`, `tests/fuzz/` or `.clusterfuzzlite/`, and often not built by default) and corpora for them. A shipped corpus usually holds far more coverage than a Phase 1 campaign can build from scratch. Find and import them in the analysis image, after the overlay (Step 1a):
+
+```text
+python3 /opt/framac-pipeline/scripts/fuzz_assets.py discover
+python3 /opt/framac-pipeline/scripts/fuzz_assets.py map --corpus <id> --fuzzer <id>              # or:
+python3 /opt/framac-pipeline/scripts/fuzz_assets.py map --corpus <id> --function <fn> [<fn>...]
+python3 /opt/framac-pipeline/scripts/fuzz_assets.py map --corpus <id> --ignore --reason '<why>'
+python3 /opt/framac-pipeline/scripts/fuzz_assets.py import
+```
+
+`discover` reads the target without following symlinks and writes `workspace/reports/fuzz_assets.json`. It finds:
+- **fuzzers:** C and C++ files that define `LLVMFuzzerTestOneInput`, whether they also define `LLVMFuzzerInitialize`, and the functions they call with their input (`direct_api_calls`). C++ fuzzers are `unsupported` (E-ACSL is C only), but their corpora can still be mapped to functions;
+- **corpora:** `*_seed_corpus.zip` files, and directories named with `corpus`, `seed` or `fuzz` that hold data files;
+- **libFuzzer files:** `<fuzzer>.dict` and `<fuzzer>.options` (`max_len`);
+- **corpora from outside the target:** each folder under `<run-dir>/inputs/corpora/<name>/`. Put a corpus the user has elsewhere (a ClusterFuzz backup, an earlier campaign) there, one folder per corpus; a folder named as a fuzzer id is paired with that fuzzer.
+
+Only the OSS-Fuzz names pair automatically: `<fuzzer>_seed_corpus.zip` (or the unzipped `<fuzzer>_seed_corpus/`), `corpus/<fuzzer>/`, `<fuzzer>_corpus/`, `<fuzzer>.dict`, `<fuzzer>.options`. Every other corpus is unmapped, and pairing it is your call. `direct_api_calls` only sees calls whose arguments name the fuzzer's input parameters: a fuzzer that copies its input into a local first (c-ares's name fuzzer) lists helpers only, so its corpus reaches the unit's own harness cases only through its `tf_` module. Read the fuzzer source, a few corpus files, and the build or test scripts that use the folder (c-ares feeds `test/fuzzinput/` to `ares-test-fuzz.c` and `test/fuzznames/` to `ares-test-fuzz-name.c`). Then:
+- map it to a **fuzzer** when its files are that fuzzer's input;
+- map it to **functions** when its files are whole inputs of API functions that no shipped C fuzzer wraps, such as DNS replies for `ares_parse_a_reply`;
+- **ignore** it, with the reason, when its files are not inputs (expected outputs, test vectors in a text format a parser does not read).
+
+`import` copies the mapped corpora into `workspace/fuzz_assets/corpora/<id>/`, content-addressed. Unmapped corpora are not imported, and a warning lists them. The limits are fixed: 1 MiB per input, 20,000 inputs and 256 MiB per corpus. Zip entry names are never used as paths, and symlinks and special files are skipped. Each corpus's `imported` record counts what was kept and why the rest was dropped. A target with no fuzz assets just has empty lists: shipped assets are an improvement, never a requirement.
+
 ---
 
 ## Step 2 — Build the Call-Graph DAG, Topological Waves & Risk Tiers
@@ -325,6 +351,19 @@ Supported `--entry-style` modes and options in `generate_harness.py`:
 - If a dynamic LibFuzzer binary cannot link an external third-party library symbol at link time, pass `--stubbed-callee <fn>` so it is recorded in `harness_<mod>.json` (`stubbed_callees`) and any linker stub is guarded by `#ifndef __FRAMAC__`.
 - Harness code may call a function through a macro alias (`crypto_hash` for `crypto_hash_sha512_tweet`): the generator and the reach gate resolve it through the DAG's `macro_aliases`.
 
+**Target fuzz harnesses.** Each `usable` fuzzer in `workspace/reports/fuzz_assets.json` (Step 1f) gets one more harness module, `tf_<id>`, besides the unit's own harness:
+
+```text
+python3 /opt/framac-pipeline/scripts/generate_harness.py --module tf_<id> --unit <unit> --target-fuzzer <work_path> --target-fuzzer-id <id> --sources <the unit's required_sources...> --header none --cppflags='<the unit's cppflags>' --out-dir workspace/harnesses
+```
+
+- **Unit:** the link unit whose API the fuzzer calls (its `direct_api_calls`). Pass the fuzzer's `work_path` from the report.
+- **What it generates:** the target's `LLVMFuzzerTestOneInput` and `LLVMFuzzerInitialize` are renamed (`__framac_target_embedded_*`). The harness copies the input into `fuzz_buf`, calls the target's initializer once, then calls the target's fuzz function. The two rules below therefore still hold. Use `--target-fuzzer`, never `--self-harnessed`, for a target's fuzzer.
+- **Input size:** `max_input_size` comes from the fuzzer's `.options` `max_len`, else from its largest imported input (4 KiB to 1 MiB). Pass `--max-size` only to override it.
+- **Additive:** the module's scope is the fuzzer file, so it answers for no entry point. The unit still needs its own harness for the reach gate, and the gate fails a `tf_` module whose fuzzer reaches no DAG function (`target_fuzzer_reaches_nothing`). `tf_` modules are fuzzed and measured for coverage, never analysed by Eva.
+- **Skip** a fuzzer that needs code outside the unit's sources (another library, C++ helpers) or that writes files or opens sockets, and say why in your summary.
+- A crash inside the fuzzer's own code is harness-side: the crash location is the first target frame below it.
+
 Module headers are often not self-sufficient (for example `Events.h` uses `Boolean_T`, `GST_CHAIN_MODE_T`, or `CMD_NAME_MAX_LEN` defined in `PtfUtil.h` without including it). Auto-prelude handles this (on by default):
 - After writing the harness, `generate_harness.py` runs `clang -fsyntax-only -x c <cppflags> harness_<mod>.c` (LibFuzzer branch, no `-D__FRAMAC__`; with the run snapshot's include options, as every compile of the target, so a header the build generated such as libpng's `pnglibconf.h` is found), collects `unknown type name` / `use of undeclared identifier` diagnostics, finds the defining `*.h` in the `-I` directories of `--cppflags` (typedefs, `} X;`, `#define X`, enum constants; top-level of each directory only), and `#include`s it before the module header. It repeats this up to 3 rounds.
 - The outcome is recorded in `harness_<mod>.json` and the JSON output as `prelude_headers`, `prelude_status` (`clean`, `resolved`, `unresolved`, `skipped` when clang is missing or hits a fatal error, `disabled`), and `prelude_unresolved`. If symbols are still unresolved, the command fails and lists them. In that case, add the missing directory with `-I`, or use the manual form below.
@@ -376,7 +415,7 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py build-check   # Phase 0's 
 
 The Makefile's `seed` target (`pipeline_make.py run seed`) runs the first three lines after the reach gate and `security-props`. Seeding does not record Phase 0 as done: `build-check` is its last gate, and it records the checkpoint (`checkpoint.py save-phase state --phase 0`) itself, only when it passes and the reach gate holds for every module of the plan, with each harness and the DAG unchanged since the check. Its JSON says so under `phase0_checkpoint` (`saved`, or the gate `reasons` that kept it from saving). Never save the Phase 0 checkpoint by hand.
 
-`validate_artifacts.py run-dir` also checks the Phase 0 artifacts present (`build_capture.json`, `phase0_model.json`, `security_props.json`, `callgraph_dag.json`, `build_check.json`, `harness_reach_dynamic.json`, `seed_harvest.json`, each harness sidecar, `seed_records/traces.jsonl`) against `schemas/`, and fails on the schema problems their producers recorded as `schema:` warnings. A link-unit DAG without `schema_version` predates the GCC-fallback blocking: rebuild it with `build_callgraph_dag.py`.
+`validate_artifacts.py run-dir` also checks the Phase 0 artifacts present (`build_capture.json`, `phase0_model.json`, `security_props.json`, `callgraph_dag.json`, `build_check.json`, `harness_reach_dynamic.json`, `seed_harvest.json`, `fuzz_assets.json`, each harness sidecar, `seed_records/traces.jsonl`) against `schemas/`, and fails on the schema problems their producers recorded as `schema:` warnings. A link-unit DAG without `schema_version` predates the GCC-fallback blocking: rebuild it with `build_callgraph_dag.py`.
 
 `ledger.py seed` creates one unit per function × obligation class, keyed by link unit:
 - each unit takes its function's `callgraph_source`; units on the GCC fallback carry `bookkeeping.callgraph_fallback`, and those of a function whose link unit is on the fallback (`eva_wp_blocked`) are seeded `deferred` with a `callgraph_fallback:` reason, since Eva and WP cannot run on them; the report lists them under "Units not worked in this run";

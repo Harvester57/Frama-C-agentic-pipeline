@@ -3,7 +3,7 @@
 The benchmark's `phase0` set: the seeded-bug projects of tests/fixtures/phase0/seeded/ (step I5b). Each project is a
 small library with one verified bug that Phases 1-2 find only when Phase 0 reports the right sources,
 flags and entry points, and decoys that a wrong Phase 0 turns into false positives (see that
-directory's README and each project's truth.json). Acceptance: 7/7 bugs found, 0 decoys fired.
+directory's README and each project's truth.json). Acceptance: 9/9 bugs found, 0 decoys fired.
 
     benchmark_seeded.py run [--project sNN_name ...] [--fuzz-budget 30] [--work-dir DIR] [--run-id ID]
                             [--corpus DIR] [--dry-run]
@@ -20,12 +20,15 @@ Host side (`run`), per project, every stage through the real wrapper (scripts/be
   4. pipeline_make.py build-check (which checkpoints Phase 0 when it passes), run fuzz, run eva, run
      coverage reach-dynamic, run ingest, as `benchmark.py run` does.
 
-Container side (`inner`): Phase 0 as `benchmark.py inner-phase0` runs it (run metadata, overlay, DAG from
-the model, so its modules are link units, reach gate, ledger seed, validation, checkpoint state, Make
-generation), with the manifest's pinned harnesses replaced by the fixed mechanical harness policy below,
-so only what Phase 0 reports decides what gets fuzzed and analysed.
+Container side (`inner`): Phase 0 as `benchmark.py inner-phase0` runs it (run metadata, overlay, the
+target's shipped fuzz assets discovered and imported (scripts/fuzz_assets.py `discover`, `import`; a
+failure there is recorded and Phase 0 goes on without them), DAG from the model, so its modules are link
+units, reach gate, ledger seed, validation, checkpoint state, Make generation), with the manifest's pinned
+harnesses replaced by the fixed mechanical harness policy below, so only what Phase 0 reports decides what
+gets fuzzed and analysed. Only the automatic (OSS-Fuzz naming) corpus mappings apply: no agent maps the
+rest.
 
-Harness policy (deterministic; a function of the DAG and the overlay's sources only):
+Harness policy (deterministic; a function of the DAG, the overlay's sources and fuzz_assets.json only):
 
   - one harness module per DAG module (a link unit with the model, a lexer module without it), named as
     the module: a `dispatch` harness with one case per callable entry point (the module's
@@ -43,7 +46,13 @@ Harness policy (deterministic; a function of the DAG and the overlay's sources o
     other parameter makes the entry point unsupported;
   - every entry point the policy does not call is exempted at the reachability gate with the policy's
     reason (in its harness sidecar, or the whole module when it got no harness), so the gate only fails
-    on a harness that does not reach what it calls.
+    on a harness that does not reach what it calls;
+  - then, in fuzzer id order, one additional target fuzz module `tf_<id>` per `usable` fuzzer of
+    workspace/reports/fuzz_assets.json (generate_harness.py `--target-fuzzer`): its `--unit` is the DAG
+    module defining the most of the fuzzer's `direct_api_calls` (ties: the first by name; none: no
+    module, with the reason recorded), and it compiles that unit's harness sources plus the fuzzer source
+    with the unit's flags. It is additive: the unit keeps its own harness, and its fuzz budget is set
+    like the others'.
 
 Scoring (per project, from workspace/reports/{fuzz,eva}): each bug is found by fuzzing (a fuzz artifact
 in its file and function), found by Eva (an Invalid alarm there), flagged by Eva (an Unknown obligation at
@@ -84,6 +93,7 @@ PROFILE = "standard"
 TARGET_EXCLUDES = ("repro", "truth.json")  # the reproducers and the answers stay out of the target
 
 DAG = Path("workspace/reports/callgraph_dag.json")
+FUZZ_ASSETS = Path("workspace/reports/fuzz_assets.json")
 HARNESS_DIR = Path("workspace/harnesses")
 WORK = "workspace/work"
 _PATH_OPTS = ("-iquote", "-isystem", "-idirafter", "-include", "-imacros", "-I")
@@ -337,18 +347,93 @@ def generate_argv(module: str, plan: dict, cases: list[tuple[str, str, str]], he
     return argv
 
 
+def _module_defines(dag: dict, module: str) -> set[str]:
+    """Names of the non-static functions a DAG module defines."""
+    fns: dict[str, dict] = dag.get("functions") or {}
+    rec = (dag.get("modules") or {}).get(module) or {}
+    keys = rec.get("functions") or [k for k, f in fns.items() if f.get("module") == module]
+    return {_fn_name(k, fns.get(k) or {}) for k in keys if not (fns.get(k) or {}).get("is_static")}
+
+
+def plan_target_fuzzers(dag: dict, assets: dict, plans: dict[str, dict]) -> dict[str, dict]:
+    """
+    The policy's target fuzz modules: `tf_<id>` -> {fuzzer, path, work_path, unit, sources, cppflags}, or
+    {fuzzer, path, reason} for a fuzzer that gets none. One per fuzzer row, in id order; deterministic.
+    """
+    modules: dict[str, dict] = dag.get("modules") or {}
+    fuzzers = [f for f in assets.get("fuzzers") or [] if isinstance(f, dict) and f.get("id")]
+    work_paths = {str(f.get("work_path") or f"{WORK}/{f.get('path')}") for f in fuzzers}
+    out: dict[str, dict] = {}
+    for fz in sorted(fuzzers, key=lambda f: str(f["id"])):
+        fid = str(fz["id"])
+        module = f"tf_{fid}"
+        work_path = str(fz.get("work_path") or f"{WORK}/{fz.get('path')}")
+        row: dict[str, Any] = {"fuzzer": fid, "path": fz.get("path"), "work_path": work_path}
+        calls = {str(c) for c in fz.get("direct_api_calls") or []}
+        defined = {m: len(calls & _module_defines(dag, m)) for m in sorted(modules)}
+        unit = max(defined, key=lambda m: defined[m], default="")  # the first by name on a tie
+        if module in out or module in plans or module in modules:
+            row["reason"] = f"module name {module} is already taken"
+        elif fz.get("status") != "usable":
+            row["reason"] = f"fuzzer {fz.get('status') or 'unknown'}: {fz.get('reason') or 'no reason given'}"
+        elif not calls:
+            row["reason"] = "the fuzzer calls no function with its input"
+        elif not unit or not defined[unit]:
+            row["reason"] = f"no DAG module defines what the fuzzer calls ({', '.join(sorted(calls))})"
+        else:
+            unit_plans = [p for _, p in sorted(plans.items()) if p.get("unit") == unit]
+            sources = unit_plans[0]["sources"] if unit_plans else module_sources(dag, modules[unit])
+            cppflags = (
+                unit_plans[0]["cppflags"] if unit_plans else harness_cppflags(modules[unit].get("cppflags") or [])
+            )
+            # Other fuzzers' sources stay out: each defines LLVMFuzzerTestOneInput too.
+            sources = [s for s in sources if s not in work_paths]
+            if not sources:
+                row["reason"] = f"unit {unit} has no sources"
+            else:
+                row.update(unit=unit, sources=[*sources, work_path], cppflags=cppflags)
+        out[module] = row
+    return out
+
+
+def target_fuzzer_argv(module: str, plan: dict) -> list[str]:
+    """generate_harness.py arguments of one target fuzz module (`--target-fuzzer`, additive to its unit)."""
+    return [
+        sys.executable,
+        str(SCRIPTS_DIR / "generate_harness.py"),
+        "--target-fuzzer",
+        plan["work_path"],
+        "--target-fuzzer-id",
+        plan["fuzzer"],
+        f"--unit={plan['unit']}",
+        "--module",
+        module,
+        "--sources",
+        *plan["sources"],
+        f"--cppflags={plan['cppflags']}",
+        "--out-dir",
+        str(HARNESS_DIR),
+        "--header",
+        "none",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Container side
 # ---------------------------------------------------------------------------
 
 
-def apply_policy(dag: dict, step: Any) -> dict:
-    """Generate the policy's harnesses and record its exemptions; the policy report per harness module."""
+def apply_policy(dag: dict, step: Any, assets: dict | None = None) -> dict:
+    """
+    Generate the policy's harnesses and record its exemptions, then its target fuzz modules (from
+    `assets`, else workspace/reports/fuzz_assets.json when there is one); the policy report per module.
+    """
     import harness_reach
 
     fns: dict[str, dict] = dag.get("functions") or {}
     report: dict[str, dict] = {}
-    for module, plan in plan_harnesses(dag).items():
+    plans = plan_harnesses(dag)
+    for module, plan in plans.items():
         excluded = dict(plan["excluded"])
         info: dict[str, Any] = {
             "unit": plan["unit"],
@@ -377,6 +462,26 @@ def apply_policy(dag: dict, step: Any) -> dict:
         else:
             for key, why in sorted(excluded.items()):
                 harness_reach.record_exempt(HARNESS_DIR, module, key, f"seeded harness policy: {why}", DAG)
+        report[module] = info
+    if assets is None:
+        assets = benchmark.read_json(FUZZ_ASSETS, {}) or {}
+    for module, tf in plan_target_fuzzers(dag, assets, plans).items():
+        # Additive: no exemption either way (the gate checks the module's own roots, never the unit's).
+        reason = str(tf.get("reason") or "")
+        if not reason and not step(f"harness:{module}", target_fuzzer_argv(module, tf)):
+            reason = "generate_harness.py failed"
+        info = {
+            "unit": tf.get("unit"),
+            "submodule": True,
+            "sources": tf.get("sources") or [],
+            "cppflags": tf.get("cppflags") or "",
+            "target_fuzzer": {"id": tf["fuzzer"], "path": tf.get("path")},
+            "harness": not reason,
+            "cases": [] if reason else ["LLVMFuzzerTestOneInput"],
+            "excluded": {},
+        }
+        if reason:
+            info["reason"] = reason
         report[module] = info
     return report
 
@@ -409,6 +514,16 @@ def inner(repo: str, fuzz_budget: int) -> int:
         ok = ok and step(
             "overlay", [py, script("workspace_overlay.py"), "init", "--target", "/target", "--overlay", "workspace"]
         )
+        if ok:
+            # The target's shipped fuzz targets and corpora are an improvement, never a requirement: a
+            # failure is recorded (optional) and Phase 0 goes on without them.
+            assets_ok = step("fuzz_assets_discover", [py, script("fuzz_assets.py"), "discover", "--target", "/target"])
+            assets_ok = assets_ok and step(
+                "fuzz_assets_import", [py, script("fuzz_assets.py"), "import", "--target", "/target"]
+            )
+            if not assets_ok:
+                steps[-1]["optional"] = True
+            result["fuzz_assets"] = assets_ok
         ok = ok and step(
             "dag",
             [

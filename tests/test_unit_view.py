@@ -353,6 +353,21 @@ def test_module_map_resolves_sub_modules_to_their_unit() -> None:
     assert mm.is_submodule("decode") and not mm.is_submodule("kvtool")
 
 
+def test_target_fuzz_module_never_stands_in_for_its_unit() -> None:
+    # `tf_a` sorts before `decode`, but a target fuzz module answers for no entry point.
+    sidecars = _sidecars()
+    sidecars["tf_a"] = {
+        "unit": "libkv_a",
+        "scope_files": ["workspace/work/fuzz/a.c"],
+        "target_fuzzer": {"id": "a", "source": "workspace/work/fuzz/a.c", "initialize": False},
+    }
+    mm = module_map.ModuleMap(_units(), sidecars)
+    assert "tf_a" in mm.submodules("libkv_a")
+    assert mm.harness_module_for("libkv_a") == "decode"
+    only_tf = {"tf_a": sidecars["tf_a"]}
+    assert module_map.ModuleMap(_units(), only_tf).harness_module_for("libkv_a") is None
+
+
 def test_module_map_scope_tier_and_flags() -> None:
     mm = module_map.ModuleMap(_units(), _sidecars())
     assert mm.scope_functions("decode") == ["dec_run", "dec_step"]

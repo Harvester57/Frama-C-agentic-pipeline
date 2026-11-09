@@ -1,0 +1,39 @@
+{
+  "description": "Record container parser: a header guarded by a magic, a CRC-32 and a version, then typed records; the scale record's index is checked against the wrong bound. The project ships a libFuzzer target and its seed corpus, and no test suite",
+  "mechanism": "shipped_corpus",
+  "build": "make",
+  "bugs": [
+    {
+      "id": "S09-1",
+      "mechanism": "shipped_corpus",
+      "file": "src/rcf.c",
+      "function": "rec_scale",
+      "line": 20,
+      "kind": "mem_access",
+      "trigger": "rcf_parse on a frame with a valid header (magic RCF1, version 1, 1..8 records, CRC-32 of the first 8 bytes in bytes 8-11) holding a scale record (type 3, length 3) whose index byte is 6: rec_scale checks idx > RCF_SCALES instead of idx >= RCF_SCALES and reads rcf_scale[6], one past the 6-entry global table"
+    }
+  ],
+  "decoys": [],
+  "entry_points": [
+    "src/rcf.c#rcf_crc32",
+    "src/rcf.c#rcf_parse"
+  ],
+  "fuzz_assets": {
+    "fuzzers": ["fuzz/fuzz_parse.c"],
+    "corpora": ["fuzz/fuzz_parse_seed_corpus.zip"],
+    "note": "fuzz/fuzz_parse.c defines LLVMFuzzerTestOneInput and calls rcf_parse(data, size); it is not in the Makefile. fuzz/fuzz_parse_seed_corpus.zip (OSS-Fuzz naming, so discovery pairs it with the fuzzer) holds three valid frames: name_only, value_scale and name_scale_max. name_scale_max has a scale record with index 5, one byte away from S09-1; no corpus input triggers the bug itself."
+  },
+  "lexer_expected": "Control case for the shipped fuzz assets, not a lexer weakness: modules and entry points are right for both Phase 0s. The CRC-32 is compared through an XOR with zero, so libFuzzer's compare tables cannot repair it, and a short campaign from an empty corpus never gets past the header (checked: 40M executions in 30 s, no crash). There is no test suite, so no seeds are recorded; the bug is found only from the shipped seed corpus, imported by fuzz_assets.py, which needs one byte changed to reach it.",
+  "trust": {
+    "rule": "step I7, no threat model: a library alone (the fuzz target is not built), so its API is untrusted (default, boundary) and every other function trusted (default)",
+    "untrusted": {
+      "src/rcf.c#rcf_crc32": [
+        "default"
+      ],
+      "src/rcf.c#rcf_parse": [
+        "default"
+      ]
+    },
+    "boundary": ["src/rcf.c#rcf_crc32", "src/rcf.c#rcf_parse"]
+  }
+}

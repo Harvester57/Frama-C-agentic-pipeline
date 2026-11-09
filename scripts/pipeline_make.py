@@ -398,9 +398,12 @@ class ModulePlan:
     # A recorded decision current for these settings and the last base run's inputs: `eva-<mod>` then
     # replays the tuning (base run, recorded rungs, combination) instead of one run of the selected options.
     eva_replay: bool = False
+    # Why the module never runs Eva although its DAG record schedules it (a target fuzz module), or None.
+    eva_off: str | None = None
 
     def to_json(self) -> dict:
         return {
+            **({"eva_off": self.eva_off} if self.eva_off else {}),
             "tier": self.tier,
             "fuzz": self.fuzz,
             "eva": self.eva,
@@ -506,11 +509,12 @@ class Plan:
     def unit_harness_modules(self, module: str | None) -> list[str]:
         """
         The harness modules standing for a ledger unit's `module`: none when it has a harness of its
-        own (or is no DAG module), else the sub-modules of the link unit.
+        own (or is no DAG module), else the sub-modules of the link unit. A target fuzz module never
+        stands for its unit (it is additive).
         """
         if not module or module in self.mm.sidecars or module not in self.dag_modules:
             return []
-        return [s for s in self.mm.submodules(module) if s != module]
+        return [s for s in self.mm.submodules(module) if s != module and not is_target_fuzzer(self.mm.sidecars.get(s))]
 
     def wp_cppflags_for(self, module: str | None) -> tuple[list[str] | None, str]:
         """
@@ -658,10 +662,28 @@ def _source_defines_main(path: Path) -> bool:
     return bool(_MAIN_DEF_RE.search(cleaned))
 
 
+TARGET_FUZZER_EVA_OFF = (
+    "target fuzz module (sidecar target_fuzzer): it wraps the target's own fuzz function, so it is "
+    "fuzzed and measured for coverage only; Eva runs from its unit's own harness"
+)
+
+
+def is_target_fuzzer(sidecar: dict | None) -> bool:
+    """Whether a harness sidecar is a target fuzz module's (`tf_<id>`, generate_harness.py --target-fuzzer)."""
+    return isinstance((sidecar or {}).get("target_fuzzer"), dict)
+
+
 def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     fuzz, eva = bool(dag_mod.get("run_eacsl_fuzz")), bool(dag_mod.get("run_eva"))
     if not MODULE_RE.match(name) or name in _RESERVED_MODULES:
         raise _Excluded("module name cannot be used in make targets and report paths")
+    target_fuzzer = is_target_fuzzer(plan.mm.sidecars.get(name))
+    if target_fuzzer:
+        eva = False
+        if not fuzz:
+            raise _Excluded(
+                "the DAG does not schedule its unit for fuzzing (run_eacsl_fuzz is false): " + TARGET_FUZZER_EVA_OFF
+            )
     if not (fuzz or eva):
         raise _Excluded("the DAG schedules neither fuzzing nor Eva (run_eacsl_fuzz and run_eva are false)")
     sidecar = _load_sidecar(plan.run_dir, name)
@@ -745,6 +767,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         # generate_harness.py --cppflags if the module does not build.
         dag_cppflags_missing=[t for t in dag_flags if t not in _joined_forms(base)],
         loop_unroll=loop_unroll_level(sidecar.get("max_input_size")),
+        eva_off=TARGET_FUZZER_EVA_OFF if target_fuzzer else None,
     )
     missing = [s for s in sources if not (plan.run_dir / s if not s.startswith("/") else Path(s)).is_file()]
     if missing:
@@ -932,7 +955,9 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
 
 
 def harness_case_count(sidecar: dict | None) -> int:
-    """Cases of a harness: its dispatch cases, else 1."""
+    """Cases of a harness: its dispatch cases, else 1 (always 1 for a target fuzz module: one fuzz function)."""
+    if is_target_fuzzer(sidecar):
+        return 1
     cases = (sidecar or {}).get("dispatch_cases")
     n = len([c for c in cases if isinstance(c, str) and c.strip()]) if isinstance(cases, list) else 0
     return max(1, n)
@@ -1010,6 +1035,9 @@ def _harness_record(mm: ModuleMap, name: str, dag_modules: dict[str, dict]) -> d
     if unit_rec.get("fuzz_engine"):
         # The unit's engine (the fallback, or setjmp/longjmp: route_nonlocal_jumps) is its harnesses'.
         rec.update(fuzz_engine=unit_rec["fuzz_engine"], fuzz_engine_reason=unit_rec.get("fuzz_engine_reason"))
+    if is_target_fuzzer(mm.sidecars.get(name)):
+        # Fuzz and coverage only: no Eva report is expected of it (Plan.expected).
+        rec["run_eva"] = False
     return rec
 
 

@@ -113,7 +113,7 @@ from framac_common import (  # noqa: E402
     scan_undeclared_functions,
     utc_now,
 )
-from generate_harness import DISPATCH_SKIP_MACRO  # noqa: E402
+from generate_harness import DISPATCH_SKIP_MACRO, TARGET_EMBEDDED_PREFIX  # noqa: E402
 from resources import (  # noqa: E402
     CLASSES,
     FUZZ_RSS_LIMIT_MB,
@@ -398,6 +398,15 @@ def _resolve_function_at_line(file_path: str, line: int) -> str:
     return "unknown_function"
 
 
+def is_harness_fuzz_function(name: str) -> bool:
+    """
+    The harness's own fuzz entry, or a target fuzzer's hook it calls (renamed with the
+    `__framac_target_embedded_` prefix by generate_harness.py --target-fuzzer): harness code, so never
+    selected for RTE/E-ACSL and never a crash location.
+    """
+    return name == "LLVMFuzzerTestOneInput" or name.startswith(TARGET_EMBEDDED_PREFIX)
+
+
 def _parse_segment_failure(text: str) -> dict | None:
     """E-ACSL segment-model runtime message; location from the first non-runtime stack frame, if any."""
     seg = _SEGMENT_RE.search(text)
@@ -408,7 +417,7 @@ def _parse_segment_failure(text: str) -> dict | None:
     file_, line_, function = "unknown", 0, "unknown_function"
     for m in _STACK_FRAME_RE.finditer(text):
         fn, fpath = m.group("function"), m.group("file")
-        if is_runtime_function(fn, fpath) or Path(fpath).name.startswith("harness_") or fn == "LLVMFuzzerTestOneInput":
+        if is_runtime_function(fn, fpath) or Path(fpath).name.startswith("harness_") or is_harness_fuzz_function(fn):
             continue
         file_, line_, function = fpath, int(m.group("line")), fn
         break
@@ -509,7 +518,9 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         m
         for m in frames
         if not Path(m.group("file")).name.startswith("harness_")
-        and not m.group("function").startswith(("__interceptor_", "__asan_", "LLVMFuzzerTestOneInput"))
+        and not m.group("function").startswith(
+            ("__interceptor_", "__asan_", "LLVMFuzzerTestOneInput", TARGET_EMBEDDED_PREFIX)
+        )
     ]
     candidates = non_harness_frames or frames
     best_frame: re.Match[str] | None = candidates[0] if candidates else None
@@ -616,7 +627,8 @@ def _discover_slice_functions(
                 # validation ("no function 'void'"), which aborts the whole instrumentation.
                 if (
                     name
-                    and name not in ("eva_main", "LLVMFuzzerTestOneInput", "main")
+                    and name not in ("eva_main", "main")
+                    and not is_harness_fuzz_function(name)
                     and name not in TYPE_MODIFIERS_AND_PRIMITIVES
                 ):
                     discovered.add(name)
@@ -1645,7 +1657,54 @@ def resolve_campaign_dictionary(
     if not auto:
         return None, {"path": None, "auto": False, "reason": "disabled by --no-auto-dict"}
     info = build_auto_dictionary(sources, auto_dictionary_path(module, corpus_dir), cppflags)
+    extra = extra_dictionary_path(module)
+    if extra is not None and extra.is_file():
+        info = merge_extra_dictionary(info, extra)
     return (Path(info["path"]) if info.get("path") else None), info
+
+
+def extra_dictionary_path(module: str) -> Path | None:
+    """The target's shipped dictionary for `module` (workspace/dicts/<module>.extra.dict, scripts/fuzz_assets.py)."""
+    return AUTO_DICT_DIR / f"{_dict_stem(module)}.extra.dict" if module else None
+
+
+def _dictionary_entry_lines(text: str) -> list[str]:
+    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def merge_extra_dictionary(info: dict, extra: Path) -> dict:
+    """
+    Append the entries of the target's shipped dictionary `extra` to the auto-dictionary `info` describes
+    (identical lines once) and record `extra_entries`. Without an auto-dictionary, `extra` is used alone.
+    Never raises: an unreadable `extra` leaves `info` as it was, with an `extra_reason`.
+    """
+    info = dict(info)
+    try:
+        extra_lines = list(dict.fromkeys(_dictionary_entry_lines(extra.read_text(encoding="utf-8", errors="replace"))))
+    except OSError as exc:
+        info["extra_reason"] = f"could not read {extra.as_posix()}: {exc}"
+        return info
+    auto_path = Path(info["path"]) if info.get("path") else None
+    if auto_path is None:
+        info.update({"path": extra.as_posix(), "entries": len(extra_lines), "extra_entries": len(extra_lines)})
+        return info
+    try:
+        auto_text = auto_path.read_text(encoding="utf-8", errors="replace")
+        seen = set(_dictionary_entry_lines(auto_text))
+        added = [ln for ln in extra_lines if ln not in seen]
+        content = auto_text if auto_text.endswith("\n") or not auto_text else auto_text + "\n"
+        content += "".join(f"{ln}\n" for ln in added)
+        fd, tmp_name = tempfile.mkstemp(dir=str(auto_path.parent), prefix=".tmp_", suffix=".dict")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        os.replace(tmp_name, auto_path)
+    except OSError as exc:
+        info["extra_reason"] = f"could not merge {extra.as_posix()}: {exc}"
+        return info
+    info["entries"] = int(info.get("entries") or 0) + len(added)
+    info["extra_entries"] = len(added)
+    info["sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return info
 
 
 def run_fuzz_campaign(

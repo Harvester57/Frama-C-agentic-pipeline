@@ -1,0 +1,103 @@
+{
+  "$comment": "Contract for workspace/reports/fuzz_assets.json, written by scripts/fuzz_assets.py (discover, map, import): the fuzz targets (`LLVMFuzzerTestOneInput` sources) and fuzz corpora the analysed target ships, corpora dropped into the run directory (inputs/corpora/<name>/, kind run_input), how corpora are paired with fuzzers or API functions (`source: auto` from OSS-Fuzz naming, `agent` from `fuzz_assets.py map`), and what `import` kept of each corpus under workspace/fuzz_assets/corpora/<id>/. Fuzzer and corpus paths are posix, relative to the target root (run inputs: relative to the run directory). Fuzz assets are an improvement, never a requirement of Phase 0 or Phase 1.",
+  "type": "object",
+  "definitions": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9_.+-]{1,120}$"},
+    "name_or_null": {"type": ["string", "null"]},
+    "count": {"type": "integer", "minimum": 0},
+    "fuzzer": {
+      "type": "object",
+      "properties": {
+        "id": {"$ref": "#/definitions/id"},
+        "path": {"type": "string", "minLength": 1},
+        "work_path": {"type": "string", "minLength": 1},
+        "language": {"type": "string", "enum": ["c", "cxx"]},
+        "defines_initialize": {"type": "boolean"},
+        "data_param": {"$ref": "#/definitions/name_or_null"},
+        "size_param": {"$ref": "#/definitions/name_or_null"},
+        "direct_api_calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "dict": {"$ref": "#/definitions/name_or_null"},
+        "options": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "properties": {
+                "max_len": {"type": ["integer", "null"], "minimum": 1},
+                "dict": {"$ref": "#/definitions/name_or_null"}
+              },
+              "required": ["max_len", "dict"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "status": {"type": "string", "enum": ["usable", "unsupported"]},
+        "reason": {"$ref": "#/definitions/name_or_null"},
+        "suggested_max_input_size": {"type": "integer", "minimum": 4096, "maximum": 1048576}
+      },
+      "required": ["id", "path", "work_path", "language", "defines_initialize", "data_param", "size_param", "direct_api_calls", "dict", "options", "status", "reason", "suggested_max_input_size"],
+      "additionalProperties": false
+    },
+    "imported": {
+      "type": "object",
+      "properties": {
+        "kept": {"$ref": "#/definitions/count"},
+        "bytes": {"$ref": "#/definitions/count"},
+        "max_input_bytes": {"$ref": "#/definitions/count"},
+        "dropped": {
+          "type": "object",
+          "properties": {
+            "too_large": {"$ref": "#/definitions/count"},
+            "over_cap": {"$ref": "#/definitions/count"},
+            "empty": {"$ref": "#/definitions/count"},
+            "symlink": {"$ref": "#/definitions/count"},
+            "not_regular": {"$ref": "#/definitions/count"},
+            "unreadable": {"$ref": "#/definitions/count"}
+          },
+          "required": ["too_large", "over_cap", "empty", "symlink", "not_regular", "unreadable"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["kept", "bytes", "max_input_bytes", "dropped"],
+      "additionalProperties": false
+    },
+    "corpus": {
+      "type": "object",
+      "properties": {
+        "id": {"$ref": "#/definitions/id"},
+        "path": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "enum": ["zip", "dir", "run_input"]},
+        "files": {"$ref": "#/definitions/count"},
+        "bytes": {"$ref": "#/definitions/count"},
+        "imported": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/imported"}]},
+        "dir": {"$ref": "#/definitions/name_or_null"}
+      },
+      "required": ["id", "path", "kind", "files", "bytes", "imported", "dir"],
+      "additionalProperties": false
+    },
+    "mapping": {
+      "type": "object",
+      "properties": {
+        "corpus": {"$ref": "#/definitions/id"},
+        "fuzzer": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/id"}]},
+        "functions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "ignored": {"type": "boolean"},
+        "reason": {"$ref": "#/definitions/name_or_null"},
+        "source": {"type": "string", "enum": ["auto", "agent"]}
+      },
+      "required": ["corpus", "fuzzer", "functions", "ignored", "reason", "source"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "target": {"type": "string", "minLength": 1},
+    "fuzzers": {"type": "array", "items": {"$ref": "#/definitions/fuzzer"}},
+    "corpora": {"type": "array", "items": {"$ref": "#/definitions/corpus"}},
+    "mappings": {"type": "array", "items": {"$ref": "#/definitions/mapping"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["schema_version", "generated_at", "target", "fuzzers", "corpora", "mappings", "warnings"],
+  "additionalProperties": false
+}

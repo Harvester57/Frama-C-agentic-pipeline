@@ -12,7 +12,8 @@ leading scalars.
 Each project holds a `truth.json` (bugs, decoys, entry points, verified lexer
 behavior) and a `repro/` directory: `driver.c` (byte 0 selects the API
 function; the rest is copied to an exact-size heap buffer), `S0N-K.bin` (bug
-input), `benign-*.bin` and, for s03, `decoy-D1.bin`. `repro/` is not part of
+input), `benign-*.bin` and, for s03, `decoy-D1.bin`. s09 also ships `fuzz/` (a fuzz target and its
+seed corpus), which `make` does not build; it stays in the target. `repro/` is not part of
 `make`; leave it out of the target handed to the pipeline (with it, the lexer's
 modules for the library are unchanged; checked).
 
@@ -26,6 +27,7 @@ modules for the library are unchanged; checked).
 | `s06_cross_dir` | cross_dir (control) | S06-1 `compat/b64.c:33` `b64_decode`: checks `o >= cap` and then writes 3 bytes; `ip=` + 8 base64 chars overflows `ip[4]` | D1 harness_induced: `compat/b64.c#load_be32` | Correct sources (`compat/b64.c` + `src/msg.c`), so the bug is reachable. Offers `b64_decode` and `load_be32` (module `compat`); `load_be32` crashes when called directly. |
 | `s07_static_collision` | static_collision (control) | S07-1 `src/frame.c:10` static `at`: `i <= n` reads `buf[len]` when the header length byte is greater than the input length | none | Reports the `at` collision and keeps only `src/stats.c#at` (the safe one); `header_digest` → `at` points to the wrong file. Modules and entry points are right, so the bug is still reachable. |
 | `s08_wellformed_input` | wellformed_input (control, step I6) | S08-1 `src/sdf.c:18` `ext_name`: the name extension's length is checked against `SDF_NAME_MAX` (32) and copied into an 8-byte stack buffer; reachable only behind a valid header (magic `SDF1`, Fletcher-16 compared through an XOR with zero, version 2, 1..8 extensions) | none | Modules and entry points are right. The checksum defeats libFuzzer's compare tables, so a short campaign from an empty corpus misses the bug; seeds recorded from `./sdf_test` (sealed frames with short names) are one length byte away from it. |
+| `s09_shipped_corpus` | shipped_corpus (control, fuzz assets) | S09-1 `src/rcf.c:20` `rec_scale`: the scale index is checked with `idx > RCF_SCALES` and reads `rcf_scale[6]`, one past the 6-entry global table; reachable only behind a valid header (magic `RCF1`, CRC-32 of the first 8 bytes compared through an XOR with zero, version 1, 1..8 records) | none | Modules and entry points are right. There is no test suite, so no seeds are recorded. The project ships `fuzz/fuzz_parse.c` (`LLVMFuzzerTestOneInput` calling `rcf_parse(data, size)`, not in the Makefile) and `fuzz/fuzz_parse_seed_corpus.zip` (three valid frames; `name_scale_max` has scale index 5, one byte away from the bug): only a campaign from the imported corpus reaches S09-1. |
 
 Per mechanism, what the correct extractor must do:
 
@@ -34,6 +36,8 @@ Per mechanism, what the correct extractor must do:
 - **force_include**: compile with `-include config.h`.
 - **api_internal**: take entry points from `include/` (so `kv_key_equals` is one).
 - **wellformed_input**: record seeds from the project's tests (`truth.json` `test`).
+- **shipped_corpus**: discover and import the target's shipped fuzz assets (`scripts/fuzz_assets.py`), and fuzz its
+  fuzz target (module `tf_<id>`) or the API harness from that corpus.
 - **Decoys**: never offer a D1 helper (not declared in `include/`) or a function that is not compiled.
 
 ## Verification
@@ -57,3 +61,9 @@ Decoys and lexer-flag builds:
 - s04 (no `-include config.h`): S04-1 exits 0. `be16_at(1000, buf4, 4)` overflows at `bytes.c:6`.
 - s06: `load_be32` on a 1-byte buffer overflows at `b64.c:53`.
 - s08: `make` also builds `sdf_test`, which prints `OK` and exits 0; `repro/S08-1.bin` aborts with a stack-buffer-overflow at `sdf.c:18` in `ext_name`, and `benign-1.bin` exits 0. Random inputs were not run: the checksum rejects them before the bug.
+- s09 (checked in `framac-analysis:latest`, whose clang has the sanitizer runtimes): `make` builds `librcf.a` only, with no
+  warnings; `repro/S09-1.bin` aborts with a UBSan `index 6 out of bounds for type 'const uint32_t[6]'` at `rcf.c:20` in
+  `rec_scale`; `benign-1.bin`, `benign-2.bin` and the three seed-corpus inputs (as `rcf_parse` calls) exit 0; 300 random
+  inputs cause no abort. `clang -fsanitize=fuzzer,address,undefined src/rcf.c fuzz/fuzz_parse.c` ran 40M inputs in 30 s
+  from an empty corpus without passing the header (cov 12), and crashed at `rcf.c:20` within the first seconds from the
+  unzipped seed corpus. The zip is written deterministically (stored entries, fixed timestamps).

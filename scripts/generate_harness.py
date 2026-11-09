@@ -493,18 +493,126 @@ def extract_function_declaration(
 
 
 _FUZZER_ENTRY_DEF_RE = re.compile(r"\bLLVMFuzzerTestOneInput\s*\([^;{)]*\)\s*\{")
+_FUZZER_INIT_DEF_RE = re.compile(r"\bLLVMFuzzerInitialize\s*\([^;{)]*\)\s*\{")
+
+# A target's own libFuzzer hooks, renamed by -D in the sidecar cppflags so the generated harness's
+# LLVMFuzzerTestOneInput (and the E-ACSL runtime's LLVMFuzzerInitialize, templates/eacsl_runtime/
+# fuzz_init.c, compiled without the cppflags) stay the only ones at link time. run_eacsl_fuzz.py treats
+# every name with this prefix as harness code (no RTE selection, never a crash location).
+TARGET_EMBEDDED_PREFIX = "__framac_target_embedded_"
+TARGET_EMBEDDED_ENTRY = f"{TARGET_EMBEDDED_PREFIX}LLVMFuzzerTestOneInput"
+TARGET_EMBEDDED_INIT = f"{TARGET_EMBEDDED_PREFIX}LLVMFuzzerInitialize"
+DEFAULT_MAX_INPUT_SIZE = 1500
+# A target fuzz module's input bound when neither --max-size nor fuzz_assets.json gives one.
+TARGET_FUZZER_DEFAULT_MAX_INPUT_SIZE = 4096
+_TARGET_FUZZER_ID_JUNK = re.compile(r"[^A-Za-z0-9_.+-]")
 
 
-def _source_defines_fuzzer_entry(src: str, cppflags: str = "-I.") -> bool:
-    """Return True if `src` defines `LLVMFuzzerTestOneInput(...) { ... }`."""
+def _source_defines(src: str, pattern: re.Pattern[str], cppflags: str = "-I.") -> bool:
     for p in _collect_prototype_search_paths(None, [src], cppflags):
         try:
             text = _strip_c_comments(p.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        if _FUZZER_ENTRY_DEF_RE.search(text):
+        if pattern.search(text):
             return True
     return False
+
+
+def _source_defines_fuzzer_entry(src: str, cppflags: str = "-I.") -> bool:
+    """Return True if `src` defines `LLVMFuzzerTestOneInput(...) { ... }`."""
+    return _source_defines(src, _FUZZER_ENTRY_DEF_RE, cppflags)
+
+
+def _source_defines_fuzzer_initialize(src: str, cppflags: str = "-I.") -> bool:
+    """Return True if `src` defines `LLVMFuzzerInitialize(...) { ... }`."""
+    return _source_defines(src, _FUZZER_INIT_DEF_RE, cppflags)
+
+
+def _read_target_fuzzer_text(src: str) -> str | None:
+    """The target fuzzer's text without comments: `src` itself, else under workspace/work/; None if missing."""
+    sp = Path(src.replace("\\", "/").strip())
+    for cand in (sp, Path("workspace/work") / sp):
+        if cand.is_file():
+            try:
+                return _strip_c_comments(cand.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                return None
+    return None
+
+
+def resolve_target_fuzzer_id(src: str, explicit: str | None = None) -> str:
+    """The target fuzz module's id: `explicit` (checked), else the source's stem with other chars as `_`."""
+    if explicit is not None:
+        if not explicit or _TARGET_FUZZER_ID_JUNK.search(explicit):
+            raise ValueError(f"invalid --target-fuzzer-id {explicit!r}: use only [A-Za-z0-9_.+-]")
+        return explicit
+    stem = Path(src.replace("\\", "/").strip()).stem
+    return _TARGET_FUZZER_ID_JUNK.sub("_", stem) or "fuzzer"
+
+
+def target_fuzzer_max_input_size(out_dir: Path, src: str, fuzzer_id: str | None = None) -> int:
+    """
+    A target fuzz module's `max_input_size` without --max-size: the `suggested_max_input_size` of its
+    row in workspace/reports/fuzz_assets.json (scripts/fuzz_assets.py; the row whose `work_path` is
+    `src`, else whose `id` is `fuzzer_id`), else TARGET_FUZZER_DEFAULT_MAX_INPUT_SIZE.
+    """
+    norm_src = _normalize_run_rel_dir(src)
+    for path in (out_dir.parent / "reports" / "fuzz_assets.json", Path("workspace/reports/fuzz_assets.json")):
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        rows = data.get("fuzzers") if isinstance(data, dict) else None
+        rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        match = next(
+            (
+                r
+                for r in rows
+                if isinstance(r.get("work_path"), str) and _normalize_run_rel_dir(r["work_path"]) == norm_src
+            ),
+            None,
+        )
+        if match is None and fuzzer_id:
+            match = next((r for r in rows if r.get("id") == fuzzer_id), None)
+        size = match.get("suggested_max_input_size") if match else None
+        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+            return size
+        break
+    return TARGET_FUZZER_DEFAULT_MAX_INPUT_SIZE
+
+
+def _target_fuzzer_prelude(initialize: bool) -> str:
+    """Declarations (and the run-once LLVMFuzzerInitialize call) a target fuzz harness needs."""
+    lines = [
+        "/* Target fuzz module: the target's own fuzz target, renamed by -D in the sidecar cppflags. */",
+        f"int {TARGET_EMBEDDED_ENTRY}(const uint8_t *data, size_t size);",
+    ]
+    if initialize:
+        lines += [
+            f"int {TARGET_EMBEDDED_INIT}(int *argc, char ***argv);",
+            "static int __framac_target_initialized = 0;",
+            "static void __framac_target_initialize_once(void) {",
+            '    static char framac_target_argv0[] = "framac_target_fuzzer";',
+            "    static char *framac_target_argv[2] = {framac_target_argv0, NULL};",
+            "    int framac_target_argc = 1;",
+            "    char **framac_target_argvp = framac_target_argv;",
+            "    if (__framac_target_initialized) {",
+            "        return;",
+            "    }",
+            "    __framac_target_initialized = 1;",
+            f"    (void){TARGET_EMBEDDED_INIT}(&framac_target_argc, &framac_target_argvp);",
+            "}",
+        ]
+    return "\n".join(lines)
+
+
+def _target_fuzzer_invocation(initialize: bool) -> str:
+    """The call of the target's fuzz function on the harness's own copy of the input (both builds)."""
+    call = f"(void){TARGET_EMBEDDED_ENTRY}(fuzz_buf, fuzz_len);"
+    return f"__framac_target_initialize_once();\n    {call}" if initialize else call
 
 
 def extract_function_prototype(
@@ -1599,11 +1707,44 @@ def generate_module_harness(
     dispatch_cases: list[str] | None = None,
     unit: str | None = None,
     scope_files: list[str] | None = None,
+    target_fuzzer: str | None = None,
+    target_fuzzer_id: str | None = None,
 ) -> dict[str, Any]:
+    # A target fuzz module (--target-fuzzer): the harness calls the target's own fuzz function, renamed
+    # by -D (see the rename path below), on its own copy of the input. It answers for its fuzzer file only.
+    target_fuzzer_record: dict[str, Any] | None = None
+    target_fuzzer_snippet: str | None = None
+    if target_fuzzer is not None:
+        if self_harnessed:
+            raise ValueError("--target-fuzzer and --self-harnessed are mutually exclusive")
+        if not unit:
+            raise ValueError("--target-fuzzer requires --unit (the link unit the fuzzer exercises)")
+        tf_src = _normalize_run_rel_dir(target_fuzzer)
+        if Path(tf_src).suffix.lower() != ".c":
+            raise ValueError(f"--target-fuzzer {target_fuzzer!r}: only C fuzz targets (.c) are supported")
+        target_fuzzer_snippet = _read_target_fuzzer_text(tf_src)
+        if target_fuzzer_snippet is None:
+            raise ValueError(f"--target-fuzzer {target_fuzzer!r}: file not found")
+        if not _FUZZER_ENTRY_DEF_RE.search(target_fuzzer_snippet):
+            raise ValueError(f"--target-fuzzer {target_fuzzer!r} does not define LLVMFuzzerTestOneInput")
+        target_fuzzer_record = {
+            "id": resolve_target_fuzzer_id(tf_src, target_fuzzer_id),
+            "source": tf_src,
+            "initialize": bool(_FUZZER_INIT_DEF_RE.search(target_fuzzer_snippet)),
+        }
+        norm_given = [_normalize_run_rel_dir(s) for s in sources if isinstance(s, str) and s.strip()]
+        sources = list(sources) if tf_src in norm_given else [*sources, tf_src]
+        entry_fn = TARGET_EMBEDDED_ENTRY
+        entry_style = "buffer_len"
+        auto_args = False
+        scope_files = [tf_src]
     if auto_args:
         entry_style = "auto_prototype"
     # Reachability: explicit, else from the entry function's trust (step I7), else from the entry style.
+    # A target fuzz target takes untrusted input by definition.
     reachability_source = "explicit"
+    if reachability is None and target_fuzzer_record is not None:
+        reachability, reachability_source = "untrusted_surface", "target_fuzzer"
     if reachability is None:
         from_trust = _trust_reachability(out_dir, entry_fn, sources)
         if from_trust is not None:
@@ -1693,7 +1834,8 @@ def generate_module_harness(
     # The --header must actually declare the entry function. When it does not (e.g. the
     # public header while the entry lives in a module-internal header), find the header
     # in the -I directories that does declare it and include it alongside.
-    if norm_header and not effective_self_harnessed:
+    # A target fuzz module skips it: no header declares the renamed fuzz function.
+    if norm_header and not effective_self_harnessed and target_fuzzer_record is None:
         if extract_function_declaration(entry_fn, norm_header, None, norm_cppflags) is None:
             declaring = _find_declaring_header(
                 entry_fn, norm_cppflags, exclude={norm_header, *norm_extra_includes, *norm_compat_includes}
@@ -1726,6 +1868,13 @@ def generate_module_harness(
         auto_params=auto_params,
         dispatch_cases=dispatch_cases,
     )
+    if target_fuzzer_record is not None:
+        # The copy in fuzz_buf (never libFuzzer's `data`) is what E-ACSL's initialization checks need.
+        tf_call = _target_fuzzer_invocation(bool(target_fuzzer_record["initialize"]))
+        if effective_null_terminate:
+            eva_call, fuzz_call = _wrap_null_terminated(tf_call, tf_call)
+        else:
+            eva_call, fuzz_call = tf_call, tf_call
     norm_dispatch_cases = [c.strip() for c in dispatch_cases or [] if c and c.strip()]
     arity_expr = call_expr or eva_expr or fuzz_expr or " ".join(norm_dispatch_cases)
     if arity_expr:
@@ -1739,6 +1888,8 @@ def generate_module_harness(
         eva_expr,
         fuzz_expr,
         *norm_dispatch_cases,
+        # The unit functions the target's fuzzer calls pull in their sources too.
+        target_fuzzer_snippet,
     )
 
     inc_lines: list[str] = []
@@ -1751,22 +1902,30 @@ def generate_module_harness(
 
     embedded_fuzzer_in_sources = any(_source_defines_fuzzer_entry(s, norm_cppflags) for s in sources)
     rename_embedded_fuzzer = bool(embedded_fuzzer_in_sources and not effective_self_harnessed)
+    # A source's own LLVMFuzzerInitialize is renamed too: the E-ACSL init hook (fuzz_init.c) defines the
+    # real one, and the harness never does (a target fuzz harness calls the renamed one itself).
+    rename_embedded_init = bool(
+        not effective_self_harnessed and any(_source_defines_fuzzer_initialize(s, norm_cppflags) for s in sources)
+    )
 
     if include_source:
         for src in sources:
             src_path = Path(src.replace("\\", "/").strip())
+            renames = []
             if rename_embedded_fuzzer and _source_defines_fuzzer_entry(src, norm_cppflags):
-                inc_lines.append("#define LLVMFuzzerTestOneInput __framac_target_embedded_LLVMFuzzerTestOneInput")
-                inc_lines.append(f'#include "{src_path.name}"')
-                inc_lines.append("#undef LLVMFuzzerTestOneInput")
-            else:
-                inc_lines.append(f'#include "{src_path.name}"')
+                renames.append(("LLVMFuzzerTestOneInput", TARGET_EMBEDDED_ENTRY))
+            if rename_embedded_init and _source_defines_fuzzer_initialize(src, norm_cppflags):
+                renames.append(("LLVMFuzzerInitialize", TARGET_EMBEDDED_INIT))
+            inc_lines.extend(f"#define {name} {embedded}" for name, embedded in renames)
+            inc_lines.append(f'#include "{src_path.name}"')
+            inc_lines.extend(f"#undef {name}" for name, _ in renames)
     else:
         if rename_embedded_fuzzer:
-            norm_cppflags = _append_cppflag(
-                norm_cppflags, "-DLLVMFuzzerTestOneInput=__framac_target_embedded_LLVMFuzzerTestOneInput"
-            )
-        if not norm_header:
+            norm_cppflags = _append_cppflag(norm_cppflags, f"-DLLVMFuzzerTestOneInput={TARGET_EMBEDDED_ENTRY}")
+        if rename_embedded_init:
+            norm_cppflags = _append_cppflag(norm_cppflags, f"-DLLVMFuzzerInitialize={TARGET_EMBEDDED_INIT}")
+        # A target fuzz module's declarations come below, with its run-once initialization.
+        if not norm_header and target_fuzzer_record is None:
             if effective_self_harnessed:
                 inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
             else:
@@ -1775,6 +1934,8 @@ def generate_module_harness(
                     inc_lines.append(synth_decl)
         elif effective_self_harnessed:
             inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+    if target_fuzzer_record is not None:
+        inc_lines.append(_target_fuzzer_prelude(bool(target_fuzzer_record["initialize"])))
 
     if not inc_lines:
         inc_lines.append("/* No external module header required */")
@@ -1894,6 +2055,8 @@ def generate_module_harness(
         "reach_exempt": reach_exempt,
         **prelude_fields,
     }
+    if target_fuzzer_record is not None:
+        sidecar["target_fuzzer"] = dict(target_fuzzer_record)
     write_sidecar(harness_meta_file, sidecar)
 
     if (
@@ -1928,6 +2091,7 @@ def generate_module_harness(
         "reachability": reachability,
         "reachability_source": reachability_source,
         "scope_files": scope,
+        **({"target_fuzzer": dict(target_fuzzer_record)} if target_fuzzer_record is not None else {}),
         **prelude_fields,
     }
 
@@ -2007,7 +2171,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sources", nargs="+", help="List of C source files in the module slice")
     parser.add_argument("--header", default=None, help="Optional module header to include in harness (or 'none')")
     parser.add_argument("--entry-fn", help="Target entry function accepting (buf, len) or LLVMFuzzerTestOneInput")
-    parser.add_argument("--max-size", type=int, default=1500, help="Max symbolic/fuzzer buffer size in bytes")
+    parser.add_argument(
+        "--max-size",
+        type=int,
+        default=None,
+        help=(
+            f"Max symbolic/fuzzer buffer size in bytes (default: {DEFAULT_MAX_INPUT_SIZE}; with --target-fuzzer, "
+            "the fuzzer's suggested_max_input_size in workspace/reports/fuzz_assets.json, else "
+            f"{TARGET_FUZZER_DEFAULT_MAX_INPUT_SIZE})"
+        ),
+    )
     parser.add_argument("--cppflags", default="-I.", help="Extra preprocessor flags")
     parser.add_argument(
         "--ldflags",
@@ -2066,6 +2239,21 @@ def main(argv: list[str] | None = None) -> int:
         "--self-harnessed",
         action="store_true",
         help="Target already defines LLVMFuzzerTestOneInput; emit only eva_main in the generated harness",
+    )
+    parser.add_argument(
+        "--target-fuzzer",
+        default=None,
+        help=(
+            "A C fuzz target the analysed project ships (defines LLVMFuzzerTestOneInput, e.g. "
+            "workspace/work/fuzz/fuzz_parse.c): generate a target fuzz module whose harness calls it, renamed "
+            f"to {TARGET_EMBEDDED_ENTRY}, on a copy of the input; requires --unit; sets --entry-fn, "
+            "--entry-style buffer_len and --scope-file; adds the file to --sources"
+        ),
+    )
+    parser.add_argument(
+        "--target-fuzzer-id",
+        default=None,
+        help="Id of the --target-fuzzer recorded in the sidecar (default: the file's stem, chars [A-Za-z0-9_.+-])",
     )
     parser.add_argument(
         "--call-expr",
@@ -2152,7 +2340,7 @@ def main(argv: list[str] | None = None) -> int:
             result = generate(
                 module=args.module,
                 header=args.header,
-                max_input_size=args.max_size,
+                max_input_size=args.max_size if args.max_size is not None else DEFAULT_MAX_INPUT_SIZE,
                 cppflags=args.cppflags,
                 out_dir=args.out_dir,
                 unit=args.unit,
@@ -2168,7 +2356,28 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
         return 0
 
-    if not (args.module and args.sources and args.entry_fn):
+    if args.target_fuzzer is not None:
+        if args.self_harnessed:
+            parser.error("--target-fuzzer and --self-harnessed are mutually exclusive")
+        if not args.unit:
+            parser.error("--target-fuzzer requires --unit")
+        if not args.module:
+            parser.error("--target-fuzzer requires --module")
+        try:
+            tf_id = resolve_target_fuzzer_id(args.target_fuzzer, args.target_fuzzer_id)
+        except ValueError as exc:
+            parser.error(str(exc))
+        # The fuzzer's own file is a source; the entry function is its renamed fuzz function.
+        args.sources = list(args.sources or [])
+        args.entry_fn = TARGET_EMBEDDED_ENTRY
+        if args.max_size is None:
+            args.max_size = target_fuzzer_max_input_size(args.out_dir, args.target_fuzzer, tf_id)
+    elif args.target_fuzzer_id is not None:
+        parser.error("--target-fuzzer-id requires --target-fuzzer")
+    if args.max_size is None:
+        args.max_size = DEFAULT_MAX_INPUT_SIZE
+
+    if not (args.module and (args.sources or args.target_fuzzer) and args.entry_fn):
         parser.error("--module, --sources, and --entry-fn are required when generating a harness")
 
     effective_style = "auto_prototype" if args.auto_args else args.entry_style
@@ -2210,6 +2419,8 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_cases=args.dispatch_case,
             unit=args.unit,
             scope_files=args.scope_file,
+            target_fuzzer=args.target_fuzzer,
+            target_fuzzer_id=args.target_fuzzer_id,
         )
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

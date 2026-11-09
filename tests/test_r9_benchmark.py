@@ -171,7 +171,7 @@ def test_inner_phase0_steps_leave_the_phase0_checkpoint_to_build_check():
 def test_seeded_corpus_is_the_fixture_copy_and_the_scorer_accepts_it(tmp_path):
     assert bs.CORPUS == PHASE0_FIXTURES / "seeded"
     projects = bs.projects_in(bs.CORPUS)
-    assert len(projects) == 8
+    assert len(projects) == 9
     for proj in projects:
         truth = json.loads((proj / "truth.json").read_text(encoding="utf-8"))
         # Every bug found by a fuzz artifact at its site and no decoy fired: the scorer reads each truth.

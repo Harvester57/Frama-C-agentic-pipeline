@@ -106,22 +106,26 @@ selftest:
 
 # Seed inputs recorded from the target's tests (seed_harvest.py record, run in the build image after
 # the build capture) in each harness's case format: workspace/seeds/<mod>/. Rewritten from the records
-# before every campaign, so a repaired harness gets seeds in its new format. Seeds are an improvement,
-# never a requirement, hence the `-`.
+# before every campaign, so a repaired harness gets seeds in its new format. The corpora the target
+# ships (fuzz_assets.py import, Phase 0) are written the same way, per fuzzed module, as imported inputs
+# (imp-*) in workspace/imported_corpus/<mod>/. Seeds are an improvement, never a requirement, hence the `-`.
 seeds:
 	-$(RUN) --class light --key seeds -- $(PY) $(S)/seed_harvest.py write
+	-for m in $(FUZZ_MODULES); do $(RUN) --class light --key seeds -- $(PY) $(S)/fuzz_assets.py write --module $$m || true; done
 
 # One campaign per module. Its effort is a CPU-second budget spread over the workers the lease
 # allows (pipeline_make.py: per harness case, capped per unit and profile); FUZZ_MAX_TIME_<mod>
-# overrides the wall time. The module's seeds are a read-only extra corpus.
+# overrides the wall time. The module's seeds and its imported corpus (the target's shipped corpora,
+# fuzz_assets.py write) are read-only extra corpora; a missing one is skipped.
 fuzz: $(FUZZ_TARGETS)
 $(FUZZ_TARGETS): fuzz-%: selftest build-%
 	$(GATE) --module $* --need reach,build_check
 	-$(RUN) --class light --key $* -- $(PY) $(S)/seed_harvest.py write --module $*
+	-$(RUN) --class light --key $* -- $(PY) $(S)/fuzz_assets.py write --module $*
 	$(RUN) --class fuzz --key $* --output workspace/reports/fuzz/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py campaign --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
-		--extra-corpus workspace/seeds/$* \
+		--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
 		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) \
@@ -129,15 +133,15 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/reports/fuzz/$*.json
 
-# Which functions each module's corpus executes. It replays the corpus as it stands: a dependency
-# on fuzz-% would start a new campaign, because every target is phony.
+# Which functions each module's corpus executes (with its seeds and imported corpus). It replays the
+# corpus as it stands: a dependency on fuzz-% would start a new campaign, because every target is phony.
 coverage: $(COVERAGE_TARGETS)
 $(COVERAGE_TARGETS): coverage-%:
 	$(GATE) --module $* --need reach
 	$(RUN) --class replay --key $* --output workspace/reports/coverage/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py coverage --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/cov_$* --corpus-dir workspace/corpus/$* \
-		--extra-corpus workspace/seeds/$* \
+		--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \
 		--scratch-dir workspace/coverage/$* \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--out-json workspace/reports/coverage/$*.json

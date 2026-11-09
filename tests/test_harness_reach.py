@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 import harness_reach
+from framac_common import ArtifactError
 from generate_harness import _build_invocations, generate_module_harness
 
 TIER_1A = "Tier 1A (Untrusted Binary / Network Parser)"
@@ -466,3 +467,94 @@ def test_unexecuted_entry_point_reopens_the_gate_until_the_harness_changes(tmp_p
     assert harness_reach.main(["dynamic", "--module", "api"]) == 0
     _coverage(run, {}, status="error")
     assert harness_reach.main(["dynamic", "--module", "api"]) == 2
+
+
+# --- target fuzz modules (tf_<id>: the target's own fuzz function) ---------------------------
+
+TF_ENTRY = "__framac_target_embedded_LLVMFuzzerTestOneInput"
+
+
+def _add_target_fuzzer(
+    run: Path, fuzzer_text: str | None, unit: str = "libkv_a", name: str = "tf_fuzz_kv"
+) -> dict[str, Any]:
+    """A target fuzz module of `unit` around workspace/work/fuzz/fuzz_kv.c (not written when None)."""
+    src = "workspace/work/fuzz/fuzz_kv.c"
+    if fuzzer_text is not None:
+        (run / src).parent.mkdir(parents=True, exist_ok=True)
+        (run / src).write_text(fuzzer_text, encoding="utf-8")
+    hdir = run / "workspace/harnesses"
+    hdir.mkdir(parents=True, exist_ok=True)
+    (hdir / f"harness_{name}.c").write_text(
+        f'#include "{Path(src).name}"\nint LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n)'
+        f" {{ return {TF_ENTRY}(d, n); }}\n",
+        encoding="utf-8",
+    )
+    sidecar = {
+        "module": name,
+        "unit": unit,
+        "harness_file": f"workspace/harnesses/harness_{name}.c",
+        "cppflags": "-I.",
+        "sources": [src],
+        "scope_files": [src],
+        "entry_fn": TF_ENTRY,
+        "entry_style": "buffer_len",
+        "target_fuzzer": {"id": "fuzz_kv", "source": src, "initialize": False},
+    }
+    (hdir / f"harness_{name}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    return sidecar
+
+
+FUZZER_C = "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { dec_run(); return 0; }\n"
+
+
+def test_target_fuzz_module_takes_its_roots_from_the_fuzzer_source(tmp_path, monkeypatch):
+    dag, hdir = _unit_run(
+        tmp_path, monkeypatch, {"decode": "dec_run(); dec_peek();"}, exempt={"kvtool": "c", "kvdemo": "e"}
+    )
+    _add_target_fuzzer(tmp_path, FUZZER_C)
+    rows = _rows(harness_reach.run_check(dag, hdir, None))
+    tf = rows["tf_fuzz_kv"]
+    assert tf["passed"] is True and tf["target_fuzzer"] == "fuzz_kv" and tf["unit"] == "libkv_a"
+    # It answers for no entry point; its roots come from the fuzzer, not the wrapper.
+    assert tf["entry_points"] == 0 and tf["gaps"] == [] and tf["roots"] == ["dec_run"]
+    # Additive: the unit's own row is decided by its own harnesses only (u_len and enc_run stay gaps).
+    lib = rows["libkv_a"]
+    assert lib["harness_modules"] == ["decode"] and lib["passed"] is False
+
+
+def test_target_fuzz_module_that_reaches_nothing_or_has_no_source_fails(tmp_path, monkeypatch):
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run();"})
+    _add_target_fuzzer(tmp_path, "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }\n")
+    tf = _rows(harness_reach.run_check(dag, hdir, ["tf_fuzz_kv"]))["tf_fuzz_kv"]
+    assert tf["passed"] is False and tf["error"] == "target_fuzzer_reaches_nothing"
+
+    (tmp_path / "workspace/work/fuzz/fuzz_kv.c").unlink()
+    tf = _rows(harness_reach.run_check(dag, hdir, ["tf_fuzz_kv"]))["tf_fuzz_kv"]
+    assert tf["passed"] is False and tf["error"] == "target_fuzzer_source_missing"
+
+
+def test_unit_with_only_a_target_fuzz_module_still_fails_no_harness(tmp_path, monkeypatch):
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {}, exempt={"kvtool": "cli", "kvdemo": "ex"})
+    _add_target_fuzzer(tmp_path, FUZZER_C)
+    report = harness_reach.run_check(dag, hdir, None)
+    rows = _rows(report)
+    assert rows["tf_fuzz_kv"]["passed"] is True
+    assert rows["libkv_a"]["error"] == "no_harness" and report["passed"] is False
+    # Nor does an entry-point exemption of the unit land in the target fuzz module's sidecar.
+    with pytest.raises((ArtifactError, OSError)):
+        harness_reach.record_exempt(hdir, "libkv_a", "u_len", "helper", dag)
+    assert "reach_exempt" not in json.loads((hdir / "harness_tf_fuzz_kv.json").read_text(encoding="utf-8"))
+
+
+def test_dynamic_gate_holds_a_target_fuzz_module_to_no_entry_point(tmp_path, monkeypatch, capsys):
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run(); dec_peek();"})
+    _add_target_fuzzer(tmp_path, FUZZER_C)
+    cdir = tmp_path / "workspace/reports/coverage"
+    cdir.mkdir(parents=True)
+    rows = [{"function": "dec_run", "file": "src/decode.c", "line": 1, "executions": 0}]
+    (cdir / "tf_fuzz_kv.json").write_text(json.dumps({"status": "ok", "functions": rows, "inputs": {"replayed": 1}}))
+    assert harness_reach.main(["dynamic", "--module", "tf_fuzz_kv"]) == 0
+    out = json.loads((tmp_path / "workspace/reports/harness_reach_dynamic.json").read_text())
+    row = out["modules"]["tf_fuzz_kv"]
+    assert row["passed"] is True and row["entry_points"] == 0 and row["gaps"] == []
+    assert "warnings" not in out

@@ -1807,3 +1807,67 @@ def test_reach_dynamic_runs_after_coverage(tmp_path):
     assert "reach-dynamic-log" in out["targets"]
     rc, out = pm.run_targets(["reach-dynamic-nope"], run, jobs=1, make_runner=fake, templates_dir=ACSL)
     assert rc != 0
+
+
+def _target_fuzzer_run(run: Path) -> Path:
+    """_unit_run plus tf_fuzz_kv, a target fuzz module of libkv_a around workspace/work/fuzz/fuzz_kv.c."""
+    _unit_run(run)
+    src = "workspace/work/fuzz/fuzz_kv.c"
+    (run / src).parent.mkdir(parents=True, exist_ok=True)
+    (run / src).write_text("int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }\n")
+    sidecar = {
+        "module": "tf_fuzz_kv",
+        "unit": "libkv_a",
+        "sources": [src],
+        "scope_files": [src],
+        "cppflags": "-I.",
+        "entry_fn": "__framac_target_embedded_LLVMFuzzerTestOneInput",
+        "entry_style": "buffer_len",
+        "target_fuzzer": {"id": "fuzz_kv", "source": src, "initialize": False},
+    }
+    write_json(run / pm.HARNESS_DIR / "harness_tf_fuzz_kv.json", sidecar)
+    (run / pm.HARNESS_DIR / "harness_tf_fuzz_kv.c").write_text("int harness;\n", encoding="utf-8")
+    return run
+
+
+def test_target_fuzz_module_is_fuzzed_and_measured_but_never_runs_eva(tmp_path):
+    run = _target_fuzzer_run(tmp_path)
+    plan = pm.build_plan(run, templates_dir=ACSL)
+    tf = plan.modules["tf_fuzz_kv"]
+    assert (tf.fuzz, tf.eva) == (True, False) and tf.eva_off == pm.TARGET_FUZZER_EVA_OFF
+    assert tf.to_json()["eva_off"] == pm.TARGET_FUZZER_EVA_OFF and "eva_off" not in plan.modules["decode"].to_json()
+    assert tf.sources == ["workspace/work/fuzz/fuzz_kv.c", "workspace/harnesses/harness_tf_fuzz_kv.c"]
+    assert "tf_fuzz_kv" in plan.fuzz_modules and "tf_fuzz_kv" not in plan.eva_modules
+    # No Eva report is expected of it, so ingestion never stubs one.
+    assert "tf_fuzz_kv" in plan.expected("fuzz") and "tf_fuzz_kv" not in plan.expected("eva")
+    # One fuzz function: one case, counted toward its unit's cap with the unit's other campaigns.
+    assert tf.params["fuzz_cases"] == 1
+    cap = pm.FUZZ_UNIT_CAP_BY_PROFILE[plan.profile]
+    unit_total = sum(plan.modules[m].params["fuzz_budget"] for m in ("decode", "extra", "tf_fuzz_kv"))
+    assert unit_total <= max(cap, 3 * pm.MIN_FUZZ_BUDGET_S)
+    # It never stands for its unit (WP flags, link-unit target hints).
+    assert "tf_fuzz_kv" not in plan.unit_harness_modules("libkv_a")
+
+    out = pm.generate(run, templates_dir=ACSL)
+    assert out["ok"] is True
+    mk = (run / pm.MODULES_MK).read_text(encoding="utf-8")
+    fuzz_line = next(line for line in mk.splitlines() if line.startswith("FUZZ_MODULES"))
+    eva_line = next(line for line in mk.splitlines() if line.startswith("EVA_MODULES"))
+    assert "tf_fuzz_kv" in fuzz_line and "tf_fuzz_kv" not in eva_line
+    for target in ("build", "fuzz", "coverage", "reach-dynamic"):
+        assert any(n.endswith("-tf_fuzz_kv") for n in pm._target_nodes(target, plan))
+    assert not any("tf_fuzz_kv" in n for t in ("eva", "eva-tune", "flamegraph") for n in pm._target_nodes(t, plan))
+
+
+def test_makefile_fuzz_and_coverage_use_the_imported_corpus():
+    mk = (REPO / "templates" / "pipeline.mk").read_text(encoding="utf-8")
+    fuzz = mk.split("$(FUZZ_TARGETS): fuzz-%:", 1)[1].split("\n\n", 1)[0]
+    cov = mk.split("$(COVERAGE_TARGETS): coverage-%:", 1)[1].split("\n\n", 1)[0]
+    write = "-$(RUN) --class light --key $* -- $(PY) $(S)/fuzz_assets.py write --module $*"
+    assert write in fuzz and fuzz.index("seed_harvest.py write --module $*") < fuzz.index(write)
+    assert fuzz.index(write) < fuzz.index("run_eacsl_fuzz.py campaign")
+    for recipe in (fuzz, cov):
+        assert "--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \\" in recipe
+    seeds = mk.split("\nseeds:\n", 1)[1].split("\n\n", 1)[0]
+    assert all(line.startswith("\t-") for line in seeds.splitlines())  # both writers stay optional
+    assert "fuzz_assets.py write --module" in seeds

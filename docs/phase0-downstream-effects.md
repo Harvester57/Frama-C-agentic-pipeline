@@ -21,7 +21,8 @@ Read this before you change Phase 1 (fuzzing), Phase 2 (Eva), the Pre-WP crash g
 | Flags | Lexer Makefile scan | The build's flags per unit, `force_includes` apart | `unit_cppflags` |
 | Tiers | Regex patterns per module | Per function, from trust and structure; units take the highest | `scripts/tiers.py` |
 | Big units | Not handled | Split into clusters above 400 functions or 15k lines | `scripts/unit_split.py` |
-| Fuzz corpus | Empty | Seeds recorded from the target's tests | `scripts/seed_harvest.py` |
+| Fuzz corpus | Empty | Seeds recorded from the target's tests, plus the fuzz corpora the target ships | `scripts/seed_harvest.py`, `scripts/fuzz_assets.py` |
+| Target's own fuzzers | Ignored | One extra harness module `tf_<id>` per C fuzz target, fuzz and coverage only | `scripts/fuzz_assets.py`, `generate_harness.py --target-fuzzer` |
 | Reach gate | Static only | Static, then reopened by coverage (`reach-dynamic`) | `scripts/harness_reach.py` |
 | Trust | None | `untrusted`/`trusted` plus `boundary` per function, from the API, input readers and the threat model; optional CodeQL | `scripts/trust.py`, `scripts/codeql_trust.py` |
 | Security properties | `templates/acsl/layer4/5/6` | MetAcsl properties from a structured threat model | `scripts/security_props.py`, `templates/metacsl/` |
@@ -38,6 +39,8 @@ Read this before you change Phase 1 (fuzzing), Phase 2 (Eva), the Pre-WP crash g
 | `workspace/reports/security_props.json` | `obligations["file#name"]` (class, property) | `ledger.py` seed, `run_wp_function.py`, `workspace_overlay.py` (prover brief) |
 | `workspace/harnesses/harness_<mod>.json` (sidecar, `schemas/harness_sidecar.schema.json` since R5) | `unit`, `sources`, `scope_files`, `cppflags`, `ldflags`, `include_source`, `header`, `dispatch_cases`, `max_input_size`, `reach_exempt`, `entry_fn`, `reachability`, `api_harness`, `api_cases`, `api_skipped` | `module_map.py`, `pipeline_make.py`, `run_eacsl_fuzz.py`, `harness_reach.py`, `workspace_overlay.py` |
 | `workspace/seeds/<mod>/` | seed inputs | `fuzz-%` and `coverage-%` through `--extra-corpus` (`templates/pipeline.mk`) |
+| `workspace/reports/fuzz_assets.json` (`schemas/fuzz_assets.schema.json`) | `fuzzers` (path, `direct_api_calls`, `defines_initialize`, `suggested_max_input_size`), `corpora` (`imported` counts), `mappings` (`auto` or `agent`) | `fuzz_assets.py write`, `generate_harness.py --target-fuzzer`, `benchmark_seeded.py`, `validate_artifacts.py` |
+| `workspace/fuzz_assets/corpora/<id>/` | imported corpus inputs, content-addressed | `fuzz_assets.py write`, which writes `workspace/imported_corpus/<mod>/` for `fuzz-%` and `coverage-%` (second `--extra-corpus`) |
 | `workspace/reports/phase0_gates.json` | reach (passed, gaps, `harness_digest`), `build_check` (ok, `fuzz_engine`) | `phase0_gates.check` from `pipeline.mk`; `validate_artifacts.py` |
 
 The names `lexer_modules`, `lexer_module` and `unit_of_lexer_module` are kept for compatibility. They now mean **path modules**: files grouped by directory (`src/<dir>/…` → `<dir>`, `src/f.c` → `f`), with header functions placed by vote. There is no lexer behind them.
@@ -163,6 +166,8 @@ The ledger's `module` is also a DAG module name, and a ledger *unit* (`file#func
   - capped per unit at 480, 1200 or 7200, scaled down in proportion with at least 30 each;
   - recorded as `fuzz_budget_source`.
 - **Seeds:** `fuzz-%` writes `workspace/seeds/<mod>` and passes it as `--extra-corpus`, and so does `coverage-%`. The single-module commands in `skills/framac-fuzz/SKILL.md` do the same (R10).
+- **Imported corpus:** `fuzz-%` also runs `fuzz_assets.py write --module <mod>` and passes `workspace/imported_corpus/<mod>` as a second `--extra-corpus`, and `coverage-%` replays it. Inputs are named `imp-*`, never `seed-*`, which guardrails always replay.
+- **Target fuzz modules (`tf_<id>`, sidecar `target_fuzzer`):** fuzz and coverage only, never Eva. They answer for no entry point at the reach gate (scope: the fuzzer file), but fail it when the fuzzer reaches no DAG function; the gate digest covers the fuzzer source. `run_eacsl_fuzz.py` treats the renamed `__framac_target_embedded_*` functions as harness code (no RTE selection, skipped as crash frames).
 - **Whole-API harness (`generate_harness.py --api`):**
   - one dispatch case per entry point of the module's scope, built from the model's signatures, formals and `param_sizes`;
   - plus sequence cases from the recorded traces;

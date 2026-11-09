@@ -25,6 +25,11 @@ gets a row only for its Tier 1/2 entry points that lie in no harness module's sc
 (or all of them when it has no harness): each is a gap unless its lexer module (or
 the unit) is exempt in reach_exempt_modules.json, or a sidecar of the unit exempts it.
 
+A target fuzz module (`tf_<id>`, sidecar `target_fuzzer`: a harness around the target's own libFuzzer
+fuzz function) is additive: it answers for no entry point and never stands for its unit, which still
+needs its own harness or exemptions. Its row fails only when its fuzzer source is missing
+(`target_fuzzer_source_missing`) or names no DAG function (`target_fuzzer_reaches_nothing`).
+
 Subcommands:
   check   [--module M]... [--out FILE]   gate every harnessed module (exit 1 on a gap)
   exempt  --module M [--function F] --reason R
@@ -214,13 +219,43 @@ def check_module(
     harness_text: str,
     include_dirs: list[Path],
     mm: ModuleMap | None = None,
+    run_dir: Path = Path("."),
 ) -> dict[str, Any]:
+    """
+    The gate row of one harness module. A target fuzz module (sidecar `target_fuzzer`) wraps the
+    target's own fuzz function: its roots also come from the fuzzer source, it answers for no entry
+    point (its unit still needs its own harness, `check_unit`), and it fails when it reaches no DAG
+    function at all.
+    """
     by_name = _functions_by_name(dag)
     fn_names = set(by_name)
     unit = mm.unit_of(module) if mm is not None else module
     mod_info = (dag.get("modules") or {}).get(module) or {}
     tier = mod_info.get("tier")
-    if mm is not None and unit != module:
+    target_fuzzer = sidecar.get("target_fuzzer")
+    fuzzer_text: str | None = None
+    tf_row: dict[str, Any] = {}
+    if isinstance(target_fuzzer, dict):
+        src = phase0_gates.target_fuzzer_source(run_dir, sidecar)
+        try:
+            fuzzer_text = src.read_text(encoding="utf-8", errors="replace") if src is not None else None
+        except OSError:
+            fuzzer_text = None
+        tf_row = {
+            "module": module,
+            "tier": mm.tier_of(module) if mm is not None else tier,
+            "harness_file": sidecar.get("harness_file"),
+            "target_fuzzer": str(target_fuzzer.get("id") or ""),
+        }
+        if unit != module:
+            tf_row["unit"] = unit
+        if fuzzer_text is None:
+            return {**tf_row, "passed": False, "error": "target_fuzzer_source_missing"}
+    if fuzzer_text is not None:
+        mod_fns: list[str] = []
+        entries: list[str] = []
+        tier = tf_row["tier"]
+    elif mm is not None and unit != module:
         # A sub-module of a link unit: the unit's entry points in its scope, callees across the unit.
         mod_fns = mm.scope_functions(module)
         entries = mm.scope_entry_points(module)
@@ -235,6 +270,10 @@ def check_module(
     for alias, keys in dag_macro_aliases(dag).items():
         macros[alias] = macros.get(alias, set()) | keys
     roots = harness_roots(harness_text, fn_names, macros)
+    if fuzzer_text is not None:
+        roots |= harness_roots(fuzzer_text, fn_names, macros)
+        if not roots:
+            return {**tf_row, "roots": [], "passed": False, "error": "target_fuzzer_reaches_nothing"}
     reached = callee_closure(roots, by_name, unit)
 
     exempt_raw = sidecar.get("reach_exempt")
@@ -259,6 +298,8 @@ def check_module(
     }
     if unit != module:
         row["unit"] = unit
+    if fuzzer_text is not None:
+        row["target_fuzzer"] = tf_row["target_fuzzer"]
     return row
 
 
@@ -360,7 +401,9 @@ def _exempt_note(lexers: list[str], module_exempt: dict[str, Any], unit: str | N
     return "every entry point is in an exempt module (" + "; ".join(parts) + ")"
 
 
-def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> dict[str, Any]:
+def run_check(
+    dag_path: Path, harness_dir: Path, modules: list[str] | None, run_dir: Path = Path(".")
+) -> dict[str, Any]:
     dag = load_json_strict(dag_path)
     if not isinstance(dag, dict):
         raise ValueError(f"{dag_path}: not a call-graph DAG object")
@@ -377,10 +420,14 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
         if not isinstance(sidecar, dict):
             continue
         module = str(sidecar.get("module") or sidecar_path.stem[len("harness_") :])
-        harnessed.add(module)
+        # A target fuzz module is never a DAG module: it is gated under the unit its sidecar names, and
+        # it is additive, so it never stands for its unit's entry points (`check_unit` ignores it).
+        tf = isinstance(sidecar.get("target_fuzzer"), dict)
+        if not tf:
+            harnessed.add(module)
         if wanted and module not in wanted:
             continue
-        if (mm.unit_of(module) if link_units else module) not in dag_modules:
+        if (mm.unit_of(module) if link_units or tf else module) not in dag_modules:
             results.append({"module": module, "passed": True, "skipped": "module_not_in_dag"})
             continue
         harness_file = _harness_path(sidecar, sidecar_path)
@@ -390,7 +437,11 @@ def run_check(dag_path: Path, harness_dir: Path, modules: list[str] | None) -> d
             results.append({"module": module, "passed": False, "error": f"harness_unreadable: {exc}"})
             continue
         include_dirs = _include_dirs_from_cppflags(str(sidecar.get("cppflags") or ""))
-        results.append(check_module(module, dag, sidecar, harness_text, include_dirs, mm=mm if link_units else None))
+        results.append(
+            check_module(
+                module, dag, sidecar, harness_text, include_dirs, mm=mm if link_units or tf else None, run_dir=run_dir
+            )
+        )
     if link_units:
         for unit in sorted(dag_modules):
             if wanted and unit not in wanted:
@@ -441,7 +492,10 @@ def record_exempt(
         return {"module": module, "function": None, "reason": reason}
     sidecar_path = harness_dir / f"harness_{module}.json"
     if not sidecar_path.is_file() and dag_path is not None and dag_path.is_file():
-        stand_in = ModuleMap(load_json_strict(dag_path), load_sidecars(harness_dir)).harness_module_for(module)
+        mm = ModuleMap(load_json_strict(dag_path), load_sidecars(harness_dir))
+        # Not a target fuzz module: the unit's gate never reads its exemptions (`run_check`).
+        subs = [s for s in mm.submodules(module) if not isinstance(mm.sidecars[s].get("target_fuzzer"), dict)]
+        stand_in = module if module in subs else (subs[0] if subs else None)
         if stand_in:
             sidecar_path = harness_dir / f"harness_{stand_in}.json"
     sidecar = load_json_strict(sidecar_path)
@@ -467,8 +521,10 @@ def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str
     The entry points the reach gate holds a harness module to (as `check_module` does): for a sub-module,
     its unit's entry points within its scope (`ModuleMap.scope_entry_points`); for a unit, its DAG
     `candidate_entry_points`, else its non-static functions. All are DAG keys: the plain name, or
-    `file#name` when the name collides.
+    `file#name` when the name collides. A target fuzz module (sidecar `target_fuzzer`) answers for none.
     """
+    if isinstance((mm.sidecars.get(module) or {}).get("target_fuzzer"), dict):
+        return []
     if mm.units_are_link_units and mm.unit_of(module) != module:
         return mm.scope_entry_points(module)
     info = (dag.get("modules") or {}).get(module) or {}

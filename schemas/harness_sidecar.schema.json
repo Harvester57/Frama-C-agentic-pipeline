@@ -94,6 +94,17 @@
       "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}]}
     },
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason", "type": "object", "additionalProperties": {"type": "string"}},
+    "target_fuzzer": {
+      "$comment": "Set on a target fuzz module (generate_harness.py --target-fuzzer): the harness calls the target's own LLVMFuzzerTestOneInput, renamed to __framac_target_embedded_LLVMFuzzerTestOneInput; `initialize` is true when the fuzzer also defines LLVMFuzzerInitialize (renamed and called once by the harness). Absent on every other module.",
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+        "initialize": {"type": "boolean"}
+      },
+      "required": ["id", "source", "initialize"],
+      "additionalProperties": false
+    },
     "warnings": {"$ref": "#/definitions/strings"}
   },
   "required": ["module", "harness_file", "sources", "cppflags", "entry_fn", "entry_style"]

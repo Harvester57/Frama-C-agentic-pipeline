@@ -494,6 +494,10 @@ def validate_seed_harvest(data: Any) -> Errors:
     return _schema_check("seed_harvest", data)
 
 
+def validate_fuzz_assets(data: Any) -> Errors:
+    return _schema_check("fuzz_assets", data)
+
+
 def validate_dynamic_reach(data: Any) -> Errors:
     errors = _schema_check("harness_reach_dynamic", data)
     if errors:
@@ -618,6 +622,7 @@ PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
     (f"{REPORTS}/build_check.json", validate_build_check),
     (f"{REPORTS}/harness_reach_dynamic.json", validate_dynamic_reach),
     (f"{REPORTS}/seed_harvest.json", validate_seed_harvest),
+    (f"{REPORTS}/fuzz_assets.json", validate_fuzz_assets),
 )
 
 
@@ -658,6 +663,7 @@ PHASE0_COMMANDS: dict[str, Any] = {
     "build-check": validate_build_check,
     "reach-dynamic": validate_dynamic_reach,
     "seed-harvest": validate_seed_harvest,
+    "fuzz-assets": validate_fuzz_assets,
     "build-capture": validate_build_capture,
     "phase0-model": validate_phase0_model,
     "security-props": validate_security_props,

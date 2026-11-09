@@ -305,6 +305,17 @@ The same rules as the Phase 0 plans:
   - the docstring says it sets cwd and HOME only.
 - **Owns:** `scripts/sandbox_exec.py` and the call sites. After S3, so the seam is in place; S11 takes the new name if it lands later.
 
+### S14. The target's own fuzz targets and corpora (M, before S3, S6 and S11)
+
+- **Goal:** a fuzz corpus or fuzz target the target ships is used. Until now nothing looked for them: no `*_seed_corpus.zip`, no `corpus/` folder, no `.dict` or `.options`, and a target's own `LLVMFuzzerTestOneInput` was not in the DAG and had no harness.
+- **Work:**
+  - `scripts/fuzz_assets.py` (new): `discover`, `map` (the Phase 0 agent pairs what OSS-Fuzz naming does not), `import` (fixed limits, zip-safe), `write --module` (per harness module, `workspace/imported_corpus/<mod>/imp-*`);
+  - `generate_harness.py --target-fuzzer`: an extra module `tf_<id>` that renames the target's fuzz entry and initializer, copies the input into `fuzz_buf` and calls them;
+  - the reach gate reads the fuzzer source for a `tf_` module, which answers for no entry point; `pipeline_make` gives `tf_` modules no Eva; `fuzz-%` and `coverage-%` take the imported corpus as a second `--extra-corpus`;
+  - the seeded fixture `s09_shipped_corpus` and the seeded benchmark's Phase 0 sequence.
+- **Owns:** `scripts/fuzz_assets.py`, `schemas/fuzz_assets.schema.json`, the target-fuzzer parts of `scripts/generate_harness.py`, `schemas/harness_sidecar.schema.json`, `scripts/harness_reach.py`, `scripts/phase0_gates.py`, `scripts/pipeline_make.py`, `templates/pipeline.mk`, three small spots in `scripts/run_eacsl_fuzz.py` (RTE selection, crash frames, dictionary merge), `scripts/benchmark_seeded.py`, the s09 fixture, and the Phase 0/1 skills.
+- **Order:** it lands before S3, S6 and S11, which then move or change `run_eacsl_fuzz.py`, `generate_harness.py` and the sidecar schema from it.
+
 ### V. Validation run (user-triggered, last)
 
 - **Runs:**
@@ -332,6 +343,7 @@ S1 ─┬─▶ S2 ─────────┐
             ├─▶ S11
             └─▶ S13
 S12 (F14, F16): any time
+S14 ─▶ S3, S6, S11 (it lands first)
                                          all ─▶ V (user)
 ```
 
@@ -366,4 +378,5 @@ S12 (F14, F16): any time
 | S11 | M | open |
 | S12 | S | open (F13 after S10) |
 | S13 | S | open |
+| S14 | M | done; seeded benchmark 9/9 bugs, 0/4 decoys (run seeded-s14, s09 found by both `tf_fuzz_parse` and the imported corpus in `librcf_a`); a c-ares coverage comparison is still to do |
 | V | — | waits for the user |

@@ -7,6 +7,7 @@ still builds in the build image.
 
 import json
 import re
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,7 @@ def _truth(project: Path) -> dict:
 
 def test_fixture_sets_are_present():
     assert len(REPRODUCERS) == 9
-    assert len(SEEDED) == 8
+    assert len(SEEDED) == 9
 
 
 @pytest.mark.unit
@@ -64,6 +65,26 @@ def test_seeded_truth_points_at_real_code(project):
         assert bug["kind"] in ("mem_access", "signed_overflow", "division_by_zero"), bug
         assert (project / "repro" / f"{bug['id']}.bin").is_file(), bug
     assert all(FID_RE.match(e) for e in t["entry_points"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("project", [p for p in SEEDED if "fuzz_assets" in _truth(p)], ids=lambda p: p.name)
+def test_seeded_shipped_fuzz_assets_are_real_and_not_built(project):
+    t = _truth(project)
+    makefile = (project / "Makefile").read_text(encoding="utf-8")
+    assets = t["fuzz_assets"]
+    assert assets["fuzzers"] and assets["corpora"]
+    assert "test" not in t, "no test suite: the shipped corpus is the only source of seeds"
+    for fuzzer in assets["fuzzers"]:
+        text = (project / fuzzer).read_text(encoding="utf-8")
+        assert re.search(r"\bint\s+LLVMFuzzerTestOneInput\s*\(", text), fuzzer
+        assert Path(fuzzer).stem not in makefile and "fuzz/" not in makefile, "the fuzz target is not built"
+    for corpus in assets["corpora"]:
+        with zipfile.ZipFile(project / corpus) as z:
+            infos = z.infolist()
+            assert infos and all(not i.is_dir() and i.file_size > 0 for i in infos), corpus
+            # OSS-Fuzz naming pairs the corpus with its fuzzer.
+            assert any(Path(corpus).name == f"{Path(f).stem}_seed_corpus.zip" for f in assets["fuzzers"])
 
 
 @pytest.mark.integration

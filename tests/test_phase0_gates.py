@@ -266,3 +266,31 @@ def test_manifest_exemptions_reach_the_container_spec():
                 assert module.get("fuzz_engine_reason"), (target["id"], module["name"])
     x509 = next(t for t in manifest["targets"] if t["id"] == "x509-parser")
     assert json.dumps(x509).count('"fuzz_engine": "sanitizers"') == 4
+
+
+@pytest.mark.unit
+def test_harness_digest_covers_a_target_fuzz_modules_fuzzer_source(tmp_path):
+    hdir = tmp_path / "workspace/harnesses"
+    hdir.mkdir(parents=True)
+    src = tmp_path / "workspace/work/fuzz/fuzz_kv.c"
+    src.parent.mkdir(parents=True)
+    src.write_text("int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }\n")
+    (hdir / "harness_tf_fuzz_kv.c").write_text("int wrapper;\n")
+    sidecar = {
+        "module": "tf_fuzz_kv",
+        "target_fuzzer": {"id": "fuzz_kv", "source": "fuzz/fuzz_kv.c", "initialize": False},
+    }
+    (hdir / "harness_tf_fuzz_kv.json").write_text(json.dumps(sidecar))
+    # Resolved like a sidecar source: the run directory first, then the work tree.
+    assert phase0_gates.target_fuzzer_source(tmp_path, sidecar) == src
+    before = phase0_gates.harness_digest(tmp_path, "tf_fuzz_kv")
+    src.write_text("int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 1; }\n")
+    after = phase0_gates.harness_digest(tmp_path, "tf_fuzz_kv")
+    assert before is not None and after is not None and before != after
+    src.unlink()
+    assert phase0_gates.harness_digest(tmp_path, "tf_fuzz_kv") not in (before, after, None)
+    # A harness without `target_fuzzer` digests its own two files only, as before.
+    (hdir / "harness_api.json").write_text("{}")
+    import hashlib
+
+    assert phase0_gates.harness_digest(tmp_path, "api") == hashlib.sha256(b".json{}").hexdigest()

@@ -111,10 +111,14 @@ class ModuleMap:
         return sorted(m for m in self.sidecars if self.unit_of(m) == unit)
 
     def harness_module_for(self, unit: str) -> str | None:
-        """The harness to build or replay on behalf of a unit: its own, else its first sub-module."""
+        """The harness to build or replay on behalf of a unit: its own, else its first sub-module.
+
+        A target fuzz module (sidecar `target_fuzzer`) never stands in for its unit: it answers for no
+        entry point, and its input format is the target fuzzer's, not the unit's API.
+        """
         if unit in self.sidecars:
             return unit
-        subs = self.submodules(unit)
+        subs = [m for m in self.submodules(unit) if not (self.sidecars.get(m) or {}).get("target_fuzzer")]
         return subs[0] if subs else None
 
     def is_submodule(self, module: str) -> bool:

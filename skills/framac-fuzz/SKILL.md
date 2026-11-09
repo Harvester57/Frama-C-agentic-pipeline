@@ -6,7 +6,8 @@ description: >-
   compiling them with E-ACSL into runtime shadow-memory and arithmetic checks,
   and fuzzing the resulting binary with Clang LibFuzzer inside the hardened
   analysis container under sandbox_exec.py (rlimits, env allowlist,
-  timeout), starting from seeds recorded from the target's own tests. Catches
+  timeout), starting from seeds recorded from the target's own tests and from
+  the fuzz corpora the target ships. Catches
   intra-struct sub-object overflows, use-after-free, uninitialized reads,
   signed overflows, and ACSL contract violations. Measures per-function
   coverage and reopens the reach gate for API entry points no input executed.
@@ -85,6 +86,13 @@ Before each campaign, `seed_harvest.py write --module <mod>` turns them into `wo
 
 The campaign and `coverage` read the seeds as a read-only extra corpus (`--extra-corpus`). No test command and no executable that calls the API, a failing test suite, or no recorded call just means fewer or no seeds, never an error. Calls made through header `static inline` functions are not recorded, so their harness cases start from an empty corpus.
 
+**The target's own corpus.** Phase 0 imports the fuzz corpora the target ships (`/framac-slice` Step 1f). Before each campaign, `fuzz_assets.py write --module <mod>` writes them to `workspace/imported_corpus/<mod>/imp-*`:
+- a target fuzz module (`tf_<id>`, sidecar `target_fuzzer`) gets the corpora mapped to its fuzzer as they are: they are that fuzzer's own input format;
+- any other module gets each mapped corpus in the cases that take the whole buffer and call one of the corpus's functions (its mapped `--function`s, or its fuzzer's `direct_api_calls`), with the dispatch selector byte in front;
+- inputs longer than the module's `max_input_size` are dropped and counted, and a module gets at most 20,000 inputs.
+
+`workspace/reports/imported_corpus/<mod>.json` says what each case got. The campaign and `coverage` read the folder as a second read-only extra corpus. When the fuzzer ships a dictionary, its valid entries go to `workspace/dicts/<mod>.extra.dict` and are appended to the auto dictionary (the report's `dictionary.extra_entries`); an explicit `--dict` is used alone. Imported inputs are named `imp-`, not `seed-`, so guardrails do not replay them all.
+
 A campaign keeps going after a crash, so one shallow bug does not hide the others in its module:
 - **Dispatch harnesses** run in rounds. Each case an input crashed (or timed out) in (the input's first byte modulo the case count) is skipped from the next round on. The skip uses a rebuild with `-DFRAMAC_FUZZ_SKIP_CASES=<bit mask>`, with the same engine. Rounds share the campaign's wall time and end when a round finds no new crashing case, every case is skipped, less than 5 s are left (`MIN_ROUND_WALL_S`; the first round gets at least 30 s), or a rebuild fails. A skipped case is not fuzzed for the rest of the campaign, so a second bug in the same case can still be hidden; the report's `keep_going.rounds` lists what each round skipped and found.
 - **Other harnesses** (and dispatch harnesses generated before the skip macro existed) run in libFuzzer fork mode with `-ignore_crashes=1` (`keep_going.mode: fork`). The same bug is then saved many times: at most 64 crash inputs are replayed, and at most 3 artifacts are listed per fingerprint (`artifacts_omitted` counts the rest).
@@ -95,7 +103,8 @@ For a single module in guidance mode, check the module's Phase 0 gate first, the
 ```text
 python3 /opt/framac-pipeline/scripts/phase0_gates.py check --module <mod> --need reach,build_check
 python3 /opt/framac-pipeline/scripts/seed_harvest.py write --module <mod>
-python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --extra-corpus workspace/seeds/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
+python3 /opt/framac-pipeline/scripts/fuzz_assets.py write --module <mod>
+python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py campaign --module <mod> --sources <sidecar sources> workspace/harnesses/harness_<mod>.c --out-bin workspace/harnesses/fuzz_<mod> --corpus-dir workspace/corpus/<mod> --artifacts-dir workspace/crashes/<mod> --extra-corpus workspace/seeds/<mod> workspace/imported_corpus/<mod> --workers auto --fuzz-budget <cpu-seconds> --engine auto --cppflags='<sidecar cppflags> -I/opt/framac-pipeline/templates/acsl' --out-json workspace/reports/fuzz/<mod>.json
 ```
 
 The gate check exits 1 with the reasons when the module failed the reach gate or build-check, or its harness or the DAG changed since the reach check: repair the harness and re-run the gate (`/framac-slice` Steps 4b and 5); never fuzz around it. `campaign --module <mod>` enforces the same check itself whenever the run directory has a gate stamp (`workspace/reports/phase0_gates.json`): it refuses the module with the reasons and writes no report. A campaign outside a run directory is not gated.
@@ -152,7 +161,7 @@ A module whose coverage measured nothing (the statuses above, or no report) gets
 
 Exemptions are for entry points that cannot be driven from bytes, not for a corpus that did not get deep enough:
 - **Valid reasons:** the function needs a live kernel socket or a real file descriptor; it reads a process-global the harness cannot set up safely; it is a callback only the platform calls.
-- **Not reasons:** "30 s of fuzzing did not reach it"; "behind a parser check"; "reached only through `parse_x509_cert`". Those are reach gaps to work on, in this order: recorded seeds (`/framac-slice` Step 1e), a dictionary (`params set --fuzz-dict`), a larger budget (`--fuzz-budget`), then a dispatch case that calls the function directly with fixed-size slots. Exempt only what still cannot be driven, and say what you tried in the reason.
+- **Not reasons:** "30 s of fuzzing did not reach it"; "behind a parser check"; "reached only through `parse_x509_cert`". Those are reach gaps to work on, in this order: recorded seeds (`/framac-slice` Step 1e), the target's own corpus mapped to the function (`/framac-slice` Step 1f), a dictionary (`params set --fuzz-dict`), a larger budget (`--fuzz-budget`), then a dispatch case that calls the function directly with fixed-size slots. Exempt only what still cannot be driven, and say what you tried in the reason.
 - **Not a repair:** a case that calls the function with constant arguments only to tick the gate. The gate then passes, but fuzzing exercises nothing.
 
 Read `executions: 0` before tuning. The harness may simply not call that function, which a better dictionary or budget cannot fix: repair the harness instead. If the harness does call it, the corpus is stuck behind an input check, and `uncovered_lines` on the callers shows where. This report is reach only: it is not proof, the ledger does not read it, and a reached function is not a safe one.

@@ -45,16 +45,52 @@ HOW_TO_RUN = {
 }
 
 
+WORK_DIR = "workspace/work"
+
+
+def target_fuzzer_source(run_dir: Path, sidecar: Any) -> Path | None:
+    """
+    The fuzzer source file of a target fuzz module (sidecar `target_fuzzer.source`), resolved like the
+    sidecar's sources (pipeline_make._plan_module: the run directory, then the work tree), or None when
+    the sidecar has no `target_fuzzer` or the file is not found.
+    """
+    tf = sidecar.get("target_fuzzer") if isinstance(sidecar, dict) else None
+    src = tf.get("source") if isinstance(tf, dict) else None
+    if not isinstance(src, str) or not src.strip():
+        return None
+    candidates = [Path(src)] if src.startswith("/") else [Path(run_dir) / src]
+    candidates.append(Path(run_dir) / WORK_DIR / src.lstrip("/"))
+    return next((p for p in candidates if p.is_file()), None)
+
+
 def harness_digest(run_dir: Path, module: str) -> str | None:
-    """sha256 over the module's harness sidecar and source, or None when the harness is missing."""
+    """
+    sha256 over the module's harness sidecar and source, or None when the harness is missing. A target
+    fuzz module (sidecar `target_fuzzer`) also covers its fuzzer source: editing the target's fuzzer
+    changes what the harness runs, as a harness edit does.
+    """
     h = hashlib.sha256()
     found = False
+    sidecar: Any = None
     for suffix in (".json", ".c"):
         path = run_dir / HARNESS_DIR / f"harness_{module}{suffix}"
         if path.is_file():
             found = True
+            data = path.read_bytes()
             h.update(suffix.encode())
-            h.update(path.read_bytes())
+            h.update(data)
+            if suffix == ".json":
+                try:
+                    sidecar = json.loads(data)
+                except ValueError:
+                    sidecar = None
+    if isinstance(sidecar, dict) and isinstance(sidecar.get("target_fuzzer"), dict):
+        src = target_fuzzer_source(run_dir, sidecar)
+        h.update(b"target_fuzzer")
+        try:
+            h.update(src.read_bytes() if src is not None else b"\0missing")
+        except OSError:
+            h.update(b"\0unreadable")
     return h.hexdigest() if found else None
 
 

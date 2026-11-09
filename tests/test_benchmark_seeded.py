@@ -205,6 +205,192 @@ def test_apply_policy_generates_and_exempts(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Target fuzz modules (the target's shipped fuzzers)
+# ---------------------------------------------------------------------------
+
+
+def _two_unit_dag() -> dict:
+    fns = dict(
+        [
+            _fn("src/rcf.c", "rcf_parse", "rcf"),
+            _fn("src/rcf.c", "rcf_crc32", "rcf"),
+            _fn("src/rcf.c", "rec_scale", "rcf", static=True),
+            _fn("lib/aux.c", "aux_parse", "aux"),
+            _fn("lib/aux.c", "rcf_crc32_alt", "aux"),
+        ]
+    )
+    return {
+        "module_kind": "link_unit",
+        "functions": fns,
+        "modules": {
+            "librcf_a": {
+                "required_sources": ["src/rcf.c", "include/rcf.h"],
+                "cppflags": ["-I", "include"],
+                "functions": ["src/rcf.c#rcf_parse", "src/rcf.c#rcf_crc32", "src/rcf.c#rec_scale"],
+                "candidate_entry_points": ["src/rcf.c#rcf_parse", "src/rcf.c#rcf_crc32"],
+            },
+            "libaux_a": {
+                "required_sources": ["lib/aux.c"],
+                "cppflags": ["-DAUX"],
+                "functions": ["lib/aux.c#aux_parse", "lib/aux.c#rcf_crc32_alt"],
+                "candidate_entry_points": ["lib/aux.c#aux_parse"],
+            },
+        },
+    }
+
+
+def _fuzzer(fid: str, calls: list[str], status: str = "usable", **extra: object) -> dict:
+    path = f"fuzz/{fid}.c"
+    return {
+        "id": fid,
+        "path": path,
+        "work_path": f"workspace/work/{path}",
+        "language": "c",
+        "direct_api_calls": calls,
+        "status": status,
+        **extra,
+    }
+
+
+@pytest.mark.unit
+def test_target_fuzzers_pick_the_unit_defining_most_of_their_calls():
+    dag = _two_unit_dag()
+    plans = bs.plan_harnesses(dag)
+    assets = {
+        "fuzzers": [
+            _fuzzer("fuzz_parse", ["rcf_parse", "rcf_crc32", "aux_parse"]),
+            _fuzzer("fuzz_aux", ["aux_parse"]),
+            _fuzzer("fuzz_tie", ["rcf_parse", "aux_parse"]),
+            _fuzzer("fuzz_static", ["rec_scale"]),  # a static function is not callable from the fuzzer
+            _fuzzer("fuzz_none", []),
+            _fuzzer("fuzz_cxx", ["rcf_parse"], status="unsupported", reason="cxx"),
+            {"path": "fuzz/no_id.c", "status": "usable"},  # no id: not a fuzzer row
+        ]
+    }
+    tf = bs.plan_target_fuzzers(dag, assets, plans)
+    assert list(tf) == ["tf_fuzz_aux", "tf_fuzz_cxx", "tf_fuzz_none", "tf_fuzz_parse", "tf_fuzz_static", "tf_fuzz_tie"]
+    parse = tf["tf_fuzz_parse"]
+    assert parse["unit"] == "librcf_a" and "reason" not in parse
+    # The unit's planned harness sources and flags, plus the fuzzer; the other fuzzers' sources stay out.
+    assert parse["sources"] == ["workspace/work/src/rcf.c", "workspace/work/fuzz/fuzz_parse.c"]
+    assert parse["cppflags"] == plans["librcf_a"]["cppflags"] == "-Iworkspace/work/include"
+    assert tf["tf_fuzz_aux"]["unit"] == "libaux_a"
+    assert tf["tf_fuzz_aux"]["sources"] == ["workspace/work/lib/aux.c", "workspace/work/fuzz/fuzz_aux.c"]
+    assert tf["tf_fuzz_tie"]["unit"] == "libaux_a"  # one call each: the first module by name
+    assert tf["tf_fuzz_static"]["reason"].startswith("no DAG module defines what the fuzzer calls (rec_scale)")
+    assert tf["tf_fuzz_none"]["reason"] == "the fuzzer calls no function with its input"
+    assert tf["tf_fuzz_cxx"]["reason"] == "fuzzer unsupported: cxx"
+    assert bs.plan_target_fuzzers(dag, assets, plans) == tf  # deterministic
+    assert bs.plan_target_fuzzers(dag, {}, plans) == {}
+    # A module name already taken by the DAG is never reused.
+    clash = bs.plan_target_fuzzers({**dag, "modules": {**dag["modules"], "tf_fuzz_aux": {}}}, assets, plans)
+    assert clash["tf_fuzz_aux"]["reason"] == "module name tf_fuzz_aux is already taken"
+
+
+@pytest.mark.unit
+def test_target_fuzzer_argv_follows_the_generator_contract():
+    plan = {
+        "fuzzer": "fuzz_parse",
+        "work_path": "workspace/work/fuzz/fuzz_parse.c",
+        "unit": "librcf_a",
+        "sources": ["workspace/work/src/rcf.c", "workspace/work/fuzz/fuzz_parse.c"],
+        "cppflags": "-Iworkspace/work/include",
+    }
+    argv = bs.target_fuzzer_argv("tf_fuzz_parse", plan)
+    assert argv[1].endswith("generate_harness.py")
+    assert argv[argv.index("--target-fuzzer") + 1] == "workspace/work/fuzz/fuzz_parse.c"
+    assert argv[argv.index("--target-fuzzer-id") + 1] == "fuzz_parse"
+    assert argv[argv.index("--module") + 1] == "tf_fuzz_parse"
+    assert "--unit=librcf_a" in argv and "--cppflags=-Iworkspace/work/include" in argv
+    i = argv.index("--sources")
+    assert argv[i + 1 : i + 3] == plan["sources"] and argv[i + 3].startswith("--")
+    assert argv[argv.index("--header") + 1] == "none"
+    assert argv[argv.index("--out-dir") + 1] == str(bs.HARNESS_DIR)
+
+
+@pytest.mark.unit
+def test_apply_policy_adds_target_fuzz_modules(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    dag = _two_unit_dag()
+    calls: list[tuple[str, list[str]]] = []
+
+    def step(name: str, argv: list[str]) -> bool:
+        calls.append((name, argv))
+        return name != "harness:tf_fuzz_broken"
+
+    # The API harnesses are not what this test is about: their prototypes come from a stub.
+    monkeypatch.setattr(bs, "build_cases", lambda plan, fns: ([("k", "f", "(void)f();")], {}, {}))
+    assets = {
+        "fuzzers": [
+            _fuzzer("fuzz_parse", ["rcf_parse"]),
+            _fuzzer("fuzz_broken", ["aux_parse"]),
+            _fuzzer("fuzz_cxx", ["rcf_parse"], status="unsupported", reason="cxx"),
+        ]
+    }
+    report = bs.apply_policy(dag, step, assets)
+    # The unit harnesses come first, then the target fuzz modules in id order; nothing replaces a unit's.
+    assert [n for n, _ in calls] == [
+        "harness:libaux_a",
+        "harness:librcf_a",
+        "harness:tf_fuzz_broken",
+        "harness:tf_fuzz_parse",
+    ]
+    assert report["librcf_a"]["harness"] is True and report["libaux_a"]["harness"] is True
+    tf = report["tf_fuzz_parse"]
+    assert tf["harness"] is True and tf["unit"] == "librcf_a" and tf["cases"] == ["LLVMFuzzerTestOneInput"]
+    assert tf["target_fuzzer"] == {"id": "fuzz_parse", "path": "fuzz/fuzz_parse.c"} and "reason" not in tf
+    assert report["tf_fuzz_broken"] == {**report["tf_fuzz_broken"], "harness": False}
+    assert report["tf_fuzz_broken"]["reason"] == "generate_harness.py failed"
+    assert report["tf_fuzz_cxx"]["harness"] is False and report["tf_fuzz_cxx"]["reason"] == "fuzzer unsupported: cxx"
+    # Without an explicit document the policy reads workspace/reports/fuzz_assets.json, and goes without one.
+    calls.clear()
+    assert not any(m.startswith("tf_") for m in bs.apply_policy(dag, step))
+    bs.benchmark.write_json(bs.FUZZ_ASSETS, assets)
+    assert "tf_fuzz_parse" in bs.apply_policy(dag, step)
+    # A target fuzz module never gets a reach exemption: the gate checks its own roots.
+    exempt = tmp_path / "workspace" / "harnesses" / "reach_exempt_modules.json"
+    assert not exempt.exists() or not any(m.startswith("tf_") for m in json.loads(exempt.read_text(encoding="utf-8")))
+
+
+@pytest.mark.unit
+def test_inner_goes_on_when_the_fuzz_assets_steps_fail(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ran: list[list[str]] = []
+
+    class Proc:
+        def __init__(self, rc: int) -> None:
+            self.returncode = rc
+
+    def fake_run(argv: list[str], **_: object) -> Proc:
+        ran.append(argv)
+        return Proc(1 if argv[1].endswith("fuzz_assets.py") else 0)
+
+    monkeypatch.setattr(bs.subprocess, "run", fake_run)
+    assert bs.inner("s09-shipped-corpus", 30) == 0
+    names = [Path(a[1]).name + (f" {a[2]}" if len(a) > 2 else "") for a in ran]
+    # Discovery and import come after the overlay and before the DAG; import is skipped when discovery fails.
+    i = names.index("fuzz_assets.py discover")
+    assert names[i - 1].startswith("workspace_overlay.py") and names[i + 1].startswith("build_callgraph_dag.py")
+    assert "fuzz_assets.py import" not in names
+    discover = [a for a in ran if a[1].endswith("fuzz_assets.py")][0]
+    assert discover[2:] == ["discover", "--target", "/target"]
+    phase0 = json.loads((tmp_path / bs.benchmark.BENCH_SUBDIR / "phase0.json").read_text(encoding="utf-8"))
+    assert phase0["ok"] is True and phase0["fuzz_assets"] is False
+    step = next(s for s in phase0["steps"] if s["name"] == "fuzz_assets_discover")
+    assert step["rc"] == 1 and step["optional"] is True
+    # Both steps run when discovery succeeds.
+    ran.clear()
+
+    def ok_run(argv: list[str], **_: object) -> Proc:
+        ran.append(argv)
+        return Proc(0)
+
+    monkeypatch.setattr(bs.subprocess, "run", ok_run)
+    assert bs.inner("s09-shipped-corpus", 30) == 0
+    assert [a[2] for a in ran if a[1].endswith("fuzz_assets.py")] == ["discover", "import"]
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -337,15 +523,21 @@ def test_rescore_resolves_run_dirs_against_the_work_dir(tmp_path):
 @pytest.mark.unit
 def test_projects_and_specs_come_from_the_corpus():
     projects = bs.projects_in(SEEDED)
-    assert [p.name for p in projects][:2] == ["s01_macro_fn", "s02_token_paste"] and len(projects) == 8
+    assert [p.name for p in projects][:2] == ["s01_macro_fn", "s02_token_paste"] and len(projects) == 9
+    by_name = {p.name: p for p in projects}
     with pytest.raises(bs.benchmark.BenchmarkError):
         bs.projects_in(SEEDED, ["s99_nope"])
-    spec = bs.project_spec(projects[3], _truth("s04_force_include"))
+    assert [p.name for p in bs.projects_in(SEEDED, ["s09_shipped_corpus"])] == ["s09_shipped_corpus"]
+    s04 = by_name["s04_force_include"]
+    spec = bs.project_spec(s04, _truth("s04_force_include"))
     assert spec["build"] == {"command": "make", "test_command": None, "origin": "benchmark"}
     assert spec["repo"] == "s04-force-include"
-    s08 = bs.project_spec(projects[7], _truth("s08_wellformed_input"))
+    s08 = bs.project_spec(by_name["s08_wellformed_input"], _truth("s08_wellformed_input"))
     assert s08["build"]["test_command"] == "./sdf_test"
-    assert bs.project_spec(projects[7], _truth("s08_wellformed_input"), seeds=False)["build"]["test_command"] is None
-    plan = bs.stage_plan(projects[3], 45)
+    no_seeds = bs.project_spec(by_name["s08_wellformed_input"], _truth("s08_wellformed_input"), seeds=False)
+    assert no_seeds["build"]["test_command"] is None
+    # s09 has no test suite: its seeds can only come from the corpus it ships.
+    assert bs.project_spec(by_name["s09_shipped_corpus"], _truth("s09_shipped_corpus"))["build"]["test_command"] is None
+    plan = bs.stage_plan(s04, 45)
     assert [s[0] for s in plan] == ["phase0", "build", "fuzz", "eva", "coverage", "ingest"]
     assert plan[0][1].endswith("benchmark_seeded.py inner --repo s04-force-include --fuzz-budget 45")
