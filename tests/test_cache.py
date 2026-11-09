@@ -330,8 +330,10 @@ def test_budget_is_capped_by_env_and_free_disk(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAMAC_CACHE_MAX", "1M")
     assert store.budget_bytes() == 1024 * 1024
     monkeypatch.setenv("FRAMAC_CACHE_MAX", "100T")
-    free = __import__("shutil").disk_usage(tmp_path).free
-    assert store.budget_bytes() == int(0.25 * free)
+    # Pinned: free space read twice raced with other writers (parallel workers, a live run) and failed under -n.
+    usage = __import__("shutil").disk_usage(tmp_path)
+    monkeypatch.setattr(cache.shutil, "disk_usage", lambda _path: usage)
+    assert store.budget_bytes() == int(0.25 * usage.free)
 
 
 def test_cli_stats_gc_and_clear(run, capsys):

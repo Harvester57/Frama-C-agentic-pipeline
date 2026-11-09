@@ -461,6 +461,26 @@ def _remove_agent(run_dir: Path, agent_id: str) -> None:
     shutil.rmtree(run_dir / "agents" / agent_id, ignore_errors=True)
 
 
+def _snapshot_files(work: Path, wp_report: Path, rels: list[str | None]) -> dict[Path, bytes | None]:
+    """Bytes of the tree files a replay may change (None: absent), for _restore_files."""
+    paths = [work / r for r in rels if r] + [wp_report]
+    return {p: (p.read_bytes() if p.is_file() else None) for p in paths}
+
+
+def _restore_files(snapshot: dict[Path, bytes | None]) -> None:
+    """Put back every snapshotted file that changed; remove one that did not exist."""
+    for path, raw in snapshot.items():
+        current = path.read_bytes() if path.is_file() else None
+        if current == raw:
+            continue
+        if raw is None:
+            path.unlink(missing_ok=True)
+            continue
+        tmp = path.with_name(f".tmp_restore_{path.name}")
+        tmp.write_bytes(raw)
+        os.replace(tmp, path)
+
+
 def _default_merge() -> MergeFn:
     import workspace_overlay
 
@@ -592,11 +612,19 @@ def replay(
             "ldflags": side.get("ldflags") or "",
         }
         agents: list[str] = []
+        # merge_agent_overlay undoes its own failed merge, but not one that succeeded before a later step of this
+        # item failed (the header declarations before the prover merge, or the ingest after it): restore those.
+        snapshot = _snapshot_files(work, overlay / "reports" / "wp" / f"{fn}.json", [file, header])
+
+        def undo(item: dict, why: str, agents: list[str] | None = None, *, _snap=snapshot) -> None:
+            _restore_files(_snap)
+            reject(item, why, agents)
+
         try:
             if missing:
                 bad = [d["name"] for d in missing if d.get("source") != header]
                 if bad or not header:
-                    reject(
+                    undo(
                         item,
                         f"missing declarations outside the header: {', '.join(bad or [d['name'] for d in missing])}",
                     )
@@ -607,12 +635,12 @@ def replay(
                 h_path = run_dir / "agents" / arch_id / "scratch" / "work" / header
                 new_h = _insert_decls(_read(h_path) or "", fn, missing, header)
                 if new_h is None:
-                    reject(item, "prototype not found for the declarations", agents)
+                    undo(item, "prototype not found for the declarations", agents)
                     continue
                 h_path.write_text(new_h, encoding="utf-8", newline="")
                 res = merge(run_dir, arch_id, "architect", overlay, header_file=header, **merge_kw)
                 if not res.get("ok"):
-                    reject(item, f"declarations not merged: {res.get('reason')}", agents)
+                    undo(item, f"declarations not merged: {res.get('reason')}", agents)
                     continue
 
             aid, next_n = _next_agent_id(run_dir, next_n)
@@ -622,14 +650,14 @@ def replay(
             c_path = scratch / "work" / file
             new_c = _replace_span(_read(c_path) or "", fn, doc["span_c"], False, file)
             if new_c is None:
-                reject(item, "definition not found in the agent copy", agents)
+                undo(item, "definition not found in the agent copy", agents)
                 continue
             c_path.write_text(new_c, encoding="utf-8", newline="")
             if header and doc.get("span_h"):
                 h_path = scratch / "work" / header
                 new_h2 = _replace_span(_read(h_path) or "", fn, doc["span_h"], True, header)
                 if new_h2 is None:
-                    reject(item, "prototype not found in the agent copy", agents)
+                    undo(item, "prototype not found in the agent copy", agents)
                     continue
                 h_path.write_text(new_h2, encoding="utf-8", newline="")
             # The parent WP re-check takes its reduced checks and model from here (infer_prover_wp_flags).
@@ -647,24 +675,27 @@ def replay(
                 **merge_kw,
             )
         except Exception as exc:  # ScopeViolationError, AcslError, ArtifactError, OverlayMergeError, ...
-            reject(item, f"{type(exc).__name__}: {exc}", agents)
+            undo(item, f"{type(exc).__name__}: {exc}", agents)
             continue
         if not res.get("ok"):
-            reject(item, str(res.get("reason") or "merge failed"), agents)
+            undo(item, str(res.get("reason") or "merge failed"), agents)
             continue
         rep = res.get("parent_wp_report")
         if not rep:
-            reject(item, "merged without a parent WP report")
+            undo(item, "merged without a parent WP report")
             continue
         ok, detail = ingest(rep)
         if not ok:
             summary["ok"] = False
-            reject(item, f"ledger ingest-wp failed: {detail}")
+            undo(item, f"ledger ingest-wp failed: {detail}")
             continue
         entry_rel = contract_path.relative_to(run_dir).as_posix()
         credited = mark(rep, entry_rel, key)
         if not credited:
-            reject(item, "the re-proof credited no unit")
+            # ingest-wp already credited the units with the fresh all_proven report, so the merge stays: only the
+            # carried_forward_reproven label is missing. Not rolled back, or the ledger would point at a contract
+            # that is no longer in the tree.
+            reject(item, "re-proven and ingested, but mark-carried labelled no unit")
             continue
         summary["reproven"] += 1
         summary["carried"].append(

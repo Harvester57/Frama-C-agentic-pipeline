@@ -355,6 +355,32 @@ def test_failed_reproof_leaves_units_planned_and_removes_the_agent(tmp_path, mon
     assert {u["status"] for u in units} == {"planned"}
 
 
+def test_failed_prover_merge_also_undoes_the_header_declarations(tmp_path, monkeypatch):
+    # The architect merge of `predicate small` succeeds, then inc's prover merge fails: the header goes back too.
+    _seed_store(tmp_path)
+    run = _make_run(tmp_path / "run2", C_FRESH, HEADER_FRESH, _planned_units())
+    ingest, mark = _ledger_calls(run, monkeypatch)
+    pc.replay(run, FakePlan(), merge=FakeMerge(run, fail={"inc"}), ingest=ingest, mark=mark)
+    assert (run / "workspace/work/src/m.h").read_text(encoding="utf-8") == HEADER_FRESH
+    assert (run / "workspace/work/src/m.c").read_text(encoding="utf-8") == C_FRESH
+
+
+def test_ingest_failure_after_a_merge_rolls_the_tree_back(tmp_path, monkeypatch):
+    # libmnl A/B: `ledger ingest-wp failed` left mnl_cb_noop's carried contract in workspace/work with its units
+    # still planned.
+    _seed_store(tmp_path)
+    run = _make_run(tmp_path / "run2", C_FRESH, HEADER_FRESH, _planned_units())
+    _, mark = _ledger_calls(run, monkeypatch)
+    summary = pc.replay(run, FakePlan(), merge=FakeMerge(run), ingest=lambda rep: (False, "schema error"), mark=mark)
+    assert summary["reproven"] == 0 and summary["ok"] is False
+    assert {r["function"] for r in summary["rejected"]} == {"inc"}
+    assert "ledger ingest-wp failed" in summary["rejected"][0]["reason"]
+    assert (run / "workspace/work/src/m.c").read_text(encoding="utf-8") == C_FRESH
+    assert (run / "workspace/work/src/m.h").read_text(encoding="utf-8") == HEADER_FRESH
+    units = json.loads((run / "coverage-ledger.json").read_text(encoding="utf-8"))
+    assert {u["status"] for u in units} == {"planned"}
+
+
 def test_scope_violation_is_a_rejection(tmp_path, monkeypatch):
     _seed_store(tmp_path)
     run = _make_run(tmp_path / "run2", C_FRESH, HEADER_FRESH, _planned_units())

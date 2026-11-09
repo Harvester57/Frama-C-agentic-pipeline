@@ -377,19 +377,19 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - **Open, not diagnosed** (seen 2026-11-09 in the offline A/B on a copy of libmnl run 1). `req_0015` was assigned to `negotiate-mnl_attr_get_payload-5` at 16:35:10 (its scratch is empty), then closed `rejected_by_callee` at 16:36:40 with a `not dispatched:` note. The callee had 5 negotiate dispatches although `MAX_NEGOTIATION_ROUNDS_PER_CALLEE = 3`. Because of the `not dispatched:` prefix, Tier 1 treats it as a structural rejection and leaves it out of "Known Dead Ends". Open the scheduler log of that run (`_emit_negotiations`, the round counter) before naming a cause.
 
 ### Symptom: Implementation Mutants Fail With `acsl_syntax_error` (`return attr->=nla_len;`, `<==`, `>==`)
-- **Open pipeline bug** (found 2026-11-09 by the formal-discovery Tier 4 A/B on libmnl run 1: 6 of 15 implementation mutants; also present on `phase1-remediation`).
+- **Fixed pipeline bug** (found 2026-11-09 by the formal-discovery Tier 4 A/B on libmnl run 1: 6 of 15 implementation mutants; also present on `phase1-remediation`; fixed on branch `formal-discovery-tiers`).
 - **Cause:** [`../scripts/mutation_check.py`](../scripts/mutation_check.py) `impl_mutants` applies `_REL_OP_FLIP` with `body_text.replace(op, flipped, 1)`, a plain substring replace with no token boundaries, so `>` matches inside `->` and `<` inside `<=`. With the corrected criterion these mutants are `not_applicable` and leave the denominator, but the function then gets no real implementation mutant.
-- **Fix (proposed):** flip only standalone relational-operator tokens, using the `c_token`s of `acsl_ast.tokenize_c_acsl`.
+- **Fix:** `mutation_check._c_operators` regroups the single-character `c_token`s of `acsl_ast.tokenize_c_acsl` into C operators by maximal munch (`->`, `>>`, `<=`, ...), skipping comments, strings and ACSL, and `impl_mutants` flips only a whole `<`, `<=`, `>` or `>=`. Test: `test_impl_mutants_flip_only_whole_relational_operators`.
 
 ### Symptom: `mutation_check.py --run-dir` Scores Every Mutant `not_applicable` on a Target With Include Paths
-- **Open pipeline bug** (found 2026-11-09 by the Tier 4 A/B on libmnl: every mutant failed with `fatal error: libmnl/libmnl.h: No such file or directory`, reported as `acsl_syntax_error`).
+- **Fixed pipeline bug** (fixed on branch `formal-discovery-tiers`; found 2026-11-09 by the Tier 4 A/B on libmnl: every mutant failed with `fatal error: libmnl/libmnl.h: No such file or directory`, reported as `acsl_syntax_error`).
 - **Cause:** `run_mutation_check` passes the hard-coded cppflags `"-I."` to `check_function` instead of the module's WP flags. A preprocessing failure is also classified as `acsl_syntax_error`, which is misleading.
-- **Fix (proposed):** use `pipeline_make.build_plan(run).wp_cppflags_for(module)` as `wp-sweep` does, and report preprocessing failures under their own status. The Tier 4 A/B worked around it in a driver that passed the module's flags; the stock command still has the defect.
+- **Fix:** `run_mutation_check` resolves each function's module from `coverage-ledger.json` and uses `pipeline_make.build_plan(run).wp_cppflags_for(module)`, as `wp-sweep` does; each function records `cppflags_source`. A function whose module flags cannot be resolved is listed under `skipped` instead of being checked with wrong flags; a directory with no ledger modules keeps the old `-I.` (`cppflags_source: default ...`). **Still open:** a preprocessing failure is reported as `acsl_syntax_error`.
 
 ### Symptom: A Proof-Carry Replay Rejected After Its Merge Leaves the Cached Contract in `workspace/work/`
-- **Open pipeline bug** (found 2026-11-09 by the formal-discovery Tier 6 A/B on a copy of libmnl run 1: `mnl_cb_noop` was rejected with `ledger ingest-wp failed`, its contract stayed in `workspace/work/src/callback.c` and its units stayed `planned`).
+- **Fixed pipeline bug** (fixed on branch `formal-discovery-tiers`; found 2026-11-09 by the formal-discovery Tier 6 A/B on a copy of libmnl run 1: `mnl_cb_noop` was rejected with `ledger ingest-wp failed`, its contract stayed in `workspace/work/src/callback.c` and its units stayed `planned`).
 - **Cause:** [`../scripts/proof_carry.py`](../scripts/proof_carry.py) `replay` calls `reject()` after `merge_agent_overlay` has already spliced the tree (the `merged without a parent WP report` and `ledger ingest-wp failed` paths). `reject()` only removes the agent; the module docstring promises that anything else rolls back.
-- **Fix (proposed):** restore the pre-merge span on those paths, or treat an ingest failure as fatal for the phase.
+- **Fix:** `replay` snapshots the function's file, its header and its canonical `workspace/reports/wp/<fn>.json` before any merge and restores them on every rejection after that point (`_snapshot_files` / `_restore_files`), including a prover merge that fails after the header declarations were merged. A `mark-carried` failure after a successful `ingest-wp` is not rolled back: the units are already credited by the fresh report. Tests: `test_ingest_failure_after_a_merge_rolls_the_tree_back`, `test_failed_prover_merge_also_undoes_the_header_declarations`.
 
 ### Symptom: A Rejected Proof-Carry Replay Leaves Only a Short Reason, No Guardrail Report or Logs
 - **Open pipeline gap** (Tier 6 A/B, 2026-11-09): `reject()` deletes `agents/carry-<n>` with its guardrail JSON and logs; only a reason truncated to 400 characters reaches `workspace/reports/proof-carry/summary.json`. Diagnosing the rejections below needed a driver that skipped `_remove_agent`.
@@ -426,6 +426,11 @@ The full guide is [`./resources-and-caching.md`](./resources-and-caching.md) (Se
 - **An ad-hoc command is OOM-killed at 1 GiB:** commands the broker does not recognise run as `light` (1 CPU, 1 GiB). Pass `-Class` / `--class` (for example `build` or `phase-dynamic`).
 - **`RunLockTimeout`:** another container held the run's `ledger` or `merge` lock for longer than `FRAMAC_LOCK_TIMEOUT`. A holder whose heartbeat stopped (`FRAMAC_LOCK_STALE`, default 120 s) is broken automatically, and an interrupted merge is rolled back from `state/merge-journal.json` by the next merge.
 - **Need the previous static behavior:** `FRAMAC_BROKER=off` (`-NoBroker`) for container sizing, `FRAMAC_SCHEDULER=waves` for Phase 3 dispatch.
+
+### Symptom: `test_budget_is_capped_by_env_and_free_disk` Fails Under `-n` With `assert ... == int((0.25 * <free>))`
+- **Fixed test race, not a pipeline defect** (seen 2026-11-09 in a full `-n 6` run on branch `formal-discovery-tiers` while an analysis was running; passes alone).
+- **Cause:** the test read `shutil.disk_usage(tmp_path).free` once and `Store.budget_bytes()` read it again; other writers (parallel workers, a live run) changed the free space in between.
+- **Fix:** [`../tests/test_cache.py`](../tests/test_cache.py) pins `cache.shutil.disk_usage` to one measurement.
 
 ### Symptom: `test_sh_new_run_allocation_is_atomic_under_concurrency` fails on Windows with `child_copy: cygheap read copy failed ... Win32 error 299` or return code `3221225794`
 

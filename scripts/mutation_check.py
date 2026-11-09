@@ -58,6 +58,9 @@ DEFAULT_MAX_FUNCTIONS = 20
 DEFAULT_MAX_MUTANTS = 6
 
 _REL_OP_FLIP = [("<=", "<"), (">=", ">"), ("<", "<="), (">", ">=")]
+_C_PUNCT = frozenset("-+*/%&|^!~<>=?:")
+# Longest first, so `->`, `<<=` and `<=` are never read as `>` or `<`.
+_C_OPERATOR_RE = re.compile(r"->|<<=|>>=|<<|>>|<=|>=|==|!=|&&|\|\||\+\+|--|[-+*/%&|^]=|[-+*/%&|^!~<>=?:]")
 _RETURN_CONST_RE = re.compile(r"\breturn\s+(-?\d+)\s*;")
 _ENSURES_CLAUSE_RE = re.compile(r"\bensures\b[^;]*;")
 # WP report statuses that carry goal results; any other status is a failed run.
@@ -95,12 +98,43 @@ def spec_mutants(contract_acsl: str, max_mutants: int) -> list[tuple[str, str]]:
     return out[:max_mutants]
 
 
+def _c_operators(body_text: str) -> list[tuple[int, int, str]]:
+    """
+    C operators of the code (not comments, strings or ACSL), as (start, end, text), by maximal munch.
+
+    tokenize_c_acsl emits one token per punctuation character, so adjacent characters are regrouped here: without
+    that, `>` matches inside `->` and `>>`, and `<` inside `<=`.
+    """
+    out: list[tuple[int, int, str]] = []
+    run_start = run_end = -1
+
+    def flush() -> None:
+        if run_start < 0:
+            return
+        for m in _C_OPERATOR_RE.finditer(body_text, run_start, run_end):
+            out.append((m.start(), m.end(), m.group(0)))
+
+    for tok in tokenize_c_acsl(body_text):
+        if tok.kind == "c_token" and len(tok.text) == 1 and tok.text in _C_PUNCT:
+            if tok.start != run_end:
+                flush()
+                run_start = tok.start
+            run_end = tok.end
+        else:
+            flush()
+            run_start = run_end = -1
+    flush()
+    return out
+
+
 def impl_mutants(body_text: str, max_mutants: int) -> list[tuple[str, str]]:
     """Implementation mutants: flip relational operators, change return constants."""
     out: list[tuple[str, str]] = []
+    ops = _c_operators(body_text)
     for op, flipped in _REL_OP_FLIP:
-        if op in body_text:
-            out.append((f"flip-{op}", body_text.replace(op, flipped, 1)))
+        hit = next(((s, e) for s, e, text in ops if text == op), None)
+        if hit is not None:
+            out.append((f"flip-{op}", body_text[: hit[0]] + flipped + body_text[hit[1] :]))
         if len(out) >= max_mutants:
             break
     for m in _RETURN_CONST_RE.finditer(body_text):
@@ -378,6 +412,48 @@ def classify_open_unit(wp_report: dict | None) -> str:
     return "spec_limited"
 
 
+def _module_cppflags_resolver(run_dir: Path):
+    """
+    (work-relative file, function) -> (cppflags, source) with the module's WP cppflags, as wp-sweep proves with.
+
+    A hard-coded `-I.` made every mutant of a target with include paths fail to preprocess (libmnl:
+    `libmnl/libmnl.h: No such file or directory`), so every function scored `not_applicable`. Without a ledger or a
+    build plan (a bare directory, unit tests) the old `-I.` default stays, labelled `default`. A module whose flags
+    cannot be resolved returns (None, reason), and the function is skipped rather than checked with wrong flags.
+    """
+    try:
+        import shlex
+
+        import pipeline_make
+
+        ledger = load_json_optional(run_dir / pipeline_make.LEDGER_JSON, [])
+        modules: dict[tuple[str, str], str] = {}
+        by_fn: dict[str, set[str]] = {}
+        for unit in ledger if isinstance(ledger, list) else []:
+            if isinstance(unit, dict) and unit.get("module") and unit.get("function"):
+                modules[(str(unit.get("file")), str(unit["function"]))] = str(unit["module"])
+                by_fn.setdefault(str(unit["function"]), set()).add(str(unit["module"]))
+        plan = pipeline_make.build_plan(run_dir) if modules else None
+    except Exception as exc:  # no build plan: keep the old default, but say so
+        reason = f"default (no build plan: {type(exc).__name__})"
+        return lambda _file, _fn: ("-I.", reason)
+    if plan is None:
+        return lambda _file, _fn: ("-I.", "default (no ledger modules)")
+
+    def resolve(file: str, fn: str) -> tuple[str | None, str]:
+        module = modules.get((file, fn))
+        if module is None and len(by_fn.get(fn, ())) == 1:
+            module = next(iter(by_fn[fn]))
+        if module is None:
+            return None, f"no ledger module for {file}#{fn}"
+        flags, reason = plan.wp_cppflags_for(module)
+        if flags is None:
+            return None, f"module {module}: {reason}"
+        return shlex.join(flags), f"module {module}"
+
+    return resolve
+
+
 def run_mutation_check(
     run_dir: Path,
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
@@ -391,6 +467,8 @@ def run_mutation_check(
     work = run_dir / "workspace" / "work"
     out_path = out_path or run_dir / "workspace" / "reports" / "mutation.json"
     doc: dict[str, Any] = {"schema": MUTATION_SCHEMA, "generated_at": utc_now(), "functions": {}}
+    skipped: list[dict] = []
+    flags_for = _module_cppflags_resolver(run_dir)
     if wp_dir.is_dir():
         reports = sorted(wp_dir.glob("*.json"))
         for rep_path in reports[:max_functions]:
@@ -407,14 +485,26 @@ def run_mutation_check(
                 c_file = cand if cand.is_file() else c_file
             if not c_file.is_file():
                 continue
-            doc["functions"][fn] = check_function(
+            try:
+                rel = c_file.resolve().relative_to(work.resolve()).as_posix()
+            except ValueError:
+                rel = c_file.name
+            cppflags, source = flags_for(rel, fn)
+            if cppflags is None:
+                skipped.append({"function": fn, "file": rel, "reason": source})
+                continue
+            result = check_function(
                 c_file,
                 fn,
-                "-I.",
+                cppflags,
                 run_dir / "workspace" / "reports" / "mutation-wp",
                 wp_runner=wp_runner,
                 max_mutants=max_mutants,
             )
+            result["cppflags_source"] = source
+            doc["functions"][fn] = result
+    if skipped:
+        doc["skipped"] = skipped
     totals: dict[str, Any] = {
         "functions": len(doc["functions"]),
         "spec_mutants": sum(f.get("spec_mutants", 0) for f in doc["functions"].values()),

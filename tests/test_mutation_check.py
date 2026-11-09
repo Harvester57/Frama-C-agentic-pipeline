@@ -51,6 +51,19 @@ def test_impl_mutants_flip_operators_and_return_constants() -> None:
     assert len(mutants) <= 6
 
 
+def test_impl_mutants_flip_only_whole_relational_operators() -> None:
+    # libmnl A/B: plain substring flips produced `attr->=nla_len`, `<==` and `>==`, which WP cannot parse.
+    body = '{ if ((int)attr->nla_len <= len && (x >> 2) > 1) return 0; /* a < b */ s = "p<q"; return y >= z; }'
+    mutants = dict(mc.impl_mutants(body, 6))
+    assert mutants["flip-<="] == body.replace("nla_len <= len", "nla_len < len")
+    assert mutants["flip->="] == body.replace("y >= z", "y > z")
+    assert mutants["flip->"] == body.replace(") > 1)", ") >= 1)")
+    assert "flip-<" not in mutants  # the only `<` is in a comment and a string
+    for text in mutants.values():
+        assert "->" in text and ">>" in text and "<==" not in text and ">==" not in text
+    assert mc.impl_mutants("{ return attr->nla_len; }", 6) == []
+
+
 @pytest.fixture(autouse=True)
 def _stub_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test starts with FRAMAC_MUTATION_STUB unset (default on)."""
@@ -383,3 +396,54 @@ def test_report_spec_quality_section(tmp_path: Path) -> None:
     data2 = {**data, "mutation": None}
     section2 = "\n".join(gr.spec_quality_section(data2))
     assert "mutation check" not in section2 and "prover_limited" in section2
+
+
+def _ledger_run(tmp_path: Path, module: str | None) -> Path:
+    run_dir = _fake_run(tmp_path)
+    units = [{"file": "m.c", "function": "sum", "module": module}] if module else []
+    (run_dir / "coverage-ledger.json").write_text(json.dumps(units), encoding="utf-8")
+    return run_dir
+
+
+class _FakePlan:
+    def wp_cppflags_for(self, module):
+        return (["-Iinclude", "-DX=1"], "") if module == "m" else (None, "no sidecar")
+
+
+def test_run_mutation_check_uses_the_modules_wp_cppflags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # libmnl A/B: the hard-coded `-I.` made every mutant fail on `libmnl/libmnl.h: No such file or directory`.
+    import pipeline_make
+
+    monkeypatch.setattr(pipeline_make, "build_plan", lambda run_dir: _FakePlan())
+    seen: set[str] = set()
+
+    def runner(c_file, fn, out_dir, cppflags="-I."):
+        seen.add(cppflags)
+        return {"status": "all_proven"}
+
+    doc = mc.run_mutation_check(_ledger_run(tmp_path, "m"), wp_runner=runner)
+    assert seen == {"-Iinclude -DX=1"}
+    assert doc["functions"]["sum"]["cppflags_source"] == "module m"
+
+
+def test_run_mutation_check_skips_a_function_whose_flags_are_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pipeline_make
+
+    monkeypatch.setattr(pipeline_make, "build_plan", lambda run_dir: _FakePlan())
+    doc = mc.run_mutation_check(_ledger_run(tmp_path, "other"), wp_runner=lambda *a, **k: {"status": "all_proven"})
+    assert doc["functions"] == {}
+    assert doc["skipped"] == [{"function": "sum", "file": "m.c", "reason": "module other: no sidecar"}]
+
+
+def test_run_mutation_check_without_a_ledger_keeps_the_default_flags(tmp_path: Path) -> None:
+    seen: set[str] = set()
+
+    def runner(c_file, fn, out_dir, cppflags="-I."):
+        seen.add(cppflags)
+        return {"status": "all_proven"}
+
+    doc = mc.run_mutation_check(_fake_run(tmp_path), wp_runner=runner)
+    assert seen == {"-I."}
+    assert doc["functions"]["sum"]["cppflags_source"].startswith("default")
