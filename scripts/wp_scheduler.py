@@ -2005,7 +2005,12 @@ def _callee_history(state: dict | None, task: dict) -> dict | None:
     """
     current = task.get("agent_id")
     key = _key(task)
-    aids = [a for a in _agents_of(state, f"prove:{key}") + _agents_of(state, str(task.get("id") or "")) if a != current]
+    # Newest first across both tasks: a later negotiate attempt on the callee knows more than its first prove agent.
+    tids = {f"prove:{key}", str(task.get("id") or "")}
+    agents = (state or {}).get("agents") or {}
+    aids = [
+        str(a) for a, tid in reversed(list(agents.items())) if tid in tids and a != current and is_safe_agent_id(str(a))
+    ]
     scratches = [Path("agents") / a / "scratch" for a in aids]
     if not any((sc / prover_candidates.STATE_FILE).is_file() for sc in scratches):
         # Fallback: a prover scratch of the same function whose budget names the same file, newest first.

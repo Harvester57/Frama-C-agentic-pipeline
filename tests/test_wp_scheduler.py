@@ -1973,7 +1973,7 @@ def _write_candidates_state(run_dir, aid, function):
             "next_id": 5,
             "best": "c3",
             "best_digest": "d3",
-            "best_rank": [1, 0, 17],
+            "best_rank": {"failed": 1, "proved": 17, "invalid": 0},
             "best_files": None,
             "candidates": {"d3": {"refuted": False}, "d4": {"refuted": False}},
             "history": [entry("c3", "wp", None, 1, 17), entry("c4", "guardrail", "passed_dynamic_oracle", 2, 16)],
@@ -1996,12 +1996,24 @@ def test_negotiate_kwargs_carry_the_callers_seam_goals_and_the_callee_history(ru
     assert kw["callee_history"] == {
         "agent_id": "prove-g",
         "iterations": 2,
-        "best_rank": [1, 0, 17],
+        "best_rank": {"failed": 1, "proved": 17, "invalid": 0},
         "highest_proved": 17,
         "last_wp_status": "unproven_goals_remain",
         "last_guardrail_status": "passed_dynamic_oracle",
     }
     assert S._describe(neg, None, state)["caller_evidence_goals"] == 2
+
+
+def test_callee_history_prefers_the_newest_agent_across_prove_and_negotiate(run_dir, monkeypatch):
+    # libmnl run 1: negotiate-<fn>-2..5 all showed the first prove-<fn> agent, because prove agents were listed first.
+    monkeypatch.delenv("FRAMAC_NEGOTIATE_EVIDENCE", raising=False)
+    state, neg = _negotiate_evidence_state(run_dir)
+    state["agents"]["negotiate-g-2"] = neg["id"]
+    neg["agent_id"] = "negotiate-g-3"
+    state["agents"]["negotiate-g-3"] = neg["id"]
+    _write_candidates_state(run_dir, "prove-g", "g")
+    _write_candidates_state(run_dir, "negotiate-g-2", "g")
+    assert S._callee_history(state, neg)["agent_id"] == "negotiate-g-2"
 
 
 def test_negotiate_evidence_caps_goals_and_finds_the_callee_by_name(run_dir, monkeypatch):

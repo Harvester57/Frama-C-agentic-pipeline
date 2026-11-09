@@ -1012,7 +1012,7 @@ NEG_EVIDENCE = [
 NEG_HISTORY = {
     "agent_id": "a-3",
     "iterations": 4,
-    "best_rank": [1, 0, 17],
+    "best_rank": {"failed": 1, "proved": 17, "invalid": 0},
     "highest_proved": 17,
     "last_wp_status": "unproven_goals_remain",
     "last_guardrail_status": "passed_dynamic_oracle",
@@ -1058,10 +1058,16 @@ def test_negotiate_brief_renders_the_seam_evidence_after_the_requests(tmp_path):
     assert "  - line 102, postcondition `len_ok`: Unknown (`step_c_contract_postcondition`)" in after
     assert "- `send_pkt` (`src/send.c`, no WP report found):\n  - no unproven goal at the call site" in after
     assert (
-        "Agent `a-3` ran 4 iterations; best rank (failed, invalid, proved) = (1, 0, 17); last WP status "
+        "Agent `a-3` ran 4 iterations; best rank: failed 1, proved 17, invalid 0; last WP status "
         "`unproven_goals_remain`, last guardrail `passed_dynamic_oracle`." in after
     )
     assert "say which caller goal would remain open" in after
+
+
+def test_negotiate_brief_renders_a_missing_best_rank_as_none_recorded(tmp_path):
+    run_dir = _negotiate_run(tmp_path)
+    brief = _negotiate_brief(run_dir, caller_evidence=NEG_EVIDENCE, callee_history={**NEG_HISTORY, "best_rank": None})
+    assert "best rank: none recorded;" in brief
 
 
 def test_negotiate_brief_without_evidence_is_unchanged(tmp_path):

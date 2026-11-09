@@ -2468,11 +2468,17 @@ def _negotiation_evidence_section(caller_evidence: list[dict] | None, callee_his
                 out += f"  - line {g.get('line')}, {prop}: {g.get('status') or 'Unknown'} (`{bucket}`)\n"
     if callee_history:
         rank = callee_history.get("best_rank")
-        rank_text = f"({', '.join(str(x) for x in rank)})" if isinstance(rank, list | tuple) else "none recorded"
+        # prover_candidates stores best_rank as a dict ({failed, proved, invalid, ...}); older states used a list.
+        if isinstance(rank, dict) and rank:
+            rank_text = ", ".join(f"{k} {v}" for k, v in rank.items() if v is not None)
+        elif isinstance(rank, list | tuple) and rank:
+            rank_text = f"({', '.join(str(x) for x in rank)})"
+        else:
+            rank_text = "none recorded"
         out += (
             "\n### Your function's previous prover run\n\n"
             f"Agent `{callee_history.get('agent_id')}` ran {callee_history.get('iterations')} iterations; "
-            f"best rank (failed, invalid, proved) = {rank_text}; "
+            f"best rank: {rank_text}; "
             f"last WP status `{callee_history.get('last_wp_status')}`, "
             f"last guardrail `{callee_history.get('last_guardrail_status')}`. "
             "Its scratch is read-only to you; do not copy clauses the guardrail refuted.\n"

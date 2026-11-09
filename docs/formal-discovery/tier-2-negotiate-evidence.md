@@ -48,7 +48,7 @@ New A/B switch: `FRAMAC_NEGOTIATE_EVIDENCE` (`off` disables the extra sections; 
   ```
   ### Your function's previous prover run
 
-  Agent `a-3` ran 4 iterations; best rank (failed, invalid, proved) = (1, 0, 17); last WP status `unproven_goals_remain`, last guardrail `passed_dynamic_oracle`. Its scratch is read-only to you; do not copy clauses the guardrail refuted.
+  Agent `a-3` ran 4 iterations; best rank: failed 1, proved 17, invalid 0; last WP status `unproven_goals_remain`, last guardrail `passed_dynamic_oracle`. Its scratch is read-only to you; do not copy clauses the guardrail refuted.
   ```
 
   Then one instruction sentence: "Prove the requested clauses first; if a requested clause is exactly what the caller's goal needs but cannot hold, say which caller goal would remain open."
