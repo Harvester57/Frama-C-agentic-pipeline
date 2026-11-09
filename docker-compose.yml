@@ -68,8 +68,9 @@ services:
       - FRAMAC_LOOP_TEMPLATES
       - FRAMAC_SPEC_KB
       - FRAMAC_NEGOTIATE_EVIDENCE
-      - FRAMAC_RESOURCES_VERBOSE
       - FRAMAC_MUTATION_STUB
+      - FRAMAC_CANDIDATE_RANK
+      - FRAMAC_RESOURCES_VERBOSE
     volumes:
       - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro
       - ${FRAMAC_RUN_DIR:?set FRAMAC_RUN_DIR to a run directory outside the target}:/framac-run
