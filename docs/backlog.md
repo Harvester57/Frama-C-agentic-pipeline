@@ -37,6 +37,10 @@ A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions.
 - [ ] Decide D4 (E-ACSL's share of each campaign) in plan step S10, after fixing F17 and checking the seeded benchmark for bugs only E-ACSL can catch.
 - [ ] Work through the plan's steps, updating its status table and each defect's status in `phase1-review.md`.
 
+## 1c. Formal-discovery tiers ([`./formal-discovery-plan.md`](./formal-discovery-plan.md))
+
+- [x] Tier 2: seam evidence in the negotiate brief (callers' call-site goals, the callee's previous prover run), behind `FRAMAC_NEGOTIATE_EVIDENCE` ([`./formal-discovery/tier-2-negotiate-evidence.md`](./formal-discovery/tier-2-negotiate-evidence.md)). Unit-tested; the `benchmark.py` / `benchmark_compare.py` acceptance run against the previous baseline is still to do.
+
 ## 2. Verification gaps (not testable on this machine)
 
 - [ ] **Podman**, rootless and rootful: per-controller flags, the refusal when memory/pids limits cannot be enforced, and `sandbox.outer: podman-hardened`. Podman is not installed here (it would need installing in WSL Ubuntu).

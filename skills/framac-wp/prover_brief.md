@@ -104,6 +104,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    - Isolate the failing goal by passing `--prop <clause_name> --dump-goal` to `run_wp_function.py` and read `vc_goal_dumps` in the JSON output to see the exact `Goal ... : ... Prove: ...` sequent.
    - Check if `{function_name}` relies on caller guarantees (e.g., `len <= MAX_PDU_SIZE`, `buf != \null`, `\valid_read(buf + (0 .. len - 1))`). Add the minimal necessary `requires` clause to `agents/{agent_id}/scratch/work/{header_file}`, subject to Rule 3.
     - Check if `{function_name}` fails because a **callee function `g()`** has a weak contract in its `.h` header. Do not edit `g()`; add an entry to `strengthening_requests` in your result (`callee`, `header_file`, optional `callee_file`, `needed_clause`, `reason`).
+    - If this brief ends with strengthening requests from callers, you are the callee they negotiate with. Under the requests, the brief lists each caller's unproven goals at the call site (line, kind, verdict, bucket) with the WP report they come from, and summarizes the last prover run on your function. Prove the requested clauses first; if one is exactly what a caller goal needs but cannot hold, say in `unproven_goals` which caller goal stays open.
 2. **Common ACSL Traps to Avoid (WP + E-ACSL Intersection Cheat Sheet):**
 
    | Rule / Construct | WRONG (Fails WP, E-ACSL, or Parser) | RIGHT (Valid in Both WP and E-ACSL) |

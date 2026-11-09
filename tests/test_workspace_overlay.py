@@ -876,3 +876,121 @@ def test_prover_edit_outside_function_scope_is_still_rejected(tmp_path):
             cppflags=UMBRELLA_FLAGS,
             verify_hook=lambda: (True, ""),
         )
+
+
+# ---------------------------------------------------------------------------
+# Negotiate brief: seam evidence under the Contract Negotiation Requests
+# ---------------------------------------------------------------------------
+
+NEG_REQUEST = {
+    "id": "req_0001_read_pkt_to_parse_hdr",
+    "caller_function": "read_pkt",
+    "callee_function": "parse_hdr",
+    "needed_clause": "ensures \\result <= len;",
+}
+NEG_EVIDENCE = [
+    {
+        "caller": "read_pkt",
+        "caller_file": "src/pkt.c",
+        "report": "agents/a-7/artifacts/wp_read_pkt.json",
+        "goals": [
+            {
+                "line": 88,
+                "kind": "precondition",
+                "status": "Unknown",
+                "annotation": "typed_read_pkt_call_parse_hdr_requires",
+                "diagnostic_bucket": "step_c_caller_precondition",
+            },
+            {
+                "line": 102,
+                "kind": "postcondition",
+                "status": "Unknown",
+                "annotation": "len_ok",
+                "diagnostic_bucket": "step_c_contract_postcondition",
+            },
+        ],
+    },
+    {"caller": "send_pkt", "caller_file": "src/send.c", "report": None, "goals": []},
+]
+NEG_HISTORY = {
+    "agent_id": "a-3",
+    "iterations": 4,
+    "best_rank": [1, 0, 17],
+    "highest_proved": 17,
+    "last_wp_status": "unproven_goals_remain",
+    "last_guardrail_status": "passed_dynamic_oracle",
+}
+
+
+def _negotiate_run(tmp_path: Path) -> Path:
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    (target / "src" / "hdr.c").write_text("int parse_hdr(int len) { return len; }\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    WO.init_overlay(target, run_dir / "workspace")
+    return run_dir
+
+
+def _negotiate_brief(run_dir: Path, **kwargs) -> str:
+    res = WO.prepare_agent(
+        run_dir=run_dir,
+        agent_id="negotiate-parse_hdr",
+        role="prover",
+        function="parse_hdr",
+        c_file="src/hdr.c",
+        requests=[NEG_REQUEST],
+        **kwargs,
+    )
+    return (run_dir / res["brief_file"]).read_text(encoding="utf-8")
+
+
+def test_negotiate_brief_renders_the_seam_evidence_after_the_requests(tmp_path):
+    run_dir = _negotiate_run(tmp_path)
+    brief = _negotiate_brief(run_dir, caller_evidence=NEG_EVIDENCE, callee_history=NEG_HISTORY)
+    section = brief.split("## Contract Negotiation Requests", 1)[1]
+    json_block, after = section.split("```json\n", 1)[1].split("\n```\n", 1)
+    assert json.loads(json_block) == [NEG_REQUEST]
+    assert after.index("### Why the callers stalled (seam evidence)") < after.index(
+        "### Your function's previous prover run"
+    )
+    assert "- `read_pkt` (`src/pkt.c`, report `agents/a-7/artifacts/wp_read_pkt.json`):" in after
+    assert (
+        "  - line 88, precondition `typed_read_pkt_call_parse_hdr_requires`: Unknown (`step_c_caller_precondition`)"
+        in after
+    )
+    assert "  - line 102, postcondition `len_ok`: Unknown (`step_c_contract_postcondition`)" in after
+    assert "- `send_pkt` (`src/send.c`, no WP report found):\n  - no unproven goal at the call site" in after
+    assert (
+        "Agent `a-3` ran 4 iterations; best rank (failed, invalid, proved) = (1, 0, 17); last WP status "
+        "`unproven_goals_remain`, last guardrail `passed_dynamic_oracle`." in after
+    )
+    assert "say which caller goal would remain open" in after
+
+
+def test_negotiate_brief_without_evidence_is_unchanged(tmp_path):
+    run_dir = _negotiate_run(tmp_path)
+    plain = _negotiate_brief(run_dir)
+    assert _negotiate_brief(run_dir, caller_evidence=[], callee_history=None) == plain
+    assert "seam evidence" not in plain and "previous prover run" not in plain
+    # Only the history: its subsection alone, then the instruction.
+    only_history = _negotiate_brief(run_dir, callee_history=NEG_HISTORY)
+    assert "### Why the callers stalled" not in only_history
+    assert "### Your function's previous prover run" in only_history
+
+
+def test_prepare_agent_cli_reads_the_evidence_files(tmp_path, capsys):
+    run_dir = _negotiate_run(tmp_path)
+    (run_dir / "workspace/reports").mkdir(parents=True, exist_ok=True)
+    (run_dir / "workspace/reports/strengthen_requests.json").write_text(
+        json.dumps({"requests": [NEG_REQUEST]}), encoding="utf-8"
+    )
+    ev, hist = tmp_path / "ev.json", tmp_path / "hist.json"
+    ev.write_text(json.dumps(NEG_EVIDENCE), encoding="utf-8")
+    hist.write_text(json.dumps(NEG_HISTORY), encoding="utf-8")
+    base = ["prepare-agent", "--run-dir", str(run_dir), "--agent-id", "negotiate-parse_hdr", "--role", "prover"]
+    base += ["--function", "parse_hdr", "--file", "src/hdr.c", "--request-id", NEG_REQUEST["id"]]
+    assert WO.main([*base, "--caller-evidence-json", str(ev), "--callee-history-json", str(hist)]) == 0
+    brief = (run_dir / json.loads(capsys.readouterr().out)["brief_file"]).read_text(encoding="utf-8")
+    assert "line 88, precondition" in brief and "Agent `a-3` ran 4 iterations" in brief
+    # A history file that is not an object is refused.
+    assert WO.main([*base, "--callee-history-json", str(ev)]) != 0

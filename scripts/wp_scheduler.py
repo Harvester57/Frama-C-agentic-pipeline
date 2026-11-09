@@ -63,6 +63,7 @@ from framac_common import (  # noqa: E402
     RunLockTimeout,
     atomic_write_json,
     eva_alarm_in_file,
+    is_safe_agent_id,
     load_agent_result_json,
     load_json_optional,
     load_json_strict,
@@ -110,6 +111,11 @@ MAX_NEGOTIATIONS_PER_PAIR = 2  # negotiation rounds per (caller, callee) pair
 # Dispatches of one callee's negotiation task: many callers can each ask for a stronger contract the callee cannot
 # be proved to give, and every round costs an agent run for the same stall.
 MAX_NEGOTIATION_ROUNDS_PER_CALLEE = 3
+# Seam evidence in a negotiate brief (A/B switch FRAMAC_NEGOTIATE_EVIDENCE, `off` disables): each caller's unproven
+# goals at the call site and the callee's previous prover run.
+NEGOTIATE_EVIDENCE_ENV = "FRAMAC_NEGOTIATE_EVIDENCE"
+MAX_EVIDENCE_GOALS_PER_CALLER = 12
+_SEAM_BUCKETS = frozenset({"step_c_caller_precondition", "step_c_contract_postcondition"})
 MAX_MERGE_ATTEMPTS = 2  # a prover whose merge fails twice is blocked
 MAX_ANALYSIS_ERRORS = 2  # a WP analysis_error is retried once, then the units are blocked
 MAX_INVALID_RESULTS = 2  # a malformed result is re-run once with a fresh agent
@@ -1918,7 +1924,133 @@ def _replay_reports(fingerprint: str, cand: dict) -> list[str]:
     return found
 
 
-def _prepare_kwargs(task: dict) -> dict:
+def negotiate_evidence_enabled() -> bool:
+    return os.environ.get(NEGOTIATE_EVIDENCE_ENV, "on").strip().lower() != "off"
+
+
+def _agents_of(state: dict | None, task_id: str) -> list[str]:
+    """Agent ids assigned to a task, most recent first (state["agents"] keeps assignment order)."""
+    agents = (state or {}).get("agents") or {}
+    return [aid for aid, tid in reversed(list(agents.items())) if tid == task_id and is_safe_agent_id(str(aid))]
+
+
+def _caller_report(state: dict | None, caller: dict) -> tuple[str | None, dict | None]:
+    """
+    A stalled caller's most recent WP report: the task's own `wp_report`, else the report promoted from its
+    latest agent (agents/<id>/artifacts/wp_<fn>.json, the breaker's source), else the canonical
+    workspace/reports/wp/<fn>.json, which may be stale.
+    """
+    fn = str(caller.get("function") or "")
+    paths: list[str] = [caller["wp_report"]] if caller.get("wp_report") else []
+    aids = [caller.get("agent_id")] if is_safe_agent_id(str(caller.get("agent_id") or "")) else []
+    for aid in dict.fromkeys([*aids, *_agents_of(state, str(caller.get("id") or ""))]):
+        paths.append(f"agents/{aid}/artifacts/wp_{fn}.json")
+    breaker = ((state or {}).get("tasks") or {}).get(f"breaker:{_key(caller)}") or {}
+    if breaker.get("wp_report"):
+        paths.append(breaker["wp_report"])
+    paths.append(f"workspace/reports/wp/{fn}.json")
+    for path in dict.fromkeys(paths):
+        try:
+            report = _load_report(path)
+        except OSError:
+            report = None
+        if report is not None and report.get("function") in (None, fn):
+            return path, report
+    return None, None
+
+
+def _caller_evidence(state: dict | None, task: dict) -> list[dict]:
+    """
+    For a negotiate task, each caller's unproven goals at the seam with the callee: goals in the caller-precondition
+    or contract-postcondition buckets, or whose annotation names the callee. At most 12 goals per caller.
+    """
+    tasks = (state or {}).get("tasks") or {}
+    callee = str(task.get("function") or "")
+    names_callee = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(callee)}(?![A-Za-z0-9_])") if callee else None
+    out: list[dict] = []
+    for cid in task.get("callers") or []:
+        caller = tasks.get(cid) or {}
+        _, _, ckey = str(cid).partition(":")
+        cfile, _, cfn = ckey.rpartition("#")
+        entry: dict[str, Any] = {
+            "caller": caller.get("function") or cfn,
+            "caller_file": caller.get("file") or cfile,
+            "report": None,
+            "goals": [],
+        }
+        path, report = _caller_report(
+            state, {"id": cid, "function": entry["caller"], "file": entry["caller_file"], **caller}
+        )
+        if report is not None:
+            entry["report"] = Path(path).as_posix() if path else None
+            raw = report.get("unproven_goals")
+            for goal in raw if isinstance(raw, list) else []:
+                if not isinstance(goal, dict):
+                    continue
+                annotation = str(goal.get("annotation") or "")
+                if goal.get("diagnostic_bucket") in _SEAM_BUCKETS or (names_callee and names_callee.search(annotation)):
+                    entry["goals"].append(
+                        {k: goal.get(k) for k in ("line", "kind", "status", "annotation", "diagnostic_bucket")}
+                    )
+                    if len(entry["goals"]) >= MAX_EVIDENCE_GOALS_PER_CALLER:
+                        break
+        out.append(entry)
+    return out
+
+
+def _callee_history(state: dict | None, task: dict) -> dict | None:
+    """
+    The callee's previous prover run (prover_candidates.status of its latest prover scratch other than this task's
+    own agent), trimmed for the brief. None when no prover of the callee recorded a candidate.
+    """
+    current = task.get("agent_id")
+    key = _key(task)
+    aids = [a for a in _agents_of(state, f"prove:{key}") + _agents_of(state, str(task.get("id") or "")) if a != current]
+    scratches = [Path("agents") / a / "scratch" for a in aids]
+    if not any((sc / prover_candidates.STATE_FILE).is_file() for sc in scratches):
+        # Fallback: a prover scratch of the same function whose budget names the same file, newest first.
+        found = []
+        for budget in Path("agents").glob(f"*/scratch/{prover_candidates.BUDGET_FILE}"):
+            aid = budget.parent.parent.name
+            if aid == current or not is_safe_agent_id(aid):
+                continue
+            data = _load_report(budget) or {}
+            if data.get("function") == task.get("function") and data.get("file") in (None, "", task.get("file")):
+                found.append((budget.stat().st_mtime, budget.parent))
+        scratches = [sc for _, sc in sorted(found, key=lambda x: x[0], reverse=True)]
+    for scratch in scratches:
+        if not (scratch / prover_candidates.STATE_FILE).is_file():
+            continue
+        st = prover_candidates.status(scratch)
+        history = [h for h in st.get("history") or [] if isinstance(h, dict)]
+        return {
+            "agent_id": st.get("agent_id"),
+            "iterations": st.get("iterations"),
+            "best_rank": st.get("best_rank"),
+            "highest_proved": st.get("highest_proved"),
+            "last_wp_status": next((h["wp_status"] for h in reversed(history) if h.get("wp_status")), None),
+            "last_guardrail_status": next(
+                (h["guardrail_status"] for h in reversed(history) if h.get("guardrail_status")), None
+            ),
+        }
+    return None
+
+
+def _negotiate_evidence(state: dict | None, task: dict) -> dict:
+    """caller_evidence and callee_history for a negotiate brief; never raises (a failure leaves a key out)."""
+    out: dict[str, Any] = {}
+    try:
+        out["caller_evidence"] = _caller_evidence(state, task)
+    except Exception:  # evidence is advisory: a broken report never blocks a dispatch
+        out["caller_evidence"] = []
+    try:
+        out["callee_history"] = _callee_history(state, task)
+    except Exception:
+        out["callee_history"] = None
+    return out
+
+
+def _prepare_kwargs(task: dict, state: dict | None = None) -> dict:
     kind = task["kind"]
     module = task.get("module") if task.get("module") != "unknown" else None
     if kind == "prove":
@@ -1938,13 +2070,14 @@ def _prepare_kwargs(task: dict) -> dict:
             "c_file": task["file"],
             "header_file": task.get("header"),
             "requests": [by_id[r] for r in task.get("requests") or [] if r in by_id],
+            **(_negotiate_evidence(state, task) if negotiate_evidence_enabled() else {}),
         }
     if kind == "arch":
         return {"module": module, "header_file": task.get("header")}
     return {"module": module, "candidate_fp": task["fingerprint"]}
 
 
-def _describe(task: dict, ctx: Ctx | None = None) -> dict:
+def _describe(task: dict, ctx: Ctx | None = None, state: dict | None = None) -> dict:
     out: dict[str, Any] = {
         "task": task["id"],
         "kind": task["kind"],
@@ -1969,6 +2102,12 @@ def _describe(task: dict, ctx: Ctx | None = None) -> dict:
         by_id = {r.get("id"): r for r in _requests()}
         out["requests"] = [by_id[r] for r in task.get("requests") or [] if r in by_id]
         out["callers"] = list(task.get("callers") or [])
+        if negotiate_evidence_enabled():
+            try:
+                evidence = _caller_evidence(state, task)
+            except Exception:
+                evidence = []
+            out["caller_evidence_goals"] = sum(len(e["goals"]) for e in evidence)
     elif task["kind"] == "breaker" and task.get("wp_report"):
         out["wp_report"] = task["wp_report"]  # the stalled prover's promoted WP report (unproven goals)
     if task.get("brief_file"):
@@ -2283,7 +2422,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
         save_schedule(state)
         snapshot = {tid: json.loads(json.dumps(state["tasks"][tid])) for tid in picked}
         if not prepare:
-            out["tasks"] = [_describe(snapshot[tid], ctx) for tid in picked]
+            out["tasks"] = [_describe(snapshot[tid], ctx, state) for tid in picked]
             out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
             out["done"] = _is_done(state, ctx)
             return out
@@ -2293,12 +2432,13 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
     failures: dict[str, str] = {}
     if picked:
         worker_cap = min(len(picked), os.cpu_count() or 4, 16)
+        sched = state  # the schedule the snapshot was taken from: negotiate evidence reads callers and agents
 
         def _do_prepare(tid: str) -> tuple[str, dict | None, str | None]:
             task = snapshot[tid]
             try:
                 res = DEPS.prepare_agent(
-                    Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task)
+                    Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task, sched)
                 )
                 return tid, res, None
             except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running
@@ -2390,7 +2530,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                     out["skipped"].append({"task": tid, "agent_id": aid, "reason": neg_refusal})
                     continue
             task["brief_file"] = prepared[tid].get("brief_file")
-            out["tasks"].append(_describe(task, ctx))
+            out["tasks"].append(_describe(task, ctx, state))
             if task["brief_file"]:
                 out["briefs"].append(task["brief_file"])
         out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
