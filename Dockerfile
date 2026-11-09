@@ -15,8 +15,9 @@
 # own Debian stage. Bump the two digests together; CI's toolchain check (image_toolchain.py compare)
 # fails when the release, gcc or glibc drift apart.
 #
-# Both images create /framac-scratch, mode 1777: a new named scratch volume mounted there copies that mode,
-# so any non-root uid can write the capture's scratch tree without a chmod step.
+# Both images create /framac-scratch and /framac-cache, mode 1777: a new named scratch volume (or a named
+# cache volume) mounted there copies that mode on its first mount, so any non-root uid can write the
+# capture's scratch tree (or the shared cache) without a chmod step.
 ARG FRAMAC_BASE=framac/frama-c:dev@sha256:2296220f5d51cd9842db1d83f0c84390298100bc4efeb1bcab6bad557866f124
 # MetAcsl, built from source: its 0.11 release does not compile against Frama-C 35 (Fileloc.t), the
 # development branch does (feasibility test of 2026-11-07, plan step I0).
@@ -81,8 +82,8 @@ COPY templates/ /opt/framac-pipeline/templates/
 COPY schemas/ /opt/framac-pipeline/schemas/
 RUN chmod -R a+rX /opt/framac-pipeline \
     && chmod a+x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh \
-    && mkdir -p /home/framac/.cache /framac-run /framac-scratch \
-    && chmod 1777 /home/framac /home/framac/.cache /framac-run /framac-scratch
+    && mkdir -p /home/framac/.cache /framac-run /framac-scratch /framac-cache \
+    && chmod 1777 /home/framac /home/framac/.cache /framac-run /framac-scratch /framac-cache
 
 WORKDIR /framac-run
 ENTRYPOINT ["/bin/bash", "-lc"]
@@ -153,8 +154,8 @@ COPY docs/references/ /opt/framac-pipeline/docs/references/
 # directory must be writable by any uid (sticky, like /tmp), since that uid has no passwd entry or home.
 RUN chmod -R a+rX /opt/framac-pipeline \
     && chmod a+x /opt/framac-pipeline/scripts/*.py /opt/framac-pipeline/scripts/*.sh \
-    && mkdir -p /home/opam/.cache /framac-run /framac-scratch \
-    && chmod 1777 /home/opam /home/opam/.cache /framac-run /framac-scratch
+    && mkdir -p /home/opam/.cache /framac-run /framac-scratch /framac-cache \
+    && chmod 1777 /home/opam /home/opam/.cache /framac-run /framac-scratch /framac-cache
 # The Phase 0 model's dump module must compile and load against this kernel.
 RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
 

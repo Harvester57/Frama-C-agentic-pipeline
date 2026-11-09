@@ -29,7 +29,7 @@ The pool is the minimum over every source that applies, minus a reserve for the 
 
 The reserve is `FRAMAC_RESERVE_CPUS` (default max(0.5, 5 %)) and `FRAMAC_RESERVE_MEMORY` (default max(1 GiB, 10 %)). It is taken once, from the machine. A container whose size comes from a cgroup limit or a lease already holds a reserved grant, so no second reserve is taken inside it.
 
-The probe also records the CPU topology (SMT siblings, L3 domains, NUMA nodes) and the filesystem type of the run directory. On network or virtualized filesystems (NFS, CIFS, 9p, FUSE, virtiofs, Lustre, GPFS) it warns, because the many small files that WP, LibFuzzer and E-ACSL write are slow there; keep run directories on local disk.
+The probe also records the CPU topology (SMT siblings, L3 domains, NUMA nodes) and the filesystem type of the run directory. On network or virtualized filesystems (NFS, CIFS, 9p, FUSE, virtiofs, Lustre, GPFS) it warns, because the many small files that WP, LibFuzzer and E-ACSL write are slow there; keep run directories on local disk. The shared cache avoids this on its own (Section 5, *Where the store lives*). The run directory stays a bind mount because the orchestrator and its subagents read and write it from the host. With Docker Desktop on Windows, a run directory on the Windows disk reaches containers over 9p. For speed, put it inside the WSL2 filesystem and run the wrapper from WSL.
 
 ```text
 python3 /opt/framac-pipeline/scripts/resources.py budget      # this job: cpus, mem_mb, source
@@ -84,12 +84,12 @@ The fuzz budget is CPU-seconds per module: quick 60, standard 120, deep 900. A b
 The wrappers ([`../wrappers/framac-docker.sh`](../wrappers/framac-docker.sh) / [`../wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1)) call [`../scripts/resources.py`](../scripts/resources.py) `exec` with the host's Python (3.10 or newer). For each container it:
 
 1. **Leases resources** from the host pool:
-   - Requests are served first in, first out. A later request can jump ahead only when that doesn't delay the head of the queue.
+   - Requests are served by run: the run directory holding the fewest granted (gated) leases goes first, then first in, first out. A later request can jump ahead only when that doesn't delay the head of the queue.
    - Grants are elastic: `cpus = clamp(free // (1 + waiting), class min, min(class max, pool / 2))`. When a single `wp` job is running or scheduled with no competitors, it can expand up to `min(class max, pool)` (up to 8 CPUs) to fully utilize available cores.
    - Memory comes from the class model or history. CPUs are lowered when memory doesn't fit.
    - `light` jobs are never queued.
    - Nothing is preempted. When the pool shrinks, new grants wait until enough is released.
-2. **Starts the container** with `--name framac-<lease> --label framac.lease=<id> --init`, `--cpus` (or `--cpuset-cpus`), `--memory` = `--memory-swap`, and `--pids-limit`. Each limit flag is added only when the engine can enforce it. A caller that puts one of these flags on the engine command line itself is refused (exit 2): fixed sizes go through `exec --cpus/--memory/--pids-limit`, which still registers them with the broker.
+2. **Starts the container** with `--name framac-<lease> --label framac.lease=<id> --init` (the wrappers add `framac.repo` and `framac.run`, see *Several runs at once*), `--cpus` (or `--cpuset-cpus`), `--memory` = `--memory-swap`, and `--pids-limit`. Each limit flag is added only when the engine can enforce it. A caller that puts one of these flags on the engine command line itself is refused (exit 2): fixed sizes go through `exec --cpus/--memory/--pids-limit`, which still registers them with the broker.
 3. **Passes the sizing in** as environment:
    - `FRAMAC_JOB_CPUS`, `FRAMAC_JOB_MEM_MB`, `FRAMAC_JOB_CLASS` (and `FRAMAC_JOB_KEY`);
    - `FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`, so in-container code sees the whole node;
@@ -121,6 +121,32 @@ python3 scripts/resources.py gc         # reclaim leases of dead holders whose c
 - The broker adds only enforceable flags.
 - With any engine, Docker included, it refuses classes that run target code when the engine reports that memory or pids limits can't be enforced, unless `FRAMAC_ALLOW_UNENFORCED_LIMITS=1`. Podman runs record `sandbox.outer: podman-hardened` in `run-metadata.json`.
 
+### Several runs at once
+
+Runs of different targets, or several runs of one target, can share a machine. Every host on that machine uses one broker, because they all draw on the same CPUs and memory. Nothing else is shared between runs. The wrappers give each run an identity and key every resource on it:
+
+| Name | Value | Used for |
+|---|---|---|
+| repo key (`FRAMAC_REPO_KEY`) | `<repo>-<first 12 hex of sha256(target path)>` | shared-cache partition and volume `framac-cache-<repo key>`, derived images `framac-build:<repo key>` and `framac-codeql:<repo key>`, label `framac.repo` |
+| run tag (`FRAMAC_RUN_TAG`) | `<run id>-<first 12 hex of sha256(run path)>` | label `framac.run` |
+| scratch volume | `framac-scratch-<repo>-<run id>-<hash of the run path>` | one per run directory, labelled with both |
+
+`<repo>` (`--repo` / `-Repo`, default the target folder's name) still names the run base directory `~/framac-pipeline/<repo>/`. Two checkouts with the same folder name share that directory's `run-<N>` numbering, but nothing else. `--new-run` (`-NewRun`) claims `run-<N>` by creating it with a call that fails when the directory already exists, then retries with `N+1`. Two concurrent `--new-run` calls therefore never get the same run.
+
+How the runs interact:
+
+- **The queue:** it is shared, and served by run as described above, so a burst of tickets from one run does not hold every other run behind it.
+- **Run-directory exclusion:** the rule between a writable-cache job and a target-code job (Section 5) applies only within one run directory. Two runs never wait on each other because of it.
+- **Changing an existing setup:** moving from the repository name to the repository key changes the shared-cache partition and the derived image tags once. The first run of a target after the change starts with a cold shared cache and rebuilds its derived build image.
+
+To see or stop one run's containers, and to list its volumes:
+
+```text
+docker ps --filter label=framac.repo=<repo key> --filter label=framac.run=<run tag>
+docker volume ls --filter label=framac.repo=<repo key>
+python3 scripts/resources.py status        # each lease shows its repo, run and run_dir
+```
+
 ### Container broker (`resources.py run`)
 
 Inside one container (a Make phase, a `merge-batch`), recipes and sub-jobs go through `resources.py run --class C --key K [--output REPORT] -- cmd`. The pool is that container's own budget, re-read from its cgroup on every acquire. With `--output`, the recipe succeeds whenever the report exists, so Make keeps an `analysis_error` report instead of deleting it. A report left over from an earlier run, untouched by the command, does not count. A `run` nested inside another leased `run` passes through instead of waiting for itself.
@@ -149,7 +175,8 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_BROKER` | `off` disables the broker | on |
 | `FRAMAC_BROKER_DIR` | Lease state directory (local disk only) | `/tmp/framac-pipeline-$UID/broker`, `%LOCALAPPDATA%\framac-pipeline\broker` |
 | `FRAMAC_CACHE` | `off` disables every cache, including per-run | on inside a run |
-| `FRAMAC_CACHE_DIR` | Shared cross-run store (one partition per repository under `repos/`), `off` to disable | `~/.cache/framac-pipeline` |
+| `FRAMAC_CACHE_DIR` | Shared cross-run store (one partition per repository key under `repos/`), `off` to disable | `~/.cache/framac-pipeline` |
+| `FRAMAC_CACHE_VOLUME` | `auto`, `on` or `off`: keep the shared store in the named volume `framac-cache-<repo key>` instead of bind-mounting `FRAMAC_CACHE_DIR` (Section 5) | `auto` |
 | `FRAMAC_CACHE_RW` | `off` mounts the shared store read-only for every command, trusted steps included | on |
 | `FRAMAC_CACHE_MAX` | Size cap for a cache store | min(20 GiB, 25 % of (free disk + the store's size)) |
 | `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR` | Set by the broker inside the container: how the shared store is mounted, and where | — |
@@ -167,7 +194,7 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_SPEC_KB` | `off` disables the ACSL knowledge base (retrieved knowledge in prover briefs, repair hints from failed goals), for A/B comparisons | on |
 | `FRAMAC_CPUS`, `FRAMAC_MEMORY`, `FRAMAC_PIDS_LIMIT`, `FRAMAC_CONCURRENT_AGENTS` | Legacy per-container sizing, used only on the no-broker path | — |
 
-Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT`, `FRAMAC_PROVER_WALL_BUDGET_S`, `FRAMAC_PROVER_CONTEXT`, `FRAMAC_FRAME_SKELETON`, `FRAMAC_LOOP_TEMPLATES`, `FRAMAC_SPEC_KB` and `FRAMAC_RESOURCES_VERBOSE` (the same list in both wrappers and in `docker-compose.yml`, checked by `tests/test_remediation_p2_container.py`). The others are read by the wrappers or the host broker, or set by them (`FRAMAC_RUN_ID`, `FRAMAC_REPO`, `FRAMAC_TARGET_*`, `FRAMAC_OUTER_SANDBOX`, `FRAMAC_JOB_*`, `FRAMAC_POOL_*`, `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR`, `FRAMAC_IMAGE_ID`).
+Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT`, `FRAMAC_PROVER_WALL_BUDGET_S`, `FRAMAC_PROVER_CONTEXT`, `FRAMAC_FRAME_SKELETON`, `FRAMAC_LOOP_TEMPLATES`, `FRAMAC_SPEC_KB` and `FRAMAC_RESOURCES_VERBOSE` (the same list in both wrappers and in `docker-compose.yml`, checked by `tests/test_remediation_p2_container.py`). The others are read by the wrappers or the host broker, or set by them (`FRAMAC_RUN_ID`, `FRAMAC_REPO`, `FRAMAC_REPO_KEY`, `FRAMAC_RUN_TAG`, `FRAMAC_TARGET_*`, `FRAMAC_OUTER_SANDBOX`, `FRAMAC_JOB_*`, `FRAMAC_POOL_*`, `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR`, `FRAMAC_IMAGE_ID`).
 
 With rootful Docker on a Linux or macOS host, both wrappers run the container as the calling user (`--user $(id -u):$(id -g)`), so the run directory never collects root-owned files; on Windows (Docker Desktop) and with Podman they keep the engine's default. `docker compose` takes the user from `FRAMAC_UID` / `FRAMAC_GID` (default `1000:1000`; set them to `$(id -u)` / `$(id -g)`) and the run id from `FRAMAC_RUN_ID` (default `run-1`, must match `run-<N>`). The image keeps everything a non-root uid reads world-readable and `HOME` (`/home/opam`) writable by any uid. The pool reaches the container only as the broker's measurement (`FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`).
 
@@ -222,10 +249,36 @@ The match is token-exact after expanding `$S/` or `${S}/` to `/opt/framac-pipeli
 - **Mutual exclusion with target code:** On the same run directory (`run_dir`, compared via `realpath`), the host broker never runs a writable-cache (`cache_mode="rw"`) container concurrently with a container that runs target code (`fuzz`, `guardrail`, `replay`, `selftest`, `verify`, `phase-dynamic`, or any unrecognized command which fails closed as running target code), automatically downgrading an allowlisted `rw` step to `ro` when a target-code job is already active on that `run_dir`, and `pipeline_make.py run` executes `make` against a stage-private temporary copy of `Makefile` and `modules.mk` rendered directly from memory. Target code in another container therefore cannot race a trusted build/Eva/sweep step or rewrite the Makefile it executes.
 - **WP results** never reach the shared store today. The end-of-run `wp-sweep` re-proves every merged function on the final tree with no proof cache at all (`--cache-dir off`), so nothing an agent wrote into the per-run cache can answer it, and it publishes nothing; a function it cannot re-establish has its WP-covered units `blocked`. Publishing swept proofs for carry-forward is still open.
 - **Partitioning and promotion:**
-  - The store has one partition per repository (`$FRAMAC_CACHE_DIR/repos/<repo>`, the wrappers' repository name), so a repository's runs only ever read entries that its own runs wrote.
+  - The store has one partition per repository key (`$FRAMAC_CACHE_DIR/repos/<repo key>`, or the volume `framac-cache-<repo key>`), so a repository's runs only ever read entries that its own runs wrote. The key is the repository name plus a hash of the target path (Section 3, *Several runs at once*), so two checkouts with the same folder name never share a partition.
   - Within a partition, entries are keyed by toolchain identity.
   - Per-run entries are never promoted.
 - **Lookup order:** run, then shared.
+
+#### Where the store lives
+
+The host broker either bind-mounts the host directory or mounts a named volume at `/framac-cache`. The broker decides per job with `FRAMAC_CACHE_VOLUME`:
+
+- **`auto` (default):** uses the volume `framac-cache-<repo key>` when a bind mount would be slow or wrong:
+  - the engine runs containers in a VM (Docker Desktop on Windows or macOS, a Podman machine), where bind mounts cross the VM boundary over 9p, virtiofs or gRPC FUSE;
+  - the engine is remote, so a host path would name a directory on another machine;
+  - the cache directory is on a network or virtualized filesystem (NFS, CIFS, or 9p as for `/mnt/c` in WSL2).
+
+  Otherwise (Linux, WSL2 with the cache on the WSL filesystem) it bind-mounts `FRAMAC_CACHE_DIR`.
+- **`on` / `off`:** force one or the other.
+
+The read-only and read-write rules above apply to the volume unchanged. The first job that needs the volume creates it, labelled `framac.cache=1` and `framac.repo=<repo key>`. A one-off init container then sets the volume root to mode 1777, so the non-root job user can write it. That container runs as root with no network and no capabilities, and runs no target code. A lock in the broker directory keeps a concurrent job from mounting the volume before its root is set up. If the volume cannot be created or initialized, the job falls back to the bind mount and says so.
+
+A volume lives in the engine, not on the host. Two consequences:
+
+- The host broker does not read the shared resource history in it, so it sizes leases from the run's own history only.
+- `cache.py stats`, `gc` and `clear` work as usual inside a container.
+
+To drop a repository's store:
+
+```text
+docker volume rm framac-cache-<repo key>
+docker volume ls --filter label=framac.cache=1
+```
 
 ---
 

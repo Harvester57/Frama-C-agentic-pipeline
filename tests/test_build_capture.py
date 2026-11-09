@@ -525,7 +525,7 @@ class TestWrappersAndBenchmark:
         cases: tuple[tuple[list[str], str, bool], ...] = (
             ([], "framac-analysis:latest", False),
             (["-BuildImage", "-Scratch"], "framac-build:latest", True),
-            (["-BuildImage", "-TargetPackages", "check", "-NoBroker"], "framac-build:target_repo", False),
+            (["-BuildImage", "-TargetPackages", "check", "-NoBroker"], "framac-build:target_repo-", False),
             # The analysis image never gets target packages, under its default name or another one.
             (["-TargetPackages", "check", "-NoBroker"], "framac-analysis:latest", False),
             (
@@ -538,7 +538,11 @@ class TestWrappersAndBenchmark:
             proc = subprocess.run([*base, *extra, "true"], env=env, capture_output=True, text=True)
             assert proc.returncode == 0, proc.stderr or proc.stdout
             args, _ = _engine_run_args(log_file)
-            assert image in args, (extra, args)
+            # A derived image is tagged with the repo key (<repo>-<12 hex of the target path hash>).
+            if image.endswith("-"):
+                assert any(re.fullmatch(re.escape(image) + "[0-9a-f]{12}", a) for a in args), (extra, args)
+            else:
+                assert image in args, (extra, args)
             mounts = [a for a in args if a.endswith(":/framac-scratch")]
             assert bool(mounts) == scratch, extra
             if scratch:

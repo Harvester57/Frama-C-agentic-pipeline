@@ -88,7 +88,7 @@ docker build --target framac-analysis -t framac-analysis:latest .
 docker build --target framac-build -t framac-build:latest .
 ```
 
-The analysis image holds none of the target's packages. Name them in the build recipe: the build capture installs them in a derived build image (`framac-build:<repo>`) and copies the headers and libraries the build used to the run's snapshot (`workspace/snapshot/`), where the analysis image reads them.
+The analysis image holds none of the target's packages. Name them in the build recipe: the build capture installs them in a derived build image (`framac-build:<repo key>`) and copies the headers and libraries the build used to the run's snapshot (`workspace/snapshot/`), where the analysis image reads them.
 
 One more image is optional: **CodeQL** (`docker build -f Dockerfile.codeql -t framac-codeql:latest .`), off by default. It adds untrusted marks from CodeQL's taint queries, and runs only when the user declares the target open source.
 
@@ -162,7 +162,7 @@ frama-c/
 ├── wrappers/
 │   ├── framac-docker.ps1             # Windows PowerShell wrapper (host broker, image choice, scratch volume, hardening)
 │   ├── framac-docker.sh              # POSIX/Bash wrapper (same options)
-│   └── codeql-derived.Dockerfile     # framac-codeql:<repo>: the target's build image plus the CodeQL CLI
+│   └── codeql-derived.Dockerfile     # framac-codeql:<repo key>: the target's build image plus the CodeQL CLI
 ├── skills/                           # Modular Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ mirror them)
 │   ├── framac-verify/SKILL.md        # Umbrella end-to-end orchestrator (/framac-verify)
 │   ├── framac-slice/SKILL.md         # Phase 0: Slicing, Call-Graph DAG, stubs & harnesses (/framac-slice)

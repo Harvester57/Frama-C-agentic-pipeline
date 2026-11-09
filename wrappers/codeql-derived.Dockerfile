@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# framac-codeql:<repo>: a target's derived build image (framac-build:<repo>, with its packages) plus the
+# framac-codeql:<repo key>: a target's derived build image (framac-build:<repo key>, with its packages) plus the
 # CodeQL CLI and C/C++ packs copied from framac-codeql:latest, which Dockerfile.codeql builds from the
 # pinned, digest-checked bundle. Nothing is downloaded here. The wrappers build it from stdin (no context)
 # with -CodeQL / --codeql and labels holding both base image ids; it is rebuilt when either changes.

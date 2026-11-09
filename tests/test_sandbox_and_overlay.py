@@ -219,7 +219,9 @@ def test_wrappers_divide_cpu_memory_pids_and_mount_skills(tmp_path):
     assert "--pids-limit 1365" in docker_invocation
     assert "/opt/framac-pipeline/skills:ro" in docker_invocation
     # The legacy path keeps today's static flags: no lease, no entry shim, the command string last.
-    assert "--init" not in args and "--label" not in args and "--entrypoint" not in args and args[-1] == "true"
+    assert "--init" not in args and "--entrypoint" not in args and args[-1] == "true"
+    labels = [b for a, b in zip(args, args[1:], strict=False) if a == "--label"]
+    assert [lab.split("=", 1)[0] for lab in labels] == ["framac.repo", "framac.run"]  # identity only, no lease
 
 
 def test_ps1_broker_path_sizes_the_container_through_resources_exec(tmp_path):

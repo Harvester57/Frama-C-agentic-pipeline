@@ -877,7 +877,7 @@ def wrapper_argv(
 ) -> list[str]:
     """
     The wrapper command for this OS. The shared cross-run cache stays off: a benchmark must not reuse old results.
-    `build_image` runs the stage in the build image (framac-build, or framac-build:<repo> with packages),
+    `build_image` runs the stage in the build image (framac-build, or framac-build:<repo key> with packages),
     `scratch` mounts the run's scratch volume at /framac-scratch.
     """
     if _is_windows():

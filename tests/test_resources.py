@@ -596,6 +596,51 @@ def test_plan_grant_fifo_backfill_and_shrink():
     assert R.plan_grant(late, entries, 3, 32000) is None  # pool shrank below what is granted
 
 
+def test_queue_serves_the_run_holding_fewest_grants_first(tmp_path):
+    run_a, run_b = str(tmp_path / "a" / "run-1"), str(tmp_path / "b" / "run-1")
+    held = [_ticket(f"g{i}", state="granted", cpus=1.0, mem_mb=1024, run_dir=run_a) for i in range(3)]
+    burst = [_ticket(f"a{i}", seq=10 + i, run_dir=run_a) for i in range(5)]  # run A queued first
+    late = _ticket("b0", seq=20, run_dir=run_b)  # run B arrives later, holding nothing
+    entries = [*held, *burst, late]
+    assert [e["id"] for e in R._queue(entries)][:2] == ["b0", "a0"]
+    assert R.queue_position("b0", entries) == (1, 6)
+    # Equal holdings: plain FIFO across runs.
+    even = [*held, *(_ticket(f"h{i}", state="granted", cpus=1.0, mem_mb=1024, run_dir=run_b) for i in range(3))]
+    assert [e["id"] for e in R._queue([*even, *burst, late])][:2] == ["a0", "a1"]
+    # Light (ungated) grants do not count as holdings.
+    light = [_ticket(f"l{i}", cls="light", state="granted", run_dir=run_b) for i in range(5)]
+    assert R._queue([*held, *light, *burst, late])[0]["id"] == "b0"
+
+
+def test_cache_partition_prefers_the_repo_key(monkeypatch):
+    monkeypatch.setenv("FRAMAC_REPO", "libssh2")
+    monkeypatch.delenv("FRAMAC_REPO_KEY", raising=False)
+    assert R.cache_partition() == "libssh2"
+    monkeypatch.setenv("FRAMAC_REPO_KEY", "libssh2-0123456789ab")
+    assert R.cache_partition() == "libssh2-0123456789ab"
+    assert R.cache_volume_name(R.cache_partition()) == "framac-cache-libssh2-0123456789ab"
+    monkeypatch.setenv("FRAMAC_REPO_KEY", "../escape")
+    assert R.cache_partition() is not None and "/" not in R.cache_partition()
+
+
+def test_cache_volume_wanted_where_a_bind_mount_is_slow_or_wrong():
+    local = R.EngineInfo(kind="docker")
+    vm = R.EngineInfo(kind="docker", vm_backed=True)
+    remote = R.EngineInfo(kind="docker", vm_backed=True, remote=True)
+    assert R.cache_volume_wanted(local, "/c", setting="auto", fstype="ext4") == (False, "local disk")
+    assert R.cache_volume_wanted(vm, "/c", setting="auto", fstype="ext4")[0]
+    assert "remote" in R.cache_volume_wanted(remote, "/c", setting="auto")[1]
+    assert R.cache_volume_wanted(local, "/mnt/c/x", setting="auto", fstype="9p") == (
+        True,
+        "/mnt/c/x is on 9p (network or virtualized filesystem)",
+    )
+    assert R.cache_volume_wanted(local, "/c", setting="auto", fstype="nfs4")[0]
+    assert R.cache_volume_wanted(local, "C:/c", setting="auto", windows_remote=True)[0]
+    assert R.cache_volume_wanted(vm, "/c", setting="off") == (False, "FRAMAC_CACHE_VOLUME=off")
+    assert R.cache_volume_wanted(local, "/c", setting="on") == (True, "FRAMAC_CACHE_VOLUME=on")
+    assert not R.cache_volume_wanted(R.EngineInfo(vm_backed=True, ok=False), "/c", setting="auto")[0]
+
+
 def test_history_estimate_uses_recent_peaks_per_key(tmp_path):
     for peak, key, oom in ((100, "f", False), (400, "f", False), (900, "g", False), (300, "f", False)):
         R.write_history(tmp_path, {"class": "wp", "key": key, "peak_mb": peak, "oom_killed": oom})
@@ -1049,6 +1094,21 @@ def make_fake_engine(bin_dir: Path, info: dict, log: Path) -> None:
             print("Docker version 28.0.0")
         elif cmd == "kill":
             (here / "killed").write_text(" ".join(sys.argv[2:]))
+        elif cmd == "volume":
+            vols = here / "volumes"
+            vols.mkdir(exist_ok=True)
+            with (here / "volume_calls.txt").open("a", encoding="utf-8") as fh:
+                fh.write(" ".join(sys.argv[2:]) + "\\n")
+            name = sys.argv[-1]
+            if sys.argv[2] == "inspect":
+                sys.exit(0 if (vols / name).exists() else 1)
+            elif sys.argv[2] == "create":
+                (vols / name).write_text(" ".join(sys.argv[3:-1]))
+            elif sys.argv[2] == "rm":
+                (vols / name).unlink(missing_ok=True)
+        elif cmd == "run" and "/bin/chmod" in sys.argv:  # cache volume init container
+            (here / "init_args.txt").write_text("\\n".join(sys.argv[1:]) + "\\n", encoding="utf-8")
+            sys.exit(int((here / "init_rc").read_text()) if (here / "init_rc").exists() else 0)
         elif cmd == "run":
             pathlib.Path({str(log)!r}).write_text("\\n".join(sys.argv[1:]) + "\\n", encoding="utf-8")
             if "FAKE_WAIT=1" in sys.argv:  # behave like a running container until `kill`
@@ -1081,6 +1141,8 @@ def fake_engine(tmp_path, monkeypatch):
         monkeypatch.setenv("PATH", str(tmp_path / "bin") + os.pathsep + os.environ.get("PATH", ""))
         monkeypatch.setenv("FRAMAC_BROKER_DIR", str(tmp_path / "broker"))
         monkeypatch.setenv("FRAMAC_CACHE_DIR", str(tmp_path / "cache"))
+        monkeypatch.setenv("FRAMAC_CACHE_VOLUME", "off")  # bind mounts unless a test opts in
+        monkeypatch.delenv("FRAMAC_REPO_KEY", raising=False)
         monkeypatch.setenv("FRAMAC_POOL_CPUS", "2")
         monkeypatch.setenv("FRAMAC_POOL_MEMORY", "4g")
         monkeypatch.setenv("FRAMAC_PROBE_ROOT", str(probe_root))
@@ -1143,6 +1205,60 @@ def test_exec_mounts_this_repositorys_cache_partition_writable_only_for_allowlis
     assert mode == "ro" and mounts == [f"{partition}:/framac-cache:ro"]
     monkeypatch.setenv("FRAMAC_CACHE_RW", "off")
     assert dry_run("python3 /opt/framac-pipeline/scripts/pipeline_make.py run build")[0] == "ro"
+
+
+def test_exec_puts_the_cache_in_a_named_volume_when_the_engine_runs_in_a_vm(tmp_path, fake_engine, monkeypatch, capsys):
+    fake_engine(DOCKER_DESKTOP)
+    monkeypatch.setattr(sys, "platform", "win32")  # Docker Desktop from the Windows host: vm_backed
+    monkeypatch.setenv("FRAMAC_CACHE_VOLUME", "auto")
+    monkeypatch.setenv("FRAMAC_REPO", "net-snmp")
+    monkeypatch.setenv("FRAMAC_REPO_KEY", "net-snmp-0123456789ab")
+    monkeypatch.delenv("FRAMAC_CACHE_RW", raising=False)
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz")
+    assert R.main(["exec", "--run-dir", str(tmp_path / "run-1"), "--dry-run", "--", "docker", "run", "img"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["cache_volume"] == "framac-cache-net-snmp-0123456789ab" and out["cache_mode"] == "ro"
+    assert ("-v", "framac-cache-net-snmp-0123456789ab:/framac-cache:ro") in _pairs(out["argv"])
+    assert ("-e", "FRAMAC_SHARED_CACHE_DIR=/framac-cache") in _pairs(out["argv"])
+    assert not (tmp_path / "cache").exists()  # the slow host directory is never touched
+
+
+def test_exec_creates_and_initializes_the_cache_volume_once(tmp_path, fake_engine, monkeypatch, capsys):
+    log = fake_engine(DOCKER_DESKTOP)
+    bin_dir = tmp_path / "bin"
+    monkeypatch.setenv("FRAMAC_CACHE_VOLUME", "on")
+    monkeypatch.setenv("FRAMAC_REPO_KEY", "net-snmp-0123456789ab")
+    monkeypatch.setenv("FRAMAC_IMAGE_ID", "sha256:feedface")
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/pipeline_make.py run build")
+    run = ["exec", "--run-dir", str(tmp_path / "run-1"), "--", "docker", "run", "--rm", "img", "/entry.sh"]
+    assert R.main(run) == 0
+    created = (bin_dir / "volumes" / "framac-cache-net-snmp-0123456789ab").read_text()
+    assert "framac.cache=1" in created and "framac.repo=net-snmp-0123456789ab" in created
+    init = (bin_dir / "init_args.txt").read_text().splitlines()
+    assert init[-3:] == ["sha256:feedface", "1777", "/framac-cache"]
+    assert ("--user", "0:0") in _pairs(init) and ("--network", "none") in _pairs(init)
+    assert ("--cap-drop", "ALL") in _pairs(init)
+    assert ("-v", "framac-cache-net-snmp-0123456789ab:/framac-cache") in _pairs(log.read_text().splitlines())
+    (bin_dir / "init_args.txt").unlink()
+    assert R.main(run) == 0
+    assert not (bin_dir / "init_args.txt").exists()  # the existing volume is reused as is
+
+
+def test_exec_falls_back_to_the_bind_mount_when_the_cache_volume_cannot_be_initialized(
+    tmp_path, fake_engine, monkeypatch, capsys
+):
+    log = fake_engine(DOCKER_DESKTOP)
+    bin_dir = tmp_path / "bin"
+    (bin_dir / "init_rc").write_text("1")
+    monkeypatch.setenv("FRAMAC_CACHE_VOLUME", "on")
+    monkeypatch.setenv("FRAMAC_REPO_KEY", "net-snmp-0123456789ab")
+    monkeypatch.setenv("FRAMAC_IMAGE_ID", "sha256:feedface")
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "python3 /opt/framac-pipeline/scripts/pipeline_make.py run build")
+    assert R.main(["exec", "--run-dir", str(tmp_path / "run-1"), "--", "docker", "run", "img", "/e.sh"]) == 0
+    assert "bind-mounting the cache directory instead" in capsys.readouterr().err
+    assert not (bin_dir / "volumes" / "framac-cache-net-snmp-0123456789ab").exists()  # removed for a retry
+    partition = str((tmp_path / "cache" / "repos" / "net-snmp-0123456789ab").resolve())
+    assert ("-v", f"{partition}:/framac-cache") in _pairs(log.read_text().splitlines())
 
 
 def test_exec_runs_the_engine_and_returns_its_exit_code(tmp_path, fake_engine, monkeypatch):
