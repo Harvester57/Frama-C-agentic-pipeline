@@ -315,3 +315,21 @@ def test_reporting_semantics_wp_vs_eva_and_sarif_levels(tmp_path):
     assert levels_by_sev["medium"] == "warning"
     assert levels_by_sev["low"] == "note"
     assert levels_by_sev["needs_validation"] == "warning"
+
+
+def test_report_counts_functions_carried_forward_and_reproven(tmp_path):
+    build_run(tmp_path)
+    report = generate(tmp_path, tmp_path) and (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "Carried forward from earlier runs" not in report
+    write_json(tmp_path / "workspace/reports/wp/snmp.json", {})
+    ledger = json.loads((tmp_path / "coverage-ledger.json").read_text(encoding="utf-8"))
+    carried = {
+        **evidence(phase="wp", result="carried_forward_reproven", tool_output="workspace/reports/wp/snmp.json"),
+        "details": {"limits": {"vacuity": {"status": "consistent"}}},
+    }
+    ledger.append(unit("src/snmp/pdu.c", "snmp_len", "rte", "covered", evidence=[carried]))
+    ledger.append(unit("src/snmp/pdu.c", "snmp_len", "l2_termination", "covered", evidence=[carried]))
+    write_json(tmp_path / "coverage-ledger.json", sorted(ledger, key=lambda u: u["coverage_id"]))
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "- Carried forward from earlier runs and re-proven: 1 function(s)" in report.split("## 3.")[0]

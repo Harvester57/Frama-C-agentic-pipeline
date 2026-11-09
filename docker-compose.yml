@@ -67,6 +67,7 @@ services:
       - FRAMAC_FRAME_SKELETON
       - FRAMAC_LOOP_TEMPLATES
       - FRAMAC_SPEC_KB
+      - FRAMAC_PROOF_CARRY
       - FRAMAC_RESOURCES_VERBOSE
     volumes:
       - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro

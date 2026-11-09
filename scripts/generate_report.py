@@ -539,8 +539,15 @@ def render_report(data: dict) -> str:
         f"- **Rejected candidates:** {len(rejected)} (retained to suppress repeated claims)",
         f"- **Blocked units:** {len(blocked)}",
         f"- **Proof coverage:** {len(covered) - len(cond)} unit(s) proven unconditionally, {len(cond)} proven under open assumptions, out of {len(ledger)} unit(s){proof_breakdown}",
-        "",
     ]
+    carried = {
+        (u["file"], u["function"])
+        for u in covered
+        if any(e.get("result") == "carried_forward_reproven" for e in u.get("evidence", []))
+    }
+    if carried:
+        out.append(f"- Carried forward from earlier runs and re-proven: {len(carried)} function(s)")
+    out.append("")
 
     out += ["## 3. Confirmed findings", ""]
     if not confirmed:

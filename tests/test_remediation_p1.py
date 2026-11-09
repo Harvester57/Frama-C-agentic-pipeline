@@ -75,7 +75,7 @@ def test_h5_checkpoint_init_never_rewinds_progress(tmp_path, capsys):
 
 def test_h5_wp_queue_records_phase_two():
     mk = (Path(R.__file__).resolve().parent.parent / "templates" / "pipeline.mk").read_text(encoding="utf-8")
-    recipe = mk.split("\nwp-queue: ingest facts\n", 1)[1].split("\n\n", 1)[0]
+    recipe = mk.split("\nwp-queue: ingest facts wp-replay\n", 1)[1].split("\n\n", 1)[0]
     assert "checkpoint.py save-phase state --phase 2" in recipe
 
 

@@ -1876,3 +1876,23 @@ def test_h2_parent_replays_a_phase3_candidate_before_ingesting_its_verdict(sim, 
     assert found == ["workspace/reports/replay/src_m_f.c_f_mem_access_0123456789-abcdef0123.json"]
     # An existing replay is reused, never run again.
     assert S._parent_replay(fp, cand, out) == found and len(calls) == 1
+
+
+def test_status_counts_units_carried_forward_from_an_earlier_run(sim):
+    write_json(sim.run_dir / "workspace/reports/wp/c.json", {})
+    carried = {
+        **evidence(phase="wp", result="carried_forward_reproven", tool_output="workspace/reports/wp/c.json"),
+        "producer": "proof_carry.py",
+        "details": {"limits": {"vacuity": {"status": "consistent"}}},
+    }
+    sim.build(
+        {"a": ("src/m/a.c", "m", ["c"]), "c": ("src/m/c.c", "m", [])},
+        units=[
+            unit("src/m/a.c", "a", "rte", module="m", tier=TIER1),
+            unit("src/m/c.c", "c", "rte", "covered", module="m", tier=TIER1, evidence=[carried]),
+        ],
+    )
+    checkpoint.cmd_init(Path("state"), "/target", "verify")
+    init = S.cmd_init()
+    assert init["by_kind"] == {"prove": {"pending": 1}}  # the carried function gets no prove task
+    assert S.cmd_status()["carried_forward"] == 1

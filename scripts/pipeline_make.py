@@ -54,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 import phase0_gates  # noqa: E402
+import proof_carry  # noqa: E402
 from eva_loops import loop_ref_from_json, mirror_id  # noqa: E402
 from eva_options import (  # noqa: E402
     EVA_OPTIONS,
@@ -1498,6 +1499,8 @@ STAGE_OF_TARGET = {
     "ingest": 5,
     "replay": 5,
     "minimize": 5,
+    # Before wp-queue (a prerequisite in pipeline.mk): the units it credits never become prove tasks.
+    "wp-replay": 5,
     "wp-queue": 5,
     "wp-baseline": 5,
     "wp-sweep": 6,
@@ -1516,6 +1519,7 @@ _TARGET_OUTPUTS = {
     "ingest": INGESTED_JSON,
     "replay": "workspace/reports/replay/index.json",
     "minimize": "workspace/reports/minimize/index.json",
+    "wp-replay": proof_carry.SUMMARY_REL,
     "wp-queue": "workspace/reports/wp_queue.json",
     "wp-baseline": "workspace/reports/wp_baseline.json",
     "wp-sweep": f"{SWEEP_DIR}/summary.json",
@@ -1606,7 +1610,7 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
         return [f"evabase-{mod}"]  # the recorded rungs are optional, as in eva-tune
     if node == "seed":
         return ["reach-gate", "security-props"]
-    if node in ("replay", "wp-queue"):
+    if node in ("replay", "wp-queue", "wp-replay"):
         # wp-queue also depends on facts in pipeline.mk, but facts recipes never fail the build (`-`),
         # so they can never be the reason wp-queue was skipped.
         return ["ingest"]
@@ -2217,6 +2221,8 @@ def sweep(
         entries, skipped = sweep_list(run_dir, list_warnings)
         slugs = _file_slugs({e["file"] for e in entries})
         tasks: list[tuple[dict, str, list[str]]] = []
+        # What a published proof is keyed on: the flags this re-proof ran with.
+        proof_inputs: dict[str, tuple[list[str], list[str], list[str]]] = {}
         for e in entries:
             flags, reason = plan.wp_cppflags_for(e["module"])
             if flags is None:
@@ -2263,6 +2269,7 @@ def sweep(
             # A report left by an earlier sweep must never be read as this sweep's result.
             (run_dir / out_json).unlink(missing_ok=True)
             tasks.append((e, out_json, cmd))
+            proof_inputs[out_json] = (list(flags), list(wp_extra_flags), list(extra_sources))
 
         rcs: list[int] = []
         if tasks:
@@ -2303,6 +2310,7 @@ def sweep(
         }
         if list_warnings:
             summary["warnings"] = list_warnings
+        summary["published_proofs"] = _publish_swept_proofs(run_dir, results, proof_inputs, summary)
         # A WP-covered function whose re-proof left no report was not re-established either: record
         # that as its own report, so the ledger stops counting it as covered.
         missing_reports = []
@@ -2340,6 +2348,64 @@ def sweep(
             summary["audit_error"] = f"ledger.py audit-hypotheses failed (rc={rc_a})"
         atomic_write_json(run_dir / SWEEP_DIR / "summary.json", summary)
     return summary
+
+
+def _publish_swept_proofs(
+    run_dir: Path, results: list[dict], proof_inputs: dict[str, tuple[list[str], list[str], list[str]]], summary: dict
+) -> int:
+    """
+    Publish every function this sweep re-proved `all_proven` to the `proofs` cache (run store; the
+    shared store too with FRAMAC_CACHE_MODE=rw), so the next run can replay it (`wp-replay`).
+    FRAMAC_PROOF_CARRY=off or a disabled cache publishes nothing. A failure is a warning only.
+    """
+    if not proof_carry.flag_enabled() or not cache.enabled(run_dir):
+        for row in results:
+            row["published"] = False
+        return 0
+    overlay = run_dir / "workspace"
+    dag_fns = proof_carry.load_dag_functions(run_dir)
+    published = 0
+    for row in results:
+        row["published"] = False
+        if row["status"] != "all_proven" or row.get("eva_only"):
+            continue
+        flags, wp_extra_flags, extra_sources = proof_inputs[row["report"]]
+        try:
+            ok, why = proof_carry.publish_proof(
+                run_dir,
+                overlay,
+                row,
+                run_dir / row["report"],
+                flags,
+                dag_fns,
+                extra_sources,
+                wp_extra_flags,
+            )
+        except Exception as exc:  # never a sweep failure
+            ok, why = False, f"{type(exc).__name__}: {exc}"
+        row["published"] = ok
+        if ok:
+            published += 1
+        else:
+            summary.setdefault("warnings", []).append(
+                f"{row['file']}#{row['function']}: proof not published to the cache ({why})"
+            )
+    return published
+
+
+def wp_replay(run_dir: Path | str = ".", plan: Plan | None = None, script_runner: ScriptRunner | None = None) -> dict:
+    """
+    Make target `wp-replay` (after the Phase 3 gate, before `wp_scheduler.py init`): re-apply and
+    re-prove the cached proofs of planned functions (scripts/proof_carry.py), so the units a re-proof
+    credits never become prove tasks. Holds the `wp-sweep` lock: it never runs beside a sweep.
+    """
+    run_dir = Path(run_dir).resolve()
+    if not proof_carry.flag_enabled() or not cache.enabled(run_dir):
+        return proof_carry.replay(run_dir, None)  # writes the skipped summary
+    plan = plan or build_plan(run_dir)
+    ingest_fn, mark_fn = proof_carry.ledger_runner(script_runner or _script_runner(run_dir))
+    with run_lock("wp-sweep", run_dir=run_dir):
+        return proof_carry.replay(run_dir, plan, ingest=ingest_fn, mark=mark_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -2737,6 +2803,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("sweep-list", help="WP-covered proof units of the ledger, as (file, function)")
     p_sweep = sub.add_parser("sweep", help="Trusted re-proof of the sweep list without the per-run WP cache")
     p_sweep.add_argument("--jobs", type=int, default=None)
+    sub.add_parser(
+        "wp-replay",
+        help="Re-apply and re-prove proofs an earlier run's wp-sweep published, before the Phase 3 queue",
+    )
 
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(_normalize_flag_args(raw))
@@ -2782,6 +2852,9 @@ def main(argv: list[str] | None = None) -> int:
             list_warnings: list[str] = []
             entries, skipped = sweep_list(run_dir, list_warnings)
             out = {"count": len(entries), "units": entries, "skipped": skipped, "warnings": list_warnings}
+        elif args.cmd == "wp-replay":
+            out = wp_replay(run_dir)
+            rc = 0 if out["ok"] else 1
         else:
             out = sweep(run_dir, jobs=args.jobs)
             rc = 0 if out["ok"] else 1

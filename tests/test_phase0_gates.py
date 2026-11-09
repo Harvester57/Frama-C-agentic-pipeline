@@ -207,7 +207,7 @@ def test_seed_runs_the_reach_gate_and_wp_queue_needs_both():
     text = PIPELINE_MK.read_text(encoding="utf-8")
     assert re.search(r"^seed: reach-gate security-props$", text, re.MULTILINE)
     assert "harness_reach.py check" in _recipe(text, "reach-gate:")[0]
-    assert _recipe(text, "wp-queue: ingest facts")[0] == (
+    assert _recipe(text, "wp-queue: ingest facts wp-replay")[0] == (
         '\t$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"'
     )
     assert "\t$$(GATE) --module $(1) --need reach" in text  # the Eva tuning rungs
