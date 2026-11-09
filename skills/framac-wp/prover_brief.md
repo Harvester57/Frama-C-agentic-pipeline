@@ -244,9 +244,10 @@ Run wrapper commands in the **foreground** and wait for completion: either run *
 Both oracles record each iteration under `agents/{agent_id}/scratch/candidates/` and print a `candidate` block. On the same files, the first to finish says `next_action: "wait_for_other_oracle"`; the second says `evaluated: true` and carries the verdict.
 
 - The best candidate passes the guardrail and has the fewest unproven goals, then the most proved goals. A candidate the guardrail rejects is never compared, however good its proof ratio: a stronger `requires` can raise that ratio by excluding inputs.
+- `trivial_added` counts clauses you added that hold whatever the code does (`\true`, `x == x`, literal comparisons such as `0 <= 1`, in an `ensures`, `assert`, `check` or `loop invariant`); they earn no credit in the rank, adding only such clauses is not progress, and `next_synthesis_focus: "drop_trivial_clauses"` in the `candidate` block asks you to remove them.
 - `next_action: "continue"`: keep iterating.
 - `next_action: "finished"`: this candidate is `all_proven` and passes the guardrail.
-- `next_action: "restore_best_and_finish"` (the output also says `next_synthesis_focus: "no_progress_restore_best_and_finish"`): this iteration improved neither number. Stop iterating, and finish as below.
+- `next_action: "restore_best_and_finish"` (the output also says `next_synthesis_focus: "no_progress_restore_best_and_finish"`): this iteration improved neither number (proved goals of trivial clauses do not count). Stop iterating, and finish as below.
 - Runs with `--prop` or `--dump-goal` are diagnostics and are not recorded.
 
 Whenever you finish without `all_proven`, for any reason, first run `python3 /opt/framac-pipeline/scripts/prover_candidates.py restore-best --agent-id {agent_id}`. It puts the best candidate's files and reports back and regenerates the patch. Then take your status from the restored `agents/{agent_id}/scratch/wp_{function_name}.json`. After a `code_fault`, the report with the fault is at `agents/{agent_id}/scratch/candidates/last/guard_{function_name}.json` if a best candidate replaced it: name that file in `evidence`.

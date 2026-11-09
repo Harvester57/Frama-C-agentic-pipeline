@@ -34,6 +34,17 @@ PASSED = "passed_dynamic_oracle"
 SCRIPT = Path(PC.__file__).resolve()
 
 
+def rk(failed: int, proved: int, invalid: int = 0, trivial: int = 0) -> dict:
+    """A rank as the trivial-aware tracker records it."""
+    return {
+        "failed": failed,
+        "proved": proved,
+        "invalid": invalid,
+        "trivial_added": trivial,
+        "effective_proved": max(0, proved - trivial),
+    }
+
+
 def annotated(tag: str) -> str:
     """The source with a contract: every tag is a distinct candidate."""
     return f"/*@ requires {tag}: x >= 0;\n  @ assigns \\nothing;\n  @*/\n{BASE_C}"
@@ -158,6 +169,7 @@ def test_a_candidate_is_evaluated_by_whichever_oracle_finishes_second(prover, fi
         "best_rank": None,
         "progress": None,
         "next_action": "wait_for_other_oracle",
+        "trivial_added": 0 if first == "wp" else None,
     }
     block = runs[1]()
     assert block == {
@@ -165,11 +177,12 @@ def test_a_candidate_is_evaluated_by_whichever_oracle_finishes_second(prover, fi
         "candidate": 1,
         "evaluated": True,
         "eligible": True,
-        "rank": {"failed": 1, "proved": 5, "invalid": 0},
+        "rank": rk(1, 5),
         "best": 1,
-        "best_rank": {"failed": 1, "proved": 5, "invalid": 0},
+        "best_rank": rk(1, 5),
         "progress": True,
         "next_action": "continue",
+        "trivial_added": 0,
     }
     json.dumps(block)
     assert (prover.scratch / "candidates/best/work" / C_REL).read_text(encoding="utf-8") == annotated("a")
@@ -263,12 +276,12 @@ def test_rejected_by_the_guardrail_is_never_best_even_with_the_best_proof_ratio(
     # The stronger `requires` excludes inputs: everything is proved, and it is false on a real input.
     block = prover.iterate("stronger", "all_proven", 0, 10, guard="rejected_overconstrained")
     assert block["eligible"] is False and block["rank"] is None and block["progress"] is None
-    assert block["best"] == 1 and block["best_rank"] == {"failed": 4, "proved": 6, "invalid": 0}
+    assert block["best"] == 1 and block["best_rank"] == rk(4, 6)
     assert block["next_action"] == "continue"  # the prover must fix it: not a stall
     assert PC.restore_best(prover.scratch) == {
         "restored": True,
         "best": 1,
-        "rank": {"failed": 4, "proved": 6, "invalid": 0},
+        "rank": rk(4, 6),
     }
     assert prover.read() == annotated("a")
     assert load(prover.guard_path)["status"] == PASSED
@@ -324,13 +337,13 @@ def test_rank_is_fewer_failed_then_more_proved_and_a_tie_keeps_the_earlier(prove
     assert prover.iterate("b", failed=2, proved=1)["best"] == 2  # fewer failed beats more proved
     assert prover.iterate("c", failed=2, proved=4)["best"] == 3  # same failed, more proved
     block = prover.iterate("d", failed=2, proved=4)
-    assert block["best"] == 3 and block["best_rank"] == {"failed": 2, "proved": 4, "invalid": 0}
+    assert block["best"] == 3 and block["best_rank"] == rk(2, 4)
     assert (prover.scratch / "candidates/best/work" / C_REL).read_text(encoding="utf-8") == annotated("c")
 
 
 def test_proved_counts_goals_proved_under_hypotheses(prover):
     block = prover.iterate("a", failed=1, proved=2, proven_under_hyp_count=3)
-    assert block["rank"] == {"failed": 1, "proved": 5, "invalid": 0}
+    assert block["rank"] == rk(1, 5)
 
 
 def test_rank_tiebreak_prefers_fewer_invalid_invariants(prover):
@@ -351,11 +364,11 @@ def test_rank_tiebreak_prefers_fewer_invalid_invariants(prover):
         },
     ]
     block = prover.iterate("a", failed=2, proved=3, unproven_goals=invalid_goals)
-    assert block["rank"] == {"failed": 2, "proved": 3, "invalid": 2} and block["best"] == 1
+    assert block["rank"] == rk(2, 3, 2) and block["best"] == 1
     # Same failed count, but only provability failures: ranks higher despite fewer proved.
     block = prover.iterate("b", failed=2, proved=1)
-    assert block["rank"] == {"failed": 2, "proved": 1, "invalid": 0}
-    assert block["best"] == 2 and block["best_rank"] == {"failed": 2, "proved": 1, "invalid": 0}
+    assert block["rank"] == rk(2, 1)
+    assert block["best"] == 2 and block["best_rank"] == rk(2, 1)
     assert (prover.scratch / "candidates/best/work" / C_REL).read_text(encoding="utf-8") == annotated("b")
 
 
@@ -375,8 +388,8 @@ def test_failed_up_and_proved_up_continues_and_the_best_stays_the_lower_failed(p
     prover.iterate("a", failed=1, proved=10)
     block = prover.iterate("b", failed=3, proved=14)
     assert (block["progress"], block["next_action"]) == (True, "continue")
-    assert block["rank"] == {"failed": 3, "proved": 14, "invalid": 0}
-    assert block["best"] == 1 and block["best_rank"] == {"failed": 1, "proved": 10, "invalid": 0}
+    assert block["rank"] == rk(3, 14)
+    assert block["best"] == 1 and block["best_rank"] == rk(1, 10)
 
 
 def test_failed_up_and_proved_down_stops(prover):
@@ -582,7 +595,7 @@ def test_a_better_rerun_on_the_same_files_updates_the_reports_of_the_best(prover
     assert (block["candidate"], block["progress"], block["best_rank"]) == (
         1,
         True,
-        {"failed": 1, "proved": 6, "invalid": 0},
+        rk(1, 6),
     )
     assert load(prover.scratch / f"candidates/best/wp_{FN}.json")["unproven_count"] == 1
 
@@ -591,7 +604,7 @@ def test_a_worse_rerun_on_the_same_files_keeps_the_better_reports(prover):
     prover.iterate("a", failed=1, proved=6)
     block = prover.wp(failed=3, proved=4)
     assert (block["progress"], block["next_action"], block["best"]) == (False, "restore_best_and_finish", 1)
-    assert restore(prover.scratch)["rank"] == {"failed": 1, "proved": 6, "invalid": 0}
+    assert restore(prover.scratch)["rank"] == rk(1, 6)
     assert load(prover.wp_path)["unproven_count"] == 1
 
 
@@ -607,7 +620,7 @@ def test_a_wp_rerun_that_decides_nothing_leaves_the_best_alone(prover, failure):
     prover.iterate("a", failed=1, proved=6)
     block = prover.wp(**failure)
     assert (block["eligible"], block["best"], block["next_action"]) == (False, 1, "continue")
-    assert restore(prover.scratch)["rank"] == {"failed": 1, "proved": 6, "invalid": 0}
+    assert restore(prover.scratch)["rank"] == rk(1, 6)
 
 
 @pytest.mark.parametrize(
@@ -664,7 +677,7 @@ def test_restore_puts_back_files_reports_and_patch_and_is_idempotent(prover):
     assert PC.restore_best(prover.scratch) == {
         "restored": True,
         "best": 1,
-        "rank": {"failed": 1, "proved": 9, "invalid": 0},
+        "rank": rk(1, 9),
     }
     assert prover.read() == annotated("best") and prover.read(H_REL) == annotated_header("best")
     assert PC.tracked_digest(prover.scratch) == prover.state()["best_digest"]
@@ -682,7 +695,7 @@ def test_restore_puts_back_files_reports_and_patch_and_is_idempotent(prover):
     assert PC.restore_best(prover.scratch) == {
         "restored": False,
         "best": 1,
-        "rank": {"failed": 1, "proved": 9, "invalid": 0},
+        "rank": rk(1, 9),
     }
     assert tree_bytes(prover.scratch) == before
     assert not (prover.scratch / ".framac-locks").exists()
@@ -1035,7 +1048,7 @@ def test_cli_restore_best_and_status(prover, capsys):
     assert json.loads(capsys.readouterr().out) == {
         "restored": True,
         "best": 1,
-        "rank": {"failed": 1, "proved": 9, "invalid": 0},
+        "rank": rk(1, 9),
     }
     assert prover.read() == annotated("a")
     assert PC.main(["status", "--agent-id", AID]) == 0
@@ -1159,7 +1172,7 @@ def test_complete_restores_the_best_candidate_before_promotion_and_the_partial_m
     out = S.cmd_complete(AID)
 
     assert out["action"] == "blocked" and out["errors"] == []
-    assert out["best_candidate"] == {"restored": True, "best": 1, "rank": {"failed": 1, "proved": 9, "invalid": 0}}
+    assert out["best_candidate"] == {"restored": True, "best": 1, "rank": rk(1, 9)}
     promoted = load(sim.run_dir / "agents" / AID / "artifacts" / f"wp_{FN}.json")
     assert (promoted["unproven_count"], promoted["proven_count"], promoted["file"]) == (1, 9, C_REL)
     assert out["partial_merge"]["ok"] is True and seen == {
@@ -1187,7 +1200,7 @@ def test_complete_merges_the_contract_of_a_fully_proved_best_candidate_without_c
 
     out = S.cmd_complete(AID)
 
-    assert out["best_candidate"] == {"restored": True, "best": 1, "rank": {"failed": 0, "proved": 9, "invalid": 0}}
+    assert out["best_candidate"] == {"restored": True, "best": 1, "rank": rk(0, 9)}
     assert out["action"] == "blocked" and "ingest_wp" not in out
     assert out["partial_merge"]["ok"] is True and seen["source"] == annotated("proved")
 
@@ -1332,3 +1345,130 @@ def test_complete_of_a_negotiating_prover_restores_too(sim, monkeypatch):
 
     assert out["best_candidate"]["best"] == 1 and out["action"] == "negotiation_rejected"
     assert prover.read() == annotated("best")
+
+
+# ---------------------------------------------------------------------------
+# Trivial-annotation-aware rank (FRAMAC_CANDIDATE_RANK)
+# ---------------------------------------------------------------------------
+
+
+def with_trivial(tag: str, n: int) -> str:
+    """annotated(tag) with `n` added trivial asserts in the body: each one proves a goal whatever the code does."""
+    body = "".join("  //@ assert \\true;\n" for _ in range(n))
+    return f"/*@ requires {tag}: x >= 0;\n  @ assigns \\nothing;\n  @*/\nint f(int x) {{\n{body}  return x;\n}}\n"
+
+
+def iterate_source(prover: Prover, source: str, **kwargs: Any) -> dict:
+    prover.edit(source)
+    assert prover.guard()["next_action"] == "wait_for_other_oracle"
+    block = prover.wp(**kwargs)
+    assert block is not None and block["evaluated"] is True
+    return block
+
+
+def test_trivial_added_clauses_counts_only_new_tautological_assertions(prover):
+    base = "/*@ ensures old: \\true; */\nint g(void);\nint f(int x) {\n  return x;\n}\n"
+    work = (
+        "/*@ ensures old: \\true; */\nint g(void);\n"
+        "/*@ requires \\true;\n  @ ensures named: x == x;\n  @*/\n"
+        "int f(int x) {\n"
+        "  //@ assert 1 <= 2;\n"
+        "  int i = 0;\n"
+        "  /*@ loop invariant \\true;\n      loop invariant lo: 0 <= i;\n      loop assigns i; */\n"
+        "  while (i < x) i++;\n"
+        "  //@ assert 0 <= i;\n"
+        "  //@ check (\\true && 3 == 3);\n"
+        "  return x;\n}\n"
+    )
+    (prover.scratch / "base" / C_REL).write_text(base, encoding="utf-8")
+    budget = {"file": C_REL, "function": FN}
+    found = PC.trivial_added_clauses(prover.scratch, budget, {C_REL: work.encode()})
+    assert [(c["kind"], c["predicate"], c["line"]) for c in found] == [
+        ("ensures", "x == x", 4),
+        ("assert", "1 <= 2", 7),
+        ("loop invariant", "\\true", 9),
+        ("check", "(\\true && 3 == 3)", 14),
+    ]
+    assert {c["file"] for c in found} == {C_REL}
+    # The unchanged trivial `ensures` of the base, the `requires \true`, and the real clauses are not counted.
+    unchanged = PC.trivial_added_clauses(prover.scratch, budget, {C_REL: base.encode()})
+    assert unchanged == []
+
+
+def test_trivial_added_clauses_fails_open_on_an_untokenizable_file(prover, monkeypatch):
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise ValueError("bad token")
+
+    monkeypatch.setattr(PC, "tokenize_c_acsl", boom)
+    assert PC.trivial_added_clauses(prover.scratch, {}, {C_REL: with_trivial("a", 2).encode()}) == []
+
+
+def test_the_wp_oracle_records_trivial_clauses_in_the_candidate_and_history(prover):
+    block = iterate_source(prover, with_trivial("a", 2), failed=1, proved=7)
+    assert block["trivial_added"] == 2
+    assert block["rank"] == rk(1, 7, trivial=2)
+    assert block["next_synthesis_focus"] == "drop_trivial_clauses"
+    state = prover.state()
+    cand = state["candidates"][state["best_digest"]]
+    assert cand["wp"]["trivial_added"] == 2
+    assert [c["predicate"] for c in cand["wp"]["trivial_clauses"]] == ["\\true", "\\true"]
+    assert (state["history"][-1]["trivial_added"], state["history"][-1]["effective_proved"]) == (2, 5)
+
+
+@pytest.mark.parametrize(("mode", "best"), [(None, 1), ("trivial_aware", 1), ("legacy", 2), ("LEGACY", 2)])
+def test_trivial_clauses_lose_the_tie_in_trivial_aware_mode_only(prover, monkeypatch, mode, best):
+    if mode is None:
+        monkeypatch.delenv("FRAMAC_CANDIDATE_RANK", raising=False)
+    else:
+        monkeypatch.setenv("FRAMAC_CANDIDATE_RANK", mode)
+    iterate_source(prover, with_trivial("a", 0), failed=2, proved=10)
+    block = iterate_source(prover, with_trivial("b", 3), failed=2, proved=12)
+    assert block["best"] == best
+    legacy = best == 2
+    assert ("next_synthesis_focus" in block) is not legacy
+
+
+def test_adding_only_trivial_clauses_is_not_progress(prover):
+    iterate_source(prover, with_trivial("a", 0), failed=2, proved=10)
+    block = iterate_source(prover, with_trivial("b", 2), failed=2, proved=12)
+    assert (block["progress"], block["next_action"], block["best"]) == (False, "restore_best_and_finish", 1)
+    assert block["next_synthesis_focus"] == "drop_trivial_clauses"
+
+
+def test_real_proved_goals_are_still_progress(prover):
+    iterate_source(prover, with_trivial("a", 0), failed=2, proved=10)
+    block = iterate_source(prover, with_trivial("b", 0), failed=2, proved=12)
+    assert (block["progress"], block["next_action"], block["best"]) == (True, "continue", 2)
+    assert "next_synthesis_focus" not in block
+
+
+def test_legacy_mode_counts_trivial_goals_as_progress(prover, monkeypatch):
+    monkeypatch.setenv("FRAMAC_CANDIDATE_RANK", "legacy")
+    iterate_source(prover, with_trivial("a", 0), failed=2, proved=10)
+    block = iterate_source(prover, with_trivial("b", 2), failed=2, proved=12)
+    assert (block["progress"], block["next_action"], block["best"]) == (True, "continue", 2)
+    assert block["trivial_added"] == 2  # still recorded, for the A/B comparison
+
+
+def test_all_proven_with_trivial_clauses_is_finished_without_a_drop_focus(prover):
+    block = iterate_source(prover, with_trivial("a", 1), status="all_proven", failed=0, proved=6)
+    assert block["next_action"] == "finished" and "next_synthesis_focus" not in block
+
+
+def test_a_state_written_before_the_trivial_aware_rank_still_compares(prover):
+    iterate_source(prover, with_trivial("a", 0), failed=2, proved=10)
+    path = prover.scratch / "candidates" / "state.json"
+    state = load(path)
+    state["best_rank"] = {"failed": 2, "proved": 10, "invalid": 0}
+    for entry in state["history"]:
+        entry.pop("trivial_added", None)
+        entry.pop("effective_proved", None)
+    for cand in state["candidates"].values():
+        cand["wp"].pop("trivial_added", None)
+        cand["wp"].pop("trivial_clauses", None)
+    write_json(path, state)
+    assert PC.status(prover.scratch)["highest_proved"] == 10
+    block = iterate_source(prover, with_trivial("b", 2), failed=2, proved=12)
+    assert (block["progress"], block["best"]) == (False, 1)
+    block = iterate_source(prover, with_trivial("c", 0), failed=2, proved=11)
+    assert (block["progress"], block["best"]) == (True, 3)

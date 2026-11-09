@@ -69,7 +69,7 @@ Every single iteration of the Function Prover Subagent ([`../skills/framac-wp/pr
 
 ### The Best Candidate, Not the Last
 
-Both oracles record each iteration in the prover's scratch directory ([`../scripts/prover_candidates.py`](../scripts/prover_candidates.py)). Candidates that pass the guardrail are ranked by fewest unproven goals, then most proved goals. Only those compete, because a stronger `requires` can raise the proof ratio by excluding inputs. The tracker tells the prover to stop when an iteration improves neither number. Before a stalled prover's report and partial contract are used, `wp_scheduler.py complete` restores its best candidate.
+Both oracles record each iteration in the prover's scratch directory ([`../scripts/prover_candidates.py`](../scripts/prover_candidates.py)). Candidates that pass the guardrail are ranked by fewest unproven goals, then most proved goals. Only those compete, because a stronger `requires` can raise the proof ratio by excluding inputs. Clauses the prover added that hold whatever the code does (`\true`, `x == x`, `0 <= 1`; `acsl_ast.is_trivial_predicate`) earn no credit: a candidate with fewer of them wins a tie, and their goals are subtracted from the proved count (`FRAMAC_CANDIDATE_RANK=legacy` restores the plain count). The tracker tells the prover to stop when an iteration improves neither number. Before a stalled prover's report and partial contract are used, `wp_scheduler.py complete` restores its best candidate.
 
 ### What a Prover Starts From
 
