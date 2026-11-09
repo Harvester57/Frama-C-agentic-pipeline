@@ -2600,8 +2600,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help=(
             "Drop -rte-initialized from the fuzz build for this module; recorded in "
-            "reduced_checks. Useful when E-ACSL's by-value struct parameter shadow copy "
-            "makes every input a false initialization alarm (Eva still checks statically)."
+            "reduced_checks. Useful when uninstrumented code fills memory the target reads "
+            "(Eva still checks statically). Not needed for alarms on formal parameters: the "
+            "build marks formals initialized (compile.formal_inits)."
         ),
     )
     p_set.set_defaults(fuzz_rte_initialized=None)

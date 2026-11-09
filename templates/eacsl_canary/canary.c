@@ -13,7 +13,11 @@
  *   - a benign input runs clean. Every input writes a caller's stack buffer
  *     through canary_fill: without full memory tracking E-ACSL reports these
  *     valid writes as invalid, and without the runtime init hook
- *     (templates/eacsl_runtime/fuzz_init.c) every input crashes.
+ *     (templates/eacsl_runtime/fuzz_init.c) every input crashes. Every input
+ *     also reads a by-value struct parameter (canary_span_len) and a scalar
+ *     parameter through its address (canary_odd): E-ACSL registers formals
+ *     without marking them initialized, so without the build's formal-init
+ *     pass every input fails \initialized on them.
  * Like generated harnesses, LLVMFuzzerTestOneInput copies the input into its
  * own buffer: libFuzzer writes `data` outside instrumented code, so with
  * -rte-initialized every direct read of it would be reported as uninitialized.
@@ -37,6 +41,22 @@ static void canary_fill(char *dst, size_t n)
     }
 }
 
+struct canary_span {
+    const uint8_t *ptr;
+    size_t len;
+};
+
+static size_t canary_span_len(struct canary_span span)
+{
+    return span.len;
+}
+
+static int canary_odd(size_t n)
+{
+    const size_t *pn = &n;
+    return (int)(*pn & 1U);
+}
+
 static int canary_pick(const uint8_t *data, size_t len)
 {
     int picked;
@@ -53,8 +73,10 @@ static int canary_process(const uint8_t *data, size_t len)
     u_short short_len = (u_short)len;
     __int32_t widened = (__int32_t)short_len;
     char local[4] = {0};
+    struct canary_span span = {data, len};
 
     canary_fill(local, len < sizeof local ? len : sizeof local);
+    widened += canary_odd(canary_span_len(span));
     if (len > 0 && data[0] == 'O') {
         int fd = open("/nonexistent/framac-canary", O_RDONLY, 0);
         if (fd >= 0) {

@@ -271,6 +271,175 @@ def mark_wrapper_results_initialized(c_text: str) -> tuple[str, int]:
     return "\n".join(out), count
 
 
+FORMAL_INIT_DECL = "void __e_acsl_full_init(void *ptr);"
+_FULL_INIT_DECL_RE = re.compile(r"\bvoid\s+__e_acsl_full_init\s*\(\s*void\s*\*")
+# A definition header starts in column 0 with an identifier and has a parameter list.
+_DEF_HEADER_START_RE = re.compile(r"^[A-Za-z_][^;{}]*\(")
+_STORE_BLOCK_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+UL\);$"
+)
+_CALL_LIKE_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_FN_PTR_DECLARATOR_RE = re.compile(r"\(\s*\*+\s*(?:(?:const|volatile|restrict|__restrict)\s+)*([A-Za-z_]\w*)\s*\)")
+_TRAILING_NAME_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$")
+# Words that can precede `(` in a header without being the function name.
+_HEADER_NON_NAMES = frozenset(
+    {
+        "__attribute__",
+        "__attribute",
+        "__declspec",
+        "__extension__",
+        "__typeof__",
+        "__typeof",
+        "typeof",
+        "_Alignas",
+        "sizeof",
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "_Bool",
+        "const",
+        "volatile",
+        "restrict",
+        "static",
+        "extern",
+        "inline",
+        "__inline",
+        "__inline__",
+        "struct",
+        "union",
+        "enum",
+    }
+)
+
+
+def _matching_paren(text: str, open_at: int) -> int:
+    """Index of the `)` closing the `(` at `open_at`, or -1."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _split_top_level(params: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(params):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(params[start:i])
+            start = i + 1
+    parts.append(params[start:])
+    return parts
+
+
+def definition_formals(header: str) -> list[str]:
+    """
+    Parameter names of a function definition header as Frama-C prints it (one or more lines,
+    without the `{`). The parameter list is the group after the function name: the first
+    `<name>(` whose group ends the header, or is followed by `)` as in a function returning a
+    function pointer (`int (*get(int k))(int )`). Function-pointer parameters (`int (*cb)(int )`)
+    yield the pointer's name; `void` and `...` yield nothing. Returns [] when no list is found.
+    """
+    text = " ".join(header.split())
+    for m in _CALL_LIKE_RE.finditer(text):
+        if m.group(1) in _HEADER_NON_NAMES:
+            continue
+        open_at = m.end() - 1
+        close_at = _matching_paren(text, open_at)
+        if close_at < 0:
+            return []
+        rest = text[close_at + 1 :].strip()
+        if rest and not rest.startswith(")"):
+            continue
+        names: list[str] = []
+        for param in _split_top_level(text[open_at + 1 : close_at]):
+            param = param.strip()
+            if not param or param in ("void", "..."):
+                continue
+            fn_ptr = _FN_PTR_DECLARATOR_RE.search(param)
+            named = fn_ptr or _TRAILING_NAME_RE.search(param)
+            if named and named.group(1) not in _HEADER_NON_NAMES:
+                names.append(named.group(1))
+        return names
+    return []
+
+
+def mark_formals_initialized(c_text: str) -> tuple[str, int]:
+    """
+    Work around an E-ACSL gap (Frama-C 33-35): a function registers each formal parameter with
+    `__e_acsl_store_block((void *)(& p),N)` but never marks it initialized, although the caller
+    has just written it. Under -rte-initialized, the first read of a by-value struct field
+    (`\\initialized(&s.len)`) or of a scalar formal through its address fails on every call,
+    whatever the caller passed; the assertion is blocking, so nothing after it in the function
+    is ever checked. Insert `__e_acsl_full_init((void *)(& p));` after the first store_block of
+    each formal in each definition. Locals keep their tracking, so uninitialized locals are still
+    reported. Cost: uninitialized struct members passed by value are no longer reported by
+    E-ACSL (the check that would report them failed on every call). Declares the runtime function
+    ahead of the first patched definition when Frama-C pruned its prototype. Returns the new
+    text and the number of insertions.
+    """
+    lines = c_text.split("\n")
+    out: list[str] = []
+    header_lines: list[str] | None = None  # a definition header being read, before its `{`
+    header_at = first_patched_at = 0  # index in `out` of the current / first patched header
+    formals: set[str] = set()  # formals of the definition whose body is being read
+    patched: set[str] = set()
+    in_body = False
+    count = 0
+    for idx, line in enumerate(lines):
+        out.append(line)
+        if in_body:
+            if line.startswith("}"):
+                in_body = False
+                continue
+            m = _STORE_BLOCK_LINE_RE.match(line)
+            if not m or m.group("name") not in formals or m.group("name") in patched:
+                continue
+            name = m.group("name")
+            patched.add(name)
+            next_nonblank = next((ln for ln in lines[idx + 1 :] if ln.strip()), "")
+            if re.search(rf"__e_acsl_(?:full_init|initialize)\(\(void \*\)\(& ?{name}\)", next_nonblank):
+                continue
+            out.append(f"{m.group('indent')}__e_acsl_full_init((void *)(& {name}));")
+            if not count:
+                first_patched_at = header_at
+            count += 1
+            continue
+        if header_lines is not None:
+            if line.rstrip() == "{":
+                formals = set(definition_formals(" ".join(header_lines)))
+                patched = set()
+                in_body = bool(formals)
+                header_lines = None
+            elif line[:1].isspace() and not line.rstrip().endswith(";"):
+                header_lines.append(line)
+            else:
+                header_lines = None
+            if header_lines is not None or in_body:
+                continue
+        if _DEF_HEADER_START_RE.match(line) and not line.rstrip().endswith(";"):
+            header_lines = [line]
+            header_at = len(out) - 1
+    if count and not _FULL_INIT_DECL_RE.search("\n".join(out[:first_patched_at])):
+        out[first_patched_at:first_patched_at] = [FORMAL_INIT_DECL, ""]
+    return "\n".join(out), count
+
+
 _READONLY_SCALAR_RE = re.compile(
     r"(?P<store>^[ \t]*__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+UL\);\n"
     r"[ \t]*__e_acsl_full_init\(\(void \*\)\(& ?(?P=name)\)\);\n)"

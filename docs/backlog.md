@@ -69,6 +69,8 @@ A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions.
   - Closed in [`../README.md`](../README.md) and [`./resources-and-caching.md`](./resources-and-caching.md).
 - [x] **E-ACSL `__retres` workaround:** it rewrites E-ACSL's generated C text, so it is fragile across Frama-C releases. Report the gap upstream and drop the rewrite once it is fixed.
   - Documented as Issue 8 in [`./upstream/frama-c-e-acsl-issues.md`](./upstream/frama-c-e-acsl-issues.md#issue-8-__gen_e_acsl_fn-wrapper-leaves-__retres-uninitialized-under--rte-initialized).
+- [ ] **E-ACSL formal-parameter workaround** (`mark_formals_initialized`): it also rewrites E-ACSL's generated C text. Report it upstream, and drop the rewrite once E-ACSL marks formals initialized. The selftest canary fails `benign_input_clean` if neither is in place.
+  - Drafted in [`./upstream/frama-c-eacsl-formal-params-initialized.md`](./upstream/frama-c-eacsl-formal-params-initialized.md); not filed yet, and not yet listed in the index [`./upstream/frama-c-e-acsl-issues.md`](./upstream/frama-c-e-acsl-issues.md).
 
 ## 4. Deferred by the plan
 

@@ -1149,8 +1149,8 @@ def _run_parent_reverify(
         harness = overlay_dir / "harnesses" / f"harness_{hmod}.c"
         corpus = overlay_dir / "corpus" / hmod
         # The parent re-check must use the same reduced checks as the module's build:
-        # a module fuzzed with -no-rte-initialized would otherwise re-trip the E-ACSL
-        # by-value-struct initialization artifact here and be misread as code_fault.
+        # a module fuzzed with -no-rte-initialized would otherwise re-trip an
+        # initialization alarm the module opted out of and be misread as code_fault.
         rte_initialized = True
         try:
             import pipeline_make  # imported lazily; the overlay also works without the Make layer

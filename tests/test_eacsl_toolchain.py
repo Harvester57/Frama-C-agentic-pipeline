@@ -298,6 +298,149 @@ def test_the_build_patches_wrappers_only_when_uninitialized_reads_are_checked(tm
     assert T.WRAPPER_RESULT_INIT not in (tmp_path / "plain_mod.instrumented.c").read_text(encoding="utf-8")
 
 
+# Shapes copied from Frama-C 35 output (QCBOR run-5 and a minimal by-value struct file).
+FORMALS_PROTO = " __attribute__((__FC_BUILTIN__)) void __e_acsl_full_init(void *ptr);\n\n"
+FORMALS_C = """\
+void UsefulOutBuf_InsertUsefulBuf(UsefulOutBuf *pMe, UsefulBufC NewData,
+                                  size_t uInsertionPos);
+
+int f_struct(struct S s, int k)
+{
+  int __retres;
+  __e_acsl_store_block((void *)(& __retres),4UL);
+  {
+    int __gen_e_acsl_initialized;
+    __e_acsl_store_block((void *)(& k),4UL);
+    __e_acsl_store_block((void *)(& s),16UL);
+    __gen_e_acsl_initialized = __e_acsl_initialized((void *)(& s.len),
+                                                    sizeof(unsigned long));
+  }
+  if (s.len > (unsigned long)3) {
+    int k_copy;
+    __e_acsl_store_block((void *)(& k_copy),4UL);
+    __e_acsl_full_init((void *)(& __retres));
+    __retres = k + 1;
+  }
+  return __retres;
+}
+
+void UsefulOutBuf_InsertUsefulBuf(UsefulOutBuf *pMe, UsefulBufC NewData,
+                                  size_t uInsertionPos)
+{
+  int tmp;
+  __e_acsl_store_block((void *)(& tmp),4UL);
+  {
+    int __gen_e_acsl_valid_read;
+    __e_acsl_store_block((void *)(& uInsertionPos),8UL);
+    __e_acsl_store_block((void *)(& NewData),16UL);
+    __e_acsl_store_block((void *)(& pMe),8UL);
+  }
+  {
+    size_t uInsertionPos;
+    __e_acsl_store_block((void *)(& uInsertionPos),8UL);
+  }
+  return;
+}
+
+int apply(int (*cb)(int , char *), int x)
+{
+  __e_acsl_store_block((void *)(& x),4UL);
+  __e_acsl_store_block((void *)(& cb),8UL);
+  return (*cb)(x,(char *)0);
+}
+
+int no_formals(void)
+{
+  int s;
+  __e_acsl_store_block((void *)(& s),4UL);
+  return 0;
+}
+"""
+
+
+def _full_init(name: str) -> str:
+    return f"__e_acsl_full_init((void *)(& {name}));"
+
+
+def test_formals_are_marked_initialized_right_after_their_registration():
+    patched, n = T.mark_formals_initialized(FORMALS_PROTO + FORMALS_C)
+    assert n == 7  # k, s, uInsertionPos, NewData, pMe, x, cb
+    lines = patched.split("\n")
+    for name in ("k", "s", "NewData", "pMe", "x", "cb"):
+        i = lines.index(next(ln for ln in lines if f"__e_acsl_store_block((void *)(& {name})," in ln))
+        assert lines[i + 1].strip() == _full_init(name)
+    # Only the formal's own registration: not the shadowing local in a nested block.
+    assert patched.count(_full_init("uInsertionPos")) == 1
+    shadow = max(i for i, ln in enumerate(lines) if "store_block((void *)(& uInsertionPos)" in ln)
+    assert _full_init("uInsertionPos") not in lines[shadow + 1]
+    # Locals stay uninitialized until written: they are still checked.
+    assert _full_init("k_copy") not in patched and _full_init("tmp") not in patched
+    # `s` in no_formals is a local of a function without parameters.
+    no_formals = patched[patched.index("int no_formals(void)") :]
+    assert _full_init("s") not in no_formals
+    # Frama-C kept the runtime prototype, so nothing is declared.
+    assert lines.count(T.FORMAL_INIT_DECL) == 0
+
+
+def test_formal_patch_is_idempotent_and_respects_an_upstream_fix():
+    patched, n = T.mark_formals_initialized(FORMALS_PROTO + FORMALS_C)
+    assert n and T.mark_formals_initialized(patched) == (patched, 0)
+    upstream_fixed = FORMALS_C.replace(
+        "    __e_acsl_store_block((void *)(& s),16UL);\n",
+        "    __e_acsl_store_block((void *)(& s),16UL);\n    __e_acsl_full_init((void *)(& s));\n",
+    )
+    patched, n = T.mark_formals_initialized(FORMALS_PROTO + upstream_fixed)
+    assert n == 6 and patched.count(_full_init("s")) == 1
+
+
+def test_formal_patch_declares_the_runtime_function_frama_c_pruned():
+    patched, n = T.mark_formals_initialized(FORMALS_C)
+    lines = patched.split("\n")
+    assert n == 7 and lines.count(T.FORMAL_INIT_DECL) == 1
+    # At file scope, after the prototype and right before the first patched definition.
+    decl_at = lines.index(T.FORMAL_INIT_DECL)
+    assert lines[decl_at + 2] == "int f_struct(struct S s, int k)"
+    assert T.mark_formals_initialized(patched) == (patched, 0)
+    # A call is not a declaration; a definition without registered formals changes nothing.
+    assert T.mark_formals_initialized("int f(void)\n{\n  return 0;\n}\n") == ("int f(void)\n{\n  return 0;\n}\n", 0)
+
+
+@pytest.mark.parametrize(
+    ("header", "formals"),
+    [
+        ("int f_struct(struct S s, int k)", ["s", "k"]),
+        ("int UsefulBuf_Compare(UsefulBufC const UB1, UsefulBufC const UB2)", ["UB1", "UB2"]),
+        (
+            "void UsefulOutBuf_InsertUsefulBuf(UsefulOutBuf *pMe, UsefulBufC NewData,\n"
+            "                                  size_t uInsertionPos)",
+            ["pMe", "NewData", "uInsertionPos"],
+        ),
+        ("static uint64_t QCBOREncode_Private_BigNumberToUInt(UsefulBufC const BigNumber)", ["BigNumber"]),
+        ("int apply(int (*cb)(int , char *), int x)", ["cb", "x"]),
+        ("int (*get_cb(int k))(int )", ["k"]),
+        ("UsefulBufC (*pick(UsefulBufC b))(int )", ["b"]),
+        ("int __attribute__((__noinline__)) f(char const * restrict fmt, ...)", ["fmt"]),
+        ("int sum(int n, int arr[4])", ["n", "arr"]),
+        ("int no_formals(void)", []),
+        ("int LLVMFuzzerTestOneInput(uint8_t const *data, size_t size)", ["data", "size"]),
+    ],
+)
+def test_definition_formals(header, formals):
+    assert T.definition_formals(header) == formals
+
+
+def test_the_build_marks_formals_initialized_without_reducing_checks(tmp_path, modern_cli):
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=FakeEacslGcc(FORMALS_C))
+    assert res["returncode"] == 0 and res["formal_inits"] == 7 and res["reduced_checks"] == []
+    text = (tmp_path / "fuzz_mod.instrumented.c").read_text(encoding="utf-8")
+    assert _full_init("NewData") in text
+    # Formals hold the caller's values whatever is checked: user contracts can read them too.
+    res = R.compile_eacsl_binary(
+        [str(_src(tmp_path))], tmp_path / "plain_mod", rte_initialized=False, runner=FakeEacslGcc(FORMALS_C)
+    )
+    assert res["formal_inits"] == 7 and res["reduced_checks"] == ["-no-rte-initialized"]
+
+
 def test_rte_initialized_opt_out_is_recorded(tmp_path, modern_cli):
     fake = FakeEacslGcc()
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", rte_initialized=False, runner=fake)
@@ -704,6 +847,17 @@ def test_selftest_with_fake_toolchain(tmp_path, modern_cli, monkeypatch):
 
     blind = R.run_selftest(tmp_path / "st4", runner=FakeEacslGcc(), replay=no_init_checks)
     assert not blind["ok"] and not blind["checks"]["detects_uninitialized"] and blind["checks"]["detects_overflow"]
+
+    # Unmarked formals: every input stops at the by-value struct read, before the canary's own bugs.
+    def formal_artifact(binary, artifact, scratch, timeout_s=60):
+        return {
+            "reproduced": True,
+            "failure": {"file": "canary.c", "line": 51, "function": "canary_span_len", "alarm_kind": "initialization"},
+        }
+
+    unmarked = R.run_selftest(tmp_path / "st5", runner=FakeEacslGcc(), replay=formal_artifact)
+    assert not unmarked["ok"] and not unmarked["checks"]["benign_input_clean"]
+    assert not unmarked["checks"]["detects_uninitialized"]  # an alarm in another function is not the canary's
 
 
 # ---------------------------------------------------------------------------

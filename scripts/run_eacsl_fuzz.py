@@ -93,6 +93,7 @@ from eacsl_toolchain import (  # noqa: E402
     defines_fuzzer_initialize,
     fix_readonly_scalar_globals,
     is_eacsl_instrumented,
+    mark_formals_initialized,
     mark_wrapper_results_initialized,
     normalize_passthrough,
     parse_missing_functions,
@@ -1004,6 +1005,17 @@ def _compile_eacsl_binary_uncached(
                         f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
                         "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n"
                     )
+
+            # Without this, the first read of a by-value struct field fails \initialized on every call.
+            c_text, n_formals = mark_formals_initialized(c_text)
+            if n_formals:
+                c_modified = True
+                result["formal_inits"] = n_formals
+                log_parts.append(
+                    f"Marked {n_formals} formal parameter(s) initialized at function entry "
+                    "(E-ACSL registers formals without marking them; uninitialized struct members "
+                    "passed by value are not reported).\n"
+                )
 
             c_text, n_readonly = fix_readonly_scalar_globals(c_text)
             if n_readonly:
@@ -2489,6 +2501,9 @@ CANARY_INPUT = b"FC33" + b"P" * 12
 CANARY_BENIGN_INPUT = b"BENIGN" + b"P" * 10
 # Reaches canary_pick with data[4] != 'S': an uninitialized read that -rte-initialized must report.
 CANARY_UNINIT_INPUT = b"UNINX" + b"P" * 11
+# The function holding the canary's uninitialized read. An initialization alarm elsewhere (such as
+# E-ACSL's unmarked formals, which every input reaches first) must not satisfy the check.
+CANARY_UNINIT_FUNCTION = "canary_pick"
 DEFAULT_SELFTEST_JSON = Path("workspace/reports/eacsl_selftest.json")
 
 
@@ -2574,7 +2589,9 @@ def run_selftest(
         uninit_rep = replay(Path(comp["binary"]), uninit, work_dir / "scratch")
         uninit_failure = uninit_rep.get("failure") or {}
         checks["detects_uninitialized"] = (
-            bool(uninit_rep.get("reproduced")) and uninit_failure.get("alarm_kind") == "initialization"
+            bool(uninit_rep.get("reproduced"))
+            and uninit_failure.get("alarm_kind") == "initialization"
+            and uninit_failure.get("function", CANARY_UNINIT_FUNCTION) == CANARY_UNINIT_FUNCTION
         )
     required = (
         "compiled",
