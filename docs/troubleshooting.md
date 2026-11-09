@@ -376,6 +376,39 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 ### Symptom: A Negotiate Request Is Dispatched to an Agent, Then Closed as `not dispatched: callee went through 4 negotiation rounds`
 - **Open, not diagnosed** (seen 2026-11-09 in the offline A/B on a copy of libmnl run 1). `req_0015` was assigned to `negotiate-mnl_attr_get_payload-5` at 16:35:10 (its scratch is empty), then closed `rejected_by_callee` at 16:36:40 with a `not dispatched:` note. The callee had 5 negotiate dispatches although `MAX_NEGOTIATION_ROUNDS_PER_CALLEE = 3`. Because of the `not dispatched:` prefix, Tier 1 treats it as a structural rejection and leaves it out of "Known Dead Ends". Open the scheduler log of that run (`_emit_negotiations`, the round counter) before naming a cause.
 
+### Symptom: Implementation Mutants Fail With `acsl_syntax_error` (`return attr->=nla_len;`, `<==`, `>==`)
+- **Open pipeline bug** (found 2026-11-09 by the formal-discovery Tier 4 A/B on libmnl run 1: 6 of 15 implementation mutants; also present on `phase1-remediation`).
+- **Cause:** [`../scripts/mutation_check.py`](../scripts/mutation_check.py) `impl_mutants` applies `_REL_OP_FLIP` with `body_text.replace(op, flipped, 1)`, a plain substring replace with no token boundaries, so `>` matches inside `->` and `<` inside `<=`. With the corrected criterion these mutants are `not_applicable` and leave the denominator, but the function then gets no real implementation mutant.
+- **Fix (proposed):** flip only standalone relational-operator tokens, using the `c_token`s of `acsl_ast.tokenize_c_acsl`.
+
+### Symptom: `mutation_check.py --run-dir` Scores Every Mutant `not_applicable` on a Target With Include Paths
+- **Open pipeline bug** (found 2026-11-09 by the Tier 4 A/B on libmnl: every mutant failed with `fatal error: libmnl/libmnl.h: No such file or directory`, reported as `acsl_syntax_error`).
+- **Cause:** `run_mutation_check` passes the hard-coded cppflags `"-I."` to `check_function` instead of the module's WP flags. A preprocessing failure is also classified as `acsl_syntax_error`, which is misleading.
+- **Fix (proposed):** use `pipeline_make.build_plan(run).wp_cppflags_for(module)` as `wp-sweep` does, and report preprocessing failures under their own status. The Tier 4 A/B worked around it in a driver that passed the module's flags; the stock command still has the defect.
+
+### Symptom: A Proof-Carry Replay Rejected After Its Merge Leaves the Cached Contract in `workspace/work/`
+- **Open pipeline bug** (found 2026-11-09 by the formal-discovery Tier 6 A/B on a copy of libmnl run 1: `mnl_cb_noop` was rejected with `ledger ingest-wp failed`, its contract stayed in `workspace/work/src/callback.c` and its units stayed `planned`).
+- **Cause:** [`../scripts/proof_carry.py`](../scripts/proof_carry.py) `replay` calls `reject()` after `merge_agent_overlay` has already spliced the tree (the `merged without a parent WP report` and `ledger ingest-wp failed` paths). `reject()` only removes the agent; the module docstring promises that anything else rolls back.
+- **Fix (proposed):** restore the pre-merge span on those paths, or treat an ingest failure as fatal for the phase.
+
+### Symptom: A Rejected Proof-Carry Replay Leaves Only a Short Reason, No Guardrail Report or Logs
+- **Open pipeline gap** (Tier 6 A/B, 2026-11-09): `reject()` deletes `agents/carry-<n>` with its guardrail JSON and logs; only a reason truncated to 400 characters reaches `workspace/reports/proof-carry/summary.json`. Diagnosing the rejections below needed a driver that skipped `_remove_agent`.
+- **Fix (proposed):** keep the guard and WP reports under `state/proof-carry/<slug>__<fn>/` before removing the agent.
+
+### Symptom: `wp-sweep` Publishes Proofs That the Replay's Merge Gate Always Rejects
+- **Open pipeline gap** (Tier 6 A/B, 2026-11-09: `mnl_attr_get_str` was rejected at replay with `frame-preservation check failed: projected frame clause missing or weakened: 'assigns \nothing;'`, because run 1's swept contract predates the frame skeleton).
+- **Cause:** publishing re-proves the function but never runs the merge-time checks (frame preservation, scope).
+- **Fix (proposed):** run those checks before publishing, or record the expected rejection on the entry. Safe as is: a rejected hit never credits a unit.
+
+### Symptom: Every `ledger.py` Write Refuses the libmnl Run 1 Ledger (`callgraph_source: "regex"`, `l6_secret`)
+- **Not a pipeline defect: stale artifact** (seen 2026-11-09 in the Tier 6 A/B). 182 units of `targets/libmnl/framac-run-1-results/coverage-ledger.json` use `callgraph_source: "regex"` (no longer allowed since 3ca823b) and 14 the obligation class `l6_secret`, so `ingest-wp`, `audit-hypotheses` and `mark-carried` all refuse it. The A/B remapped the labels in its run copies only (no verdict changes). Re-run Phase 0 rather than reuse that ledger.
+
+### Symptom: E-ACSL Fails With `labels pre-analysis was not performed on construct \old(b)` on a Guardrail Build
+- **Open, toolchain (Frama-C 35.0~dev)** (Tier 6 A/B, 2026-11-09: the `mnl_nlmsg_batch_is_empty` guardrail returned `compile_error`; the same contract passed under run 1's Frama-C 34 image). Not a pipeline defect; reduce it to a minimal case before filing upstream.
+
+### Symptom: The `mnl_attr_get_len` Guardrail Returns `guardrail_error` (`Binary failed without a recognizable E-ACSL failure report`, Exit Code 1)
+- **Open, not diagnosed** (Tier 6 A/B replay, 2026-11-09, Frama-C 35.0~dev image; the function was not reached by the 64 replayed corpus inputs, and the same guardrail passed in run 1). Open the binary's stderr in a kept agent directory before naming a cause.
+
 ### Symptom: PowerShell Splits Frama-C or Docker CLI Flags Containing `.` or `=`
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.
 - **Fix:** Always invoke container commands through [`../wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
