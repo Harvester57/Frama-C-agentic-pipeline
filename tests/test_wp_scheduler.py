@@ -1876,3 +1876,193 @@ def test_h2_parent_replays_a_phase3_candidate_before_ingesting_its_verdict(sim, 
     assert found == ["workspace/reports/replay/src_m_f.c_f_mem_access_0123456789-abcdef0123.json"]
     # An existing replay is reused, never run again.
     assert S._parent_replay(fp, cand, out) == found and len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Negotiate brief evidence (FRAMAC_NEGOTIATE_EVIDENCE)
+# ---------------------------------------------------------------------------
+
+
+def _negotiate_evidence_state(run_dir):
+    """One negotiate task on g with two stalled callers: f has a promoted report, h has none anywhere."""
+    goals = [
+        {
+            "line": 88,
+            "kind": "precondition",
+            "status": "Unknown",
+            "annotation": "typed_f_call_g_requires",
+            "diagnostic_bucket": "step_c_caller_precondition",
+            "obligation_class": "contract",
+        },
+        {
+            "line": 102,
+            "kind": "postcondition",
+            "status": "Unknown",
+            "annotation": "len_ok",
+            "diagnostic_bucket": "step_c_contract_postcondition",
+        },
+        {
+            "line": 95,
+            "kind": "mem_access",
+            "status": "Unknown",
+            "annotation": "rte: mem_access: \\valid_read(p)",
+            "diagnostic_bucket": "step_c_rte_obligation",
+        },
+    ]
+    write_json(
+        run_dir / "agents/prove-f/artifacts/wp_f.json",
+        {**wp_report("f", "src/m/f.c", "unproven_goals_remain"), "unproven_goals": goals},
+    )
+    # The canonical report is stale and must not win over the promoted one.
+    write_json(run_dir / "workspace/reports/wp/f.json", wp_report("f", "src/m/f.c", "all_proven"))
+    neg: dict = {
+        "id": "negotiate:src/m/g.c#g",
+        "kind": "negotiate",
+        "function": "g",
+        "file": "src/m/g.c",
+        "module": "m",
+        "header": "src/m/g.h",
+        "requests": [],
+        "callers": ["prove:src/m/f.c#f", "prove:src/m/h.c#h"],
+        "agent_id": "negotiate-g",
+    }
+
+    def prove(fn):
+        return {
+            "id": f"prove:src/m/{fn}.c#{fn}",
+            "kind": "prove",
+            "function": fn,
+            "file": f"src/m/{fn}.c",
+            "agent_id": f"prove-{fn}",
+            "state": "blocked",
+        }
+
+    task_map: dict[str, dict] = {neg["id"]: neg}
+    task_map.update({f"prove:src/m/{fn}.c#{fn}": prove(fn) for fn in ("f", "g", "h")})
+    state = {
+        "tasks": task_map,
+        "agents": {
+            "prove-g": "prove:src/m/g.c#g",
+            "prove-f": "prove:src/m/f.c#f",
+            "prove-h": "prove:src/m/h.c#h",
+            "negotiate-g": neg["id"],
+        },
+    }
+    return state, neg
+
+
+def _write_candidates_state(run_dir, aid, function):
+    def entry(cid, oracle, guard, failed, proved):
+        return {
+            "id": cid,
+            "digest": f"d{cid[1:]}",
+            "oracle": oracle,
+            "wp_status": "unproven_goals_remain",
+            "guardrail_status": guard,
+            "failed": failed,
+            "proved": proved,
+            "eligible": True,
+        }
+
+    write_json(
+        run_dir / f"agents/{aid}/scratch/candidates/state.json",
+        {
+            "schema": 1,
+            "agent_id": aid,
+            "function": function,
+            "next_id": 5,
+            "best": "c3",
+            "best_digest": "d3",
+            "best_rank": [1, 0, 17],
+            "best_files": None,
+            "candidates": {"d3": {"refuted": False}, "d4": {"refuted": False}},
+            "history": [entry("c3", "wp", None, 1, 17), entry("c4", "guardrail", "passed_dynamic_oracle", 2, 16)],
+        },
+    )
+
+
+def test_negotiate_kwargs_carry_the_callers_seam_goals_and_the_callee_history(run_dir, monkeypatch):
+    monkeypatch.delenv("FRAMAC_NEGOTIATE_EVIDENCE", raising=False)
+    state, neg = _negotiate_evidence_state(run_dir)
+    _write_candidates_state(run_dir, "prove-g", "g")
+    kw = S._prepare_kwargs(neg, state)
+    by_caller = {e["caller"]: e for e in kw["caller_evidence"]}
+    f_ev = by_caller["f"]
+    assert f_ev["caller_file"] == "src/m/f.c"
+    assert f_ev["report"] == "agents/prove-f/artifacts/wp_f.json"
+    assert [g["line"] for g in f_ev["goals"]] == [88, 102]  # the rte goal is not at the seam
+    assert set(f_ev["goals"][0]) == {"line", "kind", "status", "annotation", "diagnostic_bucket"}
+    assert by_caller["h"] == {"caller": "h", "caller_file": "src/m/h.c", "report": None, "goals": []}
+    assert kw["callee_history"] == {
+        "agent_id": "prove-g",
+        "iterations": 2,
+        "best_rank": [1, 0, 17],
+        "highest_proved": 17,
+        "last_wp_status": "unproven_goals_remain",
+        "last_guardrail_status": "passed_dynamic_oracle",
+    }
+    assert S._describe(neg, None, state)["caller_evidence_goals"] == 2
+
+
+def test_negotiate_evidence_caps_goals_and_finds_the_callee_by_name(run_dir, monkeypatch):
+    monkeypatch.delenv("FRAMAC_NEGOTIATE_EVIDENCE", raising=False)
+    state, neg = _negotiate_evidence_state(run_dir)
+    goals = [
+        {"line": i, "kind": "assert", "status": "Unknown", "annotation": f"g_result_{i}", "diagnostic_bucket": "x"}
+        for i in range(3)
+    ]
+    goals.append(
+        {"line": 50, "kind": "assert", "status": "Unknown", "annotation": "uses g(x)", "diagnostic_bucket": "x"}
+    )
+    goals += [
+        {
+            "line": 100 + i,
+            "kind": "precondition",
+            "status": "Unknown",
+            "annotation": "r",
+            "diagnostic_bucket": "step_c_caller_precondition",
+        }
+        for i in range(20)
+    ]
+    write_json(run_dir / "agents/prove-f/artifacts/wp_f.json", {"function": "f", "unproven_goals": goals})
+    f_ev = S._caller_evidence(state, neg)[0]
+    assert f_ev["goals"][0]["line"] == 50  # `g_result_0` does not name g; `g(x)` does
+    assert len(f_ev["goals"]) == S.MAX_EVIDENCE_GOALS_PER_CALLER
+    assert S._callee_history(state, neg) is None  # no prover of g recorded a candidate
+
+
+def test_negotiate_evidence_is_off_with_the_switch_and_never_raises(run_dir, monkeypatch):
+    state, neg = _negotiate_evidence_state(run_dir)
+    monkeypatch.setenv("FRAMAC_NEGOTIATE_EVIDENCE", "OFF")
+    kw = S._prepare_kwargs(neg, state)
+    assert "caller_evidence" not in kw and "callee_history" not in kw
+    assert "caller_evidence_goals" not in S._describe(neg, None, state)
+
+    monkeypatch.setenv("FRAMAC_NEGOTIATE_EVIDENCE", "on")
+    (run_dir / "agents/prove-f/artifacts/wp_f.json").write_text("{not json", encoding="utf-8")
+    (run_dir / "agents/prove-g/scratch/candidates").mkdir(parents=True)
+    (run_dir / "agents/prove-g/scratch/candidates/state.json").write_text("[]", encoding="utf-8")
+    kw = S._prepare_kwargs(neg, state)
+    f_ev = kw["caller_evidence"][0]
+    # The corrupted promoted report is skipped; the canonical report (all proven) has no seam goals.
+    assert f_ev["report"] == "workspace/reports/wp/f.json" and f_ev["goals"] == []
+    assert kw["callee_history"] is None
+    # Without a schedule the task still prepares: callers resolve from their ids.
+    kw = S._prepare_kwargs(neg)
+    assert [e["caller"] for e in kw["caller_evidence"]] == ["f", "h"]
+
+
+def test_dispatched_negotiate_brief_kwargs_name_the_stalled_callers_report(sim, monkeypatch):
+    monkeypatch.delenv("FRAMAC_NEGOTIATE_EVIDENCE", raising=False)
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-f", "f", "src/m/f.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    S.cmd_complete("prove-f")
+    neg = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "negotiate"][0]
+    kw = [kw for aid, _, kw in sim.prepared if aid == neg["agent_id"]][-1]
+    assert kw["caller_evidence"][0]["caller"] == "f"
+    assert kw["caller_evidence"][0]["report"] == "agents/prove-f/artifacts/wp_f.json"
+    assert "caller_evidence_goals" in neg

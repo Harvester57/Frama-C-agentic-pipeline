@@ -2443,6 +2443,48 @@ def _prover_context(
     return section, features if isinstance(features, dict) else None, summary
 
 
+def _negotiation_evidence_section(caller_evidence: list[dict] | None, callee_history: dict | None) -> str:
+    """
+    The seam evidence appended to the Contract Negotiation Requests: why each caller stalled (its
+    unproven goals at the call site) and this function's previous prover run. Empty when there is
+    neither, so the brief is then unchanged.
+    """
+    out = ""
+    entries = [e for e in caller_evidence or [] if isinstance(e, dict)]
+    if entries:
+        out += "\n### Why the callers stalled (seam evidence)\n\n"
+        for entry in entries:
+            report = entry.get("report")
+            where = f"report `{report}`" if report else "no WP report found"
+            out += f"- `{entry.get('caller')}` (`{entry.get('caller_file')}`, {where}):\n"
+            goals = [g for g in entry.get("goals") or [] if isinstance(g, dict)]
+            if not goals:
+                out += "  - no unproven goal at the call site was recorded\n"
+            for g in goals:
+                annotation = " ".join(str(g.get("annotation") or "").replace("`", "'").split())
+                kind = str(g.get("kind") or "goal")
+                prop = f"{kind} `{annotation}`" if annotation else kind
+                bucket = g.get("diagnostic_bucket") or "unclassified"
+                out += f"  - line {g.get('line')}, {prop}: {g.get('status') or 'Unknown'} (`{bucket}`)\n"
+    if callee_history:
+        rank = callee_history.get("best_rank")
+        rank_text = f"({', '.join(str(x) for x in rank)})" if isinstance(rank, list | tuple) else "none recorded"
+        out += (
+            "\n### Your function's previous prover run\n\n"
+            f"Agent `{callee_history.get('agent_id')}` ran {callee_history.get('iterations')} iterations; "
+            f"best rank (failed, invalid, proved) = {rank_text}; "
+            f"last WP status `{callee_history.get('last_wp_status')}`, "
+            f"last guardrail `{callee_history.get('last_guardrail_status')}`. "
+            "Its scratch is read-only to you; do not copy clauses the guardrail refuted.\n"
+        )
+    if out:
+        out += (
+            "\nProve the requested clauses first; if a requested clause is exactly what the caller's goal "
+            "needs but cannot hold, say which caller goal would remain open.\n"
+        )
+    return out
+
+
 def prepare_agent(
     run_dir: Path,
     agent_id: str,
@@ -2458,6 +2500,8 @@ def prepare_agent(
     ldflags: str | None = None,
     wp_report: str | None = None,
     requests: list[dict] | None = None,
+    caller_evidence: list[dict] | None = None,
+    callee_history: dict | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -2467,7 +2511,9 @@ def prepare_agent(
     `wp_report` names the WP report whose unproven goals the brief lists (a breaker gets the
     stalled prover's report); the default is `workspace/reports/wp/<function>.json`.
     `requests` are strengthening requests a negotiating callee prover must answer; they are
-    appended to its brief.
+    appended to its brief, followed by the seam evidence when given: `caller_evidence` (each
+    caller's unproven goals at the call site, from its stalled WP report) and `callee_history`
+    (a summary of this function's previous prover run).
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -2801,6 +2847,7 @@ def prepare_agent(
             "fails and why. Never weaken an existing clause to make a requested one provable.\n\n"
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
+        rendered += _negotiation_evidence_section(caller_evidence, callee_history)
 
     brief_path = agent_root / "brief.md"
     brief_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3001,6 +3048,18 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Strengthening request the callee prover must answer (repeatable)",
     )
+    p_prep.add_argument(
+        "--caller-evidence-json",
+        type=Path,
+        default=None,
+        help="JSON list of the callers' call-site goals, rendered under the negotiation requests",
+    )
+    p_prep.add_argument(
+        "--callee-history-json",
+        type=Path,
+        default=None,
+        help="JSON object summarizing the callee's previous prover run, rendered under the requests",
+    )
 
     p_check = sub.add_parser("check-acsl-only")
     p_check.add_argument("--overlay", type=Path, default=Path("workspace"))
@@ -3072,6 +3131,12 @@ def main(argv: list[str] | None = None) -> int:
                 if missing:
                     raise ArtifactError(f"unknown strengthening request(s) in {req_file}: {', '.join(missing)}")
                 requests = [known[rid] for rid in args.request_id]
+            caller_evidence = load_json_strict(args.caller_evidence_json) if args.caller_evidence_json else None
+            if caller_evidence is not None and not isinstance(caller_evidence, list):
+                raise ArtifactError(f"{args.caller_evidence_json}: expected a JSON list")
+            callee_history = load_json_strict(args.callee_history_json) if args.callee_history_json else None
+            if callee_history is not None and not isinstance(callee_history, dict):
+                raise ArtifactError(f"{args.callee_history_json}: expected a JSON object")
             res = prepare_agent(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -3087,6 +3152,8 @@ def main(argv: list[str] | None = None) -> int:
                 ldflags=args.ldflags,
                 wp_report=args.wp_report,
                 requests=requests,
+                caller_evidence=caller_evidence,
+                callee_history=callee_history,
             )
         elif args.cmd == "check-acsl-only":
             res = check_acsl_only(args.overlay, args.work_dir, args.file or None)
