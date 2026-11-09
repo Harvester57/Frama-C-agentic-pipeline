@@ -23,6 +23,11 @@
 
 #if defined(__FRAMAC__)
 
+/* `offsetof` stays the libc's `__builtin_offsetof`, which the kernel folds to a constant. A
+ * non-constant array index (`offsetof(T, m[i])`) is repaired in the preprocessed output by
+ * scripts/fc_cpp_wrapper.py. Never redefine `offsetof` here: the null-pointer form
+ * `&((T *)0)->m` is an invalid pointer for Eva (-warn-invalid-pointer) and no longer a constant. */
+
 #ifndef _Float32
 #define _Float32 float
 #endif
@@ -63,6 +68,43 @@ long long int llabs(long long int j);
 
 #include <stdint.h>
 #include <sys/types.h>
+
+/* Linux and glibc declarations __fc_libc lacks (found on libseccomp). E-ACSL builds take them from
+ * glibc itself, so they live in this branch only. */
+
+/* glibc <unistd.h>: `syscall`. The contract only says what ACSL can say about a variadic call: the
+ * result depends on the number. It cannot state what the call writes through its arguments, so
+ * Eva and WP assume a syscall writes no memory; buffers it fills stay as the caller left them. */
+/*@ assigns \result \from number; */
+long syscall(long number, ...);
+
+/* Linux <asm-generic/ioctl.h>: the ioctl request encoding (`_IOWR(magic, nr, struct foo)`), which
+ * glibc's <sys/ioctl.h> provides and __fc_libc's does not. Without it the struct-type argument is a
+ * syntax error. Values are those of x86_64 (and every architecture using the generic layout). */
+#ifndef _IOC
+#define _IOC_NRBITS 8
+#define _IOC_TYPEBITS 8
+#define _IOC_SIZEBITS 14
+#define _IOC_DIRBITS 2
+#define _IOC_NRSHIFT 0
+#define _IOC_TYPESHIFT (_IOC_NRSHIFT + _IOC_NRBITS)
+#define _IOC_SIZESHIFT (_IOC_TYPESHIFT + _IOC_TYPEBITS)
+#define _IOC_DIRSHIFT (_IOC_SIZESHIFT + _IOC_SIZEBITS)
+#define _IOC_NONE 0U
+#define _IOC_WRITE 1U
+#define _IOC_READ 2U
+#define _IOC(dir, type, nr, size) \
+  (((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) | ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))
+#define _IOC_TYPECHECK(t) (sizeof(t))
+#define _IO(type, nr) _IOC(_IOC_NONE, (type), (nr), 0)
+#define _IOR(type, nr, size) _IOC(_IOC_READ, (type), (nr), (_IOC_TYPECHECK(size)))
+#define _IOW(type, nr, size) _IOC(_IOC_WRITE, (type), (nr), (_IOC_TYPECHECK(size)))
+#define _IOWR(type, nr, size) _IOC(_IOC_READ | _IOC_WRITE, (type), (nr), (_IOC_TYPECHECK(size)))
+#define _IOC_DIR(nr) (((nr) >> _IOC_DIRSHIFT) & ((1 << _IOC_DIRBITS) - 1))
+#define _IOC_TYPE(nr) (((nr) >> _IOC_TYPESHIFT) & ((1 << _IOC_TYPEBITS) - 1))
+#define _IOC_NR(nr) (((nr) >> _IOC_NRSHIFT) & ((1 << _IOC_NRBITS) - 1))
+#define _IOC_SIZE(nr) (((nr) >> _IOC_SIZESHIFT) & ((1 << _IOC_SIZEBITS) - 1))
+#endif
 
 #ifndef __FC_COMPAT_INT_TYPES_DEFINED
 #define __FC_COMPAT_INT_TYPES_DEFINED 1

@@ -45,6 +45,7 @@ known-first-party = [
     "eva_shards",
     "eva_tuning",
     "extract_references",
+    "fc_cpp_wrapper",
     "fingerprint",
     "framac_common",
     "frame_skeleton",

@@ -37,7 +37,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import resolve_fc_stubs_dir  # noqa: E402
+from framac_common import framac_cpp_wrapper, resolve_fc_stubs_dir  # noqa: E402
 
 # Frama-C has no 128-bit integer type, and host headers such as <linux/types.h> declare
 # `__int128` typedefs only when the compiler predefines __SIZEOF_INT128__.
@@ -157,6 +157,10 @@ def build_eacsl_flag_sets(
             front.append(f"-I{stubs_posix}")
         if "fc_compat_types.h" not in joined_user:
             front.extend(["-include", f"{stubs_posix}/fc_compat_types.h"])
+    # Frama-C's frontend preprocessing repairs `offsetof` with a non-constant index (scripts/fc_cpp_wrapper.py).
+    wrapper = framac_cpp_wrapper()
+    if wrapper:
+        front.extend(["-wrapper", wrapper])
     front.extend(pre)
     front.extend(forced)
     front.extend(t for t in other if t.startswith("-std="))

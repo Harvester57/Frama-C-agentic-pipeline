@@ -41,6 +41,8 @@ NOT_FORWARDED = {
     # C macros of generated harnesses, not environment variables
     "FRAMAC_FUZZ_SKIP_CASES",
     "FRAMAC_EVA_SHARD",
+    # debugging switch read inside the container only (scripts/fc_cpp_wrapper.py)
+    "FRAMAC_CPP_REWRITE",
     # host broker / wrapper / benchmark-driver knobs (the pool reaches the container as the broker's measurement)
     "FRAMAC_ALLOW_UNENFORCED_LIMITS",
     "FRAMAC_BENCH_DIR",

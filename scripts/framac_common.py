@@ -508,6 +508,18 @@ def resolve_fc_stubs_dir() -> Path | None:
     return None
 
 
+def framac_cpp_wrapper(path: Path | None = None) -> str | None:
+    """
+    scripts/fc_cpp_wrapper.py (or `path`) as a gcc `-wrapper` program for Frama-C's preprocessor, or None
+    where gcc could not run it (not POSIX, not executable, or a path `-wrapper` and e-acsl-gcc would split).
+    """
+    path = path or Path(__file__).resolve().parent / "fc_cpp_wrapper.py"
+    text = path.as_posix()
+    if os.name != "posix" or not os.access(path, os.X_OK) or any(c.isspace() or c == "," for c in text):
+        return None
+    return text
+
+
 def augment_framac_cppflags(cppflags: str) -> str:
     """
     Prepend `-I<fc_stubs>` and `-include <fc_compat_types.h>` for Frama-C `-nostdinc` runs
@@ -515,7 +527,9 @@ def augment_framac_cppflags(cppflags: str) -> str:
     and glibc internal integer typedefs (`__int32_t`, etc.) resolve cleanly without
     shadowing `__fc_libc`, ensuring stubs and compatibility headers precede target headers.
     The build's generated headers (`config.h`) and the target's system headers come last, in that order,
-    from the run's snapshot (scripts/target_env.py).
+    from the run's snapshot (scripts/target_env.py), then the image's own system directories for the
+    headers Frama-C's libc lacks (`elf.h`, `linux/*`). Last, `-wrapper` runs gcc's preprocessor under
+    scripts/fc_cpp_wrapper.py, which repairs `offsetof` with a non-constant index (`framac_cpp_wrapper`).
     """
     from target_env import with_include_flags
 
@@ -532,6 +546,12 @@ def augment_framac_cppflags(cppflags: str) -> str:
         prefix.append(f"-include {compat_hdr}")
     if base:
         prefix.append(base)
+    for d in ("/usr/include/x86_64-linux-gnu", "/usr/include"):
+        if os.path.isdir(d) and f"-idirafter {d}" not in base and f"-idirafter {d}" not in prefix:
+            prefix.append(f"-idirafter {d}")
+    wrapper = framac_cpp_wrapper()
+    if wrapper and "-wrapper" not in base.split():
+        prefix.append(f"-wrapper {wrapper}")
     return " ".join(prefix)
 
 
