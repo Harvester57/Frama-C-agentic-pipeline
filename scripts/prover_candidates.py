@@ -233,8 +233,24 @@ def _load_state(scratch: Path) -> dict | None:
     return state
 
 
+# What state.json keeps of a refuting guardrail's `failure` (run_eacsl_fuzz.parse_eacsl_failure): no file paths.
+FAILURE_KEYS = ("function", "line", "kind", "label", "predicate", "annotation_rte", "is_rte")
+
+
+def _trim_failure(failure: object) -> dict | None:
+    if not isinstance(failure, dict):
+        return None
+    return {k: failure[k] for k in FAILURE_KEYS if k in failure}
+
+
 def _oracle_summary(oracle: str, report: dict) -> dict:
     if oracle == "guardrail":
+        if report.get("status") in GUARDRAIL_REFUTATIONS:
+            return {
+                "status": report.get("status"),
+                "reason": report.get("reason"),
+                "failure": _trim_failure(report.get("failure")),
+            }
         return {"status": report.get("status")}
     summary = {
         "status": report.get("status"),
@@ -522,6 +538,67 @@ def restore_best(scratch: Path) -> dict | None:
         return {"restored": any(changed), "best": state["best"], "rank": state["best_rank"]}
 
 
+def refuted_clauses(scratch: Path) -> list[dict]:
+    """
+    The clauses the E-ACSL guardrail refuted on this prover's candidates (`rejected_overconstrained` with a
+    predicate), one per distinct (predicate, annotation_rte), ordered by candidate id. A `code_fault` is a code defect
+    candidate, never evidence against the contract, so it is not listed. Never raises: a missing or malformed state
+    gives [].
+    """
+    try:
+        scratch = Path(scratch)
+        state = _load_state(scratch)
+        if state is None:
+            return []
+        function = state.get("function")
+        cands = sorted(
+            (
+                c
+                for c in (state.get("candidates") or {}).values()
+                if isinstance(c, dict) and isinstance(c.get("id"), int)
+            ),
+            key=lambda c: c["id"],
+        )
+        out: list[dict] = []
+        seen: set[tuple[str, bool]] = set()
+        for cand in cands:
+            guard = cand.get("guardrail")
+            if not isinstance(guard, dict) or guard.get("status") != "rejected_overconstrained":
+                continue
+            if "failure" in guard:
+                failure = guard.get("failure")
+            elif isinstance(function, str) and _FUNCTION_RE.match(function):
+                # A summary recorded before the failure was kept: read the candidate's own report.
+                report = load_json_optional(
+                    scratch / CANDIDATES_DIR / f"c{cand['id']}" / _report_name("guardrail", function), {}
+                )
+                failure = report.get("failure") if isinstance(report, dict) else None
+            else:
+                failure = None
+            if not isinstance(failure, dict):
+                continue
+            predicate = str(failure.get("predicate") or "").strip()
+            if not predicate:
+                continue
+            key = (predicate, failure.get("annotation_rte") is True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "predicate": predicate,
+                    "label": failure.get("label"),
+                    "line": failure.get("line"),
+                    "kind": failure.get("kind"),
+                    "annotation_rte": key[1],
+                    "candidate": cand["id"],
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
 def status(scratch: Path) -> dict:
     """What a later analysis needs: the best candidate and the history of recorded oracle runs."""
     scratch = Path(scratch)
@@ -534,6 +611,7 @@ def status(scratch: Path) -> dict:
         "best_rank": state["best_rank"],
         "highest_proved": _highest_proved(state),
         "history": state["history"],
+        "refuted_clauses": refuted_clauses(scratch),
     }
 
 

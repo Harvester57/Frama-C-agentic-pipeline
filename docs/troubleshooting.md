@@ -347,6 +347,13 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - `wp_trivial_clause_only`: every `L4_*`, `L5_*` or `L6_*` clause of that class holds whatever the function does. Write a clause that constrains the output or state.
 - `wp_limits_unmet`: the report has no `limits`, or its contract check did not pass. Re-run with the current `run_wp_function.py`; reports written before verdict limits existed are not credited.
 
+### Symptom: `workspace/reports/kb/evolved.json` and `obstructions.json` Never Appear in a Run
+
+- **Seen:** while implementing formal-discovery Tier 1 (dead-end ledger), 2026-11-09, by reading the code; no target run yet.
+- **Cause:** `spec_kb.mine_run` (CLI `spec_kb.py mine --run-dir .`) is the only writer of the evolved KB and of the obstruction store, and no script, Make target, scheduler step or skill calls it. Both stores therefore stay empty unless someone runs it by hand, and the "evolved" half of the spec KB has never fed a brief or a repair hint in an unattended run.
+- **Workaround in place:** the Tier 1 "Known Dead Ends" section does not depend on mining: `prepare_agent` reads earlier provers' refutations of the same function from their scratch (`prover_candidates.refuted_clauses`), and `spec_kb.obstructions_for` reads callee rejections live from `workspace/reports/strengthen_requests.json`. Only cross-function persistence (the stored items) needs `mine`.
+- **Fix:** **Open pipeline bug:** run `spec_kb.py mine --run-dir .` from the scheduler after each `complete` (or from a Make target before each dispatch round). Not done in Tier 1, whose plan excludes scheduler changes.
+
 ### Symptom: PowerShell Splits Frama-C or Docker CLI Flags Containing `.` or `=`
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.
 - **Fix:** Always invoke container commands through [`../wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
