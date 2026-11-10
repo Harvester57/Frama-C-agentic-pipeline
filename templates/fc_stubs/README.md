@@ -86,6 +86,10 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   glibc's `<sys/ioctl.h>` provides and `__fc_libc`'s does not (a struct-type argument was a syntax
   error). Generic-layout values, as on x86_64.
 - Both sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+- **What to add next:** [`../../scripts/libc_gap_report.py`](../../scripts/libc_gap_report.py) lists, over
+  the Phase 0 models of one or more runs, the external functions called that neither `__fc_libc` nor
+  these stubs give a contract with `assigns` (run it in the analysis image, where it finds the libc
+  through `frama-c -print-share-path`). Gaps come first, most-called first.
 - `offsetof` is never redefined here. [`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py)
   repairs, in the preprocessed text, `offsetof` with a non-constant index and the null-pointer offset
   idiom `(size_t)&((T *)0)->m` (gperf tables), so `-warn-invalid-pointer` stays on.
