@@ -477,6 +477,21 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - **Cause:** MetAcsl runs with `-meta-simpl` by default, which discards instances that are obviously true. `-meta -then-last -print` shows `show` with the L5 assert only; with `-meta-no-simpl` the instance comes back as `assert L6_no_leak_key: meta: &log_line == &log_line ==> \separated(&(banner[0]), &key);`. `run_wp_function.py` (`meta_stage`: `-meta -meta-warn-key unknown-func=inactive -then-last`) then reports no goal of class `l6_no_leak`, and `ledger.py ingest-wp` credits the zero-goal case only for `rte`, `l2_termination` and `l3_frame`. The unit falls through to `wp_no_credited_goals` and stays uncovered although the function satisfies the property. Not unsound: it under-credits. Any `\calling`, `\writing` or `\reading` instance MetAcsl decides syntactically can hit it.
 - **Open pipeline bug:** add `-meta-no-simpl` to `meta_stage` in `scripts/run_wp_function.py`, so every instance becomes a goal Qed discharges; or have `ledger.py ingest-wp` credit an L4–L6 unit whose function ran with the property in `security_props.properties`, ended `all_proven` and has no goal of that class. The test case is `xfail(strict=True)` until then.
 
+### Symptom: A Rejected Candidate's Units Are `candidate` Again After a Re-Fuzz, But No Verifier Is Dispatched
+- **Fixed pipeline bug** (branch `papers-generalization`, uncommitted, 2026-11-10). Found by reading the code while building the reopening of weak rejections; reproduced in `tests/test_rejection_reopen.py::test_flag_off_restores_the_earlier_behaviour`, not observed on a target run.
+- **Cause:** `cmd_ingest_fuzz` in `scripts/ledger.py` called `mark_candidate` on the linked units of every fuzz failure, also when the candidate was already `verified` with a `rejected` record. After a `harness_induced` rejection and a harness repair, a recurring crash left the units `candidate` while `candidates.json` stayed `verified`, so nothing asked for a second verdict.
+- **Fix:** [`../scripts/ledger.py`](../scripts/ledger.py) `tool_evidence_on_verified_candidate`: a replayed reproducer on a rejected candidate now reopens it or is recorded as contradicting evidence, and the units are not marked `candidate` otherwise. `FRAMAC_REJECTION_REOPEN=off` keeps the earlier behaviour, on purpose.
+
+### Symptom: A Reopened Candidate (`status: unverified`, With a `reopened` Entry) Gets No New Verifier Task
+- **Fixed pipeline bug** (branch `papers-generalization`, uncommitted, 2026-11-10). Read from the code, covered by `tests/test_wp_scheduler.py::test_a_candidate_the_ledger_reopened_gets_its_verify_task_back_once`; not exercised on a target run.
+- **Cause:** `_sync` in `scripts/wp_scheduler.py` created `verify:<fingerprint>` only when no task with that id existed. A candidate reopened by `ledger.py` already has a terminal `verify:` task from its first verdict, so the scheduler left it.
+- **Fix:** [`../scripts/wp_scheduler.py`](../scripts/wp_scheduler.py) `_sync` reopens a terminal verify task once per ledger reopening (`candidate_reopens` on the task against the candidate's `reopened` entries), so a verify task that ended blocked for another reason is not dispatched again.
+
+### Symptom: `loop_seeds.py` Under the Wrapper Reports `status: partial` With `analysis_error: insufficient_memory`
+- **Fixed pipeline bug** (branch `papers-generalization`, uncommitted, 2026-11-10). Found by reading `_CLASS_PATTERNS` while building the tool; never reproduced under the wrapper (the container runs used plain `docker run`). Only reachable with `FRAMAC_LOOP_SEEDS=on`.
+- **Cause:** `resources.infer_class` had no pattern for `loop_seeds.py`, so the command got the `light` class (1 CPU, 1024 MB), below what its WP rounds need.
+- **Fix:** [`../scripts/resources.py`](../scripts/resources.py) maps `loop_seeds.py` to the `guardrail` class. Test: `tests/test_resources.py::test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name`.
+
 ---
 
 ## Resources, Caches and Scheduling

@@ -68,6 +68,17 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 - **Recursive function:** write `decreases <measure>;` after `terminates` and before `assigns`, using an argument that shrinks at every recursive call. A `requires` on the measure is needed only if no guard keeps it non-negative at those calls, and Rule 3 still applies to it.
 <!-- endif -->
 <!-- if: loops -->
+<!-- if: loop_seeds -->
+0. **Loop invariant seeds (run once, after Step A and before you write an invariant).** Through the wrapper:
+   ```text
+   python3 /opt/framac-pipeline/scripts/loop_seeds.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --module {module_name} --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --corpus-dir workspace/corpus/{module_name} --out-json agents/{agent_id}/scratch/loop_seeds_{function_name}.json
+   ```
+   It derives candidate invariants named `seed_<n>` from the loop facts (counter and guard bounds, pointer-walker anchors), keeps those WP can establish and preserve under your current contract and loop annotations, and replays the corpus on the ones WP dropped. It works on a private copy, changes none of your files and does not count against your WP budget. It takes a second per loop when everything proves, and up to a few minutes otherwise. Whatever it prints, it only gives hints: on any `status` other than `ok`, or with no seed, go on with item 1.
+   - **"Proven inductive":** paste these clauses into the loop's annotation as printed, keeping the `seed_<n>` names, before `loop assigns`. Then add the invariants only you can write (accumulators, quantified ranges) beside them.
+   - **"Held on every replayed corpus input, NOT proven":** a hint about what is probably true, never a clause to paste as it is. Look for the invariant that makes it provable (a pointer bound usually needs both pointers anchored on one base, see the pointer-difference pattern in Step C), or leave it out.
+   - **Never add or strengthen a `requires` to make a seed hold.** A seed that needs a precondition the callers do not give is not an invariant of `{function_name}`; Rule 3 applies unchanged.
+   - **Drop a seed that stops proving** after you change the contract or the loop annotations. Seeds were proven under what you had when the tool ran: remove the seed, do not bend the contract around it.
+<!-- endif -->
 1. For every loop in `{function_name}`, add named invariants in order:
    - Index bounds invariant (e.g., `loop invariant range: 0 <= i <= len;` — note `<= len`, NOT `< len`, because the invariant must hold at loop exit!).
    - Accumulator / pointer offset invariants needed by RTE assertions inside the loop body (e.g., `loop invariant ptr_step: cur_ptr == buf + offset;` and `loop invariant off_bound: 0 <= offset <= max_len;`).

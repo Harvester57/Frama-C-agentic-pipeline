@@ -55,6 +55,7 @@ from framac_common import (  # noqa: E402
 
 FACTS_SCHEMA = 3  # 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates)
 LOOP_TEMPLATES_ENV = "FRAMAC_LOOP_TEMPLATES"
+LOOP_SEEDS_ENV = "FRAMAC_LOOP_SEEDS"
 FACTS_DIR = "workspace/reports/facts"
 CONTEXT_ENV = "FRAMAC_PROVER_CONTEXT"
 CONTEXT_SENTINEL = "<!-- deterministic-context -->"
@@ -621,6 +622,8 @@ def _function_record(
         "called_by": [],
         "may_alias": _may_alias(formals, writes),
         "recursion": recursion,
+        # Local pointers that start from a formal: loop_seeds.py anchors a pointer walker on its root.
+        "derived_pointers": {str(k): str(v) for k, v in derived.items() if k and v},
         "return_paths": paths,
         "eva": _eva_record(by_function.get(kernel_name), str(flows.get("status") or "unavailable")),
         "features": _features(raw, loops, calls, formals, src, recursion),
@@ -796,6 +799,9 @@ def _condition_holds(expr: str, features: dict[str, bool] | None) -> bool:
         name = term[4:].strip() if negated else term
         if name == "facts":
             value = features is not None
+        elif name == "loop_seeds":
+            # An opt-in step, not guidance: without the flag, or without facts to seed from, it is left out.
+            value = loop_seeds_enabled() and features is not None and bool(features.get("loops"))
         elif features is None:
             value = True
         else:
@@ -826,6 +832,11 @@ def render_conditionals(template: str, features: dict[str, bool] | None) -> str:
         if all(s["live"] for s in stack):
             out.append(line)
     return "\n".join(out)
+
+
+def line_mapper(record: dict, text: str | None):
+    """Public form of the mapping below, for tools that place annotations by facts line (loop_seeds.py)."""
+    return _line_mapper(record, text)
 
 
 def _line_mapper(record: dict, text: str | None):
@@ -1214,6 +1225,15 @@ def render_section(
 def context_enabled() -> bool:
     """FRAMAC_PROVER_CONTEXT=off: briefs without facts and slice, for A/B comparisons."""
     return (os.environ.get(CONTEXT_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
+
+
+def loop_seeds_enabled() -> bool:
+    """
+    FRAMAC_LOOP_SEEDS=on: provers get loop invariant candidates filtered by WP and by the corpus
+    (loop_seeds.py). Off by default, and off whenever FRAMAC_PROVER_CONTEXT=off removes the facts.
+    """
+    wanted = (os.environ.get(LOOP_SEEDS_ENV) or "").strip().lower() in ("on", "1", "true", "yes", "enabled")
+    return wanted and context_enabled()
 
 
 def main(argv: list[str] | None = None) -> int:

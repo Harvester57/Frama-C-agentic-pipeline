@@ -122,6 +122,142 @@ def dedupe_findings_for_report(findings: list[dict], run_dir: Path | None = None
     return merged
 
 
+def decision_point_text(rec: dict) -> str | None:
+    """The verifier's decision point as one line, or None for a record without one."""
+    dp = rec.get("decision_point")
+    if not isinstance(dp, dict):
+        return None
+    basis = f" (basis `{dp['basis']}`)" if dp.get("basis") else ""
+    return (
+        f"`{dp['file']}:{dp['line']}` in `{dp['function']}`, controlled by `{dp['controlled_by']}`{basis}: "
+        f"{md_escape(dp['description'])}"
+    )
+
+
+def decision_point_basis_lines(records: list[dict]) -> list[str]:
+    """Decision points counted by basis; nothing when no record states one."""
+    counts = Counter(
+        r["decision_point"].get("basis") or "unstated" for r in records if isinstance(r.get("decision_point"), dict)
+    )
+    if not counts or set(counts) == {"unstated"}:
+        return []
+    cells = ", ".join(f"{counts[b]} `{b}`" for b in REFUTATION_BASES if counts[b])
+    return [
+        f"Decision points by basis: {cells} (`checked`: a patch at that location removes the failure for the "
+        "recorded reproducers, nothing more; `located`: traced in the source; `model`: reasoning only).",
+        "",
+    ]
+
+
+def prior_verdict_text(rec: dict) -> str | None:
+    """The rejection(s) a record superseded after its candidate was reopened, as one line."""
+    prior = rec.get("prior_verdicts") or []
+    if not prior:
+        return None
+    return "; ".join(
+        f"rejected as `{p['rejection_class']}` (basis `{p.get('refutation_basis') or 'unstated'}`) by "
+        f"`{p['verifier']['agent_id']}`, reopened by `{p['reopened_by']['source']}` "
+        f"(`{p['reopened_by']['artifact']}`): {md_escape(p['reason'])}"
+        for p in prior
+    )
+
+
+def reopening_lines(candidates: list[dict]) -> list[str]:
+    """
+    Rejections that later tool-reproduced evidence reopened, and those it contradicted without
+    reopening (candidates.json: `reopened`, `contradicting_evidence`). Nothing when there is neither.
+    """
+    reopened = [c for c in candidates if c.get("reopened")]
+    by_reason: Counter = Counter()
+    for c in candidates:
+        for reason in {e.get("reason") for e in c.get("contradicting_evidence") or []}:
+            by_reason[reason] += 1
+    if not reopened and not by_reason:
+        return []
+    out: list[str] = []
+    if reopened:
+        times = sum(len(c["reopened"]) for c in reopened)
+        awaiting = sum(1 for c in reopened if "resolved" not in c["reopened"][-1])
+        final = Counter(c["reopened"][-1]["resolved"]["decision"] for c in reopened if "resolved" in c["reopened"][-1])
+        after = ", ".join(f"{final[d]} {d}" for d in ("confirmed", "needs_validation", "rejected") if final[d])
+        out.append(
+            f"- **Reopened rejections:** {len(reopened)} candidate(s), {times} time(s) in all: a reproduced failure "
+            "arrived after a rejection whose basis was not a verifier-cited tool output"
+            + (f"; verdict after reopening: {after}" if after else "")
+            + (f"; {awaiting} still awaiting a verdict" if awaiting else "")
+            + "."
+        )
+        for c in reopened[:50]:
+            last = c["reopened"][-1]
+            out.append(
+                f"  - `{c['fingerprint']}`: rejected as `{last['rejection_class']}` (basis `{last['refutation_basis']}`), "
+                f"reopened by `{last['evidence']['source']}` (`{last['evidence']['artifact']}`)"
+            )
+    if by_reason["checked_rejection"]:
+        out.append(
+            f"- **Contradicted `checked` rejections:** {by_reason['checked_rejection']} candidate(s): a reproduced "
+            "failure arrived after a rejection that cites a refuting tool output. They stay rejected; both the "
+            "tool output and the reproducer need a look."
+        )
+    if by_reason["harness_unchanged"]:
+        out.append(
+            f"- Recurred through an unrepaired harness: {by_reason['harness_unchanged']} `harness_induced` "
+            "rejection(s) (not reopened: the same harness says nothing new)."
+        )
+    if by_reason["reopen_limit"]:
+        out.append(
+            f"- Not reopened again: {by_reason['reopen_limit']} candidate(s) reached the reopening limit "
+            "(the harness repair budget)."
+        )
+    out.append("")
+    return out
+
+
+def shared_decision_point_lines(confirmed: list[dict]) -> list[str]:
+    """
+    Confirmed findings whose decision point is the same file and line: possibly one defect seen at
+    several sinks. Report only; fingerprints and merging do not use it.
+    """
+    groups: dict[tuple[str, int], list[dict]] = {}
+    for r in confirmed:
+        dp = r.get("decision_point")
+        if isinstance(dp, dict):
+            groups.setdefault((normalize_file(dp["file"]), int(dp["line"])), []).append(r)
+    shared = {k: v for k, v in groups.items() if len(v) > 1}
+    if not shared:
+        return []
+    out = [
+        "Confirmed findings that share a decision point (possibly one defect; they stay separate records):",
+        "",
+    ]
+    for (file_, line), recs in sorted(shared.items()):
+        fps = ", ".join(f"`{r['fingerprint']}`" for r in sorted(recs, key=lambda r: r["fingerprint"]))
+        out.append(f"- `{file_}:{line}`: {fps}")
+    out.append("")
+    return out
+
+
+REFUTATION_BASES = ("checked", "located", "model", "unstated")
+
+
+def rejection_basis_lines(rejected: list[dict]) -> list[str]:
+    """Rejections counted by class and evidence basis; a record without a basis counts as `unstated`."""
+    if not rejected:
+        return []
+    counts = Counter((r["rejection_class"], r.get("refutation_basis") or "unstated") for r in rejected)
+    out = [
+        "Rejected candidates by class and evidence basis (`checked`: a cited tool output refutes the "
+        "candidate; `located`: file and line of the check or dead branch; `model`: reasoning only):",
+        "",
+        "| Rejection class | " + " | ".join(REFUTATION_BASES) + " |",
+        "| :--- | " + " | ".join("---:" for _ in REFUTATION_BASES) + " |",
+    ]
+    for cls in sorted({c for c, _ in counts}):
+        out.append(f"| `{cls}` | " + " | ".join(str(counts[(cls, b)]) for b in REFUTATION_BASES) + " |")
+    out.append("")
+    return out
+
+
 def load_inputs(run_dir: Path) -> dict:
     errors = validate_run_dir(run_dir)
     if errors:
@@ -585,6 +721,9 @@ def render_report(data: dict) -> str:
     if carried:
         out.append(f"- Carried forward from earlier runs and re-proven: {len(carried)} function(s)")
     out.append("")
+    out += rejection_basis_lines(rejected)
+    out += reopening_lines(data["candidates"])
+    out += decision_point_basis_lines([*confirmed, *needs])
 
     out += ["## 3. Confirmed findings", ""]
     if not confirmed:
@@ -608,11 +747,14 @@ def render_report(data: dict) -> str:
                 f"- **Fingerprint:** `{r['fingerprint']}`{fp_suffix}",
                 f"- **Location:** {loc(r, run_dir)}; failing property `{md_escape(r['property']['kind'])}`: `{md_escape(r['property']['predicate'])}`",
                 f"- **Root cause:** {md_escape(r['root_cause'])}",
+                *([f"- **Decision point:** {dp}"] if (dp := decision_point_text(r)) else []),
+                *([f"- **Earlier verdict:** {pv}"] if (pv := prior_verdict_text(r)) else []),
                 f"- **Reproduce:** `{md_escape(r['reproducers'][0]['command'])}` with `{r['reproducers'][0]['input']}`",
                 f"- **Severity rationale:** {md_escape(r['severity_rationale'])}",
                 f"- **Fix:** {md_escape(r['remediation']['summary'])} (invariant: {md_escape(r['remediation']['invariant'])})",
                 "",
             ]
+        out += shared_decision_point_lines(confirmed)
 
     out += ["## 4. Needs validation", ""]
     if not needs:
@@ -721,6 +863,7 @@ def render_findings_detail(findings: list[dict], run_dir: Path | None = None) ->
             "",
             f"**Root cause.** {md_escape(r['root_cause'])}",
             "",
+            *([f"**Decision point.** {dp}", ""] if (dp := decision_point_text(r)) else []),
             f"**Intended behavior.** {md_escape(r['intended_behavior'])}",
             "",
             "**Trace.**",
@@ -782,6 +925,7 @@ def render_needs_validation(findings: list[dict], run_dir: Path | None = None) -
             "",
             f"**Claimed root cause.** {md_escape(r['claimed_root_cause'])}",
             "",
+            *([f"**Decision point.** {dp}", ""] if (dp := decision_point_text(r)) else []),
             "**Trace.**",
             "",
             *_trace_lines(r),
