@@ -91,6 +91,8 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   glibc's `<sys/ioctl.h>` provides and `__fc_libc`'s does not (a struct-type argument was a syntax
   error). Generic-layout values, as on x86_64.
 - Both sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+- The header assumes x86_64 LP64 (ioctl encoding, syscall numbers, `long` literals) and says so
+  with a `_Static_assert` on `sizeof(long)` and `sizeof(void *)`: another machdep stops at parse time.
 - **What to add next:** [`../../scripts/libc_gap_report.py`](../../scripts/libc_gap_report.py) lists, over
   the Phase 0 models of one or more runs, the external functions called that neither `__fc_libc` nor
   these stubs give a contract with `assigns` (run it in the analysis image, where it finds the libc

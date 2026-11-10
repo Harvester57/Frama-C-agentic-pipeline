@@ -196,6 +196,11 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - **Cause:** An ACSL annotation containing `\false`, `\forall`, `\at`, or `\base_addr` was written through an unescaped Python or shell string, turning `\f` into ASCII `0x0c` (form-feed), `\a` into `0x07`, or `\b` into `0x08`.
 - **Fix:** Always use raw Python strings (`r"..."`) or file-editing tools when writing ACSL annotations. `acsl_ast.py` (`check-acsl-only`) automatically flags control characters (`\x07`, `\x08`, `\x0c`) inside ACSL comments.
 
+### Symptom: `static assertion failed: "fc_compat_types.h assumes an LP64 machdep (x86_64): run Frama-C with -machdep x86_64"`
+- **Cause:** the run used a machdep that is not LP64 (`-machdep x86_32`, `x86_16`, `ppc_32`, a custom one). `templates/fc_stubs/fc_compat_types.h` hard-codes x86_64 facts: the generic ioctl encoding, the x86_64 numbers of the typed `syscall` rewrites (`scripts/fc_cpp_wrapper.py`) and the `long` literals of the `abs`/`labs` contracts. Before step S9 of [`templates-and-stubs-improvement-plan.md`](templates-and-stubs-improvement-plan.md) such a run parsed and gave results computed on the wrong sizes.
+- **Fix (pipeline, step S9):** the header starts with `_Static_assert(sizeof(long) == 8 && sizeof(void *) == 8, ...)`, so another machdep stops at parse time with the message above. Use the pipeline's default `-machdep gcc_x86_64` (or `x86_64`). Verified in the analysis image: `x86_64` parses, `x86_32` stops (`tests/test_fc_compat_contracts.py`, `FRAMAC_DOCKER_TESTS=1`).
+- **Open:** a 32-bit target needs its own ioctl and syscall tables before the assertion can be relaxed.
+
 ---
 
 ## 3. E-ACSL + LibFuzzer Build & Runtime Issues

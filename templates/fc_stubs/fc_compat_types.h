@@ -23,6 +23,12 @@
 
 #if defined(__FRAMAC__)
 
+/* Machdep (plan step S9). The ioctl encoding, the x86_64 numbers of the typed syscall rewrites and the
+ * `long` literals of the abs/labs contracts below assume x86_64 LP64. Another machdep stops here, at
+ * parse time, instead of giving results computed on the wrong sizes. */
+_Static_assert(sizeof(long) == 8 && sizeof(void *) == 8,
+               "fc_compat_types.h assumes an LP64 machdep (x86_64): run Frama-C with -machdep x86_64");
+
 /* `offsetof` stays the libc's `__builtin_offsetof`, which the kernel folds to a constant. A
  * non-constant array index (`offsetof(T, m[i])`) is repaired in the preprocessed output by
  * scripts/fc_cpp_wrapper.py. Never redefine `offsetof` here: the null-pointer form

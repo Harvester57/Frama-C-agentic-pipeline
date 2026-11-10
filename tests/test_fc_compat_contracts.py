@@ -1,6 +1,6 @@
 """
 Contracts of templates/fc_stubs/fc_compat_types.h against the real Frama-C (FRAMAC_DOCKER_TESTS=1), plan
-docs/templates-and-stubs-improvement-plan.md: typed syscalls (S6).
+docs/templates-and-stubs-improvement-plan.md: typed syscalls (S6), the LP64 assertion (S9).
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ import pytest
 
 from conftest import ANALYSIS_IMAGE, ROOT, require_docker_images
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+image = pytest.mark.integration
+slow = pytest.mark.slow
 
 PY = 'import sys; sys.path.insert(0, "/opt/framac-pipeline/scripts"); '
 FRAMAC_FLAGS = f"A=$(python3 -c '{PY}import framac_common; print(framac_common.augment_framac_cppflags(\"-I.\"))'); "
@@ -87,6 +88,8 @@ int main(void) { return seed() + rd(0) + rf(3) + (int)other(); }
 """
 
 
+@image
+@slow
 def test_typed_syscalls_write_their_buffers_in_eva_and_wp_and_never_reach_eacsl(tmp_path):
     require_docker_images(ANALYSIS_IMAGE)
     script = (
@@ -108,3 +111,31 @@ def test_typed_syscalls_write_their_buffers_in_eva_and_wp_and_never_reach_eacsl(
     proved, total = _proved(log, "wp")
     assert proved == total, log.split("==wp==", 1)[1]
     assert "eacsl typed: 0" in log  # E-ACSL keeps the real syscall
+
+
+# ---------------------------------------------------------------------------------------------------
+# S9: the header refuses a machdep that is not LP64
+# ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_lp64_assertion_guards_every_frama_c_parse():
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    head = text.split("#if defined(__FRAMAC__)\n", 1)[1].split("#if defined(__FRAMAC_EACSL__)", 1)[0]
+    assert "_Static_assert(sizeof(long) == 8 && sizeof(void *) == 8," in head  # both branches see it
+
+
+@image
+@slow
+def test_a_non_lp64_machdep_stops_at_parse_time(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    script = (
+        FRAMAC_FLAGS + 'echo "==x86_64=="; frama-c -no-unicode m.c -cpp-extra-args="$A" -machdep x86_64 2>&1; '
+        'echo "rc=$?"; echo "==x86_32=="; frama-c -no-unicode m.c -cpp-extra-args="$A" -machdep x86_32 2>&1; '
+        'echo "rc=$?"; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"m.c": "int main(void) { return 0; }\n"}, script)
+    good = log.split("==x86_64==", 1)[1].split("==x86_32==", 1)[0]
+    bad = log.split("==x86_32==", 1)[1]
+    assert "rc=0" in good, good
+    assert "rc=0" not in bad and "assumes an LP64 machdep" in bad, bad
