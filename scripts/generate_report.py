@@ -136,6 +136,7 @@ def load_inputs(run_dir: Path) -> dict:
         "coverage": load_coverage_reports(run_dir),
         "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
         "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
+        "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
     }
 
 
@@ -268,6 +269,25 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
 
 
 TRUST_ROWS_MAX = 60
+
+
+def security_props_lines(props: dict | None) -> list[str]:
+    """
+    Threat-model items security_props.py turned into no property (a returned secret, a name the build
+    lacks, an unusable sink parameter), from its warnings, so the report says what was not checked.
+    """
+    if not isinstance(props, dict):
+        return []
+    items = [
+        str(w) for w in props.get("warnings") or [] if str(w).startswith(("secret ", "auth gate ", "output sink "))
+    ]
+    if not items:
+        return []
+    out = ["### Threat-model items without a property", ""]
+    out += [f"- {md_escape(w)}" for w in items[:30]]
+    if len(items) > 30:
+        out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
+    return [*out, ""]
 
 
 def trust_lines(model: dict | None) -> list[str]:
@@ -546,6 +566,7 @@ def render_report(data: dict) -> str:
         out.append(f"**{len(work['open_units'])} coverage unit(s) are still planned or in progress.**")
         out.append("")
     out += trust_lines(data.get("model"))
+    out += security_props_lines(data.get("security_props"))
     out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]

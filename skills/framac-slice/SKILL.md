@@ -303,7 +303,7 @@ It reads `workspace/reports/phase0_model.json` and the threat model the model re
 - **L3:** an `l3_frame` unit for every function that writes through a pointer;
 - **L4:** auth gates become MetAcsl `\writing` and `\precond` properties (`l4_auth_state`, `l4_auth_required`);
 - **L5:** output sinks become sanitization properties (`l5_sanitized`). A caller that hands a log or terminal sink string literals only is decided from the model's call sites instead (listed under the property's `decided`, no goal): the seed covers its unit, or blocks it when a literal holds CR or LF;
-- **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`).
+- **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`). A secret of kind `local` gets a `check` written into the work tree before each return in its scope; one of kind `return` gets no property (a warning, listed in `REPORT.md`). `--eva-taint` adds Eva taint checks for copies of a secret (`docs/security-properties.md`, Layer 6).
 
 Each property is rendered from `templates/metacsl/` and lists the functions where its generated annotations land; those are the ledger units. Nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. It writes nothing and stops the run when:
 - the model recorded an invalid threat model: exit 2 with the errors. Fix it, then re-run the model;

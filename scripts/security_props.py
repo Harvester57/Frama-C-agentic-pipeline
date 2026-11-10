@@ -636,8 +636,14 @@ class _Gen:
                 }
             self.warnings.append(f"secret {name}: object {obj} is neither a parameter of {fn_name} nor a global")
             return None
+        if kind == "local":
+            if name in formals:
+                self.warnings.append(f"secret {name}: a parameter of {fn_name}, not a local (kind `parameter`)")
+                return None
+            return {"lv": name, "region": "", "scope": "local", "formals": formals, "files": [], "shape": "local"}
         self.warnings.append(
-            f"secret {name}: kind `{kind}` (a returned secret) has no lvalue a property can name; declare where the caller keeps it"
+            f"secret {name}: kind `{kind}` (a returned secret) has no lvalue a property can name, so no property is "
+            "generated; declare where the caller keeps it (a global, a field, or a local of the caller)"
         )
         return None
 
@@ -664,6 +670,14 @@ class _Gen:
             fn = item.get("function")
             fn_name = str(fn).split("#")[-1] if fn else None
             size = item.get("size")
+            if sec["scope"] == "local":
+                self._local_wipe(item, sec)
+                if sinks:
+                    self.warnings.append(
+                        f"secret {name}: a local: no no-leak property (MetAcsl cannot name a local, and the taint "
+                        "annotations follow globals and parameters only)"
+                    )
+                continue
             # Wiped before release.
             if fn_name and self._one(str(fn), f"secret {name}") is not None:
                 shape = sec["shape"]
@@ -743,6 +757,35 @@ class _Gen:
                 targets=targets,
                 taint=taint,
             )
+
+    def _local_wipe(self, item: dict, sec: dict) -> None:
+        """
+        Plan step M6: a secret held in a local array. A postcondition cannot name a local, so the
+        property is a named `check` that apply_code writes into the work tree before each `return` in
+        the local's scope and before the closing brace of its block; WP proves it with the function.
+        """
+        name = str(item["name"])
+        if self._one(str(item["function"]), f"secret {name}") is None:
+            return
+        fids = [f for f in self.m.resolve(str(item["function"])) if f in self.m.live]
+        size = item.get("size")
+        count = f"({size})" if size else f"sizeof({name}) / sizeof({name}[0])"
+        pred = self.t.render("l6_wiped", "local_array", count=count, lv=name)
+        pname = self._unique(f"{NAME_PREFIX['wiped']}{_ident(name)}")
+        check = self.t.render("l6_wiped", "local", name=pname, predicate=pred)
+        notes = ["a local array: the check is written into the work tree, not the meta file"]
+        if not size:
+            notes.append("no `size`: sizeof of the local (an array; a pointer local needs `size`)")
+        self._add(
+            "wiped",
+            pname,
+            check,
+            set(fids),
+            notes=notes,
+            threat_model={"secret": name, "kind": "local", "release": str(item["function"]).split("#")[-1]},
+            targets=str(item["function"]).split("#")[-1],
+            code={"local": name, "check": check},
+        )
 
     # -- L6, indirect flows (plan step M3) ----------------------------------------------------------
 
@@ -876,7 +919,8 @@ def properties_for(props: dict, function: str) -> list[dict]:
 
 def meta_file_text(props: dict, function: str) -> tuple[str, list[str], list[str]] | None:
     """(meta C file, property names, extra sources) for one function's WP run; None without properties."""
-    selected = properties_for(props, function)
+    # A property written into the work tree (`code`, plan step M6) is not MetAcsl: the source holds it.
+    selected = [p for p in properties_for(props, function) if not p.get("code")]
     if not selected:
         return None
     parts = [str(props.get("preamble") or "")]
@@ -931,7 +975,8 @@ TAINT_TAG = "eva_taint"
 DEFAULT_WORK = Path("workspace/work")
 # What apply_taint inserts, and nothing else: re-running it first removes these.
 _GENERATED_TAINT_RE = re.compile(
-    r"/\*@ (?:taint [^\n]*?; |assert L6_no_leak_[A-Za-z0-9_]+: " + TAINT_TAG + r": [^\n]*?; )\*/ "
+    r"/\*@ (?:taint [^\n]*?; |assert L6_no_leak_[A-Za-z0-9_]+: " + TAINT_TAG + r": [^\n]*?; "
+    r"|check L6_wiped_[A-Za-z0-9_]+: [^\n]*?; )\*/ "
 )
 # Argument text an assertion may repeat: no call, assignment or increment.
 _ARG_UNSAFE_RE = re.compile(r"[A-Za-z_]\w*\s*\(|(?<![=!<>])=(?!=)|\+\+|--")
@@ -1044,6 +1089,9 @@ def _insert_taint_in_function(
     tokens = [t for t in tokenize_c_acsl(source, where) if body_start <= t.start < span.end_byte]
     out: list[tuple[int, str]] = []
     for op in ops:
+        if op["kind"] == "local":
+            out += _local_check_inserts(source, tokens, op, skipped, where, name, placed)
+            continue
         if op["kind"] == "entry":
             out.append((body_start + 1, taint_annotation(op["lvalues"])))
         elif op["kind"] == "return":
@@ -1102,7 +1150,52 @@ def _insert_taint_in_function(
     return out
 
 
-def apply_taint(props: dict, work: Path) -> dict:
+def _local_check_inserts(
+    source: str, tokens: list, op: dict, skipped: list[str], where: str, name: str, placed: list[dict] | None
+) -> list[tuple[int, str]]:
+    """
+    Plan step M6: before each `return` in the scope of local `op["local"]` (from its declaration, the
+    first use of the name in the body, to the end of its block) and before that block's closing brace.
+    """
+    code = [t for t in tokens if t.kind == "c_token"]
+    stack: list[int] = []
+    decl = None
+    for i, tok in enumerate(code):
+        if tok.text == "{":
+            stack.append(i)
+        elif tok.text == "}":
+            if stack:
+                stack.pop()
+        elif tok.text == op["local"] and stack:
+            decl = i
+            break
+    if decl is None:
+        skipped.append(f"{where}#{name}: local {op['local']} not found")
+        return []
+    depth, close = 0, None
+    for k in range(stack[-1], len(code)):
+        if code[k].text == "{":
+            depth += 1
+        elif code[k].text == "}":
+            depth -= 1
+            if depth == 0:
+                close = k
+                break
+    if close is None:
+        skipped.append(f"{where}#{name}: the block of local {op['local']} does not close")
+        return []
+    text = op["check"] + " "
+    out = [(code[k].start, text) for k in range(decl, close) if code[k].text == "return"]
+    out.append((code[close].start, text))
+    if placed is not None:
+        lines = [code[k].line for k in range(decl, close) if code[k].text == "return"] + [code[close].line]
+        placed += [
+            {"file": where, "line": line, "function": f"{where}#{name}", "property": op["property"]} for line in lines
+        ]
+    return out
+
+
+def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
     """
     Write the taint annotations of every property's `taint` plan into the work tree (`work`, the
     target's copy): same-line insertions, so no line number moves. Annotations a previous run
@@ -1110,7 +1203,16 @@ def apply_taint(props: dict, work: Path) -> dict:
     exactly the current plan. Returns the files changed, the annotated functions and what was skipped.
     """
     by_file: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    code_placed: list[dict] = []
     for p in props.get("properties") or []:
+        code = p.get("code")
+        for fid in p.get("instances") or [] if code else []:
+            file, _, name = str(fid).rpartition("#")
+            by_file[file][name].append(
+                {"kind": "local", "local": code["local"], "check": code["check"], "property": p["name"]}
+            )
+        if not taint:
+            continue
         plan = p.get("taint") or {}
         for s in plan.get("sources") or []:
             file, _, name = str(s["function"]).rpartition("#")
@@ -1141,14 +1243,19 @@ def apply_taint(props: dict, work: Path) -> dict:
         original = path.read_text(encoding="utf-8", errors="surrogateescape")
         text, _ = strip_taint(original)
         inserts: list[tuple[int, str]] = []
+        tainted = False
         for name, ops in sorted(by_file.get(file, {}).items()):
-            found = _insert_taint_in_function(text, name, ops, skipped, file, placed)
+            local_ops = [op for op in ops if op["kind"] == "local"]
+            taint_ops = [op for op in ops if op["kind"] != "local"]
+            inserts += _insert_taint_in_function(text, name, local_ops, skipped, file, code_placed)
+            found = _insert_taint_in_function(text, name, taint_ops, skipped, file, placed)
             if found:
                 annotated.append(f"{file}#{name}")
+                tainted = True
             inserts += found
         for offset, snippet in sorted(set(inserts), reverse=True):
             text = text[:offset] + snippet + text[offset:]
-        if inserts:
+        if tainted:
             annotated_files.append(file)
         if text != original:
             path.write_text(text, encoding="utf-8", errors="surrogateescape", newline="")
@@ -1159,6 +1266,7 @@ def apply_taint(props: dict, work: Path) -> dict:
         "files": annotated_files,
         "functions": sorted(set(annotated)),
         "checks": sorted(placed, key=lambda c: (c["file"], c["line"], c["property"])),
+        "code_checks": sorted(code_placed, key=lambda c: (c["file"], c["line"], c["property"])),
         "skipped": skipped,
     }
 
@@ -1214,6 +1322,10 @@ DISCHARGE = {
         "`ensures {name}`): what reaches the sink is sanitized"
     ),
     "wiped": "the generated `ensures {name}`: the secret is zero on every return path",
+    "wiped_local": (
+        "the generated `check {name}` already in the code before each return in the local's scope (do not edit or "
+        "move it): the local is zero there. Wipe it with a loop whose invariants state the zeroed prefix"
+    ),
     "no_leak": (
         "the generated `assert {name}: meta:` before each sink call: no argument points into the secret "
         "(for a pointer parameter, `requires \\separated(...)` with the secret)"
@@ -1250,7 +1362,9 @@ def brief_entries(props: dict, file: str, name: str) -> list[dict]:
                 "kind": p.get("kind"),
                 "metacsl": p.get("acsl"),
                 "notes": p.get("notes") or [],
-                "discharge": DISCHARGE.get(str(p.get("kind")), "").format(name=p.get("name")),
+                "discharge": (
+                    DISCHARGE["wiped_local"] if p.get("code") else DISCHARGE.get(str(p.get("kind")), "")
+                ).format(name=p.get("name")),
             }
         )
     return out
@@ -1314,7 +1428,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     previous_taint = previous.get("eva_taint") if isinstance(previous, dict) else None
     previous_taint = previous_taint if isinstance(previous_taint, dict) else {}
     enabled = args.eva_taint if args.eva_taint is not None else bool(previous_taint.get("enabled"))
-    applied = apply_taint(doc if enabled else {"properties": []}, args.work)
+    applied = apply_taint(doc, args.work, taint=enabled)
+    doc["code_checks"] = applied["code_checks"]
     record: dict[str, Any] = {
         "enabled": enabled,
         **{k: applied[k] for k in ("files", "functions", "checks", "skipped")},
@@ -1326,9 +1441,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     doc["eva_taint"] = record
     if enabled and record.get("pending"):
         doc["warnings"].append(f"eva_taint: {record['pending']}")
-    if enabled and applied["skipped"]:
+    if applied["skipped"]:
         doc["warnings"].append(
-            f"eva_taint: {len(applied['skipped'])} annotation(s) not placed: {applied['skipped'][:3]}"
+            f"work tree: {len(applied['skipped'])} annotation(s) not placed: {applied['skipped'][:3]}"
         )
     # Own schema problems are warnings in the artifact (validate_artifacts.py run-dir fails on them).
     problems = validate(doc)

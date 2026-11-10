@@ -46,8 +46,8 @@
         "type": "object",
         "properties": {
           "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
-          "kind": {"type": "string", "enum": ["global", "parameter", "field", "return"]},
-          "function": {"$comment": "where the secret is released (kind global) or held (parameter, field): its wipe is checked when this function returns (step I9)", "$ref": "#/definitions/function_ref"},
+          "kind": {"$comment": "local (plan step M6): an array local of `function`, wiped before each return in its scope", "type": "string", "enum": ["global", "parameter", "field", "local", "return"]},
+          "function": {"$comment": "where the secret is released (kind global) or held (parameter, field, local): its wipe is checked when this function returns (step I9)", "$ref": "#/definitions/function_ref"},
           "size": {"$comment": "step I9: number of elements to wipe, a C expression over constants and the function's parameters (`len`, `32`); default sizeof for arrays", "type": "string", "pattern": "^[A-Za-z0-9_ ()*+/.>-]+$"},
           "object": {"$comment": "step I9, kind field: the parameter or global holding the field", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "description": {"$ref": "#/definitions/description"}

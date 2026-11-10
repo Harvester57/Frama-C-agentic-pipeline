@@ -83,6 +83,13 @@
             "required": ["sources", "checks", "notes"],
             "additionalProperties": false
           },
+          "code": {
+            "$comment": "plan step M6: a property written into the work tree (a local secret's wipe `check`), not into the meta file",
+            "type": "object",
+            "properties": {"local": {"type": "string", "minLength": 1}, "check": {"type": "string", "minLength": 1}},
+            "required": ["local", "check"],
+            "additionalProperties": false
+          },
           "direct_writers": {"type": "array", "items": {"type": "string"}},
           "entry_points": {"type": "array", "items": {"type": "string"}}
         },
@@ -118,6 +125,21 @@
       }
     },
     "summary": {"type": "object"},
+    "code_checks": {
+      "$comment": "plan step M6: each in-code check placed in the work tree (file, line: where Eva reports its status)",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file": {"type": "string"},
+          "line": {"type": "integer"},
+          "function": {"type": "string", "pattern": "#"},
+          "property": {"type": "string"}
+        },
+        "required": ["file", "line", "function", "property"],
+        "additionalProperties": false
+      }
+    },
     "eva_taint": {
       "$comment": "the Eva taint annotations written into the work tree (plan step M3); absent from reports older than it",
       "type": "object",

@@ -27,7 +27,7 @@ How it runs:
 
 Without a threat model only Layer 3 is generated.
 
-A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind`, `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`; `output_sinks` `function`, `kind`, `params`, `length`):
+A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`; `output_sinks` `function`, `kind`, `params`, `length`):
 
 ````markdown
 ```json framac-threat-model
@@ -105,6 +105,8 @@ Output grammars specific to a format (RFC 5424 structured-data escaping, delimit
 A secret `{"name": "session_key", "kind": "global", "function": "session_close"}` becomes:
 
 1. **`L6_wiped_session_key`:** a postcondition of the release function: every element is zero when it returns, on every path (`size` sets the element count of a pointer secret; arrays default to `sizeof`). WP proves a wipe written as a loop with invariants; a `memset` of an `unsigned char` array does not prove under WP's Typed model. WP also cannot see a wipe the compiler drops as a dead store, so the production code should use `explicit_bzero` or a volatile write.
+
+   A secret held in a local array (`{"name": "buf", "kind": "local", "function": "derive", "size": "16"}`; `size` defaults to `sizeof` of the array, a pointer local needs it) cannot be named by a postcondition. `security_props.py run` writes `/*@ check L6_wiped_buf: \forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0; */` into the work tree, on the same line, before each `return` in the local's scope (from its declaration, the first use of the name in the body, to the end of its block) and before that block's closing brace. The property has a `code` field and no meta-file text; `security_props.json` lists the placed checks under `code_checks`, and a re-run rewrites them. WP proves the check with the function (unit `l6_wiped` of the owning function). E-ACSL executes it as a `check`: a failure is printed and the run goes on, so a fuzz campaign is not stopped by it. A local secret gets no no-leak property.
 2. **`L6_no_leak_session_key`:** at every call of an output sink, no argument points into the secret (`\calling`), and a sink the target defines never reads it (`\reading`).
 
 The no-leak check sees direct flows only. A copy of the secret into a buffer that later reaches a sink is Eva's taint domain's job. `security_props.py run --eva-taint` (opt-in; the choice is kept in `security_props.json`, so the Makefile's plain `security-props` run keeps it, and `--no-eva-taint` removes the annotations again) writes, from each no-leak property's `taint` plan, ACSL comments into the work tree on the lines they belong to (no line number moves):
@@ -123,5 +125,5 @@ It sets `eva_taint` in `params.json` (`EVA_TAINT_<mod>`, `taint` added to Eva's 
 - **L5 on string literals:** `L5_no_crlf` on a literal argument does not prove, even with Alt-Ergo, Z3 and CVC5 at 10 s. A caller passing literals only is decided from the model instead; one that passes a sink both literals and other text keeps a goal its literal calls cannot discharge, and a pointer into a literal (`"abc" + 1`) counts as other text.
 - **Instances MetAcsl decides statically:** MetAcsl drops an instance it simplifies to true (a literal or another global separated from the secret), leaving no goal. `ledger.py ingest-wp` credits such a unit when the WP run loaded every property it names and ended `all_proven`.
 - **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop with invariants does.
-- **Returned secrets:** a secret of kind `return` gives a warning and no property.
+- **Returned secrets:** a secret of kind `return` gives a warning and no property; `REPORT.md` lists it under "Threat-model items without a property". Declare where the caller keeps the returned value instead (a global, a field, or a `local` of the caller).
 - **Taint checks (`--eva-taint`):** off by default until `run_wp_function.py` leaves the `eva_taint` assertions out of WP (`-wp-prop=-eva_taint`): WP cannot prove `\tainted`, so a WP run on an annotated function reports them unproven. A check sits only in the property's calling instances: a parameter secret handed to a callee that leaks it is not followed into the callee. A sink without a `length` is checked on its first byte (`strlen` in an annotation breaks E-ACSL builds). Eva's taint is a may-analysis: an Unknown check is a possible flow to review, not a confirmed leak.

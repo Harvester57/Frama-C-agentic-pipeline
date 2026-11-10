@@ -12,6 +12,7 @@ the unwiped key leaves the L6 unit unproven, the wipe proves it.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -1074,3 +1075,132 @@ def test_taint_annotations_in_the_image(model_run, tmp_path, violate):  # noqa: 
     rows = [r.split("\t") for r in (work / "out.csv").read_text(encoding="utf-8").splitlines()]
     taint = [(int(r[2]), r[5]) for r in rows if len(r) > 6 and "\\tainted(" in r[6]]
     assert taint == [(applied["checks"][0]["line"], "Unknown" if violate else "Valid")], res.stdout
+
+
+# ---------------------------------------------------------------------------------------------------
+# Secrets held in a local (plan step M6)
+# ---------------------------------------------------------------------------------------------------
+
+LOCAL_DIR = FIX / "local"
+LOCAL_SECRET = {"name": "buf", "kind": "local", "function": "derive", "description": "Derived key."}
+LOCAL_CHECK = "/*@ check L6_wiped_buf: \\forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0; */ "
+
+
+def _local_doc(**secret) -> dict:
+    m = model({"prog.c#derive": fn("derive", "prog.c", formals=[{"name": "n", "kind": "value"}])})
+    return sp.generate(m, threat(secrets=[{**LOCAL_SECRET, **secret}], output_sinks=[LOG_SINK]))
+
+
+@pytest.mark.unit
+def test_a_local_secret_is_an_in_code_check():
+    doc = _local_doc()
+    assert not sp.validate(doc)
+    prop = by_name(doc)["L6_wiped_buf"]
+    assert prop["instances"] == ["prog.c#derive"] and prop["obligation_class"] == "l6_wiped"
+    assert prop["code"] == {"local": "buf", "check": LOCAL_CHECK.rstrip()}
+    # Not MetAcsl: no meta file, and the brief says the check is already in the code.
+    assert sp.meta_file_text(doc, "prog.c#derive") is None
+    assert "already in the code" in sp.brief_entries(doc, "prog.c", "derive")[-1]["discharge"]
+    assert any(w.startswith("secret buf: a local: no no-leak property") for w in doc["warnings"])
+    sized = by_name(_local_doc(size="n"))["L6_wiped_buf"]
+    assert "0 <= i < (n) ==> buf[i] == 0" in sized["code"]["check"]
+    assert run_wp_class(prop["name"]) == "l6_wiped"
+
+
+def run_wp_class(name: str) -> str:
+    return rwf.goal_obligation_class({"kind": "check", "annotation": f"{name}: \\forall integer i; ..."})
+
+
+@pytest.mark.unit
+def test_local_checks_go_before_each_return_in_scope(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    source = (LOCAL_DIR / "l6_wiped_local.c").read_text(encoding="utf-8")
+    (work / "prog.c").write_text(source, encoding="utf-8", newline="\n")
+    doc = _local_doc()
+    out = sp.apply_taint(doc, work, taint=False)
+    assert not out["skipped"] and out["files"] == [] and out["checks"] == []
+    assert [(c["line"], c["property"]) for c in out["code_checks"]] == [(26, "L6_wiped_buf"), (27, "L6_wiped_buf")]
+    lines = (work / "prog.c").read_text(encoding="utf-8").splitlines()
+    assert lines[25] == "            " + LOCAL_CHECK + "return -1;"
+    assert lines[26] == "    " + LOCAL_CHECK + "}"
+    # Out of the local's scope: untouched.
+    assert lines[11] == "        return -2;" and lines[27] == "    return n;"
+    # The same plan again changes nothing; without the property the source is back.
+    assert sp.apply_taint(doc, work, taint=False)["changed"] == []
+    sp.apply_taint({"properties": []}, work)
+    assert (work / "prog.c").read_text(encoding="utf-8") == source
+
+
+@pytest.mark.unit
+def test_report_lists_threat_model_items_without_a_property():
+    import generate_report as gr
+
+    m = model({"prog.c#derive": fn("derive", "prog.c")})
+    doc = sp.generate(m, threat(secrets=[{"name": "tok", "kind": "return", "function": "derive", "description": "d"}]))
+    lines = gr.security_props_lines(doc)
+    assert lines[0] == "### Threat-model items without a property"
+    assert any("tok" in line and "returned secret" in line and "no property" in line for line in lines)
+    assert gr.security_props_lines({"warnings": ["the model has no call sites"]}) == []
+
+
+@pytest.mark.unit
+def test_eva_rows_of_a_local_check_go_to_the_l6_wiped_unit(run_dir):
+    m = model({"prog.c#derive": fn("derive", "prog.c", formals=[{"name": "n", "kind": "value"}])})
+    doc = _local_doc()
+    doc["code_checks"] = [{"file": "prog.c", "line": 26, "function": "prog.c#derive", "property": "L6_wiped_buf"}]
+    _seed_one_file(run_dir, m, doc)
+    row = {
+        "directory": ".",
+        "file": "prog.c",
+        "function": "derive",
+        "line": 26,
+        "kind": "user check",
+        "status": "Unknown",
+        "annotation": "∀ ℤ i; 0 ≤ i < 16 ⇒ buf[i] ≡ 0",
+    }
+    eva = run_dir / "workspace/reports/eva/libprog.a.json"
+    report = {
+        "status": "ok",
+        "module": "libprog.a",
+        "unknown_obligations_by_function": {"derive": [row]},
+        "invalid_alarms": [],
+        "dead_alarms": [],
+        "functions_with_properties": ["derive"],
+    }
+    write_json(eva, report)
+    L.cmd_ingest_eva([eva])
+    units = _ledger_units(run_dir)
+    assert units["prog.c#derive::l6_wiped"]["evidence"][-1]["result"] == "eva_check_unknown"
+    assert units["prog.c#derive::rte"]["bookkeeping"]["eva_verdicts"] == {"libprog.a": "valid"}
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["wiped", "refilled"])
+def test_local_wipe_check_in_the_image(model_run, tmp_path, violate):  # noqa: F811
+    """The in-code check proves when the local is wiped before the return, and not when it is refilled."""
+    lists = {"secrets": [LOCAL_SECRET]}
+    target = _one_file_target(tmp_path / "target", LOCAL_DIR / "l6_wiped_local.c", lists, violate)
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    assert by_name(doc)["L6_wiped_buf"]["instances"] == ["prog.c#derive"], doc["warnings"]
+    work = run / "local-work"
+    work.mkdir()
+    shutil.copy(target / "prog.c", work / "prog.c")
+    assert len(sp.apply_taint(doc, work, taint=False)["code_checks"]) == 2
+    defs = " -cpp-extra-args=-DVIOLATE" if violate else ""
+    cmd = [
+        "docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+        "-v", f"{work.resolve()}:/w", "-w", "/w", ANALYSIS_IMAGE, "-c",
+        f"frama-c prog.c{defs} -wp -wp-fct derive -wp-prop L6_wiped_buf -wp-timeout 10 -wp-par 1",
+    ]  # fmt: skip
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", res.stdout)
+    assert proved and int(proved.group(2)) >= 2, res.stdout
+    assert (proved.group(1) == proved.group(2)) is (not violate), res.stdout

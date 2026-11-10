@@ -1153,8 +1153,26 @@ def _is_taint_row(row: object) -> bool:
     return isinstance(row, dict) and "\\tainted(" in str(row.get("annotation") or "")
 
 
-def _split_taint_rows(report: dict) -> tuple[dict, list[tuple[str, dict]]]:
-    """The report without its taint rows, and those rows with their verdict (unknown, invalid, dead)."""
+def _code_key(row: dict) -> tuple[str, int]:
+    return _eva_alarm_path(row), int(row.get("line") or 0)
+
+
+def _is_taint_or_code_row(row: object, code: set[tuple[str, int]]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return _is_taint_row(row) or ("check" in str(row.get("kind") or "") and _code_key(row) in code)
+
+
+def _split_taint_rows(report: dict, code: set[tuple[str, int]] | None = None) -> tuple[dict, list[tuple[str, dict]]]:
+    """
+    The report without its taint rows and the rows of in-code checks security_props.py placed (`code`:
+    file and line, plan step M6), and those rows with their verdict (unknown, invalid, dead).
+    """
+    code = code or set()
+
+    def _is_taint_row(row: object) -> bool:
+        return _is_taint_or_code_row(row, code)
+
     out = dict(report)
     rows: list[tuple[str, dict]] = []
     raw = report.get("unknown_obligations_by_function")
@@ -1187,6 +1205,46 @@ def _taint_checks(path: Path = DEFAULT_SECURITY_PROPS) -> list[dict]:
     record = doc.get("eva_taint") if isinstance(doc, dict) else None
     checks = record.get("checks") if isinstance(record, dict) and record.get("enabled") else None
     return [c for c in checks or [] if isinstance(c, dict) and c.get("function")]
+
+
+def _code_checks(path: Path = DEFAULT_SECURITY_PROPS) -> dict[tuple[str, int], dict]:
+    """(file, line) -> the in-code check security_props.py placed there (plan step M6)."""
+    try:
+        doc = load_json_optional(path, {})
+    except ArtifactError:
+        return {}
+    checks = doc.get("code_checks") if isinstance(doc, dict) else None
+    return {
+        (normalize_file(str(c.get("file"))), int(c.get("line") or 0)): c
+        for c in checks or []
+        if isinstance(c, dict) and c.get("function")
+    }
+
+
+def _ingest_code_checks(
+    units: dict[str, dict], rows: list[tuple[str, dict]], checks: dict, module: str, tool_output: str
+) -> None:
+    """Eva's statuses of the in-code wipe checks: evidence on the l6_wiped unit (WP decides it)."""
+    for verdict, row in rows:
+        check = checks.get(_code_key(row))
+        if not check:
+            continue
+        for u in units.values():
+            if (
+                u["obligation_class"] == "l6_wiped"
+                and u["function"] == str(row.get("function") or "")
+                and _alarm_in_file(row, u["file"])
+            ):
+                add_evidence(
+                    u,
+                    "eva",
+                    "run_eva_slice.py",
+                    f"eva_check_{verdict}",
+                    False,
+                    tool_output,
+                    f"Eva slice '{module}': {check.get('property')} at line {row.get('line')} is {verdict}; "
+                    "the wipe is WP's to prove.",
+                )
 
 
 def _taint_open(unit: dict) -> list[str]:
@@ -1268,6 +1326,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
     unit_names = {u["function"] for u in units.values()}
     touched: set[str] = set()
     taint_checks = _taint_checks()
+    code_checks = _code_checks()
     for path in paths:
         report = load_json_strict(path)
         stats["reports"] += 1
@@ -1315,7 +1374,10 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             if isinstance(taint, dict) and module in taint:
                 del taint[module]
                 taint_reset.append(u)
-        report, taint_rows = _split_taint_rows(report)
+        report, split_rows = _split_taint_rows(report, set(code_checks))
+        code_rows = [(v, r) for v, r in split_rows if _code_key(r) in code_checks and not _is_taint_row(r)]
+        taint_rows = [(v, r) for v, r in split_rows if _is_taint_row(r)]
+        _ingest_code_checks(units, code_rows, code_checks, module, tool_output)
         taint_units = _ingest_taint(units, taint_rows, taint_checks, module, report, tool_output)
         if taint_units:
             stats["taint_units"] = stats.get("taint_units", 0) + taint_units
