@@ -1607,7 +1607,7 @@ def test_repair_hints_port_make_wrapper_patterns():
     by_pattern = {h["pattern"]: h for h in hints}
     assert by_pattern["recursive_call"]["action"].find("--eva-recursion-fallback") != -1
     spec = [h for h in hints if h.get("function") == "ext_fn"][0]
-    assert spec["spec_kind"] == "specification" and "external_stubs.h" in spec["action"]
+    assert spec["spec_kind"] == "specification" and "workspace/stubs/" in spec["action"]
     assigns = [h for h in hints if h.get("function") == "rec_fn"][0]
     assert "assigns clause" in assigns["action"]
     assert run_eva_slice.extract_repair_hints("[eva] all good\n") == []

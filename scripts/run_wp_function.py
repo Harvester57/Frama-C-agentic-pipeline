@@ -65,6 +65,7 @@ from framac_common import (  # noqa: E402
     normalize_flag_args,
     read_report_csv,
     scan_undeclared_functions,
+    stub_repair_action,
     wp_model_unsound,
 )
 from resources import CLASSES, FRAMAC_KERNEL_RESERVE_MB, WP_MEMLIMIT_MB, enforced_memory_mb, wp_parallelism  # noqa: E402
@@ -740,8 +741,9 @@ def derive_wp_diagnostic_hints(
             _add(
                 f"Callee(s) without any contract: {', '.join(missing_spec)}. Frama-C generated a default contract "
                 "that WP then trusted, so this proof does not hold. A contract is needed on the prototype: "
-                "request it through `strengthening_requests`, or use a stub from `templates/acsl/external_stubs.h` "
-                "for an external function."
+                "request it through `strengthening_requests` for a project function; for an external function, "
+                + "; ".join(stub_repair_action(fn) for fn in missing_spec)
+                + "."
             )
         if "Ignoring " in aborts_and_unsound or "not yet supported (skipped)" in aborts_and_unsound:
             if _WP_ALLOC_UNSUPPORTED_RE.search(aborts_and_unsound):

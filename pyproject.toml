@@ -78,6 +78,7 @@ known-first-party = [
     "security_props",
     "seed_harvest",
     "spec_kb",
+    "stub_gen",
     "target_env",
     "tiers",
     "trust",

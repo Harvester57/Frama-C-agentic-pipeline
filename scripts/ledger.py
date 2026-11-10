@@ -14,6 +14,7 @@ Subcommands (run with the run directory as working directory):
   ingest-agent-hypothesis  <agent_result.json> [--module MOD]
                            (fault_hypothesis, proof_gap, breaker crash_found, prover guardrail code_fault)
   record-boundary-assumptions <agent_result.json>   (prover / architect boundary_assumptions)
+  record-stub-contracts    [--report workspace/reports/stubs.json]   (the run's stub overlay, scripts/stub_gen.py)
   ingest-verifier          <verifier_result.json> [--replay-report <fuzz.json> ...] [--harness-meta <harness_mod.json>]
   transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT] [--expect STATUS ...]
   transition-many          --spec-json JSON|PATH
@@ -2183,6 +2184,78 @@ def cmd_record_boundary_assumptions(result_path: Path) -> dict:
     return out
 
 
+STUB_ASSUMPTION_PREFIX = "Overlay stub contract of "
+STUB_ACTIVE_STATES = ("incomplete", "filled", "manual")
+
+
+def stub_contract_descriptions(report: dict) -> dict[tuple[str, str], list[str]]:
+    """
+    (caller file, caller function) -> the `stub_contract` descriptions of the overlay contracts it calls
+    (scripts/stub_gen.py's report): one per active contract (filled, incomplete, manual), naming the header
+    and its digest, so a report can say what a proof rests on.
+    """
+    out: dict[tuple[str, str], list[str]] = {}
+    for header, rec in sorted((report.get("headers") or {}).items()):
+        if not isinstance(rec, dict):
+            continue
+        digest = str(rec.get("digest") or "")[:12]
+        for fn, f in sorted((rec.get("functions") or {}).items()):
+            state = f.get("state")
+            if state not in STUB_ACTIVE_STATES:
+                continue
+            check = (f.get("check") or {}).get("status")
+            text = (
+                f"{STUB_ASSUMPTION_PREFIX}{fn} in {header} (sha256 {digest}, {state}) is assumed, not proven"
+                + (f"; stub-check: {check}" if check else "")
+                + "."
+            )
+            for caller in f.get("callers") or []:
+                file, _, name = str(caller).rpartition("#")
+                if file and name:
+                    out.setdefault((file, name), []).append(text)
+    return out
+
+
+@ledger_locked
+def cmd_record_stub_contracts(report_path: Path) -> dict:
+    """
+    Record the run's stub overlay contracts (`stub_gen.py run`) as `stub_contract` assumptions on the
+    units of the functions that call them. Replaces the overlay assumptions recorded before, so an
+    edited header (a new digest) or a contract back in draft never leaves a stale one. No ledger yet:
+    nothing to do (`seed` records them).
+    """
+    if not Path(LEDGER).is_file():
+        return {"recorded": 0, "skipped_reason": "no ledger yet: `seed` records the stub contracts"}
+    report = load_json_optional(report_path, None)
+    if not isinstance(report, dict):
+        return {"recorded": 0, "skipped_reason": f"no stub report at {report_path}: run `stubs` first"}
+    wanted = stub_contract_descriptions(report)
+    units, candidates = load_state()
+    changed = 0
+    recorded = 0
+    for u in units.values():
+        kept = [
+            a
+            for a in u["assumptions"]
+            if not (
+                a.get("kind") == "stub_contract" and str(a.get("description") or "").startswith(STUB_ASSUMPTION_PREFIX)
+            )
+        ]
+        new = list(kept)
+        if u["status"] not in NO_TOUCH:
+            for text in wanted.get((u["file"], u["function"]), []):
+                a = {"kind": "stub_contract", "description": text, "related_units": []}
+                if a not in new:
+                    new.append(a)
+                    recorded += 1
+        if new != u["assumptions"]:
+            u["assumptions"] = new
+            changed += 1
+    if changed:
+        commit(units, candidates, run_dir=Path.cwd())
+    return {"recorded": recorded, "units_changed": changed, "callers": len(wanted)}
+
+
 def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_outputs: list[str]) -> set[str]:
     shas: set[str] = set()
     all_paths = list(report_paths) + [run_dir / t for t in tool_outputs]
@@ -3062,6 +3135,10 @@ def main(argv: list[str] | None = None) -> int:
     p_hyp.add_argument("--module", default=None)
     p_ba = sub.add_parser("record-boundary-assumptions")
     p_ba.add_argument("result", type=Path)
+    p_sc = sub.add_parser(
+        "record-stub-contracts", help="Record the stub overlay's active contracts as stub_contract assumptions"
+    )
+    p_sc.add_argument("--report", type=Path, default=Path("workspace/reports/stubs.json"))
     p_ver = sub.add_parser("ingest-verifier")
     p_ver.add_argument("result", type=Path)
     p_ver.add_argument("--replay-report", action="append", type=Path, default=[])
@@ -3132,6 +3209,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_ingest_agent_hypothesis(args.result, args.module)
         elif args.cmd == "record-boundary-assumptions":
             out = cmd_record_boundary_assumptions(args.result)
+        elif args.cmd == "record-stub-contracts":
+            out = cmd_record_stub_contracts(args.report)
         elif args.cmd == "ingest-verifier":
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
         elif args.cmd == "transition":

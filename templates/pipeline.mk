@@ -43,12 +43,12 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init dag security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
+.PHONY: help slice-init dag stubs security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) $(EVA_SHARD_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init dag security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init dag stubs security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -65,6 +65,15 @@ slice-init:
 dag:
 	$(RUN) --class light --key dag -- $(PY) $(S)/build_callgraph_dag.py --target workspace/work \
 		--out workspace/reports/callgraph_dag.json
+
+# The run's stub overlay (scripts/stub_gen.py, docs/slicing-and-onboarding.md Section 3): from the Phase 0
+# model, a skeleton block in workspace/stubs/<header> for every external function a host header declares
+# (inactive until a stub author fills it), and workspace/reports/stubs.json with each header's digest and
+# each function's state. Existing blocks are never rewritten. Then every active contract is recorded in
+# the ledger as a stub_contract assumption (a no-op before `seed`, which records them itself).
+stubs:
+	$(RUN) --class light --key stubs -- $(PY) $(S)/stub_gen.py run
+	$(RUN) --class light --key stubs -- $(PY) $(S)/ledger.py record-stub-contracts
 
 # The MetAcsl security properties (Layers 3-6) from the model and the threat model. The ledger seed
 # reads them, so they are written before it.
@@ -83,6 +92,7 @@ reach-gate:
 # every Phase 0 gate passed.
 seed: reach-gate security-props
 	$(RUN) --class light --key seed -- $(PY) $(S)/ledger.py seed --dag workspace/reports/callgraph_dag.json $(SEED_SCOPE_ARGS)
+	$(RUN) --class light --key seed -- $(PY) $(S)/ledger.py record-stub-contracts
 	$(RUN) --class light --key seed -- $(PY) $(S)/validate_artifacts.py run-dir .
 	test -f state/progress.json || $(RUN) --class light --key seed -- $(PY) $(S)/checkpoint.py init state --target $(TARGET_DIR)
 

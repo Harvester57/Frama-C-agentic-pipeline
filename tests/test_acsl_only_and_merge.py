@@ -222,11 +222,10 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
         assert errors == []
 
     def test_templates_acsl_are_pure_acsl(self, repo_root: Path) -> None:
-        """The Layer 3-6 MetAcsl templates (I9) contain zero executable C tokens or #includes, and external_stubs.h has zero ACSL hazards."""
+        """The Layer 3-6 MetAcsl templates (I9) contain zero executable C tokens or #includes."""
         from acsl_ast import find_unsound_acsl_keywords
         from security_props import load_template
 
-        acsl_dir = repo_root / "templates" / "acsl"
         metacsl = sorted((repo_root / "templates" / "metacsl").glob("*.acsl"))
         assert metacsl
         for path in metacsl:
@@ -237,10 +236,6 @@ int parse_payload(const uint8_t *buf, size_t len, int *out) {
             c_tokens = [t for t in tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line", "c_comment")]
             assert c_tokens == [], f"{path.name} contains non-ACSL C tokens: {c_tokens[:5]}"
             assert find_unsound_acsl_keywords(tokens, path=path.name) == []
-
-        stubs_text = (acsl_dir / "external_stubs.h").read_text(encoding="utf-8")
-        stub_tokens = tokenize_c_acsl(stubs_text)
-        assert find_unsound_acsl_keywords(stub_tokens, path="external_stubs.h") == []
 
         from c_definitions import extract_functions_from_code
         from framac_common import augment_framac_cppflags

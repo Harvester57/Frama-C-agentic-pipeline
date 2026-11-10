@@ -520,9 +520,50 @@ def framac_cpp_wrapper(path: Path | None = None) -> str | None:
     return text
 
 
+# The run's stub overlay (docs/templates-and-stubs-improvement-plan.md S2, scripts/stub_gen.py): contracts for
+# external functions only a host header declares, one header per included library header. It is searched
+# before templates/fc_stubs, so the pipeline's own templates are never edited for one target.
+STUB_OVERLAY_REL = "workspace/stubs"
+CONTAINER_STUB_OVERLAY_DIR = f"/framac-run/{STUB_OVERLAY_REL}"
+STUB_REPORT_REL = "workspace/reports/stubs.json"
+
+
+def stub_overlay_dir() -> Path | None:
+    """The run's stub overlay: FRAMAC_STUB_OVERLAY_DIR (tests, host runs), else the run mount's; None when absent."""
+    d = Path(os.environ.get("FRAMAC_STUB_OVERLAY_DIR") or CONTAINER_STUB_OVERLAY_DIR)
+    return d if d.is_dir() else None
+
+
+def stub_header_for(function: str, report: Path | None = None) -> str | None:
+    """The overlay header holding `function`'s stub (workspace/reports/stubs.json, from the cwd), or None."""
+    data = load_json_optional(report or Path(STUB_REPORT_REL), {})
+    if not isinstance(data, dict):
+        return None
+    for header, rec in sorted((data.get("headers") or {}).items()):
+        if isinstance(rec, dict) and function in (rec.get("functions") or {}):
+            return str(header)
+    return None
+
+
+def stub_repair_action(function: str) -> str:
+    """Where a missing contract of an external `function` goes: its overlay header (S2)."""
+    header = stub_header_for(function)
+    if header:
+        return (
+            f"fill {function!r}'s contract in {header} (the stub-author brief: `stub_gen.py brief --header {header}`), "
+            "then `pipeline_make.py run stubs stub-check`"
+        )
+    return (
+        f"give {function!r} a contract in {STUB_OVERLAY_REL}/<lib>.h, the run's stub overlay: "
+        "`pipeline_make.py run stubs` writes the skeleton for every external a host header declares "
+        "(a prototype in a project header takes its contract in the work tree instead)"
+    )
+
+
 def augment_framac_cppflags(cppflags: str) -> str:
     """
-    Prepend `-I<fc_stubs>` and `-include <fc_compat_types.h>` for Frama-C `-nostdinc` runs
+    Prepend the run's stub overlay (`-I<workspace/stubs>`, when it exists), then
+    `-I<fc_stubs>` and `-include <fc_compat_types.h>` for Frama-C `-nostdinc` runs
     (Eva and WP) so third-party headers (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`)
     and glibc internal integer typedefs (`__int32_t`, etc.) resolve cleanly without
     shadowing `__fc_libc`, ensuring stubs and compatibility headers precede target headers.
@@ -534,12 +575,14 @@ def augment_framac_cppflags(cppflags: str) -> str:
     from target_env import with_include_flags
 
     base = with_include_flags((cppflags or "-I.").strip())
+    overlay = stub_overlay_dir()
+    overlay_flag = [f"-I{overlay.as_posix()}"] if overlay is not None and f"-I{overlay.as_posix()}" not in base else []
     fc_stubs = resolve_fc_stubs_dir()
     if fc_stubs is None:
-        return base
+        return " ".join([*overlay_flag, base]) if base else " ".join(overlay_flag)
     stubs_posix = fc_stubs.as_posix()
     compat_hdr = (fc_stubs / "fc_compat_types.h").as_posix()
-    prefix: list[str] = []
+    prefix: list[str] = list(overlay_flag)
     if f"-I{stubs_posix}" not in base:
         prefix.append(f"-I{stubs_posix}")
     if "fc_compat_types.h" not in base and (fc_stubs / "fc_compat_types.h").is_file():

@@ -1478,6 +1478,8 @@ STAGE_OF_TARGET = {
     # The overlay; the build capture and the Phase 0 model run outside Make between it and the DAG.
     "slice-init": 0,
     "dag": 1,
+    # Reads the Phase 0 model only; before reach-gate and seed, which records its contracts in the ledger.
+    "stubs": 1,
     "security-props": 2,
     "reach-gate": 2,
     "seed": 2,
@@ -1507,13 +1509,14 @@ STAGE_OF_TARGET = {
     "report": 7,
 }
 # Phase 0 targets that write what the plan reads: they run even when the current DAG is unusable.
-PHASE0_INPUT_TARGETS = frozenset({"slice-init", "dag", "security-props"})
+PHASE0_INPUT_TARGETS = frozenset({"slice-init", "dag", "stubs", "security-props"})
 MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "coverage-", "eva-", "flamegraph-", "module-", "facts-")
 REACH_DYNAMIC_PREFIX = "reach-dynamic-"
 _TARGET_OUTPUTS = {
     "slice-init": "workspace/overlay_meta.json",
     "dag": DAG_JSON,
     "security-props": "workspace/reports/security_props.json",
+    "stubs": "workspace/reports/stubs.json",
     "seed": LEDGER_JSON,
     "selftest": SELFTEST_JSON,
     "ingest": INGESTED_JSON,

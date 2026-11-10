@@ -63,6 +63,7 @@ NOT_FORWARDED = {
     "FRAMAC_P0_ALIAS_OUT",
     "FRAMAC_P0_ALIAS_TIMEOUT",
     "FRAMAC_SNAPSHOT_DIR",
+    "FRAMAC_STUB_OVERLAY_DIR",
     "FRAMAC_PROBE_MEMO_S",
     "FRAMAC_PROBE_ROOT",
     "FRAMAC_SECURITY_PROPS",  # run_wp_function.py override; the default is the run's workspace/reports file

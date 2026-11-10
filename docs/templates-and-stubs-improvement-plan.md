@@ -204,3 +204,9 @@ The rules of [`open-topics-remediation-plan.md`](open-topics-remediation-plan.md
 
 - Contracts for whole libraries nobody has run a target against (zlib, OpenSSL): S2 generates what a target needs when it needs it.
 - Replacing host-header mode for E-ACSL: the reasons in the stub README still hold.
+
+## Status
+
+| ID | Status |
+| :--- | :--- |
+| S2 | done 2026-11-10: `scripts/stub_gen.py`, Make target `stubs`, the stub-author brief (`skills/framac-slice/stub_author_brief.md`), `ledger.py record-stub-contracts`, overlay in the include paths and the cache key; `templates/acsl/external_stubs.h` deleted (decision 2). The Phase 0 dump now records each external's declaration (`external_decls`). |

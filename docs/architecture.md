@@ -27,7 +27,7 @@ flowchart TD
         MO --> SD["Seeds from the Tests<br/>(seed_harvest.py record, build image)"]
         MO --> C["DAG View: Link-Unit Modules, Waves 0..K,<br/>Tiers from Trust, Unit Split<br/>(build_callgraph_dag.py, tiers.py, unit_split.py)"]
         MO --> SP["MetAcsl Layer 3-6 Properties<br/>(security_props.py)"]
-        C --> D["Stub External Boundaries<br/>(__fc_libc + external_stubs.h)"]
+        C --> D["Stub External Boundaries<br/>(__fc_libc, fc_stubs + run overlay workspace/stubs,<br/>stub_gen.py + stub author)"]
         D --> E{"Route Modules by<br/>Risk Tier"}
     end
 

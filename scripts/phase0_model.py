@@ -64,8 +64,10 @@ the checkpoint (`--state`, scripts/checkpoint.py) with each unit's first error, 
 them and restarts at the model; a model that parses clears it.
 
 Version 2 of the model (`schema_version`) records `external_calls`, `kernel_names`, `formals`, `writes`
-and `param_sizes` on its functions. Consumers ask `model_features(model)` which of these a model has,
-so a version 1 model is recognized the same way everywhere.
+and `param_sizes` on its functions, and (S2 of docs/templates-and-stubs-improvement-plan.md) each external's
+first declaration and C text under `external_decls`, from which scripts/stub_gen.py writes the stub skeletons
+(a model without it gets no skeletons). Consumers ask `model_features(model)` which of these a model has, so
+a version 1 model is recognized the same way everywhere.
 
 `selftest` compiles the dump module and checks it on a two-file program (a static collision, a
 callback, an indirect call); the image build runs it, so a kernel upgrade that breaks the dump fails
@@ -629,6 +631,8 @@ class ModelBuilder:
         # Step I9: defined global variables (`file#name`) and the formals of declared functions.
         self.global_vars: dict[str, dict] = {}
         self.declared_formals: dict[str, list] = {}
+        # Declared (not defined) functions: their first declaration and its C text (scripts/stub_gen.py).
+        self.declared_info: dict[str, dict] = {}
         # Callee id -> (caller id, call location, argument index, bytes): what the callers pass.
         self.arg_sites: dict[str, set[tuple[str, str, str, int]]] = defaultdict(set)
 
@@ -729,6 +733,10 @@ class ModelBuilder:
         for d in dump.get("declared") or []:
             if d.get("name") and d.get("formals") is not None:
                 self.declared_formals.setdefault(d["name"], d["formals"])
+            if d.get("name") and d.get("decl") and d.get("proto"):
+                self.declared_info.setdefault(
+                    d["name"], {"decl": d["decl"], "proto": d["proto"], "signature": d.get("signature") or ""}
+                )
         for k in dump.get("address_taken") or []:
             if k in kmap:
                 self.functions[kmap[k]]["address_taken"] = True
@@ -1067,6 +1075,7 @@ def build_model(
         external_formals={
             n: builder.declared_formals[n] for n in sorted(builder.externals) if n in builder.declared_formals
         },
+        external_decls={n: builder.declared_info[n] for n in sorted(builder.externals) if n in builder.declared_info},
         global_variables=dict(sorted(builder.global_vars.items())),
         macro_aliases=builder.aliases(defines),
         entry_points=sorted({e for u in units_out.values() if not u.get("test") for e in u.get("entry_points") or []}),

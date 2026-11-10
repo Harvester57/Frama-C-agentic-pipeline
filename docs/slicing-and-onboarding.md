@@ -69,23 +69,41 @@ Frama-C needs exactly the files, include paths and macros each compilation unit 
 
 Frama-C substitutes the host's `/usr/include` standard C library with its own ACSL-annotated standard library (`__fc_libc`), which already includes complete formal contracts for `<string.h>`, `<stdlib.h>`, `<stdio.h>`, `<stdint.h>`, and `<sys/socket.h>`.
 
-For external third-party libraries (such as OpenSSL/mbedTLS in SNMPv3 or OS hardware abstractions):
-1. **Never include third-party library `.c` files in a module slice.**
-2. Include [`../templates/acsl/external_stubs.h`](../templates/acsl/external_stubs.h) or attach a concise ACSL contract to the external function's `.h` prototype:
-   ```c
-   /*@
-     requires \valid_read(key + (0 .. key_len - 1));
-     requires \valid_read(msg + (0 .. msg_len - 1));
-     requires \valid(tag_out + (0 .. 15));
-     requires \separated(tag_out + (0 .. 15), key + (0 .. key_len - 1), msg + (0 .. msg_len - 1));
-     assigns tag_out[0 .. 15];
-     ensures \result == 0 || \result == -1;
-     ensures \result == 0 ==> \initialized(tag_out + (0 .. 15));
-   */
-   int external_hmac_sha256_96(
-       const uint8_t *key, size_t key_len,
-       const uint8_t *msg, size_t msg_len,
-       uint8_t *tag_out
-   );
-   ```
+For external third-party libraries (such as OpenSSL/mbedTLS in SNMPv3 or OS hardware abstractions), never include the library's `.c` files in a module slice. Give each external function the target calls a contract instead, in one of three places, decided by where its prototype is declared:
+
+- **Frama-C's libc and `templates/fc_stubs/`** already carry contracts (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`, `fc_compat_types.h`). They are the pipeline's, never edited for one target.
+- **A header of the project:** the contract goes on that prototype in `workspace/work/`, as any ACSL edit.
+- **A host header (a package the build used):** the run's stub overlay, `workspace/stubs/<lib>.h` (step S2 of [`templates-and-stubs-improvement-plan.md`](templates-and-stubs-improvement-plan.md)).
+
+The overlay works in two halves:
+
+1. **Skeletons (Make, `pipeline_make.py run stubs`, after the model and before `reach-gate`):** `scripts/stub_gen.py run` reads the Phase 0 model (`externals`, `external_decls`) and writes, for every external a host header declares, a block in `workspace/stubs/<name>`, where `<name>` is how the target includes that header (`json-c/json.h`, `gcrypt.h`). The overlay header includes the real one (`#include_next`), then redeclares the functions with their contracts. It is first on the include path of every Frama-C parse (`augment_framac_cppflags`) and of the E-ACSL frontend (`build_eacsl_flag_sets`). A skeleton has the real prototype and a frame derived from the signature (const pointers read only, a pointer and its length bound a range), and stays under `#ifdef FC_STUB_DRAFT` with a `TODO(stub-author)` line: inactive until filled. `stub_gen.py run` never rewrites an existing block, and its report, `workspace/reports/stubs.json`, gives each header's digest and each function's state (`draft`, `incomplete`, `filled`, or `manual` for a header written without the markers).
+2. **Contracts (a subagent):** one stub author per overlay header, briefed with `stub_gen.py brief --header workspace/stubs/<name>` ([`../skills/framac-slice/stub_author_brief.md`](../skills/framac-slice/stub_author_brief.md)), fills the contracts from the library's documentation and removes the guard. No function bodies, and no `ensures` the documentation does not justify.
+
+Every active stub contract is an assumption, not a result: `ledger.py record-stub-contracts` (run by `stubs` and `seed`) records it as a `stub_contract` assumption, with the header's digest, on the units of every function that calls it. The cache keys of Eva and of the E-ACSL builds include the overlay headers each module reads, so a changed contract never replays a stale result.
+
+Worked example: the target calls `external_hmac_sha256_96` from `<crypto/hmac.h>`. After the author, `workspace/stubs/crypto/hmac.h` holds:
+
+```c
+#pragma once
+#include_next <crypto/hmac.h>
+
+/* fc-stub: external_hmac_sha256_96 */
+/*@
+  requires valid_key: key_len > 0 ==> \valid_read(key + (0 .. key_len - 1));
+  requires valid_msg: msg_len > 0 ==> \valid_read(msg + (0 .. msg_len - 1));
+  requires init_key: key_len > 0 ==> \initialized(key + (0 .. key_len - 1));
+  requires init_msg: msg_len > 0 ==> \initialized(msg + (0 .. msg_len - 1));
+  requires valid_tag: \valid(tag_out + (0 .. 15));
+  requires sep: \separated(tag_out + (0 .. 15), key + (0 .. key_len - 1), msg + (0 .. msg_len - 1));
+  assigns tag_out[0 .. 15], \result \from key[0 .. key_len - 1], msg[0 .. msg_len - 1], key_len, msg_len;
+  ensures status: \result == 0 || \result == -1;
+  ensures init_tag: \result == 0 ==> \initialized(tag_out + (0 .. 15));
+*/
+extern int external_hmac_sha256_96(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len,
+                                   uint8_t *tag_out);
+```
+
 This allows Frama-C (`Eva` and `WP`) to verify that *your* code passes valid, initialized, non-overlapping buffers into the cryptographic library and checks its return code, without ever analyzing the cryptographic library's internal math.
+
+Limits: a header the library includes only through a quoted sibling include (`#include "hmac_impl.h"` inside `hmac.h`) is never looked up on the include path, so `stub_gen.py` shadows the sibling that includes it; a translation unit that includes the inner header directly then sees no contract. A function called without any prototype is listed as `undeclared` in the report: a header is missing from the module's flags.

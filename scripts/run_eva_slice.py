@@ -91,6 +91,7 @@ from framac_common import (  # noqa: E402
     normalize_flag_args,
     read_report_csv,
     scan_undeclared_functions,
+    stub_repair_action,
 )
 from resources import CLASSES  # noqa: E402
 
@@ -696,8 +697,7 @@ def extract_repair_hints(log_text: str) -> list[dict]:
         if kind == "specification":
             action = (
                 f"add the file defining {fname!r} to the module sources (locate it via "
-                "build_callgraph_dag.py's function index), or add a stub/contract in "
-                "templates/acsl/external_stubs.h"
+                f"build_callgraph_dag.py's function index), or, for an external function, {stub_repair_action(fname)}"
             )
         else:
             action = (

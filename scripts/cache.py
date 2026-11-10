@@ -18,7 +18,7 @@ ad-hoc runs outside a run never read or write one.
 
 Keys hash CACHE_SCHEMA_VERSION, the toolchain identity (FRAMAC_IMAGE_ID, else a memoized tuple of
 tool versions), a digest of scripts/ and templates/ (bind-mounted, so the image ID does not cover
-them), the effective flags, output paths and cwd, and a dependency manifest: the union of the
+them) and of the run's stub overlay (workspace/stubs), the effective flags, output paths and cwd, and a dependency manifest: the union of the
 include sets `gcc -M -MG` (with Frama-C-like defines) and `clang -M -MG` report for the effective
 preprocessor flags, each file content-hashed. A build whose manifest cannot be computed is never
 cached.
@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
 from c_definitions import C_KEYWORDS  # noqa: E402
-from framac_common import RunLockTimeout, run_lock, utc_now  # noqa: E402
+from framac_common import RunLockTimeout, run_lock, stub_overlay_dir, utc_now  # noqa: E402
 
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_MAX_BYTES = 20 * 1024**3
@@ -1112,6 +1112,21 @@ def dependency_manifest(
     return [[dep, file_digest(dep) or "missing"] for dep in sorted(deps)]
 
 
+def stub_overlay_digest() -> str | None:
+    """sha256 of the run's stub overlay, workspace/stubs (path and content of each file), or None without one."""
+    overlay = stub_overlay_dir()
+    if overlay is None:
+        return None
+    h = hashlib.sha256()
+    n = 0
+    for path in sorted(p for p in overlay.rglob("*") if p.is_file()):
+        h.update(
+            path.relative_to(overlay).as_posix().encode() + b"\0" + (file_digest(path) or "missing").encode() + b"\n"
+        )
+        n += 1
+    return h.hexdigest() if n else None
+
+
 def make_key(ns: str, material: dict) -> str:
     doc = {
         "schema": CACHE_SCHEMA_VERSION,
@@ -1120,6 +1135,11 @@ def make_key(ns: str, material: dict) -> str:
         "scripts": scripts_digest(),
         "material": material,
     }
+    # The run's stub overlay is outside scripts/ and templates/: a changed contract must not replay a
+    # result computed under the old one. Absent from the key without an overlay, so older entries stay valid.
+    overlay = stub_overlay_digest()
+    if overlay is not None:
+        doc["stub_overlay"] = overlay
     blob = json.dumps(doc, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
 
