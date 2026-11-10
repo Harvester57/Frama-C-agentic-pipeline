@@ -110,6 +110,9 @@ MEMORY_WRITERS = frozenset(
         "recv",
         "recvfrom",
         "getline",
+        # The typed syscall rewrites of the libc track (fc_cpp_wrapper.py): read and recvfrom.
+        "__fc_syscall_read",
+        "__fc_syscall_recvfrom",
     }
 )
 TEXT_SINKS = frozenset({"log", "terminal"})
@@ -271,7 +274,7 @@ def _ident(text: str) -> str:
 
 
 def _has_crlf(text: str) -> bool:
-    """Whether a C string holds CR or LF before its terminating NUL (what L5_no_crlf forbids)."""
+    """Whether a C string holds CR or LF before its terminating NUL (what no_crlf_string forbids)."""
     head = text.split("\0", 1)[0]
     return "\r" in head or "\n" in head
 
@@ -520,7 +523,7 @@ class _Gen:
         self, sink: str, params: list[str], formals: list[dict] | None, instances: set[str], notes: list[str]
     ) -> dict[str, dict]:
         """
-        Plan step M2: L5_no_crlf on a string literal does not prove (an unbounded quantifier over the
+        Plan step M2: no_crlf_string on a string literal does not prove (an unbounded quantifier over the
         literal's bytes), but the model knows the literal. A caller whose every call of the sink passes
         literals to the text parameters is decided here, syntactically: satisfied when no literal holds
         CR or LF before its first NUL, else violated. It gets no MetAcsl goal (the ledger records the
@@ -563,7 +566,7 @@ class _Gen:
         if mixed:
             notes.append(
                 f"{', '.join(mixed)}: call(s) {sink} with string literals and with other text; the literal calls keep "
-                "a goal that does not prove (L5_no_crlf on a literal)"
+                "a goal that does not prove (no_crlf_string on a literal)"
             )
         return out
 
@@ -907,6 +910,9 @@ def _count(items: Any) -> dict[str, int]:
 # ---------------------------------------------------------------------------------------------------
 
 
+META_INCLUDE = '#include "__fc_string_axiomatic.h"'
+
+
 def properties_for(props: dict, function: str) -> list[dict]:
     """The MetAcsl properties with an instance in `function` (`file#name`, or a bare name)."""
     out = []
@@ -923,7 +929,8 @@ def meta_file_text(props: dict, function: str) -> tuple[str, list[str], list[str
     selected = [p for p in properties_for(props, function) if not p.get("code")]
     if not selected:
         return None
-    parts = [str(props.get("preamble") or "")]
+    # libc's `strlen` for the vocabulary's no_crlf_string the preamble repeats (plan step S8).
+    parts = [META_INCLUDE, str(props.get("preamble") or "")]
     parts += [str(p["acsl"]) for p in selected]
     sources = sorted({s for p in selected for s in p.get("sources") or []})
     return "\n".join(parts) + "\n", [str(p["name"]) for p in selected], sources

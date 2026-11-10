@@ -107,7 +107,7 @@ def test_session_fixture_properties_and_instances():
     assert {"decided": "satisfied", "class": "l5_sanitized"}.items() <= next(
         o for o in doc["obligations"]["session.c#session_admin"] if o["class"] == "l5_sanitized"
     ).items()
-    assert "L5_no_crlf(\\called_arg(msg))" in props["L5_sanitized_log_line"]["acsl"]
+    assert "no_crlf_string(\\called_arg(msg))" in props["L5_sanitized_log_line"]["acsl"]
     wiped = props["L6_wiped_session_key"]
     assert wiped["instances"] == ["session.c#session_close"] and wiped["sources"] == ["session.c"]
     assert "sizeof(session_key) / sizeof(session_key[0])" in wiped["acsl"]
@@ -125,6 +125,34 @@ def test_generated_annotations_are_pure_acsl():
     for text in [doc["preamble"], *(p["acsl"] for p in doc["properties"])]:
         tokens = tokenize_c_acsl(text)
         assert [t for t in tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line", "c_comment")] == []
+    # The meta file's one directive, above the preamble: libc's `strlen` for no_crlf_string (S8).
+    found = sp.meta_file_text(doc, "session.c#session_status")
+    assert found is not None and found[0].startswith(sp.META_INCLUDE + "\n")
+
+
+def _acsl_definition(text: str, name: str) -> str | None:
+    """The whitespace-normalized text of `predicate <name>(...) = ...;` in an ACSL block, or None."""
+    m = re.search(r"predicate\s+" + name + r"\s*\([^)]*\)\s*=[\s\S]*?;[ \t]*\n", text + "\n")
+    return " ".join(m.group(0).split()) if m else None
+
+
+@pytest.mark.unit
+def test_preamble_repeats_the_vocabulary_text():
+    """S8: the meta file's no_crlf_string is the vocabulary's, word for word, so Frama-C merges the two."""
+    preamble = sp.load_template("preamble")["preamble"]
+    mine = _acsl_definition(preamble, "no_crlf_string")
+    assert (
+        mine
+        == "predicate no_crlf_string(char *s) = \\forall integer i; 0 <= i < strlen(s) ==> (s[i] != '\\r' && s[i] != '\\n');"
+    )
+    vocabulary = (ROOT / "templates" / "acsl" / "acsl_vocabulary.h").read_text(encoding="utf-8")
+    theirs = _acsl_definition(vocabulary, "no_crlf_string")
+    if theirs is not None:  # the libc track's S8 adds it to the vocabulary
+        assert mine == theirs
+    for template in ("l4_auth_required", "l4_auth_state", "l5_sanitized", "l6_no_leak", "l6_wiped"):
+        assert not re.search(r"\b(?:predicate|logic)\s+\w+\s*\(", "".join(sp.load_template(template).values())), (
+            template
+        )
 
 
 @pytest.mark.unit
@@ -262,7 +290,7 @@ def test_meta_file_lines_and_function_match(tmp_path):
     assert meta is not None
     text, names, sources = meta
     assert names == ["L5_sanitized_log_line", "L6_no_leak_session_key"] and sources == ["session.c"]
-    assert text.startswith(doc["preamble"])
+    assert text.startswith(sp.META_INCLUDE + "\n" + doc["preamble"])
     lines = sp.meta_line_names(text)
     assert set(lines.values()) == {"L5_sanitized_log_line", "L6_no_leak_session_key"}
     first = min(k for k, v in lines.items() if v == "L6_no_leak_session_key")

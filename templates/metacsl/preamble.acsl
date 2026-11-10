@@ -7,9 +7,20 @@
  * `-meta -then-last -wp ...`. MetAcsl resolves the names below in the linked program, so the meta file
  * needs no declarations. Every generated annotation is named `<property>: meta:`, which maps its WP
  * goals to the property's ledger class (run_wp_function.goal_obligation_class).
+ *
+ * Vocabulary (plan step S8): the properties use the canonical names of
+ * templates/acsl/acsl_vocabulary.h and define none of their own. The meta file is a translation unit
+ * of its own and does not include that header (a target need not), so it takes `strlen` from
+ * __fc_libc (security_props.meta_file_text puts `#include "__fc_string_axiomatic.h"` above this
+ * preamble: the templates stay pure ACSL) and repeats `no_crlf_string` with the vocabulary's exact
+ * text: Frama-C merges identical
+ * definitions across files, so this one and the vocabulary's coexist (checked in the image). Keep the
+ * two texts identical. A length-bounded buffer is the vocabulary's `no_crlf_or_nul(buf, len)`.
+ * MetAcsl properties only reach WP; E-ACSL never runs them (it can execute `no_crlf_string`, through
+ * `strlen`, when a contract names it).
  */
 //# preamble
-/*@ predicate L5_no_crlf{L}(char *s) =
-      \forall integer i; 0 <= i ==>
-        (\forall integer j; 0 <= j < i ==> s[j] != '\0') ==> (s[i] != '\r' && s[i] != '\n');
+/*@
+  predicate no_crlf_string(char *s) =
+    \forall integer i; 0 <= i < strlen(s) ==> (s[i] != '\r' && s[i] != '\n');
 */
