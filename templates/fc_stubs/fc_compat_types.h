@@ -78,6 +78,79 @@ long long int llabs(long long int j);
 /*@ assigns \result \from number; */
 long syscall(long number, ...);
 
+/* Typed syscalls (plan step S6). scripts/fc_cpp_wrapper.py rewrites `syscall(<x86_64 number>, ...)` into
+ * `__fc_syscall_<name>(...)` for the numbers below, which write memory, when this branch declares them.
+ * Arguments as the kernel takes them; pointers are `void *` so any argument type converts as it does for
+ * `syscall` (except `addrlen`, a socklen_t). The result is that of glibc's `syscall()`: -1 on error (errno is not modelled).
+ * The unnamed postconditions hold on every call and are what WP uses: the first \result bytes are
+ * initialized. Eva does not treat an `assigns` range as initialized and does not reduce that range on a
+ * later test of the count, so, as in __fc_libc's read(), Frama_C_entropy_source splits a full transfer
+ * (\result is the length) from a short one or an error; WP learns nothing from that volatile split.
+ * No <sys/socket.h> here: the getsockopt block below must be the first to include it. No `\old` in an
+ * `assigns`: WP 35 with -wp-check-memory-model crashed on `\old(*(unsigned int *)addrlen)` there
+ * (Wp__NormAtLabels.LabelError). */
+#include "__fc_builtin.h"
+
+/* read(2), x86_64 number 0. */
+/*@ requires buf_has_room: \valid((char *)buf + (0 .. count - 1));
+  @ assigns \result, ((char *)buf)[0 .. count - 1]
+  @   \from indirect:fd, indirect:count, indirect:Frama_C_entropy_source;
+  @ ensures result_error_or_read_length: -1 <= \result <= count;
+  @ ensures initialization: \initialized((char *)buf + (0 .. \result - 1));
+  @ behavior full_read:
+  @   assumes nondet_full: Frama_C_entropy_source != 0 && count <= 9223372036854775807;
+  @   ensures result_full: \result == count;
+  @ behavior partial_or_error:
+  @   assumes nondet_partial: !(Frama_C_entropy_source != 0 && count <= 9223372036854775807);
+  @   ensures result_short: \result < count;
+  @ complete behaviors;
+  @ disjoint behaviors;
+  @*/
+long __fc_syscall_read(int fd, void *buf, size_t count);
+
+/* recvfrom(2), x86_64 number 45. `addrlen` is a socklen_t, `unsigned int` on Linux. */
+/*@ requires valid_buffer_length: \valid((char *)buf + (0 .. len - 1));
+  @ requires valid_addrbuf_or_null:
+  @   src_addr == \null
+  @   || (\valid(addrlen) && \initialized(addrlen)
+  @       && \valid((char *)src_addr + (0 .. *addrlen - 1)));
+  @ assigns \result, ((char *)buf)[0 .. len - 1]
+  @   \from indirect:sockfd, indirect:len, indirect:flags, indirect:Frama_C_entropy_source;
+  @ assigns *addrlen \from indirect:sockfd, indirect:src_addr;
+  @ assigns ((char *)src_addr)[0 .. *addrlen - 1] \from indirect:sockfd;
+  @ ensures result_error_or_received_length: -1 <= \result <= len;
+  @ ensures initialization:buf: \initialized((char *)buf + (0 .. \result - 1));
+  @ ensures initialization:addrbuf:
+  @   src_addr != \null ==> \initialized((char *)src_addr + (0 .. \old(*addrlen) - 1));
+  @ behavior full_receive:
+  @   assumes nondet_full: Frama_C_entropy_source != 0 && len <= 9223372036854775807;
+  @   ensures result_full: \result == len;
+  @ behavior partial_or_error:
+  @   assumes nondet_partial: !(Frama_C_entropy_source != 0 && len <= 9223372036854775807);
+  @   ensures result_short: \result < len;
+  @ complete behaviors;
+  @ disjoint behaviors;
+  @*/
+long __fc_syscall_recvfrom(int sockfd, void *buf, size_t len, int flags, void *src_addr, unsigned int *addrlen);
+
+/* getrandom(2), x86_64 number 318. Up to 256 bytes on an initialized pool fill the buffer, but a blocked call
+ * can still fail (EINTR, EAGAIN with GRND_NONBLOCK, ENOSYS): the error branch stays reachable. */
+/*@ requires valid_buf: \valid((char *)buf + (0 .. buflen - 1));
+  @ assigns \result, ((char *)buf)[0 .. buflen - 1]
+  @   \from indirect:buflen, indirect:flags, indirect:Frama_C_entropy_source;
+  @ ensures result_error_or_length: -1 <= \result <= buflen;
+  @ ensures initialization: \initialized((char *)buf + (0 .. \result - 1));
+  @ behavior full:
+  @   assumes nondet_full: Frama_C_entropy_source != 0 && buflen <= 9223372036854775807;
+  @   ensures result_full: \result == buflen;
+  @ behavior partial_or_error:
+  @   assumes nondet_partial: !(Frama_C_entropy_source != 0 && buflen <= 9223372036854775807);
+  @   ensures result_short: \result < buflen;
+  @ complete behaviors;
+  @ disjoint behaviors;
+  @*/
+long __fc_syscall_getrandom(void *buf, size_t buflen, unsigned int flags);
+
 /* Linux <asm-generic/ioctl.h>: the ioctl request encoding (`_IOWR(magic, nr, struct foo)`), which
  * glibc's <sys/ioctl.h> provides and __fc_libc's does not. Without it the struct-type argument is a
  * syntax error. Values are those of x86_64 (and every architecture using the generic layout). */

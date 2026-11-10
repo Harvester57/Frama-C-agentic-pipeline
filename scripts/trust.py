@@ -96,6 +96,10 @@ INPUT_READERS = frozenset(
         "fscanf",
         "getenv",
         "secure_getenv",
+        # `syscall(SYS_read, ...)` and `syscall(SYS_recvfrom, ...)` as the model sees them after
+        # scripts/fc_cpp_wrapper.py's typed syscall rewrite.
+        "__fc_syscall_read",
+        "__fc_syscall_recvfrom",
     }
 )
 LIBRARY_KINDS = frozenset({"static_lib", "shared_lib"})

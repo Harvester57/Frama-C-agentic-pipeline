@@ -81,7 +81,12 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   Define `FC_STUBS_KEEP_LIBC_GETSOCKOPT` to keep the libc contract.
 - `syscall`: missing from `__fc_libc`'s `<unistd.h>`. Declared with `assigns \result \from number;`,
   the most ACSL can say about a variadic call: Eva and WP assume it writes no memory, so a buffer a
-  syscall fills (`getrandom`, `read` through `syscall`) keeps the value the caller gave it.
+  syscall fills keeps the value the caller gave it. For the numbers that write memory,
+  [`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py) rewrites a call with a constant
+  x86_64 number into a typed declaration with a real contract: `syscall(SYS_read, ...)` becomes
+  `__fc_syscall_read(...)`, likewise `recvfrom` and `getrandom`; each rewrite is logged
+  (`[fc-cpp] <file>:<line>: syscall <name> rewritten`). The wrapper only rewrites when the text
+  declares the target, so E-ACSL builds keep the real `syscall`. Other numbers keep the caveat.
 - `_IO`, `_IOR`, `_IOW`, `_IOWR` and the `_IOC_*` helpers: Linux's ioctl request encoding, which
   glibc's `<sys/ioctl.h>` provides and `__fc_libc`'s does not (a struct-type argument was a syntax
   error). Generic-layout values, as on x86_64.
