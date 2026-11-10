@@ -432,3 +432,178 @@ def test_wipe_acceptance_in_the_image(model_run, tmp_path, variant, proven):  # 
     counts = report["by_obligation_class"]["l6_wiped"]
     assert (counts["proven"], counts["unproven"]) == ((1, 0) if proven else (0, 1))
     assert (report["status"] == "all_proven") is proven
+
+
+# ---------------------------------------------------------------------------------------------------
+# Acceptance (Docker): every MetAcsl template variant, against the real MetAcsl (plan step M1)
+# ---------------------------------------------------------------------------------------------------
+
+VARIANTS_DIR = FIX / "variants"
+LOG_SINK = {"function": "log_line", "kind": "log", "params": ["msg"], "description": "Log lines."}
+LOGIN_GATE = {"function": "login", "state": "auth_ok", "protects": ["admin"], "description": "d"}
+CHECK_GATE = {"function": "check", "state": "s->ok", "protects": ["act"], "description": "d"}
+
+# variant -> (function under WP, property name, threat-model lists). Each variants/<variant>.c
+# satisfies the property; built with -DVIOLATE it violates it in the function under WP.
+TEMPLATE_VARIANTS: dict[str, tuple[str, str, dict]] = {
+    "l4_auth_required_global": ("dispatch", "L4_auth_required_login", {"auth_gates": [LOGIN_GATE]}),
+    "l4_auth_required_formal": ("serve", "L4_auth_required_check", {"auth_gates": [CHECK_GATE]}),
+    "l4_auth_state_global": ("store", "L4_auth_state_login", {"auth_gates": [LOGIN_GATE]}),
+    "l4_auth_state_formal": ("bump", "L4_auth_state_check", {"auth_gates": [CHECK_GATE]}),
+    "l5_sanitized_text": ("report", "L5_sanitized_log_line", {"output_sinks": [LOG_SINK]}),
+    "l5_sanitized_bytes": (
+        "emit",
+        "L5_sanitized_send_bytes",
+        {"output_sinks": [{"function": "send_bytes", "kind": "network", "length": "n", "description": "d"}]},
+    ),
+    "l5_sanitized_object": (
+        "emit",
+        "L5_sanitized_send_msg",
+        {"output_sinks": [{"function": "send_msg", "kind": "ipc", "description": "d"}]},
+    ),
+    "l5_sanitized_buffer": (
+        "finish",
+        "L5_sanitized_finish",
+        {"output_sinks": [{"function": "finish", "kind": "buffer", "description": "d"}]},
+    ),
+    "l6_no_leak_calling": (
+        "show",
+        "L6_no_leak_key",
+        {"secrets": [{"name": "key", "kind": "global", "description": "d"}], "output_sinks": [LOG_SINK]},
+    ),
+    "l6_no_leak_calling_static": (
+        "show",
+        "L6_no_leak_key",
+        {"secrets": [{"name": "key", "kind": "global", "description": "d"}], "output_sinks": [LOG_SINK]},
+    ),
+    "l6_no_leak_reading": (
+        "log_line",
+        "L6_no_leak_key",
+        {"secrets": [{"name": "key", "kind": "global", "description": "d"}], "output_sinks": [LOG_SINK]},
+    ),
+    "l6_no_leak_parameter": (
+        "derive",
+        "L6_no_leak_key",
+        {
+            "secrets": [{"name": "key", "kind": "parameter", "function": "derive", "size": "len", "description": "d"}],
+            "output_sinks": [{"function": "net_send", "kind": "network", "length": "n", "description": "d"}],
+        },
+    ),
+    "l6_wiped_scalar": (
+        "drop",
+        "L6_wiped_token",
+        {"secrets": [{"name": "token", "kind": "global", "function": "drop", "description": "d"}]},
+    ),
+    "l6_wiped_parameter": (
+        "burn",
+        "L6_wiped_key",
+        {"secrets": [{"name": "key", "kind": "parameter", "function": "burn", "size": "len", "description": "d"}]},
+    ),
+    "l6_wiped_field": (
+        "ctx_free",
+        "L6_wiped_secret",
+        {"secrets": [{"name": "secret", "kind": "field", "object": "ctx", "function": "ctx_free", "description": "d"}]},
+    ),
+}
+# A goal named apart from its property: the `reading` half of a global secret's no-leak property.
+GOAL_NAMES = {"l6_no_leak_reading": "L6_no_leak_read_key"}
+# Open pipeline bugs (docs/troubleshooting.md): (variant, violate) -> reason.
+OPEN_DEFECTS = {
+    ("l6_no_leak_calling_static", False): (
+        "MetAcsl's default -meta-simpl drops an instance it decides statically (a global separated from the "
+        "secret), so the satisfied program has no L6_no_leak goal and ledger.py ingest-wp never credits the unit"
+    ),
+}
+
+
+def _variant_params() -> list:
+    out = []
+    for variant in sorted(TEMPLATE_VARIANTS):
+        for violate in (False, True):
+            reason = OPEN_DEFECTS.get((variant, violate))
+            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
+            out.append(
+                pytest.param(variant, violate, marks=marks, id=f"{variant}-{'violated' if violate else 'satisfied'}")
+            )
+    return out
+
+
+_VARIANT_MAKEFILE = """CC ?= cc
+CFLAGS = -O0 -g -Wall -Wextra -std=c99 {defs}
+
+all: libprog.a
+
+prog.o: prog.c
+\t$(CC) $(CFLAGS) -c -o $@ prog.c
+
+libprog.a: prog.o
+\tar rcs $@ prog.o
+"""
+
+
+def _variant_target(dest: Path, variant: str, violate: bool) -> Path:
+    """A one-file target: variants/<variant>.c as prog.c, its Makefile and THREAT_MODEL.md."""
+    dest.mkdir(parents=True)
+    shutil.copy(VARIANTS_DIR / f"{variant}.c", dest / "prog.c")
+    defs = "-DVIOLATE" if violate else ""
+    (dest / "Makefile").write_text(_VARIANT_MAKEFILE.format(defs=defs), encoding="utf-8", newline="\n")
+    block: dict = {"schema_version": 1, "target": variant, "input_sources": [], "trusted_callers": []}
+    block.update({"secrets": [], "auth_gates": [], "output_sinks": []})
+    block.update(TEMPLATE_VARIANTS[variant][2])
+    text = f"# Threat model: {variant}\n\n```json framac-threat-model\n{json.dumps(block, indent=1)}\n```\n"
+    (dest / "THREAT_MODEL.md").write_text(text, encoding="utf-8", newline="\n")
+    return dest
+
+
+@pytest.mark.unit
+def test_every_template_variant_has_a_program_and_its_property(tmp_path):
+    assert sorted(p.stem for p in VARIANTS_DIR.glob("*.c")) == sorted(TEMPLATE_VARIANTS)
+    for variant, (_, name, _) in TEMPLATE_VARIANTS.items():
+        threat_model = trust.load_threat_model(_variant_target(tmp_path / variant, variant, False) / "THREAT_MODEL.md")
+        assert threat_model["status"] == "ok", (variant, threat_model)
+        assert any(name.startswith(prefix) for prefix in sp.NAME_PREFIX.values()), name
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize(("variant", "violate"), _variant_params())
+def test_template_variant_acceptance_in_the_image(model_run, tmp_path, variant, violate):  # noqa: F811
+    """
+    The named goal of each template variant proves on a program that satisfies the property and stays
+    unproven on one that violates it: MetAcsl accepts the template and it is not trivially true.
+    """
+    function, name, _ = TEMPLATE_VARIANTS[variant]
+    target = _variant_target(tmp_path / "target", variant, violate)
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    assert not sp.validate(doc)
+    props = by_name(doc)
+    assert name in props, doc["warnings"]
+    assert f"prog.c#{function}" in props[name]["instances"], props[name]
+    write_json(run / "workspace/reports/security_props.json", doc)
+    defs = " -DVIOLATE" if violate else ""
+    cmd = [
+        "docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+        "-v", f"{target.resolve()}:/target:ro", "-v", f"{run.resolve()}:/framac-run", "-w", "/framac-run",
+        "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+        "-v", f"{ROOT / 'schemas'}:/opt/framac-pipeline/schemas:ro",
+        ANALYSIS_IMAGE, "-c",
+        f"python3 /opt/framac-pipeline/scripts/run_wp_function.py --file /target/prog.c --function {function} "
+        f"--out-dir workspace/wp '--cppflags=-I/target{defs}' --timeout 10 --out-json workspace/reports/wp/out.json",
+    ]  # fmt: skip
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    report = json.loads((run / "workspace/reports/wp/out.json").read_text(encoding="utf-8"))
+    assert name in report["security_props"]["properties"]
+    mine = f"{GOAL_NAMES.get(variant, name)}:"
+    proven = [g for g in report["layer_goals"] if str(g.get("annotation") or "").startswith(mine)]
+    unproven = [g for g in report["unproven_goals"] if str(g.get("annotation") or "").startswith(mine)]
+    detail = json.dumps({"proven": proven, "unproven": unproven, "log": report.get("wp_log_tail")}, indent=1)
+    if violate:
+        assert unproven, detail
+    else:
+        assert proven and not unproven, detail
