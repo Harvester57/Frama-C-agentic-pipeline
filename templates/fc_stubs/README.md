@@ -81,11 +81,26 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   Define `FC_STUBS_KEEP_LIBC_GETSOCKOPT` to keep the libc contract.
 - `syscall`: missing from `__fc_libc`'s `<unistd.h>`. Declared with `assigns \result \from number;`,
   the most ACSL can say about a variadic call: Eva and WP assume it writes no memory, so a buffer a
-  syscall fills (`getrandom`, `read` through `syscall`) keeps the value the caller gave it.
+  syscall fills keeps the value the caller gave it. For the numbers that write memory,
+  [`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py) rewrites a call with a constant
+  x86_64 number into a typed declaration with a real contract: `syscall(SYS_read, ...)` becomes
+  `__fc_syscall_read(...)`, likewise `recvfrom` and `getrandom`; each rewrite is logged
+  (`[fc-cpp] <file>:<line>: syscall <name> rewritten`). The wrapper only rewrites when the text
+  declares the target, so E-ACSL builds keep the real `syscall`. Other numbers keep the caveat.
 - `_IO`, `_IOR`, `_IOW`, `_IOWR` and the `_IOC_*` helpers: Linux's ioctl request encoding, which
   glibc's `<sys/ioctl.h>` provides and `__fc_libc`'s does not (a struct-type argument was a syntax
   error). Generic-layout values, as on x86_64.
-- Both sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+- `explicit_bzero` and `memset_s`: missing from `__fc_libc`. Their postconditions state every
+  written element (through `char` and `unsigned char`), so an L6 wipe through them proves without a
+  loop: under WP Typed for a `char` array, under `Typed+cast` only for an `unsigned char` array.
+  `FC_STUBS_NO_WIPE_DECLS` drops both declarations for a target that defines its own.
+- All of these sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+- The header assumes x86_64 LP64 (ioctl encoding, syscall numbers, `long` literals) and says so
+  with a `_Static_assert` on `sizeof(long)` and `sizeof(void *)`: another machdep stops at parse time.
+- **What to add next:** [`../../scripts/libc_gap_report.py`](../../scripts/libc_gap_report.py) lists, over
+  the Phase 0 models of one or more runs, the external functions called that neither `__fc_libc` nor
+  these stubs give a contract with `assigns` (run it in the analysis image, where it finds the libc
+  through `frama-c -print-share-path`). Gaps come first, most-called first.
 - `offsetof` is never redefined here. [`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py)
   repairs, in the preprocessed text, `offsetof` with a non-constant index and the null-pointer offset
   idiom `(size_t)&((T *)0)->m` (gperf tables), so `-warn-invalid-pointer` stays on.

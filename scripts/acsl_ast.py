@@ -2024,11 +2024,12 @@ _SHAPE_BUILTINS = (
 )
 # Predicates of templates/acsl/acsl_vocabulary.h that state shape only (validity of a range, with
 # the `len >= 0` / `len == 0` guards that come with it). The others (is_printable_ascii,
-# no_crlf_or_nul, buffer_is_zeroed, c_strlen) constrain byte values.
+# no_crlf_or_nul, no_crlf_string, buffer_is_zeroed) constrain byte values.
 SHAPE_VOCABULARY_PREDICATES = frozenset({"valid_read_buffer", "valid_write_buffer"})
-# valid_c_string(s) also says that s holds a NUL: a recorded environment fact only when the harness
-# NUL-terminates the input (entry_style c_string / argv, or null_terminate).
-_NUL_TERMINATION_PREDICATES = frozenset({"valid_c_string"})
+# valid_read_string(s) (canonical, plan step S8) and its old alias valid_c_string(s) also say that s
+# holds a NUL: a recorded environment fact only when the harness NUL-terminates the input
+# (entry_style c_string / argv, or null_terminate).
+_NUL_TERMINATION_PREDICATES = frozenset({"valid_read_string", "valid_c_string"})
 _SHAPE_CALL_RE = re.compile(
     r"\\(?:" + "|".join(_SHAPE_BUILTINS) + r")\b(?:\{[^}]*\})?\s*\(|\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{[^}]*\})?\s*\("
 )
@@ -2259,7 +2260,7 @@ def entry_requires_violations(
 
     Lexical and conservative: what it cannot classify as shape is flagged. Implication antecedents
     only guard and are not checked; a disjunction violates only if each disjunct does.
-    `nul_terminated`: the harness NUL-terminates the input, so `valid_c_string` is shape here.
+    `nul_terminated`: the harness NUL-terminates the input, so `valid_read_string` (or `valid_c_string`) is shape here.
     """
     attackers = frozenset(p for p in attacker_params if p)
     if not attackers:

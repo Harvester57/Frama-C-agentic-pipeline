@@ -1261,11 +1261,11 @@ def test_compat_types_abs_preconditions_and_dual_oracle_cstring_predicates():
     assert "long int labs(long int j);" in content
     assert "long long int llabs(long long int j);" in content
 
-    # Item 4: concrete dual-oracle C-string predicates under __FRAMAC__
+    # Item 4: executable C-string predicates under __FRAMAC_EACSL__, with libc's names and semantics (S8)
     assert "predicate valid_read_nstring(char *s, integer n)" in content
     assert "predicate valid_read_string(char *s)" in content
     assert "predicate valid_string(char *s)" in content
-    assert "\\exists integer i; 0 <= i <= n" in content
+    assert "\\exists integer i; 0 <= i <= 65536" in content
 
 
 def test_harness_dual_template_resets_sound_verdict():

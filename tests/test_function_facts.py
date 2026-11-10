@@ -808,7 +808,7 @@ def test_strict_rules_survive_for_the_plainest_function() -> None:
 @pytest.mark.parametrize(
     ("feature", "needle"),
     [
-        ("strings", "Concrete Dual-Oracle C-String Predicates"),
+        ("strings", "One String Vocabulary"),
         ("floats", "Floating-point comparisons"),
         ("unions", "Struct / union equality"),
         ("structs", "Padded-struct / union"),

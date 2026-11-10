@@ -23,6 +23,12 @@
 
 #if defined(__FRAMAC__)
 
+/* Machdep (plan step S9). The ioctl encoding, the x86_64 numbers of the typed syscall rewrites and the
+ * `long` literals of the abs/labs contracts below assume x86_64 LP64. Another machdep stops here, at
+ * parse time, instead of giving results computed on the wrong sizes. */
+_Static_assert(sizeof(long) == 8 && sizeof(void *) == 8,
+               "fc_compat_types.h assumes an LP64 machdep (x86_64): run Frama-C with -machdep x86_64");
+
 /* `offsetof` stays the libc's `__builtin_offsetof`, which the kernel folds to a constant. A
  * non-constant array index (`offsetof(T, m[i])`) is repaired in the preprocessed output by
  * scripts/fc_cpp_wrapper.py. Never redefine `offsetof` here: the null-pointer form
@@ -77,6 +83,111 @@ long long int llabs(long long int j);
  * Eva and WP assume a syscall writes no memory; buffers it fills stay as the caller left them. */
 /*@ assigns \result \from number; */
 long syscall(long number, ...);
+
+/* Typed syscalls (plan step S6). scripts/fc_cpp_wrapper.py rewrites `syscall(<x86_64 number>, ...)` into
+ * `__fc_syscall_<name>(...)` for the numbers below, which write memory, when this branch declares them.
+ * Arguments as the kernel takes them; pointers are `void *` so any argument type converts as it does for
+ * `syscall` (except `addrlen`, a socklen_t). The result is that of glibc's `syscall()`: -1 on error (errno is not modelled).
+ * The unnamed postconditions hold on every call and are what WP uses: the first \result bytes are
+ * initialized. Eva does not treat an `assigns` range as initialized and does not reduce that range on a
+ * later test of the count, so, as in __fc_libc's read(), Frama_C_entropy_source splits a full transfer
+ * (\result is the length) from a short one or an error; WP learns nothing from that volatile split.
+ * No <sys/socket.h> here: the getsockopt block below must be the first to include it. No `\old` in an
+ * `assigns`: WP 35 with -wp-check-memory-model crashed on `\old(*(unsigned int *)addrlen)` there
+ * (Wp__NormAtLabels.LabelError). */
+#include "__fc_builtin.h"
+
+/* read(2), x86_64 number 0. */
+/*@ requires buf_has_room: \valid((char *)buf + (0 .. count - 1));
+  @ assigns \result, ((char *)buf)[0 .. count - 1]
+  @   \from indirect:fd, indirect:count, indirect:Frama_C_entropy_source;
+  @ ensures result_error_or_read_length: -1 <= \result <= count;
+  @ ensures initialization: \initialized((char *)buf + (0 .. \result - 1));
+  @ behavior full_read:
+  @   assumes nondet_full: Frama_C_entropy_source != 0 && count <= 9223372036854775807;
+  @   ensures result_full: \result == count;
+  @ behavior partial_or_error:
+  @   assumes nondet_partial: !(Frama_C_entropy_source != 0 && count <= 9223372036854775807);
+  @   ensures result_short: \result < count;
+  @ complete behaviors;
+  @ disjoint behaviors;
+  @*/
+long __fc_syscall_read(int fd, void *buf, size_t count);
+
+/* recvfrom(2), x86_64 number 45. `addrlen` is a socklen_t, `unsigned int` on Linux. */
+/*@ requires valid_buffer_length: \valid((char *)buf + (0 .. len - 1));
+  @ requires valid_addrbuf_or_null:
+  @   src_addr == \null
+  @   || (\valid(addrlen) && \initialized(addrlen)
+  @       && \valid((char *)src_addr + (0 .. *addrlen - 1)));
+  @ assigns \result, ((char *)buf)[0 .. len - 1]
+  @   \from indirect:sockfd, indirect:len, indirect:flags, indirect:Frama_C_entropy_source;
+  @ assigns *addrlen \from indirect:sockfd, indirect:src_addr;
+  @ assigns ((char *)src_addr)[0 .. *addrlen - 1] \from indirect:sockfd;
+  @ ensures result_error_or_received_length: -1 <= \result <= len;
+  @ ensures initialization:buf: \initialized((char *)buf + (0 .. \result - 1));
+  @ ensures initialization:addrbuf:
+  @   src_addr != \null ==> \initialized((char *)src_addr + (0 .. \old(*addrlen) - 1));
+  @ behavior full_receive:
+  @   assumes nondet_full: Frama_C_entropy_source != 0 && len <= 9223372036854775807;
+  @   ensures result_full: \result == len;
+  @ behavior partial_or_error:
+  @   assumes nondet_partial: !(Frama_C_entropy_source != 0 && len <= 9223372036854775807);
+  @   ensures result_short: \result < len;
+  @ complete behaviors;
+  @ disjoint behaviors;
+  @*/
+long __fc_syscall_recvfrom(int sockfd, void *buf, size_t len, int flags, void *src_addr, unsigned int *addrlen);
+
+/* getrandom(2), x86_64 number 318. Up to 256 bytes on an initialized pool fill the buffer, but a blocked call
+ * can still fail (EINTR, EAGAIN with GRND_NONBLOCK, ENOSYS): the error branch stays reachable. */
+/*@ requires valid_buf: \valid((char *)buf + (0 .. buflen - 1));
+  @ assigns \result, ((char *)buf)[0 .. buflen - 1]
+  @   \from indirect:buflen, indirect:flags, indirect:Frama_C_entropy_source;
+  @ ensures result_error_or_length: -1 <= \result <= buflen;
+  @ ensures initialization: \initialized((char *)buf + (0 .. \result - 1));
+  @ behavior full:
+  @   assumes nondet_full: Frama_C_entropy_source != 0 && buflen <= 9223372036854775807;
+  @   ensures result_full: \result == buflen;
+  @ behavior partial_or_error:
+  @   assumes nondet_partial: !(Frama_C_entropy_source != 0 && buflen <= 9223372036854775807);
+  @   ensures result_short: \result < buflen;
+  @ complete behaviors;
+  @ disjoint behaviors;
+  @*/
+long __fc_syscall_getrandom(void *buf, size_t buflen, unsigned int flags);
+
+/* Wipes (plan step M6): explicit_bzero (glibc <string.h> since 2.25, the BSDs) and memset_s (C11 Annex K),
+ * which __fc_libc lacks. The postconditions state the written range element by element, so a wipe
+ * through them proves an L6 "wiped" property without a loop. Twice: through `char`, which WP Typed proves
+ * for a `char` buffer (Typed reads `void *` as `char *`), and through `unsigned char`, which proves an
+ * `unsigned char` / `uint8_t` buffer only under Typed+cast (Typed rejects the buffer's conversion to
+ * `void *` at the call). `\subset` is the form Eva reduces. A target that defines its own explicit_bzero
+ * or memset_s gets these contracts on its definition; define FC_STUBS_NO_WIPE_DECLS to drop them. */
+#ifndef FC_STUBS_NO_WIPE_DECLS
+/*@ requires valid_s: \valid((char *)s + (0 .. n - 1));
+  @ assigns ((char *)s)[0 .. n - 1] \from \nothing;
+  @ ensures zeroed: \forall integer k; 0 <= k < n ==> ((char *)s)[k] == 0;
+  @ ensures zeroed_bytes: \forall integer k; 0 <= k < n ==> ((unsigned char *)s)[k] == 0;
+  @ ensures zeroed_values: \subset(((char *)s)[0 .. n - 1], {0});
+  @ ensures initialization: \initialized((char *)s + (0 .. n - 1));
+  @*/
+void explicit_bzero(void *s, size_t n);
+
+/* errno_t and rsize_t are `int` and `size_t` (Annex K); the call sets min(n, smax) bytes and fails when
+ * n > smax. */
+/*@ requires valid_s: \valid((char *)s + (0 .. smax - 1));
+  @ assigns ((char *)s)[0 .. (n <= smax ? n : smax) - 1] \from c, indirect:n, indirect:smax;
+  @ assigns \result \from indirect:n, indirect:smax;
+  @ ensures set: \forall integer k; 0 <= k < (n <= smax ? n : smax) ==> ((char *)s)[k] == (char)c;
+  @ ensures set_bytes:
+  @   \forall integer k; 0 <= k < (n <= smax ? n : smax) ==> ((unsigned char *)s)[k] == (unsigned char)c;
+  @ ensures set_values: \subset(((char *)s)[0 .. (n <= smax ? n : smax) - 1], {(char)c});
+  @ ensures initialization: \initialized((char *)s + (0 .. (n <= smax ? n : smax) - 1));
+  @ ensures result: n <= smax ? \result == 0 : \result != 0;
+  @*/
+int memset_s(void *s, size_t smax, int c, size_t n);
+#endif /* FC_STUBS_NO_WIPE_DECLS */
 
 /* Linux <asm-generic/ioctl.h>: the ioctl request encoding (`_IOWR(magic, nr, struct foo)`), which
  * glibc's <sys/ioctl.h> provides and __fc_libc's does not. Without it the struct-type argument is a
@@ -169,40 +280,41 @@ extern int getsockopt(int sockfd, int level, int optname, void *optval, socklen_
 #endif /* __FRAMAC_EACSL__ */
 
 /*
- * Concrete Dual-Oracle C-String Predicates (E-ACSL host-header mode only)
+ * The string vocabulary (plan step S8). One name per notion, the names of __fc_libc's
+ * __fc_string_axiomatic.h, which Eva and WP read (templates/acsl/acsl_vocabulary.h lists them):
  *
- * Standard Frama-C libc axiomatics (\\strlen, valid_read_string) do not survive
- * E-ACSL -no-frama-c-stdlib builds because host libc lacks E-ACSL models for
- * uninterpreted logic functions. These bounded predicates use explicit integer
- * quantifiers executable under both WP first-order proving and E-ACSL dynamic
- * instrumentation.
+ *   valid_read_string(s)      s is readable up to and including its first NUL
+ *   valid_string(s)           the same, writable
+ *   valid_read_nstring(s, n)  n readable, initialized bytes, or a readable string (strnlen's domain)
+ *   valid_string_or_null(s)   s == \null || valid_string(s)
+ *   strlen(s)                 the length (a logic function, no backslash; `\strlen` does not exist)
  *
- * They must NOT be defined in the Eva/WP (-nostdinc, __fc_libc) configuration:
- * there __fc_string_axiomatic.h already declares valid_string,
- * valid_read_string, valid_read_nstring and valid_nstring, and a second
- * declaration aborts the kernel under annot-error=abort.
+ * E-ACSL builds use the host's headers (-no-frama-c-stdlib), which do not define them, so this block
+ * defines the same names with executable bodies. Differences an E-ACSL run can show:
+ *   - valid_read_string and valid_string look for the NUL within 65536 bytes: a longer string fails;
+ *   - on a buffer that is not a string they abort with an E-ACSL RTE inside the predicate
+ *     (`\valid_read(s + i)`, E-ACSL checks the read before the validity guard next to it) rather than
+ *     with the precondition: still a failure, reported at the predicate's line;
+ *   - strlen is recursive: on a buffer that is not a string it aborts the same way.
+ * These definitions must NOT reach the Eva/WP (__fc_libc) parse: a second definition of a libc
+ * predicate aborts the kernel under annot-error=abort.
  */
 
 #if defined(__FRAMAC_EACSL__)
 
 /*@
-  @ predicate valid_read_nstring(char *s, integer n) =
-  @   0 <= n &&
-  @   \exists integer i; 0 <= i <= n &&
-  @     \valid_read(s + (0 .. i)) &&
-  @     s[i] == '\0';
+  @ logic integer strlen(char *s) = s[0] == '\0' ? 0 : 1 + strlen(s + 1);
   @
   @ predicate valid_read_string(char *s) =
-  @   valid_read_nstring(s, 65536);
-  @
-  @ predicate valid_nstring(char *s, integer n) =
-  @   0 <= n &&
-  @   \exists integer i; 0 <= i <= n &&
-  @     \valid(s + (0 .. i)) &&
-  @     s[i] == '\0';
+  @   \exists integer i; 0 <= i <= 65536 && \valid_read(s + (0 .. i)) && s[i] == '\0';
   @
   @ predicate valid_string(char *s) =
-  @   valid_nstring(s, 65536);
+  @   \exists integer i; 0 <= i <= 65536 && \valid(s + (0 .. i)) && s[i] == '\0';
+  @
+  @ predicate valid_read_nstring(char *s, integer n) =
+  @   (\valid_read(s + (0 .. n - 1)) && \initialized(s + (0 .. n - 1))) || valid_read_string(s);
+  @
+  @ predicate valid_string_or_null(char *s) = s == \null || valid_string(s);
   @*/
 
 #endif /* __FRAMAC_EACSL__ */
