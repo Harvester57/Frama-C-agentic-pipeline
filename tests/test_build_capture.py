@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -467,7 +468,7 @@ def test_report_schema_accepts_the_three_statuses():
 
 def elf_head(bits: int, machine: int, big: bool = False) -> bytes:
     """The first 20 bytes of an ELF file: class, data encoding, e_type (relocatable) and e_machine."""
-    order = "big" if big else "little"
+    order: Literal["big", "little"] = "big" if big else "little"
     ident = b"\x7fELF" + bytes([1 if bits == 32 else 2, 2 if big else 1, 1, 0]) + b"\0" * 8
     return ident + (1).to_bytes(2, order) + machine.to_bytes(2, order)
 
