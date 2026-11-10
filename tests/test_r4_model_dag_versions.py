@@ -195,6 +195,7 @@ def _v2_model() -> dict:
         kernel_names={"liba.a": "grow"},
         formals=[{"name": "p", "kind": "pointer"}, {"name": "n", "kind": "value"}],
         writes={"pointer": 1, "params": ["p"], "globals": []},
+        call_sites=[{"callee": "memcpy", "line": 3, "literals": {}}],
         trust={"value": "untrusted", "source": "default", "sources": ["default"], "boundary": True, "reasons": []},
     )
     return model
@@ -216,16 +217,17 @@ def test_model_features_read_a_version_1_model_by_its_fields():
         "trust",
         "kernel_names",
         "param_sizes",
+        "call_sites",
     ]
     old = _v1_model()
     old["functions"]["src/a.c#grow"].update(
         external_calls=[], kernel_names={}, param_sizes={"0": {"min": 1, "max": 1, "sites": 1}}
     )
     old["trust"] = {"threat_model": {"status": "no_threat_model"}}
-    assert pm.missing_features(old) == ["formals", "writes"]
+    assert pm.missing_features(old) == ["formals", "writes", "call_sites"]
     # A GCC-fallback function never has formals or writes: it does not count for them.
     old["functions"]["src/b.c#gcc"] = _model_fn("src/b.c", "gcc", source="gcc-callgraph-info", formals=[])
-    assert pm.missing_features(old) == ["formals", "writes"]
+    assert pm.missing_features(old) == ["formals", "writes", "call_sites"]
 
 
 def test_model_features_of_a_version_2_model_and_of_no_model():

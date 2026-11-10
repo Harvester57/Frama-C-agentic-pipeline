@@ -5,6 +5,11 @@
  * explicit_bzero or a volatile write in the code.
  *   array   `count` elements: the threat model's `size`, else sizeof(x) / sizeof(x[0])
  *   scalar  a global scalar
+ *   local   a secret held in a local array (plan step M6): a postcondition cannot name a local,
+ *           so security_props.py writes this `check` into the work tree before each `return` in
+ *           the local's scope and before the closing brace of its block. WP proves it with the
+ *           function; E-ACSL executes it without stopping the run (a `check` does not abort).
+ *   local_array  its predicate: `count` is the threat model's `size`, else sizeof(x) / sizeof(x[0])
  */
 //# property
 /*@ meta \prop, \name(${name}), \targets({${function}}), \context(\postcond),
@@ -14,3 +19,7 @@
 \fguard(\forall integer i; 0 <= i < ${count} ==> ${lv}[i] == 0)
 //# scalar
 \fguard(${lv} == 0)
+//# local
+/*@ check ${name}: ${predicate}; */
+//# local_array
+\forall integer i; 0 <= i < ${count} ==> ${lv}[i] == 0

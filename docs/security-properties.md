@@ -14,7 +14,7 @@ This pipeline extends Frama-C verification across **six distinct security layers
 | **2** | **Availability & Anti-DoS** (Guaranteed loop & recursion termination; no zero-advance TLV loops) | CWE-835, CWE-674 | `loop variant`, `decreases` | Built-in (`/framac-wp`) |
 | **3** | **Memory Isolation** (every function writing through a pointer has a proven frame) | CWE-471, CWE-668 | `assigns`, `loop assigns`, `\separated` | `scripts/security_props.py` (class `l3_frame`) |
 | **4** | **Authentication gates** (only the gate writes the auth state; privileged functions require it) | CWE-287, CWE-285, CWE-306 | MetAcsl `\writing` and `\precond` meta-properties | threat model `auth_gates`, [`templates/metacsl/l4_*.acsl`](../templates/metacsl/) |
-| **5** | **Output sanitization** (no CR/LF reaches a log or terminal sink; no uninitialized byte reaches any sink) | CWE-93, CWE-117, CWE-457, CWE-200 | MetAcsl `\calling` (writers) or `\postcond` (buffer sinks) | threat model `output_sinks`, [`templates/metacsl/l5_sanitized.acsl`](../templates/metacsl/l5_sanitized.acsl) |
+| **5** | **Output sanitization** (no CR/LF reaches a log or terminal sink; a format argument is a string literal; no uninitialized byte reaches any sink) | CWE-93, CWE-117, CWE-134, CWE-457, CWE-200 | MetAcsl `\calling` (writers) or `\postcond` (buffer sinks) | threat model `output_sinks`, [`templates/metacsl/l5_sanitized.acsl`](../templates/metacsl/l5_sanitized.acsl) |
 | **6** | **Secrets** (wiped when released; never handed to or read by an output sink) | CWE-226, CWE-532, CWE-200 | MetAcsl `\postcond`, `\calling` and `\reading` | threat model `secrets`, [`templates/metacsl/l6_*.acsl`](../templates/metacsl/) |
 
 Layers 3 to 6 come from what the structured threat model (the `framac-threat-model` block of `THREAT_MODEL.md`, `schemas/threat_model.schema.json`) requires, not from patterns in the code (plan step I9). The old per-function pattern matching and its ACSL templates for Layers 4 to 6 are gone.
@@ -27,7 +27,7 @@ How it runs:
 
 Without a threat model only Layer 3 is generated.
 
-A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind`, `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`; `output_sinks` `function`, `kind`, `params`, `length`):
+A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`, `success`; `output_sinks` `function`, `kind`, `params`, `length`, `format`):
 
 ````markdown
 ```json framac-threat-model
@@ -37,8 +37,8 @@ A threat model block looks like this (fields per kind: `input_sources` `function
   "input_sources": [{"function": "parse_packet", "role": "entry", "description": "Bytes from the network."}],
   "trusted_callers": [],
   "secrets": [{"name": "session_key", "kind": "global", "function": "session_close", "description": "Session key."}],
-  "auth_gates": [{"function": "login", "state": "auth_ok", "protects": ["admin"], "description": "Password check."}],
-  "output_sinks": [{"function": "syslog", "kind": "log", "description": "System log."}]
+  "auth_gates": [{"function": "login", "state": "auth_ok", "protects": ["admin"], "success": "0", "description": "Password check."}],
+  "output_sinks": [{"function": "syslog", "kind": "log", "params": ["param1"], "format": "param1", "description": "System log."}]
 }
 ```
 ````
@@ -90,11 +90,24 @@ An auth gate `{"function": "login", "state": "auth_ok", "protects": ["admin"]}` 
 
 MetAcsl puts an assertion before every write of every other function (a write of `auth_ok` outside the gate becomes `\false`), and a `requires` on `admin` that WP proves at each call site. A state that hangs off a parameter (`ctx->authed`) is checked in the functions that have that parameter.
 
+Neither property stops the gate itself from setting the state on a failed check. With the gate's `success` value (`"success": "0"`, a C constant expression, plan step M7), a third property, `L4_auth_state_login_on_failure`, says that any other result leaves the state as it was on entry. MetAcsl's `\postcond` context cannot name `\result`, so `security_props.py run` writes it into the work tree, on the same line, before each `return` of the gate, with the returned expression in place of the result:
+
+```c
+if (pw != 42)
+    /*@ check L4_auth_state_login_on_failure: (-1) != (0) ==> auth_ok == \at(auth_ok, Pre); */ return -1;
+```
+
+WP proves it with the gate (unit `l4_auth_state` of the gate, which the other two properties never name); E-ACSL executes it as a non-blocking `check`. A `return` whose expression the check cannot repeat (a call, an assignment) or a `return;` is skipped and listed in the warnings: store the result in a local first.
+
 ---
 
 ## Layer 5: Output Sanitization
 
-An output sink is checked where data reaches it. For a `log` or `terminal` sink, each text parameter must hold no CR or LF before its terminating NUL (`L5_no_crlf`, log injection); for the other kinds, every byte handed over must be initialized (with the sink's `length` parameter, else the object pointed to). These are `\calling` properties, so they also hold for a sink the target only declares (`syslog`, `send`). A `buffer` sink (the output is returned in an out-parameter, like `QCBOREncode_Finish`) gets a postcondition: its out-parameters are initialized when it returns.
+An output sink is checked where data reaches it. For a `log` or `terminal` sink, each text parameter must hold no CR or LF before its terminating NUL (`no_crlf_string`, log injection); for the other kinds, every byte handed over must be initialized (with the sink's `length` parameter, else the object pointed to). These are `\calling` properties, so they also hold for a sink the target only declares (`syslog`, `send`). A caller that hands a text sink string literals only gets no goal: the provers do not discharge `no_crlf_string` on a literal, so `security_props.py` decides it from the model, which records the literal each call passes (`call_sites`): satisfied when no literal holds CR or LF before its NUL, else violated. The property lists it under `decided`, and the ledger seed records the verdict (a `covered` unit with evidence of phase `static`, or a `blocked` one). A `buffer` sink (the output is returned in an out-parameter, like `QCBOREncode_Finish`) gets a postcondition: its out-parameters are initialized when it returns.
+
+A sink with a `format` parameter (`{"function": "syslog", "kind": "log", "format": "param1", ...}`, CWE-134; Frama-C's libc declares `syslog(int, const char *, ...)` without parameter names, so the kernel calls them `param0`, `param1`, ...: name a parameter of such a prototype by its 0-based position, here and in `params`) gets `L5_sanitized_format_<sink>`: the argument there is a string literal at every call. It is decided from the model like the literals above, never by WP: a caller whose every call passes a literal format is `satisfied`, one with any other format is `violated` (the ledger seed blocks its `l5_sanitized` unit). A caller that is a format sink of the threat model itself forwards its own format, so its callers are checked instead; declare such wrappers. A model without call sites decides nothing and says so in a warning.
+
+The properties name the canonical vocabulary of `templates/acsl/acsl_vocabulary.h` (plan step S8) and define no predicate of their own: `no_crlf_string(s)` (a NUL-terminated string, bounded by `strlen`) and, for a length-bounded buffer, `no_crlf_or_nul(buf, len)`. The meta file does not include the vocabulary header, so its preamble takes `strlen` from `__fc_string_axiomatic.h` and repeats `no_crlf_string` with the vocabulary's exact text (Frama-C merges identical definitions; `test_preamble_repeats_the_vocabulary_text` keeps the two equal). The MetAcsl properties only reach WP; E-ACSL can execute `no_crlf_string` through `strlen` where a contract names it.
 
 Output grammars specific to a format (RFC 5424 structured-data escaping, delimiter breakout) are not generated: a prover adds them as named `L5_*` clauses where the threat model calls for them.
 
@@ -105,9 +118,16 @@ Output grammars specific to a format (RFC 5424 structured-data escaping, delimit
 A secret `{"name": "session_key", "kind": "global", "function": "session_close"}` becomes:
 
 1. **`L6_wiped_session_key`:** a postcondition of the release function: every element is zero when it returns, on every path (`size` sets the element count of a pointer secret; arrays default to `sizeof`). WP proves a wipe written as a loop with invariants; a `memset` of an `unsigned char` array does not prove under WP's Typed model. `explicit_bzero` and `memset_s` carry contracts in `templates/fc_stubs/fc_compat_types.h` whose postconditions state every zeroed element: a wipe through them proves under Typed for a `char` array, and for an `unsigned char` or `uint8_t` array only under `Typed+cast`, which the pipeline does not credit (Typed rejects the array's conversion to `void *`). WP also cannot see a wipe the compiler drops as a dead store, so the production code should use `explicit_bzero` or a volatile write.
+
+   A secret held in a local array (`{"name": "buf", "kind": "local", "function": "derive", "size": "16"}`; `size` defaults to `sizeof` of the array, a pointer local needs it) cannot be named by a postcondition. `security_props.py run` writes `/*@ check L6_wiped_buf: \forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0; */` into the work tree, on the same line, before each `return` in the local's scope (from its declaration, the first use of the name in the body, to the end of its block) and before that block's closing brace. The property has a `code` field and no meta-file text; `security_props.json` lists the placed checks under `code_checks`, and a re-run rewrites them. WP proves the check with the function (unit `l6_wiped` of the owning function). E-ACSL executes it as a `check`: a failure is printed and the run goes on, so a fuzz campaign is not stopped by it. A local secret gets no no-leak property.
 2. **`L6_no_leak_session_key`:** at every call of an output sink, no argument points into the secret (`\calling`), and a sink the target defines never reads it (`\reading`).
 
-The no-leak check sees direct flows only. A copy of the secret into a buffer that later reaches a sink needs Eva's taint domain (`-eva-domains taint`, `//@ taint ...;` at the source and `//@ assert !\tainted(...);` at the sink, or the upstream `__fc_private` / `security_status` idiom vendored in `docs/upstream/sources/`), which the pipeline does not generate.
+The no-leak check sees direct flows only. A copy of the secret into a buffer that later reaches a sink is Eva's taint domain's job. `security_props.py run --eva-taint` (opt-in; the choice is kept in `security_props.json`, so the Makefile's plain `security-props` run keeps it, and `--no-eva-taint` removes the annotations again) writes, from each no-leak property's `taint` plan, ACSL comments into the work tree on the lines they belong to (no line number moves):
+
+- `/*@ taint <secret>; */` where the secret gets its value: at the entry of the function holding a parameter or field secret; for a global one, before each `return` (and the closing brace) of the functions that write it directly or call a libc memory writer.
+- `/*@ assert L6_no_leak_<secret>: eva_taint: !\tainted(<region>); */` before each sink call in the property's calling instances: the pointed-to region (`[0 .. length - 1]` with the sink's `length` parameter, else the first byte). The second name, `eva_taint`, lets a WP run leave the check out. A call the assertion cannot precede (inside a condition or an expression) or whose argument it cannot repeat (a call, an assignment) is listed under `eva_taint.skipped`.
+
+It sets `eva_taint` in `params.json` (`EVA_TAINT_<mod>`, `taint` added to Eva's domains) for every harness module whose sources hold an annotated file; run before the harnesses exist, it says so (`eva_taint.pending`), and the `seed` target's run sets it. `ledger.py ingest-eva` files each check's status under the function's `l6_no_leak` unit, never its `rte` unit: Unknown or Invalid blocks the unit and `ingest-wp` does not credit it until a later Eva run of that module leaves the check Valid. E-ACSL does not execute `\tainted` (it ignores the assertion), so Phase 1 checks nothing here.
 
 ---
 
@@ -115,6 +135,8 @@ The no-leak check sees direct flows only. A copy of the secret into a buffer tha
 
 - **Pipeline integration:** `security_props.py run` is a `/framac-slice` step. The generated Makefile runs it as the `security-props` target, which `seed` depends on, and `benchmark.py` and `benchmark_seeded.py` run it as the `security_props` stage before the ledger seed.
 - **L3 over-approximation:** a call to a libc memory writer counts as a pointer write even when its destination is local.
-- **L5 on string literals:** `L5_no_crlf` on a literal argument does not prove, even with Alt-Ergo, Z3 and CVC5 at 10 s.
+- **L5 on string literals:** `no_crlf_string` on a literal argument does not prove (checked again after S8), even with Alt-Ergo, Z3 and CVC5 at 10 s. A caller passing literals only is decided from the model instead; one that passes a sink both literals and other text keeps a goal its literal calls cannot discharge, and a pointer into a literal (`"abc" + 1`) counts as other text.
+- **Instances MetAcsl decides statically:** MetAcsl drops an instance it simplifies to true (a literal or another global separated from the secret), leaving no goal. `ledger.py ingest-wp` credits such a unit when the WP run loaded every property it names and ended `all_proven`.
 - **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop with invariants does. `explicit_bzero` and `memset_s` prove for a `char` array only; an `unsigned char` or `uint8_t` array through them needs `Typed+cast`.
-- **Returned secrets:** a secret of kind `return` gives a warning and no property.
+- **Returned secrets:** a secret of kind `return` gives a warning and no property; `REPORT.md` lists it under "Threat-model items without a property". Declare where the caller keeps the returned value instead (a global, a field, or a `local` of the caller).
+- **Taint checks (`--eva-taint`):** off by default until `run_wp_function.py` leaves the `eva_taint` assertions out of WP (`-wp-prop=-eva_taint`): WP cannot prove `\tainted`, so a WP run on an annotated function reports them unproven. A check sits only in the property's calling instances: a parameter secret handed to a callee that leaks it is not followed into the callee. A sink without a `length` is checked on its first byte (`strlen` in an annotation breaks E-ACSL builds). Eva's taint is a may-analysis: an Unknown check is a possible flow to review, not a confirmed leak.

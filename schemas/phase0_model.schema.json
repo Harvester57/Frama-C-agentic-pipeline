@@ -118,6 +118,20 @@
             "additionalProperties": false
           },
           "external_calls": {"$comment": "functions it calls that no unit of its program defines (libc, packages)", "type": "array", "items": {"type": "string"}},
+          "call_sites": {
+            "$comment": "Dump schema 4 (plan steps M2, M5): each direct call of its body, with the string literals it passes (argument index -> text; bytes outside printable ASCII but CR, LF, tab and NUL read '?'). Absent: not recorded",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "callee": {"type": "string"},
+                "line": {"type": "integer", "minimum": 0},
+                "literals": {"type": "object", "additionalProperties": {"type": "string"}}
+              },
+              "required": ["callee", "line", "literals"],
+              "additionalProperties": false
+            }
+          },
           "param_sizes": {
             "$comment": "argument index -> bytes of the object the parsed callers pass there (an array, an object's address), when the call site shows it",
             "type": "object",
