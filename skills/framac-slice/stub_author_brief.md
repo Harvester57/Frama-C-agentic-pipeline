@@ -48,10 +48,16 @@ The frame is a guess from the signature: a pointer followed by a length-named va
 Run, from `/framac-run`:
 
 ```text
-python3 /opt/framac-pipeline/scripts/pipeline_make.py run stubs
+python3 /opt/framac-pipeline/scripts/pipeline_make.py run stubs stub-check
 ```
 
-`stubs` re-reads the states: every block you finished must read `filled` in `workspace/reports/stubs.json`, and the header's `problems` must be empty. Fix every problem it reports in your header.
+`stubs` re-reads the states: every block you finished must read `filled` in `workspace/reports/stubs.json`, and the header's `problems` must be empty. `stub-check` then checks `{header}` three ways (`workspace/reports/stub_check.json`, under `headers`):
+
+- **`abi`** must be `passed`: your prototypes still match the real header.
+- **`eva`**, per function: `passed`; `too_weak` means your `requires` accept a buffer one element shorter than the length says (state the buffer's validity over the length); `valid_call_alarm` means a call with valid, initialized buffers already raises an alarm, so a `requires` demands more than the documentation does.
+- **`dynamic`**, per function, against the real library under E-ACSL: `violated` means the library broke one of your `ensures` (the report shows the values): the postcondition is wrong, fix it. `driver_rejected` means the generated arguments did not meet a `requires`; say in `notes` whether that is the documentation's precondition. `inconclusive` (a crash, a timeout, no library to link) is for `notes`.
+
+A header with a failed `abi` or a `violated` contract blocks every module that calls it, so fix those before you finish.
 
 ## Result
 

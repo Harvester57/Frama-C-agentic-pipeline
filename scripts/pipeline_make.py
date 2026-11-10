@@ -1480,33 +1480,35 @@ STAGE_OF_TARGET = {
     "dag": 1,
     # Reads the Phase 0 model only; before reach-gate and seed, which records its contracts in the ledger.
     "stubs": 1,
-    "security-props": 2,
-    "reach-gate": 2,
-    "seed": 2,
-    "build": 3,
-    "selftest": 3,
-    "fuzz": 3,
-    "eva": 3,
-    "eva-tune-base": 3,
+    # Its own stage between them: seed then records the contracts with the statuses it found.
+    "stub-check": 2,
+    "security-props": 3,
+    "reach-gate": 3,
+    "seed": 3,
+    "build": 4,
+    "selftest": 4,
+    "fuzz": 4,
+    "eva": 4,
+    "eva-tune-base": 4,
     # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
-    "eva-tune": 4,
+    "eva-tune": 5,
     # Renders the flamegraph.txt an earlier Eva run left (it never runs Eva), so after eva and eva-tune.
-    "flamegraph": 5,
-    "coverage": 4,  # after fuzz, so that it measures the campaign's corpus
-    "seeds": 3,
+    "flamegraph": 6,
+    "coverage": 5,  # after fuzz, so that it measures the campaign's corpus
+    "seeds": 4,
     # Reads the coverage reports, so after coverage (its per-module targets depend on coverage-<mod>).
-    "reach-dynamic": 5,
+    "reach-dynamic": 6,
     # After eva-tune, which rewrites the Eva report the facts read.
-    "facts": 5,
-    "ingest": 5,
-    "replay": 5,
-    "minimize": 5,
+    "facts": 6,
+    "ingest": 6,
+    "replay": 6,
+    "minimize": 6,
     # Before wp-queue (a prerequisite in pipeline.mk): the units it credits never become prove tasks.
-    "wp-replay": 5,
-    "wp-queue": 5,
-    "wp-baseline": 5,
-    "wp-sweep": 6,
-    "report": 7,
+    "wp-replay": 6,
+    "wp-queue": 6,
+    "wp-baseline": 6,
+    "wp-sweep": 7,
+    "report": 8,
 }
 # Phase 0 targets that write what the plan reads: they run even when the current DAG is unusable.
 PHASE0_INPUT_TARGETS = frozenset({"slice-init", "dag", "stubs", "security-props"})
@@ -1517,6 +1519,7 @@ _TARGET_OUTPUTS = {
     "dag": DAG_JSON,
     "security-props": "workspace/reports/security_props.json",
     "stubs": "workspace/reports/stubs.json",
+    "stub-check": "workspace/reports/stub_check.json",
     "seed": LEDGER_JSON,
     "selftest": SELFTEST_JSON,
     "ingest": INGESTED_JSON,

@@ -43,12 +43,12 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init dag stubs security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
+.PHONY: help slice-init dag stubs stub-check security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) $(EVA_SHARD_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init dag stubs security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init dag stubs stub-check security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -74,6 +74,15 @@ dag:
 stubs:
 	$(RUN) --class light --key stubs -- $(PY) $(S)/stub_gen.py run
 	$(RUN) --class light --key stubs -- $(PY) $(S)/ledger.py record-stub-contracts
+
+# The stub overlay's contracts checked three ways (scripts/stub_check.py): the ABI against the real header,
+# an Eva smoke caller per function, and the contracts against the real library under E-ACSL. A failed
+# header blocks the modules that call its functions (phase0_gates.py) until a stub-check of the fixed header
+# passes; the recipe still exits 0 then (`-`), so the other modules go on. The statuses reach the ledger.
+# It runs library code, hence the `replay` class (never beside a writable cache).
+stub-check:
+	-$(RUN) --class replay --key stub-check --output workspace/reports/stub_check.json -- $(PY) $(S)/stub_check.py run
+	$(RUN) --class light --key stub-check -- $(PY) $(S)/ledger.py record-stub-contracts
 
 # The MetAcsl security properties (Layers 3-6) from the model and the threat model. The ledger seed
 # reads them, so they are written before it.
