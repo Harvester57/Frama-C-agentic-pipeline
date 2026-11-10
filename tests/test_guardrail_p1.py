@@ -460,3 +460,137 @@ def test_architect_header_violation_on_entry_prototype(tmp_path):
         workspace_overlay.merge_agent_overlay(
             run_dir, "arch-m", "architect", overlay, header_file="m.h", module="m", skip_reverify=True
         )
+
+
+# ---------------------------------------------------------------------------
+# Inputs that crash outside the checked functions (libmnl Tier 6 A/B, 2026-11-09)
+# ---------------------------------------------------------------------------
+
+# Trimmed from the real replay: the corpus seed `seed-ext-parse-offset-2pow31` reproduces a known bug in
+# `mnl_attr_parse`, and every guardrail of module `attr` stopped on it with `guardrail_error`.
+_G = "/framac-run/state/parent_guard/attr-7457e160cb/guard_attr_mnl_attr_get_len.instrumented.c"
+SEGV_ELSEWHERE = f"""INFO: Running with entropic power schedule (0xFF, 100).
+UndefinedBehaviorSanitizer:DEADLYSIGNAL
+==7==ERROR: UndefinedBehaviorSanitizer: SEGV on unknown address 0x76a8a3763c30 (pc 0x5fd4a2ce31af T7)
+==7==The signal is caused by a READ memory access.
+    #0 0x5fd4a2ce31af in mnl_attr_ok {_G}:874:30
+    #1 0x5fd4a2ce3c04 in mnl_attr_parse {_G}:1139:13
+    #2 0x5fd4a2ce9a55 in ext_attr_parse_offset {_G}:3662:3
+    #3 0x5fd4a2ce9a55 in LLVMFuzzerTestOneInput {_G}:3927:3
+    #4 0x5fd4a2c9b8ea in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/w/guard.bin+0x368ea)
+UndefinedBehaviorSanitizer can not provide additional info.
+SUMMARY: UndefinedBehaviorSanitizer: SEGV {_G}:874:30 in mnl_attr_ok
+==7==ABORTING
+"""
+COVERAGE_DUMP = "COVERAGE:\n" + "".join(
+    f"COVERED_FUNC: hits: 1 edges: 1/2 f{i} /x.c:{i}\n  UNCOVERED_PC: /x.c:{i + 1}\n" for i in range(300)
+)
+
+
+def test_crash_outside_the_checked_functions_is_named():
+    why = R.crash_outside_checked_functions(SEGV_ELSEWHERE, ["mnl_attr_get_len"])
+    assert why is not None and "SEGV" in why and "mnl_attr_ok" in why
+
+
+@pytest.mark.parametrize("checked", [["mnl_attr_parse"], ["mnl_attr_ok"], []])
+def test_crash_through_a_checked_function_or_unknown_scope_is_not_excused(checked):
+    assert R.crash_outside_checked_functions(SEGV_ELSEWHERE, checked) is None
+
+
+def test_a_crash_in_the_e_acsl_wrapper_is_not_excused():
+    out = SEGV_ELSEWHERE.replace("in mnl_attr_parse ", "in __gen_e_acsl_mnl_attr_get_len ")
+    assert R.crash_outside_checked_functions(out, ["mnl_attr_get_len"]) is None
+
+
+def test_timeouts_and_stackless_crashes_are_not_excused():
+    timeout = "==9== ERROR: libFuzzer: timeout after 30 seconds\n    #0 0x1 in other /x.c:3:1\n"
+    assert R.crash_outside_checked_functions(timeout, ["f"]) is None
+    assert R.crash_outside_checked_functions("==9==ERROR: UndefinedBehaviorSanitizer: SEGV\n", ["f"]) is None
+
+
+def test_coverage_dump_no_longer_hides_the_crash_report():
+    _, stripped = R.parse_guardrail_reach(SEGV_ELSEWHERE + COVERAGE_DUMP, ["mnl_attr_get_len"])
+    assert "UNCOVERED_PC" not in stripped
+    assert "SUMMARY: UndefinedBehaviorSanitizer: SEGV" in stripped[-4000:]
+
+
+@pytest.fixture
+def chdir_tmp(tmp_path, monkeypatch):
+    """crash_input paths are run-relative: run from tmp_path as the run directory."""
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _crashing_replays(monkeypatch, crasher: bytes, calls: list) -> None:
+    """A fake libFuzzer that stops on the first replayed file whose content is `crasher`."""
+    monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        prefix = Path(next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1])
+        replayed = sorted(Path(cmd[-1]).iterdir())
+        if any(p.read_bytes() == crasher for p in replayed):
+            (prefix / "crash-0123").write_bytes(crasher)
+            out = SEGV_ELSEWHERE + f"Test unit written to {prefix}/crash-0123\n" + COVERAGE_DUMP
+            return SandboxResult(1, "", out, False, "rlimits", list(cmd))
+        stats = f"COVERED_FUNC: hits: 2 edges: 1/1 mnl_attr_get_len {_G}:686\n"
+        return SandboxResult(
+            0, stats + f"stat::number_of_executed_units: {len(replayed)}\n", "", False, "rlimits", list(cmd)
+        )
+
+    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+
+
+def _corpus(tmp_path: Path) -> Path:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(5):
+        (corpus / f"{i:040x}").write_bytes(b"ok%d" % i)
+    (corpus / "seed-ext-parse-offset-2pow31").write_bytes(b"\x030\x04\x00\x01\x00\x80\x00")
+    return corpus
+
+
+def test_guardrail_drops_an_input_that_crashes_elsewhere_and_replays_the_rest(tmp_path, monkeypatch, chdir_tmp):
+    calls: list = []
+    corpus = _corpus(tmp_path)
+    _crashing_replays(monkeypatch, b"\x030\x04\x00\x01\x00\x80\x00", calls)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    verdict = R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 0, use_cache=False, module="attr", seed=1, functions=["mnl_attr_get_len"]
+    )
+    assert verdict["status"] == "passed_dynamic_oracle"
+    assert [e["input"] for e in verdict["excluded_inputs"]] == ["seed-ext-parse-offset-2pow31"]
+    assert "mnl_attr_ok" in verdict["excluded_inputs"][0]["crash"]
+    assert len(calls) == 2
+    assert verdict["reach"]["functions"] == {"mnl_attr_get_len": 2}
+    assert sorted(p.name for p in corpus.iterdir())[-1] == "seed-ext-parse-offset-2pow31"  # shared corpus untouched
+
+
+def test_guardrail_keeps_the_error_when_the_crash_is_in_a_checked_function(tmp_path, monkeypatch, chdir_tmp):
+    calls: list = []
+    corpus = _corpus(tmp_path)
+    _crashing_replays(monkeypatch, b"\x030\x04\x00\x01\x00\x80\x00", calls)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    verdict = R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 0, use_cache=False, module="attr", seed=1, functions=["mnl_attr_parse"]
+    )
+    assert verdict["status"] == "guardrail_error" and verdict["excluded_inputs"] == []
+    assert len(calls) == 1
+    assert "SUMMARY: UndefinedBehaviorSanitizer: SEGV" in verdict["runtime_trace"]
+
+
+def test_guardrail_gives_up_after_too_many_crashing_inputs(tmp_path, monkeypatch, chdir_tmp):
+    monkeypatch.setattr(R, "GUARDRAIL_MAX_EXCLUDED_INPUTS", 1)
+    calls: list = []
+    corpus = _corpus(tmp_path)
+    (corpus / "seed-other").write_bytes(b"\x030\x04\x00\x01\x00\x80\x00")  # same bytes, second crasher
+    _crashing_replays(monkeypatch, b"\x030\x04\x00\x01\x00\x80\x00", calls)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    verdict = R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 0, use_cache=False, module="attr", seed=1, functions=["mnl_attr_get_len"]
+    )
+    assert verdict["status"] == "guardrail_error"
+    assert len(verdict["excluded_inputs"]) == 1 and "More than 1 replayed inputs" in verdict["reason"]

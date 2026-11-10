@@ -82,6 +82,8 @@ Two more rules for this plan:
 
 ### O1. Regression tests for the ledger fixes of `8936217` (P0, S)
 
+**Done 2026-11-10.** The check below found a real regression: `needs_validation` results for unlinked candidates were discarded, including ones the verifier resolved to a target function. Fixed, with the safety net now recording the rejection as the unit's reason; see the ledger entries in [`troubleshooting.md`](troubleshooting.md) Section 5.
+
 - **Goal:** the three fixes that keep verifier and WP results from being discarded cannot regress silently. They landed without tests.
 - **Entries:** the `linked_units: fewer than 1 items`, `deferred unit must not hide evidence` and `unresolved[N]: duplicate item` entries of [`troubleshooting.md`](troubleshooting.md) Section 5.
 - **Work:**
@@ -93,6 +95,8 @@ Two more rules for this plan:
 - **Acceptance:** each test fails when its fix in `8936217` is reverted.
 
 ### O2. `guardrail_error` on `mnl_attr_get_len` (P0, S to diagnose)
+
+**Done 2026-11-10.** Not Frama-C 35: the always-replayed seed `seed-ext-parse-offset-2pow31` reproduces a known bug in `mnl_attr_parse`, the replay stopped on its SEGV in `mnl_attr_ok`, and `UNCOVERED_PC` lines hid the report. The guardrail now drops inputs that crash outside the checked functions (`excluded_inputs`) and keeps the report; see the guardrail entry in [`troubleshooting.md`](troubleshooting.md) Section 5. Item 3 below was wrong: the output was kept (`runtime_trace`) but crowded out. The original text follows.
 
 - **Goal:** know why a parent guardrail fails on Frama-C 35 for a contract that cannot be wrong, and make the next such failure diagnosable from the report alone.
 - **Entry:** "The `mnl_attr_get_len` Guardrail Returns `guardrail_error`", Section 5.
@@ -279,8 +283,8 @@ O11 before Phase 1 S11 (same file)
 | M1 | decided 2026-11-10: option (b), merge after O1 and O2 |
 | M2 | open, after M1 |
 | M3 | open, after M1 |
-| O1 | open |
-| O2 | open; the evidence is in a temporary scratchpad (copy it first) |
+| O1 | done 2026-11-10: tests, plus a fix for the `needs_validation` regression and the safety-net reason they found |
+| O2 | done 2026-11-10: a seed reproducing a known bug elsewhere in the module stopped the replay; such inputs are now excluded (evidence kept in `targets/libmnl/ab-2026-11-09-tier6/`) |
 | O3 | open |
 | O4 | open |
 | O5 | open |

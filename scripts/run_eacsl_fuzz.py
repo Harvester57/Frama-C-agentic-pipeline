@@ -31,6 +31,9 @@ Modes:
    Past `--max-corpus-inputs`, every promoted seed-* / crash-* file is replayed and the rest is
    a deterministic sample; `corpus_total`, `corpus_replayed`, `corpus_sampled` and
    `corpus_empty` say what was replayed. A pass on an empty corpus is not a pass on real inputs.
+   A replayed input that crashes outside the checked functions with no E-ACSL report (a seed that
+   reproduces a known bug elsewhere in the module) is dropped and the rest replayed again, at most
+   GUARDRAIL_MAX_EXCLUDED_INPUTS times; `excluded_inputs` lists each with its crash.
 3. `selftest`: builds the bundled canary through the production path (never cached).
 4. `build`: compiles a module's fuzz binary only (no target code runs). Used by Make.
 5. `replay`: replays given inputs once each on a given or built binary. The report's
@@ -2042,7 +2045,8 @@ def run_fuzz_campaign(
 
 
 _COVERAGE_LINE_RE = re.compile(
-    r"^(?:UN)?COVERED_FUNC: hits: (\d+) edges: \d+/\d+ (\S+) .*$|^COVERAGE:\s*$|^stat::number_of_executed_units: (\d+)\s*$",
+    r"^(?:UN)?COVERED_FUNC: hits: (\d+) edges: \d+/\d+ (\S+) .*$|^COVERAGE:\s*$|^stat::number_of_executed_units: (\d+)\s*$"
+    r"|^[ \t]*UNCOVERED_PC: .*$",
     re.MULTILINE,
 )
 
@@ -2072,7 +2076,7 @@ def parse_guardrail_reach(output: str, functions: list[str] | None) -> tuple[dic
         "functions": by_fn,
         "unreached": sorted(fn for fn, n in by_fn.items() if n == 0),
     }
-    return reach, _COVERAGE_LINE_RE.sub("", output or "")
+    return reach, re.sub(r"\n{2,}", "\n", _COVERAGE_LINE_RE.sub("", output or ""))
 
 
 def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
@@ -2317,6 +2321,63 @@ def corpus_selection_fields(total: int, replayed: int, sampled: bool) -> dict:
     }
 
 
+# The crash a replay stopped on: a sanitizer's error headline or libFuzzer's own (deadly signal, ...).
+_REPLAY_CRASH_RE = re.compile(r"^(?:==\d+==\s*)?ERROR:\s*(?:\w+Sanitizer|libFuzzer):.*$", re.MULTILINE)
+_SANITIZER_SUMMARY_RE = re.compile(r"^SUMMARY:\s*(?P<summary>\S.*)$", re.MULTILINE)
+# How many replayed inputs a guardrail drops for crashing outside the checked functions before it gives up.
+GUARDRAIL_MAX_EXCLUDED_INPUTS = 8
+
+
+def crash_outside_checked_functions(output: str, functions: list[str] | None) -> str | None:
+    """
+    The crash a guardrail replay stopped on, as one line, when it says nothing about the contract; else None.
+
+    That is the case when E-ACSL reported nothing, a sanitizer or libFuzzer reported a crash (not a timeout or
+    an out-of-memory) with a stack, and no frame of that stack is a checked function or its E-ACSL wrapper
+    (`__gen_e_acsl_<fn>`). The guardrail build instruments only the checked functions, so such an input
+    crashed in other code: a seed or promoted crash that reproduces a known bug elsewhere in the module
+    (libmnl `seed-ext-parse-offset-2pow31`: a SEGV in `mnl_attr_ok` stopped every guardrail of module `attr`).
+    Without `functions`, or without a stack, nothing is excused.
+    """
+    if not functions or parse_eacsl_failure(output) is not None:
+        return None
+    headline = _REPLAY_CRASH_RE.search(output or "")
+    if headline is None or re.search(r"timeout|out-of-memory", headline.group(0), re.IGNORECASE):
+        return None
+    frames = [m.group("function") for m in _STACK_FRAME_RE.finditer(output, headline.start())]
+    if not frames:
+        return None
+    checked = set(functions) | {f"__gen_e_acsl_{fn}" for fn in functions}
+    if any(name in checked for name in frames):
+        return None
+    summary = _SANITIZER_SUMMARY_RE.search(output, headline.start())
+    text = summary.group("summary") if summary else headline.group(0)
+    return re.sub(r"\s+", " ", text).strip()[:300]
+
+
+def _replayed_input_of(crash_input: str | None, entries: list[list[str | int]]) -> str | None:
+    """The replayed corpus file whose content is the crash artifact `crash_input` (run-relative), or None."""
+    if not crash_input:
+        return None
+    path = Path(crash_input)
+    digest = cache.file_digest(path) or (sha256_file(path) if path.is_file() else None)
+    if not digest:
+        return None
+    return next((str(e[0]) for e in sorted(entries) if e[1] == digest), None)
+
+
+def _stage_replay_corpus(scratch_dir: Path, corpus_dir: Path, names: list[str]) -> Path:
+    """A scratch copy of the corpus files `names`, so the shared corpus is never changed."""
+    replay_corpus = scratch_dir / "replay_corpus"
+    if replay_corpus.is_dir():
+        shutil.rmtree(replay_corpus, ignore_errors=True)
+    replay_corpus.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        with contextlib.suppress(OSError):
+            shutil.copy2(corpus_dir / name, replay_corpus / name)
+    return replay_corpus
+
+
 _CRASH_KIND_ORDER = {"crash": 0, "leak": 1, "timeout": 2, "oom": 3}
 
 
@@ -2462,40 +2523,58 @@ def run_guardrail_check(
                     cached["diagnostic_hints"] = derive_eacsl_diagnostic_hints(cached)
                     return cached
 
-    replay_dir = corpus_dir
-    if sampled:
-        replay_corpus = scratch_dir / "replay_corpus"
-        if replay_corpus.is_dir():
-            shutil.rmtree(replay_corpus, ignore_errors=True)
-        replay_corpus.mkdir(parents=True, exist_ok=True)
-        for name in chosen_names:
-            with contextlib.suppress(OSError):
-                shutil.copy2(corpus_dir / name, replay_corpus / name)
-        replay_dir = replay_corpus
-
-    cmd = [
-        str(binary.resolve()),
-        f"-runs={runs}",
-        f"-timeout={per_input_timeout}",
-        f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
-        f"-seed={seed}",
-        f"-artifact_prefix={scratch_dir.resolve()}/",
-        "-print_coverage=1",
-        "-print_final_stats=1",
-        str(scratch_corpus.resolve()),
-        str(replay_dir.resolve()),
-    ]
-    artifacts_before = _prefix_artifacts(scratch_dir)
-    res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
-    reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
-    verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
-    crash_input = (
-        None
-        if verdict["status"] == "passed_dynamic_oracle"
-        else guardrail_crash_input(scratch_dir, artifacts_before, combined_out)
-    )
+    # A replay stops at its first crash. An input that crashes outside the checked functions says nothing about
+    # the contract: drop it and replay the rest (crash_outside_checked_functions), at most a few times.
+    replay_names = list(chosen_names)
+    excluded: list[dict[str, str]] = []
+    while True:
+        replay_dir = corpus_dir
+        if sampled or excluded:
+            replay_dir = _stage_replay_corpus(scratch_dir, corpus_dir, replay_names)
+        cmd = [
+            str(binary.resolve()),
+            f"-runs={runs}",
+            f"-timeout={per_input_timeout}",
+            f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+            f"-seed={seed}",
+            f"-artifact_prefix={scratch_dir.resolve()}/",
+            "-print_coverage=1",
+            "-print_final_stats=1",
+            str(scratch_corpus.resolve()),
+            str(replay_dir.resolve()),
+        ]
+        artifacts_before = _prefix_artifacts(scratch_dir)
+        res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
+        reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
+        verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
+        crash_input = (
+            None
+            if verdict["status"] == "passed_dynamic_oracle"
+            else guardrail_crash_input(scratch_dir, artifacts_before, combined_out)
+        )
+        if (
+            verdict["status"] != "guardrail_error"
+            or verdict.get("failure") is not None
+            or verdict.get("unsound")
+            or res.timed_out
+        ):
+            break
+        why = crash_outside_checked_functions(combined_out, functions)
+        still = set(replay_names)
+        name = _replayed_input_of(crash_input, [e for e in replay_manifest if e[0] in still]) if why else None
+        if why is None or name is None:
+            break
+        if len(excluded) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
+            verdict["reason"] = (
+                f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} replayed inputs crash outside the checked functions "
+                f"(the last: {why}); the contract was not tested on the rest."
+            )
+            break
+        excluded.append({"input": name, "crash": why})
+        replay_names.remove(name)
     verdict.update(
         {
+            "excluded_inputs": excluded,
             "crash_input": crash_input,
             "reach": reach,
             "returncode": res.returncode,
