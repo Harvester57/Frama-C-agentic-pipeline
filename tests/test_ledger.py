@@ -1082,3 +1082,39 @@ def test_ingest_eva_never_credits_unclassified_statuses(run_dir):
     assert tag["status"] == "planned"
     assert any(e["result"] == "eva_unclassified_status" and "Inconsistent" in e["summary"] for e in tag["evidence"])
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+# O1 (docs/open-topics-remediation-plan.md): `unresolved` is `uniqueItems`, and two goals of one
+# function can render to the same text (two pointer accesses on one source line).
+_DUP_GOAL = {"obligation_class": "rte", "kind": "mem_access", "line": 12, "annotation": "\valid(p)"}
+
+
+@pytest.mark.parametrize(
+    ("report_kw", "expected"),
+    [
+        (
+            {
+                "status": "unproven_goals_remain",
+                "by_obligation_class": {"rte": {"proven": 1, "proven_under_hyp": 0, "unproven": 2}},
+                "unproven_goals": [dict(_DUP_GOAL), dict(_DUP_GOAL)],
+            },
+            ["unproven mem_access at line 12: \valid(p)"],
+        ),
+        (
+            {
+                "status": "wp_aborted",
+                "soundness": {"tier_a_aborts": ["Timeout in typed_snmp_parse_pdu_assert_rte_mem_access"] * 2},
+            },
+            ["wp_aborted: Timeout in typed_snmp_parse_pdu_assert_rte_mem_access"],
+        ),
+    ],
+    ids=["unproven-goals", "error-issues"],
+)
+def test_ingest_wp_deduplicates_identical_unresolved_entries(run_dir, report_kw, expected):
+    seed(run_dir)
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", wp_report(**report_kw))
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    u = _unit(run_dir, "rte")
+    assert u["status"] == "blocked"
+    assert u["unresolved"] == expected
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []

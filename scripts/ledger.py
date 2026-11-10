@@ -2436,11 +2436,10 @@ def cmd_ingest_verifier(
                                 f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
                             ]
                 elif u["status"] in NO_EVIDENCE_STATES:
+                    # Its deferral reason no longer explains a blocked unit: the rejection comes first.
                     u["status"] = "blocked"
-                    if not u.get("unresolved"):
-                        u["unresolved"] = [
-                            f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
-                        ]
+                    reason = f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
+                    u["unresolved"] = list(dict.fromkeys([reason, *(u.get("unresolved") or [])]))
 
         if fp in findings:
             _merge_finding_record(findings[fp], rec)
@@ -2655,7 +2654,14 @@ def cmd_scaffold_verifier(
         ]
         linked = fn_units or list(cand.get("linked_units") or [])
     else:
-        linked = list(cand.get("linked_units") or [])
+        # The candidate's own units; failing those, the resolved function's units that may carry evidence
+        # (a deferred or out-of-scope unit must not, so a rejection never links one). A candidate in a libc
+        # stub or harness code with no target function links nothing.
+        linked = list(cand.get("linked_units") or []) or [
+            u["coverage_id"]
+            for u in units_for_function(units, loc_file, loc_fn)
+            if u["status"] not in NO_EVIDENCE_STATES
+        ]
     tool_outputs = list(cand.get("tool_outputs") or [])
     primary_tool = tool_outputs[0] if tool_outputs else f"workspace/reports/fuzz/{module}.json"
     ev_phase = "eva" if cand.get("origin") == "eva" else "fuzz"

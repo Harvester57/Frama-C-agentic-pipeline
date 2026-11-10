@@ -173,7 +173,7 @@
           "anyOf": [{"required": ["local"]}, {"required": ["owner"]}],
           "additionalProperties": false
         },
-        "linked_units": {"$ref": "#/definitions/linked_units_nonempty"},
+        "linked_units": {"$ref": "#/definitions/linked_units"},
         "verifier": {"$ref": "#/definitions/verifier"}
       },
       "required": ["verdict", "fingerprint", "title", "description", "location", "property", "origin", "claimed_root_cause", "trace", "evidence", "reachability", "blockers", "validation_plan", "linked_units", "verifier"],

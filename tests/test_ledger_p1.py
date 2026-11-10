@@ -5,10 +5,16 @@ import json
 import pytest
 
 import ledger as L
-from conftest import write_json
+from conftest import FP_REJ, evidence, metadata, rejected_record, unit, write_json
 from fingerprint import make_fingerprint
 from test_ledger import DAG, eva_report, load, seed, units_by_id
-from validate_artifacts import validate_candidates, validate_ledger
+from validate_artifacts import (
+    validate_agent_result,
+    validate_candidates,
+    validate_findings,
+    validate_ledger,
+    validate_run_dir,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -280,3 +286,152 @@ def test_record_boundary_assumptions_skips_deferred_units(run_dir):
     out = L.cmd_record_boundary_assumptions(res_path)
     assert out["added"] == 0 and out["units"] == [] and "skipped_reason" in out
     assert units_by_id(run_dir)["src/glue/init.c#glue_init::rte"]["assumptions"] == []
+
+
+# ------------------------------------------------------------------ O1 (verifier records, 8936217)
+
+LIBC_FREE = ("FRAMAC_SHARE/libc/stdlib.h", "free", "mem_access", "\\freeable(p)")
+HARNESS_CRASH_FP = "harness_snmp.c#unknown_function::unparsed_crash::0123456789"
+FUZZ_REPORT = "workspace/reports/fuzz/snmp.json"
+TAG_RTE = "src/snmp/ber.c#ber_decode_tag::rte"
+TAG_L2 = "src/snmp/ber.c#ber_decode_tag::l2_termination"
+TAG_L3 = "src/snmp/ber.c#ber_decode_tag::l3_frame"
+DEFERRAL = "tier3_not_scheduled: Tier 3 is deferred under the quick profile"
+
+
+def _verifier_run(run_dir, units, candidates):
+    """A run directory with these ledger units and candidates, and the fuzz report they cite."""
+    write_json(run_dir / "run-metadata.json", metadata("in_progress"))
+    write_json(run_dir / "coverage-ledger.json", sorted(units, key=lambda u: u["coverage_id"]))
+    write_json(run_dir / "candidates.json", sorted(candidates, key=lambda c: c["fingerprint"]))
+    write_json(run_dir / FUZZ_REPORT, {"module": "snmp", "status": "eacsl_violation"})
+
+
+def _candidate(fp, file, function, kind, predicate, linked):
+    return {
+        "fingerprint": fp,
+        "status": "unverified",
+        "origin": "fuzz",
+        "proposed_verdict": "needs_validation",
+        "module": "snmp",
+        "location": {"file": file, "line": 3, "function": function},
+        "property": {"kind": kind, "predicate": predicate},
+        "reproducers": [],
+        "tool_outputs": [FUZZ_REPORT],
+        "linked_units": linked,
+        "first_seen": "2026-10-29T00:00:00+00:00",
+    }
+
+
+def _unlinked_candidate(where):
+    """A candidate with no target unit: in a libc stub, or in generated harness code."""
+    if where == "libc_stub":
+        return _candidate(make_fingerprint(*LIBC_FREE), *LIBC_FREE, [])
+    return _candidate(HARNESS_CRASH_FP, "harness_snmp.c", "unknown_function", "crash", "", [])
+
+
+def _tag_candidate():
+    return _candidate(FP_REJ, "src/snmp/ber.c", "ber_decode_tag", "mem_access", "\\valid_read(p)", [TAG_RTE])
+
+
+def _tag_units(rte_status="candidate"):
+    """ber_decode_tag: an rte unit (holding the candidate), a deferred l2 unit, an out-of-scope l3 unit."""
+    rte = unit("src/snmp/ber.c", "ber_decode_tag", "rte", status=rte_status)
+    if rte_status == "candidate":
+        rte["evidence"] = [evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output=FUZZ_REPORT)]
+        rte["result_fingerprints"] = [FP_REJ]
+    l2 = unit("src/snmp/ber.c", "ber_decode_tag", "l2_termination", status="deferred", unresolved=[DEFERRAL])
+    l3 = unit("src/snmp/ber.c", "ber_decode_tag", "l3_frame", status="out_of_scope", unresolved=["outside --scope"])
+    return [rte, l2, l3]
+
+
+def _write_result(run_dir, res):
+    path = run_dir / "agents" / res["agent_id"] / "scratch" / "result.json"
+    write_json(path, res)
+    return path
+
+
+@pytest.mark.parametrize("where", ["libc_stub", "harness_code"])
+def test_rejected_record_without_target_unit_validates_and_ingests(run_dir, where):
+    """Troubleshooting `linked_units: fewer than 1 items` (fixed in 8936217): a rejected record may link no unit."""
+    cand = _unlinked_candidate(where)
+    _verifier_run(run_dir, [unit("src/snmp/ber.c", "ber_decode_len", "rte")], [cand])
+    res = L.cmd_scaffold_verifier(cand["fingerprint"], "rejected", "verifier-1")
+    assert res["record"]["linked_units"] == []
+    assert list(validate_findings([res["record"]])) == []
+    assert list(validate_agent_result(res)) == []
+
+    out = L.cmd_ingest_verifier(_write_result(run_dir, res))
+    assert out["decision"] == "rejected"
+    (finding,) = load(run_dir / "findings.json")
+    assert finding["verdict"] == "rejected" and finding["linked_units"] == []
+    assert load(run_dir / "candidates.json")[0]["status"] == "verified"
+    assert units_by_id(run_dir)["src/snmp/ber.c#ber_decode_len::rte"]["status"] == "planned"
+    assert validate_run_dir(run_dir) == []
+
+
+def test_scaffold_rejected_links_only_the_candidate_units(run_dir):
+    """Troubleshooting `deferred unit must not hide evidence` (fixed in 8936217): the scaffold's links."""
+    _verifier_run(run_dir, _tag_units(), [_tag_candidate()])
+
+    # Only a confirmed bug claims the whole function (every unit not out of scope) to keep it from WP.
+    confirmed = L.cmd_scaffold_verifier(FP_REJ, "confirmed", "verifier-1")
+    assert sorted(confirmed["record"]["linked_units"]) == [TAG_L2, TAG_RTE]
+    res = L.cmd_scaffold_verifier(FP_REJ, "rejected", "verifier-1")
+    assert res["record"]["linked_units"] == [TAG_RTE]
+    assert list(validate_agent_result(res)) == []
+
+    L.cmd_ingest_verifier(_write_result(run_dir, res))
+    units = units_by_id(run_dir)
+    assert units[TAG_RTE]["status"] == "planned"  # harness_induced, and the harness repair is not exhausted
+    assert units[TAG_L2]["status"] == "deferred" and units[TAG_L2]["evidence"] == []
+    assert validate_run_dir(run_dir) == []
+
+
+def test_rejection_evidence_on_a_deferred_unit_blocks_it(run_dir):
+    """The ingest-verifier safety net: a NO_EVIDENCE_STATES unit that receives rejection evidence becomes blocked."""
+    _verifier_run(run_dir, _tag_units(), [_tag_candidate()])
+    write_json(run_dir / "agents/verifier-3/artifacts/notes.txt", {"notes": "bounds checked by every caller"})
+    rec = rejected_record(FP_REJ)
+    rec["rejection_class"] = "disproved_by_source"
+    rec["linked_units"] = [TAG_RTE, TAG_L2]  # hand-written, or scaffolded before 8936217
+    res = {
+        "role": "crash_verifier",
+        "agent_id": "verifier-3",
+        "candidate_fingerprint": FP_REJ,
+        "decision": "rejected",
+        "refingerprint_reason": None,
+        "record": rec,
+    }
+    assert list(validate_agent_result(res)) == []
+
+    L.cmd_ingest_verifier(_write_result(run_dir, res))
+    units = units_by_id(run_dir)
+    l2 = units[TAG_L2]
+    assert l2["status"] == "blocked" and l2["agent_id"] is None
+    assert [e["result"] for e in l2["evidence"]] == ["rejected:disproved_by_source"]
+    assert any(a.get("decision") == "rejected" and a["result_fingerprints"] == [FP_REJ] for a in l2["attempts"])
+    # The rejection explains the blocked unit; its old deferral reason follows it.
+    assert l2["unresolved"] == [f"candidate_rejected (disproved_by_source): {rec['reason']}", DEFERRAL]
+    assert units[TAG_RTE]["status"] == "blocked"
+    assert units[TAG_RTE]["unresolved"] == [f"candidate_rejected (disproved_by_source): {rec['reason']}"]
+    assert units[TAG_L3]["status"] == "out_of_scope" and units[TAG_L3]["evidence"] == []
+    assert validate_run_dir(run_dir) == []
+
+
+@pytest.mark.parametrize("where", ["libc_stub", "harness_code", "resolved_to_target_function"])
+def test_scaffold_needs_validation_for_unlinked_candidate_is_ingestible(run_dir, where):
+    cand = _unlinked_candidate("harness_code" if where == "resolved_to_target_function" else where)
+    _verifier_run(run_dir, _tag_units(rte_status="planned"), [cand])
+    overrides: dict = {}
+    if where == "resolved_to_target_function":
+        overrides = {"file_override": "src/snmp/ber.c", "fn_override": "ber_decode_tag", "line_override": 12}
+    res = L.cmd_scaffold_verifier(cand["fingerprint"], "needs_validation", "verifier-1", **overrides)
+    if where == "resolved_to_target_function":
+        # Linked to the resolved function's units that may carry evidence, as before 8936217.
+        assert res["record"]["linked_units"] == [TAG_RTE]
+    else:
+        assert res["record"]["linked_units"] == []
+    L.cmd_ingest_verifier(_write_result(run_dir, res))
+    assert load(run_dir / "findings.json")[0]["verdict"] == "needs_validation"
+    assert validate_run_dir(run_dir) == []
