@@ -338,8 +338,9 @@ def test_entry_requires_shape_is_allowed(contract):
     assert entry_requires_violations(contract, ATTACKER) == [], contract
 
 
-def test_valid_c_string_is_shape_only_when_the_harness_nul_terminates():
-    c = "/*@ requires valid_c_string(s); */"
+@pytest.mark.parametrize("name", ["valid_read_string", "valid_c_string"])
+def test_a_string_predicate_is_shape_only_when_the_harness_nul_terminates(name):
+    c = f"/*@ requires {name}(s); */"
     assert entry_requires_violations(c, ["s"])
     assert entry_requires_violations(c, ["s"], nul_terminated=True) == []
 

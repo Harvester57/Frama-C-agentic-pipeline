@@ -280,40 +280,41 @@ extern int getsockopt(int sockfd, int level, int optname, void *optval, socklen_
 #endif /* __FRAMAC_EACSL__ */
 
 /*
- * Concrete Dual-Oracle C-String Predicates (E-ACSL host-header mode only)
+ * The string vocabulary (plan step S8). One name per notion, the names of __fc_libc's
+ * __fc_string_axiomatic.h, which Eva and WP read (templates/acsl/acsl_vocabulary.h lists them):
  *
- * Standard Frama-C libc axiomatics (\\strlen, valid_read_string) do not survive
- * E-ACSL -no-frama-c-stdlib builds because host libc lacks E-ACSL models for
- * uninterpreted logic functions. These bounded predicates use explicit integer
- * quantifiers executable under both WP first-order proving and E-ACSL dynamic
- * instrumentation.
+ *   valid_read_string(s)      s is readable up to and including its first NUL
+ *   valid_string(s)           the same, writable
+ *   valid_read_nstring(s, n)  n readable, initialized bytes, or a readable string (strnlen's domain)
+ *   valid_string_or_null(s)   s == \null || valid_string(s)
+ *   strlen(s)                 the length (a logic function, no backslash; `\strlen` does not exist)
  *
- * They must NOT be defined in the Eva/WP (-nostdinc, __fc_libc) configuration:
- * there __fc_string_axiomatic.h already declares valid_string,
- * valid_read_string, valid_read_nstring and valid_nstring, and a second
- * declaration aborts the kernel under annot-error=abort.
+ * E-ACSL builds use the host's headers (-no-frama-c-stdlib), which do not define them, so this block
+ * defines the same names with executable bodies. Differences an E-ACSL run can show:
+ *   - valid_read_string and valid_string look for the NUL within 65536 bytes: a longer string fails;
+ *   - on a buffer that is not a string they abort with an E-ACSL RTE inside the predicate
+ *     (`\valid_read(s + i)`, E-ACSL checks the read before the validity guard next to it) rather than
+ *     with the precondition: still a failure, reported at the predicate's line;
+ *   - strlen is recursive: on a buffer that is not a string it aborts the same way.
+ * These definitions must NOT reach the Eva/WP (__fc_libc) parse: a second definition of a libc
+ * predicate aborts the kernel under annot-error=abort.
  */
 
 #if defined(__FRAMAC_EACSL__)
 
 /*@
-  @ predicate valid_read_nstring(char *s, integer n) =
-  @   0 <= n &&
-  @   \exists integer i; 0 <= i <= n &&
-  @     \valid_read(s + (0 .. i)) &&
-  @     s[i] == '\0';
+  @ logic integer strlen(char *s) = s[0] == '\0' ? 0 : 1 + strlen(s + 1);
   @
   @ predicate valid_read_string(char *s) =
-  @   valid_read_nstring(s, 65536);
-  @
-  @ predicate valid_nstring(char *s, integer n) =
-  @   0 <= n &&
-  @   \exists integer i; 0 <= i <= n &&
-  @     \valid(s + (0 .. i)) &&
-  @     s[i] == '\0';
+  @   \exists integer i; 0 <= i <= 65536 && \valid_read(s + (0 .. i)) && s[i] == '\0';
   @
   @ predicate valid_string(char *s) =
-  @   valid_nstring(s, 65536);
+  @   \exists integer i; 0 <= i <= 65536 && \valid(s + (0 .. i)) && s[i] == '\0';
+  @
+  @ predicate valid_read_nstring(char *s, integer n) =
+  @   (\valid_read(s + (0 .. n - 1)) && \initialized(s + (0 .. n - 1))) || valid_read_string(s);
+  @
+  @ predicate valid_string_or_null(char *s) = s == \null || valid_string(s);
   @*/
 
 #endif /* __FRAMAC_EACSL__ */

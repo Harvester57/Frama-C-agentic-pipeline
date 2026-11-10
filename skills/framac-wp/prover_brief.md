@@ -135,15 +135,11 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    | **Padded-struct / union `\initialized`** | `ensures \initialized(out_struct);` or `ensures \initialized(u);` | Assert field-level initialization (`ensures \initialized(&out_struct->field);`); E-ACSL checks all `sizeof(*p)` bytes in flat shadow memory and fails on uninitialized struct padding or smaller union members |
 <!-- endif -->
 <!-- if: strings -->
-   | **C-string contracts & `\strlen`** | `requires valid_read_string(s);` (Frama-C libc axiomatic) or `\strlen(s) < n` | `requires valid_read_nstring(s, n);` or `requires valid_read_string(s);` (concrete bounded predicates from `fc_compat_types.h`) |
+   | **C-string contracts** | `\strlen(s) < n`, `valid_c_string(s)`, `c_strlen(s)`, `valid_nstring(s, n)` | `requires valid_read_string(s);`, `valid_string(s)`, `valid_read_nstring(s, n)`, `strlen(s) < n` (one name per notion, below) |
 <!-- endif -->
 
 <!-- if: strings -->
-   - **Concrete Dual-Oracle C-String Predicates:** Frama-C libc standard library axiomatics (`\strlen`, uninterpreted `valid_read_string` relying on `\strlen(s) >= 0`) do not survive E-ACSL `-no-frama-c-stdlib` dynamic verification because host libc headers lack executable E-ACSL models for uninterpreted logic functions. The pipeline force-includes `fc_compat_types.h`, which provides concrete bounded predicates executable by both WP and E-ACSL:
-     - `valid_read_nstring(char *s, integer n)`: validates reading up to `n` characters with null termination.
-     - `valid_read_string(char *s)`: validates null termination within a bounded horizon (65536).
-     - `valid_string(char *s)`: validates a writable null-terminated buffer.
-     Always use `valid_read_nstring(s, max_len)` or `valid_read_string(s)` instead of `\strlen` or libc string axiomatics.
+   - **One String Vocabulary:** write only these names, listed in `templates/acsl/acsl_vocabulary.h`: `valid_read_string(s)` (readable up to and including its NUL), `valid_string(s)` (the same, writable), `valid_read_nstring(s, n)` (`n` readable, initialized bytes, or a shorter string: the domain of `strnlen`), `valid_string_or_null(s)`, `strlen(s)` (a logic function, no backslash: `\strlen` does not exist in Frama-C) and `no_crlf_string(s)` (no CR or LF before the NUL). WP and Eva read Frama-C libc's definitions; the E-ACSL guardrail runs executable definitions of the same names from `fc_compat_types.h`, so every one of them is also checked at run time. An E-ACSL run differs in two ways: a string longer than 65536 bytes fails `valid_read_string` and `valid_string`, and a buffer that is not a string fails inside the predicate (E-ACSL RTE `\valid_read(s + i)`) rather than at the precondition. `valid_c_string` and `c_strlen` are old aliases of `valid_read_string` and `strlen`, and `valid_nstring` exists nowhere: never write them.
 <!-- endif -->
 <!-- if: arrays -->
    - **`\at(expr, Old)` distributes over array indexing:** `\at(a[i], Pre)` evaluates `a[\at(i, Pre)]` in the `Pre` state. Inside a loop where `k` is quantified, write `\at(a, Pre)[k]` or `loop invariant \forall integer k; 0 <= k < i ==> a[k] == \at(a[k], LoopEntry);`.

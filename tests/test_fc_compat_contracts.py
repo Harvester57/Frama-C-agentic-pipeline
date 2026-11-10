@@ -1,7 +1,7 @@
 """
 Contracts of templates/fc_stubs/fc_compat_types.h against the real Frama-C (FRAMAC_DOCKER_TESTS=1), plan
 docs/templates-and-stubs-improvement-plan.md: typed syscalls (S6), the LP64 assertion (S9), the wipe
-contracts (M6).
+contracts (M6), the string vocabulary (S8).
 """
 
 from __future__ import annotations
@@ -210,3 +210,102 @@ def test_a_wipe_through_explicit_bzero_or_memset_s_proves_without_a_loop(tmp_pat
     # A partial wipe never proves.
     assert "typed_close_short_ensures_wiped" in typed and "typed_cast_close_short_ensures_wiped" in cast
     assert "Assertions        1 valid" in log.split("==eva==", 1)[1], log
+
+
+# ---------------------------------------------------------------------------------------------------
+# S8: one string vocabulary (Frama-C libc's names), executable under E-ACSL
+# ---------------------------------------------------------------------------------------------------
+
+STRINGS = ("valid_read_string", "valid_string", "valid_read_nstring", "valid_string_or_null")
+
+
+def _eacsl_string_block() -> str:
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    start = text.index("logic integer strlen(char *s)")
+    return text[start : text.index("*/", start)]
+
+
+@pytest.mark.unit
+def test_eacsl_builds_define_libc_s_string_names_and_nothing_else():
+    block = _eacsl_string_block()
+    defined = set(re.findall(r"predicate (\w+)\(", block))
+    assert defined == set(STRINGS)
+    assert "valid_nstring" not in (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    # libc semantics: n readable initialized bytes, or a shorter string.
+    nstring = block.split("predicate valid_read_nstring", 1)[1].split("predicate", 1)[0]
+    assert "\\initialized(s + (0 .. n - 1))" in nstring and "|| valid_read_string(s)" in nstring
+
+
+@pytest.mark.unit
+def test_the_vocabulary_names_the_canonical_strings_and_keeps_the_aliases():
+    vocab = (ROOT / "templates" / "acsl" / "acsl_vocabulary.h").read_text(encoding="utf-8")
+    for name in (*STRINGS, "strlen(s)", "no_crlf_string(s)"):
+        assert name in vocab, name
+    assert '#include "__fc_string_axiomatic.h"' in vocab
+    assert "predicate valid_c_string(char *s) = valid_read_string(s);" in vocab
+    assert "logic integer c_strlen(char *s) = strlen(s);" in vocab
+    for brief in ("prover_brief.md", "header_architect_brief.md"):
+        text = (ROOT / "skills" / "framac-wp" / brief).read_text(encoding="utf-8")
+        assert "One String Vocabulary" in text and "no_crlf_string(s)" in text, brief
+        assert "valid_c_string(s)` (" not in text  # named only as a name never to write
+
+
+STRINGS_C = r"""#include <string.h>
+#include <stdio.h>
+
+/*@ requires valid_read_string(s);
+    requires valid_c_string(s);
+    requires no_crlf_string(s);
+    requires strlen(s) < 64 && c_strlen(s) == strlen(s);
+    assigns \nothing;
+    ensures \result == strlen(s); */
+size_t len(const char *s) { return strlen(s); }
+
+/*@ requires valid_read_nstring(s, n);
+    assigns \nothing; */
+size_t nlen(const char *s, size_t n) { return strnlen(s, n); }
+
+/*@ requires valid_string_or_null(s);
+    assigns \nothing; */
+int first(char *s) { return s ? s[0] : -1; }
+
+int main(int argc, char **argv) {
+  char ok[] = "hello";
+  char raw[4] = {'a', 'b', 'c', 'd'};
+  char crlf[] = "a\r\n";
+  size_t a = len(ok);
+  size_t b = nlen(raw, 4); /* libc semantics: 4 readable bytes, no NUL needed */
+  size_t c = nlen(ok, 64); /* a string shorter than n */
+  int d = first(0) + first(ok);
+  printf("ok %zu %zu %zu %d\n", a, b, c, d);
+  fflush(stdout);
+  if (argc > 1 && argv[1][0] == 'r') return (int)len(raw); /* not a string: must fail */
+  if (argc > 1 && argv[1][0] == 'c') return (int)len(crlf); /* CR/LF: must fail */
+  return 0;
+}
+"""
+
+
+@image
+@slow
+def test_the_string_vocabulary_runs_under_eacsl_and_proves_under_wp(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    script = (
+        FRAMAC_FLAGS + EACSL_FLAGS + 'echo "==eacsl=="; '
+        'e-acsl-gcc -c -F -e-acsl-full-mtracking -E "$F" -o s.frama.c -O bin s.c > build.log 2>&1; echo "build=$?"; '
+        './bin.e-acsl 2>&1; echo "run_ok=$?"; ./bin.e-acsl r 2>&1; echo "run_raw=$?"; ./bin.e-acsl c 2>&1; echo "run_crlf=$?"; '
+        'echo "==wp=="; frama-c -no-unicode s.c -cpp-extra-args="$A" -wp -wp-model Typed -wp-check-memory-model '
+        "-wp-rte -wp-fct len,nlen,first -wp-timeout 20 -wp-cache none 2>&1; "
+        'echo "==eva=="; frama-c -no-unicode s.c -cpp-extra-args="$A" -eva 2>&1; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"s.c": STRINGS_C}, script)
+    eacsl = log.split("==eacsl==", 1)[1].split("==wp==", 1)[0]
+    assert "build=0" in eacsl, (tmp_path / "build.log").read_text(encoding="utf-8", errors="replace")
+    # Every name executes, the unterminated n-byte buffer satisfies valid_read_nstring (libc semantics).
+    assert "ok 5 4 5 103" in eacsl and "run_ok=0" in eacsl, eacsl
+    assert "run_raw=0" not in eacsl and "run_crlf=0" not in eacsl, eacsl
+    assert "no_crlf_string" in eacsl.split("run_raw=", 1)[1], eacsl
+    proved, total = _proved(log, "wp")
+    assert proved == total, log.split("==wp==", 1)[1]
+    eva = log.split("==eva==", 1)[1]
+    assert eva.count("Invalid") + eva.count("invalid") >= 1, eva
