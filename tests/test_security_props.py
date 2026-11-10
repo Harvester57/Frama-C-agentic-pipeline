@@ -1354,3 +1354,104 @@ def test_format_strings_are_decided_from_the_real_model(model_run, tmp_path, mon
         assert unit["status"] != "blocked" and any(
             d["property"] == "L5_sanitized_format_syslog" for d in unit["bookkeeping"]["decided_properties"]
         ), unit
+
+
+# ---------------------------------------------------------------------------------------------------
+# The gate sets the state only on success (plan step M7)
+# ---------------------------------------------------------------------------------------------------
+
+GATE_DIR = FIX / "gate"
+SUCCESS_GATE = {**LOGIN_GATE, "success": "0"}
+FAILURE_CHECK = "/*@ check L4_auth_state_login_on_failure: ({}) != (0) ==> auth_ok == \\at(auth_ok, Pre); */ "
+
+
+def _gate_model() -> dict:
+    return model(
+        {
+            "prog.c#login": fn("login", "prog.c", formals=[{"name": "pw", "kind": "value"}]),
+            "prog.c#dispatch": fn("dispatch", "prog.c"),
+            "prog.c#admin": fn("admin", "prog.c"),
+        },
+        edges=[("prog.c#dispatch", "prog.c#login"), ("prog.c#dispatch", "prog.c#admin")],
+        global_variables={"auth_ok": {"name": "auth_ok", "file": "prog.c", "type": "int"}},
+    )
+
+
+@pytest.mark.unit
+def test_a_gate_success_value_is_an_in_code_check():
+    doc = sp.generate(_gate_model(), threat(auth_gates=[SUCCESS_GATE]))
+    assert not sp.validate(doc), sp.validate(doc)
+    prop = by_name(doc)["L4_auth_state_login_on_failure"]
+    assert prop["instances"] == ["prog.c#login"] and prop["obligation_class"] == "l4_auth_state"
+    assert prop["code"] == {"returns": True, "check": FAILURE_CHECK.format("${result}").rstrip()}
+    assert rwf.goal_obligation_class({"kind": "check", "annotation": prop["code"]["check"][4:]}) == "l4_auth_state"
+    assert sp.meta_file_text(doc, "prog.c#login") is None
+    assert "success path only" in sp.brief_entries(doc, "prog.c", "login")[-1]["discharge"]
+    # Without `success` nothing changes.
+    assert "L4_auth_state_login_on_failure" not in by_name(sp.generate(_gate_model(), threat(auth_gates=[LOGIN_GATE])))
+
+
+@pytest.mark.unit
+def test_gate_checks_go_before_each_return(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    source = (GATE_DIR / "l4_gate_failure.c").read_text(encoding="utf-8")
+    source += "int other(int x)\n{\n    return x;\n}\nint login2(void) { return next(); }\n"
+    (work / "prog.c").write_text(source, encoding="utf-8", newline="\n")
+    doc = sp.generate(_gate_model(), threat(auth_gates=[SUCCESS_GATE]))
+    out = sp.apply_taint(doc, work, taint=False)
+    assert not out["skipped"]
+    assert [c["line"] for c in out["code_checks"]] == [9, 12, 15]
+    lines = (work / "prog.c").read_text(encoding="utf-8").splitlines()
+    assert lines[11] == "        " + FAILURE_CHECK.format("-1") + "return -1;"
+    assert lines[14] == "    " + FAILURE_CHECK.format("0") + "return 0;"
+    assert lines[26] == "    return x;"
+    # A returned call cannot be repeated in the check: skipped and said so.
+    gate2 = {**SUCCESS_GATE, "function": "login2"}
+    m = _gate_model()
+    m["functions"]["prog.c#login2"] = fn("login2", "prog.c", formals=[])
+    out = sp.apply_taint(sp.generate(m, threat(auth_gates=[gate2])), work, taint=False)
+    assert out["skipped"] == ["prog.c:29: login2 return: a returned expression the check cannot repeat"]
+
+
+@pytest.mark.unit
+def test_threat_model_schema_takes_a_gate_success(tmp_path):
+    path = tmp_path / "THREAT_MODEL.md"
+    for success, status in (("0", "ok"), (1, "ok"), ("AUTH_OK", "ok"), ("x; y", trust.STATUS_INVALID)):
+        block = {"schema_version": 1, "input_sources": [], "secrets": [], "output_sinks": []}
+        block["auth_gates"] = [{**LOGIN_GATE, "success": success}]
+        path.write_text(f"# Threat model\n\n```json framac-threat-model\n{json.dumps(block)}\n```\n", encoding="utf-8")
+        assert trust.load_threat_model(path)["status"] == status, success
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["set_on_success", "set_before_check"])
+def test_gate_failure_check_in_the_image(model_run, tmp_path, violate):  # noqa: F811
+    """A gate that sets the state before its check fails the generated check; one that sets it on success proves it."""
+    target = _one_file_target(
+        tmp_path / "target", GATE_DIR / "l4_gate_failure.c", {"auth_gates": [SUCCESS_GATE]}, violate
+    )
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    assert by_name(doc)["L4_auth_state_login_on_failure"]["instances"] == ["prog.c#login"], doc["warnings"]
+    work = run / "gate-work"
+    work.mkdir()
+    shutil.copy(target / "prog.c", work / "prog.c")
+    # Both #ifdef branches hold returns: three checks in the text, two in either build.
+    assert len(sp.apply_taint(doc, work, taint=False)["code_checks"]) == 3
+    defs = " -cpp-extra-args=-DVIOLATE" if violate else ""
+    cmd = [
+        "docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+        "-v", f"{work.resolve()}:/w", "-w", "/w", ANALYSIS_IMAGE, "-c",
+        f"frama-c prog.c{defs} -wp -wp-fct login -wp-prop L4_auth_state_login_on_failure -wp-timeout 10 -wp-par 1",
+    ]  # fmt: skip
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", res.stdout)
+    assert proved and int(proved.group(2)) >= 2, res.stdout
+    assert (proved.group(1) == proved.group(2)) is (not violate), res.stdout

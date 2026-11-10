@@ -65,6 +65,7 @@
           "function": {"$ref": "#/definitions/function_ref"},
           "state": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.>-]*$"},
           "protects": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_ref"}},
+          "success": {"$comment": "plan step M7: the value the gate returns when the check passed (a C constant expression: `0`, `1`, `AUTH_OK`); any other result must leave `state` unchanged", "type": ["string", "integer"], "pattern": "^[A-Za-z0-9_ ()+-]+$"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "protects", "description"],

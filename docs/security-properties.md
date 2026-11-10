@@ -27,7 +27,7 @@ How it runs:
 
 Without a threat model only Layer 3 is generated.
 
-A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`; `output_sinks` `function`, `kind`, `params`, `length`, `format`):
+A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`, `success`; `output_sinks` `function`, `kind`, `params`, `length`, `format`):
 
 ````markdown
 ```json framac-threat-model
@@ -37,7 +37,7 @@ A threat model block looks like this (fields per kind: `input_sources` `function
   "input_sources": [{"function": "parse_packet", "role": "entry", "description": "Bytes from the network."}],
   "trusted_callers": [],
   "secrets": [{"name": "session_key", "kind": "global", "function": "session_close", "description": "Session key."}],
-  "auth_gates": [{"function": "login", "state": "auth_ok", "protects": ["admin"], "description": "Password check."}],
+  "auth_gates": [{"function": "login", "state": "auth_ok", "protects": ["admin"], "success": "0", "description": "Password check."}],
   "output_sinks": [{"function": "syslog", "kind": "log", "params": ["param1"], "format": "param1", "description": "System log."}]
 }
 ```
@@ -89,6 +89,15 @@ An auth gate `{"function": "login", "state": "auth_ok", "protects": ["admin"]}` 
 ```
 
 MetAcsl puts an assertion before every write of every other function (a write of `auth_ok` outside the gate becomes `\false`), and a `requires` on `admin` that WP proves at each call site. A state that hangs off a parameter (`ctx->authed`) is checked in the functions that have that parameter.
+
+Neither property stops the gate itself from setting the state on a failed check. With the gate's `success` value (`"success": "0"`, a C constant expression, plan step M7), a third property, `L4_auth_state_login_on_failure`, says that any other result leaves the state as it was on entry. MetAcsl's `\postcond` context cannot name `\result`, so `security_props.py run` writes it into the work tree, on the same line, before each `return` of the gate, with the returned expression in place of the result:
+
+```c
+if (pw != 42)
+    /*@ check L4_auth_state_login_on_failure: (-1) != (0) ==> auth_ok == \at(auth_ok, Pre); */ return -1;
+```
+
+WP proves it with the gate (unit `l4_auth_state` of the gate, which the other two properties never name); E-ACSL executes it as a non-blocking `check`. A `return` whose expression the check cannot repeat (a call, an assignment) or a `return;` is skipped and listed in the warnings: store the result in a local first.
 
 ---
 

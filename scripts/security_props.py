@@ -379,6 +379,8 @@ class _Gen:
                 continue
             variant, lv, files = resolved
             root = str(state).split("-")[0].split(".")[0]
+            if item.get("success") is not None:
+                self._gate_on_failure(item, gate, variant, lv, root)
             note = (
                 []
                 if variant == "global"
@@ -426,6 +428,41 @@ class _Gen:
                 targets=", ".join(protects),
                 entry_points=sorted(entry),
             )
+
+    def _gate_on_failure(self, item: dict, gate: str, variant: str, lv: str, root: str) -> None:
+        """
+        Plan step M7: when the gate's result is not its `success` value, the auth state is unchanged.
+        MetAcsl's \\postcond cannot name \\result, so this is a `check` apply_code writes before each
+        `return` of the gate, with the returned expression in place of the result.
+        """
+        fids = [f for f in self.m.resolve(gate) if f in self.m.live]
+        if not fids:
+            self.warnings.append(f"auth gate {gate}: not defined in the build: its `success` is not checked")
+            return
+        if variant == "formal" and root not in {str(p.get("name")) for p in self.m.formals(gate) or []}:
+            self.warnings.append(
+                f"auth gate {gate}: state {item.get('state')} is not reached from a parameter of the gate: "
+                "its `success` is not checked"
+            )
+            return
+        name = self._unique(f"{NAME_PREFIX['auth_state']}{_ident(gate)}_on_failure")
+        state = lv.replace("\\formal(", "(")
+        check = self.t.render(
+            "l4_auth_state", "on_failure", name=name, result="${result}", success=str(item["success"]), state=state
+        )
+        self._add(
+            "auth_state",
+            name,
+            check,
+            set(fids),
+            notes=[
+                "written into the work tree before each return of the gate, the returned expression in place of "
+                "the result; a return whose expression the check cannot repeat (a call, an assignment) is skipped"
+            ],
+            threat_model={"auth_gate": gate, "state": item.get("state"), "success": item["success"]},
+            targets=gate,
+            code={"returns": True, "check": check},
+        )
 
     # -- L5 -----------------------------------------------------------------------------------------
 
@@ -1064,11 +1101,13 @@ DEFAULT_WORK = Path("workspace/work")
 # What apply_taint inserts, and nothing else: re-running it first removes these.
 _GENERATED_TAINT_RE = re.compile(
     r"/\*@ (?:taint [^\n]*?; |assert L6_no_leak_[A-Za-z0-9_]+: " + TAINT_TAG + r": [^\n]*?; "
-    r"|check L6_wiped_[A-Za-z0-9_]+: [^\n]*?; )\*/ "
+    r"|check (?:L6_wiped_|L4_auth_state_)[A-Za-z0-9_]+: [^\n]*?; )\*/ "
 )
 # Argument text an assertion may repeat: no call, assignment or increment.
 _ARG_UNSAFE_RE = re.compile(r"[A-Za-z_]\w*\s*\(|(?<![=!<>])=(?!=)|\+\+|--")
 _STATEMENT_STOP = frozenset({";", "{", "}"})
+# Code-check operations (written whatever --eva-taint says): a local's wipe (M6), a gate's failure (M7).
+CODE_OPS = frozenset({"local", "returns"})
 
 
 def taint_annotation(lvalues: str) -> str:
@@ -1180,6 +1219,9 @@ def _insert_taint_in_function(
         if op["kind"] == "local":
             out += _local_check_inserts(source, tokens, op, skipped, where, name, placed)
             continue
+        if op["kind"] == "returns":
+            out += _return_check_inserts(source, tokens, op, skipped, where, name, placed)
+            continue
         if op["kind"] == "entry":
             out.append((body_start + 1, taint_annotation(op["lvalues"])))
         elif op["kind"] == "return":
@@ -1283,6 +1325,38 @@ def _local_check_inserts(
     return out
 
 
+def _return_check_inserts(
+    source: str, tokens: list, op: dict, skipped: list[str], where: str, name: str, placed: list[dict] | None
+) -> list[tuple[int, str]]:
+    """Plan step M7: before each `return <expr>;`, the check with `<expr>` in place of the result."""
+    code = [t for t in tokens if t.kind != "whitespace" and t.kind not in ("c_comment", "acsl_block", "acsl_line")]
+    out: list[tuple[int, str]] = []
+    for i, tok in enumerate(code):
+        if tok.kind != "c_token" or tok.text != "return":
+            continue
+        depth, end = 0, None
+        for k in range(i + 1, len(code)):
+            t = code[k]
+            if t.kind == "c_token" and t.text in "([{":
+                depth += 1
+            elif t.kind == "c_token" and t.text in ")]}":
+                depth -= 1
+            elif t.kind == "c_token" and t.text == ";" and depth == 0:
+                end = k
+                break
+        expr = source[tok.end : code[end].start].strip() if end is not None else ""
+        if not expr or _ARG_UNSAFE_RE.search(expr):
+            skipped.append(
+                f"{where}:{tok.line}: {name} return: "
+                + ("no returned value" if not expr else "a returned expression the check cannot repeat")
+            )
+            continue
+        out.append((tok.start, op["check"].replace("${result}", expr) + " "))
+        if placed is not None:
+            placed.append({"file": where, "line": tok.line, "function": f"{where}#{name}", "property": op["property"]})
+    return out
+
+
 def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
     """
     Write the taint annotations of every property's `taint` plan into the work tree (`work`, the
@@ -1296,9 +1370,12 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         code = p.get("code")
         for fid in p.get("instances") or [] if code else []:
             file, _, name = str(fid).rpartition("#")
-            by_file[file][name].append(
-                {"kind": "local", "local": code["local"], "check": code["check"], "property": p["name"]}
-            )
+            if code.get("returns"):
+                by_file[file][name].append({"kind": "returns", "check": code["check"], "property": p["name"]})
+            else:
+                by_file[file][name].append(
+                    {"kind": "local", "local": code["local"], "check": code["check"], "property": p["name"]}
+                )
         if not taint:
             continue
         plan = p.get("taint") or {}
@@ -1333,8 +1410,8 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         inserts: list[tuple[int, str]] = []
         tainted = False
         for name, ops in sorted(by_file.get(file, {}).items()):
-            local_ops = [op for op in ops if op["kind"] == "local"]
-            taint_ops = [op for op in ops if op["kind"] != "local"]
+            local_ops = [op for op in ops if op["kind"] in CODE_OPS]
+            taint_ops = [op for op in ops if op["kind"] not in CODE_OPS]
             inserts += _insert_taint_in_function(text, name, local_ops, skipped, file, code_placed)
             found = _insert_taint_in_function(text, name, taint_ops, skipped, file, placed)
             if found:
@@ -1410,6 +1487,11 @@ DISCHARGE = {
         "`ensures {name}`): what reaches the sink is sanitized"
     ),
     "wiped": "the generated `ensures {name}`: the secret is zero on every return path",
+    "gate_failure": (
+        "the generated `check {name}` already in the code before each return of the gate (do not edit or move "
+        "it): a result other than the success value leaves the auth state as it was on entry. Set the state on "
+        "the success path only"
+    ),
     "wiped_local": (
         "the generated `check {name}` already in the code before each return in the local's scope (do not edit or "
         "move it): the local is zero there. Wipe it with a loop whose invariants state the zeroed prefix"
@@ -1451,7 +1533,11 @@ def brief_entries(props: dict, file: str, name: str) -> list[dict]:
                 "metacsl": p.get("acsl"),
                 "notes": p.get("notes") or [],
                 "discharge": (
-                    DISCHARGE["wiped_local"] if p.get("code") else DISCHARGE.get(str(p.get("kind")), "")
+                    DISCHARGE["gate_failure"]
+                    if (p.get("code") or {}).get("returns")
+                    else DISCHARGE["wiped_local"]
+                    if p.get("code")
+                    else DISCHARGE.get(str(p.get("kind")), "")
                 ).format(name=p.get("name")),
             }
         )

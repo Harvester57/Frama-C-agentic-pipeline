@@ -1224,14 +1224,14 @@ def _code_checks(path: Path = DEFAULT_SECURITY_PROPS) -> dict[tuple[str, int], d
 def _ingest_code_checks(
     units: dict[str, dict], rows: list[tuple[str, dict]], checks: dict, module: str, tool_output: str
 ) -> None:
-    """Eva's statuses of the in-code wipe checks: evidence on the l6_wiped unit (WP decides it)."""
+    """Eva's statuses of the in-code checks (M6 wipes, M7 gate failures): evidence on their property's unit (WP decides it)."""
     for verdict, row in rows:
         check = checks.get(_code_key(row))
         if not check:
             continue
         for u in units.values():
             if (
-                u["obligation_class"] == "l6_wiped"
+                str(check.get("property")) in ((u.get("bookkeeping") or {}).get("security_properties") or [])
                 and u["function"] == str(row.get("function") or "")
                 and _alarm_in_file(row, u["file"])
             ):
@@ -1243,7 +1243,7 @@ def _ingest_code_checks(
                     False,
                     tool_output,
                     f"Eva slice '{module}': {check.get('property')} at line {row.get('line')} is {verdict}; "
-                    "the wipe is WP's to prove.",
+                    "WP proves the check.",
                 )
 
 
