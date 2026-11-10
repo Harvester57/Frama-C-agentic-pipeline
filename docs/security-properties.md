@@ -113,7 +113,7 @@ The no-leak check sees direct flows only. A copy of the secret into a buffer tha
 
 ## Known Limits
 
-- **Pipeline integration:** `security_props.py run` is a `/framac-slice` step. The benchmark and the generated Makefile do not run it.
+- **Pipeline integration:** `security_props.py run` is a `/framac-slice` step. The generated Makefile runs it as the `security-props` target, which `seed` depends on, and `benchmark.py` and `benchmark_seeded.py` run it as the `security_props` stage before the ledger seed.
 - **L3 over-approximation:** a call to a libc memory writer counts as a pointer write even when its destination is local.
 - **L5 on string literals:** `L5_no_crlf` on a literal argument does not prove, even with Alt-Ergo, Z3 and CVC5 at 10 s.
 - **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop with invariants does.

@@ -55,7 +55,7 @@ def test_input_slice_by_value_points_at_the_input_never_takes_input_bytes_as_a_p
     stmt, layout, _ = ah.single_case("UsefulBuf_Compare", rec, SPARE, _api())
     assert stmt is not None and layout is not None
     # Never the whole struct from the input.
-    assert "memcpy(&c0a0, fuzz_buf" not in stmt and "memcpy(&c0a1, fuzz_buf" not in stmt
+    assert "memcpy(&c0a0, " not in stmt and "memcpy(&c0a1, " not in stmt
     # The first slice takes the rest of the input; the second a generator buffer read from the input.
     assert "c0a0.ptr = (void *)(fuzz_buf + fuzz_off); c0a0.len = (unsigned long)(fuzz_len - fuzz_off);" in stmt
     assert layout["rest"] == {"call": 0, "param": 0, "kind": "bytes", "off": 0}
@@ -259,7 +259,7 @@ def test_bools_from_the_input_take_the_low_bit():
     api = ah.ApiInfo(structs=layouts, probed=True)
     stmt, layout, _ = ah.single_case("h", {"signature": "int(struct opts)", "formals": _formals("value")}, SPARE, api)
     assert stmt is not None and layout is not None
-    assert "c0a0.on = (fc_b & 1U) != 0;" in stmt and "memcpy(&c0a0, fuzz_buf" not in stmt
+    assert "c0a0.on = (fc_b & 1U) != 0;" in stmt and "memcpy(&c0a0, " not in stmt
     assert [(s["kind"], s["off"], s["size"]) for s in layout["slots"]] == [("field", 0, 1), ("field", 4, 4)]
 
 
@@ -312,7 +312,7 @@ def test_sequence_initializer_gets_slices_by_the_same_rules():
     ]
     stmt, layout, _ = ah.sequence_case(trace, [0, 1], records, SPARE, _init_api())
     assert stmt is not None and layout is not None
-    assert "c0a1.ptr = (void *)(fuzz_buf + fuzz_off);" in stmt and "memcpy(&c0a1, fuzz_buf" not in stmt
+    assert "c0a1.ptr = (void *)(fuzz_buf + fuzz_off);" in stmt and "memcpy(&c0a1, " not in stmt
     assert stmt.count("QCBORDecode_Init(") == 1 and "inits" not in layout
     assert "sizeof(struct _QCBORDecodeContext)" in stmt
     # A chain whose first use of the context is not its initializer gets it first.
@@ -489,3 +489,143 @@ def test_generate_writes_valid_layouts_with_inits_and_notes(tmp_path, monkeypatc
     sel = by_entry["QCBORDecode_GetInt64"]["selector"]
     seeds = [p.read_bytes() for p in Path("workspace/seeds/lib").iterdir()]
     assert bytes([sel]) + b"\0\0\0\0\xa0" in seeds
+
+
+# --- Eva Unknowns of libseccomp run-4 (docs/troubleshooting.md, Section 4): input copies and handles -----
+
+
+def test_the_harness_copies_input_through_the_macro_and_seeds_still_read_the_slots():
+    rec = {"signature": "int(unsigned int,char const *)", "formals": _formals("value", "value")}
+    stmt, layout, _ = ah.single_case("resolve", rec, SPARE, _api())
+    assert stmt is not None and layout is not None
+    # The scalar and the string are the harness's own copies: never straight from fuzz_buf, whose
+    # bytes Eva cannot show initialized behind the length guard.
+    assert "memcpy(&c0a0, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), sizeof(c0a0));" in stmt
+    assert "memcpy(c0a1, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), rest_n); c0a1[rest_n] = 0;" in stmt
+    assert "fuzz_buf + fuzz_off" not in stmt
+    assert sh.case_bindings(stmt, {"resolve"})["slots"] == ["c0a0"]
+
+
+def test_the_template_gives_eva_an_initialized_shadow_for_those_copies():
+    text = (Path(__file__).resolve().parents[1] / "templates" / "harness_dual.c.template").read_text(encoding="utf-8")
+    define = "#define FRAMAC_FUZZ_COPY(buf, off) "
+    eva = text[text.index("int eva_main(void)") : text.index("int LLVMFuzzerTestOneInput")]
+    assert "Frama_C_make_unknown((char *)framac_input_init, MAX_INPUT_SIZE);" in eva
+    # The input itself keeps its uninitialized tail: a target read past input_len stays an alarm.
+    assert "Frama_C_make_unknown((char *)input_buf, input_len);" in eva
+    before_eva = text[: text.index("int eva_main(void)")]
+    assert before_eva.split(define)[-1].startswith("(framac_input_init + (off))")
+    # The LibFuzzer entry copies from the input again.
+    assert eva.split(define)[-1].startswith("((buf) + (off))")
+
+
+def _fn(name: str, qual: str, *params: tuple[str, str]) -> dict:
+    return {
+        "kind": "FunctionDecl",
+        "name": name,
+        "type": {"qualType": qual},
+        "inner": [{"kind": "ParmVarDecl", "name": n, "type": {"qualType": t}} for n, t in params],
+    }
+
+
+CTX = "scmp_filter_ctx"
+HANDLE_TREE = {
+    "kind": "TranslationUnitDecl",
+    "inner": [
+        {"kind": "TypedefDecl", "name": CTX, "type": {"qualType": "void *"}},
+        {"kind": "TypedefDecl", "name": "uint32_t", "type": {"qualType": "unsigned int"}},
+        {"kind": "RecordDecl", "name": "opaque", "tagUsed": "struct"},
+        {"kind": "TypedefDecl", "name": "opaque_t", "type": {"qualType": "struct opaque *"}},
+        _record("plain", _field("a", "int")),
+        _fn("seccomp_init", f"{CTX} (uint32_t)", ("def_action", "uint32_t")),
+        _fn("seccomp_release", f"void ({CTX})", ("ctx", CTX)),
+        _fn("seccomp_load", f"int (const {CTX})", ("ctx", f"const {CTX}")),
+        _fn("seccomp_merge", f"int ({CTX}, {CTX})", ("d", CTX), ("s", CTX)),
+        _fn("export_mem", f"int (const {CTX}, void *)", ("ctx", f"const {CTX}"), ("buf", "void *")),
+        _fn("op_new", "opaque_t (void)"),
+        _fn("op_use", "int (struct opaque *, struct plain *)", ("o", "struct opaque *"), ("p", "struct plain *")),
+    ],
+}
+
+
+def test_handle_prototypes_name_typedefs_of_void_pointers_and_pointers_to_undefined_structs():
+    _, declared = ah.record_layouts(HANDLE_TREE)
+    assert isinstance(declared, ah.Declared)
+    protos = declared.prototypes
+    assert protos["seccomp_init"] == {"ret": CTX, "params": [None]}
+    assert protos["seccomp_load"] == {"ret": None, "params": [CTX]}
+    # A plain `void *` is no handle, nor is a pointer to a struct the headers define.
+    assert protos["export_mem"]["params"] == [CTX, None]
+    assert protos["op_new"]["ret"] == "struct opaque *"
+    assert protos["op_use"]["params"] == ["struct opaque *", None]
+    assert "seccomp_init" in declared and "op_use" in declared
+
+
+def _handle_api() -> tuple[ah.ApiInfo, dict[str, dict]]:
+    def rec(name: str, signature: str, *kinds: str) -> dict:
+        return {"name": name, "signature": signature, "formals": _formals(*kinds)}
+
+    recs = {
+        "seccomp_init": rec("seccomp_init", "void *(unsigned int)", "value"),
+        "seccomp_release": rec("seccomp_release", "void(void *)", "pointer"),
+        "seccomp_load": rec("seccomp_load", "int(void *)", "pointer"),
+        "seccomp_merge": rec("seccomp_merge", "int(void *,void *)", "pointer", "pointer"),
+        "export_mem": rec("export_mem", "int(void *,void *)", "pointer", "pointer"),
+    }
+    _, declared = ah.record_layouts(HANDLE_TREE)
+    handles, ctors, dtors, dtor_names, ctor_records, returns = ah.handle_functions(recs, declared)
+    assert returns == {"seccomp_init": CTX}
+    assert ctors == {CTX: "seccomp_init"} and dtors == {CTX: "seccomp_release"}
+    assert handles["export_mem"] == {0: CTX}
+    api = ah.ApiInfo(
+        probed=True,
+        records=ctor_records,
+        handles=handles,
+        ctors=ctors,
+        dtors=dtors,
+        dtor_names=dtor_names,
+        returns=returns,
+    )
+    return api, recs
+
+
+def test_an_opaque_handle_is_constructed_and_released_around_the_call():
+    api, recs = _handle_api()
+    stmt, layout, _ = ah.single_case("seccomp_load", recs["seccomp_load"], SPARE, api)
+    assert stmt is not None and layout is not None
+    # The constructor's argument comes from the input; no zeroed byte buffer stands in for the handle.
+    assert "unsigned int c1a0;" in stmt and "unsigned char c0a0[" not in stmt
+    call = f"{CTX} c0a0 = seccomp_init(c1a0); (void)seccomp_load((void *)c0a0);"
+    assert f"{call} if (c0a0 != 0) {{ (void)seccomp_release(c0a0); }}" in stmt
+    assert layout["inits"] == [{"fn": "seccomp_init", "call": 1, "for": {"call": 0, "param": 0}}]
+    assert [(s["call"], s["param"]) for s in layout["slots"]] == [(1, 0)]
+    # Only the handle: the plain `void *` beside it stays a spare buffer.
+    stmt, _, _ = ah.single_case("export_mem", recs["export_mem"], SPARE, api)
+    assert stmt is not None and f"{CTX} c0a0 = seccomp_init(c1a0);" in stmt
+    assert f"static unsigned char c0a1[{SPARE}];" in stmt
+
+
+def test_the_destructor_and_the_constructor_cases_do_not_release_twice_or_construct_first():
+    api, recs = _handle_api()
+    stmt, _, _ = ah.single_case("seccomp_release", recs["seccomp_release"], SPARE, api)
+    assert stmt is not None
+    assert stmt.count("seccomp_release(") == 1 and f"{CTX} c0a0 = seccomp_init(c1a0);" in stmt
+    stmt, layout, _ = ah.single_case("seccomp_init", recs["seccomp_init"], SPARE, api)
+    assert stmt is not None and layout is not None
+    assert stmt.count("seccomp_init(") == 1 and "inits" not in layout
+    # The handle the constructor's own case makes is released: no leak per run of the case.
+    assert f"{{ {CTX} c0r = seccomp_init(c0a0); if (c0r != 0) {{ (void)seccomp_release(c0r); }} }}" in stmt
+
+
+def test_handles_stay_buffers_when_ownership_or_the_destructor_is_unknown():
+    api, recs = _handle_api()
+    stmt, layout, _ = ah.single_case("seccomp_merge", recs["seccomp_merge"], SPARE, api)
+    assert stmt is not None and layout is not None
+    assert "seccomp_init(" not in stmt and "seccomp_release(" not in stmt
+    assert len(layout["notes"]) == 2 and "takes 2 such handles" in layout["notes"][0]
+    api.dtors.clear()
+    stmt, layout, _ = ah.single_case("seccomp_load", recs["seccomp_load"], SPARE, api)
+    assert stmt is not None and layout is not None
+    assert "seccomp_init(" not in stmt and "no destructor known" in layout["notes"][0]
+    # Without a probe nothing is a handle.
+    assert ah.handle_functions(recs, None)[0] == {}

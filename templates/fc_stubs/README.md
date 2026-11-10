@@ -15,6 +15,9 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
 1. **Prototypes, types, macros and ACSL contracts only. Never C function bodies.** A body in a
    stub would be analysed as if it were the library, which makes the results depend on code
    nobody reviewed. Enforced by `test_fc_stub_headers_contain_no_function_bodies`.
+   Not every prototype has a contract yet: `json-c/json.h` has none, so Eva and WP use default
+   `assigns` for those functions and a proof that calls them is not sound. The functions still
+   without a contract are listed in the allowlist of the stub contract lint test; the list only shrinks.
 2. **Opaque handle types must be complete, and they are never dereferenced.** E-ACSL emits
    `alignof`/`sizeof` on pointed-to types, so `typedef struct json_object json_object;` alone
    fails to compile. Use one dummy member (`struct json_object { int _fc_opaque; };`). The

@@ -39,8 +39,24 @@ typedef uint64_t __uint64_t;
 #define MAX_INPUT_SIZE {{MAX_INPUT_SIZE}}
 #endif
 
+/*
+ * Where a dispatch case copies input bytes into an argument it builds itself (a scalar, a struct
+ * without pointers, a string): the input in the LibFuzzer entry, redefined for Eva below.
+ */
+#define FRAMAC_FUZZ_COPY(buf, off) ((buf) + (off))
+
 #if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)
 #include "__fc_builtin.h"
+
+/*
+ * In eva_main such a copy reads a fully initialized shadow of the input. Eva does not relate fuzz_len
+ * to the initialized prefix of input_buf, so a copy from input_buf itself would leave every
+ * argument possibly uninitialized, even behind the harness's own length guard. The guard is harness
+ * code, so the copied bytes are input bytes: any initialized value. A pointer the target receives
+ * into the input still points into input_buf, where a read past input_len is an alarm.
+ */
+#undef FRAMAC_FUZZ_COPY
+#define FRAMAC_FUZZ_COPY(buf, off) (framac_input_init + (off))
 
 /*@
   terminates \true;
@@ -54,6 +70,9 @@ int eva_main(void) {
     if (input_len > 0) {
         Frama_C_make_unknown((char *)input_buf, input_len);
     }
+    uint8_t framac_input_init[MAX_INPUT_SIZE];
+    Frama_C_make_unknown((char *)framac_input_init, MAX_INPUT_SIZE);
+    (void)framac_input_init;
     uint8_t *fuzz_buf = input_buf;
     size_t fuzz_len = input_len;
     (void)fuzz_buf;
@@ -64,6 +83,8 @@ int eva_main(void) {
 
     return 0;
 }
+#undef FRAMAC_FUZZ_COPY
+#define FRAMAC_FUZZ_COPY(buf, off) ((buf) + (off))
 #endif /* defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__) */
 
 /*

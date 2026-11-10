@@ -7,7 +7,8 @@ fuzzed. This one gives every API entry point of the module's scope a dispatch ca
 byte selects it), with arguments built from the model's signature of each function:
 
   - a scalar, an enum, or a struct by value without pointers: read from the input
-    (`memcpy(&a, fuzz_buf + fuzz_off, sizeof a)`);
+    (`memcpy(&a, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), sizeof a)`: the input, or in `eva_main` an
+    initialized shadow of it, see templates/harness_dual.c.template);
   - a struct by value with pointers (a `{ptr, len}` slice such as QCBOR's `UsefulBufC`): never read
     from the input as a whole, so no input byte becomes a pointer. Its layout comes from the target's
     headers (`probe_layouts`: clang's AST of the harness). Each (pointer, length) field pair gets
@@ -31,6 +32,15 @@ byte selects it), with arguments built from the model's signature of each functi
     the recorded traces call first, else the plainest): one object, initialized by that call before
     the call under test (its own arguments built by the same rules; the case's `inits` name it). The
     initializer's own case does not call it first;
+  - an opaque handle (a typedef of `void *`, or a pointer to a struct the headers only declare, as
+    the layout probe saw the parameter written): the result of the API's constructor for that type
+    (a function named like an initializer that returns it), released after the call under test with
+    the API's destructor (a function of that one parameter named like `*_release`, `*_free`,
+    `*_destroy`); a call under test that returns a handle has its result released the same way. A
+    zeroed byte buffer is no such object: it is not aligned for the struct behind
+    the handle and fails the target's own validity checks. Built only when the call takes one handle
+    of the type and both functions are known; otherwise, and without a probe, the parameter is a
+    byte pointer as below and the case's `notes` say why;
   - a pointer to another scalar or struct: one object (an output, or read from the input when `const`
     and the struct has no pointers; zeroed otherwise);
   - a function pointer: NULL.
@@ -70,8 +80,15 @@ MAX_CASES = 255  # one selector byte
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
 MAX_DIAGNOSTIC_CHARS = 300
 POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
+# The source of a copy the harness makes itself: the input, or in eva_main an initialized shadow of it
+# (templates/harness_dual.c.template defines the macro for both entries).
+FUZZ_COPY = "FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off)"
 # Initializer names: QCBORDecode_Init, UsefulOutBuf_Init, ctx_init, foo_new, bar_create.
 _INIT_NAME_RE = re.compile(r"Init|(?:^|_)init(?:$|_)|_new$|_create$")
+# Destructor names: seccomp_release, foo_free, bar_destroy, ctx_close, FooFree.
+_DTOR_NAME_RE = re.compile(
+    r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|Free|Destroy|Release"
+)
 
 # Byte size of the scalars a slot can hold (x86_64): a seed needs it to lay out the input.
 SCALAR_BYTES = {
@@ -142,6 +159,13 @@ class ApiInfo:
     inits: dict[str, str] = field(default_factory=dict)
     candidates: dict[str, set[str]] = field(default_factory=dict)
     records: dict[str, dict] = field(default_factory=dict)
+    # Opaque handles (`handle_functions`): per function, parameter index -> handle type; per handle
+    # type, its constructor, its destructor and every function named like a destructor of it.
+    handles: dict[str, dict[int, str]] = field(default_factory=dict)
+    ctors: dict[str, str] = field(default_factory=dict)
+    dtors: dict[str, str] = field(default_factory=dict)
+    dtor_names: dict[str, set[str]] = field(default_factory=dict)
+    returns: dict[str, str] = field(default_factory=dict)  # function -> the handle type it returns
 
 
 class _Case:
@@ -163,7 +187,7 @@ class _Case:
     ) -> None:
         ref = f"&{var}" if addr else var
         self.decls.append(
-            f"if (fuzz_len >= fuzz_off + sizeof({var})) {{ memcpy({ref}, fuzz_buf + fuzz_off, sizeof({var}));"
+            f"if (fuzz_len >= fuzz_off + sizeof({var})) {{ memcpy({ref}, {FUZZ_COPY}, sizeof({var}));"
             f" fuzz_off += sizeof({var}); }}"
         )
         self.slots.append({"call": call, "param": param, "size": size, "kind": kind, **extra})
@@ -313,6 +337,18 @@ def _init_call(case: _Case, pointee: str, target: str, call: int, param: int) ->
     return _bind_call(case, k, fn, params or [], list(rec.get("formals") or []), rec, {0: target}, allow_init=False)
 
 
+def _handle_call(case: _Case, htype: str, var: str, call: int, param: int) -> str:
+    """`<handle type> var = <constructor>(...);` before call `call`, the constructor's arguments by the usual rules."""
+    fn = case.api.ctors[htype]
+    rec = case.api.records.get(fn) or {}
+    params, _ = plan_params(str(rec.get("signature") or ""))
+    k = case.ncalls + len(case.inits)
+    case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
+    stmt = _bind_call(case, k, fn, params or [], list(rec.get("formals") or []), rec, allow_init=False)
+    # Without initializers the statement is the call alone: keep its result instead of dropping it.
+    return stmt.replace("(void)", f"{htype} {var} = ", 1)
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -331,12 +367,34 @@ def _bind_call(
     varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
     before: list[str] = []
+    after: list[str] = []
+    handles = case.api.handles.get(name) or {}
     i = 0
     n = len(params)
     while i < n:
         p = params[i]
         v = f"c{call}a{i}"
         nxt = params[i + 1] if i + 1 < n else None
+        htype = handles.get(i) if allow_init and i not in shared and p["kind"] == "ptr" else None
+        if htype is not None and htype in case.api.ctors:
+            same = sum(1 for t in handles.values() if t == htype)
+            if htype not in case.api.dtors:
+                case.note(call, i, f"{htype}: no destructor known: a zeroed buffer, not a constructed handle")
+            elif same > 1:
+                case.note(
+                    call,
+                    i,
+                    f"{htype}: the call takes {same} such handles and who owns them afterwards is not known: "
+                    "zeroed buffers, not constructed handles",
+                )
+            else:
+                # A handle: the constructor's result, released afterwards unless this call is the release.
+                before.append(_handle_call(case, htype, v, call, i))
+                if name not in case.api.dtor_names.get(htype, set()):
+                    after.append(f"if ({v} != 0) {{ (void){case.api.dtors[htype]}({v}); }}")
+                args.append(f"({p['type']}){v}")
+                i += 1
+                continue
         if i in shared:
             args.append(f"({p['type']}){shared[i]}")
             if nxt is not None and (i + 1) not in shared and _is_pair(params, i, formals):
@@ -397,7 +455,7 @@ def _bind_call(
                     case.rest = {"call": call, "param": i, "kind": "string"}
                     case.post.append(
                         f"{{ size_t rest_n = fuzz_len - fuzz_off; if (rest_n > sizeof({v}) - 1) "
-                        f"{{ rest_n = sizeof({v}) - 1; }} memcpy({v}, fuzz_buf + fuzz_off, rest_n); {v}[rest_n] = 0; }}"
+                        f"{{ rest_n = sizeof({v}) - 1; }} memcpy({v}, {FUZZ_COPY}, rest_n); {v}[rest_n] = 0; }}"
                     )
                 args.append(f"({p['type']}){v}")
                 i += 1
@@ -444,7 +502,13 @@ def _bind_call(
             case.slot(v, SCALAR_BYTES.get(p["ctype"]), call, i, "int")
         args.append(v)
         i += 1
-    return " ".join([*before, f"(void){name}({', '.join(args)});"])
+    made = case.api.returns.get(name) if allow_init else None
+    if made is not None and made in case.api.dtors:
+        # The call under test makes a handle: release it, or every run of the case leaks one.
+        r = f"c{call}r"
+        own = f"{{ {made} {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){case.api.dtors[made]}({r}); }} }}"
+        return " ".join([*before, own, *after])
+    return " ".join([*before, f"(void){name}({', '.join(args)});", *after])
 
 
 def plan_params(signature: str) -> tuple[list[dict] | None, str | None]:
@@ -539,6 +603,50 @@ def initializers(
         if t not in chosen:
             chosen[t] = min(names, key=plainest)
     return chosen, cands, records
+
+
+def handle_functions(
+    functions: dict[str, dict], visible: set[str] | None
+) -> tuple[
+    dict[str, dict[int, str]], dict[str, str], dict[str, str], dict[str, set[str]], dict[str, dict], dict[str, str]
+]:
+    """
+    Opaque handles among `functions` (the model's records the harness may call): (per function, the
+    parameters that are handles; per handle type its constructor, its destructor, every function named
+    like a destructor of it; the records of the constructors; per function, the handle type it returns). The types come from the layout probe
+    (`visible`, a `Declared`): the model's signatures have typedefs expanded, so `scmp_filter_ctx` and
+    any other `void *` look alike there. Without a probe nothing is a handle.
+
+    A constructor is named like an initializer, returns the handle type and takes none; the fewest
+    parameters win, then the name. A destructor is named like one and takes the handle alone.
+    """
+    protos = getattr(visible, "prototypes", None) or {}
+    by_name: dict[str, dict] = {}
+    for key, rec in functions.items():
+        if isinstance(rec, dict) and not (rec.get("static") and not rec.get("header")):
+            by_name.setdefault(str(rec.get("name") or key.split("#")[-1]), rec)
+    handles: dict[str, dict[int, str]] = {}
+    ctor_cands: dict[str, list[str]] = {}
+    dtor_cands: dict[str, set[str]] = {}
+    returns: dict[str, str] = {}
+    for name, rec in by_name.items():
+        proto = protos.get(name)
+        params, _ = plan_params(str(rec.get("signature") or ""))
+        if not isinstance(proto, dict) or params is None or len(params) != len(proto.get("params") or []):
+            continue
+        mine = {i: t for i, t in enumerate(proto["params"]) if t and params[i]["kind"] == "ptr"}
+        if mine:
+            handles[name] = mine
+        ret = proto.get("ret")
+        if ret:
+            returns[name] = ret
+        if ret and not mine and _INIT_NAME_RE.search(name):
+            ctor_cands.setdefault(ret, []).append(name)
+        if len(params) == 1 and mine and _DTOR_NAME_RE.search(name):
+            dtor_cands.setdefault(mine[0], set()).add(name)
+    ctors = {t: min(names, key=lambda n: (len(protos[n]["params"]), n)) for t, names in ctor_cands.items()}
+    dtors = {t: min(names) for t, names in dtor_cands.items()}
+    return handles, ctors, dtors, dtor_cands, {n: by_name[n] for n in ctors.values()}, returns
 
 
 def load_traces(path: Path = TRACES_JSONL) -> list[list[dict]]:
@@ -712,12 +820,18 @@ def plan(
         and (str(rec.get("name") or k.split("#")[-1]) in entry_names or (rec.get("static") and rec.get("header")))
     }
     inits, candidates, init_records = initializers(init_pool, traces, visible)
+    handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
     api = ApiInfo(
         structs=dict(struct_layouts or {}),
         probed=struct_layouts is not None,
         inits=inits,
         candidates=candidates,
-        records=init_records,
+        records={**init_records, **ctor_records},
+        handles=handles,
+        ctors=ctors,
+        dtors=dtors,
+        dtor_names=dtor_names,
+        returns=returns,
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -791,6 +905,84 @@ def _walk_records(tree: dict) -> tuple[dict[str, dict], set[str]]:
     return records, functions
 
 
+class Declared(set):  # type: ignore[type-arg]
+    """
+    The function names a probe saw declared. `prototypes` gives, for each, the opaque handle types in
+    its declaration as written: {name: {"ret": type or None, "params": [type or None, ...]}}.
+    """
+
+    prototypes: dict[str, dict[str, Any]]
+
+    def __init__(self, names: Any = (), prototypes: dict[str, dict[str, Any]] | None = None) -> None:
+        super().__init__(names)
+        self.prototypes = prototypes or {}
+
+
+def _spelled(t: str) -> str:
+    return " ".join(_QUALIFIERS_RE.sub(" ", t).split())
+
+
+def handle_prototypes(tree: dict, complete: set[str]) -> dict[str, dict[str, Any]]:
+    """
+    Per declared function, where its declaration names an opaque handle type: a typedef that resolves
+    to `void *`, or a pointer to a struct or union with no definition in the translation unit
+    (`complete` holds the defined ones). A handle type is named as written when it is a typedef of
+    `void *` (`scmp_filter_ctx`), else by the pointer type (`struct foo *`, also through a typedef).
+    A plain `void *` is not a handle: nothing says what it points to.
+    """
+    typedefs: dict[str, str] = {}
+    decls: list[dict] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        if kind == "FunctionDecl":
+            decls.append(node)
+            continue
+        if kind == "TypedefDecl" and isinstance(node.get("name"), str):
+            typedefs.setdefault(node["name"], str((node.get("type") or {}).get("qualType") or ""))
+        stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+
+    def resolve(t: str) -> str:
+        seen: set[str] = set()
+        t = _spelled(t)
+        while t in typedefs and t not in seen:
+            seen.add(t)
+            t = _spelled(typedefs[t])
+        return t
+
+    def handle(t: str) -> str | None:
+        written = _spelled(t)
+        full = resolve(written)
+        if not full.endswith("*"):
+            return None
+        base = resolve(full[:-1])
+        if "*" in base or "(" in base:
+            return None
+        if base == "void":
+            return written if written in typedefs else None
+        m = _RECORD_TYPE_RE.match(base)
+        if m and m.group(1) != "enum" and base not in complete:
+            return f"{base} *"
+        return None
+
+    out: dict[str, dict[str, Any]] = {}
+    for node in decls:
+        name = node.get("name")
+        qual = str((node.get("type") or {}).get("qualType") or "")
+        if not isinstance(name, str) or "(" not in qual:
+            continue
+        params = [
+            handle(str((n.get("type") or {}).get("qualType") or ""))
+            for n in node.get("inner") or []
+            if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"
+        ]
+        ret = handle(qual[: qual.index("(")])
+        if ret or any(params):
+            out.setdefault(name, {"ret": ret, "params": params})
+    return out
+
+
 def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
     """
     The layouts of every complete named struct and union of a clang JSON AST (x86_64 sizes and
@@ -798,7 +990,8 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
     kind (int, float, enum, ptr, fnptr, array, record), off, size, ctype?, const?, what?, pointers?, bools?}],
     bools?}; `bools` marks a record or member holding a `_Bool`.
     A record with a bit-field, a packed or aligned attribute, an anonymous member or a type the
-    generator does not know has no layout.
+    generator does not know has no layout. The functions are a `Declared`, which also carries the
+    opaque handle types of their declarations (`handle_prototypes`).
     """
     raw, functions = _walk_records(tree)
     memo: dict[str, dict | None] = {}
@@ -899,7 +1092,7 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         return out
 
     layouts = {k: lay for k in raw if (lay := layout(k)) is not None}
-    return layouts, functions
+    return layouts, Declared(functions, handle_prototypes(tree, set(raw)))
 
 
 def probe_layouts(

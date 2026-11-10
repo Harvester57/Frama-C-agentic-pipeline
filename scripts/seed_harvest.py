@@ -1094,13 +1094,17 @@ def _bare(arg: str) -> str:
         a = b
 
 
+# The harness's own copies name their source through a macro (api_harness.FUZZ_COPY).
+_FUZZ_COPY_RE = re.compile(r"FRAMAC_FUZZ_COPY\(\s*fuzz_buf\s*,\s*fuzz_off\s*\)")
+
+
 def case_bindings(stmt: str, functions: set[str]) -> dict[str, Any]:
     """
     How one case turns its input into API arguments: the scalar slots it reads first (in order), and per
     call of a recorded function, which parameter receives a slot ('slot'/'pslot' with the variable) or
     the rest of the input ('data' for a pointer or string, 'struct' for a struct around it).
     """
-    s = strip_comments(stmt)
+    s = _FUZZ_COPY_RE.sub("fuzz_buf + fuzz_off", strip_comments(stmt))
     slots: list[str] = []
     data: set[str] = set()
     structs: set[str] = set()
