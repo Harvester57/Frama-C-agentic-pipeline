@@ -20,11 +20,10 @@ from conftest import write_json
 from framac_common import read_report_csv
 from generate_harness import _build_dispatch_invocation
 from test_eva_tuning import ACSL, COMPLETE_LOG
-from test_pipeline_make import SIDECARS, _make_run
+from test_pipeline_make import REPO, SIDECARS, _make_run
 
 pytestmark = pytest.mark.unit
 
-REPO = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------

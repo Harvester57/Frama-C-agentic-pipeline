@@ -564,7 +564,7 @@ def test_ingest_eva_maps_kernel_renamed_copies_to_their_unit(run_dir):
         "function": "get_0",
         "line": 3,
         "kind": "mem_access",
-        "property": "\valid(p)",
+        "property": "\\valid(p)",
     }
     rep = eva_report(
         module="m",
@@ -1086,7 +1086,7 @@ def test_ingest_eva_never_credits_unclassified_statuses(run_dir):
 
 # O1 (docs/open-topics-remediation-plan.md): `unresolved` is `uniqueItems`, and two goals of one
 # function can render to the same text (two pointer accesses on one source line).
-_DUP_GOAL = {"obligation_class": "rte", "kind": "mem_access", "line": 12, "annotation": "\valid(p)"}
+_DUP_GOAL = {"obligation_class": "rte", "kind": "mem_access", "line": 12, "annotation": "\\valid(p)"}
 
 
 @pytest.mark.parametrize(
@@ -1098,7 +1098,7 @@ _DUP_GOAL = {"obligation_class": "rte", "kind": "mem_access", "line": 12, "annot
                 "by_obligation_class": {"rte": {"proven": 1, "proven_under_hyp": 0, "unproven": 2}},
                 "unproven_goals": [dict(_DUP_GOAL), dict(_DUP_GOAL)],
             },
-            ["unproven mem_access at line 12: \valid(p)"],
+            ["unproven mem_access at line 12: \\valid(p)"],
         ),
         (
             {

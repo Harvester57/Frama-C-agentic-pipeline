@@ -307,12 +307,12 @@ int some_fn(void);
 # Top-level declarations a prover adds outside its function (prover brief, Step B: Inductive Lemmas)
 # ---------------------------------------------------------------------------
 
-_BASE = "/*@ requires n >= 0;\n  @ assigns \nothing;\n  @ ensures \result == n;\n  @*/\nint f(int n) { return n; }\n"
+_BASE = "/*@ requires n >= 0;\n  @ assigns \\nothing;\n  @ ensures \\result == n;\n  @*/\nint f(int n) { return n; }\n"
 _GHOST = (
     "/*@ ghost\n"
     "  /@ requires n >= 0;\n"
     "   @ decreases n;\n"
-    "   @ assigns \nothing;\n"
+    "   @ assigns \\nothing;\n"
     "   @ ensures n >= 0;\n"
     "   @/\n"
     "  void lem(int n) { if (n <= 0) return; lem(n - 1); }\n"
@@ -354,6 +354,6 @@ class TestTopLevelAdditions:
 
     def test_another_edit_outside_the_span_keeps_the_old_message(self) -> None:
         base = "int g(void) { return 0; }\n" + _BASE
-        agent = "int g(void) { /*@ assert \true; */ return 0; }\n" + _BASE
+        agent = "int g(void) { /*@ assert \\true; */ return 0; }\n" + _BASE
         with pytest.raises(ScopeViolationError, match=r"agent modified content outside assigned function 'f'$"):
             splice_prover_changes(base, agent, base, "f")

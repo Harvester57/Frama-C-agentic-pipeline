@@ -30,8 +30,6 @@ import resources as R  # noqa: E402
 import wp_scheduler as S  # noqa: E402
 from test_wp_scheduler import Sim, tasks, units  # noqa: E402
 
-TIER1 = "Tier 1A (Untrusted Binary / Network Parser)"
-
 # Feature capability probes for progressive testability across M1-M4
 _HAS_M1_SPLICE = hasattr(acsl_ast, "splice_architect_header")
 _HAS_M2_SPECULATIVE = hasattr(S, "callee_has_contract") or (

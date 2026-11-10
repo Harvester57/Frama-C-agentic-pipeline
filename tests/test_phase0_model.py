@@ -14,9 +14,8 @@ import pytest
 
 import phase0_model as pm
 import resources
-from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, require_docker_images
+from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, ROOT, require_docker_images
 
-ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "phase0"
 TREE = "/framac-scratch/tree"
 

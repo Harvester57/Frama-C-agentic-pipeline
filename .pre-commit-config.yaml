@@ -12,6 +12,15 @@ repos:
     rev: v2.4.1
     hooks:
       - id: mypy
-        files: ^(scripts|tests)/
+        files: ^(scripts|tests|tools)/
         additional_dependencies:
           - pytest
+
+  - repo: local
+    hooks:
+      # Control characters, CRLF, mangled ACSL escapes, redefined test constants
+      - id: check-generated-text
+        name: check generated text
+        entry: python tools/check_generated_text.py
+        language: system
+        files: \.(py|md|sh|c|h)$

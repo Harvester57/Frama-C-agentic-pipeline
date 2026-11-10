@@ -5,6 +5,12 @@
 - Pass git commit messages through a file (`git commit -F msg.txt`), not through a PowerShell pipe.
 - If Git Bash hits fork errors under load, switch to PowerShell instead of retrying.
 
+## Generated-text guardrails
+- Write and change files with the Write/Edit tools only. A PreToolUse hook (`tools/block_heredoc_writes.py`) blocks Bash/PowerShell commands that write a file through a heredoc or here-string.
+- Run Docker from PowerShell on Windows when Git Bash hits fork errors.
+- Pass commit messages via a file: Write `msg.txt`, then `git commit -F msg.txt`.
+- A PostToolUse hook runs `tools/check_generated_text.py` on the files each Write/Edit/Bash/PowerShell call touched and reports control characters, CRLF in `.sh`/`.py`, literal `\n` in `.sh`, mangled ACSL (`\result`, `\valid_read`, `\old` corrupted or missing their backslash) and test constants redefined from an imported module. Fix the hit; if it is intended, add it to `tools/check_generated_text.allow` with a justification. Run `python tools/check_generated_text.py` for the whole repo.
+
 ## Worktrees & parallel agents
 - Cut agent worktrees from the current integration branch (e.g. phase1-remediation), never from an old main commit. Confirm with `git merge-base` before dispatching.
 - When a live pipeline run is in progress, make code changes in an isolated worktree. Don't touch the run's working tree or containers.

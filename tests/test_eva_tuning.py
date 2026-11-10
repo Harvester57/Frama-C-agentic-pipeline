@@ -19,10 +19,8 @@ import run_eva_slice
 from conftest import unit, write_json
 from eva_loops import LoopRef
 from framac_common import STATUS_DEAD, STATUS_INVALID, STATUS_UNKNOWN, STATUS_VALID
-from test_pipeline_make import _make_run
+from test_pipeline_make import ACSL, REPO, _make_run
 
-REPO = Path(__file__).resolve().parent.parent
-ACSL = "/opt/framac-pipeline/templates"
 COMPLETE_LOG = """\
 [eva:final-states] Values at end of function parse:
   n IN {0}

@@ -3,21 +3,17 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import function_facts as ff  # noqa: E402
 from run_wp_function import _is_synthetic_probe_file, _locate_agent_scratch_dir  # noqa: E402
-from test_function_facts import _access, _formal, _loop, _raw, _record, _write  # noqa: E402
+from test_function_facts import MARKER_RE, _access, _formal, _loop, _raw, _record, _write  # noqa: E402
 from workspace_overlay import init_overlay, prepare_agent  # noqa: E402
-
-MARKER_RE = re.compile(r"<!--\s*(?:if:|else|endif)")
 
 MOD_H = r"""#ifndef MOD_H
 #define MOD_H

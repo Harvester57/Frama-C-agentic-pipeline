@@ -25,7 +25,7 @@ RUN_DIR_LINE = re.compile(r"^\[framac-docker\] run dir: (.+)$", re.M)
 
 # A `docker` that logs every call (one JSON argv per line), answers info/images/image/--version, and reports
 # every volume as missing so the wrapper creates it.
-FAKE_ENGINE = """\
+IDENTITY_FAKE_ENGINE = """\
 import json, pathlib, sys
 here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
@@ -54,7 +54,7 @@ def _fake_engine(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     bin_dir.mkdir()
     (bin_dir / "info.json").write_text(json.dumps(DOCKER_INFO), encoding="utf-8")
     script = bin_dir / "fake_engine.py"
-    script.write_text(FAKE_ENGINE, encoding="utf-8")
+    script.write_text(IDENTITY_FAKE_ENGINE, encoding="utf-8")
     if os.name == "nt":
         (bin_dir / "docker.cmd").write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
     else:

@@ -942,7 +942,7 @@ def test_prover_edit_outside_function_scope_is_still_rejected(tmp_path):
     scratch = run_dir / NESTED_SCRATCH
     (scratch / "inc" / "nest" / "api.h").write_text(PROTO_WITH_CONTRACT, encoding="utf-8")
     (scratch / "inc" / "nest" / "cfg.h").write_text(
-        "#ifndef NEST_CFG_H\n#define NEST_CFG_H\n/*@ predicate p = \true; */\n#endif\n", encoding="utf-8"
+        "#ifndef NEST_CFG_H\n#define NEST_CFG_H\n/*@ predicate p = \\true; */\n#endif\n", encoding="utf-8"
     )
     with pytest.raises(WO.ScopeViolationError, match="inc/nest/cfg.h"):
         WO.merge_agent_overlay(
@@ -960,7 +960,7 @@ def test_prover_edit_outside_function_scope_is_still_rejected(tmp_path):
     (scratch / "inc" / "nest" / "cfg.h").write_text(
         "#ifndef NEST_CFG_H\n#define NEST_CFG_H\n#endif\n", encoding="utf-8"
     )
-    (scratch / "inc" / "api.h").write_text('#include "nest/api.h"\n/*@ predicate q = \true; */\n', encoding="utf-8")
+    (scratch / "inc" / "api.h").write_text('#include "nest/api.h"\n/*@ predicate q = \\true; */\n', encoding="utf-8")
     with pytest.raises(WO.ScopeViolationError, match="inc/api.h"):
         WO.merge_agent_overlay(
             run_dir=run_dir,

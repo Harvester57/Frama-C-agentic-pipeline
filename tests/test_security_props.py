@@ -24,10 +24,9 @@ import run_wp_function as rwf
 import security_props as sp
 import trust
 from acsl_ast import tokenize_c_acsl
-from conftest import ANALYSIS_IMAGE, write_json
+from conftest import ANALYSIS_IMAGE, ROOT, write_json
 from test_phase0_model import model_run  # noqa: F401  (Docker fixture)
 
-ROOT = Path(__file__).resolve().parent.parent
 FIX = ROOT / "tests" / "fixtures" / "security_props"
 ASSETS = ROOT / "benchmark" / "assets"
 

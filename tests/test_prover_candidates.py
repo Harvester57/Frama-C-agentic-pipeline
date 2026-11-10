@@ -28,7 +28,7 @@ AID = "prove-f"
 FN = "f"
 C_REL = "src/m/f.c"
 H_REL = "src/m/f.h"
-BASE_C = "int f(int x) { return x; }\n"
+CANDIDATES_BASE_C = "int f(int x) { return x; }\n"
 BASE_H = "int f(int x);\n"
 PASSED = "passed_dynamic_oracle"
 SCRIPT = Path(PC.__file__).resolve()
@@ -47,7 +47,7 @@ def rk(failed: int, proved: int, invalid: int = 0, trivial: int = 0) -> dict:
 
 def annotated(tag: str) -> str:
     """The source with a contract: every tag is a distinct candidate."""
-    return f"/*@ requires {tag}: x >= 0;\n  @ assigns \\nothing;\n  @*/\n{BASE_C}"
+    return f"/*@ requires {tag}: x >= 0;\n  @ assigns \\nothing;\n  @*/\n{CANDIDATES_BASE_C}"
 
 
 def annotated_header(tag: str) -> str:
@@ -74,7 +74,7 @@ class Prover:
         self.scratch = run_dir / "agents" / aid / "scratch"
         for tree in ("work", "base"):
             (self.scratch / tree / C_REL).parent.mkdir(parents=True, exist_ok=True)
-            (self.scratch / tree / C_REL).write_text(BASE_C, encoding="utf-8")
+            (self.scratch / tree / C_REL).write_text(CANDIDATES_BASE_C, encoding="utf-8")
             (self.scratch / tree / H_REL).write_text(BASE_H, encoding="utf-8")
         budget: dict[str, Any] = {
             "agent_id": aid,
@@ -773,7 +773,7 @@ def test_restore_puts_back_files_reports_and_patch_and_is_idempotent(prover):
     # What it replaced is kept: the code_fault report of the last iteration is the evidence of a defect.
     assert load(prover.scratch / f"candidates/last/guard_{FN}.json")["status"] == "code_fault"
     assert (prover.scratch / "candidates/last/work" / C_REL).read_text(encoding="utf-8") == annotated("last")
-    assert (prover.scratch / "base" / C_REL).read_text(encoding="utf-8") == BASE_C
+    assert (prover.scratch / "base" / C_REL).read_text(encoding="utf-8") == CANDIDATES_BASE_C
 
     before = tree_bytes(prover.scratch)
     assert PC.restore_best(prover.scratch) == {
@@ -1439,7 +1439,7 @@ GHOST_LEMMA = (
     "/*@ ghost\n"
     "  /@ requires n >= 0;\n"
     "   @ decreases n;\n"
-    "   @ assigns \nothing;\n"
+    "   @ assigns \\nothing;\n"
     "   @ ensures n >= 0;\n"
     "   @/\n"
     "  void lem(int n) { if (n <= 0) return; lem(n - 1); }\n"
@@ -1485,7 +1485,7 @@ def test_a_predicate_added_in_the_header_is_pending(prover):
 
 def test_declarations_already_in_base_are_not_pending(prover):
     for tree in ("base", "work"):
-        (prover.scratch / tree / C_REL).write_text(GHOST_LEMMA + BASE_C, encoding="utf-8")
+        (prover.scratch / tree / C_REL).write_text(GHOST_LEMMA + CANDIDATES_BASE_C, encoding="utf-8")
     prover.edit(GHOST_LEMMA + annotated("a"))
     assert "scope_violation_pending" not in prover.guard()
 

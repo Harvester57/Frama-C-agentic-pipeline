@@ -19,11 +19,10 @@ import pipeline_make as pm
 import resources as R
 import run_eva_slice
 from test_eva_tuning import ACSL, _base_report, _csv_row, _finish_args, _mk, _record_for, _write_trial
-from test_pipeline_make import _make_run
+from test_pipeline_make import REPO, _make_run
 
 pytestmark = pytest.mark.unit
 
-REPO = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------

@@ -20,10 +20,8 @@ from fingerprint import (
     normalize_predicate,
 )
 from test_eva_tuning import _base_report, _csv_row, _finish_args, _mk, _record, _write_trial
-from test_pipeline_make import FakeMake, _make_run
+from test_pipeline_make import ACSL, REPO, FakeMake, _make_run
 
-REPO = Path(__file__).resolve().parent.parent
-ACSL = "/opt/framac-pipeline/templates"
 MK = (REPO / "templates" / "pipeline.mk").read_text(encoding="utf-8")
 
 

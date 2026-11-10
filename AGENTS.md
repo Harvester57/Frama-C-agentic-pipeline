@@ -22,6 +22,13 @@ python3 -m pytest tests -n auto
 
 See `tests/README.md` for the other variants and `skills/python-testing/SKILL.md` for test conventions.
 
+## Generated-text guardrails
+
+- Write and change files with your file-writing/editing tools only, never through a shell heredoc or PowerShell here-string: the shell rewrites ACSL backslashes (`\result`, `\valid_read`), `\n` and line endings. (Claude Code blocks such commands with `tools/block_heredoc_writes.py`.)
+- Run Docker from PowerShell on Windows when Git Bash hits fork errors.
+- Pass commit messages via a file: write `msg.txt`, then `git commit -F msg.txt`.
+- Run `python tools/check_generated_text.py` (whole repo, or the files you changed) before committing. It flags control characters, CRLF in `.sh`/`.py`, literal `\n` in `.sh`, mangled or backslash-less ACSL builtins, and test constants redefined from an imported module. Intended hits go in `tools/check_generated_text.allow` with a justification.
+
 ## Recording pipeline bugs in `docs/troubleshooting.md`
 
 Whenever you hit a bug, gap or workaround in the pipeline itself while running or developing it (a script, a generator, a gate, the wrapper, a skill or brief that is wrong or incomplete), write it into `docs/troubleshooting.md` **in the same session**, so the maintainers can inspect and correct it later. This applies to every agent: the parent, forks, subagents and anyone working a target run. Do not leave it only in chat or in a progress report.

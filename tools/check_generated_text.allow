@@ -1,0 +1,8 @@
+# Known, intended hits of tools/check_generated_text.py.
+# Format: <path glob> <rule|*> -- <justification>   (the justification is required)
+# Keep entries narrow: one file and one rule, and say why the hit is deliberate.
+
+tests/test_acsl_only_and_merge.py acsl-corrupted -- the "\x0calse" clause is a deliberate fixture: verify_acsl_only must reject an annotation whose \false was corrupted into a form feed.
+tests/test_promote_and_verifier.py acsl-corrupted -- deliberately non-raw clause ("\valid", "\at", "\base_addr", "\forall", "\false"): the test checks that load_agent_result_json repairs those control characters.
+tests/test_check_generated_text.py acsl-corrupted -- the checker's own fixtures: mangled ACSL strings the rule must catch.
+tests/test_check_generated_text.py acsl-missing-backslash -- the checker's own fixtures: annotations without backslashes the rule must catch.

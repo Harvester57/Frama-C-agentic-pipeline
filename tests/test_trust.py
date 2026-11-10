@@ -13,10 +13,9 @@ from pathlib import Path
 import pytest
 
 import trust as T
-from conftest import PHASE0_FIXTURES
+from conftest import PHASE0_FIXTURES, ROOT
 from test_phase0_model import model_run  # noqa: F401  (the Docker capture + model fixture)
 
-ROOT = Path(__file__).resolve().parent.parent
 pytestmark = pytest.mark.unit
 
 
