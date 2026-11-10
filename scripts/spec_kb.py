@@ -154,7 +154,7 @@ _FEATURE_QUERY = {
     "read_only_loop": "loop assigns loop invariant read-only loop",
     "macro_loops": "macro loop annotation preprocessor",
     "pointer_walk": "pointer walk loop invariant \\at base_addr offset pointer difference",
-    "strings": "valid_read_nstring valid_read_string \\strlen nul terminated string",
+    "strings": "valid_read_string valid_read_nstring valid_string strlen nul terminated string",
     "floats": "\\is_NaN \\is_finite floating point",
     "unions": "union equality \\with struct",
     "structs": "struct field equality \\initialized padding",

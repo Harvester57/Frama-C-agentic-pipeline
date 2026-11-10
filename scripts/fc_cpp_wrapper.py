@@ -35,6 +35,17 @@ initializer, refuses to start on ("globals initialization is not computable"). O
 with an identifier-only cast `(I)` and a null pointer `0`, `(0)` or `((void *)0)` is touched; a pointer
 cast, a further `->` or a call leaves the expression alone.
 
+Third, `syscall` with a constant number becomes a call to a typed declaration with a real contract, for the
+numbers that write memory (`syscall` itself is variadic, and its contract cannot say what it writes):
+
+    syscall(318, buf, sizeof buf, 0)  ->  __fc_syscall_getrandom(buf, sizeof buf, 0)
+
+The numbers are x86_64's (`SYS_getrandom` and `__NR_getrandom` expand to 318 before the wrapper sees the
+text): `read` (0), `recvfrom` (45) and `getrandom` (318), `TYPED_SYSCALLS`. A call is rewritten only when the
+preprocessed text declares the target `__fc_syscall_<name>`, which templates/fc_stubs/fc_compat_types.h does
+in its `__fc_libc` branch (Eva, WP, the model), never for E-ACSL, which links the real `syscall`; and only
+when the call has that syscall's number of arguments. Other numbers keep `syscall`'s own contract.
+
 For the E-ACSL frontend only, fc_cpp_wrapper_eacsl.py runs this script with `iff=True`, which also writes
 every `<==>` in an ACSL annotation as two implications (E-ACSL 35 aborts on `<==>` over a labelled term;
 see `rewrite_iff_text`). Eva and WP read the annotations as written.
@@ -333,6 +344,131 @@ def rewrite_text(text: str) -> tuple[str, list[dict]]:
 
 
 # ---------------------------------------------------------------------------------------------------
+# `syscall(<constant>, ...)` -> `__fc_syscall_<name>(...)` for the numbers that write memory
+# ---------------------------------------------------------------------------------------------------
+
+SYSCALL_PREFIX = "__fc_syscall_"
+# x86_64 numbers (asm/unistd_64.h) -> (name, number of arguments after the number). The machdep is LP64
+# x86_64 (fc_compat_types.h asserts it); each name has a declaration with a contract in fc_compat_types.h.
+TYPED_SYSCALLS: dict[int, tuple[str, int]] = {0: ("read", 3), 45: ("recvfrom", 6), 318: ("getrandom", 3)}
+_SYSCALL_SCAN_RE = re.compile(
+    r"//[^\n]*"
+    r"|/\*.*?\*/"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|^[ \t]*#(?:[^\n\\]|\\.)*"
+    r"|(?<![\w.>])(syscall)\s*\(",
+    re.DOTALL | re.MULTILINE,
+)
+# The number: a decimal or hex literal, possibly parenthesized and behind an integer cast `(long)`.
+_SYSCALL_NUMBER_RE = re.compile(
+    r"\(*(?:\((?:unsigned|signed)?(?:longlong|long|int)\))?\(*(0[xX][0-9A-Fa-f]+|[0-9]+)[uUlL]*\)*"
+)
+
+
+def _call_args(text: str, open_paren: int) -> tuple[int, list[str]] | None:
+    """
+    (end after `)`, top-level arguments) of the call whose `(` is at `open_paren`. Line markers inside (gcc
+    writes them around a macro from a system header, `SYS_getrandom`) are not part of any argument.
+    """
+    depth, start, j, n = 0, open_paren + 1, open_paren, len(text)
+    args: list[str] = []
+    while j < n:
+        c = text[j]
+        if c == "#" and not text[text.rfind("\n", 0, j) + 1 : j].strip():
+            nl = text.find("\n", j)
+            j = n if nl < 0 else nl
+            continue
+        if c in "\"'":
+            m = _LITERAL_RE.match(text, j)
+            if m is None:
+                return None
+            j = m.end()
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(_DIRECTIVE_RE.sub("", text[start:j]))
+                return j + 1, args
+        elif c == "," and depth == 1:
+            args.append(_DIRECTIVE_RE.sub("", text[start:j]))
+            start = j + 1
+        j += 1
+    return None
+
+
+def syscall_number(arg: str) -> int | None:
+    """The value of a constant syscall number (`318`, `(long)318`, `(318)`), else None."""
+    e = "".join(arg.split())
+    m = _SYSCALL_NUMBER_RE.fullmatch(e)
+    if m is None or e.count("(") != e.count(")"):
+        return None
+    digits = m.group(1)
+    if digits[:2] in ("0x", "0X"):
+        return int(digits, 16)
+    try:
+        return int(digits, 8) if len(digits) > 1 and digits[0] == "0" else int(digits)
+    except ValueError:
+        return None
+
+
+def rewrite_syscall_text(text: str) -> tuple[str, list[dict]]:
+    """
+    The preprocessed text with every `syscall(<constant>, ...)` of `TYPED_SYSCALLS` whose typed declaration
+    the text holds rewritten, and one note per rewrite.
+    """
+    if SYSCALL_PREFIX not in text or "syscall" not in text:
+        return text, []
+    declared = {
+        number: (name, arity)
+        for number, (name, arity) in TYPED_SYSCALLS.items()
+        if re.search(r"\b" + SYSCALL_PREFIX + name + r"\s*\(", text)
+    }
+    if not declared:
+        return text, []
+    out: list[str] = []
+    notes: list[dict] = []
+    last = 0
+    where: Callable[[int], tuple[str, int]] | None = None
+    for m in _SYSCALL_SCAN_RE.finditer(text):
+        if m.group(1) is None or m.start() < last:
+            continue
+        span = _call_args(text, m.end() - 1)
+        if span is None:
+            continue
+        end, args = span
+        number = syscall_number(args[0]) if args else None
+        if number not in declared:
+            continue
+        name, arity = declared[number]
+        if len(args) != arity + 1:
+            continue  # a wrong argument count: leave it to the kernel and to the caveat of `syscall`
+        original = text[m.start() : end]
+        new = f"{SYSCALL_PREFIX}{name}(" + ", ".join(" ".join(a.split()) for a in args[1:]) + ")"
+        # The line markers stay where they were, blank lines elsewhere: every later line keeps its number.
+        tail = "".join("\n" + (ln if ln.lstrip().startswith("#") else "") for ln in original.split("\n")[1:])
+        out += [text[last : m.start()], new + tail]
+        last = end
+        where = where or _locator(text)
+        file, line = where(m.start())
+        notes.append(
+            {
+                "file": file,
+                "line": line,
+                "kind": f"syscall {name}",
+                "original": " ".join(_DIRECTIVE_RE.sub("", original).split()),
+                "rewritten": new,
+            }
+        )
+    if not notes:
+        return text, []
+    out.append(text[last:])
+    return "".join(out), notes
+
+
+# ---------------------------------------------------------------------------------------------------
 # E-ACSL only: `p1 <==> p2` -> `((p1) ==> (p2)) && ((p2) ==> (p1))` inside ACSL annotations
 # ---------------------------------------------------------------------------------------------------
 #
@@ -505,6 +641,8 @@ def rewrite_file(path: str, iff: bool = False) -> list[dict]:
         with open(path, "rb") as fh:
             text = fh.read().decode("latin-1")  # byte-preserving: the C text round-trips unchanged
         new, notes = rewrite_text(text)
+        new, syscall_notes = rewrite_syscall_text(new)
+        notes += syscall_notes
         if iff:
             new, iff_notes = rewrite_iff_text(new)
             notes += iff_notes

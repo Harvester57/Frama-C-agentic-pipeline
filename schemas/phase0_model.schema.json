@@ -118,6 +118,20 @@
             "additionalProperties": false
           },
           "external_calls": {"$comment": "functions it calls that no unit of its program defines (libc, packages)", "type": "array", "items": {"type": "string"}},
+          "call_sites": {
+            "$comment": "Dump schema 4 (plan steps M2, M5): each direct call of its body, with the string literals it passes (argument index -> text; bytes outside printable ASCII but CR, LF, tab and NUL read '?'). Absent: not recorded",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "callee": {"type": "string"},
+                "line": {"type": "integer", "minimum": 0},
+                "literals": {"type": "object", "additionalProperties": {"type": "string"}}
+              },
+              "required": ["callee", "line", "literals"],
+              "additionalProperties": false
+            }
+          },
           "param_sizes": {
             "$comment": "argument index -> bytes of the object the parsed callers pass there (an array, an object's address), when the call site shows it",
             "type": "object",
@@ -175,6 +189,16 @@
     },
     "externals": {"type": "array", "items": {"type": "string"}},
     "external_formals": {"$comment": "Step I9: the formals of external functions, from their prototypes", "type": "object", "additionalProperties": {"$ref": "#/definitions/formals"}},
+    "external_decls": {
+      "$comment": "S2: the first declaration of each external function (`decl`, a Frama-C location: FRAMAC_SHARE/libc/..., a path under the parse's tree, or an absolute header path) and its C text with typedef and parameter names (`proto`), from which scripts/stub_gen.py writes the stub skeletons",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {"decl": {"type": "string"}, "proto": {"type": "string"}, "signature": {"type": "string"}},
+        "required": ["decl", "proto"],
+        "additionalProperties": false
+      }
+    },
     "global_variables": {
       "$comment": "Step I9: defined global variables, `file#name`, where security properties naming them are anchored",
       "type": "object",

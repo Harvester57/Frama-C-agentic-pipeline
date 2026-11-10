@@ -64,8 +64,11 @@ the checkpoint (`--state`, scripts/checkpoint.py) with each unit's first error, 
 them and restarts at the model; a model that parses clears it.
 
 Version 2 of the model (`schema_version`) records `external_calls`, `kernel_names`, `formals`, `writes`
-and `param_sizes` on its functions. Consumers ask `model_features(model)` which of these a model has,
-so a version 1 model is recognized the same way everywhere.
+and `param_sizes` on its functions; (S2 of docs/templates-and-stubs-improvement-plan.md) each external's
+first declaration and C text under `external_decls`, from which scripts/stub_gen.py writes the stub skeletons
+(a model without it gets no skeletons); and, from dump schema 4 on, the parsed functions' `call_sites`
+(each direct call with its string-literal arguments). Consumers ask `model_features(model)` which of these a
+model has, so a version 1 model is recognized the same way everywhere.
 
 `selftest` compiles the dump module and checks it on a two-file program (a static collision, a
 callback, an indirect call); the image build runs it, so a kernel upgrade that breaks the dump fails
@@ -166,6 +169,8 @@ MODEL_FEATURES: dict[str, str] = {
     "kernel_names": "no kernel names: a kernel-renamed static (f_0) cannot be mapped back to its file#name",
     "param_sizes": "no caller argument sizes (made before 55df295): harnesses and seeds size fixed buffers "
     "from defaults",
+    "call_sites": "no call sites with their string-literal arguments (dump before schema 4): no sink argument "
+    "is decided from the model (L5 text on a literal, L5 format strings), every one is left to WP",
 }
 
 
@@ -193,6 +198,8 @@ def model_features(model: dict | None) -> dict[str, bool]:
         "trust": isinstance(model.get("trust"), dict) or any(isinstance(f.get("trust"), dict) for f in fns),
         "kernel_names": current or any("kernel_names" in f for f in fns),
         "param_sizes": current or any("param_sizes" in f for f in fns),
+        # Not implied by the version: dump schema 4 adds it to a version 2 model.
+        "call_sites": any("call_sites" in f for f in parsed),
     }
 
 
@@ -230,9 +237,33 @@ def tree_rel(path: str, tree: str, cwd: str | None = None) -> str | None:
     return found[0] if found else None
 
 
-def _body_facts(fn: dict) -> dict:
-    """The dump's formals and writes (schema 3, step I9), when the dump module recorded them."""
+def _call_sites(fn: dict) -> list[dict] | None:
+    """
+    The direct calls of a function body with their string-literal arguments (dump schema 4, plan
+    steps M2 and M5): [{callee, line, literals: {argument index: text}}], in body order. None when the
+    dump predates them, so a consumer can tell "no literal" from "not recorded".
+    """
+    calls = [c for c in fn.get("calls") or [] if not c.get("indirect")]
+    if any("literal_args" not in c for c in calls) or (not calls and "calls" not in fn):
+        return None
+    out = []
+    for c in calls:
+        loc = parse_location(str(c.get("loc") or ""))
+        lits = c.get("literal_args") if isinstance(c.get("literal_args"), dict) else {}
+        out.append({"callee": str(c.get("name") or ""), "line": loc[1] if loc else 0, "literals": dict(lits)})
+    return out
+
+
+def _body_facts(fn: dict, literals: bool = True) -> dict:
+    """
+    The dump's formals and writes (schema 3, step I9), and its call sites with their literal
+    arguments (schema 4, `literals`), when the dump module recorded them.
+    """
     out: dict[str, Any] = {}
+    if literals:
+        sites = _call_sites(fn)
+        if sites is not None:
+            out["call_sites"] = sites
     if isinstance(fn.get("formals"), list):
         out["formals"] = fn["formals"]
     w = fn.get("writes")
@@ -629,6 +660,8 @@ class ModelBuilder:
         # Step I9: defined global variables (`file#name`) and the formals of declared functions.
         self.global_vars: dict[str, dict] = {}
         self.declared_formals: dict[str, list] = {}
+        # Declared (not defined) functions: their first declaration and its C text (scripts/stub_gen.py).
+        self.declared_info: dict[str, dict] = {}
         # Callee id -> (caller id, call location, argument index, bytes): what the callers pass.
         self.arg_sites: dict[str, set[tuple[str, str, str, int]]] = defaultdict(set)
 
@@ -705,7 +738,7 @@ class ModelBuilder:
                         "cyclomatic": int(fn.get("cyclomatic") or 1),
                         "address_taken": False,
                         "source": SOURCE_FRAMAC,
-                        **_body_facts(fn),
+                        **_body_facts(fn, int(dump.get("schema") or 0) >= 4),
                     },
                 )
                 if not fn.get("static"):
@@ -729,6 +762,10 @@ class ModelBuilder:
         for d in dump.get("declared") or []:
             if d.get("name") and d.get("formals") is not None:
                 self.declared_formals.setdefault(d["name"], d["formals"])
+            if d.get("name") and d.get("decl") and d.get("proto"):
+                self.declared_info.setdefault(
+                    d["name"], {"decl": d["decl"], "proto": d["proto"], "signature": d.get("signature") or ""}
+                )
         for k in dump.get("address_taken") or []:
             if k in kmap:
                 self.functions[kmap[k]]["address_taken"] = True
@@ -1067,6 +1104,7 @@ def build_model(
         external_formals={
             n: builder.declared_formals[n] for n in sorted(builder.externals) if n in builder.declared_formals
         },
+        external_decls={n: builder.declared_info[n] for n in sorted(builder.externals) if n in builder.declared_info},
         global_variables=dict(sorted(builder.global_vars.items())),
         macro_aliases=builder.aliases(defines),
         entry_points=sorted({e for u in units_out.values() if not u.get("test") for e in u.get("entry_points") or []}),

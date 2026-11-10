@@ -46,8 +46,8 @@
         "type": "object",
         "properties": {
           "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
-          "kind": {"type": "string", "enum": ["global", "parameter", "field", "return"]},
-          "function": {"$comment": "where the secret is released (kind global) or held (parameter, field): its wipe is checked when this function returns (step I9)", "$ref": "#/definitions/function_ref"},
+          "kind": {"$comment": "local (plan step M6): an array local of `function`, wiped before each return in its scope", "type": "string", "enum": ["global", "parameter", "field", "local", "return"]},
+          "function": {"$comment": "where the secret is released (kind global) or held (parameter, field, local): its wipe is checked when this function returns (step I9)", "$ref": "#/definitions/function_ref"},
           "size": {"$comment": "step I9: number of elements to wipe, a C expression over constants and the function's parameters (`len`, `32`); default sizeof for arrays", "type": "string", "pattern": "^[A-Za-z0-9_ ()*+/.>-]+$"},
           "object": {"$comment": "step I9, kind field: the parameter or global holding the field", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "description": {"$ref": "#/definitions/description"}
@@ -65,6 +65,7 @@
           "function": {"$ref": "#/definitions/function_ref"},
           "state": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.>-]*$"},
           "protects": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_ref"}},
+          "success": {"$comment": "plan step M7: the value the gate returns when the check passed (a C constant expression: `0`, `1`, `AUTH_OK`); any other result must leave `state` unchanged", "type": ["string", "integer"], "pattern": "^[A-Za-z0-9_ ()+-]+$"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "protects", "description"],
@@ -81,6 +82,7 @@
           "kind": {"type": "string", "enum": ["network", "file", "log", "terminal", "ipc", "buffer", "other"]},
           "params": {"$comment": "step I9: the parameters carrying the output (default: the pointer parameters)", "type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
           "length": {"$comment": "step I9: the parameter giving the number of elements `params` point to", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "format": {"$comment": "plan step M5: the parameter holding a printf-style format; every call must pass a string literal there (CWE-134)", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "kind", "description"],

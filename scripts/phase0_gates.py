@@ -15,6 +15,10 @@ a gate (docs/phase0-implementation-plan.md, step I1):
                judges the module's current build report when there is one: Make rebuilds a module
                as a prerequisite of fuzz-<mod>, so that is the binary the campaign uses.
 
+Independently of the sections, a module that calls a function of a stub overlay header whose
+stub-check failed (workspace/reports/stub_check.json, scripts/stub_check.py) fails the gate until a
+stub-check of the fixed header passes.
+
     phase0_gates.py check [--module M] [--need reach,build_check] [--modules "A B"] [--fuzzed "A"]
 
 exits 0 when the gate passes and 1 with the reasons otherwise. Without --module, every module of
@@ -284,6 +288,9 @@ def check(
                         f"to fuzz it with the sanitizers run `{row['next_step']}`"
                     )
                 reasons.append(f"build-check failed for {module}: {status}{first}")
+    from stub_check import gate_reasons as stub_gate_reasons  # a failed stub contract blocks its callers (S3)
+
+    reasons.extend(stub_gate_reasons(run_dir, module))
     return reasons
 
 

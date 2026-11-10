@@ -206,3 +206,27 @@ The rules of [`open-topics-remediation-plan.md`](open-topics-remediation-plan.md
 
 - Contracts for whole libraries nobody has run a target against (zlib, OpenSSL): S2 generates what a target needs when it needs it.
 - Replacing host-header mode for E-ACSL: the reasons in the stub README still hold.
+
+## Status
+
+| ID | Status |
+| :--- | :--- |
+| S2 | done 2026-11-10: `scripts/stub_gen.py`, Make target `stubs`, the stub-author brief (`skills/framac-slice/stub_author_brief.md`), `ledger.py record-stub-contracts`, overlay in the include paths and the cache key; `templates/acsl/external_stubs.h` deleted (decision 2). The Phase 0 dump now records each external's declaration (`external_decls`). |
+| K2 | done 2026-11-10: `cache.make_key` leaves `templates/fc_stubs` and the overlay out of keys that carry a dependency manifest (which hashes the stub headers read). |
+| S3 | done 2026-11-10: `scripts/stub_check.py` (`run`: ABI, Eva smoke, contract against the real library under E-ACSL; `shipped`: prototypes and struct layouts of `templates/fc_stubs`), Make target `stub-check`, the Phase 0 gate refuses the modules a failed header blocks, the ledger records the status. Open: module fuzzing does not check stub contracts (troubleshooting). |
+| K3 | done 2026-11-10: one `define FACTS_RECIPE` for `facts-%` and `module-%`, `help` lists `eva-tune-base`, `stubs` and `stub-check` in `.PHONY`, `help` and the stage order; a test keeps `help` and `.PHONY` in step with `STAGE_OF_TARGET`. |
+| D1, S1, H1, K1, M1, M4, S5 | done 2026-11-10 before this table (see the commits tagged with each ID). M4 is a diagnosis: guardrail builds never see `meta:` annotations, and ignored E-ACSL clauses go unreported (open in troubleshooting). |
+| S4 | done 2026-11-10: `bsd/string.h` with `fc_strlcpy.h` (strict for Eva/WP, exact under E-ACSL, decision 1; libc `strlcpy`/`strlcat` renamed), `json-c/json.h` fully specified over a ghost pool (S1 allowlist empty), `ip_icmp.h` matches glibc, `getopt` keeps `optarg` inside `argv` (libc declaration renamed; `-eva-use-spec` does not help). Open: E-ACSL does not track memory an uninstrumented library allocates. |
+| S6 | done 2026-11-10: `fc_cpp_wrapper.py` rewrites literal `syscall(SYS_read/recvfrom/getrandom, ...)` into typed `__fc_syscall_*` with contracts. |
+| S7 | done 2026-11-10: `scripts/libc_gap_report.py`. On the local models (QCBOR, libpng, libseccomp, nettle, seeded-s14) no libc function lacks a contract; the gaps are zlib (libpng) and GMP (nettle). |
+| S8 | done 2026-11-10: libc's names are canonical (`valid_read_string`, `valid_string`, `valid_read_nstring`, `valid_string_or_null`, `strlen`, plus `no_crlf_string`), all executable under E-ACSL; `c_strlen`/`valid_c_string` are aliases; the MetAcsl preamble uses `no_crlf_string`. The E-ACSL `valid_read_nstring` had stricter semantics than libc's (fixed). The E-ACSL string predicates avoid E-ACSL 35's dropped-conjunct form. |
+| S9 | done 2026-11-10: `_Static_assert` on LP64 in `fc_compat_types.h`. |
+| M2 | done 2026-11-10: literal-only callers are decided from the model (`call_sites`, dump schema 4) and recorded as static evidence; MetAcsl's statically decided instances are now credited (M1's open bug, fixed). |
+| M3 | done 2026-11-10, opt-in (`security_props.py run --eva-taint`): taint and `!\tainted` assertions in the work tree, `eva_taint` in `params.json`, statuses on the `l6_no_leak` unit; WP leaves them out (`-wp-prop=-eva_taint`). Not yet used on a real target. |
+| M5 | done 2026-11-10 (decision 3): sink `format` parameter, `L5_sanitized_format_<sink>` decided from the model. Also fixed: a CRLF `THREAT_MODEL.md` was read as no threat model. |
+| M6 | done 2026-11-10: `explicit_bzero`/`memset_s` contracts (prove under Typed for `char` arrays; `unsigned char` needs Typed+cast, not credited), `local` secrets get a `check` before each `return`, `return` secrets are listed in the report. |
+| M7 | done 2026-11-10 (decision 3): gate `success` value; MetAcsl refuses `\result` in `\postcond`, so `L4_auth_state_<gate>_on_failure` is an in-code check before each `return`. |
+| H2 | done 2026-11-10: lifecycle cases for every opaque handle type with a constructor and destructor (not only those without a recorded chain: `sequence_case` cannot pass a constructed handle, open). |
+| H3 | done 2026-11-10: oversized, empty and skipped-case inputs return `-1`; `FRAMAC_FUZZ_REJECT()` for hand-written guards. Generated `--api` cases have no rejecting guard. |
+| H4 | measured, not adopted: on QCBOR `qcbor_main_decode` with `MAX_INPUT_SIZE=16`, split was 14-16x slower and turned no obligation Valid. |
+| C1 | done 2026-11-10: the canary exercises the result-init pass (struct `\result` field only checks on Frama-C 35), `isnan` and the errno shim; `tests/test_eacsl_canary.py` shows each regression fails. |

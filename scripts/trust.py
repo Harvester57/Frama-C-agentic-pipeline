@@ -96,6 +96,10 @@ INPUT_READERS = frozenset(
         "fscanf",
         "getenv",
         "secure_getenv",
+        # `syscall(SYS_read, ...)` and `syscall(SYS_recvfrom, ...)` as the model sees them after
+        # scripts/fc_cpp_wrapper.py's typed syscall rewrite.
+        "__fc_syscall_read",
+        "__fc_syscall_recvfrom",
     }
 )
 LIBRARY_KINDS = frozenset({"static_lib", "shared_lib"})
@@ -106,7 +110,9 @@ STATUS_OK, STATUS_NONE, STATUS_INVALID = "ok", "no_threat_model", "invalid_threa
 MAX_REASONS = 6
 
 _FENCE_RE = re.compile(
-    r"^(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\n`]*)\n(?P<body>.*?)^(?P=fence)[ \t]*$", re.MULTILINE | re.DOTALL
+    # `\r` before the line ends: a THREAT_MODEL.md with CRLF line endings (a Windows checkout).
+    r"^(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\n`]*)\n(?P<body>.*?)^(?P=fence)[ \t\r]*$",
+    re.MULTILINE | re.DOTALL,
 )
 _FID_RE = re.compile(r"^(?:(?P<file>[A-Za-z0-9_./+-]+\.[A-Za-z0-9]+)#)?(?P<name>[A-Za-z_]\w*)$")
 

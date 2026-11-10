@@ -1,9 +1,13 @@
 /*
- * Frama-C Bodyless Prototype & ACSL Contract Stub for <bsd/string.h>
+ * Frama-C prototypes and ACSL contracts for <bsd/string.h> (libbsd).
  *
- * Used by Frama-C (Eva / WP) under -nostdinc so calls to libbsd string routines
- * are checked for buffer validity and recorded as Considered valid (STATUS_ASSUMED)
- * in the coverage ledger without C stub bodies.
+ * strlcpy and strlcat come from ../fc_strlcpy.h, shared with ../fc_compat_types.h because
+ * glibc and Frama-C's libc declare them in <string.h> too; its header comment explains the two
+ * versions of each contract (strict for Eva and WP, exact for E-ACSL) and the E-ACSL limits
+ * behind them. strnstr follows the same rules.
+ *
+ * No C bodies: Eva and WP use the contracts, which the ledger records as assumed
+ * (STATUS_ASSUMED).
  */
 
 #ifndef FRAMAC_BSD_STRING_H
@@ -11,36 +15,40 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <fc_strlcpy.h>
+
+#if defined(__FRAMAC_EACSL__)
 
 /*@
-  requires valid_src: src != \null;
-  requires valid_dst: size > 0 ==> (dst != \null && \valid(dst + (0 .. size - 1)));
-  terminates \true;
-  exits \false;
-  assigns dst[0 .. size - 1] \from src[0 .. size - 1], size;
-  assigns \result \from src[0 .. size - 1], size;
-  ensures init_dst: size > 0 ==> \initialized(dst);
+  // strnstr reads big up to its NUL or len bytes, whichever comes first.
+  predicate __fc_bsd_nul_before(char *s, integer len, integer i) = i < len && s[i] == '\0';
 */
-size_t strlcpy(char *dst, const char *src, size_t size);
 
 /*@
-  requires valid_src: src != \null;
-  requires valid_dst: size > 0 ==> (dst != \null && \valid(dst + (0 .. size - 1)));
-  terminates \true;
-  exits \false;
-  assigns dst[0 .. size - 1] \from dst[0 .. size - 1], src[0 .. size - 1], size;
-  assigns \result \from dst[0 .. size - 1], src[0 .. size - 1], size;
-*/
-size_t strlcat(char *dst, const char *src, size_t size);
-
-/*@
-  requires valid_big: big != \null;
-  requires valid_little: little != \null;
-  terminates \true;
-  exits \false;
-  assigns \nothing;
-  ensures null_or_in_big: \result == \null || \base_addr(\result) == \base_addr(big);
+  requires little_string: \valid_read(little) ==>
+    \exists integer i; 0 <= i < \block_length(little) - \offset(little) &&
+      __fc_bsd_nul_in_block((char *)little, i);
+  requires big_readable: (len > 0 && \valid_read(big)) ==>
+    (\valid_read(big + (0 .. len - 1)) ||
+     \exists integer i; 0 <= i < \block_length(big) - \offset(big) &&
+       __fc_bsd_nul_before((char *)big, len, i));
+  assigns \result \from big, indirect:big[0 .. len - 1], indirect:little[0 ..], indirect:len;
 */
 char *strnstr(const char *big, const char *little, size_t len);
+
+#else /* Eva / WP: Frama-C's libc (valid_read_string, valid_read_nstring) */
+
+/*@
+  requires valid_little: valid_read_string(little);
+  requires valid_big: valid_read_nstring((char *)big, len);
+  terminates \true;
+  exits \false;
+  assigns \result \from big, indirect:big[0 .. len - 1], indirect:little[0 .. strlen(little)],
+                        indirect:len;
+  ensures null_or_in_big: \result == \null || \subset(\result, big + (0 .. len));
+*/
+char *strnstr(const char *big, const char *little, size_t len);
+
+#endif /* __FRAMAC_EACSL__ */
 
 #endif /* FRAMAC_BSD_STRING_H */

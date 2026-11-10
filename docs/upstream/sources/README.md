@@ -13,7 +13,7 @@ re-extract and diff these against the new master.
 | `annot11.c`, `security_macro.h` | `plugins/eva/tests/secure_flow/` | `__fc_private` / `__attribute__((private))` marking + `assert security_status(x) == public;` under `-eva-secure-flow` — alternative to `!\tainted(...)` for indirect secret flows, which the MetAcsl `L6_no_leak_*` properties (direct flows only, `docs/security-properties.md`) do not see |
 | `loopinv.c` | `plugins/eva/tests/value/` | `-eva-slevel-function main2:20`, loop invariants reducing widening |
 | `partitioning-annots.c` | `plugins/eva/tests/value/` | `//@ loop unroll N;`, `-eva-partition-value` / `-eva-partition-history` |
-| `use_spec.i` | `plugins/eva/tests/value/` | `-eva-use-spec f,h` — override a function with a spec inside Eva (complements `templates/acsl/external_stubs.h`) |
+| `use_spec.i` | `plugins/eva/tests/value/` | `-eva-use-spec f,h` — override a function with a spec inside Eva (complements the run's stub overlay `workspace/stubs/<lib>.h`) |
 | `euclid.c`, `bsearch.c`, `find.i` | `plugins/wp/tests/wp_gallery/` | Textbook WP contract patterns (axiomatic gcd + `\at(...,Pre)`, named behaviors, `∀` invariants) for `skills/framac-wp/prover_brief.md` |
 | `eacsl_manual_link.sh` | `plugins/e-acsl/examples/demo/compile.sh` | Manual E-ACSL runtime link recipe (`e_acsl.c` + `e_acsl_bittree.c` + `e_acsl_mmodel.c`) as fallback when `eacsl_toolchain.py`'s `e-acsl-gcc` flow fails |
 | `make_wrapper_tips.md` | `share/analysis-scripts/make_wrapper.py` (rewritten as notes) | Log-pattern → repair-hint mapping ported into `run_eva_slice.py` report `repair_hints` |

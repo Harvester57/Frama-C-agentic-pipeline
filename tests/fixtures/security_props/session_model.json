@@ -38,6 +38,15 @@
  "functions": {
   "session.c#session_admin": {
    "address_taken": false,
+   "call_sites": [
+    {
+     "callee": "log_line",
+     "line": 25,
+     "literals": {
+      "0": "admin command"
+     }
+    }
+   ],
    "cyclomatic": 1,
    "end_line": 26,
    "external_calls": [
@@ -80,6 +89,7 @@
   },
   "session.c#session_close": {
    "address_taken": false,
+   "call_sites": [],
    "cyclomatic": 1,
    "end_line": 57,
    "external_calls": [],
@@ -122,6 +132,7 @@
   },
   "session.c#session_copy_state": {
    "address_taken": false,
+   "call_sites": [],
    "cyclomatic": 1,
    "end_line": 51,
    "external_calls": [],
@@ -169,6 +180,13 @@
   },
   "session.c#session_dispatch": {
    "address_taken": false,
+   "call_sites": [
+    {
+     "callee": "session_admin",
+     "line": 31,
+     "literals": {}
+    }
+   ],
    "cyclomatic": 3,
    "end_line": 32,
    "external_calls": [],
@@ -214,6 +232,7 @@
   },
   "session.c#session_login": {
    "address_taken": false,
+   "call_sites": [],
    "cyclomatic": 7,
    "end_line": 13,
    "external_calls": [],
@@ -269,6 +288,7 @@
   },
   "session.c#session_reset": {
    "address_taken": false,
+   "call_sites": [],
    "cyclomatic": 1,
    "end_line": 44,
    "external_calls": [],
@@ -312,6 +332,7 @@
   },
   "session.c#session_set_key": {
    "address_taken": false,
+   "call_sites": [],
    "cyclomatic": 2,
    "end_line": 20,
    "external_calls": [],
@@ -360,6 +381,13 @@
   },
   "session.c#session_status": {
    "address_taken": false,
+   "call_sites": [
+    {
+     "callee": "log_line",
+     "line": 36,
+     "literals": {}
+    }
+   ],
    "cyclomatic": 2,
    "end_line": 37,
    "external_calls": [

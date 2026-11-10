@@ -5,6 +5,11 @@
  *   global  the state is a global lvalue (`auth_ok`, `session.authed`): program-wide
  *   formal  the state hangs off a parameter (`ctx->authed`): checked in the functions that have a
  *           parameter of that name (\tguard: \true elsewhere)
+ *   on_failure  plan step M7, the gate's threat model gives its `success` value: when the gate returns
+ *           anything else, the state is what it was on entry. MetAcsl's \postcond cannot name
+ *           \result, so security_props.py writes this `check` into the work tree before each
+ *           `return` of the gate, with `result` the returned expression. WP proves it with the gate;
+ *           E-ACSL executes it without stopping the run.
  */
 //# global
 /*@ meta \prop, \name(${name}), \targets(\diff(\ALL, {${gate}})), \context(\writing),
@@ -14,3 +19,5 @@
 /*@ meta \prop, \name(${name}), \targets(\diff(\ALL, {${gate}})), \context(\writing),
       \tguard(\separated(\written, &${state}));
 */
+//# on_failure
+/*@ check ${name}: (${result}) != (${success}) ==> ${state} == \at(${state}, Pre); */

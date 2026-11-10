@@ -1,8 +1,12 @@
 /*
- * Frama-C Header Stub for <netinet/ip_icmp.h>
+ * Frama-C header stub for <netinet/ip_icmp.h>
  *
- * Provides standard Linux/BSD ICMP header structures and constants missing
- * from Frama-C's POSIX __fc_libc when -nostdinc is active.
+ * Frama-C's libc has no <netinet/ip_icmp.h>. This stub follows glibc's: the Linux names
+ * (struct icmphdr, ICMP_DEST_UNREACH, ...) and, as glibc does under __USE_MISC, the BSD names
+ * (struct icmp, ICMP_UNREACH, ICMP_TIMXCEED, ICMP_MASKREQ, ...) with the same layouts and
+ * values on x86_64. In particular `icmp_ip` is a `struct ip` (from <netinet/ip.h>), so
+ * `icp->icmp_ip.ip_hl` parses. tests/test_fc_stub_repairs.py checks the layouts and values
+ * against glibc's header.
  */
 
 #ifndef FRAMAC_NETINET_IP_ICMP_H
@@ -11,6 +15,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 
 struct icmphdr {
     uint8_t type;
@@ -26,9 +31,70 @@ struct icmphdr {
             uint16_t __glibc_reserved;
             uint16_t mtu;
         } frag;
-        uint8_t reserved[4];
     } un;
 };
+
+#define ICMP_ECHOREPLY      0
+#define ICMP_DEST_UNREACH   3
+#define ICMP_SOURCE_QUENCH  4
+#define ICMP_REDIRECT       5
+#define ICMP_ECHO           8
+#define ICMP_TIME_EXCEEDED  11
+#define ICMP_PARAMETERPROB  12
+#define ICMP_TIMESTAMP      13
+#define ICMP_TIMESTAMPREPLY 14
+#define ICMP_INFO_REQUEST   15
+#define ICMP_INFO_REPLY     16
+#define ICMP_ADDRESS        17
+#define ICMP_ADDRESSREPLY   18
+#define NR_ICMP_TYPES       18
+
+/* Codes for ICMP_DEST_UNREACH. */
+#define ICMP_NET_UNREACH    0
+#define ICMP_HOST_UNREACH   1
+#define ICMP_PROT_UNREACH   2
+#define ICMP_PORT_UNREACH   3
+#define ICMP_FRAG_NEEDED    4
+#define ICMP_SR_FAILED      5
+#define ICMP_NET_UNKNOWN    6
+#define ICMP_HOST_UNKNOWN   7
+#define ICMP_HOST_ISOLATED  8
+#define ICMP_NET_ANO        9
+#define ICMP_HOST_ANO       10
+#define ICMP_NET_UNR_TOS    11
+#define ICMP_HOST_UNR_TOS   12
+#define ICMP_PKT_FILTERED   13
+#define ICMP_PREC_VIOLATION 14
+#define ICMP_PREC_CUTOFF    15
+#define NR_ICMP_UNREACH     15
+
+/* Codes for ICMP_REDIRECT. */
+#define ICMP_REDIR_NET      0
+#define ICMP_REDIR_HOST     1
+#define ICMP_REDIR_NETTOS   2
+#define ICMP_REDIR_HOSTTOS  3
+
+/* Codes for ICMP_TIME_EXCEEDED. */
+#define ICMP_EXC_TTL        0
+#define ICMP_EXC_FRAGTIME   1
+
+/* ICMP_EXT_ECHO (probe, RFC 8335). */
+#define ICMP_EXT_ECHO               42
+#define ICMP_EXT_ECHOREPLY          43
+#define ICMP_EXT_CODE_MAL_QUERY     1
+#define ICMP_EXT_CODE_NO_IF         2
+#define ICMP_EXT_CODE_NO_TABLE_ENT  3
+#define ICMP_EXT_CODE_MULT_IFS      4
+#define ICMP_EXT_ECHOREPLY_ACTIVE   (1 << 2)
+#define ICMP_EXT_ECHOREPLY_IPV4     (1 << 1)
+#define ICMP_EXT_ECHOREPLY_IPV6     1
+#define ICMP_EXT_ECHO_CTYPE_NAME    1
+#define ICMP_EXT_ECHO_CTYPE_INDEX   2
+#define ICMP_EXT_ECHO_CTYPE_ADDR    3
+#define ICMP_AFI_IP                 1
+#define ICMP_AFI_IP6                2
+
+/* BSD names (glibc: __USE_MISC). */
 
 struct icmp_ra_addr {
     uint32_t ira_addr;
@@ -40,7 +106,7 @@ struct icmp {
     uint8_t icmp_code;
     uint16_t icmp_cksum;
     union {
-        uint8_t ih_pptr;
+        unsigned char ih_pptr;
         struct in_addr ih_gwaddr;
         struct ih_idseq {
             uint16_t icd_id;
@@ -74,7 +140,8 @@ struct icmp {
             uint32_t its_ttime;
         } id_ts;
         struct {
-            uint8_t idi_ip[20];
+            struct ip idi_ip;
+            /* options and then 64 bits of data */
         } id_ip;
         struct icmp_ra_addr id_radv;
         uint32_t id_mask;
@@ -89,19 +156,65 @@ struct icmp {
 #define icmp_data       icmp_dun.id_data
 };
 
-#define ICMP_MINLEN         8
-#define ICMP_ECHOREPLY      0
-#define ICMP_DEST_UNREACH   3
-#define ICMP_SOURCE_QUENCH  4
-#define ICMP_REDIRECT       5
-#define ICMP_ECHO           8
-#define ICMP_TIME_EXCEEDED  11
-#define ICMP_PARAMETERPROB  12
-#define ICMP_TIMESTAMP      13
-#define ICMP_TIMESTAMPREPLY 14
-#define ICMP_INFO_REQUEST   15
-#define ICMP_INFO_REPLY     16
-#define ICMP_ADDRESS        17
-#define ICMP_ADDRESSREPLY   18
+/* Lower bounds for valid lengths, by message type. glibc spells ICMP_TSLEN with n_time, a
+ * uint32_t that Frama-C's libc does not define. */
+#define ICMP_MINLEN     8
+#define ICMP_TSLEN      (8 + 3 * sizeof (uint32_t))
+#define ICMP_MASKLEN    12
+#define ICMP_ADVLENMIN  (8 + sizeof (struct ip) + 8)
+#ifndef _IP_VHL
+#define ICMP_ADVLEN(p)  (8 + ((p)->icmp_ip.ip_hl << 2) + 8)
+#else
+#define ICMP_ADVLEN(p)  (8 + (IP_VHL_HL((p)->icmp_ip.ip_vhl) << 2) + 8)
+#endif
+
+/* BSD type and code names. */
+#define ICMP_UNREACH                    3
+#define ICMP_SOURCEQUENCH               4
+#define ICMP_ROUTERADVERT               9
+#define ICMP_ROUTERSOLICIT              10
+#define ICMP_TIMXCEED                   11
+#define ICMP_PARAMPROB                  12
+#define ICMP_TSTAMP                     13
+#define ICMP_TSTAMPREPLY                14
+#define ICMP_IREQ                       15
+#define ICMP_IREQREPLY                  16
+#define ICMP_MASKREQ                    17
+#define ICMP_MASKREPLY                  18
+#define ICMP_MAXTYPE                    18
+
+#define ICMP_UNREACH_NET                0
+#define ICMP_UNREACH_HOST               1
+#define ICMP_UNREACH_PROTOCOL           2
+#define ICMP_UNREACH_PORT               3
+#define ICMP_UNREACH_NEEDFRAG           4
+#define ICMP_UNREACH_SRCFAIL            5
+#define ICMP_UNREACH_NET_UNKNOWN        6
+#define ICMP_UNREACH_HOST_UNKNOWN       7
+#define ICMP_UNREACH_ISOLATED           8
+#define ICMP_UNREACH_NET_PROHIB         9
+#define ICMP_UNREACH_HOST_PROHIB        10
+#define ICMP_UNREACH_TOSNET             11
+#define ICMP_UNREACH_TOSHOST            12
+#define ICMP_UNREACH_FILTER_PROHIB      13
+#define ICMP_UNREACH_HOST_PRECEDENCE    14
+#define ICMP_UNREACH_PRECEDENCE_CUTOFF  15
+
+#define ICMP_REDIRECT_NET               0
+#define ICMP_REDIRECT_HOST              1
+#define ICMP_REDIRECT_TOSNET            2
+#define ICMP_REDIRECT_TOSHOST           3
+
+#define ICMP_TIMXCEED_INTRANS           0
+#define ICMP_TIMXCEED_REASS             1
+
+#define ICMP_PARAMPROB_OPTABSENT        1
+
+#define ICMP_INFOTYPE(type) \
+    ((type) == ICMP_ECHOREPLY || (type) == ICMP_ECHO \
+     || (type) == ICMP_ROUTERADVERT || (type) == ICMP_ROUTERSOLICIT \
+     || (type) == ICMP_TSTAMP || (type) == ICMP_TSTAMPREPLY \
+     || (type) == ICMP_IREQ || (type) == ICMP_IREQREPLY \
+     || (type) == ICMP_MASKREQ || (type) == ICMP_MASKREPLY)
 
 #endif /* FRAMAC_NETINET_IP_ICMP_H */

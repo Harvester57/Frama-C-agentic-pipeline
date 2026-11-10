@@ -663,3 +663,29 @@ def test_pointer_cast_goals_are_recognised_from_their_annotation():
     assert not W._is_pointer_cast_goal({"annotation": "\\valid_read(buf + (0 .. len - 1))"})
     assert not W._is_pointer_cast_goal({"annotation": "(int)x <= 65535"})
     assert not W._is_pointer_cast_goal({})
+
+
+TAINTED_C = "int f(int x) {\n  /*@ assert L6_no_leak_k: eva_taint: !\\tainted(x); */\n  return x;\n}\n"
+
+
+@pytest.mark.parametrize(
+    "tainted,prop,expected",
+    [
+        (True, None, ["-wp-prop=-eva_taint"]),
+        (True, "L6_no_leak_k", ["-wp-prop=L6_no_leak_k,-eva_taint"]),
+        # Any -wp-prop also drops the kernel's Exit- and Termination-conditions: none without taint checks.
+        (False, None, []),
+        (False, "L6_no_leak_k", ["-wp-prop=L6_no_leak_k"]),
+    ],
+)
+def test_wp_leaves_out_eva_taint_checks_only_where_there_are_some(tmp_path, monkeypatch, tainted, prop, expected):
+    # security_props.py --eva-taint names its `\tainted` assertions `eva_taint`; WP cannot prove them.
+    _budget(monkeypatch, 4, 65536)
+    fake = FakeFramaC()
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    c_file = _c_file(tmp_path)
+    if tainted:
+        c_file.write_text(TAINTED_C, encoding="utf-8")
+    W.run_wp_on_function(c_file, "f", tmp_path / "wp", retry_bitwise=False, prop=prop)
+    (cmd,) = fake.wp_calls()
+    assert [a for a in cmd if a.startswith("-wp-prop")] == expected

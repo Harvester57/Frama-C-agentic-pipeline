@@ -15,9 +15,9 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
 1. **Prototypes, types, macros and ACSL contracts only. Never C function bodies.** A body in a
    stub would be analysed as if it were the library, which makes the results depend on code
    nobody reviewed. Enforced by `test_fc_stub_headers_contain_no_function_bodies`.
-   Not every prototype has a contract yet: `json-c/json.h` has none, so Eva and WP use default
-   `assigns` for those functions and a proof that calls them is not sound. The functions still
-   without a contract are listed in the allowlist of the stub contract lint test; the list only shrinks.
+   Every prototype has a contract with an `assigns` clause (otherwise Eva and WP use default
+   `assigns` and a proof that calls the function is not sound). The stub contract lint test
+   enforces it, and its allowlist is empty: write the contract, do not add an entry.
 2. **Opaque handle types must be complete, and they are never dereferenced.** E-ACSL emits
    `alignof`/`sizeof` on pointed-to types, so `typedef struct json_object json_object;` alone
    fails to compile. Use one dummy member (`struct json_object { int _fc_opaque; };`). The
@@ -71,6 +71,43 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   fallbacks sync the same way. The build result records the wrapped functions in `errno_shim`, a
   coverage caveat: after a libc call outside that list the target reads the last value it wrote.
   Add a function to the table (non-variadic, with its header) when a target branches on its errno.
+- Memory that an uninstrumented library allocates (json-c objects and strings, `strdup`,
+  `getenv`) is not tracked, so `\valid_read` is false on it. A stub contract that requires
+  `\valid_read(p)` would reject every such pointer. The E-ACSL branches therefore check a string
+  or buffer argument only when it lies in tracked memory (`\valid_read(s) ==> ...`), and they
+  require handles only to be non-NULL, where the library asserts on NULL.
+- E-ACSL 35 drops the first conjunct after the guard of a quantifier: in
+  `\exists integer i; 0 <= i < n && P && Q` only `Q` is checked. Every E-ACSL quantifier in the
+  stubs has a single predicate call after the guard (`... && __fc_bsd_cpy_fits(dst, src, size, i)`),
+  which `test_eacsl_quantifiers_have_one_conjunct_after_the_guard` enforces.
+- Ghost globals that are never defined (the json-c pools) carry libc's
+  `__attribute__((__fc_stdlib_internal))` under `__FRAMAC__`, so E-ACSL does not register them in
+  `__e_acsl_globals_init` (an undefined symbol at link time).
+- E-ACSL checks `requires` only; it ignores `assigns`, and the stubs keep postconditions on
+  library-owned results to the Eva / WP branch.
+
+## Stub models
+
+- `strlcpy` / `strlcat` ([`./fc_strlcpy.h`](./fc_strlcpy.h), included by `bsd/string.h` and by
+  `fc_compat_types.h`): for Eva and WP the destination must hold `size` bytes
+  (`\valid(dst + (0 .. size - 1))`), the source is a valid string, `strlcat`'s destination holds a
+  string shorter than `size`, and the postconditions give the length, the copied prefix and the
+  NUL. Under E-ACSL the destination check is exact: only the bytes actually written
+  (`strlen(src) + 1`, bounded by `size`) must be valid, so a fuzz crash is always a real
+  out-of-bounds write.
+- `strnstr` (`bsd/string.h`): `little` is a valid string, `big` is readable up to `len` bytes or to
+  its NUL; the result is NULL or inside `big`.
+- json-c ([`./json-c/json.h`](./json-c/json.h), json-c 0.18): for Eva and WP, constructors return
+  NULL or an element of the ghost pool `__fc_json_pool` (tokeners: `__fc_json_tokener_pool`), as
+  `__fc_libc` does for `FILE`, so a handle used without its NULL check is an alarm. Returned
+  strings point into the ghost buffer `__fc_json_strbuf` and are valid strings. Reference counts
+  and the free in `json_object_put` are not modelled.
+- `<netinet/ip_icmp.h>` follows glibc's layout and names, including the BSD ones (`struct icmp`
+  with `icmp_ip` a `struct ip`, `ICMP_UNREACH`, `ICMP_TIMXCEED`, `ICMP_MASKREQ`, ...).
+- `tests/test_fc_stub_repairs.py` checks these headers in the images: Eva on valid and short
+  buffers, WP, E-ACSL against the real json-c, and the ABI (prototypes, constants, layouts)
+  against glibc and json-c headers. libbsd is in neither image, so `strnstr`'s prototype is not
+  checked against it.
 
 ## Libc contract overrides (Eva / WP)
 
@@ -79,13 +116,39 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   Invalid. [`./fc_compat_types.h`](./fc_compat_types.h), force-included before any other header,
   renames the libc declaration and declares `getsockopt` with `optval` bounded by `*optlen`.
   Define `FC_STUBS_KEEP_LIBC_GETSOCKOPT` to keep the libc contract.
+- `getopt`: `__fc_libc`'s contract assigns `*optarg` and nothing says where `optarg` points, so Eva
+  gave a garbled mix for `optarg` and every `strcmp(optarg, ...)` or `argv[optind]` was Unknown.
+  `-eva-use-spec` does not help (the function has no body either way); the kernel merges a second
+  contract into the libc one, so the libc declaration is renamed like `getsockopt`'s. The override
+  keeps `optarg` NULL or inside one of the `argv` strings and `optind` in `1 .. max(argc, 1)`.
+  `optarg` stays possibly NULL after an option that takes an argument (the contract does not parse
+  `optstring`), so a target that skips that check still gets one Unknown. Define
+  `FC_STUBS_KEEP_LIBC_GETOPT` to keep the libc contract.
+- `strlcpy`, `strlcat`: Frama-C 35's `<string.h>` declares them with its own contract, which the
+  kernel merged with the stub's. The libc declarations are renamed and [`./fc_strlcpy.h`](./fc_strlcpy.h)
+  declares them (see Stub models). Define `FC_STUBS_KEEP_LIBC_STRLCPY` to keep the libc contract.
 - `syscall`: missing from `__fc_libc`'s `<unistd.h>`. Declared with `assigns \result \from number;`,
   the most ACSL can say about a variadic call: Eva and WP assume it writes no memory, so a buffer a
-  syscall fills (`getrandom`, `read` through `syscall`) keeps the value the caller gave it.
+  syscall fills keeps the value the caller gave it. For the numbers that write memory,
+  [`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py) rewrites a call with a constant
+  x86_64 number into a typed declaration with a real contract: `syscall(SYS_read, ...)` becomes
+  `__fc_syscall_read(...)`, likewise `recvfrom` and `getrandom`; each rewrite is logged
+  (`[fc-cpp] <file>:<line>: syscall <name> rewritten`). The wrapper only rewrites when the text
+  declares the target, so E-ACSL builds keep the real `syscall`. Other numbers keep the caveat.
 - `_IO`, `_IOR`, `_IOW`, `_IOWR` and the `_IOC_*` helpers: Linux's ioctl request encoding, which
   glibc's `<sys/ioctl.h>` provides and `__fc_libc`'s does not (a struct-type argument was a syntax
   error). Generic-layout values, as on x86_64.
-- Both sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+- `explicit_bzero` and `memset_s`: missing from `__fc_libc`. Their postconditions state every
+  written element (through `char` and `unsigned char`), so an L6 wipe through them proves without a
+  loop: under WP Typed for a `char` array, under `Typed+cast` only for an `unsigned char` array.
+  `FC_STUBS_NO_WIPE_DECLS` drops both declarations for a target that defines its own.
+- All of these sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+- The header assumes x86_64 LP64 (ioctl encoding, syscall numbers, `long` literals) and says so
+  with a `_Static_assert` on `sizeof(long)` and `sizeof(void *)`: another machdep stops at parse time.
+- **What to add next:** [`../../scripts/libc_gap_report.py`](../../scripts/libc_gap_report.py) lists, over
+  the Phase 0 models of one or more runs, the external functions called that neither `__fc_libc` nor
+  these stubs give a contract with `assigns` (run it in the analysis image, where it finds the libc
+  through `frama-c -print-share-path`). Gaps come first, most-called first.
 - `offsetof` is never redefined here. [`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py)
   repairs, in the preprocessed text, `offsetof` with a non-constant index and the null-pointer offset
   idiom `(size_t)&((T *)0)->m` (gperf tables), so `-warn-invalid-pointer` stays on.

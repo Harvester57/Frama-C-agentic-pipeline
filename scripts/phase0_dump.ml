@@ -6,7 +6,8 @@
    - every defined function: kernel name, source name, definition location and line span, storage,
      signature, loops and cyclomatic complexity;
    - its direct calls (with the project functions passed as arguments: thread start routines,
-     callbacks) and its indirect call sites, with the called signature;
+     callbacks, and the string literals passed: schema 4) and its indirect call sites, with the
+     called signature;
    - every function whose address is taken (in code or in a global initializer): the only possible
      targets of an indirect call.
 
@@ -167,6 +168,38 @@ let arg_sizes args =
           (fun i a -> match (try arg_size a with _ -> None) with Some n -> [ (string_of_int i, I n) ] | None -> [])
           args))
 
+(* String-literal arguments (plan step M2, M5): argument index -> the literal's bytes, those outside
+   printable ASCII but CR, LF, tab and NUL replaced by '?' (the JSON stays UTF-8; the security
+   properties decide on CR, LF and NUL only). Since Frama-C 32 a literal is a global const array
+   (Ast_info.is_string_literal) the argument points to the start of: `"abc"` or `&"abc"[0]`. A
+   pointer into it (`"abc" + 1`) is not recorded. A wide literal keeps its code points below 128. *)
+let literal_text s =
+  String.map (fun c -> if c = '\r' || c = '\n' || c = '\t' || c = '\000' || (c >= ' ' && c <= '~') then c else '?') s
+
+let string_literal (v : varinfo) =
+  if not (Ast_info.is_string_literal v) then None
+  else
+    match Globals.Vars.get_string_literal v with
+    | Str s -> Some (literal_text s)
+    | Wstr l ->
+      let ascii c = if Int64.compare c 0L >= 0 && Int64.compare c 128L < 0 then Char.chr (Int64.to_int c) else '?' in
+      Some (literal_text (String.concat "" (List.map (fun c -> String.make 1 (ascii c)) l)))
+    | exception _ -> None
+
+let literal_args args =
+  O
+    (List.concat
+       (List.mapi
+          (fun i a ->
+             let lit =
+               match (Cil.stripCasts a).enode with
+               | StartOf (Var v, NoOffset) -> string_literal v
+               | AddrOf (Var v, Index (z, NoOffset)) when const_int z = Some 0 -> string_literal v
+               | _ -> None
+             in
+             match lit with Some s -> [ (string_of_int i, S s) ] | None -> [])
+          args))
+
 (* Calls, loops, decisions, writes and the last line of a function body, in one pass. *)
 class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) (last : int ref) (w : writes) =
 object
@@ -206,7 +239,8 @@ object
           in
           calls :=
             O [ ("kernel_name", S f.vname); ("name", S f.vorig_name); ("indirect", B false);
-                ("function_args", L fn_args); ("arg_sizes", arg_sizes args); ("loc", S (loc_s loc)) ]
+                ("function_args", L fn_args); ("arg_sizes", arg_sizes args);
+                ("literal_args", literal_args args); ("loc", S (loc_s loc)) ]
             :: !calls
         | Mem e ->
           let called = Cil.typeOfLval (Mem e, NoOffset) in
@@ -254,9 +288,11 @@ let run () =
         let vi = Kernel_function.get_vi kf in
         if Kernel_function.is_definition kf then functions := function_json kf :: !functions
         else
+          (* `decl`: its first declaration (the header that declares it); `proto`: that declaration as C,
+             with typedef names and parameter names, for the stub skeletons (scripts/stub_gen.py). *)
           declared :=
             O [ ("kernel_name", S vi.vname); ("name", S vi.vorig_name); ("signature", S (signature vi.vtype));
-                ("formals", formals_json kf) ]
+                ("formals", formals_json kf); ("decl", S (loc_s vi.vdecl)); ("proto", S (one_line Printer.pp_vdecl vi)) ]
             :: !declared);
     let taken = Hashtbl.fold (fun k () acc -> S k :: acc) address_taken [] in
     (* Defined global variables, where the security properties that name them are anchored (I9). *)
@@ -271,7 +307,7 @@ let run () =
         (Ast.get ()).globals
     in
     let doc =
-      O [ ("schema", I 3); ("functions", L (List.rev !functions)); ("declared", L !declared);
+      O [ ("schema", I 4); ("functions", L (List.rev !functions)); ("declared", L !declared);
           ("address_taken", L taken); ("globals", L globals) ]
     in
     let b = Buffer.create 65536 in

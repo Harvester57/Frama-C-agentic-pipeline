@@ -135,7 +135,7 @@ def test_rendered_brief_shows_facts_and_slice_and_only_the_sections_that_apply(t
     # Assembled for this function.
     assert "Inspect every loop, pointer write" not in brief
     assert "Start from the **Deterministic Function Context**" in brief
-    assert "Concrete Dual-Oracle C-String Predicates" not in brief
+    assert "One String Vocabulary" not in brief
     assert "Floating-point comparisons" not in brief
     assert "Pointer-Difference Equality Bridge" not in brief
     assert "Distinguishing Establishment vs. Preservation Failures" in brief
@@ -171,7 +171,7 @@ def test_brief_without_a_facts_file_keeps_all_guidance_and_the_slice(tmp_path: P
     brief = (run_dir / prep["brief_file"]).read_text(encoding="utf-8")
     assert prep["prover_context"]["facts"] is False
     assert "Inspect every loop, pointer write" in brief
-    assert "Concrete Dual-Oracle C-String Predicates" in brief and "Floating-point comparisons" in brief
+    assert "One String Vocabulary" in brief and "Floating-point comparisons" in brief
     assert "### Reading Slice" in brief
     assert "**Writes (AST" not in brief
     assert not MARKER_RE.search(brief)
@@ -185,7 +185,7 @@ def test_context_off_gives_the_full_brief_without_context(tmp_path: Path, monkey
     assert prep["prover_context"] == {"enabled": False}
     assert "## Deterministic Function Context" not in brief and "### Reading Slice" not in brief
     assert "Inspect every loop, pointer write" in brief
-    assert "Concrete Dual-Oracle C-String Predicates" in brief
+    assert "One String Vocabulary" in brief
     assert ff.CONTEXT_SENTINEL not in brief and not MARKER_RE.search(brief)
     assert not (run_dir / "agents" / "prove-total" / "scratch" / "context").exists()
 

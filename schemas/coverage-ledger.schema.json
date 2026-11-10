@@ -8,7 +8,7 @@
     "evidence": {
       "type": "object",
       "properties": {
-        "phase": {"type": "string", "enum": ["fuzz", "eva", "wp", "breaker", "verifier", "audit", "carry_forward"]},
+        "phase": {"type": "string", "enum": ["fuzz", "eva", "wp", "breaker", "verifier", "audit", "carry_forward", "static"]},
         "producer": {"type": "string", "minLength": 1},
         "result": {"type": "string", "minLength": 1},
         "discharging": {"type": "boolean"},
