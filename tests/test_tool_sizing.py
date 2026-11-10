@@ -663,3 +663,16 @@ def test_pointer_cast_goals_are_recognised_from_their_annotation():
     assert not W._is_pointer_cast_goal({"annotation": "\\valid_read(buf + (0 .. len - 1))"})
     assert not W._is_pointer_cast_goal({"annotation": "(int)x <= 65535"})
     assert not W._is_pointer_cast_goal({})
+
+
+@pytest.mark.parametrize(
+    "prop,expected", [(None, "-wp-prop=-eva_taint"), ("L6_no_leak_k", "-wp-prop=L6_no_leak_k,-eva_taint")]
+)
+def test_wp_always_leaves_out_eva_taint_checks(tmp_path, monkeypatch, prop, expected):
+    # security_props.py --eva-taint names its `\tainted` assertions `eva_taint`; WP cannot prove them.
+    _budget(monkeypatch, 4, 65536)
+    fake = FakeFramaC()
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp", retry_bitwise=False, prop=prop)
+    (cmd,) = fake.wp_calls()
+    assert [a for a in cmd if a.startswith("-wp-prop")] == [expected]
