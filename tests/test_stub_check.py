@@ -18,8 +18,8 @@ HASH = "int ml_hash(ml_ctx *ctx, unsigned char const *data, size_t len, unsigned
 NAME = "char const *ml_name(ml_ctx const *ctx)"
 HEADER = "workspace/stubs/mylib/mylib.h"
 FIXTURE = ROOT / "tests" / "fixtures" / "stub_check"
-# Shipped stubs that still diverge from the real header (the plan's S4 repairs them): header -> member.
-KNOWN_SHIPPED_DIVERGENCES = {"netinet/ip_icmp.h": "icmp.icmp_ip"}
+# Shipped stubs that still diverge from the real header: header -> member (S4 repaired ip_icmp.h).
+KNOWN_SHIPPED_DIVERGENCES: dict[str, str] = {}
 
 
 def _docker(*args: str, mounts: dict[Path, str], timeout: int = 900) -> str:
