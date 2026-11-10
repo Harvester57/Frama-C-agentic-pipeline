@@ -171,6 +171,7 @@ The ledger's `module` is also a DAG module name, and a ledger *unit* (`file#func
 - **Whole-API harness (`generate_harness.py --api`):**
   - one dispatch case per entry point of the module's scope, built from the model's signatures, formals and `param_sizes`;
   - plus sequence cases from the recorded traces;
+  - plus one lifecycle case per opaque handle type with a constructor and a destructor (H2): build the handle, up to 8 calls on it chosen by input bytes, release it; within the 16 sequence cases, after the recorded ones;
   - its sidecar carries `api_cases` (each case's input layout), which `seed_harvest.py write` reads instead of parsing the C, and `api_skipped`.
 - **Seed sources:**
   - with no test command, Phase 0 records the calls of the project's non-test executables, each run once with no arguments (report `source: executables`);

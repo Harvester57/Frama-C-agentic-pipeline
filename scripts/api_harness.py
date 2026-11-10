@@ -47,7 +47,12 @@ byte selects it), with arguments built from the model's signature of each functi
 
 Recorded call sequences (seed_harvest.py traces) add sequence cases: the calls of one traced chain in
 order, the buffers they share passed between them, so a later call sees what an earlier one produced
-(a key pair before the box that uses it).
+(a key pair before the box that uses it). A handle type with a constructor and a destructor gets one
+synthesized lifecycle case (`lifecycle_case`; a recorded chain passes a shared handle as a zeroed
+buffer, so it does not stand in for one): build the
+handle, make up to LIFECYCLE_MAX_CALLS calls on it, each chosen by an input byte among the functions
+taking it, then release it, so use after free, double free and call after error stay reachable. Both
+kinds share the MAX_SEQUENCE_CASES cap, recorded chains first.
 
 The layout of every case (which input bytes feed which argument) goes to the sidecar as `api_cases`,
 which seed_harvest.py write reads to turn recorded calls into seeds for each case. Functions the
@@ -75,7 +80,8 @@ from seed_harvest import _CHAR_POINTEES, _QUALIFIERS_RE, classify_type, is_lengt
 
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
 TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
-MAX_SEQUENCE_CASES = 16
+MAX_SEQUENCE_CASES = 16  # recorded chains first, then synthesized lifecycle cases (H2)
+LIFECYCLE_MAX_CALLS = 8  # calls on the handle per run of a lifecycle case, each picked by one input byte
 MAX_CASES = 255  # one selector byte
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
 MAX_DIAGNOSTIC_CHARS = 300
@@ -778,6 +784,74 @@ def sequence_case(
     return case.statements(calls), case.layout("sequence", names), None
 
 
+def lifecycle_methods(htype: str, records: dict[str, dict], api: ApiInfo) -> list[str]:
+    """
+    The functions a lifecycle case of handle type `htype` may call on its handle: the API functions
+    with a case (`records`) that take exactly one handle of that type, other than its constructor
+    and the functions named like its destructor (the case releases the handle itself, last).
+    """
+    out: list[str] = []
+    for name in sorted(records):
+        if sum(1 for t in (api.handles.get(name) or {}).values() if t == htype) != 1:
+            continue
+        if name == api.ctors.get(htype) or name in api.dtor_names.get(htype, set()):
+            continue
+        out.append(name)
+    return out[:MAX_CASES]
+
+
+def lifecycle_case(
+    htype: str,
+    methods: list[str],
+    records: dict[str, dict],
+    spare: int,
+    api: ApiInfo,
+    max_calls: int = LIFECYCLE_MAX_CALLS,
+) -> tuple[str | None, dict | None, str | None]:
+    """
+    A synthesized call sequence on one handle (H2): the constructor builds it (call 0, its arguments
+    from the input as in any case), then while the input lasts, up to `max_calls` times, one input
+    byte picks one of `methods` (call k + 1 for methods[k]), called on the handle with its other
+    arguments read from the input at that point, then the destructor releases the handle. Only the
+    constructor's slots are fixed, so they are the layout's slots (seeds start from the constructor's
+    recorded arguments); the method calls read their bytes in the loop. A NULL handle runs no method.
+    """
+    ctor, dtor = api.ctors.get(htype), api.dtors.get(htype)
+    if ctor is None or dtor is None:
+        return None, None, f"{htype}: no constructor or destructor known"
+    if not methods:
+        return None, None, f"{htype}: no other function takes the handle"
+    crec = api.records.get(ctor) or records.get(ctor) or {}
+    cparams, why = plan_params(str(crec.get("signature") or ""))
+    if cparams is None:
+        return None, None, f"{ctor}: {why}"
+    ncalls = len(methods) + 2
+    case = _Case(spare, api, calls=ncalls)
+    make = _bind_call(case, 0, ctor, cparams, list(crec.get("formals") or []), crec, allow_init=False)
+    # Without initializers the statement is the call alone: keep its result instead of dropping it.
+    make = make.replace("(void)", f"{htype} fc_h = ", 1)
+    branches: list[str] = []
+    for k, name in enumerate(methods):
+        rec = records[name]
+        params, why = plan_params(str(rec.get("signature") or ""))
+        if params is None:
+            return None, None, f"{name}: {why}"
+        idx = next(i for i, t in (api.handles.get(name) or {}).items() if t == htype)
+        sub = _Case(spare, api, calls=ncalls)
+        call = _bind_call(sub, k + 1, name, params, list(rec.get("formals") or []), rec, {idx: "fc_h"})
+        case.notes.extend(sub.notes)
+        branches.append(f"if (fc_k == {k}U) {{ {' '.join([*sub.decls, *sub.post, call])} }}")
+    loop = (
+        f"if (fc_h != 0) {{ for (unsigned int fc_i = 0; fc_i < {max_calls}U; fc_i++) {{ unsigned char fc_op = 0;"
+        f" if (fuzz_len < fuzz_off + 1) {{ break; }} memcpy(&fc_op, {FUZZ_COPY}, 1); fuzz_off += 1;"
+        f" unsigned int fc_k = (unsigned int)fc_op % {len(methods)}U; {' else '.join(branches)} }}"
+        f" (void){dtor}(fc_h); }}"
+    )
+    layout = case.layout("lifecycle", [ctor, dtor])
+    layout.update(handle=htype, methods=list(methods), max_calls=max_calls)
+    return case.statements([make, loop]), layout, None
+
+
 def plan(
     dag: dict,
     model: dict,
@@ -869,6 +943,21 @@ def plan(
             seq_seen.add(sig)
             cases.append(stmt)
             layouts.append(layout)
+    # Every handle type with a constructor and a destructor gets one synthesized lifecycle case, within
+    # the same cap as the recorded sequences (which come first). A recorded chain does not cover the
+    # type: sequence_case passes a shared handle as a zeroed buffer (an incomplete struct does not
+    # even compile), never the constructor's result, which the traces do not record.
+    n_seq = len(seq_seen)
+    for htype in sorted(set(api.ctors) & set(api.dtors)):
+        if n_seq >= MAX_SEQUENCE_CASES:
+            break
+        methods = lifecycle_methods(htype, records, api)
+        stmt, layout, why = lifecycle_case(htype, methods, records, spare, api)
+        if stmt is None or layout is None:
+            continue
+        n_seq += 1
+        cases.append(stmt)
+        layouts.append(layout)
     if len(cases) > MAX_CASES:
         for lay in layouts[MAX_CASES:]:
             if lay.get("entry"):
@@ -1344,6 +1433,7 @@ def generate(
         api_cases=len(layouts),
         api_entries=sum(1 for lay in layouts if lay.get("entry")),
         api_sequences=sum(1 for lay in layouts if lay["kind"] == "sequence"),
+        api_lifecycles=sum(1 for lay in layouts if lay["kind"] == "lifecycle"),
         api_skipped=skipped,
     )
     return result

@@ -73,6 +73,23 @@
       },
       "required": ["selector", "kind", "calls", "slots", "rest"],
       "additionalProperties": false
+    },
+    "lifecycle_case": {
+      "$comment": "A synthesized call sequence on one opaque handle (api_harness.lifecycle_case): `calls` are its constructor (call 0, whose arguments are the slots) and destructor; up to `max_calls` calls of `methods`, each picked by one input byte, run on the handle in between, their arguments read from the input in the loop.",
+      "type": "object",
+      "properties": {
+        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "kind": {"const": "lifecycle"},
+        "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 2, "maxItems": 2},
+        "handle": {"type": "string", "minLength": 1},
+        "methods": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+        "max_calls": {"type": "integer", "minimum": 1},
+        "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
+        "rest": {"type": "null"},
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
+      },
+      "required": ["selector", "kind", "calls", "handle", "methods", "max_calls", "slots", "rest"],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -114,7 +131,7 @@
     "api_harness": {"const": true},
     "api_cases": {
       "type": "array",
-      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}]}
+      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}]}
     },
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason", "type": "object", "additionalProperties": {"type": "string"}},
     "target_fuzzer": {
