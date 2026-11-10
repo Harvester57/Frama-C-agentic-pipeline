@@ -67,7 +67,17 @@ NOT_FORWARDED = {
     "FRAMAC_PROBE_ROOT",
     "FRAMAC_SECURITY_PROPS",  # run_wp_function.py override; the default is the run's workspace/reports file
 }
-AB_SWITCHES = ("FRAMAC_FRAME_SKELETON", "FRAMAC_LOOP_TEMPLATES", "FRAMAC_SPEC_KB")
+AB_SWITCHES = (
+    "FRAMAC_FRAME_SKELETON",
+    "FRAMAC_LOOP_TEMPLATES",
+    "FRAMAC_SPEC_KB",
+    "FRAMAC_NEGOTIATE_EVIDENCE",
+    "FRAMAC_MUTATION_STUB",
+    "FRAMAC_CANDIDATE_RANK",
+    "FRAMAC_PROOF_CARRY",
+)
+# The value that turns each switch to its baseline side.
+AB_BASELINE = {name: "off" for name in AB_SWITCHES} | {"FRAMAC_CANDIDATE_RANK": "legacy"}
 
 
 def _read(rel: str) -> str:
@@ -149,7 +159,7 @@ def test_ps1_forwards_the_ab_switches_and_sets_user_only_off_windows(tmp_path):
     if not pwsh:
         pytest.skip("pwsh/powershell not available")
     log_file, env = _fake_engine(tmp_path)
-    env.update(FRAMAC_FRAME_SKELETON="off", FRAMAC_LOOP_TEMPLATES="off", FRAMAC_SPEC_KB="off")
+    env.update(AB_BASELINE)
     base = [
         pwsh,
         "-NoProfile",
@@ -165,7 +175,7 @@ def test_ps1_forwards_the_ab_switches_and_sets_user_only_off_windows(tmp_path):
         assert proc.returncode == 0, proc.stderr or proc.stdout
         args, pairs = _engine_run_args(log_file)
         for name in AB_SWITCHES:
-            assert ("-e", f"{name}=off") in pairs, (extra, name)
+            assert ("-e", f"{name}={AB_BASELINE[name]}") in pairs, (extra, name)
         if sys.platform == "win32":
             assert "--user" not in args, extra
         else:

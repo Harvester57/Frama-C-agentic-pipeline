@@ -19,6 +19,8 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 
 <!-- deterministic-context -->
 
+A `Known Dead Ends` section, when present, lists clauses already refuted on this function or rejected by a callee; never re-add them.
+
 <!-- spec-kb -->
 
 ## Strict Rules
@@ -94,9 +96,9 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    - **Failure-kind repair strategy:** classify each unproven loop goal by its WP name: `_established` fails => weaken the invariant or add a `requires` that holds at loop entry; `_preserved` fails => adjust it (not inductive across one iteration, or `loop assigns` missing/too broad); failing BOTH => the invariant is invalid — drop and regenerate it (largest valid subset), never keep it; only provability/postcondition goals fail => strengthen the invariant; `loop_variant` / `decreases` goals fail => fix the measure or add a progress guard (e.g. `if (consumed == 0) return -1;`).
 <!-- endif -->
 <!-- if: loops or recursion -->
-3. **Inductive Lemmas Without Coq (Ghost Lemma Functions):**
-   - Never write an unproven global `lemma foo: ...;` expecting SMT solvers to do induction automatically (`run_wp_function.py` flags unproven global lemmas as `unsound_proof`).
-   - Instead, write a `/*@ ghost ... */` recursive C function with `requires`, `decreases n;`, `assigns \nothing;`, and `ensures`, whose body steps the base case (`if (n <= 0) return;`) and recursive step (`lemma_fn(n - 1);`). WP proves each recursive call inducts cleanly with Alt-Ergo/Z3/CVC5.
+3. **Inductive Lemmas: Stop, Do Not Work Around Them:**
+   - Never write a global `lemma` and never write a file-scope `/*@ ghost ... */` function. An unproven `lemma` makes the proof `unsound_proof`; a ghost function sits outside your function's span and `merge-agent` refuses the whole patch (`ScopeViolationError`), and nothing proves the ghost function's own contract under `-wp-fct`.
+   - When a goal needs an inductive argument that WP cannot do inline (a `loop invariant` over a recursively defined quantity, a lemma about a `predicate`), stop with `status: "stalled_after_k_retries"` and `proof_gap: {"predicate": "<the goal's predicate>", "reason": "inductive lemma required: <one line>"}`. Do not work around it with `axiomatic`, `admit`, a ghost function inside the body, or a weaker clause.
 <!-- endif -->
 
 ### Step C — Preconditions (`requires`), Postconditions (`ensures`), and RTE Discharge
@@ -104,6 +106,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
    - Isolate the failing goal by passing `--prop <clause_name> --dump-goal` to `run_wp_function.py` and read `vc_goal_dumps` in the JSON output to see the exact `Goal ... : ... Prove: ...` sequent.
    - Check if `{function_name}` relies on caller guarantees (e.g., `len <= MAX_PDU_SIZE`, `buf != \null`, `\valid_read(buf + (0 .. len - 1))`). Add the minimal necessary `requires` clause to `agents/{agent_id}/scratch/work/{header_file}`, subject to Rule 3.
     - Check if `{function_name}` fails because a **callee function `g()`** has a weak contract in its `.h` header. Do not edit `g()`; add an entry to `strengthening_requests` in your result (`callee`, `header_file`, optional `callee_file`, `needed_clause`, `reason`).
+    - If this brief ends with strengthening requests from callers, you are the callee they negotiate with. Under the requests, the brief lists each caller's unproven goals at the call site (line, kind, verdict, bucket) with the WP report they come from, and summarizes the last prover run on your function. Prove the requested clauses first; if one is exactly what a caller goal needs but cannot hold, say in `unproven_goals` which caller goal stays open.
 2. **Common ACSL Traps to Avoid (WP + E-ACSL Intersection Cheat Sheet):**
 
    | Rule / Construct | WRONG (Fails WP, E-ACSL, or Parser) | RIGHT (Valid in Both WP and E-ACSL) |
@@ -243,10 +246,13 @@ Run wrapper commands in the **foreground** and wait for completion: either run *
 
 Both oracles record each iteration under `agents/{agent_id}/scratch/candidates/` and print a `candidate` block. On the same files, the first to finish says `next_action: "wait_for_other_oracle"`; the second says `evaluated: true` and carries the verdict.
 
+- `scope_violation_pending` lists top-level ACSL declarations you added outside your function (`ghost lem`, `predicate p`, ...); the output also says `next_synthesis_focus: "remove_top_level_acsl_declarations"` and `next_action: "continue"`, even for an `all_proven` candidate. Remove them before the next iteration, the merge will refuse them (Strict Rule 2; Step B, Inductive Lemmas). Such a candidate is never kept as your best.
+
 - The best candidate passes the guardrail and has the fewest unproven goals, then the most proved goals. A candidate the guardrail rejects is never compared, however good its proof ratio: a stronger `requires` can raise that ratio by excluding inputs.
+- `trivial_added` counts clauses you added that hold whatever the code does (`\true`, `x == x`, literal comparisons such as `0 <= 1`, in an `ensures`, `assert`, `check` or `loop invariant`); they earn no credit in the rank, adding only such clauses is not progress, and `next_synthesis_focus: "drop_trivial_clauses"` in the `candidate` block asks you to remove them.
 - `next_action: "continue"`: keep iterating.
 - `next_action: "finished"`: this candidate is `all_proven` and passes the guardrail.
-- `next_action: "restore_best_and_finish"` (the output also says `next_synthesis_focus: "no_progress_restore_best_and_finish"`): this iteration improved neither number. Stop iterating, and finish as below.
+- `next_action: "restore_best_and_finish"` (the output also says `next_synthesis_focus: "no_progress_restore_best_and_finish"`): this iteration improved neither number (proved goals of trivial clauses do not count). Stop iterating, and finish as below.
 - Runs with `--prop` or `--dump-goal` are diagnostics and are not recorded.
 
 Whenever you finish without `all_proven`, for any reason, first run `python3 /opt/framac-pipeline/scripts/prover_candidates.py restore-best --agent-id {agent_id}`. It puts the best candidate's files and reports back and regenerates the patch. Then take your status from the restored `agents/{agent_id}/scratch/wp_{function_name}.json`. After a `code_fault`, the report with the fault is at `agents/{agent_id}/scratch/candidates/last/guard_{function_name}.json` if a best candidate replaced it: name that file in `evidence`.

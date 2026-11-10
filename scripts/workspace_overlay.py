@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import function_facts  # noqa: E402
 import function_slice  # noqa: E402
+import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
@@ -1392,6 +1393,41 @@ def merge_agent_overlay(
         return res
 
 
+def _callee_names(fn_meta: dict) -> list[str]:
+    """The function's callees from its call graph record, as plain names (`file#fn` keys lose the file)."""
+    for key in ("internal_callees", "direct_callees", "callees"):
+        raw = fn_meta.get(key)
+        if isinstance(raw, list) and raw:
+            return sorted({str(c).rsplit("#", 1)[-1] for c in raw if c})
+    return []
+
+
+def _earlier_refutations(run_dir: Path, agent_id: str, function: str | None, c_file: str | None) -> list[dict]:
+    """
+    Clauses the guardrail refuted on earlier provers of the same function and file in this run. A re-dispatch gets a
+    fresh agent id (wp_scheduler._assign_agent), so the earlier attempts live in other agents' scratch directories.
+    """
+    agents = run_dir / "agents"
+    if not function or not agents.is_dir():
+        return []
+    out: list[dict] = []
+    for agent in sorted(agents.iterdir()):
+        scratch = agent / "scratch"
+        if agent.name == agent_id or not (scratch / prover_candidates.STATE_FILE).is_file():
+            continue
+        try:
+            budget = json.loads((scratch / prover_candidates.BUDGET_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(budget, dict) or budget.get("function") != function:
+            continue
+        if c_file and _normalize_work_relpath(str(budget.get("file") or "")) != c_file:
+            continue
+        for clause in prover_candidates.refuted_clauses(scratch):
+            out.append({**clause, "kind": "guardrail_refutation", "function": function, "source": agent.name})
+    return out
+
+
 def _load_function_facts(overlay: Path, module: str | None, c_file: str | None, function: str | None) -> dict | None:
     """
     A function's facts (`reports/facts/<harness module>.json`): the module's own report, then that
@@ -2407,6 +2443,54 @@ def _prover_context(
     return section, features if isinstance(features, dict) else None, summary
 
 
+def _negotiation_evidence_section(caller_evidence: list[dict] | None, callee_history: dict | None) -> str:
+    """
+    The seam evidence appended to the Contract Negotiation Requests: why each caller stalled (its
+    unproven goals at the call site) and this function's previous prover run. Empty when there is
+    neither, so the brief is then unchanged.
+    """
+    out = ""
+    entries = [e for e in caller_evidence or [] if isinstance(e, dict)]
+    if entries:
+        out += "\n### Why the callers stalled (seam evidence)\n\n"
+        for entry in entries:
+            report = entry.get("report")
+            where = f"report `{report}`" if report else "no WP report found"
+            out += f"- `{entry.get('caller')}` (`{entry.get('caller_file')}`, {where}):\n"
+            goals = [g for g in entry.get("goals") or [] if isinstance(g, dict)]
+            if not goals:
+                out += "  - no unproven goal at the call site was recorded\n"
+            for g in goals:
+                annotation = " ".join(str(g.get("annotation") or "").replace("`", "'").split())
+                kind = str(g.get("kind") or "goal")
+                prop = f"{kind} `{annotation}`" if annotation else kind
+                bucket = g.get("diagnostic_bucket") or "unclassified"
+                out += f"  - line {g.get('line')}, {prop}: {g.get('status') or 'Unknown'} (`{bucket}`)\n"
+    if callee_history:
+        rank = callee_history.get("best_rank")
+        # prover_candidates stores best_rank as a dict ({failed, proved, invalid, ...}); older states used a list.
+        if isinstance(rank, dict) and rank:
+            rank_text = ", ".join(f"{k} {v}" for k, v in rank.items() if v is not None)
+        elif isinstance(rank, list | tuple) and rank:
+            rank_text = f"({', '.join(str(x) for x in rank)})"
+        else:
+            rank_text = "none recorded"
+        out += (
+            "\n### Your function's previous prover run\n\n"
+            f"Agent `{callee_history.get('agent_id')}` ran {callee_history.get('iterations')} iterations; "
+            f"best rank: {rank_text}; "
+            f"last WP status `{callee_history.get('last_wp_status')}`, "
+            f"last guardrail `{callee_history.get('last_guardrail_status')}`. "
+            "Its scratch is read-only to you; do not copy clauses the guardrail refuted.\n"
+        )
+    if out:
+        out += (
+            "\nProve the requested clauses first; if a requested clause is exactly what the caller's goal "
+            "needs but cannot hold, say which caller goal would remain open.\n"
+        )
+    return out
+
+
 def prepare_agent(
     run_dir: Path,
     agent_id: str,
@@ -2422,6 +2506,8 @@ def prepare_agent(
     ldflags: str | None = None,
     wp_report: str | None = None,
     requests: list[dict] | None = None,
+    caller_evidence: list[dict] | None = None,
+    callee_history: dict | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -2431,7 +2517,9 @@ def prepare_agent(
     `wp_report` names the WP report whose unproven goals the brief lists (a breaker gets the
     stalled prover's report); the default is `workspace/reports/wp/<function>.json`.
     `requests` are strengthening requests a negotiating callee prover must answer; they are
-    appended to its brief.
+    appended to its brief, followed by the seam evidence when given: `caller_evidence` (each
+    caller's unproven goals at the call site, from its stalled WP report) and `callee_history`
+    (a summary of this function's previous prover run).
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -2676,6 +2764,14 @@ def prepare_agent(
         if spec_kb.enabled():
             record = _load_function_facts(overlay, module, norm_c_file, function)
             kb_section = spec_kb.kb_section_for(overlay, record)
+    if role in ("prover", "breaker") and spec_kb.enabled():
+        # Dead ends: clauses refuted on this function (earlier dispatches included) and rejected callee requests.
+        kb_section += spec_kb.obstructions_section_for(
+            overlay,
+            function,
+            _callee_names(fn_meta),
+            _earlier_refutations(run_dir, agent_id, function, norm_c_file),
+        )
     replacements = {
         "{agent_id}": agent_id,
         "{module_name}": module or "unknown",
@@ -2757,6 +2853,7 @@ def prepare_agent(
             "fails and why. Never weaken an existing clause to make a requested one provable.\n\n"
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
+        rendered += _negotiation_evidence_section(caller_evidence, callee_history)
 
     brief_path = agent_root / "brief.md"
     brief_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2957,6 +3054,18 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Strengthening request the callee prover must answer (repeatable)",
     )
+    p_prep.add_argument(
+        "--caller-evidence-json",
+        type=Path,
+        default=None,
+        help="JSON list of the callers' call-site goals, rendered under the negotiation requests",
+    )
+    p_prep.add_argument(
+        "--callee-history-json",
+        type=Path,
+        default=None,
+        help="JSON object summarizing the callee's previous prover run, rendered under the requests",
+    )
 
     p_check = sub.add_parser("check-acsl-only")
     p_check.add_argument("--overlay", type=Path, default=Path("workspace"))
@@ -3028,6 +3137,12 @@ def main(argv: list[str] | None = None) -> int:
                 if missing:
                     raise ArtifactError(f"unknown strengthening request(s) in {req_file}: {', '.join(missing)}")
                 requests = [known[rid] for rid in args.request_id]
+            caller_evidence = load_json_strict(args.caller_evidence_json) if args.caller_evidence_json else None
+            if caller_evidence is not None and not isinstance(caller_evidence, list):
+                raise ArtifactError(f"{args.caller_evidence_json}: expected a JSON list")
+            callee_history = load_json_strict(args.callee_history_json) if args.callee_history_json else None
+            if callee_history is not None and not isinstance(callee_history, dict):
+                raise ArtifactError(f"{args.callee_history_json}: expected a JSON object")
             res = prepare_agent(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -3043,6 +3158,8 @@ def main(argv: list[str] | None = None) -> int:
                 ldflags=args.ldflags,
                 wp_report=args.wp_report,
                 requests=requests,
+                caller_evidence=caller_evidence,
+                callee_history=callee_history,
             )
         elif args.cmd == "check-acsl-only":
             res = check_acsl_only(args.overlay, args.work_dir, args.file or None)

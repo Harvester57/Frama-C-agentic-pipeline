@@ -14,6 +14,10 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
 - **Shared corpus (read-only for you):** `workspace/corpus/{module_name}/`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
 
+A `Known Dead Ends` section, when present, lists clauses already refuted on this function or rejected by a callee; never re-add them. A clause refuted under E-ACSL came with an input that violates it: use its predicate as a hint for inputs that violate the current contract.
+
+<!-- spec-kb -->
+
 ## Rules
 
 - Inputs must respect the harness entry function's declared or documented contract. A failure that requires violating that contract (for example a length larger than the buffer the API documents) is harness-induced and does not count.

@@ -10,7 +10,10 @@ The oracles record themselves here, so nothing relies on an LLM remembering what
 A candidate is identified by the sha256 of the tracked files in scratch/work/: the `file` and the optional
 `header` of scratch/.prover_budget.json. It is evaluated once both oracles have reported on the same digest, in
 either order or in parallel. Only candidates that pass the guardrail are compared, because a stronger `requires`
-can raise the proof ratio by excluding inputs. The rank is (failed goals, -proved goals), lower is better.
+can raise the proof ratio by excluding inputs. The rank is (failed goals, invalid invariants, trivial clauses added,
+-effective proved goals), lower is better: a clause the prover added that holds whatever the code does (`\\true`,
+`x == x`, `1 <= 2`; acsl_ast.is_trivial_predicate) earns no credit, so it can neither win a tie nor count as progress.
+FRAMAC_CANDIDATE_RANK=legacy restores the earlier (failed, invalid, -proved) rank and progress test.
 
 State, under agents/<id>/scratch/candidates/:
   state.json   the best candidate, the candidates seen, and one history entry per recorded oracle run
@@ -42,6 +45,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from acsl_ast import (  # noqa: E402
+    _parse_acsl_inner_segments,
+    added_top_level_acsl_declarations,
+    is_trivial_predicate,
+    tokenize_c_acsl,
+)
 from framac_common import (  # noqa: E402
     ArtifactError,
     atomic_write_json,
@@ -68,6 +77,22 @@ COMPARABLE_WP_STATUSES = frozenset({"all_proven", "unproven_goals_remain"})
 GUARDRAIL_REFUTATIONS = frozenset({"rejected_overconstrained", "code_fault"})
 WP_STATUSES_WITH_SOUNDNESS_VERDICT = frozenset({"unsound_proof", "unproven_goals_remain"})
 NO_PROGRESS_FOCUS = "no_progress_restore_best_and_finish"
+# The candidate adds top-level ACSL declarations outside the function: merge-agent refuses the whole patch.
+SCOPE_VIOLATION_FOCUS = "remove_top_level_acsl_declarations"
+DROP_TRIVIAL_FOCUS = "drop_trivial_clauses"
+
+# A/B switch for the rank: "legacy" restores (failed, invalid, -proved); anything else is trivial-aware.
+RANK_MODE_ENV = "FRAMAC_CANDIDATE_RANK"
+LEGACY_RANK = "legacy"
+# Clauses whose goals inflate `proved` when their predicate holds whatever the code does. `requires` is left out: a
+# trivial precondition adds no goal of the function's own, and dropping it changes nothing.
+TRIVIAL_CANDIDATE_KINDS = frozenset({"ensures", "assert", "check", "invariant", "loop invariant"})
+MAX_TRIVIAL_CLAUSES_KEPT = 20
+_CLAUSE_HEAD_RE = re.compile(
+    r"^\s*(?P<kind>loop\s+invariant|ensures|assert|check|invariant)\b\s*"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)\s*)*(?P<pred>.*?)\s*;?\s*$",
+    re.DOTALL,
+)
 
 # Far above what a holder needs (milliseconds), and above the 120 s after which run_lock breaks a dead holder's lock.
 LOCK_TIMEOUT_S = 300.0
@@ -209,6 +234,32 @@ def digest_before_run(out_json: Path | str) -> str | None:
         return None
 
 
+def top_level_additions(scratch: Path, budget: dict) -> list[str]:
+    """
+    `"<kind> <name>"` for each top-level ACSL declaration (ghost function, predicate, lemma, ...) that scratch/work
+    adds over the pristine scratch/base in the tracked files. merge-agent refuses such a patch (prover brief, Step B: Inductive Lemmas).
+    Fail-open: any error gives [].
+    """
+    try:
+        rels = _tracked_rels(budget)
+        if rels is None:
+            return []
+        pending: list[str] = []
+        for rel in rels:
+            work = _read_regular(scratch, f"work/{rel}")
+            if work is None:
+                continue
+            base = _read_regular(scratch, f"base/{rel}") or b""
+            pending.extend(
+                added_top_level_acsl_declarations(
+                    base.decode("utf-8", "surrogateescape"), work.decode("utf-8", "surrogateescape"), path=rel
+                )
+            )
+        return pending
+    except Exception:
+        return []
+
+
 def _new_state(scratch: Path, function: str | None) -> dict:
     return {
         "schema": SCHEMA_VERSION,
@@ -233,8 +284,24 @@ def _load_state(scratch: Path) -> dict | None:
     return state
 
 
+# What state.json keeps of a refuting guardrail's `failure` (run_eacsl_fuzz.parse_eacsl_failure): no file paths.
+FAILURE_KEYS = ("function", "line", "kind", "label", "predicate", "annotation_rte", "is_rte")
+
+
+def _trim_failure(failure: object) -> dict | None:
+    if not isinstance(failure, dict):
+        return None
+    return {k: failure[k] for k in FAILURE_KEYS if k in failure}
+
+
 def _oracle_summary(oracle: str, report: dict) -> dict:
     if oracle == "guardrail":
+        if report.get("status") in GUARDRAIL_REFUTATIONS:
+            return {
+                "status": report.get("status"),
+                "reason": report.get("reason"),
+                "failure": _trim_failure(report.get("failure")),
+            }
         return {"status": report.get("status")}
     summary = {
         "status": report.get("status"),
@@ -257,6 +324,75 @@ def _oracle_summary(oracle: str, report: dict) -> dict:
     return summary
 
 
+def _acsl_tokens(data: bytes | None) -> list[tuple[str, int]]:
+    """(text, line) of every ACSL annotation token in `data`; raises on a tokenizer error."""
+    if data is None:
+        return []
+    source = data.decode("utf-8", "surrogateescape")
+    return [(t.text, t.line) for t in tokenize_c_acsl(source) if t.kind in ("acsl_block", "acsl_line")]
+
+
+def _added_acsl_texts(base: bytes | None, work: bytes | None) -> list[tuple[str, int]]:
+    """
+    (text, line) of the ACSL tokens of `work` whose text is not an ACSL token of `base`: the annotations the prover
+    added or changed (the baseline idea of verify_acsl_only). Fail-open: a tokenizer error means none.
+    """
+    try:
+        base_texts = {text for text, _ in _acsl_tokens(base)}
+        return [(text, line) for text, line in _acsl_tokens(work) if text not in base_texts]
+    except Exception:
+        return []
+
+
+def _acsl_inner(text: str) -> str:
+    if text.startswith("/*@"):
+        return text[3:-2] if text.endswith("*/") else text[3:]
+    return text[3:] if text.startswith("//@") else text
+
+
+def trivial_added_clauses(scratch: Path, budget: dict, contents: dict[str, bytes | None]) -> list[dict]:
+    """
+    The clauses the prover added to its tracked files (scratch/work vs the pristine scratch/base) whose predicate holds
+    whatever the code does: [{"file", "line", "kind", "predicate"}]. Syntactic, like trivial_layer_clauses in the WP
+    report: semantic tautologies are missed, and anything the detector cannot see through counts as real.
+    """
+    del budget  # the tracked files are the keys of `contents`; kept for symmetry with the other budget readers
+    found: list[dict] = []
+    for rel in sorted(contents):
+        if not is_safe_relative_path(rel):
+            continue
+        for text, line in _added_acsl_texts(_read_regular(scratch, f"base/{rel}"), contents[rel]):
+            try:
+                segments = _parse_acsl_inner_segments(_acsl_inner(text), line)
+            except Exception:
+                continue
+            for seg in segments:
+                # Continuation lines of a block may start with `@`, which is not part of the predicate.
+                raw = " ".join(seg.raw_text.replace("@", " ").split())
+                m = _CLAUSE_HEAD_RE.match(raw)
+                if m is None:
+                    continue
+                kind = " ".join(m.group("kind").split())
+                predicate = m.group("pred")
+                if kind in TRIVIAL_CANDIDATE_KINDS and predicate and is_trivial_predicate(predicate):
+                    found.append({"file": rel, "line": seg.line, "kind": kind, "predicate": predicate})
+    return found
+
+
+def _legacy_rank() -> bool:
+    return os.environ.get(RANK_MODE_ENV, "trivial_aware").strip().lower() == LEGACY_RANK
+
+
+def _effective_proved(wp: dict) -> int:
+    """
+    The proved goals the rank credits. Trivial-aware mode drops one goal per trivial clause added: an under-estimate
+    for a `loop invariant`, which yields two (established and preserved), accepted to keep the count conservative.
+    """
+    if _legacy_rank():
+        return int(wp["proved"])
+    return max(0, int(wp["proved"]) - int(wp.get("trivial_added") or 0))
+
+
 def _is_eligible(wp: dict, guard: dict) -> bool:
     """
     Whether a candidate may be compared at all. A candidate with no goals is not: it describes no proof state, and
@@ -268,6 +404,8 @@ def _is_eligible(wp: dict, guard: dict) -> bool:
         and wp["soundness_ok"]
         and wp["failed"] is not None
         and wp["failed"] + wp["proved"] > 0
+        # Unmergeable: merge-agent refuses top-level declarations outside the function. Absent in older states.
+        and wp.get("scope_ok", True)
     )
 
 
@@ -277,17 +415,35 @@ def _is_refuted(wp: dict, guard: dict) -> bool:
     return wp["status"] in WP_STATUSES_WITH_SOUNDNESS_VERDICT and not wp["soundness_ok"]
 
 
-def _rank_key(rank: dict) -> tuple[int, int, int]:
+def _rank_key(rank: dict) -> tuple[int, ...]:
     # Fewer failed goals first; among equals, fewer INVALID invariants (establishment/preservation
-    # failures, which must be dropped/regenerated) before more proved goals.
-    return (rank["failed"], rank.get("invalid", 0), -rank["proved"])
+    # failures, which must be dropped/regenerated) before more proved goals. Trivial-aware mode then
+    # prefers fewer trivial clauses added and credits only the proved goals they did not add. A rank
+    # written before trivial-aware mode existed has neither field: it counts as no trivial clause.
+    if _legacy_rank():
+        return (rank["failed"], rank.get("invalid", 0), -rank["proved"])
+    effective = rank.get("effective_proved")
+    return (
+        rank["failed"],
+        rank.get("invalid", 0),
+        rank.get("trivial_added") or 0,
+        -(rank["proved"] if effective is None else effective),
+    )
 
 
 def _highest_proved(state: dict) -> int | None:
-    """The highest proved count of any eligible evaluation so far, unless later runs refuted those files."""
+    """
+    The highest proved count of any eligible evaluation so far, unless later runs refuted those files. Trivial-aware
+    mode uses the effective count where the history entry has one (entries written before it have only `proved`).
+    """
     refuted = {digest for digest, cand in state["candidates"].items() if cand["refuted"]}
+    key = "proved" if _legacy_rank() else "effective_proved"
     return max(
-        (h["proved"] for h in state["history"] if h["eligible"] and h["digest"] not in refuted),
+        (
+            h["proved"] if h.get(key) is None else h[key]
+            for h in state["history"]
+            if h["eligible"] and h["digest"] not in refuted
+        ),
         default=None,
     )
 
@@ -330,12 +486,20 @@ def _evaluate(scratch: Path, state: dict, digest: str, contents: dict[str, bytes
         # existing retry budget bounds that.
         return {"eligible": False, "rank": None, "progress": None, "next_action": "continue"}
 
-    rank = {"failed": wp["failed"], "proved": wp["proved"], "invalid": wp.get("invalid") or 0}
+    trivial_added = wp.get("trivial_added") or 0
+    rank = {
+        "failed": wp["failed"],
+        "proved": wp["proved"],
+        "invalid": wp.get("invalid") or 0,
+        "trivial_added": trivial_added,
+        "effective_proved": _effective_proved(wp),
+    }
     ranks_higher = state["best_rank"] is None or _rank_key(rank) < _rank_key(state["best_rank"])
     # New annotations add goals, so an iteration can raise both the failed and the proved count and is still moving,
-    # while one that improves neither number is a stall. The rank alone still decides which candidate is best.
+    # while one that improves neither number is a stall. The rank alone still decides which candidate is best. Goals
+    # of trivial clauses are not counted: adding `assert \true;` is not a move.
     highest = _highest_proved(state)
-    progress = ranks_higher or highest is None or rank["proved"] > highest
+    progress = ranks_higher or highest is None or rank["effective_proved"] > highest
     if ranks_higher:
         _install_best(scratch, state, cand, contents)
         state.update(best=cand["id"], best_digest=digest, best_rank=rank, best_files=sorted(contents))
@@ -343,7 +507,10 @@ def _evaluate(scratch: Path, state: dict, digest: str, contents: dict[str, bytes
         next_action = "finished"
     else:
         next_action = "continue" if progress else "restore_best_and_finish"
-    return {"eligible": True, "rank": rank, "progress": progress, "next_action": next_action}
+    verdict = {"eligible": True, "rank": rank, "progress": progress, "next_action": next_action}
+    if trivial_added and wp["status"] != "all_proven" and not _legacy_rank():
+        verdict["next_synthesis_focus"] = DROP_TRIVIAL_FOCUS
+    return verdict
 
 
 def _not_recorded(state: dict | None, reason: str) -> dict:
@@ -358,6 +525,7 @@ def _not_recorded(state: dict | None, reason: str) -> dict:
         "best_rank": state["best_rank"] if state else None,
         "progress": None,
         "next_action": "continue",
+        "trivial_added": None,
     }
 
 
@@ -406,30 +574,44 @@ def note_oracle(out_json: Path, oracle: str, report: dict, digest_before: str | 
         name = _report_name(oracle, function)
         _write_under(scratch, f"{CANDIDATES_DIR}/c{cand['id']}/{name}", _report_bytes(report))
         cand[oracle] = _oracle_summary(oracle, report)
+        if oracle == "wp":
+            # Recorded in both rank modes, so an A/B comparison can count them.
+            trivial = trivial_added_clauses(scratch, budget, contents)
+            cand["wp"]["trivial_added"] = len(trivial)
+            cand["wp"]["trivial_clauses"] = trivial[:MAX_TRIVIAL_CLAUSES_KEPT]
+        pending = top_level_additions(scratch, budget)
+        if cand["wp"] is not None:
+            cand["wp"]["scope_ok"] = not pending
 
         evaluated = cand["wp"] is not None and cand["guardrail"] is not None
         if evaluated:
             verdict = _evaluate(scratch, state, digest, contents)
+            if pending:
+                # Even an all_proven candidate cannot be merged: the prover must remove the declarations.
+                verdict["next_action"] = "continue"
         else:
             verdict = {"eligible": None, "rank": None, "progress": None, "next_action": "wait_for_other_oracle"}
         wp, guard = cand["wp"] or {}, cand["guardrail"] or {}
-        state["history"].append(
-            {
-                "id": cand["id"],
-                "digest": digest,
-                "oracle": oracle,
-                "at": utc_now(),
-                "wp_status": wp.get("status"),
-                "guardrail_status": guard.get("status"),
-                "failed": wp.get("failed"),
-                "proved": wp.get("proved"),
-                "evaluated": evaluated,
-                "eligible": verdict["eligible"],
-                "progress": verdict["progress"],
-            }
-        )
+        entry = {
+            "id": cand["id"],
+            "digest": digest,
+            "oracle": oracle,
+            "at": utc_now(),
+            "wp_status": wp.get("status"),
+            "guardrail_status": guard.get("status"),
+            "failed": wp.get("failed"),
+            "proved": wp.get("proved"),
+            "trivial_added": wp.get("trivial_added"),
+            "effective_proved": verdict["rank"]["effective_proved"] if verdict["rank"] else None,
+            "evaluated": evaluated,
+            "eligible": verdict["eligible"],
+            "progress": verdict["progress"],
+        }
+        if pending:
+            entry["scope_violation_pending"] = pending
+        state["history"].append(entry)
         atomic_write_json(scratch / STATE_FILE, state)
-        return {
+        block = {
             "recorded": True,
             "candidate": cand["id"],
             "evaluated": evaluated,
@@ -439,7 +621,14 @@ def note_oracle(out_json: Path, oracle: str, report: dict, digest_before: str | 
             "best_rank": state["best_rank"],
             "progress": verdict["progress"],
             "next_action": verdict["next_action"],
+            "trivial_added": wp.get("trivial_added"),
         }
+        if "next_synthesis_focus" in verdict:
+            block["next_synthesis_focus"] = verdict["next_synthesis_focus"]
+        if pending:
+            block["scope_violation_pending"] = pending
+            block["next_synthesis_focus"] = SCOPE_VIOLATION_FOCUS
+        return block
 
 
 def add_candidate_block(summary: dict, out_json: Path, oracle: str, report: dict, digest_before: str | None) -> None:
@@ -452,7 +641,9 @@ def add_candidate_block(summary: dict, out_json: Path, oracle: str, report: dict
     if block is None:
         return
     summary["candidate"] = block
-    if block["next_action"] == "restore_best_and_finish":
+    if block.get("scope_violation_pending"):
+        summary["next_synthesis_focus"] = SCOPE_VIOLATION_FOCUS
+    elif block["next_action"] == "restore_best_and_finish":
         summary["next_synthesis_focus"] = NO_PROGRESS_FOCUS
 
 
@@ -522,6 +713,67 @@ def restore_best(scratch: Path) -> dict | None:
         return {"restored": any(changed), "best": state["best"], "rank": state["best_rank"]}
 
 
+def refuted_clauses(scratch: Path) -> list[dict]:
+    """
+    The clauses the E-ACSL guardrail refuted on this prover's candidates (`rejected_overconstrained` with a
+    predicate), one per distinct (predicate, annotation_rte), ordered by candidate id. A `code_fault` is a code defect
+    candidate, never evidence against the contract, so it is not listed. Never raises: a missing or malformed state
+    gives [].
+    """
+    try:
+        scratch = Path(scratch)
+        state = _load_state(scratch)
+        if state is None:
+            return []
+        function = state.get("function")
+        cands = sorted(
+            (
+                c
+                for c in (state.get("candidates") or {}).values()
+                if isinstance(c, dict) and isinstance(c.get("id"), int)
+            ),
+            key=lambda c: c["id"],
+        )
+        out: list[dict] = []
+        seen: set[tuple[str, bool]] = set()
+        for cand in cands:
+            guard = cand.get("guardrail")
+            if not isinstance(guard, dict) or guard.get("status") != "rejected_overconstrained":
+                continue
+            if "failure" in guard:
+                failure = guard.get("failure")
+            elif isinstance(function, str) and _FUNCTION_RE.match(function):
+                # A summary recorded before the failure was kept: read the candidate's own report.
+                report = load_json_optional(
+                    scratch / CANDIDATES_DIR / f"c{cand['id']}" / _report_name("guardrail", function), {}
+                )
+                failure = report.get("failure") if isinstance(report, dict) else None
+            else:
+                failure = None
+            if not isinstance(failure, dict):
+                continue
+            predicate = str(failure.get("predicate") or "").strip()
+            if not predicate:
+                continue
+            key = (predicate, failure.get("annotation_rte") is True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "predicate": predicate,
+                    "label": failure.get("label"),
+                    "line": failure.get("line"),
+                    "kind": failure.get("kind"),
+                    "annotation_rte": key[1],
+                    "candidate": cand["id"],
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
 def status(scratch: Path) -> dict:
     """What a later analysis needs: the best candidate and the history of recorded oracle runs."""
     scratch = Path(scratch)
@@ -534,6 +786,7 @@ def status(scratch: Path) -> dict:
         "best_rank": state["best_rank"],
         "highest_proved": _highest_proved(state),
         "history": state["history"],
+        "refuted_clauses": refuted_clauses(scratch),
     }
 
 

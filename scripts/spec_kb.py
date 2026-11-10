@@ -19,11 +19,21 @@ Used in two places: the prover brief gets a "Retrieved ACSL Knowledge" section a
 dispatch (workspace_overlay.prepare_agent, `<!-- spec-kb -->` sentinel), and
 run_wp_function.derive_wp_diagnostic_hints turns failed goals into repair-pattern
 hints from the evolved KB. FRAMAC_SPEC_KB=off disables everything (A/B runs).
+
+A third store records dead ends (`<overlay>/reports/kb/obstructions.json`, filled by
+`mine_run`): clauses the E-ACSL guardrail refuted on a corpus input, and strengthening
+requests a callee prover tried and could not prove. They have no helpfulness triplet, so
+they are never pruned by the evolved KB's top-L ranking. Prover and breaker briefs get a
+"Known Dead Ends (Do Not Repeat)" section from them (`obstructions_section_for`).
+
+Both mined stores are filled during the run: wp_scheduler.py `complete` calls
+`mine_after_complete` after every accepted result, and `mine_run` scores each agent once.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -31,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from framac_common import atomic_write_json, load_json_optional, run_lock, utc_now  # noqa: E402
 
 KB_ENV = "FRAMAC_SPEC_KB"
 KB_SENTINEL = "<!-- spec-kb -->"
@@ -40,6 +50,15 @@ MAX_ITEM_CHARS = 1200
 TOP_G = 3
 TOP_L_EVOLVED = 50
 MAX_REPAIR_HINTS = 3
+
+OBSTRUCTIONS_FILE = "obstructions.json"
+OBSTRUCTION_SCHEMA = 1
+MAX_OBSTRUCTIONS_RENDERED = 10
+MAX_OBSTRUCTIONS_STORED = 500
+MAX_NOTE_CHARS = 160
+# wp_scheduler._emit_negotiations: a request the scheduler never sent to a callee prover (callee not found,
+# self-request, caps, callee not provable). It says nothing about the clause itself.
+STRUCTURAL_REJECTION_PREFIX = "not dispatched:"
 
 _STOPWORDS = frozenset(
     """the a an and or not if else for while do return int char void long short unsigned signed const
@@ -258,22 +277,31 @@ def _added_acsl_lines(patch_text: str) -> list[str]:
     return out
 
 
-def mine_run(run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOLVED) -> dict:
+def mine_run(
+    run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOLVED, finished_only: bool = False
+) -> dict:
     """
     Update the evolved KB from a run directory: for each agent with a result, pair the error
     signatures seen in its candidate WP reports with the ACSL lines its merged patch added,
     and update each item's helpfulness triplet (helpful on all_proven, harmful on a stall).
     Keeps the top-L items by helpful-harmful. Never raises on a malformed run dir.
+    Each agent is mined once (`mined_agents`), so mining again after every task never counts an
+    agent twice. `finished_only` (the scheduler's mode) leaves agents without a result.json for a
+    later call instead of scoring them neutral now.
     """
     run_dir = Path(run_dir)
     kb_path = kb_path or kb_dir_of(run_dir / "workspace") / "evolved.json"
     evolved = load_json_optional(kb_path, {"schema": KB_SCHEMA, "kind": "evolved", "items": []})
     items = {it.get("id"): it for it in evolved.get("items") or [] if isinstance(it, dict)}
+    mined = {str(a) for a in evolved.get("mined_agents") or []}
     agents = run_dir / "agents"
     if agents.is_dir():
         for agent in sorted(agents.iterdir()):
-            if not agent.is_dir():
+            if not agent.is_dir() or agent.name in mined:
                 continue
+            if finished_only and not (agent / "scratch" / "result.json").is_file():
+                continue
+            mined.add(agent.name)
             result = load_json_optional(agent / "scratch" / "result.json", {})
             status = str(result.get("status") or "")
             errors: set[str] = set()
@@ -325,12 +353,264 @@ def mine_run(run_dir: Path, kb_path: Path | None = None, top_l: int = TOP_L_EVOL
                 item["keywords"] = sorted(_keywords(sig + " " + str(item.get("fix") or fix_blob)))
     ranked = sorted(items.values(), key=lambda it: (-(it.get("helpful", 0) - it.get("harmful", 0)), str(it.get("id"))))
     evolved["items"] = ranked[:top_l]
+    evolved["mined_agents"] = sorted(mined)
     evolved["updated_at"] = utc_now()
     try:
         atomic_write_json(kb_path, evolved)
     except OSError:
         pass
+    mine_obstructions(run_dir, Path(kb_path).parent / OBSTRUCTIONS_FILE)
     return evolved
+
+
+def mine_after_complete(run_dir: Path) -> dict:
+    """
+    The scheduler's step after each `complete`: mine the finished agents into the evolved KB and the
+    obstruction store, so dead ends and repairs reach later briefs of other functions. Under its own
+    run lock (completes run concurrently). FRAMAC_SPEC_KB=off mines nothing.
+    """
+    if not enabled():
+        return {"skipped": f"{KB_ENV}=off"}
+    run_dir = Path(run_dir)
+    with run_lock("spec-kb", run_dir=run_dir):
+        evolved = mine_run(run_dir, finished_only=True)
+    obstructions = load_json_optional(kb_dir_of(run_dir / "workspace") / OBSTRUCTIONS_FILE, {})
+    return {
+        "evolved_items": len(evolved.get("items") or []),
+        "mined_agents": len(evolved.get("mined_agents") or []),
+        "obstructions": len(obstructions.get("items") or []) if isinstance(obstructions, dict) else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Obstructions: dead ends not to repeat
+# ---------------------------------------------------------------------------
+
+
+def _load_quiet(path: Path, default: dict) -> dict:
+    """load_json_optional, but a malformed, unreadable or non-object file is `default` too."""
+    try:
+        data = load_json_optional(path, default)
+    except Exception:
+        return default
+    return data if isinstance(data, dict) else default
+
+
+def _guard_obstruction(report: dict, budget: dict, agent: str, candidate: int | None) -> dict | None:
+    if report.get("status") != "rejected_overconstrained":
+        return None
+    failure = report.get("failure")
+    if not isinstance(failure, dict):
+        return None
+    predicate = str(failure.get("predicate") or "").strip()
+    function = str(failure.get("function") or "")
+    if not function or function == "unknown_function":
+        function = str(budget.get("function") or "")
+    if not predicate or not function:
+        return None
+    digest = hashlib.sha1(predicate.encode("utf-8")).hexdigest()[:12]
+    annotation_rte = failure.get("annotation_rte") is True or report.get("annotation_rte") is True
+    return {
+        # An undefined term and a false clause with the same text are different lessons.
+        "id": f"guard:{function}:{digest}{':rte' if annotation_rte else ''}",
+        "kind": "guardrail_refutation",
+        "function": function,
+        "file": str(budget.get("file") or ""),
+        "predicate": predicate,
+        "label": failure.get("label"),
+        "line": failure.get("line"),
+        "annotation_rte": annotation_rte,
+        "source": agent,
+        "candidate": candidate,
+    }
+
+
+def _request_obstruction(req: dict) -> dict | None:
+    if req.get("status") != "rejected_by_callee":
+        return None
+    note = str(req.get("resolution_note") or "").strip()
+    clause = str(req.get("needed_clause") or "").strip()
+    callee = str(req.get("callee_function") or "")
+    if note.startswith(STRUCTURAL_REJECTION_PREFIX) or not clause or not callee or not req.get("id"):
+        return None
+    return {
+        "id": f"req:{req['id']}",
+        "kind": "rejected_strengthening",
+        "callee_function": callee,
+        "callee_file": req.get("callee_file"),
+        "caller_function": req.get("caller_function"),
+        "needed_clause": clause,
+        "resolution_note": note,
+        "source": str(req["id"]),
+    }
+
+
+def _request_obstructions(requests_path: Path) -> list[dict]:
+    doc = _load_quiet(requests_path, {})
+    reqs = doc.get("requests")
+    found = [_request_obstruction(r) for r in reqs if isinstance(r, dict)] if isinstance(reqs, list) else []
+    return [item for item in found if item]
+
+
+def _run_obstructions(run_dir: Path) -> list[dict]:
+    """Every obstruction the run directory shows now, with repeats (one per report or request)."""
+    found: list[dict] = []
+    agents = run_dir / "agents"
+    if agents.is_dir():
+        for agent in sorted(agents.iterdir()):
+            cand_dir = agent / "scratch" / "candidates"
+            if not cand_dir.is_dir():
+                continue
+            budget = _load_quiet(agent / "scratch" / ".prover_budget.json", {})
+            for report in sorted(cand_dir.glob("c*/guard_*.json")):
+                m = re.fullmatch(r"c(\d+)", report.parent.name)
+                item = _guard_obstruction(_load_quiet(report, {}), budget, agent.name, int(m.group(1)) if m else None)
+                if item:
+                    found.append(item)
+    return found + _request_obstructions(run_dir / "workspace" / "reports" / "strengthen_requests.json")
+
+
+def mine_obstructions(run_dir: Path, out_path: Path | None = None) -> dict:
+    """
+    Update `<overlay>/reports/kb/obstructions.json` from a run directory: guardrail refutations recorded under
+    agents/*/scratch/candidates/c*/guard_*.json, and strengthening requests a callee prover rejected (never the
+    scheduler's structural `not dispatched:` rejections). Items merge by id; `seen` counts the distinct sources
+    (agents, requests) that showed one. Capped at MAX_OBSTRUCTIONS_STORED, oldest dropped. Never raises.
+    """
+    run_dir = Path(run_dir)
+    out_path = Path(out_path) if out_path else kb_dir_of(run_dir / "workspace") / OBSTRUCTIONS_FILE
+    doc = _load_quiet(out_path, {})
+    raw = doc.get("items")
+    old: list = raw if isinstance(raw, list) else []
+    items: dict[str, dict] = {str(it["id"]): it for it in old if isinstance(it, dict) and it.get("id")}
+    try:
+        found = _run_obstructions(run_dir)
+    except OSError:
+        found = []
+    for new in found:
+        item = items.get(new["id"])
+        if item is None:
+            items[new["id"]] = {**new, "sources": [new["source"]], "seen": 1}
+            continue
+        sources = [s for s in item.get("sources") or [item.get("source")] if s]
+        if new["source"] not in sources:
+            sources.append(new["source"])
+            item.update(new)
+        item["sources"] = sources
+        seen = item.get("seen")
+        item["seen"] = max(seen if isinstance(seen, int) else 0, len(sources))
+    # Insertion order is age (stored items first, new ones appended): drop the oldest beyond the cap.
+    out = {
+        "schema": OBSTRUCTION_SCHEMA,
+        "updated_at": utc_now(),
+        "items": list(items.values())[-MAX_OBSTRUCTIONS_STORED:],
+    }
+    try:
+        atomic_write_json(out_path, out)
+    except OSError:
+        pass
+    return out
+
+
+def _plain_name(name: str) -> str:
+    return name.rsplit("#", 1)[-1]
+
+
+def _candidate_order(item: dict) -> int:
+    cand = item.get("candidate")
+    return -cand if isinstance(cand, int) else 0
+
+
+def obstructions_for(
+    overlay: Path, function: str | None, callees: list[str] | None, extra: list[dict] | None = None
+) -> list[dict]:
+    """
+    The dead ends relevant to one function, at most MAX_OBSTRUCTIONS_RENDERED: guardrail refutations on `function`
+    (`extra` first, then the store's, most recent candidate first), then rejected strengthening requests on any of
+    `callees` (plain names or `file#fn` keys). Requests are also read from the live
+    `<overlay>/reports/strengthen_requests.json`, so a rejection counts before the next `mine`. `extra` are guardrail
+    items the caller found itself (an earlier dispatch's refutations of the same function).
+    """
+    doc = _load_quiet(kb_dir_of(overlay) / OBSTRUCTIONS_FILE, {})
+    stored = [it for it in doc.get("items") or [] if isinstance(it, dict)] if isinstance(doc.get("items"), list) else []
+    live = _request_obstructions(Path(overlay) / "reports" / "strengthen_requests.json")
+    callee_names = {_plain_name(str(c)) for c in callees or [] if c}
+    stored_guards = sorted(
+        (
+            it
+            for it in stored
+            if it.get("kind") == "guardrail_refutation" and function and it.get("function") == function
+        ),
+        key=_candidate_order,
+    )
+    guards: list[dict] = []
+    seen_guards: set[tuple[str, bool]] = set()
+    for it in [*(extra or []), *stored_guards]:
+        key = (str(it.get("predicate") or ""), it.get("annotation_rte") is True)
+        if key[0] and key not in seen_guards:
+            seen_guards.add(key)
+            guards.append(it)
+    reqs: list[dict] = []
+    seen_reqs: set[str] = set()
+    for it in [*stored, *live]:
+        if it.get("kind") != "rejected_strengthening":
+            continue
+        if _plain_name(str(it.get("callee_function") or "")) not in callee_names:
+            continue
+        rid = str(it.get("id") or "")
+        if rid and rid not in seen_reqs:
+            seen_reqs.add(rid)
+            reqs.append(it)
+    return [*guards, *reqs][:MAX_OBSTRUCTIONS_RENDERED]
+
+
+def _code(text: object) -> str:
+    """Inline Markdown code for a clause on one line; a backtick inside would end the span."""
+    return "`" + " ".join(str(text).split()).replace("`", "'") + "`"
+
+
+def obstructions_section_for(
+    overlay: Path, function: str | None, callees: list[str] | None, extra: list[dict] | None = None
+) -> str:
+    """The brief's 'Known Dead Ends (Do Not Repeat)' section, or "" when disabled or nothing matches."""
+    if not enabled():
+        return ""
+    items = obstructions_for(overlay, function, callees, extra)
+    if not items:
+        return ""
+    lines = [
+        "## Known Dead Ends (Do Not Repeat)",
+        "",
+        "Clauses below were refuted on real inputs or rejected by their callee in this run. Do not write them "
+        "again; if you believe one is needed, say so in `unproven_goals` instead.",
+        "",
+    ]
+    for it in items:
+        if it.get("kind") == "rejected_strengthening":
+            note = " ".join(str(it.get("resolution_note") or "").split())[:MAX_NOTE_CHARS].replace('"', "'")
+            caller = it.get("caller_function") or "a caller"
+            lines.append(
+                f"- Callee `{_plain_name(str(it.get('callee_function')))}`: {_code(it.get('needed_clause'))} was "
+                f'requested by `{caller}` and could not be proven ("{note}").'
+            )
+            continue
+        where = []
+        if it.get("line") is not None:
+            where.append(f"line {it['line']}")
+        if it.get("label"):
+            where.append(f"label `{it['label']}`")
+        loc = f" ({', '.join(where)})" if where else ""
+        if it.get("annotation_rte"):
+            lines.append(
+                f"- {_code(it.get('predicate'))}{loc}: evaluated an undefined term at runtime (guard it with `==>`), "
+                "not a false clause."
+            )
+            continue
+        origin = f"candidate {it['candidate']}" if it.get("candidate") is not None else "an earlier candidate"
+        if it.get("source"):
+            origin += f" of agent {it['source']}"
+        lines.append(f"- {_code(it.get('predicate'))}{loc}: failed under E-ACSL on a corpus input ({origin}).")
+    return "\n".join(lines) + "\n"
 
 
 def repair_hints_for_goals(res: dict, kb_dir: Path) -> list[str]:

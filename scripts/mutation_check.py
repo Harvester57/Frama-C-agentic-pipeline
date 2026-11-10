@@ -8,8 +8,28 @@ KBSpec's C@All, 2606.21339v2), complementing WP pass/fail:
   still proves the mutant contract against the unchanged code, the mutant is
   equivalent and the original spec is incomplete. completeness = 1 - equivalent/total.
 - precision (REJECT-style): mutate the *implementation* (flip < to <= in a guard,
-  change a return constant). If WP then reports an ensures/behavior goal Invalid,
-  the spec rejects the wrong code. precision = rejected/total.
+  change a return constant). If WP then leaves a non-RTE goal (ensures, behavior,
+  assert, assigns) unproven, the spec rejects the wrong code.
+  precision = rejected/total.
+- trivial stub (Shirobokov et al., Appendix I.1): replace the body with one that
+  does nothing (`{ }` for void, `{ return 0; }` for scalar and pointer returns).
+  A contract that still proves against it constrains no result. It is prepended
+  to the implementation mutants (outside max_mutants); FRAMAC_MUTATION_STUB=off
+  disables it for A/B runs.
+
+Rejection criterion. The original function is all_proven with the same solver
+budget, so a mutant goal the solvers can no longer prove is evidence that the
+spec distinguishes the mutant: Invalid (a counter-model was found) and Unknown
+(none was found; a false postcondition usually ends there) both count as
+rejected. A timeout at equal budget is possible but rare; the per-mutant
+`verdict` (`invalid` / `unknown`) keeps the two cases apart for anyone auditing
+the number. A mutant whose WP run yields no goal results (analysis_error,
+acsl_syntax_error, wp_aborted, a runner exception) is `not_applicable` and is
+left out of the denominator instead of counting as accepted. Its detail carries a
+`failure`: `preprocessing_failed` when the C preprocessor stopped the run (a
+missing header, wrong include flags: the setup is at fault, not the mutant; run_wp
+reports it as acsl_syntax_error), else the WP status. A function whose every
+mutant failed to preprocess gets an `error` instead of a score.
 
 Runs only on functions whose parent WP report (workspace/reports/wp/<fn>.json)
 is all_proven, writes workspace/reports/mutation.json, and generate_report.py
@@ -22,7 +42,9 @@ CLI: mutation-check --run-dir D [--max-functions N] [--max-mutants M]
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import os
 import re
 import sys
 import tempfile
@@ -40,8 +62,21 @@ DEFAULT_MAX_FUNCTIONS = 20
 DEFAULT_MAX_MUTANTS = 6
 
 _REL_OP_FLIP = [("<=", "<"), (">=", ">"), ("<", "<="), (">", ">=")]
+_C_PUNCT = frozenset("-+*/%&|^!~<>=?:")
+# Longest first, so `->`, `<<=` and `<=` are never read as `>` or `<`.
+_C_OPERATOR_RE = re.compile(r"->|<<=|>>=|<<|>>|<=|>=|==|!=|&&|\|\||\+\+|--|[-+*/%&|^]=|[-+*/%&|^!~<>=?:]")
 _RETURN_CONST_RE = re.compile(r"\breturn\s+(-?\d+)\s*;")
 _ENSURES_CLAUSE_RE = re.compile(r"\bensures\b[^;]*;")
+# WP report statuses that carry goal results; any other status is a failed run.
+_ANALYSED_STATUSES = ("all_proven", "unproven_goals_remain")
+_DECL_DROP = frozenset({"static", "inline", "__inline", "__inline__", "extern", "_Noreturn", "__extension__"})
+_ATTRIBUTE_KEYWORDS = frozenset({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm"})
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def stub_enabled() -> bool:
+    """The trivial-stub mutant runs unless FRAMAC_MUTATION_STUB=off (A/B switch)."""
+    return os.environ.get("FRAMAC_MUTATION_STUB", "on").strip().lower() != "off"
 
 
 def _acsl_text_of_span(span) -> str:
@@ -67,12 +102,43 @@ def spec_mutants(contract_acsl: str, max_mutants: int) -> list[tuple[str, str]]:
     return out[:max_mutants]
 
 
+def _c_operators(body_text: str) -> list[tuple[int, int, str]]:
+    """
+    C operators of the code (not comments, strings or ACSL), as (start, end, text), by maximal munch.
+
+    tokenize_c_acsl emits one token per punctuation character, so adjacent characters are regrouped here: without
+    that, `>` matches inside `->` and `>>`, and `<` inside `<=`.
+    """
+    out: list[tuple[int, int, str]] = []
+    run_start = run_end = -1
+
+    def flush() -> None:
+        if run_start < 0:
+            return
+        for m in _C_OPERATOR_RE.finditer(body_text, run_start, run_end):
+            out.append((m.start(), m.end(), m.group(0)))
+
+    for tok in tokenize_c_acsl(body_text):
+        if tok.kind == "c_token" and len(tok.text) == 1 and tok.text in _C_PUNCT:
+            if tok.start != run_end:
+                flush()
+                run_start = tok.start
+            run_end = tok.end
+        else:
+            flush()
+            run_start = run_end = -1
+    flush()
+    return out
+
+
 def impl_mutants(body_text: str, max_mutants: int) -> list[tuple[str, str]]:
     """Implementation mutants: flip relational operators, change return constants."""
     out: list[tuple[str, str]] = []
+    ops = _c_operators(body_text)
     for op, flipped in _REL_OP_FLIP:
-        if op in body_text:
-            out.append((f"flip-{op}", body_text.replace(op, flipped, 1)))
+        hit = next(((s, e) for s, e, text in ops if text == op), None)
+        if hit is not None:
+            out.append((f"flip-{op}", body_text[: hit[0]] + flipped + body_text[hit[1] :]))
         if len(out) >= max_mutants:
             break
     for m in _RETURN_CONST_RE.finditer(body_text):
@@ -83,19 +149,126 @@ def impl_mutants(body_text: str, max_mutants: int) -> list[tuple[str, str]]:
     return out[:max_mutants]
 
 
-def _is_rejection(report: dict) -> bool:
-    """The spec rejects the mutant: an ensures/behavior goal came back Invalid."""
+def _strip_attributes(toks: list[str]) -> list[str] | None:
+    """Drop `__attribute__((...))`-style groups; None when a group is unbalanced."""
+    out: list[str] = []
+    i = 0
+    while i < len(toks):
+        if toks[i] not in _ATTRIBUTE_KEYWORDS:
+            out.append(toks[i])
+            i += 1
+            continue
+        i += 1
+        if i < len(toks) and toks[i] in ("volatile", "__volatile__"):
+            i += 1
+        if i >= len(toks) or toks[i] != "(":
+            continue
+        depth = 0
+        while i < len(toks):
+            if toks[i] == "(":
+                depth += 1
+            elif toks[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth != 0:
+            return None
+        i += 1
+    return out
+
+
+def trivial_stub_mutant(span_text: str, brace_offset: int | None) -> tuple[str, str] | None:
+    """
+    The body that does nothing for this function: ("trivial-noop-body", "{ }") for
+    a `void` return, ("trivial-zero-body", "{ return 0; }") for integer, floating,
+    enum, _Bool and pointer returns. None for a by-value struct/union return (a
+    scalar `return 0;` does not compile) and for a declarator that cannot be
+    parsed. A typedef'd struct return is not recognisable from the declarator; its
+    stub fails to compile and the WP run is recorded as not_applicable.
+    """
+    if brace_offset is None or brace_offset <= 0:
+        return None
+    try:
+        tokens = tokenize_c_acsl(span_text[:brace_offset], path="<declarator>")
+    except Exception:
+        return None
+    toks = _strip_attributes([t.text for t in tokens if t.kind == "c_token"])
+    if not toks or "(" not in toks:
+        return None
+    paren = toks.index("(")
+    if paren == 0 or not _IDENT_RE.fullmatch(toks[paren - 1]):
+        return None
+    ret = [t for t in toks[: paren - 1] if t not in _DECL_DROP]
+    if not ret:
+        return None
+    pointer = "*" in ret
+    if not pointer and ("struct" in ret or "union" in ret):
+        return None
+    if not pointer and "void" in ret:
+        return ("trivial-noop-body", "{ }")
+    return ("trivial-zero-body", "{ return 0; }")
+
+
+def _is_rejection(report: dict) -> tuple[bool, str]:
+    """
+    Does the spec reject the mutant? Returns (rejected, verdict), verdict one of
+    `invalid` (a non-RTE goal came back Invalid), `unknown` (a non-RTE goal is
+    otherwise unproven: Unknown, Timeout, Never tried), `proved` (all_proven),
+    `rte_only` (only RTE guards are unproven: the contract itself accepts the
+    mutant) or `not_applicable` (the WP run yielded no goal results).
+    """
+    status = report.get("status")
+    if status not in _ANALYSED_STATUSES:
+        return False, "not_applicable"
+    if status == "all_proven":
+        return False, "proved"
+    verdict = ""
     for g in report.get("unproven_goals") or []:
-        status = str(g.get("status") or "").lower()
+        goal_status = str(g.get("status") or "").lower()
         kind = str(g.get("kind") or "")
-        if "invalid" in status and kind and not kind.startswith("rte"):
-            return True
-    return False
+        if not kind or kind.startswith("rte"):
+            continue
+        if "invalid" in goal_status:
+            return True, "invalid"
+        verdict = "unknown"
+    if verdict:
+        return True, verdict
+    return False, "rte_only"
+
+
+_PREPROCESS_HINT_RE = re.compile(r"failed to run: .*-E\b|preprocess", re.IGNORECASE)
+
+
+def _failure_kind(report: dict) -> str:
+    """Why a mutant's WP run yielded no goal results: `preprocessing_failed`, or its status."""
+    status = str(report.get("status") or "error")
+    if status == "acsl_syntax_error":
+        errors = (report.get("syntax_check") or {}).get("errors") or []
+        if any(run_wp_function._CPP_ERROR_RE.match(str(e)) or _PREPROCESS_HINT_RE.search(str(e)) for e in errors):
+            return "preprocessing_failed"
+    return status
 
 
 def _is_equivalent(report: dict) -> bool:
     """The mutant contract still proves against the unchanged code."""
     return report.get("status") == "all_proven"
+
+
+def _default_runner():
+    """run_wp_on_function with counter-examples on, when it accepts the flag."""
+    base = run_wp_function.run_wp_on_function
+    try:
+        accepts = "counter_examples" in inspect.signature(base).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    if not accepts:
+        return base
+
+    def runner(c_file: Path, fn: str, out_dir: Path, cppflags: str = "-I.") -> dict:
+        return base(c_file, fn, out_dir, cppflags=cppflags, counter_examples=True)
+
+    return runner
 
 
 def check_function(
@@ -108,11 +281,15 @@ def check_function(
 ) -> dict:
     """
     Mutate the contract and the body of `fn` in `c_file`, run WP per mutant, and
-    return {function, file, spec_mutants, equivalent, impl_mutants, rejected,
-    completeness, precision, details}. `wp_runner` defaults to
-    run_wp_function.run_wp_on_function and is injectable for tests.
+    return {function, file, spec_mutants, spec_not_applicable, equivalent,
+    impl_mutants, impl_not_applicable, rejected, completeness, precision,
+    trivial_body_rejected (only with the stub on), details}. Mutants whose WP run
+    yields no goal results are counted in the *_not_applicable fields and left out
+    of the denominators. `wp_runner` defaults to run_wp_function.run_wp_on_function
+    (with counter-examples, so an Invalid verdict carries a model) and is
+    injectable for tests.
     """
-    runner = wp_runner or run_wp_function.run_wp_on_function
+    runner = wp_runner or _default_runner()
     text = c_file.read_text(encoding="utf-8", errors="replace")
     span = locate_function_span(text, fn, is_header=False, path=str(c_file))
     if span is None:
@@ -124,18 +301,41 @@ def check_function(
         "function": fn,
         "file": str(c_file),
         "spec_mutants": 0,
+        "spec_not_applicable": 0,
         "equivalent": 0,
         "impl_mutants": 0,
+        "impl_not_applicable": 0,
         "rejected": 0,
         "completeness": None,
         "precision": None,
+        "preprocessing_failed": 0,
         "details": [],
     }
+    impl = impl_mutants(body, max_mutants)
+    stub_name: str | None = None
+    if stub_enabled():
+        result["trivial_body_rejected"] = None
+        stub = trivial_stub_mutant(span.text, brace)
+        if stub is None:
+            result["details"].append(
+                {
+                    "mutant": "trivial-stub",
+                    "kind": "impl",
+                    "rejected": False,
+                    "verdict": "not_applicable",
+                    "status": None,
+                    "reason": "no stub body for this return type (struct/union by value, or unparsed declarator)",
+                }
+            )
+        else:
+            stub_name = stub[0]
+            impl = [stub, *impl]  # the stub does not count against max_mutants
+    first_preprocess_error = ""
     with tempfile.TemporaryDirectory(prefix="framac-mutation-") as tmp:
         tmp_path = Path(tmp)
         for kind, mutants in (
             ("spec", spec_mutants(contract, max_mutants)),
-            ("impl", impl_mutants(body, max_mutants)),
+            ("impl", impl),
         ):
             for name, mutated in mutants:
                 if kind == "spec":
@@ -150,24 +350,56 @@ def check_function(
                     report = runner(mut_file, fn, tmp_path / f"wp-{kind}-{name}", cppflags=cppflags)
                 except Exception as exc:
                     report = {"status": "error", "reason": str(exc)}
+                if not isinstance(report, dict):
+                    report = {"status": "error", "reason": "runner returned no report"}
                 if kind == "spec":
-                    result["spec_mutants"] += 1
-                    eq = _is_equivalent(report)
-                    result["equivalent"] += int(eq)
-                    result["details"].append(
-                        {"mutant": name, "kind": "spec", "equivalent": eq, "status": report.get("status")}
-                    )
+                    if report.get("status") not in _ANALYSED_STATUSES:
+                        result["spec_not_applicable"] += 1
+                        eq, verdict = False, "not_applicable"
+                    else:
+                        result["spec_mutants"] += 1
+                        eq = _is_equivalent(report)
+                        result["equivalent"] += int(eq)
+                        verdict = "equivalent" if eq else "distinguished"
+                    detail = {
+                        "mutant": name,
+                        "kind": "spec",
+                        "equivalent": eq,
+                        "verdict": verdict,
+                        "status": report.get("status"),
+                    }
                 else:
-                    result["impl_mutants"] += 1
-                    rej = _is_rejection(report)
-                    result["rejected"] += int(rej)
-                    result["details"].append(
-                        {"mutant": name, "kind": "impl", "rejected": rej, "status": report.get("status")}
-                    )
+                    rej, verdict = _is_rejection(report)
+                    if verdict == "not_applicable":
+                        result["impl_not_applicable"] += 1
+                    else:
+                        result["impl_mutants"] += 1
+                        result["rejected"] += int(rej)
+                    if name == stub_name:
+                        result["trivial_body_rejected"] = None if verdict == "not_applicable" else rej
+                    detail = {
+                        "mutant": name,
+                        "kind": "impl",
+                        "rejected": rej,
+                        "verdict": verdict,
+                        "status": report.get("status"),
+                    }
+                if verdict == "not_applicable":
+                    detail["failure"] = _failure_kind(report)
+                    if detail["failure"] == "preprocessing_failed":
+                        result["preprocessing_failed"] += 1
+                        first_preprocess_error = first_preprocess_error or next(
+                            iter((report.get("syntax_check") or {}).get("errors") or []), ""
+                        )
+                result["details"].append(detail)
     if result["spec_mutants"]:
         result["completeness"] = round(1 - result["equivalent"] / result["spec_mutants"], 4)
     if result["impl_mutants"]:
         result["precision"] = round(result["rejected"] / result["impl_mutants"], 4)
+    tried = result["preprocessing_failed"] + result["spec_mutants"] + result["impl_mutants"]
+    if result["preprocessing_failed"] and result["preprocessing_failed"] == tried:
+        # Not a score of zero: the check never ran (missing header, wrong include flags).
+        result["error"] = f"preprocessing failed for every mutant: {str(first_preprocess_error)[:300]}"
     return result
 
 
@@ -207,6 +439,48 @@ def classify_open_unit(wp_report: dict | None) -> str:
     return "spec_limited"
 
 
+def _module_cppflags_resolver(run_dir: Path):
+    """
+    (work-relative file, function) -> (cppflags, source) with the module's WP cppflags, as wp-sweep proves with.
+
+    A hard-coded `-I.` made every mutant of a target with include paths fail to preprocess (libmnl:
+    `libmnl/libmnl.h: No such file or directory`), so every function scored `not_applicable`. Without a ledger or a
+    build plan (a bare directory, unit tests) the old `-I.` default stays, labelled `default`. A module whose flags
+    cannot be resolved returns (None, reason), and the function is skipped rather than checked with wrong flags.
+    """
+    try:
+        import shlex
+
+        import pipeline_make
+
+        ledger = load_json_optional(run_dir / pipeline_make.LEDGER_JSON, [])
+        modules: dict[tuple[str, str], str] = {}
+        by_fn: dict[str, set[str]] = {}
+        for unit in ledger if isinstance(ledger, list) else []:
+            if isinstance(unit, dict) and unit.get("module") and unit.get("function"):
+                modules[(str(unit.get("file")), str(unit["function"]))] = str(unit["module"])
+                by_fn.setdefault(str(unit["function"]), set()).add(str(unit["module"]))
+        plan = pipeline_make.build_plan(run_dir) if modules else None
+    except Exception as exc:  # no build plan: keep the old default, but say so
+        reason = f"default (no build plan: {type(exc).__name__})"
+        return lambda _file, _fn: ("-I.", reason)
+    if plan is None:
+        return lambda _file, _fn: ("-I.", "default (no ledger modules)")
+
+    def resolve(file: str, fn: str) -> tuple[str | None, str]:
+        module = modules.get((file, fn))
+        if module is None and len(by_fn.get(fn, ())) == 1:
+            module = next(iter(by_fn[fn]))
+        if module is None:
+            return None, f"no ledger module for {file}#{fn}"
+        flags, reason = plan.wp_cppflags_for(module)
+        if flags is None:
+            return None, f"module {module}: {reason}"
+        return shlex.join(flags), f"module {module}"
+
+    return resolve
+
+
 def run_mutation_check(
     run_dir: Path,
     max_functions: int = DEFAULT_MAX_FUNCTIONS,
@@ -220,6 +494,8 @@ def run_mutation_check(
     work = run_dir / "workspace" / "work"
     out_path = out_path or run_dir / "workspace" / "reports" / "mutation.json"
     doc: dict[str, Any] = {"schema": MUTATION_SCHEMA, "generated_at": utc_now(), "functions": {}}
+    skipped: list[dict] = []
+    flags_for = _module_cppflags_resolver(run_dir)
     if wp_dir.is_dir():
         reports = sorted(wp_dir.glob("*.json"))
         for rep_path in reports[:max_functions]:
@@ -236,21 +512,42 @@ def run_mutation_check(
                 c_file = cand if cand.is_file() else c_file
             if not c_file.is_file():
                 continue
-            doc["functions"][fn] = check_function(
+            try:
+                rel = c_file.resolve().relative_to(work.resolve()).as_posix()
+            except ValueError:
+                rel = c_file.name
+            cppflags, source = flags_for(rel, fn)
+            if cppflags is None:
+                skipped.append({"function": fn, "file": rel, "reason": source})
+                continue
+            result = check_function(
                 c_file,
                 fn,
-                "-I.",
+                cppflags,
                 run_dir / "workspace" / "reports" / "mutation-wp",
                 wp_runner=wp_runner,
                 max_mutants=max_mutants,
             )
+            result["cppflags_source"] = source
+            doc["functions"][fn] = result
+    if skipped:
+        doc["skipped"] = skipped
     totals: dict[str, Any] = {
         "functions": len(doc["functions"]),
         "spec_mutants": sum(f.get("spec_mutants", 0) for f in doc["functions"].values()),
         "equivalent": sum(f.get("equivalent", 0) for f in doc["functions"].values()),
         "impl_mutants": sum(f.get("impl_mutants", 0) for f in doc["functions"].values()),
         "rejected": sum(f.get("rejected", 0) for f in doc["functions"].values()),
+        "spec_not_applicable": sum(f.get("spec_not_applicable", 0) for f in doc["functions"].values()),
+        "impl_not_applicable": sum(f.get("impl_not_applicable", 0) for f in doc["functions"].values()),
+        "preprocessing_failed": sum(f.get("preprocessing_failed", 0) for f in doc["functions"].values()),
     }
+    if stub_enabled():
+        checked = [fn for fn, f in doc["functions"].items() if f.get("trivial_body_rejected") is not None]
+        accepted = sorted(fn for fn in checked if doc["functions"][fn]["trivial_body_rejected"] is False)
+        totals["trivial_body_checked"] = len(checked)
+        totals["trivial_body_accepted"] = len(accepted)
+        totals["trivial_body_accepted_functions"] = accepted
     comps = [f["completeness"] for f in doc["functions"].values() if f.get("completeness") is not None]
     precs = [f["precision"] for f in doc["functions"].values() if f.get("precision") is not None]
     totals["completeness"] = round(sum(comps) / len(comps), 4) if comps else None

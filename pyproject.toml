@@ -66,6 +66,7 @@ known-first-party = [
     "phase0_model",
     "pipeline_make",
     "promote_artifact",
+    "proof_carry",
     "prover_candidates",
     "resources",
     "run_eacsl_fuzz",

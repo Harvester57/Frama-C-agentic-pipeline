@@ -1515,8 +1515,10 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     # A direct Frama-C call (parse or annotation check): one single-threaded kernel, like Eva.
     (r"(?:^|[\s;&|(/])frama-c(?:\s|$)", "eva"),
 )
-# `minimize` replays crash inputs under cvise, so it runs target code like `replay`.
-_DYNAMIC_MAKE_TARGETS = frozenset({"selftest", "fuzz", "coverage", "replay", "minimize"})
+# `minimize` replays crash inputs under cvise, so it runs target code like `replay`. `wp-replay`
+# re-proves carried-forward contracts through the parent merge, whose guardrail runs the target's
+# code; `wp-queue` depends on it in pipeline.mk.
+_DYNAMIC_MAKE_TARGETS = frozenset({"selftest", "fuzz", "coverage", "replay", "minimize", "wp-replay", "wp-queue"})
 # Per-module targets that run target code (fuzz-<mod>, module-<mod>, ...); build-<mod>/eva-<mod> stay static.
 _DYNAMIC_MAKE_PREFIXES = ("module-", "fuzz-", "coverage-", "replay-", "selftest-")
 _MAKE_VALUE_OPTIONS = frozenset({"--jobs", "-j"})
@@ -1675,7 +1677,6 @@ CACHE_RW_ALLOWLIST: frozenset[tuple[str, ...]] = frozenset(
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "facts"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "wp-sweep"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "ingest"),
-        ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "run", "ingest", "wp-queue"),
         ("python3", f"{_PIPELINE_SCRIPTS}/pipeline_make.py", "ingest"),
         ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "gc"),
         ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "stats"),

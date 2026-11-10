@@ -1653,7 +1653,11 @@ def test_exec_auto_downgrades_cache_mode_when_target_code_lease_is_active_on_run
     monkeypatch.delenv("FRAMAC_CACHE_RW", raising=False)
 
     assert R.cache_mount_mode("python3 $S/pipeline_make.py ingest", True) == "rw"
-    assert R.cache_mount_mode("python3 $S/pipeline_make.py run ingest wp-queue", True) == "rw"
+    # wp-queue runs wp-replay (the parent guardrail runs target code): never with a writable store.
+    assert R.cache_mount_mode("python3 $S/pipeline_make.py run ingest wp-queue", True) == "ro"
+    assert not R.is_known_static_command("python3 $S/pipeline_make.py run wp-queue")
+    assert not R.is_known_static_command("python3 $S/pipeline_make.py run wp-replay")
+    assert not R.is_known_static_command("python3 $S/pipeline_make.py wp-replay")
 
     run_dir = tmp_path / "run-1"
     run_dir.mkdir()

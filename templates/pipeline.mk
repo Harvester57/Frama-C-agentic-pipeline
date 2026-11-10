@@ -43,12 +43,12 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init dag security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report \
+.PHONY: help slice-init dag security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
         $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) $(EVA_SHARD_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init dag security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init dag security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -297,9 +297,18 @@ minimize: replay
 		$(PY) $(S)/run_eacsl_fuzz.py minimize-candidates --candidates candidates.json \
 		--harness-dir workspace/harnesses --out-dir workspace/reports/minimize
 
+# Cross-run proof carry-forward (scripts/proof_carry.py): after the Phase 3 gate, re-apply each
+# planned function's contract an earlier run's wp-sweep published and re-prove it on this tree
+# (guardrail + parent WP), so the units it credits never become prove tasks. Never fails the build:
+# a rejected or missing proof only leaves the units planned. FRAMAC_PROOF_CARRY=off skips it.
+# Not leased per function: merges are serialized by the merge lock, so one `wp` lease covers it.
+wp-replay: ingest facts
+	$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"
+	-$(RUN) --class wp --key wp-replay --output workspace/reports/proof-carry/summary.json -- $(PM) wp-replay
+
 # Phases 1 and 2 are done once the Phase-3 queue is built from their ingested reports: record it,
 # so a resumed run starts at Phase 3.
-wp-queue: ingest facts
+wp-queue: ingest facts wp-replay
 	$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/wp_scheduler.py init
 	$(RUN) --class light --key wp-queue -- $(PY) $(S)/checkpoint.py save-phase state --phase 2 \

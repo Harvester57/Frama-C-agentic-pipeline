@@ -105,7 +105,12 @@
             "impl_mutants": {"type": "integer"},
             "rejected": {"type": "integer"},
             "completeness": {"type": ["number", "null"]},
-            "precision": {"type": ["number", "null"]}
+            "precision": {"type": ["number", "null"]},
+            "spec_not_applicable": {"type": "integer"},
+            "impl_not_applicable": {"type": "integer"},
+            "trivial_body_checked": {"type": "integer"},
+            "trivial_body_accepted": {"type": "integer"},
+            "trivial_body_accepted_functions": {"type": "array", "items": {"type": "string"}}
           }
         },
         "candidates": {"type": "object"}

@@ -18,7 +18,83 @@ from conftest import (
 )
 from fingerprint import make_fingerprint
 from framac_common import ArtifactError
-from generate_report import generate
+from generate_report import generate, spec_quality_section
+
+
+def _spec_quality(totals: dict, functions: dict) -> str:
+    return "\n".join(spec_quality_section({"mutation": {"totals": totals, "functions": functions}}))
+
+
+_MUTATION_TOTALS = {
+    "functions": 3,
+    "spec_mutants": 4,
+    "equivalent": 1,
+    "completeness": 0.75,
+    "impl_mutants": 4,
+    "rejected": 3,
+    "precision": 0.6667,
+}
+_MUTATION_FUNCTIONS: dict[str, dict] = {
+    "f": {
+        "completeness": 1.0,
+        "precision": 1.0,
+        "spec_mutants": 2,
+        "equivalent": 0,
+        "impl_mutants": 2,
+        "rejected": 2,
+        "trivial_body_rejected": True,
+    },
+    "g": {
+        "completeness": 0.5,
+        "precision": 0.0,
+        "spec_mutants": 2,
+        "equivalent": 1,
+        "impl_mutants": 1,
+        "rejected": 0,
+        "trivial_body_rejected": False,
+    },
+    "h": {"completeness": None, "precision": 1.0, "impl_mutants": 1, "rejected": 1, "trivial_body_rejected": None},
+}
+
+
+def test_spec_quality_trivial_stub_line_with_accepted_functions():
+    totals = {
+        **_MUTATION_TOTALS,
+        "trivial_body_checked": 2,
+        "trivial_body_accepted": 1,
+        "trivial_body_accepted_functions": ["g"],
+    }
+    text = _spec_quality(totals, _MUTATION_FUNCTIONS)
+    assert (
+        "- Trivial-stub check: 2 functions checked, 1 accept a body that does nothing: `g` "
+        "(their contracts constrain no result)"
+    ) in text
+    lines = {line.split("`")[1]: line for line in text.splitlines() if line.startswith("- `")}
+    assert lines["f"].endswith("trivial stub rejected: yes")
+    assert lines["g"].endswith("trivial stub rejected: no")
+    assert lines["h"].endswith("trivial stub rejected: n/a")
+
+
+def test_spec_quality_trivial_stub_line_without_accepted_functions():
+    totals = {
+        **_MUTATION_TOTALS,
+        "trivial_body_checked": 2,
+        "trivial_body_accepted": 0,
+        "trivial_body_accepted_functions": [],
+    }
+    text = _spec_quality(totals, _MUTATION_FUNCTIONS)
+    assert "- Trivial-stub check: 2 functions checked, 0 accept a body that does nothing\n" in text + "\n"
+    assert "constrain no result" not in text
+
+
+def test_spec_quality_without_the_stub_mentions_no_stub():
+    # FRAMAC_MUTATION_STUB=off: neither the totals key nor the per-function key exists.
+    plain = {
+        k: {kk: vv for kk, vv in v.items() if kk != "trivial_body_rejected"} for k, v in _MUTATION_FUNCTIONS.items()
+    }
+    text = _spec_quality(_MUTATION_TOTALS, plain)
+    assert "Trivial-stub" not in text and "trivial stub" not in text
+    assert "Specification quality (mutation check)" in text
 
 
 def build_run(run, status="incomplete", reason="candidate_validation_not_run", unverified=True):
@@ -315,3 +391,51 @@ def test_reporting_semantics_wp_vs_eva_and_sarif_levels(tmp_path):
     assert levels_by_sev["medium"] == "warning"
     assert levels_by_sev["low"] == "note"
     assert levels_by_sev["needs_validation"] == "warning"
+
+
+def test_report_counts_inductive_lemma_gaps_per_function(tmp_path):
+    build_run(tmp_path)
+    ledger_path = tmp_path / "coverage-ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    for u in ledger:
+        if u["coverage_id"] == "src/snmp/pdu.c#snmp_parse_pdu::l2_termination":
+            u["evidence"].append(
+                {
+                    "phase": "wp",
+                    "producer": "prove-snmp_parse_pdu",
+                    "result": "proof_gap",
+                    "discharging": False,
+                    "tool_output": "workspace/reports/eva/snmp.json",
+                    "summary": "Proof gap on n == count(p): inductive lemma required: count is recursive",
+                    "details": {"gap_kind": "inductive_lemma_required"},
+                }
+            )
+    write_json(ledger_path, ledger)
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "### Open units: prover-limited vs spec-limited" in report
+    assert "- **inductive lemma required**: 1 function(s): `snmp_parse_pdu`" in report
+
+
+def test_report_has_no_inductive_lemma_line_without_such_gaps(tmp_path):
+    build_run(tmp_path)
+    generate(tmp_path, tmp_path)
+    assert "inductive lemma required" not in (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+
+
+def test_report_counts_functions_carried_forward_and_reproven(tmp_path):
+    build_run(tmp_path)
+    report = generate(tmp_path, tmp_path) and (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "Carried forward from earlier runs" not in report
+    write_json(tmp_path / "workspace/reports/wp/snmp.json", {})
+    ledger = json.loads((tmp_path / "coverage-ledger.json").read_text(encoding="utf-8"))
+    carried = {
+        **evidence(phase="wp", result="carried_forward_reproven", tool_output="workspace/reports/wp/snmp.json"),
+        "details": {"limits": {"vacuity": {"status": "consistent"}}},
+    }
+    ledger.append(unit("src/snmp/pdu.c", "snmp_len", "rte", "covered", evidence=[carried]))
+    ledger.append(unit("src/snmp/pdu.c", "snmp_len", "l2_termination", "covered", evidence=[carried]))
+    write_json(tmp_path / "coverage-ledger.json", sorted(ledger, key=lambda u: u["coverage_id"]))
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "- Carried forward from earlier runs and re-proven: 1 function(s)" in report.split("## 3.")[0]

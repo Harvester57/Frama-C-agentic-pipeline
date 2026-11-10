@@ -819,7 +819,8 @@ def test_strict_rules_survive_for_the_plainest_function() -> None:
         ("macro_loops", "Unannotatable File-Scope"),
         ("pointer_len_params", "Zero-length"),
         ("recursion", "Recursive function:"),
-        ("recursion", "Inductive Lemmas Without Coq"),
+        ("recursion", "Inductive Lemmas: Stop, Do Not Work Around Them"),
+        ("loops", "never write a file-scope `/*@ ghost ... */` function"),
         ("loops", "Distinguishing Establishment vs. Preservation Failures"),
         ("loops", "Loop counter upper bound"),
         ("loop_reads_earlier_writes", "over the **full finished range**"),
@@ -835,6 +836,18 @@ def test_conditional_guidance_appears_only_with_its_feature(feature: str, needle
         on["loops"] = True
     assert needle in _brief_sections_for(**on)
     assert needle in ff.render_conditionals(BRIEF, None), "without facts a prover keeps all guidance"
+
+
+@pytest.mark.parametrize("on", [{"loops": True}, {"recursion": True}])
+def test_inductive_lemma_rule_stops_with_a_proof_gap_instead_of_a_ghost_function(on: dict) -> None:
+    rendered = _brief_sections_for(**on)
+    assert "never write a file-scope `/*@ ghost ... */` function" in rendered
+    assert 'proof_gap: {"predicate"' in rendered and "inductive lemma required" in rendered
+    assert "write a `/*@ ghost ... */` recursive C function" not in rendered
+    # Ghost variables inside the body stay allowed.
+    assert "/*@ ghost size_t idx = 0; */" in _brief_sections_for(loops=True, pointer_walk=True)
+    # The candidate block's scope field is explained whatever the function looks like.
+    assert "`scope_violation_pending`" in _brief_sections_for()
 
 
 def test_step_a_only_asks_for_enumeration_without_facts() -> None:
@@ -1267,3 +1280,13 @@ def test_real_flows_from_a_saved_session(tmp_path: Path, monkeypatch: pytest.Mon
     assert {w["loc"] for w in flow["writes"]} == {"g_state", "d[0..3]"}
     assert "s[0..3]" in flow["inputs"]
     assert res["flows"]["call_edges"]["dispatch"] == ["sum_rec"]
+
+
+def test_every_c_snippet_of_the_prover_brief_tokenizes() -> None:
+    """A syntax slip in a brief example (an unclosed `/*@`, a stray quote) is copied by every prover."""
+    from acsl_ast import tokenize_c_acsl
+
+    snippets = re.findall(r"```c\n(.*?)```", BRIEF, re.DOTALL)
+    assert snippets
+    for snippet in snippets:
+        tokenize_c_acsl(snippet, path="prover_brief.md")

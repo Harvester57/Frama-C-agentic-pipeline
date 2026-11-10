@@ -16,6 +16,7 @@ Used by scripts/workspace_overlay.py to enforce Milestone 2 isolation guarantees
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,8 @@ _VACUOUS_FALSE_CLAUSE_RE = re.compile(
 _EMPTY_BEHAVIOR_RE = re.compile(r"\bbehavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*;")
 _STRING_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
+# A ghost function's own contract, written `/@ ... @/` inside a `/*@ ghost ... */` block.
+_GHOST_CONTRACT_RE = re.compile(r"/@.*?@/", re.DOTALL)
 _ESCAPED_CTRL_IN_ACSL_RE = re.compile(r"[\x07\x08\x0c]")
 
 
@@ -766,6 +769,13 @@ def splice_prover_changes(
     agent_suffix = agent_work_text[agent_span.end_byte :]
 
     if base_prefix != agent_prefix or base_suffix != agent_suffix:
+        added = added_top_level_acsl_declarations(base_work_text, agent_work_text, path=path)
+        if added:
+            raise ScopeViolationError(
+                f"{path}: agent added top-level ACSL declaration(s) outside '{function_name}': "
+                f"{', '.join(added)}; file-scope ghost functions, predicates and lemmas are not "
+                "mergeable by a prover (see the prover brief, Step B: Inductive Lemmas)"
+            )
         raise ScopeViolationError(f"{path}: agent modified content outside assigned function '{function_name}'")
 
     # Verify that in current_work_text, function_name's span hasn't been concurrently altered
@@ -1123,6 +1133,8 @@ def _parse_acsl_inner_segments(inner: str, base_line: int) -> list[_AcslSegment]
         decl_param_types: tuple[str, ...] | None = None
         if current_kw in _TOP_DECL_KWS and kw_end_offset != -1 and kw_end_offset <= end_pos:
             body_slice = inner[kw_end_offset:end_pos]
+            if current_kw == "ghost":
+                body_slice = _GHOST_CONTRACT_RE.sub(" ", body_slice)
             decl_name = _extract_decl_name(current_kw, body_slice)
             decl_arity = _extract_decl_arity(current_kw, body_slice, decl_name)
             decl_param_types = _extract_decl_param_types(current_kw, body_slice, decl_name)
@@ -1162,6 +1174,19 @@ def _parse_acsl_inner_segments(inner: str, base_line: int) -> list[_AcslSegment]
             while i < n and inner[i] != "\n":
                 i += 1
             at_line_start = False
+            continue
+
+        # A ghost function's `/@ ... @/` contract: its `;` and keywords belong to the ghost
+        # declaration, not to new top-level segments
+        if current_kw == "ghost" and ch == "/" and i + 1 < n and inner[i + 1] == "@":
+            close = inner.find("@/", i + 2)
+            end = n if close == -1 else close + 2
+            nl = inner.count("\n", i, end)
+            if nl:
+                line += nl
+                line_start_offset = inner.rfind("\n", i, end) + 1
+            at_line_start = False
+            i = end
             continue
 
         # Leading `*` bullet on continuation line inside /*@ ... */
@@ -1332,6 +1357,22 @@ def extract_top_level_acsl_declarations(source: str, path: str = "<input>") -> l
                     )
 
     return decls
+
+
+def added_top_level_acsl_declarations(base_text: str, agent_text: str, path: str = "<input>") -> list[str]:
+    """
+    Return `"<kind> <name>"` for each top-level ACSL declaration present in `agent_text`
+    but not in `base_text`, in source order (compared on `(kind, name)`, counting repeats).
+    """
+    remaining = Counter((d["kind"], d["name"]) for d in extract_top_level_acsl_declarations(base_text, path=path))
+    added: list[str] = []
+    for d in extract_top_level_acsl_declarations(agent_text, path=path):
+        key = (d["kind"], d["name"])
+        if remaining[key] > 0:
+            remaining[key] -= 1
+        else:
+            added.append(f"{d['kind']} {d['name']}")
+    return added
 
 
 def dedup_acsl_declarations(
