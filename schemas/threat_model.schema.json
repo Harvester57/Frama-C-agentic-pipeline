@@ -81,6 +81,7 @@
           "kind": {"type": "string", "enum": ["network", "file", "log", "terminal", "ipc", "buffer", "other"]},
           "params": {"$comment": "step I9: the parameters carrying the output (default: the pointer parameters)", "type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
           "length": {"$comment": "step I9: the parameter giving the number of elements `params` point to", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "format": {"$comment": "plan step M5: the parameter holding a printf-style format; every call must pass a string literal there (CWE-134)", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "kind", "description"],

@@ -1232,3 +1232,125 @@ def test_local_wipe_check_in_the_image(model_run, tmp_path, violate):  # noqa: F
     proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", res.stdout)
     assert proved and int(proved.group(2)) >= 2, res.stdout
     assert (proved.group(1) == proved.group(2)) is (not violate), res.stdout
+
+
+# ---------------------------------------------------------------------------------------------------
+# Format strings (plan step M5)
+# ---------------------------------------------------------------------------------------------------
+
+SYSLOG_FORMALS = [{"name": "priority", "kind": "value"}, {"name": "format", "kind": "const_pointer"}]
+SYSLOG_SINK = {"function": "syslog", "kind": "log", "params": ["format"], "format": "format", "description": "d"}
+WRAPPER_SINK = {"function": "log_fmt", "kind": "log", "params": ["fmt"], "format": "fmt", "description": "d"}
+
+
+def _format_model() -> dict:
+    def site(callee: str, line: int, literals: dict) -> dict:
+        return {"callee": callee, "line": line, "literals": literals}
+
+    return model(
+        {
+            "f.c#good": fn("good", "f.c", external_calls=["syslog"], call_sites=[site("syslog", 5, {"1": "id %d"})]),
+            "f.c#bad": fn(
+                "bad",
+                "f.c",
+                external_calls=["syslog"],
+                call_sites=[site("syslog", 9, {"1": "ok"}), site("syslog", 10, {})],
+            ),
+            "f.c#log_fmt": fn(
+                "log_fmt",
+                "f.c",
+                external_calls=["syslog"],
+                formals=[{"name": "fmt", "kind": "const_pointer"}],
+                call_sites=[site("syslog", 14, {})],
+            ),
+            "f.c#user": fn("user", "f.c", call_sites=[site("log_fmt", 20, {"0": "x=%s"})]),
+        },
+        edges=[("f.c#user", "f.c#log_fmt")],
+        external_formals={"syslog": SYSLOG_FORMALS},
+    )
+
+
+@pytest.mark.unit
+def test_a_format_argument_is_decided_from_the_model():
+    doc = sp.generate(_format_model(), threat(output_sinks=[SYSLOG_SINK, WRAPPER_SINK]))
+    assert not sp.validate(doc)
+    props = by_name(doc)
+    syslog = props["L5_sanitized_format_syslog"]
+    assert syslog["instances"] == [] and syslog["obligation_class"] == "l5_sanitized"
+    assert [(d["function"], d["verdict"]) for d in syslog["decided"]] == [
+        ("f.c#bad", "violated"),
+        ("f.c#good", "satisfied"),
+    ]
+    assert "line 10; CWE-134" in syslog["decided"][0]["reason"]
+    # The wrapper forwards its own format: its caller is checked instead.
+    assert any("log_fmt is a format sink itself" in n for n in syslog["notes"])
+    assert [(d["function"], d["verdict"]) for d in props["L5_sanitized_format_log_fmt"]["decided"]] == [
+        ("f.c#user", "satisfied")
+    ]
+    # `bad` keeps its no-CRLF goal (a non-literal argument); the format property never has one.
+    meta = sp.meta_file_text(doc, "f.c#bad")
+    assert meta is not None and meta[1] == ["L5_sanitized_syslog"]
+
+
+@pytest.mark.unit
+def test_a_format_problem_is_a_warning():
+    bad = {**SYSLOG_SINK, "format": "fmt"}
+    doc = sp.generate(_format_model(), threat(output_sinks=[bad]))
+    assert (
+        "output sink syslog: format fmt is not one of its parameters: L5 format property not generated"
+        in doc["warnings"]
+    )
+    unnamed = _format_model()
+    unnamed["external_formals"]["syslog"] = [
+        {"name": "param0", "kind": "value"},
+        {"name": "param1", "kind": "const_pointer"},
+    ]
+    doc = sp.generate(unnamed, threat(output_sinks=[{**SYSLOG_SINK, "params": ["param1"]}]))
+    assert any("its prototype names none: write its 0-based position, param0, param1" in w for w in doc["warnings"])
+    old = _format_model()
+    for f in old["functions"].values():
+        f.pop("call_sites")
+    doc = sp.generate(old, threat(output_sinks=[SYSLOG_SINK]))
+    assert any(w.startswith("output sink syslog: the model has") and "format not decided" in w for w in doc["warnings"])
+    assert "L5_sanitized_format_syslog" not in by_name(doc)
+
+
+@pytest.mark.unit
+def test_threat_model_schema_takes_a_sink_format(tmp_path):
+    block = {"schema_version": 1, "input_sources": [], "secrets": [], "auth_gates": [], "output_sinks": [SYSLOG_SINK]}
+    path = tmp_path / "THREAT_MODEL.md"
+    path.write_text(f"# Threat model\n\n```json framac-threat-model\n{json.dumps(block)}\n```\n", encoding="utf-8")
+    assert trust.load_threat_model(path)["status"] == "ok"
+    # The test wrote CRLF line endings on Windows and LF elsewhere; both are read.
+    path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    assert trust.load_threat_model(path)["status"] == "ok"
+    block["output_sinks"] = [{**SYSLOG_SINK, "format": "not a name"}]
+    path.write_text(f"# Threat model\n\n```json framac-threat-model\n{json.dumps(block)}\n```\n", encoding="utf-8")
+    assert trust.load_threat_model(path)["status"] == trust.STATUS_INVALID
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["literal", "user_format"])
+def test_format_strings_are_decided_from_the_real_model(model_run, tmp_path, monkeypatch, violate):  # noqa: F811
+    """The dump records syslog's literal format; a call passing the user's text as format blocks the unit."""
+    # Frama-C's libc declares `syslog(int, const char *, ...)`: the kernel names the formals param0, param1...
+    sink = {**SYSLOG_SINK, "params": ["param1"], "format": "param1"}
+    target = _one_file_target(tmp_path / "target", DECIDED_DIR / "l5_format.c", {"output_sinks": [sink]}, violate)
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    assert not sp.validate(doc)
+    prop = by_name(doc).get("L5_sanitized_format_syslog")
+    assert prop is not None, doc["warnings"]
+    assert [d["verdict"] for d in prop["decided"]] == ["violated" if violate else "satisfied"], prop
+    monkeypatch.chdir(run)
+    _seed_one_file(run, m, doc)
+    unit = _ledger_units(run)["prog.c#report::l5_sanitized"]
+    if violate:
+        assert unit["status"] == "blocked", unit
+    else:
+        assert unit["status"] != "blocked" and any(
+            d["property"] == "L5_sanitized_format_syslog" for d in unit["bookkeeping"]["decided_properties"]
+        ), unit

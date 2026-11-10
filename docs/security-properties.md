@@ -14,7 +14,7 @@ This pipeline extends Frama-C verification across **six distinct security layers
 | **2** | **Availability & Anti-DoS** (Guaranteed loop & recursion termination; no zero-advance TLV loops) | CWE-835, CWE-674 | `loop variant`, `decreases` | Built-in (`/framac-wp`) |
 | **3** | **Memory Isolation** (every function writing through a pointer has a proven frame) | CWE-471, CWE-668 | `assigns`, `loop assigns`, `\separated` | `scripts/security_props.py` (class `l3_frame`) |
 | **4** | **Authentication gates** (only the gate writes the auth state; privileged functions require it) | CWE-287, CWE-285, CWE-306 | MetAcsl `\writing` and `\precond` meta-properties | threat model `auth_gates`, [`templates/metacsl/l4_*.acsl`](../templates/metacsl/) |
-| **5** | **Output sanitization** (no CR/LF reaches a log or terminal sink; no uninitialized byte reaches any sink) | CWE-93, CWE-117, CWE-457, CWE-200 | MetAcsl `\calling` (writers) or `\postcond` (buffer sinks) | threat model `output_sinks`, [`templates/metacsl/l5_sanitized.acsl`](../templates/metacsl/l5_sanitized.acsl) |
+| **5** | **Output sanitization** (no CR/LF reaches a log or terminal sink; a format argument is a string literal; no uninitialized byte reaches any sink) | CWE-93, CWE-117, CWE-134, CWE-457, CWE-200 | MetAcsl `\calling` (writers) or `\postcond` (buffer sinks) | threat model `output_sinks`, [`templates/metacsl/l5_sanitized.acsl`](../templates/metacsl/l5_sanitized.acsl) |
 | **6** | **Secrets** (wiped when released; never handed to or read by an output sink) | CWE-226, CWE-532, CWE-200 | MetAcsl `\postcond`, `\calling` and `\reading` | threat model `secrets`, [`templates/metacsl/l6_*.acsl`](../templates/metacsl/) |
 
 Layers 3 to 6 come from what the structured threat model (the `framac-threat-model` block of `THREAT_MODEL.md`, `schemas/threat_model.schema.json`) requires, not from patterns in the code (plan step I9). The old per-function pattern matching and its ACSL templates for Layers 4 to 6 are gone.
@@ -27,7 +27,7 @@ How it runs:
 
 Without a threat model only Layer 3 is generated.
 
-A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`; `output_sinks` `function`, `kind`, `params`, `length`):
+A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`; `output_sinks` `function`, `kind`, `params`, `length`, `format`):
 
 ````markdown
 ```json framac-threat-model
@@ -38,7 +38,7 @@ A threat model block looks like this (fields per kind: `input_sources` `function
   "trusted_callers": [],
   "secrets": [{"name": "session_key", "kind": "global", "function": "session_close", "description": "Session key."}],
   "auth_gates": [{"function": "login", "state": "auth_ok", "protects": ["admin"], "description": "Password check."}],
-  "output_sinks": [{"function": "syslog", "kind": "log", "description": "System log."}]
+  "output_sinks": [{"function": "syslog", "kind": "log", "params": ["param1"], "format": "param1", "description": "System log."}]
 }
 ```
 ````
@@ -95,6 +95,8 @@ MetAcsl puts an assertion before every write of every other function (a write of
 ## Layer 5: Output Sanitization
 
 An output sink is checked where data reaches it. For a `log` or `terminal` sink, each text parameter must hold no CR or LF before its terminating NUL (`no_crlf_string`, log injection); for the other kinds, every byte handed over must be initialized (with the sink's `length` parameter, else the object pointed to). These are `\calling` properties, so they also hold for a sink the target only declares (`syslog`, `send`). A caller that hands a text sink string literals only gets no goal: the provers do not discharge `no_crlf_string` on a literal, so `security_props.py` decides it from the model, which records the literal each call passes (`call_sites`): satisfied when no literal holds CR or LF before its NUL, else violated. The property lists it under `decided`, and the ledger seed records the verdict (a `covered` unit with evidence of phase `static`, or a `blocked` one). A `buffer` sink (the output is returned in an out-parameter, like `QCBOREncode_Finish`) gets a postcondition: its out-parameters are initialized when it returns.
+
+A sink with a `format` parameter (`{"function": "syslog", "kind": "log", "format": "param1", ...}`, CWE-134; Frama-C's libc declares `syslog(int, const char *, ...)` without parameter names, so the kernel calls them `param0`, `param1`, ...: name a parameter of such a prototype by its 0-based position, here and in `params`) gets `L5_sanitized_format_<sink>`: the argument there is a string literal at every call. It is decided from the model like the literals above, never by WP: a caller whose every call passes a literal format is `satisfied`, one with any other format is `violated` (the ledger seed blocks its `l5_sanitized` unit). A caller that is a format sink of the threat model itself forwards its own format, so its callers are checked instead; declare such wrappers. A model without call sites decides nothing and says so in a warning.
 
 The properties name the canonical vocabulary of `templates/acsl/acsl_vocabulary.h` (plan step S8) and define no predicate of their own: `no_crlf_string(s)` (a NUL-terminated string, bounded by `strlen`) and, for a length-bounded buffer, `no_crlf_or_nul(buf, len)`. The meta file does not include the vocabulary header, so its preamble takes `strlen` from `__fc_string_axiomatic.h` and repeats `no_crlf_string` with the vocabulary's exact text (Frama-C merges identical definitions; `test_preamble_repeats_the_vocabulary_text` keeps the two equal). The MetAcsl properties only reach WP; E-ACSL can execute `no_crlf_string` through `strlen` where a contract names it.
 

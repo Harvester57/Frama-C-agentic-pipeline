@@ -442,6 +442,8 @@ class _Gen:
             sink = self._one(str(item.get("function") or ""), "output sink")
             if sink is None:
                 continue
+            if item.get("format"):
+                self._format_literal(item, sink)
             kind = str(item.get("kind") or "other")
             buffer = kind == "buffer"
             params, formals = self._sink_params(item, sink, ("pointer",) if buffer else ("pointer", "const_pointer"))
@@ -498,6 +500,85 @@ class _Gen:
                 threat_model={"output_sink": sink, "kind": kind, "params": params},
                 targets=sink,
             )
+
+    def _format_literal(self, item: dict, sink: str) -> None:
+        """
+        Plan step M5 (CWE-134): the `format` argument of the sink is a string literal at every call.
+        Decided from the model (call_sites) like the literals of M2, with no MetAcsl goal: a caller
+        whose every call passes a literal there is satisfied, one with any other format is violated.
+        A caller that is itself a format sink of the threat model forwards its own format: its callers
+        are checked instead.
+        """
+        fmt = str(item["format"])
+        formals = self.m.formals(sink)
+        index = {str(p.get("name")): i for i, p in enumerate(formals or [])}
+        if fmt not in index:
+            unnamed = bool(index) and all(re.fullmatch(r"param\d+", n) for n in index)
+            self.warnings.append(
+                f"output sink {sink}: format {fmt} is not one of its parameters"
+                + ("" if formals else " (the model has no parameters for it)")
+                + (f" (its prototype names none: write its 0-based position, {', '.join(index)})" if unnamed else "")
+                + ": L5 format property not generated"
+            )
+            return
+        callers = self.m.callers_of(str(item["function"]))
+        if callers and not self.m.features["call_sites"]:
+            self.warnings.append(
+                f"output sink {sink}: the model has {MODEL_FEATURES['call_sites']}: format not decided"
+            )
+            return
+        forwarders = {
+            f
+            for s in self.block.get("output_sinks") or []
+            if s.get("format") and s.get("function")
+            for f in self.m.resolve(str(s["function"]))
+        }
+        decided: dict[str, dict] = {}
+        notes: list[str] = []
+        for fid in sorted(callers):
+            if fid in forwarders:
+                notes.append(f"{self.m.name(fid)} is a format sink itself: its callers are checked")
+                continue
+            sites = self.m.call_sites(fid, sink) or []
+            if not sites:
+                notes.append(f"{self.m.name(fid)}: no call of {sink} recorded (an indirect call?): not decided")
+                continue
+            other = [
+                int(s.get("line") or 0)
+                for s in sites
+                if not isinstance((s.get("literals") or {}).get(str(index[fmt])), str)
+            ]
+            lines = ", ".join(str(int(s.get("line") or 0)) for s in sites)
+            if other:
+                decided[fid] = {
+                    "verdict": "violated",
+                    "how": "syntactic",
+                    "reason": f"{sink} is passed a format `{fmt}` that is not a string literal (line {other[0]}; CWE-134)",
+                }
+            else:
+                decided[fid] = {
+                    "verdict": "satisfied",
+                    "how": "syntactic",
+                    "reason": f"every call of {sink} passes a string-literal format `{fmt}` (line(s) {lines})",
+                }
+        if not callers:
+            notes.append(f"no project code calls {sink}: nothing to decide in the target")
+        name = self._unique(f"{NAME_PREFIX['sanitized']}format_{_ident(sink)}")
+        # No MetAcsl text: the property is decided from the model and never reaches a meta file.
+        acsl = (
+            f"/* {name}: at every call of {sink}, the format argument `{fmt}` is a string literal (CWE-134). "
+            "Decided from the model's call sites; no MetAcsl goal. */"
+        )
+        self._add(
+            "sanitized",
+            name,
+            acsl,
+            set(),
+            decided=decided,
+            notes=notes,
+            threat_model={"output_sink": sink, "format": fmt},
+            targets=sink,
+        )
 
     def _literal_sites(self, fid: str, sink: str, indexes: list[int]) -> tuple[list[tuple[int, list[str]]], int] | None:
         """
