@@ -166,6 +166,58 @@ typedef unsigned long u_long;
 extern int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
 #endif /* FC_STUBS_KEEP_LIBC_GETSOCKOPT */
 
+/*
+ * getopt, strlcpy and strlcat: libc contracts replaced, as for getsockopt (plan step S4).
+ * The kernel merges two contracts of one function, so the libc declarations are renamed here,
+ * before any target header includes <unistd.h> or <string.h>.
+ *
+ * getopt: __fc_libc's contract assigns `*optarg` (not `optarg`) and `optind` \from the argv
+ * pointers, so Eva turns `optind` and `\result` into a garbled mix of addresses and `optarg`
+ * and `argv + optind` are imprecise after the call (one strcmp Unknown per use on libseccomp's
+ * tools). __fc_libc has a body in unistd.c, but the pipeline never parses it, so -eva-use-spec
+ * changes nothing. The replacement keeps `optind` in [1 .. max(argc, 1)] and `optarg` NULL or
+ * inside one of the argv strings. Eva cannot relate `optarg` to the option returned, so a use
+ * of `optarg` as a string still has an Unknown for NULL; that one is real for an option
+ * declared with an optional argument ("a::"). The precondition on `optind` is left out:
+ * __fc_libc's `optind = 1` is in unistd.c, so Eva sees an unknown `optind` at the first call.
+ *
+ * strlcpy, strlcat: the contracts are in fc_strlcpy.h, shared with bsd/string.h.
+ *
+ * Define FC_STUBS_KEEP_LIBC_GETOPT or FC_STUBS_KEEP_LIBC_STRLCPY to keep __fc_libc's.
+ */
+#ifndef FC_STUBS_KEEP_LIBC_GETOPT
+#define getopt __fc_libc_getopt_imprecise
+#include <unistd.h>
+#undef getopt
+/*@
+  requires valid_argv: \valid_read(argv + (0 .. argc - 1));
+  requires valid_args: \forall integer i; 0 <= i < argc ==> valid_read_string(argv[i]);
+  requires valid_optstring: valid_read_string(optstring);
+  assigns \result \from indirect:argc, indirect:argv[0 .. argc - 1][0 ..],
+                        indirect:optstring[0 ..], indirect:optind;
+  assigns optind \from optind, indirect:argc, indirect:argv[0 .. argc - 1][0 ..],
+                       indirect:optstring[0 ..];
+  assigns optopt \from argv[0 .. argc - 1][0 ..], indirect:argc, indirect:optind,
+                       indirect:optstring[0 ..];
+  assigns optarg \from argv[0 .. argc - 1], indirect:argc, indirect:optind,
+                       indirect:argv[0 .. argc - 1][0 ..], indirect:optstring[0 ..];
+  ensures result_range: -128 <= \result <= 255;
+  ensures optind_range: 1 <= optind <= \max(argc, 1);
+  ensures optarg_in_argv: optarg == \null || \subset(optarg, argv[0 .. argc - 1] + (0 ..));
+  ensures optarg_string: optarg == \null || valid_read_string(optarg);
+*/
+extern int getopt(int argc, char *const argv[], const char *optstring);
+#endif /* FC_STUBS_KEEP_LIBC_GETOPT */
+
+#ifndef FC_STUBS_KEEP_LIBC_STRLCPY
+#define strlcpy __fc_libc_strlcpy
+#define strlcat __fc_libc_strlcat
+#include <string.h>
+#undef strlcpy
+#undef strlcat
+#include "fc_strlcpy.h"
+#endif /* FC_STUBS_KEEP_LIBC_STRLCPY */
+
 #endif /* __FRAMAC_EACSL__ */
 
 /*
