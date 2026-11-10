@@ -7,7 +7,8 @@ The target's own fuzz targets and fuzz corpora (Phase 0 discovery and import, Ph
     fuzz_assets.py import [--target /target]
     fuzz_assets.py write [--module MOD ...]
 
-Run from the run directory. Every command prints one JSON summary; exit 0 on success, 2 on a usage error.
+Run from the run directory. Every command prints one JSON summary; exit 0 on success, 2 on a usage error,
+1 when `write` failed for a module.
 
 `discover` walks the target read-only (never following a symlink; skipping `.git`, a top-level
 `workspace/` and the pipeline's own output directories) for:
@@ -42,7 +43,9 @@ workspace/reports/imported_corpus/<mod>.json:
 
 Inputs longer than the module's `max_input_size` are dropped. A module whose fuzzer ships a
 dictionary also gets workspace/dicts/<mod>.extra.dict. Fuzz assets are an improvement, never a
-requirement: without fuzz_assets.json, `write` records the reason and exits 0.
+requirement: without fuzz_assets.json, `write` records the reason and exits 0. Each module's outcome
+(ok / skipped / failed, with the reason) is recorded in workspace/reports/seed_status/fuzz_assets/<mod>.json
+for the fuzz report's `seeds` field (seed_harvest.py); a module that failed makes `write` exit 1.
 """
 
 from __future__ import annotations
@@ -977,23 +980,55 @@ def _store_report(module: str, report: dict[str, Any]) -> dict[str, Any]:
 
 
 def write(modules: list[str]) -> dict[str, Any]:
-    raw = load_json_optional(REPORT_JSON, None) if REPORT_JSON.is_file() else None
-    doc = raw if isinstance(raw, dict) else None
-    out: dict[str, Any] = {"fuzz_assets": doc is not None, "modules": {}}
+    """
+    Write the imported inputs of every harness module (or of `modules`). Each module's outcome is
+    recorded (`seed_harvest.record_write_status`) and returned under `status`; an exception fails
+    that module only.
+    """
+    from seed_harvest import failure_reason, record_write_status
+
+    out: dict[str, Any] = {"fuzz_assets": False, "modules": {}}
     paths = sorted(HARNESS_DIR.glob("harness_*.json")) if HARNESS_DIR.is_dir() else []
-    for sidecar_path in paths:
-        module = sidecar_path.stem[len("harness_") :]
-        if (modules and module not in modules) or not _MODULE_RE.match(module):
+    selected = [
+        (m, p)
+        for p in paths
+        if (m := p.stem[len("harness_") :]) and (not modules or m in modules) and _MODULE_RE.match(m)
+    ]
+
+    def done(module: str, status: str, reason: str | None = None, **summary: Any) -> None:
+        record_write_status("fuzz_assets", module, status, reason, summary.get("inputs"))
+        out["modules"][module] = {**summary, "status": status, **({"reason": reason} if reason else {})}
+
+    try:
+        raw = load_json_optional(REPORT_JSON, None) if REPORT_JSON.is_file() else None
+    except Exception as exc:  # noqa: BLE001 - recorded per module: fuzz assets never stop the pipeline
+        reason = f"cannot read {REPORT_JSON.as_posix()}: {type(exc).__name__}: {exc}"
+        out["error"] = reason
+        for module, _ in selected:
+            done(module, "failed", reason)
+        return out
+    doc = raw if isinstance(raw, dict) else None
+    out["fuzz_assets"] = doc is not None
+    for module, sidecar_path in selected:
+        try:
+            sidecar = load_json_optional(sidecar_path, {}) or {}
+            if not isinstance(sidecar, dict):
+                done(module, "skipped", f"{sidecar_path.as_posix()} is not a JSON object")
+                continue
+            c_path = sidecar_path.with_suffix(".c")
+            harness_c = c_path.read_text(encoding="utf-8", errors="replace") if c_path.is_file() else ""
+            rep = write_module(module, sidecar, harness_c, doc)
+        except Exception as exc:  # noqa: BLE001 - recorded: fuzz assets never stop the pipeline
+            done(module, "failed", failure_reason(exc, IMPORTED_DIR / module))
             continue
-        sidecar = load_json_optional(sidecar_path, {}) or {}
-        if not isinstance(sidecar, dict):
-            continue
-        c_path = sidecar_path.with_suffix(".c")
-        harness_c = c_path.read_text(encoding="utf-8", errors="replace") if c_path.is_file() else ""
-        rep = write_module(module, sidecar, harness_c, doc)
-        out["modules"][module] = {
-            k: rep[k] for k in ("inputs", "dropped_too_large", "dropped_over_cap", "reason") if k in rep
-        }
+        kept = {k: rep[k] for k in ("inputs", "dropped_too_large", "dropped_over_cap") if k in rep}
+        if rep["inputs"]:
+            done(module, "ok", rep.get("reason"), **kept)
+        else:
+            done(module, "skipped", rep.get("reason") or "no imported input fits a harness case", **kept)
+    for module in modules:
+        if module not in out["modules"]:
+            done(module, "skipped", f"no harness sidecar {(HARNESS_DIR / f'harness_{module}.json').as_posix()}")
     return out
 
 
@@ -1089,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"error": str(exc)}, indent=1))
         return 2
     print(json.dumps(summary, indent=1))
+    if a.cmd == "write" and any(m.get("status") == "failed" for m in summary["modules"].values()):
+        return 1
     return 0
 
 

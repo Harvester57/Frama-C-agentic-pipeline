@@ -47,6 +47,12 @@ data files become seeds for every case that passes the whole input as one buffer
 the harness's `max_input_size` are dropped. They go to workspace/seeds/<module>/ (replaced on each
 write), which the fuzz and coverage recipes pass to the campaign with --extra-corpus; the summary of a
 module is workspace/reports/seeds/<module>.json.
+
+Each `write` (this script's and `fuzz_assets.py write`) also records, per module, whether it worked in
+workspace/reports/seed_status/<writer>/<module>.json: `ok` (inputs written), `skipped` (nothing to
+write, with the reason) or `failed` (the exception, after which the module's folder may hold part of
+the new inputs). The exit code is 1 when a module failed, but Make ignores it: seeds never stop a
+campaign. The campaign's report carries both statuses as its `seeds` field (`seeds_report_field`).
 """
 
 from __future__ import annotations
@@ -74,6 +80,9 @@ REPORT_JSON = Path("workspace/reports/seed_harvest.json")
 RECORDS_DIR = Path("workspace/seed_records")
 SEEDS_DIR = Path("workspace/seeds")
 SEED_REPORTS_DIR = Path("workspace/reports/seeds")
+SEED_STATUS_DIR = Path("workspace/reports/seed_status")  # <writer>/<module>.json, read by the fuzz report
+SEED_WRITERS = ("seed_harvest", "fuzz_assets")
+WRITE_STATUSES = ("ok", "failed", "skipped")
 HARNESS_DIR = Path("workspace/harnesses")
 RUN_METADATA = Path("run-metadata.json")
 
@@ -1475,33 +1484,139 @@ def write_module(module: str, sidecar: dict, harness_c: str, calls: list[dict], 
     return _store_seeds(module, seeds, too_large, max_size, dispatch, per_case)
 
 
-def write(modules: list[str]) -> dict:
-    calls = load_calls()
-    traces = load_traces()
-    files = (
-        [p.read_bytes() for p in sorted((RECORDS_DIR / "files").glob("*"))] if (RECORDS_DIR / "files").is_dir() else []
-    )
-    out: dict[str, Any] = {"calls": len(calls), "files": len(files), "modules": {}}
-    for sidecar_path in sorted(HARNESS_DIR.glob("harness_*.json")):
-        module = sidecar_path.stem[len("harness_") :]
-        if modules and module not in modules:
-            continue
-        sidecar = load_json_optional(sidecar_path, {}) or {}
-        c_path = sidecar_path.with_suffix(".c")
-        if not isinstance(sidecar, dict) or not c_path.is_file():
-            continue
-        if not calls and not files:
-            out_dir = SEEDS_DIR / module
-            if out_dir.is_dir():
-                for old in out_dir.glob(f"{SEED_PREFIX}*"):
-                    old.unlink()
-            out["modules"][module] = {"seeds": 0, "reason": "no records (seed_harvest.py record has not run)"}
-            continue
-        if sidecar.get("api_cases"):
-            summary = write_layout_module(module, sidecar, calls, traces)
+_STATUS_MODULE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}$")  # pipeline_make.MODULE_RE
+
+
+def write_status_path(writer: str, module: str, status_dir: Path | None = None) -> Path:
+    return (status_dir or SEED_STATUS_DIR) / writer / f"{module}.json"
+
+
+def record_write_status(
+    writer: str, module: str, status: str, reason: str | None = None, inputs: int | None = None
+) -> None:
+    """Record how one module's `write` ended. Never raises: the status is best effort, like the seeds."""
+    if writer not in SEED_WRITERS or status not in WRITE_STATUSES or not _STATUS_MODULE_RE.match(module):
+        return
+    doc: dict[str, Any] = {"writer": writer, "module": module, "status": status, "generated_at": utc_now()}
+    if reason:
+        doc["reason"] = reason
+    if inputs is not None:
+        doc["inputs"] = inputs
+    try:
+        atomic_write_json(write_status_path(writer, module), doc)
+    except OSError as exc:
+        print(f"{writer}: cannot record the write status of {module}: {exc}", file=sys.stderr)
+
+
+def failure_reason(exc: BaseException, out_dir: Path) -> str:
+    return f"{type(exc).__name__}: {exc} ({out_dir.as_posix()}/ may hold part of the new inputs)"
+
+
+def seeds_report_field(module: str | None, extra_corpus: bool, status_dir: Path | None = None) -> dict[str, Any]:
+    """
+    The fuzz report's `seeds` field: how the module's seed writes (seed_harvest.py and fuzz_assets.py
+    `write`) ended. `failed` when one failed, or when the campaign reads extra corpora and a writer
+    recorded no status (it did not run, or stopped before recording one); `ok` when one wrote inputs;
+    `skipped` otherwise. Each writer's own status is under `writers`.
+    """
+    if not extra_corpus:
+        return {"status": "skipped", "reason": "the campaign was given no --extra-corpus"}
+    if not module or not _STATUS_MODULE_RE.match(module):
+        return {"status": "skipped", "reason": "the campaign was given no valid --module"}
+    writers: dict[str, dict[str, Any]] = {}
+    for writer in SEED_WRITERS:
+        path = write_status_path(writer, module, status_dir)
+        try:
+            raw = load_json_optional(path, None)
+        except Exception as exc:  # noqa: BLE001 - an unreadable status is reported, never raised
+            raw = None
+            missing = f"unreadable status {path.as_posix()}: {type(exc).__name__}: {exc}"
         else:
-            summary = write_module(module, sidecar, c_path.read_text(encoding="utf-8", errors="replace"), calls, files)
-        out["modules"][module] = {k: summary[k] for k in ("seeds", "dropped_too_large")}
+            missing = (
+                f"no status in {path.as_posix()}: `{writer}.py write --module {module}` did not run "
+                "or stopped before recording one"
+            )
+        if isinstance(raw, dict) and raw.get("status") in WRITE_STATUSES:
+            writers[writer] = {k: raw[k] for k in ("status", "reason", "inputs", "generated_at") if k in raw}
+        else:
+            writers[writer] = {"status": "failed", "reason": missing}
+    failed = [w for w, s in writers.items() if s["status"] == "failed"]
+    field: dict[str, Any]
+    if failed:
+        field = {"status": "failed", "reason": "; ".join(f"{w}: {writers[w].get('reason')}" for w in failed)}
+    elif any(s["status"] == "ok" for s in writers.values()):
+        field = {"status": "ok"}
+    else:
+        reasons = [f"{w}: {s['reason']}" for w, s in writers.items() if s.get("reason")]
+        field = {"status": "skipped", "reason": "; ".join(reasons) or "no seed inputs"}
+    field["writers"] = writers
+    return field
+
+
+def _clear_seeds(module: str) -> None:
+    out_dir = SEEDS_DIR / module
+    if out_dir.is_dir():
+        for old in out_dir.glob(f"{SEED_PREFIX}*"):
+            old.unlink()
+
+
+def write(modules: list[str]) -> dict:
+    """
+    Write the seeds of every harness module (or of `modules`). Each module's outcome is recorded
+    (`record_write_status`) and returned under `status`; an exception fails that module only.
+    """
+    out: dict[str, Any] = {"calls": 0, "files": 0, "modules": {}}
+    sidecars = sorted(HARNESS_DIR.glob("harness_*.json")) if HARNESS_DIR.is_dir() else []
+    selected = [(p.stem[len("harness_") :], p) for p in sidecars if not modules or p.stem[len("harness_") :] in modules]
+
+    def done(module: str, status: str, reason: str | None = None, **summary: Any) -> None:
+        inputs = summary.get("seeds")
+        record_write_status("seed_harvest", module, status, reason, inputs)
+        out["modules"][module] = {**summary, "status": status, **({"reason": reason} if reason else {})}
+
+    try:
+        calls = load_calls()
+        traces = load_traces()
+        files_dir = RECORDS_DIR / "files"
+        files = [p.read_bytes() for p in sorted(files_dir.glob("*"))] if files_dir.is_dir() else []
+    except Exception as exc:  # noqa: BLE001 - recorded per module: seeds never stop the pipeline
+        reason = f"cannot read {RECORDS_DIR.as_posix()}: {type(exc).__name__}: {exc}"
+        out["error"] = reason
+        for module, _ in selected:
+            done(module, "failed", reason)
+        return out
+    out.update({"calls": len(calls), "files": len(files)})
+    for module, sidecar_path in selected:
+        c_path = sidecar_path.with_suffix(".c")
+        try:
+            sidecar = load_json_optional(sidecar_path, {}) or {}
+            if not isinstance(sidecar, dict) or not c_path.is_file():
+                done(
+                    module,
+                    "skipped",
+                    f"no harness sidecar object and source ({sidecar_path.as_posix()}, {c_path.name})",
+                )
+                continue
+            if not calls and not files:
+                _clear_seeds(module)
+                done(module, "skipped", "no records (seed_harvest.py record has not run)", seeds=0)
+                continue
+            if sidecar.get("api_cases"):
+                summary = write_layout_module(module, sidecar, calls, traces)
+            else:
+                harness_c = c_path.read_text(encoding="utf-8", errors="replace")
+                summary = write_module(module, sidecar, harness_c, calls, files)
+        except Exception as exc:  # noqa: BLE001 - recorded: seeds never stop the pipeline
+            done(module, "failed", failure_reason(exc, SEEDS_DIR / module))
+            continue
+        kept = {k: summary[k] for k in ("seeds", "dropped_too_large")}
+        if summary["seeds"]:
+            done(module, "ok", **kept)
+        else:
+            done(module, "skipped", "no recorded call or data file fits a harness case", **kept)
+    for module in modules:
+        if module not in out["modules"]:
+            done(module, "skipped", f"no harness sidecar {(HARNESS_DIR / f'harness_{module}.json').as_posix()}")
     return out
 
 
@@ -1517,8 +1632,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--module", action="append", default=[])
     a = p.parse_args(argv)
     if a.cmd == "write":
-        print(json.dumps(write(a.module), indent=1))
-        return 0
+        out = write(a.module)
+        print(json.dumps(out, indent=1))
+        return 1 if any(m.get("status") == "failed" for m in out["modules"].values()) else 0
     try:
         report, code = record(a)
     except Exception as exc:  # noqa: BLE001 - recorded as a status: seeds never stop the pipeline

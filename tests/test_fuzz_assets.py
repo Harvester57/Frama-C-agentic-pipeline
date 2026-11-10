@@ -390,7 +390,7 @@ def test_write_dispatch_api_and_target_fuzzer_modules(tmp_path, monkeypatch, cap
     imp = tmp_path / "workspace" / "imported_corpus"
 
     # dispatch harness: case 0 only (case 1 reads a scalar slot first); the 8-byte input is too large
-    assert out["libpng_a"] == {"inputs": 1, "dropped_too_large": 1, "dropped_over_cap": 0}
+    assert out["libpng_a"] == {"inputs": 1, "dropped_too_large": 1, "dropped_over_cap": 0, "status": "ok"}
     files = list((imp / "libpng_a").iterdir())
     assert [p.read_bytes() for p in files] == [b"\x00\x89PNG-a"]
     assert all(p.name.startswith("imp-") and len(p.name) == 20 for p in files)

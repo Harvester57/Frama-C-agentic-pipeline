@@ -109,7 +109,9 @@ selftest:
 # the build capture) in each harness's case format: workspace/seeds/<mod>/. Rewritten from the records
 # before every campaign, so a repaired harness gets seeds in its new format. The corpora the target
 # ships (fuzz_assets.py import, Phase 0) are written the same way, per fuzzed module, as imported inputs
-# (imp-*) in workspace/imported_corpus/<mod>/. Seeds are an improvement, never a requirement, hence the `-`.
+# (imp-*) in workspace/imported_corpus/<mod>/. Seeds are an improvement, never a requirement, hence the `-`
+# (and `|| true`): a failed write exits 1 without stopping Make, after recording ok / skipped / failed and
+# the reason in workspace/reports/seed_status/<writer>/<mod>.json, which the fuzz report carries as `seeds`.
 seeds:
 	-$(RUN) --class light --key seeds -- $(PY) $(S)/seed_harvest.py write
 	-for m in $(FUZZ_MODULES); do $(RUN) --class light --key seeds -- $(PY) $(S)/fuzz_assets.py write --module $$m || true; done
@@ -117,7 +119,8 @@ seeds:
 # One campaign per module. Its effort is a CPU-second budget spread over the workers the lease
 # allows (pipeline_make.py: per harness case, capped per unit and profile); FUZZ_MAX_TIME_<mod>
 # overrides the wall time. The module's seeds and its imported corpus (the target's shipped corpora,
-# fuzz_assets.py write) are read-only extra corpora; a missing one is skipped.
+# fuzz_assets.py write) are read-only extra corpora; a missing one is skipped. A failed write does not
+# stop the campaign (`-`): its recorded status is the report's `seeds` field.
 fuzz: $(FUZZ_TARGETS)
 $(FUZZ_TARGETS): fuzz-%: selftest build-%
 	$(GATE) --module $* --need reach,build_check

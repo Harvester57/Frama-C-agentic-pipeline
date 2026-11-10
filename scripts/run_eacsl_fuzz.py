@@ -4607,6 +4607,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "guardrail":
             res["crash_input"] = None
 
+    if args.mode == "campaign":
+        import seed_harvest  # lazily: only campaigns read the seed writes' statuses
+
+        res["seeds"] = seed_harvest.seeds_report_field(args.module, bool(args.extra_corpus))
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = _summary(res)

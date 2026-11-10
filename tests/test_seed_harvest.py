@@ -327,7 +327,7 @@ def test_write_module_and_records(tmp_path, monkeypatch):
     (tmp_path / "workspace" / "seeds" / "libkv_a" / "seed-stale").write_bytes(b"old")
     out = sh.write([])
     # max_input_size 4: the two 5-byte seeds built from the data file are dropped
-    assert out["modules"]["libkv_a"] == {"seeds": 2, "dropped_too_large": 2}
+    assert out["modules"]["libkv_a"] == {"seeds": 2, "dropped_too_large": 2, "status": "ok"}
     seeds = sorted(p.read_bytes() for p in (tmp_path / "workspace" / "seeds" / "libkv_a").iterdir())
     assert seeds == [b"\x00\x01\x02", b"\x01k"]
     summary = json.loads((tmp_path / "workspace" / "reports" / "seeds" / "libkv_a.json").read_text())
