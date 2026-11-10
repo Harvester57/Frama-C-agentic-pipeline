@@ -1011,6 +1011,17 @@ def _find_unframed_variadic_callees(c_file: Path, fn_name: str, out_dir: Path) -
     return variadic_callees
 
 
+def _sources_hold_eva_taint(sources: list[str]) -> bool:
+    """True when a source holds an assertion named `eva_taint` (security_props.py --eva-taint)."""
+    for src in sources:
+        try:
+            if WP_PROP_EXCLUDE[1:] + ":" in Path(src).read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def run_wp_on_function(
     c_file: Path,
     fn_name: str,
@@ -1339,9 +1350,14 @@ def run_wp_on_function(
         # counter_example_goals list names them, and crash verifiers use them as witnesses.
         cmd.append("-wp-counter-examples")
     # Eva's taint checks (security_props.py --eva-taint) carry the second name `eva_taint`: WP cannot
-    # prove `\tainted`, so every WP run leaves them out. Checked in the analysis image: `-eva_taint`
-    # alone keeps every other goal, and after a positive name it still keeps only that name.
-    cmd.append(f"-wp-prop={prop},{WP_PROP_EXCLUDE}" if prop else f"-wp-prop={WP_PROP_EXCLUDE}")
+    # prove `\tainted`, so a run whose sources hold one leaves them out. Only then: any -wp-prop, even
+    # a purely negative one, also drops the kernel-generated Exit- and Termination-conditions (checked
+    # in the analysis image), so it is never passed when there is nothing to exclude.
+    exclude_taint = _sources_hold_eva_taint(sources)
+    if prop:
+        cmd.append(f"-wp-prop={prop},{WP_PROP_EXCLUDE}" if exclude_taint else f"-wp-prop={prop}")
+    elif exclude_taint:
+        cmd.append(f"-wp-prop={WP_PROP_EXCLUDE}")
     if dump_goal:
         cmd.extend(["-wp-print", "-wp-no-qed"])
 
