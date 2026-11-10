@@ -210,3 +210,4 @@ The rules of [`open-topics-remediation-plan.md`](open-topics-remediation-plan.md
 | ID | Status |
 | :--- | :--- |
 | S2 | done 2026-11-10: `scripts/stub_gen.py`, Make target `stubs`, the stub-author brief (`skills/framac-slice/stub_author_brief.md`), `ledger.py record-stub-contracts`, overlay in the include paths and the cache key; `templates/acsl/external_stubs.h` deleted (decision 2). The Phase 0 dump now records each external's declaration (`external_decls`). |
+| K2 | done 2026-11-10: `cache.make_key` leaves `templates/fc_stubs` and the overlay out of keys that carry a dependency manifest (which hashes the stub headers read). |

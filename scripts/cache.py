@@ -18,7 +18,8 @@ ad-hoc runs outside a run never read or write one.
 
 Keys hash CACHE_SCHEMA_VERSION, the toolchain identity (FRAMAC_IMAGE_ID, else a memoized tuple of
 tool versions), a digest of scripts/ and templates/ (bind-mounted, so the image ID does not cover
-them) and of the run's stub overlay (workspace/stubs), the effective flags, output paths and cwd, and a dependency manifest: the union of the
+them; without templates/fc_stubs when the key has a dependency manifest, which names the stub headers read)
+and, without a manifest, of the run's stub overlay (workspace/stubs), the effective flags, output paths and cwd, and a dependency manifest: the union of the
 include sets `gcc -M -MG` (with Frama-C-like defines) and `clang -M -MG` report for the effective
 preprocessor flags, each file content-hashed. A build whose manifest cannot be computed is never
 cached.
@@ -618,7 +619,7 @@ def single_flight(store: Store, ns: str, key: str) -> Iterator[bool]:
 # ---------------------------------------------------------------------------
 
 _toolchain_memo: str | None = None
-_scripts_memo: str | None = None
+_scripts_memo: dict[bool, str] = {}
 _digest_memo: dict[tuple, str] = {}
 _memo_guard = threading.Lock()
 # Version probes never go through a test's monkeypatched subprocess.run.
@@ -661,12 +662,21 @@ def _image_or_tools_id(runner: Callable | None = None) -> str:
     return value
 
 
-def scripts_digest() -> str:
-    """sha256 of every file under scripts/ and templates/ (memoized per process)."""
-    global _scripts_memo
+# Stub headers (templates/fc_stubs) a preprocessor reads: a key with a dependency manifest has the ones it
+# read, each hashed, so the global digest leaves them out (K2 of docs/templates-and-stubs-improvement-plan.md).
+_STUB_TEMPLATES = "templates/fc_stubs/"
+
+
+def scripts_digest(exclude_stub_headers: bool = False) -> str:
+    """
+    sha256 of every file under scripts/ and templates/ (memoized per process). With
+    `exclude_stub_headers`, without templates/fc_stubs: for keys whose dependency manifest already
+    names the stub headers the preprocessing read, so editing one stub invalidates only the results
+    that read it.
+    """
     with _memo_guard:
-        if _scripts_memo is not None:
-            return _scripts_memo
+        if exclude_stub_headers in _scripts_memo:
+            return _scripts_memo[exclude_stub_headers]
     h = hashlib.sha256()
     for base in (_SCRIPTS_DIR, _TEMPLATES_DIR):
         if not base.is_dir():
@@ -675,10 +685,12 @@ def scripts_digest() -> str:
             if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
                 continue
             rel = f"{base.name}/{path.relative_to(base).as_posix()}"
+            if exclude_stub_headers and rel.startswith(_STUB_TEMPLATES):
+                continue
             h.update(rel.encode() + b"\0" + _sha256_path(path).encode("ascii") + b"\n")
     value = h.hexdigest()
     with _memo_guard:
-        _scripts_memo = value
+        _scripts_memo[exclude_stub_headers] = value
     return value
 
 
@@ -1128,16 +1140,24 @@ def stub_overlay_digest() -> str | None:
 
 
 def make_key(ns: str, material: dict) -> str:
+    """
+    The key of `material` in namespace `ns`. Stub headers (templates/fc_stubs and the run's overlay
+    workspace/stubs) enter it per module (K2): a key whose material carries a dependency manifest
+    (`deps`, from `memoize`) has the stub headers its preprocessing read, each hashed, so the global
+    digests leave them out and a stub edit invalidates only the results that read it. Any other key
+    keeps the digest of all of templates/ and of the whole overlay.
+    """
+    per_module = isinstance(material.get("deps"), list)
     doc = {
         "schema": CACHE_SCHEMA_VERSION,
         "ns": ns,
         "toolchain": toolchain_id(),
-        "scripts": scripts_digest(),
+        "scripts": scripts_digest(exclude_stub_headers=per_module),
         "material": material,
     }
     # The run's stub overlay is outside scripts/ and templates/: a changed contract must not replay a
     # result computed under the old one. Absent from the key without an overlay, so older entries stay valid.
-    overlay = stub_overlay_digest()
+    overlay = None if per_module else stub_overlay_digest()
     if overlay is not None:
         doc["stub_overlay"] = overlay
     blob = json.dumps(doc, sort_keys=True, separators=(",", ":"), default=str)

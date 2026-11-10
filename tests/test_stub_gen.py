@@ -390,3 +390,41 @@ python3 -c "import json; print('state=' + json.load(open('stubs.json'))['headers
     assert "draft_missing=1" in out, out
     assert "filled_missing=0" in out, out
     assert "state=filled" in out, out
+
+
+@pytest.mark.unit
+def test_a_stub_edit_invalidates_only_the_keys_that_read_it(tmp_path, monkeypatch):
+    """K2: a key with a dependency manifest is keyed on the stub headers it read, not on all of them."""
+    monkeypatch.setenv("FRAMAC_IMAGE_ID", "sha256:test")
+    scripts, templates = tmp_path / "scripts", tmp_path / "templates"
+    (templates / "fc_stubs").mkdir(parents=True)
+    scripts.mkdir()
+    (scripts / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (templates / "pipeline.mk").write_text("all:\n", encoding="utf-8")
+    stub = templates / "fc_stubs" / "zlib.h"
+    stub.write_text("int z(void);\n", encoding="utf-8")
+    monkeypatch.setattr(cache, "_SCRIPTS_DIR", scripts)
+    monkeypatch.setattr(cache, "_TEMPLATES_DIR", templates)
+    monkeypatch.setattr(cache, "_scripts_memo", {})
+    overlay = tmp_path / "stubs"
+    overlay.mkdir()
+    (overlay / "o.h").write_text("int o(void);\n", encoding="utf-8")
+    monkeypatch.setenv("FRAMAC_STUB_OVERLAY_DIR", str(overlay))
+    reads = {"deps": [["a.c", "1" * 64], [stub.as_posix(), "2" * 64]]}
+    other = {"deps": [["b.c", "3" * 64]]}
+    plain = {"text": "x"}
+    before = [cache.make_key("eva", m) for m in (reads, other, plain)]
+    # Edit the shipped stub and the overlay: keys with a manifest change only through their deps.
+    stub.write_text("/*@ assigns \\nothing; */ int z(void);\n", encoding="utf-8")
+    (overlay / "o.h").write_text("/*@ assigns \\nothing; */ int o(void);\n", encoding="utf-8")
+    monkeypatch.setattr(cache, "_scripts_memo", {})
+    reads_after = {"deps": [["a.c", "1" * 64], [stub.as_posix(), "4" * 64]]}
+    after = [cache.make_key("eva", m) for m in (reads_after, other, plain)]
+    assert after[1] == before[1]  # read neither stub
+    assert after[0] != before[0]  # its manifest names the edited stub
+    assert after[2] != before[2]  # no manifest: every stub counts
+    assert cache.make_key("eva", reads) == before[0]
+    # Anything else under templates/ still counts for every key.
+    (templates / "pipeline.mk").write_text("all: x\n", encoding="utf-8")
+    monkeypatch.setattr(cache, "_scripts_memo", {})
+    assert cache.make_key("eva", other) != before[1]

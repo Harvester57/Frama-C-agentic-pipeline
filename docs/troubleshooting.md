@@ -498,6 +498,12 @@ The full guide is [`./resources-and-caching.md`](./resources-and-caching.md) (Se
 - **Cause:** the test read `shutil.disk_usage(tmp_path).free` once and `Store.budget_bytes()` read it again; other writers (parallel workers, a live run) changed the free space in between.
 - **Fix:** [`../tests/test_cache.py`](../tests/test_cache.py) pins `cache.shutil.disk_usage` to one measurement.
 
+### Symptom: Editing One Stub Header Re-runs Every Cached Eva Run and E-ACSL Build of the Run
+- **Seen on:** K2 of [`templates-and-stubs-improvement-plan.md`](templates-and-stubs-improvement-plan.md), from reading `scripts/cache.py` (2026-11-10); not measured on a run.
+- **Cause:** every cache key hashed all of `scripts/` and `templates/` (`cache.scripts_digest`), and after S2 the whole stub overlay (`workspace/stubs`) too. A contract added to one stub header therefore invalidated the results of modules that never include it.
+- **Fix (fixed):** `cache.make_key` keys stub headers per module. A key whose material has a dependency manifest (`deps`: Eva, facts and E-ACSL/sanitizer builds, through `cache.memoize`) leaves `templates/fc_stubs/` and the overlay out of its global digests: the manifest (`gcc -M`/`clang -M` over the effective flags, which put the overlay and `templates/fc_stubs` on the include path) already names, and hashes, the stub headers that module's preprocessing read. Keys without a manifest (`slice-index`, `proofs`, `guardrail`) keep the digest of all of `templates/` and of the whole overlay. Everything else under `templates/` (the harness template, the E-ACSL runtime, `pipeline.mk`) still invalidates every key.
+- **Limit:** the manifest is the include set `gcc -M` sees with Frama-C's defines; a stub header Frama-C reaches but `gcc -M` does not (none known) would not enter the key. If you suspect a stale result, compare with `FRAMAC_CACHE=off`.
+
 ### Symptom: `test_sh_new_run_allocation_is_atomic_under_concurrency` fails on Windows with `child_copy: cygheap read copy failed ... Win32 error 299` or return code `3221225794`
 
 - **Seen:** 2026-11-09, full `python -m pytest tests -n auto` in the formal-discovery Tier 4 worktree while five other sessions ran their own suites on the same Windows host. Failed twice in the full suite; `tests/test_run_identity_wrappers.py` passes alone (`-n 0`).
