@@ -505,6 +505,11 @@ The full guide is [`./resources-and-caching.md`](./resources-and-caching.md) (Se
 - **Cause:** the test read `shutil.disk_usage(tmp_path).free` once and `Store.budget_bytes()` read it again; other writers (parallel workers, a live run) changed the free space in between.
 - **Fix:** [`../tests/test_cache.py`](../tests/test_cache.py) pins `cache.shutil.disk_usage` to one measurement.
 
+### Symptom: `make help` Does Not List a Target `pipeline_make.py run` Accepts, or `facts-<mod>` and `module-<mod>` Compute Facts Differently
+- **Seen on:** K3 of [`templates-and-stubs-improvement-plan.md`](templates-and-stubs-improvement-plan.md), from reading `templates/pipeline.mk`; no run failed on it.
+- **Cause:** `help` omitted `eva-tune-base` (staged by `pipeline_make.STAGE_OF_TARGET`, in `.PHONY`), and `module-%` repeated the `facts-%` recipe line for line, so an option added to one would silently miss the other.
+- **Fix (fixed):** `templates/pipeline.mk` has one `define FACTS_RECIPE` that both rules call (`$(call FACTS_RECIPE,$*)`; its body is tab-indented like any recipe, so `test_pipeline_makefile_builds_only_through_the_pipeline_scripts` still reads it, and GNU make keeps the `-` prefix after expansion, checked in `framac-analysis:latest`), and `help` lists `eva-tune-base`; `stubs` and `stub-check` are in `.PHONY`, `help` and the stage order (S2, S3). `tests/test_pipeline_make.py::test_pipeline_mk_lists_every_staged_target_and_shares_the_facts_recipe` checks that every target in `STAGE_OF_TARGET` is in `help`, in `.PHONY` and has a rule.
+
 ### Symptom: Editing One Stub Header Re-runs Every Cached Eva Run and E-ACSL Build of the Run
 - **Seen on:** K2 of [`templates-and-stubs-improvement-plan.md`](templates-and-stubs-improvement-plan.md), from reading `scripts/cache.py` (2026-11-10); not measured on a run.
 - **Cause:** every cache key hashed all of `scripts/` and `templates/` (`cache.scripts_digest`), and after S2 the whole stub overlay (`workspace/stubs`) too. A contract added to one stub header therefore invalidated the results of modules that never include it.

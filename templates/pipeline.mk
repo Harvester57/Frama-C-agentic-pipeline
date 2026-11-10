@@ -48,7 +48,7 @@ MAKEFLAGS += --no-builtin-rules
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init dag stubs stub-check security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init dag stubs stub-check security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune-base eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -290,12 +290,15 @@ $(FLAMEGRAPH_TARGETS): flamegraph-%:
 
 # Kernel AST facts of the module's functions, joined with the flows of its Eva report if there is
 # one, for the provers' briefs (cached by content). Hints only: a failure means briefs without
-# facts, never a stopped pipeline, hence the `-`.
+# facts, never a stopped pipeline, hence the `-`. module-<mod> runs the same recipe.
+define FACTS_RECIPE
+	-$(RUN) --class eva --key $(1) --output workspace/reports/facts/$(1).json -- \
+		$(PY) $(S)/function_facts.py --module $(1) --sources $(SOURCES_$(1)) --cppflags=$(CPPFLAGS_$(1)) \
+		--eva-report workspace/reports/eva/$(1).json --out-json workspace/reports/facts/$(1).json
+endef
 facts: $(FACTS_TARGETS)
 $(FACTS_TARGETS): facts-%:
-	-$(RUN) --class eva --key $* --output workspace/reports/facts/$*.json -- \
-		$(PY) $(S)/function_facts.py --module $* --sources $(SOURCES_$*) --cppflags=$(CPPFLAGS_$*) \
-		--eva-report workspace/reports/eva/$*.json --out-json workspace/reports/facts/$*.json
+	$(call FACTS_RECIPE,$*)
 
 # --- Ingestion and Phase 3 preparation -------------------------------------------------------
 
@@ -363,6 +366,4 @@ report:
 $(foreach m,$(MODULES),$(eval module-$(m): $(filter fuzz-$(m) eva-$(m),$(FUZZ_TARGETS) $(EVA_TARGETS))))
 $(MODULE_TARGETS): module-%:
 	$(RUN) --class light --key ingest -- $(PM) ingest --module $*
-	-$(RUN) --class eva --key $* --output workspace/reports/facts/$*.json -- \
-		$(PY) $(S)/function_facts.py --module $* --sources $(SOURCES_$*) --cppflags=$(CPPFLAGS_$*) \
-		--eva-report workspace/reports/eva/$*.json --out-json workspace/reports/facts/$*.json
+	$(call FACTS_RECIPE,$*)
