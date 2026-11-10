@@ -37,6 +37,21 @@ _BASH_REDIRECT_RE = re.compile(r"(?<![\d&=<>-])>>?\|?\s*(?!&)([^\s;&|()<>]+)")
 _TEE_RE = re.compile(r"\btee\b((?:\s+-[a-zA-Z]+)*)\s+([^\s;&|()<>]+)")
 
 
+_QUOTED_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+
+
+def _mask_quotes(line: str) -> str:
+    """Blank quoted text (data such as `printf '... <<EOF > f'`), keeping quoted heredoc delimiters."""
+
+    def blank(match: re.Match[str]) -> str:
+        before = line[: match.start()].rstrip()
+        if before.endswith("<<") or before.endswith("<<-"):
+            return match.group(0)
+        return match.group(0)[0] + " " * (len(match.group(0)) - 2) + match.group(0)[-1]
+
+    return _QUOTED_RE.sub(blank, line)
+
+
 def _bash_command_lines(command: str) -> tuple[list[str], bool, list[str]]:
     """(heredoc/here-string start lines, any found, all non-body lines)."""
     starts: list[str] = []
@@ -51,10 +66,11 @@ def _bash_command_lines(command: str) -> tuple[list[str], bool, list[str]]:
                 pending.pop(0)
             continue
         outside.append(line)
-        heredocs = list(_HEREDOC_RE.finditer(line))
-        if heredocs or _HERESTRING_RE.search(line):
+        masked = _mask_quotes(line)
+        heredocs = list(_HEREDOC_RE.finditer(masked))
+        if heredocs or _HERESTRING_RE.search(masked):
             found = True
-            starts.append(line)
+            starts.append(masked)
         for match in heredocs:
             delimiter = match.group(2) or match.group(3) or match.group(4)
             pending.append((delimiter, match.group(1) == "-"))

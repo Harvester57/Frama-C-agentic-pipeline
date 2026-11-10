@@ -176,7 +176,7 @@ def _control_chars(rel: str, text: str) -> list[Violation]:
                 hint = ""
                 tail_match = _STRONG_CORRUPTION_RE.match(body, col)
                 if tail_match:
-                    hint = f" (corrupted ACSL {_restored(tail_match)!r}?)"
+                    hint = f" (corrupted ACSL {_restored(tail_match)}?)"
                 out.append(
                     Violation(
                         rel, lineno, "control-char", f"control character {_describe(ch)} at column {col + 1}{hint}"

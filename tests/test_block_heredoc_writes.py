@@ -43,6 +43,9 @@ def test_bash_heredoc_writes_are_blocked(command: str) -> None:
         "ls > files.txt",
         "echo hi",
         "[[ $a > $b ]] && echo ok",
+        # Heredoc syntax inside a quoted argument is data, e.g. a hook payload piped to a script.
+        'printf \'{"command":"cat > a.c <<EOF"}\' | python hook.py',
+        'echo "cat <<EOF > out.c" | python check.py',
     ],
 )
 def test_bash_commands_without_a_heredoc_write_pass(command: str) -> None:
