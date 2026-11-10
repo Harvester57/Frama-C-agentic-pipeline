@@ -886,6 +886,10 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
     Each case also sits in `#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_<k>)`: an
     Eva shard keeps only its cases in the source (eva_shards.py). The preprocessor keeps line numbers, so
     an obligation has the same (file, line) in every shard that keeps it.
+
+    An input that runs no case (no selector byte, a skipped case) calls FRAMAC_FUZZ_REJECT(): the fuzz
+    entry returns -1 for it, so libFuzzer keeps it out of the corpus; in eva_main the macro is empty.
+    A hand-written case whose own length guard turns the input away before any call does the same.
     """
     stmts = [c.strip() for c in cases if c and c.strip()]
     if not stmts:
@@ -929,7 +933,16 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
             f"    case {i}U: {{ {stmt} }} break;",
             "#endif",
         ]
-    lines += ["    default: break;", "    }", "}"]
+    lines += [
+        "    default: break;",
+        "    }",
+        # A case the campaign skips calls nothing: libFuzzer keeps the input out of the corpus (H3).
+        f"#ifdef {DISPATCH_SKIP_MACRO}",
+        "    else { FRAMAC_FUZZ_REJECT(); }",
+        "#endif",
+        # No selector byte: no case runs.
+        "} else { FRAMAC_FUZZ_REJECT(); }",
+    ]
     return "\n    ".join(lines)
 
 

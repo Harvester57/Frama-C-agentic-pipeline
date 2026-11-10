@@ -36,7 +36,7 @@ def test_each_dispatch_case_is_guarded_for_the_shards():
     stmt = _build_dispatch_invocation(["f(fuzz_buf, fuzz_len);", "g(1);", "h();"])
     for k in range(3):
         assert f"#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_{k})" in stmt
-    assert stmt.count("#endif") == 3 + 1  # the cases, and the fuzz skip mask
+    assert stmt.count("#endif") == 3 + 2  # the cases, the fuzz skip mask and its rejection of a skipped case
     assert es.harness_shardable(stmt)
     assert not es.harness_shardable("    case 0U: { f(); } break;\n")
     assert es.shard_cppflags([3, 1]) == ["-DFRAMAC_EVA_SHARD", "-DFRAMAC_EVA_SHARD_CASE_1", "-DFRAMAC_EVA_SHARD_CASE_3"]
