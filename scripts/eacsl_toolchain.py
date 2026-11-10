@@ -49,6 +49,8 @@ EACSL_DEFINES = ("-D__FRAMAC_EACSL__", "-D_Float128=double", "-U__SIZEOF_INT128_
 # Header shims for the E-ACSL frontend only (templates/fc_stubs/eacsl): first on its include path,
 # never on the Eva/WP path (which gets templates/fc_stubs itself) nor on the backend compile.
 EACSL_STUBS_SUBDIR = "eacsl"
+# gcc `-wrapper` of the E-ACSL frontend: fc_cpp_wrapper.py plus the `<==>` rewrite.
+EACSL_CPP_WRAPPER = Path(__file__).resolve().parent / "fc_cpp_wrapper_eacsl.py"
 EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-function-declaration")
 # Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
 # leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full
@@ -169,8 +171,11 @@ def build_eacsl_flag_sets(
             front.append(f"-I{stubs_posix}")
         if "fc_compat_types.h" not in joined_user:
             front.extend(["-include", f"{stubs_posix}/fc_compat_types.h"])
-    # Frama-C's frontend preprocessing repairs `offsetof` with a non-constant index (scripts/fc_cpp_wrapper.py).
-    wrapper = framac_cpp_wrapper()
+    # Frama-C's frontend preprocessing repairs `offsetof` with a non-constant index (scripts/fc_cpp_wrapper.py)
+    # and, for E-ACSL only, writes `<==>` in annotations as two implications (scripts/fc_cpp_wrapper_eacsl.py):
+    # E-ACSL 35 aborts on `<==>` over `\old`, `\at` or a formal in `ensures`
+    # (docs/upstream/frama-c-eacsl-iff-labelled-term.md).
+    wrapper = framac_cpp_wrapper(EACSL_CPP_WRAPPER)
     if wrapper:
         front.extend(["-wrapper", wrapper])
     front.extend(pre)

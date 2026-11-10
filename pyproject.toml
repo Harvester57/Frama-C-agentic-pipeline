@@ -46,6 +46,7 @@ known-first-party = [
     "eva_tuning",
     "extract_references",
     "fc_cpp_wrapper",
+    "fc_cpp_wrapper_eacsl",
     "fingerprint",
     "framac_common",
     "frame_skeleton",

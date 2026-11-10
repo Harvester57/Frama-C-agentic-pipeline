@@ -653,9 +653,10 @@ None of the loop-invariant cases we tried fail.
 pre-analysis. That pre-analysis runs once per file and keys labelled terms by identity, so the
 copies' `\old` / `\at` terms have no entry. 34 reused the operands without copying.
 
-**Workaround.** None in the pipeline yet: a contract of this shape cannot pass the parent guardrail
-on 35, and the merge is refused (`parent guardrail returned status='compile_error'`). Writing the
-equivalence as two implications avoids it.
+**Workaround.** Writing the equivalence as two implications avoids it. Since 2026-11-10 the
+pipeline's E-ACSL frontend does that in the preprocessed text (`scripts/fc_cpp_wrapper_eacsl.py`), so
+contracts already proved with `<==>` build again; WP and Eva still read `<==>` as written, and the prover
+brief asks for two implications in new contracts.
 
 **Proposed fix (not validated).** Translate each operand once and combine the C expressions, as the
 interlang `Piff` case already does. Reproducer, table of failing shapes and the 34/35 source diff:

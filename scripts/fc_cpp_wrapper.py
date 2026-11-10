@@ -35,7 +35,11 @@ initializer, refuses to start on ("globals initialization is not computable"). O
 with an identifier-only cast `(I)` and a null pointer `0`, `(0)` or `((void *)0)` is touched; a pointer
 cast, a further `->` or a call leaves the expression alone.
 
-FRAMAC_CPP_REWRITE=off runs the subcommand without the rewrite.
+For the E-ACSL frontend only, fc_cpp_wrapper_eacsl.py runs this script with `iff=True`, which also writes
+every `<==>` in an ACSL annotation as two implications (E-ACSL 35 aborts on `<==>` over a labelled term;
+see `rewrite_iff_text`). Eva and WP read the annotations as written.
+
+FRAMAC_CPP_REWRITE=off runs the subcommand without any rewrite.
 """
 
 from __future__ import annotations
@@ -328,12 +332,182 @@ def rewrite_text(text: str) -> tuple[str, list[dict]]:
     return "".join(out), notes
 
 
-def rewrite_file(path: str) -> list[dict]:
+# ---------------------------------------------------------------------------------------------------
+# E-ACSL only: `p1 <==> p2` -> `((p1) ==> (p2)) && ((p2) ==> (p1))` inside ACSL annotations
+# ---------------------------------------------------------------------------------------------------
+#
+# E-ACSL in Frama-C 35 aborts on a `<==>` whose operands hold a labelled term (`\old`, `\at`, or a formal
+# in an `ensures`): "labels pre-analysis was not performed on construct \old(b)" (docs/upstream/
+# frama-c-eacsl-iff-labelled-term.md). Two implications are the same predicate and build on 34 and 35.
+# Only the E-ACSL frontend asks for this (fc_cpp_wrapper_eacsl.py): WP and Eva read the contract as written.
+#
+# ACSL precedence, tightest first: ... `&&`, `^^`, `||`, `==>` (right), `<==>` (left), `? :`, then binders
+# (`\forall`, `\exists`, `\let`, `\lambda`), whose body runs as far right as it can. So an operand of `<==>`
+# ends, at its own nesting depth, at a bracket that closes its group, `,`, `;`, `?`, `:`, `=`, another
+# `<==>` or the end of the annotation; on the left it also starts after the clause keywords
+# (`ensures`, `loop invariant`, ...). On the right, a binder's own `;` does not end the operand.
+
+IFF = "<==>"
+_ANNOT_RE = re.compile(
+    r"/\*@(?P<block>.*?)\*/"
+    r"|//@(?P<line>[^\n]*)"
+    r"|//[^\n]*"
+    r"|/\*.*?\*/"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|^[ \t]*#(?:[^\n\\]|\\.)*",
+    re.DOTALL | re.MULTILINE,
+)
+_ACSL_TOKEN_RE = re.compile(
+    r"(?P<ws>(?:\s|@)+)"
+    r"|(?P<comment>//[^\n]*)"
+    r'|(?P<lit>"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\')'
+    r"|(?P<word>\\?[A-Za-z_]\w*)"
+    r"|(?P<op><==>|<-->|==>|-->|==|<=|>=|!=|&&|\|\||\^\^|->|\.\.|::|[^\s@])",
+)
+_CLAUSE_KEYWORDS = frozenset(
+    {
+        "requires", "ensures", "assumes", "assert", "check", "admit", "invariant", "variant", "decreases",
+        "terminates", "exits", "breaks", "continues", "returns", "assigns", "allocates", "frees", "loop",
+        "strong", "weak", "behavior", "reads", "lemma", "axiom", "global", "type",
+    }
+)  # fmt: skip
+_BINDERS = frozenset({"\\forall", "\\exists", "\\let", "\\lambda"})
+_LEFT_STOPS = frozenset({",", ";", "?", ":", "=", IFF})
+_RIGHT_STOPS = frozenset({",", ";", "?", ":", "=", IFF})
+_OPENERS, _CLOSERS = frozenset("([{"), frozenset(")]}")
+_MAX_IFF_REWRITES = 256  # per annotation: `a <==> (b <==> c)` copies the inner one; bound the growth
+
+
+def _acsl_tokens(body: str) -> list[tuple[str, int, int]] | None:
+    """(kind, start, end) of every token of an annotation body, or None if some text does not lex."""
+    toks: list[tuple[str, int, int]] = []
+    pos = 0
+    while pos < len(body):
+        m = _ACSL_TOKEN_RE.match(body, pos)
+        if m is None or m.end() == pos:
+            return None
+        toks.append((m.lastgroup or "op", m.start(), m.end()))
+        pos = m.end()
+    return toks
+
+
+def _iff_operands(body: str, toks: list[tuple[str, int, int]], k: int) -> tuple[int, int, int, int] | None:
+    """Token index bounds (first, last) of the left and right operands of the `<==>` at token `k`."""
+    sig = [i for i, t in enumerate(toks) if t[0] not in ("ws", "comment")]
+    at = sig.index(k)
+    text = [body[toks[i][1] : toks[i][2]] for i in sig]
+
+    depth, j = 0, at - 1
+    while j >= 0:
+        t = text[j]
+        if t in _CLOSERS:
+            depth += 1
+        elif t in _OPENERS:
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and t in _LEFT_STOPS:
+            break
+        j -= 1
+    lo = j + 1
+    while lo < at and text[lo] in _CLAUSE_KEYWORDS:
+        lo += 1
+
+    depth, j, binder = 0, at + 1, False
+    while j < len(text):
+        t = text[j]
+        if t in _OPENERS:
+            depth += 1
+        elif t in _CLOSERS:
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and t in _BINDERS:
+            binder = True
+        elif depth == 0 and binder and t == ";":
+            binder = False  # the binder's own `;`: its body follows, still part of the operand
+        elif depth == 0 and not binder and t in _RIGHT_STOPS:
+            break
+        j += 1
+    hi = j - 1
+    if lo >= at or hi <= at:
+        return None
+    return sig[lo], sig[at - 1], sig[at + 1], sig[hi]
+
+
+def _flat(body: str, toks: list[tuple[str, int, int]], first: int, last: int) -> str:
+    """The operand on one line, without comments or `@` blanks, so the copy adds no line."""
+    return "".join(" " if kind in ("ws", "comment") else body[s:e] for kind, s, e in toks[first : last + 1])
+
+
+def rewrite_iff_body(body: str) -> tuple[str, int]:
+    """An annotation body with every `<==>` written as two implications, and the number rewritten."""
+    count = 0
+    while IFF in body and count < _MAX_IFF_REWRITES:
+        toks = _acsl_tokens(body)
+        if toks is None:
+            break
+        k = next((i for i, t in enumerate(toks) if body[t[1] : t[2]] == IFF), None)
+        if k is None:
+            break
+        bounds = _iff_operands(body, toks, k)
+        if bounds is None:
+            break  # malformed: leave it for the kernel to report
+        l0, l1, r0, r1 = bounds
+        left = body[toks[l0][1] : toks[l1][2]]
+        right = body[toks[r0][1] : toks[r1][2]]
+        # The text around the operator keeps any newline (and comment) where it was.
+        arrow = body[toks[l1][2] : toks[k][1]] + "==>" + body[toks[k][2] : toks[r0][1]]
+        new = f"((({left}){arrow}({right})) && (({_flat(body, toks, r0, r1)}) ==> ({_flat(body, toks, l0, l1)})))"
+        body = body[: toks[l0][1]] + new + body[toks[r1][2] :]
+        count += 1
+    return body, count
+
+
+def rewrite_iff_text(text: str) -> tuple[str, list[dict]]:
+    """The preprocessed text with every `<==>` in an ACSL annotation rewritten, and one note per annotation."""
+    if IFF not in text:
+        return text, []
+    out: list[str] = []
+    notes: list[dict] = []
+    last = 0
+    where: Callable[[int], tuple[str, int]] | None = None
+    for m in _ANNOT_RE.finditer(text):
+        group = "block" if m.group("block") is not None else "line" if m.group("line") is not None else None
+        if group is None or IFF not in m.group(group):
+            continue
+        new_body, n = rewrite_iff_body(m.group(group))
+        if not n:
+            continue
+        out += [text[last : m.start(group)], new_body]
+        last = m.end(group)
+        where = where or _locator(text)
+        file, line = where(m.start())
+        notes.append(
+            {
+                "file": file,
+                "line": line,
+                "kind": f"{n} `<==>` in an annotation (E-ACSL: two implications)",
+                "original": " ".join(m.group(group).split())[:240],
+                "rewritten": " ".join(new_body.split())[:480],
+            }
+        )
+    if not notes:
+        return text, []
+    out.append(text[last:])
+    return "".join(out), notes
+
+
+def rewrite_file(path: str, iff: bool = False) -> list[dict]:
     """Rewrite one preprocessed file in place; fail open (the file stays as the preprocessor wrote it)."""
     try:
         with open(path, "rb") as fh:
             text = fh.read().decode("latin-1")  # byte-preserving: the C text round-trips unchanged
         new, notes = rewrite_text(text)
+        if iff:
+            new, iff_notes = rewrite_iff_text(new)
+            notes += iff_notes
         if notes:
             tmp = f"{path}.fc-cpp"
             with open(tmp, "wb") as fh:
@@ -346,7 +520,7 @@ def rewrite_file(path: str) -> list[dict]:
             )
         return notes
     except Exception as exc:  # noqa: BLE001 - the wrapper must never fail a parse the preprocessor passed
-        print(f"{LOG_PREFIX} warning: offsetof rewrite skipped for {path}: {exc}", file=sys.stderr)
+        print(f"{LOG_PREFIX} warning: rewrite skipped for {path}: {exc}", file=sys.stderr)
         return []
 
 
@@ -367,8 +541,11 @@ def output_path(cmd: Sequence[str]) -> str | None:
     return None
 
 
-def run(cmd: Sequence[str], call: Callable[[list[str]], int] = subprocess.call) -> int:
-    """Run gcc's subcommand `cmd`; after a successful preprocessing into a file, rewrite that file."""
+def run(cmd: Sequence[str], call: Callable[[list[str]], int] = subprocess.call, iff: bool = False) -> int:
+    """
+    Run gcc's subcommand `cmd`; after a successful preprocessing into a file, rewrite that file. `iff`
+    (the E-ACSL frontend, fc_cpp_wrapper_eacsl.py) also rewrites `<==>` in annotations.
+    """
     if not cmd:
         print(f"usage: {os.path.basename(sys.argv[0])} <subcommand> [args...] (a gcc -wrapper)", file=sys.stderr)
         return 2
@@ -377,7 +554,7 @@ def run(cmd: Sequence[str], call: Callable[[list[str]], int] = subprocess.call) 
         return rc
     out = output_path(cmd)
     if out is not None and out != "-":
-        rewrite_file(out)
+        rewrite_file(out, iff=iff)
     return rc
 
 

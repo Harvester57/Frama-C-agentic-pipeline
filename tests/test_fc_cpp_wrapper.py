@@ -1,6 +1,7 @@
 """
 scripts/fc_cpp_wrapper.py: the gcc `-wrapper` that repairs `offsetof` with a non-constant index in
-Frama-C's preprocessed output, and its wiring into every Frama-C parse and the E-ACSL frontend.
+Frama-C's preprocessed output, and its wiring into every Frama-C parse and the E-ACSL frontend; and
+scripts/fc_cpp_wrapper_eacsl.py, the E-ACSL frontend's variant that also writes `<==>` as two implications.
 """
 
 from __future__ import annotations
@@ -194,6 +195,97 @@ def test_anything_that_is_not_a_designator_is_left_alone(call):
 
 
 # ---------------------------------------------------------------------------------------------------
+# E-ACSL only: `<==>` as two implications
+# ---------------------------------------------------------------------------------------------------
+
+
+def _iff(body: str) -> str:
+    new, _ = W.rewrite_iff_body(body)
+    return " ".join(new.split())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # The libmnl contract that failed the Tier 6 guardrail.
+        (
+            r" ensures empty_iff_zero: (\result != 0) <==> (b->buflen == 0); ",
+            r"ensures empty_iff_zero: ((((\result != 0)) ==> ((b->buflen == 0))) && "
+            r"(((b->buflen == 0)) ==> ((\result != 0))));",
+        ),
+        # `==>` binds tighter than `<==>`; a binder's body holds the `<==>`.
+        (
+            r" ensures \forall integer i; 0 <= i < n ==> a[i] == 0 <==> \result; ",
+            r"ensures \forall integer i; (((0 <= i < n ==> a[i] == 0) ==> (\result)) && "
+            r"((\result) ==> (0 <= i < n ==> a[i] == 0)));",
+        ),
+        # A binder on the right keeps its own `;` inside the operand.
+        (
+            r" ensures (x == 0) <==> \forall integer i; 0 <= i < n ==> a[i] == 0; ",
+            r"ensures ((((x == 0)) ==> (\forall integer i; 0 <= i < n ==> a[i] == 0)) && "
+            r"((\forall integer i; 0 <= i < n ==> a[i] == 0) ==> ((x == 0))));",
+        ),
+        # Inside a group, a call argument, a ternary branch, a `\let` body and a definition.
+        (r" ensures r: x == 0 ==> (\result <==> \old(y) > 0); ",
+         r"ensures r: x == 0 ==> ((((\result) ==> (\old(y) > 0)) && ((\old(y) > 0) ==> (\result))));"),
+        (r" ensures P(a, b <==> c); ", r"ensures P(a, (((b) ==> (c)) && ((c) ==> (b))));"),
+        (r" ensures c ? a <==> b : d; ", r"ensures c ? (((a) ==> (b)) && ((b) ==> (a))) : d;"),
+        (r" ensures \let v = x + 1; v > 0 <==> x >= 0; ",
+         r"ensures \let v = x + 1; (((v > 0) ==> (x >= 0)) && ((x >= 0) ==> (v > 0)));"),
+        (r" predicate p(int x) = x > 0 <==> x != 0; ",
+         r"predicate p(int x) = (((x > 0) ==> (x != 0)) && ((x != 0) ==> (x > 0)));"),
+        # Labelled terms, and `loop invariant` (two keywords) in front of the left operand.
+        (r" loop invariant (s == 0) <==> (i == 0 && n == \at(n, Pre)); ",
+         r"loop invariant ((((s == 0)) ==> ((i == 0 && n == \at(n, Pre)))) && "
+         r"(((i == 0 && n == \at(n, Pre))) ==> ((s == 0))));"),
+        # `<==>` is left-associative: (a <==> b) <==> c.
+        (r" ensures a <==> b <==> c; ",
+         r"ensures ((((((a) ==> (b)) && ((b) ==> (a)))) ==> (c)) && "
+         r"((c) ==> ((((a) ==> (b)) && ((b) ==> (a))))));"),
+        # Numbers, ranges and bit operators keep their spelling in the copies.
+        (r" ensures \valid(p + (0 .. 1)) <==> x --> 1.5e0 > 0x1Fu; ",
+         r"ensures (((\valid(p + (0 .. 1))) ==> (x --> 1.5e0 > 0x1Fu)) && "
+         r"((x --> 1.5e0 > 0x1Fu) ==> (\valid(p + (0 .. 1)))));"),
+    ],
+)  # fmt: skip
+def test_every_equivalence_becomes_two_implications(body, expected):
+    assert _iff(body) == expected
+    assert "<==>" not in W.rewrite_iff_body(body)[0]
+
+
+@pytest.mark.unit
+def test_the_equivalence_rewrite_keeps_lines_and_leaves_c_and_other_comments_alone():
+    text = _pp(
+        "/*@ requires \\valid(b);\n"
+        "    @ assigns \\nothing;\n"
+        "    @ ensures (\\result != 0) // why\n"
+        "    @   <==> (b->n == 0); */\n"
+        'int f(struct s *b) { char *m = "a <==> b"; /* x <==> y */ return b->n == 0; }\n'
+        "//@ ghost int g = 0;\n"
+        "int h(int r) { /*@ assert (r != 0) <==> (\\at(r, Pre) != 0); */ return r; }\n",
+        file="src/f.c",
+        line=10,
+    )
+    new, notes = W.rewrite_iff_text(text)
+    assert new.count("\n") == text.count("\n")
+    assert new.count("<==>") == 2  # the string literal and the plain comment
+    assert '"a <==> b"' in new and "/* x <==> y */" in new
+    # The first implication keeps the operands' lines; the reversed copy is on one line, without the comment.
+    assert (
+        "ensures ((((\\result != 0)) // why\n    @   ==> ((b->n == 0))) && (((b->n == 0)) ==> ((\\result != 0))));"
+        in new
+    )
+    assert [(n["file"], n["line"]) for n in notes] == [("src/f.c", 10), ("src/f.c", 16)]
+    assert W.rewrite_iff_text(_pp("int x = a <= b;\n")) == (_pp("int x = a <= b;\n"), [])
+
+
+@pytest.mark.unit
+def test_an_equivalence_without_operand_is_left_for_the_kernel():
+    assert W.rewrite_iff_body(" ensures <==> x; ") == (" ensures <==> x; ", 0)
+
+
+# ---------------------------------------------------------------------------------------------------
 # The wrapper around gcc's subcommands
 # ---------------------------------------------------------------------------------------------------
 
@@ -244,9 +336,26 @@ def test_other_subcommands_failures_and_the_switch_leave_the_output_alone(tmp_pa
 
 
 @pytest.mark.unit
+def test_only_the_eacsl_wrapper_rewrites_equivalences(tmp_path, capsys):
+    text = _pp("/*@ ensures (\\result != 0) <==> (b->n == 0); */\nint f(struct s *b);\n", file="src/f.c", line=3)
+    out = tmp_path / "f.i"
+    call, _ = _fake_cc1(text)
+    cmd = [CC1, "-E", "src/f.c", "-o", str(out)]
+    assert W.run(cmd, call=call) == 0
+    assert out.read_text(encoding="utf-8") == text  # Eva and WP read the contract as written
+    assert W.run(cmd, call=call, iff=True) == 0
+    assert "<==>" not in out.read_text(encoding="utf-8")
+    assert (
+        "[fc-cpp] src/f.c:3: 1 `<==>` in an annotation (E-ACSL: two implications) rewritten" in capsys.readouterr().err
+    )
+    source = (ROOT / "scripts" / "fc_cpp_wrapper_eacsl.py").read_text(encoding="utf-8")
+    assert "run(sys.argv[1:], iff=True)" in source
+
+
+@pytest.mark.unit
 def test_a_failed_rewrite_fails_open(tmp_path, capsys):
     assert W.rewrite_file(str(tmp_path / "missing.i")) == []
-    assert "[fc-cpp] warning: offsetof rewrite skipped" in capsys.readouterr().err
+    assert "[fc-cpp] warning: rewrite skipped" in capsys.readouterr().err
 
 
 @pytest.mark.unit
@@ -296,11 +405,18 @@ def test_every_framac_parse_runs_the_preprocessor_under_the_wrapper(monkeypatch)
 
 @pytest.mark.unit
 def test_the_eacsl_frontend_runs_under_the_wrapper_and_the_backend_does_not(monkeypatch, tmp_path):
-    monkeypatch.setattr(eacsl_toolchain, "framac_cpp_wrapper", lambda: "/opt/framac-pipeline/scripts/fc_cpp_wrapper.py")
+    asked: list[Path] = []
+    monkeypatch.setattr(
+        eacsl_toolchain,
+        "framac_cpp_wrapper",
+        lambda path: asked.append(path) or "/opt/framac-pipeline/scripts/fc_cpp_wrapper_eacsl.py",
+    )
     flags = eacsl_toolchain.build_eacsl_flag_sets("-Isrc -std=gnu99", fc_stubs=tmp_path)
     front, back = flags["frontend"].split(), flags["backend"].split()
     assert front[:2] == ["-D__FRAMAC_EACSL__", "-D_Float128=double"]
-    assert front[front.index("-wrapper") + 1] == "/opt/framac-pipeline/scripts/fc_cpp_wrapper.py"
+    # The E-ACSL variant (with the `<==>` rewrite), not the Eva/WP wrapper.
+    assert asked == [ROOT / "scripts" / "fc_cpp_wrapper_eacsl.py"]
+    assert front[front.index("-wrapper") + 1] == "/opt/framac-pipeline/scripts/fc_cpp_wrapper_eacsl.py"
     assert "-wrapper" not in back
 
 
@@ -388,3 +504,64 @@ def test_frama_c_and_eacsl_accept_a_non_constant_offsetof_without_losing_precisi
     assert "not computable" not in log
     proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", log)
     assert proved and proved.group(1) == proved.group(2), log
+
+
+# The libmnl contract shape that the Frama-C 35 guardrail refused (docs/upstream/frama-c-eacsl-iff-labelled-term.md),
+# plus a body assertion over `\at` and a binder.
+IFF_LABELLED = r"""struct s { int n; };
+/*@ requires \valid(b);
+    assigns b->n;
+    ensures empty_iff_zero: (\result != 0) <==> (\old(b->n) == 0);
+    ensures all: \forall integer i; 0 <= i < 1 ==> (b->n == 5 <==> \true); */
+int f(struct s *b) {
+  int r = b->n == 0;
+  b->n = 5;
+  /*@ assert (r != 0) <==> (\at(b->n, Pre) == 0); */
+  return r;
+}
+/*@ ensures wrong: (\result != 0) <==> (x == 0); */
+int g(int x) { return x != 0; }
+int main(int argc, char **argv) {
+  struct s x = { 0 };
+  int ok = f(&x) == 1 && x.n == 5;
+  if (argc > 1) g(0);  /* violates `wrong`: the rewritten check still fires */
+  return ok ? 0 : 1;
+}
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_eacsl_builds_and_checks_equivalences_over_labelled_terms(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "i.c").write_text(IFF_LABELLED, encoding="utf-8", newline="\n")
+    py = 'import sys; sys.path.insert(0, "/opt/framac-pipeline/scripts"); '
+    script = (
+        "cd /w; "
+        f'F=$(python3 -c \'{py}import eacsl_toolchain as T; print(T.build_eacsl_flag_sets("-I.", fuzzer=False)["frontend"])\'); '
+        'case "$F" in *fc_cpp_wrapper_eacsl.py*) ;; *) echo "NO EACSL WRAPPER: $F"; exit 9;; esac; '
+        # Without the rewrite, Frama-C 35 stops (keeps this test honest about what it repairs).
+        'FRAMAC_CPP_REWRITE=off e-acsl-gcc --full-mtracking -G clang -E "$F" -O off i.c > off.log 2>&1; echo "off_rc=$?"; '
+        'e-acsl-gcc --full-mtracking -G clang -E "$F" -O bin i.c > on.log 2>&1; echo "on_rc=$?"; cat on.log; '
+        './bin.e-acsl; echo "run_rc=$?"; ./bin.e-acsl violate > viol.log 2>&1; echo "viol_rc=$?"; cat viol.log; '
+        "grep -c 'labels pre-analysis was not performed' off.log || true"
+    )
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", f"{tmp_path}:/w",
+            "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+            "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+            "--entrypoint", "bash", ANALYSIS_IMAGE, "-c", script,
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False,
+    )  # fmt: skip
+    log = proc.stdout + proc.stderr
+    assert "on_rc=0" in log and "run_rc=0" in log, log
+    assert "[fc-cpp] /w/i.c:2: 2 `<==>` in an annotation (E-ACSL: two implications) rewritten" in log, log
+    assert "[fc-cpp] /w/i.c:9: 1 `<==>`" in log and "[fc-cpp] /w/i.c:12: 1 `<==>`" in log, log
+    # The rewritten postcondition is still checked: g(0) breaks it at run time.
+    violation = (tmp_path / "viol.log").read_text(encoding="utf-8", errors="replace")
+    assert "viol_rc=0" not in log and "Postcondition" in violation and "wrong" in violation, log
+    if "off_rc=0" not in log:  # Frama-C 35: the original text fails as diagnosed; 34 builds both
+        assert "labels pre-analysis was not performed" in (tmp_path / "off.log").read_text(encoding="utf-8"), log
