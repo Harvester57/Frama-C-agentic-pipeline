@@ -55,6 +55,7 @@ A review of Phase 1 found 17 defects (3 P1, 10 P2, 4 P3) and 4 design questions.
 - [x] **Tier 4, evidence basis on rejections, step 1 (2026-11-10):** `refutation_basis` recorded and reported; `dead_code` raised to `checked` from the Eva or coverage report on disk.
 - [ ] **Tier 4, step 2:** read the class-by-basis counts of one benchmark run before any unit status depends on the basis. A raised `checked` means "not reached under this harness", not "unreachable".
 - [x] **Loop invariant seeds (2026-11-10):** `scripts/loop_seeds.py`, candidates from loop facts filtered by WP (Houdini) and a corpus replay; `FRAMAC_LOOP_SEEDS`, default off. Run on toy loops only.
+- [ ] **Loop invariant seeds, cost of the no-harm check:** two full WP runs per function (483 s against 45 s on eleven toy functions). Measure on a real module; consider reusing the prover's own baseline WP report.
 - [ ] **Loop invariant seeds, acceptance:** benchmark A/B on `FRAMAC_LOOP_SEEDS` (prover iterations on functions with loops, `rejected_overconstrained` count); then decide the default. Add a `tests/test_function_facts.py` test for the new `derived_pointers` field.
 - [x] **Reopening of weak rejections (2026-11-10):** `FRAMAC_REJECTION_REOPEN`, default on; the scheduler dispatches the second verifier. Not yet seen on a real run; a `confirmed` second verdict is untested.
 - [x] **Decision point patch-and-replay check (2026-11-10):** `scripts/decision_point_check.py` and `decision_point.basis`. One toy run in the image.

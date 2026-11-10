@@ -220,8 +220,7 @@ def test_inner_loop_restates_what_the_outer_loop_knows() -> None:
     assert [(c.loop_line, c.predicate, c.template) for c in cands] == [
         (3, "r <= rows", "guard_upper"),
         (4, "c <= cols", "guard_upper"),
-        (4, "r < rows", "outer_guard"),
-        (4, "r <= rows", "outer_restated"),
+        (4, "r < rows", "outer_guard"),  # and no restated `r <= rows`: the strict guard already says it
     ]
     # Nothing is restated about a variable the inner loop writes.
     writes_r = {**inner, "scalars": inner["scalars"] + [{"var": "r", "updates": ["r + 1UL"]}]}
@@ -623,6 +622,7 @@ def test_cli_finds_facts_runs_the_filters_and_writes_the_report(
         return wp
 
     monkeypatch.setattr(ls, "default_wp_runner", fake_wp_runner)
+    monkeypatch.setattr(ls, "default_full_runner", lambda orig, cppflags, out_dir, deadline: FakeFull([[], []]))
     out_json = tmp_path / "agents" / "p1" / "scratch" / "loop_seeds_sum_int.json"
     rc = ls.main(
         [
@@ -807,3 +807,90 @@ def test_report_path_never_leaves_the_reports_directory() -> None:
     assert ls.default_out_json("m", "f").as_posix() == "workspace/reports/loop_seeds/m/f.json"
     assert ls.default_out_json(None, "f").as_posix() == "workspace/reports/loop_seeds/_/f.json"
     assert ls.default_out_json("../../etc", "a/b").as_posix() == "workspace/reports/loop_seeds/_.._etc/a_b.json"
+
+
+# ------------------------------------------------------------------ no-harm check
+
+
+class FakeFull:
+    """Full WP runs decided by a table: per run, the unproven goals as (kind, annotation, line)."""
+
+    def __init__(self, runs, status=None):
+        self.runs = list(runs)
+        self.status = status
+        self.seeds: list[list[str]] = []
+
+    def __call__(self, copy: Path, function: str) -> dict:
+        text = copy.read_text(encoding="utf-8")
+        self.seeds.append(ls._SEED_CLAUSE_RE.findall(text))
+        goals = self.runs.pop(0)
+        if isinstance(goals, dict):
+            return goals
+        return {
+            "status": self.status or ("unproven_goals_remain" if goals else "all_proven"),
+            "unproven_goals": [{"kind": k, "annotation": a, "line": line} for k, a, line in goals],
+        }
+
+
+TERMINATION = ("termination clause", "\\true", 1)
+MEM = ("mem_access", "\\valid_read(buf + i)", 9)
+
+
+def _proven_names(report: dict, label: str = "proven_inductive") -> list[str]:
+    return [c["name"] for c in report["candidates"] if c["label"] == label]
+
+
+@pytest.mark.unit
+def test_no_harm_keeps_the_seeds_when_wp_loses_no_goal(tmp_path: Path) -> None:
+    full = FakeFull([[TERMINATION, MEM], [TERMINATION]])
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    report = ls.compute(src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c", run_full=full)
+    assert report["no_harm"]["status"] == "ok" and report["no_harm"]["newly_proved"] == 1
+    assert report["no_harm"]["baseline_unproven"] == 2 and report["no_harm"]["lost"] == []
+    assert full.seeds[0] == [] and full.seeds[1] == report["proven"] != []
+    assert "loses no goal" in ls.render(report) and "proves 1 more" in ls.render(report)
+
+
+@pytest.mark.unit
+def test_no_harm_withholds_the_one_seed_whose_removal_restores_the_goal(tmp_path: Path) -> None:
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    # Baseline, all seeds (loses MEM), without the first seed (still lost), without the second (restored).
+    full = FakeFull([[TERMINATION], [TERMINATION, MEM], [TERMINATION, MEM], [TERMINATION]])
+    report = ls.compute(src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c", run_full=full)
+    check = report["no_harm"]
+    assert check["status"] == "one_withheld" and [g["kind"] for g in check["lost"]] == ["mem_access"]
+    all_seeds = full.seeds[1]
+    assert full.seeds[2] == all_seeds[1:] and full.seeds[3] == [all_seeds[0], *all_seeds[2:]]
+    assert _proven_names(report, "proven_withheld") == [all_seeds[1]]
+    assert all_seeds[1] not in report["proven"] and all_seeds[0] in report["proven"]
+    text = ls.render(report)
+    assert "Proven, but withheld" in text and "mem_access" in text
+
+
+@pytest.mark.unit
+def test_no_harm_withholds_everything_when_no_single_removal_helps(tmp_path: Path) -> None:
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    full = FakeFull([[TERMINATION]] + [[TERMINATION, MEM]] * 10)
+    report = ls.compute(src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c", run_full=full)
+    assert report["no_harm"]["status"] == "all_withheld" and report["proven"] == []
+    assert len(report["no_harm"]["runs"]) <= 1 + ls.MAX_NO_HARM_RUNS
+    assert _proven_names(report, "proven_withheld") != []
+
+
+@pytest.mark.unit
+def test_no_harm_that_cannot_run_withholds_nothing_and_says_so(tmp_path: Path) -> None:
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    failed = FakeFull([{"status": "analysis_error", "reason": "timeout"}])
+    report = ls.compute(src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c", run_full=failed)
+    assert report["no_harm"]["status"] == "skipped" and "timeout" in report["no_harm"]["reason"]
+    assert report["proven"] != [] and "were not checked" in ls.render(report)
+    none = ls.compute(src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c2")
+    assert none["no_harm"]["status"] == "skipped"
+    late = ls.compute(
+        src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c3", run_full=FakeFull([]), deadline=0.0
+    )
+    assert late["no_harm"]["status"] in ("skipped", "not_needed")

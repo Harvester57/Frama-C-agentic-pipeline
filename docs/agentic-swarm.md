@@ -94,12 +94,13 @@ Eva does not hold the index-against-length relation at a widened loop head ([`./
 1. **Syntactic candidates**, over the function's own formals and locals:
    - `0 <= i` for a signed counter (a scalar whose every update is `i + k` or `i - k`);
    - `i <= bound` for each header condition that compares a counter with an operand the loop does not write, and the guarded form `0 <= bound ==> i <= bound` when the counter is signed (with a signed `len`, `i <= len` fails establishment);
-   - for a pointer walker, its anchor on the formal it starts from (`\at(p, Pre) <= p`, same `\base_addr`, `p == \at(p, Pre) + (p - \at(p, Pre))`) and its end bound;
+   - for a pointer walker, its anchor on the formal it starts from (`\at(p, Pre) <= p`, same `\base_addr`) and its end bound;
    - in a nested loop, the enclosing loops' guards and candidates that the inner loop leaves alone, because WP forgets them across an inner loop without `loop assigns`.
 
    A literal bound is kept only when the literal is written in the function's source, so a harness buffer size or a macro's value never becomes a candidate.
 2. **Houdini with WP.** All candidates go into a private copy as `loop invariant seed_<n>: ...;` and only those goals are proved (`-wp-prop`). A candidate WP cannot establish or preserve is dropped, and the rest is proved again until a round drops nothing (at most 6 rounds). Survivors are inductive under the function's current contract and loop annotations. The report says, for each dropped candidate, whether establishment or preservation failed.
 3. **Corpus filter.** The candidates WP dropped are compiled as E-ACSL checks with the guardrail's build and replayed on the Phase 1 corpus, without mutation. An input that falsifies a candidate is recorded with it. A candidate no input falsifies is reported as "held on every replayed corpus input, not proven": a hint, never a clause to paste.
+4. **No-harm check.** Proven seeds are true, but more hypotheses can make a solver miss another goal (measured on a nested loop with a nonlinear index). The tool runs every goal of the function once without seeds and once with the proven ones. A seed set that loses a goal is reduced by leaving out one seed of the loop the goal sits in, or withheld entirely, and the report lists those seeds as "Proven, but withheld". When the check cannot run, nothing is withheld and the report says the seeds were not checked. It adds two full WP runs per function.
 
 WP runs first because it is the cheaper filter: measured on toy functions, a round on the seed goals costs about one second when nothing fails and about six when a goal times out (the per-goal limit is 5 s), and an E-ACSL build and replay costs about two. A proven candidate needs no corpus check, so the build is paid only for what WP dropped.
 

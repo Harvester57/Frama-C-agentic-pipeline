@@ -50,6 +50,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,6 +79,9 @@ MAX_CANDIDATES_PER_LOOP = 10
 MAX_CANDIDATES = 24
 MAX_WP_ROUNDS = 6
 MAX_CORPUS_ROUNDS = 4
+# Seeded full-WP runs of the no-harm check: the whole proven set, then leave-one-out on the loop a
+# lost goal sits in. Past this, every seed is withheld (the function is then as it was).
+MAX_NO_HARM_RUNS = 4
 # Per goal and per prover, fixed whatever the machine. Shorter than run_wp_function.py's default of 15 s:
 # a seed that proves does so in milliseconds (measured), and a seed lost to this limit is only a lost hint,
 # while every false candidate costs the whole limit.
@@ -402,6 +406,7 @@ def _inherited_candidates(
         return not (set(re.findall(_IDENT, predicate)) & written)
 
     out: list[tuple[str, str, str | None]] = []
+    implied: set[str] = set()
     seen = {loop.get("index")}
     parent = loop.get("parent")
     while parent is not None and parent not in seen and parent in by_index:
@@ -416,7 +421,15 @@ def _inherited_candidates(
             predicate = f"{lhs.text} {op} {rhs.text}"
             if untouched(predicate) and not function_facts._TEMP_RE.search(predicate):
                 out.append((predicate, "outer_guard", None))
-        out += [(pred, "outer_restated", weaker) for pred, _t, weaker in own.get(parent, []) if untouched(pred)]
+                # The outer loop's own `a <= b` holds in its body as the strict guard: do not restate it.
+                if op in ("<", ">"):
+                    implied.add(re.sub(r"\s+", "", f"{lhs.text} {op}= {rhs.text}"))
+                    implied.add(re.sub(r"\s+", "", f"{rhs.text} {_MIRRORED[op]}= {lhs.text}"))
+        out += [
+            (pred, "outer_restated", weaker)
+            for pred, _t, weaker in own.get(parent, [])
+            if untouched(pred) and re.sub(r"\s+", "", pred) not in implied
+        ]
         parent = outer.get("parent")
     return out
 
@@ -623,6 +636,122 @@ def houdini(
 
 
 # ---------------------------------------------------------------------------
+# No-harm check
+# ---------------------------------------------------------------------------
+
+# (scratch copy, function) -> run_wp_function's dict for every goal of the function
+FullWpRunner = Callable[[Path, str], dict]
+
+
+def _unproven_keys(result: dict) -> Counter[tuple[str, str]]:
+    return Counter(
+        (str(g.get("kind") or ""), re.sub(r"\s+", " ", str(g.get("annotation") or "")).strip())
+        for g in result.get("unproven_goals") or []
+    )
+
+
+def _usable(result: dict) -> bool:
+    return result.get("status") in ("all_proven", "unproven_goals_remain") and isinstance(
+        result.get("unproven_goals"), list
+    )
+
+
+def no_harm(
+    text: str,
+    function: str,
+    copy: Path,
+    proven: list[Candidate],
+    run_full: FullWpRunner,
+    max_runs: int = MAX_NO_HARM_RUNS,
+    deadline: float | None = None,
+) -> dict:
+    """
+    Proven seeds are true, but more hypotheses can make a solver miss a goal it proved without them
+    (measured: `c <= cols` on a nested fill loses a nonlinear `\\valid`). Compare the function's
+    unproven goals without seeds and with them; on a lost goal, try leaving out one seed of the
+    loop the goal sits in, and withhold every seed if nothing within `max_runs` restores it. Sets
+    `wp["withheld"]` on the seeds left out. A check that cannot run withholds nothing and says so.
+    """
+    summary: dict = {"status": "ok", "runs": [], "lost": [], "newly_proved": 0}
+
+    def out_of_time() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    def measure(kept: list[Candidate]) -> tuple[dict, dict[str, int]]:
+        seeded, lines, _ = insert_seeds(text, kept, path=copy.name)
+        copy.write_text(seeded, encoding="utf-8", newline="\n")
+        started = time.monotonic()
+        result = run_full(copy, function)
+        summary["runs"].append(
+            {
+                "seeds": [c.name for c in kept],
+                "seconds": round(time.monotonic() - started, 1),
+                "wp_status": result.get("status"),
+                "unproven": len(result.get("unproven_goals") or []),
+            }
+        )
+        return result, lines
+
+    def skip(reason: str) -> dict:
+        summary.update(status="skipped", reason=reason)
+        return summary
+
+    if out_of_time():
+        return skip("no time left")
+    base, _ = measure([])
+    if not _usable(base):
+        return skip(f"baseline WP run: {base.get('reason') or base.get('status')}")
+    before = _unproven_keys(base)
+    summary["baseline_unproven"] = sum(before.values())
+
+    def lost_goals(result: dict) -> list[dict]:
+        extra = _unproven_keys(result) - before
+        goals = []
+        for g in result.get("unproven_goals") or []:
+            key = (str(g.get("kind") or ""), re.sub(r"\s+", " ", str(g.get("annotation") or "")).strip())
+            if extra.get(key, 0) > 0:
+                extra[key] -= 1
+                goals.append({"kind": key[0], "annotation": key[1], "line": g.get("line")})
+        return goals
+
+    def withhold(seeds: list[Candidate], reason: str) -> None:
+        for seed in seeds:
+            seed.wp["withheld"] = reason
+
+    if out_of_time():
+        return skip("no time left after the baseline run")
+    full, lines = measure(proven)
+    if not _usable(full):
+        return skip(f"seeded WP run: {full.get('reason') or full.get('status')}")
+    lost = lost_goals(full)
+    summary["newly_proved"] = sum((before - _unproven_keys(full)).values())
+    if not lost:
+        return summary
+    summary["lost"] = lost
+    text_lost = "; ".join(f"{g['kind']} `{g['annotation']}`" for g in lost[:3])
+
+    # The loop a lost goal sits in: the seeded loop whose annotation is the last one above the goal.
+    suspects: list[Candidate] = []
+    for goal in lost:
+        above = [c for c in proven if isinstance(goal.get("line"), int) and lines.get(c.name, 0) < goal["line"]]
+        if above:
+            index = max(above, key=lambda c: lines[c.name]).loop_index
+            suspects += [c for c in proven if c.loop_index == index and c not in suspects]
+    for suspect in suspects:
+        if len(summary["runs"]) - 1 >= max_runs or out_of_time():
+            break
+        kept = [c for c in proven if c is not suspect]
+        trial, _ = measure(kept)
+        if _usable(trial) and not lost_goals(trial):
+            withhold([suspect], f"with it, WP no longer proves {text_lost}")
+            summary.update(status="one_withheld", newly_proved=sum((before - _unproven_keys(trial)).values()))
+            return summary
+    withhold(proven, f"with the seeds, WP no longer proves {text_lost}, and leaving one out did not restore it")
+    summary.update(status="all_withheld", newly_proved=0)
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Corpus filter
 # ---------------------------------------------------------------------------
 
@@ -772,6 +901,31 @@ def default_wp_runner(orig_file: Path, cppflags: str, out_dir: Path, deadline: f
     return _run
 
 
+def default_full_runner(orig_file: Path, cppflags: str, out_dir: Path, deadline: float | None) -> FullWpRunner:
+    """Every goal of the function, at run_wp_function's own goal timeout (what the prover's run uses)."""
+    import run_wp_function
+
+    def _run(copy: Path, function: str) -> dict:
+        wall = run_wp_function.default_wall_timeout(None)
+        if deadline is not None:
+            left = max(1, int(deadline - time.monotonic()))
+            wall = min(wall, left) if wall else left
+        return run_wp_function.run_wp_on_function(
+            c_file=copy,
+            fn_name=function,
+            out_dir=out_dir,
+            cppflags=_with_include(orig_file.parent, cppflags),
+            warn_unsigned_downcast=False,
+            retry_bitwise=False,
+            retry_tail=False,
+            retry_cast_probe=False,
+            wall_timeout=wall,
+            ignore_prover_budget=True,
+        )
+
+    return _run
+
+
 def default_guard_runner(
     orig_file: Path,
     sources: list[str],
@@ -828,6 +982,8 @@ def default_guard_runner(
 
 def _label(seed: Candidate, proven: set[str]) -> str:
     if seed.wp.get("verdict") == "proven":
+        if seed.wp.get("withheld"):
+            return "proven_withheld"
         return "redundant" if seed.weaker_of in proven else "proven_inductive"
     if seed.wp.get("verdict") == "dropped" and seed.corpus.get("verdict") == "held":
         return "held_on_corpus_unproven"
@@ -862,6 +1018,7 @@ def compute(
     module: str | None = None,
     corpus_dir: Path | None = None,
     deadline: float | None = None,
+    run_full: FullWpRunner | None = None,
 ) -> dict:
     """The seeds report of one function. Never raises on a tool problem: `status` carries it."""
     shown_file = c_file.as_posix()
@@ -902,6 +1059,15 @@ def compute(
         report["corpus"] = corpus_filter(text, function, copy, dropped, run_guard, corpus_dir, deadline=deadline)
 
     proven = {c.predicate for c in candidates if c.wp.get("verdict") == "proven"}
+    pasted = [
+        c for c in candidates if c.wp.get("verdict") == "proven" and (c.weaker_of is None or c.weaker_of not in proven)
+    ]
+    if not pasted:
+        report["no_harm"] = {"status": "not_needed", "runs": []}
+    elif run_full is None:
+        report["no_harm"] = {"status": "skipped", "reason": "no full WP runner given", "runs": []}
+    else:
+        report["no_harm"] = no_harm(text, function, copy, pasted, run_full, deadline=deadline)
     for cand in candidates:
         report["candidates"].append(
             {
@@ -953,6 +1119,19 @@ def render(report: dict) -> str:
         "hints: WP stays the only judge, and none of them is a reason to add or strengthen a `requires`.",
         "",
     ]
+    check = report.get("no_harm") or {}
+    if check.get("status") == "ok":
+        lines += [
+            f"Checked on every goal of `{function}`: with the proven seeds pasted, WP loses no goal it proved "
+            f"without them and proves {check.get('newly_proved', 0)} more.",
+            "",
+        ]
+    elif check.get("status") == "skipped":
+        lines += [
+            f"The proven seeds were not checked against the function's other goals ({check.get('reason')}): "
+            "if a goal that proved before stops proving after you paste them, remove them.",
+            "",
+        ]
     headers = {lp.get("index"): lp for lp in report.get("loops") or []}
     for index in dict.fromkeys(c["loop_index"] for c in candidates):
         group = [c for c in candidates if c["loop_index"] == index]
@@ -963,6 +1142,7 @@ def render(report: dict) -> str:
         held = [c for c in group if c["label"] == "held_on_corpus_unproven"]
         undecided = [c for c in group if c["label"] == "undecided"]
         dropped = [c for c in group if c["label"] == "dropped"]
+        withheld = [c for c in group if c["label"] == "proven_withheld"]
         if proven:
             lines.append(
                 "**Proven inductive under the current contract and loop annotations** (paste into this loop's "
@@ -979,6 +1159,14 @@ def render(report: dict) -> str:
             lines.append("")
             for c in held:
                 lines.append(f"- `loop invariant {c['name']}: {c['predicate']};` WP: {_failure_text(c['wp'])}.")
+            lines.append("")
+        if withheld:
+            lines.append(
+                "**Proven, but withheld** (true, yet with them in the annotation WP lost a goal it proves "
+                "without them; do not paste them unless a goal needs one):"
+            )
+            lines.append("")
+            lines += [f"- `{c['predicate']}`: {c['wp'].get('withheld')}." for c in withheld]
             lines.append("")
         if undecided:
             lines.append("**Not decided** (the WP filter did not finish; treat as unknown):")
@@ -1064,6 +1252,7 @@ def run(
             module=module,
             corpus_dir=corpus_dir,
             deadline=deadline,
+            run_full=default_full_runner(c_file, cppflags, tmp / "wp_full", deadline),
         )
     except Exception as exc:  # hints only: no failure of this tool may stop a prover
         return _base_report(function, shown_file, module, "error", f"{type(exc).__name__}: {exc}")

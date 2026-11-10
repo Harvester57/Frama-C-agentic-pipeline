@@ -492,6 +492,13 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - **Cause:** `resources.infer_class` had no pattern for `loop_seeds.py`, so the command got the `light` class (1 CPU, 1024 MB), below what its WP rounds need.
 - **Fix:** [`../scripts/resources.py`](../scripts/resources.py) maps `loop_seeds.py` to the `guardrail` class. Test: `tests/test_resources.py::test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name`.
 
+### Symptom: Pasting Proven Loop Seeds Makes a Previously Proved Goal Time Out (Nested Loop)
+- **Fixed pipeline bug** (branch `papers-generalization`, uncommitted, 2026-11-10). Seen on a toy benchmark of `scripts/loop_seeds.py` in `framac-analysis:latest`, no target run. Only reachable with `FRAMAC_LOOP_SEEDS=on` (default off).
+- **Seen on:** function `fill` (two nested loops writing `m[r * cols + c]`): 12 of 13 goals proved before seeding, 15 of 17 after, and `\valid(m + (size_t)((size_t)(r * cols) + c))` went from proved to unproven at a 10 s goal timeout.
+- **Cause:** the seeds are proven, so the goal is not false: the solver misses a nonlinear goal once more hypotheses are in context. Measured by running WP on `fill` with seed subsets: no seed 12/13; `c <= cols` alone on the inner loop loses the goal; `r <= rows` alone on the outer loop loses it and an assigns goal; `r < rows` alone on the inner loop keeps everything and is fast. The tool only checked that each seed proves, never what pasting them does to the function's other goals. (The first report of a duplicate `r <= rows` was wrong: it was the outer loop's seed and its restatement in the inner loop, redundant next to the inner `r < rows`.)
+- **Fix:** [`../scripts/loop_seeds.py`](../scripts/loop_seeds.py) `no_harm`: after Houdini, one full WP run of the function without seeds and one with the proven seeds; if a goal is lost, it leaves out one seed of the loop the goal sits in (at most `MAX_NO_HARM_RUNS` seeded runs) and otherwise withholds every seed, printed as "Proven, but withheld". A check that cannot run withholds nothing and the report says the seeds were not checked. The restated outer bound is no longer generated when the strict outer guard is. On the rerun `fill` is back to 12/13 with all three seeds withheld; the other ten functions are unchanged.
+- **Cost, and a limit:** the check adds two full WP runs per function with seeds: on the eleven toy functions the tool's total went from 45 s to 483 s. Leave-one-out did not find the one helpful subset for `fill` (`r < rows` alone), so the fallback loses that hint.
+
 ---
 
 ## Resources, Caches and Scheduling
