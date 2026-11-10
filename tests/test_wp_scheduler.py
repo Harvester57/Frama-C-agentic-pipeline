@@ -2013,7 +2013,8 @@ def test_callee_history_prefers_the_newest_agent_across_prove_and_negotiate(run_
     state["agents"]["negotiate-g-3"] = neg["id"]
     _write_candidates_state(run_dir, "prove-g", "g")
     _write_candidates_state(run_dir, "negotiate-g-2", "g")
-    assert S._callee_history(state, neg)["agent_id"] == "negotiate-g-2"
+    history = S._callee_history(state, neg)
+    assert history is not None and history["agent_id"] == "negotiate-g-2"
 
 
 def test_negotiate_evidence_caps_goals_and_finds_the_callee_by_name(run_dir, monkeypatch):

@@ -620,7 +620,8 @@ def test_cache_partition_prefers_the_repo_key(monkeypatch):
     assert R.cache_partition() == "libssh2-0123456789ab"
     assert R.cache_volume_name(R.cache_partition()) == "framac-cache-libssh2-0123456789ab"
     monkeypatch.setenv("FRAMAC_REPO_KEY", "../escape")
-    assert R.cache_partition() is not None and "/" not in R.cache_partition()
+    partition = R.cache_partition()
+    assert partition is not None and "/" not in partition
 
 
 def test_cache_volume_wanted_where_a_bind_mount_is_slow_or_wrong():

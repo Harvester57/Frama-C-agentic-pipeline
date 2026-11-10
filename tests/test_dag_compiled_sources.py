@@ -106,7 +106,7 @@ def _capture(getopt: dict, prog_defines: list[str] | None = None, **prog: object
 
 
 # The wrapper elided (glibc has getopt): an empty object, both probes ran.
-ELIDED = {"headers": [], "defined_functions": [], "probe_errors": {}}
+ELIDED: dict[str, object] = {"headers": [], "defined_functions": [], "probe_errors": {}}
 # The wrapper included lib/getopt.c (a libc without getopt): `cc -M` lists it, nm sees getopt_long.
 INCLUDED = {
     "headers": ["lib/getopt.c"],
@@ -265,7 +265,7 @@ def test_the_ledger_and_the_report_show_the_mark(target: Path) -> None:
 
     dag = bcd.build_dag(target, _model(), _capture(ELIDED))
     assert "model_only" in ledger.SEED_BOOKKEEPING
-    units = [
+    units: list[dict] = [
         {"file": "lib/getopt.c", "function": "getopt_long", "bookkeeping": {"model_only": "not compiled"}},
         {"file": "prog.c", "function": "main"},
     ]

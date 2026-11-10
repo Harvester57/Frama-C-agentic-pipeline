@@ -1616,7 +1616,7 @@ def test_first_error_skips_warnings_and_wrap_ups_for_the_line_that_explains_the_
     path = tmp_path / "fuzz_m.compile.log"
     path.write_text(log, encoding="utf-8")
     first = pm._first_build_error(path)
-    assert first.startswith(start), first
+    assert first is not None and first.startswith(start), first
     assert "deprecated alias" not in first and "DWARF" not in first
     assert ("lack of memory" in first) == start.startswith("e-acsl-gcc")
 

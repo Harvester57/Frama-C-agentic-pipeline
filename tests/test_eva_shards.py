@@ -149,7 +149,8 @@ def _sharded_run(tmp_path: Path, cases: int = 4, guards: bool = True) -> Path:
     sidecars["snmp"]["entry_style"] = "dispatch"
     sidecars["snmp"]["dispatch_cases"] = [f"snmp_call_{k}(fuzz_buf, fuzz_len);" for k in range(cases)]
     run = _make_run(tmp_path, sidecars=sidecars)
-    body = _build_dispatch_invocation(sidecars["snmp"]["dispatch_cases"]) if guards else "case 0U: {}"
+    cases_list: list[str] = sidecars["snmp"]["dispatch_cases"]  # type: ignore[assignment]
+    body = _build_dispatch_invocation(cases_list) if guards else "case 0U: {}"
     (run / pm.HARNESS_DIR / "harness_snmp.c").write_text(body + "\n", encoding="utf-8")
     return run
 
@@ -456,4 +457,4 @@ def test_flows_merge_as_hints_over_the_shards():
     assert "h" in merged["by_function"] and merged["call_edges"]["f"] == ["g", "k"]
     assert merged["status"] == "ok"
     assert es.merge_flows([a, {"status": "timeout", "reason": "flows timed out"}])["status"] == "partial"
-    assert es.merge_flows([None, None])["status"] == "not_run"
+    assert es.merge_flows([None, None])["status"] == "not_run"  # type: ignore[list-item]

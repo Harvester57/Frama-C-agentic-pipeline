@@ -406,11 +406,12 @@ def test_every_framac_parse_runs_the_preprocessor_under_the_wrapper(monkeypatch)
 @pytest.mark.unit
 def test_the_eacsl_frontend_runs_under_the_wrapper_and_the_backend_does_not(monkeypatch, tmp_path):
     asked: list[Path] = []
-    monkeypatch.setattr(
-        eacsl_toolchain,
-        "framac_cpp_wrapper",
-        lambda path: asked.append(path) or "/opt/framac-pipeline/scripts/fc_cpp_wrapper_eacsl.py",
-    )
+
+    def wrapper(path: Path) -> str:
+        asked.append(path)
+        return "/opt/framac-pipeline/scripts/fc_cpp_wrapper_eacsl.py"
+
+    monkeypatch.setattr(eacsl_toolchain, "framac_cpp_wrapper", wrapper)
     flags = eacsl_toolchain.build_eacsl_flag_sets("-Isrc -std=gnu99", fc_stubs=tmp_path)
     front, back = flags["frontend"].split(), flags["backend"].split()
     assert front[:2] == ["-D__FRAMAC_EACSL__", "-D_Float128=double"]
