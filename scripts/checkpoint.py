@@ -6,6 +6,8 @@ Stores state in <state-dir>/progress.json and phase/wave payload files.
 `status` is running | complete, or a blocking status a step records when the run must stop and wait
 for the user, with the details under `blocked`:
   - `needs_build_recipe`: build_capture.py, when the target does not build (report path, first error);
+  - `unsupported_architecture`: build_capture.py, when the host or what the build produced is not x86_64
+    Linux (report path, first error);
   - `no_unit_parsed`: phase0_model.py, when Frama-C parses none of the units (report path, and each
     unit's first Frama-C error under `units`).
 `blocked.resume_at` names the step a resumed run restarts at. `phase_done` is not advanced by a blocked
@@ -135,14 +137,15 @@ def _new_progress(target_dir: str = "/target", mode: str = "verify") -> dict:
 # Blocking statuses -> the step (and its command) a resumed run restarts at.
 BLOCKING_STEPS = {
     "needs_build_recipe": "build_capture.py run",
+    "unsupported_architecture": "build_capture.py run",
     "no_unit_parsed": "phase0_model.py run",
 }
 
 
 def mark_blocked(state_dir: Path, status: str, detail: dict) -> dict:
     """
-    Record that the run stopped and waits for the user (`needs_build_recipe` from the build capture,
-    `no_unit_parsed` from the model). `phase_done` is unchanged, so a resumed run starts again at the
+    Record that the run stopped and waits for the user (`needs_build_recipe` and
+    `unsupported_architecture` from the build capture, `no_unit_parsed` from the model). `phase_done` is unchanged, so a resumed run starts again at the
     step that stopped (`blocked.resume_at`).
     """
     state_dir.mkdir(parents=True, exist_ok=True)

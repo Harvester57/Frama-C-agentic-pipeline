@@ -95,6 +95,15 @@ Phase 0 needs the target's own build: what it compiles, links and exports. A tar
 
    Ask for a corrected command, packages or flags, record them with `set-build`, and run the capture again. A successful capture clears the status, and Phase 0 continues.
 
+4. **Unsupported architecture.** x86_64 Linux is the only supported platform. Exit code 5 and `"status": "unsupported_architecture"` mean the capture stopped on its architecture guard. The checkpoint records the same status. There are two cases, and `diagnostics.instructions` says what to do in each:
+   - **The host is not x86_64** (`architecture.host`, checked before the build). Nothing in the recipe changes this: tell the user the run needs an x86_64 machine. Emulation as `linux/amd64` is not tested and not supported.
+   - **The build produced other code than x86_64** (`architecture.unsupported`, checked after the build and before anything is derived from it). Each entry names the file, its sources, what the file is (`ELF32 i386`, `ELF64 aarch64`) and what in the command line made it so (`-m32`, `-mx32`, `--target=`, a cross compiler). Show the user the entries and ask for a native recipe:
+     - without `-m32`, `-mx32` or `-m16`;
+     - without the cross toolchain (`CC=<triple>-gcc`, `--host=`, `CMAKE_TOOLCHAIN_FILE`);
+     - naming only the native make targets, when only some outputs are foreign.
+
+   Record the recipe with `set-build` and run the capture again. Never drop a flag on your own: the user confirms the recipe. Tell the user that the run then covers the x86_64 build only, so behaviour that exists only with 32-bit `long`, `size_t` and pointers is not analysed. A target that builds for another architecture only (firmware, a Windows or macOS build) is out of scope: stop the run and say so.
+
 ### Step 1c — Frama-C Model
 
 Parse every non-test link unit of the capture with Frama-C, on the same scratch volume, in the analysis image:
