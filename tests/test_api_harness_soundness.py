@@ -577,6 +577,9 @@ def _handle_api() -> tuple[ah.ApiInfo, dict[str, dict]]:
     assert returns == {"seccomp_init": CTX}
     assert ctors == {CTX: "seccomp_init"} and dtors == {CTX: "seccomp_release"}
     assert handles["export_mem"] == {0: CTX}
+    # A variadic function: the header declares one parameter fewer than the model lists.
+    variadic = {**recs, "seccomp_load": rec("seccomp_load", "int(void *,void **)", "pointer", "pointer")}
+    assert ah.handle_functions(variadic, declared)[0]["seccomp_load"] == {0: CTX}
     api = ah.ApiInfo(
         probed=True,
         records=ctor_records,

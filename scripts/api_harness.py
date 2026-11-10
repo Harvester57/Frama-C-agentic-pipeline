@@ -632,7 +632,8 @@ def handle_functions(
     for name, rec in by_name.items():
         proto = protos.get(name)
         params, _ = plan_params(str(rec.get("signature") or ""))
-        if not isinstance(proto, dict) or params is None or len(params) != len(proto.get("params") or []):
+        # A variadic declaration names fewer parameters than the model, which adds one for the rest.
+        if not isinstance(proto, dict) or params is None or len(proto.get("params") or []) > len(params):
             continue
         mine = {i: t for i, t in enumerate(proto["params"]) if t and params[i]["kind"] == "ptr"}
         if mine:
