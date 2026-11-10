@@ -229,7 +229,9 @@ def _eacsl_string_block() -> str:
 def test_eacsl_builds_define_libc_s_string_names_and_nothing_else():
     block = _eacsl_string_block()
     defined = set(re.findall(r"predicate (\w+)\(", block))
-    assert defined == set(STRINGS)
+    # Plus the private helpers that keep one predicate call after each quantifier guard
+    # (E-ACSL 35 drops the first conjunct of `\exists i; guard && P && Q`).
+    assert defined - {"__fc_eacsl_read_nul_at", "__fc_eacsl_nul_at"} == set(STRINGS)
     assert "valid_nstring" not in (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
     # libc semantics: n readable initialized bytes, or a shorter string.
     nstring = block.split("predicate valid_read_nstring", 1)[1].split("predicate", 1)[0]

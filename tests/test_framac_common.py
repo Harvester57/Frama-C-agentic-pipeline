@@ -1,3 +1,4 @@
+import re
 import shlex
 
 import pytest
@@ -393,17 +394,17 @@ def test_fc_compat_types_guards_and_float_fallbacks():
 def test_bsd_string_contracts_include_from_dependencies():
     from conftest import ROOT
 
-    bsd_path = ROOT / "templates" / "fc_stubs" / "bsd" / "string.h"
-    assert bsd_path.is_file()
-    text = bsd_path.read_text(encoding="utf-8")
-
-    # strlcpy contract checks
-    assert "assigns dst[0 .. size - 1] \\from src[0 .. size - 1], size;" in text
-    assert "assigns \\result \\from src[0 .. size - 1], size;" in text
-
-    # strlcat contract checks
-    assert "assigns dst[0 .. size - 1] \\from dst[0 .. size - 1], src[0 .. size - 1], size;" in text
-    assert "assigns \\result \\from dst[0 .. size - 1], src[0 .. size - 1], size;" in text
+    stubs = ROOT / "templates" / "fc_stubs"
+    # strlcpy / strlcat live in fc_strlcpy.h (shared with fc_compat_types.h); strnstr in bsd/string.h.
+    for rel in ("fc_strlcpy.h", "bsd/string.h"):
+        text = (stubs / rel).read_text(encoding="utf-8")
+        acsl = "".join(re.findall(r"/\*@.*?\*/", text, re.S))
+        clauses = re.findall(r"\bassigns\b[^;]*;", acsl)
+        assert clauses, rel
+        for clause in clauses:
+            assert "\\from" in clause or "\\nothing" in clause, (rel, clause)
+    text = (stubs / "fc_strlcpy.h").read_text(encoding="utf-8")
+    assert "assigns \\result \\from indirect:src[0 .. strlen(src)];" in text
 
 
 @pytest.mark.parametrize(

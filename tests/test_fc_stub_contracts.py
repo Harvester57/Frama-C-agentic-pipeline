@@ -21,50 +21,9 @@ pytestmark = pytest.mark.unit
 FC_STUBS = Path(__file__).resolve().parent.parent / "templates" / "fc_stubs"
 
 # (header path relative to templates/fc_stubs, function name) of every prototype that has no contract
-# with an `assigns` clause today. It may only shrink: the test fails when an entry gains a contract or
-# disappears. Step S4 of docs/templates-and-stubs-improvement-plan.md empties it.
-MISSING_CONTRACT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
-    ("json-c/json.h", name)
-    for name in (
-        "json_tokener_parse",
-        "json_object_from_file",
-        "json_object_from_fd",
-        "json_object_to_file",
-        "json_object_to_file_ext",
-        "json_object_to_json_string",
-        "json_object_to_json_string_ext",
-        "json_object_get",
-        "json_object_put",
-        "json_object_is_type",
-        "json_object_get_type",
-        "json_object_new_object",
-        "json_object_object_length",
-        "json_object_object_add",
-        "json_object_object_del",
-        "json_object_object_get",
-        "json_object_object_get_ex",
-        "json_object_new_array",
-        "json_object_new_array_ext",
-        "json_object_array_length",
-        "json_object_array_add",
-        "json_object_array_put_idx",
-        "json_object_array_get_idx",
-        "json_object_new_boolean",
-        "json_object_get_boolean",
-        "json_object_new_int",
-        "json_object_new_int64",
-        "json_object_new_uint64",
-        "json_object_get_int",
-        "json_object_get_int64",
-        "json_object_get_uint64",
-        "json_object_new_double",
-        "json_object_get_double",
-        "json_object_new_string",
-        "json_object_new_string_len",
-        "json_object_get_string",
-        "json_object_get_string_len",
-    )
-)
+# with an `assigns` clause. Step S4 of docs/templates-and-stubs-improvement-plan.md emptied it; keep it
+# empty: write the contract instead of adding an entry.
+MISSING_CONTRACT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _ASSIGNS_RE = re.compile(r"(?<![A-Za-z0-9_])assigns\b")
@@ -288,11 +247,13 @@ int in_linkage(void);
 def test_parser_finds_the_known_shipped_prototypes() -> None:
     seen, _ = _missing_contracts()
     for key in (
-        ("bsd/string.h", "strlcpy"),
-        ("bsd/string.h", "strlcat"),
+        ("fc_strlcpy.h", "strlcpy"),
+        ("fc_strlcpy.h", "strlcat"),
         ("bsd/string.h", "strnstr"),
         ("fc_compat_types.h", "abs"),
         ("fc_compat_types.h", "getsockopt"),
+        ("fc_compat_types.h", "getopt"),
+        ("json-c/json.h", "json_tokener_parse_ex"),
         ("json-c/json.h", "json_tokener_parse"),
     ):
         assert key in seen, f"parser lost {key}"
