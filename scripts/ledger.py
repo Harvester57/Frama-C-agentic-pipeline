@@ -28,7 +28,11 @@ Units are function x obligation class (docs/v2-design.md, Section 5). The securi
 from scripts/security_props.py (step I9) when its report exists: l3_frame for every function writing
 through a pointer, and one class per MetAcsl property kind (l4_auth_state, l4_auth_required,
 l5_sanitized, l6_wiped, l6_no_leak) on the functions holding its generated annotations; each such unit
-names the properties it must discharge under `bookkeeping.security_properties`. Every write
+names the properties it must discharge under `bookkeeping.security_properties`. An obligation
+security_props.py decided from the model (plan step M2) is recorded under
+`bookkeeping.decided_properties` at seed time: a violation blocks the unit, and a unit whose every
+property was decided satisfied is covered by evidence of phase `static`. `ingest-wp` also credits an
+L4-L6 unit whose properties MetAcsl loaded and decided statically (no goal left). Every write
 is validated against schemas/ before it is committed atomically; an invalid
 result is never written. Every read-modify-write holds the run-wide `ledger` lock
 (framac_common.run_lock), so concurrent containers of one run never lose updates.
@@ -89,6 +93,11 @@ LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame"}
 # Step I9: classes keyed to the MetAcsl properties of scripts/security_props.py.
 SECURITY_CLASSES = ("l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
 DEFAULT_SECURITY_PROPS = Path("workspace/reports/security_props.json")
+METACSL_CLASSES = ("l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
+# Plan step M2: obligations security_props.py decided from the model, recorded at seed time as
+# evidence of this phase. A seed refresh re-derives a unit whose only evidence is of this phase.
+DECIDED_VERDICTS = ("satisfied", "violated")
+STATIC_PHASE = "static"
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
 UNIT_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*$")
 FN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -362,6 +371,73 @@ HEADER_UNREACHED = "header_unreached: no entry point of the build reaches this h
 CALLGRAPH_FALLBACK = "callgraph_fallback"
 
 
+def _apply_decided(unit: dict, decided: list[dict], tool_output: str | None) -> None:
+    """
+    Record the security obligations security_props.py decided from the model (plan step M2: a text
+    sink handed string literals only) on a freshly derived unit: under `bookkeeping.decided_properties`,
+    and, for a planned unit, as its status. A violation blocks the unit; a unit whose every property
+    of its class was decided satisfied is covered by that decision (evidence phase `static`). A unit
+    that still has undecided properties stays planned for WP.
+    """
+    bk = unit.setdefault("bookkeeping", {})
+    bk["decided_properties"] = sorted(decided, key=lambda d: (d["property"], d["verdict"]))
+    if unit["status"] != "planned":
+        return
+    violated = [d for d in decided if d["verdict"] == "violated"]
+    if violated:
+        add_evidence(
+            unit,
+            STATIC_PHASE,
+            "security_props.py",
+            "decided_violated",
+            False,
+            tool_output,
+            f"Decided from the model: {violated[0]['property']} does not hold ({violated[0]['reason']})."[:400],
+        )
+        unit["status"] = "blocked"
+        unit["unresolved"] = list(
+            dict.fromkeys(f"{d['property']} violated (decided from the model): {d['reason']}"[:240] for d in violated)
+        )
+    elif not bk.get("security_properties"):
+        names = ", ".join(sorted({d["property"] for d in decided}))
+        add_evidence(
+            unit,
+            STATIC_PHASE,
+            "security_props.py",
+            "decided_syntactically",
+            True,
+            tool_output,
+            f"Decided from the model, no WP goal: {names} holds ({decided[0]['reason']})."[:400],
+        )
+        unit["status"] = "covered"
+
+
+def _decided_violation(unit: dict) -> bool:
+    """Whether security_props.py decided, from the model, that a property of this unit is violated."""
+    return any(d.get("verdict") == "violated" for d in (unit.get("bookkeeping") or {}).get("decided_properties") or [])
+
+
+def _decided_only(unit: dict) -> bool:
+    """Whether every property of this unit was decided from the model: no WP goal is generated for it."""
+    bk = unit.get("bookkeeping") or {}
+    return bool(bk.get("decided_properties")) and not bk.get("security_properties")
+
+
+def _meta_decided_statically(unit: dict, report: dict) -> bool:
+    """
+    Whether a WP run that ended `all_proven` with no goal of an L4-L6 unit's class decided it: MetAcsl
+    loaded every property the unit must discharge (`security_props.properties` of the report) and its
+    simplification (-meta-simpl, the default) dropped each instance in the function as obviously true
+    (a global separated from the secret, a write of a local). Without a loaded property, an error
+    loading them, or no property named on the unit, nothing was decided.
+    """
+    sp = report.get("security_props")
+    names = set((unit.get("bookkeeping") or {}).get("security_properties") or [])
+    if not isinstance(sp, dict) or sp.get("error") or not names:
+        return False
+    return names <= {str(n) for n in sp.get("properties") or []}
+
+
 def _load_security_obligations(path: Path | None) -> tuple[dict[str, list[dict]] | None, str]:
     """security_props.py's obligations per `file#name`, and a status (`ok`, `absent`, `invalid`)."""
     path = path or DEFAULT_SECURITY_PROPS
@@ -380,12 +456,14 @@ def _derive_units(
     callgraph_source: str,
     profile: str | None,
     obligations: dict[str, list[dict]] | None,
+    sec_props_output: str | None = None,
 ) -> tuple[dict[str, dict], dict[str, str], list[str], set[str], set[tuple[str, str]]]:
     """
     Every unit the DAG derives, whatever the ledger already holds: coverage id -> unit; the ids
     deferred for an unreached header (`unreached`) or the GCC fallback (`fallback`); the names
     skipped as unsupported; the functions security_props.py's obligations matched; and the DAG's
-    (file, name) pairs.
+    (file, name) pairs. `sec_props_output` is the security_props.json the decided obligations
+    (plan step M2) cite as their evidence.
     """
     modules = dag.get("modules", {})
     # With link units (step I5b) each function has its own tier (scripts/tiers.py, step I8).
@@ -424,12 +502,22 @@ def _derive_units(
             if cls and cls not in [c for c, _ in classes]:
                 classes.append((cls, prop.get("reason", "")))
         sec_names: dict[str, list[str]] = {}
+        sec_decided: dict[str, list[dict]] = {}
         for ob in (obligations or {}).get(f"{file}#{name}") or []:
             cls = ob.get("class")
             if cls not in SECURITY_CLASSES:
                 continue
             sec_matched.add(f"{file}#{name}")
-            sec_names.setdefault(cls, []).append(str(ob.get("property")))
+            if ob.get("decided") in DECIDED_VERDICTS:
+                sec_decided.setdefault(cls, []).append(
+                    {
+                        "property": str(ob.get("property")),
+                        "verdict": ob["decided"],
+                        "reason": str(ob.get("decided_reason") or ob["decided"]),
+                    }
+                )
+            else:
+                sec_names.setdefault(cls, []).append(str(ob.get("property")))
             if cls not in [c for c, _ in classes]:
                 classes.append((cls, str(ob.get("reason") or "")))
 
@@ -508,6 +596,8 @@ def _derive_units(
                 tags[cid] = "unreached"
             if sec_names.get(cls):
                 unit.setdefault("bookkeeping", {})["security_properties"] = sorted(set(sec_names[cls]))
+            if sec_decided.get(cls):
+                _apply_decided(unit, sec_decided[cls], sec_props_output)
             if fn.get("callgraph_fallback"):
                 unit.setdefault("bookkeeping", {})["callgraph_fallback"] = fn["callgraph_fallback"]
             if concurrent:
@@ -529,11 +619,13 @@ def _derive_units(
     return derived, tags, skipped, sec_matched, dag_fns
 
 
-# What `seed --refresh` may re-derive: a unit in one of these statuses that carries no evidence.
+# What `seed --refresh` may re-derive: a unit in one of these statuses that carries no evidence, or
+# one whose only evidence is the seed's own decision from the model (phase `static`, plan step M2).
 REFRESHABLE = frozenset({"planned", "deferred", "out_of_scope"})
 # The bookkeeping keys the seed writes (a refresh replaces them; any other key is kept).
 SEED_BOOKKEEPING = (
     "security_properties",
+    "decided_properties",
     "callgraph_fallback",
     "concurrent",
     "model_only",
@@ -547,9 +639,12 @@ REFRESH_LIST_MAX = 50
 
 
 def _has_evidence(unit: dict) -> bool:
-    """Whether a phase has worked on the unit: what `seed --refresh` never rewrites."""
+    """
+    Whether a phase has worked on the unit: what `seed --refresh` never rewrites. The seed's own
+    decisions from the model (evidence phase `static`) do not count: a refresh decides again.
+    """
     return bool(
-        unit.get("evidence")
+        any(e.get("phase") != STATIC_PHASE for e in unit.get("evidence") or [])
         or unit.get("result_fingerprints")
         or unit.get("attempts")
         or unit.get("assumptions")
@@ -567,6 +662,8 @@ def _rederived(unit: dict, new: dict | None, reason: str) -> dict:
         return out
     for key in ("module", "tier", "wave", "callgraph_source", "status", "unresolved", "agent_id"):
         out[key] = copy.deepcopy(new[key])
+    # Only reached without evidence of a phase (_has_evidence): the seed's decisions follow the model.
+    out["evidence"] = copy.deepcopy(new.get("evidence") or [])
     if "inference_reason" in new:
         out["inference_reason"] = new["inference_reason"]
     else:
@@ -598,7 +695,8 @@ def _refresh_units(
         target = _rederived(unit, new, reason)
         if target == unit:
             continue
-        if unit["status"] not in REFRESHABLE or _has_evidence(unit):
+        seed_decided = bool(unit.get("evidence")) and not _has_evidence(unit)
+        if (unit["status"] not in REFRESHABLE and not seed_decided) or _has_evidence(unit):
             changed["kept_with_evidence"].append(cid)
             continue
         units[cid] = target
@@ -628,7 +726,7 @@ def cmd_seed(
     units, candidates = load_state()
     obligations, sec_status = _load_security_obligations(security_props)
     derived, tags, skipped, sec_matched, dag_fns = _derive_units(
-        dag, dag_path, scope, callgraph_source, profile, obligations
+        dag, dag_path, scope, callgraph_source, profile, obligations, rel(str(security_props or DEFAULT_SECURITY_PROPS))
     )
     added = [cid for cid in sorted(derived) if cid not in units]
     for cid in added:
@@ -1570,6 +1668,21 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     "WP result recorded on a unit with an open candidate; candidate verdict takes precedence.",
                 )
                 continue
+            if _decided_violation(u):
+                # Decided from the model (plan step M2): no WP result outweighs the literal it was shown.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    f"wp_{report['status']}",
+                    False,
+                    tool_output,
+                    "WP result recorded on a unit decided violated from the model; not credited.",
+                )
+                continue
+            if _decided_only(u):
+                # Every property of the unit was decided from the model: WP has no goal of it to report.
+                continue
             cls = u["obligation_class"]
             counts = by_class.get(cls)
             if counts and counts.get("unproven", 0) > 0:
@@ -1670,6 +1783,26 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                         "other",
                         f"WP run with reduced RTE check flags: {', '.join(soundness['reduced_checks'])}.",
                     )
+                u["status"] = "covered"
+                u["unresolved"] = []
+                credited.add(u["coverage_id"])
+                stats["covered"] += 1
+            elif cls in METACSL_CLASSES and all_proven and not counts and _meta_decided_statically(u, report):
+                # MetAcsl's -meta-simpl drops an instance it decides statically: no goal is left, the
+                # property still holds in this function (docs/troubleshooting.md, M1 of the templates plan).
+                names = ", ".join(sorted((u.get("bookkeeping") or {}).get("security_properties") or []))
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_meta_simplified",
+                    True,
+                    tool_output,
+                    f"MetAcsl loaded {names} and decided every instance in this function statically "
+                    f"(no {cls} goal left); WP soundness passed.",
+                    details={"limits": limits},
+                )
+                add_wp_limit_assumptions(u, limits, report["function"])
                 u["status"] = "covered"
                 u["unresolved"] = []
                 credited.add(u["coverage_id"])

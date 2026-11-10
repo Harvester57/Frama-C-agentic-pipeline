@@ -563,11 +563,19 @@ def render_report(data: dict) -> str:
         if u not in wp_units
         and any(e.get("phase") == "eva" and e.get("discharging", True) for e in u.get("evidence", []))
     ]
-    other_covered = len(covered) - len(wp_units) - len(eva_units)
-    if other_covered:
-        proof_breakdown = f" ({len(wp_units)} proven by WP, {len(eva_units)} discharged by Eva, {other_covered} other)"
-    else:
-        proof_breakdown = f" ({len(wp_units)} proven by WP, {len(eva_units)} discharged by Eva)"
+    # Security obligations security_props.py decided from the model (a sink handed string literals).
+    static_units = [
+        u
+        for u in covered
+        if u not in wp_units
+        and u not in eva_units
+        and any(e.get("phase") == "static" and e.get("discharging") for e in u.get("evidence", []))
+    ]
+    other_covered = len(covered) - len(wp_units) - len(eva_units) - len(static_units)
+    proof_breakdown = f" ({len(wp_units)} proven by WP, {len(eva_units)} discharged by Eva"
+    if static_units:
+        proof_breakdown += f", {len(static_units)} decided from the model"
+    proof_breakdown += f", {other_covered} other)" if other_covered else ")"
 
     out += [
         f"- **Confirmed findings:** {len(confirmed)}"

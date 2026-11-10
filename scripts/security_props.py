@@ -23,7 +23,9 @@ search order, with a warning). It writes security_props.json
   L5  each output sink: L5_sanitized_<sink>, an assertion at every call of the sink (\\calling, so it
       also holds for a sink the target only declares) that its writers (callers) discharge - no CR/LF
       in text handed to a log or terminal sink, initialized bytes handed to the others - or, for a
-      `buffer` sink, initialized out-parameters when it returns (\\postcond);
+      `buffer` sink, initialized out-parameters when it returns (\\postcond). A caller that hands a
+      text sink string literals only is decided from the model's call sites instead (plan step M2):
+      no goal, the property's `decided` and the obligation's `decided` record the verdict;
   L6  each secret:
         L6_wiped_<secret>    zero when its release function (the secret's `function`) returns;
         L6_no_leak_<secret>  never passed to a sink, never read by a sink the target defines.
@@ -193,6 +195,13 @@ class _Model:
         self.features = model_features(model)
         self.has_writes = self.features["writes"]
 
+    def call_sites(self, fid: str, callee: str) -> list[dict] | None:
+        """The calls of `callee` in `fid` with their literal arguments; None when the model recorded none."""
+        sites = self.functions[fid].get("call_sites")
+        if not isinstance(sites, list):
+            return None
+        return [s for s in sites if isinstance(s, dict) and s.get("callee") == callee]
+
     def resolve(self, ref: str) -> list[str]:
         if "#" in ref:
             return [ref] if ref in self.functions else []
@@ -261,6 +270,12 @@ def _ident(text: str) -> str:
     return re.sub(r"\W", "_", text)
 
 
+def _has_crlf(text: str) -> bool:
+    """Whether a C string holds CR or LF before its terminating NUL (what L5_no_crlf forbids)."""
+    head = text.split("\0", 1)[0]
+    return "\r" in head or "\n" in head
+
+
 def _formalize(expr: str, formals: set[str]) -> str:
     """`n * 2` -> `\\formal(n) * 2` for the function's parameter names (MetAcsl's way to name them)."""
     return _IDENT_RE.sub(lambda m: f"\\formal({m.group(0)})" if m.group(0) in formals else m.group(0), expr)
@@ -302,16 +317,19 @@ class _Gen:
 
     def _add(self, kind: str, name: str, acsl: str, instances: set[str], **extra: Any) -> dict:
         layer, cls = KINDS[kind]
+        decided = {f: d for f, d in (extra.pop("decided", None) or {}).items() if f in self.m.live}
         prop = {
             "name": name,
             "layer": layer,
             "kind": kind,
             "obligation_class": cls,
             "acsl": acsl,
-            "instances": sorted(f for f in instances if f in self.m.live),
+            "instances": sorted(f for f in instances if f in self.m.live and f not in decided),
             "sources": sorted(set(extra.pop("sources", []))),
             "notes": list(extra.pop("notes", [])),
         }
+        if decided:
+            prop["decided"] = [{"function": f, **decided[f]} for f in sorted(decided)]
         prop.update(extra)
         self.properties.append(prop)
         return prop
@@ -464,15 +482,90 @@ class _Gen:
                 instances = self.m.callers_of(sink)
                 if not instances:
                     notes.append(f"no project code calls {sink}: nothing to discharge in the target")
+            decided: dict[str, dict] = {}
+            if kind in TEXT_SINKS and not buffer:
+                decided = self._decide_text_literals(sink, params, formals, instances, notes)
             self._add(
                 "sanitized",
                 name,
                 acsl,
                 instances,
+                decided=decided,
                 notes=notes,
                 threat_model={"output_sink": sink, "kind": kind, "params": params},
                 targets=sink,
             )
+
+    def _literal_sites(self, fid: str, sink: str, indexes: list[int]) -> tuple[list[tuple[int, list[str]]], int] | None:
+        """
+        The calls of `sink` in `fid` whose arguments at `indexes` are all string literals, as (line,
+        texts), and how many calls pass something else there. None when the model recorded no call
+        sites (dump before schema 4) or none of this sink.
+        """
+        sites = self.m.call_sites(fid, sink)
+        if not sites:
+            return None
+        literal: list[tuple[int, list[str]]] = []
+        other = 0
+        for site in sites:
+            lits = site.get("literals") or {}
+            texts = [lits.get(str(i)) for i in indexes]
+            if all(isinstance(t, str) for t in texts):
+                literal.append((int(site.get("line") or 0), [str(t) for t in texts]))
+            else:
+                other += 1
+        return literal, other
+
+    def _decide_text_literals(
+        self, sink: str, params: list[str], formals: list[dict] | None, instances: set[str], notes: list[str]
+    ) -> dict[str, dict]:
+        """
+        Plan step M2: L5_no_crlf on a string literal does not prove (an unbounded quantifier over the
+        literal's bytes), but the model knows the literal. A caller whose every call of the sink passes
+        literals to the text parameters is decided here, syntactically: satisfied when no literal holds
+        CR or LF before its first NUL, else violated. It gets no MetAcsl goal (the ledger records the
+        verdict); a caller that also passes something else keeps its goal.
+        """
+        if not instances:
+            return {}
+        if not self.m.features["call_sites"]:
+            self.warnings.append(f"output sink {sink}: the model has {MODEL_FEATURES['call_sites']}")
+            return {}
+        index = {str(p.get("name")): i for i, p in enumerate(formals or [])}
+        if not formals or any(p not in index for p in params):
+            return {}
+        indexes = [index[p] for p in params]
+        out: dict[str, dict] = {}
+        mixed: list[str] = []
+        for fid in sorted(instances):
+            found = self._literal_sites(fid, sink, indexes)
+            if found is None or not found[0]:
+                continue
+            literal, other = found
+            if other:
+                mixed.append(self.m.name(fid))
+                continue
+            bad = [(line, t) for line, texts in literal for t in texts if _has_crlf(t)]
+            if bad:
+                line, text = bad[0]
+                out[fid] = {
+                    "verdict": "violated",
+                    "how": "syntactic",
+                    "reason": f"{sink} is passed the string literal {json.dumps(text)}, which holds a CR or LF (line {line})",
+                }
+            else:
+                lines = ", ".join(str(line) for line, _ in literal)
+                out[fid] = {
+                    "verdict": "satisfied",
+                    "how": "syntactic",
+                    "reason": f"every call of {sink} passes string literals without CR or LF (line(s) {lines})",
+                }
+        if mixed:
+            notes.append(
+                f"{', '.join(mixed)}: call(s) {sink} with string literals and with other text; the literal calls keep "
+                "a goal that does not prove (L5_no_crlf on a literal)"
+            )
+        return out
 
     # -- L6 -----------------------------------------------------------------------------------------
 
@@ -666,9 +759,20 @@ def generate(model: dict, threat: dict | None, templates: _Templates | None = No
     for fid, why in sorted(frame.items()):
         obligations[fid].append({"class": "l3_frame", "property": "L3_frame", "reason": why})
     for prop in gen.properties:
+        reason = f"{prop['name']} ({prop['kind'].replace('_', ' ')}, layer {prop['layer']})"
         for fid in prop["instances"]:
-            reason = f"{prop['name']} ({prop['kind'].replace('_', ' ')}, layer {prop['layer']})"
             obligations[fid].append({"class": prop["obligation_class"], "property": prop["name"], "reason": reason})
+        # Decided from the model (plan step M2): the ledger seed records the verdict; no WP goal exists.
+        for d in prop.get("decided") or []:
+            obligations[d["function"]].append(
+                {
+                    "class": prop["obligation_class"],
+                    "property": prop["name"],
+                    "reason": reason,
+                    "decided": d["verdict"],
+                    "decided_reason": d["reason"],
+                }
+            )
     by_class: dict[str, int] = defaultdict(int)
     for items in obligations.values():
         for cls in {i["class"] for i in items}:

@@ -33,6 +33,21 @@
           "notes": {"type": "array", "items": {"type": "string"}},
           "targets": {"type": "string"},
           "threat_model": {"$comment": "the threat-model item the property comes from", "type": "object"},
+          "decided": {
+            "$comment": "instances decided from the model instead of by a WP goal (plan step M2): not in `instances`, recorded by the ledger seed",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "function": {"type": "string", "pattern": "#"},
+                "verdict": {"type": "string", "enum": ["satisfied", "violated"]},
+                "how": {"type": "string", "enum": ["syntactic"]},
+                "reason": {"type": "string", "minLength": 1}
+              },
+              "required": ["function", "verdict", "how", "reason"],
+              "additionalProperties": false
+            }
+          },
           "direct_writers": {"type": "array", "items": {"type": "string"}},
           "entry_points": {"type": "array", "items": {"type": "string"}}
         },
@@ -58,7 +73,9 @@
           "properties": {
             "class": {"$ref": "#/definitions/class"},
             "property": {"type": "string"},
-            "reason": {"type": "string"}
+            "reason": {"type": "string"},
+            "decided": {"$comment": "decided from the model, no WP goal (plan step M2)", "type": "string", "enum": ["satisfied", "violated"]},
+            "decided_reason": {"type": "string", "minLength": 1}
           },
           "required": ["class", "property", "reason"],
           "additionalProperties": false

@@ -94,7 +94,7 @@ MetAcsl puts an assertion before every write of every other function (a write of
 
 ## Layer 5: Output Sanitization
 
-An output sink is checked where data reaches it. For a `log` or `terminal` sink, each text parameter must hold no CR or LF before its terminating NUL (`L5_no_crlf`, log injection); for the other kinds, every byte handed over must be initialized (with the sink's `length` parameter, else the object pointed to). These are `\calling` properties, so they also hold for a sink the target only declares (`syslog`, `send`). A `buffer` sink (the output is returned in an out-parameter, like `QCBOREncode_Finish`) gets a postcondition: its out-parameters are initialized when it returns.
+An output sink is checked where data reaches it. For a `log` or `terminal` sink, each text parameter must hold no CR or LF before its terminating NUL (`L5_no_crlf`, log injection); for the other kinds, every byte handed over must be initialized (with the sink's `length` parameter, else the object pointed to). These are `\calling` properties, so they also hold for a sink the target only declares (`syslog`, `send`). A caller that hands a text sink string literals only gets no goal: the provers do not discharge `L5_no_crlf` on a literal, so `security_props.py` decides it from the model, which records the literal each call passes (`call_sites`): satisfied when no literal holds CR or LF before its NUL, else violated. The property lists it under `decided`, and the ledger seed records the verdict (a `covered` unit with evidence of phase `static`, or a `blocked` one). A `buffer` sink (the output is returned in an out-parameter, like `QCBOREncode_Finish`) gets a postcondition: its out-parameters are initialized when it returns.
 
 Output grammars specific to a format (RFC 5424 structured-data escaping, delimiter breakout) are not generated: a prover adds them as named `L5_*` clauses where the threat model calls for them.
 
@@ -115,6 +115,7 @@ The no-leak check sees direct flows only. A copy of the secret into a buffer tha
 
 - **Pipeline integration:** `security_props.py run` is a `/framac-slice` step. The generated Makefile runs it as the `security-props` target, which `seed` depends on, and `benchmark.py` and `benchmark_seeded.py` run it as the `security_props` stage before the ledger seed.
 - **L3 over-approximation:** a call to a libc memory writer counts as a pointer write even when its destination is local.
-- **L5 on string literals:** `L5_no_crlf` on a literal argument does not prove, even with Alt-Ergo, Z3 and CVC5 at 10 s.
+- **L5 on string literals:** `L5_no_crlf` on a literal argument does not prove, even with Alt-Ergo, Z3 and CVC5 at 10 s. A caller passing literals only is decided from the model instead; one that passes a sink both literals and other text keeps a goal its literal calls cannot discharge, and a pointer into a literal (`"abc" + 1`) counts as other text.
+- **Instances MetAcsl decides statically:** MetAcsl drops an instance it simplifies to true (a literal or another global separated from the secret), leaving no goal. `ledger.py ingest-wp` credits such a unit when the WP run loaded every property it names and ended `all_proven`.
 - **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop with invariants does.
 - **Returned secrets:** a secret of kind `return` gives a warning and no property.

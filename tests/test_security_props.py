@@ -92,8 +92,20 @@ def test_session_fixture_properties_and_instances():
     assert "\\separated(\\written, &auth_ok)" in props["L4_auth_state_session_login"]["acsl"]
     # The privileged function's precondition is proved where it is called.
     assert props["L4_auth_required_session_login"]["instances"] == ["session.c#session_dispatch"]
-    # The log sink is external: its writers (callers) discharge the check.
-    assert props["L5_sanitized_log_line"]["instances"] == ["session.c#session_admin", "session.c#session_status"]
+    # The log sink is external: its writers (callers) discharge the check. session_admin hands it a
+    # string literal only, decided from the model (plan step M2): no goal there.
+    assert props["L5_sanitized_log_line"]["instances"] == ["session.c#session_status"]
+    assert props["L5_sanitized_log_line"]["decided"] == [
+        {
+            "function": "session.c#session_admin",
+            "verdict": "satisfied",
+            "how": "syntactic",
+            "reason": "every call of log_line passes string literals without CR or LF (line(s) 25)",
+        }
+    ]
+    assert {"decided": "satisfied", "class": "l5_sanitized"}.items() <= next(
+        o for o in doc["obligations"]["session.c#session_admin"] if o["class"] == "l5_sanitized"
+    ).items()
     assert "L5_no_crlf(\\called_arg(msg))" in props["L5_sanitized_log_line"]["acsl"]
     wiped = props["L6_wiped_session_key"]
     assert wiped["instances"] == ["session.c#session_close"] and wiped["sources"] == ["session.c"]
@@ -373,6 +385,165 @@ def test_wipe_proof_decides_the_l6_unit(run_dir, report, status):
     assert units["session.c#session_close::l6_wiped"]["status"] == status
 
 
+SESSION_SINK_DAG: dict = json.loads(json.dumps(SESSION_DAG))
+SESSION_SINK_DAG["functions"].update(
+    {
+        name: {"name": name, "file": "session.c", "module": "libsession.a", "wave": 0, "has_loops": False}
+        for name in ("session_admin", "session_status")
+    }
+)
+
+
+def _seed_sinks(run_dir: Path, doc: dict | None = None, refresh: bool = False) -> dict[str, dict]:
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", SESSION_SINK_DAG)
+    write_json(run_dir / "workspace/reports/security_props.json", doc or session_props())
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c", refresh=refresh)
+    return {u["coverage_id"]: u for u in json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))}
+
+
+@pytest.mark.unit
+def test_a_literal_decided_from_the_model_is_recorded_by_the_seed(run_dir):
+    """Plan step M2: session_admin hands the log sink a literal only; the seed covers its L5 unit."""
+    units = _seed_sinks(run_dir)
+    admin = units["session.c#session_admin::l5_sanitized"]
+    assert admin["status"] == "covered" and not admin["unresolved"]
+    assert [(e["phase"], e["result"], e["discharging"]) for e in admin["evidence"]] == [
+        ("static", "decided_syntactically", True)
+    ]
+    assert admin["evidence"][0]["tool_output"] == "workspace/reports/security_props.json"
+    assert admin["bookkeeping"]["decided_properties"][0]["property"] == "L5_sanitized_log_line"
+    assert "security_properties" not in admin["bookkeeping"]
+    # session_status passes a non-literal: its unit waits for WP.
+    status = units["session.c#session_status::l5_sanitized"]
+    assert status["status"] == "planned" and status["bookkeeping"]["security_properties"] == ["L5_sanitized_log_line"]
+    assert not L.validate_ledger(list(units.values()))
+
+
+@pytest.mark.unit
+def test_a_literal_with_a_line_break_blocks_the_unit_and_wp_cannot_credit_it(run_dir):
+    m = session_model()
+    m["functions"]["session.c#session_admin"]["call_sites"][0]["literals"]["0"] = "admin\r\ncommand"
+    doc = sp.generate(m, trust.load_threat_model(FIX / "secret_unwiped" / "THREAT_MODEL.md"))
+    assert not sp.validate(doc)
+    decided = by_name(doc)["L5_sanitized_log_line"]["decided"]
+    assert decided[0]["verdict"] == "violated" and '"admin\\r\\ncommand"' in decided[0]["reason"]
+    units = _seed_sinks(run_dir, doc)
+    admin = units["session.c#session_admin::l5_sanitized"]
+    assert admin["status"] == "blocked" and admin["evidence"][0]["result"] == "decided_violated"
+    assert admin["unresolved"][0].startswith("L5_sanitized_log_line violated (decided from the model)")
+    # The literal is fixed, then broken again: a refresh decides again, the seed's decision is not evidence.
+    units = _seed_sinks(run_dir, session_props(), refresh=True)
+    assert units["session.c#session_admin::l5_sanitized"]["status"] == "covered"
+    units = _seed_sinks(run_dir, doc, refresh=True)
+    assert units["session.c#session_admin::l5_sanitized"]["status"] == "blocked"
+    assert not L.validate_ledger(list(units.values()))
+    # No WP result credits a unit decided violated.
+    report = json.loads((FIX / "wp_close_wiped.json").read_text(encoding="utf-8"))
+    report.update(function="session_admin", by_obligation_class={"l5_sanitized": {"proven": 1, "unproven": 0}})
+    path = _write(run_dir / "workspace/reports/wp/admin.json", report)
+    L.cmd_ingest_wp([path])
+    after = {u["coverage_id"]: u for u in json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))}
+    assert after["session.c#session_admin::l5_sanitized"]["status"] == "blocked"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("loaded", "error", "status"),
+    [
+        (["L6_no_leak_session_key"], None, "covered"),
+        ([], None, "planned"),
+        (["L6_no_leak_session_key"], "x", "planned"),
+    ],
+)
+def test_an_instance_metacsl_decides_statically_is_credited(run_dir, loaded, error, status):
+    """
+    The M1 bug: MetAcsl's -meta-simpl drops an instance it decides statically, so the WP run of an
+    instance function that loaded the property ends all_proven with no goal of the class. Credited when
+    the report says the property was loaded without error.
+    """
+    _seed_sinks(run_dir)
+    report = json.loads((FIX / "wp_close_wiped.json").read_text(encoding="utf-8"))
+    sp_block = {"props": "workspace/reports/security_props.json", "properties": loaded}
+    if error:
+        sp_block["error"] = error
+    report.update(
+        function="session_admin",
+        by_obligation_class={"rte": {"proven": 1, "proven_under_hyp": 0, "unproven": 0}},
+        layer_goals=[],
+        security_props=sp_block,
+    )
+    report["limits"]["unchecked_layer_clauses"] = []
+    path = _write(run_dir / "workspace/reports/wp/admin.json", report)
+    L.cmd_ingest_wp([path])
+    units = {u["coverage_id"]: u for u in json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))}
+    leak = units["session.c#session_admin::l6_no_leak"]
+    assert leak["status"] == status
+    if status == "covered":
+        assert leak["evidence"][-1]["result"] == "wp_meta_simplified"
+    else:
+        assert leak["evidence"][-1]["result"] == "wp_no_credited_goals"
+    # The unit decided from the model is left alone by WP.
+    admin = units["session.c#session_admin::l5_sanitized"]
+    assert admin["status"] == "covered" and [e["phase"] for e in admin["evidence"]] == ["static"]
+    assert not L.validate_ledger(list(units.values()))
+
+
+@pytest.mark.unit
+def test_text_sink_literals_are_decided_per_caller():
+    def site(callee: str, line: int, **lits: str) -> dict:
+        return {"callee": callee, "line": line, "literals": {k.lstrip("a"): v for k, v in lits.items()}}
+
+    sites = {
+        "a.c#lit": [site("log2", 3, a1="hello")],
+        "a.c#crlf": [site("log2", 4, a1="a\nb")],
+        "a.c#after_nul": [site("log2", 5, a1="ok\0\n")],
+        "a.c#mixed": [site("log2", 6, a1="ok"), site("log2", 7)],
+        "a.c#var": [site("log2", 8)],
+        "a.c#other": [site("log2", 9, a0="x")],
+    }
+    funcs = {fid: fn(fid.split("#")[1], external_calls=["log2"], call_sites=s) for fid, s in sites.items()}
+    m = model(
+        funcs, external_formals={"log2": [{"name": "lvl", "kind": "value"}, {"name": "msg", "kind": "const_pointer"}]}
+    )
+    t = threat(output_sinks=[{"function": "log2", "kind": "log", "params": ["msg"], "description": "d"}])
+    doc = sp.generate(m, t)
+    assert not sp.validate(doc), sp.validate(doc)
+    prop = by_name(doc)["L5_sanitized_log2"]
+    verdicts = {d["function"]: d["verdict"] for d in prop["decided"]}
+    assert verdicts == {"a.c#lit": "satisfied", "a.c#crlf": "violated", "a.c#after_nul": "satisfied"}
+    assert prop["instances"] == ["a.c#mixed", "a.c#other", "a.c#var"]
+    assert any(n.startswith("mixed: call(s) log2 with string literals and with other text") for n in prop["notes"])
+    assert doc["obligations"]["a.c#crlf"][0]["decided"] == "violated"
+    # A model without call sites decides nothing, and says why.
+    for f in m["functions"].values():
+        del f["call_sites"]
+    old = sp.generate(m, t)
+    assert (
+        "decided" not in by_name(old)["L5_sanitized_log2"] and len(by_name(old)["L5_sanitized_log2"]["instances"]) == 6
+    )
+    assert any("no call sites with their string-literal arguments" in w for w in old["warnings"])
+
+
+@pytest.mark.unit
+def test_model_call_sites_from_the_dump():
+    import phase0_model as pm
+
+    dump_fn = {
+        "calls": [
+            {"name": "log_line", "indirect": False, "literal_args": {"0": "hi"}, "loc": "/t/a.c:4:2-9"},
+            {"indirect": True, "expr": "fp", "loc": "/t/a.c:5"},
+            {"name": "g", "indirect": False, "literal_args": {}, "loc": "/t/a.c:6"},
+        ]
+    }
+    assert pm._body_facts(dump_fn)["call_sites"] == [
+        {"callee": "log_line", "line": 4, "literals": {"0": "hi"}},
+        {"callee": "g", "line": 6, "literals": {}},
+    ]
+    # A dump before schema 4 has no literal_args: no call sites, so "no literal" is never assumed.
+    assert "call_sites" not in pm._body_facts({"calls": [{"name": "g", "indirect": False, "loc": "/t/a.c:6"}]})
+    assert "call_sites" not in pm._body_facts(dump_fn, literals=False)
+
+
 @pytest.mark.unit
 def test_brief_entries_name_what_to_discharge():
     doc = session_props()
@@ -507,13 +678,11 @@ TEMPLATE_VARIANTS: dict[str, tuple[str, str, dict]] = {
 }
 # A goal named apart from its property: the `reading` half of a global secret's no-leak property.
 GOAL_NAMES = {"l6_no_leak_reading": "L6_no_leak_read_key"}
+# Variants whose satisfied program MetAcsl decides statically (-meta-simpl drops the instance): no
+# goal is left, and the ledger credits the unit from the report's loaded properties.
+STATIC_VARIANTS = {"l6_no_leak_calling_static"}
 # Open pipeline bugs (docs/troubleshooting.md): (variant, violate) -> reason.
-OPEN_DEFECTS = {
-    ("l6_no_leak_calling_static", False): (
-        "MetAcsl's default -meta-simpl drops an instance it decides statically (a global separated from the "
-        "secret), so the satisfied program has no L6_no_leak goal and ledger.py ingest-wp never credits the unit"
-    ),
-}
+OPEN_DEFECTS: dict[tuple[str, bool], str] = {}
 
 
 def _variant_params() -> list:
@@ -541,18 +710,42 @@ libprog.a: prog.o
 """
 
 
-def _variant_target(dest: Path, variant: str, violate: bool) -> Path:
-    """A one-file target: variants/<variant>.c as prog.c, its Makefile and THREAT_MODEL.md."""
+def _one_file_target(dest: Path, source: Path, lists: dict, violate: bool) -> Path:
+    """A one-file target: `source` as prog.c, its Makefile and a THREAT_MODEL.md with `lists`."""
     dest.mkdir(parents=True)
-    shutil.copy(VARIANTS_DIR / f"{variant}.c", dest / "prog.c")
+    shutil.copy(source, dest / "prog.c")
     defs = "-DVIOLATE" if violate else ""
     (dest / "Makefile").write_text(_VARIANT_MAKEFILE.format(defs=defs), encoding="utf-8", newline="\n")
-    block: dict = {"schema_version": 1, "target": variant, "input_sources": [], "trusted_callers": []}
+    block: dict = {"schema_version": 1, "target": source.stem, "input_sources": [], "trusted_callers": []}
     block.update({"secrets": [], "auth_gates": [], "output_sinks": []})
-    block.update(TEMPLATE_VARIANTS[variant][2])
-    text = f"# Threat model: {variant}\n\n```json framac-threat-model\n{json.dumps(block, indent=1)}\n```\n"
+    block.update(lists)
+    text = f"# Threat model: {source.stem}\n\n```json framac-threat-model\n{json.dumps(block, indent=1)}\n```\n"
     (dest / "THREAT_MODEL.md").write_text(text, encoding="utf-8", newline="\n")
     return dest
+
+
+def _variant_target(dest: Path, variant: str, violate: bool) -> Path:
+    """variants/<variant>.c as a one-file target with its threat model."""
+    return _one_file_target(dest, VARIANTS_DIR / f"{variant}.c", TEMPLATE_VARIANTS[variant][2], violate)
+
+
+def _seed_one_file(run: Path, model: dict, doc: dict) -> None:
+    """Seed the ledger of a one-file run (cwd `run`) from its model and security properties."""
+    dag = {
+        "callgraph_source": "frama_c",
+        "modules": {"libprog.a": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"}},
+        "functions": {
+            f["name"]: {"name": f["name"], "file": f["file"], "module": "libprog.a", "wave": 0, "has_loops": False}
+            for f in model["functions"].values()
+        },
+    }
+    write_json(run / "workspace/reports/security_props.json", doc)
+    write_json(run / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run / "workspace/reports/callgraph_dag.json", [], "frama_c")
+
+
+def _ledger_units(run: Path) -> dict[str, dict]:
+    return {u["coverage_id"]: u for u in json.loads((run / "coverage-ledger.json").read_text(encoding="utf-8"))}
 
 
 @pytest.mark.unit
@@ -567,10 +760,11 @@ def test_every_template_variant_has_a_program_and_its_property(tmp_path):
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.parametrize(("variant", "violate"), _variant_params())
-def test_template_variant_acceptance_in_the_image(model_run, tmp_path, variant, violate):  # noqa: F811
+def test_template_variant_acceptance_in_the_image(model_run, tmp_path, monkeypatch, variant, violate):  # noqa: F811
     """
     The named goal of each template variant proves on a program that satisfies the property and stays
-    unproven on one that violates it: MetAcsl accepts the template and it is not trivially true.
+    unproven on one that violates it: MetAcsl accepts the template and it is not trivially true. A
+    satisfied instance MetAcsl decides statically leaves no goal; the ledger credits it all the same.
     """
     function, name, _ = TEMPLATE_VARIANTS[variant]
     target = _variant_target(tmp_path / "target", variant, violate)
@@ -605,5 +799,59 @@ def test_template_variant_acceptance_in_the_image(model_run, tmp_path, variant, 
     detail = json.dumps({"proven": proven, "unproven": unproven, "log": report.get("wp_log_tail")}, indent=1)
     if violate:
         assert unproven, detail
+    elif variant in STATIC_VARIANTS:
+        assert not proven and not unproven and report["status"] == "all_proven", detail
+        monkeypatch.chdir(run)
+        _seed_one_file(run, m, doc)
+        L.cmd_ingest_wp([run / "workspace/reports/wp/out.json"])
+        unit = _ledger_units(run)[f"prog.c#{function}::{props[name]['obligation_class']}"]
+        assert unit["status"] == "covered" and unit["evidence"][-1]["result"] == "wp_meta_simplified", unit
     else:
         assert proven and not unproven, detail
+
+
+# ---------------------------------------------------------------------------------------------------
+# Acceptance (Docker): string-literal arguments decided from the real model (plan step M2)
+# ---------------------------------------------------------------------------------------------------
+
+DECIDED_DIR = FIX / "decided"
+LOG_AT_SINK = {"function": "log_at", "kind": "log", "params": ["msg"], "description": "Leveled log lines."}
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["satisfied", "violated"])
+def test_text_literals_are_decided_from_the_real_model(model_run, tmp_path, monkeypatch, violate):  # noqa: F811
+    """
+    The dump records the literals each call passes (dump schema 4); security_props.py decides the
+    callers that hand a text sink literals only, with no goal, and the seed records the verdict.
+    """
+    lists = {"output_sinks": [LOG_SINK, LOG_AT_SINK]}
+    target = _one_file_target(tmp_path / "target", DECIDED_DIR / "l5_text_literal.c", lists, violate)
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    sites = m["functions"]["prog.c#report"]["call_sites"]
+    expected = (
+        [("log_line", {"0": "state:"}), ("log_at", {}), ("log_line", {"0": "injected\nline"})]
+        if violate
+        else [("log_line", {"0": "state:"}), ("log_at", {"1": "up\0\n"})]
+    )
+    assert [(s["callee"], s["literals"]) for s in sites] == expected, sites
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    assert not sp.validate(doc)
+    props = by_name(doc)
+    line, at = props["L5_sanitized_log_line"], props["L5_sanitized_log_at"]
+    assert [d["verdict"] for d in line["decided"]] == ["violated" if violate else "satisfied"]
+    assert line["instances"] == []
+    if violate:
+        # A non-literal argument (a conditional) keeps its goal.
+        assert at["instances"] == ["prog.c#report"] and "decided" not in at
+    else:
+        # No goal is left in `report`: no meta file for its WP run.
+        assert at["instances"] == [] and [d["verdict"] for d in at["decided"]] == ["satisfied"]
+        assert sp.meta_file_text(doc, "prog.c#report") is None
+    monkeypatch.chdir(run)
+    _seed_one_file(run, m, doc)
+    unit = _ledger_units(run)["prog.c#report::l5_sanitized"]
+    assert unit["status"] == ("blocked" if violate else "covered"), unit
