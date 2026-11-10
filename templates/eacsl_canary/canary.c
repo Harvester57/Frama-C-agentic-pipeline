@@ -17,14 +17,26 @@
  *     also reads a by-value struct parameter (canary_span_len) and a scalar
  *     parameter through its address (canary_odd): E-ACSL registers formals
  *     without marking them initialized, so without the build's formal-init
- *     pass every input fails \initialized on them.
+ *     pass every input fails \initialized on them. Every input also calls a
+ *     function whose `ensures` reads a field of its struct \result
+ *     (canary_clamp: without the wrapper result-init pass every input fails
+ *     \initialized(&\result.len); Frama-C 35 checks no scalar \result so),
+ *     classifies a double with isnan (canary_classify: without the <math.h>
+ *     shim the build fails on glibc's __builtin_* / _Generic forms), and
+ *     writes errno around a libc call that sets it (canary_errno: errno is
+ *     the fc_stubs global in E-ACSL builds; without the stub every input
+ *     aborts in unsafe_initialize, and without the errno shim libc's ERANGE
+ *     never reaches the global, which fails the canary_errno_synced
+ *     assertion).
  * Like generated harnesses, LLVMFuzzerTestOneInput copies the input into its
  * own buffer: libFuzzer writes `data` outside instrumented code, so with
  * -rte-initialized every direct read of it would be reported as uninitialized.
  * Keep the CANARY_OOB marker on the overflowing statement.
  */
 
+#include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -57,6 +69,29 @@ static int canary_odd(size_t n)
     return (int)(*pn & 1U);
 }
 
+/*@ ensures \result.len <= span.len; */
+static struct canary_span canary_clamp(struct canary_span span)
+{
+    struct canary_span out = {span.ptr, span.len < 16U ? span.len : 16U};
+    return out;
+}
+
+static int canary_classify(size_t len)
+{
+    double ratio = (double)len / 3.0;
+    return isnan(ratio) ? 1 : 0;
+}
+
+static int canary_errno(void)
+{
+    errno = 0;
+    long v = strtol("99999999999999999999", NULL, 10);
+    int synced = errno == ERANGE;
+    /*@ assert canary_errno_synced: synced != 0; */
+    errno = 0;
+    return (int)(v & 1) + synced;
+}
+
 static int canary_pick(const uint8_t *data, size_t len)
 {
     int picked;
@@ -77,6 +112,7 @@ static int canary_process(const uint8_t *data, size_t len)
 
     canary_fill(local, len < sizeof local ? len : sizeof local);
     widened += canary_odd(canary_span_len(span));
+    widened += (__int32_t)canary_clamp(span).len + canary_classify(len) + canary_errno();
     if (len > 0 && data[0] == 'O') {
         int fd = open("/nonexistent/framac-canary", O_RDONLY, 0);
         if (fd >= 0) {

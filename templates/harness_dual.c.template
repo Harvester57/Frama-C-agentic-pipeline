@@ -58,6 +58,9 @@ typedef uint64_t __uint64_t;
 #undef FRAMAC_FUZZ_COPY
 #define FRAMAC_FUZZ_COPY(buf, off) (framac_input_init + (off))
 
+/* An input the fuzz entry turns away (FRAMAC_FUZZ_REJECT, below) is nothing to record in Eva. */
+#define FRAMAC_FUZZ_REJECT() ((void)0)
+
 /*@
   terminates \true;
   exits \false;
@@ -85,6 +88,7 @@ int eva_main(void) {
 }
 #undef FRAMAC_FUZZ_COPY
 #define FRAMAC_FUZZ_COPY(buf, off) ((buf) + (off))
+#undef FRAMAC_FUZZ_REJECT
 #endif /* defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__) */
 
 /*
@@ -92,14 +96,22 @@ int eva_main(void) {
  * Do not define LLVMFuzzerInitialize here: E-ACSL builds link
  * templates/eacsl_runtime/fuzz_init.c, which defines it to initialize the
  * E-ACSL runtime (run_eacsl_fuzz.py refuses with eacsl_init_hook_conflict).
+ *
+ * An input that reaches no target code returns -1, so libFuzzer keeps it out of the corpus
+ * (libFuzzer's input rejection; clang 19 of the analysis image has it): one longer than
+ * MAX_INPUT_SIZE, and, through FRAMAC_FUZZ_REJECT(), one a dispatch harness turns away (no selector
+ * byte, a case the campaign skips) or a case's own length guard rejects before any call.
  */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 #ifdef __FRAMAC_EACSL__
     extern int __e_acsl_sound_verdict;
     __e_acsl_sound_verdict = 1;
 #endif
-    if (data == NULL || size > MAX_INPUT_SIZE) {
+    if (data == NULL) {
         return 0;
+    }
+    if (size > MAX_INPUT_SIZE) {
+        return -1;
     }
 
     /*
@@ -122,10 +134,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size_t fuzz_len = size;
     (void)fuzz_buf;
     (void)fuzz_len;
+    int harness_reject = 0;
+#undef FRAMAC_FUZZ_REJECT
+#define FRAMAC_FUZZ_REJECT() ((void)(harness_reject = 1))
 
     /* Invoke target module entry point */
     {{TARGET_INVOCATION_FUZZ}}
 
     free(alloc_ptr);
-    return 0;
+    return harness_reject ? -1 : 0;
 }
