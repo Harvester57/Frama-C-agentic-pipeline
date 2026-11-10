@@ -58,9 +58,19 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   The E-ACSL frontend therefore gets `-D__SUPPORT_SNAN__` (glibc then uses the library forms)
   and [`./eacsl/math.h`](./eacsl/math.h), which `#include_next`s glibc's header and redefines
   `__MATH_TG` and `signbit` under `__FRAMAC_EACSL__`. Eva and WP never see either.
-- [`./errno.h`](./errno.h) maps `errno` to a tracked global under `__FRAMAC_EACSL__` only:
-  glibc's thread-local errno is not E-ACSL-tracked memory, so every `errno = ...` would abort the
-  runtime. errno values set by the real libc are not visible through it.
+- [`./errno.h`](./errno.h) maps `errno` to a tracked global (`__fc_eacsl_errno`) under
+  `__FRAMAC_EACSL__` only. glibc's errno lives in libc.so's TLS block, outside the TLS segment the
+  E-ACSL runtime shadows (the executable's own block), so every `errno = ...` would abort the
+  runtime (`Use of invalid address ... in unsafe_initialize`), and registering the address from
+  `fuzz_init.c` crashes in `shadow_alloca` instead. libc never writes the global, so
+  `run_eacsl_fuzz.py` links a generated, link-only errno shim (`<out>_errno_shim/eacsl_errno_shim.o`,
+  `-Wl,--wrap=<fn>`) for the errno-setting libc functions the slice calls
+  (`ERRNO_SHIM_FUNCTIONS` in [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py)):
+  each wrapper copies the global into libc's errno before the call and libc's errno back after it,
+  so `errno == ERANGE` after `strtol` and `EINTR` after `read` take the right branch. The Variadic
+  fallbacks sync the same way. The build result records the wrapped functions in `errno_shim`, a
+  coverage caveat: after a libc call outside that list the target reads the last value it wrote.
+  Add a function to the table (non-variadic, with its header) when a target branches on its errno.
 
 ## Libc contract overrides (Eva / WP)
 

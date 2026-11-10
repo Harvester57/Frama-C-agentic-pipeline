@@ -608,8 +608,8 @@ def test_variadic_fallbacks_are_linked_from_a_separate_object(tmp_path, modern_c
     gen = (tmp_path / "fuzz_mod_fallbacks" / "eacsl_fallbacks.c").read_text(encoding="utf-8")
     assert "#include <fcntl.h>" in gen
     assert (
-        "int open_fallback_1(char const *filename, int flags, mode_t mode) { return open(filename, flags, mode); }"
-        in gen
+        "int open_fallback_1(char const *filename, int flags, mode_t mode) "
+        "{ FC_ERRNO_IN(); int r = open(filename, flags, mode); FC_ERRNO_OUT(); return r; }" in gen
     )
     final_stage2 = fake.calls[-1]
     assert final_stage2[final_stage2.index("-l") + 1].endswith("eacsl_fallbacks.o")
@@ -651,11 +651,16 @@ def test_fallback_generation_modes():
     src, records = T.generate_fallback_source(fbs)
     modes = {r["name"]: r["mode"] for r in records}
     assert modes == {"ioctl_fallback_2": "forward", "logx_fallback_3": "enosys", "weird_fallback_1": "enosys"}
-    assert "int ioctl_fallback_2(int a0, unsigned long a1) { return ioctl(a0, a1); }" in src
-    assert "void *weird_fallback_1() { errno = ENOSYS; return 0; }" in src
-    assert "void logx_fallback_3() { errno = ENOSYS; }" in src
+    assert (
+        "int ioctl_fallback_2(int a0, unsigned long a1) "
+        "{ FC_ERRNO_IN(); int r = ioctl(a0, a1); FC_ERRNO_OUT(); return r; }" in src
+    )
+    assert "void *weird_fallback_1() { errno = ENOSYS; FC_ERRNO_OUT(); return 0; }" in src
+    assert "void logx_fallback_3() { errno = ENOSYS; FC_ERRNO_OUT(); }" in src
+    # The errno stub's global is weak: a slice that never includes <errno.h> still links.
+    assert "extern int __fc_eacsl_errno __attribute__((weak));" in src
     forced_src, forced = T.generate_fallback_source(fbs, force_enosys=True)
-    assert all(r["mode"] == "enosys" for r in forced) and "return ioctl(" not in forced_src
+    assert all(r["mode"] == "enosys" for r in forced) and "= ioctl(" not in forced_src
 
 
 def test_link_and_frama_c_log_parsers():
@@ -707,8 +712,90 @@ def test_generate_fallback_source_forwards_va_named_snprintf():
     assert "#include <stdio.h>" in src
     assert (
         "int snprintf_va_3(char * restrict __s, size_t __maxlen, char const * restrict __format, "
-        "char *param0, int param1) { return snprintf(__s, __maxlen, __format, param0, param1); }" in src
+        "char *param0, int param1) { FC_ERRNO_IN(); int r = snprintf(__s, __maxlen, __format, param0, param1); "
+        "FC_ERRNO_OUT(); return r; }" in src
     )
+
+
+# ---------------------------------------------------------------------------
+# S5 errno shim: libc's errno reaches the fc_stubs/errno.h global
+# ---------------------------------------------------------------------------
+
+ERRNO_INSTRUMENTED = (
+    "int __fc_eacsl_errno;\n"
+    "extern  __attribute__((__nothrow__)) long strtol(char const * __restrict __nptr, char ** __restrict __endptr,\n"
+    "                                                 int __base);\n"
+    "extern ssize_t read(int __fd, void *__buf, size_t __nbytes);\n"
+    "extern int close(int __fd);\n"
+    "int f(char const *s, int fd, char *buf)\n"
+    "{\n"
+    "  long v;\n"
+    "  ssize_t n;\n"
+    "  __fc_eacsl_errno = 0;\n"
+    "  v = strtol(s,(char **)0,10);\n"
+    "  n = (ssize_t)read(fd,(void *)buf,(size_t)4);\n"
+    "  return __fc_eacsl_errno;\n"
+    "}\n"
+)
+
+
+def test_errno_shim_wraps_called_functions_only():
+    # close is only declared, never called: no wrapper for it.
+    assert T.find_errno_shim_calls(ERRNO_INSTRUMENTED) == ["strtol", "read"]
+    # Without the stub's global (the slice never includes <errno.h>) nothing reads errno.
+    assert T.find_errno_shim_calls(ERRNO_INSTRUMENTED.replace("__fc_eacsl_errno", "x")) == []
+    assert T.find_errno_shim_calls("int __fc_eacsl_errno;\nvoid g(int fd) { close(fd); }\n") == ["close"]
+
+
+def test_errno_shim_source_syncs_both_ways_and_checks_prototypes():
+    src = T.generate_errno_shim_source(["strtol", "read"])
+    assert "#include <stdlib.h>" in src and "#include <unistd.h>" in src
+    assert "extern int __fc_eacsl_errno;" in src
+    assert "extern __typeof__(strtol) __real_strtol;" in src
+    body = src[src.index("long __wrap_strtol(") :]
+    body = body[: body.index("}")]
+    # The target's value goes to libc first (a successful call leaves errno alone), libc's comes back.
+    assert body.index("errno = __fc_eacsl_errno;") < body.index("__real_strtol(a0, a1, a2)")
+    assert body.index("__real_strtol(a0, a1, a2)") < body.index("__fc_eacsl_errno = errno;")
+    # A table signature that drifts from the host prototype fails the -Werror compile.
+    assert "static __typeof__(read) *const fc_errno_shim_check_read" in src
+    assert all(len(f) == 4 and f[3].endswith(".h") for f in T.ERRNO_SHIM_FUNCTIONS)
+    assert len({f[1] for f in T.ERRNO_SHIM_FUNCTIONS}) == len(T.ERRNO_SHIM_FUNCTIONS)
+
+
+def test_errno_shim_is_linked_with_wrap_flags_and_recorded(tmp_path, modern_cli):
+    fake = FakeEacslGcc(instrumented_text=ERRNO_INSTRUMENTED)
+    out_bin = tmp_path / "fuzz_mod"
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], out_bin, runner=fake, use_cache=False)
+    assert res["returncode"] == 0, res
+    shim_obj = tmp_path / "fuzz_mod_errno_shim" / "eacsl_errno_shim.o"
+    assert res["errno_shim"] == {"status": "built", "wrapped": ["strtol", "read"], "object": str(shim_obj)}
+    shim_compile = next(c for c in fake.calls if c[0] == "clang")
+    assert "-Werror" in shim_compile
+    link = fake.calls[-1][fake.calls[-1].index("-l") + 1].split()
+    assert shim_obj.as_posix() in link and "-Wl,--wrap=strtol,--wrap=read" in link
+    # The instrumented source is never modified.
+    assert out_bin.with_suffix(".instrumented.c").read_text(encoding="utf-8") == ERRNO_INSTRUMENTED
+
+
+def test_errno_shim_absent_or_failed(tmp_path, modern_cli):
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "a", runner=FakeEacslGcc(), use_cache=False)
+    assert res["returncode"] == 0 and res["errno_shim"] is None
+
+    class ShimFails(FakeEacslGcc):
+        def __call__(self, cmd, **kwargs):
+            if cmd[0] == "clang" and "-c" in cmd:
+                self.calls.append(list(cmd))
+                return _cp(cmd, 1, "", "error: conflicting types for '__wrap_read'")
+            return super().__call__(cmd, **kwargs)
+
+    fake = ShimFails(instrumented_text=ERRNO_INSTRUMENTED)
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "b", runner=fake, use_cache=False)
+    # Not fatal, but recorded as a caveat: the target reads stale errno after these calls.
+    assert res["returncode"] == 0
+    assert res["errno_shim"] == {"status": "failed", "wrapped": [], "unsynced": ["strtol", "read"]}
+    assert not any("--wrap" in a for a in fake.calls[-1])
+    assert "errno shim not linked" in Path(res["compile_log"]).read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1418,3 +1505,74 @@ def test_register_locals_and_member_alignas_build_and_run_in_the_analysis_image(
     assert res["binary"].endswith(".e-acsl")
     assert "LAYOUT_OK" in proc.stdout, out[-4000:]  # the rewrite kept the 16-byte alignment
     assert "RUN_OK" in proc.stdout, out[-4000:]
+
+
+# ---------------------------------------------------------------------------
+# S5 errno shim, end to end in the analysis image (FRAMAC_DOCKER_TESTS=1)
+# ---------------------------------------------------------------------------
+
+ERRNO_FUZZ_C = r"""#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    char buf[4];
+    char *end = NULL;
+    (void)data;
+    (void)size;
+    errno = 0;
+    long v = strtol("99999999999999999999", &end, 10);
+    printf("STRTOL errno=%d erange=%d v=%ld\n", errno, ERANGE, v);
+    errno = 0;
+    long n = read(-1, buf, sizeof buf);
+    printf("READ errno=%d ebadf=%d n=%ld\n", errno, EBADF, n);
+    errno = 0;
+    v = strtol("12", &end, 10);
+    printf("OKSTRTOL errno=%d v=%ld\n", errno, v);
+    fflush(stdout);
+    return 0;
+}
+"""
+
+ERRNO_BUILD_SCRIPT = r"""set -e
+cp -r /fixture /tmp/w && cd /tmp/w
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/opt/framac-pipeline/scripts")
+import run_eacsl_fuzz as R
+res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
+print("RESULT " + json.dumps({k: res.get(k) for k in ("returncode", "reason", "binary", "errno_shim")}))
+EOF
+./out/fuzz_mod.e-acsl -runs=1 > run.log 2>&1 && echo RUN_OK
+grep -E "^(STRTOL|READ|OKSTRTOL) |unsafe_initialize" run.log | head -6
+"""
+
+
+@pytest.mark.integration
+def test_eacsl_binary_sees_the_errno_libc_set(tmp_path):
+    """The instrumented binary sees ERANGE after strtol and EBADF after read (no unsafe_initialize abort)."""
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mod.c").write_text(ERRNO_FUZZ_C, encoding="utf-8")
+    argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro"]
+    argv += ["-v", f"{REPO / 'scripts'}:/opt/framac-pipeline/scripts:ro"]
+    argv += ["-v", f"{REPO / 'templates'}:/opt/framac-pipeline/templates:ro", ANALYSIS_IMAGE, ERRNO_BUILD_SCRIPT]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    out = proc.stdout + proc.stderr
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    assert line, out[-4000:]
+    res = json.loads(line[len("RESULT ") :])
+    assert res["returncode"] == 0, out[-4000:]
+    assert res["errno_shim"]["status"] == "built"
+    assert {"strtol", "read"} <= set(res["errno_shim"]["wrapped"])
+    assert "RUN_OK" in proc.stdout, out[-4000:]
+    assert "unsafe_initialize" not in proc.stdout
+    assert "STRTOL errno=34 erange=34 v=9223372036854775807" in proc.stdout, out[-4000:]
+    assert "READ errno=9 ebadf=9 n=-1" in proc.stdout, out[-4000:]
+    # The target's errno = 0 reaches libc, so a successful call does not show a stale EBADF.
+    assert "OKSTRTOL errno=0 v=12" in proc.stdout, out[-4000:]

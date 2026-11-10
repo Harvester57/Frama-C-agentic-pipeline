@@ -93,6 +93,7 @@ from eacsl_toolchain import (  # noqa: E402
     EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
     build_eacsl_flag_sets,
+    build_errno_shim_object,
     build_fallback_object,
     defines_fuzzer_initialize,
     fix_readonly_scalar_globals,
@@ -812,12 +813,16 @@ def compile_eacsl_binary(
     instrumented_c = out_bin.with_suffix(".instrumented.c")
     compile_log = out_bin.with_suffix(".compile.log")
     fallback_dir = out_bin.parent / f"{out_bin.name}_fallbacks"
+    errno_shim_dir = out_bin.parent / f"{out_bin.name}_errno_shim"
 
     def _outputs(res: dict) -> dict[str, Path]:
         files = {"binary": Path(res["binary"]), "instrumented.c": instrumented_c, "compile.log": compile_log}
         if res.get("variadic_fallbacks"):
             files["fallbacks.o"] = fallback_dir / "eacsl_fallbacks.o"
             files["fallbacks.c"] = fallback_dir / "eacsl_fallbacks.c"
+        if (res.get("errno_shim") or {}).get("status") == "built":
+            files["errno_shim.o"] = errno_shim_dir / "eacsl_errno_shim.o"
+            files["errno_shim.c"] = errno_shim_dir / "eacsl_errno_shim.c"
         return files
 
     if enable_l2 is None:
@@ -871,6 +876,8 @@ def _compile_eacsl_binary_uncached(
     unless `rte_initialized` is False, which is recorded in `reduced_checks`. Stage 1 is retried
     once without functions Frama-C reports as unknown; stage 2 is retried once with a generated
     link-only object when Variadic `<fn>_fallback_<N>` symbols are undefined.
+    When the slice reads errno (the fc_stubs/errno.h global) and calls libc functions that set it,
+    stage 2 also links the generated errno shim (`errno_shim`: wrapped functions, or `failed`).
     On success the result's `binary` is the E-ACSL-instrumented executable (`<out>.e-acsl` when
     present) and is guaranteed to contain E-ACSL instrumentation.
     """
@@ -890,6 +897,7 @@ def _compile_eacsl_binary_uncached(
         "stdout": "",
         "stderr": "",
         "variadic_fallbacks": [],
+        "errno_shim": None,
         "rte_select_dropped": [],
         "reduced_checks": [] if rte_initialized else ["-no-rte-initialized"],
     }
@@ -1091,6 +1099,25 @@ def _compile_eacsl_binary_uncached(
                 return _finish(1, "eacsl_init_hook_conflict")
             init_hook = [resolve_fuzz_init_source().as_posix()]
             result["init_hook"] = init_hook[0]
+
+        # fc_stubs/errno.h maps errno to a tracked global (libc's TLS errno is outside E-ACSL's
+        # shadow segments); the shim copies libc's errno into it after each shimmed call.
+        shim = build_errno_shim_object(
+            instrumented_c, out_bin.parent / f"{out_bin.name}_errno_shim", runner=runner, timeout=BUILD_TIMEOUT_S
+        )
+        if shim["status"] == "built":
+            try:
+                ldflags = normalize_passthrough(
+                    f"{ldflags} {shlex.quote(Path(shim['object']).as_posix())} {shim['wrap_flags']}"
+                )
+            except UnsafePassthroughError as exc:
+                log_parts.append(f"Refusing to link errno shim: {exc}\n")
+                return _finish(2, "eacsl_argv_unsafe")
+            result["errno_shim"] = {"status": "built", "wrapped": shim["wrapped"], "object": shim["object"]}
+        elif shim["status"] == "error":
+            # Not fatal: the target still builds, but reads stale errno after these calls.
+            result["errno_shim"] = {"status": "failed", "wrapped": [], "unsynced": shim["wrapped"]}
+            log_parts.append(f"errno shim not linked: {shim.get('reason')}\n")
 
         def _stage2(link: str) -> tuple[list[str], int, str, str]:
             cmd2 = [eacsl_bin, "-C", "-G", "clang", "-e", flags["backend"], "-O", str(out_bin)]
