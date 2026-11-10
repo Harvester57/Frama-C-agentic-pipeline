@@ -1544,7 +1544,9 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 )
                 if u["status"] != "candidate":
                     u["status"] = "blocked"
-                    u["unresolved"] = list(dict.fromkeys(f"{report['status']}: {msg[:180]}" for msg in (issues[:10] or [summary])))
+                    u["unresolved"] = list(
+                        dict.fromkeys(f"{report['status']}: {msg[:180]}" for msg in (issues[:10] or [summary]))
+                    )
                     stats["blocked"] += 1
             continue
         soundness = report.get("soundness", {})
