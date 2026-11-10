@@ -1,6 +1,7 @@
 """
 Contracts of templates/fc_stubs/fc_compat_types.h against the real Frama-C (FRAMAC_DOCKER_TESTS=1), plan
-docs/templates-and-stubs-improvement-plan.md: typed syscalls (S6), the LP64 assertion (S9).
+docs/templates-and-stubs-improvement-plan.md: typed syscalls (S6), the LP64 assertion (S9), the wipe
+contracts (M6).
 """
 
 from __future__ import annotations
@@ -139,3 +140,73 @@ def test_a_non_lp64_machdep_stops_at_parse_time(tmp_path):
     bad = log.split("==x86_32==", 1)[1]
     assert "rc=0" in good, good
     assert "rc=0" not in bad and "assumes an LP64 machdep" in bad, bad
+
+
+# ---------------------------------------------------------------------------------------------------
+# M6: a wipe through explicit_bzero or memset_s proves without a loop
+# ---------------------------------------------------------------------------------------------------
+
+WIPE_C = r"""#include <string.h>
+#include <stdint.h>
+
+static char ckey[16];
+static char mkey[16];
+static unsigned char ukey[16];
+static uint8_t u8key[32];
+
+/*@ assigns ckey[0 .. 15];
+    ensures wiped: \forall integer i; 0 <= i < 16 ==> ckey[i] == 0; */
+void close_c(void) { explicit_bzero(ckey, sizeof ckey); }
+
+/*@ assigns mkey[0 .. 15];
+    ensures wiped: \forall integer i; 0 <= i < 16 ==> mkey[i] == 0; */
+void close_m(void) { (void)memset_s(mkey, sizeof mkey, 0, sizeof mkey); }
+
+/*@ assigns ukey[0 .. 15];
+    ensures wiped: \forall integer i; 0 <= i < 16 ==> ukey[i] == 0; */
+void close_u(void) { explicit_bzero(ukey, sizeof ukey); }
+
+/*@ assigns u8key[0 .. 31];
+    ensures wiped: \forall integer i; 0 <= i < 32 ==> u8key[i] == 0; */
+void close_u8(void) { (void)memset_s(u8key, sizeof u8key, 0, sizeof u8key); }
+
+/*@ assigns ckey[0 .. 15];
+    ensures wiped: \forall integer i; 0 <= i < 16 ==> ckey[i] == 0; */
+void close_short(void) { explicit_bzero(ckey, 8); }
+
+int main(void) {
+  ckey[3] = 7; close_c();
+  mkey[3] = 7; close_m();
+  /*@ assert eva_wiped: ckey[3] == 0 && mkey[15] == 0; */
+  return 0;
+}
+"""
+
+
+def _wp_unproved(log: str, tag: str) -> set[str]:
+    section = log.split(f"=={tag}==", 1)[1].split("==", 1)[0]
+    return set(re.findall(r"\[wp\] \[(?:Timeout|Unknown|Failed)\] (\S+)", section))
+
+
+@image
+@slow
+def test_a_wipe_through_explicit_bzero_or_memset_s_proves_without_a_loop(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    wp = (
+        'frama-c -no-unicode w.c -cpp-extra-args="$A" -wp -wp-check-memory-model -wp-rte -wp-timeout 20 '
+        "-wp-cache none -wp-fct close_c,close_m,close_u,close_u8,close_short -wp-model"
+    )
+    script = (
+        FRAMAC_FLAGS + f'echo "==typed=="; {wp} Typed 2>&1; echo "==cast=="; {wp} Typed+cast 2>&1; '
+        'echo "==eva=="; frama-c -no-unicode w.c -cpp-extra-args="$A" -eva 2>&1; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"w.c": WIPE_C}, script)
+    typed, cast = _wp_unproved(log, "typed"), _wp_unproved(log, "cast")
+    # Typed, the model whose proofs count: a `char` key, through either function.
+    assert not {g for g in typed if g.startswith(("typed_close_c_", "typed_close_m_"))}, typed
+    # An unsigned char / uint8_t key: Typed rejects its conversion to `void *`; Typed+cast proves it.
+    assert any(g.startswith("typed_close_u_") for g in typed), typed
+    assert not {g for g in cast if g.startswith(("typed_cast_close_u_", "typed_cast_close_u8_"))}, cast
+    # A partial wipe never proves.
+    assert "typed_close_short_ensures_wiped" in typed and "typed_cast_close_short_ensures_wiped" in cast
+    assert "Assertions        1 valid" in log.split("==eva==", 1)[1], log

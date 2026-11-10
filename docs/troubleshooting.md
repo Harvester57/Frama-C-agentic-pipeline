@@ -393,6 +393,11 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - `wp_trivial_clause_only`: every `L4_*`, `L5_*` or `L6_*` clause of that class holds whatever the function does. Write a clause that constrains the output or state.
 - `wp_limits_unmet`: the report has no `limits`, or its contract check did not pass. Re-run with the current `run_wp_function.py`; reports written before verdict limits existed are not credited.
 
+### Symptom: An `L6_wiped_*` Goal Stays Unproven Although the Release Function Calls `explicit_bzero` or `memset_s`
+- **Cause:** `__fc_libc` declares neither function, so before step M6 of [`templates-and-stubs-improvement-plan.md`](templates-and-stubs-improvement-plan.md) the call had no contract (`unsound_proof`) and only a wipe loop with invariants proved. A second cause is WP's Typed model: it reads a `void *` parameter as `char *`, so passing an `unsigned char` or `uint8_t` array is a pointer cast it rejects (`Cast with incompatible pointers types (source: uint8*) (target: sint8*)`), whatever the callee's contract says.
+- **Fix (pipeline, step M6):** `fc_compat_types.h` (`__fc_libc` branch) declares `explicit_bzero(void *, size_t)` and `memset_s(void *, size_t, int, size_t)` with postconditions that state each written element, through `char` and through `unsigned char`, plus `\subset` for Eva and `\initialized`. Verified in the analysis image (`tests/test_fc_compat_contracts.py`, `FRAMAC_DOCKER_TESTS=1`): a wipe of a `char` array through either function proves under Typed with `-wp-check-memory-model`; an `unsigned char` or `uint8_t` array proves under `Typed+cast` only; a partial wipe never proves; Eva reads zeros after the call.
+- **Still open (WP model limit, not a contract defect):** under Typed, which is the only model whose proofs count, an `unsigned char` secret wiped through these functions stays unproven. Write the wipe as a loop with invariants (the prover brief says so), or use a `char` array. Define `FC_STUBS_NO_WIPE_DECLS` when a target defines its own `explicit_bzero` or `memset_s` and the contracts must not apply to that definition.
+
 ### Symptom: `workspace/reports/kb/evolved.json` and `obstructions.json` Never Appear in a Run
 
 - **Seen:** while implementing formal-discovery Tier 1 (dead-end ledger), 2026-11-09, by reading the code; no target run yet.

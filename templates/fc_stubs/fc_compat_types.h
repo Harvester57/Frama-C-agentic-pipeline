@@ -157,6 +157,38 @@ long __fc_syscall_recvfrom(int sockfd, void *buf, size_t len, int flags, void *s
   @*/
 long __fc_syscall_getrandom(void *buf, size_t buflen, unsigned int flags);
 
+/* Wipes (plan step M6): explicit_bzero (glibc <string.h> since 2.25, the BSDs) and memset_s (C11 Annex K),
+ * which __fc_libc lacks. The postconditions state the written range element by element, so a wipe
+ * through them proves an L6 "wiped" property without a loop. Twice: through `char`, which WP Typed proves
+ * for a `char` buffer (Typed reads `void *` as `char *`), and through `unsigned char`, which proves an
+ * `unsigned char` / `uint8_t` buffer only under Typed+cast (Typed rejects the buffer's conversion to
+ * `void *` at the call). `\subset` is the form Eva reduces. A target that defines its own explicit_bzero
+ * or memset_s gets these contracts on its definition; define FC_STUBS_NO_WIPE_DECLS to drop them. */
+#ifndef FC_STUBS_NO_WIPE_DECLS
+/*@ requires valid_s: \valid((char *)s + (0 .. n - 1));
+  @ assigns ((char *)s)[0 .. n - 1] \from \nothing;
+  @ ensures zeroed: \forall integer k; 0 <= k < n ==> ((char *)s)[k] == 0;
+  @ ensures zeroed_bytes: \forall integer k; 0 <= k < n ==> ((unsigned char *)s)[k] == 0;
+  @ ensures zeroed_values: \subset(((char *)s)[0 .. n - 1], {0});
+  @ ensures initialization: \initialized((char *)s + (0 .. n - 1));
+  @*/
+void explicit_bzero(void *s, size_t n);
+
+/* errno_t and rsize_t are `int` and `size_t` (Annex K); the call sets min(n, smax) bytes and fails when
+ * n > smax. */
+/*@ requires valid_s: \valid((char *)s + (0 .. smax - 1));
+  @ assigns ((char *)s)[0 .. (n <= smax ? n : smax) - 1] \from c, indirect:n, indirect:smax;
+  @ assigns \result \from indirect:n, indirect:smax;
+  @ ensures set: \forall integer k; 0 <= k < (n <= smax ? n : smax) ==> ((char *)s)[k] == (char)c;
+  @ ensures set_bytes:
+  @   \forall integer k; 0 <= k < (n <= smax ? n : smax) ==> ((unsigned char *)s)[k] == (unsigned char)c;
+  @ ensures set_values: \subset(((char *)s)[0 .. (n <= smax ? n : smax) - 1], {(char)c});
+  @ ensures initialization: \initialized((char *)s + (0 .. (n <= smax ? n : smax) - 1));
+  @ ensures result: n <= smax ? \result == 0 : \result != 0;
+  @*/
+int memset_s(void *s, size_t smax, int c, size_t n);
+#endif /* FC_STUBS_NO_WIPE_DECLS */
+
 /* Linux <asm-generic/ioctl.h>: the ioctl request encoding (`_IOWR(magic, nr, struct foo)`), which
  * glibc's <sys/ioctl.h> provides and __fc_libc's does not. Without it the struct-type argument is a
  * syntax error. Values are those of x86_64 (and every architecture using the generic layout). */

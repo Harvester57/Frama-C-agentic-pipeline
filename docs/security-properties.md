@@ -104,7 +104,7 @@ Output grammars specific to a format (RFC 5424 structured-data escaping, delimit
 
 A secret `{"name": "session_key", "kind": "global", "function": "session_close"}` becomes:
 
-1. **`L6_wiped_session_key`:** a postcondition of the release function: every element is zero when it returns, on every path (`size` sets the element count of a pointer secret; arrays default to `sizeof`). WP proves a wipe written as a loop with invariants; a `memset` of an `unsigned char` array does not prove under WP's Typed model. WP also cannot see a wipe the compiler drops as a dead store, so the production code should use `explicit_bzero` or a volatile write.
+1. **`L6_wiped_session_key`:** a postcondition of the release function: every element is zero when it returns, on every path (`size` sets the element count of a pointer secret; arrays default to `sizeof`). WP proves a wipe written as a loop with invariants; a `memset` of an `unsigned char` array does not prove under WP's Typed model. `explicit_bzero` and `memset_s` carry contracts in `templates/fc_stubs/fc_compat_types.h` whose postconditions state every zeroed element: a wipe through them proves under Typed for a `char` array, and for an `unsigned char` or `uint8_t` array only under `Typed+cast`, which the pipeline does not credit (Typed rejects the array's conversion to `void *`). WP also cannot see a wipe the compiler drops as a dead store, so the production code should use `explicit_bzero` or a volatile write.
 2. **`L6_no_leak_session_key`:** at every call of an output sink, no argument points into the secret (`\calling`), and a sink the target defines never reads it (`\reading`).
 
 The no-leak check sees direct flows only. A copy of the secret into a buffer that later reaches a sink needs Eva's taint domain (`-eva-domains taint`, `//@ taint ...;` at the source and `//@ assert !\tainted(...);` at the sink, or the upstream `__fc_private` / `security_status` idiom vendored in `docs/upstream/sources/`), which the pipeline does not generate.
@@ -116,5 +116,5 @@ The no-leak check sees direct flows only. A copy of the secret into a buffer tha
 - **Pipeline integration:** `security_props.py run` is a `/framac-slice` step. The generated Makefile runs it as the `security-props` target, which `seed` depends on, and `benchmark.py` and `benchmark_seeded.py` run it as the `security_props` stage before the ledger seed.
 - **L3 over-approximation:** a call to a libc memory writer counts as a pointer write even when its destination is local.
 - **L5 on string literals:** `L5_no_crlf` on a literal argument does not prove, even with Alt-Ergo, Z3 and CVC5 at 10 s.
-- **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop with invariants does.
+- **Wipes under the Typed model:** a `memset` of an `unsigned char` array does not prove; a loop with invariants does. `explicit_bzero` and `memset_s` prove for a `char` array only; an `unsigned char` or `uint8_t` array through them needs `Typed+cast`.
 - **Returned secrets:** a secret of kind `return` gives a warning and no property.
