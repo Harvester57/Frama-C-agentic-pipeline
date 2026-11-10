@@ -91,6 +91,7 @@ MODEL_JSON = Path("workspace/reports/phase0_model.json")
 UNIT_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*$")
 FN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NO_TOUCH = {"deferred", "out_of_scope", "not_applicable"}
+NO_EVIDENCE_STATES = NO_TOUCH
 ALLOWED_MANUAL_STATUSES = frozenset({"planned", "in_progress", "blocked", "deferred", "out_of_scope", "not_applicable"})
 
 
@@ -1537,7 +1538,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 )
                 if u["status"] != "candidate":
                     u["status"] = "blocked"
-                    u["unresolved"] = [f"{report['status']}: {msg[:180]}" for msg in (issues[:10] or [summary])]
+                    u["unresolved"] = list(dict.fromkeys(f"{report['status']}: {msg[:180]}" for msg in (issues[:10] or [summary])))
                     stats["blocked"] += 1
             continue
         soundness = report.get("soundness", {})
@@ -1575,10 +1576,12 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"{counts['unproven']} goal(s) unproven, {counts.get('proven', 0)} proven.",
                 )
                 u["status"] = "blocked"
-                u["unresolved"] = [
-                    f"unproven {g.get('kind') or 'goal'} at line {g.get('line')}: {(g.get('annotation') or '')[:160]}".strip()
-                    for g in goals[:10]
-                ] or [f"{counts['unproven']} unproven goal(s)"]
+                u["unresolved"] = list(
+                    dict.fromkeys(
+                        f"unproven {g.get('kind') or 'goal'} at line {g.get('line')}: {(g.get('annotation') or '')[:160]}".strip()
+                        for g in goals[:10]
+                    )
+                ) or [f"{counts['unproven']} unproven goal(s)"]
                 stats["blocked"] += 1
             elif all_proven and limits_problem:
                 add_evidence(
@@ -2383,6 +2386,12 @@ def cmd_ingest_verifier(
                             u["unresolved"] = [
                                 f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
                             ]
+                elif u["status"] in NO_EVIDENCE_STATES:
+                    u["status"] = "blocked"
+                    if not u.get("unresolved"):
+                        u["unresolved"] = [
+                            f"candidate_rejected ({rej_class}): {rec.get('reason') or 'candidate disproved'}"
+                        ]
 
         if fp in findings:
             _merge_finding_record(findings[fp], rec)
@@ -2589,12 +2598,15 @@ def cmd_scaffold_verifier(
         rec_fp = cand_fp
         refp_reason = None
 
-    fn_units = [
-        u["coverage_id"]
-        for u in units_for_function(units, loc_file, loc_fn)
-        if u["status"] not in ("out_of_scope", "not_applicable")
-    ]
-    linked = fn_units or list(cand.get("linked_units") or [])
+    if decision == "confirmed":
+        fn_units = [
+            u["coverage_id"]
+            for u in units_for_function(units, loc_file, loc_fn)
+            if u["status"] not in ("out_of_scope", "not_applicable")
+        ]
+        linked = fn_units or list(cand.get("linked_units") or [])
+    else:
+        linked = list(cand.get("linked_units") or [])
     tool_outputs = list(cand.get("tool_outputs") or [])
     primary_tool = tool_outputs[0] if tool_outputs else f"workspace/reports/fuzz/{module}.json"
     ev_phase = "eva" if cand.get("origin") == "eva" else "fuzz"

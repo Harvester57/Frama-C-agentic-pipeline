@@ -548,8 +548,9 @@ if ($CodeQL) {
 }
 
 if ($Scratch) {
-    & $EngineName volume inspect "$ScratchVolume" *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $volExists = $false
+    try { $null = & $EngineName volume inspect "$ScratchVolume" 2>$null; if ($LASTEXITCODE -eq 0) { $volExists = $true } } catch {}
+    if (-not $volExists) {
         & $EngineName volume create "--label" "framac.scratch=1" "--label" "framac.repo=$RepoKey" `
             "--label" "framac.run=$RunTag" "$ScratchVolume" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Failed to create scratch volume $ScratchVolume" }

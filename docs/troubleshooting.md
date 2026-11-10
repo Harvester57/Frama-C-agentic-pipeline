@@ -351,6 +351,18 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
 - **Cause:** Windows PowerShell parses unquoted arguments containing `.` or `=` (like `-wp-model=Typed+ref` or `-report-csv=out.csv`) into multiple tokens.
 - **Fix:** Always invoke container commands through [`../wrappers/framac-docker.ps1`](../wrappers/framac-docker.ps1) and double-quote any CLI flag containing `=` or `.`.
 
+### Symptom: `wp_scheduler.py` Rejects Verifier Results with `$.record.linked_units: fewer than 1 items`
+- **Cause:** `schemas/findings.schema.json` globally enforced `minItems: 1` on `linked_units`. When a crash or leak candidate originates from an external standard library stub (such as `FRAMAC_SHARE/libc/stdlib.h#free`) or generated harness code (`harness_<module>.c#unknown_function`), there are no target units in `coverage-ledger.json`, leading `scripts/ledger.py scaffold-verifier` to emit `linked_units: []`, which tripped the schema check and caused the scheduler to discard the result as invalid.
+- **Fix:** Added `linked_units_nonempty` (`minItems: 1`) for `confirmed` findings in [`../schemas/findings.schema.json`](../schemas/findings.schema.json) while permitting empty `linked_units` for `rejected` candidate records. (Status: fixed).
+
+### Symptom: `ingest-verifier refused the result: deferred unit must not hide evidence (use 'blocked' for partial work)`
+- **Cause:** When `cmd_scaffold_verifier` scaffolded a `rejected` result for a function containing `deferred` units (e.g., functions skipped from WP prover dispatch via `shell_unverifiable_wp` or bounded profile), it populated `linked_units` with all non-out-of-scope function units. During ingestion, `cmd_ingest_verifier` added non-discharging reject evidence to each linked unit. Because the units were in status `deferred`, `validate_artifacts.py` rejected the ledger update under the invariant that `deferred` units cannot carry evidence.
+- **Fix:** Updated `cmd_scaffold_verifier` in [`../scripts/ledger.py`](../scripts/ledger.py) so non-confirmed (rejected/needs_validation) candidate scaffolding links only the candidate's actual `linked_units` rather than all function units. In addition, updated `cmd_ingest_verifier` defensively so that if any unit in `NO_EVIDENCE_STATES` (`deferred`, `out_of_scope`, `not_applicable`) receives non-discharging evidence, its status transitions to `blocked` to maintain ledger validity. (Status: fixed).
+
+### Symptom: `refusing to write invalid ledger: $[index].unresolved[N]: duplicate item`
+- **Cause:** When multiple unproven goals on a function had identical annotations or lines (such as multiple pointer accesses or overflows on the same source line), `cmd_ingest_wp` in `scripts/ledger.py` appended them to `u["unresolved"]` without deduplication, violating the `coverage-ledger.schema.json` `uniqueItems: true` constraint.
+- **Fix:** Deduplicated `u["unresolved"]` with `list(dict.fromkeys(...))` in [`../scripts/ledger.py`](../scripts/ledger.py) during WP report ingestion. (Status: fixed).
+
 ---
 
 ## Resources, Caches and Scheduling
