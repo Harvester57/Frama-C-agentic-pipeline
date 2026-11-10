@@ -17,6 +17,8 @@ Subcommands (run with the run directory as working directory):
   record-stub-contracts    [--report workspace/reports/stubs.json] [--check-report workspace/reports/stub_check.json]
                            (the run's stub overlay, scripts/stub_gen.py; its stub-check, scripts/stub_check.py)
   ingest-verifier          <verifier_result.json> [--replay-report <fuzz.json> ...] [--harness-meta <harness_mod.json>]
+                           (settles decision_point.basis from workspace/reports/decision_point/, and
+                           supersedes the rejection of a candidate that later tool evidence reopened)
   transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT] [--expect STATUS ...]
   transition-many          --spec-json JSON|PATH
   close-remaining          --reason TEXT
@@ -38,6 +40,11 @@ L4-L6 unit whose properties MetAcsl loaded and decided statically (no goal left)
 is validated against schemas/ before it is committed atomically; an invalid
 result is never written. Every read-modify-write holds the run-wide `ledger` lock
 (framac_common.run_lock), so concurrent containers of one run never lose updates.
+
+A rejected candidate is reopened when a tool later reproduces a failure at its sink (a breaker
+crash_found, a guardrail code_fault with a crash input, a new fuzz reproducer), unless the verifier
+cited a refuting tool output (`refutation_basis: checked`); see tool_evidence_on_verified_candidate.
+FRAMAC_REJECTION_REOPEN=off restores the earlier behaviour (the signal is evidence only).
 """
 
 from __future__ import annotations
@@ -48,6 +55,7 @@ import copy
 import functools
 import hashlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -57,6 +65,7 @@ from typing import Any, TypeVar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
@@ -326,6 +335,190 @@ def upsert_candidate(
         if note not in cand["notes"]:
             cand["notes"].append(note)
     return cand
+
+
+# ------------------------------------------------- reopening a rejected candidate
+#
+# A rejection made on reasoning alone must not silence a later reproduced crash at the same sink.
+# FRAMAC_REJECTION_REOPEN=off restores the earlier behaviour: the signal is recorded as evidence only.
+REOPEN_ENV = "FRAMAC_REJECTION_REOPEN"
+UNSTATED_BASIS = "unstated"
+# `checked` because ingest read "not reached" from a report (see _dead_code_on_disk): a reproduced
+# crash at that location contradicts the report's reading, so such a rejection is reopened.
+INGEST_RAISED_BASIS_SOURCES = frozenset({"eva_dead", "fuzz_coverage"})
+# Reopenings per candidate when the harness sidecar names no repair budget (generate_harness.py:
+# MAX_HARNESS_REPAIR_ATTEMPTS). The bound is the harness repair budget: a rejected crash can only
+# legitimately come back after a repair of the harness it was found through, and the harness gets
+# `max_repair_attempts` repairs.
+DEFAULT_MAX_REOPENINGS = 2
+HARNESS_DIR = Path("workspace/harnesses")
+
+
+def rejection_reopen_enabled() -> bool:
+    """FRAMAC_REJECTION_REOPEN=off: tool evidence never reopens a rejected candidate (A/B switch)."""
+    return os.environ.get(REOPEN_ENV, "on").strip().lower() != "off"
+
+
+def _harness_state(module: str) -> dict:
+    """Digest of the module's harness source and its repair budget (cwd is the run directory)."""
+    state: dict[str, Any] = {"sha256": None, "repair_attempts": None, "max_reopenings": DEFAULT_MAX_REOPENINGS}
+    source = HARNESS_DIR / f"harness_{module}.c"
+    try:
+        if source.is_file():
+            state["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    try:
+        meta = load_json_optional(HARNESS_DIR / f"harness_{module}.json", {})
+    except ArtifactError:
+        meta = {}
+    if isinstance(meta, dict):
+        with contextlib.suppress(TypeError, ValueError):
+            state["repair_attempts"] = int(meta.get("repair_attempts", 0))
+        with contextlib.suppress(TypeError, ValueError):
+            state["max_reopenings"] = max(0, int(meta.get("max_repair_attempts", DEFAULT_MAX_REOPENINGS)))
+    return state
+
+
+def _rejected_resolution(cand: dict, findings: dict[str, dict]) -> list[dict] | None:
+    """The rejected records a verified candidate resolved to; None unless every resolved record is one."""
+    if cand.get("status") != "verified":
+        return None
+    recs = [findings.get(fp) for fp in cand.get("resolved_fingerprints") or [cand["fingerprint"]]]
+    if not recs or any(r is None or r.get("verdict") != "rejected" for r in recs):
+        return None
+    return [r for r in recs if r is not None]
+
+
+def _attempt_basis_source(units: dict[str, dict], cand: dict, fp: str) -> str | None:
+    """How the last rejection of `fp` got its basis, read from the linked units' attempt entries."""
+    for cid in cand.get("linked_units") or []:
+        for attempt in reversed((units.get(cid) or {}).get("attempts") or []):
+            if attempt.get("decision") == "rejected" and fp in (attempt.get("result_fingerprints") or []):
+                return attempt.get("refutation_basis_source")
+    return None
+
+
+def tool_evidence_on_verified_candidate(
+    units: dict[str, dict],
+    findings: dict[str, dict],
+    cand: dict,
+    *,
+    source: str,
+    phase: str,
+    producer: str,
+    artifact: str,
+    tool_output: str,
+    linked: list[str],
+    already_listed: bool,
+) -> str:
+    """
+    A tool-reproduced signal (`artifact`: a crash input a tool replayed) arrived for a verified
+    candidate. Returns what was done:
+
+    - `not_rejected`: the candidate is not a verified rejection; nothing done.
+    - `known`: the artifact was already listed on the candidate (and the harness of a
+      `harness_induced` rejection has not changed since): no new information, nothing done.
+    - `reopened`: the candidate is `unverified` again, its units are `candidate` again, and a
+      `reopened` entry records the time, the evidence and the rejection's class and basis. The
+      rejected record stays in findings.json until the next verdict supersedes it (ingest-verifier).
+    - `contradicted`: not reopened, the evidence is recorded on the candidate
+      (`contradicting_evidence`) and on the units, with the reason:
+      `checked_rejection` (the verifier cited a tool output that refutes the candidate; for a
+      `harness_induced` rejection this holds only while the harness is the one it was made on),
+      `harness_unchanged` (a `harness_induced` rejection and the same harness source: the crash
+      recurring through the unrepaired harness says nothing new) or `reopen_limit`.
+    """
+    recs = _rejected_resolution(cand, findings)
+    if recs is None:
+        return "not_rejected"
+    fp = cand["fingerprint"]
+    primary = recs[0]
+    rej_class = primary["rejection_class"]
+    basis = primary.get("refutation_basis") or UNSTATED_BASIS
+    last = cand.get("last_rejection")
+    ctx: dict = last if isinstance(last, dict) else {}
+
+    def source_of(rec: dict) -> str | None:
+        recorded = ctx.get("refutation_basis_source") if rec is primary else None
+        return recorded or _attempt_basis_source(units, cand, rec["fingerprint"])
+
+    basis_source = source_of(primary)
+    harness = _harness_state(_candidate_harness_module(ModuleMap.load("."), cand))
+    rejected_sha = ctx.get("harness_sha256")
+    harness_known = bool(rejected_sha and harness["sha256"])
+    harness_changed = harness_known and rejected_sha != harness["sha256"]
+
+    if already_listed and not (rej_class == "harness_induced" and harness_changed):
+        return "known"
+
+    # What a verifier cited about a `harness_induced` rejection speaks for the harness it was made on.
+    verifier_checked = not (rej_class == "harness_induced" and harness_changed) and any(
+        r.get("refutation_basis") == "checked" and source_of(r) not in INGEST_RAISED_BASIS_SOURCES for r in recs
+    )
+    reason: str | None = None
+    if verifier_checked:
+        reason = "checked_rejection"
+    elif rej_class == "harness_induced" and harness_known and not harness_changed:
+        reason = "harness_unchanged"
+    elif len(cand.get("reopened") or []) >= harness["max_reopenings"]:
+        reason = "reopen_limit"
+
+    described = {"rejection_class": rej_class, "refutation_basis": basis}
+    if basis_source:
+        described["refutation_basis_source"] = basis_source
+    evidence = {"source": source, "artifact": artifact, "tool_output": tool_output}
+    affected = [cid for cid in dict.fromkeys([*linked, *(cand.get("linked_units") or [])]) if cid in units]
+
+    if reason is not None:
+        seen = cand.setdefault("contradicting_evidence", [])
+        if all((e.get("artifact"), e.get("reason")) != (artifact, reason) for e in seen):
+            seen.append({"at": utc_now(), **evidence, "reason": reason, **described})
+        for cid in affected:
+            add_evidence(
+                units[cid],
+                phase,
+                producer,
+                "rejection_contradicted",
+                False,
+                tool_output,
+                f"A reproduced failure contradicts the rejection ({rej_class}, basis {basis}) of {fp}; "
+                f"not reopened: {reason}.",
+                {"artifact": artifact, "fingerprint": fp, "reason": reason},
+            )
+        return "contradicted"
+
+    entry: dict[str, Any] = {
+        "at": utc_now(),
+        "evidence": evidence,
+        **described,
+        "rejected_fingerprints": [r["fingerprint"] for r in recs],
+    }
+    if rej_class == "harness_induced" and harness_known:
+        entry["harness_changed"] = harness_changed
+    if cand.get("refingerprint_reason"):
+        entry["refingerprint_reason"] = cand["refingerprint_reason"]
+    cand.setdefault("reopened", []).append(entry)
+    cand["status"] = "unverified"
+    cand["proposed_verdict"] = "confirmed"
+    cand.pop("resolved_fingerprints", None)
+    cand.pop("refingerprint_reason", None)
+    for cid in affected:
+        u = units[cid]
+        if u["status"] in ("out_of_scope", "not_applicable"):
+            continue
+        u["attempts"].append(
+            {
+                "phase": phase,
+                "agent_id": None,
+                "decision": "reopened",
+                **described,
+                "evidence": artifact,
+                "result_fingerprints": [fp],
+            }
+        )
+        mark_candidate(u, fp)
+    return "reopened"
 
 
 def rel(path: str) -> str:
@@ -816,6 +1009,8 @@ def fuzz_engine_note(report: dict) -> str:
 @ledger_locked
 def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
+    reopen = rejection_reopen_enabled()
+    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])} if reopen else {}
     mm = ModuleMap.load(".")
     # A failure lands on the function its line lies in, as Eva rows do (a renamed static, `f_0`,
     # still credits `f`); the reported name, through the model's kernel_names, only without a line.
@@ -889,6 +1084,9 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 if not linked:
                     notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
                 note = "; ".join(notes) or None
+                prior = candidates.get(fp)
+                already_listed = prior is not None and artifact_rel in prior["reproducers"]
+                rejected_before = reopen and prior is not None and _rejected_resolution(prior, findings) is not None
                 upsert_candidate(
                     candidates,
                     fp,
@@ -916,7 +1114,25 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                         f"{engine_note} failure {failure.get('alarm_kind') or failure.get('kind')} at line {failure.get('line')}.",
                         {"artifact": artifact_rel, "reproducible": art.get("reproducible")},
                     )
-                    mark_candidate(units[cid], fp)
+                    if not rejected_before:
+                        mark_candidate(units[cid], fp)
+                if rejected_before and art.get("reproducible"):
+                    # A reproducer replayed by the campaign on a rejected candidate: reopen it or
+                    # record the contradiction. Its units stay as the rejection left them otherwise.
+                    outcome = tool_evidence_on_verified_candidate(
+                        units,
+                        findings,
+                        candidates[fp],
+                        source="fuzz_reproducer",
+                        phase="fuzz",
+                        producer="run_eacsl_fuzz.py",
+                        artifact=artifact_rel,
+                        tool_output=tool_output,
+                        linked=linked,
+                        already_listed=already_listed,
+                    )
+                    if outcome in ("reopened", "contradicted"):
+                        stats[outcome] = stats.get(outcome, 0) + 1
             else:
                 kind = art.get("kind", "crash")
                 digest = hashlib.sha256(
@@ -2154,6 +2370,9 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         raise LedgerError(f"ingest-agent-hypothesis expects prover or breaker result (got {role!r})")
 
     units, candidates = load_state()
+    reopen = rejection_reopen_enabled()
+    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])} if reopen else {}
+    reopen_outcomes: list[str] = []
     aid = res["agent_id"]
     file = normalize_file(res["file"])
     fn = res["function"]
@@ -2284,6 +2503,8 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         prom_res = promote_file(Path.cwd(), aid, rel(str(result_path)), kind="artifact")
         tool_out = str(prom_res["dest"])
         note = str(res.get("analysis") or "breaker reproduced crash")
+        already_listed = existing_cand is not None and crash_rel in existing_cand["reproducers"]
+        verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
         upsert_candidate(
             candidates,
             fp,
@@ -2312,11 +2533,28 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
                 mark_candidate(units[cid], fp)
         if existing_cand is None:
             candidates_added += 1
+        elif reopen and verified_before:
+            reopen_outcomes.append(
+                tool_evidence_on_verified_candidate(
+                    units,
+                    findings,
+                    existing_cand,
+                    source="breaker_crash_found",
+                    phase="breaker",
+                    producer=aid,
+                    artifact=crash_rel,
+                    tool_output=tool_out,
+                    linked=linked,
+                    already_listed=already_listed,
+                )
+            )
 
     code_faults_recorded = 0
     if role == "prover":
         for report_rel in _prover_code_fault_reports(res, aid):
-            added = _ingest_prover_code_fault(units, candidates, aid, mod, report_rel)
+            added = _ingest_prover_code_fault(
+                units, candidates, aid, mod, report_rel, findings if reopen else None, reopen_outcomes
+            )
             code_faults_recorded += 1
             candidates_added += added
 
@@ -2329,6 +2567,12 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         "strengthening_requests_added": strengthening_requests_added,
         "proof_gaps_recorded": 1 if pg is not None else 0,
         "code_faults_recorded": code_faults_recorded,
+        **({"candidates_reopened": reopen_outcomes.count("reopened")} if "reopened" in reopen_outcomes else {}),
+        **(
+            {"rejections_contradicted": reopen_outcomes.count("contradicted")}
+            if "contradicted" in reopen_outcomes
+            else {}
+        ),
     }
 
 
@@ -2396,13 +2640,16 @@ def _ingest_prover_code_fault(
     aid: str,
     mod: str,
     report_rel: str,
+    findings: dict[str, dict] | None = None,
+    reopen_outcomes: list[str] | None = None,
 ) -> int:
     """
     Turn a prover's guardrail `code_fault` into a candidate (remediation plan H8), mirroring the breaker
     `crash_found` branch: the guardrail report is promoted and recorded as the tool output, the crashing
     input (when libFuzzer wrote one under the agent's scratch) is promoted as a crash reproducer, and the
     function's units of the failing obligation class are linked and marked `candidate`. Returns 1 when a
-    new candidate was created.
+    new candidate was created. With `findings` (FRAMAC_REJECTION_REOPEN on), a crash input on a rejected
+    candidate reopens it or is recorded as contradicting evidence (tool_evidence_on_verified_candidate).
     """
     src = Path(report_rel)
     prom_report = promote_file(
@@ -2437,6 +2684,8 @@ def _ingest_prover_code_fault(
         note += "; the crashing input was not found under the agent scratch, verifier must reproduce"
     if not linked:
         note += f"; no ledger unit for {ffile}#{ffn}::{cls} (harness or unseeded code)"
+    already_listed = existing_cand is not None and crash_rel is not None and crash_rel in existing_cand["reproducers"]
+    verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
     upsert_candidate(
         candidates,
         fp,
@@ -2463,6 +2712,21 @@ def _ingest_prover_code_fault(
         )
         if existing_cand is None or existing_cand.get("status") == "unverified":
             mark_candidate(units[cid], fp)
+    if findings is not None and existing_cand is not None and verified_before and crash_rel is not None:
+        outcome = tool_evidence_on_verified_candidate(
+            units,
+            findings,
+            existing_cand,
+            source="guardrail_code_fault",
+            phase="wp",
+            producer=aid,
+            artifact=crash_rel,
+            tool_output=tool_out,
+            linked=linked,
+            already_listed=already_listed,
+        )
+        if reopen_outcomes is not None:
+            reopen_outcomes.append(outcome)
     return 1 if existing_cand is None else 0
 
 
@@ -2695,6 +2959,143 @@ def _merge_finding_record(existing: dict, incoming: dict) -> None:
                     existing[key].append(item)
 
 
+EVA_REPORT_DIR = Path("workspace/reports/eva")
+COVERAGE_REPORT_DIR = Path("workspace/reports/coverage")
+
+
+def _row_line(row: dict) -> int:
+    try:
+        return int(row.get("line") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dead_code_on_disk(run_dir: Path, module: str, location: dict) -> dict | None:
+    """
+    Tool output already on disk that agrees with a `dead_code` rejection at `location`, or None.
+
+    - Eva: the module's report completed and lists a Dead property at the file and line, and no Invalid,
+      Unknown or inconsistent property there.
+    - Phase 1 coverage: the module's coverage report is complete (`status: ok`) and the function was
+      never executed.
+
+    Both say "not reached under this module's harness", which is what the verifier claims. A missing,
+    unreadable or incomplete report agrees with nothing.
+    """
+    loc_file = normalize_file(str(location.get("file") or ""))
+    loc_fn = str(location.get("function") or "")
+    loc_line = _row_line(location)
+    if not loc_file or loc_line < 1:
+        return None
+
+    def load(path: Path) -> dict:
+        try:
+            data = load_json_optional(run_dir / path, {})
+        except ArtifactError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def here(row: object) -> bool:
+        return (
+            isinstance(row, dict)
+            and bool(row.get("file"))
+            and eva_alarm_in_file(row, loc_file)
+            and _row_line(row) == loc_line
+        )
+
+    eva_path = EVA_REPORT_DIR / f"{module}.json"
+    eva = load(eva_path)
+    if eva.get("status") == "ok":
+        dead = eva.get("dead_alarms")
+        unknown = eva.get("unknown_obligations_by_function")
+        live: list = [
+            *(eva.get("invalid_alarms") or []),
+            *(eva.get("other_properties") or []),
+            *(row for rows in (unknown.values() if isinstance(unknown, dict) else []) for row in rows or []),
+        ]
+        if any(here(r) for r in (dead if isinstance(dead, list) else [])) and not any(here(r) for r in live):
+            return {
+                "source": "eva_dead",
+                "phase": "eva",
+                "tool_output": eva_path.as_posix(),
+                "description": f"Eva reports the properties at {loc_file}:{loc_line} Dead under the module harness.",
+            }
+
+    cov_path = COVERAGE_REPORT_DIR / f"{module}.json"
+    cov = load(cov_path)
+    if cov.get("status") == "ok" and loc_fn:
+        rows = [
+            f
+            for f in cov.get("functions") or []
+            if isinstance(f, dict)
+            and f.get("function") == loc_fn
+            and normalize_file(str(f.get("file") or "")) == loc_file
+        ]
+        if rows and all(f.get("executions") == 0 for f in rows):
+            return {
+                "source": "fuzz_coverage",
+                "phase": "fuzz",
+                "tool_output": cov_path.as_posix(),
+                "description": f"Phase 1 coverage: no corpus input executed {loc_fn} ({loc_file}).",
+            }
+    return None
+
+
+def _open_reopening(cand: dict) -> dict | None:
+    """The `reopened` entry of a candidate that awaits its next verdict, else None."""
+    entries = cand.get("reopened") or []
+    if cand.get("status") != "unverified" or not entries or "resolved" in entries[-1]:
+        return None
+    return entries[-1]
+
+
+def _prior_verdict(old: dict, reopening: dict) -> dict:
+    """What stays in findings.json of a rejected record superseded after its candidate was reopened."""
+    prior = {k: old[k] for k in ("verdict", "fingerprint", "rejection_class", "reason", "evidence", "verifier")}
+    if old.get("refutation_basis"):
+        prior["refutation_basis"] = old["refutation_basis"]
+    prior["superseded_at"] = utc_now()
+    prior["reopened_by"] = dict(reopening["evidence"])
+    return prior
+
+
+def _settle_decision_point_basis(run_dir: Path, cand_fp: str, rec: dict) -> dict | None:
+    """
+    Settle `decision_point.basis` of a confirmed / needs_validation record against the patch-and-replay
+    report on disk (decision_point_check.py), as _dead_code_on_disk does for a `dead_code` rejection:
+
+    - an agreeing report (same candidate, same decision point, the patch at that location, status
+      `checked`) raises the basis to `checked` and is cited in the record's evidence;
+    - a stated `checked` without one is lowered to `located`.
+
+    Returns the fields for the units' attempt entry, or None for a record with no basis at all.
+    Recorded and reported only: no unit status and no severity depends on it.
+    """
+    dp = rec["decision_point"]
+    stated = dp.get("basis")
+    agrees = decision_point_check.agreeing_report(run_dir, cand_fp, rec["fingerprint"], dp)
+    basis = stated
+    fields: dict[str, Any] = {}
+    if agrees is not None:
+        basis = "checked"
+        fields["decision_point_basis_source"] = "patch_replay"
+        fields.update(agrees["flags"])
+        cited = {"phase": "verifier", "tool_output": agrees["tool_output"], "description": agrees["description"]}
+        if all(e.get("tool_output") != cited["tool_output"] for e in rec["evidence"]):
+            rec["evidence"].append(cited)
+    elif stated == "checked":
+        basis = "located"
+        fields["decision_point_basis_lowered"] = decision_point_check.disagreement(
+            run_dir, cand_fp, rec["fingerprint"], dp
+        )
+    if basis is None:
+        return None
+    dp["basis"] = basis
+    if basis != stated:
+        fields["decision_point_basis_stated"] = stated or UNSTATED_BASIS
+    return {"decision_point_basis": basis, **fields}
+
+
 @ledger_locked
 def cmd_ingest_verifier(
     result_path: Path,
@@ -2721,6 +3122,15 @@ def cmd_ingest_verifier(
         raise LedgerError(f"unknown candidate_fingerprint: {cand_fp}")
     cand = candidates[cand_fp]
     module = _candidate_harness_module(ModuleMap.load(run_dir), cand)
+
+    # A reopened candidate: this verdict supersedes the rejected record(s) it was reopened from. They
+    # leave findings.json here and come back as `prior_verdicts` of the new record (see below).
+    reopening = _open_reopening(cand)
+    superseded: list[dict] = []
+    for old_fp in (reopening or {}).get("rejected_fingerprints") or []:
+        if (findings.get(old_fp) or {}).get("verdict") == "rejected":
+            superseded.append(findings.pop(old_fp))
+    rejection_sources: dict[str, str | None] = {}
 
     reproducible_shas = _collect_reproducible_shas(
         run_dir,
@@ -2754,6 +3164,18 @@ def cmd_ingest_verifier(
 
         verdict = rec["verdict"]
         primary_ev_out = rec["evidence"][0]["tool_output"] if rec.get("evidence") else None
+        rec.pop("prior_verdicts", None)  # written by this command only, never taken from a verifier
+        dp_attempt: dict | None = None
+        if verdict in ("confirmed", "needs_validation") and isinstance(rec.get("decision_point"), dict):
+            fields = _settle_decision_point_basis(run_dir, cand_fp, rec)
+            if fields is not None:
+                dp_attempt = {
+                    "phase": "verifier",
+                    "agent_id": aid,
+                    "decision": verdict,
+                    **fields,
+                    "result_fingerprints": [fp],
+                }
 
         if verdict == "confirmed":
             for rep in rec["reproducers"]:
@@ -2799,6 +3221,8 @@ def cmd_ingest_verifier(
                     primary_ev_out,
                     f"Crash verifier confirmed {fp} ({rec['severity']}).",
                 )
+                if dp_attempt is not None and dp_attempt not in u["attempts"]:
+                    u["attempts"].append(dp_attempt)
                 mark_candidate(u, fp)
 
         elif verdict == "needs_validation":
@@ -2817,10 +3241,26 @@ def cmd_ingest_verifier(
                     primary_ev_out,
                     f"Crash verifier classified {fp} as needs_validation.",
                 )
+                if dp_attempt is not None and dp_attempt not in u["attempts"]:
+                    u["attempts"].append(dp_attempt)
                 mark_candidate(u, fp)
 
         elif verdict == "rejected":
             rej_class = rec["rejection_class"]
+            # Evidence basis of the rejection (record and report only: no unit status depends on it).
+            stated_basis = rec.get("refutation_basis") or UNSTATED_BASIS
+            basis = stated_basis
+            basis_source: str | None = None
+            if rej_class == "dead_code" and basis != "checked":
+                agrees = _dead_code_on_disk(run_dir, module, rec["location"])
+                if agrees is not None:
+                    basis = "checked"
+                    basis_source = agrees["source"]
+                    rec["refutation_basis"] = basis
+                    cited = {k: agrees[k] for k in ("phase", "tool_output", "description")}
+                    if all(e.get("tool_output") != cited["tool_output"] for e in rec["evidence"]):
+                        rec["evidence"].append(cited)
+            rejection_sources[fp] = basis_source
             affected_cids = set(rec["linked_units"]) | set(cand.get("linked_units") or [])
             for cid in sorted(affected_cids):
                 if cid not in units:
@@ -2834,9 +3274,13 @@ def cmd_ingest_verifier(
                     "agent_id": aid,
                     "decision": "rejected",
                     "rejection_class": rej_class,
+                    "refutation_basis": basis,
                     "reason": rec["reason"],
                     "result_fingerprints": [fp],
                 }
+                if basis != stated_basis:
+                    attempt_entry["refutation_basis_stated"] = stated_basis
+                    attempt_entry["refutation_basis_source"] = basis_source
                 if attempt_entry not in u["attempts"]:
                     u["attempts"].append(attempt_entry)
                 add_evidence(
@@ -2846,7 +3290,7 @@ def cmd_ingest_verifier(
                     f"rejected:{rej_class}",
                     False,
                     primary_ev_out,
-                    f"Rejected ({rej_class}): {rec['reason'][:140]}",
+                    f"Rejected ({rej_class}, basis {basis}): {rec['reason'][:140]}",
                 )
                 if not u["result_fingerprints"] and u["status"] == "candidate":
                     if rej_class == "harness_induced" and not harness_exhausted:
@@ -2897,10 +3341,61 @@ def cmd_ingest_verifier(
             else:
                 findings[fp] = rec
 
+    if reopening is not None:
+        # The history stays in findings.json: the superseded rejection(s), oldest first, on the record
+        # that now answers for the candidate.
+        target = findings[resolved_fps[0]]
+        history = list(target.get("prior_verdicts") or [])
+        for old in superseded:
+            for prior in [*(old.get("prior_verdicts") or []), _prior_verdict(old, reopening)]:
+                if all((h["fingerprint"], h["reason"]) != (prior["fingerprint"], prior["reason"]) for h in history):
+                    history.append(prior)
+        if history:
+            target["prior_verdicts"] = history
+        for old in superseded:
+            old_fp = old["fingerprint"]
+            if old_fp in findings:
+                continue
+            # Another candidate merged into the superseded record follows it to the new one.
+            for other in candidates.values():
+                other_fps = other.get("resolved_fingerprints") or [other["fingerprint"]]
+                if other is cand or other.get("status") != "verified" or old_fp not in other_fps:
+                    continue
+                other["resolved_fingerprints"] = list(
+                    dict.fromkeys(resolved_fps[0] if x == old_fp else x for x in other_fps)
+                )
+                if not other.get("refingerprint_reason"):
+                    other["refingerprint_reason"] = (
+                        f"Rejected finding {old_fp} was superseded by {resolved_fps[0]} "
+                        f"after candidate {cand_fp} was reopened."
+                    )
+        reopening["resolved"] = {
+            "at": utc_now(),
+            "decision": res["decision"],
+            "resolved_fingerprints": list(resolved_fps),
+        }
+
     cand["status"] = "verified"
     cand["resolved_fingerprints"] = resolved_fps
     if res.get("refingerprint_reason"):
         cand["refingerprint_reason"] = res["refingerprint_reason"]
+
+    # What a later tool signal needs to know about this rejection (tool_evidence_on_verified_candidate).
+    cand.pop("last_rejection", None)
+    resolved_recs = [findings[x] for x in resolved_fps]
+    if rejection_reopen_enabled() and all(r["verdict"] == "rejected" for r in resolved_recs):
+        harness = _harness_state(module)
+        last: dict[str, Any] = {
+            "at": utc_now(),
+            "rejection_class": resolved_recs[0]["rejection_class"],
+            "refutation_basis": resolved_recs[0].get("refutation_basis") or UNSTATED_BASIS,
+            "harness_sha256": harness["sha256"],
+            "repair_attempts": harness["repair_attempts"],
+        }
+        source = rejection_sources.get(records[0]["fingerprint"])
+        if source:
+            last["refutation_basis_source"] = source
+        cand["last_rejection"] = last
 
     commit(units, candidates, findings, run_dir=run_dir)
     return {
@@ -2908,6 +3403,7 @@ def cmd_ingest_verifier(
         "decision": res["decision"],
         "resolved_fingerprints": resolved_fps,
         "harness_exhausted": harness_exhausted,
+        **({"superseded_rejections": [o["fingerprint"] for o in superseded]} if superseded else {}),
     }
 
 
@@ -3148,10 +3644,24 @@ def cmd_scaffold_verifier(
         "property": {"kind": p_kind, "predicate": p_pred},
     }
 
+    # A placeholder at the sink: the verifier moves it to the earliest outside choice that makes the
+    # failure inevitable and names who controls it (attacker_input, harness_choice or environment).
+    decision_point = {
+        "file": loc_file,
+        "line": loc_line,
+        "function": loc_fn,
+        "controlled_by": "attacker_input",
+        "description": f"Placeholder: fuzz input bytes reach {loc_fn} unvalidated; name the deciding step.",
+        # The weakest basis: `located` once the step is traced in the source; `checked` comes only from
+        # a decision_point_check.py report, which ingest-verifier reads itself.
+        "basis": "model",
+    }
+
     if decision == "confirmed":
         record = {
             **base_fields,
             "root_cause": f"Unchecked input reaches {loc_file}:{loc_line} in {loc_fn}.",
+            "decision_point": decision_point,
             "intended_behavior": f"Validate bounds and preconditions before executing line {loc_line} in {loc_fn}.",
             "trace": [
                 {
@@ -3208,6 +3718,7 @@ def cmd_scaffold_verifier(
             **base_fields,
             "origin": nv_origin,
             "claimed_root_cause": f"Potential {p_kind} at {loc_file}:{loc_line} in {loc_fn}.",
+            "decision_point": decision_point,
             "trace": [
                 {
                     "kind": "sink",
@@ -3247,6 +3758,8 @@ def cmd_scaffold_verifier(
             ],
             "rejection_class": "harness_induced",
             "reason": f"Candidate in {loc_fn} does not occur under valid entry preconditions.",
+            # The weakest basis: the verifier raises it to `located` or `checked` with what it cites.
+            "refutation_basis": "model",
             "linked_units": linked,
             "verifier": {
                 "agent_id": agent_id,

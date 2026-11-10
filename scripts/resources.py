@@ -1485,6 +1485,8 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"seed_harvest\.py\s+(?:[^\s;&|]+\s+)*?record(?:\s|$)", "phase-dynamic"),
     (r"codeql_trust\.py\s+(?:[^\s;&|]+\s+)*?run(?:\s|$)", "phase-dynamic"),
     (r"run_wp_function\.py", "wp"),
+    # Houdini rounds of WP plus E-ACSL builds and corpus replays: sized like the guardrail, not `light`.
+    (r"loop_seeds\.py", "guardrail"),
     (r"run_eva_slice\.py", "eva"),
     (r"eva_tuning\.py", "eva"),
     (r"function_facts\.py", "eva"),

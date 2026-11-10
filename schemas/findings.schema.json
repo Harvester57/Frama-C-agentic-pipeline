@@ -87,6 +87,59 @@
       "additionalProperties": false
     },
     "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api"]},
+    "decision_point": {
+      "type": "object",
+      "description": "Optional. The earliest step at which a value chosen outside the target makes the failure inevitable, and who controls that value. A reviewed claim of the verifier, not an analysis result.",
+      "properties": {
+        "file": {"$ref": "#/definitions/relpath"},
+        "line": {"type": "integer", "minimum": 1},
+        "function": {"$ref": "#/definitions/text"},
+        "controlled_by": {"type": "string", "enum": ["attacker_input", "harness_choice", "environment"]},
+        "description": {"$ref": "#/definitions/text"},
+        "basis": {
+          "type": "string",
+          "description": "Optional. What the decision point rests on: 'checked' (set by ledger.py ingest-verifier only, from an agreeing scripts/decision_point_check.py report: a patch at that location removes the failure for the recorded reproducers, nothing more), 'located' (traced in the source, file and line cited), 'model' (reasoning only).",
+          "enum": ["checked", "located", "model"]
+        }
+      },
+      "required": ["file", "line", "function", "controlled_by", "description"],
+      "additionalProperties": false
+    },
+    "prior_verdicts": {
+      "type": "array",
+      "description": "Written by ledger.py ingest-verifier only. The rejection(s) this record superseded after later tool evidence reopened the candidate, oldest first.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "verdict": {"const": "rejected"},
+          "fingerprint": {"$ref": "#/definitions/fingerprint"},
+          "rejection_class": {"type": "string", "enum": ["harness_induced", "dead_code", "toolchain_artifact", "contract_overconstraint", "disproved_by_source", "duplicate", "other"]},
+          "reason": {"$ref": "#/definitions/text"},
+          "refutation_basis": {"$ref": "#/definitions/refutation_basis"},
+          "evidence": {"$ref": "#/definitions/evidence"},
+          "verifier": {"$ref": "#/definitions/verifier"},
+          "superseded_at": {"type": "string", "minLength": 1},
+          "reopened_by": {
+            "type": "object",
+            "properties": {
+              "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer"]},
+              "artifact": {"$ref": "#/definitions/relpath"},
+              "tool_output": {"$ref": "#/definitions/relpath"}
+            },
+            "required": ["source", "artifact", "tool_output"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["verdict", "fingerprint", "rejection_class", "reason", "evidence", "verifier", "superseded_at", "reopened_by"],
+        "additionalProperties": false
+      }
+    },
+    "refutation_basis": {
+      "type": "string",
+      "description": "Optional. What a rejection rests on: 'checked' (a tool output cited in evidence refutes the candidate), 'located' (file and line of the check or dead branch, no tool output), 'model' (reasoning only).",
+      "enum": ["checked", "located", "model"]
+    },
     "confirmed": {
       "type": "object",
       "description": "A reproduced E-ACSL failure in target code through a harness that respected the entry function's contract.",
@@ -98,6 +151,8 @@
         "location": {"$ref": "#/definitions/location"},
         "property": {"$ref": "#/definitions/property"},
         "root_cause": {"$ref": "#/definitions/text"},
+        "decision_point": {"$ref": "#/definitions/decision_point"},
+        "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
         "intended_behavior": {"$ref": "#/definitions/text"},
         "trace": {"$ref": "#/definitions/trace"},
         "evidence": {"$ref": "#/definitions/evidence"},
@@ -160,6 +215,8 @@
         "property": {"$ref": "#/definitions/property"},
         "origin": {"type": "string", "enum": ["eva_invalid_no_witness", "fault_hypothesis", "fuzz_timeout_or_oom", "fuzz_unreproduced"]},
         "claimed_root_cause": {"$ref": "#/definitions/text"},
+        "decision_point": {"$ref": "#/definitions/decision_point"},
+        "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
         "trace": {"$ref": "#/definitions/trace"},
         "evidence": {"$ref": "#/definitions/evidence"},
         "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api", "unknown"]},
@@ -181,7 +238,7 @@
     },
     "rejected": {
       "type": "object",
-      "description": "A candidate disproved during verification, retained to suppress the identical claim in later runs.",
+      "description": "A candidate disproved during verification, retained so the identical claim is not verified twice in this run; a new reproduced failure can reopen it (ledger.py, FRAMAC_REJECTION_REOPEN).",
       "properties": {
         "verdict": {"const": "rejected"},
         "fingerprint": {"$ref": "#/definitions/fingerprint"},
@@ -193,6 +250,8 @@
         "evidence": {"$ref": "#/definitions/evidence"},
         "rejection_class": {"type": "string", "enum": ["harness_induced", "dead_code", "toolchain_artifact", "contract_overconstraint", "disproved_by_source", "duplicate", "other"]},
         "reason": {"$ref": "#/definitions/text"},
+        "refutation_basis": {"$ref": "#/definitions/refutation_basis"},
+        "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
         "linked_units": {"$ref": "#/definitions/linked_units"},
         "verifier": {"$ref": "#/definitions/verifier"}
       },

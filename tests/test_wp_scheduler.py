@@ -2099,3 +2099,30 @@ def test_status_counts_units_carried_forward_from_an_earlier_run(sim):
     init = S.cmd_init()
     assert init["by_kind"] == {"prove": {"pending": 1}}  # the carried function gets no prove task
     assert S.cmd_status()["carried_forward"] == 1
+
+
+def test_a_candidate_the_ledger_reopened_gets_its_verify_task_back_once(sim):
+    sim.build({"f": ("src/m/f.c", "m", []), "h": ("src/m/h.c", "m", [])}, sidecars={"m": {}})
+    fp = sim.eva_candidate("m", "src/m/f.c", "f")
+    S.cmd_init()
+    ver = S.cmd_next("auto", prepare=True)["tasks"][0]
+    L.cmd_scaffold_verifier(
+        fp, "rejected", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json")
+    )
+    S.cmd_complete(ver["agent_id"])
+    assert tasks()[f"verify:{fp}"]["state"] == "done"
+
+    # A verify task that is terminal while its candidate is unverified is left alone without a ledger reopening.
+    cands = load("candidates.json")
+    cands[0]["status"] = "unverified"
+    write_json(Path("candidates.json"), cands)
+    assert f"verify:{fp}" not in S.cmd_refresh()["sync"]["reopened"]
+    assert tasks()[f"verify:{fp}"]["state"] == "done"
+
+    # ledger.py reopened it on new tool evidence: one more verifier, with a fresh agent id.
+    cands[0]["reopened"] = [{"at": "2026-11-10T00:00:00Z"}]
+    write_json(Path("candidates.json"), cands)
+    assert f"verify:{fp}" in S.cmd_refresh()["sync"]["reopened"]
+    task = tasks()[f"verify:{fp}"]
+    assert task["state"] == "pending" and task["candidate_reopens"] == 1
+    assert f"verify:{fp}" not in S.cmd_refresh()["sync"]["reopened"]

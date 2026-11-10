@@ -87,6 +87,25 @@ A function may not reach a prover at all: when an earlier run's `wp-sweep` publi
 
 These are hints. Eva's locations hold only under the harness (`a[0..15]`, not `out[0 .. n - 1]`), so the prover restates them over the formals, and WP remains the only judge of `assigns`.
 
+### Loop Invariant Seeds (`FRAMAC_LOOP_SEEDS=on`, off by default)
+
+Eva does not hold the index-against-length relation at a widened loop head ([`./papers-generalization-plan.md`](./papers-generalization-plan.md), Tier 1, "Step 0 result"), so loop invariant candidates come from the loop facts and are filtered by the two oracles ([`../scripts/loop_seeds.py`](../scripts/loop_seeds.py)):
+
+1. **Syntactic candidates**, over the function's own formals and locals:
+   - `0 <= i` for a signed counter (a scalar whose every update is `i + k` or `i - k`);
+   - `i <= bound` for each header condition that compares a counter with an operand the loop does not write, and the guarded form `0 <= bound ==> i <= bound` when the counter is signed (with a signed `len`, `i <= len` fails establishment);
+   - for a pointer walker, its anchor on the formal it starts from (`\at(p, Pre) <= p`, same `\base_addr`) and its end bound;
+   - in a nested loop, the enclosing loops' guards and candidates that the inner loop leaves alone, because WP forgets them across an inner loop without `loop assigns`.
+
+   A literal bound is kept only when the literal is written in the function's source, so a harness buffer size or a macro's value never becomes a candidate.
+2. **Houdini with WP.** All candidates go into a private copy as `loop invariant seed_<n>: ...;` and only those goals are proved (`-wp-prop`). A candidate WP cannot establish or preserve is dropped, and the rest is proved again until a round drops nothing (at most 6 rounds). Survivors are inductive under the function's current contract and loop annotations. The report says, for each dropped candidate, whether establishment or preservation failed.
+3. **Corpus filter.** The candidates WP dropped are compiled as E-ACSL checks with the guardrail's build and replayed on the Phase 1 corpus, without mutation. An input that falsifies a candidate is recorded with it. A candidate no input falsifies is reported as "held on every replayed corpus input, not proven": a hint, never a clause to paste.
+4. **No-harm check.** Proven seeds are true, but more hypotheses can make a solver miss another goal (measured on a nested loop with a nonlinear index). The tool runs every goal of the function once without seeds and once with the proven ones. A seed set that loses a goal is reduced by leaving out one seed of the loop the goal sits in, or withheld entirely, and the report lists those seeds as "Proven, but withheld". When the check cannot run, nothing is withheld and the report says the seeds were not checked. It adds two full WP runs per function.
+
+WP runs first because it is the cheaper filter: measured on toy functions, a round on the seed goals costs about one second when nothing fails and about six when a goal times out (the per-goal limit is 5 s), and an E-ACSL build and replay costs about two. A proven candidate needs no corpus check, so the build is paid only for what WP dropped.
+
+**Where it runs.** The prover runs the tool itself, as the first item of Step B, on its scratch overlay. That is the point where the function has the contract and `loop assigns` the seeds are proved under, and where the callees' contracts are already merged. It needs no new task kind and no work under the scheduler's locks. The tool writes nothing but its report (`agents/<agent-id>/scratch/loop_seeds_<function>.json`), works on a copy outside the agent's tree, and never adds a `requires`. `wp_scheduler.py complete` copies the report to `workspace/reports/loop_seeds/<module>/<function>.json`, so the parent stays the only writer outside the scratch overlay and the ledger is not involved. A failure or a timeout only loses hints: the report's `status` says so (`ok`, `partial`, `timeout`, `no_facts`, `no_loops`, `no_candidates`, `disabled`, `error`), and no unit status depends on it. `FRAMAC_PROVER_CONTEXT=off` removes the seeds together with the facts.
+
 ---
 
 ## 3. Caller-Callee Contract Negotiation

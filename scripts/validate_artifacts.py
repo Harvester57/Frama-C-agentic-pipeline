@@ -170,6 +170,11 @@ def validate_candidates(data) -> Errors:
         seen.add(fp)
         if not is_valid_fingerprint(fp):
             errors.add(f"$[{idx}].fingerprint: invalid fingerprint format")
+        reopened = cand.get("reopened") or []
+        if any("resolved" not in entry for entry in reopened[:-1]):
+            errors.add(f"$[{idx}].reopened: only the last reopening may await its verdict")
+        if reopened and "resolved" not in reopened[-1] and cand["status"] != "unverified":
+            errors.add(f"$[{idx}].reopened: a reopened candidate is 'unverified' until its next verdict")
     return errors
 
 
@@ -729,7 +734,12 @@ def _validate_run_dir_core(run_dir: Path) -> Errors:
                     f"candidates.json: {fp} was refingerprinted/split to {resolved_fps} without refingerprint_reason"
                 )
         if cand["status"] == "unverified" and fp in findings:
-            errors.add(f"candidates.json: {fp} has a verdict but is still marked unverified")
+            # A reopened candidate keeps the rejected record it was reopened from until its next verdict
+            # supersedes it (ledger.py: tool_evidence_on_verified_candidate, ingest-verifier).
+            reopened = cand.get("reopened") or []
+            awaiting = bool(reopened) and "resolved" not in reopened[-1]
+            if not (awaiting and findings[fp]["verdict"] == "rejected" and fp in reopened[-1]["rejected_fingerprints"]):
+                errors.add(f"candidates.json: {fp} has a verdict but is still marked unverified")
         for cid in cand["linked_units"]:
             if cid not in ledger:
                 errors.add(f"candidates.json: {fp} links unknown unit {cid}")

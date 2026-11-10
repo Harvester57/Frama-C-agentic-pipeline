@@ -1630,6 +1630,7 @@ def test_is_known_static_command_rejects_shell_chaining_and_anchors():
 def test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name():
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py campaign --module build") == "fuzz"
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py guardrail --module build") == "guardrail"
+    assert R.infer_class("python3 $S/loop_seeds.py --file a.c --function f --module build") == "guardrail"
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py replay --module build") == "replay"
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py selftest --module build") == "selftest"
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py build --module build") == "build"

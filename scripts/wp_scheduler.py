@@ -52,7 +52,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import acsl_ast  # noqa: E402
 import checkpoint  # noqa: E402
 import contract_negotiator  # noqa: E402
+import function_facts  # noqa: E402
 import ledger  # noqa: E402
+import loop_seeds  # noqa: E402
 import phase0_gates  # noqa: E402
 import prover_candidates  # noqa: E402
 import resources  # noqa: E402
@@ -1009,6 +1011,15 @@ def _sync(state: dict, ctx: Ctx) -> dict:
                     invalid_results=0,
                 )
                 changes["created"].append(tid)
+            elif task["state"] in TERMINAL:
+                # The ledger reopened a rejected candidate on new tool evidence (`reopened` entries on
+                # the candidate): it needs a second verdict. One task reopening per ledger reopening,
+                # so a verify task that ended blocked for another reason is not dispatched again.
+                ledger_reopens = len(cand.get("reopened") or [])
+                if ledger_reopens > int(task.get("candidate_reopens") or 0):
+                    task["candidate_reopens"] = ledger_reopens
+                    _reopen(state, task, "candidate reopened by tool evidence after a rejection")
+                    changes["reopened"].append(tid)
         elif task is not None and task["state"] == "pending":
             _finish(state, task, "done", "verified_elsewhere")
             changes["closed"].append(tid)
@@ -2628,6 +2639,33 @@ def _promote_agent_wp(task: dict, agent_id: str, res: dict, errors: list) -> tup
     return dest.as_posix(), report
 
 
+LOOP_SEEDS_MAX_BYTES = 1 << 20
+
+
+def _promote_loop_seeds(task: dict, agent_id: str, errors: list) -> str | None:
+    """
+    Keep the prover's loop-seeds report (loop_seeds.py) under workspace/reports/loop_seeds/, so a run
+    records which seeds each prover was offered. Hints only: nothing that decides a status reads it,
+    and a missing or malformed report is simply not copied.
+    """
+    if not function_facts.loop_seeds_enabled():
+        return None
+    function = str(task.get("function") or "")
+    src = Path("agents") / agent_id / "scratch" / f"loop_seeds_{function}.json"
+    try:
+        if src.is_symlink() or not src.is_file() or src.stat().st_size > LOOP_SEEDS_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    data = _load_report(src)
+    if not data or data.get("function") != function or not isinstance(data.get("candidates"), list):
+        return None
+    dest = loop_seeds.default_out_json(task.get("module"), function)
+    promoted = {**data, "agent_id": agent_id, "agent_file": data.get("file"), "file": task.get("file")}
+    _try(errors, f"promote {src.as_posix()}", atomic_write_json, dest, promoted)
+    return dest.as_posix() if dest.is_file() else None
+
+
 def _resolve_request(errors: list, rid: str, status: str, note: str) -> None:
     _try(errors, f"resolve {rid}", DEPS.resolve_request, REQUESTS, rid, status, note)
 
@@ -3025,6 +3063,9 @@ def _complete_prover(
 ) -> dict | None:
     status = res["status"]
     out["result_status"] = status
+    seeds_report = _promote_loop_seeds(task, aid, out["errors"])
+    if seeds_report:
+        out["loop_seeds"] = seeds_report
     if status == "all_proven":
         # Never restored: the parent re-verifies on merge, and a last iteration that skipped the guardrail must not
         # be replaced by an older partial.
