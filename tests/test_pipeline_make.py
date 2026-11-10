@@ -2060,3 +2060,19 @@ def test_makefile_fuzz_and_coverage_use_the_imported_corpus():
     seeds = mk.split("\nseeds:\n", 1)[1].split("\n\n", 1)[0]
     assert all(line.startswith("\t-") for line in seeds.splitlines())  # both writers stay optional
     assert "fuzz_assets.py write --module" in seeds
+
+
+@pytest.mark.unit
+def test_pipeline_mk_lists_every_staged_target_and_shares_the_facts_recipe():
+    """K3: help and .PHONY name every top-level target `run` orders; facts-% and module-% share one recipe."""
+    mk = (REPO / "templates" / "pipeline.mk").read_text(encoding="utf-8")
+    help_line = next(line for line in mk.splitlines() if "@echo 'Targets:" in line)
+    phony = mk.split(".PHONY:", 1)[1].split("\n\n", 1)[0]
+    for target in pm.STAGE_OF_TARGET:
+        assert f" {target} " in help_line, target
+        assert f" {target} " in phony, target
+        assert f"\n{target}:" in mk, target
+    assert mk.count("function_facts.py") == 1
+    assert "\tdefine" not in mk and "\ndefine FACTS_RECIPE\n" in mk
+    for rule in ("$(FACTS_TARGETS): facts-%:", "$(MODULE_TARGETS): module-%:"):
+        assert "\t$(call FACTS_RECIPE,$*)" in mk.split(rule, 1)[1].split("\n\n", 1)[0]

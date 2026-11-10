@@ -175,6 +175,16 @@
     },
     "externals": {"type": "array", "items": {"type": "string"}},
     "external_formals": {"$comment": "Step I9: the formals of external functions, from their prototypes", "type": "object", "additionalProperties": {"$ref": "#/definitions/formals"}},
+    "external_decls": {
+      "$comment": "S2: the first declaration of each external function (`decl`, a Frama-C location: FRAMAC_SHARE/libc/..., a path under the parse's tree, or an absolute header path) and its C text with typedef and parameter names (`proto`), from which scripts/stub_gen.py writes the stub skeletons",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {"decl": {"type": "string"}, "proto": {"type": "string"}, "signature": {"type": "string"}},
+        "required": ["decl", "proto"],
+        "additionalProperties": false
+      }
+    },
     "global_variables": {
       "$comment": "Step I9: defined global variables, `file#name`, where security properties naming them are anchored",
       "type": "object",

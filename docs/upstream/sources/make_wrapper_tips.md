@@ -7,7 +7,7 @@ recognizes these patterns. The pipeline ports them as `repair_hints` in the Eva 
 | Log pattern (regex) | Upstream tip | Pipeline action |
 |---|---|---|
 | `detected recursive call` followed by `^\s+stack:` lines until a line starting with `[` | "Consider patching, stubbing or adding an ACSL specification to the recursive call, then re-run the analysis." | `pipeline_make.py params set --module <mod> --eva-recursion-fallback` (passes `-eva-warn-key assigns:missing=warning`, recorded in `reduced_checks`), or add an `assigns` contract / stub for the callee |
-| `Neither code nor (specification|[^ ]+ assigns clause) for function ([^,]+),` | Runs `frama-c-script find-fun <fname>` and prints the file(s) defining it: "Add the following file to the list of sources to be parsed" or "provide a stub" | Locate the defining file via `build_callgraph_dag.py`'s function index and add it to the module sources, or add a stub to `templates/acsl/external_stubs.h` |
+| `Neither code nor (specification|[^ ]+ assigns clause) for function ([^,]+),` | Runs `frama-c-script find-fun <fname>` and prints the file(s) defining it: "Add the following file to the list of sources to be parsed" or "provide a stub" | Locate the defining file via `build_callgraph_dag.py`'s function index and add it to the module sources, or, for an external function, fill its contract in the run's stub overlay `workspace/stubs/<lib>.h` (`pipeline_make.py run stubs` writes the skeleton) |
 
 Upstream regexes (verbatim, for the port):
 

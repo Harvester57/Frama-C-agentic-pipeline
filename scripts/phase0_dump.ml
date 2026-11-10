@@ -254,9 +254,11 @@ let run () =
         let vi = Kernel_function.get_vi kf in
         if Kernel_function.is_definition kf then functions := function_json kf :: !functions
         else
+          (* `decl`: its first declaration (the header that declares it); `proto`: that declaration as C,
+             with typedef names and parameter names, for the stub skeletons (scripts/stub_gen.py). *)
           declared :=
             O [ ("kernel_name", S vi.vname); ("name", S vi.vorig_name); ("signature", S (signature vi.vtype));
-                ("formals", formals_json kf) ]
+                ("formals", formals_json kf); ("decl", S (loc_s vi.vdecl)); ("proto", S (one_line Printer.pp_vdecl vi)) ]
             :: !declared);
     let taken = Hashtbl.fold (fun k () acc -> S k :: acc) address_taken [] in
     (* Defined global variables, where the security properties that name them are anchored (I9). *)

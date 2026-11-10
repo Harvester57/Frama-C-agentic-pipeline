@@ -206,3 +206,12 @@ The rules of [`open-topics-remediation-plan.md`](open-topics-remediation-plan.md
 
 - Contracts for whole libraries nobody has run a target against (zlib, OpenSSL): S2 generates what a target needs when it needs it.
 - Replacing host-header mode for E-ACSL: the reasons in the stub README still hold.
+
+## Status
+
+| ID | Status |
+| :--- | :--- |
+| S2 | done 2026-11-10: `scripts/stub_gen.py`, Make target `stubs`, the stub-author brief (`skills/framac-slice/stub_author_brief.md`), `ledger.py record-stub-contracts`, overlay in the include paths and the cache key; `templates/acsl/external_stubs.h` deleted (decision 2). The Phase 0 dump now records each external's declaration (`external_decls`). |
+| K2 | done 2026-11-10: `cache.make_key` leaves `templates/fc_stubs` and the overlay out of keys that carry a dependency manifest (which hashes the stub headers read). |
+| S3 | done 2026-11-10: `scripts/stub_check.py` (`run`: ABI, Eva smoke, contract against the real library under E-ACSL; `shipped`: prototypes and struct layouts of `templates/fc_stubs`), Make target `stub-check`, the Phase 0 gate refuses the modules a failed header blocks, the ledger records the status. Open: module fuzzing does not check stub contracts (troubleshooting). |
+| K3 | done 2026-11-10: one `define FACTS_RECIPE` for `facts-%` and `module-%`, `help` lists `eva-tune-base`, `stubs` and `stub-check` in `.PHONY`, `help` and the stage order; a test keeps `help` and `.PHONY` in step with `STAGE_OF_TARGET`. |
