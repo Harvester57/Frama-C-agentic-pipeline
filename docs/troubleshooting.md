@@ -244,7 +244,7 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
   - The crash verifier classifies such reports as `harness_induced`.
 
 ### Symptom: Every Input Fails `\initialized(&__retres)` in a `__gen_e_acsl_<fn>` Wrapper
-- **Cause:** an E-ACSL gap in Frama-C 33. The wrapper that checks a function contract registers its `__retres` with the runtime but never marks it initialized after `__retres = <fn>(...)`. Under `-rte-initialized`, any `ensures` that reads `\result` then fails on the first input.
+- **Cause:** an E-ACSL gap in Frama-C 33. The wrapper that checks a function contract registers its `__retres` with the runtime but never marks it initialized after `__retres = <fn>(...)`. Under `-rte-initialized`, an `ensures` that reads `\result` then fails on the first input. On Frama-C 35 only an `ensures` reading a field of a struct `\result` gets that check; a scalar or pointer `\result` does not (C1 entry below).
 - **Fix:** automatic. Between instrumentation and compilation, `run_eacsl_fuzz.py` inserts the missing `__e_acsl_initialize` after each such assignment; the build report counts them in `compile.wrapper_result_inits`. This is sound, because the callee's own return value is still checked for uninitialized reads. A report of this failure means the build ran without that step: rebuild it, and never weaken a contract to get past it.
 
 ### Symptom: The E-ACSL Selftest Passes Although the Result-Init Pass, the `isnan` Shim or the errno Shim Is Broken
