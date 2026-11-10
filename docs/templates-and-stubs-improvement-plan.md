@@ -50,6 +50,8 @@ It does not repeat work another plan owns:
 2. **`templates/acsl/external_stubs.h`:** nothing includes it and no target calls its `fc_stub_*` functions. Recommendation: delete it once S2 lands and keep its HMAC contract as the worked example in `slicing-and-onboarding.md`.
 3. **Threat-model schema:** M5 needs a `format` parameter on a sink, M7 a `success` value on an auth gate. Both are optional fields; say whether the schema may grow.
 
+**Decided (user, 2026-11-10):** 1. split: strict for Eva and WP, exact under `__FRAMAC_EACSL__`. 2. delete `external_stubs.h` once S2 lands, keep its HMAC contract as the worked example. 3. the schema grows with both optional fields.
+
 ## Steps
 
 ### D1. Stale statements in the docs (P0, S)
