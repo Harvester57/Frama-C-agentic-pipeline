@@ -43,6 +43,18 @@ the missing headers and candidate -dev packages (CANDIDATE_RULE), the checkpoint
 the exit code is 3. After the recipe is fixed (`run_metadata.py set-build ...`), running the capture again
 clears the status and Phase 0 resumes.
 
+Architecture guard (ARCH_RULE): x86_64 Linux is the only supported platform. The capture stops Phase 0
+with status `unsupported_architecture` and exit code 5, and the checkpoint records it, in two cases:
+
+  - before the build, when the build container itself is not x86_64 (an arm64 host);
+  - after the build and before any analysis of it, when an object, executable or shared library the build
+    produced is not ELF64, little-endian, x86-64: `-m32`, `-mx32`, a cross compiler, `--target=`. The
+    file header decides; the command line decides only for a file that cannot be read (removed by the
+    build, LLVM bitcode of an LTO build).
+
+`diagnostics.instructions` says what to do in each case and `architecture.unsupported` lists the files.
+A capture whose outputs are all x86_64 clears the status.
+
 `propose` prints a recipe guessed from the build files, for the agent to confirm with the user.
 """
 
@@ -52,6 +64,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import posixpath
 import re
 import shlex
@@ -73,7 +86,10 @@ from framac_common import atomic_write_json, is_pipeline_output_dir, load_json_o
 SCHEMA_VERSION = 1
 STATUS_OK = "ok"
 STATUS_NEEDS_RECIPE = "needs_build_recipe"
+STATUS_UNSUPPORTED_ARCH = "unsupported_architecture"
+BLOCKING_STATUSES = (STATUS_NEEDS_RECIPE, STATUS_UNSUPPORTED_ARCH)
 EXIT_NEEDS_RECIPE = 3
+EXIT_UNSUPPORTED_ARCH = 5  # 4 is phase0_model.py's no_unit_parsed
 DEFAULT_TIMEOUT_S = 1800
 INSTALL_TIMEOUT_S = 300
 TOOL_TIMEOUT_S = 120
@@ -91,7 +107,74 @@ CANDIDATE_RULE = (
     "package or the missing -l library. Candidates are proposals to confirm with the user."
 )
 
+SUPPORTED_ARCH = "x86_64"
+ARCH_RULE = (
+    "x86_64 Linux is the only supported platform: the build container runs on x86_64, and every object, "
+    "executable and shared library the build produces is ELF64, little-endian, x86-64 (LP64). Frama-C's "
+    "machdep (gcc_x86_64), the harness layouts and the E-ACSL and sanitizer builds assume it. A file's header "
+    "decides; its command line (-m32, -mx32, -m16, --target=, a cross compiler's name) decides only when the "
+    "file cannot be read (removed by the build, LLVM bitcode of an LTO build)."
+)
+ARCH_LIST_CAP = 50
+HOST_INSTRUCTIONS = (
+    "Run the pipeline on an x86_64 Linux container host. Nothing in the recipe changes this.",
+    "On an arm64 machine (Apple Silicon, Graviton) the two images can be built and run as linux/amd64 under "
+    "emulation (DOCKER_DEFAULT_PLATFORM=linux/amd64). This is not tested and not supported: it is slow, and "
+    "the sanitizer and LibFuzzer builds of Phase 1 may misbehave under emulation.",
+)
+TARGET_INSTRUCTIONS = (
+    "-m32, -mx32 or -m16 in the flags: remove it from the recipe (CFLAGS, a configure or CMake option), "
+    "record the recipe with `run_metadata.py set-build`, and run the capture again. The run then covers the "
+    "x86_64 build only: behaviour that exists only with 32-bit long, size_t and pointers is not analysed.",
+    "A cross compiler (CC=<triple>-gcc, ./configure --host=, CMAKE_TOOLCHAIN_FILE, clang --target=): record "
+    "a native recipe without it, so the build image's own compiler builds the target for x86_64.",
+    "Only some outputs are foreign (a 32-bit test, a BPF or WebAssembly object, firmware next to host "
+    "tools): name the native make targets in the recipe so that the others are not built.",
+    "A target that builds for another architecture only (firmware, a Windows or macOS build) is out of "
+    "scope for now: there is no recipe that makes it pass.",
+)
+
 _COMPILER_RE = re.compile(r"^(?:[\w.+-]+-)?(?:cc|gcc|clang|c89|c99)(?:-\d+(?:\.\d+)*)?$")
+# A compiler named after its target: <arch>-<os...>-gcc. One-word prefixes (afl-gcc, musl-gcc) are wrappers.
+_TRIPLE_COMPILER_RE = re.compile(r"^(?P<triple>[\w.+]+(?:-[\w.+]+)+)-(?:cc|gcc|clang|c89|c99)(?:-\d+(?:\.\d+)*)?$")
+_ARCH_WORD_RE = re.compile(
+    r"^(?:x86_64|amd64|x86|i[3-6]86|arm\w*|thumb\w*|aarch64\w*|riscv\w*|mips\w*|powerpc\w*|ppc\w*|s390x?|"
+    r"sparc\w*|avr\w*|msp430|m68k|sh[0-9]\w*|xtensa\w*|loongarch\w*|alpha\w*|hppa\w*|ia64|microblaze\w*|nios2|"
+    r"or1k|wasm\w*|bpf\w*)$"
+)
+# An x86_64 triple that is still not x86_64 Linux LP64: another object format, or the x32 ABI.
+_FOREIGN_X86_64_WORDS = ("mingw", "w64", "windows", "msvc", "cygwin", "darwin", "apple", "macos", "gnux32")
+_ELF_MACHINES = {
+    2: "sparc",
+    3: "i386",
+    4: "m68k",
+    8: "mips",
+    15: "parisc",
+    20: "ppc",
+    21: "ppc64",
+    22: "s390",
+    40: "arm",
+    42: "sh",
+    43: "sparcv9",
+    50: "ia64",
+    62: "x86-64",
+    83: "avr",
+    94: "xtensa",
+    105: "msp430",
+    183: "aarch64",
+    243: "riscv",
+    247: "bpf",
+    258: "loongarch",
+}
+_COFF_MACHINES = {b"\x64\x86": "x86-64", b"\x4c\x01": "i386", b"\x64\xaa": "arm64", b"\xc4\x01": "arm"}
+_MACHO_MAGICS = (
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+)
+OBJECT_HEAD_BYTES = 20  # up to e_machine of an ELF header
 _AR_RE = re.compile(r"^(?:[\w.+-]+-)?(?:gcc-|llvm-)?ar(?:-\d+(?:\.\d+)*)?$")
 # Options whose value is the next argument.
 _ARG_OPTS = {
@@ -1189,6 +1272,183 @@ def diagnose(log: str, packages_not_installed: list[str] | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------------
+# 5b. Architecture guard (ARCH_RULE)
+# ---------------------------------------------------------------------------------------------------
+
+
+def host_machine() -> str:
+    """The machine the capture runs on, as `uname -m` names it (the amd64 spellings folded to x86_64)."""
+    machine = platform.machine().lower()
+    return SUPPORTED_ARCH if machine in ("x86_64", "amd64", "x64") else (machine or "unknown")
+
+
+def object_format(head: bytes) -> tuple[bool | None, str]:
+    """
+    Whether a build output is x86_64 Linux code, from its first OBJECT_HEAD_BYTES bytes: (verdict, what
+    the file is). True for ELF64 little-endian x86-64; False for any other ELF, for COFF/PE, Mach-O and
+    WebAssembly; None when the header does not say (LLVM bitcode, an archive, a truncated or unknown file).
+    """
+    if head[:4] == b"\x7fELF":
+        if len(head) < OBJECT_HEAD_BYTES or head[4] not in (1, 2) or head[5] not in (1, 2):
+            return None, "truncated or malformed ELF header"
+        bits = 32 if head[4] == 1 else 64
+        big = head[5] == 2
+        machine = int.from_bytes(head[18:20], "big" if big else "little")
+        what = f"ELF{bits} {'big-endian ' if big else ''}{_ELF_MACHINES.get(machine, f'machine {machine}')}"
+        if machine == 62 and bits == 32:
+            what += " (x32 ABI)"
+        return (bits == 64 and not big and machine == 62), what
+    if head[:4] in _MACHO_MAGICS:
+        return False, "Mach-O (macOS)"
+    if head[:4] == b"\0asm":
+        return False, "WebAssembly"
+    if head[:4] in (b"BC\xc0\xde", b"\xde\xc0\x17\x0b"):
+        return None, "LLVM bitcode (LTO)"
+    if head[:8] == b"!<arch>\n":
+        return None, "archive"
+    if head[:2] == b"MZ":
+        return False, "PE (Windows)"
+    if head[:2] in _COFF_MACHINES:
+        return False, f"COFF {_COFF_MACHINES[head[:2]]} (Windows)"
+    return None, "unrecognised file format" if head else "empty file"
+
+
+def foreign_triple(triple: str) -> bool | None:
+    """
+    Whether a target triple (or a bare architecture: `bpf`, `wasm32`) names something else than x86_64
+    Linux LP64. None when its first word is no architecture name: a wrapper's prefix, not a triple.
+    """
+    words = triple.lower().split("-")
+    if not _ARCH_WORD_RE.match(words[0]):
+        return None
+    if words[0] not in ("x86_64", "amd64"):
+        return True
+    rest = "-".join(words[1:])
+    return any(w in rest for w in _FOREIGN_X86_64_WORDS)
+
+
+def arch_hint(arguments: list[str]) -> str | None:
+    """
+    What in a compiler command line selects another target than x86_64 Linux, or None: the last of
+    -m32/-mx32/-m16/-m64, the last `--target=` (`-target X`), else a compiler named after a foreign triple.
+    """
+    if not arguments:
+        return None
+    name = posixpath.basename(arguments[0])
+    abi = target = None
+    i = 1
+    while i < len(arguments):
+        a = arguments[i]
+        if a in ("-m32", "-mx32", "-m16", "-m64"):
+            abi = a
+        elif a.startswith("--target="):
+            target = a.split("=", 1)[1]
+        elif a in ("-target", "--target") and i + 1 < len(arguments):
+            target = arguments[i + 1]
+            i += 1
+        i += 1
+    reasons: list[str] = []
+    named = _TRIPLE_COMPILER_RE.match(name)
+    if target is not None:
+        if foreign_triple(target):
+            reasons.append(f"--target={target}")
+    elif named and foreign_triple(named["triple"]):
+        reasons.append(f"cross compiler {name}")
+    if abi and abi != "-m64":
+        reasons.append(abi)
+    return ", ".join(reasons) or None
+
+
+def read_head(path: str) -> bytes | None:
+    """The first OBJECT_HEAD_BYTES bytes of a file, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(OBJECT_HEAD_BYTES)
+    except OSError:
+        return None
+
+
+def check_architecture(
+    compiles: dict[str, dict],
+    artifacts: dict[str, dict],
+    tree: str,
+    read: Callable[[str], bytes | None] = read_head,
+) -> dict:
+    """
+    The architecture guard on a finished build (ARCH_RULE): every object a compile wrote and every
+    executable and shared library a link step wrote, each read once. A compile-and-link command has no
+    object of its own, so its sources are judged by the file it linked. Static libraries are judged by
+    their members. `read` gives a file's first bytes, or None when it cannot be read (replaced in tests).
+    """
+    files: dict[str, dict] = {}
+    for key, c in sorted(compiles.items()):
+        path = key.split("::", 1)[0] if c.get("implicit") else c["object"]
+        entry = files.setdefault(path, {"sources": [], "hint": None})
+        if c["source"] not in entry["sources"]:
+            entry["sources"].append(c["source"])
+        entry["hint"] = entry["hint"] or arch_hint(c.get("arguments") or [])
+    for path, art in sorted(artifacts.items()):
+        if art["kind"] in ("executable", "shared_lib"):
+            entry = files.setdefault(path, {"sources": [], "hint": None})
+            entry["hint"] = entry["hint"] or arch_hint([art["compiler"]] if art.get("compiler") else [])
+    unsupported: list[dict] = []
+    unknown = 0
+    for path in sorted(files):
+        entry = files[path]
+        head = read(absolute(path, tree))
+        verdict, found = (None, "not found after the build") if head is None else object_format(head)
+        decided_by = "header"
+        if verdict is None and entry["hint"]:
+            verdict, decided_by = False, "command_line"
+        if verdict is None:
+            unknown += 1
+        elif not verdict:
+            unsupported.append(
+                {
+                    "file": path,
+                    "sources": entry["sources"],
+                    "found": found,
+                    "why": entry["hint"],
+                    "decided_by": decided_by,
+                }
+            )
+    return {
+        "files": len(files),
+        "unknown": unknown,
+        "unsupported_total": len(unsupported),
+        "unsupported": unsupported[:ARCH_LIST_CAP],
+    }
+
+
+def describe_unsupported(entry: dict) -> str:
+    """One unsupported build output as a sentence part: what it is and what in the build made it so."""
+    if entry["decided_by"] == "command_line":
+        return f"{entry['file']} is built with {entry['why']} ({entry['found']})"
+    return f"{entry['file']} is {entry['found']}" + (f" (built with {entry['why']})" if entry.get("why") else "")
+
+
+def host_diagnostics(host: str) -> dict:
+    """The stop-and-ask diagnostic of a capture started on another machine than x86_64."""
+    return {
+        **diagnose(""),
+        "first_error": f"unsupported host architecture {host}: the pipeline runs on x86_64 Linux only",
+        "instructions": list(HOST_INSTRUCTIONS),
+    }
+
+
+def target_diagnostics(arch: dict) -> dict:
+    """The stop-and-ask diagnostic of a build that produced other code than x86_64 Linux."""
+    return {
+        **diagnose(""),
+        "first_error": (
+            f"{arch['unsupported_total']} of {arch['files']} build output(s) are not x86_64 Linux code "
+            f"(ELF64, little-endian): {describe_unsupported(arch['unsupported'][0])}"
+        ),
+        "instructions": list(TARGET_INSTRUCTIONS),
+    }
+
+
+# ---------------------------------------------------------------------------------------------------
 # 6. Recipe
 # ---------------------------------------------------------------------------------------------------
 
@@ -1389,6 +1649,13 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
         "warnings": [],
         "seconds": 0.0,
     }
+    # The architecture guard, first half: nothing is copied or built on another machine than x86_64.
+    host = host_machine()
+    report["architecture"] = {"supported": SUPPORTED_ARCH, "host": host, "rule": ARCH_RULE}
+    if host != SUPPORTED_ARCH:
+        report["status"] = STATUS_UNSUPPORTED_ARCH
+        report["diagnostics"] = host_diagnostics(host)
+        return report, EXIT_UNSUPPORTED_ARCH
     recipe = load_recipe(args)
     if recipe is None:
         proposed = propose_recipe(target)
@@ -1470,6 +1737,18 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
             "add a clean step or name the build target)",
         }
         return report, EXIT_NEEDS_RECIPE
+    # The architecture guard, second half: what the build produced, before anything is derived from it.
+    arch = report["architecture"]
+    arch.update(check_architecture(cap["compiles"], cap["artifacts"], str(tree)))
+    if arch["unsupported"]:
+        report["status"] = STATUS_UNSUPPORTED_ARCH
+        report["diagnostics"] = target_diagnostics(arch)
+        return report, EXIT_UNSUPPORTED_ARCH
+    if arch["unknown"]:
+        report["warnings"].append(
+            f"the architecture of {arch['unknown']} of {arch['files']} build output(s) was not checked (not "
+            "found after the build, or LLVM bitcode) and their command lines name no other target than x86_64"
+        )
     analyse(report, cap, tree, scratch, recipe, args.timeout, jobs)
     report["status"] = STATUS_OK
     report["seconds"] = round(time.monotonic() - started, 2)
@@ -1724,15 +2003,16 @@ def validate_report(report: dict) -> list[str]:
 def record_checkpoint(state: Path, report: dict) -> None:
     import checkpoint
 
-    if report["status"] == STATUS_NEEDS_RECIPE:
+    if report["status"] in BLOCKING_STATUSES:
         diag = report.get("diagnostics") or {}
         checkpoint.mark_blocked(
             state,
-            STATUS_NEEDS_RECIPE,
+            report["status"],
             {"report": "workspace/reports/build_capture.json", "first_error": diag.get("first_error")},
         )
     else:
-        checkpoint.clear_blocked(state, STATUS_NEEDS_RECIPE)
+        for status in BLOCKING_STATUSES:
+            checkpoint.clear_blocked(state, status)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1754,7 +2034,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(out, report)
-    if args.state and report.get("status") in (STATUS_OK, STATUS_NEEDS_RECIPE):
+    if args.state and report.get("status") in (STATUS_OK, *BLOCKING_STATUSES):
         record_checkpoint(Path(args.state), report)
     summary: dict[str, Any] = {"status": report["status"], "report": str(out)}
     if report.get("status") == STATUS_OK:
@@ -1768,6 +2048,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         if d.get("proposed_recipe"):
             summary["proposed_recipe"] = d["proposed_recipe"]
+        if report.get("status") == STATUS_UNSUPPORTED_ARCH:
+            arch = report.get("architecture") or {}
+            summary = {
+                "status": report["status"],
+                "report": str(out),
+                "first_error": d.get("first_error"),
+                "host": arch.get("host"),
+                "unsupported": [describe_unsupported(e) for e in (arch.get("unsupported") or [])[:5]],
+                "instructions": d.get("instructions") or [],
+            }
     else:
         summary["error"] = report.get("error")
     print(json.dumps(summary, indent=1))

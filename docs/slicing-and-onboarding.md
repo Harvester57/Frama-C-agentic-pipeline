@@ -58,7 +58,7 @@ Frama-C needs exactly the files, include paths and macros each compilation unit 
    - test executables, marked `test` and left out of the analysis;
    - the API: exports (`nm -D`, version scripts), public headers, `main`;
    - a snapshot of the headers and libraries the build used from outside the project, for the analysis image.
-3. **Stop and ask.** A build that fails stops Phase 0 with `needs_build_recipe` and a diagnostic: first error, missing headers, candidate packages. The user fixes the recipe, and the capture runs again.
+3. **Stop and ask.** A build that fails stops Phase 0 with `needs_build_recipe` and a diagnostic: first error, missing headers, candidate packages. The user fixes the recipe, and the capture runs again. A host that is not x86_64, or a build that produces other code than x86_64 (`-m32`, `-mx32`, a cross compiler), stops Phase 0 with `unsupported_architecture` and instructions: x86_64 Linux is the only supported platform.
 4. **Model** (`phase0_model.py run`, analysis image). Frama-C parses each unit with its own flags, once per distinct set of sources and flags. A unit Frama-C cannot parse falls back to GCC's call graph and is flagged.
 
 `build_callgraph_dag.py` turns the model into the DAG: one module per link unit, with its `required_sources`, `cppflags` and `force_includes`. The harness sidecars carry them into `pipeline_make.py gen`, which writes the per-module Make recipes.

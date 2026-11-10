@@ -4,7 +4,34 @@
   "properties": {
     "schema_version": {"const": 1},
     "generated_at": {"type": "string", "minLength": 1},
-    "status": {"type": "string", "enum": ["ok", "needs_build_recipe", "error"]},
+    "status": {"type": "string", "enum": ["ok", "needs_build_recipe", "unsupported_architecture", "error"]},
+    "architecture": {
+      "$comment": "The architecture guard (build_capture.ARCH_RULE): x86_64 Linux only. `host` is the machine the capture ran on. The counts and `unsupported` are set once the build ran: the objects, executables and shared libraries it produced, by file header (`decided_by: header`) or, for a file that cannot be read, by its command line (`command_line`). A non-empty `unsupported`, or a host that is not x86_64, gives status unsupported_architecture.",
+      "type": "object",
+      "properties": {
+        "supported": {"const": "x86_64"},
+        "host": {"type": "string", "minLength": 1},
+        "rule": {"type": "string"},
+        "files": {"type": "integer", "minimum": 0},
+        "unknown": {"type": "integer", "minimum": 0},
+        "unsupported_total": {"type": "integer", "minimum": 0},
+        "unsupported": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file": {"type": "string", "minLength": 1},
+              "sources": {"type": "array", "items": {"type": "string"}},
+              "found": {"type": "string", "minLength": 1},
+              "why": {"type": ["string", "null"]},
+              "decided_by": {"type": "string", "enum": ["header", "command_line"]}
+            },
+            "required": ["file", "sources", "found", "why", "decided_by"]
+          }
+        }
+      },
+      "required": ["supported", "host"]
+    },
     "target": {"type": "string", "minLength": 1},
     "error": {"type": "string"},
     "scratch": {
@@ -59,7 +86,7 @@
       "required": ["returncode", "timed_out", "seconds", "executions", "log", "events"]
     },
     "diagnostics": {
-      "$comment": "Set when status is needs_build_recipe: what the agent shows the user when it asks for a recipe.",
+      "$comment": "Set when status is needs_build_recipe (what the agent shows the user when it asks for a recipe) or unsupported_architecture (`first_error` and `instructions`: what to do on a host or for a target that is not x86_64).",
       "type": ["object", "null"],
       "properties": {
         "first_error": {"type": "string"},
@@ -69,6 +96,7 @@
         "candidate_packages": {"type": "array", "items": {"type": "string"}},
         "packages_not_installed": {"type": "array", "items": {"type": "string"}},
         "proposed_recipe": {"type": ["object", "null"]},
+        "instructions": {"type": "array", "items": {"type": "string"}},
         "heuristic": {"type": "string"},
         "log_tail": {"type": "string"}
       },

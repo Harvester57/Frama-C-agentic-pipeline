@@ -462,6 +462,268 @@ def test_report_schema_accepts_the_three_statuses():
     assert bc.validate_report({**base, "status": "maybe"})
 
 
+# ------------------------------------------------------------------------------ architecture guard
+
+
+def elf_head(bits: int, machine: int, big: bool = False) -> bytes:
+    """The first 20 bytes of an ELF file: class, data encoding, e_type (relocatable) and e_machine."""
+    order = "big" if big else "little"
+    ident = b"\x7fELF" + bytes([1 if bits == 32 else 2, 2 if big else 1, 1, 0]) + b"\0" * 8
+    return ident + (1).to_bytes(2, order) + machine.to_bytes(2, order)
+
+
+X86_64 = elf_head(64, 62)
+
+
+def cc(*args: str, compiler: str = "cc", cwd: str = TREE) -> dict:
+    return {"exe": f"/usr/bin/{compiler}", "args": [compiler, *args], "cwd": cwd}
+
+
+def guard(execs: list[dict], heads: dict[str, bytes]) -> dict:
+    """check_architecture on intercepted executions, with the files' headers given by tree-relative path."""
+    cap = bc.classify_executions(execs, TREE)
+    return bc.check_architecture(cap["compiles"], cap["artifacts"], TREE, lambda p: heads.get(p[len(TREE) + 1 :]))
+
+
+@pytest.mark.unit
+class TestArchitectureGuard:
+    def test_only_elf64_little_endian_x86_64_is_supported(self):
+        assert bc.object_format(X86_64) == (True, "ELF64 x86-64")
+
+    @pytest.mark.parametrize(
+        ("head", "found"),
+        [
+            (elf_head(32, 3), "ELF32 i386"),
+            (elf_head(32, 62), "ELF32 x86-64 (x32 ABI)"),
+            (elf_head(64, 183), "ELF64 aarch64"),
+            (elf_head(32, 40), "ELF32 arm"),
+            (elf_head(64, 243), "ELF64 riscv"),
+            (elf_head(32, 243), "ELF32 riscv"),
+            (elf_head(64, 21, big=True), "ELF64 big-endian ppc64"),
+            (elf_head(64, 21), "ELF64 ppc64"),
+            (elf_head(64, 22, big=True), "ELF64 big-endian s390"),
+            (elf_head(32, 8, big=True), "ELF32 big-endian mips"),
+            (elf_head(64, 247), "ELF64 bpf"),
+            (elf_head(64, 258), "ELF64 loongarch"),
+            (elf_head(64, 9999), "ELF64 machine 9999"),
+            (b"MZ\x90\0" + b"\0" * 16, "PE (Windows)"),
+            (b"\x64\x86" + b"\0" * 18, "COFF x86-64 (Windows)"),
+            (b"\xcf\xfa\xed\xfe" + b"\0" * 16, "Mach-O (macOS)"),
+            (b"\0asm\x01\0\0\0", "WebAssembly"),
+        ],
+    )
+    def test_other_architectures_and_formats_are_unsupported(self, head, found):
+        assert bc.object_format(head) == (False, found)
+
+    @pytest.mark.parametrize(
+        ("head", "found"),
+        [
+            (b"BC\xc0\xde" + b"\0" * 16, "LLVM bitcode (LTO)"),
+            (b"!<arch>\n" + b"\0" * 12, "archive"),
+            (b"\x7fELF\x02\x01", "truncated or malformed ELF header"),
+            (b"#!/bin/sh\n", "unrecognised file format"),
+            (b"", "empty file"),
+        ],
+    )
+    def test_a_header_that_does_not_say_gives_no_verdict(self, head, found):
+        assert bc.object_format(head) == (None, found)
+
+    @pytest.mark.parametrize(
+        ("argv", "hint"),
+        [
+            (["cc", "-O2", "-c", "a.c"], None),
+            (["x86_64-linux-gnu-gcc-14", "-c", "a.c"], None),
+            (["/usr/bin/x86_64-pc-linux-gnu-gcc", "-c", "a.c"], None),
+            (["afl-gcc", "-c", "a.c"], None),
+            (["musl-gcc", "-c", "a.c"], None),
+            (["clang", "--target=x86_64-pc-linux-gnu", "-c", "a.c"], None),
+            (["gcc", "-m32", "-m64", "-c", "a.c"], None),
+            (["gcc", "-m32", "-c", "a.c"], "-m32"),
+            (["gcc", "-m64", "-mx32", "-c", "a.c"], "-mx32"),
+            (["gcc", "-m16", "-c", "boot.c"], "-m16"),
+            (["arm-linux-gnueabihf-gcc", "-c", "a.c"], "cross compiler arm-linux-gnueabihf-gcc"),
+            (["/opt/x/bin/aarch64-linux-gnu-gcc-13", "-c", "a.c"], "cross compiler aarch64-linux-gnu-gcc-13"),
+            (["i686-linux-gnu-gcc", "-c", "a.c"], "cross compiler i686-linux-gnu-gcc"),
+            (["riscv64-unknown-elf-gcc", "-c", "a.c"], "cross compiler riscv64-unknown-elf-gcc"),
+            (["x86_64-w64-mingw32-gcc", "-c", "a.c"], "cross compiler x86_64-w64-mingw32-gcc"),
+            (["x86_64-linux-gnux32-gcc", "-c", "a.c"], "cross compiler x86_64-linux-gnux32-gcc"),
+            (["clang", "--target=aarch64-linux-gnu", "-c", "a.c"], "--target=aarch64-linux-gnu"),
+            (["clang", "-target", "bpf", "-c", "a.c"], "--target=bpf"),
+            (["clang", "--target=wasm32", "-c", "a.c"], "--target=wasm32"),
+            (["clang", "--target=x86_64-apple-darwin", "-c", "a.c"], "--target=x86_64-apple-darwin"),
+            (["clang", "--target=i386-linux-gnu", "-m32", "-c", "a.c"], "--target=i386-linux-gnu, -m32"),
+        ],
+    )
+    def test_command_line_hints(self, argv, hint):
+        assert bc.arch_hint(argv) == hint
+
+    def test_host_machine_folds_the_amd64_spellings(self, monkeypatch):
+        for raw, want in (("x86_64", "x86_64"), ("AMD64", "x86_64"), ("aarch64", "aarch64"), ("arm64", "arm64")):
+            monkeypatch.setattr(bc.platform, "machine", lambda raw=raw: raw)
+            assert bc.host_machine() == want
+        monkeypatch.setattr(bc.platform, "machine", lambda: "")
+        assert bc.host_machine() == "unknown"
+
+    def test_a_native_build_passes(self):
+        execs = [
+            cc("-c", "src/a.c", "-o", "src/a.o"),
+            cc("-c", "src/b.c", "-o", "src/b.o"),
+            {"exe": "/usr/bin/ar", "args": ["ar", "rcs", "libk.a", "src/a.o", "src/b.o"], "cwd": TREE},
+            cc("-shared", "src/a.o", "-o", "libk.so"),
+            cc("main.c", "-L.", "-lk", "-o", "prog"),
+        ]
+        heads = {"src/a.o": X86_64, "src/b.o": X86_64, "libk.so": X86_64, "prog": X86_64}
+        assert guard(execs, heads) == {"files": 4, "unknown": 0, "unsupported_total": 0, "unsupported": []}
+
+    def test_a_32_bit_object_is_listed_with_its_source_and_flag(self):
+        execs = [cc("-c", "src/a.c", "-o", "src/a.o"), cc("-m32", "-c", "src/b.c", "-o", "src/b.o")]
+        res = guard(execs, {"src/a.o": X86_64, "src/b.o": elf_head(32, 3)})
+        assert res["files"] == 2 and res["unsupported_total"] == 1
+        assert res["unsupported"] == [
+            {"file": "src/b.o", "sources": ["src/b.c"], "found": "ELF32 i386", "why": "-m32", "decided_by": "header"}
+        ]
+        assert bc.describe_unsupported(res["unsupported"][0]) == "src/b.o is ELF32 i386 (built with -m32)"
+
+    def test_the_header_wins_over_the_command_line(self):
+        # A cross-named compiler that writes x86_64 code is supported; a plain `cc` that does not is not.
+        execs = [
+            cc("-m64", "-c", "a.c", "-o", "a.o", compiler="i686-linux-gnu-gcc"),
+            cc("-c", "b.c", "-o", "b.o"),
+        ]
+        res = guard(execs, {"a.o": X86_64, "b.o": elf_head(64, 183)})
+        assert [(e["file"], e["found"], e["why"]) for e in res["unsupported"]] == [("b.o", "ELF64 aarch64", None)]
+        assert bc.describe_unsupported(res["unsupported"][0]) == "b.o is ELF64 aarch64"
+
+    def test_a_compile_and_link_command_is_judged_by_the_file_it_linked(self):
+        res = guard([cc("-mx32", "main.c", "util.c", "-o", "bin/prog")], {"bin/prog": elf_head(32, 62)})
+        assert res["files"] == 1
+        assert res["unsupported"][0] == {
+            "file": "bin/prog",
+            "sources": ["main.c", "util.c"],
+            "found": "ELF32 x86-64 (x32 ABI)",
+            "why": "-mx32",
+            "decided_by": "header",
+        }
+
+    def test_an_unreadable_output_is_decided_by_its_command_line(self):
+        execs = [
+            cc("-c", "a.c", "-o", "a.o", compiler="arm-linux-gnueabihf-gcc"),  # object removed by the build
+            cc("-flto", "--target=aarch64-linux-gnu", "-c", "b.c", "-o", "b.o", compiler="clang"),
+            cc("-flto", "-c", "c.c", "-o", "c.o", compiler="clang"),  # bitcode, nothing names another target
+            cc("-c", "d.c", "-o", "d.o"),  # removed, native command line
+        ]
+        res = guard(execs, {"b.o": b"BC\xc0\xde" + b"\0" * 16, "c.o": b"BC\xc0\xde" + b"\0" * 16})
+        assert res["files"] == 4 and res["unknown"] == 2 and res["unsupported_total"] == 2
+        assert [(e["file"], e["decided_by"]) for e in res["unsupported"]] == [
+            ("a.o", "command_line"),
+            ("b.o", "command_line"),
+        ]
+        assert bc.describe_unsupported(res["unsupported"][0]) == (
+            "a.o is built with cross compiler arm-linux-gnueabihf-gcc (not found after the build)"
+        )
+
+    def test_the_list_is_capped_and_the_total_is_kept(self):
+        n = bc.ARCH_LIST_CAP + 7
+        execs = [cc("-m32", "-c", f"f{i}.c", "-o", f"f{i}.o") for i in range(n)]
+        res = guard(execs, {f"f{i}.o": elf_head(32, 3) for i in range(n)})
+        assert res["unsupported_total"] == n and len(res["unsupported"]) == bc.ARCH_LIST_CAP
+
+    def test_target_diagnostics_name_the_first_file_and_give_the_instructions(self):
+        execs = [cc("-c", "a.c", "-o", "a.o"), cc("-m32", "-c", "b.c", "-o", "b.o")]
+        arch = guard(execs, {"a.o": X86_64, "b.o": elf_head(32, 3)})
+        diag = bc.target_diagnostics(arch)
+        assert diag["first_error"] == (
+            "1 of 2 build output(s) are not x86_64 Linux code (ELF64, little-endian): "
+            "b.o is ELF32 i386 (built with -m32)"
+        )
+        text = " ".join(diag["instructions"])
+        for word in ("-m32", "set-build", "cross compiler", "--host=", "CMAKE_TOOLCHAIN_FILE", "out of scope"):
+            assert word in text, word
+        assert diag["candidate_packages"] == [] and diag["missing_headers"] == []
+
+    def test_a_foreign_host_stops_the_capture_before_anything_is_copied_or_built(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(bc.platform, "machine", lambda: "aarch64")
+
+        def never(*a, **k):
+            raise AssertionError("the capture went on after the host check")
+
+        for name in ("load_recipe", "copy_target", "run_sandboxed_shell"):
+            monkeypatch.setattr(bc, name, never)
+        ns = argparse.Namespace(target=str(tmp_path / "target"), scratch=str(tmp_path / "scratch"), timeout=10)
+        report, code = bc.capture(ns)
+        assert code == bc.EXIT_UNSUPPORTED_ARCH == 5
+        assert report["status"] == "unsupported_architecture"
+        assert report["architecture"] == {"supported": "x86_64", "host": "aarch64", "rule": bc.ARCH_RULE}
+        assert report["diagnostics"]["first_error"] == (
+            "unsupported host architecture aarch64: the pipeline runs on x86_64 Linux only"
+        )
+        text = " ".join(report["diagnostics"]["instructions"])
+        assert "x86_64 Linux container host" in text and "linux/amd64" in text and "not supported" in text
+        assert not bc.validate_report(report)
+
+    def test_cmd_run_writes_the_report_blocks_the_checkpoint_and_prints_the_instructions(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(bc.platform, "machine", lambda: "riscv64")
+        out = tmp_path / "workspace" / "reports" / "build_capture.json"
+        rc = bc.main(["run", "--target", str(tmp_path), "--scratch", str(tmp_path / "s"), "--out", str(out)])
+        assert rc == 5
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["status"] == "unsupported_architecture" and not report["warnings"]
+        progress = json.loads((tmp_path / "state" / "progress.json").read_text(encoding="utf-8"))
+        assert progress["status"] == "unsupported_architecture"
+        assert progress["blocked"]["resume_at"] == "build_capture.py run"
+        assert "riscv64" in progress["blocked"]["first_error"]
+        assert any("riscv64" in line for line in checkpoint.blocked_lines(progress))
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["status"] == "unsupported_architecture" and summary["host"] == "riscv64"
+        assert summary["instructions"] == list(bc.HOST_INSTRUCTIONS) and summary["unsupported"] == []
+
+    def test_the_checkpoint_records_the_status_and_a_good_capture_clears_it(self, tmp_path):
+        assert checkpoint.BLOCKING_STEPS["unsupported_architecture"] == "build_capture.py run"
+        report = {"status": "unsupported_architecture", "diagnostics": {"first_error": "a.o is ELF32 i386"}}
+        bc.record_checkpoint(tmp_path, report)
+        progress = json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))
+        assert progress["status"] == "unsupported_architecture"
+        assert progress["blocked"]["first_error"] == "a.o is ELF32 i386"
+        # A recipe that then fails to build replaces the status; a capture that succeeds clears either.
+        bc.record_checkpoint(tmp_path, {"status": "needs_build_recipe", "diagnostics": {"first_error": "boom"}})
+        assert json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))["status"] == "needs_build_recipe"
+        bc.record_checkpoint(tmp_path, report)
+        bc.record_checkpoint(tmp_path, {"status": "ok"})
+        cleared = json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))
+        assert cleared["status"] == "running" and "blocked" not in cleared
+
+    def test_report_schema_accepts_the_status_and_the_architecture_block(self):
+        base = {"schema_version": 1, "generated_at": "t", "target": "/target", "warnings": []}
+        execs = [cc("-m32", "-c", "b.c", "-o", "b.o")]
+        arch = {"supported": "x86_64", "host": "x86_64", "rule": bc.ARCH_RULE, **guard(execs, {})}
+        blocked = {
+            **base,
+            "status": "unsupported_architecture",
+            "architecture": arch,
+            "diagnostics": bc.target_diagnostics(arch),
+        }
+        assert not bc.validate_report(blocked)
+        assert bc.validate_report({**blocked, "architecture": {**arch, "supported": "aarch64"}})
+        assert bc.validate_report({**blocked, "architecture": {"supported": "x86_64"}})
+        entry = {**arch["unsupported"][0], "decided_by": "guess"}
+        assert bc.validate_report({**blocked, "architecture": {**arch, "unsupported": [entry]}})
+
+    def test_benchmark_summary_carries_the_first_error(self):
+        report = {
+            "status": "unsupported_architecture",
+            "diagnostics": {"first_error": "b.o is ELF32 i386", "candidate_packages": []},
+        }
+        assert benchmark.summarize_capture(report) == {
+            "status": "unsupported_architecture",
+            "first_error": "b.o is ELF32 i386",
+            "candidate_packages": [],
+        }
+
+
 # ----------------------------------------------------------------------------- wrappers, benchmark
 
 
@@ -658,6 +920,66 @@ def test_broken_build_stops_with_a_diagnostic_and_resumes_after_the_recipe_is_fi
     report = json.loads((run / "workspace/reports/build_capture.json").read_text(encoding="utf-8"))
     assert report["status"] == "ok" and report["recipe"]["command"] == "make lib"
     assert report["units"]["libdemo.a"]["entry_points"] == ["src/demo.c#demo_sum"]
+    assert json.loads((run / "state/progress.json").read_text(encoding="utf-8"))["status"] == "running"
+
+
+FOREIGN_BUILDS = {
+    "m32": ("cc -m32 -c demo.c -o demo.o", "demo.o is ELF32 i386 (built with -m32)"),
+    "mx32": ("cc -mx32 -c demo.c -o demo.o", "demo.o is ELF32 x86-64 (x32 ABI) (built with -mx32)"),
+    "aarch64": (
+        "clang --target=aarch64-linux-gnu -c demo.c -o demo.o",
+        "demo.o is ELF64 aarch64 (built with --target=aarch64-linux-gnu)",
+    ),
+    "bpf": ("clang -target bpf -c demo.c -o demo.o", "demo.o is ELF64 bpf (built with --target=bpf)"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("name", sorted(FOREIGN_BUILDS))
+def test_a_build_for_another_architecture_stops_and_resumes_after_a_native_recipe(build_image_run, tmp_path, name):
+    """The guard on real objects: a mixed build (one native object, one foreign) stops with exit code 5."""
+    foreign, described = FOREIGN_BUILDS[name]
+    fixture = tmp_path / "target"
+    fixture.mkdir()
+    # No #include: the build image has no 32-bit or cross libc headers, and needs none to compile these.
+    (fixture / "demo.c").write_text("int demo_sum(int a, int b) { return a + b; }\n", encoding="utf-8")
+    (fixture / "host.c").write_text("int host_id(void) { return 7; }\n", encoding="utf-8")
+    run = tmp_path / "run-1"
+    py = "python3 /opt/framac-pipeline/scripts"
+    mixed = f"cc -c host.c -o host.o && {foreign} && ar rcs libdemo.a host.o demo.o"
+    native = "cc -c host.c -o host.o && cc -c demo.c -o demo.o && ar rcs libdemo.a host.o demo.o"
+    script = (
+        f"{py}/run_metadata.py init --repo demo --run-id run-1 >/dev/null && "
+        f"{py}/run_metadata.py set-build --command '{mixed}' >/dev/null && "
+        f"{{ {py}/build_capture.py run --scratch /tmp/scratch > first-summary.json; echo rc=$?; }} && "
+        f"cp workspace/reports/build_capture.json first.json && cp state/progress.json first-progress.json && "
+        f"{py}/run_metadata.py set-build --command '{native}' --origin agent_confirmed >/dev/null && "
+        f"{py}/build_capture.py run --scratch /tmp/scratch"
+    )
+    proc = build_image_run(fixture, run, script)
+    assert "rc=5" in proc.stdout, proc.stdout + proc.stderr
+    first = json.loads((run / "first.json").read_text(encoding="utf-8"))
+    assert not bc.validate_report(first)
+    assert first["status"] == "unsupported_architecture"
+    arch = first["architecture"]
+    assert arch["host"] == "x86_64" and arch["files"] == 2 and arch["unknown"] == 0
+    assert [e["file"] for e in arch["unsupported"]] == ["demo.o"] and arch["unsupported_total"] == 1
+    assert arch["unsupported"][0]["sources"] == ["demo.c"] and arch["unsupported"][0]["decided_by"] == "header"
+    assert first["diagnostics"]["first_error"].endswith(described)
+    assert first["diagnostics"]["instructions"] == list(bc.TARGET_INSTRUCTIONS)
+    assert first["units"] == {} and first["snapshot"] is None  # stopped before any analysis of the build
+    summary = json.loads((run / "first-summary.json").read_text(encoding="utf-8"))
+    assert summary["unsupported"] == [described] and summary["instructions"] == list(bc.TARGET_INSTRUCTIONS)
+    blocked = json.loads((run / "first-progress.json").read_text(encoding="utf-8"))
+    assert blocked["status"] == "unsupported_architecture" and blocked["phase_done"] == -1
+    assert blocked["blocked"]["resume_at"] == "build_capture.py run"
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    report = json.loads((run / "workspace/reports/build_capture.json").read_text(encoding="utf-8"))
+    assert not bc.validate_report(report)
+    assert report["status"] == "ok" and report["architecture"]["unsupported"] == []
+    assert report["architecture"]["files"] == 2 and report["architecture"]["unknown"] == 0
+    assert report["units"]["libdemo.a"]["files"] == ["demo.c", "host.c"]
     assert json.loads((run / "state/progress.json").read_text(encoding="utf-8"))["status"] == "running"
 
 
