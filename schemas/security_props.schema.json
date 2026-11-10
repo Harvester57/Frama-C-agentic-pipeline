@@ -48,6 +48,41 @@
               "additionalProperties": false
             }
           },
+          "taint": {
+            "$comment": "where the work tree gets Eva taint annotations for this secret (plan step M3, `run --eva-taint`)",
+            "type": "object",
+            "properties": {
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "function": {"type": "string", "pattern": "#"},
+                    "at": {"type": "string", "enum": ["entry", "return"]},
+                    "lvalues": {"type": "string", "minLength": 1}
+                  },
+                  "required": ["function", "at", "lvalues"],
+                  "additionalProperties": false
+                }
+              },
+              "checks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "function": {"type": "string", "pattern": "#"},
+                    "sink": {"type": "string", "minLength": 1},
+                    "args": {"$comment": "[pointer argument index, length argument index or null]", "type": "array", "items": {"type": "array"}}
+                  },
+                  "required": ["function", "sink", "args"],
+                  "additionalProperties": false
+                }
+              },
+              "notes": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["sources", "checks", "notes"],
+            "additionalProperties": false
+          },
           "direct_writers": {"type": "array", "items": {"type": "string"}},
           "entry_points": {"type": "array", "items": {"type": "string"}}
         },
@@ -83,6 +118,35 @@
       }
     },
     "summary": {"type": "object"},
+    "eva_taint": {
+      "$comment": "the Eva taint annotations written into the work tree (plan step M3); absent from reports older than it",
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "functions": {"type": "array", "items": {"type": "string"}},
+        "checks": {
+          "$comment": "each taint check placed: where Eva reports its status (ledger.py ingest-eva names the property from it)",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file": {"type": "string"},
+              "line": {"type": "integer"},
+              "function": {"type": "string", "pattern": "#"},
+              "property": {"type": "string"}
+            },
+            "required": ["file", "line", "function", "property"],
+            "additionalProperties": false
+          }
+        },
+        "skipped": {"type": "array", "items": {"type": "string"}},
+        "modules": {"$comment": "harness modules whose EVA_TAINT this run set", "type": "array", "items": {"type": "string"}},
+        "pending": {"type": "string"}
+      },
+      "required": ["enabled", "files", "functions", "checks", "skipped"],
+      "additionalProperties": false
+    },
     "warnings": {"type": "array", "items": {"type": "string"}}
   },
   "required": ["schema_version", "generated_at", "threat_model", "preamble", "properties", "frame", "obligations", "summary", "warnings"],

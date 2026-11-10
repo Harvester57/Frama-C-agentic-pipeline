@@ -855,3 +855,222 @@ def test_text_literals_are_decided_from_the_real_model(model_run, tmp_path, monk
     _seed_one_file(run, m, doc)
     unit = _ledger_units(run)["prog.c#report::l5_sanitized"]
     assert unit["status"] == ("blocked" if violate else "covered"), unit
+
+
+# ---------------------------------------------------------------------------------------------------
+# Eva taint annotations for indirect secret flows (plan step M3)
+# ---------------------------------------------------------------------------------------------------
+
+TAINT_DIR = FIX / "taint"
+SESSION_KEY_TSET = "session_key[0 .. sizeof(session_key) / sizeof(session_key[0]) - 1]"
+
+
+@pytest.mark.unit
+def test_taint_plan_names_sources_and_sink_calls():
+    plan = by_name(session_props())["L6_no_leak_session_key"]["taint"]
+    assert plan["sources"] == [{"function": "session.c#session_set_key", "at": "return", "lvalues": SESSION_KEY_TSET}]
+    assert [(c["function"], c["sink"], c["args"]) for c in plan["checks"]] == [
+        ("session.c#session_admin", "log_line", [[0, None]]),
+        ("session.c#session_status", "log_line", [[0, None]]),
+    ]
+
+
+@pytest.mark.unit
+def test_apply_taint_inserts_on_the_same_lines_and_is_idempotent(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    original = (FIX / "secret_unwiped" / "session.c").read_text(encoding="utf-8")
+    (work / "session.c").write_text(original, encoding="utf-8", newline="\n")
+    doc = session_props()
+    out = sp.apply_taint(doc, work)
+    text = (work / "session.c").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert len(lines) == len(original.splitlines())
+    assert out["files"] == ["session.c"] and out["changed"] == ["session.c"] and not out["skipped"]
+    assert out["functions"] == ["session.c#session_admin", "session.c#session_set_key", "session.c#session_status"]
+    # No return in session_set_key: the taint goes before its closing brace.
+    assert lines[19] == f"/*@ taint {SESSION_KEY_TSET}; */ }}"
+    check = "/*@ assert L6_no_leak_session_key: eva_taint: !\\tainted(*((unsigned char const *)({}))); */ "
+    assert lines[24] == "    " + check.format('"admin command"') + 'log_line("admin command");'
+    assert lines[35].startswith("    " + check.format('session_open ? "open" : "closed"'))
+    assert [(c["line"], c["function"]) for c in out["checks"]] == [
+        (25, "session.c#session_admin"),
+        (36, "session.c#session_status"),
+    ]
+    # Every annotation is a well-formed comment the tokenizer reads as ACSL.
+    assert sum(1 for t in tokenize_c_acsl(text, "session.c") if t.kind == "acsl_block") == 3
+    again = sp.apply_taint(doc, work)
+    assert again["changed"] == [] and (work / "session.c").read_text(encoding="utf-8") == text
+    off = sp.apply_taint({"properties": []}, work)
+    assert off["changed"] == ["session.c"] and (work / "session.c").read_text(encoding="utf-8") == original
+
+
+@pytest.mark.unit
+def test_apply_taint_skips_calls_an_assertion_cannot_precede(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    source = (
+        "int send(const char *p, int n);\n"
+        "char *next(char *p);\n"
+        "int f(char *p, int n)\n"
+        "{\n"
+        "    if (send(p, n) < 0) return -1;\n"
+        "    send(next(p), n);\n"
+        "    return n > 0 ? send(p, n) : 0;\n"
+        "}\n"
+        "int g(char *p, int n) { int r = send(p, n); for (;;) send(p + 1, n - 1); return r; }\n"
+    )
+    (work / "x.c").write_text(source, encoding="utf-8", newline="\n")
+    checks = [{"function": f"x.c#{f}", "sink": "send", "args": [[0, 1]]} for f in ("f", "g")]
+    props = {"properties": [{"name": "L6_no_leak_k", "taint": {"sources": [], "checks": checks, "notes": []}}]}
+    out = sp.apply_taint(props, work)
+    assert [s.split(": ", 1)[1] for s in out["skipped"]] == [
+        "send call: not a statement of its own",
+        "send call: an argument the assertion cannot repeat",
+        "send call: not a statement of its own",
+    ]
+    lines = (work / "x.c").read_text(encoding="utf-8").splitlines()
+    region = "((unsigned char const *)({}))[0 .. ({}) - 1]"
+    first = "/*@ assert L6_no_leak_k: eva_taint: !\\tainted(" + region.format("p", "n") + "); */ "
+    loop = "/*@ assert L6_no_leak_k: eva_taint: !\\tainted(" + region.format("p + 1", "n - 1") + "); */ "
+    assert (
+        lines[8]
+        == f"int g(char *p, int n) {{ {first}int r = send(p, n); for (;;) {loop}send(p + 1, n - 1); return r; }}"
+    )
+    assert [c["line"] for c in out["checks"]] == [9, 9]
+
+
+def _taint_report(rows: list[dict], analysed: list[str]) -> dict:
+    return {
+        "status": "ok",
+        "module": "libsession.a",
+        "unknown_obligations_by_function": {r["function"]: [r] for r in rows},
+        "invalid_alarms": [],
+        "dead_alarms": [],
+        "functions_with_properties": analysed,
+    }
+
+
+@pytest.mark.unit
+def test_eva_taint_statuses_land_on_the_l6_unit(run_dir):
+    """A taint Unknown blocks the l6_no_leak unit (not the rte one) and WP cannot credit it; a later clean run reopens it."""
+    doc = session_props()
+    work = run_dir / "workspace/work"
+    work.mkdir(parents=True)
+    shutil.copy(FIX / "secret_unwiped" / "session.c", work / "session.c")
+    applied = sp.apply_taint(doc, work)
+    doc["eva_taint"] = {"enabled": True, **{k: applied[k] for k in ("files", "functions", "checks", "skipped")}}
+    assert not sp.validate(doc)
+    _seed_sinks(run_dir, doc)
+    row = {
+        "directory": ".",
+        "file": "session.c",
+        "function": "session_status",
+        "line": 36,
+        "kind": "user assertion",
+        "status": "Unknown",
+        "status_bucket": "Unknown",
+        "annotation": '¬\\tainted(*((unsigned char const *)(session_open != 0? "open": "closed")))',
+    }
+    eva = run_dir / "workspace/reports/eva/libsession.a.json"
+    write_json(eva, _taint_report([row], ["session_admin", "session_status"]))
+    L.cmd_ingest_eva([eva])
+    units = _ledger_units(run_dir)
+    status = units["session.c#session_status::l6_no_leak"]
+    assert status["status"] == "blocked"
+    assert status["unresolved"][0].startswith("Eva taint: L6_no_leak_session_key at line 36")
+    assert status["bookkeeping"]["eva_taint"] == {"libsession.a": "unknown"}
+    assert units["session.c#session_admin::l6_no_leak"]["evidence"][-1]["result"] == "eva_taint_valid"
+    # The taint row is not an RTE obligation of session_status.
+    assert units["session.c#session_status::rte"]["bookkeeping"]["eva_verdicts"] == {"libsession.a": "valid"}
+    assert L._taint_open(status) == ["libsession.a"]
+    # A clean run of the same module: the unit is WP's again.
+    write_json(eva, _taint_report([], ["session_admin", "session_status"]))
+    L.cmd_ingest_eva([eva])
+    status = _ledger_units(run_dir)["session.c#session_status::l6_no_leak"]
+    assert status["status"] == "planned" and not status["unresolved"]
+    assert status["bookkeeping"]["eva_taint"] == {"libsession.a": "valid"}
+    assert not L.validate_ledger(list(_ledger_units(run_dir).values()))
+
+
+@pytest.mark.unit
+def test_wp_cannot_credit_a_unit_with_an_open_taint_check(run_dir):
+    _seed_session(run_dir)
+    ledger = json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))
+    for u in ledger:
+        if u["coverage_id"] == "session.c#session_close::l6_wiped":
+            u.setdefault("bookkeeping", {})["eva_taint"] = {"libsession.a": "unknown"}
+    write_json(run_dir / "coverage-ledger.json", ledger)
+    path = run_dir / "workspace/reports/wp/wp_close_wiped.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIX / "wp_close_wiped.json", path)
+    L.cmd_ingest_wp([path])
+    unit = _ledger_units(run_dir)["session.c#session_close::l6_wiped"]
+    assert unit["status"] != "covered" and not unit["evidence"][-1]["discharging"]
+    assert "Eva taint check is open" in unit["evidence"][-1]["summary"]
+
+
+@pytest.mark.unit
+def test_run_turns_taint_on_and_off(run_dir):
+    model_path = run_dir / "workspace/reports/phase0_model.json"
+    m = session_model()
+    m["threat_model"] = {"status": "ok"}
+    write_json(model_path, m)
+    work = run_dir / "workspace/work"
+    work.mkdir(parents=True)
+    original = (FIX / "secret_unwiped" / "session.c").read_text(encoding="utf-8")
+    (work / "session.c").write_text(original, encoding="utf-8", newline="\n")
+    tm = FIX / "secret_unwiped" / "THREAT_MODEL.md"
+    real = trust.recorded_threat_model
+    try:
+        trust.recorded_threat_model = lambda _m: (trust.load_threat_model(tm), None)  # type: ignore[assignment]
+        assert sp.main(["run", "--eva-taint"]) == 0
+        doc = json.loads((run_dir / "workspace/reports/security_props.json").read_text(encoding="utf-8"))
+        assert doc["eva_taint"]["enabled"] and doc["eva_taint"]["files"] == ["session.c"]
+        assert "pending" in doc["eva_taint"]  # no harness module yet
+        assert "eva_taint" in (work / "session.c").read_text(encoding="utf-8")
+        # Sticky: a plain run (the Makefile's) keeps the annotations.
+        assert sp.main(["run"]) == 0
+        assert "eva_taint" in (work / "session.c").read_text(encoding="utf-8")
+        assert sp.main(["run", "--no-eva-taint"]) == 0
+        assert (work / "session.c").read_text(encoding="utf-8") == original
+        doc = json.loads((run_dir / "workspace/reports/security_props.json").read_text(encoding="utf-8"))
+        assert doc["eva_taint"]["enabled"] is False and not sp.validate(doc)
+    finally:
+        trust.recorded_threat_model = real  # type: ignore[assignment]
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["no_copy", "copy"])
+def test_taint_annotations_in_the_image(model_run, tmp_path, violate):  # noqa: F811
+    """
+    The generated annotations parse and Eva's taint domain decides them: the copy of the key handed
+    to the sink leaves the check Unknown, a buffer that never held it proves it.
+    """
+    lists = {"secrets": [{"name": "key", "kind": "global", "description": "d"}], "output_sinks": [LOG_SINK]}
+    target = _one_file_target(tmp_path / "target", TAINT_DIR / "l6_indirect.c", lists, violate)
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    plan = by_name(doc)["L6_no_leak_key"]["taint"]
+    assert {s["function"] for s in plan["sources"]} >= {"prog.c#set_key"}
+    work = run / "taint-work"
+    work.mkdir()
+    shutil.copy(target / "prog.c", work / "prog.c")
+    applied = sp.apply_taint(doc, work)
+    assert not applied["skipped"] and [c["function"] for c in applied["checks"]] == ["prog.c#show"]
+    defs = " -cpp-extra-args=-DVIOLATE" if violate else ""
+    cmd = [
+        "docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+        "-v", f"{work.resolve()}:/w", "-w", "/w", ANALYSIS_IMAGE, "-c",
+        f"frama-c prog.c{defs} -eva -main eva_main -eva-domains cvalue,taint -then -report-csv out.csv",
+    ]  # fmt: skip
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    rows = [r.split("\t") for r in (work / "out.csv").read_text(encoding="utf-8").splitlines()]
+    taint = [(int(r[2]), r[5]) for r in rows if len(r) > 6 and "\\tainted(" in r[6]]
+    assert taint == [(applied["checks"][0]["line"], "Unknown" if violate else "Valid")], res.stdout

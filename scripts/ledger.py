@@ -1140,6 +1140,125 @@ def _unit_eva_verdicts(unit: dict) -> dict:
     return unit.setdefault("bookkeeping", {}).setdefault("eva_verdicts", {})
 
 
+# Plan step M3: the Eva taint checks security_props.py writes into the work tree (`run --eva-taint`)
+# report as user assertions on `\tainted(...)`. Their status belongs to the property's l6_no_leak
+# unit, never to the function's rte unit: bookkeeping.eva_taint (module -> verdict), and a taint
+# Unknown or Invalid keeps the unit from being credited (a copy of the secret may reach the sink).
+TAINT_CLASS = "l6_no_leak"
+TAINT_UNRESOLVED = "Eva taint: "
+TAINT_BLOCKING = frozenset({"invalid", "unknown"})
+
+
+def _is_taint_row(row: object) -> bool:
+    return isinstance(row, dict) and "\\tainted(" in str(row.get("annotation") or "")
+
+
+def _split_taint_rows(report: dict) -> tuple[dict, list[tuple[str, dict]]]:
+    """The report without its taint rows, and those rows with their verdict (unknown, invalid, dead)."""
+    out = dict(report)
+    rows: list[tuple[str, dict]] = []
+    raw = report.get("unknown_obligations_by_function")
+    if isinstance(raw, dict):
+        kept: dict[str, list] = {}
+        for fn, found in raw.items():
+            keep = []
+            for row in found if isinstance(found, list) else []:
+                if _is_taint_row(row):
+                    rows.append(("unknown", row))
+                else:
+                    keep.append(row)
+            if keep:
+                kept[fn] = keep
+        out["unknown_obligations_by_function"] = kept
+    for key, verdict in (("invalid_alarms", "invalid"), ("dead_alarms", "dead")):
+        found = report.get(key)
+        if isinstance(found, list):
+            rows += [(verdict, r) for r in found if _is_taint_row(r)]
+            out[key] = [r for r in found if not _is_taint_row(r)]
+    return out, rows
+
+
+def _taint_checks(path: Path = DEFAULT_SECURITY_PROPS) -> list[dict]:
+    """The taint checks security_props.py placed ([] without its report or without taint)."""
+    try:
+        doc = load_json_optional(path, {})
+    except ArtifactError:
+        return []
+    record = doc.get("eva_taint") if isinstance(doc, dict) else None
+    checks = record.get("checks") if isinstance(record, dict) and record.get("enabled") else None
+    return [c for c in checks or [] if isinstance(c, dict) and c.get("function")]
+
+
+def _taint_open(unit: dict) -> list[str]:
+    """The modules whose Eva taint verdict on this unit is Unknown or Invalid."""
+    verdicts = (unit.get("bookkeeping") or {}).get("eva_taint") or {}
+    return sorted(m for m, v in verdicts.items() if v in TAINT_BLOCKING)
+
+
+def _ingest_taint(
+    units: dict[str, dict],
+    rows: list[tuple[str, dict]],
+    checks: list[dict],
+    module: str,
+    report: dict,
+    tool_output: str,
+) -> int:
+    """File one Eva report's taint statuses under the l6_no_leak units; returns how many units it touched."""
+    names = {(normalize_file(str(c["file"])), int(c.get("line") or 0)): str(c["property"]) for c in checks}
+    found: dict[str, list[tuple[str, dict]]] = {}
+    for verdict, row in rows:
+        fn = str(row.get("function") or "")
+        for u in units.values():
+            if u["obligation_class"] == TAINT_CLASS and u["function"] == fn and _alarm_in_file(row, u["file"]):
+                found.setdefault(u["coverage_id"], []).append((verdict, row))
+    # A placed check with no Unknown, Invalid or Dead row in a function Eva analysed held: Valid.
+    analysed = set(report.get("functions_with_properties") or [])
+    for c in checks:
+        file, _, fn = str(c["function"]).rpartition("#")
+        if fn not in analysed:
+            continue
+        for u in units.values():
+            if (
+                u["obligation_class"] == TAINT_CLASS
+                and u["function"] == fn
+                and normalize_file(u["file"]) == normalize_file(file)
+            ):
+                found.setdefault(u["coverage_id"], [])
+    for cid, unit_rows in found.items():
+        u = units[cid]
+        verdicts = {v for v, _ in unit_rows}
+        verdict = next((v for v in ("invalid", "unknown", "dead") if v in verdicts), "valid")
+        u.setdefault("bookkeeping", {}).setdefault("eva_taint", {})[module] = verdict
+        where = [
+            f"{names.get((_eva_alarm_path(r), int(r.get('line') or 0)), 'taint check')} at line {r.get('line')}"
+            for _, r in unit_rows
+        ]
+        summary = {
+            "valid": f"Eva slice '{module}': every taint check here holds (no copy of the secret reaches a sink "
+            "from eva_main's contexts); the direct-flow proof is still WP's.",
+            "dead": f"Eva slice '{module}': the taint check(s) are dead ({', '.join(where[:5])}): not reached.",
+            "unknown": f"Eva slice '{module}': the secret's taint may reach a sink ({', '.join(where[:5])}).",
+            "invalid": f"Eva slice '{module}': the secret's taint reaches a sink ({', '.join(where[:5])}).",
+        }[verdict]
+        add_evidence(u, "eva", "run_eva_slice.py", f"eva_taint_{verdict}", False, tool_output, summary)
+        if verdict in TAINT_BLOCKING and u["status"] in ("planned", "blocked", "covered"):
+            u["status"] = "blocked"
+            u["unresolved"] = [x for x in u.get("unresolved") or [] if not x.startswith(TAINT_UNRESOLVED)] + [
+                f"{TAINT_UNRESOLVED}{w}: the secret's taint may reach the sink (indirect flow)" for w in where[:5]
+            ]
+    return len(found)
+
+
+def _taint_reopen(unit: dict) -> None:
+    """A unit blocked only by Eva taint verdicts that no longer block: planned again (WP decides)."""
+    unresolved = unit.get("unresolved") or []
+    if unit["status"] != "blocked" or _taint_open(unit) or not unresolved:
+        return
+    if all(str(x).startswith(TAINT_UNRESOLVED) for x in unresolved):
+        unit["status"] = "planned"
+        unit["unresolved"] = []
+
+
 @ledger_locked
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -1148,6 +1267,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
     index = _dag_line_index(dag=mm.dag)
     unit_names = {u["function"] for u in units.values()}
     touched: set[str] = set()
+    taint_checks = _taint_checks()
     for path in paths:
         report = load_json_strict(path)
         stats["reports"] += 1
@@ -1185,11 +1305,22 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             continue
 
         # This module's newest report replaces every verdict its earlier ones gave.
+        taint_reset: list[dict] = []
         for u in units.values():
             verdicts = (u.get("bookkeeping") or {}).get("eva_verdicts")
             if isinstance(verdicts, dict) and module in verdicts:
                 del verdicts[module]
                 touched.add(u["coverage_id"])
+            taint = (u.get("bookkeeping") or {}).get("eva_taint")
+            if isinstance(taint, dict) and module in taint:
+                del taint[module]
+                taint_reset.append(u)
+        report, taint_rows = _split_taint_rows(report)
+        taint_units = _ingest_taint(units, taint_rows, taint_checks, module, report, tool_output)
+        if taint_units:
+            stats["taint_units"] = stats.get("taint_units", 0) + taint_units
+        for u in taint_reset:
+            _taint_reopen(u)
 
         def by_function(rows: object, reported: str | None = None) -> dict[str, list]:
             out: dict[str, list] = {}
@@ -1682,6 +1813,19 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 continue
             if _decided_only(u):
                 # Every property of the unit was decided from the model: WP has no goal of it to report.
+                continue
+            if _taint_open(u):
+                # Plan step M3: Eva's taint domain says a copy of the secret may reach a sink here.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    f"wp_{report['status']}",
+                    False,
+                    tool_output,
+                    f"WP result recorded on a unit whose Eva taint check is open (module(s) "
+                    f"{', '.join(_taint_open(u))}); not credited.",
+                )
                 continue
             cls = u["obligation_class"]
             counts = by_class.get(cls)

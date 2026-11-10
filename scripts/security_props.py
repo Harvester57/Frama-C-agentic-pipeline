@@ -721,9 +721,10 @@ class _Gen:
             acsl = self.t.render(
                 "l6_no_leak", "calling", name=pname, targets=targets, predicate=" &&\n      ".join(clauses)
             )
-            notes = ["direct flows only: a copy of the secret that reaches a sink is not seen"]
+            notes = ["direct flows only: a copy of the secret that reaches a sink is not seen (see `taint`)"]
             if sec["scope"] != "global":
                 notes.append(f"a parameter secret is checked in {fn_name} only")
+            taint = self._taint_plan(item, sec, sinks, set(instances))
             if defined and sec["scope"] == "global":
                 rname = self._unique(f"{NAME_PREFIX['no_leak']}read_{_ident(name)}")
                 sink_names = sorted({self.m.name(f) for f in defined})
@@ -740,7 +741,64 @@ class _Gen:
                 notes=notes,
                 threat_model={"secret": name, "kind": item.get("kind"), "sinks": [str(s["function"]) for s in sinks]},
                 targets=targets,
+                taint=taint,
             )
+
+    # -- L6, indirect flows (plan step M3) ----------------------------------------------------------
+
+    def _taint_lvalues(self, item: dict, sec: dict) -> str:
+        """The secret as a C-scope ACSL tset for `//@ taint` (no \\formal: the annotation is in the code)."""
+        name, kind, size = str(item.get("name")), str(item.get("kind")), item.get("size")
+        if kind == "parameter":
+            return f"{name}[0 .. ({size}) - 1]" if size else f"*{name}"
+        if kind == "field":
+            return sec["lv"].replace("\\formal(", "(")
+        shape = sec["shape"]
+        if size:
+            return f"{name}[0 .. ({size}) - 1]"
+        if shape == "array":
+            return f"{name}[0 .. sizeof({name}) / sizeof({name}[0]) - 1]"
+        if shape == "pointer":
+            return f"*{name}"
+        return name
+
+    def _taint_plan(self, item: dict, sec: dict, sinks: list[dict], callers: set[str]) -> dict:
+        """
+        Where the work tree gets Eva taint annotations for this secret (plan step M3), applied by
+        `apply_taint`: `//@ taint <secret>;` at its sources, and `//@ assert <property>: eva_taint:
+        !\\tainted(...);` before each call of a sink in the property's calling instances. A secret held
+        by a function (a parameter, a field of one) is tainted when that function starts; a global one
+        where it may be written: before each return of its direct writers and of the functions that
+        call a libc memory writer (tainting the secret more often only marks it more precisely).
+        """
+        lvalues = self._taint_lvalues(item, sec)
+        sources: list[dict] = []
+        if sec["scope"] == "function":
+            for fid in self.m.resolve(str(item.get("function"))):
+                if fid in self.m.live:
+                    sources.append({"function": fid, "at": "entry", "lvalues": lvalues})
+        else:
+            root = str(item.get("object") if str(item.get("kind")) == "field" else item.get("name"))
+            writers = self.m.direct_writers(root) | {
+                fid for fid in self.m.live if set(self.m.functions[fid].get("external_calls") or []) & MEMORY_WRITERS
+            }
+            sources += [{"function": fid, "at": "return", "lvalues": lvalues} for fid in sorted(writers)]
+        checks: list[dict] = []
+        notes: list[str] = []
+        for s in sinks:
+            sname = str(s["function"]).split("#")[-1]
+            params, formals = self._sink_params(s, sname, ("pointer", "const_pointer"))
+            index = {str(p.get("name")): i for i, p in enumerate(formals or [])}
+            length = s.get("length")
+            if not formals or any(p not in index for p in params) or (length and str(length) not in index):
+                notes.append(f"{sname}: its parameters are unknown, no taint check at its calls")
+                continue
+            args = [[index[p], index[str(length)] if length else None] for p in params]
+            for fid in sorted(callers & self.m.callers_of(str(s["function"]))):
+                checks.append({"function": fid, "sink": sname, "args": args})
+        if not sources:
+            notes.append("no function the secret's taint can start in: the checks cannot fail")
+        return {"sources": sources, "checks": checks, "notes": notes}
 
 
 def generate(model: dict, threat: dict | None, templates: _Templates | None = None) -> dict:
@@ -863,6 +921,279 @@ def meta_line_names(text: str) -> dict[int, str]:
     return out
 
 
+# ---------------------------------------------------------------------------------------------------
+# Eva taint annotations in the work tree (plan step M3)
+# ---------------------------------------------------------------------------------------------------
+
+# The name every generated taint check carries next to its property's: WP leaves it out
+# (`-wp-prop=-eva_taint`), and ledger.py ingest-eva files its status under the property's l6 unit.
+TAINT_TAG = "eva_taint"
+DEFAULT_WORK = Path("workspace/work")
+# What apply_taint inserts, and nothing else: re-running it first removes these.
+_GENERATED_TAINT_RE = re.compile(
+    r"/\*@ (?:taint [^\n]*?; |assert L6_no_leak_[A-Za-z0-9_]+: " + TAINT_TAG + r": [^\n]*?; )\*/ "
+)
+# Argument text an assertion may repeat: no call, assignment or increment.
+_ARG_UNSAFE_RE = re.compile(r"[A-Za-z_]\w*\s*\(|(?<![=!<>])=(?!=)|\+\+|--")
+_STATEMENT_STOP = frozenset({";", "{", "}"})
+
+
+def taint_annotation(lvalues: str) -> str:
+    return f"/*@ taint {lvalues}; */ "
+
+
+def taint_check(prop: str, regions: list[str]) -> str:
+    pred = " && ".join(f"!\\tainted({r})" for r in regions)
+    return f"/*@ assert {prop}: {TAINT_TAG}: {pred}; */ "
+
+
+def strip_taint(text: str) -> tuple[str, int]:
+    """`text` without the annotations apply_taint generated, and how many there were."""
+    return _GENERATED_TAINT_RE.subn("", text)
+
+
+def _call_args(tokens: list, open_idx: int, close_idx: int, source: str) -> list[str]:
+    """The source text of each argument of a call whose parentheses are tokens[open_idx], tokens[close_idx]."""
+    out, depth, start = [], 0, tokens[open_idx].end
+    for tok in tokens[open_idx + 1 : close_idx]:
+        if tok.kind != "c_token":
+            continue
+        if tok.text in "([{":
+            depth += 1
+        elif tok.text in ")]}":
+            depth -= 1
+        elif tok.text == "," and depth == 0:
+            out.append(source[start : tok.start].strip())
+            start = tok.end
+    last = source[start : tokens[close_idx].start].strip()
+    if last or out:
+        out.append(last)
+    return out
+
+
+def _statement_start(tokens: list, idx: int) -> int | None:
+    """
+    The token starting the statement that holds the call at tokens[idx], or None when the call is
+    inside a condition, an argument list or a conditional expression (no place for an assertion).
+    """
+    code = [k for k in range(idx) if tokens[k].kind == "c_token"]
+    start = idx
+    pos = len(code) - 1
+    while pos >= 0:
+        k = code[pos]
+        text = tokens[k].text
+        if text in (")", "]"):
+            # Skip the group back to its opener: a cast, an index, or the head of a control statement.
+            opener_text = "(" if text == ")" else "["
+            depth = 0
+            while pos >= 0:
+                t = tokens[code[pos]].text
+                if t == text:
+                    depth += 1
+                elif t == opener_text:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                pos -= 1
+            if pos < 0:
+                return None
+            before = tokens[code[pos - 1]].text if pos > 0 else ""
+            if text == ")" and before in ("if", "while", "for", "switch"):
+                return start  # `if (c) f(x);`: the call is the body
+            start = code[pos]
+        elif text in ("(", "["):
+            return None  # inside a condition or an argument list
+        elif text in _STATEMENT_STOP or text in ("else", "do"):
+            return start
+        elif text == ":":
+            # A label or a case ends the walk; the `:` of a conditional expression does not.
+            for back in range(pos - 1, -1, -1):
+                t = tokens[code[back]].text
+                if t == "?":
+                    return None
+                if t in _STATEMENT_STOP:
+                    break
+            return start
+        elif text in ("?", ","):
+            return None  # a conditional or comma expression, or a declarator list
+        else:
+            start = k
+        pos -= 1
+    return start
+
+
+def _insert_taint_in_function(
+    source: str, name: str, ops: list[dict], skipped: list[str], where: str, placed: list[dict] | None = None
+) -> list:
+    """
+    (offset, text) insertions for one function's sources and checks; problems go to `skipped`, and each
+    check placed (file, line, function, property: where Eva reports its status) to `placed`.
+    """
+    from acsl_ast import _find_body_brace_offset, locate_all_definition_spans, tokenize_c_acsl  # noqa: PLC0415
+
+    spans = locate_all_definition_spans(source, where)
+    span = spans.get(name)
+    if span is None:
+        skipped.append(f"{where}#{name}: no definition found")
+        return []
+    brace = _find_body_brace_offset(span.text, where)
+    if brace is None:
+        skipped.append(f"{where}#{name}: no body found")
+        return []
+    body_start = span.start_byte + brace
+    tokens = [t for t in tokenize_c_acsl(source, where) if body_start <= t.start < span.end_byte]
+    out: list[tuple[int, str]] = []
+    for op in ops:
+        if op["kind"] == "entry":
+            out.append((body_start + 1, taint_annotation(op["lvalues"])))
+        elif op["kind"] == "return":
+            text = taint_annotation(op["lvalues"])
+            out += [(t.start, text) for t in tokens if t.kind == "c_token" and t.text == "return"]
+            out.append((span.end_byte - 1, text))
+        else:
+            for i, tok in enumerate(tokens):
+                if tok.kind != "c_token" or tok.text != op["sink"]:
+                    continue
+                nxt = next((k for k in range(i + 1, len(tokens)) if tokens[k].kind == "c_token"), None)
+                prev = next((k for k in range(i - 1, -1, -1) if tokens[k].kind == "c_token"), None)
+                if nxt is None or tokens[nxt].text != "(" or (prev is not None and tokens[prev].text in (".", "->")):
+                    continue
+                close = nxt
+                depth = 0
+                for k in range(nxt, len(tokens)):
+                    if tokens[k].kind == "c_token" and tokens[k].text == "(":
+                        depth += 1
+                    elif tokens[k].kind == "c_token" and tokens[k].text == ")":
+                        depth -= 1
+                        if depth == 0:
+                            close = k
+                            break
+                args = _call_args(tokens, nxt, close, source)
+                regions: list[str] = []
+                for p, length in op["args"]:
+                    if p >= len(args) or (length is not None and length >= len(args)):
+                        regions = []
+                        break
+                    ptr = args[p]
+                    if _ARG_UNSAFE_RE.search(ptr) or (length is not None and _ARG_UNSAFE_RE.search(args[length])):
+                        regions = []
+                        break
+                    if length is None:
+                        regions.append(f"*((unsigned char const *)({ptr}))")
+                    else:
+                        regions.append(f"((unsigned char const *)({ptr}))[0 .. ({args[length]}) - 1]")
+                start = _statement_start(tokens, i)
+                if not regions or start is None:
+                    skipped.append(
+                        f"{where}:{tok.line}: {op['sink']} call: "
+                        + ("an argument the assertion cannot repeat" if not regions else "not a statement of its own")
+                    )
+                    continue
+                out.append((tokens[start].start, taint_check(op["property"], regions)))
+                if placed is not None:
+                    placed.append(
+                        {
+                            "file": where,
+                            "line": tokens[start].line,
+                            "function": f"{where}#{name}",
+                            "property": op["property"],
+                        }
+                    )
+    return out
+
+
+def apply_taint(props: dict, work: Path) -> dict:
+    """
+    Write the taint annotations of every property's `taint` plan into the work tree (`work`, the
+    target's copy): same-line insertions, so no line number moves. Annotations a previous run
+    generated are removed first, so a re-run (or a run with taint off and an empty plan) leaves
+    exactly the current plan. Returns the files changed, the annotated functions and what was skipped.
+    """
+    by_file: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for p in props.get("properties") or []:
+        plan = p.get("taint") or {}
+        for s in plan.get("sources") or []:
+            file, _, name = str(s["function"]).rpartition("#")
+            by_file[file][name].append({"kind": s["at"], "lvalues": s["lvalues"]})
+        for c in plan.get("checks") or []:
+            file, _, name = str(c["function"]).rpartition("#")
+            by_file[file][name].append({"kind": "check", "sink": c["sink"], "args": c["args"], "property": p["name"]})
+    changed: list[str] = []
+    annotated: list[str] = []
+    annotated_files: list[str] = []
+    placed: list[dict] = []
+    skipped: list[str] = []
+    candidates = set(by_file)
+    if work.is_dir():
+        for path in sorted(work.rglob("*")):
+            if path.suffix in (".c", ".h") and path.is_file():
+                rel = path.relative_to(work).as_posix()
+                try:
+                    if _GENERATED_TAINT_RE.search(path.read_text(encoding="utf-8", errors="replace")):
+                        candidates.add(rel)
+                except OSError:
+                    continue
+    for file in sorted(candidates):
+        path = work / file
+        if not path.is_file():
+            skipped.append(f"{file}: not in the work tree")
+            continue
+        original = path.read_text(encoding="utf-8", errors="surrogateescape")
+        text, _ = strip_taint(original)
+        inserts: list[tuple[int, str]] = []
+        for name, ops in sorted(by_file.get(file, {}).items()):
+            found = _insert_taint_in_function(text, name, ops, skipped, file, placed)
+            if found:
+                annotated.append(f"{file}#{name}")
+            inserts += found
+        for offset, snippet in sorted(set(inserts), reverse=True):
+            text = text[:offset] + snippet + text[offset:]
+        if inserts:
+            annotated_files.append(file)
+        if text != original:
+            path.write_text(text, encoding="utf-8", errors="surrogateescape", newline="")
+            changed.append(file)
+    return {
+        "work": work.as_posix(),
+        "changed": changed,
+        "files": annotated_files,
+        "functions": sorted(set(annotated)),
+        "checks": sorted(placed, key=lambda c: (c["file"], c["line"], c["property"])),
+        "skipped": skipped,
+    }
+
+
+def set_taint_params(files: list[str], previous: list[str], work: Path, run_dir: Path = Path(".")) -> dict:
+    """
+    Turn Eva's taint domain on (params.json `eva_taint`, EVA_TAINT_<mod> in the Makefile) for every
+    harness module whose sources include an annotated file, and off again for the modules a previous
+    run turned it on for that no longer need it. Without harness modules yet (Phase 0 Step 3 runs
+    before Step 4), nothing is set: the Makefile's `seed` runs `security-props` again after them.
+    """
+    import pipeline_make  # noqa: PLC0415 (lazy: the generation itself needs no Make layer)
+
+    wanted = {(work / f).as_posix() for f in files}
+    try:
+        plan = pipeline_make.build_plan(run_dir)
+    except Exception as exc:  # noqa: BLE001 (no plan yet: nothing to set, said in the result)
+        return {"modules": [], "pending": f"no module plan yet ({str(exc)[:160]})"}
+    if not plan.modules:
+        return {"modules": [], "pending": "no harness module yet: run security_props.py again after Step 4"}
+    modules = []
+    for name, mod in sorted(plan.modules.items()):
+        # An include_source harness #includes the module's files: its DAG record names them.
+        dag_sources = (plan.records.get(name) or {}).get("required_sources") or []
+        srcs = {Path(s).as_posix() for s in mod.sources} | {(work / str(s)).as_posix() for s in dag_sources}
+        if wanted & srcs:
+            modules.append(name)
+    for name in modules:
+        pipeline_make.params_set(run_dir, name, eva_taint=True)
+    for name in sorted(set(previous) - set(modules)):
+        if name in plan.modules:
+            pipeline_make.params_set(run_dir, name, eva_taint=False)
+    return {"modules": modules}
+
+
 def obligations_for(props: dict, file: str, name: str) -> list[dict]:
     """The obligations of a function, keyed `file#name`."""
     return list((props.get("obligations") or {}).get(f"{file}#{name}") or [])
@@ -977,6 +1308,28 @@ def cmd_run(args: argparse.Namespace) -> int:
     doc = generate(model, threat)
     if note:
         doc["warnings"].insert(0, note)
+    # Plan step M3, opt in: Eva taint annotations in the work tree. The choice is sticky (the Makefile's
+    # `security-props` runs without options), and turning it off removes the annotations again.
+    previous = load_json_optional(args.out, None)
+    previous_taint = previous.get("eva_taint") if isinstance(previous, dict) else None
+    previous_taint = previous_taint if isinstance(previous_taint, dict) else {}
+    enabled = args.eva_taint if args.eva_taint is not None else bool(previous_taint.get("enabled"))
+    applied = apply_taint(doc if enabled else {"properties": []}, args.work)
+    record: dict[str, Any] = {
+        "enabled": enabled,
+        **{k: applied[k] for k in ("files", "functions", "checks", "skipped")},
+    }
+    if enabled or previous_taint.get("modules"):
+        record.update(
+            set_taint_params(applied["files"], list(previous_taint.get("modules") or []), args.work, args.run_dir)
+        )
+    doc["eva_taint"] = record
+    if enabled and record.get("pending"):
+        doc["warnings"].append(f"eva_taint: {record['pending']}")
+    if enabled and applied["skipped"]:
+        doc["warnings"].append(
+            f"eva_taint: {len(applied['skipped'])} annotation(s) not placed: {applied['skipped'][:3]}"
+        )
     # Own schema problems are warnings in the artifact (validate_artifacts.py run-dir fails on them).
     problems = validate(doc)
     if problems:
@@ -987,6 +1340,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "out": str(args.out),
         "threat_model": doc["threat_model"]["status"],
         "summary": doc["summary"],
+        "eva_taint": {k: v for k, v in doc["eva_taint"].items() if k not in ("functions", "checks")},
         "warnings": doc["warnings"][:10],
     }
     if problems:
@@ -1017,6 +1371,17 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="Write workspace/reports/security_props.json")
     r.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     r.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    taint = r.add_mutually_exclusive_group()
+    taint.add_argument(
+        "--eva-taint",
+        dest="eva_taint",
+        action="store_true",
+        help="Write Eva taint annotations for the L6 secrets into the work tree (sticky; plan step M3)",
+    )
+    taint.add_argument("--no-eva-taint", dest="eva_taint", action="store_false", help="Remove them again")
+    r.set_defaults(eva_taint=None)
+    r.add_argument("--work", type=Path, default=DEFAULT_WORK, help=f"The work tree (default {DEFAULT_WORK})")
+    r.add_argument("--run-dir", type=Path, default=Path("."), help="The run directory (params.json)")
     m = sub.add_parser("meta-file", help="The MetAcsl file of one function's WP run")
     m.add_argument("--function", required=True, help="file#name (or a bare name)")
     m.add_argument("--props", type=Path, default=DEFAULT_OUT)
