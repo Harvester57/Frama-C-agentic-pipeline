@@ -1,3 +1,4 @@
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
 
 ## Windows shell & file-writing rules
 - Never write code, tests, or docs containing backslashes (ACSL `\valid_read`, `\result`, regex, `\n`) through shell heredocs. Use the Write/Edit tools instead.
@@ -28,11 +29,11 @@
 - New test modules must not redefine shared module-level constants (e.g. TREE). Check for name collisions first.
 - Known flaky tests: the concurrency/run-lock tests. Rerun once before investigating.
 
-## Recording pipeline bugs in `docs/troubleshooting.md`
+## Recording pipeline bugs in `docs/troubleshooting/`
 
-Whenever you hit a bug, gap or workaround in the pipeline itself while running or developing it (a script, a generator, a gate, the wrapper, a skill or brief that is wrong or incomplete), write it into `docs/troubleshooting.md` **in the same session**, so the maintainers can inspect and correct it later. This applies to every agent: the parent, forks, subagents and anyone working a target run. Do not leave it only in chat or in a progress report.
+Whenever you hit a bug, gap or workaround in the pipeline itself while running or developing it (a script, a generator, a gate, the wrapper, a skill or brief that is wrong or incomplete), write it into the thematic sub-documents under [`./docs/troubleshooting/`](./docs/troubleshooting/README.md) **in the same session**, so the maintainers can inspect and correct it later. Read [`./docs/troubleshooting/AGENTS.md`](./docs/troubleshooting/AGENTS.md) for how to update the folder. This applies to every agent: the parent, forks, subagents and anyone working a target run. Do not leave it only in chat or in a progress report.
 
-- **Where:** the section for the phase it appeared in (Phase 0 is Section 1), as a `### Symptom: ...` entry with **Cause:** and **Fix:** bullets, in the format of the neighbouring entries. Update an existing entry instead of adding a duplicate.
+- **Where:** the thematic sub-document matching the component or phase (see the routing table in [`./docs/troubleshooting/AGENTS.md`](./docs/troubleshooting/AGENTS.md)), as a `### Symptom: ...` entry with **Cause:** and **Fix:** bullets, in the format of the neighbouring entries. Update an existing entry instead of adding a duplicate.
 - **What to include:** the exact error text or gate message, the target and run that showed it, the root cause once you have diagnosed it (open the logs first; do not guess), and the workaround you used.
 - **Status:** say whether the pipeline bug is **fixed** (name the file and the change; mention it is uncommitted if it is) or **open** (mark it `**Open pipeline bug:**` so it is easy to find). A target-side issue (for example a CRLF checkout) is a troubleshooting entry too, but say it is not a pipeline defect.
 - **Do not silently work around it:** if you change pipeline code to get past it, say so in the entry and in your report to the user. If you only worked around it in the run directory, the entry must say the pipeline still has the defect.
