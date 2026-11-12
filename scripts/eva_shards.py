@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Eva sharding: one module's Eva run split by dispatch case into k runs, and their reports merged into
-the module's report (docs/eva-sharding.md).
+the module's report (docs/guides/eva-sharding.md).
 
 Eva is single-threaded, so a module whose harness has many dispatch cases takes the sum of all of
 them in one run (QCBOR run-5: 6,964 s for 179 cases). A shard is the same analysis of the same

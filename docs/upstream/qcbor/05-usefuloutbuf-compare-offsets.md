@@ -1,7 +1,7 @@
 # `UsefulOutBuf_Compare()` reads outside the buffer for large offsets, despite its documentation
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
-Patch: [`patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch`](patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch).
+Patch: [`patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch`](./patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch).
 
 ## Summary
 
@@ -31,7 +31,7 @@ The documentation is also wrong in two smaller ways:
 
 ## Reproducer
 
-[`repro/outbuf_compare.c`](repro/outbuf_compare.c):
+[`repro/outbuf_compare.c`](./repro/outbuf_compare.c):
 
 ```c
 uint8_t *pStorage = malloc(16);

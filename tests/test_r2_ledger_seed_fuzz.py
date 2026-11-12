@@ -1,4 +1,4 @@
-"""Remediation step R2 (docs/phase0-remediation-plan.md): ledger seed checks, --refresh, fuzz ingest by line."""
+"""Remediation step R2 (docs/plans/archive/phase0-remediation-plan.md): ledger seed checks, --refresh, fuzz ingest by line."""
 
 import copy
 import json

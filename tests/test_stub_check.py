@@ -1,4 +1,4 @@
-"""Checks of stub contracts (docs/templates-and-stubs-improvement-plan.md S3): scripts/stub_check.py."""
+"""Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md S3): scripts/stub_check.py."""
 
 from __future__ import annotations
 

@@ -25,7 +25,7 @@ Writes the call-graph DAG (workspace/reports/callgraph_dag.json) from the Phase 
   E-ACSL cannot build them (`route_nonlocal_jumps`: setjmp/longjmp).
 
 Without a successful model there is no DAG: Phase 0 stops, and the parent agent asks for a build
-recipe (`needs_build_recipe`, docs/phase0-implementation-plan.md).
+recipe (`needs_build_recipe`, docs/plans/archive/phase0-implementation-plan.md).
 
 **Versions.** The DAG records `schema_version` (DAG_SCHEMA_VERSION), stamped by `block_fallback_units`:
 a DAG without it predates the GCC-fallback blocking (defect 6), and its fallback units may still run
@@ -33,7 +33,7 @@ Eva and WP. A model that lacks one of the facts above (a version 1 model: `phase
 gives one DAG warning per missing fact, saying what the DAG cannot derive without it (the
 `dynamic_allocation` blocker and Tier 2, format/write detection, buffer direction, trust).
 
-**Fields dropped** (docs/phase0-remediation-plan.md R4, D9: a field stays only when the report or the
+**Fields dropped** (docs/plans/archive/phase0-remediation-plan.md R4, D9: a field stays only when the report or the
 benchmark shows it; the skills describe what the pipeline gives, not the reverse). Per function
 `indirect_callees`: `internal_callees` holds the indirect edges, and `wp_notes`/`verifiability` name the
 sites that need `//@ calls`. Per module `cross_module_callees` (`required_sources` already holds the
@@ -692,7 +692,7 @@ def model_only_functions(model: dict, capture: dict | None) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------------------------------
-# The DAG from the Phase 0 model, path modules as modules (docs/phase0-implementation-plan.md step I5a)
+# The DAG from the Phase 0 model, path modules as modules (docs/plans/archive/phase0-implementation-plan.md step I5a)
 # ---------------------------------------------------------------------------------------------------
 
 
@@ -991,7 +991,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
 
 
 # ---------------------------------------------------------------------------------------------------
-# Link units as modules (docs/phase0-implementation-plan.md step I5b)
+# Link units as modules (docs/plans/archive/phase0-implementation-plan.md step I5b)
 # ---------------------------------------------------------------------------------------------------
 
 _UNIT_KIND_ORDER = {"static_lib": 0, "shared_lib": 1}

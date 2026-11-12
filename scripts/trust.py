@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trust boundary (docs/phase0-implementation-plan.md step I7): which functions take attacker-controlled
+Trust boundary (docs/plans/archive/phase0-implementation-plan.md step I7): which functions take attacker-controlled
 data, decided by a stated rule, the target's threat model and, optionally, CodeQL. Stdlib only.
 
     trust.py run [--model workspace/reports/phase0_model.json] [--threat-model PATH]

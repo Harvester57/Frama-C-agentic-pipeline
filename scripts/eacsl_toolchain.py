@@ -60,7 +60,7 @@ EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-f
 # tracking fixes that; it needs the runtime initialized by templates/eacsl_runtime/fuzz_init.c.
 # Failure reports print the values involved by default (-e-acsl-O-print-values, on at O <= 3).
 # Never pass the deprecated -e-acsl-assert-print-data: Frama-C 34+ aliases it to -e-acsl-O-valid,
-# which re-instruments proven annotations (docs/upstream/frama-c-eacsl-assert-print-data-alias.md).
+# which re-instruments proven annotations (docs/upstream/frama-c/frama-c-eacsl-assert-print-data-alias.md).
 EACSL_FULL_MTRACKING_FLAG = "-e-acsl-full-mtracking"
 EACSL_FC_EXTRA_FLAGS = (EACSL_FULL_MTRACKING_FLAG,)
 # Full tracking registers every local with `__e_acsl_store_block(&local, ...)`, and the kernel aborts
@@ -181,7 +181,7 @@ def build_eacsl_flag_sets(
     # Frama-C's frontend preprocessing repairs `offsetof` with a non-constant index (scripts/fc_cpp_wrapper.py)
     # and, for E-ACSL only, writes `<==>` in annotations as two implications (scripts/fc_cpp_wrapper_eacsl.py):
     # E-ACSL 35 aborts on `<==>` over `\old`, `\at` or a formal in `ensures`
-    # (docs/upstream/frama-c-eacsl-iff-labelled-term.md).
+    # (docs/upstream/frama-c/frama-c-eacsl-iff-labelled-term.md).
     wrapper = framac_cpp_wrapper(EACSL_CPP_WRAPPER)
     if wrapper:
         front.extend(["-wrapper", wrapper])

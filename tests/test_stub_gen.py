@@ -1,4 +1,4 @@
-"""The run's stub overlay, workspace/stubs (docs/templates-and-stubs-improvement-plan.md S2): scripts/stub_gen.py."""
+"""The run's stub overlay, workspace/stubs (docs/plans/templates-and-stubs-improvement-plan.md S2): scripts/stub_gen.py."""
 
 from __future__ import annotations
 

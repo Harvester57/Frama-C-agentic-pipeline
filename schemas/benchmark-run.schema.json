@@ -1,5 +1,5 @@
 {
-  "$comment": "Contract for one benchmark run file, written by scripts/benchmark.py run and stored as a baseline under benchmark/baselines. Checked by benchmark.py baseline. Metric names are documented in docs/benchmark.md.",
+  "$comment": "Contract for one benchmark run file, written by scripts/benchmark.py run and stored as a baseline under benchmark/baselines. Checked by benchmark.py baseline. Metric names are documented in docs/guides/benchmark.md.",
   "type": "object",
   "properties": {
     "schema_version": {"const": 1},

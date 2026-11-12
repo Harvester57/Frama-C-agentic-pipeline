@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Harness modules and the build's link units (docs/phase0-implementation-plan.md step I5b).
+Harness modules and the build's link units (docs/plans/archive/phase0-implementation-plan.md step I5b).
 
 With the Phase 0 model, the DAG's modules are link units (`libqcbor_a`, `libcryptolib_so`): the ledger
 groups functions by unit, and tiers, sources and flags come from the unit. Harnesses stay smaller: a

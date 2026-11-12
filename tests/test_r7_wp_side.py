@@ -1,4 +1,4 @@
-"""R7 (docs/phase0-remediation-plan.md): one architect per harness header, sub-module gating, old classes gone."""
+"""R7 (docs/plans/archive/phase0-remediation-plan.md): one architect per harness header, sub-module gating, old classes gone."""
 
 from __future__ import annotations
 

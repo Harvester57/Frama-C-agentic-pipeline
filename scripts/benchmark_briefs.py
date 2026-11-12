@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 A/B of prover briefs on a small fixed sample of small assert programs, judged by this pipeline's own
-oracles rather than the dataset's. See docs/benchmark.md.
+oracles rather than the dataset's. See docs/guides/benchmark.md.
 
 The dataset stays outside the repository and its path is always a parameter. Nothing it names is ever
 written down: samples are identified by content digest, because some of its file names look like
@@ -21,7 +21,7 @@ Oracles, in order, for one answer:
   4. A new value precondition on an entry function may define the problem away. Without a dynamic
      oracle here (these programs have no corpus), such a proof is reported apart, as conditional.
 
-The E-ACSL guardrail is not one of these oracles; docs/benchmark.md says what that leaves open.
+The E-ACSL guardrail is not one of these oracles; docs/guides/benchmark.md says what that leaves open.
 """
 
 from __future__ import annotations
@@ -504,7 +504,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
     programs = scan_dataset(Path(args.dataset))
     chosen = select_sample(programs, args.per_corpus, args.salt)
     doc = {
-        "comment": "Fixed sample of the assert-program dataset. Content digests only: never add file names (docs/benchmark.md).",
+        "comment": "Fixed sample of the assert-program dataset. Content digests only: never add file names (docs/guides/benchmark.md).",
         "salt": args.salt,
         "per_corpus": args.per_corpus,
         "max_lines": MAX_LINES,

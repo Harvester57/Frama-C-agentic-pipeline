@@ -4,7 +4,7 @@
 # packs. CodeQL extracts C by tracing the target's build, so it needs exactly the build image's
 # compilers, build tools and target packages; neither the monolith nor the analysis image ever
 # contains CodeQL. The CodeQL licence allows it for open-source code only: this image is built
-# locally and never pushed or shared (docs/phase0-implementation-plan.md, steps I0 and I7).
+# locally and never pushed or shared (docs/plans/archive/phase0-implementation-plan.md, steps I0 and I7).
 #
 #   docker build --target framac-build -t framac-build .
 #   docker build -f Dockerfile.codeql -t framac-codeql .

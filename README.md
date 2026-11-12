@@ -41,14 +41,14 @@ flowchart LR
    - **Layer 5:** Output sanitization at the threat model's sinks (no CR/LF in log text, no uninitialized byte)
    - **Layer 6:** Secrets wiped on release and never handed to an output sink
 
-   Layers 4 to 6 come from the structured threat model in `THREAT_MODEL.md`, not from patterns in the code ([`./docs/security-properties.md`](./docs/security-properties.md)).
+   Layers 4 to 6 come from the structured threat model in `THREAT_MODEL.md`, not from patterns in the code ([`./docs/guides/security-properties.md`](./docs/guides/security-properties.md)).
 7. **Self-Sizing Resource Broker & Content-Addressed Caches:**
-   Before every job, [`./scripts/resources.py`](./scripts/resources.py) measures available cgroups, Slurm allocations, and Docker/Podman engine limits to lease CPUs and memory per container while keeping outcome-deciding limits (`-wp-memlimit`, `-rss_limit_mb`, seeds) fixed across machines. Deterministic per-module builds, fuzzing, and Eva runs execute via Make ([`./scripts/pipeline_make.py`](./scripts/pipeline_make.py)) backed by per-run and cross-run caches ([`./docs/resources-and-caching.md`](./docs/resources-and-caching.md)).
+   Before every job, [`./scripts/resources.py`](./scripts/resources.py) measures available cgroups, Slurm allocations, and Docker/Podman engine limits to lease CPUs and memory per container while keeping outcome-deciding limits (`-wp-memlimit`, `-rss_limit_mb`, seeds) fixed across machines. Deterministic per-module builds, fuzzing, and Eva runs execute via Make ([`./scripts/pipeline_make.py`](./scripts/pipeline_make.py)) backed by per-run and cross-run caches ([`./docs/guides/resources-and-caching.md`](./docs/guides/resources-and-caching.md)).
 8. **Evidence Discipline & Mechanical Validation:**
-   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`./docs/v2-design.md`](./docs/v2-design.md)).
+   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`./docs/guides/v2-design.md`](./docs/guides/v2-design.md)).
 
 > [!IMPORTANT]
-> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`./scripts/sandbox_exec.py`](./scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container; see [`./docs/v2-design.md` (Section 3)](./docs/v2-design.md) for the residual-risk model.
+> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`./scripts/sandbox_exec.py`](./scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container; see [`./docs/guides/v2-design.md` (Section 3)](./docs/guides/v2-design.md) for the residual-risk model.
 
 ---
 
@@ -56,7 +56,7 @@ flowchart LR
 
 - **Container Engine:** Docker or Podman (`FRAMAC_CONTAINER_ENGINE=auto|docker|podman`).
   - Allocate at least **4 GiB of RAM** to the container engine VM (**8 GiB+ recommended** for parallel WP and fuzzing). Tools refuse to run below their single-worker memory floor (`1768 MiB` for WP, `3072 MiB` for LibFuzzer) rather than producing starved or flaky results.
-- **Platform:** **x86_64 Linux containers only.** The host must be x86_64, and the target's build must produce x86_64 code. A host of another architecture, or a build with `-m32`, `-mx32` or a cross compiler, stops Phase 0 with `unsupported_architecture` and instructions (see [Troubleshooting](./docs/troubleshooting.md#1-phase-0-build-capture-frama-c-model--gates)). Other architectures are not supported yet.
+- **Platform:** **x86_64 Linux containers only.** The host must be x86_64, and the target's build must produce x86_64 code. A host of another architecture, or a build with `-m32`, `-mx32` or a cross compiler, stops Phase 0 with `unsupported_architecture` and instructions (see [Troubleshooting](./docs/troubleshooting/phase0-build-and-model.md)). Other architectures are not supported yet.
 - **Host Python:** Python **3.10+** (stdlib only; used on the host by the resource broker and test suite).
 - **Target C Project:** a C99/C11 source tree that builds. Phase 0 runs the target's own build (make, CMake, Meson, Ninja, autotools) under `bear` in the build image, from a recipe you give or confirm: the build command, its Debian packages, and optionally the test command. A target that does not build stops Phase 0 with `needs_build_recipe` and a diagnostic (first error, missing headers, candidate packages) until the recipe is fixed.
 - **Threat model (recommended):** a structured `framac-threat-model` block in the target's `THREAT_MODEL.md` (input sources, trusted callers, secrets, auth gates, output sinks; [`./schemas/threat_model.schema.json`](./schemas/threat_model.schema.json)). Without it, trust follows the default rules and only Layer 3 properties are generated.
@@ -120,7 +120,7 @@ Use [`./wrappers/framac-docker.ps1`](./wrappers/framac-docker.ps1) on Windows or
 Pass the printed run directory as `-RunDir "<run-dir>"` (`--run-dir "<run-dir>"`) on subsequent commands for that run.
 - `sandbox_exec.py probe` verifies the inner sandbox (`{"sandbox": "rlimits"}`).
 - `run_eacsl_fuzz.py selftest` compiles and runs the built-in E-ACSL canary ([`./templates/eacsl_canary/canary.c`](./templates/eacsl_canary/canary.c)) to verify that benign inputs pass cleanly while buffer overflows and uninitialized reads are caught at runtime.
-- Optional resource caps and cache settings are controlled via host environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_CACHE`, `FRAMAC_BROKER=off`; see [`./docs/resources-and-caching.md`](./docs/resources-and-caching.md)).
+- Optional resource caps and cache settings are controlled via host environment variables (`FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY`, `FRAMAC_MAX_AGENTS`, `FRAMAC_CACHE`, `FRAMAC_BROKER=off`; see [`./docs/guides/resources-and-caching.md`](./docs/guides/resources-and-caching.md)).
 
 ### 3. Run the Agent Skills
 
@@ -221,9 +221,13 @@ frama-c/
 │   └── codeql/                       # CodeQL trust query
 ├── benchmark/                        # Benchmark manifest, harness assets, fixed brief sample & stored baseline
 ├── tests/                            # Pytest unit and integration test suite
-└── docs/                             # Architecture, onboarding, security layers, caching, & reference manuals
+└── docs/                             # Documentation hub (README.md, AGENTS.md, and category folders)
+    ├── guides/                       # Living architecture, onboarding, security layers, swarm, caching & benchmark guides
+    ├── troubleshooting/              # Thematic troubleshooting guides, master README & agent update guide
+    ├── plans/                        # Active engineering plans, backlog, formal-discovery tiers & historical archive/
+    ├── runs/                         # Chronological target run logs, postmortems & findings assessments
     ├── bugs-found/                   # Public vulnerability advisories & verification reports per target
-    ├── upstream/                     # Upstream Frama-C 33/34 e-acsl-gcc bug reports & workarounds
+    ├── upstream/                     # Upstream bug drafts & source references (frama-c/, qcbor/, sources/)
     └── references/                   # Frama-C RTE, Eva, WP, ACSL, and E-ACSL reference manuals (33.0 editions; re-extract from the 35.0 PDFs when published)
 ```
 
@@ -240,7 +244,7 @@ See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master 
 | **CryptoLib** | [`nasa/CryptoLib`](https://github.com/nasa/CryptoLib) | **1** (1 Medium; +1 C11 hygiene note) | [`./docs/bugs-found/cryptolib/README.md`](./docs/bugs-found/cryptolib/README.md) |
 | **libmnl** | [`netfilter/libmnl`](https://git.netfilter.org/libmnl) | **5** (1 Medium, 4 Low) | [`./docs/bugs-found/libmnl/README.md`](./docs/bugs-found/libmnl/README.md) |
 | **picohttpparser** | [`h2o/picohttpparser`](https://github.com/h2o/picohttpparser) | **0** (11 units proven) | [`./docs/bugs-found/picohttpparser/README.md`](./docs/bugs-found/picohttpparser/README.md) |
-| **Frama-C 33.0 – 35.0~~dev (E-ACSL, `e-acsl-gcc`, Variadic)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **9** to file (8 Bugs, 1 Limitation; 4 more not filed) | [`./docs/upstream/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c-e-acsl-issues.md) |
+| **Frama-C 33.0 – 35.0~~dev (E-ACSL, `e-acsl-gcc`, Variadic)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **9** to file (8 Bugs, 1 Limitation; 4 more not filed) | [`./docs/upstream/frama-c/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c/frama-c-e-acsl-issues.md) |
 
 ---
 
@@ -274,19 +278,21 @@ Add `-n auto` to run the tests in parallel (pytest-xdist); see [`tests/README.md
 
 ## Documentation Index
 
-- [Bugs Found & Target Verification Reports (`./docs/bugs-found/README.md`)](./docs/bugs-found/README.md)
-- [Architecture & Dataflow (`./docs/architecture.md`)](./docs/architecture.md)
-- [Slicing & Onboarding 90k+ LoC Codebases (`./docs/slicing-and-onboarding.md`)](./docs/slicing-and-onboarding.md)
-- [Phase 0 Redesign & Implementation Plan (`./docs/phase0-redesign.md`, `./docs/phase0-implementation-plan.md`)](./docs/phase0-implementation-plan.md)
-- [Phase 0 Redesign: Effects on the Other Phases (`./docs/phase0-downstream-effects.md`)](./docs/phase0-downstream-effects.md)
-- [Plans & Reviews: Remediation Plan, Phase 0 Remediation, Phase 1 Review & Remediation (`./docs/remediation-plan.md`, `./docs/phase0-remediation-plan.md`, `./docs/phase1-review.md`, `./docs/phase1-remediation-plan.md`)](./docs/remediation-plan.md)
-- [Proving Security Properties Beyond Memory Safety (`./docs/security-properties.md`)](./docs/security-properties.md)
-- [Multi-Agent Swarm & Dual-Oracle Guardrail (`./docs/agentic-swarm.md`)](./docs/agentic-swarm.md)
-- [Resources, Scheduling & Caching (`./docs/resources-and-caching.md`)](./docs/resources-and-caching.md)
-- [Pipeline v2 Design & Evidence Discipline (`./docs/v2-design.md`)](./docs/v2-design.md)
-- [Implementation Backlog & Verification Checklist (`./docs/backlog.md`)](./docs/backlog.md)
-- [Benchmark: Measuring Changes to Filters, Eva Configuration & Briefs (`./docs/benchmark.md`)](./docs/benchmark.md)
-- [Troubleshooting Guide (`./docs/troubleshooting.md`)](./docs/troubleshooting.md)
-- [Upstream Frama-C 33.0 – 35.0~~dev E-ACSL & Variadic Issues (`./docs/upstream/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c-e-acsl-issues.md)
-- [Frama-C Reference Manuals (`./docs/references/README.md`)](./docs/references/README.md) & [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md)
-- [Third-Party Header Stubs Guide (`./templates/fc_stubs/README.md`)](./templates/fc_stubs/README.md)
+Start at [`./docs/README.md`](./docs/README.md) for the full documentation map and [`./docs/AGENTS.md`](./docs/AGENTS.md) for maintenance rules:
+
+- **Core Living Guides ([`./docs/guides/README.md`](./docs/guides/README.md)):**
+  - [Architecture & Dataflow (`./docs/guides/architecture.md`)](./docs/guides/architecture.md)
+  - [Pipeline v2 Design & Evidence Discipline (`./docs/guides/v2-design.md`)](./docs/guides/v2-design.md)
+  - [Slicing & Onboarding 90k+ LoC Codebases (`./docs/guides/slicing-and-onboarding.md`)](./docs/guides/slicing-and-onboarding.md)
+  - [Proving Security Properties Beyond Memory Safety (`./docs/guides/security-properties.md`)](./docs/guides/security-properties.md)
+  - [Multi-Agent Swarm & Dual-Oracle Guardrail (`./docs/guides/agentic-swarm.md`)](./docs/guides/agentic-swarm.md)
+  - [Resources, Scheduling & Caching (`./docs/guides/resources-and-caching.md`)](./docs/guides/resources-and-caching.md)
+  - [Eva Sharding (`./docs/guides/eva-sharding.md`)](./docs/guides/eva-sharding.md)
+  - [Benchmark: Measuring Changes to Filters, Eva Configuration & Briefs (`./docs/guides/benchmark.md`)](./docs/guides/benchmark.md)
+- **Troubleshooting ([`./docs/troubleshooting/README.md`](./docs/troubleshooting/README.md)):** thematic operational runbooks and [`./docs/troubleshooting/AGENTS.md`](./docs/troubleshooting/AGENTS.md)
+- **Bugs Found & Target Verification Reports ([`./docs/bugs-found/README.md`](./docs/bugs-found/README.md))**
+- **Upstream Reports & Reference Sources ([`./docs/upstream/README.md`](./docs/upstream/README.md)):** [Frama-C E-ACSL & Variadic Issues (`./docs/upstream/frama-c/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c/frama-c-e-acsl-issues.md), [QCBOR Run-5 Reports (`./docs/upstream/qcbor/README.md`)](./docs/upstream/qcbor/README.md), and [Vendored Upstream Sources (`./docs/upstream/sources/README.md`)](./docs/upstream/sources/README.md)
+- **Engineering Plans & Backlog ([`./docs/plans/README.md`](./docs/plans/README.md)):** [Implementation Backlog (`./docs/plans/backlog.md`)](./docs/plans/backlog.md), active roadmaps, formal-discovery tiers, and archived Phase 0 plans
+- **Run Logs & Postmortems ([`./docs/runs/README.md`](./docs/runs/README.md))**
+- **Frama-C Reference Manuals ([`./docs/references/README.md`](./docs/references/README.md)):** [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md) & [`INDEX.md`](./docs/references/INDEX.md)
+- **Third-Party Header Stubs Guide ([`./templates/fc_stubs/README.md`](./templates/fc_stubs/README.md))**

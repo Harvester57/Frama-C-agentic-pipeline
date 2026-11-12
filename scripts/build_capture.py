@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build capture (Phase 0, docs/phase0-implementation-plan.md step I2): run the target's own build under
+Build capture (Phase 0, docs/plans/archive/phase0-implementation-plan.md step I2): run the target's own build under
 `bear intercept` in a scratch copy and record what it compiles, links, archives and exports. Stdlib only.
 
     build_capture.py run [--recipe-file run-metadata.json] [--command CMD] [--workdir DIR]

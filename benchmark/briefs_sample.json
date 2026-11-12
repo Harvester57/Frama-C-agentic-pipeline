@@ -1,5 +1,5 @@
 {
- "comment": "Fixed sample of the assert-program dataset. Content digests only: never add file names (docs/benchmark.md).",
+ "comment": "Fixed sample of the assert-program dataset. Content digests only: never add file names (docs/guides/benchmark.md).",
  "salt": "framac-benchmark-v1",
  "per_corpus": 10,
  "max_lines": 80,

@@ -4,7 +4,7 @@ Phase 0 gate stamp (stdlib only): workspace/reports/phase0_gates.json.
 
 The two Phase 0 gates write their results here, and the Make recipes that consume harnesses
 (build, fuzz, coverage, Eva, wp-queue) check it first, so no step can run on a harness that failed
-a gate (docs/phase0-implementation-plan.md, step I1):
+a gate (docs/plans/archive/phase0-implementation-plan.md, step I1):
 
   reach        harness_reach.py check: every DAG entry point of a module is reached by its harness,
                or exempted with a reason. Recorded with a digest of the module's harness files and

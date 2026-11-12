@@ -1,6 +1,6 @@
 """
 The Phase 0 recipes of templates/pipeline.mk run as written (defects 1 and 5 of
-docs/phase0-downstream-effects.md): `slice-init` (the overlay), `dag` (the call-graph DAG from the
+docs/plans/archive/phase0-downstream-effects.md): `slice-init` (the overlay), `dag` (the call-graph DAG from the
 Phase 0 model) and `security-props` (the MetAcsl properties), which `seed` depends on. Each recipe's
 command is taken from the template and run, so a flag a script no longer accepts fails here.
 """

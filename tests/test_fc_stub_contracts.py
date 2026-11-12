@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 FC_STUBS = Path(__file__).resolve().parent.parent / "templates" / "fc_stubs"
 
 # (header path relative to templates/fc_stubs, function name) of every prototype that has no contract
-# with an `assigns` clause. Step S4 of docs/templates-and-stubs-improvement-plan.md emptied it; keep it
+# with an `assigns` clause. Step S4 of docs/plans/templates-and-stubs-improvement-plan.md emptied it; keep it
 # empty: write the contract instead of adding an entry.
 MISSING_CONTRACT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
 

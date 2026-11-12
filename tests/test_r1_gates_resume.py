@@ -1,5 +1,5 @@
 """
-Step R1 of docs/phase0-remediation-plan.md (Make, gates and resume): the Phase 0 checkpoint is
+Step R1 of docs/plans/archive/phase0-remediation-plan.md (Make, gates and resume): the Phase 0 checkpoint is
 recorded by a passing build-check, a DAG rebuilt after the reach check fails the gate, both reach
 gates match exemptions alike, build-check names the reach gate's reason, the fuzz budget warns,
 the sweep list warns on a name-only callee match, and run_eva_slice.py refuses a gated module.

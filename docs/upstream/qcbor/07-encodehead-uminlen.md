@@ -2,8 +2,8 @@
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
 Patches:
-- `dev`: [`patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch`](patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch);
-- 1.x: [`patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch`](patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), which also applies to v1.6.1.
+- `dev`: [`patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch`](./patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch);
+- 1.x: [`patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch`](./patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), which also applies to v1.6.1.
 
 ## Summary
 
@@ -36,7 +36,7 @@ No caller inside QCBOR passes more than 8, and an application has no reason to.
 
 ## Reproducer
 
-[`repro/encodehead.c`](repro/encodehead.c):
+[`repro/encodehead.c`](./repro/encodehead.c):
 
 ```c
 UsefulBuf_MAKE_STACK_UB(Head, QCBOR_HEAD_BUFFER_SIZE);

@@ -121,7 +121,7 @@ def test_every_framac_variable_in_scripts_is_forwarded_or_known_not_to_be():
 
 
 def test_docs_list_every_forwarded_knob():
-    docs = _read("docs/resources-and-caching.md")
+    docs = _read("docs/guides/resources-and-caching.md")
     para = next(line for line in docs.splitlines() if line.startswith("Set every knob on the host"))
     for name in sh_knobs():
         assert f"`{name}`" in para, name

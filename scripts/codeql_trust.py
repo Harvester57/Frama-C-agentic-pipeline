@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CodeQL trust facts (docs/phase0-implementation-plan.md step I7), optional. Stdlib only.
+CodeQL trust facts (docs/plans/archive/phase0-implementation-plan.md step I7), optional. Stdlib only.
 
     codeql_trust.py run [--target /target] [--scratch DIR] [--recipe-file FILE]
                         [--out workspace/reports/codeql_trust.json] [--timeout 1800]

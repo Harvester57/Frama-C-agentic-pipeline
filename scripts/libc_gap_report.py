@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-libc gap report (docs/templates-and-stubs-improvement-plan.md step S7).
+libc gap report (docs/plans/templates-and-stubs-improvement-plan.md step S7).
 
 Lists the external functions that Phase 0 models call and that neither Frama-C's libc (`__fc_libc`, the
 headers Eva and WP parse with `-nostdinc`) nor the pipeline's own stubs (`templates/fc_stubs`) give a

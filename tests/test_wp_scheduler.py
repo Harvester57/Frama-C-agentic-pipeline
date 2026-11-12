@@ -1819,7 +1819,7 @@ def test_baseline_cli_subcommand(sim, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# Remediation plan P1 (docs/remediation-plan.md)
+# Remediation plan P1 (docs/plans/archive/remediation-plan.md)
 # ---------------------------------------------------------------------------
 
 

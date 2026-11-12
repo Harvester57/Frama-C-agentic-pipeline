@@ -1,4 +1,4 @@
-"""Remediation P2 (docs/remediation-plan.md): M2, Eva tuning is never lost; M3, one alarm kind per property."""
+"""Remediation P2 (docs/plans/archive/remediation-plan.md): M2, Eva tuning is never lost; M3, one alarm kind per property."""
 
 from __future__ import annotations
 

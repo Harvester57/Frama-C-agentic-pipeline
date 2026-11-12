@@ -1,4 +1,4 @@
-"""Regression tests for the P1 items of docs/remediation-plan.md owned outside the ledger and guardrail."""
+"""Regression tests for the P1 items of docs/plans/archive/remediation-plan.md owned outside the ledger and guardrail."""
 
 from __future__ import annotations
 

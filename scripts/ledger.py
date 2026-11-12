@@ -28,7 +28,7 @@ Subcommands (run with the run directory as working directory):
   audit-hypotheses         [--dag workspace/reports/callgraph_dag.json]
   summary | status
 
-Units are function x obligation class (docs/v2-design.md, Section 5). The security classes come
+Units are function x obligation class (docs/guides/v2-design.md, Section 5). The security classes come
 from scripts/security_props.py (step I9) when its report exists: l3_frame for every function writing
 through a pointer, and one class per MetAcsl property kind (l4_auth_state, l4_auth_required,
 l5_sanitized, l6_wiped, l6_no_leak) on the functions holding its generated annotations; each such unit
@@ -2213,7 +2213,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 stats["covered"] += 1
             elif cls in METACSL_CLASSES and all_proven and not counts and _meta_decided_statically(u, report):
                 # MetAcsl's -meta-simpl drops an instance it decides statically: no goal is left, the
-                # property still holds in this function (docs/troubleshooting.md, M1 of the templates plan).
+                # property still holds in this function (docs/troubleshooting/security-properties.md, M1).
                 names = ", ".join(sorted((u.get("bookkeeping") or {}).get("security_properties") or []))
                 add_evidence(
                     u,

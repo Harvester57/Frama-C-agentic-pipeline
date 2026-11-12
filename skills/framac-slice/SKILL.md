@@ -313,13 +313,13 @@ It reads `workspace/reports/phase0_model.json` and the threat model the model re
 - **L3:** an `l3_frame` unit for every function that writes through a pointer;
 - **L4:** auth gates become MetAcsl `\writing` and `\precond` properties (`l4_auth_state`, `l4_auth_required`); a gate with a `success` value also gets a `check` before each of its returns, written into the work tree: any other result leaves the state unchanged;
 - **L5:** output sinks become sanitization properties (`l5_sanitized`). A caller that hands a log or terminal sink string literals only is decided from the model's call sites instead (listed under the property's `decided`, no goal): the seed covers its unit, or blocks it when a literal holds CR or LF. A sink with a `format` parameter also gets `L5_sanitized_format_<sink>`, decided the same way: a caller passing a non-literal format is blocked (CWE-134). A sink Frama-C's libc declares without parameter names (`syslog`) is named by position: `"format": "param1"`;
-- **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`). A secret of kind `local` gets a `check` written into the work tree before each return in its scope; one of kind `return` gets no property (a warning, listed in `REPORT.md`). `--eva-taint` adds Eva taint checks for copies of a secret (`docs/security-properties.md`, Layer 6).
+- **L6:** secrets become "wiped before release" and "never reaches a sink" (`l6_wiped`, `l6_no_leak`). A secret of kind `local` gets a `check` written into the work tree before each return in its scope; one of kind `return` gets no property (a warning, listed in `REPORT.md`). `--eva-taint` adds Eva taint checks for copies of a secret (`docs/guides/security-properties.md`, Layer 6).
 
 Each property is rendered from `templates/metacsl/` and lists the functions where its generated annotations land; those are the ledger units. Nothing is attached to the code by hand. Without a threat model only `l3_frame` units are generated. It writes nothing and stops the run when:
 - the model recorded an invalid threat model: exit 2 with the errors. Fix it, then re-run the model;
 - the recorded threat model changed, went missing or appeared since the model was built: exit 1. Re-run the model as Step 1d says.
 
-Schema problems in its own output are recorded as a `schema:` warning in the file. `ledger.py seed` (Step 5) reads the file when it exists; the Makefile's `seed` target runs `security-props` first. See [security-properties.md](../../docs/security-properties.md).
+Schema problems in its own output are recorded as a `schema:` warning in the file. `ledger.py seed` (Step 5) reads the file when it exists; the Makefile's `seed` target runs `security-props` first. See [security-properties.md](../../docs/guides/security-properties.md).
 
 ---
 

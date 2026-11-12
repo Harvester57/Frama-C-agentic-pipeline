@@ -3,7 +3,7 @@
 Loop invariant seeds for Function Prover subagents (stdlib only).
 
 Eva does not hold the index-against-length relation at a widened loop head (measured, see
-docs/papers-generalization-plan.md, Tier 1), so the candidates come from the loop facts instead
+docs/plans/papers-generalization-plan.md, Tier 1), so the candidates come from the loop facts instead
 (function_facts.py) and two oracles filter them:
 
   1. Syntactic candidates over the function's own formals and locals: `0 <= i` for a signed

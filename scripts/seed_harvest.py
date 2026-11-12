@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Seed inputs from the target's own tests (docs/phase0-implementation-plan.md, step I6).
+Seed inputs from the target's own tests (docs/plans/archive/phase0-implementation-plan.md, step I6).
 
 The tests of a C library call its API with realistic, well-formed inputs, written inline as literals
 (minmea's sentences, QCBOR's encoded arrays). This script records those calls and turns them into

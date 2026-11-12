@@ -29,6 +29,10 @@ This codebase is yours: what it's for and how it's built are your call, and you'
 - New test modules must not redefine shared module-level constants (e.g. TREE). Check for name collisions first.
 - Known flaky tests: the concurrency/run-lock tests. Rerun once before investigating.
 
+## Documentation layout (`docs/`)
+
+Read [`./docs/AGENTS.md`](./docs/AGENTS.md) before adding, moving, or linking Markdown files under [`./docs/`](./docs/README.md). Keep `docs/` root free of loose files (`README.md`, `AGENTS.md`, and category subdirectories only), use explicit `./` or `../` relative links, and run `python -m pytest tests/test_docs_structure.py -n auto` after documentation changes.
+
 ## Recording pipeline bugs in `docs/troubleshooting/`
 
 Whenever you hit a bug, gap or workaround in the pipeline itself while running or developing it (a script, a generator, a gate, the wrapper, a skill or brief that is wrong or incomplete), write it into the thematic sub-documents under [`./docs/troubleshooting/`](./docs/troubleshooting/README.md) **in the same session**, so the maintainers can inspect and correct it later. Read [`./docs/troubleshooting/AGENTS.md`](./docs/troubleshooting/AGENTS.md) for how to update the folder. This applies to every agent: the parent, forks, subagents and anyone working a target run. Do not leave it only in chat or in a progress report.

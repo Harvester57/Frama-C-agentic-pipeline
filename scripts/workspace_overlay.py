@@ -1512,7 +1512,7 @@ def entry_trust_boundary_errors(
 ) -> list[str]:
     """
     Trust-boundary violations an agent adds to the untrusted_surface entry function's contract in
-    `rel` (docs/v2-design.md §6). Only the entry function is checked, and only when the agent
+    `rel` (docs/guides/v2-design.md §6). Only the entry function is checked, and only when the agent
     changed its contract; violations already in the target's own baseline ACSL are not the agent's.
     An entry that records its `file` (one the function's trust put on the boundary) is checked in
     that source and in headers, never in another source's same-named static.
@@ -1736,7 +1736,7 @@ def _merge_agent_overlay_locked(
     entry_metas = _untrusted_entry_metas(overlay, module, function, norm_c_file)
     if entry_metas:
         # On an untrusted_surface entry, `requires` may state memory shape only: a value constraint on
-        # attacker-controlled bytes or lengths would define the bug away (docs/v2-design.md §6).
+        # attacker-controlled bytes or lengths would define the bug away (docs/guides/v2-design.md §6).
         # A link unit has one entry per harness: every one of them is checked.
         tb_errs: list[str] = []
         for entry_meta in entry_metas:

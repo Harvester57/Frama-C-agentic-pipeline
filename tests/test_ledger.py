@@ -917,7 +917,7 @@ def test_ingest_eva_cross_module_invalid_alarm_and_reduced_checks(run_dir):
 
 
 # ---------------------------------------------------------------------------
-# Remediation plan P0 (docs/remediation-plan.md): no credit without the evidence it implies
+# Remediation plan P0 (docs/plans/archive/remediation-plan.md): no credit without the evidence it implies
 # ---------------------------------------------------------------------------
 
 
@@ -1084,7 +1084,7 @@ def test_ingest_eva_never_credits_unclassified_statuses(run_dir):
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
 
 
-# O1 (docs/open-topics-remediation-plan.md): `unresolved` is `uniqueItems`, and two goals of one
+# O1 (docs/plans/open-topics-remediation-plan.md): `unresolved` is `uniqueItems`, and two goals of one
 # function can render to the same text (two pointer accesses on one source line).
 _DUP_GOAL = {"obligation_class": "rte", "kind": "mem_access", "line": 12, "annotation": "\\valid(p)"}
 

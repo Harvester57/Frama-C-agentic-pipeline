@@ -85,7 +85,7 @@
     framac-build) with -BuildIfMissing.
 
 .PARAMETER CodeQL
-    Run the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py; docs/phase0-implementation-plan.md
+    Run the command in the CodeQL image (optional trust facts, scripts/codeql_trust.py; docs/plans/archive/phase0-implementation-plan.md
     step I7): framac-codeql:latest, the build image plus the pinned CodeQL CLI (Dockerfile.codeql). With -TargetPackages,
     the derived build image framac-build:<repo key> is built first, then framac-codeql:<repo key> from it, copying /opt/codeql
     out of framac-codeql:latest (no download: wrappers/codeql-derived.Dockerfile). The derived image is labelled with

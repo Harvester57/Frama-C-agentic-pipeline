@@ -1,7 +1,7 @@
 # A positive big number encoded with `QCBOR_ENCODE_AS_BORROWED` comes out negative
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
-Patch: [`patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch`](patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch).
+Patch: [`patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch`](./patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch).
 
 ## Summary
 
@@ -34,7 +34,7 @@ in the wrong order. Two things go wrong, with no error reported:
 
 ## Reproducer
 
-[`repro/bignum_borrowed.c`](repro/bignum_borrowed.c) prints the table above:
+[`repro/bignum_borrowed.c`](./repro/bignum_borrowed.c) prints the table above:
 
 ```c
 static const uint8_t a258[] = {0x01, 0x02};

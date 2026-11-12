@@ -1,5 +1,5 @@
 """
-Remediation step R5 (docs/phase0-remediation-plan.md): contracts and validation. Each Phase 0 artifact
+Remediation step R5 (docs/plans/archive/phase0-remediation-plan.md): contracts and validation. Each Phase 0 artifact
 has a schema that accepts what its producer writes (generated here by calling the producers on recorded
 inputs) and rejects a broken one; `validate_artifacts.py run-dir` checks them and fails on the schema
 problems producers record as warnings; the sidecar's `scope_files` survives a regeneration (plain and

@@ -104,7 +104,7 @@ class TestSampling:
         sample = load_sample()
         assert len(sample["programs"]) == 30
         text = DEFAULT_SAMPLE.read_text(encoding="utf-8")
-        assert not re.search(r"\.c\b(?!\w)", text.replace("docs/benchmark.md", ""))
+        assert not re.search(r"\.c\b(?!\w)", text.replace("docs/guides/benchmark.md", ""))
         assert "BL.EN" not in text
         for row in sample["programs"]:
             assert set(row) == {"id", "corpus", "sha256", "lines"}

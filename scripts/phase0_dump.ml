@@ -1,7 +1,7 @@
 (* Phase 0 model: inventory and call graph from the Frama-C kernel AST, written to $FRAMAC_P0_DUMP_OUT.
 
    Compiled and loaded by phase0_model.py (`ocamlfind ocamlopt -shared`, then `frama-c -load-module`),
-   like scripts/kernel_ast_dump.ml, but limited to what Phase 0 needs (docs/phase0-implementation-plan.md
+   like scripts/kernel_ast_dump.ml, but limited to what Phase 0 needs (docs/plans/archive/phase0-implementation-plan.md
    step I3):
    - every defined function: kernel name, source name, definition location and line span, storage,
      signature, loops and cyclomatic complexity;

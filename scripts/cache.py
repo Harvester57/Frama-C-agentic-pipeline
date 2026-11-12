@@ -663,7 +663,7 @@ def _image_or_tools_id(runner: Callable | None = None) -> str:
 
 
 # Stub headers (templates/fc_stubs) a preprocessor reads: a key with a dependency manifest has the ones it
-# read, each hashed, so the global digest leaves them out (K2 of docs/templates-and-stubs-improvement-plan.md).
+# read, each hashed, so the global digest leaves them out (K2 of docs/plans/templates-and-stubs-improvement-plan.md).
 _STUB_TEMPLATES = "templates/fc_stubs/"
 
 

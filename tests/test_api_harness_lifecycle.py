@@ -1,5 +1,5 @@
 """
-H2 of docs/templates-and-stubs-improvement-plan.md: synthesized call sequences on an opaque handle.
+H2 of docs/plans/templates-and-stubs-improvement-plan.md: synthesized call sequences on an opaque handle.
 A handle type with a constructor and a destructor that no recorded chain covers gets one lifecycle
 case: build the handle, call functions on it chosen by input bytes, release it.
 """

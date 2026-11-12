@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Repeatable benchmark of this pipeline: measures what a change to its filters, Eva configuration or
-briefs actually does, instead of assuming it. See docs/benchmark.md.
+briefs actually does, instead of assuming it. See docs/guides/benchmark.md.
 
 Host commands (stdlib only; tools run in the pipeline containers, so targets are fetched here):
   check-manifest                 validate benchmark/manifest.json
@@ -2193,7 +2193,9 @@ def cmd_migrate_units(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Repeatable benchmark of the Frama-C pipeline (docs/benchmark.md).")
+    parser = argparse.ArgumentParser(
+        description="Repeatable benchmark of the Frama-C pipeline (docs/guides/benchmark.md)."
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     # The phase0 set has its own runner and options (scripts/benchmark_seeded.py run --help).
     sub.add_parser("seeded", help="The phase0 set: seeded-bug projects (benchmark_seeded.py run; see its --help)")

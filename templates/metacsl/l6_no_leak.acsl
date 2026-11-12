@@ -4,7 +4,7 @@
  *            (in every function for a global secret, in the owning function for a parameter);
  *   reading  a sink defined in the target, and everything it calls, never reads the secret.
  * A copy of the secret into another buffer that then reaches a sink is an indirect flow these
- * checks do not see (Eva's taint domain does; see docs/security-properties.md).
+ * checks do not see (Eva's taint domain does; see docs/guides/security-properties.md).
  */
 //# calling
 /*@ meta \prop, \name(${name}), \targets(${targets}), \context(\calling),

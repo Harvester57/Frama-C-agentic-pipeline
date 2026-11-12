@@ -13,7 +13,7 @@ Subcommands (run from the run directory):
   params set --module M [...]  record per-module tuning in workspace/build/params.json
   params show [--module M]     effective tuning of every module
   run <targets...>             make -f workspace/build/Makefile -j<this container's CPUs> -k --output-sync=target
-                               (`eva-tune` is the Eva ladder: docs/resources-and-caching.md, Section 6)
+                               (`eva-tune` is the Eva ladder: docs/guides/resources-and-caching.md, Section 6)
   ingest [--module M]          ingest new fuzz then Eva reports, stubbing missing ones; validate
   build-check [--target D]     Phase 0's last gate: every fuzzed module builds with E-ACSL; once
                                every Phase 0 gate passed, records the Phase 0 checkpoint (state/)
@@ -2435,7 +2435,7 @@ _WRAP_UP_RE = re.compile(r"fatal error: aborted by Frama-C|linker command failed
 _NOT_AN_ERROR_RE = re.compile(r"\bwarning\b\s*:|DWARF error:", re.IGNORECASE)
 _SILENT_ABORT_RE = re.compile(r"aborted by Frama-C", re.IGNORECASE)
 
-# E-ACSL failures with no source-level fix (docs/troubleshooting.md, Section 1): build-check names the
+# E-ACSL failures with no source-level fix (docs/troubleshooting/harnesses-and-seeds.md): build-check names the
 # failure and the command that records the sanitizers choice, and never switches the engine itself.
 KNOWN_EACSL_FAILURES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (

@@ -1,4 +1,4 @@
-"""Regression tests for the P2 items of docs/remediation-plan.md owned by the ledger, overlay and scheduler."""
+"""Regression tests for the P2 items of docs/plans/archive/remediation-plan.md owned by the ledger, overlay and scheduler."""
 
 from __future__ import annotations
 

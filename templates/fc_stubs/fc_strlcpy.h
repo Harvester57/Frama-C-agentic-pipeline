@@ -9,7 +9,7 @@
  * would be conjoined with this one.
  *
  * No C bodies: Eva and WP use the contracts below, which the ledger records as assumed
- * (STATUS_ASSUMED). Two versions (docs/templates-and-stubs-improvement-plan.md, S4 and
+ * (STATUS_ASSUMED). Two versions (docs/plans/templates-and-stubs-improvement-plan.md, S4 and
  * decision 1):
  *
  *   Eva / WP (__fc_libc): strict. `dst` must be valid for all `size` bytes, as the BSD manual

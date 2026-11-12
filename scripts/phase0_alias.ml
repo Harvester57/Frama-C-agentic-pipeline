@@ -1,4 +1,4 @@
-(* Phase 0 model, Alias narrowing (docs/phase0-implementation-plan.md step I4): for every indirect call
+(* Phase 0 model, Alias narrowing (docs/plans/archive/phase0-implementation-plan.md step I4): for every indirect call
    site of the parse, the functions Frama-C's Alias plugin says the called pointer may point to, written
    to $FRAMAC_P0_ALIAS_OUT.
 

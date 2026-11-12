@@ -1,5 +1,5 @@
 """
-C1 of docs/templates-and-stubs-improvement-plan.md: the E-ACSL selftest canary exercises, on every
+C1 of docs/plans/templates-and-stubs-improvement-plan.md: the E-ACSL selftest canary exercises, on every
 input, the build steps it did not cover: the wrapper result-init pass (an `ensures` reading
 \\result), the <math.h> classification shim (`isnan`) and the errno stub and shim. Taking any one of
 them out of the build fails the selftest.

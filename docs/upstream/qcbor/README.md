@@ -2,7 +2,7 @@
 
 These are the reports, reproducers and patches for the QCBOR bugs confirmed while re-assessing
 QCBOR run-5. The assessment itself is in
-[`../../bugs/2026-11-09-qcbor-run5-assessment.md`](../../bugs/2026-11-09-qcbor-run5-assessment.md).
+[`../../runs/2026-11-09-qcbor-run5-assessment.md`](../../runs/2026-11-09-qcbor-run5-assessment.md).
 
 - **Upstream:** https://github.com/laurencelundblade/QCBOR (maintainer: Laurence Lundblade).
 - **Analyzed:** `dev` at `9bd08456d46ac5fbaa7822420fd3e25e0e9c486f`. The run's `src/` and `inc/` are
@@ -20,15 +20,15 @@ after the reporter has integrated it, or after 30 days.
 
 | # | Bug | Affected | Severity | Channel | Report | Patch |
 | :-- | :--- | :--- | :---: | :--- | :--- | :--- |
-| 08 | `GetArray()`/`GetMap()` return an uninitialized length for `[]` / `{}` | `dev` only (since 33cf49e, 2026-11-02) | High | **Private** | [08](08-getarray-empty-container-length.md) | [private/0002](patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch) |
-| 01 | Encoding an all-zero big number reads 1 byte past the buffer | `dev`, v2.0-alpha-6 | Medium | **Private** | [01](01-bignum-all-zero-overread.md) | [private/0001](patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch) |
-| 02 | Positive big number with `ENCODE_AS_BORROWED` encodes as negative | `dev`, v2.0-alpha-6 | Medium | Public issue | [02](02-bignum-positive-borrowed-sign.md) | [public/0001](patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch) |
-| 03 | Negative zero big number encodes as −1, −256 or −2^64 | `dev`, v2.0-alpha-6 | Low | Public issue | [03](03-bignum-negative-zero.md) | [public/0002](patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch) |
-| 04 | Out-of-range shifts in `IEEE754_SingleToHalf()` / `DoubleToSingle()` | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Public issue | [04](04-ieee754-out-of-range-shift.md) | [public/0003](patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch), [v1/0001](patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch) |
-| 05 | `UsefulOutBuf_Compare()` reads outside the buffer for wrapping offsets | `dev`, v2.0-alpha-6 | Low | Public issue | [05](05-usefuloutbuf-compare-offsets.md) | [public/0004](patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch) |
-| 06 | Epoch date/days getters write an indeterminate value on error | `dev`, v2.0-alpha-6 | Low | Public issue | [06](06-epoch-date-output-on-error.md) | [public/0005](patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch) |
-| 07 | `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before its buffer | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Public issue | [07](07-encodehead-uminlen.md) | [public/0006](patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), [v1/0002](patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch) |
-| 09 | Signed overflow negating `INT64_MIN` in `ProcessBigNumber()` | `dev`, v2.0-alpha-6 | Low | Public issue | [09](09-processbignumber-int64-min.md) | [public/0007](patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch) |
+| 08 | `GetArray()`/`GetMap()` return an uninitialized length for `[]` / `{}` | `dev` only (since 33cf49e, 2026-11-02) | High | **Private** | [08](./08-getarray-empty-container-length.md) | [private/0002](./patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch) |
+| 01 | Encoding an all-zero big number reads 1 byte past the buffer | `dev`, v2.0-alpha-6 | Medium | **Private** | [01](./01-bignum-all-zero-overread.md) | [private/0001](./patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch) |
+| 02 | Positive big number with `ENCODE_AS_BORROWED` encodes as negative | `dev`, v2.0-alpha-6 | Medium | Public issue | [02](./02-bignum-positive-borrowed-sign.md) | [public/0001](./patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch) |
+| 03 | Negative zero big number encodes as −1, −256 or −2^64 | `dev`, v2.0-alpha-6 | Low | Public issue | [03](./03-bignum-negative-zero.md) | [public/0002](./patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch) |
+| 04 | Out-of-range shifts in `IEEE754_SingleToHalf()` / `DoubleToSingle()` | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Public issue | [04](./04-ieee754-out-of-range-shift.md) | [public/0003](./patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch), [v1/0001](./patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch) |
+| 05 | `UsefulOutBuf_Compare()` reads outside the buffer for wrapping offsets | `dev`, v2.0-alpha-6 | Low | Public issue | [05](./05-usefuloutbuf-compare-offsets.md) | [public/0004](./patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch) |
+| 06 | Epoch date/days getters write an indeterminate value on error | `dev`, v2.0-alpha-6 | Low | Public issue | [06](./06-epoch-date-output-on-error.md) | [public/0005](./patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch) |
+| 07 | `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before its buffer | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Public issue | [07](./07-encodehead-uminlen.md) | [public/0006](./patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), [v1/0002](./patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch) |
+| 09 | Signed overflow negating `INT64_MIN` in `ProcessBigNumber()` | `dev`, v2.0-alpha-6 | Low | Public issue | [09](./09-processbignumber-int64-min.md) | [public/0007](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch) |
 
 **Why 08 and 01 are private.** Both are out-of-bounds reads that data can trigger.
 - **08** is triggered by a single byte of untrusted input (`80`) through the decoder, QCBOR's main
@@ -64,8 +64,8 @@ public upstream, do not push the following. They describe or reproduce bugs 01 a
 - `patches/private/`;
 - `repro/bignum_zero.c`, `repro/getarray_empty.c`, and `repro/run_all.sh`, which runs them;
 - `logs/dev-*.log` (all four `dev` logs run the private reproducers);
-- `../../bugs/2026-11-09-qcbor-run5-findings-review.md` (the run-5 dossier, which describes the
-  over-read) and `../../bugs/2026-11-09-qcbor-run5-assessment.md`.
+- `../../runs/2026-11-09-qcbor-run5-findings-review.md` (the run-5 dossier, which describes the
+  over-read) and `../../runs/2026-11-09-qcbor-run5-assessment.md`.
 
 Everything else in this folder can go public with the public issues.
 
@@ -125,12 +125,12 @@ The runs here used clang 19.1.7 on Linux x86_64, inside the `framac-analysis` co
 
 | Tree | Reproducers | Test suite |
 | :--- | :--- | :--- |
-| `dev` 9bd0845 | All 9 bugs reproduce ([log](logs/dev-9bd0845.log)) | 89/89 pass; recoverable UBSan reports `ieee754.c:466`, `:625` and `qcbor_number_decode.c:1964`, `:2008` |
-| `dev` + public + private | All clean ([log](logs/dev-patched.log)) | 89/89 pass in plain, ASan + recoverable UBSan, and MSan builds; no UBSan reports left from these bugs |
-| `dev` + public only | Public bugs clean, 01 and 08 still reproduce ([log](logs/dev-public.log)) | 89/89 pass |
-| `dev` + private only | 01 and 08 clean, public bugs still reproduce ([log](logs/dev-private.log)) | 89/89 pass |
-| 1.x `master` 1d06057 | 04 and 07 reproduce ([log](logs/v1-master.log)) | 76/76 pass; UBSan reports `ieee754.c:510` and `:666` |
-| 1.x + `patches/v1` | Clean ([log](logs/v1-master.log)) | 76/76 pass under ASan + recoverable UBSan |
+| `dev` 9bd0845 | All 9 bugs reproduce ([log](./logs/dev-9bd0845.log)) | 89/89 pass; recoverable UBSan reports `ieee754.c:466`, `:625` and `qcbor_number_decode.c:1964`, `:2008` |
+| `dev` + public + private | All clean ([log](./logs/dev-patched.log)) | 89/89 pass in plain, ASan + recoverable UBSan, and MSan builds; no UBSan reports left from these bugs |
+| `dev` + public only | Public bugs clean, 01 and 08 still reproduce ([log](./logs/dev-public.log)) | 89/89 pass |
+| `dev` + private only | 01 and 08 clean, public bugs still reproduce ([log](./logs/dev-private.log)) | 89/89 pass |
+| 1.x `master` 1d06057 | 04 and 07 reproduce ([log](./logs/v1-master.log)) | 76/76 pass; UBSan reports `ieee754.c:510` and `:666` |
+| 1.x + `patches/v1` | Clean ([log](./logs/v1-master.log)) | 76/76 pass under ASan + recoverable UBSan |
 
 **UBSan reports left after the patches.** These are on every tree, not caused by these bugs, and
 not reported: `memcpy`/`memcmp` passed a NULL pointer with length 0, at `UsefulBuf.h:2195`
@@ -144,10 +144,10 @@ the first of these NULL-pointer reports, `UsefulBuf.h:2196`, instead of at `ieee
 
 - **`uOffset` in `QCBORDecode_Private_GetItemInMap()`** is uninitialized when an error is already
   latched, but it is never read on that path. See the note at the end of
-  [06](06-epoch-date-output-on-error.md).
+  [06](./06-epoch-date-output-on-error.md).
 - **The three harness-induced rejections** of run-5 are on `*_Private_*` helpers that no public
   API can drive into the reported state. The exception is `QCBOREncode_EncodeHead()`, which is
   public and is report 07.
 - **The 13 "toolchain artifact" rejections** come from an E-ACSL bug, not a QCBOR one. That bug
   is reported to Frama-C in
-  [`../frama-c-eacsl-formal-params-initialized.md`](../frama-c-eacsl-formal-params-initialized.md).
+  [`../frama-c/frama-c-eacsl-formal-params-initialized.md`](../frama-c/frama-c-eacsl-formal-params-initialized.md).

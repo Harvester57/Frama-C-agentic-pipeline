@@ -4,7 +4,7 @@
 # CodeQL CLI and C/C++ packs copied from framac-codeql:latest, which Dockerfile.codeql builds from the
 # pinned, digest-checked bundle. Nothing is downloaded here. The wrappers build it from stdin (no context)
 # with -CodeQL / --codeql and labels holding both base image ids; it is rebuilt when either changes.
-# Local only: never pushed or shared (docs/phase0-implementation-plan.md step I7).
+# Local only: never pushed or shared (docs/plans/archive/phase0-implementation-plan.md step I7).
 ARG BUILD_IMAGE=framac-build:latest
 ARG CODEQL_IMAGE=framac-codeql:latest
 FROM ${CODEQL_IMAGE} AS codeql

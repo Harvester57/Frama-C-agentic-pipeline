@@ -3,7 +3,7 @@
 **Report privately.** Send this to lgl@island-resort.com with "QCBOR SECURITY" in the subject, as
 QCBOR's `SECURITY.md` asks, or use GitHub private vulnerability reporting on the repository, which
 is enabled. Do not open a public issue or push this file before the fix is public.
-Patch: [`patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch`](patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch).
+Patch: [`patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch`](./patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch).
 
 ## Summary
 
@@ -27,7 +27,7 @@ encoded output. ASan reports a heap-buffer-overflow read when the big number is 
 
 ## Reproducer
 
-[`repro/bignum_zero.c`](repro/bignum_zero.c):
+[`repro/bignum_zero.c`](./repro/bignum_zero.c):
 
 ```c
 static const uint8_t aFour[] = {0x00, 0x00, 0x00, 0x00, 0xA5};
@@ -105,4 +105,4 @@ Validated with clang 19.1.7 on Linux x86_64:
 ## Related
 
 After this fix, a *negative* all-zero big number becomes a separate problem: `AddTBigNumber(-, 00)`
-encodes `-2^64`. See [03-bignum-negative-zero.md](03-bignum-negative-zero.md).
+encodes `-2^64`. See [03-bignum-negative-zero.md](./03-bignum-negative-zero.md).

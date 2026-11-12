@@ -1,5 +1,5 @@
 """
-The repaired shipped stubs (step S4 of docs/templates-and-stubs-improvement-plan.md): <bsd/string.h>
+The repaired shipped stubs (step S4 of docs/plans/templates-and-stubs-improvement-plan.md): <bsd/string.h>
 and fc_strlcpy.h, <json-c/json.h>, <netinet/ip_icmp.h> and getopt in fc_compat_types.h.
 
 Text tests pin what each repair must keep. The Docker-backed tests (FRAMAC_DOCKER_TESTS=1) check, per

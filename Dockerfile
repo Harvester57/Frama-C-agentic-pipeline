@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Two images from one file (docs/phase0-implementation-plan.md, decision "Images"); the optional third
+# Two images from one file (docs/plans/archive/phase0-implementation-plan.md, decision "Images"); the optional third
 # image has its own Dockerfile:
 #   docker build --target framac-analysis -t framac-analysis .     Frama-C, provers, instrumented builds
 #   docker build --target framac-build -t framac-build .           the target's build and tests

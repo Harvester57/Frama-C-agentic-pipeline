@@ -2,8 +2,8 @@
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
 Patches:
-- `dev`: [`patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch);
-- 1.x: [`patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch), which also applies to v1.6.1.
+- `dev`: [`patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](./patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch);
+- 1.x: [`patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](./patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch), which also applies to v1.6.1.
 
 ## Summary
 
@@ -34,7 +34,7 @@ range check, so common compilers produce the right output. But:
 
 ## Reproducer
 
-[`repro/float_shift.c`](repro/float_shift.c), for `dev`, has four modes:
+[`repro/float_shift.c`](./repro/float_shift.c), for `dev`, has four modes:
 
 ```c
 QCBOREncode_AddDouble(&E, 0.1);                           /* enc-double */
@@ -56,7 +56,7 @@ $ ./a.out dec-double
 src/ieee754.c:625:93: runtime error: shift exponent -93 is negative
 ```
 
-[`repro/float_shift_v1.c`](repro/float_shift_v1.c), for 1.x, calls `AddDouble(0.1)` and
+[`repro/float_shift_v1.c`](./repro/float_shift_v1.c), for 1.x, calls `AddDouble(0.1)` and
 `AddFloat(1.1f)`:
 
 ```text
@@ -117,8 +117,8 @@ non-subnormal paths, and they are what triggers the report under UBSan.
 ## Validation
 
 Validated with clang 19.1.7 on Linux x86_64. The results are in
-[`logs/dev-9bd0845.log`](logs/dev-9bd0845.log), [`logs/dev-patched.log`](logs/dev-patched.log)
-and [`logs/v1-master.log`](logs/v1-master.log).
+[`logs/dev-9bd0845.log`](./logs/dev-9bd0845.log), [`logs/dev-patched.log`](./logs/dev-patched.log)
+and [`logs/v1-master.log`](./logs/v1-master.log).
 
 | Tree | Reproducers under UBSan | Test suite under ASan + recoverable UBSan |
 | :--- | :--- | :--- |

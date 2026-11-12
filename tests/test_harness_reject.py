@@ -1,5 +1,5 @@
 """
-H3 of docs/templates-and-stubs-improvement-plan.md: an input that reaches no target code makes
+H3 of docs/plans/templates-and-stubs-improvement-plan.md: an input that reaches no target code makes
 LLVMFuzzerTestOneInput return -1, so libFuzzer keeps the corpus to inputs that reach the target.
 """
 

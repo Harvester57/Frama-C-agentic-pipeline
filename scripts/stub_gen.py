@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-The run's stub overlay, workspace/stubs/ (docs/templates-and-stubs-improvement-plan.md step S2). Stdlib only.
+The run's stub overlay, workspace/stubs/ (docs/plans/templates-and-stubs-improvement-plan.md step S2). Stdlib only.
 
     stub_gen.py run   [--model workspace/reports/phase0_model.json] [--capture workspace/reports/build_capture.json]
                       [--overlay workspace/stubs] [--out workspace/reports/stubs.json]
@@ -266,7 +266,7 @@ def draft_block(name: str, proto: str, formals: list[dict]) -> str:
 
 def header_preamble(name: str, real: str) -> str:
     return (
-        f"/* Stub overlay for <{name}> ({real}): scripts/stub_gen.py, docs/templates-and-stubs-improvement-plan.md S2.\n"
+        f"/* Stub overlay for <{name}> ({real}): scripts/stub_gen.py, docs/plans/templates-and-stubs-improvement-plan.md S2.\n"
         " *\n"
         " * Found first on the include path of Frama-C (Eva, WP) and of the E-ACSL frontend: it includes the\n"
         " * real header, then redeclares the external functions the target calls, each with its ACSL contract.\n"

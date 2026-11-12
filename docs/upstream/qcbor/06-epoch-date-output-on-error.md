@@ -1,7 +1,7 @@
 # `GetTEpochDate()` / `GetTEpochDays()` overwrite the caller's output with an indeterminate value on error
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
-Patch: [`patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch`](patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch).
+Patch: [`patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch`](./patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch).
 
 ## Summary
 
@@ -33,7 +33,7 @@ outputs, so a careful caller is not affected. But:
 
 ## Reproducer
 
-[`repro/epoch_uninit.c`](repro/epoch_uninit.c) has five modes. The caller's own value is `0x1234`:
+[`repro/epoch_uninit.c`](./repro/epoch_uninit.c) has five modes. The caller's own value is `0x1234`:
 
 ```c
 int64_t nOut = 0x1234;

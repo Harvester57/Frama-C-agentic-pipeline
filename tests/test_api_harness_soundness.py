@@ -1,5 +1,5 @@
 """
-The `--api` harness respects the API's contract (docs/bugs/2026-11-09-qcbor-run4-fuzz-campaign-and-api-harness.md,
+The `--api` harness respects the API's contract (docs/runs/2026-11-09-qcbor-run4-fuzz-campaign-and-api-harness.md,
 items A1-A5 and D1): no input byte in a pointer, contexts initialized first, no C string paired with an
 enum, seeds that never carry a recorded pointer, and the compiler's reason for each dropped case.
 """
@@ -491,7 +491,7 @@ def test_generate_writes_valid_layouts_with_inits_and_notes(tmp_path, monkeypatc
     assert bytes([sel]) + b"\0\0\0\0\xa0" in seeds
 
 
-# --- Eva Unknowns of libseccomp run-4 (docs/troubleshooting.md, Section 4): input copies and handles -----
+# --- Eva Unknowns of libseccomp run-4 (docs/troubleshooting/eva.md): input copies and handles ------------
 
 
 def test_the_harness_copies_input_through_the_macro_and_seeds_still_read_the_slots():

@@ -74,7 +74,7 @@ _STATUS_MAP = {
 }
 
 
-# A prover's wall-clock budget per profile (docs/v2-design.md Section 9): the brief states it and the
+# A prover's wall-clock budget per profile (docs/guides/v2-design.md Section 9): the brief states it and the
 # scheduler enforces it, so both read it here. FRAMAC_PROVER_WALL_BUDGET_S overrides it.
 PROVER_WALL_BUDGET_S = {"quick": 600, "standard": 900, "deep": 1800}
 
@@ -520,7 +520,7 @@ def framac_cpp_wrapper(path: Path | None = None) -> str | None:
     return text
 
 
-# The run's stub overlay (docs/templates-and-stubs-improvement-plan.md S2, scripts/stub_gen.py): contracts for
+# The run's stub overlay (docs/plans/templates-and-stubs-improvement-plan.md S2, scripts/stub_gen.py): contracts for
 # external functions only a host header declares, one header per included library header. It is searched
 # before templates/fc_stubs, so the pipeline's own templates are never edited for one target.
 STUB_OVERLAY_REL = "workspace/stubs"

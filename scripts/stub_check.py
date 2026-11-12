@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Checks of stub contracts (docs/templates-and-stubs-improvement-plan.md step S3). Stdlib only.
+Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md step S3). Stdlib only.
 
     stub_check.py run    [--report workspace/reports/stubs.json] [--model workspace/reports/phase0_model.json]
                          [--dag workspace/reports/callgraph_dag.json] [--out workspace/reports/stub_check.json]

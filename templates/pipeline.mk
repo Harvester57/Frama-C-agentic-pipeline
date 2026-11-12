@@ -66,7 +66,7 @@ dag:
 	$(RUN) --class light --key dag -- $(PY) $(S)/build_callgraph_dag.py --target workspace/work \
 		--out workspace/reports/callgraph_dag.json
 
-# The run's stub overlay (scripts/stub_gen.py, docs/slicing-and-onboarding.md Section 3): from the Phase 0
+# The run's stub overlay (scripts/stub_gen.py, docs/guides/slicing-and-onboarding.md Section 3): from the Phase 0
 # model, a skeleton block in workspace/stubs/<header> for every external function a host header declares
 # (inactive until a stub author fills it), and workspace/reports/stubs.json with each header's digest and
 # each function's state. Existing blocks are never rewritten. Then every active contract is recorded in
@@ -214,7 +214,7 @@ $(EVA_TARGETS): eva-%:
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
 		$(if $(EVA_SHARDS_$*),$(call eva_merge_cmd,$*),$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*)))
 
-# Eva sharding (eva_shards.py, docs/eva-sharding.md): a module whose last single run was too slow for
+# Eva sharding (eva_shards.py, docs/guides/eva-sharding.md): a module whose last single run was too slow for
 # the ladder (or with eva_shards in params.json) runs as EVA_SHARDS_<mod> shards, each keeping only some
 # dispatch cases (-DFRAMAC_EVA_SHARD_CASE_<k>, workspace/reports/eva-shards/<mod>/plan.json). Each shard is
 # the module's plain run otherwise, with its own resource-history key <mod>:shard<i>; until a shard has a

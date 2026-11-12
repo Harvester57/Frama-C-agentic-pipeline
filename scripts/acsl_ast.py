@@ -2251,7 +2251,7 @@ def entry_requires_violations(
     nul_terminated: bool = False,
 ) -> list[str]:
     """
-    Trust-boundary check of an untrusted_surface entry function's contract (docs/v2-design.md §6):
+    Trust-boundary check of an untrusted_surface entry function's contract (docs/guides/v2-design.md §6):
     its `requires` may state memory shape only (`\\valid`, `\\valid_read`, `\\separated`,
     `\\initialized`, `p != \\null`, `\\block_length`, shape-only vocabulary predicates) and facts
     that do not involve attacker-controlled parameters. A clause that constrains the value of an

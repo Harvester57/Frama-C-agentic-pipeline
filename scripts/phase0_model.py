@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 0 model (docs/phase0-implementation-plan.md step I3): the inventory and the call graph of the
+Phase 0 model (docs/plans/archive/phase0-implementation-plan.md step I3): the inventory and the call graph of the
 target, from one Frama-C parse per link unit of the build capture, named as Eva and WP will name them.
 Stdlib only.
 
@@ -42,7 +42,7 @@ snapshot (scripts/target_env.py), so it runs in a container started with the wra
      structured threat model (THREAT_MODEL.md, --threat-model); a missing one records `no_threat_model`.
      `trust.py run` redoes it after a CodeQL run.
 
-With `--alias` (plan step I4; off by default, see docs/phase0-redesign.md §7 "Alias narrowing"), each
+With `--alias` (plan step I4; off by default, see docs/plans/archive/phase0-redesign.md §7 "Alias narrowing"), each
 parse also loads scripts/phase0_alias.ml, which runs Frama-C's Alias plugin on the same AST and reports,
 per indirect call site, the functions the called pointer may point to. A site's type-match candidates
 are then intersected with them. A site keeps its full type match, with the reason recorded, when Alias
@@ -64,7 +64,7 @@ the checkpoint (`--state`, scripts/checkpoint.py) with each unit's first error, 
 them and restarts at the model; a model that parses clears it.
 
 Version 2 of the model (`schema_version`) records `external_calls`, `kernel_names`, `formals`, `writes`
-and `param_sizes` on its functions; (S2 of docs/templates-and-stubs-improvement-plan.md) each external's
+and `param_sizes` on its functions; (S2 of docs/plans/templates-and-stubs-improvement-plan.md) each external's
 first declaration and C text under `external_decls`, from which scripts/stub_gen.py writes the stub skeletons
 (a model without it gets no skeletons); and, from dump schema 4 on, the parsed functions' `call_sites`
 (each direct call with its string-literal arguments). Consumers ask `model_features(model)` which of these a
@@ -126,7 +126,7 @@ ALIAS_OUT_ENV = "FRAMAC_P0_ALIAS_OUT"
 ALIAS_TIMEOUT_ENV = "FRAMAC_P0_ALIAS_TIMEOUT"
 # Fixed, not sized from the machine: it decides which sites are narrowed.
 ALIAS_TIMEOUT_S = 300
-ALIAS_DEFAULT = False  # I4: measured, not adopted (docs/phase0-redesign.md §7)
+ALIAS_DEFAULT = False  # I4: measured, not adopted (docs/plans/archive/phase0-redesign.md §7)
 
 _LOC_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+)(?:-\d+)?(?::\d+(?:-\d+)?)?$")
 _LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?\d+\s+"(?P<file>[^"]*)"')

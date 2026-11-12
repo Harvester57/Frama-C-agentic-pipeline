@@ -3,7 +3,7 @@
 **Report privately.** Send this to lgl@island-resort.com with "QCBOR SECURITY" in the subject, as
 QCBOR's `SECURITY.md` asks, or use GitHub private vulnerability reporting on the repository, which
 is enabled. Do not open a public issue or push this file before the fix is public.
-Patch: [`patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch`](patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch).
+Patch: [`patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch`](./patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch).
 
 ## Summary
 
@@ -32,7 +32,7 @@ input buffer. A small garbage length gives a disclosure; a huge one gives a cras
 
 ## Reproducer
 
-[`repro/getarray_empty.c`](repro/getarray_empty.c). Its `Scribble()` fills the stack with `0x41` first, so a plain
+[`repro/getarray_empty.c`](./repro/getarray_empty.c). Its `Scribble()` fills the stack with `0x41` first, so a plain
 build shows a recognizable value:
 
 ```c

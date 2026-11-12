@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Security layers L3-L6 (docs/phase0-implementation-plan.md step I9): the obligations the threat model
+Security layers L3-L6 (docs/plans/archive/phase0-implementation-plan.md step I9): the obligations the threat model
 requires, as MetAcsl meta-properties, and the frame obligation of every function that writes through a
 pointer. Stdlib only.
 

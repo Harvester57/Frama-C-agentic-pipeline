@@ -5,7 +5,7 @@ Toolchain identity of the image this runs in, as JSON (stdlib only).
 The build image (`framac-build`) and the analysis image (`framac-analysis`) must agree on the
 Debian release, gcc and glibc: flags captured by the build mean the same thing to the analysis
 side's preprocessor, and binaries built against the build's libraries link and run on the
-analysis side (docs/phase0-implementation-plan.md, decision "Images").
+analysis side (docs/plans/archive/phase0-implementation-plan.md, decision "Images").
 
     image_toolchain.py                       print this image's identity
     image_toolchain.py compare A.json B.json  exit 1 unless the shared fields are equal

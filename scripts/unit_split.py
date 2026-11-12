@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Split link units too large for one Eva run into sub-modules (docs/phase0-implementation-plan.md step I8).
+Split link units too large for one Eva run into sub-modules (docs/plans/archive/phase0-implementation-plan.md step I8).
 Stdlib only.
 
     unit_split.py show [--dag workspace/reports/callgraph_dag.json] [--max-functions N] [--max-lines N]

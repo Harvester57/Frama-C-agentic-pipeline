@@ -1,5 +1,5 @@
 """
-Remediation step R4 (docs/phase0-remediation-plan.md): model, DAG and versions. `no_unit_parsed` in the
+Remediation step R4 (docs/plans/archive/phase0-remediation-plan.md): model, DAG and versions. `no_unit_parsed` in the
 checkpoint, GCC paths resolved against the compile's directory, the model's version 2 and
 `model_features`, the DAG's feature warnings and `schema_version`, and the report's fallback section.
 """

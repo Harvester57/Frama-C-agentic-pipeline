@@ -1,5 +1,5 @@
 """
-Security layers via MetAcsl (docs/phase0-implementation-plan.md step I9): property generation from the
+Security layers via MetAcsl (docs/plans/archive/phase0-implementation-plan.md step I9): property generation from the
 threat model (scripts/security_props.py), the meta file of a WP run and its goal names
 (run_wp_function.py), the ledger classes (ledger.py seed / ingest-wp) and the Phase 3 brief entries.
 
@@ -709,7 +709,7 @@ GOAL_NAMES = {"l6_no_leak_reading": "L6_no_leak_read_key"}
 # Variants whose satisfied program MetAcsl decides statically (-meta-simpl drops the instance): no
 # goal is left, and the ledger credits the unit from the report's loaded properties.
 STATIC_VARIANTS = {"l6_no_leak_calling_static"}
-# Open pipeline bugs (docs/troubleshooting.md): (variant, violate) -> reason.
+# Open pipeline bugs (docs/troubleshooting/security-properties.md): (variant, violate) -> reason.
 OPEN_DEFECTS: dict[tuple[str, bool], str] = {}
 
 

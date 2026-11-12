@@ -1,5 +1,5 @@
 """
-R3 (docs/phase0-remediation-plan.md): per-file trust of same-named functions (defect 9), one threat
+R3 (docs/plans/archive/phase0-remediation-plan.md): per-file trust of same-named functions (defect 9), one threat
 model shared by trust.py and security_props.py (the path and sha256 the model recorded), an invalid
 threat model stopping `security_props.py run`, the self-validation policy of both producers, and the
 model-feature helper (phase0_model.model_features) instead of their own field sniffing. Unit tests on

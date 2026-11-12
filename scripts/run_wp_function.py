@@ -145,7 +145,7 @@ _VC_DUMP_RE = re.compile(
 
 def goal_obligation_class(item: dict) -> str:
     """
-    Map a WP goal to a coverage-ledger obligation class (naming convention in docs/v2-design.md):
+    Map a WP goal to a coverage-ledger obligation class (naming convention in docs/guides/v2-design.md):
     MetAcsl-generated L4_auth_state_*, L4_auth_required_*, L5_sanitized_*, L6_wiped_*,
     L6_no_leak_* -> their property class; loop variant/decreases -> l2_termination;
     assigns/separated/frees/allocates -> l3_frame; everything else -> rte. A hand-named

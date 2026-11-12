@@ -1,7 +1,7 @@
 # A negative big number of value zero encodes as −1, −256 or −2^64
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
-Patch: [`patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch`](patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch). It applies on top of `patches/public/0001`.
+Patch: [`patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch`](./patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch). It applies on top of `patches/public/0001`.
 
 ## Summary
 
@@ -28,7 +28,7 @@ Their negative expectations are `NULLUsefulBufCConst`, so the negative side of z
 
 ## Reproducer
 
-[`repro/bignum_negzero.c`](repro/bignum_negzero.c):
+[`repro/bignum_negzero.c`](./repro/bignum_negzero.c):
 
 ```c
 static const uint8_t aZero[] = {0x00, 0x00};

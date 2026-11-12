@@ -507,7 +507,7 @@ def test_frama_c_and_eacsl_accept_a_non_constant_offsetof_without_losing_precisi
     assert proved and proved.group(1) == proved.group(2), log
 
 
-# The libmnl contract shape that the Frama-C 35 guardrail refused (docs/upstream/frama-c-eacsl-iff-labelled-term.md),
+# The libmnl contract shape that the Frama-C 35 guardrail refused (docs/upstream/frama-c/frama-c-eacsl-iff-labelled-term.md),
 # plus a body assertion over `\at` and a binder.
 IFF_LABELLED = r"""struct s { int n; };
 /*@ requires \valid(b);

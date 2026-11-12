@@ -791,7 +791,7 @@ class Ctx:
     def quick_entry_chain(self, planned: list[tuple[str, str]]) -> set[tuple[str, str]]:
         """
         Under `--profile quick`, WP restricts prove tasks to Tier 1A entry functions and their
-        transitive callees (docs/v2-design.md Section 9). If no Tier 1A function exists in the
+        transitive callees (docs/guides/v2-design.md Section 9). If no Tier 1A function exists in the
         run, all `planned` functions remain eligible so `quick` is never vacuous.
         """
         all_fns = set(self.units_by_fn) | set(self.dag_by_key)
@@ -899,7 +899,7 @@ QUICK_OFF_CHAIN_REASON = "quick_profile_wp_not_scheduled: outside the Tier 1A en
 
 def _park_quick_off_chain(ctx: Ctx, off_chain: list[tuple[str, str]], changes: dict) -> None:
     """
-    Close the planned units of functions `quick` never gives a prover (docs/v2-design.md Section 9),
+    Close the planned units of functions `quick` never gives a prover (docs/guides/v2-design.md Section 9),
     so the run can reach `done` instead of `stuck`: units with earlier evidence become `blocked`,
     the others `deferred`, both with the reason, as `ledger.py close-remaining` does.
     """

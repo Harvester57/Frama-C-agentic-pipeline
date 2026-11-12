@@ -1,5 +1,5 @@
 """
-Eva sharding (eva_shards.py, docs/eva-sharding.md): a module's dispatch cases split over k Eva runs, a
+Eva sharding (eva_shards.py, docs/guides/eva-sharding.md): a module's dispatch cases split over k Eva runs, a
 plan that never moves once recorded, and a merge that calls an obligation Valid only when no shard
 reaching it leaves it Unknown or Invalid.
 """

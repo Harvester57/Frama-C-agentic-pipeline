@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Risk tiers per function and per module (docs/phase0-implementation-plan.md step I8). Stdlib only.
+Risk tiers per function and per module (docs/plans/archive/phase0-implementation-plan.md step I8). Stdlib only.
 
     tiers.py summary [--dag workspace/reports/callgraph_dag.json]
 

@@ -1,7 +1,7 @@
 # Signed overflow negating `INT64_MIN` in `QCBORDecode_ProcessBigNumber()`
 
 Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
-Patch: [`patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch`](patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch).
+Patch: [`patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch`](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch).
 
 ## Summary
 
@@ -29,7 +29,7 @@ value is correct.
 
 ## Reproducer
 
-[`repro/int64min.c`](repro/int64min.c):
+[`repro/int64min.c`](./repro/int64min.c):
 
 ```c
 static const uint8_t in[] = {0xc4, 0x82, 0x00, 0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};

@@ -1,4 +1,4 @@
-"""Remediation plan P1 recall (docs/remediation-plan.md, H7 and H8) for scripts/ledger.py."""
+"""Remediation plan P1 recall (docs/plans/archive/remediation-plan.md, H7 and H8) for scripts/ledger.py."""
 
 import json
 

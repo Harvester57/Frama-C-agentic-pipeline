@@ -20,9 +20,9 @@ argument-hint: "<target-dir> [--module <name>] [--profile quick|standard|deep] [
 
 # /framac-verify
 
-Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: `docs/v2-design.md`.
+Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: `docs/guides/v2-design.md`.
 
-The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in `docs/references/` (see `docs/references/README.md`; mounted inside the container at `/opt/framac-pipeline/docs/references`). Consult them only when a skill, a brief, and `docs/troubleshooting.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. `wp_scheduler.py next --prepare` automatically populates `{references_dir}` in rendered briefs.
+The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in `docs/references/` (see `docs/references/README.md`; mounted inside the container at `/opt/framac-pipeline/docs/references`). Consult them only when a skill, a brief, and `docs/troubleshooting/README.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. `wp_scheduler.py next --prepare` automatically populates `{references_dir}` in rendered briefs.
 
 ## Operating modes
 
@@ -47,7 +47,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 
 - `<target-dir>` (required): Path to the target C repository.
 - `--module <name>`: Verify only a specific module slice (repeatable). Seed with `--scope` set to the module's `required_sources`, and run its per-module Make targets (`pipeline_make.py run build-<mod> fuzz-<mod> eva-<mod>`, or `module-<mod>`, which also ingests) instead of the all-module ones.
-- `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
+- `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/guides/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
 - `--scope <path>`: Restrict to repository-relative paths (repeatable). Everything else is seeded `out_of_scope`.
 - `--max-agents <N>`: Cap on concurrent LLM subagents: pass it as `wp_scheduler.py step --max-agents <N>`. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), capped at 16, or 32 on 32+ CPUs and 64 on 64+ CPUs; `FRAMAC_MAX_AGENTS` replaces that cap.
 - `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget per harness case (quick 60, standard 120, deep 900), capped per link unit (480 / 1200 / 7200), divided by the workers the machine allows.
@@ -59,7 +59,7 @@ The pipeline sizes itself; do not pass CPU, memory or agent counts to the wrappe
 - Every wrapper call leases CPUs and memory from the measured pool (cgroups, Slurm, the container engine, `FRAMAC_POOL_*` caps). Each tool runs as many provers or fuzz workers as its lease allows; `-wp-memlimit` and `-rss_limit_mb` stay fixed, so results do not depend on the machine.
 - Run wrapper commands in the **foreground** and wait for them to finish (or as background jobs only if your host harness explicitly supports non-detaching background commands). A waiting command prints its queue position.
 
-Details, knobs and troubleshooting: `docs/resources-and-caching.md`.
+Details, knobs and troubleshooting: `docs/guides/resources-and-caching.md`.
 
 ---
 
@@ -123,7 +123,7 @@ These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/S
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (the deterministic Eva ladder, for modules that still have Unknowns; `skills/framac-eva/SKILL.md`, Step 2a). Skip it under `--profile quick`, which allows no extra Eva runs.
 
-   Write the `build`, `ingest`, standalone `eva`, `eva-tune` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/resources-and-caching.md`, Section 5).
+   Write the `build`, `ingest`, standalone `eva`, `eva-tune` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/guides/resources-and-caching.md`, Section 5).
 4. Measure what each corpus reached, for the report's coverage gaps, and reopen the reach gate for API entry points no input executed: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage reach-dynamic`. A module that fails the dynamic reach gate stops at its next `fuzz-`/`eva-` target, and `wp-queue` refuses the whole run until every module passes. Repair its harness or exempt the entry point (`skills/framac-fuzz/SKILL.md`, Step 3), re-run the reach gate (`python3 /opt/framac-pipeline/scripts/pipeline_make.py run reach-gate`), then re-run the module (`run module-<mod>`, then `run coverage-<mod> reach-dynamic-<mod>`). A module whose coverage could not be measured is listed under `unmeasured` instead: `reach-dynamic` exits non-zero but does not reopen the gate (`skills/framac-fuzz/SKILL.md`, Step 3).
 5. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
@@ -170,7 +170,7 @@ Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipel
 
 ## Recording pipeline bugs
 
-When a run hits a bug, gap or workaround in the pipeline itself (a script, generator, gate, wrapper, skill or brief), add or update a `### Symptom:` entry in `docs/troubleshooting.md` in the same session, with the exact error, the target and run, the diagnosed cause, the workaround, and whether it is fixed (file and change) or an open pipeline bug. Do not leave it only in chat or in the progress report. Rules and format: `AGENTS.md`, "Recording pipeline bugs in `docs/troubleshooting.md`". Subagents put the entry in their result; the parent writes it before the run ends.
+When a run hits a bug, gap or workaround in the pipeline itself (a script, generator, gate, wrapper, skill or brief), add or update a `### Symptom:` entry in the relevant thematic guide under `docs/troubleshooting/` in the same session, with the exact error, the target and run, the diagnosed cause, the workaround, and whether it is fixed (file and change) or an open pipeline bug. Do not leave it only in chat or in the progress report. Rules and format: `docs/troubleshooting/AGENTS.md` and `AGENTS.md`, "Recording pipeline bugs in `docs/troubleshooting/`". Subagents put the entry in their result; the parent writes it before the run ends.
 
 ## Anti-patterns
 

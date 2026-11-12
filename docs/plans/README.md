@@ -1,0 +1,44 @@
+# Engineering Plans, Backlog & Design Archive
+
+- **Documentation Hub:** [`../README.md`](../README.md)
+- **Maintenance Rules:** [`../AGENTS.md`](../AGENTS.md)
+
+This directory separates **active engineering plans and open backlog items** from **completed historical redesign and remediation plans** (`./archive/`).
+
+---
+
+## 1. Open Backlog & Active Plans
+
+| Document | Scope | Status |
+| :--- | :--- | :--- |
+| [`./backlog.md`](./backlog.md) | Master checklist of open verification items, environment gaps (Podman, Slurm, SELinux, NUMA), formal-discovery/papers A/B measurements, and completed hardening follow-ups. | Living backlog |
+| [`./open-topics-remediation-plan.md`](./open-topics-remediation-plan.md) | Prioritized open items (`M1`-`M3`, `O1`-`O13`) from the nettle, libpng, libseccomp, and libmnl runs before/around merging `phase1-remediation`. | Active (`O1`, `O2` done; remaining steps open) |
+| [`./phase1-review.md`](./phase1-review.md) | Read-only coherency review of Phase 1 (`/framac-fuzz`), cataloging defects `F1`-`F17` and design questions `D1`-`D4`. | Active reference for Phase 1 remediation |
+| [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md) | Step-by-step execution plan (`S0`-`S13` and validation `V`) resolving the defects in [`./phase1-review.md`](./phase1-review.md). | Active (`phase1-remediation` branch) |
+| [`./templates-and-stubs-improvement-plan.md`](./templates-and-stubs-improvement-plan.md) | Hardening plan across `templates/` (dual harnesses, `fc_stubs/`, `workspace/stubs/` overlay, E-ACSL runtime/canary, MetAcsl templates, `pipeline.mk`). | Active (many `S*`/`M*`/`H*` steps landed; remaining items tracked) |
+| [`./regex-hardening-plan.md`](./regex-hardening-plan.md) | Follow-up workstreams (`A`-`E`) from the repository-wide regex audit: replacing fragile log/ACSL regexes with structured CSV/AST parsers and fail-closed matchers. | Active |
+| [`./papers-generalization-plan.md`](./papers-generalization-plan.md) | Assessment and ranked implementation tiers (Eva loop-head states, Heurix, verifier decision points, rejection evidence basis, Houdini loop seeds). | Active (code landed for Tiers 3-4, loop seeds, reopen; A/B measurements open) |
+| [`./formal-discovery-plan.md`](./formal-discovery-plan.md) | Assessment and 7-tier plan porting formal-discovery mechanisms onto the pipeline, with per-tier specs in `./formal-discovery/`. | Tiers 1-6 implemented (A/B benchmarks & Tier 7 open) |
+
+### Formal-Discovery Per-Tier Plans (`./formal-discovery/`)
+
+- [`./formal-discovery/tier-1-dead-end-ledger.md`](./formal-discovery/tier-1-dead-end-ledger.md) — Dead-end & obstruction ledger (`spec_kb.py`)
+- [`./formal-discovery/tier-2-negotiate-evidence.md`](./formal-discovery/tier-2-negotiate-evidence.md) — Caller goal & callee history seam evidence in negotiate briefs
+- [`./formal-discovery/tier-3-rule3-ghost-lemma.md`](./formal-discovery/tier-3-rule3-ghost-lemma.md) — Prover brief Rule 3 / ghost-lemma scope alignment
+- [`./formal-discovery/tier-4-trivial-stub-mutant.md`](./formal-discovery/tier-4-trivial-stub-mutant.md) — Trivial-stub mutant and corrected mutation rejection criterion
+- [`./formal-discovery/tier-5-trivial-aware-rank.md`](./formal-discovery/tier-5-trivial-aware-rank.md) — Trivial-annotation-aware prover candidate ranking
+- [`./formal-discovery/tier-6-proof-carry-forward.md`](./formal-discovery/tier-6-proof-carry-forward.md) — Cross-run WP proof carry-forward (`proof_carry.py`)
+
+---
+
+## 2. Completed Historical Plans (`./archive/`)
+
+These plans have been executed and merged. They remain as historical design records explaining why specific invariants, schemas, and architecture choices exist.
+
+| Archived Document | Scope | Completed |
+| :--- | :--- | :--- |
+| [`./archive/remediation-plan.md`](./archive/remediation-plan.md) | Workflow coherency audit across skills, briefs, Make recipes, ledger, and container mounts (`C1`-`C5`, `H1`-`H10`, `M1`-`M12`, `L1`-`L6`). | 2026-11-07 (all items Fixed) |
+| [`./archive/phase0-redesign.md`](./archive/phase0-redesign.md) | Design for build-derived link-unit inventory, Frama-C kernel AST call graph, trust propagation, and two-image snapshot architecture. | 2026-11-08 |
+| [`./archive/phase0-implementation-plan.md`](./archive/phase0-implementation-plan.md) | Implementation steps `I0`-`I10` delivering the Phase 0 redesign on `main`. | 2026-11-08 |
+| [`./archive/phase0-downstream-effects.md`](./archive/phase0-downstream-effects.md) | Audit of Phase 0 artifact contracts (`build_capture.json`, `phase0_model.json`, `callgraph_dag.json`, `security_props.json`) and downstream Phase 1-3 consumers. Sections 1-2 remain a detailed artifact-field reference. | 2026-11-08 |
+| [`./archive/phase0-remediation-plan.md`](./archive/phase0-remediation-plan.md) | Post-merge Phase 0 remediation steps `R1`-`R10` (gates, schemas, trust, sub-module gating, capture snapshot). | 2026-11-08 |

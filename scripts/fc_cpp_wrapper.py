@@ -473,7 +473,7 @@ def rewrite_syscall_text(text: str) -> tuple[str, list[dict]]:
 # ---------------------------------------------------------------------------------------------------
 #
 # E-ACSL in Frama-C 35 aborts on a `<==>` whose operands hold a labelled term (`\old`, `\at`, or a formal
-# in an `ensures`): "labels pre-analysis was not performed on construct \old(b)" (docs/upstream/
+# in an `ensures`): "labels pre-analysis was not performed on construct \old(b)" (docs/upstream/frama-c/
 # frama-c-eacsl-iff-labelled-term.md). Two implications are the same predicate and build on 34 and 35.
 # Only the E-ACSL frontend asks for this (fc_cpp_wrapper_eacsl.py): WP and Eva read the contract as written.
 #

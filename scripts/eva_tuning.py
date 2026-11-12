@@ -33,7 +33,7 @@ strongest status across runs in one session. A red status wins any conflict, as 
 
 The argument needs the runs to differ only in tuning, so every rung holds the sources, harness and
 checks fixed and input_digest and reduced_checks are compared. Dead is never counted as a proof: it is
-a harness gap (see docs/resources-and-caching.md).
+a harness gap (see docs/guides/resources-and-caching.md).
 
 A machine that completes fewer rungs discharges a subset of the same obligations and finds a subset of
 the same red statuses: both are unions over completed runs, so it can only leave more units `planned`.
