@@ -90,6 +90,19 @@
       },
       "required": ["selector", "kind", "calls", "handle", "methods", "max_calls", "slots", "rest"],
       "additionalProperties": false
+    },
+    "custom_case": {
+      "$comment": "A hand-written case (generate_harness.py --api --dispatch-case), after the generated ones: its statements are `dispatch_cases[selector]`. No calls and no slots: the seed writers make nothing for it.",
+      "type": "object",
+      "properties": {
+        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "kind": {"const": "custom"},
+        "calls": {"type": "array", "maxItems": 0},
+        "slots": {"type": "array", "maxItems": 0},
+        "rest": {"type": "null"}
+      },
+      "required": ["selector", "kind", "calls", "slots", "rest"],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -100,6 +113,7 @@
     "scope_files": {"$comment": "files whose functions a sub-module answers for at the reach gate (generate_harness.py --scope-file, kept on regeneration); empty means `sources`", "$ref": "#/definitions/strings"},
     "header": {"type": ["string", "null"]},
     "extra_includes": {"$ref": "#/definitions/strings"},
+    "extra_includes_first": {"$comment": "the `extra_includes` the prelude resolution moved before `header`, because the header needs what they define; absent when none was moved", "$ref": "#/definitions/strings"},
     "static_analysis_includes": {"$ref": "#/definitions/strings"},
     "compat_includes": {"$ref": "#/definitions/strings"},
     "cppflags": {"type": "string"},
@@ -114,6 +128,7 @@
     "eva_expr": {"type": ["string", "null"]},
     "fuzz_expr": {"type": ["string", "null"]},
     "dispatch_cases": {"$ref": "#/definitions/strings"},
+    "dispatch_case_count": {"type": "integer", "minimum": 0},
     "include_source": {"type": "boolean"},
     "stubbed_callees": {"$ref": "#/definitions/strings"},
     "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api"]},
@@ -131,7 +146,7 @@
     "api_harness": {"const": true},
     "api_cases": {
       "type": "array",
-      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}]}
+      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}, {"$ref": "#/definitions/custom_case"}]}
     },
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason", "type": "object", "additionalProperties": {"type": "string"}},
     "target_fuzzer": {

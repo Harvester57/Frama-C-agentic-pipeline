@@ -32,9 +32,11 @@ needs its own harness or exemptions. Its row fails only when its fuzzer source i
 
 Subcommands:
   check   [--module M]... [--out FILE]   gate every harnessed module (exit 1 on a gap)
-  exempt  --module M [--function F] --reason R
-          record an accepted gap: one entry point (in the module's sidecar), or a whole
-          module that needs no harness (in reach_exempt_modules.json)
+  exempt  --module M [--function F]... --reason R
+          record an accepted gap: entry points (in the module's sidecar), or a whole
+          module that needs no harness (in reach_exempt_modules.json). Once the gate has run, it
+          re-records the gate rows the exemption can change (`gate` in the output), so the module's
+          targets need no `reach-gate` in between.
   dynamic [--module M]...                 dynamic reach (step I6, after `coverage-<mod>`): an entry
           point of the gate that the module's corpus never executed (workspace/reports/coverage)
           reopens the gate for that module (exit 1). The rows go to harness_reach_dynamic.json with
@@ -55,6 +57,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -63,6 +68,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import phase0_gates  # noqa: E402
+from acsl_ast import AcslSyntaxError, tokenize_c_acsl  # noqa: E402
 from framac_common import (  # noqa: E402
     ArtifactError,
     atomic_write_json,
@@ -180,18 +186,147 @@ def dag_macro_aliases(dag: dict[str, Any]) -> dict[str, set[str]]:
     return out
 
 
+def _callees_from_clang_ast(tree: dict) -> set[str]:
+    """Extract referenced function names from Clang JSON AST."""
+    callees: set[str] = set()
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        kind = node.get("kind")
+        if kind == "DeclRefExpr":
+            ref = node.get("referencedDecl")
+            if isinstance(ref, dict) and ref.get("kind") == "FunctionDecl":
+                name = ref.get("name")
+                if isinstance(name, str) and name:
+                    callees.add(name)
+            elif isinstance(node.get("name"), str):
+                callees.add(node["name"])
+        elif kind == "CallExpr":
+            callee_decl = node.get("calleeDecl")
+            if isinstance(callee_decl, dict) and callee_decl.get("name"):
+                callees.add(callee_decl["name"])
+        inner = node.get("inner")
+        if isinstance(inner, list):
+            stack.extend(n for n in reversed(inner) if isinstance(n, dict))
+    return callees
+
+
+def _callees_from_clang(harness_path: Path, cppflags: str) -> set[str] | None:
+    clang = shutil.which("clang")
+    if not clang or not harness_path.is_file():
+        return None
+    from target_env import with_include_flags
+
+    argv = [
+        clang,
+        "-fsyntax-only",
+        "-w",
+        "-x",
+        "c",
+        *shlex.split(with_include_flags(cppflags)),
+        "-Xclang",
+        "-ast-dump=json",
+        str(harness_path),
+    ]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
+        tree = json.loads(proc.stdout or "")
+        return _callees_from_clang_ast(tree) if isinstance(tree, dict) else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
 def harness_roots(
     harness_text: str,
     fn_names: set[str],
     macros: dict[str, set[str]],
+    harness_path: Path | None = None,
+    cppflags: str = "-I.",
 ) -> set[str]:
     """DAG functions the harness names directly or through a header macro (inline wrappers are DAG functions)."""
     roots: set[str] = set()
-    for ident in set(_IDENT_RE.findall(_strip_c_comments(harness_text))):
+    ast_callees = _callees_from_clang(harness_path, cppflags) if harness_path else None
+    idents = ast_callees if ast_callees is not None else _used_identifiers(harness_text)
+    for ident in idents:
         if ident in fn_names:
             roots.add(ident)
         roots |= macros.get(ident, set())
     return roots
+
+
+# Words that can stand right before an expression: an identifier after one of them is a use, not a declared name.
+_EXPR_KEYWORDS = frozenset({"return", "else", "do", "case", "sizeof", "goto"})
+_TAG_KEYWORDS = frozenset({"struct", "union", "enum"})
+_PP_IF_RE = re.compile(r"^#\s*(if|ifdef|ifndef|elif|else|endif)\b\s*(.*)$", re.DOTALL)
+_PP_DEFINE_BODY_RE = re.compile(r"^#\s*define\s+[A-Za-z_]\w*(?:\([^)]*\))?(.*)$", re.DOTALL)
+
+
+def _used_identifiers(text: str) -> set[str]:
+    """
+    Identifiers the C text uses as a value or a call: not the ones it only declares, and not text that
+    is never compiled as code. Naming a function is not calling it, so these do not count:
+
+    - string and character literals, comments, and the body of `#if 0`;
+    - a member (`s.hash`, `p->hash`) and a tag (`struct stat`);
+    - a declared name: a prototype or a definition at file scope, and inside a body an identifier
+      that follows a type (`int hash = 0;`, `char *stat;`, `int f(int);`), with the later uses of
+      such a variable or parameter.
+
+    A function passed as a value (`register_cb(on_msg)`, `cb = on_msg;`) counts. Text the tokenizer
+    cannot read falls back to every identifier outside comments, as before.
+    """
+    try:
+        tokens = [t for t in tokenize_c_acsl(text) if t.kind not in ("whitespace", "c_comment")]
+    except AcslSyntaxError:
+        return set(_IDENT_RE.findall(_strip_c_comments(text)))
+    used: set[str] = set()
+    variables: set[str] = set()
+    depth = 0
+    dead: list[bool] = []  # one entry per open #if: whether its current branch is `#if 0`
+    for i, tok in enumerate(tokens):
+        if tok.kind == "pp_directive":
+            m = _PP_IF_RE.match(tok.text)
+            if m:
+                word, rest = m.group(1), _strip_c_comments(m.group(2)).strip()
+                if word in ("if", "ifdef", "ifndef"):
+                    dead.append(word == "if" and rest == "0")
+                elif word in ("elif", "else") and dead:
+                    dead[-1] = False
+                elif word == "endif" and dead:
+                    dead.pop()
+            elif not any(dead) and (body := _PP_DEFINE_BODY_RE.match(tok.text)):
+                used.update(_IDENT_RE.findall(_strip_c_comments(body.group(1))))
+            continue
+        if any(dead) or tok.kind != "c_token":
+            continue
+        if tok.text == "{":
+            depth += 1
+        elif tok.text == "}":
+            depth = max(0, depth - 1)
+        if not _IDENT_RE.fullmatch(tok.text):
+            continue
+        prev = tokens[i - 1] if i else None
+        prev_text = prev.text if prev is not None and prev.kind == "c_token" else ""
+        before = tokens[i - 2].text if i > 1 and tokens[i - 2].kind == "c_token" else ""
+        if prev_text == "." or (prev_text == ">" and before == "-") or prev_text in _TAG_KEYWORDS:
+            continue
+        after_type = bool(_IDENT_RE.fullmatch(prev_text)) and prev_text not in _EXPR_KEYWORDS
+        nxt = tokens[i + 1].text if i + 1 < len(tokens) else ""
+        if prev_text == "*" and _IDENT_RE.fullmatch(before) and before not in _EXPR_KEYWORDS:
+            after_type = nxt != "("  # `char *name;` declares; `n * f(x)` calls
+        if after_type and nxt != "(":
+            variables.add(tok.text)  # a variable or a parameter of that name hides the function
+        if tok.text in variables:
+            continue
+        if depth == 0:
+            # File scope: only an initializer uses a function (`static cb_t cb = on_msg;`).
+            if prev_text in ("=", "&"):
+                used.add(tok.text)
+        elif not after_type:
+            used.add(tok.text)
+    return used
 
 
 def callee_closure(roots: set[str], by_name: dict[str, list[tuple[str, dict[str, Any]]]], module: str) -> set[str]:
@@ -283,9 +418,12 @@ def check_module(
     macros = header_macro_functions(include_dirs, fn_names)
     for alias, keys in dag_macro_aliases(dag).items():
         macros[alias] = macros.get(alias, set()) | keys
-    roots = harness_roots(harness_text, fn_names, macros)
+    h_file = sidecar.get("harness_file")
+    harness_path = run_dir / h_file if h_file else None
+    cppflags = str(sidecar.get("cppflags") or "-I.")
+    roots = harness_roots(harness_text, fn_names, macros, harness_path=harness_path, cppflags=cppflags)
     if fuzzer_text is not None:
-        roots |= harness_roots(fuzzer_text, fn_names, macros)
+        roots |= harness_roots(fuzzer_text, fn_names, macros, harness_path=src, cppflags=cppflags)
         if not roots:
             return {**tf_row, "roots": [], "passed": False, "error": "target_fuzzer_reaches_nothing"}
     reached = callee_closure(roots, by_name, unit)
@@ -540,6 +678,42 @@ def record_exempt(
     return {"module": module, "function": function, "reason": reason, "reach_exempt": sidecar["reach_exempt"]}
 
 
+def regate_after_exempt(run_dir: Path, dag_path: Path, harness_dir: Path, module: str) -> dict[str, Any]:
+    """
+    Re-record the reach gate rows an exemption can change, as `check` would: the module's own row, its
+    unit's and its sub-modules' (the sidecar that took the exemption changed its digest), and every row
+    the gate holds as failed (a module-wide exemption can clear rows of other names). A dynamic gap is
+    kept only while it is not exempted (`apply_dynamic`). Without this, `coverage-<mod>` stopped at the
+    stale row and `reach-dynamic-<mod>`, which depends on it, never ran to replace it (ptf-original
+    run-2). Nothing is recorded before the gate's first run, and a check that cannot run leaves the rows
+    as they were: the exemption itself is already stored.
+    """
+    reach = phase0_gates.load_gates(run_dir).get("reach")
+    prior = reach.get("modules") if isinstance(reach, dict) else None
+    if not isinstance(prior, dict):
+        return {"rechecked": [], "note": "the reach gate has not run yet"}
+    try:
+        report = run_check(dag_path, harness_dir, None, run_dir=run_dir)
+        dag = load_json_strict(dag_path)
+        mm = ModuleMap(dag if isinstance(dag, dict) else {}, load_sidecars(harness_dir))
+        affected = {module, mm.unit_of(module), *mm.submodules(module)}
+    except (ArtifactError, OSError, ValueError, KeyError) as exc:
+        return {"rechecked": [], "note": f"gate not re-checked ({exc}): run `{phase0_gates.HOW_TO_RUN['reach']}`"}
+    affected |= {str(m) for m, r in prior.items() if not (isinstance(r, dict) and r.get("passed"))}
+    report["modules"] = [r for r in report["modules"] if r.get("module") in affected]
+    apply_dynamic(report, run_dir / DEFAULT_DYNAMIC_OUT, harness_dir, run_dir, dag=dag if isinstance(dag, dict) else {})
+    phase0_gates.record_reach(run_dir, report, partial=True, dag_path=dag_path)
+    failing = {
+        str(r["module"]): r.get("error") or f"entry points not reached: {', '.join(r.get('gaps') or [])}"
+        for r in report["modules"]
+        if not r.get("passed")
+    }
+    out: dict[str, Any] = {"rechecked": sorted(str(r["module"]) for r in report["modules"])}
+    if failing:
+        out["still_failing"] = dict(sorted(failing.items()))
+    return out
+
+
 DEFAULT_DYNAMIC_OUT = Path("workspace/reports/harness_reach_dynamic.json")
 COVERAGE_DIR = Path("workspace/reports/coverage")
 _COVERAGE_OK = ("ok", "partial")
@@ -680,7 +854,11 @@ def record_dynamic(
     from validate_artifacts import schema_warning
 
     measured = {
-        row["module"]: {**row, "harness_digest": phase0_gates.harness_digest(run_dir, row["module"])}
+        # Without `reach_exempt`: an exemption recorded later is not a repaired harness (`apply_dynamic`).
+        row["module"]: {
+            **row,
+            "harness_digest": phase0_gates.harness_digest(run_dir, row["module"], ignore_exempt=True),
+        }
         for row in report["modules"]
         if row.get("passed") is not None
     }
@@ -770,7 +948,14 @@ def apply_dynamic(
         d = rows.get(row.get("module"))
         if not isinstance(d, dict) or not d.get("gaps") or not row.get("passed"):
             continue
-        if d.get("harness_digest") != phase0_gates.harness_digest(run_dir, str(row["module"])):
+        # The row's digest leaves `reach_exempt` out, so an exemption clears only the gaps it names. A
+        # row written before that (digest of the whole sidecar) still matches while nothing changed.
+        name = str(row["module"])
+        current = (
+            phase0_gates.harness_digest(run_dir, name, ignore_exempt=True),
+            phase0_gates.harness_digest(run_dir, name),
+        )
+        if d.get("harness_digest") not in current:
             continue
         sidecar = load_json_optional(harness_dir / f"harness_{row['module']}.json", {})
         raw = sidecar.get("reach_exempt") if isinstance(sidecar, dict) else None
@@ -795,7 +980,10 @@ def main(argv: list[str] | None = None) -> int:
     p_ex.add_argument("--dag", type=Path, default=DEFAULT_DAG, help="To place a link unit's exemption")
     p_ex.add_argument("--module", required=True)
     p_ex.add_argument(
-        "--function", default=None, help="Entry point to exempt; omit to exempt a module without a harness"
+        "--function",
+        action="append",
+        default=[],
+        help="Entry point to exempt (repeatable, one reason for all); omit to exempt a module without a harness",
     )
     p_ex.add_argument("--reason", required=True)
     p_dyn = sub.add_parser("dynamic", help="Reopen the gate for entry points the corpus never executed")
@@ -817,12 +1005,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "exempt":
             if not args.reason.strip():
                 raise ValueError("--reason must not be empty")
-            print(
-                json.dumps(
-                    record_exempt(args.harness_dir, args.module, args.function, args.reason.strip(), args.dag),
-                    indent=2,
-                )
-            )
+            recorded: dict[str, Any] = {}
+            for fn in args.function or [None]:
+                recorded = record_exempt(args.harness_dir, args.module, fn, args.reason.strip(), args.dag)
+            if len(args.function) > 1:
+                recorded["function"] = list(args.function)
+            # The gate reads recorded rows, and the sidecar just changed: re-record them here, so no
+            # target stops at a stale row until someone runs `reach-gate`.
+            recorded["gate"] = regate_after_exempt(Path("."), args.dag, args.harness_dir, args.module)
+            print(json.dumps(recorded, indent=2))
             return 0
         report = run_check(args.dag, args.harness_dir, args.module)
         apply_dynamic(report, DEFAULT_DYNAMIC_OUT, args.harness_dir, Path("."))

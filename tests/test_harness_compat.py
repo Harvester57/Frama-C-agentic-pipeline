@@ -78,7 +78,8 @@ def test_call_expr_arity_validated_against_definition(tmp_path: Path) -> None:
     pub, _priv, mod, _compat = _mini_target(tmp_path)
     out_dir = tmp_path / "harnesses"
     # my_entry takes 3 parameters; a 1-argument call must be rejected early.
-    with pytest.raises(ValueError, match="argument"):
+    # The arity error itself, with both counts (the "takes no arguments" error of an argv harness is another one).
+    with pytest.raises(ValueError, match=r"passes 1 argument\(s\) to 'my_entry' .*takes 3\b"):
         generate_module_harness(
             module_name="mod",
             sources=[str(mod)],

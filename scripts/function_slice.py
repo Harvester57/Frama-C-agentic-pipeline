@@ -62,6 +62,7 @@ from acsl_ast import (  # noqa: E402
     _parse_acsl_inner_segments,
     extract_top_level_acsl_declarations,
     locate_function_span,
+    mask_comments_and_literals,
     tokenize_c_acsl,
 )
 from c_definitions import (  # noqa: E402
@@ -108,7 +109,6 @@ _AGENT_PREFIX_RE = re.compile(r"agents/[^/\s\"]+/scratch/work/")
 _TREE_TAIL_RE = re.compile(r"^(?:workspace/work|agents/[^/]+/scratch/work)/(.+)$")
 _REL_PREFIX_RE = re.compile(r"^(?:\./|/framac-run/)+")
 _ABSOLUTE_RE = re.compile(r"^(?:/|[A-Za-z]:/)")
-_SYNTAX_LINE_RE = re.compile(r":(\d+): unclosed (.*)$")
 _NAME_RE = re.compile(r"^[A-Za-z_]\w*$")
 _IDENT_FIND_RE = re.compile(r"[A-Za-z_]\w*")
 _ACSL_IDENT_RE = re.compile(r"(?<![\\\w])[A-Za-z_]\w*")
@@ -199,14 +199,13 @@ def _tokenize_tolerant(text: str) -> tuple[str, list[Token]]:
         try:
             return text, tokenize_c_acsl(text)
         except AcslSyntaxError as exc:
-            m = _SYNTAX_LINE_RE.search(str(exc))
-            if not m:
+            if exc.line is None or exc.kind is None:
                 break
-            if "block comment" in m.group(2):
+            if exc.kind in ("acsl_block_comment", "c_block_comment"):
                 text += "\n*/"
                 continue
             lines = text.split("\n")
-            idx = int(m.group(1)) - 1
+            idx = exc.line - 1
             if not 0 <= idx < len(lines) or not lines[idx]:
                 break
             lines[idx] = ""
@@ -903,9 +902,7 @@ def _publish_index(key: str, material: dict, items: list[_Item], run_dir: Path) 
 
 def _clean_directive(text: str) -> str:
     unfolded = re.sub(r"\\\r?\n", " ", text)
-    unfolded = re.sub(r"/\*.*?\*/", " ", unfolded, flags=re.DOTALL)
-    if '"' not in unfolded:
-        unfolded = re.sub(r"//.*", "", unfolded)
+    unfolded = mask_comments_and_literals(unfolded, acsl="blank", literals=False, on_error="mask")
     return unfolded.strip()
 
 
@@ -1771,7 +1768,7 @@ class _Slicer:
 
 
 def _strip_comments(text: str) -> str:
-    return re.sub(r"//[^\n]*", " ", re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL))
+    return mask_comments_and_literals(text, acsl="blank", literals=False, on_error="mask")
 
 
 # ---------------------------------------------------------------------------

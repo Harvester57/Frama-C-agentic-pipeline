@@ -68,6 +68,7 @@ known-first-party = [
     "minischema",
     "module_map",
     "mutation_check",
+    "patterns",
     "phase0_gates",
     "phase0_model",
     "pipeline_make",

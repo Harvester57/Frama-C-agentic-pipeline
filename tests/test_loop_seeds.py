@@ -894,3 +894,22 @@ def test_no_harm_that_cannot_run_withholds_nothing_and_says_so(tmp_path: Path) -
         src, "sum_int", _sum_int_record(), FakeWp([{}]), None, tmp_path / "c3", run_full=FakeFull([]), deadline=0.0
     )
     assert late["no_harm"]["status"] in ("skipped", "not_needed")
+
+
+@pytest.mark.unit
+def test_kernel_error_line_rejects_prefix_overlapping_filename() -> None:
+    result = {"syntax_check": {"errors": ["[kernel] not_sum.c:9: User Error: boom", "prefix_sum.c:10: error", "other-sum.c:12: error"]}}
+    assert ls._kernel_error_line(result, "sum.c") is None
+    result_match = {"syntax_check": {"errors": ["[kernel] sum.c:9: User Error: boom"]}}
+    assert ls._kernel_error_line(result_match, "sum.c") == 9
+    result_dir = {"syntax_check": {"errors": ["[kernel] dir/sum.c:9: error"]}}
+    assert ls._kernel_error_line(result_dir, "sum.c") == 9
+    result_rel = {"syntax_check": {"errors": ["[kernel] ./sum.c:9: error"]}}
+    assert ls._kernel_error_line(result_rel, "sum.c") == 9
+    result_abs = {"syntax_check": {"errors": ["[kernel] /abs/path/sum.c:9: User Error: boom"]}}
+    assert ls._kernel_error_line(result_abs, "sum.c") == 9
+    result_ws = {"syntax_check": {"errors": ["[kernel] workspace/work/sum.c:9: error"]}}
+    assert ls._kernel_error_line(result_ws, "sum.c") == 9
+    result_dir_overlap = {"syntax_check": {"errors": ["[kernel] dir/not_sum.c:9: error", "dir/prefix_sum.c:10: error"]}}
+    assert ls._kernel_error_line(result_dir_overlap, "sum.c") is None
+

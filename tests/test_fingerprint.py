@@ -60,3 +60,29 @@ def test_invalid_fingerprints_rejected():
     assert not is_valid_fingerprint("src/a.c#f::mem_access::012345678")
     assert not is_valid_fingerprint("src/a.c#f::mem_access::0123456789a")
     assert is_valid_fingerprint("harness_snmp.c#unknown_function::unparsed_crash::0123456789")
+
+
+# ---------------------------------------------------------------------------
+# D8: Predicate Label Stripping & Precompiled Alarm Kind Detection
+# ---------------------------------------------------------------------------
+
+
+def test_d8_predicate_label_stripping_preserves_identifiers():
+    from fingerprint import detect_alarm_kind
+
+    # Colon-delimited labels should be stripped
+    assert normalize_predicate("assert: x > 0") == "x>0"
+    assert normalize_predicate("check: y == 1") == "y==1"
+    assert normalize_predicate("admit: z != 0") == "z!=0"
+    assert normalize_predicate("assert rte/index_bound: i < 8") == "i<8"
+
+    # Expressions where assert/check/admit are used as variable/identifier without colon must NOT be stripped
+    assert normalize_predicate("check > 0") == "check>0"
+    assert normalize_predicate("admit == 1") == "admit==1"
+    assert normalize_predicate("assert != 0") == "assert!=0"
+
+    # Precompiled alarm kind detection
+    assert detect_alarm_kind("mem_access: \\valid_read(p)") == "mem_access"
+    assert detect_alarm_kind("signed_overflow: x + 1") == "signed_overflow"
+    assert detect_alarm_kind("unknown_alarm") == ""
+

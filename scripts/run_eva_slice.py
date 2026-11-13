@@ -53,21 +53,6 @@ from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
-_KERNEL_ERR_RE = re.compile(
-    r"^(?:\[kernel[^\]]*\]|[^:\n]+:\d+:).*?(?:user error|syntax error|fatal error|error:|unbound logic|invalid).*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
-    """Extract concise kernel/preprocessor error lines from a Frama-C log."""
-    matches = [m.group(0).strip() for m in _KERNEL_ERR_RE.finditer(log_text or "")]
-    if matches:
-        return matches[:max_lines]
-    tail = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
-    return tail[-max_lines:]
-
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
@@ -77,6 +62,7 @@ from eva_loops import LoopRef, parse_loop_ref, prepare_mirror, strip_mirror  # n
 from eva_options import extra_domains as option_domains  # noqa: E402
 from eva_options import framac_args, options_problem, parse_option  # noqa: E402
 from framac_common import (  # noqa: E402
+    _KERNEL_ERROR_HINT_RE,
     STATUS_ASSUMED,
     STATUS_DEAD,
     STATUS_INVALID,
@@ -88,16 +74,41 @@ from framac_common import (  # noqa: E402
     ArtifactError,
     augment_framac_cppflags,
     failure_reason,
+    fold_messages,
+    missing_spec_messages,
     normalize_flag_args,
+    parse_missing_spec,
     read_report_csv,
     scan_undeclared_functions,
     stub_repair_action,
 )
+from patterns import DOMAIN_RE  # noqa: E402
 from resources import CLASSES  # noqa: E402
+
+_KERNEL_ERR_RE = re.compile(
+    r"^(?:\[kernel[^\]]*\]|[^:\n]+:\d+:).*?(?:user error|syntax error|fatal error|error:|unbound logic|invalid).*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
+    """Extract concise kernel/preprocessor error lines from a Frama-C log."""
+    messages = fold_messages(log_text or "")
+    seen: set[str] = set()
+    matches: list[str] = []
+    for m in messages:
+        if (m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded)) or _KERNEL_ERR_RE.search(m.folded):
+            if m.folded not in seen:
+                seen.add(m.folded)
+                matches.append(m.folded)
+    if matches:
+        return matches[:max_lines]
+    tail = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
+    return tail[-max_lines:]
 
 BASE_DOMAINS = ("cvalue", "equality", "symbolic-locations", "octagon", "gauges")
 DEFAULT_AUTO_LOOP_UNROLL = 32
-_DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_DOMAIN_RE = DOMAIN_RE
 _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 _PTR_FUNC_DEF_RE = re.compile(
     r"\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{",
@@ -395,7 +406,7 @@ def eva_domains(extra_domains: list[str] | str | None = None, precision: int | N
         dom = raw.strip()
         if not dom:
             continue
-        if not _DOMAIN_RE.match(dom):
+        if not _DOMAIN_RE.fullmatch(dom):
             raise ValueError(f"invalid Eva domain name {dom!r}")
         if dom not in domains:
             domains.append(dom)
@@ -692,19 +703,28 @@ def extract_repair_hints(log_text: str) -> list[dict]:
     and called functions with neither code nor a specification.
     """
     hints: list[dict] = []
-    for m in _RE_MISSING_SPEC_RE.finditer(log_text or ""):
-        kind, fname = m.group(1), m.group(2).strip()
-        if kind == "specification":
+    specs = missing_spec_messages(log_text or "")
+    if not specs and "Neither code nor" in (log_text or ""):
+        specs = parse_missing_spec(log_text or "")
+    for spec in specs:
+        if spec.benign:
+            continue
+        fname = spec.function
+        if not fname:
+            continue
+        if "specification" in spec.missing:
             action = (
                 f"add the file defining {fname!r} to the module sources (locate it via "
                 f"build_callgraph_dag.py's function index), or, for an external function, {stub_repair_action(fname)}"
             )
+            spec_kind = "specification"
         else:
             action = (
                 f"add an ACSL assigns clause for {fname!r}, or enable the recursion fallback "
                 "(pipeline_make.py params set --module <mod> --eva-recursion-fallback)"
             )
-        hints.append({"pattern": "missing_spec", "function": fname, "spec_kind": kind, "action": action})
+            spec_kind = "assigns"
+        hints.append({"pattern": "missing_spec", "function": fname, "spec_kind": spec_kind, "action": action})
     if _RE_RECURSIVE_CALL_RE.search(log_text or ""):
         hints.append(
             {

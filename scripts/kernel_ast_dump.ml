@@ -731,6 +731,12 @@ let function_json kf =
     | TFun (_, _, v) -> v
     | _ -> false
   in
+  (* The kernel's own variables (`tmp`, `tmp_0`, `__retres`), by the name the printer gives them in
+     every expression above. A source variable called `tmp` is not in this list: the kernel renames
+     its temporaries around it. function_facts.py drops expressions that name one of these. *)
+  let temps =
+    List.filter_map (fun (v : varinfo) -> if v.vtemp then Some (S v.vname) else None) f.slocals
+  in
   O
     [ ("kernel_name", S vi.vname);
       ("name", S vi.vorig_name);
@@ -745,6 +751,7 @@ let function_json kf =
       ("reads", L (List.rev_map (fun (_, a) -> access_json a) ctx.reads));
       ("return_paths", L (List.rev ctx.paths));
       ("derived_pointers", L derived);
+      ("temps", L temps);
       ("truncated", B ctx.truncated);
       ("features",
        O

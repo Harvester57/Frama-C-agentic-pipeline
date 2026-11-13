@@ -54,6 +54,10 @@ handle, make up to LIFECYCLE_MAX_CALLS calls on it, each chosen by an input byte
 taking it, then release it, so use after free, double free and call after error stay reachable. Both
 kinds share the MAX_SEQUENCE_CASES cap, recorded chains first.
 
+Hand-written cases (`--api --dispatch-case '<stmts>'`, for a function the generator skipped) come last,
+in the same switch: their layout is `{kind: custom, calls: [], slots: [], rest: null}`, so the seed
+writers make nothing for them, and a later `--api` run without the flag keeps them.
+
 The layout of every case (which input bytes feed which argument) goes to the sidecar as `api_cases`,
 which seed_harvest.py write reads to turn recorded calls into seeds for each case. Functions the
 generator cannot call (static, variadic, an anonymous struct by value, a case the compiler refuses,
@@ -83,6 +87,7 @@ TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
 MAX_SEQUENCE_CASES = 16  # recorded chains first, then synthesized lifecycle cases (H2)
 LIFECYCLE_MAX_CALLS = 8  # calls on the handle per run of a lifecycle case, each picked by one input byte
 MAX_CASES = 255  # one selector byte
+CUSTOM_KIND = "custom"  # the layout kind of a hand-written case (`--api --dispatch-case`)
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
 MAX_DIAGNOSTIC_CHARS = 300
 POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
@@ -90,10 +95,13 @@ POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
 # (templates/harness_dual.c.template defines the macro for both entries).
 FUZZ_COPY = "FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off)"
 # Initializer names: QCBORDecode_Init, UsefulOutBuf_Init, ctx_init, foo_new, bar_create.
-_INIT_NAME_RE = re.compile(r"Init|(?:^|_)init(?:$|_)|_new$|_create$")
+_INIT_NAME_RE = re.compile(
+    r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)init(?:$|_)|_new$|_create$"
+)
 # Destructor names: seccomp_release, foo_free, bar_destroy, ctx_close, FooFree.
 _DTOR_NAME_RE = re.compile(
-    r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|Free|Destroy|Release"
+    r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|"
+    r"(?:^|(?<=[a-z0-9_]))(?:Free|Destroy|Release)(?=[A-Z0-9_]|$)"
 )
 
 # Byte size of the scalars a slot can hold (x86_64): a seed needs it to lay out the input.
@@ -118,6 +126,13 @@ SCALAR_BYTES = {
 
 class ApiHarnessError(ValueError):
     pass
+
+
+class _DeclError(Exception):
+    """A case would declare a variable twice, or under a name that is not an identifier: the case is skipped."""
+
+
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 
 
 def spare_bytes(max_input_size: int) -> int:
@@ -187,6 +202,20 @@ class _Case:
         self.rest: dict[str, Any] | None = None
         self.inits: list[dict[str, Any]] = []
         self.notes: list[str] = []
+        self.declared: set[str] = set()
+
+    def declare(self, name: str) -> str:
+        """
+        `name`, recorded as a variable this case declares. Every declaration the generator emits goes
+        through here: a name that is not a C identifier, or one the case already declared, would be a
+        compile error blamed on the target's headers, so the case is refused instead (`_DeclError`).
+        """
+        if not _IDENT_RE.fullmatch(name):
+            raise _DeclError(f"generator defect: variable name {name!r} is not a C identifier")
+        if name in self.declared:
+            raise _DeclError(f"generator defect: variable {name!r} would be declared twice in the case")
+        self.declared.add(name)
+        return name
 
     def slot(
         self, var: str, size: int | None, call: int, param: int, kind: str, addr: bool = True, **extra: Any
@@ -287,7 +316,9 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
         fx = f"{expr}.{f['name']}"
         off = base + int(f["off"])
         nxt = fields[i + 1] if i + 1 < len(fields) else None
-        tag = f"{expr.replace('.', '_')}f{i}"
+        # The storage of a pointer field, named after the field's path. The path of an object in an
+        # array is `c0a0[0]`: every character an identifier cannot hold becomes `_` (`c0a0_0_f2`).
+        tag = f"{re.sub(r'[^A-Za-z0-9_]', '_', expr)}f{i}"
         if f["kind"] == "ptr" and nxt is not None and _len_field(nxt):
             lx = f"{expr}.{nxt['name']}"
             if f.get("const") and case.rest is None:
@@ -295,7 +326,9 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
                 case.post.append(f"{fx} = (void *)(fuzz_buf + fuzz_off); {lx} = ({nxt['ctype']})(fuzz_len - fuzz_off);")
             else:
                 size = PAIR_BYTES if f.get("const") else case.spare
-                case.decls.append(f"{_storage(None)}unsigned char {tag}[{size}]; memset({tag}, 0, sizeof({tag}));")
+                case.decls.append(
+                    f"{_storage(None)}unsigned char {case.declare(tag)}[{size}]; memset({tag}, 0, sizeof({tag}));"
+                )
                 if f.get("const"):
                     case.slot(tag, size, call, param, "field_bytes", addr=False, off=off)
                 case.slot(lx, int(nxt["size"]), call, param, "field_len", off=off, max=size)
@@ -306,7 +339,7 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
             continue
         if f["kind"] == "ptr":
             case.decls.append(
-                f"static unsigned char {tag}[{case.spare}]; memset({tag}, 0, sizeof({tag})); {fx} = (void *){tag};"
+                f"static unsigned char {case.declare(tag)}[{case.spare}]; memset({tag}, 0, sizeof({tag})); {fx} = (void *){tag};"
             )
         elif f["kind"] == "int" and f.get("ctype") == "_Bool":
             case.bool_slot(fx, call, param, "field", off=off)
@@ -321,7 +354,7 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
 
 def _struct_value(case: _Case, call: int, param: int, v: str, ctype: str) -> None:
     """A struct (or union) by value: read from the input without pointers, else filled field by field."""
-    case.decls.append(f"{ctype} {v}; memset(&{v}, 0, sizeof({v}));")
+    case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
     lay = case.api.structs.get(ctype)
     if lay is None:
         case.note(call, param, f"{_layout_why(case.api, ctype)}: zeroed, not read from the input")
@@ -352,7 +385,7 @@ def _handle_call(case: _Case, htype: str, var: str, call: int, param: int) -> st
     case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
     stmt = _bind_call(case, k, fn, params or [], list(rec.get("formals") or []), rec, allow_init=False)
     # Without initializers the statement is the call alone: keep its result instead of dropping it.
-    return stmt.replace("(void)", f"{htype} {var} = ", 1)
+    return stmt.replace("(void)", f"{htype} {case.declare(var)} = ", 1)
 
 
 def _bind_call(
@@ -406,7 +439,7 @@ def _bind_call(
             if nxt is not None and (i + 1) not in shared and _is_pair(params, i, formals):
                 # The length of a shared buffer: from the input, clamped to that buffer.
                 ln = f"c{call}a{i + 1}"
-                case.decls.append(f"{nxt['ctype']} {ln}; memset(&{ln}, 0, sizeof({ln}));")
+                case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                 case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
                 case.decls.append(
                     f"if ((unsigned long long){ln} > sizeof({shared[i]})) {{ {ln} = ({nxt['ctype']})sizeof({shared[i]}); }}"
@@ -429,7 +462,7 @@ def _bind_call(
             own_init = i == 0 and name in case.api.candidates.get(pointee, set())
             if allow_init and pointee in case.api.inits and not own_init:
                 # A context object: its initializer runs first, never a zeroed or input-filled object.
-                case.decls.append(f"{pointee} {v}; memset(&{v}, 0, sizeof({v}));")
+                case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
                 before.append(_init_call(case, pointee, f"&{v}", call, i))
                 args.append(f"&{v}")
                 i += 1
@@ -441,11 +474,13 @@ def _bind_call(
                     args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
                 else:
                     buf = size or case.spare
-                    case.decls.append(f"{_storage(size)}unsigned char {v}[{buf}]; memset({v}, 0, sizeof({v}));")
+                    case.decls.append(
+                        f"{_storage(size)}unsigned char {case.declare(v)}[{buf}]; memset({v}, 0, sizeof({v}));"
+                    )
                     if size and is_input:
                         case.slot(v, size, call, i, "bytes", addr=False)
                     ln = f"c{call}a{i + 1}"
-                    case.decls.append(f"{nxt['ctype']} {ln}; memset(&{ln}, 0, sizeof({ln}));")
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                     case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
                     case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({nxt['ctype']}){buf}; }}")
                     args.append(f"({p['type']}){v}")
@@ -454,7 +489,9 @@ def _bind_call(
                 continue
             if charlike:
                 buf = size or case.spare
-                case.decls.append(f"{_storage(size)}unsigned char {v}[{buf}]; memset({v}, 0, sizeof({v}));")
+                case.decls.append(
+                    f"{_storage(size)}unsigned char {case.declare(v)}[{buf}]; memset({v}, 0, sizeof({v}));"
+                )
                 if size and is_input:
                     case.slot(v, size, call, i, "bytes", addr=False)
                 elif size is None and is_input and pointee in ("char", "signed char") and case.rest is None:
@@ -474,7 +511,7 @@ def _bind_call(
                 case.note(call, i, f"{_layout_why(case.api, pointee)}: the object is zeroed, not read from the input")
             if size:
                 case.decls.append(
-                    f"{pointee} {v}[({size} + sizeof({pointee}) - 1) / sizeof({pointee})]; memset({v}, 0, sizeof({v}));"
+                    f"{pointee} {case.declare(v)}[({size} + sizeof({pointee}) - 1) / sizeof({pointee})]; memset({v}, 0, sizeof({v}));"
                 )
                 if is_input and raw_ok:
                     case.slot(v, size, call, i, "bytes", addr=False)
@@ -482,10 +519,10 @@ def _bind_call(
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
                 args.append(f"({p['type']}){v}")
             elif varlen and _lone_output(params, formals, i):
-                case.decls.append(f"static unsigned char {v}[{case.spare}]; memset({v}, 0, sizeof({v}));")
+                case.decls.append(f"static unsigned char {case.declare(v)}[{case.spare}]; memset({v}, 0, sizeof({v}));")
                 args.append(f"({p['type']}){v}")
             else:
-                case.decls.append(f"{pointee} {v}; memset(&{v}, 0, sizeof({v}));")
+                case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
                 if is_input and pointee == "_Bool":
                     case.bool_slot(v, call, i, "pointee")
                 elif is_input and raw_ok:
@@ -501,7 +538,7 @@ def _bind_call(
             i += 1
             continue
         # A scalar or an enum.
-        case.decls.append(f"{p['ctype']} {v}; memset(&{v}, 0, sizeof({v}));")
+        case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
         if p["ctype"] == "_Bool":
             case.bool_slot(v, call, i, "int")
         else:
@@ -557,7 +594,10 @@ def single_case(
     if params is None:
         return None, None, why
     case = _Case(spare, api, calls=1)
-    call = _bind_call(case, 0, name, params, list(model_rec.get("formals") or []), model_rec)
+    try:
+        call = _bind_call(case, 0, name, params, list(model_rec.get("formals") or []), model_rec)
+    except _DeclError as e:
+        return None, None, str(e)
     return case.statements([call]), case.layout("single", [name]), None
 
 
@@ -727,6 +767,15 @@ def sequence_case(
     as in a single case. The layout's slots name the trace call (`call`, its position in the chain).
     A shared struct object whose first use is not one of its initializers gets the initializer first.
     """
+    try:
+        return _sequence_case(trace, chain, records, spare, api)
+    except _DeclError as e:
+        return None, None, str(e)
+
+
+def _sequence_case(
+    trace: list[dict], chain: list[int], records: dict[str, dict], spare: int, api: ApiInfo | None
+) -> tuple[str | None, dict | None, str | None]:
     case = _Case(spare, api, calls=len(chain))
     buffers: dict[str, str] = {}
     calls: list[str] = []
@@ -765,7 +814,7 @@ def sequence_case(
                     # Room for the whole object, whatever size the call sites showed.
                     n_bytes = f"({n_bytes} > sizeof({pointee}) ? {n_bytes} : sizeof({pointee}))"
                 case.decls.append(
-                    f"{_storage(size or None)}unsigned char {var}[{n_bytes}]; memset({var}, 0, sizeof({var}));"
+                    f"{_storage(size or None)}unsigned char {case.declare(var)}[{n_bytes}]; memset({var}, 0, sizeof({var}));"
                 )
                 # Filled from the input when its first use reads it, its size is known, and it holds
                 # no pointer.
@@ -816,6 +865,15 @@ def lifecycle_case(
     constructor's slots are fixed, so they are the layout's slots (seeds start from the constructor's
     recorded arguments); the method calls read their bytes in the loop. A NULL handle runs no method.
     """
+    try:
+        return _lifecycle_case(htype, methods, records, spare, api, max_calls)
+    except _DeclError as e:
+        return None, None, str(e)
+
+
+def _lifecycle_case(
+    htype: str, methods: list[str], records: dict[str, dict], spare: int, api: ApiInfo, max_calls: int
+) -> tuple[str | None, dict | None, str | None]:
     ctor, dtor = api.ctors.get(htype), api.dtors.get(htype)
     if ctor is None or dtor is None:
         return None, None, f"{htype}: no constructor or destructor known"
@@ -829,7 +887,7 @@ def lifecycle_case(
     case = _Case(spare, api, calls=ncalls)
     make = _bind_call(case, 0, ctor, cparams, list(crec.get("formals") or []), crec, allow_init=False)
     # Without initializers the statement is the call alone: keep its result instead of dropping it.
-    make = make.replace("(void)", f"{htype} fc_h = ", 1)
+    make = make.replace("(void)", f"{htype} {case.declare('fc_h')} = ", 1)
     branches: list[str] = []
     for k, name in enumerate(methods):
         rec = records[name]
@@ -862,12 +920,15 @@ def plan(
     scope_files: list[str] | None = None,
     struct_layouts: dict[str, dict] | None = None,
     visible: set[str] | None = None,
+    reserve: int = 0,
 ) -> dict[str, Any]:
     """
     The cases of a module's API harness: {entries, cases, layouts, skipped}. `scope_files` (the
     sidecar's) give a sub-module that is neither a lexer module nor a cluster its scope.
-    `struct_layouts` and `visible` come from `probe_layouts` (None: no probe ran).
+    `struct_layouts` and `visible` come from `probe_layouts` (None: no probe ran). `reserve` selectors
+    are left free for the hand-written cases `generate` appends.
     """
+    max_cases = max(0, MAX_CASES - reserve)
     from module_map import ModuleMap
 
     sidecar: dict[str, Any] = {
@@ -958,11 +1019,11 @@ def plan(
         n_seq += 1
         cases.append(stmt)
         layouts.append(layout)
-    if len(cases) > MAX_CASES:
-        for lay in layouts[MAX_CASES:]:
+    if len(cases) > max_cases:
+        for lay in layouts[max_cases:]:
             if lay.get("entry"):
                 skipped[lay["entry"]] = f"more than {MAX_CASES} cases"
-        cases, layouts = cases[:MAX_CASES], layouts[:MAX_CASES]
+        cases, layouts = cases[:max_cases], layouts[:max_cases]
     for sel, lay in enumerate(layouts):
         lay["selector"] = sel
     return {"entries": names, "cases": cases, "layouts": layouts, "skipped": skipped}
@@ -1306,6 +1367,20 @@ def failing_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> s
     return None if diags is None else set(diags)
 
 
+def previous_custom_cases(sidecar: dict[str, Any]) -> list[str]:
+    """The hand-written cases of an API harness's sidecar: the `dispatch_cases` its `custom` layouts select."""
+    cases = sidecar.get("dispatch_cases")
+    layouts = sidecar.get("api_cases")
+    if not isinstance(cases, list) or not isinstance(layouts, list):
+        return []
+    out: list[str] = []
+    for lay in layouts:
+        sel = lay.get("selector") if isinstance(lay, dict) and lay.get("kind") == CUSTOM_KIND else None
+        if isinstance(sel, int) and 0 <= sel < len(cases) and isinstance(cases[sel], str) and cases[sel].strip():
+            out.append(cases[sel].strip())
+    return out
+
+
 def generate(
     module: str,
     header: str | None,
@@ -1324,11 +1399,18 @@ def generate(
     scope_files: list[str] | None = None,
     struct_layouts: dict[str, dict] | None = None,
     visible: set[str] | None = None,
+    dispatch_cases: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Write harness_<module>.{c,json} for the module's whole API; the generate_harness result plus counts.
     `scope_files` (`--scope-file`) default to the previous sidecar's, and are kept in the new one.
     `struct_layouts`/`visible` replace the layout probe (`probe_layouts`), which runs with `probe`.
+
+    `dispatch_cases` (`--dispatch-case`) are hand-written cases, for a function the generator cannot
+    call: appended after the generated ones in the same switch (the next selectors), each with an
+    `api_cases` layout of kind `custom` (no calls, no slots: the seed writers make nothing for it).
+    None keeps the previous sidecar's custom cases; a list replaces them (an empty one drops them).
+    One that does not compile fails the generation: it is never dropped silently.
     """
     from generate_harness import (
         _norm_scope_files,
@@ -1351,8 +1433,27 @@ def generate(
         if scope_files is not None
         else previous_scope_files(previous if isinstance(previous, dict) else {})
     )
+    custom = (
+        previous_custom_cases(previous if isinstance(previous, dict) else {})
+        if dispatch_cases is None
+        else [c.strip() for c in dispatch_cases if isinstance(c, str) and c.strip()]
+    )
+    for n, text in enumerate(custom, start=1):
+        if "\n" in text or "\r" in text:
+            # The compile probe and the layout probe map a case to its one line of the harness.
+            raise ApiHarnessError(f"module {module!r}: --dispatch-case {n} of {len(custom)} must be one line of C")
+    if len(custom) >= MAX_CASES:
+        raise ApiHarnessError(f"module {module!r}: {len(custom)} --dispatch-case cases, at most {MAX_CASES - 1}")
+
+    def with_custom(planned: dict[str, Any]) -> tuple[list[str], list[dict], dict[str, str]]:
+        """The planned cases followed by the hand-written ones, their layouts, and the skipped functions."""
+        lays = [*planned["layouts"], *({"kind": CUSTOM_KIND, "calls": [], "slots": [], "rest": None} for _ in custom)]
+        for sel, lay in enumerate(lays):
+            lay["selector"] = sel
+        return [*planned["cases"], *custom], lays, dict(planned["skipped"])
+
     traces = load_traces(traces_path)
-    p = plan(dag, model, module, unit, max_input_size, traces, scope, struct_layouts, visible)
+    p = plan(dag, model, module, unit, max_input_size, traces, scope, struct_layouts, visible, reserve=len(custom))
     if not p["cases"]:
         raise ApiHarnessError(f"module {module!r}: no API entry point the generator can call: {p['skipped']}")
     functions = dag.get("functions") or {}
@@ -1363,7 +1464,7 @@ def generate(
         | {str(s) for s in req_sources if s}
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
-    cases, layouts, skipped = list(p["cases"]), list(p["layouts"]), dict(p["skipped"])
+    cases, layouts, skipped = with_custom(p)
     result: dict[str, Any] = {}
     # Struct layouts come from the first harness written (its headers and prelude): the cases are
     # planned again with them before the compile probe. Each later round drops at least one case, so
@@ -1399,9 +1500,11 @@ def generate(
                 need_layouts = False
                 layouts_probed = probe_layouts(Path(result["harness_file"]), result["cppflags"])
                 if layouts_probed is not None:
-                    p = plan(dag, model, module, unit, max_input_size, traces, scope, *layouts_probed)
+                    p = plan(
+                        dag, model, module, unit, max_input_size, traces, scope, *layouts_probed, reserve=len(custom)
+                    )
                     if p["cases"]:
-                        cases, layouts, skipped = list(p["cases"]), list(p["layouts"]), dict(p["skipped"])
+                        cases, layouts, skipped = with_custom(p)
                         continue
             probed = probe_cases(Path(result["harness_file"]), result["cppflags"])
             if probed is None:
@@ -1415,6 +1518,12 @@ def generate(
                 break
             keep = [i for i in range(len(cases)) if i not in bad]
             for i, diag in sorted(bad.items()):
+                if layouts[i]["kind"] == CUSTOM_KIND:
+                    n = sum(1 for lay in layouts[: i + 1] if lay["kind"] == CUSTOM_KIND)
+                    raise ApiHarnessError(
+                        f"module {module!r}: --dispatch-case {n} of {len(custom)} does not compile "
+                        f"with the target's headers: {diag}"
+                    )
                 if layouts[i].get("entry"):
                     skipped[layouts[i]["entry"]] = f"the case does not compile with the target's headers: {diag}"
             if not keep:
@@ -1426,6 +1535,7 @@ def generate(
         sidecar_path = Path(result["harness_meta"])
         sidecar = load_json_optional(sidecar_path, {}) or {}
         sidecar["api_harness"] = True
+        sidecar["dispatch_case_count"] = len(layouts)
         sidecar["api_cases"] = layouts
         sidecar["api_skipped"] = skipped
         write_sidecar(sidecar_path, sidecar)
@@ -1434,6 +1544,7 @@ def generate(
         api_entries=sum(1 for lay in layouts if lay.get("entry")),
         api_sequences=sum(1 for lay in layouts if lay["kind"] == "sequence"),
         api_lifecycles=sum(1 for lay in layouts if lay["kind"] == "lifecycle"),
+        api_custom=sum(1 for lay in layouts if lay["kind"] == CUSTOM_KIND),
         api_skipped=skipped,
     )
     return result

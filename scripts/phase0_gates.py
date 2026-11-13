@@ -67,11 +67,15 @@ def target_fuzzer_source(run_dir: Path, sidecar: Any) -> Path | None:
     return next((p for p in candidates if p.is_file()), None)
 
 
-def harness_digest(run_dir: Path, module: str) -> str | None:
+def harness_digest(run_dir: Path, module: str, ignore_exempt: bool = False) -> str | None:
     """
     sha256 over the module's harness sidecar and source, or None when the harness is missing. A target
     fuzz module (sidecar `target_fuzzer`) also covers its fuzzer source: editing the target's fuzzer
     changes what the harness runs, as a harness edit does.
+
+    `ignore_exempt` leaves the sidecar's `reach_exempt` (and `warnings`) out: the dynamic reach rows use it to tell a
+    repaired harness (which clears every measured gap) from a recorded exemption (which clears only the
+    entry points it names).
     """
     h = hashlib.sha256()
     found = False
@@ -81,13 +85,17 @@ def harness_digest(run_dir: Path, module: str) -> str | None:
         if path.is_file():
             found = True
             data = path.read_bytes()
-            h.update(suffix.encode())
-            h.update(data)
             if suffix == ".json":
                 try:
                     sidecar = json.loads(data)
                 except ValueError:
                     sidecar = None
+                if ignore_exempt and isinstance(sidecar, dict):
+                    # `warnings` is rewritten with every sidecar write (the schema check's result).
+                    rest = {k: v for k, v in sidecar.items() if k not in ("reach_exempt", "warnings")}
+                    data = json.dumps(rest, sort_keys=True, separators=(",", ":")).encode()
+            h.update(suffix.encode())
+            h.update(data)
     if isinstance(sidecar, dict) and isinstance(sidecar.get("target_fuzzer"), dict):
         src = target_fuzzer_source(run_dir, sidecar)
         h.update(b"target_fuzzer")
@@ -244,7 +252,9 @@ def check(
             else:
                 if not _section_ok(section, entry):
                     failed = sorted(m for m, r in modules.items() if not r.get("passed"))
-                    reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
+                    reasons.append(
+                        f"{section} failed for {', '.join(failed) or 'the run'}; {_reach_next_step('<mod>')}"
+                    )
                 stale = sorted(
                     m
                     for m, r in modules.items()
@@ -271,7 +281,7 @@ def check(
         if section == "reach":
             if not row.get("passed"):
                 detail = row.get("error") or f"entry points not reached: {', '.join(row.get('gaps') or [])}"
-                reasons.append(f"reach gate failed for {module}: {detail}")
+                reasons.append(f"reach gate failed for {module}: {detail}; {_reach_next_step(module)}")
             elif row.get("harness_digest") != harness_digest(run_dir, module):
                 reasons.append(f"the harness of {module} changed after the reach gate ran; run it again")
             elif row.get("dag_digest") != current_dag:
@@ -292,6 +302,15 @@ def check(
 
     reasons.extend(stub_gate_reasons(run_dir, module))
     return reasons
+
+
+def _reach_next_step(module: str) -> str:
+    """What to run after a failed reach row: the gate's message is the one text every caller reads."""
+    return (
+        f"repair the harness and run `{HOW_TO_RUN['reach']}` again, or record why with "
+        f"`python3 $S/harness_reach.py exempt --module {module} --function <fn> --reason <why>` "
+        "(which re-checks the gate)"
+    )
 
 
 def _dag_changed(modules: str) -> str:

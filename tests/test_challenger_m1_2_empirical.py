@@ -483,7 +483,7 @@ class TestAdversarialCompilerTempsAndCallerLinking:
             ],
         }
         callee_raw = {"kernel_name": "callee_fn", "name": "callee_fn", "loc": "c.c:20"}
-        records = {
+        records: dict[str, dict] = {
             "c.c#callee_fn": {"kernel_name": "callee_fn", "name": "callee_fn", "called_by": []}
         }
         function_facts._link_callers([caller_raw, callee_raw], records)
@@ -538,7 +538,7 @@ class TestAdversarialCompilerTempsAndCallerLinking:
             ],
         }
         callee = {"kernel_name": "target", "name": "target", "loc": "legacy.c:10"}
-        records = {"legacy.c#target": {"kernel_name": "target", "name": "target", "called_by": []}}
+        records: dict[str, dict] = {"legacy.c#target": {"kernel_name": "target", "name": "target", "called_by": []}}
         function_facts._link_callers([caller_no_temps, callee], records)
 
         # 'tmp_1 > 0' is filtered out; user_var > 0 is preserved

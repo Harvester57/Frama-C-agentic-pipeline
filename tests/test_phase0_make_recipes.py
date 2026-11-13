@@ -8,13 +8,14 @@ command is taken from the template and run, so a flag a script no longer accepts
 from __future__ import annotations
 
 import json
-import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from conftest import MakeRule, makefile_rule
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
@@ -25,11 +26,9 @@ pytestmark = pytest.mark.unit
 
 def recipe_commands(target: str) -> list[str]:
     """The logical recipe lines of `target` (backslash continuations joined)."""
-    text = TEMPLATE.read_text(encoding="utf-8")
-    m = re.search(rf"^{re.escape(target)}:[^\n]*\n((?:\t[^\n]*\n)+)", text, re.MULTILINE)
-    assert m is not None, f"no recipe for {target}"
-    body = re.sub(r"\\\n\t*", " ", m.group(1))
-    return [line.strip() for line in body.splitlines() if line.strip()]
+    recipe = makefile_rule(TEMPLATE.read_text(encoding="utf-8"), target).recipe
+    assert recipe, f"no recipe for {target}"
+    return list(recipe)
 
 
 def argv_of(recipe: str, target_dir: Path) -> list[str]:
@@ -130,9 +129,17 @@ def test_phase0_recipes_run_as_written(tmp_path: Path) -> None:
 
 
 def test_seed_runs_after_the_security_properties() -> None:
-    text = TEMPLATE.read_text(encoding="utf-8")
-    m = re.search(r"^seed:([^\n]*)$", text, re.MULTILINE)
-    assert m is not None and "security-props" in m.group(1).split()
+    assert "security-props" in makefile_rule(TEMPLATE.read_text(encoding="utf-8"), "seed").prerequisites
+
+
+def test_a_blank_or_comment_line_does_not_cut_a_recipe_short() -> None:
+    # The old `((?:\t[^\n]*\n)+)` stopped at the first line that is not tab-led, so the commands after
+    # it were never run by these tests.
+    text = "all: a b\n\tfirst \\\n\t\t--flag\n\n# why the next one\n\tsecond\nX = a:b\nother: all\n\tfourth\n"
+    assert makefile_rule(text, "all") == MakeRule(("all",), "", ("a", "b"), ("first --flag", "second"))
+    assert makefile_rule(text, "other").recipe == ("fourth",)
+    pattern = makefile_rule("$(T) extra: t-%: dep-% | order\n\t$(GATE) $*\n$(foreach m,$(M),$(eval x: y))\n", "$(T)")
+    assert pattern == MakeRule(("$(T)",), "t-%", ("dep-%", "order"), ("$(GATE) $*",))
 
 
 def test_seed_does_not_record_phase_0() -> None:

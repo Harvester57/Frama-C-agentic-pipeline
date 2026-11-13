@@ -24,7 +24,7 @@ import run_wp_function as rwf
 import security_props as sp
 import trust
 from acsl_ast import tokenize_c_acsl
-from conftest import ANALYSIS_IMAGE, ROOT, write_json
+from conftest import ANALYSIS_IMAGE, ROOT, wp_proved_goals, write_json
 from test_phase0_model import model_run  # noqa: F401  (Docker fixture)
 
 FIX = ROOT / "tests" / "fixtures" / "security_props"
@@ -131,7 +131,7 @@ def test_generated_annotations_are_pure_acsl():
 
 def _acsl_definition(text: str, name: str) -> str | None:
     """The whitespace-normalized text of `predicate <name>(...) = ...;` in an ACSL block, or None."""
-    m = re.search(r"predicate\s+" + name + r"\s*\([^)]*\)\s*=[\s\S]*?;[ \t]*\n", text + "\n")
+    m = re.search(r"predicate\s+" + re.escape(name) + r"\s*\([^)]*\)\s*=[\s\S]*?;[ \t]*\n", text + "\n")
     return " ".join(m.group(0).split()) if m else None
 
 
@@ -1202,6 +1202,19 @@ def test_eva_rows_of_a_local_check_go_to_the_l6_wiped_unit(run_dir):
     assert units["prog.c#derive::rte"]["bookkeeping"]["eva_verdicts"] == {"libprog.a": "valid"}
 
 
+@pytest.mark.unit
+def test_wp_summary_helper_reads_every_line_and_refuses_an_empty_run():
+    """conftest.wp_proved_goals, which the image tests below (and the fc_* ones) read WP logs through."""
+    assert wp_proved_goals("[wp] Proved goals:    4 / 4\n  Qed: 4\n") == [(4, 4)]
+    assert wp_proved_goals("[wp] Proved goals: 2/3\n") == [(2, 3)]  # spacing as loose as production's pattern
+    # Every summary line: a second run that leaves a goal open is not hidden by the first.
+    assert wp_proved_goals("[wp] Proved goals:   5 / 5\n...\n[wp] Proved goals:   1 / 2\n") == [(5, 5), (1, 2)]
+    # `0 / 0` has proved == total and proves nothing; a log without a summary proves nothing either.
+    for log in ("[wp] Proved goals:    0 / 0\n", "[wp] Proved goals:  3 / 3\n[wp] Proved goals:  0 / 0\n", "[wp] 3 goals\n"):
+        with pytest.raises(AssertionError):
+            wp_proved_goals(log)
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.parametrize("violate", [False, True], ids=["wiped", "refilled"])
@@ -1228,9 +1241,9 @@ def test_local_wipe_check_in_the_image(model_run, tmp_path, violate):  # noqa: F
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
     )
     assert res.returncode == 0, res.stdout + res.stderr
-    proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", res.stdout)
-    assert proved and int(proved.group(2)) >= 2, res.stdout
-    assert (proved.group(1) == proved.group(2)) is (not violate), res.stdout
+    goals = wp_proved_goals(res.stdout)
+    assert all(total >= 2 for _, total in goals), res.stdout
+    assert all(proved == total for proved, total in goals) is (not violate), res.stdout
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1451,6 +1464,6 @@ def test_gate_failure_check_in_the_image(model_run, tmp_path, violate):  # noqa:
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
     )
     assert res.returncode == 0, res.stdout + res.stderr
-    proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", res.stdout)
-    assert proved and int(proved.group(2)) >= 2, res.stdout
-    assert (proved.group(1) == proved.group(2)) is (not violate), res.stdout
+    goals = wp_proved_goals(res.stdout)
+    assert all(total >= 2 for _, total in goals), res.stdout
+    assert all(proved == total for proved, total in goals) is (not violate), res.stdout

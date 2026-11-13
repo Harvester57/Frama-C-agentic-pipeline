@@ -82,6 +82,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import benchmark  # noqa: E402
+from patterns import KERNEL_RENAME_RE  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 CORPUS = benchmark.PIPELINE_ROOT / "tests" / "fixtures" / "phase0" / "seeded"
@@ -102,7 +103,7 @@ _SCALAR_RE = re.compile(
     r"|u?int(?:8|16|32|64)_t)$"
 )
 _LEN_RE = re.compile(r"\b(size_t|unsigned|int|long|u?int(?:16|32|64)_t)\b")
-_RENAMED_RE = re.compile(r"(.+)_\d+")
+_RENAMED_RE = KERNEL_RENAME_RE
 
 # Host-side stages after Phase 0, as `benchmark.py run` runs them (no replay, gate or queue: the seeded
 # set has no manifest reproducers and stops at Phase 2). `coverage reach-dynamic` runs before ingest, as

@@ -54,8 +54,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import run_wp_function  # noqa: E402
-from acsl_ast import _find_body_brace_offset, locate_function_span, tokenize_c_acsl  # noqa: E402
-from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from acsl_ast import _find_body_brace_offset, iter_clauses, locate_function_span, tokenize_c_acsl  # noqa: E402
+from framac_common import _CPP_ERROR_RE, atomic_write_json, load_json_optional, utc_now  # noqa: E402
 
 MUTATION_SCHEMA = 1
 DEFAULT_MAX_FUNCTIONS = 20
@@ -65,13 +65,27 @@ _REL_OP_FLIP = [("<=", "<"), (">=", ">"), ("<", "<="), (">", ">=")]
 _C_PUNCT = frozenset("-+*/%&|^!~<>=?:")
 # Longest first, so `->`, `<<=` and `<=` are never read as `>` or `<`.
 _C_OPERATOR_RE = re.compile(r"->|<<=|>>=|<<|>>|<=|>=|==|!=|&&|\|\||\+\+|--|[-+*/%&|^]=|[-+*/%&|^!~<>=?:]")
-_RETURN_CONST_RE = re.compile(r"\breturn\s+(-?\d+)\s*;")
-_ENSURES_CLAUSE_RE = re.compile(r"\bensures\b[^;]*;")
+_ACSL_REL_FLIP_RE = re.compile(r"<==>|==>|<=|>=")
+_DEC_INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 # WP report statuses that carry goal results; any other status is a failed run.
 _ANALYSED_STATUSES = ("all_proven", "unproven_goals_remain")
 _DECL_DROP = frozenset({"static", "inline", "__inline", "__inline__", "extern", "_Noreturn", "__extension__"})
 _ATTRIBUTE_KEYWORDS = frozenset({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm"})
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _flip_rel_ops(clause_text: str) -> str:
+    """Flip `<=` to `<` and `>=` to `>`, preserving `<==>` and `==>`."""
+
+    def repl(m: re.Match) -> str:
+        s = m.group(0)
+        if s == "<=":
+            return "<"
+        if s == ">=":
+            return ">"
+        return s
+
+    return _ACSL_REL_FLIP_RE.sub(repl, clause_text)
 
 
 def stub_enabled() -> bool:
@@ -90,15 +104,20 @@ def _acsl_text_of_span(span) -> str:
 def spec_mutants(contract_acsl: str, max_mutants: int) -> list[tuple[str, str]]:
     """Contract mutants: drop each ensures clause, flip <=/>= in ensures, \\true-ify one."""
     out: list[tuple[str, str]] = []
-    clauses = _ENSURES_CLAUSE_RE.findall(contract_acsl)
-    for i, clause in enumerate(clauses[:max_mutants]):
-        out.append((f"drop-ensures-{i}", contract_acsl.replace(clause, "", 1)))
-    for i, clause in enumerate(clauses[: max_mutants - len(out)]):
-        flipped = clause.replace("<=", "<").replace(">=", ">")
+    ensures = [
+        (span, contract_acsl[span[0] : span[1]])
+        for kind, _label, _pred, span in iter_clauses(contract_acsl)
+        if kind == "ensures"
+    ]
+    for i, (span, _clause) in enumerate(ensures[:max_mutants]):
+        out.append((f"drop-ensures-{i}", contract_acsl[: span[0]] + contract_acsl[span[1] :]))
+    for i, (span, clause) in enumerate(ensures[: max_mutants - len(out)]):
+        flipped = _flip_rel_ops(clause)
         if flipped != clause:
-            out.append((f"weaken-ensures-{i}", contract_acsl.replace(clause, flipped, 1)))
-    if clauses and len(out) < max_mutants:
-        out.append(("ensures-true", _ENSURES_CLAUSE_RE.sub(lambda m: r"ensures \true;", contract_acsl, count=1)))
+            out.append((f"weaken-ensures-{i}", contract_acsl[: span[0]] + flipped + contract_acsl[span[1] :]))
+    if ensures and len(out) < max_mutants:
+        first_span, _ = ensures[0]
+        out.append(("ensures-true", contract_acsl[: first_span[0]] + r"ensures \true;" + contract_acsl[first_span[1] :]))
     return out[:max_mutants]
 
 
@@ -131,6 +150,37 @@ def _c_operators(body_text: str) -> list[tuple[int, int, str]]:
     return out
 
 
+def _c_return_constants(body_text: str) -> list[tuple[int, int, int]]:
+    """Find return constant statements `return [-]N;` in code tokens as (start, end, val)."""
+    out: list[tuple[int, int, int]] = []
+    try:
+        tokens = tokenize_c_acsl(body_text)
+    except Exception:
+        return out
+    code_toks = [t for t in tokens if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line")]
+    i = 0
+    while i < len(code_toks):
+        tok = code_toks[i]
+        if tok.kind == "c_token" and tok.text == "return":
+            start = tok.start
+            i += 1
+            sign = 1
+            if i < len(code_toks) and code_toks[i].kind == "c_token" and code_toks[i].text == "-":
+                sign = -1
+                i += 1
+            if i < len(code_toks) and code_toks[i].kind == "c_token" and _DEC_INT_RE.match(code_toks[i].text):
+                val = sign * int(code_toks[i].text)
+                i += 1
+                if i < len(code_toks) and code_toks[i].kind == "c_token" and code_toks[i].text == ";":
+                    end = code_toks[i].end
+                    out.append((start, end, val))
+                    i += 1
+                    continue
+        else:
+            i += 1
+    return out
+
+
 def impl_mutants(body_text: str, max_mutants: int) -> list[tuple[str, str]]:
     """Implementation mutants: flip relational operators, change return constants."""
     out: list[tuple[str, str]] = []
@@ -141,11 +191,10 @@ def impl_mutants(body_text: str, max_mutants: int) -> list[tuple[str, str]]:
             out.append((f"flip-{op}", body_text[: hit[0]] + flipped + body_text[hit[1] :]))
         if len(out) >= max_mutants:
             break
-    for m in _RETURN_CONST_RE.finditer(body_text):
+    for start, end, val in _c_return_constants(body_text):
         if len(out) >= max_mutants:
             break
-        val = int(m.group(1))
-        out.append((f"return-{val}-to-{val + 1}", body_text[: m.start()] + f"return {val + 1};" + body_text[m.end() :]))
+        out.append((f"return-{val}-to-{val + 1}", body_text[:start] + f"return {val + 1};" + body_text[end:]))
     return out[:max_mutants]
 
 
@@ -245,7 +294,7 @@ def _failure_kind(report: dict) -> str:
     status = str(report.get("status") or "error")
     if status == "acsl_syntax_error":
         errors = (report.get("syntax_check") or {}).get("errors") or []
-        if any(run_wp_function._CPP_ERROR_RE.match(str(e)) or _PREPROCESS_HINT_RE.search(str(e)) for e in errors):
+        if any(_CPP_ERROR_RE.match(str(e)) or _PREPROCESS_HINT_RE.search(str(e)) for e in errors):
             return "preprocessing_failed"
     return status
 

@@ -807,6 +807,42 @@ def test_annotation_joins_an_existing_loop_annotation_as_its_first_clause():
     assert "/* just a comment */ /*@ loop unroll 8; */ for (;;) {}" in text
 
 
+@pytest.mark.unit
+def test_annotation_joins_multiline_loop_annotation_with_leading_at() -> None:
+    source = (
+        "void f(int n) {\n"
+        "  /*@\n"
+        "    @ loop invariant 0 <= i;\n"
+        "    @*/\n"
+        "  for (int i = 0; i < n; i++) {}\n"
+        "}\n"
+    )
+    refs = [LoopRef("a.c", "f", 0, 8)]
+    text, applied, dropped = eva_loops.annotate_source(source, refs)
+    assert applied == refs and dropped == []
+    # Must join the existing block, NOT introduce a second /*@ block
+    assert text.count("/*@") == 1
+    assert "loop unroll 8;" in text
+
+
+@pytest.mark.unit
+def test_find_loops_sees_multiline_unroll_annotation() -> None:
+    source = (
+        "void f(int n) {\n"
+        "  /*@\n"
+        "    @ loop\n"
+        "    @ unroll 8;\n"
+        "    @*/\n"
+        "  for (int i = 0; i < n; i++) {}\n"
+        "}\n"
+    )
+    # If the loop already has an unroll annotation, annotate_source must drop it and keep the decision
+    refs = [LoopRef("a.c", "f", 0, 16)]
+    _, applied, dropped = eva_loops.annotate_source(source, refs)
+    assert applied == []
+    assert dropped == refs
+
+
 def test_loop_refs_round_trip_and_reject_anything_else():
     ref = LoopRef("workspace/work/a.c", "f", 2, 256)
     assert eva_loops.parse_loop_ref(ref.to_arg()) == ref

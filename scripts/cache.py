@@ -57,6 +57,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
 from c_definitions import C_KEYWORDS  # noqa: E402
 from framac_common import RunLockTimeout, run_lock, stub_overlay_dir, utc_now  # noqa: E402
+from patterns import parse_make_deps  # noqa: E402
+from patterns import parse_size as _parse_size
 
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_MAX_BYTES = 20 * 1024**3
@@ -75,9 +77,14 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _TEMPLATES_DIR = _SCRIPTS_DIR.parent / "templates"
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 _LINE_DIRECTIVE_RE = re.compile(r'^\s*#\s*(?:line\s+)?(\d+)(?:\s+"([^"]*)")?')
 _ACSL_BLOCK_RE = re.compile(r"/\*@.*?\*/|//@[^\n]*", re.DOTALL)
-_GLOBAL_ACSL_DECL_RE = re.compile(r"\b(?:predicate|logic|axiomatic|lemma|inductive|type|ghost|model)\b")
+# Annotations that apply beyond the function they stand next to, so they stay in every function's digest.
+# `global invariant` and `volatile` are among them: left out, editing one would not change the key.
+_GLOBAL_ACSL_DECL_RE = re.compile(
+    r"\b(?:predicate|logic|axiomatic|lemma|inductive|type|ghost|model|volatile)\b|\bglobal\s+invariant\b"
+)
 _FN_DECL_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _OFF = ("off", "0", "false", "no", "disabled")
 _ON = ("on", "1", "true", "yes", "enabled")
@@ -137,7 +144,7 @@ def wp_cache_dir(cwd: Path | None = None) -> Path | None:
 
 def shared_corpus_dir(module: str) -> Path | None:
     """`<shared_cache_root>/corpora/<module>` when the shared cache is active and `module` is a safe name."""
-    if forced_off() or not module or not _NAME_RE.match(module):
+    if forced_off() or not module or not _NAME_RE.fullmatch(module):
         return None
     root = shared_cache_root()
     if root is None:
@@ -335,7 +342,7 @@ class Store:
             manifest: dict[str, dict] = {}
             total = 0
             for name, src in files.items():
-                if not _NAME_RE.match(name):
+                if not _NAME_RE.fullmatch(name):
                     raise ValueError(f"invalid cache file name {name!r}")
                 dst = tmp / "files" / name
                 shutil.copy2(src, dst)
@@ -387,7 +394,7 @@ class Store:
                 if child.name.startswith("."):
                     continue  # temp dirs, tombs and locks
                 meta_file = child / "meta.json"
-                if child.is_dir() and _KEY_RE.match(child.name) and meta_file.is_file():
+                if child.is_dir() and _KEY_RE.fullmatch(child.name) and meta_file.is_file():
                     try:
                         meta = json.loads(meta_file.read_text(encoding="utf-8"))
                         items.append((meta_file.stat().st_mtime, int(meta.get("bytes") or 0), child, True))
@@ -485,14 +492,6 @@ class Store:
                 _remove_tree(path)
                 cleared.append(name)
         return {"root": str(self.root), "cleared": cleared}
-
-
-def _parse_size(raw: str) -> int | None:
-    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmMgGtT]?)(?:i?[bB])?\s*", raw)
-    if not m:
-        return None
-    factor = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[m.group(2).lower()]
-    return int(float(m.group(1)) * factor)
 
 
 def _publish_dir(tmp: Path, final: Path) -> bool:
@@ -764,13 +763,13 @@ def _has_preceding_fn_sig(tokens: list[Token], idx: int, min_idx: int) -> bool:
             if prev_fn > min_idx and tokens[prev_fn].kind == "c_token":
                 if (
                     tokens[prev_fn].text not in C_KEYWORDS
-                    and re.match(r"^[A-Za-z_]\w*$", tokens[prev_fn].text)
+                    and _IDENT_RE.fullmatch(tokens[prev_fn].text)
                     and _prev_meaningful(tokens, prev_fn - 1, min_idx) > min_idx
                 ):
                     return True
             before = _prev_meaningful(tokens, open_p - 1, min_idx)
             continue
-        if tok.kind == "c_token" and re.match(r"^[A-Za-z_]\w*$", tok.text) and tok.text not in C_KEYWORDS:
+        if tok.kind == "c_token" and _IDENT_RE.fullmatch(tok.text) and tok.text not in C_KEYWORDS:
             before = _prev_meaningful(tokens, before - 1, min_idx)
             continue
         break
@@ -801,7 +800,7 @@ def _strip_trailing_attrs_backward(tokens: list[Token], end_idx: int, min_idx: i
                         continue
                     if (
                         tokens[p_c].kind == "c_token"
-                        and re.match(r"^[A-Za-z_]\w*$", tokens[p_c].text)
+                        and _IDENT_RE.fullmatch(tokens[p_c].text)
                         and tokens[p_c].text not in C_KEYWORDS
                         and _has_preceding_fn_sig(tokens, p_c - 1, min_idx)
                     ):
@@ -812,7 +811,7 @@ def _strip_trailing_attrs_backward(tokens: list[Token], end_idx: int, min_idx: i
                 cursor -= 1
                 continue
             if (
-                re.match(r"^[A-Za-z_]\w*$", tok.text)
+                _IDENT_RE.fullmatch(tok.text)
                 and tok.text not in C_KEYWORDS
                 and _has_preceding_fn_sig(tokens, cursor - 1, min_idx)
             ):
@@ -827,7 +826,7 @@ def _resolve_fn_name(tokens: list[Token], min_idx: int, open_params_idx: int) ->
     if prev_idx <= min_idx:
         return None
     prev = tokens[prev_idx]
-    if prev.kind == "c_token" and prev.text not in C_KEYWORDS and re.match(r"^[A-Za-z_]\w*$", prev.text):
+    if prev.kind == "c_token" and prev.text not in C_KEYWORDS and _IDENT_RE.fullmatch(prev.text):
         return prev.text
     # Function-pointer returning declarator: `ret (*fn(params))(fp_params)`
     if prev.kind == "c_token" and prev.text == ")":
@@ -843,7 +842,7 @@ def _resolve_fn_name(tokens: list[Token], min_idx: int, open_params_idx: int) ->
                         if (
                             cand.kind == "c_token"
                             and cand.text not in C_KEYWORDS
-                            and re.match(r"^[A-Za-z_]\w*$", cand.text)
+                            and _IDENT_RE.fullmatch(cand.text)
                         ):
                             return cand.text
     return None
@@ -1031,47 +1030,6 @@ def normalized_dependency_manifest(
         ]
         for dep, digest in deps
     ]
-
-
-def _split_make_words(text: str) -> list[str]:
-    words: list[str] = []
-    cur: list[str] = []
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if c == "\\" and i + 1 < len(text) and text[i + 1] in " #\\":
-            cur.append(text[i + 1])
-            i += 2
-            continue
-        if c == "$" and text[i + 1 : i + 2] == "$":
-            cur.append("$")
-            i += 2
-            continue
-        if c.isspace():
-            if cur:
-                words.append("".join(cur))
-                cur = []
-            i += 1
-            continue
-        cur.append(c)
-        i += 1
-    if cur:
-        words.append("".join(cur))
-    return words
-
-
-_RULE_RE = re.compile(r"^((?:[^:\\]|\\.)+?):(?=\s|$)(.*)$")
-
-
-def parse_make_deps(text: str) -> list[str]:
-    """Prerequisites of every rule in `gcc -M` / `clang -M` output."""
-    deps: list[str] = []
-    joined = re.sub(r"\\\r?\n", " ", text or "")
-    for line in joined.splitlines():
-        m = _RULE_RE.match(line.strip())
-        if m:
-            deps.extend(_split_make_words(m.group(2)))
-    return deps
 
 
 _PRE_SEPARATE = frozenset({"-I", "-D", "-U", "-include", "-imacros", "-isystem", "-idirafter", "-iquote"})

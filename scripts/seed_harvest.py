@@ -1453,7 +1453,11 @@ def _store_seeds(
 def write_module(module: str, sidecar: dict, harness_c: str, calls: list[dict], files: list[bytes]) -> dict:
     """Write workspace/seeds/<module>/ from the records; the module's summary."""
     functions = {c["fn"] for c in calls}
-    cases = harness_cases(harness_c)
+    cases: list[tuple[int | None, str]]
+    if sidecar and sidecar.get("dispatch_cases"):
+        cases = [(i, str(stmt)) for i, stmt in enumerate(sidecar["dispatch_cases"])]
+    else:
+        cases = harness_cases(harness_c)
     bindings = [(sel, case_bindings(stmt, functions)) for sel, stmt in cases]
     max_size = int(sidecar.get("max_input_size") or 0) or 1 << 20
     seeds: dict[str, bytes] = {}

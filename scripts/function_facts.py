@@ -64,6 +64,15 @@ CONTEXT_SENTINEL = "<!-- deterministic-context -->"
 _AT = "\\at"
 
 _TEMP_RE = re.compile(r"\b(?:tmp(?:_\d+)?|__retres)\b")
+
+
+def _temp_pattern(temps: list[str] | None) -> re.Pattern:
+    """Compile a regex matching any of the function's compiler temporaries on word boundaries."""
+    if temps is None:
+        return _TEMP_RE
+    if not temps:
+        return re.compile(r"(?!)")  # never matches
+    return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in temps) + r")\b")
 _RUN_PREFIX_RE = re.compile(r"^(?:/framac-run/|\./)+")
 _AGENT_WORK_RE = re.compile(r"^agents/[^/]+/scratch/work/")
 _STRING_CALLEES = frozenset(
@@ -199,9 +208,9 @@ def _source_context(span: Span | None, path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _clean_expr(text: str | None) -> str | None:
+def _clean_expr(text: str | None, temp_re: re.Pattern = _TEMP_RE) -> str | None:
     """An expression naming a kernel temporary means nothing to the prover: it is left out."""
-    if text is None or _TEMP_RE.search(text):
+    if text is None or temp_re.search(text):
         return None
     return text
 
@@ -215,7 +224,7 @@ def _root_of(access: dict, derived: dict[str, str]) -> tuple[str, str]:
     return base, kind
 
 
-def _access_records(accesses: list[dict], derived: dict[str, str]) -> list[dict]:
+def _access_records(accesses: list[dict], derived: dict[str, str], temp_re: re.Pattern = _TEMP_RE) -> list[dict]:
     """Memory accesses by formal or global; a private local array is not a frame fact."""
     out: list[dict] = []
     seen: set[tuple[str | None, str]] = set()
@@ -223,7 +232,7 @@ def _access_records(accesses: list[dict], derived: dict[str, str]) -> list[dict]
         root, kind = _root_of(access, derived)
         if kind == "local" and not access.get("through_pointer"):
             continue
-        lval = _clean_expr(access.get("lval"))
+        lval = _clean_expr(access.get("lval"), temp_re)
         key = (lval, root)
         if key in seen:
             continue
@@ -236,28 +245,28 @@ def _access_records(accesses: list[dict], derived: dict[str, str]) -> list[dict]
             "line": kernel_ast.parse_location(access.get("loc"))["line"],
         }
         # The kernel dump carries the RHS expressions of writes (loop and straight-line alike).
-        values = [v for v in (_clean_expr(x) for x in access.get("values") or []) if v]
+        values = [v for v in (_clean_expr(x, temp_re) for x in access.get("values") or []) if v]
         if values:
             record["values"] = values
         out.append(record)
     return out
 
 
-def _loop_record(raw: dict, derived: dict[str, str], tokens: list) -> dict:
+def _loop_record(raw: dict, derived: dict[str, str], tokens: list, temp_re: re.Pattern = _TEMP_RE) -> dict:
     loc = kernel_ast.parse_location(raw.get("loc"))
     header, macro_expanded = _loop_header(tokens, loc["line"]) if tokens else ("", False)
     scalars: list[dict] = []
     memory: list[dict] = []
     for write in raw.get("writes") or []:
         root, kind = _root_of(write, derived)
-        values = [v for v in (_clean_expr(x) for x in write.get("values") or []) if v]
-        lval = _clean_expr(write.get("lval"))
+        values = [v for v in (_clean_expr(x, temp_re) for x in write.get("values") or []) if v]
+        lval = _clean_expr(write.get("lval"), temp_re)
         if write.get("through_pointer") or kind == "global" or (lval and ("[" in lval or "." in lval)):
             memory.append({"lval": lval, "root": root, "root_kind": kind, "values": values})
         elif lval:
             scalars.append({"var": lval, "updates": values})
     reads = [
-        {"lval": _clean_expr(r.get("lval")), "root": _root_of(r, derived)[0], "root_kind": _root_of(r, derived)[1]}
+        {"lval": _clean_expr(r.get("lval"), temp_re), "root": _root_of(r, derived)[0], "root_kind": _root_of(r, derived)[1]}
         for r in raw.get("reads") or []
     ]
     # In-place: the same object read and written at positions that move with the loop. A field read
@@ -285,14 +294,14 @@ def _loop_record(raw: dict, derived: dict[str, str], tokens: list) -> dict:
         "header": header,
         "macro_expanded": macro_expanded,
         # A guard on a kernel temporary is the source header's condition after normalization.
-        "guard": guard if guard and not _TEMP_RE.search(guard) else None,
+        "guard": guard if guard and not temp_re.search(guard) else None,
         "unconditional": guard is None,
         "scalars": scalars,
         "memory_writes": memory,
         "reads": reads,
         "calls": list(raw.get("calls") or []),
         "exits": exits,
-        "pointer_walkers": [p for p in raw.get("pointer_walkers") or [] if not _TEMP_RE.fullmatch(p)],
+        "pointer_walkers": [p for p in raw.get("pointer_walkers") or [] if not temp_re.fullmatch(p)],
         "strided_writes": [
             _root_of({"base": b, "base_kind": "local"}, derived)[0] for b in raw.get("strided_writes") or []
         ],
@@ -487,7 +496,7 @@ def _clean_location(loc: str) -> str:
     return loc if len(loc) <= MAX_LOCATION_CHARS else loc[: MAX_LOCATION_CHARS - 1] + "..."
 
 
-def _eva_record(flow: dict | None, flows_status: str) -> dict:
+def _eva_record(flow: dict | None, flows_status: str, temp_re: re.Pattern = _TEMP_RE) -> dict:
     if flows_status != "ok":
         return {"status": "unavailable"}
     if flow is None:
@@ -495,13 +504,13 @@ def _eva_record(flow: dict | None, flows_status: str) -> dict:
     merged: dict[str, dict] = {}
     for write in flow.get("writes") or []:
         loc = _clean_location(write.get("loc") or "")
-        if not loc or _TEMP_RE.fullmatch(loc):
+        if not loc or temp_re.fullmatch(loc):
             continue
         entry = merged.setdefault(loc, {"loc": loc, "from": [], "and_self": False})
         entry["and_self"] = entry["and_self"] or bool(write.get("and_self"))
         for source in write.get("from") or []:
             cleaned = _clean_location(source)
-            if not _TEMP_RE.fullmatch(cleaned) and cleaned not in entry["from"]:
+            if not temp_re.fullmatch(cleaned) and cleaned not in entry["from"]:
                 entry["from"].append(cleaned)
     writes = list(merged.values())
     truncated = len(writes) > MAX_EVA_LOCATIONS
@@ -570,10 +579,13 @@ def _function_record(
     derived = {d.get("local"): d.get("formal") for d in raw.get("derived_pointers") or []}
     span = spans.get(name) if spans is not None else locate_function_span(text, name, is_header=False, path=file)
     src = _source_context(span, file)
-    loops = [_loop_record(loop, derived, src["tokens"]) for loop in raw.get("loops") or []]
+    temps = kernel_ast.temp_names(raw)
+    kernel_temps = sorted(temps) if temps is not None else None
+    temp_re = _temp_pattern(temps)
+    loops = [_loop_record(loop, derived, src["tokens"], temp_re) for loop in raw.get("loops") or []]
     _link_loops(loops)
-    writes = _access_records(raw.get("writes") or [], derived)
-    reads = _access_records(raw.get("reads") or [], derived)
+    writes = _access_records(raw.get("writes") or [], derived, temp_re)
+    reads = _access_records(raw.get("reads") or [], derived, temp_re)
     formals = list(raw.get("formals") or [])
     recursion = _recursion(raw, cycle, by_kernel)
     kernel_name = raw.get("kernel_name") or name
@@ -598,8 +610,8 @@ def _function_record(
     for path in raw.get("return_paths") or []:
         paths.append(
             {
-                "value": _clean_expr(path.get("value")) if path.get("value") else None,
-                "conditions": [c for c in path.get("conditions") or [] if not _TEMP_RE.search(c)],
+                "value": _clean_expr(path.get("value"), temp_re) if path.get("value") else None,
+                "conditions": [c for c in path.get("conditions") or [] if not temp_re.search(c)],
                 "conditions_partial": bool(path.get("conditions_partial")),
                 "in_loop": bool(path.get("in_loop")),
                 "line": kernel_ast.parse_location(path.get("loc"))["line"],
@@ -625,8 +637,9 @@ def _function_record(
         # Local pointers that start from a formal: loop_seeds.py anchors a pointer walker on its root.
         "derived_pointers": {str(k): str(v) for k, v in derived.items() if k and v},
         "return_paths": paths,
-        "eva": _eva_record(by_function.get(kernel_name), str(flows.get("status") or "unavailable")),
+        "eva": _eva_record(by_function.get(kernel_name), str(flows.get("status") or "unavailable"), temp_re),
         "features": _features(raw, loops, calls, formals, src, recursion),
+        "kernel_temps": kernel_temps,
         "truncated": bool(raw.get("truncated")),
     }
     record["frame_skeleton"] = frame_skeleton.compute(record)
@@ -641,15 +654,22 @@ def _link_callers(raw_functions: list[dict], records: dict[str, dict]) -> None:
         loc = kernel_ast.parse_location(raw.get("loc"))
         if work_relative(loc["file"]) is None:
             continue  # a harness is not a caller whose checks a contract can rely on
+        caller_temps = kernel_ast.temp_names(raw)
+        temp_re = _temp_pattern(caller_temps)
         for call in raw.get("calls") or []:
             target = by_kernel.get(call.get("kernel_name"))
             if target is None or call.get("indirect") or raw.get("kernel_name") == call.get("kernel_name"):
                 continue
+            conds = (
+                []
+                if call.get("conditions_partial")
+                else [c for c in call.get("conditions") or [] if not temp_re.search(c)]
+            )
             target["called_by"].append(
                 {
                     "caller": raw.get("name"),
                     "args": list(call.get("args") or []),
-                    "conditions": [] if call.get("conditions_partial") else list(call.get("conditions") or []),
+                    "conditions": conds,
                     "in_loop": bool(call.get("in_loop")),
                 }
             )
@@ -687,6 +707,11 @@ def build_module_facts(
     spans: dict[str, dict[str, Span]] = {}
     for raw in raw_functions:
         loc = kernel_ast.parse_location(raw.get("loc"))
+        if not loc.get("known"):
+            doc.setdefault("warnings", []).append(
+                f"{raw.get('name') or '?'}: kernel location '{raw.get('loc')}' not understood, function left out"
+            )
+            continue
         file = work_relative(loc["file"])
         if file is None:
             continue
@@ -1064,18 +1089,20 @@ def _render_callers(record: dict, lines: list[str]) -> None:
         return
     lines.append("\n**Callers** (what they pass, and what their code has checked by then, in normalized C):")
     name = record.get("name") or "?"
-    shown = list(
-        dict.fromkeys(
-            f"- `{item.get('caller')}`: {_code(_shorten(name + '(' + ', '.join(item.get('args') or []) + ')'))}"
-            + (
-                f" when {_code(_shorten(' && '.join(c for c in item['conditions'] if not _TEMP_RE.search(c))))}"
-                if any(not _TEMP_RE.search(c) for c in item.get("conditions") or [])
-                else ""
-            )
-            + (" (in a loop)" if item.get("in_loop") else "")
-            for item in callers
+    shown = []
+    for item in callers:
+        conds = (
+            item.get("conditions") or []
+            if "in_loop" in item
+            else [c for c in item.get("conditions") or [] if not _TEMP_RE.search(c)]
         )
-    )
+        when_clause = f" when {_code(_shorten(' && '.join(conds)))}" if conds else ""
+        shown.append(
+            f"- `{item.get('caller')}`: {_code(_shorten(name + '(' + ', '.join(item.get('args') or []) + ')'))}"
+            + when_clause
+            + (" (in a loop)" if item.get("in_loop") else "")
+        )
+    shown = list(dict.fromkeys(shown))
     lines.extend(shown[:MAX_SHOWN_CALLERS])
     if len(shown) > MAX_SHOWN_CALLERS:
         lines.append(f"- ... {len(shown) - MAX_SHOWN_CALLERS} more.")

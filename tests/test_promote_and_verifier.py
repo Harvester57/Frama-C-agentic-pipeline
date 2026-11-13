@@ -1422,7 +1422,8 @@ class TestHarnessLegitimacyAndMetadata:
                         ".\tcksum.c\tInCksum\t1\trte: unsigned_downcast\tValid\t(sum >> 16) <= 65535\n",
                         encoding="utf-8",
                     )
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            stdout = "[wp] Proved goals:    1 / 1\n" if "-wp" in cmd and cmd[cmd.index("-wp-model") + 1] != "Typed" else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
         monkeypatch.setattr(wp_mod.subprocess, "run", fake_run)
 

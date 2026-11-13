@@ -2,6 +2,7 @@
   "$comment": "Contract for workspace/reports/security_props.json, written by scripts/security_props.py run (plan step I9): the MetAcsl security properties the threat model requires (L4-L6), the frame obligations (L3), and the ledger obligations per function (`file#name`).",
   "type": "object",
   "definitions": {
+    "function_id": {"$comment": "A function id, `file#name`: the file relative to the target root (any character but `#`), then one symbol name. The name may carry what nm prints for a compiler clone or a versioned symbol (`parse.constprop.0`, `f@@VERS_1`).", "type": "string", "pattern": "^(?:[^#\\s]+|[^#\\s][^#\\r\\n]*\\/[^#/\\s]+)#[A-Za-z_$][A-Za-z0-9_$.@]*$"},
     "class": {"type": "string", "enum": ["l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"]}
   },
   "properties": {
@@ -28,7 +29,7 @@
           "kind": {"type": "string", "enum": ["auth_state", "auth_required", "sanitized", "wiped", "no_leak"]},
           "obligation_class": {"$ref": "#/definitions/class"},
           "acsl": {"$comment": "the meta-property annotation(s), ready to parse", "type": "string", "minLength": 1},
-          "instances": {"$comment": "functions whose WP proof holds the generated annotations: the ledger units", "type": "array", "items": {"type": "string", "pattern": "#"}},
+          "instances": {"$comment": "functions whose WP proof holds the generated annotations: the ledger units", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
           "sources": {"$comment": "files defining the globals the property names, parsed with every WP run that loads it", "type": "array", "items": {"type": "string"}},
           "notes": {"type": "array", "items": {"type": "string"}},
           "targets": {"type": "string"},
@@ -39,7 +40,7 @@
             "items": {
               "type": "object",
               "properties": {
-                "function": {"type": "string", "pattern": "#"},
+                "function": {"$ref": "#/definitions/function_id"},
                 "verdict": {"type": "string", "enum": ["satisfied", "violated"]},
                 "how": {"type": "string", "enum": ["syntactic"]},
                 "reason": {"type": "string", "minLength": 1}
@@ -57,7 +58,7 @@
                 "items": {
                   "type": "object",
                   "properties": {
-                    "function": {"type": "string", "pattern": "#"},
+                    "function": {"$ref": "#/definitions/function_id"},
                     "at": {"type": "string", "enum": ["entry", "return"]},
                     "lvalues": {"type": "string", "minLength": 1}
                   },
@@ -70,7 +71,7 @@
                 "items": {
                   "type": "object",
                   "properties": {
-                    "function": {"type": "string", "pattern": "#"},
+                    "function": {"$ref": "#/definitions/function_id"},
                     "sink": {"type": "string", "minLength": 1},
                     "args": {"$comment": "[pointer argument index, length argument index or null]", "type": "array", "items": {"type": "array"}}
                   },
@@ -105,7 +106,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "properties": {"function": {"type": "string", "pattern": "#"}, "reason": {"type": "string"}},
+        "properties": {"function": {"$ref": "#/definitions/function_id"}, "reason": {"type": "string"}},
         "required": ["function", "reason"],
         "additionalProperties": false
       }
@@ -137,7 +138,7 @@
         "properties": {
           "file": {"type": "string"},
           "line": {"type": "integer"},
-          "function": {"type": "string", "pattern": "#"},
+          "function": {"$ref": "#/definitions/function_id"},
           "property": {"type": "string"}
         },
         "required": ["file", "line", "function", "property"],
@@ -159,7 +160,7 @@
             "properties": {
               "file": {"type": "string"},
               "line": {"type": "integer"},
-              "function": {"type": "string", "pattern": "#"},
+              "function": {"$ref": "#/definitions/function_id"},
               "property": {"type": "string"}
             },
             "required": ["file", "line", "function", "property"],

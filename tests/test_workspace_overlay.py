@@ -302,7 +302,8 @@ def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypat
             rows.append(f".\tmacro_test.c\tcaller\t{i + 4}\tassert\tPartially proven\tg{i}")
         csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
         stdout = (
-            "[wp] macro_test.c:3: Warning: Missing assigns clause (assigns 'everything' instead)\n"
+            "[wp] macro_test.c:3: Warning:\n"
+            "  Missing assigns clause (assigns 'everything' instead)\n"
             f"[wp] Proved goals:   {37 if is_tail else 36} / 37\n"
             f"[wp]   Timeout:           {0 if is_tail else 1}\n"
         )

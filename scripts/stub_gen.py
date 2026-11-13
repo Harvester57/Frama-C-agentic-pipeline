@@ -58,7 +58,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from acsl_ast import AcslError, has_function_contract, locate_all_definition_spans  # noqa: E402
+from c_definitions import return_type_tokens, returns_void  # noqa: E402
 from framac_common import STUB_OVERLAY_REL, STUB_REPORT_REL, atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from kernel_ast import parse_location  # noqa: E402
+from patterns import ASSIGNS_RE  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "workspace/reports/phase0_model.json"
@@ -71,12 +74,12 @@ BLOCK_MARK_RE = re.compile(r"^/\* fc-stub: ([A-Za-z_]\w*) \*/[ \t]*$", re.MULTIL
 # System include directories gcc searches by default (scripts/target_env.py), longest first.
 DEFAULT_SYSTEM_DIRS = ("/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include")
 _SNAPSHOT_ROOT_RE = re.compile(r"^(?P<root>.*?/workspace/snapshot/root)(?P<path>/.+)$")
-_LOC_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+)(?:-\d+)?(?::\d+(?:-\d+)?)?$")
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 _INCLUDE_DIR_OPTIONS = ("-isystem", "-idirafter", "-iquote", "-I")
 _LENGTH_NAME_RE = re.compile(r"(?:^|_)(?:n|len|length|size|sz|cap|capacity|count|nbytes|bytes|max|maxlen)$|len$|size$")
 _ARRAY_PARAM_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]")
-_ASSIGNS_RE = re.compile(r"(?<![A-Za-z0-9_])assigns\b")
+# The `assigns` keyword of a contract (not `no_assigns`): scripts/libc_gap_report.py imports this one.
+_ASSIGNS_RE = ASSIGNS_RE
 
 KINDS = ("host_header", "project_header", "libc", "pipeline_stub", "overlay", "undeclared", "unknown")
 ACTIVE_STATES = ("incomplete", "filled", "manual")
@@ -105,8 +108,9 @@ def overlay_digest(overlay: Path) -> str | None:
 
 
 def decl_file(decl: str) -> str:
-    m = _LOC_RE.match((decl or "").strip())
-    return m.group("file") if m else (decl or "").strip()
+    """The file of a declaration's location as Frama-C printed it; the text itself when it is not a location."""
+    loc = parse_location(decl)
+    return loc["file"] if loc["known"] else (decl or "").strip()
 
 
 def classify(info: dict | None) -> tuple[str, str]:
@@ -236,11 +240,10 @@ def skeleton_contract(proto: str, formals: list[dict]) -> list[str]:
         else:
             assigns.append(f"*{name}")
             notes.append(f"{name}: written through; one object (*{name}) or a range? may it be NULL?")
-    ret = proto.split("(", 1)[0]
-    returns = not re.match(r"^\s*(?:extern\s+)?(?:static\s+)?void\s+[A-Za-z_]\w*\s*$", ret)
-    if returns:
+    # A prototype c_definitions.returns_void cannot read (None) keeps `\result`: the author sees it.
+    if not returns_void(proto):
         assigns.append("\\result")
-        if "*" in ret:
+        if "*" in (return_type_tokens(proto) or proto.split("(", 1)[0]):
             notes.append("result: a pointer; may it be NULL? what does it point to (a ghost pool, an argument)?")
     frame = ", ".join(assigns) if assigns else "\\nothing"
     from_part = f" \\from {', '.join(n for n in names if n)}" if assigns == ["\\result"] and any(names) else ""

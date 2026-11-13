@@ -300,7 +300,7 @@ def validate_snapshot_manifest(data, run_dir: Path | None = None) -> Errors:
     if not isinstance(data.get("run_id"), str) or not data.get("run_id"):
         errors.add("$.run_id: must be a non-empty string")
     manifest_sha = data.get("manifest_sha256")
-    if not isinstance(manifest_sha, str) or not _HEX64_RE.match(manifest_sha):
+    if not isinstance(manifest_sha, str) or not _HEX64_RE.fullmatch(manifest_sha):
         errors.add("$.manifest_sha256: must be a 64-character lowercase hex sha256")
     files = data.get("files")
     if not isinstance(files, dict):
@@ -314,7 +314,7 @@ def validate_snapshot_manifest(data, run_dir: Path | None = None) -> Errors:
             continue
         sha = info.get("sha256")
         size = info.get("size")
-        if not isinstance(sha, str) or not _HEX64_RE.match(sha):
+        if not isinstance(sha, str) or not _HEX64_RE.fullmatch(sha):
             errors.add(f"{where}.sha256: must be a 64-character lowercase hex sha256")
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             errors.add(f"{where}.size: must be a non-negative integer")
@@ -328,7 +328,7 @@ def validate_snapshot_manifest(data, run_dir: Path | None = None) -> Errors:
                     errors.add(f"{where}.size: file size changed (expected {size}, got {len(blob)})")
                 if isinstance(sha, str) and hashlib.sha256(blob).hexdigest() != sha:
                     errors.add(f"{where}.sha256: file digest changed after snapshot: {rel}")
-    if isinstance(manifest_sha, str) and _HEX64_RE.match(manifest_sha):
+    if isinstance(manifest_sha, str) and _HEX64_RE.fullmatch(manifest_sha):
         computed = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if computed != manifest_sha:
             errors.add("$.manifest_sha256: does not match canonical digest of $.files")
@@ -449,7 +449,6 @@ def validate_phase0_gates(data: Any) -> Errors:
 # match its schema, and records the problems in its `warnings` with this prefix (schema_warning);
 # `run-dir` fails on such a warning as on a schema error found now.
 SCHEMA_WARNING_PREFIX = "schema: "
-_RECORDED_SCHEMA_RE = re.compile(r"^schema:|does not match its schema")
 
 
 def schema_problems(name: str, data: Any) -> list[str]:
@@ -471,7 +470,7 @@ def recorded_schema_warnings(data: Any) -> list[str]:
     warnings = data.get("warnings") if isinstance(data, dict) else None
     if not isinstance(warnings, list):
         return []
-    return [w for w in warnings if isinstance(w, str) and _RECORDED_SCHEMA_RE.search(w)]
+    return [w for w in warnings if isinstance(w, str) and (w.startswith("schema:") or "does not match its schema" in w)]
 
 
 def _schema_check(name: str, data: Any) -> Errors:

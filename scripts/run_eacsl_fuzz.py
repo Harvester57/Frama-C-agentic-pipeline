@@ -204,15 +204,16 @@ ARTIFACT_KINDS = (
 #           rte/index_bound:
 #               i < 8.
 #           With values at failure point:
-_FN_RE = re.compile(r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+(?:\.[chi]|\.acsl)):\s*In function '(?P<function>[^']+)'")
+_FN_RE = re.compile(r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+):\s*In function '(?P<function>[^']+)'")
 _ERR_RE = re.compile(
-    r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+(?:\.[chi]|\.acsl)):(?P<line>\d+):\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?",
+    r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+):(?P<line>\d+)(?::\d+)?:\s*Error:\s*(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed:?",
     re.IGNORECASE,
 )
 # Older style: "Assertion failed at line 42 in file foo.c." / "... in function parse."
 _OLD_RE = re.compile(
     r"(?P<kind>[A-Za-z][A-Za-z _-]*?)\s+failed at line (?P<line>\d+)"
-    r"(?:\s+in\s+file\s+(?P<file>[^\s]+?(?:\.[chi]|\.acsl)))?(?:\s+in\s+function\s+(?P<function>\w+))?",
+    r"(?:\s+in\s+file\s+(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+?)(?:\.?(?=\s+in\s+function)|\.(?=\s|$)|(?=\s|$)))?"
+    r"(?:\s+in\s+function\s+(?P<function>\w+))?",
     re.IGNORECASE,
 )
 _PRED_HEAD_RE = re.compile(r"The failing predicate is:[ \t]*", re.IGNORECASE)
@@ -251,7 +252,7 @@ def is_runtime_function(name: str | None, file_: str | None = None) -> bool:
 # UBSan format:
 #   SyncMem.c:819:9: runtime error: index 1025 out of bounds for type 'char[1024]'
 _UBSAN_RE = re.compile(
-    r"(?P<file>[^\s:'\"]+\.[ch]):(?P<line>\d+)(?::\d+)?:\s*runtime error:\s*(?P<pred>[^\n]+)",
+    r"(?P<file>(?:[A-Za-z]:)?[^\s:'\"]+):(?P<line>\d+)(?::\d+)?:\s*runtime error:\s*(?P<pred>[^\n]+)",
     re.IGNORECASE,
 )
 # A runtime value in a UBSan message: an integer, a hex address, a float. Not inside a quoted type.
@@ -271,17 +272,22 @@ def stable_ubsan_message(message: str) -> str:
 # ASan header:
 #   ==123==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x...
 _ASAN_ERR_RE = re.compile(
-    r"ERROR:\s*AddressSanitizer:\s*(?P<kind>[A-Za-z0-9_-]+)",
+    r"ERROR:\s*AddressSanitizer:\s*(?P<kind>"
+    r"attempting double-free"
+    r"|attempting free on address which was not malloc\(\)-ed"
+    r"|requested allocation size"
+    r"|[A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
 _ASAN_OP_RE = re.compile(
-    r"^(?P<op>(?:READ|WRITE)\s+of\s+size\s+\d+)",
+    r"^(?P<op>READ|WRITE)(?:\s+of\s+size\s+\d+)?",
     re.MULTILINE,
 )
 # Sanitizer stack frame:
 #   #0 0x555555 in UpdateSyncMem /path/to/SyncMem.c:827:5
 _STACK_FRAME_RE = re.compile(
-    r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<file>[^\s():]+\.[ch]):(?P<line>\d+)"
+    r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s+(?P<file>(?:[A-Za-z]:)?[^\s():]+):(?P<line>\d+)(?::\d+)?)?"
 )
 
 
@@ -301,7 +307,7 @@ def _map_sanitizer_alarm_kind(kind_or_msg: str) -> str:
         return "separation"
     if "use-after-free" in low or "use-after-scope" in low or "use-after-return" in low:
         return "dangling_pointer"
-    if "bad-free" in low or "attempting free" in low:
+    if "bad-free" in low or "attempting free" in low or "double-free" in low:
         return "freeable"
     if "bool" in low:
         return "bool_value"
@@ -432,9 +438,9 @@ def _parse_segment_failure(text: str) -> dict | None:
     file_, line_, function = "unknown", 0, "unknown_function"
     for m in _STACK_FRAME_RE.finditer(text):
         fn, fpath = m.group("function"), m.group("file")
-        if is_runtime_function(fn, fpath) or Path(fpath).name.startswith("harness_") or is_harness_fuzz_function(fn):
+        if is_runtime_function(fn, fpath) or (fpath and Path(fpath).name.startswith("harness_")) or is_harness_fuzz_function(fn):
             continue
-        file_, line_, function = fpath, int(m.group("line")), fn
+        file_, line_, function = fpath or "unknown", int(m.group("line")) if m.group("line") else 0, fn
         break
     if function == "unknown_function" and reported_fn and not is_runtime_function(reported_fn):
         function = reported_fn
@@ -487,7 +493,7 @@ def parse_eacsl_failure(text: str) -> dict | None:
     hit = err or old
     if not hit:
         return _parse_segment_failure(text)
-    file_ = hit.group("file") or ""
+    file_ = (hit.group("file") or "").rstrip(".")
     line_ = int(hit.group("line"))
     function = hit.groupdict().get("function") or ""
     if not function:
@@ -532,7 +538,7 @@ def parse_sanitizer_failure(text: str) -> dict | None:
     non_harness_frames = [
         m
         for m in frames
-        if not Path(m.group("file")).name.startswith("harness_")
+        if (not m.group("file") or not Path(m.group("file")).name.startswith("harness_"))
         and not m.group("function").startswith(
             ("__interceptor_", "__asan_", "LLVMFuzzerTestOneInput", TARGET_EMBEDDED_PREFIX)
         )
@@ -547,7 +553,9 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         pred = ub.group("pred").strip().rstrip(".")
         fn = "unknown_function"
         for m in frames:
-            if Path(m.group("file")).name == Path(file_).name and int(m.group("line")) == line_:
+            f = m.group("file")
+            line_str = m.group("line")
+            if f and line_str and Path(f).name == Path(file_).name and int(line_str) == line_:
                 fn = m.group("function")
                 break
         if fn == "unknown_function" and best_frame is not None:
@@ -573,17 +581,18 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         op_m = _ASAN_OP_RE.search(text, asan.end())
         op_txt = f" ({op_m.group('op')})" if op_m else ""
         alarm = _map_sanitizer_alarm_kind(asan_kind)
-        file_ = best_frame.group("file") if best_frame else "unknown"
-        line_ = int(best_frame.group("line")) if best_frame else 0
+        file_ = (best_frame.group("file") if best_frame and best_frame.group("file") else "") or "unknown"
+        line_ = int(best_frame.group("line")) if best_frame and best_frame.group("line") else 0
         fn = best_frame.group("function") if best_frame else "unknown_function"
         if fn == "unknown_function" and file_ != "unknown" and line_ > 0:
             fn = _resolve_function_at_line(file_, line_)
         pred = f"AddressSanitizer: {asan_kind}{op_txt}"
+        kind_slug = re.sub(r"[^a-z0-9_]+", "_", asan_kind.lower()).strip("_")
         return {
             "file": file_,
             "line": line_,
             "function": fn,
-            "kind": "asan_" + asan_kind.lower().replace("-", "_"),
+            "kind": "asan_" + kind_slug,
             "alarm_kind": alarm,
             "is_rte": True,
             "predicate": f"rte: {alarm}: {pred}",
@@ -1356,6 +1365,21 @@ def dispatch_case_count(sources: list[str]) -> int | None:
     before the macro existed.
     """
     for src in sources:
+        sidecar_path = Path(src).with_suffix(".json")
+        if not sidecar_path.is_file():
+            sidecar_path = Path(src).parent / f"harness_{Path(src).stem.removeprefix('harness_')}.json"
+        if sidecar_path.is_file():
+            try:
+                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                cnt = sidecar.get("dispatch_case_count")
+                if cnt is not None:
+                    return int(cnt)
+                if sidecar.get("api_cases") is not None:
+                    return len(sidecar["api_cases"])
+                if sidecar.get("dispatch_cases") is not None:
+                    return len(sidecar["dispatch_cases"])
+            except (OSError, ValueError):
+                pass
         try:
             text = Path(src).read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -2351,6 +2375,10 @@ def corpus_selection_fields(total: int, replayed: int, sampled: bool) -> dict:
 # The crash a replay stopped on: a sanitizer's error headline or libFuzzer's own (deadly signal, ...).
 _REPLAY_CRASH_RE = re.compile(r"^(?:==\d+==\s*)?ERROR:\s*(?:\w+Sanitizer|libFuzzer):.*$", re.MULTILINE)
 _SANITIZER_SUMMARY_RE = re.compile(r"^SUMMARY:\s*(?P<summary>\S.*)$", re.MULTILINE)
+# The function of a stack frame, whatever follows it. `_STACK_FRAME_RE` also wants a `.c`/`.h` file and a
+# line, so it skips a frame in `gram.y`, in `tables.inc`, or with no line information; deciding that a crash
+# is outside the checked functions must see those frames too.
+_STACK_FRAME_FN_RE = re.compile(r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 # How many replayed inputs a guardrail drops for crashing outside the checked functions before it gives up.
 GUARDRAIL_MAX_EXCLUDED_INPUTS = 8
 
@@ -2371,7 +2399,7 @@ def crash_outside_checked_functions(output: str, functions: list[str] | None) ->
     headline = _REPLAY_CRASH_RE.search(output or "")
     if headline is None or re.search(r"timeout|out-of-memory", headline.group(0), re.IGNORECASE):
         return None
-    frames = [m.group("function") for m in _STACK_FRAME_RE.finditer(output, headline.start())]
+    frames = [m.group("function") for m in _STACK_FRAME_FN_RE.finditer(output, headline.start())]
     if not frames:
         return None
     checked = set(functions) | {f"__gen_e_acsl_{fn}" for fn in functions}
@@ -2787,7 +2815,10 @@ def selftest_blocks_eacsl(selftest_json: Path | None, runner=subprocess.run) -> 
     return f"eacsl_selftest_failed: {', '.join(failed) or 'unknown'}"
 
 
-_UNDEFINED_REF_RE = re.compile(r"undefined reference to [`'](?P<sym>[A-Za-z_]\w*)'")
+_UNDEFINED_REF_RE = re.compile(
+    r"(?:undefined reference to [`'\"]|undefined symbol:\s*[`'\"]?)(?P<sym>[A-Za-z_]\w*)",
+    re.IGNORECASE,
+)
 
 
 def parse_undefined_references(log: str) -> list[str]:
@@ -2845,12 +2876,196 @@ def _normalize_dag_source(file: str, run_dir: Path) -> str:
     return f"workspace/work/{src}"
 
 
+LINK_GLOBALS_FILE = "link_globals.c"
+LINK_GLOBALS_ASSUMPTION = "starts zero-initialized, as in a fresh process"
+
+_GLOBAL_TYPE_CHARS_RE = re.compile(r"^[\w\s*\[\](),.]+$")
+_GLOBAL_TAG_RE = re.compile(r"\b(struct|union)\s+([A-Za-z_]\w*)")
+# The declarator slot of a pointer to function or to array, as Frama-C prints it: `(*)`, `(*[4])`.
+_GLOBAL_POINTER_SLOT_RE = re.compile(r"\(\s*(\*+)\s*((?:\[\d+\])*)\s*\)")
+_GLOBAL_ARRAY_RE = re.compile(r"^(?P<base>[^\[\]]*?)\s*(?P<dims>(?:\[\d+\]\s*)*)$")
+
+
+def _model_global_variables(dag_path: Path) -> dict[str, list[dict]]:
+    """
+    Name -> records of the global variables the project defines with external linkage, from the
+    Phase 0 model next to the DAG (workspace/reports/phase0_model.json, `global_variables`: name,
+    file, type, units). The DAG does not carry them. Empty without a model, and for the units on
+    the GCC fallback, whose globals the model does not list.
+    """
+    model = load_json_optional(Path(dag_path).parent / "phase0_model.json", None)
+    records = model.get("global_variables") if isinstance(model, dict) else None
+    out: dict[str, list[dict]] = {}
+    for key, rec in sorted(records.items()) if isinstance(records, dict) else []:
+        if not isinstance(rec, dict) or rec.get("static"):
+            continue
+        name = str(rec.get("name") or str(key).split("#")[-1])
+        file = rec.get("file") or (str(key).rpartition("#")[0] if "#" in str(key) else "")
+        if name and file:
+            units = [str(u) for u in rec.get("units") or []] if isinstance(rec.get("units"), list) else []
+            out.setdefault(name, []).append(
+                {"name": name, "file": str(file), "type": str(rec.get("type") or ""), "units": units}
+            )
+    return out
+
+
+def global_definition_text(name: str, type_text: str) -> tuple[str | None, str]:
+    """
+    The C definition of global `name` from the type text the model records (Frama-C's printing,
+    typedefs unrolled, qualifiers dropped: `int`, `unsigned char [16]`, `struct conn *`,
+    `void (*)(int )`), as (definition, "") or (None, reason). No initializer: an object of static
+    storage starts zero-initialized. A type that needs a definition the generated file does not
+    have (a struct or union held by value, an enum) is not usable.
+    """
+    text = " ".join(str(type_text or "").split())
+    if not text:
+        return None, "the model records no type for it"
+    if not _GLOBAL_TYPE_CHARS_RE.match(text):
+        return None, f"its type `{text}` is not a plain C type"
+    if re.search(r"\benum\b", text):
+        return None, f"its type `{text}` needs an enum definition the generated file does not have"
+    if any(tag.startswith("__anon") for _kw, tag in _GLOBAL_TAG_RE.findall(text)):
+        return None, f"its type `{text}` names an anonymous struct or union"
+    slot = _GLOBAL_POINTER_SLOT_RE.search(text)
+    if slot:
+        return f"{text[: slot.start()]}({slot.group(1)}{name}{slot.group(2)}){text[slot.end() :]};", ""
+    m = _GLOBAL_ARRAY_RE.match(text)
+    if not m or "(" in text:
+        return None, f"its type `{text}` is not one the generated file can declare"
+    base, dims = m.group("base").strip(), "".join(m.group("dims").split())
+    if not base:
+        return None, f"its type `{text}` is not one the generated file can declare"
+    if _GLOBAL_TAG_RE.search(base) and "*" not in base:
+        return None, f"its type `{text}` is held by value and needs a definition the generated file does not have"
+    return f"{base}{'' if base.endswith('*') else ' '}{name}{dims};", ""
+
+
+def _declaring_header(name: str, run_dir: Path) -> tuple[Path, str] | None:
+    """
+    The project header (workspace/work) with an `extern` declaration of global `name`, shortest path
+    first, and the definition to write after including it: the declaration itself without `extern`,
+    so with its qualifiers and typedef names (`extern volatile int G;` gives `volatile int G;`).
+    `__typeof__(G) G;` would not do: Frama-C 35 drops a top-level `volatile` there and then refuses
+    the definition (`different qualifiers`). It is used only for a declaration of several variables,
+    whose text would define the others too.
+    """
+    work = Path(run_dir) / "workspace/work"
+    if not work.is_dir():
+        return None
+    decl = re.compile(rf"^[ \t]*extern\b([^;{{}}()]*\b{re.escape(name)}\b\s*(?:\[[^;]*\]\s*)*);", re.MULTILINE)
+    for header in sorted(work.rglob("*.h"), key=lambda p: (len(p.parts), p.as_posix())):
+        try:
+            text = header.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = decl.search(text) if name in text else None
+        if m:
+            own = " ".join(m.group(1).split())
+            return header, (f"__typeof__({name}) {name};" if "," in own else f"{own};")
+    return None
+
+
+def link_globals_source(stubs: list[dict]) -> str:
+    """The generated definitions file for the globals link repair stands in for (`stubbed_globals`)."""
+    includes = dict.fromkeys(f'#include "{s["include"]}"' for s in stubs if s.get("include"))
+    tags = dict.fromkeys(
+        f"{kw} {tag};" for s in stubs if not s.get("include") for kw, tag in _GLOBAL_TAG_RE.findall(s["type"])
+    )
+    lines = [
+        "/* Generated by run_eacsl_fuzz.py (link repair): global variables another link unit defines.",
+        " * Linking that unit's file could bring a whole program (its main); each global is defined",
+        f" * here instead and {LINK_GLOBALS_ASSUMPTION}. */",
+        *includes,
+        *tags,
+    ]
+    for s in stubs:
+        lines.append(f"/* {s['name']}: defined in {s['file']} ({', '.join(s['units']) or 'unit not recorded'}) */")
+        lines.append(s["definition"])
+    return "\n".join(lines) + "\n"
+
+
+def _dag_tree_path(path: str) -> str:
+    p = str(path).replace("\\", "/")
+    for prefix in ("/framac-run/", "/target/", "./"):
+        if p.startswith(prefix):
+            p = p[len(prefix) :]
+    return p[len("workspace/work/") :] if p.startswith("workspace/work/") else p
+
+
+def _link_unit_context(dag_path: Path, module: str | None) -> dict:
+    """
+    What placing a global needs from the DAG: the link unit record of harness module `module`
+    (`unit`: None without link units, without a module, or for a module the DAG and the sidecars
+    do not place, as `ModuleMap.unit_of` answers), that unit's sources (`unit_files`: its own and
+    those of the project libraries it links) and the files defining a `main` (`main_files`).
+    """
+    from module_map import ModuleMap, load_sidecars
+
+    dag = load_json_optional(Path(dag_path), None)
+    mm = ModuleMap(dag if isinstance(dag, dict) else None, load_sidecars(Path(dag_path).parent.parent / "harnesses"))
+    unit: dict | None = None
+    if module and mm.units_are_link_units:
+        rec = mm.modules.get(mm.unit_of(module))
+        unit = rec if isinstance(rec, dict) else None
+    files = [*((unit or {}).get("files") or []), *((unit or {}).get("required_sources") or [])]
+    return {
+        "unit": unit,
+        "unit_files": {_dag_tree_path(f) for f in files if isinstance(f, str)},
+        "main_files": {
+            _dag_tree_path(str(r.get("file") or ""))
+            for k, r in mm.functions.items()
+            if isinstance(r, dict) and (r.get("name") or str(k).split("#")[-1]) == "main"
+        },
+    }
+
+
+def _place_global(records: list[dict], ctx: dict) -> tuple[str, dict, str]:
+    """
+    Where an undefined global comes from, as (action, record, reason):
+
+    - `add`: link its defining file, as for a function. Its file belongs to the module's link
+      unit; or the unit is not known and the file defines no `main`.
+    - `stub`: another link unit defines it. Its file is not linked (it may hold that unit's
+      `main`); the generated definitions file defines it instead.
+    - `unresolved`: the unit is not known and the file defines a `main`.
+    """
+    unit = ctx["unit"]
+    if unit is None:
+        for rec in records:
+            if _dag_tree_path(rec["file"]) not in ctx["main_files"]:
+                return "add", rec, ""
+        return "unresolved", records[0], "its file defines a main and the module's link unit is not known"
+    for rec in records:
+        if unit.get("unit") in rec["units"] or _dag_tree_path(rec["file"]) in ctx["unit_files"]:
+            return "add", rec, ""
+    return "stub", records[0], ""
+
+
 def repair_sources_for_link(
-    sources: list[str], log: str, dag_path: Path | str | None, run_dir: Path | str
+    sources: list[str],
+    log: str,
+    dag_path: Path | str | None,
+    run_dir: Path | str,
+    *,
+    module: str | None = None,
+    stub_dir: Path | None = None,
+    stubbed: list[dict] | None = None,
+    unresolved: list[dict] | None = None,
 ) -> tuple[list[str], dict]:
     """
     One link-repair round: map `undefined reference to 'X'` symbols to their
     defining sources via the DAG and append the missing files. Returns (sources, info).
+
+    A symbol that is no function of the DAG is looked up among the model's global variables
+    (`_model_global_variables`). One defined in the link unit of harness module `module` adds
+    its file like a function. One defined in another link unit is defined, zero-initialized, in
+    the generated `stub_dir`/link_globals.c (rewritten with those of the earlier rounds,
+    `stubbed`), which joins the sources: with the type of its `extern` declaration in a project
+    header the file includes (`declared_in`, `include`: the declaration keeps the qualifiers), else,
+    when no header declares it, from the model's type text (`global_definition_text`). `info["stubbed_globals"]` lists
+    the new ones (name, type, file, units, definition, assumption). The globals left undefined
+    are appended to `unresolved` (name, file, units, reason), not to `info`, which stays empty
+    for a round that repaired nothing.
     """
     syms = parse_undefined_references(log)
     if not syms or not dag_path:
@@ -2859,18 +3074,58 @@ def repair_sources_for_link(
     have = {s.replace("\\", "/") for s in sources}
     added: list[str] = []
     resolved: list[str] = []
+    new_stubs: list[dict] = []
+    known_stubs = {s["name"] for s in stubbed or []}
+    global_vars: dict[str, list[dict]] | None = None
+    ctx: dict = {}
     for sym in syms:
         f = sym_files.get(sym)
         if not f:
-            continue
+            if global_vars is None:
+                global_vars = _model_global_variables(Path(dag_path))
+            if sym not in global_vars or sym in known_stubs:
+                continue
+            ctx = ctx or _link_unit_context(Path(dag_path), module)
+            action, rec, reason = _place_global(global_vars[sym], ctx)
+            if action == "stub" and stub_dir is None:
+                action, reason = "unresolved", "another link unit defines it and no build directory was given"
+            elif action == "stub" and stub_dir is not None:
+                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION}
+                # The header that declares it comes first: it has the types and the qualifiers the
+                # model's type text drops. A plain `int G;` next to another stub's header declaring
+                # `extern volatile int G;` does not compile (checked with clang 19 and Frama-C 35).
+                declared = _declaring_header(sym, Path(run_dir))
+                header = declared[0] if declared else None
+                definition, reason = (declared[1], "") if declared else global_definition_text(sym, rec["type"])
+                if header is not None:
+                    stub["declared_in"] = header.relative_to(Path(run_dir)).as_posix()
+                    stub["include"] = Path(os.path.relpath(header.resolve(), stub_dir.resolve())).as_posix()
+                if definition is None:
+                    action, reason = "unresolved", f"{reason}, and no header of the project declares it"
+                else:
+                    new_stubs.append({**stub, "definition": definition})
+                    resolved.append(sym)
+                    continue
+            if action == "unresolved":
+                if unresolved is not None:
+                    unresolved.append({"name": sym, "file": rec["file"], "units": rec["units"], "reason": reason})
+                continue
+            f = rec["file"]
         norm = _normalize_dag_source(f, Path(run_dir))
         if norm not in have:
             have.add(norm)
             added.append(norm)
             resolved.append(sym)
-    if not added:
-        return list(sources), {}
-    return [*sources, *added], {"symbols": resolved, "added_sources": added}
+    if new_stubs and stub_dir is not None:
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub_file = stub_dir / LINK_GLOBALS_FILE
+        stub_file.write_text(link_globals_source([*(stubbed or []), *new_stubs]), encoding="utf-8", newline="\n")
+        if stub_file.as_posix() not in have:
+            added.append(stub_file.as_posix())
+    info: dict = {"symbols": resolved, "added_sources": added} if added or new_stubs else {}
+    if new_stubs:
+        info["stubbed_globals"] = new_stubs
+    return [*sources, *added], info
 
 
 def build_module_binary(
@@ -2889,6 +3144,7 @@ def build_module_binary(
     rte_initialized: bool = True,
     use_cache: bool = True,
     dag_path: Path | str | None = None,
+    link_module: str | None = None,
 ) -> dict:
     """
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
@@ -2897,8 +3153,14 @@ def build_module_binary(
     On a link failure with undefined references, repair rounds append the defining sources (via
     `dag_path`) and relink while a round adds a file: linking takes whole files, so a file added
     for one symbol can need still more files. The rounds are bounded by the number of files the
-    DAG names and recorded under `link_repair` (`symbols` and `added_sources` over all rounds,
-    `rounds` one entry each).
+    DAG names plus the globals the model lists, and recorded under `link_repair` (`symbols` and
+    `added_sources` over all rounds, `rounds` one entry each).
+    An undefined global variable is repaired from the model (`repair_sources_for_link`): its file
+    when the link unit of harness module `link_module` defines it, else a zero-initialized
+    definition in the generated `<out_bin>_link_globals/link_globals.c`, recorded under
+    `link_repair` as `stubbed_globals` (name, type, file, units, definition, assumption) with
+    `globals_file`: an assumption of the build, to show in the report. `unresolved_globals`
+    (name, file, units, reason) lists the globals no rule could define.
     Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt, sources}, where
     `sources` is what was compiled last (the input plus any repair).
     """
@@ -2937,14 +3199,31 @@ def build_module_binary(
     current = list(sources)
     comp, eacsl_attempt, fallback_reason = _attempt(current)
     rounds: list[dict] = []
+    stub_dir = Path(out_bin).parent / f"{Path(out_bin).name}_link_globals"
+    stubbed: list[dict] = []
+    left: list[dict] = []
     if comp["returncode"] != 0 and dag_path:
-        # Each round adds at least one file the DAG names, so this many rounds always suffice.
-        max_rounds = max(1, len(set(_dag_symbol_files(Path(dag_path)).values())))
+        # Each round adds at least one file the DAG names or defines one global of the model, so
+        # this many rounds always suffice.
+        max_rounds = max(
+            1,
+            len(set(_dag_symbol_files(Path(dag_path)).values())) + len(_model_global_variables(Path(dag_path))),
+        )
         while comp["returncode"] != 0 and len(rounds) < max_rounds:
             log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
-            current, info = repair_sources_for_link(current, log, dag_path, Path.cwd())
+            current, info = repair_sources_for_link(
+                current,
+                log,
+                dag_path,
+                Path.cwd(),
+                module=link_module,
+                stub_dir=stub_dir,
+                stubbed=stubbed,
+                unresolved=left,
+            )
             if not info:
                 break
+            stubbed += info.get("stubbed_globals", [])
             rounds.append(info)
             comp, eacsl_attempt, fallback_reason = _attempt(current)
     result = {
@@ -2954,12 +3233,18 @@ def build_module_binary(
         "eacsl_compile_attempt": eacsl_attempt,
         "sources": current,
     }
-    if rounds:
+    unresolved_globals = list({u["name"]: u for u in left}.values())
+    if rounds or unresolved_globals:
         result["link_repair"] = {
             "symbols": [sym for r in rounds for sym in r["symbols"]],
             "added_sources": [src for r in rounds for src in r["added_sources"]],
             "rounds": rounds,
         }
+        if stubbed:
+            result["link_repair"]["stubbed_globals"] = stubbed
+            result["link_repair"]["globals_file"] = (stub_dir / LINK_GLOBALS_FILE).as_posix()
+        if unresolved_globals:
+            result["link_repair"]["unresolved_globals"] = unresolved_globals
     return result
 
 
@@ -4197,6 +4482,7 @@ def _build_options(args) -> dict:
         "rte_initialized": not args.no_rte_initialized,
         "use_cache": not getattr(args, "no_cache", False),
         "dag_path": dag,
+        "link_module": getattr(args, "module", "") or None,
     }
 
 

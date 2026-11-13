@@ -44,6 +44,7 @@ from benchmark_compare import SCHEMA_VERSION, Tolerances, compare_runs, load_run
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
 from minischema import Validator, load_schema  # noqa: E402
 from mutation_check import summarize_mutation  # noqa: E402
+from patterns import KERNEL_RENAME_RE  # noqa: E402
 from resources import FUZZ_RSS_LIMIT_MB, WP_MEMLIMIT_MB  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -76,8 +77,18 @@ NOT_REACHED_RESULTS = frozenset({"eva_dead", "eva_no_properties"})
 
 _EVA_FUNCTIONS_RE = re.compile(r"(\d+) functions? analyzed \(out of (\d+)\)")
 _EVA_STATEMENTS_RE = re.compile(r"(\d+) statements? reached \(out of (\d+)\)")
-_RENAMED_STATIC_RE = re.compile(r"(.+)_\d+")
-_HOST_PATH_RE = re.compile(r"(?:[A-Za-z]:\\|/Users/|/home/)")
+_RENAMED_STATIC_RE = KERNEL_RENAME_RE
+_HOST_PATH_RE = re.compile(
+    r"(?:"
+    r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]|"
+    r"\\\\[A-Za-z0-9_.$~-]+[\\/]|"
+    r"(?<![.\w\\])\\[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+|"
+    r"(?<![:\w])//[A-Za-z0-9_.$~-]+/[A-Za-z0-9_.-]+|"
+    r"file://(?!/framac-run(?:/|$))|"
+    r"/framac-run/\.\.|"
+    r"(?<![.\w/:])/(?!framac-run(?:/|$))[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
+    r")"
+)
 
 
 class BenchmarkError(RuntimeError):
@@ -1832,6 +1843,7 @@ def assert_no_host_paths(value: Any, where: str = "$") -> None:
     """A run file may be committed as a baseline: it must not carry a home directory or machine layout."""
     if isinstance(value, dict):
         for key, item in value.items():
+            assert_no_host_paths(key, f"{where}.(key)")
             assert_no_host_paths(item, f"{where}.{key}")
     elif isinstance(value, list):
         for idx, item in enumerate(value):
@@ -1843,7 +1855,10 @@ def assert_no_host_paths(value: Any, where: str = "$") -> None:
 def scrub_host_paths(value: Any, replacements: list[tuple[str, str]]) -> Any:
     """Replace host path prefixes that tools echo into error text."""
     if isinstance(value, dict):
-        return {k: scrub_host_paths(v, replacements) for k, v in value.items()}
+        return {
+            (scrub_host_paths(k, replacements) if isinstance(k, str) else k): scrub_host_paths(v, replacements)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [scrub_host_paths(v, replacements) for v in value]
     if isinstance(value, str):

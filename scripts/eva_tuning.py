@@ -166,6 +166,11 @@ def parse_eva_reachability(
             entry_reached = True
 
     estimate = coverage.get("coverage_estimate_pct")
+    if estimate is None and coverage.get("statements_total"):
+        # No "Coverage estimation" line (wording or version): gate on the statements reached inside the
+        # analyzed functions instead of skipping the gate. That ratio is an upper bound of Eva's estimate,
+        # so it is used here only and not recorded as `coverage_estimate_pct`.
+        estimate = 100.0 * coverage["statements_reached"] / coverage["statements_total"]
     if entry_reached is False:
         reachability = "entry_unreached"
     elif estimate is not None and estimate < min_coverage_pct:

@@ -2,6 +2,7 @@
   "$comment": "The structured block of a target's THREAT_MODEL.md (plan step I7): a fenced code block whose info string is `framac-threat-model` (or `json framac-threat-model`) holding one JSON object. scripts/trust.py reads it. A function is named `name` or `file#name` (file relative to the target root); `unit` is a link unit of the build capture, by its full name or its file name (`build/libfoo.a` or `libfoo.a`). The four lists are required and may be empty: an empty list states that the target has none.",
   "type": "object",
   "definitions": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
     "function_ref": {"type": "string", "pattern": "^(?:[A-Za-z0-9_./+-]+\\.[A-Za-z0-9]+#)?[A-Za-z_][A-Za-z0-9_]*$"},
     "description": {"type": "string", "minLength": 1, "visibleContent": true}
   },
@@ -17,7 +18,7 @@
         "properties": {
           "function": {"$ref": "#/definitions/function_ref"},
           "role": {"type": "string", "enum": ["entry", "reader"]},
-          "params": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
+          "params": {"type": "array", "items": {"$ref": "#/definitions/identifier"}},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "role", "description"],
@@ -45,11 +46,11 @@
       "items": {
         "type": "object",
         "properties": {
-          "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "name": {"$ref": "#/definitions/identifier"},
           "kind": {"$comment": "local (plan step M6): an array local of `function`, wiped before each return in its scope", "type": "string", "enum": ["global", "parameter", "field", "local", "return"]},
           "function": {"$comment": "where the secret is released (kind global) or held (parameter, field, local): its wipe is checked when this function returns (step I9)", "$ref": "#/definitions/function_ref"},
-          "size": {"$comment": "step I9: number of elements to wipe, a C expression over constants and the function's parameters (`len`, `32`); default sizeof for arrays", "type": "string", "pattern": "^[A-Za-z0-9_ ()*+/.>-]+$"},
-          "object": {"$comment": "step I9, kind field: the parameter or global holding the field", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "size": {"$comment": "step I9: number of elements to wipe, a C expression over constants and the function's parameters (`len`, `32`); default sizeof for arrays. It is written into a generated annotation, so it cannot hold a comment delimiter (`/*`, `*/`, `//`)", "type": "string", "pattern": "^(?!.*(?:/[*/]|\\*/))[A-Za-z0-9_ ()*+/.>-]+$"},
+          "object": {"$comment": "step I9, kind field: the parameter or global holding the field", "$ref": "#/definitions/identifier"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["name", "kind", "description"],
@@ -80,9 +81,9 @@
         "properties": {
           "function": {"$ref": "#/definitions/function_ref"},
           "kind": {"type": "string", "enum": ["network", "file", "log", "terminal", "ipc", "buffer", "other"]},
-          "params": {"$comment": "step I9: the parameters carrying the output (default: the pointer parameters)", "type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
-          "length": {"$comment": "step I9: the parameter giving the number of elements `params` point to", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
-          "format": {"$comment": "plan step M5: the parameter holding a printf-style format; every call must pass a string literal there (CWE-134)", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "params": {"$comment": "step I9: the parameters carrying the output (default: the pointer parameters)", "type": "array", "items": {"$ref": "#/definitions/identifier"}},
+          "length": {"$comment": "step I9: the parameter giving the number of elements `params` point to", "$ref": "#/definitions/identifier"},
+          "format": {"$comment": "plan step M5: the parameter holding a printf-style format; every call must pass a string literal there (CWE-134)", "$ref": "#/definitions/identifier"},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "kind", "description"],

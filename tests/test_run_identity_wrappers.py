@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ROOT
+from conftest import ROOT, dockerfile_command_args, dockerfile_stages
 from test_sandbox_and_overlay import DOCKER_INFO
 
 SH = ROOT / "wrappers" / "framac-docker.sh"
@@ -156,10 +156,11 @@ def test_new_run_claims_the_directory_with_a_create_that_fails_when_it_exists():
 @pytest.mark.unit
 def test_both_images_create_the_cache_directory_world_writable():
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    build, analysis = text.split("AS framac-build", 1)[1].split("AS framac-analysis", 1)
-    for stage in (build, analysis):
-        assert re.search(r"mkdir -p [^\n]*/framac-scratch /framac-cache", stage)
-        assert re.search(r"chmod 1777 [^\n]*/framac-scratch /framac-cache", stage)
+    stages = dockerfile_stages(text)
+    assert [s.name for s in stages] == ["framac-build", "framac-analysis"]
+    for stage in stages:
+        for command in (("mkdir", "-p"), ("chmod", "1777")):
+            assert {"/framac-scratch", "/framac-cache"} <= dockerfile_command_args(stage.text, *command), stage.name
 
 
 @pytest.mark.unit

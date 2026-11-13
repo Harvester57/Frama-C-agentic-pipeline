@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ANALYSIS_IMAGE, ROOT, require_docker_images
+from conftest import ANALYSIS_IMAGE, ROOT, require_docker_images, wp_proved_goals
 
 image = pytest.mark.integration
 slow = pytest.mark.slow
@@ -44,10 +44,10 @@ def _run_in_image(tmp_path: Path, files: dict[str, str], script: str, timeout: i
 
 
 def _proved(log: str, tag: str) -> tuple[int, int]:
+    """(proved, total) over every WP summary line of the section: at least one, none with zero goals."""
     section = log.split(f"=={tag}==", 1)[1].split("==", 1)[0]
-    m = re.search(r"Proved goals:\s+(\d+) / (\d+)", section)
-    assert m, section
-    return int(m.group(1)), int(m.group(2))
+    goals = wp_proved_goals(section)
+    return sum(p for p, _ in goals), sum(t for _, t in goals)
 
 
 # ---------------------------------------------------------------------------------------------------

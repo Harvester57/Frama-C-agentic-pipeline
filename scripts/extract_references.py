@@ -68,7 +68,7 @@ _ASCII_FOLD = str.maketrans(
 )
 
 _TOC_LEADER_RE = re.compile(r"(?:\s?\.){4,}\s*\d+\s*$")
-_PAGE_NUMBER_RE = re.compile(r"^\s*(?:\d+|[ivxlcdm]+)\s*$", re.IGNORECASE)
+_PAGE_NUMBER_RE = re.compile(r"^\s*(?:\d+|(?=[ivxl])(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))\s*$")
 # LaTeX running headers: "2.4. COMMAND LINE OPTIONS", "CHAPTER 3. KNOWN LIMITATIONS", "A.1. CHANGES", "CONTENTS".
 _RUNNING_HEADER_RE = re.compile(
     r"^(?:(?:CHAPTER|APPENDIX)\s+[A-Z0-9]+\.\s+|[A-Z0-9]+(?:\.[0-9]+)*\.\s+)[^a-z]+$"

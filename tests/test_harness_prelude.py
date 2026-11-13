@@ -234,6 +234,7 @@ class TestResolvePreludeHeaders:
             "prelude_headers": [],
             "unresolved_symbols": [],
             "iterations": 0,
+            "extra_includes_first": [],
         }
         assert runner.calls == []
         assert tree["harness"].read_text(encoding="utf-8") == HARNESS_TEXT

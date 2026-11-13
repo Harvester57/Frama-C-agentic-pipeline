@@ -457,10 +457,12 @@ def test_architect_header_violation_on_entry_prototype(tmp_path):
     workspace_overlay.init_agent_overlay(run_dir, "arch-m", overlay)
     path = run_dir / "agents" / "arch-m" / "scratch" / "work" / "m.h"
     path.write_text("/*@ requires size < 100; */\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
-    with pytest.raises(TrustBoundaryError, match="size"):
+    # The refusal names the file, the entry and the clause, not just any text with "size" in it.
+    with pytest.raises(TrustBoundaryError, match=r"(?s)m\.h: parse: requires size < 100;") as refused:
         workspace_overlay.merge_agent_overlay(
             run_dir, "arch-m", "architect", overlay, header_file="m.h", module="m", skip_reverify=True
         )
+    assert str(refused.value).startswith(workspace_overlay.TRUST_BOUNDARY_REASON)
 
 
 # ---------------------------------------------------------------------------

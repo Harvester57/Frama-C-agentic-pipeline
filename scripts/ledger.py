@@ -85,6 +85,7 @@ from framac_common import (  # noqa: E402
     wp_model_unsound,
 )
 from module_map import ModuleMap  # noqa: E402
+from patterns import KERNEL_RENAME_RE  # noqa: E402
 from promote_artifact import PromotionError, promote_file, promote_seeds  # noqa: E402
 from run_wp_function import goal_obligation_class  # noqa: E402
 from validate_artifacts import (  # noqa: E402
@@ -672,7 +673,7 @@ def _derive_units(
     for fn_name, fn in sorted(dag.get("functions", {}).items()):
         name = fn.get("name", fn_name)
         file = normalize_file(fn.get("file", ""))
-        if not FN_RE.match(name) or not UNIT_PATH_RE.match(file):
+        if not FN_RE.fullmatch(name) or not UNIT_PATH_RE.fullmatch(file):
             skipped.append(f"{file}#{name}")
             continue
         dag_fns.add((file, name))
@@ -1249,7 +1250,7 @@ def _wp_discharged(unit: dict) -> bool:
     )
 
 
-_KERNEL_RENAME_RE = re.compile(r"(.+)_\d+")
+_KERNEL_RENAME_RE = KERNEL_RENAME_RE
 
 
 def _kernel_renames(reported: set[str], unit_names: set[str]) -> dict[str, str]:

@@ -155,6 +155,72 @@ def _strip_trailing_attributes(c_tokens: list[Token], end_idx: int, min_idx: int
     return cursor
 
 
+_ATTRIBUTE_WORDS = frozenset({"__attribute__", "__attribute", "__declspec", "asm", "__asm", "__asm__"})
+# Declaration specifiers that say nothing about the type returned.
+_NON_TYPE_SPECIFIERS = frozenset(
+    {
+        "extern", "static", "inline", "__inline", "__inline__", "_Noreturn", "__extension__", "register",
+        "_Thread_local", "__thread", "const", "volatile", "__const", "__volatile__",
+    }
+)  # fmt: skip
+
+
+def _without_attributes(c_tokens: list[Token]) -> list[Token]:
+    """The tokens without their `__attribute__((...))`, `__declspec(...)` and `asm(...)` groups, wherever they sit."""
+    out: list[Token] = []
+    idx = 0
+    while idx < len(c_tokens):
+        if c_tokens[idx].text in _ATTRIBUTE_WORDS and idx + 1 < len(c_tokens) and c_tokens[idx + 1].text == "(":
+            close = _find_matching_forward(c_tokens, idx + 1, "(", ")")
+            if close != -1:
+                idx = close + 1
+                continue
+        out.append(c_tokens[idx])
+        idx += 1
+    return out
+
+
+def return_type_tokens(proto: str) -> list[str] | None:
+    """
+    The tokens a function prototype writes before the function's name, attributes left out: its
+    specifiers, and the `(` and `*` of its declarator (`void ( *` for `void (*f(int))(int)`). None when
+    `proto` is not a function prototype this reads.
+    """
+    try:
+        tokens = [t for t in tokenize_c_acsl(proto) if t.kind in ("c_token", "string", "char")]
+    except AcslSyntaxError:
+        return None
+    tokens = _without_attributes(tokens)
+    while tokens and tokens[-1].text == ";":
+        tokens.pop()
+    if not tokens or tokens[-1].text != ")":
+        return None
+    close_params = len(tokens) - 1
+    open_params = _find_matching_backward(tokens, close_params, "(", ")")
+    if open_params <= 0:
+        return None
+    name, _, _ = _resolve_declarator(tokens, -1, open_params, close_params)
+    if not name:
+        return None
+    return [t.text for t in tokens[: next(i for i, t in enumerate(tokens) if t.text == name)]]
+
+
+def returns_void(proto: str) -> bool | None:
+    """
+    Whether the function a prototype declares returns `void`: True, False, or None when `proto` is not a
+    function prototype this reads. Storage and function specifiers and attributes do not count, in any
+    position Frama-C or a header writes them (`__inline static void f(int)`,
+    ` __attribute__((__noreturn__)) void die(int)`, `void ( __attribute__((__noreturn__)) die)(int)`,
+    `_Noreturn void die(int)`); a pointer does (`void *f(void)`, `void (*f(int))(int)`).
+    """
+    prefix = return_type_tokens(proto)
+    if prefix is None:
+        return None
+    if "*" in prefix:
+        return False
+    return [t for t in prefix if t != "(" and t not in _NON_TYPE_SPECIFIERS] == ["void"]
+
+
 _DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(\([^)]*\))?(.*)$", re.DOTALL)
 
 
@@ -163,12 +229,7 @@ def extract_macro_definitions(raw_code: str, path: str = "<input>") -> dict[str,
     Extract file-scope `#define` macros from `raw_code`, computing each macro's transitive
     callees and embedded non-trivial loop count (`for` and `while` excluding `while (0)`).
     """
-    try:
-        all_tokens = tokenize_c_acsl(raw_code, path=path)
-    except AcslSyntaxError:
-        cleaned = re.sub(r"/\*.*?\*/", " ", raw_code, flags=re.DOTALL)
-        cleaned = re.sub(r"//[^\n]*", " ", cleaned)
-        all_tokens = tokenize_c_acsl(cleaned, path=path)
+    all_tokens = tokenize_c_acsl(raw_code, path=path)
 
     raw_macros: dict[str, dict] = {}
     for tok in all_tokens:
@@ -260,14 +321,13 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
     """
     Deterministically extract all C function definitions from `raw_code` using
     the lossless C/ACSL tokenizer.
+
+    A source with an unclosed comment or literal raises AcslSyntaxError. There used to be a retry on the
+    text with its comments removed by a regex: it could not help with an unclosed comment or literal
+    (the regex removes closed comments only), and on the one shape it did accept, a `/*` inside a `//`
+    comment closed lines later, it deleted the code in between and shifted every line after it.
     """
-    try:
-        all_tokens = tokenize_c_acsl(raw_code, path=path)
-    except AcslSyntaxError:
-        # Fallback if a file has an unclosed comment/literal: strip comments/strings conservatively
-        cleaned = re.sub(r"/\*.*?\*/", " ", raw_code, flags=re.DOTALL)
-        cleaned = re.sub(r"//[^\n]*", " ", cleaned)
-        all_tokens = tokenize_c_acsl(cleaned, path=path)
+    all_tokens = tokenize_c_acsl(raw_code, path=path)
 
     c_tokens = [t for t in all_tokens if t.kind in ("c_token", "string")]
     results: list[dict] = []
@@ -399,16 +459,37 @@ def _resolve_declarator(
             # `ret (*fn(params))(fp_params)`.
             inner_open = _find_matching_backward(c_tokens, j, "(", ")")
             if inner_open > last_top_boundary:
-                # `(*fn(params))(fp)`: the name sits before an inner params group.
+                orig_inner_open = inner_open
+                while (
+                    inner_open < j - 1
+                    and c_tokens[inner_open + 1].text == "("
+                    and _find_matching_forward(c_tokens, inner_open + 1, "(", ")") == j - 1
+                ):
+                    inner_open += 1
+                    j -= 1
+
+                # `(*fn(params))(fp)`: the name sits before an inner params group. Only a group at
+                # the declarator's own level counts: `(*fn(int, void (*cb)(int)))(fp)` has others inside.
                 last_inner_open = -1
                 depth = 0
                 for k in range(inner_open + 1, j):
                     if c_tokens[k].text == "(":
+                        if depth == 0:
+                            last_inner_open = k
                         depth += 1
-                        last_inner_open = k
                     elif c_tokens[k].text == ")":
                         depth -= 1
-                if last_inner_open != -1 and depth == 0:
+                has_name_before = (
+                    any(
+                        _is_ident(c_tokens[k].text)
+                        and c_tokens[k].text not in TYPE_MODIFIERS_AND_PRIMITIVES
+                        and c_tokens[k].text not in _ATTRIBUTE_WORDS
+                        for k in range(inner_open + 1, last_inner_open)
+                    )
+                    if last_inner_open != -1
+                    else False
+                )
+                if last_inner_open != -1 and depth == 0 and has_name_before:
                     inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")")
                     return _resolve_declarator(c_tokens, inner_open, last_inner_open, inner_close)
                 # `(*fn)(params)`: the name is the last identifier inside the parens.
@@ -417,7 +498,7 @@ def _resolve_declarator(
                         return (
                             c_tokens[k].text,
                             c_tokens[open_params + 1 : close_params],
-                            c_tokens[last_top_boundary + 1 : inner_open],
+                            c_tokens[last_top_boundary + 1 : orig_inner_open],
                         )
                 return None, [], []
         if candidate.text in TYPE_MODIFIERS_AND_PRIMITIVES:
@@ -428,8 +509,9 @@ def _resolve_declarator(
             depth = 0
             for k in range(open_params + 1, close_params):
                 if c_tokens[k].text == "(":
+                    if depth == 0:
+                        last_inner_open = k
                     depth += 1
-                    last_inner_open = k
                 elif c_tokens[k].text == ")":
                     depth -= 1
             if last_inner_open != -1 and depth == 0:

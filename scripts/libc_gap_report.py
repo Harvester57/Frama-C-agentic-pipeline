@@ -49,11 +49,12 @@ from pathlib import Path
 from typing import Any
 
 from acsl_ast import AcslError, Token, tokenize_c_acsl
+from patterns import ASSIGNS_RE
 
 MODEL_REL = Path("workspace") / "reports" / "phase0_model.json"
 _RUN_DIR_RE = re.compile(r"run-\d+\Z")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_ASSIGNS_RE = re.compile(r"(?<![A-Za-z0-9_])assigns\b")
+_ASSIGNS_RE = ASSIGNS_RE
 _ACSL_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 _ACSL_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 # A statement made only of these is a macro standing alone (`__BEGIN_DECLS`, `__PUSH_FC_STDLIB`), not the

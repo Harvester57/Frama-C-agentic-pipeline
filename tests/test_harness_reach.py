@@ -529,7 +529,7 @@ def test_unexecuted_entry_point_reopens_the_gate_until_the_harness_changes(tmp_p
     assert harness_reach.main(["dynamic", "--module", "api"]) == 1
     dyn = json.loads((run / "workspace/reports/harness_reach_dynamic.json").read_text())["modules"]["api"]
     assert dyn["gaps"] == ["rec_put"] and dyn["executions"] == {"rec_parse": 40, "rec_print": 0, "rec_put": 0}
-    assert dyn["harness_digest"] == phase0_gates.harness_digest(run, "api")
+    assert dyn["harness_digest"] == phase0_gates.harness_digest(run, "api", ignore_exempt=True)
     [reason] = phase0_gates.check(run, "api", ("reach",))
     assert "never executed" in reason
 
@@ -554,6 +554,91 @@ def test_unexecuted_entry_point_reopens_the_gate_until_the_harness_changes(tmp_p
     assert harness_reach.main(["dynamic", "--module", "api"]) == 0
     _coverage(run, {}, status="error")
     assert harness_reach.main(["dynamic", "--module", "api"]) == 2
+
+
+def _exempt_cli(hdir: Path, capsys, *functions: str, module: str = "api") -> dict:
+    capsys.readouterr()
+    argv = ["exempt", "--harness-dir", str(hdir), "--module", module, "--reason", "cannot be driven from bytes"]
+    for fn in functions:
+        argv += ["--function", fn]
+    assert harness_reach.main(argv) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_exempting_a_dynamic_gap_reopens_the_gate_without_a_reach_gate_run(tmp_path, monkeypatch, capsys):
+    # ptf-original run-2: coverage-<mod> stopped at the recorded dynamic failure, and reach-dynamic-<mod>,
+    # which would have replaced it, depends on coverage-<mod>.
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1); rec_print(0, 0);")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    _coverage(run, {"rec_parse": 40, "rec_put": 0, "rec_print": 0})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+    [reason] = phase0_gates.check(run, "api", ("reach",))
+    # The gate's message names both ways out.
+    assert "never executed" in reason and "harness_reach.py check" in reason
+    assert "harness_reach.py exempt --module api --function <fn>" in reason
+
+    # One of the two gaps exempted: re-checked, still failing on the other.
+    out = _exempt_cli(hdir, capsys, "rec_put")
+    assert out["gate"]["rechecked"] == ["api"] and "never executed" in out["gate"]["still_failing"]["api"]
+    assert phase0_gates.load_gates(run)["reach"]["modules"]["api"]["gaps"] == ["rec_print"]
+    assert phase0_gates.check(run, "api", ("reach",))
+
+    out = _exempt_cli(hdir, capsys, "rec_print")
+    assert out["gate"] == {"rechecked": ["api"]}
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+    assert phase0_gates.check(run, None, ("reach",)) == []
+
+
+def test_exempt_takes_several_functions_and_keeps_a_passing_gate_passing(tmp_path, monkeypatch, capsys):
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len);")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    # Before the gate's first run nothing is recorded: `reach-gate` still has to run.
+    out = _exempt_cli(hdir, capsys, "rec_put", "rec_print")
+    assert out["function"] == ["rec_put", "rec_print"] and set(out["reach_exempt"]) == {"rec_put", "rec_print"}
+    assert out["gate"] == {"rechecked": [], "note": "the reach gate has not run yet"}
+    assert "reach" not in phase0_gates.load_gates(run)
+
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    # The sidecar is part of the harness digest: a further exemption used to leave the row stale
+    # ("the harness of api changed after the reach gate ran").
+    out = _exempt_cli(hdir, capsys, "rec_parse")
+    assert out["function"] == "rec_parse" and out["gate"] == {"rechecked": ["api"]}
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+
+
+def test_module_exemption_clears_the_failed_row_of_that_module(tmp_path, monkeypatch, capsys):
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1); rec_print(0, 0);")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1  # tools: no_harness
+    assert phase0_gates.check(run, "tools", ("reach",))
+    out = _exempt_cli(hdir, capsys, module="tools")
+    assert out["gate"] == {"rechecked": ["tools"]}
+    assert phase0_gates.check(run, None, ("reach",)) == []
+
+
+def test_unit_exemption_in_a_sub_module_sidecar_re_records_the_unit_and_the_sub_module(tmp_path, monkeypatch, capsys):
+    import phase0_gates
+
+    harnesses = {"decode": "dec_run(); dec_peek();", "encode": "enc_run();"}
+    dag, hdir = _unit_run(tmp_path, monkeypatch, harnesses, exempt={"kvtool": "cli", "kvdemo": "ex"})
+    assert harness_reach.main(["check", "--dag", str(dag), "--harness-dir", str(hdir)]) == 1
+    capsys.readouterr()
+    argv = ["exempt", "--dag", str(dag), "--harness-dir", str(hdir), "--module", "libkv_a"]
+    assert harness_reach.main([*argv, "--function", "u_len", "--reason", "internal helper"]) == 0
+    gate = json.loads(capsys.readouterr().out)["gate"]
+    # The exemption went into decode's sidecar, whose digest changed with it.
+    assert {"libkv_a", "decode"} <= set(gate["rechecked"]) and "still_failing" not in gate
+    for module in ("libkv_a", "decode", "encode"):
+        assert phase0_gates.check(tmp_path, module, ("reach",)) == []
 
 
 # --- target fuzz modules (tf_<id>: the target's own fuzz function) ---------------------------
@@ -645,3 +730,55 @@ def test_dynamic_gate_holds_a_target_fuzz_module_to_no_entry_point(tmp_path, mon
     row = out["modules"]["tf_fuzz_kv"]
     assert row["passed"] is True and row["entry_points"] == 0 and row["gaps"] == []
     assert "warnings" not in out
+
+
+# ---------------------------------------------------------------------------
+# B11: Clang AST Callee Extraction
+# ---------------------------------------------------------------------------
+
+
+def test_b11_callees_from_clang_ast():
+    from harness_reach import _callees_from_clang_ast
+
+    tree = {
+        "kind": "TranslationUnitDecl",
+        "inner": [
+            {
+                "kind": "FunctionDecl",
+                "name": "LLVMFuzzerTestOneInput",
+                "inner": [
+                    {
+                        "kind": "CompoundStmt",
+                        "inner": [
+                            {
+                                "kind": "CallExpr",
+                                "calleeDecl": {"name": "target_init"},
+                                "inner": [
+                                    {
+                                        "kind": "DeclRefExpr",
+                                        "referencedDecl": {"kind": "FunctionDecl", "name": "target_init"},
+                                    }
+                                ],
+                            },
+                            {
+                                "kind": "CallExpr",
+                                "inner": [
+                                    {
+                                        "kind": "DeclRefExpr",
+                                        "referencedDecl": {"kind": "FunctionDecl", "name": "target_process"},
+                                    }
+                                ],
+                            },
+                            {
+                                "kind": "DeclRefExpr",
+                                "name": "target_cleanup",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    callees = _callees_from_clang_ast(tree)
+    assert callees == {"target_init", "target_process", "target_cleanup"}
+

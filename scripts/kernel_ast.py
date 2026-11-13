@@ -44,8 +44,14 @@ COMPILE_TIMEOUT_S = 120
 # Parsing and normalizing only: far below any Eva or WP limit. It decides nothing but hints.
 DUMP_TIMEOUT_S = 600
 
-# Fileloc.pretty: `file:12`, `file:12-15`, `file:12:3-9`, `file:12-15:3-9`, or a generated location.
-_LOC_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+)(?:-(?P<end>\d+))?(?::\d+(?:-\d+)?)?$")
+# Fileloc.pretty: `file:12`, `file:12-15`, `file:12:3`, `file:12:3-9`, `file:12-15:3-9`, `file:12:3-15:9`,
+# or a generated location. The file part is lazy and the whole text must match, so the first reading
+# that fits is the one with the shortest file: `a.c:12:3-15:9` is line 12 of `a.c`, never line 3 of
+# `a.c:12` (which the pattern without the `line:col-line:col` form answered).
+_LOC_RE = re.compile(
+    r"^(?P<file>.+?):(?P<line>\d+)"
+    r"(?:-(?P<end>\d+)(?::\d+(?:-\d+)?)?|:\d+-(?P<end2>\d+):\d+|:\d+(?:-\d+)?)?$"
+)
 _NOTE_LIMIT = 2000
 _SELFTEST_SOURCE = """int total(const int *a, int n) {
   int s = 0;
@@ -56,12 +62,30 @@ _SELFTEST_SOURCE = """int total(const int *a, int n) {
 
 
 def parse_location(text: str | None) -> dict:
-    """{file, line, end_line} of a kernel location string; empty values when it has none."""
+    """
+    {file, line, end_line, known} of a kernel location string. A text that is not a location (a generated
+    one, an empty one, a form this does not read) has `known` False, an empty file and line 0: a caller
+    for which line 0 or no file would be a wrong answer checks `known` (stub_gen.decl_file,
+    function_facts.build_module_facts).
+    """
     m = _LOC_RE.match((text or "").strip())
     if not m:
-        return {"file": "", "line": 0, "end_line": 0}
+        return {"file": "", "line": 0, "end_line": 0, "known": False}
     line = int(m.group("line"))
-    return {"file": m.group("file"), "line": line, "end_line": int(m.group("end") or line)}
+    end = int(m.group("end") or m.group("end2") or line)
+    return {"file": m.group("file"), "line": line, "end_line": end, "known": True}
+
+
+def temp_names(function: dict) -> list[str] | None:
+    """
+    The names of the kernel's own variables in one dumped function (`tmp_0`, `__retres`), as its printed
+    expressions spell them; None for a dump written before kernel_ast_dump.ml reported them (`temps`).
+    A source variable named `tmp` or `__retres` is not one of them.
+    """
+    temps = function.get("temps")
+    if not isinstance(temps, list):
+        return None
+    return [str(t) for t in temps]
 
 
 def _failed(status: str, reason: str) -> dict:

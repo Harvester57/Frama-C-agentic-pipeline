@@ -785,7 +785,7 @@ def _resolve_overlay_source(run_dir: Path, work_dir: Path, src: str) -> str:
     in_work = work_dir / stripped
     if in_work.is_file():
         return str(in_work)
-    run_rel = re.sub(r"^/framac-run/", "", norm)
+    run_rel = norm.removeprefix("/framac-run/")
     in_run = run_dir / run_rel
     if in_run.is_file():
         return str(in_run)
@@ -1092,7 +1092,7 @@ def infer_prover_wp_flags(
     if (
         wp_model
         and wp_model != "Typed"
-        and re.match(r"^[A-Za-z0-9_+,-]+$", wp_model)
+        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
         and not wp_model_unsound(wp_model)
     ):
         flags.extend(["--wp-model", wp_model])
@@ -2606,7 +2606,7 @@ def prepare_agent(
     merge_sources_list: list[str] = []
     harness_files = {f"harness_{m}.c" for m in [*([module] if module else []), *harness_names]}
     for raw_s in raw_sources:
-        norm_s = re.sub(r"^/framac-run/", "", (raw_s or "").replace("\\", "/").strip())
+        norm_s = (raw_s or "").replace("\\", "/").strip().removeprefix("/framac-run/")
         if not norm_s:
             continue
         if Path(norm_s).name in harness_files:

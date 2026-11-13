@@ -13,6 +13,7 @@ cannot silently disable a check.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from pathlib import Path
@@ -79,7 +80,43 @@ def check_schema(schema: Any, where: str = "schema") -> None:
             for idx, sub in enumerate(value):
                 check_schema(sub, f"{where}.{key}[{idx}]")
         elif key == "pattern":
-            re.compile(value)
+            compile_pattern(value)
+
+
+@functools.lru_cache(maxsize=512)
+def compile_pattern(pattern: str) -> re.Pattern[str]:
+    """
+    A schema `pattern`, compiled with `$` meaning the end of the string, as in JSON Schema. Python's
+    `$` also matches before a trailing newline, so `^[0-9a-f]{64}$` would accept a digest followed by
+    a line feed. Every `$` that is an anchor (not escaped, not inside a character class) becomes `\\Z`;
+    the search semantics are kept (an unanchored pattern matches anywhere).
+    """
+    out: list[str] = []
+    in_class = False
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if in_class:
+            in_class = c != "]"
+        elif c == "[":
+            in_class = True
+            # A `]` right after `[` or `[^` is a literal member of the class.
+            j = i + 2 if pattern[i + 1 : i + 2] == "^" else i + 1
+            if pattern[j : j + 1] == "]":
+                out.append(pattern[i : j + 1])
+                i = j + 1
+                continue
+        elif c == "$":
+            out.append("\\Z")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return re.compile("".join(out))
 
 
 def _type_ok(value: Any, expected: str) -> bool:
@@ -152,7 +189,7 @@ class Validator:
                 out.append(f"{path}: shorter than {schema['minLength']}")
             if "maxLength" in schema and len(value) > schema["maxLength"]:
                 out.append(f"{path}: longer than {schema['maxLength']}")
-            if "pattern" in schema and not re.search(schema["pattern"], value):
+            if "pattern" in schema and not compile_pattern(schema["pattern"]).search(value):
                 out.append(f"{path}: does not match pattern {schema['pattern']!r}")
             if schema.get("visibleContent") and not value.strip():
                 out.append(f"{path}: must contain visible text")

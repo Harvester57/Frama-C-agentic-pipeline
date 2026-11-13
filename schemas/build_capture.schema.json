@@ -143,13 +143,13 @@
           },
           "compiler": {"type": ["string", "null"]},
           "cppflags": {"type": "array", "items": {"type": "string"}},
-          "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
-          "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"type": "string", "pattern": "#"}}
+          "entry_points": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
+          "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"$ref": "#/definitions/function_id"}}
         },
         "required": ["kind", "test", "test_reason", "files", "objects", "links", "external_libs", "cppflags", "entry_points", "embedded_api"]
       }
     },
-    "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "entry_points": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
     "public_headers": {
       "type": ["object", "null"],
       "properties": {
@@ -188,6 +188,7 @@
   "required": ["schema_version", "generated_at", "status", "target", "warnings"],
   "additionalProperties": false,
   "definitions": {
+    "function_id": {"$comment": "A function id, `file#name`: the file relative to the target root (any character but `#`), then one symbol name. The name may carry what nm prints for a compiler clone or a versioned symbol (`parse.constprop.0`, `f@@VERS_1`).", "type": "string", "pattern": "^(?:[^#\\s]+|[^#\\s][^#\\r\\n]*\\/[^#/\\s]+)#[A-Za-z_$][A-Za-z0-9_$.@]*$"},
     "system_file": {
       "type": "object",
       "properties": {

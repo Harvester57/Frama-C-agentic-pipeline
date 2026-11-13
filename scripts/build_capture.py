@@ -82,6 +82,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import target_env  # noqa: E402
 from framac_common import atomic_write_json, is_pipeline_output_dir, load_json_optional, utc_now  # noqa: E402
+from patterns import parse_make_deps  # noqa: E402
 
 SCHEMA_VERSION = 1
 STATUS_OK = "ok"
@@ -134,9 +135,12 @@ TARGET_INSTRUCTIONS = (
     "scope for now: there is no recipe that makes it pass.",
 )
 
-_COMPILER_RE = re.compile(r"^(?:[\w.+-]+-)?(?:cc|gcc|clang|c89|c99)(?:-\d+(?:\.\d+)*)?$")
+_COMPILER_NAME = r"(?:cc|gcc|clang(?:-fast)?|c89|c99|tcc|icx)"
+_COMPILER_SUFFIX = r"(?:-\d+(?:\.\d+)*)?(?:-posix)?"
+_COMPILER_RE = re.compile(rf"^(?:[\w.+-]+-)?{_COMPILER_NAME}{_COMPILER_SUFFIX}$")
 # A compiler named after its target: <arch>-<os...>-gcc. One-word prefixes (afl-gcc, musl-gcc) are wrappers.
-_TRIPLE_COMPILER_RE = re.compile(r"^(?P<triple>[\w.+]+(?:-[\w.+]+)+)-(?:cc|gcc|clang|c89|c99)(?:-\d+(?:\.\d+)*)?$")
+_TRIPLE_COMPILER_RE = re.compile(rf"^(?P<triple>[\w.+]+(?:-[\w.+]+)+)-{_COMPILER_NAME}{_COMPILER_SUFFIX}$")
+_COMPILER_LIKE_RE = re.compile(r"(?i)\b(?:gcc|clang|tcc|icx|ccache|distcc)\b")
 _ARCH_WORD_RE = re.compile(
     r"^(?:x86_64|amd64|x86|i[3-6]86|arm\w*|thumb\w*|aarch64\w*|riscv\w*|mips\w*|powerpc\w*|ppc\w*|s390x?|"
     r"sparc\w*|avr\w*|msp430|m68k|sh[0-9]\w*|xtensa\w*|loongarch\w*|alpha\w*|hppa\w*|ia64|microblaze\w*|nios2|"
@@ -222,7 +226,10 @@ _DEP_FLAGS_NOARG = {"-MD", "-MMD", "-MP", "-M", "-MM", "-MG"}
 _DEP_FLAGS_ARG = {"-MF", "-MT", "-MQ"}
 _LINK_ONLY_NOARG = {"-shared", "-static", "-rdynamic", "-pie", "-no-pie", "-static-pie", "-s", "-nostartfiles"}
 
-TEST_WORDS = frozenset({"test", "tests", "check", "checks", "unittest", "unittests", "testsuite"})
+# `check` is not a test word in a file or unit name: `check_http`, `health-check`, `libspell-check.so` and
+# `bounds_check.c` are product code, and a unit marked as a test is left out of the analysis. A `check/`
+# directory (TEST_DIRS) still marks a test.
+TEST_WORDS = frozenset({"test", "tests", "unittest", "unittests", "testsuite"})
 TEST_DIRS = frozenset({"test", "tests", "testing", "check", "checks", "unittest", "unittests"})
 
 LIBC_PACKAGES = frozenset({"libc6", "libc6-dev", "linux-libc-dev", "libc-dev-bin", "libc6-dbg", "libc-bin"})
@@ -725,6 +732,7 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
     artifacts: dict[str, dict] = {}
     archives: dict[str, list[str]] = defaultdict(list)
     probes = 0
+    skipped_compiler_like: list[str] = []
     for ex in execs:
         name = posixpath.basename(ex["exe"] or (ex["args"][0] if ex["args"] else ""))
         cwd = ex["cwd"] or tree
@@ -742,7 +750,15 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
                     if member not in archives[archive]:
                         archives[archive].append(member)
             continue
-        if not _COMPILER_RE.match(name) and not (ex["args"] and _COMPILER_RE.match(posixpath.basename(ex["args"][0]))):
+        is_compiler = bool(
+            _COMPILER_RE.match(name) or (ex["args"] and _COMPILER_RE.match(posixpath.basename(ex["args"][0])))
+        )
+        if not is_compiler:
+            args = ex.get("args") or []
+            if _COMPILER_LIKE_RE.search(name) or (
+                "-c" in args and any(a.endswith((".c", ".cc", ".cpp", ".cxx")) for a in args)
+            ):
+                skipped_compiler_like.append(f"{name} (args: {args[:5]})")
             continue
         args = expand_response_files(ex["args"], cwd)
         d = parse_driver(args)
@@ -788,7 +804,12 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
             "external_libdirs": [],
             "compiler": None,
         }
-    return {"compiles": compiles, "artifacts": artifacts, "probes_dropped": probes}
+    return {
+        "compiles": compiles,
+        "artifacts": artifacts,
+        "probes_dropped": probes,
+        "skipped_compiler_like": skipped_compiler_like,
+    }
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -956,19 +977,43 @@ def parse_nm(text: str) -> dict[str, tuple[str, str | None]]:
 FUNCTION_TYPES = {"T", "W", "i"}
 
 
-def parse_make_deps(text: str, cwd: str) -> list[str]:
-    """The prerequisites of a `cc -M` rule, as absolute normalised paths (the first is the source)."""
-    joined = text.replace("\\\n", " ")
-    _, _, rhs = joined.partition(":")
-    deps: list[str] = []
-    for tok in re.split(r"(?<!\\)\s+", rhs.strip()):
-        if tok:
-            deps.append(absolute(tok.replace("\\ ", " "), cwd))
-    return deps
-
-
 def declared_names(text: str, names: set[str]) -> set[str]:
-    return {n for n in names if re.search(rf"\b{re.escape(n)}\s*\(", text)}
+    """Return function names declared in text, ignoring comments, strings, and call expressions."""
+    if not names:
+        return set()
+    candidates = {n for n in names if n in text}
+    if not candidates:
+        return set()
+
+    try:
+        from acsl_ast import tokenize_c_acsl
+
+        tokens = tokenize_c_acsl(text)
+    except Exception:
+        return {
+            n
+            for n in candidates
+            if re.search(rf"(?m)^\s*(?:[A-Za-z0-9_*]+\s+)+[*]*\b{re.escape(n)}\b\s*\(", text)
+        }
+
+    c_tokens = [t for t in tokens if t.kind in ("c_token", "char")]
+    found: set[str] = set()
+    n = len(c_tokens)
+    paren_depth = 0
+    brace_depth = 0
+    for i, tok in enumerate(c_tokens):
+        if tok.text == "(":
+            paren_depth += 1
+        elif tok.text == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif tok.text == "{":
+            brace_depth += 1
+        elif tok.text == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif brace_depth == 0 and paren_depth == 0 and tok.text in candidates:
+            if i + 1 < n and c_tokens[i + 1].text == "(":
+                found.add(tok.text)
+    return found
 
 
 def declared_in(headers: list[Path], names: set[str], flags: list[str]) -> set[str]:
@@ -1238,8 +1283,7 @@ def _header_package(header: str) -> str:
     first = h.split("/", 1)[0]
     if "/" in h and first in HEADER_PACKAGES:
         return HEADER_PACKAGES[first]
-    stem = re.sub(r"\.h$", "", first)
-    stem = re.sub(r"^lib", "", stem)
+    stem = first.removesuffix(".h").removeprefix("lib")
     return f"lib{stem.lower()}-dev"
 
 
@@ -1250,10 +1294,10 @@ def diagnose(log: str, packages_not_installed: list[str] | None = None) -> dict:
     candidates: list[str] = [_header_package(h) for h in headers]
     for a, b in _PKGCONFIG_RE.findall(log):
         mod = (a or b).strip()
-        candidates.append(PKGCONFIG_PACKAGES.get(mod, f"lib{re.sub(r'^lib', '', mod)}-dev"))
+        candidates.append(PKGCONFIG_PACKAGES.get(mod, f"lib{mod.removeprefix('lib')}-dev"))
     for name in _CMAKE_MISSING_RE.findall(log) + _CMAKE_CONFIG_RE.findall(log):
         low = name.lower()
-        candidates.append(CMAKE_PACKAGES.get(low, f"lib{re.sub(r'^lib', '', low)}-dev"))
+        candidates.append(CMAKE_PACKAGES.get(low, f"lib{low.removeprefix('lib')}-dev"))
     for lib in _LIB_MISSING_RE.findall(log):
         candidates.append(LIB_PACKAGES.get(lib, f"lib{lib}-dev"))
     commands = list(dict.fromkeys(a or b for a, b in _COMMAND_MISSING_RE.findall(log)))
@@ -1730,6 +1774,9 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
             report["diagnostics"]["first_error"] = f"build timed out after {args.timeout} s"
         return report, EXIT_NEEDS_RECIPE
     cap = classify_executions(execs, str(tree))
+    if cap.get("skipped_compiler_like"):
+        for item in cap["skipped_compiler_like"]:
+            report["warnings"].append(f"skipped compiler-like executable: {item}")
     if not cap["compiles"]:
         report["diagnostics"] = {
             **diagnose(log, missing_pkgs),

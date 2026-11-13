@@ -66,13 +66,23 @@ _PATH_PREFIXES = (
     "./",
 )
 
-_LABEL_RE = re.compile(
-    r"^\s*(?:(?:assert|check|admit)\s+|(?:assert|check|admit|rte|eva|e-acsl|wp)\s*:\s*)+",
-    re.IGNORECASE,
-)
 # Longest first, so `is_nan_or_infinite` is never read as `is_nan`.
 _KINDS_ALT = "|".join(sorted(KNOWN_ALARM_KINDS, key=len, reverse=True))
+_GENERIC_LABELS = "assert|check|admit|rte|eva|e-acsl|wp"
+_LABEL_RE = re.compile(
+    r"^\s*(?:(?:assert|check|admit)\s+(?=(?:(?:"
+    + _GENERIC_LABELS
+    + r"|"
+    + _KINDS_ALT
+    + r"|rte/(?:"
+    + _KINDS_ALT
+    + r"))\s*:(?!:)))|(?:(?:"
+    + _GENERIC_LABELS
+    + r")\s*:(?!:)\s*))+",
+    re.IGNORECASE,
+)
 _KIND_LABEL_RE = re.compile(r"^\s*(?:rte/)?(?:" + _KINDS_ALT + r")\s*:(?!:)\s*", re.IGNORECASE)
+_ALARM_KIND_RE = re.compile(r"(?<![a-z0-9_])(" + _KINDS_ALT + r")(?![a-z0-9_])", re.IGNORECASE)
 # Frama-C prints ACSL with Unicode symbols unless -no-unicode; E-ACSL reports and Eva/WP CSVs differ.
 _UNICODE_ACSL = {
     "≤": "<=",
@@ -129,11 +139,8 @@ def detect_alarm_kind(predicate: str) -> str:
     The first known alarm kind named anywhere in a short label or kind string (`rte/mem_access`,
     `Assertion rte/index_bound`). Not for a predicate body: an identifier such as `shift` matches.
     """
-    text = (predicate or "").lower()
-    for kind in KNOWN_ALARM_KINDS:
-        if re.search(r"(?<![a-z0-9_])" + re.escape(kind) + r"(?![a-z0-9_])", text):
-            return kind
-    return ""
+    m = _ALARM_KIND_RE.search((predicate or "").lower())
+    return m.group(1).lower() if m else ""
 
 
 # A kind used as a label inside a predicate: `rte/shift` anywhere, or `shift:` (not `::`, not `?:`).

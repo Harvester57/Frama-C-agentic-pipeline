@@ -319,7 +319,7 @@ def _oracle_summary(oracle: str, report: dict) -> dict:
     summary["invalid"] = sum(
         1
         for g in report.get("unproven_goals") or []
-        if re.search(r"_(established|preserved)$", str(g.get("annotation") or ""), re.IGNORECASE)
+        if str(g.get("annotation") or "").lower().endswith(("_established", "_preserved"))
     )
     return summary
 

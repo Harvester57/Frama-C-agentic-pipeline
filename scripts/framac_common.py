@@ -28,6 +28,7 @@ import time
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from fingerprint import normalize_file
 
@@ -83,11 +84,16 @@ PROVER_WALL_BUDGET_S = {"quick": 600, "standard": 900, "deep": 1800}
 WP_UNSOUND_MODEL_ISSUE = "WP memory model with 'cast' (unlimited casts) is unsound; the proof is not evidence"
 
 
+def wp_model_parts(model: object) -> frozenset[str]:
+    """The lower-cased options of a WP memory model string: `Typed+ref,int` gives {typed, ref, int}."""
+    if not isinstance(model, str):
+        return frozenset()
+    return frozenset(part.strip().lower() for part in model.replace(",", "+").split("+") if part.strip())
+
+
 def wp_model_unsound(model: object) -> bool:
     """Whether a WP memory model string (for example `Typed+cast`) includes the unsound `cast` option."""
-    if not isinstance(model, str):
-        return False
-    return "cast" in {m.strip().lower() for m in re.split(r"[+,]", model) if m.strip()}
+    return "cast" in wp_model_parts(model)
 
 
 def wp_limits_problem(limits: object) -> str | None:
@@ -357,7 +363,8 @@ AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def is_safe_agent_id(value: str) -> bool:
-    return isinstance(value, str) and bool(AGENT_ID_RE.match(value)) and not _WINDOWS_DEVICE.match(value)
+    # fullmatch: `$` also matches before a trailing newline, which must never reach a path.
+    return isinstance(value, str) and bool(AGENT_ID_RE.fullmatch(value)) and not _WINDOWS_DEVICE.match(value)
 
 
 def to_run_relative(path: Path, run_dir: Path) -> str:
@@ -763,11 +770,14 @@ def run_lock(
 
 # Frama-C: "Calling undeclared function X. Old style K&R code?" (it then invents `int X()`,
 # which is unsound for Eva/WP). Clang: "call to undeclared function 'X'" /
-# "implicit declaration of function 'X'".
+# "implicit declaration of function 'X'". GCC quotes the name with U+2018/U+2019 under a UTF-8
+# locale and with ASCII quotes under LANG=C, so both are accepted.
+_QUOTE_OPEN = "['`\\u2018]"
+_QUOTE_CLOSE = "['\\u2019]"
 _UNDECLARED_FN_RES = (
-    re.compile(r"Calling undeclared function\s+'?(?P<fn>[A-Za-z_]\w*)'?"),
-    re.compile(r"call to undeclared (?:library )?function '(?P<fn>[A-Za-z_]\w*)'"),
-    re.compile(r"implicit declaration of function '(?P<fn>[A-Za-z_]\w*)'"),
+    re.compile(rf"Calling undeclared function\s+{_QUOTE_OPEN}?(?P<fn>[A-Za-z_]\w*){_QUOTE_CLOSE}?"),
+    re.compile(rf"call to undeclared (?:library )?function {_QUOTE_OPEN}(?P<fn>[A-Za-z_]\w*){_QUOTE_CLOSE}"),
+    re.compile(rf"implicit declaration of function {_QUOTE_OPEN}(?P<fn>[A-Za-z_]\w*){_QUOTE_CLOSE}"),
 )
 
 
@@ -778,3 +788,140 @@ def scan_undeclared_functions(log_text: str) -> list[str]:
         for m in rx.finditer(log_text or ""):
             found.add(m.group("fn"))
     return sorted(found)
+
+
+# ---------------------------------------------------------------------------
+# Frama-C log messages
+# ---------------------------------------------------------------------------
+#
+# Frama-C wraps a message at about 80 columns, and breaks right after the kind when the text does
+# not fit on the head line (captured on Frama-C 35, framac-analysis image, 2026-11-11):
+#
+#   [wp] a2.c:34: Warning: Missing assigns clause (assigns 'everything' instead)
+#   [wp] macro_test.c:3: Warning:
+#     Missing assigns clause (assigns 'everything' instead)
+#   [kernel:annot:missing-spec] a1.c:15: Warning:
+#     Neither code nor explicit exits, assigns and terminates for function
+#     only_ensures, generating default clauses.
+#
+# A pattern applied to one line therefore sees the location or the text, never both, and a name can
+# sit on the line after the words that introduce it. Every reader of such messages goes through
+# fold_messages().
+
+_FC_HEAD_RE = re.compile(r"^\[(?P<plugin>[A-Za-z][\w-]*)(?::(?P<category>[^\]]*))?\]\s*(?P<rest>.*)$")
+_FC_LOCATION_RE = re.compile(r"^(?P<file>\S+?):(?P<line>\d+):(?:\d+:)?\s*(?P<rest>.*)$")
+_FC_KIND_RE = re.compile(
+    r"^(?P<kind>warning|user error|failure|fatal error|internal error|error)\s*:\s*(?P<rest>.*)$", re.IGNORECASE
+)
+_CPP_ERROR_RE = re.compile(r"^\S+\.[ch]:\d+(?::\d+)?:\s*(?:fatal )?error:", re.IGNORECASE)
+_KERNEL_ERROR_HINT_RE = re.compile(
+    r"user error|syntax error|annot-error|failure|fatal error|error:|unbound|invalid", re.IGNORECASE
+)
+
+
+class FcMessage(NamedTuple):
+    """One message of a Frama-C log, with its indented continuation lines folded in."""
+
+    plugin: str  # `kernel`, `wp`, `eva`...; `cpp` for a compiler diagnostic; "" for any other line
+    file: str  # "" when the message carries no location
+    line: int  # 0 when the message carries no location
+    kind: str  # `Warning`, `User Error`, `Failure`... or ""
+    text: str  # the message after its kind, on one line
+    category: str = ""  # `annot:missing-spec` of `[kernel:annot:missing-spec]`
+    folded: str = ""  # the whole message on one line, head included
+
+
+def fold_messages(log_text: str | None) -> list[FcMessage]:
+    """
+    The messages of a Frama-C log, in order. A message starts at a `[plugin]` head, at a compiler
+    diagnostic (`f.c:3:1: error: ...`) or at any other unindented line, and takes the indented
+    lines that follow it. No non-blank line is dropped: a line that belongs to no plug-in message
+    is a message with an empty `plugin`, so that a reader can tell it from Frama-C's own output.
+    """
+    blocks: list[tuple[str, str, list[str]]] = []
+    for raw in (log_text or "").splitlines():
+        if not raw.strip():
+            continue
+        head = _FC_HEAD_RE.match(raw)
+        if head:
+            blocks.append((head.group("plugin"), head.group("category") or "", [head.group("rest").strip()]))
+        elif blocks and raw[:1].isspace():
+            blocks[-1][2].append(raw.strip())
+        else:
+            blocks.append(("cpp" if _CPP_ERROR_RE.match(raw) else "", "", [raw.strip()]))
+    messages: list[FcMessage] = []
+    for plugin, category, lines in blocks:
+        rest = lines[0]
+        file, line_no, kind = "", 0, ""
+        location = _FC_LOCATION_RE.match(rest)
+        if location:
+            file, line_no, rest = location.group("file"), int(location.group("line")), location.group("rest")
+        kind_m = _FC_KIND_RE.match(rest)
+        if kind_m:
+            kind, rest = kind_m.group("kind").title(), kind_m.group("rest")
+        text = " ".join(part for part in [rest.strip(), *lines[1:]] if part)
+        tag = f"[{plugin}:{category}]" if category else f"[{plugin}]"
+        whole = [tag, *lines] if plugin not in ("", "cpp") else lines
+        folded = " ".join(part for part in whole if part)
+        messages.append(FcMessage(plugin, file, line_no, kind, text, category, folded))
+    return messages
+
+
+def kernel_parse_errors(log_text: str | None) -> list[str]:
+    """
+    Kernel-phase errors of a Frama-C log (preprocessing, C syntax, ACSL parsing and typing),
+    one string per message with its indented continuation lines folded in, e.g.
+    `[kernel:annot-error] f.c:1: Failure: unbound logic variable alse. ...`.
+    """
+    return [
+        m.folded
+        for m in fold_messages(log_text)
+        if m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded) and "Frama-C aborted" not in m.folded
+    ]
+
+
+# The kernel's message for a called function without a body (`[kernel:annot:missing-spec]`). The
+# words between `nor` and `for function` say what it had to invent, as captured on Frama-C 35:
+#   Neither code nor specification for function f, generating default exits, assigns and terminates.
+#   Neither code nor explicit exits and terminates for function f, generating default clauses.
+#   Neither code nor explicit exits, assigns and terminates for function f, ...
+#   Neither code nor explicit assigns for function f, ...          (and `exits`, `terminates` alone)
+# Only invented `exits` and `terminates` clauses are harmless: an invented `assigns` (no write to a
+# global) is a frame the caller's proof or analysis then rests on.
+_MISSING_SPEC_RE = re.compile(r"Neither code nor (?P<what>.+?) for function (?P<fn>[A-Za-z_]\w*)")
+_MISSING_SPEC_PREFIX = "Neither code nor "
+_BENIGN_GENERATED_CLAUSES = frozenset({"exits", "terminates"})
+
+
+class MissingSpec(NamedTuple):
+    function: str  # "" when the message could not be read
+    missing: tuple[str, ...]  # (`specification`,), the clause names, or () for a wording not recognised
+    message: str
+
+    @property
+    def benign(self) -> bool:
+        """Only `exits` / `terminates` were generated. An unrecognised wording is never benign."""
+        return bool(self.missing) and set(self.missing) <= _BENIGN_GENERATED_CLAUSES
+
+
+def parse_missing_spec(message: str) -> list[MissingSpec]:
+    """The `Neither code nor ...` statements of one folded message (see fold_messages)."""
+    found: list[MissingSpec] = []
+    for m in _MISSING_SPEC_RE.finditer(message):
+        what = " ".join(m.group("what").split())
+        if what == "specification":
+            missing: tuple[str, ...] = ("specification",)
+        elif what.startswith("explicit "):
+            parts = re.split(r"\s*,\s*|\s+and\s+", what[len("explicit ") :])
+            missing = tuple(part.strip() for part in parts if part.strip())
+        else:
+            missing = ()
+        found.append(MissingSpec(m.group("fn"), missing, message))
+    if not found and _MISSING_SPEC_PREFIX in message:
+        found.append(MissingSpec("", (), message))
+    return found
+
+
+def missing_spec_messages(log_text: str | None) -> list[MissingSpec]:
+    """Every `Neither code nor ...` statement Frama-C printed in a log, harmless ones included."""
+    return [spec for m in fold_messages(log_text) if m.plugin != "" for spec in parse_missing_spec(m.folded)]

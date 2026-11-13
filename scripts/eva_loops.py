@@ -36,7 +36,8 @@ MAX_LOOP_UNROLL = 1_000_000
 _LOOP_FILE_RE = re.compile(r"[^-#=\s][^#=\s]*")
 _LOOP_REF_RE = re.compile(r"^(?P<file>[^#=\s]+)#(?P<function>[A-Za-z_][A-Za-z0-9_]*)#(?P<ordinal>\d+)=(?P<unroll>\d+)$")
 _LOOP_KEYWORDS = ("for", "while", "do")
-_LOOP_ANNOTATION_RE = re.compile(r"(?:/\*@|//@)\s*(?:for\b[^:]*:\s*)?loop\b")
+_LOOP_ANNOTATION_RE = re.compile(r"(?:/\*@|//@)[\s@]*(?:for\b[^:]*:[\s@]*)?loop\b")
+_UNROLL_RE = re.compile(r"\bloop[\s@]+unroll\b")
 _SKIPPED_KINDS = ("whitespace", "c_comment", "pp_directive")
 # Flags whose value is a path; the same list resolve includes for cache.preprocessor_args.
 _PATH_FLAGS_SEPARATE = ("-I", "-include", "-imacros", "-isystem", "-iquote", "-idirafter")
@@ -157,7 +158,7 @@ def _statement_end(tokens: list[Token], idx: int) -> int:
 def _has_unroll_annotation(tokens: list[Token], idx: int) -> bool:
     i = idx - 1
     while i >= 0 and tokens[i].kind in ("whitespace", "c_comment", "acsl_block", "acsl_line"):
-        if tokens[i].kind.startswith("acsl") and "loop unroll" in tokens[i].text:
+        if tokens[i].kind.startswith("acsl") and _UNROLL_RE.search(tokens[i].text):
             return True
         i -= 1
     return False

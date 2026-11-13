@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,7 +27,23 @@ class AcslError(RuntimeError):
 
 
 class AcslSyntaxError(AcslError):
-    """Raised when a C/H file contains an unclosed comment or string/char literal."""
+    """
+    Raised when a C/H file contains an unclosed comment or string/char literal.
+
+    The message keeps its `path:line: unclosed ...` text. Callers that need the position read the
+    attributes instead of parsing it:
+    - `line`: 1-based line of the construct that does not close, or None;
+    - `kind`: `acsl_block_comment`, `c_block_comment`, `string_literal` or `char_literal`, or None;
+    - `offset`: offset in the tokenized text of the first character of that construct, or None.
+    """
+
+    def __init__(
+        self, message: str = "", *, line: int | None = None, kind: str | None = None, offset: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.line = line
+        self.kind = kind
+        self.offset = offset
 
 
 class ScopeViolationError(AcslError):
@@ -63,19 +80,21 @@ class Span:
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"[0-9][A-Za-z0-9_.]*")
 _UNSOUND_ACSL_RE = re.compile(r"\b(admit|axiom|axiomatic|inductive)\b")
-_LOGIC_C_INT_RE = re.compile(
-    r"\blogic\s+(?:(?:unsigned|signed)\s+)?(?:int|long|short|char|size_t|ssize_t|u?int(?:8|16|32|64)_t)\b"
+_C_INT_TYPE_CORE = (
+    r"(?:(?:(?:unsigned|signed)\s+)*(?:int|long|short|char)|unsigned|signed|"
+    r"size_t|ssize_t|ptrdiff_t|u?int(?:8|16|32|64|ptr)_t)"
 )
-_LOGIC_DECL_RE = re.compile(r"\blogic\s+[A-Za-z_][A-Za-z0-9_*\s]*?\b[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)")
-_C_INT_PARAM_RE = re.compile(
-    r"^\s*(?:(?:const|unsigned|signed)\s+)*(?:int|long|short|char|size_t|ssize_t|u?int(?:8|16|32|64)_t)\s+[A-Za-z_][A-Za-z0-9_]*\s*$"
+_LOGIC_C_INT_RE = re.compile(rf"\blogic\s+(?:const\s+)?{_C_INT_TYPE_CORE}\b")
+_LOGIC_DECL_RE = re.compile(
+    r"\blogic\s+[A-Za-z_][A-Za-z0-9_*\s]*?\b[A-Za-z_][A-Za-z0-9_]*(?:\s*\{[^}]*\})?\s*\(([^)]*)\)"
 )
+_C_INT_PARAM_RE = re.compile(rf"^\s*(?:const\s+)?{_C_INT_TYPE_CORE}\s+[A-Za-z_][A-Za-z0-9_]*\s*$")
 _INVARIANT_CLAUSE_RE = re.compile(r"(?:(loop|type|global|strong)\s+)?\binvariant\b(?!\s*:)")
-_VACUOUS_FALSE_CLAUSE_RE = re.compile(
-    r"\b(requires|assumes|loop\s+invariant)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*:\s*)*(?:\\false|0)\s*;"
-)
+_VACUOUS_CLAUSE_HEAD_RE = re.compile(r"(?<![\\\w])(requires|assumes|loop\s+invariant)\b")
 _EMPTY_BEHAVIOR_RE = re.compile(r"\bbehavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*;")
-_STRING_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+# String and character literals, scanned left to right in one pass and bounded by the line: a `'"'`
+# character literal must not open a string that swallows the annotation text up to the next quote.
+_LITERAL_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
 # A ghost function's own contract, written `/@ ... @/` inside a `/*@ ghost ... */` block.
 _GHOST_CONTRACT_RE = re.compile(r"/@.*?@/", re.DOTALL)
@@ -123,7 +142,12 @@ def tokenize_c_acsl(source: str, path: str = "<input>") -> list[Token]:
                     break
                 i += 1
             if not closed:
-                raise AcslSyntaxError(f"{path}:{start_line}: unclosed {'ACSL' if is_acsl else 'C'} block comment")
+                raise AcslSyntaxError(
+                    f"{path}:{start_line}: unclosed {'ACSL' if is_acsl else 'C'} block comment",
+                    line=start_line,
+                    kind="acsl_block_comment" if is_acsl else "c_block_comment",
+                    offset=start,
+                )
             at_line_start = False
             tokens.append(Token("acsl_block" if is_acsl else "c_comment", source[start:i], start, i, start_line))
             continue
@@ -185,7 +209,12 @@ def tokenize_c_acsl(source: str, path: str = "<input>") -> list[Token]:
                 i += 1
             if not closed:
                 lit_kind = "string" if quote == '"' else "character"
-                raise AcslSyntaxError(f"{path}:{start_line}: unclosed {lit_kind} literal")
+                raise AcslSyntaxError(
+                    f"{path}:{start_line}: unclosed {lit_kind} literal",
+                    line=start_line,
+                    kind="string_literal" if quote == '"' else "char_literal",
+                    offset=start,
+                )
             tokens.append(Token("string" if quote == '"' else "char", source[start:i], start, i, start_line))
             continue
 
@@ -212,6 +241,198 @@ def tokenize_c_acsl(source: str, path: str = "<input>") -> list[Token]:
     return tokens
 
 
+# ---------------------------------------------------------------------------
+# Comment and literal masking (one lexer for every "strip the comments" need)
+# ---------------------------------------------------------------------------
+
+_LEXICAL_SPAN_KINDS = frozenset({"c_comment", "acsl_block", "acsl_line", "string", "char"})
+_UNCLOSED_LABELS = {
+    "acsl_block_comment": "ACSL block comment",
+    "c_block_comment": "C block comment",
+    "string_literal": "string literal",
+    "char_literal": "character literal",
+}
+_NOT_LINE_END_RE = re.compile(r"[^\r\n]")
+
+
+def _directive_comment_spans(text: str, start: int, end: int) -> tuple[list[tuple[str, int, int]], int | None]:
+    """
+    Comments inside the preprocessor directive `text[start:end]` (one token for the tokenizer), and the offset
+    of a block comment the directive leaves open (it then continues on the following lines), or None. A quote
+    that does not close on the directive (`#error don't`) is an ordinary character.
+    """
+    spans: list[tuple[str, int, int]] = []
+    i = start
+    while i < end:
+        ch = text[i]
+        if ch in "\"'":
+            j = i + 1
+            closed = False
+            while j < end:
+                c = text[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == "\n":
+                    break
+                if c == ch:
+                    closed = True
+                    break
+                j += 1
+            i = j + 1 if closed else i + 1
+            continue
+        if ch == "/" and i + 1 < end and text[i + 1] == "/":
+            spans.append(("c_comment", i, end))
+            return spans, None
+        if ch == "/" and i + 1 < end and text[i + 1] == "*":
+            close = text.find("*/", i + 2, end)
+            if close == -1:
+                return spans, i
+            spans.append(("c_comment", i, close + 2))
+            i = close + 2
+            continue
+        i += 1
+    return spans, None
+
+
+def comment_and_literal_spans(
+    text: str, *, on_error: str = "raise", path: str = "<input>"
+) -> list[tuple[str, int, int]]:
+    """
+    The comments and literals of C/ACSL `text` as `(kind, start, end)`, in source order and never overlapping.
+    `kind` is `c_comment`, `acsl_block`, `acsl_line`, `string` or `char`; `text[start:end]` is the whole
+    construct with its delimiters. The lexer is `tokenize_c_acsl`, with two additions:
+
+    - Preprocessor directives. The tokenizer returns a directive as one token; its `/* */` and `//` comments
+      are reported here as `c_comment` (an annotation-looking `/*@` in a directive is a plain comment), a block
+      comment opened on a directive and closed on a later line is followed to its `*/`, and string and
+      character literals inside a directive are NOT reported (`#include "x.h"` stays readable).
+    - Text the tokenizer rejects (`on_error`). `"raise"`, the default, raises `AcslSyntaxError`. `"mask"`
+      never raises: an unclosed block comment is reported up to the end of the text, an unclosed string or
+      character literal from its quote up to the end of its line (the newline is not included), and lexing
+      resumes on the next line. Use `"mask"` only where the old regex was already a best-effort reading; a
+      caller that guards a verdict should keep `"raise"` and treat the error as "unknown".
+
+    Use this instead of `mask_comments_and_literals` when the comments must be deleted or replaced by
+    something of another length.
+    """
+    if on_error not in ("raise", "mask"):
+        raise ValueError(f"on_error must be 'raise' or 'mask', not {on_error!r}")
+    spans: list[tuple[str, int, int]] = []
+    n = len(text)
+    pos = 0
+
+    def unclosed(kind: str, at: int) -> AcslSyntaxError:
+        line = text.count("\n", 0, at) + 1
+        return AcslSyntaxError(f"{path}:{line}: unclosed {_UNCLOSED_LABELS[kind]}", line=line, kind=kind, offset=at)
+
+    while pos < n:
+        chunk = text[pos:] if pos else text
+        failure: AcslSyntaxError | None = None
+        try:
+            tokens = tokenize_c_acsl(chunk, path=path)
+        except AcslSyntaxError as exc:
+            if exc.offset is None or exc.kind not in _UNCLOSED_LABELS:
+                raise
+            if on_error == "raise":
+                raise unclosed(exc.kind, pos + exc.offset) from None
+            failure = exc
+            tokens = tokenize_c_acsl(chunk[: exc.offset], path=path)
+        resume: int | None = None
+        for tok in tokens:
+            if tok.kind in _LEXICAL_SPAN_KINDS:
+                spans.append((tok.kind, pos + tok.start, pos + tok.end))
+            elif tok.kind == "pp_directive":
+                inner, open_at = _directive_comment_spans(text, pos + tok.start, pos + tok.end)
+                spans.extend(inner)
+                if open_at is None:
+                    continue
+                close = text.find("*/", pos + tok.end)
+                if close == -1:
+                    if on_error == "raise":
+                        raise unclosed("c_block_comment", open_at)
+                    spans.append(("c_comment", open_at, n))
+                    return spans
+                spans.append(("c_comment", open_at, close + 2))
+                resume = close + 2
+                break
+        if resume is None:
+            if failure is None or failure.offset is None:
+                break
+            at = pos + failure.offset
+            if failure.kind in ("acsl_block_comment", "c_block_comment"):
+                spans.append(("acsl_block" if failure.kind == "acsl_block_comment" else "c_comment", at, n))
+                break
+            eol = text.find("\n", at)
+            eol = n if eol == -1 else eol
+            spans.append(("string" if failure.kind == "string_literal" else "char", at, eol))
+            resume = eol
+        pos = resume
+    return spans
+
+
+def _blank(text: str) -> str:
+    """`text` with every character but its line ends replaced by a space."""
+    return _NOT_LINE_END_RE.sub(" ", text)
+
+
+def _blank_literal(literal: str) -> str:
+    """A string or character literal with its content blanked and its quotes kept."""
+    closed = len(literal) >= 2 and literal[-1] == literal[0]
+    return literal[0] + _blank(literal[1:-1] if closed else literal[1:]) + (literal[-1] if closed else "")
+
+
+def mask_comments_and_literals(
+    text: str, *, acsl: str = "keep", literals: bool = True, on_error: str = "raise", path: str = "<input>"
+) -> str:
+    """
+    `text` with its comments and literal contents replaced by spaces, for a regex that must not match in them.
+
+    The result has the length of `text` and the same line ends (`\\n` and `\\r` are never replaced), so every
+    offset, line and column of a match in the result is valid in `text`. Nothing is deleted.
+
+    - C comments (`/* */`, `//`), also those inside a preprocessor directive: blanked, delimiters included.
+    - String and character literals in code: content blanked, quotes kept (`"a;b"` becomes `"   "`), so a
+      literal is still one literal. `literals=False` leaves them as written. Literals inside a preprocessor
+      directive are always left as written (`#include "x.h"`, `#define S "..."`).
+    - ACSL annotations (`/*@ */`, `//@`), by `acsl`:
+        `"keep"` (default): left as written, with their own `//` comments and literals;
+        `"mask"`: kept, but the `//` comments inside them are blanked, and their literal contents too
+            (when `literals`);
+        `"blank"`: blanked like any comment. This is what the old `re.sub(r"/\\*.*?\\*/", " ", ...)` did.
+    - Text the tokenizer rejects, by `on_error` (see `comment_and_literal_spans`): `"raise"` (default)
+      raises `AcslSyntaxError`; `"mask"` blanks an unclosed block comment up to the end of the text, and an
+      unclosed literal from its quote up to the end of its line (with `literals=False` that line is left as
+      written, and a `/*` on it does not open a comment).
+
+    The drop-in for a regex that stripped every comment from a file it had not validated is
+    `mask_comments_and_literals(text, acsl="blank", literals=False, on_error="mask")`. Limits, all inherited
+    from `tokenize_c_acsl`: no trigraphs, no raw strings, `<...>` include names are not literals (a `//` in
+    one reads as a comment), and a `#` that follows a comment on its line is not a directive.
+    """
+    if acsl not in ("keep", "mask", "blank"):
+        raise ValueError(f"acsl must be 'keep', 'mask' or 'blank', not {acsl!r}")
+    out: list[str] = []
+    last = 0
+    for kind, start, end in comment_and_literal_spans(text, on_error=on_error, path=path):
+        piece = text[start:end]
+        if kind == "c_comment" or (acsl == "blank" and kind in ("acsl_block", "acsl_line")):
+            piece = _blank(piece)
+        elif kind in ("acsl_block", "acsl_line"):
+            if acsl == "mask":
+                closed = kind == "acsl_block" and len(piece) >= 5 and piece.endswith("*/")
+                body_end = len(piece) - 2 if closed else len(piece)
+                body = mask_comments_and_literals(piece[3:body_end], literals=literals, on_error="mask", path=path)
+                piece = piece[:3] + body + piece[body_end:]
+        elif literals:
+            piece = _blank_literal(piece)
+        out.append(text[last:start])
+        out.append(piece)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path: str) -> list[str]:
     """
     Flag newly added ACSL annotations that introduce unsound or silently dropped constructs:
@@ -233,7 +454,7 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                 f"{path}:{tok.line}: syntax hazard: control character {m_ctrl.group(0)!r} ({esc}) found in ACSL "
                 "annotation (likely caused by unescaped \\false, \\forall, \\at, or \\base_addr in a Python/shell string)"
             )
-        scrubbed = _COMMENT_IN_ACSL_RE.sub("", _STRING_IN_ACSL_RE.sub('""', tok.text))
+        scrubbed = _scrub_acsl_literals(tok.text)
         m = _UNSOUND_ACSL_RE.search(scrubbed)
         if m:
             errors.append(
@@ -261,13 +482,27 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                     "(WP silently drops statement invariants; use 'loop invariant' or 'assert')"
                 )
                 break
-        m_vac = _VACUOUS_FALSE_CLAUSE_RE.search(scrubbed)
-        if m_vac:
+        vacuous = _first_vacuous_clause(scrubbed)
+        if vacuous:
             errors.append(
-                f"{path}:{tok.line}: forbidden vacuous '{m_vac.group(0).strip()}' in annotation "
+                f"{path}:{tok.line}: forbidden vacuous '{vacuous}' in annotation "
                 "(assuming \\false or 0 makes all WP obligations vacuously true)"
             )
     return errors
+
+
+def _scrub_acsl_literals(text: str) -> str:
+    """ACSL annotation text with string and character literals emptied and `//` comments removed."""
+    emptied = _LITERAL_IN_ACSL_RE.sub(lambda m: '""' if m.group(0).startswith('"') else "' '", text)
+    return _COMMENT_IN_ACSL_RE.sub("", emptied)
+
+
+def _first_vacuous_clause(scrubbed: str) -> str | None:
+    """The first `requires` / `assumes` / `loop invariant` clause whose predicate is false by its form, or None."""
+    for kind, _label, pred, (start, end) in iter_clauses(scrubbed):
+        if kind in ("requires", "assumes", "loop invariant") and is_trivially_false_predicate(pred):
+            return " ".join(scrubbed[start:end].split())
+    return None
 
 
 def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> list[str]:
@@ -280,7 +515,7 @@ def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> li
     for tok in tokens:
         if tok.kind not in ("acsl_block", "acsl_line"):
             continue
-        scrubbed = _COMMENT_IN_ACSL_RE.sub("", _STRING_IN_ACSL_RE.sub('""', tok.text))
+        scrubbed = _scrub_acsl_literals(tok.text)
         for m in _EMPTY_BEHAVIOR_RE.finditer(scrubbed):
             errors.append(
                 f"{path}:{tok.line}: empty named behavior '{m.group(0).strip()}' is forbidden since Frama-C 34 "
@@ -866,8 +1101,7 @@ class _AcslSegment:
 
 def _normalize_acsl_type(type_str: str) -> str:
     """Normalize whitespace and type aliases in ACSL parameter type strings."""
-    t = _COMMENT_IN_ACSL_RE.sub(" ", type_str).strip()
-    t = re.sub(r"/\*.*?\*/", " ", t, flags=re.DOTALL)
+    t = mask_comments_and_literals(type_str, acsl="blank", literals=False, on_error="mask").strip()
     t = re.sub(r"\s*\*\s*", " *", t)
     t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\buint8_t\b", "unsigned char", t)
@@ -978,8 +1212,7 @@ def _extract_decl_param_types(
 
 def _is_acsl_comment_or_whitespace_only(inner: str) -> bool:
     """Return True if the ACSL annotation interior contains only whitespace and/or comments."""
-    no_comments = _COMMENT_IN_ACSL_RE.sub(" ", inner)
-    no_comments = re.sub(r"/\*.*?\*/", " ", no_comments, flags=re.DOTALL)
+    no_comments = mask_comments_and_literals(inner, acsl="blank", literals=False, on_error="mask")
     remainder = re.sub(r"[\s*@]", "", no_comments)
     return len(remainder) == 0
 
@@ -1630,10 +1863,11 @@ _RELATION_RE = re.compile(r"==|!=|<=|>=|<|(?<!-)>")
 
 def find_named_clause(source: str, name: str) -> str | None:
     """Predicate of the ACSL clause labelled `name` (`ensures L5_x: <predicate>;`), or None if absent."""
-    m = re.search(rf"\b{re.escape(name)}\s*:(.*?)(?:;|\*/)", source, re.DOTALL)
-    if m is None:
-        return None
-    return " ".join(m.group(1).replace("@", " ").split())
+    for _kind, label, predicate, _span in iter_clauses(source):
+        labels = [item.strip() for item in label.split(",") if item.strip()]
+        if name in labels:
+            return " ".join(predicate.split())
+    return None
 
 
 def _top_level_positions(text: str) -> list[bool]:
@@ -1714,6 +1948,50 @@ def is_trivial_predicate(text: str) -> bool:
     return _is_trivial_relation(text)
 
 
+_ZERO_LITERAL_RE = re.compile(r"^(?:0+|0[xX]0+)[uUlL]*$")
+
+
+def _is_false_relation(text: str) -> bool:
+    top = _top_level_positions(text)
+    found = [m for m in _RELATION_RE.finditer(text) if top[m.start()]]
+    if len(found) != 1:
+        return False
+    op = found[0].group(0)
+    lhs = _strip_outer_parens(text[: found[0].start()])
+    rhs = _strip_outer_parens(text[found[0].end() :])
+    if not lhs or not rhs:
+        return False
+    if lhs == rhs:
+        return op in ("!=", "<", ">")
+    if _INT_LITERAL_RE.match(lhs) and _INT_LITERAL_RE.match(rhs):
+        a, b = int(lhs), int(rhs)
+        return not {"==": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b, "<": a < b, ">": a > b}[op]
+    return False
+
+
+def is_trivially_false_predicate(text: str) -> bool:
+    """
+    True when an ACSL predicate is false whatever the program does: `\\false`, a zero literal, `x != x`,
+    `1 == 0`, `!\\true`, or a connective built from those. The twin of `is_trivial_predicate`, and as
+    conservative: it answers False for anything it cannot see through.
+    """
+    text = _strip_outer_parens(" ".join(text.split()))
+    if text == "\\false" or _ZERO_LITERAL_RE.match(text):
+        return True
+    if len(_split_top_level(text, "<==>")) > 1:
+        return False
+    if len(parts := _split_top_level(text, "==>")) > 1:
+        rhs = " ==> ".join(parts[1:])
+        return is_trivial_predicate(parts[0]) and is_trivially_false_predicate(rhs)
+    if len(parts := _split_top_level(text, "||")) > 1:
+        return all(is_trivially_false_predicate(p) for p in parts)
+    if len(parts := _split_top_level(text, "&&")) > 1:
+        return any(is_trivially_false_predicate(p) for p in parts)
+    if text.startswith("!") and not text.startswith("!="):
+        return is_trivial_predicate(text[1:])
+    return _is_false_relation(text)
+
+
 # ---------------------------------------------------------------------------
 # Frame-skeleton preservation (AutoFraming-style projected frame clauses)
 # ---------------------------------------------------------------------------
@@ -1758,12 +2036,9 @@ def extract_frame_clauses(acsl_text: str) -> dict:
         inner, _ = _paren_group_at(acsl_text, m.end() - 1)
         separated.append(_split_top_level(inner, ","))
     assigns: list[dict] = []
-    for m in _ASSIGNS_RE.finditer(acsl_text):
-        prefix = acsl_text[max(0, m.start() - 6) : m.start()]
-        if _LOOP_ASSIGNS_PREFIX_RE.search(prefix):
+    for kind, _label, clause, _span in iter_clauses(acsl_text):
+        if kind != "assigns":
             continue
-        end = _scan_to_semicolon(acsl_text, m.end())
-        clause = acsl_text[m.end() : end]
         from_m = _FROM_RE.search(clause)
         if from_m:
             locs_text, from_text = clause[: from_m.start()], clause[from_m.end() :]
@@ -2035,7 +2310,7 @@ _SHAPE_CALL_RE = re.compile(
 )
 _BINDER_RE = re.compile(r"\\(?:forall|exists|let)\b")
 _REQUIRES_RE = re.compile(r"(?<![\\\w])requires\b")
-_CLAUSE_LABEL_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)")
+_CLAUSE_LABEL_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(?!:)")
 _NULL_CMP_RE = re.compile(r"^(?:([A-Za-z_][A-Za-z0-9_]*)\s*!=\s*\\null|\\null\s*!=\s*([A-Za-z_][A-Za-z0-9_]*))$")
 _NONNEG_RE = re.compile(r"^(?:([A-Za-z_][A-Za-z0-9_]*)\s*>=\s*0|0\s*<=\s*([A-Za-z_][A-Za-z0-9_]*))$")
 _CAPACITY_RE = re.compile(r"\\(?:block_length|offset)\b")
@@ -2101,22 +2376,41 @@ def _scan_clause_end(text: str, start: int) -> int:
     return len(text)
 
 
+_CLAUSE_HEAD_RE = re.compile(
+    r"(?<![\\\w])(?:(loop\s+(?:invariant|assigns|variant|allocates|frees))|"
+    r"(requires|ensures|assumes|assigns|allocates|frees|terminates|exits|breaks|continues|returns|decreases|invariant|variant))\b"
+)
+
+
+def iter_clauses(annotation: str) -> Iterator[tuple[str, str, str, tuple[int, int]]]:
+    """Iterate parsed ACSL clauses (kind, label, predicate, span) across annotation text."""
+    masked = mask_comments_and_literals(annotation, acsl="mask", on_error="mask")
+    i = 0
+    n = len(annotation)
+    while i < n:
+        m = _CLAUSE_HEAD_RE.search(masked, i)
+        if m is None:
+            break
+        kind = " ".join((m.group(1) or m.group(2)).split())
+        end = _scan_clause_end(masked, m.end())
+        if end >= n:
+            i = m.end()
+            continue
+        raw = re.sub(r"(^|\n)\s*@", r"\1 ", annotation[m.end() : end])
+        labels: list[str] = []
+        while (lab := _CLAUSE_LABEL_RE.match(raw)) is not None:
+            labels.append(lab.group(1))
+            raw = raw[lab.end() :]
+        label = ", ".join(labels)
+        pred = raw.strip()
+        span = (m.start(), end + 1)
+        yield (kind, label, pred, span)
+        i = end + 1
+
+
 def extract_requires_clauses(contract_text: str) -> list[str]:
     """The predicates of every `requires` clause (function and behavior level) in ACSL contract text."""
-    body = " ".join(_acsl_comment_body(contract_text).split())
-    out: list[str] = []
-    top = _top_level_positions(body)
-    for m in _REQUIRES_RE.finditer(body):
-        if not top[m.start()]:
-            continue
-        end = _scan_clause_end(body, m.end())
-        pred = body[m.end() : end]
-        while (lab := _CLAUSE_LABEL_RE.match(pred)) is not None:
-            pred = pred[lab.end() :]
-        pred = pred.strip()
-        if pred:
-            out.append(pred)
-    return out
+    return [pred for kind, _label, pred, _span in iter_clauses(contract_text) if kind == "requires" and pred]
 
 
 def _split_unbound(text: str, op: str) -> list[str]:

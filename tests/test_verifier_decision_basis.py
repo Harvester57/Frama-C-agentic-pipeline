@@ -223,7 +223,8 @@ def test_ingest_refuses_a_bad_controlled_by(run_dir):
     rec["location"] = {"file": "src/snmp/ber.c", "line": 12, "function": "ber_decode_tag"}
     rec["linked_units"] = [TAG_RTE]
     rec["decision_point"] = decision_point(controlled_by="nobody")
-    with pytest.raises(ledger.LedgerError, match="invalid crash_verifier result"):
+    # The refusal names the field: the generic prefix alone would pass on any other invalid part of the result.
+    with pytest.raises(ledger.LedgerError, match=r"(?s)invalid crash_verifier result:.*\.decision_point\.controlled_by: "):
         ledger.cmd_ingest_verifier(_result(run_dir, rec, "needs_validation"))
     assert not (run_dir / "findings.json").exists() or json.loads((run_dir / "findings.json").read_text()) == []
 
@@ -251,7 +252,7 @@ def test_basis_is_recorded_and_never_changes_the_unit_status(run_dir, basis, dis
 
 def test_ingest_refuses_a_bad_refutation_basis(run_dir):
     _seed_run(run_dir)
-    with pytest.raises(ledger.LedgerError, match="invalid crash_verifier result"):
+    with pytest.raises(ledger.LedgerError, match=r"(?s)invalid crash_verifier result:.*\.refutation_basis: "):
         ledger.cmd_ingest_verifier(_result(run_dir, _rejection(basis="proven"), "rejected"))
 
 

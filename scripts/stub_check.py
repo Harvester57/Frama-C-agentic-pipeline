@@ -62,13 +62,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import stub_gen  # noqa: E402
 import target_env  # noqa: E402
-from acsl_ast import AcslError, locate_all_prototype_spans  # noqa: E402
+from acsl_ast import AcslError, AcslSyntaxError, Token, locate_all_prototype_spans, tokenize_c_acsl  # noqa: E402
+from c_definitions import (  # noqa: E402
+    TYPE_MODIFIERS_AND_PRIMITIVES,
+    _find_matching_backward,
+    _is_ident,
+    _resolve_declarator,
+    _without_attributes,
+    return_type_tokens,
+    returns_void,
+)
 from framac_common import (  # noqa: E402
+    STATUS_DEAD,
+    STATUS_VALID,
+    STATUS_VALID_UNDER_HYP,
     STUB_OVERLAY_REL,
     STUB_REPORT_REL,
     atomic_write_json,
     augment_framac_cppflags,
     load_json_optional,
+    normalize_status,
+    read_report_csv,
     resolve_fc_stubs_dir,
     stub_overlay_dir,
     utc_now,
@@ -85,8 +99,10 @@ SMOKE = "fc_stub_smoke.c"
 DRIVER = "fc_stub_driver.c"
 
 _WARNING_RE = re.compile(
-    r"(?P<file>[^\s:]+):(?P<line>\d+): Warning:\s*\n?\s*function (?P<fn>[A-Za-z_]\w*): precondition"
-    r"(?P<name>[^\n]*?) got status (?P<status>[a-z_]+)"
+    # The column and the `, behavior <name>` part are optional: without them here, a location printed as
+    # `file:line:col` would read as file `line`, and the alarm would be dropped as "not the smoke file".
+    r"(?P<file>[^\s:]+):(?P<line>\d+)(?::\d+)?: Warning:\s*\n?\s*function (?P<fn>[A-Za-z_]\w*)"
+    r"(?:, behavior [^:\n]+)?: precondition(?P<name>[^\n]*?) got status (?P<status>[a-z_]+)"
 )
 _PARAM_NAME_RE = re.compile(r"([A-Za-z_]\w*)\s*(\[\s*\d*\s*\])?\s*$")
 _TYPE_WORDS = frozenset(
@@ -124,38 +140,53 @@ def parse_proto(proto: str) -> dict | None:
     {name, returns_void, params: [{name, type, array}]} for a prototype as the model prints it, or None
     when it cannot be called generically (variadic, function-pointer return, no parameter list).
     """
-    head, sep, rest = proto.partition("(")
-    if not sep or not rest.rstrip().endswith(")") or "(*" in rest:
+    is_void = returns_void(proto)
+    if is_void is None:
         return None
-    m = re.search(r"([A-Za-z_]\w*)\s*$", head)
-    if m is None:
+    ret_tokens = return_type_tokens(proto)
+    if ret_tokens is None or ("(" in ret_tokens and "*" in ret_tokens):
         return None
-    name = m.group(1)
-    ret = head[: m.start()].replace("extern", "").strip()
-    params_text = rest.rstrip()[:-1].strip()
+    try:
+        raw_tokens = [t for t in tokenize_c_acsl(proto) if t.kind in ("c_token", "string", "char")]
+    except AcslSyntaxError:
+        return None
+    tokens = _without_attributes(raw_tokens)
+    while tokens and tokens[-1].text == ";":
+        tokens.pop()
+    if not tokens or tokens[-1].text != ")":
+        return None
+    close_params = len(tokens) - 1
+    open_params = _find_matching_backward(tokens, close_params, "(", ")")
+    if open_params <= 0:
+        return None
+    name, _, _ = _resolve_declarator(tokens, -1, open_params, close_params)
+    if not name:
+        return None
+    params_tokens = tokens[open_params + 1 : close_params]
+    if not params_tokens or [t.text for t in params_tokens] == ["void"]:
+        return {"name": name, "returns_void": is_void, "params": []}
+    params_text = " ".join(t.text for t in params_tokens)
     params: list[dict] = []
-    if params_text not in ("", "void"):
-        for i, p in enumerate(_split_params(params_text)):
-            if p == "...":
+    for i, p in enumerate(_split_params(params_text)):
+        if p == "...":
+            return None
+        if "(" in p:
+            return None
+        pm = _PARAM_NAME_RE.search(p)
+        if pm is None:
+            if not p.endswith("*"):
                 return None
-            pm = _PARAM_NAME_RE.search(p)
-            if "(" in p:
-                return None
-            if pm is None:  # an unnamed pointer (`char *`)
-                if not p.endswith("*"):
-                    return None
-                params.append({"name": f"a{i}", "type": p, "array": None})
-                continue
-            pname, arr = pm.group(1), pm.group(2)
-            ptype = p[: pm.start()].strip()
-            if not ptype or pname in _TYPE_WORDS or ptype.split()[-1] in ("struct", "union", "enum"):
-                # a type with no parameter name
-                ptype, pname = p, f"a{i}"
-            size = int(arr.strip("[] ")) if arr and arr.strip("[] ") else None
-            if arr:
-                ptype = f"{ptype} *"
-            params.append({"name": pname, "type": ptype, "array": size})
-    return {"name": name, "returns_void": ret in ("void", ""), "params": params}
+            params.append({"name": f"a{i}", "type": p, "array": None})
+            continue
+        pname, arr = pm.group(1), pm.group(2)
+        ptype = p[: pm.start()].strip()
+        if not ptype or pname in _TYPE_WORDS or ptype.split()[-1] in ("struct", "union", "enum"):
+            ptype, pname = p, f"a{i}"
+        size = int(arr.strip("[] ")) if arr and arr.strip("[] ") else None
+        if arr:
+            ptype = f"{ptype} *"
+        params.append({"name": pname, "type": ptype, "array": size})
+    return {"name": name, "returns_void": is_void, "params": params}
 
 
 def _pairs(sig: dict) -> dict[int, int | str]:
@@ -311,6 +342,7 @@ def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
     """{status, functions: {name: {status, alarms}}}: `error` when Frama-C cannot parse the program."""
     text, lines_of = smoke_source(include, sigs)
     (work / SMOKE).write_text(text, encoding="utf-8")
+    csv_path = work / "fc_stub_smoke_report.csv"
     cmd = [
         "frama-c",
         "-no-unicode",
@@ -322,19 +354,58 @@ def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
         "-main",
         "fc_stub_smoke_main",
         "-eva-no-alloc-returns-null",
+        "-then",
+        "-report",
+        "-report-csv",
+        str(csv_path),
     ]
     rc, log = _run(cmd, work)
     (work / "eva.log").write_text(log, encoding="utf-8")
-    if rc != 0 or "[eva] done" not in log and "====== VALUES COMPUTED ======" not in log:
+    if rc != 0 or ("[eva] done" not in log and "====== VALUES COMPUTED ======" not in log):
         return {"status": "error", "reason": _first_error(log) or f"frama-c exited {rc}"}
+    if not csv_path.is_file():
+        return {"status": "error", "reason": f"no Eva report CSV produced in {work}"}
+
     alarms: dict[tuple[str, str], list[str]] = {}
+    for row in read_report_csv(csv_path):
+        if Path(row["file"]).name != SMOKE:
+            continue
+        where = lines_of.get(int(row["line"]))
+        if where is None:
+            continue
+        if " of " in row["kind"]:
+            callee = row["kind"].split(" of ", 1)[1].strip()
+            if where[0] != callee:
+                continue
+        norm_status = row["status"]
+        status_raw = str(row["status_raw"] or "").strip().lower()
+        prop = str(row["property"] or "").strip()
+        alarm_text = f"{prop}: {status_raw}"
+
+        if where[1] == "ok":
+            if norm_status not in (STATUS_VALID, STATUS_VALID_UNDER_HYP):
+                alarms.setdefault(where, []).append(alarm_text)
+        elif where[1] == "short":
+            if norm_status not in (STATUS_VALID, STATUS_VALID_UNDER_HYP, STATUS_DEAD):
+                alarms.setdefault(where, []).append(alarm_text)
+
     for m in _WARNING_RE.finditer(log):
         if Path(m.group("file")).name != SMOKE:
             continue
         where = lines_of.get(int(m.group("line")))
         if where is None or where[0] != m.group("fn"):
             continue
-        alarms.setdefault(where, []).append(f"{m.group('name').strip() or 'precondition'}: {m.group('status')}")
+        pred_name = m.group("name").strip() or "precondition"
+        st = m.group("status").strip()
+        norm_st = normalize_status(st)
+        if where[1] == "ok" and norm_st in (STATUS_VALID, STATUS_VALID_UNDER_HYP):
+            continue
+        if where[1] == "short" and norm_st in (STATUS_VALID, STATUS_VALID_UNDER_HYP, STATUS_DEAD):
+            continue
+        existing = alarms.get(where, [])
+        if not any(pred_name in a for a in existing):
+            alarms.setdefault(where, []).append(f"{pred_name}: {st} (Eva log only)")
+
     functions: dict[str, dict] = {}
     for sig in sigs:
         fn = sig["name"]
@@ -602,9 +673,114 @@ def shipped_prototypes(text: str, path: str) -> list[str]:
 # Stubs that are not replacements of one real header: the E-ACSL variants, the type shim the pipeline
 # force-includes, and errno.h, which maps errno to a global on purpose (README of fc_stubs).
 SHIPPED_EXEMPT = ("eacsl/", "fc_compat_types.h", "errno.h")
-_STRUCT_RE = re.compile(r"\bstruct\s+([A-Za-z_]\w*)\s*\{")
 _MEMBER_MACRO_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*(?:\.\s*[A-Za-z_]\w*\s*)+$", re.M)
-_LAST_IDENT_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*(?::\s*\d+\s*)?$")
+_STRUCT_QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "__restrict__"})
+
+
+def _extract_member_name_from_decl(tokens: list[Token]) -> str | None:
+    p_depth = 0
+    b_depth = 0
+    for t in tokens:
+        if t.text == "(":
+            p_depth += 1
+        elif t.text == ")":
+            p_depth -= 1
+        elif t.text == "[":
+            b_depth += 1
+        elif t.text == "]":
+            b_depth -= 1
+        elif t.text == ":" and p_depth == 0 and b_depth == 0:
+            return None  # Bit-field: omitted
+
+    idx = 0
+    while idx < len(tokens) and tokens[idx].text == "*":
+        idx += 1
+    if idx < len(tokens) and tokens[idx].text == "(":
+        p_depth = 0
+        close_idx = -1
+        for j in range(idx, len(tokens)):
+            if tokens[j].text == "(":
+                p_depth += 1
+            elif tokens[j].text == ")":
+                p_depth -= 1
+                if p_depth == 0:
+                    close_idx = j
+                    break
+        if close_idx != -1:
+            inner = tokens[idx + 1 : close_idx]
+            for t in inner:
+                if t.text == "[":
+                    break
+                if _is_ident(t.text) and t.text not in _STRUCT_QUALIFIERS and t.text not in TYPE_MODIFIERS_AND_PRIMITIVES:
+                    return t.text
+
+    candidates: list[str] = []
+    for t in tokens:
+        if t.text in ("[", "("):
+            break
+        if _is_ident(t.text) and t.text not in _STRUCT_QUALIFIERS and t.text not in TYPE_MODIFIERS_AND_PRIMITIVES:
+            candidates.append(t.text)
+    return candidates[-1] if candidates else None
+
+
+def _split_decl_tokens(tokens: list[Token]) -> list[list[Token]]:
+    decls: list[list[Token]] = []
+    cur: list[Token] = []
+    p_depth = 0
+    b_depth = 0
+    for t in tokens:
+        if t.text == "(":
+            p_depth += 1
+        elif t.text == ")":
+            p_depth -= 1
+        elif t.text == "[":
+            b_depth += 1
+        elif t.text == "]":
+            b_depth -= 1
+        elif t.text == "," and p_depth == 0 and b_depth == 0:
+            if cur:
+                decls.append(cur)
+                cur = []
+            continue
+        cur.append(t)
+    if cur:
+        decls.append(cur)
+    return decls
+
+
+def _parse_stmt_members(stmt: list[Token]) -> list[str]:
+    last_close = -1
+    for idx, t in enumerate(stmt):
+        if t.text == "}":
+            last_close = idx
+    if last_close != -1:
+        decl_tokens = _without_attributes(stmt[last_close + 1 :])
+    else:
+        clean = _without_attributes(stmt)
+        if not clean:
+            return []
+        start_idx = 0
+        if clean[0].text in ("struct", "union", "enum"):
+            if len(clean) > 1 and _is_ident(clean[1].text):
+                start_idx = 2
+            else:
+                start_idx = 1
+        else:
+            while start_idx < len(clean) and (
+                clean[start_idx].text in TYPE_MODIFIERS_AND_PRIMITIVES
+                or clean[start_idx].text in _STRUCT_QUALIFIERS
+            ):
+                start_idx += 1
+            if start_idx == 0:
+                start_idx = 1
+        decl_tokens = clean[start_idx:]
+
+    members: list[str] = []
+    for piece in _split_decl_tokens(decl_tokens):
+        name = _extract_member_name_from_decl(piece)
+        if name:
+            members.append(name)
+    return members
 
 
 def struct_members(text: str) -> dict[str, list[str]]:
@@ -613,34 +789,74 @@ def struct_members(text: str) -> dict[str, list[str]]:
     macros defined inside its body (`#define icmp_ip icmp_dun.id_ip.idi_ip`), which is how code names
     them. Bit-fields are left out (offsetof refuses them).
     """
-    code = re.sub(r"/\*.*?\*/|//[^\n]*", " ", text, flags=re.DOTALL)
+    raw_tokens = tokenize_c_acsl(text)
+    all_tokens = _without_attributes(
+        [t for t in raw_tokens if t.kind in ("c_token", "string", "pp_directive")]
+    )
     out: dict[str, list[str]] = {}
-    for m in _STRUCT_RE.finditer(code):
-        depth, i = 1, m.end()
-        stmt: list[str] = []
-        members: list[str] = []
-        while i < len(code) and depth:
-            ch = code[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-            elif ch == ";" and depth == 1:
-                decl = re.sub(r"^\s*#[^\n]*$", " ", "".join(stmt), flags=re.M)
-                decl = re.sub(r"\{.*\}", " ", decl, flags=re.DOTALL).strip()
-                last = _LAST_IDENT_RE.search(decl)
-                if last and ":" not in decl and decl != last.group(1):
-                    members.append(last.group(1))
-                stmt = []
-                i += 1
-                continue
-            if depth >= 1:
-                stmt.append(ch)
+    stack: list[dict[str, Any]] = []
+
+    i = 0
+    n = len(all_tokens)
+    while i < n:
+        tok = all_tokens[i]
+
+        if tok.kind == "pp_directive" and stack:
+            m = _MEMBER_MACRO_RE.match(tok.text)
+            if m:
+                macro_name = m.group(1)
+                for frame in stack:
+                    if frame["tag"]:
+                        frame["members"].append(macro_name)
             i += 1
-        body = code[m.end() : i]
-        members += _MEMBER_MACRO_RE.findall(body)
-        if members:
-            out.setdefault(m.group(1), list(dict.fromkeys(members)))
+            continue
+
+        if tok.kind not in ("c_token", "string"):
+            i += 1
+            continue
+
+        if tok.text in ("struct", "union") and i + 1 < n:
+            tag = None
+            brace_idx = -1
+            if all_tokens[i + 1].text == "{":
+                brace_idx = i + 1
+            elif _is_ident(all_tokens[i + 1].text) and i + 2 < n and all_tokens[i + 2].text == "{":
+                if tok.text == "struct":
+                    tag = all_tokens[i + 1].text
+                brace_idx = i + 2
+            if brace_idx != -1:
+                if stack:
+                    stack[-1]["cur_stmt"].append(tok)
+                    if tag:
+                        stack[-1]["cur_stmt"].append(all_tokens[i + 1])
+                    stack[-1]["cur_stmt"].append(all_tokens[brace_idx])
+                stack.append({"tag": tag, "members": [], "cur_stmt": []})
+                i = brace_idx + 1
+                continue
+
+        if tok.text == "}":
+            if stack:
+                frame = stack.pop()
+                if frame["tag"]:
+                    out.setdefault(frame["tag"], list(dict.fromkeys(frame["members"])))
+                if stack:
+                    stack[-1]["cur_stmt"].append(tok)
+            i += 1
+            continue
+
+        if tok.text == ";":
+            if stack:
+                mems = _parse_stmt_members(stack[-1]["cur_stmt"])
+                stack[-1]["members"].extend(mems)
+                stack[-1]["cur_stmt"] = []
+            i += 1
+            continue
+
+        if stack:
+            stack[-1]["cur_stmt"].append(tok)
+
+        i += 1
+
     return out
 
 
@@ -674,7 +890,10 @@ def _layout(include: str, structs: dict[str, list[str]], flags: list[str], work:
 
 def check_shipped_layout(rel: str, text: str, stubs: Path, isystem: list[str], work: Path) -> dict:
     """The stub's structs against the real header's: same members, offsets, sizes and type classes."""
-    structs = struct_members(text)
+    try:
+        structs = struct_members(text)
+    except AcslSyntaxError as exc:
+        return {"status": "error", "reason": f"header does not tokenize: {exc}"}
     if not structs:
         return {"status": "passed", "structs": 0}
     sys_flags = [f for d in isystem for f in ("-isystem", d)]

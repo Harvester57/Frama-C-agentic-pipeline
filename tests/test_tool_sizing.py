@@ -33,7 +33,7 @@ def _flag(cmd: list[str], name: str) -> str:
 class FakeFramaC:
     """Records WP runs; writes the report CSV it is asked for (all goals Valid by default)."""
 
-    def __init__(self, status: str = "Valid", rc: int = 0, log: str = "[wp] 1 goal scheduled\n"):
+    def __init__(self, status: str = "Valid", rc: int = 0, log: str = "[wp] 1 goal scheduled\n[wp] Proved goals:    1 / 1\n"):
         self.calls: list[tuple[list[str], dict]] = []
         self.status, self.rc, self.log = status, rc, log
 
@@ -152,7 +152,8 @@ def test_bitwise_retry_reuses_the_cache_dir_and_sizing(tmp_path, monkeypatch):
         Path(_flag(cmd, "-report-csv")).write_text(
             CSV_HEADER + f".\tf.c\tf\t1\trte: shift\t{status}\tx << 3\n", encoding="utf-8"
         )
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        stdout = "[wp] Proved goals:    1 / 1\n" if status == "Valid" else ""
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(W.subprocess, "run", fake_run)
     res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")

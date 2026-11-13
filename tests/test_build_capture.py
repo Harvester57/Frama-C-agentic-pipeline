@@ -177,9 +177,11 @@ class TestRecordedEvents:
             "tests/runner": "directory",
             "unit_test": "name",
             "projtest": "name_and_sources",
-            "harness": "test_sources",
         }
         assert not units["latest"]["test"] and not units["tool"]["test"] and not units["libp.a"]["test"]
+        # Built from `check_parser.c` outside a test directory: `check` in a file name no longer marks a
+        # test (`check_http.c` is product code), so the unit is analysed rather than dropped.
+        assert not units["harness"]["test"]
 
     def test_driver_parsing_modes(self):
         assert bc.parse_driver(["cc", "-E", "a.c"])["mode"] == "other"

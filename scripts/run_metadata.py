@@ -224,10 +224,10 @@ def validate_build_recipe(recipe: dict) -> list[str]:
     if workdir != "." and not is_safe_relative_path(workdir):
         errors.append(f"build.workdir: {workdir!r} must be a relative path inside the target")
     for pkg in recipe.get("packages") or []:
-        if not _PACKAGE_RE.match(pkg):
+        if not _PACKAGE_RE.fullmatch(pkg):
             errors.append(f"build.packages: {pkg!r} is not a Debian package name")
     for key in recipe.get("env") or {}:
-        if not _ENV_KEY_RE.match(key):
+        if not _ENV_KEY_RE.fullmatch(key):
             errors.append(f"build.env: {key!r} is not a variable name")
         elif key in RESERVED_BUILD_ENV or key.startswith("INTERCEPT_"):
             errors.append(f"build.env: {key} is set by the sandbox and cannot be overridden")
@@ -282,7 +282,7 @@ def cmd_init(
     if META.exists():
         raise ArtifactError(f"{META} already exists; a run directory is initialized once")
     resolved_run_id = (run_id or os.environ.get("FRAMAC_RUN_ID") or Path.cwd().name).strip()
-    if not re.match(r"^run-[0-9]+$", resolved_run_id):
+    if not re.fullmatch(r"run-[0-9]+", resolved_run_id):
         raise ArtifactError(
             f"run_id must match run-<N> (via --run-id, FRAMAC_RUN_ID, or working directory name), got {resolved_run_id!r}"
         )

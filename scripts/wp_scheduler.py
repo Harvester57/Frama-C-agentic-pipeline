@@ -164,12 +164,43 @@ def _over_budget_tasks(state: dict, now: float | None = None) -> list[dict]:
     return over
 
 
-_PLACEHOLDER_RE = re.compile(
-    r"\{(agent_id|module_name|header_file|c_file|function_name|wave_index|scratch_module_sources|module_sources|"
-    r"cppflags|scratch_cppflags|ldflags|security_properties_json|untrusted_entry_functions_json|coverage_ids_json|"
-    r"unknown_obligations_json|reachability|max_retries|unproven_goals_json|candidate_fingerprint|candidate_short|"
-    r"candidate_json|target_dir|run_dir)\}"
+BRIEF_RENDER_KEYS: tuple[str, ...] = (
+    "agent_id",
+    "module_name",
+    "header_file",
+    "c_file",
+    "function_name",
+    "wave_index",
+    "scratch_module_sources",
+    "module_sources",
+    "cppflags",
+    "scratch_cppflags",
+    "ldflags",
+    "security_properties_json",
+    "untrusted_entry_functions_json",
+    "coverage_ids_json",
+    "unknown_obligations_json",
+    "reachability",
+    "max_retries",
+    "unproven_goals_json",
+    "candidate_fingerprint",
+    "candidate_short",
+    "candidate_json",
+    "target_dir",
+    "run_dir",
+    "references_dir",
 )
+
+
+def placeholder_re(keys: Iterable[str] | None = None) -> re.Pattern[str]:
+    """Derive prompt placeholder regex dynamically from the render keys."""
+    if keys is None:
+        keys = getattr(workspace_overlay, "BRIEF_RENDER_KEYS", BRIEF_RENDER_KEYS)
+    escaped = "|".join(re.escape(k) for k in sorted(keys))
+    return re.compile(rf"\{{({escaped})\}}")
+
+
+_PLACEHOLDER_RE = placeholder_re()
 _SCRATCH_PREFIX_RE = re.compile(r"^(?:.*/)?agents/[A-Za-z0-9_-]+/scratch/(?:work|base)/")
 _WORK_PREFIX_RE = re.compile(r"^(?:.*/)?workspace/(?:work|baseline)/")
 _TOLERATED = (ledger.LedgerError, ArtifactError, KeyError, OSError, ValueError)

@@ -111,8 +111,50 @@ MAX_REASONS = 6
 
 _FENCE_RE = re.compile(
     # `\r` before the line ends: a THREAT_MODEL.md with CRLF line endings (a Windows checkout).
-    r"^(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\n`]*)\n(?P<body>.*?)^(?P=fence)[ \t\r]*$",
+    # As in CommonMark: up to three spaces of indentation, and a closing fence at least as long as the opening.
+    r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\n`]*)\n(?P<body>.*?)^ {0,3}(?P=fence)[`~]*[ \t\r]*$",
     re.MULTILINE | re.DOTALL,
+)
+_OPEN_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\n`\r]*)[ \t\r]*$")
+
+
+def _scan_code_fences(text: str) -> list[tuple[str, str]]:
+    """
+    Linear CommonMark code fence scanner: returns list of (info_string, body_text).
+    Scans line-by-line to avoid quadratic backtracking on unclosed fences.
+    """
+    fences: list[tuple[str, str]] = []
+    fence_char: str | None = None
+    fence_len = 0
+    info_str = ""
+    body_lines: list[str] = []
+
+    for line in text.splitlines(keepends=True):
+        if fence_char is None:
+            m = _OPEN_FENCE_RE.match(line)
+            if m:
+                f_str = m.group("fence")
+                fence_char = f_str[0]
+                fence_len = len(f_str)
+                info_str = m.group("info") or ""
+                body_lines = []
+        else:
+            stripped = line.lstrip(" ")
+            indent = len(line) - len(stripped)
+            if indent <= 3 and stripped.startswith(fence_char * fence_len):
+                rest = stripped[fence_len:].lstrip(fence_char).rstrip(" \t\r\n")
+                if not rest:
+                    fences.append((info_str, "".join(body_lines)))
+                    fence_char = None
+                    continue
+            body_lines.append(line)
+
+    return fences
+
+
+# A line that opens a fence naming the block, wherever it sits (a list item, a quote, deeper indentation).
+_BLOCK_OPENER_RE = re.compile(
+    r"^[ \t>*+\-0-9.)]*(?:`{3,}|~{3,})[^\n]*" + re.escape("framac-threat-model"), re.MULTILINE
 )
 _FID_RE = re.compile(r"^(?:(?P<file>[A-Za-z0-9_./+-]+\.[A-Za-z0-9]+)#)?(?P<name>[A-Za-z_]\w*)$")
 
@@ -133,13 +175,24 @@ def _schema_path() -> Path | None:
 
 def extract_block(text: str) -> tuple[dict | None, list[str]]:
     """The structured block of THREAT_MODEL.md: (object or None, errors). No block is (None, [])."""
-    blocks = [m for m in _FENCE_RE.finditer(text) if BLOCK_INFO in m.group("info").split()]
+    blocks = [
+        body
+        for info, body in _scan_code_fences(text)
+        if BLOCK_INFO in (w.strip("{}.") for w in info.split())
+    ]
     if not blocks:
+        if _BLOCK_OPENER_RE.search(text):
+            # A fence names the block but does not parse as one: an error, not "no threat model", so the
+            # trust boundary does not fall back to the defaults without anyone noticing.
+            return None, [
+                f"a fence names `{BLOCK_INFO}` but no block could be read: start the fence at the left margin "
+                "(not inside a list item or a quote) and close it with the same fence"
+            ]
         return None, []
     if len(blocks) > 1:
         return None, [f"{len(blocks)} `{BLOCK_INFO}` blocks: keep exactly one"]
     try:
-        data = json.loads(blocks[0].group("body"))
+        data = json.loads(blocks[0])
     except ValueError as exc:
         return None, [f"the `{BLOCK_INFO}` block is not JSON: {exc}"]
     if not isinstance(data, dict):
@@ -288,7 +341,7 @@ class _Index:
                 self.callers[b].add(a)
 
     def resolve(self, ref: str) -> list[str]:
-        m = _FID_RE.match(ref or "")
+        m = _FID_RE.fullmatch(ref or "")
         if not m:
             return []
         if m.group("file"):

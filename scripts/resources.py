@@ -64,6 +64,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from patterns import parse_mem
+
 try:  # POSIX advisory locks
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -252,24 +254,6 @@ def _unlink(path: Path) -> None:
 
     with contextlib.suppress(OSError):
         _retry_os(_rm, attempts=20)
-
-
-def parse_mem(value: str | int | None) -> int | None:
-    """'8g', '512m', '1024' (MiB) or a byte count with a bare 'b' suffix ('1048576b') -> MiB."""
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmMgGtT]?)([iI]?)([bB]?)\s*", str(value))
-    if not m:
-        return None
-    num, unit = float(m.group(1)), m.group(2).lower()
-    if not unit and m.group(3):
-        return None  # 'i' without a unit letter
-    if not unit and m.group(4):
-        return int(num // (1024 * 1024))  # plain bytes
-    factor = {"": 1, "k": 1 / 1024, "m": 1, "g": 1024, "t": 1024 * 1024}[unit]
-    return int(num * factor)
 
 
 def parse_cpu_list(text: str | None) -> list[int]:
@@ -1523,6 +1507,21 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
 _DYNAMIC_MAKE_TARGETS = frozenset({"selftest", "fuzz", "coverage", "replay", "minimize", "wp-replay", "wp-queue"})
 # Per-module targets that run target code (fuzz-<mod>, module-<mod>, ...); build-<mod>/eva-<mod> stay static.
 _DYNAMIC_MAKE_PREFIXES = ("module-", "fuzz-", "coverage-", "replay-", "selftest-")
+_STATIC_MAKE_PREFIXES = ("build-", "eva-", "facts-", "flamegraph-")
+
+
+def _is_static_make_target(target: str) -> bool:
+    try:
+        from pipeline_make import STAGE_OF_TARGET
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from pipeline_make import STAGE_OF_TARGET
+
+    if target in STAGE_OF_TARGET:
+        return target not in _DYNAMIC_MAKE_TARGETS and not target.startswith(_DYNAMIC_MAKE_PREFIXES)
+    return any(target.startswith(p) and bool(target[len(p) :]) for p in _STATIC_MAKE_PREFIXES)
+
+
 _MAKE_VALUE_OPTIONS = frozenset({"--jobs", "-j"})
 _PIPELINE_SCRIPTS = "/opt/framac-pipeline/scripts"
 _SCRIPT_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])(?:\$S|\$\{S\})(?=/|\s|$)")
@@ -1684,7 +1683,6 @@ CACHE_RW_ALLOWLIST: frozenset[tuple[str, ...]] = frozenset(
         ("python3", f"{_PIPELINE_SCRIPTS}/cache.py", "stats"),
     }
 )
-_PLAIN_COMMAND = re.compile(r"[A-Za-z0-9_./ \t-]*")
 
 
 def is_known_static_command(cmd: str | None) -> bool:
@@ -1704,34 +1702,35 @@ def is_known_static_command(cmd: str | None) -> bool:
     # Strip python interpreter prefix if present
     clean = re.sub(r"^(?:/usr/bin/|/usr/local/bin/)?(?:python3?|pypy3?)\s+", "", text).strip()
     m = re.match(
-        r"^(?:/opt/framac-pipeline/scripts/)?pipeline_make\.py(?:\s+--run-dir(?:\s+\S+|=\S+))?\s+(?P<sub>gen|plan|params|ingest|sweep|run)(?:\s+(?P<targets>.*))?$",
+        r"^/opt/framac-pipeline/scripts/pipeline_make\.py(?:\s+--run-dir(?:\s+\S+|=\S+))?\s+(?P<sub>gen|plan|params|ingest|sweep|build-check|run)(?:\s+(?P<targets>.*))?$",
         clean,
     )
     if m:
-        if m.group("sub") != "run":
+        sub = m.group("sub")
+        if sub != "run":
             return True
         targets = _make_targets(m.group("targets") or "")
         if not targets:
             return False
-        return not any(t in _DYNAMIC_MAKE_TARGETS or t.startswith(_DYNAMIC_MAKE_PREFIXES) for t in targets)
+        return all(_is_static_make_target(t) for t in targets)
     if "run_eacsl_fuzz.py" in clean:
         return bool(
-            re.match(r"^(?:/opt/framac-pipeline/scripts/)?run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", clean)
+            re.match(r"^/opt/framac-pipeline/scripts/run_eacsl_fuzz\.py\s+(?:\S+\s+)*?build(?:\s|$)", clean)
         ) and not any(sub in clean for sub in ("campaign", "guardrail", "replay", "selftest", "coverage"))
     static_tool_res = (
-        r"^(?:/opt/framac-pipeline/scripts/)?run_wp_function\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?run_eva_slice\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?eva_tuning\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?function_facts\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?build_callgraph_dag\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?extract_references\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?generate_harness\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?ledger\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?run_metadata\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?validate_artifacts\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?cache\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?generate_report\.py\b",
-        r"^(?:/opt/framac-pipeline/scripts/)?contract_negotiator\.py\b",
+        r"^/opt/framac-pipeline/scripts/run_wp_function\.py\b",
+        r"^/opt/framac-pipeline/scripts/run_eva_slice\.py\b",
+        r"^/opt/framac-pipeline/scripts/eva_tuning\.py\b",
+        r"^/opt/framac-pipeline/scripts/function_facts\.py\b",
+        r"^/opt/framac-pipeline/scripts/build_callgraph_dag\.py\b",
+        r"^/opt/framac-pipeline/scripts/extract_references\.py\b",
+        r"^/opt/framac-pipeline/scripts/generate_harness\.py\b",
+        r"^/opt/framac-pipeline/scripts/ledger\.py\b",
+        r"^/opt/framac-pipeline/scripts/run_metadata\.py\b",
+        r"^/opt/framac-pipeline/scripts/validate_artifacts\.py\b",
+        r"^/opt/framac-pipeline/scripts/cache\.py\b",
+        r"^/opt/framac-pipeline/scripts/generate_report\.py\b",
+        r"^/opt/framac-pipeline/scripts/contract_negotiator\.py\b",
         r"^(?:/usr/bin/|/usr/local/bin/)?(?:e-acsl-gcc(?:\.sh)?|frama-c(?:-gui)?)(?:\s|$)",
     )
     return any(re.search(pat, clean) for pat in static_tool_res)
@@ -1749,7 +1748,7 @@ def cache_mount_mode(cmd: str, cache_rw_requested: bool, cache_dir: str | Path |
     if (os.environ.get("FRAMAC_CACHE") or "").strip().lower() == "off":
         return "off"
     text = expand_script_var(cmd or "")
-    if cache_rw_requested and _PLAIN_COMMAND.fullmatch(text) and tuple(text.split()) in CACHE_RW_ALLOWLIST:
+    if cache_rw_requested and tuple(text.split()) in CACHE_RW_ALLOWLIST:
         return "rw"
     return "ro"
 

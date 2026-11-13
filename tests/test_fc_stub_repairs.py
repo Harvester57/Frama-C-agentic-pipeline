@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from acsl_ast import Token, tokenize_c_acsl
-from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, ROOT, require_docker_images
+from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, ROOT, require_docker_images, wp_proved_goals
 from test_fc_stub_contracts import _prototype_name
 
 STUBS = ROOT / "templates" / "fc_stubs"
@@ -429,8 +429,7 @@ def test_bsd_string_in_eva_wp_eacsl_and_against_glibc(tmp_path):
         assert f"function {failed} got status invalid" in per[main], per[main]
     # Bytes strlcpy does not write stay uninitialized.
     assert "assert \\initialized(&d[5]);" in per["read_past_copy"], per["read_past_copy"]
-    proved = re.search(r"Proved goals:\s+(\d+) / (\d+)", per["wp"])
-    assert proved and proved.group(1) == proved.group(2), per["wp"]
+    assert all(proved == total for proved, total in wp_proved_goals(per["wp"])), per["wp"]
     assert "ABI_OK" in per["abi"], per["abi"]
     for case, precondition in BSD_EACSL_CASES.items():
         out = (tmp_path / f"{case}.out").read_text(encoding="utf-8", errors="replace")

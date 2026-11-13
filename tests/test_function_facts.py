@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import function_facts as ff  # noqa: E402
 import kernel_ast  # noqa: E402
 import run_eva_slice as eva  # noqa: E402
+from function_facts import _ENDIF_RE, _IF_RE  # noqa: E402
 
 BRIEF = (ROOT / "skills" / "framac-wp" / "prover_brief.md").read_text(encoding="utf-8")
 MARKER_RE = re.compile(r"<!--\s*(?:if:|else|endif)")
@@ -663,6 +664,38 @@ def test_callers_show_what_they_pass_and_what_they_checked(tmp_path: Path, monke
     assert "**Callers:** none in this module" in ff.render_section(top, function="top")
 
 
+def test_link_callers_filters_temps_on_legacy_caller_without_temps_key() -> None:
+    caller = {
+        "kernel_name": "caller",
+        "name": "caller",
+        "loc": "src/t.c:1",
+        "calls": [
+            {
+                "callee": "callee",
+                "kernel_name": "callee",
+                "indirect": False,
+                "args": ["x"],
+                "conditions": ["tmp_1 > 0", "__retres == 0", "x > 0"],
+                "loc": "src/t.c:5",
+                "in_loop": False,
+            }
+        ],
+    }
+    callee = {"kernel_name": "callee", "name": "callee", "loc": "src/t.c:20"}
+    records: dict[str, dict] = {"src/t.c#callee": {"kernel_name": "callee", "name": "callee", "called_by": []}}
+    ff._link_callers([caller, callee], records)
+
+    called_by = records["src/t.c#callee"]["called_by"]
+    assert len(called_by) == 1
+    assert called_by[0]["conditions"] == ["x > 0"]
+
+    lines: list[str] = []
+    ff._render_callers(records["src/t.c#callee"], lines)
+    assert any("when `x > 0`" in line for line in lines)
+    assert not any("tmp" in line for line in lines)
+    assert not any("__retres" in line for line in lines)
+
+
 def test_ast_failure_gives_a_failed_document_without_functions() -> None:
     result = ff.build_module_facts("m", ["a.c"], "-I.", None, runner=_fake_run(compile_rc=2))
     assert result["status"] == "failed" and result["functions"] == {}
@@ -760,8 +793,9 @@ def test_without_facts_every_gate_is_open_except_the_facts_gate() -> None:
 def _features(**on) -> dict:
     names = {
         name
-        for expr in re.findall(r"^\s*<!--\s*if:\s*(.*?)\s*-->", BRIEF, re.MULTILINE)
-        for name in re.findall(r"[a-z_]+", expr)
+        for m in (_IF_RE.match(line) for line in BRIEF.splitlines())
+        if m
+        for name in re.findall(r"[a-z_]+", m.group("expr"))
         if name not in ("or", "not")
     }
     out = dict.fromkeys(names, False)
@@ -774,7 +808,8 @@ def _brief_sections_for(**on) -> str:
 
 
 def test_brief_markers_balance_and_every_rendering_is_clean() -> None:
-    assert BRIEF.count("<!-- endif -->") == len(re.findall(r"<!--\s*if:", BRIEF))
+    lines = BRIEF.splitlines()
+    assert sum(1 for line in lines if _ENDIF_RE.match(line)) == sum(1 for line in lines if _IF_RE.match(line))
     for features in (None, _features(), _features(loops=True, recursion=True, strings=True)):
         rendered = ff.render_conditionals(BRIEF, features)
         assert not MARKER_RE.search(rendered)

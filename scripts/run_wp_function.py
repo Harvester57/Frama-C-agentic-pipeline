@@ -62,7 +62,11 @@ from framac_common import (  # noqa: E402
     WP_UNSOUND_MODEL_ISSUE,
     augment_framac_cppflags,
     failure_reason,
+    fold_messages,
+    kernel_parse_errors,
+    missing_spec_messages,
     normalize_flag_args,
+    parse_missing_spec,
     read_report_csv,
     scan_undeclared_functions,
     stub_repair_action,
@@ -108,15 +112,13 @@ _TIER_B_PATTERNS = (
     "using unguarded behavior assigns",
     "using complete behaviors assigns",
     "Failed smoke-test",
-    # The kernel invents a default contract (no writes to globals) for a called prototype: the
-    # caller's proof then rests on it. "Neither code nor explicit exits and terminates" is benign.
-    "Neither code nor specification for function",
 )
 _MISSING_SPEC_RE = re.compile(r"Neither code nor specification for function ([A-Za-z_][A-Za-z0-9_]*)")
 # Only a doomed `requires` makes a proof vacuous. Doomed dead_code / dead_call goals also fire on
 # correct defensive code (`if (p == NULL)` under `requires \valid(p)`), so they are only counted.
-_DOOMED_REQUIRES_RE = re.compile(r"\(Doomed\) typed_[A-Za-z0-9_]*?_wp_smoke_([A-Za-z0-9_]+)_requires\b")
-_DOOMED_DEAD_RE = re.compile(r"\(Doomed\) (typed_[A-Za-z0-9_]*?_wp_smoke_dead_[a-z]+_[A-Za-z0-9_]+)")
+_DOOMED_REQUIRES_RE = re.compile(r"\(Doomed\)\s+[A-Za-z0-9_]*?_wp_smoke_([A-Za-z0-9_]+)_requires\b")
+_DOOMED_DEAD_RE = re.compile(r"\(Doomed\)\s+([A-Za-z0-9_]*?_wp_smoke_dead_[a-z_]+_[A-Za-z0-9_]+)")
+_SMOKE_COUNT_RE = re.compile(r"Smoke Tests\s*:\s*(\d+)\s*/\s*(\d+)")
 VACUITY_GOAL_TIMEOUT_S = 1
 VACUITY_SMOKE_TIMEOUT_S = 5
 VACUITY_WALL_TIMEOUT_S = 300
@@ -228,29 +230,35 @@ def scan_wp_log_soundness(
     memory-model separation hypotheses, skipped RTE guards, and degenerated
     function-pointer value goals (`\\valid_function`).
     """
-    tier_a_aborts = sorted({m.group(1).strip() for m in _TIER_A_RE.finditer(log_text)})
-    tier_b_unsound = sorted({m.group(0).strip() for m in _TIER_B_RE.finditer(log_text)})
-
+    messages = fold_messages(log_text)
+    tier_a_aborts = sorted({m.folded for m in messages if _TIER_A_RE.search(m.folded)})
+    tier_b_unsound_set = {m.folded for m in messages if any(p in m.folded for p in _TIER_B_PATTERNS)}
+    for m in messages:
+        specs = parse_missing_spec(m.folded)
+        if any(not s.benign for s in specs):
+            tier_b_unsound_set.add(m.folded)
+    for m in messages:
+        if _SMOKE_FAIL_RE.search(m.folded):
+            tier_b_unsound_set.add(m.folded)
     for m_smoke in _SMOKE_FAIL_RE.finditer(log_text):
-        msg = m_smoke.group(1).strip()
-        if msg not in tier_b_unsound:
-            tier_b_unsound.append(msg)
+        tier_b_unsound_set.add(m_smoke.group(1).strip())
 
-    mm_functions = sorted({m.group(1) for m in _MM_HYP_RE.finditer(log_text)})
+    mm_functions = sorted({m.group(1) for msg in messages for m in _MM_HYP_RE.finditer(msg.folded)})
     if mm_functions and not check_memory_model:
-        tier_b_unsound.append(
+        tier_b_unsound_set.add(
             f"Memory model hypotheses for function(s) {', '.join(mm_functions)} unchecked (-wp-no-check-memory-model)"
         )
 
     skipped_rte = sorted(
         {
             (m.group(1) or m.group(2) or "").strip()
-            for m in _SKIPPED_RTE_RE.finditer(log_text)
+            for msg in messages
+            for m in _SKIPPED_RTE_RE.finditer(msg.folded)
             if (m.group(1) or m.group(2))
         }
     )
     if skipped_rte and _INDIRECT_CALL_UNSOUND_RE.search(log_text):
-        tier_b_unsound.append("indirect call present without '//@ calls' while \\valid_function RTE guards are skipped")
+        tier_b_unsound_set.add("indirect call present without '//@ calls' while \\valid_function RTE guards are skipped")
 
     fpv_goals = sorted({m.group(1) for m in _FPV_DEGEN_RE.finditer(log_text)})
 
@@ -262,6 +270,7 @@ def scan_wp_log_soundness(
     if not warn_invalid_pointer:
         reduced_checks.append("-warn-invalid-pointer OFF")
 
+    tier_b_unsound = sorted(tier_b_unsound_set)
     return {
         "ok": len(tier_a_aborts) == 0 and len(tier_b_unsound) == 0,
         "tier_a_aborts": tier_a_aborts,
@@ -305,7 +314,7 @@ def check_acsl_syntax(
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if proc.returncode != 0:
-        errors = [m.group(0) for m in ACSL_ERROR_RE.finditer(combined)]
+        errors = kernel_parse_errors(combined)
         return {
             "syntax_ok": False,
             "returncode": proc.returncode,
@@ -315,35 +324,9 @@ def check_acsl_syntax(
     return {"syntax_ok": True, "returncode": 0, "errors": []}
 
 
-_FC_MESSAGE_RE = re.compile(r"^\[(?P<plugin>[A-Za-z][\w-]*)(?::[^\]]*)?\]")
-_CPP_ERROR_RE = re.compile(r"^\S+\.[ch]:\d+(?::\d+)?:\s*(?:fatal )?error:", re.IGNORECASE)
-_KERNEL_ERROR_HINT_RE = re.compile(r"user error|syntax error|annot-error|failure|fatal error|error:", re.IGNORECASE)
 _PLUGIN_USER_ERROR_RE = re.compile(
     r"^\[(?!kernel\b)[A-Za-z][\w-]*(?::[^\]]*)?\][^\n]*user error", re.IGNORECASE | re.MULTILINE
 )
-
-
-def kernel_parse_errors(log_text: str) -> list[str]:
-    """
-    Kernel-phase errors of a Frama-C log (preprocessing, C syntax, ACSL parsing and typing),
-    one string per message with its indented continuation lines folded in, e.g.
-    `[kernel:annot-error] f.c:1: Failure: unbound logic variable alse. ...`.
-    """
-    blocks: list[tuple[str, list[str]]] = []
-    for line in (log_text or "").splitlines():
-        m = _FC_MESSAGE_RE.match(line)
-        if m:
-            blocks.append((m.group("plugin"), [line.strip()]))
-        elif _CPP_ERROR_RE.match(line):
-            blocks.append(("cpp", [line.strip()]))
-        elif blocks and line[:1].isspace() and line.strip():
-            blocks[-1][1].append(line.strip())
-    errors: list[str] = []
-    for plugin, lines in blocks:
-        text = " ".join(lines)
-        if plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(text) and "Frama-C aborted" not in text:
-            errors.append(text)
-    return errors
 
 
 def _folded_syntax_errors(
@@ -457,13 +440,11 @@ _PTR_DIFF_EQ_RE = re.compile(
     r"[A-Za-z_]\w*\s*!=\s*[A-Za-z_]\w*\s*==>\s*[A-Za-z_]\w*\s*-\s*[A-Za-z_]\w*\s*>\s*0|"
     r"\\base_addr\s*\()"
 )
-_MISSING_ASSIGNS_LINE_RE = re.compile(r"([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*Warning:\s*Missing assigns clause")
-_WP_PROVED_GOALS_RE = re.compile(r"^\[wp\]\s*Proved goals:\s*(\d+)\s*/\s*(\d+)", re.MULTILINE)
-_WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILINE)
-_ASSIGN_VC_FAIL_RE = re.compile(
-    r"^\[wp\]\s*\[(?:Timeout|Unknown|Failed|Stepout)\][^\n]*\bassigns\b",
-    re.IGNORECASE | re.MULTILINE,
+_MISSING_ASSIGNS_LINE_RE = re.compile(
+    r"(?<![\w./-])([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*Warning:\s*Missing assigns clause"
 )
+_WP_PROVED_GOALS_RE = re.compile(r"^\s*(?:\[wp\]\s*)?Proved goals:\s*(\d+)\s*/\s*(\d+)", re.MULTILINE)
+_WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILINE)
 
 
 def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
@@ -738,7 +719,16 @@ def derive_wp_diagnostic_hints(
                 "Vacuous proof detected (--wp-smoke-tests proved \\false): your 'requires' clauses or loop "
                 "invariants are mutually contradictory. Inspect and relax conflicting preconditions."
             )
-        missing_spec = sorted(set(_MISSING_SPEC_RE.findall(aborts_and_unsound)))
+        missing_spec_set = {
+            s.function
+            for msg in (soundness.get("tier_b_unsound") or [])
+            for s in parse_missing_spec(msg)
+            if not s.benign and s.function
+        }
+        for s in missing_spec_messages(aborts_and_unsound):
+            if not s.benign and s.function:
+                missing_spec_set.add(s.function)
+        missing_spec = sorted(missing_spec_set)
         if missing_spec:
             _add(
                 f"Callee(s) without any contract: {', '.join(missing_spec)}. Frama-C generated a default contract "
@@ -1475,7 +1465,9 @@ def run_wp_on_function(
     }
     by_class: dict[str, dict[str, int]] = {}
     layer_goals: list[dict] = []
-    fpv_assumed_count = len(soundness["assumed_function_pointer_goals"])
+    # One Degenerated goal in the log excuses one unproved `\valid_function` row, never a data-pointer
+    # `\object_pointer` alarm: the report CSV carries no goal name, so the rows are matched by predicate and count.
+    fpv_assumed_left = len(soundness["assumed_function_pointer_goals"])
 
     if csv_path.exists():
         for row in read_report_csv(csv_path):
@@ -1512,7 +1504,8 @@ def run_wp_on_function(
                 # Degenerated \valid_function goal that WP cannot prove; count it as an explicit assumption.
                 annot_low = (item.get("annotation") or "").lower()
                 kind_low = (item.get("kind") or "").lower()
-                if fpv_assumed_count > 0 and ("\\valid_function" in annot_low or "pointer_value" in annot_low):
+                if fpv_assumed_left > 0 and "\\valid_function" in annot_low and "\\object_pointer" not in annot_low:
+                    fpv_assumed_left -= 1
                     under_hyp_goals.append(item)
                     counts["proven_under_hyp"] += 1
                     continue
@@ -1684,15 +1677,20 @@ def run_wp_on_function(
                     pass
 
     total_goals = len(proven_goals) + len(under_hyp_goals) + len(unproven_goals)
+    vc_proved_valid = (
+        (proved_m is not None and vc_total > 0 and vc_proved == vc_total)
+        if csv_path.exists()
+        else (vc_total == 0 or vc_proved == vc_total)
+    )
     all_valid = (
         (total_goals > 0)
         and (len(unproven_goals) == 0)
-        and (vc_total == 0 or vc_proved == vc_total)
+        and vc_proved_valid
         and (vc_timeouts == 0)
         and (returncode == 0)
         and soundness["ok"]
     )
-    assigns_vcs_proven = (len(buckets["step_a_assigns"]) == 0) and not bool(_ASSIGN_VC_FAIL_RE.search(combined_log))
+    assigns_vcs_proven = len(buckets["step_a_assigns"]) == 0
 
     if soundness["tier_a_aborts"]:
         status = "wp_aborted"
@@ -1933,6 +1931,30 @@ def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
             "doomed": [],
             "dead_goals": len(dead),
         }
+    m_count = _SMOKE_COUNT_RE.search(log_text)
+    if not m_count:
+        return {
+            "status": "inconclusive",
+            "reason": "malformed smoke test results line",
+            "doomed": [],
+            "dead_goals": len(dead),
+        }
+    k, n = int(m_count.group(1)), int(m_count.group(2))
+    if n <= 0 or k > n or k < 0:
+        return {
+            "status": "inconclusive",
+            "reason": f"invalid smoke test counts ({k}/{n})",
+            "doomed": [],
+            "dead_goals": len(dead),
+        }
+    unexplained_fails = (n - k) - len(dead)
+    if (k < n and not dead) or (unexplained_fails > 0):
+        return {
+            "status": "inconclusive",
+            "reason": f"smoke test failure ({k}/{n}) without recognised doomed goals",
+            "doomed": [],
+            "dead_goals": len(dead),
+        }
     return {"status": "consistent", "doomed": [], "dead_goals": len(dead)}
 
 
@@ -1983,7 +2005,12 @@ def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None) -> dict:
     """
     soundness = res.get("soundness") or {}
     missing_spec = sorted(
-        {name for msg in soundness.get("tier_b_unsound") or [] for name in _MISSING_SPEC_RE.findall(msg)}
+        {
+            s.function
+            for msg in soundness.get("tier_b_unsound") or []
+            for s in parse_missing_spec(msg)
+            if not s.benign and s.function
+        }
     )
     res["limits"] = {
         "vacuity": vacuity or {"status": "not_run", "doomed": []},

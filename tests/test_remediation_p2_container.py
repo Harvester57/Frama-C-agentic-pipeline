@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from conftest import ROOT
+from conftest import ROOT, dockerfile_command_args
 from test_sandbox_and_overlay import _engine_run_args, _fake_engine
 
 # FRAMAC_* names that scripts/ mention but that a user does not set for the container: set by the wrappers,
@@ -127,11 +127,82 @@ def test_docs_list_every_forwarded_knob():
         assert f"`{name}`" in para, name
 
 
+COMPOSE_SERVICES = ("framac-pipeline", "framac-build")
+
+
+def _compose_service_blocks(compose: str) -> dict[str, str]:
+    """The text of each service of a compose file, by name (the keys one level under `services:`)."""
+    section: list[str] = []
+    inside = False
+    for line in compose.splitlines():
+        if line and not line[0].isspace() and not line.startswith("#"):
+            inside = line.rstrip() == "services:"
+            continue
+        if inside:
+            section.append(line)
+    keys = [m for line in section if (m := re.fullmatch(r"( +)([\w.-]+):\s*", line))]
+    indent = min((len(m.group(1)) for m in keys), default=0)
+    blocks: dict[str, list[str]] = {}
+    name = None
+    for line in section:
+        m = re.fullmatch(rf" {{{indent}}}([\w.-]+):\s*", line)
+        if m:
+            name = m.group(1)
+            assert name not in blocks, f"service {name} defined twice"
+            blocks[name] = []
+        elif name is not None:
+            blocks[name].append(line)
+    return {name: "\n".join(lines) for name, lines in blocks.items()}
+
+
+def _compose_identity_errors(compose: str) -> list[str]:
+    """What keeps a compose service from running as a non-root user under a run id run_metadata.py accepts."""
+    blocks = _compose_service_blocks(compose)
+    errors = [] if tuple(blocks) == COMPOSE_SERVICES else [f"services: {list(blocks)}"]
+    for name, block in blocks.items():
+        users = re.findall(r"^\s+user:\s*(.*?)\s*$", block, re.M)
+        if len(users) != 1:
+            errors.append(f"{name}: {len(users)} user lines")
+        for user in users:
+            m = re.fullmatch(r'"\$\{FRAMAC_UID:-(\d+)\}:\$\{FRAMAC_GID:-(\d+)\}"', user)
+            if m is None:
+                errors.append(f"{name}: user is {user}")
+            elif int(m.group(1)) == 0 or int(m.group(2)) == 0:
+                errors.append(f"{name}: root by default ({user})")
+        run_ids = re.findall(r"^\s+-\s+FRAMAC_RUN_ID=(.*?)\s*$", block, re.M)
+        if len(run_ids) != 1:
+            errors.append(f"{name}: {len(run_ids)} FRAMAC_RUN_ID entries")
+        for run_id in run_ids:
+            # The default is in the format run_metadata.py init accepts.
+            if not re.fullmatch(r"\$\{FRAMAC_RUN_ID:-run-[0-9]+\}", run_id):
+                errors.append(f"{name}: FRAMAC_RUN_ID is {run_id}")
+    return errors
+
+
 def test_compose_runs_as_a_non_root_user_with_a_valid_run_id():
+    assert _compose_identity_errors(_read("docker-compose.yml")) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "count"),
+    [
+        ('user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"', 'user: "${FRAMAC_UID:-0}:${FRAMAC_GID:-0}"', 1),
+        ('user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"', 'user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-0}"', 2),
+        ('    user: "${FRAMAC_UID:-1000}:${FRAMAC_GID:-1000}"\n', "", -1),  # the second service only
+        ("- FRAMAC_RUN_ID=${FRAMAC_RUN_ID:-run-1}", "- FRAMAC_RUN_ID=${FRAMAC_RUN_ID:-latest}", -1),
+        ("- FRAMAC_RUN_ID=${FRAMAC_RUN_ID:-run-1}", "- FRAMAC_RUN_ID=${FRAMAC_RUN_ID:-run-1}-x", 1),
+    ],
+)
+def test_compose_identity_check_sees_every_service(old, new, count):
+    """The check reads each service, and the defaults themselves: a root default or one bad service fails it."""
     compose = _read("docker-compose.yml")
-    assert re.search(r'^\s+user: "\$\{FRAMAC_UID:-(\d+)\}:\$\{FRAMAC_GID:-(\d+)\}"$', compose, re.M)
-    m = re.search(r"- FRAMAC_RUN_ID=\$\{FRAMAC_RUN_ID:-([^}]+)\}", compose)
-    assert m and re.match(r"^run-[0-9]+$", m.group(1))  # the format run_metadata.py init accepts
+    assert compose.count(old) == 2
+    if count == -1:
+        head, _, tail = compose.rpartition(old)
+        mutated = head + new + tail
+    else:
+        mutated = compose.replace(old, new, count)
+    assert _compose_identity_errors(mutated)
 
 
 def test_ps1_passes_the_host_user_on_linux_and_macos_like_the_sh_wrapper():
@@ -148,7 +219,10 @@ def test_image_is_usable_by_a_non_root_uid_and_ships_docs_references():
     assert "COPY docs/references/ /opt/framac-pipeline/docs/references/" in dockerfile
     assert "chmod -R a+rX /opt/framac-pipeline" in dockerfile
     assert "chmod -R a+rX /home/opam/.opam" in dockerfile
-    assert re.search(r"chmod 1777 /home/opam\b", dockerfile)
+    # The home directory itself, not only something under it (`/home/opam/.cache`).
+    assert "/home/opam" in dockerfile_command_args(dockerfile, "chmod", "1777")
+    without_home = "RUN chmod a+rx /home/opam /root \\\n    && chmod 1777 /home/opam/.cache /framac-run\n"
+    assert dockerfile_command_args(without_home, "chmod", "1777") == {"/home/opam/.cache", "/framac-run"}
     ignore = _read(".dockerignore").splitlines()
     assert "!docs/references/" in ignore and "!docs/references/**" in ignore
     assert "!docs/" not in ignore and "!docs/**" not in ignore  # the rest of docs/ stays out of the context

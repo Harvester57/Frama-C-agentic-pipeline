@@ -2,6 +2,7 @@
   "$comment": "Contract for workspace/reports/phase0_model.json, written by scripts/phase0_model.py run (plan step I3). Function ids are `file#name`, the file relative to the target root. Every function, edge and alias carries its source. Version 2 records external_calls, kernel_names, formals, writes and param_sizes on its functions; version 1 models stay valid and consumers read which facts they have with phase0_model.model_features. Fields (remediation R4, D9: kept when the report, the benchmark or a skill step shows them): thread_entries and parse_jobs are kept (the benchmark counts thread entries and sums parse seconds); alias is kept (the report summarizes an --alias run); a function's `included` (a .c file another source includes) is dropped: nothing read it.",
   "type": "object",
   "definitions": {
+    "function_id": {"$comment": "A function id, `file#name`: the file relative to the target root (any character but `#`), then one symbol name. The name may carry what nm prints for a compiler clone or a versioned symbol (`parse.constprop.0`, `f@@VERS_1`).", "type": "string", "pattern": "^(?:[^#\\s]+|[^#\\s][^#\\r\\n]*\\/[^#/\\s]+)#[A-Za-z_$][A-Za-z0-9_$.@]*$"},
     "formals": {
       "$comment": "Step I9: a function's parameters; kind `pointer` (the pointee may be written: non-const pointer or array), `const_pointer` or `value`.",
       "type": "array",
@@ -67,8 +68,8 @@
           "files": {"type": "array", "items": {"type": "string"}},
           "links": {"type": "array", "items": {"type": "string"}},
           "cppflags": {"type": ["array", "null"], "items": {"type": "string"}},
-          "entry_points": {"type": ["array", "null"], "items": {"type": "string", "pattern": "#"}},
-          "embedded_api": {"type": ["array", "null"], "items": {"type": "string", "pattern": "#"}},
+          "entry_points": {"type": ["array", "null"], "items": {"$ref": "#/definitions/function_id"}},
+          "embedded_api": {"type": ["array", "null"], "items": {"$ref": "#/definitions/function_id"}},
           "parse": {
             "type": "object",
             "properties": {
@@ -156,8 +157,8 @@
       "items": {
         "type": "object",
         "properties": {
-          "caller": {"type": "string", "pattern": "#"},
-          "callee": {"type": "string", "pattern": "#"},
+          "caller": {"$ref": "#/definitions/function_id"},
+          "callee": {"$ref": "#/definitions/function_id"},
           "kind": {"type": "string", "enum": ["direct", "indirect"]},
           "sources": {
             "type": "array",
@@ -175,14 +176,14 @@
         "properties": {
           "unit": {"type": "string"},
           "units": {"type": "array", "items": {"type": "string"}},
-          "caller": {"type": "string", "pattern": "#"},
+          "caller": {"$ref": "#/definitions/function_id"},
           "expr": {"type": ["string", "null"]},
           "signature": {"$comment": "null when the GCC fallback found the site: no candidates then", "type": ["string", "null"]},
           "loc": {"type": ["string", "null"]},
-          "candidates": {"$comment": "the type match, narrowed by Alias when narrowing is alias", "type": "array", "items": {"type": "string", "pattern": "#"}},
+          "candidates": {"$comment": "the type match, narrowed by Alias when narrowing is alias", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
           "narrowing": {"type": "string", "enum": ["alias", "none"]},
           "narrowing_reason": {"$comment": "alias, or why the full type match stays: disabled, gcc_fallback, alias_<status> (failed, timeout, crashed, unavailable), no_state, no_targets, error, unmatched, disjoint (Alias names none of the type match), no_candidates (empty type match)", "type": "string"},
-          "dropped": {"$comment": "type-match candidates Alias ruled out", "type": "array", "items": {"type": "string", "pattern": "#"}}
+          "dropped": {"$comment": "type-match candidates Alias ruled out", "type": "array", "items": {"$ref": "#/definitions/function_id"}}
         },
         "required": ["unit", "caller", "signature", "candidates"]
       }
@@ -221,7 +222,7 @@
         "type": "object",
         "properties": {
           "function": {"type": "string"},
-          "ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "#"}},
+          "ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_id"}},
           "via": {"type": "array", "items": {"type": "string"}},
           "defined_in": {"type": "string"},
           "source": {"const": "preprocessor"}
@@ -229,9 +230,9 @@
         "required": ["function", "ids", "via", "defined_in", "source"]
       }
     },
-    "entry_points": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "entry_points": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
     "entry_points_source": {"type": "string"},
-    "thread_entries": {"type": "array", "items": {"type": "string", "pattern": "#"}},
+    "thread_entries": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
     "alias": {
       "$comment": "plan step I4: narrowing of indirect sites with Frama-C's Alias plugin (phase0_model.py --alias)",
       "type": "object",

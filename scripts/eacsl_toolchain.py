@@ -41,6 +41,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import framac_cpp_wrapper, resolve_fc_stubs_dir, stub_overlay_dir  # noqa: E402
+from patterns import FUZZER_INIT_DEF_RE  # noqa: E402
 
 # Frama-C has no 128-bit integer type, and host headers such as <linux/types.h> declare
 # `__int128` typedefs only when the compiler predefines __SIZEOF_INT128__.
@@ -74,7 +75,7 @@ EACSL_FULL_MTRACKING_DEFINES = ("-Dregister=",)
 # Reads of memory written outside instrumented code (libFuzzer's `data`, external libraries) fail
 # these checks: harnesses must copy the input into their own buffer, as generated harnesses do.
 EACSL_RTE_INITIALIZED_FLAG = "-rte-initialized @all"
-_FUZZER_INITIALIZE_DEF_RE = re.compile(r"\bLLVMFuzzerInitialize\s*\([^;{)]*\)\s*\{")
+_FUZZER_INITIALIZE_DEF_RE = FUZZER_INIT_DEF_RE
 EACSL_BINARY_MARKERS = (b"__e_acsl_", b"eacsl_assert")
 
 _JOINABLE_SHORT = frozenset({"-I", "-D", "-U", "-L", "-l", "-W"})
@@ -312,7 +313,7 @@ _FULL_INIT_DECL_RE = re.compile(r"\bvoid\s+__e_acsl_full_init\s*\(\s*void\s*\*")
 # A definition header starts in column 0 with an identifier and has a parameter list.
 _DEF_HEADER_START_RE = re.compile(r"^[A-Za-z_][^;{}]*\(")
 _STORE_BLOCK_LINE_RE = re.compile(
-    r"^(?P<indent>[ \t]*)__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+UL\);$"
+    r"^(?P<indent>[ \t]*)__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+[uUlL]*\);$"
 )
 _CALL_LIKE_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _FN_PTR_DECLARATOR_RE = re.compile(r"\(\s*\*+\s*(?:(?:const|volatile|restrict|__restrict)\s+)*([A-Za-z_]\w*)\s*\)")
@@ -437,6 +438,15 @@ def mark_formals_initialized(c_text: str) -> tuple[str, int]:
     patched: set[str] = set()
     in_body = False
     count = 0
+    store_lines = [ln for ln in lines if "__e_acsl_store_block(" in ln]
+    if store_lines and not any(_STORE_BLOCK_LINE_RE.match(ln) for ln in store_lines):
+        import warnings
+
+        warnings.warn(
+            "__e_acsl_store_block lines exist in text but none matched _STORE_BLOCK_LINE_RE",
+            UserWarning,
+            stacklevel=2,
+        )
     for idx, line in enumerate(lines):
         out.append(line)
         if in_body:
@@ -477,7 +487,7 @@ def mark_formals_initialized(c_text: str) -> tuple[str, int]:
 
 
 _READONLY_SCALAR_RE = re.compile(
-    r"(?P<store>^[ \t]*__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+UL\);\n"
+    r"(?P<store>^[ \t]*__e_acsl_store_block\(\(void \*\)\(& ?(?P<name>[A-Za-z_]\w*)\),\s*\d+[uUlL]*\);\n"
     r"[ \t]*__e_acsl_full_init\(\(void \*\)\(& ?(?P=name)\)\);\n)"
     r"(?P<indent>[ \t]*)__e_acsl_mark_readonly\(\(void \*\)(?P=name)\);",
     re.MULTILINE,
@@ -774,7 +784,10 @@ FALLBACK_HEADER_MAP: dict[str, tuple[str, ...]] = {
     "syslog": ("syslog.h",),
 }
 
-_FALLBACK_UNDEFINED_RE = re.compile(r"undefined reference to [`'\"](?P<name>[A-Za-z_]\w*(?:_fallback_|_va_)\d+)['\"]")
+_FALLBACK_UNDEFINED_RE = re.compile(
+    r"(?:undefined reference to [`'\"]|undefined symbol:\s*[`'\"]?)"
+    r"(?P<name>[A-Za-z_]\w*(?:_fallback_|_va_)\d+)['\"]?"
+)
 _FALLBACK_PROTO_RE = re.compile(
     r"(?P<ret>(?:[A-Za-z_]\w*[\s\*]+)+?)(?P<name>(?P<base>[A-Za-z_]\w*?)(?:_fallback_|_va_)(?P<idx>\d+))\s*\((?P<params>[^;{}()]*)\)\s*(?:/\*[\s\S]*?\*/\s*)?(?P<end>[;{])"
 )
@@ -1038,7 +1051,10 @@ ERRNO_SHIM_FUNCTIONS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
 _ERRNO_SHIM_NAMES = frozenset(f[1] for f in ERRNO_SHIM_FUNCTIONS)
 # A call in CIL output is a statement or the right-hand side of an assignment (CIL hoists calls
 # out of expressions); a prototype has its return type before the name, so it never matches.
-_CALL_SITE_RE = re.compile(r"(?:^|[=;{}])[ \t]*(?:\([^()\n]*\)[ \t]*)?(?P<name>[A-Za-z_]\w*)[ \t]*\(", re.MULTILINE)
+_CALL_SITE_RE = re.compile(
+    r"(?:^|[=;{}:,!?&|()]|\breturn\b|\belse\b)[ \t]*(?:\([^()\n]*\)[ \t]*)?(?!(?:if|while|for|switch|return|sizeof)\b)(?P<name>[A-Za-z_]\w*)[ \t]*\(",
+    re.MULTILINE,
+)
 
 
 def find_errno_shim_calls(instrumented_source: str) -> list[str]:
@@ -1094,10 +1110,20 @@ def build_errno_shim_object(
     try:
         text = Path(instrumented_c).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return {"status": "error", "reason": f"cannot read instrumented source: {exc}", "wrapped": []}
+        return {"status": "error", "reason": f"cannot read instrumented source: {exc}", "wrapped": [], "unshimmed": []}
     names = find_errno_shim_calls(text)
+    raw_calls = {m.group("name") for m in _CALL_SITE_RE.finditer(text)}
+    unshimmed = sorted((raw_calls & _ERRNO_SHIM_NAMES) - set(names))
+    if unshimmed:
+        import warnings
+
+        warnings.warn(
+            f"libc call(s) without errno shim: {', '.join(unshimmed)}",
+            UserWarning,
+            stacklevel=2,
+        )
     if not names:
-        return {"status": "none", "wrapped": []}
+        return {"status": "none", "wrapped": [], "unshimmed": unshimmed}
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / "eacsl_errno_shim.c"
     obj = out_dir / "eacsl_errno_shim.o"
@@ -1111,10 +1137,16 @@ def build_errno_shim_object(
     except OSError as exc:
         rc, err = 127, str(exc)
     if rc != 0:
-        return {"status": "error", "reason": f"errno shim failed to compile: {err}", "wrapped": names}
+        return {
+            "status": "error",
+            "reason": f"errno shim failed to compile: {err}",
+            "wrapped": names,
+            "unshimmed": unshimmed,
+        }
     return {
         "status": "built",
         "wrapped": names,
+        "unshimmed": unshimmed,
         "object": str(obj),
         "source": str(src),
         "wrap_flags": "-Wl," + ",".join(f"--wrap={n}" for n in names),

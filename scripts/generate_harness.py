@@ -37,6 +37,7 @@ from framac_common import (  # noqa: E402
     normalize_flag_args,
     utc_now,
 )
+from patterns import FUZZER_ENTRY_DEF_RE, FUZZER_INIT_DEF_RE  # noqa: E402
 
 DEFAULT_TEMPLATE_DIR = Path("/opt/framac-pipeline/templates")
 MAX_HARNESS_REPAIR_ATTEMPTS = 2
@@ -136,10 +137,21 @@ def _wrap_null_terminated(eva_inner: str, fuzz_inner: str) -> tuple[str, str]:
 
 
 _PARAM_DECL_RE = re.compile(
-    r"^(?P<type_part>.*?)(?P<stars>(?:\*\s*)+)?(?P<name>[A-Za-z_]\w*)\s*(?P<array>\[[^\]]*\])?$"
+    r"^(?P<type_part>.*?)(?P<stars>(?:\*\s*)+)?(?P<name>[A-Za-z_]\w*)\s*(?P<array>(?:\[[^\]]*\]\s*)+)?$"
+)
+_ARRAY_PTR_PARAM_RE = re.compile(
+    r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*(?P<array>(?:\[[^\]]*\]\s*)+)$"
 )
 _FN_PTR_PARAM_RE = re.compile(r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*\((?P<args>.*)\)$")
 _FN_TYPE_PARAM_RE = re.compile(r"^(?P<head>[^(]+)\((?P<args>.*)\)$")
+
+
+def _format_c_decl(c_type: str, name: str) -> str:
+    m = re.match(r"^(.*?)\s*((?:\[[^\]]*\])+)$", c_type.strip())
+    if m:
+        return f"{m.group(1)} {name}{m.group(2)};"
+    return f"{c_type} {name};"
+
 # A directive with its continuation lines: a backslash before the newline continues it (a `[^\n]*`
 # would take that backslash and stop at the first line, leaving a macro's body in the text).
 _C_PP_DIRECTIVE_RE = re.compile(r"^[ \t]*#(?:\\\r?\n|[^\n])*", re.MULTILINE)
@@ -302,6 +314,31 @@ def _parse_c_param(raw_param: str, index: int) -> dict[str, Any]:
             "is_const": False,
         }
 
+    m_ap = _ARRAY_PTR_PARAM_RE.match(clean)
+    if m_ap:
+        ret = m_ap.group("ret").strip()
+        inner = m_ap.group("inner").strip()
+        array = m_ap.group("array").strip()
+        ident_matches = [
+            tok
+            for tok in re.findall(r"[A-Za-z_]\w*", inner)
+            if tok not in ("const", "volatile", "restrict", "__restrict", "__restrict__")
+        ]
+        name = ident_matches[-1] if ident_matches else f"arg_{index}"
+        inner_quals = re.sub(rf"\b{re.escape(name)}\b", "", inner).strip() if ident_matches else inner
+        star_part = f"* {inner_quals}".strip() if inner_quals else "*"
+        full_type = f"{ret} ({star_part}){array}"
+        pointee_type = f"{ret} {array}".strip()
+        return {
+            "raw": clean,
+            "type": full_type,
+            "pointee_type": pointee_type,
+            "name": name,
+            "is_pointer": True,
+            "is_fn_pointer": False,
+            "is_const": "const" in ret,
+        }
+
     m = _PARAM_DECL_RE.match(clean)
     if m:
         type_part = m.group("type_part").strip()
@@ -316,14 +353,30 @@ def _parse_c_param(raw_param: str, index: int) -> dict[str, Any]:
 
     if m and cand_name not in _C_TYPE_KEYWORDS and _has_concrete_type_token(type_part):
         name = cand_name
-        full_type = f"{type_part} {stars}".strip()
-        if array:
-            full_type = f"{full_type} *"
+        dims = re.findall(r"\[[^\]]*\]", array) if array else []
+        if len(dims) > 1:
+            rest_dims = "".join(dims[1:])
+            star_s = stars + " " if stars else ""
+            full_type = f"{type_part} {star_s}(*){rest_dims}".strip()
+            pointee_type = f"{type_part} {rest_dims}".strip()
+        elif len(dims) == 1:
+            full_type = f"{type_part} {stars}*".strip()
+            pointee_type = type_part
+        else:
+            full_type = f"{type_part} {stars}".strip()
+            pointee_type = type_part
     else:
-        array_m = re.search(r"\[[^\]]*\]\s*$", clean)
+        array_m = re.search(r"(?:\[[^\]]*\]\s*)+$", clean)
         if array_m:
             base = clean[: array_m.start()].strip()
-            full_type = f"{base} *".strip()
+            dims = re.findall(r"\[[^\]]*\]", array_m.group(0))
+            if len(dims) > 1:
+                rest_dims = "".join(dims[1:])
+                full_type = f"{base} (*){rest_dims}".strip()
+                pointee_type = f"{base} {rest_dims}".strip()
+            else:
+                full_type = f"{base} *".strip()
+                pointee_type = base
             array = array_m.group(0).strip()
         else:
             full_type = clean
@@ -333,11 +386,13 @@ def _parse_c_param(raw_param: str, index: int) -> dict[str, Any]:
 
     is_pointer = ("*" in full_type) or bool(array)
     is_const = bool(re.search(r"\bconst\b", full_type))
-    pointee_type = re.sub(r"\b(?:const|volatile|restrict|__restrict|__restrict__)\b", " ", full_type)
-    pointee_type = pointee_type.replace("*", " ")
-    pointee_type = " ".join(pointee_type.split()).strip() or "int"
-    if pointee_type == "void":
-        pointee_type = "uint8_t"
+    dims = re.findall(r"\[[^\]]*\]", array) if array else []
+    if len(dims) <= 1:
+        pointee_type = re.sub(r"\b(?:const|volatile|restrict|__restrict|__restrict__)\b", " ", full_type)
+        pointee_type = pointee_type.replace("*", " ")
+        pointee_type = " ".join(pointee_type.split()).strip() or "int"
+        if pointee_type == "void":
+            pointee_type = "uint8_t"
 
     return {
         "raw": clean,
@@ -470,17 +525,21 @@ def _collect_prototype_search_paths(
     return search_paths
 
 
-def extract_function_declaration(
-    entry_fn: str,
-    header_include: str | None = None,
-    sources: list[str] | None = None,
-    cppflags: str = "-I.",
-) -> str | None:
-    """
-    Extract a C forward declaration (`<ret> <entry_fn>(<params>);`) from `header_include` or `sources`,
-    stripping any leading `static` storage class so a multi-TU harness can declare it when `--header` is omitted.
-    """
-    search_paths = _collect_prototype_search_paths(header_include, sources, cppflags)
+def _lookup_model_function(model: dict[str, Any] | None, entry_fn: str) -> dict[str, Any] | None:
+    if not model or not isinstance(model, dict):
+        return None
+    fns = model.get("functions")
+    if isinstance(fns, dict):
+        for fid, rec in fns.items():
+            if not isinstance(rec, dict):
+                continue
+            name = rec.get("name") or str(fid).rpartition("#")[2]
+            if name == entry_fn:
+                return rec
+    return None
+
+
+def _scan_raw_c_declaration(entry_fn: str, search_paths: list[Path]) -> tuple[str, str] | None:
     sig_head_re = re.compile(
         rf"(?P<head>(?:[\w]+(?:\s+|\s*\*+\s*))+\**\s*\b{re.escape(entry_fn)})\s*\(",
         re.DOTALL,
@@ -505,13 +564,38 @@ def extract_function_declaration(
             if head == entry_fn:
                 head = f"int {entry_fn}"
             head = re.sub(r"\b(?:static|inline|__inline__|__inline)\b\s*", "", head).strip() or f"int {entry_fn}"
-            params_raw = " ".join(text[open_pos + 1 : close_pos].split()).strip() or "void"
-            return f"{head}({params_raw});"
+            params_raw = text[open_pos + 1 : close_pos].strip()
+            return head, params_raw
     return None
 
 
-_FUZZER_ENTRY_DEF_RE = re.compile(r"\bLLVMFuzzerTestOneInput\s*\([^;{)]*\)\s*\{")
-_FUZZER_INIT_DEF_RE = re.compile(r"\bLLVMFuzzerInitialize\s*\([^;{)]*\)\s*\{")
+def extract_function_declaration(
+    entry_fn: str,
+    header_include: str | None = None,
+    sources: list[str] | None = None,
+    cppflags: str = "-I.",
+    model: dict[str, Any] | None = None,
+) -> str | None:
+    """
+    Extract a C forward declaration (`<ret> <entry_fn>(<params>);`) from `header_include` or `sources`,
+    stripping any leading `static` storage class so a multi-TU harness can declare it when `--header` is omitted.
+    """
+    model_rec = _lookup_model_function(model, entry_fn)
+    if model_rec and model_rec.get("signature"):
+        sig = model_rec["signature"].strip().rstrip(";")
+        return f"{sig};"
+
+    search_paths = _collect_prototype_search_paths(header_include, sources, cppflags)
+    scan = _scan_raw_c_declaration(entry_fn, search_paths)
+    if scan is not None:
+        head, params_raw = scan
+        params_clean = " ".join(params_raw.split()).strip() or "void"
+        return f"{head}({params_clean});"
+    return None
+
+
+_FUZZER_ENTRY_DEF_RE = FUZZER_ENTRY_DEF_RE
+_FUZZER_INIT_DEF_RE = FUZZER_INIT_DEF_RE
 
 # A target's own libFuzzer hooks, renamed by -D in the sidecar cppflags so the generated harness's
 # LLVMFuzzerTestOneInput (and the E-ACSL runtime's LLVMFuzzerInitialize, templates/eacsl_runtime/
@@ -638,36 +722,38 @@ def extract_function_prototype(
     header_include: str | None = None,
     sources: list[str] | None = None,
     cppflags: str = "-I.",
+    model: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Locate the C declaration or definition of `entry_fn` in `header_include` or `sources`
     and return its parsed parameter list.
     """
-    search_paths = _collect_prototype_search_paths(header_include, sources, cppflags)
-
-    sig_head_re = re.compile(
-        rf"(?:[\w]+(?:\s+|\s*\*+\s*))+\**\s*\b{re.escape(entry_fn)}\s*\(",
-        re.DOTALL,
-    )
-    for path in search_paths:
-        try:
-            raw_text = path.read_text(encoding="utf-8", errors="replace")
-            text = _prepare_prototype_search_text(raw_text)
-        except OSError:
-            continue
-        for m in sig_head_re.finditer(text):
-            open_pos = m.end() - 1
-            close_pos = _find_matching_paren(text, open_pos)
-            if close_pos < 0:
-                continue
-            trailing = text[close_pos + 1 :].lstrip()
-            if not trailing.startswith((";", "{")):
-                continue
-            params_raw = text[open_pos + 1 : close_pos].strip()
+    model_rec = _lookup_model_function(model, entry_fn)
+    if model_rec and model_rec.get("signature"):
+        sig = model_rec["signature"]
+        m = re.search(rf"\b{re.escape(entry_fn)}\s*\((?P<params>.*)\)$", sig.strip())
+        if m:
+            params_raw = m.group("params").strip()
             if not params_raw or params_raw == "void":
                 return []
             parts = _split_top_level_params(params_raw)
-            return [_parse_c_param(p, idx) for idx, p in enumerate(parts)]
+            formals = list(model_rec.get("formals") or [])
+            parsed_parts = []
+            for idx, p in enumerate(parts):
+                p_clean = p.strip()
+                if idx < len(formals) and formals[idx] and not re.search(rf"\b{re.escape(formals[idx])}\b", p_clean):
+                    p_clean = f"{p_clean} {formals[idx]}"
+                parsed_parts.append(_parse_c_param(p_clean, idx))
+            return parsed_parts
+
+    search_paths = _collect_prototype_search_paths(header_include, sources, cppflags)
+    scan = _scan_raw_c_declaration(entry_fn, search_paths)
+    if scan is not None:
+        _head, params_raw = scan
+        if not params_raw or params_raw == "void":
+            return []
+        parts = _split_top_level_params(params_raw)
+        return [_parse_c_param(p, idx) for idx, p in enumerate(parts)]
 
     raise ValueError(
         f"Could not locate C prototype for function {entry_fn!r} in header {header_include!r} or sources {sources!r}"
@@ -830,11 +916,11 @@ def _build_auto_prototype_invocations(
         if p["is_pointer"]:
             pt = p["pointee_type"]
             vname = f"arg_{i}"
-            eva_lines.append(f"{pt} {vname};")
+            eva_lines.append(_format_c_decl(pt, vname))
             eva_lines.append(f"Frama_C_make_unknown((char *)&{vname}, sizeof({vname}));")
             eva_args.append(f"&{vname}")
 
-            fuzz_lines.append(f"{pt} {vname};")
+            fuzz_lines.append(_format_c_decl(pt, vname))
             fuzz_lines.append(f"memset(&{vname}, 0, sizeof({vname}));")
             fuzz_lines.append(
                 f"if (fuzz_len >= fuzz_off + sizeof({vname})) {{ "
@@ -848,11 +934,11 @@ def _build_auto_prototype_invocations(
         # Scalar integer / enum / struct-by-value parameter
         st = p["pointee_type"]
         vname = f"arg_{i}"
-        eva_lines.append(f"{st} {vname};")
+        eva_lines.append(_format_c_decl(st, vname))
         eva_lines.append(f"Frama_C_make_unknown((char *)&{vname}, sizeof({vname}));")
         eva_args.append(vname)
 
-        fuzz_lines.append(f"{st} {vname};")
+        fuzz_lines.append(_format_c_decl(st, vname))
         fuzz_lines.append(f"memset(&{vname}, 0, sizeof({vname}));")
         fuzz_lines.append(
             f"if (fuzz_len >= fuzz_off + sizeof({vname})) {{ "
@@ -1250,6 +1336,45 @@ def _insert_prelude_includes(
     harness_file.write_text("".join(lines), encoding="utf-8")
 
 
+_QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+EXTRA_INCLUDE_FIRST_MARK = "/* auto-prelude: moved before the header that needs it */"
+
+
+def _move_extra_include_first(
+    harness_file: Path, extra: str, header_include: str, failing_names: set[str], anchor: str | None = None
+) -> str | None:
+    """
+    Move the `#include "<extra>"` line of the harness up, before the first of: the module header line
+    (without one, the `anchor` line), and any earlier quoted include of a file in `failing_names` (the
+    basenames clang reported the unresolved identifiers in). Returns the harness text as it was, to
+    restore when the move does not help, or None when the line is not below such a line (nothing moved).
+    """
+    before_text = harness_file.read_text(encoding="utf-8")
+    lines = before_text.splitlines(keepends=True)
+    src = next(
+        (i for i, line in enumerate(lines) if (m := _QUOTED_INCLUDE_RE.match(line)) and m.group(1) == extra), None
+    )
+    if src is None:
+        return None
+    dst: int | None = None
+    for i, line in enumerate(lines[:src]):
+        m = _QUOTED_INCLUDE_RE.match(line)
+        included = m.group(1) if m else None
+        if (
+            (included is not None and header_include and included == header_include)
+            or (included is not None and Path(included).name in failing_names)
+            or (not header_include and anchor and anchor.strip() and line.strip() == anchor.strip())
+        ):
+            dst = i
+            break
+    if dst is None:
+        return None
+    lines.pop(src)
+    lines.insert(dst, f'#include "{extra}" {EXTRA_INCLUDE_FIRST_MARK}\n')
+    harness_file.write_text("".join(lines), encoding="utf-8")
+    return before_text
+
+
 def resolve_prelude_headers(
     harness_file: Path,
     cppflags: str,
@@ -1258,6 +1383,7 @@ def resolve_prelude_headers(
     clang: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
     anchor: str | None = None,
+    extra_includes: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Make the harness self-sufficient by auto-including the headers that define
@@ -1272,9 +1398,18 @@ def resolve_prelude_headers(
     the first line of the harness's header slot). Repeats up to `max_iterations`
     rewrite rounds, re-running clang after each one.
 
+    Identifiers no header of the -I directories defines (the search reads only the
+    `*.h` files directly in them, so not `libxml/tree.h`) may still be defined by one
+    of the harness's own `extra_includes` (`--extra-include`), which come after the
+    module header: each is moved in turn before the module header (or the earlier
+    include the identifiers failed in) and clang runs again. The move is kept when
+    identifiers are resolved by it and none is new, else undone. The moved headers
+    are returned as `extra_includes_first`, in the order the harness includes them.
+
     Returns a dict with `status` ("clean" | "resolved" | "unresolved" |
     "skipped"), `prelude_headers` (basenames as included), `unresolved_symbols`,
-    `iterations` (number of clang runs) and, when skipped, `reason`.
+    `iterations` (number of clang runs), `extra_includes_first` and, when skipped,
+    `reason`.
 
     clang also gets the run snapshot's `-idirafter` options (scripts/target_env.py), as every other
     compile of the target does: a header the build generated (libpng's `pnglibconf.h`) is only there.
@@ -1288,6 +1423,7 @@ def resolve_prelude_headers(
         "prelude_headers": [],
         "unresolved_symbols": [],
         "iterations": 0,
+        "extra_includes_first": [],
     }
     clang_bin = clang or shutil.which("clang")
     if not clang_bin:
@@ -1318,18 +1454,66 @@ def resolve_prelude_headers(
         str(harness_file),
     ]
     prelude: list[str] = []
+    moved_first: list[str] = []
     max_rounds = max(0, int(max_iterations))
     rounds = 0
-    while True:
+    pending: tuple[Any, str] | None = None  # the clang run that accepted a moved extra include
+
+    def _moved_in_order() -> list[str]:
         try:
-            proc = runner(cmd, capture_output=True, text=True, check=False, timeout=_PRELUDE_CLANG_TIMEOUT_S)
-        except (OSError, subprocess.SubprocessError) as exc:
-            result.update(status="skipped", reason=f"clang invocation failed: {exc}", prelude_headers=list(prelude))
-            return result
-        result["iterations"] += 1
-        output = f"{getattr(proc, 'stderr', '') or ''}\n{getattr(proc, 'stdout', '') or ''}"
+            text = harness_file.read_text(encoding="utf-8")
+        except OSError:
+            return list(moved_first)
+        found = [m.group(1) for line in text.splitlines() if (m := _QUOTED_INCLUDE_RE.match(line))]
+        return [h for h in found if h in moved_first]
+
+    def _move_an_extra_include(symbols: dict[str, list[str]], output: str) -> tuple[Any, str] | None:
+        """
+        The last resort before `unresolved` (no header of the -I directories defines what is left, or
+        the rewrite rounds are spent). One of the harness's own extra includes may define it, through
+        a header in a subdirectory or a system one, which the search does not read; but it comes
+        after the header that needs it. Move each in turn before that header and let clang judge: a
+        move is kept only when identifiers are resolved, none is new and fewer errors are left.
+        Returns the clang run of the move kept (process, output), or None when none helps.
+        """
+        failing_all = {Path(f.replace("\\", "/")).name for files in symbols.values() for f in files}
+        n_errors = len(_DIAG_ERROR_RE.findall(output))
+        for ext in extra_includes or []:
+            if ext in moved_first:
+                continue
+            before_text = _move_extra_include_first(harness_file, ext, module_line_include, failing_all, anchor)
+            if before_text is None:
+                continue
+            try:
+                trial = runner(cmd, capture_output=True, text=True, check=False, timeout=_PRELUDE_CLANG_TIMEOUT_S)
+            except (OSError, subprocess.SubprocessError):
+                harness_file.write_text(before_text, encoding="utf-8")
+                return None
+            result["iterations"] += 1
+            trial_output = f"{getattr(trial, 'stderr', '') or ''}\n{getattr(trial, 'stdout', '') or ''}"
+            if (
+                set(_parse_symbol_diagnostics(trial_output)) < set(symbols)
+                and len(_DIAG_ERROR_RE.findall(trial_output)) < n_errors
+            ):
+                moved_first.append(ext)
+                return trial, trial_output
+            harness_file.write_text(before_text, encoding="utf-8")
+        return None
+
+    while True:
+        if pending is not None:
+            (proc, output), pending = pending, None
+        else:
+            try:
+                proc = runner(cmd, capture_output=True, text=True, check=False, timeout=_PRELUDE_CLANG_TIMEOUT_S)
+            except (OSError, subprocess.SubprocessError) as exc:
+                result.update(status="skipped", reason=f"clang invocation failed: {exc}", prelude_headers=list(prelude))
+                return result
+            result["iterations"] += 1
+            output = f"{getattr(proc, 'stderr', '') or ''}\n{getattr(proc, 'stdout', '') or ''}"
         symbols = _parse_symbol_diagnostics(output)
         result["prelude_headers"] = list(prelude)
+        result["extra_includes_first"] = _moved_in_order()
 
         if not symbols:
             fatal = _DIAG_FATAL_RE.search(output)
@@ -1349,10 +1533,13 @@ def resolve_prelude_headers(
                 )
                 result.update(status="error", reason=f"clang compile error: {err_line}", unresolved_symbols=[])
             else:
-                result.update(status="resolved" if prelude else "clean", unresolved_symbols=[])
+                result.update(status="resolved" if prelude or moved_first else "clean", unresolved_symbols=[])
             return result
 
         if rounds >= max_rounds:
+            pending = _move_an_extra_include(symbols, output)
+            if pending is not None:
+                continue
             result.update(status="unresolved", unresolved_symbols=list(symbols))
             result["reason"] = f"prelude iteration cap ({max_rounds}) reached"
             return result
@@ -1402,6 +1589,9 @@ def resolve_prelude_headers(
             new_headers.append((best.name, before))
 
         if not new_headers:
+            pending = _move_an_extra_include(symbols, output)
+            if pending is not None:
+                continue
             result.update(status="unresolved", unresolved_symbols=unresolved or list(symbols))
             result["reason"] = "no defining header found in -I directories"
             return result
@@ -2122,21 +2312,48 @@ def _generate_module_harness(
 
     main_def_re = re.compile(r"\bmain\s*\([^;{}]*\)\s*\{")
     has_main_def = False
-    for src in sources or []:
-        sp = Path(src.replace("\\", "/").strip())
-        cands = [sp, Path("workspace/work") / sp]
-        for c in cands:
-            if c.is_file():
-                try:
-                    content = c.read_text(encoding="utf-8", errors="replace")
-                    cleaned = _strip_c_comments(content)
-                    if main_def_re.search(cleaned):
-                        has_main_def = True
+    capture_path = Path("workspace/reports/build_capture.json")
+    if not capture_path.is_file():
+        capture_path = Path(out_dir).parent.parent / "reports/build_capture.json"
+    if capture_path.is_file():
+        try:
+            capture = json.loads(capture_path.read_text(encoding="utf-8"))
+            for src in sources or []:
+                src_posix = src.replace("\\", "/").strip()
+                for c in capture.get("compiles") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    c_file = str(c.get("file") or "").replace("\\", "/")
+                    if c_file.endswith(src_posix) or src_posix.endswith(c_file):
+                        for fid in c.get("defined_functions") or []:
+                            if str(fid).rpartition("#")[2] == "main":
+                                has_main_def = True
+                                break
+                    if has_main_def:
                         break
-                except OSError:
-                    pass
-        if has_main_def:
-            break
+                if has_main_def:
+                    break
+        except (OSError, ValueError):
+            pass
+
+    if not has_main_def:
+        from acsl_ast import mask_comments_and_literals
+
+        for src in sources or []:
+            sp = Path(src.replace("\\", "/").strip())
+            cands = [sp, Path("workspace/work") / sp]
+            for c in cands:
+                if c.is_file():
+                    try:
+                        content = c.read_text(encoding="utf-8", errors="replace")
+                        cleaned = mask_comments_and_literals(content)
+                        if main_def_re.search(cleaned):
+                            has_main_def = True
+                            break
+                    except OSError:
+                        pass
+            if has_main_def:
+                break
 
     if has_main_def:
         main_flag = f"-Dmain=__framac_module_main_{_C_IDENT_JUNK.sub('_', module_name)}"
@@ -2164,6 +2381,7 @@ def _generate_module_harness(
             # The header slot's first line: without a --header, the declaration synthesized from
             # the sources sits there, and the headers defining its types must come before it.
             anchor=inc_lines[0],
+            extra_includes=norm_extra_includes,
         )
     else:
         prelude = {"status": "disabled", "prelude_headers": [], "unresolved_symbols": [], "iterations": 0}
@@ -2174,6 +2392,11 @@ def _generate_module_harness(
     }
     if prelude.get("reason"):
         prelude_fields["prelude_reason"] = prelude["reason"]
+    if prelude.get("extra_includes_first"):
+        # The `extra_includes` the harness includes before `header` instead of after it, in the order
+        # it includes them: the prelude resolution moved them there because the header (or an earlier
+        # include) needs what they define. Absent when none was moved.
+        prelude_fields["extra_includes_first"] = list(prelude["extra_includes_first"])
 
     # A repair that regenerates the harness keeps the count `--record-repair` kept, or the
     # repair cap would reset on every repair and the loop would never end.
@@ -2211,6 +2434,7 @@ def _generate_module_harness(
         "eva_expr": eva_expr,
         "fuzz_expr": fuzz_expr,
         "dispatch_cases": norm_dispatch_cases if entry_style == "dispatch" else [],
+        "dispatch_case_count": len(norm_dispatch_cases) if entry_style == "dispatch" or norm_dispatch_cases else 0,
         "include_source": include_source,
         "stubbed_callees": sorted(set(stubbed_callees or [])),
         "reachability": reachability,
@@ -2447,7 +2671,10 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help=(
             "One API-call case for --entry-style=dispatch (repeatable): C statements using fuzz_buf and "
-            "fuzz_len (the input after the selector byte); must respect the callee's contract and never return"
+            "fuzz_len (the input after the selector byte); must respect the callee's contract and never return. "
+            "With --api: a hand-written case appended after the generated ones (for a function in api_skipped), "
+            "one line of C; kept by a later --api run without the flag, replaced by one with it "
+            "(--dispatch-case '' drops them)"
         ),
     )
     parser.add_argument(
@@ -2522,6 +2749,8 @@ def main(argv: list[str] | None = None) -> int:
                 reachability=args.reachability,
                 auto_prelude=args.auto_prelude,
                 scope_files=args.scope_file,
+                # Hand-written cases after the generated ones; without the flag, the previous sidecar's.
+                dispatch_cases=args.dispatch_case or None,
             )
         except (ApiHarnessError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

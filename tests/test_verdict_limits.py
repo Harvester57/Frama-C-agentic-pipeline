@@ -90,7 +90,7 @@ DOOMED_BEHAVIOR = "[wp] [Failed] (Doomed) typed_f_wp_smoke_b_requires (Qed)\n  S
 DOOMED_DEFENSIVE = (
     "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s4 (Qed)\n"
     "[wp] [Failed] (Doomed) typed_log_err_wp_smoke_dead_call_s3 (Qed)\n"
-    "  Smoke Tests:     2 / 8\n"
+    "  Smoke Tests:     6 / 8\n"
 )
 
 

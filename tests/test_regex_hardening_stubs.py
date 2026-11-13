@@ -47,8 +47,9 @@ _EVA_DONE = "[eva] done for function fc_stub_smoke_main\n"
 
 
 def _smoke_sigs():
-    sigs = [stub_check.parse_proto(p) for p in (_HASH_PROTO, _SUM_PROTO, _ID_PROTO)]
-    assert all(sigs)
+    parsed = [stub_check.parse_proto(p) for p in (_HASH_PROTO, _SUM_PROTO, _ID_PROTO)]
+    sigs = [s for s in parsed if s is not None]
+    assert len(sigs) == len(parsed)
     _, lines_of = stub_check.smoke_source("mylib.h", sigs)
     line = {where: n for n, where in lines_of.items()}
     return sigs, line
@@ -553,7 +554,7 @@ def test_caller_conditions_follow_the_callers_flag():
             },
         ],
     }
-    records = {
+    records: dict[str, dict] = {
         "t.c#user_tmp": {"kernel_name": "user_tmp", "name": "user_tmp", "called_by": []},
         "t.c#die": {"kernel_name": "die", "name": "die", "called_by": []},
     }

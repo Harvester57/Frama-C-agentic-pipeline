@@ -511,7 +511,7 @@ class Plan:
         flag = "run_eacsl_fuzz" if kind == "fuzz" else "run_eva"
         out: dict[str, str] = {}
         for name, dag_mod in sorted(self.records.items()):
-            if not dag_mod.get(flag) or not MODULE_RE.match(name):
+            if not dag_mod.get(flag) or not MODULE_RE.fullmatch(name):
                 continue
             if is_deferred(str(dag_mod.get("tier") or ""), self.profile):
                 continue
@@ -654,7 +654,7 @@ def _module_base_cppflags(run_dir: Path, name: str, sidecar: dict | None = None)
     source of truth: prover briefs, the parent re-check and replay-candidates use the same flags,
     so Make builds hit their cache entries and the WP sweep re-proves what was merged.
     """
-    if sidecar is None and MODULE_RE.match(name or ""):
+    if sidecar is None and MODULE_RE.fullmatch(name or ""):
         sidecar = _load_sidecar(run_dir, name)
     try:
         tokens = split_flags((sidecar or {}).get("cppflags") or None, "-I.")
@@ -669,13 +669,25 @@ def _module_base_cppflags(run_dir: Path, name: str, sidecar: dict | None = None)
 _MAIN_DEF_RE = re.compile(r"\bmain\s*\([^;{}]*\)\s*\{")
 
 
-def _source_defines_main(path: Path) -> bool:
+def _source_defines_main(path: Path, capture: dict | None = None) -> bool:
+    if capture:
+        src_name = path.as_posix()
+        for c in capture.get("compiles") or []:
+            if not isinstance(c, dict):
+                continue
+            c_file = str(c.get("file") or "").replace("\\", "/")
+            if c_file.endswith(src_name) or src_name.endswith(c_file):
+                for fid in c.get("defined_functions") or []:
+                    if str(fid).rpartition("#")[2] == "main":
+                        return True
+        return False
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    cleaned = re.sub(r"/\*.*?\*/", " ", content, flags=re.DOTALL)
-    cleaned = re.sub(r"//[^\n]*", " ", cleaned)
+    from acsl_ast import mask_comments_and_literals
+
+    cleaned = mask_comments_and_literals(content)
     return bool(_MAIN_DEF_RE.search(cleaned))
 
 
@@ -692,7 +704,7 @@ def is_target_fuzzer(sidecar: dict | None) -> bool:
 
 def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     fuzz, eva = bool(dag_mod.get("run_eacsl_fuzz")), bool(dag_mod.get("run_eva"))
-    if not MODULE_RE.match(name) or name in _RESERVED_MODULES:
+    if not MODULE_RE.fullmatch(name) or name in _RESERVED_MODULES:
         raise _Excluded("module name cannot be used in make targets and report paths")
     target_fuzzer = is_target_fuzzer(plan.mm.sidecars.get(name))
     if target_fuzzer:
@@ -723,6 +735,13 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
     for raw_s in (sidecar.get("sources") or []) + (dag_mod.get("required_sources") or []):
         if isinstance(raw_s, str) and raw_s not in all_slice_sources:
             all_slice_sources.append(raw_s)
+    capture_file = plan.run_dir / "workspace/reports/build_capture.json"
+    capture = None
+    if capture_file.is_file():
+        try:
+            capture = json.loads(capture_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            capture = None
     has_main_def = False
     for src in all_slice_sources:
         if PurePosixPath(src).name == f"harness_{name}.c":
@@ -733,7 +752,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         ]
         for cp in cand_paths:
             if cp.is_file():
-                if _source_defines_main(cp):
+                if _source_defines_main(cp, capture=capture):
                     has_main_def = True
                 break
         if has_main_def:
@@ -1361,7 +1380,7 @@ def params_set(
     other setting Eva analyses under makes that decision stale by itself. ValueError on an invalid value.
     """
     run_dir = Path(run_dir)
-    if not MODULE_RE.match(module or ""):
+    if not MODULE_RE.fullmatch(module or ""):
         raise ValueError(f"invalid module name {module!r}")
     unknown = sorted(set(updates) - set(PARAM_TYPES))
     if unknown:
@@ -1982,7 +2001,7 @@ def ingest(
     with reason `not_run`. A malformed expected report is moved aside and stubbed the same way.
     """
     run_dir = Path(run_dir)
-    if module is not None and not MODULE_RE.match(module):
+    if module is not None and not MODULE_RE.fullmatch(module):
         raise PipelineMakeError(f"invalid module name {module!r}")
     runner = runner or _script_runner(run_dir)
     plan = plan or build_plan(run_dir)
@@ -2098,7 +2117,7 @@ def sweep_list(run_dir: Path | str = ".", warnings: list[str] | None = None) -> 
             isinstance(file, str)
             and is_safe_relative_path(file)
             and isinstance(function, str)
-            and FUNCTION_RE.match(function)
+            and FUNCTION_RE.fullmatch(function)
         ):
             skipped.append({"file": file, "function": function, "reason": "unsafe file path or function name"})
             continue
@@ -2159,7 +2178,7 @@ def sweep_list(run_dir: Path | str = ".", warnings: list[str] | None = None) -> 
                             isinstance(uf, str)
                             and is_safe_relative_path(uf)
                             and isinstance(ufn, str)
-                            and FUNCTION_RE.match(ufn)
+                            and FUNCTION_RE.fullmatch(ufn)
                         ):
                             continue
                         ent = entries.setdefault(

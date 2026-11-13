@@ -209,6 +209,22 @@ def missing_features(model: dict | None) -> list[str]:
     return [name for name in MODEL_FEATURES if not have[name]]
 
 
+def header_declared_functions(model: dict, header: str) -> set[str]:
+    """Audit function declarations for a project header directly from the Phase 0 model."""
+    norm_h = posixpath.normpath(header.replace("\\", "/")).lstrip("/")
+    decls: set[str] = set()
+    for fid, fn in (model.get("functions") or {}).items():
+        file = posixpath.normpath(str(fn.get("file") or "").replace("\\", "/")).lstrip("/")
+        if file == norm_h:
+            decls.add(str(fn.get("name") or fid.rsplit("#", 1)[-1]))
+    for name, info in (model.get("external_decls") or {}).items():
+        decl_loc = str(info.get("decl") or "")
+        loc_file = posixpath.normpath(decl_loc.partition(":")[0].replace("\\", "/")).lstrip("/")
+        if loc_file == norm_h:
+            decls.add(name)
+    return decls
+
+
 # ---------------------------------------------------------------------------------------------------
 # Paths and flags
 # ---------------------------------------------------------------------------------------------------

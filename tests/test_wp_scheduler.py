@@ -947,7 +947,7 @@ def test_reconcile_returns_orphaned_in_progress_units_and_reports_stale_briefs(s
             "brief": "agents/prover-old/brief.md",
             "agent_id": "prover-old",
             "live": False,
-            "reasons": ["unrendered placeholders: {c_file}, {function_name}"],
+            "reasons": ["unrendered placeholders: {c_file}, {function_name}, {references_dir}"],
             "action": "re-render with next --prepare",
         }
     ]

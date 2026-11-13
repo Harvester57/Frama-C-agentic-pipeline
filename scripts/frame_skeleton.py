@@ -65,6 +65,19 @@ def _paren_group(text: str, open_idx: int) -> tuple[str, int]:
     return text[open_idx + 1 :], len(text)
 
 
+def _bracket_group(text: str, open_idx: int) -> tuple[str, int] | None:
+    """Inner text of the bracket group opening at `open_idx`, and the index after its close."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : i], i + 1
+    return None
+
+
 def _offset_expr(lval: str, root: str) -> tuple[str, str] | None:
     """
     The offset expression of an access rooted at `root`: ("const"|"expr"|"zero", text).
@@ -79,19 +92,43 @@ def _offset_expr(lval: str, root: str) -> tuple[str, str] | None:
         m = re.match(rf"^{r}\s*\+\s*(.+)$", inner.strip())
         if m:
             return "expr", m.group(1).strip()
-        if re.fullmatch(rf"{r}", inner.strip()):
+        if inner.strip() == root:
             return "zero", "0"
         return None
     if re.match(rf"^\*\s*{r}(\s|$|->|\.|\[)", lv):
         return "zero", "0"
-    m = re.match(rf"^{r}\s*\[\s*(.+?)\s*\]", lv)
-    if m:
-        return "expr", m.group(1)
+    if re.match(rf"^{r}\s*\[", lv):
+        open_b = lv.find("[")
+        res = _bracket_group(lv, open_b)
+        if res is not None:
+            inner, _ = res
+            return "expr", inner.strip()
+        return None
     if re.match(rf"^{r}\s*(->|\.)", lv):
         return "zero", "0"
     if re.match(rf"^\(\s*\*\s*{r}\s*\)\s*\.", lv):
         return "zero", "0"
     return None
+
+
+def _strip_matching_parens(s: str) -> str:
+    s = s.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        matching = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i < len(s) - 1:
+                    matching = False
+                    break
+        if matching:
+            s = s[1:-1].strip()
+        else:
+            break
+    return s
 
 
 def _classify_offset(expr: str, loops: list[dict]) -> tuple[str, int | tuple[str, bool] | None]:
@@ -105,15 +142,35 @@ def _classify_offset(expr: str, loops: list[dict]) -> tuple[str, int | tuple[str
             if e not in scalars:
                 continue
             guard = str(loop.get("guard") or "")
-            m = re.search(rf"\b{re.escape(e)}\s*(<=|<)\s*([A-Za-z_][A-Za-z0-9_]*|\d+)", guard) or re.search(
-                rf"([A-Za-z_][A-Za-z0-9_]*|\d+)\s*(>=|>)\s*{re.escape(e)}\b", guard
-            )
-            if m:
-                if m.lastindex == 2:
-                    bound, incl = m.group(2), m.group(1) == "<="
-                else:
-                    bound, incl = m.group(1), m.group(2) == ">="
-                return "range", (bound, incl)
+            if not guard or "||" in guard:
+                continue
+
+            var_re = rf"^(?:\([^)]+\)\s*)?{re.escape(e)}$"
+            conjuncts = [c.strip() for c in guard.split("&&")]
+            for c in conjuncts:
+                c = _strip_matching_parens(c)
+
+                # Forward: <lhs: e> (<|<=) <rhs: bound>
+                m_fwd = re.match(r"^(?P<lhs>.+?)\s*(?P<op><=|<=?)\s*(?P<rhs>.+)$", c)
+                if m_fwd:
+                    lhs = m_fwd.group("lhs").strip()
+                    op = m_fwd.group("op").strip()
+                    rhs = m_fwd.group("rhs").strip()
+                    if re.match(var_re, lhs):
+                        if _IDENT_RE.fullmatch(rhs) or _INT_RE.fullmatch(rhs):
+                            return "range", (rhs, op == "<=")
+                        return "unknown", None
+
+                # Reverse: <lhs: bound> (>|>=) <rhs: e>
+                m_rev = re.match(r"^(?P<lhs>.+?)\s*(?P<op>>=|>=?)\s*(?P<rhs>.+)$", c)
+                if m_rev:
+                    lhs = m_rev.group("lhs").strip()
+                    op = m_rev.group("op").strip()
+                    rhs = m_rev.group("rhs").strip()
+                    if re.match(var_re, rhs):
+                        if _IDENT_RE.fullmatch(lhs) or _INT_RE.fullmatch(lhs):
+                            return "range", (lhs, op == ">=")
+                        return "unknown", None
         return "unknown", None
     return "unknown", None
 

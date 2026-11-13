@@ -70,6 +70,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from patterns import FUZZER_ENTRY_DEF_RE, FUZZER_INIT_DEF_RE, MODULE_RE  # noqa: E402
 
 SCHEMA_VERSION = 1
 REPORT_JSON = Path("workspace/reports/fuzz_assets.json")
@@ -98,9 +99,9 @@ IMPORTED_PREFIX = "imp-"
 
 C_SUFFIXES = {".c": "c", ".cc": "cxx", ".cpp": "cxx", ".cxx": "cxx"}
 _ID_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,120}$")
-_MODULE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}$")  # pipeline_make.MODULE_RE
-_FUZZER_ENTRY_DEF_RE = re.compile(r"\bLLVMFuzzerTestOneInput\s*\(([^;{)]*)\)\s*\{")  # generate_harness's
-_FUZZER_INIT_DEF_RE = re.compile(r"\bLLVMFuzzerInitialize\s*\([^;{)]*\)\s*\{")
+_MODULE_RE = MODULE_RE
+_FUZZER_ENTRY_DEF_RE = FUZZER_ENTRY_DEF_RE
+_FUZZER_INIT_DEF_RE = FUZZER_INIT_DEF_RE
 _COMMENT_OR_LITERAL_RE = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.S)
 _CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _NOT_CALLS = {

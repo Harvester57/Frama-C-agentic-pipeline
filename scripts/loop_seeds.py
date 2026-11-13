@@ -542,7 +542,7 @@ GuardRunner = Callable[[Path, str], dict]
 def _kernel_error_line(result: dict, file_name: str) -> int | None:
     errors = (result.get("syntax_check") or {}).get("errors") or []
     for message in errors:
-        m = re.search(rf"{re.escape(file_name)}:(\d+)", str(message))
+        m = re.search(rf"(?<![\w.-]){re.escape(file_name)}:(\d+)", str(message))
         if m:
             return int(m.group(1))
     return None

@@ -20,7 +20,7 @@ import build_capture as bc
 import framac_common
 import resources
 import target_env
-from conftest import ROOT
+from conftest import ROOT, dockerfile_command_args, dockerfile_commands, dockerfile_stages
 
 FIXTURE = ROOT / "tests" / "fixtures" / "r8_generated_header"
 
@@ -252,16 +252,121 @@ def test_wrappers_and_compose_no_longer_chmod_the_scratch_volume():
 @pytest.mark.unit
 def test_both_images_create_the_scratch_directory_world_writable():
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    build, analysis = text.split("AS framac-build", 1)[1].split("AS framac-analysis", 1)
-    for stage in (build, analysis):
-        assert re.search(r"mkdir -p [^\n]*/framac-scratch", stage)
-        assert re.search(r"chmod 1777 [^\n]*/framac-scratch", stage)
+    stages = dockerfile_stages(text)
+    assert [s.name for s in stages] == ["framac-build", "framac-analysis"]
+    for stage in stages:
+        assert "/framac-scratch" in dockerfile_command_args(stage.text, "mkdir", "-p"), stage.name
+        assert "/framac-scratch" in dockerfile_command_args(stage.text, "chmod", "1777"), stage.name
     # The two Debian bases stay aligned by pinned digests (decision D9).
-    assert re.search(r"ARG FRAMAC_BASE=\S+@sha256:[0-9a-f]{64}", text)
-    assert re.search(r"ARG DEBIAN_BASE=\S+@sha256:[0-9a-f]{64}", text)
+    assert _unpinned_bases(text) == []
     assert "pinned digests" in text
     # The image build runs only the model selftest; the canaries run in CI.
-    assert re.findall(r"^RUN python3 \S+/(\w+)\.py (\w+)", text, re.MULTILINE) == [("phase0_model", "selftest")]
+    assert _image_script_runs(text) == [("phase0_model", "selftest")]
+
+
+def _unpinned_bases(text: str) -> list[str]:
+    """The base-image arguments of a Dockerfile that are not set, on a line of their own, to a full digest."""
+    return [
+        name
+        for name in ("FRAMAC_BASE", "DEBIAN_BASE")
+        if len(re.findall(rf"^ARG {name}=\S+@sha256:[0-9a-f]{{64}}$", text, re.MULTILINE)) != 1
+        or len(re.findall(rf"^\s*ARG\s+{name}=", text, re.MULTILINE)) != 1
+    ]
+
+
+def _image_script_runs(text: str) -> list[tuple[str, str]]:
+    """
+    (script, subcommand) of every `python3 <script>.py <subcommand>` an image build runs, wherever it sits
+    in a RUN instruction. Inline code (`python3 -c`) may patch a file of the image, never run the pipeline.
+    """
+    runs = []
+    for argv in dockerfile_commands(text):
+        if Path(argv[0]).name != "python3":
+            continue
+        if argv[1:2] == ["-c"]:
+            assert "framac-pipeline" not in argv[2] and "selftest" not in argv[2], argv
+            continue
+        assert len(argv) > 1 and argv[1].endswith(".py"), f"python3 runs something other than a script: {argv}"
+        runs.append((Path(argv[1]).stem, argv[2] if len(argv) > 2 else ""))
+    return runs
+
+
+DOCKERFILE_SAMPLE = """\
+ARG FRAMAC_BASE=framac/frama-c:dev@sha256:{digest}
+ARG DEBIAN_BASE=debian:trixie-slim@sha256:{digest}
+FROM ${{DEBIAN_BASE}} AS framac-build
+RUN apt-get install -y python3 \\
+    # a comment inside a continued instruction
+    && mkdir -p /home/framac/.cache /framac-scratch /framac-cache \\
+    && chmod 1777 /framac-cache /framac-scratch
+FROM ${{FRAMAC_BASE}} AS framac-analysis
+RUN chmod a+rx /home/opam /root && python3 -c "print('a; b && c')" \\
+    && chmod 1777 /home/opam /framac-scratch
+RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
+""".format(digest="0123456789abcdef" * 4)
+
+
+@pytest.mark.unit
+def test_dockerfile_helpers_read_whole_commands():
+    text = DOCKERFILE_SAMPLE
+    build, analysis = dockerfile_stages(text)
+    assert (build.base, build.name) == ("${DEBIAN_BASE}", "framac-build")
+    # Arguments are a set per command and mode: order and line do not matter, a path of another mode is out.
+    assert dockerfile_command_args(build.text, "chmod", "1777") == {"/framac-cache", "/framac-scratch"}
+    assert dockerfile_command_args(build.text, "mkdir", "-p") >= {"/framac-scratch", "/framac-cache"}
+    assert dockerfile_command_args(analysis.text, "chmod", "1777") == {"/home/opam", "/framac-scratch"}
+    assert "/root" not in dockerfile_command_args(analysis.text, "chmod", "1777")
+    # A quoted argument stays one word, operators inside it included; the apt package is not a command.
+    assert ["python3", "-c", "print('a; b && c')"] in dockerfile_commands(text)
+    assert _image_script_runs(text) == [("phase0_model", "selftest")]
+    assert _unpinned_bases(text) == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # A longer name is another directory (the old `chmod 1777 [^\n]*/framac-scratch` took it).
+        ("&& chmod 1777 /framac-cache /framac-scratch\n", "&& chmod 1777 /framac-cache /framac-scratch-old\n"),
+        ("/framac-scratch /framac-cache \\", "/framac-scratch-old /framac-cache \\"),
+    ],
+)
+def test_a_scratch_directory_of_another_name_is_not_the_scratch_directory(old, new):
+    assert old in DOCKERFILE_SAMPLE
+    build = dockerfile_stages(DOCKERFILE_SAMPLE.replace(old, new))[0]
+    created = dockerfile_command_args(build.text, "mkdir", "-p") & dockerfile_command_args(build.text, "chmod", "1777")
+    assert "/framac-scratch" not in created
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # Commented out, with the pattern still on the line.
+        ("ARG FRAMAC_BASE=", "ARG FRAMAC_BASE=framac/frama-c:dev\n# ARG FRAMAC_BASE="),
+        ("ARG DEBIAN_BASE=", "# ARG DEBIAN_BASE="),
+        # 65 hexadecimal digits are not a digest.
+        ("\nARG DEBIAN_BASE", "f\nARG DEBIAN_BASE"),
+        ("@sha256:", ":"),
+    ],
+)
+def test_a_base_image_without_a_full_digest_is_reported(old, new):
+    assert old in DOCKERFILE_SAMPLE
+    assert _unpinned_bases(DOCKERFILE_SAMPLE.replace(old, new, 1))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # Chained on a continuation line of another RUN (the old `^RUN python3 ...` saw only the line start).
+        "RUN echo ok \\\n    && python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest\n",
+        "RUN true; python3 /opt/framac-pipeline/scripts/stub_check.py run\n",
+        "RUN  python3  /opt/framac-pipeline/scripts/run_eacsl_fuzz.py selftest\n",
+    ],
+)
+def test_a_second_script_run_in_the_image_build_is_seen(extra):
+    assert len(_image_script_runs(DOCKERFILE_SAMPLE + extra)) == 2
 
 
 @pytest.mark.unit

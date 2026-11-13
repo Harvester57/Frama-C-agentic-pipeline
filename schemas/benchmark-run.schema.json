@@ -11,7 +11,7 @@
       "properties": {
         "commit": {"type": ["string", "null"]},
         "dirty": {"type": ["boolean", "null"]},
-        "content_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "content_digest": {"$ref": "#/definitions/sha256"}
       },
       "required": ["commit", "dirty", "content_digest"]
     },
@@ -44,6 +44,7 @@
   },
   "required": ["schema_version", "run_id", "created_at", "mode", "pipeline", "toolchain", "machine", "limits", "selection", "targets", "recall", "briefs", "totals"],
   "definitions": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "rate": {
       "type": "object",
       "properties": {
@@ -60,7 +61,7 @@
       "properties": {
         "set": {"type": "string", "enum": ["recall", "comparison"]},
         "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "harness_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "harness_digest": {"$ref": "#/definitions/sha256"},
         "status": {"type": "string", "enum": ["ok", "partial", "failed"]},
         "problems": {"type": "array", "items": {"type": "string"}},
         "stages": {"type": "object"},

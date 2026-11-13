@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from eva_loops import loop_ref_problem
+from patterns import C_IDENT_RE, DOMAIN_RE
 
 MAX_INT_OPTION = 1_000_000
 EXTRA_DOMAINS = ("multidim",)
@@ -42,9 +43,8 @@ EQUALITY_THROUGH_CALLS = ("none", "formals", "all")
 ALLOC_BUILTIN_MODES = ("imprecise", "by_stack", "fresh", "fresh_weak")
 STD_ALLOC_FUNCTIONS = ("malloc", "calloc", "realloc")
 _SIMPLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
-_C_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_FUNC_VALUE_RE = re.compile(r"^([^:]+):(.+)$")
-_DOMAIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_C_IDENT_RE = C_IDENT_RE
+_DOMAIN_NAME_RE = DOMAIN_RE
 
 
 @dataclass(frozen=True)
@@ -135,10 +135,9 @@ def option_problem(name: str, value: Any) -> str | None:
         if not entries or not all(isinstance(e, str) for e in entries):
             return f"{name} must be a 'func:param' string or a non-empty list of them"
         for entry in entries:
-            m = _FUNC_VALUE_RE.match(entry)
-            if not m:
+            head, sep, tail = entry.partition(":")
+            if not sep or not head or not tail:
                 return f"{name} entries must be 'func:param' (got {entry!r})"
-            head = m.group(1)
             if spec.domains:
                 if not _DOMAIN_NAME_RE.fullmatch(head):
                     return f"{name} entries must start with a domain name (got {head!r})"

@@ -13,6 +13,7 @@ import pytest
 import eacsl_toolchain as T
 import ledger
 import run_eacsl_fuzz as R
+from conftest import makefile_rule, makefile_rules
 from framac_common import scan_undeclared_functions
 from sandbox_exec import SandboxResult
 
@@ -1063,7 +1064,7 @@ def test_json_stub_completes_opaque_handles_and_declares_from_fd():
     text = (REPO / "templates/fc_stubs/json-c/json.h").read_text(encoding="utf-8")
     assert "json_object *json_object_from_fd(int fd);" in text
     for name in ("json_object", "array_list", "lh_table"):
-        assert re.search(rf"struct {name} \{{ int _fc_opaque; \}};", text)
+        assert f"struct {name} {{ int _fc_opaque; }};" in text
 
 
 def test_fc_stubs_readme_documents_rules():
@@ -1114,8 +1115,9 @@ def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     assert "e-acsl-gcc" not in code and re.search(r"\bframa-c\b", code) is None and "FRAMAC" not in code
 
-    # Logical recipe lines: a tab-led line plus its backslash continuations.
-    recipes = [re.sub(r"\s*\\\n\s*", " ", r) for r in re.findall(r"^\t((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE)]
+    # Logical recipe lines (continuations joined) of every rule, those of the `define` bodies included:
+    # there a `$$(X)` is the `$(X)` the rule gets once it is evaluated.
+    recipes = [line.replace("$$(", "$(") for rule in makefile_rules(text) for line in rule.recipe]
     invocations = 0
     for line in recipes:
         if line in ("$(PM) sweep", "$(PY) $(S)/wp_scheduler.py baseline"):  # coordinators; lease wp jobs per function
@@ -1127,14 +1129,14 @@ def test_pipeline_makefile_builds_only_through_the_pipeline_scripts():
     assert invocations >= 15
 
     # fuzz depends on the selftest and the module's build; the static build never runs the canary.
-    assert re.search(r"^\$\(FUZZ_TARGETS\): fuzz-%: selftest build-%$", text, re.MULTILINE)
-    assert re.search(r"^\$\(BUILD_TARGETS\): build-%:$", text, re.MULTILINE)
-    fuzz = next(r for r in recipes if "campaign" in r)
+    fuzz_rule = makefile_rule(text, "$(FUZZ_TARGETS)")
+    assert fuzz_rule.pattern == "fuzz-%" and {"selftest", "build-%"} <= set(fuzz_rule.prerequisites)
+    build_rule = makefile_rule(text, "$(BUILD_TARGETS)")
+    assert build_rule.pattern == "build-%" and "selftest" not in build_rule.prerequisites
+    (fuzz,) = (r for r in fuzz_rule.recipe if "campaign" in r)
     assert "--class fuzz" in fuzz and "--workers auto --fuzz-budget $(FUZZ_BUDGET_$*)" in fuzz
     assert "--selftest-json $(SELFTEST_JSON)" in fuzz and "--cppflags=$(CPPFLAGS_$*)" in fuzz
-    m_phony = re.search(r"^\.PHONY:((?:[^\n]*\\\n)*[^\n]*)", text, re.MULTILINE)
-    assert m_phony is not None
-    phony = set(m_phony.group(1).replace("\\", " ").split())
+    phony = set(makefile_rule(text, ".PHONY").prerequisites)
     assert {
         "slice-init",
         "dag",
@@ -1576,3 +1578,91 @@ def test_eacsl_binary_sees_the_errno_libc_set(tmp_path):
     assert "READ errno=9 ebadf=9 n=-1" in proc.stdout, out[-4000:]
     # The target's errno = 0 reaches libc, so a successful call does not show a stale EBADF.
     assert "OKSTRTOL errno=0 v=12" in proc.stdout, out[-4000:]
+
+
+# ---------------------------------------------------------------------------
+# D3, D4, D5: LLD diagnostics, Libc call sites, Store block integer suffixes
+# ---------------------------------------------------------------------------
+
+
+def test_parse_undefined_fallbacks_accepts_lld_undefined_symbol():
+    """D3: LLVM lld output 'undefined symbol: name' must be parsed."""
+    log = (
+        "ld.lld: error: undefined symbol: snprintf_va_3\n"
+        ">>> referenced by fuzz_transport.c:123\n"
+        "ld.lld: error: undefined symbol: fcntl_fallback_2\n"
+        "ld.lld: error: undefined symbol: 'open_fallback_1'\n"
+    )
+    assert T.parse_undefined_fallbacks(log) == ["snprintf_va_3", "fcntl_fallback_2", "open_fallback_1"]
+
+
+def test_find_errno_shim_calls_detects_calls_in_complex_statements():
+    """D4: Libc calls in if-conditions, return statements, and ternary expressions must be found."""
+    src = (
+        "int __fc_eacsl_errno;\n"
+        "extern int close(int fd);\n"
+        "extern int fclose(void *f);\n"
+        "extern ssize_t read(int fd, void *buf, size_t n);\n"
+        "int f(void *f, int fd, char *buf) {\n"
+        "  if (f) fclose(f);\n"
+        "  if (close(fd) != 0) return -1;\n"
+        "  return (ssize_t)read(fd, buf, 4);\n"
+        "}\n"
+    )
+    calls = T.find_errno_shim_calls(src)
+    assert "fclose" in calls
+    assert "close" in calls
+    assert "read" in calls
+
+
+def test_build_errno_shim_object_logs_warning_on_unshimmed_libc_calls(tmp_path):
+    """D4: When libc calls exist in source but receive no shim, a warning is emitted and recorded."""
+    src = tmp_path / "mod.instrumented.c"
+    # No __fc_eacsl_errno global, but close() is called
+    src.write_text("void f(int fd) { close(fd); }\n", encoding="utf-8")
+    with pytest.warns(UserWarning, match="libc call.*without errno shim.*close"):
+        res = T.build_errno_shim_object(src, tmp_path / "shim")
+    assert res["status"] == "none"
+    assert res.get("unshimmed") == ["close"]
+
+
+@pytest.mark.parametrize("suffix", ["4U", "4L", "4ULL", "4"])
+def test_mark_formals_initialized_supports_all_integer_suffix_forms(suffix):
+    """D5: Support integer suffixes in __e_acsl_store_block (U, L, ULL, bare)."""
+    src = (
+        "int f_struct(int k)\n"
+        "{\n"
+        f"  __e_acsl_store_block((void *)(& k),{suffix});\n"
+        "  return k + 1;\n"
+        "}\n"
+    )
+    patched, n = T.mark_formals_initialized(src)
+    assert n == 1
+    assert "__e_acsl_full_init((void *)(& k));" in patched
+
+
+def test_mark_formals_initialized_warns_when_store_block_lines_exist_and_none_match():
+    """D5: Warn when __e_acsl_store_block exists in source but none matches _STORE_BLOCK_LINE_RE."""
+    src = (
+        "int f(int k) {\n"
+        "  __e_acsl_store_block(bogus_syntax_here);\n"
+        "  return k;\n"
+        "}\n"
+    )
+    with pytest.warns(UserWarning, match="__e_acsl_store_block lines exist in text but none matched"):
+        patched, n = T.mark_formals_initialized(src)
+    assert n == 0
+
+
+@pytest.mark.parametrize("suffix", ["8UL", "8U", "8L", "8ULL", "8"])
+def test_fix_readonly_scalar_globals_supports_all_integer_suffix_forms(suffix):
+    """D5: fix_readonly_scalar_globals supports all integer suffix forms."""
+    src = (
+        f"  __e_acsl_store_block((void *)(& kMaxEmbeddedInt), {suffix});\n"
+        "  __e_acsl_full_init((void *)(& kMaxEmbeddedInt));\n"
+        "  __e_acsl_mark_readonly((void *)kMaxEmbeddedInt);\n"
+    )
+    patched, n = T.fix_readonly_scalar_globals(src)
+    assert n == 1
+    assert "__e_acsl_mark_readonly((void *)(& kMaxEmbeddedInt));" in patched
+

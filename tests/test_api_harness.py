@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -335,7 +336,7 @@ def _generate_fixture(tmp_path, monkeypatch, names: list[str]) -> tuple[Path, li
     return out, writes
 
 
-def _gen(out: Path) -> dict:
+def _gen(out: Path, **kw: Any) -> dict:
     return ah.generate(
         "lib",
         None,
@@ -346,6 +347,7 @@ def _gen(out: Path) -> dict:
         dag_path=Path("dag.json"),
         model_path=Path("model.json"),
         traces_path=Path("none/traces.jsonl"),
+        **kw,
     )
 
 
@@ -410,6 +412,264 @@ def test_case_probe_lifts_the_error_cap_and_reports_unlocated_errors(tmp_path, m
     assert "-fmax-errors=0" in seen[1] and "-ferror-limit=0" not in seen[1]
 
 
+# --- variable names (PTF WriteAnomaly: `redefinition of 'c0a0'`) ----------------------------------------
+
+# `int WriteAnomaly(const AnomalyDBEntry_T *AnomalyElement, char ChainId[])`: the model spells the
+# typedef as its struct, the call sites pass one object (`param_sizes`), and the struct holds pointers.
+_ANOMALY_H = (
+    "typedef struct AnomalyBase_T {\n"
+    "    const unsigned char *Data;\n    unsigned int DataLen;\n    char *Name;\n    int Id;\n"
+    "} AnomalyDBEntry_T;\n"
+    "int WriteAnomaly(const AnomalyDBEntry_T *AnomalyElement, char ChainId[]);\n"
+)
+_ANOMALY_LAYOUT = {
+    "what": "struct",
+    "size": 32,
+    "align": 8,
+    "pointers": True,
+    "fields": [
+        {"name": "Data", "off": 0, "kind": "ptr", "size": 8, "pointers": True, "const": True},
+        {"name": "DataLen", "off": 8, "kind": "int", "size": 4, "pointers": False, "ctype": "unsigned int"},
+        {"name": "Name", "off": 16, "kind": "ptr", "size": 8, "pointers": True, "const": False},
+        {"name": "Id", "off": 24, "kind": "int", "size": 4, "pointers": False, "ctype": "int"},
+    ],
+}
+_ANOMALY_REC = {
+    "signature": "int(struct AnomalyBase_T *,char *)",
+    "formals": [{"name": "AnomalyElement", "kind": "const_pointer"}, {"name": "ChainId", "kind": "pointer"}],
+    "param_sizes": {"0": {"min": 32, "max": 32, "sites": 1}},
+}
+
+
+def _declared(stmt: str) -> list[str]:
+    """The zero-initialized variables a case declares (`<type> <name>[...]; memset(...)`), as the generator writes them."""
+    import re
+
+    return re.findall(r"(?:^|; |\} )(?:static )?(?:[A-Za-z_]\w* )+([^ ;=]+?)(?:\[[^;]*\])?;", stmt)
+
+
+def test_pointer_field_storage_of_a_struct_in_an_array_has_an_identifier_for_a_name():
+    api = ah.ApiInfo(structs={"struct AnomalyBase_T": _ANOMALY_LAYOUT}, probed=True)
+    stmt, layout, why = ah.single_case("WriteAnomaly", _ANOMALY_REC, SPARE, api)
+    assert why is None and stmt is not None and layout is not None
+    # The object is an array of the call sites' size, its fields are filled through `c0a0[0]`...
+    assert "struct AnomalyBase_T c0a0[(32 + sizeof(struct AnomalyBase_T) - 1) / sizeof(struct AnomalyBase_T)];" in stmt
+    assert "c0a0[0].Data = (void *)(fuzz_buf + fuzz_off);" in stmt
+    # ... and the storage of its lone pointer field was `static unsigned char c0a0[0]f2[N]`: a second
+    # `c0a0`, of type `unsigned char[0]`.
+    assert "c0a0[0]f" not in stmt
+    assert f"static unsigned char c0a0_0_f2[{SPARE}];" in stmt and "c0a0[0].Name = (void *)c0a0_0_f2;" in stmt
+    names = _declared(stmt)
+    assert names == ["c0a0", "c0a0_0_f2", "c0a1"]
+    # Without a call-site size the object is one struct, named as before.
+    stmt, _, _ = ah.single_case("WriteAnomaly", {**_ANOMALY_REC, "param_sizes": {}}, SPARE, api)
+    assert stmt is not None and f"static unsigned char c0a0f2[{SPARE}];" in stmt
+
+
+@pytest.mark.skipif(shutil.which("clang") is None, reason="needs clang")
+def test_the_struct_array_case_compiles(tmp_path):
+    import subprocess
+
+    api = ah.ApiInfo(structs={"struct AnomalyBase_T": _ANOMALY_LAYOUT}, probed=True)
+    stmt, _, _ = ah.single_case("WriteAnomaly", _ANOMALY_REC, SPARE, api)
+    src = tmp_path / "harness_lib.c"
+    src.write_text(
+        "#include <stddef.h>\n#include <string.h>\n#define FRAMAC_FUZZ_COPY(buf, off) ((buf) + (off))\n"
+        + _ANOMALY_H
+        + "void run(const unsigned char *fuzz_buf, size_t fuzz_len) {\n    switch (fuzz_len % 1U) {\n"
+        + f"    case 0U: {{ {stmt} }} break;\n"
+        + "    }\n}\n"
+    )
+    proc = subprocess.run(["clang", "-fsyntax-only", "-x", "c", str(src)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert ah.probe_cases(src, "") == ({}, [])
+
+
+def test_a_case_never_declares_a_name_twice():
+    case = ah._Case(SPARE)
+    assert case.declare("c0a0") == "c0a0"
+    with pytest.raises(ah._DeclError, match="'c0a0' would be declared twice"):
+        case.declare("c0a0")
+    with pytest.raises(ah._DeclError, match=r"'c0a0\[0\]f2' is not a C identifier"):
+        case.declare("c0a0[0]f2")
+
+
+def test_a_name_collision_skips_the_function_with_a_reason():
+    # Field paths `a.b` and `a_b` give their pointer storage the same name: the case is not written.
+    ptr = {"name": "p", "off": 0, "kind": "ptr", "size": 8, "pointers": True, "const": False}
+    inner = {"what": "struct", "size": 8, "align": 8, "pointers": True, "fields": [ptr]}
+
+    def member(name: str, off: int, ctype: str) -> dict:
+        return {
+            "name": name,
+            "off": off,
+            "kind": "record",
+            "size": 8,
+            "pointers": True,
+            "what": "struct",
+            "ctype": ctype,
+        }
+
+    structs = {
+        "struct inner": inner,
+        "struct mid": {**inner, "fields": [member("b", 0, "struct inner")]},
+        "struct outer": {
+            "what": "struct",
+            "size": 16,
+            "align": 8,
+            "pointers": True,
+            "fields": [member("a", 0, "struct mid"), member("a_b", 8, "struct inner")],
+        },
+    }
+    rec = {"signature": "int(struct outer)", "formals": _formals("value")}
+    stmt, layout, why = ah.single_case("take", rec, SPARE, ah.ApiInfo(structs=structs, probed=True))
+    assert stmt is None and layout is None
+    assert why == "generator defect: variable 'c0a0_a_bf0' would be declared twice in the case"
+
+    dag = _dag({"take": _fn("take"), "ok": _fn("ok")}, ["take", "ok"])
+    model = _model(take=rec, ok={"signature": "int(int)", "formals": _formals("value")})
+    p = ah.plan(dag, model, "lib", "lib", 64, struct_layouts=structs, visible=set())
+    assert p["skipped"] == {"take": why} and [lay["calls"] for lay in p["layouts"]] == [["ok"]]
+
+
+# --- hand-written cases (`--api --dispatch-case`) -------------------------------------------------------
+
+_CUSTOM_CASE = "if (fuzz_len >= 4) { (void)take_by_value(fuzz_buf); }"
+
+
+def test_api_appends_hand_written_cases_and_a_regeneration_keeps_them(tmp_path, monkeypatch):
+    out, writes = _generate_fixture(tmp_path, monkeypatch, ["a", "b"])
+    monkeypatch.setattr(ah, "probe_cases", lambda h, c, clang=None: ({}, []))
+
+    res = _gen(out, dispatch_cases=[f"  {_CUSTOM_CASE}  ", ""])
+
+    assert len(writes[-1]) == 3 and writes[-1][2] == _CUSTOM_CASE and "a(" in writes[-1][0]
+    meta = json.loads((out / "harness_lib.json").read_text())
+    assert meta["api_cases"][2] == {"kind": "custom", "calls": [], "slots": [], "rest": None, "selector": 2}
+    assert [lay["selector"] for lay in meta["api_cases"]] == [0, 1, 2]
+    assert len(meta["dispatch_cases"]) == len(meta["api_cases"]) == res["api_cases"] == 3
+    assert res["api_custom"] == 1 and res["api_entries"] == 2
+    assert ah.previous_custom_cases(meta) == [_CUSTOM_CASE]
+    # The sidecar schema takes the custom layout (and the moved extra includes of the prelude).
+    from validate_artifacts import schema_problems
+
+    doc = {**meta, "extra_includes_first": ["mod_prelude.h"]}
+    assert not [p for p in schema_problems("harness_sidecar", doc) if "api_cases" in p or "extra_includes" in p]
+    bad = {**meta, "api_cases": [*meta["api_cases"][:2], {**meta["api_cases"][2], "calls": ["a"]}]}
+    assert [p for p in schema_problems("harness_sidecar", bad) if "api_cases" in p]
+
+    # Without the flag (None), the next run keeps the case; with it, the given cases replace it.
+    _gen(out)
+    assert writes[-1][2:] == [_CUSTOM_CASE]
+    _gen(out, dispatch_cases=["(void)other();", _CUSTOM_CASE])
+    assert writes[-1][2:] == ["(void)other();", _CUSTOM_CASE]
+    res = _gen(out, dispatch_cases=[""])
+    assert len(writes[-1]) == 2 and res["api_custom"] == 0
+    assert all(lay["kind"] == "single" for lay in json.loads((out / "harness_lib.json").read_text())["api_cases"])
+
+
+def test_seed_writers_make_nothing_for_a_hand_written_case(tmp_path, monkeypatch):
+    import fuzz_assets
+
+    out, _ = _generate_fixture(tmp_path, monkeypatch, ["a"])
+    monkeypatch.setattr(ah, "probe_cases", lambda h, c, clang=None: ({}, []))
+    _gen(out, dispatch_cases=[_CUSTOM_CASE])
+    meta = json.loads((out / "harness_lib.json").read_text())
+
+    calls = [
+        {"fn": "a", "args": {"0": [["i", 0, "07000000"]]}},
+        {"fn": "take_by_value", "args": {"0": [["b", 0, "00"]]}},
+    ]
+    seeds = sh.layout_seeds(meta["api_cases"], calls, [])
+    assert seeds[1] == [] and len(seeds[0]) == 1 and seeds[0][0][0] == 0
+    assert fuzz_assets._whole_input_selectors(meta, "", {"a", "take_by_value"}) == []
+
+
+def test_a_dropped_generated_case_renumbers_the_hand_written_one(tmp_path, monkeypatch):
+    out, writes = _generate_fixture(tmp_path, monkeypatch, ["ok_a", "bad_1", "ok_b"])
+
+    def probe(harness_c, cppflags, clang=None):
+        lines = Path(harness_c).read_text().splitlines()
+        return {i: "error" for i, line in enumerate(lines) if "bad_" in line}, []
+
+    monkeypatch.setattr(ah, "probe_cases", probe)
+    _gen(out, dispatch_cases=[_CUSTOM_CASE])
+
+    meta = json.loads((out / "harness_lib.json").read_text())
+    assert [(lay["selector"], lay["kind"]) for lay in meta["api_cases"]] == [
+        (0, "single"),
+        (1, "single"),
+        (2, "custom"),
+    ]
+    assert meta["dispatch_cases"][2] == _CUSTOM_CASE and writes[-1][2] == _CUSTOM_CASE
+    assert set(meta["api_skipped"]) == {"bad_1"}
+
+
+def test_a_hand_written_case_that_does_not_compile_fails_the_generation(tmp_path, monkeypatch):
+    out, _ = _generate_fixture(tmp_path, monkeypatch, ["a", "b"])
+    (out / "harness_lib.c").write_text("previous")
+    (out / "harness_lib.json").write_text('{"previous": true}')
+    monkeypatch.setattr(
+        ah,
+        "probe_cases",
+        lambda h, c, clang=None: ({3: "harness_lib.c:9: error: use of undeclared identifier 'x'"}, []),
+    )
+
+    with pytest.raises(
+        ah.ApiHarnessError, match=r"--dispatch-case 2 of 2 does not compile .*undeclared identifier 'x'"
+    ):
+        _gen(out, dispatch_cases=["(void)one();", "(void)two(x);"])
+    assert (out / "harness_lib.c").read_text() == "previous"
+    assert (out / "harness_lib.json").read_text() == '{"previous": true}'
+
+
+def test_a_hand_written_case_of_several_lines_is_refused(tmp_path, monkeypatch):
+    out, writes = _generate_fixture(tmp_path, monkeypatch, ["a"])
+    with pytest.raises(ah.ApiHarnessError, match="--dispatch-case 1 of 1 must be one line of C"):
+        _gen(out, dispatch_cases=["(void)one();\n(void)two();"])
+    assert writes == []
+
+
+def test_hand_written_cases_keep_their_selectors_free(monkeypatch):
+    names = ["a", "b", "c"]
+    dag = _dag({n: _fn(n) for n in names}, names)
+    model = _model(**{n: {"signature": "int(int)", "formals": _formals("value")} for n in names})
+    monkeypatch.setattr(ah, "MAX_CASES", 3)
+    p = ah.plan(dag, model, "lib", "lib", 64, reserve=1)
+    assert len(p["cases"]) == 2 and p["skipped"] == {"c": "more than 3 cases"}
+
+
+def test_the_switch_counts_the_hand_written_case_like_any_other():
+    """One selector space: the modulus, the skip mask and the Eva shard guards index it by position."""
+    import generate_harness
+
+    text = generate_harness._build_dispatch_invocation(["(void)a(0);", "(void)b(0);", _CUSTOM_CASE])
+    assert "switch (harness_selector % 3U) {" in text
+    assert "(harness_selector % 3U) & 63U" in text
+    assert (
+        f"#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_2)\n        case 2U: {{ {_CUSTOM_CASE} }} break;"
+        in text
+    )
+
+
+def test_cli_api_passes_dispatch_cases(tmp_path, monkeypatch, capsys):
+    import generate_harness
+
+    seen: list[dict] = []
+
+    def fake(**kw):
+        seen.append(kw)
+        return {"ok": True}
+
+    monkeypatch.setattr(ah, "generate", fake)
+    base = ["--api", "--module", "lib", "--out-dir", str(tmp_path)]
+    assert generate_harness.main([*base, f"--dispatch-case={_CUSTOM_CASE}"]) == 0
+    assert generate_harness.main(base) == 0
+    assert generate_harness.main([*base, "--dispatch-case="]) == 0
+    capsys.readouterr()
+    assert [kw["dispatch_cases"] for kw in seen] == [[_CUSTOM_CASE], None, [""]]
+
+
 # --- benchmark ------------------------------------------------------------------------------------------
 
 
@@ -472,3 +732,49 @@ def test_compare_flags_api_reach_changes(before, after, severity):
 def test_compare_without_api_reach_in_the_baseline_is_not_compared():
     result = compare_runs(_run(None), _run({"entry_points": 25, "reached": 25, "exempt": 0, "modules": {}}))
     assert [d.severity for d in result.diffs if d.area == "api_reach"] == ["not_compared"]
+
+
+# ---------------------------------------------------------------------------
+# D6: Word-Bounded API Lifecycle Names
+# ---------------------------------------------------------------------------
+
+
+def test_api_lifecycle_names_respect_word_boundaries():
+    """D6: Match Init/Free/Destroy/Release only on word boundaries."""
+    # Positives
+    for name in [
+        "QCBORDecode_Init",
+        "UsefulOutBuf_Init",
+        "ctx_init",
+        "init_ctx",
+        "foo_new",
+        "bar_create",
+        "FooInit",
+        "InitContext",
+        "Init",
+    ]:
+        assert ah._INIT_NAME_RE.search(name), f"Init regex missed positive: {name}"
+
+    for name in [
+        "seccomp_release",
+        "foo_free",
+        "bar_destroy",
+        "ctx_close",
+        "FooFree",
+        "Foo_Free",
+        "FreeFoo",
+        "BarDestroy",
+        "DestroyBar",
+        "HandleRelease",
+        "ReleaseHandle",
+        "seccomp_Release",
+    ]:
+        assert ah._DTOR_NAME_RE.search(name), f"Dtor regex missed positive: {name}"
+
+    # Negatives (must NOT match)
+    for name in ["Initialize", "InitializeFoo", "FooInitialize", "InitialValue", "Initiate", "Primitive"]:
+        assert not ah._INIT_NAME_RE.search(name), f"Init regex false positive: {name}"
+
+    for name in ["Freeze", "Freezer", "Freelist", "Freedom", "Destroyer", "Releasable"]:
+        assert not ah._DTOR_NAME_RE.search(name), f"Dtor regex false positive: {name}"
+

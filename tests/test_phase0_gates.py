@@ -5,7 +5,6 @@ the benchmark records its manifest exemptions before the gate runs.
 """
 
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -15,9 +14,9 @@ import harness_reach
 import phase0_gates
 import pipeline_make
 import validate_artifacts
+from conftest import ROOT, makefile_rule
 from test_harness_reach import _run_dir, _unit_run, _write_harness
 
-ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_MK = ROOT / "templates" / "pipeline.mk"
 
 
@@ -180,38 +179,58 @@ def test_cli_exit_codes(tmp_path, capsys):
         phase0_gates.main(["check", "--run-dir", str(tmp_path), "--need", "bogus"])
 
 
-def _recipe(text: str, target_line: str) -> list[str]:
-    body = text.split(target_line + "\n", 1)[1]
-    return [line for line in body.splitlines() if line.startswith("\t")][:2]
+def _recipe(text: str, target: str) -> list[str]:
+    """The logical recipe lines of the rule of `target`, whatever its prerequisites are."""
+    recipe = makefile_rule(text, target).recipe
+    assert recipe, f"no recipe for {target}"
+    return list(recipe)
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("target_line", "need"),
+    ("target", "pattern", "need"),
     [
-        ("$(BUILD_TARGETS): build-%:", "reach"),
-        ("$(FUZZ_TARGETS): fuzz-%: selftest build-%", "reach,build_check"),
-        ("$(COVERAGE_TARGETS): coverage-%:", "reach"),
-        ("$(EVA_TARGETS): eva-%:", "reach"),
-        ("$(EVA_BASE_TARGETS): evabase-%:", "reach"),
-        ("$(EVA_TUNE_TARGETS): evatune-%:", "reach"),
+        ("$(BUILD_TARGETS)", "build-%", "reach"),
+        ("$(FUZZ_TARGETS)", "fuzz-%", "reach,build_check"),
+        ("$(COVERAGE_TARGETS)", "coverage-%", "reach"),
+        ("$(EVA_TARGETS)", "eva-%", "reach"),
+        ("$(EVA_BASE_TARGETS)", "evabase-%", "reach"),
+        ("$(EVA_TUNE_TARGETS)", "evatune-%", "reach"),
     ],
 )
-def test_every_harness_consuming_recipe_checks_its_gate_first(target_line, need):
-    first = _recipe(PIPELINE_MK.read_text(encoding="utf-8"), target_line)[0]
-    assert first == f"\t$(GATE) --module $* --need {need}"
+def test_every_harness_consuming_recipe_checks_its_gate_first(target, pattern, need):
+    text = PIPELINE_MK.read_text(encoding="utf-8")
+    assert makefile_rule(text, target).pattern == pattern
+    assert _recipe(text, target)[0] == f"$(GATE) --module $* --need {need}"
 
 
 @pytest.mark.unit
 def test_seed_runs_the_reach_gate_and_wp_queue_needs_both():
     text = PIPELINE_MK.read_text(encoding="utf-8")
-    assert re.search(r"^seed: reach-gate security-props$", text, re.MULTILINE)
-    assert "harness_reach.py check" in _recipe(text, "reach-gate:")[0]
-    assert _recipe(text, "wp-queue: ingest facts wp-replay")[0] == (
-        '\t$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"'
+    assert {"reach-gate", "security-props"} <= set(makefile_rule(text, "seed").prerequisites)
+    assert {"selftest", "build-%"} <= set(makefile_rule(text, "$(FUZZ_TARGETS)").prerequisites)
+    assert "harness_reach.py check" in _recipe(text, "reach-gate")[0]
+    assert {"ingest", "facts", "wp-replay"} <= set(makefile_rule(text, "wp-queue").prerequisites)
+    assert _recipe(text, "wp-queue")[0] == (
+        '$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"'
     )
-    assert "\t$$(GATE) --module $(1) --need reach" in text  # the Eva tuning rungs
+    for rung in ("evashard-$(1)--$(2)", "evarung-$(1)--$(2)"):  # the Eva shards and tuning rungs
+        assert _recipe(text, rung)[0] == "$$(GATE) --module $(1) --need reach"
     assert "reach-gate" in pipeline_make.STAGE_OF_TARGET
+
+
+@pytest.mark.unit
+def test_a_gate_check_survives_an_added_prerequisite_and_a_moved_gate_does_not():
+    gate = "\t$(GATE) --module $* --need reach\n"
+    text = "seed: reach-gate security-props\n\t$(RUN) seed\n\n$(BUILD_TARGETS): build-%:\n" + gate + "\t$(RUN) build\n"
+    # An added prerequisite is not a missing gate (the old `^seed: reach-gate security-props$` failed on it).
+    more = text.replace("seed: reach-gate security-props\n", "seed: reach-gate stubs security-props\n")
+    assert more != text and {"reach-gate", "security-props"} <= set(makefile_rule(more, "seed").prerequisites)
+    assert "reach-gate" not in makefile_rule(text.replace("seed: reach-gate ", "seed: "), "seed").prerequisites
+    # The gate is the recipe's first command: after another command it no longer guards that command.
+    assert _recipe(text, "$(BUILD_TARGETS)")[0] == "$(GATE) --module $* --need reach"
+    moved = text.replace(gate + "\t$(RUN) build\n", "\t$(RUN) build\n\n# gated below\n" + gate)
+    assert _recipe(moved, "$(BUILD_TARGETS)") == ["$(RUN) build", "$(GATE) --module $* --need reach"]
 
 
 @pytest.mark.unit
