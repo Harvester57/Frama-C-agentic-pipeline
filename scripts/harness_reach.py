@@ -10,13 +10,29 @@ harness reaches statically:
 
   roots    = DAG functions the harness file names, directly or through a header
              macro (e.g. a `for_each` iterator) or a header `static inline` wrapper
+  direct   = roots, plus what a root reaches through header `static inline`
+             functions only (DAG `header` and `is_static`): the walk follows the
+             callees of such a wrapper and stops at the first other function
   reached  = roots plus their transitive in-repo callees (`internal_callees`)
+
+An entry point is reached only when it is direct: the harness calls it itself, or
+through a macro alias or thin header wrappers. An entry point that only another
+function calls gets that caller's arguments, not the harness's (minmea run-1: the
+variadic `minmea_scan` behind the `minmea_parse_*` roots, with their fixed format
+strings; its 's' format branch never ran). It is a gap, and `reached_only_through`
+names, for each such entry point, the sorted roots whose callees lead to it. Internal
+functions keep the transitive reach (`functions_reached`).
 
 An entry point the harness does not reach fails the gate unless the sidecar
 records why it cannot be harnessed (`reach_exempt`, written by the `exempt`
 subcommand), by its DAG key or by its plain name when no other DAG function has
 it (the static and the dynamic gate match alike). Static reach over-approximates (a call behind an impossible branch
 counts); Phase 1/2 measure the dynamic reach.
+
+Limits of the direct rule: a header-only library is all header `static inline` code, so
+there every transitive callee still counts; and with clang on the PATH the roots are every
+function the harness's translation unit references (included header bodies, and the module
+source for an `include_source` harness), so a callee named there is a root.
 
 With link units as DAG modules (step I5b, scripts/module_map.py), a harness that is a
 sub-module of a unit answers for the unit's entry points in its scope (its lexer
@@ -329,10 +345,23 @@ def _used_identifiers(text: str) -> set[str]:
     return used
 
 
-def callee_closure(roots: set[str], by_name: dict[str, list[tuple[str, dict[str, Any]]]], module: str) -> set[str]:
+def is_header_inline(rec: dict[str, Any]) -> bool:
+    """A header `static inline` function of the DAG (`header` and `is_static`, build_callgraph_dag.py)."""
+    return bool(rec.get("header")) and bool(rec.get("is_static"))
+
+
+def callee_closure(
+    roots: set[str],
+    by_name: dict[str, list[tuple[str, dict[str, Any]]]],
+    module: str,
+    follow: Callable[[dict[str, Any]], bool] | None = None,
+) -> set[str]:
     """Transitive in-repo callees of `roots`, as names and DAG keys.
 
     A colliding plain name resolves to its record in `module` first; a `file#name` key to its record.
+    With `follow`, the callees of a record are followed only when `follow(record)` holds: the walk
+    stops at (and includes) the first function that does not (`is_header_inline` gives the direct
+    reach of `check_module`).
     """
     reached: set[str] = set()
     work = sorted(roots)
@@ -348,8 +377,27 @@ def callee_closure(roots: set[str], by_name: dict[str, list[tuple[str, dict[str,
             # The plain name stands for this record only when no other record shares it.
             idents = (key, plain) if len(by_name.get(plain) or []) == 1 else (key,)
             work.extend(i for i in idents if i not in reached)
-            work.extend(c for c in rec.get("internal_callees") or [] if c not in reached)
+            if follow is None or follow(rec):
+                work.extend(c for c in rec.get("internal_callees") or [] if c not in reached)
     return reached
+
+
+def transitive_only_roots(
+    entries: list[str],
+    roots: set[str],
+    by_name: dict[str, list[tuple[str, dict[str, Any]]]],
+    module: str,
+) -> dict[str, list[str]]:
+    """For each of `entries`, the sorted harness roots whose callees (transitively) include it."""
+    out: dict[str, list[str]] = {e: [] for e in entries}
+    if not entries:
+        return out
+    for root in sorted(roots):
+        below = callee_closure({root}, by_name, module)
+        for e in entries:
+            if e in below:
+                out[e].append(root)
+    return out
 
 
 def built_entries(entries: list[str], functions: dict[str, Any]) -> list[str]:
@@ -374,6 +422,9 @@ def check_module(
     target's own fuzz function: its roots also come from the fuzzer source, it answers for no entry
     point (its unit still needs its own harness, `check_unit`), and it fails when it reaches no DAG
     function at all.
+
+    An entry point is reached when it is a root or a root reaches it through header inline wrappers
+    only (`direct`); `reached_only_through` lists the others some root calls into, with those roots.
     """
     by_name = _functions_by_name(dag)
     fn_names = set(by_name)
@@ -428,11 +479,16 @@ def check_module(
         if not roots:
             return {**tf_row, "roots": [], "passed": False, "error": "target_fuzzer_reaches_nothing"}
     reached = callee_closure(roots, by_name, unit)
+    # An entry point counts only when the harness calls it itself: a root, or behind header inline
+    # wrappers of a root. One that only another function calls is driven with that caller's arguments
+    # (minmea run-1: `minmea_scan` behind the `minmea_parse_*` roots, its 's' format branch never run).
+    direct = callee_closure(roots, by_name, unit, follow=is_header_inline)
 
     exempt_raw = sidecar.get("reach_exempt")
     exempt = {str(k): str(v) for k, v in exempt_raw.items()} if isinstance(exempt_raw, dict) else {}
     match = exemption_matcher(exempt, dag.get("functions") or {})
-    unreached = sorted(f for f in entries if f not in reached)
+    unreached = sorted(f for f in entries if f not in direct)
+    only_through = transitive_only_roots([f for f in unreached if f in reached], roots, by_name, unit)
     exempted = {f: why for f in unreached if (why := match(f)) is not None}
     gaps = [f for f in unreached if f not in exempted]
     row: dict[str, Any] = {
@@ -445,6 +501,8 @@ def check_module(
         "functions_reached": sum(1 for f in mod_fns if f in reached),
         "roots": sorted(roots & set(mod_fns)) + sorted(roots - set(mod_fns)),
         "unreached_entry_points": unreached,
+        # The unreached entry points some root calls into (exempted ones included), with those roots.
+        "reached_only_through": only_through,
         "exempt": exempted,
         "gaps": gaps,
         "passed": not gaps,

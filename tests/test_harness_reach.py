@@ -257,6 +257,191 @@ def test_cli_exit_codes_and_report(tmp_path, monkeypatch, capsys):
     )
 
 
+# --- direct reach: an entry point the harness does not call itself is a gap -------------------
+
+SCAN_H = """\
+#include <stddef.h>
+#include <stdint.h>
+int scan(const char *s, const char *fmt);
+int parse_a(const char *s);
+int parse_b(const char *s);
+#define scan_alias scan
+"""
+# Only the wrapper tests include it: with clang the roots are every function the harness's translation
+# unit references, the body of an included inline function too.
+SCAN_WRAPPER = 'static inline int scan_text(const char *s) { return scan(s, "s"); }\n'
+
+
+def _scan_dag(wrapper_in_header: bool = True) -> dict:
+    """parse_a and parse_b call the entry point `scan` with their own format; `scan_text` wraps it."""
+    functions = {
+        "scan": _fn("scan", ["is_field"]),
+        "is_field": _fn("is_field", static=True),
+        "parse_a": _fn("parse_a", ["scan"]),
+        "parse_b": _fn("parse_b", ["scan"]),
+        "scan_text": {**_fn("scan_text", ["scan"], static=True), "header": wrapper_in_header},
+    }
+    return {
+        "modules": {
+            "api": {
+                "module": "api",
+                "tier": TIER_1A,
+                "functions": list(functions),
+                "candidate_entry_points": ["parse_a", "parse_b", "scan"],
+            }
+        },
+        "functions": functions,
+    }
+
+
+def _scan_run(tmp_path: Path, monkeypatch, call: str, dag: dict | None = None, wrapper: bool = False, **extra):
+    run = _run_dir(tmp_path, monkeypatch)
+    header = SCAN_H + (SCAN_WRAPPER if wrapper else "")
+    (run / "workspace/work/include/api.h").write_text(header, encoding="utf-8", newline="\n")
+    dag_path = run / "workspace/reports/callgraph_dag.json"
+    dag_path.write_text(json.dumps(dag or _scan_dag()), encoding="utf-8", newline="\n")
+    return dag_path, _write_harness(run, call, **extra)
+
+
+PARSE_BOTH = "(void)parse_a((const char *)fuzz_buf); (void)parse_b((const char *)fuzz_buf);"
+
+
+def test_entry_point_called_only_by_other_entry_points_is_a_gap(tmp_path, monkeypatch):
+    dag, hdir = _scan_run(tmp_path, monkeypatch, PARSE_BOTH)
+    report = harness_reach.run_check(dag, hdir, ["api"])
+    api = _api(report)
+    assert report["passed"] is False and api["passed"] is False
+    assert api["gaps"] == ["scan"] and api["unreached_entry_points"] == ["scan"]
+    assert api["reached_only_through"] == {"scan": ["parse_a", "parse_b"]}
+    assert api["entry_points"] == 3 and api["entry_points_reached"] == 2
+    # Internal functions keep the transitive reach: scan and is_field are below the roots.
+    assert api["functions_reached"] == 4
+
+    # Calling it from the harness makes it direct.
+    _write_harness(tmp_path, PARSE_BOTH + ' (void)scan((const char *)fuzz_buf, "s");')
+    api = _api(harness_reach.run_check(dag, hdir, ["api"]))
+    assert api["passed"] is True and api["gaps"] == [] and api["reached_only_through"] == {}
+    assert api["entry_points_reached"] == 3
+
+
+def test_entry_point_no_root_leads_to_is_not_in_reached_only_through(tmp_path, monkeypatch):
+    dag, hdir = _scan_run(tmp_path, monkeypatch, "(void)parse_a((const char *)fuzz_buf);")
+    api = _api(harness_reach.run_check(dag, hdir, ["api"]))
+    assert api["gaps"] == ["parse_b", "scan"]
+    assert api["reached_only_through"] == {"scan": ["parse_a"]}
+
+
+def test_exemption_clears_an_entry_point_reached_only_transitively(tmp_path, monkeypatch, capsys):
+    import phase0_gates
+
+    dag, hdir = _scan_run(tmp_path, monkeypatch, PARSE_BOTH)
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1
+    [reason] = phase0_gates.check(tmp_path, "api", ("reach",))
+    assert "scan" in reason
+    out = _exempt_cli(hdir, capsys, "scan")
+    assert out["gate"] == {"rechecked": ["api"]}
+    assert phase0_gates.check(tmp_path, "api", ("reach",)) == []
+    api = _api(harness_reach.run_check(dag, hdir, ["api"]))
+    assert api["passed"] is True and api["gaps"] == []
+    assert api["exempt"] == {"scan": "cannot be driven from bytes"}
+    # Still listed as not called by the harness, with the reason why a reader might think it is.
+    assert api["unreached_entry_points"] == ["scan"] and api["entry_points_reached"] == 2
+    assert api["reached_only_through"] == {"scan": ["parse_a", "parse_b"]}
+
+
+def test_header_inline_wrapper_root_makes_the_wrapped_entry_point_direct(tmp_path, monkeypatch):
+    call = PARSE_BOTH + " (void)scan_text((const char *)fuzz_buf);"
+    dag, hdir = _scan_run(tmp_path, monkeypatch, call, wrapper=True)
+    api = _api(harness_reach.run_check(dag, hdir, ["api"]))
+    assert "scan_text" in api["roots"]
+    assert api["passed"] is True and api["gaps"] == [] and api["reached_only_through"] == {}
+    assert api["entry_points_reached"] == 3
+
+
+def test_direct_reach_follows_header_inline_wrappers_only():
+    by_name = harness_reach._functions_by_name(_scan_dag())
+    direct = harness_reach.callee_closure({"scan_text"}, by_name, "api", follow=harness_reach.is_header_inline)
+    # Through the wrapper to scan, and no further: is_field is scan's own callee.
+    assert direct == {"scan_text", "scan"}
+    assert harness_reach.callee_closure({"scan_text"}, by_name, "api") == {"scan_text", "scan", "is_field"}
+    # The same function defined in a .c file is an ordinary caller: what it calls is not direct.
+    by_name = harness_reach._functions_by_name(_scan_dag(wrapper_in_header=False))
+    direct = harness_reach.callee_closure({"scan_text"}, by_name, "api", follow=harness_reach.is_header_inline)
+    assert direct == {"scan_text"}
+    assert harness_reach.transitive_only_roots(["scan"], {"scan_text", "parse_a"}, by_name, "api") == {
+        "scan": ["parse_a", "scan_text"]
+    }
+
+
+def test_macro_alias_of_an_entry_point_counts_as_direct(tmp_path, monkeypatch):
+    # A header macro alias...
+    call = PARSE_BOTH + ' (void)scan_alias((const char *)fuzz_buf, "s");'
+    dag, hdir = _scan_run(tmp_path, monkeypatch, call)
+    api = _api(harness_reach.run_check(dag, hdir, ["api"]))
+    assert "scan" in api["roots"] and api["passed"] is True and api["reached_only_through"] == {}
+
+
+def test_model_macro_alias_of_an_entry_point_counts_as_direct():
+    # ...and one only the model knows (`macro_aliases` in the DAG, defined by no header read here).
+    text = 'void drive(const char *s) { parse_a(s); parse_b(s); scan_m(s, "s"); }\n'
+    api = harness_reach.check_module("api", _scan_dag(), {}, text, [])
+    assert api["gaps"] == ["scan"] and api["reached_only_through"] == {"scan": ["parse_a", "parse_b"]}
+    dag_doc = {**_scan_dag(), "macro_aliases": {"scan_m": ["scan"]}}
+    api = harness_reach.check_module("api", dag_doc, {}, text, [])
+    assert "scan" in api["roots"] and api["passed"] is True and api["gaps"] == []
+    assert api["reached_only_through"] == {}
+
+
+MINMEA_PARSERS = [f"minmea_parse_{s}" for s in ("gbs", "gga", "gll", "gsa", "gst", "gsv", "rmc", "vtg", "zda")]
+
+
+def test_minmea_shape_fails_the_gate_on_the_scanner_behind_the_parsers(tmp_path, monkeypatch):
+    # minmea run-1: 17 entry points, 16 roots, `entry_points_reached: 17`, `gaps: []`. The variadic
+    # minmea_scan was only called by the parsers, with their own format strings (CVE-2026-29974).
+    callers = [*MINMEA_PARSERS, "minmea_sentence_id", "minmea_talker_id"]
+    others = ["minmea_check", "minmea_checksum", "minmea_getdatetime", "minmea_gettime", "minmea_sentence"]
+    unit = "libminmea_a"
+    functions = {n: _ufn(n, unit, "minmea", TIER_1A, ["minmea_scan"]) for n in callers}
+    functions.update({n: _ufn(n, unit, "minmea", TIER_1A) for n in others})
+    functions["minmea_scan"] = _ufn("minmea_scan", unit, "minmea", TIER_1A, ["minmea_isfield"])
+    functions["minmea_isfield"] = {**_ufn("minmea_isfield", unit, "minmea", TIER_1A, static=True), "header": True}
+    entries = sorted(k for k, f in functions.items() if not f["is_static"])
+    assert len(entries) == 17
+    dag_doc = {
+        "module_kind": "link_unit",
+        "modules": {
+            unit: {
+                "module": unit,
+                "tier": TIER_1A,
+                "functions": sorted(functions),
+                "candidate_entry_points": entries,
+                "lexer_modules": ["minmea"],
+            }
+        },
+        "functions": functions,
+        "lexer_modules": {"minmea": {"module": "minmea", "tier": TIER_1A}},
+        "unit_of_lexer_module": {"minmea": unit},
+    }
+    call = " ".join(f"{n}();" for n in [*callers, *others])
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {"minmea": call}, dag=dag_doc, units={"minmea": unit})
+    report = harness_reach.run_check(dag, hdir, None)
+    row = _rows(report)["minmea"]
+    assert report["passed"] is False and row["passed"] is False
+    assert row["entry_points"] == 17 and row["entry_points_reached"] == 16
+    assert row["gaps"] == ["minmea_scan"]
+    assert row["reached_only_through"] == {"minmea_scan": sorted(callers)}
+    assert len(row["roots"]) == 16 and "minmea_scan" not in row["roots"]
+    # Every function of the module is still below the roots.
+    assert row["functions_reached"] == row["functions"] == 18
+
+
+def test_target_fuzz_module_row_has_no_transitive_only_entry_point(tmp_path, monkeypatch):
+    dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run(); dec_peek();"})
+    _add_target_fuzzer(tmp_path, FUZZER_C)
+    tf = _rows(harness_reach.run_check(dag, hdir, ["tf_fuzz_kv"]))["tf_fuzz_kv"]
+    assert tf["passed"] is True and tf["entry_points"] == 0 and tf["reached_only_through"] == {}
+
+
 # --- link units as DAG modules (step I5b) ---------------------------------------------------
 
 T2 = "Tier 2 (Recursive Heap / Tree Parser)"

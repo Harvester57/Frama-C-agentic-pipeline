@@ -108,7 +108,9 @@ def test_a_module_the_reach_gate_stopped_is_not_built_with_the_gates_reason(tmp_
 
 def test_a_dag_rewritten_after_the_check_fails_the_gate(tmp_path, monkeypatch):
     run = _run_dir(tmp_path, monkeypatch)
-    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 0); rec_print(0, 0);")
+    # rec_ok becomes an entry point below: the harness calls it itself, as the reach gate requires.
+    calls = "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 0); rec_print(0, 0);"
+    hdir = _write_harness(run, calls + " (void)rec_ok((const struct rec *)fuzz_buf, (int)fuzz_len);")
     harness_reach.record_exempt(hdir, "tools", None, "example programs")
     assert _reach(run, hdir) == 0
     stamp = phase0_gates.load_gates(run)["reach"]["modules"]["api"]
