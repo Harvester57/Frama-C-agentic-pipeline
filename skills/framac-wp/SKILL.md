@@ -126,6 +126,8 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
    - **verifiers** are ingested with their replay report (`ingest-verifier`);
    - **architects** are merged via tolerant header splicing.
 
+   A result that fails validation is discarded (`action: requeued_invalid_result`, the errors in `validation_errors`) and the task is re-run once with a fresh agent, whose brief ends with those errors and the discarded agent's scratch directory (`Previous Attempt: Result Rejected`). Every brief tells its agent to run `validate_artifacts.py agent-result` on its `result.json` before returning, so this should be rare.
+
 4. Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py run-dir .` after any manual write.
 
 **Recovery:**

@@ -56,5 +56,7 @@ A `Known Dead Ends` section, when present, lists clauses already refuted on this
 }
 ```
 
+**Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the result schema does not have: remove it, in nested objects too) and run the check again. The parent discards a result that fails it and reruns the whole task.
+
 - **`crash_found`**: give the crash artifact and failing predicate from the campaign report. The parent reproduces and fingerprints it; it becomes a candidate, not yet a finding.
 - **`clean`**: explain why the branch is dynamically unreachable (e.g., a prior sanitization check in caller `f()` restricts the range) and give the missing caller `requires` if one exists. If you still believe a specific input breaks the goal but could not produce it, fill `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`). If the goal is safe/unreachable or blocked only by a WP/SMT limitation rather than a suspected bug, leave `fault_hypothesis` as `null` and optionally record `proof_gap` (`{"predicate": "...", "reason": "..."}`).

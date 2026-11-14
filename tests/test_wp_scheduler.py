@@ -994,6 +994,34 @@ def test_invalid_results_are_rerun_once_then_never_leave_units_in_progress(sim):
     assert units()["src/m/f.c#f::rte"]["status"] == "planned" and out["units"]["planned"] == ["src/m/f.c#f::rte"]
 
 
+def test_rerun_after_an_invalid_result_is_told_the_validation_errors(sim):
+    """minmea run-1: one extra key in a strengthening request discarded a complete prover result."""
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    assert sim.prepared[-1][0] == "prove-g" and "rejected_result" not in sim.prepared[-1][2]
+    sim.prover("prove-g", "g", "src/m/g.c")
+    S.cmd_complete("prove-g")
+    S.cmd_merge_pending(force=True)
+    S.cmd_next("auto", prepare=True)
+    assert sim.prepared[-1][0] == "prove-f"
+    bad = {**request("g", 1), "caller_function": "f"}
+    sim.prover("prove-f", "f", "src/m/f.c", status="stalled_after_k_retries", requests=[bad])
+    out = S.cmd_complete("prove-f")
+    error = "$.strengthening_requests[0].caller_function: unexpected property"
+    assert out["action"] == "requeued_invalid_result" and out["validation_errors"] == [error]
+    assert out["rejected_result"] == {"agent_id": "prove-f", "errors": [error]}
+
+    assert S.cmd_next("auto", prepare=True)["tasks"][0]["agent_id"] == "prove-f-2"
+    aid, _role, kw = sim.prepared[-1]
+    assert aid == "prove-f-2" and kw["rejected_result"] == {"agent_id": "prove-f", "errors": [error]}
+
+    # A valid result closes the matter: a later dispatch of the task is not told about it again.
+    sim.prover("prove-f-2", "f", "src/m/f.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    assert S.cmd_complete("prove-f-2")["action"] != "requeued_invalid_result"
+    assert "invalid_result" not in tasks()["prove:src/m/f.c#f"]
+
+
 def test_requeue_stale_agents_and_accept_a_late_result(sim):
     sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])})
     S.cmd_init()

@@ -2101,6 +2101,13 @@ def _negotiate_evidence(state: dict | None, task: dict) -> dict:
 
 
 def _prepare_kwargs(task: dict, state: dict | None = None) -> dict:
+    kwargs = _task_prepare_kwargs(task, state)
+    if task.get("invalid_result"):  # a re-run after `requeued_invalid_result`: the brief names the errors
+        kwargs["rejected_result"] = task["invalid_result"]
+    return kwargs
+
+
+def _task_prepare_kwargs(task: dict, state: dict | None = None) -> dict:
     kind = task["kind"]
     module = task.get("module") if task.get("module") != "unknown" else None
     if kind == "prove":
@@ -2875,12 +2882,17 @@ def _ensure_repair(state: dict, module: str, reason: str, out: dict) -> None:
 
 
 def _on_invalid_result(state: dict, task: dict, agent_id: str, errors: list[str], out: dict) -> None:
-    """Malformed results are discarded, never repaired: one re-run with a fresh agent, then blocked."""
+    """
+    Malformed results are discarded, never repaired: one re-run with a fresh agent, then blocked.
+    The re-run's brief names the validation errors and the discarded agent (`rejected_result`).
+    """
     task["invalid_results"] = int(task.get("invalid_results") or 0) + 1
     out["validation_errors"] = errors
     if task["invalid_results"] < MAX_INVALID_RESULTS:
         out["units_released"] = _release_units(task)
         _reopen(state, task, "invalid agent result")
+        task["invalid_result"] = {"agent_id": agent_id, "errors": [str(e)[:300] for e in errors[:10]]}
+        out["rejected_result"] = task["invalid_result"]
         out["action"] = "requeued_invalid_result"
         return
     out["units"] = _park_units(task, agent_id, f"agent result invalid {task['invalid_results']} times")
@@ -3340,6 +3352,7 @@ def _complete_agent(agent_id: str) -> dict:
             return out
         result_path = Path("agents") / agent_id / "scratch" / "result.json"
         res, errors = _load_result(result_path, task, agent_id)
+        task.pop("invalid_result", None)  # about the previous agent's result; set again below if this one fails
         ctx = Ctx()
         if errors or res is None:
             _on_invalid_result(state, task, agent_id, errors or ["unreadable result"], out)

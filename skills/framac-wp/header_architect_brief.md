@@ -78,3 +78,5 @@ Write your annotation diff to `agents/{agent_id}/scratch/{module_name}_header.pa
 ```
 
 List in `functions` every function whose contract you wrote or changed: the parent records your `boundary_assumptions` on those functions' ledger units.
+
+**Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the result schema does not have: remove it, in nested objects too) and run the check again. The parent discards a result that fails it and reruns the whole task.
