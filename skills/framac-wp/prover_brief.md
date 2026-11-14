@@ -296,6 +296,20 @@ The Frama-C manuals are available as greppable Markdown under `{references_dir}`
 }
 ```
 
+Each `strengthening_requests` entry has exactly the keys below (`callee_file` may be `null` or left out). The parent records the requesting caller from your result's `function`: any other key, `caller_function` included, makes the whole result invalid.
+
+```json
+{
+  "callee": "parse_hdr",
+  "callee_file": "src/pkt/hdr.c",
+  "header_file": "src/pkt/hdr.h",
+  "needed_clause": "ensures bound: 0 <= *out_len <= len;",
+  "reason": "the mem_access goal at line 88 of {function_name} needs the bound on *out_len"
+}
+```
+
+**Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the result schema does not have: remove it, in nested objects too) and run the check again. Do this even when your budget is exhausted: it runs no proof, and the parent discards a result that fails it and reruns the whole task.
+
 A `blocked` result (a guardrail `code_fault`, a repeated `analysis_error`) may leave `unproven_goals` empty, but its `evidence` must name the report that blocked it.
 
 Set `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) only when you believe a specific input violates a specific goal (which creates a `needs_validation` bug candidate). When a goal stalls due to a WP/SMT limitation (for example `<stdlib.h>` dynamic allocation predicates `\freeable` / `allocates` or nonlinear arithmetic) or an unreachable branch rather than a code bug, leave `fault_hypothesis` as `null` and set `proof_gap` (`{"predicate": "...", "reason": "..."}`; must be `null` when `status` is `"all_proven"`). A stall without either is reported through `unproven_goals` alone.

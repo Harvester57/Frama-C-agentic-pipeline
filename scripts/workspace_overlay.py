@@ -2444,6 +2444,62 @@ def _prover_context(
     return section, features if isinstance(features, dict) else None, summary
 
 
+REJECTED_RESULT_MAX_ERRORS = 10
+REJECTED_RESULT_MAX_ERROR_CHARS = 300
+_REJECTED_RESULT_REUSE = {
+    "prover": (
+        "Its annotations are in `{prev}work/` (and in its patch, if it wrote one). They were never checked "
+        "by the parent: read them as a starting point, write them into your own scratch work tree, and run "
+        "both oracles yourself before you write your result. Unchanged goals are answered from the proof cache."
+    ),
+    "architect": (
+        "Its contracts are in `{prev}work/` (and in its patch, if it wrote one). They were never checked by "
+        "the parent: read them as a starting point, write them into your own scratch work tree, and run the "
+        "syntax check and the guardrail yourself before you write your result."
+    ),
+    "breaker": (
+        "Its seeds, if any, are under `{prev}seeds/`: you may copy them into your own seeds directory, and "
+        "must run the campaign yourself."
+    ),
+    "verifier": "Its replay outputs under `{prev}` may guide you, but reproduce and decide yourself.",
+}
+
+
+def _rejected_result_section(rejected_result: dict | None, agent_id: str, role: str) -> str:
+    """
+    Appended to the brief of an agent that re-runs a task whose previous result.json failed validation
+    (wp_scheduler `requeued_invalid_result`): the validation errors, so that the new result does not
+    repeat them, and where the previous agent's work is. The rejected result itself stays discarded.
+    Error texts embed key names the previous agent chose: they are shown as capped JSON strings.
+    """
+    if not isinstance(rejected_result, dict):
+        return ""
+    errors = [
+        str(e).replace("`", "'")[:REJECTED_RESULT_MAX_ERROR_CHARS]
+        for e in (rejected_result.get("errors") or [])[:REJECTED_RESULT_MAX_ERRORS]
+    ]
+    if not errors:
+        return ""
+    prev = str(rejected_result.get("agent_id") or "")
+    who = f"Agent `{prev}`" if is_safe_agent_id(prev) else "An earlier agent"
+    out = (
+        "\n## Previous Attempt: Result Rejected\n\n"
+        f"{who} already worked on this task. The parent discarded its `result.json`, and with it the whole "
+        "attempt, because the file failed validation:\n\n"
+        "```json\n" + json.dumps(errors, indent=2) + "\n```\n\n"
+        "These are errors of the result file, not of the analysis. Do not repeat them, and run the "
+        "validation command of this brief before you return.\n"
+    )
+    if is_safe_agent_id(prev):
+        out += (
+            "\n"
+            + _REJECTED_RESULT_REUSE[role].format(prev=f"agents/{prev}/scratch/")
+            + " Never copy its `result.json` or its reports: your result names your own agent id and only "
+            + f"files under `agents/{agent_id}/`.\n"
+        )
+    return out
+
+
 def _negotiation_evidence_section(caller_evidence: list[dict] | None, callee_history: dict | None) -> str:
     """
     The seam evidence appended to the Contract Negotiation Requests: why each caller stalled (its
@@ -2509,6 +2565,7 @@ def prepare_agent(
     requests: list[dict] | None = None,
     caller_evidence: list[dict] | None = None,
     callee_history: dict | None = None,
+    rejected_result: dict | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -2521,6 +2578,8 @@ def prepare_agent(
     appended to its brief, followed by the seam evidence when given: `caller_evidence` (each
     caller's unproven goals at the call site, from its stalled WP report) and `callee_history`
     (a summary of this function's previous prover run).
+    `rejected_result` (`{"agent_id", "errors"}`) is set when this agent re-runs a task whose previous
+    result.json failed validation: the brief ends with those errors.
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -2855,6 +2914,7 @@ def prepare_agent(
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
         rendered += _negotiation_evidence_section(caller_evidence, callee_history)
+    rendered += _rejected_result_section(rejected_result, agent_id, role)
 
     brief_path = agent_root / "brief.md"
     brief_path.parent.mkdir(parents=True, exist_ok=True)

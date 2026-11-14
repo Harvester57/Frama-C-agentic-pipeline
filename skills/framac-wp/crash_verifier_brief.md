@@ -193,3 +193,5 @@ Return **exactly one JSON object** matching `schemas/agent-result.schema.json` (
   }
 }
 ```
+
+**Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It checks `record` and `additional_records` against the findings schema as well, and must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the schema does not have: remove it, in nested objects too) and run the check again. The parent discards a result that fails it and reruns the whole task.
