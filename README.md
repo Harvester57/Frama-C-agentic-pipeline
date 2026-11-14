@@ -133,6 +133,7 @@ Invoke the skills from your AI coding assistant:
 | [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice via Make. |
 | [`/framac-eva`](./skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
 | [`/framac-wp`](./skills/framac-wp/SKILL.md) | **Phase 3** | Dispatches the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) via `wp_scheduler.py`, enforcing the E-ACSL Dynamic Guardrail and spawning Adversarial Breakers on stalled goals. |
+| [`/run-supervisor`](./skills/run-supervisor/SKILL.md) | **Any (host-side)** | **Read-only supervisor of a live run:** polls progress, containers and the opencode transcript, triages stalls and failures, has fixer subagents reproduce and fix pipeline bugs in isolated worktrees with a failing regression test first, records troubleshooting entries and upstream drafts, and writes a supervision report. Never steers or stops the run, never pushes. |
 
 ---
 
