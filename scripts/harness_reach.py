@@ -23,6 +23,11 @@ strings; its 's' format branch never ran). It is a gap, and `reached_only_throug
 names, for each such entry point, the sorted roots whose callees lead to it. Internal
 functions keep the transitive reach (`functions_reached`).
 
+An `argv` harness (sidecar `entry_style: argv`) is the exception: it runs a program
+through its `main(argc, argv)`, the program's one real entry, so its entry points
+(the program's non-static helpers in the DAG) keep the transitive reach (nettle
+run-3: `sexp_conv`, `base16dec`, `nettle_hash`).
+
 An entry point the harness does not reach fails the gate unless the sidecar
 records why it cannot be harnessed (`reach_exempt`, written by the `exempt`
 subcommand), by its DAG key or by its plain name when no other DAG function has
@@ -425,6 +430,7 @@ def check_module(
 
     An entry point is reached when it is a root or a root reaches it through header inline wrappers
     only (`direct`); `reached_only_through` lists the others some root calls into, with those roots.
+    An `argv` harness (the program's `main` is the entry) keeps the transitive reach.
     """
     by_name = _functions_by_name(dag)
     fn_names = set(by_name)
@@ -482,7 +488,10 @@ def check_module(
     # An entry point counts only when the harness calls it itself: a root, or behind header inline
     # wrappers of a root. One that only another function calls is driven with that caller's arguments
     # (minmea run-1: `minmea_scan` behind the `minmea_parse_*` roots, its 's' format branch never run).
-    direct = callee_closure(roots, by_name, unit, follow=is_header_inline)
+    # An `argv` harness drives a program through its `main(argc, argv)`, the one real entry: the DAG's
+    # entry points are the program's non-static helpers, which no harness could call any better.
+    whole_program = sidecar.get("entry_style") == "argv"
+    direct = reached if whole_program else callee_closure(roots, by_name, unit, follow=is_header_inline)
 
     exempt_raw = sidecar.get("reach_exempt")
     exempt = {str(k): str(v) for k, v in exempt_raw.items()} if isinstance(exempt_raw, dict) else {}

@@ -435,6 +435,30 @@ def test_minmea_shape_fails_the_gate_on_the_scanner_behind_the_parsers(tmp_path,
     assert row["functions_reached"] == row["functions"] == 18
 
 
+def test_argv_harness_keeps_the_transitive_reach_of_a_program(tmp_path, monkeypatch):
+    # nettle run-3 (sexp_conv, base16dec, nettle_hash): the harness runs the program's main(argc, argv),
+    # and the DAG's entry points are the program's non-static helpers below it.
+    functions = {
+        "main": _fn("main", ["conv_parse", "write_data"]),
+        "conv_parse": _fn("conv_parse", ["conv_token"]),
+        "conv_token": _fn("conv_token"),
+        "write_data": _fn("write_data"),
+        "conv_unused": _fn("conv_unused"),
+    }
+    entries = ["conv_parse", "conv_token", "conv_unused", "write_data"]
+    module = {"module": "api", "tier": TIER_1A, "functions": list(functions), "candidate_entry_points": entries}
+    dag_doc = {"modules": {"api": module}, "functions": functions}
+    text = "int drive(int argc, char **argv) { return main(argc, argv); }\n"
+    row = harness_reach.check_module("api", dag_doc, {"entry_style": "argv"}, text, [])
+    assert row["roots"] == ["main"] and row["entry_points_reached"] == 3
+    # Only what main never leads to is a gap.
+    assert row["gaps"] == ["conv_unused"] and row["reached_only_through"] == {}
+    # Any other entry style holds the same harness to direct calls.
+    row = harness_reach.check_module("api", dag_doc, {"entry_style": "custom"}, text, [])
+    assert row["gaps"] == entries and row["entry_points_reached"] == 0
+    assert row["reached_only_through"] == {"conv_parse": ["main"], "conv_token": ["main"], "write_data": ["main"]}
+
+
 def test_target_fuzz_module_row_has_no_transitive_only_entry_point(tmp_path, monkeypatch):
     dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run(); dec_peek();"})
     _add_target_fuzzer(tmp_path, FUZZER_C)
