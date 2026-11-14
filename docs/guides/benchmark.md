@@ -62,7 +62,7 @@ A selection that skips a bug or target reports it as `not_compared`, never as a 
 
 A build failure or timeout gives `undecided`, which still fails the comparison.
 
-Each bug replays on the engine that confirmed it. MINMEA-01 to 03 need the sanitizer build: E-ACSL alone does not see `abs(INT_MIN)` (MINMEA-02), and with `-rte-initialized` it stops earlier at a false alarm on `strtol`'s `endptr`. Other engines are recorded as informational replays: they can warn, never fail.
+Each bug replays on the engine that confirmed it. MINMEA-01 to 03 need the sanitizer build: E-ACSL alone does not see `abs(INT_MIN)` (MINMEA-02). minmea's E-ACSL build has run with `-rte-initialized` since S9 of [`../plans/phase1-remediation-plan.md`](../plans/phase1-remediation-plan.md) (2026-11-14). Before that, the manifest turned it off because of false alarms on `strtol`'s `endptr` and on `va_arg`. With it on, the MINMEA-01 input reaches `minmea.c:656` on E-ACSL too. Other engines are recorded as informational replays: they can warn, never fail.
 
 **Comparison.** ANSSI [x509-parser](https://github.com/ANSSI-FR/x509-parser) (upstream, not the copy in OSCS) and a practical subset of the [Open Source Case Studies](https://git.frama-c.com/pub/open-source-case-studies) (OSCS): `jsmn`, `semver`, `stmr`, `qlz` and `tweetnacl-usable`, each with a harness pinned in the manifest. The manifest's `left_out` lists what is not included and why. OSCS's own alarm counts use its flags and its entry points, so they are not comparable with these.
 

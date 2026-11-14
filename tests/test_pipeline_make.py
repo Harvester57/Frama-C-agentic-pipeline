@@ -116,6 +116,7 @@ FUZZ_BUDGET_cfg := 60
 FUZZ_MAX_TIME_cfg :=
 FUZZ_DICT_cfg :=
 FUZZ_NO_RTE_INIT_cfg :=
+FUZZ_NO_LIBC_CHECKS_cfg :=
 FUZZ_ENGINE_cfg := auto
 
 # log
@@ -132,6 +133,7 @@ FUZZ_BUDGET_log := 60
 FUZZ_MAX_TIME_log :=
 FUZZ_DICT_log :=
 FUZZ_NO_RTE_INIT_log :=
+FUZZ_NO_LIBC_CHECKS_log :=
 FUZZ_ENGINE_log := auto
 
 # snmp
@@ -148,6 +150,7 @@ FUZZ_BUDGET_snmp := 300
 FUZZ_MAX_TIME_snmp := 30
 FUZZ_DICT_snmp := workspace/dicts/snmp.dict
 FUZZ_NO_RTE_INIT_snmp :=
+FUZZ_NO_LIBC_CHECKS_snmp :=
 FUZZ_ENGINE_snmp := auto
 """
 
@@ -264,6 +267,7 @@ def test_gen_flags_come_from_the_sidecar_and_dag_flags_are_diagnostics(tmp_path)
         ),
         "ldflags": "-lm",
         "rte_initialized": True,
+        "libc_checks": True,
     }
     with pytest.raises(ValueError, match="fplugin"):
         pm.module_build_spec("evil", run)
@@ -394,6 +398,17 @@ def test_params_set_and_show(tmp_path):
     assert res["overrides"] == {"eva_slevel": 250, "eva_taint": False, "fuzz_max_time": 45, "eva_timeout": 600}
     assert pm.params_set(run, "snmp", reset=True)["overrides"] == {}
     assert pm.load_params(run)["modules"] == {}
+
+
+def test_libc_checks_opt_out_reaches_make_and_replays(tmp_path):
+    run = _make_run(tmp_path)
+    assert pm.module_build_spec("snmp", run)["libc_checks"] is True
+    pm.params_set(run, "snmp", fuzz_libc_checks=False)
+    assert pm.module_build_spec("snmp", run)["libc_checks"] is False
+    mk = pm.render_modules_mk(pm.build_plan(run, templates_dir=ACSL))
+    assert "FUZZ_NO_LIBC_CHECKS_snmp := 1" in mk and "FUZZ_NO_LIBC_CHECKS_cfg :=\n" in mk
+    recipes = (Path(pm.__file__).resolve().parent.parent / "templates" / "pipeline.mk").read_text(encoding="utf-8")
+    assert recipes.count("$(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks)") == 2  # build and campaign
 
 
 @pytest.mark.parametrize(

@@ -403,6 +403,7 @@ def build_binary(module: str, spec: dict, out_bin: Path, engine: str) -> dict:
         cppflags=spec.get("cppflags") or "-I.",
         ldflags=spec.get("ldflags") or "",
         rte_initialized=bool(spec.get("rte_initialized", True)),
+        libc_checks=bool(spec.get("libc_checks", True)),
     )
 
 

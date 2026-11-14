@@ -1152,16 +1152,22 @@ def _run_parent_reverify(
         # The parent re-check must use the same reduced checks as the module's build:
         # a module fuzzed with -no-rte-initialized would otherwise re-trip an
         # initialization alarm the module opted out of and be misread as code_fault.
+        # Same for --no-fuzz-libc-checks (a false `... unallocated` report on a string libc allocated).
         rte_initialized = True
+        libc_checks = True
         try:
             import pipeline_make  # imported lazily; the overlay also works without the Make layer
 
             _plan = pipeline_make.build_plan(run_dir)
             _eff = pipeline_make.effective_params(pipeline_make.load_params(run_dir), hmod, _plan.profile)
             rte_initialized = bool(_eff.get("fuzz_rte_initialized", True))
+            libc_checks = bool(_eff.get("fuzz_libc_checks", True))
         except Exception:
             rte_initialized = True
-        build_tag_items = [list(sources), cppflags, ldflags, rte_initialized]
+            libc_checks = True
+        build_tag_items: list = [list(sources), cppflags, ldflags, rte_initialized]
+        if not libc_checks:
+            build_tag_items.append("no-libc-checks")
         if function:
             build_tag_items.append(function)
         build_tag = hashlib.sha256(json.dumps(build_tag_items).encode()).hexdigest()[:10]
@@ -1201,6 +1207,8 @@ def _run_parent_reverify(
             cmd.extend(["--reach-functions", *sorted(set(reach_functions))])
         if not rte_initialized:
             cmd.append("--no-rte-initialized")
+        if not libc_checks:
+            cmd.append("--no-libc-checks")
         if ldflags:
             cmd.append(f"--ldflags={ldflags}")
         proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")

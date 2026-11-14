@@ -1636,6 +1636,7 @@ def inner_replay() -> int:
                 cppflags=build["cppflags"],
                 ldflags=build["ldflags"],
                 rte_initialized=bool(build.get("rte_initialized", True)),
+                libc_checks=bool(build.get("libc_checks", True)),
             )
             report = fuzz.replay_report(
                 module,

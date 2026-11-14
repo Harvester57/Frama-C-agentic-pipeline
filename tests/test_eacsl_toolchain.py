@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -209,6 +210,23 @@ def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path
     assert res["full_mtracking_defines"] == ["-Dregister="] and "-Dregister=" in res["frontend_flags"]
     assert "-Dregister=" in Path(res["compile_log"]).read_text(encoding="utf-8")
     assert "alignas_rewrites" not in res  # nothing to rewrite in this instrumented file
+    # libc and format-string checks: --validate-format-strings also sets the runtime define at stage 2.
+    for stage in (stage1, stage2):
+        assert "--libc-replacements" in stage and "--validate-format-strings" in stage
+        assert stage.index("--validate-format-strings") < stage.index("-G")  # options, not flag values
+    assert res["check_options"] == ["--libc-replacements", "--validate-format-strings"]
+
+
+def test_check_options_are_part_of_the_build_cache_key(tmp_path, modern_cli, monkeypatch):
+    def material():
+        return R._eacsl_cache_material(
+            [str(_src(tmp_path))], tmp_path / "fuzz_mod", "gcc_x86_64", "-I.", "all", True, None, "", True, False, True
+        )
+
+    with_checks = material()
+    assert with_checks is not None and with_checks["check_options"] == list(T.EACSL_GCC_CHECK_OPTIONS)
+    monkeypatch.setattr(R, "EACSL_GCC_CHECK_OPTIONS", ())
+    assert material() != with_checks
 
 
 def test_slice_defining_llvmfuzzerinitialize_is_refused(tmp_path, modern_cli):
@@ -529,6 +547,40 @@ def test_rte_initialized_opt_out_is_recorded(tmp_path, modern_cli):
     assert res["reduced_checks"] == ["-no-rte-initialized"]
 
 
+def test_libc_checks_opt_out_drops_both_options_and_is_recorded(tmp_path, modern_cli):
+    fake = FakeEacslGcc()
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", libc_checks=False, runner=fake)
+    assert res["returncode"] == 0
+    for stage in fake.calls:
+        assert "--libc-replacements" not in stage and "--validate-format-strings" not in stage
+    assert res["check_options"] == [] and res["reduced_checks"] == [T.EACSL_NO_LIBC_CHECKS]
+    both = R.compile_eacsl_binary(
+        [str(_src(tmp_path))], tmp_path / "both", rte_initialized=False, libc_checks=False, runner=FakeEacslGcc()
+    )
+    assert both["reduced_checks"] == ["-no-rte-initialized", T.EACSL_NO_LIBC_CHECKS]
+
+
+def test_campaign_cli_threads_no_libc_checks(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_compile(*a, **k):
+        seen.update(k)
+        return {
+            "engine": "eacsl",
+            "returncode": 0,
+            "binary": str(tmp_path / "fuzz_mod.e-acsl"),
+            "reduced_checks": [T.EACSL_NO_LIBC_CHECKS],
+        }
+
+    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
+    monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path, "--no-libc-checks"))
+    R.main()
+    out = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert seen["libc_checks"] is False and seen["rte_initialized"] is True
+    assert out["reduced_checks"] == [T.EACSL_NO_LIBC_CHECKS]
+
+
 def test_variadic_opt_out_uses_the_kernel_option(tmp_path, modern_cli):
     fake = FakeEacslGcc()
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", variadic_translation=False, runner=fake)
@@ -770,7 +822,12 @@ def test_errno_shim_is_linked_with_wrap_flags_and_recorded(tmp_path, modern_cli)
     res = R.compile_eacsl_binary([str(_src(tmp_path))], out_bin, runner=fake, use_cache=False)
     assert res["returncode"] == 0, res
     shim_obj = tmp_path / "fuzz_mod_errno_shim" / "eacsl_errno_shim.o"
-    assert res["errno_shim"] == {"status": "built", "wrapped": ["strtol", "read"], "object": str(shim_obj)}
+    assert res["errno_shim"] == {
+        "status": "built",
+        "wrapped": ["strtol", "read"],
+        "eacsl_effects": ["strtol", "read"],
+        "object": str(shim_obj),
+    }
     shim_compile = next(c for c in fake.calls if c[0] == "clang")
     assert "-Werror" in shim_compile
     link = fake.calls[-1][fake.calls[-1].index("-l") + 1].split()
@@ -794,9 +851,190 @@ def test_errno_shim_absent_or_failed(tmp_path, modern_cli):
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "b", runner=fake, use_cache=False)
     # Not fatal, but recorded as a caveat: the target reads stale errno after these calls.
     assert res["returncode"] == 0
-    assert res["errno_shim"] == {"status": "failed", "wrapped": [], "unsynced": ["strtol", "read"]}
+    assert res["errno_shim"] == {
+        "status": "failed",
+        "wrapped": [],
+        "unsynced": ["strtol", "read"],
+        "eacsl_effects_missing": ["strtol", "read"],
+    }
     assert not any("--wrap" in a for a in fake.calls[-1])
     assert "errno shim not linked" in Path(res["compile_log"]).read_text(encoding="utf-8")
+    # Both attempts ran: with the E-ACSL effects, then errno alone.
+    assert sum(1 for c in fake.calls if c[0] == "clang" and "-c" in c) == 2
+
+
+# ---------------------------------------------------------------------------
+# S9 (F17): the libc shim tells the E-ACSL runtime what libc wrote or returned
+# ---------------------------------------------------------------------------
+
+EFFECTS_INSTRUMENTED = (
+    "extern char *strerror(int __errnum);\n"
+    "extern struct tm *gmtime(time_t const *__timer);\n"
+    "int f(char const *s, int sv[2], struct sockaddr *a, socklen_t *l)\n"
+    "{\n"
+    "  char *e;\n"
+    "  long v = strtol(s,& e,10);\n"
+    "  socketpair(1,1,0,sv);\n"
+    "  getsockname(sv[0],a,l);\n"
+    '  fprintf(stderr,"%s",strerror(2));\n'
+    "  gmtime((time_t const *)0);\n"
+    "  return (int)v;\n"
+    "}\n"
+)
+
+
+def _wrapper_body(src: str, name: str) -> str:
+    start = src.index(f" __wrap_{name}(")
+    return src[start : src.index("\n}\n", start)]
+
+
+def test_effect_calls_need_no_errno_global():
+    # No __fc_eacsl_errno: no errno sync, but every effect function called still gets a wrapper.
+    assert T.find_errno_shim_calls(EFFECTS_INSTRUMENTED) == []
+    assert T.find_eacsl_effect_calls(EFFECTS_INSTRUMENTED) == [
+        "strtol",
+        "getsockname",
+        "socketpair",
+        "strerror",
+        "gmtime",
+    ]
+
+
+def test_effects_table_signatures_match_the_errno_table():
+    errno_sigs = {f[1]: (f[0], f[2], f[3]) for f in T.ERRNO_SHIM_FUNCTIONS}
+    for name, (ret, params, header, _pre, post, copy) in T.EACSL_LIBC_EFFECTS.items():
+        assert header.endswith(".h") and (post or copy), name
+        assert copy in (None, "string", "struct"), name
+        if name in errno_sigs:
+            assert errno_sigs[name] == (ret, params, header), name
+
+
+def test_effect_wrappers_initialize_out_parameters_through_the_guard():
+    src = T.generate_errno_shim_source([], T.find_eacsl_effect_calls(EFFECTS_INSTRUMENTED))
+    # Runtime API, the readiness flag fuzz_init.c sets, and the tracked-memory guard.
+    assert "void __e_acsl_initialize(void *ptr, size_t size);" in src
+    assert "extern int __fc_eacsl_runtime_ready __attribute__((weak));" in src
+    assert "__e_acsl_valid(fc_p, fc_n, fc_p, (void *)0)" in src
+    # No errno sync when the slice does not read errno through the stub.
+    assert "errno = __fc_eacsl_errno;" not in src
+    strtol = _wrapper_body(src, "strtol")
+    assert strtol.index("__real_strtol(a0, a1, a2)") < strtol.index("FC_INIT(a1, sizeof *a1);")
+    gsn = _wrapper_body(src, "getsockname")
+    # The length is in/out: the address is initialized for at most the caller's buffer size.
+    assert gsn.index("socklen_t fc_in = a2 ? *a2 : 0;") < gsn.index("__real_getsockname(")
+    assert "FC_INIT(a1, FC_MIN(fc_in, *a2))" in gsn and "if (r == 0 && a2)" in gsn
+    assert "FC_INIT(a3, 2 * sizeof *a3);" in _wrapper_body(src, "socketpair")
+    assert "static __typeof__(gmtime) *const fc_errno_shim_check_gmtime" in src
+
+
+def test_scatter_reads_initialize_only_the_bytes_received():
+    src = T.generate_errno_shim_source([], ["recvmsg", "readv"])
+    assert "static __attribute__((unused)) void fc_init_iov(" in src
+    rm = _wrapper_body(src, "recvmsg")
+    # The in/out lengths are captured before the call; the iovec gets r bytes, the name and
+    # control buffers at most what the caller offered.
+    assert rm.index("socklen_t fc_name_in = a1 ? a1->msg_namelen : 0;") < rm.index("__real_recvmsg(")
+    assert "fc_init_iov(a1->msg_iov, a1->msg_iovlen, r);" in rm
+    assert "FC_INIT(a1->msg_name, FC_MIN(fc_name_in, a1->msg_namelen));" in rm
+    assert "if (r > 0) fc_init_iov(a1, a2, r);" in _wrapper_body(src, "readv")
+    # Effects stay off until fuzz_init.c says the runtime is up (absent flag: never).
+    assert "#define FC_READY (&__fc_eacsl_runtime_ready && __fc_eacsl_runtime_ready)" in src
+
+
+def test_returned_libc_storage_is_copied_into_a_registered_buffer():
+    src = T.generate_errno_shim_source([], ["strerror", "gmtime"])
+    se = _wrapper_body(src, "strerror")
+    assert f"static char fc_strerror_buf[{T.EACSL_SHIM_STRING_MAX}];" in src
+    # libc's own block lies outside the shadowed segments: never registered, never returned once ready.
+    assert "__e_acsl_store_block(r" not in src
+    assert "if (!r || !FC_READY) return r;" in se
+    assert "fc_strerror_buf[fc_n - 1] = 0;" in se
+    assert se.index("__e_acsl_store_block(fc_strerror_buf") < se.index("__e_acsl_initialize(fc_strerror_buf, fc_n);")
+    assert se.rstrip().endswith("return fc_strerror_buf;")
+    gm = _wrapper_body(src, "gmtime")
+    assert "static struct tm fc_gmtime_buf;" in src
+    assert "fc_gmtime_buf = *r;" in gm and gm.rstrip().endswith("return &fc_gmtime_buf;")
+
+
+def test_one_wrapper_merges_errno_sync_and_effects():
+    src = T.generate_errno_shim_source(["strtol"], ["strtol", "strerror"])
+    assert src.count(" __wrap_strtol(") == 1 and "= __wrap_strtol;" in src
+    body = _wrapper_body(src, "strtol")
+    assert body.index("errno = __fc_eacsl_errno;") < body.index("__real_strtol(")
+    assert body.index("__fc_eacsl_errno = errno;") < body.index("FC_INIT(a1, sizeof *a1);")
+    assert "__wrap_strerror(" in src
+
+
+def test_effects_only_shim_is_built_and_linked(tmp_path, modern_cli):
+    fake = FakeEacslGcc(instrumented_text=EFFECTS_INSTRUMENTED)
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=fake, use_cache=False)
+    assert res["returncode"] == 0, res
+    assert res["errno_shim"]["eacsl_effects"] == ["strtol", "getsockname", "socketpair", "strerror", "gmtime"]
+    link = fake.calls[-1][fake.calls[-1].index("-l") + 1].split()
+    assert "-Wl,--wrap=strtol,--wrap=getsockname,--wrap=socketpair,--wrap=strerror,--wrap=gmtime" in link
+
+
+def test_effects_that_fail_to_compile_fall_back_to_errno_only(tmp_path):
+    class EffectsFail:
+        def __init__(self):
+            self.sources: list[str] = []
+
+        def __call__(self, cmd, **kwargs):
+            text = Path(cmd[cmd.index("-c") + 4]).read_text(encoding="utf-8")
+            self.sources.append(text)
+            rc = 1 if "__e_acsl_initialize" in text else 0
+            return _cp(cmd, rc, "", "error: conflicting types for '__wrap_gmtime'" if rc else "")
+
+    instrumented = tmp_path / "x.instrumented.c"
+    instrumented.write_text(ERRNO_INSTRUMENTED, encoding="utf-8")
+    runner = EffectsFail()
+    shim = T.build_errno_shim_object(instrumented, tmp_path / "shim", runner=runner)
+    assert shim["status"] == "built" and shim["wrapped"] == ["strtol", "read"]
+    assert shim["eacsl_effects"] == [] and "conflicting types" in shim["effects_error"]
+    assert len(runner.sources) == 2 and "__e_acsl_initialize" not in runner.sources[1]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("clang") is None,
+    reason="needs clang and glibc headers (inside the image)",
+)
+def test_every_shim_wrapper_compiles_against_the_host_libc(tmp_path):
+    """One prototype that drifts from glibc fails the whole -Werror shim, so compile all of them."""
+    names = [f[1] for f in T.ERRNO_SHIM_FUNCTIONS]
+    for errno_names in (names, []):
+        src = tmp_path / f"shim_{len(errno_names)}.c"
+        src.write_text(
+            T.generate_errno_shim_source(errno_names, list(T.EACSL_LIBC_EFFECTS)), encoding="utf-8", newline="\n"
+        )
+        proc = subprocess.run(
+            ["clang", "-c", "-O1", "-Werror", "-std=gnu17", str(src), "-o", str(src.with_suffix(".o"))],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr[-4000:]
+
+
+def test_va_list_initialized_checks_are_skipped_and_others_kept():
+    text = (
+        "      __gen_e_acsl_initialized_16 = __e_acsl_initialized((void *)(& ap),\n"
+        "                                                         sizeof(va_list));\n"
+        "      __gen_e_acsl_initialized_17 = __e_acsl_initialized((void *)(& st->args),sizeof(__builtin_va_list));\n"
+        "      __gen_e_acsl_initialized_18 = __e_acsl_initialized((void *)(& x),sizeof(int));\n"
+    )
+    out, n = T.skip_va_list_initialized_checks(text)
+    assert n == 2
+    assert "__gen_e_acsl_initialized_16 = 1 /* ap: va_start/va_copy are not instrumented */;" in out
+    assert "__gen_e_acsl_initialized_17 = 1 /* st->args:" in out
+    assert "__e_acsl_initialized((void *)(& x),sizeof(int));" in out
+    assert T.skip_va_list_initialized_checks(out) == (out, 0)
+
+
+def test_fuzz_init_sets_the_runtime_ready_flag_after_initialization():
+    text = T.resolve_fuzz_init_source().read_text(encoding="utf-8")
+    body = text[text.index("int LLVMFuzzerInitialize(") :]
+    assert "int __fc_eacsl_runtime_ready;" in text
+    assert body.index("__e_acsl_memory_init(") < body.index("__fc_eacsl_runtime_ready = 1;")
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +1076,126 @@ def test_segment_model_message_is_parsed_and_runtime_frames_skipped():
     bare = R.parse_eacsl_failure("Use of invalid address 0x7ffd1234 in unsafe_initialize\n")
     assert bare is not None and bare["function"] == "unknown_function" and R.needs_attribution(bare)
     assert R.needs_attribution(None)
+
+
+# libmnl nlmsg harness, Frama-C 34.0~beta, --libc-replacements (2026-11-14), shortened: LIBMNL-01 at seed replay.
+LIBC_DEADLY_SIGNAL_LOG = (
+    "INFO: seed corpus: files: 1212 min: 1b max: 1583b total: 575353b rss: 51Mb\n"
+    "memcpy: overlapping memory areas\n"
+    "==100== ERROR: libFuzzer: deadly signal\n"
+    "    #0 0x6018f9ae9798 in __sanitizer_print_stack_trace (/t/lf.e-acsl+0x7f798) (BuildId: 4cb0)\n"
+    "    #1 0x6018f9abc36c in fuzzer::PrintStackTrace() (/t/lf.e-acsl+0x5236c) (BuildId: 4cb0)\n"
+    "    #2 0x6018f9aa12e7 in fuzzer::Fuzzer::CrashCallback() (/t/lf.e-acsl+0x372e7) (BuildId: 4cb0)\n"
+    "    #3 0x742602c1bd6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b)\n"
+    "    #5 0x742602c1bc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41) (BuildId: 5e5b)\n"
+    "    #6 0x6018f9b22cf2 in raise_abort /home/opam/.opam/5.5/bin/../share/frama-c/share/e-acsl/internals/e_acsl_private_assert.c:26:3\n"
+    "    #7 0x6018f9b22cf2 in private_abort_fail /home/opam/.opam/5.5/bin/../share/frama-c/share/e-acsl/internals/e_acsl_private_assert.c:43:3\n"
+    "    #8 0x6018f9b368f6 in validate_overlapping_spaces /home/opam/.opam/5.5/bin/../share/frama-c/share/e-acsl/libc_replacements/e_acsl_string.c:126:5\n"
+    "    #9 0x6018f9b368f6 in __e_acsl_builtin_memcpy /home/opam/.opam/5.5/bin/../share/frama-c/share/e-acsl/libc_replacements/e_acsl_string.c:224:3\n"
+    "    #10 0x6018f9b0b594 in mnl_nlmsg_batch_reset /t/lf.inst.c:24714:5\n"
+    "    #11 0x6018f9b206fb in ext_nlmsg_batch /t/lf.inst.c:37462:11\n"
+    "    #13 0x6018f9b1ab15 in LLVMFuzzerTestOneInput /t/lf.inst.c:38877:3\n"
+    "    #14 0x6018f9aa29ea in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/t/lf.e-acsl+0x389ea)\n"
+    "SUMMARY: libFuzzer: deadly signal\n"
+)
+
+
+def test_libc_replacement_report_is_parsed_with_its_caller():
+    f = R.parse_runtime_failure(LIBC_DEADLY_SIGNAL_LOG)
+    assert f is not None
+    assert f["function"] == "mnl_nlmsg_batch_reset"  # not `fuzzer`, `raise` or an E-ACSL runtime frame
+    assert f["kind"] == "eacsl_libc_error" and f["alarm_kind"] == "separation" and f["is_rte"]
+    assert f["predicate"] == "memcpy: overlapping memory areas"
+    assert f["instrumented_location"] == "/t/lf.inst.c:24714"
+    # The line is in the instrumented file: no source location, so the sanitizer replay is asked for one.
+    assert f["file"] == "unknown" and f["line"] == 0 and R.needs_attribution(f)
+    verdict = R.classify_guardrail(-6, False, LIBC_DEADLY_SIGNAL_LOG)
+    assert verdict["status"] == "code_fault"  # a libc misuse is not evidence against a contract
+
+
+@pytest.mark.parametrize(
+    ("line", "alarm", "kind", "predicate"),
+    [
+        (
+            "memcpy: insufficient space in destination space , at least 16 bytes required",
+            "mem_access",
+            "eacsl_libc_error",
+            "memcpy: insufficient space in destination space",
+        ),
+        (
+            "strlen: input string not NUL-terminated",
+            "valid_string",
+            "eacsl_libc_error",
+            "strlen: input string not NUL-terminated",
+        ),
+        # strncpy(d, strerror(e), n): libc's buffer is untracked (a false alarm, see --no-libc-checks).
+        (
+            "strncpy: source string string unallocated",
+            "mem_access",
+            "eacsl_libc_error",
+            "strncpy: source string string unallocated",
+        ),
+        (
+            "strcat: insufficient space in destination string, available: 8 bytes, requires at least 12 bytes",
+            "mem_access",
+            "eacsl_libc_error",
+            "strcat: insufficient space in destination string",
+        ),
+        (
+            "printf: directive 1 ('%s') expects argument of type 'char*' but the corresponding argument has type 'long'",
+            None,
+            "eacsl_format_error",
+            "printf: directive expects argument of type 'char*' but the corresponding argument has type 'long'",
+        ),
+        (
+            'printf: directive 1 (%s) in format "%s%s%s%n" has no argument',
+            None,
+            "eacsl_format_error",
+            "printf: directive in format has no argument",
+        ),
+        (
+            "Format error: illegal format specifier 'y'",
+            None,
+            "eacsl_format_error",
+            "Format error: illegal format specifier …",
+        ),
+        (
+            "snprintf: unterminated string in directive 2 ('%s')",
+            "valid_string",
+            "eacsl_format_error",
+            "snprintf: unterminated string in a directive",
+        ),
+    ],
+)
+def test_libc_and_format_reports_map_to_stable_predicates(line, alarm, kind, predicate):
+    f = R.parse_eacsl_failure(f"out\n{line}\nAborted\n")
+    assert f is not None and (f["alarm_kind"], f["kind"], f["predicate"]) == (alarm, kind, predicate)
+    assert f["message"] == line and f["function"] == "unknown_function"  # no stack, no caller
+
+
+def test_libc_report_predicate_ignores_input_dependent_parts():
+    def fp(line):
+        f = R.parse_eacsl_failure(line + "\n")
+        assert f is not None
+        return ledger.make_fingerprint(f["file"], f["function"], f["alarm_kind"] or f["kind"], f["predicate"])
+
+    assert fp('printf: directive 1 (%s) in format "%s%n" has no argument') == fp(
+        'printf: directive 3 (%x) in format "AAAA%x%x%x" has no argument'
+    )
+    assert fp("memcpy: insufficient space in destination space , at least 16 bytes required") == fp(
+        "memcpy: insufficient space in destination space , at least 4096 bytes required"
+    )
+
+
+def test_target_output_mid_line_is_not_a_libc_report():
+    assert R.parse_eacsl_failure("log: got 'memcpy: overlapping memory areas' from peer\n") is None
+    assert R.parse_eacsl_failure("note: string unallocated in cache\n") is None
+
+
+def test_segment_report_in_a_deadly_signal_stack_skips_libfuzzer_frames():
+    text = "Use of invalid address 0x1 in unsafe_initialize\n" + LIBC_DEADLY_SIGNAL_LOG.split("\n", 2)[2]
+    f = R.parse_eacsl_failure(text)
+    assert f is not None and f["kind"] == "eacsl_runtime_error" and f["function"] != "fuzzer"
 
 
 def test_differential_replay_attributes_unlocated_eacsl_crash(tmp_path, monkeypatch):
@@ -1489,6 +1847,139 @@ clang -fsyntax-only -w layout.c && echo LAYOUT_OK
 """
 
 
+# ---------------------------------------------------------------------------
+# S9 libc shim, end to end in the analysis image (FRAMAC_DOCKER_TESTS=1)
+# ---------------------------------------------------------------------------
+
+LIBC_EFFECTS_PROBE_C = r"""#define _GNU_SOURCE 1
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+
+static int sum(int n, ...)
+{
+    va_list ap;
+    int s = 0;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++)
+        s += va_arg(ap, int);
+    va_end(ap);
+    return s;
+}
+
+static int probe(int sel)
+{
+    switch (sel) {
+    case 0: { char *end; long v = strtol("12x", &end, 10); return (int)v + *end; }
+    case 1: {
+        int sv[2]; struct sockaddr_un a; socklen_t len = sizeof a;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        int r = getsockname(sv[0], (struct sockaddr *)&a, &len);
+        close(sv[0]); close(sv[1]);
+        return r == 0 ? a.sun_family + (int)len : 0;
+    }
+    case 2: fprintf(stderr, "e=%s\n", strerror(2)); return 0;
+    case 3: { time_t t = 0; struct tm *tm = gmtime(&t); return tm ? tm->tm_year : 0; }
+    case 4: {
+        int sv[2]; char buf[16]; struct iovec iov = {buf, sizeof buf}; struct msghdr m = {0};
+        m.msg_iov = &iov; m.msg_iovlen = 1;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        write(sv[1], "hi", 2);
+        ssize_t r = recvmsg(sv[0], &m, 0);
+        close(sv[0]); close(sv[1]);
+        return r == 2 ? buf[0] + buf[1] : 0;
+    }
+    case 5: return sum(3, 1, 2, sel);
+    /* Real uninitialized reads next to a wrapped call. */
+    case 6: {
+        int p[2]; char buf[16];
+        if (pipe(p) != 0) return 0;
+        write(p[1], "ab", 2);
+        ssize_t r = read(p[0], buf, sizeof buf);
+        close(p[0]); close(p[1]);
+        return r == 2 ? buf[5] : 0;
+    }
+    case 7: {
+        struct sockaddr_un a; socklen_t len = sizeof a;
+        if (getsockname(-1, (struct sockaddr *)&a, &len) == 0) return 0;
+        return a.sun_family;
+    }
+    case 8: {
+        /* MSG_TRUNC: recv returns the datagram's length (8), but wrote only 2 bytes. */
+        int sv[2]; char buf[16];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) return 0;
+        write(sv[1], "abcdefgh", 8);
+        ssize_t r = recv(sv[0], buf, 2, MSG_TRUNC);
+        close(sv[0]); close(sv[1]);
+        return r == 8 ? buf[5] : 0;
+    }
+    }
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (size < 1)
+        return 0;
+    return probe(data[0] % 9) == 12345;
+}
+"""
+
+LIBC_EFFECTS_SCRIPT = r"""set -e
+cp -r /fixture /tmp/w && cd /tmp/w
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/repo/scripts")
+import run_eacsl_fuzz as R
+res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
+keys = ("returncode", "reason", "binary", "errno_shim", "va_list_init_checks_skipped")
+print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
+EOF
+set +e
+for i in 0 1 2 3 4 5 6 7 8; do
+  printf "$(printf '\\%03o' "$i")" > "in$i"
+  ./out/fuzz_mod.e-acsl -runs=1 "in$i" > "run$i.log" 2>&1
+  echo "CASE $i rc=$? init_failed=$(grep -c 'initialized' "run$i.log")"
+done
+"""
+
+
+@pytest.mark.integration
+def test_libc_shim_clears_libc_false_alarms_and_keeps_real_ones_in_the_analysis_image(tmp_path):
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mod.c").write_text(LIBC_EFFECTS_PROBE_C, encoding="utf-8")
+    argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro"]
+    argv += ["-v", f"{REPO}:/repo:ro", ANALYSIS_IMAGE, LIBC_EFFECTS_SCRIPT]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    out = proc.stdout + proc.stderr
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    assert line, out[-4000:]
+    res = json.loads(line[len("RESULT ") :])
+    assert res["returncode"] == 0, out[-4000:]
+    assert {"strtol", "getsockname", "strerror", "gmtime", "recvmsg", "read", "recv"} <= set(
+        res["errno_shim"]["eacsl_effects"]
+    )
+    assert res["va_list_init_checks_skipped"]
+    cases = dict(re.findall(r"^CASE (\d) (rc=\d+ init_failed=\d+)$", proc.stdout, re.MULTILINE))
+    # strtol endptr, getsockname, strerror into fprintf, gmtime, recvmsg, va_arg: clean.
+    for i in "012345":
+        assert cases[i] == "rc=0 init_failed=0", (i, out[-4000:])
+    # A byte past what read() returned, the address after a failed getsockname, a byte past what
+    # recv(MSG_TRUNC) wrote although it returned more: still caught.
+    for i in "678":
+        assert not cases[i].startswith("rc=0 ") and not cases[i].endswith("=0"), (i, out[-4000:])
+
+
 @pytest.mark.integration
 def test_register_locals_and_member_alignas_build_and_run_in_the_analysis_image(tmp_path):
     from conftest import ANALYSIS_IMAGE, require_docker_images
@@ -1629,13 +2120,7 @@ def test_build_errno_shim_object_logs_warning_on_unshimmed_libc_calls(tmp_path):
 @pytest.mark.parametrize("suffix", ["4U", "4L", "4ULL", "4"])
 def test_mark_formals_initialized_supports_all_integer_suffix_forms(suffix):
     """D5: Support integer suffixes in __e_acsl_store_block (U, L, ULL, bare)."""
-    src = (
-        "int f_struct(int k)\n"
-        "{\n"
-        f"  __e_acsl_store_block((void *)(& k),{suffix});\n"
-        "  return k + 1;\n"
-        "}\n"
-    )
+    src = f"int f_struct(int k)\n{{\n  __e_acsl_store_block((void *)(& k),{suffix});\n  return k + 1;\n}}\n"
     patched, n = T.mark_formals_initialized(src)
     assert n == 1
     assert "__e_acsl_full_init((void *)(& k));" in patched
@@ -1643,12 +2128,7 @@ def test_mark_formals_initialized_supports_all_integer_suffix_forms(suffix):
 
 def test_mark_formals_initialized_warns_when_store_block_lines_exist_and_none_match():
     """D5: Warn when __e_acsl_store_block exists in source but none matches _STORE_BLOCK_LINE_RE."""
-    src = (
-        "int f(int k) {\n"
-        "  __e_acsl_store_block(bogus_syntax_here);\n"
-        "  return k;\n"
-        "}\n"
-    )
+    src = "int f(int k) {\n  __e_acsl_store_block(bogus_syntax_here);\n  return k;\n}\n"
     with pytest.warns(UserWarning, match="__e_acsl_store_block lines exist in text but none matched"):
         patched, n = T.mark_formals_initialized(src)
     assert n == 0
@@ -1665,4 +2145,3 @@ def test_fix_readonly_scalar_globals_supports_all_integer_suffix_forms(suffix):
     patched, n = T.fix_readonly_scalar_globals(src)
     assert n == 1
     assert "__e_acsl_mark_readonly((void *)(& kMaxEmbeddedInt));" in patched
-

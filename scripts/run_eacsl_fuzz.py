@@ -96,6 +96,8 @@ from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
     EACSL_FULL_MTRACKING_DEFINES,
+    EACSL_GCC_CHECK_OPTIONS,
+    EACSL_NO_LIBC_CHECKS,
     EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
     build_eacsl_flag_sets,
@@ -115,6 +117,7 @@ from eacsl_toolchain import (  # noqa: E402
     rewrite_sound_verdict_resets,
     rewrite_trailing_alignas,
     select_eacsl_binary,
+    skip_va_list_initialized_checks,
     slice_has_pthread,
     uses_full_mtracking,
 )
@@ -291,8 +294,10 @@ _ASAN_OP_RE = re.compile(
 )
 # Sanitizer stack frame:
 #   #0 0x555555 in UpdateSyncMem /path/to/SyncMem.c:827:5
+# C++ names keep their scope (`fuzzer::PrintStackTrace()`, libFuzzer's own frames in a deadly-signal
+# stack), so `fuzzer::` matches _RUNTIME_FN_PREFIXES instead of leaving a function named `fuzzer`.
 _STACK_FRAME_RE = re.compile(
-    r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*)"
+    r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*(?:::~?[A-Za-z_][A-Za-z0-9_]*)*)"
     r"(?:\s+(?P<file>(?:[A-Za-z]:)?[^\s():]+):(?P<line>\d+)(?::\d+)?)?"
 )
 
@@ -444,7 +449,11 @@ def _parse_segment_failure(text: str) -> dict | None:
     file_, line_, function = "unknown", 0, "unknown_function"
     for m in _STACK_FRAME_RE.finditer(text):
         fn, fpath = m.group("function"), m.group("file")
-        if is_runtime_function(fn, fpath) or (fpath and Path(fpath).name.startswith("harness_")) or is_harness_fuzz_function(fn):
+        if (
+            is_runtime_function(fn, fpath)
+            or (fpath and Path(fpath).name.startswith("harness_"))
+            or is_harness_fuzz_function(fn)
+        ):
             continue
         file_, line_, function = fpath or "unknown", int(m.group("line")) if m.group("line") else 0, fn
         break
@@ -460,6 +469,192 @@ def _parse_segment_failure(text: str) -> dict | None:
         "is_rte": True,
         "predicate": f"rte: mem_access: {msg}{detail}",
     }
+
+
+# Reports of E-ACSL's libc replacements (--libc-replacements, share/e-acsl/libc_replacements/e_acsl_string.c)
+# and format-string checks (--validate-format-strings, e_acsl_stdio.c). The runtime prints one bare line,
+# `<function>: <message>` or `Format error: <message>`, then aborts: no file, line or failing predicate.
+# A closed list of the runtime's templates, anchored at a line start, so target output of the same shape
+# is not read as one. Each entry: (template, alarm kind or None, failure kind, stable predicate). The stable
+# predicate drops sizes, directive numbers and the format string, which vary from input to input and feed
+# the fingerprint; type names in a mismatch stay.
+_LIBC_FN = r"(?P<func>[A-Za-z_]\w*): "
+_LIBC_TEMPLATES: tuple[tuple[re.Pattern[str], str | None, str, str], ...] = tuple(
+    (re.compile(r"^" + rx + r"\s*$", re.MULTILINE), alarm, kind, stable)
+    for rx, alarm, kind, stable in (
+        (
+            _LIBC_FN + r"(?P<desc>(?:\w+ )*)string unallocated",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: {desc}string unallocated",
+        ),
+        (
+            _LIBC_FN + r"(?P<desc>(?:\w+ )*)string is not writable",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: {desc}string is not writable",
+        ),
+        (
+            _LIBC_FN + r"(?P<desc>(?:\w+ )*)string has insufficient length",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: {desc}string has insufficient length",
+        ),
+        (
+            _LIBC_FN + r"(?P<desc>(?:\w+ )*)string not NUL-terminated",
+            "valid_string",
+            "eacsl_libc_error",
+            "{func}: {desc}string not NUL-terminated",
+        ),
+        (
+            _LIBC_FN + r"unallocated \(or insufficient\) space in (?P<space>.+?)",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: unallocated (or insufficient) space in {space}",
+        ),
+        (
+            _LIBC_FN + r"insufficient space in (?P<space>.+?)\s*, at least \d+ bytes required",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: insufficient space in {space}",
+        ),
+        (
+            _LIBC_FN + r"insufficient space in destination string, available: \d+ bytes, requires at least \d+ bytes",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: insufficient space in destination string",
+        ),
+        (
+            _LIBC_FN + r"(?P<space>.+?) space unallocated or cannot be written",
+            "mem_access",
+            "eacsl_libc_error",
+            "{func}: {space} space unallocated or cannot be written",
+        ),
+        (_LIBC_FN + r"overlapping memory areas", "separation", "eacsl_libc_error", "{func}: overlapping memory areas"),
+        (
+            _LIBC_FN
+            + r"directive \d+ \(.*\) expects argument of type '(?P<exp>[^']*)' but the corresponding argument has type '(?P<act>[^']*)'",
+            None,
+            "eacsl_format_error",
+            "{func}: directive expects argument of type '{exp}' but the corresponding argument has type '{act}'",
+        ),
+        (
+            _LIBC_FN + r"attempt to access (?P<part>(?:partially )?)unallocated memory via directive \d+ \(.*\)",
+            "mem_access",
+            "eacsl_format_error",
+            "{func}: attempt to access {part}unallocated memory via a directive",
+        ),
+        (
+            _LIBC_FN + r"unterminated string in directive \d+ \(.*\)",
+            "valid_string",
+            "eacsl_format_error",
+            "{func}: unterminated string in a directive",
+        ),
+        (
+            _LIBC_FN + r"output buffer overlaps with argument \d+ \(.*\)",
+            "separation",
+            "eacsl_format_error",
+            "{func}: output buffer overlaps with an argument",
+        ),
+        (
+            _LIBC_FN + r"invalid format string \(unallocated or unterminated\)",
+            "valid_string",
+            "eacsl_format_error",
+            "{func}: invalid format string (unallocated or unterminated)",
+        ),
+        (
+            _LIBC_FN + r"directive \d+ \(.*\) in format \".*\" has no argument",
+            None,
+            "eacsl_format_error",
+            "{func}: directive in format has no argument",
+        ),
+        (
+            _LIBC_FN + r"argument \d+ of directive \S+ not allocated(?P<w>(?: or writeable)?)",
+            "mem_access",
+            "eacsl_format_error",
+            "{func}: argument of a directive not allocated{w}",
+        ),
+        (
+            _LIBC_FN
+            + r"attempt to write to (?P<what>an invalid stream|a closed stream|a closed file descriptor)(?: -?\d+)?",
+            None,
+            "eacsl_format_error",
+            "{func}: attempt to write to {what}",
+        ),
+        (
+            _LIBC_FN + r"output buffer is unallocated or has insufficient length to store \d+ characters.*",
+            "mem_access",
+            "eacsl_format_error",
+            "{func}: output buffer is unallocated or has insufficient length",
+        ),
+        (r"(?P<func>)Format error: (?P<msg>.+?)", None, "eacsl_format_error", "Format error: {msg}"),
+    )
+)
+# A quoted directive, format string or flag in a `Format error:` message, and the numbers in it.
+_LIBC_QUOTED_RE = re.compile(r"\"[^\"]*\"|'[^']*'|\([^)]*\)")
+_EACSL_GEN_PREFIX = "__gen_e_acsl_"
+
+
+def _caller_of_eacsl_runtime(text: str) -> tuple[str, str]:
+    """
+    (function, `file:line`) of the first stack frame after the innermost E-ACSL runtime frame: the
+    target code that called the checked libc function. libFuzzer and libc frames come first in a
+    deadly-signal stack (`fuzzer::PrintStackTrace`, `raise`), so the first non-runtime frame is not it.
+    The file is the instrumented source, whose line numbers mean nothing in the target's sources.
+    """
+    frames = list(_STACK_FRAME_RE.finditer(text))
+    last_rt = -1
+    for i, m in enumerate(frames):
+        fn, fpath = m.group("function"), m.group("file") or ""
+        if fn.startswith(("__e_acsl", "private_abort", "raise_abort", "vabort")) or "e-acsl/" in fpath.replace(
+            "\\", "/"
+        ):
+            last_rt = i
+    if last_rt < 0:
+        return "", ""
+    for m in frames[last_rt + 1 :]:
+        fn = m.group("function")
+        if is_runtime_function(fn, m.group("file")) or is_harness_fuzz_function(fn):
+            continue
+        where = f"{m.group('file')}:{m.group('line')}" if m.group("file") and m.group("line") else ""
+        return fn.removeprefix(_EACSL_GEN_PREFIX), where
+    return "", ""
+
+
+def _parse_libc_failure(text: str) -> dict | None:
+    """
+    A report of E-ACSL's libc replacements or format-string checks. It has no location: `file` is
+    `unknown` and `line` 0, so the campaign replays the input on its sanitizer build for one (ASan
+    locates the memory errors, not the format errors). `function` is the caller found in the stack,
+    when libFuzzer printed one.
+    """
+    best: tuple[int, re.Match[str], str | None, str, str] | None = None
+    for rx, alarm, kind, stable in _LIBC_TEMPLATES:
+        m = rx.search(text)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), m, alarm, kind, stable)
+    if best is None:
+        return None
+    _, m, alarm, kind, stable = best
+    groups = {k: (v or "") for k, v in m.groupdict().items()}
+    if "msg" in groups:
+        groups["msg"] = re.sub(r"\d+", "N", _LIBC_QUOTED_RE.sub("…", groups["msg"]))
+    message = m.group(0).strip()
+    function, where = _caller_of_eacsl_runtime(text)
+    res: dict = {
+        "file": "unknown",
+        "line": 0,
+        "function": function or "unknown_function",
+        "kind": kind,
+        "alarm_kind": alarm,
+        "is_rte": True,
+        "label": "",
+        "predicate": stable.format(**groups),
+        "message": message,
+    }
+    if where:
+        res["instrumented_location"] = where
+    return res
 
 
 def _failing_predicate(text: str, start: int) -> tuple[str, str]:
@@ -498,7 +693,7 @@ def parse_eacsl_failure(text: str) -> dict | None:
     old = None if err else _OLD_RE.search(text)
     hit = err or old
     if not hit:
-        return _parse_segment_failure(text)
+        return _parse_libc_failure(text) or _parse_segment_failure(text)
     file_ = (hit.group("file") or "").rstrip(".")
     line_ = int(hit.group("line"))
     function = hit.groupdict().get("function") or ""
@@ -717,6 +912,7 @@ def _eacsl_cache_material(
     warn_unsigned_downcast: bool,
     rte_initialized: bool,
     concurrency: bool | None = None,
+    libc_checks: bool = True,
 ) -> dict | None:
     """Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse)."""
     has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
@@ -753,7 +949,13 @@ def _eacsl_cache_material(
         "rte_initialized": rte_initialized,
         "no_constfold": True,
         "concurrency": has_pthread,
+        "check_options": _check_options(is_modern, libc_checks),
     }
+
+
+def _check_options(is_modern: bool, libc_checks: bool) -> list[str]:
+    """e-acsl-gcc options for both stages (EACSL_GCC_CHECK_OPTIONS); the long-option CLI of Frama-C <= 32 gets none."""
+    return list(EACSL_GCC_CHECK_OPTIONS) if is_modern and libc_checks else []
 
 
 def compile_eacsl_binary(
@@ -772,6 +974,7 @@ def compile_eacsl_binary(
     use_cache: bool = True,
     enable_l2: bool | None = None,
     concurrency: bool | None = None,
+    libc_checks: bool = True,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL (see `_compile_eacsl_binary_uncached`).
@@ -802,6 +1005,7 @@ def compile_eacsl_binary(
             runner,
             target_fns=target_fns,
             concurrency=concurrency,
+            libc_checks=libc_checks,
         )
 
     material = None
@@ -819,6 +1023,7 @@ def compile_eacsl_binary(
             warn_unsigned_downcast,
             rte_initialized,
             concurrency=concurrency,
+            libc_checks=libc_checks,
         )
     if material is None:
         res = _build()
@@ -873,14 +1078,17 @@ def _compile_eacsl_binary_uncached(
     runner=subprocess.run,
     target_fns: list[str] | None = None,
     concurrency: bool | None = None,
+    libc_checks: bool = True,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL.
 
     Modern CLI (Frama-C 33+) runs in two explicit stages so preprocessor flags never reach the
     compile of the self-contained instrumented file:
-      1. instrument: `e-acsl-gcc -n -G clang -F <frama-c flags> -E <frontend> -o <out>.instrumented.c <sources>`
-      2. compile:    `e-acsl-gcc -C -G clang -e <backend> -l <ldflags> -O <out> [fuzz_init.c] <out>.instrumented.c`
+      1. instrument: `e-acsl-gcc -n --no-constfold <checks> -G clang -F <frama-c flags> -E <frontend> -o <out>.instrumented.c <sources>`
+      2. compile:    `e-acsl-gcc -C <checks> -G clang -e <backend> -l <ldflags> -O <out> [fuzz_init.c] <out>.instrumented.c`
+    `<checks>` is EACSL_GCC_CHECK_OPTIONS (libc and format-string checks, `check_options` in the
+    result) unless `libc_checks` is False, which is recorded in `reduced_checks`.
     `-n` matters: without it `e-acsl-gcc` also links the original sources, which fails on a
     main-less fuzz harness. Fuzz builds use full memory tracking and link
     templates/eacsl_runtime/fuzz_init.c, whose LLVMFuzzerInitialize initializes the runtime that
@@ -914,7 +1122,8 @@ def _compile_eacsl_binary_uncached(
         "variadic_fallbacks": [],
         "errno_shim": None,
         "rte_select_dropped": [],
-        "reduced_checks": [] if rte_initialized else ["-no-rte-initialized"],
+        "reduced_checks": ([] if rte_initialized else ["-no-rte-initialized"])
+        + ([] if libc_checks else [EACSL_NO_LIBC_CHECKS]),
     }
 
     def _record(cmd: list[str], rc: int, out: str, err: str) -> None:
@@ -954,6 +1163,9 @@ def _compile_eacsl_binary_uncached(
         return _finish(2, "eacsl_argv_unsafe")
     result["frontend_flags"] = flags["frontend"]
     result["backend_flags"] = flags["backend"]
+    check_options = _check_options(is_modern, libc_checks)
+    if is_modern:
+        result["check_options"] = check_options
     if full_mtracking:
         result["full_mtracking_defines"] = list(EACSL_FULL_MTRACKING_DEFINES)
         log_parts.append(
@@ -1014,6 +1226,7 @@ def _compile_eacsl_binary_uncached(
                 eacsl_bin,
                 "-n",
                 "--no-constfold",
+                *check_options,
                 "-G",
                 "clang",
                 "-F",
@@ -1059,6 +1272,15 @@ def _compile_eacsl_binary_uncached(
                     log_parts.append(
                         f"Marked __retres initialized after {n_inits} contract-wrapper call(s) "
                         "(E-ACSL omits it; -rte-initialized would reject every ensures on \\result).\n"
+                    )
+                # Without this, every va_arg fails \initialized(&ap): va_start is not instrumented.
+                c_text, n_va = skip_va_list_initialized_checks(c_text)
+                if n_va:
+                    c_modified = True
+                    result["va_list_init_checks_skipped"] = n_va
+                    log_parts.append(
+                        f"Skipped {n_va} \\initialized check(s) on va_list objects "
+                        "(va_start/va_copy are compiler builtins E-ACSL does not instrument).\n"
                     )
 
             # Without this, the first read of a by-value struct field fails \initialized on every call.
@@ -1116,7 +1338,8 @@ def _compile_eacsl_binary_uncached(
             result["init_hook"] = init_hook[0]
 
         # fc_stubs/errno.h maps errno to a tracked global (libc's TLS errno is outside E-ACSL's
-        # shadow segments); the shim copies libc's errno into it after each shimmed call.
+        # shadow segments); the shim copies libc's errno into it after each shimmed call. The same
+        # wrappers tell the runtime what libc wrote or returned (eacsl_toolchain.EACSL_LIBC_EFFECTS).
         shim = build_errno_shim_object(
             instrumented_c, out_bin.parent / f"{out_bin.name}_errno_shim", runner=runner, timeout=BUILD_TIMEOUT_S
         )
@@ -1128,14 +1351,28 @@ def _compile_eacsl_binary_uncached(
             except UnsafePassthroughError as exc:
                 log_parts.append(f"Refusing to link errno shim: {exc}\n")
                 return _finish(2, "eacsl_argv_unsafe")
-            result["errno_shim"] = {"status": "built", "wrapped": shim["wrapped"], "object": shim["object"]}
+            result["errno_shim"] = {
+                "status": "built",
+                "wrapped": shim["wrapped"],
+                "eacsl_effects": shim["eacsl_effects"],
+                "object": shim["object"],
+            }
+            if shim.get("effects_error"):
+                result["errno_shim"]["effects_error"] = shim["effects_error"]
+                log_parts.append(f"E-ACSL libc effects not linked: {shim['effects_error']}\n")
         elif shim["status"] == "error":
-            # Not fatal: the target still builds, but reads stale errno after these calls.
-            result["errno_shim"] = {"status": "failed", "wrapped": [], "unsynced": shim["wrapped"]}
+            # Not fatal: the target still builds, but reads stale errno after these calls and
+            # E-ACSL may stop on memory libc wrote.
+            result["errno_shim"] = {
+                "status": "failed",
+                "wrapped": [],
+                "unsynced": shim["wrapped"],
+                "eacsl_effects_missing": shim.get("eacsl_effects", []),
+            }
             log_parts.append(f"errno shim not linked: {shim.get('reason')}\n")
 
         def _stage2(link: str) -> tuple[list[str], int, str, str]:
-            cmd2 = [eacsl_bin, "-C", "-G", "clang", "-e", flags["backend"], "-O", str(out_bin)]
+            cmd2 = [eacsl_bin, "-C", *check_options, "-G", "clang", "-e", flags["backend"], "-O", str(out_bin)]
             if link:
                 cmd2.extend(["-l", link])
             cmd2.extend(init_hook)
@@ -3251,6 +3488,7 @@ def build_module_binary(
     variadic_translation: bool = True,
     warn_unsigned_downcast: bool = False,
     rte_initialized: bool = True,
+    libc_checks: bool = True,
     use_cache: bool = True,
     dag_path: Path | str | None = None,
     link_module: str | None = None,
@@ -3295,6 +3533,7 @@ def build_module_binary(
                     variadic_translation=variadic_translation,
                     warn_unsigned_downcast=warn_unsigned_downcast,
                     rte_initialized=rte_initialized,
+                    libc_checks=libc_checks,
                     use_cache=use_cache,
                 )
                 if comp["returncode"] != 0 and engine == "auto":
@@ -3768,6 +4007,7 @@ def replay_candidates(
                     cppflags=spec["cppflags"],
                     ldflags=spec["ldflags"],
                     rte_initialized=bool(spec.get("rte_initialized", True)),
+                    libc_checks=bool(spec.get("libc_checks", True)),
                 )
         scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
         report = replay_report(
@@ -4032,6 +4272,7 @@ def minimize_candidates(
                     cppflags=spec["cppflags"],
                     ldflags=spec["ldflags"],
                     rte_initialized=bool(spec.get("rte_initialized", True)),
+                    libc_checks=bool(spec.get("libc_checks", True)),
                 )
         prepared = prepared_by_key[key]
         binary = prepared.get("binary") if isinstance(prepared, dict) else None
@@ -4589,6 +4830,11 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
         help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks",
     )
     p.add_argument(
+        "--no-libc-checks",
+        action="store_true",
+        help="Build E-ACSL without --libc-replacements and --validate-format-strings; recorded in reduced_checks",
+    )
+    p.add_argument(
         "--selftest-json",
         type=Path,
         default=DEFAULT_SELFTEST_JSON,
@@ -4623,6 +4869,7 @@ def _build_options(args) -> dict:
         "variadic_translation": not args.no_variadic_translation,
         "warn_unsigned_downcast": args.warn_unsigned_downcast,
         "rte_initialized": not args.no_rte_initialized,
+        "libc_checks": not args.no_libc_checks,
         "use_cache": not getattr(args, "no_cache", False),
         "dag_path": dag,
         "link_module": getattr(args, "module", "") or None,
@@ -4725,6 +4972,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-rte-initialized",
         action="store_true",
         help="Do not check uninitialized reads (-rte-initialized); recorded in reduced_checks",
+    )
+    p_guard.add_argument(
+        "--no-libc-checks",
+        action="store_true",
+        help="Build E-ACSL without --libc-replacements and --validate-format-strings; recorded in reduced_checks",
     )
     p_guard.add_argument(
         "--no-cache",
@@ -4954,6 +5206,7 @@ def main(argv: list[str] | None = None) -> int:
                 cppflags=args.cppflags,
                 ldflags=args.ldflags,
                 rte_initialized=not args.no_rte_initialized,
+                libc_checks=not args.no_libc_checks,
             )
             binary = prepared.get("binary")
         else:
@@ -5043,6 +5296,7 @@ def main(argv: list[str] | None = None) -> int:
                 variadic_translation=not args.no_variadic_translation,
                 warn_unsigned_downcast=args.warn_unsigned_downcast,
                 rte_initialized=not args.no_rte_initialized,
+                libc_checks=not args.no_libc_checks,
                 use_cache=use_cache,
             )
             if comp["returncode"] != 0:
@@ -5250,7 +5504,7 @@ def _run_campaign_mode(args) -> dict:
             return out
 
         # `auto` with a working E-ACSL build fuzzes with both engines, half the time each: ASan+UBSan
-        # first (faster, and it catches what E-ACSL does not check, such as overlapping memcpy), then
+        # first (faster, and it catches what E-ACSL does not check, such as heap-use-after-free on a reused block), then
         # E-ACSL on the grown corpus, which replays every corpus input under its contract checks.
         second = None
         if args.engine == "auto" and engine_used == "eacsl":

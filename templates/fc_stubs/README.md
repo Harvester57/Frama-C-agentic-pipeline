@@ -71,6 +71,16 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   fallbacks sync the same way. The build result records the wrapped functions in `errno_shim`, a
   coverage caveat: after a libc call outside that list the target reads the last value it wrote.
   Add a function to the table (non-variadic, with its header) when a target branches on its errno.
+- The same shim tells the E-ACSL runtime what a libc call wrote (`EACSL_LIBC_EFFECTS` in
+  [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py)), because E-ACSL runs on
+  host headers without Frama-C's libc `assigns` clauses. Out-parameters get the written bytes marked
+  initialized: `strto*`'s `endptr`, the socket address of `getsockname`, `accept` and `recvfrom`,
+  the buffers of `read`, `recv`, `recvmsg` and `readv`, and others. Results in libc's static
+  storage (`strerror`, `gmtime`, ...) are copied into a tracked buffer of the shim. Each entry is
+  `(return type, parameter types, header, pre, post, copy)` in C. Add one when a target stops on
+  `\initialized` right after a libc call, or on `unallocated` memory libc returned. A signature
+  that differs from the host prototype makes the effects fail to compile; the shim then falls back
+  to the errno wrappers alone and records `effects_error`.
 - Memory that an uninstrumented library allocates (json-c objects and strings, `strdup`,
   `getenv`) is not tracked, so `\valid_read` is false on it. A stub contract that requires
   `\valid_read(p)` would reject every such pointer. The E-ACSL branches therefore check a string

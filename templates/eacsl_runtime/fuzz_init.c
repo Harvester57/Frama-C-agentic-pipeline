@@ -18,11 +18,20 @@
 void __e_acsl_memory_init(int *argc_ref, char ***argv_ref, size_t ptr_size);
 void __e_acsl_globals_init(void) __attribute__((weak));
 
+/*
+ * Set once the runtime is initialized. The libc shim (eacsl_errno_shim.c,
+ * eacsl_toolchain.EACSL_LIBC_EFFECTS) also wraps calls libFuzzer and the
+ * runtime's own initialization make before the shadow memory is mapped; it
+ * calls the runtime only once this is set.
+ */
+int __fc_eacsl_runtime_ready;
+
 int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
     __e_acsl_memory_init(argc, argv, sizeof(void *));
     if (__e_acsl_globals_init)
         __e_acsl_globals_init();
+    __fc_eacsl_runtime_ready = 1;
     return 0;
 }
 

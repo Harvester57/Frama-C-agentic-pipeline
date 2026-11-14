@@ -24,7 +24,8 @@ spaces break. This module enforces the invocation contract:
     enters the instrumented sources (so the fallback numbering stays stable);
   - `find_errno_shim_calls()` / `build_errno_shim_object()` link `-Wl,--wrap`
     wrappers that copy libc's errno into the global fc_stubs/errno.h maps
-    `errno` to, so the target sees the errno a libc call set.
+    `errno` to, so the target sees the errno a libc call set; the same wrappers
+    tell the E-ACSL runtime what the call wrote (`EACSL_LIBC_EFFECTS`).
 """
 
 from __future__ import annotations
@@ -64,6 +65,23 @@ EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-f
 # which re-instruments proven annotations (docs/upstream/frama-c/frama-c-eacsl-assert-print-data-alias.md).
 EACSL_FULL_MTRACKING_FLAG = "-e-acsl-full-mtracking"
 EACSL_FC_EXTRA_FLAGS = (EACSL_FULL_MTRACKING_FLAG,)
+# e-acsl-gcc options passed to both stages of the two-stage CLI (Frama-C 33+):
+# --libc-replacements (-e-acsl-replace-libc-functions) checks the buffers of memcpy, memmove, memset,
+#   strcpy, strncpy, strcat, strncat, strlen, strcmp, strncmp, strdup and strndup; RTE emits nothing for
+#   libc calls, so their overflows, overlaps and unterminated strings were missed.
+# --validate-format-strings (-e-acsl-validate-format-strings at stage 1, -DE_ACSL_VALIDATE_FORMAT_STRINGS
+#   at stage 2, so both stages need it) checks printf-family directives against their arguments.
+# Both abort with a bare `<function>: <message>` line and no location (parse_eacsl_failure reads them).
+# 2026-11-14 trial: 2/9 seeded defects caught without them; 8/9 and about +10% run time with them,
+# derived from per-flag runs (docs/plans/frama-c-34-option-review.md). Under clang the format runtime needs EACSL_CODEGEN_FLAGS'
+# -O1 and -Wno-implicit-function-declaration (docs/upstream/frama-c/frama-c-eacsl-gcc-clang-cflags.md).
+# Not --temporal: it aborts on any call that passes a function's address under full tracking
+# (docs/upstream/frama-c/frama-c-eacsl-temporal-function-address-argument.md).
+EACSL_GCC_CHECK_OPTIONS = ("--libc-replacements", "--validate-format-strings")
+# The `reduced_checks` entry of a build without them (`--no-libc-checks`). E-ACSL does not track memory
+# libc allocates itself (`strerror`'s buffer), so `fprintf(f, "%s", strerror(e))` or `strncpy(d,
+# strerror(e), n)` aborts as unallocated: a module whose seeds stop on such a call fuzzes without them.
+EACSL_NO_LIBC_CHECKS = "-no-libc-checks"
 # Full tracking registers every local with `__e_acsl_store_block(&local, ...)`, and the kernel aborts
 # on a `register` local ("Taking the address of a register variable", Cil.mkAddrOf; nettle arcfour.c:
 # `register uint8_t i, j;`). Dropping the storage class changes nothing for a local whose address is
@@ -484,6 +502,28 @@ def mark_formals_initialized(c_text: str) -> tuple[str, int]:
     if count and not _FULL_INIT_DECL_RE.search("\n".join(out[:first_patched_at])):
         out[first_patched_at:first_patched_at] = [FORMAL_INIT_DECL, ""]
     return "\n".join(out), count
+
+
+# `__e_acsl_initialized((void *)(& ap), sizeof(va_list))`, the check -rte-initialized puts before
+# each `__builtin_va_arg(ap, ...)`. Only va_start and va_copy initialize a va_list, and both are
+# compiler builtins E-ACSL does not instrument, so the check fails on every va_arg (minmea's
+# minmea_scan, S9). Marking `ap` initialized after va_start would not help: the block is registered
+# with Frama-C's machdep size (8 on gcc_x86_64) while clang's sizeof(va_list) is 24.
+_VA_LIST_INITIALIZED_RE = re.compile(
+    r"__e_acsl_initialized\(\s*\(void \*\)\s*\(\s*&\s*(?P<lv>[^,()]+?)\s*\)\s*,\s*"
+    r"sizeof\(\s*(?:__builtin_)?va_list\s*\)\s*\)"
+)
+
+
+def skip_va_list_initialized_checks(c_text: str) -> tuple[str, int]:
+    """
+    Replace E-ACSL's `\\initialized` test on a va_list object by 1. A va_list is initialized only by
+    va_start or va_copy, which the runtime never sees, so the test is false on every va_arg; reading
+    a va_list before va_start is no longer reported. Returns (new_text, count).
+    """
+    return _VA_LIST_INITIALIZED_RE.subn(
+        lambda m: f"1 /* {m.group('lv')}: va_start/va_copy are not instrumented */", c_text
+    )
 
 
 _READONLY_SCALAR_RE = re.compile(
@@ -1066,31 +1106,320 @@ def find_errno_shim_calls(instrumented_source: str) -> list[str]:
     return [name for _ret, name, _params, _hdr in ERRNO_SHIM_FUNCTIONS if name in called]
 
 
-def generate_errno_shim_source(names: Sequence[str]) -> str:
-    """C source of the `__wrap_<name>` wrappers, type-checked against the host prototypes."""
-    table = {f[1]: f for f in ERRNO_SHIM_FUNCTIONS}
-    headers = ["errno.h", "stddef.h", "stdint.h", "sys/types.h"]
+# What a libc call writes or returns that the E-ACSL runtime cannot see (F17,
+# docs/plans/phase1-review.md). E-ACSL tracks only memory the instrumented code allocates or
+# writes: with -rte-initialized, a value libc wrote through an out-parameter fails `\initialized`
+# at its first read (`strtol`'s endptr, `getsockname`'s address), and with --libc-replacements and
+# --validate-format-strings a buffer libc owns (`strerror`'s string, `gmtime`'s struct) is
+# "unallocated". Each listed function the slice calls goes through the same `-Wl,--wrap` wrapper
+# as the errno shim (a function can be wrapped once), which after the real call:
+#   - `post`: marks the bytes the call wrote initialized, through FC_INIT, which skips memory the
+#     runtime does not track (initializing it would write a shadow the runtime never mapped);
+#   - `copy`: "string" or "struct", copies the result into a buffer of the shim object, inside
+#     the executable's global segment that the runtime shadows, registers that buffer once,
+#     marks the copied bytes initialized and returns it. libc's own block cannot be registered:
+#     it lies outside every shadowed segment. One buffer per function keeps the libc contract
+#     (the result is overwritten by the next call); a string is cut at EACSL_SHIM_STRING_MAX - 1.
+# Memory libc allocates with malloc needs nothing: the runtime defines malloc, and libc's strdup
+# or getline call it. Their contents still need `post` (libc writes them). `pre` captures inputs
+# the call may overwrite (an in/out length). Parameters are a0..aN and the result is r.
+# Entries: name -> (return type, parameter types, header, pre, post, copy). The signature of a
+# function also in ERRNO_SHIM_FUNCTIONS must match it (tests check this).
+EACSL_SHIM_STRING_MAX = 1024
+_SOCKLEN_IN = "socklen_t fc_in = {len} ? *{len} : 0;"
+_SOCKADDR_OUT = "if ({cond} && {len}) {{ FC_INIT({addr}, FC_MIN(fc_in, *{len})); FC_INIT({len}, sizeof *{len}); }}"
+_ENDPTR = "FC_INIT(a1, sizeof *a1);"
+EACSL_LIBC_EFFECTS: dict[str, tuple[str, tuple[str, ...], str, str, str, str | None]] = {
+    # Out-parameters.
+    **{
+        name: (ret, ("const char *", "char **", *extra), hdr, "", _ENDPTR, None)
+        for name, ret, extra, hdr in (
+            ("strtol", "long", ("int",), "stdlib.h"),
+            ("strtoll", "long long", ("int",), "stdlib.h"),
+            ("strtoul", "unsigned long", ("int",), "stdlib.h"),
+            ("strtoull", "unsigned long long", ("int",), "stdlib.h"),
+            ("strtoimax", "intmax_t", ("int",), "inttypes.h"),
+            ("strtoumax", "uintmax_t", ("int",), "inttypes.h"),
+            ("strtod", "double", (), "stdlib.h"),
+            ("strtof", "float", (), "stdlib.h"),
+            ("strtold", "long double", (), "stdlib.h"),
+        )
+    },
+    "read": ("ssize_t", ("int", "void *", "size_t"), "unistd.h", "", "if (r > 0) FC_INIT(a1, r);", None),
+    "pread": ("ssize_t", ("int", "void *", "size_t", "off_t"), "unistd.h", "", "if (r > 0) FC_INIT(a1, r);", None),
+    # With MSG_TRUNC, recv and recvfrom return the packet's real length, which can exceed `len`.
+    "recv": (
+        "ssize_t",
+        ("int", "void *", "size_t", "int"),
+        "sys/socket.h",
+        "",
+        "if (r > 0) FC_INIT(a1, FC_MIN((size_t)r, a2));",
+        None,
+    ),
+    "recvfrom": (
+        "ssize_t",
+        ("int", "void *", "size_t", "int", "struct sockaddr *", "socklen_t *"),
+        "sys/socket.h",
+        _SOCKLEN_IN.format(len="a5"),
+        "if (r > 0) FC_INIT(a1, FC_MIN((size_t)r, a2)); " + _SOCKADDR_OUT.format(cond="r >= 0", addr="a4", len="a5"),
+        None,
+    ),
+    "readv": (
+        "ssize_t",
+        ("int", "const struct iovec *", "int"),
+        "sys/uio.h",
+        "",
+        "if (r > 0) fc_init_iov(a1, a2, r);",
+        None,
+    ),
+    "recvmsg": (
+        "ssize_t",
+        ("int", "struct msghdr *", "int"),
+        "sys/socket.h",
+        "socklen_t fc_name_in = a1 ? a1->msg_namelen : 0; size_t fc_ctl_in = a1 ? a1->msg_controllen : 0;",
+        "if (r >= 0 && a1) { fc_init_iov(a1->msg_iov, a1->msg_iovlen, r); "
+        "FC_INIT(a1->msg_name, FC_MIN(fc_name_in, a1->msg_namelen)); "
+        "FC_INIT(a1->msg_control, FC_MIN(fc_ctl_in, a1->msg_controllen)); "
+        "FC_INIT(&a1->msg_namelen, sizeof a1->msg_namelen); "
+        "FC_INIT(&a1->msg_controllen, sizeof a1->msg_controllen); "
+        "FC_INIT(&a1->msg_flags, sizeof a1->msg_flags); }",
+        None,
+    ),
+    "accept": (
+        "int",
+        ("int", "struct sockaddr *", "socklen_t *"),
+        "sys/socket.h",
+        _SOCKLEN_IN.format(len="a2"),
+        _SOCKADDR_OUT.format(cond="r >= 0", addr="a1", len="a2"),
+        None,
+    ),
+    **{
+        name: (
+            "int",
+            ("int", "struct sockaddr *", "socklen_t *"),
+            "sys/socket.h",
+            _SOCKLEN_IN.format(len="a2"),
+            _SOCKADDR_OUT.format(cond="r == 0", addr="a1", len="a2"),
+            None,
+        )
+        for name in ("getsockname", "getpeername")
+    },
+    "getsockopt": (
+        "int",
+        ("int", "int", "int", "void *", "socklen_t *"),
+        "sys/socket.h",
+        _SOCKLEN_IN.format(len="a4"),
+        _SOCKADDR_OUT.format(cond="r == 0", addr="a3", len="a4"),
+        None,
+    ),
+    "socketpair": (
+        "int",
+        ("int", "int", "int", "int *"),
+        "sys/socket.h",
+        "",
+        "if (r == 0) FC_INIT(a3, 2 * sizeof *a3);",
+        None,
+    ),
+    "pipe": ("int", ("int *",), "unistd.h", "", "if (r == 0) FC_INIT(a0, 2 * sizeof *a0);", None),
+    "inet_pton": (
+        "int",
+        ("int", "const char *", "void *"),
+        "arpa/inet.h",
+        "",
+        "if (r == 1) FC_INIT(a2, a0 == AF_INET ? 4 : 16);",
+        None,
+    ),
+    **{
+        name: ("int", (first, "struct stat *"), "sys/stat.h", "", "if (r == 0) FC_INIT(a1, sizeof *a1);", None)
+        for name, first in (("stat", "const char *"), ("fstat", "int"), ("lstat", "const char *"))
+    },
+    "clock_gettime": (
+        "int",
+        ("clockid_t", "struct timespec *"),
+        "time.h",
+        "",
+        "if (r == 0) FC_INIT(a1, sizeof *a1);",
+        None,
+    ),
+    "gettimeofday": (
+        "int",
+        ("struct timeval *", "void *"),
+        "sys/time.h",
+        "",
+        "if (r == 0) FC_INIT(a0, sizeof *a0);",
+        None,
+    ),
+    "time": ("time_t", ("time_t *",), "time.h", "", "FC_INIT(a0, sizeof *a0);", None),
+    "nanosleep": (
+        "int",
+        ("const struct timespec *", "struct timespec *"),
+        "time.h",
+        "",
+        "if (r != 0) FC_INIT(a1, sizeof *a1);",
+        None,
+    ),
+    "poll": (
+        "int",
+        ("struct pollfd *", "nfds_t", "int"),
+        "poll.h",
+        "",
+        "if (r >= 0) FC_INIT(a0, a1 * sizeof *a0);",
+        None,
+    ),
+    "select": (
+        "int",
+        ("int", "fd_set *", "fd_set *", "fd_set *", "struct timeval *"),
+        "sys/select.h",
+        "",
+        "if (r >= 0) { FC_INIT(a1, sizeof *a1); FC_INIT(a2, sizeof *a2); FC_INIT(a3, sizeof *a3); }",
+        None,
+    ),
+    **{
+        name: ("struct tm *", ("const time_t *", "struct tm *"), "time.h", "", "if (r) FC_INIT(a1, sizeof *a1);", None)
+        for name in ("gmtime_r", "localtime_r")
+    },
+    "fgets": ("char *", ("char *", "int", "FILE *"), "stdio.h", "", "if (r) FC_INIT(a0, strlen(a0) + 1);", None),
+    "fread": ("size_t", ("void *", "size_t", "size_t", "FILE *"), "stdio.h", "", "FC_INIT(a0, r * a1);", None),
+    # Blocks libc allocates through the runtime's malloc and fills itself.
+    "strdup": ("char *", ("const char *",), "string.h", "", "if (r) FC_INIT(r, strlen(r) + 1);", None),
+    "strndup": ("char *", ("const char *", "size_t"), "string.h", "", "if (r) FC_INIT(r, strlen(r) + 1);", None),
+    "realpath": ("char *", ("const char *", "char *"), "stdlib.h", "", "if (r) FC_INIT(r, strlen(r) + 1);", None),
+    "getline": (
+        "ssize_t",
+        ("char **", "size_t *", "FILE *"),
+        "stdio.h",
+        "",
+        "FC_INIT(a0, sizeof *a0); FC_INIT(a1, sizeof *a1); if (r >= 0 && *a0) FC_INIT(*a0, (size_t)r + 1);",
+        None,
+    ),
+    # Results in libc's own static storage.
+    **{
+        name: (ret, params, hdr, "", "", "string")
+        for name, ret, params, hdr in (
+            ("strerror", "char *", ("int",), "string.h"),
+            ("strsignal", "char *", ("int",), "string.h"),
+            ("inet_ntoa", "char *", ("struct in_addr",), "arpa/inet.h"),
+            ("gai_strerror", "const char *", ("int",), "netdb.h"),
+            ("ctime", "char *", ("const time_t *",), "time.h"),
+            ("asctime", "char *", ("const struct tm *",), "time.h"),
+        )
+    },
+    **{name: ("struct tm *", ("const time_t *",), "time.h", "", "", "struct") for name in ("gmtime", "localtime")},
+}
+
+
+def find_eacsl_effect_calls(instrumented_source: str) -> list[str]:
+    """Functions of EACSL_LIBC_EFFECTS the slice calls, in table order."""
+    called = {m.group("name") for m in _CALL_SITE_RE.finditer(instrumented_source or "")}
+    return [name for name in EACSL_LIBC_EFFECTS if name in called]
+
+
+_SHIM_PRELUDE = (
+    "void *__e_acsl_store_block(void *ptr, size_t size);\n"
+    "void __e_acsl_initialize(void *ptr, size_t size);\n"
+    "int __e_acsl_valid(void *ptr, size_t size, void *ptr_base, void *addrof_base);\n"
+    "/* templates/eacsl_runtime/fuzz_init.c sets it once the runtime is initialized. Before that,\n"
+    " * libFuzzer and the runtime's own initialization (it read()s /proc/self/maps) make wrapped calls\n"
+    " * while the shadow is not mapped. Without the init hook nothing says when the runtime is ready,\n"
+    " * so the effects stay off. */\n"
+    "extern int __fc_eacsl_runtime_ready __attribute__((weak));\n"
+    "#define FC_READY (&__fc_eacsl_runtime_ready && __fc_eacsl_runtime_ready)\n"
+    "/* Only memory the runtime tracks: its shadow is mapped. */\n"
+    "#define FC_INIT(p, n) do { void *fc_p = (void *)(p); size_t fc_n = (size_t)(n); \\\n"
+    "    if (FC_READY && fc_p && fc_n && __e_acsl_valid(fc_p, fc_n, fc_p, (void *)0)) \\\n"
+    "        __e_acsl_initialize(fc_p, fc_n); } while (0)\n"
+    "#define FC_MIN(a, b) ((a) < (b) ? (a) : (b))\n"
+    "#include <sys/uio.h>\n"
+    "/* The first `total` bytes a scatter read stored, across the iovec. */\n"
+    "static __attribute__((unused)) void fc_init_iov(const struct iovec *iov, size_t n, size_t total)\n"
+    "{\n"
+    "    for (size_t i = 0; iov && i < n && total > 0; i++) {\n"
+    "        size_t k = FC_MIN(iov[i].iov_len, total);\n"
+    "        FC_INIT(iov[i].iov_base, k);\n"
+    "        total -= k;\n"
+    "    }\n"
+    "}\n"
+)
+
+
+def _shim_copy_lines(name: str, copy: str) -> tuple[str, list[str]]:
+    """(static storage, statements) returning a tracked copy of `r`."""
+    buf, reg = f"fc_{name}_buf", f"fc_{name}_registered"
+    if copy == "string":
+        storage = f"static char {buf}[{EACSL_SHIM_STRING_MAX}];\nstatic int {reg};\n"
+        lines = [
+            "if (!r || !FC_READY) return r;",
+            f"size_t fc_n = strlen(r) + 1; if (fc_n > sizeof {buf}) fc_n = sizeof {buf};",
+            f"memcpy({buf}, r, fc_n); {buf}[fc_n - 1] = 0;",
+            f"if (!{reg}) {{ __e_acsl_store_block({buf}, sizeof {buf}); {reg} = 1; }}",
+            f"__e_acsl_initialize({buf}, fc_n);",
+            f"return {buf};",
+        ]
+    else:
+        storage = f"static struct tm {buf};\nstatic int {reg};\n"
+        lines = [
+            "if (!r || !FC_READY) return r;",
+            f"{buf} = *r;",
+            f"if (!{reg}) {{ __e_acsl_store_block(&{buf}, sizeof {buf}); {reg} = 1; }}",
+            f"__e_acsl_initialize(&{buf}, sizeof {buf});",
+            f"return &{buf};",
+        ]
+    return storage, lines
+
+
+def generate_errno_shim_source(names: Sequence[str], effects: Sequence[str] = ()) -> str:
+    """
+    C source of the `__wrap_<name>` wrappers, type-checked against the host prototypes: errno sync
+    for `names` (ERRNO_SHIM_FUNCTIONS) and the E-ACSL effects of `effects` (EACSL_LIBC_EFFECTS).
+    A function in both gets one wrapper doing both.
+    """
+    table = {f[1]: (f[0], f[2], f[3]) for f in ERRNO_SHIM_FUNCTIONS}
+    effect_names = [n for n in effects if n in EACSL_LIBC_EFFECTS]
+    headers = ["errno.h", "stddef.h", "stdint.h", "string.h", "sys/types.h"]
     bodies: list[str] = []
-    for name in names:
-        ret, _name, params, header = table[name]
+    for name in [*names, *(n for n in effect_names if n not in names)]:
+        effect = EACSL_LIBC_EFFECTS.get(name) if name in effect_names else None
+        if name in table:
+            ret, params, header = table[name]
+        else:
+            assert effect is not None
+            ret, params, header = effect[0], effect[1], effect[2]
         if header not in headers:
             headers.append(header)
         decls = ", ".join(f"{p} a{i}" for i, p in enumerate(params))
         args = ", ".join(f"a{i}" for i in range(len(params)))
+        sync = name in names
+        storage = ""
+        lines: list[str] = []
+        if effect and effect[3]:
+            lines.append(effect[3])
+        if sync:
+            lines.append(f"errno = {ERRNO_SHIM_GLOBAL};")
+        lines.append(f"{ret} r = __real_{name}({args});")
+        if sync:
+            lines.append(f"{ERRNO_SHIM_GLOBAL} = errno;")
+        if effect and effect[4]:
+            lines.append(effect[4])
+        if effect and effect[5]:
+            storage, copy_lines = _shim_copy_lines(name, effect[5])
+            lines.extend(copy_lines)
+        else:
+            lines.append("return r;")
+        body = "".join(f"    {line}\n" for line in lines)
         bodies.append(
-            f"extern __typeof__({name}) __real_{name};\n"
-            f"{ret} __wrap_{name}({decls})\n"
-            f"{{\n    errno = {ERRNO_SHIM_GLOBAL};\n    {ret} r = __real_{name}({args});\n"
-            f"    {ERRNO_SHIM_GLOBAL} = errno;\n    return r;\n}}\n"
+            f"extern __typeof__({name}) __real_{name};\n" + storage + f"{ret} __wrap_{name}({decls})\n{{\n{body}}}\n"
             f"static __typeof__({name}) *const fc_errno_shim_check_{name} __attribute__((unused)) = __wrap_{name};\n"
         )
     return (
-        "/* Generated by run_eacsl_fuzz.py: link-only errno shim for E-ACSL builds.\n"
-        f" * templates/fc_stubs/errno.h maps the target's errno to {ERRNO_SHIM_GLOBAL}; each wrapper hands\n"
-        " * that value to libc and copies libc's errno back, so the target sees what the call set. */\n"
+        "/* Generated by run_eacsl_fuzz.py: link-only libc shim for E-ACSL builds.\n"
+        f" * templates/fc_stubs/errno.h maps the target's errno to {ERRNO_SHIM_GLOBAL}; each errno wrapper hands\n"
+        " * that value to libc and copies libc's errno back, so the target sees what the call set. The\n"
+        " * E-ACSL effects tell the runtime what the call wrote (eacsl_toolchain.EACSL_LIBC_EFFECTS). */\n"
         "#define _GNU_SOURCE 1\n"
         + "".join(f"#include <{h}>\n" for h in headers)
-        + f"\nextern int {ERRNO_SHIM_GLOBAL};\n\n"
+        + f"\nextern int {ERRNO_SHIM_GLOBAL};\n"
+        + (_SHIM_PRELUDE if effect_names else "")
+        + "\n"
         + "\n".join(bodies)
     )
 
@@ -1104,14 +1433,23 @@ def build_errno_shim_object(
 ) -> dict[str, Any]:
     """
     Generate and compile `eacsl_errno_shim.o` when the slice reads errno through the stub's global
-    and calls shimmed functions. Returns {status: none|built|error, wrapped, object, source,
-    wrap_flags, reason}; the caller links `object` with `wrap_flags`.
+    and calls shimmed functions, or calls a function of EACSL_LIBC_EFFECTS. Returns {status:
+    none|built|error, wrapped, eacsl_effects, unshimmed, object, source, wrap_flags, reason}; the
+    caller links `object` with `wrap_flags`. When the effects do not compile against the host libc,
+    the errno wrappers alone are retried and `effects_error` says why.
     """
     try:
         text = Path(instrumented_c).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return {"status": "error", "reason": f"cannot read instrumented source: {exc}", "wrapped": [], "unshimmed": []}
+        return {
+            "status": "error",
+            "reason": f"cannot read instrumented source: {exc}",
+            "wrapped": [],
+            "eacsl_effects": [],
+            "unshimmed": [],
+        }
     names = find_errno_shim_calls(text)
+    effects = find_eacsl_effect_calls(text)
     raw_calls = {m.group("name") for m in _CALL_SITE_RE.finditer(text)}
     unshimmed = sorted((raw_calls & _ERRNO_SHIM_NAMES) - set(names))
     if unshimmed:
@@ -1122,32 +1460,50 @@ def build_errno_shim_object(
             UserWarning,
             stacklevel=2,
         )
-    if not names:
-        return {"status": "none", "wrapped": [], "unshimmed": unshimmed}
+    if not names and not effects:
+        return {"status": "none", "wrapped": [], "eacsl_effects": [], "unshimmed": unshimmed}
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / "eacsl_errno_shim.c"
     obj = out_dir / "eacsl_errno_shim.o"
-    src.write_text(generate_errno_shim_source(names), encoding="utf-8", newline="\n")
-    cmd = [compiler, "-c", "-O1", "-Werror", "-std=gnu17", str(src), "-o", str(obj)]
-    try:
-        proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-        rc, err = proc.returncode, (proc.stderr or "")[-4000:]
-    except subprocess.TimeoutExpired:
-        rc, err = 124, f"{compiler} exceeded the {timeout} s build time limit"
-    except OSError as exc:
-        rc, err = 127, str(exc)
+
+    def _compile(errno_names: list[str], effect_names: list[str]) -> tuple[int, str]:
+        src.write_text(generate_errno_shim_source(errno_names, effect_names), encoding="utf-8", newline="\n")
+        cmd = [compiler, "-c", "-O1", "-Werror", "-std=gnu17", str(src), "-o", str(obj)]
+        try:
+            proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+            return proc.returncode, (proc.stderr or "")[-4000:]
+        except subprocess.TimeoutExpired:
+            return 124, f"{compiler} exceeded the {timeout} s build time limit"
+        except OSError as exc:
+            return 127, str(exc)
+
+    found_effects = effects
+    effects_error = ""
+    rc, err = _compile(names, effects)
+    if rc != 0 and effects and names:
+        effects_error = f"E-ACSL libc effects failed to compile: {err}"
+        effects = []
+        rc, err = _compile(names, [])
     if rc != 0:
         return {
             "status": "error",
-            "reason": f"errno shim failed to compile: {err}",
+            "reason": f"errno shim failed to compile: {err}"
+            if names
+            else f"E-ACSL libc effects failed to compile: {err}",
             "wrapped": names,
+            "eacsl_effects": found_effects,
             "unshimmed": unshimmed,
         }
-    return {
+    wrapped = [*names, *(n for n in effects if n not in names)]
+    result: dict[str, Any] = {
         "status": "built",
-        "wrapped": names,
+        "wrapped": wrapped,
+        "eacsl_effects": effects,
         "unshimmed": unshimmed,
         "object": str(obj),
         "source": str(src),
-        "wrap_flags": "-Wl," + ",".join(f"--wrap={n}" for n in names),
+        "wrap_flags": "-Wl," + ",".join(f"--wrap={n}" for n in wrapped),
     }
+    if effects_error:
+        result["effects_error"] = effects_error
+    return result

@@ -292,6 +292,7 @@ PARAM_TYPES: dict[str, type] = {
     "fuzz_max_time": int,
     "fuzz_dict": str,
     "fuzz_rte_initialized": bool,
+    "fuzz_libc_checks": bool,
     "fuzz_engine": str,
     "wp_exclude_files": list,
     "wp_extra_sources": list,
@@ -313,6 +314,7 @@ def default_params(profile: str) -> dict:
         "fuzz_max_time": None,
         "fuzz_dict": None,
         "fuzz_rte_initialized": True,
+        "fuzz_libc_checks": True,
         "fuzz_engine": "auto",
         "wp_exclude_files": [],
         "wp_extra_sources": [],
@@ -1211,6 +1213,7 @@ def module_build_spec(
         "cppflags": shlex.join(mod.cppflags),
         "ldflags": shlex.join(mod.ldflags),
         "rte_initialized": bool(mod.params.get("fuzz_rte_initialized", True)),
+        "libc_checks": bool(mod.params.get("fuzz_libc_checks", True)),
     }
 
 
@@ -1278,6 +1281,7 @@ def _module_block(mod: ModulePlan) -> list[str]:
         _assign(f"FUZZ_MAX_TIME_{n}", _opt(p["fuzz_max_time"])),
         _assign(f"FUZZ_DICT_{n}", _opt(p["fuzz_dict"])),
         _assign(f"FUZZ_NO_RTE_INIT_{n}", "" if p["fuzz_rte_initialized"] else "1"),
+        _assign(f"FUZZ_NO_LIBC_CHECKS_{n}", "" if p.get("fuzz_libc_checks", True) else "1"),
         _assign(f"FUZZ_ENGINE_{n}", mk_quote(str(p.get("fuzz_engine") or "auto"))),
     ]
 
@@ -2789,6 +2793,24 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_set.set_defaults(fuzz_rte_initialized=None)
+    libc_checks = p_set.add_mutually_exclusive_group()
+    libc_checks.add_argument(
+        "--fuzz-libc-checks",
+        dest="fuzz_libc_checks",
+        action="store_true",
+        help="Build E-ACSL with --libc-replacements and --validate-format-strings (default)",
+    )
+    libc_checks.add_argument(
+        "--no-fuzz-libc-checks",
+        dest="fuzz_libc_checks",
+        action="store_false",
+        help=(
+            "Build this module's E-ACSL binary without --libc-replacements and --validate-format-strings; "
+            "recorded in reduced_checks. For a module whose seeds stop on a false `... unallocated` report: "
+            "E-ACSL does not track memory libc allocates itself, such as the string strerror returns."
+        ),
+    )
+    p_set.set_defaults(fuzz_libc_checks=None)
     p_set.add_argument(
         "--fuzz-engine",
         choices=["auto", "eacsl", "sanitizers", ""],
@@ -2858,6 +2880,7 @@ def main(argv: list[str] | None = None) -> int:
                 fuzz_budget=args.fuzz_budget,
                 fuzz_max_time=args.fuzz_max_time,
                 fuzz_rte_initialized=args.fuzz_rte_initialized,
+                fuzz_libc_checks=args.fuzz_libc_checks,
                 fuzz_engine=args.fuzz_engine,
                 wp_exclude_files=args.wp_exclude_files,
                 wp_extra_sources=args.wp_extra_sources,

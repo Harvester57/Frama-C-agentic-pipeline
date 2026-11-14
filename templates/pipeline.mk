@@ -115,7 +115,7 @@ $(BUILD_TARGETS): build-%:
 	$(RUN) --class build --key $* --output workspace/build/$*.build.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py build --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
-		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) \
+		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) $(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks) \
 		--engine=$(FUZZ_ENGINE_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/build/$*.build.json
 
@@ -151,7 +151,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 		--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
-		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) \
+		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) $(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks) \
 		--engine=$(FUZZ_ENGINE_$*) \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/reports/fuzz/$*.json

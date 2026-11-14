@@ -47,9 +47,6 @@
       ],
       "call_expr": "const char *s; struct minmea_sentence_gbs gbs; struct minmea_sentence_rmc rmc; struct minmea_sentence_gga gga; struct minmea_sentence_gsa gsa; struct minmea_sentence_gll gll; struct minmea_sentence_gst gst; struct minmea_sentence_gsv gsv; struct minmea_sentence_vtg vtg; struct minmea_sentence_zda zda; char talker[3]; struct tm tmv; struct timespec tsp; enum minmea_sentence_id sid; s = (const char *)fuzz_buf; memset(&gbs,0,sizeof(gbs)); memset(&rmc,0,sizeof(rmc)); memset(&gga,0,sizeof(gga)); memset(&gsa,0,sizeof(gsa)); memset(&gll,0,sizeof(gll)); memset(&gst,0,sizeof(gst)); memset(&gsv,0,sizeof(gsv)); memset(&vtg,0,sizeof(vtg)); memset(&zda,0,sizeof(zda)); memset(talker,0,sizeof(talker)); memset(&tmv,0,sizeof(tmv)); memset(&tsp,0,sizeof(tsp)); (void)minmea_checksum(s); (void)minmea_check(s,false); (void)minmea_check(s,true); sid = minmea_sentence_id(s,false); (void)minmea_sentence(sid); (void)minmea_talker_id(talker,s); (void)minmea_parse_gbs(&gbs,s); (void)minmea_parse_rmc(&rmc,s); (void)minmea_parse_gga(&gga,s); (void)minmea_parse_gsa(&gsa,s); (void)minmea_parse_gll(&gll,s); (void)minmea_parse_gst(&gst,s); (void)minmea_parse_gsv(&gsv,s); (void)minmea_parse_vtg(&vtg,s); (void)minmea_parse_zda(&zda,s); (void)minmea_getdatetime(&tmv,&zda.date,&rmc.time); (void)minmea_gettime(&tsp,&zda.date,&rmc.time);"
      },
-     "params": {
-      "fuzz_rte_initialized": false
-     },
      "unit": "libminmea_a"
     }
    ],
