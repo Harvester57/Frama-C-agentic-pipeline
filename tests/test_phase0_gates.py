@@ -192,7 +192,7 @@ def _recipe(text: str, target: str) -> list[str]:
     [
         ("$(BUILD_TARGETS)", "build-%", "reach"),
         ("$(FUZZ_TARGETS)", "fuzz-%", "reach,build_check"),
-        ("$(COVERAGE_TARGETS)", "coverage-%", "reach"),
+        ("$(COVERAGE_TARGETS)", "coverage-%", "reach --allow-dynamic-gap"),
         ("$(EVA_TARGETS)", "eva-%", "reach"),
         ("$(EVA_BASE_TARGETS)", "evabase-%", "reach"),
         ("$(EVA_TUNE_TARGETS)", "evatune-%", "reach"),

@@ -43,6 +43,7 @@ GATES_JSON = "workspace/reports/phase0_gates.json"
 HARNESS_DIR = "workspace/harnesses"
 DAG_JSON = "workspace/reports/callgraph_dag.json"
 SECTIONS = ("reach", "build_check")
+DYNAMIC_GAP_ERROR = "dynamic: entry points never executed by the corpus"
 HOW_TO_RUN = {
     "reach": "python3 $S/harness_reach.py check",
     "build_check": "python3 $S/pipeline_make.py build-check",
@@ -196,6 +197,12 @@ def _section_ok(section: str, entry: dict[str, Any]) -> bool:
     return bool(entry.get("passed") if section == "reach" else entry.get("ok"))
 
 
+def _row_reach_ok(row: dict[str, Any], allow_dynamic_gap: bool = False) -> bool:
+    if row.get("passed"):
+        return True
+    return bool(allow_dynamic_gap and row.get("error") == DYNAMIC_GAP_ERROR)
+
+
 def current_build_status(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, str] | None:
     """
     The build-check verdict on the module's current build report (workspace/build/<mod>.build.json),
@@ -223,6 +230,7 @@ def check(
     need: tuple[str, ...] = SECTIONS,
     modules_expected: list[str] | None = None,
     fuzzed_expected: list[str] | None = None,
+    allow_dynamic_gap: bool = False,
 ) -> list[str]:
     """
     Reasons the gate fails for `module` (or for the whole run when None); empty when it passes.
@@ -250,20 +258,22 @@ def check(
                     reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
                 expected = fuzzed_expected
             else:
-                if not _section_ok(section, entry):
-                    failed = sorted(m for m, r in modules.items() if not r.get("passed"))
+                failed = sorted(m for m, r in modules.items() if not _row_reach_ok(r, allow_dynamic_gap))
+                if failed or (not modules and not _section_ok(section, entry)):
                     reasons.append(
                         f"{section} failed for {', '.join(failed) or 'the run'}; {_reach_next_step('<mod>')}"
                     )
                 stale = sorted(
                     m
                     for m, r in modules.items()
-                    if r.get("passed") and r.get("harness_digest") != harness_digest(run_dir, m)
+                    if _row_reach_ok(r, allow_dynamic_gap) and r.get("harness_digest") != harness_digest(run_dir, m)
                 )
                 if stale:
                     reasons.append(f"the harness of {', '.join(stale)} changed after the reach gate ran; run it again")
                 dag_stale = sorted(
-                    m for m, r in modules.items() if r.get("passed") and r.get("dag_digest") != current_dag
+                    m
+                    for m, r in modules.items()
+                    if _row_reach_ok(r, allow_dynamic_gap) and r.get("dag_digest") != current_dag
                 )
                 if dag_stale:
                     reasons.append(_dag_changed(", ".join(dag_stale)))
@@ -279,7 +289,7 @@ def check(
             reasons.append(f"{section}: module {module} was not checked; run `{HOW_TO_RUN[section]}` again")
             continue
         if section == "reach":
-            if not row.get("passed"):
+            if not _row_reach_ok(row, allow_dynamic_gap):
                 detail = row.get("error") or f"entry points not reached: {', '.join(row.get('gaps') or [])}"
                 reasons.append(f"reach gate failed for {module}: {detail}; {_reach_next_step(module)}")
             elif row.get("harness_digest") != harness_digest(run_dir, module):
@@ -338,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Whole run: the plan's fuzzed modules (space-separated), each needing a build row",
     )
+    c.add_argument(
+        "--allow-dynamic-gap",
+        action="store_true",
+        help="Allow reach rows that failed only on dynamic corpus gaps when harness and DAG digests still match",
+    )
     a = p.parse_args(argv)
     need = tuple(s.strip() for s in a.need.split(",") if s.strip())
     unknown = [s for s in need if s not in SECTIONS]
@@ -352,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             need,
             None if a.modules is None else a.modules.split(),
             None if a.fuzzed is None else a.fuzzed.split(),
+            allow_dynamic_gap=a.allow_dynamic_gap,
         )
     except (ArtifactError, OSError, ValueError) as exc:
         reasons = [f"cannot read {GATES_JSON}: {exc}"]
