@@ -495,6 +495,77 @@ def test_run_requires_gen(tmp_path):
     assert rc == 2 and "pipeline_make.py gen" in out["error"]
 
 
+@pytest.mark.unit
+def test_phase0_targets_bootstrap_makefile_without_gen(tmp_path):
+    phase0_targets = ("slice-init", "dag", "stubs", "stub-check", "security-props", "reach-gate", "seed")
+    for target in phase0_targets:
+        run = tmp_path / target
+        run.mkdir()
+        expected_out = pm._TARGET_OUTPUTS.get(target)
+        writes = {expected_out: json.dumps({"status": "ok"})} if expected_out else {}
+        fake = FakeMake(writes=writes)
+        assert not (run / pm.MAKEFILE).exists()
+
+        rc, out = pm.run_targets([target], run, jobs=2, make_runner=fake, templates_dir=ACSL)
+
+        assert rc == 0 and out["ok"] is True, (target, out)
+        assert out["targets"][target]["status"] == "ok"
+        assert [c[7:] for c in fake.calls] == [[target]]
+        assert (run / pm.MAKEFILE).is_file()
+        assert (run / pm.MODULES_MK).is_file()
+
+    multi = tmp_path / "multi"
+    multi.mkdir()
+    fake_multi = FakeMake(
+        writes={
+            pm._TARGET_OUTPUTS["stubs"]: json.dumps({"status": "ok"}),
+            pm._TARGET_OUTPUTS["stub-check"]: json.dumps({"status": "ok"}),
+            pm._TARGET_OUTPUTS["seed"]: "[]",
+        }
+    )
+    rc, out = pm.run_targets(["seed", "stubs", "stub-check"], multi, jobs=2, make_runner=fake_multi, templates_dir=ACSL)
+    assert rc == 0 and out["ok"] is True
+    assert [c[7:] for c in fake_multi.calls] == [["stubs"], ["stub-check"], ["seed"]]
+    assert (multi / pm.MAKEFILE).is_file() and (multi / pm.MODULES_MK).is_file()
+
+
+@pytest.mark.unit
+def test_phase1_and_mixed_targets_still_require_gen(tmp_path):
+    cases = (
+        ["build"],
+        ["fuzz"],
+        ["eva"],
+        ["eva-tune"],
+        ["coverage"],
+        ["ingest"],
+        ["report"],
+        ["build-snmp"],
+        ["fuzz-snmp"],
+        ["eva-snmp"],
+        ["stubs", "fuzz"],
+        ["seed", "build"],
+    )
+    for idx, targets in enumerate(cases):
+        run = tmp_path / f"case_{idx}"
+        run.mkdir()
+        fake = FakeMake()
+        rc, out = pm.run_targets(targets, run, jobs=2, make_runner=fake, templates_dir=ACSL)
+        assert rc == 2 and out["ok"] is False, (targets, out)
+        assert "pipeline_make.py gen" in out["error"]
+        assert fake.calls == []
+        assert not (run / pm.MAKEFILE).exists()
+
+    for idx, bad in enumerate(([], ["bogus"], ["stubs", "bogus"])):
+        run = tmp_path / f"bad_{idx}"
+        run.mkdir()
+        fake = FakeMake()
+        rc, out = pm.run_targets(bad, run, jobs=2, make_runner=fake, templates_dir=ACSL)
+        assert rc == 2 and out["ok"] is False
+        assert "unknown target(s)" in out["error"]
+        assert fake.calls == []
+        assert not (run / pm.MAKEFILE).exists()
+
+
 def test_run_rejects_unknown_and_excluded_targets(tmp_path):
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)

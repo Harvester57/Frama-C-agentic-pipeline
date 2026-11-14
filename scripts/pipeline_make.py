@@ -1807,11 +1807,6 @@ def run_targets(
     output, whether this run changed it, and the report's own status.
     """
     run_dir = Path(run_dir)
-    if not (run_dir / MAKEFILE).is_file():
-        return 2, {
-            "ok": False,
-            "error": f"{MAKEFILE} not found: run `pipeline_make.py gen` first, from the run directory",
-        }
     targets = list(dict.fromkeys(targets))
     if "eva-tune" in targets and "eva-tune-base" not in targets:
         targets.insert(targets.index("eva-tune"), "eva-tune-base")
@@ -1819,6 +1814,15 @@ def run_targets(
     if not targets or unknown:
         known = ", ".join([*STAGE_OF_TARGET, *(p + "<mod>" for p in MODULE_TARGET_PREFIXES)])
         return 2, {"ok": False, "error": f"unknown target(s) {unknown or '(none given)'}; targets: {known}"}
+    # Phase 0 targets (slice-init .. seed) run before Step 5's `gen` and bootstrap the Makefile via
+    # `_generate` below; Phase 1+ targets still require `gen` to have written workspace/build/Makefile.
+    if not (run_dir / MAKEFILE).is_file() and any(
+        (stage := _stage(t)) is not None and stage > STAGE_OF_TARGET["seed"] for t in targets
+    ):
+        return 2, {
+            "ok": False,
+            "error": f"{MAKEFILE} not found: run `pipeline_make.py gen` first, from the run directory",
+        }
     make_bin = "make"
     use_private_makefile = make_runner is None
     if make_runner is None:
