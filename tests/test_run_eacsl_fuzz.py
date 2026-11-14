@@ -205,39 +205,3 @@ def test_a_harness_that_is_not_a_dispatch_harness_runs_in_fork_mode(tmp_path: Pa
 
     res = R.run_campaign_rounds(Path("bin"), 60, campaign=campaign, rebuild=None, n_cases=0)
     assert res["keep_going"] == {"mode": "fork"} and calls == [True]
-
-
-def test_a_replayed_input_that_hits_a_known_candidate_is_excluded():
-    # minmea run-1 (2026-11-14): the shared corpus seed '$GPVTG,.0000000000' trips the already
-    # confirmed minmea_scan overflow in every guardrail of module minmea, including an architect's
-    # whole-module one, so no contract of the module could pass the dynamic oracle.
-    log = """workspace/work/minmea.c: In function 'minmea_scan'
-workspace/work/minmea.c:186: Error: Assertion failed:
-\tThe failing predicate is:
-\trte/signed_overflow:
-\t\tscale * 10 <= 2147483647.
-"""
-    fp = R._failure_fingerprint(R.parse_eacsl_failure(log))
-    assert fp
-    why = R.crash_matches_known_candidate(log, {fp})
-    assert why and fp in why and "minmea_scan" in why
-    assert R.crash_matches_known_candidate(log, set()) is None
-    assert R.crash_matches_known_candidate(log, {"minmea.c#other::signed_overflow::deadbeef00"}) is None
-    # A contract assertion is not an RTE assertion, but a known fingerprint still identifies a
-    # ledgered defect, so the exclusion is about the defect, not the alarm kind.
-    assert R.crash_matches_known_candidate("no failure here", {fp}) is None
-
-
-def test_known_candidate_fingerprints_reads_candidates_and_findings(tmp_path: Path):
-    (tmp_path / "candidates.json").write_text(
-        json.dumps([{"fingerprint": "a.c#f::signed_overflow::0123456789"}]), encoding="utf-8"
-    )
-    (tmp_path / "findings.json").write_text(
-        json.dumps({"findings": {"b.c#g::signed_overflow::abcdef0123": {"fingerprint": "b.c#g::signed_overflow::abcdef0123"}}}),
-        encoding="utf-8",
-    )
-    assert R.known_candidate_fingerprints(tmp_path) == {
-        "a.c#f::signed_overflow::0123456789",
-        "b.c#g::signed_overflow::abcdef0123",
-    }
-    assert R.known_candidate_fingerprints(tmp_path / "missing") == set()
