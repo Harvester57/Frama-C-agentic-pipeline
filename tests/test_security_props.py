@@ -289,7 +289,9 @@ def test_meta_file_lines_and_function_match(tmp_path):
     assert meta is not None
     text, names, sources = meta
     assert names == ["L5_sanitized_log_line", "L6_no_leak_session_key"] and sources == ["session.c"]
-    assert text.startswith(sp.META_INCLUDE + "\n" + doc["preamble"])
+    # The preamble is guarded: the force-included vocabulary already declares what it repeats.
+    guard_open, guard_close = sp.META_PREAMBLE_GUARD
+    assert text.startswith(f"{sp.META_INCLUDE}\n{guard_open}\n{doc['preamble']}\n{guard_close}\n")
     lines = sp.meta_line_names(text)
     assert set(lines.values()) == {"L5_sanitized_log_line", "L6_no_leak_session_key"}
     first = min(k for k, v in lines.items() if v == "L6_no_leak_session_key")

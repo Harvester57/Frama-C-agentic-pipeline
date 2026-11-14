@@ -8,21 +8,23 @@
 # scripts/image_toolchain.py), so flags captured in one mean the same in the other and binaries
 # link against the same libc. The analysis image is the last stage, so a build without --target makes it.
 #
-# The "common base stage" of the plan's decision "Images" is kept by pinned digests, not by one shared
-# stage (remediation plan step R8, decision D9): the analysis image starts from the Frama-C image
-# (FRAMAC_BASE), which is built on Debian, and the build image from the same Debian release (DEBIAN_BASE),
-# both pinned by digest. A shared stage cannot be had without rebuilding Frama-C and its opam switch on our
-# own Debian stage. Bump the two digests together; CI's toolchain check (image_toolchain.py compare)
-# fails when the release, gcc or glibc drift apart.
+# The "common base stage" of the plan's decision "Images" (remediation plan step R8, decision D9): both
+# images start from the same pinned Debian image (DEBIAN_BASE). Frama-C, its provers and MetAcsl are built
+# from source in an opam stage (framac-opam, on the official OCaml image OPAM_BASE, the same Debian
+# release) and only the opam switch is copied into the analysis image. Both bases are pinned digests: bump them together;
+# CI's toolchain check (image_toolchain.py compare) fails when the release, gcc or glibc drift apart.
+#
+# Frama-C and MetAcsl come from the local opam repository in opam/ (opam files of their pending
+# opam-repository releases, ocaml/opam-repository#31236 and #31235, each with its source checksum).
+# Every other package comes from the opam-repository checkout inside OPAM_BASE, so the digest pins it.
 #
 # Both images create /framac-scratch and /framac-cache, mode 1777: a new named scratch volume (or a named
 # cache volume) mounted there copies that mode on its first mount, so any non-root uid can write the
 # capture's scratch tree (or the shared cache) without a chmod step.
-ARG FRAMAC_BASE=framac/frama-c:dev@sha256:2296220f5d51cd9842db1d83f0c84390298100bc4efeb1bcab6bad557866f124
-# MetAcsl, built from source: its 0.11 release does not compile against Frama-C 35 (Fileloc.t), the
-# development branch does (feasibility test of 2026-11-07, plan step I0).
-ARG METACSL_COMMIT=4d5d0e9179ae07f852ceb33fb5db58b04cab0801
-# The Debian release the Frama-C base is built on (Debian 13.7, glibc 2.41-12+deb13u4, gcc 14.2.0-19).
+ARG OPAM_BASE=ocaml/opam:debian-13-ocaml-5.5@sha256:2f2870cc00eb7f66d39715193466107a3f1abd71fed09f078505b02bb21488dd
+ARG FRAMAC_VERSION=34.0~beta
+ARG METACSL_VERSION=0.12~beta
+# Debian 13 (trixie): the build image, the opam stage's release and the analysis image's base.
 ARG DEBIAN_BASE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # --- Build image: runs the target's own build and its tests ----------------------------------------
@@ -88,15 +90,33 @@ RUN chmod -R a+rX /opt/framac-pipeline \
 WORKDIR /framac-run
 ENTRYPOINT ["/bin/bash", "-lc"]
 
+# --- opam stage: Frama-C, MetAcsl, Why3 and Alt-Ergo built from source into the switch -------------
+FROM ${OPAM_BASE} AS framac-opam
+
+USER opam
+ENV OPAMYES=1
+ENV OPAMCONFIRMLEVEL=unsafe-yes
+ARG FRAMAC_VERSION
+ARG METACSL_VERSION
+COPY --chown=opam:opam opam/ /home/opam/framac-opam-repo/
+# No `opam update`: the default repository stays the checkout pinned by OPAM_BASE. Depexts (GMP, zlib,
+# graphviz) come from apt through opam. The switch is then stripped of what a job never reads.
+RUN opam repo add --this-switch framac-local /home/opam/framac-opam-repo \
+    && opam install "frama-c.${FRAMAC_VERSION}" "frama-c-metacsl.${METACSL_VERSION}" \
+        why3.1.8.2 alt-ergo-free.2.4.3 ocamlfind \
+    && opam exec -- frama-c -version \
+    && opam exec -- frama-c -plugins | grep -q MetAcsl \
+    && opam clean --all-switches --download-cache --logs --repo-cache \
+    && rm -rf /home/opam/.opam/5.5/.opam-switch/sources /home/opam/.opam/5.5/.opam-switch/build \
+        /home/opam/.opam/5.5/doc /home/opam/.opam/5.5/man
+
 # --- Analysis image: Frama-C, provers, instrumented builds; no build systems, no target packages ------
-FROM ${FRAMAC_BASE} AS framac-analysis
+FROM ${DEBIAN_BASE} AS framac-analysis
 
-LABEL description="Frama-C pipeline analysis image: Frama-C (RTE, Eva, WP, E-ACSL), Alt-Ergo, Z3, CVC5, Clang/LibFuzzer, cvise; the target's headers and libraries come from the build image's snapshot"
+LABEL description="Frama-C pipeline analysis image: Frama-C (RTE, Eva, WP, E-ACSL, MetAcsl), Alt-Ergo, Z3, CVC5, Clang/LibFuzzer, cvise; the target's headers and libraries come from the build image's snapshot"
 
-USER root
 ENV HOME=/home/opam
 ENV DEBIAN_FRONTEND=noninteractive
-ENV OPAMYES=1
 ENV OPAMROOT=/home/opam/.opam
 ENV PYTHONIOENCODING=utf-8
 ENV LANG=C.UTF-8
@@ -106,8 +126,12 @@ ENV FRAMAC_SHARE="/home/opam/.opam/5.5/share/frama-c"
 ENV WHY3CONFIG="/home/opam/.why3.conf"
 ENV S="/opt/framac-pipeline/scripts"
 
-# build-essential stays: Frama-C preprocesses with gcc, E-ACSL compiles with it, and the pipeline's
-# own Makefile needs make. GMP and MPFR serve E-ACSL's runtime.
+# The switch only: compiler, ocamlfind (the dump modules are compiled at run time), Frama-C and plug-ins.
+COPY --from=framac-opam /home/opam/.opam/5.5 /home/opam/.opam/5.5
+
+# build-essential stays: Frama-C preprocesses with gcc, E-ACSL compiles with it, the dump modules link
+# with it, and the pipeline's own Makefile needs make. GMP serves Zarith and, with MPFR, E-ACSL's runtime;
+# zlib serves camlzip.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -124,6 +148,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     time \
     z3 \
+    zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && chmod a+rx /home/opam /root \
     && chmod -R a+rX /home/opam/.opam \
@@ -134,15 +159,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && cp -f /home/opam/.why3.conf /root/.why3.conf \
     && chmod 644 /home/opam/.why3.conf /root/.why3.conf
 
-# MetAcsl (program-wide ACSL properties, Layers 4-6), pinned to a commit of its development branch.
-ARG METACSL_COMMIT
-RUN git init -q /tmp/metacsl \
-    && git -C /tmp/metacsl fetch -q --depth 1 https://git.frama-c.com/pub/meta.git "${METACSL_COMMIT}" \
-    && git -C /tmp/metacsl checkout -q FETCH_HEAD \
-    && cd /tmp/metacsl && opam exec -- sh -c 'dune build @install && dune install' \
-    && cd / && rm -rf /tmp/metacsl \
-    && chmod -R a+rX /home/opam/.opam \
-    && frama-c -plugins | grep -q MetAcsl
+# MetAcsl (program-wide ACSL properties, Layers 4-6) comes with the switch.
+RUN frama-c -plugins | grep -q MetAcsl
 
 COPY scripts/ /opt/framac-pipeline/scripts/
 COPY templates/ /opt/framac-pipeline/templates/

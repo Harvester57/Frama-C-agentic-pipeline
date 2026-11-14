@@ -1363,29 +1363,35 @@ def dispatch_case_count(sources: list[str]) -> int | None:
     The number of cases of a `dispatch` harness among `sources` that a build can skip with
     -D<DISPATCH_SKIP_MACRO> (generate_harness.py), or None: no such harness, or one generated
     before the macro existed.
+
+    Only a source that holds the skip macro is a dispatch harness a build can skip cases of. Its
+    sidecar's count is preferred over the source's switch. Every sidecar records
+    `dispatch_case_count`, 0 for a harness that is not a dispatch harness: a count of 0 (or an empty
+    case list) means "no dispatch", never a harness with no case, which would put the campaign in
+    dispatch rounds and divide by zero on its first crash (benchmark run ab-fc35dev, 2026-11-13).
     """
     for src in sources:
-        sidecar_path = Path(src).with_suffix(".json")
-        if not sidecar_path.is_file():
-            sidecar_path = Path(src).parent / f"harness_{Path(src).stem.removeprefix('harness_')}.json"
-        if sidecar_path.is_file():
-            try:
-                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-                cnt = sidecar.get("dispatch_case_count")
-                if cnt is not None:
-                    return int(cnt)
-                if sidecar.get("api_cases") is not None:
-                    return len(sidecar["api_cases"])
-                if sidecar.get("dispatch_cases") is not None:
-                    return len(sidecar["dispatch_cases"])
-            except (OSError, ValueError):
-                pass
         try:
             text = Path(src).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         if DISPATCH_SKIP_MACRO not in text:
             continue
+        sidecar_path = Path(src).with_suffix(".json")
+        if not sidecar_path.is_file():
+            sidecar_path = Path(src).parent / f"harness_{Path(src).stem.removeprefix('harness_')}.json"
+        if sidecar_path.is_file():
+            try:
+                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                for cnt in (
+                    sidecar.get("dispatch_case_count"),
+                    len(sidecar["api_cases"]) if sidecar.get("api_cases") is not None else None,
+                    len(sidecar["dispatch_cases"]) if sidecar.get("dispatch_cases") is not None else None,
+                ):
+                    if cnt is not None:
+                        return int(cnt) if int(cnt) > 0 else None
+            except (OSError, ValueError, TypeError):
+                pass
         m = _DISPATCH_SWITCH_RE.search(text)
         if m:
             return int(m.group(1))
@@ -1421,6 +1427,8 @@ def dispatch_skip_cppflags(mask: int) -> str:
 
 def artifact_dispatch_case(artifact: dict, n_cases: int) -> int | None:
     """The dispatch case an artifact's input selects (its first byte modulo `n_cases`), or None if empty."""
+    if n_cases <= 0:
+        return None
     try:
         with open(artifact["artifact"], "rb") as fh:
             first = fh.read(1)
@@ -1458,7 +1466,7 @@ def run_campaign_rounds(
     """
     if not keep_going:
         return campaign(binary, max_time, False)
-    if n_cases is None:
+    if not n_cases:
         res = campaign(binary, max_time, True)
         res["keep_going"] = {"mode": "fork"}
         return res

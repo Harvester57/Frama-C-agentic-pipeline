@@ -83,7 +83,9 @@ def run_of(name: str, rows: list[dict], *, log_text: str | None = None, **report
         ("min-loop-unroll=8", ("min-loop-unroll", 8)),
         ("auto-loop-unroll=1024", ("auto-loop-unroll", 1024)),
         ("widening-delay=6", ("widening-delay", 6)),
-        ("partition-history=1", ("partition-history", 1)),
+        ("partition-path=1", ("partition-path", 1)),
+        ("auto-partition-path=4", ("auto-partition-path", 4)),
+        ("auto-partition-path-function=f:4", ("auto-partition-path-function", ["f:4"])),
         ("slevel=1000", ("slevel", 1000)),
         ("ilevel=64", ("ilevel", 64)),
         ("plevel=1000", ("plevel", 1000)),
@@ -103,6 +105,17 @@ def test_every_allowlisted_option_parses(text, expected):
     assert eo.parse_option(text) == expected
     name, value = expected
     assert eo.parse_option(eo.format_option(name, value)) == expected
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [("partition-history=1", "partition-path"), ("partition-history-function=f:1", "partition-path-function")],
+)
+def test_an_option_frama_c_renamed_is_refused_with_its_new_name(old, new):
+    # Frama-C 34 renamed it: the old name is never translated behind the configuration's back.
+    with pytest.raises(ValueError, match=f"renamed '{new}'"):
+        eo.parse_option(old)
+    assert f"renamed '{new}'" in (eo.options_problem({old.split("=")[0]: 1}) or "")
 
 
 @pytest.mark.parametrize(
@@ -189,7 +202,7 @@ def test_the_ladder_is_not_nested():
             if name != other and other != composite:
                 assert not _extends(other_options, options), f"{other} simply extends {name}"
     # PARF: history hurts on some programs even with a high slevel, so it never rides along with the top one.
-    with_history = [name for name, options in rungs.items() if "partition-history" in options]
+    with_history = [name for name, options in rungs.items() if "partition-path" in options]
     assert with_history == ["history"]
     assert rungs["slevel"]["slevel"] > rungs["history"]["slevel"]
 
@@ -209,12 +222,12 @@ def test_eva_command_carries_options_and_keeps_every_check():
         True,
         True,
         "",
-        eva_options={"slevel": 1000, "auto-loop-unroll": 1024, "domains": ["multidim"], "partition-history": 1},
+        eva_options={"slevel": 1000, "auto-loop-unroll": 1024, "domains": ["multidim"], "partition-path": 1},
     )
     assert reduced == []
     assert tuned[tuned.index("-eva-slevel") + 1] == "1000" and tuned[tuned.index("-eva-auto-loop-unroll") + 1] == "1024"
     assert tuned[tuned.index("-eva-domains") + 1].endswith(",multidim")
-    assert tuned[tuned.index("-eva-partition-history") + 1] == "1"
+    assert tuned[tuned.index("-eva-partition-path") + 1] == "1"
     # What is checked stays the same: only tuning differs between the two command lines.
     assert [t for t in plain if t.startswith("-warn") or t == "-rte"] == [
         t for t in tuned if t.startswith("-warn") or t == "-rte"
@@ -1286,7 +1299,7 @@ def test_finish_writes_the_report_the_evidence_and_the_decision(tune_run, capsys
         "m",
         "history",
         [_csv_row(1), _csv_row(2, "Valid"), _csv_row(3, function="other")],
-        eva_options={"partition-history": 1},
+        eva_options={"partition-path": 1},
     )
     assert et.main(_finish_args(tune_run, ["slevel", "history"])) == 0
     capsys.readouterr()

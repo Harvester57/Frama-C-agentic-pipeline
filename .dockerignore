@@ -10,6 +10,9 @@
 !schemas/**
 !skills/
 !skills/**
+# The local opam repository the analysis image installs Frama-C and MetAcsl from
+!opam/
+!opam/**
 # Only the greppable Frama-C manuals from docs/ (do not re-include docs/ itself: that would pull in all of it)
 !docs/references/
 !docs/references/**

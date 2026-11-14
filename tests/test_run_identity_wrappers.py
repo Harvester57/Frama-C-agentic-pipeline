@@ -157,8 +157,9 @@ def test_new_run_claims_the_directory_with_a_create_that_fails_when_it_exists():
 def test_both_images_create_the_cache_directory_world_writable():
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     stages = dockerfile_stages(text)
-    assert [s.name for s in stages] == ["framac-build", "framac-analysis"]
-    for stage in stages:
+    assert [s.name for s in stages] == ["framac-build", "framac-opam", "framac-analysis"]
+    # framac-opam only builds the switch the analysis image copies; no job runs in it.
+    for stage in (s for s in stages if s.name != "framac-opam"):
         for command in (("mkdir", "-p"), ("chmod", "1777")):
             assert {"/framac-scratch", "/framac-cache"} <= dockerfile_command_args(stage.text, *command), stage.name
 

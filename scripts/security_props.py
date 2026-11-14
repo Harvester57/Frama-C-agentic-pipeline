@@ -1029,6 +1029,11 @@ def _count(items: Any) -> dict[str, int]:
 
 
 META_INCLUDE = '#include "__fc_string_axiomatic.h"'
+# The include guard of templates/acsl/acsl_vocabulary.h. Every Frama-C run of the pipeline force-includes
+# that header through fc_compat_types.h, so the meta file's own unit already declares no_crlf_string,
+# and a second declaration in one unit is a fatal annot-error ("already declared with the same
+# profile"). The preamble applies only when the vocabulary is absent (a run without fc_stubs).
+META_PREAMBLE_GUARD = ("#ifndef ACSL_VOCABULARY_H", "#endif /* ACSL_VOCABULARY_H */")
 
 
 def properties_for(props: dict, function: str) -> list[dict]:
@@ -1047,8 +1052,9 @@ def meta_file_text(props: dict, function: str) -> tuple[str, list[str], list[str
     selected = [p for p in properties_for(props, function) if not p.get("code")]
     if not selected:
         return None
-    # libc's `strlen` for the vocabulary's no_crlf_string the preamble repeats (plan step S8).
-    parts = [META_INCLUDE, str(props.get("preamble") or "")]
+    # libc's `strlen` for the vocabulary's no_crlf_string the preamble repeats (plan step S8), and the
+    # preamble only where the vocabulary was not force-included (META_PREAMBLE_GUARD).
+    parts = [META_INCLUDE, META_PREAMBLE_GUARD[0], str(props.get("preamble") or ""), META_PREAMBLE_GUARD[1]]
     parts += [str(p["acsl"]) for p in selected]
     sources = sorted({s for p in selected for s in p.get("sources") or []})
     return "\n".join(parts) + "\n", [str(p["name"]) for p in selected], sources

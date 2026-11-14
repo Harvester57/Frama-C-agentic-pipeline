@@ -177,6 +177,31 @@ ld.lld: error: undefined symbol: custom_cleanup
 def test_b8_dispatch_case_count_reads_sidecar_json(tmp_path: Path):
     harness_c = tmp_path / "harness_crypto.c"
     harness_json = tmp_path / "harness_crypto.json"
-    harness_c.write_text("// dummy C file\n", encoding="utf-8")
+    harness_c.write_text(f"// {R.DISPATCH_SKIP_MACRO}\n", encoding="utf-8")
     harness_json.write_text(json.dumps({"dispatch_case_count": 7}), encoding="utf-8")
     assert R.dispatch_case_count([str(harness_c)]) == 7
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    [{"dispatch_case_count": 0, "dispatch_cases": []}, {"api_cases": []}, {"dispatch_case_count": 5}],
+)
+def test_a_harness_that_is_not_a_dispatch_harness_runs_in_fork_mode(tmp_path: Path, sidecar):
+    # Benchmark run ab-fc35dev (2026-11-13): every non-dispatch sidecar records dispatch_case_count 0;
+    # read as a dispatch harness with no case, the first crash divided by zero and no campaign ran.
+    harness_c = tmp_path / "harness_minmea.c"
+    harness_c.write_text("int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }\n")
+    (tmp_path / "harness_minmea.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # A source without the skip macro cannot skip cases, whatever its sidecar says.
+    assert R.dispatch_case_count([str(harness_c)]) is None
+    crash = tmp_path / "crash-1"
+    crash.write_bytes(b"\x07")
+    assert R.artifact_dispatch_case({"artifact": str(crash)}, 0) is None
+    calls = []
+
+    def campaign(binary, max_time, fork):
+        calls.append(fork)
+        return {"status": "ok", "artifacts": [{"artifact": str(crash), "kind": "crash"}]}
+
+    res = R.run_campaign_rounds(Path("bin"), 60, campaign=campaign, rebuild=None, n_cases=0)
+    assert res["keep_going"] == {"mode": "fork"} and calls == [True]

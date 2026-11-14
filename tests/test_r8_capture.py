@@ -253,8 +253,9 @@ def test_wrappers_and_compose_no_longer_chmod_the_scratch_volume():
 def test_both_images_create_the_scratch_directory_world_writable():
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     stages = dockerfile_stages(text)
-    assert [s.name for s in stages] == ["framac-build", "framac-analysis"]
-    for stage in stages:
+    assert [s.name for s in stages] == ["framac-build", "framac-opam", "framac-analysis"]
+    # framac-opam only builds the switch the analysis image copies; no job runs in it.
+    for stage in (s for s in stages if s.name != "framac-opam"):
         assert "/framac-scratch" in dockerfile_command_args(stage.text, "mkdir", "-p"), stage.name
         assert "/framac-scratch" in dockerfile_command_args(stage.text, "chmod", "1777"), stage.name
     # The two Debian bases stay aligned by pinned digests (decision D9).
@@ -268,7 +269,7 @@ def _unpinned_bases(text: str) -> list[str]:
     """The base-image arguments of a Dockerfile that are not set, on a line of their own, to a full digest."""
     return [
         name
-        for name in ("FRAMAC_BASE", "DEBIAN_BASE")
+        for name in ("OPAM_BASE", "DEBIAN_BASE")
         if len(re.findall(rf"^ARG {name}=\S+@sha256:[0-9a-f]{{64}}$", text, re.MULTILINE)) != 1
         or len(re.findall(rf"^\s*ARG\s+{name}=", text, re.MULTILINE)) != 1
     ]
@@ -292,14 +293,14 @@ def _image_script_runs(text: str) -> list[tuple[str, str]]:
 
 
 DOCKERFILE_SAMPLE = """\
-ARG FRAMAC_BASE=framac/frama-c:dev@sha256:{digest}
+ARG OPAM_BASE=ocaml/opam:debian-13-ocaml-5.5@sha256:{digest}
 ARG DEBIAN_BASE=debian:trixie-slim@sha256:{digest}
 FROM ${{DEBIAN_BASE}} AS framac-build
 RUN apt-get install -y python3 \\
     # a comment inside a continued instruction
     && mkdir -p /home/framac/.cache /framac-scratch /framac-cache \\
     && chmod 1777 /framac-cache /framac-scratch
-FROM ${{FRAMAC_BASE}} AS framac-analysis
+FROM ${{DEBIAN_BASE}} AS framac-analysis
 RUN chmod a+rx /home/opam /root && python3 -c "print('a; b && c')" \\
     && chmod 1777 /home/opam /framac-scratch
 RUN python3 /opt/framac-pipeline/scripts/phase0_model.py selftest
@@ -343,7 +344,7 @@ def test_a_scratch_directory_of_another_name_is_not_the_scratch_directory(old, n
     ("old", "new"),
     [
         # Commented out, with the pattern still on the line.
-        ("ARG FRAMAC_BASE=", "ARG FRAMAC_BASE=framac/frama-c:dev\n# ARG FRAMAC_BASE="),
+        ("ARG OPAM_BASE=", "ARG OPAM_BASE=ocaml/opam:debian-13-ocaml-5.5\n# ARG OPAM_BASE="),
         ("ARG DEBIAN_BASE=", "# ARG DEBIAN_BASE="),
         # 65 hexadecimal digits are not a digest.
         ("\nARG DEBIAN_BASE", "f\nARG DEBIAN_BASE"),

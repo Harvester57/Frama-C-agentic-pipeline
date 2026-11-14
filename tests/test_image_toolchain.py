@@ -39,15 +39,20 @@ def test_dockerfile_defines_the_build_and_analysis_images_with_the_analysis_imag
     # Every FROM counts, named or not: a trailing unnamed stage would be the image a plain build produces.
     assert [(s.base, s.name) for s in dockerfile_stages(text)] == [
         ("${DEBIAN_BASE}", "framac-build"),
-        ("${FRAMAC_BASE}", "framac-analysis"),
+        ("${OPAM_BASE}", "framac-opam"),
+        ("${DEBIAN_BASE}", "framac-analysis"),
     ]
     # The analysis image carries no build system or target library; the build image no Frama-C.
     analysis = text.split("AS framac-analysis", 1)[1]
     for absent in ("cmake", "bear", "ninja-build", "libssl-dev", "TARGET_APT_PACKAGES"):
         assert absent not in analysis, absent
+    # The analysis image takes the opam switch only, not opam itself.
+    assert "COPY --from=framac-opam /home/opam/.opam/5.5 /home/opam/.opam/5.5" in analysis
+    assert "opam install" not in analysis
     assert re.search(r"^FROM \$\{DEBIAN_BASE\} AS framac-build$", text, re.MULTILINE)
-    build = text.split("AS framac-build", 1)[1].split("AS framac-analysis", 1)[0]
-    assert "opam" not in build and "METACSL" not in build
+    build_stage = text.split("AS framac-build", 1)[1].split("AS framac-opam", 1)[0]
+    build = "\n".join(line for line in build_stage.splitlines()[:-1] if not line.lstrip().startswith("#"))
+    assert "opam" not in build.lower() and "METACSL" not in build
 
 
 @pytest.mark.unit

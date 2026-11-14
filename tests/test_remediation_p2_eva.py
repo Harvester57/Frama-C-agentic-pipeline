@@ -193,7 +193,7 @@ def _trials(run_dir: Path) -> None:
         flamegraph_file=(run_dir / "workspace/eva/m/tune/slevel/flamegraph.txt").as_posix(),
     )
     (slevel / "flamegraph.txt").write_text("slevel 1\n", encoding="utf-8")
-    _write_trial(run_dir, "m", "history", [_csv_row(1), _csv_row(2, "Valid")], eva_options={"partition-history": 1})
+    _write_trial(run_dir, "m", "history", [_csv_row(1), _csv_row(2, "Valid")], eva_options={"partition-path": 1})
 
 
 @pytest.mark.unit

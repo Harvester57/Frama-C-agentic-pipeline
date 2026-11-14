@@ -13,9 +13,11 @@
  * of its own and does not include that header (a target need not), so it takes `strlen` from
  * __fc_libc (security_props.meta_file_text puts `#include "__fc_string_axiomatic.h"` above this
  * preamble: the templates stay pure ACSL) and repeats `no_crlf_string` with the vocabulary's exact
- * text: Frama-C merges identical
- * definitions across files, so this one and the vocabulary's coexist (checked in the image). Keep the
- * two texts identical. A length-bounded buffer is the vocabulary's `no_crlf_or_nul(buf, len)`.
+ * text. Frama-C merges identical definitions across files, but a second declaration in one file is a
+ * fatal annot-error, and the pipeline force-includes the vocabulary into every file (fc_compat_types.h).
+ * So meta_file_text puts this preamble under `#ifndef ACSL_VOCABULARY_H`: it applies only to a run
+ * without the vocabulary. Keep the two texts identical. A length-bounded buffer is the vocabulary's
+ * `no_crlf_or_nul(buf, len)`.
  * MetAcsl properties only reach WP; E-ACSL never runs them (it can execute `no_crlf_string`, through
  * `strlen`, when a contract names it).
  */

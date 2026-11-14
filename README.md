@@ -1,6 +1,6 @@
 # Frama-C Agentic Verification & Hybrid Fuzzing Pipeline
 
-An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 35.0~~dev (Bromine)** (`RTE`, `Eva`, `WP`, `E-ACSL`, `MetAcsl`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
+An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 34.0~beta (Selenium)** (`RTE`, `Eva`, `WP`, `E-ACSL`, `MetAcsl`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
 
 All verification tools execute inside reproducible, network-isolated containers (a **build image** for the target's own build and tests, an **analysis image** for everything else), orchestrated by modular **Agent Skills** ([`/framac-verify`](./skills/framac-verify/SKILL.md), [`/framac-slice`](./skills/framac-slice/SKILL.md), [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md), [`/framac-eva`](./skills/framac-eva/SKILL.md), [`/framac-wp`](./skills/framac-wp/SKILL.md)) and deterministic Python helper scripts.
 
@@ -156,8 +156,10 @@ Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contai
 
 ```text
 frama-c/
-├── Dockerfile                        # Stages framac-build (Debian trixie, build systems, bear, strace), framac-analysis
-│                                     # (Frama-C 35.0~~dev, MetAcsl, E-ACSL, Alt-Ergo/Z3/CVC5, Clang/LibFuzzer), the last stage
+├── Dockerfile                        # Stages framac-build (Debian trixie, build systems, bear, strace), framac-opam
+│                                     # (Frama-C, MetAcsl, Why3, Alt-Ergo built with opam), framac-analysis (Debian trixie +
+│                                     # that switch: Frama-C 34.0~beta, E-ACSL, Z3/CVC5, Clang/LibFuzzer), the last stage
+├── opam/                             # Local opam repository: Frama-C and MetAcsl releases not yet in opam-repository
 ├── Dockerfile.codeql                 # Optional CodeQL image, built from framac-build
 ├── docker-compose.yml                # Manual container service definition & volume mappings
 ├── wrappers/

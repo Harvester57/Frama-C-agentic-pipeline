@@ -63,7 +63,9 @@ EVA_OPTIONS: dict[str, EvaOption] = {
     "auto-loop-unroll": EvaOption("int"),
     "widening-delay": EvaOption("int", minimum=1),
     "widening-period": EvaOption("int", minimum=1),
-    "partition-history": EvaOption("int"),
+    "partition-path": EvaOption("int"),
+    # Frama-C 34: partition-path restricted by heuristics to the junctions worth keeping apart.
+    "auto-partition-path": EvaOption("int"),
     "slevel": EvaOption("int"),
     "ilevel": EvaOption("int", minimum=2),
     "plevel": EvaOption("int"),
@@ -80,7 +82,8 @@ EVA_OPTIONS: dict[str, EvaOption] = {
     "domains": EvaOption("domains"),
     # Per-function overrides (`-eva-*-function f:n`, repeatable): tuning for one function only.
     "slevel-function": EvaOption("func_value"),
-    "partition-history-function": EvaOption("func_value"),
+    "partition-path-function": EvaOption("func_value"),
+    "auto-partition-path-function": EvaOption("func_value"),
     "equality-through-calls-function": EvaOption("func_value"),
     "subdivide-non-linear-function": EvaOption("func_value"),
     "split-return-function": EvaOption("func_value"),
@@ -102,9 +105,19 @@ EVA_OPTIONS: dict[str, EvaOption] = {
 }
 
 
+# Options Frama-C has renamed: an old name is refused with its new one, never translated silently,
+# so a module configuration says what the analysis actually runs.
+RENAMED_OPTIONS = {
+    "partition-history": "partition-path",  # Frama-C 34.0 (Selenium)
+    "partition-history-function": "partition-path-function",
+}
+
+
 def option_problem(name: str, value: Any) -> str | None:
     """Why (`name`, `value`) is not allowed, or None."""
     spec = EVA_OPTIONS.get(name)
+    if spec is None and name in RENAMED_OPTIONS:
+        return f"{name!r} was renamed {RENAMED_OPTIONS[name]!r} in Frama-C 34; use the new name"
     if spec is None:
         return f"{name!r} is not an allowed Eva option (allowed: {', '.join(sorted(EVA_OPTIONS))})"
     if spec.kind == "bool":
@@ -270,7 +283,8 @@ def merge_options(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[s
 #
 # Fixed configurations tried on a module that still has Unknowns. They are deliberately not nested:
 # PARF (JCST 2025, Table A2) found no knob dominant on every program. slevel leads on average (0.490),
-# then domains (0.258, already on in the base configuration), while partition-history helps some
+# then domains (0.258, already on in the base configuration), while partition-history (partition-path
+# since Frama-C 34) helps some
 # programs (x509-parser 0.407, khash 0.292) and hurts others (qlz-ex3 -0.167, and `tutorials`, where
 # only a high slevel with no history removes the alarm). The rungs therefore change one concern each,
 # and history stays out of the rung that raises slevel the most. Changing a rung changes results, so
@@ -305,7 +319,7 @@ LADDER: tuple[Rung, ...] = (
     Rung("slevel", {"slevel": 1000}),
     Rung("unroll", {"auto-loop-unroll": 1024, "min-loop-unroll": 256}),
     # History needs states to keep apart: Eva manual 6.5.1, and PARF 5 on its exponential appetite for slevel.
-    Rung("history", {"partition-history": 2, "slevel": 500}),
+    Rung("history", {"partition-path": 2, "slevel": 500}),
     Rung("values", {"ilevel": 64, "plevel": 1000, "subdivide-non-linear": 100}),
     # Not multidim: Frama-C calls it experimental, and a Valid here can end a function's verification.
     # It stays available as a module option, where someone chooses it.

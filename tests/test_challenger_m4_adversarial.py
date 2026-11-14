@@ -457,7 +457,8 @@ class TestB8SidecarSchemaAndDispatchMetadata:
         """
         harness_c = tmp_path / "harness_test.c"
         harness_json = tmp_path / "harness_test.json"
-        harness_c.write_text("// C file with no switch\n", encoding="utf-8")
+        # A dispatch harness a build can skip cases of holds the skip macro; its switch is not needed.
+        harness_c.write_text(f"// {gh.DISPATCH_SKIP_MACRO}, no switch\n", encoding="utf-8")
 
         # 1. dispatch_case_count wins
         harness_json.write_text(
