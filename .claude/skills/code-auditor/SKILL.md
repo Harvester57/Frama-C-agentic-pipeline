@@ -36,7 +36,7 @@ For a full audit, read every phase reference when that phase begins, plus the le
 | control | Review state, artifacts, resume, or closure | [Control](references/control.md) |
 | scope | Scope or full-audit preparation | [Scope](references/scope.md) |
 | tools | Analysis of repository-native tools | [Tool analysis](references/tool-analysis.md) |
-| threats | Construction of threat model | [Threat model](references/threat-model.md) |
+| threats | Construction of threat model | [Threat model](references/threat-model.md) and [Frama-C threat-model block](references/framac-threat-model.md) |
 | discovery | Candidate findings discovery | [Discovery](references/discovery.md) |
 | triage | Merge, triage, or validation | [Validation](references/validation.md) and [rating rubrics](references/rating-rubrics.md) |
 | remediation | Remediation using patches, fixes or hardening | [Remediation](references/remediation.md) |
@@ -55,7 +55,7 @@ Do not collapse discovery into validation or let scanner output seed independent
 1. **Resolve scope.** Inventory the requested path, disclose exclusions and non-reviewable files, confirm an omitted or ambiguous scope, and record the source-stability assumption.
 2. **Initialize durable state.** Create `./.security-reviews/<review-id>/` unless the user chose a different output location. Initialize the phase ledger, file inventory, and artifact folders described in the ledger reference. Do this only after scope confirmation.
 3. **Analyse with existing tools.** Inspect repository configuration for already-available security, dependency, build, and test commands. Run only approved commands, preserve complete evidence, or close the phase as skipped with the exact reason. Keep results private until discovery finishes.
-4. **Build the threat model.** Trace assets, actors, entry points, trust boundaries, root controls, sensitive sinks, deployment assumptions, and unknowns from source.
+4. **Build the threat model.** Trace assets, actors, entry points, trust boundaries, root controls, sensitive sinks, deployment assumptions, and unknowns from source. Then end `ThreatModel.md` with its validated `framac-threat-model` block, so the Frama-C pipeline can take the file through `--threat-model PATH`.
 5. **Run independent discovery.** Default to three full-coverage passes using the three lenses in the discovery reference. Every eligible file needs a receipt in every pass. Preserve negative results and defer only with an exact reason.
 6. **Merge, triage, and statically validate.** Reveal any tool results only now. Semantically merge candidates, retain every disposition, reconstruct source-to-sink paths, assign severity and confidence separately, and create one durable analysis per candidate. Do not execute payloads.
 7. **Patches preparation.** Analyse each reportable candidate remediation actions and produce appropriate diff or patch files per finding.
@@ -80,5 +80,5 @@ Reassess affected coverage when scoped source changed.
 
 ## Hand off the result
 
-State the review path, scope, completion status, number and severity of reportable findings, highest-priority actions, deferred questions, unreviewed files, skipped tools, and whether any runtime testing or source editing occurred.
+State the review path, the `ThreatModel.md` path to pass as `--threat-model PATH` together with its block's validation status, scope, completion status, number and severity of reportable findings, highest-priority actions, deferred questions, unreviewed files, skipped tools, and whether any runtime testing or source editing occurred.
 A no-findings result still needs scope, threat model, coverage, methodology, limitations, and residual-risk evidence.

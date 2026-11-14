@@ -88,6 +88,7 @@ Here is a layout of the most important files expected as an output after running
 .security-reviews/
 ├── <review-id>/
     ├── ...
+    ├── ThreatModel.md                     # threat model, ending with a `framac-threat-model` JSON block
     ├── Findings.md                        # aggregated findings report
     ├── findings/
     │   └── SEVERITY-NNN-short-name.md     # per finding report
@@ -99,6 +100,11 @@ Here is a layout of the most important files expected as an output after running
 ```
 
 Please note that your agentic tool not store the `.security-reviews` folder under your current working directory.
+
+The Frama-C verification pipeline can take `ThreatModel.md` directly as its threat model:
+
+- **How to pass it:** use `phase0_model.py run --threat-model PATH` or `trust.py run --threat-model PATH`. The pipeline reads only the fenced `framac-threat-model` block (see `references/framac-threat-model.md`).
+- **How to check it:** `python scripts/trust.py check-threat-model PATH` validates it.
 
 ---
 
