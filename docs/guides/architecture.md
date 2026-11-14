@@ -157,6 +157,7 @@ run-<N>/
 │       ├── codeql_trust.json                 # Optional CodeQL trust facts
 │       ├── seed_harvest.json                 # What the seed recording kept
 │       ├── fuzz_assets.json                  # The target's own fuzzers, corpora and their mappings
+│       ├── variadic_calls.json               # Call sites of the variadic API in the target's own programs
 │       ├── imported_corpus/<mod>.json        # What each harness case got from the imported corpora
 │       ├── security_props.json               # MetAcsl Layer 3-6 properties and their instances
 │       ├── callgraph_dag.json                # DAG view: link-unit modules, waves, tiers, unit split

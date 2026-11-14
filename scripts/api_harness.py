@@ -54,16 +54,30 @@ handle, make up to LIFECYCLE_MAX_CALLS calls on it, each chosen by an input byte
 taking it, then release it, so use after free, double free and call after error stay reachable. Both
 kinds share the MAX_SEQUENCE_CASES cap, recorded chains first.
 
+A variadic function (a signature ending in `...`, or a last formal named `__va_params`) has no
+signature for the arguments after the fixed ones. It is called the way the target's own programs
+call it (`variadic_case`; the call sites come from scripts/variadic_calls.py, which reads the tests
+and examples with clang): one case, kind `variadic`, per distinct (format, objects) of its call
+sites with a literal format, at most MAX_VARIADIC_CASES per function, after the single cases. The
+format (the last fixed parameter, `const char *`) is that call site's literal, never input bytes;
+each argument after it is a zeroed object of exactly the call site's type and size, on the stack
+(`char value[80]` passed by name, `struct minmea_float` passed by address), so a write past it is
+caught at its real size; the other fixed parameters follow the rules above, and the first `const`
+byte pointer among them takes the rest of the input as a NUL-terminated string. A call site whose
+case is left out (over the cap, a type the harness cannot name, a case the compiler refuses) goes to
+the sidecar's `api_variadic_dropped` with the reason.
+
 Hand-written cases (`--api --dispatch-case '<stmts>'`, for a function the generator skipped) come last,
 in the same switch: their layout is `{kind: custom, calls: [], slots: [], rest: null}`, so the seed
 writers make nothing for them, and a later `--api` run without the flag keeps them.
 
 The layout of every case (which input bytes feed which argument) goes to the sidecar as `api_cases`,
-which seed_harvest.py write reads to turn recorded calls into seeds for each case. Functions the
-generator cannot call (static, variadic: a signature ending in `...` or a last formal named
-`__va_params`, an anonymous struct by value, a case the compiler refuses, with the compiler's first
-error) go to `api_skipped` with the reason, and the reach gate reports an entry point the harness
-does not call directly as a gap.
+which seed_harvest.py write reads to turn recorded calls (and, for a `variadic` case, the literal
+data of its call sites) into seeds for each case. Functions the generator cannot call (static, a
+variadic function with no usable call site, an anonymous struct by value, a case the compiler
+refuses, with the compiler's first error) go to `api_skipped` with the reason, and the reach gate
+reports an entry point the harness does not call directly as a gap. A variadic function leaves
+`api_skipped` once one of its cases is in the harness.
 """
 
 from __future__ import annotations
@@ -94,7 +108,10 @@ MODEL_JSON = Path("workspace/reports/phase0_model.json")
 TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
 MAX_SEQUENCE_CASES = 16  # recorded chains first, then synthesized lifecycle cases (H2)
 LIFECYCLE_MAX_CALLS = 8  # calls on the handle per run of a lifecycle case, each picked by one input byte
+MAX_VARIADIC_CASES = 32  # per variadic function: one case per harvested (format, objects)
 MAX_CASES = 255  # one selector byte
+VARIADIC_KIND = "variadic"  # the layout kind of a case built from a call site (scripts/variadic_calls.py)
+NO_VARIADIC_SITE = "variadic: no call site with a literal format and sized objects in the target's own sources"
 CUSTOM_KIND = "custom"  # the layout kind of a hand-written case (`--api --dispatch-case`)
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
 MAX_DIAGNOSTIC_CHARS = 300
@@ -405,10 +422,12 @@ def _bind_call(
     rec: dict,
     shared: dict[int, str] | None = None,
     allow_init: bool = True,
+    extra_args: list[str] | None = None,
 ) -> str:
     """
     The declarations and slots of one call's arguments (added to `case`); returns the call statement,
-    preceded by the initializer calls of its struct objects.
+    preceded by the initializer calls of its struct objects. `extra_args` follow the arguments built
+    from `params` as they are (the objects behind a variadic call, `variadic_case`).
     """
     shared = shared or {}
     varlen = _variable_length(params, formals, rec, shared)
@@ -553,6 +572,7 @@ def _bind_call(
             case.slot(v, SCALAR_BYTES.get(p["ctype"]), call, i, "int")
         args.append(v)
         i += 1
+    args += extra_args or []
     made = case.api.returns.get(name) if allow_init else None
     if made is not None and made in case.api.dtors:
         # The call under test makes a handle: release it, or every run of the case leaks one.
@@ -574,6 +594,11 @@ def plan_params(signature: str, formals: Sequence[Any] | None = None) -> tuple[l
     _, params_s, _ = parts
     if is_variadic(signature, formals):
         return None, "variadic"
+    return _spell_params(params_s)
+
+
+def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | None]:
+    """The parameter types of a model signature as the generator spells them, or why it cannot."""
     params: list[dict] = []
     for t in params_s:
         c = classify_type(t)
@@ -611,6 +636,150 @@ def single_case(
     except _DeclError as e:
         return None, None, str(e)
     return case.statements([call]), case.layout("single", [name]), None
+
+
+# --- variadic functions: one case per call site of the target's own programs -------------------------
+
+_OBJECT_ARRAY_RE = re.compile(r"^(?P<elem>[^\[\]]+?)\s*(?P<dims>(?:\[\d+\])+)$")
+_OBJECT_BASE_RE = re.compile(r"[A-Za-z_]\w*(?: [A-Za-z_]\w*)*")
+
+
+def c_string_literal(data: bytes) -> str:
+    """
+    `data` as one C string literal on one line: printable ASCII as it is, every other byte, the
+    quote, the backslash and `?` (no trigraph) as a three-digit octal escape, which never runs into
+    the character after it.
+    """
+    out = ['"']
+    for b in data:
+        out.append(chr(b) if 0x20 <= b < 0x7F and chr(b) not in '"\\?' else f"\\{b:03o}")
+    return "".join(out) + '"'
+
+
+def _object_decl(ctype: str, var: str) -> tuple[str, bool] | None:
+    """(`<type> var` for an object type of a call site (`struct tag`, `char[80]`), whether it is an array)."""
+    t = " ".join(ctype.split())
+    m = _OBJECT_ARRAY_RE.match(t)
+    elem = m.group("elem").strip() if m else t
+    if not _OBJECT_BASE_RE.fullmatch(elem):
+        return None
+    return f"{elem} {var}{m.group('dims') if m else ''}", m is not None
+
+
+def variadic_case(
+    name: str, model_rec: dict, site: dict, spare: int, api: ApiInfo | None = None
+) -> tuple[str | None, dict | None, str | None]:
+    """
+    (statements, layout, why not) of the case that calls a variadic function as one call site of the
+    target's own programs does (`site`: a case of scripts/variadic_calls.py). What the call site
+    fixes stays fixed, so the case is a call the target itself makes, with another input:
+
+      - the format (the last fixed parameter, `const char *`) is the call site's string literal. It
+        is never read from the fuzz input: a fuzzed format would ask for objects the case does not
+        pass, and every report would be the harness's own fault;
+      - each argument after it is an object the case declares with exactly the call site's type
+        (`char c0v0[80]`, `struct minmea_float c0v1`), zeroed, on the stack, passed as there (the
+        array itself, or the object's address): a write past it is caught at its real size. No
+        input byte goes into these objects, and none becomes a pointer;
+      - the other fixed parameters follow the rules of every case, except that a `const` byte
+        pointer among them keeps no size from the call sites (`param_sizes` there is the length of
+        the literals the callers pass, not a contract): the first takes the rest of the input as a
+        NUL-terminated string.
+
+    The layout has kind `variadic` and records `format` (the literal's bytes as latin-1 text),
+    `format_param` and `varargs` ({type, pass}), for the seed writer and for a reviewer.
+    """
+    sig = str(model_rec.get("signature") or "")
+    parts = split_signature(sig)
+    if parts is None or not is_variadic(sig, model_rec.get("formals")):
+        return None, None, "not a variadic function"
+    # A definition Frama-C translated lists the rest as one more parameter (`__va_params`).
+    types = list(parts[1]) if parts[2] else list(parts[1])[:-1]
+    params, why = _spell_params(types)
+    if params is None:
+        return None, None, why
+    formals = [f for f in model_rec.get("formals") or [] if isinstance(f, dict)][: len(params)]
+    fmt_at = len(params) - 1
+    if fmt_at < 0 or site.get("format_param") != fmt_at:
+        return None, None, "the call site's format is not the last fixed parameter of the model's signature"
+    fmt_param = params[fmt_at]
+    if fmt_param["kind"] != "ptr" or fmt_param.get("pointee") != "char" or not _is_input(formals, fmt_at):
+        return None, None, "the last fixed parameter is not `const char *`: no format to fix"
+    fmt = site.get("format")
+    try:
+        fmt_bytes = fmt.encode("latin-1") if isinstance(fmt, str) else None
+    except UnicodeEncodeError:
+        fmt_bytes = None
+    if fmt_bytes is None:
+        return None, None, "the call site has no format literal"
+    case = _Case(spare, api, calls=1)
+    extra: list[str] = []
+    varargs: list[dict[str, str]] = []
+    try:
+        for j, va in enumerate(site.get("varargs") or []):
+            ctype, how = (str(va.get("type") or ""), va.get("pass")) if isinstance(va, dict) else ("", None)
+            v = case.declare(f"c0v{j}")
+            decl = _object_decl(ctype, v)
+            if decl is None or how not in ("addr", "array") or (how == "array" and not decl[1]):
+                return None, None, f"variable argument {j}: an object of type {ctype!r} cannot be declared"
+            case.decls.append(f"{decl[0]}; memset({v if decl[1] else '&' + v}, 0, sizeof({v}));")
+            extra.append(v if how == "array" else f"&{v}")
+            varargs.append({"type": " ".join(ctype.split()), "pass": str(how)})
+            if (case.api.structs.get(ctype.split("[")[0].strip()) or {}).get("pointers"):
+                case.note(0, fmt_at + 1 + j, f"{ctype}: holds pointers: the object is zeroed")
+        sizes = {
+            k: s
+            for k, s in (model_rec.get("param_sizes") or {}).items()
+            if not (k.isdigit() and int(k) < len(params) and _charlike(params[int(k)]) and _is_input(formals, int(k)))
+        }
+        rec = {**model_rec, "param_sizes": sizes}
+        literal = c_string_literal(fmt_bytes)
+        call = _bind_call(case, 0, name, params, formals, rec, {fmt_at: literal}, extra_args=extra)
+    except _DeclError as e:
+        return None, None, str(e)
+    layout = case.layout(VARIADIC_KIND, [name])
+    layout.update(format=fmt, format_param=fmt_at, varargs=varargs)
+    return case.statements([call]), layout, None
+
+
+def variadic_cases(
+    key: str, name: str, model_rec: dict, sites: Sequence[dict], spare: int, api: ApiInfo | None = None
+) -> tuple[list[tuple[str, dict]], list[dict]]:
+    """
+    The cases of one variadic entry point, one per distinct (format, objects) of its harvested call
+    sites, at most MAX_VARIADIC_CASES: ((statements, layout) list, the call sites left out with
+    `why`). Call sites that pass an array come first: a buffer whose size the callee cannot see is
+    where an unchecked copy shows, so the cap never drops them for a scalar-only format.
+    """
+    made: list[tuple[str, dict]] = []
+    dropped: list[dict] = []
+    seen: set[str] = set()
+
+    def arrays_first(item: tuple[int, dict]) -> tuple[bool, int]:
+        vas = item[1].get("varargs") or []
+        return (not any(isinstance(v, dict) and v.get("pass") == "array" for v in vas), item[0])
+
+    for _, site in sorted(enumerate(s for s in sites if isinstance(s, dict)), key=arrays_first):
+        ident = json.dumps([site.get("format"), site.get("varargs")], sort_keys=True, default=str)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        left_out = {"entry": key, "format": str(site.get("format")), "varargs": site.get("varargs") or []}
+        if len(made) >= MAX_VARIADIC_CASES:
+            dropped.append({**left_out, "why": f"more than {MAX_VARIADIC_CASES} variadic cases of {name}"})
+            continue
+        stmt, layout, why = variadic_case(name, model_rec, site, spare, api)
+        if stmt is None or layout is None:
+            dropped.append({**left_out, "why": str(why)})
+            continue
+        made.append((stmt, {**layout, "entry": key}))
+    return made, dropped
+
+
+def still_skipped(layouts: Sequence[dict], skipped: dict[str, str]) -> dict[str, str]:
+    """`skipped` without the entry points a case still calls (a variadic function has several cases)."""
+    alive = {lay.get("entry") for lay in layouts if lay.get("entry")}
+    return {k: v for k, v in skipped.items() if k not in alive}
 
 
 def initializers(
@@ -936,12 +1105,16 @@ def plan(
     struct_layouts: dict[str, dict] | None = None,
     visible: set[str] | None = None,
     reserve: int = 0,
+    variadic: dict[str, list[dict]] | None = None,
 ) -> dict[str, Any]:
     """
-    The cases of a module's API harness: {entries, cases, layouts, skipped}. `scope_files` (the
-    sidecar's) give a sub-module that is neither a lexer module nor a cluster its scope.
-    `struct_layouts` and `visible` come from `probe_layouts` (None: no probe ran). `reserve` selectors
-    are left free for the hand-written cases `generate` appends.
+    The cases of a module's API harness: {entries, cases, layouts, skipped, variadic_dropped}.
+    `scope_files` (the sidecar's) give a sub-module that is neither a lexer module nor a cluster its
+    scope. `struct_layouts` and `visible` come from `probe_layouts` (None: no probe ran). `reserve`
+    selectors are left free for the hand-written cases `generate` appends. `variadic` gives each
+    variadic function's harvested call sites (`variadic_calls.load_cases`): its cases come after the
+    single ones, and it is skipped only when it has none. `variadic_dropped` lists the call sites
+    that made no case, with the reason.
     """
     max_cases = max(0, MAX_CASES - reserve)
     from module_map import ModuleMap
@@ -962,6 +1135,8 @@ def plan(
     skipped: dict[str, str] = {}
     records: dict[str, dict] = {}
     names: list[str] = []
+    variadic_made: list[tuple[str, dict]] = []
+    dropped: list[dict] = []
     # Initializers: the module's callable entry points, and header functions the harness sees.
     entry_names = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]) for k in entries}
     init_pool = {
@@ -996,6 +1171,16 @@ def plan(
         if not mrec:
             skipped[key] = "not in the Phase 0 model"
             continue
+        if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
+            # Not in `records`: a sequence or a lifecycle case builds its calls from the signature.
+            made, left_out = variadic_cases(key, name, mrec, (variadic or {}).get(name) or [], spare, api)
+            dropped += left_out
+            if made:
+                names.append(key)
+                variadic_made += made
+            else:
+                skipped[key] = f"{NO_VARIADIC_SITE} ({left_out[0]['why']})" if left_out else NO_VARIADIC_SITE
+            continue
         stmt, layout, why = single_case(name, mrec, spare, api)
         if stmt is None or layout is None:
             skipped[key] = str(why)
@@ -1004,6 +1189,9 @@ def plan(
         names.append(key)
         cases.append(stmt)
         layouts.append({**layout, "entry": key})
+    for stmt, layout in variadic_made:
+        cases.append(stmt)
+        layouts.append(layout)
     seq_seen: set[tuple[str, ...]] = set()
     for full in traces or []:
         # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
@@ -1038,10 +1226,23 @@ def plan(
         for lay in layouts[max_cases:]:
             if lay.get("entry"):
                 skipped[lay["entry"]] = f"more than {MAX_CASES} cases"
+            if lay.get("kind") == VARIADIC_KIND:
+                dropped.append(_dropped_variadic(lay, f"more than {MAX_CASES} cases"))
         cases, layouts = cases[:max_cases], layouts[:max_cases]
+        skipped = still_skipped(layouts, skipped)
     for sel, lay in enumerate(layouts):
         lay["selector"] = sel
-    return {"entries": names, "cases": cases, "layouts": layouts, "skipped": skipped}
+    return {"entries": names, "cases": cases, "layouts": layouts, "skipped": skipped, "variadic_dropped": dropped}
+
+
+def _dropped_variadic(layout: dict, why: str) -> dict[str, Any]:
+    """The `api_variadic_dropped` record of a variadic case that was planned and then left out."""
+    return {
+        "entry": str(layout.get("entry") or ""),
+        "format": str(layout.get("format")),
+        "varargs": list(layout.get("varargs") or []),
+        "why": why,
+    }
 
 
 # --- struct layouts (clang's AST of the harness) ----------------------------------------------------
@@ -1415,11 +1616,18 @@ def generate(
     struct_layouts: dict[str, dict] | None = None,
     visible: set[str] | None = None,
     dispatch_cases: list[str] | None = None,
+    variadic: dict[str, list[dict]] | None = None,
 ) -> dict[str, Any]:
     """
     Write harness_<module>.{c,json} for the module's whole API; the generate_harness result plus counts.
     `scope_files` (`--scope-file`) default to the previous sidecar's, and are kept in the new one.
     `struct_layouts`/`visible` replace the layout probe (`probe_layouts`), which runs with `probe`.
+
+    `variadic` replaces the call sites of the variadic API (function -> cases). By default they are
+    read from workspace/reports/variadic_calls.json next to the DAG, harvested first when that report
+    is missing or was made from another model (`variadic_calls.ensure`). A call site whose case was
+    left out (over a cap, or refused by the compiler) is listed in the sidecar's
+    `api_variadic_dropped`; the function is in `api_skipped` only when none of its cases is left.
 
     `dispatch_cases` (`--dispatch-case`) are hand-written cases, for a function the generator cannot
     call: appended after the generated ones in the same switch (the next selectors), each with an
@@ -1468,7 +1676,24 @@ def generate(
         return [*planned["cases"], *custom], lays, dict(planned["skipped"])
 
     traces = load_traces(traces_path)
-    p = plan(dag, model, module, unit, max_input_size, traces, scope, struct_layouts, visible, reserve=len(custom))
+    if variadic is None:
+        from variadic_calls import ensure
+
+        reports = dag_file.parent
+        variadic = ensure(reports / "variadic_calls.json", model_path, reports / "build_capture.json")
+    p = plan(
+        dag,
+        model,
+        module,
+        unit,
+        max_input_size,
+        traces,
+        scope,
+        struct_layouts,
+        visible,
+        reserve=len(custom),
+        variadic=variadic,
+    )
     if not p["cases"]:
         raise ApiHarnessError(f"module {module!r}: no API entry point the generator can call: {p['skipped']}")
     functions = dag.get("functions") or {}
@@ -1480,6 +1705,7 @@ def generate(
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
     cases, layouts, skipped = with_custom(p)
+    dropped: list[dict] = list(p["variadic_dropped"])
     result: dict[str, Any] = {}
     # Struct layouts come from the first harness written (its headers and prelude): the cases are
     # planned again with them before the compile probe. Each later round drops at least one case, so
@@ -1516,10 +1742,20 @@ def generate(
                 layouts_probed = probe_layouts(Path(result["harness_file"]), result["cppflags"])
                 if layouts_probed is not None:
                     p = plan(
-                        dag, model, module, unit, max_input_size, traces, scope, *layouts_probed, reserve=len(custom)
+                        dag,
+                        model,
+                        module,
+                        unit,
+                        max_input_size,
+                        traces,
+                        scope,
+                        *layouts_probed,
+                        reserve=len(custom),
+                        variadic=variadic,
                     )
                     if p["cases"]:
                         cases, layouts, skipped = with_custom(p)
+                        dropped = list(p["variadic_dropped"])
                         continue
             probed = probe_cases(Path(result["harness_file"]), result["cppflags"])
             if probed is None:
@@ -1541,6 +1777,9 @@ def generate(
                     )
                 if layouts[i].get("entry"):
                     skipped[layouts[i]["entry"]] = f"the case does not compile with the target's headers: {diag}"
+                if layouts[i]["kind"] == VARIADIC_KIND:
+                    why = f"the case does not compile with the target's headers: {diag}"
+                    dropped.append(_dropped_variadic(layouts[i], why))
             if not keep:
                 raise ApiHarnessError(f"module {module!r}: no API case compiles: {sorted(skipped.items())}")
             cases = [cases[i] for i in keep]
@@ -1551,12 +1790,19 @@ def generate(
         sidecar = load_json_optional(sidecar_path, {}) or {}
         sidecar["api_harness"] = True
         sidecar["dispatch_case_count"] = len(layouts)
+        # A variadic function has one case per call site: it is skipped only when none is left.
+        skipped = still_skipped(layouts, skipped)
         sidecar["api_cases"] = layouts
         sidecar["api_skipped"] = skipped
+        sidecar.pop("api_variadic_dropped", None)
+        if dropped:
+            sidecar["api_variadic_dropped"] = dropped
         write_sidecar(sidecar_path, sidecar)
     result.update(
         api_cases=len(layouts),
-        api_entries=sum(1 for lay in layouts if lay.get("entry")),
+        api_entries=len({lay["entry"] for lay in layouts if lay.get("entry")}),
+        api_variadic=sum(1 for lay in layouts if lay["kind"] == VARIADIC_KIND),
+        api_variadic_dropped=dropped,
         api_sequences=sum(1 for lay in layouts if lay["kind"] == "sequence"),
         api_lifecycles=sum(1 for lay in layouts if lay["kind"] == "lifecycle"),
         api_custom=sum(1 for lay in layouts if lay["kind"] == CUSTOM_KIND),

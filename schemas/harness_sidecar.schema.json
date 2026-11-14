@@ -103,6 +103,35 @@
       },
       "required": ["selector", "kind", "calls", "slots", "rest"],
       "additionalProperties": false
+    },
+    "vararg": {
+      "$comment": "One object a variadic case passes after the format: `type` is its type at the call site (`struct minmea_float`, `char[80]`), `pass` how it is passed: `addr` (`&object`) or `array` (the array by name). The case declares it with exactly that type, zeroed; no input byte goes into it.",
+      "type": "object",
+      "properties": {
+        "type": {"type": "string", "minLength": 1},
+        "pass": {"type": "string", "enum": ["addr", "array"]}
+      },
+      "required": ["type", "pass"],
+      "additionalProperties": false
+    },
+    "variadic_case": {
+      "$comment": "One call of a variadic API function as a call site of the target's own programs makes it (api_harness.variadic_case, from workspace/reports/variadic_calls.json): `format` is that call site's string literal (its bytes as latin-1 text), passed as parameter `format_param` (the last fixed one) and never read from the input; `varargs` are the objects passed after it. `slots` and `rest` cover the other fixed parameters, as in a single case. A function has one such case per distinct (format, varargs), all with the same `entry`.",
+      "type": "object",
+      "properties": {
+        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "kind": {"const": "variadic"},
+        "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 1},
+        "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
+        "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
+        "entry": {"$comment": "the DAG key of the API entry point the case calls", "type": "string", "minLength": 1},
+        "format": {"type": "string"},
+        "format_param": {"type": "integer", "minimum": 0},
+        "varargs": {"type": "array", "items": {"$ref": "#/definitions/vararg"}},
+        "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
+      },
+      "required": ["selector", "kind", "calls", "slots", "rest", "entry", "format", "format_param", "varargs"],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -146,9 +175,24 @@
     "api_harness": {"const": true},
     "api_cases": {
       "type": "array",
-      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}, {"$ref": "#/definitions/custom_case"}]}
+      "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}, {"$ref": "#/definitions/custom_case"}, {"$ref": "#/definitions/variadic_case"}]}
     },
-    "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason", "type": "object", "additionalProperties": {"type": "string"}},
+    "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason. A variadic function is here only when none of its call sites made a case", "type": "object", "additionalProperties": {"type": "string"}},
+    "api_variadic_dropped": {
+      "$comment": "Call sites of a variadic entry point that made no case (over a cap, a type the harness cannot declare, a case the compiler refused), with the reason. Absent when there is none.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "entry": {"type": "string", "minLength": 1},
+          "format": {"type": "string"},
+          "varargs": {"type": "array", "items": {"type": "object"}},
+          "why": {"type": "string", "minLength": 1}
+        },
+        "required": ["entry", "format", "varargs", "why"],
+        "additionalProperties": false
+      }
+    },
     "target_fuzzer": {
       "$comment": "Set on a target fuzz module (generate_harness.py --target-fuzzer): the harness calls the target's own LLVMFuzzerTestOneInput, renamed to __framac_target_embedded_LLVMFuzzerTestOneInput; `initialize` is true when the fuzzer also defines LLVMFuzzerInitialize (renamed and called once by the harness). Absent on every other module.",
       "type": "object",
