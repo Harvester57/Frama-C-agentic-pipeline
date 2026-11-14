@@ -742,6 +742,28 @@ def test_guardrail_keeps_a_contract_violation_of_the_checked_function(tmp_path, 
     assert verdict["failure"]["function"] == "minmea_tocoord" and len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("report", "status", "replays"),
+    [(EACSL_RTE_ELSEWHERE, "passed_dynamic_oracle", 2), (EACSL_ANNOTATION_ELSEWHERE, "rejected_overconstrained", 1)],
+    ids=["rte_dropped", "annotation_kept"],
+)
+def test_module_wide_guardrail_never_excuses_a_failed_annotation(
+    tmp_path, monkeypatch, chdir_tmp, report, status, replays
+):
+    # `--reach-functions` (batch merge): every annotation of the module is checked, so the reach list is
+    # no contract scope. An RTE failure of other code is still no evidence about any contract.
+    corpus = _corpus(tmp_path)
+    (corpus / "seed-gll-scale").write_bytes(MINMEA_CRASHER)
+    calls: list = []
+    _crashing_replays(monkeypatch, MINMEA_CRASHER, calls, report)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    verdict = R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 0, use_cache=False, seed=1, functions=["f"], contract_functions=[]
+    )
+    assert verdict["status"] == status and len(calls) == replays
+
+
 def test_guardrail_never_blames_the_contract_past_the_exclusion_limit(tmp_path, monkeypatch, chdir_tmp):
     monkeypatch.setattr(R, "GUARDRAIL_MAX_EXCLUDED_INPUTS", 1)
     calls: list = []

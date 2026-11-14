@@ -2578,6 +2578,7 @@ def run_guardrail_check(
     use_verdict_cache: bool = True,
     max_corpus_inputs: int = 64,
     functions: list[str] | None = None,
+    contract_functions: list[str] | None = None,
 ) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
@@ -2590,6 +2591,12 @@ def run_guardrail_check(
 
     A pass only says that no replayed input broke a check. `reach` records how often each of
     `functions` ran: a contract on a function no input reached was not tested at all.
+
+    A failure outside `functions` is not held against the contract (failure_outside_checked_functions).
+    `contract_functions` are the functions whose annotations the build is limited to (`--functions`;
+    default `functions`): a failed annotation is only excused outside them, so a module-wide build that
+    only measures the reach of `functions` (`--reach-functions`, an empty list here) excuses RTE
+    failures of other code but never a failed annotation.
 
     When caching is enabled (`scripts/cache.py`), deterministic passing verdicts
     (`passed_dynamic_oracle`) are cached in the run-local `guardrail` namespace
@@ -2685,7 +2692,8 @@ def run_guardrail_check(
             break
         failure = verdict.get("failure")
         if failure is not None:
-            why = failure_outside_checked_functions(failure, combined_out, functions)
+            scope = functions if verdict["status"] == "code_fault" or contract_functions is None else contract_functions
+            why = failure_outside_checked_functions(failure, combined_out, scope)
         elif verdict["status"] == "guardrail_error":
             why = crash_outside_checked_functions(combined_out, functions)
         else:
@@ -2711,7 +2719,7 @@ def run_guardrail_check(
         still = set(replay_names)
         name = _replayed_input_of(crash_input, [e for e in replay_manifest if e[0] in still])
         if name is None:
-            if crash_input is None or mutation_runs <= 0:
+            if failure is None or crash_input is None or mutation_runs <= 0:
                 break
             # Not a corpus file: a mutation of the burst. The seed is fixed, so the burst would stop there
             # every time; replay the corpus alone and say so (`mutations_skipped`).
@@ -5014,6 +5022,7 @@ def main(argv: list[str] | None = None) -> int:
                     use_verdict_cache=use_verdict_cache,
                     max_corpus_inputs=args.max_corpus_inputs,
                     functions=args.reach_functions if args.reach_functions else args.functions,
+                    contract_functions=args.functions or [],
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
                 if "diagnostic_hints" not in res:
