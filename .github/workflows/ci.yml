@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - ".agents/**"
+      - ".claude/skills/**"
+      - ".pre-commit-config.yaml"
+      - "tools/**"
       - ".dockerignore"
       - "benchmark/**"
       - ".github/workflows/ci.yml"
@@ -24,6 +27,9 @@ on:
       - main
     paths:
       - ".agents/**"
+      - ".claude/skills/**"
+      - ".pre-commit-config.yaml"
+      - "tools/**"
       - ".dockerignore"
       - "benchmark/**"
       - ".github/workflows/ci.yml"
@@ -82,8 +88,11 @@ jobs:
       - name: Run Mypy typechecker
         run: python -m mypy scripts tests
 
-      - name: Verify reference manuals and skill mirrors
+      - name: Verify reference manuals
         run: python scripts/extract_references.py --check
+
+      - name: Verify skill mirrors are copies of skills/
+        run: python tools/sync_skill_mirrors.py --check
 
       - name: Check POSIX shell script syntax
         run: bash -n wrappers/framac-docker.sh scripts/container_entry.sh

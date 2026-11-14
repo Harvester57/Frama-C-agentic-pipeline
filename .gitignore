@@ -11,8 +11,8 @@ venv/
 dist/
 build/
 
-# Local agent/analysis scratch directories. .agents/skills is tracked: each skill there is a
-# symlink to ../skills/<name>, so skills are edited once in skills/ and shared by every harness.
+# Local agent/analysis scratch directories. .agents/skills is tracked: it is a plain copy of
+# skills/, the only place skills are edited (tools/sync_skill_mirrors.py copies and checks it).
 .agents/*
 !.agents/skills/
 to_analyze/

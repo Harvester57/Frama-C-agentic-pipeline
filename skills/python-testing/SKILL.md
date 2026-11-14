@@ -43,4 +43,4 @@ Only the markers registered in `pyproject.toml` are allowed (`--strict-markers` 
 - **Mocking external tools (`monkeypatch`):**
   When unit-testing wrappers around `frama-c`, `e-acsl-gcc`, `clang`, `docker`, or `podman` on a host where the container toolchain is not installed natively, use `monkeypatch.setattr` on `subprocess.run` or the module's runner helper to simulate stdout/stderr, exit codes, and generated report files deterministically.
 - **Skill mirror invariant:**
-  The skill directories `skills/framac-*` and `.agents/skills/framac-*` must remain byte-for-byte identical. Tests in `tests/test_extract_references.py` enforce this invariant automatically.
+  Edit skills only under `skills/`. `.agents/skills/` and `.claude/skills/` are plain copies and must remain byte-for-byte identical to it: run `python tools/sync_skill_mirrors.py` after an edit. `tests/test_sync_skill_mirrors.py`, the pre-commit hook and CI enforce this (`python tools/sync_skill_mirrors.py --check`).

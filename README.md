@@ -274,7 +274,7 @@ python3 -m mypy scripts tests
 Add `-n auto` to run the tests in parallel (pytest-xdist); see [`tests/README.md`](./tests/README.md).
 
 > [!NOTE]
-> Edit skills only under `skills/`. The repository records the harness mirrors `.agents/skills/*` and `.claude/skills/*` as symlinks to `skills/*`. Where a checkout cannot use them (Windows with `core.symlinks=false`, where a harness needs real files), the mirror may be a real copy instead; `tests/test_extract_references.py` accepts a link, git's plain-file form of a link, or a copy, and fails when a copy differs from `skills/` by a single byte.
+> Edit skills only under `skills/`. The harness mirrors `.agents/skills/` and `.claude/skills/` are plain tracked copies of it (no symlinks). After an edit, run `python tools/sync_skill_mirrors.py` to refresh both. The pre-commit hook, CI and `tests/test_sync_skill_mirrors.py` run `python tools/sync_skill_mirrors.py --check`, which fails when a mirror differs from `skills/` by a single byte.
 
 ---
 

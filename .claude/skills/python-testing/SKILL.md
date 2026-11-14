@@ -1,0 +1,46 @@
+---
+name: python-testing
+description: Pytest testing conventions, fixtures, mocking, schema validation checks, and marker usage (`unit`, `integration`, `slow`) for the Frama-C verification pipeline (`tests/`).
+---
+
+# Python Testing (`frama-c` Pipeline)
+
+Testing conventions for the `tests/` suite in this repository.
+
+## 1. Running the Test Suite
+
+Always run tests in parallel with pytest-xdist: pass `-n auto` to every run of more than a single test (the full suite takes about a minute in parallel, several minutes serially). Use `-n 0` only to debug one failing test (`pdb`, clean output, or to check whether a failure appears only in parallel). With `FRAMAC_DOCKER_TESTS=1`, cap the workers (`-n 4`), as each worker starts its own containers. See `tests/README.md` for the other variants.
+
+From PowerShell on Windows (always set `PYTHONIOENCODING="utf-8"` and double-quote flags containing `=` or `.`):
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python -m pytest tests -n auto
+python -m pytest tests/test_validators.py -k "test_name"
+python -m pytest "-m" "not slow" tests -n auto
+```
+
+`pyproject.toml` configures `pythonpath = ["scripts", "tests"]` and `--strict-markers`, so tests import pipeline modules directly by name (e.g., `import ledger`, `import resources`, `import workspace_overlay`).
+
+## 2. Pytest Markers
+
+Only the markers registered in `pyproject.toml` are allowed (`--strict-markers` is active):
+- `@pytest.mark.unit`: fast, self-contained unit tests using `tmp_path` and mocks.
+- `@pytest.mark.integration`: tests exercising multi-script workflows or container/toolchain interactions.
+- `@pytest.mark.slow`: long-running tests.
+
+## 3. Core Testing Conventions
+
+- **Filesystem isolation with `tmp_path`:**
+  Build synthetic run directories, `workspace/work/` trees, or broker state directories inside pytest's `tmp_path` fixture. Never mutate repository files or the user's `~/framac-pipeline` / `~/.cache/framac-pipeline` directories during tests (`monkeypatch.setenv("FRAMAC_CACHE_DIR", str(tmp_path / "cache"))` and `monkeypatch.setenv("FRAMAC_BROKER_DIR", str(tmp_path / "broker"))`).
+- **Schema & artifact validation:**
+  When testing scripts that emit or mutate `coverage-ledger.json`, `candidates.json`, `findings.json`, `run-metadata.json`, or `agent-result` JSONs, assert that `validate_artifacts.py` accepts the produced artifacts (and rejects intentionally malformed ones).
+- **Cross-platform paths & line endings:**
+  Tests run on Windows host Python as well as Linux inside the container.
+  - Use `Path` methods and `.as_posix()` when comparing relative paths stored in JSON artifacts (`<rel-file>#<function>::<class>`).
+  - Always specify `encoding="utf-8"` when reading or writing test files.
+  - Remember that ACSL strings contain backslashes (`\valid`, `\forall`, `\false`, `\result`, `\at`); use raw strings (`r"/*@ requires \valid(p); */"`) or `json.dumps` when constructing test fixtures.
+- **Mocking external tools (`monkeypatch`):**
+  When unit-testing wrappers around `frama-c`, `e-acsl-gcc`, `clang`, `docker`, or `podman` on a host where the container toolchain is not installed natively, use `monkeypatch.setattr` on `subprocess.run` or the module's runner helper to simulate stdout/stderr, exit codes, and generated report files deterministically.
+- **Skill mirror invariant:**
+  Edit skills only under `skills/`. `.agents/skills/` and `.claude/skills/` are plain copies and must remain byte-for-byte identical to it: run `python tools/sync_skill_mirrors.py` after an edit. `tests/test_sync_skill_mirrors.py`, the pre-commit hook and CI enforce this (`python tools/sync_skill_mirrors.py --check`).

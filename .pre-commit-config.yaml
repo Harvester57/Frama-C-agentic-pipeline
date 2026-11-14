@@ -24,3 +24,11 @@ repos:
         entry: python tools/check_generated_text.py
         language: system
         files: \.(py|md|sh|c|h)$
+      # skills/ is the source of truth; .agents/skills and .claude/skills are plain copies of it.
+      # To fix a failure: edit under skills/, then run `python tools/sync_skill_mirrors.py`.
+      - id: check-skill-mirrors
+        name: check skill mirrors
+        entry: python tools/sync_skill_mirrors.py --check
+        language: system
+        pass_filenames: false
+        files: ^(skills|\.agents/skills|\.claude/skills)/

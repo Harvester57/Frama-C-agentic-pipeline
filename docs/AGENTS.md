@@ -38,7 +38,7 @@ Local scratch folders `docs/papers/` and `docs/lessons/` are gitignored in [`../
 - **File-writing tools only (never shell heredocs):** Always write and edit files with direct file-writing/editing tools, never via Bash heredocs or PowerShell here-strings, which corrupt ACSL backslashes (`\result`, `\valid_read`, `\forall`, `\false`) and line endings.
 - **LF line endings:** Keep all Markdown files LF-terminated (`\n`).
 - **Generated manuals:** Never hand-edit generated `<tool>/<name>.md` files or `INDEX.md` inside `./references/`; regenerate them via `python scripts/extract_references.py`.
-- **Skill mirror synchronization:** If a documentation change updates paths inside [`../skills/`](../skills/), synchronize the modified `SKILL.md` bytes into `.agents/skills/` and `.claude/skills/` when those mirrors exist as plain copies on Windows checkouts.
+- **Skill mirror synchronization:** If a documentation change updates paths inside [`../skills/`](../skills/), run `python tools/sync_skill_mirrors.py` afterwards. `skills/` is the only place skills are edited; `.agents/skills/` and `.claude/skills/` are plain tracked copies, and the pre-commit hook and CI fail when they differ (`python tools/sync_skill_mirrors.py --check`).
 
 ---
 
