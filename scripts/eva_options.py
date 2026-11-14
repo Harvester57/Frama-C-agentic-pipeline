@@ -41,6 +41,7 @@ EXTRA_DOMAINS = ("multidim",)
 SPLIT_RETURN_WORDS = ("auto", "full")
 EQUALITY_THROUGH_CALLS = ("none", "formals", "all")
 ALLOC_BUILTIN_MODES = ("imprecise", "by_stack", "fresh", "fresh_weak")
+DESCENDING_ITERATION = ("no", "full", "exits")
 STD_ALLOC_FUNCTIONS = ("malloc", "calloc", "realloc")
 _SIMPLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _C_IDENT_RE = C_IDENT_RE
@@ -91,16 +92,20 @@ EVA_OPTIONS: dict[str, EvaOption] = {
     "partition-value": EvaOption("int"),
     "default-loop-unroll": EvaOption("int"),
     "context-width": EvaOption("int"),
-    "interprocedural-history": EvaOption("int"),
-    "interprocedural-splits": EvaOption("int"),
+    # Flags in Frama-C 34, not counts: an int here rendered `-eva-interprocedural-splits 1`, and
+    # Frama-C read the `1` as a source file.
+    "interprocedural-partition-path": EvaOption("bool"),
+    "interprocedural-splits": EvaOption("bool"),
     # Stub externals inside Eva itself (upstream use_spec.i pattern); no std allocators merged in.
     "builtin": EvaOption("func_list", merge_std_alloc=False),
     "use-spec": EvaOption("func_list", merge_std_alloc=False),
     "reduce-on-logic-alarms": EvaOption("bool"),
     "hierarchical-convergence": EvaOption("bool"),
-    "descending-iteration": EvaOption("bool"),
+    # Takes a value (`no`, `full`, `exits`); there is no `-eva-no-descending-iteration`.
+    "descending-iteration": EvaOption("enum", choices=DESCENDING_ITERATION),
     "join-results": EvaOption("bool"),
     "alloc-returns-null": EvaOption("bool"),
+    # Deprecated in Frama-C 34 (a warning, not an error).
     "all-rounding-modes-constants": EvaOption("bool"),
 }
 
@@ -110,6 +115,7 @@ EVA_OPTIONS: dict[str, EvaOption] = {
 RENAMED_OPTIONS = {
     "partition-history": "partition-path",  # Frama-C 34.0 (Selenium)
     "partition-history-function": "partition-path-function",
+    "interprocedural-history": "interprocedural-partition-path",
 }
 
 

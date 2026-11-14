@@ -99,6 +99,9 @@ def run_of(name: str, rows: list[dict], *, log_text: str | None = None, **report
         ("context-depth=4", ("context-depth", 4)),
         ("precision=8", ("precision", 8)),
         ("domains=multidim", ("domains", ["multidim"])),
+        ("interprocedural-partition-path=true", ("interprocedural-partition-path", True)),
+        ("interprocedural-splits=true", ("interprocedural-splits", True)),
+        ("descending-iteration=exits", ("descending-iteration", "exits")),
     ],
 )
 def test_every_allowlisted_option_parses(text, expected):
@@ -109,13 +112,39 @@ def test_every_allowlisted_option_parses(text, expected):
 
 @pytest.mark.parametrize(
     ("old", "new"),
-    [("partition-history=1", "partition-path"), ("partition-history-function=f:1", "partition-path-function")],
+    [
+        ("partition-history=1", "partition-path"),
+        ("partition-history-function=f:1", "partition-path-function"),
+        ("interprocedural-history=true", "interprocedural-partition-path"),
+    ],
 )
 def test_an_option_frama_c_renamed_is_refused_with_its_new_name(old, new):
     # Frama-C 34 renamed it: the old name is never translated behind the configuration's back.
     with pytest.raises(ValueError, match=f"renamed '{new}'"):
         eo.parse_option(old)
     assert f"renamed '{new}'" in (eo.options_problem({old.split("=")[0]: 1}) or "")
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        # Frama-C 34 flags: a value after them is read as a source file.
+        ({"interprocedural-splits": True}, ["-eva-interprocedural-splits"]),
+        ({"interprocedural-partition-path": False}, ["-eva-no-interprocedural-partition-path"]),
+        # A value, not a flag: there is no -eva-no-descending-iteration.
+        ({"descending-iteration": "full"}, ["-eva-descending-iteration", "full"]),
+    ],
+)
+def test_frama_c_34_flags_and_values_render_as_frama_c_expects(options, expected):
+    assert eo.framac_args(options) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("interprocedural-splits", 1), ("descending-iteration", True), ("descending-iteration", "partial")],
+)
+def test_an_option_given_the_wrong_kind_of_value_is_refused(name, value):
+    assert eo.option_problem(name, value)
 
 
 @pytest.mark.parametrize(
