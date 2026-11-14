@@ -1,4 +1,4 @@
-# E-ACSL: `<==>` over a labelled term (`\old`, `\at`, or a formal in a postcondition) aborts with `labels pre-analysis was not performed` (regression in 35)
+# E-ACSL: `<==>` over a labelled term (`\old`, `\at`, or a formal in a postcondition) aborts with `labels pre-analysis was not performed` (regression in 34.0~beta and 35)
 
 Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). Listed as Issue 14 in
 [`frama-c-e-acsl-issues.md`](./frama-c-e-acsl-issues.md#issue-14-iff-over-a-labelled-term-aborts-the-translation).
@@ -61,6 +61,7 @@ cases below fail, including `<==>` with `\at(n, Pre)`.
 |---|---|
 | `35.0~~dev (Bromine)`, image `framac-analysis:latest` (pipeline image, 2026-11-08) | **fails** |
 | `34.0~~dev (Selenium)`, image `framac-pipeline:fc34-20261105` | works |
+| `34.0~beta (Selenium)`, opam build, image `framac-analysis:latest` (2026-11-14) | **fails** (same message, reproducer below) |
 
 Debian 13, clang 19 / gcc 14, default `e-acsl-gcc` options. `master` could not be checked: the
 tracker's raw-file and history pages refuse automated requests.

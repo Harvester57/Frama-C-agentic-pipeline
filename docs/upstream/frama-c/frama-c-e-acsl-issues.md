@@ -37,7 +37,8 @@ patches together.
 | 10 | `e-acsl-gcc -G clang` overwrites `CFLAGS` | **Present** | **Yes, medium** | Drops `-std=c99`, `-m<bits>`, `-g -O2`, `--rt-debug` flags; the `--rt-debug` backtrace comes out empty. File together with 12 | [clang-cflags](./frama-c-eacsl-gcc-clang-cflags.md) |
 | 12 | `e-acsl-gcc` compiles with `-std=c99` but without the `-D_DEFAULT_SOURCE` Frama-C preprocessed with | **Present** | **Yes, medium** | With gcc 14, any program calling `strdup`, `strtok_r`, `fileno`, … fails to build; clang works only because of Issue 10 | [default-source](./frama-c-eacsl-gcc-default-source.md) |
 | 13 | Formals registered with `__e_acsl_store_block` but never marked initialized | **Present** (also 34) | **Yes, high** | Any `\initialized` on a by-value struct field fails on every call, with or without `-rte`. Same bug as closed #177, which fails again. Same family as 8: file together | [formal-params-initialized](./frama-c-eacsl-formal-params-initialized.md) |
-| 14 | `<==>` over a labelled term (`\old`, `\at`, a formal in `ensures`) aborts with `labels pre-analysis was not performed` | **Present** (regression; 34 works) | **Yes, high** | A common postcondition shape (`(\result != 0) <==> (b->n == 0)`) cannot be instrumented at all; fix not validated yet | [iff-labelled-term](./frama-c-eacsl-iff-labelled-term.md) |
+| 14 | `<==>` over a labelled term (`\old`, `\at`, a formal in `ensures`) aborts with `labels pre-analysis was not performed` | **Present** (regression; `34.0~~dev` worked, `34.0~beta` fails too) | **Yes, high** | A common postcondition shape (`(\result != 0) <==> (b->n == 0)`) cannot be instrumented at all; fix not validated yet | [iff-labelled-term](./frama-c-eacsl-iff-labelled-term.md) |
+| 15 | `--temporal` with `-e-acsl-full-mtracking`: a function's address passed as an argument aborts with `Unreachable` | Not checked (found on `34.0~beta`) | **Yes, medium** | The callee pulls temporal metadata for the function-pointer parameter, the call site never saves it. Blocks temporal analysis on callback APIs | [temporal-function-address-argument](./frama-c-eacsl-temporal-function-address-argument.md) |
 | 2 | `-O` builds plain + `.e-acsl`; `-X`/`--oexec-e-acsl` absent from `-h` | Unchanged | No | Documented behaviour (`man e-acsl-gcc` describes `-O`, `-X`, `--oexec-e-acsl`; `-h` says it lists only basic options) | — |
 | 6 | RTL abort in `unsafe_initialize` has no target location | Unchanged | No | `--rt-debug` already prints a backtrace naming the target function; its failure under clang is Issue 10 | — |
 | 7 | Unknown names in `-rte-select`/`-e-acsl-functions` abort | Unchanged | No | Same convention as `-wp-fct`; deliberate kernel-wide behaviour | — |
@@ -661,6 +662,39 @@ brief asks for two implications in new contracts.
 **Proposed fix (not validated).** Translate each operand once and combine the C expressions, as the
 interlang `Piff` case already does. Reproducer, table of failing shapes and the 34/35 source diff:
 [frama-c-eacsl-iff-labelled-term.md](./frama-c-eacsl-iff-labelled-term.md).
+
+**34.0~beta.** The released beta (opam, image `framac-analysis:latest`, 2026-11-14) fails the same
+reproducer, so the regression reached the 34 branch after `34.0~~dev`.
+
+## Issue 15: temporal analysis aborts on a function-address argument
+
+**Status.** Found 2026-11-14 on `34.0~beta (Selenium)` while trying `e-acsl-gcc --temporal` for the
+pipeline ([`../../plans/frama-c-34-option-review.md`](../../plans/frama-c-34-option-review.md)).
+
+**Observed.** With `--temporal` and `-e-acsl-full-mtracking`, `apply(&cb, &v)` where
+`apply(int (*f)(int), int *v)` aborts with `Unreachable` (exit 134). The callee pulls temporal
+metadata for `f`; the call site saves it only for `v`. Without full tracking, the callee does not pull
+`f` and the program runs.
+
+**Workaround.** None that keeps both options. Ten-line reproducer and the generated code:
+[frama-c-eacsl-temporal-function-address-argument.md](./frama-c-eacsl-temporal-function-address-argument.md).
+
+---
+
+## Issue 16: a `loop variant` that is one application of a memory-reading logic function aborts
+
+**Status.** Found 2026-11-14 on `34.0~beta (Selenium)` in minmea `run-1`
+([`../../runs/2026-11-14-minmea-run1-supervision.md`](../../runs/2026-11-14-minmea-run1-supervision.md));
+also reproduced on `35.0~~dev`. Not filed.
+
+**Observed.** `loop variant len(s);`, where `len` is a logic function whose body reads memory, aborts
+the translation with `typing was not performed on construct len(s)` (exit 4, "Please report as
+'crash'"). The same application in an `assert`, `requires`, `ensures` or `loop invariant`, or as a
+strict subterm of the variant (`len(s) + 0`), translates. The type is recorded on the normalized
+term and `Loops.handle_annotations` asks for it on the original one.
+
+**Workaround.** Write the variant as `len(s) + 0`. Seventeen-line reproducer and the analysis:
+[frama-c-eacsl-loop-variant-logic-function-application.md](./frama-c-eacsl-loop-variant-logic-function-application.md).
 
 ---
 

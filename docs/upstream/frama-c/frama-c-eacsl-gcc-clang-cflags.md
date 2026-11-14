@@ -137,6 +137,40 @@ Built from `ad24dca` with this patch and the `_DEFAULT_SOURCE` patch:
 
 The E-ACSL test suite runs with gcc, so it does not exercise the clang branch.
 
+### Further consequence: `--validate-format-strings` does not build under clang
+
+Found 2026-11-14 on `34.0~beta (Selenium)` (opam build, Debian 13, clang 19.1.7). With
+`--validate-format-strings`, the runtime compiles `libc_replacements/e_acsl_stdio.c`, which:
+
+- calls `vabort`, `isdigit` and `vsyslog` with no declaration in scope. clang 16 and later treat an
+  implicit function declaration as an error, and the clang branch has dropped
+  `-Wno-implicit-function-declaration`:
+
+  ```
+  e_acsl_stdio.c:136:3: error: call to undeclared function 'vabort'; ISO C99 and later do not support implicit function declarations
+  e_acsl_stdio.c:284:12: error: call to undeclared library function 'isdigit' with type 'int (int)'
+  e_acsl_stdio.c:998:10: error: call to undeclared function 'vsyslog'
+  e-acsl-gcc: fatal error: fail to compile/link instrumented code
+  ```
+
+- calls `valid_string`, defined as a plain C99 `inline` function in `libc_replacements/e_acsl_string.h:66`
+  (`long inline valid_string(...)`) with no external definition. At `-O0`, which is what the clang
+  branch leaves, the call is not inlined and the link fails:
+
+  ```
+  e_acsl_rtl.c:(.text+0x947a): undefined reference to `valid_string'
+  ```
+
+With gcc (`-G gcc`), the same build works and reports both seeded format bugs. The proposed fix
+above restores `-O2` and the warning flags, which hides both problems. Each is also a defect of its
+own: `e_acsl_stdio.c` should include `<ctype.h>` and `<syslog.h>` and declare `vabort` (it is
+defined nowhere in `share/e-acsl`), and `valid_string` should be `static inline` or have an
+`extern` declaration in one translation unit.
+
+Reproducer: any program, for example `int main(void) { return 0; }`, with
+`e-acsl-gcc -c -G clang --validate-format-strings -O t t.c`. Workaround: pass
+`-e "-O1 -Wno-implicit-function-declaration"` (the pipeline's backend flags already contain both).
+
 ## Related documentation nit (same script)
 
 `man e-acsl-gcc` (`plugins/e-acsl/man/e-acsl-gcc.1:69-80`), on output names:
