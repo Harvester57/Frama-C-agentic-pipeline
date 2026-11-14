@@ -3604,6 +3604,9 @@ def replay_candidates(
     machdep: str = "gcc_x86_64",
     per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
     attribution: bool = True,
+    only: str | None = None,
+    inputs: list[Path] | None = None,
+    out_json: Path | None = None,
 ) -> dict:
     """
     Replay the reproducers of every unverified candidate on its module's binary, built with
@@ -3611,9 +3614,19 @@ def replay_candidates(
     `make build` and of the campaign, so the build is a cache hit. Candidates whose module Make
     cannot build get an `error` report. Writes `<out_dir>/<fingerprint-slug>.json` per candidate
     and `index.json`, which maps each fingerprint to its report.
+
+    With `only` (a candidate fingerprint), replay the given `inputs` instead of the candidate's own
+    reproducers, on that candidate's binary, whatever its status. This is how the parent checks the
+    reproducers a Crash Verifier lists from its own scratch before `ingest-verifier`. Only `out_json`
+    is written: the candidate's own report and `index.json` stay as they are.
     """
     candidates = load_json_optional(Path(candidates_path), [])
     todo = [c for c in candidates if isinstance(c, dict) and c.get("status") == "unverified" and _reproducer_paths(c)]
+    if only is not None:
+        if not inputs or out_json is None:
+            raise ValueError("replay_candidates(only=...) needs inputs and out_json")
+        todo = [c for c in candidates if isinstance(c, dict) and c.get("fingerprint") == only][:1]
+        out_dir = Path(out_json).parent
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
@@ -3658,17 +3671,38 @@ def replay_candidates(
         scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
         report = replay_report(
             module,
-            _reproducer_paths(cand),
+            list(inputs or []) if only is not None else _reproducer_paths(cand),
             scratch,
             prepared=prepared_by_key[key],
             per_input_timeout=per_input_timeout,
         )
         report["candidate_fingerprint"] = fingerprint
         report["fingerprint_matches"] = any(a.get("fingerprint") == fingerprint for a in report["artifacts"])
-        report_path = out_dir / f"{_candidate_slug(fingerprint)}.json"
+        report_path = Path(out_json) if out_json is not None else out_dir / f"{_candidate_slug(fingerprint)}.json"
         atomic_write_json(report_path, report)
         index[fingerprint] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
         by_status[report["status"]] = by_status.get(report["status"], 0) + 1
+    if only is not None and out_json is not None:
+        if not todo:
+            by_status["error"] = 1
+            atomic_write_json(
+                Path(out_json),
+                {
+                    "mode": "replay",
+                    "status": "error",
+                    "reason": f"unknown candidate fingerprint: {only}",
+                    "candidate_fingerprint": only,
+                    "inputs": [str(i) for i in inputs or []],
+                    "artifacts": [],
+                },
+            )
+        return {
+            "mode": "replay-candidates",
+            "status": "error" if by_status.get("error") else "ok",
+            "candidates": len(todo),
+            "by_status": by_status,
+            "report": Path(out_json).as_posix(),
+        }
     index_path = out_dir / "index.json"
     atomic_write_json(
         index_path,
@@ -4693,6 +4727,13 @@ def main(argv: list[str] | None = None) -> int:
     p_cands.add_argument("--machdep", default="gcc_x86_64")
     p_cands.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_cands.add_argument("--no-attribution-replay", action="store_true")
+    p_cands.add_argument(
+        "--fingerprint",
+        default=None,
+        help="Replay --inputs on this one candidate's module binary instead (report: --out-json; no index)",
+    )
+    p_cands.add_argument("--inputs", type=Path, nargs="+", default=None, help="With --fingerprint: the input files")
+    p_cands.add_argument("--out-json", type=Path, default=None, help="With --fingerprint: the replay report")
 
     p_min = sub.add_parser("minimize", help="Minimize crash input(s) with cvise/creduce on a given or built binary")
     _add_build_args(p_min, sources_required=False)
@@ -4748,6 +4789,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if args.mode == "replay-candidates":
+        if (args.fingerprint is None) != (args.inputs is None) or (args.fingerprint is None) != (args.out_json is None):
+            raise SystemExit("replay-candidates: --fingerprint, --inputs and --out-json go together")
         summary = replay_candidates(
             args.candidates,
             args.harness_dir,
@@ -4758,6 +4801,9 @@ def main(argv: list[str] | None = None) -> int:
             machdep=args.machdep,
             per_input_timeout=args.per_input_timeout,
             attribution=not args.no_attribution_replay,
+            only=args.fingerprint,
+            inputs=args.inputs,
+            out_json=args.out_json,
         )
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "ok" else 1
