@@ -524,8 +524,8 @@ def chdir_tmp(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _crashing_replays(monkeypatch, crasher: bytes, calls: list) -> None:
-    """A fake libFuzzer that stops on the first replayed file whose content is `crasher`."""
+def _crashing_replays(monkeypatch, crasher: bytes, calls: list, report: str = SEGV_ELSEWHERE) -> None:
+    """A fake libFuzzer that stops on the first replayed file whose content is `crasher`, printing `report`."""
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
@@ -534,7 +534,7 @@ def _crashing_replays(monkeypatch, crasher: bytes, calls: list) -> None:
         replayed = sorted(Path(cmd[-1]).iterdir())
         if any(p.read_bytes() == crasher for p in replayed):
             (prefix / "crash-0123").write_bytes(crasher)
-            out = SEGV_ELSEWHERE + f"Test unit written to {prefix}/crash-0123\n" + COVERAGE_DUMP
+            out = report + f"Test unit written to {prefix}/crash-0123\n" + COVERAGE_DUMP
             return SandboxResult(1, "", out, False, "rlimits", list(cmd))
         stats = f"COVERED_FUNC: hits: 2 edges: 1/1 mnl_attr_get_len {_G}:686\n"
         return SandboxResult(
@@ -597,3 +597,210 @@ def test_guardrail_gives_up_after_too_many_crashing_inputs(tmp_path, monkeypatch
     )
     assert verdict["status"] == "guardrail_error"
     assert len(verdict["excluded_inputs"]) == 1 and "More than 1 replayed inputs" in verdict["reason"]
+
+
+# ---------------------------------------------------------------------------
+# E-ACSL failures outside the checked functions (minmea run-1, Phase 3, 2026-11-14)
+# ---------------------------------------------------------------------------
+
+# `minmea_tocoord` is a header `static inline` Frama-C does not know (`rte_select_dropped`), so the guardrail
+# build instrumented the whole module and every replay stopped on the known signed overflow of `minmea_scan`.
+# The stack and the values are the run's `runtime_trace` (frames trimmed); the trace is cut to its last 4000
+# characters, so the four lines before the values follow the layout of a Docker replay of the same build.
+_MINMEA_C = "agents/prove-minmea_tocoord/scratch/work/minmea.c"
+_MINMEA_I = "/framac-run/agents/prove-minmea_tocoord/scratch/guard_minmea_tocoord.instrumented.c"
+_MINMEA_STACK = f"""==131== ERROR: libFuzzer: deadly signal
+    #0 0x5aff4df7c758 in __sanitizer_print_stack_trace (/framac-run/guard_minmea_tocoord.e-acsl+0x7f758)
+    #1 0x5aff4df4f32c in fuzzer::PrintStackTrace() (/framac-run/guard_minmea_tocoord.e-acsl+0x5232c)
+    #2 0x5aff4df342a7 in fuzzer::Fuzzer::CrashCallback() (/framac-run/guard_minmea_tocoord.e-acsl+0x372a7)
+    #3 0x7b00d5d3ed6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f)
+    #4 0x7b00d5d9369b  (/lib/x86_64-linux-gnu/libc.so.6+0x9469b)
+    #5 0x7b00d5d3ec41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)
+    #6 0x5aff4df8644d in minmea_scan {_MINMEA_I}:8593:25
+    #7 0x5aff4dfa440f in minmea_parse_gll {_MINMEA_I}:29292:9
+    #8 0x5aff4dfaf079 in LLVMFuzzerTestOneInput {_MINMEA_I}:36924:5
+    #9 0x5aff4df359aa in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/w/g+0x389aa)
+NOTE: libFuzzer has rudimentary signal handlers.
+SUMMARY: libFuzzer: deadly signal
+"""
+EACSL_RTE_ELSEWHERE = (
+    "INFO: Running with entropic power schedule (0xFF, 100).\n"
+    f"{_MINMEA_C}: In function 'minmea_scan'\n"
+    f"{_MINMEA_C}:186: Error: Assertion failed:\n"
+    "\tThe failing predicate is:\n"
+    "\trte/signed_overflow:\n"
+    "\t\tscale * 10 ≤ 2147483647.\n"
+    "\tWith values at failure point:\n"
+    "\t- scale: 1000000000\n" + _MINMEA_STACK
+)
+# The same build at HEAD in Docker (2026-11-14): an annotation-side failure in the same unchecked function.
+EACSL_ANNOTATION_ELSEWHERE = (
+    f"{_MINMEA_C}: In function 'minmea_scan'\n"
+    f"{_MINMEA_C}:224: Error: E-ACSL RTE failed:\n"
+    "\tThe failing predicate is:\n"
+    "\tuninitialized:\n"
+    "\t\t\\initialized(&endptr).\n"
+    "\tWith values at failure point:\n"
+    "\t- uninitialized: \\initialized(&endptr): 0\n" + _MINMEA_STACK.replace("minmea_parse_gll", "minmea_parse_gsa")
+)
+# A precondition of the checked function itself, failing in its E-ACSL wrapper.
+EACSL_CONTRACT_OF_CHECKED = (
+    f"{_MINMEA_C}: In function 'minmea_tocoord'\n"
+    f"{_MINMEA_C}:95: Error: Precondition failed:\n"
+    "\tThe failing predicate is:\n"
+    "\tf->scale > 0.\n"
+    + _MINMEA_STACK.replace("in minmea_scan ", "in __gen_e_acsl_minmea_tocoord ").replace(
+        "in minmea_parse_gll ", "in minmea_parse_rmc "
+    )
+)
+MINMEA_CRASHER = b"$GPGLL,.0000000000"
+
+
+def _minmea_guardrail(
+    tmp_path: Path, monkeypatch, report: str, functions: list[str], calls: list, crashers: int = 1
+) -> dict:
+    corpus = _corpus(tmp_path)
+    for i in range(crashers):
+        (corpus / ("seed-gll-scale" + f"-{i}" * (i > 0))).write_bytes(MINMEA_CRASHER)
+    _crashing_replays(monkeypatch, MINMEA_CRASHER, calls, report)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    return R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 0, use_cache=False, module="minmea", seed=1, functions=functions
+    )
+
+
+def test_eacsl_failure_outside_the_checked_functions_is_named():
+    failure = R.parse_eacsl_failure(EACSL_RTE_ELSEWHERE)
+    assert failure == {  # the `failure` of the run's guard_minmea_tocoord.json
+        "file": _MINMEA_C,
+        "line": 186,
+        "function": "minmea_scan",
+        "kind": "assertion",
+        "alarm_kind": "signed_overflow",
+        "is_rte": True,
+        "label": "rte/signed_overflow",
+        "predicate": "scale * 10 ≤ 2147483647",
+    }
+    why = R.failure_outside_checked_functions(failure, EACSL_RTE_ELSEWHERE, ["minmea_tocoord"])
+    assert why is not None and "rte/signed_overflow" in why and why.endswith(f"{_MINMEA_C}:186 in minmea_scan")
+
+
+@pytest.mark.parametrize("checked", [["minmea_scan"], ["minmea_parse_gll"], ["__no_such__", "minmea_scan"], [], None])
+def test_eacsl_failure_in_or_below_a_checked_function_or_unknown_scope_is_not_excused(checked):
+    failure = R.parse_eacsl_failure(EACSL_RTE_ELSEWHERE)
+    assert R.failure_outside_checked_functions(failure, EACSL_RTE_ELSEWHERE, checked) is None
+
+
+def test_eacsl_failure_without_a_stack_or_a_named_function_is_not_excused():
+    failure = R.parse_eacsl_failure(EACSL_RTE_ELSEWHERE)
+    stackless = EACSL_RTE_ELSEWHERE.split("==131==")[0]
+    assert R.failure_outside_checked_functions(failure, stackless, ["minmea_tocoord"]) is None
+    assert failure is not None
+    unnamed = {**failure, "function": "unknown_function"}
+    assert R.failure_outside_checked_functions(unnamed, EACSL_RTE_ELSEWHERE, ["minmea_tocoord"]) is None
+    assert R.failure_outside_checked_functions(None, EACSL_RTE_ELSEWHERE, ["minmea_tocoord"]) is None
+    wrapper = EACSL_RTE_ELSEWHERE.replace("in minmea_parse_gll ", "in __gen_e_acsl_minmea_tocoord ")
+    assert R.failure_outside_checked_functions(failure, wrapper, ["minmea_tocoord"]) is None
+
+
+@pytest.mark.parametrize(
+    ("report", "label"),
+    [(EACSL_RTE_ELSEWHERE, "rte/signed_overflow"), (EACSL_ANNOTATION_ELSEWHERE, "uninitialized")],
+    ids=["code_fault", "rejected_overconstrained"],
+)
+def test_guardrail_drops_an_input_whose_eacsl_failure_is_in_another_function(
+    tmp_path, monkeypatch, chdir_tmp, report, label
+):
+    # Before the fix: `code_fault` / `rejected_overconstrained` against the contract of minmea_tocoord.
+    assert R.classify_guardrail(77, False, report)["status"] in ("code_fault", "rejected_overconstrained")
+    calls: list = []
+    verdict = _minmea_guardrail(tmp_path, monkeypatch, report, ["minmea_tocoord"], calls)
+    assert verdict["status"] == "passed_dynamic_oracle"
+    assert len(calls) == 2
+    (dropped,) = verdict["excluded_inputs"]
+    assert dropped["input"] == "seed-gll-scale" and "in minmea_scan" in dropped["crash"]
+    # The failure stays visible in the report, with the fingerprint a code fault has.
+    assert dropped["failure"]["function"] == "minmea_scan" and dropped["failure"]["label"] == label
+    assert ("fingerprint" in dropped) == (label == "rte/signed_overflow")
+    assert any("outside the checked functions" in h and "minmea_scan" in h for h in verdict["diagnostic_hints"])
+
+
+@pytest.mark.parametrize("checked", [["minmea_scan"], ["minmea_parse_gll"]], ids=["inside", "callee_of_checked"])
+def test_guardrail_keeps_the_code_fault_in_or_below_a_checked_function(tmp_path, monkeypatch, chdir_tmp, checked):
+    calls: list = []
+    verdict = _minmea_guardrail(tmp_path, monkeypatch, EACSL_RTE_ELSEWHERE, checked, calls)
+    assert verdict["status"] == "code_fault" and verdict["excluded_inputs"] == []
+    assert verdict["failure"]["function"] == "minmea_scan" and len(calls) == 1
+    assert "outside_checked_functions" not in verdict
+
+
+def test_guardrail_keeps_a_contract_violation_of_the_checked_function(tmp_path, monkeypatch, chdir_tmp):
+    calls: list = []
+    verdict = _minmea_guardrail(tmp_path, monkeypatch, EACSL_CONTRACT_OF_CHECKED, ["minmea_tocoord"], calls)
+    assert verdict["status"] == "rejected_overconstrained" and verdict["excluded_inputs"] == []
+    assert verdict["failure"]["function"] == "minmea_tocoord" and len(calls) == 1
+
+
+def test_guardrail_never_blames_the_contract_past_the_exclusion_limit(tmp_path, monkeypatch, chdir_tmp):
+    monkeypatch.setattr(R, "GUARDRAIL_MAX_EXCLUDED_INPUTS", 1)
+    calls: list = []
+    verdict = _minmea_guardrail(tmp_path, monkeypatch, EACSL_RTE_ELSEWHERE, ["minmea_tocoord"], calls, crashers=2)
+    assert verdict["status"] == "guardrail_error" and verdict["failure"] is None and len(calls) == 2
+    assert len(verdict["excluded_inputs"]) == 1 and "More than 1 replayed inputs" in verdict["reason"]
+    assert verdict["outside_checked_functions"]["failure"]["function"] == "minmea_scan"
+
+
+def _mutation_guardrail(tmp_path: Path, monkeypatch, functions: list[str], calls: list, always: bool = False) -> dict:
+    """
+    A guardrail whose fake libFuzzer stops on an input no corpus file holds, with the minmea_scan overflow:
+    a mutation of the `--extra-runs` burst (only when `-runs` is not 0), or with `always` on every replay.
+    This is the minmea case: 64 of 223 corpus inputs replayed, and the fault came from a generated unit.
+    """
+    corpus = _corpus(tmp_path)
+    monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if always or "-runs=0" not in cmd:
+            prefix = Path(next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1])
+            (prefix / "crash-0123").write_bytes(MINMEA_CRASHER)
+            out = EACSL_RTE_ELSEWHERE + f"Test unit written to {prefix}/crash-0123\n"
+            return SandboxResult(77, "", out, False, "rlimits", list(cmd))
+        return SandboxResult(0, "stat::number_of_executed_units: 6\n", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    return R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 100, use_cache=False, module="minmea", seed=1, functions=functions
+    )
+
+
+def test_guardrail_skips_the_mutation_burst_when_a_mutation_fails_in_another_function(tmp_path, monkeypatch, chdir_tmp):
+    calls: list = []
+    verdict = _mutation_guardrail(tmp_path, monkeypatch, ["minmea_tocoord"], calls)
+    assert verdict["status"] == "passed_dynamic_oracle" and verdict["excluded_inputs"] == []
+    assert ["-runs=100" in c for c in calls] == [True, False] and "-runs=0" in calls[1]
+    skipped = verdict["mutations_skipped"]
+    assert skipped["crash_input"] == "scratch/crash-0123" and "in minmea_scan" in skipped["crash"]
+    assert skipped["failure"]["label"] == "rte/signed_overflow" and skipped["fingerprint"]
+    assert any("mutation burst was skipped" in h for h in verdict["diagnostic_hints"])
+
+
+def test_guardrail_keeps_the_code_fault_of_a_mutation_in_a_checked_function(tmp_path, monkeypatch, chdir_tmp):
+    calls: list = []
+    verdict = _mutation_guardrail(tmp_path, monkeypatch, ["minmea_scan"], calls)
+    assert verdict["status"] == "code_fault" and len(calls) == 1
+    assert "mutations_skipped" not in verdict and "outside_checked_functions" not in verdict
+
+
+def test_guardrail_never_blames_the_contract_for_an_input_it_cannot_drop(tmp_path, monkeypatch, chdir_tmp):
+    # Still failing elsewhere without mutations, on an input that is no replayed corpus file: nothing to drop.
+    calls: list = []
+    verdict = _mutation_guardrail(tmp_path, monkeypatch, ["minmea_tocoord"], calls, always=True)
+    assert verdict["status"] == "guardrail_error" and verdict["failure"] is None and len(calls) == 2
+    assert verdict["excluded_inputs"] == [] and "cannot be dropped" in verdict["reason"]
+    outside = verdict["outside_checked_functions"]
+    assert outside["failure"]["label"] == "rte/signed_overflow" and outside["fingerprint"]
+    assert len(verdict["diagnostic_hints"]) == 1 and "NOT a code_fault" in verdict["diagnostic_hints"][0]
