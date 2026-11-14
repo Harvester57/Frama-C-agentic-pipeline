@@ -31,9 +31,15 @@ Modes:
    Past `--max-corpus-inputs`, every promoted seed-* / crash-* file is replayed and the rest is
    a deterministic sample; `corpus_total`, `corpus_replayed`, `corpus_sampled` and
    `corpus_empty` say what was replayed. A pass on an empty corpus is not a pass on real inputs.
-   A replayed input that crashes outside the checked functions with no E-ACSL report (a seed that
-   reproduces a known bug elsewhere in the module) is dropped and the rest replayed again, at most
-   GUARDRAIL_MAX_EXCLUDED_INPUTS times; `excluded_inputs` lists each with its crash.
+   A replayed input that crashes outside the checked functions (a seed that reproduces a known bug
+   elsewhere in the module), with no E-ACSL report or with an E-ACSL failure in a function that is
+   not checked and was not reached through one, is dropped and the rest replayed again, at most
+   GUARDRAIL_MAX_EXCLUDED_INPUTS times; `excluded_inputs` lists each with its crash (and the E-ACSL
+   `failure` and `fingerprint`). Such a failure is never a `code_fault` or `rejected_overconstrained`
+   of the contract under check. When the input is a mutation of the burst, not a corpus file, the
+   corpus is replayed again without mutations and `mutations_skipped` holds the crash. When the
+   input still cannot be dropped, or past the limit, the status is `guardrail_error` and
+   `outside_checked_functions` holds the failure.
 3. `selftest`: builds the bundled canary through the production path (never cached).
 4. `build`: compiles a module's fuzz binary only (no target code runs). Used by Make.
 5. `replay`: replays given inputs once each on a given or built binary. The report's
@@ -2202,6 +2208,19 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "It is not evidence that the contract holds on real inputs; the merged proof records it as an "
                 "open assumption."
             )
+        dropped = [e for e in res.get("excluded_inputs") or [] if e.get("failure")]
+        if dropped:
+            passed_hints.append(
+                f"{len(dropped)} replayed input(s) were dropped because a check failed outside the checked "
+                f"functions (the first: {dropped[0].get('crash')}). That is a defect candidate or an alarm in "
+                "other code, not evidence about this contract; `excluded_inputs` lists each one."
+            )
+        if res.get("mutations_skipped"):
+            passed_hints.append(
+                "The mutation burst was skipped: a mutated input crashed outside the checked functions "
+                f"({res['mutations_skipped'].get('crash')}), which says nothing about this contract. "
+                "This pass replayed the corpus only."
+            )
         unreached = (res.get("reach") or {}).get("unreached") or []
         if unreached:
             passed_hints.append(
@@ -2273,6 +2292,15 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
             f"RTE assertion failed at runtime on a real input ({loc}, predicate={failure.get('predicate')!r}): "
             "this is a code defect candidate, NOT a contract error. Do NOT weaken your ACSL contracts to hide it; "
             "stop synthesis and return status 'blocked' (or 'failed' for architect) with this guardrail report in 'evidence'."
+        )
+        return hints
+
+    if status == "guardrail_error" and res.get("outside_checked_functions"):
+        _add(
+            f"A check failed outside the checked functions ({res['outside_checked_functions'].get('crash')}): "
+            "this says nothing about your contract, and it is NOT a code_fault of the function under proof. "
+            "Do not change your ACSL contracts for it; the replay stopped there, so the contract was not tested "
+            "on the remaining inputs."
         )
         return hints
 
@@ -2404,17 +2432,53 @@ def crash_outside_checked_functions(output: str, functions: list[str] | None) ->
     """
     if not functions or parse_eacsl_failure(output) is not None:
         return None
+    headline = _crash_headline_outside(output, functions)
+    if headline is None:
+        return None
+    summary = _SANITIZER_SUMMARY_RE.search(output, headline.start())
+    text = summary.group("summary") if summary else headline.group(0)
+    return re.sub(r"\s+", " ", text).strip()[:300]
+
+
+def _checked_names(functions: list[str]) -> set[str]:
+    """The checked functions and their E-ACSL wrappers (`__gen_e_acsl_<fn>`)."""
+    return set(functions) | {f"__gen_e_acsl_{fn}" for fn in functions}
+
+
+def _crash_headline_outside(output: str, functions: list[str]) -> re.Match[str] | None:
+    """The crash headline of a replay (not a timeout or an out-of-memory) whose stack has no checked function."""
     headline = _REPLAY_CRASH_RE.search(output or "")
     if headline is None or re.search(r"timeout|out-of-memory", headline.group(0), re.IGNORECASE):
         return None
     frames = [m.group("function") for m in _STACK_FRAME_FN_RE.finditer(output, headline.start())]
-    if not frames:
+    if not frames or any(name in _checked_names(functions) for name in frames):
         return None
-    checked = set(functions) | {f"__gen_e_acsl_{fn}" for fn in functions}
-    if any(name in checked for name in frames):
+    return headline
+
+
+def failure_outside_checked_functions(failure: dict | None, output: str, functions: list[str] | None) -> str | None:
+    """
+    The E-ACSL failure a guardrail replay stopped on, as one line, when it says nothing about the contract; else None.
+
+    That is the case when E-ACSL names the function of the failed check, that function is not a checked
+    function or its wrapper, and no frame of the stack libFuzzer printed is one either. `-rte-select` and
+    `-e-acsl-functions` normally keep other functions uninstrumented, but a checked function Frama-C does not
+    know (a header `static inline` nothing in the translation unit calls: `rte_select_dropped`) drops the
+    selection and the whole module is instrumented (minmea `minmea_tocoord`: every replay stopped on the
+    known signed overflow of `minmea_scan`). A failure below a checked function (a callee it reached) is
+    kept: the checked function may have caused it. Without `functions`, a named function or a stack,
+    nothing is excused.
+    """
+    if not functions or not failure:
         return None
-    summary = _SANITIZER_SUMMARY_RE.search(output, headline.start())
-    text = summary.group("summary") if summary else headline.group(0)
+    function = str(failure.get("function") or "")
+    if function in ("", "unknown", "unknown_function") or function in _checked_names(functions):
+        return None
+    if _crash_headline_outside(output, functions) is None:
+        return None
+    what = failure.get("label") or failure.get("alarm_kind") or failure.get("kind") or "check"
+    where = f"{failure.get('file')}:{failure.get('line')} in {function}"
+    text = f"E-ACSL {what}: {failure.get('predicate') or ''} at {where}"
     return re.sub(r"\s+", " ", text).strip()[:300]
 
 
@@ -2514,6 +2578,7 @@ def run_guardrail_check(
     use_verdict_cache: bool = True,
     max_corpus_inputs: int = 64,
     functions: list[str] | None = None,
+    contract_functions: list[str] | None = None,
 ) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
@@ -2526,6 +2591,12 @@ def run_guardrail_check(
 
     A pass only says that no replayed input broke a check. `reach` records how often each of
     `functions` ran: a contract on a function no input reached was not tested at all.
+
+    A failure outside `functions` is not held against the contract (failure_outside_checked_functions).
+    `contract_functions` are the functions whose annotations the build is limited to (`--functions`;
+    default `functions`): a failed annotation is only excused outside them, so a module-wide build that
+    only measures the reach of `functions` (`--reach-functions`, an empty list here) excuses RTE
+    failures of other code but never a failed annotation.
 
     When caching is enabled (`scripts/cache.py`), deterministic passing verdicts
     (`passed_dynamic_oracle`) are cached in the run-local `guardrail` namespace
@@ -2589,14 +2660,16 @@ def run_guardrail_check(
     # A replay stops at its first crash. An input that crashes outside the checked functions says nothing about
     # the contract: drop it and replay the rest (crash_outside_checked_functions), at most a few times.
     replay_names = list(chosen_names)
-    excluded: list[dict[str, str]] = []
+    excluded: list[dict] = []
+    mutation_runs = runs
+    mutations_skipped: dict | None = None
     while True:
         replay_dir = corpus_dir
         if sampled or excluded:
             replay_dir = _stage_replay_corpus(scratch_dir, corpus_dir, replay_names)
         cmd = [
             str(binary.resolve()),
-            f"-runs={runs}",
+            f"-runs={mutation_runs}",
             f"-timeout={per_input_timeout}",
             f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
             f"-seed={seed}",
@@ -2615,25 +2688,51 @@ def run_guardrail_check(
             if verdict["status"] == "passed_dynamic_oracle"
             else guardrail_crash_input(scratch_dir, artifacts_before, combined_out)
         )
-        if (
-            verdict["status"] != "guardrail_error"
-            or verdict.get("failure") is not None
-            or verdict.get("unsound")
-            or res.timed_out
-        ):
+        if verdict["status"] == "passed_dynamic_oracle" or verdict.get("unsound") or res.timed_out:
             break
-        why = crash_outside_checked_functions(combined_out, functions)
+        failure = verdict.get("failure")
+        if failure is not None:
+            scope = functions if verdict["status"] == "code_fault" or contract_functions is None else contract_functions
+            why = failure_outside_checked_functions(failure, combined_out, scope)
+        elif verdict["status"] == "guardrail_error":
+            why = crash_outside_checked_functions(combined_out, functions)
+        else:
+            why = None
+        if why is None:
+            break
+        outside: dict = {"crash": why}
+        if failure is not None:
+            # A check that failed in other code is neither a `code_fault` nor a refutation of this contract.
+            # Unless the input is dropped below, the replay stopped before testing the contract on the rest.
+            outside["failure"] = failure
+            if verdict.get("fingerprint"):
+                outside["fingerprint"] = verdict["fingerprint"]
+            verdict = {
+                "status": "guardrail_error",
+                "reason": (
+                    f"A check failed outside the checked functions ({why}) on an input that cannot be dropped "
+                    "(not a replayed corpus file); the contract was not tested on the rest."
+                ),
+                "outside_checked_functions": outside,
+                "failure": None,
+            }
         still = set(replay_names)
-        name = _replayed_input_of(crash_input, [e for e in replay_manifest if e[0] in still]) if why else None
-        if why is None or name is None:
-            break
+        name = _replayed_input_of(crash_input, [e for e in replay_manifest if e[0] in still])
+        if name is None:
+            if failure is None or crash_input is None or mutation_runs <= 0:
+                break
+            # Not a corpus file: a mutation of the burst. The seed is fixed, so the burst would stop there
+            # every time; replay the corpus alone and say so (`mutations_skipped`).
+            mutations_skipped = {"crash_input": crash_input, **outside}
+            mutation_runs = 0
+            continue
         if len(excluded) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
             verdict["reason"] = (
                 f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} replayed inputs crash outside the checked functions "
                 f"(the last: {why}); the contract was not tested on the rest."
             )
             break
-        excluded.append({"input": name, "crash": why})
+        excluded.append({"input": name, **outside})
         replay_names.remove(name)
     verdict.update(
         {
@@ -2649,6 +2748,8 @@ def run_guardrail_check(
             **selection,
         }
     )
+    if mutations_skipped is not None:
+        verdict["mutations_skipped"] = mutations_skipped
     if verdict["status"] != "passed_dynamic_oracle":
         verdict["runtime_trace"] = combined_out[-4000:]
     verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(verdict)
@@ -4967,6 +5068,7 @@ def main(argv: list[str] | None = None) -> int:
                     use_verdict_cache=use_verdict_cache,
                     max_corpus_inputs=args.max_corpus_inputs,
                     functions=args.reach_functions if args.reach_functions else args.functions,
+                    contract_functions=args.functions or [],
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
                 if "diagnostic_hints" not in res:
