@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,7 @@ def test_checkout_steps_disable_persist_credentials_and_jobs_set_timeouts() -> N
         assert _jobs_missing(job_lines, "permissions:") == [], f"{wf.name}: every job must declare job permissions"
 
 
-def _job_bodies(lines: list[str]) -> dict[str, list[str]]:
+def _job_bodies(lines: Sequence[str]) -> dict[str, list[str]]:
     """
     The lines of each job of a workflow, by job id. The jobs are the keys one level under `jobs:`, at
     whatever indent the file uses there (the first key's), with or without a trailing comment.
@@ -86,9 +87,10 @@ def _job_bodies(lines: list[str]) -> dict[str, list[str]]:
         if indent == job_indent:
             m_job = re.fullmatch(r"([A-Za-z0-9_-]+):\s*(#.*)?", stripped)
             assert m_job is not None, f"unreadable job line: {line!r}"
-            current_job = m_job.group(1)
-            assert current_job not in job_lines, f"job {current_job} defined twice"
-            job_lines[current_job] = []
+            job: str = m_job.group(1)
+            assert job not in job_lines, f"job {job} defined twice"
+            job_lines[job] = []
+            current_job = job
         else:
             assert indent > job_indent and current_job is not None, f"line outside a job: {line!r}"
             job_lines[current_job].append(line)

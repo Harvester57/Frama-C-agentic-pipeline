@@ -96,7 +96,9 @@ def unit(file, function, cls, status="planned", **kw):
     return u
 
 
-def evidence(phase="eva", result="eva_all_valid", discharging=True, tool_output="workspace/reports/eva/snmp.json"):
+def evidence(
+    phase="eva", result="eva_all_valid", discharging=True, tool_output: str | None = "workspace/reports/eva/snmp.json"
+):
     return {
         "phase": phase,
         "producer": "run_eva_slice.py",

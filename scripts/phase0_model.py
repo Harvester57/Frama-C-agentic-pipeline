@@ -499,7 +499,7 @@ def gcc_callgraph(job: dict, tree: str, snapshot_root: str | None, log_dir: Path
                 if labels.get(dst) == "Indirect Call Placeholder":
                     indirect.append(ids[src])
                 else:
-                    edges.append((ids[src], ids.get(dst), labels.get(dst, dst)))
+                    edges.append((ids[src], ids.get(dst), labels.get(dst, str(dst))))
     _write_log(log_dir, job["key"], "gcc", None, "\n".join(logs))
     status = "ok" if not errors else ("partial" if functions else "failed")
     return {"status": status, "errors": errors, "functions": functions, "edges": edges, "indirect": indirect}

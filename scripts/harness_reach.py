@@ -382,6 +382,7 @@ def check_module(
     tier = mod_info.get("tier")
     target_fuzzer = sidecar.get("target_fuzzer")
     fuzzer_text: str | None = None
+    src: Path | None = None
     tf_row: dict[str, Any] = {}
     if isinstance(target_fuzzer, dict):
         src = phase0_gates.target_fuzzer_source(run_dir, sidecar)

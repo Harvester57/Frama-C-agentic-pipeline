@@ -301,7 +301,7 @@ def test_api_sidecars_validate_and_keep_scope_files_through_api_regeneration(tmp
 
 def test_api_cli_passes_scope_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    paths = _api_inputs(tmp_path)
+    _api_inputs(tmp_path)
     seen: dict = {}
 
     def fake_generate(**kw: Any) -> dict:
@@ -313,7 +313,6 @@ def test_api_cli_passes_scope_file(tmp_path, monkeypatch):
     assert seen["scope_files"] == ["lib.c"]
     assert gh.main(["--api", "--module", "crypto"]) == 0
     assert seen["scope_files"] is None  # kept from the previous sidecar by generate
-    assert paths
 
 
 def test_infer_unit_votes_by_dag_key_not_plain_name():

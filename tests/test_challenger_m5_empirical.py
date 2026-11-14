@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -171,14 +172,13 @@ class TestParseMemEmpirical:
             "assert not pipeline_mods, f'Forbidden imports found: {pipeline_mods}'\n"
             "print('ZERO_PIPELINE_IMPORTS_OK')\n"
         )
+        scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
         res = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
-            cwd=str(pat.Path(__file__).resolve().parent.parent / "scripts")
-            if hasattr(pat, "Path")
-            else None,
-            env={"PYTHONPATH": "scripts", "PYTHONIOENCODING": "utf-8"},
+            cwd=str(scripts_dir),
+            env={"PYTHONPATH": str(scripts_dir), "PYTHONIOENCODING": "utf-8"},
             check=True,
         )
         assert "ZERO_PIPELINE_IMPORTS_OK" in res.stdout

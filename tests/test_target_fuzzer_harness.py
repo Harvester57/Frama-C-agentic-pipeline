@@ -317,7 +317,7 @@ def test_extra_dictionary_is_merged_into_the_auto_dictionary(tmp_path: Path, mon
     extra.parent.mkdir(parents=True)
     extra.write_text('# shipped\n"PUT"\nkw1="HEAD"\n\n"PUT"\n', encoding="utf-8")
     path, info = R.resolve_campaign_dictionary(None, ["a.c"], "mod", tmp_path / "corpus")
-    assert path == Path("workspace/dicts/mod.dict")
+    assert path is not None and path == Path("workspace/dicts/mod.dict")
     assert path.read_text(encoding="utf-8") == '"GET"\n"PUT"\nkw1="HEAD"\n'
     assert info["extra_entries"] == 1 and info["entries"] == 3
 

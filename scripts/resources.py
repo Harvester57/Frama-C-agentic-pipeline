@@ -1888,7 +1888,7 @@ def _lock_fd(fd: int, blocking: bool) -> bool:
             if exc.errno in (errno.EAGAIN, errno.EACCES):
                 return False
             raise
-    if msvcrt is not None:
+    if sys.platform == "win32" and msvcrt is not None:
         try:
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -1937,7 +1937,7 @@ class FileLock:
         try:
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
-            elif msvcrt is not None:
+            elif sys.platform == "win32" and msvcrt is not None:
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         except OSError:

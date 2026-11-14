@@ -380,6 +380,7 @@ def _parse_c_param(raw_param: str, index: int) -> dict[str, Any]:
             array = array_m.group(0).strip()
         else:
             full_type = clean
+            pointee_type = clean  # no array dims: recomputed from full_type below
             array = ""
         name = f"arg_{index}"
         stars = "*" if "*" in full_type else ""

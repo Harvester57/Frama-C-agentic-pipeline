@@ -1300,7 +1300,7 @@ def diagnose(log: str, packages_not_installed: list[str] | None = None) -> dict:
         candidates.append(CMAKE_PACKAGES.get(low, f"lib{low.removeprefix('lib')}-dev"))
     for lib in _LIB_MISSING_RE.findall(log):
         candidates.append(LIB_PACKAGES.get(lib, f"lib{lib}-dev"))
-    commands = list(dict.fromkeys(a or b for a, b in _COMMAND_MISSING_RE.findall(log)))
+    commands: list[str] = list(dict.fromkeys(a or b for a, b in _COMMAND_MISSING_RE.findall(log)))
     for cmd in commands:
         candidates.append(COMMAND_PACKAGES.get(cmd, cmd))
     return {
@@ -1725,6 +1725,9 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
     if jobs > 1 and not {"MAKEFLAGS", "CMAKE_BUILD_PARALLEL_LEVEL"} & set(recipe["env"]):
         plan.append(1)
     attempts: list[dict] = []
+    # `plan` always holds at least one job count, so the loop below always sets both.
+    res: Any = None
+    build_seconds = 0.0
     log = ""
     for n, j in enumerate(plan):
         if n:

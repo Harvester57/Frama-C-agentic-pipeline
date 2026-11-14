@@ -194,9 +194,10 @@ BRIEF_RENDER_KEYS: tuple[str, ...] = (
 
 def placeholder_re(keys: Iterable[str] | None = None) -> re.Pattern[str]:
     """Derive prompt placeholder regex dynamically from the render keys."""
-    if keys is None:
-        keys = getattr(workspace_overlay, "BRIEF_RENDER_KEYS", BRIEF_RENDER_KEYS)
-    escaped = "|".join(re.escape(k) for k in sorted(keys))
+    render_keys: Iterable[str] = (
+        keys if keys is not None else getattr(workspace_overlay, "BRIEF_RENDER_KEYS", BRIEF_RENDER_KEYS)
+    )
+    escaped = "|".join(re.escape(k) for k in sorted(render_keys))
     return re.compile(rf"\{{({escaped})\}}")
 
 

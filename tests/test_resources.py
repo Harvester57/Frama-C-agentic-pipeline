@@ -244,12 +244,15 @@ def test_topology_and_whole_core_allocator_on_two_numa_nodes(tmp_path):
     taken: set[int] = set()
     first = R.allocate_cpuset(topo, range(16), taken, 4)
     assert first == [0, 1, 8, 9]  # whole cores, lowest domain on a tie
+    assert first is not None
     taken |= set(first)
     second = R.allocate_cpuset(topo, range(16), taken, 3)
     assert second == [2, 3, 10, 11]  # rounded up to whole cores; best fit = fuller node 0
+    assert second is not None
     taken |= set(second)
     third = R.allocate_cpuset(topo, range(16), taken, 6)
     assert third == [4, 5, 6, 12, 13, 14]  # stays inside node 1
+    assert third is not None
     taken |= set(third)
     assert R.allocate_cpuset(topo, range(16), taken, 4) is None  # only one free core left
     # No single node has enough free cores: spread over the emptiest domains.

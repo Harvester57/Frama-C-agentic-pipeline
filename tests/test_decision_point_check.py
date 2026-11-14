@@ -143,10 +143,15 @@ def _check(run_dir: Path, patch: Path, dp: dict = DP, **kw) -> dict:
 # ------------------------------------------------------------------ the patch
 
 
+def _lines(text: str) -> list[str]:
+    """`text` split as the checker reads a file (typed `str`, so literals do not stay `LiteralString`)."""
+    return text.splitlines(keepends=True)
+
+
 def test_parse_and_apply_tolerates_a_shifted_hunk_and_keeps_crlf():
     text = "a\r\nb\r\nc\r\nd\r\n"
     (section,) = dpc.parse_unified_diff("--- a/x.c\n+++ b/x.c\n@@ -7,2 +7,3 @@\n c\n+new\n d\n")
-    out = dpc.apply_hunks(text.splitlines(keepends=True), section.hunks, "x.c")
+    out = dpc.apply_hunks(_lines(text), section.hunks, "x.c")
     assert "".join(out) == "a\r\nb\r\nc\r\nnew\r\nd\r\n"
 
 
@@ -158,7 +163,7 @@ def test_a_hunk_that_matches_nothing_does_not_apply():
 
 
 def test_changed_ranges_are_in_unpatched_line_numbers():
-    old = SOURCE.splitlines(keepends=True)
+    old = _lines(SOURCE)
     new = old[:5] + ["    if (n >= len)\n", "        return 0;\n"] + old[5:]
     (rng,) = dpc.changed_ranges(old, new, dpc.function_spans(SOURCE))
     assert (rng["kind"], rng["start"], rng["end"], rng["added"], rng["removed"]) == ("insert", 5, 6, 2, 0)

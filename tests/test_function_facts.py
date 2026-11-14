@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -251,7 +252,7 @@ def test_call_graph_is_usable_without_facts() -> None:
     assert graph["indirect_calls"] == {"g": ["fp"]}
 
 
-def _fake_run(ast_doc=None, compile_rc=0, framac_rc=0, framac_exc=None):
+def _fake_run(ast_doc=None, compile_rc=0, framac_rc=0, framac_exc=None) -> Any:
     calls = []
 
     def run(cmd, **kwargs):

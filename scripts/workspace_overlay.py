@@ -1437,7 +1437,8 @@ def _load_function_facts(overlay: Path, module: str | None, c_file: str | None, 
         return None
     mm = module_map_for(overlay)
     first = harness_module_for_function(mm, module, c_file, function)
-    for name in dict.fromkeys([module, *([first] if first else []), *harness_modules_of(mm, module)]):
+    candidates: list[str] = [module, *([first] if first else []), *harness_modules_of(mm, module)]
+    for name in dict.fromkeys(candidates):
         record = function_facts.load_function_facts(overlay, name, c_file, function)
         if record is not None:
             return record

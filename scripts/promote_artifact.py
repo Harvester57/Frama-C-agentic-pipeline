@@ -41,6 +41,7 @@ class PromotionError(ArtifactError):
 def _lstat_walk_no_symlinks(base_dir: Path, rel_path: str) -> os.stat_result:
     """Walk every path component from base_dir down to rel_path using lstat, rejecting symlinks."""
     current = base_dir
+    st: os.stat_result | None = None
     for part in rel_path.split("/"):
         current = current / part
         try:
@@ -49,6 +50,8 @@ def _lstat_walk_no_symlinks(base_dir: Path, rel_path: str) -> os.stat_result:
             raise PromotionError(f"cannot lstat {rel_path}: {exc}") from exc
         if stat.S_ISLNK(st.st_mode):
             raise PromotionError(f"symlink rejected along promotion path: {current}")
+    if st is None:  # str.split always yields at least one part
+        raise PromotionError(f"empty promotion path: {rel_path!r}")
     return st
 
 

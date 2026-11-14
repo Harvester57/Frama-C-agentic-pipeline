@@ -464,9 +464,8 @@ def apply_policy(dag: dict, step: Any, assets: dict | None = None) -> dict:
             for key, why in sorted(excluded.items()):
                 harness_reach.record_exempt(HARNESS_DIR, module, key, f"seeded harness policy: {why}", DAG)
         report[module] = info
-    if assets is None:
-        assets = benchmark.read_json(FUZZ_ASSETS, {}) or {}
-    for module, tf in plan_target_fuzzers(dag, assets, plans).items():
+    shipped: dict = assets if assets is not None else (benchmark.read_json(FUZZ_ASSETS, {}) or {})
+    for module, tf in plan_target_fuzzers(dag, shipped, plans).items():
         # Additive: no exemption either way (the gate checks the module's own roots, never the unit's).
         reason = str(tf.get("reason") or "")
         if not reason and not step(f"harness:{module}", target_fuzzer_argv(module, tf)):

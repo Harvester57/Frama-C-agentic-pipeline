@@ -668,13 +668,14 @@ def plan_recorder(model: dict) -> tuple[list[dict], dict[str, str]]:
     functions = model.get("functions") or {}
     seen: set[str] = set()
     # An executable's embedded API (a library compiled into it) is API too, as for trust and the DAG.
-    embedded = {
+    embedded: set[str] = {
         e
         for u in (model.get("units") or {}).values()
         if isinstance(u, dict) and not u.get("test")
         for e in u.get("embedded_api") or []
     }
-    for fid in sorted({*(model.get("entry_points") or []), *embedded}):
+    api_ids: set[str] = {*(model.get("entry_points") or []), *embedded}
+    for fid in sorted(api_ids):
         rec = functions.get(fid) or {}
         name = str(rec.get("name") or fid.split("#")[-1])
         if name == "main" or name in seen:

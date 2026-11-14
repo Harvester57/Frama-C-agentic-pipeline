@@ -369,7 +369,8 @@ def stale_outputs(root: Path) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    # `python -OO` strips docstrings.
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0] if __doc__ else None)
     parser.add_argument(
         "--root", type=Path, default=DEFAULT_ROOT, help="references directory (default: docs/references)"
     )

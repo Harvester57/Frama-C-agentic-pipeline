@@ -4764,6 +4764,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "minimize-interest":
         # Exit 0 iff the variant is still interesting (crashes with the same fingerprint).
+        if args.binary is None:  # required=True on this subcommand; argparse already refuses it
+            raise SystemExit("minimize-interest: --binary is required")
         interesting = minimize_interest(
             args.binary,
             args.variant,

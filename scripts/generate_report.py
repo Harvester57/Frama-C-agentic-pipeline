@@ -451,7 +451,8 @@ def trust_lines(model: dict | None) -> list[str]:
     for unit, u in sorted((model.get("units") or {}).items()):
         if u.get("test"):
             continue
-        for fid in dict.fromkeys([*(u.get("entry_points") or []), *(u.get("embedded_api") or [])]):
+        api: list[str] = [*(u.get("entry_points") or []), *(u.get("embedded_api") or [])]
+        for fid in dict.fromkeys(api):
             t = (functions.get(fid) or {}).get("trust")
             if not isinstance(t, dict):
                 continue

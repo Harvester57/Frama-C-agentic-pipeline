@@ -93,7 +93,7 @@ class TestClassifyReplay:
         assert classify_replay(None, EXPECTED)[0] == "tool_failure"
 
 
-def unit(cid="a.c#f::rte", status="planned", wave=0, cls="rte", evidence=()) -> dict:
+def unit(cid="a.c#f::rte", status="planned", wave: int | None = 0, cls="rte", evidence=()) -> dict:
     return {
         "coverage_id": cid,
         "status": status,
@@ -162,7 +162,7 @@ def bug_spec() -> dict:
     }
 
 
-def record(outcome="reproduced", gate="confirmed", reason=None) -> dict:
+def record(outcome="reproduced", gate: str | None = "confirmed", reason=None) -> dict:
     return {"outcome": outcome, "gate": gate, "reason": reason, "observed": {"fingerprint": "fp"}}
 
 

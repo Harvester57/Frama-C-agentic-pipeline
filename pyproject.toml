@@ -106,3 +106,12 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 module = ["pypdf", "pypdf.*"]
 ignore_missing_imports = true
+
+# The pipeline runs on Linux (inside the analysis/build containers), so check against Linux stubs
+# even when pyright is launched from a Windows or macOS checkout.
+[tool.pyright]
+include = ["scripts", "tests", "tools"]
+extraPaths = ["scripts", "tests", "tools"]
+pythonVersion = "3.10"
+pythonPlatform = "Linux"
+typeCheckingMode = "standard"

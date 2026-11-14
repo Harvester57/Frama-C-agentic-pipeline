@@ -1796,7 +1796,7 @@ def run_wp_on_function(
         # Diagnostic only: `cast` is the unsound model (WP manual, Section Memory models), so its result is never
         # promoted. It tells a memory-model limit from a contract that is simply too weak.
         try:
-            probe = run_wp_on_function(
+            probe: dict = run_wp_on_function(
                 c_file=c_file,
                 fn_name=fn_name,
                 out_dir=out_dir,

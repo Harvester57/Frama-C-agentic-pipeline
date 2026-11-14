@@ -33,6 +33,7 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -684,13 +685,13 @@ def validate_run_dir(run_dir: Path) -> Errors:
 def _validate_run_dir_core(run_dir: Path) -> Errors:
     errors = Errors()
     loaded = {}
-    validators: tuple[tuple[str, Any, bool], ...] = (
-        ("run-metadata.json", validate_metadata, False),
-        ("coverage-ledger.json", validate_ledger, True),
-        ("candidates.json", validate_candidates, False),
-        ("findings.json", validate_findings, True),
+    validators: tuple[tuple[str, Callable[[Any, Path], Errors]], ...] = (
+        ("run-metadata.json", lambda data, _run: validate_metadata(data)),
+        ("coverage-ledger.json", validate_ledger),
+        ("candidates.json", lambda data, _run: validate_candidates(data)),
+        ("findings.json", validate_findings),
     )
-    for name, fn, needs_run in validators:
+    for name, fn in validators:
         path = run_dir / name
         if not path.exists():
             if name in ("run-metadata.json", "coverage-ledger.json"):
@@ -702,7 +703,7 @@ def _validate_run_dir_core(run_dir: Path) -> Errors:
             errors.add(f"{name}: {exc}")
             continue
         loaded[name] = data
-        for e in fn(data, run_dir) if needs_run else fn(data):
+        for e in fn(data, run_dir):
             errors.add(f"{name}: {e}")
     if errors:
         return errors

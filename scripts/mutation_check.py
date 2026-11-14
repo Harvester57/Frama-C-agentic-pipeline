@@ -396,7 +396,7 @@ def check_function(
                 mut_file = tmp_path / c_file.name
                 mut_file.write_text(text[: span.start_byte] + new_span + text[span.end_byte :], encoding="utf-8")
                 try:
-                    report = runner(mut_file, fn, tmp_path / f"wp-{kind}-{name}", cppflags=cppflags)
+                    report: Any = runner(mut_file, fn, tmp_path / f"wp-{kind}-{name}", cppflags=cppflags)
                 except Exception as exc:
                     report = {"status": "error", "reason": str(exc)}
                 if not isinstance(report, dict):

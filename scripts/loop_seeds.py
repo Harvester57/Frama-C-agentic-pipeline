@@ -1100,7 +1100,7 @@ def _failure_text(wp: dict) -> str:
         "rejected_by_kernel": "the kernel rejected the clause",
         "not_proven": "not proven",
     }
-    return " and ".join(names.get(f, f) for f in wp.get("failed") or []) or "not proven"
+    return " and ".join(names.get(f, str(f)) for f in wp.get("failed") or []) or "not proven"
 
 
 def render(report: dict) -> str:

@@ -396,6 +396,7 @@ def eva_domains(extra_domains: list[str] | str | None = None, precision: int | N
     """`-eva-domains` value: the base domains plus extra ones (e.g. `taint`), deduplicated."""
     if isinstance(extra_domains, str):
         extra_domains = extra_domains.split(",")
+    domains: list[str]
     if precision is not None and precision < 2:
         domains = ["cvalue"]
     elif precision == 2:

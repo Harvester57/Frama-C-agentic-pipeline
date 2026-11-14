@@ -2062,8 +2062,11 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
         soundness = report.get("soundness", {})
         by_class = report.get("by_obligation_class", {})
         all_proven = report["status"] == "all_proven"
-        limits = report.get("limits")
-        limits_problem = wp_limits_problem(limits)
+        raw_limits = report.get("limits")
+        limits_problem = wp_limits_problem(raw_limits)
+        # Every branch that reads the limits is guarded by `all_proven` after the `limits_problem` branch,
+        # so it only runs on a dict; the fallback just keeps that visible to the type checker.
+        limits: dict = raw_limits if isinstance(raw_limits, dict) else {}
         unproven_by_class: dict[str, list[dict]] = {}
         for g in report.get("unproven_goals", []):
             unproven_by_class.setdefault(g.get("obligation_class", "rte"), []).append(g)
