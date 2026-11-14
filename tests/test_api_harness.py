@@ -146,8 +146,8 @@ def test_plan_covers_the_scope_and_skips_with_reasons():
 
 def test_a_translated_variadic_definition_is_skipped_as_variadic():
     # Frama-C's model of `bool scan(const char *sentence, const char *format, ...)`: no `...` in the
-    # signature, a last formal for the rest. A case would fuzz the format string and pass input
-    # bytes as the argument array.
+    # signature, a last formal for the rest. A case would call it as a three-parameter function: an
+    # empty format, and a pointer read from the input where the variable arguments go.
     scan: dict[str, Any] = {
         "signature": "_Bool(char *,char *,void **)",
         "formals": [
