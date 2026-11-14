@@ -22,6 +22,7 @@ def _harness(tmp_path: Path) -> Path:
     path = tmp_path / "harness_mod.c"
     path.write_text(
         "#include <stddef.h>\n#include <stdint.h>\n"
+        "#ifndef FRAMAC_FUZZ_REJECT\n#define FRAMAC_FUZZ_REJECT() ((void)0)\n#endif\n"
         f"int run(uint8_t *fuzz_buf, size_t fuzz_len) {{\n    {fuzz}\n    return 0;\n}}\n",
         encoding="utf-8",
     )
@@ -63,7 +64,9 @@ def _harness_n(tmp_path: Path, n: int) -> Path:
     _, fuzz = _build_invocations("f", "dispatch", dispatch_cases=cases)
     path = tmp_path / f"harness_{n}.c"
     path.write_text(
-        "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\nstatic int sink = -1;\n"
+        "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n"
+        "#ifndef FRAMAC_FUZZ_REJECT\n#define FRAMAC_FUZZ_REJECT() ((void)0)\n#endif\n"
+        "static int sink = -1;\n"
         f"static int run(uint8_t *fuzz_buf, size_t fuzz_len) {{\n    sink = -1;\n    {fuzz}\n    return sink;\n}}\n"
         "int main(void) {\n    for (int b = 0; b < 256; b++) {\n"
         '        uint8_t in[2] = {(uint8_t)b, 0};\n        printf("%d %d\\n", b, run(in, 2));\n    }\n'
@@ -391,3 +394,330 @@ def test_candidate_engine_of_a_dual_report_is_the_artifact_engine(tmp_path):
     assert R._candidate_engine({"fingerprint": "a", "tool_outputs": [str(report)]}) == "sanitizers"
     assert R._candidate_engine({"fingerprint": "b", "tool_outputs": [str(report)]}) == "eacsl"
     assert R._candidate_engine({"fingerprint": "c", "tool_outputs": [str(report)]}) == "auto"
+
+
+# --- zero-rebuild runtime dispatch-case skipping ---------------------------------------------
+
+
+def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
+    import os
+
+    from generate_harness import generate_module_harness
+
+    assert R.format_skip_cases_env([129, 0, 65, 300, 0]) == "0,65,129,300"
+    assert R.format_skip_cases_env(set()) == ""
+    assert R.harness_supports_runtime_skip_cases(None) is False
+
+    src = tmp_path / "mod.c"
+    src.write_text("int hit_case(unsigned int c) { return (int)c; }\n", encoding="utf-8")
+    hdr = tmp_path / "mod.h"
+    hdr.write_text("int hit_case(unsigned int c);\n", encoding="utf-8")
+
+    out_dir = tmp_path / "harnesses"
+    cases = [f"(void)hit_case({i}U);" for i in range(200)]
+    res = generate_module_harness(
+        module_name="mod",
+        sources=[str(src)],
+        header_include=str(hdr),
+        entry_fn="hit_case",
+        max_input_size=64,
+        cppflags=f"-I{tmp_path.as_posix()}",
+        out_dir=out_dir,
+        entry_style="dispatch",
+        dispatch_cases=cases,
+        auto_prelude=False,
+    )
+    harness_c = Path(res["harness_file"])
+    text = harness_c.read_text(encoding="utf-8")
+    assert "#define FRAMAC_FUZZ_RUNTIME_SKIP_CASES 1" in text
+    assert "framac_fuzz_skip_case(" in text
+    assert R.harness_supports_runtime_skip_cases(harness_c) is True
+    assert R.harness_supports_runtime_skip_cases([str(src), str(harness_c)]) is True
+
+    # Non-dispatch harnesses and legacy dispatch harnesses without the runtime helper return False.
+    plain_dir = tmp_path / "plain"
+    plain = generate_module_harness(
+        module_name="plain",
+        sources=[str(src)],
+        header_include="none",
+        entry_fn="hit_case",
+        max_input_size=64,
+        cppflags="-I.",
+        out_dir=plain_dir,
+        entry_style="void_call",
+        auto_prelude=False,
+    )
+    assert R.harness_supports_runtime_skip_cases(Path(plain["harness_file"])) is False
+    assert R.harness_supports_runtime_skip_cases(_harness(tmp_path)) is False
+
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        return
+
+    driver = tmp_path / "driver.c"
+    driver.write_text(
+        f'#include "{harness_c.as_posix()}"\n'
+        "#include <stdio.h>\n"
+        "static int last_hit = -1;\n"
+        "int hit_case(unsigned int c) { last_hit = (int)c; return (int)c; }\n"
+        "int main(void) {\n"
+        '    printf("direct:%d,%d,%d,%d,%d,%d\\n",\n'
+        "           framac_fuzz_skip_case(0U),\n"
+        "           framac_fuzz_skip_case(65U),\n"
+        "           framac_fuzz_skip_case(129U),\n"
+        "           framac_fuzz_skip_case(300U),\n"
+        "           framac_fuzz_skip_case(7U),\n"
+        "           framac_fuzz_skip_case(5000U));\n"
+        "    for (unsigned int c = 0; c < 200U; c++) {\n"
+        "        uint8_t in[2] = {(uint8_t)c, 0x42U};\n"
+        "        last_hit = -1;\n"
+        "        int rc = LLVMFuzzerTestOneInput(in, 2U);\n"
+        '        printf("case:%u:%d:%d\\n", c, rc, last_hit);\n'
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "rt_skip_driver.exe"
+    proc = subprocess.run(
+        [cc, "-Wall", "-Werror", f"-I{tmp_path.as_posix()}", str(driver), "-o", str(exe)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    env = dict(os.environ)
+    env["FRAMAC_FUZZ_SKIP_CASES"] = "0, 65, 129, 300"
+    run = subprocess.run([str(exe)], env=env, capture_output=True, text=True, check=True)
+    lines = [ln.strip() for ln in run.stdout.splitlines() if ln.strip()]
+    assert lines[0] == "direct:1,1,1,1,0,0"
+    for ln in lines[1:]:
+        _, c_s, rc_s, hit_s = ln.split(":")
+        c_i, rc_i, hit_i = int(c_s), int(rc_s), int(hit_s)
+        if c_i in {0, 65, 129}:
+            assert rc_i == -1 and hit_i == -1
+        else:
+            assert rc_i == 0 and hit_i == c_i
+
+
+def test_runtime_skip_rounds_pass_env_with_zero_rebuilds(tmp_path):
+    calls: list[tuple[str, int, bool, dict | None]] = []
+    plan = [
+        [_art(tmp_path / "crash-1", bytes([129]), "fp129")],
+        [_art(tmp_path / "crash-2", bytes([5]), "fp5")],
+        [],
+    ]
+
+    def campaign(binary, seconds, fork, *, extra_env=None):
+        calls.append((str(binary), seconds, fork, extra_env))
+        arts = plan[len(calls) - 1]
+        return {"status": "crash_found" if arts else "clean", "returncode": 1 if arts else 0, "artifacts": arts}
+
+    res = R.run_campaign_rounds(
+        Path("bin0"),
+        600,
+        campaign=campaign,
+        rebuild=lambda mask: pytest.fail(f"unexpected rebuild({mask:#x}) when runtime_skip=True"),
+        n_cases=181,
+        runtime_skip=True,
+    )
+    assert [c[0] for c in calls] == ["bin0", "bin0", "bin0"]
+    assert [c[3] for c in calls] == [
+        None,
+        {"FRAMAC_FUZZ_SKIP_CASES": "129"},
+        {"FRAMAC_FUZZ_SKIP_CASES": "5,129"},
+    ]
+    kg = res["keep_going"]
+    assert kg["mode"] == "dispatch_rounds"
+    assert kg["runtime_skip"] is True
+    assert kg["skipped_cases"] == [5, 129]
+    assert [r["skipped_cases"] for r in kg["rounds"]] == [[], [129], [5, 129]]
+
+
+def test_campaign_mode_runtime_skip_never_rebuilds_and_legacy_rebuild_preserves_out_bin(tmp_path, monkeypatch):
+    import json
+
+    from generate_harness import generate_module_harness
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
+    src = tmp_path / "src.c"
+    src.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+
+    # 1. Modern generated dispatch harness: 0 rebuilds, FRAMAC_FUZZ_SKIP_CASES passed via sandbox extra_env.
+    gen_dir = tmp_path / "gen"
+    gen = generate_module_harness(
+        module_name="mod",
+        sources=[str(src)],
+        header_include="none",
+        entry_fn="f",
+        max_input_size=64,
+        cppflags="-I.",
+        out_dir=gen_dir,
+        entry_style="dispatch",
+        dispatch_cases=["(void)f(0);", "(void)f(1);", "(void)f(2);"],
+        auto_prelude=False,
+    )
+    harness_new = Path(gen["harness_file"])
+    out_bin = tmp_path / "fuzz_mod"
+    builds: list[tuple[Path, str]] = []
+    sandbox_envs: list[dict[str, str]] = []
+
+    def fake_build(sources, target_bin, **opts):
+        target_path = Path(target_bin)
+        cpp = str(opts.get("cppflags") or "")
+        builds.append((target_path, cpp))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"UNMASKED" if "SKIP_CASES=" not in cpp else f"MASKED:{cpp}".encode()
+        target_path.write_bytes(payload)
+        return {
+            "compile": {"returncode": 0, "binary": str(target_path)},
+            "engine_used": "eacsl",
+            "engine_fallback_reason": None,
+            "eacsl_compile_attempt": None,
+        }
+
+    round_idx = 0
+
+    def fake_sandbox(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        nonlocal round_idx
+        if "-runs=1" in cmd:
+            return SandboxResult(1, "", "Assertion failed", False, "rlimits", list(cmd))
+        sandbox_envs.append(dict(extra_env or {}))
+        round_idx += 1
+        prefix = next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1]
+        if round_idx == 1:
+            Path(f"{prefix}crash-r1").write_bytes(bytes([0, 0x11]))
+            return SandboxResult(1, "", "", False, "rlimits", list(cmd))
+        if round_idx == 2:
+            Path(f"{prefix}crash-r2").write_bytes(bytes([2, 0x22]))
+            return SandboxResult(1, "", "", False, "rlimits", list(cmd))
+        return SandboxResult(0, "", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "build_module_binary", fake_build)
+    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+
+    out_json = tmp_path / "reports" / "fuzz_new.json"
+    rc = R.main(
+        [
+            "campaign",
+            "--module",
+            "mod",
+            "--sources",
+            str(src),
+            str(harness_new),
+            "--out-bin",
+            str(out_bin),
+            "--corpus-dir",
+            str(tmp_path / "corpus_new"),
+            "--artifacts-dir",
+            str(tmp_path / "crashes_new"),
+            "--workers",
+            "1",
+            "--max-time",
+            "120",
+            "--no-cache",
+            "--no-attribution-replay",
+            "--no-auto-dict",
+            "--engine",
+            "eacsl",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    assert len(builds) == 1, f"expected exactly 1 initial build and 0 rebuilds, got {builds}"
+    assert out_bin.read_bytes() == b"UNMASKED"
+    assert [e.get("FRAMAC_FUZZ_SKIP_CASES") for e in sandbox_envs] == [None, "0", "0,2"]
+    report_new = json.loads(out_json.read_text(encoding="utf-8"))
+    assert report_new["keep_going"]["skipped_cases"] == [0, 2]
+    assert report_new["keep_going"]["runtime_skip"] is True
+
+    # 2. Legacy dispatch harness without runtime marker: falls back to rebuild WITHOUT clobbering out_bin.
+    builds.clear()
+    sandbox_envs.clear()
+    round_idx = 0
+    legacy_harness = _harness(tmp_path)
+    out_bin_legacy = tmp_path / "fuzz_legacy"
+    out_json_legacy = tmp_path / "reports" / "fuzz_legacy.json"
+    rc_leg = R.main(
+        [
+            "campaign",
+            "--module",
+            "legacy",
+            "--sources",
+            str(src),
+            str(legacy_harness),
+            "--out-bin",
+            str(out_bin_legacy),
+            "--corpus-dir",
+            str(tmp_path / "corpus_leg"),
+            "--artifacts-dir",
+            str(tmp_path / "crashes_leg"),
+            "--workers",
+            "1",
+            "--max-time",
+            "120",
+            "--no-cache",
+            "--no-attribution-replay",
+            "--no-auto-dict",
+            "--engine",
+            "eacsl",
+            "--out-json",
+            str(out_json_legacy),
+        ]
+    )
+    assert rc_leg == 0
+    assert len(builds) == 3  # initial build + 2 skip rebuilds
+    assert builds[0][0] == out_bin_legacy
+    assert all(b[0] != out_bin_legacy for b in builds[1:])
+    assert out_bin_legacy.read_bytes() == b"UNMASKED"
+    assert all("FRAMAC_FUZZ_SKIP_CASES" not in e for e in sandbox_envs)
+
+
+def test_eacsl_stage2_links_environ_keep_shim_when_getenv_present(tmp_path, monkeypatch):
+    from subprocess import CompletedProcess
+
+    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("/usr/bin/e-acsl-gcc", True))
+    src = tmp_path / "src.c"
+    src.write_text("int target(int x) { return x; }\n", encoding="utf-8")
+
+    stage2_links: list[str] = []
+
+    def fake_runner(cmd, **kwargs):
+        if cmd[0] == "clang" and "-E" in cmd:
+            return CompletedProcess(cmd, 0, f'# 1 "{src.as_posix()}"\nint target(int x) {{ return x; }}\n', "")
+        if cmd[0] == "clang" and "-c" in cmd:
+            Path(cmd[cmd.index("-o") + 1]).write_bytes(b"OBJ")
+            return CompletedProcess(cmd, 0, "", "")
+        if cmd[0] == "/usr/bin/e-acsl-gcc" and "-n" in cmd:
+            inst = Path(cmd[cmd.index("-o") + 1])
+            inst.write_text(
+                "extern char *getenv(const char *);\n"
+                'static inline int framac_fuzz_skip_case(unsigned int c) { return getenv("FRAMAC_FUZZ_SKIP_CASES") != 0; }\n'
+                "int target(int x) { return x; }\n"
+                "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long s) { return framac_fuzz_skip_case(0U); }\n",
+                encoding="utf-8",
+            )
+            return CompletedProcess(cmd, 0, "", "")
+        if cmd[0] == "/usr/bin/e-acsl-gcc" and "-C" in cmd:
+            stage2_links.append(cmd[cmd.index("-l") + 1])
+            out = Path(cmd[cmd.index("-O") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.with_name(out.name + ".e-acsl").write_bytes(b"\x7fELF\x00__e_acsl_memory_init\x00")
+            return CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    res = R.compile_eacsl_binary(
+        [str(src)],
+        tmp_path / "fuzz_mod",
+        cppflags="-I.",
+        fuzzer_flag=True,
+        runner=fake_runner,
+        use_cache=False,
+    )
+    assert res["returncode"] == 0
+    assert res["environ_keep"]["status"] == "built"
+    assert len(stage2_links) == 1
+    assert "-Wl,--wrap=__e_acsl_memory_init" in stage2_links[0]
+    assert "eacsl_env_keep.o" in stage2_links[0]
