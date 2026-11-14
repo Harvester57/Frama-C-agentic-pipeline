@@ -580,6 +580,9 @@ def _handle_api() -> tuple[ah.ApiInfo, dict[str, dict]]:
     # A variadic function: the header declares one parameter fewer than the model lists.
     variadic = {**recs, "seccomp_load": rec("seccomp_load", "int(void *,void **)", "pointer", "pointer")}
     assert ah.handle_functions(variadic, declared)[0]["seccomp_load"] == {0: CTX}
+    # One the model shows as variadic (its last formal) has no case, so it has no handles either.
+    variadic["seccomp_load"]["formals"][-1]["name"] = sh.VA_PARAMS
+    assert "seccomp_load" not in ah.handle_functions(variadic, declared)[0]
     api = ah.ApiInfo(
         probed=True,
         records=ctor_records,

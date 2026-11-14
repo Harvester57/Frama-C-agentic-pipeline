@@ -74,6 +74,9 @@ _STATUS_MAP = {
     "inconsistent": STATUS_INCONSISTENT,
 }
 
+# The formal Frama-C gives a variadic definition's `...`: `f(int n, ...)` is in the model as
+# `f(int n, void * const *__va_params)`, with a signature that no longer ends in `...`.
+VA_PARAMS = "__va_params"
 
 # A prover's wall-clock budget per profile (docs/guides/v2-design.md Section 9): the brief states it and the
 # scheduler enforces it, so both read it here. FRAMAC_PROVER_WALL_BUDGET_S overrides it.

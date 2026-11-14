@@ -13,8 +13,9 @@ seed inputs for each harness module, in the byte layout that harness reads.
 
   1. the API to record: the model's entry points (workspace/reports/phase0_model.json) that a test
      executable defines, with a signature the recorder can spell (scalars, enums, pointers, and structs
-     by value whose definition is in a project header); variadic functions and anonymous structs are
-     skipped with a reason;
+     by value whose definition is in a project header); variadic functions (a signature ending in
+     `...`, or a last formal named `__va_params`, Frama-C's translation of a variadic definition)
+     and anonymous structs are skipped with a reason;
   2. a recorder, generated from those signatures: `__wrap_<fn>` saves the arguments of each outermost
      API call (string and buffer contents, scalars, the `(ptr, len)` pairs inside a struct passed by
      value, the pointee of a pointer to a scalar) and calls `__real_<fn>`. Memory is copied through a
@@ -65,12 +66,13 @@ import re
 import shutil
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from framac_common import VA_PARAMS, atomic_write_json, load_json_optional, utc_now  # noqa: E402
 
 SCHEMA_VERSION = 1
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
@@ -201,6 +203,25 @@ def split_signature(sig: str) -> tuple[str, list[str], bool] | None:
     return ret, params, variadic
 
 
+def is_variadic(signature: str, formals: Sequence[Any] | None = None) -> bool:
+    """
+    Whether a model function is variadic: its signature ends in `...` (a declaration), or its last
+    formal is the one Frama-C's variadic translation adds to a definition (`__va_params`, with a
+    signature such as `_Bool(char *,char *,void **)` that shows no `...`). `formals` are the model's
+    (`{"name": ...}` records) or their names. A signature that is not understood is not variadic.
+    """
+    parts = split_signature(signature)
+    if parts is None:
+        return False
+    if parts[2]:
+        return True
+    if not isinstance(formals, (list, tuple)) or not formals:
+        return False
+    last = formals[-1]
+    name = last.get("name") if isinstance(last, dict) else last
+    return name == VA_PARAMS
+
+
 def classify_type(t: str) -> dict[str, Any]:
     """How the recorder declares and records one type: {kind, ctype, ...} or {kind: unsupported, why}."""
     n = _norm_type(t)
@@ -250,13 +271,14 @@ def plan_function(
     `sizes` is the model's `param_sizes`: a pointer with no length next to it whose callers pass a
     known-size object (a key, a nonce, an array of scalars) is recorded with that many bytes ('a').
     `names` are the formals' names (the model's `formals`), which decide whether a signed integer
-    after a byte pointer is its length.
+    after a byte pointer is its length, and whether the function is variadic (`is_variadic`): a
+    wrapper with a fixed argument list cannot forward the rest.
     """
     parts = split_signature(signature)
     if parts is None:
         return {"name": name, "supported": False, "why": f"signature {signature!r} not understood"}
-    ret_s, params_s, variadic = parts
-    if variadic:
+    ret_s, params_s, _ = parts
+    if is_variadic(signature, names):
         return {"name": name, "supported": False, "why": "variadic"}
     ret = classify_type(ret_s)
     if ret["kind"] == "unsupported":
