@@ -71,7 +71,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 <!-- if: loop_seeds -->
 0. **Loop invariant seeds (run once, after Step A and before you write an invariant).** Through the wrapper:
    ```text
-   python3 /opt/framac-pipeline/scripts/loop_seeds.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --module {module_name} --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --corpus-dir workspace/corpus/{module_name} --out-json agents/{agent_id}/scratch/loop_seeds_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/loop_seeds.py --file agents/{agent_id}/scratch/work/{c_file} --function {function_name} --module {harness_module_name} --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --sources {scratch_module_sources} workspace/harnesses/harness_{harness_module_name}.c --corpus-dir workspace/corpus/{harness_module_name} --out-json agents/{agent_id}/scratch/loop_seeds_{function_name}.json
    ```
    It derives candidate invariants named `seed_<n>` from the loop facts (counter and guard bounds, pointer-walker anchors), keeps those WP can establish and preserve under your current contract and loop annotations, and replays the corpus on the ones WP dropped. It works on a private copy, changes none of your files and does not count against your WP budget. It takes a second per loop when everything proves, and up to a few minutes otherwise. Whatever it prints, it only gives hints: on any `status` other than `ok`, or with no seed, go on with item 1.
    - **"Proven inductive":** paste these clauses into the loop's annotation as printed, keeping the `seed_<n>` names, before `loop assigns`. Then add the invariants only you can write (accumulators, quantified ranges) beside them.
@@ -232,7 +232,7 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
 
 1. **Oracle 1 — Dynamic Anti-Hallucination Guardrail (`E-ACSL`):**
    ```text
-   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --functions {function_name} --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 100 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
+   python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{harness_module_name}.c --functions {function_name} --out-bin agents/{agent_id}/scratch/guard_{function_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{harness_module_name} --extra-runs 100 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/guard_{function_name}.json
    ```
    - The shared corpus is replayed read-only; new units and artifacts stay in your scratch directory.
    - `--functions {function_name}` instruments only your function: its contract, loop annotations and RTE checks. That makes each iteration about an order of magnitude faster than instrumenting the whole module. The parent's re-check after the merge instruments the whole module.

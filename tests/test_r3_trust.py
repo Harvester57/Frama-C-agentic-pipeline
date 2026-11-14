@@ -116,6 +116,47 @@ def test_trust_boundary_check_skips_another_files_same_named_static():
     assert wo.entry_trust_boundary_errors(sidecar, "b.c", agent, agent, base, base)
 
 
+def test_a_synthetic_entry_inherits_the_units_nul_termination(tmp_path):
+    """minmea run-1: `minmea_checksum` is not the harness entry, but the harness NUL-terminates its input.
+
+    The synthetic entry used to carry no `null_terminate`, so `valid_read_string(sentence)` (memory
+    shape) was flagged as an attacker-value constraint and the 10/11 proof did not merge.
+    """
+    ws = tmp_path / "workspace"
+    (ws / "reports").mkdir(parents=True)
+    (ws / "harnesses").mkdir()
+    (ws / "reports" / "callgraph_dag.json").write_text(
+        json.dumps(
+            {
+                "functions": {
+                    "a.c#f": {
+                        "name": "f",
+                        "file": "a.c",
+                        "trust": {"value": "untrusted", "boundary": True},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ws / "harnesses" / "harness_m.json").write_text(
+        json.dumps(
+            {
+                "module": "m",
+                "entry_fn": "parse",
+                "reachability": "untrusted_surface",
+                "null_terminate": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    entries = wo._untrusted_entry_metas(ws, "m", "f", "a.c")
+    assert entries and entries[0]["null_terminate"] is True
+    base = "int f(char *s) { return s ? 1 : 0; }\n"
+    agent = "/*@ requires valid_read_string(s); */\nint f(char *s) { return s ? 1 : 0; }\n"
+    assert wo.entry_trust_boundary_errors(entries[0], "a.c", agent, agent, base, base) == []
+
+
 # ---------------------------------------------------------------------------------------------------
 # Invalid and missing threat models
 # ---------------------------------------------------------------------------------------------------

@@ -167,6 +167,7 @@ def _over_budget_tasks(state: dict, now: float | None = None) -> list[dict]:
 BRIEF_RENDER_KEYS: tuple[str, ...] = (
     "agent_id",
     "module_name",
+    "harness_module_name",
     "header_file",
     "c_file",
     "function_name",

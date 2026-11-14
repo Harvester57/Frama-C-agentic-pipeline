@@ -1146,7 +1146,14 @@ def _run_parent_reverify(
 
     if module and sources:
         # A link unit is built through one of its harnesses (the one answering for `function`).
-        hmod = harness_module_for_function(module_map_for(overlay_dir), module, c_file, function) or module
+        mm = module_map_for(overlay_dir)
+        hmod = harness_module_for_function(mm, module, c_file, function) or module
+        # Use that harness's own sources: the merged sidecar of a unit also carries its target-fuzz
+        # sub-modules, and compiling their `<fuzzer>.c` here renames the fuzz entry and leaves
+        # libFuzzer's `main` with no real `LLVMFuzzerTestOneInput` (minmea run-1, 2026-11-14).
+        h_sources = (mm.sidecars.get(hmod) or {}).get("sources")
+        if isinstance(h_sources, list) and h_sources:
+            sources = [str(s) for s in h_sources if isinstance(s, str) and s]
         harness = overlay_dir / "harnesses" / f"harness_{hmod}.c"
         corpus = overlay_dir / "corpus" / hmod
         # The parent re-check must use the same reduced checks as the module's build:
@@ -1495,6 +1502,14 @@ def _untrusted_entry_metas(
             entry: dict = {"entry_fn": function, "reachability": "untrusted_surface", "trust_boundary": True}
             if file:
                 entry["file"] = file
+            # The harnesses of the same unit may NUL-terminate the input even though none of them
+            # is the entry named here (`minmea_checksum` is called by the `minmea` harness from its
+            # NUL-terminated copy). Carry that shape fact, or `valid_read_string` on the attacker
+            # string is misread as a value constraint (minmea run-1, 2026-11-14).
+            if any(
+                bool(m.get("null_terminate")) or m.get("entry_style") in ("c_string", "argv") for m in out
+            ):
+                entry["null_terminate"] = True
             out.append(entry)
     return out
 
@@ -2664,8 +2679,29 @@ def prepare_agent(
         if not norm_header and hmeta.get("header"):
             norm_header = _normalize_work_relpath(hmeta["header"])
 
+    # The brief names one harness: a link unit's sub-module answering for this function (or its
+    # header), never the union of the unit's harnesses. `tf_` target-fuzz modules are not candidates.
+    harness_module_name = module
+    if module:
+        if role == "architect":
+            harness_module_name = next(
+                (
+                    m
+                    for m in harness_modules_of(mm, module)
+                    if isinstance(mm.sidecars.get(m), dict)
+                    and _normalize_work_relpath(str(mm.sidecars[m].get("header") or ""))
+                    == _normalize_work_relpath(norm_header or "")
+                ),
+                None,
+            ) or harness_module_for_function(mm, module) or module
+        elif function and role in ("prover", "breaker"):
+            harness_module_name = harness_module_for_function(mm, module, norm_c_file, function) or module
+    brief_meta = mm.sidecars.get(harness_module_name) if harness_module_name else None
+    if not isinstance(brief_meta, dict) or not brief_meta:
+        brief_meta = hmeta
+
     raw_sources = (
-        hmeta.get("sources")
+        brief_meta.get("sources")
         or (dag_mods.get(module or "", {}).get("files") if module else [])
         or ([norm_c_file] if norm_c_file else [])
     )
@@ -2696,8 +2732,8 @@ def prepare_agent(
     scratch_sources_str = " ".join(scratch_sources_list)
     module_sources_str = " ".join(module_sources_list)
 
-    eff_cppflags = cppflags if cppflags is not None else (hmeta.get("cppflags") or "-I.")
-    eff_ldflags = ldflags if ldflags is not None else (hmeta.get("ldflags") or "")
+    eff_cppflags = cppflags if cppflags is not None else (brief_meta.get("cppflags") or "-I.")
+    eff_ldflags = ldflags if ldflags is not None else (brief_meta.get("ldflags") or "")
 
     # The sidecar's header is the name the harness includes; the brief needs the file in the tree.
     header_flags = _module_header_flags(overlay, module, eff_cppflags)
@@ -2843,6 +2879,7 @@ def prepare_agent(
     replacements = {
         "{agent_id}": agent_id,
         "{module_name}": module or "unknown",
+        "{harness_module_name}": harness_module_name or module or "unknown",
         "{header_file}": norm_header or "",
         "{c_file}": norm_c_file or "",
         "{function_name}": function or "",

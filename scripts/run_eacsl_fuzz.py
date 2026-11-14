@@ -2719,6 +2719,50 @@ def failure_outside_checked_functions(failure: dict | None, output: str, functio
     return re.sub(r"\s+", " ", text).strip()[:300]
 
 
+def crash_matches_known_candidate(output: str, known: set[str] | None) -> str | None:
+    """
+    The crash a guardrail replay stopped on when it is already a ledgered candidate of this run; else None.
+
+    A replayed seed or promoted crash can reproduce a known defect of the same module (for example
+    minmea's `$GPVTG,.0000000000` drives `minmea_scan` past INT_MAX). That input tests the known
+    defect, not the contract under proof, even when its E-ACSL assertion is reported (which
+    `crash_outside_checked_functions` deliberately does not excuse). Excluding it never hides a new
+    finding: its fingerprint is already in `candidates.json`, and the candidate keeps its own
+    verifier. The caller drops the input and replays the rest, like the outside-function case.
+    """
+    if not known:
+        return None
+    failure = parse_eacsl_failure(output or "") or parse_sanitizer_failure(output or "")
+    if not failure:
+        return None
+    try:
+        fp = _failure_fingerprint(failure)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not fp or fp not in known:
+        return None
+    loc = f"{failure.get('file', 'unknown')}:{failure.get('line', 0)} in {failure.get('function', 'unknown')}"
+    return f"known candidate {fp} ({loc})"[:300]
+
+
+def known_candidate_fingerprints(run_dir: Path | str = ".") -> set[str]:
+    """Fingerprints of the run's candidates and findings, for `crash_matches_known_candidate`."""
+    root = Path(run_dir)
+    out: set[str] = set()
+    for name in ("candidates.json", "findings.json"):
+        try:
+            data = json.loads((root / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        items = data if isinstance(data, list) else (data.get("candidates") or data.get("findings") or [])
+        if isinstance(items, dict):
+            items = list(items.values())
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and item.get("fingerprint"):
+                out.add(str(item["fingerprint"]))
+    return out
+
+
 def _replayed_input_of(crash_input: str | None, entries: list[list[str | int]]) -> str | None:
     """The replayed corpus file whose content is the crash artifact `crash_input` (run-relative), or None."""
     if not crash_input:

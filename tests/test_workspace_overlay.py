@@ -453,6 +453,123 @@ def test_prepare_agent_brief_of_a_colliding_function(tmp_path):
     assert "only_in_a_c_helper" not in brief
 
 
+def test_prepare_agent_brief_names_the_submodule_harness(tmp_path):
+    """A link unit with sub-module harnesses: the brief must name the one answering for the function.
+
+    Regression (minmea run-1): provers of `libminmea_a` were told to use
+    `workspace/harnesses/harness_libminmea_a.c` (no such file, the harness is `harness_minmea.c`),
+    the target-fuzzer module's `fuzzer.c` among their sources, and the unit's corpus directory.
+    """
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "m.c").write_text("int parse(char *s) { return s ? 1 : 0; }\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    WO.init_overlay(target, run_dir / "workspace")
+    (run_dir / "run-metadata.json").write_text(json.dumps({"profile": "standard"}), encoding="utf-8")
+    dag = {
+        "modules": {"libm_a": {"tier": "Tier 1A", "functions": ["parse"]}},
+        "functions": {"parse": {"name": "parse", "file": "m.c", "module": "libm_a", "wave": 0}},
+    }
+    reports = run_dir / "workspace" / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / "callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
+    harnesses = run_dir / "workspace" / "harnesses"
+    harnesses.mkdir(parents=True, exist_ok=True)
+    (harnesses / "harness_m.json").write_text(
+        json.dumps(
+            {
+                "module": "m",
+                "unit": "libm_a",
+                "sources": ["workspace/work/m.c"],
+                "header": "m.h",
+                "entry_fn": "parse",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (harnesses / "harness_tf_x.json").write_text(
+        json.dumps(
+            {
+                "module": "tf_x",
+                "unit": "libm_a",
+                "sources": ["workspace/work/m.c", "workspace/work/fuzz.c"],
+                "target_fuzzer": {"id": "x", "source": "workspace/work/fuzz.c"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    WO.prepare_agent(run_dir=run_dir, agent_id="prove-parse", role="prover", c_file="m.c", function="parse")
+    brief = (run_dir / "agents" / "prove-parse" / "brief.md").read_text(encoding="utf-8")
+    assert "workspace/harnesses/harness_m.c" in brief
+    assert "workspace/harnesses/harness_libm_a.c" not in brief
+    assert "workspace/corpus/m" in brief
+    assert "fuzz.c" not in brief
+
+
+def test_parent_reverify_uses_only_the_answerable_harness_sources(tmp_path, monkeypatch):
+    """minmea run-1: the merged sidecar pulled `.clusterfuzzlite/fuzzer.c` into the parent guardrail.
+
+    That source is renamed by the global `-DLLVMFuzzerTestOneInput=...`, leaving libFuzzer's `main`
+    with no real entry (`undefined reference to LLVMFuzzerTestOneInput`). The guardrail must compile
+    the harness chosen for the function, not the union of the unit's harness sources.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    overlay = tmp_path / "overlay"
+    (overlay / "work").mkdir(parents=True)
+    (overlay / "harnesses").mkdir()
+    (overlay / "reports").mkdir()
+    (overlay / "work" / "p.c").write_text("int parse(int x) { return x; }\n", encoding="utf-8")
+    (overlay / "harnesses" / "harness_p.c").write_text("int main() { return 0; }\n", encoding="utf-8")
+    (overlay / "harnesses" / "harness_p.json").write_text(
+        json.dumps({"module": "p", "unit": "libp_a", "sources": ["workspace/work/p.c"], "entry_fn": "parse"}),
+        encoding="utf-8",
+    )
+    (overlay / "harnesses" / "harness_tf_x.json").write_text(
+        json.dumps(
+            {
+                "module": "tf_x",
+                "unit": "libp_a",
+                "sources": ["workspace/work/p.c", "workspace/work/fuzz.c"],
+                "target_fuzzer": {"id": "x", "source": "workspace/work/fuzz.c"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (overlay / "reports" / "callgraph_dag.json").write_text(
+        json.dumps({"modules": {"libp_a": {"functions": ["parse"]}}, "functions": {"parse": {"name": "parse", "file": "p.c", "module": "libp_a"}}}),
+        encoding="utf-8",
+    )
+
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None):
+        seen.append(list(cmd))
+        out = Path(cmd[cmd.index("--out-json") + 1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"status": "passed_dynamic_oracle"}), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(WO.subprocess, "run", fake_run)
+    ok, _ = WO._run_parent_reverify(
+        run_dir=run_dir,
+        agent_id="prover-parse",
+        role="architect",
+        overlay_dir=overlay,
+        c_file=None,
+        function=None,
+        module="libp_a",
+        sources=["p.c", ".clusterfuzzlite/fuzzer.c"],
+        cppflags="-I.",
+    )
+    assert ok is True
+    guard = next(c for c in seen if any("run_eacsl_fuzz.py" in str(x) for x in c))
+    sources = guard[guard.index("--sources") + 1 : guard.index("--out-bin")]
+    assert any(s.endswith("p.c") for s in sources)
+    assert not any(s.endswith("fuzz.c") for s in sources)
+
+
 def _dead_end_run(tmp_path: Path) -> Path:
     target = tmp_path / "target"
     (target / "src").mkdir(parents=True)

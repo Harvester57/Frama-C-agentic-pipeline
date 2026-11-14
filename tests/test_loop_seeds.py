@@ -749,7 +749,7 @@ def test_brief_command_uses_only_placeholders_the_scheduler_fills() -> None:
         "agent_id",
         "c_file",
         "function_name",
-        "module_name",
+        "harness_module_name",
         "scratch_cppflags",
         "ldflags",
         "scratch_module_sources",

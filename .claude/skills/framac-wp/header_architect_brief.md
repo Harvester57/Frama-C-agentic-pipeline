@@ -9,7 +9,7 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
 - **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
 - **Isolated Scratch Header Path:** `agents/{agent_id}/scratch/work/{header_file}`
 - **Isolated Scratch Module Sources:** `{scratch_module_sources}`
-- **Module Harness & Fuzzer Corpus:** `workspace/harnesses/harness_{module_name}.c` and `workspace/corpus/{module_name}/` (read-only for you)
+- **Module Harness & Fuzzer Corpus:** `workspace/harnesses/harness_{harness_module_name}.c` and `workspace/corpus/{harness_module_name}/` (read-only for you)
 - **Security Properties (Layer 2 from `callgraph_dag.json`; Layers 3–6 generated from the threat model as MetAcsl meta-properties, `workspace/reports/security_props.json`):** `{security_properties_json}`
 - **Untrusted entry functions in this header:** `{untrusted_entry_functions_json}`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
@@ -50,7 +50,7 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
    - **Check 1 (Frama-C Kernel Syntax):** run `run_wp_function.py` or `frama-c -kernel-warn-key annot-error=abort` on `agents/{agent_id}/scratch/work/` to confirm zero ACSL syntax or typing errors.
    - **Check 2 (Dynamic E-ACSL Anti-Hallucination Guardrail):**
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/guard_{module_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{module_name} --extra-runs 200 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/header_guard_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{harness_module_name}.c --out-bin agents/{agent_id}/scratch/guard_{module_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{harness_module_name} --extra-runs 200 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/header_guard_{module_name}.json
      ```
    - `rejected_overconstrained`: inspect `runtime_trace` and `failure`, relax the clause that failed on real inputs, and re-run until `passed_dynamic_oracle`.
    - `code_fault`: an RTE failed on a real input; report it (status `failed`) instead of weakening contracts around it.
