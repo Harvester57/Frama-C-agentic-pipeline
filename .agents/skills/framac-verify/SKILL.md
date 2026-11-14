@@ -105,7 +105,7 @@ Execute `skills/framac-slice/SKILL.md`:
 - The DAG's modules are the build's link units; harnesses may be sub-modules of a unit. Tiers come from trust; Tier 3 is deferred under `quick`.
 - It generates the MetAcsl security properties (Layers 3-6) from the threat model (`security_props.py run`, once per run).
 - It generates exact-size dual harnesses (`generate_harness.py`, emitting `harness_<mod>.c` and `harness_<mod>.json`).
-- It gates every harness on reachability (`harness_reach.py check`): each module's DAG entry points must be reached, or exempted with a recorded reason, before the ledger is seeded.
+- It gates every harness on reachability (`harness_reach.py check`): the harness must call each of the module's DAG entry points itself (one that only another function calls is a gap), or the entry point must be exempted with a recorded reason, before the ledger is seeded.
 - It seeds the ledger (`ledger.py seed`), which creates one unit per function × obligation class. Out-of-scope work, Layers 2-6 of Tier 3 functions, and all Tier 3 work under `quick`, are seeded `out_of_scope` / `deferred` with reasons; under `quick` the Tier 3 modules are also left out of the Make phases.
 - Then `pipeline_make.py gen` writes the Makefile for the next phases.
 - Last, `pipeline_make.py build-check` requires every fuzzed module to build with E-ACSL, unless the sanitizers were chosen for that module, so Phase 1 never falls back to ASan/UBSan silently. The choice is either `--fuzz-engine sanitizers`, or the DAG's for a unit E-ACSL cannot build (GCC fallback, setjmp/longjmp), which comes with its reason.
