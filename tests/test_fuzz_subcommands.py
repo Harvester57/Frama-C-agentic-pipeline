@@ -545,6 +545,42 @@ def test_replay_candidates_fall_back_to_the_sidecar_without_pipeline_make(run_di
     assert out_bin == Path("workspace/harnesses/fuzz_snmp") and cppflags == f"-Iworkspace/work/src -I{acsl}"
 
 
+def test_replay_candidates_fingerprint_replays_given_inputs_on_the_candidates_binary(run_dir, monkeypatch):
+    """The parent's check of the reproducers a verifier lists from its scratch (wp_scheduler._complete_verifier)."""
+    import pipeline_make
+
+    _replay_candidates_run(run_dir)
+    eacsl_calls, _ = _fake_builds(monkeypatch, run_dir)
+    seeds = run_dir / "agents/verify-1/scratch/seeds"
+    seeds.mkdir(parents=True)
+    (seeds / "hit").write_bytes(b"CRASH from a verifier seed")
+    (seeds / "miss").write_bytes(b"benign")
+    out_json = Path("workspace/reports/replay/verifier/verify-1.json")
+    argv = ["replay-candidates", "--selftest-json", "none.json", "--out-json", str(out_json)]
+    inputs = ["--inputs", "agents/verify-1/scratch/seeds/hit", "agents/verify-1/scratch/seeds/miss"]
+    # `x#y::z::2` has no reproducer of its own and `x#y::z::1` is already verified: both still replay.
+    for fp in ("x#y::z::2", "x#y::z::1"):
+        assert R.main([*argv, "--fingerprint", fp, *inputs]) == 0
+        rep = json.loads(out_json.read_text(encoding="utf-8"))
+        assert rep["status"] == "reproduced" and rep["candidate_fingerprint"] == fp
+        assert [(a["artifact"], a["reproducible"]) for a in rep["artifacts"]] == [
+            ("agents/verify-1/scratch/seeds/hit", True),
+            ("agents/verify-1/scratch/seeds/miss", False),
+        ]
+        assert rep["artifacts"][0]["sha256"] == hashlib.sha256(b"CRASH from a verifier seed").hexdigest()
+    # The module's own build (Make's spec), and neither the index nor a candidate report is written.
+    snmp_spec = pipeline_make.module_build_spec("snmp", run_dir)
+    assert eacsl_calls[0] == (snmp_spec["sources"], Path("workspace/harnesses/fuzz_snmp"), snmp_spec["cppflags"], "-lm")
+    assert sorted(p.name for p in (run_dir / "workspace/reports/replay").glob("*")) == ["verifier"]
+
+    assert R.main([*argv, "--fingerprint", "x#y::z::3", *inputs]) == 1  # `ghost` is not a Make module
+    assert json.loads(out_json.read_text(encoding="utf-8"))["artifacts"] == []
+    assert R.main([*argv, "--fingerprint", "no#such::fp::0", *inputs]) == 1
+    assert "unknown candidate" in json.loads(out_json.read_text(encoding="utf-8"))["reason"]
+    with pytest.raises(SystemExit):
+        R.main(["replay-candidates", "--fingerprint", FP_PARSE])
+
+
 # ---------------------------------------------------------------------------
 # guardrail corpus replay capping (Item 6)
 # ---------------------------------------------------------------------------

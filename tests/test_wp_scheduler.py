@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -1876,6 +1877,120 @@ def test_h2_parent_replays_a_phase3_candidate_before_ingesting_its_verdict(sim, 
     assert found == ["workspace/reports/replay/src_m_f.c_f_mem_access_0123456789-abcdef0123.json"]
     # An existing replay is reused, never run again.
     assert S._parent_replay(fp, cand, out) == found and len(calls) == 1
+
+
+def _confirmed_on_a_scratch_reproducer(sim, with_recorded_crash=False):
+    """A verifier confirms a candidate on an input it wrote into its own scratch (crash_verifier_brief.md, Case B)."""
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {}})
+    fp = sim.eva_candidate("m", "src/m/f.c", "f")
+    if with_recorded_crash:
+        # The candidate has a reproducer of its own, already replayed by the parent (Phase 2).
+        crash = sim.run_dir / "workspace/crashes/m/crash-1"
+        crash.parent.mkdir(parents=True)
+        crash.write_bytes(b"recorded crash")
+        cands = load("candidates.json")
+        cands[0]["reproducers"] = ["workspace/crashes/m/crash-1"]
+        write_json(sim.run_dir / "candidates.json", cands)
+        write_json(
+            sim.run_dir / f"workspace/reports/replay/{S._fp_slug(fp)}.json",
+            {
+                "candidate_fingerprint": fp,
+                "artifacts": [{"sha256": hashlib.sha256(b"recorded crash").hexdigest(), "reproducible": True}],
+            },
+        )
+    S.cmd_init()
+    aid = S.cmd_next("auto", prepare=True)["tasks"][0]["agent_id"]
+    result = Path(f"agents/{aid}/scratch/result.json")
+    L.cmd_scaffold_verifier(fp, "confirmed", aid, out_path=result)
+    seed = f"agents/{aid}/scratch/seeds/seed-1"
+    (sim.run_dir / seed).parent.mkdir(parents=True)
+    (sim.run_dir / seed).write_bytes(b"verifier seed")
+    res = load(result)
+    res["record"]["reproducers"].append(
+        {
+            "input": seed,
+            "sha256": hashlib.sha256(b"verifier seed").hexdigest(),
+            "size_bytes": len(b"verifier seed"),
+            # A verifier names its own binary here; the parent never replays on it.
+            "command": f"run_eacsl_fuzz.py replay --inputs {seed} --binary agents/{aid}/scratch/verify_m.e-acsl",
+            "observed_result": "mem_access: p != 0",
+        }
+    )
+    write_json(sim.run_dir / result, res)
+    return fp, aid, seed
+
+
+def _fake_verifier_replay(monkeypatch, reproducible, calls):
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if reproducible is None:
+            raise OSError("no interpreter")
+        inputs = cmd[cmd.index("--inputs") + 1 : cmd.index("--out-json")]
+        write_json(
+            Path(cmd[cmd.index("--out-json") + 1]),
+            {
+                "mode": "replay",
+                "status": "reproduced" if reproducible else "not_reproduced",
+                "fingerprint_matches": reproducible,
+                "artifacts": [
+                    {"artifact": i, "sha256": hashlib.sha256(Path(i).read_bytes()).hexdigest(), "reproducible": r}
+                    for i, r in zip(inputs, [reproducible] * len(inputs), strict=True)
+                ],
+            },
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake_run)
+
+
+@pytest.mark.parametrize("with_recorded_crash", [False, True])
+def test_parent_replays_the_scratch_reproducers_a_verifier_confirms_on(sim, monkeypatch, with_recorded_crash):
+    fp, aid, seed = _confirmed_on_a_scratch_reproducer(sim, with_recorded_crash)
+    calls: list = []
+    _fake_verifier_replay(monkeypatch, True, calls)
+    out = S.cmd_complete(aid)
+    assert out.get("error") is None and (out["action"], out["decision"]) == ("ingested", "confirmed")
+    # One replay, of the scratch input only, on the candidate's own module binary (built by the parent).
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[cmd.index("--fingerprint") + 1] == fp and "replay-candidates" in cmd
+    assert cmd[cmd.index("--inputs") + 1 : cmd.index("--out-json")] == [seed]
+    assert "--binary" not in cmd and not any("verify_m" in str(c) for c in cmd)
+    report = f"workspace/reports/replay/verifier/{aid}.json"
+    assert cmd[cmd.index("--out-json") + 1] == report and out["replay_reports"][-1] == report
+    assert out["verifier_replay"] == {
+        "returncode": 0,
+        "report": report,
+        "inputs": [seed],
+        "status": "reproduced",
+        "fingerprint_matches": True,
+    }
+    assert [f["verdict"] for f in load("findings.json")] == ["confirmed"]
+    assert tasks()[f"verify:{fp}"]["outcome"] == "confirmed"
+
+
+@pytest.mark.parametrize("reproducible", [False, None])
+def test_a_scratch_reproducer_the_parent_cannot_reproduce_is_still_refused(sim, monkeypatch, reproducible):
+    fp, aid, _seed = _confirmed_on_a_scratch_reproducer(sim)
+    calls: list = []
+    _fake_verifier_replay(monkeypatch, reproducible, calls)
+    out = S.cmd_complete(aid)
+    assert len(calls) == 1
+    assert out["action"] == "requeued_ingest_error"
+    assert "requires a parent-verified reproducible crash report matching sha256" in out["error"]
+    assert load("candidates.json")[0]["status"] == "unverified" and tasks()[f"verify:{fp}"]["state"] == "pending"
+
+
+def test_a_verdict_without_scratch_reproducers_needs_no_extra_replay(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {}})
+    fp = sim.eva_candidate("m", "src/m/f.c", "f")
+    S.cmd_init()
+    aid = S.cmd_next("auto", prepare=True)["tasks"][0]["agent_id"]
+    L.cmd_scaffold_verifier(fp, "needs_validation", aid, out_path=Path(f"agents/{aid}/scratch/result.json"))
+    calls: list = []
+    _fake_verifier_replay(monkeypatch, True, calls)
+    out = S.cmd_complete(aid)
+    assert out["decision"] == "needs_validation" and calls == [] and "verifier_replay" not in out
 
 
 # ---------------------------------------------------------------------------

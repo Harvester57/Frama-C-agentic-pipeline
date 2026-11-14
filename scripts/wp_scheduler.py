@@ -3243,9 +3243,65 @@ def _parent_replay(fp: str, cand: dict, out: dict) -> list[str]:
     return _replay_reports(fp, cand)
 
 
+def _verifier_scratch_reproducers(res: dict) -> list[str]:
+    """The reproducers of a verifier's `confirmed` records that live in its own scratch (existing files)."""
+    prefix = f"agents/{res.get('agent_id')}/scratch/"
+    found: list[str] = []
+    for rec in [res.get("record") or {}, *(res.get("additional_records") or [])]:
+        if rec.get("verdict") != "confirmed":
+            continue
+        for rep in rec.get("reproducers") or []:
+            inp = str((rep.get("input") if isinstance(rep, dict) else None) or "").replace("\\", "/")
+            if inp.startswith(prefix) and ".." not in inp.split("/") and inp not in found and Path(inp).is_file():
+                found.append(inp)
+    return found
+
+
+def _parent_replay_verifier_inputs(fp: str, res: dict, out: dict) -> list[str]:
+    """
+    The parent's replay of the reproducers a verifier lists from its own scratch (a seed it wrote, a
+    crash of its own campaign): the candidate's replay report covers only the candidate's reproducers,
+    and `ingest-verifier` confirms only inputs the parent itself replayed. The inputs run on the
+    candidate's module binary, built by the parent, never on a binary the verifier names. A replay
+    that fails or reproduces nothing leaves the refusal to `ingest-verifier`.
+    """
+    inputs = _verifier_scratch_reproducers(res)
+    if not inputs:
+        return []
+    report = REPLAY_DIR / "verifier" / f"{res['agent_id']}.json"  # a sub-directory: never a candidate's own report
+    report.unlink(missing_ok=True)
+    cmd = [
+        sys.executable or "python3",
+        str(Path(__file__).resolve().parent / "run_eacsl_fuzz.py"),
+        "replay-candidates",
+        "--candidates",
+        "candidates.json",
+        "--harness-dir",
+        HARNESS_DIR.as_posix(),
+        "--fingerprint",
+        fp,
+        "--inputs",
+        *inputs,
+        "--out-json",
+        report.as_posix(),
+    ]
+    info: dict[str, Any] = {"report": report.as_posix(), "inputs": inputs}
+    try:
+        proc = DEPS.run_cmd(cmd, capture_output=True, text=True, check=False, timeout=3600)
+        info = {"returncode": getattr(proc, "returncode", None), **info}
+    except (OSError, subprocess.SubprocessError) as exc:
+        info = {"error": f"{type(exc).__name__}: {exc}", **info}
+    # `fingerprint_matches` is false when the inputs fail, but not with the candidate's failure.
+    replayed = _load_report(report) or {}
+    info.update(status=replayed.get("status"), fingerprint_matches=replayed.get("fingerprint_matches"))
+    out["verifier_replay"] = info
+    return [report.as_posix()] if report.is_file() else []
+
+
 def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path: Path, out: dict) -> None:
     fp = task["fingerprint"]
     replays = _parent_replay(fp, ctx.candidates.get(fp) or {}, out)
+    replays = [*replays, *_parent_replay_verifier_inputs(fp, res, out)]
     harness_mod = _verify_harness_module(task, ctx)
     meta = HARNESS_DIR / f"harness_{harness_mod}.json"
     out["replay_reports"] = replays
