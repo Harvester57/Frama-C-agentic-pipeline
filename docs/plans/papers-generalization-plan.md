@@ -130,6 +130,87 @@ The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) (
 
 **Consequence.** What Eva can supply here is `0 <= i` and bounds by a harness constant. The first is what a prover writes unprompted; the second is exactly what the constant rule below exists to suppress. The tier stays open only if a different source for the relation is found (for example the gauges domain's internal state, which `Eva.Results` does not expose, or a relational analyser outside Eva).
 
+#### Tier 1b trial: Eva's own range export (`-eva-annot`)
+
+> **Status: closed on 2026-11-14. Step 1 met the stop rule, so Step 2 was not built and no pipeline code changed.** The only RTE goal it closed did so through an assertion that only the harness makes true. See "Step 1 result" below.
+
+**Step 1 result (2026-11-14).** Two deviations from the design below:
+- **libseccomp run-4 replaced QCBOR.** All 10 of QCBOR's WP-checked functions (runs 2, 2-deep and 3) were fully proved, so it had nothing to test.
+- **WP was not run through `run_wp_function.py`.** It ran as `frama-c` directly with that script's options (Typed, `-wp-rte -wp-split`, Alt-Ergo, Z3 and CVC5, 15 s, its warn flags and `augment_framac_cppflags`), on the function's own file.
+
+| | libmnl (`ab-2026-11-09-tier6/run3-rep`) | libseccomp (`run-4`) |
+|---|---|---|
+| Functions left with Unknown RTE goals / goals | 4 / 30 | 99 / 1,237 |
+| How Eva was obtained | Re-run with `run_eva_slice.py` on the run's sources and harnesses (its session was not kept), Frama-C 34.0~beta, `--no-warn-unsigned-downcast` as in the run. nlmsg matched the run: 72 Valid, 36 Unknown | The run's saved sessions, loaded in `framac-analysis:fc35dev`, which made them |
+| Functions with Eva results | 1: `mnl_nlmsg_batch_next` and `mnl_attr_nest_cancel` have 0 calls, and the one call to `mnl_nlmsg_fprintf_payload` is unreachable | 25: 21 of 92 in `libseccomp_a`, 4 of 4 in `scmp_bpf_disasm`, 0 of 3 in `scmp_bpf_sim`. The old harness stops at `db.c:1078` (gap D in [`../troubleshooting/eva.md`](../troubleshooting/eva.md)) |
+| `Eva_export` assertions | 0: `mnl_attr_next` is annotated but gets none | 218 in the unproved functions |
+| Filter: full type range / constant not in the code / `\false` / not in a goal / kept | none to filter | 111 / 57 / 15 / 31 / 4 |
+| WP: (a) proved from the code / (b) RTE goals closed / (c) need a new `requires` | 0 / 0 / 0 | 1 / 1 / 2 |
+
+- **The 4 kept assertions.**
+  - `col->state ≡ 0` (`db_col_valid`), `col->filter_cnt ≡ 0` and `iter ≡ 0` (`db_col_arch_exist`) hold only because the old harness passes a zeroed buffer as the handle. WP cannot prove them.
+  - `line ≡ 0` (`bpf_dot_decode`) sits inside `if (line == 0)`. WP proves it (24/34 becomes 25/35), but it closes nothing.
+- **The one gain is the hazard the design names.** `db_col_valid`'s goal `0 <= col->state` closes only under the unprovable `col->state == 0`.
+- **The filter's weak spot.** The constant rule exempts 0 and 1, and 3 of the 4 kept assertions were harness values equal to 0. Step 2 would also have had to drop equalities to 0 on fields of a handle the harness builds.
+- **Why so little survives.** Where Phase 3 is stuck, Eva has usually not been at all (3 of 4 functions on libmnl, 74 of 99 on libseccomp). Where it has, its ranges are the C type's or the harness's. Better harnesses (H1 of the templates plan) would raise the coverage, but the ranges would still come from the harness.
+- **Practical notes.**
+  - A saved session replays its output options on `-load`. `-report-csv`, `-eva-report-red-statuses`, `-nonterm-log` and `-metrics-output` point into the original run directory, so loading a session from a read-only copy fails with `System error: .../alarms.csv: No such file or directory` until those options are redirected.
+  - `-eva-annot` prints "Annotate f" or "Can not annotate f (no available results)" for each function. That makes it a cheap way to list which unproved functions Eva reached.
+
+**Reduction plugin rechecked (2026-11-14).** The plugin was run with `-reduc -reduc-gen-annot=inout` and `=all` on the same sessions and functions, through the same filter. WP was not re-run: what survived the filter is the same kind of assertion WP was already run on.
+- **No new reach.** It reads the same Eva states, so it has nothing for functions Eva never reached.
+- **Much more output.** On `libseccomp_a`, `all` gives 17,412 assertions (6,294 of them in the unproved functions), against 218 from `-eva-annot`. 5,394 of the 6,294 are full type ranges.
+- **The same 0-or-harness values after filtering.**
+  - `inout`: 4 kept, all `0 ≤ line ≤ 0` inside `if (line == 0)`.
+  - `all`: 36 kept, the same harness zeros repeated (`col->state`, `col->filter_cnt`, `iter`, `line`), plus `col ≡ 0` (a NULL handle) and `col->prgm_bpf ≡ 0`.
+  - libmnl: 0 kept.
+- **Slower and coarser.** It took 130 s with `inout` on `libseccomp_a`, and it cannot be restricted to chosen functions.
+
+It does not do better than `-eva-annot`, so it is not proposed.
+
+Scripts and outputs: scratchpad of session `e4700376` (`t1b/`), not kept.
+
+Design as written before the run:
+
+> **Status at design time: designed on 2026-11-14, Step 0 run on toy code only; nothing built.** It does not reopen Tier 1 by itself: it gives intervals, not the index-against-length relation. It tests whether intervals Eva has already computed help Phase 3 at the point of an Unknown RTE goal, and costs little to try because it needs no OCaml module.
+
+**What the option does (Frama-C 34.0~beta).** `-eva-annot=<f1,...>`, listed under "Output messages" in `frama-c -eva-help-options` (not in the short `-eva-help` overview), adds to each named function an `assert Eva_export: lo ≤ lval ≤ hi;` before each statement, for the l-values that statement reads, with the range Eva computed there. `-print -ocode <file>` writes the annotated code. The Reduction plugin (`-reduc -reduc-gen-annot=inout|all`) does the same with more redundant assertions and float-printed bounds (`s ≥ 0. ∧ s ≤ 0.`), so the trial uses `-eva-annot`.
+
+**Step 0 (2026-11-14, toy code, `framac-analysis:latest`).** An index loop `sum(buf, len)` called with `len ∈ [0..16]` over a 16-byte buffer, and `scale(x, k)` with `k ∈ [1..8]`.
+- **It runs on the saved session.** `frama-c -load framac.sav -eva-annot=sum,scale -then -print -ocode out.c` prints `[eva] Annotate sum` and writes the 9 assertions with no new Eva run. It fits the `collect_flows` step of `run_eva_slice.py`.
+- **Intervals only, as Tier 1 found.** At the loop head: `0 ≤ i ≤ 2147483647` and `0 ≤ len ≤ 16`, so no `i ≤ len`. In the body after the guard: `0 ≤ i ≤ 15`. The useful-looking bounds are the harness's (16 is the buffer size), which is what Tier 1's constant rule suppresses.
+- **The assertions are true in the harness's calling context, not as the function's contract.** WP in a fresh process, with no `requires`, times out on `0 ≤ len ≤ 16` and on most others (11 of 21 goals proved).
+- **Hazard: never run WP in Eva's session.** With `-eva -eva-annot ... -then -wp`, WP takes the `Eva_export` assertions as already valid and its goal count drops from 21 to 6. The pipeline runs WP in a separate process on the spliced sources, so this cannot happen today, and the trial must keep it that way.
+
+**Hypothesis.** At an RTE goal that Phase 3 leaves Unknown, Eva's range of the operands is sometimes narrower than the C type and not derived from a harness constant. For example, a length masked or checked earlier in the same function, or a value read from a table. There it is an `assert` candidate that WP can prove from the function's own code and then use to close the RTE goal.
+
+**Step 1: mechanical oracle, no LLM, one afternoon.** Take the functions with Unknown RTE goals after Phase 3 on one libmnl and one QCBOR module.
+1. Run `-load framac.sav -eva-annot=<those functions>` with the flows time limit. Record the time and the number of assertions.
+2. Filter.
+   - Drop a range equal to the full range of the l-value's type.
+   - Drop a range whose bound is a constant that does not appear literally in the function's source (Tier 1's rule).
+   - Keep only l-values that are operands of an Unknown goal, or are in the same statement as one (Tier 1's `weaken`).
+3. For each function, copy its current merged contract, insert the kept assertions at their statements, and run WP as Phase 3 does (`run_wp_function.py`, same provers and timeouts) in a scratch copy. Count three things:
+   - (a) the kept assertions WP proves from the existing contract alone;
+   - (b) the Unknown RTE goals that become Valid;
+   - (c) the assertions that would need a new `requires` to hold. These are the ones a prover would be tempted to "fix" with a harness-shaped precondition.
+
+**Stop or go.**
+- **Stop:** (b) is zero on both modules, or every gain in (b) rests on an assertion counted in (c). Record the counts here and close the trial.
+- **Go:** at least a few RTE goals close through assertions in (a).
+
+**Step 2, only on go.**
+- In [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py), add `collect_eva_export` next to `collect_flows`, with the same contract: hints only, a time limit, and a `status` field. It runs on the functions with Unknown alarms only.
+- In [`../../scripts/function_facts.py`](../../scripts/function_facts.py), apply the Step 1 filter and render the kept ranges beside the Unknown obligation, under "observed by Eva under this harness".
+- Brief rule (Step B of [`../../skills/framac-wp/prover_brief.md`](../../skills/framac-wp/prover_brief.md)): paste a range as an `assert` only if WP proves it; never add or strengthen a `requires` to make one hold.
+- Put it behind the flag `FRAMAC_EVA_EXPORT_HINTS` (default off); `FRAMAC_PROVER_CONTEXT=off` removes it too.
+- Tests: parsing the annotated code, the three filter rules, and absence with the flag off.
+
+**Acceptance (Step 2).** A benchmark A/B on the flag, measured like Tier 1:
+- prover iterations to `all_proven` and RTE goals left Unknown, on functions that had Unknowns;
+- no rise in `rejected_overconstrained`;
+- a read of the merged contracts for `requires` that bound a value by a harness constant.
+
 **Problem.** Gap 1. The paper's core move is to take the abstract interpreter's loop-head state as the invariant instead of asking a solver to find one (Section 1.1). Its ordering result says to do so up front: 176 solved with abstract interpretation first against 145 with it last (Table 3).
 
 **Step 0: measure the extraction before building anything.** (Original design, kept for reference; the result is above.) Two routes exist, and neither was verified on the Frama-C 35 image when this was written:

@@ -270,6 +270,25 @@ The same rules as the Phase 0 plans:
   - a real uninitialized read still fails;
   - the list parser on a libc snippet.
 - **Acceptance:** the libmnl socket false alarm and minmea's `strtol` stop are gone on their recorded inputs.
+- **Done (2026-11-14, commit `7be8bd1`):**
+  - **The list:** it lives in `EACSL_LIBC_EFFECTS` in `scripts/eacsl_toolchain.py`, not in a JSON file under `templates/fc_stubs/`. Each entry holds the written range as a C statement (`pre`/`post`), which states in/out lengths (`FC_MIN(fc_in, *addrlen)`), the result count of `read`, `recvmsg`'s iovec and failure cases more simply than a length expression. It was written by hand from the libc contracts, not parsed from `share/libc`. `test_effects_table_signatures_match_the_errno_table` checks it against `ERRNO_SHIM_FUNCTIONS`.
+  - **The wrappers:**
+    - They are the errno shim's wrappers (`eacsl_errno_shim.o`), because a function can be wrapped only once. A slice that does not read errno gets the effects alone.
+    - They call `__e_acsl_initialize` only in memory the runtime tracks (`__e_acsl_valid`), and only after `fuzz_init.c` sets `__fc_eacsl_runtime_ready`.
+    - Backlog item 38 is folded in: libc's static results (`strerror`, `gmtime`, ...) come back as a tracked copy.
+    - If the effects fail to compile, the errno wrappers are linked alone (`effects_error`).
+  - **Also fixed:** the `\initialized` check on a `va_list` (`skip_va_list_initialized_checks`). With the `endptr` alarm gone, it was minmea's next false stop.
+  - **Measured:**
+    - libmnl: `mnl_socket_fdopen` stopped at `socket.c:183` before and runs clean after.
+    - minmea: MINMEA-01 now reaches its real bug at `minmea.c:656` on E-ACSL.
+    - The probe, the commands and the remaining gaps are in [`../troubleshooting/eacsl-and-fuzzing.md`](../troubleshooting/eacsl-and-fuzzing.md).
+  - **Not done:**
+    - minmea's `fuzz_rte_initialized: false` was dropped from `benchmark/manifest.json` (2026-11-14). The next benchmark run differs from the stored baselines on minmea's E-ACSL campaign; explain that difference when re-baselining. QCBOR's and CryptoLib's opt-outs stay until they are checked the same way.
+    - `test_every_shim_wrapper_compiles_against_the_host_libc` runs only where clang and glibc headers exist. The image has no pytest, so the full-table compile was checked by hand in the container.
+  - **Tests:**
+    - The Docker-backed `test_libc_shim_clears_libc_false_alarms_and_keeps_real_ones_in_the_analysis_image` (`FRAMAC_DOCKER_TESTS=1`) covers `getsockname`, `strtol`'s `endptr`, `recvmsg`, `strerror`, `gmtime` and `va_arg`, plus two real uninitialized reads next to wrapped calls.
+    - The unit tests check the generated wrappers.
+    - There is no list parser to test, since nothing parses `share/libc`.
 
 ### S10. Engine split decision (D4) (user-triggered, after S9)
 
@@ -373,7 +392,7 @@ S14 ─▶ S3, S6, S11 (it lands first)
 | S6 | M | open |
 | S7 | S | open |
 | S8 | S | open, after S0 |
-| S9 | M | open |
+| S9 | M | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |
 | S10 | — | waits for S9, then the user |
 | S11 | M | open |
 | S12 | S | open (F13 after S10) |
