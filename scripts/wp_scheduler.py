@@ -2257,8 +2257,14 @@ def _describe_repair(task: dict) -> dict:
     # A repaired harness has a new digest, so `build-`/`fuzz-<mod>` refuse it until the reach gate
     # records it again; build-check needs no re-run (the gate reads the current build report).
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run reach-gate")
+    # module-<mod> re-runs fuzz, Eva and facts on the repaired harness. Skipping Eva leaves the alarms, the
+    # facts and the WP queue resting on the old harness, so `refresh` refuses to close the repair until the
+    # fuzz and Eva reports carry the repaired harness's digest (and names the targets still to run).
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run module-{mod}")
-    actions.append(f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}")
+    actions.append(
+        f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}"
+        "  # refuses to close (repair: stale_evidence) until Eva and fuzz were re-run on the repaired harness"
+    )
     return {
         "task": task["id"],
         "kind": "repair",
@@ -3973,21 +3979,99 @@ def cmd_step(
 # ---------------------------------------------------------------------------
 
 
+def _harness_run_flags(ctx: Ctx, harness: str) -> tuple[bool, bool]:
+    """(fuzz, eva): whether Make runs `fuzz-<harness>` and `eva-<harness>`, from the record its plan uses."""
+    import pipeline_make  # noqa: PLC0415 (lazy: only refresh needs the Make layer's module records)
+
+    try:
+        rec = pipeline_make._harness_record(ctx.mm, harness, ctx.modules)
+    except KeyError:
+        rec = ctx.modules.get(harness) or {}
+    eva = bool(rec.get("run_eva")) and not pipeline_make.is_target_fuzzer(ctx.sidecars.get(harness))
+    return bool(rec.get("run_eacsl_fuzz")), eva
+
+
+def _stale_repair_evidence(ctx: Ctx, module: str) -> tuple[list[dict], list[str]]:
+    """
+    Reports of `module`'s harnesses that were not produced from the current (repaired) harness, and the
+    Make targets that still have to run. A fuzz or Eva report must carry the current
+    `phase0_gates.harness_digest(..., ignore_exempt=True)` as `harness_digest`; a report without the field
+    is accepted only when it is newer than the harness files (written before the field existed). The facts
+    must be newer than the Eva report they were joined with.
+    """
+    stale: list[dict] = []
+    targets: list[str] = []
+    run_dir = Path(".")
+    for harness in ctx.harness_modules(module) or [module]:
+        digest = phase0_gates.harness_digest(run_dir, harness, ignore_exempt=True)
+        if digest is None:
+            continue  # no harness of its own: nothing was repaired here
+        files = (HARNESS_DIR / f"harness_{harness}.c", HARNESS_DIR / f"harness_{harness}.json")
+        harness_mtime = max((p.stat().st_mtime for p in files if p.is_file()), default=0.0)
+        fuzz, eva = _harness_run_flags(ctx, harness)
+        eva_stale = False
+        for kind, runs in (("fuzz", fuzz), ("eva", eva)):
+            if not runs:
+                continue
+            path = Path(f"workspace/reports/{kind}/{harness}.json")
+            reason = None
+            if not path.is_file():
+                reason = "missing"
+            else:
+                try:
+                    report = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
+                except ArtifactError:
+                    report = None
+                recorded = report.get("harness_digest") if isinstance(report, dict) else None
+                if not isinstance(report, dict):
+                    reason = "unreadable"
+                elif recorded is None:
+                    if path.stat().st_mtime <= harness_mtime:
+                        reason = "no harness_digest and older than the harness"
+                elif recorded != digest:
+                    reason = "harness_digest differs from the current harness"
+            if reason:
+                stale.append({"module": harness, "report": path.as_posix(), "reason": reason})
+                targets.append(f"{kind}-{harness}")
+                eva_stale = eva_stale or kind == "eva"
+        if eva:
+            facts = Path(f"workspace/reports/facts/{harness}.json")
+            eva_path = Path(f"workspace/reports/eva/{harness}.json")
+            if eva_stale or (
+                eva_path.is_file() and (not facts.is_file() or facts.stat().st_mtime < eva_path.stat().st_mtime)
+            ):
+                targets.append(f"facts-{harness}")
+    return stale, targets
+
+
 def cmd_refresh(module: str | None = None) -> dict:
-    """After the parent repaired a harness (or re-ran a module): close repair:<module> and re-sync."""
+    """
+    After the parent repaired a harness (or re-ran a module): close repair:<module> and re-sync. The repair
+    stays open (`repair: "stale_evidence"`, `targets` to run) while a fuzz or Eva report of the module's
+    harnesses was produced from another harness than the current one.
+    """
     with run_lock("ledger"):
         state = load_schedule()
         out: dict[str, Any] = {"ok": True, "repair": None}
+        ctx = Ctx()
         task = state["tasks"].get(f"repair:{module}") if module else None
         if task is not None and task["state"] not in TERMINAL:
+            stale, targets = _stale_repair_evidence(ctx, str(module))
             if task.get("followup_reasons"):
                 task["reasons"] = task.pop("followup_reasons")
                 _reopen(state, task, "new reasons arrived during the repair")
                 out["repair"] = "reopened"
+            elif stale or targets:
+                out.update(ok=False, repair="stale_evidence", stale_evidence=stale, targets=targets)
+                out["actions"] = [
+                    f"python3 {SCRIPTS}/pipeline_make.py run {' '.join(targets)}",
+                    f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {module}",
+                ]
+                _event(state, "refresh_refused", task["id"], reason=f"stale evidence: {', '.join(targets)}")
             else:
                 _finish(state, task, "done", "refreshed")
                 out["repair"] = "done"
-        out["sync"] = _sync(state, Ctx())
+        out["sync"] = _sync(state, ctx)
         save_schedule(state)
     return out
 

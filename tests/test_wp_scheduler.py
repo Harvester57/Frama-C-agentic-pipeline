@@ -636,7 +636,14 @@ def test_harness_induced_rejection_creates_a_repair_that_holds_the_gate(sim):
     # The repaired harness has a new digest: the reach gate records it before module-m's targets run.
     gate = next(i for i, a in enumerate(actions) if a.endswith("pipeline_make.py run reach-gate"))
     assert gate < next(i for i, a in enumerate(actions) if a.endswith("pipeline_make.py run module-m"))
-    S.cmd_refresh("m")
+    # No fuzz report and no facts yet; the Eva report predates harness_digest and is newer than the harness.
+    assert S.cmd_refresh("m")["targets"] == ["fuzz-m", "facts-m"]
+    digest = phase0_gates.harness_digest(Path("."), "m", ignore_exempt=True)
+    for kind in ("fuzz", "eva"):
+        path = sim.run_dir / f"workspace/reports/{kind}/m.json"
+        write_json(path, {**(load(path) if path.is_file() else {"status": "ok"}), "harness_digest": digest})
+    write_json(sim.run_dir / "workspace/reports/facts/m.json", {"module": "m", "functions": {}})
+    assert S.cmd_refresh("m")["repair"] == "done"
     assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m/f.c#f", "prove:src/m/h.c#h"]
 
 
