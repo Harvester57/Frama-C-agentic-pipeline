@@ -1920,6 +1920,7 @@ def run_campaign_rounds(
     spent = 0.0
     last: dict = {}
     fallback_reason: str | None = None
+    skip_error: str | None = None
     while True:
         budget = max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))
         started = time.monotonic()
@@ -1949,6 +1950,19 @@ def run_campaign_rounds(
             "crashed_cases": crashed,
         }
         rounds.append(rnd)
+        if in_skipped := [c for c in crashed if c in skipped]:
+            # The round ran with these cases skipped and an input still crashed in one: the skip did
+            # not take (runtime skip without a visible environment), or the crash is in harness code
+            # every case runs. Another round would find the same crash again.
+            rnd["stopped"] = "crash_in_skipped_case"
+            rnd["skipped_crashed_cases"] = in_skipped
+            skip_error = (
+                f"round {len(rounds)} crashed in skipped case{'s' if len(in_skipped) > 1 else ''} "
+                f"{', '.join(map(str, in_skipped))}"
+                f" ({'FRAMAC_FUZZ_SKIP_CASES in the environment' if runtime_skip else 'skip rebuild'}"
+                "): the cases were not skipped, or the crash is in harness code before the dispatch"
+            )
+            break
         fresh = [c for c in crashed if c not in skipped]
         new = [c for c in fresh if c < skippable]
         if last.get("status") == "insufficient_memory" or not fresh:
@@ -2022,6 +2036,11 @@ def run_campaign_rounds(
     }
     if runtime_skip:
         out["keep_going"]["runtime_skip"] = True
+    if skip_error:
+        # Not ok: the campaign did not fuzz the cases it meant to. The crashes found stay listed (and
+        # `status` keeps them for ingest); `error_summary` carries the reason to the reader.
+        out["keep_going"].update(status="error", error=skip_error)
+        out["error_summary"] = [*(out.get("error_summary") or []), f"keep-going rounds: {skip_error}"]
     if fallback is not None:
         out["keep_going"]["fork_fallback"] = fallback
     return out
@@ -2050,7 +2069,7 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
     else:
         status = classify_campaign(0, False, artifacts)
     last = list(runs.values())[-1]
-    return {
+    merged = {
         "status": status,
         "returncode": last.get("returncode"),
         "timed_out": any(bool(r.get("timed_out")) for r in runs.values()),
@@ -2059,6 +2078,9 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
         "engines": engines,
         "log_tail": "\n".join(f"--- {e}\n{(r.get('log_tail') or '')[-2000:]}" for e, r in runs.items()),
     }
+    if errors := [f"{engine}: {e}" for engine, run in runs.items() for e in run.get("error_summary") or []]:
+        merged["error_summary"] = errors
+    return merged
 
 
 def classify_campaign(returncode: int, timed_out: bool, artifacts: list[dict]) -> str:
@@ -5690,7 +5712,7 @@ def _run_campaign_mode(args) -> dict:
 
         n_cases = dispatch_case_count(args.sources)
         skippable = dispatch_skippable_cases(args.sources, n_cases) if n_cases is not None else None
-        runtime_skip = bool(
+        harness_runtime_skip = bool(
             n_cases is not None
             and n_cases <= DISPATCH_RUNTIME_SKIP_MAX_CASES
             and harness_supports_runtime_skip_cases(args.sources)
@@ -5698,6 +5720,11 @@ def _run_campaign_mode(args) -> dict:
 
         def _engine_campaign(engine: str, binary: Path, seconds: int) -> dict:
             attribution = attribution_builder if engine == "eacsl" else None
+            # The harness reads the skip set with getenv(); in an E-ACSL build the runtime's
+            # argv/environ setup leaves `environ` empty unless the `environ_keep` shim is linked
+            # (-Wl,--wrap=__e_acsl_memory_init). Without it, skip with rebuilds as for an older harness.
+            shim = (comp.get("environ_keep") or {}).get("status") if engine == "eacsl" else None
+            runtime_skip = harness_runtime_skip and (engine != "eacsl" or shim == "built")
 
             def _campaign(binary: Path, seconds: int, fork: bool, *, extra_env: dict[str, str] | None = None) -> dict:
                 return run_fuzz_campaign(
@@ -5740,6 +5767,11 @@ def _run_campaign_mode(args) -> dict:
                 skippable=skippable,
                 runtime_skip=runtime_skip,
             )
+            if harness_runtime_skip and not runtime_skip and isinstance(out.get("keep_going"), dict):
+                out["keep_going"]["runtime_skip_unavailable"] = (
+                    f"E-ACSL environ shim {shim or 'not built'}: getenv() would not see FRAMAC_FUZZ_SKIP_CASES, "
+                    "so skipped cases are rebuilt out with -DFRAMAC_FUZZ_SKIP_CASES"
+                )
             for art in out.get("artifacts") or []:
                 art["engine"] = engine
             return out
