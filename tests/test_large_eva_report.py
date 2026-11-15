@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from pathlib import Path
@@ -714,3 +715,202 @@ def test_requeue_recovers_killed_prepare_without_burning_dispatches(tmp_path, mo
     assert nxt_recovered["tasks"][0]["agent_id"] == "prove-f-2"
     assert nxt_recovered["tasks"][0]["attempt"] == 1
     assert (tmp_path / "agents" / "prove-f-2" / "brief.md").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Follow-Up 1: Hold `repair:<module>` until all `verify:*` of `<module>` finish
+# ---------------------------------------------------------------------------
+
+
+def test_repair_waits_for_all_open_verifiers_of_module_and_accumulates_reasons(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "target"
+    (target / "src" / "mod_a").mkdir(parents=True)
+    (target / "src" / "mod_b").mkdir(parents=True)
+    for fn in ("f1", "f2", "f3", "h"):
+        (target / "src" / "mod_a" / f"{fn}.c").write_text(f"int {fn}(int *p) {{ return *p; }}\n", encoding="utf-8")
+    (target / "src" / "mod_b" / "g.c").write_text("int g(int *p) { return *p; }\n", encoding="utf-8")
+
+    WO.init_overlay(target, tmp_path / "workspace")
+    write_json(tmp_path / "run-metadata.json", {"profile": "standard"})
+    write_json(
+        tmp_path / "workspace" / "reports" / "callgraph_dag.json",
+        {
+            "schema_version": 1,
+            "module_kind": "link_unit",
+            "callgraph_source": "frama_c",
+            "warnings": [],
+            "modules": {
+                "mod_a": {
+                    "tier": TIER1,
+                    "files": [f"src/mod_a/{fn}.c" for fn in ("f1", "f2", "f3", "h")],
+                    "functions": ["f1", "f2", "f3", "h"],
+                },
+                "mod_b": {
+                    "tier": TIER1,
+                    "files": ["src/mod_b/g.c"],
+                    "functions": ["g"],
+                },
+            },
+            "functions": {
+                **{
+                    fn: {
+                        "name": fn,
+                        "file": f"src/mod_a/{fn}.c",
+                        "module": "mod_a",
+                        "wave": 0,
+                        "callees": [],
+                    }
+                    for fn in ("f1", "f2", "f3", "h")
+                },
+                "g": {"name": "g", "file": "src/mod_b/g.c", "module": "mod_b", "wave": 0, "callees": []},
+            },
+        },
+    )
+    for mod in ("mod_a", "mod_b"):
+        write_json(
+            tmp_path / "workspace" / "harnesses" / f"harness_{mod}.json",
+            {
+                "module": mod,
+                "unit": mod,
+                "sources": [],
+                "cppflags": "-I.",
+                "repair_attempts": 1,
+                "max_repair_attempts": 2,
+            },
+        )
+    write_json(
+        tmp_path / "coverage-ledger.json",
+        sorted(
+            [
+                *[unit(f"src/mod_a/{fn}.c", fn, "rte", module="mod_a", tier=TIER1) for fn in ("f1", "f2", "f3", "h")],
+                unit("src/mod_b/g.c", "g", "rte", module="mod_b", tier=TIER1),
+            ],
+            key=lambda u: u["coverage_id"],
+        ),
+    )
+    write_json(tmp_path / "candidates.json", [])
+
+    eva_a = tmp_path / "workspace" / "reports" / "eva" / "mod_a.json"
+    write_json(
+        eva_a,
+        {
+            "status": "ok",
+            "module": "mod_a",
+            "unknown_obligations_by_function": {},
+            "invalid_alarms": [
+                {"file": f"src/mod_a/{fn}.c", "function": fn, "line": 1, "kind": "mem_access", "annotation": "p != 0"}
+                for fn in ("f1", "f2", "f3")
+            ],
+            "dead_alarms": [],
+            "assumed_properties": [],
+            "functions_with_properties": ["f1", "f2", "f3", "h"],
+        },
+    )
+    eva_b = tmp_path / "workspace" / "reports" / "eva" / "mod_b.json"
+    write_json(
+        eva_b,
+        {
+            "status": "ok",
+            "module": "mod_b",
+            "unknown_obligations_by_function": {},
+            "invalid_alarms": [
+                {"file": "src/mod_b/g.c", "function": "g", "line": 1, "kind": "mem_access", "annotation": "p != 0"}
+            ],
+            "dead_alarms": [],
+            "assumed_properties": [],
+            "functions_with_properties": ["g"],
+        },
+    )
+    L.cmd_ingest_eva([eva_a, eva_b])
+
+    # Give `f3`'s candidate a parent-replayed crash artifact so `v3` can complete as `confirmed`.
+    crash_bytes = b"crash-f3"
+    crash_file = tmp_path / "workspace" / "crashes" / "mod_a" / "crash-f3"
+    crash_file.parent.mkdir(parents=True, exist_ok=True)
+    crash_file.write_bytes(crash_bytes)
+    cands = json.loads((tmp_path / "candidates.json").read_text(encoding="utf-8"))
+    by_fn = {c["location"]["function"]: c for c in cands}
+    fp1, fp2, fp3, fp_b = (
+        by_fn["f1"]["fingerprint"],
+        by_fn["f2"]["fingerprint"],
+        by_fn["f3"]["fingerprint"],
+        by_fn["g"]["fingerprint"],
+    )
+    by_fn["f3"]["reproducers"] = ["workspace/crashes/mod_a/crash-f3"]
+    write_json(tmp_path / "candidates.json", cands)
+    write_json(
+        tmp_path / "workspace" / "reports" / "replay" / f"{S._fp_slug(fp3)}.json",
+        {
+            "status": "ok",
+            "candidate_fingerprint": fp3,
+            "artifacts": [{"sha256": hashlib.sha256(crash_bytes).hexdigest(), "reproducible": True}],
+        },
+    )
+
+    monkeypatch.setattr(S.DEPS, "recommend", lambda max_agents=None: {"max_agents": 4})
+    monkeypatch.setattr(
+        S.DEPS,
+        "prepare_agent",
+        lambda run_dir, aid, role, **kw: {
+            "agent_id": aid,
+            "brief_file": f"agents/{aid}/brief.md",
+            "scratch": f"agents/{aid}/scratch",
+        },
+    )
+
+    S.cmd_init()
+    # Batch 1: dispatch 2 of the 4 verifiers (`f1` and `f2` on `mod_a`, sorted by task id).
+    batch1 = S.cmd_next("2", prepare=False)
+    assert batch1["parent_tasks"] == []
+    dispatched1 = {t["candidate_fingerprint"]: t["agent_id"] for t in batch1["tasks"]}
+    assert set(dispatched1) == {fp1, fp2}
+
+    # `v1` rejects as `harness_induced` while `v2` is `running` and `v3` is still `pending`.
+    aid1 = dispatched1[fp1]
+    L.cmd_scaffold_verifier(fp1, "rejected", aid1, out_path=tmp_path / f"agents/{aid1}/scratch/result.json")
+    comp1 = S.cmd_complete(aid1)
+    assert comp1["decision"] == "rejected"
+    assert "repair:mod_a" in comp1["new_tasks"]
+
+    sched1 = json.loads((tmp_path / "state" / "wp_schedule.json").read_text(encoding="utf-8"))
+    assert sched1["tasks"]["repair:mod_a"]["state"] == "pending"
+    assert sched1["tasks"]["repair:mod_a"]["reasons"] == [f"harness_induced: {fp1}"]
+    assert sorted(sched1["tasks"]["repair:mod_a"]["deps"]) == sorted(
+        [f"verify:{fp1}", f"verify:{fp2}", f"verify:{fp3}"]
+    )
+    assert "repair:mod_a" not in {r["task"] for r in S.cmd_status()["ready"]}
+
+    # `cmd_next` MUST hold `repair:mod_a` and dispatch remaining verifiers (`v3` and `v_b`) instead!
+    batch2 = S.cmd_next("2", prepare=False)
+    assert batch2["parent_tasks"] == []
+    dispatched2 = {t["candidate_fingerprint"]: t["agent_id"] for t in batch2["tasks"]}
+    assert set(dispatched2) == {fp3, fp_b}
+
+    # `v2` also rejects as `harness_induced` while `v3` is still `running`: reason is appended, still held!
+    aid2 = dispatched1[fp2]
+    L.cmd_scaffold_verifier(fp2, "rejected", aid2, out_path=tmp_path / f"agents/{aid2}/scratch/result.json")
+    comp2 = S.cmd_complete(aid2)
+    assert comp2["decision"] == "rejected"
+
+    sched2 = json.loads((tmp_path / "state" / "wp_schedule.json").read_text(encoding="utf-8"))
+    assert sched2["tasks"]["repair:mod_a"]["state"] == "pending"
+    assert sched2["tasks"]["repair:mod_a"]["reasons"] == [
+        f"harness_induced: {fp1}",
+        f"harness_induced: {fp2}",
+    ]
+    assert S.cmd_next("2", prepare=False)["parent_tasks"] == []
+
+    # `v3` finishes `confirmed` while unrelated `mod_b` verifier `v_b` is STILL running:
+    # all `verify:*` tasks of `mod_a` are now terminal, so `repair:mod_a` dispatches ONCE with BOTH reasons!
+    aid3 = dispatched2[fp3]
+    L.cmd_scaffold_verifier(fp3, "confirmed", aid3, out_path=tmp_path / f"agents/{aid3}/scratch/result.json")
+    comp3 = S.cmd_complete(aid3)
+    assert comp3["decision"] == "confirmed"
+
+    nxt_repair = S.cmd_next("2", prepare=False)
+    assert [p["task"] for p in nxt_repair["parent_tasks"]] == ["repair:mod_a"]
+    assert nxt_repair["parent_tasks"][0]["reasons"] == [
+        f"harness_induced: {fp1}",
+        f"harness_induced: {fp2}",
+    ]

@@ -1431,6 +1431,8 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
             task["wp_blockers"] = ctx.wp_blockers(task["file"], task["function"])
         elif task["kind"] == "arch":
             task["deps"] = [f"gate:{task['module']}"]
+        elif task["kind"] == "repair":
+            task["deps"] = _repair_verify_deps(tasks, task["module"], ctx)
         elif task["kind"] in ("breaker", "negotiate"):
             task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task.get("function") or "")
     # Architects of modules sharing a header run one after the other: the second merge would
@@ -1714,6 +1716,8 @@ class _View:
             for member in members
             for dep in _deps(self.tasks[member])
         )
+        if ok and task["kind"] == "repair":
+            ok = all(self.terminal(vtid) for vtid in _repair_verify_deps(self.tasks, task["module"], self.ctx))
         if scc:
             self._group_ready[scc] = ok
         return ok
@@ -2223,6 +2227,20 @@ def _verify_harness_module(task: dict, ctx: Ctx | None = None) -> str:
             mm, mod, task.get("location_file"), task.get("location_function") or task.get("function")
         )
         or mod
+    )
+
+
+def _repair_verify_deps(tasks: dict[str, dict], module: str, ctx: Ctx | None = None) -> list[str]:
+    """
+    Every `verify:*` task answering to `module`'s harness: `repair:<module>` stays pending and
+    accumulates `harness_induced` reasons until all open verifiers of `module` reach a terminal state.
+    """
+    if not module or module == "unknown":
+        return []
+    return sorted(
+        tid
+        for tid, t in tasks.items()
+        if t["kind"] == "verify" and (t.get("module") == module or _verify_harness_module(t, ctx) == module)
     )
 
 
@@ -2917,7 +2935,7 @@ def _ensure_breaker(state: dict, prove_task: dict, agent_id: str, wp_report: str
     out.setdefault("new_tasks", []).append(tid)
 
 
-def _ensure_repair(state: dict, module: str, reason: str, out: dict) -> None:
+def _ensure_repair(state: dict, module: str, reason: str, out: dict, ctx: Ctx | None = None) -> None:
     tid = f"repair:{module}"
     task = state["tasks"].get(tid)
     if task is None:
@@ -2929,6 +2947,7 @@ def _ensure_repair(state: dict, module: str, reason: str, out: dict) -> None:
         task.setdefault("followup_reasons", []).append(reason)
     elif reason not in task.setdefault("reasons", []):
         task["reasons"].append(reason)
+    task["deps"] = _repair_verify_deps(state["tasks"], module, ctx)
     out.setdefault("new_tasks", []).append(tid)
 
 
@@ -3390,7 +3409,7 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
     )
     if harness_induced and not ing.get("harness_exhausted"):
         # The harness to repair (`pipeline_make.py run module-<harness>`), never a bare link unit.
-        _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out)
+        _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out, ctx=ctx)
     _finish(state, task, "done", str(ing.get("decision")))
     out.update(action="ingested", decision=ing.get("decision"), harness_exhausted=ing.get("harness_exhausted"))
 
