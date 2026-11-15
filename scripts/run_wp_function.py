@@ -1085,13 +1085,36 @@ def _prove_then_collect_models(call_args: dict[str, Any]) -> dict:
     for the crash verifiers, not proofs that a clause is false.
     """
     res = run_wp_on_function(**{**call_args, "counter_examples": False})
+    return collect_counter_example_models(res, call_args)
+
+
+def needs_model_pass(res: dict) -> bool:
+    """Whether a verdict leaves failed goals a counter-example pass could give models for."""
+    return res.get("status") == "unproven_goals_remain" and bool(res.get("unproven_goals"))
+
+
+def collect_counter_example_models(res: dict, call_args: dict[str, Any]) -> dict:
+    """The -wp-counter-examples pass for the verdict `res` of a proof run with `call_args`.
+
+    It never changes the verdict. It is skipped when no goal failed, and when the verdict pass found the
+    prover budget exhausted: the model pass ignores the budget (it is no proof iteration), so starting it
+    then would be a full WP run the budget had just refused.
+    """
     res["counter_examples"] = True
     res["counter_example_goals"] = []
-    if res.get("status") != "unproven_goals_remain" or not res.get("unproven_goals"):
+    if not needs_model_pass(res):
+        res.pop("counter_example_pass", None)
+        return res
+    if res.get("budget_exhausted"):
+        res["counter_example_pass"] = {
+            "status": "skipped",
+            "reason": "prover budget exhausted: the verdict pass ran no WP, so no model pass either",
+        }
         return res
     out_dir = Path(call_args["out_dir"])
     fn_name = str(call_args["fn_name"])
-    suffix = str(call_args["artifact_suffix"])
+    base_suffix = str(call_args.get("artifact_suffix") or "")
+    suffix = base_suffix
     if res.get("bitwise_retry"):
         suffix += "_retry"
     elif res.get("tail_retry"):
@@ -1101,13 +1124,13 @@ def _prove_then_collect_models(call_args: dict[str, Any]) -> dict:
         failed = parse_failed_wp_goals(proof_log.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         failed = set()
-    model_suffix = f"{call_args['artifact_suffix']}{_MODEL_PASS_SUFFIX}"
+    model_suffix = f"{base_suffix}{_MODEL_PASS_SUFFIX}"
     try:
         model_res = run_wp_on_function(
             **{
                 **call_args,
                 "counter_examples": True,
-                "wp_model": res.get("wp_model") or call_args["wp_model"],
+                "wp_model": res.get("wp_model") or call_args.get("wp_model") or "Typed",
                 "artifact_suffix": model_suffix,
                 "retry_bitwise": False,
                 "retry_tail": False,
@@ -2475,37 +2498,39 @@ def main(argv: list[str] | None = None) -> int:
     whole_run = not (args.prop or args.dump_goal)
     digest_before = prover_candidates.digest_before_run(args.out_json) if whole_run else None
     security_meta = resolve_security_meta(args.security_props, args.file, args.function, args.out_dir)
-    res = run_wp_on_function(
-        c_file=args.file,
-        fn_name=args.function,
-        out_dir=args.out_dir,
-        machdep=args.machdep,
-        cppflags=args.cppflags,
-        provers=args.provers,
-        wp_par=args.wp_par,
-        timeout=args.timeout,
-        wp_steps=args.wp_steps,
-        wp_model=args.wp_model,
-        check_memory_model=not args.no_check_memory_model,
-        warn_invalid_pointer=not args.no_warn_invalid_pointer,
-        unsigned_reduced=args.no_warn_unsigned,
-        warn_unsigned_downcast=not args.no_warn_unsigned_downcast,
-        retry_bitwise=not args.no_retry_bitwise,
-        retry_tail=not args.no_retry_tail,
-        smoke_tests=args.smoke_tests,
-        counter_examples=args.counter_examples,
-        prop=args.prop,
-        dump_goal=args.dump_goal,
-        session_dir=args.session_dir,
-        extra_sources=args.extra_sources,
-        wall_timeout=default_wall_timeout(args.wall_timeout),
-        cache_dir=args.cache_dir,
-        sarif=args.sarif,
-        keep_goals=args.keep_goals,
-        wp_blockers=args.wp_blockers,
-        ignore_prover_budget=args.ignore_prover_budget,
-        security_meta=security_meta,
-    )
+    wp_kwargs: dict[str, Any] = {
+        "c_file": args.file,
+        "fn_name": args.function,
+        "out_dir": args.out_dir,
+        "machdep": args.machdep,
+        "cppflags": args.cppflags,
+        "provers": args.provers,
+        "wp_par": args.wp_par,
+        "timeout": args.timeout,
+        "wp_steps": args.wp_steps,
+        "wp_model": args.wp_model,
+        "check_memory_model": not args.no_check_memory_model,
+        "warn_invalid_pointer": not args.no_warn_invalid_pointer,
+        "unsigned_reduced": args.no_warn_unsigned,
+        "warn_unsigned_downcast": not args.no_warn_unsigned_downcast,
+        "retry_bitwise": not args.no_retry_bitwise,
+        "retry_tail": not args.no_retry_tail,
+        "smoke_tests": args.smoke_tests,
+        "prop": args.prop,
+        "dump_goal": args.dump_goal,
+        "session_dir": args.session_dir,
+        "extra_sources": args.extra_sources,
+        "wall_timeout": default_wall_timeout(args.wall_timeout),
+        "cache_dir": args.cache_dir,
+        "sarif": args.sarif,
+        "keep_goals": args.keep_goals,
+        "wp_blockers": args.wp_blockers,
+        "ignore_prover_budget": args.ignore_prover_budget,
+        "security_meta": security_meta,
+    }
+    # --counter-examples: the verdict pass first; its report is written before the model pass starts
+    # (below), so a kill during that second full WP run never loses the verdict.
+    res = run_wp_on_function(**wp_kwargs, counter_examples=False)
     if args.no_warn_unsigned and whole_run:
         res = check_declared_wraps(
             res,
@@ -2544,6 +2569,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     apply_verdict_limits(res, args.file, vacuity)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
+    if args.counter_examples:
+        res["counter_examples"] = True
+        res["counter_example_goals"] = []
+        if needs_model_pass(res) and not res.get("budget_exhausted"):
+            res["counter_example_pass"] = {"status": "pending"}
+            args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+        res = collect_counter_example_models(res, wp_kwargs)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = {
         "status": res["status"],
