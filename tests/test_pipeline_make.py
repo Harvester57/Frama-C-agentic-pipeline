@@ -1203,7 +1203,10 @@ def test_make_dry_run(tmp_path):
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    argv = json.loads(next(line for line in proc.stdout.splitlines() if line.startswith("ARGV "))[5:])
+    # The recipe runs the Phase 0 gate command first (no `--`): take the Eva run's command line.
+    argv = json.loads(
+        next(line for line in proc.stdout.splitlines() if line.startswith("ARGV ") and "run_eva_slice.py" in line)[5:]
+    )
     tool = argv[argv.index("--") + 1 :]
     cppflags = next(a for a in tool if a.startswith("--cppflags="))[len("--cppflags=") :]
     assert shlex.split(cppflags)[:3] == ["-I.", "-DQ=$5#x", '-DFMT="%s"']
