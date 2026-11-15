@@ -1,9 +1,11 @@
 # `QCBORDecode_GetArray()` / `GetMap()` return an uninitialized length for an empty array or map
 
-**Report privately.** Send this to lgl@island-resort.com with "QCBOR SECURITY" in the subject, as
-QCBOR's `SECURITY.md` asks, or use GitHub private vulnerability reporting on the repository, which
-is enabled. Do not open a public issue or push this file before the fix is public.
-Patch: [`patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch`](./patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch).
+Private report for the QCBOR maintainer. Attached with it:
+- `0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch`, the fix with tests, for
+  `dev` at `19c3367`;
+- `getarray_empty.c`, the reproducer.
+
+Line numbers below are for `dev` at `19c3367`.
 
 ## Summary
 
@@ -26,14 +28,15 @@ input buffer. A small garbage length gives a disclosure; a huge one gives a cras
 
 | | |
 | :--- | :--- |
-| **Affected** | `dev` only: introduced by 33cf49e (#431, 2026-11-02, "Fixes for GetArray()/GetMap() …"), present at 9bd0845. **Not** in v2.0-alpha-6 or any 1.x release. |
+| **Affected** | `dev` only: introduced by 33cf49e (#431, 2026-11-02, "Fixes for GetArray()/GetMap() …"), still present at `19c3367`. **Not** in v2.0-alpha-6 or any 1.x release. |
 | **Severity** | High for code built from `dev`. An attacker needs one byte of CBOR to trigger it. The out-of-bounds read happens in the caller's use of the returned length. |
 | **Reachability** | Untrusted decode input, through the documented public API. |
 
 ## Reproducer
 
-[`repro/getarray_empty.c`](./repro/getarray_empty.c). Its `Scribble()` fills the stack with `0x41` first, so a plain
-build shows a recognizable value:
+`getarray_empty.c` (attached). It takes the case to run as its argument: `top` (the default),
+`map`, `nested` or `indef`, in the order of the table above. Its `Scribble()` fills the stack with `0x41` first, so a plain build shows a
+recognizable value:
 
 ```c
 static const uint8_t aTop[] = {0x80};              /* [] */
@@ -42,6 +45,8 @@ QCBORDecode_GetArray(&D, &Item, &Enc);
 printf("error=%d len=%zu\n", QCBORDecode_GetError(&D), Enc.len);
 ```
 
+Build it from the top of a QCBOR checkout:
+
 ```text
 $ clang -g -O0 -Iinc -Isrc getarray_empty.c src/*.c -lm
 $ ./a.out top
@@ -49,20 +54,20 @@ top    error=0  len=4702111234474983745 (expect 1)
 $ ./a.out map
 map    error=0  len=4702111234474983745 (expect 1)
 
-$ clang -g -O1 -fsanitize=memory -fsanitize-memory-track-origins=2 ...
+$ clang -g -O1 -fsanitize=memory -fsanitize-memory-track-origins=2 -Iinc -Isrc getarray_empty.c src/*.c -lm
 $ ./a.out top
 WARNING: MemorySanitizer: use-of-uninitialized-value
   Uninitialized value was stored to memory at
-    #0 in QCBORDecode_Private_GetArrayOrMap src/qcbor_main_decode.c:2551:22
+    #0 in QCBORDecode_Private_GetArrayOrMap src/qcbor_main_decode.c:2578:22
   Uninitialized value was created by an allocation of 'End' in the stack frame
-    #0 in QCBORDecode_Private_GetArrayOrMap src/qcbor_main_decode.c:2488:4
+    #0 in QCBORDecode_Private_GetArrayOrMap src/qcbor_main_decode.c:2515:4
 ```
 
 MSan reports the same for `nested`, `map` and `indef`.
 
 ## Root cause
 
-`QCBORDecode_Private_GetArrayOrMap()` ([`qcbor_main_decode.c:2488-2552`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_main_decode.c#L2488-L2552))
+`QCBORDecode_Private_GetArrayOrMap()` ([`qcbor_main_decode.c:2515-2579`](https://github.com/laurencelundblade/QCBOR/blob/19c3367c0bf7db3ffcc8bc5626d7740dc5b8a76e/src/qcbor_main_decode.c#L2515-L2579))
 declares `struct ItemEndTracker End`. It sets only `End.uTargetLevel`, then reads `End.uEndOffset`
 at the end:
 
@@ -91,7 +96,8 @@ if(pEnd != NULL &&
 ```
 
 The patch adds tests 110–113 to `GetMapAndArrayTest`, one for each input in the table above, each
-expecting a length of 1.
+expecting the one-byte encoding back. Test 113 is skipped under
+`QCBOR_DISABLE_INDEFINITE_LENGTH_ARRAYS`.
 
 A defensive alternative would be to initialize `End.uEndOffset` to an invalid value and fail
 with an error if it is still unset. That would stop a wrong length from ever leaving the
@@ -99,10 +105,14 @@ function. It could be added on top of this fix.
 
 ## Validation
 
-Validated with clang 19.1.7 on Linux x86_64:
-- All four cases return `len=1` in plain and MSan builds, with no MSan report.
-- The test suite passes (89/89) in plain, ASan + recoverable UBSan, and MSan builds.
-- On the sources before this patch, the new test fails: `GetMapAndArrayTest FAILED (returned 110)`.
+On `dev` at `19c3367`, with gcc 14.2.0 and clang 19.1.7 on Linux x86_64:
+- `make warn` builds with no new warning and the test suite passes in all 12 CI configurations
+  (no `#define`, and each of the 11 `QCBOR_DISABLE_*` / `USEFULBUF_DISABLE_*` options), with gcc
+  and clang.
+- The test suite passes (90/90) under ASan + UBSan and under MSan
+  (`-fno-sanitize-memory-param-retval`). UBSan reports nothing new.
+- On the unpatched sources, the new test fails: `GetMapAndArrayTest FAILED (returned 110)`.
+- All four reproducer cases return `len=1` in plain and MSan builds, with no MSan report.
 
 ## Credit
 

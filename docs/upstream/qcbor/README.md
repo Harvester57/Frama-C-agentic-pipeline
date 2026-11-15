@@ -75,9 +75,10 @@ The `NN-*-issue.md` and `NN-*-pr.md` files are paste-ready bodies. Their titles:
 | 07 | `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before the start of its buffer | Reject uMinLen > 8 in QCBOREncode_EncodeHead() (and "(1.x)" for `master`) |
 | 10 | `QCBORDecode_VGetNextConsume()` on a truncated array or map leaves `uNextNestLevel` uninitialized | Don't set uNextNestLevel when consuming an array or map stops early (and "(1.x)" for `master`) |
 
-The longer `NN-<slug>.md` drafts (02 to 09) are the original analysis against `9bd0845`, kept as
-background. Their line numbers and test counts (89) are from `9bd0845`; the filing texts use `19c3367`
-(90 tests).
+The longer `NN-<slug>.md` drafts (02 to 07, and 09) are the original analysis against `9bd0845`,
+kept as background. Their line numbers and test counts (89) are from `9bd0845`; the filing texts use
+`19c3367` (90 tests). The 01 and 08 reports are the email attachments themselves: they use `19c3367`
+and name the other attachments by file name, with no links into this repository.
 
 **Why 08 and 01 are private.** Both are out-of-bounds reads that data can trigger.
 - **08** is triggered by a single byte of untrusted input (`80`) through the decoder, QCBOR's main

@@ -5,7 +5,7 @@ Draft, not sent. It follows up the private report of 2026-11-04 (the `ieee754.c`
 Before sending, fill in the point marked **[check]**. Attach:
 - [`patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch`](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch) (09, rebased on `dev` `19c3367`);
 - [`patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](./patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch) (04 for 1.x), only if you want to offer it;
-- for 01 and 08, the two report files, the two patches in `patches/private/`, and the two reproducers `repro/bignum_zero.c` and `repro/getarray_empty.c`.
+- for 01 and 08, the two reports [`01-bignum-all-zero-overread.md`](./01-bignum-all-zero-overread.md) and [`08-getarray-empty-container-length.md`](./08-getarray-empty-container-length.md) (written to be sent as they are), the two patches in `patches/private/`, and the two reproducers `repro/bignum_zero.c` and `repro/getarray_empty.c`.
 
 Both private patches are rebased on `dev` `19c3367` and validated there (2026-11-15; see the README).
 
