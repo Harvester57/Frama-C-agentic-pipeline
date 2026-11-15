@@ -472,6 +472,21 @@ def test_a_preprocessing_failure_is_named_and_leaves_the_function_unscored(tmp_p
     assert f["error"].startswith("preprocessing failed for every mutant: m.c:1:10: fatal error")
 
 
+def test_a_preprocessing_analysis_error_is_named_and_leaves_the_function_unscored(tmp_path: Path) -> None:
+    # run_wp_function.py now reports a failed `gcc -E` as analysis_error with a preprocessing_failed reason.
+    fatal = "m.c:1:10: fatal error: libmnl/libmnl.h: No such file or directory"
+    report = {
+        "status": "analysis_error",
+        "reason": f"preprocessing_failed: {fatal}",
+        "preprocess_errors": [fatal, "[kernel] User Error: failed to run: gcc -E -C -I. m.c"],
+    }
+    c_file = _write(tmp_path, "m.c", SRC)
+    f = mc.check_function(c_file, "sum", "-I.", tmp_path / "out", wp_runner=lambda *a, **k: dict(report))
+    tried = [d for d in f["details"] if d.get("status") is not None]
+    assert tried and all(d["failure"] == "preprocessing_failed" for d in tried)
+    assert f["error"].startswith("preprocessing failed for every mutant: m.c:1:10: fatal error")
+
+
 def test_an_acsl_error_is_not_a_preprocessing_failure(tmp_path: Path) -> None:
     c_file = _write(tmp_path, "m.c", SRC)
 

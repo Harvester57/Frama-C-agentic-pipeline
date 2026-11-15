@@ -411,8 +411,7 @@ def test_wp_counter_example_model_goals_parse():
         "[wp] [Valid] typed_ok (Alt-Ergo)\n"
         "[wp] [Unsuccess] typed_wrong_ensures (Z3) (Model)\n"
     )
-    goals = [{"goal": m.group(1).strip(), "prover": m.group(2).strip()} for m in W._MODEL_GOAL_RE.finditer(log)]
-    assert goals == [
+    assert W.parse_model_goals(log) == [
         {"goal": "typed_check_lemma_wrong", "prover": "CVC4"},
         {"goal": "typed_wrong_ensures", "prover": "Z3"},
     ]

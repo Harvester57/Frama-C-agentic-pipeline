@@ -5,7 +5,10 @@ Drives Frama-C WP + RTE deductive verification on a single C function (-wp-fct).
    -wp-rte -warn-invalid-pointer -warn-unsigned-overflow -warn-unsigned-downcast
    -wp-split) and parallel SMT solvers (Alt-Ergo, Z3, CVC5). The ACSL syntax/type
    check is folded into this run (-kernel-warn-key annot-error=abort): a kernel
-   parse or annotation error still yields status `acsl_syntax_error`.
+   parse or annotation error still yields status `acsl_syntax_error`. A failed
+   preprocessor run (`gcc -E`: missing header, wrong include flags) is a build
+   configuration error, reported as `analysis_error` with reason
+   `preprocessing_failed: <first cpp error>` and the messages in `preprocess_errors`.
 2. Sizes itself from the job budget (scripts/resources.py): `--wp-par auto` scales the
    number of concurrent provers with CPUs and memory, while `-wp-memlimit` stays fixed
    at 1000 MB so a proof never depends on the machine.
@@ -43,6 +46,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -52,6 +56,7 @@ import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import find_named_clause, is_trivial_predicate  # noqa: E402
 from framac_common import (  # noqa: E402
+    _CPP_ERROR_RE,
     STATUS_DEAD,
     STATUS_INVALID,
     STATUS_INVALID_UNDER_HYP,
@@ -137,8 +142,34 @@ _FPV_DEGEN_RE = re.compile(
     re.MULTILINE,
 )
 # With -wp-counter-examples, failed goals carry a witness model: "[wp] [Unsuccess] <goal> (<prover>) (Model)"
-# (upstream plugins/wp/tests/wp_ce oracle format).
-_MODEL_GOAL_RE = re.compile(r"\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout)\] ([^\n(]+?) \(([^)]+)\) \(Model\)")
+# (upstream plugins/wp/tests/wp_ce oracle format), or with Frama-C 34's tags
+# "[wp] [Unknown] <goal> (Qed 2ms) (CVC5) (Cached) (Model)".
+_MODEL_GOAL_RE = re.compile(
+    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout)\] ([A-Za-z_]\w*)((?: \([^)\n]*\))*?) \(Model\)",
+    re.MULTILINE,
+)
+# Every goal WP reports as not proved, with or without a model.
+_FAILED_GOAL_RE = re.compile(
+    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout|Incorrect|Invalid)\] ([A-Za-z_]\w*)", re.MULTILINE
+)
+_PAREN_TAG_RE = re.compile(r"\(([^)\n]*)\)")
+# Artifact suffix of the -wp-counter-examples pass (run_wp_on_function): it never decides a status.
+_MODEL_PASS_SUFFIX = "_cex"
+
+
+def parse_model_goals(log: str) -> list[dict[str, str]]:
+    """The goals of a -wp-counter-examples log that carry a model, with the prover that produced it."""
+    goals: list[dict[str, str]] = []
+    for m in _MODEL_GOAL_RE.finditer(log):
+        tags = [t.strip() for t in _PAREN_TAG_RE.findall(m.group(2))]
+        provers = [t for t in tags if t and t != "Cached" and not re.match(r"Qed\b", t)]
+        goals.append({"goal": m.group(1), "prover": provers[-1] if provers else ""})
+    return goals
+
+
+def parse_failed_wp_goals(log: str) -> set[str]:
+    """Names of the goals a WP log reports as not proved."""
+    return set(_FAILED_GOAL_RE.findall(log))
 _VC_DUMP_RE = re.compile(
     r"-{20,}\n(\s*Goal [^\n]+:.*?)(?=\n-{20,}|\Z)",
     re.DOTALL,
@@ -327,6 +358,26 @@ def check_acsl_syntax(
 _PLUGIN_USER_ERROR_RE = re.compile(
     r"^\[(?!kernel\b)[A-Za-z][\w-]*(?::[^\]]*)?\][^\n]*user error", re.IGNORECASE | re.MULTILINE
 )
+
+
+# The kernel's message when the preprocessor command itself fails (missing header, bad include path).
+_PREPROCESS_FAILED_RE = re.compile(r"^\[kernel\][^\n]*User Error: failed to run:", re.IGNORECASE | re.MULTILINE)
+PREPROCESSING_FAILED = "preprocessing_failed"
+
+
+def _preprocess_failure(
+    log_text: str, returncode: int | None, timed_out: bool, report_exists: bool
+) -> tuple[str, list[str]] | None:
+    """
+    (reason, errors) when the run stopped because `gcc -E` failed, else None. A build-configuration
+    error (wrong or missing --cppflags), never an ACSL syntax error: the annotations were not read.
+    """
+    if timed_out or returncode in (0, None) or report_exists or not _PREPROCESS_FAILED_RE.search(log_text or ""):
+        return None
+    cpp_lines = [line.strip() for line in (log_text or "").splitlines() if _CPP_ERROR_RE.match(line)]
+    errors = list(dict.fromkeys([*cpp_lines, *kernel_parse_errors(log_text)]))
+    first = cpp_lines[0] if cpp_lines else "the C preprocessor (gcc -E) failed"
+    return f"{PREPROCESSING_FAILED}: {first}"[:300], errors
 
 
 def _folded_syntax_errors(
@@ -660,6 +711,15 @@ def derive_wp_diagnostic_hints(
                 "(\\result, \\old, \\valid, \\valid_read, \\separated, \\forall, \\nothing), and function/loop "
                 "clause order is respected."
             )
+        return hints
+
+    if status == "analysis_error" and str(res.get("reason") or "").startswith(PREPROCESSING_FAILED):
+        _add(
+            "The C preprocessor (gcc -E) failed before any annotation was read: a missing header or wrong "
+            "include path, not an ACSL error and not something a re-run fixes. Re-run with the module's preprocessor "
+            "flags (run_wp_function --cppflags as in the scheduler's command; workspace_overlay merge-agent "
+            "--module <m>) and leave the contract unchanged."
+        )
         return hints
 
     if status == "analysis_error":
@@ -1012,6 +1072,67 @@ def _sources_hold_eva_taint(sources: list[str]) -> bool:
     return False
 
 
+def _prove_then_collect_models(call_args: dict[str, Any]) -> dict:
+    """--counter-examples: prove without -wp-counter-examples, then take models for the goals still failing.
+
+    Frama-C 34 WP builds weaker goals under -wp-counter-examples (the model probes keep memory variables
+    apart, and the frame equalities Qed uses are lost: `ensures p->ptr == \\old(p->ptr)` for an untouched
+    pointer field is `Prove: true` normally, `Prove: Mptr_0[a] = Mptr_1[a]` with nothing relating the two
+    memories in counter-example mode). So the verdict, counts, report CSV and SARIF all come from the normal
+    proof pass, retries included; the model pass runs only when goals fail, writes its own `_cex` artifacts,
+    and only contributes `counter_example_goals` for goals the proof pass also failed. Its models are hints
+    for the crash verifiers, not proofs that a clause is false.
+    """
+    res = run_wp_on_function(**{**call_args, "counter_examples": False})
+    res["counter_examples"] = True
+    res["counter_example_goals"] = []
+    if res.get("status") != "unproven_goals_remain" or not res.get("unproven_goals"):
+        return res
+    out_dir = Path(call_args["out_dir"])
+    fn_name = str(call_args["fn_name"])
+    suffix = str(call_args["artifact_suffix"])
+    if res.get("bitwise_retry"):
+        suffix += "_retry"
+    elif res.get("tail_retry"):
+        suffix += "_tail"
+    proof_log = out_dir / f"wp_{fn_name}{suffix}.log"
+    try:
+        failed = parse_failed_wp_goals(proof_log.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        failed = set()
+    model_suffix = f"{call_args['artifact_suffix']}{_MODEL_PASS_SUFFIX}"
+    try:
+        model_res = run_wp_on_function(
+            **{
+                **call_args,
+                "counter_examples": True,
+                "wp_model": res.get("wp_model") or call_args["wp_model"],
+                "artifact_suffix": model_suffix,
+                "retry_bitwise": False,
+                "retry_tail": False,
+                "retry_cast_probe": False,
+                "smoke_tests": False,
+                "sarif": False,
+                "keep_goals": False,
+                "dump_goal": False,
+                "session_dir": None,
+                "ignore_prover_budget": True,
+            }
+        )
+    except Exception as exc:  # a failed model pass never changes the proof result
+        model_res = {"status": "model_pass_error", "reason": f"{type(exc).__name__}: {exc}"}
+    res["counter_example_goals"] = [
+        g for g in model_res.get("counter_example_goals") or [] if g.get("goal") in failed
+    ]
+    res["counter_example_pass"] = {
+        "status": model_res.get("status"),
+        "log": str(out_dir / f"wp_{fn_name}{model_suffix}.log"),
+        "models_dropped_for_proved_goals": len(model_res.get("counter_example_goals") or [])
+        - len(res["counter_example_goals"]),
+    }
+    return res
+
+
 def run_wp_on_function(
     c_file: Path,
     fn_name: str,
@@ -1045,10 +1166,15 @@ def run_wp_on_function(
     retry_cast_probe: bool = True,
     security_meta: dict | None = None,
 ) -> dict:
+    call_args: dict[str, Any] = dict(locals())  # first statement: exactly this call's arguments
+    if counter_examples and not artifact_suffix.endswith(_MODEL_PASS_SUFFIX):
+        return _prove_then_collect_models(call_args)
     out_dir.mkdir(parents=True, exist_ok=True)
     par = resolve_wp_par(wp_par)
     wp_cache = resolve_wp_cache_dir(cache_dir)
-    use_wp_cache = wp_cache is not None and not dump_goal
+    # The counter-example pass proves weaker goals: none of its results may reach the shared prover cache.
+    model_pass = counter_examples and artifact_suffix.endswith(_MODEL_PASS_SUFFIX)
+    use_wp_cache = wp_cache is not None and not dump_goal and not model_pass
     sizing = {
         "wp_par": par,
         "wp_memlimit_mb": WP_MEMLIMIT_MB,
@@ -1056,7 +1182,7 @@ def run_wp_on_function(
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
     scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
-    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe")):
+    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe", _MODEL_PASS_SUFFIX)):
         if _is_synthetic_probe_file(c_file, scratch_dir):
             probe_msg = (
                 f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
@@ -1333,6 +1459,9 @@ def run_wp_on_function(
     elif use_wp_cache:
         # Frama-C's own goal digests: unchanged goals are not re-proved across iterations.
         cmd.extend(["-wp-cache", "update", "-wp-cache-dir", str(wp_cache)])
+    elif model_pass:
+        # Without an explicit mode WP still reads and writes its default cache.
+        cmd.extend(["-wp-cache", "none"])
     if smoke_tests:
         cmd.extend(["-wp-smoke-tests", "-wp-smoke-timeout", str(min(timeout, 5))])
     if counter_examples:
@@ -1375,6 +1504,29 @@ def run_wp_on_function(
             shutil.rmtree(tmp_goals, ignore_errors=True)
     combined_log = (stdout or "") + "\n" + (stderr or "")
     log_path.write_text(combined_log, encoding="utf-8")
+
+    preprocess = _preprocess_failure(combined_log, returncode, timed_out, csv_path.exists())
+    if preprocess is not None:
+        pp_reason, pp_errors = preprocess
+        pp_res = _analysis_error_result(
+            fn_name,
+            c_file,
+            pp_reason,
+            returncode,
+            scan_wp_log_soundness(
+                combined_log,
+                check_memory_model=check_memory_model,
+                unsigned_reduced=unsigned_reduced,
+                warn_invalid_pointer=warn_invalid_pointer,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+            ),
+            combined_log,
+        )
+        pp_res["preprocess_errors"] = pp_errors
+        if unframed_var_callees:
+            pp_res["unframed_variadic_callees"] = unframed_var_callees
+        pp_res["sizing"] = sizing
+        return pp_res
 
     syntax_errors = _folded_syntax_errors(combined_log, returncode, timed_out, csv_path.exists())
     if syntax_errors is not None:
@@ -1732,9 +1884,7 @@ def run_wp_on_function(
     else:
         next_focus = "complete"
 
-    model_goals = [
-        {"goal": m.group(1).strip(), "prover": m.group(2).strip()} for m in _MODEL_GOAL_RE.finditer(combined_log)
-    ]
+    model_goals = parse_model_goals(combined_log) if counter_examples else []
 
     res = {
         "status": status,

@@ -196,6 +196,46 @@ def test_folded_syntax_check_still_reports_acsl_syntax_error(tmp_path, monkeypat
     assert len(fake.calls) == 1
 
 
+# QCBOR run-6: the parent WP re-check of a merge ran without the module's include paths (-I. only).
+MISSING_HEADER_LOG = (
+    "[kernel] Parsing workspace/work/src/qcbor_main_decode.c (with preprocessing)\n"
+    "[kernel] User Error: failed to run: gcc -E -C -I. -I'/tmp/__fc_machdepe14a11.dir' "
+    "-I'/home/opam/.opam/5.5/share/frama-c/share/libc' -D__FRAMAC__ -dD -nostdinc -undef "
+    "-I/framac-run/workspace/stubs -I. -idirafter /usr/include "
+    "'/framac-run/workspace/work/src/qcbor_main_decode.c' -o '/tmp/qcbor_main_decode.cfac59d.i'\n"
+    "  (PWD: /framac-run)\n"
+    '  See chapter "Preparing the Sources" in the Frama-C user manual for more details.\n'
+    "[kernel] Frama-C aborted: invalid user input.\n"
+    "\n"
+    "/framac-run/workspace/work/src/qcbor_main_decode.c:36:10: fatal error: qcbor/qcbor_main_decode.h: "
+    "No such file or directory\n"
+    '   36 | #include "qcbor/qcbor_main_decode.h"\n'
+    "      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~\n"
+    "compilation terminated.\n"
+)
+MISSING_HEADER_FATAL = "fatal error: qcbor/qcbor_main_decode.h: No such file or directory"
+
+
+def test_a_preprocessor_failure_is_an_analysis_error_not_an_acsl_syntax_error(tmp_path, monkeypatch):
+    fake = FakeFramaC(rc=1, log=MISSING_HEADER_LOG)
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")
+    assert res["status"] == "analysis_error" and res["function"] == "f"
+    assert res["reason"].startswith("preprocessing_failed") and MISSING_HEADER_FATAL in res["reason"]
+    assert any(MISSING_HEADER_FATAL in e for e in res["preprocess_errors"])
+    assert len(res["reason"]) <= 400  # the gcc command line stays out of the reason
+    hints = " ".join(res["diagnostic_hints"])
+    assert "include" in hints and "Backslash" not in hints and "ACSL syntax" not in hints
+    assert len(fake.calls) == 1
+
+
+def test_an_acsl_annotation_error_still_reports_acsl_syntax_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(W.subprocess, "run", FakeFramaC(rc=1, log=ANNOT_ERROR_LOG))
+    res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")
+    assert res["status"] == "acsl_syntax_error"
+    assert "preprocess_errors" not in res
+
+
 def test_a_wp_user_error_is_a_tier_a_abort_not_a_syntax_error(tmp_path, monkeypatch):
     log = (
         "[kernel] Parsing f.c\n[wp] User Error: Main entry point function 'f' is (potentially) recursive.\n"
