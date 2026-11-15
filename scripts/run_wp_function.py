@@ -846,8 +846,9 @@ def derive_wp_diagnostic_hints(
         if missing_spec:
             _add(
                 f"Callee(s) without any contract: {', '.join(missing_spec)}. Frama-C generated a default contract "
-                "that WP then trusted, so this proof does not hold. A contract is needed on the prototype: "
-                "request it through `strengthening_requests` for a project function; for an external function, "
+                "that WP then trusted, so this proof does not hold. A contract is needed on one of its declarations: "
+                "request it through `strengthening_requests` for a project function, unless the brief lists the "
+                "callee under 'Calls Without a Contract'; for an external function, "
                 + "; ".join(stub_repair_action(fn) for fn in missing_spec)
                 + "."
             )
