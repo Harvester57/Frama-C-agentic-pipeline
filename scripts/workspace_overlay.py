@@ -51,15 +51,15 @@ from acsl_ast import (  # noqa: E402
     TrustBoundaryError,
     check_conflicting_acsl_profiles,
     check_frame_preserved,
+    contract_declaration_spans,
+    declaration_contract_text,
+    declaration_param_names,
     dedup_acsl_declarations,
     entry_requires_violations,
     extract_top_level_acsl_declarations,
-    function_contract_text,
-    function_param_names,
     function_trust_records,
     is_trust_boundary,
     locate_all_prototype_spans,
-    locate_function_span,
     splice_architect_header,
     splice_prover_changes,
     tokenize_c_acsl,
@@ -1539,6 +1539,10 @@ def entry_trust_boundary_errors(
     changed its contract; violations already in the target's own baseline ACSL are not the agent's.
     An entry that records its `file` (one the function's trust put on the boundary) is checked in
     that source and in headers, never in another source's same-named static.
+
+    In a header, every declaration of the entry is checked (a `static inline` function is often
+    declared twice and a contract may sit on either), each against its own formal names: the
+    prototype may call a parameter `pUOutBuf` and the definition `pMe` (QCBOR run-6).
     """
     entry = str(hmeta.get("entry_fn") or "")
     if not entry or Path(rel).suffix not in ACSL_CHECK_EXTS:
@@ -1548,21 +1552,30 @@ def entry_trust_boundary_errors(
     if entry_file and not is_hdr and _normalize_work_relpath(rel) != entry_file:
         return []
     try:
-        if function_contract_text(agent_text, entry, is_hdr, rel) == function_contract_text(
-            base_text, entry, is_hdr, rel
-        ):
+        if [declaration_contract_text(d, rel) for d in contract_declaration_spans(agent_text, entry, is_hdr, rel)] == [
+            declaration_contract_text(d, rel) for d in contract_declaration_spans(base_text, entry, is_hdr, rel)
+        ]:
             return []
-        contract = function_contract_text(merged_text, entry, is_hdr, rel)
-        params = set(function_param_names(merged_text, entry, is_hdr, rel))
-        baseline_contract = function_contract_text(baseline_text, entry, is_hdr, rel)
+        merged_decls = contract_declaration_spans(merged_text, entry, is_hdr, rel)
+        baseline_decls = contract_declaration_spans(baseline_text, entry, is_hdr, rel)
     except AcslError:
         return []  # the ACSL-only check reports unparsable files
-    params.update(str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k))
+    globals_ = {str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k)}
     nul = bool(hmeta.get("null_terminate")) or hmeta.get("entry_style") in ("c_string", "argv")
-    found = entry_requires_violations(contract, params, nul_terminated=nul)
+
+    def violations(decls: list) -> list[str]:
+        out: list[str] = []
+        for decl in decls:
+            params = set(declaration_param_names(decl, rel)) | globals_
+            for v in entry_requires_violations(declaration_contract_text(decl, rel), params, nul_terminated=nul):
+                if v not in out:
+                    out.append(v)
+        return out
+
+    found = violations(merged_decls)
     if not found:
         return []
-    pre_existing = set(entry_requires_violations(baseline_contract, params, nul_terminated=nul))
+    pre_existing = set(violations(baseline_decls))
     return [f"{rel}: {entry}: {v}" for v in found if v not in pre_existing]
 
 
@@ -1748,16 +1761,15 @@ def _merge_agent_overlay_locked(
         frame_parts: list[str] = []
         for rel_str in changed_rels:
             # A header may declare the function twice (prototype and `static inline` definition);
-            # the spliced contract can sit on either declaration, so read the ACSL of both spans.
-            header_kinds = (True, False) if rel_str.endswith(".h") else (False,)
-            for is_header_span in header_kinds:
-                span = locate_function_span(
-                    new_contents[rel_str], function or "", is_header=is_header_span, path=rel_str
-                )
-                if span is not None:
-                    acsl_piece = _acsl_text_of_span(span)
-                    if acsl_piece and acsl_piece not in frame_parts:
-                        frame_parts.append(acsl_piece)
+            # the spliced contract can sit on either declaration, so read the ACSL of every one.
+            # Frama-C merges the two contracts and takes the union of their `assigns`, which is
+            # what "some clause lists the location" checks here.
+            for decl in contract_declaration_spans(
+                new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str
+            ):
+                acsl_piece = _acsl_text_of_span(decl.span)
+                if acsl_piece and acsl_piece not in frame_parts:
+                    frame_parts.append(acsl_piece)
         frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))

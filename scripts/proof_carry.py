@@ -45,7 +45,9 @@ import cache  # noqa: E402
 from acsl_ast import (  # noqa: E402
     AcslError,
     AcslSyntaxError,
+    Span,
     check_frame_preserved,
+    contract_declaration_spans,
     extract_top_level_acsl_declarations,
     function_contract_text,
     locate_function_span,
@@ -152,10 +154,21 @@ def direct_callees(dag_fns: dict, file: str, function: str) -> list[tuple[str, s
 
 
 def resolve_header(run_dir: Path, overlay: Path, file: str, function: str, module: str | None) -> str | None:
-    """The header holding `function`'s prototype, as the prover merge resolves it (None: no prototype)."""
+    """
+    The header holding `function`'s prototype, as the prover merge resolves it; for a function
+    defined in a header without a prototype (a lone `static inline`), that header itself. None
+    when there is neither.
+    """
     import workspace_overlay  # lazily: it is heavy and imports pipeline_make on demand
 
     work = overlay / "work"
+    if file.endswith(".h"):
+        own = _read(work / file)
+        with contextlib.suppress(AcslError):
+            if own is not None and [
+                d.kind for d in contract_declaration_spans(own, function, is_header=True, path=file)
+            ] == ["definition"]:
+                return file
     header: str | None = None
     try:
         side = workspace_overlay.merged_sidecar(workspace_overlay.module_map_for(overlay), module)
@@ -188,9 +201,18 @@ def _callee_contract_digest(work: Path, callee_file: str, name: str, extra_heade
         if text is None:
             continue
         with contextlib.suppress(AcslError):
-            if locate_function_span(text, name, is_header=True, path=h) is not None:
+            # Any declaration: a `static inline` callee may carry its contract on its definition only.
+            if contract_declaration_spans(text, name, is_header=True, path=h):
                 parts.append(f"h:{h}:" + _norm_ws(function_contract_text(text, name, True, h)))
     return _sha("\n".join(parts))
+
+
+def _header_prototype_span(text: str, function: str, header: str) -> Span | None:
+    """The first prototype of `function` in a header (its definition, if the header has one, is not it)."""
+    return next(
+        (d.span for d in contract_declaration_spans(text, function, is_header=True, path=header) if d.kind == "prototype"),
+        None,
+    )
 
 
 def proof_key_material(
@@ -336,7 +358,9 @@ def publish_proof(
     span_h_text = contract_h = None
     if header:
         h_text = _read(work / header) or ""
-        span_h = locate_function_span(h_text, function, is_header=True, path=header)
+        # The prototype: when `file` is the header itself, span_c above is the `static inline` definition,
+        # so the contracts on both declarations travel.
+        span_h = _header_prototype_span(h_text, function, header)
         if span_h is not None:
             span_h_text = span_h.text
             contract_h = function_contract_text(h_text, function, True, header)
@@ -452,7 +476,12 @@ def callee_first(items: list[dict], dag_fns: dict) -> list[dict]:
 
 
 def _replace_span(text: str, function: str, new_span: str, is_header: bool, path: str) -> str | None:
-    span = locate_function_span(text, function, is_header=is_header, path=path)
+    """`text` with `function`'s definition (`is_header`: its header prototype) replaced by `new_span`."""
+    span = (
+        _header_prototype_span(text, function, path)
+        if is_header
+        else locate_function_span(text, function, is_header=False, path=path)
+    )
     if span is None:
         return None
     return text[: span.start_byte] + new_span + text[span.end_byte :]
@@ -477,12 +506,16 @@ def _existing_decls(work: Path, rels: list[str]) -> dict[str, str]:
 
 
 def _insert_decls(header_text: str, function: str, decls: list[dict], header: str) -> str | None:
-    """Put `decls` as one ACSL block right before `function`'s prototype (outside its span)."""
-    span = locate_function_span(header_text, function, is_header=True, path=header)
-    if span is None:
+    """
+    Put `decls` as one ACSL block right before `function`'s first declaration in the header (outside
+    its span): its prototype, or its `static inline` definition when the header has no prototype.
+    """
+    decls_of_fn = contract_declaration_spans(header_text, function, is_header=True, path=header)
+    if not decls_of_fn:
         return None
+    start = decls_of_fn[0].span.start_byte
     block = "/*@\n" + "\n".join(f"  {d['text']}" for d in decls) + "\n*/\n"
-    return header_text[: span.start_byte] + block + header_text[span.start_byte :]
+    return header_text[:start] + block + header_text[start:]
 
 
 def _remove_agent(run_dir: Path, agent_id: str) -> None:
