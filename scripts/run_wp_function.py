@@ -5,7 +5,10 @@ Drives Frama-C WP + RTE deductive verification on a single C function (-wp-fct).
    -wp-rte -warn-invalid-pointer -warn-unsigned-overflow -warn-unsigned-downcast
    -wp-split) and parallel SMT solvers (Alt-Ergo, Z3, CVC5). The ACSL syntax/type
    check is folded into this run (-kernel-warn-key annot-error=abort): a kernel
-   parse or annotation error still yields status `acsl_syntax_error`.
+   parse or annotation error still yields status `acsl_syntax_error`. A failed
+   preprocessor run (`gcc -E`: missing header, wrong include flags) is a build
+   configuration error, reported as `analysis_error` with reason
+   `preprocessing_failed: <first cpp error>` and the messages in `preprocess_errors`.
 2. Sizes itself from the job budget (scripts/resources.py): `--wp-par auto` scales the
    number of concurrent provers with CPUs and memory, while `-wp-memlimit` stays fixed
    at 1000 MB so a proof never depends on the machine.
@@ -53,6 +56,7 @@ import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import find_named_clause, is_trivial_predicate  # noqa: E402
 from framac_common import (  # noqa: E402
+    _CPP_ERROR_RE,
     STATUS_DEAD,
     STATUS_INVALID,
     STATUS_INVALID_UNDER_HYP,
@@ -354,6 +358,26 @@ def check_acsl_syntax(
 _PLUGIN_USER_ERROR_RE = re.compile(
     r"^\[(?!kernel\b)[A-Za-z][\w-]*(?::[^\]]*)?\][^\n]*user error", re.IGNORECASE | re.MULTILINE
 )
+
+
+# The kernel's message when the preprocessor command itself fails (missing header, bad include path).
+_PREPROCESS_FAILED_RE = re.compile(r"^\[kernel\][^\n]*User Error: failed to run:", re.IGNORECASE | re.MULTILINE)
+PREPROCESSING_FAILED = "preprocessing_failed"
+
+
+def _preprocess_failure(
+    log_text: str, returncode: int | None, timed_out: bool, report_exists: bool
+) -> tuple[str, list[str]] | None:
+    """
+    (reason, errors) when the run stopped because `gcc -E` failed, else None. A build-configuration
+    error (wrong or missing --cppflags), never an ACSL syntax error: the annotations were not read.
+    """
+    if timed_out or returncode in (0, None) or report_exists or not _PREPROCESS_FAILED_RE.search(log_text or ""):
+        return None
+    cpp_lines = [line.strip() for line in (log_text or "").splitlines() if _CPP_ERROR_RE.match(line)]
+    errors = list(dict.fromkeys([*cpp_lines, *kernel_parse_errors(log_text)]))
+    first = cpp_lines[0] if cpp_lines else "the C preprocessor (gcc -E) failed"
+    return f"{PREPROCESSING_FAILED}: {first}"[:300], errors
 
 
 def _folded_syntax_errors(
@@ -687,6 +711,15 @@ def derive_wp_diagnostic_hints(
                 "(\\result, \\old, \\valid, \\valid_read, \\separated, \\forall, \\nothing), and function/loop "
                 "clause order is respected."
             )
+        return hints
+
+    if status == "analysis_error" and str(res.get("reason") or "").startswith(PREPROCESSING_FAILED):
+        _add(
+            "The C preprocessor (gcc -E) failed before any annotation was read: a missing header or wrong "
+            "include path, not an ACSL error and not something a re-run fixes. Re-run with the module's preprocessor "
+            "flags (run_wp_function --cppflags as in the scheduler's command; workspace_overlay merge-agent "
+            "--module <m>) and leave the contract unchanged."
+        )
         return hints
 
     if status == "analysis_error":
@@ -1471,6 +1504,29 @@ def run_wp_on_function(
             shutil.rmtree(tmp_goals, ignore_errors=True)
     combined_log = (stdout or "") + "\n" + (stderr or "")
     log_path.write_text(combined_log, encoding="utf-8")
+
+    preprocess = _preprocess_failure(combined_log, returncode, timed_out, csv_path.exists())
+    if preprocess is not None:
+        pp_reason, pp_errors = preprocess
+        pp_res = _analysis_error_result(
+            fn_name,
+            c_file,
+            pp_reason,
+            returncode,
+            scan_wp_log_soundness(
+                combined_log,
+                check_memory_model=check_memory_model,
+                unsigned_reduced=unsigned_reduced,
+                warn_invalid_pointer=warn_invalid_pointer,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+            ),
+            combined_log,
+        )
+        pp_res["preprocess_errors"] = pp_errors
+        if unframed_var_callees:
+            pp_res["unframed_variadic_callees"] = unframed_var_callees
+        pp_res["sizing"] = sizing
+        return pp_res
 
     syntax_errors = _folded_syntax_errors(combined_log, returncode, timed_out, csv_path.exists())
     if syntax_errors is not None:

@@ -28,7 +28,8 @@ acsl_syntax_error, wp_aborted, a runner exception) is `not_applicable` and is
 left out of the denominator instead of counting as accepted. Its detail carries a
 `failure`: `preprocessing_failed` when the C preprocessor stopped the run (a
 missing header, wrong include flags: the setup is at fault, not the mutant; run_wp
-reports it as acsl_syntax_error), else the WP status. A function whose every
+reports it as analysis_error with a `preprocessing_failed` reason, older reports as
+acsl_syntax_error), else the WP status. A function whose every
 mutant failed to preprocess gets an `error` instead of a score.
 
 Runs only on functions whose parent WP report (workspace/reports/wp/<fn>.json)
@@ -292,7 +293,9 @@ _PREPROCESS_HINT_RE = re.compile(r"failed to run: .*-E\b|preprocess", re.IGNOREC
 def _failure_kind(report: dict) -> str:
     """Why a mutant's WP run yielded no goal results: `preprocessing_failed`, or its status."""
     status = str(report.get("status") or "error")
-    if status == "acsl_syntax_error":
+    if status == "analysis_error" and str(report.get("reason") or "").startswith("preprocessing_failed"):
+        return "preprocessing_failed"
+    if status == "acsl_syntax_error":  # reports written before run_wp_function.py named the case
         errors = (report.get("syntax_check") or {}).get("errors") or []
         if any(_CPP_ERROR_RE.match(str(e)) or _PREPROCESS_HINT_RE.search(str(e)) for e in errors):
             return "preprocessing_failed"
@@ -438,7 +441,12 @@ def check_function(
                     if detail["failure"] == "preprocessing_failed":
                         result["preprocessing_failed"] += 1
                         first_preprocess_error = first_preprocess_error or next(
-                            iter((report.get("syntax_check") or {}).get("errors") or []), ""
+                            iter(
+                                report.get("preprocess_errors")
+                                or (report.get("syntax_check") or {}).get("errors")
+                                or []
+                            ),
+                            "",
                         )
                 result["details"].append(detail)
     if result["spec_mutants"]:
