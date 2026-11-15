@@ -103,6 +103,37 @@ def test_case_costs_split_shared_callees_and_eva_mains_own_time(tmp_path):
     assert es.case_costs(["f();", "g();"], None) == ([1.0, 1.0], "uniform")
 
 
+def test_case_costs_weight_shared_callee_by_static_call_multiplicity(tmp_path):
+    # QCBOR run-6 shape: 36 single-call cases (`decode_next(ctx);`) plus 1 18-call stateful sequence
+    # case (`case 36`): total multiplicity = 36 * 1 + 18 = 54, so the sequence case receives 18/54
+    # (1/3) of `decode_next`'s inclusive samples rather than 1/37.
+    fg = _flamegraph(
+        tmp_path / "fg_mult.txt",
+        [
+            "eva_main;decode_next 540.0",
+            "eva_main;decode_next;parse_item 540.0",
+            "eva_main;seq_init 20.0",
+        ],
+    )
+    single_cases = ["decode_next(&ctx, &item);"] * 36
+    seq_case = "seq_init(&ctx); " + " ".join(f"if (ok_{i}) decode_next(&ctx, &item);" for i in range(18))
+    cases = [*single_cases, seq_case]
+
+    assert es.case_callee_counts(seq_case) == {"seq_init": 1, "decode_next": 18}
+    assert es.case_callees(seq_case) == {"seq_init", "decode_next"}
+
+    costs, basis = es.case_costs(cases, fg)
+    assert basis == "flamegraph"
+    # Inclusive time on `decode_next` is 1080.0: each single-call case gets 1080 * 1/54 = 20.0,
+    # while the 18-call sequence case gets 1080 * 18/54 + 20.0 (`seq_init`) = 380.0.
+    assert costs[:36] == pytest.approx([20.0] * 36)
+    assert costs[36] == pytest.approx(380.0)
+    # Packing into 4 shards isolates the heavy sequence case into its own shard.
+    shards = es.pack(costs, 4)
+    seq_shard = next(s for s in shards if 36 in s)
+    assert seq_shard == [36]
+
+
 def test_packing_is_longest_first_deterministic_and_covers_every_case_once():
     costs = [5.0, 1.0, 1.0, 4.0, 2.0, 2.0]
     shards = es.pack(costs, 3)

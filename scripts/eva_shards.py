@@ -34,7 +34,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,16 +84,25 @@ def shard_cppflags(cases: Iterable[int]) -> list[str]:
     return [f"-D{EVA_SHARD_MACRO}", *(f"-D{EVA_SHARD_MACRO}_CASE_{k}" for k in sorted(cases))]
 
 
+def case_callee_counts(case_text: str) -> dict[str, int]:
+    """Direct call multiplicity per function in a dispatch case (`name -> count >= 1`)."""
+    counts: Counter[str] = Counter(
+        m.group(1) for m in _CALL_RE.finditer(case_text or "") if m.group(1) not in _NOT_CALLS
+    )
+    return dict(counts)
+
+
 def case_callees(case_text: str) -> set[str]:
     """The functions a dispatch case calls directly (its statements as generate_harness wrote them)."""
-    return {m.group(1) for m in _CALL_RE.finditer(case_text or "") if m.group(1) not in _NOT_CALLS}
+    return set(case_callee_counts(case_text))
 
 
 def case_costs(cases: list[str], flamegraph_txt: Path | None, main_fn: str = "eva_main") -> tuple[list[float], str]:
     """
     Each dispatch case's share of a single run's time, from its `-eva-flamegraph` file: the inclusive
-    time of every function eva_main calls directly, split evenly between the cases that call it. Time
-    no case accounts for (eva_main's own, and callees outside the switch) is split evenly between all
+    time of every function eva_main calls directly, split between the cases that call it in proportion
+    to static call multiplicity (uniform `1 / len(owners)` when each caller calls it once). Time no
+    case accounts for (eva_main's own, and callees outside the switch) is split evenly between all
     cases. Every case costs the same without a usable profile. Returns (costs, basis).
     """
     n = len(cases)
@@ -119,19 +128,21 @@ def case_costs(cases: list[str], flamegraph_txt: Path | None, main_fn: str = "ev
                     inclusive[frames[1]] += t
     except OSError:
         return uniform
-    callees = [case_callees(text) for text in cases]
-    callers: defaultdict[str, list[int]] = defaultdict(list)
-    for k, names in enumerate(callees):
-        for name in names:
-            callers[name].append(k)
+    callee_counts = [case_callee_counts(text) for text in cases]
+    callers: defaultdict[str, list[tuple[int, int]]] = defaultdict(list)
+    for k, counts in enumerate(callee_counts):
+        for name, mult in counts.items():
+            if mult > 0:
+                callers[name].append((k, mult))
     costs = [0.0] * n
     for name, t in inclusive.items():
         owners = callers.get(name)
         if not owners:
             shared += t
             continue
-        for k in owners:
-            costs[k] += t / len(owners)
+        total_mult = sum(mult for _, mult in owners)
+        for k, mult in owners:
+            costs[k] += t * mult / total_mult
     costs = [c + shared / n for c in costs]
     if sum(costs) <= 0:
         return uniform

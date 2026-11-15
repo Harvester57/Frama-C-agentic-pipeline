@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -914,3 +915,83 @@ def test_repair_waits_for_all_open_verifiers_of_module_and_accumulates_reasons(t
         f"harness_induced: {fp1}",
         f"harness_induced: {fp2}",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Follow-Up 2: Preserve 5-domain base timeout `flamegraph.txt` across fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_base_timeout_flamegraph_preserved_across_timed_out_and_completed_fallbacks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(res_mod, "_input_digest", lambda sources, flags: "d")
+    src = tmp_path / "a.c"
+    src.write_text("int eva_main(void) { return 0; }\n", encoding="utf-8")
+
+    # Case 1 (QCBOR run-6): 5-domain base times out at 7200 s after writing `flamegraph.txt`,
+    # then both 900 s cvalue fallbacks ALSO time out. `flamegraph.txt` must retain the 5-domain profile!
+    out_all_to = tmp_path / "eva_all_timeout"
+    seen_cmds_all_to: list[list[str]] = []
+
+    def fake_run_all_timeout(cmd, **kwargs):
+        if cmd and cmd[0] == "frama-c":
+            seen_cmds_all_to.append(list(cmd))
+        out_all_to.mkdir(parents=True, exist_ok=True)
+        if "-eva-flamegraph" in cmd:
+            fg_dest = Path(cmd[cmd.index("-eva-flamegraph") + 1])
+            domains = cmd[cmd.index("-eva-domains") + 1]
+            if "equality" in domains:
+                fg_dest.write_text("eva_main;five_domain_heavy 500\neva_main;helper 100\n", encoding="utf-8")
+            else:
+                fg_dest.write_text("eva_main;degraded_cvalue_only 10\n", encoding="utf-8")
+        raise subprocess.TimeoutExpired(cmd, float(kwargs.get("timeout") or 0), output="", stderr="")
+
+    monkeypatch.setattr(res_mod.subprocess, "run", fake_run_all_timeout)
+    res_to = res_mod.run_eva_on_slice([str(src)], "eva_main", out_all_to, timeout=7200, use_cache=False)
+    assert res_to["status"] == "analysis_timeout"
+    assert [t["tier"] for t in res_to["timeout_fallback_tried"]] == ["cvalue_fast", "cvalue_imprecise_alloc"]
+    assert len(seen_cmds_all_to) == 3
+    # Base run requested `-eva-flamegraph`; fallback tiers omitted `-eva-flamegraph` once base profile existed.
+    assert "-eva-flamegraph" in seen_cmds_all_to[0]
+    assert "-eva-flamegraph" not in seen_cmds_all_to[1]
+    assert "-eva-flamegraph" not in seen_cmds_all_to[2]
+    fg_text = (out_all_to / "flamegraph.txt").read_text(encoding="utf-8")
+    assert "five_domain_heavy" in fg_text and "degraded_cvalue_only" not in fg_text
+    assert not (out_all_to / "flamegraph.timed_out.txt").exists()
+    assert res_to["flamegraph_file"] == str(out_all_to / "flamegraph.txt")
+    assert res_to["cost_profile"]["self"][0]["function"] == "five_domain_heavy"
+
+    # Case 2: 5-domain base times out with non-empty `flamegraph.txt`, and `cvalue_fast` completes (`status == "ok"`).
+    # Because `pipeline_make._plan_shards` still shards `timeout_fallback` modules using `report["flamegraph_file"]`,
+    # `out_dir / "flamegraph.txt"` must still hold the 5-domain base profile even if a fallback wrote over it!
+    out_fb_ok = tmp_path / "eva_fb_ok"
+    calls_fb_ok = 0
+
+    def fake_execute_fb_ok(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root=None):
+        nonlocal calls_fb_ok
+        calls_fb_ok += 1
+        fg = Path(out_dir) / "flamegraph.txt"
+        if calls_fb_ok == 1:
+            fg.write_text("eva_main;five_domain_heavy 400\n", encoding="utf-8")
+            return {
+                "status": "analysis_timeout",
+                "error_summary": ["exceeded limit"],
+                "sources": sources,
+                "reduced_checks": reduced_checks,
+                "flamegraph_file": str(fg),
+                "cost_profile": {
+                    "run": "timed_out",
+                    "self": [{"function": "five_domain_heavy", "share": 1.0}],
+                    "inclusive": [],
+                },
+            }
+        # Even if a fallback writes `flamegraph.txt`, `_restore_timed_out_flamegraph` restores the 5-domain one.
+        fg.write_text("eva_main;cvalue_fallback_fast 5\n", encoding="utf-8")
+        return {"status": "ok", "sources": sources, "reduced_checks": reduced_checks, "flamegraph_file": str(fg)}
+
+    monkeypatch.setattr(res_mod, "_execute_eva", fake_execute_fb_ok)
+    res_ok = res_mod.run_eva_on_slice([str(src)], "eva_main", out_fb_ok, timeout=7200, use_cache=False)
+    assert res_ok["status"] == "ok" and res_ok["timeout_fallback"] == "cvalue_fast"
+    assert (out_fb_ok / "flamegraph.txt").read_text(encoding="utf-8") == "eva_main;five_domain_heavy 400\n"
+    assert not (out_fb_ok / "flamegraph.timed_out.txt").exists()
+    assert res_ok["flamegraph_file"] == str(out_fb_ok / "flamegraph.txt")
