@@ -81,7 +81,7 @@ Design and measurements: [`../plans/archive/phase0-redesign.md`](../plans/archiv
 - **DAG view** (`build_callgraph_dag.py`). Modules are the build's link units. Harnesses may be sub-modules of a unit, and `module_map.py` maps every report back to its unit. Tiers come from trust (`tiers.py`), and units too large for one Eva run are split into clusters (`unit_split.py`).
 - **Seeds** (`seed_harvest.py`). The API calls the target's tests make are recorded in the build image and written as seeds in each harness's case format.
 - **Security properties** (`security_props.py`). The threat model's auth gates, output sinks and secrets become MetAcsl properties (Layers 4 to 6), and pointer writers get Layer 3 frame units.
-- **Gates.** The reach gate and the E-ACSL build check write `workspace/reports/phase0_gates.json`, and Make refuses to fuzz, run Eva or queue WP on a module that failed one. Coverage after fuzzing reopens the reach gate for entry points no input executed.
+- **Gates.** The reach gate and the E-ACSL build check write `workspace/reports/phase0_gates.json`, and Make refuses to fuzz, run Eva or queue WP on a module that failed one. `pipeline_make.py run` refuses every target after Phase 0 while the DAG has no module or no harness sidecar matches a DAG module. Coverage after fuzzing reopens the reach gate for entry points no input executed; a fuzz crash counts as executing an entry point only when it was found under the current harness (`harness_digest` and `dispatch_case_count` of the fuzz report and its artifacts) and shows the entry point ran (`crash_notes` say why a crash did not count).
 
 ---
 
