@@ -480,8 +480,9 @@ def merge_flows(flows: list[dict]) -> dict:
                             if (v if isinstance(v, str) else json.dumps(v, sort_keys=True)) not in seen
                         ]
                 elif old is None and isinstance(value, list):
-                    if name not in _FLOW_INTERSECT:
-                        mine[name] = _dedup_flow_list(value)
+                    # A shard without the list did not report it (-inout printed no such section there):
+                    # sure outputs intersect over the shards that report them, so a later list is kept.
+                    mine[name] = _dedup_flow_list(value)
                 elif name not in mine:
                     mine[name] = json.loads(json.dumps(value))
     edges: dict[str, set[str]] = defaultdict(set)

@@ -47,6 +47,7 @@ from acsl_ast import AcslSyntaxError, Span, locate_all_definition_spans, locate_
 from build_callgraph_dag import DYNAMIC_ALLOC_CALLEES  # noqa: E402
 from framac_common import (  # noqa: E402
     EVA_REPORT_MAX_BYTES,
+    ArtifactError,
     atomic_write_json,
     augment_framac_cppflags,
     load_json_optional,
@@ -796,10 +797,14 @@ def generate(
     machdep: str = "gcc_x86_64",
     runner=None,
 ) -> dict:
-    """Write the module's facts to `out_json`, restored from the cache when nothing changed."""
+    """
+    Write the module's facts to `out_json`, restored from the cache when nothing changed. An Eva report
+    whose spilled flows file is missing or unreadable raises ArtifactError naming it: the briefs would
+    otherwise lose their Eva facts without a word.
+    """
     report = load_json_optional(eva_report, {}, max_bytes=EVA_REPORT_MAX_BYTES) if eva_report else {}
     raw_flows = report.get("flows") if isinstance(report, dict) else None
-    flows = resolve_flows(raw_flows, report_path=eva_report)
+    flows = resolve_flows(raw_flows, report_path=eva_report, strict=True)
 
     def _build() -> dict:
         doc = build_module_facts(module, sources, cppflags, flows, machdep=machdep, runner=runner)
@@ -1322,7 +1327,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-json", type=Path, required=True)
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
-    res = generate(args.module, args.sources, args.cppflags, args.eva_report, args.out_json, machdep=args.machdep)
+    try:
+        res = generate(args.module, args.sources, args.cppflags, args.eva_report, args.out_json, machdep=args.machdep)
+    except ArtifactError as exc:
+        # A failed document replaces an earlier run's facts, so no brief is built from them.
+        reason = str(exc)
+        atomic_write_json(
+            args.out_json,
+            {
+                "schema": FACTS_SCHEMA,
+                "module": args.module,
+                "generated_at": utc_now(),
+                "status": "failed",
+                "eva": {"status": "failed", "reason": reason},
+                "functions": {},
+            },
+        )
+        res = {"status": "failed", "module": args.module, "out_json": args.out_json.as_posix(), "reason": reason}
+        print(f"function_facts: {reason}", file=sys.stderr)
     print(json.dumps(res, indent=2))
     return 0 if res.get("status") in ("ok", "partial") else 1
 

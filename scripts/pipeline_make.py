@@ -77,6 +77,7 @@ from eva_options import (  # noqa: E402
 )
 from eva_shards import MAX_SHARDS, SHARD_DIR, harness_shardable, make_plan, plan_problem, shard_cppflags  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
@@ -844,7 +845,9 @@ def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
     whole ladder. A rung that changes nothing here is the base run again and is left out.
     """
     try:
-        base = load_json_optional(plan.run_dir / TUNE_REPORT_DIR / mod.name / "base.json", None)
+        base = load_json_optional(
+            plan.run_dir / TUNE_REPORT_DIR / mod.name / "base.json", None, max_bytes=EVA_REPORT_MAX_BYTES
+        )
     except ArtifactError as exc:
         mod.warnings.append(f"Eva tuning: {exc}")
         return
@@ -1679,14 +1682,46 @@ def _output_state(run_dir: Path, rel: str) -> str | None:
         return None
 
 
+REPORT_BRIEF_PARSE_MAX_BYTES = 8 * 1024 * 1024
+_TOP_LEVEL_FIELD_RE = re.compile(r'^  "(status|ok|stub)": (.*?),?$')
+
+
+def _top_level_fields(path: Path) -> dict | None:
+    """
+    `status`, `ok` and `stub` of a report too large to parse for a summary line, read line by line:
+    atomic_write_json writes with indent=2, so a top-level key is the only one at two spaces. None
+    when the file cannot be read.
+    """
+    data: dict = {}
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = _TOP_LEVEL_FIELD_RE.match(line.rstrip("\n"))
+                if m and m.group(1) not in data:
+                    try:
+                        data[m.group(1)] = json.loads(m.group(2))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        return None
+    return data
+
+
 def _report_brief(path: Path) -> dict:
     """`status` of a JSON report (or `ok` for the selftest), for the run summary."""
-    if path.suffix != ".json" or not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+    if path.suffix != ".json" or not path.is_file():
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {"report_status": "unreadable"}
+    if path.stat().st_size > REPORT_BRIEF_PARSE_MAX_BYTES:
+        # A large Eva or WP report: its status without holding the whole document in memory.
+        fields = _top_level_fields(path)
+        if fields is None:
+            return {"report_status": "unreadable"}
+        data = fields
+    else:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {"report_status": "unreadable"}
     if not isinstance(data, dict):
         return {}
     out: dict = {}
@@ -1982,9 +2017,14 @@ def _pending_reports(
     for path in paths:
         if not path.is_file():
             continue
+        rel = f"{REPORT_DIRS[kind]}/{path.name}"
+        size = path.stat().st_size
+        if size > EVA_REPORT_MAX_BYTES:
+            # The ledger reads reports with the Eva cap (ledger.cmd_ingest_eva): say so here, unread.
+            bad.append({"report": rel, "error": f"artifact exceeds {EVA_REPORT_MAX_BYTES} bytes ({size} bytes)"})
+            continue
         data = path.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
-        rel = f"{REPORT_DIRS[kind]}/{path.name}"
         if digest in seen:
             known += 1
             continue
