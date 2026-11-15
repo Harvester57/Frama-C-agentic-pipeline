@@ -1447,21 +1447,13 @@ def run_wp_on_function(
         cmd.extend(["-wp-steps", str(wp_steps)])
     if session_dir is not None:
         session_dir.mkdir(parents=True, exist_ok=True)
-        cmd.extend(
-            [
-                "-wp-session",
-                str(session_dir),
-                "-wp-cache",
-                "none" if dump_goal else "update",
-            ]
-        )
-        if use_wp_cache:
-            cmd.extend(["-wp-cache-dir", str(wp_cache)])
-    elif use_wp_cache:
+        cmd.extend(["-wp-session", str(session_dir)])
+    if use_wp_cache:
         # Frama-C's own goal digests: unchanged goals are not re-proved across iterations.
         cmd.extend(["-wp-cache", "update", "-wp-cache-dir", str(wp_cache)])
-    elif model_pass:
-        # Without an explicit mode WP still reads and writes its default cache.
+    else:
+        # Without an explicit mode WP still reads and writes its default cache (`--cache-dir off`,
+        # FRAMAC_CACHE=off, a VC dump, the counter-example pass).
         cmd.extend(["-wp-cache", "none"])
     if smoke_tests:
         cmd.extend(["-wp-smoke-tests", "-wp-smoke-timeout", str(min(timeout, 5))])
