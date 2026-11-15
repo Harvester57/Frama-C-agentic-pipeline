@@ -717,8 +717,9 @@ def derive_wp_diagnostic_hints(
         _add(
             "The C preprocessor (gcc -E) failed before any annotation was read: a missing header or wrong "
             "include path, not an ACSL error and not something a re-run fixes. Re-run with the module's preprocessor "
-            "flags (run_wp_function --cppflags as in the scheduler's command; workspace_overlay merge-agent "
-            "--module <m>) and leave the contract unchanged."
+            "flags: pass --cppflags with the module sidecar's cppflags, as the scheduler's command does (for "
+            "workspace_overlay merge-agent too: its --module only resolves the header and does not change the "
+            "parent WP check's include paths), and leave the contract unchanged."
         )
         return hints
 

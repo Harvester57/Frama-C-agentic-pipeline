@@ -226,6 +226,9 @@ def test_a_preprocessor_failure_is_an_analysis_error_not_an_acsl_syntax_error(tm
     assert len(res["reason"]) <= 400  # the gcc command line stays out of the reason
     hints = " ".join(res["diagnostic_hints"])
     assert "include" in hints and "Backslash" not in hints and "ACSL syntax" not in hints
+    # run-6 07:14: `merge-agent --module` alone still checked with -I. only, so the hint must name --cppflags
+    # and must not offer --module as the fix.
+    assert "--cppflags" in hints and "--module <m>)" not in hints
     assert len(fake.calls) == 1
 
 
