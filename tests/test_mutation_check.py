@@ -279,26 +279,96 @@ def test_run_mutation_check_trivial_body_totals(tmp_path: Path) -> None:
     assert totals["impl_not_applicable"] == 1
 
 
-def test_default_runner_requests_counter_examples(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_default_runner_requests_no_counter_examples(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Nothing reads the models, and since F5 each failing mutant would pay a second full WP pass for them.
     seen: dict = {}
 
-    def fake(c_file, fn_name, out_dir, cppflags="-I.", counter_examples=False):
-        seen["counter_examples"] = counter_examples
+    def fake(c_file, fn_name, out_dir, **kwargs):
+        seen.update(kwargs)
         return {"status": "all_proven"}
 
     monkeypatch.setattr(mc.run_wp_function, "run_wp_on_function", fake)
     mc._default_runner()(tmp_path / "x.c", "f", tmp_path, cppflags="-I.")
-    assert seen["counter_examples"] is True
+    assert seen == {"cppflags": "-I."}
+    mc._default_runner({"wp_model": "Bytes"})(tmp_path / "x.c", "f", tmp_path, cppflags="-I.")
+    assert seen["wp_model"] == "Bytes" and not seen.get("counter_examples")
 
-    def old(c_file, fn_name, out_dir, cppflags="-I."):
+
+@pytest.mark.parametrize(
+    "flags,options",
+    [
+        (["--no-warn-unsigned-downcast"], {"warn_unsigned_downcast": False}),
+        (
+            ["--no-warn-unsigned", "--wrap-code-lines=1,4", "--wp-model", "Bytes"],
+            {"unsigned_reduced": True, "wp_model": "Bytes"},
+        ),
+        (["--no-warn-invalid-pointer", "--wp-model=Typed+ref+int"], {"warn_invalid_pointer": False, "wp_model": "Typed+ref+int"}),
+        (["--no-warn-unsigned", "--waive-signed-downcast"], {"unsigned_reduced": True, "warn_signed_downcast": False}),
+    ],
+)
+def test_proof_flags_map_onto_the_runner_options(flags, options) -> None:
+    got, ignored = mc.wp_options_from_flags(flags)
+    assert got == options
+    assert ignored == [f for f in flags if f.startswith("--wrap-code-lines")]
+
+
+def _proof_report(**extra) -> dict:
+    return {"status": "all_proven", "function": "sum", "file": "m.c", **extra}
+
+
+def test_mutants_replay_the_model_and_checks_the_proof_used(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    run_dir = _fake_run(tmp_path)
+    report = _proof_report(
+        wp_model="Bytes",
+        soundness={"ok": True, "reduced_checks": ["-warn-unsigned-overflow / -warn-unsigned-downcast OFF"]},
+        unsigned_wraps={"declared_code_lines": [2]},
+    )
+    (run_dir / "workspace" / "reports" / "wp" / "sum.json").write_text(json.dumps(report), encoding="utf-8")
+    seen: list[dict] = []
+
+    def fake(c_file, fn_name, out_dir, **kwargs):
+        seen.append(kwargs)
         return {"status": "all_proven"}
 
-    monkeypatch.setattr(mc.run_wp_function, "run_wp_on_function", old)
-    assert mc._default_runner() is old
+    monkeypatch.setattr(mc.run_wp_function, "run_wp_on_function", fake)
+    doc = mc.run_mutation_check(run_dir)
+    assert seen, "the default runner ran the mutants"
+    for kwargs in seen:
+        assert kwargs["wp_model"] == "Bytes" and kwargs["unsigned_reduced"] is True
+        assert not kwargs.get("counter_examples")
+    f = doc["functions"]["sum"]
+    assert f["wp_options"] == {"unsigned_reduced": True, "wp_model": "Bytes"}
+    assert f["wp_flags"] == ["--no-warn-unsigned", "--wrap-code-lines=2", "--wp-model", "Bytes"]
+
+
+def test_mutants_of_a_default_proof_keep_the_parent_check_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: list[dict] = []
+
+    def fake(c_file, fn_name, out_dir, **kwargs):
+        seen.append(kwargs)
+        return {"status": "all_proven"}
+
+    monkeypatch.setattr(mc.run_wp_function, "run_wp_on_function", fake)
+    mc.run_mutation_check(_fake_run(tmp_path))
+    assert seen and all(k == {"cppflags": "-I.", "warn_unsigned_downcast": False} for k in seen)
+
+
+@pytest.mark.parametrize(
+    "report,expected",
+    [
+        ({"status": "analysis_error"}, "prover_limited"),
+        ({"status": "analysis_error", "reason": "timeout"}, "prover_limited"),
+        ({"status": "analysis_error", "reason": "insufficient_memory"}, "prover_limited"),
+        ({"status": "analysis_error", "reason": "preprocessing_failed: m.c:1:10: fatal error: x.h"}, "unknown"),
+        ({"status": "analysis_error", "reason": "unsigned_wrap_check_failed"}, "unknown"),
+    ],
+)
+def test_classify_open_unit_tells_setup_errors_from_prover_limits(report, expected) -> None:
+    # A missing header or a failed wrap check says nothing about the prover or the contract.
+    assert mc.classify_open_unit(report) == expected
 
 
 def test_classify_open_unit_prover_vs_spec_limited() -> None:
-    assert mc.classify_open_unit({"status": "analysis_error"}) == "prover_limited"
     assert mc.classify_open_unit({"wp_allocation_limitation": True}) == "prover_limited"
     assert mc.classify_open_unit({"unproven_goals": [{"status": "Timeout"}]}) == "prover_limited"
     assert mc.classify_open_unit({"frame_summary": {"missing_assigns_warning": True}}) == "spec_limited"
