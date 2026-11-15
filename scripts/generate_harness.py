@@ -24,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -2671,6 +2672,64 @@ def record_harness_repair(harness_meta_path: Path, reason: str) -> dict[str, Any
     }
 
 
+def _restore_file(path: Path, data: bytes | None) -> None:
+    """Put `data` back at `path` atomically (a temp file in the same directory, then a rename); None removes it."""
+    if data is None:
+        path.unlink(missing_ok=True)
+        return
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_restore_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def _rolled_back_on_failure(paths: list[Path] | None) -> Iterator[None]:
+    """
+    Run a `--record-repair` regeneration so that any failure (an exception of any kind, from the
+    attempt count's write to the final sidecar write) puts every file in `paths` back as it was before:
+    the harness is unchanged and no repair attempt is consumed. None: no repair, nothing to roll back.
+    """
+    saved: dict[Path, bytes | None] = {}
+    for path in dict.fromkeys(Path(p).resolve() for p in paths or []):
+        try:
+            saved[path] = path.read_bytes()
+        except FileNotFoundError:
+            saved[path] = None
+    try:
+        yield
+    except BaseException:
+        for path, data in saved.items():
+            with contextlib.suppress(OSError):
+                _restore_file(path, data)
+        raise
+
+
+def _with_repair_result(result: dict[str, Any], repair_res: dict[str, Any] | None) -> str:
+    """The JSON a generation prints, with the repair's attempt count when it recorded one."""
+    if repair_res is not None:
+        result["repair_recorded"] = repair_res
+        result["repair_attempts"] = repair_res["repair_attempts"]
+        result["exhausted"] = repair_res["exhausted"]
+    return json.dumps(result, indent=2)
+
+
+def _generation_failed(exc: Exception, *, repair: bool) -> int:
+    """
+    Report a failed generation as `{"ok": false, "error": ...}` and exit 1. Without `--record-repair`,
+    only the errors a generation reports (ValueError, ApiHarnessError) are; anything else propagates.
+    """
+    if not repair and not isinstance(exc, ValueError):
+        raise exc
+    print(json.dumps({"ok": False, "error": str(exc) or type(exc).__name__}, indent=2))
+    return 1
+
+
 def _bind_flag_values(argv: list[str]) -> list[str]:
     """
     argparse reads a lone value such as `--ldflags -lbsd` as an unknown option; bind the value of
@@ -2880,7 +2939,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
     args = parser.parse_args(raw_argv)
 
-    orig_sidecar_bytes: bytes | None = None
     if args.record_repair is not None:
         if not args.reason.strip():
             print(json.dumps({"ok": False, "error": "--record-repair requires --reason"}, indent=2))
@@ -2897,7 +2955,6 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir = args.record_repair.parent
         try:
             existing_meta = load_json_strict(args.record_repair)
-            orig_sidecar_bytes = args.record_repair.read_bytes()
         except (ArtifactError, OSError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
             return 1
@@ -2942,44 +2999,43 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-    def _restore_sidecar_on_failure() -> None:
-        if args.record_repair is not None and orig_sidecar_bytes is not None:
-            with contextlib.suppress(OSError):
-                args.record_repair.write_bytes(orig_sidecar_bytes)
+    def _repair_paths() -> list[Path] | None:
+        """The files a `--record-repair` regeneration may rewrite: they are rolled back on any failure."""
+        if args.record_repair is None:
+            return None
+        return [args.record_repair, args.out_dir / f"harness_{args.module}.c", args.out_dir / f"harness_{args.module}.json"]
 
     if args.api:
         if not args.module:
             parser.error("--api requires --module")
-        from api_harness import ApiHarnessError, generate
+        from api_harness import generate
 
-        repair_res = (
-            record_harness_repair(args.record_repair, args.reason.strip()) if args.record_repair is not None else None
-        )
         try:
-            result = generate(
-                module=args.module,
-                header=args.header,
-                max_input_size=args.max_size if args.max_size is not None else DEFAULT_MAX_INPUT_SIZE,
-                cppflags=args.cppflags,
-                out_dir=args.out_dir,
-                unit=args.unit,
-                ldflags=args.ldflags,
-                extra_includes=args.extra_include,
-                reachability=args.reachability,
-                auto_prelude=args.auto_prelude,
-                scope_files=args.scope_file,
-                # Hand-written cases after the generated ones; without the flag, the previous sidecar's.
-                dispatch_cases=args.dispatch_case or None,
-            )
-        except (ApiHarnessError, ValueError) as exc:
-            _restore_sidecar_on_failure()
-            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
-            return 1
-        if repair_res is not None:
-            result["repair_recorded"] = repair_res
-            result["repair_attempts"] = repair_res["repair_attempts"]
-            result["exhausted"] = repair_res["exhausted"]
-        print(json.dumps(result, indent=2))
+            with _rolled_back_on_failure(_repair_paths()):
+                repair_res = (
+                    record_harness_repair(args.record_repair, args.reason.strip())
+                    if args.record_repair is not None
+                    else None
+                )
+                result = generate(
+                    module=args.module,
+                    header=args.header,
+                    max_input_size=args.max_size if args.max_size is not None else DEFAULT_MAX_INPUT_SIZE,
+                    cppflags=args.cppflags,
+                    out_dir=args.out_dir,
+                    unit=args.unit,
+                    ldflags=args.ldflags,
+                    extra_includes=args.extra_include,
+                    reachability=args.reachability,
+                    auto_prelude=args.auto_prelude,
+                    scope_files=args.scope_file,
+                    # Hand-written cases after the generated ones; without the flag, the previous sidecar's.
+                    dispatch_cases=args.dispatch_case or None,
+                )
+                out = _with_repair_result(result, repair_res)
+        except Exception as exc:  # a repair's files are already rolled back
+            return _generation_failed(exc, repair=args.record_repair is not None)
+        print(out)
         return 0
 
     if args.target_fuzzer is not None:
@@ -3014,52 +3070,50 @@ def main(argv: list[str] | None = None) -> int:
     # None: generate_module_harness takes it from the entry function's trust, else from the entry style.
     effective_reachability = args.reachability
 
-    repair_res = (
-        record_harness_repair(args.record_repair, args.reason.strip()) if args.record_repair is not None else None
-    )
     try:
-        result = generate_module_harness(
-            module_name=args.module,
-            sources=args.sources,
-            header_include=args.header,
-            entry_fn=args.entry_fn,
-            max_input_size=args.max_size,
-            cppflags=args.cppflags,
-            out_dir=args.out_dir,
-            reachability=effective_reachability,
-            contract_notes=args.contract_note,
-            entry_style=effective_style,
-            global_buf=args.global_buf,
-            global_len=args.global_len,
-            struct_type=args.struct_type,
-            include_source=args.include_source,
-            stubbed_callees=args.stubbed_callee,
-            extra_includes=args.extra_include,
-            static_analysis_includes=args.static_analysis_include,
-            compat_includes=args.compat_include,
-            self_harnessed=args.self_harnessed,
-            call_expr=args.call_expr,
-            eva_expr=args.eva_expr,
-            fuzz_expr=args.fuzz_expr,
-            null_terminate=args.null_terminate,
-            auto_args=args.auto_args,
-            auto_prelude=args.auto_prelude,
-            ldflags=args.ldflags,
-            dispatch_cases=args.dispatch_case,
-            unit=args.unit,
-            scope_files=args.scope_file,
-            target_fuzzer=args.target_fuzzer,
-            target_fuzzer_id=args.target_fuzzer_id,
-        )
-    except ValueError as exc:
-        _restore_sidecar_on_failure()
-        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
-        return 1
-    if repair_res is not None:
-        result["repair_recorded"] = repair_res
-        result["repair_attempts"] = repair_res["repair_attempts"]
-        result["exhausted"] = repair_res["exhausted"]
-    print(json.dumps(result, indent=2))
+        with _rolled_back_on_failure(_repair_paths()):
+            repair_res = (
+                record_harness_repair(args.record_repair, args.reason.strip())
+                if args.record_repair is not None
+                else None
+            )
+            result = generate_module_harness(
+                module_name=args.module,
+                sources=args.sources,
+                header_include=args.header,
+                entry_fn=args.entry_fn,
+                max_input_size=args.max_size,
+                cppflags=args.cppflags,
+                out_dir=args.out_dir,
+                reachability=effective_reachability,
+                contract_notes=args.contract_note,
+                entry_style=effective_style,
+                global_buf=args.global_buf,
+                global_len=args.global_len,
+                struct_type=args.struct_type,
+                include_source=args.include_source,
+                stubbed_callees=args.stubbed_callee,
+                extra_includes=args.extra_include,
+                static_analysis_includes=args.static_analysis_include,
+                compat_includes=args.compat_include,
+                self_harnessed=args.self_harnessed,
+                call_expr=args.call_expr,
+                eva_expr=args.eva_expr,
+                fuzz_expr=args.fuzz_expr,
+                null_terminate=args.null_terminate,
+                auto_args=args.auto_args,
+                auto_prelude=args.auto_prelude,
+                ldflags=args.ldflags,
+                dispatch_cases=args.dispatch_case,
+                unit=args.unit,
+                scope_files=args.scope_file,
+                target_fuzzer=args.target_fuzzer,
+                target_fuzzer_id=args.target_fuzzer_id,
+            )
+            out = _with_repair_result(result, repair_res)
+    except Exception as exc:  # a repair's files are already rolled back
+        return _generation_failed(exc, repair=args.record_repair is not None)
+    print(out)
     return 0
 
 
