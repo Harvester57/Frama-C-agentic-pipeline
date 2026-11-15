@@ -75,7 +75,7 @@ from framac_common import (  # noqa: E402
     read_report_csv,
     scan_undeclared_functions,
     stub_repair_action,
-    wp_model_unsound,
+    wp_model_problem,
 )
 from resources import CLASSES, FRAMAC_KERNEL_RESERVE_MB, WP_MEMLIMIT_MB, enforced_memory_mb, wp_parallelism  # noqa: E402
 
@@ -226,6 +226,65 @@ def _is_pointer_cast_goal(item: dict) -> bool:
     return bool(_POINTER_CAST_RE.search(str(item.get("annotation") or "")))
 
 
+# The automatic retry under WP's byte-level model (run_wp_on_function, retry_bytes). QCBOR run-6: the
+# `memcpy` type puns and union-writing decoders that stall or are unsound under `Typed` proved under it.
+BYTES_RETRY_MODEL = "Bytes"
+_BYTES_RETRY_SUFFIX = "_bytes"
+_UNION_UNSOUND_RE = re.compile(r"Accessing union fields with \w+ model might be unsound", re.IGNORECASE)
+_INCOMPATIBLE_CAST_RE = re.compile(r"Cast with incompatible pointers types")
+_MEM_BUILTIN_PRECOND_RE = re.compile(r"precondition of (?:memcpy|memmove|memcmp|memset)\b", re.IGNORECASE)
+
+
+def _bytes_retry_trigger(res: dict, log_text: str) -> str | None:
+    """
+    Why a `Typed` verdict that is not all_proven is worth one retry under `Bytes`, or None. Only for the
+    obstacles `Bytes` can remove: `union` when soundness fails solely on WP's union warning, or
+    `pointer_cast` when the run is sound and the unproven goals come from byte-wise casts (the cast probe
+    proved everything, WP warned `Cast with incompatible pointers types`, or every unproven goal is a
+    `memcpy`-style builtin precondition or a pointer-cast annotation).
+    """
+    soundness = res.get("soundness") or {}
+    if soundness.get("tier_a_aborts") or res.get("budget_exhausted"):
+        return None
+    unsound = list(soundness.get("tier_b_unsound") or [])
+    if unsound:
+        return "union" if all(_UNION_UNSOUND_RE.search(msg) for msg in unsound) else None
+    goals = res.get("unproven_goals") or []
+    if not goals:
+        return None
+    if (
+        res.get("wp_cast_limitation")
+        or _INCOMPATIBLE_CAST_RE.search(log_text or "")
+        or all(_MEM_BUILTIN_PRECOND_RE.search(str(g.get("kind") or "")) or _is_pointer_cast_goal(g) for g in goals)
+    ):
+        return "pointer_cast"
+    return None
+
+
+def decide_bytes_retry(
+    typed_status: str, typed_unproven: int, typed_sound: bool, bytes_res: dict
+) -> tuple[bool, str]:
+    """(kept, reason): the `Bytes` result replaces the `Typed` one only when it is sound and strictly better."""
+    status = bytes_res.get("status")
+    soundness = bytes_res.get("soundness") or {}
+    union = [m for m in soundness.get("tier_b_unsound") or [] if _UNION_UNSOUND_RE.search(m)]
+    if union:
+        return False, f"union access still unsound under Bytes: {union[0]}"
+    if status not in ("all_proven", "unproven_goals_remain", "unsound_proof"):
+        reason = f": {bytes_res['reason']}" if bytes_res.get("reason") else ""
+        return False, f"the Bytes run decided nothing (status {status!r}{reason})"
+    if not soundness.get("ok", False):
+        return False, "the Bytes run is not sound: " + "; ".join(
+            [*(soundness.get("tier_a_aborts") or []), *(soundness.get("tier_b_unsound") or [])]
+        )[:300]
+    bytes_unproven = int(bytes_res.get("unproven_count") or 0)
+    if bytes_unproven < typed_unproven:
+        return True, f"Bytes leaves {bytes_unproven} goal(s) unproven, Typed {typed_unproven}"
+    if not typed_sound:
+        return True, f"Bytes is sound where Typed was not ({typed_status})"
+    return False, f"Bytes is not better: {bytes_unproven} goal(s) unproven, Typed {typed_unproven}"
+
+
 def _locate_agent_scratch_dir(c_file: Path, out_dir: Path) -> Path | None:
     """If `c_file` or `out_dir` is inside `.../agents/<agent_id>/scratch/...`, return that `scratch` dir."""
     for candidate in (c_file, out_dir):
@@ -317,42 +376,6 @@ def extract_vc_goal_dumps(log_text: str, max_dumps: int = 5) -> list[str]:
     """Extract raw verification condition (`Assume` / `Prove`) dumps from `-wp-print` output."""
     dumps = [m.group(1).strip() for m in _VC_DUMP_RE.finditer(log_text)]
     return dumps[:max_dumps]
-
-
-ACSL_ERROR_RE = re.compile(
-    r"([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*(?:\[kernel.*?\]|error|warning).*?(?:annot-error|syntax error|unbound|invalid|type|wrong order of clause).*?$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def check_acsl_syntax(
-    c_file: Path,
-    machdep: str = "gcc_x86_64",
-    cppflags: str = "-I.",
-) -> dict:
-    effective_cppflags = augment_framac_cppflags(cppflags)
-    cmd = [
-        "frama-c",
-        "-pp-annot",
-        "-no-unicode",
-        "-machdep",
-        machdep,
-        f"-cpp-extra-args={effective_cppflags}",
-        "-kernel-warn-key",
-        "annot-error=abort",
-        str(c_file),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    if proc.returncode != 0:
-        errors = kernel_parse_errors(combined)
-        return {
-            "syntax_ok": False,
-            "returncode": proc.returncode,
-            "errors": errors or [combined[-2000:]],
-            "raw_log": combined[-3000:],
-        }
-    return {"syntax_ok": True, "returncode": 0, "errors": []}
 
 
 _PLUGIN_USER_ERROR_RE = re.compile(
@@ -1141,6 +1164,8 @@ def collect_counter_example_models(res: dict, call_args: dict[str, Any]) -> dict
         suffix += "_retry"
     elif res.get("tail_retry"):
         suffix += "_tail"
+    elif (res.get("bytes_retry") or {}).get("kept"):
+        suffix += _BYTES_RETRY_SUFFIX
     proof_log = out_dir / f"wp_{fn_name}{suffix}.log"
     try:
         failed = parse_failed_wp_goals(proof_log.read_text(encoding="utf-8", errors="replace"))
@@ -1157,6 +1182,7 @@ def collect_counter_example_models(res: dict, call_args: dict[str, Any]) -> dict
                 "retry_bitwise": False,
                 "retry_tail": False,
                 "retry_cast_probe": False,
+                "retry_bytes": False,
                 "smoke_tests": False,
                 "sarif": False,
                 "keep_goals": False,
@@ -1211,6 +1237,7 @@ def run_wp_on_function(
     ignore_prover_budget: bool = False,
     retry_cast_probe: bool = True,
     security_meta: dict | None = None,
+    retry_bytes: bool = False,
 ) -> dict:
     call_args: dict[str, Any] = dict(locals())  # first statement: exactly this call's arguments
     if counter_examples and not artifact_suffix.endswith(_MODEL_PASS_SUFFIX):
@@ -1228,7 +1255,7 @@ def run_wp_on_function(
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
     scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
-    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe", _MODEL_PASS_SUFFIX)):
+    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe", _BYTES_RETRY_SUFFIX, _MODEL_PASS_SUFFIX)):
         if _is_synthetic_probe_file(c_file, scratch_dir):
             probe_msg = (
                 f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
@@ -1721,9 +1748,11 @@ def run_wp_on_function(
 
     # Workstream 3: Automatic bitwise/shift solver retry with Typed+ref+int and extended timeout
     model_parts = {m.strip().lower() for m in re.split(r"[+,]", wp_model) if m.strip()}
-    if wp_model_unsound(wp_model):
-        # Whoever chose the model, a proof under `cast` never counts: all_proven becomes unsound_proof.
-        soundness["tier_b_unsound"].append(WP_UNSOUND_MODEL_ISSUE)
+    model_problem = wp_model_problem(wp_model)
+    if model_problem:
+        # Whoever chose the model, a proof under one outside the allowlist (`cast`, `Hoare`, `Region`,
+        # `nat`, ...) never counts: all_proven becomes unsound_proof, with the reason.
+        soundness["tier_b_unsound"].append(model_problem)
         soundness["ok"] = False
     if (
         retry_bitwise
@@ -2029,6 +2058,62 @@ def run_wp_on_function(
         if proves_all:
             res["wp_cast_limitation"] = True
             res["next_synthesis_focus"] = "wp_typed_cast_limitation_stop_now"
+    bytes_trigger = (
+        _bytes_retry_trigger(res, combined_log)
+        if retry_bytes and not prop and not dump_goal and status != "all_proven" and model_parts == {"typed"}
+        else None
+    )
+    if bytes_trigger:
+        try:
+            bytes_res: dict = run_wp_on_function(
+                c_file=c_file,
+                fn_name=fn_name,
+                out_dir=out_dir,
+                machdep=machdep,
+                cppflags=cppflags,
+                provers=provers,
+                wp_par=par,
+                timeout=timeout,
+                wp_steps=wp_steps,
+                wp_model=BYTES_RETRY_MODEL,
+                check_memory_model=check_memory_model,
+                warn_invalid_pointer=warn_invalid_pointer,
+                unsigned_reduced=unsigned_reduced,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+                retry_bitwise=False,
+                retry_tail=False,
+                retry_cast_probe=False,
+                retry_bytes=False,
+                security_meta=security_meta,
+                smoke_tests=smoke_tests,
+                session_dir=session_dir,
+                extra_sources=extra_sources,
+                wall_timeout=wall_timeout,
+                artifact_suffix=f"{artifact_suffix}{_BYTES_RETRY_SUFFIX}",
+                cache_dir=wp_cache if wp_cache is not None else "off",
+                sarif=sarif,
+                keep_goals=keep_goals,
+            )
+        except Exception as exc:  # a failed retry never changes the Typed result
+            bytes_res = {"status": "retry_error", "reason": f"{type(exc).__name__}: {exc}"}
+        kept, why = decide_bytes_retry(status, len(unproven_goals), soundness["ok"], bytes_res)
+        record = {
+            "triggered": True,
+            "trigger": bytes_trigger,
+            "kept": kept,
+            "reason": why,
+            "wp_model": BYTES_RETRY_MODEL,
+            "typed_status": status,
+            "typed_unproven_count": len(unproven_goals),
+            "bytes_status": bytes_res.get("status"),
+            "bytes_unproven_count": bytes_res.get("unproven_count"),
+        }
+        if kept:
+            # The report's wp_model is Bytes, so the parent's merge check, the sweep and the ledger replay
+            # and record it (framac_common.wp_model_assumption).
+            bytes_res["bytes_retry"] = record
+            return bytes_res
+        res["bytes_retry"] = record
     if _WHY3_MEMADDR_ERR_RE.search(combined_log):
         res["wp_why3_memaddr_limitation"] = True
     if soundness.get("macro_loop_warnings"):
@@ -2422,7 +2507,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=int, default=15)
     parser.add_argument("--wp-steps", type=int, default=0, help="Optional deterministic solver step budget")
-    parser.add_argument("--wp-model", default="Typed", help="WP memory model (default: Typed)")
+    parser.add_argument(
+        "--wp-model",
+        default=None,
+        help="WP memory model (default: Typed, retried once under Bytes when only union or byte-wise cast "
+        "obstacles remain; an explicit model is never retried)",
+    )
+    parser.add_argument(
+        "--no-retry-bytes",
+        action="store_true",
+        help="Disable the automatic retry under -wp-model Bytes (report field bytes_retry)",
+    )
     parser.add_argument("--no-check-memory-model", action="store_true", help="Disable -wp-check-memory-model")
     parser.add_argument("--no-warn-invalid-pointer", action="store_true", help="Disable -warn-invalid-pointer")
     parser.add_argument(
@@ -2530,7 +2625,10 @@ def main(argv: list[str] | None = None) -> int:
         "wp_par": args.wp_par,
         "timeout": args.timeout,
         "wp_steps": args.wp_steps,
-        "wp_model": args.wp_model,
+        "wp_model": args.wp_model or "Typed",
+        # Only when the caller left the model to us: a chosen model (a parent re-check replaying the
+        # prover's) is the configuration under test.
+        "retry_bytes": args.wp_model is None and not args.no_retry_bytes,
         "check_memory_model": not args.no_check_memory_model,
         "warn_invalid_pointer": not args.no_warn_invalid_pointer,
         "unsigned_reduced": args.no_warn_unsigned,
@@ -2567,7 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
             wp_par=args.wp_par,
             timeout=args.timeout,
             wp_steps=args.wp_steps,
-            wp_model=res.get("wp_model") or args.wp_model,
+            wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
             check_memory_model=not args.no_check_memory_model,
             warn_invalid_pointer=not args.no_warn_invalid_pointer,
             session_dir=args.session_dir,
@@ -2585,7 +2683,7 @@ def main(argv: list[str] | None = None) -> int:
             machdep=args.machdep,
             cppflags=args.cppflags,
             provers=args.provers,
-            wp_model=res.get("wp_model") or args.wp_model,
+            wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
             wp_par=args.wp_par,
             extra_sources=args.extra_sources,
         )
