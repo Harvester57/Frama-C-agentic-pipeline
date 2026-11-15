@@ -36,14 +36,17 @@ Bottom-up verification would otherwise have to wait for leaf functions before ca
 - the architects of its own unit and of every callee's unit (a leaf or static function that touches no module header skips them);
 - the gate of every fuzz/Eva slice covering its file; a sub-module's open candidates hold only the functions in its own scope, and the callers whose call cone they lie in.
 
+A callee that ends up without a contract the caller's proof can see (its prove task ended without one, or it has none) does not release the caller. The scheduler files a strengthening request itself (`origin: scheduler`, reason `caller needs a contract`), which opens `negotiate:<callee>` (Section 3), and the caller waits on that negotiation. When no negotiation can run (a crash candidate, a `shell_unverifiable_wp` function, a callee out of scope, a negotiation that ended without a contract or was refused by a cap), the caller is tagged `callees_without_contract`: it is dispatched after every untagged ready task, and its brief ends with a "Calls Without a Contract" section.
+
 Ordering and merging:
-- Functions with the longest chains of callers waiting on them go first, so the critical path starts early.
+- Functions with the longest chains of callers waiting on them go first, so the critical path starts early. Provers tagged `callees_without_contract` come after all of them.
 - Inside each prover's WP run, `-wp-par` follows the lease (min of CPUs and memory at the fixed 1000 MB prover limit).
 - Finished provers are merged in micro-batches. Their parent re-checks run in parallel, one WP job per function.
 
 ### Level 4: Adversarial Prover-vs-Breaker Dual-Play
 When a Function Prover Subagent fails to prove a specific RTE or security assertion after `K` retries (default `K = 4`):
 - The scheduler queues an **Adversarial Breaker Subagent** ([`../../skills/framac-wp/breaker_brief.md`](../../skills/framac-wp/breaker_brief.md)). Callers of the stalled function are released immediately: the breaker never blocks them.
+- No task waits on a breaker, so it would rank below every ready prover. A quarter of each round's dispatch slots (at least one) is therefore reserved for ready breakers; reserved slots no breaker needs go to the normal order.
 - The Breaker analyzes the exact unproven assertion and synthesizes surgical binary seed inputs for `E-ACSL + LibFuzzer` to trigger a runtime crash at that line.
 - A crash becomes a candidate for an independent Crash Verifier. It reopens the gates of the slices it affects, so no further proof work starts on code that may be broken.
 
@@ -66,6 +69,8 @@ Every single iteration of the Function Prover Subagent ([`../../skills/framac-wp
    - If *any* real input violates the proposed `requires` or `loop invariant`, the annotation is **immediately rejected as `rejected_overconstrained`**, and the exact failing variable values from the runtime stack trace are fed back to the subagent.
 2. **Oracle 2 — The Static Deductive Oracle (`run_wp_function.py`):**
    Only after a contract holds on 100% of real dynamic executions is it passed to `frama-c -wp -wp-rte -wp-fct <fn>` to prove that it holds mathematically across *all* possible inputs.
+   - It proves under WP's `Typed` memory model. When that run is not `all_proven` and is held back only by WP's union warning or by byte-wise goals (`memcpy`-style preconditions, pointer casts), it retries once under `Bytes` and keeps that result only when it is sound and strictly better (report field `bytes_retry`). `--no-retry-bytes` or an explicit `--wp-model` turns the retry off.
+   - Only `Typed` and `Bytes`, with the options `nocast`, `raw`, `ref`, `int` and `float`, count as evidence. A proof under any other model or option (`Hoare`, `Region`, `+cast`, `+nat`, `+real`) is `unsound_proof`: the merge refuses it and the ledger never credits it. The parent re-check replays only an accepted model, and the ledger records a `Bytes` proof with the assumption that it rests on that experimental model.
 
 ### The Best Candidate, Not the Last
 
@@ -79,7 +84,8 @@ The deterministic side prepares what a prover would otherwise have to work out b
 
 - **Function facts** ([`../../scripts/function_facts.py`](../../scripts/function_facts.py), Make target `facts`, cached by content):
   - From the Frama-C kernel AST ([`../../scripts/kernel_ast.py`](../../scripts/kernel_ast.py)): loops with their guard and updated variables, writes and reads in terms of formals and globals, possibly aliased pointer parameters, recursive calls with their decreasing argument, and return paths.
-  - From the module's Eva run ([`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py)): write and read sets, and resolved call targets.
+  - From the module's Eva run ([`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py)): write and read sets, and resolved call targets. A large `flows` section is spilled to `workspace/eva/<mod>/flows.json` (also by `eva_tuning.py`), and the report keeps a `flows_file` pointer to it. When that file is missing or unreadable, `function_facts.py` writes a `status: "failed"` facts document naming it and exits 1, so no brief is built from facts without their Eva data.
+  - Briefs load only facts of the current schema, so facts written by an older pipeline version are left out until `facts` runs again.
 - **A reading slice** ([`../../scripts/function_slice.py`](../../scripts/function_slice.py)): the target's body, callee prototypes with their current contracts, and only the types, macros and globals the target references, resolved with the real compile flags. It is built from the agent's snapshot and is reading context only. The proof target stays the real file, because a slice can differ from the compiled program.
 - **A brief assembled for the function:** string, float, union and pointer-walking guidance, and similar parts, appear only for functions with those features. Every strict rule stays. Without facts, the whole brief is rendered.
 
@@ -129,7 +135,7 @@ python3 /opt/framac-pipeline/scripts/contract_negotiator.py request \
   --reason "Required by snmpv3_parse_pdu to prove \valid_read(buf + offset + \result)"
 ```
 
-As soon as the request is ingested (`wp_scheduler.py complete`), the scheduler emits a `negotiate` task for `A`. Requests are capped per caller/callee pair, and `B` is requeued once the request is resolved:
+As soon as the request is ingested (`wp_scheduler.py complete`), the scheduler emits a `negotiate` task for `A`. Requests are capped per caller/callee pair, and `B` is requeued once the request is resolved. The scheduler files such a request itself when a callee has no contract the caller can see (Section 1, Level 3). The negotiation runs as follows:
 1. The orchestrator dispatches Callee Subagent `A` to evaluate the requested `ensures \result <= (int)max_len;` clause.
 2. Subagent `A` tests the stronger clause against **Oracle 1 (`E-ACSL guardrail`)** and **Oracle 2 (`WP` on `parse_ber_length`)**.
 3. **Outcome 1 (True in `A`):** Both oracles pass. Subagent `A` returns the stronger `ensures` clause in its scratch patch; the parent merges it into `include/ber_decode.h`, re-verifies it, marks the request `verified_and_applied`, and requeues Caller `B`.

@@ -196,6 +196,10 @@ the design above:
   one.
 - **Identity.** Shards must agree on `main_fn`, sources, reduced checks and assumption options.
   `input_digest` differs by construction; the merged report's is a digest of the shards' digests.
+  They must also carry the same `harness_digest`: shards of an older and of a repaired harness, or
+  a stamped shard beside an unstamped one, are refused, and must be run again. A merged report built
+  from shards that record no `harness_digest` gets the current harness's digest only when every
+  shard is newer than the harness, else `"unknown"`.
 - **Profiles and flows.** The shards' `flamegraph.txt` files are concatenated into
   `workspace/eva/<mod>/flamegraph.txt`, so a later re-plan reads the whole module's work. Flows are
   merged as described above.
