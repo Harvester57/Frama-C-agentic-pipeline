@@ -640,12 +640,12 @@ def test_hand_written_cases_keep_their_selectors_free(monkeypatch):
 
 
 def test_the_switch_counts_the_hand_written_case_like_any_other():
-    """One selector space: the modulus, the skip mask and the Eva shard guards index it by position."""
+    """One selector space: the case count, the skip mask and the Eva shard guards index it by position."""
     import generate_harness
 
     text = generate_harness._build_dispatch_invocation(["(void)a(0);", "(void)b(0);", _CUSTOM_CASE])
-    assert "switch (harness_selector % 3U) {" in text
-    assert "(harness_selector % 3U) & 63U" in text
+    assert "switch (harness_selector) { /* dispatch selector: identity, 3 cases */" in text
+    assert "(harness_selector & 63U)" in text
     assert (
         f"#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_2)\n        case 2U: {{ {_CUSTOM_CASE} }} break;"
         in text

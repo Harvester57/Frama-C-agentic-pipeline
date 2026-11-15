@@ -123,8 +123,9 @@ def test_dispatch_selects_one_case_per_input_byte():
     assert eva == fuzz
     assert "uint8_t harness_selector = fuzz_buf[0];" in eva
     assert "fuzz_buf += 1;" in eva and "fuzz_len -= 1;" in eva
-    # Blank cases are dropped, so the modulus counts real cases only.
-    assert "switch (harness_selector % 1U)" in eva
+    # Blank cases are dropped, so the case count counts real cases only.
+    assert "switch (harness_selector) { /* dispatch selector: identity, 1 cases */" in eva
+    assert "default: FRAMAC_FUZZ_REJECT(); break;" in eva
     assert "case 0U: { rec_parse(fuzz_buf, fuzz_len); } break;" in eva
 
 
@@ -165,7 +166,8 @@ def test_dispatch_harness_sidecar_records_cases_and_keeps_exemptions(tmp_path, m
     sidecar = json.loads((hdir / "harness_api.json").read_text(encoding="utf-8"))
     assert sidecar["reach_exempt"] == {"rec_print": "debug printer, writes to stdout only"}
     text = (hdir / "harness_api.c").read_text(encoding="utf-8")
-    assert "switch (harness_selector % 2U)" in text
+    assert "switch (harness_selector) { /* dispatch selector: identity, 2 cases */" in text
+    assert sidecar["dispatch_selector"] == "identity"
 
     clang = shutil.which("clang")
     if clang:
@@ -794,10 +796,14 @@ def _harness_identity(run: Path, module: str) -> dict[str, Any]:
 
     sidecar = json.loads((run / "workspace" / "harnesses" / f"harness_{module}.json").read_text(encoding="utf-8"))
     count = sidecar.get("dispatch_case_count")
-    return {
+    out: dict[str, Any] = {
         "harness_digest": phase0_gates.harness_digest(run, module, ignore_exempt=True),
         "dispatch_case_count": count if isinstance(count, int) and count > 0 else None,
     }
+    if out["dispatch_case_count"] is not None:
+        # run_eacsl_fuzz.dispatch_selector: the sidecar's field, `modulo` for a sidecar without it.
+        out["dispatch_selector"] = sidecar.get("dispatch_selector") or "modulo"
+    return out
 
 
 def _write_fuzz_report(

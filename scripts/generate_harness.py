@@ -64,6 +64,21 @@ DISPATCH_SKIP_ALL_MARKER = "every dispatch case skippable"
 DISPATCH_SKIP_FN = "framac_fuzz_skip_case"
 DISPATCH_RUNTIME_SKIP_MARKER = "runtime dispatch case skip"
 DISPATCH_RUNTIME_SKIP_MAX_CASES = 4096
+# The dispatch selector: the input's first byte is the case index, and a byte at or above the case count
+# runs no case (the input is rejected), so appending a case never changes the case an input selects. One
+# byte selects at most DISPATCH_MAX_CASES cases. The sidecar records the encoding as `dispatch_selector`;
+# a dispatch harness without it was generated with the older selector, the first byte modulo the case
+# count (DISPATCH_SELECTOR_MODULO), and is still decoded that way.
+DISPATCH_SELECTOR_IDENTITY = "identity"
+DISPATCH_SELECTOR_MODULO = "modulo"
+DISPATCH_MAX_CASES = 256
+DISPATCH_IDENTITY_MARKER = "dispatch selector: identity"
+# Both selector forms in harness text: `switch (harness_selector % <n>U)` (modulo) and
+# `switch (harness_selector) { /* dispatch selector: identity, <n> cases */` (identity).
+DISPATCH_SWITCH_RE = re.compile(
+    r"switch \(harness_selector % (?P<mod>\d+)U\)"
+    r"|switch \(harness_selector\) \{ /\* " + re.escape(DISPATCH_IDENTITY_MARKER) + r", (?P<ident>\d+) cases \*/"
+)
 # Eva sharding (eva_shards.py): a shard is built with -DFRAMAC_EVA_SHARD and -DFRAMAC_EVA_SHARD_CASE_<k>
 # for each case it keeps. Without FRAMAC_EVA_SHARD every case is there, as before.
 EVA_SHARD_MACRO = "FRAMAC_EVA_SHARD"
@@ -966,11 +981,47 @@ def _build_auto_prototype_invocations(
     return eva_stmt, fuzz_stmt, needs_null_terminate
 
 
+def dispatch_selector_of_text(text: str) -> tuple[str, int] | None:
+    """(encoding, case count) of the dispatch switch in harness text, or None when it has none."""
+    m = DISPATCH_SWITCH_RE.search(text)
+    if not m:
+        return None
+    if m.group("ident") is not None:
+        return DISPATCH_SELECTOR_IDENTITY, int(m.group("ident"))
+    return DISPATCH_SELECTOR_MODULO, int(m.group("mod"))
+
+
+def dispatch_selector_of(sidecar: dict[str, Any] | None, text: str | None = None) -> str:
+    """
+    The selector encoding of a dispatch harness: the sidecar's `dispatch_selector`; without a sidecar,
+    the harness text's switch. A sidecar without the field is a harness generated before the field
+    existed, which selects modulo the case count.
+    """
+    if isinstance(sidecar, dict):
+        raw = sidecar.get("dispatch_selector")
+        return DISPATCH_SELECTOR_IDENTITY if raw == DISPATCH_SELECTOR_IDENTITY else DISPATCH_SELECTOR_MODULO
+    found = dispatch_selector_of_text(text) if text else None
+    return found[0] if found else DISPATCH_SELECTOR_MODULO
+
+
+def dispatch_case_of(first_byte: int, n_cases: int, selector: str) -> int | None:
+    """The case an input whose first byte is `first_byte` runs, or None when the harness rejects it."""
+    if n_cases <= 0:
+        return None
+    if selector == DISPATCH_SELECTOR_IDENTITY:
+        return first_byte if first_byte < n_cases else None
+    return first_byte % n_cases
+
+
 def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) -> str:
     """
-    One harness that drives several API calls: the first input byte selects a case and the
-    rest of the input is the case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one
-    analysis covers every case. Cases must not `return` (the fuzz side frees its buffer after).
+    One harness that drives several API calls: the first input byte is the index of the case to run
+    (identity selector) and the rest of the input is the case's `fuzz_buf`/`fuzz_len`. A first byte at
+    or above the case count runs no case and is rejected, so a case appended later never changes the
+    case an existing input (corpus, seed, crash file) selects. One byte selects at most
+    DISPATCH_MAX_CASES cases: more is a ValueError, never a harness whose last cases are never fuzzed.
+    Eva sees an unknown selector, so one analysis covers every case (the values at or above the count
+    run nothing). Cases must not `return` (the fuzz side frees its buffer after).
 
     A campaign that already crashed in some cases skips them on the next round via the runtime
     `FRAMAC_FUZZ_SKIP_CASES` environment variable (`runtime_skip=True`, checked by `framac_fuzz_skip_case`)
@@ -982,15 +1033,23 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     Eva shard keeps only its cases in the source (eva_shards.py). The preprocessor keeps line numbers, so
     an obligation has the same (file, line) in every shard that keeps it.
 
-    An input that runs no case (no selector byte, a skipped case) calls FRAMAC_FUZZ_REJECT(): the fuzz
-    entry returns -1 for it, so libFuzzer keeps it out of the corpus; in eva_main the macro is empty.
-    A hand-written case whose own length guard turns the input away before any call does the same.
+    An input that runs no case (no selector byte, a selector at or above the case count, a skipped
+    case) calls FRAMAC_FUZZ_REJECT(): the fuzz entry returns -1 for it, so libFuzzer keeps it out of the
+    corpus; in eva_main the macro is empty. A hand-written case whose own length guard turns the input
+    away before any call does the same.
     """
     stmts = [c.strip() for c in cases if c and c.strip()]
     if not stmts:
         raise ValueError("entry_style 'dispatch' requires at least one --dispatch-case")
     n = len(stmts)
-    case = f"(harness_selector % {n}U)"
+    if n > DISPATCH_MAX_CASES:
+        raise ValueError(
+            f"a dispatch harness selects its case with one input byte, so it holds at most {DISPATCH_MAX_CASES} "
+            f"cases; this one has {n}. Split the module into sub-module harnesses (--scope-file), each with at "
+            f"most {DISPATCH_MAX_CASES} cases"
+        )
+    case = "harness_selector"
+    switch_head = f"    switch (harness_selector) {{ /* {DISPATCH_IDENTITY_MARKER}, {n} cases */"
     n_words = (n + 63) // 64
     # The mask word of the selected case: word k for cases 64k..64k+63 (no comma, so the -D values
     # never pass through a comma-separated option list).
@@ -1026,7 +1085,7 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
             "#endif",
             "    if (!harness_skip_case)",
             "#endif",
-            f"    switch (harness_selector % {n}U) {{",
+            switch_head,
         ]
         for i, stmt in enumerate(stmts):
             lines += [
@@ -1035,7 +1094,8 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
                 "#endif",
             ]
         lines += [
-            "    default: break;",
+            # A selector at or above the case count runs no case.
+            "    default: FRAMAC_FUZZ_REJECT(); break;",
             "    }",
             skip_guard,
             "    else { FRAMAC_FUZZ_REJECT(); }",
@@ -1061,7 +1121,7 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     lines += [
         f"    if ((({word} >> ({case} & 63U)) & 1ULL) == 0ULL)",
         "#endif",
-        f"    switch (harness_selector % {n}U) {{",
+        switch_head,
     ]
     for i, stmt in enumerate(stmts):
         # An Eva shard keeps only its own cases (eva_shards.py): the others leave the source, so Eva never
@@ -1072,7 +1132,8 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
             "#endif",
         ]
     lines += [
-        "    default: break;",
+        # A selector at or above the case count runs no case.
+        "    default: FRAMAC_FUZZ_REJECT(); break;",
         "    }",
         # A case the campaign skips calls nothing: libFuzzer keeps the input out of the corpus (H3).
         f"#ifdef {DISPATCH_SKIP_MACRO}",
@@ -2505,6 +2566,9 @@ def _generate_module_harness(
         "reach_exempt": reach_exempt,
         **prelude_fields,
     }
+    if entry_style == "dispatch" and target_fuzzer_record is None:
+        # The harness written above selects with _build_dispatch_invocation's identity selector.
+        sidecar["dispatch_selector"] = DISPATCH_SELECTOR_IDENTITY
     if target_fuzzer_record is not None:
         sidecar["target_fuzzer"] = dict(target_fuzzer_record)
     write_sidecar(harness_meta_file, sidecar)

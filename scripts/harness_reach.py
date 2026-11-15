@@ -78,10 +78,14 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 from generate_harness import (  # noqa: E402
+    DISPATCH_SELECTOR_IDENTITY,
+    DISPATCH_SELECTOR_MODULO,
     DISPATCH_SKIP_FN,
     TARGET_EMBEDDED_PREFIX,
     _include_dirs_from_cppflags,
     _strip_c_comments,
+    dispatch_case_of,
+    dispatch_selector_of,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 
@@ -990,25 +994,39 @@ def _artifact_identity_problem(
     harness_digest: str | None,
     n_cases: int | None,
     first_byte: int | None,
+    selector: str = DISPATCH_SELECTOR_MODULO,
 ) -> str | None:
     """
     Why a crash artifact cannot speak for the current harness, or None. A stamped artifact must carry
-    the current `harness_digest` and `dispatch_case_count` (run_eacsl_fuzz.stamp_harness_identity).
-    Its own count only explains the mismatch: the case its first byte selected then and selects now.
-    An artifact without them counts only in a report written before the fields existed and after the
-    harness last changed (`legacy_problem` is None).
+    the current `harness_digest` and `dispatch_case_count` (run_eacsl_fuzz.stamp_harness_identity), and
+    be found under the current selector encoding (`selector`; an artifact without `dispatch_selector`
+    was found under the modulo one). Its own count and encoding only explain the mismatch: the case
+    its first byte selected then and selects now. An artifact without them counts only in a report
+    written before the fields existed and after the harness last changed (`legacy_problem` is None).
     """
     if "harness_digest" in art and "dispatch_case_count" in art:
         found_n = _case_count(art.get("dispatch_case_count"))
-        if found_n != n_cases:
+        found_sel = (
+            DISPATCH_SELECTOR_IDENTITY
+            if art.get("dispatch_selector") == DISPATCH_SELECTOR_IDENTITY
+            else DISPATCH_SELECTOR_MODULO
+        )
+        if found_n != n_cases or (n_cases is not None and found_sel != selector):
 
-            def _under(n: int | None) -> str:
+            def _under(n: int | None, sel: str) -> str:
                 if n is None:
                     return "a harness without dispatch cases"
-                case = f", case {first_byte % n}" if first_byte is not None else ""
-                return f"{n} dispatch cases{case}"
+                idx = dispatch_case_of(first_byte, n, sel) if first_byte is not None else None
+                case = (
+                    ""
+                    if first_byte is None
+                    else f", case {idx}" if idx is not None else f", no case (first byte {first_byte})"
+                )
+                # The encodings are named only when they differ (a harness regenerated across the change).
+                how = f" ({sel} selector)" if found_sel != selector else ""
+                return f"{n} dispatch cases{how}{case}"
 
-            return f"found under {_under(found_n)}; the harness now has {_under(n_cases)}"
+            return f"found under {_under(found_n, found_sel)}; the harness now has {_under(n_cases, selector)}"
         if harness_digest is None or art.get("harness_digest") != harness_digest:
             return "found under another harness (harness_digest differs)"
         return None
@@ -1047,8 +1065,9 @@ def _crashed_entry_points(
     - a frame of its replay's stack is the entry point (`_artifact_frames`; exact names);
     - its failure is in the entry point itself, after the body started (not an E-ACSL precondition or
       wrapper failure, `_artifact_failure`);
-    - its input selects a `single` dispatch case of the entry point (first byte modulo the current case
-      count) and the failure is in the entry's callee closure but in none of the case's init helpers'
+    - its input selects a `single` dispatch case of the entry point (its first byte decoded with the
+      sidecar's `dispatch_selector`: the case index itself, nothing at or above the case count; modulo
+      the case count for a harness without the field) and the failure is in the entry's callee closure but in none of the case's init helpers'
       closures (they run before the entry), or the failure is unknown and the case has no init helper.
       A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
       only the first two kinds of evidence credit it.
@@ -1070,6 +1089,7 @@ def _crashed_entry_points(
 
     by_name = _functions_by_name(dag)
     n_cases = _case_count(sidecar.get("dispatch_case_count"))
+    selector = dispatch_selector_of(sidecar)
     raw_cases = sidecar.get("api_cases")
     api_cases = raw_cases if isinstance(raw_cases, list) and n_cases else []
     stamped_report = "harness_digest" in fuzz_report
@@ -1097,7 +1117,7 @@ def _crashed_entry_points(
         name = Path(str(raw_path)).name if raw_path else "artifact"
         first_byte = _artifact_first_byte(raw_path, roots)
         problem = _artifact_identity_problem(
-            art, stamped_report, legacy_problem, harness_digest, n_cases, first_byte
+            art, stamped_report, legacy_problem, harness_digest, n_cases, first_byte, selector
         )
         if problem:
             notes.append(f"{name}: not used ({problem})")
@@ -1116,7 +1136,10 @@ def _crashed_entry_points(
                 credited = True
         if in_harness or not api_cases or first_byte is None or n_cases is None:
             continue
-        idx = first_byte % n_cases
+        sel_case = dispatch_case_of(first_byte, n_cases, selector)
+        if sel_case is None:
+            continue  # the identity selector rejects this first byte: no case ran
+        idx = sel_case
         case = api_cases[idx] if idx < len(api_cases) and isinstance(api_cases[idx], dict) else {}
         kind = str(case.get("kind") or "")
         if kind in ("custom", "sequence"):
