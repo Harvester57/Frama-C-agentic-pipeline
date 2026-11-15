@@ -216,7 +216,14 @@ def sink_conflict_lines(findings: list[dict], candidates: list[dict]) -> list[st
     ]
     for pos, neg in pairs[:50]:
         rej = by_fp[neg]
-        cands = [c for c in candidates if neg == c["fingerprint"] or neg in (c.get("resolved_fingerprints") or [])]
+        # A reopened candidate has no resolved_fingerprints; its reopening names the rejection.
+        cands = [
+            c
+            for c in candidates
+            if neg == c["fingerprint"]
+            or neg in (c.get("resolved_fingerprints") or [])
+            or any(neg in r.get("rejected_fingerprints", []) for r in c.get("reopened") or [])
+        ]
         sibling = [
             e
             for c in cands
@@ -271,7 +278,8 @@ def reopening_lines(candidates: list[dict]) -> list[str]:
     if by_reason["checked_rejection"]:
         out.append(
             f"- **Contradicted `checked` rejections:** {by_reason['checked_rejection']} candidate(s): a reproduced "
-            "failure arrived after a rejection that cites a refuting tool output. They stay rejected; both the "
+            "failure (or an opposite verdict at the same sink) arrived after a rejection that cites a refuting tool "
+            "output. They stay rejected; both the "
             "tool output and the reproducer need a look."
         )
     if by_reason["harness_unchanged"]:

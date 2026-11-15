@@ -17,7 +17,7 @@ import pytest
 import ledger
 from conftest import confirmed_record, metadata, needs_validation_record, rejected_record, unit, write_json
 from fingerprint import make_fingerprint
-from generate_report import generate
+from generate_report import generate, sink_conflict_lines
 from validate_artifacts import validate_run_dir
 
 pytestmark = pytest.mark.unit
@@ -283,6 +283,18 @@ def test_report_and_needs_validation_list_the_conflicting_pair(run_dir):
     assert f"`{FP_POS}` (needs_validation) vs `{FP_NEG}` (rejected as `harness_induced`, basis `checked`)" in report
     needs = (run_dir / "NEEDS-VALIDATION.md").read_text(encoding="utf-8")
     assert f"**Conflicting verdict.** `{FP_NEG}`: rejected as `harness_induced`" in needs
+
+
+def test_report_finds_a_reopened_candidate_by_its_reopening(run_dir):
+    """A candidate refingerprinted onto the rejected record loses resolved_fingerprints when reopened."""
+    _seed(run_dir)
+    _positive(run_dir)
+    _negative(run_dir)
+    findings = _load(run_dir, "findings.json")
+    cand = _cands(run_dir)[FP_NEG]
+    other = {**cand, "fingerprint": make_fingerprint("src/snmp/ber.c", "ber_decode_tag", "mem_access", "q")}
+    lines = sink_conflict_lines(findings, [other])
+    assert lines[1].endswith(": the rejection is reopened and awaits re-verification")
 
 
 def test_report_flags_a_confirmed_finding_with_a_conflicting_rejection(run_dir):
