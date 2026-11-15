@@ -147,6 +147,8 @@ def record_reach(
             "passed": bool(row.get("passed")),
             "gaps": list(row.get("gaps") or []),
             "error": row.get("error"),
+            # Why crash inputs did not count as execution of a gap (harness_reach.py `crash_notes`).
+            "notes": [str(n) for n in (row.get("crash_notes") or [])],
             "exempt": row.get("exempt"),
             "harness_digest": harness_digest(run_dir, name),
             "dag_digest": dag,
@@ -291,6 +293,8 @@ def check(
         if section == "reach":
             if not _row_reach_ok(row, allow_dynamic_gap):
                 detail = row.get("error") or f"entry points not reached: {', '.join(row.get('gaps') or [])}"
+                if row.get("notes"):
+                    detail += f" ({'; '.join(row['notes'][:3])})"
                 reasons.append(f"reach gate failed for {module}: {detail}; {_reach_next_step(module)}")
             elif row.get("harness_digest") != harness_digest(run_dir, module):
                 reasons.append(f"the harness of {module} changed after the reach gate ran; run it again")

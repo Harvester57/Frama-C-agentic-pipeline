@@ -54,6 +54,17 @@ def test_reach_gate_records_the_stamp_and_follows_exemptions_and_harness_changes
 
 
 @pytest.mark.unit
+def test_the_reach_gate_reason_says_why_crash_inputs_did_not_count(tmp_path):
+    note = "custom case 181 crashed in helper(), not in the entry"
+    row = {"module": "api", "passed": False, "gaps": ["rec_put"], "error": phase0_gates.DYNAMIC_GAP_ERROR}
+    phase0_gates.record_reach(tmp_path, {"modules": [{**row, "crash_notes": [note]}]})
+    (reason,) = phase0_gates.check(tmp_path, "api", ("reach",))
+    assert phase0_gates.DYNAMIC_GAP_ERROR in reason and note in reason
+    # The error text itself is unchanged: --allow-dynamic-gap matches it exactly.
+    assert phase0_gates.check(tmp_path, "api", ("reach",), allow_dynamic_gap=True) == []
+
+
+@pytest.mark.unit
 def test_a_partial_reach_check_updates_only_its_modules(tmp_path, monkeypatch):
     run = _run_dir(tmp_path, monkeypatch)
     hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 0); rec_print(0, 0);")

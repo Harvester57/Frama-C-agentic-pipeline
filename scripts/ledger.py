@@ -1009,6 +1009,23 @@ def _report_scope(mm: ModuleMap, module: str) -> tuple[str, set[tuple[str, str]]
     return mm.unit_of(module), scope_keys(mm, module)
 
 
+def fuzz_keep_going_errors(report: dict) -> list[str]:
+    """
+    Why a campaign's keep-going rounds stopped before every dispatch case was fuzzed (`keep_going.status:
+    error`, e.g. a crash in a case the round had skipped), from the report and each engine's part.
+    """
+    engines = report.get("engines")
+    parts = [report, *(engines.values() if isinstance(engines, dict) else [])]
+    errors: list[str] = []
+    for part in parts:
+        kg = part.get("keep_going") if isinstance(part, dict) else None
+        if isinstance(kg, dict) and kg.get("status") == "error":
+            text = str(kg.get("error") or "no reason recorded")
+            if text not in errors:
+                errors.append(text)
+    return errors
+
+
 def fuzz_engine_note(report: dict) -> str:
     """Human-readable engine qualifier for fuzz evidence (sanitizer fallback has narrower checks)."""
     if report.get("engine_used") == "sanitizers":
@@ -1077,6 +1094,18 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
             continue
 
         ingested_modules.append(module)
+        for kg_error in fuzz_keep_going_errors(report):
+            # The crashes below are still ingested; the cases the rounds never got to were not fuzzed.
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_keep_going_error",
+                    False,
+                    tool_output,
+                    f"Keep-going fuzz rounds stopped early, the remaining dispatch cases were not fuzzed: {kg_error}",
+                )
         for art in report.get("artifacts", []):
             artifact_rel = rel(art["artifact"])
             failure = art.get("failure")
