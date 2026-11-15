@@ -43,6 +43,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -137,8 +138,34 @@ _FPV_DEGEN_RE = re.compile(
     re.MULTILINE,
 )
 # With -wp-counter-examples, failed goals carry a witness model: "[wp] [Unsuccess] <goal> (<prover>) (Model)"
-# (upstream plugins/wp/tests/wp_ce oracle format).
-_MODEL_GOAL_RE = re.compile(r"\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout)\] ([^\n(]+?) \(([^)]+)\) \(Model\)")
+# (upstream plugins/wp/tests/wp_ce oracle format), or with Frama-C 34's tags
+# "[wp] [Unknown] <goal> (Qed 2ms) (CVC5) (Cached) (Model)".
+_MODEL_GOAL_RE = re.compile(
+    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout)\] ([A-Za-z_]\w*)((?: \([^)\n]*\))*?) \(Model\)",
+    re.MULTILINE,
+)
+# Every goal WP reports as not proved, with or without a model.
+_FAILED_GOAL_RE = re.compile(
+    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout|Incorrect|Invalid)\] ([A-Za-z_]\w*)", re.MULTILINE
+)
+_PAREN_TAG_RE = re.compile(r"\(([^)\n]*)\)")
+# Artifact suffix of the -wp-counter-examples pass (run_wp_on_function): it never decides a status.
+_MODEL_PASS_SUFFIX = "_cex"
+
+
+def parse_model_goals(log: str) -> list[dict[str, str]]:
+    """The goals of a -wp-counter-examples log that carry a model, with the prover that produced it."""
+    goals: list[dict[str, str]] = []
+    for m in _MODEL_GOAL_RE.finditer(log):
+        tags = [t.strip() for t in _PAREN_TAG_RE.findall(m.group(2))]
+        provers = [t for t in tags if t and t != "Cached" and not re.match(r"Qed\b", t)]
+        goals.append({"goal": m.group(1), "prover": provers[-1] if provers else ""})
+    return goals
+
+
+def parse_failed_wp_goals(log: str) -> set[str]:
+    """Names of the goals a WP log reports as not proved."""
+    return set(_FAILED_GOAL_RE.findall(log))
 _VC_DUMP_RE = re.compile(
     r"-{20,}\n(\s*Goal [^\n]+:.*?)(?=\n-{20,}|\Z)",
     re.DOTALL,
@@ -1012,6 +1039,67 @@ def _sources_hold_eva_taint(sources: list[str]) -> bool:
     return False
 
 
+def _prove_then_collect_models(call_args: dict[str, Any]) -> dict:
+    """--counter-examples: prove without -wp-counter-examples, then take models for the goals still failing.
+
+    Frama-C 34 WP builds weaker goals under -wp-counter-examples (the model probes keep memory variables
+    apart, and the frame equalities Qed uses are lost: `ensures p->ptr == \\old(p->ptr)` for an untouched
+    pointer field is `Prove: true` normally, `Prove: Mptr_0[a] = Mptr_1[a]` with nothing relating the two
+    memories in counter-example mode). So the verdict, counts, report CSV and SARIF all come from the normal
+    proof pass, retries included; the model pass runs only when goals fail, writes its own `_cex` artifacts,
+    and only contributes `counter_example_goals` for goals the proof pass also failed. Its models are hints
+    for the crash verifiers, not proofs that a clause is false.
+    """
+    res = run_wp_on_function(**{**call_args, "counter_examples": False})
+    res["counter_examples"] = True
+    res["counter_example_goals"] = []
+    if res.get("status") != "unproven_goals_remain" or not res.get("unproven_goals"):
+        return res
+    out_dir = Path(call_args["out_dir"])
+    fn_name = str(call_args["fn_name"])
+    suffix = str(call_args["artifact_suffix"])
+    if res.get("bitwise_retry"):
+        suffix += "_retry"
+    elif res.get("tail_retry"):
+        suffix += "_tail"
+    proof_log = out_dir / f"wp_{fn_name}{suffix}.log"
+    try:
+        failed = parse_failed_wp_goals(proof_log.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        failed = set()
+    model_suffix = f"{call_args['artifact_suffix']}{_MODEL_PASS_SUFFIX}"
+    try:
+        model_res = run_wp_on_function(
+            **{
+                **call_args,
+                "counter_examples": True,
+                "wp_model": res.get("wp_model") or call_args["wp_model"],
+                "artifact_suffix": model_suffix,
+                "retry_bitwise": False,
+                "retry_tail": False,
+                "retry_cast_probe": False,
+                "smoke_tests": False,
+                "sarif": False,
+                "keep_goals": False,
+                "dump_goal": False,
+                "session_dir": None,
+                "ignore_prover_budget": True,
+            }
+        )
+    except Exception as exc:  # a failed model pass never changes the proof result
+        model_res = {"status": "model_pass_error", "reason": f"{type(exc).__name__}: {exc}"}
+    res["counter_example_goals"] = [
+        g for g in model_res.get("counter_example_goals") or [] if g.get("goal") in failed
+    ]
+    res["counter_example_pass"] = {
+        "status": model_res.get("status"),
+        "log": str(out_dir / f"wp_{fn_name}{model_suffix}.log"),
+        "models_dropped_for_proved_goals": len(model_res.get("counter_example_goals") or [])
+        - len(res["counter_example_goals"]),
+    }
+    return res
+
+
 def run_wp_on_function(
     c_file: Path,
     fn_name: str,
@@ -1045,6 +1133,9 @@ def run_wp_on_function(
     retry_cast_probe: bool = True,
     security_meta: dict | None = None,
 ) -> dict:
+    call_args: dict[str, Any] = dict(locals())  # first statement: exactly this call's arguments
+    if counter_examples and not artifact_suffix.endswith(_MODEL_PASS_SUFFIX):
+        return _prove_then_collect_models(call_args)
     out_dir.mkdir(parents=True, exist_ok=True)
     par = resolve_wp_par(wp_par)
     wp_cache = resolve_wp_cache_dir(cache_dir)
@@ -1056,7 +1147,7 @@ def run_wp_on_function(
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
     scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
-    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe")):
+    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe", _MODEL_PASS_SUFFIX)):
         if _is_synthetic_probe_file(c_file, scratch_dir):
             probe_msg = (
                 f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
@@ -1732,9 +1823,7 @@ def run_wp_on_function(
     else:
         next_focus = "complete"
 
-    model_goals = [
-        {"goal": m.group(1).strip(), "prover": m.group(2).strip()} for m in _MODEL_GOAL_RE.finditer(combined_log)
-    ]
+    model_goals = parse_model_goals(combined_log) if counter_examples else []
 
     res = {
         "status": status,
