@@ -1,0 +1,593 @@
+{
+ "module": "libqcbor_a",
+ "artifacts": [
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-db339e5cc163cf896b4d3525b7612c4b82180017",
+   "first_byte": 239,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBOREncode_EncodeHead",
+    "file": "workspace/work/src/qcbor_main_encode.c",
+    "line": 470,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #5 0x7f26d98b2c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x7f26d989b4ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x5a5724288abf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x5a57242868f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x5a572429c7d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x5a572429ed80 in handleOutOfBoundsImpl(__ubsan::OutOfBoundsData*, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x5a572429edd7 in __ubsan_handle_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173dd7)\n    #12 0x5a57242af043 in QCBOREncode_EncodeHead /framac-run/workspace/work/src/qcbor_main_encode.c:470:39\n    #13 0x5a57242af64f in QCBOREncode_Private_AppendCBORHead /framac-run/workspace/work/src/qcbor_main_encode.c:709:29\n    #14 0x5a57242e5edf in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:897:1129\n    #15 0x5a57241a653a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #16 0x5a572418e433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #17 0x5a5724194571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #18 0x5a57241c0a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #20 0x7f26d989cd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #21 0x5a5724188a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-39504f381f4e146adc8eb062cc5a1020498b7098",
+   "first_byte": 250,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #13 0x5b0bfaab1306 in QCBORDecode_Private_SingleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:799:19\n    #14 0x5b0bfaab1306 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:931:17\n    #15 0x5b0bfaab1306 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #16 0x5b0bfaab1306 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #17 0x5b0bfaaae63f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #18 0x5b0bfaaae63f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #19 0x5b0bfaaaa3ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #20 0x5b0bfaaaa3ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #21 0x5b0bfaaab4a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #22 0x5b0bfaaacda0 in QCBORDecode_GetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2320:11\n    #23 0x5b0bfaaacda0 in QCBORDecode_VGetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2366:31\n    #24 0x5b0bfaab83af in QCBORDecode_Private_GetInt64Convert /framac-run/workspace/work/src/qcbor_number_decode.c:220:4\n    #25 0x5b0bfaab83af in QCBORDecode_GetInt64ConvertAll /framac-run/workspace/work/src/qcbor_number_decode.c:1302:4\n    #26 0x5b0bfaaddb96 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:930:740\n    #27 0x5b0bfa9a953a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #28 0x5b0bfa991433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #29 0x5b0bfa997571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #30 0x5b0bfa9c3a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #32 0x7d7c09aa9d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #33 0x5b0bfa98ba20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-079330cf223cc03c56ccabec747cc29fdacced04",
+   "first_byte": 113,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBOREncode_Private_BigNumberToUInt",
+    "file": "/framac-run/workspace/work/src/qcbor_number_encode.c",
+    "line": 214,
+    "kind": "asan_heap_buffer_overflow"
+   },
+   "replay_log_tail": "    #11 0x57e91124ca20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n    #0 0x57e911324793 in malloc (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x135793)\n    #1 0x57e911395758 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:693:37\n    #2 0x57e91126a53a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #3 0x57e911252433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #4 0x57e911258571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #5 0x57e911284a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-0e79bfd35b4001e0657b08f82fab764a2d3f74b6",
+   "first_byte": 111,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #5 0x71f066b15c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x71f066afe4ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x625f68612abf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x625f686108f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x625f686267d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x625f68628b02 in handleShiftOutOfBoundsImpl(__ubsan::ShiftOutOfBoundsData*, unsigned long, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x625f68628b87 in __ubsan_handle_shift_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173b87)\n    #12 0x625f6862f1e2 in IEEE754_SingleToHalf /framac-run/workspace/work/src/ieee754.c:466:87\n    #13 0x625f6864ace8 in QCBOREncode_Private_AddPreferredFloat /framac-run/workspace/work/src/qcbor_number_encode.c:186:18\n    #14 0x625f68663d30 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1059:752\n    #15 0x625f6853053a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #16 0x625f68518433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #17 0x625f6851e571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #18 0x625f6854aa26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #20 0x71f066affd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #21 0x625f68512a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-1a0b2a32f6f6e79158833a82cb92c94120dc833a",
+   "first_byte": 111,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #5 0x7c69c760fc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x7c69c75f84ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x5b2e18c1babf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x5b2e18c198f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x5b2e18c2f7d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x5b2e18c31b02 in handleShiftOutOfBoundsImpl(__ubsan::ShiftOutOfBoundsData*, unsigned long, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x5b2e18c31b87 in __ubsan_handle_shift_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173b87)\n    #12 0x5b2e18c381e2 in IEEE754_SingleToHalf /framac-run/workspace/work/src/ieee754.c:466:87\n    #13 0x5b2e18c53ce8 in QCBOREncode_Private_AddPreferredFloat /framac-run/workspace/work/src/qcbor_number_encode.c:186:18\n    #14 0x5b2e18c6cd30 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1059:752\n    #15 0x5b2e18b3953a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #16 0x5b2e18b21433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #17 0x5b2e18b27571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #18 0x5b2e18b53a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #20 0x7c69c75f9d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #21 0x5b2e18b1ba20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-44a8ba1323a917d21720226fede1ff3ae2292bb0",
+   "first_byte": 48,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBOREncode_EncodeHead",
+    "file": "workspace/work/src/qcbor_main_encode.c",
+    "line": 470,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #2 0x5cec32635e37 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x79e37)\n    #5 0x7bf0bc807c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x7bf0bc7f04ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x5cec32719abf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x5cec327178f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x5cec3272d7d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x5cec3272fd80 in handleOutOfBoundsImpl(__ubsan::OutOfBoundsData*, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x5cec3272fdd7 in __ubsan_handle_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173dd7)\n    #12 0x5cec32740043 in QCBOREncode_EncodeHead /framac-run/workspace/work/src/qcbor_main_encode.c:470:39\n    #13 0x5cec32777cab in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:870:1007\n    #14 0x5cec3263753a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #15 0x5cec3261f433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #16 0x5cec32625571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #17 0x5cec32651a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #19 0x7bf0bc7f1d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #20 0x5cec32619a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-cf2144353ef65a3f8984ee1182843610d44e3a32",
+   "first_byte": 10,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "UsefulOutBuf_Compare",
+    "file": "workspace/work/src/UsefulBuf.c",
+    "line": 746,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #5 0x729e74820c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x729e748094ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x577f14fe2abf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x577f14fe08f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x577f14ff67d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x577f14ffb03a in handlePointerOverflowImpl(__ubsan::PointerOverflowData*, unsigned long, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x577f14ffb087 in __ubsan_handle_pointer_overflow_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x176087)\n    #12 0x577f14ffe674 in UsefulOutBuf_Compare /framac-run/workspace/work/src/UsefulBuf.c:746:22\n    #13 0x577f150418dd in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:756:1320\n    #14 0x577f14f0053a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #15 0x577f14ee8433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #16 0x577f14eee571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #17 0x577f14f1aa26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #19 0x729e7480ad64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #20 0x577f14ee2a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-e620ed5f4a604ee970d73e475b89bdc3f2d626d9",
+   "first_byte": 111,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #5 0x708311d57c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x708311d404ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x61c85b816abf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x61c85b8148f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x61c85b82a7d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x61c85b82cb02 in handleShiftOutOfBoundsImpl(__ubsan::ShiftOutOfBoundsData*, unsigned long, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x61c85b82cb87 in __ubsan_handle_shift_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173b87)\n    #12 0x61c85b8331e2 in IEEE754_SingleToHalf /framac-run/workspace/work/src/ieee754.c:466:87\n    #13 0x61c85b84ece8 in QCBOREncode_Private_AddPreferredFloat /framac-run/workspace/work/src/qcbor_number_encode.c:186:18\n    #14 0x61c85b867d30 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1059:752\n    #15 0x61c85b73453a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #16 0x61c85b71c433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #17 0x61c85b722571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #18 0x61c85b74ea26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #20 0x708311d41d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #21 0x61c85b716a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-f409df3a8e7e41fd088967823010357baa19cfa5",
+   "first_byte": 113,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBOREncode_Private_BigNumberToUInt",
+    "file": "/framac-run/workspace/work/src/qcbor_number_encode.c",
+    "line": 214,
+    "kind": "asan_heap_buffer_overflow"
+   },
+   "replay_log_tail": "    #11 0x6228b77c6a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n    #0 0x6228b789e793 in malloc (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x135793)\n    #1 0x6228b790f758 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:693:37\n    #2 0x6228b77e453a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #3 0x6228b77cc433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #4 0x6228b77d2571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #5 0x6228b77fea26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-49da032558425f5b82737fb889067767447d53cb",
+   "first_byte": 166,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBORDecode_Private_CheckItemType",
+    "file": "/framac-run/workspace/work/src/qcbor_tag_decode.c",
+    "line": 255,
+    "kind": "asan_stack_buffer_overflow"
+   },
+   "replay_log_tail": "\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-7f63cf33cce1590a3913da319a51ee2190f1c07c",
+   "first_byte": 166,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBORDecode_Private_CheckItemType",
+    "file": "/framac-run/workspace/work/src/qcbor_tag_decode.c",
+    "line": 255,
+    "kind": "asan_stack_buffer_overflow"
+   },
+   "replay_log_tail": "\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-b34b92295824fed9d368653847e516005f4bfcf2",
+   "first_byte": 112,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "UsefulOutBuf_AppendUsefulBuf",
+    "file": "/framac-run/workspace/work/src/UsefulBuf.c",
+    "line": 523,
+    "kind": "asan_heap_buffer_overflow"
+   },
+   "replay_log_tail": "    #12 0x5e1ac48c0a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n    #0 0x5e1ac4998793 in malloc (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x135793)\n    #1 0x5e1ac4a09758 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:693:37\n    #2 0x5e1ac48de53a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #3 0x5e1ac48c6433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #4 0x5e1ac48cc571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #5 0x5e1ac48f8a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-c8267e625cd02a4f338da2a640a5ba3cef70e2d1",
+   "first_byte": 166,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBORDecode_Private_ProcessTagItem",
+    "file": "/framac-run/workspace/work/src/qcbor_tag_decode.c",
+    "line": 485,
+    "kind": "asan_segv"
+   },
+   "replay_log_tail": "    #0 0x5f245d7c5a9d in QCBORDecode_Private_ProcessTagItem /framac-run/workspace/work/src/qcbor_tag_decode.c:485:14\n    #1 0x5f245d7e2e68 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1224:1517\n    #2 0x5f245d6a153a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #3 0x5f245d689433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #4 0x5f245d68f571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #5 0x5f245d6bba26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #7 0x701c2923dd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #8 0x5f245d683a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-cb97435967e90153e196bb3194ca57ed3bac56de",
+   "first_byte": 84,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #12 0x63fc9eb4a47b in IEEE754_DoubleToSingle /framac-run/workspace/work/src/ieee754.c:625:93\n    #13 0x63fc9eb4a47b in IEEE754_DoubleToSmaller /framac-run/workspace/work/src/ieee754.c:653:13\n    #14 0x63fc9eb53364 in QCBORDecode_Private_DoubleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:832:19\n    #15 0x63fc9eb53364 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:937:17\n    #16 0x63fc9eb53364 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #17 0x63fc9eb53364 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #18 0x63fc9eb5063f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #19 0x63fc9eb5063f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #20 0x63fc9eb4c3ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #21 0x63fc9eb4c3ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #22 0x63fc9eb4d4a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #23 0x63fc9eb6044a in QCBORDecode_Private_GetAndTell /framac-run/workspace/work/inc/qcbor/qcbor_main_decode.h:1657:31\n    #24 0x63fc9eb6044a in QCBORDecode_GetTBigNumberRaw /framac-run/workspace/work/src/qcbor_number_decode.c:2197:4\n    #25 0x63fc9eb871aa in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:978:801\n    #26 0x63fc9ea4b53a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #27 0x63fc9ea33433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #28 0x63fc9ea39571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #29 0x63fc9ea65a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #31 0x74bdd8633d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #32 0x63fc9ea2da20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-d7e3e2e92e48505067b597ff0bf273a9795d39b4",
+   "first_byte": 255,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #12 0x64d0aca7047b in IEEE754_DoubleToSingle /framac-run/workspace/work/src/ieee754.c:625:93\n    #13 0x64d0aca7047b in IEEE754_DoubleToSmaller /framac-run/workspace/work/src/ieee754.c:653:13\n    #14 0x64d0aca79364 in QCBORDecode_Private_DoubleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:832:19\n    #15 0x64d0aca79364 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:937:17\n    #16 0x64d0aca79364 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #17 0x64d0aca79364 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #18 0x64d0aca7663f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #19 0x64d0aca7663f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #20 0x64d0aca723ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #21 0x64d0aca723ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #22 0x64d0aca734a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #23 0x64d0aca8a481 in QCBORDecode_Private_GetAndTell /framac-run/workspace/work/inc/qcbor/qcbor_main_decode.h:1657:31\n    #24 0x64d0aca8a481 in QCBORDecode_GetTBigFloatBigMantissa /framac-run/workspace/work/src/qcbor_number_decode.c:2895:4\n    #25 0x64d0acab0747 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:945:1233\n    #26 0x64d0ac97153a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #27 0x64d0ac959433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #28 0x64d0ac95f571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #29 0x64d0ac98ba26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #31 0x7adcda91cd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #32 0x64d0ac953a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-fd948a5e81638d356c08ab8279e3a37bdc5899fc",
+   "first_byte": 146,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #11 0x5f492bed1b87 in __ubsan_handle_shift_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173b87)\n    #12 0x5f492bed847b in IEEE754_DoubleToSingle /framac-run/workspace/work/src/ieee754.c:625:93\n    #13 0x5f492bed847b in IEEE754_DoubleToSmaller /framac-run/workspace/work/src/ieee754.c:653:13\n    #14 0x5f492bee1364 in QCBORDecode_Private_DoubleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:832:19\n    #15 0x5f492bee1364 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:937:17\n    #16 0x5f492bee1364 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #17 0x5f492bee1364 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #18 0x5f492bede63f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #19 0x5f492bede63f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #20 0x5f492beda3ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #21 0x5f492beda3ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #22 0x5f492bedb4a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #23 0x5f492befbce2 in QCBORDecode_GetNextTagNumber /framac-run/workspace/work/src/qcbor_tag_decode.c:74:11\n    #24 0x5f492bf0e4d0 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1164:570\n    #25 0x5f492bdd953a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #26 0x5f492bdc1433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #27 0x5f492bdc7571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #28 0x5f492bdf3a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #30 0x711a563b3d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #31 0x5f492bdbba20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-114f847a11a8468b939b2f175160579dc630a397",
+   "first_byte": 170,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "QCBOREncode_EncodeHead",
+    "file": "workspace/work/src/qcbor_main_encode.c",
+    "line": 470,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #5 0x717a6b660c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x717a6b6494ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab)\n    #7 0x5b306c487abf in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15dabf)\n    #8 0x5b306c4858f1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x15b8f1)\n    #9 0x5b306c49b7d6 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x1717d6)\n    #10 0x5b306c49dd80 in handleOutOfBoundsImpl(__ubsan::OutOfBoundsData*, unsigned long, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x5b306c49ddd7 in __ubsan_handle_out_of_bounds_abort (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x173dd7)\n    #12 0x5b306c4ae043 in QCBOREncode_EncodeHead /framac-run/workspace/work/src/qcbor_main_encode.c:470:39\n    #13 0x5b306c4ae64f in QCBOREncode_Private_AppendCBORHead /framac-run/workspace/work/src/qcbor_main_encode.c:709:29\n    #14 0x5b306c4f1db6 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1236:21734\n    #15 0x5b306c3a553a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #16 0x5b306c38d433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #17 0x5b306c393571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #18 0x5b306c3bfa26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #20 0x717a6b64ad64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #21 0x5b306c387a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-b7fc60516b1cf43b6a668bca996e7a9f11c3b6c5",
+   "first_byte": 133,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #13 0x5c91aa07147b in IEEE754_DoubleToSmaller /framac-run/workspace/work/src/ieee754.c:653:13\n    #14 0x5c91aa07a364 in QCBORDecode_Private_DoubleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:832:19\n    #15 0x5c91aa07a364 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:937:17\n    #16 0x5c91aa07a364 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #17 0x5c91aa07a364 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #18 0x5c91aa07763f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #19 0x5c91aa07763f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #20 0x5c91aa0733ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #21 0x5c91aa0733ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #22 0x5c91aa0744a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #23 0x5c91aa075da0 in QCBORDecode_GetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2320:11\n    #24 0x5c91aa075da0 in QCBORDecode_VGetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2366:31\n    #25 0x5c91aa08dc2e in QCBORDecode_Private_GetString /framac-run/workspace/work/src/qcbor_spiffy_decode.c:84:4\n    #26 0x5c91aa0a81f2 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1125:768\n    #27 0x5c91a9f7253a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #28 0x5c91a9f5a433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #29 0x5c91a9f60571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #30 0x5c91a9f8ca26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #32 0x74389b4e8d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #33 0x5c91a9f54a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-445f7162bd7e7d7f20f16f01313084630b68fb77",
+   "first_byte": 128,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #12 0x5870011421e2 in IEEE754_SingleToHalf /framac-run/workspace/work/src/ieee754.c:466:87\n    #13 0x58700114b306 in QCBORDecode_Private_SingleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:799:19\n    #14 0x58700114b306 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:931:17\n    #15 0x58700114b306 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #16 0x58700114b306 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #17 0x58700114863f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #18 0x58700114863f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #19 0x5870011443ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #20 0x5870011443ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #21 0x5870011454a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #22 0x5870011468ee in QCBORDecode_GetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2320:11\n    #23 0x5870011636ac in QCBORDecode_Private_EnterBoundedMapOrArray /framac-run/workspace/work/src/qcbor_spiffy_decode.c:862:11\n    #24 0x5870011780de in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1110:764\n    #25 0x58700104353a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #26 0x58700102b433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #27 0x587001031571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #28 0x58700105da26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #30 0x7b637a395d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #31 0x587001025a20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-53438b07974382c5ee228f86d7857c4b5cc23270",
+   "first_byte": 120,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #12 0x6413e55ba1e2 in IEEE754_SingleToHalf /framac-run/workspace/work/src/ieee754.c:466:87\n    #13 0x6413e55c3306 in QCBORDecode_Private_SingleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:799:19\n    #14 0x6413e55c3306 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:931:17\n    #15 0x6413e55c3306 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #16 0x6413e55c3306 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #17 0x6413e55c063f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #18 0x6413e55c063f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #19 0x6413e55bc3ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #20 0x6413e55bc3ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #21 0x6413e55bd4a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #22 0x6413e55beda0 in QCBORDecode_GetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2320:11\n    #23 0x6413e55beda0 in QCBORDecode_VGetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2366:31\n    #24 0x6413e55dc6ab in QCBORDecode_GetBool /framac-run/workspace/work/src/qcbor_spiffy_decode.c:1065:4\n    #25 0x6413e55f3443 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1086:562\n    #26 0x6413e54bb53a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #27 0x6413e54a3433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #28 0x6413e54a9571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #29 0x6413e54d5a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #31 0x72595114ad64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #32 0x6413e549da20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-adc84da359f729d4903d641208b438d4a0025b0c",
+   "first_byte": 38,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #12 0x57600c27c47b in IEEE754_DoubleToSingle /framac-run/workspace/work/src/ieee754.c:625:93\n    #13 0x57600c27c47b in IEEE754_DoubleToSmaller /framac-run/workspace/work/src/ieee754.c:653:13\n    #14 0x57600c285364 in QCBORDecode_Private_DoubleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:832:19\n    #15 0x57600c285364 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:937:17\n    #16 0x57600c285364 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #17 0x57600c285364 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #18 0x57600c28263f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #19 0x57600c28263f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #20 0x57600c27e3ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #21 0x57600c27e3ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #22 0x57600c27f4a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #23 0x57600c280da0 in QCBORDecode_GetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2320:11\n    #24 0x57600c280da0 in QCBORDecode_VGetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2366:31\n    #25 0x57600c2b19a4 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:840:638\n    #26 0x57600c17d53a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #27 0x57600c165433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #28 0x57600c16b571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #29 0x57600c197a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #31 0x738df3bfbd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #32 0x57600c15fa20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-727de3f8b588687c5aa84104a8858ab9478aaced",
+   "first_byte": 99,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "sanitizers",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "ubsan_runtime_error"
+   },
+   "replay_log_tail": "    #13 0x5c835deb947b in IEEE754_DoubleToSmaller /framac-run/workspace/work/src/ieee754.c:653:13\n    #14 0x5c835dec2364 in QCBORDecode_Private_DoubleConformance /framac-run/workspace/work/src/qcbor_main_decode.c:832:19\n    #15 0x5c835dec2364 in QCBOR_Private_DecodeFloat /framac-run/workspace/work/src/qcbor_main_decode.c:937:17\n    #16 0x5c835dec2364 in QCBOR_Private_DecodeType7 /framac-run/workspace/work/src/qcbor_main_decode.c:1003:17\n    #17 0x5c835dec2364 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/work/src/qcbor_main_decode.c:1150:17\n    #18 0x5c835debf63f in QCBORDecode_Private_GetNextFullString /framac-run/workspace/work/src/qcbor_main_decode.c:1222:14\n    #19 0x5c835debf63f in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/work/src/qcbor_main_decode.c:1495:14\n    #20 0x5c835debb3ea in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/work/src/qcbor_main_decode.c:1587:11\n    #21 0x5c835debb3ea in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/work/src/qcbor_main_decode.c:1880:14\n    #22 0x5c835debc4a4 in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/work/src/qcbor_main_decode.c:1984:11\n    #23 0x5c835debdda0 in QCBORDecode_GetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2320:11\n    #24 0x5c835debdda0 in QCBORDecode_VGetNext /framac-run/workspace/work/src/qcbor_main_decode.c:2366:31\n    #25 0x5c835dec8404 in QCBORDecode_Private_GetDoubleConvert /framac-run/workspace/work/src/qcbor_number_decode.c:554:4\n    #26 0x5c835def05f5 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libqcbor_a.c:1023:863\n    #27 0x5c835ddba53a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x7b53a)\n    #28 0x5c835dda2433 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x63433)\n    #29 0x5c835dda8571 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x69571)\n    #30 0x5c835ddd4a26 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x95a26)\n    #32 0x71737b96ed64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #33 0x5c835dd9ca20 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a+0x5da20)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-fa138ae356d35c8d77083c406a5be73745643aae",
+   "first_byte": 151,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_GetTEpochDate",
+    "file": "workspace/work/src/qcbor_tag_decode.c",
+    "line": 893,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x64b88a1eb7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x64b88a1be3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x64b88a1a3327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x742109591c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x64b88a2c2973 in QCBORDecode_GetTEpochDate /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:166613:5\n    #7 0x64b88a2ef65d in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:185594:9\n    #8 0x64b88a1a4a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #9 0x64b88a18c923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #10 0x64b88a192a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #11 0x64b88a1bef16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #13 0x74210957bd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #14 0x64b88a186f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-fe83f217d464f6fdfa5b2b1f87fe3a1a47371196",
+   "first_byte": 171,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_Private_GetItemInMap",
+    "file": "workspace/work/src/qcbor_spiffy_decode.c",
+    "line": 516,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5fdd2a51c7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5fdd2a4ef3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5fdd2a4d4327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x71c27206ec41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5fdd2a5d4279 in QCBORDecode_Private_GetItemInMap /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:145989:5\n    #7 0x5fdd2a584ce6 in QCBORDecode_GetItemInMapSZ /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:146388:3\n    #8 0x5fdd2a61de09 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:188099:9\n    #9 0x5fdd2a4d5a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #10 0x5fdd2a4bd923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #11 0x5fdd2a4c3a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #12 0x5fdd2a4eff16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #14 0x71c272058d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #15 0x5fdd2a4b7f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-13cba177bcfad90e7b3de70616b2e54ba4bb107f",
+   "first_byte": 154,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_GetTEpochDays",
+    "file": "workspace/work/src/qcbor_tag_decode.c",
+    "line": 966,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5e67b58aa7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5e67b587d3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5e67b5862327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x72c60dc7cc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5e67b5984c63 in QCBORDecode_GetTEpochDays /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:167075:5\n    #7 0x5e67b599d5c4 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:185797:11\n    #8 0x5e67b5863a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #9 0x5e67b584b923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #10 0x5e67b5851a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #11 0x5e67b587df16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #13 0x72c60dc66d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #14 0x5e67b5845f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-5c9800a50f7d77be1ddb1266d4325043484cec9d",
+   "first_byte": 181,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_Private_ConsumeItem",
+    "file": "workspace/work/src/qcbor_main_decode.c",
+    "line": 2089,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x6388725037d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x6388724d63ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x6388724bb327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x70da3e379c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x63887253d366 in QCBORDecode_Private_ConsumeItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:51546:5\n    #7 0x6388725b76ad in QCBORDecode_Private_MapSearch /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:141999:17\n    #8 0x6388725c39fd in QCBORDecode_Private_ExitBoundedMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:151367:12\n    #9 0x63887260dd03 in QCBORDecode_ExitArray_2 /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:176865:3\n    #10 0x63887260d9f9 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:191654:19\n    #11 0x6388724bca2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #12 0x6388724a4923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #13 0x6388724aaa61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #14 0x6388724d6f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #16 0x70da3e363d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #17 0x63887249ef10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-c859d73c54a19fa0f1d5516661feec52c6b82071",
+   "first_byte": 181,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_Private_ConsumeItem",
+    "file": "workspace/work/src/qcbor_main_decode.c",
+    "line": 2089,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5ade051fb7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5ade051ce3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5ade051b3327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x7acf5fa5ac41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5ade05235366 in QCBORDecode_Private_ConsumeItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:51546:5\n    #7 0x5ade052af6ad in QCBORDecode_Private_MapSearch /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:141999:17\n    #8 0x5ade052bb9fd in QCBORDecode_Private_ExitBoundedMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:151367:12\n    #9 0x5ade05305d03 in QCBORDecode_ExitArray_2 /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:176865:3\n    #10 0x5ade053059f9 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:191654:19\n    #11 0x5ade051b4a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #12 0x5ade0519c923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #13 0x5ade051a2a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #14 0x5ade051cef16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #16 0x7acf5fa44d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #17 0x5ade05196f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-61a66f79e7bfd9cd750842f5f5814202d5690cb4",
+   "first_byte": 39,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_Private_ConsumeItem",
+    "file": "workspace/work/src/qcbor_main_decode.c",
+    "line": 2089,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5e56fadda7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5e56fadad3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5e56fad92327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x766af6577c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5e56fae14366 in QCBORDecode_Private_ConsumeItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:51546:5\n    #7 0x5e56fae1cc84 in QCBORDecode_VGetNextConsume /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:57310:10\n    #8 0x5e56faee1b23 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:179028:11\n    #9 0x5e56fad93a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #10 0x5e56fad7b923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #11 0x5e56fad81a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #12 0x5e56fadadf16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #14 0x766af6561d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #15 0x5e56fad75f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-db339e5cc163cf896b4d3525b7612c4b82180017",
+   "first_byte": 239,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBOREncode_EncodeHead",
+    "file": "workspace/work/src/qcbor_main_encode.c",
+    "line": 470,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x649b467ef7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x649b467c23ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x649b467a7327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x79029dc77c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x649b4683f12c in QCBOREncode_EncodeHead /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:75799:15\n    #7 0x649b4684358f in QCBOREncode_Private_AppendCBORHead /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:78561:5\n    #8 0x649b468f6651 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:179877:11\n    #9 0x649b467a8a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #10 0x649b46790923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #11 0x649b46796a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #12 0x649b467c2f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #14 0x79029dc61d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #15 0x649b4678af10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-5f716bb9bba607fa45bf748b4e88174e4ff40764",
+   "first_byte": 30,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_Private_GetArrayOrMap",
+    "file": "workspace/work/src/qcbor_main_decode.c",
+    "line": 2549,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x6467519c97d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x64675199c3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x646751981327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x7da8ed13cc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x646751a0dcad in QCBORDecode_Private_GetArrayOrMap /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:58495:5\n    #7 0x646751abac53 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:178589:11\n    #8 0x646751982a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #9 0x64675196a923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #10 0x646751970a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #11 0x64675199cf16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #13 0x7da8ed126d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #14 0x646751964f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-39504f381f4e146adc8eb062cc5a1020498b7098",
+   "first_byte": 250,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #9 0x6058cbfadda7 in QCBOR_Private_DecodeType7 /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:37888:11\n    #10 0x6058cbfa44f9 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39079:12\n    #11 0x6058cbfaf28b in QCBORDecode_Private_GetNextFullString /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39276:13\n    #12 0x6058cbedacd6 in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:43726:12\n    #13 0x6058cbec4463 in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:44299:10\n    #14 0x6058cbec4463 in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:47191:13\n    #15 0x6058cbec90be in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:48524:10\n    #16 0x6058cbed42c3 in QCBORDecode_GetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:55297:10\n    #17 0x6058cbed5d90 in QCBORDecode_VGetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:56438:9\n    #18 0x6058cbefad38 in QCBORDecode_Private_GetInt64Convert /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:89534:3\n    #19 0x6058cbf085be in QCBORDecode_GetInt64ConvertAll /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:103700:3\n    #20 0x6058cbf8715e in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:180437:11\n    #21 0x6058cbe4ea2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #22 0x6058cbe36923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #23 0x6058cbe3ca61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #24 0x6058cbe68f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #26 0x709537cc8d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #27 0x6058cbe30f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-21d31adacdbffdb034e576a00b0dbd435abe9298",
+   "first_byte": 48,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBOREncode_EncodeHead",
+    "file": "workspace/work/src/qcbor_main_encode.c",
+    "line": 470,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5c8e685d57d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5c8e685a83ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5c8e6858d327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x702f30296c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5c8e6862512c in QCBOREncode_EncodeHead /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:75799:15\n    #7 0x5c8e686ded7e in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:179444:11\n    #8 0x5c8e6858ea2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #9 0x5c8e68576923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #10 0x5c8e6857ca61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #11 0x5c8e685a8f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #13 0x702f30280d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #14 0x5c8e68570f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-808611174df2f8e4e18f5ee0bc206ece64c04dd8",
+   "first_byte": 120,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #8 0x59944e616da7 in QCBOR_Private_DecodeFloat /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:37521:12\n    #9 0x59944e616da7 in QCBOR_Private_DecodeType7 /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:37888:11\n    #10 0x59944e60d4f9 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39079:12\n    #11 0x59944e61828b in QCBORDecode_Private_GetNextFullString /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39276:13\n    #12 0x59944e543cd6 in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:43726:12\n    #13 0x59944e52d463 in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:44299:10\n    #14 0x59944e52d463 in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:47191:13\n    #15 0x59944e5320be in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:48524:10\n    #16 0x59944e53d2c3 in QCBORDecode_GetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:55297:10\n    #17 0x59944e53ed90 in QCBORDecode_VGetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:56438:9\n    #18 0x59944e5beb6a in QCBORDecode_GetBool /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:152234:3\n    #19 0x59944e5fc351 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:184002:11\n    #20 0x59944e4b7a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #21 0x59944e49f923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #22 0x59944e4a5a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #23 0x59944e4d1f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #25 0x75d23a367d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #26 0x59944e499f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-82c21831a4cec9fab6b190effbdb9f91888eba28",
+   "first_byte": 48,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBOREncode_EncodeHead",
+    "file": "workspace/work/src/qcbor_main_encode.c",
+    "line": 470,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5efdb87c37d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5efdb87963ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5efdb877b327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x764dc555ac41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5efdb881312c in QCBOREncode_EncodeHead /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:75799:15\n    #7 0x5efdb88ccd7e in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:179444:11\n    #8 0x5efdb877ca2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #9 0x5efdb8764923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #10 0x5efdb876aa61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #11 0x5efdb8796f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #13 0x764dc5544d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #14 0x5efdb875ef10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-8c09793b87a4fde59389418c7c978bdd549a6840",
+   "first_byte": 113,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBOREncode_Private_BigNumberToUInt",
+    "file": "workspace/work/src/qcbor_number_encode.c",
+    "line": 214,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x59471cb6e7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x59471cb413ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x59471cb26327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x79a8b7577c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x59471cc13882 in QCBOREncode_Private_BigNumberToUInt /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:131443:7\n    #7 0x59471cc13882 in QCBOREncode_Private_AddTBigNumberMain /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:134280:22\n    #8 0x59471cc15f7a in QCBOREncode_AddTBigNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:129345:3\n    #9 0x59471cc15f7a in QCBOREncode_Private_AddTExpBigMantissa /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:134527:3\n    #10 0x59471cc76b2d in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:183599:11\n    #11 0x59471cb27a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #12 0x59471cb0f923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #13 0x59471cb15a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #14 0x59471cb41f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #16 0x79a8b7561d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #17 0x59471cb09f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-eaa19a2ed18e84b2e15e1ec49f3cc793eb5b59df",
+   "first_byte": 110,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x64d33e3b57d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x64d33e3883ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x64d33e36d327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x7d88283adc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x64d33e3d7b32 in IEEE754_DoubleToSingle /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:23272:13\n    #7 0x64d33e3d6118 in IEEE754_DoubleToSmaller /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:23788:12\n    #8 0x64d33e455e24 in QCBOREncode_Private_AddPreferredDouble /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:130280:17\n    #9 0x64d33e4a764e in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:183360:11\n    #10 0x64d33e36ea2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #11 0x64d33e356923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #12 0x64d33e35ca61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #13 0x64d33e388f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #15 0x7d8828397d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #16 0x64d33e350f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-5a81727abf4b414e63c5da91c25ff3d5508cafda",
+   "first_byte": 102,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "IEEE754_SingleToHalf",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 466,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #12 0x5c5b6eb3ecd6 in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:43726:12\n    #13 0x5c5b6eb28bc2 in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:44577:11\n    #14 0x5c5b6eb28bc2 in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:47191:13\n    #15 0x5c5b6eb32d97 in QCBORDecode_Private_ConsumeItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:51273:15\n    #16 0x5c5b6ec12d71 in QCBORDecode_Private_GetLabelAndConsume /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:52019:10\n    #17 0x5c5b6eb36ecc in QCBORDecode_Private_CheckDups /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:52235:12\n    #18 0x5c5b6eb36ecc in QCBORDecode_Private_CheckMap /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:53746:12\n    #19 0x5c5b6eb33d94 in QCBORDecode_Private_GetItemChecks /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:54448:16\n    #20 0x5c5b6eb38487 in QCBORDecode_GetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:55362:10\n    #21 0x5c5b6eb39d90 in QCBORDecode_VGetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:56438:9\n    #22 0x5c5b6eb5ed38 in QCBORDecode_Private_GetInt64Convert /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:89534:3\n    #23 0x5c5b6ebe9621 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:182876:11\n    #24 0x5c5b6eab2a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #25 0x5c5b6ea9a923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #26 0x5c5b6eaa0a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #27 0x5c5b6eaccf16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #29 0x74821c1add64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #30 0x5c5b6ea94f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-5bb4ac9c4c197274eeed07e14a8b9ea661fcc620",
+   "first_byte": 112,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBOREncode_Private_AddTNegativeBigNumber",
+    "file": "workspace/work/src/qcbor_number_encode.c",
+    "line": 290,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #0 0x5d3a690687d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x5d3a6903b3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x5d3a69020327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x7464a42f8c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x5d3a6910eaa5 in QCBOREncode_Private_AddTNegativeBigNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:132805:7\n    #7 0x5d3a6910eaa5 in QCBOREncode_Private_AddTBigNumberMain /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:134420:7\n    #8 0x5d3a6915b474 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:183501:11\n    #9 0x5d3a69021a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #10 0x5d3a69009923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #11 0x5d3a6900fa61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #12 0x5d3a6903bf16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #14 0x7464a42e2d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #15 0x5d3a69003f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-76c790c506e02c6caad69db9b30904b4e932bb43",
+   "first_byte": 99,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #9 0x5aaa8bccfee7 in QCBOR_Private_DecodeFloat /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:37821:12\n    #10 0x5aaa8bccfee7 in QCBOR_Private_DecodeType7 /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:37888:11\n    #11 0x5aaa8bcc64f9 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39079:12\n    #12 0x5aaa8bcd128b in QCBORDecode_Private_GetNextFullString /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39276:13\n    #13 0x5aaa8bbfccd6 in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:43726:12\n    #14 0x5aaa8bbe6463 in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:44299:10\n    #15 0x5aaa8bbe6463 in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:47191:13\n    #16 0x5aaa8bbeb0be in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:48524:10\n    #17 0x5aaa8bbf62c3 in QCBORDecode_GetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:55297:10\n    #18 0x5aaa8bbf7d90 in QCBORDecode_VGetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:56438:9\n    #19 0x5aaa8bc246a8 in QCBORDecode_Private_GetDoubleConvert /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:94836:3\n    #20 0x5aaa8bcab8eb in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:182688:11\n    #21 0x5aaa8bb70a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #22 0x5aaa8bb58923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #23 0x5aaa8bb5ea61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #24 0x5aaa8bb8af16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #26 0x78db9edd0d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #27 0x5aaa8bb52f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-ab203568107026234267056b9a7da89556e70a36",
+   "first_byte": 96,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "IEEE754_DoubleToSingle",
+    "file": "workspace/work/src/ieee754.c",
+    "line": 625,
+    "kind": "assertion"
+   },
+   "replay_log_tail": "    #10 0x5fa87842aee7 in QCBOR_Private_DecodeType7 /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:37888:11\n    #11 0x5fa8784214f9 in QCBOR_Private_DecodeAtomicDataItem /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39079:12\n    #12 0x5fa87842c28b in QCBORDecode_Private_GetNextFullString /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:39276:13\n    #13 0x5fa878357cd6 in QCBORDecode_Private_GetNextTagNumber /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:43726:12\n    #14 0x5fa878341463 in QCBORDecode_Private_GetNextMapEntry /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:44299:10\n    #15 0x5fa878341463 in QCBORDecode_Private_GetNextMapOrArray /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:47191:13\n    #16 0x5fa8783460be in QCBORDecode_Private_GetNextTagContent /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:48524:10\n    #17 0x5fa8783512c3 in QCBORDecode_GetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:55297:10\n    #18 0x5fa878352d90 in QCBORDecode_VGetNext /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:56438:9\n    #19 0x5fa87837ade8 in QCBORDecode_Private_GetUInt64Convert /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:92692:3\n    #20 0x5fa87838b57e in QCBORDecode_GetUInt64ConvertAll /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:107607:3\n    #21 0x5fa878417581 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:182509:11\n    #22 0x5fa8782cba2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #23 0x5fa8782b3923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #24 0x5fa8782b9a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #25 0x5fa8782e5f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #27 0x7cc8b9358d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #28 0x5fa8782adf10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-d3585b5e72e5560c24851c8060040685f7d8e760",
+   "first_byte": 166,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "QCBORDecode_Private_ProcessTagItem",
+    "file": "/framac-run/workspace/work/src/qcbor_tag_decode.c",
+    "line": 485,
+    "kind": "asan_segv"
+   },
+   "replay_log_tail": "    #1 0x62d65a21d184 in ubsan_GetStackTrace(__sanitizer::BufferedStackTrace*, unsigned long, unsigned long, unsigned long, void*, bool) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x8c184)\n    #2 0x62d65a21c692 in __sanitizer::ReportDeadlySignal(__sanitizer::SignalContext const&, unsigned int, void (*)(__sanitizer::SignalContext const&, void const*, __sanitizer::BufferedStackTrace*), void const*) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x8b692)\n    #3 0x62d65a21c994 in __sanitizer::HandleDeadlySignal(void*, void*, unsigned int, void (*)(__sanitizer::SignalContext const&, void const*, __sanitizer::BufferedStackTrace*), void const*) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x8b994)\n"
+  },
+  {
+   "artifact": "workspace/crashes/libqcbor_a/crash-d121f6b9b7c5ffc96ba35f59eeb98d11caf45f96",
+   "first_byte": 10,
+   "kind": "crash",
+   "reproducible": true,
+   "engine": "eacsl",
+   "failure": {
+    "function": "UsefulOutBuf_Compare",
+    "file": "workspace/work/src/UsefulBuf.c",
+    "line": 753,
+    "kind": "e-acsl_rte"
+   },
+   "replay_log_tail": "    #0 0x577d090b57d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x927d8)\n    #1 0x577d090883ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x653ac)\n    #2 0x577d0906d327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4a327)\n    #5 0x735565586c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)\n    #6 0x577d090cbb00 in UsefulOutBuf_Compare /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:15191:9\n    #7 0x577d091b9d10 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libqcbor_a.instrumented.c:177741:11\n    #8 0x577d0906ea2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x4ba2a)\n    #9 0x577d09056923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x33923)\n    #10 0x577d0905ca61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x39a61)\n    #11 0x577d09088f16 in main (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x65f16)\n    #13 0x735565570d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64)\n    #14 0x577d09050f10 in _start (/framac-run/workspace/harnesses/fuzz_libqcbor_a.e-acsl+0x2df10)\n"
+  }
+ ]
+}

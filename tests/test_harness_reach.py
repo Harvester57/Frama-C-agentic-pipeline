@@ -788,13 +788,35 @@ def test_b11_callees_from_clang_ast():
 # ---------------------------------------------------------------------------
 
 
-def _write_fuzz_report(run: Path, module: str, artifacts: list[dict[str, Any]], *, under_engine: bool = False) -> Path:
+def _harness_identity(run: Path, module: str) -> dict[str, Any]:
+    """The values `run_eacsl_fuzz.py campaign` stamps for the module's current harness."""
+    import phase0_gates
+
+    sidecar = json.loads((run / "workspace" / "harnesses" / f"harness_{module}.json").read_text(encoding="utf-8"))
+    count = sidecar.get("dispatch_case_count")
+    return {
+        "harness_digest": phase0_gates.harness_digest(run, module, ignore_exempt=True),
+        "dispatch_case_count": count if isinstance(count, int) and count > 0 else None,
+    }
+
+
+def _write_fuzz_report(
+    run: Path, module: str, artifacts: list[dict[str, Any]], *, under_engine: bool = False, stamp: bool = True
+) -> Path:
+    """
+    A fuzz campaign report. With `stamp` (the default) it carries the current harness identity on top
+    and on each artifact that does not set its own, as a campaign on the current harness writes it;
+    without, it is a report written before the fields existed.
+    """
     fdir = run / "workspace" / "reports" / "fuzz"
     fdir.mkdir(parents=True, exist_ok=True)
+    identity = _harness_identity(run, module) if stamp else {}
+    artifacts = [{**identity, **a} for a in artifacts]
     if under_engine:
         doc: dict[str, Any] = {"module": module, "artifacts": [], "engines": {"sanitizers": {"artifacts": artifacts}}}
     else:
         doc = {"module": module, "artifacts": artifacts}
+    doc.update(identity)
     out = fdir / f"{module}.json"
     out.write_text(json.dumps(doc), encoding="utf-8")
     return fdir
@@ -837,17 +859,22 @@ def test_dynamic_direct_crash_in_entry_point_counts_as_executed(tmp_path, monkey
     assert validate_dynamic_reach(doc) == [] and "warnings" not in doc
     assert phase0_gates.check(run, "api", ("reach",)) == []
 
-    # Stack frame naming rec_put (and engine-nested artifacts fallback) also proves execution.
+    # A stack frame of rec_put in the replay (the `frames` a campaign records; engine-nested artifacts
+    # fallback) also proves execution.
     _write_fuzz_report(
         run,
         "api",
         [
             {
-                "path": "workspace/crashes/api/crash-frame",
-                "failure": {
-                    "function": "__sanitizer_memcpy",
-                    "frames": ["#0 0x1 in __sanitizer_memcpy", "#1 0x2 in rec_put src/api.c:46"],
-                },
+                "artifact": "workspace/crashes/api/crash-frame",
+                "reproducible": True,
+                "kind": "crash",
+                "failure": {"function": "__sanitizer_memcpy", "file": "unknown", "line": 0},
+                "frames": [
+                    {"function": "__sanitizer_memcpy", "file": "", "line": 0},
+                    {"function": "rec_put", "file": "/framac-run/workspace/work/src/api.c", "line": 46},
+                    {"function": "LLVMFuzzerTestOneInput", "file": "/framac-run/workspace/harnesses/harness_api.c", "line": 3},
+                ],
             }
         ],
         under_engine=True,

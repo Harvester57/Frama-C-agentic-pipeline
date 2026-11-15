@@ -18,6 +18,7 @@
           "entry_points": {"type": "integer", "minimum": 0},
           "entry_points_executed": {"type": "integer", "minimum": 0},
           "crashed_entry_points": {"$comment": "entry points with 0 coverage counts proven executed by reproducible fuzz crash artifacts", "type": "array", "items": {"type": "string", "minLength": 1}},
+          "crash_notes": {"$comment": "on a row with gaps: why reproducible fuzz crashes credited no further entry point (an artifact found under another harness or case count, a custom or sequence case, a failure an init helper also reaches); at most 20 plus a count", "type": "array", "items": {"type": "string", "minLength": 1}},
           "executions": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
           "gaps": {"type": "array", "items": {"type": "string", "minLength": 1}},
           "failed_inputs": {"$comment": "inputs that crashed the coverage replay when every input was replayed (inputs.failed); the reach stands", "type": "integer", "minimum": 1},

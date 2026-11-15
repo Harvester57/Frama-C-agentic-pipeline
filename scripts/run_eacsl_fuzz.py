@@ -1629,6 +1629,34 @@ def _artifact_kind(name: str) -> str | None:
     return None
 
 
+STACK_FRAMES_MAX = 64
+_PROCESS_FRAME_FNS = ("main", "_start", "__libc_start_main", "__libc_start_call_main")
+
+
+def stack_frames(text: str, limit: int = STACK_FRAMES_MAX) -> list[dict]:
+    """
+    The distinct stack frames (`{function, file, line}`, in the order printed) of a replay's output,
+    without sanitizer, E-ACSL or libFuzzer runtime frames, harness entry frames and process start-up.
+    Every stack the output prints counts (an ASan report adds the allocation and free stacks): each
+    function in one ran on that input. `harness_reach.py dynamic` credits an entry point found here;
+    names stay exact, so E-ACSL's `__gen_e_acsl_<fn>` wrapper is not `<fn>`.
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for m in _STACK_FRAME_RE.finditer(text or ""):
+        fn = m.group("function")
+        if "::" in fn or is_runtime_function(fn) or is_harness_fuzz_function(fn) or fn in _PROCESS_FRAME_FNS:
+            continue
+        key = (fn, m.group("file") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"function": fn, "file": key[1], "line": int(m.group("line") or 0)})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def replay_artifact(
     binary: Path,
     artifact: Path,
@@ -1669,6 +1697,7 @@ def replay_artifact(
         "sandbox": res.sandbox,
         "seed": seed,
         "log_tail": out[-3000:],
+        "frames": stack_frames(out),
     }
 
 
@@ -2487,6 +2516,7 @@ def run_fuzz_campaign(
                 failure = replay["failure"] or (parse_runtime_failure(combined_out) if crash_like == 1 else None)
                 entry["reproducible"] = replay["reproduced"]
                 entry["replay_log_tail"] = replay["log_tail"]
+                entry["frames"] = replay.get("frames") or []
                 entry["failure_source"] = "primary" if failure else None
                 if needs_attribution(failure):
                     san_bin = _attribution_binary()
@@ -5068,7 +5098,9 @@ def _summary(res: dict) -> dict:
     out = {k: v for k, v in res.items() if k not in _SUMMARY_OMITTED}
     if isinstance(out.get("artifacts"), list):
         out["artifacts"] = [
-            {k: v for k, v in a.items() if k not in ("replay_log_tail", "attribution")} if isinstance(a, dict) else a
+            {k: v for k, v in a.items() if k not in ("replay_log_tail", "attribution", "frames")}
+            if isinstance(a, dict)
+            else a
             for a in out["artifacts"]
         ]
     return out

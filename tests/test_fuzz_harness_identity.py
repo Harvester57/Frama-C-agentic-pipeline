@@ -121,6 +121,47 @@ def test_an_artifact_carried_over_keeps_the_identity_it_was_found_under(tmp_path
     assert report["dispatch_case_count"] == 3
 
 
+ASAN_REPLAY = """==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000011 at pc 0x55 bp 0x7f sp 0x7f
+READ of size 1 at 0x602000000011 thread T0
+    #0 0x55a1 in __asan_memcpy (/framac-run/workspace/harnesses/fuzz_mod+0x1)
+    #1 0x55a2 in rec_check /framac-run/workspace/work/src/api.c:4:40
+    #2 0x55a3 in rec_parse /framac-run/workspace/work/src/api.c:8:38
+    #3 0x55a4 in __gen_e_acsl_rec_put /framac-run/workspace/harnesses/fuzz_mod.instrumented.c:90:3
+    #4 0x55a5 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_mod.c:3:1
+    #5 0x55a6 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/fuzz_mod+0x7b53a)
+    #6 0x55a7 in main (/framac-run/fuzz_mod+0x95a26)
+0x602000000011 is located 0 bytes after 1-byte region
+allocated by thread T0 here:
+    #0 0x55b1 in malloc (/framac-run/fuzz_mod+0x2)
+    #1 0x55a2 in rec_parse /framac-run/workspace/work/src/api.c:8:38
+    #2 0x55b3 in rec_alloc /framac-run/workspace/work/src/api.c:2:10
+SUMMARY: AddressSanitizer: heap-buffer-overflow /framac-run/workspace/work/src/api.c:4:40 in rec_check
+"""
+
+
+def test_campaign_records_the_replay_stack_frames_of_each_crash(tmp_path, monkeypatch):
+    assert R.stack_frames(ASAN_REPLAY) == [
+        {"function": "rec_check", "file": "/framac-run/workspace/work/src/api.c", "line": 4},
+        {"function": "rec_parse", "file": "/framac-run/workspace/work/src/api.c", "line": 8},
+        {"function": "__gen_e_acsl_rec_put", "file": "/framac-run/workspace/harnesses/fuzz_mod.instrumented.c", "line": 90},
+        {"function": "malloc", "file": "", "line": 0},
+        {"function": "rec_alloc", "file": "/framac-run/workspace/work/src/api.c", "line": 2},
+    ]
+    sources = _run_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(R, "build_module_binary", _fake_build)
+
+    def fake(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        if "-runs=1" in cmd:
+            return SandboxResult(1, "", ASAN_REPLAY, False, "rlimits", list(cmd))
+        prefix = next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1]
+        Path(f"{prefix}crash-1").write_bytes(b"\x01")
+        return SandboxResult(1, "", "", False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(R, "run_sandboxed", fake)
+    report = _campaign(sources, tmp_path / "workspace/reports/fuzz/mod.json")
+    assert [f["function"] for f in report["artifacts"][0]["frames"]][:2] == ["rec_check", "rec_parse"]
+
+
 def test_identity_of_a_non_dispatch_harness_and_of_a_campaign_that_did_not_run(tmp_path, monkeypatch):
     sources = _run_dir(tmp_path, monkeypatch, entry_style="void_call")
     assert R.campaign_harness_identity("mod", sources)["dispatch_case_count"] is None
