@@ -831,6 +831,18 @@ def _artifact_failure(art: dict[str, Any], frames: list[tuple[str, str]]) -> tup
     return fn, file_, in_harness, before_body
 
 
+_SANITIZER_KIND_PREFIXES = ("asan_", "ubsan_", "msan_", "lsan_")
+
+
+def _failure_kind(art: dict[str, Any]) -> str:
+    """The failure kind of an artifact (its own failure, else the replay attribution's), lower case."""
+    raw = art.get("failure")
+    if not isinstance(raw, dict):
+        attr = art.get("attribution")
+        raw = attr.get("failure") if isinstance(attr, dict) else None
+    return str(raw.get("kind") or "").strip().lower() if isinstance(raw, dict) else ""
+
+
 def _artifact_frames(art: dict[str, Any]) -> list[tuple[str, str]]:
     """
     (function, file) of every stack frame the artifact's replay printed: the `frames` a campaign records
@@ -1064,12 +1076,16 @@ def _crashed_entry_points(
 
     - a frame of its replay's stack is the entry point (`_artifact_frames`; exact names);
     - its failure is in the entry point itself, after the body started (not an E-ACSL precondition or
-      wrapper failure, `_artifact_failure`);
+      wrapper failure, `_artifact_failure`), and either the replay printed a stack, or the failure is a
+      sanitizer's (`asan_*`, `ubsan_*`, `msan_*`, `lsan_*`: its function is the top frame of its own
+      stack) or a Postcondition. Any other E-ACSL failure under the entry's name without a stack may be
+      the wrapper's check before the body: not credited, with a note;
     - its input selects a `single` dispatch case of the entry point (its first byte decoded with the
       sidecar's `dispatch_selector`: the case index itself, nothing at or above the case count; modulo
-      the case count for a harness without the field) and the failure is in the entry's callee closure but in none of the case's init helpers'
-      closures (they run before the entry), or the failure is unknown and the case has no init helper.
-      A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
+      the case count for a harness without the field) and the failure is in the entry's callee closure
+      but in none of the case's init helpers' closures (they run before the entry); this is the fallback
+      when a tail call removed the entry's frame. A failure at an unknown location credits nothing (the
+      harness body runs before the call) and gets a note. A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
       only the first two kinds of evidence credit it.
 
     A failure in the harness's own code (`LLVMFuzzerTestOneInput`, a `harness_*` file) credits nothing.
@@ -1125,15 +1141,27 @@ def _crashed_entry_points(
         frames = _artifact_frames(art)
         fn, fn_file, in_harness, before_body = _artifact_failure(art, frames)
         credited = False
+        fail_kind = _failure_kind(art)
+        # A failure under the entry's own name with no stack at all: a sanitizer names the top frame of its
+        # own stack, and a Postcondition is checked after the body, but any other E-ACSL check may be the
+        # wrapper's before the body ran, which nothing tells apart without frames.
+        direct_ok = bool(frames) or fail_kind.startswith(_SANITIZER_KIND_PREFIXES) or fail_kind == "postcondition"
         for ep in candidates:
             if ep in proven:
                 continue
             in_body = bool(fn) and not in_harness and not before_body
-            if any(_fn_matches_entry(f, f_file, ep, module, dag, by_name) for f, f_file in frames) or (
-                in_body and _fn_matches_entry(fn, fn_file, ep, module, dag, by_name)
-            ):
+            if any(_fn_matches_entry(f, f_file, ep, module, dag, by_name) for f, f_file in frames):
                 proven.add(ep)
                 credited = True
+            elif in_body and _fn_matches_entry(fn, fn_file, ep, module, dag, by_name):
+                if direct_ok:
+                    proven.add(ep)
+                    credited = True
+                else:
+                    notes.append(
+                        f"{name}: failed in {fn} ({fail_kind or 'unknown kind'}) with no stack frame: an E-ACSL "
+                        "check under the entry's name may be its wrapper's, before the body ran"
+                    )
         if in_harness or not api_cases or first_byte is None or n_cases is None:
             continue
         sel_case = dispatch_case_of(first_byte, n_cases, selector)
@@ -1159,8 +1187,8 @@ def _crashed_entry_points(
         inits = [i.get("fn") if isinstance(i, dict) else i for i in case.get("inits") or []]
         init_fns = [i for i in inits if isinstance(i, str) and i]
         if not fn:
-            if not init_fns:
-                proven.add(ep)
+            # The harness body runs before the call: a crash nobody located proves nothing.
+            notes.append(f"{name}: single case {idx} ({target}) crashed at an unknown location")
             continue
         if _fn_matches_entry(fn, fn_file, ep, module, dag, by_name) or not _in_closure(
             fn, fn_file, closure(ep), module, dag, by_name

@@ -229,8 +229,59 @@ def test_e_custom_or_sequence_case_is_credited_only_on_direct_evidence(tmp_path,
     notes = " ".join(row["crash_notes"])
     assert "custom case 1" in notes and "sequence case 2" in notes, notes
 
-    # The failure in the entry itself is direct evidence.
-    fdir = _write_fuzz_report(run, "api", [_crash_art(custom, "rec_parse")])
+    # A sanitizer failure in the entry itself is direct evidence.
+    fdir = _write_fuzz_report(run, "api", [_crash_art(custom, "rec_parse", failure=_sanitizer_failure("rec_parse"))])
+    assert _row(run, hdir, fdir)["crashed_entry_points"] == ["rec_parse"]
+
+
+def _sanitizer_failure(function: str, kind: str = "asan_heap_buffer_overflow") -> dict[str, Any]:
+    return {"function": function, "file": "workspace/work/src/api.c", "line": 4, "kind": kind}
+
+
+# --- run-6 review (c), (d): weak paths without a stack ---------------------------------------------
+
+
+def test_single_case_crash_at_an_unknown_location_is_not_reach(tmp_path, monkeypatch):
+    # Before: a single case without init helpers was credited for a crash nobody located. The harness
+    # body runs before the call, so it proves nothing.
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _dispatch(run, TWO_CASES)
+    art = _crash(run, "crash-nowhere", b"\x01\x00")  # case 1: rec_put, no inits
+    _coverage(run, {"rec_parse": 10, "rec_put": 0})
+    fdir = _write_fuzz_report(run, "api", [_crash_art(art, None)])
+    row = _row(run, hdir, fdir)
+    assert row["crashed_entry_points"] == [] and row["gaps"] == ["rec_put"]
+    assert any("single case 1 (rec_put) crashed at an unknown location" in n for n in row["crash_notes"])
+
+
+@pytest.mark.parametrize(
+    ("kind", "credited"),
+    [
+        ("assertion", False),
+        ("e-acsl_rte", False),
+        ("", False),
+        ("postcondition", True),
+        ("asan_heap_buffer_overflow", True),
+        ("ubsan_signed_integer_overflow", True),
+    ],
+)
+def test_direct_failure_without_a_stack_is_credited_only_for_sanitizers_and_postconditions(
+    tmp_path, monkeypatch, kind, credited
+):
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _dispatch(run, TWO_CASES)
+    art = _crash(run, "crash-direct", b"\x00\x00")
+    _coverage(run, {"rec_parse": 0, "rec_put": 10})
+    fdir = _write_fuzz_report(run, "api", [_crash_art(art, None, failure=_sanitizer_failure("rec_parse", kind))])
+    row = _row(run, hdir, fdir)
+    assert row["crashed_entry_points"] == (["rec_parse"] if credited else []), row
+    if not credited:
+        assert any("no stack frame" in n for n in row["crash_notes"]), row["crash_notes"]
+    # With the replay's stack, the same E-ACSL failure counts (the frame shows the body ran).
+    tail = "    #0 0x1 in rec_parse /framac-run/workspace/work/src/api.c:4:2\n"
+    fdir = _write_fuzz_report(
+        run, "api", [_crash_art(art, None, failure=_sanitizer_failure("rec_parse", kind), replay_log_tail=tail)]
+    )
     assert _row(run, hdir, fdir)["crashed_entry_points"] == ["rec_parse"]
 
 
