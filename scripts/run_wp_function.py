@@ -363,6 +363,14 @@ _PLUGIN_USER_ERROR_RE = re.compile(
 # The kernel's message when the preprocessor command itself fails (missing header, bad include path).
 _PREPROCESS_FAILED_RE = re.compile(r"^\[kernel\][^\n]*User Error: failed to run:", re.IGNORECASE | re.MULTILINE)
 PREPROCESSING_FAILED = "preprocessing_failed"
+# A comment (an annotation, in practice) without its closing `*/`: the main `gcc -E` fails, but the
+# file's own text is at fault, not the build configuration.
+_UNTERMINATED_COMMENT_RE = re.compile(r"\berror:\s*unterminated comment\b", re.IGNORECASE)
+
+
+def _cpp_error_lines(log_text: str) -> list[str]:
+    """The preprocessor's own `file:line:col: [fatal] error:` lines, in order."""
+    return [line.strip() for line in (log_text or "").splitlines() if _CPP_ERROR_RE.match(line)]
 
 
 def _preprocess_failure(
@@ -371,10 +379,14 @@ def _preprocess_failure(
     """
     (reason, errors) when the run stopped because `gcc -E` failed, else None. A build-configuration
     error (wrong or missing --cppflags), never an ACSL syntax error: the annotations were not read.
+    An unterminated comment is the exception: it is a typo in the source (an annotation missing its
+    `*/`), so it stays an ACSL syntax error (None here).
     """
     if timed_out or returncode in (0, None) or report_exists or not _PREPROCESS_FAILED_RE.search(log_text or ""):
         return None
-    cpp_lines = [line.strip() for line in (log_text or "").splitlines() if _CPP_ERROR_RE.match(line)]
+    cpp_lines = _cpp_error_lines(log_text)
+    if cpp_lines and _UNTERMINATED_COMMENT_RE.search(cpp_lines[0]):
+        return None
     errors = list(dict.fromkeys([*cpp_lines, *kernel_parse_errors(log_text)]))
     first = cpp_lines[0] if cpp_lines else "the C preprocessor (gcc -E) failed"
     return f"{PREPROCESSING_FAILED}: {first}"[:300], errors
@@ -388,7 +400,11 @@ def _folded_syntax_errors(
         return None
     if _PLUGIN_USER_ERROR_RE.search(log_text or ""):
         return None  # WP (or another plug-in) refused the function: a Tier-A abort, not a syntax error
-    return kernel_parse_errors(log_text) or None
+    errors = kernel_parse_errors(log_text)
+    if errors and _PREPROCESS_FAILED_RE.search(log_text or ""):
+        # The preprocessor's own message names the file and line; the kernel's only the command.
+        errors = list(dict.fromkeys([*_cpp_error_lines(log_text), *errors]))
+    return errors or None
 
 
 def resolve_wp_par(value: int | str | None) -> int:
@@ -668,6 +684,12 @@ def derive_wp_diagnostic_hints(
     if status == "acsl_syntax_error":
         sc = res.get("syntax_check") or {}
         err_blob = "\n".join(sc.get("errors") or []) + "\n" + (sc.get("raw_log") or "") + "\n" + (log_text or "")
+        if _UNTERMINATED_COMMENT_RE.search(err_blob):
+            _add(
+                "An annotation or comment is missing its closing '*/': the C preprocessor stopped with "
+                "'unterminated comment' at the line where it opens (see syntax_check.errors). Close that "
+                "'/*@ ... */' block; this is an edit in the source, not a missing include path."
+            )
         if _EATEN_BACKSLASH_RE.search(err_blob):
             _add(
                 "Backslash in an ACSL keyword was eaten by string escaping (e.g. \\false -> form-feed + 'alse', "

@@ -259,6 +259,36 @@ def test_a_preprocessor_failure_is_an_analysis_error_not_an_acsl_syntax_error(tm
     assert len(fake.calls) == 1
 
 
+# framac-analysis:latest, an annotation without its closing `*/`: the main `gcc -E` fails too.
+UNTERMINATED_COMMENT_LOG = (
+    "[kernel] Parsing f.c (with preprocessing)\n"
+    "/pp/f.c:1:1: error: unterminated comment\n"
+    "    1 | /*@ requires x >= 0;\n"
+    "      | ^\n"
+    "cc1: note: unrecognized command-line option '-Wno-unknown-warning-option' may have been intended to "
+    "silence earlier diagnostics\n"
+    "[kernel] User Error: failed to run: gcc -E -C -I. -I'/tmp/__fc_machdep7b6999.dir' -D__FRAMAC__ -dD "
+    "-nostdinc -undef '/pp/f.c' -o '/tmp/f.cb568e6.i'\n"
+    "  (PWD: /pp)\n"
+    "  this is possibly due to missing preprocessor flags;\n"
+    "  consider options -cpp-extra-args, -compilation-db or -cpp-command.\n"
+    '  See chapter "Preparing the Sources" in the Frama-C user manual for more details.\n'
+    "[kernel] Frama-C aborted: invalid user input.\n"
+)
+
+
+def test_an_annotation_missing_its_closing_comment_is_an_acsl_syntax_error(tmp_path, monkeypatch):
+    fake = FakeFramaC(rc=1, log=UNTERMINATED_COMMENT_LOG)
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")
+    assert res["status"] == "acsl_syntax_error" and "preprocess_errors" not in res
+    assert any("unterminated comment" in e for e in res["syntax_check"]["errors"])
+    hints = " ".join(res["diagnostic_hints"])
+    assert "*/" in hints and "unterminated" in hints
+    assert "leave the contract unchanged" not in hints and "--cppflags" not in hints
+    assert len(fake.calls) == 1
+
+
 def test_an_acsl_annotation_error_still_reports_acsl_syntax_error(tmp_path, monkeypatch):
     monkeypatch.setattr(W.subprocess, "run", FakeFramaC(rc=1, log=ANNOT_ERROR_LOG))
     res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")
