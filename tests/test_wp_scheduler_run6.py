@@ -141,6 +141,14 @@ def test_refresh_closes_the_repair_when_fuzz_and_eva_ran_on_the_repaired_harness
     assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m/f.c#f", "prove:src/m/h.c#h"]
 
 
+def test_refresh_names_missing_facts_but_does_not_hold_the_repair_on_them(sim):
+    _open_repair(sim)
+    _report("fuzz", _digest())
+    _report("eva", _digest())  # no facts: `facts-m` tolerates a failure, so it cannot be a condition
+    out = S.cmd_refresh("m")
+    assert out["repair"] == "done" and out["ok"] is True and out["targets"] == ["facts-m"]
+
+
 def test_refresh_accepts_legacy_reports_without_the_field_only_when_newer_than_the_harness(sim):
     _open_repair(sim)
     _report("fuzz", None, mtime=500_000)  # older than the repaired harness: stale
@@ -343,6 +351,7 @@ def test_replay_no_prover_is_dispatched_blind_on_a_contract_less_callee(sim):
         nxt = S.cmd_next("auto", prepare=True)
         if not nxt["tasks"] and nxt["done"]:
             break
+        assert nxt["tasks"], "the schedule stalled with nothing to hand out"
         for job in nxt["tasks"]:
             aid, kind, fn = job["agent_id"], job["kind"], job.get("function")
             if kind == "verify":
@@ -367,6 +376,8 @@ def test_replay_no_prover_is_dispatched_blind_on_a_contract_less_callee(sim):
     assert {f"prove:src/m/{a}.c#{a}" for a in ("a1", "a2", "a3", "a4")} <= set(dispatched)
     assert blind == []
     t = tasks()
+    assert [tid for tid, x in t.items() if x["state"] not in S.TERMINAL] == []  # the run drained
+    assert base.units()["src/n/c3.c#c3::rte"]["status"] == "covered"  # a rejected negotiation keeps Eva's cover
     assert t["prove:src/m/c1.c#c1"]["state"] == "blocked"
     assert "prove:src/n/c3.c#c3" not in t
     assert t["prove:src/m/a4.c#a4"]["callees_without_contract"] == ["src/m/c1.c#c1", "src/n/c3.c#c3"]

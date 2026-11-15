@@ -1229,14 +1229,15 @@ def _callee_frame_clause(ctx: Ctx, cfile: str, cname: str, cmod: str | None) -> 
     return " ".join(clauses) or DEFAULT_CONTRACT_CLAUSE
 
 
-def _callee_header(ctx: Ctx, cfile: str, cmod: str | None) -> str:
-    """Where a caller in another file sees the callee's contract: its own header, its sibling header, the module's."""
+def _callee_header(cfile: str) -> str:
+    """
+    The callee's header when it is certain (the callee lives in a header, or its sibling `.h` exists), else "":
+    the merge infers the header from the agent's changes (a module header may not declare a static callee).
+    """
     if cfile.endswith(".h"):
         return cfile
     sibling = Path(cfile).with_suffix(".h").as_posix()
-    if (Path("workspace/work") / sibling).is_file():
-        return sibling
-    return (ctx.header(cmod) if cmod else None) or ""
+    return sibling if (Path("workspace/work") / sibling).is_file() else ""
 
 
 def _contract_less_callees(state: dict, ctx: Ctx, changes: dict, persist: bool = True) -> bool:
@@ -1304,7 +1305,7 @@ def _contract_less_callees(state: dict, ctx: Ctx, changes: dict, persist: bool =
                     "caller_function": task["function"],
                     "callee_function": cname,
                     "callee_file": cfile,
-                    "header_file": _callee_header(ctx, cfile, cmod),
+                    "header_file": _callee_header(cfile),
                     "needed_clause": _callee_frame_clause(ctx, cfile, cname, cmod),
                     "reason": CONTRACT_REQUEST_REASON,
                 }
@@ -4220,7 +4221,8 @@ def cmd_refresh(module: str | None = None) -> dict:
     """
     After the parent repaired a harness (or re-ran a module): close repair:<module> and re-sync. The repair
     stays open (`repair: "stale_evidence"`, `targets` to run) while a fuzz or Eva report of the module's
-    harnesses was produced from another harness than the current one.
+    harnesses was produced from another harness than the current one. Facts older than the Eva report are
+    named in `targets` but do not hold the repair.
     """
     with run_lock("ledger"):
         state = load_schedule()
@@ -4233,7 +4235,7 @@ def cmd_refresh(module: str | None = None) -> dict:
                 task["reasons"] = task.pop("followup_reasons")
                 _reopen(state, task, "new reasons arrived during the repair")
                 out["repair"] = "reopened"
-            elif stale or targets:
+            elif stale:
                 out.update(ok=False, repair="stale_evidence", stale_evidence=stale, targets=targets)
                 out["actions"] = [
                     f"python3 {SCRIPTS}/pipeline_make.py run {' '.join(targets)}",
@@ -4243,6 +4245,10 @@ def cmd_refresh(module: str | None = None) -> dict:
             else:
                 _finish(state, task, "done", "refreshed")
                 out["repair"] = "done"
+                if targets:
+                    # Only the facts lag behind the Eva report. `facts-<mod>` tolerates a failure (Make `-`), so a
+                    # missing facts file must not hold the repair: it is named, not enforced.
+                    out["targets"] = targets
         out["sync"] = _sync(state, ctx)
         save_schedule(state)
     return out
