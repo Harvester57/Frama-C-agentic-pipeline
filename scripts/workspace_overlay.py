@@ -1001,6 +1001,10 @@ def infer_prover_wp_flags(
         flags.append("--no-warn-unsigned")
         if wrap_code_lines:
             flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
+            # The signed-downcast waiver on declared wrap lines (run_wp_function.py), valid only
+            # together with --no-warn-unsigned and declared lines.
+            if any("-warn-signed-downcast OFF" in r for r in reduced):
+                flags.append("--waive-signed-downcast")
     else:
         flags.append("--no-warn-unsigned-downcast")
     if any("-warn-invalid-pointer OFF" in r for r in reduced):
