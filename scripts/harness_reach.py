@@ -78,10 +78,14 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 from generate_harness import (  # noqa: E402
+    DISPATCH_SELECTOR_IDENTITY,
+    DISPATCH_SELECTOR_MODULO,
     DISPATCH_SKIP_FN,
     TARGET_EMBEDDED_PREFIX,
     _include_dirs_from_cppflags,
     _strip_c_comments,
+    dispatch_case_of,
+    dispatch_selector_of,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 
@@ -827,6 +831,18 @@ def _artifact_failure(art: dict[str, Any], frames: list[tuple[str, str]]) -> tup
     return fn, file_, in_harness, before_body
 
 
+_SANITIZER_KIND_PREFIXES = ("asan_", "ubsan_", "msan_", "lsan_")
+
+
+def _failure_kind(art: dict[str, Any]) -> str:
+    """The failure kind of an artifact (its own failure, else the replay attribution's), lower case."""
+    raw = art.get("failure")
+    if not isinstance(raw, dict):
+        attr = art.get("attribution")
+        raw = attr.get("failure") if isinstance(attr, dict) else None
+    return str(raw.get("kind") or "").strip().lower() if isinstance(raw, dict) else ""
+
+
 def _artifact_frames(art: dict[str, Any]) -> list[tuple[str, str]]:
     """
     (function, file) of every stack frame the artifact's replay printed: the `frames` a campaign records
@@ -990,25 +1006,39 @@ def _artifact_identity_problem(
     harness_digest: str | None,
     n_cases: int | None,
     first_byte: int | None,
+    selector: str = DISPATCH_SELECTOR_MODULO,
 ) -> str | None:
     """
     Why a crash artifact cannot speak for the current harness, or None. A stamped artifact must carry
-    the current `harness_digest` and `dispatch_case_count` (run_eacsl_fuzz.stamp_harness_identity).
-    Its own count only explains the mismatch: the case its first byte selected then and selects now.
-    An artifact without them counts only in a report written before the fields existed and after the
-    harness last changed (`legacy_problem` is None).
+    the current `harness_digest` and `dispatch_case_count` (run_eacsl_fuzz.stamp_harness_identity), and
+    be found under the current selector encoding (`selector`; an artifact without `dispatch_selector`
+    was found under the modulo one). Its own count and encoding only explain the mismatch: the case
+    its first byte selected then and selects now. An artifact without them counts only in a report
+    written before the fields existed and after the harness last changed (`legacy_problem` is None).
     """
     if "harness_digest" in art and "dispatch_case_count" in art:
         found_n = _case_count(art.get("dispatch_case_count"))
-        if found_n != n_cases:
+        found_sel = (
+            DISPATCH_SELECTOR_IDENTITY
+            if art.get("dispatch_selector") == DISPATCH_SELECTOR_IDENTITY
+            else DISPATCH_SELECTOR_MODULO
+        )
+        if found_n != n_cases or (n_cases is not None and found_sel != selector):
 
-            def _under(n: int | None) -> str:
+            def _under(n: int | None, sel: str) -> str:
                 if n is None:
                     return "a harness without dispatch cases"
-                case = f", case {first_byte % n}" if first_byte is not None else ""
-                return f"{n} dispatch cases{case}"
+                idx = dispatch_case_of(first_byte, n, sel) if first_byte is not None else None
+                case = (
+                    ""
+                    if first_byte is None
+                    else f", case {idx}" if idx is not None else f", no case (first byte {first_byte})"
+                )
+                # The encodings are named only when they differ (a harness regenerated across the change).
+                how = f" ({sel} selector)" if found_sel != selector else ""
+                return f"{n} dispatch cases{how}{case}"
 
-            return f"found under {_under(found_n)}; the harness now has {_under(n_cases)}"
+            return f"found under {_under(found_n, found_sel)}; the harness now has {_under(n_cases, selector)}"
         if harness_digest is None or art.get("harness_digest") != harness_digest:
             return "found under another harness (harness_digest differs)"
         return None
@@ -1046,11 +1076,16 @@ def _crashed_entry_points(
 
     - a frame of its replay's stack is the entry point (`_artifact_frames`; exact names);
     - its failure is in the entry point itself, after the body started (not an E-ACSL precondition or
-      wrapper failure, `_artifact_failure`);
-    - its input selects a `single` dispatch case of the entry point (first byte modulo the current case
-      count) and the failure is in the entry's callee closure but in none of the case's init helpers'
-      closures (they run before the entry), or the failure is unknown and the case has no init helper.
-      A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
+      wrapper failure, `_artifact_failure`), and either the replay printed a stack, or the failure is a
+      sanitizer's (`asan_*`, `ubsan_*`, `msan_*`, `lsan_*`: its function is the top frame of its own
+      stack) or a Postcondition. Any other E-ACSL failure under the entry's name without a stack may be
+      the wrapper's check before the body: not credited, with a note;
+    - its input selects a `single` dispatch case of the entry point (its first byte decoded with the
+      sidecar's `dispatch_selector`: the case index itself, nothing at or above the case count; modulo
+      the case count for a harness without the field) and the failure is in the entry's callee closure
+      but in none of the case's init helpers' closures (they run before the entry); this is the fallback
+      when a tail call removed the entry's frame. A failure at an unknown location credits nothing (the
+      harness body runs before the call) and gets a note. A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
       only the first two kinds of evidence credit it.
 
     A failure in the harness's own code (`LLVMFuzzerTestOneInput`, a `harness_*` file) credits nothing.
@@ -1070,6 +1105,7 @@ def _crashed_entry_points(
 
     by_name = _functions_by_name(dag)
     n_cases = _case_count(sidecar.get("dispatch_case_count"))
+    selector = dispatch_selector_of(sidecar)
     raw_cases = sidecar.get("api_cases")
     api_cases = raw_cases if isinstance(raw_cases, list) and n_cases else []
     stamped_report = "harness_digest" in fuzz_report
@@ -1097,7 +1133,7 @@ def _crashed_entry_points(
         name = Path(str(raw_path)).name if raw_path else "artifact"
         first_byte = _artifact_first_byte(raw_path, roots)
         problem = _artifact_identity_problem(
-            art, stamped_report, legacy_problem, harness_digest, n_cases, first_byte
+            art, stamped_report, legacy_problem, harness_digest, n_cases, first_byte, selector
         )
         if problem:
             notes.append(f"{name}: not used ({problem})")
@@ -1105,18 +1141,33 @@ def _crashed_entry_points(
         frames = _artifact_frames(art)
         fn, fn_file, in_harness, before_body = _artifact_failure(art, frames)
         credited = False
+        fail_kind = _failure_kind(art)
+        # A failure under the entry's own name with no stack at all: a sanitizer names the top frame of its
+        # own stack, and a Postcondition is checked after the body, but any other E-ACSL check may be the
+        # wrapper's before the body ran, which nothing tells apart without frames.
+        direct_ok = bool(frames) or fail_kind.startswith(_SANITIZER_KIND_PREFIXES) or fail_kind == "postcondition"
         for ep in candidates:
             if ep in proven:
                 continue
             in_body = bool(fn) and not in_harness and not before_body
-            if any(_fn_matches_entry(f, f_file, ep, module, dag, by_name) for f, f_file in frames) or (
-                in_body and _fn_matches_entry(fn, fn_file, ep, module, dag, by_name)
-            ):
+            if any(_fn_matches_entry(f, f_file, ep, module, dag, by_name) for f, f_file in frames):
                 proven.add(ep)
                 credited = True
+            elif in_body and _fn_matches_entry(fn, fn_file, ep, module, dag, by_name):
+                if direct_ok:
+                    proven.add(ep)
+                    credited = True
+                else:
+                    notes.append(
+                        f"{name}: failed in {fn} ({fail_kind or 'unknown kind'}) with no stack frame: an E-ACSL "
+                        "check under the entry's name may be its wrapper's, before the body ran"
+                    )
         if in_harness or not api_cases or first_byte is None or n_cases is None:
             continue
-        idx = first_byte % n_cases
+        sel_case = dispatch_case_of(first_byte, n_cases, selector)
+        if sel_case is None:
+            continue  # the identity selector rejects this first byte: no case ran
+        idx = sel_case
         case = api_cases[idx] if idx < len(api_cases) and isinstance(api_cases[idx], dict) else {}
         kind = str(case.get("kind") or "")
         if kind in ("custom", "sequence"):
@@ -1136,8 +1187,8 @@ def _crashed_entry_points(
         inits = [i.get("fn") if isinstance(i, dict) else i for i in case.get("inits") or []]
         init_fns = [i for i in inits if isinstance(i, str) and i]
         if not fn:
-            if not init_fns:
-                proven.add(ep)
+            # The harness body runs before the call: a crash nobody located proves nothing.
+            notes.append(f"{name}: single case {idx} ({target}) crashed at an unknown location")
             continue
         if _fn_matches_entry(fn, fn_file, ep, module, dag, by_name) or not _in_closure(
             fn, fn_file, closure(ep), module, dag, by_name
