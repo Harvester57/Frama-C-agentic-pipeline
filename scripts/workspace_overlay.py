@@ -51,15 +51,15 @@ from acsl_ast import (  # noqa: E402
     TrustBoundaryError,
     check_conflicting_acsl_profiles,
     check_frame_preserved,
+    contract_declaration_spans,
+    declaration_contract_text,
+    declaration_param_names,
     dedup_acsl_declarations,
     entry_requires_violations,
     extract_top_level_acsl_declarations,
-    function_contract_text,
-    function_param_names,
     function_trust_records,
     is_trust_boundary,
     locate_all_prototype_spans,
-    locate_function_span,
     splice_architect_header,
     splice_prover_changes,
     tokenize_c_acsl,
@@ -83,7 +83,7 @@ from framac_common import (  # noqa: E402
     scratch_first_cppflags,
     source_tree_relpath,
     utc_now,
-    wp_model_unsound,
+    wp_model_problem,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 from resources import (  # noqa: E402
@@ -991,15 +991,69 @@ def infer_prover_wp_flags(
     Infer the WP RTE check and memory-model CLI flags used by the prover for `function`
     so parent merge re-checks, contract re-checks, and final WP sweeps run with matching
     reduced-check assumptions (which `ledger.py` records explicitly on covered units) and
-    WP model. Defaults to `['--no-warn-unsigned-downcast']`.
+    WP model. Defaults to `['--no-warn-unsigned-downcast']`. A memory model that
+    `framac_common.wp_model_problem` rejects (`cast`, `Hoare`, `Region`, `nat`, ...) is never
+    replayed; `prover_wp_model_problem` refuses the merge of a prover that used one.
+    """
+    reduced, wp_model, _own, wrap_code_lines = _prover_wp_config(run_dir, overlay_dir, agent_id, c_file, function)
+    flags: list[str] = []
+    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
+        flags.append("--no-warn-unsigned")
+        if wrap_code_lines:
+            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
+            # The signed-downcast waiver on declared wrap lines (run_wp_function.py), valid only
+            # together with --no-warn-unsigned and declared lines.
+            if any("-warn-signed-downcast OFF" in r for r in reduced):
+                flags.append("--waive-signed-downcast")
+    else:
+        flags.append("--no-warn-unsigned-downcast")
+    if any("-warn-invalid-pointer OFF" in r for r in reduced):
+        flags.append("--no-warn-invalid-pointer")
+    # Replay only an accepted model; never the unsound `cast` option or a model that is not evidence.
+    if (
+        wp_model
+        and wp_model != "Typed"
+        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
+        and wp_model_problem(wp_model) is None
+    ):
+        flags.extend(["--wp-model", wp_model])
+    return flags
+
+
+def prover_wp_model_problem(
+    run_dir: Path,
+    overlay_dir: Path | None = None,
+    agent_id: str | None = None,
+    c_file: str | None = None,
+    function: str | None = None,
+) -> str | None:
+    """
+    Why the memory model of the prover's own WP report (the one `infer_prover_wp_flags` replays,
+    read from the agent's scratch, artifacts or result evidence) is not evidence, or None. The
+    parent re-check cannot replay such a model, so the prover's proof is not the one re-checked.
+    """
+    _reduced, wp_model, own, _lines = _prover_wp_config(run_dir, overlay_dir, agent_id, c_file, function)
+    return wp_model_problem(wp_model) if own and wp_model else None
+
+
+def _prover_wp_config(
+    run_dir: Path,
+    overlay_dir: Path | None,
+    agent_id: str | None,
+    c_file: str | None,
+    function: str | None,
+) -> tuple[list[str], str | None, bool, list[int]]:
+    """
+    (reduced checks, WP model, whether the model comes from the prover's own report, declared
+    wrap lines) of the report the prover's proof is replayed from.
     """
     overlay = (overlay_dir or (run_dir / "workspace")).resolve()
     norm_c = _normalize_work_relpath(c_file) if c_file else None
-    cand_paths: list[Path] = []
+    cand_paths: list[tuple[Path, bool]] = []  # (report, the prover's own)
     if agent_id and function and is_safe_agent_id(agent_id):
         agent_dir = run_dir / "agents" / agent_id
-        cand_paths.append(agent_dir / "scratch" / f"wp_{function}.json")
-        cand_paths.append(agent_dir / "artifacts" / f"wp_{function}.json")
+        cand_paths.append((agent_dir / "scratch" / f"wp_{function}.json", True))
+        cand_paths.append((agent_dir / "artifacts" / f"wp_{function}.json", True))
         res_file = agent_dir / "scratch" / "result.json"
         if res_file.is_file():
             res_data = load_json_optional(res_file, {}) or {}
@@ -1007,13 +1061,14 @@ def infer_prover_wp_flags(
                 for ev in res_data.get("evidence") or []:
                     tout = str((ev or {}).get("tool_output") or "").replace("\\", "/").strip()
                     if tout.startswith(f"agents/{agent_id}/") and tout.endswith(".json"):
-                        cand_paths.append(run_dir / tout)
-        cand_paths.append(agent_dir / "scratch" / "parent_wp" / f"{function}.json")
+                        cand_paths.append((run_dir / tout, True))
+        cand_paths.append((agent_dir / "scratch" / "parent_wp" / f"{function}.json", False))
     if function:
-        cand_paths.append(overlay / "reports" / "wp" / f"{function}.json")
+        cand_paths.append((overlay / "reports" / "wp" / f"{function}.json", False))
 
     reduced: list[str] = []
     wp_model: str | None = None
+    model_own = False
     wrap_code_lines: list[int] = []
 
     def _note_wraps(report: dict) -> None:
@@ -1021,7 +1076,7 @@ def infer_prover_wp_flags(
         if isinstance(declared, list) and not wrap_code_lines:
             wrap_code_lines.extend(n for n in declared if isinstance(n, int) and not isinstance(n, bool))
 
-    for p in cand_paths:
+    for p, own in cand_paths:
         if not p.is_file() or p.is_symlink():
             continue
         rep = load_json_optional(p, {}) or {}
@@ -1041,6 +1096,7 @@ def infer_prover_wp_flags(
         )
         if isinstance(m, str) and m.strip() and wp_model is None:
             wp_model = m.strip()
+            model_own = own
         _note_wraps(rep)
         if reduced or wp_model:
             break
@@ -1079,25 +1135,7 @@ def infer_prover_wp_flags(
                                 )
                                 if isinstance(m, str) and m.strip() and wp_model is None:
                                     wp_model = m.strip()
-
-    flags: list[str] = []
-    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
-        flags.append("--no-warn-unsigned")
-        if wrap_code_lines:
-            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
-    else:
-        flags.append("--no-warn-unsigned-downcast")
-    if any("-warn-invalid-pointer OFF" in r for r in reduced):
-        flags.append("--no-warn-invalid-pointer")
-    # Never carry the unsound `cast` model into a parent re-check or the sweep.
-    if (
-        wp_model
-        and wp_model != "Typed"
-        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
-        and not wp_model_unsound(wp_model)
-    ):
-        flags.extend(["--wp-model", wp_model])
-    return flags
+    return reduced, wp_model, model_own, wrap_code_lines
 
 
 def _collect_existing_header_declarations(work_dir: Path, exclude_rels: set[str]) -> set[str]:
@@ -1115,6 +1153,29 @@ def _supports_kwarg(func: Any, kwarg: str) -> bool:
         return kwarg in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     except (ValueError, TypeError):
         return True
+
+
+def _wp_report_detail(wp_report: dict) -> str:
+    """`: <reason>; <first error line>` of a WP report (run_wp_function.py), or '' when it has neither."""
+    parts: list[str] = []
+    reason = wp_report.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(reason.strip())
+    syntax = wp_report.get("syntax_check")
+    soundness = wp_report.get("soundness")
+    for errors in (
+        wp_report.get("preprocess_errors"),
+        syntax.get("errors") if isinstance(syntax, dict) else None,
+        soundness.get("tier_a_aborts") if isinstance(soundness, dict) else None,
+        soundness.get("tier_b_unsound") if isinstance(soundness, dict) else None,
+    ):
+        first = next((e for e in errors if isinstance(e, str) and e.strip()), None) if isinstance(errors, list) else None
+        if first is not None:
+            line = first.strip().splitlines()[0][:300]
+            if not any(line in p for p in parts):
+                parts.append(line)
+            break
+    return (": " + "; ".join(parts)) if parts else ""
 
 
 def _run_parent_reverify(
@@ -1144,6 +1205,15 @@ def _run_parent_reverify(
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
     guard_report: dict | None = None
+
+    if role == "prover" and c_file and function:
+        # A proof under a memory model that is not evidence is never replayed, so the parent check
+        # would re-prove under another model than the prover's: refuse it outright.
+        model_problem = prover_wp_model_problem(
+            run_dir, overlay_dir=overlay_dir, agent_id=agent_id, c_file=_normalize_work_relpath(c_file), function=function
+        )
+        if model_problem:
+            return False, f"prover's WP report used a memory model that is not accepted: {model_problem}"
 
     if module and sources:
         # A link unit is built through one of its harnesses (the one answering for `function`).
@@ -1280,10 +1350,10 @@ def _run_parent_reverify(
                 return (
                     False,
                     f"parent partial WP check rejected (status={wp_status!r}, sound_ok={sound_ok}, "
-                    f"assigns_verified={assigns_ok})",
+                    f"assigns_verified={assigns_ok}){_wp_report_detail(wp_report)}",
                 )
         elif wp_status != "all_proven":
-            return False, f"parent WP check on merged tree returned status={wp_status!r}"
+            return False, f"parent WP check on merged tree returned status={wp_status!r}{_wp_report_detail(wp_report)}"
         if guard_report is not None and _apply_guard_limits(wp_report, function, guard_report):
             wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
         _publish_canonical_wp(run_dir, overlay_dir, wp_json, norm_c, function)
@@ -1539,6 +1609,10 @@ def entry_trust_boundary_errors(
     changed its contract; violations already in the target's own baseline ACSL are not the agent's.
     An entry that records its `file` (one the function's trust put on the boundary) is checked in
     that source and in headers, never in another source's same-named static.
+
+    In a header, every declaration of the entry is checked (a `static inline` function is often
+    declared twice and a contract may sit on either), each against its own formal names: the
+    prototype may call a parameter `pUOutBuf` and the definition `pMe` (QCBOR run-6).
     """
     entry = str(hmeta.get("entry_fn") or "")
     if not entry or Path(rel).suffix not in ACSL_CHECK_EXTS:
@@ -1548,21 +1622,30 @@ def entry_trust_boundary_errors(
     if entry_file and not is_hdr and _normalize_work_relpath(rel) != entry_file:
         return []
     try:
-        if function_contract_text(agent_text, entry, is_hdr, rel) == function_contract_text(
-            base_text, entry, is_hdr, rel
-        ):
+        if [declaration_contract_text(d, rel) for d in contract_declaration_spans(agent_text, entry, is_hdr, rel)] == [
+            declaration_contract_text(d, rel) for d in contract_declaration_spans(base_text, entry, is_hdr, rel)
+        ]:
             return []
-        contract = function_contract_text(merged_text, entry, is_hdr, rel)
-        params = set(function_param_names(merged_text, entry, is_hdr, rel))
-        baseline_contract = function_contract_text(baseline_text, entry, is_hdr, rel)
+        merged_decls = contract_declaration_spans(merged_text, entry, is_hdr, rel)
+        baseline_decls = contract_declaration_spans(baseline_text, entry, is_hdr, rel)
     except AcslError:
         return []  # the ACSL-only check reports unparsable files
-    params.update(str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k))
+    globals_ = {str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k)}
     nul = bool(hmeta.get("null_terminate")) or hmeta.get("entry_style") in ("c_string", "argv")
-    found = entry_requires_violations(contract, params, nul_terminated=nul)
+
+    def violations(decls: list) -> list[str]:
+        out: list[str] = []
+        for decl in decls:
+            params = set(declaration_param_names(decl, rel)) | globals_
+            for v in entry_requires_violations(declaration_contract_text(decl, rel), params, nul_terminated=nul):
+                if v not in out:
+                    out.append(v)
+        return out
+
+    found = violations(merged_decls)
     if not found:
         return []
-    pre_existing = set(entry_requires_violations(baseline_contract, params, nul_terminated=nul))
+    pre_existing = set(violations(baseline_decls))
     return [f"{rel}: {entry}: {v}" for v in found if v not in pre_existing]
 
 
@@ -1748,16 +1831,15 @@ def _merge_agent_overlay_locked(
         frame_parts: list[str] = []
         for rel_str in changed_rels:
             # A header may declare the function twice (prototype and `static inline` definition);
-            # the spliced contract can sit on either declaration, so read the ACSL of both spans.
-            header_kinds = (True, False) if rel_str.endswith(".h") else (False,)
-            for is_header_span in header_kinds:
-                span = locate_function_span(
-                    new_contents[rel_str], function or "", is_header=is_header_span, path=rel_str
-                )
-                if span is not None:
-                    acsl_piece = _acsl_text_of_span(span)
-                    if acsl_piece and acsl_piece not in frame_parts:
-                        frame_parts.append(acsl_piece)
+            # the spliced contract can sit on either declaration, so read the ACSL of every one.
+            # Frama-C merges the two contracts and takes the union of their `assigns`, which is
+            # what "some clause lists the location" checks here.
+            for decl in contract_declaration_spans(
+                new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str
+            ):
+                acsl_piece = _acsl_text_of_span(decl.span)
+                if acsl_piece and acsl_piece not in frame_parts:
+                    frame_parts.append(acsl_piece)
         frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
@@ -1901,6 +1983,36 @@ def _merge_agent_overlay_locked(
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
     return result
+
+
+def single_merge_build_inputs(
+    overlay: Path,
+    module: str | None,
+    sources: list[str] | None,
+    cppflags: str | None,
+    ldflags: str | None,
+    reverify: bool = True,
+) -> tuple[list[str] | None, str, str]:
+    """
+    (sources, cppflags, ldflags) for one `merge-agent` call: what the caller passed, else the
+    module's merged harness sidecar (as `_enrich_batch_entry` does for a batch), else `-I.` and no
+    sources. A merge that re-verifies with `module` but resolves no sources is refused: the parent
+    re-check would otherwise skip the E-ACSL guardrail without saying so (QCBOR run-6).
+    """
+    hmeta: dict = merged_sidecar(module_map_for(Path(overlay)), module) if module else {}
+    side_sources = hmeta.get("sources")
+    out_sources = sources or (
+        [str(s) for s in side_sources if isinstance(s, str) and s] if isinstance(side_sources, list) else None
+    )
+    out_sources = out_sources or None
+    out_cppflags = cppflags or str(hmeta.get("cppflags") or "") or "-I."
+    out_ldflags = ldflags if ldflags is not None else str(hmeta.get("ldflags") or "")
+    if module and reverify and not out_sources:
+        raise ArtifactError(
+            f"merge-agent --module {module}: no harness sources found for the module, so the parent "
+            "re-check cannot run the E-ACSL guardrail; pass --sources (and --cppflags) explicitly"
+        )
+    return out_sources, out_cppflags, out_ldflags
 
 
 def _enrich_batch_entry(
@@ -3209,9 +3321,9 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--function", default=None)
     p_merge.add_argument("--header", default=None)
     p_merge.add_argument("--module", default=None)
-    p_merge.add_argument("--sources", nargs="*", default=None)
-    p_merge.add_argument("--cppflags", default="-I.")
-    p_merge.add_argument("--ldflags", default="", help="Extra linker flags for parent guardrail")
+    p_merge.add_argument("--sources", nargs="*", default=None, help="Default: the --module's harness sources")
+    p_merge.add_argument("--cppflags", default=None, help="Default: the --module's cppflags, else -I.")
+    p_merge.add_argument("--ldflags", default=None, help="Extra linker flags for parent guardrail (default: the --module's)")
     p_merge.add_argument("--skip-reverify", action="store_true")
     p_merge.add_argument(
         "--allow-partial-wp",
@@ -3294,6 +3406,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(res, indent=2))
             return 0 if res["ok"] else 1
         elif args.cmd == "merge-agent":
+            m_sources, m_cppflags, m_ldflags = single_merge_build_inputs(
+                (args.overlay or args.run_dir / "workspace"),
+                args.module,
+                args.sources,
+                args.cppflags,
+                args.ldflags,
+                reverify=not args.skip_reverify,
+            )
             res = merge_agent_overlay(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -3303,9 +3423,9 @@ def main(argv: list[str] | None = None) -> int:
                 function=args.function,
                 header_file=args.header,
                 module=args.module,
-                sources=args.sources,
-                cppflags=args.cppflags,
-                ldflags=args.ldflags,
+                sources=m_sources,
+                cppflags=m_cppflags,
+                ldflags=m_ldflags,
                 skip_reverify=args.skip_reverify,
                 allow_partial_wp=args.allow_partial_wp,
                 contract_only=args.contract_only,

@@ -524,6 +524,41 @@ def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> li
     return errors
 
 
+_ALIGNED_RE = re.compile(r"\\aligned\s*\(")
+
+
+def _aligned_requires(tokens: list[Token]) -> list[tuple[int, str]]:
+    """(line, whitespace-normalised clause) of every `requires` clause using `\\aligned(...)`."""
+    out: list[tuple[int, str]] = []
+    for tok in tokens:
+        if tok.kind not in ("acsl_block", "acsl_line") or "aligned" not in tok.text:
+            continue
+        for kind, _label, pred, _span in iter_clauses(_scrub_acsl_literals(tok.text)):
+            if kind == "requires" and _ALIGNED_RE.search(pred):
+                out.append((tok.line, " ".join(pred.split())))
+    return out
+
+
+def _added_aligned_requires(base_tokens: list[Token], work_tokens: list[Token], path: str) -> list[str]:
+    """
+    `requires` clauses using `\\aligned(...)` that `work_tokens` adds to `base_tokens`. WP implements
+    `\\aligned` under no memory model (`\\aligned not yet implemented`), so no caller can discharge
+    such a precondition and every call site keeps an Unknown goal. A clause already in the baseline
+    is the target's, not the agent's: compared per clause, so extending a baseline block keeps it.
+    """
+    known = Counter(clause for _line, clause in _aligned_requires(base_tokens))
+    errors: list[str] = []
+    for line, clause in _aligned_requires(work_tokens):
+        if known[clause] > 0:
+            known[clause] -= 1
+            continue
+        errors.append(
+            f"{path}:{line}: forbidden 'requires {clause}': WP implements \\aligned under no memory model, "
+            "so no caller can discharge it; state the alignment in the result's boundary_assumptions instead"
+        )
+    return errors
+
+
 def find_unsound_acsl_keywords(tokens: list[Token], path: str = "<input>") -> list[str]:
     """Check all ACSL tokens in `tokens` for unsound or hazardous ACSL constructs."""
     return _check_unsound_acsl(tokens, set(), path) + find_empty_named_behaviors(tokens, path)
@@ -547,6 +582,7 @@ def verify_acsl_only(
     if check_unsound:
         base_acsl = {t.text for t in base_tokens if t.kind in ("acsl_block", "acsl_line")}
         errors.extend(_check_unsound_acsl(work_tokens, base_acsl, path))
+        errors.extend(_added_aligned_requires(base_tokens, work_tokens, path))
 
     base_c = [t for t in base_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
     work_c = [t for t in work_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
@@ -722,6 +758,103 @@ def locate_function_span(
         idx += 1
 
     return None
+
+
+@dataclass(slots=True, frozen=True)
+class DeclSpan:
+    """One top-level declaration of a function: `kind` is `prototype` (ends with `;`) or `definition`."""
+
+    kind: str
+    span: Span
+
+
+def function_declaration_spans(source: str, function_name: str, path: str = "<input>") -> list[DeclSpan]:
+    """
+    Every top-level declaration of `function_name` in `source`, in source order: its prototypes and
+    its definition, each span including the ACSL contract in front of it. A header commonly declares
+    a `static inline` function twice (QCBOR's `UsefulBuf.h`), and ACSL accepts a contract on either
+    declaration (Frama-C merges them), so every reader of a header function's contract uses this.
+    """
+    tokens = tokenize_c_acsl(source, path=path)
+    linkage = _linkage_block_braces(tokens)
+    out: list[DeclSpan] = []
+    brace_depth = 0
+    paren_depth = 0
+    last_top_boundary_idx = -1
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if idx in linkage:
+            idx += 1
+            continue
+        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
+            last_top_boundary_idx = idx
+        elif tok.kind == "c_token":
+            if tok.text == "{":
+                brace_depth += 1
+            elif tok.text == "}":
+                brace_depth = max(0, brace_depth - 1)
+                if brace_depth == 0 and paren_depth == 0:
+                    last_top_boundary_idx = idx
+            elif tok.text == "(":
+                paren_depth += 1
+            elif tok.text == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif tok.text == ";" and brace_depth == 0 and paren_depth == 0:
+                last_top_boundary_idx = idx
+            elif brace_depth == 0 and paren_depth == 0 and tok.text == function_name:
+                open_paren_idx = _next_meaningful(tokens, idx + 1)
+                if open_paren_idx < n and tokens[open_paren_idx].kind == "c_token" and tokens[open_paren_idx].text == "(":
+                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
+                    after_idx = _next_meaningful(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
+                    end_idx = -1
+                    kind = ""
+                    if after_idx < n and tokens[after_idx].kind == "c_token":
+                        if tokens[after_idx].text == "{":
+                            end_idx = _find_matching_delim(tokens, after_idx, "{", "}")
+                            kind = "definition"
+                        elif tokens[after_idx].text == ";":
+                            end_idx = after_idx
+                            kind = "prototype"
+                    if end_idx != -1:
+                        start_tok = tokens[_compute_span_start(tokens, last_top_boundary_idx, idx)]
+                        end_tok = tokens[end_idx]
+                        span = Span(
+                            function=function_name,
+                            start_byte=start_tok.start,
+                            end_byte=end_tok.end,
+                            start_line=start_tok.line,
+                            end_line=end_tok.line,
+                            text=source[start_tok.start : end_tok.end],
+                        )
+                        out.append(DeclSpan(kind=kind, span=span))
+                        last_top_boundary_idx = end_idx
+                        idx = end_idx + 1
+                        continue
+        idx += 1
+    return out
+
+
+def contract_declaration_spans(
+    source: str, function_name: str, is_header: bool = False, path: str = "<input>"
+) -> list[DeclSpan]:
+    """
+    The declarations of `function_name` whose contract the pipeline reads and merges: in a header,
+    every one (`function_declaration_spans`); in a source file, its first definition only.
+    """
+    spans = function_declaration_spans(source, function_name, path=path)
+    if is_header:
+        return spans
+    return [d for d in spans if d.kind == "definition"][:1]
+
+
+def _span_contract_part(decl: DeclSpan, path: str = "<input>") -> str:
+    """The text of a declaration span up to its body `{` (the whole span for a prototype)."""
+    if decl.kind != "definition":
+        return decl.span.text
+    brace = _find_body_brace_offset(decl.span.text, path=path)
+    return decl.span.text if brace is None else decl.span.text[:brace]
 
 
 def _is_top_level_acsl_token(tok: Token) -> bool:
@@ -945,26 +1078,20 @@ def has_function_contract(
     path: str = "<input>",
 ) -> bool:
     """
-    Return True when `function_name`'s span in `source` has at least one function-level ACSL
+    Return True when one of `function_name`'s declarations in `source` (its definition; in a
+    header any of them, `contract_declaration_spans`) has at least one function-level ACSL
     contract clause (`requires`, `terminates`, `decreases`, `exits`, `assigns`, `ensures`,
     `behavior`, `assumes`, `allocates`, `frees`, `complete`, `disjoint`) before its body `{`
     (or `;` for a prototype).
     """
-    span = locate_function_span(source, function_name, is_header=is_header, path=path)
-    if span is None:
-        return False
-    header_part = span.text
-    if not is_header:
-        brace_off = _find_body_brace_offset(span.text, path=path)
-        if brace_off is not None:
-            header_part = span.text[:brace_off]
-    tokens = tokenize_c_acsl(header_part, path=path)
-    for tok in tokens:
-        if tok.kind in ("acsl_block", "acsl_line"):
-            inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
-            for seg in _parse_acsl_inner_segments(inner, tok.line):
-                if seg.kind in _CONTRACT_KWS:
-                    return True
+    for decl in contract_declaration_spans(source, function_name, is_header=is_header, path=path):
+        tokens = tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
+        for tok in tokens:
+            if tok.kind in ("acsl_block", "acsl_line"):
+                inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
+                for seg in _parse_acsl_inner_segments(inner, tok.line):
+                    if seg.kind in _CONTRACT_KWS:
+                        return True
     return False
 
 
@@ -978,32 +1105,43 @@ def splice_prover_changes(
     contract_only: bool = False,
 ) -> str:
     """
-    Validate that the prover only modified ACSL annotations inside `function_name`'s span
-    (comparing `agent_work_text` against `base_work_text`), then splice `function_name`'s
-    updated span into `current_work_text`. When `contract_only=True` and `not is_header`,
-    only the function-level contract before `{` is taken from `agent_work_text` while the
-    body `{ ... }` is preserved from `base_work_text`.
+    Validate that the prover only modified ACSL annotations inside `function_name`'s
+    declarations (comparing `agent_work_text` against `base_work_text`), then splice the
+    updated declarations into `current_work_text`. In a source file that is the definition;
+    in a header it is every declaration (`contract_declaration_spans`: the prototype, the
+    `static inline` definition, or both). When `contract_only=True`, only the contract before
+    a definition's `{` is taken from `agent_work_text`; its body `{ ... }` is kept from
+    `base_work_text`.
     """
     acsl_errors = verify_acsl_only(base_work_text, agent_work_text, path=path)
     if acsl_errors:
         raise AcslError(f"ACSL-only check failed on {path}:\n  " + "\n  ".join(acsl_errors))
 
-    base_span = locate_function_span(base_work_text, function_name, is_header=is_header, path=path)
-    agent_span = locate_function_span(agent_work_text, function_name, is_header=is_header, path=path)
-    curr_span = locate_function_span(current_work_text, function_name, is_header=is_header, path=path)
+    base_decls = contract_declaration_spans(base_work_text, function_name, is_header=is_header, path=path)
+    agent_decls = contract_declaration_spans(agent_work_text, function_name, is_header=is_header, path=path)
+    curr_decls = contract_declaration_spans(current_work_text, function_name, is_header=is_header, path=path)
 
-    if base_span is None or agent_span is None or curr_span is None:
+    if not base_decls or not agent_decls or not curr_decls:
         raise ScopeViolationError(
-            f"{path}: could not locate {'prototype' if is_header else 'definition'} of function '{function_name}'"
+            f"{path}: could not locate {'a declaration' if is_header else 'definition'} of function '{function_name}'"
         )
 
-    # Verify the agent did not modify anything before or after function_name's span
-    base_prefix = base_work_text[: base_span.start_byte]
-    agent_prefix = agent_work_text[: agent_span.start_byte]
-    base_suffix = base_work_text[base_span.end_byte :]
-    agent_suffix = agent_work_text[agent_span.end_byte :]
+    # Verify the agent did not modify anything outside function_name's declarations: the text
+    # between them (and before the first, after the last) must be unchanged. The ACSL-only check
+    # above keeps every C token, so base and agent have the same declarations in the same order.
+    def _gaps(text: str, decls: list[DeclSpan]) -> list[str]:
+        out: list[str] = []
+        last = 0
+        for d in decls:
+            out.append(text[last : d.span.start_byte])
+            last = d.span.end_byte
+        out.append(text[last:])
+        return out
 
-    if base_prefix != agent_prefix or base_suffix != agent_suffix:
+    kinds = [d.kind for d in base_decls]
+    if [d.kind for d in agent_decls] != kinds or _gaps(base_work_text, base_decls) != _gaps(
+        agent_work_text, agent_decls
+    ):
         added = added_top_level_acsl_declarations(base_work_text, agent_work_text, path=path)
         if added:
             raise ScopeViolationError(
@@ -1013,20 +1151,24 @@ def splice_prover_changes(
             )
         raise ScopeViolationError(f"{path}: agent modified content outside assigned function '{function_name}'")
 
-    # Verify that in current_work_text, function_name's span hasn't been concurrently altered
-    if curr_span.text != base_span.text:
+    # Verify that in current_work_text, none of function_name's declarations has been concurrently altered
+    if [d.kind for d in curr_decls] != kinds or any(
+        c.span.text != b.span.text for c, b in zip(curr_decls, base_decls, strict=True)
+    ):
         raise ScopeViolationError(
             f"{path}: function '{function_name}' in workspace/work/ diverged from agent base snapshot"
         )
 
-    replacement_span = agent_span.text
-    if contract_only and not is_header:
-        agent_brace = _find_body_brace_offset(agent_span.text, path=path)
-        base_brace = _find_body_brace_offset(base_span.text, path=path)
-        if agent_brace is not None and base_brace is not None:
-            replacement_span = agent_span.text[:agent_brace] + base_span.text[base_brace:]
-
-    spliced = current_work_text[: curr_span.start_byte] + replacement_span + current_work_text[curr_span.end_byte :]
+    spliced = current_work_text
+    # Replace from the last declaration backwards so the earlier byte offsets stay valid.
+    for curr, base, agent in reversed(list(zip(curr_decls, base_decls, agent_decls, strict=True))):
+        replacement_span = agent.span.text
+        if contract_only and agent.kind == "definition":
+            agent_brace = _find_body_brace_offset(agent.span.text, path=path)
+            base_brace = _find_body_brace_offset(base.span.text, path=path)
+            if agent_brace is not None and base_brace is not None:
+                replacement_span = agent.span.text[:agent_brace] + base.span.text[base_brace:]
+        spliced = spliced[: curr.span.start_byte] + replacement_span + spliced[curr.span.end_byte :]
     post_errors = verify_acsl_only(current_work_text, spliced, path=path)
     if post_errors:
         raise AcslError(f"Post-splice ACSL-only check failed on {path}:\n  " + "\n  ".join(post_errors))
@@ -2572,11 +2714,20 @@ def entry_requires_violations(
 
 
 def function_param_names(source: str, function: str, is_header: bool = False, path: str = "<input>") -> list[str]:
-    """Parameter names of `function`'s definition (or prototype, `is_header`); unnamed parameters are skipped."""
-    span = locate_function_span(source, function, is_header=is_header, path=path)
-    if span is None:
-        return []
-    toks = [t for t in tokenize_c_acsl(span.text, path=path) if t.kind == "c_token"]
+    """
+    Parameter names of `function`'s definition (in a header: of its first prototype, else of its
+    definition); unnamed parameters are skipped. The declarations of one function may name their
+    formals differently: `declaration_param_names` reads one declaration.
+    """
+    decls = contract_declaration_spans(source, function, is_header=is_header, path=path)
+    decls = [d for d in decls if d.kind == "prototype"][:1] or decls
+    return declaration_param_names(decls[0], path=path) if decls else []
+
+
+def declaration_param_names(decl: DeclSpan, path: str = "<input>") -> list[str]:
+    """Parameter names of one declaration of a function; unnamed parameters are skipped."""
+    function = decl.span.function
+    toks = [t for t in tokenize_c_acsl(_span_contract_part(decl, path=path), path=path) if t.kind == "c_token"]
     for k, tok in enumerate(toks):
         if tok.text != function or k + 1 >= len(toks) or toks[k + 1].text != "(":
             continue
@@ -2612,14 +2763,22 @@ def function_param_names(source: str, function: str, is_header: bool = False, pa
 
 
 def function_contract_text(source: str, function: str, is_header: bool = False, path: str = "<input>") -> str:
-    """The ACSL contract in front of `function`'s definition (or prototype), without body annotations."""
-    span = locate_function_span(source, function, is_header=is_header, path=path)
-    if span is None:
-        return ""
-    parts: list[str] = []
-    for t in tokenize_c_acsl(span.text, path=path):
-        if t.kind == "c_token" and t.text == "{":
-            break
-        if t.kind in ("acsl_block", "acsl_line"):
-            parts.append(t.text)
-    return "\n".join(parts)
+    """
+    The ACSL contract in front of `function`'s definition, without body annotations. In a header,
+    the contracts in front of every declaration (prototype and definition), joined in source order:
+    Frama-C merges them into one contract.
+    """
+    parts = [
+        declaration_contract_text(d, path=path)
+        for d in contract_declaration_spans(source, function, is_header=is_header, path=path)
+    ]
+    return "\n".join(p for p in parts if p)
+
+
+def declaration_contract_text(decl: DeclSpan, path: str = "<input>") -> str:
+    """The ACSL contract in front of one declaration of a function, without body annotations."""
+    return "\n".join(
+        t.text
+        for t in tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
+        if t.kind in ("acsl_block", "acsl_line")
+    )
