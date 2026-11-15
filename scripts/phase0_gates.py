@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,35 @@ def harness_digest(run_dir: Path, module: str, ignore_exempt: bool = False) -> s
         except OSError:
             h.update(b"\0unreadable")
     return h.hexdigest() if found else None
+
+
+# `harness_digest` of a report built from runs that cannot be tied to the current harness. It equals no
+# digest, so every comparison with the current harness fails (wp_scheduler.py refresh: stale evidence).
+HARNESS_DIGEST_UNKNOWN = "unknown"
+
+
+def derived_harness_digest(run_dir: Path, module: str, inputs: Iterable[Path]) -> str | None:
+    """
+    The `harness_digest` of a report built from `inputs` that record none (Eva trials or shards written
+    before the field existed). It is the current harness's digest when every input is newer than the
+    harness source, else HARNESS_DIGEST_UNKNOWN: a report rebuilt today from runs that predate a harness
+    repair must not pass for one of the repaired harness because the rebuild is recent. None when the
+    module has no harness.
+    """
+    current = harness_digest(run_dir, module, ignore_exempt=True)
+    if current is None:
+        return None
+    paths = [Path(p) for p in inputs]
+    try:
+        # The source, as wp_scheduler's refresh reads it: the sidecar is rewritten for bookkeeping.
+        source = next(
+            p for s in (".c", ".json") if (p := Path(run_dir) / HARNESS_DIR / f"harness_{module}{s}").is_file()
+        )
+        changed = source.stat().st_mtime
+        fresh = bool(paths) and all(p.stat().st_mtime > changed for p in paths)
+    except (OSError, StopIteration):
+        fresh = False
+    return current if fresh else HARNESS_DIGEST_UNKNOWN
 
 
 def dag_digest(run_dir: Path, dag_path: Path | None = None) -> str | None:

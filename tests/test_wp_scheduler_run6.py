@@ -8,6 +8,7 @@ from pathlib import Path
 import function_facts
 import ledger as L
 import phase0_gates
+import run_eacsl_fuzz
 import test_wp_scheduler as base
 import wp_scheduler as S
 from conftest import write_json
@@ -158,6 +159,33 @@ def test_refresh_accepts_legacy_reports_without_the_field_only_when_newer_than_t
     assert out["repair"] == "stale_evidence" and out["targets"] == ["fuzz-m"]
     _report("fuzz", None, mtime=2_000_000)
     assert S.cmd_refresh("m")["repair"] == "done"
+
+
+def test_refresh_accepts_the_identity_a_fuzz_campaign_stamps_and_rejects_it_after_another_edit(sim):
+    """The writer's own stamp (run_eacsl_fuzz.campaign_harness_identity), not a digest the test computed."""
+    _open_repair(sim)
+    harness = "workspace/harnesses/harness_m.c"
+    identity = run_eacsl_fuzz.campaign_harness_identity("m", [harness])
+    assert identity["harness_digest"]
+    _report("fuzz", identity["harness_digest"])
+    _report("eva", _digest())
+    _facts()
+    assert S._stale_repair_evidence(S.Ctx(), "m") == ([], [])
+
+    Path(harness).write_text("int eva_main(void) { return 1; } /* repaired again */\n", encoding="utf-8")
+    stale, targets = S._stale_repair_evidence(S.Ctx(), "m")
+    assert [s["reason"] for s in stale] == ["harness_digest differs from the current harness"] * 2
+    assert targets == ["fuzz-m", "eva-m", "facts-m"]
+
+
+def test_refresh_rejects_a_recent_report_rebuilt_from_runs_of_an_unknown_harness(sim):
+    """eva_tuning finish / eva_shards merge over unstamped runs older than the harness write this marker."""
+    _open_repair(sim)
+    _report("fuzz", _digest())
+    _report("eva", phase0_gates.HARNESS_DIGEST_UNKNOWN, mtime=3_000_000)
+    _facts(mtime=3_000_100)
+    out = S.cmd_refresh("m")
+    assert out["repair"] == "stale_evidence" and out["targets"] == ["eva-m", "facts-m"]
 
 
 def test_the_repair_actions_say_refresh_waits_for_eva_and_fuzz(sim):

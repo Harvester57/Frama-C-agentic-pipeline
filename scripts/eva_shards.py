@@ -42,6 +42,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import phase0_gates  # noqa: E402
 from eva_flamegraph import fold_flamegraph  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_NEVER_TRIED,
@@ -694,7 +695,12 @@ def merge(
                 if all(digests)
                 else None
             ),
-            "harness_digest": base.get("harness_digest"),
+            # Shards without the field (identity_problem: then none has it) stand for the current
+            # harness only when every shard report is newer than the harness source.
+            "harness_digest": base.get("harness_digest")
+            or phase0_gates.derived_harness_digest(
+                Path("."), module, [Path(p) for s in shards if (p := s.run.report.get("_path"))]
+            ),
             "cache": {"hit": all((s.run.report.get("cache") or {}).get("hit") for s in shards), "key": None},
             "flows": merge_flows([s.run.report.get("flows") for s in shards]),
             "nonterm": _union(s.run.report.get("nonterm") for s in shards),

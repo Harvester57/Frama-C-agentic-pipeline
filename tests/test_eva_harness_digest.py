@@ -4,9 +4,11 @@ eva_tuning.py finish. wp_scheduler.py refresh compares it with the current harne
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
+import eva_shards as es
 import eva_tuning as et
 import phase0_gates
 import run_eva_slice as res_mod
@@ -126,12 +128,62 @@ def test_finish_stamps_the_harness_the_base_run_used(tmp_path, monkeypatch, caps
     assert report["harness_digest"] == "H-base"
 
 
+def _age(path: Path, when: float) -> None:
+    os.utime(path, (when, when))
+
+
+def _harness_at(run: Path, when: float) -> str:
+    current = _harness(run)
+    for suffix in (".c", ".json"):
+        _age(run / phase0_gates.HARNESS_DIR / f"harness_m{suffix}", when)
+    return current
+
+
 def test_finish_without_a_stamped_base_stamps_the_current_harness(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "workspace/build").mkdir(parents=True)
-    current = _harness(tmp_path)
+    current = _harness_at(tmp_path, 1_000_000)
     _write_trial(tmp_path, "m", "base", [_csv_row(1, "Valid")])
+    _age(tmp_path / "workspace/reports/eva-tuning/m/base.json", 2_000_000)
     assert et.main(_finish_args(tmp_path, [])) == 0
     capsys.readouterr()
     report = json.loads((tmp_path / "workspace/reports/eva/m.json").read_text(encoding="utf-8"))
     assert report["harness_digest"] == current
+
+
+def test_finish_on_an_unstamped_base_older_than_the_harness_does_not_pass_for_the_current_harness(
+    tmp_path, monkeypatch, capsys
+):
+    """A base run from before a harness repair, decided again today: the new report is not fresh evidence."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "workspace/build").mkdir(parents=True)
+    current = _harness_at(tmp_path, 2_000_000)
+    _write_trial(tmp_path, "m", "base", [_csv_row(1, "Valid")])
+    _age(tmp_path / "workspace/reports/eva-tuning/m/base.json", 1_000_000)
+    assert et.main(_finish_args(tmp_path, [])) == 0
+    capsys.readouterr()
+    report = json.loads((tmp_path / "workspace/reports/eva/m.json").read_text(encoding="utf-8"))
+    assert report["harness_digest"] == phase0_gates.HARNESS_DIGEST_UNKNOWN != current
+
+
+def test_the_merge_of_unstamped_shards_stands_for_the_harness_only_when_they_are_newer(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    current = _harness_at(tmp_path, 2_000_000)
+    for i in (0, 1):
+        _shard(tmp_path, i, [_row(1, "Valid")], {"parse": 5})
+        _age(tmp_path / es.SHARD_DIR / "m" / f"shard{i}.json", 3_000_000)
+    rc, report = _merge(tmp_path)
+    assert rc == 0 and report["harness_digest"] == current
+
+    # One shard report predates the harness (run-6: shards of the 181-case harness merged again later).
+    _age(tmp_path / es.SHARD_DIR / "m" / "shard1.json", 1_000_000)
+    rc, report = _merge(tmp_path)
+    capsys.readouterr()
+    assert rc == 0 and report["harness_digest"] == phase0_gates.HARNESS_DIGEST_UNKNOWN
+
+
+def test_a_derived_digest_is_none_without_a_harness_and_unknown_without_inputs(tmp_path):
+    assert phase0_gates.derived_harness_digest(tmp_path, "m", [tmp_path / "x.json"]) is None
+    _harness(tmp_path)
+    assert phase0_gates.derived_harness_digest(tmp_path, "m", []) == phase0_gates.HARNESS_DIGEST_UNKNOWN
+    assert phase0_gates.derived_harness_digest(tmp_path, "m", [tmp_path / "missing.json"]) == "unknown"

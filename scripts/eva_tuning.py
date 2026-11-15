@@ -743,10 +743,13 @@ def finish(args: argparse.Namespace) -> dict:
 
     def write(report: dict) -> dict:
         report["module"] = args.module
-        # The harness the trials ran on (run_eva_slice.py stamps the base run); else the current one.
+        # The harness the trials ran on (run_eva_slice.py stamps the base run). A base run without the
+        # field stands for the current harness only when it is newer than the harness source.
         stamped = base.report.get("harness_digest")
         report["harness_digest"] = (
-            stamped if stamped else phase0_gates.harness_digest(Path(args.run_dir), args.module, ignore_exempt=True)
+            stamped
+            if stamped
+            else phase0_gates.derived_harness_digest(Path(args.run_dir), args.module, [tuner.report_dir / "base.json"])
         )
         # The module report owns its flows: a trial's spilled flows are copied next to the module's Eva
         # work (workspace/eva/<mod>/flows.json, where run_eva_slice.py puts them), never pointed into a
