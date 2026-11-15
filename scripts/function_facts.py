@@ -55,7 +55,9 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 
-FACTS_SCHEMA = 3  # 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates)
+# 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates);
+# 4: `assigns \nothing` only when no call may write (calls carry the callee's kernel name)
+FACTS_SCHEMA = 4
 LOOP_TEMPLATES_ENV = "FRAMAC_LOOP_TEMPLATES"
 LOOP_SEEDS_ENV = "FRAMAC_LOOP_SEEDS"
 FACTS_DIR = "workspace/reports/facts"
@@ -613,6 +615,8 @@ def _function_record(
             record["eva_targets"] = sorted(resolved - direct) if flows.get("status") == "ok" else None
         else:
             record["callee"] = call.get("callee")
+            # Same-named statics differ only here: the frame pass resolves callees by kernel name.
+            record["kernel_name"] = call.get("kernel_name") or call.get("callee")
         calls.append(record)
     paths = []
     for path in raw.get("return_paths") or []:
@@ -748,8 +752,39 @@ def build_module_facts(
         except AcslSyntaxError as exc:
             doc.setdefault("warnings", []).append(f"{key}: {exc}")
     _link_callers(raw_functions, doc["functions"])
+    _close_frames_over_calls(doc["functions"])
     doc["status"] = "ok" if flows.get("status") == "ok" else "partial"
     return doc
+
+
+def write_free_functions(records: dict[str, dict]) -> set[str]:
+    """
+    Kernel names of the module's functions that cannot write caller-visible memory, even through a
+    call: no direct write, and every call reaches another such function. Greatest fixpoint, so a
+    recursive cycle is write-free exactly when every member is. An indirect call, or a callee with no
+    record here (libc, another module, the harness, a function left out), may write.
+    """
+    by_kernel = {str(r.get("kernel_name")): r for r in records.values() if r.get("kernel_name")}
+    free = {name for name, r in by_kernel.items() if frame_skeleton.writes_nothing_directly(r)}
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(free):
+            targets = [frame_skeleton.call_target(c) for c in by_kernel[name].get("calls") or []]
+            if any(t is None or t not in free for t in targets):
+                free.discard(name)
+                changed = True
+    return free
+
+
+def _close_frames_over_calls(records: dict[str, dict]) -> None:
+    """Re-project the frame skeletons of callers with the module verdict on what their callees write."""
+    if not frame_skeleton.enabled():
+        return
+    free = write_free_functions(records)
+    for record in records.values():
+        if record.get("calls"):
+            record["frame_skeleton"] = frame_skeleton.compute(record, write_free_callees=free)
 
 
 def generate(
@@ -1141,6 +1176,11 @@ def _render_skeleton(record: dict, lines: list[str]) -> None:
     seps = skel.get("separated") or []
     assigns = skel.get("assigns") or []
     if not seps and not assigns:
+        # Nothing required; say why there is no `assigns \nothing` (a callee may write) as a hint.
+        notes = skel.get("notes") or []
+        if notes:
+            lines.append("\n**Projected frame skeleton:** no clause is required for this function.")
+            lines.extend(f"- note: {note}" for note in notes)
         return
     lines.append(
         "\n**Projected frame skeleton** (deterministic projection of the AST and Eva dependence sets above into "
