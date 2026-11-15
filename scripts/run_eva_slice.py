@@ -30,7 +30,10 @@ sources (eva_loops.py) and maps its paths back, so workspace/work is never touch
 Inside a run directory with a Phase 0 gate stamp (workspace/reports/phase0_gates.json), a run for
 `--module M` first checks M's reach gate (phase0_gates.py check --module M --need reach) and refuses
 to run, exit 1 and no report, when M failed it or its harness or the DAG changed since: guidance-mode
-runs never analyse a harness the gate stopped, as the Make recipes never do.
+runs never analyse a harness the gate stopped, as the Make recipes never do. The report's top-level
+`harness_digest` (phase0_gates.harness_digest(run_dir, M, ignore_exempt=True), None without a harness)
+names the harness it stands for, on a cache hit too; wp_scheduler.py refresh compares it with the
+current one.
 
 After a successful run, read and write sets are taken from the saved session in a separate
 Frama-C process (`-load framac.sav -deps -inout -input -out-external -cg`), so they can neither
@@ -1290,6 +1293,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"phase0 gate: {reason}", file=sys.stderr)
         return 1
 
+    # The harness this report stands for, taken before the run (a cache hit included: the restored
+    # result describes these sources, so it gets the stamp of the harness that is current now).
+    harness = phase0_gates.harness_digest(Path("."), args.module, ignore_exempt=True) if args.module else None
     res = run_eva_on_slice(
         sources=args.sources,
         main_fn=args.main,
@@ -1311,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
         flamegraph=not args.no_flamegraph,
     )
     res["module"] = args.module
+    res["harness_digest"] = harness
     disk_res = spill_large_flows(res, args.out_dir / "flows.json", report_path=args.out_json)
     atomic_write_json(args.out_json, disk_res)
     print(

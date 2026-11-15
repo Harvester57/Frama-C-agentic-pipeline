@@ -303,6 +303,15 @@ def identity_problem(shards: list[Shard]) -> str | None:
     for s in shards[1:]:
         if identity(s) != first:
             return f"shard{s.index} is not the same analysis as shard{shards[0].index}"
+    # The merged report stands for one harness (`harness_digest`): shards of different harnesses, or a
+    # stamped shard beside an unstamped one, cannot be merged into it.
+    harness = shards[0].run.report.get("harness_digest")
+    for s in shards[1:]:
+        if s.run.report.get("harness_digest") != harness:
+            return (
+                f"shard{s.index} was run on a different harness than shard{shards[0].index} "
+                f"(harness_digest {s.run.report.get('harness_digest')!r} != {harness!r}): run the shards again"
+            )
     return None
 
 
@@ -675,7 +684,16 @@ def merge(
             "sav_file": None,
             "nonterm_log_file": None,
             "flamegraph_file": None,
-            "input_digest": hashlib.sha256("\n".join(digests).encode()).hexdigest() if all(digests) else None,
+            # Shards normally differ only in their case defines; when they share one input digest, it
+            # is the module's (recomputable), else the combination of theirs.
+            "input_digest": (
+                digests[0]
+                if all(digests) and len(set(digests)) == 1
+                else hashlib.sha256("\n".join(digests).encode()).hexdigest()
+                if all(digests)
+                else None
+            ),
+            "harness_digest": base.get("harness_digest"),
             "cache": {"hit": all((s.run.report.get("cache") or {}).get("hit") for s in shards), "key": None},
             "flows": merge_flows([s.run.report.get("flows") for s in shards]),
             "nonterm": _union(s.run.report.get("nonterm") for s in shards),

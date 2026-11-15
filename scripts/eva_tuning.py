@@ -59,6 +59,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import phase0_gates  # noqa: E402
 from eva_loops import LoopRef, find_loops, loop_nests, loop_ref_from_json, mirror_id  # noqa: E402
 from eva_options import (  # noqa: E402
     DEFAULT_LOOP_UNROLL,
@@ -737,6 +738,11 @@ def finish(args: argparse.Namespace) -> dict:
 
     def write(report: dict) -> dict:
         report["module"] = args.module
+        # The harness the trials ran on (run_eva_slice.py stamps the base run); else the current one.
+        stamped = base.report.get("harness_digest")
+        report["harness_digest"] = (
+            stamped if stamped else phase0_gates.harness_digest(Path(args.run_dir), args.module, ignore_exempt=True)
+        )
         atomic_write_json(Path(args.out_json), report)
         atomic_write_json(tuner.report_dir / "decision.json", report.get("tuning") or {})
         publish_flamegraph(report, flamegraph_out, base.report)
