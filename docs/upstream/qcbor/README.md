@@ -23,7 +23,20 @@ QCBOR run-5 and run-6. The assessments are in
 - **09 is still open on `19c3367`.** Do not file it publicly: it belongs to the private report.
   Follow up by email with the rebased patch ([`private-followup-email.md`](./private-followup-email.md)).
 - **01 and 08 are not reported yet.**
-- **Nothing has been filed publicly from here.**
+- **02, 03, 05, 06, 07 and 10 were filed publicly on 2026-11-15.** Each PR comes from a one-commit
+  branch on the fork [`Harvester57/QCBOR`](https://github.com/Harvester57/QCBOR), with the GitHub
+  noreply address as author:
+
+  | # | Issue | PR (`dev`) | PR (`master`, 1.x) |
+  | :-- | :--- | :--- | :--- |
+  | 02 | [#439](https://github.com/laurencelundblade/QCBOR/issues/439) | [#445](https://github.com/laurencelundblade/QCBOR/pull/445) | - |
+  | 03 | [#440](https://github.com/laurencelundblade/QCBOR/issues/440) | [#446](https://github.com/laurencelundblade/QCBOR/pull/446) | - |
+  | 05 | [#441](https://github.com/laurencelundblade/QCBOR/issues/441) | [#447](https://github.com/laurencelundblade/QCBOR/pull/447) | - |
+  | 06 | [#442](https://github.com/laurencelundblade/QCBOR/issues/442) | [#448](https://github.com/laurencelundblade/QCBOR/pull/448) | - |
+  | 07 | [#443](https://github.com/laurencelundblade/QCBOR/issues/443) | [#449](https://github.com/laurencelundblade/QCBOR/pull/449) | [#451](https://github.com/laurencelundblade/QCBOR/pull/451) |
+  | 10 | [#444](https://github.com/laurencelundblade/QCBOR/issues/444) | [#450](https://github.com/laurencelundblade/QCBOR/pull/450) | [#452](https://github.com/laurencelundblade/QCBOR/pull/452) |
+
+  The private follow-up email has not been sent yet. It now points to these references.
 
 **Exposure in this repository.** `origin` (`Harvester57/Frama-C-agentic-pipeline`) is a public
 GitHub repository:
@@ -33,8 +46,8 @@ GitHub repository:
   on `origin/main` since `ac30fb8` (2026-11-09).
 
 So 01 and 08 are already publicly readable. Whether to remove them from `main` (the history keeps
-them) is the owner's decision. Either way, the maintainer should hear about all of it from the
-private follow-up email, before any public issue is filed.
+them) is the owner's decision. Either way, the maintainer should hear about 01 and 08 from the
+private follow-up email. The public issues went out first, on the owner's decision.
 
 ## Bugs
 
@@ -42,14 +55,14 @@ private follow-up email, before any public issue is filed.
 | :-- | :--- | :--- | :---: | :--- | :--- | :--- | :--- |
 | 08 | `GetArray()`/`GetMap()` return an uninitialized length for `[]` / `{}` | `dev` only (since 33cf49e, 2026-11-02) | High | **Private** | [08](./08-getarray-empty-container-length.md) | - | [private/0002](./patches/private/0002-Fix-GetArray-GetMap-length-for-empty-definite-length.patch) |
 | 01 | Encoding an all-zero big number reads 1 byte past the buffer | `dev`, v2.0-alpha-6 | Medium | **Private** | [01](./01-bignum-all-zero-overread.md) | - | [private/0001](./patches/private/0001-Fix-1-byte-over-read-encoding-an-all-zero-big-number.patch) |
-| 02 | Positive big number with `ENCODE_AS_BORROWED` encodes as negative | `dev`, v2.0-alpha-6 | Medium | Public issue + PR | [issue](./02-bignum-positive-borrowed-sign-issue.md) | [PR](./02-bignum-positive-borrowed-sign-pr.md) | [public/0001](./patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch) |
-| 03 | Negative zero big number encodes as −1 or −2^64 | `dev`, v2.0-alpha-6 | Low | Public issue + PR | [issue](./03-bignum-negative-zero-issue.md) | [PR](./03-bignum-negative-zero-pr.md) | [public/0002](./patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch) |
+| 02 | Positive big number with `ENCODE_AS_BORROWED` encodes as negative | `dev`, v2.0-alpha-6 | Medium | Public: issue #439, PR #445 | [issue](./02-bignum-positive-borrowed-sign-issue.md) | [PR](./02-bignum-positive-borrowed-sign-pr.md) | [public/0001](./patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch) |
+| 03 | Negative zero big number encodes as −1 or −2^64 | `dev`, v2.0-alpha-6 | Low | Public: issue #440, PR #446 | [issue](./03-bignum-negative-zero-issue.md) | [PR](./03-bignum-negative-zero-pr.md) | [public/0002](./patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch) |
 | 04 | Out-of-range shifts in `IEEE754_SingleToHalf()` / `DoubleToSingle()` | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Reported privately 2026-11-04; public as #434, fix in #438 | [04](./04-ieee754-out-of-range-shift.md) | - | [v1/0001](./patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch) (1.x only) |
-| 05 | `UsefulOutBuf_Compare()` reads outside the buffer for wrapping offsets | `dev`, v2.0-alpha-6 | Low | Public issue + PR | [issue](./05-usefuloutbuf-compare-offsets-issue.md) | [PR](./05-usefuloutbuf-compare-offsets-pr.md) | [public/0004](./patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch) |
-| 06 | Epoch date/days getters write an indeterminate value on error | `dev`, v2.0-alpha-6 | Low | Public issue + PR | [issue](./06-epoch-date-output-on-error-issue.md) | [PR](./06-epoch-date-output-on-error-pr.md) | [public/0005](./patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch) |
-| 07 | `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before its buffer | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Public issue + 2 PRs (`dev`, `master`) | [issue](./07-encodehead-uminlen-issue.md) | [PRs](./07-encodehead-uminlen-pr.md) | [public/0006](./patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), [v1/0002](./patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch) |
+| 05 | `UsefulOutBuf_Compare()` reads outside the buffer for wrapping offsets | `dev`, v2.0-alpha-6 | Low | Public: issue #441, PR #447 | [issue](./05-usefuloutbuf-compare-offsets-issue.md) | [PR](./05-usefuloutbuf-compare-offsets-pr.md) | [public/0004](./patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch) |
+| 06 | Epoch date/days getters write an indeterminate value on error | `dev`, v2.0-alpha-6 | Low | Public: issue #442, PR #448 | [issue](./06-epoch-date-output-on-error-issue.md) | [PR](./06-epoch-date-output-on-error-pr.md) | [public/0005](./patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch) |
+| 07 | `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before its buffer | `dev`, v2.0-alpha-6, 1.x incl. v1.6.1 | Low | Public: issue #443, PRs #449 (`dev`), #451 (`master`) | [issue](./07-encodehead-uminlen-issue.md) | [PRs](./07-encodehead-uminlen-pr.md) | [public/0006](./patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), [v1/0002](./patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch) |
 | 09 | Signed overflow negating `INT64_MIN` in `ProcessBigNumber()` | `dev`, v2.0-alpha-6 | Low | Reported privately 2026-11-04; follow up by email | [09](./09-processbignumber-int64-min.md) | - | [public/0007](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch) |
-| 10 | `VGetNextConsume()` on a truncated array or map leaves an uninitialized `uNextNestLevel` | `dev` (not v2.0-alpha-6), 1.x `master`, v1.6.1, v1.5.3 | Low | Public issue + 2 PRs (`dev`, `master`) | [issue](./10-consumeitem-nest-level-issue.md) | [PRs](./10-consumeitem-nest-level-pr.md) | [public/0008](./patches/public/0008-Don-t-set-uNextNestLevel-when-consuming-an-array-or-.patch), [v1/0003](./patches/v1/0003-Don-t-set-uNextNestLevel-when-consuming-an-array-or-.patch) |
+| 10 | `VGetNextConsume()` on a truncated array or map leaves an uninitialized `uNextNestLevel` | `dev` (not v2.0-alpha-6), 1.x `master`, v1.6.1, v1.5.3 | Low | Public: issue #444, PRs #450 (`dev`), #452 (`master`) | [issue](./10-consumeitem-nest-level-issue.md) | [PRs](./10-consumeitem-nest-level-pr.md) | [public/0008](./patches/public/0008-Don-t-set-uNextNestLevel-when-consuming-an-array-or-.patch), [v1/0003](./patches/v1/0003-Don-t-set-uNextNestLevel-when-consuming-an-array-or-.patch) |
 
 The `NN-*-issue.md` and `NN-*-pr.md` files are paste-ready bodies. Their titles:
 
@@ -86,8 +99,8 @@ the value, not in memory, or data cannot reach it.
   reported privately, so they follow that channel.
 
 **Borderline: 07.** It is an out-of-bounds *write* in a stable release (v1.6.1). Only a constant
-the application passes triggers it, so public is the normal call for API hardening. The follow-up
-email lists it among the public filings, so the maintainer can object first.
+the application passes triggers it, so public is the normal call for API hardening. It was filed
+publicly with the others (#443).
 
 **03 and private bug 01.** Both are in `QCBOREncode_Private_AddTBigNumberMain()`. The 03 texts and
 reproducer use only the empty big number, which never reaches 01's over-read, and the 03 patch
@@ -95,16 +108,15 @@ decides "is zero" from the caller's buffer, not from the result of `SkipLeadingZ
 is right whether or not 01 is fixed. The test-table rows for `"\x00"` still pass because a string
 literal has a zero byte after it.
 
-## Filing order
+## Filing
 
-1. Send [`private-followup-email.md`](./private-followup-email.md) (09 follow-up, 04 status, 01 and 08, and the list of
-   public filings to come). Check its two **[check]** points first.
-2. Give the maintainer a few days to object to any public filing.
-3. File each public issue (02, 03, 05, 06, 07, 10), then open its PR from a branch with that one
-   patch, and replace `#<issue>` (and `#<dev PR>` for the `master` PRs) in the PR text. Each `dev`
-   PR applies on its own to `dev` `19c3367`, so the order does not matter.
-4. When opening a PR with Claude Code, append its attribution line to the PR body. It is left out
-   of these files because `docs/` allows no emojis.
+1. Done 2026-11-15: each public issue (02, 03, 05, 06, 07, 10) was filed, then its PR was opened
+   from a branch with that one patch, with `#<issue>` (and `#<dev PR>` for the `master` PRs)
+   replaced in the PR text. The `NN-*-pr.md` files keep the placeholders. Each `dev` PR applies on
+   its own to `dev` `19c3367`. The Claude Code attribution line was appended to each PR body. It is
+   left out of these files because `docs/` allows no emojis.
+2. To do: send [`private-followup-email.md`](./private-followup-email.md) (09 follow-up, 04
+   status, 01 and 08, and the references of the public filings). Check its **[check]** point first.
 
 ## Applying the patches
 

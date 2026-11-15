@@ -1,6 +1,6 @@
 # Private follow-up email to the QCBOR maintainer
 
-Draft, not sent. It follows up the private report of 2026-11-04 (the `ieee754.c` shifts and the `INT64_MIN` negation, reports 04 and 09 here). It also carries the two private bugs, 01 and 08. Send it before filing any of the public issues, so the maintainer hears about everything from you first.
+Draft, not sent. It follows up the private report of 2026-11-04 (the `ieee754.c` shifts and the `INT64_MIN` negation, reports 04 and 09 here). It also carries the two private bugs, 01 and 08, and points to the six public issues and eight PRs filed on 2026-11-15 (02, 03, 05, 06, 07, 10; see the README).
 
 Before sending, fill in the point marked **[check]**. Attach:
 - [`patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch`](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch) (09, rebased on `dev` `19c3367`);
@@ -47,16 +47,24 @@ Both private patches are rebased on `dev` `19c3367` and validated there (2026-11
 > - `QCBOREncode_AddTBigNumber()` / `AddTBigNumberNoPreferred()` read and encode the byte after an
 >   all-zero big number. On `dev` and v2.0-alpha-6.
 >
-> **5. Lower-severity bugs I plan to file publicly** with patches, unless you would rather see any
-> of them privately first:
-> - a positive big number with `QCBOR_ENCODE_AS_BORROWED` is encoded as tag 3 (negative);
-> - a negative big number of value zero is encoded as −1 or −2^64;
-> - `UsefulOutBuf_Compare()` reads outside the buffer for offsets or lengths near `SIZE_MAX`;
+> **5. Lower-severity bugs, filed publicly.** I judged these safe to file in the open, since none
+> of them lets input data read or write out of bounds. Each has an issue and a pull request with
+> tests:
+> - a positive big number with `QCBOR_ENCODE_AS_BORROWED` is encoded as tag 3 (negative): issue
+>   #439, PR #445;
+> - a negative big number of value zero is encoded as −1 or −2^64: issue #440, PR #446;
+> - `UsefulOutBuf_Compare()` reads outside the buffer for offsets or lengths near `SIZE_MAX`:
+>   issue #441, PR #447;
 > - the epoch date and days getters overwrite the caller's output with an uninitialized value on
->   error;
-> - `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before its buffer (also 1.x);
+>   error: issue #442, PR #448;
+> - `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before its buffer: issue #443, PR #449
+>   for `dev` and PR #451 for 1.x `master`;
 > - `QCBORDecode_VGetNextConsume()` on a truncated array or map leaves an uninitialized
->   `uNextNestLevel` in the item (also 1.x).
+>   `uNextNestLevel` in the item: issue #444, PR #450 for `dev` and PR #452 for 1.x `master`.
+>
+> Each `dev` PR applies on its own to `dev` `19c3367`. The attached 01 patch adds tests to the
+> same big-number test function as #445 and #446, so it may need a small rebase after them; I can
+> do that. None of the public issues or PRs mentions the two bugs in point 4.
 >
 > The patches and texts were prepared with LLM assistance (Claude Code); I reviewed them and ran
 > the tests myself.
