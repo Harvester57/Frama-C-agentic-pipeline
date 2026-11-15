@@ -283,10 +283,13 @@ def spill_large_flows(
     if dest_resolved.parent.as_posix().rstrip("/").endswith("/reports/eva"):
         mod = str(report.get("module") or (Path(report_path).stem if report_path else dest.stem) or "module")
         dest_resolved = dest_resolved.parent.parent / "eva-flows" / f"{mod}.json"
-    atomic_write_json(dest_resolved, flows)
 
     run_root = _infer_run_root_from_report(report_path) or Path.cwd()
     ref = to_run_relative(dest_resolved, run_root)
+    if not flows_ref_is_run_relative(ref):
+        # resolve_flows only follows a pointer inside the run directory: keep the flows inline.
+        return report
+    atomic_write_json(dest_resolved, flows)
     return {
         **report,
         "flows": {
@@ -297,54 +300,61 @@ def spill_large_flows(
     }
 
 
+def flows_ref_is_run_relative(ref: object) -> bool:
+    """A `flows_file` pointer is a relative POSIX path that stays inside the run directory (no `..`)."""
+    if not isinstance(ref, str) or not ref or "\\" in ref:
+        return False
+    if ref.startswith("/") or re.match(r"^[A-Za-z]:", ref):
+        return False
+    return all(part not in ("..", "") for part in ref.split("/"))
+
+
 def resolve_flows(
     flows: object,
     report_path: Path | None = None,
     run_dir: Path | None = None,
     max_bytes: int = EVA_REPORT_MAX_BYTES,
+    strict: bool = False,
 ) -> dict | None:
-    """Resolve inline `flows` or a spilled `flows_file` pointer back to the full flows dict."""
+    """
+    Resolve inline `flows` or a spilled `flows_file` pointer back to the full flows dict. The pointer
+    must be run-relative (flows_ref_is_run_relative) and is looked up under `run_dir`, the run directory
+    the report is in, then the current directory. A pointer that is not run-relative, or a side file that
+    is missing, oversized, malformed or not an object, gives a `status: failed` flows dict, or, with
+    `strict`, an ArtifactError naming the file.
+    """
     if not isinstance(flows, dict):
         return None
     ref = flows.get("flows_file")
     if not isinstance(ref, str) or not ref or "by_function" in flows:
         return flows
 
-    candidates: list[Path] = []
-    raw_path = Path(ref)
-    if raw_path.is_absolute():
-        candidates.append(raw_path)
-    else:
-        if run_dir is not None:
-            candidates.append(Path(run_dir) / raw_path)
-        inferred_root = _infer_run_root_from_report(report_path)
-        if inferred_root is not None:
-            candidates.append(inferred_root / raw_path)
-        candidates.append(Path.cwd() / raw_path)
-        if report_path is not None:
-            rp = Path(report_path).resolve()
-            for ancestor in list(rp.parents)[:5]:
-                candidates.append(ancestor / raw_path)
+    def _failed(reason: str) -> dict:
+        if strict:
+            raise ArtifactError(reason)
+        return {"status": "failed", "reason": reason, "by_function": {}, "call_edges": {}}
 
-    for cand in candidates:
+    where = f"Eva report {report_path}: " if report_path is not None else ""
+    if not flows_ref_is_run_relative(ref):
+        return _failed(f"{where}flows_file {ref!r} is not a run-relative path inside the run directory")
+    roots: list[Path] = []
+    if run_dir is not None:
+        roots.append(Path(run_dir))
+    inferred_root = _infer_run_root_from_report(report_path)
+    if inferred_root is not None:
+        roots.append(inferred_root)
+    roots.append(Path.cwd())
+    for root in roots:
+        cand = root / ref
         if cand.is_file():
             try:
                 loaded = load_json_strict(cand, max_bytes=max_bytes)
             except ArtifactError as exc:
-                return {
-                    "status": "failed",
-                    "reason": str(exc),
-                    "by_function": {},
-                    "call_edges": {},
-                }
+                return _failed(f"{where}spilled flows file {ref} is unreadable: {exc}")
             if isinstance(loaded, dict):
                 return loaded
-    return {
-        "status": "failed",
-        "reason": f"missing spilled flows file: {ref}",
-        "by_function": {},
-        "call_edges": {},
-    }
+            return _failed(f"{where}spilled flows file {ref} is not a JSON object")
+    return _failed(f"{where}missing spilled flows file: {ref}")
 
 
 _UNESCAPED_ACSL_IN_JSON_RE = re.compile(

@@ -59,6 +59,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import phase0_gates  # noqa: E402
 from eva_loops import LoopRef, find_loops, loop_nests, loop_ref_from_json, mirror_id  # noqa: E402
 from eva_options import (  # noqa: E402
     DEFAULT_LOOP_UNROLL,
@@ -70,6 +71,7 @@ from eva_options import (  # noqa: E402
 )
 from fingerprint import make_fingerprint  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     STATUS_ASSUMED,
     STATUS_DEAD,
     STATUS_INVALID,
@@ -82,6 +84,8 @@ from framac_common import (  # noqa: E402
     atomic_write_json,
     load_json_optional,
     normalize_flag_args,
+    resolve_flows,
+    spill_large_flows,
 )
 from run_eva_slice import read_report_rows, run_eva_on_slice, summarize_rows  # noqa: E402
 
@@ -579,7 +583,7 @@ class Tuner:
 
     def read_trial(self, name: str) -> EvaRun:
         try:
-            report = load_json_optional(self.report_dir / f"{name}.json", None)
+            report = load_json_optional(self.report_dir / f"{name}.json", None, max_bytes=EVA_REPORT_MAX_BYTES)
         except ArtifactError as exc:
             report = {"status": "no_report", "reason": str(exc)}
         return load_run(name, report, self.args.entry_fn)
@@ -608,7 +612,9 @@ class Tuner:
             flamegraph=False,
         )
         result["module"] = a.module
-        atomic_write_json(self.report_dir / f"{name}.json", result)
+        path = self.report_dir / f"{name}.json"
+        # As run_eva_slice.py writes its reports: large flows go to the trial's own directory.
+        atomic_write_json(path, spill_large_flows(result, self.work_dir / name / "flows.json", report_path=path))
         return load_run(name, result, a.entry_fn)
 
 
@@ -737,7 +743,21 @@ def finish(args: argparse.Namespace) -> dict:
 
     def write(report: dict) -> dict:
         report["module"] = args.module
-        atomic_write_json(Path(args.out_json), report)
+        # The harness the trials ran on (run_eva_slice.py stamps the base run); else the current one.
+        stamped = base.report.get("harness_digest")
+        report["harness_digest"] = (
+            stamped if stamped else phase0_gates.harness_digest(Path(args.run_dir), args.module, ignore_exempt=True)
+        )
+        # The module report owns its flows: a trial's spilled flows are copied next to the module's Eva
+        # work (workspace/eva/<mod>/flows.json, where run_eva_slice.py puts them), never pointed into a
+        # trial directory that the next tuning rewrites; large inline ones are spilled there too.
+        out_json = Path(args.out_json)
+        disk = dict(report)
+        flows = disk.get("flows")
+        if isinstance(flows, dict) and "flows_file" in flows:
+            disk["flows"] = resolve_flows(flows, run_dir=Path(args.run_dir))
+        disk = spill_large_flows(disk, Path(args.work_dir).parent / "flows.json", report_path=out_json)
+        atomic_write_json(out_json, disk)
         atomic_write_json(tuner.report_dir / "decision.json", report.get("tuning") or {})
         publish_flamegraph(report, flamegraph_out, base.report)
         return report
