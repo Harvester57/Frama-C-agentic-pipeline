@@ -1115,6 +1115,8 @@ def _prover_wp_config(
                         reduced.append("-warn-unsigned-overflow / -warn-unsigned-downcast OFF")
                     if "-warn-invalid-pointer OFF" in desc:
                         reduced.append("-warn-invalid-pointer OFF")
+                    if "-warn-signed-downcast OFF" in desc:
+                        reduced.append("-warn-signed-downcast OFF on declared wrap lines")
                 for ev in u.get("evidence") or []:
                     if not isinstance(ev, dict) or ev.get("phase") != "wp":
                         continue

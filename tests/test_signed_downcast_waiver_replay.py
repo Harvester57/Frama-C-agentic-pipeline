@@ -33,6 +33,22 @@ def test_the_waiver_is_replayed_with_its_declared_lines(tmp_path: Path) -> None:
     assert flags == ["--no-warn-unsigned", "--wrap-code-lines=282", "--waive-signed-downcast"]
 
 
+def test_the_waiver_is_replayed_from_the_ledger_assumption(tmp_path: Path) -> None:
+    """Without a prover report, the unit's recorded assumption says which checks the proof ran without."""
+    report = tmp_path / "workspace" / "reports" / "wp" / "f.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"function": "f", "unsigned_wraps": {"declared_code_lines": [282]}}), encoding="utf-8")
+    unit = {
+        "function": "f",
+        "file": "m.c",
+        "assumptions": [{"description": f"WP run with reduced RTE check flags: {UNSIGNED_OFF}, {SIGNED_WAIVER}."}],
+        "evidence": [{"phase": "wp", "tool_output": "workspace/reports/wp/f.json"}],
+    }
+    (tmp_path / "coverage-ledger.json").write_text(json.dumps([unit]), encoding="utf-8")
+    flags = WO.infer_prover_wp_flags(tmp_path, c_file="m.c", function="f")
+    assert flags == ["--no-warn-unsigned", "--wrap-code-lines=282", "--waive-signed-downcast"]
+
+
 @pytest.mark.parametrize(
     "reduced,lines",
     [([UNSIGNED_OFF], [282]), ([UNSIGNED_OFF, SIGNED_WAIVER], None), ([SIGNED_WAIVER], [282])],

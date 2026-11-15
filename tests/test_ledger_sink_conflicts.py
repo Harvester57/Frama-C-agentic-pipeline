@@ -237,9 +237,18 @@ def test_a_duplicate_rejection_is_not_a_conflict(run_dir):
     assert validate_run_dir(run_dir) == []
 
 
-def test_a_verifier_stated_checked_rejection_is_flagged_but_not_reopened(run_dir):
+def test_a_checked_rejection_is_re_verified_against_a_confirmed_sibling(run_dir):
+    """QCBOR run-6, EncodeHead: a reproduced crash and a `checked` harness_induced rejection at one sink."""
     _seed(run_dir)
-    _positive(run_dir)
+    _positive(run_dir, "confirmed")
+    out = _negative(run_dir, basis="checked")
+    assert out["sink_conflicts"] == [{"positive": FP_POS, "negative": FP_NEG, "outcome": "reopened"}]
+    _assert_reopened_by_sibling(run_dir)
+
+
+def test_a_checked_rejection_is_kept_against_a_needs_validation_sibling(run_dir):
+    _seed(run_dir)
+    _positive(run_dir, "needs_validation")
     out = _negative(run_dir, basis="checked")
     assert out["sink_conflicts"] == [
         {"positive": FP_POS, "negative": FP_NEG, "outcome": "contradicted", "reason": "checked_rejection"}

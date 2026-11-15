@@ -423,6 +423,7 @@ def tool_evidence_on_verified_candidate(
     tool_output: str,
     linked: list[str],
     already_listed: bool,
+    override_checked: bool = False,
 ) -> str:
     """
     A tool-reproduced signal (`artifact`: a crash input a tool replayed) arrived for a verified
@@ -441,6 +442,10 @@ def tool_evidence_on_verified_candidate(
       `harness_unchanged` (a `harness_induced` rejection and the same harness source: the crash
       recurring through the unrepaired harness says nothing new; not for the `sibling_verdict`
       source, an opposite verdict on the same sink) or `reopen_limit`.
+
+    `override_checked`: the evidence outweighs a `checked` rejection (a sibling verdict that
+    confirmed the same sink with a reproducer: one of the two verifiers is wrong, and a cited tool
+    output does not say which). The reopening limit still applies.
     """
     recs = _rejected_resolution(cand, findings)
     if recs is None:
@@ -466,7 +471,7 @@ def tool_evidence_on_verified_candidate(
         return "known"
 
     # What a verifier cited about a `harness_induced` rejection speaks for the harness it was made on.
-    verifier_checked = not (rej_class == "harness_induced" and harness_changed) and any(
+    verifier_checked = not override_checked and not (rej_class == "harness_induced" and harness_changed) and any(
         r.get("refutation_basis") == "checked" and source_of(r) not in INGEST_RAISED_BASIS_SOURCES for r in recs
     )
     reason: str | None = None
@@ -3029,7 +3034,9 @@ def _reconcile_sink_conflicts(
     Record opposite verdicts at one sink on both records (`conflicts_with`) and give the rejected
     candidate of each pair that involves a record of this ingest one re-verification: it is reopened
     through tool_evidence_on_verified_candidate with the `sibling_verdict` source, which skips the
-    `harness_unchanged` suppression but keeps `checked_rejection` and the reopening limit. A candidate
+    `harness_unchanged` suppression and keeps the reopening limit. A `checked` rejection is kept
+    against a `needs_validation` sibling and re-verified against a `confirmed` one (a reproduced
+    crash and a cited refutation at one sink cannot both hold; QCBOR run-6, EncodeHead). A candidate
     already reopened by a sibling verdict is not reopened again (`already_reverified`), so a second
     rejection leaves the pair flagged for the report. Nothing picks a side.
     """
@@ -3065,6 +3072,7 @@ def _reconcile_sink_conflicts(
                 tool_output=tool_output,
                 linked=[],
                 already_listed=False,
+                override_checked=findings[pos].get("verdict") == "confirmed",
             )
             if entry["outcome"] == "contradicted":
                 entry["reason"] = next(
