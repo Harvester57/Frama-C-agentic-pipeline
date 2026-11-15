@@ -308,12 +308,18 @@ def _is_synthetic_probe_file(c_file: Path, scratch_dir: Path | None) -> bool:
     return not rel.parts or rel.parts[0] != "work"
 
 
+# soundness.reduced_checks of a run with --waive-signed-downcast. workspace_overlay replays the flag for
+# a reduced check containing `-warn-signed-downcast OFF`, and the ledger records it as an assumption.
+SIGNED_DOWNCAST_WAIVED = "-warn-signed-downcast OFF on declared wrap lines"
+
+
 def scan_wp_log_soundness(
     log_text: str,
     check_memory_model: bool = True,
     unsigned_reduced: bool = False,
     warn_invalid_pointer: bool = True,
     warn_unsigned_downcast: bool = True,
+    warn_signed_downcast: bool = True,
 ) -> dict:
     """
     Scan Frama-C WP log output for Tier-A aborts, Tier-B silent unsoundness,
@@ -359,6 +365,8 @@ def scan_wp_log_soundness(
         reduced_checks.append("-no-warn-unsigned-downcast")
     if not warn_invalid_pointer:
         reduced_checks.append("-warn-invalid-pointer OFF")
+    if not warn_signed_downcast:
+        reduced_checks.append(SIGNED_DOWNCAST_WAIVED)
 
     tier_b_unsound = sorted(tier_b_unsound_set)
     return {
@@ -1238,6 +1246,7 @@ def run_wp_on_function(
     retry_cast_probe: bool = True,
     security_meta: dict | None = None,
     retry_bytes: bool = False,
+    warn_signed_downcast: bool = True,
 ) -> dict:
     call_args: dict[str, Any] = dict(locals())  # first statement: exactly this call's arguments
     if counter_examples and not artifact_suffix.endswith(_MODEL_PASS_SUFFIX):
@@ -1471,11 +1480,14 @@ def run_wp_on_function(
         "-kernel-warn-key",
         "annot-error=abort",
         "-warn-signed-overflow",
-        "-warn-signed-downcast",
         "-warn-left-shift-negative",
         "-warn-right-shift-negative",
         "-warn-pointer-downcast",
     ]
+    if warn_signed_downcast:
+        # Off only with --waive-signed-downcast, whose check pass (check_declared_wraps) limits it to the
+        # declared wrap lines.
+        cmd.insert(cmd.index("-warn-signed-overflow") + 1, "-warn-signed-downcast")
     if warn_invalid_pointer:
         cmd.append("-warn-invalid-pointer")
     if not unsigned_reduced:
@@ -1584,6 +1596,7 @@ def run_wp_on_function(
                 unsigned_reduced=unsigned_reduced,
                 warn_invalid_pointer=warn_invalid_pointer,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
             ),
             combined_log,
         )
@@ -1617,6 +1630,7 @@ def run_wp_on_function(
         unsigned_reduced=unsigned_reduced,
         warn_invalid_pointer=warn_invalid_pointer,
         warn_unsigned_downcast=warn_unsigned_downcast,
+        warn_signed_downcast=warn_signed_downcast,
     )
     macro_loop_lines = _find_macro_loop_lines(c_file, fn_name)
     if macro_loop_lines and soundness.get("tier_b_unsound"):
@@ -1779,6 +1793,7 @@ def run_wp_on_function(
                 warn_invalid_pointer=warn_invalid_pointer,
                 unsigned_reduced=unsigned_reduced,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
                 retry_bitwise=False,
                 retry_tail=False,
                 retry_cast_probe=False,
@@ -1858,6 +1873,7 @@ def run_wp_on_function(
                         warn_invalid_pointer=warn_invalid_pointer,
                         unsigned_reduced=unsigned_reduced,
                         warn_unsigned_downcast=warn_unsigned_downcast,
+                        warn_signed_downcast=warn_signed_downcast,
                         retry_bitwise=False,
                         retry_tail=False,
                         retry_cast_probe=False,
@@ -2028,6 +2044,7 @@ def run_wp_on_function(
                 warn_invalid_pointer=warn_invalid_pointer,
                 unsigned_reduced=unsigned_reduced,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
                 retry_bitwise=False,
                 retry_tail=False,
                 retry_cast_probe=False,
@@ -2080,6 +2097,7 @@ def run_wp_on_function(
                 warn_invalid_pointer=warn_invalid_pointer,
                 unsigned_reduced=unsigned_reduced,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
                 retry_bitwise=False,
                 retry_tail=False,
                 retry_cast_probe=False,
@@ -2312,6 +2330,22 @@ def _line_list(raw: str) -> list[int]:
     return values
 
 
+# The RTE properties a declared wrap line may leave unproved, in the order the check names them; the
+# second only with --waive-signed-downcast. Also the -wp-prop names of the check pass.
+WAIVABLE_WRAP_PROPERTIES = ("unsigned_overflow", "signed_downcast")
+_SIGNED_DOWNCAST_KIND_RE = re.compile(r"(?<![a-z])signed_downcast")
+
+
+def _wrap_property(goal: dict) -> str | None:
+    """The waivable property a goal checks (by its report kind), or None."""
+    kind = str(goal.get("kind") or "").lower()
+    if "unsigned_overflow" in kind:
+        return "unsigned_overflow"
+    if _SIGNED_DOWNCAST_KIND_RE.search(kind):
+        return "signed_downcast"
+    return None
+
+
 def check_declared_wraps(
     res: dict,
     c_file: Path,
@@ -2319,13 +2353,16 @@ def check_declared_wraps(
     out_dir: Path,
     wrap_lines: list[int] | None = None,
     wrap_code_lines: list[int] | None = None,
+    waive_signed_downcast: bool = False,
     **wp_options,
 ) -> dict:
     """
     `--no-warn-unsigned` turns the unsigned overflow checks off for a whole function, so that a run proves
     nothing about them. This second run, with them on, limits the opt-out to the lines a prover declared
     as deliberate wraps: an `unsigned_overflow` goal elsewhere that is not fully proved leaves the
-    function unproven.
+    function unproven. `--waive-signed-downcast` adds `signed_downcast` (the proof run left
+    `-warn-signed-downcast` off): an implementation-defined narrowing of a deliberate wrap, such as
+    `(int)(u64 - BIAS)`, is waived on a declared line and fails anywhere else, the same way.
 
     The proof stays the run with the checks off. Goals cannot be waived inside this one, because WP takes
     each RTE assertion as a hypothesis for what follows, so a false wrap assertion would support later
@@ -2347,15 +2384,17 @@ def check_declared_wraps(
         else:
             unknown_lines.append(line)
 
+    waived = WAIVABLE_WRAP_PROPERTIES if waive_signed_downcast else WAIVABLE_WRAP_PROPERTIES[:1]
     check = run_wp_on_function(
         c_file,
         fn_name,
         out_dir,
         unsigned_reduced=False,
         warn_unsigned_downcast=False,
+        warn_signed_downcast=True,
         retry_bitwise=False,
         retry_tail=False,
-        prop="unsigned_overflow",
+        prop=",".join(waived),
         artifact_suffix="_wrapcheck",
         ignore_prover_budget=True,
         **wp_options,
@@ -2377,7 +2416,8 @@ def check_declared_wraps(
         *(check.get("partially_proven_goals") or []),
     ]
     for goal in not_fully_proved:
-        if "unsigned_overflow" not in str(goal.get("kind") or "").lower():
+        prop_kind = _wrap_property(goal)
+        if prop_kind not in waived:
             continue
         try:
             line = int(goal.get("line"))
@@ -2386,10 +2426,21 @@ def check_declared_wraps(
         same_file = Path(str(goal.get("file") or "")).name == Path(c_file).name
         position = code_lines.index(line) if same_file and line in code_lines else None
         if position in declared:
-            entry = used.setdefault(position, {"line": line, "code_line": position, "annotations": []})
+            entry = used.setdefault(
+                position, {"line": line, "code_line": position, "annotations": [], "properties": []}
+            )
             entry["annotations"].append(goal.get("annotation"))
+            if prop_kind not in entry["properties"]:
+                entry["properties"].append(prop_kind)
         else:
-            undeclared.append({**goal, "diagnostic_bucket": "step_c_rte_obligation", "undeclared_unsigned_wrap": True})
+            undeclared.append(
+                {
+                    **goal,
+                    "diagnostic_bucket": "step_c_rte_obligation",
+                    "undeclared_unsigned_wrap": True,
+                    "waivable_property": prop_kind,
+                }
+            )
 
     declared_entries = [used[position] for position in sorted(used)]
     res["unsigned_wraps"] = {
@@ -2405,8 +2456,9 @@ def check_declared_wraps(
     }
     if declared_entries:
         lines = ", ".join(f"L{entry['line']}" for entry in declared_entries)
+        kinds = [p for p in waived if any(p in entry["properties"] for entry in declared_entries)]
         res.setdefault("soundness", {}).setdefault("reduced_checks", []).append(
-            f"unsigned overflow left unproved on declared deliberate wraps at {lines}"
+            f"{' and '.join(k.replace('_', ' ') for k in kinds)} left unproved on declared deliberate wraps at {lines}"
         )
     if undeclared:
         res.setdefault("unproven_goals", []).extend(undeclared)
@@ -2421,8 +2473,9 @@ def check_declared_wraps(
         if res.get("next_synthesis_focus") == "complete":
             res["next_synthesis_focus"] = "step_c_rte_obligation"
         lines = ", ".join(sorted({str(goal.get("line")) for goal in undeclared}))
+        kinds_text = "/".join(sorted({str(goal["waivable_property"]) for goal in undeclared}))
         res.setdefault("diagnostic_hints", []).append(
-            f"With the unsigned checks on, unsigned_overflow goals are not fully proved on line(s) {lines}, which "
+            f"With the checks on, {kinds_text} goals are not fully proved on line(s) {lines}, which "
             "--wrap-lines does not declare. Prove them, or declare a line in --wrap-lines only if its wrap is "
             "deliberate. A 'Partially proven' goal below a declared wrap may rest on that wrap's false assertion."
         )
@@ -2540,6 +2593,13 @@ def main(argv: list[str] | None = None) -> int:
         "(what parent re-checks pass, from the prover's report)",
     )
     parser.add_argument(
+        "--waive-signed-downcast",
+        action="store_true",
+        help="With --no-warn-unsigned and declared wrap lines: prove with -warn-signed-downcast off too; the "
+        "check run (checks on) then fails the function on any signed_downcast goal not fully proved outside "
+        "the declared lines (an implementation-defined narrowing of a deliberate wrap)",
+    )
+    parser.add_argument(
         "--no-warn-unsigned-downcast",
         action="store_true",
         help="Disable -warn-unsigned-downcast only (C11 modulo narrowing; keeps -warn-unsigned-overflow enabled)",
@@ -2610,6 +2670,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--wp-par must be 'auto' or a positive integer (got {args.wp_par!r})")
     if (args.wrap_lines or args.wrap_code_lines) and not args.no_warn_unsigned:
         parser.error("--wrap-lines and --wrap-code-lines only apply with --no-warn-unsigned")
+    if args.waive_signed_downcast and not (args.no_warn_unsigned and (args.wrap_lines or args.wrap_code_lines)):
+        parser.error("--waive-signed-downcast only applies with --no-warn-unsigned and --wrap-lines / --wrap-code-lines")
 
     # --prop and --dump-goal are partial runs: they say nothing about the candidate as a whole.
     whole_run = not (args.prop or args.dump_goal)
@@ -2633,6 +2695,7 @@ def main(argv: list[str] | None = None) -> int:
         "warn_invalid_pointer": not args.no_warn_invalid_pointer,
         "unsigned_reduced": args.no_warn_unsigned,
         "warn_unsigned_downcast": not args.no_warn_unsigned_downcast,
+        "warn_signed_downcast": not args.waive_signed_downcast,
         "retry_bitwise": not args.no_retry_bitwise,
         "retry_tail": not args.no_retry_tail,
         "smoke_tests": args.smoke_tests,
@@ -2659,6 +2722,7 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir,
             wrap_lines=args.wrap_lines,
             wrap_code_lines=args.wrap_code_lines,
+            waive_signed_downcast=args.waive_signed_downcast,
             machdep=args.machdep,
             cppflags=args.cppflags,
             provers=args.provers,

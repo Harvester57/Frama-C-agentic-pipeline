@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -87,6 +88,7 @@ def test_the_check_is_a_second_run_with_overflow_checks_on_and_no_retries(monkey
     options = calls[0]
     assert options["unsigned_reduced"] is False
     assert options["warn_unsigned_downcast"] is False, "aligned with the parent's default re-check"
+    assert options["warn_signed_downcast"] is True
     assert options["prop"] == "unsigned_overflow"
     assert options["retry_bitwise"] is False and options["retry_tail"] is False
     assert options["ignore_prover_budget"] is True, "one prover iteration, not two"
@@ -98,7 +100,7 @@ def test_declared_lines_are_recorded_and_the_proof_stands(monkeypatch, source) -
     assert res["status"] == "all_proven" and res["unproven_count"] == 0
     wraps = res["unsigned_wraps"]
     assert wraps["status"] == "ok" and wraps["undeclared"] == []
-    assert wraps["declared"] == [{"line": 2, "code_line": 1, "annotations": ["p2"]}]
+    assert wraps["declared"] == [{"line": 2, "code_line": 1, "annotations": ["p2"], "properties": ["unsigned_overflow"]}]
     assert wraps["declared_code_lines"] == [1]
     assert any("declared deliberate wraps at L2" in item for item in res["soundness"]["reduced_checks"])
     assert any("OFF" in item for item in res["soundness"]["reduced_checks"]), "the parent still infers the flag"
@@ -152,7 +154,9 @@ def test_declared_positions_survive_acsl_merges(monkeypatch, source) -> None:
     # while the line below, which was never declared, still fails.
     again, _ = _check(monkeypatch, source, unproven=[_goal(4)], wrap_code_lines=positions)
     assert again["status"] == "all_proven"
-    assert again["unsigned_wraps"]["declared"] == [{"line": 4, "code_line": 1, "annotations": ["p4"]}]
+    assert again["unsigned_wraps"]["declared"] == [
+        {"line": 4, "code_line": 1, "annotations": ["p4"], "properties": ["unsigned_overflow"]}
+    ]
     other, _ = _check(monkeypatch, source, unproven=[_goal(6)], wrap_code_lines=positions)
     assert other["status"] == "unproven_goals_remain"
 
@@ -183,6 +187,80 @@ def test_a_failed_check_proves_nothing(monkeypatch, source) -> None:
 def test_no_check_when_the_proof_run_decided_nothing(monkeypatch, source, proof) -> None:
     res, calls = _check(monkeypatch, source, proof=copy.deepcopy(proof))
     assert calls == [] and "unsigned_wraps" not in res
+
+
+# ---------------------------------------------------------------------------
+# --waive-signed-downcast: an implementation-defined narrowing on a declared line
+# (QCBOR run-6, IEEE754_SingleToDouble, src/ieee754.c:282)
+# ---------------------------------------------------------------------------
+
+SIGNED_DOWNCAST_WAIVER = "-warn-signed-downcast OFF on declared wrap lines"
+
+
+def test_the_waiver_check_also_runs_the_signed_downcast_goals(monkeypatch, source) -> None:
+    _, calls = _check(monkeypatch, source, waive_signed_downcast=True, wrap_lines=[2])
+    (options,) = calls
+    assert options["prop"] == "unsigned_overflow,signed_downcast"
+    assert options["warn_signed_downcast"] is True, "the check pass runs with the checks on"
+
+
+def test_a_signed_downcast_on_a_declared_line_is_waived(monkeypatch, source) -> None:
+    unproven = [_goal(2), _goal(2, kind="signed_downcast")]
+    res, _ = _check(monkeypatch, source, unproven=unproven, waive_signed_downcast=True, wrap_lines=[2])
+    assert res["status"] == "all_proven" and res["unproven_count"] == 0
+    (entry,) = res["unsigned_wraps"]["declared"]
+    assert entry["line"] == 2 and entry["properties"] == ["unsigned_overflow", "signed_downcast"]
+    assert any(
+        "signed downcast" in item and "declared deliberate wraps at L2" in item
+        for item in res["soundness"]["reduced_checks"]
+    )
+
+
+def test_a_signed_downcast_on_an_undeclared_line_still_fails(monkeypatch, source) -> None:
+    unproven = [_goal(2, kind="signed_downcast"), _goal(3, kind="signed_downcast")]
+    res, _ = _check(monkeypatch, source, unproven=unproven, waive_signed_downcast=True, wrap_lines=[2])
+    assert res["status"] == "unproven_goals_remain" and res["unproven_count"] == 1
+    assert [g["line"] for g in res["unproven_goals"]] == [3]
+    assert res["unsigned_wraps"]["undeclared"][0]["line"] == 3
+    assert any("signed_downcast" in hint and "line(s) 3" in hint for hint in res["diagnostic_hints"])
+
+
+def test_without_the_waiver_signed_downcasts_are_left_to_the_proof_run(monkeypatch, source) -> None:
+    # Unsigned downcasts are never confused with signed ones either.
+    unproven = [_goal(2, kind="signed_downcast"), _goal(3, kind="unsigned_downcast")]
+    res, calls = _check(monkeypatch, source, unproven=unproven, wrap_lines=[2])
+    assert calls[0]["prop"] == "unsigned_overflow"
+    assert res["status"] == "all_proven" and res["unsigned_wraps"]["declared"] == []
+    res, _ = _check(monkeypatch, source, unproven=unproven[1:], waive_signed_downcast=True, wrap_lines=[2])
+    assert res["status"] == "all_proven"
+
+
+class _RecordingFramaC:
+    """Answers every WP run with one valid goal and records the command."""
+
+    def __init__(self) -> None:
+        self.cmds: list[list[str]] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.cmds.append(list(cmd))
+        csv = Path(cmd[cmd.index("-report-csv") + 1])
+        csv.write_text(
+            "directory\tfile\tfunction\tline\tkind\tstatus\tproperty\n.\tm.c\tf\t2\trte: mem_access\tValid\tx\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="[wp] Proved goals:    1 / 1\n", stderr="")
+
+
+@pytest.mark.parametrize("warn", [True, False])
+def test_the_proof_run_omits_the_signed_downcast_check_only_when_waived(monkeypatch, source, warn) -> None:
+    fake = _RecordingFramaC()
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    res = W.run_wp_on_function(
+        source, "f", source.parent / "wp", cache_dir="off", retry_bitwise=False, warn_signed_downcast=warn
+    )
+    (cmd,) = fake.cmds
+    assert ("-warn-signed-downcast" in cmd) is warn
+    assert (SIGNED_DOWNCAST_WAIVER in res["soundness"]["reduced_checks"]) is (not warn)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +307,30 @@ def test_main_rejects_declarations_without_the_opt_out(monkeypatch, tmp_path: Pa
     with pytest.raises(SystemExit):
         _main(monkeypatch, tmp_path, "--wrap-lines", "2")
     assert "only apply with --no-warn-unsigned" in capsys.readouterr().err
+
+
+def test_main_waives_signed_downcasts_on_declared_lines(monkeypatch, tmp_path: Path) -> None:
+    rc, report, runs = _main(
+        monkeypatch, tmp_path, "--no-warn-unsigned", "--wrap-lines", "2", "--waive-signed-downcast"
+    )
+    assert rc == 0 and len(runs) == 2
+    assert runs[0]["warn_signed_downcast"] is False, "the proof run omits -warn-signed-downcast"
+    assert runs[1]["prop"] == "unsigned_overflow,signed_downcast" and runs[1]["warn_signed_downcast"] is True
+    assert report["status"] == "all_proven"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--waive-signed-downcast",),
+        ("--waive-signed-downcast", "--no-warn-unsigned"),
+        ("--waive-signed-downcast", "--wrap-lines", "2"),
+    ],
+)
+def test_main_rejects_the_waiver_without_the_opt_out_and_declared_lines(monkeypatch, tmp_path: Path, capsys, extra) -> None:
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, tmp_path, *extra)
+    assert "--waive-signed-downcast" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
