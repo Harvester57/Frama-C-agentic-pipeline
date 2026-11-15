@@ -83,7 +83,7 @@ from framac_common import (  # noqa: E402
     scratch_first_cppflags,
     source_tree_relpath,
     utc_now,
-    wp_model_unsound,
+    wp_model_problem,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 from resources import (  # noqa: E402
@@ -991,15 +991,65 @@ def infer_prover_wp_flags(
     Infer the WP RTE check and memory-model CLI flags used by the prover for `function`
     so parent merge re-checks, contract re-checks, and final WP sweeps run with matching
     reduced-check assumptions (which `ledger.py` records explicitly on covered units) and
-    WP model. Defaults to `['--no-warn-unsigned-downcast']`.
+    WP model. Defaults to `['--no-warn-unsigned-downcast']`. A memory model that
+    `framac_common.wp_model_problem` rejects (`cast`, `Hoare`, `Region`, `nat`, ...) is never
+    replayed; `prover_wp_model_problem` refuses the merge of a prover that used one.
+    """
+    reduced, wp_model, _own, wrap_code_lines = _prover_wp_config(run_dir, overlay_dir, agent_id, c_file, function)
+    flags: list[str] = []
+    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
+        flags.append("--no-warn-unsigned")
+        if wrap_code_lines:
+            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
+    else:
+        flags.append("--no-warn-unsigned-downcast")
+    if any("-warn-invalid-pointer OFF" in r for r in reduced):
+        flags.append("--no-warn-invalid-pointer")
+    # Replay only an accepted model; never the unsound `cast` option or a model that is not evidence.
+    if (
+        wp_model
+        and wp_model != "Typed"
+        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
+        and wp_model_problem(wp_model) is None
+    ):
+        flags.extend(["--wp-model", wp_model])
+    return flags
+
+
+def prover_wp_model_problem(
+    run_dir: Path,
+    overlay_dir: Path | None = None,
+    agent_id: str | None = None,
+    c_file: str | None = None,
+    function: str | None = None,
+) -> str | None:
+    """
+    Why the memory model of the prover's own WP report (the one `infer_prover_wp_flags` replays,
+    read from the agent's scratch, artifacts or result evidence) is not evidence, or None. The
+    parent re-check cannot replay such a model, so the prover's proof is not the one re-checked.
+    """
+    _reduced, wp_model, own, _lines = _prover_wp_config(run_dir, overlay_dir, agent_id, c_file, function)
+    return wp_model_problem(wp_model) if own and wp_model else None
+
+
+def _prover_wp_config(
+    run_dir: Path,
+    overlay_dir: Path | None,
+    agent_id: str | None,
+    c_file: str | None,
+    function: str | None,
+) -> tuple[list[str], str | None, bool, list[int]]:
+    """
+    (reduced checks, WP model, whether the model comes from the prover's own report, declared
+    wrap lines) of the report the prover's proof is replayed from.
     """
     overlay = (overlay_dir or (run_dir / "workspace")).resolve()
     norm_c = _normalize_work_relpath(c_file) if c_file else None
-    cand_paths: list[Path] = []
+    cand_paths: list[tuple[Path, bool]] = []  # (report, the prover's own)
     if agent_id and function and is_safe_agent_id(agent_id):
         agent_dir = run_dir / "agents" / agent_id
-        cand_paths.append(agent_dir / "scratch" / f"wp_{function}.json")
-        cand_paths.append(agent_dir / "artifacts" / f"wp_{function}.json")
+        cand_paths.append((agent_dir / "scratch" / f"wp_{function}.json", True))
+        cand_paths.append((agent_dir / "artifacts" / f"wp_{function}.json", True))
         res_file = agent_dir / "scratch" / "result.json"
         if res_file.is_file():
             res_data = load_json_optional(res_file, {}) or {}
@@ -1007,13 +1057,14 @@ def infer_prover_wp_flags(
                 for ev in res_data.get("evidence") or []:
                     tout = str((ev or {}).get("tool_output") or "").replace("\\", "/").strip()
                     if tout.startswith(f"agents/{agent_id}/") and tout.endswith(".json"):
-                        cand_paths.append(run_dir / tout)
-        cand_paths.append(agent_dir / "scratch" / "parent_wp" / f"{function}.json")
+                        cand_paths.append((run_dir / tout, True))
+        cand_paths.append((agent_dir / "scratch" / "parent_wp" / f"{function}.json", False))
     if function:
-        cand_paths.append(overlay / "reports" / "wp" / f"{function}.json")
+        cand_paths.append((overlay / "reports" / "wp" / f"{function}.json", False))
 
     reduced: list[str] = []
     wp_model: str | None = None
+    model_own = False
     wrap_code_lines: list[int] = []
 
     def _note_wraps(report: dict) -> None:
@@ -1021,7 +1072,7 @@ def infer_prover_wp_flags(
         if isinstance(declared, list) and not wrap_code_lines:
             wrap_code_lines.extend(n for n in declared if isinstance(n, int) and not isinstance(n, bool))
 
-    for p in cand_paths:
+    for p, own in cand_paths:
         if not p.is_file() or p.is_symlink():
             continue
         rep = load_json_optional(p, {}) or {}
@@ -1041,6 +1092,7 @@ def infer_prover_wp_flags(
         )
         if isinstance(m, str) and m.strip() and wp_model is None:
             wp_model = m.strip()
+            model_own = own
         _note_wraps(rep)
         if reduced or wp_model:
             break
@@ -1079,25 +1131,7 @@ def infer_prover_wp_flags(
                                 )
                                 if isinstance(m, str) and m.strip() and wp_model is None:
                                     wp_model = m.strip()
-
-    flags: list[str] = []
-    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
-        flags.append("--no-warn-unsigned")
-        if wrap_code_lines:
-            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
-    else:
-        flags.append("--no-warn-unsigned-downcast")
-    if any("-warn-invalid-pointer OFF" in r for r in reduced):
-        flags.append("--no-warn-invalid-pointer")
-    # Never carry the unsound `cast` model into a parent re-check or the sweep.
-    if (
-        wp_model
-        and wp_model != "Typed"
-        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
-        and not wp_model_unsound(wp_model)
-    ):
-        flags.extend(["--wp-model", wp_model])
-    return flags
+    return reduced, wp_model, model_own, wrap_code_lines
 
 
 def _collect_existing_header_declarations(work_dir: Path, exclude_rels: set[str]) -> set[str]:
@@ -1167,6 +1201,15 @@ def _run_parent_reverify(
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
     guard_report: dict | None = None
+
+    if role == "prover" and c_file and function:
+        # A proof under a memory model that is not evidence is never replayed, so the parent check
+        # would re-prove under another model than the prover's: refuse it outright.
+        model_problem = prover_wp_model_problem(
+            run_dir, overlay_dir=overlay_dir, agent_id=agent_id, c_file=_normalize_work_relpath(c_file), function=function
+        )
+        if model_problem:
+            return False, f"prover's WP report used a memory model that is not accepted: {model_problem}"
 
     if module and sources:
         # A link unit is built through one of its harnesses (the one answering for `function`).
