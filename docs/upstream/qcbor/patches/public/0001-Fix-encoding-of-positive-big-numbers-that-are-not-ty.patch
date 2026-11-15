@@ -1,7 +1,7 @@
-From bb4420805efa413f0557490cc2d158af002a837c Mon Sep 17 00:00:00 2001
+From 5718c21a1013a946e0588412827f5560876a3b51 Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:20:26 +0100
-Subject: [PATCH 1/7] Fix encoding of positive big numbers that are not type 0
+Subject: [PATCH] Fix encoding of positive big numbers that are not type 0
  integers
 
 QCBOREncode_Private_AddTBigNumberMain() output a positive big number
@@ -52,7 +52,7 @@ index dc75a3c..ab233af 100644
     }
  }
 diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
-index 5daffca..f6876c4 100644
+index e9e5977..44984c1 100644
 --- a/test/qcbor_encode_tests.c
 +++ b/test/qcbor_encode_tests.c
 @@ -1118,6 +1118,27 @@ int32_t BigNumEncodeTests(void)

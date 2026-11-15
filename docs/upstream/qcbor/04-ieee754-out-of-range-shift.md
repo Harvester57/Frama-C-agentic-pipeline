@@ -1,8 +1,8 @@
 # Out-of-range shifts in `IEEE754_SingleToHalf()` and `IEEE754_DoubleToSingle()`
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
+Background analysis against `9bd0845`. Reported privately by email on 2026-11-04, then filed by a third party as laurencelundblade/QCBOR#434. The maintainer's fix for `dev` is laurencelundblade/QCBOR#438, checked clean against the reproducer on 2026-11-15. Do not file again.
 Patches:
-- `dev`: [`patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](./patches/public/0003-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch);
+- `dev`: none any more; the earlier `public/0003` was dropped in favour of #438;
 - 1.x: [`patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](./patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch), which also applies to v1.6.1.
 
 ## Summary

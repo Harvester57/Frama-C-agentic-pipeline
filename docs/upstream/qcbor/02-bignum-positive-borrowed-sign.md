@@ -1,6 +1,6 @@
 # A positive big number encoded with `QCBOR_ENCODE_AS_BORROWED` comes out negative
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
+Background analysis against `9bd0845`. Not filed yet. The texts to file, against `19c3367`, are [`02-bignum-positive-borrowed-sign-issue.md`](./02-bignum-positive-borrowed-sign-issue.md) and [`02-bignum-positive-borrowed-sign-pr.md`](./02-bignum-positive-borrowed-sign-pr.md).
 Patch: [`patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch`](./patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch).
 
 ## Summary

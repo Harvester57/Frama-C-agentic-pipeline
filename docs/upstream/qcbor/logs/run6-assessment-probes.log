@@ -1,0 +1,169 @@
+# probe.sh: consume_item / getiteminmap, MSan -O0/-O1, eager/lazy, both trees
+----- 9bd consume_item -O0 eager array1
+==20==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x555555620680 in main /new/consume_item.c:37:7
+    #1 0x7ffff7cbdca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)
+  Uninitialized value was stored to memory at
+    #0 0x55555564178a in QCBORDecode_Private_ConsumeItem /t/9bd/src/qcbor_main_decode.c:2089:21
+    #1 0x5555556451b0 in QCBORDecode_VGetNextConsume /t/9bd/src/qcbor_main_decode.c:2426:11
+  Uninitialized value was created by an allocation of 'Item' in the stack frame
+    #0 0x555555641136 in QCBORDecode_Private_ConsumeItem /t/9bd/src/qcbor_main_decode.c:2073:4
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /new/consume_item.c:37:7 in main
+----- 9bd getiteminmap -O0 eager latched
+==36==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5e2749f32b3b in QCBORDecode_Private_GetItemInMap /t/9bd/src/qcbor_spiffy_decode.c:516:11
+    #1 0x5e2749f33818 in QCBORDecode_GetItemInMapSZ /t/9bd/src/qcbor_spiffy_decode.c:592:4
+  Uninitialized value was stored to memory at
+    #0 0x5e2749f32b34 in QCBORDecode_Private_GetItemInMap /t/9bd/src/qcbor_spiffy_decode.c:516:67
+    #1 0x5e2749f33818 in QCBORDecode_GetItemInMapSZ /t/9bd/src/qcbor_spiffy_decode.c:592:4
+  Uninitialized value was created by an allocation of 'uOffset' in the stack frame
+    #0 0x5e2749f32892 in QCBORDecode_Private_GetItemInMap /t/9bd/src/qcbor_spiffy_decode.c:512:4
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /t/9bd/src/qcbor_spiffy_decode.c:516:11 in QCBORDecode_Private_GetItemInMap
+----- 9bd consume_item -O0 lazy array1
+==52==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5555556207fb in main /new/consume_item.c:37:7
+    #1 0x7ffff7cbdca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)
+  Uninitialized value was stored to memory at
+    #0 0x555555644e41 in QCBORDecode_Private_ConsumeItem /t/9bd/src/qcbor_main_decode.c:2089:21
+    #1 0x555555648e68 in QCBORDecode_VGetNextConsume /t/9bd/src/qcbor_main_decode.c:2426:11
+  Uninitialized value was created by an allocation of 'Item' in the stack frame
+    #0 0x555555644737 in QCBORDecode_Private_ConsumeItem /t/9bd/src/qcbor_main_decode.c:2073:4
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /new/consume_item.c:37:7 in main
+----- 9bd getiteminmap -O0 lazy latched
+after EnterMap error=67
+after GetItemInMapSZ error=67 type=0
+----- 9bd consume_item -O1 eager array1
+==83==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5854c3cf4050 in main /new/consume_item.c
+    #1 0x7b9a69757ca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)
+  Uninitialized value was stored to memory at
+    #0 0x5854c3cfa4a8 in QCBORDecode_Private_ConsumeItem /t/9bd/src/qcbor_main_decode.c
+    #1 0x5854c3cfa4a8 in QCBORDecode_VGetNextConsume /t/9bd/src/qcbor_main_decode.c:2426:11
+  Uninitialized value was created by an allocation of 'Item.i' in the stack frame
+    #0 0x5854c3cfa321 in QCBORDecode_Private_ConsumeItem /t/9bd/src/qcbor_main_decode.c:2073:4
+    #1 0x5854c3cfa321 in QCBORDecode_VGetNextConsume /t/9bd/src/qcbor_main_decode.c:2426:11
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /new/consume_item.c in main
+----- 9bd getiteminmap -O1 eager latched
+after EnterMap error=67
+after GetItemInMapSZ error=67 type=0
+----- 9bd consume_item -O1 lazy array1
+error=67 type=4
+uNextNestLevel 0
+----- 9bd getiteminmap -O1 lazy latched
+after EnterMap error=67
+after GetItemInMapSZ error=67 type=0
+----- dev consume_item -O0 eager array1
+==144==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5a7357432680 in main /new/consume_item.c:37:7
+    #1 0x7a4f7dee6ca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)
+  Uninitialized value was stored to memory at
+    #0 0x5a7357453f49 in QCBORDecode_Private_ConsumeItem /t/dev/src/qcbor_main_decode.c:2116:21
+    #1 0x5a7357457b70 in QCBORDecode_VGetNextConsume /t/dev/src/qcbor_main_decode.c:2453:11
+  Uninitialized value was created by an allocation of 'Item' in the stack frame
+    #0 0x5a73574538d6 in QCBORDecode_Private_ConsumeItem /t/dev/src/qcbor_main_decode.c:2090:4
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /new/consume_item.c:37:7 in main
+----- dev getiteminmap -O0 eager latched
+==160==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5c243e64950b in QCBORDecode_Private_GetItemInMap /t/dev/src/qcbor_spiffy_decode.c:517:11
+    #1 0x5c243e64a1e8 in QCBORDecode_GetItemInMapSZ /t/dev/src/qcbor_spiffy_decode.c:593:4
+  Uninitialized value was stored to memory at
+    #0 0x5c243e649504 in QCBORDecode_Private_GetItemInMap /t/dev/src/qcbor_spiffy_decode.c:517:67
+    #1 0x5c243e64a1e8 in QCBORDecode_GetItemInMapSZ /t/dev/src/qcbor_spiffy_decode.c:593:4
+  Uninitialized value was created by an allocation of 'uOffset' in the stack frame
+    #0 0x5c243e649262 in QCBORDecode_Private_GetItemInMap /t/dev/src/qcbor_spiffy_decode.c:513:4
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /t/dev/src/qcbor_spiffy_decode.c:517:11 in QCBORDecode_Private_GetItemInMap
+----- dev consume_item -O0 lazy array1
+==176==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5555556207fb in main /new/consume_item.c:37:7
+    #1 0x7ffff7cbdca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)
+  Uninitialized value was stored to memory at
+    #0 0x555555645638 in QCBORDecode_Private_ConsumeItem /t/dev/src/qcbor_main_decode.c:2116:21
+    #1 0x5555556498a8 in QCBORDecode_VGetNextConsume /t/dev/src/qcbor_main_decode.c:2453:11
+  Uninitialized value was created by an allocation of 'Item' in the stack frame
+    #0 0x555555644ed7 in QCBORDecode_Private_ConsumeItem /t/dev/src/qcbor_main_decode.c:2090:4
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /new/consume_item.c:37:7 in main
+----- dev getiteminmap -O0 lazy latched
+after EnterMap error=147
+after GetItemInMapSZ error=147 type=0
+----- dev consume_item -O1 eager array1
+==207==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5f9cd5b14050 in main /new/consume_item.c
+    #1 0x7da62fc0fca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)
+  Uninitialized value was stored to memory at
+    #0 0x5f9cd5b1a644 in QCBORDecode_Private_ConsumeItem /t/dev/src/qcbor_main_decode.c
+    #1 0x5f9cd5b1a644 in QCBORDecode_VGetNextConsume /t/dev/src/qcbor_main_decode.c:2453:11
+  Uninitialized value was created by an allocation of 'Item.i' in the stack frame
+    #0 0x5f9cd5b1a498 in QCBORDecode_Private_ConsumeItem /t/dev/src/qcbor_main_decode.c:2090:4
+    #1 0x5f9cd5b1a498 in QCBORDecode_VGetNextConsume /t/dev/src/qcbor_main_decode.c:2453:11
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /new/consume_item.c in main
+----- dev getiteminmap -O1 eager latched
+after EnterMap error=147
+after GetItemInMapSZ error=147 type=0
+----- dev consume_item -O1 lazy array1
+error=147 type=4
+uNextNestLevel 0
+----- dev getiteminmap -O1 lazy latched
+after EnterMap error=147
+after GetItemInMapSZ error=147 type=0
+
+# probe2.sh: consume_indef, MSan -O0, default and float-disabled builds, both trees
+----- 9bd 9f01f97e01ff
+error=92 type=4
+uNextNestLevel 0
+----- 9bd 9f01f97e00ff
+error=0 type=4
+uNextNestLevel 0
+----- 9bd 9f01fa7f800001ff
+error=92 type=4
+uNextNestLevel 0
+----- 9bd 9f019f01ffff
+error=0 type=4
+uNextNestLevel 0
+----- 9bd -DUSEFULBUF_DISABLE_ALL_FLOAT 9f01f93c00ff
+error=77 type=4
+uNextNestLevel 0
+----- 9bd -DUSEFULBUF_DISABLE_ALL_FLOAT 9f01fa3f800000ff
+error=77 type=4
+uNextNestLevel 0
+----- 9bd -DUSEFULBUF_DISABLE_ALL_FLOAT 9f01fb3ff0000000000000ff
+error=77 type=4
+uNextNestLevel 0
+----- 9bd -DQCBOR_DISABLE_PREFERRED_FLOAT 9f01f93c00ff
+error=74 type=4
+uNextNestLevel 0
+----- 9bd -DQCBOR_DISABLE_PREFERRED_FLOAT 9f01fa3f800000ff
+error=0 type=4
+uNextNestLevel 0
+----- 9bd -DQCBOR_DISABLE_PREFERRED_FLOAT 9f01fb3ff0000000000000ff
+error=0 type=4
+uNextNestLevel 0
+----- dev 9f01f97e01ff
+error=172 type=4
+uNextNestLevel 0
+----- dev 9f01f97e00ff
+error=0 type=4
+uNextNestLevel 0
+----- dev 9f01fa7f800001ff
+error=172 type=4
+uNextNestLevel 0
+----- dev 9f019f01ffff
+error=0 type=4
+uNextNestLevel 0
+----- dev -DUSEFULBUF_DISABLE_ALL_FLOAT 9f01f93c00ff
+error=157 type=4
+uNextNestLevel 0
+----- dev -DUSEFULBUF_DISABLE_ALL_FLOAT 9f01fa3f800000ff
+error=157 type=4
+uNextNestLevel 0
+----- dev -DUSEFULBUF_DISABLE_ALL_FLOAT 9f01fb3ff0000000000000ff
+error=157 type=4
+uNextNestLevel 0
+----- dev -DQCBOR_DISABLE_PREFERRED_FLOAT 9f01f93c00ff
+error=154 type=4
+uNextNestLevel 0
+----- dev -DQCBOR_DISABLE_PREFERRED_FLOAT 9f01fa3f800000ff
+error=0 type=4
+uNextNestLevel 0
+----- dev -DQCBOR_DISABLE_PREFERRED_FLOAT 9f01fb3ff0000000000000ff
+error=0 type=4
+uNextNestLevel 0

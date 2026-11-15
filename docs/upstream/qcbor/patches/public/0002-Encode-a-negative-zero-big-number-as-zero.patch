@@ -1,32 +1,30 @@
-From 8cfca88d216f21ac0094f28a726487c91e25689b Mon Sep 17 00:00:00 2001
+From af75cd1c62a8c94583975ecb92040de9899faef7 Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:20:54 +0100
-Subject: [PATCH 2/7] Encode a negative zero big number as zero
+Subject: [PATCH] Encode a negative zero big number as zero
 
 QCBOREncode_AddTBigNumber() and QCBOREncode_AddTBigNumberNoPreferred()
-with bNegative true and a big number of value zero (empty or all
-zero bytes) applied the offset of one to zero and produced three
-different wrong values:
+with bNegative true and a big number of value zero (empty or all zero
+bytes) applied CBOR's offset of one to zero. For an empty big number:
 
-  AddTBigNumber(-, 00)           3b ff ff ff ff ff ff ff ff  (-2^64)
-  AddTBigNumber(-, empty)        3b ff ff ff ff ff ff ff ff  (-2^64)
-  AddTBigNumberNoPreferred(-, 00)    c3 41 ff                (-256)
-  AddTBigNumberNoPreferred(-, empty) c3 40                   (-1)
+  AddTBigNumber(-, empty)            3b ff ff ff ff ff ff ff ff  (-2^64)
+  AddTBigNumberNoPreferred(-, empty) c3 40                       (-1)
 
 No error was set. The test cases named "error for no negative 0" did
 not test the negative side.
 
-Treat a zero big number as non-negative, so it encodes as 0, and test
-the negative side of the zero cases.
+Zero has no sign, so treat a zero big number as non-negative and
+encode it as 0. Test the negative side of the zero cases, and add an
+empty big number case.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/qcbor_number_encode.c | 18 ++++++++++++++----
+ src/qcbor_number_encode.c | 15 +++++++++++----
  test/qcbor_encode_tests.c | 20 ++++++++++++++------
- 2 files changed, 28 insertions(+), 10 deletions(-)
+ 2 files changed, 25 insertions(+), 10 deletions(-)
 
 diff --git a/src/qcbor_number_encode.c b/src/qcbor_number_encode.c
-index ab233af..afa576b 100644
+index dc75a3c..501273d 100644
 --- a/src/qcbor_number_encode.c
 +++ b/src/qcbor_number_encode.c
 @@ -366,6 +366,7 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
@@ -37,18 +35,15 @@ index ab233af..afa576b 100644
      UsefulBufC  BigNumberNLZ;
     enum QCBORPrivateMajorType uMajorType;
  
-@@ -378,10 +379,19 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
+@@ -378,10 +379,16 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
  
     BigNumberNLZ = QCBOREncode_Private_SkipLeadingZeros(BigNumber);
  
 +   /* Zero has no sign. A "negative zero" would otherwise go through
-+    * the offset of one below and come out as -1, -256 or -2^64
-+    * depending on its length and on preferred serialization. Leading
-+    * zeros are gone, so the number is zero if it is empty or starts
-+    * with a zero byte. */
-+   bIsNegative = bNegative &&
-+                 BigNumberNLZ.len > 0 &&
-+                 UsefulBufC_NTH_BYTE(BigNumberNLZ, 0) != 0x00;
++    * the offset of one below and come out as a negative number such
++    * as -1 or -2^64. The number is zero if it is empty or all zero
++    * bytes. */
++   bIsNegative = bNegative && UsefulBuf_SkipLeading(BigNumber, 0x00).len > 0;
 +
     static const uint8_t twoExp64[] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     bIs2exp64 = ! UsefulBuf_Compare(BigNumberNLZ, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(twoExp64));
@@ -58,7 +53,7 @@ index ab233af..afa576b 100644
        if(bIs2exp64) {
           /* 2^64 is a 9 byte big number. Since negative numbers are offset
            * by one in CBOR, it can be encoded as a type 1 negative. The
-@@ -391,14 +401,14 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
+@@ -391,14 +398,14 @@ QCBOREncode_Private_AddTBigNumberMain(QCBOREncodeContext *pMe,
           uInt = UINT64_MAX;
        } else {
           uInt = QCBOREncode_Private_BigNumberToUInt(BigNumberNLZ);
@@ -75,9 +70,9 @@ index ab233af..afa576b 100644
 +      if(bIsNegative) {
           QCBOREncode_Private_AddTNegativeBigNumber(pMe, uTagRequirement, BigNumberNLZ);
        } else {
-          /* Not QCBOREncode_AddTBigNumberRaw(): its usage guard for
+          QCBOREncode_AddTBigNumberRaw(pMe, false, uTagRequirement,BigNumberNLZ);
 diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
-index f6876c4..9df3caf 100644
+index e9e5977..61e81b7 100644
 --- a/test/qcbor_encode_tests.c
 +++ b/test/qcbor_encode_tests.c
 @@ -1029,20 +1029,28 @@ struct BigNumEncodeTest BigNumEncodeTestCases[] = {

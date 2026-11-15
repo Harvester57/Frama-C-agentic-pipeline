@@ -1,6 +1,6 @@
 # `GetTEpochDate()` / `GetTEpochDays()` overwrite the caller's output with an indeterminate value on error
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
+Background analysis against `9bd0845`. Not filed yet. The texts to file, against `19c3367`, are [`06-epoch-date-output-on-error-issue.md`](./06-epoch-date-output-on-error-issue.md) and [`06-epoch-date-output-on-error-pr.md`](./06-epoch-date-output-on-error-pr.md).
 Patch: [`patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch`](./patches/public/0005-Don-t-write-an-indeterminate-epoch-date-or-days-on-d.patch).
 
 ## Summary

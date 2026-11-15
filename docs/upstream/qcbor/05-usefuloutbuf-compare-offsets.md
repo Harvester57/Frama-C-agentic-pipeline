@@ -1,6 +1,6 @@
 # `UsefulOutBuf_Compare()` reads outside the buffer for large offsets, despite its documentation
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
+Background analysis against `9bd0845`. Not filed yet. The texts to file, against `19c3367`, are [`05-usefuloutbuf-compare-offsets-issue.md`](./05-usefuloutbuf-compare-offsets-issue.md) and [`05-usefuloutbuf-compare-offsets-pr.md`](./05-usefuloutbuf-compare-offsets-pr.md).
 Patch: [`patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch`](./patches/public/0004-Make-UsefulOutBuf_Compare-safe-for-any-offset-and-le.patch).
 
 ## Summary

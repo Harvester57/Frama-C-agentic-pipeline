@@ -1,7 +1,7 @@
-From 18da27c0515da7bf7387535dc6152cf2c3f85efd Mon Sep 17 00:00:00 2001
+From b55479c940dcf8ea48866dd7ec85b524da34dfea Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:23:23 +0100
-Subject: [PATCH 5/7] Don't write an indeterminate epoch date or days on decode
+Subject: [PATCH] Don't write an indeterminate epoch date or days on decode
  error
 
 QCBORDecode_GetTEpochDate(), QCBORDecode_GetTEpochDays() and their
@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 33 insertions(+), 6 deletions(-)
 
 diff --git a/src/qcbor_tag_decode.c b/src/qcbor_tag_decode.c
-index 1895f4c..6ebd959 100644
+index ec83259..b2311e1 100644
 --- a/src/qcbor_tag_decode.c
 +++ b/src/qcbor_tag_decode.c
 @@ -890,7 +890,9 @@ QCBORDecode_GetTEpochDate(QCBORDecodeContext          *pMe,
@@ -97,7 +97,7 @@ index 1895f4c..6ebd959 100644
  
  
 diff --git a/test/qcbor_decode_tests.c b/test/qcbor_decode_tests.c
-index ee36606..d4d69a1 100644
+index 17beea5..c2ae8a1 100644
 --- a/test/qcbor_decode_tests.c
 +++ b/test/qcbor_decode_tests.c
 @@ -3752,6 +3752,21 @@ int32_t SpiffyDateDecodeTest(void)

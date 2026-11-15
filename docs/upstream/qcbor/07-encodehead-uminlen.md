@@ -1,6 +1,6 @@
 # `QCBOREncode_EncodeHead()` with `uMinLen` > 8 writes before the start of its buffer
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
+Background analysis against `9bd0845`. Not filed yet. The texts to file, against `19c3367` and `master` `1d06057`, are [`07-encodehead-uminlen-issue.md`](./07-encodehead-uminlen-issue.md) and [`07-encodehead-uminlen-pr.md`](./07-encodehead-uminlen-pr.md). On `19c3367` the new test makes the unpatched test binary segfault, rather than return -5.
 Patches:
 - `dev`: [`patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch`](./patches/public/0006-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch);
 - 1.x: [`patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch`](./patches/v1/0002-Reject-uMinLen-8-in-QCBOREncode_EncodeHead.patch), which also applies to v1.6.1.

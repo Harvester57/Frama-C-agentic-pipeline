@@ -1,0 +1,95 @@
+From 159ce927613f9f6e862c286f72dea520f1027c53 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 12:21:12 +0100
+Subject: [PATCH] Don't set uNextNestLevel when consuming an array or map stops
+ early
+
+QCBORDecode_Private_ConsumeItem() walks the members of a non-empty
+array or map with a local QCBORItem. When the input ends before the
+first member, QCBORDecode_Private_GetNextMapOrArray() returns
+QCBOR_ERR_NO_MORE_ITEMS without writing the item, and the loop was
+followed unconditionally by
+
+   *puNextNestLevel = Item.uNextNestLevel;
+
+which copies an uninitialized byte.
+
+QCBORDecode_VGetNextConsume() passes &pDecodedItem->uNextNestLevel,
+so the 1 that QCBORDecode_VGetNext() had just stored for input 0x81
+is replaced with stack contents. MemorySanitizer reports it at the
+caller's first use. The other callers check the error first.
+
+Set the output only on success, and document that.
+
+This is the 1.x version of the same fix for the dev branch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/qcbor_decode.c        |  9 +++++++--
+ test/qcbor_decode_tests.c | 16 ++++++++++++++++
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/qcbor_decode.c b/src/qcbor_decode.c
+index 77f6cc5..8e9a62c 100644
+--- a/src/qcbor_decode.c
++++ b/src/qcbor_decode.c
+@@ -3145,7 +3145,7 @@ QCBORDecode_SetMemPool(QCBORDecodeContext *pMe,
+  *                              consumed.
+  * @param[in,out] pEnd          Tracks where the target ends. Can be NULL.
+  * @param[out] puNextNestLevel  The next nesting level after the item was
+- *                              fully consumed.
++ *                              fully consumed. Not set on error.
+  *
+  * This may be called when @c pItemToConsume is not an array or
+  * map. In that case, this is just a pass through for @c puNextNestLevel
+@@ -3172,7 +3172,12 @@ QCBORDecode_Private_ConsumeItem(QCBORDecodeContext    *pMe,
+          uReturn = QCBORDecode_Private_GetNextMapOrArray(pMe, pEnd, &Item);
+       } while(uReturn == QCBOR_SUCCESS && Item.uNextNestLevel >= pItemToConsume->uNextNestLevel);
+ 
+-      *puNextNestLevel = Item.uNextNestLevel;
++      /* On error, Item may not have been written, for example when
++       * the input ends before the array or map does (0x81 with
++       * nothing after it). Leave *puNextNestLevel unset then. */
++      if(uReturn == QCBOR_SUCCESS) {
++         *puNextNestLevel = Item.uNextNestLevel;
++      }
+ 
+    } else {
+       /* pItemToConsume is not a map or array. Just pass the nesting
+diff --git a/test/qcbor_decode_tests.c b/test/qcbor_decode_tests.c
+index 99e7a3e..91cd636 100644
+--- a/test/qcbor_decode_tests.c
++++ b/test/qcbor_decode_tests.c
+@@ -7390,6 +7390,11 @@ const unsigned char spBadConsumeInput5[] = {
+    0xa1, 0x80, 0x00
+ };
+ 
++/* An array of one item with no bytes for the item */
++const unsigned char spBadConsumeInput6[] = {
++   0x81
++};
++
+ const unsigned char spOneInteger[] = {
+    0x01
+ };
+@@ -8089,6 +8094,17 @@ int32_t EnterMapTest(void)
+       return 3000;
+    }
+ 
++   /* When consuming stops early, uNextNestLevel keeps the value
++    * QCBORDecode_VGetNext() returned for the array */
++   QCBORDecode_Init(&DCtx, UsefulBuf_FROM_BYTE_ARRAY_LITERAL(spBadConsumeInput6), 0);
++   QCBORDecode_VGetNextConsume(&DCtx, &Item1);
++   if(QCBORDecode_GetError(&DCtx) != QCBOR_ERR_NO_MORE_ITEMS) {
++      return 3001;
++   }
++   if(Item1.uDataType != QCBOR_TYPE_ARRAY || Item1.uNextNestLevel != 1) {
++      return 3002;
++   }
++
+    /* GetItemsInMap search for nothing on an item that isn't a map */
+    memset(SearchItems, 0, sizeof SearchItems);
+    SearchItems[0].uLabelType = QCBOR_TYPE_NONE;
+-- 
+2.56.0.windows.4
+

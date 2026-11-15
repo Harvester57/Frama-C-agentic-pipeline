@@ -1,7 +1,7 @@
-From b19f9d131b9189816e7242a019e8008c70a96f21 Mon Sep 17 00:00:00 2001
+From 4794b7af12e2fd7038157b1238c79453d3c846ea Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:25:29 +0100
-Subject: [PATCH 7/7] Don't negate INT64_MIN in QCBORDecode_ProcessBigNumber()
+Subject: [PATCH] Don't negate INT64_MIN in QCBORDecode_ProcessBigNumber()
 
 For a QCBOR_TYPE_INT64 item, QCBORDecode_ProcessBigNumber() computes
 the magnitude with ABSOLUTE_VALUE(Item.val.int64) and with

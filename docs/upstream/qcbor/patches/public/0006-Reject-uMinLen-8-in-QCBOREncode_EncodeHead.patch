@@ -1,7 +1,7 @@
-From da38eff8c170a1dccf5e254029e682963c97804d Mon Sep 17 00:00:00 2001
+From 46bd4043af5f3d570e194b723a9f4935e95c4f44 Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:23:59 +0100
-Subject: [PATCH 6/7] Reject uMinLen > 8 in QCBOREncode_EncodeHead()
+Subject: [PATCH] Reject uMinLen > 8 in QCBOREncode_EncodeHead()
 
 QCBOREncode_EncodeHead() is public and its uMinLen is documented only
 as the minimum number of bytes to encode the argument. A CBOR head
@@ -44,7 +44,7 @@ index b664250..5104895 100644
   * Callers do not to need to call this for normal CBOR encoding. Note
   * that it doesn't even take a @ref QCBOREncodeContext argument.
 diff --git a/src/qcbor_main_encode.c b/src/qcbor_main_encode.c
-index e95e66e..5d0fe0a 100644
+index 465e37e..e4b26af 100644
 --- a/src/qcbor_main_encode.c
 +++ b/src/qcbor_main_encode.c
 @@ -424,6 +424,13 @@ QCBOREncode_EncodeHead(UsefulBuf  Buffer,
@@ -71,10 +71,10 @@ index e95e66e..5d0fe0a 100644
     }
  #endif /* EXTRA_ENCODE_HEAD_CHECK */
 diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
-index 9df3caf..66f6e80 100644
+index e9e5977..65d068b 100644
 --- a/test/qcbor_encode_tests.c
 +++ b/test/qcbor_encode_tests.c
-@@ -3458,6 +3458,23 @@ int32_t QCBORHeadTest(void)
+@@ -3429,6 +3429,23 @@ int32_t QCBORHeadTest(void)
        return -3;
     }
  

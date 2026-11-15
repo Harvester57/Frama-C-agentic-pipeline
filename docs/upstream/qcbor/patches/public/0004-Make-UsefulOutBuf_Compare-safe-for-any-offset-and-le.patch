@@ -1,8 +1,7 @@
-From 075172e280ef2eb1a24e85ca18384699fe7f8c76 Mon Sep 17 00:00:00 2001
+From 18d8939e21ba7d543515a4b6b725ab4e75b133df Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:22:43 +0100
-Subject: [PATCH 4/7] Make UsefulOutBuf_Compare() safe for any offset and
- length
+Subject: [PATCH] Make UsefulOutBuf_Compare() safe for any offset and length
 
 UsefulBuf.h says no data is read beyond the buffer's end, whatever
 the offsets. But the implementation added the offsets and lengths to

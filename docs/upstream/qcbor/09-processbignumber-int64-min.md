@@ -1,6 +1,6 @@
 # Signed overflow negating `INT64_MIN` in `QCBORDecode_ProcessBigNumber()`
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
+Background analysis against `9bd0845`. Reported privately by email on 2026-11-04, with a patch. Do not file publicly: follow up through [`private-followup-email.md`](./private-followup-email.md). Still present on `dev` `19c3367`. The patch below is rebased on it.
 Patch: [`patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch`](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch).
 
 ## Summary

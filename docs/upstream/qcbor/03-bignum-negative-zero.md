@@ -1,7 +1,7 @@
 # A negative big number of value zero encodes as −1, −256 or −2^64
 
-Draft issue for https://github.com/laurencelundblade/QCBOR/issues. Not filed yet.
-Patch: [`patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch`](./patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch). It applies on top of `patches/public/0001`.
+Background analysis against `9bd0845`. Not filed yet. The texts to file, against `19c3367`, are [`03-bignum-negative-zero-issue.md`](./03-bignum-negative-zero-issue.md) and [`03-bignum-negative-zero-pr.md`](./03-bignum-negative-zero-pr.md). They use only the empty big number. The `00` rows below hold only when the byte after the buffer is zero, because of private bug 01.
+Patch: [`patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch`](./patches/public/0002-Encode-a-negative-zero-big-number-as-zero.patch). It now applies on its own to `dev`. Its check is `UsefulBuf_SkipLeading(BigNumber, 0x00).len > 0`, not the `NTH_BYTE` version under "Fix" below, which read the byte that bug 01 over-reads.
 
 ## Summary
 
