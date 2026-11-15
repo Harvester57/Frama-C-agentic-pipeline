@@ -1747,11 +1747,17 @@ def _merge_agent_overlay_locked(
         # spliced files together.
         frame_parts: list[str] = []
         for rel_str in changed_rels:
-            span = locate_function_span(
-                new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str
-            )
-            if span is not None:
-                frame_parts.append(_acsl_text_of_span(span))
+            # A header may declare the function twice (prototype and `static inline` definition);
+            # the spliced contract can sit on either declaration, so read the ACSL of both spans.
+            header_kinds = (True, False) if rel_str.endswith(".h") else (False,)
+            for is_header_span in header_kinds:
+                span = locate_function_span(
+                    new_contents[rel_str], function or "", is_header=is_header_span, path=rel_str
+                )
+                if span is not None:
+                    acsl_piece = _acsl_text_of_span(span)
+                    if acsl_piece and acsl_piece not in frame_parts:
+                        frame_parts.append(acsl_piece)
         frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))

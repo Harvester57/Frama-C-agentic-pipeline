@@ -102,6 +102,49 @@ def wp_model_unsound(model: object) -> bool:
     return "cast" in wp_model_parts(model)
 
 
+# The WP memory models a proof may be credited under (`frama-c -wp-h`, Frama-C 34). `Typed` is the
+# default. `Bytes` is listed there as experimental: accepted, but the proof records it as an
+# assumption (wp_model_assumption). `Hoare` has no pointers, `Region` is experimental and depends on
+# the region plug-in: neither is evidence. Options: `nocast`, `raw`, `ref`, `int` and `float` keep
+# machine semantics; `cast` (unlimited casts), `nat` (integers without overflow) and `real` (floats
+# as reals) do not.
+WP_MODEL_BASES_ALLOWED = frozenset({"typed", "bytes"})
+WP_MODEL_OPTIONS_ALLOWED = frozenset({"nocast", "raw", "ref", "int", "float"})
+WP_EXPERIMENTAL_MODEL_ASSUMPTION = (
+    "proved under the experimental WP memory model 'Bytes' (low-level, little-endian layout)"
+)
+
+
+def wp_model_problem(model: object) -> str | None:
+    """
+    Why a proof under this WP memory model is not evidence, or None when the model is accepted.
+    No model (None or an empty string) is the default `Typed` and is accepted. Every reader that
+    credits or replays a model (the parent merge check, the ledger, the WP runner) asks this.
+    """
+    parts = wp_model_parts(model)
+    if not parts:
+        return None
+    if "cast" in parts:
+        return WP_UNSOUND_MODEL_ISSUE
+    rejected = sorted(parts - WP_MODEL_BASES_ALLOWED - WP_MODEL_OPTIONS_ALLOWED)
+    if rejected:
+        return (
+            f"WP memory model {model!r} is not accepted as evidence (not allowed: {', '.join(rejected)}; "
+            f"allowed: {', '.join(sorted(WP_MODEL_BASES_ALLOWED))} with "
+            f"{', '.join(sorted(WP_MODEL_OPTIONS_ALLOWED))})"
+        )
+    if len(parts & WP_MODEL_BASES_ALLOWED) > 1:
+        return f"WP memory model {model!r} names more than one base model"
+    return None
+
+
+def wp_model_assumption(model: object) -> str | None:
+    """The assumption a proof under an accepted, non-default memory model rests on, or None."""
+    if wp_model_problem(model) is None and "bytes" in wp_model_parts(model):
+        return WP_EXPERIMENTAL_MODEL_ASSUMPTION
+    return None
+
+
 def wp_limits_problem(limits: object) -> str | None:
     """Why the verdict limits of a WP report (run_wp_function.py) do not allow crediting its proof, or None."""
     if not isinstance(limits, dict):
