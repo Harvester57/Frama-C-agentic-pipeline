@@ -46,14 +46,19 @@ import kernel_ast  # noqa: E402
 from acsl_ast import AcslSyntaxError, Span, locate_all_definition_spans, locate_function_span, tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import DYNAMIC_ALLOC_CALLEES  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
+    ArtifactError,
     atomic_write_json,
     augment_framac_cppflags,
     load_json_optional,
     normalize_flag_args,
+    resolve_flows,
     utc_now,
 )
 
-FACTS_SCHEMA = 3  # 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates)
+# 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates);
+# 4: `assigns \nothing` only when no call may write (calls carry the callee's kernel name)
+FACTS_SCHEMA = 4
 LOOP_TEMPLATES_ENV = "FRAMAC_LOOP_TEMPLATES"
 LOOP_SEEDS_ENV = "FRAMAC_LOOP_SEEDS"
 FACTS_DIR = "workspace/reports/facts"
@@ -73,6 +78,8 @@ def _temp_pattern(temps: list[str] | None) -> re.Pattern:
     if not temps:
         return re.compile(r"(?!)")  # never matches
     return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in temps) + r")\b")
+
+
 _RUN_PREFIX_RE = re.compile(r"^(?:/framac-run/|\./)+")
 _AGENT_WORK_RE = re.compile(r"^agents/[^/]+/scratch/work/")
 _STRING_CALLEES = frozenset(
@@ -266,7 +273,11 @@ def _loop_record(raw: dict, derived: dict[str, str], tokens: list, temp_re: re.P
         elif lval:
             scalars.append({"var": lval, "updates": values})
     reads = [
-        {"lval": _clean_expr(r.get("lval"), temp_re), "root": _root_of(r, derived)[0], "root_kind": _root_of(r, derived)[1]}
+        {
+            "lval": _clean_expr(r.get("lval"), temp_re),
+            "root": _root_of(r, derived)[0],
+            "root_kind": _root_of(r, derived)[1],
+        }
         for r in raw.get("reads") or []
     ]
     # In-place: the same object read and written at positions that move with the loop. A field read
@@ -605,6 +616,8 @@ def _function_record(
             record["eva_targets"] = sorted(resolved - direct) if flows.get("status") == "ok" else None
         else:
             record["callee"] = call.get("callee")
+            # Same-named statics differ only here: the frame pass resolves callees by kernel name.
+            record["kernel_name"] = call.get("kernel_name") or call.get("callee")
         calls.append(record)
     paths = []
     for path in raw.get("return_paths") or []:
@@ -740,8 +753,39 @@ def build_module_facts(
         except AcslSyntaxError as exc:
             doc.setdefault("warnings", []).append(f"{key}: {exc}")
     _link_callers(raw_functions, doc["functions"])
+    _close_frames_over_calls(doc["functions"])
     doc["status"] = "ok" if flows.get("status") == "ok" else "partial"
     return doc
+
+
+def write_free_functions(records: dict[str, dict]) -> set[str]:
+    """
+    Kernel names of the module's functions that cannot write caller-visible memory, even through a
+    call: no direct write, and every call reaches another such function. Greatest fixpoint, so a
+    recursive cycle is write-free exactly when every member is. An indirect call, or a callee with no
+    record here (libc, another module, the harness, a function left out), may write.
+    """
+    by_kernel = {str(r.get("kernel_name")): r for r in records.values() if r.get("kernel_name")}
+    free = {name for name, r in by_kernel.items() if frame_skeleton.writes_nothing_directly(r)}
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(free):
+            targets = [frame_skeleton.call_target(c) for c in by_kernel[name].get("calls") or []]
+            if any(t is None or t not in free for t in targets):
+                free.discard(name)
+                changed = True
+    return free
+
+
+def _close_frames_over_calls(records: dict[str, dict]) -> None:
+    """Re-project the frame skeletons of callers with the module verdict on what their callees write."""
+    if not frame_skeleton.enabled():
+        return
+    free = write_free_functions(records)
+    for record in records.values():
+        if record.get("calls"):
+            record["frame_skeleton"] = frame_skeleton.compute(record, write_free_callees=free)
 
 
 def generate(
@@ -753,9 +797,14 @@ def generate(
     machdep: str = "gcc_x86_64",
     runner=None,
 ) -> dict:
-    """Write the module's facts to `out_json`, restored from the cache when nothing changed."""
-    report = load_json_optional(eva_report, {}) if eva_report else {}
-    flows = report.get("flows") if isinstance(report, dict) else None
+    """
+    Write the module's facts to `out_json`, restored from the cache when nothing changed. An Eva report
+    whose spilled flows file is missing or unreadable raises ArtifactError naming it: the briefs would
+    otherwise lose their Eva facts without a word.
+    """
+    report = load_json_optional(eva_report, {}, max_bytes=EVA_REPORT_MAX_BYTES) if eva_report else {}
+    raw_flows = report.get("flows") if isinstance(report, dict) else None
+    flows = resolve_flows(raw_flows, report_path=eva_report, strict=True)
 
     def _build() -> dict:
         doc = build_module_facts(module, sources, cppflags, flows, machdep=machdep, runner=runner)
@@ -1132,6 +1181,11 @@ def _render_skeleton(record: dict, lines: list[str]) -> None:
     seps = skel.get("separated") or []
     assigns = skel.get("assigns") or []
     if not seps and not assigns:
+        # Nothing required; say why there is no `assigns \nothing` (a callee may write) as a hint.
+        notes = skel.get("notes") or []
+        if notes:
+            lines.append("\n**Projected frame skeleton:** no clause is required for this function.")
+            lines.extend(f"- note: {note}" for note in notes)
         return
     lines.append(
         "\n**Projected frame skeleton** (deterministic projection of the AST and Eva dependence sets above into "
@@ -1273,7 +1327,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-json", type=Path, required=True)
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
-    res = generate(args.module, args.sources, args.cppflags, args.eva_report, args.out_json, machdep=args.machdep)
+    try:
+        res = generate(args.module, args.sources, args.cppflags, args.eva_report, args.out_json, machdep=args.machdep)
+    except ArtifactError as exc:
+        # A failed document replaces an earlier run's facts, so no brief is built from them.
+        reason = str(exc)
+        atomic_write_json(
+            args.out_json,
+            {
+                "schema": FACTS_SCHEMA,
+                "module": args.module,
+                "generated_at": utc_now(),
+                "status": "failed",
+                "eva": {"status": "failed", "reason": reason},
+                "functions": {},
+            },
+        )
+        res = {"status": "failed", "module": args.module, "out_json": args.out_json.as_posix(), "reason": reason}
+        print(f"function_facts: {reason}", file=sys.stderr)
     print(json.dumps(res, indent=2))
     return 0 if res.get("status") in ("ok", "partial") else 1
 

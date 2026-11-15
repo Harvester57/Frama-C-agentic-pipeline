@@ -23,7 +23,11 @@ writes, reads, loops, may_alias, return_paths, eva). Output:
     }
 
 `partial` means some region/dependence was approximated (strongest entry-expressible
-form); the prover must check it against the code. FRAMAC_FRAME_SKELETON=off disables
+form); the prover must check it against the code. `assigns \\nothing` is projected only when
+the function writes nothing caller-visible directly AND every call it makes reaches a module
+function that writes nothing either, transitively (`write_free_callees`, computed over the
+module by function_facts); otherwise a function without direct writes gets no assigns entry,
+status `partial`, and a note naming the calls that may write. FRAMAC_FRAME_SKELETON=off disables
 the projection (A/B ablation), yielding {"status": "disabled"}.
 """
 
@@ -31,8 +35,10 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Collection
 
 SKELETON_ENV = "FRAMAC_FRAME_SKELETON"
+MAX_BLOCKERS_SHOWN = 6
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _INT_RE = re.compile(r"\d+[uUlL]*")
@@ -301,17 +307,64 @@ def _lift_dep(root: str, formals: dict[str, dict], record: dict, loops: list[dic
     return root
 
 
-def compute(record: dict) -> dict:
-    """Project one function record's frame information into a skeleton. Never raises."""
+def writes_nothing_directly(record: dict) -> bool:
+    """
+    No caller-visible write in the function's own body: no write rooted at a formal or a global, no
+    write through a pointer the facts cannot attribute (a local not derived from a formal), and a
+    complete (not truncated) record. Calls are not looked at here: see `call_blockers`.
+    """
+    if record.get("truncated"):
+        return False
+    for w in record.get("writes") or []:
+        if w.get("root_kind") != "local" or w.get("through_pointer"):
+            return False
+    for loop in record.get("loops") or []:
+        for w in loop.get("memory_writes") or []:
+            if w.get("root_kind") != "local":
+                return False
+    return True
+
+
+def call_target(call: dict) -> str | None:
+    """The kernel name a direct call reaches (older facts carry only `callee`); None for an indirect call."""
+    if call.get("indirect"):
+        return None
+    return call.get("kernel_name") or call.get("callee") or None
+
+
+def call_blockers(record: dict, write_free_callees: Collection[str] | None) -> list[str]:
+    """
+    The calls through which the function may write caller-visible memory: an indirect call, or a
+    callee not in `write_free_callees` (the module's functions that write nothing, transitively;
+    function_facts computes it). Without that verdict (None) every call may write.
+    """
+    out: list[str] = []
+    for call in record.get("calls") or []:
+        target = call_target(call)
+        if target is None:
+            out.append(f"an indirect call (`{call.get('expr') or '?'}`)")
+        elif write_free_callees is None or target not in write_free_callees:
+            out.append(f"`{call.get('callee') or target}`")
+    return list(dict.fromkeys(out))
+
+
+def compute(record: dict, write_free_callees: Collection[str] | None = None) -> dict:
+    """
+    Project one function record's frame information into a skeleton. Never raises.
+
+    `write_free_callees`: kernel names of the module's functions that cannot write caller-visible
+    memory, even through their own calls. `assigns \\nothing` is projected only for a function with no
+    direct write whose every call reaches one of them; None means "unknown", so any call blocks it.
+    """
     if not enabled():
         return {"status": "disabled"}
     try:
-        return _compute(record)
+        return _compute(record, write_free_callees)
     except Exception as exc:  # a skeleton is a hint; never break facts generation
         return {"status": "partial", "separated": [], "assigns": [], "notes": [f"skeleton computation failed: {exc}"]}
 
 
-def _compute(record: dict) -> dict:
+def _compute(record: dict, write_free_callees: Collection[str] | None = None) -> dict:
     formals = {f.get("name"): f for f in record.get("formals") or [] if f.get("name")}
     caller, _ = _caller_roots(record)
     loops = record.get("loops") or []
@@ -416,7 +469,24 @@ def _compute(record: dict) -> dict:
             clause = f"assigns {entry['loc']} \\from \\nothing;"
         assigns.append({"loc": entry["loc"], "from": froms, "clause": clause, "source": entry["source"]})
     if not assigns:
-        assigns.append({"loc": "\\nothing", "from": [], "clause": "assigns \\nothing;", "source": "ast"})
+        # `\nothing` only when nothing caller-visible can be written: not directly, not through a call.
+        blockers = call_blockers(record, write_free_callees)
+        if not writes_nothing_directly(record):
+            partial = True
+            notes.append(
+                "no `assigns \\nothing` projected: the body writes through a pointer the facts cannot "
+                "attribute to a formal or a global, or the record is truncated"
+            )
+        elif blockers:
+            partial = True
+            shown = ", ".join(blockers[:MAX_BLOCKERS_SHOWN]) + (", ..." if len(blockers) > MAX_BLOCKERS_SHOWN else "")
+            notes.append(
+                f"no `assigns \\nothing` projected: the function may write through {shown} "
+                "(a callee of this module that writes, possibly transitively, an indirect call, or a "
+                "function outside the module); state what those calls assign"
+            )
+        else:
+            assigns.append({"loc": "\\nothing", "from": [], "clause": "assigns \\nothing;", "source": "ast"})
     assigns.sort(key=lambda a: a["loc"])
 
     return {

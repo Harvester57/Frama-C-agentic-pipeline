@@ -8,6 +8,7 @@ UsefulOutBuf_Reset). The parent merge check passes --counter-examples, so it ref
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -115,6 +116,86 @@ def test_counter_example_goals_only_list_goals_the_proof_pass_failed(
     assert proof_cmd[proof_cmd.index("-wp-cache-dir") + 1] == str(shared_cache)
     assert "-wp-cache-dir" not in model_cmd
     assert model_cmd[model_cmd.index("-wp-cache") + 1] == "none"
+
+
+_FAILING_PROOF_CSV = _csv_rows([("keep_ptr", "Valid"), ("keep_len", "Unknown")])
+_FAILING_PROOF_LOG = (
+    "[wp] 2 goals scheduled\n"
+    "[wp] [Timeout] typed_f_ensures_keep_len (Qed 1ms) (Alt-Ergo)\n"
+    "[wp] Proved goals:    1 / 2\n"
+)
+_FAILING_MODEL_LOG = "[wp] [Unknown] typed_f_ensures_keep_len (Qed 1ms) (Z3) (Model)\n[wp] Proved goals:    1 / 2\n"
+
+
+@pytest.mark.unit
+def test_no_model_pass_when_the_prover_budget_is_exhausted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scratch = tmp_path / "agents" / "prove-f" / "scratch"
+    work = scratch / "work"
+    work.mkdir(parents=True)
+    c_file = _c_file(work)
+    (scratch / ".prover_budget.json").write_text(
+        '{"max_wp_invocations": 2, "wp_invocations": 2, "first_wp_at": 1}', encoding="utf-8"
+    )
+    (scratch / "wp_f.json").write_text(
+        '{"unproven_goals": [{"annotation": "keep_len", "kind": "postcondition"}], "unproven_count": 1}',
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        W.subprocess,
+        "run",
+        _fake_wp(_FAILING_PROOF_CSV, _FAILING_PROOF_LOG, _FAILING_PROOF_CSV, _FAILING_MODEL_LOG, calls),
+    )
+
+    res = W.run_wp_on_function(c_file, "f", scratch / "wp", counter_examples=True, cache_dir="off")
+
+    assert res["budget_exhausted"] is True and res["status"] == "unproven_goals_remain"
+    # The verdict pass ran no WP; neither may the model pass (it ignores the budget by design).
+    assert calls == []
+    assert res["counter_example_goals"] == []
+    assert res["counter_example_pass"]["status"] == "skipped"
+    assert "budget" in res["counter_example_pass"]["reason"]
+
+
+@pytest.mark.unit
+def test_main_writes_the_verdict_before_the_model_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_json = tmp_path / "wp_f.json"
+    seen_during_model_pass: list[dict] = []
+    calls: list[list[str]] = []
+    inner = _fake_wp(_FAILING_PROOF_CSV, _FAILING_PROOF_LOG, _FAILING_PROOF_CSV, _FAILING_MODEL_LOG, calls)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if _CE_FLAG in cmd:
+            # A kill now must not lose the verdict: it is already on disk.
+            seen_during_model_pass.append(json.loads(out_json.read_text(encoding="utf-8")))
+        return inner(cmd, **kwargs)
+
+    monkeypatch.setattr(W.subprocess, "run", fake_run)
+    argv = [
+        "--file",
+        str(_c_file(tmp_path)),
+        "--function",
+        "f",
+        "--out-dir",
+        str(tmp_path / "wp"),
+        "--out-json",
+        str(out_json),
+        "--cache-dir",
+        "off",
+        "--no-retry-bitwise",
+        "--no-retry-tail",
+        "--counter-examples",
+    ]
+    assert W.main(argv) == 0
+
+    (early,) = seen_during_model_pass
+    assert early["status"] == "unproven_goals_remain" and early["unproven_count"] == 1
+    assert early["counter_examples"] is True and early["counter_example_pass"]["status"] == "pending"
+    final = json.loads(out_json.read_text(encoding="utf-8"))
+    assert final["status"] == "unproven_goals_remain"
+    assert final["counter_example_goals"] == [{"goal": "typed_f_ensures_keep_len", "prover": "Z3"}]
+    assert final["counter_example_pass"]["status"] == "unproven_goals_remain"
+    assert [_CE_FLAG in c for c in calls if "-report-csv" in c] == [False, True]
 
 
 @pytest.mark.unit

@@ -34,6 +34,7 @@ import concurrent.futures
 import contextlib
 import fnmatch
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -61,6 +62,7 @@ import resources  # noqa: E402
 import spec_kb  # noqa: E402
 import workspace_overlay  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     PROVER_WALL_BUDGET_S,
     ArtifactError,
     RunLockTimeout,
@@ -283,6 +285,7 @@ class Deps:
         self.record_boundary_assumptions: Callable[..., dict] = ledger.cmd_record_boundary_assumptions
         self.ingest_verifier: Callable[..., dict] = ledger.cmd_ingest_verifier
         self.resolve_request: Callable[..., dict] = contract_negotiator.cmd_resolve
+        self.file_request: Callable[..., dict] = contract_negotiator.cmd_request
         self.save_shard: Callable[[str, Path], dict] = _save_shard
         self.restore_best: Callable[[Path], dict | None] = prover_candidates.restore_best
         self.mine_kb: Callable[[Path], dict] = spec_kb.mine_after_complete
@@ -523,18 +526,19 @@ def _reopen(state: dict, task: dict, reason: str) -> None:
 
 def _assign_agent(state: dict, task: dict) -> str:
     base = f"{task['kind']}-{task['slug']}"
-    n = int(task.get("dispatches") or 0) + 1
+    attempt = int(task.get("dispatches") or 0) + 1
+    seq = attempt
     while True:
-        aid = base if n == 1 else f"{base}-{n}"
+        aid = base if seq == 1 else f"{base}-{seq}"
         # Never reuse an id (or the agents/<id>/ directory of an earlier run): its scratch/result.json
         # would be read as this agent's answer.
         if aid not in state["agents"] and not (Path("agents") / aid).exists():
             break
-        n += 1
+        seq += 1
     now_iso = utc_now()
     now_ts = DEPS.now()
     task.update(
-        dispatches=n,
+        dispatches=attempt,
         agent_id=aid,
         state="running",
         assigned_at=now_iso,
@@ -577,7 +581,7 @@ class Ctx:
         self.sidecars = self._load_sidecars()
         # Link units (step I5b): a DAG module's harnesses may be sub-modules with their own sidecars.
         self.mm = ModuleMap(self.dag, self.sidecars)
-        self.eva_unknowns, self._eva_items_by_fn = self._load_eva()
+        self.eva_unknowns, self._eva_items_by_fn, self._eva_by_report = self._load_eva()
 
         # DAG function records, by (file, name) and by bare name. `functions` is keyed by the bare name,
         # or by `file#name` when several functions share the name (build_callgraph_dag): both key forms
@@ -661,22 +665,55 @@ class Ctx:
         return out
 
     @staticmethod
-    def _load_eva() -> tuple[dict[str, int], dict[str, list[Any]]]:
+    def _load_eva() -> tuple[dict[str, int], dict[str, list[Any]], dict[str, dict[str, list[Any]]]]:
         counts: dict[str, int] = {}
         items_by_fn: dict[str, list[Any]] = defaultdict(list)
+        by_report: dict[str, dict[str, list[Any]]] = {}
         if EVA_DIR.is_dir():
             for path in sorted(EVA_DIR.glob("*.json")):
                 try:
-                    data = load_json_strict(path)
+                    data = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
                 except ArtifactError:
                     continue
                 by_fn = data.get("unknown_obligations_by_function") if isinstance(data, dict) else None
                 if isinstance(by_fn, dict):
+                    report_map: dict[str, list[Any]] = {}
                     for fn, items in by_fn.items():
                         n = len(items) if isinstance(items, list) else int(bool(items))
                         counts[fn] = max(counts.get(fn, 0), n)
                         items_by_fn[fn].append(items)
-        return counts, dict(items_by_fn)
+                        if isinstance(items, list):
+                            report_map[str(fn)] = items
+                    by_report[path.stem] = report_map
+                    raw_mod = data.get("module") if isinstance(data, dict) else None
+                    if isinstance(raw_mod, str) and raw_mod and raw_mod not in by_report:
+                        by_report[raw_mod] = report_map
+        return counts, dict(items_by_fn), by_report
+
+    def eva_unknown_obligations(self, module: str | None, file: str | None, fn: str | None) -> list[dict]:
+        """
+        Pre-extract the function-scoped Eva unknown obligations that `workspace_overlay.prepare_agent`
+        embeds into a prover/breaker/negotiate brief so worker threads do not re-parse large Eva JSONs.
+        """
+        if not fn:
+            return []
+        norm_c_file = norm_path(file) if file else None
+        mod = module if module and module != "unknown" else None
+        harness_names = self.harness_modules(mod) if mod else []
+        names = list(dict.fromkeys([*([mod] if mod else []), *harness_names]))
+        out: list[dict] = []
+        for name in names:
+            raw_unknowns = (self._eva_by_report.get(name) or {}).get(fn, [])
+            if not isinstance(raw_unknowns, list):
+                continue
+            rows = [
+                a
+                for a in raw_unknowns
+                if isinstance(a, dict) and (not norm_c_file or eva_alarm_in_file(a, norm_c_file))
+            ]
+            seen = list(out)
+            out += [a for a in rows if a not in seen]
+        return out
 
     def eva_unknown_count(self, file: str | None, fn: str) -> int:
         if not fn:
@@ -1013,12 +1050,13 @@ def _sync_architects(state: dict, ctx: Ctx, mod: str, changes: dict[str, list[st
             task["harness_module"] = harness
 
 
-def _sync(state: dict, ctx: Ctx) -> dict:
+def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
     """
     Bring the task set in line with the ledger and candidates (idempotent): a verify task per
     unverified candidate, a prove task per function with planned units, an architect per module
     with prove work and a header; then recompute dependencies, gates, recursion groups, waves and
-    priorities.
+    priorities, and handle callees without a contract (`_contract_less_callees`). `persist=False`
+    is for a sync whose state is not saved: it files no contract request.
     """
     tasks = state["tasks"]
     changes: dict[str, list[str]] = {"created": [], "reopened": [], "skipped": [], "closed": []}
@@ -1170,7 +1208,152 @@ def _sync(state: dict, ctx: Ctx) -> dict:
     }
     _compute_deps(state, ctx)
     _compute_graph(state)
+    if _contract_less_callees(state, ctx, changes, persist=persist):
+        _compute_graph(state)  # new negotiate tasks and their waiting callers change the heights
     return changes
+
+
+CONTRACT_REQUEST_REASON = "caller needs a contract"
+DEFAULT_CONTRACT_CLAUSE = "a function contract with a sound assigns clause"
+
+
+def _callee_frame_clause(ctx: Ctx, cfile: str, cname: str, cmod: str | None) -> str:
+    """The callee's projected frame skeleton (its `assigns` clauses, from the module's facts), else a generic ask."""
+    try:
+        skel = workspace_overlay._function_frame_skeleton(
+            Path("workspace"), cmod or ctx.file_module.get(cfile), cfile, cname
+        )
+    except Exception:  # the clause only guides the negotiator: never block the scheduler on the facts
+        skel = None
+    clauses = [str(a["clause"]) for a in (skel or {}).get("assigns") or [] if isinstance(a, dict) and a.get("clause")]
+    return " ".join(clauses) or DEFAULT_CONTRACT_CLAUSE
+
+
+def _callee_header(cfile: str) -> str:
+    """
+    The callee's header when it is certain (the callee lives in a header, or its sibling `.h` exists), else "":
+    the merge infers the header from the agent's changes (a module header may not declare a static callee).
+    """
+    if cfile.endswith(".h"):
+        return cfile
+    sibling = Path(cfile).with_suffix(".h").as_posix()
+    return sibling if (Path("workspace/work") / sibling).is_file() else ""
+
+
+def _contract_less_callees(state: dict, ctx: Ctx, changes: dict, persist: bool = True) -> bool:
+    """
+    Pending provers whose callee has no contract the caller's proof can see (QCBOR run-6: callers were released
+    because `_View` counts a blocked or skipped callee task, or none, as satisfied):
+
+    - the callee's prove task is open: the caller waits on it (`_compute_deps`, class A);
+    - the callee's prove task is done or merged a stalled prover's contract, or a negotiation applied one:
+      satisfied;
+    - the callee is in the caller's recursion group: ignored (the group is proved together);
+    - otherwise, when a negotiation may run (`_negotiate_skip_verdict` is None and the callee has a unit in
+      scope), the scheduler files one `caller needs a contract` request per (caller, callee), recorded in the
+      caller's `contract_requests`; `_emit_negotiations` opens or joins `negotiate:<callee>` under its round
+      caps, and the caller waits on it while it is open (class B);
+    - every other contract-less callee (a crash candidate or `shell_unverifiable_wp`, out of scope, a
+      negotiation that ended without a contract or was refused by a cap) is named in the caller's
+      `callees_without_contract`: the caller is dispatched after the untagged ready tasks (class C).
+
+    The wait is derived again at every sync, so a caller waits only on an open negotiate task, which its round
+    caps bound. `persist=False` (an in-memory sync) files nothing in the request store. Returns whether a
+    dependency or a task changed.
+    """
+    tasks = state["tasks"]
+    prove_by_key = {_key(t): tid for tid, t in tasks.items() if t["kind"] == "prove"}
+    out: dict[str, Any] = {"errors": []}
+    changed = False
+    open_groups = {t["scc"] for t in tasks.values() if t.get("scc") and t["state"] not in TERMINAL}
+
+    def live_negotiation(caller_id: str, key: str) -> str | None:
+        neg = tasks.get(f"negotiate:{key}")
+        if neg is None or neg["state"] in TERMINAL:
+            return None
+        waiting = [*(neg.get("callers") or []), *(neg.get("followup_callers") or [])]
+        return neg["id"] if caller_id in waiting else None
+
+    for tid in sorted(tasks):
+        task = tasks[tid]
+        if task["kind"] != "prove" or task["state"] != "pending":
+            continue
+        filed: dict[str, str] = dict(task.get("contract_requests") or {})
+        waits: set[str] = set()
+        untagged: list[str] = []
+        for key in task.get("callees") or []:
+            cfile, _, cname = key.rpartition("#")
+            callee = tasks.get(prove_by_key.get(key, ""))
+            if callee is not None and callee["state"] not in TERMINAL:
+                continue  # class A: _compute_deps holds the caller on the callee's open task
+            if callee is not None and task.get("scc") and callee.get("scc") == task.get("scc"):
+                continue
+            if callee is not None and callee.get("scc") in open_groups:
+                continue  # class A: _View waits for the callee's whole recursion group
+            if callee is not None and (callee["state"] == "done" or callee.get("partial_contract_merged")):
+                continue  # its contract was merged (a stalled prover's sound contract too)
+            neg = tasks.get(f"negotiate:{key}")
+            if neg is not None and neg["state"] == "done" and neg.get("outcome") == "applied":
+                continue
+            cmod = ctx.key_module(key) or None
+            if callee_has_contract(ctx, cfile, cname, cmod, caller_file=task["file"]):
+                continue
+            in_scope = any(u["status"] not in NO_TOUCH for u in ctx.units_by_fn.get((cfile, cname), []))
+            verdict = _negotiate_skip_verdict(ctx.fn_units(cfile, cname), set(), ctx.verifiability(cfile, cname))
+            if verdict is None and in_scope and key not in filed:
+                req = {
+                    "caller_function": task["function"],
+                    "callee_function": cname,
+                    "callee_file": cfile,
+                    "header_file": _callee_header(cfile),
+                    "needed_clause": _callee_frame_clause(ctx, cfile, cname, cmod),
+                    "reason": CONTRACT_REQUEST_REASON,
+                }
+                if persist:
+                    entry = _try(
+                        out["errors"],
+                        f"contract request {tid} -> {key}",
+                        DEPS.file_request,
+                        REQUESTS,
+                        req["caller_function"],
+                        cname,
+                        cfile,
+                        req["header_file"],
+                        req["needed_clause"],
+                        CONTRACT_REQUEST_REASON,
+                        origin="scheduler",
+                    )
+                else:
+                    entry = {**req, "id": f"dry:{tid}|{key}"}
+                if isinstance(entry, dict) and entry.get("id"):
+                    filed[key] = str(entry["id"])
+                    task["contract_requests"] = filed
+                    _emit_negotiations(state, ctx, task, [entry], out, dry_run=not persist)
+                    changes.setdefault("contract_requests", []).append(f"{tid} -> negotiate:{key}")
+                    changed = True
+            neg_id = live_negotiation(tid, key)
+            if neg_id:
+                waits.add(neg_id)  # class B
+            else:
+                untagged.append(key)  # class C
+        if filed or task.get("extra_deps"):
+            # Open deps stay (a prover's own request still being negotiated); a negotiation filed here counts only
+            # while this caller is among its callers.
+            extra = {d for d in task.get("extra_deps") or [] if d in tasks and tasks[d]["state"] not in TERMINAL}
+            extra = {d for d in extra if d in waits or d.removeprefix("negotiate:") not in filed}
+            extra |= waits
+            if sorted(extra) != sorted(task.get("extra_deps") or []):
+                task["extra_deps"] = sorted(extra)
+                changed = True
+        if untagged:
+            if task.get("callees_without_contract") != sorted(untagged):
+                task["callees_without_contract"] = sorted(untagged)
+                changed = True
+        elif task.pop("callees_without_contract", None) is not None:
+            changed = True
+    if out["errors"]:
+        changes.setdefault("errors", []).extend(str(e) for e in out["errors"])
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1206,24 +1389,28 @@ def callee_has_contract(
     cname: str,
     cmod: str | None,
     work_dir: Path | None = None,
+    caller_file: str | None = None,
 ) -> bool:
     """
-    Check whether `cname` in `cfile` (module `cmod`) has an ACSL function contract in workspace/work/.
-    Inspects:
+    Check whether `cname` in `cfile` (module `cmod`) has an ACSL function contract in workspace/work/
+    that a caller in `caller_file` can see. Inspects:
     1. Sibling header: workspace/work/<stem>.h (both prototype and inline definition)
     2. Module header(s): workspace/work/<header> for each harness sidecar's `header` and `headers`
-    3. C source definition / prototype: workspace/work/<cfile>
+    3. C source definition / prototype: workspace/work/<cfile>, only for a caller in the same file (or
+       when no caller is named): a caller in another file includes the headers, never the callee's `.c`,
+       so its proof cannot see a contract written there.
     """
     cfile_norm = norm_path(cfile)
     work_root = Path(work_dir) if work_dir is not None else Path("workspace/work")
     if not work_root.is_dir():
         return False
+    source_visible = caller_file is None or norm_path(caller_file) == cfile_norm or cfile_norm.endswith(".h")
 
     # Check per-command Ctx cache
-    cache: dict[tuple[str, str, str | None, str], bool] = getattr(ctx, "_callee_contract_cache", None)  # type: ignore[assignment]
+    cache: dict[tuple[str, str, str | None, str, bool], bool] = getattr(ctx, "_callee_contract_cache", None)  # type: ignore[assignment]
     if cache is None:
         cache = ctx._callee_contract_cache = {}  # type: ignore[attr-defined]
-    cache_key = (cfile_norm, cname, cmod, str(work_root.resolve()))
+    cache_key = (cfile_norm, cname, cmod, str(work_root.resolve()), source_visible)
     if cache_key in cache:
         return cache[cache_key]
 
@@ -1263,7 +1450,7 @@ def callee_has_contract(
 
     # 3. Check C source definition or prototype
     src_path = work_root / cfile_norm
-    if src_path.is_file():
+    if source_visible and src_path.is_file():
         if _file_has_contract(src_path, cname, is_header=False) or _file_has_contract(src_path, cname, is_header=True):
             cache[cache_key] = True
             return True
@@ -1279,7 +1466,10 @@ def touches_module_header(
     module: str | None,
     work_dir: Path | None = None,
 ) -> bool:
-    """Check whether `fn` has a prototype or declaration in one of the module's harness headers."""
+    """
+    Check whether `fn` is declared in one of the module's harness headers: a prototype, or a `static inline`
+    definition (a header that holds only the definition takes the prover's contract too).
+    """
     if not module:
         return False
     cand_headers = [header for _, header in ctx.headers(module)]
@@ -1300,8 +1490,7 @@ def touches_module_header(
             return True
         if not re.search(r"\b" + re.escape(fn) + r"\b", hdr_text):
             continue
-        span = acsl_ast.locate_function_span(hdr_text, fn, is_header=True, path=hdr_rel)
-        if span is not None:
+        if acsl_ast.function_declaration_spans(hdr_text, fn, path=hdr_rel):
             return True
     return False
 
@@ -1374,7 +1563,7 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
                     # Speculative contract-first dispatch (Option A):
                     # If callee already has a contract in workspace/work/, caller does not wait
                     # for the callee's body proof or callee module architect.
-                    has_contract = callee_has_contract(ctx, cfile, cname, cmod)
+                    has_contract = callee_has_contract(ctx, cfile, cname, cmod, caller_file=task["file"])
                     if not has_contract:
                         if key in prove_by_key:
                             deps.add(prove_by_key[key])
@@ -1395,6 +1584,8 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
             task["wp_blockers"] = ctx.wp_blockers(task["file"], task["function"])
         elif task["kind"] == "arch":
             task["deps"] = [f"gate:{task['module']}"]
+        elif task["kind"] == "repair":
+            task["deps"] = _repair_verify_deps(tasks, task["module"], ctx)
         elif task["kind"] in ("breaker", "negotiate"):
             task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task.get("function") or "")
     # Architects of modules sharing a header run one after the other: the second merge would
@@ -1656,7 +1847,8 @@ class _View:
                 t = self.tasks.get(dep)
                 if t:
                     cctx = self.ctx or Ctx()
-                    if callee_has_contract(cctx, t["file"], t["function"], t.get("module")):
+                    caller_file = task.get("file") if task and task.get("kind") == "prove" else None
+                    if callee_has_contract(cctx, t["file"], t["function"], t.get("module"), caller_file=caller_file):
                         return True
             return False
         if scc not in self._group_done:
@@ -1678,6 +1870,8 @@ class _View:
             for member in members
             for dep in _deps(self.tasks[member])
         )
+        if ok and task["kind"] == "repair":
+            ok = all(self.terminal(vtid) for vtid in _repair_verify_deps(self.tasks, task["module"], self.ctx))
         if scc:
             self._group_ready[scc] = ok
         return ok
@@ -1695,7 +1889,10 @@ def _priority_key(task: dict) -> tuple:
         )
         else 0
     )
-    return (shell_leaf, -int(task.get("height") or 0), -int(task.get("eva_unknowns") or 0), task["id"])
+    # A prover with a callee that has no contract and cannot get one (`_contract_less_callees`, class C) runs
+    # after every untagged ready task: its proof sees only WP's default spec of those callees.
+    tagged = 1 if task.get("kind") == "prove" and task.get("callees_without_contract") else 0
+    return (tagged, shell_leaf, -int(task.get("height") or 0), -int(task.get("eva_unknowns") or 0), task["id"])
 
 
 def _waves_filter(state: dict) -> Callable[[dict], bool]:
@@ -2150,6 +2347,8 @@ def _describe(task: dict, ctx: Ctx | None = None, state: dict | None = None) -> 
             out[field] = task[field]
     if task["kind"] == "prove":
         out["coverage_ids"] = list(task.get("units") or [])
+        if task.get("callees_without_contract"):  # `file#name` of callees the proof sees without a contract
+            out["callees_without_contract"] = list(task["callees_without_contract"])
     elif task["kind"] == "verify":
         cand = (ctx.candidates.get(task["fingerprint"]) if ctx else None) or {}
         out["candidate_fingerprint"] = task["fingerprint"]
@@ -2190,6 +2389,20 @@ def _verify_harness_module(task: dict, ctx: Ctx | None = None) -> str:
     )
 
 
+def _repair_verify_deps(tasks: dict[str, dict], module: str, ctx: Ctx | None = None) -> list[str]:
+    """
+    Every `verify:*` task answering to `module`'s harness: `repair:<module>` stays pending and
+    accumulates `harness_induced` reasons until all open verifiers of `module` reach a terminal state.
+    """
+    if not module or module == "unknown":
+        return []
+    return sorted(
+        tid
+        for tid, t in tasks.items()
+        if t["kind"] == "verify" and (t.get("module") == module or _verify_harness_module(t, ctx) == module)
+    )
+
+
 def _describe_repair(task: dict) -> dict:
     mod = task["module"]
     actions = []
@@ -2203,8 +2416,14 @@ def _describe_repair(task: dict) -> dict:
     # A repaired harness has a new digest, so `build-`/`fuzz-<mod>` refuse it until the reach gate
     # records it again; build-check needs no re-run (the gate reads the current build report).
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run reach-gate")
+    # module-<mod> re-runs fuzz, Eva and facts on the repaired harness. Skipping Eva leaves the alarms, the
+    # facts and the WP queue resting on the old harness, so `refresh` refuses to close the repair until the
+    # fuzz and Eva reports carry the repaired harness's digest (and names the targets still to run).
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run module-{mod}")
-    actions.append(f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}")
+    actions.append(
+        f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}"
+        "  # refuses to close (repair: stale_evidence) until Eva and fuzz were re-run on the repaired harness"
+    )
     return {
         "task": task["id"],
         "kind": "repair",
@@ -2394,6 +2613,7 @@ def cmd_init(reconcile: bool = False) -> dict:
 
 def _prepare_failed(state: dict, task: dict, error: str) -> None:
     task["prepare_errors"] = int(task.get("prepare_errors") or 0) + 1
+    task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
     if task["prepare_errors"] >= MAX_PREPARE_ERRORS:
         _finish(state, task, "blocked", "prepare_failed", reason=error)
     else:
@@ -2446,10 +2666,19 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             budget = max(0, int(slots))
             out["slots"] = {"mode": "fixed", "running": running, "available": budget}
         picked: list[str] = []
-        for task in _ready(state, mode, ctx=ctx):
+        ready = _ready(state, mode, ctx=ctx)
+        # A breaker has no waiter, so its height is 0 and every taller prover outranks it: without reserved
+        # slots no breaker is ever dispatched while provers are ready (run-6: 19 created, none dispatched).
+        # A quarter of the budget (at least one slot) goes to ready breakers; unused reserved slots fall back
+        # to the normal order.
+        ready_breakers = [t["id"] for t in ready if t["kind"] == "breaker"]
+        reserved = set(ready_breakers[: min(len(ready_breakers), max(1, budget // 4), budget)])
+        for task in ready:
             if task["kind"] == "repair":
                 _assign_parent(state, task)
                 out["parent_tasks"].append(_describe_repair(task))
+                continue
+            if task["id"] not in reserved and len(picked) + len(reserved - set(picked)) >= budget:
                 continue
             if len(picked) >= budget:
                 continue
@@ -2484,6 +2713,14 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
             out["done"] = _is_done(state, ctx)
             return out
+        pre_eva = {
+            tid: ctx.eva_unknown_obligations(
+                snapshot[tid].get("module"),
+                snapshot[tid].get("file"),
+                snapshot[tid].get("function"),
+            )
+            for tid in picked
+        }
 
     # Scratch overlays are snapshotted under the `merge` lock: never while holding the ledger lock.
     prepared: dict[str, dict] = {}
@@ -2491,13 +2728,23 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
     if picked:
         worker_cap = min(len(picked), os.cpu_count() or 4, 16)
         sched = state  # the schedule the snapshot was taken from: negotiate evidence reads callers and agents
+        try:
+            _prepare_params = inspect.signature(DEPS.prepare_agent).parameters
+        except (TypeError, ValueError):
+            _prepare_params = {}  # type: ignore[assignment]
+        _pass_eva_obligations = "eva_unknown_obligations" in _prepare_params
+        # Passed once prepare_agent accepts it (the brief then names the calls whose callee has no contract).
+        _pass_no_contract = "callees_without_contract" in _prepare_params
 
         def _do_prepare(tid: str) -> tuple[str, dict | None, str | None]:
             task = snapshot[tid]
             try:
-                res = DEPS.prepare_agent(
-                    Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task, sched)
-                )
+                kw = _prepare_kwargs(task, sched)
+                if _pass_eva_obligations:
+                    kw["eva_unknown_obligations"] = pre_eva[tid]
+                if _pass_no_contract and task.get("callees_without_contract"):
+                    kw["callees_without_contract"] = list(task["callees_without_contract"])
+                res = DEPS.prepare_agent(Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **kw)
                 return tid, res, None
             except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running
                 return tid, None, f"{type(exc).__name__}: {exc}"
@@ -2710,10 +2957,20 @@ def _resolve_request(errors: list, rid: str, status: str, note: str) -> None:
     _try(errors, f"resolve {rid}", DEPS.resolve_request, REQUESTS, rid, status, note)
 
 
-def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[dict], out: dict) -> None:
-    """Each new strengthening request becomes (or joins) negotiate:<callee> right away, capped per pair."""
+def _emit_negotiations(
+    state: dict, ctx: Ctx, caller: dict, new_requests: list[dict], out: dict, dry_run: bool = False
+) -> None:
+    """
+    Each new strengthening request becomes (or joins) negotiate:<callee> right away, capped per pair.
+    `dry_run` (an in-memory sync, `status`) leaves the request store alone.
+    """
     tasks = state["tasks"]
     caller_key = _key(caller)
+
+    def resolve(errors: list, rid: str, status: str, note: str) -> None:
+        if not dry_run:
+            _resolve_request(errors, rid, status, note)
+
     for req in new_requests:
         rid = str(req.get("id"))
         name = str(req.get("callee_function") or "")
@@ -2723,7 +2980,7 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
         if not match and cfile and name:
             match = [(cfile, name, ctx.file_module.get(cfile, ""))]
         if not match:
-            _resolve_request(
+            resolve(
                 out["errors"],
                 rid,
                 "rejected_by_callee",
@@ -2733,7 +2990,7 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
         cfile, cname, cmod = match[0]
         key = f"{cfile}#{cname}"
         if key == caller_key:
-            _resolve_request(
+            resolve(
                 out["errors"],
                 rid,
                 "rejected_by_callee",
@@ -2742,7 +2999,7 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
             continue
         neg_verdict = _negotiate_skip_verdict(ctx.fn_units(cfile, cname), set(), ctx.verifiability(cfile, cname))
         if neg_verdict:
-            _resolve_request(
+            resolve(
                 out["errors"],
                 rid,
                 "rejected_by_callee",
@@ -2757,7 +3014,7 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
             and settled.get("outcome") != "applied"
             and int(settled.get("dispatches") or 0) >= MAX_NEGOTIATION_ROUNDS_PER_CALLEE
         ):
-            _resolve_request(
+            resolve(
                 out["errors"],
                 rid,
                 "rejected_by_callee",
@@ -2769,7 +3026,7 @@ def _emit_negotiations(state: dict, ctx: Ctx, caller: dict, new_requests: list[d
         pair = f"{caller['id']}|{key}"
         count = int(state["negotiation_counts"].get(pair, 0))
         if count >= MAX_NEGOTIATIONS_PER_PAIR:
-            _resolve_request(
+            resolve(
                 out["errors"],
                 rid,
                 "rejected_by_callee",
@@ -2867,7 +3124,7 @@ def _ensure_breaker(state: dict, prove_task: dict, agent_id: str, wp_report: str
     out.setdefault("new_tasks", []).append(tid)
 
 
-def _ensure_repair(state: dict, module: str, reason: str, out: dict) -> None:
+def _ensure_repair(state: dict, module: str, reason: str, out: dict, ctx: Ctx | None = None) -> None:
     tid = f"repair:{module}"
     task = state["tasks"].get(tid)
     if task is None:
@@ -2879,6 +3136,7 @@ def _ensure_repair(state: dict, module: str, reason: str, out: dict) -> None:
         task.setdefault("followup_reasons", []).append(reason)
     elif reason not in task.setdefault("reasons", []):
         task["reasons"].append(reason)
+    task["deps"] = _repair_verify_deps(state["tasks"], module, ctx)
     out.setdefault("new_tasks", []).append(tid)
 
 
@@ -2928,7 +3186,10 @@ def _eva_has_invalid(file: str, fn: str) -> bool:
     if not EVA_DIR.is_dir():
         return False
     for path in sorted(EVA_DIR.glob("*.json")):
-        data = load_json_optional(path, {}) or {}
+        try:
+            data = load_json_optional(path, {}, max_bytes=EVA_REPORT_MAX_BYTES) or {}
+        except ArtifactError:
+            continue
         for alarm in (data.get("invalid_alarms") if isinstance(data, dict) else None) or []:
             if isinstance(alarm, dict) and alarm.get("function") == fn and eva_alarm_in_file(alarm, file):
                 return True
@@ -3337,9 +3598,12 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
     )
     if harness_induced and not ing.get("harness_exhausted"):
         # The harness to repair (`pipeline_make.py run module-<harness>`), never a bare link unit.
-        _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out)
+        _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out, ctx=ctx)
     _finish(state, task, "done", str(ing.get("decision")))
     out.update(action="ingested", decision=ing.get("decision"), harness_exhausted=ing.get("harness_exhausted"))
+    if ing.get("sink_conflicts"):
+        # Opposite verdicts at one sink (ledger.py): shown to the parent now, not only in the final report.
+        out["sink_conflicts"] = ing["sink_conflicts"]
 
 
 def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path: Path, out: dict) -> None:
@@ -3892,21 +4156,105 @@ def cmd_step(
 # ---------------------------------------------------------------------------
 
 
+def _harness_run_flags(ctx: Ctx, harness: str) -> tuple[bool, bool]:
+    """(fuzz, eva): whether Make runs `fuzz-<harness>` and `eva-<harness>`, from the record its plan uses."""
+    import pipeline_make  # noqa: PLC0415 (lazy: only refresh needs the Make layer's module records)
+
+    try:
+        rec = pipeline_make._harness_record(ctx.mm, harness, ctx.modules)
+    except KeyError:
+        rec = ctx.modules.get(harness) or {}
+    eva = bool(rec.get("run_eva")) and not pipeline_make.is_target_fuzzer(ctx.sidecars.get(harness))
+    return bool(rec.get("run_eacsl_fuzz")), eva
+
+
+def _stale_repair_evidence(ctx: Ctx, module: str) -> tuple[list[dict], list[str]]:
+    """
+    Reports of `module`'s harnesses that were not produced from the current (repaired) harness, and the
+    Make targets that still have to run. A fuzz or Eva report must carry the current
+    `phase0_gates.harness_digest(..., ignore_exempt=True)` as `harness_digest`; a report without the field
+    is accepted only when it is newer than the harness files (written before the field existed). The facts
+    must be newer than the Eva report they were joined with.
+    """
+    stale: list[dict] = []
+    targets: list[str] = []
+    run_dir = Path(".")
+    for harness in ctx.harness_modules(module) or [module]:
+        digest = phase0_gates.harness_digest(run_dir, harness, ignore_exempt=True)
+        if digest is None:
+            continue  # no harness of its own: nothing was repaired here
+        # The harness source (the sidecar when there is none): the sidecar is rewritten for bookkeeping.
+        files = [p for p in (HARNESS_DIR / f"harness_{harness}.c", HARNESS_DIR / f"harness_{harness}.json") if p.is_file()]
+        harness_mtime = files[0].stat().st_mtime if files else 0.0
+        fuzz, eva = _harness_run_flags(ctx, harness)
+        eva_stale = False
+        for kind, runs in (("fuzz", fuzz), ("eva", eva)):
+            if not runs:
+                continue
+            path = Path(f"workspace/reports/{kind}/{harness}.json")
+            reason = None
+            if not path.is_file():
+                reason = "missing"
+            else:
+                try:
+                    report = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
+                except ArtifactError:
+                    report = None
+                recorded = report.get("harness_digest") if isinstance(report, dict) else None
+                if not isinstance(report, dict):
+                    reason = "unreadable"
+                elif recorded is None:
+                    if path.stat().st_mtime <= harness_mtime:
+                        reason = "no harness_digest and older than the harness"
+                elif recorded != digest:
+                    reason = "harness_digest differs from the current harness"
+            if reason:
+                stale.append({"module": harness, "report": path.as_posix(), "reason": reason})
+                targets.append(f"{kind}-{harness}")
+                eva_stale = eva_stale or kind == "eva"
+        if eva:
+            facts = Path(f"workspace/reports/facts/{harness}.json")
+            eva_path = Path(f"workspace/reports/eva/{harness}.json")
+            if eva_stale or (
+                eva_path.is_file() and (not facts.is_file() or facts.stat().st_mtime < eva_path.stat().st_mtime)
+            ):
+                targets.append(f"facts-{harness}")
+    return stale, targets
+
+
 def cmd_refresh(module: str | None = None) -> dict:
-    """After the parent repaired a harness (or re-ran a module): close repair:<module> and re-sync."""
+    """
+    After the parent repaired a harness (or re-ran a module): close repair:<module> and re-sync. The repair
+    stays open (`repair: "stale_evidence"`, `targets` to run) while a fuzz or Eva report of the module's
+    harnesses was produced from another harness than the current one. Facts older than the Eva report are
+    named in `targets` but do not hold the repair.
+    """
     with run_lock("ledger"):
         state = load_schedule()
         out: dict[str, Any] = {"ok": True, "repair": None}
+        ctx = Ctx()
         task = state["tasks"].get(f"repair:{module}") if module else None
         if task is not None and task["state"] not in TERMINAL:
+            stale, targets = _stale_repair_evidence(ctx, str(module))
             if task.get("followup_reasons"):
                 task["reasons"] = task.pop("followup_reasons")
                 _reopen(state, task, "new reasons arrived during the repair")
                 out["repair"] = "reopened"
+            elif stale:
+                out.update(ok=False, repair="stale_evidence", stale_evidence=stale, targets=targets)
+                out["actions"] = [
+                    f"python3 {SCRIPTS}/pipeline_make.py run {' '.join(targets)}",
+                    f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {module}",
+                ]
+                _event(state, "refresh_refused", task["id"], reason=f"stale evidence: {', '.join(targets)}")
             else:
                 _finish(state, task, "done", "refreshed")
                 out["repair"] = "done"
-        out["sync"] = _sync(state, Ctx())
+                if targets:
+                    # Only the facts lag behind the Eva report. `facts-<mod>` tolerates a failure (Make `-`), so a
+                    # missing facts file must not hold the repair: it is named, not enforced.
+                    out["targets"] = targets
+        out["sync"] = _sync(state, ctx)
         save_schedule(state)
     return out
 
@@ -3943,9 +4291,19 @@ def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None)
                 continue
             released = _release_units(task)
             previous = task.get("agent_id")
-            _reopen(state, task, f"requeued: agent {previous} never returned")
-            task["requeued_from"] = previous  # its result, should it still arrive, is accepted
-            out["requeued"].append({"task": task["id"], "agent_id": previous, "units_released": released})
+            had_brief = bool(previous and (Path("agents") / str(previous) / "brief.md").is_file())
+            if had_brief:
+                _reopen(state, task, f"requeued: agent {previous} never returned")
+                task["requeued_from"] = previous  # its result, should it still arrive, is accepted
+            else:
+                # `step --prepare` / `next --prepare` died after saving `running` before writing brief.md:
+                # no agent ever ran for `previous`, so do not burn the task's dispatch budget.
+                _reopen(state, task, f"requeued: agent {previous} was never prepared (missing brief.md)")
+                task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+            entry_info: dict[str, Any] = {"task": task["id"], "agent_id": previous, "units_released": released}
+            if not had_brief:
+                entry_info["unprepared"] = True
+            out["requeued"].append(entry_info)
         limit = float(stale_minutes or 0) * 60.0
         rechecks_requeued = []
         for rid, entry in list((state.get("rechecks") or {}).items()):
@@ -3963,7 +4321,7 @@ def cmd_status() -> dict:
     with run_lock("ledger"):
         state = load_schedule()
         ctx = Ctx()
-        _sync(state, ctx)  # in memory only: what `next` would see
+        _sync(state, ctx, persist=False)  # in memory only: what `next` would see
     mode = scheduler_mode()
     tasks = state["tasks"]
     now = DEPS.now()

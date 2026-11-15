@@ -566,6 +566,33 @@ def test_phase1_and_mixed_targets_still_require_gen(tmp_path):
         assert not (run / pm.MAKEFILE).exists()
 
 
+@pytest.mark.unit
+def test_phase1_targets_still_require_gen_after_a_phase0_target_bootstrapped_the_makefile(tmp_path):
+    fake = FakeMake(writes={pm._TARGET_OUTPUTS["stubs"]: json.dumps({"status": "ok"})})
+    rc, out = pm.run_targets(["stubs"], tmp_path, jobs=2, make_runner=fake, templates_dir=ACSL)
+    assert rc == 0 and (tmp_path / pm.MAKEFILE).is_file()
+    for targets in (["build"], ["eva-snmp"], ["seed", "fuzz"]):
+        rc, out = pm.run_targets(targets, tmp_path, jobs=2, make_runner=fake, templates_dir=ACSL)
+        assert rc == 2 and out["ok"] is False, (targets, out)
+        assert "pipeline_make.py gen" in out["error"] and pm.DAG_JSON in out["error"]
+    assert [c[7:] for c in fake.calls] == [["stubs"]]
+
+    # With the DAG but no harness sidecar for any of its modules, still nothing to run.
+    run = _make_run(tmp_path / "noharness")
+    for sidecar in (run / pm.HARNESS_DIR).glob("harness_*.json"):
+        sidecar.unlink()
+    rc, out = pm.run_targets(["build"], run, jobs=2, make_runner=FakeMake(), templates_dir=ACSL)
+    assert rc == 2 and "harness" in out["error"] and "pipeline_make.py gen" in out["error"]
+
+    # A run with its Phase 0 model and harnesses runs Phase 1 targets, the Makefile bootstrapped.
+    ready = _make_run(tmp_path / "ready")
+    (ready / pm.MAKEFILE).unlink(missing_ok=True)
+    fake_ready = FakeMake()
+    rc, out = pm.run_targets(["build"], ready, jobs=2, make_runner=fake_ready, templates_dir=ACSL)
+    assert "error" not in out, out
+    assert fake_ready.calls and (ready / pm.MAKEFILE).is_file()
+
+
 def test_run_rejects_unknown_and_excluded_targets(tmp_path):
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
@@ -1203,7 +1230,10 @@ def test_make_dry_run(tmp_path):
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    argv = json.loads(next(line for line in proc.stdout.splitlines() if line.startswith("ARGV "))[5:])
+    # The recipe runs the Phase 0 gate command first (no `--`): take the Eva run's command line.
+    argv = json.loads(
+        next(line for line in proc.stdout.splitlines() if line.startswith("ARGV ") and "run_eva_slice.py" in line)[5:]
+    )
     tool = argv[argv.index("--") + 1 :]
     cppflags = next(a for a in tool if a.startswith("--cppflags="))[len("--cppflags=") :]
     assert shlex.split(cppflags)[:3] == ["-I.", "-DQ=$5#x", '-DFMT="%s"']

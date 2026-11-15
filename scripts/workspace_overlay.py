@@ -51,15 +51,15 @@ from acsl_ast import (  # noqa: E402
     TrustBoundaryError,
     check_conflicting_acsl_profiles,
     check_frame_preserved,
+    contract_declaration_spans,
+    declaration_contract_text,
+    declaration_param_names,
     dedup_acsl_declarations,
     entry_requires_violations,
     extract_top_level_acsl_declarations,
-    function_contract_text,
-    function_param_names,
     function_trust_records,
     is_trust_boundary,
     locate_all_prototype_spans,
-    locate_function_span,
     splice_architect_header,
     splice_prover_changes,
     tokenize_c_acsl,
@@ -67,6 +67,7 @@ from acsl_ast import (  # noqa: E402
 )
 from fingerprint import normalize_file  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     PROVER_WALL_BUDGET_S,
     ArtifactError,
     atomic_write_json,
@@ -82,7 +83,7 @@ from framac_common import (  # noqa: E402
     scratch_first_cppflags,
     source_tree_relpath,
     utc_now,
-    wp_model_unsound,
+    wp_model_problem,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 from resources import (  # noqa: E402
@@ -990,15 +991,69 @@ def infer_prover_wp_flags(
     Infer the WP RTE check and memory-model CLI flags used by the prover for `function`
     so parent merge re-checks, contract re-checks, and final WP sweeps run with matching
     reduced-check assumptions (which `ledger.py` records explicitly on covered units) and
-    WP model. Defaults to `['--no-warn-unsigned-downcast']`.
+    WP model. Defaults to `['--no-warn-unsigned-downcast']`. A memory model that
+    `framac_common.wp_model_problem` rejects (`cast`, `Hoare`, `Region`, `nat`, ...) is never
+    replayed; `prover_wp_model_problem` refuses the merge of a prover that used one.
+    """
+    reduced, wp_model, _own, wrap_code_lines = _prover_wp_config(run_dir, overlay_dir, agent_id, c_file, function)
+    flags: list[str] = []
+    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
+        flags.append("--no-warn-unsigned")
+        if wrap_code_lines:
+            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
+            # The signed-downcast waiver on declared wrap lines (run_wp_function.py), valid only
+            # together with --no-warn-unsigned and declared lines.
+            if any("-warn-signed-downcast OFF" in r for r in reduced):
+                flags.append("--waive-signed-downcast")
+    else:
+        flags.append("--no-warn-unsigned-downcast")
+    if any("-warn-invalid-pointer OFF" in r for r in reduced):
+        flags.append("--no-warn-invalid-pointer")
+    # Replay only an accepted model; never the unsound `cast` option or a model that is not evidence.
+    if (
+        wp_model
+        and wp_model != "Typed"
+        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
+        and wp_model_problem(wp_model) is None
+    ):
+        flags.extend(["--wp-model", wp_model])
+    return flags
+
+
+def prover_wp_model_problem(
+    run_dir: Path,
+    overlay_dir: Path | None = None,
+    agent_id: str | None = None,
+    c_file: str | None = None,
+    function: str | None = None,
+) -> str | None:
+    """
+    Why the memory model of the prover's own WP report (the one `infer_prover_wp_flags` replays,
+    read from the agent's scratch, artifacts or result evidence) is not evidence, or None. The
+    parent re-check cannot replay such a model, so the prover's proof is not the one re-checked.
+    """
+    _reduced, wp_model, own, _lines = _prover_wp_config(run_dir, overlay_dir, agent_id, c_file, function)
+    return wp_model_problem(wp_model) if own and wp_model else None
+
+
+def _prover_wp_config(
+    run_dir: Path,
+    overlay_dir: Path | None,
+    agent_id: str | None,
+    c_file: str | None,
+    function: str | None,
+) -> tuple[list[str], str | None, bool, list[int]]:
+    """
+    (reduced checks, WP model, whether the model comes from the prover's own report, declared
+    wrap lines) of the report the prover's proof is replayed from.
     """
     overlay = (overlay_dir or (run_dir / "workspace")).resolve()
     norm_c = _normalize_work_relpath(c_file) if c_file else None
-    cand_paths: list[Path] = []
+    cand_paths: list[tuple[Path, bool]] = []  # (report, the prover's own)
     if agent_id and function and is_safe_agent_id(agent_id):
         agent_dir = run_dir / "agents" / agent_id
-        cand_paths.append(agent_dir / "scratch" / f"wp_{function}.json")
-        cand_paths.append(agent_dir / "artifacts" / f"wp_{function}.json")
+        cand_paths.append((agent_dir / "scratch" / f"wp_{function}.json", True))
+        cand_paths.append((agent_dir / "artifacts" / f"wp_{function}.json", True))
         res_file = agent_dir / "scratch" / "result.json"
         if res_file.is_file():
             res_data = load_json_optional(res_file, {}) or {}
@@ -1006,13 +1061,14 @@ def infer_prover_wp_flags(
                 for ev in res_data.get("evidence") or []:
                     tout = str((ev or {}).get("tool_output") or "").replace("\\", "/").strip()
                     if tout.startswith(f"agents/{agent_id}/") and tout.endswith(".json"):
-                        cand_paths.append(run_dir / tout)
-        cand_paths.append(agent_dir / "scratch" / "parent_wp" / f"{function}.json")
+                        cand_paths.append((run_dir / tout, True))
+        cand_paths.append((agent_dir / "scratch" / "parent_wp" / f"{function}.json", False))
     if function:
-        cand_paths.append(overlay / "reports" / "wp" / f"{function}.json")
+        cand_paths.append((overlay / "reports" / "wp" / f"{function}.json", False))
 
     reduced: list[str] = []
     wp_model: str | None = None
+    model_own = False
     wrap_code_lines: list[int] = []
 
     def _note_wraps(report: dict) -> None:
@@ -1020,7 +1076,7 @@ def infer_prover_wp_flags(
         if isinstance(declared, list) and not wrap_code_lines:
             wrap_code_lines.extend(n for n in declared if isinstance(n, int) and not isinstance(n, bool))
 
-    for p in cand_paths:
+    for p, own in cand_paths:
         if not p.is_file() or p.is_symlink():
             continue
         rep = load_json_optional(p, {}) or {}
@@ -1040,6 +1096,7 @@ def infer_prover_wp_flags(
         )
         if isinstance(m, str) and m.strip() and wp_model is None:
             wp_model = m.strip()
+            model_own = own
         _note_wraps(rep)
         if reduced or wp_model:
             break
@@ -1058,6 +1115,8 @@ def infer_prover_wp_flags(
                         reduced.append("-warn-unsigned-overflow / -warn-unsigned-downcast OFF")
                     if "-warn-invalid-pointer OFF" in desc:
                         reduced.append("-warn-invalid-pointer OFF")
+                    if "-warn-signed-downcast OFF" in desc:
+                        reduced.append("-warn-signed-downcast OFF on declared wrap lines")
                 for ev in u.get("evidence") or []:
                     if not isinstance(ev, dict) or ev.get("phase") != "wp":
                         continue
@@ -1078,25 +1137,7 @@ def infer_prover_wp_flags(
                                 )
                                 if isinstance(m, str) and m.strip() and wp_model is None:
                                     wp_model = m.strip()
-
-    flags: list[str] = []
-    if any("-warn-unsigned-overflow / -warn-unsigned-downcast OFF" in r for r in reduced):
-        flags.append("--no-warn-unsigned")
-        if wrap_code_lines:
-            flags.append(f"--wrap-code-lines={','.join(str(n) for n in wrap_code_lines)}")
-    else:
-        flags.append("--no-warn-unsigned-downcast")
-    if any("-warn-invalid-pointer OFF" in r for r in reduced):
-        flags.append("--no-warn-invalid-pointer")
-    # Never carry the unsound `cast` model into a parent re-check or the sweep.
-    if (
-        wp_model
-        and wp_model != "Typed"
-        and re.fullmatch(r"[A-Za-z0-9_+,-]+", wp_model)
-        and not wp_model_unsound(wp_model)
-    ):
-        flags.extend(["--wp-model", wp_model])
-    return flags
+    return reduced, wp_model, model_own, wrap_code_lines
 
 
 def _collect_existing_header_declarations(work_dir: Path, exclude_rels: set[str]) -> set[str]:
@@ -1114,6 +1155,29 @@ def _supports_kwarg(func: Any, kwarg: str) -> bool:
         return kwarg in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     except (ValueError, TypeError):
         return True
+
+
+def _wp_report_detail(wp_report: dict) -> str:
+    """`: <reason>; <first error line>` of a WP report (run_wp_function.py), or '' when it has neither."""
+    parts: list[str] = []
+    reason = wp_report.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(reason.strip())
+    syntax = wp_report.get("syntax_check")
+    soundness = wp_report.get("soundness")
+    for errors in (
+        wp_report.get("preprocess_errors"),
+        syntax.get("errors") if isinstance(syntax, dict) else None,
+        soundness.get("tier_a_aborts") if isinstance(soundness, dict) else None,
+        soundness.get("tier_b_unsound") if isinstance(soundness, dict) else None,
+    ):
+        first = next((e for e in errors if isinstance(e, str) and e.strip()), None) if isinstance(errors, list) else None
+        if first is not None:
+            line = first.strip().splitlines()[0][:300]
+            if not any(line in p for p in parts):
+                parts.append(line)
+            break
+    return (": " + "; ".join(parts)) if parts else ""
 
 
 def _run_parent_reverify(
@@ -1143,6 +1207,15 @@ def _run_parent_reverify(
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
     guard_report: dict | None = None
+
+    if role == "prover" and c_file and function:
+        # A proof under a memory model that is not evidence is never replayed, so the parent check
+        # would re-prove under another model than the prover's: refuse it outright.
+        model_problem = prover_wp_model_problem(
+            run_dir, overlay_dir=overlay_dir, agent_id=agent_id, c_file=_normalize_work_relpath(c_file), function=function
+        )
+        if model_problem:
+            return False, f"prover's WP report used a memory model that is not accepted: {model_problem}"
 
     if module and sources:
         # A link unit is built through one of its harnesses (the one answering for `function`).
@@ -1279,10 +1352,10 @@ def _run_parent_reverify(
                 return (
                     False,
                     f"parent partial WP check rejected (status={wp_status!r}, sound_ok={sound_ok}, "
-                    f"assigns_verified={assigns_ok})",
+                    f"assigns_verified={assigns_ok}){_wp_report_detail(wp_report)}",
                 )
         elif wp_status != "all_proven":
-            return False, f"parent WP check on merged tree returned status={wp_status!r}"
+            return False, f"parent WP check on merged tree returned status={wp_status!r}{_wp_report_detail(wp_report)}"
         if guard_report is not None and _apply_guard_limits(wp_report, function, guard_report):
             wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
         _publish_canonical_wp(run_dir, overlay_dir, wp_json, norm_c, function)
@@ -1506,9 +1579,7 @@ def _untrusted_entry_metas(
             # is the entry named here (`minmea_checksum` is called by the `minmea` harness from its
             # NUL-terminated copy). Carry that shape fact, or `valid_read_string` on the attacker
             # string is misread as a value constraint (minmea run-1, 2026-11-14).
-            if any(
-                bool(m.get("null_terminate")) or m.get("entry_style") in ("c_string", "argv") for m in out
-            ):
+            if any(bool(m.get("null_terminate")) or m.get("entry_style") in ("c_string", "argv") for m in out):
                 entry["null_terminate"] = True
             out.append(entry)
     return out
@@ -1540,6 +1611,10 @@ def entry_trust_boundary_errors(
     changed its contract; violations already in the target's own baseline ACSL are not the agent's.
     An entry that records its `file` (one the function's trust put on the boundary) is checked in
     that source and in headers, never in another source's same-named static.
+
+    In a header, every declaration of the entry is checked (a `static inline` function is often
+    declared twice and a contract may sit on either), each against its own formal names: the
+    prototype may call a parameter `pUOutBuf` and the definition `pMe` (QCBOR run-6).
     """
     entry = str(hmeta.get("entry_fn") or "")
     if not entry or Path(rel).suffix not in ACSL_CHECK_EXTS:
@@ -1549,21 +1624,30 @@ def entry_trust_boundary_errors(
     if entry_file and not is_hdr and _normalize_work_relpath(rel) != entry_file:
         return []
     try:
-        if function_contract_text(agent_text, entry, is_hdr, rel) == function_contract_text(
-            base_text, entry, is_hdr, rel
-        ):
+        if [declaration_contract_text(d, rel) for d in contract_declaration_spans(agent_text, entry, is_hdr, rel)] == [
+            declaration_contract_text(d, rel) for d in contract_declaration_spans(base_text, entry, is_hdr, rel)
+        ]:
             return []
-        contract = function_contract_text(merged_text, entry, is_hdr, rel)
-        params = set(function_param_names(merged_text, entry, is_hdr, rel))
-        baseline_contract = function_contract_text(baseline_text, entry, is_hdr, rel)
+        merged_decls = contract_declaration_spans(merged_text, entry, is_hdr, rel)
+        baseline_decls = contract_declaration_spans(baseline_text, entry, is_hdr, rel)
     except AcslError:
         return []  # the ACSL-only check reports unparsable files
-    params.update(str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k))
+    globals_ = {str(hmeta[k]) for k in ("global_buf", "global_len") if hmeta.get(k)}
     nul = bool(hmeta.get("null_terminate")) or hmeta.get("entry_style") in ("c_string", "argv")
-    found = entry_requires_violations(contract, params, nul_terminated=nul)
+
+    def violations(decls: list) -> list[str]:
+        out: list[str] = []
+        for decl in decls:
+            params = set(declaration_param_names(decl, rel)) | globals_
+            for v in entry_requires_violations(declaration_contract_text(decl, rel), params, nul_terminated=nul):
+                if v not in out:
+                    out.append(v)
+        return out
+
+    found = violations(merged_decls)
     if not found:
         return []
-    pre_existing = set(entry_requires_violations(baseline_contract, params, nul_terminated=nul))
+    pre_existing = set(violations(baseline_decls))
     return [f"{rel}: {entry}: {v}" for v in found if v not in pre_existing]
 
 
@@ -1748,11 +1832,16 @@ def _merge_agent_overlay_locked(
         # spliced files together.
         frame_parts: list[str] = []
         for rel_str in changed_rels:
-            span = locate_function_span(
+            # A header may declare the function twice (prototype and `static inline` definition);
+            # the spliced contract can sit on either declaration, so read the ACSL of every one.
+            # Frama-C merges the two contracts and takes the union of their `assigns`, which is
+            # what "some clause lists the location" checks here.
+            for decl in contract_declaration_spans(
                 new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str
-            )
-            if span is not None:
-                frame_parts.append(_acsl_text_of_span(span))
+            ):
+                acsl_piece = _acsl_text_of_span(decl.span)
+                if acsl_piece and acsl_piece not in frame_parts:
+                    frame_parts.append(acsl_piece)
         frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
@@ -1896,6 +1985,36 @@ def _merge_agent_overlay_locked(
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
     return result
+
+
+def single_merge_build_inputs(
+    overlay: Path,
+    module: str | None,
+    sources: list[str] | None,
+    cppflags: str | None,
+    ldflags: str | None,
+    reverify: bool = True,
+) -> tuple[list[str] | None, str, str]:
+    """
+    (sources, cppflags, ldflags) for one `merge-agent` call: what the caller passed, else the
+    module's merged harness sidecar (as `_enrich_batch_entry` does for a batch), else `-I.` and no
+    sources. A merge that re-verifies with `module` but resolves no sources is refused: the parent
+    re-check would otherwise skip the E-ACSL guardrail without saying so (QCBOR run-6).
+    """
+    hmeta: dict = merged_sidecar(module_map_for(Path(overlay)), module) if module else {}
+    side_sources = hmeta.get("sources")
+    out_sources = sources or (
+        [str(s) for s in side_sources if isinstance(s, str) and s] if isinstance(side_sources, list) else None
+    )
+    out_sources = out_sources or None
+    out_cppflags = cppflags or str(hmeta.get("cppflags") or "") or "-I."
+    out_ldflags = ldflags if ldflags is not None else str(hmeta.get("ldflags") or "")
+    if module and reverify and not out_sources:
+        raise ArtifactError(
+            f"merge-agent --module {module}: no harness sources found for the module, so the parent "
+            "re-check cannot run the E-ACSL guardrail; pass --sources (and --cppflags) explicitly"
+        )
+    return out_sources, out_cppflags, out_ldflags
 
 
 def _enrich_batch_entry(
@@ -2488,6 +2607,36 @@ _REJECTED_RESULT_REUSE = {
 }
 
 
+CALLEES_WITHOUT_CONTRACT_MAX = 20
+
+
+def _callees_without_contract_section(callees: list[str] | None, role: str) -> str:
+    """
+    Appended to a prover's brief when the scheduler dispatched it although some callees have no contract
+    its proof can see and none can be obtained (wp_scheduler `callees_without_contract`, `<file>#<name>`
+    keys: a crash candidate, an out-of-scope function, or a negotiation that ended without a contract).
+    """
+    if role != "prover" or not callees:
+        return ""
+    rows = []
+    for key in list(dict.fromkeys(str(c) for c in callees))[:CALLEES_WITHOUT_CONTRACT_MAX]:
+        cfile, cname = (re.sub(r"[\s`]+", " ", part).strip() for part in key.rpartition("#")[::2])
+        rows.append(f"- `{cname}`" + (f" (`{cfile}`)" if cfile else ""))
+    more = len(set(callees)) - len(rows)
+    if more > 0:
+        rows.append(f"- ... and {more} more")
+    return (
+        "\n## Calls Without a Contract\n\n"
+        "These callees have no ACSL contract your proof can see, and the pipeline could not get one (a crash "
+        "candidate, a function out of scope, or a negotiation that ended without a contract):\n\n"
+        + "\n".join(rows)
+        + "\n\nWP applies its default specification to these calls: they may write anything and guarantee "
+        "nothing. Do not assume any postcondition of these calls, do not write a contract for them, and do not "
+        "file a strengthening request for them. Prove what holds without them, and list the goals that depend "
+        "on their effects in `unproven_goals`.\n"
+    )
+
+
 def _rejected_result_section(rejected_result: dict | None, agent_id: str, role: str) -> str:
     """
     Appended to the brief of an agent that re-runs a task whose previous result.json failed validation
@@ -2589,6 +2738,8 @@ def prepare_agent(
     caller_evidence: list[dict] | None = None,
     callee_history: dict | None = None,
     rejected_result: dict | None = None,
+    eva_unknown_obligations: list[dict] | None = None,
+    callees_without_contract: list[str] | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -2603,6 +2754,8 @@ def prepare_agent(
     (a summary of this function's previous prover run).
     `rejected_result` (`{"agent_id", "errors"}`) is set when this agent re-runs a task whose previous
     result.json failed validation: the brief ends with those errors.
+    `callees_without_contract` (`<file>#<name>` keys, from the scheduler) are the prover's callees that
+    have no contract and cannot get one: the brief names them.
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -2684,16 +2837,20 @@ def prepare_agent(
     harness_module_name = module
     if module:
         if role == "architect":
-            harness_module_name = next(
-                (
-                    m
-                    for m in harness_modules_of(mm, module)
-                    if isinstance(mm.sidecars.get(m), dict)
-                    and _normalize_work_relpath(str(mm.sidecars[m].get("header") or ""))
-                    == _normalize_work_relpath(norm_header or "")
-                ),
-                None,
-            ) or harness_module_for_function(mm, module) or module
+            harness_module_name = (
+                next(
+                    (
+                        m
+                        for m in harness_modules_of(mm, module)
+                        if isinstance(mm.sidecars.get(m), dict)
+                        and _normalize_work_relpath(str(mm.sidecars[m].get("header") or ""))
+                        == _normalize_work_relpath(norm_header or "")
+                    ),
+                    None,
+                )
+                or harness_module_for_function(mm, module)
+                or module
+            )
         elif function and role in ("prover", "breaker"):
             harness_module_name = harness_module_for_function(mm, module, norm_c_file, function) or module
     brief_meta = mm.sidecars.get(harness_module_name) if harness_module_name else None
@@ -2742,13 +2899,6 @@ def prepare_agent(
     else:
         norm_header = _resolve_include_header(run_dir, overlay / "work", norm_header, header_flags)
 
-    # Eva reports are per harness: a link unit's are those of its harnesses.
-    eva_reports = [
-        rep
-        for name in dict.fromkeys([*([module] if module else []), *harness_names])
-        for rep in [load_json_optional(overlay / "reports" / "eva" / f"{name}.json", {})]
-        if isinstance(rep, dict) and rep
-    ]
     wp_report_rel: str | None = None
     wp_data: dict = {}
     if wp_report:
@@ -2759,14 +2909,33 @@ def prepare_agent(
         wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
 
     unknown_obligations: list = []
-    for eva_report in eva_reports if function else []:
-        raw_unknowns = (eva_report.get("unknown_obligations_by_function") or {}).get(function, [])
-        rows = [
-            a for a in raw_unknowns if not (norm_c_file and isinstance(a, dict)) or eva_alarm_in_file(a, norm_c_file)
-        ]
-        # Another harness's report of the same unit repeats rows the first one listed.
-        seen = list(unknown_obligations)
-        unknown_obligations += [a for a in rows if a not in seen]
+    if eva_unknown_obligations is not None:
+        unknown_obligations = list(eva_unknown_obligations) if function else []
+    elif function:
+        # Eva reports are per harness: only load them when preparing a function-scoped brief,
+        # and tolerate oversized or unreadable reports gracefully.
+        for name in dict.fromkeys([*([module] if module else []), *harness_names]):
+            try:
+                eva_report = load_json_optional(
+                    overlay / "reports" / "eva" / f"{name}.json",
+                    {},
+                    max_bytes=EVA_REPORT_MAX_BYTES,
+                )
+            except ArtifactError:
+                continue
+            if not isinstance(eva_report, dict) or not eva_report:
+                continue
+            raw_unknowns = (eva_report.get("unknown_obligations_by_function") or {}).get(function, [])
+            if not isinstance(raw_unknowns, list):
+                continue
+            rows = [
+                a
+                for a in raw_unknowns
+                if not (norm_c_file and isinstance(a, dict)) or eva_alarm_in_file(a, norm_c_file)
+            ]
+            # Another harness's report of the same unit repeats rows the first one listed.
+            seen = list(unknown_obligations)
+            unknown_obligations += [a for a in rows if a not in seen]
 
     unproven_goals = wp_data.get("unproven_goals", []) if isinstance(wp_data, dict) else []
     if not unproven_goals and unknown_obligations:
@@ -2959,6 +3128,7 @@ def prepare_agent(
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
         rendered += _negotiation_evidence_section(caller_evidence, callee_history)
+    rendered += _callees_without_contract_section(callees_without_contract, role)
     rendered += _rejected_result_section(rejected_result, agent_id, role)
 
     brief_path = agent_root / "brief.md"
@@ -3187,9 +3357,9 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--function", default=None)
     p_merge.add_argument("--header", default=None)
     p_merge.add_argument("--module", default=None)
-    p_merge.add_argument("--sources", nargs="*", default=None)
-    p_merge.add_argument("--cppflags", default="-I.")
-    p_merge.add_argument("--ldflags", default="", help="Extra linker flags for parent guardrail")
+    p_merge.add_argument("--sources", nargs="*", default=None, help="Default: the --module's harness sources")
+    p_merge.add_argument("--cppflags", default=None, help="Default: the --module's cppflags, else -I.")
+    p_merge.add_argument("--ldflags", default=None, help="Extra linker flags for parent guardrail (default: the --module's)")
     p_merge.add_argument("--skip-reverify", action="store_true")
     p_merge.add_argument(
         "--allow-partial-wp",
@@ -3272,6 +3442,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(res, indent=2))
             return 0 if res["ok"] else 1
         elif args.cmd == "merge-agent":
+            m_sources, m_cppflags, m_ldflags = single_merge_build_inputs(
+                (args.overlay or args.run_dir / "workspace"),
+                args.module,
+                args.sources,
+                args.cppflags,
+                args.ldflags,
+                reverify=not args.skip_reverify,
+            )
             res = merge_agent_overlay(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -3281,9 +3459,9 @@ def main(argv: list[str] | None = None) -> int:
                 function=args.function,
                 header_file=args.header,
                 module=args.module,
-                sources=args.sources,
-                cppflags=args.cppflags,
-                ldflags=args.ldflags,
+                sources=m_sources,
+                cppflags=m_cppflags,
+                ldflags=m_ldflags,
                 skip_reverify=args.skip_reverify,
                 allow_partial_wp=args.allow_partial_wp,
                 contract_only=args.contract_only,

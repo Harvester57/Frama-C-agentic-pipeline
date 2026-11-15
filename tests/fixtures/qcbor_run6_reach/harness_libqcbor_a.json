@@ -1,0 +1,2466 @@
+{
+ "module": "libqcbor_a",
+ "unit": "libqcbor_a",
+ "harness_file": "workspace/harnesses/harness_libqcbor_a.c",
+ "entry_style": "dispatch",
+ "dispatch_case_count": 182,
+ "api_cases": [
+  {
+   "selector": 0,
+   "kind": "single",
+   "entry": "UsefulBuf_Compare",
+   "calls": [
+    "UsefulBuf_Compare"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 1,
+   "kind": "single",
+   "entry": "UsefulBuf_CopyOffset",
+   "calls": [
+    "UsefulBuf_CopyOffset"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 2,
+   "kind": "single",
+   "entry": "UsefulBuf_FindBytes",
+   "calls": [
+    "UsefulBuf_FindBytes"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 3,
+   "kind": "single",
+   "entry": "UsefulBuf_IsValue",
+   "calls": [
+    "UsefulBuf_IsValue"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 4,
+   "kind": "single",
+   "entry": "UsefulBuf_SkipLeading",
+   "calls": [
+    "UsefulBuf_SkipLeading"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 5,
+   "kind": "single",
+   "entry": "UsefulInputBuf_Compare",
+   "calls": [
+    "UsefulInputBuf_Compare"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulInputBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 6,
+   "kind": "single",
+   "entry": "UsefulInputBuf_GetBytes",
+   "calls": [
+    "UsefulInputBuf_GetBytes"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulInputBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 7,
+   "kind": "single",
+   "entry": "UsefulOutBuf_Advance",
+   "calls": [
+    "UsefulOutBuf_Advance"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 8,
+   "kind": "single",
+   "entry": "UsefulOutBuf_AppendDirect",
+   "calls": [
+    "UsefulOutBuf_AppendDirect"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 9,
+   "kind": "single",
+   "entry": "UsefulOutBuf_AppendUsefulBuf",
+   "calls": [
+    "UsefulOutBuf_AppendUsefulBuf"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 10,
+   "kind": "single",
+   "entry": "UsefulOutBuf_Compare",
+   "calls": [
+    "UsefulOutBuf_Compare"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 11,
+   "kind": "single",
+   "entry": "UsefulOutBuf_CopyOut",
+   "calls": [
+    "UsefulOutBuf_CopyOut"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 12,
+   "kind": "single",
+   "entry": "UsefulOutBuf_Flush",
+   "calls": [
+    "UsefulOutBuf_Flush"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 13,
+   "kind": "single",
+   "entry": "UsefulOutBuf_Init",
+   "calls": [
+    "UsefulOutBuf_Init"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 14,
+   "kind": "single",
+   "entry": "UsefulOutBuf_InsertUsefulBuf",
+   "calls": [
+    "UsefulOutBuf_InsertUsefulBuf"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 15,
+   "kind": "single",
+   "entry": "UsefulOutBuf_OutSubString",
+   "calls": [
+    "UsefulOutBuf_OutSubString"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 16,
+   "kind": "single",
+   "entry": "UsefulOutBuf_OutUBuf",
+   "calls": [
+    "UsefulOutBuf_OutUBuf"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 17,
+   "kind": "single",
+   "entry": "UsefulOutBuf_OutUBufOffset",
+   "calls": [
+    "UsefulOutBuf_OutUBufOffset"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 18,
+   "kind": "single",
+   "entry": "UsefulOutBuf_Swap",
+   "calls": [
+    "UsefulOutBuf_Swap"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 19,
+   "kind": "single",
+   "entry": "IEEE754_DoubleIsNonTrivialNaN",
+   "calls": [
+    "IEEE754_DoubleIsNonTrivialNaN"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 20,
+   "kind": "single",
+   "entry": "IEEE754_SingleIsNonTrivialNaN",
+   "calls": [
+    "IEEE754_SingleIsNonTrivialNaN"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 21,
+   "kind": "single",
+   "entry": "qcbor_err_to_str",
+   "calls": [
+    "qcbor_err_to_str"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 22,
+   "kind": "single",
+   "entry": "QCBORDecode_CompatibilityV1",
+   "calls": [
+    "QCBORDecode_CompatibilityV1"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 23,
+   "kind": "single",
+   "entry": "QCBORDecode_EndCheck",
+   "calls": [
+    "QCBORDecode_EndCheck"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 24,
+   "kind": "single",
+   "entry": "QCBORDecode_Finish",
+   "calls": [
+    "QCBORDecode_Finish"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 25,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNext",
+   "calls": [
+    "QCBORDecode_GetNext"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 26,
+   "kind": "single",
+   "entry": "QCBORDecode_Init",
+   "calls": [
+    "QCBORDecode_Init"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 27,
+   "kind": "single",
+   "entry": "QCBORDecode_PartialFinish",
+   "calls": [
+    "QCBORDecode_PartialFinish"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 28,
+   "kind": "single",
+   "entry": "QCBORDecode_PeekNext",
+   "calls": [
+    "QCBORDecode_PeekNext"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 29,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_ConsumeItem",
+   "calls": [
+    "QCBORDecode_Private_ConsumeItem"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 30,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetArrayOrMap",
+   "calls": [
+    "QCBORDecode_Private_GetArrayOrMap"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 31,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetItemChecks",
+   "calls": [
+    "QCBORDecode_Private_GetItemChecks"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 32,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetNextTagContent",
+   "calls": [
+    "QCBORDecode_Private_GetNextTagContent"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 33,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_NestLevelAscender",
+   "calls": [
+    "QCBORDecode_Private_NestLevelAscender"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 34,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_UnMapTagNumber",
+   "calls": [
+    "QCBORDecode_Private_UnMapTagNumber"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 35,
+   "kind": "single",
+   "entry": "QCBORDecode_RestoreCursor",
+   "calls": [
+    "QCBORDecode_RestoreCursor"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 36,
+   "kind": "single",
+   "entry": "QCBORDecode_SaveCursor",
+   "calls": [
+    "QCBORDecode_SaveCursor"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 37,
+   "kind": "single",
+   "entry": "QCBORDecode_SetMemPool",
+   "calls": [
+    "QCBORDecode_SetMemPool"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 38,
+   "kind": "single",
+   "entry": "QCBORDecode_VGetNext",
+   "calls": [
+    "QCBORDecode_VGetNext"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 39,
+   "kind": "single",
+   "entry": "QCBORDecode_VGetNextConsume",
+   "calls": [
+    "QCBORDecode_VGetNextConsume"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 40,
+   "kind": "single",
+   "entry": "QCBORDecode_VPeekNext",
+   "calls": [
+    "QCBORDecode_VPeekNext"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 41,
+   "kind": "single",
+   "entry": "QCBOREncode_AddEncoded",
+   "calls": [
+    "QCBOREncode_AddEncoded"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 42,
+   "kind": "single",
+   "entry": "QCBOREncode_AddStreamedEncoded",
+   "calls": [
+    "QCBOREncode_AddStreamedEncoded"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 43,
+   "kind": "single",
+   "entry": "QCBOREncode_CancelBstrWrap",
+   "calls": [
+    "QCBOREncode_CancelBstrWrap"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 44,
+   "kind": "single",
+   "entry": "QCBOREncode_CloseAndSortFlowedMap",
+   "calls": [
+    "QCBOREncode_CloseAndSortFlowedMap"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 45,
+   "kind": "single",
+   "entry": "QCBOREncode_CloseAndSortMap",
+   "calls": [
+    "QCBOREncode_CloseAndSortMap"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 46,
+   "kind": "single",
+   "entry": "QCBOREncode_CloseBstrWrap2",
+   "calls": [
+    "QCBOREncode_CloseBstrWrap2"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 47,
+   "kind": "single",
+   "entry": "QCBOREncode_CloseBytes",
+   "calls": [
+    "QCBOREncode_CloseBytes"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 48,
+   "kind": "single",
+   "entry": "QCBOREncode_EncodeHead",
+   "calls": [
+    "QCBOREncode_EncodeHead"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 49,
+   "kind": "single",
+   "entry": "QCBOREncode_Finish",
+   "calls": [
+    "QCBOREncode_Finish"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 50,
+   "kind": "single",
+   "entry": "QCBOREncode_FinishGetSize",
+   "calls": [
+    "QCBOREncode_FinishGetSize"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 51,
+   "kind": "single",
+   "entry": "QCBOREncode_FinishStream",
+   "calls": [
+    "QCBOREncode_FinishStream"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 52,
+   "kind": "single",
+   "entry": "QCBOREncode_Init",
+   "calls": [
+    "QCBOREncode_Init"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 53,
+   "kind": "single",
+   "entry": "QCBOREncode_OpenBytes",
+   "calls": [
+    "QCBOREncode_OpenBytes"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 54,
+   "kind": "single",
+   "entry": "QCBOREncode_OpenSizedBytes",
+   "calls": [
+    "QCBOREncode_OpenSizedBytes"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 55,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddBuffer",
+   "calls": [
+    "QCBOREncode_Private_AddBuffer"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 56,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddStreamedBuffer",
+   "calls": [
+    "QCBOREncode_Private_AddStreamedBuffer"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 57,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AppendCBORHead",
+   "calls": [
+    "QCBOREncode_Private_AppendCBORHead"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 58,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_CloseMapOrArray",
+   "calls": [
+    "QCBOREncode_Private_CloseMapOrArray"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 59,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_CloseMapUnsorted",
+   "calls": [
+    "QCBOREncode_Private_CloseMapUnsorted"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 60,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_CloseNestingAppend",
+   "calls": [
+    "QCBOREncode_Private_CloseNestingAppend"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 61,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_InIndefString",
+   "calls": [
+    "QCBOREncode_Private_InIndefString"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 62,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_OpenNestingAppend",
+   "calls": [
+    "QCBOREncode_Private_OpenNestingAppend"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 63,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_OpenNestingInsert",
+   "calls": [
+    "QCBOREncode_Private_OpenNestingInsert"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 64,
+   "kind": "single",
+   "entry": "QCBOREncode_SubString",
+   "calls": [
+    "QCBOREncode_SubString"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 65,
+   "kind": "single",
+   "entry": "QCBORDecode_GetDoubleConvertAll",
+   "calls": [
+    "QCBORDecode_GetDoubleConvertAll"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 66,
+   "kind": "single",
+   "entry": "QCBORDecode_GetDoubleConvertAllInMapN",
+   "calls": [
+    "QCBORDecode_GetDoubleConvertAllInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 67,
+   "kind": "single",
+   "entry": "QCBORDecode_GetDoubleConvertAllInMapSZ",
+   "calls": [
+    "QCBORDecode_GetDoubleConvertAllInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 68,
+   "kind": "single",
+   "entry": "QCBORDecode_GetInt64ConvertAll",
+   "calls": [
+    "QCBORDecode_GetInt64ConvertAll"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 69,
+   "kind": "single",
+   "entry": "QCBORDecode_GetInt64ConvertAllInMapN",
+   "calls": [
+    "QCBORDecode_GetInt64ConvertAllInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 70,
+   "kind": "single",
+   "entry": "QCBORDecode_GetInt64ConvertAllInMapSZ",
+   "calls": [
+    "QCBORDecode_GetInt64ConvertAllInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 71,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNumberConvertPrecisely",
+   "calls": [
+    "QCBORDecode_GetNumberConvertPrecisely"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 72,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloat",
+   "calls": [
+    "QCBORDecode_GetTBigFloat"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 73,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatBigMantissa",
+   "calls": [
+    "QCBORDecode_GetTBigFloatBigMantissa"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 74,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatBigMantissaInMapN",
+   "calls": [
+    "QCBORDecode_GetTBigFloatBigMantissaInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 75,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatBigMantissaInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTBigFloatBigMantissaInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 76,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatBigMantissaRaw",
+   "calls": [
+    "QCBORDecode_GetTBigFloatBigMantissaRaw"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 77,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatBigMantissaRawInMapN",
+   "calls": [
+    "QCBORDecode_GetTBigFloatBigMantissaRawInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 78,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatBigMantissaRawInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTBigFloatBigMantissaRawInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 79,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatInMapN",
+   "calls": [
+    "QCBORDecode_GetTBigFloatInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 80,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigFloatInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTBigFloatInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 81,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigNumber",
+   "calls": [
+    "QCBORDecode_GetTBigNumber"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 82,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigNumberInMapN",
+   "calls": [
+    "QCBORDecode_GetTBigNumberInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 83,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigNumberInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTBigNumberInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 84,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigNumberRaw",
+   "calls": [
+    "QCBORDecode_GetTBigNumberRaw"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 85,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigNumberRawInMapN",
+   "calls": [
+    "QCBORDecode_GetTBigNumberRawInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 86,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTBigNumberRawInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTBigNumberRawInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 87,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFraction",
+   "calls": [
+    "QCBORDecode_GetTDecimalFraction"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 88,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionBigMantissa",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionBigMantissa"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 89,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionBigMantissaInMapN",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionBigMantissaInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 90,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionBigMantissaInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionBigMantissaInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 91,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionBigMantissaRaw",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionBigMantissaRaw"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 92,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionBigMantissaRawInMapN",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionBigMantissaRawInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 93,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionBigMantissaRawInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionBigMantissaRawInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 94,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionInMapN",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 95,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTDecimalFractionInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTDecimalFractionInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 96,
+   "kind": "single",
+   "entry": "QCBORDecode_GetUInt64ConvertAll",
+   "calls": [
+    "QCBORDecode_GetUInt64ConvertAll"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 97,
+   "kind": "single",
+   "entry": "QCBORDecode_GetUInt64ConvertAllInMapN",
+   "calls": [
+    "QCBORDecode_GetUInt64ConvertAllInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 98,
+   "kind": "single",
+   "entry": "QCBORDecode_GetUInt64ConvertAllInMapSZ",
+   "calls": [
+    "QCBORDecode_GetUInt64ConvertAllInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 99,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetDoubleConvert",
+   "calls": [
+    "QCBORDecode_Private_GetDoubleConvert"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 100,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetDoubleConvertInMapN",
+   "calls": [
+    "QCBORDecode_Private_GetDoubleConvertInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 101,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetDoubleConvertInMapSZ",
+   "calls": [
+    "QCBORDecode_Private_GetDoubleConvertInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 102,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetInt64Convert",
+   "calls": [
+    "QCBORDecode_Private_GetInt64Convert"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 103,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetInt64ConvertInMapN",
+   "calls": [
+    "QCBORDecode_Private_GetInt64ConvertInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 104,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetInt64ConvertInMapSZ",
+   "calls": [
+    "QCBORDecode_Private_GetInt64ConvertInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 105,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetUInt64Convert",
+   "calls": [
+    "QCBORDecode_Private_GetUInt64Convert"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 106,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetUInt64ConvertInMapN",
+   "calls": [
+    "QCBORDecode_Private_GetUInt64ConvertInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 107,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetUInt64ConvertInMapSZ",
+   "calls": [
+    "QCBORDecode_Private_GetUInt64ConvertInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 108,
+   "kind": "single",
+   "entry": "QCBORDecode_ProcessBigNumber",
+   "calls": [
+    "QCBORDecode_ProcessBigNumber"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 109,
+   "kind": "single",
+   "entry": "QCBOREncode_AddInt64",
+   "calls": [
+    "QCBOREncode_AddInt64"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 110,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddPreferredDouble",
+   "calls": [
+    "QCBOREncode_Private_AddPreferredDouble"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 111,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddPreferredFloat",
+   "calls": [
+    "QCBOREncode_Private_AddPreferredFloat"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 112,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddTBigNumberMain",
+   "calls": [
+    "QCBOREncode_Private_AddTBigNumberMain"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 113,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddTExpBigMantissa",
+   "calls": [
+    "QCBOREncode_Private_AddTExpBigMantissa"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 114,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddTExpBigMantissaRaw",
+   "calls": [
+    "QCBOREncode_Private_AddTExpBigMantissaRaw"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 115,
+   "kind": "single",
+   "entry": "QCBOREncode_Private_AddTExpIntMantissa",
+   "calls": [
+    "QCBOREncode_Private_AddTExpIntMantissa"
+   ],
+   "inits": [
+    {
+     "fn": "QCBOREncode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 116,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterArrayFromMapN",
+   "calls": [
+    "QCBORDecode_EnterArrayFromMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 117,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterArrayFromMapSZ",
+   "calls": [
+    "QCBORDecode_EnterArrayFromMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 118,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterMapFromMapN",
+   "calls": [
+    "QCBORDecode_EnterMapFromMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 119,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterMapFromMapSZ",
+   "calls": [
+    "QCBORDecode_EnterMapFromMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 120,
+   "kind": "single",
+   "entry": "QCBORDecode_GetBool",
+   "calls": [
+    "QCBORDecode_GetBool"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 121,
+   "kind": "single",
+   "entry": "QCBORDecode_GetBoolInMapN",
+   "calls": [
+    "QCBORDecode_GetBoolInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 122,
+   "kind": "single",
+   "entry": "QCBORDecode_GetBoolInMapSZ",
+   "calls": [
+    "QCBORDecode_GetBoolInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 123,
+   "kind": "single",
+   "entry": "QCBORDecode_GetItemInMapN",
+   "calls": [
+    "QCBORDecode_GetItemInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 124,
+   "kind": "single",
+   "entry": "QCBORDecode_GetItemInMapSZ",
+   "calls": [
+    "QCBORDecode_GetItemInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 125,
+   "kind": "single",
+   "entry": "QCBORDecode_GetSimple",
+   "calls": [
+    "QCBORDecode_GetSimple"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 126,
+   "kind": "single",
+   "entry": "QCBORDecode_GetSimpleInMapN",
+   "calls": [
+    "QCBORDecode_GetSimpleInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 127,
+   "kind": "single",
+   "entry": "QCBORDecode_GetSimpleInMapSZ",
+   "calls": [
+    "QCBORDecode_GetSimpleInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 128,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_EnterBoundedMapOrArray",
+   "calls": [
+    "QCBORDecode_Private_EnterBoundedMapOrArray"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 129,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_ExitBoundedLevel",
+   "calls": [
+    "QCBORDecode_Private_ExitBoundedLevel"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 130,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_ExitBoundedMapOrArray",
+   "calls": [
+    "QCBORDecode_Private_ExitBoundedMapOrArray"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 131,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetItemInMapNoCheckN",
+   "calls": [
+    "QCBORDecode_Private_GetItemInMapNoCheckN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 132,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetItemInMapNoCheckSZ",
+   "calls": [
+    "QCBORDecode_Private_GetItemInMapNoCheckSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 133,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetString",
+   "calls": [
+    "QCBORDecode_Private_GetString"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 134,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_SearchAndGetArrayOrMap",
+   "calls": [
+    "QCBORDecode_Private_SearchAndGetArrayOrMap"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 135,
+   "kind": "single",
+   "entry": "QCBORDecode_Rewind",
+   "calls": [
+    "QCBORDecode_Rewind"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 136,
+   "kind": "single",
+   "entry": "QCBORDecode_SeekToLabelN",
+   "calls": [
+    "QCBORDecode_SeekToLabelN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 137,
+   "kind": "single",
+   "entry": "QCBORDecode_SeekToLabelSZ",
+   "calls": [
+    "QCBORDecode_SeekToLabelSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 138,
+   "kind": "single",
+   "entry": "QCBORDecode_BigNumTagCB",
+   "calls": [
+    "QCBORDecode_BigNumTagCB"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 139,
+   "kind": "single",
+   "entry": "QCBORDecode_DateEpochTagCB",
+   "calls": [
+    "QCBORDecode_DateEpochTagCB"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 140,
+   "kind": "single",
+   "entry": "QCBORDecode_DaysEpochTagCB",
+   "calls": [
+    "QCBORDecode_DaysEpochTagCB"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 141,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterBstrWrapped",
+   "calls": [
+    "QCBORDecode_EnterBstrWrapped"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 142,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterBstrWrappedFromMapN",
+   "calls": [
+    "QCBORDecode_EnterBstrWrappedFromMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 143,
+   "kind": "single",
+   "entry": "QCBORDecode_EnterBstrWrappedFromMapSZ",
+   "calls": [
+    "QCBORDecode_EnterBstrWrappedFromMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 144,
+   "kind": "single",
+   "entry": "QCBORDecode_ExitBstrWrapped",
+   "calls": [
+    "QCBORDecode_ExitBstrWrapped"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 145,
+   "kind": "single",
+   "entry": "QCBORDecode_ExpMantissaTagCB",
+   "calls": [
+    "QCBORDecode_ExpMantissaTagCB"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 146,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNextTagNumber",
+   "calls": [
+    "QCBORDecode_GetNextTagNumber"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 147,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNextTagNumberInMapN",
+   "calls": [
+    "QCBORDecode_GetNextTagNumberInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 148,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNextTagNumberInMapSZ",
+   "calls": [
+    "QCBORDecode_GetNextTagNumberInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 149,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNthTag",
+   "calls": [
+    "QCBORDecode_GetNthTag"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 150,
+   "kind": "single",
+   "entry": "QCBORDecode_GetNthTagOfLast",
+   "calls": [
+    "QCBORDecode_GetNthTagOfLast"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 151,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTEpochDate",
+   "calls": [
+    "QCBORDecode_GetTEpochDate"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 152,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTEpochDateInMapN",
+   "calls": [
+    "QCBORDecode_GetTEpochDateInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 153,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTEpochDateInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTEpochDateInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 154,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTEpochDays",
+   "calls": [
+    "QCBORDecode_GetTEpochDays"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 155,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTEpochDaysInMapN",
+   "calls": [
+    "QCBORDecode_GetTEpochDaysInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 156,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTEpochDaysInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTEpochDaysInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 157,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTMIMEMessage",
+   "calls": [
+    "QCBORDecode_GetTMIMEMessage"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 158,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTMIMEMessageInMapN",
+   "calls": [
+    "QCBORDecode_GetTMIMEMessageInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 159,
+   "kind": "single",
+   "entry": "QCBORDecode_GetTMIMEMessageInMapSZ",
+   "calls": [
+    "QCBORDecode_GetTMIMEMessageInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 160,
+   "kind": "single",
+   "entry": "QCBORDecode_MIMETagCB",
+   "calls": [
+    "QCBORDecode_MIMETagCB"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 161,
+   "kind": "single",
+   "entry": "QCBORDecode_NthTagNumber",
+   "calls": [
+    "QCBORDecode_NthTagNumber"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 162,
+   "kind": "single",
+   "entry": "QCBORDecode_NthTagNumberOfLast",
+   "calls": [
+    "QCBORDecode_NthTagNumberOfLast"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 163,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetTaggedString",
+   "calls": [
+    "QCBORDecode_Private_GetTaggedString"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 164,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetTaggedStringInMapN",
+   "calls": [
+    "QCBORDecode_Private_GetTaggedStringInMapN"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 165,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_GetTaggedStringInMapSZ",
+   "calls": [
+    "QCBORDecode_Private_GetTaggedStringInMapSZ"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 166,
+   "kind": "single",
+   "entry": "QCBORDecode_Private_ProcessTagItem",
+   "calls": [
+    "QCBORDecode_Private_ProcessTagItem"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 167,
+   "kind": "single",
+   "entry": "QCBORDecode_StringsTagCB",
+   "calls": [
+    "QCBORDecode_StringsTagCB"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 168,
+   "kind": "single",
+   "entry": "QCBORDecode_VGetNextTagNumber",
+   "calls": [
+    "QCBORDecode_VGetNextTagNumber"
+   ],
+   "inits": [
+    {
+     "fn": "QCBORDecode_Init"
+    }
+   ]
+  },
+  {
+   "selector": 169,
+   "kind": "single",
+   "entry": "QCBOR_Private_BigNumConformance",
+   "calls": [
+    "QCBOR_Private_BigNumConformance"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 170,
+   "kind": "sequence",
+   "calls": [
+    "QCBOREncode_Init",
+    "QCBOREncode_Private_OpenNestingInsert",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_AddInt64",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_AddInt64",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_AddInt64",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_OpenNestingInsert",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_CloseMapOrArray",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AppendCBORHead",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "QCBOREncode_Finish",
+    "QCBOREncode_Init",
+    "QCBOREncode_Private_OpenNestingInsert",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_AddInt64",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_AddInt64",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_AddInt64",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_OpenNestingInsert",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_AddPreferredDouble",
+    "QCBOREncode_Private_CloseMapOrArray",
+    "QCBOREncode_Private_AddBuffer",
+    "QCBOREncode_Private_AppendCBORHead",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "QCBOREncode_Finish"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 171,
+   "kind": "sequence",
+   "calls": [
+    "QCBORDecode_Init",
+    "QCBORDecode_Private_EnterBoundedMapOrArray",
+    "QCBORDecode_GetItemInMapSZ",
+    "QCBORDecode_Private_GetInt64ConvertInMapSZ",
+    "QCBORDecode_Private_GetInt64ConvertInMapSZ",
+    "QCBORDecode_Private_GetDoubleConvertInMapSZ",
+    "QCBORDecode_GetBoolInMapSZ",
+    "QCBORDecode_Private_GetInt64ConvertInMapSZ",
+    "QCBORDecode_EnterArrayFromMapSZ",
+    "QCBORDecode_Private_GetDoubleConvert",
+    "QCBORDecode_Private_GetDoubleConvert",
+    "QCBORDecode_Private_GetDoubleConvert",
+    "QCBORDecode_Private_GetDoubleConvert",
+    "QCBORDecode_Private_GetDoubleConvert",
+    "QCBORDecode_Private_GetDoubleConvert",
+    "QCBORDecode_Private_ExitBoundedMapOrArray",
+    "QCBORDecode_Private_ExitBoundedMapOrArray",
+    "QCBORDecode_Finish"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 172,
+   "kind": "sequence",
+   "calls": [
+    "QCBORDecode_Init",
+    "QCBORDecode_VGetNext",
+    "QCBORDecode_Finish",
+    "QCBORDecode_Init",
+    "QCBORDecode_GetNextTagNumber",
+    "QCBORDecode_VGetNext",
+    "QCBORDecode_Finish"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 173,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 174,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_Advance",
+    "UsefulOutBuf_OutUBuf",
+    "UsefulOutBuf_CopyOut",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_Advance",
+    "UsefulOutBuf_OutUBuf"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 175,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_InsertUsefulBuf"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 176,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_OutSubString",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_OutUBuf",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_OutUBuf",
+    "UsefulOutBuf_CopyOut"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 177,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_InsertUsefulBuf",
+    "UsefulOutBuf_OutSubString"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulOutBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 178,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Flush",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Flush",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendDirect",
+    "UsefulOutBuf_Flush",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_Flush",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendDirect",
+    "UsefulOutBuf_Flush",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_Flush",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_CopyOut",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendDirect",
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_InsertUsefulBuf"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 179,
+   "kind": "sequence",
+   "calls": [
+    "UsefulOutBuf_Init",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_AppendUsefulBuf",
+    "UsefulOutBuf_OutUBuf"
+   ],
+   "inits": []
+  },
+  {
+   "selector": 180,
+   "kind": "sequence",
+   "calls": [
+    "UsefulInputBuf_GetBytes",
+    "UsefulInputBuf_GetBytes",
+    "UsefulInputBuf_GetBytes",
+    "UsefulInputBuf_GetBytes",
+    "UsefulInputBuf_GetBytes",
+    "UsefulInputBuf_GetBytes"
+   ],
+   "inits": [
+    {
+     "fn": "UsefulInputBuf_Init"
+    }
+   ]
+  },
+  {
+   "selector": 181,
+   "kind": "custom",
+   "calls": [],
+   "inits": []
+  }
+ ]
+}

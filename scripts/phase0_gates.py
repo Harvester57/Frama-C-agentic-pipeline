@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ GATES_JSON = "workspace/reports/phase0_gates.json"
 HARNESS_DIR = "workspace/harnesses"
 DAG_JSON = "workspace/reports/callgraph_dag.json"
 SECTIONS = ("reach", "build_check")
+DYNAMIC_GAP_ERROR = "dynamic: entry points never executed by the corpus"
 HOW_TO_RUN = {
     "reach": "python3 $S/harness_reach.py check",
     "build_check": "python3 $S/pipeline_make.py build-check",
@@ -106,6 +108,35 @@ def harness_digest(run_dir: Path, module: str, ignore_exempt: bool = False) -> s
     return h.hexdigest() if found else None
 
 
+# `harness_digest` of a report built from runs that cannot be tied to the current harness. It equals no
+# digest, so every comparison with the current harness fails (wp_scheduler.py refresh: stale evidence).
+HARNESS_DIGEST_UNKNOWN = "unknown"
+
+
+def derived_harness_digest(run_dir: Path, module: str, inputs: Iterable[Path]) -> str | None:
+    """
+    The `harness_digest` of a report built from `inputs` that record none (Eva trials or shards written
+    before the field existed). It is the current harness's digest when every input is newer than the
+    harness source, else HARNESS_DIGEST_UNKNOWN: a report rebuilt today from runs that predate a harness
+    repair must not pass for one of the repaired harness because the rebuild is recent. None when the
+    module has no harness.
+    """
+    current = harness_digest(run_dir, module, ignore_exempt=True)
+    if current is None:
+        return None
+    paths = [Path(p) for p in inputs]
+    try:
+        # The source, as wp_scheduler's refresh reads it: the sidecar is rewritten for bookkeeping.
+        source = next(
+            p for s in (".c", ".json") if (p := Path(run_dir) / HARNESS_DIR / f"harness_{module}{s}").is_file()
+        )
+        changed = source.stat().st_mtime
+        fresh = bool(paths) and all(p.stat().st_mtime > changed for p in paths)
+    except (OSError, StopIteration):
+        fresh = False
+    return current if fresh else HARNESS_DIGEST_UNKNOWN
+
+
 def dag_digest(run_dir: Path, dag_path: Path | None = None) -> str | None:
     """sha256 of the call-graph DAG (the run's own unless `dag_path`), or None when it is missing."""
     path = Path(dag_path) if dag_path is not None else Path(run_dir) / DAG_JSON
@@ -146,6 +177,8 @@ def record_reach(
             "passed": bool(row.get("passed")),
             "gaps": list(row.get("gaps") or []),
             "error": row.get("error"),
+            # Why crash inputs did not count as execution of a gap (harness_reach.py `crash_notes`).
+            "notes": [str(n) for n in (row.get("crash_notes") or [])],
             "exempt": row.get("exempt"),
             "harness_digest": harness_digest(run_dir, name),
             "dag_digest": dag,
@@ -196,6 +229,12 @@ def _section_ok(section: str, entry: dict[str, Any]) -> bool:
     return bool(entry.get("passed") if section == "reach" else entry.get("ok"))
 
 
+def _row_reach_ok(row: dict[str, Any], allow_dynamic_gap: bool = False) -> bool:
+    if row.get("passed"):
+        return True
+    return bool(allow_dynamic_gap and row.get("error") == DYNAMIC_GAP_ERROR)
+
+
 def current_build_status(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, str] | None:
     """
     The build-check verdict on the module's current build report (workspace/build/<mod>.build.json),
@@ -223,6 +262,7 @@ def check(
     need: tuple[str, ...] = SECTIONS,
     modules_expected: list[str] | None = None,
     fuzzed_expected: list[str] | None = None,
+    allow_dynamic_gap: bool = False,
 ) -> list[str]:
     """
     Reasons the gate fails for `module` (or for the whole run when None); empty when it passes.
@@ -250,20 +290,22 @@ def check(
                     reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
                 expected = fuzzed_expected
             else:
-                if not _section_ok(section, entry):
-                    failed = sorted(m for m, r in modules.items() if not r.get("passed"))
+                failed = sorted(m for m, r in modules.items() if not _row_reach_ok(r, allow_dynamic_gap))
+                if failed or (not modules and not _section_ok(section, entry)):
                     reasons.append(
                         f"{section} failed for {', '.join(failed) or 'the run'}; {_reach_next_step('<mod>')}"
                     )
                 stale = sorted(
                     m
                     for m, r in modules.items()
-                    if r.get("passed") and r.get("harness_digest") != harness_digest(run_dir, m)
+                    if _row_reach_ok(r, allow_dynamic_gap) and r.get("harness_digest") != harness_digest(run_dir, m)
                 )
                 if stale:
                     reasons.append(f"the harness of {', '.join(stale)} changed after the reach gate ran; run it again")
                 dag_stale = sorted(
-                    m for m, r in modules.items() if r.get("passed") and r.get("dag_digest") != current_dag
+                    m
+                    for m, r in modules.items()
+                    if _row_reach_ok(r, allow_dynamic_gap) and r.get("dag_digest") != current_dag
                 )
                 if dag_stale:
                     reasons.append(_dag_changed(", ".join(dag_stale)))
@@ -279,8 +321,10 @@ def check(
             reasons.append(f"{section}: module {module} was not checked; run `{HOW_TO_RUN[section]}` again")
             continue
         if section == "reach":
-            if not row.get("passed"):
+            if not _row_reach_ok(row, allow_dynamic_gap):
                 detail = row.get("error") or f"entry points not reached: {', '.join(row.get('gaps') or [])}"
+                if row.get("notes"):
+                    detail += f" ({'; '.join(row['notes'][:3])})"
                 reasons.append(f"reach gate failed for {module}: {detail}; {_reach_next_step(module)}")
             elif row.get("harness_digest") != harness_digest(run_dir, module):
                 reasons.append(f"the harness of {module} changed after the reach gate ran; run it again")
@@ -338,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Whole run: the plan's fuzzed modules (space-separated), each needing a build row",
     )
+    c.add_argument(
+        "--allow-dynamic-gap",
+        action="store_true",
+        help="Allow reach rows that failed only on dynamic corpus gaps when harness and DAG digests still match",
+    )
     a = p.parse_args(argv)
     need = tuple(s.strip() for s in a.need.split(",") if s.strip())
     unknown = [s for s in need if s not in SECTIONS]
@@ -352,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
             need,
             None if a.modules is None else a.modules.split(),
             None if a.fuzzed is None else a.fuzzed.split(),
+            allow_dynamic_gap=a.allow_dynamic_gap,
         )
     except (ArtifactError, OSError, ValueError) as exc:
         reasons = [f"cannot read {GATES_JSON}: {exc}"]

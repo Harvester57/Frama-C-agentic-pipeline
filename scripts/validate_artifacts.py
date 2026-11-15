@@ -675,6 +675,31 @@ PHASE0_COMMANDS: dict[str, Any] = {
 }
 
 
+# What libFuzzer writes into its current directory when it runs an input without `-artifact_prefix`.
+STRAY_FUZZER_PREFIXES = ("crash-", "leak-", "timeout-", "oom-", "slow-unit-")
+
+
+def stray_fuzzer_artifacts(run_dir: Path) -> Errors:
+    """
+    libFuzzer artifacts in the run-dir root (QCBOR run-6: a verifier replayed an input from the run
+    dir). Nothing ingests them there. Checked by the `run-dir` command only, not by validate_run_dir,
+    so `make report` stops on them while the run's state stays readable by the report and the ledger.
+    """
+    errors = Errors()
+    try:
+        entries = sorted(run_dir.iterdir())
+    except OSError:
+        return errors
+    for path in entries:
+        if path.is_file() and path.name.startswith(STRAY_FUZZER_PREFIXES):
+            errors.add(
+                f"{path.name}: libFuzzer artifact in the run-dir root, outside workspace/crashes/ (never ingested); "
+                "replays must go through `run_eacsl_fuzz.py replay` (or pass -artifact_prefix=<scratch dir>/). "
+                "Compare it with the recorded crashes, then move or delete it."
+            )
+    return errors
+
+
 def validate_run_dir(run_dir: Path) -> Errors:
     errors = _validate_run_dir_core(run_dir)
     for e in validate_phase0_artifacts(run_dir):
@@ -817,7 +842,10 @@ def main(argv=None) -> int:
 
     try:
         if args.cmd == "run-dir":
-            return _emit(validate_run_dir(args.path))
+            errors = stray_fuzzer_artifacts(args.path)  # first: never cut by the error cap
+            for e in validate_run_dir(args.path):
+                errors.add(e)
+            return _emit(errors)
         if args.cmd == "traces":
             if not args.path.is_file():
                 raise ArtifactError(f"{args.path}: not found")

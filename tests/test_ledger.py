@@ -231,6 +231,30 @@ def test_ingest_fuzz_crash_and_clean(run_dir):
     assert list(validate_candidates(cands)) == []
 
 
+def test_ingest_fuzz_records_keep_going_rounds_that_stopped_early(run_dir):
+    """A crash in a case the round had skipped stops the rounds: the other cases were not fuzzed."""
+    seed(run_dir)
+    why = "round 2 crashed in skipped case 3"
+    report = {
+        "mode": "campaign",
+        "module": "snmp",
+        "status": "crash_found",
+        "artifacts": [],
+        "keep_going": {"status": "ok"},
+        "engines": {"eacsl": {"keep_going": {"status": "error", "error": why}}, "asan": {"keep_going": None}},
+    }
+    write_json(run_dir / "workspace/reports/fuzz/snmp.json", report)
+    L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
+    found = [
+        e
+        for u in load(run_dir / "coverage-ledger.json")
+        for e in u["evidence"]
+        if e["result"] == "fuzz_keep_going_error"
+    ]
+    assert found and all(why in e["summary"] and e["discharging"] is False for e in found)
+    assert L.fuzz_keep_going_errors({"keep_going": {"status": "ok"}}) == []
+
+
 def test_ingest_fuzz_unparsed_crash_gets_triage_candidate(run_dir):
     seed(run_dir)
     report = {

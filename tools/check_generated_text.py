@@ -51,7 +51,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -464,16 +464,44 @@ def check_paths(paths: Iterable[Path], *, root: Path = ROOT, allow: Sequence[All
 _PATH_TOKEN_RE = re.compile(r"""(?:"([^"]+)"|'([^']+)'|([^\s"'`;|&<>()]+))""")
 
 
+_CHDIR_COMMANDS = frozenset({"cd", "pushd", "set-location", "sl", "chdir"})
+
+
 def _paths_in_command(command: str, cwd: Path) -> list[Path]:
+    """
+    The files with a checked suffix a shell command names. A relative name is resolved against the
+    directory the command changed to before naming it (`cd <dir>; pytest tests/x.py`), not only against
+    the session's directory: an agent working in another worktree would otherwise have the session
+    worktree's copy of the file checked.
+    """
     found: list[Path] = []
+    previous = ""
     for match in _PATH_TOKEN_RE.finditer(command):
         token = next(g for g in match.groups() if g is not None)
+        if previous.lower() in _CHDIR_COMMANDS:
+            target = Path(token) if Path(token).is_absolute() else cwd / token
+            if target.is_dir():
+                cwd = target
+        previous = token
         if Path(token).suffix.lower() not in CHECKED_SUFFIXES:
             continue
         candidate = Path(token) if Path(token).is_absolute() else cwd / token
         if candidate.is_file():
             found.append(candidate)
     return found
+
+
+def _checkout_root(path: Path, root: Path) -> Path:
+    """
+    The checkout a file belongs to: the nearest ancestor holding a `.git` entry (a directory in a clone,
+    a file in a worktree), else `root`. Allowlist patterns are relative to it, so a file in a worktree
+    under `<root>/.claude/worktrees/<name>/` matches the same entries as the main checkout's copy.
+    """
+    resolved = path.resolve()
+    for parent in resolved.parents:
+        if (parent / ".git").exists():
+            return parent
+    return root
 
 
 def _recently_dirty(root: Path, horizon: float) -> list[Path]:
@@ -528,7 +556,15 @@ def run_hook(stdin_text: str, root: Path = ROOT, allowlist: Path = DEFAULT_ALLOW
         return 0, ""
     if not isinstance(payload, dict):
         return 0, ""
-    violations = check_paths(hook_targets(payload, root), root=root, allow=load_allowlist(allowlist))
+    allow = load_allowlist(allowlist)
+    violations: list[Violation] = []
+    for path in hook_targets(payload, root):
+        own_root = _checkout_root(path, root)
+        hits = check_paths([path], root=own_root, allow=allow)
+        if own_root.resolve() != root.resolve():
+            # Matched against the allowlist by its own checkout's path; shown by where the file is.
+            hits = [replace(v, path=_relative(path, root)) for v in hits]
+        violations += hits
     if not violations:
         return 0, ""
     lines = [v.format() for v in violations[:50]]

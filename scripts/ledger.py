@@ -70,7 +70,8 @@ import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
-    WP_UNSOUND_MODEL_ISSUE,
+    DEFAULT_JSON_MAX_BYTES,
+    EVA_REPORT_MAX_BYTES,
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
@@ -82,7 +83,8 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
     wp_limits_problem,
-    wp_model_unsound,
+    wp_model_assumption,
+    wp_model_problem,
 )
 from module_map import ModuleMap  # noqa: E402
 from patterns import KERNEL_RENAME_RE  # noqa: E402
@@ -263,8 +265,17 @@ def add_assumption(unit: dict, kind: str, description: str, related: list[str] |
         unit["assumptions"].append(a)
 
 
-def add_wp_limit_assumptions(unit: dict, limits: dict, function: str) -> None:
+def wp_report_models(report: dict) -> list[str]:
+    """The WP memory models a report's verdict was obtained under: its own and a triggered bitwise retry's."""
+    retry = report.get("bitwise_retry") or {}
+    models = [report.get("wp_model"), retry.get("wp_model") if retry.get("triggered") else None]
+    return [m for m in models if isinstance(m, str) and m.strip()]
+
+
+def add_wp_limit_assumptions(unit: dict, limits: dict, function: str, model_assumption: str | None = None) -> None:
     """What a credited proof did not establish stays visible as an open assumption on the unit."""
+    if model_assumption:
+        add_assumption(unit, "other", model_assumption)
     if limits["vacuity"]["status"] == "inconclusive":
         add_assumption(unit, "other", f"The consistency check of {function}'s contract was inconclusive.")
     oracle = limits.get("dynamic_oracle") or {}
@@ -412,6 +423,7 @@ def tool_evidence_on_verified_candidate(
     tool_output: str,
     linked: list[str],
     already_listed: bool,
+    override_checked: bool = False,
 ) -> str:
     """
     A tool-reproduced signal (`artifact`: a crash input a tool replayed) arrived for a verified
@@ -428,7 +440,12 @@ def tool_evidence_on_verified_candidate(
       `checked_rejection` (the verifier cited a tool output that refutes the candidate; for a
       `harness_induced` rejection this holds only while the harness is the one it was made on),
       `harness_unchanged` (a `harness_induced` rejection and the same harness source: the crash
-      recurring through the unrepaired harness says nothing new) or `reopen_limit`.
+      recurring through the unrepaired harness says nothing new; not for the `sibling_verdict`
+      source, an opposite verdict on the same sink) or `reopen_limit`.
+
+    `override_checked`: the evidence outweighs a `checked` rejection (a sibling verdict that
+    confirmed the same sink with a reproducer: one of the two verifiers is wrong, and a cited tool
+    output does not say which). The reopening limit still applies.
     """
     recs = _rejected_resolution(cand, findings)
     if recs is None:
@@ -454,13 +471,14 @@ def tool_evidence_on_verified_candidate(
         return "known"
 
     # What a verifier cited about a `harness_induced` rejection speaks for the harness it was made on.
-    verifier_checked = not (rej_class == "harness_induced" and harness_changed) and any(
+    verifier_checked = not override_checked and not (rej_class == "harness_induced" and harness_changed) and any(
         r.get("refutation_basis") == "checked" and source_of(r) not in INGEST_RAISED_BASIS_SOURCES for r in recs
     )
     reason: str | None = None
     if verifier_checked:
         reason = "checked_rejection"
-    elif rej_class == "harness_induced" and harness_known and not harness_changed:
+    elif rej_class == "harness_induced" and harness_known and not harness_changed and source != "sibling_verdict":
+        # A sibling's opposite verdict on the same crash is not the harness speaking again.
         reason = "harness_unchanged"
     elif len(cand.get("reopened") or []) >= harness["max_reopenings"]:
         reason = "reopen_limit"
@@ -991,6 +1009,23 @@ def _report_scope(mm: ModuleMap, module: str) -> tuple[str, set[tuple[str, str]]
     return mm.unit_of(module), scope_keys(mm, module)
 
 
+def fuzz_keep_going_errors(report: dict) -> list[str]:
+    """
+    Why a campaign's keep-going rounds stopped before every dispatch case was fuzzed (`keep_going.status:
+    error`, e.g. a crash in a case the round had skipped), from the report and each engine's part.
+    """
+    engines = report.get("engines")
+    parts = [report, *(engines.values() if isinstance(engines, dict) else [])]
+    errors: list[str] = []
+    for part in parts:
+        kg = part.get("keep_going") if isinstance(part, dict) else None
+        if isinstance(kg, dict) and kg.get("status") == "error":
+            text = str(kg.get("error") or "no reason recorded")
+            if text not in errors:
+                errors.append(text)
+    return errors
+
+
 def fuzz_engine_note(report: dict) -> str:
     """Human-readable engine qualifier for fuzz evidence (sanitizer fallback has narrower checks)."""
     if report.get("engine_used") == "sanitizers":
@@ -1059,6 +1094,18 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
             continue
 
         ingested_modules.append(module)
+        for kg_error in fuzz_keep_going_errors(report):
+            # The crashes below are still ingested; the cases the rounds never got to were not fuzzed.
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_keep_going_error",
+                    False,
+                    tool_output,
+                    f"Keep-going fuzz rounds stopped early, the remaining dispatch cases were not fuzzed: {kg_error}",
+                )
         for art in report.get("artifacts", []):
             artifact_rel = rel(art["artifact"])
             failure = art.get("failure")
@@ -1547,7 +1594,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
     taint_checks = _taint_checks()
     code_checks = _code_checks()
     for path in paths:
-        report = load_json_strict(path)
+        report = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
         stats["reports"] += 1
         tool_output = rel(str(path))
         # `module` is the report's harness module; verdicts and candidates stay keyed by it. With link
@@ -1998,10 +2045,14 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 and any(e.get("phase") == "wp" and e.get("discharging") for e in u.get("evidence") or [])
             ]
             sweep_checks.append((str(report["status"]), tool_output, wp_covered))
-        if report["status"] == "all_proven" and wp_model_unsound(report.get("wp_model")):
-            # A report written before run_wp_function.py refused the model itself: same verdict.
+        models = wp_report_models(report)
+        model_problem = next((p for p in map(wp_model_problem, models) if p), None)
+        model_assumption = next((a for a in map(wp_model_assumption, models) if a), None)
+        if report["status"] == "all_proven" and model_problem:
+            # A model that is not evidence (`cast`, `Hoare`, `nat`, ...), including a report written
+            # before run_wp_function.py refused the model itself: the proof is unsound.
             soundness = dict(report.get("soundness") or {})
-            soundness["tier_b_unsound"] = [*(soundness.get("tier_b_unsound") or []), WP_UNSOUND_MODEL_ISSUE]
+            soundness["tier_b_unsound"] = [*(soundness.get("tier_b_unsound") or []), model_problem]
             report = {**report, "status": "unsound_proof", "soundness": soundness}
         if report["status"] == "acsl_syntax_error":
             for u in targets:
@@ -2164,7 +2215,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"{counts.get('proven', 0)} goal(s) proven, {counts.get('proven_under_hyp', 0)} valid under hypotheses.",
                     details={"limits": limits},
                 )
-                add_wp_limit_assumptions(u, limits, report["function"])
+                add_wp_limit_assumptions(u, limits, report["function"], model_assumption)
                 if counts.get("proven_under_hyp", 0):
                     add_assumption(
                         u,
@@ -2204,7 +2255,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     ev_summary,
                     details={"limits": limits},
                 )
-                add_wp_limit_assumptions(u, limits, report["function"])
+                add_wp_limit_assumptions(u, limits, report["function"], model_assumption)
                 if soundness.get("reduced_checks"):
                     add_assumption(
                         u,
@@ -2230,7 +2281,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"(no {cls} goal left); WP soundness passed.",
                     details={"limits": limits},
                 )
-                add_wp_limit_assumptions(u, limits, report["function"])
+                add_wp_limit_assumptions(u, limits, report["function"], model_assumption)
                 u["status"] = "covered"
                 u["unresolved"] = []
                 credited.add(u["coverage_id"])
@@ -2906,16 +2957,16 @@ def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_out
     return shas
 
 
-def _find_matching_sink_finding(
-    findings: dict[str, dict],
-    rec: dict,
-    run_dir: Path | None = None,
-) -> dict | None:
+# A generic kind matches any kind at the same sink line (a prover's `rte` goal and a fuzz `mem_access`).
+SINK_KIND_WILDCARDS = ("rte", "assertion", "property")
+SinkKey = tuple[str, str, int, str]
+
+
+def _sink_key(rec: dict, run_dir: Path | None = None) -> SinkKey | None:
     """
-    Find an already-recorded finding with the same verdict and the same canonical sink
-    `(normalized_file, function, canonical_baseline_line, normalized_kind)` so two different
-    fingerprints for the same root cause (e.g. a prover hypothesis predicate and a fuzz crash
-    predicate at the same line) merge into a single finding instead of inflating the report count.
+    The canonical sink of a verdict record: `(normalized_file, function, baseline_line, normalized_kind)`,
+    or None when the record has no usable location. The decision point plays no part (a rejected
+    record has none).
     """
     loc = rec.get("location") or {}
     rec_file = normalize_file(loc.get("file") or "")
@@ -2925,29 +2976,141 @@ def _find_matching_sink_finding(
         return None
     from workspace_overlay import map_work_to_baseline_line
 
-    rec_base_line, _ = map_work_to_baseline_line(rec_file, rec_line, run_dir=run_dir)
-    rec_prop = rec.get("property") or {}
-    rec_kind = normalize_kind(rec_prop.get("kind") or "", rec_prop.get("predicate") or "")
+    base_line, _ = map_work_to_baseline_line(rec_file, rec_line, run_dir=run_dir)
+    prop = rec.get("property") or {}
+    return rec_file, rec_fn, base_line, normalize_kind(prop.get("kind") or "", prop.get("predicate") or "")
 
+
+def _same_sink(a: SinkKey, b: SinkKey) -> bool:
+    return a[:3] == b[:3] and (a[3] == b[3] or a[3] in SINK_KIND_WILDCARDS or b[3] in SINK_KIND_WILDCARDS)
+
+
+def _find_matching_sink_finding(
+    findings: dict[str, dict],
+    rec: dict,
+    run_dir: Path | None = None,
+) -> dict | None:
+    """
+    Find an already-recorded finding with the same verdict and the same canonical sink (_sink_key)
+    so two different fingerprints for the same root cause (e.g. a prover hypothesis predicate and a
+    fuzz crash predicate at the same line) merge into a single finding instead of inflating the
+    report count.
+    """
+    key = _sink_key(rec, run_dir)
+    if key is None:
+        return None
     for existing in findings.values():
         if existing.get("verdict") != rec.get("verdict"):
             continue
-        eloc = existing.get("location") or {}
-        if normalize_file(eloc.get("file") or "") != rec_file or eloc.get("function") != rec_fn:
-            continue
-        eline = int(eloc.get("line") or 0)
-        ebase_line, _ = map_work_to_baseline_line(rec_file, eline, run_dir=run_dir)
-        if ebase_line != rec_base_line:
-            continue
-        eprop = existing.get("property") or {}
-        ekind = normalize_kind(eprop.get("kind") or "", eprop.get("predicate") or "")
-        if (
-            ekind == rec_kind
-            or ekind in ("rte", "assertion", "property")
-            or rec_kind in ("rte", "assertion", "property")
-        ):
+        ekey = _sink_key(existing, run_dir)
+        if ekey is not None and _same_sink(key, ekey):
             return existing
     return None
+
+
+SIBLING_VERDICT_SOURCE = "sibling_verdict"
+
+
+def _verdict_family(rec: dict) -> str | None:
+    """`positive` (confirmed, needs_validation), `negative` (rejected, but not as a duplicate) or None."""
+    if rec.get("verdict") in ("confirmed", "needs_validation"):
+        return "positive"
+    if rec.get("verdict") == "rejected" and rec.get("rejection_class") != "duplicate":
+        return "negative"
+    return None
+
+
+def sink_conflicts(findings: dict[str, dict], run_dir: Path | None = None) -> list[tuple[str, str]]:
+    """Pairs `(positive, negative)` of verdict records at the same sink with opposite verdicts, sorted."""
+    keyed: dict[str, list[tuple[str, SinkKey]]] = {"positive": [], "negative": []}
+    for fp, rec in sorted(findings.items()):
+        family = _verdict_family(rec)
+        key = _sink_key(rec, run_dir) if family else None
+        if family and key is not None:
+            keyed[family].append((fp, key))
+    return [(pos, neg) for pos, pkey in keyed["positive"] for neg, nkey in keyed["negative"] if _same_sink(pkey, nkey)]
+
+
+def _refresh_conflicts_with(findings: dict[str, dict], pairs: list[tuple[str, str]]) -> None:
+    """Rewrite `conflicts_with` of every record from the current pairs (a superseded or merged record drops out)."""
+    partners: dict[str, set[str]] = {}
+    for pos, neg in pairs:
+        partners.setdefault(pos, set()).add(neg)
+        partners.setdefault(neg, set()).add(pos)
+    for fp, rec in findings.items():
+        if fp in partners:
+            rec["conflicts_with"] = sorted(partners[fp])
+        else:
+            rec.pop("conflicts_with", None)
+
+
+def _sibling_evidence(rec: dict) -> tuple[str, str]:
+    """What a re-verification is handed from the positive sibling: (artifact, tool_output)."""
+    tool_output = rec["evidence"][0]["tool_output"] if rec.get("evidence") else FINDINGS.as_posix()
+    reproducers = rec.get("reproducers") or []
+    artifact = reproducers[0]["input"] if reproducers else tool_output
+    return artifact, tool_output
+
+
+def _reconcile_sink_conflicts(
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    findings: dict[str, dict],
+    run_dir: Path,
+    ingested: list[str],
+) -> list[dict]:
+    """
+    Record opposite verdicts at one sink on both records (`conflicts_with`) and give the rejected
+    candidate of each pair that involves a record of this ingest one re-verification: it is reopened
+    through tool_evidence_on_verified_candidate with the `sibling_verdict` source, which skips the
+    `harness_unchanged` suppression and keeps the reopening limit. A `checked` rejection is kept
+    against a `needs_validation` sibling and re-verified against a `confirmed` one (a reproduced
+    crash and a cited refutation at one sink cannot both hold; QCBOR run-6, EncodeHead). A candidate
+    already reopened by a sibling verdict is not reopened again (`already_reverified`), so a second
+    rejection leaves the pair flagged for the report. Nothing picks a side.
+    """
+    pairs = sink_conflicts(findings, run_dir)
+    _refresh_conflicts_with(findings, pairs)
+    out: list[dict] = []
+    for pos, neg in pairs:
+        if pos not in ingested and neg not in ingested:
+            continue
+        entry: dict[str, Any] = {"positive": pos, "negative": neg}
+        cands = [
+            c
+            for _, c in sorted(candidates.items())
+            if c.get("status") == "verified" and neg in (c.get("resolved_fingerprints") or [c["fingerprint"]])
+        ]
+        cand = next((c for c in cands if c["fingerprint"] == neg), cands[0] if cands else None)
+        if cand is None:
+            entry["outcome"] = "awaiting_verdict"
+        elif not rejection_reopen_enabled():
+            entry["outcome"] = "not_reopened"
+        elif any((r.get("evidence") or {}).get("source") == SIBLING_VERDICT_SOURCE for r in cand.get("reopened") or []):
+            entry["outcome"] = "already_reverified"
+        else:
+            artifact, tool_output = _sibling_evidence(findings[pos])
+            entry["outcome"] = tool_evidence_on_verified_candidate(
+                units,
+                findings,
+                cand,
+                source=SIBLING_VERDICT_SOURCE,
+                phase="verifier",
+                producer="ledger.py",
+                artifact=artifact,
+                tool_output=tool_output,
+                linked=[],
+                already_listed=False,
+                override_checked=findings[pos].get("verdict") == "confirmed",
+            )
+            if entry["outcome"] == "contradicted":
+                entry["reason"] = next(
+                    e["reason"]
+                    for e in reversed(cand["contradicting_evidence"])
+                    if (e["source"], e["artifact"]) == (SIBLING_VERDICT_SOURCE, artifact)
+                )
+        out.append(entry)
+    return out
 
 
 def _merge_finding_record(existing: dict, incoming: dict) -> None:
@@ -2992,9 +3155,9 @@ def _dead_code_on_disk(run_dir: Path, module: str, location: dict) -> dict | Non
     if not loc_file or loc_line < 1:
         return None
 
-    def load(path: Path) -> dict:
+    def load(path: Path, max_bytes: int = DEFAULT_JSON_MAX_BYTES) -> dict:
         try:
-            data = load_json_optional(run_dir / path, {})
+            data = load_json_optional(run_dir / path, {}, max_bytes=max_bytes)
         except ArtifactError:
             return {}
         return data if isinstance(data, dict) else {}
@@ -3008,7 +3171,7 @@ def _dead_code_on_disk(run_dir: Path, module: str, location: dict) -> dict | Non
         )
 
     eva_path = EVA_REPORT_DIR / f"{module}.json"
-    eva = load(eva_path)
+    eva = load(eva_path, max_bytes=EVA_REPORT_MAX_BYTES)
     if eva.get("status") == "ok":
         dead = eva.get("dead_alarms")
         unknown = eva.get("unknown_obligations_by_function")
@@ -3169,6 +3332,7 @@ def cmd_ingest_verifier(
         verdict = rec["verdict"]
         primary_ev_out = rec["evidence"][0]["tool_output"] if rec.get("evidence") else None
         rec.pop("prior_verdicts", None)  # written by this command only, never taken from a verifier
+        rec.pop("conflicts_with", None)  # likewise (_reconcile_sink_conflicts)
         dp_attempt: dict | None = None
         if verdict in ("confirmed", "needs_validation") and isinstance(rec.get("decision_point"), dict):
             fields = _settle_decision_point_basis(run_dir, cand_fp, rec)
@@ -3401,6 +3565,9 @@ def cmd_ingest_verifier(
             last["refutation_basis_source"] = source
         cand["last_rejection"] = last
 
+    # Opposite verdicts at one sink (this verdict against an earlier one, either way round).
+    conflicts = _reconcile_sink_conflicts(units, candidates, findings, run_dir, resolved_fps)
+
     commit(units, candidates, findings, run_dir=run_dir)
     return {
         "candidate_fingerprint": cand_fp,
@@ -3408,6 +3575,7 @@ def cmd_ingest_verifier(
         "resolved_fingerprints": resolved_fps,
         "harness_exhausted": harness_exhausted,
         **({"superseded_rejections": [o["fingerprint"] for o in superseded]} if superseded else {}),
+        **({"sink_conflicts": conflicts} if conflicts else {}),
     }
 
 

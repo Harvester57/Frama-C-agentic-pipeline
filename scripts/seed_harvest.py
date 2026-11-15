@@ -1057,9 +1057,13 @@ def fuzz_invocation(harness_c: str) -> str:
 
 
 def harness_cases(harness_c: str) -> list[tuple[int | None, str]]:
-    """(selector byte or None, statement) per case of a harness's fuzz entry point."""
+    """
+    (selector byte or None, statement) per case of a harness's fuzz entry point. Case i is byte i under
+    both selector encodings (generate_harness.DISPATCH_SWITCH_RE): `switch (harness_selector)` (identity)
+    and `switch (harness_selector % <n>U)` (a harness generated before it).
+    """
     block = fuzz_invocation(harness_c)
-    m = re.search(r"switch\s*\(\s*harness_selector\s*%\s*(\d+)U?\s*\)\s*\{", block)
+    m = re.search(r"switch\s*\(\s*harness_selector\s*(?:%\s*(\d+)U?\s*)?\)\s*\{", block)
     if not m:
         return [(None, block)]
     end = _match_brace(block, m.end() - 1)

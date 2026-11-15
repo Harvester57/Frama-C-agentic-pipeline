@@ -131,13 +131,40 @@ def test_wp_cache_dir_off_explicit_and_forced_off(tmp_path, monkeypatch):
     W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp", retry_bitwise=False, cache_dir=explicit)
     assert Path(_flag(fake.wp_calls()[-1], "-wp-cache-dir")) == explicit
     W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp", retry_bitwise=False, cache_dir="off")
-    assert "-wp-cache" not in fake.wp_calls()[-1]
+    # Without an explicit mode WP reads and writes its default cache (run-6 cast probe: `[Cache] found:9`).
+    assert _flag(fake.wp_calls()[-1], "-wp-cache") == "none"
+    assert "-wp-cache-dir" not in fake.wp_calls()[-1]
     monkeypatch.setenv("FRAMAC_CACHE", "off")
     W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp", retry_bitwise=False, cache_dir=explicit)
     assert "-wp-cache-dir" not in fake.wp_calls()[-1]
+    assert _flag(fake.wp_calls()[-1], "-wp-cache") == "none"
     monkeypatch.setenv("FRAMAC_CACHE", "on")
     W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp", retry_bitwise=False, dump_goal=True)
     assert "-wp-cache-dir" not in fake.wp_calls()[-1]  # a VC dump always runs the provers
+    assert _flag(fake.wp_calls()[-1], "-wp-cache") == "none"
+
+
+@pytest.mark.parametrize("cache_on", [True, False])
+def test_wp_session_never_uses_the_default_cache_when_the_cache_is_off(tmp_path, monkeypatch, cache_on):
+    fake = FakeFramaC()
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    monkeypatch.delenv("FRAMAC_CACHE", raising=False)
+    cache_dir = tmp_path / "wpcache"
+    W.run_wp_on_function(
+        _c_file(tmp_path),
+        "f",
+        tmp_path / "wp",
+        retry_bitwise=False,
+        session_dir=tmp_path / "session",
+        cache_dir=cache_dir if cache_on else "off",
+    )
+    cmd = fake.wp_calls()[-1]
+    assert _flag(cmd, "-wp-session") == str(tmp_path / "session")
+    assert cmd.count("-wp-cache") == 1
+    if cache_on:
+        assert _flag(cmd, "-wp-cache") == "update" and Path(_flag(cmd, "-wp-cache-dir")) == cache_dir
+    else:
+        assert _flag(cmd, "-wp-cache") == "none" and "-wp-cache-dir" not in cmd
 
 
 def test_bitwise_retry_reuses_the_cache_dir_and_sizing(tmp_path, monkeypatch):
@@ -229,6 +256,36 @@ def test_a_preprocessor_failure_is_an_analysis_error_not_an_acsl_syntax_error(tm
     # run-6 07:14: `merge-agent --module` alone still checked with -I. only, so the hint must name --cppflags
     # and must not offer --module as the fix.
     assert "--cppflags" in hints and "--module <m>)" not in hints
+    assert len(fake.calls) == 1
+
+
+# framac-analysis:latest, an annotation without its closing `*/`: the main `gcc -E` fails too.
+UNTERMINATED_COMMENT_LOG = (
+    "[kernel] Parsing f.c (with preprocessing)\n"
+    "/pp/f.c:1:1: error: unterminated comment\n"
+    "    1 | /*@ requires x >= 0;\n"
+    "      | ^\n"
+    "cc1: note: unrecognized command-line option '-Wno-unknown-warning-option' may have been intended to "
+    "silence earlier diagnostics\n"
+    "[kernel] User Error: failed to run: gcc -E -C -I. -I'/tmp/__fc_machdep7b6999.dir' -D__FRAMAC__ -dD "
+    "-nostdinc -undef '/pp/f.c' -o '/tmp/f.cb568e6.i'\n"
+    "  (PWD: /pp)\n"
+    "  this is possibly due to missing preprocessor flags;\n"
+    "  consider options -cpp-extra-args, -compilation-db or -cpp-command.\n"
+    '  See chapter "Preparing the Sources" in the Frama-C user manual for more details.\n'
+    "[kernel] Frama-C aborted: invalid user input.\n"
+)
+
+
+def test_an_annotation_missing_its_closing_comment_is_an_acsl_syntax_error(tmp_path, monkeypatch):
+    fake = FakeFramaC(rc=1, log=UNTERMINATED_COMMENT_LOG)
+    monkeypatch.setattr(W.subprocess, "run", fake)
+    res = W.run_wp_on_function(_c_file(tmp_path), "f", tmp_path / "wp")
+    assert res["status"] == "acsl_syntax_error" and "preprocess_errors" not in res
+    assert any("unterminated comment" in e for e in res["syntax_check"]["errors"])
+    hints = " ".join(res["diagnostic_hints"])
+    assert "*/" in hints and "unterminated" in hints
+    assert "leave the contract unchanged" not in hints and "--cppflags" not in hints
     assert len(fake.calls) == 1
 
 

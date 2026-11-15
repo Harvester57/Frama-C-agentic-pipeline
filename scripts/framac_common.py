@@ -79,6 +79,12 @@ _STATUS_MAP = {
 # scheduler enforces it, so both read it here. FRAMAC_PROVER_WALL_BUDGET_S overrides it.
 PROVER_WALL_BUDGET_S = {"quick": 600, "standard": 900, "deep": 1800}
 
+# Merged or legacy Eva reports on large modules can exceed the default 64 MiB artifact cap.
+DEFAULT_JSON_MAX_BYTES = 64 * 1024 * 1024
+EVA_REPORT_MAX_BYTES = 768 * 1024 * 1024
+FLOWS_INLINE_MAX_BYTES = 2 * 1024 * 1024
+MAX_FLOW_LOCATION_CHARS = 240
+
 # The WP manual (Section "Memory models") calls the `cast` model option "unlimited casts (unsound)":
 # a proof under it is a diagnostic, never evidence.
 WP_UNSOUND_MODEL_ISSUE = "WP memory model with 'cast' (unlimited casts) is unsound; the proof is not evidence"
@@ -94,6 +100,49 @@ def wp_model_parts(model: object) -> frozenset[str]:
 def wp_model_unsound(model: object) -> bool:
     """Whether a WP memory model string (for example `Typed+cast`) includes the unsound `cast` option."""
     return "cast" in wp_model_parts(model)
+
+
+# The WP memory models a proof may be credited under (`frama-c -wp-h`, Frama-C 34). `Typed` is the
+# default. `Bytes` is listed there as experimental: accepted, but the proof records it as an
+# assumption (wp_model_assumption). `Hoare` has no pointers, `Region` is experimental and depends on
+# the region plug-in: neither is evidence. Options: `nocast`, `raw`, `ref`, `int` and `float` keep
+# machine semantics; `cast` (unlimited casts), `nat` (integers without overflow) and `real` (floats
+# as reals) do not.
+WP_MODEL_BASES_ALLOWED = frozenset({"typed", "bytes"})
+WP_MODEL_OPTIONS_ALLOWED = frozenset({"nocast", "raw", "ref", "int", "float"})
+WP_EXPERIMENTAL_MODEL_ASSUMPTION = (
+    "proved under the experimental WP memory model 'Bytes' (low-level, little-endian layout)"
+)
+
+
+def wp_model_problem(model: object) -> str | None:
+    """
+    Why a proof under this WP memory model is not evidence, or None when the model is accepted.
+    No model (None or an empty string) is the default `Typed` and is accepted. Every reader that
+    credits or replays a model (the parent merge check, the ledger, the WP runner) asks this.
+    """
+    parts = wp_model_parts(model)
+    if not parts:
+        return None
+    if "cast" in parts:
+        return WP_UNSOUND_MODEL_ISSUE
+    rejected = sorted(parts - WP_MODEL_BASES_ALLOWED - WP_MODEL_OPTIONS_ALLOWED)
+    if rejected:
+        return (
+            f"WP memory model {model!r} is not accepted as evidence (not allowed: {', '.join(rejected)}; "
+            f"allowed: {', '.join(sorted(WP_MODEL_BASES_ALLOWED))} with "
+            f"{', '.join(sorted(WP_MODEL_OPTIONS_ALLOWED))})"
+        )
+    if len(parts & WP_MODEL_BASES_ALLOWED) > 1:
+        return f"WP memory model {model!r} names more than one base model"
+    return None
+
+
+def wp_model_assumption(model: object) -> str | None:
+    """The assumption a proof under an accepted, non-default memory model rests on, or None."""
+    if wp_model_problem(model) is None and "bytes" in wp_model_parts(model):
+        return WP_EXPERIMENTAL_MODEL_ASSUMPTION
+    return None
 
 
 def wp_limits_problem(limits: object) -> str | None:
@@ -159,7 +208,7 @@ class ArtifactError(RuntimeError):
     """Raised when a required pipeline artifact is missing or malformed."""
 
 
-def load_json_strict(path: Path, max_bytes: int = 64 * 1024 * 1024):
+def load_json_strict(path: Path, max_bytes: int = DEFAULT_JSON_MAX_BYTES):
     """Load JSON and fail loudly. Callers must decide explicitly how to treat absence."""
     path = Path(path)
     if not path.is_file():
@@ -173,12 +222,139 @@ def load_json_strict(path: Path, max_bytes: int = 64 * 1024 * 1024):
         raise ArtifactError(f"malformed JSON in {path}: {exc}") from exc
 
 
-def load_json_optional(path: Path, default):
+def load_json_optional(path: Path, default, max_bytes: int = DEFAULT_JSON_MAX_BYTES):
     """Load JSON if present; a present-but-malformed file still raises."""
     path = Path(path)
     if not path.exists():
         return default
-    return load_json_strict(path)
+    return load_json_strict(path, max_bytes=max_bytes)
+
+
+def bound_flow_location(loc: str, max_chars: int = MAX_FLOW_LOCATION_CHARS) -> str:
+    """
+    Bound Frama-C `-deps`/`-inout` location strings before storing or merging them.
+    String literals collapse to `<string literal>` and oversized struct bit-range expansions
+    are capped while keeping normal C lvalues intact for `function_facts.py`.
+    """
+    if not isinstance(loc, str):
+        return str(loc)
+    if loc.startswith('"'):
+        return "<string literal>"
+    if len(loc) > max_chars:
+        return loc[: max_chars - 3] + "..."
+    return loc
+
+
+def _infer_run_root_from_report(report_path: Path | None) -> Path | None:
+    if report_path is None:
+        return None
+    resolved = Path(report_path).resolve()
+    parts = list(resolved.parts)
+    for idx in range(len(parts) - 1, -1, -1):
+        if parts[idx] == "workspace" and idx > 0:
+            return Path(*parts[:idx])
+    return None
+
+
+def spill_large_flows(
+    report: dict,
+    flows_dest: Path,
+    report_path: Path | None = None,
+    max_bytes: int | None = None,
+) -> dict:
+    """
+    When `report["flows"]` exceeds `max_bytes` serialized, write the full flows payload to
+    `flows_dest` (never directly inside `.../reports/eva/`, where `*.json` is scanned as a
+    module report) and replace `report["flows"]` with a lightweight `flows_file` pointer dict.
+    Returns a shallow copy when spilled so callers holding `report` in memory stay unchanged.
+    """
+    if not isinstance(report, dict):
+        return report
+    flows = report.get("flows")
+    if not isinstance(flows, dict) or "by_function" not in flows:
+        return report
+    limit = FLOWS_INLINE_MAX_BYTES if max_bytes is None else max_bytes
+    encoded = json.dumps(flows, ensure_ascii=False).encode("utf-8")
+    if len(encoded) <= limit:
+        return report
+
+    dest = Path(flows_dest)
+    dest_resolved = dest.resolve() if dest.is_absolute() else (Path.cwd() / dest).resolve()
+    if dest_resolved.parent.as_posix().rstrip("/").endswith("/reports/eva"):
+        mod = str(report.get("module") or (Path(report_path).stem if report_path else dest.stem) or "module")
+        dest_resolved = dest_resolved.parent.parent / "eva-flows" / f"{mod}.json"
+
+    run_root = _infer_run_root_from_report(report_path) or Path.cwd()
+    ref = to_run_relative(dest_resolved, run_root)
+    if not flows_ref_is_run_relative(ref):
+        # resolve_flows only follows a pointer inside the run directory: keep the flows inline.
+        return report
+    atomic_write_json(dest_resolved, flows)
+    return {
+        **report,
+        "flows": {
+            "status": flows.get("status"),
+            "reason": flows.get("reason"),
+            "flows_file": ref,
+        },
+    }
+
+
+def flows_ref_is_run_relative(ref: object) -> bool:
+    """A `flows_file` pointer is a relative POSIX path that stays inside the run directory (no `..`)."""
+    if not isinstance(ref, str) or not ref or "\\" in ref:
+        return False
+    if ref.startswith("/") or re.match(r"^[A-Za-z]:", ref):
+        return False
+    return all(part not in ("..", "") for part in ref.split("/"))
+
+
+def resolve_flows(
+    flows: object,
+    report_path: Path | None = None,
+    run_dir: Path | None = None,
+    max_bytes: int = EVA_REPORT_MAX_BYTES,
+    strict: bool = False,
+) -> dict | None:
+    """
+    Resolve inline `flows` or a spilled `flows_file` pointer back to the full flows dict. The pointer
+    must be run-relative (flows_ref_is_run_relative) and is looked up under `run_dir`, the run directory
+    the report is in, then the current directory. A pointer that is not run-relative, or a side file that
+    is missing, oversized, malformed or not an object, gives a `status: failed` flows dict, or, with
+    `strict`, an ArtifactError naming the file.
+    """
+    if not isinstance(flows, dict):
+        return None
+    ref = flows.get("flows_file")
+    if not isinstance(ref, str) or not ref or "by_function" in flows:
+        return flows
+
+    def _failed(reason: str) -> dict:
+        if strict:
+            raise ArtifactError(reason)
+        return {"status": "failed", "reason": reason, "by_function": {}, "call_edges": {}}
+
+    where = f"Eva report {report_path}: " if report_path is not None else ""
+    if not flows_ref_is_run_relative(ref):
+        return _failed(f"{where}flows_file {ref!r} is not a run-relative path inside the run directory")
+    roots: list[Path] = []
+    if run_dir is not None:
+        roots.append(Path(run_dir))
+    inferred_root = _infer_run_root_from_report(report_path)
+    if inferred_root is not None:
+        roots.append(inferred_root)
+    roots.append(Path.cwd())
+    for root in roots:
+        cand = root / ref
+        if cand.is_file():
+            try:
+                loaded = load_json_strict(cand, max_bytes=max_bytes)
+            except ArtifactError as exc:
+                return _failed(f"{where}spilled flows file {ref} is unreadable: {exc}")
+            if isinstance(loaded, dict):
+                return loaded
+            return _failed(f"{where}spilled flows file {ref} is not a JSON object")
+    return _failed(f"{where}missing spilled flows file: {ref}")
 
 
 _UNESCAPED_ACSL_IN_JSON_RE = re.compile(
@@ -876,7 +1052,9 @@ def kernel_parse_errors(log_text: str | None) -> list[str]:
     return [
         m.folded
         for m in fold_messages(log_text)
-        if m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded) and "Frama-C aborted" not in m.folded
+        if m.plugin in ("kernel", "cpp")
+        and _KERNEL_ERROR_HINT_RE.search(m.folded)
+        and "Frama-C aborted" not in m.folded
     ]
 
 

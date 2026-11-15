@@ -139,10 +139,15 @@ from framac_common import (  # noqa: E402
 from generate_harness import (  # noqa: E402
     DISPATCH_RUNTIME_SKIP_MARKER,
     DISPATCH_RUNTIME_SKIP_MAX_CASES,
+    DISPATCH_SELECTOR_MODULO,
     DISPATCH_SKIP_ALL_MARKER,
     DISPATCH_SKIP_FN,
     DISPATCH_SKIP_MACRO,
+    DISPATCH_SWITCH_RE,
     TARGET_EMBEDDED_PREFIX,
+    dispatch_case_of,
+    dispatch_selector_of,
+    dispatch_selector_of_text,
 )
 from resources import (  # noqa: E402
     CLASSES,
@@ -195,7 +200,8 @@ MAX_REPLAYED_CRASHES = 64
 MAX_ARTIFACTS_PER_FINGERPRINT = 3
 # engine_used of a campaign that fuzzed with ASan+UBSan and then E-ACSL (`--engine auto`).
 DUAL_ENGINE = "eacsl+sanitizers"
-_DISPATCH_SWITCH_RE = re.compile(r"switch \(harness_selector % (\d+)U\)")
+# Both selector forms (`% <n>U` and the identity switch): generate_harness.DISPATCH_SWITCH_RE.
+_DISPATCH_SWITCH_RE = DISPATCH_SWITCH_RE
 
 SANITIZER_RUNTIME_ENV = {
     "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
@@ -1629,6 +1635,45 @@ def _artifact_kind(name: str) -> str | None:
     return None
 
 
+STACK_FRAMES_MAX = 64
+_PROCESS_FRAME_FNS = ("main", "_start", "__libc_start_main", "__libc_start_call_main")
+
+
+def stack_frames(text: str, limit: int = STACK_FRAMES_MAX) -> list[dict]:
+    """
+    The distinct stack frames (`{function, file, line}`, in the order printed) of a replay's output,
+    without sanitizer, E-ACSL or libFuzzer runtime frames, harness entry frames and process start-up.
+    Every stack the output prints counts (an ASan report adds the allocation and free stacks): each
+    function in one ran on that input. `harness_reach.py dynamic` credits an entry point found here;
+    names stay exact, so E-ACSL's `__gen_e_acsl_<fn>` wrapper is not `<fn>`.
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for m in _STACK_FRAME_RE.finditer(text or ""):
+        fn = m.group("function")
+        if "::" in fn or is_runtime_function(fn) or is_harness_fuzz_function(fn) or fn in _PROCESS_FRAME_FNS:
+            continue
+        key = (fn, m.group("file") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"function": fn, "file": key[1], "line": int(m.group("line") or 0)})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def replay_artifact_dir(scratch: Path) -> Path:
+    """
+    Where a replay's libFuzzer writes the `crash-<sha1>` (or leak-, timeout-, oom-) copy of a failing
+    input: a directory of its own under the replay's writable `scratch`, never the working directory
+    (without -artifact_prefix libFuzzer writes there, the run-dir root: QCBOR run-6, issue #15).
+    """
+    out = (Path(scratch) / "replay_artifacts").resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def replay_artifact(
     binary: Path,
     artifact: Path,
@@ -1653,6 +1698,7 @@ def replay_artifact(
             f"-timeout={per_input_timeout}",
             f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
             f"-seed={seed}",
+            f"-artifact_prefix={replay_artifact_dir(scratch)}/",
             str(Path(artifact).resolve()),
         ],
         writable=[scratch],
@@ -1669,6 +1715,7 @@ def replay_artifact(
         "sandbox": res.sandbox,
         "seed": seed,
         "log_tail": out[-3000:],
+        "frames": stack_frames(out),
     }
 
 
@@ -1707,9 +1754,7 @@ def dispatch_case_count(sources: list[str]) -> int | None:
             continue
         if DISPATCH_SKIP_MACRO not in text:
             continue
-        sidecar_path = Path(src).with_suffix(".json")
-        if not sidecar_path.is_file():
-            sidecar_path = Path(src).parent / f"harness_{Path(src).stem.removeprefix('harness_')}.json"
+        sidecar_path = _dispatch_sidecar_path(src)
         if sidecar_path.is_file():
             try:
                 sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -1722,10 +1767,109 @@ def dispatch_case_count(sources: list[str]) -> int | None:
                         return int(cnt) if int(cnt) > 0 else None
             except (OSError, ValueError, TypeError):
                 pass
-        m = _DISPATCH_SWITCH_RE.search(text)
-        if m:
-            return int(m.group(1))
+        found = dispatch_selector_of_text(text)
+        if found:
+            return found[1]
     return None
+
+
+def _dispatch_sidecar_path(src: str | Path) -> Path:
+    sidecar_path = Path(src).with_suffix(".json")
+    if not sidecar_path.is_file():
+        sidecar_path = Path(src).parent / f"harness_{Path(src).stem.removeprefix('harness_')}.json"
+    return sidecar_path
+
+
+def dispatch_selector(sources: Sequence[str | Path]) -> str | None:
+    """
+    How the dispatch harness among `sources` (the source holding the skip macro, as
+    `dispatch_case_count` finds it) maps an input's first byte to a case: `identity` or `modulo`
+    (generate_harness.dispatch_selector_of: the sidecar's `dispatch_selector`, a sidecar without it is
+    modulo; without a readable sidecar, the harness text). None when no source is such a harness.
+    """
+    for src in sources:
+        try:
+            text = Path(src).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if DISPATCH_SKIP_MACRO not in text:
+            continue
+        sidecar: dict | None = None
+        sidecar_path = _dispatch_sidecar_path(src)
+        if sidecar_path.is_file():
+            try:
+                loaded = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                sidecar = loaded if isinstance(loaded, dict) else None
+            except (OSError, ValueError):
+                sidecar = None
+        return dispatch_selector_of(sidecar, text)
+    return None
+
+
+HARNESS_IDENTITY_FIELDS = ("harness_digest", "dispatch_case_count")
+
+
+def campaign_harness_identity(module: str, sources: Sequence[str | Path], run_dir: Path = Path(".")) -> dict:
+    """
+    The identity of the harness a campaign fuzzes, stamped on its report and on every artifact it finds:
+
+    - `harness_digest`: `phase0_gates.harness_digest(run_dir, module, ignore_exempt=True)`, as the
+      dynamic reach gate computes it, or None when the run has no harness for `module` or the campaign
+      does not fuzz it (none of `sources` is `workspace/harnesses/harness_<module>.c`, e.g. a breaker's
+      own copy);
+    - `dispatch_case_count`: the case count a dispatch harness selects with (`dispatch_case_count`),
+      None for any other harness;
+    - `dispatch_selector`: how its first byte selects a case (`dispatch_selector`: `identity`, or
+      `modulo` for a harness generated before the identity selector, where the same file selects
+      another case under another count), None for any other harness. Not part of
+      HARNESS_IDENTITY_FIELDS: an artifact without it was found under the modulo selector.
+    """
+    digest: str | None = None
+    if module:
+        import phase0_gates  # imported lazily: campaigns outside a run directory do not need it
+
+        own = (Path(run_dir) / phase0_gates.HARNESS_DIR / f"harness_{module}.c").resolve()
+        if any(Path(src).resolve() == own for src in sources):
+            try:
+                digest = phase0_gates.harness_digest(Path(run_dir), module, ignore_exempt=True)
+            except OSError:
+                digest = None
+    n_cases = dispatch_case_count([str(s) for s in sources])
+    return {
+        "harness_digest": digest,
+        "dispatch_case_count": n_cases,
+        "dispatch_selector": dispatch_selector(sources) if n_cases is not None else None,
+    }
+
+
+def stamp_harness_identity(report: dict, identity: dict, prior: dict | None = None) -> dict:
+    """
+    Stamp `identity` (campaign_harness_identity) on a campaign `report` and on each artifact it lists. An
+    artifact this campaign found gets the campaign's values. One carried over from an earlier campaign
+    (`pre_existing`) keeps the values the `prior` report recorded for the same sha256, or gets none: its
+    harness is unknown, and the reach gate never credits an artifact of a stamped report without them.
+    """
+    # The selector encoding travels with the identity, but its absence means `modulo` (an artifact
+    # stamped before it existed), never "unknown harness".
+    fields = (*HARNESS_IDENTITY_FIELDS, "dispatch_selector")
+    report.update({k: identity.get(k) for k in fields if k in HARNESS_IDENTITY_FIELDS or identity.get(k)})
+    earlier: dict[str, dict] = {}
+    prior_arts = prior.get("artifacts") if isinstance(prior, dict) else None
+    for art in prior_arts if isinstance(prior_arts, list) else []:
+        if isinstance(art, dict) and art.get("sha256") and all(k in art for k in HARNESS_IDENTITY_FIELDS):
+            earlier.setdefault(str(art["sha256"]), {k: art[k] for k in fields if k in art})
+    for art in report.get("artifacts") or []:
+        if not isinstance(art, dict):
+            continue
+        if not art.get("pre_existing"):
+            for k in fields:
+                if k in HARNESS_IDENTITY_FIELDS or identity.get(k):
+                    art.setdefault(k, identity.get(k))
+        elif all(k in art for k in HARNESS_IDENTITY_FIELDS):
+            continue
+        elif str(art.get("sha256") or "") in earlier:
+            art.update(earlier[str(art["sha256"])])
+    return report
 
 
 def dispatch_skippable_cases(sources: list[str], n_cases: int) -> int:
@@ -1780,8 +1924,12 @@ def harness_supports_runtime_skip_cases(sources: Sequence[str | Path] | str | Pa
     return False
 
 
-def artifact_dispatch_case(artifact: dict, n_cases: int) -> int | None:
-    """The dispatch case an artifact's input selects (its first byte modulo `n_cases`), or None if empty."""
+def artifact_dispatch_case(artifact: dict, n_cases: int, selector: str = DISPATCH_SELECTOR_MODULO) -> int | None:
+    """
+    The dispatch case an artifact's input selects under `selector` (generate_harness.dispatch_case_of:
+    the first byte for `identity`, the first byte modulo `n_cases` for `modulo`), or None for an empty
+    input or one the harness rejects.
+    """
     if n_cases <= 0:
         return None
     try:
@@ -1789,7 +1937,7 @@ def artifact_dispatch_case(artifact: dict, n_cases: int) -> int | None:
             first = fh.read(1)
     except (OSError, KeyError):
         return None
-    return first[0] % n_cases if first else None
+    return dispatch_case_of(first[0], n_cases, selector) if first else None
 
 
 def run_campaign_rounds(
@@ -1802,9 +1950,11 @@ def run_campaign_rounds(
     keep_going: bool = True,
     skippable: int | None = None,
     runtime_skip: bool = False,
+    selector: str = DISPATCH_SELECTOR_MODULO,
 ) -> dict:
     """
-    A campaign that keeps going after a crash, within `max_time` seconds of fuzzing in all.
+    A campaign that keeps going after a crash, within `max_time` seconds of fuzzing in all. A crash's
+    case is its input's first byte decoded with the harness's `selector` (`dispatch_selector`).
 
     `campaign(binary, max_time, fork)` runs one libFuzzer campaign (run_fuzz_campaign) and
     `rebuild(mask)` returns (binary, build record) for a build skipping the dispatch cases set in
@@ -1837,6 +1987,7 @@ def run_campaign_rounds(
     spent = 0.0
     last: dict = {}
     fallback_reason: str | None = None
+    skip_error: str | None = None
     while True:
         budget = max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))
         started = time.monotonic()
@@ -1853,7 +2004,7 @@ def run_campaign_rounds(
                 c
                 for a in arts
                 if a.get("kind") in ("crash", "leak", "timeout", "oom") and not a.get("pre_existing")
-                for c in [artifact_dispatch_case(a, n_cases)]
+                for c in [artifact_dispatch_case(a, n_cases, selector)]
                 if c is not None
             }
         )
@@ -1866,6 +2017,19 @@ def run_campaign_rounds(
             "crashed_cases": crashed,
         }
         rounds.append(rnd)
+        if in_skipped := [c for c in crashed if c in skipped]:
+            # The round ran with these cases skipped and an input still crashed in one: the skip did
+            # not take (runtime skip without a visible environment), or the crash is in harness code
+            # every case runs. Another round would find the same crash again.
+            rnd["stopped"] = "crash_in_skipped_case"
+            rnd["skipped_crashed_cases"] = in_skipped
+            skip_error = (
+                f"round {len(rounds)} crashed in skipped case{'s' if len(in_skipped) > 1 else ''} "
+                f"{', '.join(map(str, in_skipped))}"
+                f" ({'FRAMAC_FUZZ_SKIP_CASES in the environment' if runtime_skip else 'skip rebuild'}"
+                "): the cases were not skipped, or the crash is in harness code before the dispatch"
+            )
+            break
         fresh = [c for c in crashed if c not in skipped]
         new = [c for c in fresh if c < skippable]
         if last.get("status") == "insufficient_memory" or not fresh:
@@ -1932,6 +2096,7 @@ def run_campaign_rounds(
     out["keep_going"] = {
         "mode": "dispatch_rounds",
         "dispatch_cases": n_cases,
+        "dispatch_selector": selector,
         "skippable_cases": skippable,
         "skipped_cases": sorted(skipped),
         "fuzz_seconds": round(spent, 1),
@@ -1939,6 +2104,11 @@ def run_campaign_rounds(
     }
     if runtime_skip:
         out["keep_going"]["runtime_skip"] = True
+    if skip_error:
+        # Not ok: the campaign did not fuzz the cases it meant to. The crashes found stay listed (and
+        # `status` keeps them for ingest); `error_summary` carries the reason to the reader.
+        out["keep_going"].update(status="error", error=skip_error)
+        out["error_summary"] = [*(out.get("error_summary") or []), f"keep-going rounds: {skip_error}"]
     if fallback is not None:
         out["keep_going"]["fork_fallback"] = fallback
     return out
@@ -1967,7 +2137,7 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
     else:
         status = classify_campaign(0, False, artifacts)
     last = list(runs.values())[-1]
-    return {
+    merged = {
         "status": status,
         "returncode": last.get("returncode"),
         "timed_out": any(bool(r.get("timed_out")) for r in runs.values()),
@@ -1976,6 +2146,9 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
         "engines": engines,
         "log_tail": "\n".join(f"--- {e}\n{(r.get('log_tail') or '')[-2000:]}" for e, r in runs.items()),
     }
+    if errors := [f"{engine}: {e}" for engine, run in runs.items() for e in run.get("error_summary") or []]:
+        merged["error_summary"] = errors
+    return merged
 
 
 def classify_campaign(returncode: int, timed_out: bool, artifacts: list[dict]) -> str:
@@ -2433,6 +2606,7 @@ def run_fuzz_campaign(
                 failure = replay["failure"] or (parse_runtime_failure(combined_out) if crash_like == 1 else None)
                 entry["reproducible"] = replay["reproduced"]
                 entry["replay_log_tail"] = replay["log_tail"]
+                entry["frames"] = replay.get("frames") or []
                 entry["failure_source"] = "primary" if failure else None
                 if needs_attribution(failure):
                     san_bin = _attribution_binary()
@@ -4534,6 +4708,7 @@ def replay_for_coverage(
                 f"-timeout={per_input_timeout}",
                 f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
                 f"-seed={seed}",
+                f"-artifact_prefix={replay_artifact_dir(scratch)}/",
                 *[str(Path(f).resolve()) for f in batch],
             ],
             writable=[scratch, batch_dir],
@@ -5014,7 +5189,9 @@ def _summary(res: dict) -> dict:
     out = {k: v for k, v in res.items() if k not in _SUMMARY_OMITTED}
     if isinstance(out.get("artifacts"), list):
         out["artifacts"] = [
-            {k: v for k, v in a.items() if k not in ("replay_log_tail", "attribution")} if isinstance(a, dict) else a
+            {k: v for k, v in a.items() if k not in ("replay_log_tail", "attribution", "frames")}
+            if isinstance(a, dict)
+            else a
             for a in out["artifacts"]
         ]
     return out
@@ -5368,6 +5545,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["status"] == "ok" else 1
 
     digest_before = prover_candidates.digest_before_run(args.out_json) if args.mode == "guardrail" else None
+    identity: dict = {}
+    prior_report: dict | None = None
+    if args.mode == "campaign":
+        # Taken before the build: the values the artifacts are found under. The report this run
+        # replaces holds the values of the artifacts libFuzzer only re-reports (`pre_existing`).
+        identity = campaign_harness_identity(args.module, args.sources)
+        try:
+            loaded = json.loads(args.out_json.read_text(encoding="utf-8"))
+            prior_report = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError):
+            prior_report = None
     try:
         if args.mode == "selftest":
             res = run_selftest(args.work_dir, args.machdep, variadic_translation=not args.no_variadic_translation)
@@ -5466,6 +5654,7 @@ def main(argv: list[str] | None = None) -> int:
         import seed_harvest  # lazily: only campaigns read the seed writes' statuses
 
         res["seeds"] = seed_harvest.seeds_report_field(args.module, bool(args.extra_corpus))
+        stamp_harness_identity(res, identity, prior_report)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = _summary(res)
@@ -5591,8 +5780,9 @@ def _run_campaign_mode(args) -> dict:
         )
 
         n_cases = dispatch_case_count(args.sources)
+        selector = dispatch_selector(args.sources) or DISPATCH_SELECTOR_MODULO
         skippable = dispatch_skippable_cases(args.sources, n_cases) if n_cases is not None else None
-        runtime_skip = bool(
+        harness_runtime_skip = bool(
             n_cases is not None
             and n_cases <= DISPATCH_RUNTIME_SKIP_MAX_CASES
             and harness_supports_runtime_skip_cases(args.sources)
@@ -5600,6 +5790,11 @@ def _run_campaign_mode(args) -> dict:
 
         def _engine_campaign(engine: str, binary: Path, seconds: int) -> dict:
             attribution = attribution_builder if engine == "eacsl" else None
+            # The harness reads the skip set with getenv(); in an E-ACSL build the runtime's
+            # argv/environ setup leaves `environ` empty unless the `environ_keep` shim is linked
+            # (-Wl,--wrap=__e_acsl_memory_init). Without it, skip with rebuilds as for an older harness.
+            shim = (comp.get("environ_keep") or {}).get("status") if engine == "eacsl" else None
+            runtime_skip = harness_runtime_skip and (engine != "eacsl" or shim == "built")
 
             def _campaign(binary: Path, seconds: int, fork: bool, *, extra_env: dict[str, str] | None = None) -> dict:
                 return run_fuzz_campaign(
@@ -5641,7 +5836,13 @@ def _run_campaign_mode(args) -> dict:
                 keep_going=not args.stop_on_first_crash,
                 skippable=skippable,
                 runtime_skip=runtime_skip,
+                selector=selector,
             )
+            if harness_runtime_skip and not runtime_skip and isinstance(out.get("keep_going"), dict):
+                out["keep_going"]["runtime_skip_unavailable"] = (
+                    f"E-ACSL environ shim {shim or 'not built'}: getenv() would not see FRAMAC_FUZZ_SKIP_CASES, "
+                    "so skipped cases are rebuilt out with -DFRAMAC_FUZZ_SKIP_CASES"
+                )
             for art in out.get("artifacts") or []:
                 art["engine"] = engine
             return out

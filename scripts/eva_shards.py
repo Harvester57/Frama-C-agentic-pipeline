@@ -34,7 +34,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,12 +42,16 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import phase0_gates  # noqa: E402
 from eva_flamegraph import fold_flamegraph  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_NEVER_TRIED,
     ArtifactError,
     atomic_write_json,
+    bound_flow_location,
     load_json_strict,
+    resolve_flows,
+    spill_large_flows,
 )
 
 SHARD_FORMAT = 1
@@ -81,16 +85,25 @@ def shard_cppflags(cases: Iterable[int]) -> list[str]:
     return [f"-D{EVA_SHARD_MACRO}", *(f"-D{EVA_SHARD_MACRO}_CASE_{k}" for k in sorted(cases))]
 
 
+def case_callee_counts(case_text: str) -> dict[str, int]:
+    """Direct call multiplicity per function in a dispatch case (`name -> count >= 1`)."""
+    counts: Counter[str] = Counter(
+        m.group(1) for m in _CALL_RE.finditer(case_text or "") if m.group(1) not in _NOT_CALLS
+    )
+    return dict(counts)
+
+
 def case_callees(case_text: str) -> set[str]:
     """The functions a dispatch case calls directly (its statements as generate_harness wrote them)."""
-    return {m.group(1) for m in _CALL_RE.finditer(case_text or "") if m.group(1) not in _NOT_CALLS}
+    return set(case_callee_counts(case_text))
 
 
 def case_costs(cases: list[str], flamegraph_txt: Path | None, main_fn: str = "eva_main") -> tuple[list[float], str]:
     """
     Each dispatch case's share of a single run's time, from its `-eva-flamegraph` file: the inclusive
-    time of every function eva_main calls directly, split evenly between the cases that call it. Time
-    no case accounts for (eva_main's own, and callees outside the switch) is split evenly between all
+    time of every function eva_main calls directly, split between the cases that call it in proportion
+    to static call multiplicity (uniform `1 / len(owners)` when each caller calls it once). Time no
+    case accounts for (eva_main's own, and callees outside the switch) is split evenly between all
     cases. Every case costs the same without a usable profile. Returns (costs, basis).
     """
     n = len(cases)
@@ -116,19 +129,21 @@ def case_costs(cases: list[str], flamegraph_txt: Path | None, main_fn: str = "ev
                     inclusive[frames[1]] += t
     except OSError:
         return uniform
-    callees = [case_callees(text) for text in cases]
-    callers: defaultdict[str, list[int]] = defaultdict(list)
-    for k, names in enumerate(callees):
-        for name in names:
-            callers[name].append(k)
+    callee_counts = [case_callee_counts(text) for text in cases]
+    callers: defaultdict[str, list[tuple[int, int]]] = defaultdict(list)
+    for k, counts in enumerate(callee_counts):
+        for name, mult in counts.items():
+            if mult > 0:
+                callers[name].append((k, mult))
     costs = [0.0] * n
     for name, t in inclusive.items():
         owners = callers.get(name)
         if not owners:
             shared += t
             continue
-        for k in owners:
-            costs[k] += t / len(owners)
+        total_mult = sum(mult for _, mult in owners)
+        for k, mult in owners:
+            costs[k] += t * mult / total_mult
     costs = [c + shared / n for c in costs]
     if sum(costs) <= 0:
         return uniform
@@ -289,6 +304,15 @@ def identity_problem(shards: list[Shard]) -> str | None:
     for s in shards[1:]:
         if identity(s) != first:
             return f"shard{s.index} is not the same analysis as shard{shards[0].index}"
+    # The merged report stands for one harness (`harness_digest`): shards of different harnesses, or a
+    # stamped shard beside an unstamped one, cannot be merged into it.
+    harness = shards[0].run.report.get("harness_digest")
+    for s in shards[1:]:
+        if s.run.report.get("harness_digest") != harness:
+            return (
+                f"shard{s.index} was run on a different harness than shard{shards[0].index} "
+                f"(harness_digest {s.run.report.get('harness_digest')!r} != {harness!r}): run the shards again"
+            )
     return None
 
 
@@ -336,11 +360,93 @@ _FLOW_INTERSECT = frozenset({"sure_outputs"})
 _FLOW_ALL = frozenset({"non_terminating", "no_effects"})
 
 
+def _bound_flow_item(item: Any) -> Any:
+    return bound_flow_location(item) if isinstance(item, str) else item
+
+
+def _merge_writes(old: list[Any], new: list[Any]) -> list[Any]:
+    """
+    Merge per-function `writes` (`{"loc": str, "from": list[str], "and_self": bool}`) by `loc`
+    rather than whole-dict equality so slight `from` variations across N shards do not multiply
+    entries by N.
+    """
+    out: list[Any] = []
+    by_loc: dict[str, dict[str, Any]] = {}
+    seen_other: set[str] = set()
+    for raw in [*old, *new]:
+        if isinstance(raw, dict) and isinstance(raw.get("loc"), str):
+            loc = bound_flow_location(raw["loc"])
+            raw_from = raw.get("from") or []
+            from_items = [
+                bound_flow_location(x) if isinstance(x, str) else x
+                for x in (raw_from if isinstance(raw_from, list) else [])
+            ]
+            and_self = bool(raw.get("and_self"))
+            existing = by_loc.get(loc)
+            if existing is None:
+                dedup_from: list[Any] = []
+                seen_f: set[str] = set()
+                for item in from_items:
+                    key = item if isinstance(item, str) else json.dumps(item, sort_keys=True)
+                    if key not in seen_f:
+                        seen_f.add(key)
+                        dedup_from.append(item)
+                rec: dict[str, Any] = {
+                    **raw,
+                    "loc": loc,
+                    "and_self": and_self,
+                    "from": dedup_from,
+                }
+                by_loc[loc] = rec
+                out.append(rec)
+            else:
+                existing["and_self"] = bool(existing.get("and_self")) or and_self
+                cur_from = existing.get("from")
+                cur_list = list(cur_from) if isinstance(cur_from, list) else []
+                seen_f = {x if isinstance(x, str) else json.dumps(x, sort_keys=True) for x in cur_list}
+                for item in from_items:
+                    key = item if isinstance(item, str) else json.dumps(item, sort_keys=True)
+                    if key not in seen_f:
+                        seen_f.add(key)
+                        cur_list.append(item)
+                existing["from"] = cur_list
+        else:
+            key = json.dumps(raw, sort_keys=True)
+            if key not in seen_other:
+                seen_other.add(key)
+                out.append(json.loads(key))
+    return out
+
+
+def _dedup_flow_list(items: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    seen: set[str] = set()
+    for raw in items:
+        val = _bound_flow_item(raw)
+        key = val if isinstance(val, str) else json.dumps(val, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(val)
+    return out
+
+
+def _normalize_fn_flow(info: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, value in info.items():
+        if name == "writes" and isinstance(value, list):
+            out[name] = _merge_writes([], value)
+        elif isinstance(value, list):
+            out[name] = _dedup_flow_list(value)
+        else:
+            out[name] = json.loads(json.dumps(value))
+    return out
+
+
 def merge_flows(flows: list[dict]) -> dict:
     """
     Read and write sets per function, over the shards that analysed it: lists are unions (sure
-    outputs an intersection), `non_terminating` and `no_effects` hold only if they hold in every
-    shard. Hints for prover briefs, never verdicts.
+    outputs an intersection), `writes` entries merge by `loc`, and `non_terminating` and
+    `no_effects` hold only if they hold in every shard. Hints for prover briefs, never verdicts.
     """
     usable = [f for f in flows if isinstance(f, dict)]
     if not usable:
@@ -352,20 +458,34 @@ def merge_flows(flows: list[dict]) -> dict:
                 continue
             mine = by_function.get(fn)
             if mine is None:
-                by_function[fn] = json.loads(json.dumps(info))
+                by_function[fn] = _normalize_fn_flow(info)
                 continue
             for name, value in info.items():
                 old = mine.get(name)
                 if name in _FLOW_ALL:
                     mine[name] = bool(old) and bool(value)
+                elif name == "writes" and isinstance(value, list):
+                    mine[name] = _merge_writes(old if isinstance(old, list) else [], value)
                 elif isinstance(value, list) and isinstance(old, list):
+                    norm_new = _dedup_flow_list(value)
                     if name in _FLOW_INTERSECT:
-                        mine[name] = [v for v in old if v in value]
+                        new_keys = {v if isinstance(v, str) else json.dumps(v, sort_keys=True) for v in norm_new}
+                        mine[name] = [
+                            v for v in old if (v if isinstance(v, str) else json.dumps(v, sort_keys=True)) in new_keys
+                        ]
                     else:
-                        seen = {json.dumps(v, sort_keys=True) for v in old}
-                        mine[name] = old + [v for v in value if json.dumps(v, sort_keys=True) not in seen]
+                        seen = {v if isinstance(v, str) else json.dumps(v, sort_keys=True) for v in old}
+                        mine[name] = old + [
+                            v
+                            for v in norm_new
+                            if (v if isinstance(v, str) else json.dumps(v, sort_keys=True)) not in seen
+                        ]
+                elif old is None and isinstance(value, list):
+                    # A shard without the list did not report it (-inout printed no such section there):
+                    # sure outputs intersect over the shards that report them, so a later list is kept.
+                    mine[name] = _dedup_flow_list(value)
                 elif name not in mine:
-                    mine[name] = value
+                    mine[name] = json.loads(json.dumps(value))
     edges: dict[str, set[str]] = defaultdict(set)
     for flow in usable:
         for fn, callees in (flow.get("call_edges") or {}).items():
@@ -566,7 +686,21 @@ def merge(
             "sav_file": None,
             "nonterm_log_file": None,
             "flamegraph_file": None,
-            "input_digest": hashlib.sha256("\n".join(digests).encode()).hexdigest() if all(digests) else None,
+            # Shards normally differ only in their case defines; when they share one input digest, it
+            # is the module's (recomputable), else the combination of theirs.
+            "input_digest": (
+                digests[0]
+                if all(digests) and len(set(digests)) == 1
+                else hashlib.sha256("\n".join(digests).encode()).hexdigest()
+                if all(digests)
+                else None
+            ),
+            # Shards without the field (identity_problem: then none has it) stand for the current
+            # harness only when every shard report is newer than the harness source.
+            "harness_digest": base.get("harness_digest")
+            or phase0_gates.derived_harness_digest(
+                Path("."), module, [Path(p) for s in shards if (p := s.run.report.get("_path"))]
+            ),
             "cache": {"hit": all((s.run.report.get("cache") or {}).get("hit") for s in shards), "key": None},
             "flows": merge_flows([s.run.report.get("flows") for s in shards]),
             "nonterm": _union(s.run.report.get("nonterm") for s in shards),
@@ -609,6 +743,10 @@ def load_report(path: Path) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
+    if isinstance(data.get("flows"), dict) and "flows_file" in data["flows"]:
+        resolved = resolve_flows(data["flows"], report_path=path, max_bytes=_MAX_REPORT_BYTES)
+        if isinstance(resolved, dict):
+            data["flows"] = resolved
     data["_path"] = str(path)
     return data
 
@@ -642,7 +780,11 @@ def main(argv: list[str] | None = None) -> int:
             reports = [load_report(shard_report_path(args.shard_dir, i)) for i in range(len(shards))]
             report = merge(args.module, plan, reports, args.entry_fn, args.csv_out, args.flamegraph_out)
     report["module"] = args.module
-    atomic_write_json(args.out_json, report)
+    flows_dir = args.csv_out.parent
+    if flows_dir.resolve() == args.out_json.parent.resolve():
+        flows_dir = args.shard_dir
+    disk_report = spill_large_flows(report, flows_dir / "flows.json", report_path=args.out_json)
+    atomic_write_json(args.out_json, disk_report)
     sharding = report.get("eva_shards") or {}
     print(
         json.dumps(

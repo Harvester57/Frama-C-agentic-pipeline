@@ -68,7 +68,9 @@ So an obligation is Valid only if no shard leaves it Unknown or Invalid. *Not he
 "no execution of this shard reaches it", never as a proof on its own.
 
 Why this is sound. Each execution of the original `eva_main` takes exactly one value of
-`harness_selector % N`, so it is an execution of exactly one shard. The prefix before the `switch` is
+`harness_selector` (the case index itself; a value at or above the case count runs no case, and a
+harness generated before the identity selector switches on `harness_selector % N`), so it is an
+execution of at most one shard's case. The prefix before the `switch` is
 the same in every shard, and the selector values a shard does not handle go to `default` and call
 nothing. Each shard is a sound Eva analysis of its own executions. Eva's Valid statuses hold under the
 alarms it reported earlier on the same path (Eva manual 5.7, 8.1.2), and this is the argument
@@ -196,6 +198,10 @@ the design above:
   one.
 - **Identity.** Shards must agree on `main_fn`, sources, reduced checks and assumption options.
   `input_digest` differs by construction; the merged report's is a digest of the shards' digests.
+  They must also carry the same `harness_digest`: shards of an older and of a repaired harness, or
+  a stamped shard beside an unstamped one, are refused, and must be run again. A merged report built
+  from shards that record no `harness_digest` gets the current harness's digest only when every
+  shard is newer than the harness, else `"unknown"`.
 - **Profiles and flows.** The shards' `flamegraph.txt` files are concatenated into
   `workspace/eva/<mod>/flamegraph.txt`, so a later re-plan reads the whole module's work. Flows are
   merged as described above.

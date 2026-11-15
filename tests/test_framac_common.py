@@ -421,3 +421,35 @@ def test_bsd_string_contracts_include_from_dependencies():
 )
 def test_wp_model_unsound_flags_only_the_cast_option(model, unsound):
     assert wp_model_unsound(model) is unsound
+
+
+@pytest.mark.parametrize(
+    ("model", "accepted", "assumption"),
+    [
+        (None, True, False),
+        ("", True, False),
+        ("Typed", True, False),
+        ("Typed+ref+int", True, False),
+        ("Typed+nocast", True, False),
+        ("Typed,raw", True, False),
+        ("+ref", True, False),
+        ("Bytes", True, True),
+        ("bytes+raw", True, True),
+        ("Typed+cast", False, False),
+        ("Bytes+cast", False, False),
+        ("Hoare", False, False),
+        ("Region", False, False),
+        ("Typed+nat", False, False),
+        ("Typed+real", False, False),
+        ("Typed+Bytes", False, False),
+        ("Typed+bogus", False, False),
+    ],
+)
+def test_wp_model_allowlist_and_experimental_assumption(model, accepted, assumption):
+    from framac_common import WP_UNSOUND_MODEL_ISSUE, wp_model_assumption, wp_model_problem
+
+    problem = wp_model_problem(model)
+    assert (problem is None) is accepted, problem
+    assert (wp_model_assumption(model) is not None) is assumption
+    if wp_model_unsound(model):
+        assert problem == WP_UNSOUND_MODEL_ISSUE

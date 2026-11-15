@@ -24,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,21 @@ DISPATCH_SKIP_ALL_MARKER = "every dispatch case skippable"
 DISPATCH_SKIP_FN = "framac_fuzz_skip_case"
 DISPATCH_RUNTIME_SKIP_MARKER = "runtime dispatch case skip"
 DISPATCH_RUNTIME_SKIP_MAX_CASES = 4096
+# The dispatch selector: the input's first byte is the case index, and a byte at or above the case count
+# runs no case (the input is rejected), so appending a case never changes the case an input selects. One
+# byte selects at most DISPATCH_MAX_CASES cases. The sidecar records the encoding as `dispatch_selector`;
+# a dispatch harness without it was generated with the older selector, the first byte modulo the case
+# count (DISPATCH_SELECTOR_MODULO), and is still decoded that way.
+DISPATCH_SELECTOR_IDENTITY = "identity"
+DISPATCH_SELECTOR_MODULO = "modulo"
+DISPATCH_MAX_CASES = 256
+DISPATCH_IDENTITY_MARKER = "dispatch selector: identity"
+# Both selector forms in harness text: `switch (harness_selector % <n>U)` (modulo) and
+# `switch (harness_selector) { /* dispatch selector: identity, <n> cases */` (identity).
+DISPATCH_SWITCH_RE = re.compile(
+    r"switch \(harness_selector % (?P<mod>\d+)U\)"
+    r"|switch \(harness_selector\) \{ /\* " + re.escape(DISPATCH_IDENTITY_MARKER) + r", (?P<ident>\d+) cases \*/"
+)
 # Eva sharding (eva_shards.py): a shard is built with -DFRAMAC_EVA_SHARD and -DFRAMAC_EVA_SHARD_CASE_<k>
 # for each case it keeps. Without FRAMAC_EVA_SHARD every case is there, as before.
 EVA_SHARD_MACRO = "FRAMAC_EVA_SHARD"
@@ -966,11 +982,47 @@ def _build_auto_prototype_invocations(
     return eva_stmt, fuzz_stmt, needs_null_terminate
 
 
+def dispatch_selector_of_text(text: str) -> tuple[str, int] | None:
+    """(encoding, case count) of the dispatch switch in harness text, or None when it has none."""
+    m = DISPATCH_SWITCH_RE.search(text)
+    if not m:
+        return None
+    if m.group("ident") is not None:
+        return DISPATCH_SELECTOR_IDENTITY, int(m.group("ident"))
+    return DISPATCH_SELECTOR_MODULO, int(m.group("mod"))
+
+
+def dispatch_selector_of(sidecar: dict[str, Any] | None, text: str | None = None) -> str:
+    """
+    The selector encoding of a dispatch harness: the sidecar's `dispatch_selector`; without a sidecar,
+    the harness text's switch. A sidecar without the field is a harness generated before the field
+    existed, which selects modulo the case count.
+    """
+    if isinstance(sidecar, dict):
+        raw = sidecar.get("dispatch_selector")
+        return DISPATCH_SELECTOR_IDENTITY if raw == DISPATCH_SELECTOR_IDENTITY else DISPATCH_SELECTOR_MODULO
+    found = dispatch_selector_of_text(text) if text else None
+    return found[0] if found else DISPATCH_SELECTOR_MODULO
+
+
+def dispatch_case_of(first_byte: int, n_cases: int, selector: str) -> int | None:
+    """The case an input whose first byte is `first_byte` runs, or None when the harness rejects it."""
+    if n_cases <= 0:
+        return None
+    if selector == DISPATCH_SELECTOR_IDENTITY:
+        return first_byte if first_byte < n_cases else None
+    return first_byte % n_cases
+
+
 def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) -> str:
     """
-    One harness that drives several API calls: the first input byte selects a case and the
-    rest of the input is the case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one
-    analysis covers every case. Cases must not `return` (the fuzz side frees its buffer after).
+    One harness that drives several API calls: the first input byte is the index of the case to run
+    (identity selector) and the rest of the input is the case's `fuzz_buf`/`fuzz_len`. A first byte at
+    or above the case count runs no case and is rejected, so a case appended later never changes the
+    case an existing input (corpus, seed, crash file) selects. One byte selects at most
+    DISPATCH_MAX_CASES cases: more is a ValueError, never a harness whose last cases are never fuzzed.
+    Eva sees an unknown selector, so one analysis covers every case (the values at or above the count
+    run nothing). Cases must not `return` (the fuzz side frees its buffer after).
 
     A campaign that already crashed in some cases skips them on the next round via the runtime
     `FRAMAC_FUZZ_SKIP_CASES` environment variable (`runtime_skip=True`, checked by `framac_fuzz_skip_case`)
@@ -982,15 +1034,23 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     Eva shard keeps only its cases in the source (eva_shards.py). The preprocessor keeps line numbers, so
     an obligation has the same (file, line) in every shard that keeps it.
 
-    An input that runs no case (no selector byte, a skipped case) calls FRAMAC_FUZZ_REJECT(): the fuzz
-    entry returns -1 for it, so libFuzzer keeps it out of the corpus; in eva_main the macro is empty.
-    A hand-written case whose own length guard turns the input away before any call does the same.
+    An input that runs no case (no selector byte, a selector at or above the case count, a skipped
+    case) calls FRAMAC_FUZZ_REJECT(): the fuzz entry returns -1 for it, so libFuzzer keeps it out of the
+    corpus; in eva_main the macro is empty. A hand-written case whose own length guard turns the input
+    away before any call does the same.
     """
     stmts = [c.strip() for c in cases if c and c.strip()]
     if not stmts:
         raise ValueError("entry_style 'dispatch' requires at least one --dispatch-case")
     n = len(stmts)
-    case = f"(harness_selector % {n}U)"
+    if n > DISPATCH_MAX_CASES:
+        raise ValueError(
+            f"a dispatch harness selects its case with one input byte, so it holds at most {DISPATCH_MAX_CASES} "
+            f"cases; this one has {n}. Split the module into sub-module harnesses (--scope-file), each with at "
+            f"most {DISPATCH_MAX_CASES} cases"
+        )
+    case = "harness_selector"
+    switch_head = f"    switch (harness_selector) {{ /* {DISPATCH_IDENTITY_MARKER}, {n} cases */"
     n_words = (n + 63) // 64
     # The mask word of the selected case: word k for cases 64k..64k+63 (no comma, so the -D values
     # never pass through a comma-separated option list).
@@ -1026,7 +1086,7 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
             "#endif",
             "    if (!harness_skip_case)",
             "#endif",
-            f"    switch (harness_selector % {n}U) {{",
+            switch_head,
         ]
         for i, stmt in enumerate(stmts):
             lines += [
@@ -1035,7 +1095,8 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
                 "#endif",
             ]
         lines += [
-            "    default: break;",
+            # A selector at or above the case count runs no case.
+            "    default: FRAMAC_FUZZ_REJECT(); break;",
             "    }",
             skip_guard,
             "    else { FRAMAC_FUZZ_REJECT(); }",
@@ -1061,7 +1122,7 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     lines += [
         f"    if ((({word} >> ({case} & 63U)) & 1ULL) == 0ULL)",
         "#endif",
-        f"    switch (harness_selector % {n}U) {{",
+        switch_head,
     ]
     for i, stmt in enumerate(stmts):
         # An Eva shard keeps only its own cases (eva_shards.py): the others leave the source, so Eva never
@@ -1072,7 +1133,8 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
             "#endif",
         ]
     lines += [
-        "    default: break;",
+        # A selector at or above the case count runs no case.
+        "    default: FRAMAC_FUZZ_REJECT(); break;",
         "    }",
         # A case the campaign skips calls nothing: libFuzzer keeps the input out of the corpus (H3).
         f"#ifdef {DISPATCH_SKIP_MACRO}",
@@ -2118,7 +2180,10 @@ def _generate_module_harness(
     target_fuzzer: str | None = None,
     target_fuzzer_id: str | None = None,
     fail_on_compile_error: bool = True,
+    file_scope: list[str] | None = None,
 ) -> dict[str, Any]:
+    # `file_scope`: one-line definitions placed right after the headers (the --api generator's callback
+    # stubs, api_harness.callback_stub), so cases can name them.
     # A target fuzz module (--target-fuzzer): the harness calls the target's own fuzz function, renamed
     # by -D (see the rename path below), on its own copy of the input. It answers for its fuzzer file only.
     target_fuzzer_record: dict[str, Any] | None = None
@@ -2420,7 +2485,7 @@ def _generate_module_harness(
 
     harness_content = (
         rendered_tpl.replace("{{MODULE_NAME}}", module_name)
-        .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))
+        .replace('#include "{{MODULE_HEADER}}"', "\n".join([*inc_lines, *(file_scope or [])]))
         .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
         .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
         .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)
@@ -2505,6 +2570,9 @@ def _generate_module_harness(
         "reach_exempt": reach_exempt,
         **prelude_fields,
     }
+    if entry_style == "dispatch" and target_fuzzer_record is None:
+        # The harness written above selects with _build_dispatch_invocation's identity selector.
+        sidecar["dispatch_selector"] = DISPATCH_SELECTOR_IDENTITY
     if target_fuzzer_record is not None:
         sidecar["target_fuzzer"] = dict(target_fuzzer_record)
     write_sidecar(harness_meta_file, sidecar)
@@ -2605,6 +2673,64 @@ def record_harness_repair(harness_meta_path: Path, reason: str) -> dict[str, Any
         "max_repair_attempts": max_attempts,
         "exhausted": attempts >= max_attempts,
     }
+
+
+def _restore_file(path: Path, data: bytes | None) -> None:
+    """Put `data` back at `path` atomically (a temp file in the same directory, then a rename); None removes it."""
+    if data is None:
+        path.unlink(missing_ok=True)
+        return
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_restore_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def _rolled_back_on_failure(paths: list[Path] | None) -> Iterator[None]:
+    """
+    Run a `--record-repair` regeneration so that any failure (an exception of any kind, from the
+    attempt count's write to the final sidecar write) puts every file in `paths` back as it was before:
+    the harness is unchanged and no repair attempt is consumed. None: no repair, nothing to roll back.
+    """
+    saved: dict[Path, bytes | None] = {}
+    for path in dict.fromkeys(Path(p).resolve() for p in paths or []):
+        try:
+            saved[path] = path.read_bytes()
+        except FileNotFoundError:
+            saved[path] = None
+    try:
+        yield
+    except BaseException:
+        for path, data in saved.items():
+            with contextlib.suppress(OSError):
+                _restore_file(path, data)
+        raise
+
+
+def _with_repair_result(result: dict[str, Any], repair_res: dict[str, Any] | None) -> str:
+    """The JSON a generation prints, with the repair's attempt count when it recorded one."""
+    if repair_res is not None:
+        result["repair_recorded"] = repair_res
+        result["repair_attempts"] = repair_res["repair_attempts"]
+        result["exhausted"] = repair_res["exhausted"]
+    return json.dumps(result, indent=2)
+
+
+def _generation_failed(exc: Exception, *, repair: bool) -> int:
+    """
+    Report a failed generation as `{"ok": false, "error": ...}` and exit 1. Without `--record-repair`,
+    only the errors a generation reports (ValueError, ApiHarnessError) are; anything else propagates.
+    """
+    if not repair and not isinstance(exc, ValueError):
+        raise exc
+    print(json.dumps({"ok": False, "error": str(exc) or type(exc).__name__}, indent=2))
+    return 1
 
 
 def _bind_flag_values(argv: list[str]) -> list[str]:
@@ -2816,7 +2942,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
     args = parser.parse_args(raw_argv)
 
-    orig_sidecar_bytes: bytes | None = None
     if args.record_repair is not None:
         if not args.reason.strip():
             print(json.dumps({"ok": False, "error": "--record-repair requires --reason"}, indent=2))
@@ -2833,7 +2958,6 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir = args.record_repair.parent
         try:
             existing_meta = load_json_strict(args.record_repair)
-            orig_sidecar_bytes = args.record_repair.read_bytes()
         except (ArtifactError, OSError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
             return 1
@@ -2878,44 +3002,43 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-    def _restore_sidecar_on_failure() -> None:
-        if args.record_repair is not None and orig_sidecar_bytes is not None:
-            with contextlib.suppress(OSError):
-                args.record_repair.write_bytes(orig_sidecar_bytes)
+    def _repair_paths() -> list[Path] | None:
+        """The files a `--record-repair` regeneration may rewrite: they are rolled back on any failure."""
+        if args.record_repair is None:
+            return None
+        return [args.record_repair, args.out_dir / f"harness_{args.module}.c", args.out_dir / f"harness_{args.module}.json"]
 
     if args.api:
         if not args.module:
             parser.error("--api requires --module")
-        from api_harness import ApiHarnessError, generate
+        from api_harness import generate
 
-        repair_res = (
-            record_harness_repair(args.record_repair, args.reason.strip()) if args.record_repair is not None else None
-        )
         try:
-            result = generate(
-                module=args.module,
-                header=args.header,
-                max_input_size=args.max_size if args.max_size is not None else DEFAULT_MAX_INPUT_SIZE,
-                cppflags=args.cppflags,
-                out_dir=args.out_dir,
-                unit=args.unit,
-                ldflags=args.ldflags,
-                extra_includes=args.extra_include,
-                reachability=args.reachability,
-                auto_prelude=args.auto_prelude,
-                scope_files=args.scope_file,
-                # Hand-written cases after the generated ones; without the flag, the previous sidecar's.
-                dispatch_cases=args.dispatch_case or None,
-            )
-        except (ApiHarnessError, ValueError) as exc:
-            _restore_sidecar_on_failure()
-            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
-            return 1
-        if repair_res is not None:
-            result["repair_recorded"] = repair_res
-            result["repair_attempts"] = repair_res["repair_attempts"]
-            result["exhausted"] = repair_res["exhausted"]
-        print(json.dumps(result, indent=2))
+            with _rolled_back_on_failure(_repair_paths()):
+                repair_res = (
+                    record_harness_repair(args.record_repair, args.reason.strip())
+                    if args.record_repair is not None
+                    else None
+                )
+                result = generate(
+                    module=args.module,
+                    header=args.header,
+                    max_input_size=args.max_size if args.max_size is not None else DEFAULT_MAX_INPUT_SIZE,
+                    cppflags=args.cppflags,
+                    out_dir=args.out_dir,
+                    unit=args.unit,
+                    ldflags=args.ldflags,
+                    extra_includes=args.extra_include,
+                    reachability=args.reachability,
+                    auto_prelude=args.auto_prelude,
+                    scope_files=args.scope_file,
+                    # Hand-written cases after the generated ones; without the flag, the previous sidecar's.
+                    dispatch_cases=args.dispatch_case or None,
+                )
+                out = _with_repair_result(result, repair_res)
+        except Exception as exc:  # a repair's files are already rolled back
+            return _generation_failed(exc, repair=args.record_repair is not None)
+        print(out)
         return 0
 
     if args.target_fuzzer is not None:
@@ -2950,52 +3073,50 @@ def main(argv: list[str] | None = None) -> int:
     # None: generate_module_harness takes it from the entry function's trust, else from the entry style.
     effective_reachability = args.reachability
 
-    repair_res = (
-        record_harness_repair(args.record_repair, args.reason.strip()) if args.record_repair is not None else None
-    )
     try:
-        result = generate_module_harness(
-            module_name=args.module,
-            sources=args.sources,
-            header_include=args.header,
-            entry_fn=args.entry_fn,
-            max_input_size=args.max_size,
-            cppflags=args.cppflags,
-            out_dir=args.out_dir,
-            reachability=effective_reachability,
-            contract_notes=args.contract_note,
-            entry_style=effective_style,
-            global_buf=args.global_buf,
-            global_len=args.global_len,
-            struct_type=args.struct_type,
-            include_source=args.include_source,
-            stubbed_callees=args.stubbed_callee,
-            extra_includes=args.extra_include,
-            static_analysis_includes=args.static_analysis_include,
-            compat_includes=args.compat_include,
-            self_harnessed=args.self_harnessed,
-            call_expr=args.call_expr,
-            eva_expr=args.eva_expr,
-            fuzz_expr=args.fuzz_expr,
-            null_terminate=args.null_terminate,
-            auto_args=args.auto_args,
-            auto_prelude=args.auto_prelude,
-            ldflags=args.ldflags,
-            dispatch_cases=args.dispatch_case,
-            unit=args.unit,
-            scope_files=args.scope_file,
-            target_fuzzer=args.target_fuzzer,
-            target_fuzzer_id=args.target_fuzzer_id,
-        )
-    except ValueError as exc:
-        _restore_sidecar_on_failure()
-        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
-        return 1
-    if repair_res is not None:
-        result["repair_recorded"] = repair_res
-        result["repair_attempts"] = repair_res["repair_attempts"]
-        result["exhausted"] = repair_res["exhausted"]
-    print(json.dumps(result, indent=2))
+        with _rolled_back_on_failure(_repair_paths()):
+            repair_res = (
+                record_harness_repair(args.record_repair, args.reason.strip())
+                if args.record_repair is not None
+                else None
+            )
+            result = generate_module_harness(
+                module_name=args.module,
+                sources=args.sources,
+                header_include=args.header,
+                entry_fn=args.entry_fn,
+                max_input_size=args.max_size,
+                cppflags=args.cppflags,
+                out_dir=args.out_dir,
+                reachability=effective_reachability,
+                contract_notes=args.contract_note,
+                entry_style=effective_style,
+                global_buf=args.global_buf,
+                global_len=args.global_len,
+                struct_type=args.struct_type,
+                include_source=args.include_source,
+                stubbed_callees=args.stubbed_callee,
+                extra_includes=args.extra_include,
+                static_analysis_includes=args.static_analysis_include,
+                compat_includes=args.compat_include,
+                self_harnessed=args.self_harnessed,
+                call_expr=args.call_expr,
+                eva_expr=args.eva_expr,
+                fuzz_expr=args.fuzz_expr,
+                null_terminate=args.null_terminate,
+                auto_args=args.auto_args,
+                auto_prelude=args.auto_prelude,
+                ldflags=args.ldflags,
+                dispatch_cases=args.dispatch_case,
+                unit=args.unit,
+                scope_files=args.scope_file,
+                target_fuzzer=args.target_fuzzer,
+                target_fuzzer_id=args.target_fuzzer_id,
+            )
+            out = _with_repair_result(result, repair_res)
+    except Exception as exc:  # a repair's files are already rolled back
+        return _generation_failed(exc, repair=args.record_repair is not None)
+    print(out)
     return 0
 
 

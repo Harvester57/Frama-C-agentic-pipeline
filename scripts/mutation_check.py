@@ -33,7 +33,9 @@ acsl_syntax_error), else the WP status. A function whose every
 mutant failed to preprocess gets an `error` instead of a score.
 
 Runs only on functions whose parent WP report (workspace/reports/wp/<fn>.json)
-is all_proven, writes workspace/reports/mutation.json, and generate_report.py
+is all_proven, judges every mutant under the WP model and checks that proof used
+(workspace_overlay.infer_prover_wp_flags, recorded per function as `wp_flags` /
+`wp_options`), writes workspace/reports/mutation.json, and generate_report.py
 renders it as a "Specification quality" section. Purely evaluative: it never
 touches workspace/work/ (mutants are written to a temp dir).
 
@@ -43,7 +45,6 @@ CLI: mutation-check --run-dir D [--max-functions N] [--max-mutants M]
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
 import re
@@ -307,20 +308,59 @@ def _is_equivalent(report: dict) -> bool:
     return report.get("status") == "all_proven"
 
 
-def _default_runner():
-    """run_wp_on_function with counter-examples on, when it accepts the flag."""
-    base = run_wp_function.run_wp_on_function
-    try:
-        accepts = "counter_examples" in inspect.signature(base).parameters
-    except (TypeError, ValueError):
-        accepts = False
-    if not accepts:
-        return base
+def _default_runner(wp_options: dict[str, Any] | None = None):
+    """
+    run_wp_on_function with the proof's model and checks (`wp_options`, from wp_options_from_flags). No
+    counter-examples: nothing here reads the models, and each failing mutant would pay a second WP pass.
+    """
+    options = dict(wp_options or {})
 
     def runner(c_file: Path, fn: str, out_dir: Path, cppflags: str = "-I.") -> dict:
-        return base(c_file, fn, out_dir, cppflags=cppflags, counter_examples=True)
+        return run_wp_function.run_wp_on_function(c_file, fn, out_dir, cppflags=cppflags, **options)
 
     return runner
+
+
+# run_wp_function.py CLI flags (as workspace_overlay.infer_prover_wp_flags replays them for the parent check
+# and the sweep) -> run_wp_on_function keyword arguments.
+_SWITCH_OPTIONS = {
+    "--no-warn-unsigned": ("unsigned_reduced", True),
+    "--no-warn-unsigned-downcast": ("warn_unsigned_downcast", False),
+    "--no-warn-invalid-pointer": ("warn_invalid_pointer", False),
+    "--waive-signed-downcast": ("warn_signed_downcast", False),
+}
+
+
+def wp_options_from_flags(flags: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """
+    (run_wp_on_function options, flags not replayed) for the proof's run_wp_function.py flags. The declared
+    wrap lines (`--wrap-code-lines`) are not replayed: they only feed the separate check run, and a mutant is
+    judged by the proof run's configuration (the unsigned checks off for the whole function).
+    """
+    options: dict[str, Any] = {}
+    ignored: list[str] = []
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag in _SWITCH_OPTIONS:
+            key, value = _SWITCH_OPTIONS[flag]
+            options[key] = value
+        elif flag == "--wp-model" and i + 1 < len(flags):
+            options["wp_model"] = flags[i + 1]
+            i += 1
+        elif flag.startswith("--wp-model="):
+            options["wp_model"] = flag.split("=", 1)[1]
+        else:
+            ignored.append(flag)
+        i += 1
+    return options, ignored
+
+
+def _proof_wp_flags(run_dir: Path, rel: str, fn: str) -> list[str]:
+    """The flags the parent check and the sweep prove `fn` with (workspace_overlay.infer_prover_wp_flags)."""
+    import workspace_overlay
+
+    return workspace_overlay.infer_prover_wp_flags(run_dir, c_file=rel, function=fn)
 
 
 def check_function(
@@ -338,8 +378,8 @@ def check_function(
     trivial_body_rejected (only with the stub on), details}. Mutants whose WP run
     yields no goal results are counted in the *_not_applicable fields and left out
     of the denominators. `wp_runner` defaults to run_wp_function.run_wp_on_function
-    (with counter-examples, so an Invalid verdict carries a model) and is
-    injectable for tests.
+    with default options (run_mutation_check passes one with the proof's model and
+    checks) and is injectable for tests.
     """
     runner = wp_runner or _default_runner()
     text = c_file.read_text(encoding="utf-8", errors="replace")
@@ -484,6 +524,11 @@ def classify_open_unit(wp_report: dict | None) -> str:
     if not isinstance(wp_report, dict):
         return "unknown"
     if wp_report.get("status") == "analysis_error":
+        # A setup error (missing header, wrong include flags, a failed wrap check) says nothing about the
+        # prover or the contract; generate_report.py lists `unknown` units. Memory and time limits are prover limits.
+        reason = str(wp_report.get("reason") or "")
+        if reason.startswith(run_wp_function.PREPROCESSING_FAILED) or reason == "unsigned_wrap_check_failed":
+            return "unknown"
         return "prover_limited"
     if wp_report.get("wp_allocation_limitation") or wp_report.get("wp_macro_loop_limitation"):
         return "prover_limited"
@@ -577,15 +622,21 @@ def run_mutation_check(
             if cppflags is None:
                 skipped.append({"function": fn, "file": rel, "reason": source})
                 continue
+            # The mutants are judged under the model and checks the original contract was proved with (a
+            # proof under Bytes or with the unsigned checks off does not hold under the defaults).
+            wp_flags = _proof_wp_flags(run_dir, rel, fn)
+            wp_options, _ = wp_options_from_flags(wp_flags)
             result = check_function(
                 c_file,
                 fn,
                 cppflags,
                 run_dir / "workspace" / "reports" / "mutation-wp",
-                wp_runner=wp_runner,
+                wp_runner=wp_runner or _default_runner(wp_options),
                 max_mutants=max_mutants,
             )
             result["cppflags_source"] = source
+            result["wp_flags"] = wp_flags
+            result["wp_options"] = wp_options
             doc["functions"][fn] = result
     if skipped:
         doc["skipped"] = skipped

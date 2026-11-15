@@ -123,8 +123,9 @@ def test_dispatch_selects_one_case_per_input_byte():
     assert eva == fuzz
     assert "uint8_t harness_selector = fuzz_buf[0];" in eva
     assert "fuzz_buf += 1;" in eva and "fuzz_len -= 1;" in eva
-    # Blank cases are dropped, so the modulus counts real cases only.
-    assert "switch (harness_selector % 1U)" in eva
+    # Blank cases are dropped, so the case count counts real cases only.
+    assert "switch (harness_selector) { /* dispatch selector: identity, 1 cases */" in eva
+    assert "default: FRAMAC_FUZZ_REJECT(); break;" in eva
     assert "case 0U: { rec_parse(fuzz_buf, fuzz_len); } break;" in eva
 
 
@@ -165,7 +166,8 @@ def test_dispatch_harness_sidecar_records_cases_and_keeps_exemptions(tmp_path, m
     sidecar = json.loads((hdir / "harness_api.json").read_text(encoding="utf-8"))
     assert sidecar["reach_exempt"] == {"rec_print": "debug printer, writes to stdout only"}
     text = (hdir / "harness_api.c").read_text(encoding="utf-8")
-    assert "switch (harness_selector % 2U)" in text
+    assert "switch (harness_selector) { /* dispatch selector: identity, 2 cases */" in text
+    assert sidecar["dispatch_selector"] == "identity"
 
     clang = shutil.which("clang")
     if clang:
@@ -782,3 +784,330 @@ def test_b11_callees_from_clang_ast():
     callees = _callees_from_clang_ast(tree)
     assert callees == {"target_init", "target_process", "target_cleanup"}
 
+
+# ---------------------------------------------------------------------------
+# Crash-proven dynamic reach & --allow-dynamic-gap (QCBOR run-6)
+# ---------------------------------------------------------------------------
+
+
+def _harness_identity(run: Path, module: str) -> dict[str, Any]:
+    """The values `run_eacsl_fuzz.py campaign` stamps for the module's current harness."""
+    import phase0_gates
+
+    sidecar = json.loads((run / "workspace" / "harnesses" / f"harness_{module}.json").read_text(encoding="utf-8"))
+    count = sidecar.get("dispatch_case_count")
+    out: dict[str, Any] = {
+        "harness_digest": phase0_gates.harness_digest(run, module, ignore_exempt=True),
+        "dispatch_case_count": count if isinstance(count, int) and count > 0 else None,
+    }
+    if out["dispatch_case_count"] is not None:
+        # run_eacsl_fuzz.dispatch_selector: the sidecar's field, `modulo` for a sidecar without it.
+        out["dispatch_selector"] = sidecar.get("dispatch_selector") or "modulo"
+    return out
+
+
+def _write_fuzz_report(
+    run: Path, module: str, artifacts: list[dict[str, Any]], *, under_engine: bool = False, stamp: bool = True
+) -> Path:
+    """
+    A fuzz campaign report. With `stamp` (the default) it carries the current harness identity on top
+    and on each artifact that does not set its own, as a campaign on the current harness writes it;
+    without, it is a report written before the fields existed.
+    """
+    fdir = run / "workspace" / "reports" / "fuzz"
+    fdir.mkdir(parents=True, exist_ok=True)
+    identity = _harness_identity(run, module) if stamp else {}
+    artifacts = [{**identity, **a} for a in artifacts]
+    if under_engine:
+        doc: dict[str, Any] = {"module": module, "artifacts": [], "engines": {"sanitizers": {"artifacts": artifacts}}}
+    else:
+        doc = {"module": module, "artifacts": artifacts}
+    doc.update(identity)
+    out = fdir / f"{module}.json"
+    out.write_text(json.dumps(doc), encoding="utf-8")
+    return fdir
+
+
+@pytest.mark.unit
+def test_dynamic_direct_crash_in_entry_point_counts_as_executed(tmp_path, monkeypatch):
+    import phase0_gates
+    from validate_artifacts import validate_dynamic_reach
+
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);")
+    harness_reach.record_exempt(hdir, "api", "rec_print", "debug output")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+
+    _coverage(run, {"rec_parse": 40, "rec_put": 0})
+    # Non-reproducible crash does NOT satisfy dynamic reach.
+    _write_fuzz_report(
+        run,
+        "api",
+        [{"artifact": "workspace/crashes/api/crash-flaky", "reproducible": False, "failure": {"function": "rec_put"}}],
+    )
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+
+    # A direct E-ACSL failure under rec_put's name with no stack may be its wrapper's, before the body.
+    _write_fuzz_report(
+        run,
+        "api",
+        [
+            {
+                "artifact": "workspace/crashes/api/crash-1",
+                "reproducible": True,
+                "failure": {"function": "rec_put", "kind": "e-acsl_rte"},
+            }
+        ],
+    )
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+    assert any("no stack frame" in n for n in _dynamic_doc(run)["modules"]["api"]["crash_notes"])
+
+    # A reproducible direct sanitizer crash in rec_put proves rec_put executed during fuzzing.
+    _write_fuzz_report(
+        run,
+        "api",
+        [
+            {
+                "artifact": "workspace/crashes/api/crash-1",
+                "reproducible": True,
+                "failure": {"function": "rec_put", "kind": "asan_heap_buffer_overflow"},
+            }
+        ],
+    )
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    doc = _dynamic_doc(run)
+    row = doc["modules"]["api"]
+    assert row["crashed_entry_points"] == ["rec_put"]
+    assert row["gaps"] == []
+    assert row["passed"] is True
+    assert row["entry_points_executed"] == 2
+    assert doc["entry_points_crashed"] == 1
+    assert validate_dynamic_reach(doc) == [] and "warnings" not in doc
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+
+    # A stack frame of rec_put in the replay (the `frames` a campaign records; engine-nested artifacts
+    # fallback) also proves execution.
+    _write_fuzz_report(
+        run,
+        "api",
+        [
+            {
+                "artifact": "workspace/crashes/api/crash-frame",
+                "reproducible": True,
+                "kind": "crash",
+                "failure": {"function": "__sanitizer_memcpy", "file": "unknown", "line": 0},
+                "frames": [
+                    {"function": "__sanitizer_memcpy", "file": "", "line": 0},
+                    {"function": "rec_put", "file": "/framac-run/workspace/work/src/api.c", "line": 46},
+                    {"function": "LLVMFuzzerTestOneInput", "file": "/framac-run/workspace/harnesses/harness_api.c", "line": 3},
+                ],
+            }
+        ],
+        under_engine=True,
+    )
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    assert _dynamic_doc(run)["modules"]["api"]["crashed_entry_points"] == ["rec_put"]
+
+
+@pytest.mark.unit
+def test_dynamic_dispatch_crash_in_transitive_callee_counts_as_executed(tmp_path, monkeypatch):
+    import phase0_gates
+    from validate_artifacts import validate_dynamic_reach
+
+    run = _run_dir(tmp_path, monkeypatch)
+    api_cases = [
+        {"selector": 0, "kind": "single", "entry": "rec_put", "calls": ["rec_put"], "inits": []},
+        {"selector": 1, "kind": "single", "entry": "rec_parse", "calls": ["rec_parse"], "inits": []},
+        {"selector": 2, "kind": "single", "function": "rec_print", "inits": []},
+    ]
+    hdir = _write_harness(
+        run,
+        "rec_put(fuzz_buf, fuzz_len, 1); rec_parse(fuzz_buf, fuzz_len); rec_print(fuzz_buf, fuzz_len);",
+        entry_style="dispatch",
+        dispatch_case_count=3,
+        api_cases=api_cases,
+    )
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+
+    crash_dir = run / "workspace" / "crashes" / "api"
+    crash_dir.mkdir(parents=True, exist_ok=True)
+    # 0x04 % 3 == 1 -> selects case 1 (rec_parse), which crashes inside its callee rec_check.
+    crash_case1 = crash_dir / "crash-case1"
+    crash_case1.write_bytes(b"\x04\xff")
+    # 0x05 % 3 == 2 -> selects case 2 (rec_print) with empty inits and a raw unattributed signal crash:
+    # the harness body runs before the call, so an unknown location proves nothing.
+    crash_case2 = crash_dir / "crash-case2"
+    crash_case2.write_bytes(b"\x05\x00")
+
+    _coverage(run, {"rec_put": 15, "rec_parse": 0, "rec_print": 0})
+    _write_fuzz_report(
+        run,
+        "api",
+        [
+            {
+                "artifact": "workspace/crashes/api/crash-case1",
+                "reproducible": True,
+                "kind": "crash",
+                "failure": {"function": "rec_check", "file": "src/api.c", "line": 37, "kind": "sanitizer"},
+            },
+            {
+                "path": str(crash_case2),
+                "reproducible": True,
+                "failure": {"function": "unknown_function"},
+            },
+        ],
+    )
+    assert harness_reach.main(["dynamic", "--module", "api", "--harnesses", str(hdir)]) == 1
+    doc = _dynamic_doc(run)
+    row = doc["modules"]["api"]
+    assert row["crashed_entry_points"] == ["rec_parse"]
+    assert row["gaps"] == ["rec_print"]
+    assert any("single case 2 (rec_print) crashed at an unknown location" in n for n in row["crash_notes"])
+    assert row["entry_points_executed"] == 2
+    assert doc["entry_points_crashed"] == 1
+    assert validate_dynamic_reach(doc) == [] and "warnings" not in doc
+    harness_reach.record_exempt(hdir, "api", "rec_print", "debug output")
+    assert harness_reach.main(["dynamic", "--module", "api", "--harnesses", str(hdir)]) == 0
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+
+
+@pytest.mark.unit
+def test_dynamic_dispatch_crash_in_init_helper_not_reachable_from_entry_stays_gap(tmp_path, monkeypatch):
+    run = _run_dir(tmp_path, monkeypatch)
+    # Case 1 targets rec_put (which has no callees), preceded by an init call to rec_ok.
+    api_cases = [
+        {"selector": 0, "kind": "single", "entry": "rec_parse", "calls": ["rec_parse"], "inits": []},
+        {
+            "selector": 1,
+            "kind": "single",
+            "function": "rec_put",
+            "inits": [{"fn": "rec_ok", "call": 1, "for": {"call": 0, "param": 0}}],
+        },
+    ]
+    hdir = _write_harness(
+        run,
+        "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);",
+        reach_exempt={"rec_print": "debug output"},
+        entry_style="dispatch",
+        dispatch_case_count=2,
+        api_cases=api_cases,
+    )
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+
+    crash_file = run / "workspace" / "crashes" / "api" / "crash-init"
+    crash_file.parent.mkdir(parents=True, exist_ok=True)
+    crash_file.write_bytes(b"\x03\x11")  # 3 % 2 == 1 -> case 1 (rec_put with rec_ok init)
+
+    _coverage(run, {"rec_parse": 10, "rec_put": 0})
+    # Crash in rec_ok (not reachable from rec_put in DAG) must NOT credit rec_put.
+    fdir = _write_fuzz_report(
+        run,
+        "api",
+        [{"artifact": "workspace/crashes/api/crash-init", "reproducible": True, "failure": {"function": "rec_ok"}}],
+    )
+    mm = harness_reach.ModuleMap(_dag(), harness_reach.load_sidecars(hdir))
+    cov = json.loads((run / "workspace/reports/coverage/api.json").read_text(encoding="utf-8"))
+    row = harness_reach.check_dynamic("api", _dag(), mm, cov, fuzz_dir=fdir, harnesses_dir=hdir)
+    assert row["crashed_entry_points"] == []
+    assert row["gaps"] == ["rec_put"]
+    assert row["passed"] is False
+
+    # Likewise an unattributed signal crash cannot credit a case with non-empty inits.
+    _write_fuzz_report(
+        run,
+        "api",
+        [{"artifact": "workspace/crashes/api/crash-init", "reproducible": True, "failure": None}],
+    )
+    row_unknown = harness_reach.check_dynamic("api", _dag(), mm, cov, fuzz_dir=fdir, harnesses_dir=hdir)
+    assert row_unknown["crashed_entry_points"] == []
+    assert row_unknown["gaps"] == ["rec_put"]
+    assert row_unknown["passed"] is False
+
+    # And an entry point in static_gaps is never credited via crash attribution.
+    _write_fuzz_report(
+        run,
+        "api",
+        [{"artifact": "workspace/crashes/api/crash-init", "reproducible": True, "failure": {"function": "rec_put"}}],
+    )
+    row_static_gap = harness_reach.check_dynamic(
+        "api", _dag(), mm, cov, fuzz_dir=fdir, harnesses_dir=hdir, static_gaps={"rec_put"}
+    )
+    assert row_static_gap["crashed_entry_points"] == []
+    assert row_static_gap["gaps"] == ["rec_put"]
+    assert row_static_gap["passed"] is False
+
+
+@pytest.mark.unit
+def test_phase0_gates_allow_dynamic_gap_unblocks_coverage_only_when_digests_match(tmp_path, monkeypatch):
+    import phase0_gates
+
+    run = _run_dir(tmp_path, monkeypatch)
+    # Missing gate stamp still fails even with allow_dynamic_gap=True.
+    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+
+    # Static reach failure (unreached rec_put, no DYNAMIC_GAP_ERROR) still fails with allow_dynamic_gap=True.
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len);", reach_exempt={"rec_print": "debug output"})
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1
+    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+
+    # Pass static reach, then fail dynamic reach (records DYNAMIC_GAP_ERROR).
+    _write_harness(
+        run,
+        "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);",
+        reach_exempt={"rec_print": "debug output"},
+    )
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    _coverage(run, {"rec_parse": 20, "rec_put": 0})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 1
+
+    # Default check (fuzz / eva) blocks on DYNAMIC_GAP_ERROR; allow_dynamic_gap=True (coverage) passes.
+    assert phase0_gates.check(run, "api", ("reach",))
+    assert phase0_gates.main(["check", "--run-dir", str(run), "--module", "api", "--need", "reach"]) == 1
+    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True) == []
+    assert (
+        phase0_gates.main(["check", "--run-dir", str(run), "--module", "api", "--need", "reach", "--allow-dynamic-gap"])
+        == 0
+    )
+
+    # Other needed gates (e.g. build_check) still must pass.
+    phase0_gates.record_build_check(run, {"ok": False, "modules": {"api": {"ok": False, "status": "build_failed"}}})
+    reasons = phase0_gates.check(run, "api", ("reach", "build_check"), allow_dynamic_gap=True)
+    assert len(reasons) == 1 and "build-check failed" in reasons[0]
+
+    # Stale harness_digest still fails even when allow_dynamic_gap=True.
+    harness_c = hdir / "harness_api.c"
+    orig_c = harness_c.read_text(encoding="utf-8")
+    harness_c.write_text(orig_c + "/* edited */\n", encoding="utf-8")
+    [stale_h] = phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+    assert "harness of api changed" in stale_h
+    harness_c.write_text(orig_c, encoding="utf-8")
+    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True) == []
+
+    # Stale dag_digest still fails even when allow_dynamic_gap=True.
+    dag_file = run / "workspace" / "reports" / "callgraph_dag.json"
+    dag_data = json.loads(dag_file.read_text(encoding="utf-8"))
+    dag_data["extra_note"] = "mutated"
+    dag_file.write_text(json.dumps(dag_data), encoding="utf-8")
+    [stale_dag] = phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+    assert "call-graph DAG changed" in stale_dag
+
+
+@pytest.mark.unit
+def test_pipeline_mk_coverage_uses_allow_dynamic_gap_while_fuzz_and_eva_block():
+    from conftest import makefile_rule
+
+    mk_path = Path(__file__).resolve().parent.parent / "templates" / "pipeline.mk"
+    text = mk_path.read_text(encoding="utf-8")
+    assert makefile_rule(text, "$(COVERAGE_TARGETS)").recipe[0] == (
+        "$(GATE) --module $* --need reach --allow-dynamic-gap"
+    )
+    assert makefile_rule(text, "$(FUZZ_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach,build_check"
+    assert makefile_rule(text, "$(EVA_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach"
+    assert makefile_rule(text, "$(BUILD_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach"
+    gate_lines = [ln.strip() for ln in text.splitlines() if "$(GATE)" in ln or "$$(GATE)" in ln]
+    allow_lines = [ln for ln in gate_lines if "--allow-dynamic-gap" in ln]
+    assert allow_lines == ["$(GATE) --module $* --need reach --allow-dynamic-gap"]
