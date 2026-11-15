@@ -48,7 +48,9 @@ def cmd_request(
     header_file: str,
     needed_clause: str,
     reason: str,
+    origin: str | None = None,
 ) -> dict:
+    """Record one request. `origin` names a requester other than a prover result (`scheduler`)."""
     ledger = load_ledger(ledger_path)
     # IDs derive from the highest existing sequence number, never from len(), so a
     # resolved or removed entry cannot cause a collision. The parent is the only writer.
@@ -71,6 +73,8 @@ def cmd_request(
         "created_at": utc_now(),
         "updated_at": utc_now(),
     }
+    if origin:
+        entry["origin"] = origin
     ledger["requests"].append(entry)
     save_ledger(ledger_path, ledger)
     return entry
