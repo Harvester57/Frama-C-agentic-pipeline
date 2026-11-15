@@ -72,7 +72,9 @@ from framac_common import (  # noqa: E402
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
     ArtifactError,
+    atomic_write_json,
     augment_framac_cppflags,
+    bound_flow_location,
     failure_reason,
     fold_messages,
     missing_spec_messages,
@@ -80,6 +82,7 @@ from framac_common import (  # noqa: E402
     parse_missing_spec,
     read_report_csv,
     scan_undeclared_functions,
+    spill_large_flows,
     stub_repair_action,
 )
 from patterns import DOMAIN_RE  # noqa: E402
@@ -97,7 +100,9 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
     seen: set[str] = set()
     matches: list[str] = []
     for m in messages:
-        if (m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded)) or _KERNEL_ERR_RE.search(m.folded):
+        if (m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded)) or _KERNEL_ERR_RE.search(
+            m.folded
+        ):
             if m.folded not in seen:
                 seen.add(m.folded)
                 matches.append(m.folded)
@@ -105,6 +110,7 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
         return matches[:max_lines]
     tail = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
     return tail[-max_lines:]
+
 
 BASE_DOMAINS = ("cvalue", "equality", "symbolic-locations", "octagon", "gauges")
 DEFAULT_AUTO_LOOP_UNROLL = 32
@@ -255,6 +261,7 @@ def parse_deps_log(log_text: str) -> dict[str, dict]:
     if not section:
         return out
     current: dict | None = None
+    writes_by_loc: dict[str, dict] = {}
     entry: dict | None = None
     previous_loc = ""
     pending_loc: str | None = None
@@ -266,13 +273,24 @@ def parse_deps_log(log_text: str) -> dict[str, dict]:
             pending_from = []
             return
         text = " ".join(pending_from)
-        entry["and_self"] = "(and SELF)" in text
-        entry["from"] = split_locations(text.replace("(and SELF)", ""))
+        and_self = "(and SELF)" in text
+        from_locs = list(dict.fromkeys(bound_flow_location(x) for x in split_locations(text.replace("(and SELF)", ""))))
         if current is not None:
             if entry["loc"] == "\\result":
-                current["result_from"] = entry["from"]
+                if current["result_from"] is None:
+                    current["result_from"] = from_locs
+                else:
+                    current["result_from"] = list(dict.fromkeys([*current["result_from"], *from_locs]))
             else:
-                current["writes"].append(entry)
+                loc = bound_flow_location(entry["loc"])
+                existing = writes_by_loc.get(loc)
+                if existing is None:
+                    rec = {"loc": loc, "and_self": and_self, "from": from_locs}
+                    writes_by_loc[loc] = rec
+                    current["writes"].append(rec)
+                else:
+                    existing["and_self"] = bool(existing.get("and_self")) or and_self
+                    existing["from"] = list(dict.fromkeys([*(existing.get("from") or []), *from_locs]))
         entry, pending_from = None, []
 
     for line in section.group(1).splitlines():
@@ -280,6 +298,7 @@ def parse_deps_log(log_text: str) -> dict[str, dict]:
         if m_fn:
             _close_entry()
             current = {"writes": [], "result_from": None, "no_effects": False, "non_terminating": False}
+            writes_by_loc = {}
             out[m_fn.group(1)] = current
             previous_loc = ""
             continue
@@ -339,7 +358,9 @@ def parse_inout_log(log_text: str) -> dict[str, dict]:
         elif stripped and field:
             buffers.setdefault((function, field), []).append(stripped)
     for (fn, name), lines in buffers.items():
-        out.setdefault(fn, {})[name] = split_locations(" ".join(lines))
+        out.setdefault(fn, {})[name] = list(
+            dict.fromkeys(bound_flow_location(x) for x in split_locations(" ".join(lines)))
+        )
     return out
 
 
@@ -460,6 +481,7 @@ def run_eva_on_slice(
         out_dir / "flows.log",
         out_dir / "flows.cg.dot",
         out_dir / "flamegraph.txt",
+        out_dir / "flamegraph.timed_out.txt",
         out_dir / "nonterm.log",
         out_dir / "eva.timed_out.log",
     ):
@@ -565,13 +587,15 @@ def run_eva_on_slice(
             )
             res["auto_recursion_fallback"] = True
 
-        # Fast cvalue fallback when the default 5-domain base run times out. Each fallback writes its
-        # flamegraph.txt over the timed-out run's, so keep the profile that says why it was slow.
+        # Fast cvalue fallback when the default 5-domain base run times out. Preserve both eva.log
+        # and any non-empty 5-domain flamegraph.txt so cost_profile and eva_shards.py plan from the
+        # true 5-domain profile instead of a 900 s cvalue fallback.
         timed_out_profile = res.get("cost_profile")
         if res["status"] == "analysis_timeout" and can_timeout_fallback:
             timed_out = res
-            # The fallback runs write eva.log over the timed-out run's: keep the one that explains it.
             _keep_timed_out_log(timed_out, out_dir)
+            kept_fg = _keep_timed_out_flamegraph(out_dir)
+            fb_flamegraph = flamegraph and kept_fg is None
             fb_budget = min(900, max(120, int((budget_s or 600) // 4)))
             tried: list[dict] = []
             for tier_name, fb_opts in _timeout_fallback_tiers(slevel, options):
@@ -589,7 +613,7 @@ def run_eva_on_slice(
                     mlevel=mlevel,
                     allow_incomplete_recursion_specs=cur_allow_rec,
                     eva_options=fb_opts,
-                    flamegraph=flamegraph,
+                    flamegraph=fb_flamegraph,
                 )
                 fb_res = _execute_eva(fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root)
                 if (
@@ -612,7 +636,7 @@ def run_eva_on_slice(
                         mlevel=mlevel,
                         allow_incomplete_recursion_specs=True,
                         eva_options=fb_opts,
-                        flamegraph=flamegraph,
+                        flamegraph=fb_flamegraph,
                     )
                     fb_res = _execute_eva(
                         fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root
@@ -621,7 +645,8 @@ def run_eva_on_slice(
                 if fb_res["status"] == "ok":
                     fb_res["eva_options"] = fb_opts
                     fb_res["timeout_fallback"] = tier_name
-                    own = cost_profile(out_dir / "flamegraph.txt")
+                    own = cost_profile(out_dir / "flamegraph.txt") if kept_fg is None else None
+                    _restore_timed_out_flamegraph(kept_fg, out_dir, fb_res)
                     profile = timed_out_profile or ({"run": "fallback", **own} if own else None)
                     if profile:
                         fb_res["cost_profile"] = profile
@@ -629,6 +654,7 @@ def run_eva_on_slice(
                 tried.append({"tier": tier_name, "status": fb_res["status"], "elapsed_s": fb_res.get("elapsed_s")})
             # No tier completed: the result is the timed-out run's, which names the limit it hit.
             res = _with_failed_fallbacks(timed_out, tried, fb_budget)
+            _restore_timed_out_flamegraph(kept_fg, out_dir, res)
         return res
 
     if not use_cache:
@@ -771,6 +797,32 @@ def _keep_timed_out_log(res: dict, out_dir: Path) -> None:
         if log.is_file():
             os.replace(log, kept)
             res["log_file"] = str(kept)
+    except OSError:
+        pass
+
+
+def _keep_timed_out_flamegraph(out_dir: Path) -> Path | None:
+    """Move a timed-out 5-domain run's non-empty flamegraph.txt aside before cvalue fallbacks run."""
+    fg = out_dir / "flamegraph.txt"
+    kept = out_dir / "flamegraph.timed_out.txt"
+    try:
+        if fg.is_file() and fg.stat().st_size > 0:
+            os.replace(fg, kept)
+            return kept
+    except OSError:
+        pass
+    return None
+
+
+def _restore_timed_out_flamegraph(kept: Path | None, out_dir: Path, res: dict) -> None:
+    """Restore the timed-out 5-domain flamegraph.txt so shard planning reads the 5-domain profile."""
+    if kept is None:
+        return
+    fg = out_dir / "flamegraph.txt"
+    try:
+        if kept.is_file():
+            os.replace(kept, fg)
+            res["flamegraph_file"] = str(fg)
     except OSError:
         pass
 
@@ -1259,8 +1311,8 @@ def main(argv: list[str] | None = None) -> int:
         flamegraph=not args.no_flamegraph,
     )
     res["module"] = args.module
-    args.out_json.parent.mkdir(parents=True, exist_ok=True)
-    args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+    disk_res = spill_large_flows(res, args.out_dir / "flows.json", report_path=args.out_json)
+    atomic_write_json(args.out_json, disk_res)
     print(
         json.dumps(
             {
