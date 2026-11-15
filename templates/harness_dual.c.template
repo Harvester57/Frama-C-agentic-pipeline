@@ -45,6 +45,51 @@ typedef uint64_t __uint64_t;
  */
 #define FRAMAC_FUZZ_COPY(buf, off) ((buf) + (off))
 
+#if !defined(__FRAMAC__) || defined(__FRAMAC_EACSL__)
+/* runtime dispatch case skip */
+#define FRAMAC_FUZZ_RUNTIME_SKIP_CASES 1
+#define framac_fuzz_skip_case framac_fuzz_skip_case
+static inline int framac_fuzz_skip_case(unsigned int c) {
+    static unsigned long long framac_fuzz_rt_skip_words[64];
+    static int framac_fuzz_rt_skip_init = 0;
+    if (!framac_fuzz_rt_skip_init) {
+        const char *env = getenv("FRAMAC_FUZZ_SKIP_CASES");
+        if (env != NULL) {
+            const char *p = env;
+            while (*p != '\0') {
+                while (*p == ',' || *p == ' ' || *p == '\t') {
+                    p++;
+                }
+                if (*p >= '0' && *p <= '9') {
+                    unsigned int val = 0U;
+                    int overflow = 0;
+                    while (*p >= '0' && *p <= '9') {
+                        unsigned int digit = (unsigned int)(*p - '0');
+                        if (val > 4096U) {
+                            overflow = 1;
+                        } else {
+                            val = val * 10U + digit;
+                        }
+                        p++;
+                    }
+                    if (!overflow && val < 4096U) {
+                        framac_fuzz_rt_skip_words[val >> 6U] |= (1ULL << (val & 63U));
+                    }
+                }
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+            }
+        }
+        framac_fuzz_rt_skip_init = 1;
+    }
+    if (c >= 4096U) {
+        return 0;
+    }
+    return (int)((framac_fuzz_rt_skip_words[c >> 6U] >> (c & 63U)) & 1ULL);
+}
+#endif
+
 #if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)
 #include "__fc_builtin.h"
 

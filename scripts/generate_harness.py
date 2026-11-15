@@ -31,6 +31,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import (  # noqa: E402
+    ArtifactError,
     atomic_write_json,
     load_json_optional,
     load_json_strict,
@@ -55,8 +56,14 @@ VALID_ENTRY_STYLES = (
 # Compile-time bit mask of dispatch cases a fuzz build skips (run_eacsl_fuzz.py campaign rounds):
 # DISPATCH_SKIP_MACRO holds cases 0..63, DISPATCH_SKIP_MACRO_<k> cases 64k..64k+63. A harness whose
 # guard carries DISPATCH_SKIP_ALL_MARKER reads every word; one generated before it reads cases 0..63 only.
+# Harnesses generated from harness_dual.c.template also carry DISPATCH_RUNTIME_SKIP_MARKER and call
+# DISPATCH_SKIP_FN so campaigns skip crashed cases at runtime via DISPATCH_SKIP_MACRO in the environment
+# without recompiling.
 DISPATCH_SKIP_MACRO = "FRAMAC_FUZZ_SKIP_CASES"
 DISPATCH_SKIP_ALL_MARKER = "every dispatch case skippable"
+DISPATCH_SKIP_FN = "framac_fuzz_skip_case"
+DISPATCH_RUNTIME_SKIP_MARKER = "runtime dispatch case skip"
+DISPATCH_RUNTIME_SKIP_MAX_CASES = 4096
 # Eva sharding (eva_shards.py): a shard is built with -DFRAMAC_EVA_SHARD and -DFRAMAC_EVA_SHARD_CASE_<k>
 # for each case it keeps. Without FRAMAC_EVA_SHARD every case is there, as before.
 EVA_SHARD_MACRO = "FRAMAC_EVA_SHARD"
@@ -139,9 +146,7 @@ def _wrap_null_terminated(eva_inner: str, fuzz_inner: str) -> tuple[str, str]:
 _PARAM_DECL_RE = re.compile(
     r"^(?P<type_part>.*?)(?P<stars>(?:\*\s*)+)?(?P<name>[A-Za-z_]\w*)\s*(?P<array>(?:\[[^\]]*\]\s*)+)?$"
 )
-_ARRAY_PTR_PARAM_RE = re.compile(
-    r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*(?P<array>(?:\[[^\]]*\]\s*)+)$"
-)
+_ARRAY_PTR_PARAM_RE = re.compile(r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*(?P<array>(?:\[[^\]]*\]\s*)+)$")
 _FN_PTR_PARAM_RE = re.compile(r"^(?P<ret>.+?)\(\s*\*(?P<inner>[^)]*)\)\s*\((?P<args>.*)\)$")
 _FN_TYPE_PARAM_RE = re.compile(r"^(?P<head>[^(]+)\((?P<args>.*)\)$")
 
@@ -151,6 +156,7 @@ def _format_c_decl(c_type: str, name: str) -> str:
     if m:
         return f"{m.group(1)} {name}{m.group(2)};"
     return f"{c_type} {name};"
+
 
 # A directive with its continuation lines: a backslash before the newline continues it (a `[^\n]*`
 # would take that backslash and stop at the first line, leaving a macro's body in the text).
@@ -960,15 +966,17 @@ def _build_auto_prototype_invocations(
     return eva_stmt, fuzz_stmt, needs_null_terminate
 
 
-def _build_dispatch_invocation(cases: list[str]) -> str:
+def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) -> str:
     """
     One harness that drives several API calls: the first input byte selects a case and the
     rest of the input is the case's `fuzz_buf`/`fuzz_len`. Eva sees an unknown selector, so one
     analysis covers every case. Cases must not `return` (the fuzz side frees its buffer after).
 
-    A campaign that already crashed in some cases rebuilds with -DFRAMAC_FUZZ_SKIP_CASES=<bit mask>
-    (bit i skips case i, cases 0..63) and -DFRAMAC_FUZZ_SKIP_CASES_<k>=<mask> for cases 64k..64k+63,
-    so the known crash stops ending every run. A word not given skips nothing. Eva never sees it.
+    A campaign that already crashed in some cases skips them on the next round via the runtime
+    `FRAMAC_FUZZ_SKIP_CASES` environment variable (`runtime_skip=True`, checked by `framac_fuzz_skip_case`)
+    or, for compile-time builds, `-DFRAMAC_FUZZ_SKIP_CASES=<bit mask>` (bit i skips case i, cases 0..63)
+    and `-DFRAMAC_FUZZ_SKIP_CASES_<k>=<mask>` for cases 64k..64k+63, so the known crash stops ending
+    every run. A word not given skips nothing. Eva never sees it.
 
     Each case also sits in `#if !defined(FRAMAC_EVA_SHARD) || defined(FRAMAC_EVA_SHARD_CASE_<k>)`: an
     Eva shard keeps only its cases in the source (eva_shards.py). The preprocessor keeps line numbers, so
@@ -992,6 +1000,49 @@ def _build_dispatch_invocation(cases: list[str]) -> str:
         word = f"({case} < {64 * (k + 1)}U ? (unsigned long long)({name}) : {word})"
     if n_words == 1:
         word = f"((unsigned long long)({DISPATCH_SKIP_MACRO}))"
+    if runtime_skip:
+        skip_guard = f"#if defined({DISPATCH_SKIP_MACRO}) || defined({DISPATCH_SKIP_FN})"
+        lines = [
+            "if (fuzz_len > 0) {",
+            "    uint8_t harness_selector = fuzz_buf[0];",
+            "    fuzz_buf += 1;",
+            "    fuzz_len -= 1;",
+            skip_guard,
+            "    int harness_skip_case = 0;",
+            f"#ifdef {DISPATCH_SKIP_MACRO}",
+            f"    /* {DISPATCH_SKIP_ALL_MARKER}: {DISPATCH_SKIP_MACRO}_<k> holds cases 64k..64k+63 */",
+        ]
+        for k in range(1, n_words):
+            lines += [
+                f"#ifndef {DISPATCH_SKIP_MACRO}_{k}",
+                f"#define {DISPATCH_SKIP_MACRO}_{k} 0ULL",
+                "#endif",
+            ]
+        lines += [
+            f"    if ((({word} >> ({case} & 63U)) & 1ULL) != 0ULL) {{ harness_skip_case = 1; }}",
+            "#endif",
+            f"#ifdef {DISPATCH_SKIP_FN}",
+            f"    if (!harness_skip_case && {DISPATCH_SKIP_FN}({case})) {{ harness_skip_case = 1; }}",
+            "#endif",
+            "    if (!harness_skip_case)",
+            "#endif",
+            f"    switch (harness_selector % {n}U) {{",
+        ]
+        for i, stmt in enumerate(stmts):
+            lines += [
+                f"#if !defined({EVA_SHARD_MACRO}) || defined({EVA_SHARD_MACRO}_CASE_{i})",
+                f"    case {i}U: {{ {stmt} }} break;",
+                "#endif",
+            ]
+        lines += [
+            "    default: break;",
+            "    }",
+            skip_guard,
+            "    else { FRAMAC_FUZZ_REJECT(); }",
+            "#endif",
+            "} else { FRAMAC_FUZZ_REJECT(); }",
+        ]
+        return "\n    ".join(lines)
     # Joined with a newline plus 4 spaces under the template's indent, so nested lines carry 4 more.
     lines = [
         "if (fuzz_len > 0) {",
@@ -2227,6 +2278,12 @@ def _generate_module_harness(
         auto_params=auto_params,
         dispatch_cases=dispatch_cases,
     )
+    if entry_style == "dispatch" and target_fuzzer_record is None:
+        fuzz_disc = _build_dispatch_invocation(dispatch_cases or [], runtime_skip=True)
+        if effective_null_terminate:
+            _, fuzz_call = _wrap_null_terminated(eva_call, fuzz_disc)
+        else:
+            fuzz_call = fuzz_disc
     if target_fuzzer_record is not None:
         # The copy in fuzz_buf (never libFuzzer's `data`) is what E-ACSL's initialization checks need.
         tf_call = _target_fuzzer_invocation(bool(target_fuzzer_record["initialize"]))
@@ -2488,6 +2545,7 @@ def _generate_module_harness(
         "include_source": include_source,
         "reachability": reachability,
         "reachability_source": reachability_source,
+        "max_input_size": max_input_size,
         "scope_files": scope,
         **({"target_fuzzer": dict(target_fuzzer_record)} if target_fuzzer_record is not None else {}),
         **prelude_fields,
@@ -2555,6 +2613,40 @@ def _bind_flag_values(argv: list[str]) -> list[str]:
     --cppflags / --ldflags with `=` so single flags work as well as quoted flag lists.
     """
     return normalize_flag_args(argv, ("--cppflags", "--ldflags"))
+
+
+def _has_generation_flags(raw_argv: list[str]) -> bool:
+    """True when `raw_argv` supplies any harness-generation flag alongside `--record-repair` / `--reason`."""
+    i = 0
+    while i < len(raw_argv):
+        tok = raw_argv[i]
+        if tok in ("--record-repair", "--reason"):
+            i += 2
+            continue
+        if tok.startswith(("--record-repair=", "--reason=")):
+            i += 1
+            continue
+        if tok.startswith("-"):
+            return True
+        i += 1
+    return False
+
+
+def _flag_passed(raw_argv: list[str], flag: str) -> bool:
+    """True when `flag` (`--out-dir`, `--entry-style`, ...) was explicitly passed in `raw_argv`."""
+    i = 0
+    while i < len(raw_argv):
+        tok = raw_argv[i]
+        if tok in ("--record-repair", "--reason"):
+            i += 2
+            continue
+        if tok.startswith(("--record-repair=", "--reason=")):
+            i += 1
+            continue
+        if tok == flag or tok.startswith(f"{flag}="):
+            return True
+        i += 1
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2724,19 +2816,81 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reason", default="", help="Reason for harness repair when using --record-repair")
     args = parser.parse_args(raw_argv)
 
+    orig_sidecar_bytes: bytes | None = None
     if args.record_repair is not None:
         if not args.reason.strip():
             print(json.dumps({"ok": False, "error": "--record-repair requires --reason"}, indent=2))
             return 1
-        res = record_harness_repair(args.record_repair, args.reason.strip())
-        print(json.dumps(res, indent=2))
-        return 0
+        if not _has_generation_flags(raw_argv):
+            try:
+                res = record_harness_repair(args.record_repair, args.reason.strip())
+            except (ArtifactError, OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+                return 1
+            print(json.dumps(res, indent=2))
+            return 0
+        if not _flag_passed(raw_argv, "--out-dir"):
+            args.out_dir = args.record_repair.parent
+        try:
+            existing_meta = load_json_strict(args.record_repair)
+            orig_sidecar_bytes = args.record_repair.read_bytes()
+        except (ArtifactError, OSError, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
+        sidecar_mod = existing_meta.get("module")
+        if not args.module and isinstance(sidecar_mod, str) and sidecar_mod:
+            args.module = sidecar_mod
+        if args.module:
+            expected_meta = args.out_dir / f"harness_{args.module}.json"
+            if args.record_repair.resolve() != expected_meta.resolve() or (
+                isinstance(sidecar_mod, str) and sidecar_mod and sidecar_mod != args.module
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": (
+                                f"--record-repair path {args.record_repair} does not match target sidecar "
+                                f"{expected_meta} for module {args.module!r}"
+                            ),
+                        },
+                        indent=2,
+                    )
+                )
+                return 1
+        cur_attempts = int(existing_meta.get("repair_attempts", 0))
+        max_attempts = int(existing_meta.get("max_repair_attempts", MAX_HARNESS_REPAIR_ATTEMPTS))
+        if cur_attempts >= max_attempts:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"harness repair budget exhausted ({cur_attempts}/{max_attempts}) for {args.record_repair}"
+                        ),
+                        "module": args.module,
+                        "repair_attempts": cur_attempts,
+                        "max_repair_attempts": max_attempts,
+                        "exhausted": True,
+                    },
+                    indent=2,
+                )
+            )
+            return 1
+
+    def _restore_sidecar_on_failure() -> None:
+        if args.record_repair is not None and orig_sidecar_bytes is not None:
+            with contextlib.suppress(OSError):
+                args.record_repair.write_bytes(orig_sidecar_bytes)
 
     if args.api:
         if not args.module:
             parser.error("--api requires --module")
         from api_harness import ApiHarnessError, generate
 
+        repair_res = (
+            record_harness_repair(args.record_repair, args.reason.strip()) if args.record_repair is not None else None
+        )
         try:
             result = generate(
                 module=args.module,
@@ -2754,8 +2908,13 @@ def main(argv: list[str] | None = None) -> int:
                 dispatch_cases=args.dispatch_case or None,
             )
         except (ApiHarnessError, ValueError) as exc:
+            _restore_sidecar_on_failure()
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
             return 1
+        if repair_res is not None:
+            result["repair_recorded"] = repair_res
+            result["repair_attempts"] = repair_res["repair_attempts"]
+            result["exhausted"] = repair_res["exhausted"]
         print(json.dumps(result, indent=2))
         return 0
 
@@ -2784,13 +2943,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--module, --sources, and --entry-fn are required when generating a harness")
 
     effective_style = "auto_prototype" if args.auto_args else args.entry_style
-    style_explicit = any(a == "--entry-style" or a.startswith("--entry-style=") for a in raw_argv)
+    style_explicit = _flag_passed(raw_argv, "--entry-style")
     if not style_explicit and not args.auto_args and args.entry_fn == "main":
         # CLI-style target: drive main(argc, argv) instead of a (buf, len) entry.
         effective_style = "argv"
     # None: generate_module_harness takes it from the entry function's trust, else from the entry style.
     effective_reachability = args.reachability
 
+    repair_res = (
+        record_harness_repair(args.record_repair, args.reason.strip()) if args.record_repair is not None else None
+    )
     try:
         result = generate_module_harness(
             module_name=args.module,
@@ -2826,8 +2988,13 @@ def main(argv: list[str] | None = None) -> int:
             target_fuzzer_id=args.target_fuzzer_id,
         )
     except ValueError as exc:
+        _restore_sidecar_on_failure()
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         return 1
+    if repair_res is not None:
+        result["repair_recorded"] = repair_res
+        result["repair_attempts"] = repair_res["repair_attempts"]
+        result["exhausted"] = repair_res["exhausted"]
     print(json.dumps(result, indent=2))
     return 0
 
