@@ -23,6 +23,7 @@ A `Known Dead Ends` section, when present, lists clauses already refuted on this
 - Inputs must respect the harness entry function's declared or documented contract. A failure that requires violating that contract (for example a length larger than the buffer the API documents) is harness-induced and does not count.
 - Do not write to the shared corpus, crash directories, ledgers, or the work tree. The parent promotes your seeds and crashes.
 - Stop at the first failing assertion; do not explore further impact.
+- Run inputs through `run_eacsl_fuzz.py` (the campaign below, or `run_eacsl_fuzz.py replay --module {harness_module_name} --inputs <files> --binary <binary> --out-json agents/{agent_id}/scratch/<name>.json`). If you run a fuzz binary by hand, pass `-artifact_prefix=agents/{agent_id}/scratch/crashes/`: without it libFuzzer writes `crash-*`, `leak-*`, `timeout-*`, `oom-*` or `slow-unit-*` files into its current directory, the run directory, and `validate_artifacts.py run-dir` then fails the run.
 - **Reference manuals (last resort):** if you cannot tell what an `rte: <kind>` assertion requires, or how the E-ACSL runtime reports a failure, grep the greppable Frama-C manuals under `{references_dir}`. Grep `INDEX.md` for the topic and Read only the reported line range; never read a manual whole. Use the RTE manual `rte/frama-c-rte-manual.md` §2 for the condition behind each alarm kind, and `e-acsl-quickref.md` (runtime output formats) or the E-ACSL plug-in manual `eacsl/e-acsl-manual.md` §2.3.5 for runtime reporting.
 
 ## Execution Steps

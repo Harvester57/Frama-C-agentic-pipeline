@@ -63,6 +63,9 @@ Export the session and its child sessions (subagents), then read the new tool ca
 - The model working around the pipeline:
   - retrying the same command;
   - hand-editing generated artifacts;
+  - editing pipeline files (`scripts/`, `templates/`, `skills/`) in the repository during the run;
+  - merging or ingesting outside `wp_scheduler.py step` / `complete` (a hand-run `merge-agent` or `ingest-verifier`, an off-schedule subagent);
+  - passing ACSL or other backslash text through an inline shell command instead of a file;
   - skipping or reinterpreting a gate;
   - inventing flags;
   - a skill or brief that contradicts a script, or that the model has to reread because it is ambiguous.
