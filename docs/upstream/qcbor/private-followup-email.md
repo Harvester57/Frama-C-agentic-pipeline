@@ -2,12 +2,12 @@
 
 Draft, not sent. It follows up the private report of 2026-11-04 (the `ieee754.c` shifts and the `INT64_MIN` negation, reports 04 and 09 here). It also carries the two private bugs, 01 and 08. Send it before filing any of the public issues, so the maintainer hears about everything from you first.
 
-Before sending, check the two points marked **[check]**. Attach:
+Before sending, fill in the point marked **[check]**. Attach:
 - [`patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch`](./patches/public/0007-Don-t-negate-INT64_MIN-in-QCBORDecode_ProcessBigNumb.patch) (09, rebased on `dev` `19c3367`);
 - [`patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch`](./patches/v1/0001-Don-t-shift-by-an-out-of-range-amount-in-float-conve.patch) (04 for 1.x), only if you want to offer it;
 - for 01 and 08, the two report files, the two patches in `patches/private/`, and the two reproducers `repro/bignum_zero.c` and `repro/getarray_empty.c`.
 
-Both private patches were made against `dev` `9bd0845`. **[check]** Rebase them on `19c3367` and rerun them before attaching.
+Both private patches are rebased on `dev` `19c3367` and validated there (2026-11-15; see the README).
 
 ---
 
@@ -37,7 +37,8 @@ Both private patches were made against `dev` `9bd0845`. **[check]** Rebase them 
 > reports either site. Would you like it as a pull request, or would you rather fix it yourself?
 >
 > **4. Two new out-of-bounds reads.** Each comes with a report, a patch with tests, and a
-> reproducer, attached.
+> reproducer, attached. Both patches apply to `dev` `19c3367` and pass the same checks as above,
+> plus ASan and MSan on the reproducers.
 >
 > - `QCBORDecode_GetArray()` / `GetMap()` on an empty definite-length array or map (`80`, `a0`)
 >   return `pEncodedCBOR` with a valid pointer and a length taken from uninitialized stack memory.

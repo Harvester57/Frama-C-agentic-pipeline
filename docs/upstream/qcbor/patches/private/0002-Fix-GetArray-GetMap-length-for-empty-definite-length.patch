@@ -1,7 +1,7 @@
-From 71d3dd1b79a91989ba74b95bb13dc131ae5d91e4 Mon Sep 17 00:00:00 2001
+From 855ae29d6ba838fa923ce1a1432efb33cbf7116b Mon Sep 17 00:00:00 2001
 From: Florian Stosse <florian.stosse@gmail.com>
 Date: Mon, 9 Nov 2026 15:24:48 +0100
-Subject: [PATCH 2/2] Fix GetArray()/GetMap() length for empty definite-length
+Subject: [PATCH] Fix GetArray()/GetMap() length for empty definite-length
  arrays and maps
 
 QCBORDecode_GetArray() and QCBORDecode_GetMap() take the end of the
@@ -32,10 +32,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 48 insertions(+)
 
 diff --git a/src/qcbor_main_decode.c b/src/qcbor_main_decode.c
-index 8c8759d..29cc1b1 100644
+index 26ccf08..75ed891 100644
 --- a/src/qcbor_main_decode.c
 +++ b/src/qcbor_main_decode.c
-@@ -1931,6 +1931,17 @@ QCBORDecode_Private_GetNextMapOrArray(QCBORDecodeContext    *pMe,
+@@ -1940,6 +1940,17 @@ QCBORDecode_Private_GetNextMapOrArray(QCBORDecodeContext    *pMe,
         * reached, then it ascends nesting levels, possibly all the way
         * to the top level.
         */
@@ -54,10 +54,10 @@ index 8c8759d..29cc1b1 100644
        uAscendErr = QCBORDecode_Private_NestLevelAscender(pMe, pEnd);
        if(uAscendErr != QCBOR_SUCCESS) {
 diff --git a/test/qcbor_decode_tests.c b/test/qcbor_decode_tests.c
-index ee36606..28c082f 100644
+index 17beea5..180e448 100644
 --- a/test/qcbor_decode_tests.c
 +++ b/test/qcbor_decode_tests.c
-@@ -13434,6 +13434,43 @@ int32_t GetMapAndArrayTest(void)
+@@ -13801,6 +13801,43 @@ int32_t GetMapAndArrayTest(void)
        return 109;
     }
  

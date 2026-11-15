@@ -17,9 +17,9 @@
 
 | ID | Title | Location (`dev` v2 / `master`) | Property / CWE | Severity | Upstream Ticket | Status |
 | :--- | :--- | :--- | :--- | :---: | :--- | :--- |
-| [`QCBOR-01`](#qcbor-01-c11-signed-integer-overflow-negating-int64_min-in-qcbordecode_processbignumber) | C11 signed integer overflow negating `INT64_MIN` in `QCBORDecode_ProcessBigNumber` | [`src/qcbor_number_decode.c:1964`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_number_decode.c#L1964), [`:2008`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_number_decode.c#L2008) (`dev`) | `signed_overflow` (CWE-190) | **Medium** | Pending / Not yet filed | Confirmed (Unreported) |
-| [`QCBOR-02`](#qcbor-02-c11-undefined-shift-by-negative-exponent-in-ieee754_doubletosingle) | C11 undefined right-shift by negative shift count in `IEEE754_DoubleToSingle` | [`src/ieee754.c:625`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/ieee754.c#L625) (`dev`) / [`src/ieee754.c:666`](https://github.com/laurencelundblade/QCBOR/blob/572a567d02bcfde42f5863f6a515131cc270798d/src/ieee754.c#L666) (`master`) | `shift` (C11 6.5.7p3 / CWE-758) | **Low** | Pending / Not yet filed | Confirmed (Unreported) |
-| [`QCBOR-03`](#qcbor-03-c11-undefined-shift-by-negative-exponent-in-ieee754_singletohalf) | C11 undefined right-shift by negative shift count in `IEEE754_SingleToHalf` | [`src/ieee754.c:466`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/ieee754.c#L466) (`dev`) / [`src/ieee754.c:510`](https://github.com/laurencelundblade/QCBOR/blob/572a567d02bcfde42f5863f6a515131cc270798d/src/ieee754.c#L510) (`master`) | `shift` (C11 6.5.7p3 / CWE-758) | **Low** | Pending / Not yet filed | Confirmed (Unreported) |
+| [`QCBOR-01`](#qcbor-01-c11-signed-integer-overflow-negating-int64_min-in-qcbordecode_processbignumber) | C11 signed integer overflow negating `INT64_MIN` in `QCBORDecode_ProcessBigNumber` | [`src/qcbor_number_decode.c:1964`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_number_decode.c#L1964), [`:2008`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_number_decode.c#L2008) (`dev`) | `signed_overflow` (CWE-190) | **Medium** | Reported privately by email on 2026-11-04 (with patch); still open on `dev` `19c3367` | Reported |
+| [`QCBOR-02`](#qcbor-02-c11-undefined-shift-by-negative-exponent-in-ieee754_doubletosingle) | C11 undefined right-shift by negative shift count in `IEEE754_DoubleToSingle` | [`src/ieee754.c:625`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/ieee754.c#L625) (`dev`) / [`src/ieee754.c:666`](https://github.com/laurencelundblade/QCBOR/blob/572a567d02bcfde42f5863f6a515131cc270798d/src/ieee754.c#L666) (`master`) | `shift` (C11 6.5.7p3 / CWE-758) | **Low** | Reported privately by email on 2026-11-04; public as [laurencelundblade/QCBOR#434](https://github.com/laurencelundblade/QCBOR/issues/434) (third party), fix open in [laurencelundblade/QCBOR#438](https://github.com/laurencelundblade/QCBOR/pull/438) (`dev` only) | Reported |
+| [`QCBOR-03`](#qcbor-03-c11-undefined-shift-by-negative-exponent-in-ieee754_singletohalf) | C11 undefined right-shift by negative shift count in `IEEE754_SingleToHalf` | [`src/ieee754.c:466`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/ieee754.c#L466) (`dev`) / [`src/ieee754.c:510`](https://github.com/laurencelundblade/QCBOR/blob/572a567d02bcfde42f5863f6a515131cc270798d/src/ieee754.c#L510) (`master`) | `shift` (C11 6.5.7p3 / CWE-758) | **Low** | Reported privately by email on 2026-11-04; public as [laurencelundblade/QCBOR#434](https://github.com/laurencelundblade/QCBOR/issues/434) (third party), fix open in [laurencelundblade/QCBOR#438](https://github.com/laurencelundblade/QCBOR/pull/438) (`dev` only) | Reported |
 
 ---
 
@@ -30,8 +30,8 @@
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `src/qcbor_number_decode.c#QCBORDecode_ProcessBigNumber::signed_overflow::e3d0c960fc` |
-| **Status** | Confirmed (Unreported) |
-| **Upstream Ticket** | Pending / Not yet filed |
+| **Status** | Reported |
+| **Upstream Ticket** | Reported privately to the maintainer by email on 2026-11-04, with a patch, following QCBOR's `SECURITY.md`. Still present on `dev` `19c3367` (2026-11-15). Rebased patch and follow-up: [`../../upstream/qcbor/09-processbignumber-int64-min.md`](../../upstream/qcbor/09-processbignumber-int64-min.md) |
 | **Severity** | **Medium** (Arithmetic undefined behavior directly reachable from untrusted CBOR input when decoding decimal fractions or bigfloats with an `INT64_MIN` mantissa) |
 | **Reachability** | `untrusted_surface` (`QCBORDecode_GetDecimalFractionBig` / `QCBORDecode_GetBigFloatBig` / `QCBORDecode_GetTDecimalFractionBigMantissa`) |
 | **Location** | [`src/qcbor_number_decode.c:1964`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_number_decode.c#L1964) and [`src/qcbor_number_decode.c:2008`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/qcbor_number_decode.c#L2008) (`QCBORDecode_ProcessBigNumber`) |
@@ -135,8 +135,8 @@ Perform the negation in `uint64_t` (`0ULL - (uint64_t)Item.val.int64`) so `INT64
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `src/ieee754.c#IEEE754_DoubleToSingle::shift::d355106f76` |
-| **Status** | Confirmed (Unreported) |
-| **Upstream Ticket** | Pending / Not yet filed |
+| **Status** | Reported |
+| **Upstream Ticket** | Reported privately to the maintainer by email on 2026-11-04, with a patch. Filed publicly by a third party as [laurencelundblade/QCBOR#434](https://github.com/laurencelundblade/QCBOR/issues/434); the maintainer's fix for `dev` is [laurencelundblade/QCBOR#438](https://github.com/laurencelundblade/QCBOR/pull/438) (open, checked clean against our reproducer on 2026-11-15). `master` (1.x) is not covered by #438. |
 | **Severity** | **Low** (C11 6.5.7p3 undefined behavior when converting any `double` that cannot be losslessly narrowed to a normal `float`, such as `1.1`) |
 | **Reachability** | `internal_api` (called by `IEEE754_DoubleToSmaller` during preferred float serialization and on `dev` v2 by `QCBORDecode_Private_DoubleConformance` under `QCBOR_DECODE_MODE_ONLY_SHORTEST_FLOAT`) |
 | **Location** | [`src/ieee754.c:625`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/ieee754.c#L625) (`dev`) / [`src/ieee754.c:666`](https://github.com/laurencelundblade/QCBOR/blob/572a567d02bcfde42f5863f6a515131cc270798d/src/ieee754.c#L666) (`master`) (`IEEE754_DoubleToSingle`) |
@@ -231,8 +231,8 @@ Check that `nDoubleUnbiasedExponent` is within the single-subnormal exponent ran
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `src/ieee754.c#IEEE754_SingleToHalf::shift::ceaaa12428` |
-| **Status** | Confirmed (Unreported) |
-| **Upstream Ticket** | Pending / Not yet filed |
+| **Status** | Reported |
+| **Upstream Ticket** | Reported privately to the maintainer by email on 2026-11-04, with a patch. Filed publicly by a third party as [laurencelundblade/QCBOR#434](https://github.com/laurencelundblade/QCBOR/issues/434); the maintainer's fix for `dev` is [laurencelundblade/QCBOR#438](https://github.com/laurencelundblade/QCBOR/pull/438) (open, checked clean against our reproducer on 2026-11-15). `master` (1.x) is not covered by #438. |
 | **Severity** | **Low** (C11 6.5.7p3 undefined behavior when converting any `float` that cannot be losslessly narrowed to a normal half-precision float, such as `1.1f` or `1.0e30f`) |
 | **Reachability** | `internal_api` (called by `IEEE754_FloatToSmallest` / `IEEE754_DoubleToSmaller` during preferred float serialization and on `dev` v2 by `QCBORDecode_Private_SingleConformance` under `QCBOR_DECODE_MODE_ONLY_SHORTEST_FLOAT`) |
 | **Location** | [`src/ieee754.c:466`](https://github.com/laurencelundblade/QCBOR/blob/9bd08456d46ac5fbaa7822420fd3e25e0e9c486f/src/ieee754.c#L466) (`dev`) / [`src/ieee754.c:510`](https://github.com/laurencelundblade/QCBOR/blob/572a567d02bcfde42f5863f6a515131cc270798d/src/ieee754.c#L510) (`master`) (`IEEE754_SingleToHalf`) |

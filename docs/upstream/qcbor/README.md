@@ -111,7 +111,7 @@ literal has a zero byte after it.
 | Series | Applies to | Contents |
 | :--- | :--- | :--- |
 | `patches/public/` (7) | `dev` `19c3367`, each patch on its own | One patch per PR: 0001 = 02, 0002 = 03, 0004 = 05, 0005 = 06, 0006 = 07, 0007 = 09, 0008 = 10 |
-| `patches/private/` (2) | `dev` `9bd0845` | Fixes 01 and 08. Not rebased on `19c3367` yet. |
+| `patches/private/` (2) | `dev` `19c3367`, each patch on its own | Fixes 01 and 08. Rebased 2026-11-15; both applied cleanly. |
 | `patches/v1/` (3) | `master` `1d06057`, each patch on its own | 0001 = 04, 0002 = 07, 0003 = 10 for 1.x |
 
 To open one PR, apply its single patch on a branch cut from `dev`:
@@ -120,6 +120,10 @@ To open one PR, apply its single patch on a branch cut from `dev`:
 git switch -c fix-bignum-borrowed origin/dev
 git am /path/to/patches/public/0001-Fix-encoding-of-positive-big-numbers-that-are-not-ty.patch
 ```
+
+Merged with the public series, `private/0001` conflicts with `public/0001` in one place: both add
+tests at the end of `BigNumEncodeTests()` in `test/qcbor_encode_tests.c`. Keep both blocks. Their
+return codes (-5/-6 and -3/-4) don't collide.
 
 The old `public/0003` (04 on `dev`) was dropped, because #438 replaces it. The patch numbers keep
 their old values so that links from the background drafts still resolve. All seven `dev` patches
@@ -162,6 +166,13 @@ For each `dev` patch on its own, and for all seven merged together:
 | Minimal reproducers | `BUG` on unpatched `dev`, `OK` with the fix, plain and under the relevant sanitizer |
 | Test suite, ASan + recoverable UBSan | 90/90; only the reports listed below |
 | Test suite, MSan with `-fno-sanitize-memory-param-retval` | 90/90 and clean, on unpatched `dev`, with 0005, with 0008, and with all seven |
+
+For the private patches on `19c3367`, each alone and both merged with the seven public ones: all 72 CI
+jobs build with no new warning and pass 90/90. The new tests fail on unpatched `src/`
+(`BigNumEncodeTests` -3; `GetMapAndArrayTest` 110). [`repro/bignum_zero.c`](./repro/bignum_zero.c) goes from `c2 41 a5` / `18 a5`
+and an ASan heap-buffer-overflow to `c2 41 00` / `00`, clean. [`repro/getarray_empty.c`](./repro/getarray_empty.c) goes from a garbage
+or 0 length and an MSan report in all four modes to `len=1`, clean. The test suite reports nothing new under ASan + UBSan, and
+is clean under MSan.
 
 For `master` `1d06057`: with `v1/0002` alone and with `v1/0003` alone, all 10 CI configurations build with
 gcc and clang with no warning, 76/76 pass, the new tests fail without the fix (0002: segfault;
