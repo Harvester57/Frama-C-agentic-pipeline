@@ -2501,10 +2501,19 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             budget = max(0, int(slots))
             out["slots"] = {"mode": "fixed", "running": running, "available": budget}
         picked: list[str] = []
-        for task in _ready(state, mode, ctx=ctx):
+        ready = _ready(state, mode, ctx=ctx)
+        # A breaker has no waiter, so its height is 0 and every taller prover outranks it: without reserved
+        # slots no breaker is ever dispatched while provers are ready (run-6: 19 created, none dispatched).
+        # A quarter of the budget (at least one slot) goes to ready breakers; unused reserved slots fall back
+        # to the normal order.
+        ready_breakers = [t["id"] for t in ready if t["kind"] == "breaker"]
+        reserved = set(ready_breakers[: min(len(ready_breakers), max(1, budget // 4), budget)])
+        for task in ready:
             if task["kind"] == "repair":
                 _assign_parent(state, task)
                 out["parent_tasks"].append(_describe_repair(task))
+                continue
+            if task["id"] not in reserved and len(picked) + len(reserved - set(picked)) >= budget:
                 continue
             if len(picked) >= budget:
                 continue
