@@ -1139,7 +1139,9 @@ def run_wp_on_function(
     out_dir.mkdir(parents=True, exist_ok=True)
     par = resolve_wp_par(wp_par)
     wp_cache = resolve_wp_cache_dir(cache_dir)
-    use_wp_cache = wp_cache is not None and not dump_goal
+    # The counter-example pass proves weaker goals: none of its results may reach the shared prover cache.
+    model_pass = counter_examples and artifact_suffix.endswith(_MODEL_PASS_SUFFIX)
+    use_wp_cache = wp_cache is not None and not dump_goal and not model_pass
     sizing = {
         "wp_par": par,
         "wp_memlimit_mb": WP_MEMLIMIT_MB,
@@ -1424,6 +1426,9 @@ def run_wp_on_function(
     elif use_wp_cache:
         # Frama-C's own goal digests: unchanged goals are not re-proved across iterations.
         cmd.extend(["-wp-cache", "update", "-wp-cache-dir", str(wp_cache)])
+    elif model_pass:
+        # Without an explicit mode WP still reads and writes its default cache.
+        cmd.extend(["-wp-cache", "none"])
     if smoke_tests:
         cmd.extend(["-wp-smoke-tests", "-wp-smoke-timeout", str(min(timeout, 5))])
     if counter_examples:

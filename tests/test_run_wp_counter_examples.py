@@ -87,12 +87,13 @@ def test_counter_example_goals_only_list_goals_the_proof_pass_failed(
     )
     monkeypatch.setattr(W.subprocess, "run", _fake_wp(proof_csv, proof_log, model_csv, model_log, calls))
 
+    shared_cache = tmp_path / "cache"
     res = W.run_wp_on_function(
         _c_file(tmp_path),
         "f",
         out_dir,
         counter_examples=True,
-        cache_dir="off",
+        cache_dir=shared_cache,
         retry_tail=False,
         retry_bitwise=False,
         retry_cast_probe=False,
@@ -109,6 +110,11 @@ def test_counter_example_goals_only_list_goals_the_proof_pass_failed(
     assert "Valid\tkeep_ptr" in (out_dir / "wp_f.csv").read_text(encoding="utf-8")
     wp_calls = [c for c in calls if "-wp" in c]
     assert [_CE_FLAG in c for c in wp_calls] == [False, True]
+    proof_cmd, model_cmd = wp_calls
+    # The proof pass keeps the shared prover cache; the weaker model-pass goals never reach any cache.
+    assert proof_cmd[proof_cmd.index("-wp-cache-dir") + 1] == str(shared_cache)
+    assert "-wp-cache-dir" not in model_cmd
+    assert model_cmd[model_cmd.index("-wp-cache") + 1] == "none"
 
 
 @pytest.mark.unit
