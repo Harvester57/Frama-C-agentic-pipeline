@@ -400,9 +400,29 @@ def test_candidate_engine_of_a_dual_report_is_the_artifact_engine(tmp_path):
 # --- zero-rebuild runtime dispatch-case skipping ---------------------------------------------
 
 
-def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
-    import os
+def _runtime_skip_harness(tmp_path: Path) -> Path:
+    """A 200-case dispatch harness of `hit_case(<case>)`, including "mod.h" by a relative name."""
+    from generate_harness import generate_module_harness
 
+    src = tmp_path / "mod.c"
+    src.write_text("int hit_case(unsigned int c) { return (int)c; }\n", encoding="utf-8")
+    (tmp_path / "mod.h").write_text("int hit_case(unsigned int c);\n", encoding="utf-8")
+    res = generate_module_harness(
+        module_name="mod",
+        sources=[str(src)],
+        header_include="mod.h",
+        entry_fn="hit_case",
+        max_input_size=64,
+        cppflags=f"-I{tmp_path.as_posix()}",
+        out_dir=tmp_path / "harnesses",
+        entry_style="dispatch",
+        dispatch_cases=[f"(void)hit_case({i}U);" for i in range(200)],
+        auto_prelude=False,
+    )
+    return Path(res["harness_file"])
+
+
+def test_runtime_skip_cases_marker(tmp_path):
     from generate_harness import generate_module_harness
 
     assert R.format_skip_cases_env([129, 0, 65, 300, 0]) == "0,65,129,300"
@@ -410,25 +430,7 @@ def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
     assert R.harness_supports_runtime_skip_cases(None) is False
 
     src = tmp_path / "mod.c"
-    src.write_text("int hit_case(unsigned int c) { return (int)c; }\n", encoding="utf-8")
-    hdr = tmp_path / "mod.h"
-    hdr.write_text("int hit_case(unsigned int c);\n", encoding="utf-8")
-
-    out_dir = tmp_path / "harnesses"
-    cases = [f"(void)hit_case({i}U);" for i in range(200)]
-    res = generate_module_harness(
-        module_name="mod",
-        sources=[str(src)],
-        header_include=str(hdr),
-        entry_fn="hit_case",
-        max_input_size=64,
-        cppflags=f"-I{tmp_path.as_posix()}",
-        out_dir=out_dir,
-        entry_style="dispatch",
-        dispatch_cases=cases,
-        auto_prelude=False,
-    )
-    harness_c = Path(res["harness_file"])
+    harness_c = _runtime_skip_harness(tmp_path)
     text = harness_c.read_text(encoding="utf-8")
     assert "#define FRAMAC_FUZZ_RUNTIME_SKIP_CASES 1" in text
     assert "framac_fuzz_skip_case(" in text
@@ -451,13 +453,22 @@ def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
     assert R.harness_supports_runtime_skip_cases(Path(plain["harness_file"])) is False
     assert R.harness_supports_runtime_skip_cases(_harness(tmp_path)) is False
 
-    cc = shutil.which("clang") or shutil.which("gcc")
-    if not cc:
-        return
 
+SKIP_ENV = "0, 65, 129, 300"
+
+
+def test_runtime_skip_cases_c_execution(tmp_path):
+    """
+    The generated harness skips exactly the cases FRAMAC_FUZZ_SKIP_CASES lists, compiled and run: with the
+    host's clang or gcc, else in the analysis image under FRAMAC_DOCKER_TESTS=1, else skipped (never a
+    silent pass).
+    """
+    import os
+
+    _runtime_skip_harness(tmp_path)
     driver = tmp_path / "driver.c"
     driver.write_text(
-        f'#include "{harness_c.as_posix()}"\n'
+        '#include "harnesses/harness_mod.c"\n'
         "#include <stdio.h>\n"
         "static int last_hit = -1;\n"
         "int hit_case(unsigned int c) { last_hit = (int)c; return (int)c; }\n"
@@ -479,18 +490,33 @@ def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
         "}\n",
         encoding="utf-8",
     )
-    exe = tmp_path / "rt_skip_driver.exe"
-    proc = subprocess.run(
-        [cc, "-Wall", "-Werror", f"-I{tmp_path.as_posix()}", str(driver), "-o", str(exe)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    env = dict(os.environ)
-    env["FRAMAC_FUZZ_SKIP_CASES"] = "0, 65, 129, 300"
-    run = subprocess.run([str(exe)], env=env, capture_output=True, text=True, check=True)
-    lines = [ln.strip() for ln in run.stdout.splitlines() if ln.strip()]
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if cc:
+        exe = tmp_path / "rt_skip_driver.exe"
+        proc = subprocess.run(
+            [cc, "-Wall", "-Werror", f"-I{tmp_path.as_posix()}", str(driver), "-o", str(exe)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        env = dict(os.environ)
+        env["FRAMAC_FUZZ_SKIP_CASES"] = SKIP_ENV
+        stdout = subprocess.run([str(exe)], env=env, capture_output=True, text=True, check=True).stdout
+    else:
+        from conftest import ANALYSIS_IMAGE, require_docker_images
+
+        require_docker_images(ANALYSIS_IMAGE)  # skips without FRAMAC_DOCKER_TESTS=1
+        script = (
+            "cd /tmp && clang -Wall -Werror -I/fixture /fixture/driver.c -o drv"
+            f" && FRAMAC_FUZZ_SKIP_CASES='{SKIP_ENV}' timeout 60 ./drv"
+        )
+        argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro", ANALYSIS_IMAGE, script]
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+        stdout = proc.stdout
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip().startswith(("direct:", "case:"))]
+    assert len(lines) == 201, stdout[-2000:]
     assert lines[0] == "direct:1,1,1,1,0,0"
     for ln in lines[1:]:
         _, c_s, rc_s, hit_s = ln.split(":")
