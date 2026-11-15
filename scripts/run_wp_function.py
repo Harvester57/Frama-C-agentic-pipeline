@@ -75,7 +75,7 @@ from framac_common import (  # noqa: E402
     read_report_csv,
     scan_undeclared_functions,
     stub_repair_action,
-    wp_model_unsound,
+    wp_model_problem,
 )
 from resources import CLASSES, FRAMAC_KERNEL_RESERVE_MB, WP_MEMLIMIT_MB, enforced_memory_mb, wp_parallelism  # noqa: E402
 
@@ -226,6 +226,65 @@ def _is_pointer_cast_goal(item: dict) -> bool:
     return bool(_POINTER_CAST_RE.search(str(item.get("annotation") or "")))
 
 
+# The automatic retry under WP's byte-level model (run_wp_on_function, retry_bytes). QCBOR run-6: the
+# `memcpy` type puns and union-writing decoders that stall or are unsound under `Typed` proved under it.
+BYTES_RETRY_MODEL = "Bytes"
+_BYTES_RETRY_SUFFIX = "_bytes"
+_UNION_UNSOUND_RE = re.compile(r"Accessing union fields with \w+ model might be unsound", re.IGNORECASE)
+_INCOMPATIBLE_CAST_RE = re.compile(r"Cast with incompatible pointers types")
+_MEM_BUILTIN_PRECOND_RE = re.compile(r"precondition of (?:memcpy|memmove|memcmp|memset)\b", re.IGNORECASE)
+
+
+def _bytes_retry_trigger(res: dict, log_text: str) -> str | None:
+    """
+    Why a `Typed` verdict that is not all_proven is worth one retry under `Bytes`, or None. Only for the
+    obstacles `Bytes` can remove: `union` when soundness fails solely on WP's union warning, or
+    `pointer_cast` when the run is sound and the unproven goals come from byte-wise casts (the cast probe
+    proved everything, WP warned `Cast with incompatible pointers types`, or every unproven goal is a
+    `memcpy`-style builtin precondition or a pointer-cast annotation).
+    """
+    soundness = res.get("soundness") or {}
+    if soundness.get("tier_a_aborts") or res.get("budget_exhausted"):
+        return None
+    unsound = list(soundness.get("tier_b_unsound") or [])
+    if unsound:
+        return "union" if all(_UNION_UNSOUND_RE.search(msg) for msg in unsound) else None
+    goals = res.get("unproven_goals") or []
+    if not goals:
+        return None
+    if (
+        res.get("wp_cast_limitation")
+        or _INCOMPATIBLE_CAST_RE.search(log_text or "")
+        or all(_MEM_BUILTIN_PRECOND_RE.search(str(g.get("kind") or "")) or _is_pointer_cast_goal(g) for g in goals)
+    ):
+        return "pointer_cast"
+    return None
+
+
+def decide_bytes_retry(
+    typed_status: str, typed_unproven: int, typed_sound: bool, bytes_res: dict
+) -> tuple[bool, str]:
+    """(kept, reason): the `Bytes` result replaces the `Typed` one only when it is sound and strictly better."""
+    status = bytes_res.get("status")
+    soundness = bytes_res.get("soundness") or {}
+    union = [m for m in soundness.get("tier_b_unsound") or [] if _UNION_UNSOUND_RE.search(m)]
+    if union:
+        return False, f"union access still unsound under Bytes: {union[0]}"
+    if status not in ("all_proven", "unproven_goals_remain", "unsound_proof"):
+        reason = f": {bytes_res['reason']}" if bytes_res.get("reason") else ""
+        return False, f"the Bytes run decided nothing (status {status!r}{reason})"
+    if not soundness.get("ok", False):
+        return False, "the Bytes run is not sound: " + "; ".join(
+            [*(soundness.get("tier_a_aborts") or []), *(soundness.get("tier_b_unsound") or [])]
+        )[:300]
+    bytes_unproven = int(bytes_res.get("unproven_count") or 0)
+    if bytes_unproven < typed_unproven:
+        return True, f"Bytes leaves {bytes_unproven} goal(s) unproven, Typed {typed_unproven}"
+    if not typed_sound:
+        return True, f"Bytes is sound where Typed was not ({typed_status})"
+    return False, f"Bytes is not better: {bytes_unproven} goal(s) unproven, Typed {typed_unproven}"
+
+
 def _locate_agent_scratch_dir(c_file: Path, out_dir: Path) -> Path | None:
     """If `c_file` or `out_dir` is inside `.../agents/<agent_id>/scratch/...`, return that `scratch` dir."""
     for candidate in (c_file, out_dir):
@@ -249,12 +308,18 @@ def _is_synthetic_probe_file(c_file: Path, scratch_dir: Path | None) -> bool:
     return not rel.parts or rel.parts[0] != "work"
 
 
+# soundness.reduced_checks of a run with --waive-signed-downcast. workspace_overlay replays the flag for
+# a reduced check containing `-warn-signed-downcast OFF`, and the ledger records it as an assumption.
+SIGNED_DOWNCAST_WAIVED = "-warn-signed-downcast OFF on declared wrap lines"
+
+
 def scan_wp_log_soundness(
     log_text: str,
     check_memory_model: bool = True,
     unsigned_reduced: bool = False,
     warn_invalid_pointer: bool = True,
     warn_unsigned_downcast: bool = True,
+    warn_signed_downcast: bool = True,
 ) -> dict:
     """
     Scan Frama-C WP log output for Tier-A aborts, Tier-B silent unsoundness,
@@ -300,6 +365,8 @@ def scan_wp_log_soundness(
         reduced_checks.append("-no-warn-unsigned-downcast")
     if not warn_invalid_pointer:
         reduced_checks.append("-warn-invalid-pointer OFF")
+    if not warn_signed_downcast:
+        reduced_checks.append(SIGNED_DOWNCAST_WAIVED)
 
     tier_b_unsound = sorted(tier_b_unsound_set)
     return {
@@ -319,42 +386,6 @@ def extract_vc_goal_dumps(log_text: str, max_dumps: int = 5) -> list[str]:
     return dumps[:max_dumps]
 
 
-ACSL_ERROR_RE = re.compile(
-    r"([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*(?:\[kernel.*?\]|error|warning).*?(?:annot-error|syntax error|unbound|invalid|type|wrong order of clause).*?$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def check_acsl_syntax(
-    c_file: Path,
-    machdep: str = "gcc_x86_64",
-    cppflags: str = "-I.",
-) -> dict:
-    effective_cppflags = augment_framac_cppflags(cppflags)
-    cmd = [
-        "frama-c",
-        "-pp-annot",
-        "-no-unicode",
-        "-machdep",
-        machdep,
-        f"-cpp-extra-args={effective_cppflags}",
-        "-kernel-warn-key",
-        "annot-error=abort",
-        str(c_file),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    if proc.returncode != 0:
-        errors = kernel_parse_errors(combined)
-        return {
-            "syntax_ok": False,
-            "returncode": proc.returncode,
-            "errors": errors or [combined[-2000:]],
-            "raw_log": combined[-3000:],
-        }
-    return {"syntax_ok": True, "returncode": 0, "errors": []}
-
-
 _PLUGIN_USER_ERROR_RE = re.compile(
     r"^\[(?!kernel\b)[A-Za-z][\w-]*(?::[^\]]*)?\][^\n]*user error", re.IGNORECASE | re.MULTILINE
 )
@@ -363,6 +394,14 @@ _PLUGIN_USER_ERROR_RE = re.compile(
 # The kernel's message when the preprocessor command itself fails (missing header, bad include path).
 _PREPROCESS_FAILED_RE = re.compile(r"^\[kernel\][^\n]*User Error: failed to run:", re.IGNORECASE | re.MULTILINE)
 PREPROCESSING_FAILED = "preprocessing_failed"
+# A comment (an annotation, in practice) without its closing `*/`: the main `gcc -E` fails, but the
+# file's own text is at fault, not the build configuration.
+_UNTERMINATED_COMMENT_RE = re.compile(r"\berror:\s*unterminated comment\b", re.IGNORECASE)
+
+
+def _cpp_error_lines(log_text: str) -> list[str]:
+    """The preprocessor's own `file:line:col: [fatal] error:` lines, in order."""
+    return [line.strip() for line in (log_text or "").splitlines() if _CPP_ERROR_RE.match(line)]
 
 
 def _preprocess_failure(
@@ -371,10 +410,14 @@ def _preprocess_failure(
     """
     (reason, errors) when the run stopped because `gcc -E` failed, else None. A build-configuration
     error (wrong or missing --cppflags), never an ACSL syntax error: the annotations were not read.
+    An unterminated comment is the exception: it is a typo in the source (an annotation missing its
+    `*/`), so it stays an ACSL syntax error (None here).
     """
     if timed_out or returncode in (0, None) or report_exists or not _PREPROCESS_FAILED_RE.search(log_text or ""):
         return None
-    cpp_lines = [line.strip() for line in (log_text or "").splitlines() if _CPP_ERROR_RE.match(line)]
+    cpp_lines = _cpp_error_lines(log_text)
+    if cpp_lines and _UNTERMINATED_COMMENT_RE.search(cpp_lines[0]):
+        return None
     errors = list(dict.fromkeys([*cpp_lines, *kernel_parse_errors(log_text)]))
     first = cpp_lines[0] if cpp_lines else "the C preprocessor (gcc -E) failed"
     return f"{PREPROCESSING_FAILED}: {first}"[:300], errors
@@ -388,7 +431,11 @@ def _folded_syntax_errors(
         return None
     if _PLUGIN_USER_ERROR_RE.search(log_text or ""):
         return None  # WP (or another plug-in) refused the function: a Tier-A abort, not a syntax error
-    return kernel_parse_errors(log_text) or None
+    errors = kernel_parse_errors(log_text)
+    if errors and _PREPROCESS_FAILED_RE.search(log_text or ""):
+        # The preprocessor's own message names the file and line; the kernel's only the command.
+        errors = list(dict.fromkeys([*_cpp_error_lines(log_text), *errors]))
+    return errors or None
 
 
 def resolve_wp_par(value: int | str | None) -> int:
@@ -668,6 +715,12 @@ def derive_wp_diagnostic_hints(
     if status == "acsl_syntax_error":
         sc = res.get("syntax_check") or {}
         err_blob = "\n".join(sc.get("errors") or []) + "\n" + (sc.get("raw_log") or "") + "\n" + (log_text or "")
+        if _UNTERMINATED_COMMENT_RE.search(err_blob):
+            _add(
+                "An annotation or comment is missing its closing '*/': the C preprocessor stopped with "
+                "'unterminated comment' at the line where it opens (see syntax_check.errors). Close that "
+                "'/*@ ... */' block; this is an edit in the source, not a missing include path."
+            )
         if _EATEN_BACKSLASH_RE.search(err_blob):
             _add(
                 "Backslash in an ACSL keyword was eaten by string escaping (e.g. \\false -> form-feed + 'alse', "
@@ -1085,33 +1138,59 @@ def _prove_then_collect_models(call_args: dict[str, Any]) -> dict:
     for the crash verifiers, not proofs that a clause is false.
     """
     res = run_wp_on_function(**{**call_args, "counter_examples": False})
+    return collect_counter_example_models(res, call_args)
+
+
+def needs_model_pass(res: dict) -> bool:
+    """Whether a verdict leaves failed goals a counter-example pass could give models for."""
+    return res.get("status") == "unproven_goals_remain" and bool(res.get("unproven_goals"))
+
+
+def collect_counter_example_models(res: dict, call_args: dict[str, Any]) -> dict:
+    """The -wp-counter-examples pass for the verdict `res` of a proof run with `call_args`.
+
+    It never changes the verdict. It is skipped when no goal failed, and when the verdict pass found the
+    prover budget exhausted: the model pass ignores the budget (it is no proof iteration), so starting it
+    then would be a full WP run the budget had just refused.
+    """
     res["counter_examples"] = True
     res["counter_example_goals"] = []
-    if res.get("status") != "unproven_goals_remain" or not res.get("unproven_goals"):
+    if not needs_model_pass(res):
+        res.pop("counter_example_pass", None)
+        return res
+    if res.get("budget_exhausted"):
+        res["counter_example_pass"] = {
+            "status": "skipped",
+            "reason": "prover budget exhausted: the verdict pass ran no WP, so no model pass either",
+        }
         return res
     out_dir = Path(call_args["out_dir"])
     fn_name = str(call_args["fn_name"])
-    suffix = str(call_args["artifact_suffix"])
+    base_suffix = str(call_args.get("artifact_suffix") or "")
+    suffix = base_suffix
     if res.get("bitwise_retry"):
         suffix += "_retry"
     elif res.get("tail_retry"):
         suffix += "_tail"
+    elif (res.get("bytes_retry") or {}).get("kept"):
+        suffix += _BYTES_RETRY_SUFFIX
     proof_log = out_dir / f"wp_{fn_name}{suffix}.log"
     try:
         failed = parse_failed_wp_goals(proof_log.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         failed = set()
-    model_suffix = f"{call_args['artifact_suffix']}{_MODEL_PASS_SUFFIX}"
+    model_suffix = f"{base_suffix}{_MODEL_PASS_SUFFIX}"
     try:
         model_res = run_wp_on_function(
             **{
                 **call_args,
                 "counter_examples": True,
-                "wp_model": res.get("wp_model") or call_args["wp_model"],
+                "wp_model": res.get("wp_model") or call_args.get("wp_model") or "Typed",
                 "artifact_suffix": model_suffix,
                 "retry_bitwise": False,
                 "retry_tail": False,
                 "retry_cast_probe": False,
+                "retry_bytes": False,
                 "smoke_tests": False,
                 "sarif": False,
                 "keep_goals": False,
@@ -1166,6 +1245,8 @@ def run_wp_on_function(
     ignore_prover_budget: bool = False,
     retry_cast_probe: bool = True,
     security_meta: dict | None = None,
+    retry_bytes: bool = False,
+    warn_signed_downcast: bool = True,
 ) -> dict:
     call_args: dict[str, Any] = dict(locals())  # first statement: exactly this call's arguments
     if counter_examples and not artifact_suffix.endswith(_MODEL_PASS_SUFFIX):
@@ -1183,7 +1264,7 @@ def run_wp_on_function(
         "wp_cache_dir": str(wp_cache) if use_wp_cache else None,
     }
     scratch_dir = _locate_agent_scratch_dir(c_file, out_dir)
-    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe", _MODEL_PASS_SUFFIX)):
+    if not artifact_suffix.endswith(("_retry", "_tail", "_castprobe", _BYTES_RETRY_SUFFIX, _MODEL_PASS_SUFFIX)):
         if _is_synthetic_probe_file(c_file, scratch_dir):
             probe_msg = (
                 f"Refused to run Frama-C WP on synthetic probe file '{c_file}'. "
@@ -1399,11 +1480,14 @@ def run_wp_on_function(
         "-kernel-warn-key",
         "annot-error=abort",
         "-warn-signed-overflow",
-        "-warn-signed-downcast",
         "-warn-left-shift-negative",
         "-warn-right-shift-negative",
         "-warn-pointer-downcast",
     ]
+    if warn_signed_downcast:
+        # Off only with --waive-signed-downcast, whose check pass (check_declared_wraps) limits it to the
+        # declared wrap lines.
+        cmd.insert(cmd.index("-warn-signed-overflow") + 1, "-warn-signed-downcast")
     if warn_invalid_pointer:
         cmd.append("-warn-invalid-pointer")
     if not unsigned_reduced:
@@ -1447,21 +1531,13 @@ def run_wp_on_function(
         cmd.extend(["-wp-steps", str(wp_steps)])
     if session_dir is not None:
         session_dir.mkdir(parents=True, exist_ok=True)
-        cmd.extend(
-            [
-                "-wp-session",
-                str(session_dir),
-                "-wp-cache",
-                "none" if dump_goal else "update",
-            ]
-        )
-        if use_wp_cache:
-            cmd.extend(["-wp-cache-dir", str(wp_cache)])
-    elif use_wp_cache:
+        cmd.extend(["-wp-session", str(session_dir)])
+    if use_wp_cache:
         # Frama-C's own goal digests: unchanged goals are not re-proved across iterations.
         cmd.extend(["-wp-cache", "update", "-wp-cache-dir", str(wp_cache)])
-    elif model_pass:
-        # Without an explicit mode WP still reads and writes its default cache.
+    else:
+        # Without an explicit mode WP still reads and writes its default cache (`--cache-dir off`,
+        # FRAMAC_CACHE=off, a VC dump, the counter-example pass).
         cmd.extend(["-wp-cache", "none"])
     if smoke_tests:
         cmd.extend(["-wp-smoke-tests", "-wp-smoke-timeout", str(min(timeout, 5))])
@@ -1520,6 +1596,7 @@ def run_wp_on_function(
                 unsigned_reduced=unsigned_reduced,
                 warn_invalid_pointer=warn_invalid_pointer,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
             ),
             combined_log,
         )
@@ -1553,6 +1630,7 @@ def run_wp_on_function(
         unsigned_reduced=unsigned_reduced,
         warn_invalid_pointer=warn_invalid_pointer,
         warn_unsigned_downcast=warn_unsigned_downcast,
+        warn_signed_downcast=warn_signed_downcast,
     )
     macro_loop_lines = _find_macro_loop_lines(c_file, fn_name)
     if macro_loop_lines and soundness.get("tier_b_unsound"):
@@ -1684,9 +1762,11 @@ def run_wp_on_function(
 
     # Workstream 3: Automatic bitwise/shift solver retry with Typed+ref+int and extended timeout
     model_parts = {m.strip().lower() for m in re.split(r"[+,]", wp_model) if m.strip()}
-    if wp_model_unsound(wp_model):
-        # Whoever chose the model, a proof under `cast` never counts: all_proven becomes unsound_proof.
-        soundness["tier_b_unsound"].append(WP_UNSOUND_MODEL_ISSUE)
+    model_problem = wp_model_problem(wp_model)
+    if model_problem:
+        # Whoever chose the model, a proof under one outside the allowlist (`cast`, `Hoare`, `Region`,
+        # `nat`, ...) never counts: all_proven becomes unsound_proof, with the reason.
+        soundness["tier_b_unsound"].append(model_problem)
         soundness["ok"] = False
     if (
         retry_bitwise
@@ -1713,6 +1793,7 @@ def run_wp_on_function(
                 warn_invalid_pointer=warn_invalid_pointer,
                 unsigned_reduced=unsigned_reduced,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
                 retry_bitwise=False,
                 retry_tail=False,
                 retry_cast_probe=False,
@@ -1792,6 +1873,7 @@ def run_wp_on_function(
                         warn_invalid_pointer=warn_invalid_pointer,
                         unsigned_reduced=unsigned_reduced,
                         warn_unsigned_downcast=warn_unsigned_downcast,
+                        warn_signed_downcast=warn_signed_downcast,
                         retry_bitwise=False,
                         retry_tail=False,
                         retry_cast_probe=False,
@@ -1962,6 +2044,7 @@ def run_wp_on_function(
                 warn_invalid_pointer=warn_invalid_pointer,
                 unsigned_reduced=unsigned_reduced,
                 warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
                 retry_bitwise=False,
                 retry_tail=False,
                 retry_cast_probe=False,
@@ -1992,6 +2075,63 @@ def run_wp_on_function(
         if proves_all:
             res["wp_cast_limitation"] = True
             res["next_synthesis_focus"] = "wp_typed_cast_limitation_stop_now"
+    bytes_trigger = (
+        _bytes_retry_trigger(res, combined_log)
+        if retry_bytes and not prop and not dump_goal and status != "all_proven" and model_parts == {"typed"}
+        else None
+    )
+    if bytes_trigger:
+        try:
+            bytes_res: dict = run_wp_on_function(
+                c_file=c_file,
+                fn_name=fn_name,
+                out_dir=out_dir,
+                machdep=machdep,
+                cppflags=cppflags,
+                provers=provers,
+                wp_par=par,
+                timeout=timeout,
+                wp_steps=wp_steps,
+                wp_model=BYTES_RETRY_MODEL,
+                check_memory_model=check_memory_model,
+                warn_invalid_pointer=warn_invalid_pointer,
+                unsigned_reduced=unsigned_reduced,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
+                retry_bitwise=False,
+                retry_tail=False,
+                retry_cast_probe=False,
+                retry_bytes=False,
+                security_meta=security_meta,
+                smoke_tests=smoke_tests,
+                session_dir=session_dir,
+                extra_sources=extra_sources,
+                wall_timeout=wall_timeout,
+                artifact_suffix=f"{artifact_suffix}{_BYTES_RETRY_SUFFIX}",
+                cache_dir=wp_cache if wp_cache is not None else "off",
+                sarif=sarif,
+                keep_goals=keep_goals,
+            )
+        except Exception as exc:  # a failed retry never changes the Typed result
+            bytes_res = {"status": "retry_error", "reason": f"{type(exc).__name__}: {exc}"}
+        kept, why = decide_bytes_retry(status, len(unproven_goals), soundness["ok"], bytes_res)
+        record = {
+            "triggered": True,
+            "trigger": bytes_trigger,
+            "kept": kept,
+            "reason": why,
+            "wp_model": BYTES_RETRY_MODEL,
+            "typed_status": status,
+            "typed_unproven_count": len(unproven_goals),
+            "bytes_status": bytes_res.get("status"),
+            "bytes_unproven_count": bytes_res.get("unproven_count"),
+        }
+        if kept:
+            # The report's wp_model is Bytes, so the parent's merge check, the sweep and the ledger replay
+            # and record it (framac_common.wp_model_assumption).
+            bytes_res["bytes_retry"] = record
+            return bytes_res
+        res["bytes_retry"] = record
     if _WHY3_MEMADDR_ERR_RE.search(combined_log):
         res["wp_why3_memaddr_limitation"] = True
     if soundness.get("macro_loop_warnings"):
@@ -2190,6 +2330,22 @@ def _line_list(raw: str) -> list[int]:
     return values
 
 
+# The RTE properties a declared wrap line may leave unproved, in the order the check names them; the
+# second only with --waive-signed-downcast. Also the -wp-prop names of the check pass.
+WAIVABLE_WRAP_PROPERTIES = ("unsigned_overflow", "signed_downcast")
+_SIGNED_DOWNCAST_KIND_RE = re.compile(r"(?<![a-z])signed_downcast")
+
+
+def _wrap_property(goal: dict) -> str | None:
+    """The waivable property a goal checks (by its report kind), or None."""
+    kind = str(goal.get("kind") or "").lower()
+    if "unsigned_overflow" in kind:
+        return "unsigned_overflow"
+    if _SIGNED_DOWNCAST_KIND_RE.search(kind):
+        return "signed_downcast"
+    return None
+
+
 def check_declared_wraps(
     res: dict,
     c_file: Path,
@@ -2197,13 +2353,16 @@ def check_declared_wraps(
     out_dir: Path,
     wrap_lines: list[int] | None = None,
     wrap_code_lines: list[int] | None = None,
+    waive_signed_downcast: bool = False,
     **wp_options,
 ) -> dict:
     """
     `--no-warn-unsigned` turns the unsigned overflow checks off for a whole function, so that a run proves
     nothing about them. This second run, with them on, limits the opt-out to the lines a prover declared
     as deliberate wraps: an `unsigned_overflow` goal elsewhere that is not fully proved leaves the
-    function unproven.
+    function unproven. `--waive-signed-downcast` adds `signed_downcast` (the proof run left
+    `-warn-signed-downcast` off): an implementation-defined narrowing of a deliberate wrap, such as
+    `(int)(u64 - BIAS)`, is waived on a declared line and fails anywhere else, the same way.
 
     The proof stays the run with the checks off. Goals cannot be waived inside this one, because WP takes
     each RTE assertion as a hypothesis for what follows, so a false wrap assertion would support later
@@ -2225,15 +2384,17 @@ def check_declared_wraps(
         else:
             unknown_lines.append(line)
 
+    waived = WAIVABLE_WRAP_PROPERTIES if waive_signed_downcast else WAIVABLE_WRAP_PROPERTIES[:1]
     check = run_wp_on_function(
         c_file,
         fn_name,
         out_dir,
         unsigned_reduced=False,
         warn_unsigned_downcast=False,
+        warn_signed_downcast=True,
         retry_bitwise=False,
         retry_tail=False,
-        prop="unsigned_overflow",
+        prop=",".join(waived),
         artifact_suffix="_wrapcheck",
         ignore_prover_budget=True,
         **wp_options,
@@ -2255,7 +2416,8 @@ def check_declared_wraps(
         *(check.get("partially_proven_goals") or []),
     ]
     for goal in not_fully_proved:
-        if "unsigned_overflow" not in str(goal.get("kind") or "").lower():
+        prop_kind = _wrap_property(goal)
+        if prop_kind not in waived:
             continue
         try:
             line = int(goal.get("line"))
@@ -2264,10 +2426,21 @@ def check_declared_wraps(
         same_file = Path(str(goal.get("file") or "")).name == Path(c_file).name
         position = code_lines.index(line) if same_file and line in code_lines else None
         if position in declared:
-            entry = used.setdefault(position, {"line": line, "code_line": position, "annotations": []})
+            entry = used.setdefault(
+                position, {"line": line, "code_line": position, "annotations": [], "properties": []}
+            )
             entry["annotations"].append(goal.get("annotation"))
+            if prop_kind not in entry["properties"]:
+                entry["properties"].append(prop_kind)
         else:
-            undeclared.append({**goal, "diagnostic_bucket": "step_c_rte_obligation", "undeclared_unsigned_wrap": True})
+            undeclared.append(
+                {
+                    **goal,
+                    "diagnostic_bucket": "step_c_rte_obligation",
+                    "undeclared_unsigned_wrap": True,
+                    "waivable_property": prop_kind,
+                }
+            )
 
     declared_entries = [used[position] for position in sorted(used)]
     res["unsigned_wraps"] = {
@@ -2283,8 +2456,9 @@ def check_declared_wraps(
     }
     if declared_entries:
         lines = ", ".join(f"L{entry['line']}" for entry in declared_entries)
+        kinds = [p for p in waived if any(p in entry["properties"] for entry in declared_entries)]
         res.setdefault("soundness", {}).setdefault("reduced_checks", []).append(
-            f"unsigned overflow left unproved on declared deliberate wraps at {lines}"
+            f"{' and '.join(k.replace('_', ' ') for k in kinds)} left unproved on declared deliberate wraps at {lines}"
         )
     if undeclared:
         res.setdefault("unproven_goals", []).extend(undeclared)
@@ -2299,8 +2473,9 @@ def check_declared_wraps(
         if res.get("next_synthesis_focus") == "complete":
             res["next_synthesis_focus"] = "step_c_rte_obligation"
         lines = ", ".join(sorted({str(goal.get("line")) for goal in undeclared}))
+        kinds_text = "/".join(sorted({str(goal["waivable_property"]) for goal in undeclared}))
         res.setdefault("diagnostic_hints", []).append(
-            f"With the unsigned checks on, unsigned_overflow goals are not fully proved on line(s) {lines}, which "
+            f"With the checks on, {kinds_text} goals are not fully proved on line(s) {lines}, which "
             "--wrap-lines does not declare. Prove them, or declare a line in --wrap-lines only if its wrap is "
             "deliberate. A 'Partially proven' goal below a declared wrap may rest on that wrap's false assertion."
         )
@@ -2385,7 +2560,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=int, default=15)
     parser.add_argument("--wp-steps", type=int, default=0, help="Optional deterministic solver step budget")
-    parser.add_argument("--wp-model", default="Typed", help="WP memory model (default: Typed)")
+    parser.add_argument(
+        "--wp-model",
+        default=None,
+        help="WP memory model (default: Typed, retried once under Bytes when only union or byte-wise cast "
+        "obstacles remain; an explicit model is never retried)",
+    )
+    parser.add_argument(
+        "--no-retry-bytes",
+        action="store_true",
+        help="Disable the automatic retry under -wp-model Bytes (report field bytes_retry)",
+    )
     parser.add_argument("--no-check-memory-model", action="store_true", help="Disable -wp-check-memory-model")
     parser.add_argument("--no-warn-invalid-pointer", action="store_true", help="Disable -warn-invalid-pointer")
     parser.add_argument(
@@ -2406,6 +2591,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="As --wrap-lines, as positions among the function's code lines, which ACSL merges do not move "
         "(what parent re-checks pass, from the prover's report)",
+    )
+    parser.add_argument(
+        "--waive-signed-downcast",
+        action="store_true",
+        help="With --no-warn-unsigned and declared wrap lines: prove with -warn-signed-downcast off too; the "
+        "check run (checks on) then fails the function on any signed_downcast goal not fully proved outside "
+        "the declared lines (an implementation-defined narrowing of a deliberate wrap)",
     )
     parser.add_argument(
         "--no-warn-unsigned-downcast",
@@ -2478,42 +2670,50 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--wp-par must be 'auto' or a positive integer (got {args.wp_par!r})")
     if (args.wrap_lines or args.wrap_code_lines) and not args.no_warn_unsigned:
         parser.error("--wrap-lines and --wrap-code-lines only apply with --no-warn-unsigned")
+    if args.waive_signed_downcast and not (args.no_warn_unsigned and (args.wrap_lines or args.wrap_code_lines)):
+        parser.error("--waive-signed-downcast only applies with --no-warn-unsigned and --wrap-lines / --wrap-code-lines")
 
     # --prop and --dump-goal are partial runs: they say nothing about the candidate as a whole.
     whole_run = not (args.prop or args.dump_goal)
     digest_before = prover_candidates.digest_before_run(args.out_json) if whole_run else None
     security_meta = resolve_security_meta(args.security_props, args.file, args.function, args.out_dir)
-    res = run_wp_on_function(
-        c_file=args.file,
-        fn_name=args.function,
-        out_dir=args.out_dir,
-        machdep=args.machdep,
-        cppflags=args.cppflags,
-        provers=args.provers,
-        wp_par=args.wp_par,
-        timeout=args.timeout,
-        wp_steps=args.wp_steps,
-        wp_model=args.wp_model,
-        check_memory_model=not args.no_check_memory_model,
-        warn_invalid_pointer=not args.no_warn_invalid_pointer,
-        unsigned_reduced=args.no_warn_unsigned,
-        warn_unsigned_downcast=not args.no_warn_unsigned_downcast,
-        retry_bitwise=not args.no_retry_bitwise,
-        retry_tail=not args.no_retry_tail,
-        smoke_tests=args.smoke_tests,
-        counter_examples=args.counter_examples,
-        prop=args.prop,
-        dump_goal=args.dump_goal,
-        session_dir=args.session_dir,
-        extra_sources=args.extra_sources,
-        wall_timeout=default_wall_timeout(args.wall_timeout),
-        cache_dir=args.cache_dir,
-        sarif=args.sarif,
-        keep_goals=args.keep_goals,
-        wp_blockers=args.wp_blockers,
-        ignore_prover_budget=args.ignore_prover_budget,
-        security_meta=security_meta,
-    )
+    wp_kwargs: dict[str, Any] = {
+        "c_file": args.file,
+        "fn_name": args.function,
+        "out_dir": args.out_dir,
+        "machdep": args.machdep,
+        "cppflags": args.cppflags,
+        "provers": args.provers,
+        "wp_par": args.wp_par,
+        "timeout": args.timeout,
+        "wp_steps": args.wp_steps,
+        "wp_model": args.wp_model or "Typed",
+        # Only when the caller left the model to us: a chosen model (a parent re-check replaying the
+        # prover's) is the configuration under test.
+        "retry_bytes": args.wp_model is None and not args.no_retry_bytes,
+        "check_memory_model": not args.no_check_memory_model,
+        "warn_invalid_pointer": not args.no_warn_invalid_pointer,
+        "unsigned_reduced": args.no_warn_unsigned,
+        "warn_unsigned_downcast": not args.no_warn_unsigned_downcast,
+        "warn_signed_downcast": not args.waive_signed_downcast,
+        "retry_bitwise": not args.no_retry_bitwise,
+        "retry_tail": not args.no_retry_tail,
+        "smoke_tests": args.smoke_tests,
+        "prop": args.prop,
+        "dump_goal": args.dump_goal,
+        "session_dir": args.session_dir,
+        "extra_sources": args.extra_sources,
+        "wall_timeout": default_wall_timeout(args.wall_timeout),
+        "cache_dir": args.cache_dir,
+        "sarif": args.sarif,
+        "keep_goals": args.keep_goals,
+        "wp_blockers": args.wp_blockers,
+        "ignore_prover_budget": args.ignore_prover_budget,
+        "security_meta": security_meta,
+    }
+    # --counter-examples: the verdict pass first; its report is written before the model pass starts
+    # (below), so a kill during that second full WP run never loses the verdict.
+    res = run_wp_on_function(**wp_kwargs, counter_examples=False)
     if args.no_warn_unsigned and whole_run:
         res = check_declared_wraps(
             res,
@@ -2522,13 +2722,14 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir,
             wrap_lines=args.wrap_lines,
             wrap_code_lines=args.wrap_code_lines,
+            waive_signed_downcast=args.waive_signed_downcast,
             machdep=args.machdep,
             cppflags=args.cppflags,
             provers=args.provers,
             wp_par=args.wp_par,
             timeout=args.timeout,
             wp_steps=args.wp_steps,
-            wp_model=res.get("wp_model") or args.wp_model,
+            wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
             check_memory_model=not args.no_check_memory_model,
             warn_invalid_pointer=not args.no_warn_invalid_pointer,
             session_dir=args.session_dir,
@@ -2546,12 +2747,19 @@ def main(argv: list[str] | None = None) -> int:
             machdep=args.machdep,
             cppflags=args.cppflags,
             provers=args.provers,
-            wp_model=res.get("wp_model") or args.wp_model,
+            wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
             wp_par=args.wp_par,
             extra_sources=args.extra_sources,
         )
     apply_verdict_limits(res, args.file, vacuity)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
+    if args.counter_examples:
+        res["counter_examples"] = True
+        res["counter_example_goals"] = []
+        if needs_model_pass(res) and not res.get("budget_exhausted"):
+            res["counter_example_pass"] = {"status": "pending"}
+            args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+        res = collect_counter_example_models(res, wp_kwargs)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = {
         "status": res["status"],
