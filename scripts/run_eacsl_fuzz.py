@@ -1728,6 +1728,60 @@ def dispatch_case_count(sources: list[str]) -> int | None:
     return None
 
 
+HARNESS_IDENTITY_FIELDS = ("harness_digest", "dispatch_case_count")
+
+
+def campaign_harness_identity(module: str, sources: Sequence[str | Path], run_dir: Path = Path(".")) -> dict:
+    """
+    The identity of the harness a campaign fuzzes, stamped on its report and on every artifact it finds:
+
+    - `harness_digest`: `phase0_gates.harness_digest(run_dir, module, ignore_exempt=True)`, as the
+      dynamic reach gate computes it, or None when the run has no harness for `module` or the campaign
+      does not fuzz it (none of `sources` is `workspace/harnesses/harness_<module>.c`, e.g. a breaker's
+      own copy);
+    - `dispatch_case_count`: the case count a dispatch harness selects with (`dispatch_case_count`),
+      None for any other harness. An input's first byte selects a case modulo this count, so the same
+      file selects another case under another count.
+    """
+    digest: str | None = None
+    if module:
+        import phase0_gates  # imported lazily: campaigns outside a run directory do not need it
+
+        own = (Path(run_dir) / phase0_gates.HARNESS_DIR / f"harness_{module}.c").resolve()
+        if any(Path(src).resolve() == own for src in sources):
+            try:
+                digest = phase0_gates.harness_digest(Path(run_dir), module, ignore_exempt=True)
+            except OSError:
+                digest = None
+    return {"harness_digest": digest, "dispatch_case_count": dispatch_case_count([str(s) for s in sources])}
+
+
+def stamp_harness_identity(report: dict, identity: dict, prior: dict | None = None) -> dict:
+    """
+    Stamp `identity` (campaign_harness_identity) on a campaign `report` and on each artifact it lists. An
+    artifact this campaign found gets the campaign's values. One carried over from an earlier campaign
+    (`pre_existing`) keeps the values the `prior` report recorded for the same sha256, or gets none: its
+    harness is unknown, and the reach gate never credits an artifact of a stamped report without them.
+    """
+    report.update({k: identity.get(k) for k in HARNESS_IDENTITY_FIELDS})
+    earlier: dict[str, dict] = {}
+    prior_arts = prior.get("artifacts") if isinstance(prior, dict) else None
+    for art in prior_arts if isinstance(prior_arts, list) else []:
+        if isinstance(art, dict) and art.get("sha256") and all(k in art for k in HARNESS_IDENTITY_FIELDS):
+            earlier.setdefault(str(art["sha256"]), {k: art[k] for k in HARNESS_IDENTITY_FIELDS})
+    for art in report.get("artifacts") or []:
+        if not isinstance(art, dict):
+            continue
+        if not art.get("pre_existing"):
+            for k in HARNESS_IDENTITY_FIELDS:
+                art.setdefault(k, identity.get(k))
+        elif all(k in art for k in HARNESS_IDENTITY_FIELDS):
+            continue
+        elif str(art.get("sha256") or "") in earlier:
+            art.update(earlier[str(art["sha256"])])
+    return report
+
+
 def dispatch_skippable_cases(sources: list[str], n_cases: int) -> int:
     """
     How many of a dispatch harness's `n_cases` (cases 0..result-1) a build can skip: all of them for
@@ -5368,6 +5422,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["status"] == "ok" else 1
 
     digest_before = prover_candidates.digest_before_run(args.out_json) if args.mode == "guardrail" else None
+    identity: dict = {}
+    prior_report: dict | None = None
+    if args.mode == "campaign":
+        # Taken before the build: the values the artifacts are found under. The report this run
+        # replaces holds the values of the artifacts libFuzzer only re-reports (`pre_existing`).
+        identity = campaign_harness_identity(args.module, args.sources)
+        try:
+            loaded = json.loads(args.out_json.read_text(encoding="utf-8"))
+            prior_report = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError):
+            prior_report = None
     try:
         if args.mode == "selftest":
             res = run_selftest(args.work_dir, args.machdep, variadic_translation=not args.no_variadic_translation)
@@ -5466,6 +5531,7 @@ def main(argv: list[str] | None = None) -> int:
         import seed_harvest  # lazily: only campaigns read the seed writes' statuses
 
         res["seeds"] = seed_harvest.seeds_report_field(args.module, bool(args.extra_corpus))
+        stamp_harness_identity(res, identity, prior_report)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
     summary = _summary(res)
