@@ -307,6 +307,19 @@ def test_g_eacsl_precondition_failure_is_not_body_execution(tmp_path, monkeypatc
         fdir = _write_fuzz_report(run, "api", [{**_crash_art(art, None), "failure": failure}])
         assert _row(run, hdir, fdir)["crashed_entry_points"] == [], failure
 
+    # The wrapper's own RTE checks before the call (`\initialized` of a formal) also carry the source
+    # name; the replay stack shows the wrapper and no frame of the body.
+    rte = {"function": "rec_put", "file": "src/api.c", "line": 44, "kind": "e-acsl_rte"}
+    wrapper_stack = [
+        {"function": "__gen_e_acsl_rec_put", "file": "/framac-run/fuzz_api.instrumented.c", "line": 90},
+        {"function": "rec_parse_all", "file": "/framac-run/workspace/work/src/api.c", "line": 9},
+    ]
+    fdir = _write_fuzz_report(run, "api", [{**_crash_art(art, None), "failure": rte, "frames": wrapper_stack}])
+    assert _row(run, hdir, fdir)["crashed_entry_points"] == []
+    body_stack = [{"function": "rec_put", "file": "/framac-run/workspace/work/src/api.c", "line": 45}, *wrapper_stack]
+    fdir = _write_fuzz_report(run, "api", [{**_crash_art(art, None), "failure": rte, "frames": body_stack}])
+    assert _row(run, hdir, fdir)["crashed_entry_points"] == ["rec_put"]
+
     # A postcondition is checked after the body returned.
     post = {"function": "rec_put", "file": "src/api.c", "line": 44, "kind": "postcondition"}
     fdir = _write_fuzz_report(run, "api", [{**_crash_art(art, None), "failure": post}])

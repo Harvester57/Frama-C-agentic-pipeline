@@ -796,15 +796,17 @@ def _is_harness_function(name: str) -> bool:
     return name in _HARNESS_FAILURE_FNS or name.startswith(TARGET_EMBEDDED_PREFIX)
 
 
-def _artifact_failure(art: dict[str, Any]) -> tuple[str, str, bool, bool]:
+def _artifact_failure(art: dict[str, Any], frames: list[tuple[str, str]]) -> tuple[str, str, bool, bool]:
     """
     (function, file, in_harness, before_body) of an artifact's failure (its own, else the sanitizer
     replay's attribution). `function` is the source name, "" when unknown. `in_harness`: the failure is
     in the harness's own code (`LLVMFuzzerTestOneInput`, the runtime skip helper, an embedded target
-    fuzzer hook, or a `harness_*` file), so no entry point was running. `before_body`: the failure is in
-    the E-ACSL wrapper of `function` before it calls the body: a Precondition, or any other failure
-    reported in `__gen_e_acsl_<function>` that is not a Postcondition (the wrapper's own checks before
-    the call, such as an RTE on `\\old`, cannot be told from those after it, so none counts).
+    fuzzer hook, or a `harness_*` file), so no entry point was running. `before_body`: the failure may be
+    in the E-ACSL wrapper of `function` before it called the body: a Precondition; any other failure
+    but a Postcondition reported in `__gen_e_acsl_<function>`; or one reported under the source name
+    (the wrapper's own RTE checks, e.g. `\\initialized` of a formal before the call, carry
+    `.fct = "<function>"`) while the replay's stack (`frames`) holds the wrapper and no frame of the
+    body. The wrapper's checks before the call cannot be told from those after it, so none counts.
     """
     raw = art.get("failure")
     if not isinstance(raw, dict):
@@ -816,9 +818,13 @@ def _artifact_failure(art: dict[str, Any]) -> tuple[str, str, bool, bool]:
     file_ = str(raw.get("file") or "")
     kind = str(raw.get("kind") or "").strip().lower()
     in_harness = _is_harness_function(raw_fn) or Path(file_.replace("\\", "/")).name.startswith("harness_")
-    in_wrapper = raw_fn.startswith(_EACSL_WRAPPER_PREFIX)
+    fn = _normalize_failure_fn(raw_fn)
+    on_stack = {f for f, _ in frames}
+    in_wrapper = raw_fn.startswith(_EACSL_WRAPPER_PREFIX) or (
+        bool(fn) and _EACSL_WRAPPER_PREFIX + fn in on_stack and fn not in on_stack
+    )
     before_body = kind == "precondition" or (in_wrapper and kind != "postcondition")
-    return _normalize_failure_fn(raw_fn), file_, in_harness, before_body
+    return fn, file_, in_harness, before_body
 
 
 def _artifact_frames(art: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1096,8 +1102,8 @@ def _crashed_entry_points(
         if problem:
             notes.append(f"{name}: not used ({problem})")
             continue
-        fn, fn_file, in_harness, before_body = _artifact_failure(art)
         frames = _artifact_frames(art)
+        fn, fn_file, in_harness, before_body = _artifact_failure(art, frames)
         credited = False
         for ep in candidates:
             if ep in proven:
@@ -1108,14 +1114,14 @@ def _crashed_entry_points(
             ):
                 proven.add(ep)
                 credited = True
-        if credited or in_harness or not api_cases or first_byte is None or n_cases is None:
+        if in_harness or not api_cases or first_byte is None or n_cases is None:
             continue
         idx = first_byte % n_cases
         case = api_cases[idx] if idx < len(api_cases) and isinstance(api_cases[idx], dict) else {}
         kind = str(case.get("kind") or "")
         if kind in ("custom", "sequence"):
-            if fn and any(_fn_matches_entry(fn, fn_file, e, module, dag, by_name) for e in proven):
-                continue  # in an entry point another crash already proved: nothing left unexplained
+            if credited or (fn and any(_fn_matches_entry(fn, fn_file, e, module, dag, by_name) for e in proven)):
+                continue  # this crash, or another, proved the entry point it shows: nothing unexplained
             where = f"in {fn}" if fn else "at an unknown location"
             notes.append(
                 f"{name}: {kind} case {idx} crashed {where}; a {kind} case is credited only for a failure "
