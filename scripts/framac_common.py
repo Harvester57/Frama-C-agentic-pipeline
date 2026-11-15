@@ -79,6 +79,12 @@ _STATUS_MAP = {
 # scheduler enforces it, so both read it here. FRAMAC_PROVER_WALL_BUDGET_S overrides it.
 PROVER_WALL_BUDGET_S = {"quick": 600, "standard": 900, "deep": 1800}
 
+# Merged or legacy Eva reports on large modules can exceed the default 64 MiB artifact cap.
+DEFAULT_JSON_MAX_BYTES = 64 * 1024 * 1024
+EVA_REPORT_MAX_BYTES = 768 * 1024 * 1024
+FLOWS_INLINE_MAX_BYTES = 2 * 1024 * 1024
+MAX_FLOW_LOCATION_CHARS = 240
+
 # The WP manual (Section "Memory models") calls the `cast` model option "unlimited casts (unsound)":
 # a proof under it is a diagnostic, never evidence.
 WP_UNSOUND_MODEL_ISSUE = "WP memory model with 'cast' (unlimited casts) is unsound; the proof is not evidence"
@@ -159,7 +165,7 @@ class ArtifactError(RuntimeError):
     """Raised when a required pipeline artifact is missing or malformed."""
 
 
-def load_json_strict(path: Path, max_bytes: int = 64 * 1024 * 1024):
+def load_json_strict(path: Path, max_bytes: int = DEFAULT_JSON_MAX_BYTES):
     """Load JSON and fail loudly. Callers must decide explicitly how to treat absence."""
     path = Path(path)
     if not path.is_file():
@@ -173,12 +179,129 @@ def load_json_strict(path: Path, max_bytes: int = 64 * 1024 * 1024):
         raise ArtifactError(f"malformed JSON in {path}: {exc}") from exc
 
 
-def load_json_optional(path: Path, default):
+def load_json_optional(path: Path, default, max_bytes: int = DEFAULT_JSON_MAX_BYTES):
     """Load JSON if present; a present-but-malformed file still raises."""
     path = Path(path)
     if not path.exists():
         return default
-    return load_json_strict(path)
+    return load_json_strict(path, max_bytes=max_bytes)
+
+
+def bound_flow_location(loc: str, max_chars: int = MAX_FLOW_LOCATION_CHARS) -> str:
+    """
+    Bound Frama-C `-deps`/`-inout` location strings before storing or merging them.
+    String literals collapse to `<string literal>` and oversized struct bit-range expansions
+    are capped while keeping normal C lvalues intact for `function_facts.py`.
+    """
+    if not isinstance(loc, str):
+        return str(loc)
+    if loc.startswith('"'):
+        return "<string literal>"
+    if len(loc) > max_chars:
+        return loc[: max_chars - 3] + "..."
+    return loc
+
+
+def _infer_run_root_from_report(report_path: Path | None) -> Path | None:
+    if report_path is None:
+        return None
+    resolved = Path(report_path).resolve()
+    parts = list(resolved.parts)
+    for idx in range(len(parts) - 1, -1, -1):
+        if parts[idx] == "workspace" and idx > 0:
+            return Path(*parts[:idx])
+    return None
+
+
+def spill_large_flows(
+    report: dict,
+    flows_dest: Path,
+    report_path: Path | None = None,
+    max_bytes: int | None = None,
+) -> dict:
+    """
+    When `report["flows"]` exceeds `max_bytes` serialized, write the full flows payload to
+    `flows_dest` (never directly inside `.../reports/eva/`, where `*.json` is scanned as a
+    module report) and replace `report["flows"]` with a lightweight `flows_file` pointer dict.
+    Returns a shallow copy when spilled so callers holding `report` in memory stay unchanged.
+    """
+    if not isinstance(report, dict):
+        return report
+    flows = report.get("flows")
+    if not isinstance(flows, dict) or "by_function" not in flows:
+        return report
+    limit = FLOWS_INLINE_MAX_BYTES if max_bytes is None else max_bytes
+    encoded = json.dumps(flows, ensure_ascii=False).encode("utf-8")
+    if len(encoded) <= limit:
+        return report
+
+    dest = Path(flows_dest)
+    dest_resolved = dest.resolve() if dest.is_absolute() else (Path.cwd() / dest).resolve()
+    if dest_resolved.parent.as_posix().rstrip("/").endswith("/reports/eva"):
+        mod = str(report.get("module") or (Path(report_path).stem if report_path else dest.stem) or "module")
+        dest_resolved = dest_resolved.parent.parent / "eva-flows" / f"{mod}.json"
+    atomic_write_json(dest_resolved, flows)
+
+    run_root = _infer_run_root_from_report(report_path) or Path.cwd()
+    ref = to_run_relative(dest_resolved, run_root)
+    return {
+        **report,
+        "flows": {
+            "status": flows.get("status"),
+            "reason": flows.get("reason"),
+            "flows_file": ref,
+        },
+    }
+
+
+def resolve_flows(
+    flows: object,
+    report_path: Path | None = None,
+    run_dir: Path | None = None,
+    max_bytes: int = EVA_REPORT_MAX_BYTES,
+) -> dict | None:
+    """Resolve inline `flows` or a spilled `flows_file` pointer back to the full flows dict."""
+    if not isinstance(flows, dict):
+        return None
+    ref = flows.get("flows_file")
+    if not isinstance(ref, str) or not ref or "by_function" in flows:
+        return flows
+
+    candidates: list[Path] = []
+    raw_path = Path(ref)
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+    else:
+        if run_dir is not None:
+            candidates.append(Path(run_dir) / raw_path)
+        inferred_root = _infer_run_root_from_report(report_path)
+        if inferred_root is not None:
+            candidates.append(inferred_root / raw_path)
+        candidates.append(Path.cwd() / raw_path)
+        if report_path is not None:
+            rp = Path(report_path).resolve()
+            for ancestor in list(rp.parents)[:5]:
+                candidates.append(ancestor / raw_path)
+
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                loaded = load_json_strict(cand, max_bytes=max_bytes)
+            except ArtifactError as exc:
+                return {
+                    "status": "failed",
+                    "reason": str(exc),
+                    "by_function": {},
+                    "call_edges": {},
+                }
+            if isinstance(loaded, dict):
+                return loaded
+    return {
+        "status": "failed",
+        "reason": f"missing spilled flows file: {ref}",
+        "by_function": {},
+        "call_edges": {},
+    }
 
 
 _UNESCAPED_ACSL_IN_JSON_RE = re.compile(
@@ -876,7 +999,9 @@ def kernel_parse_errors(log_text: str | None) -> list[str]:
     return [
         m.folded
         for m in fold_messages(log_text)
-        if m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded) and "Frama-C aborted" not in m.folded
+        if m.plugin in ("kernel", "cpp")
+        and _KERNEL_ERROR_HINT_RE.search(m.folded)
+        and "Frama-C aborted" not in m.folded
     ]
 
 

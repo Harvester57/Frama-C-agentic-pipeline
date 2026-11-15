@@ -70,6 +70,8 @@ import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
+    DEFAULT_JSON_MAX_BYTES,
+    EVA_REPORT_MAX_BYTES,
     WP_UNSOUND_MODEL_ISSUE,
     ArtifactError,
     RunLockTimeout,
@@ -1547,7 +1549,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
     taint_checks = _taint_checks()
     code_checks = _code_checks()
     for path in paths:
-        report = load_json_strict(path)
+        report = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
         stats["reports"] += 1
         tool_output = rel(str(path))
         # `module` is the report's harness module; verdicts and candidates stay keyed by it. With link
@@ -2992,9 +2994,9 @@ def _dead_code_on_disk(run_dir: Path, module: str, location: dict) -> dict | Non
     if not loc_file or loc_line < 1:
         return None
 
-    def load(path: Path) -> dict:
+    def load(path: Path, max_bytes: int = DEFAULT_JSON_MAX_BYTES) -> dict:
         try:
-            data = load_json_optional(run_dir / path, {})
+            data = load_json_optional(run_dir / path, {}, max_bytes=max_bytes)
         except ArtifactError:
             return {}
         return data if isinstance(data, dict) else {}
@@ -3008,7 +3010,7 @@ def _dead_code_on_disk(run_dir: Path, module: str, location: dict) -> dict | Non
         )
 
     eva_path = EVA_REPORT_DIR / f"{module}.json"
-    eva = load(eva_path)
+    eva = load(eva_path, max_bytes=EVA_REPORT_MAX_BYTES)
     if eva.get("status") == "ok":
         dead = eva.get("dead_alarms")
         unknown = eva.get("unknown_obligations_by_function")

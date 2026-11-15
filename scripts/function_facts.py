@@ -46,10 +46,12 @@ import kernel_ast  # noqa: E402
 from acsl_ast import AcslSyntaxError, Span, locate_all_definition_spans, locate_function_span, tokenize_c_acsl  # noqa: E402
 from build_callgraph_dag import DYNAMIC_ALLOC_CALLEES  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     atomic_write_json,
     augment_framac_cppflags,
     load_json_optional,
     normalize_flag_args,
+    resolve_flows,
     utc_now,
 )
 
@@ -73,6 +75,8 @@ def _temp_pattern(temps: list[str] | None) -> re.Pattern:
     if not temps:
         return re.compile(r"(?!)")  # never matches
     return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in temps) + r")\b")
+
+
 _RUN_PREFIX_RE = re.compile(r"^(?:/framac-run/|\./)+")
 _AGENT_WORK_RE = re.compile(r"^agents/[^/]+/scratch/work/")
 _STRING_CALLEES = frozenset(
@@ -266,7 +270,11 @@ def _loop_record(raw: dict, derived: dict[str, str], tokens: list, temp_re: re.P
         elif lval:
             scalars.append({"var": lval, "updates": values})
     reads = [
-        {"lval": _clean_expr(r.get("lval"), temp_re), "root": _root_of(r, derived)[0], "root_kind": _root_of(r, derived)[1]}
+        {
+            "lval": _clean_expr(r.get("lval"), temp_re),
+            "root": _root_of(r, derived)[0],
+            "root_kind": _root_of(r, derived)[1],
+        }
         for r in raw.get("reads") or []
     ]
     # In-place: the same object read and written at positions that move with the loop. A field read
@@ -754,8 +762,9 @@ def generate(
     runner=None,
 ) -> dict:
     """Write the module's facts to `out_json`, restored from the cache when nothing changed."""
-    report = load_json_optional(eva_report, {}) if eva_report else {}
-    flows = report.get("flows") if isinstance(report, dict) else None
+    report = load_json_optional(eva_report, {}, max_bytes=EVA_REPORT_MAX_BYTES) if eva_report else {}
+    raw_flows = report.get("flows") if isinstance(report, dict) else None
+    flows = resolve_flows(raw_flows, report_path=eva_report)
 
     def _build() -> dict:
         doc = build_module_facts(module, sources, cppflags, flows, machdep=machdep, runner=runner)

@@ -67,6 +67,7 @@ from acsl_ast import (  # noqa: E402
 )
 from fingerprint import normalize_file  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     PROVER_WALL_BUDGET_S,
     ArtifactError,
     atomic_write_json,
@@ -1506,9 +1507,7 @@ def _untrusted_entry_metas(
             # is the entry named here (`minmea_checksum` is called by the `minmea` harness from its
             # NUL-terminated copy). Carry that shape fact, or `valid_read_string` on the attacker
             # string is misread as a value constraint (minmea run-1, 2026-11-14).
-            if any(
-                bool(m.get("null_terminate")) or m.get("entry_style") in ("c_string", "argv") for m in out
-            ):
+            if any(bool(m.get("null_terminate")) or m.get("entry_style") in ("c_string", "argv") for m in out):
                 entry["null_terminate"] = True
             out.append(entry)
     return out
@@ -2589,6 +2588,7 @@ def prepare_agent(
     caller_evidence: list[dict] | None = None,
     callee_history: dict | None = None,
     rejected_result: dict | None = None,
+    eva_unknown_obligations: list[dict] | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -2684,16 +2684,20 @@ def prepare_agent(
     harness_module_name = module
     if module:
         if role == "architect":
-            harness_module_name = next(
-                (
-                    m
-                    for m in harness_modules_of(mm, module)
-                    if isinstance(mm.sidecars.get(m), dict)
-                    and _normalize_work_relpath(str(mm.sidecars[m].get("header") or ""))
-                    == _normalize_work_relpath(norm_header or "")
-                ),
-                None,
-            ) or harness_module_for_function(mm, module) or module
+            harness_module_name = (
+                next(
+                    (
+                        m
+                        for m in harness_modules_of(mm, module)
+                        if isinstance(mm.sidecars.get(m), dict)
+                        and _normalize_work_relpath(str(mm.sidecars[m].get("header") or ""))
+                        == _normalize_work_relpath(norm_header or "")
+                    ),
+                    None,
+                )
+                or harness_module_for_function(mm, module)
+                or module
+            )
         elif function and role in ("prover", "breaker"):
             harness_module_name = harness_module_for_function(mm, module, norm_c_file, function) or module
     brief_meta = mm.sidecars.get(harness_module_name) if harness_module_name else None
@@ -2742,13 +2746,6 @@ def prepare_agent(
     else:
         norm_header = _resolve_include_header(run_dir, overlay / "work", norm_header, header_flags)
 
-    # Eva reports are per harness: a link unit's are those of its harnesses.
-    eva_reports = [
-        rep
-        for name in dict.fromkeys([*([module] if module else []), *harness_names])
-        for rep in [load_json_optional(overlay / "reports" / "eva" / f"{name}.json", {})]
-        if isinstance(rep, dict) and rep
-    ]
     wp_report_rel: str | None = None
     wp_data: dict = {}
     if wp_report:
@@ -2759,14 +2756,33 @@ def prepare_agent(
         wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
 
     unknown_obligations: list = []
-    for eva_report in eva_reports if function else []:
-        raw_unknowns = (eva_report.get("unknown_obligations_by_function") or {}).get(function, [])
-        rows = [
-            a for a in raw_unknowns if not (norm_c_file and isinstance(a, dict)) or eva_alarm_in_file(a, norm_c_file)
-        ]
-        # Another harness's report of the same unit repeats rows the first one listed.
-        seen = list(unknown_obligations)
-        unknown_obligations += [a for a in rows if a not in seen]
+    if eva_unknown_obligations is not None:
+        unknown_obligations = list(eva_unknown_obligations) if function else []
+    elif function:
+        # Eva reports are per harness: only load them when preparing a function-scoped brief,
+        # and tolerate oversized or unreadable reports gracefully.
+        for name in dict.fromkeys([*([module] if module else []), *harness_names]):
+            try:
+                eva_report = load_json_optional(
+                    overlay / "reports" / "eva" / f"{name}.json",
+                    {},
+                    max_bytes=EVA_REPORT_MAX_BYTES,
+                )
+            except ArtifactError:
+                continue
+            if not isinstance(eva_report, dict) or not eva_report:
+                continue
+            raw_unknowns = (eva_report.get("unknown_obligations_by_function") or {}).get(function, [])
+            if not isinstance(raw_unknowns, list):
+                continue
+            rows = [
+                a
+                for a in raw_unknowns
+                if not (norm_c_file and isinstance(a, dict)) or eva_alarm_in_file(a, norm_c_file)
+            ]
+            # Another harness's report of the same unit repeats rows the first one listed.
+            seen = list(unknown_obligations)
+            unknown_obligations += [a for a in rows if a not in seen]
 
     unproven_goals = wp_data.get("unproven_goals", []) if isinstance(wp_data, dict) else []
     if not unproven_goals and unknown_obligations:

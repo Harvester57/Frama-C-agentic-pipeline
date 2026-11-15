@@ -34,6 +34,7 @@ import concurrent.futures
 import contextlib
 import fnmatch
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -61,6 +62,7 @@ import resources  # noqa: E402
 import spec_kb  # noqa: E402
 import workspace_overlay  # noqa: E402
 from framac_common import (  # noqa: E402
+    EVA_REPORT_MAX_BYTES,
     PROVER_WALL_BUDGET_S,
     ArtifactError,
     RunLockTimeout,
@@ -523,18 +525,19 @@ def _reopen(state: dict, task: dict, reason: str) -> None:
 
 def _assign_agent(state: dict, task: dict) -> str:
     base = f"{task['kind']}-{task['slug']}"
-    n = int(task.get("dispatches") or 0) + 1
+    attempt = int(task.get("dispatches") or 0) + 1
+    seq = attempt
     while True:
-        aid = base if n == 1 else f"{base}-{n}"
+        aid = base if seq == 1 else f"{base}-{seq}"
         # Never reuse an id (or the agents/<id>/ directory of an earlier run): its scratch/result.json
         # would be read as this agent's answer.
         if aid not in state["agents"] and not (Path("agents") / aid).exists():
             break
-        n += 1
+        seq += 1
     now_iso = utc_now()
     now_ts = DEPS.now()
     task.update(
-        dispatches=n,
+        dispatches=attempt,
         agent_id=aid,
         state="running",
         assigned_at=now_iso,
@@ -577,7 +580,7 @@ class Ctx:
         self.sidecars = self._load_sidecars()
         # Link units (step I5b): a DAG module's harnesses may be sub-modules with their own sidecars.
         self.mm = ModuleMap(self.dag, self.sidecars)
-        self.eva_unknowns, self._eva_items_by_fn = self._load_eva()
+        self.eva_unknowns, self._eva_items_by_fn, self._eva_by_report = self._load_eva()
 
         # DAG function records, by (file, name) and by bare name. `functions` is keyed by the bare name,
         # or by `file#name` when several functions share the name (build_callgraph_dag): both key forms
@@ -661,22 +664,55 @@ class Ctx:
         return out
 
     @staticmethod
-    def _load_eva() -> tuple[dict[str, int], dict[str, list[Any]]]:
+    def _load_eva() -> tuple[dict[str, int], dict[str, list[Any]], dict[str, dict[str, list[Any]]]]:
         counts: dict[str, int] = {}
         items_by_fn: dict[str, list[Any]] = defaultdict(list)
+        by_report: dict[str, dict[str, list[Any]]] = {}
         if EVA_DIR.is_dir():
             for path in sorted(EVA_DIR.glob("*.json")):
                 try:
-                    data = load_json_strict(path)
+                    data = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
                 except ArtifactError:
                     continue
                 by_fn = data.get("unknown_obligations_by_function") if isinstance(data, dict) else None
                 if isinstance(by_fn, dict):
+                    report_map: dict[str, list[Any]] = {}
                     for fn, items in by_fn.items():
                         n = len(items) if isinstance(items, list) else int(bool(items))
                         counts[fn] = max(counts.get(fn, 0), n)
                         items_by_fn[fn].append(items)
-        return counts, dict(items_by_fn)
+                        if isinstance(items, list):
+                            report_map[str(fn)] = items
+                    by_report[path.stem] = report_map
+                    raw_mod = data.get("module") if isinstance(data, dict) else None
+                    if isinstance(raw_mod, str) and raw_mod and raw_mod not in by_report:
+                        by_report[raw_mod] = report_map
+        return counts, dict(items_by_fn), by_report
+
+    def eva_unknown_obligations(self, module: str | None, file: str | None, fn: str | None) -> list[dict]:
+        """
+        Pre-extract the function-scoped Eva unknown obligations that `workspace_overlay.prepare_agent`
+        embeds into a prover/breaker/negotiate brief so worker threads do not re-parse large Eva JSONs.
+        """
+        if not fn:
+            return []
+        norm_c_file = norm_path(file) if file else None
+        mod = module if module and module != "unknown" else None
+        harness_names = self.harness_modules(mod) if mod else []
+        names = list(dict.fromkeys([*([mod] if mod else []), *harness_names]))
+        out: list[dict] = []
+        for name in names:
+            raw_unknowns = (self._eva_by_report.get(name) or {}).get(fn, [])
+            if not isinstance(raw_unknowns, list):
+                continue
+            rows = [
+                a
+                for a in raw_unknowns
+                if isinstance(a, dict) and (not norm_c_file or eva_alarm_in_file(a, norm_c_file))
+            ]
+            seen = list(out)
+            out += [a for a in rows if a not in seen]
+        return out
 
     def eva_unknown_count(self, file: str | None, fn: str) -> int:
         if not fn:
@@ -2394,6 +2430,7 @@ def cmd_init(reconcile: bool = False) -> dict:
 
 def _prepare_failed(state: dict, task: dict, error: str) -> None:
     task["prepare_errors"] = int(task.get("prepare_errors") or 0) + 1
+    task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
     if task["prepare_errors"] >= MAX_PREPARE_ERRORS:
         _finish(state, task, "blocked", "prepare_failed", reason=error)
     else:
@@ -2484,6 +2521,14 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
             out["done"] = _is_done(state, ctx)
             return out
+        pre_eva = {
+            tid: ctx.eva_unknown_obligations(
+                snapshot[tid].get("module"),
+                snapshot[tid].get("file"),
+                snapshot[tid].get("function"),
+            )
+            for tid in picked
+        }
 
     # Scratch overlays are snapshotted under the `merge` lock: never while holding the ledger lock.
     prepared: dict[str, dict] = {}
@@ -2491,13 +2536,18 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
     if picked:
         worker_cap = min(len(picked), os.cpu_count() or 4, 16)
         sched = state  # the schedule the snapshot was taken from: negotiate evidence reads callers and agents
+        try:
+            _pass_eva_obligations = "eva_unknown_obligations" in inspect.signature(DEPS.prepare_agent).parameters
+        except (TypeError, ValueError):
+            _pass_eva_obligations = False
 
         def _do_prepare(tid: str) -> tuple[str, dict | None, str | None]:
             task = snapshot[tid]
             try:
-                res = DEPS.prepare_agent(
-                    Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **_prepare_kwargs(task, sched)
-                )
+                kw = _prepare_kwargs(task, sched)
+                if _pass_eva_obligations:
+                    kw["eva_unknown_obligations"] = pre_eva[tid]
+                res = DEPS.prepare_agent(Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **kw)
                 return tid, res, None
             except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running
                 return tid, None, f"{type(exc).__name__}: {exc}"
@@ -2928,7 +2978,10 @@ def _eva_has_invalid(file: str, fn: str) -> bool:
     if not EVA_DIR.is_dir():
         return False
     for path in sorted(EVA_DIR.glob("*.json")):
-        data = load_json_optional(path, {}) or {}
+        try:
+            data = load_json_optional(path, {}, max_bytes=EVA_REPORT_MAX_BYTES) or {}
+        except ArtifactError:
+            continue
         for alarm in (data.get("invalid_alarms") if isinstance(data, dict) else None) or []:
             if isinstance(alarm, dict) and alarm.get("function") == fn and eva_alarm_in_file(alarm, file):
                 return True
@@ -3943,9 +3996,19 @@ def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None)
                 continue
             released = _release_units(task)
             previous = task.get("agent_id")
-            _reopen(state, task, f"requeued: agent {previous} never returned")
-            task["requeued_from"] = previous  # its result, should it still arrive, is accepted
-            out["requeued"].append({"task": task["id"], "agent_id": previous, "units_released": released})
+            had_brief = bool(previous and (Path("agents") / str(previous) / "brief.md").is_file())
+            if had_brief:
+                _reopen(state, task, f"requeued: agent {previous} never returned")
+                task["requeued_from"] = previous  # its result, should it still arrive, is accepted
+            else:
+                # `step --prepare` / `next --prepare` died after saving `running` before writing brief.md:
+                # no agent ever ran for `previous`, so do not burn the task's dispatch budget.
+                _reopen(state, task, f"requeued: agent {previous} was never prepared (missing brief.md)")
+                task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+            entry_info: dict[str, Any] = {"task": task["id"], "agent_id": previous, "units_released": released}
+            if not had_brief:
+                entry_info["unprepared"] = True
+            out["requeued"].append(entry_info)
         limit = float(stale_minutes or 0) * 60.0
         rechecks_requeued = []
         for rid, entry in list((state.get("rechecks") or {}).items()):

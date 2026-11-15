@@ -47,7 +47,10 @@ from framac_common import (  # noqa: E402
     STATUS_NEVER_TRIED,
     ArtifactError,
     atomic_write_json,
+    bound_flow_location,
     load_json_strict,
+    resolve_flows,
+    spill_large_flows,
 )
 
 SHARD_FORMAT = 1
@@ -336,11 +339,93 @@ _FLOW_INTERSECT = frozenset({"sure_outputs"})
 _FLOW_ALL = frozenset({"non_terminating", "no_effects"})
 
 
+def _bound_flow_item(item: Any) -> Any:
+    return bound_flow_location(item) if isinstance(item, str) else item
+
+
+def _merge_writes(old: list[Any], new: list[Any]) -> list[Any]:
+    """
+    Merge per-function `writes` (`{"loc": str, "from": list[str], "and_self": bool}`) by `loc`
+    rather than whole-dict equality so slight `from` variations across N shards do not multiply
+    entries by N.
+    """
+    out: list[Any] = []
+    by_loc: dict[str, dict[str, Any]] = {}
+    seen_other: set[str] = set()
+    for raw in [*old, *new]:
+        if isinstance(raw, dict) and isinstance(raw.get("loc"), str):
+            loc = bound_flow_location(raw["loc"])
+            raw_from = raw.get("from") or []
+            from_items = [
+                bound_flow_location(x) if isinstance(x, str) else x
+                for x in (raw_from if isinstance(raw_from, list) else [])
+            ]
+            and_self = bool(raw.get("and_self"))
+            existing = by_loc.get(loc)
+            if existing is None:
+                dedup_from: list[Any] = []
+                seen_f: set[str] = set()
+                for item in from_items:
+                    key = item if isinstance(item, str) else json.dumps(item, sort_keys=True)
+                    if key not in seen_f:
+                        seen_f.add(key)
+                        dedup_from.append(item)
+                rec: dict[str, Any] = {
+                    **raw,
+                    "loc": loc,
+                    "and_self": and_self,
+                    "from": dedup_from,
+                }
+                by_loc[loc] = rec
+                out.append(rec)
+            else:
+                existing["and_self"] = bool(existing.get("and_self")) or and_self
+                cur_from = existing.get("from")
+                cur_list = list(cur_from) if isinstance(cur_from, list) else []
+                seen_f = {x if isinstance(x, str) else json.dumps(x, sort_keys=True) for x in cur_list}
+                for item in from_items:
+                    key = item if isinstance(item, str) else json.dumps(item, sort_keys=True)
+                    if key not in seen_f:
+                        seen_f.add(key)
+                        cur_list.append(item)
+                existing["from"] = cur_list
+        else:
+            key = json.dumps(raw, sort_keys=True)
+            if key not in seen_other:
+                seen_other.add(key)
+                out.append(json.loads(key))
+    return out
+
+
+def _dedup_flow_list(items: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    seen: set[str] = set()
+    for raw in items:
+        val = _bound_flow_item(raw)
+        key = val if isinstance(val, str) else json.dumps(val, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(val)
+    return out
+
+
+def _normalize_fn_flow(info: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, value in info.items():
+        if name == "writes" and isinstance(value, list):
+            out[name] = _merge_writes([], value)
+        elif isinstance(value, list):
+            out[name] = _dedup_flow_list(value)
+        else:
+            out[name] = json.loads(json.dumps(value))
+    return out
+
+
 def merge_flows(flows: list[dict]) -> dict:
     """
     Read and write sets per function, over the shards that analysed it: lists are unions (sure
-    outputs an intersection), `non_terminating` and `no_effects` hold only if they hold in every
-    shard. Hints for prover briefs, never verdicts.
+    outputs an intersection), `writes` entries merge by `loc`, and `non_terminating` and
+    `no_effects` hold only if they hold in every shard. Hints for prover briefs, never verdicts.
     """
     usable = [f for f in flows if isinstance(f, dict)]
     if not usable:
@@ -352,20 +437,33 @@ def merge_flows(flows: list[dict]) -> dict:
                 continue
             mine = by_function.get(fn)
             if mine is None:
-                by_function[fn] = json.loads(json.dumps(info))
+                by_function[fn] = _normalize_fn_flow(info)
                 continue
             for name, value in info.items():
                 old = mine.get(name)
                 if name in _FLOW_ALL:
                     mine[name] = bool(old) and bool(value)
+                elif name == "writes" and isinstance(value, list):
+                    mine[name] = _merge_writes(old if isinstance(old, list) else [], value)
                 elif isinstance(value, list) and isinstance(old, list):
+                    norm_new = _dedup_flow_list(value)
                     if name in _FLOW_INTERSECT:
-                        mine[name] = [v for v in old if v in value]
+                        new_keys = {v if isinstance(v, str) else json.dumps(v, sort_keys=True) for v in norm_new}
+                        mine[name] = [
+                            v for v in old if (v if isinstance(v, str) else json.dumps(v, sort_keys=True)) in new_keys
+                        ]
                     else:
-                        seen = {json.dumps(v, sort_keys=True) for v in old}
-                        mine[name] = old + [v for v in value if json.dumps(v, sort_keys=True) not in seen]
+                        seen = {v if isinstance(v, str) else json.dumps(v, sort_keys=True) for v in old}
+                        mine[name] = old + [
+                            v
+                            for v in norm_new
+                            if (v if isinstance(v, str) else json.dumps(v, sort_keys=True)) not in seen
+                        ]
+                elif old is None and isinstance(value, list):
+                    if name not in _FLOW_INTERSECT:
+                        mine[name] = _dedup_flow_list(value)
                 elif name not in mine:
-                    mine[name] = value
+                    mine[name] = json.loads(json.dumps(value))
     edges: dict[str, set[str]] = defaultdict(set)
     for flow in usable:
         for fn, callees in (flow.get("call_edges") or {}).items():
@@ -609,6 +707,10 @@ def load_report(path: Path) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
+    if isinstance(data.get("flows"), dict) and "flows_file" in data["flows"]:
+        resolved = resolve_flows(data["flows"], report_path=path, max_bytes=_MAX_REPORT_BYTES)
+        if isinstance(resolved, dict):
+            data["flows"] = resolved
     data["_path"] = str(path)
     return data
 
@@ -642,7 +744,11 @@ def main(argv: list[str] | None = None) -> int:
             reports = [load_report(shard_report_path(args.shard_dir, i)) for i in range(len(shards))]
             report = merge(args.module, plan, reports, args.entry_fn, args.csv_out, args.flamegraph_out)
     report["module"] = args.module
-    atomic_write_json(args.out_json, report)
+    flows_dir = args.csv_out.parent
+    if flows_dir.resolve() == args.out_json.parent.resolve():
+        flows_dir = args.shard_dir
+    disk_report = spill_large_flows(report, flows_dir / "flows.json", report_path=args.out_json)
+    atomic_write_json(args.out_json, disk_report)
     sharding = report.get("eva_shards") or {}
     print(
         json.dumps(

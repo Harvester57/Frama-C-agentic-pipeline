@@ -72,7 +72,9 @@ from framac_common import (  # noqa: E402
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
     ArtifactError,
+    atomic_write_json,
     augment_framac_cppflags,
+    bound_flow_location,
     failure_reason,
     fold_messages,
     missing_spec_messages,
@@ -80,6 +82,7 @@ from framac_common import (  # noqa: E402
     parse_missing_spec,
     read_report_csv,
     scan_undeclared_functions,
+    spill_large_flows,
     stub_repair_action,
 )
 from patterns import DOMAIN_RE  # noqa: E402
@@ -97,7 +100,9 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
     seen: set[str] = set()
     matches: list[str] = []
     for m in messages:
-        if (m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded)) or _KERNEL_ERR_RE.search(m.folded):
+        if (m.plugin in ("kernel", "cpp") and _KERNEL_ERROR_HINT_RE.search(m.folded)) or _KERNEL_ERR_RE.search(
+            m.folded
+        ):
             if m.folded not in seen:
                 seen.add(m.folded)
                 matches.append(m.folded)
@@ -105,6 +110,7 @@ def extract_error_summary(log_text: str, max_lines: int = 20) -> list[str]:
         return matches[:max_lines]
     tail = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
     return tail[-max_lines:]
+
 
 BASE_DOMAINS = ("cvalue", "equality", "symbolic-locations", "octagon", "gauges")
 DEFAULT_AUTO_LOOP_UNROLL = 32
@@ -255,6 +261,7 @@ def parse_deps_log(log_text: str) -> dict[str, dict]:
     if not section:
         return out
     current: dict | None = None
+    writes_by_loc: dict[str, dict] = {}
     entry: dict | None = None
     previous_loc = ""
     pending_loc: str | None = None
@@ -266,13 +273,24 @@ def parse_deps_log(log_text: str) -> dict[str, dict]:
             pending_from = []
             return
         text = " ".join(pending_from)
-        entry["and_self"] = "(and SELF)" in text
-        entry["from"] = split_locations(text.replace("(and SELF)", ""))
+        and_self = "(and SELF)" in text
+        from_locs = list(dict.fromkeys(bound_flow_location(x) for x in split_locations(text.replace("(and SELF)", ""))))
         if current is not None:
             if entry["loc"] == "\\result":
-                current["result_from"] = entry["from"]
+                if current["result_from"] is None:
+                    current["result_from"] = from_locs
+                else:
+                    current["result_from"] = list(dict.fromkeys([*current["result_from"], *from_locs]))
             else:
-                current["writes"].append(entry)
+                loc = bound_flow_location(entry["loc"])
+                existing = writes_by_loc.get(loc)
+                if existing is None:
+                    rec = {"loc": loc, "and_self": and_self, "from": from_locs}
+                    writes_by_loc[loc] = rec
+                    current["writes"].append(rec)
+                else:
+                    existing["and_self"] = bool(existing.get("and_self")) or and_self
+                    existing["from"] = list(dict.fromkeys([*(existing.get("from") or []), *from_locs]))
         entry, pending_from = None, []
 
     for line in section.group(1).splitlines():
@@ -280,6 +298,7 @@ def parse_deps_log(log_text: str) -> dict[str, dict]:
         if m_fn:
             _close_entry()
             current = {"writes": [], "result_from": None, "no_effects": False, "non_terminating": False}
+            writes_by_loc = {}
             out[m_fn.group(1)] = current
             previous_loc = ""
             continue
@@ -339,7 +358,9 @@ def parse_inout_log(log_text: str) -> dict[str, dict]:
         elif stripped and field:
             buffers.setdefault((function, field), []).append(stripped)
     for (fn, name), lines in buffers.items():
-        out.setdefault(fn, {})[name] = split_locations(" ".join(lines))
+        out.setdefault(fn, {})[name] = list(
+            dict.fromkeys(bound_flow_location(x) for x in split_locations(" ".join(lines)))
+        )
     return out
 
 
@@ -1259,8 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
         flamegraph=not args.no_flamegraph,
     )
     res["module"] = args.module
-    args.out_json.parent.mkdir(parents=True, exist_ok=True)
-    args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+    disk_res = spill_large_flows(res, args.out_dir / "flows.json", report_path=args.out_json)
+    atomic_write_json(args.out_json, disk_res)
     print(
         json.dumps(
             {

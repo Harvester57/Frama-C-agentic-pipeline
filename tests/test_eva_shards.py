@@ -25,7 +25,6 @@ from test_pipeline_make import REPO, SIDECARS, _make_run
 pytestmark = pytest.mark.unit
 
 
-
 # ---------------------------------------------------------------------------
 # The harness: one guard per case
 # ---------------------------------------------------------------------------
@@ -457,3 +456,34 @@ def test_flows_merge_as_hints_over_the_shards():
     assert merged["status"] == "ok"
     assert es.merge_flows([a, {"status": "timeout", "reason": "flows timed out"}])["status"] == "partial"
     assert es.merge_flows([None, None])["status"] == "not_run"  # type: ignore[list-item]
+
+
+def test_flows_merge_writes_by_loc_without_multiplying_across_shards():
+    shards = [
+        {
+            "status": "ok",
+            "by_function": {
+                "decode_item": {
+                    "writes": [
+                        {"loc": "ctx->offset", "and_self": i == 4, "from": ["ctx->offset", f"in_byte_{i}"]},
+                        {"loc": "out->val", "and_self": False, "from": [f"src_{i % 3}"]},
+                    ],
+                    "inputs": ["ctx->offset", f"in_byte_{i}"],
+                    "sure_outputs": ["out->val", "shared_out"] if i == 0 else ["shared_out"],
+                    "non_terminating": False,
+                    "no_effects": False,
+                }
+            },
+            "call_edges": {"decode_item": ["helper"]},
+        }
+        for i in range(9)
+    ]
+    merged = es.merge_flows(shards)
+    fn_flow = merged["by_function"]["decode_item"]
+    writes = {w["loc"]: w for w in fn_flow["writes"]}
+    assert list(writes) == ["ctx->offset", "out->val"]
+    assert writes["ctx->offset"]["and_self"] is True
+    assert writes["ctx->offset"]["from"] == ["ctx->offset", *[f"in_byte_{i}" for i in range(9)]]
+    assert writes["out->val"]["and_self"] is False
+    assert writes["out->val"]["from"] == ["src_0", "src_1", "src_2"]
+    assert fn_flow["sure_outputs"] == ["shared_out"]
