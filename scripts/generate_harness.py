@@ -2180,7 +2180,10 @@ def _generate_module_harness(
     target_fuzzer: str | None = None,
     target_fuzzer_id: str | None = None,
     fail_on_compile_error: bool = True,
+    file_scope: list[str] | None = None,
 ) -> dict[str, Any]:
+    # `file_scope`: one-line definitions placed right after the headers (the --api generator's callback
+    # stubs, api_harness.callback_stub), so cases can name them.
     # A target fuzz module (--target-fuzzer): the harness calls the target's own fuzz function, renamed
     # by -D (see the rename path below), on its own copy of the input. It answers for its fuzzer file only.
     target_fuzzer_record: dict[str, Any] | None = None
@@ -2482,7 +2485,7 @@ def _generate_module_harness(
 
     harness_content = (
         rendered_tpl.replace("{{MODULE_NAME}}", module_name)
-        .replace('#include "{{MODULE_HEADER}}"', "\n".join(inc_lines))
+        .replace('#include "{{MODULE_HEADER}}"', "\n".join([*inc_lines, *(file_scope or [])]))
         .replace("{{MAX_INPUT_SIZE}}", str(max_input_size))
         .replace("{{TARGET_INVOCATION_EVA}}", eva_call)
         .replace("{{TARGET_INVOCATION_FUZZ}}", fuzz_call)

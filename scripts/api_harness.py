@@ -22,8 +22,11 @@ byte selects it), with arguments built from the model's signature of each functi
     itself, so a read past it is caught; an output pair gets a spare buffer and a length read from
     the input, clamped to the buffer;
   - a byte pointer with a size the call sites in the code base agree on (`param_sizes` in the model,
-    step "call-site sizes"): a buffer of exactly that size, read from the input when it is an input
-    (a `const` pointee), else zeroed;
+    step "call-site sizes"): a buffer of exactly that size (the largest), read from the input when it
+    is an input (a `const` pointee), else zeroed. An input byte array whose call sites pass several
+    sizes, with no length after it, is ended by a terminator (QCBOR's `QCBOR_TYPE_NONE`-terminated
+    type lists): its last byte is set to 0 after the input fills it. An array of wider scalars of that
+    shape is left as read (its sentinel value is not known) and the case's `notes` say so;
   - a byte pointer without a known size: a zeroed spare buffer (`2 * MAX_INPUT_SIZE + 1024` bytes), so
     an unknown contract does not read as a target bug; a `const char *` alone takes the rest of the
     input as a NUL-terminated string;
@@ -43,7 +46,10 @@ byte selects it), with arguments built from the model's signature of each functi
     byte pointer as below and the case's `notes` say why;
   - a pointer to another scalar or struct: one object (an output, or read from the input when `const`
     and the struct has no pointers; zeroed otherwise);
-  - a function pointer: NULL.
+  - a function pointer: a callback stub of its prototype (`callback_stub`, defined after the headers:
+    it writes nothing and returns the zero value of its type), when the layout probe spelled the
+    prototype from the headers' own typedefs (`callback_prototypes`); else NULL. Either way the case's
+    `notes` say which. A function pointer inside a struct stays NULL.
 
 Recorded call sequences (seed_harvest.py traces) add sequence cases: the calls of one traced chain in
 order, the buffers they share passed between them, so a later call sees what an earlier one produced
@@ -152,6 +158,28 @@ def param_size(rec: dict, index: int) -> int | None:
     return None
 
 
+def _sentinel_sized(rec: dict, index: int) -> bool:
+    """
+    Whether a pointer parameter's call sites pass arrays of different sizes (`param_sizes` min < max).
+    The generator calls this only for a pointer with no length parameter after it, so the callee can
+    only find the end by a terminator. A buffer every call site passes at one size (a key, a digest)
+    is not one.
+    """
+    sizes = (rec.get("param_sizes") or {}).get(str(index))
+    if not isinstance(sizes, dict):
+        return False
+    try:
+        lo, hi = int(sizes.get("min") or 0), int(sizes.get("max") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < lo < hi
+
+
+def _sizes_text(rec: dict, index: int) -> str:
+    sizes = (rec.get("param_sizes") or {}).get(str(index)) or {}
+    return f"{sizes.get('min')}..{sizes.get('max')}"
+
+
 def _storage(size: int | None) -> str:
     """
     Spare buffers (no known size) are `static`, zeroed on every call: a case may hold several and a
@@ -187,6 +215,10 @@ class ApiInfo:
     dtors: dict[str, str] = field(default_factory=dict)
     dtor_names: dict[str, set[str]] = field(default_factory=dict)
     returns: dict[str, str] = field(default_factory=dict)  # function -> the handle type it returns
+    # Function-pointer parameters whose prototype the layout probe spelled (`callback_prototypes`), and
+    # the callback stubs the cases use (stub name -> its file-scope definition, `callback_stub`).
+    callbacks: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
+    stubs: dict[str, str] = field(default_factory=dict)
 
 
 class _Case:
@@ -450,7 +482,18 @@ def _bind_call(
             i += 1
             continue
         if p["kind"] == "fnptr":
-            args.append("0")
+            proto = (case.api.callbacks.get(name) or {}).get(i)
+            if proto is not None:
+                # A NULL callback crashes a function that calls it unchecked: a crash only the harness made.
+                stub = f"framac_cb_{name}_{i}"
+                case.api.stubs.setdefault(stub, callback_stub(stub, proto))
+                case.note(call, i, f"function pointer: {stub}, a stub that writes nothing and returns zero")
+                args.append(stub)
+            else:
+                case.note(
+                    call, i, "function pointer: NULL (no callback stub: no layout probe, or its prototype not spelled)"
+                )
+                args.append("0")
             i += 1
             continue
         if p["kind"] == "ptr":
@@ -494,6 +537,17 @@ def _bind_call(
                 )
                 if size and is_input:
                     case.slot(v, size, call, i, "bytes", addr=False)
+                    if _sentinel_sized(rec, i):
+                        # No length goes with it and the call sites pass several sizes: the callee finds
+                        # the end by a terminator, as a string's NUL (QCBOR's QCBOR_TYPE_NONE-terminated
+                        # type lists). The last byte stays 0 after the input fills the array.
+                        case.post.append(f"{v}[sizeof({v}) - 1] = 0;")
+                        case.note(
+                            call,
+                            i,
+                            f"byte array of {_sizes_text(rec, i)} bytes at the call sites and no length: "
+                            "zero-terminated (its last byte is 0)",
+                        )
                 elif size is None and is_input and pointee in ("char", "signed char") and case.rest is None:
                     case.rest = {"call": call, "param": i, "kind": "string"}
                     case.post.append(
@@ -515,6 +569,15 @@ def _bind_call(
                 )
                 if is_input and raw_ok:
                     case.slot(v, size, call, i, "bytes", addr=False)
+                    if _sentinel_sized(rec, i) and not _is_record(pointee):
+                        # Its terminator value is not known (QCBOR ends tag-number lists on
+                        # CBOR_TAG_INVALID64, not 0): left as read, and said so.
+                        case.note(
+                            call,
+                            i,
+                            f"{pointee} array of {_sizes_text(rec, i)} bytes at the call sites and no length: "
+                            "probably terminated by a sentinel the generator does not know; not terminated",
+                        )
                 elif is_input and lay is not None and lay.get("what") == "struct":
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
                 args.append(f"({p['type']}){v}")
@@ -921,12 +984,15 @@ def plan(
     struct_layouts: dict[str, dict] | None = None,
     visible: set[str] | None = None,
     reserve: int = 0,
+    callback_stubs: bool = True,
 ) -> dict[str, Any]:
     """
-    The cases of a module's API harness: {entries, cases, layouts, skipped}. `scope_files` (the
+    The cases of a module's API harness: {entries, cases, layouts, skipped, stubs}. `scope_files` (the
     sidecar's) give a sub-module that is neither a lexer module nor a cluster its scope.
     `struct_layouts` and `visible` come from `probe_layouts` (None: no probe ran). `reserve` selectors
-    are left free for the hand-written cases `generate` appends.
+    are left free for the hand-written cases `generate` appends. `stubs` maps each callback stub a case
+    passes for a function pointer (`visible.callbacks`, unless `callback_stubs` is False) to its
+    file-scope definition.
     """
     max_cases = max(0, MAX_CASES - reserve)
     from module_map import ModuleMap
@@ -968,6 +1034,7 @@ def plan(
         dtors=dtors,
         dtor_names=dtor_names,
         returns=returns,
+        callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -1026,7 +1093,16 @@ def plan(
         cases, layouts = cases[:max_cases], layouts[:max_cases]
     for sel, lay in enumerate(layouts):
         lay["selector"] = sel
-    return {"entries": names, "cases": cases, "layouts": layouts, "skipped": skipped}
+    return {"entries": names, "cases": cases, "layouts": layouts, "skipped": skipped, "stubs": dict(api.stubs)}
+
+
+_STUB_NAME_RE = re.compile(r"\bframac_cb_\w+")
+
+
+def stubs_used(cases: list[str], stubs: dict[str, str]) -> list[str]:
+    """The definitions of the callback stubs `cases` call, in name order (an unused one is left out)."""
+    used = {m.group(0) for c in cases for m in _STUB_NAME_RE.finditer(c)}
+    return [stubs[s] for s in sorted(used) if s in stubs]
 
 
 # --- struct layouts (clang's AST of the harness) ----------------------------------------------------
@@ -1063,14 +1139,122 @@ class Declared(set):  # type: ignore[type-arg]
     """
 
     prototypes: dict[str, dict[str, Any]]
+    callbacks: dict[str, dict[int, dict[str, Any]]]
 
-    def __init__(self, names: Any = (), prototypes: dict[str, dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        names: Any = (),
+        prototypes: dict[str, dict[str, Any]] | None = None,
+        callbacks: dict[str, dict[int, dict[str, Any]]] | None = None,
+    ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
+        # `callback_prototypes`: per function, parameter index -> the callback's spelled prototype.
+        self.callbacks = callbacks or {}
 
 
 def _spelled(t: str) -> str:
     return " ".join(_QUALIFIERS_RE.sub(" ", t).split())
+
+
+_FN_POINTER_TYPE_RE = re.compile(r"^(?P<ret>[^()]+?)\s*\(\s*\*\s*\)\s*\((?P<params>.*)\)$")
+_FN_TYPE_RE = re.compile(r"^(?P<ret>[^()]+?)\s*\((?P<params>.*)\)$")
+
+
+def _split_top(text: str) -> list[str]:
+    out: list[str] = []
+    cur, depth = "", 0
+    for ch in text:
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+            continue
+        depth += ch in "([{"
+        depth -= ch in ")]}"
+        cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _callback_prototype(written: str, typedefs: dict[str, str]) -> dict[str, Any] | None:
+    """
+    {"ret": type, "params": [type, ...]} of a function-pointer parameter whose declared type is
+    `written` (clang's qualType), spelled with the names the headers use, or None when it is not a
+    function pointer or a part cannot be spelled in C at file scope (an unnamed type, a nested function
+    pointer, an array, a variadic list). Typedefs are followed one level at a time, never desugared, so
+    `QCBORError` stays `QCBORError` where the model has `enum __anonenum_QCBORError_1`.
+    """
+    cur = " ".join(written.split())
+    cur = re.sub(r"\s*\bconst\s*$", "", cur)
+    fn: re.Match[str] | None = None
+    for _ in range(8):
+        fn = _FN_POINTER_TYPE_RE.match(cur)
+        if fn:
+            break
+        if cur.endswith("*"):
+            base = _spelled(cur[:-1])
+            target = typedefs.get(base)
+            fn = _FN_TYPE_RE.match(" ".join(target.split())) if target else None
+            if fn:
+                break
+        nxt = typedefs.get(_spelled(cur))
+        if nxt is None:
+            return None
+        cur = re.sub(r"\s*\bconst\s*$", "", " ".join(nxt.split()))
+    if fn is None:
+        return None
+    ret = fn.group("ret").strip()
+    params = _split_top(fn.group("params"))
+    if params == ["void"]:
+        params = []
+    for t in [ret, *params]:
+        if not t or any(bad in t for bad in ("(", "[", "...", "unnamed", "anonymous", "__anon")):
+            return None
+    return {"ret": ret, "params": params}
+
+
+def callback_prototypes(tree: dict) -> dict[str, dict[int, dict[str, Any]]]:
+    """Per declared function, its function-pointer parameters (index -> `_callback_prototype`)."""
+    typedefs: dict[str, str] = {}
+    decls: list[dict] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        if kind == "FunctionDecl":
+            decls.append(node)
+            continue
+        if kind == "TypedefDecl" and isinstance(node.get("name"), str):
+            typedefs.setdefault(node["name"], str((node.get("type") or {}).get("qualType") or ""))
+        stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+    out: dict[str, dict[int, dict[str, Any]]] = {}
+    for node in decls:
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        parms = [n for n in node.get("inner") or [] if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"]
+        for i, parm in enumerate(parms):
+            proto = _callback_prototype(str((parm.get("type") or {}).get("qualType") or ""), typedefs)
+            if proto is not None:
+                out.setdefault(name, {})[i] = proto
+    return out
+
+
+CALLBACK_STUB_MARKER = "framac callback stub"
+
+
+def callback_stub(stub: str, proto: dict[str, Any]) -> str:
+    """
+    A benign callback of prototype `proto`, defined at file scope on one line: it reads and writes
+    nothing it is given, and returns the zero value of its type (`0`, a null pointer, a zeroed struct).
+    """
+    params = ", ".join(f"{t} fc_p{k}" for k, t in enumerate(proto["params"])) or "void"
+    uses = " ".join(f"(void)fc_p{k};" for k in range(len(proto["params"])))
+    ret = proto["ret"]
+    local = _spelled(ret)  # no `const`: the zero value is written with memset
+    body = uses if local == "void" else f"{uses} {local} fc_r; memset(&fc_r, 0, sizeof(fc_r)); return fc_r;"
+    return f"static {ret} {stub}({params}) {{ {body.strip()} }} /* {CALLBACK_STUB_MARKER} */"
 
 
 def handle_prototypes(tree: dict, complete: set[str]) -> dict[str, dict[str, Any]]:
@@ -1243,7 +1427,7 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         return out
 
     layouts = {k: lay for k in raw if (lay := layout(k)) is not None}
-    return layouts, Declared(functions, handle_prototypes(tree, set(raw)))
+    return layouts, Declared(functions, handle_prototypes(tree, set(raw)), callback_prototypes(tree))
 
 
 def probe_layouts(
@@ -1352,6 +1536,24 @@ def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tup
         # A failed compile with no located error (a fatal one, a driver error): not a case's fault.
         other.append(output.strip().splitlines()[0] if output.strip() else f"exit code {proc.returncode}")
     return bad, other
+
+
+def _stub_errors_only(harness_c: Path, errors: list[str]) -> bool:
+    """Whether every compile error outside the cases (`probe_cases`) is on a callback stub's line."""
+    try:
+        lines = harness_c.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    found = False
+    for err in errors:
+        m = _ERR_LINE_RE.match(err)
+        if not m or Path(m.group("file")).name != harness_c.name:
+            return False
+        no = int(m.group("line"))
+        if not (0 < no <= len(lines) and CALLBACK_STUB_MARKER in lines[no - 1]):
+            return False
+        found = True
+    return found
 
 
 def case_diagnostics(harness_c: Path, cppflags: str, clang: str | None = None) -> dict[int, str] | None:
@@ -1472,6 +1674,9 @@ def generate(
     # whose cases the sidecar lists. Failed generation leaves the previous harness files as they were
     # (generate_harness.harness_files_kept_on_failure).
     need_layouts = probe and struct_layouts is None
+    layouts_probed: tuple[dict[str, dict], set[str]] | None = (
+        (struct_layouts, visible) if struct_layouts is not None and visible is not None else None
+    )
     with harness_files_kept_on_failure(out_dir, module):
         while True:
             # While the probe drops cases, a compile error is the probe's to judge; without the
@@ -1493,6 +1698,7 @@ def generate(
                 auto_prelude=auto_prelude,
                 scope_files=scope,
                 fail_on_compile_error=not probe,
+                file_scope=stubs_used(cases, p.get("stubs") or {}),
             )
             if not probe:
                 break
@@ -1510,6 +1716,25 @@ def generate(
             if probed is None:
                 break  # no compiler: the cases stay unchecked
             bad, other = probed
+            if other and layouts_probed is not None and _stub_errors_only(Path(result["harness_file"]), other):
+                # A callback stub the headers cannot spell after all: plan again with NULL callbacks
+                # (each case's notes say so), never fail the harness for a stub.
+                p = plan(
+                    dag,
+                    model,
+                    module,
+                    unit,
+                    max_input_size,
+                    traces,
+                    scope,
+                    *layouts_probed,
+                    reserve=len(custom),
+                    callback_stubs=False,
+                )
+                layouts_probed = None
+                if p["cases"]:
+                    cases, layouts, skipped = with_custom(p)
+                    continue
             if other:
                 raise ApiHarnessError(
                     f"module {module!r}: the harness does not compile outside its cases: {'; '.join(other[:3])}"
