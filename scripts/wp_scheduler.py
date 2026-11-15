@@ -1466,7 +1466,10 @@ def touches_module_header(
     module: str | None,
     work_dir: Path | None = None,
 ) -> bool:
-    """Check whether `fn` has a prototype or declaration in one of the module's harness headers."""
+    """
+    Check whether `fn` is declared in one of the module's harness headers: a prototype, or a `static inline`
+    definition (a header that holds only the definition takes the prover's contract too).
+    """
     if not module:
         return False
     cand_headers = [header for _, header in ctx.headers(module)]
@@ -1487,8 +1490,7 @@ def touches_module_header(
             return True
         if not re.search(r"\b" + re.escape(fn) + r"\b", hdr_text):
             continue
-        span = acsl_ast.locate_function_span(hdr_text, fn, is_header=True, path=hdr_rel)
-        if span is not None:
+        if acsl_ast.function_declaration_spans(hdr_text, fn, path=hdr_rel):
             return True
     return False
 
@@ -3599,6 +3601,9 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
         _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out, ctx=ctx)
     _finish(state, task, "done", str(ing.get("decision")))
     out.update(action="ingested", decision=ing.get("decision"), harness_exhausted=ing.get("harness_exhausted"))
+    if ing.get("sink_conflicts"):
+        # Opposite verdicts at one sink (ledger.py): shown to the parent now, not only in the final report.
+        out["sink_conflicts"] = ing["sink_conflicts"]
 
 
 def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path: Path, out: dict) -> None:

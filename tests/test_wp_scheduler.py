@@ -661,6 +661,33 @@ def test_harness_induced_rejection_creates_a_repair_that_holds_the_gate(sim):
     assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m/f.c#f", "prove:src/m/h.c#h"]
 
 
+def test_verifier_completion_reports_opposite_verdicts_at_one_sink(sim, monkeypatch):
+    """QCBOR run-6: a confirmed and a rejected verdict at one sink stayed side by side, unseen until the report."""
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {}})
+    fp = sim.eva_candidate("m", "src/m/f.c", "f")
+    S.cmd_init()
+    ver = S.cmd_next("auto", prepare=True)["tasks"][0]
+    L.cmd_scaffold_verifier(
+        fp, "rejected", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json")
+    )
+    real = S.DEPS.ingest_verifier
+    pair = [{"positive": "fp-confirmed", "negative": fp, "outcome": "reopened"}]
+    monkeypatch.setattr(S.DEPS, "ingest_verifier", lambda *a, **k: {**real(*a, **k), "sink_conflicts": pair})
+    assert S.cmd_complete(ver["agent_id"])["sink_conflicts"] == pair
+
+
+def test_a_header_that_holds_only_the_static_inline_definition_counts_as_the_module_header(sim):
+    """QCBOR UsefulBuf.h: the prover's contract goes on the definition, so the module's architects matter."""
+    sim.build({"f": ("src/m/f.c", "m", [])}, sidecars={"m": {"header": "inc/m.h"}})
+    hdr = sim.run_dir / "workspace" / "work" / "inc" / "m.h"
+    hdr.parent.mkdir(parents=True, exist_ok=True)
+    hdr.write_text("static inline int only_def(int x) { return x; }\nint proto(int x);\n", encoding="utf-8")
+    ctx = S.Ctx()
+    assert S.touches_module_header(ctx, "inc/m.h", "only_def", "m")
+    assert S.touches_module_header(ctx, "src/m/f.c", "proto", "m")
+    assert not S.touches_module_header(ctx, "src/m/f.c", "absent", "m")
+
+
 def test_gate_waits_for_every_slice_covering_the_module_but_not_for_tier3_slices(sim):
     tier3 = "Tier 3 (Internal State / Glue Module)"
     sim.build(

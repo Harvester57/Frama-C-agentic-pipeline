@@ -2607,6 +2607,36 @@ _REJECTED_RESULT_REUSE = {
 }
 
 
+CALLEES_WITHOUT_CONTRACT_MAX = 20
+
+
+def _callees_without_contract_section(callees: list[str] | None, role: str) -> str:
+    """
+    Appended to a prover's brief when the scheduler dispatched it although some callees have no contract
+    its proof can see and none can be obtained (wp_scheduler `callees_without_contract`, `<file>#<name>`
+    keys: a crash candidate, an out-of-scope function, or a negotiation that ended without a contract).
+    """
+    if role != "prover" or not callees:
+        return ""
+    rows = []
+    for key in list(dict.fromkeys(str(c) for c in callees))[:CALLEES_WITHOUT_CONTRACT_MAX]:
+        cfile, cname = (re.sub(r"[\s`]+", " ", part).strip() for part in key.rpartition("#")[::2])
+        rows.append(f"- `{cname}`" + (f" (`{cfile}`)" if cfile else ""))
+    more = len(set(callees)) - len(rows)
+    if more > 0:
+        rows.append(f"- ... and {more} more")
+    return (
+        "\n## Calls Without a Contract\n\n"
+        "These callees have no ACSL contract your proof can see, and the pipeline could not get one (a crash "
+        "candidate, a function out of scope, or a negotiation that ended without a contract):\n\n"
+        + "\n".join(rows)
+        + "\n\nWP applies its default specification to these calls: they may write anything and guarantee "
+        "nothing. Do not assume any postcondition of these calls, do not write a contract for them, and do not "
+        "file a strengthening request for them. Prove what holds without them, and list the goals that depend "
+        "on their effects in `unproven_goals`.\n"
+    )
+
+
 def _rejected_result_section(rejected_result: dict | None, agent_id: str, role: str) -> str:
     """
     Appended to the brief of an agent that re-runs a task whose previous result.json failed validation
@@ -2709,6 +2739,7 @@ def prepare_agent(
     callee_history: dict | None = None,
     rejected_result: dict | None = None,
     eva_unknown_obligations: list[dict] | None = None,
+    callees_without_contract: list[str] | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -2723,6 +2754,8 @@ def prepare_agent(
     (a summary of this function's previous prover run).
     `rejected_result` (`{"agent_id", "errors"}`) is set when this agent re-runs a task whose previous
     result.json failed validation: the brief ends with those errors.
+    `callees_without_contract` (`<file>#<name>` keys, from the scheduler) are the prover's callees that
+    have no contract and cannot get one: the brief names them.
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -3095,6 +3128,7 @@ def prepare_agent(
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
         rendered += _negotiation_evidence_section(caller_evidence, callee_history)
+    rendered += _callees_without_contract_section(callees_without_contract, role)
     rendered += _rejected_result_section(rejected_result, agent_id, role)
 
     brief_path = agent_root / "brief.md"
