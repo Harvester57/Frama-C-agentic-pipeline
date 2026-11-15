@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -511,8 +512,13 @@ def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_modul
     assert t["prove:src/m1/f.c#f"]["deps"] == ["arch:m1", "arch:m2", "gate:m1"]
     assert t["arch:m2"]["header"] == "src/m2/m2.h" and t["arch:m2"]["deps"] == ["gate:m2"]
 
-    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["arch:m1", "arch:m2"]
-    assert {(a, r) for a, r, _ in sim.prepared} == {("arch-m1", "architect"), ("arch-m2", "architect")}
+    # g has no contract and no prove task: the scheduler asks for one, and f also waits on that negotiation.
+    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["arch:m1", "arch:m2", "negotiate:src/m2/g.c#g"]
+    assert {(a, r) for a, r, _ in sim.prepared} == {
+        ("arch-m1", "architect"),
+        ("arch-m2", "architect"),
+        ("negotiate-g", "prover"),
+    }
 
     sim.architect("arch-m1", "src/m1/m1.h")
     out = S.cmd_complete("arch-m1")
@@ -521,7 +527,9 @@ def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_modul
 
     sim.architect("arch-m2", "src/m2/m2.h", status="failed")
     assert S.cmd_complete("arch-m2")["action"] == "architect_failed"  # provers proceed anyway
-    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m1/f.c#f", "prove:src/m2/g2.c#g2"]
+    assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m2/g2.c#g2"]  # f waits for g's contract
+    sim.finish("negotiate-g", "g", "src/m2/g.c", force=True)
+    assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m1/f.c#f"]
 
 
 def test_priority_is_caller_height_then_eva_unknowns_then_name(sim):
@@ -557,8 +565,10 @@ def _stall_and_dispatch_breaker(sim):
     out = S.cmd_complete("prove-f")
     assert out["action"] == "blocked" and "breaker:src/m/f.c#f" in out["new_tasks"]
     assert units()["src/m/f.c#f::rte"]["status"] == "blocked"
-    assert ready() == ["breaker:src/m/f.c#f", "prove:src/m/h.c#h"]  # the stalled callee released its caller
-    brk = S.cmd_next("1", prepare=True)
+    # The stalled callee has no contract: its caller waits on the negotiation the scheduler opened for it.
+    assert ready() == ["negotiate:src/m/f.c#f", "breaker:src/m/f.c#f"]
+    assert tasks()["negotiate:src/m/f.c#f"]["callers"] == ["prove:src/m/h.c#h"]
+    brk = S.cmd_next("1", prepare=True)  # the breaker's reserved slot
     assert ids(brk) == ["breaker:src/m/f.c#f"]
     assert (
         brk["tasks"][0]["agent_id"] == "breaker-f"
@@ -580,13 +590,16 @@ def test_breaker_crash_reopens_the_gate_until_the_module_is_refreshed(sim):
     assert S.cmd_status()["gates"]["gate:m"] == {"open": False, "waiting_on": [f"verify:{fp}"]}
 
     nxt = S.cmd_next("auto", prepare=True)
+    # f's unit is a crash candidate now: its negotiation is refused at dispatch, h no longer waits on it.
     assert nxt["parent_tasks"] == [] and ids(nxt) == [f"verify:{fp}"]
+    assert tasks()["negotiate:src/m/f.c#f"]["outcome"] == "candidate"  # skipped by the sync
     ver = nxt["tasks"][0]
     L.cmd_scaffold_verifier(
         fp, "needs_validation", ver["agent_id"], out_path=Path(f"agents/{ver['agent_id']}/scratch/result.json")
     )
     assert S.cmd_complete(ver["agent_id"])["decision"] == "needs_validation"
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m/h.c#h"]
+    assert tasks()["prove:src/m/h.c#h"]["callees_without_contract"] == ["src/m/f.c#f"]
 
 
 def test_breaker_fault_hypothesis_adds_a_verify_task_that_closes_the_gate(sim):
@@ -636,7 +649,15 @@ def test_harness_induced_rejection_creates_a_repair_that_holds_the_gate(sim):
     # The repaired harness has a new digest: the reach gate records it before module-m's targets run.
     gate = next(i for i, a in enumerate(actions) if a.endswith("pipeline_make.py run reach-gate"))
     assert gate < next(i for i, a in enumerate(actions) if a.endswith("pipeline_make.py run module-m"))
-    S.cmd_refresh("m")
+    # No fuzz report and no facts yet; the Eva report predates harness_digest and is newer than the harness.
+    os.utime(sim.run_dir / "workspace/harnesses/harness_m.json", (1_000_000, 1_000_000))
+    assert S.cmd_refresh("m")["targets"] == ["fuzz-m", "facts-m"]
+    digest = phase0_gates.harness_digest(Path("."), "m", ignore_exempt=True)
+    for kind in ("fuzz", "eva"):
+        path = sim.run_dir / f"workspace/reports/{kind}/m.json"
+        write_json(path, {**(load(path) if path.is_file() else {"status": "ok"}), "harness_digest": digest})
+    write_json(sim.run_dir / "workspace/reports/facts/m.json", {"module": "m", "functions": {}})
+    assert S.cmd_refresh("m")["repair"] == "done"
     assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["prove:src/m/f.c#f", "prove:src/m/h.c#h"]
 
 
@@ -1194,13 +1215,19 @@ def test_caller_merged_with_blocked_callee_audits_hypotheses(sim):
     out = S.cmd_complete(t_callee["agent_id"])
     assert out["action"] == "blocked" and tasks()["prove:src/m/b.c#callee"]["state"] == "blocked"
 
-    # Dispatch caller (and breaker); complete breaker cleanly
+    # The breaker and a negotiation for the contract-less callee; complete the breaker cleanly
     dispatched = S.cmd_next("auto", prepare=True)["tasks"]
     brk_task = next(t for t in dispatched if t["kind"] == "breaker")
     sim.breaker(brk_task["agent_id"], "callee", "src/m/b.c", crash=False)
     S.cmd_complete(brk_task["agent_id"])
+    # The negotiation stalls too: the caller is released, told that its callee has no contract.
+    neg = next(t for t in dispatched if t["kind"] == "negotiate")
+    sim.prover(neg["agent_id"], "callee", "src/m/b.c", status="stalled_after_k_retries")
+    assert S.cmd_complete(neg["agent_id"])["action"] == "negotiation_rejected"
+    dispatched = S.cmd_next("auto", prepare=True)["tasks"]
 
     t_caller = next(t for t in dispatched if t["kind"] == "prove")
+    assert t_caller["callees_without_contract"] == ["src/m/b.c#callee"]
     assert t_caller["function"] == "caller"
     aid_caller = t_caller["agent_id"]
     sim.prover(aid_caller, "caller", "src/m/a.c", status="all_proven")
@@ -2238,6 +2265,10 @@ def test_status_counts_units_carried_forward_from_an_earlier_run(sim):
             unit("src/m/c.c", "c", "rte", "covered", module="m", tier=TIER1, evidence=[carried]),
         ],
     )
+    # The carried proof's contract, where a caller in another file sees it.
+    header = sim.run_dir / "workspace/work/src/m/c.h"
+    header.parent.mkdir(parents=True, exist_ok=True)
+    header.write_text("/*@ assigns \\nothing; */\nint c(void);\n", encoding="utf-8")
     checkpoint.cmd_init(Path("state"), "/target", "verify")
     init = S.cmd_init()
     assert init["by_kind"] == {"prove": {"pending": 1}}  # the carried function gets no prove task
