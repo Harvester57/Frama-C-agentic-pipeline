@@ -717,7 +717,12 @@ def regate_after_exempt(run_dir: Path, dag_path: Path, harness_dir: Path, module
 
 DEFAULT_DYNAMIC_OUT = Path("workspace/reports/harness_reach_dynamic.json")
 COVERAGE_DIR = Path("workspace/reports/coverage")
+FUZZ_DIR = Path("workspace/reports/fuzz")
+DEFAULT_FUZZ_DIR = FUZZ_DIR
+DEFAULT_HARNESSES = DEFAULT_HARNESS_DIR
 _COVERAGE_OK = ("ok", "partial")
+_UNKNOWN_FAILURE_FNS = frozenset({"", "unknown", "unknown_function", "LLVMFuzzerTestOneInput", "main"})
+_FRAME_IN_FN_RE = re.compile(r"\bin\s+([A-Za-z_]\w*)\b(?:\s+(\S+?)(?::\d+)?)?")
 
 
 def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str]:
@@ -762,31 +767,312 @@ def _entry_executions(key: str, dag: dict[str, Any], runs: dict[str, list[tuple[
     return sum(n for _, n in rows)
 
 
-def check_dynamic(module: str, dag: dict[str, Any], mm: ModuleMap, coverage: dict[str, Any]) -> dict[str, Any]:
+def _normalize_failure_fn(raw: object) -> str:
+    if not isinstance(raw, str):
+        return ""
+    name = raw.strip()
+    if name.startswith("__gen_e_acsl_"):
+        name = name[len("__gen_e_acsl_") :]
+    return "" if name in _UNKNOWN_FAILURE_FNS else name
+
+
+def _extract_failure_frames(art: dict[str, Any], failure: dict[str, Any] | None) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for source in (failure, art):
+        frames = source.get("frames") if isinstance(source, dict) else None
+        if not isinstance(frames, list):
+            continue
+        for item in frames:
+            if isinstance(item, dict):
+                fn = _normalize_failure_fn(item.get("function") or item.get("fn") or item.get("name"))
+                if fn:
+                    out.append((fn, str(item.get("file") or "")))
+            elif isinstance(item, str):
+                m = _FRAME_IN_FN_RE.search(item)
+                if m:
+                    fn = _normalize_failure_fn(m.group(1))
+                    if fn:
+                        out.append((fn, m.group(2) or ""))
+                elif _IDENT_RE.fullmatch(item.strip()):
+                    fn = _normalize_failure_fn(item.strip())
+                    if fn:
+                        out.append((fn, ""))
+    return out
+
+
+def _fn_matches_entry(
+    fn_name: str,
+    fn_file: str,
+    ep: str,
+    module: str,
+    dag: dict[str, Any],
+    by_name: dict[str, list[tuple[str, dict[str, Any]]]],
+) -> bool:
+    if not fn_name:
+        return False
+    if fn_name == ep:
+        return True
+    functions = dag.get("functions") or {}
+    rec = functions.get(ep) or {}
+    ep_plain = str(rec.get("name") or ep.rpartition("#")[2])
+    if fn_name != ep_plain:
+        return False
+    defs = by_name.get(ep_plain) or []
+    if len(defs) <= 1:
+        return True
+    ep_file = str(rec.get("file") or (ep.partition("#")[0] if "#" in ep else "")).replace("\\", "/")
+    norm_file = fn_file.replace("\\", "/") if fn_file and fn_file != "unknown" else ""
+    if norm_file and ep_file:
+        return norm_file.endswith(ep_file) or ep_file.endswith(norm_file)
+    return [k for k, r in defs if r.get("module") == module] == [ep]
+
+
+def _entry_callee_closure(
+    ep: str,
+    module: str,
+    dag: dict[str, Any],
+    by_name: dict[str, list[tuple[str, dict[str, Any]]]],
+) -> tuple[set[str], set[str]]:
+    """Transitive DAG keys and function names reachable from `ep` across direct and indirect callee edges."""
+    functions = dag.get("functions") or {}
+    reached_keys: set[str] = set()
+    reached_names: set[str] = set()
+    work: list[str] = [ep]
+    while work:
+        cur = work.pop()
+        if cur in reached_keys:
+            continue
+        if isinstance(functions.get(cur), dict):
+            recs = [(cur, functions[cur])]
+        else:
+            all_recs = by_name.get(cur) or []
+            same_mod = [kr for kr in all_recs if kr[1].get("module") == module]
+            recs = same_mod or all_recs
+            if not recs:
+                reached_names.add(cur)
+                continue
+        for key, rec in recs:
+            if key in reached_keys:
+                continue
+            reached_keys.add(key)
+            plain = str(rec.get("name") or key.rpartition("#")[2])
+            reached_names.add(key)
+            reached_names.add(plain)
+            for edge_field in ("internal_callees", "callees", "indirect_callees"):
+                for callee in rec.get(edge_field) or []:
+                    if isinstance(callee, str) and callee not in reached_keys:
+                        work.append(callee)
+    return reached_keys, reached_names
+
+
+def _candidate_roots(*paths: Path | None) -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for base in (Path("."), *paths):
+        if base is None:
+            continue
+        cur = Path(base)
+        for cand in (cur, cur.parent, cur.parent.parent, cur.parent.parent.parent):
+            key = str(cand)
+            if key not in seen:
+                seen.add(key)
+                roots.append(cand)
+    return roots
+
+
+def _artifact_first_byte(raw_path: object, roots: list[Path]) -> int | None:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    rel = Path(raw_path.strip())
+    candidates = [rel] if rel.is_absolute() else [rel, *(r / rel for r in roots)]
+    for cand in candidates:
+        if not cand.is_file():
+            continue
+        try:
+            with cand.open("rb") as fh:
+                first = fh.read(1)
+            return first[0] if first else None
+        except OSError:
+            continue
+    return None
+
+
+def _reproducible_fuzz_artifacts(fuzz_report: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_list: list[Any] = []
+    top = fuzz_report.get("artifacts")
+    if isinstance(top, list) and top:
+        raw_list.extend(top)
+    elif isinstance(fuzz_report.get("engines"), dict):
+        for eng_val in fuzz_report["engines"].values():
+            if isinstance(eng_val, dict) and isinstance(eng_val.get("artifacts"), list):
+                raw_list.extend(eng_val["artifacts"])
+    out: list[dict[str, Any]] = []
+    for art in raw_list:
+        if not isinstance(art, dict) or art.get("reproducible") is False:
+            continue
+        kind = art.get("kind")
+        if isinstance(kind, str) and kind and kind not in ("crash", "leak"):
+            continue
+        out.append(art)
+    return out
+
+
+def _single_case_target(case: dict[str, Any]) -> str:
+    if case.get("kind") != "single":
+        return ""
+    for field in ("entry", "function"):
+        val = case.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    calls = case.get("calls")
+    if isinstance(calls, list) and len(calls) == 1 and isinstance(calls[0], str) and calls[0].strip():
+        return calls[0].strip()
+    return ""
+
+
+def _crashed_entry_points(
+    module: str,
+    candidates: list[str],
+    dag: dict[str, Any],
+    sidecar: dict[str, Any],
+    fuzz_dir: Path | None,
+    roots: list[Path],
+) -> list[str]:
+    if not candidates or fuzz_dir is None:
+        return []
+    try:
+        fuzz_report = load_json_optional(Path(fuzz_dir) / f"{module}.json", None)
+    except (ArtifactError, OSError, ValueError):
+        return []
+    if not isinstance(fuzz_report, dict):
+        return []
+    artifacts = _reproducible_fuzz_artifacts(fuzz_report)
+    if not artifacts:
+        return []
+
+    by_name = _functions_by_name(dag)
+    n_cases_raw = sidecar.get("dispatch_case_count")
+    n_cases = n_cases_raw if isinstance(n_cases_raw, int) and not isinstance(n_cases_raw, bool) else 0
+    raw_cases = sidecar.get("api_cases")
+    api_cases = raw_cases if isinstance(raw_cases, list) and n_cases > 0 else []
+
+    closures: dict[str, tuple[set[str], set[str]]] = {}
+    proven: set[str] = set()
+    for ep in candidates:
+        for art in artifacts:
+            raw_failure = art.get("failure")
+            if not isinstance(raw_failure, dict):
+                attr = art.get("attribution")
+                raw_failure = attr.get("failure") if isinstance(attr, dict) else None
+            failure = raw_failure if isinstance(raw_failure, dict) else None
+            failure_fn = _normalize_failure_fn(failure.get("function") if failure else None)
+            failure_file = str(failure.get("file") or "") if failure else ""
+            frames = _extract_failure_frames(art, failure)
+
+            # Case 1: direct crash in `ep` or any recorded stack frame naming `ep`.
+            if _fn_matches_entry(failure_fn, failure_file, ep, module, dag, by_name) or any(
+                _fn_matches_entry(f_fn, f_file, ep, module, dag, by_name) for f_fn, f_file in frames
+            ):
+                proven.add(ep)
+                break
+
+            # Case 2: dispatch harness `single` case targeting `ep` that crashed in `ep` or its callee.
+            if not api_cases:
+                continue
+            first_byte = _artifact_first_byte(art.get("artifact") or art.get("path"), roots)
+            if first_byte is None:
+                continue
+            idx = first_byte % n_cases
+            if not (0 <= idx < len(api_cases)) or not isinstance(api_cases[idx], dict):
+                continue
+            case = api_cases[idx]
+            target_fn = _single_case_target(case)
+            if not _fn_matches_entry(target_fn, "", ep, module, dag, by_name):
+                continue
+            if failure_fn:
+                if ep not in closures:
+                    closures[ep] = _entry_callee_closure(ep, module, dag, by_name)
+                c_keys, c_names = closures[ep]
+                in_closure = any(
+                    _fn_matches_entry(failure_fn, failure_file, k, module, dag, by_name) for k in c_keys
+                ) or (failure_fn in c_names and not by_name.get(failure_fn))
+                if in_closure:
+                    proven.add(ep)
+                    break
+            elif not case.get("inits"):
+                proven.add(ep)
+                break
+    return sorted(proven)
+
+
+def _load_module_sidecar(module: str, mm: ModuleMap, harnesses_dir: Path | None) -> dict[str, Any]:
+    if harnesses_dir is not None:
+        try:
+            loaded = load_json_optional(Path(harnesses_dir) / f"harness_{module}.json", None)
+        except (ArtifactError, OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            return loaded
+    in_map = mm.sidecars.get(module)
+    if isinstance(in_map, dict) and in_map:
+        return in_map
+    try:
+        fallback = load_json_optional(DEFAULT_HARNESS_DIR / f"harness_{module}.json", None)
+    except (ArtifactError, OSError, ValueError):
+        fallback = None
+    return fallback if isinstance(fallback, dict) else {}
+
+
+def check_dynamic(
+    module: str,
+    dag: dict[str, Any],
+    mm: ModuleMap,
+    coverage: dict[str, Any],
+    fuzz_dir: Path | None = None,
+    harnesses_dir: Path | None = None,
+    *,
+    harness_dir: Path | None = None,
+    static_gaps: set[str] | list[str] | None = None,
+) -> dict[str, Any]:
     """
     The dynamic reach row of a harness module: its gate entry points the corpus never executed, minus
-    those its sidecar exempts. An entry point the coverage build does not list (a header inline
-    function no translation unit instantiated) counts as never executed.
+    those its sidecar exempts or that reproducible fuzz crashes already proved executed. An entry point
+    the coverage build does not list (a header inline function no translation unit instantiated) counts
+    as never executed unless proven by a fuzz crash.
     """
-    sidecar = mm.sidecars.get(module) or {}
+    resolved_hdir = harnesses_dir if harnesses_dir is not None else harness_dir
+    sidecar = _load_module_sidecar(module, mm, resolved_hdir)
     raw = sidecar.get("reach_exempt")
     exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
     match = exemption_matcher(exempt, dag.get("functions") or {})
+    static_gap_set = set(static_gaps) if static_gaps is not None else set()
     runs = _executions(coverage)
     executed: dict[str, int] = {}
-    never: list[str] = []
+    unexecuted: list[str] = []
     for e in _module_entries(module, dag, mm):
         n = _entry_executions(e, dag, runs) or 0
         executed[e] = n
         if not n and match(e) is None:
-            never.append(e)
+            unexecuted.append(e)
+    crash_candidates = [e for e in unexecuted if e not in static_gap_set]
+    crashed = _crashed_entry_points(
+        module,
+        crash_candidates,
+        dag,
+        sidecar,
+        fuzz_dir,
+        _candidate_roots(fuzz_dir, resolved_hdir or DEFAULT_HARNESS_DIR),
+    )
+    crashed_set = set(crashed)
+    never = [e for e in unexecuted if e not in crashed_set]
     row: dict[str, Any] = {
         "module": module,
         "mode": "dynamic",
         "coverage_status": coverage.get("status"),
         "corpus_inputs": (coverage.get("inputs") or {}).get("replayed"),
         "entry_points": len(executed),
-        "entry_points_executed": sum(1 for n in executed.values() if n),
+        "entry_points_executed": sum(1 for n in executed.values() if n) + len(crashed),
+        "crashed_entry_points": crashed,
         "executions": dict(sorted(executed.items())),
         "gaps": never,
         "passed": not never,
@@ -819,11 +1105,39 @@ def partial_coverage_reason(coverage: dict[str, Any]) -> str | None:
     return f"partial coverage: {missing} of {total or '?'} inputs not replayed"
 
 
-def run_dynamic(dag_path: Path, harness_dir: Path, modules: list[str], coverage_dir: Path) -> dict[str, Any]:
+def _static_gaps_by_module(dag_path: Path) -> dict[str, set[str]]:
+    try:
+        static_doc = load_json_optional(dag_path.parent / "harness_reach.json", None)
+    except (ArtifactError, OSError, ValueError):
+        return {}
+    if not isinstance(static_doc, dict) or not isinstance(static_doc.get("modules"), list):
+        return {}
+    out: dict[str, set[str]] = {}
+    for row in static_doc["modules"]:
+        if not isinstance(row, dict) or str(row.get("error") or "").startswith("dynamic:"):
+            continue
+        mod = row.get("module")
+        gaps = row.get("gaps")
+        if isinstance(mod, str) and isinstance(gaps, list) and gaps:
+            out[mod] = {g for g in gaps if isinstance(g, str)}
+    return out
+
+
+def run_dynamic(
+    dag_path: Path,
+    harness_dir: Path = DEFAULT_HARNESS_DIR,
+    modules: list[str] | None = None,
+    coverage_dir: Path = COVERAGE_DIR,
+    fuzz_dir: Path | None = None,
+    *,
+    harnesses_dir: Path | None = None,
+) -> dict[str, Any]:
+    resolved_hdir = harnesses_dir if harnesses_dir is not None else harness_dir
     dag = load_json_strict(dag_path)
     if not isinstance(dag, dict):
         raise ValueError(f"{dag_path}: not a call-graph DAG object")
-    mm = ModuleMap(dag, load_sidecars(harness_dir))
+    mm = ModuleMap(dag, load_sidecars(resolved_hdir))
+    static_gaps = _static_gaps_by_module(dag_path)
     rows: list[dict[str, Any]] = []
     for module in modules or sorted(mm.sidecars):
         cov = load_json_optional(coverage_dir / f"{module}.json", None)
@@ -831,12 +1145,26 @@ def run_dynamic(dag_path: Path, harness_dir: Path, modules: list[str], coverage_
             status = cov.get("status") if isinstance(cov, dict) else "missing"
             rows.append({"module": module, "mode": "dynamic", "passed": None, "error": f"no coverage ({status})"})
             continue
-        row = check_dynamic(module, dag, mm, cov)
+        row = check_dynamic(
+            module,
+            dag,
+            mm,
+            cov,
+            fuzz_dir=fuzz_dir,
+            harnesses_dir=resolved_hdir,
+            static_gaps=static_gaps.get(module),
+        )
         if (reason := partial_coverage_reason(cov)) is not None:
             # Keep what was measured for the reader; the gaps are only a lower bound and decide nothing.
             row.update(passed=None, error=reason, gaps_lower_bound=row.pop("gaps"))
         rows.append(row)
-    return {"generated_at": utc_now(), "dag": str(dag_path).replace("\\", "/"), "modules": rows}
+    crashed_total = sum(len(r.get("crashed_entry_points") or []) for r in rows if r.get("passed") is not None)
+    return {
+        "generated_at": utc_now(),
+        "dag": str(dag_path).replace("\\", "/"),
+        "entry_points_crashed": crashed_total,
+        "modules": rows,
+    }
 
 
 def record_dynamic(
@@ -878,7 +1206,12 @@ def record_dynamic(
             else:
                 unmeasured.pop(row["module"], None)
                 by_module[row["module"]] = measured[row["module"]]
-        doc: dict[str, Any] = {"generated_at": report["generated_at"], "modules": dict(sorted(by_module.items()))}
+        crashed_total = sum(len(m.get("crashed_entry_points") or []) for m in by_module.values() if isinstance(m, dict))
+        doc: dict[str, Any] = {
+            "generated_at": report["generated_at"],
+            "entry_points_crashed": crashed_total,
+            "modules": dict(sorted(by_module.items())),
+        }
         if unmeasured:
             doc["unmeasured"] = dict(sorted(unmeasured.items()))
         problem = schema_warning("harness_reach_dynamic", doc)  # R5: recorded, `validate_artifacts run-dir` fails on it
@@ -893,7 +1226,7 @@ def record_dynamic(
     _restore_static_gate(run_dir, cleared, out, dag_path, harness_dir)
 
 
-DYNAMIC_GAP_ERROR = "dynamic: entry points never executed by the corpus"
+DYNAMIC_GAP_ERROR = phase0_gates.DYNAMIC_GAP_ERROR
 
 
 def _restore_static_gate(
@@ -968,16 +1301,16 @@ def apply_dynamic(
     report["passed"] = all(r.get("passed") for r in report["modules"])
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Phase 0 harness reachability gate.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_check = sub.add_parser("check", help="Gate every harnessed module against its DAG entry points")
     p_check.add_argument("--dag", type=Path, default=DEFAULT_DAG)
-    p_check.add_argument("--harness-dir", type=Path, default=DEFAULT_HARNESS_DIR)
+    p_check.add_argument("--harness-dir", "--harnesses", dest="harness_dir", type=Path, default=DEFAULT_HARNESS_DIR)
     p_check.add_argument("--module", action="append", default=[], help="Limit to this module (repeatable)")
     p_check.add_argument("--out", type=Path, default=DEFAULT_OUT, help="Report path ('-' for stdout only)")
     p_ex = sub.add_parser("exempt", help="Record why an entry point cannot be harnessed")
-    p_ex.add_argument("--harness-dir", type=Path, default=DEFAULT_HARNESS_DIR)
+    p_ex.add_argument("--harness-dir", "--harnesses", dest="harness_dir", type=Path, default=DEFAULT_HARNESS_DIR)
     p_ex.add_argument("--dag", type=Path, default=DEFAULT_DAG, help="To place a link unit's exemption")
     p_ex.add_argument("--module", required=True)
     p_ex.add_argument(
@@ -989,15 +1322,21 @@ def main(argv: list[str] | None = None) -> int:
     p_ex.add_argument("--reason", required=True)
     p_dyn = sub.add_parser("dynamic", help="Reopen the gate for entry points the corpus never executed")
     p_dyn.add_argument("--dag", type=Path, default=DEFAULT_DAG)
-    p_dyn.add_argument("--harness-dir", type=Path, default=DEFAULT_HARNESS_DIR)
+    p_dyn.add_argument("--harness-dir", "--harnesses", dest="harness_dir", type=Path, default=DEFAULT_HARNESS_DIR)
     p_dyn.add_argument("--coverage-dir", type=Path, default=COVERAGE_DIR)
+    p_dyn.add_argument("--fuzz-dir", type=Path, default=FUZZ_DIR)
     p_dyn.add_argument("--module", action="append", default=[], help="Harness module (repeatable; default all)")
     p_dyn.add_argument("--out", type=Path, default=DEFAULT_DYNAMIC_OUT)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     try:
         if args.cmd == "dynamic":
-            dyn = run_dynamic(args.dag, args.harness_dir, args.module, args.coverage_dir)
+            dyn = run_dynamic(args.dag, args.harness_dir, args.module, args.coverage_dir, fuzz_dir=args.fuzz_dir)
             record_dynamic(Path("."), dyn, args.out, dag_path=args.dag, harness_dir=args.harness_dir)
             print(json.dumps(dyn, indent=2))
             if any(r.get("passed") is None for r in dyn["modules"]):

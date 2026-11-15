@@ -1,8 +1,9 @@
 {
-  "$comment": "Contract for workspace/reports/harness_reach_dynamic.json, written by scripts/harness_reach.py dynamic (record_dynamic): per harness module, the gate's entry points the fuzz corpus executed (from the coverage report) and those it never did (`gaps`), with the digest of the harness measured. Rows merge across runs; a module whose coverage was missing or unusable, or left inputs unreplayed (`inputs.not_replayed` > 0), gets no row (an earlier row is dropped), only its reason under `unmeasured` (dropped once it is measured). harness_reach.py check (apply_dynamic) keeps a gap failing while the harness digest is unchanged.",
+  "$comment": "Contract for workspace/reports/harness_reach_dynamic.json, written by scripts/harness_reach.py dynamic (record_dynamic): per harness module, the gate's entry points the fuzz corpus executed (from the coverage report or reproducible fuzz crash artifacts) and those it never did (`gaps`), with the digest of the harness measured. Rows merge across runs; a module whose coverage was missing or unusable, or left inputs unreplayed (`inputs.not_replayed` > 0), gets no row (an earlier row is dropped), only its reason under `unmeasured` (dropped once it is measured). harness_reach.py check (apply_dynamic) keeps a gap failing while the harness digest is unchanged.",
   "type": "object",
   "properties": {
     "generated_at": {"type": "string", "minLength": 1},
+    "entry_points_crashed": {"$comment": "total entry points across measured modules proven executed via reproducible fuzz crashes", "type": "integer", "minimum": 0},
     "unmeasured": {"$comment": "module -> why its coverage could not be measured (run_dynamic's error)", "type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
     "warnings": {"$comment":"schema problems the producer recorded (validate_artifacts.schema_warning); run-dir fails on them", "type": "array", "items": {"type": "string"}},
     "modules": {
@@ -16,6 +17,7 @@
           "corpus_inputs": {"type": ["integer", "null"], "minimum": 0},
           "entry_points": {"type": "integer", "minimum": 0},
           "entry_points_executed": {"type": "integer", "minimum": 0},
+          "crashed_entry_points": {"$comment": "entry points with 0 coverage counts proven executed by reproducible fuzz crash artifacts", "type": "array", "items": {"type": "string", "minLength": 1}},
           "executions": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
           "gaps": {"type": "array", "items": {"type": "string", "minLength": 1}},
           "failed_inputs": {"$comment": "inputs that crashed the coverage replay when every input was replayed (inputs.failed); the reach stands", "type": "integer", "minimum": 1},
