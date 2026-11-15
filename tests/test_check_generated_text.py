@@ -341,6 +341,30 @@ class TestHook:
         code, message = cgt.run_hook(json.dumps(payload), root=tmp_path, allowlist=tmp_path / "none")
         assert code == 2 and "[crlf]" in message
 
+    def test_a_relative_name_follows_the_directory_the_command_changed_to(self, tmp_path: Path) -> None:
+        """An agent in another worktree: `cd <worktree>; pytest tests/x.py` names that worktree's file."""
+        _write(tmp_path, "tests/x.sh", "echo hi\r\n")  # the session directory's copy has a CRLF
+        other = tmp_path / "wt" / "other"
+        _write(other, "tests/x.sh", "echo hi\n")
+        for chdir in ("cd", "Set-Location", "pushd"):
+            command = f"{chdir} '{other}'; sh tests/x.sh"
+            payload = {"tool_name": "PowerShell", "tool_input": {"command": command}, "cwd": str(tmp_path)}
+            assert cgt.run_hook(json.dumps(payload), root=tmp_path, allowlist=tmp_path / "none") == (0, "")
+        payload = {"tool_name": "Bash", "tool_input": {"command": "sh tests/x.sh"}, "cwd": str(tmp_path)}
+        assert cgt.run_hook(json.dumps(payload), root=tmp_path, allowlist=tmp_path / "none")[0] == 2
+
+    def test_a_file_in_a_worktree_matches_the_allowlist_by_its_own_checkout_path(self, tmp_path: Path) -> None:
+        allow = _write(tmp_path, "a.allow", "tests/fixture.sh crlf -- a deliberate CRLF fixture\n")
+        worktree = tmp_path / ".claude" / "worktrees" / "wt"
+        _write(worktree, ".git", "gitdir: elsewhere\n")
+        fixture = _write(worktree, "tests/fixture.sh", "echo hi\r\n")
+        other = _write(worktree, "tests/other.sh", "echo hi\r\n")
+        payload = {"tool_name": "Edit", "tool_input": {"file_path": str(fixture)}, "cwd": str(tmp_path)}
+        assert cgt.run_hook(json.dumps(payload), root=tmp_path, allowlist=allow) == (0, "")
+        payload["tool_input"] = {"file_path": str(other)}
+        code, message = cgt.run_hook(json.dumps(payload), root=tmp_path, allowlist=allow)
+        assert code == 2 and ".claude/worktrees/wt/tests/other.sh:1: [crlf]" in message
+
     def test_recently_modified_dirty_files_count_as_touched_by_a_shell_command(self, tmp_path: Path) -> None:
         subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
         _write(tmp_path, "gen/x.h", "/*@ requires valid(p); */\n")
