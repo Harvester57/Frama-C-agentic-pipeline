@@ -77,7 +77,12 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
 )
-from generate_harness import _include_dirs_from_cppflags, _strip_c_comments  # noqa: E402
+from generate_harness import (  # noqa: E402
+    DISPATCH_SKIP_FN,
+    TARGET_EMBEDDED_PREFIX,
+    _include_dirs_from_cppflags,
+    _strip_c_comments,
+)
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 
 DEFAULT_DAG = Path("workspace/reports/callgraph_dag.json")
@@ -721,8 +726,20 @@ FUZZ_DIR = Path("workspace/reports/fuzz")
 DEFAULT_FUZZ_DIR = FUZZ_DIR
 DEFAULT_HARNESSES = DEFAULT_HARNESS_DIR
 _COVERAGE_OK = ("ok", "partial")
-_UNKNOWN_FAILURE_FNS = frozenset({"", "unknown", "unknown_function", "LLVMFuzzerTestOneInput", "main"})
-_FRAME_IN_FN_RE = re.compile(r"\bin\s+([A-Za-z_]\w*)\b(?:\s+(\S+?)(?::\d+)?)?")
+_UNKNOWN_FAILURE_FNS = frozenset({"", "unknown", "unknown_function"})
+# Harness code: a failure here happened before or around the call of an entry point, never in one.
+_HARNESS_FAILURE_FNS = frozenset({"LLVMFuzzerTestOneInput", "main", DISPATCH_SKIP_FN})
+# E-ACSL wraps a function that has a contract in `__gen_e_acsl_<fn>`: it checks the preconditions (and
+# evaluates `\old`), calls `<fn>`, then checks the postconditions. Callers call the wrapper. The
+# runtime names a contract failure by the source name (`.fct = "<fn>"`, kind Precondition or
+# Postcondition); a crash inside the wrapper itself shows the wrapper's name.
+_EACSL_WRAPPER_PREFIX = "__gen_e_acsl_"
+# A frame of a sanitizer or libFuzzer stack (run_eacsl_fuzz._STACK_FRAME_RE), for C function names
+# only: `in fuzzer::Fuzzer::...` is not the function `fuzzer`.
+_STACK_FRAME_RE = re.compile(
+    r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_]\w*)(?![\w:])(?:\s+(?P<file>[^\s():]+):\d+)?"
+)
+_CRASH_NOTES_MAX = 20
 
 
 def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str]:
@@ -768,36 +785,66 @@ def _entry_executions(key: str, dag: dict[str, Any], runs: dict[str, list[tuple[
 
 
 def _normalize_failure_fn(raw: object) -> str:
+    """The source name a failure function stands for ("" when unknown); harness names stay as they are."""
     if not isinstance(raw, str):
         return ""
-    name = raw.strip()
-    if name.startswith("__gen_e_acsl_"):
-        name = name[len("__gen_e_acsl_") :]
+    name = raw.strip().removeprefix(_EACSL_WRAPPER_PREFIX)
     return "" if name in _UNKNOWN_FAILURE_FNS else name
 
 
-def _extract_failure_frames(art: dict[str, Any], failure: dict[str, Any] | None) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for source in (failure, art):
-        frames = source.get("frames") if isinstance(source, dict) else None
-        if not isinstance(frames, list):
-            continue
-        for item in frames:
-            if isinstance(item, dict):
-                fn = _normalize_failure_fn(item.get("function") or item.get("fn") or item.get("name"))
-                if fn:
-                    out.append((fn, str(item.get("file") or "")))
-            elif isinstance(item, str):
-                m = _FRAME_IN_FN_RE.search(item)
-                if m:
-                    fn = _normalize_failure_fn(m.group(1))
-                    if fn:
-                        out.append((fn, m.group(2) or ""))
-                elif _IDENT_RE.fullmatch(item.strip()):
-                    fn = _normalize_failure_fn(item.strip())
-                    if fn:
-                        out.append((fn, ""))
-    return out
+def _is_harness_function(name: str) -> bool:
+    return name in _HARNESS_FAILURE_FNS or name.startswith(TARGET_EMBEDDED_PREFIX)
+
+
+def _artifact_failure(art: dict[str, Any], frames: list[tuple[str, str]]) -> tuple[str, str, bool, bool]:
+    """
+    (function, file, in_harness, before_body) of an artifact's failure (its own, else the sanitizer
+    replay's attribution). `function` is the source name, "" when unknown. `in_harness`: the failure is
+    in the harness's own code (`LLVMFuzzerTestOneInput`, the runtime skip helper, an embedded target
+    fuzzer hook, or a `harness_*` file), so no entry point was running. `before_body`: the failure may be
+    in the E-ACSL wrapper of `function` before it called the body: a Precondition; any other failure
+    but a Postcondition reported in `__gen_e_acsl_<function>`; or one reported under the source name
+    (the wrapper's own RTE checks, e.g. `\\initialized` of a formal before the call, carry
+    `.fct = "<function>"`) while the replay's stack (`frames`) holds the wrapper and no frame of the
+    body. The wrapper's checks before the call cannot be told from those after it, so none counts.
+    """
+    raw = art.get("failure")
+    if not isinstance(raw, dict):
+        attr = art.get("attribution")
+        raw = attr.get("failure") if isinstance(attr, dict) else None
+    if not isinstance(raw, dict):
+        return "", "", False, False
+    raw_fn = str(raw.get("function") or "").strip()
+    file_ = str(raw.get("file") or "")
+    kind = str(raw.get("kind") or "").strip().lower()
+    in_harness = _is_harness_function(raw_fn) or Path(file_.replace("\\", "/")).name.startswith("harness_")
+    fn = _normalize_failure_fn(raw_fn)
+    on_stack = {f for f, _ in frames}
+    in_wrapper = raw_fn.startswith(_EACSL_WRAPPER_PREFIX) or (
+        bool(fn) and _EACSL_WRAPPER_PREFIX + fn in on_stack and fn not in on_stack
+    )
+    before_body = kind == "precondition" or (in_wrapper and kind != "postcondition")
+    return fn, file_, in_harness, before_body
+
+
+def _artifact_frames(art: dict[str, Any]) -> list[tuple[str, str]]:
+    """
+    (function, file) of every stack frame the artifact's replay printed: the `frames` a campaign records
+    (run_eacsl_fuzz.stack_frames), else those in `replay_log_tail` (reports written before `frames`;
+    the tail keeps the last 3000 characters, so inner frames may be missing). Names stay exact: a
+    `__gen_e_acsl_<fn>` frame is E-ACSL's wrapper, which proves its caller ran, not `<fn>`.
+    """
+    frames = art.get("frames")
+    if isinstance(frames, list) and frames:
+        return [
+            (f["function"], str(f.get("file") or ""))
+            for f in frames
+            if isinstance(f, dict) and isinstance(f.get("function"), str)
+        ]
+    tail = art.get("replay_log_tail")
+    if not isinstance(tail, str):
+        return []
+    return [(m.group("function"), m.group("file") or "") for m in _STACK_FRAME_RE.finditer(tail)]
 
 
 def _fn_matches_entry(
@@ -908,7 +955,8 @@ def _reproducible_fuzz_artifacts(fuzz_report: dict[str, Any]) -> list[dict[str, 
                 raw_list.extend(eng_val["artifacts"])
     out: list[dict[str, Any]] = []
     for art in raw_list:
-        if not isinstance(art, dict) or art.get("reproducible") is False:
+        # Only a replay that reproduced the crash: a missing or null verdict (not replayed) is not one.
+        if not isinstance(art, dict) or art.get("reproducible") is not True:
             continue
         kind = art.get("kind")
         if isinstance(kind, str) and kind and kind not in ("crash", "leak"):
@@ -930,6 +978,54 @@ def _single_case_target(case: dict[str, Any]) -> str:
     return ""
 
 
+def _case_count(raw: object) -> int | None:
+    """A dispatch case count as the sidecar and the fuzz report record it; None for no dispatch."""
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else None
+
+
+def _artifact_identity_problem(
+    art: dict[str, Any],
+    stamped_report: bool,
+    legacy_problem: str | None,
+    harness_digest: str | None,
+    n_cases: int | None,
+    first_byte: int | None,
+) -> str | None:
+    """
+    Why a crash artifact cannot speak for the current harness, or None. A stamped artifact must carry
+    the current `harness_digest` and `dispatch_case_count` (run_eacsl_fuzz.stamp_harness_identity).
+    Its own count only explains the mismatch: the case its first byte selected then and selects now.
+    An artifact without them counts only in a report written before the fields existed and after the
+    harness last changed (`legacy_problem` is None).
+    """
+    if "harness_digest" in art and "dispatch_case_count" in art:
+        found_n = _case_count(art.get("dispatch_case_count"))
+        if found_n != n_cases:
+
+            def _under(n: int | None) -> str:
+                if n is None:
+                    return "a harness without dispatch cases"
+                case = f", case {first_byte % n}" if first_byte is not None else ""
+                return f"{n} dispatch cases{case}"
+
+            return f"found under {_under(found_n)}; the harness now has {_under(n_cases)}"
+        if harness_digest is None or art.get("harness_digest") != harness_digest:
+            return "found under another harness (harness_digest differs)"
+        return None
+    if stamped_report:
+        return "carried over from an earlier campaign without a harness digest"
+    return legacy_problem
+
+
+def _in_closure(
+    fn: str, fn_file: str, closure: tuple[set[str], set[str]], module: str, dag: dict[str, Any], by_name: dict
+) -> bool:
+    keys, names = closure
+    return any(_fn_matches_entry(fn, fn_file, k, module, dag, by_name) for k in keys) or (
+        fn in names and not by_name.get(fn)
+    )
+
+
 def _crashed_entry_points(
     module: str,
     candidates: list[str],
@@ -937,72 +1033,127 @@ def _crashed_entry_points(
     sidecar: dict[str, Any],
     fuzz_dir: Path | None,
     roots: list[Path],
-) -> list[str]:
+    *,
+    harness_digest: str | None = None,
+    harness_file: Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """
+    The `candidates` that reproducible crashes of the module's fuzz report prove executed under the
+    current harness, and notes on the crashes that proved nothing (for the dynamic row's `crash_notes`).
+
+    Only an artifact found under the current harness (`_artifact_identity_problem`) counts. It proves an
+    entry point ran when:
+
+    - a frame of its replay's stack is the entry point (`_artifact_frames`; exact names);
+    - its failure is in the entry point itself, after the body started (not an E-ACSL precondition or
+      wrapper failure, `_artifact_failure`);
+    - its input selects a `single` dispatch case of the entry point (first byte modulo the current case
+      count) and the failure is in the entry's callee closure but in none of the case's init helpers'
+      closures (they run before the entry), or the failure is unknown and the case has no init helper.
+      A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
+      only the first two kinds of evidence credit it.
+
+    A failure in the harness's own code (`LLVMFuzzerTestOneInput`, a `harness_*` file) credits nothing.
+    """
     if not candidates or fuzz_dir is None:
-        return []
+        return [], []
+    report_path = Path(fuzz_dir) / f"{module}.json"
     try:
-        fuzz_report = load_json_optional(Path(fuzz_dir) / f"{module}.json", None)
+        fuzz_report = load_json_optional(report_path, None)
     except (ArtifactError, OSError, ValueError):
-        return []
+        return [], []
     if not isinstance(fuzz_report, dict):
-        return []
+        return [], []
     artifacts = _reproducible_fuzz_artifacts(fuzz_report)
     if not artifacts:
-        return []
+        return [], []
 
     by_name = _functions_by_name(dag)
-    n_cases_raw = sidecar.get("dispatch_case_count")
-    n_cases = n_cases_raw if isinstance(n_cases_raw, int) and not isinstance(n_cases_raw, bool) else 0
+    n_cases = _case_count(sidecar.get("dispatch_case_count"))
     raw_cases = sidecar.get("api_cases")
-    api_cases = raw_cases if isinstance(raw_cases, list) and n_cases > 0 else []
+    api_cases = raw_cases if isinstance(raw_cases, list) and n_cases else []
+    stamped_report = "harness_digest" in fuzz_report
+    legacy_problem: str | None = None
+    if not stamped_report:
+        try:
+            if harness_file is None or report_path.stat().st_mtime <= Path(harness_file).stat().st_mtime:
+                legacy_problem = "the fuzz report has no harness digest and is older than the harness"
+        except OSError:
+            legacy_problem = "the fuzz report has no harness digest and the harness file cannot be read"
 
     closures: dict[str, tuple[set[str], set[str]]] = {}
-    proven: set[str] = set()
-    for ep in candidates:
-        for art in artifacts:
-            raw_failure = art.get("failure")
-            if not isinstance(raw_failure, dict):
-                attr = art.get("attribution")
-                raw_failure = attr.get("failure") if isinstance(attr, dict) else None
-            failure = raw_failure if isinstance(raw_failure, dict) else None
-            failure_fn = _normalize_failure_fn(failure.get("function") if failure else None)
-            failure_file = str(failure.get("file") or "") if failure else ""
-            frames = _extract_failure_frames(art, failure)
 
-            # Case 1: direct crash in `ep` or any recorded stack frame naming `ep`.
-            if _fn_matches_entry(failure_fn, failure_file, ep, module, dag, by_name) or any(
-                _fn_matches_entry(f_fn, f_file, ep, module, dag, by_name) for f_fn, f_file in frames
+    def closure(fn: str) -> tuple[set[str], set[str]]:
+        if fn not in closures:
+            closures[fn] = _entry_callee_closure(fn, module, dag, by_name)
+        return closures[fn]
+
+    proven: set[str] = set()
+    notes: list[str] = []
+    for art in artifacts:
+        if len(proven) == len(candidates):
+            break
+        raw_path = art.get("artifact") or art.get("path")
+        name = Path(str(raw_path)).name if raw_path else "artifact"
+        first_byte = _artifact_first_byte(raw_path, roots)
+        problem = _artifact_identity_problem(
+            art, stamped_report, legacy_problem, harness_digest, n_cases, first_byte
+        )
+        if problem:
+            notes.append(f"{name}: not used ({problem})")
+            continue
+        frames = _artifact_frames(art)
+        fn, fn_file, in_harness, before_body = _artifact_failure(art, frames)
+        credited = False
+        for ep in candidates:
+            if ep in proven:
+                continue
+            in_body = bool(fn) and not in_harness and not before_body
+            if any(_fn_matches_entry(f, f_file, ep, module, dag, by_name) for f, f_file in frames) or (
+                in_body and _fn_matches_entry(fn, fn_file, ep, module, dag, by_name)
             ):
                 proven.add(ep)
-                break
-
-            # Case 2: dispatch harness `single` case targeting `ep` that crashed in `ep` or its callee.
-            if not api_cases:
-                continue
-            first_byte = _artifact_first_byte(art.get("artifact") or art.get("path"), roots)
-            if first_byte is None:
-                continue
-            idx = first_byte % n_cases
-            if not (0 <= idx < len(api_cases)) or not isinstance(api_cases[idx], dict):
-                continue
-            case = api_cases[idx]
-            target_fn = _single_case_target(case)
-            if not _fn_matches_entry(target_fn, "", ep, module, dag, by_name):
-                continue
-            if failure_fn:
-                if ep not in closures:
-                    closures[ep] = _entry_callee_closure(ep, module, dag, by_name)
-                c_keys, c_names = closures[ep]
-                in_closure = any(
-                    _fn_matches_entry(failure_fn, failure_file, k, module, dag, by_name) for k in c_keys
-                ) or (failure_fn in c_names and not by_name.get(failure_fn))
-                if in_closure:
-                    proven.add(ep)
-                    break
-            elif not case.get("inits"):
+                credited = True
+        if in_harness or not api_cases or first_byte is None or n_cases is None:
+            continue
+        idx = first_byte % n_cases
+        case = api_cases[idx] if idx < len(api_cases) and isinstance(api_cases[idx], dict) else {}
+        kind = str(case.get("kind") or "")
+        if kind in ("custom", "sequence"):
+            if credited or (fn and any(_fn_matches_entry(fn, fn_file, e, module, dag, by_name) for e in proven)):
+                continue  # this crash, or another, proved the entry point it shows: nothing unexplained
+            where = f"in {fn}" if fn else "at an unknown location"
+            notes.append(
+                f"{name}: {kind} case {idx} crashed {where}; a {kind} case is credited only for a failure "
+                "in the entry point itself or a frame of it"
+            )
+            continue
+        target = _single_case_target(case)
+        case_ep = next((e for e in candidates if _fn_matches_entry(target, "", e, module, dag, by_name)), None)
+        if case_ep is None or case_ep in proven:
+            continue
+        ep = case_ep
+        inits = [i.get("fn") if isinstance(i, dict) else i for i in case.get("inits") or []]
+        init_fns = [i for i in inits if isinstance(i, str) and i]
+        if not fn:
+            if not init_fns:
                 proven.add(ep)
-                break
-    return sorted(proven)
+            continue
+        if _fn_matches_entry(fn, fn_file, ep, module, dag, by_name) or not _in_closure(
+            fn, fn_file, closure(ep), module, dag, by_name
+        ):
+            continue  # in the entry itself only before its body ran (handled above), or outside it
+        shared = [i for i in init_fns if _in_closure(fn, fn_file, closure(i), module, dag, by_name)]
+        if shared:
+            notes.append(
+                f"{name}: single case {idx} ({target}) crashed in {fn}, which its init helper "
+                f"{', '.join(shared)} also reaches"
+            )
+            continue
+        proven.add(ep)
+    if len(notes) > _CRASH_NOTES_MAX:
+        notes = [*notes[:_CRASH_NOTES_MAX], f"... and {len(notes) - _CRASH_NOTES_MAX} more"]
+    return sorted(proven), notes
 
 
 def _load_module_sidecar(module: str, mm: ModuleMap, harnesses_dir: Path | None) -> dict[str, Any]:
@@ -1036,7 +1187,8 @@ def check_dynamic(
 ) -> dict[str, Any]:
     """
     The dynamic reach row of a harness module: its gate entry points the corpus never executed, minus
-    those its sidecar exempts or that reproducible fuzz crashes already proved executed. An entry point
+    those its sidecar exempts or that reproducible fuzz crashes of the current harness already proved
+    executed (`_crashed_entry_points`; `crash_notes` says why the others proved nothing). An entry point
     the coverage build does not list (a header inline function no translation unit instantiated) counts
     as never executed unless proven by a fuzz crash.
     """
@@ -1055,13 +1207,18 @@ def check_dynamic(
         if not n and match(e) is None:
             unexecuted.append(e)
     crash_candidates = [e for e in unexecuted if e not in static_gap_set]
-    crashed = _crashed_entry_points(
+    hdir = Path(resolved_hdir or DEFAULT_HARNESS_DIR)
+    # The run directory the harness directory lives in: the campaign stamps phase0_gates' digest of it.
+    run_dir = hdir.parent.parent if hdir.parts[-2:] == tuple(Path(DEFAULT_HARNESS_DIR).parts) else Path(".")
+    crashed, crash_notes = _crashed_entry_points(
         module,
         crash_candidates,
         dag,
         sidecar,
         fuzz_dir,
-        _candidate_roots(fuzz_dir, resolved_hdir or DEFAULT_HARNESS_DIR),
+        _candidate_roots(fuzz_dir, hdir),
+        harness_digest=phase0_gates.harness_digest(run_dir, module, ignore_exempt=True),
+        harness_file=hdir / f"harness_{module}.c",
     )
     crashed_set = set(crashed)
     never = [e for e in unexecuted if e not in crashed_set]
@@ -1077,6 +1234,9 @@ def check_dynamic(
         "gaps": never,
         "passed": not never,
     }
+    if crash_notes and never:
+        # Why the crashes of the fuzz report did not close these gaps.
+        row["crash_notes"] = crash_notes
     if failed_inputs := _input_count(coverage, "failed"):
         # Every input was replayed and only these crashed (crash candidates already): the reach stands.
         row["failed_inputs"] = failed_inputs

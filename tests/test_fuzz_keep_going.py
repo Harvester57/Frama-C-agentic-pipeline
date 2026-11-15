@@ -228,6 +228,7 @@ def test_unskippable_cases_end_the_rounds_with_a_reason_and_the_rest_runs_in_for
     # A current harness skips cases >= 64 like any other.
     calls.clear()
     masks.clear()
+    plan[1] = plan[1][1:]  # case 70 is skipped in round 2: only case 113 crashes
     plan[2] = []
     res = R.run_campaign_rounds(Path("bin0"), 600, campaign=campaign, rebuild=rebuild, n_cases=179)
     assert masks == [(1 << 5) | (1 << 70), (1 << 5) | (1 << 70) | (1 << 113)]
@@ -399,9 +400,29 @@ def test_candidate_engine_of_a_dual_report_is_the_artifact_engine(tmp_path):
 # --- zero-rebuild runtime dispatch-case skipping ---------------------------------------------
 
 
-def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
-    import os
+def _runtime_skip_harness(tmp_path: Path) -> Path:
+    """A 200-case dispatch harness of `hit_case(<case>)`, including "mod.h" by a relative name."""
+    from generate_harness import generate_module_harness
 
+    src = tmp_path / "mod.c"
+    src.write_text("int hit_case(unsigned int c) { return (int)c; }\n", encoding="utf-8")
+    (tmp_path / "mod.h").write_text("int hit_case(unsigned int c);\n", encoding="utf-8")
+    res = generate_module_harness(
+        module_name="mod",
+        sources=[str(src)],
+        header_include="mod.h",
+        entry_fn="hit_case",
+        max_input_size=64,
+        cppflags=f"-I{tmp_path.as_posix()}",
+        out_dir=tmp_path / "harnesses",
+        entry_style="dispatch",
+        dispatch_cases=[f"(void)hit_case({i}U);" for i in range(200)],
+        auto_prelude=False,
+    )
+    return Path(res["harness_file"])
+
+
+def test_runtime_skip_cases_marker(tmp_path):
     from generate_harness import generate_module_harness
 
     assert R.format_skip_cases_env([129, 0, 65, 300, 0]) == "0,65,129,300"
@@ -409,25 +430,7 @@ def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
     assert R.harness_supports_runtime_skip_cases(None) is False
 
     src = tmp_path / "mod.c"
-    src.write_text("int hit_case(unsigned int c) { return (int)c; }\n", encoding="utf-8")
-    hdr = tmp_path / "mod.h"
-    hdr.write_text("int hit_case(unsigned int c);\n", encoding="utf-8")
-
-    out_dir = tmp_path / "harnesses"
-    cases = [f"(void)hit_case({i}U);" for i in range(200)]
-    res = generate_module_harness(
-        module_name="mod",
-        sources=[str(src)],
-        header_include=str(hdr),
-        entry_fn="hit_case",
-        max_input_size=64,
-        cppflags=f"-I{tmp_path.as_posix()}",
-        out_dir=out_dir,
-        entry_style="dispatch",
-        dispatch_cases=cases,
-        auto_prelude=False,
-    )
-    harness_c = Path(res["harness_file"])
+    harness_c = _runtime_skip_harness(tmp_path)
     text = harness_c.read_text(encoding="utf-8")
     assert "#define FRAMAC_FUZZ_RUNTIME_SKIP_CASES 1" in text
     assert "framac_fuzz_skip_case(" in text
@@ -450,13 +453,22 @@ def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
     assert R.harness_supports_runtime_skip_cases(Path(plain["harness_file"])) is False
     assert R.harness_supports_runtime_skip_cases(_harness(tmp_path)) is False
 
-    cc = shutil.which("clang") or shutil.which("gcc")
-    if not cc:
-        return
 
+SKIP_ENV = "0, 65, 129, 300"
+
+
+def test_runtime_skip_cases_c_execution(tmp_path):
+    """
+    The generated harness skips exactly the cases FRAMAC_FUZZ_SKIP_CASES lists, compiled and run: with the
+    host's clang or gcc, else in the analysis image under FRAMAC_DOCKER_TESTS=1, else skipped (never a
+    silent pass).
+    """
+    import os
+
+    _runtime_skip_harness(tmp_path)
     driver = tmp_path / "driver.c"
     driver.write_text(
-        f'#include "{harness_c.as_posix()}"\n'
+        '#include "harnesses/harness_mod.c"\n'
         "#include <stdio.h>\n"
         "static int last_hit = -1;\n"
         "int hit_case(unsigned int c) { last_hit = (int)c; return (int)c; }\n"
@@ -478,18 +490,33 @@ def test_runtime_skip_cases_marker_and_c_execution(tmp_path):
         "}\n",
         encoding="utf-8",
     )
-    exe = tmp_path / "rt_skip_driver.exe"
-    proc = subprocess.run(
-        [cc, "-Wall", "-Werror", f"-I{tmp_path.as_posix()}", str(driver), "-o", str(exe)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    env = dict(os.environ)
-    env["FRAMAC_FUZZ_SKIP_CASES"] = "0, 65, 129, 300"
-    run = subprocess.run([str(exe)], env=env, capture_output=True, text=True, check=True)
-    lines = [ln.strip() for ln in run.stdout.splitlines() if ln.strip()]
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if cc:
+        exe = tmp_path / "rt_skip_driver.exe"
+        proc = subprocess.run(
+            [cc, "-Wall", "-Werror", f"-I{tmp_path.as_posix()}", str(driver), "-o", str(exe)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        env = dict(os.environ)
+        env["FRAMAC_FUZZ_SKIP_CASES"] = SKIP_ENV
+        stdout = subprocess.run([str(exe)], env=env, capture_output=True, text=True, check=True).stdout
+    else:
+        from conftest import ANALYSIS_IMAGE, require_docker_images
+
+        require_docker_images(ANALYSIS_IMAGE)  # skips without FRAMAC_DOCKER_TESTS=1
+        script = (
+            "cd /tmp && clang -Wall -Werror -I/fixture /fixture/driver.c -o drv"
+            f" && FRAMAC_FUZZ_SKIP_CASES='{SKIP_ENV}' timeout 60 ./drv"
+        )
+        argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro", ANALYSIS_IMAGE, script]
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+        stdout = proc.stdout
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip().startswith(("direct:", "case:"))]
+    assert len(lines) == 201, stdout[-2000:]
     assert lines[0] == "direct:1,1,1,1,0,0"
     for ln in lines[1:]:
         _, c_s, rc_s, hit_s = ln.split(":")
@@ -534,6 +561,120 @@ def test_runtime_skip_rounds_pass_env_with_zero_rebuilds(tmp_path):
     assert [r["skipped_cases"] for r in kg["rounds"]] == [[], [129], [5, 129]]
 
 
+@pytest.mark.parametrize("runtime_skip", [True, False])
+def test_a_crash_in_a_skipped_case_stops_the_rounds_with_an_error(tmp_path, runtime_skip):
+    # Round 2 runs with case 0 skipped and crashes in case 0 again: the skip did not take (QCBOR
+    # post-run review: the runtime skip without the environ shim stopped quietly after 0.4 s of 60).
+    calls: list = []
+
+    def campaign(binary, seconds, fork, *, extra_env=None):
+        calls.append(extra_env)
+        art = _art(tmp_path / f"crash-{len(calls)}", b"\x03\x00", f"fp{len(calls)}")  # 3 % 3 == case 0
+        return {"status": "crash_found", "returncode": 1, "artifacts": [art]}
+
+    res = R.run_campaign_rounds(
+        Path("bin0"),
+        600,
+        campaign=campaign,
+        rebuild=lambda mask: (Path("bin1"), {"compile": {"returncode": 0}}),
+        n_cases=3,
+        runtime_skip=runtime_skip,
+    )
+    assert len(calls) == 2
+    kg = res["keep_going"]
+    last = kg["rounds"][-1]
+    assert last["stopped"] == "crash_in_skipped_case" and last["skipped_crashed_cases"] == [0]
+    assert kg["status"] == "error" and "case 0" in kg["error"]
+    assert "fork_fallback" not in kg
+    assert res["status"] == "crash_found"  # the crashes found stay in the report for ingest
+
+
+def _fake_build_recording(builds: list, environ_keep: str | None):
+    def fake_build(sources, target_bin, **opts):
+        target_path = Path(target_bin)
+        cpp = str(opts.get("cppflags") or "")
+        builds.append((target_path, cpp, opts.get("engine")))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(b"UNMASKED" if "SKIP_CASES=" not in cpp else f"MASKED:{cpp}".encode())
+        eng = "sanitizers" if opts.get("engine") == "sanitizers" else "eacsl"
+        comp: dict = {"returncode": 0, "binary": str(target_path)}
+        if eng == "eacsl" and environ_keep is not None:
+            comp["environ_keep"] = {"status": environ_keep}
+        return {"compile": comp, "engine_used": eng, "engine_fallback_reason": None, "eacsl_compile_attempt": None}
+
+    return fake_build
+
+
+def _two_crash_rounds(sandbox_envs: list):
+    rounds = {"n": 0}
+
+    def fake_sandbox(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        if "-runs=1" in cmd:
+            return SandboxResult(1, "", "Assertion failed", False, "rlimits", list(cmd))
+        sandbox_envs.append((cmd[0], dict(extra_env or {})))
+        rounds["n"] += 1
+        prefix = next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1]
+        n = rounds["n"] % 3
+        if n in (1, 2):
+            Path(f"{prefix}crash-r{rounds['n']}").write_bytes(bytes([2 * (n - 1), 0x11 * rounds["n"]]))
+            return SandboxResult(1, "", "", False, "rlimits", list(cmd))
+        return SandboxResult(0, "", "", False, "rlimits", list(cmd))
+
+    return fake_sandbox
+
+
+@pytest.mark.parametrize("engine,environ_keep", [("eacsl", "failed"), ("eacsl", None), ("auto", "failed")])
+def test_runtime_skip_without_the_environ_shim_falls_back_to_skip_rebuilds(tmp_path, monkeypatch, engine, environ_keep):
+    # The E-ACSL runtime leaves `environ` empty unless the shim restores it, so getenv() cannot see
+    # FRAMAC_FUZZ_SKIP_CASES: without the shim the E-ACSL rounds rebuild with -DFRAMAC_FUZZ_SKIP_CASES.
+    # A sanitizer build reads its environment normally and keeps the runtime skip.
+    from generate_harness import generate_module_harness
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
+    src = tmp_path / "src.c"
+    src.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+    gen = generate_module_harness(
+        module_name="mod",
+        sources=[str(src)],
+        header_include="none",
+        entry_fn="f",
+        max_input_size=64,
+        cppflags="-I.",
+        out_dir=tmp_path / "gen",
+        entry_style="dispatch",
+        dispatch_cases=["(void)f(0);", "(void)f(1);", "(void)f(2);"],
+        auto_prelude=False,
+    )
+    builds: list = []
+    envs: list = []
+    monkeypatch.setattr(R, "build_module_binary", _fake_build_recording(builds, environ_keep))
+    monkeypatch.setattr(R, "run_sandboxed", _two_crash_rounds(envs))
+    out_json = tmp_path / "reports" / "fuzz.json"
+    argv = ["campaign", "--module", "mod", "--sources", str(src), gen["harness_file"], "--out-bin", "fuzz_mod"]
+    argv += ["--corpus-dir", "corpus", "--artifacts-dir", "crashes", "--workers", "1", "--max-time", "240"]
+    argv += ["--no-cache", "--no-attribution-replay", "--no-auto-dict", "--engine", engine, "--out-json", str(out_json)]
+    assert R.main(argv) == 0
+    import json
+
+    report = json.loads(out_json.read_text(encoding="utf-8"))
+    kg_eacsl = report["engines"]["eacsl"]["keep_going"] if engine == "auto" else report["keep_going"]
+    assert "runtime_skip" not in kg_eacsl
+    assert kg_eacsl["skipped_cases"] == [0, 2]
+    assert "environ" in kg_eacsl["runtime_skip_unavailable"]
+    eacsl_rebuilds = [b[1].split()[-1] for b in builds if b[2] == "eacsl" and "-DFRAMAC_FUZZ_SKIP_CASES=" in b[1]]
+    assert eacsl_rebuilds == ["-DFRAMAC_FUZZ_SKIP_CASES=0x1ULL", "-DFRAMAC_FUZZ_SKIP_CASES=0x5ULL"]
+    skip_envs = [e.get("FRAMAC_FUZZ_SKIP_CASES") for _, e in envs]
+    if engine == "auto":
+        # Sanitizers first, with the runtime skip; then E-ACSL on rebuilt binaries.
+        kg_san = report["engines"]["sanitizers"]["keep_going"]
+        assert kg_san["runtime_skip"] is True and kg_san["skipped_cases"] == [0, 2]
+        assert not any(b[2] == "sanitizers" and "SKIP_CASES=" in b[1] for b in builds)
+        assert skip_envs == [None, "0", "0,2", None, None, None]
+    else:
+        assert skip_envs == [None, None, None]
+
+
 def test_campaign_mode_runtime_skip_never_rebuilds_and_legacy_rebuild_preserves_out_bin(tmp_path, monkeypatch):
     import json
 
@@ -571,7 +712,8 @@ def test_campaign_mode_runtime_skip_never_rebuilds_and_legacy_rebuild_preserves_
         payload = b"UNMASKED" if "SKIP_CASES=" not in cpp else f"MASKED:{cpp}".encode()
         target_path.write_bytes(payload)
         return {
-            "compile": {"returncode": 0, "binary": str(target_path)},
+            # The environ shim is linked: the E-ACSL build's getenv() sees the skip set.
+            "compile": {"returncode": 0, "binary": str(target_path), "environ_keep": {"status": "built"}},
             "engine_used": "eacsl",
             "engine_fallback_reason": None,
             "eacsl_compile_attempt": None,
