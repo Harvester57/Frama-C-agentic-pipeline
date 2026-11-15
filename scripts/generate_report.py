@@ -29,7 +29,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fingerprint import normalize_file, normalize_kind  # noqa: E402
-from framac_common import ArtifactError, load_json_optional, load_json_strict  # noqa: E402
+from framac_common import (  # noqa: E402
+    WP_EXPERIMENTAL_MODEL_ASSUMPTION,
+    ArtifactError,
+    load_json_optional,
+    load_json_strict,
+)
 from ledger import INDUCTIVE_LEMMA_GAP  # noqa: E402
 from mutation_check import classify_open_unit  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
@@ -109,6 +114,8 @@ def dedupe_findings_for_report(findings: list[dict], run_dir: Path | None = None
                 for item in rec[key]:
                     if item not in matched[key]:
                         matched[key].append(item)
+        if rec.get("conflicts_with"):
+            matched["conflicts_with"] = sorted({*(matched.get("conflicts_with") or []), *rec["conflicts_with"]})
         if rec["fingerprint"] != matched["fingerprint"]:
             rel_fps = matched.setdefault("_related_fingerprints", [])
             if rec["fingerprint"] not in rel_fps:
@@ -162,6 +169,80 @@ def prior_verdict_text(rec: dict) -> str | None:
     )
 
 
+def _verdict_label(rec: dict) -> str:
+    if rec["verdict"] == "rejected":
+        return f"rejected as `{rec['rejection_class']}`, basis `{rec.get('refutation_basis') or 'unstated'}`"
+    return str(rec["verdict"])
+
+
+def _reverified_by_sibling(rejected: dict) -> bool:
+    """The rejection was reopened by its sibling's opposite verdict and came back rejected again."""
+    return any(p["reopened_by"]["source"] == "sibling_verdict" for p in rejected.get("prior_verdicts") or [])
+
+
+def conflict_text(rec: dict, by_fp: dict[str, dict]) -> str | None:
+    """The opposite verdicts recorded at this record's sink (`conflicts_with`), as one line."""
+    parts = []
+    for fp in rec.get("conflicts_with") or []:
+        other = by_fp.get(fp)
+        if other is None:
+            continue
+        rejected = other if other["verdict"] == "rejected" else rec
+        again = ", re-verified after reopening, still opposite" if _reverified_by_sibling(rejected) else ""
+        parts.append(f"`{fp}`: {_verdict_label(other)}{again}")
+    return "; ".join(parts) or None
+
+
+def sink_conflict_lines(findings: list[dict], candidates: list[dict]) -> list[str]:
+    """
+    Pairs of verdict records at the same sink with opposite verdicts (findings.json `conflicts_with`,
+    ledger.py _reconcile_sink_conflicts). Nothing when there is none.
+    """
+    by_fp = {r["fingerprint"]: r for r in findings}
+    pairs = sorted(
+        {
+            (r["fingerprint"], fp)
+            for r in findings
+            if r["verdict"] != "rejected"
+            for fp in r.get("conflicts_with") or []
+            if fp in by_fp
+        }
+    )
+    if not pairs:
+        return []
+    out = [
+        f"- **Opposite verdicts at one sink:** {len(pairs)} pair(s). Not reconciled automatically: both records "
+        "stand, and each pair needs a look."
+    ]
+    for pos, neg in pairs[:50]:
+        rej = by_fp[neg]
+        # A reopened candidate has no resolved_fingerprints; its reopening names the rejection.
+        cands = [
+            c
+            for c in candidates
+            if neg == c["fingerprint"]
+            or neg in (c.get("resolved_fingerprints") or [])
+            or any(neg in r.get("rejected_fingerprints", []) for r in c.get("reopened") or [])
+        ]
+        sibling = [
+            e
+            for c in cands
+            for e in [*(r["evidence"] for r in c.get("reopened") or []), *(c.get("contradicting_evidence") or [])]
+            if e.get("source") == "sibling_verdict"
+        ]
+        if _reverified_by_sibling(rej):
+            status = "the rejection was reopened, re-verified and rejected again"
+        elif any(c["status"] == "unverified" for c in cands):
+            status = "the rejection is reopened and awaits re-verification"
+        elif sibling and sibling[-1].get("reason"):
+            status = f"the rejection was not reopened ({sibling[-1]['reason']})"
+        else:
+            status = "the rejection was not reopened"
+        out.append(f"  - `{pos}` ({_verdict_label(by_fp[pos])}) vs `{neg}` ({_verdict_label(rej)}): {status}")
+    out.append("")
+    return out
+
+
 def reopening_lines(candidates: list[dict]) -> list[str]:
     """
     Rejections that later tool-reproduced evidence reopened, and those it contradicted without
@@ -182,7 +263,8 @@ def reopening_lines(candidates: list[dict]) -> list[str]:
         after = ", ".join(f"{final[d]} {d}" for d in ("confirmed", "needs_validation", "rejected") if final[d])
         out.append(
             f"- **Reopened rejections:** {len(reopened)} candidate(s), {times} time(s) in all: a reproduced failure "
-            "arrived after a rejection whose basis was not a verifier-cited tool output"
+            "(or an opposite verdict at the same sink, `sibling_verdict`) arrived after a rejection whose basis "
+            "was not a verifier-cited tool output"
             + (f"; verdict after reopening: {after}" if after else "")
             + (f"; {awaiting} still awaiting a verdict" if awaiting else "")
             + "."
@@ -196,7 +278,8 @@ def reopening_lines(candidates: list[dict]) -> list[str]:
     if by_reason["checked_rejection"]:
         out.append(
             f"- **Contradicted `checked` rejections:** {by_reason['checked_rejection']} candidate(s): a reproduced "
-            "failure arrived after a rejection that cites a refuting tool output. They stay rejected; both the "
+            "failure (or an opposite verdict at the same sink) arrived after a rejection that cites a refuting tool "
+            "output. They stay rejected; both the "
             "tool output and the reproducer need a look."
         )
     if by_reason["harness_unchanged"]:
@@ -753,7 +836,9 @@ def render_report(data: dict) -> str:
     out.append("")
     out += rejection_basis_lines(rejected)
     out += reopening_lines(data["candidates"])
+    out += sink_conflict_lines(data["findings"], data["candidates"])
     out += decision_point_basis_lines([*confirmed, *needs])
+    by_fp = {r["fingerprint"]: r for r in data["findings"]}
 
     out += ["## 3. Confirmed findings", ""]
     if not confirmed:
@@ -779,6 +864,7 @@ def render_report(data: dict) -> str:
                 f"- **Root cause:** {md_escape(r['root_cause'])}",
                 *([f"- **Decision point:** {dp}"] if (dp := decision_point_text(r)) else []),
                 *([f"- **Earlier verdict:** {pv}"] if (pv := prior_verdict_text(r)) else []),
+                *([f"- **Conflicting verdict:** {cv}"] if (cv := conflict_text(r, by_fp)) else []),
                 f"- **Reproduce:** `{md_escape(r['reproducers'][0]['command'])}` with `{r['reproducers'][0]['input']}`",
                 f"- **Severity rationale:** {md_escape(r['severity_rationale'])}",
                 f"- **Fix:** {md_escape(r['remediation']['summary'])} (invariant: {md_escape(r['remediation']['invariant'])})",
@@ -807,6 +893,11 @@ def render_report(data: dict) -> str:
         out.append("")
         for k, n in sorted(kinds.items()):
             out.append(f"- `{k}`: {n}")
+        experimental = sum(
+            1 for u in covered if any(a["description"] == WP_EXPERIMENTAL_MODEL_ASSUMPTION for a in u["assumptions"])
+        )
+        if experimental:
+            out.append(f"- of these, {experimental} unit(s) {WP_EXPERIMENTAL_MODEL_ASSUMPTION}")
         out.append("")
     out += verdict_limits_section(ledger)
     out += concurrency_lines(ledger)
@@ -870,6 +961,7 @@ def _evidence_lines(rec: dict) -> list[str]:
 
 def render_findings_detail(findings: list[dict], run_dir: Path | None = None) -> str:
     deduped = dedupe_findings_for_report(findings, run_dir=run_dir)
+    by_fp = {r["fingerprint"]: r for r in findings}
     confirmed = sorted(
         (r for r in deduped if r["verdict"] == "confirmed"),
         key=lambda r: (SEVERITY_ORDER[r["severity"]], r["fingerprint"]),
@@ -894,6 +986,7 @@ def render_findings_detail(findings: list[dict], run_dir: Path | None = None) ->
             f"**Root cause.** {md_escape(r['root_cause'])}",
             "",
             *([f"**Decision point.** {dp}", ""] if (dp := decision_point_text(r)) else []),
+            *([f"**Conflicting verdict.** {cv}", ""] if (cv := conflict_text(r, by_fp)) else []),
             f"**Intended behavior.** {md_escape(r['intended_behavior'])}",
             "",
             "**Trace.**",
@@ -933,6 +1026,7 @@ def render_findings_detail(findings: list[dict], run_dir: Path | None = None) ->
 
 def render_needs_validation(findings: list[dict], run_dir: Path | None = None) -> str:
     deduped = dedupe_findings_for_report(findings, run_dir=run_dir)
+    by_fp = {r["fingerprint"]: r for r in findings}
     needs = [r for r in deduped if r["verdict"] == "needs_validation"]
     out = [
         "# Needs Validation",
@@ -956,6 +1050,7 @@ def render_needs_validation(findings: list[dict], run_dir: Path | None = None) -
             f"**Claimed root cause.** {md_escape(r['claimed_root_cause'])}",
             "",
             *([f"**Decision point.** {dp}", ""] if (dp := decision_point_text(r)) else []),
+            *([f"**Conflicting verdict.** {cv}", ""] if (cv := conflict_text(r, by_fp)) else []),
             "**Trace.**",
             "",
             *_trace_lines(r),

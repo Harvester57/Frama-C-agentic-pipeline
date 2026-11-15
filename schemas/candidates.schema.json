@@ -63,7 +63,7 @@
             "evidence": {
               "type": "object",
               "properties": {
-                "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer"]},
+                "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer", "sibling_verdict"]},
                 "artifact": {"type": "string", "minLength": 1},
                 "tool_output": {"type": "string", "minLength": 1}
               },
@@ -98,7 +98,7 @@
           "type": "object",
           "properties": {
             "at": {"type": "string", "minLength": 1},
-            "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer"]},
+            "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer", "sibling_verdict"]},
             "artifact": {"type": "string", "minLength": 1},
             "tool_output": {"type": "string", "minLength": 1},
             "reason": {"type": "string", "enum": ["checked_rejection", "harness_unchanged", "reopen_limit"]},

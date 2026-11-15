@@ -123,7 +123,7 @@
           "reopened_by": {
             "type": "object",
             "properties": {
-              "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer"]},
+              "source": {"type": "string", "enum": ["breaker_crash_found", "guardrail_code_fault", "fuzz_reproducer", "sibling_verdict"]},
               "artifact": {"$ref": "#/definitions/relpath"},
               "tool_output": {"$ref": "#/definitions/relpath"}
             },
@@ -134,6 +134,13 @@
         "required": ["verdict", "fingerprint", "rejection_class", "reason", "evidence", "verifier", "superseded_at", "reopened_by"],
         "additionalProperties": false
       }
+    },
+    "conflicts_with": {
+      "type": "array",
+      "description": "Written by ledger.py ingest-verifier only. Records at the same sink (file, function, baseline line, kind) whose verdict is the opposite one: confirmed / needs_validation against rejected (any class but duplicate). Not reconciled automatically; the report lists the pair.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/definitions/fingerprint"}
     },
     "refutation_basis": {
       "type": "string",
@@ -153,6 +160,7 @@
         "root_cause": {"$ref": "#/definitions/text"},
         "decision_point": {"$ref": "#/definitions/decision_point"},
         "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
+        "conflicts_with": {"$ref": "#/definitions/conflicts_with"},
         "intended_behavior": {"$ref": "#/definitions/text"},
         "trace": {"$ref": "#/definitions/trace"},
         "evidence": {"$ref": "#/definitions/evidence"},
@@ -217,6 +225,7 @@
         "claimed_root_cause": {"$ref": "#/definitions/text"},
         "decision_point": {"$ref": "#/definitions/decision_point"},
         "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
+        "conflicts_with": {"$ref": "#/definitions/conflicts_with"},
         "trace": {"$ref": "#/definitions/trace"},
         "evidence": {"$ref": "#/definitions/evidence"},
         "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api", "unknown"]},
@@ -252,6 +261,7 @@
         "reason": {"$ref": "#/definitions/text"},
         "refutation_basis": {"$ref": "#/definitions/refutation_basis"},
         "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
+        "conflicts_with": {"$ref": "#/definitions/conflicts_with"},
         "linked_units": {"$ref": "#/definitions/linked_units"},
         "verifier": {"$ref": "#/definitions/verifier"}
       },
