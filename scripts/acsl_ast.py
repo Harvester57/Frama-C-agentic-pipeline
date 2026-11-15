@@ -524,6 +524,41 @@ def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> li
     return errors
 
 
+_ALIGNED_RE = re.compile(r"\\aligned\s*\(")
+
+
+def _aligned_requires(tokens: list[Token]) -> list[tuple[int, str]]:
+    """(line, whitespace-normalised clause) of every `requires` clause using `\\aligned(...)`."""
+    out: list[tuple[int, str]] = []
+    for tok in tokens:
+        if tok.kind not in ("acsl_block", "acsl_line") or "aligned" not in tok.text:
+            continue
+        for kind, _label, pred, _span in iter_clauses(_scrub_acsl_literals(tok.text)):
+            if kind == "requires" and _ALIGNED_RE.search(pred):
+                out.append((tok.line, " ".join(pred.split())))
+    return out
+
+
+def _added_aligned_requires(base_tokens: list[Token], work_tokens: list[Token], path: str) -> list[str]:
+    """
+    `requires` clauses using `\\aligned(...)` that `work_tokens` adds to `base_tokens`. WP implements
+    `\\aligned` under no memory model (`\\aligned not yet implemented`), so no caller can discharge
+    such a precondition and every call site keeps an Unknown goal. A clause already in the baseline
+    is the target's, not the agent's: compared per clause, so extending a baseline block keeps it.
+    """
+    known = Counter(clause for _line, clause in _aligned_requires(base_tokens))
+    errors: list[str] = []
+    for line, clause in _aligned_requires(work_tokens):
+        if known[clause] > 0:
+            known[clause] -= 1
+            continue
+        errors.append(
+            f"{path}:{line}: forbidden 'requires {clause}': WP implements \\aligned under no memory model, "
+            "so no caller can discharge it; state the alignment in the result's boundary_assumptions instead"
+        )
+    return errors
+
+
 def find_unsound_acsl_keywords(tokens: list[Token], path: str = "<input>") -> list[str]:
     """Check all ACSL tokens in `tokens` for unsound or hazardous ACSL constructs."""
     return _check_unsound_acsl(tokens, set(), path) + find_empty_named_behaviors(tokens, path)
@@ -547,6 +582,7 @@ def verify_acsl_only(
     if check_unsound:
         base_acsl = {t.text for t in base_tokens if t.kind in ("acsl_block", "acsl_line")}
         errors.extend(_check_unsound_acsl(work_tokens, base_acsl, path))
+        errors.extend(_added_aligned_requires(base_tokens, work_tokens, path))
 
     base_c = [t for t in base_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
     work_c = [t for t in work_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
