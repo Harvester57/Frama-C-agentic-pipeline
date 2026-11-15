@@ -1117,6 +1117,29 @@ def _supports_kwarg(func: Any, kwarg: str) -> bool:
         return True
 
 
+def _wp_report_detail(wp_report: dict) -> str:
+    """`: <reason>; <first error line>` of a WP report (run_wp_function.py), or '' when it has neither."""
+    parts: list[str] = []
+    reason = wp_report.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(reason.strip())
+    syntax = wp_report.get("syntax_check")
+    soundness = wp_report.get("soundness")
+    for errors in (
+        wp_report.get("preprocess_errors"),
+        syntax.get("errors") if isinstance(syntax, dict) else None,
+        soundness.get("tier_a_aborts") if isinstance(soundness, dict) else None,
+        soundness.get("tier_b_unsound") if isinstance(soundness, dict) else None,
+    ):
+        first = next((e for e in errors if isinstance(e, str) and e.strip()), None) if isinstance(errors, list) else None
+        if first is not None:
+            line = first.strip().splitlines()[0][:300]
+            if not any(line in p for p in parts):
+                parts.append(line)
+            break
+    return (": " + "; ".join(parts)) if parts else ""
+
+
 def _run_parent_reverify(
     run_dir: Path,
     agent_id: str,
@@ -1280,10 +1303,10 @@ def _run_parent_reverify(
                 return (
                     False,
                     f"parent partial WP check rejected (status={wp_status!r}, sound_ok={sound_ok}, "
-                    f"assigns_verified={assigns_ok})",
+                    f"assigns_verified={assigns_ok}){_wp_report_detail(wp_report)}",
                 )
         elif wp_status != "all_proven":
-            return False, f"parent WP check on merged tree returned status={wp_status!r}"
+            return False, f"parent WP check on merged tree returned status={wp_status!r}{_wp_report_detail(wp_report)}"
         if guard_report is not None and _apply_guard_limits(wp_report, function, guard_report):
             wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
         _publish_canonical_wp(run_dir, overlay_dir, wp_json, norm_c, function)
@@ -1913,6 +1936,36 @@ def _merge_agent_overlay_locked(
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
     return result
+
+
+def single_merge_build_inputs(
+    overlay: Path,
+    module: str | None,
+    sources: list[str] | None,
+    cppflags: str | None,
+    ldflags: str | None,
+    reverify: bool = True,
+) -> tuple[list[str] | None, str, str]:
+    """
+    (sources, cppflags, ldflags) for one `merge-agent` call: what the caller passed, else the
+    module's merged harness sidecar (as `_enrich_batch_entry` does for a batch), else `-I.` and no
+    sources. A merge that re-verifies with `module` but resolves no sources is refused: the parent
+    re-check would otherwise skip the E-ACSL guardrail without saying so (QCBOR run-6).
+    """
+    hmeta: dict = merged_sidecar(module_map_for(Path(overlay)), module) if module else {}
+    side_sources = hmeta.get("sources")
+    out_sources = sources or (
+        [str(s) for s in side_sources if isinstance(s, str) and s] if isinstance(side_sources, list) else None
+    )
+    out_sources = out_sources or None
+    out_cppflags = cppflags or str(hmeta.get("cppflags") or "") or "-I."
+    out_ldflags = ldflags if ldflags is not None else str(hmeta.get("ldflags") or "")
+    if module and reverify and not out_sources:
+        raise ArtifactError(
+            f"merge-agent --module {module}: no harness sources found for the module, so the parent "
+            "re-check cannot run the E-ACSL guardrail; pass --sources (and --cppflags) explicitly"
+        )
+    return out_sources, out_cppflags, out_ldflags
 
 
 def _enrich_batch_entry(
@@ -3221,9 +3274,9 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--function", default=None)
     p_merge.add_argument("--header", default=None)
     p_merge.add_argument("--module", default=None)
-    p_merge.add_argument("--sources", nargs="*", default=None)
-    p_merge.add_argument("--cppflags", default="-I.")
-    p_merge.add_argument("--ldflags", default="", help="Extra linker flags for parent guardrail")
+    p_merge.add_argument("--sources", nargs="*", default=None, help="Default: the --module's harness sources")
+    p_merge.add_argument("--cppflags", default=None, help="Default: the --module's cppflags, else -I.")
+    p_merge.add_argument("--ldflags", default=None, help="Extra linker flags for parent guardrail (default: the --module's)")
     p_merge.add_argument("--skip-reverify", action="store_true")
     p_merge.add_argument(
         "--allow-partial-wp",
@@ -3306,6 +3359,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(res, indent=2))
             return 0 if res["ok"] else 1
         elif args.cmd == "merge-agent":
+            m_sources, m_cppflags, m_ldflags = single_merge_build_inputs(
+                (args.overlay or args.run_dir / "workspace"),
+                args.module,
+                args.sources,
+                args.cppflags,
+                args.ldflags,
+                reverify=not args.skip_reverify,
+            )
             res = merge_agent_overlay(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -3315,9 +3376,9 @@ def main(argv: list[str] | None = None) -> int:
                 function=args.function,
                 header_file=args.header,
                 module=args.module,
-                sources=args.sources,
-                cppflags=args.cppflags,
-                ldflags=args.ldflags,
+                sources=m_sources,
+                cppflags=m_cppflags,
+                ldflags=m_ldflags,
                 skip_reverify=args.skip_reverify,
                 allow_partial_wp=args.allow_partial_wp,
                 contract_only=args.contract_only,
