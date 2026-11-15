@@ -1657,6 +1657,17 @@ def stack_frames(text: str, limit: int = STACK_FRAMES_MAX) -> list[dict]:
     return out
 
 
+def replay_artifact_dir(scratch: Path) -> Path:
+    """
+    Where a replay's libFuzzer writes the `crash-<sha1>` (or leak-, timeout-, oom-) copy of a failing
+    input: a directory of its own under the replay's writable `scratch`, never the working directory
+    (without -artifact_prefix libFuzzer writes there, the run-dir root: QCBOR run-6, issue #15).
+    """
+    out = (Path(scratch) / "replay_artifacts").resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def replay_artifact(
     binary: Path,
     artifact: Path,
@@ -1681,6 +1692,7 @@ def replay_artifact(
             f"-timeout={per_input_timeout}",
             f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
             f"-seed={seed}",
+            f"-artifact_prefix={replay_artifact_dir(scratch)}/",
             str(Path(artifact).resolve()),
         ],
         writable=[scratch],
@@ -4640,6 +4652,7 @@ def replay_for_coverage(
                 f"-timeout={per_input_timeout}",
                 f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
                 f"-seed={seed}",
+                f"-artifact_prefix={replay_artifact_dir(scratch)}/",
                 *[str(Path(f).resolve()) for f in batch],
             ],
             writable=[scratch, batch_dir],
