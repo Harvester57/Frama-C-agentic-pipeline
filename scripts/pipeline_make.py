@@ -1828,6 +1828,15 @@ def _node_status(node: str, plan: Plan, run_dir: Path, failed: set[str], cache: 
     return cache[node]
 
 
+def _phase1_inputs_problem(plan: Plan) -> str | None:
+    """Why `gen` has no module to plan Phase 1+ work for (no DAG, or no harness for its modules), or None."""
+    if not plan.dag_modules:
+        return f"Phase 1+ targets need the Phase 0 model: {DAG_JSON} is missing or has no module"
+    if not any(name in plan.sidecars for name in plan.records):
+        return f"Phase 1+ targets need the module harnesses: no {HARNESS_DIR}/harness_<mod>.json matches a DAG module"
+    return None
+
+
 def run_targets(
     targets: list[str],
     run_dir: Path | str = ".",
@@ -1850,14 +1859,16 @@ def run_targets(
         known = ", ".join([*STAGE_OF_TARGET, *(p + "<mod>" for p in MODULE_TARGET_PREFIXES)])
         return 2, {"ok": False, "error": f"unknown target(s) {unknown or '(none given)'}; targets: {known}"}
     # Phase 0 targets (slice-init .. seed) run before Step 5's `gen` and bootstrap the Makefile via
-    # `_generate` below; Phase 1+ targets still require `gen` to have written workspace/build/Makefile.
-    if not (run_dir / MAKEFILE).is_file() and any(
-        (stage := _stage(t)) is not None and stage > STAGE_OF_TARGET["seed"] for t in targets
-    ):
-        return 2, {
-            "ok": False,
-            "error": f"{MAKEFILE} not found: run `pipeline_make.py gen` first, from the run directory",
-        }
+    # `_generate` below. Phase 1+ targets need what `gen` plans modules from: the callgraph DAG and a
+    # harness sidecar for its modules. Checked on those inputs, not on the Makefile, which any Phase 0
+    # target has already written.
+    if any((stage := _stage(t)) is not None and stage > STAGE_OF_TARGET["seed"] for t in targets):
+        missing = _phase1_inputs_problem(build_plan(run_dir, templates_dir))
+        if missing:
+            return 2, {
+                "ok": False,
+                "error": f"{missing}: finish Phase 0, then run `pipeline_make.py gen` first, from the run directory",
+            }
     make_bin = "make"
     use_private_makefile = make_runner is None
     if make_runner is None:
