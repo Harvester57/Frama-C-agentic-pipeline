@@ -29,7 +29,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fingerprint import normalize_file, normalize_kind  # noqa: E402
-from framac_common import ArtifactError, load_json_optional, load_json_strict  # noqa: E402
+from framac_common import (  # noqa: E402
+    WP_EXPERIMENTAL_MODEL_ASSUMPTION,
+    ArtifactError,
+    load_json_optional,
+    load_json_strict,
+)
 from ledger import INDUCTIVE_LEMMA_GAP  # noqa: E402
 from mutation_check import classify_open_unit  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
@@ -807,6 +812,11 @@ def render_report(data: dict) -> str:
         out.append("")
         for k, n in sorted(kinds.items()):
             out.append(f"- `{k}`: {n}")
+        experimental = sum(
+            1 for u in covered if any(a["description"] == WP_EXPERIMENTAL_MODEL_ASSUMPTION for a in u["assumptions"])
+        )
+        if experimental:
+            out.append(f"- of these, {experimental} unit(s) {WP_EXPERIMENTAL_MODEL_ASSUMPTION}")
         out.append("")
     out += verdict_limits_section(ledger)
     out += concurrency_lines(ledger)

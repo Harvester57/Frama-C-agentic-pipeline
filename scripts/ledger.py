@@ -72,7 +72,6 @@ from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
     EVA_REPORT_MAX_BYTES,
-    WP_UNSOUND_MODEL_ISSUE,
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
@@ -84,7 +83,8 @@ from framac_common import (  # noqa: E402
     run_lock,
     utc_now,
     wp_limits_problem,
-    wp_model_unsound,
+    wp_model_assumption,
+    wp_model_problem,
 )
 from module_map import ModuleMap  # noqa: E402
 from patterns import KERNEL_RENAME_RE  # noqa: E402
@@ -265,8 +265,17 @@ def add_assumption(unit: dict, kind: str, description: str, related: list[str] |
         unit["assumptions"].append(a)
 
 
-def add_wp_limit_assumptions(unit: dict, limits: dict, function: str) -> None:
+def wp_report_models(report: dict) -> list[str]:
+    """The WP memory models a report's verdict was obtained under: its own and a triggered bitwise retry's."""
+    retry = report.get("bitwise_retry") or {}
+    models = [report.get("wp_model"), retry.get("wp_model") if retry.get("triggered") else None]
+    return [m for m in models if isinstance(m, str) and m.strip()]
+
+
+def add_wp_limit_assumptions(unit: dict, limits: dict, function: str, model_assumption: str | None = None) -> None:
     """What a credited proof did not establish stays visible as an open assumption on the unit."""
+    if model_assumption:
+        add_assumption(unit, "other", model_assumption)
     if limits["vacuity"]["status"] == "inconclusive":
         add_assumption(unit, "other", f"The consistency check of {function}'s contract was inconclusive.")
     oracle = limits.get("dynamic_oracle") or {}
@@ -2000,10 +2009,14 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 and any(e.get("phase") == "wp" and e.get("discharging") for e in u.get("evidence") or [])
             ]
             sweep_checks.append((str(report["status"]), tool_output, wp_covered))
-        if report["status"] == "all_proven" and wp_model_unsound(report.get("wp_model")):
-            # A report written before run_wp_function.py refused the model itself: same verdict.
+        models = wp_report_models(report)
+        model_problem = next((p for p in map(wp_model_problem, models) if p), None)
+        model_assumption = next((a for a in map(wp_model_assumption, models) if a), None)
+        if report["status"] == "all_proven" and model_problem:
+            # A model that is not evidence (`cast`, `Hoare`, `nat`, ...), including a report written
+            # before run_wp_function.py refused the model itself: the proof is unsound.
             soundness = dict(report.get("soundness") or {})
-            soundness["tier_b_unsound"] = [*(soundness.get("tier_b_unsound") or []), WP_UNSOUND_MODEL_ISSUE]
+            soundness["tier_b_unsound"] = [*(soundness.get("tier_b_unsound") or []), model_problem]
             report = {**report, "status": "unsound_proof", "soundness": soundness}
         if report["status"] == "acsl_syntax_error":
             for u in targets:
@@ -2166,7 +2179,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"{counts.get('proven', 0)} goal(s) proven, {counts.get('proven_under_hyp', 0)} valid under hypotheses.",
                     details={"limits": limits},
                 )
-                add_wp_limit_assumptions(u, limits, report["function"])
+                add_wp_limit_assumptions(u, limits, report["function"], model_assumption)
                 if counts.get("proven_under_hyp", 0):
                     add_assumption(
                         u,
@@ -2206,7 +2219,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     ev_summary,
                     details={"limits": limits},
                 )
-                add_wp_limit_assumptions(u, limits, report["function"])
+                add_wp_limit_assumptions(u, limits, report["function"], model_assumption)
                 if soundness.get("reduced_checks"):
                     add_assumption(
                         u,
@@ -2232,7 +2245,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"(no {cls} goal left); WP soundness passed.",
                     details={"limits": limits},
                 )
-                add_wp_limit_assumptions(u, limits, report["function"])
+                add_wp_limit_assumptions(u, limits, report["function"], model_assumption)
                 u["status"] = "covered"
                 u["unresolved"] = []
                 credited.add(u["coverage_id"])
