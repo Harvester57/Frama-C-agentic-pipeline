@@ -160,11 +160,13 @@ literally, an `int` is not the correct type for `"%u"`, and the upstream test
 `plugins/e-acsl/tests/format/printf.c` follows that reading (`ABRT(printf("%d\n", ui))` with
 `unsigned ui = 516`, under "Undef 19").
 
-The other reading, which every implementation follows: 6.5.2.2p6 makes a call with a promoted argument
-of the corresponding signed or unsigned type well defined "when the value is representable in both
-types", 7.16.1.1p2 gives `va_arg` the same exception, and footnote 41 to 6.2.5p9 says the shared
-representation is "meant to imply interchangeability as arguments to functions". 7.21.6.1 does not
-refer to these explicitly, and the footnote is not normative, so the strict reading is defensible;
+The other reading, which implementations follow: trailing arguments of a variadic call only get the
+default argument promotions (6.5.2.2p7), and 7.16.1.1p2 lets `va_arg` read an argument whose type is
+the corresponding signed or unsigned integer type "when the value is representable in both types",
+which is how a libc's `printf` reads them. 6.5.2.2p6 gives calls without a prototype the same
+exception, and the footnote to 6.2.5p9 says the shared representation is "meant to imply
+interchangeability as arguments to functions". 7.21.6.1 does not refer to either, and the footnote is
+not normative, so the strict reading is defensible;
 it is also not what compilers check (`-Wformat` never warns on it, `-Wformat-signedness` exists as an
 opt-in and does not warn on a promoted `unsigned char` either), nor what glibc does.
 
@@ -174,7 +176,7 @@ only spelling the runtime accepts is `"%hhu"` or an explicit cast.
 
 ## Proposed fix (validated in our pipeline, not on `master`)
 
-**A, value-based (what we ship as a runtime patch).** In `validate_format`, walk a `va_copy` of the
+**A, value-based (what we ship as a runtime patch; the 7.16.1.1p2 rule).** In `validate_format`, walk a `va_copy` of the
 arguments with each one's own promoted type (the letter in `fmtdesc`) and record whether an integer
 argument's value is representable in both the signed and the unsigned type of its rank. Skip the
 `validate_format_type` comparison when the expected and actual letters are `d`/`D`, `l`/`L` or `r`/`R`
@@ -209,13 +211,14 @@ oracle lines as they are and fixes the c-ares case.
 
 The patched runtime (both fixes), built through `e-acsl-gcc -C --e-acsl-share <patched copy>` with
 `-G clang -M --libc-replacements --validate-format-strings`, on a libFuzzer probe with one call per
-input (`tests/test_eacsl_format_signedness.py` in our pipeline):
+input (`tests/test_eacsl_format_signedness.py` in our pipeline). The test builds the probe twice, once
+with the image's runtime ("Unpatched") and once with the patched copy, and runs every case on both:
 
 | Call | Unpatched | Patched |
 |---|---|---|
 | `"%u"` / `"%x"` with `unsigned char 200`; `"%u"` with `7`; `"%d"` with `5u`; the `inet_ntop4` call; `"%lu"` with `9L` | abort | runs |
 | `"%f %u"` with `(1.5, uc)`; eight `"%u"` with eight promoted bytes (stack-passed arguments) | abort | runs |
-| `"%f %s"` with `(1.5, "abc")`; `"%Lf %s %p"` with `(2.5L, "abc", &uc)` | abort (B) | runs |
+| `"%f %s"` with `(1.5, "abc")`; `"%Lf %s %p"` with `(2.5L, "abc", &uc)` | abort (B: `attempt to access unallocated memory via directive 2 ('%s')`, and `unterminated string in directive 2 ('%s')` for the `long double`) | runs |
 | `"%u"` with `-1`; `"%f %u"` with `(1.5, -1)`; `"%d"` with `3000000000u`; eight `"%u"`, the last `-1` | abort | abort, same message |
 | `"%ld"` with an `int` | abort | abort, same message |
 

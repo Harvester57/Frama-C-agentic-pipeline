@@ -989,6 +989,10 @@ def _runtime_patches(check_options: list[str]) -> list[str]:
     return [EACSL_FORMAT_RUNTIME_PATCH] if "--validate-format-strings" in check_options else []
 
 
+# A compiler error in the patched copy's e_acsl_stdio.c (`<share>/libc_replacements/e_acsl_stdio.c:998:10: error: ...`).
+_PATCHED_STDIO_ERROR_RE = re.compile(r"libc_replacements/e_acsl_stdio\.c:\d+:\d+: error:")
+
+
 def _format_runtime_share(eacsl_bin: str, dest_root: Path) -> dict:
     """The patched E-ACSL share directory for stage 2 (eacsl_toolchain.prepare_patched_eacsl_share)."""
     src = eacsl_share_dir(eacsl_bin)
@@ -999,9 +1003,17 @@ def _format_runtime_share(eacsl_bin: str, dest_root: Path) -> dict:
             "reason": f"no E-ACSL share directory beside {eacsl_bin}",
         }
     try:
-        return prepare_patched_eacsl_share(src, dest_root)
+        patch = prepare_patched_eacsl_share(src, dest_root)
     except OSError as exc:
         return {"patch": EACSL_FORMAT_RUNTIME_PATCH, "status": "not_applied", "reason": f"copy failed: {exc}"}
+    if patch["status"] == "applied" and any(c.isspace() for c in patch["share"]):
+        # e-acsl-gcc passes `-I$EACSL_SHARE` unquoted.
+        return {
+            "patch": EACSL_FORMAT_RUNTIME_PATCH,
+            "status": "not_applied",
+            "reason": "share path contains whitespace",
+        }
+    return patch
 
 
 _GETENV_CALL_RE = re.compile(r"\bgetenv\s*\(")
@@ -1534,7 +1546,8 @@ def _compile_eacsl_binary_uncached(
             cmd2.append(str(instrumented_c))
             return (cmd2, *_run_tool(cmd2, runner))
 
-        cmd2, rc, out, err = _stage2(ldflags)
+        link_used = ldflags
+        cmd2, rc, out, err = _stage2(link_used)
         _record(cmd2, rc, out, err)
         if rc != 0 and parse_undefined_fallbacks(out + "\n" + err):
             fb = build_fallback_object(
@@ -1552,7 +1565,20 @@ def _compile_eacsl_binary_uncached(
             except UnsafePassthroughError as exc:
                 log_parts.append(f"Refusing to link fallback object: {exc}\n")
                 return _finish(2, "eacsl_argv_unsafe")
-            cmd2, rc, out, err = _stage2(link_with_fallbacks)
+            link_used = link_with_fallbacks
+            cmd2, rc, out, err = _stage2(link_used)
+            _record(cmd2, rc, out, err)
+        if rc != 0 and share_args and _PATCHED_STDIO_ERROR_RE.search(out + "\n" + err):
+            # The patched runtime itself does not compile (a Frama-C whose e_acsl_stdio.c still has the
+            # anchors but changed around them): build with the image's runtime and say so.
+            share_args.clear()
+            result["runtime_patches"]["format_runtime"] = {
+                "patch": EACSL_FORMAT_RUNTIME_PATCH,
+                "status": "not_applied",
+                "reason": "the patched e_acsl_stdio.c did not compile",
+            }
+            log_parts.append("Runtime patch format_runtime dropped: the patched e_acsl_stdio.c did not compile.\n")
+            cmd2, rc, out, err = _stage2(link_used)
             _record(cmd2, rc, out, err)
         if rc != 0:
             return _finish(rc, "eacsl_compile_failed")

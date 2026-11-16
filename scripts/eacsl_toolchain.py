@@ -90,8 +90,9 @@ EACSL_NO_LIBC_CHECKS = "-no-libc-checks"
 # `unsigned short` argument is promoted to `int`, so `snprintf(b, n, "%u", byte)` aborts on every
 # input ("directive 1 ('%u') expects argument of type 'unsigned int' but the corresponding argument
 # has type 'int'"; c-ares inet_ntop4, run-1 2026-11-16), and so does `"%d"` with a small `unsigned`.
-# C11 6.5.2.2p6 and 7.16.1.1p2 accept the signed and unsigned types of one rank when the value is
-# representable in both; gcc and clang -Wformat do not warn. The runtime sees only static types
+# C11 7.16.1.1p2 (va_arg, how a libc reads these arguments) accepts the signed and unsigned types of
+# one rank when the value is representable in both, the rule 6.5.2.2p6 also gives calls without a
+# prototype; 7.21.6.1p9 has no such exception, but gcc and clang -Wformat do not warn and glibc agrees. The runtime sees only static types
 # (fmtdesc), so the pipeline compiles it from a run-local copy of the share directory whose
 # validate_format reads each argument's value and skips the comparison for such a pair: a negative
 # `int` for "%u" or an `unsigned` above INT_MAX for "%d" still aborts with the runtime's own message.
@@ -182,7 +183,7 @@ _FMT_VALUES_BLOCK = f"""\
 _FMT_HELPER = f"""\
 /* {_FMT_PATCH_TAG}: 1 when the directive's type and the
    argument's type are the signed and unsigned types of one integer rank and the argument's value
-   is representable in both (C11 6.5.2.2p6, 7.16.1.1p2); `both` holds that per argument. */
+   is representable in both (C11 7.16.1.1p2); `both` holds that per argument. */
 static int fc_signedness_only(abbrev_t expected_t, abbrev_t actual_t,
                               const signed char *both, int idx) {{
   if (expected_t == actual_t)

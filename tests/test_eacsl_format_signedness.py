@@ -7,7 +7,7 @@ directive's type with the argument's static type exactly, so every IPv4 address 
 
     snprintf: directive 1 ('%u') expects argument of type 'unsigned int' but the corresponding argument has type 'int'
 
-C11 6.5.2.2p6 and 7.16.1.1p2 accept the signed and unsigned types of one rank when the value is
+C11 7.16.1.1p2 (va_arg) accepts the signed and unsigned types of one rank when the value is
 representable in both. The pipeline builds the runtime from a patched copy of the share directory
 that applies this rule with the argument's value; a negative `int` for "%u" still aborts. The same
 copy reads a floating-point argument with its own type when it collects the arguments, so a "%s" after
@@ -163,6 +163,25 @@ def test_stage2_builds_the_runtime_from_the_patched_share(tmp_path, modern_gcc_w
     assert "format_runtime" in Path(res["compile_log"]).read_text(encoding="utf-8")
 
 
+def test_patched_runtime_that_does_not_compile_falls_back_to_the_image_runtime(tmp_path, modern_gcc_with_share):
+    class PatchedRuntimeBreaks(_StageRecorder):
+        def __call__(self, cmd, **kwargs):
+            if "-C" in cmd and "--e-acsl-share" in cmd:
+                self.calls.append(list(cmd))
+                share = cmd[cmd.index("--e-acsl-share") + 1]
+                err = f"{share}/libc_replacements/e_acsl_stdio.c:812:5: error: use of undeclared identifier 'fc_both'\n"
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=err)
+            return super().__call__(cmd, **kwargs)
+
+    fake = PatchedRuntimeBreaks()
+    res = R.compile_eacsl_binary([str(modern_gcc_with_share)], tmp_path / "out" / "fuzz_mod", runner=fake)
+    assert res["returncode"] == 0, res
+    stage2 = [c for c in fake.calls if c[0] == "e-acsl-gcc" and "-C" in c]
+    assert len(stage2) == 2 and "--e-acsl-share" in stage2[0] and "--e-acsl-share" not in stage2[1]
+    patch = res["runtime_patches"]["format_runtime"]
+    assert patch["status"] == "not_applied" and "did not compile" in patch["reason"]
+
+
 def test_no_format_checks_means_no_patched_share(tmp_path, modern_gcc_with_share):
     fake = _StageRecorder()
     res = R.compile_eacsl_binary(
@@ -274,17 +293,23 @@ import json, sys
 from pathlib import Path
 sys.path.insert(0, "/repo/scripts")
 import run_eacsl_fuzz as R
-res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
 keys = ("returncode", "reason", "binary", "check_options", "runtime_patches")
+res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
 print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
+# The same build with the image's runtime: the cases the patch lets through must abort there.
+R.eacsl_share_dir = lambda eacsl_bin: None
+res = R.compile_eacsl_binary(["mod.c"], Path("plain/fuzz_mod"), cppflags="-I.", use_cache=False)
+print("UNPATCHED " + json.dumps({k: res.get(k) for k in keys}))
 EOF
 set +e
 for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
   printf "$(printf '\\%03o' "$i")" > "in$i"
-  timeout 60 ./out/fuzz_mod.e-acsl -runs=1 "in$i" > "run$i.log" 2>&1
-  echo "CASE $i rc=$? fmt=$(grep -c 'expects argument of type\|via directive' "run$i.log")"
+  for b in out plain; do
+    timeout 60 ./$b/fuzz_mod.e-acsl -runs=1 "in$i" > "$b$i.log" 2>&1
+    echo "CASE $b $i rc=$? fmt=$(grep -c 'expects argument of type\|via directive' "$b$i.log")"
+  done
 done
-grep -h 'expects argument of type' run*.log | sort | uniq -c
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do echo "PLAIN $i $(grep -m1 '^[a-z]*printf: ' "plain$i.log")"; done
 """
 
 
@@ -304,8 +329,15 @@ def test_promoted_arguments_pass_and_out_of_range_values_abort_in_the_analysis_i
     assert res["returncode"] == 0, out[-4000:]
     assert "--validate-format-strings" in res["check_options"]
     assert res["runtime_patches"]["format_runtime"]["status"] == "applied", out[-4000:]
-    cases = dict(re.findall(r"^CASE (\d+) (rc=\d+ fmt=\d+)$", proc.stdout, re.MULTILINE))
+    plain = next((ln for ln in proc.stdout.splitlines() if ln.startswith("UNPATCHED ")), None)
+    assert plain and json.loads(plain[len("UNPATCHED ") :])["runtime_patches"]["format_runtime"]["status"] == (
+        "not_applied"
+    ), out[-4000:]
+    cases = {(b, i): v for b, i, v in re.findall(r"^CASE (\w+) (\d+) (rc=\d+ fmt=\d+)$", proc.stdout, re.MULTILINE)}
     for i in map(str, [*range(8), 13, 14]):
-        assert cases[i] == "rc=0 fmt=0", (i, out[-4000:])
+        assert cases["out", i] == "rc=0 fmt=0", (i, out[-4000:])
+        # The image's runtime stops on each of them: the false positives this patch removes.
+        assert not cases["plain", i].startswith("rc=0 "), (i, out[-4000:])
     for i in map(str, range(8, 13)):
-        assert not cases[i].startswith("rc=0 ") and cases[i].endswith("fmt=1"), (i, out[-4000:])
+        for b in ("out", "plain"):
+            assert not cases[b, i].startswith("rc=0 ") and cases[b, i].endswith("fmt=1"), (b, i, out[-4000:])
