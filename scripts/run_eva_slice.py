@@ -1323,10 +1323,16 @@ def _execute_eva(
     # copies it (eva_flamegraph.fold_flamegraph: lossless for every reader).
     if flamegraph_path.is_file():
         fold_flamegraph(flamegraph_path)
-    # Where a run that hit its time limit spent that time (eva_flamegraph.cost_profile).
+    # Where a run that hit its time limit spent that time (eva_flamegraph.cost_profile), the limit it hit
+    # and how long it ran: a fallback tier's report keeps this profile, and Eva shard planning floors
+    # the timed-out run's time to these, not to whatever the module's limit is by then.
     profile = cost_profile(flamegraph_path) if timed_out else None
     return {
-        **({"cost_profile": {"run": "timed_out", **profile}} if profile else {}),
+        **(
+            {"cost_profile": {"run": "timed_out", "timeout_s": timeout, "elapsed_s": elapsed_s, **profile}}
+            if profile
+            else {}
+        ),
         "status": status,
         "reason": reason,
         "returncode": returncode,

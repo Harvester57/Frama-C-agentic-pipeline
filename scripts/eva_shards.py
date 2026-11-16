@@ -107,8 +107,17 @@ def case_costs(cases: list[str], flamegraph_txt: Path | None, main_fn: str = "ev
     case accounts for (eva_main's own, and callees outside the switch) is split evenly between all
     cases. Every case costs the same without a usable profile. Returns (costs, basis).
     """
+    costs, basis, _ = _case_profile(cases, flamegraph_txt, main_fn)
+    return costs, basis
+
+
+def _case_profile(cases: list[str], flamegraph_txt: Path | None, main_fn: str) -> tuple[list[float], str, list[int]]:
+    """
+    `case_costs`, plus the cases the profile has no sample of (`unsampled_cases`). Empty without a
+    usable profile.
+    """
     n = len(cases)
-    uniform = [1.0] * n, "uniform"
+    uniform: tuple[list[float], str, list[int]] = [1.0] * n, "uniform", []
     if n == 0 or flamegraph_txt is None:
         return uniform
     shared = 0.0
@@ -148,7 +157,45 @@ def case_costs(cases: list[str], flamegraph_txt: Path | None, main_fn: str = "ev
     costs = [c + shared / n for c in costs]
     if sum(costs) <= 0:
         return uniform
-    return costs, "flamegraph"
+    return costs, "flamegraph", unsampled_cases(callee_counts, inclusive)
+
+
+def unsampled_cases(callee_counts: list[dict[str, int]], inclusive: dict[str, float]) -> list[int]:
+    """
+    The cases a profile shows no sign of: none of the case's own callees has a sample. A case's own
+    callees are those of its direct callees that the fewest cases call (only it, usually: the API
+    function it exercises), so time in a helper every case calls, or in a callee another case shares,
+    is not taken as a sign of this case. A case that calls nothing has no sign either way and is not
+    listed. In a run that timed out, these are the cases Eva had not reached yet: their cost is unknown,
+    not zero.
+    """
+    callers: Counter[str] = Counter(name for counts in callee_counts for name, mult in counts.items() if mult > 0)
+    out: list[int] = []
+    for k, counts in enumerate(callee_counts):
+        names = [name for name, mult in counts.items() if mult > 0]
+        if not names:
+            continue
+        fewest = min(callers[name] for name in names)
+        own = [name for name in names if callers[name] == fewest]
+        if all(inclusive.get(name, 0.0) <= 0 for name in own):
+            out.append(k)
+    return out
+
+
+def impute_unsampled(costs: list[float], unsampled: list[int]) -> tuple[list[float], float | None]:
+    """
+    The costs with each unsampled case raised to the mean cost of the sampled ones, and that prior
+    (None, costs unchanged, when no case or every case is unsampled). The mean, not the median: in a
+    timed-out run one case usually holds nearly all the samples (c-ares dnsrec: 99.98%) and the median
+    is then ~0, which would pack every unreached case into one shard again. The mean says an unreached
+    case may cost as much as an average reached one, the dominant case included.
+    """
+    missing = set(unsampled)
+    sampled = [c for k, c in enumerate(costs) if k not in missing]
+    if not missing or not sampled:
+        return costs, None
+    prior = sum(sampled) / len(sampled)
+    return [max(c, prior) if k in missing else c for k, c in enumerate(costs)], prior
 
 
 def pack(costs: list[float], k: int) -> list[list[int]]:
@@ -204,6 +251,7 @@ def make_plan(
     forced: int | None = None,
     basis_report: str | None = None,
     censored: bool = False,
+    profile_censored: bool | None = None,
 ) -> dict:
     """
     A module's shard plan: which cases each shard keeps, and what it was predicted from. `censored`: the
@@ -212,12 +260,31 @@ def make_plan(
     case) even when the slowest shard is still predicted over `limit_s`; `predicted_over_limit` records
     that, and `over_limit_note` says it at `gen`. The plan is still made then: the other shards finish,
     and a single run would hit the same limit.
+
+    `profile_censored` (default: `censored`): the flamegraph is the timed-out run's (not a completed
+    fallback tier's). Then a case it has no sample of was not reached before the timeout: its cost is
+    unknown rather than ~0, so it gets the mean sampled case's (`impute_unsampled`) on top of `total_s`,
+    which the sampled cases keep. The plan lists those cases in `basis.imputed_cases`.
     """
-    costs, basis = case_costs(cases, flamegraph_txt)
-    k = forced if forced else choose_shard_count(costs, total_s, limit_s)
+    costs, basis, unsampled = _case_profile(cases, flamegraph_txt, "eva_main")
+    censored_profile = censored if profile_censored is None else profile_censored
+    predict_s, imputed, prior_s = total_s, [], None
+    if censored_profile and basis == "flamegraph":
+        observed = sum(costs)
+        costs_in, prior = impute_unsampled(costs, unsampled)
+        if prior is not None:
+            # Seconds per unit of cost stay those of the sampled cases: the imputed time is added.
+            predict_s = total_s * sum(costs_in) / observed
+            imputed, prior_s, costs = sorted(unsampled), prior * total_s / observed, costs_in
+    k = forced if forced else choose_shard_count(costs, predict_s, limit_s)
     shards = pack(costs, k)
-    times = predicted_shard_times(costs, shards, total_s)
+    times = predicted_shard_times(costs, shards, predict_s)
     makespan = max(times, default=0.0)
+    imputation = (
+        {"imputed_cases": imputed, **({"imputed_case_s": round(prior_s, 1)} if prior_s is not None else {})}
+        if censored_profile
+        else {}
+    )
     return {
         "format": SHARD_FORMAT,
         "settings_digest": settings_digest,
@@ -233,6 +300,7 @@ def make_plan(
             "limit_s": round(limit_s, 1),
             "censored": bool(censored),
             "predicted_over_limit": makespan >= limit_s,
+            **imputation,
         },
         "predicted_makespan_s": round(makespan, 1),
         "predicted_shard_s": [round(t, 1) for t in times],
@@ -241,6 +309,34 @@ def make_plan(
 
 def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def timed_out_profile(report: dict) -> bool:
+    """Whether a report's flamegraph is that of a run that timed out (not of a completed fallback tier)."""
+    profile = report.get("cost_profile")
+    if isinstance(profile, dict) and profile.get("run") == "timed_out":
+        return True
+    return report.get("status") == "analysis_timeout"
+
+
+def timed_out_run_s(report: dict) -> float | None:
+    """
+    How long a timed-out run is known to have taken, at least: the wall limit it ran under and the time
+    it ran, as its report recorded them (run_eva_slice.py puts both in the timed-out run's
+    `cost_profile`, which a completed fallback tier's report keeps), else a timed-out report's own
+    `elapsed_s` (the timed-out run's, also when no fallback tier completed). None when the report does
+    not say: a completed fallback tier's report from before the fields existed, or one whose timed-out
+    run left no flamegraph samples (no `cost_profile` then); its `elapsed_s` is the tier's.
+    """
+    seen: list[float] = []
+    profile = report.get("cost_profile")
+    if isinstance(profile, dict) and profile.get("run") == "timed_out":
+        seen += [v for v in (_number(profile.get("timeout_s")), _number(profile.get("elapsed_s"))) if v]
+    if report.get("status") == "analysis_timeout":
+        elapsed = _number(report.get("elapsed_s"))
+        if elapsed:
+            seen.append(elapsed)
+    return max(seen) if seen else None
 
 
 def over_limit_note(record: Any, module: str) -> str | None:
@@ -292,11 +388,29 @@ def over_limit_note(record: Any, module: str) -> str | None:
             f". To keep every shard under the limit, raise it (pipeline_make.py params set --module {module} "
             "--eva-timeout <s>: the plan is made again under it) or make that shard's cases cheaper"
         )
-    # A timed-out run's time is floored to the module's limit, so a higher limit scales it up too.
+    # A timed-out run's time is floored to the limit it ran under (recorded in its report), not to the
+    # module's limit now: a higher limit gives a new plan, but from the same lower bound.
     return note + (
-        f". Before running eva-{module}, make that shard's cases cheaper, or run the module unsharded with a "
-        f"longer limit (pipeline_make.py params set --module {module} --eva-shards 1 --eva-timeout <s>); "
-        "raising --eva-timeout alone plans the shards again from the same timed-out run"
+        f". Before running eva-{module}, make that shard's cases cheaper, raise the limit (pipeline_make.py "
+        f"params set --module {module} --eva-timeout <s>: the shards are planned again under it, still from "
+        "the timed-out run, so their times stay lower bounds), or run the module unsharded with a longer "
+        f"limit (pipeline_make.py params set --module {module} --eva-shards 1 --eva-timeout <s>)"
+    )
+
+
+def imputed_note(record: Any) -> str | None:
+    """What to tell the user when a plan guessed the cost of cases its timed-out basis never reached."""
+    basis = record.get("basis") if isinstance(record, dict) else None
+    if not isinstance(basis, dict):
+        return None
+    cases = basis.get("imputed_cases")
+    if not isinstance(cases, list) or not cases:
+        return None
+    each = _number(basis.get("imputed_case_s"))
+    return (
+        f"the timed-out run it is planned from has no sample of {'case' if len(cases) == 1 else 'cases'} "
+        f"{cases} (not reached before the timeout), so their cost is unknown: each is counted at the mean "
+        f"sampled case's{f' ({each} s)' if each is not None else ''}, a guess that spreads them over the shards"
     )
 
 

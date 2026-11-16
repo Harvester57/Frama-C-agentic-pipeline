@@ -51,11 +51,27 @@ Shard plan (deterministic, in `pipeline_make.py`, like the ladder):
   sharding warning. When the planning run itself timed out (`basis.censored`), its time and its
   per-case costs are truncated, so every prediction is a lower bound and the shard is likely to time
   out again. The plan is still made: the other shards finish in time. But a failed shard fails the
-  merge (below), so the warning tells the user to make those cases cheaper, or to run the module
-  unsharded with a longer `eva_timeout` first. Raising `eva_timeout` alone does not help then: the
-  timed-out run's time is floored to the new timeout, so the plan is predicted over the new limit too.
-  After a completed run, a higher `eva_timeout` gives a new plan under the higher limit. Plans recorded
-  before these keys existed get the warning for a timed-out run, without the shard's name.
+  merge (below), so the warning tells the user to make those cases cheaper, to raise `eva_timeout`, or
+  to run the module unsharded with a longer `eva_timeout` first. A higher `eva_timeout` changes the
+  settings digest, so the plan is made again under the higher limit, after a completed run or a
+  timed-out one. A timed-out run's time is floored to what it is recorded to have taken: the wall
+  limit it ran under and its own time, which `run_eva_slice.py` keeps in the timed-out run's
+  `cost_profile` (`timeout_s`, `elapsed_s`), or the report's `elapsed_s` when no fallback tier
+  completed (it is then the timed-out run's). It is never floored to the module's limit at `gen` time,
+  which would raise the prediction with every raise of `eva_timeout`. Only a completed fallback tier's
+  report without that record falls back to that limit, because its `elapsed_s` is the tier's: one
+  written before those fields existed, or one whose timed-out run left no flamegraph samples (no
+  `cost_profile` then). The new plan stays a lower bound. Plans recorded before these keys existed get the warning
+  for a timed-out run, without the shard's name.
+- Cases a timed-out run never reached: when the flamegraph is the timed-out run's (not a completed
+  fallback tier's), a case with no sample in any of its own callees (the direct callees the fewest
+  cases share, usually the API function it exercises) was not reached before the timeout. Its cost is
+  unknown, not ~0, so it is counted at the mean sampled case's cost. The median would be ~0 when one
+  case holds nearly every sample (c-ares run-1: 99.98% in one case), which would pack the unreached
+  cases together again. That time is added on top of the run's time, so the reached cases, the
+  dominant one included, keep their predicted times. The plan lists them in `basis.imputed_cases`,
+  with the guess in `basis.imputed_case_s`, and the `gen` warning names them. A completed run's
+  zeros are real and are never imputed.
 - Make targets: `evashard-<mod>--<i>` (base run per shard) and `evarung-<mod>--<i>--<rung>`. Each
   has its own resource-history key, `<mod>:shard<i>` and `<mod>:shard<i>:<rung>`. Before a shard has
   a peak of its own, `history_estimate`'s module-prefix tier gives it the largest peak recorded for the
@@ -197,7 +213,8 @@ the design above:
   and case count it is valid for. It is recomputed only when those change, or when the forced count
   changes. Case costs come from the slow run's `flamegraph.txt`: depth-1 callees of `eva_main`, shared
   callees split evenly, and `eva_main`'s own time and calls outside the switch spread over every case.
-  Without a profile, every case costs the same.
+  Without a profile, every case costs the same. A case a timed-out run never reached is counted at the
+  mean sampled case's cost (`basis.imputed_cases`).
 - **Not here.** A shard has no say on an obligation when the function is missing from its
   `[metrics:eva:reached-stmts]` list *and* every row it has for the obligation is Never tried. An
   obligation no shard reaches keeps the first shard's Never tried rows, so it stays Unknown as the

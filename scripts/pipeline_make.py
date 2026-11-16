@@ -79,10 +79,13 @@ from eva_shards import (  # noqa: E402
     MAX_SHARDS,
     SHARD_DIR,
     harness_shardable,
+    imputed_note,
     make_plan,
     over_limit_note,
     plan_problem,
     shard_cppflags,
+    timed_out_profile,
+    timed_out_run_s,
 )
 from framac_common import (  # noqa: E402
     EVA_REPORT_MAX_BYTES,
@@ -981,7 +984,7 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
         basis = _shard_basis(plan, mod.name)
         module_timeout = mod.params.get("eva_timeout")
         limit_s = (module_timeout or TRIAL_TIMEOUT_CEILING_S) / TUNING_SKIP_MARGIN
-        timed_out = False
+        timed_out = truncated_profile = False
         if basis is None:
             if not forced:
                 return
@@ -994,9 +997,26 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
             if not forced and not slow:
                 return
             if timed_out:
-                total_s = max(total_s, limit_s * TUNING_SKIP_MARGIN)
+                # At least the time the timed-out run is recorded to have taken (the limit it ran under),
+                # not the module's limit now: else a raised eva_timeout would raise the prediction with it.
+                # A completed fallback tier's report without that record (written before it existed, or
+                # whose timed-out run left no flamegraph samples, so no cost_profile) only has the tier's
+                # time, so it keeps the module's limit as its floor.
+                observed = timed_out_run_s(report)
+                total_s = max(total_s, observed if observed is not None else limit_s * TUNING_SKIP_MARGIN)
+                truncated_profile = timed_out_profile(report)
         # A timed-out run's time and per-case costs are truncated: the prediction is a lower bound.
-        record = make_plan(cases, flamegraph, total_s, limit_s, mod.settings_digest, forced, rel, censored=timed_out)
+        record = make_plan(
+            cases,
+            flamegraph,
+            total_s,
+            limit_s,
+            mod.settings_digest,
+            forced,
+            rel,
+            censored=timed_out,
+            profile_censored=truncated_profile,
+        )
         if record["k"] < 2:
             return
         atomic_write_json(plan_path, record)
@@ -1004,10 +1024,11 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
     mod.shards = [list(s) for s in record["shards"]]
     predicted = record.get("predicted_makespan_s")
     risk = over_limit_note(record, mod.name)
+    guessed = imputed_note(record)
     mod.warnings.append(
         SHARD_WARNING_PREFIX + f"eva-{mod.name} runs as {len(mod.shards)} shards "
         f"({SHARD_DIR}/{mod.name}/plan.json, predicted {predicted} s for the slowest); the ladder does "
-        "not run per shard yet" + (f". Warning: {risk}" if risk else "")
+        "not run per shard yet" + (f"; {guessed}" if guessed else "") + (f". Warning: {risk}" if risk else "")
     )
 
 

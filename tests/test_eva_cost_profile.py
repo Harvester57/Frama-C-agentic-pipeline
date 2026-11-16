@@ -72,6 +72,22 @@ def test_a_timed_out_run_reports_where_its_time_went(tmp_path: Path, monkeypatch
     assert res["cost_profile"]["self"][0] == {"function": "M", "share": 0.5}
 
 
+def test_a_timed_out_runs_profile_records_the_limit_it_hit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Eva shard planning floors a timed-out run's time to the limit it ran under, not to the module's
+    # limit at `gen` time (c-ares run-1: raising eva_timeout scaled the prediction up with it).
+    out = tmp_path / "eva"
+
+    def fake_run(cmd, **kwargs):
+        _write(out / "flamegraph.txt")
+        raise subprocess.TimeoutExpired(cmd, float(kwargs.get("timeout") or 0), output="", stderr="")
+
+    monkeypatch.setattr(run_eva_slice.subprocess, "run", fake_run)
+    res = run_eva_slice._execute_eva(["frama-c"], ["a.c"], "eva_main", out, [], 7200)
+    assert res["status"] == "analysis_timeout"
+    assert res["cost_profile"]["timeout_s"] == 7200
+    assert isinstance(res["cost_profile"]["elapsed_s"], float)
+
+
 def _fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_profile: bool) -> dict:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(run_eva_slice, "_input_digest", lambda sources, flags: "d")
