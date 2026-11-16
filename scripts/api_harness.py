@@ -55,7 +55,10 @@ byte selects it), with arguments built from the model's signature of each functi
     `enum __anonenum_ares_dns_class_t_7 *` for c-ares's `typedef enum { ... } ares_dns_class_t`)
     declares its object through the header's typedef, as the layout probe saw the parameter written
     (`enum_pointer_spellings`); with no typedef name the function is skipped. A pointer to an
-    anonymous struct or union is always skipped;
+    anonymous struct or union is always skipped. A pointer to a qualified pointer (c-ares's
+    `const char **name`, which the model spells `char **`) is cast and its object declared as the
+    header writes it (`qualified_pointer_spellings`: `const char *c0a2[1]`, `(const char **)c0a2`),
+    so the call keeps the nested `const` the compiler checks;
   - a function pointer: a callback stub of its prototype (`callback_stub`, defined after the headers:
     it writes nothing and returns the zero value of its type), when the layout probe spelled the
     prototype from the headers' own typedefs (`callback_prototypes`); else NULL. Either way the case's
@@ -282,6 +285,10 @@ class ApiInfo:
     # parameter index -> {type, pointee} as the declaration writes them (`cls_t *`, `cls_t`). A pointer
     # to an anonymous enum (`enum __anonenum_cls_t_7 *` in the model) is spelled only through these.
     enum_ptrs: dict[str, dict[int, dict[str, str]]] = field(default_factory=dict)
+    # Pointers to a qualified pointer (`qualified_pointer_spellings`): per function, parameter index ->
+    # {type, pointee} as the declaration writes them (`const char **`, `const char *`). The model drops
+    # the nested `const` (`char **`), which a compiler refuses to pass (gcc 14) or warns about (clang).
+    qual_ptrs: dict[str, dict[int, dict[str, str]]] = field(default_factory=dict)
 
 
 class _Case:
@@ -575,7 +582,7 @@ def _bind_call(
     from `params` as they are (the objects behind a variadic call, `variadic_case`).
     """
     shared = shared or {}
-    params = _respell_enum_pointers(case.api, name, params)
+    params = _respell_qualified_pointers(case.api, name, _respell_enum_pointers(case.api, name, params))
     varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
     before: list[str] = []
@@ -726,9 +733,12 @@ def _bind_call(
             raw_ok = pointee != "_Bool" and (not _is_record(pointee) or _raw_ok(lay))
             if is_input and not raw_ok and lay is None:
                 case.note(call, i, f"{_layout_why(case.api, pointee)}: the object is zeroed, not read from the input")
+            # The object's type as declared: the header's spelling of a qualified pointer (`decl`,
+            # `_respell_qualified_pointers`), else the model's pointee.
+            elem = p.get("decl") or pointee
             if size:
                 case.decls.append(
-                    f"{pointee} {case.declare(v)}[({size} + sizeof({pointee}) - 1) / sizeof({pointee})]; memset({v}, 0, sizeof({v}));"
+                    f"{elem} {case.declare(v)}[({size} + sizeof({elem}) - 1) / sizeof({elem})]; memset({v}, 0, sizeof({v}));"
                 )
                 if is_input and raw_ok:
                     case.slot(v, size, call, i, "bytes", addr=False)
@@ -748,7 +758,7 @@ def _bind_call(
                 case.decls.append(f"static unsigned char {case.declare(v)}[{case.spare}]; memset({v}, 0, sizeof({v}));")
                 args.append(f"({p['type']}){v}")
             else:
-                case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                case.decls.append(f"{elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
                 if is_input and pointee == "_Bool":
                     case.bool_slot(v, call, i, "pointee")
                 elif is_input and raw_ok:
@@ -849,6 +859,29 @@ def _respell_enum_pointers(api: ApiInfo, name: str, params: list[dict]) -> list[
                 why = "the headers name no typedef for it" if api.probed else "no layout probe to read its typedef"
                 raise _Unbuildable(f"pointer to an anonymous enum {p.get('pointee')}: {why}")
             p = {**p, "pointee": s["pointee"], "type": s["type"]}
+        out.append(p)
+    return out
+
+
+def _respell_qualified_pointers(api: ApiInfo, name: str, params: list[dict]) -> list[dict]:
+    """
+    `params` with each pointer to a qualified pointer spelled as the header declares it
+    (`ApiInfo.qual_ptrs`): the model's `char **` for c-ares's `const char **name` is cast to
+    `const char **`, and the object behind it declared `const char *` (`decl`). Passing a `char **`
+    there discards a `const` in a nested pointer: clang warns, gcc 14 refuses the call. Only the
+    spelling changes: `pointee` stays the model's, so the object is classified (zeroed, filled, a
+    record) as before. A spelling with another pointer depth than the model's type (a typedef hiding
+    a pointer) is not used: the object would not be the model's.
+    """
+    spelled = api.qual_ptrs.get(name)
+    if not spelled:
+        return params
+    out: list[dict] = []
+    for i, p in enumerate(params):
+        s = spelled.get(i)
+        if s is not None and p["kind"] == "ptr" and not p.get("anon_enum"):
+            if _spelled(s["type"]).count("*") == _spelled(str(p["type"])).count("*"):
+                p = {**p, "decl": s["pointee"], "type": s["type"]}
         out.append(p)
     return out
 
@@ -1502,6 +1535,7 @@ def plan(
         parents={t: p for t, p in outp.parents.items() if t in out_ctors},
         callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
         enum_ptrs=dict(getattr(visible, "enum_pointers", None) or {}),
+        qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -1641,6 +1675,7 @@ class Declared(set):  # type: ignore[type-arg]
     prototypes: dict[str, dict[str, Any]]
     callbacks: dict[str, dict[int, dict[str, Any]]]
     enum_pointers: dict[str, dict[int, dict[str, str]]]
+    qualified_pointers: dict[str, dict[int, dict[str, str]]]
 
     def __init__(
         self,
@@ -1648,6 +1683,7 @@ class Declared(set):  # type: ignore[type-arg]
         prototypes: dict[str, dict[str, Any]] | None = None,
         callbacks: dict[str, dict[int, dict[str, Any]]] | None = None,
         enum_pointers: dict[str, dict[int, dict[str, str]]] | None = None,
+        qualified_pointers: dict[str, dict[int, dict[str, str]]] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
@@ -1655,6 +1691,9 @@ class Declared(set):  # type: ignore[type-arg]
         self.callbacks = callbacks or {}
         # `enum_pointer_spellings`: per function, parameter index -> {type, pointee} of an enum pointer.
         self.enum_pointers = enum_pointers or {}
+        # `qualified_pointer_spellings`: per function, parameter index -> {type, pointee} of a `T *const *`
+        # or `const T **` parameter, as the header writes it.
+        self.qualified_pointers = qualified_pointers or {}
 
 
 def _spelled(t: str) -> str:
@@ -1794,6 +1833,50 @@ def enum_pointer_spellings(tree: dict) -> dict[str, dict[int, dict[str, str]]]:
             if not _IDENT_RE.fullmatch(base) or not is_enum(base):
                 continue
             out.setdefault(name, {})[i] = {"type": written, "pointee": base}
+    return out
+
+
+_PLAIN_TYPE_RE = re.compile(r"[\w\s*]+")
+
+
+def _drop_trailing_qualifiers(t: str) -> str:
+    while True:
+        s = _TRAILING_QUALIFIER_RE.sub("", t)
+        if s == t:
+            return t
+        t = s
+
+
+def qualified_pointer_spellings(tree: dict) -> dict[str, dict[int, dict[str, str]]]:
+    """
+    Per declared function, its parameters that point to a qualified pointer, as the declaration writes
+    them: index -> {"type": `const char **` (the parameter's own qualifier dropped), "pointee": the
+    object a case declares behind it, `const char *` (its own qualifier dropped too: `char *const *`
+    gives `char *`, an object the case can zero and write)}. The model spells c-ares's
+    `const char **name` as `char **`; a case that declares `char *` objects and casts to `char **`
+    passes a pointer that discards the nested `const`, which gcc 14 refuses outright. Only plain
+    spellings (identifiers, `*`, qualifiers) are kept: no function pointer, array, attribute, nor an
+    anonymous type, whose tag no header defines.
+    """
+    out: dict[str, dict[int, dict[str, str]]] = {}
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if node.get("kind") != "FunctionDecl":
+            stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+            continue
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        parms = [n for n in node.get("inner") or [] if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"]
+        for i, parm in enumerate(parms):
+            written = _drop_trailing_qualifiers(" ".join(str((parm.get("type") or {}).get("qualType") or "").split()))
+            if not _PLAIN_TYPE_RE.fullmatch(written) or "__anon" in written or not written.endswith("*"):
+                continue
+            pointee = written[:-1].strip()
+            if not _spelled(pointee).endswith("*") or not _QUALIFIERS_RE.search(pointee):
+                continue
+            out.setdefault(name, {})[i] = {"type": written, "pointee": _drop_trailing_qualifiers(pointee)}
     return out
 
 
@@ -1991,7 +2074,11 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
 
     layouts = {k: lay for k in raw if (lay := layout(k)) is not None}
     return layouts, Declared(
-        functions, handle_prototypes(tree, set(raw)), callback_prototypes(tree), enum_pointer_spellings(tree)
+        functions,
+        handle_prototypes(tree, set(raw)),
+        callback_prototypes(tree),
+        enum_pointer_spellings(tree),
+        qualified_pointer_spellings(tree),
     )
 
 
@@ -2046,6 +2133,27 @@ def _no_error_limit(exe: str) -> str:
     return "-ferror-limit=0" if "clang" in Path(exe).name else "-fmax-errors=0"
 
 
+_ERROR_OPTION_RE = re.compile(r"-Werror(?:=|$)|-pedantic-errors$")
+# The tag clang puts on the warning `_strict_case_flags` makes an error.
+_PROMOTED_WARNING = "-Werror,-Wincompatible-pointer-types-discards-qualifiers]"
+
+
+def _strict_case_flags(exe: str) -> list[str]:
+    """
+    The warning options of the compile probe, after the target's flags. Warnings are not errors (a
+    `-Werror`, `-Werror=` or `-pedantic-errors` in the target's flags is dropped, `-w` used to hide
+    them), except a pointer passed where its nested qualifiers
+    are dropped (`char **` for `const char **`): gcc 14 refuses that call even under `-w`
+    (`-Wincompatible-pointer-types` is an error there), while clang only warns, so a case the clang
+    probe accepted broke a gcc build of the harness. clang's `-w` would silence the `-Werror=`
+    option, and `-Wno-everything` the errors clang raises by default (`-Wint-conversion`): warnings
+    stay on and only `error:` lines are read. gcc refuses it on its own.
+    """
+    if "clang" not in Path(exe).name:
+        return ["-w"]
+    return ["-Wno-error", "-Werror=incompatible-pointer-types-discards-qualifiers"]
+
+
 def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tuple[dict[int, str], list[str]] | None:
     """
     Compile the harness once: (the dispatch cases the compiler refuses, each with the compiler's first
@@ -2066,11 +2174,11 @@ def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tup
     argv = [
         exe,
         "-fsyntax-only",
-        "-w",
         _no_error_limit(exe),
         "-x",
         "c",
-        *shlex.split(with_include_flags(cppflags)),
+        *(t for t in shlex.split(with_include_flags(cppflags)) if not _ERROR_OPTION_RE.match(t)),
+        *_strict_case_flags(exe),
         str(harness_c),
     ]
     try:
@@ -2088,6 +2196,7 @@ def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tup
     output = (proc.stdout or "") + (proc.stderr or "")
     bad: dict[int, str] = {}
     other: list[str] = []
+    promoted = False
     for m in _ERR_LINE_RE.finditer(output):
         line = int(m.group("line"))
         if Path(m.group("file")).name == harness_c.name and line in case_of_line:
@@ -2095,8 +2204,17 @@ def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tup
             if len(diag) > MAX_DIAGNOSTIC_CHARS:
                 diag = diag[: MAX_DIAGNOSTIC_CHARS - 3] + "..."
             bad.setdefault(case_of_line[line], diag)
+        elif _PROMOTED_WARNING in m.group("msg"):
+            # Only the cases are held to it: the target's own code (an inline function of its
+            # headers, an included source) compiled under `-w` before and is not the harness's.
+            promoted = True
         else:
             other.append(m.group(0).strip())
+    if not bad and not other and promoted:
+        unlocated = [t for t in output.splitlines() if "error:" in t and not _ERR_LINE_RE.match(t)]
+        if not unlocated:
+            return {}, []
+        other.append(unlocated[0].strip())
     if not bad and not other:
         # A failed compile with no located error (a fatal one, a driver error): not a case's fault.
         other.append(output.strip().splitlines()[0] if output.strip() else f"exit code {proc.returncode}")

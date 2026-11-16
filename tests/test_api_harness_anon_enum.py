@@ -149,7 +149,8 @@ def test_every_out_parameter_of_query_get_is_bound():
     m = re.search(r"\(void\)qrec_query_get\(([^;]*)\);", stmt)
     assert m, stmt
     args = [a.strip() for a in m.group(1).split(",")]
-    assert args == ["(struct qrec *)c0a0", "c0a1", "(char **)c0a2", "(rtype_t *)c0a3", "(cls_t *)c0a4"]
+    # `const char **name` keeps its nested `const` (test_api_harness_nested_const.py).
+    assert args == ["(struct qrec *)c0a0", "c0a1", "(const char **)c0a2", "(rtype_t *)c0a3", "(cls_t *)c0a4"]
     assert "rtype_t c0a3[" in stmt and "cls_t c0a4[" in stmt
     # The record handle is built through its out-parameter constructor and released after the call.
     assert stmt.index("qrec_create(") < stmt.index("qrec_query_get(") < stmt.index("qrec_destroy(")
@@ -234,7 +235,7 @@ const char *cls_tostr(cls_t c) { return c == CLS_CH ? "CH" : "IN"; }
 ENUM_AST_SCRIPT = "cd /fixture && clang -fsyntax-only -x c -Xclang -ast-dump=json lib.h"
 
 ENUM_RUN_SCRIPT = r"""cp -r /fixture /tmp/w && cd /tmp/w
-clang -fsyntax-only -Wall -Werror=incompatible-pointer-types -Wno-error=incompatible-pointer-types-discards-qualifiers -I. harness.c || exit 1
+clang -fsyntax-only -Wall -Werror=incompatible-pointer-types -Werror=incompatible-pointer-types-discards-qualifiers -I. harness.c || exit 1
 clang -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -g -I. harness.c lib.c -o fz || exit 1
 mkdir corpus
 ./fz -runs=100000 -seed=7 -max_len=64 -detect_leaks=1 corpus > fz.log 2>&1 && echo FUZZ_CLEAN || tail -40 fz.log
