@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -228,6 +229,34 @@ def _resolve_function_at_line(file_path: str, line: int) -> str:
         except Exception:
             continue
     return "unknown_function"
+
+
+def normalized_source_line(file_path: str, line: int) -> str | None:
+    """
+    The text of line `line` of the first source file `file_path` resolves to, stripped, with each run
+    of whitespace replaced by one space. None when `line` is not positive, no file resolves, or the
+    file is shorter than `line`.
+    """
+    if line <= 0:
+        return None
+    candidates = _resolve_source_candidates(file_path)
+    if not candidates:
+        return None
+    try:
+        lines = candidates[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if line > len(lines):
+        return None
+    return " ".join(lines[line - 1].split())
+
+
+def line_text_hash(file_path: str, line: int) -> str | None:
+    """The first 10 hex digits of the sha256 of the normalized text of `file_path:line`, or None."""
+    text = normalized_source_line(file_path, line)
+    if text is None:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
 
 
 def is_harness_fuzz_function(name: str) -> bool:
@@ -602,6 +631,17 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         if fn == "unknown_function" and file_ != "unknown" and line_ > 0:
             fn = _resolve_function_at_line(file_, line_)
         pred = f"AddressSanitizer: {asan_kind}{op_txt}"
+        top = frames[0] if frames else None
+        if (
+            top is not None
+            and best_frame is not top
+            and top.group("function").startswith(("__interceptor_", "__asan_"))
+        ):
+            # An interceptor (memcpy, strcpy ...) reports the defect in its own frame: the caller is the site.
+            pred += f" in {re.sub(r'^__(?:interceptor|asan)_', '', top.group('function'))} from {fn}"
+        line_hash = line_text_hash(file_, line_)
+        if line_hash is not None:
+            pred += f" [line {line_hash}]"
         kind_slug = re.sub(r"[^a-z0-9_]+", "_", asan_kind.lower()).strip("_")
         return {
             "file": file_,
