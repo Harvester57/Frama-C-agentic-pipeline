@@ -19,6 +19,24 @@ def test_env_allowlist_rejects_malformed_entries():
         S.build_env(Path("/s"), {"A=B": "x"})
 
 
+def test_preexec_sets_core_limit_to_one_byte(monkeypatch):
+    # A core limit of 0 is ignored when core_pattern is a pipe (WSL2), so every
+    # abort() streamed a full core to the crash helper; 1 byte skips the dump.
+    import types
+
+    calls = {}
+    fake = types.SimpleNamespace(
+        RLIMIT_CPU="cpu", RLIMIT_FSIZE="fsize", RLIMIT_NOFILE="nofile",
+        RLIMIT_NPROC="nproc", RLIMIT_AS="as", RLIMIT_CORE="core",
+        setrlimit=lambda which, value: calls.__setitem__(which, value),
+    )
+    monkeypatch.setitem(sys.modules, "resource", fake)
+    S._make_preexec(S.Limits())()
+    assert S.CORE_LIMIT_BYTES == 1
+    assert calls["core"] == (1, 1)
+    assert calls["cpu"] == (600, 600) and "as" not in calls
+
+
 @pytest.mark.skipif(os.name != "posix", reason="sandbox_mode() is 'rlimits' only on POSIX hosts")
 def test_sandbox_mode_is_rlimits_on_posix():
     assert S.sandbox_mode() == "rlimits"
