@@ -144,6 +144,31 @@ def test_plan_covers_the_scope_and_skips_with_reasons():
     assert "static" in p["skipped"]["s"] and "variadic" in p["skipped"]["v"]
 
 
+def test_a_translated_variadic_definition_is_skipped_as_variadic():
+    # Frama-C's model of `bool scan(const char *sentence, const char *format, ...)`: no `...` in the
+    # signature, a last formal for the rest. A case would call it as a three-parameter function: an
+    # empty format, and a pointer read from the input where the variable arguments go.
+    scan: dict[str, Any] = {
+        "signature": "_Bool(char *,char *,void **)",
+        "formals": [
+            {"name": "sentence", "kind": "const_pointer"},
+            {"name": "format", "kind": "const_pointer"},
+            {"name": sh.VA_PARAMS, "kind": "const_pointer"},
+        ],
+    }
+    assert ah.plan_params(scan["signature"], scan["formals"]) == (None, "variadic")
+    assert ah.single_case("scan", scan, SPARE) == (None, None, "variadic")
+    dag = _dag({"a": _fn("a"), "scan": _fn("scan")}, ["a", "scan"])
+    model = _model(a={"signature": "void(int)", "formals": _formals("value")}, scan=scan)
+    p = ah.plan(dag, model, "lib", "lib", 64)
+    assert p["entries"] == ["a"] and p["skipped"] == {"scan": "variadic"}
+    assert all("scan(" not in c for c in p["cases"])
+    # A trace that calls it is not replayed either.
+    trace = [{"fn": "scan", "addrs": {"0": "10"}}, {"fn": "scan", "addrs": {"0": "10"}}]
+    stmt, layout, why = ah.sequence_case(trace, [0, 1], {"scan": scan}, SPARE)
+    assert stmt is None and layout is None and why == "scan: variadic"
+
+
 # --- sequences ---------------------------------------------------------------------------------------
 
 

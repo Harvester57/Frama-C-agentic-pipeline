@@ -139,6 +139,41 @@ def test_plan_recorder_skips_main_static_and_unsupported():
     assert skipped == {"var": "variadic", "inl": "static or header inline: not a linked symbol"}
 
 
+def test_a_translated_variadic_definition_is_variadic_by_its_last_formal():
+    # Frama-C gives `bool minmea_scan(const char *sentence, const char *format, ...)` a third formal
+    # for the rest, and a signature without `...`.
+    sig = "_Bool(char *,char *,void **)"
+    formals = [
+        {"name": "sentence", "kind": "const_pointer"},
+        {"name": "format", "kind": "const_pointer"},
+        {"name": sh.VA_PARAMS, "kind": "const_pointer"},
+    ]
+    names: list[str | None] = [f["name"] for f in formals]
+    assert sh.is_variadic(sig, formals) and sh.is_variadic(sig, names)
+    assert sh.is_variadic("int(char *, ...)") and sh.is_variadic("int(char *, ...)", ["fmt"])
+    assert not sh.is_variadic(sig) and not sh.is_variadic(sig, []) and not sh.is_variadic(sig, [None, None, None])
+    assert not sh.is_variadic(sig, ["sentence", sh.VA_PARAMS, "last"])
+    assert not sh.is_variadic("bad", [sh.VA_PARAMS])
+    assert sh.plan_function("minmea_scan", sig, None, names) == {
+        "name": "minmea_scan",
+        "supported": False,
+        "why": "variadic",
+    }
+    # Without the names the signature alone says nothing: the callers pass them.
+    assert sh.plan_function("minmea_scan", sig)["supported"]
+    model = {
+        "entry_points": ["m.c#minmea_scan", "m.c#ok"],
+        "functions": {
+            "m.c#minmea_scan": {"name": "minmea_scan", "signature": sig, "formals": formals},
+            "m.c#ok": {"name": "ok", "signature": "int(char *)", "formals": [{"name": "s", "kind": "const_pointer"}]},
+        },
+    }
+    plans, skipped = sh.plan_recorder(model)
+    assert [p["name"] for p in plans] == ["ok"] and skipped == {"minmea_scan": "variadic"}
+    src = sh.wrapper_source(plans, [])
+    assert "__wrap_ok" in src and "minmea_scan" not in src
+
+
 def test_plan_recorder_records_an_executables_embedded_api():
     # tweetnacl's shape: the library is compiled straight into the executable, whose only export
     # is main; its API is the unit's embedded_api, which the recorder must wrap too.

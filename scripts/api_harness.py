@@ -66,9 +66,10 @@ writers make nothing for them, and a later `--api` run without the flag keeps th
 
 The layout of every case (which input bytes feed which argument) goes to the sidecar as `api_cases`,
 which seed_harvest.py write reads to turn recorded calls into seeds for each case. Functions the
-generator cannot call (static, variadic, an anonymous struct by value, a case the compiler refuses,
-with the compiler's first error) go to `api_skipped` with the reason; the reach gate then reports
-them as gaps.
+generator cannot call (static, variadic: a signature ending in `...` or a last formal named
+`__va_params`, an anonymous struct by value, a case the compiler refuses, with the compiler's first
+error) go to `api_skipped` with the reason, and the reach gate reports an entry point the harness
+does not call directly as a gap.
 """
 
 from __future__ import annotations
@@ -78,7 +79,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,7 +87,14 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import load_json_optional  # noqa: E402
-from seed_harvest import _CHAR_POINTEES, _QUALIFIERS_RE, classify_type, is_length, split_signature  # noqa: E402
+from seed_harvest import (  # noqa: E402
+    _CHAR_POINTEES,
+    _QUALIFIERS_RE,
+    classify_type,
+    is_length,
+    is_variadic,
+    split_signature,
+)
 
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
 TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
@@ -402,7 +410,7 @@ def _init_call(case: _Case, pointee: str, target: str, call: int, param: int) ->
     """The initializer call of a struct object `target` (an address expression) before call `call`."""
     fn = case.api.inits[pointee]
     rec = case.api.records.get(fn) or {}
-    params, _ = plan_params(str(rec.get("signature") or ""))
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
     k = case.ncalls + len(case.inits)
     case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
     return _bind_call(case, k, fn, params or [], list(rec.get("formals") or []), rec, {0: target}, allow_init=False)
@@ -412,7 +420,7 @@ def _handle_call(case: _Case, htype: str, var: str, call: int, param: int) -> st
     """`<handle type> var = <constructor>(...);` before call `call`, the constructor's arguments by the usual rules."""
     fn = case.api.ctors[htype]
     rec = case.api.records.get(fn) or {}
-    params, _ = plan_params(str(rec.get("signature") or ""))
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
     k = case.ncalls + len(case.inits)
     case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
     stmt = _bind_call(case, k, fn, params or [], list(rec.get("formals") or []), rec, allow_init=False)
@@ -617,13 +625,17 @@ def _bind_call(
     return " ".join([*before, f"(void){name}({', '.join(args)});", *after])
 
 
-def plan_params(signature: str) -> tuple[list[dict] | None, str | None]:
-    """The parameters of a model signature as the generator spells them, or why it cannot call it."""
+def plan_params(signature: str, formals: Sequence[Any] | None = None) -> tuple[list[dict] | None, str | None]:
+    """
+    The parameters of a model signature as the generator spells them, or why it cannot call it.
+    `formals` are the model record's: a definition Frama-C translated shows it is variadic only by
+    its last formal (`seed_harvest.is_variadic`), and the generator has no arguments for the rest.
+    """
     parts = split_signature(signature)
     if parts is None:
         return None, f"signature {signature!r} not understood"
-    _, params_s, variadic = parts
-    if variadic:
+    _, params_s, _ = parts
+    if is_variadic(signature, formals):
         return None, "variadic"
     params: list[dict] = []
     for t in params_s:
@@ -653,7 +665,7 @@ def single_case(
     name: str, model_rec: dict, spare: int, api: ApiInfo | None = None
 ) -> tuple[str | None, dict | None, str | None]:
     """(statements, layout, why not) of the case that calls one API function."""
-    params, why = plan_params(str(model_rec.get("signature") or ""))
+    params, why = plan_params(str(model_rec.get("signature") or ""), model_rec.get("formals"))
     if params is None:
         return None, None, why
     case = _Case(spare, api, calls=1)
@@ -687,7 +699,7 @@ def initializers(
             continue
         if (rec.get("static") and visible is None) or (visible is not None and name not in visible):
             continue
-        params, _ = plan_params(str(rec.get("signature") or ""))
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         formals = list(rec.get("formals") or [])
         if not params or params[0]["kind"] != "ptr" or _is_input(formals, 0):
             continue
@@ -740,8 +752,11 @@ def handle_functions(
     returns: dict[str, str] = {}
     for name, rec in by_name.items():
         proto = protos.get(name)
-        params, _ = plan_params(str(rec.get("signature") or ""))
-        # A variadic declaration names fewer parameters than the model, which adds one for the rest.
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        # A variadic function has no case (plan_params refuses it), so it takes no part here: no
+        # handle parameters, and it is no constructor or destructor. One the model does not show as
+        # variadic (a record without its formals) still lists one parameter more than the header
+        # declares, for the rest: its declared parameters keep their handle types.
         if not isinstance(proto, dict) or params is None or len(proto.get("params") or []) > len(params):
             continue
         mine = {i: t for i, t in enumerate(proto["params"]) if t and params[i]["kind"] == "ptr"}
@@ -804,7 +819,7 @@ def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], 
     sizes: list[int] = []
     for j in chain:
         rec = records.get(trace[j]["fn"]) or {}
-        params, _ = plan_params(str(rec.get("signature") or ""))
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         formals = list(rec.get("formals") or [])
         for i_s, a in (trace[j].get("addrs") or {}).items():
             if a != addr:
@@ -855,7 +870,7 @@ def _sequence_case(
         rec = records.get(name)
         if rec is None:
             return None, None, f"{name} is not an API function of this module"
-        params, why = plan_params(str(rec.get("signature") or ""))
+        params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         if params is None:
             return None, None, f"{name}: {why}"
         shared: dict[int, str] = {}
@@ -943,7 +958,7 @@ def _lifecycle_case(
     if not methods:
         return None, None, f"{htype}: no other function takes the handle"
     crec = api.records.get(ctor) or records.get(ctor) or {}
-    cparams, why = plan_params(str(crec.get("signature") or ""))
+    cparams, why = plan_params(str(crec.get("signature") or ""), crec.get("formals"))
     if cparams is None:
         return None, None, f"{ctor}: {why}"
     ncalls = len(methods) + 2
@@ -954,7 +969,7 @@ def _lifecycle_case(
     branches: list[str] = []
     for k, name in enumerate(methods):
         rec = records[name]
-        params, why = plan_params(str(rec.get("signature") or ""))
+        params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         if params is None:
             return None, None, f"{name}: {why}"
         idx = next(i for i, t in (api.handles.get(name) or {}).items() if t == htype)

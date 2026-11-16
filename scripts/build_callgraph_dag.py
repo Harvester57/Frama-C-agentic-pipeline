@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import tiers  # noqa: E402
 import unit_split  # noqa: E402
-from framac_common import is_pipeline_output_dir  # noqa: E402
+from framac_common import VA_PARAMS, is_pipeline_output_dir  # noqa: E402
 
 DYNAMIC_ALLOC_CALLEES = {
     "malloc",
@@ -89,9 +89,6 @@ HARNESS_ENTRYPOINT_NAMES = frozenset(
         "eva_main",
     }
 )
-
-# The formal Frama-C gives a variadic definition's `...`.
-VA_PARAMS = "__va_params"
 
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
 # 1: GCC-fallback units blocked from Eva and WP (defect 6, `block_fallback_units`). A DAG without
