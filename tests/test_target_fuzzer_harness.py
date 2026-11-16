@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import fuzz_dictionary
 import generate_harness as G
 import run_eacsl_fuzz as R
 from sandbox_exec import SandboxResult
@@ -332,7 +333,7 @@ def _fake_auto(content: str | None):
 
 def test_extra_dictionary_is_merged_into_the_auto_dictionary(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(R, "build_auto_dictionary", _fake_auto('"GET"\n"PUT"\n'))
+    monkeypatch.setattr(fuzz_dictionary, "build_auto_dictionary", _fake_auto('"GET"\n"PUT"\n'))
     extra = tmp_path / "workspace/dicts/mod.extra.dict"
     extra.parent.mkdir(parents=True)
     extra.write_text('# shipped\n"PUT"\nkw1="HEAD"\n\n"PUT"\n', encoding="utf-8")
@@ -344,7 +345,7 @@ def test_extra_dictionary_is_merged_into_the_auto_dictionary(tmp_path: Path, mon
 
 def test_extra_dictionary_alone_when_extraction_fails(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(R, "build_auto_dictionary", _fake_auto(None))
+    monkeypatch.setattr(fuzz_dictionary, "build_auto_dictionary", _fake_auto(None))
     extra = tmp_path / "workspace/dicts/mod.extra.dict"
     extra.parent.mkdir(parents=True)
     extra.write_text('"A"\n"B"\n', encoding="utf-8")
@@ -355,7 +356,7 @@ def test_extra_dictionary_alone_when_extraction_fails(tmp_path: Path, monkeypatc
 
 def test_explicit_dictionary_is_never_merged(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(R, "build_auto_dictionary", _fake_auto('"GET"\n'))
+    monkeypatch.setattr(fuzz_dictionary, "build_auto_dictionary", _fake_auto('"GET"\n'))
     extra = tmp_path / "workspace/dicts/mod.extra.dict"
     extra.parent.mkdir(parents=True)
     extra.write_text('"A"\n', encoding="utf-8")

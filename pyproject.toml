@@ -48,6 +48,7 @@ known-first-party = [
     "eva_shards",
     "eva_tuning",
     "extract_references",
+    "failure_identity",
     "fc_cpp_wrapper",
     "fc_cpp_wrapper_eacsl",
     "fingerprint",
