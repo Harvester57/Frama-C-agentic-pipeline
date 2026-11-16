@@ -623,6 +623,24 @@ def test_breaker_fault_hypothesis_adds_a_verify_task_that_closes_the_gate(sim):
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m/h.c#h"]
 
 
+def test_toolchain_artifact_rejection_creates_no_repair(sim):
+    """c-ares run-1: an E-ACSL false positive in correct code needs no harness repair."""
+    sim.build({"f": ("src/m/f.c", "m", []), "h": ("src/m/h.c", "m", [])}, sidecars={"m": {}})
+    fp = sim.eva_candidate("m", "src/m/f.c", "f")
+    S.cmd_init()
+    ver = S.cmd_next("auto", prepare=True)["tasks"][0]
+    result_path = Path(f"agents/{ver['agent_id']}/scratch/result.json")
+    L.cmd_scaffold_verifier(fp, "rejected", ver["agent_id"], out_path=result_path)
+    res = load(result_path)
+    res["record"].update(rejection_class="toolchain_artifact", refutation_basis="located")
+    write_json(result_path, res)
+    out = S.cmd_complete(ver["agent_id"])
+    assert out["decision"] == "rejected" and not any(t.startswith("repair:") for t in out.get("new_tasks") or [])
+    assert not any(t.startswith("repair:") for t in tasks())
+    assert units()["src/m/f.c#f::rte"]["status"] == "blocked"
+    assert S.cmd_status()["gates"]["gate:m"]["open"] is True
+
+
 def test_harness_induced_rejection_creates_a_repair_that_holds_the_gate(sim):
     sim.build({"f": ("src/m/f.c", "m", []), "h": ("src/m/h.c", "m", [])}, sidecars={"m": {}})
     fp = sim.eva_candidate("m", "src/m/f.c", "f")

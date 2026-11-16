@@ -127,6 +127,33 @@ def test_brief_of_a_rerun_names_why_the_previous_result_was_rejected(tmp_path, r
     assert f"agents/{BRIEF_AGENT_ID}/" in section  # paths of the new result stay under the new agent
 
 
+def _rejection_class_enums(node: object) -> list[tuple[str, ...]]:
+    """Every `rejection_class` enum of a schema, wherever it is declared."""
+    found: list[tuple[str, ...]] = []
+    if isinstance(node, dict):
+        rc = node.get("rejection_class")
+        if isinstance(rc, dict) and "enum" in rc:
+            found.append(tuple(rc["enum"]))
+        for value in node.values():
+            found.extend(_rejection_class_enums(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_rejection_class_enums(value))
+    return found
+
+
+def test_verifier_brief_names_every_rejection_class(tmp_path):
+    """c-ares run-1: the brief never named `toolchain_artifact`, so a verifier facing an E-ACSL false
+    positive could only confirm it, send it to harness repair as `harness_induced`, or reject it under
+    a class and basis that every new reproducer reopens."""
+    schemas = [validate_artifacts.get_schema(name) for name in ("candidates", "findings")]
+    enums = [e for schema in schemas for e in _rejection_class_enums(schema)]
+    assert len(enums) >= 2 and len(set(enums)) == 1  # every copy of the enum agrees
+    brief = _render(tmp_path, "verifier")
+    missing = [cls for cls in enums[0] if f'"{cls}"' not in brief]
+    assert not missing, f"crash_verifier_brief.md never names rejection class(es) {missing}"
+
+
 def test_prover_brief_names_the_callees_that_have_no_contract(tmp_path):
     """QCBOR run-6: provers were dispatched blind on callees without a contract and stalled on them."""
     plain = _render(tmp_path, "prover")
