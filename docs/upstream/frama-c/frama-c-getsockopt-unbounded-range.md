@@ -1,6 +1,10 @@
 # Frama-C libc: `getsockopt` precondition uses an unbounded range (unsatisfiable for Eva, rejected by WP)
 
+**Filed upstream on 2026-11-15:** issue [#2799](https://git.frama-c.com/pub/frama-c/-/work_items/2799), merge request [!30](https://git.frama-c.com/pub/frama-c/-/merge_requests/30).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/04b-libc-getsockopt-unbounded-range-issue.md), [MR](./filing/04b-libc-getsockopt-unbounded-range-mr.md), [reproducer](./repro/04b-libc-getsockopt-unbounded-range.sh), [patch](./patches/04b-libc-getsockopt-unbounded-range.patch)
 
 ## Summary
 
@@ -26,12 +30,13 @@ The sibling `setsockopt` already bounds its buffer correctly:
 
 ## Versions
 
-- Reproduced with Frama-C `34.0~~dev (Selenium)`.
+- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`) and on
+  `34.0~beta (Selenium)`, Eva and WP, with
+  [`./repro/04b-libc-getsockopt-unbounded-range.sh`](./repro/04b-libc-getsockopt-unbounded-range.sh)
+  (2026-11-15). The contract is at `share/libc/sys/socket.h:377-408` (clause at 397-398).
 - The same text is in the public GitHub snapshot up to 20.0 (Calcium, 2019), so the
   issue is at least five years old.
-- The contract is unchanged on `master` at `ad24dca` (2026-11-02), `share/libc/sys/socket.h:397-398`,
-  and in `35.0~~dev (Bromine)`. The Eva and WP runs below were made on 34. On 35, the same contract
-  also aborts E-ACSL under `e-acsl-gcc -L`; see
+- The same contract also aborts E-ACSL under `e-acsl-gcc -L`; see
   [frama-c-eacsl-unbounded-range-abort.md](./frama-c-eacsl-unbounded-range-abort.md).
 
 ## Reproduction
@@ -68,38 +73,39 @@ getsockopt(2) writes at most `*optlen` bytes (POSIX: a longer value "shall be si
 truncated"). Any level/option other than `SOL_SOCKET`/`SO_ERROR` triggers it
 (`SO_RCVBUF`, `TCP_INFO`, `SO_PEERCRED`, `SOL_NETLINK` options, ...).
 
-## Proposed fix
+## Fix
 
-Bound the buffer by `*optlen`, as `setsockopt` does with `optlen`. Bounding the two
-`assigns` ranges as well keeps the analysis precise. Nothing else changes; the
-`so_error` behavior is untouched.
+Patch: [`./patches/04b-libc-getsockopt-unbounded-range.patch`](./patches/04b-libc-getsockopt-unbounded-range.patch),
+one commit on `fix/libc-getsockopt-range` from `3dff90fc70`, "[libc] getsockopt: bound optval by
+*optlen". It bounds the buffer by `*optlen`, as `setsockopt` does with `optlen`
+(`socket.h:551`) and `getsockname` with `*address_len` (`socket.h:361`), in three places:
 
-```diff
---- a/share/libc/sys/socket.h
-+++ b/share/libc/sys/socket.h
-@@ getsockopt @@
-   requires valid_sockfd: 0 <= sockfd < __FC_MAX_OPEN_SOCKETS;
-   requires valid_optlen: \valid(optlen);
--  assigns ((char*)optval)[0..], \result
-+  assigns ((char*)optval)[0..*optlen-1], \result
-           \from indirect:sockfd, indirect:level, indirect:optname,
-@@
-   behavior other_options:
-     assumes optname_not_error: !(level == SOL_SOCKET && optname == SO_ERROR);
-     requires optval_null_or_valid:
--      optval == \null || \valid(((char*)optval)+(0..));
--    assigns ((char*)optval)[0..], \result
-+      optval == \null || \valid(((char*)optval)+(0..*optlen-1));
-+    assigns ((char*)optval)[0..*optlen-1], \result
-             \from indirect:sockfd, indirect:level, indirect:optname,
-```
+- `requires optval_null_or_valid: optval == \null || \valid(((char*)optval)+(0 .. *optlen-1));`
+- the default `assigns` (line 380) and the `other_options` `assigns` (line 399):
+  `((char*)optval)[0 .. *optlen-1]`.
 
-`*optlen == 0` gives an empty range (valid), and a null `optval` stays allowed, as before.
+`*optlen == 0` gives an empty range (valid), a null `optval` stays allowed, and `so_error` is
+untouched. Regression test: `tests/libc/socket_h.c` gets two calls through `other_options`
+(`SO_RCVBUF`, with a 4-byte `int` and with a null `optval`) and `socket_h.0.res.oracle` is updated.
+On `master` the first one is `invalid` and `main` becomes `NON TERMINATING`; with the patch both are
+valid, and the null call gets the same `Completely invalid destination for assigns clause ...
+Ignoring.` message as the existing null `recvfrom` call of the test.
 
-## Validation of the proposed contract
+## Validation of the fix
 
-Tested by declaring the patched contract in place of the stock one (same file and
-program as above; `-DOPTLEN=8` makes the caller claim 8 bytes for a 4-byte `int`).
+Built on `3dff90fc70` with the patch (image `framac-master-audit:3dff90f`), 2026-11-15, with the
+reproducer:
+
+| Check | `master` `3dff90fc70` | 34.0~beta | Patched |
+|---|---|---|---|
+| Eva, correct call | `optval_null_or_valid` Alarm, `NON TERMINATING FUNCTION` | same | Valid, `r ∈ {-1; 0}` |
+| Eva, `*optlen` (8) larger than `optval` (4 bytes) | Alarm | same | Alarm (as it should) |
+| WP (`-wp-model Bytes`), `-wp-fct get_rcvbuf` | `Invalid infinite range (global L_opt_402)+(0..)`, aborted | same | 8/8 goals proved |
+| ptests `tests/libc` (244 results) | — | — | only `socket_h.0.res.oracle` changes (new calls), promoted; rerun clean |
+| `git diff --check` | — | — | clean except trailing spaces in the promoted oracle lines, as in the existing oracle (36 such lines on `master`) |
+
+Earlier check on 34 (contract declared in place of the stock one, same program; `-DOPTLEN=8`
+makes the caller claim 8 bytes for a 4-byte `int`):
 
 | Program | Stock libc | Patched |
 |---|---|---|
@@ -117,10 +123,25 @@ because of the `int *` to `char *` cast (a known Typed limitation), not the cont
 
 ## Other occurrences
 
-A scan of every ACSL contract under `share/libc` for ranges without an upper bound found
-this `requires` clause as the **only** one. All other open ranges (`s[0..]` in `stdio.h`,
-`argz.h`, `pwd.h`, `sys/stat.h`, `sys/uio.h`, `recvmsg`, ...) are in `assigns`/`\from`
-clauses, where an over-approximation is sound and analysers accept it.
+Re-checked on `master` `3dff90fc70` (2026-11-15) by scanning every ACSL clause under
+`share/libc` for a range without an upper bound, outside `assigns`, `\from` and `reads`. The
+earlier claim that the `getsockopt` clause is the only one was wrong. The scan finds six:
 
-(The `assigns` range of `getsockopt` itself is one of those; the patch bounds it only for
-precision.)
+| Function | Clause | Satisfiable? |
+|---|---|---|
+| `getsockopt` | `sys/socket.h:397-398`: `requires optval_null_or_valid: ... \valid(((char*)optval)+(0..))` | no (this issue) |
+| `strtok_r` | `string.h:353-355`: `requires separation: \separated(..., *saveptr+(0..))` | yes |
+| `wcschr` | `wchar.h:109-110`: `ensures ... \subset(\result, wcs+(0..))` | yes |
+| `wcspbrk` | `wchar.h:200-201`: same `ensures` | yes |
+| `wcsrchr` | `wchar.h:208-209`: same `ensures` | yes |
+| `wcsstr` | `wchar.h:225-226`: `ensures ... \subset(\result, haystack+(0 .. ))` | yes |
+
+Only `getsockopt` is unsatisfiable. On a `strtok_r` caller and a `wcschr` caller, Eva validates the
+`separation` precondition and WP (`-wp-model Bytes`) proves all goals (8/8 and 3/3). E-ACSL aborts
+on such ranges under `e-acsl-gcc -L` (checked for `strtok_r`, `getsockopt` and `wcschr`); see
+[frama-c-eacsl-unbounded-range-abort.md](./frama-c-eacsl-unbounded-range-abort.md).
+
+The other open ranges (`s[0..]` in `stdio.h`, `argz.h`, `pwd.h`, `sys/stat.h`, `sys/uio.h`,
+`recvmsg`, the `reads` of `strlen`/`wcslen`, ...) are in `assigns`/`\from`/`reads` clauses, where
+an over-approximation is sound. The `assigns` range of `getsockopt` itself was one of those; the
+patch bounds it for precision.

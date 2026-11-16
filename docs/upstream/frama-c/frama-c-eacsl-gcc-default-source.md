@@ -1,6 +1,13 @@
 # e-acsl-gcc: Frama-C preprocesses with `-std=c99 -D_DEFAULT_SOURCE` but the compiler gets `-std=c99` alone, so programs calling `strdup`, `strtok_r`, `fileno`, … fail to build
 
+**Filed upstream on 2026-11-15:** issue [#2809](https://git.frama-c.com/pub/frama-c/-/work_items/2809), merge request [!40](https://git.frama-c.com/pub/frama-c/-/merge_requests/40).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/12-eacsl-gcc-default-source-issue.md), [MR](./filing/12-eacsl-gcc-default-source-mr.md), [reproducer](./repro/12-eacsl-gcc-default-source.sh), [patch](./patches/12-eacsl-gcc-default-source.patch)
+
+**Land before [frama-c-eacsl-gcc-clang-cflags.md](./frama-c-eacsl-gcc-clang-cflags.md) (Issue 10).**
+This fix is independent; the Issue 10 patch is stacked on it.
 
 ## Summary
 
@@ -28,9 +35,11 @@ compiler does not see them. The call is implicitly declared as returning `int`.
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02),
-  Debian 13, glibc 2.41, gcc 14.2.0, clang 19.1.7.
-- `plugins/e-acsl/scripts/e-acsl-gcc` is byte-identical in `34.0~~dev (Selenium)`.
+- Reproduced on 2026-11-15 with Frama-C `35.0~~dev (Bromine)`, `master` at `3dff90fc70`
+  (2026-11-13), and with `34.0~beta (Selenium)`: same failure on both, Debian 13, glibc 2.41,
+  gcc 14.2.0 ([reproducer](./repro/12-eacsl-gcc-default-source.sh)).
+- First seen on `master` `ad24dca` (2026-11-02); the script was byte-identical in
+  `34.0~~dev (Selenium)`.
 
 ## Reproduction
 
@@ -72,39 +81,51 @@ The glibc guard, in `/usr/include/string.h`:
 extern char *strdup (const char *__s)
 ```
 
-## Proposed fix
+## Fix (patch)
 
-Compile with the feature macros that Frama-C preprocessed with:
+[`patches/12-eacsl-gcc-default-source.patch`](./patches/12-eacsl-gcc-default-source.patch), one
+commit (`34fb547fb4`) on `fix/eacsl-gcc-default-source` from `3dff90fc70`,
+"[e-acsl] e-acsl-gcc: compile with -D_DEFAULT_SOURCE, as Frama-C preprocesses":
 
-```diff
---- a/plugins/e-acsl/scripts/e-acsl-gcc
-+++ b/plugins/e-acsl/scripts/e-acsl-gcc
-@@ -890,7 +890,7 @@ fi
- # Gcc and related flags
- CC="$OPTION_CC"
- CFLAGS="$OPTION_CFLAGS
--  -std=c99 $GCCMACHDEP $OPT_CFLAGS
-+  -std=c99 -D_DEFAULT_SOURCE $GCCMACHDEP $OPT_CFLAGS
-   -fno-builtin -fno-merge-constants
-   -Wall \
-   -Wno-long-long \
-```
+- `plugins/e-acsl/scripts/e-acsl-gcc:893`: `-std=c99 -D_DEFAULT_SOURCE` in `CFLAGS`.
+  `-std=gnu99` would also expose the declarations; `-D_DEFAULT_SOURCE` is exactly what the
+  Frama-C side uses and leaves `-std=c99` unchanged.
+- Regression test `plugins/e-acsl/tests/libc/default_source.c` (calls `stpcpy`), with its
+  default-configuration oracles. Its `dev` run uses `-L`: the `dev` configuration always passes
+  `-X`, so it never compiles the original program (and `ROOT_EACSL_GCC_MISC_OPTS` cannot be
+  overridden from a test: `EACSL_EXEC` expands it when it is defined). Without `-L`, the
+  instrumented code carries Frama-C's own prototypes and builds anyway.
+- `plugins/e-acsl/doc/Changelog`: one entry.
 
-`-std=gnu99` would also expose the declarations. `-D_DEFAULT_SOURCE` is better because it is exactly
-what the Frama-C side uses, so the compiler and Frama-C see the same declarations, and it leaves
-`-std=c99` itself unchanged.
+**Order with Issue 10.** This patch is independent. It does not change clang builds on its own,
+since the clang branch still overwrites `CFLAGS`. The Issue 10 patch is stacked on this commit:
+restoring `-std=c99` under clang without `-D_DEFAULT_SOURCE` breaks clang builds of POSIX programs
+(checked, see [frama-c-eacsl-gcc-clang-cflags.md](./frama-c-eacsl-gcc-clang-cflags.md)).
 
-## Validation of the proposed fix
+## Validation
 
-Built from `ad24dca` with this patch and the clang `CFLAGS` patch:
+Validated on 2026-11-15: patch built over `framac-master-audit:3dff90f` (master `3dff90fc70`) and
+installed; Debian 13, glibc 2.41, gcc 14.2.0, clang 19.1.7.
 
-| Check | `master` | Patched |
+| Check | `master` `3dff90fc70` | Patched |
 |---|---|---|
-| `posix_dup.c`, gcc | build fails | builds; runs, exit 0 |
-| `posix_dup.c`, gcc, `-L` | build fails | builds; runs, exit 0 |
-| `posix_dup.c`, clang (with or without `-L`) | builds (only because `-std=c99` is dropped) | builds; runs, exit 0 |
-| `strtok_r`, clang, `-L` (needs the unbounded-range fix) | — | builds; runs |
-| ptests `plugins/e-acsl/tests`, `dev` configuration (195 tests compiled and run through `e-acsl-gcc`) | — | no change |
+| `posix_dup.c` (`strdup`), gcc, without and with `-L` | `fail to compile/link un-instrumented code` | builds; runs, exit 0 |
+| `posix_dup.c`, gcc, `-X -L` | `fail to compile/link instrumented code` | — (covered by the test below) |
+| New test `libc/default_source.c`, `dev` run (`-X -L`) | fails (`assignment to ‘char *’ from ‘int’`) | pass |
+| ptests `plugins/e-acsl/tests`, `dev` configuration (196 tests, each compiled with gcc and run) | — | all pass |
+| ptests `libc`, default configuration | — | pass; only the new oracles added |
+| `posix_dup.c`, `-G clang`, with this patch and Issue 10's | builds (only because `-std=c99` is dropped) | builds; runs, exit 0 |
+| `34.0~beta (Selenium)` | same failure as `master` | — |
+
+`git diff --check` is clean except for the generated oracles (trailing spaces after `Warning:`,
+final empty line). `clang-format-19 --dry-run` passes on the test file. `make check-lint` /
+`make check-headers` were not run (no `ocp-indent` or `headache` in the image).
+
+The `dev` suite was first run without a core-size limit and stalled: on this Docker/WSL2 host every
+`abort()` goes through the `core_pattern` pipe helper (`/wsl-capture-crash`), which took up to
+156 s per crash, so `format/printf.c` (hundreds of forked aborts) alone ran for over 40 minutes.
+Rerun under `prlimit --core=1:1`, where the kernel skips the pipe dump; the whole suite then takes a
+few minutes. This is a property of the test host, not of Frama-C.
 
 ## Workaround
 

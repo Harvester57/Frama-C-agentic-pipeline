@@ -1,6 +1,10 @@
 # E-ACSL: an unbounded range anywhere aborts the whole run (`-L` and `strtok_r`, `getsockopt`, `wcschr`), instead of ignoring the annotation
 
+**Filed upstream on 2026-11-15:** issue [#2798](https://git.frama-c.com/pub/frama-c/-/work_items/2798), merge request [!29](https://git.frama-c.com/pub/frama-c/-/merge_requests/29).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/04-eacsl-unbounded-range-abort-issue.md), [MR](./filing/04-eacsl-unbounded-range-abort-mr.md), [reproducer](./repro/04-eacsl-unbounded-range-abort.sh), [patch](./patches/04-eacsl-unbounded-range-abort.patch)
 
 ## Summary
 
@@ -18,16 +22,21 @@ instrumented at all. Every other construct E-ACSL cannot translate goes through
 `Ignoring annotation.` warning and goes on.
 
 The abort is also reached for contracts the user did not write. Frama-C's own libc uses unbounded
-ranges in at least three contracts on `master`:
+ranges outside `assigns` clauses in six contracts on `master` (`3dff90fc70`):
 
-| Function | Contract (`share/libc/…`) |
-|---|---|
-| `strtok_r` | `string.h:353-355`: `requires separation: \separated(…, *saveptr+(0..));` |
-| `getsockopt` | `sys/socket.h:397-398`: `requires optval_null_or_valid: optval == \null \|\| \valid(((char*)optval)+(0..));` |
-| `wcschr` | `wchar.h:109-110`: `ensures result_null_or_inside_wcs: \result == \null \|\| \subset(\result, wcs+(0..));` |
+| Function | Contract (`share/libc/…`) | `e-acsl-gcc -L` on a caller, `master` |
+|---|---|---|
+| `strtok_r` | `string.h:354-355`: `requires separation: \separated(…, *saveptr+(0..));` | aborted (`string.h:352`) |
+| `getsockopt` | `sys/socket.h:397-398`: `requires optval_null_or_valid: optval == \null \|\| \valid(((char*)optval)+(0..));` | aborted (`sys/socket.h:377`) |
+| `wcschr` | `wchar.h:109-110`: `ensures result_null_or_inside_wcs: \result == \null \|\| \subset(\result, wcs+(0..));` | aborted (`wchar.h:106`) |
+| `wcspbrk` | `wchar.h:200-201`: same `ensures` on `wcs+(0 .. )` | aborted (`wchar.h:196`) |
+| `wcsrchr` | `wchar.h:208-209`: same `ensures` on `wcs+(0 .. )` | aborted (`wchar.h:205`) |
+| `wcsstr` | `wchar.h:225-226`: `ensures result_null_or_inside_haystack: … \subset (\result, haystack+(0 .. ));` | aborted (`wchar.h:221`) |
 
 With `e-acsl-gcc -L` (`--frama-c-stdlib`), E-ACSL instruments the libc contracts of the functions
-the program calls. A program that calls `strtok_r` therefore cannot be instrumented at all.
+the program calls. A program that calls any of these functions therefore cannot be instrumented at
+all. (The `-L` runs used `-e -D_DEFAULT_SOURCE` so that the compiler sees the POSIX prototypes;
+that is a separate `e-acsl-gcc` issue.)
 
 The `getsockopt` contract is wrong in its own right (it is unsatisfiable); that is reported
 separately in [frama-c-getsockopt-unbounded-range.md](./frama-c-getsockopt-unbounded-range.md). Fixing
@@ -35,9 +44,13 @@ it would not fix this issue, which concerns E-ACSL's handling of every unbounded
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02),
-  Debian 13, gcc 14.2.0, clang 19.1.7.
-- Same behaviour in `34.0~~dev (Selenium)`.
+- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`), Debian 13,
+  gcc 14.2.0, with [`./repro/04-eacsl-unbounded-range-abort.sh`](./repro/04-eacsl-unbounded-range-abort.sh)
+  (2026-11-15). First reproduced on `ad24dca` (2026-11-02), with gcc and clang 19.1.7.
+- Same output on `34.0~beta (Selenium)` (2026-11-15).
+- The E-ACSL interval changes merged since `ad24dca` (`67e5edb4a4`, `8768bcbeb7`, `cc5b8431a2`,
+  `4265ab3bb5`) only touch the join and meet of semi-bounded intervals in `interval_utils.ml`. The
+  four abort sites are unchanged on `3dff90fc70`, and the patch below is the same.
 
 ## Reproduction
 
@@ -80,11 +93,16 @@ e-acsl-gcc: fatal error: aborted by Frama-C
 
 The valid `requires n >= 0` clause is lost along with the rest of the program.
 
-## Proposed fix
+## Fix
 
-Treat an unbounded range as untypable, like the other unsupported constructs. The annotation that
-contains it is dropped with a warning, and the rest of the program is still instrumented. All four
-sites are the same one-line change:
+Patch: [`./patches/04-eacsl-unbounded-range-abort.patch`](./patches/04-eacsl-unbounded-range-abort.patch),
+one commit on `fix/e-acsl-unbounded-range` from `3dff90fc70`, "[e-acsl] ignore annotations with
+unbounded ranges instead of aborting". It treats an unbounded range as untypable, like the other
+unsupported constructs: the annotation that contains it is dropped with a warning, and the rest of
+the program is still instrumented. It adds the regression test
+`plugins/e-acsl/tests/memory/unbounded_range.c` (a `requires` and two `assert`s with unbounded
+ranges next to checkable clauses) with its default-configuration oracles. All four sites are the
+same one-line change:
 
 ```diff
 --- a/plugins/e-acsl/src/analyses/interval.ml
@@ -139,19 +157,28 @@ All four sites get the same change, so whichever phase meets the range first dro
 
 The patch also fixes the "E-ACSl" typo in two of the messages.
 
-## Validation of the proposed fix
+## Validation of the fix
 
-Built from `ad24dca` with the patch:
+Built on `3dff90fc70` with the patch (image `framac-master-audit:3dff90f`, incremental
+`dune build @install --release` and `dune install`), 2026-11-15:
 
-| Check | `master` | Patched |
-|---|---|---|
-| `e-acsl-gcc -L s.c` (`strtok_r`) | aborted by Frama-C | builds; runs, exit 1 (as the program returns) |
-| `e-acsl-gcc unb_user.c` | aborted by Frama-C | `invalid E-ACSL construct 'unbounded range'. Ignoring annotation.`; builds; `n >= 0` is still checked and fails at runtime as expected (`n: -1`) |
-| `e-acsl-gcc -L` on a `strchr` control | builds | builds |
-| E-ACSL ptests (default and `dev` configurations) | — | no change |
+| Check | `master` `3dff90fc70` | 34.0~beta | Patched |
+|---|---|---|---|
+| `e-acsl-gcc unb_user.c` | `unbounded ranges are not part of E-ACSl`, aborted | same | `invalid E-ACSL construct 'unbounded range'. Ignoring annotation.`; builds; `requires n >= 0` is still checked and fails at runtime as it should |
+| `e-acsl-gcc -L -e -D_DEFAULT_SOURCE` on a `strtok_r` caller | aborted (`string.h:352`) | same | builds; runs, exit 0 |
+| same on a `getsockopt` caller | aborted (`sys/socket.h:377`) | not run | warning on `socket.h:398`; builds; runs, exit 0 |
+| same on a `wcschr` caller | aborted (`wchar.h:106`) | not run | builds; runs, exit 0 |
+| same on `wcspbrk`, `wcsrchr`, `wcsstr` callers | aborted (`wchar.h:196`, `:205`, `:221`) | not run | builds; runs, exit 1 (the value the program returns) |
+| ptests `plugins/e-acsl/tests`, default configuration (198 results) | new test aborts | — | only the two new oracles; promoted; rerun clean |
+| ptests `plugins/e-acsl/tests`, `dev` configuration (compile and run) | existing tests pass; new test fails | — | pass, new test included |
+| `make check-lint` (7 changed files, ocp-indent 1.10.0) | — | — | clean (`clang-format` not installed: new C test not checked) |
+
+Earlier validation on `ad24dca` (2026-11-02) gave the same results, plus: a `strchr` control builds
+with and without the patch.
 
 ## Workaround
 
-Do not use `-L` for programs that call `strtok_r`, `getsockopt` or `wcschr`. With the host libc
+Do not use `-L` for programs that call `strtok_r`, `getsockopt`, `wcschr`, `wcspbrk`, `wcsrchr`
+or `wcsstr`. With the host libc
 (the default), libc contracts are not instrumented. Alternatively, override the contract with a
 bounded one in a project-local header.

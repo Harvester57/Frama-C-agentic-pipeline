@@ -1,0 +1,856 @@
+From 2b75ce90705674c38949fee98d1822ccafd07ed7 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 16 Nov 2026 13:04:31 +0100
+Subject: [PATCH] [e-acsl] accept a promoted unsigned char or short for %u and
+ %x
+
+With -e-acsl-validate-format-strings, the instrumentation describes each
+variadic argument of printf and friends by its type, and the runtime
+requires that type to equal the one the directive expects. An argument of
+type unsigned char, unsigned short or _Bool reaches the instrumentation
+promoted to int, so it was described as int, and formatting a byte with
+"%u" or "%x" aborted:
+
+  snprintf: directive 1 ('%u') expects argument of type 'unsigned int'
+  but the corresponding argument has type 'int'
+
+Every value of these types is representable in both int and unsigned int
+(C11 7.16.1.1p2), and "%hhu" already accepted the same argument.
+
+The instrumentation (Functions.Libc.get_printf_argument_str) now looks
+through the promotion to int and describes such an argument by its own
+type: 'C' for unsigned char (also used for _Bool, and for char where char
+is unsigned), 'H' for unsigned short. The runtime accepts these where it
+expects int or unsigned int, and names them by their own type otherwise.
+Signed types smaller than int are still described as int: a negative value
+is not representable in unsigned int. int and unsigned int stay distinct,
+so the existing printf.c test is unchanged.
+
+Regression test: tests/format/printf_promoted.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../e-acsl/libc_replacements/e_acsl_stdio.c   |  25 +-
+ plugins/e-acsl/src/libraries/functions.ml     |  34 +-
+ .../format/oracle/gen_printf_promoted.0.c     | 583 ++++++++++++++++++
+ .../oracle/printf_promoted.0.res.oracle       |  31 +
+ .../printf_promoted.0.e-acsl.err.log          |  20 +
+ plugins/e-acsl/tests/format/printf_promoted.c |  48 ++
+ 6 files changed, 737 insertions(+), 4 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/format/oracle/gen_printf_promoted.0.c
+ create mode 100644 plugins/e-acsl/tests/format/oracle/printf_promoted.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/format/oracle_dev/printf_promoted.0.e-acsl.err.log
+ create mode 100644 plugins/e-acsl/tests/format/printf_promoted.c
+
+diff --git a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+index f4876abc80..552c9e5689 100644
+--- a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
++++ b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+@@ -692,6 +692,29 @@ static abbrev_t infer_n_abbr(format_directive *dir) {
+   return '\0';
+ }
+ 
++/** \brief Return a true value if an argument of abbreviated type `actual_t`
++   is accepted by a directive that expects an argument of abbreviated type
++   `expected_t`.
++
++   Arguments of integer types smaller than `int` are promoted to `int`. The
++   instrumentation describes the signed ones as `int` ('d'), and the unsigned
++   ones by their type before promotion: 'C' for `unsigned char`, `_Bool` and
++   `char` where it is unsigned, 'H' for `unsigned short`. Besides the expected
++   type itself, such an unsigned argument is accepted for `int` and
++   `unsigned int`: each of its values is representable in both types, so
++   reading it as either type gives its value (C11 7.16.1.1p2). */
++static int compatible_abbr(abbrev_t expected_t, abbrev_t actual_t) {
++  if (actual_t == expected_t)
++    return 1;
++  switch (actual_t) {
++  case IUChar:
++  case IUShort:
++    return expected_t == IInt || expected_t == IUInt;
++  default:
++    return 0;
++  }
++}
++
+ /** \brief Check that a given abbreviated type (`expected_t`) matches the
+    abbreviated type in the format description (`fmtdesc`) and abort the
+    execution if it is not so.
+@@ -702,7 +725,7 @@ static abbrev_t infer_n_abbr(format_directive *dir) {
+ static void validate_format_type(abbrev_t expected_t, const char *fmtdesc,
+                                  format_directive *dir, const char *func) {
+   abbrev_t actual_t = fmtdesc[dir->arg.index];
+-  if (actual_t != expected_t) {
++  if (!compatible_abbr(expected_t, actual_t)) {
+     private_abort("%s: directive %d ('%s') expects argument of type '%s'"
+                   " but the corresponding argument has type '%s'\n",
+                   func, dir->arg.index + 1, dir->directive,
+diff --git a/plugins/e-acsl/src/libraries/functions.ml b/plugins/e-acsl/src/libraries/functions.ml
+index 953d8969cb..943b1cf656 100644
+--- a/plugins/e-acsl/src/libraries/functions.ml
++++ b/plugins/e-acsl/src/libraries/functions.ml
+@@ -105,8 +105,20 @@ module Libc = struct
+       else
+         l
+     in
++    (* get a character representing an unsigned integer type smaller than
++       [int], if [k] is one. An argument of such a type is promoted to [int],
++       and each of its values is representable in both [int] and
++       [unsigned int]: the runtime accepts it for directives expecting either
++       type. *)
++    let get_small_unsigned_ikind_str = function
++      | IUChar -> Some "C" (* [unsigned char] *)
++      | IBool -> Some "C" (* [_Bool], checked as [unsigned char] *)
++      | IChar when Machine.char_is_unsigned () -> Some "C" (* [char] *)
++      | IUShort -> Some "H" (* [unsigned short] *)
++      | _ -> None
++    in
+     (* get a character representing an integer type *)
+-    let get_ikind_str = function
++    let get_ikind_str k = match k with
+       | IInt -> "d" (* [int] *)
+       | IUInt -> "D" (* [unsigned int] *)
+       | ILong -> "l" (* [long] *)
+@@ -116,7 +128,18 @@ module Libc = struct
+       | IInt128 | IUInt128 -> Error.not_yet "functions.ml: 128-bit integers"
+       (* _Bool, char and short (either signed or unsigned are promoted to
+          int) *)
+-      | IBool | IChar | ISChar | IUChar | IShort | IUShort -> "d"
++      | IBool | IChar | ISChar | IUChar | IShort | IUShort ->
++        Option.value ~default:"d" (get_small_unsigned_ikind_str k)
++    in
++    (* the default argument promotions cast an argument of an unsigned type
++       smaller than [int] to [int]: look through that cast to get its type *)
++    let get_promoted_ikind_str exp = match exp.enode with
++      | CastE (ty, e) ->
++        (match Ast_types.C.unroll_node ty,
++               Ast_types.C.unroll_node (Cil.typeOf e) with
++        | TInt IInt, TInt k -> get_small_unsigned_ikind_str k
++        | _ -> None)
++      | _ -> None
+     in
+     (* get a character representing a floating point type *)
+     let get_fkind_str = function
+@@ -149,7 +172,12 @@ module Libc = struct
+     let param_str =
+       List.fold_right
+         (fun exp acc -> match Cil.(Ast_types.C.unroll_node (typeOf exp)) with
+-           | TInt k -> get_ikind_str k ^ acc
++           | TInt k ->
++             let str =
++               Option.value ~default:(get_ikind_str k)
++                 (get_promoted_ikind_str exp)
++             in
++             str ^ acc
+            | TFloat k -> get_fkind_str k ^ acc
+            | TPtr ty -> get_pkind_str exp (Ast_types.C.unroll ty) ^ acc
+            | TVoid | TArray _ | TFun _ | TNamed _ | TComp _ | TEnum _
+diff --git a/plugins/e-acsl/tests/format/oracle/gen_printf_promoted.0.c b/plugins/e-acsl/tests/format/oracle/gen_printf_promoted.0.c
+new file mode 100644
+index 0000000000..65cd4ded78
+--- /dev/null
++++ b/plugins/e-acsl/tests/format/oracle/gen_printf_promoted.0.c
+@@ -0,0 +1,583 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "stdlib.h"
++#include "sys/time.h"
++#include "sys/types.h"
++#include "sys/wait.h"
++#include "time.h"
++#include "unistd.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++/*@ terminates \false;
++    exits status: \exit_status == \old(status);
++    ensures never_terminates: \false;
++    
++    assigns \exit_status \from status;
++ */
++ __attribute__((__noreturn__)) void __gen_e_acsl_exit(int status);
++
++/*@ ensures result_ok_or_error: \result == -1 || \result >= 0;
++    ensures
++      initialization: stat_loc_init_on_success:
++        \result >= 0 && \old(stat_loc) != \null ==>
++        \initialized(\old(stat_loc));
++    assigns \result, *stat_loc;
++    assigns \result \from (indirect: options);
++    assigns *stat_loc \from (indirect: options);
++    
++    behavior stat_loc_null:
++      assumes stat_loc_null: stat_loc == \null;
++      assigns \result;
++      assigns \result \from \nothing;
++    
++    behavior stat_loc_non_null:
++      assumes stat_loc_non_null: stat_loc != \null;
++      requires valid_stat_loc: \valid(stat_loc);
++      assigns \result, *stat_loc;
++      assigns \result \from (indirect: options);
++      assigns *stat_loc \from (indirect: options);
++ */
++pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options);
++
++/*@ ensures
++      result_ok_child_or_error: \result == 0 || \result > 0 || \result == -1;
++    assigns \result;
++    assigns \result \from \nothing;
++ */
++pid_t __gen_e_acsl_fork(void);
++
++int main(void)
++{
++  int __retres;
++  char t[16];
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  unsigned char uc = (unsigned char)200;
++  unsigned short us = (unsigned short)60000;
++  _Bool b = (_Bool)1;
++  signed char sc = (signed char)-1;
++  short s = (short)-2;
++  unsigned char const addr[4] =
++    {(unsigned char)192,
++     (unsigned char)168,
++     (unsigned char)1,
++     (unsigned char)200};
++  {
++    pid_t pid = __gen_e_acsl_fork();
++    if (! pid) {
++      __e_acsl_builtin_printf("CCCC","%u %o %x %X\n",(int)uc,(int)uc,(int)uc,
++                              (int)uc);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status = 0;
++      __e_acsl_store_block((void *)(& process_status),4UL);
++      __e_acsl_full_init((void *)(& process_status));
++      __gen_e_acsl_waitpid(pid,& process_status,0);
++      signal_eval(process_status,0,"printf_promoted.c:26");
++      __e_acsl_delete_block((void *)(& process_status));
++    }
++  }
++  {
++    pid_t pid_0 = __gen_e_acsl_fork();
++    if (! pid_0) {
++      __e_acsl_builtin_printf("HHHH","%u %o %x %X\n",(int)us,(int)us,(int)us,
++                              (int)us);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_0 = 0;
++      __e_acsl_store_block((void *)(& process_status_0),4UL);
++      __e_acsl_full_init((void *)(& process_status_0));
++      __gen_e_acsl_waitpid(pid_0,& process_status_0,0);
++      signal_eval(process_status_0,0,"printf_promoted.c:27");
++      __e_acsl_delete_block((void *)(& process_status_0));
++    }
++  }
++  {
++    pid_t pid_1 = __gen_e_acsl_fork();
++    if (! pid_1) {
++      __e_acsl_builtin_printf("CCC","%u %x %d\n",(int)b,(int)b,(int)b);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_1 = 0;
++      __e_acsl_store_block((void *)(& process_status_1),4UL);
++      __e_acsl_full_init((void *)(& process_status_1));
++      __gen_e_acsl_waitpid(pid_1,& process_status_1,0);
++      signal_eval(process_status_1,0,"printf_promoted.c:28");
++      __e_acsl_delete_block((void *)(& process_status_1));
++    }
++  }
++  {
++    pid_t pid_2 = __gen_e_acsl_fork();
++    if (! pid_2) {
++      __e_acsl_builtin_printf("CHC","%d %i %c\n",(int)uc,(int)us,(int)uc);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_2 = 0;
++      __e_acsl_store_block((void *)(& process_status_2),4UL);
++      __e_acsl_full_init((void *)(& process_status_2));
++      __gen_e_acsl_waitpid(pid_2,& process_status_2,0);
++      signal_eval(process_status_2,0,"printf_promoted.c:29");
++      __e_acsl_delete_block((void *)(& process_status_2));
++    }
++  }
++  {
++    pid_t pid_3 = __gen_e_acsl_fork();
++    if (! pid_3) {
++      __e_acsl_builtin_printf("CCHH","%hhu %hhd %hu %hd\n",(int)uc,(int)uc,
++                              (int)us,(int)us);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_3 = 0;
++      __e_acsl_store_block((void *)(& process_status_3),4UL);
++      __e_acsl_full_init((void *)(& process_status_3));
++      __gen_e_acsl_waitpid(pid_3,& process_status_3,0);
++      signal_eval(process_status_3,0,"printf_promoted.c:30");
++      __e_acsl_delete_block((void *)(& process_status_3));
++    }
++  }
++  {
++    pid_t pid_4 = __gen_e_acsl_fork();
++    if (! pid_4) {
++      __e_acsl_builtin_snprintf("CCCC",t,16UL,"%u.%u.%u.%u",(int)addr[0],
++                                (int)addr[1],(int)addr[2],(int)addr[3]);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_4 = 0;
++      __e_acsl_store_block((void *)(& process_status_4),4UL);
++      __e_acsl_full_init((void *)(& process_status_4));
++      __gen_e_acsl_waitpid(pid_4,& process_status_4,0);
++      signal_eval(process_status_4,0,"printf_promoted.c:31");
++      __e_acsl_delete_block((void *)(& process_status_4));
++    }
++  }
++  {
++    pid_t pid_5 = __gen_e_acsl_fork();
++    if (! pid_5) {
++      __e_acsl_builtin_printf("C","%u\n",
++                              (int)((unsigned char)((int)uc + 100)));
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_5 = 0;
++      __e_acsl_store_block((void *)(& process_status_5),4UL);
++      __e_acsl_full_init((void *)(& process_status_5));
++      __gen_e_acsl_waitpid(pid_5,& process_status_5,0);
++      signal_eval(process_status_5,0,"printf_promoted.c:32");
++      __e_acsl_delete_block((void *)(& process_status_5));
++    }
++  }
++  {
++    pid_t pid_6 = __gen_e_acsl_fork();
++    if (! pid_6) {
++      __e_acsl_builtin_printf("dddd","%d %i %hhd %hd\n",(int)sc,(int)s,
++                              (int)sc,(int)s);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_6 = 0;
++      __e_acsl_store_block((void *)(& process_status_6),4UL);
++      __e_acsl_full_init((void *)(& process_status_6));
++      __gen_e_acsl_waitpid(pid_6,& process_status_6,0);
++      signal_eval(process_status_6,0,"printf_promoted.c:36");
++      __e_acsl_delete_block((void *)(& process_status_6));
++    }
++  }
++  {
++    pid_t pid_7 = __gen_e_acsl_fork();
++    if (! pid_7) {
++      __e_acsl_builtin_printf("d","%u\n",(int)sc);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_7 = 0;
++      __e_acsl_store_block((void *)(& process_status_7),4UL);
++      __e_acsl_full_init((void *)(& process_status_7));
++      __gen_e_acsl_waitpid(pid_7,& process_status_7,0);
++      signal_eval(process_status_7,1,"printf_promoted.c:37");
++      __e_acsl_delete_block((void *)(& process_status_7));
++    }
++  }
++  {
++    pid_t pid_8 = __gen_e_acsl_fork();
++    if (! pid_8) {
++      __e_acsl_builtin_printf("d","%x\n",(int)s);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_8 = 0;
++      __e_acsl_store_block((void *)(& process_status_8),4UL);
++      __e_acsl_full_init((void *)(& process_status_8));
++      __gen_e_acsl_waitpid(pid_8,& process_status_8,0);
++      signal_eval(process_status_8,1,"printf_promoted.c:38");
++      __e_acsl_delete_block((void *)(& process_status_8));
++    }
++  }
++  {
++    pid_t pid_9 = __gen_e_acsl_fork();
++    if (! pid_9) {
++      __e_acsl_builtin_printf("d","%u\n",7);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_9 = 0;
++      __e_acsl_store_block((void *)(& process_status_9),4UL);
++      __e_acsl_full_init((void *)(& process_status_9));
++      __gen_e_acsl_waitpid(pid_9,& process_status_9,0);
++      signal_eval(process_status_9,1,"printf_promoted.c:41");
++      __e_acsl_delete_block((void *)(& process_status_9));
++    }
++  }
++  {
++    pid_t pid_10 = __gen_e_acsl_fork();
++    if (! pid_10) {
++      __e_acsl_builtin_printf("D","%d\n",7u);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_10 = 0;
++      __e_acsl_store_block((void *)(& process_status_10),4UL);
++      __e_acsl_full_init((void *)(& process_status_10));
++      __gen_e_acsl_waitpid(pid_10,& process_status_10,0);
++      signal_eval(process_status_10,1,"printf_promoted.c:42");
++      __e_acsl_delete_block((void *)(& process_status_10));
++    }
++  }
++  {
++    pid_t pid_11 = __gen_e_acsl_fork();
++    if (! pid_11) {
++      __e_acsl_builtin_printf("C","%lu\n",(int)uc);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_11 = 0;
++      __e_acsl_store_block((void *)(& process_status_11),4UL);
++      __e_acsl_full_init((void *)(& process_status_11));
++      __gen_e_acsl_waitpid(pid_11,& process_status_11,0);
++      signal_eval(process_status_11,1,"printf_promoted.c:45");
++      __e_acsl_delete_block((void *)(& process_status_11));
++    }
++  }
++  {
++    pid_t pid_12 = __gen_e_acsl_fork();
++    if (! pid_12) {
++      __e_acsl_builtin_printf("H","%llx\n",(int)us);
++      __gen_e_acsl_exit(0);
++    }
++    else {
++      int process_status_12 = 0;
++      __e_acsl_store_block((void *)(& process_status_12),4UL);
++      __e_acsl_full_init((void *)(& process_status_12));
++      __gen_e_acsl_waitpid(pid_12,& process_status_12,0);
++      signal_eval(process_status_12,1,"printf_promoted.c:46");
++      __e_acsl_delete_block((void *)(& process_status_12));
++    }
++  }
++  __retres = 0;
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++/*@ ensures
++      result_ok_child_or_error: \result == 0 || \result > 0 || \result == -1;
++    assigns \result;
++    assigns \result \from \nothing;
++ */
++pid_t __gen_e_acsl_fork(void)
++{
++  pid_t __retres;
++  __retres = fork();
++  {
++    int __gen_e_acsl_or;
++    int __gen_e_acsl_or_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"\\result",0,
++                                 __retres);
++    if (__retres == 0) __gen_e_acsl_or = 1;
++    else {
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"\\result",0,
++                                   __retres);
++      __gen_e_acsl_or = __retres > 0;
++    }
++    if (__gen_e_acsl_or) __gen_e_acsl_or_2 = 1;
++    else {
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"\\result",0,
++                                   __retres);
++      __gen_e_acsl_or_2 = __retres == -1;
++    }
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Postcondition";
++    __gen_e_acsl_assert_data.pred_txt = "\\result == 0 || \\result > 0 || \\result == -1";
++    __gen_e_acsl_assert_data.file = "FRAMAC_SHARE/libc/unistd.h";
++    __gen_e_acsl_assert_data.fct = "fork";
++    __gen_e_acsl_assert_data.line = 902;
++    __gen_e_acsl_assert_data.name = "result_ok_child_or_error";
++    __e_acsl_assert(__gen_e_acsl_or_2,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    return __retres;
++  }
++}
++
++/*@ ensures result_ok_or_error: \result == -1 || \result >= 0;
++    ensures
++      initialization: stat_loc_init_on_success:
++        \result >= 0 && \old(stat_loc) != \null ==>
++        \initialized(\old(stat_loc));
++    assigns \result, *stat_loc;
++    assigns \result \from (indirect: options);
++    assigns *stat_loc \from (indirect: options);
++    
++    behavior stat_loc_null:
++      assumes stat_loc_null: stat_loc == \null;
++      assigns \result;
++      assigns \result \from \nothing;
++    
++    behavior stat_loc_non_null:
++      assumes stat_loc_non_null: stat_loc != \null;
++      requires valid_stat_loc: \valid(stat_loc);
++      assigns \result, *stat_loc;
++      assigns \result \from (indirect: options);
++      assigns *stat_loc \from (indirect: options);
++ */
++pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
++{
++  __e_acsl_contract_t *__gen_e_acsl_contract;
++  int *__gen_e_acsl_at_2;
++  int *__gen_e_acsl_at;
++  pid_t __retres;
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_aligned_2;
++    int __gen_e_acsl_aligned_3;
++    int __gen_e_acsl_aligned_4;
++    int __gen_e_acsl_assumes_value;
++    __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
++                                 (void *)stat_loc);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\"pointer alignment\": \\aligned(stat_loc,4)",
++                                 0,__gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(stat_loc,4); */
++    {
++      __gen_e_acsl_assert_data.blocking = 1;
++      __gen_e_acsl_assert_data.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data.pred_txt = "\\aligned(stat_loc,4)";
++      __gen_e_acsl_assert_data.file = "FRAMAC_SHARE/libc/sys/wait.h";
++      __gen_e_acsl_assert_data.fct = "waitpid";
++      __gen_e_acsl_assert_data.line = 78;
++      __gen_e_acsl_assert_data.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    }
++    __gen_e_acsl_at = stat_loc;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)stat_loc,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"stat_loc",
++                                 (void *)stat_loc);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(stat_loc,4)",
++                                 0,__gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(stat_loc,4); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(stat_loc,4)";
++      __gen_e_acsl_assert_data_2.file = "FRAMAC_SHARE/libc/sys/wait.h";
++      __gen_e_acsl_assert_data_2.fct = "waitpid";
++      __gen_e_acsl_assert_data_2.line = 78;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_at_2 = stat_loc;
++    __gen_e_acsl_contract = __e_acsl_contract_init(2UL);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)stat_loc,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"stat_loc",
++                                 (void *)stat_loc);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                 "\"pointer alignment\": \\aligned(stat_loc,4)",
++                                 0,__gen_e_acsl_aligned_3);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(stat_loc,4); */
++    {
++      __gen_e_acsl_assert_data_3.blocking = 1;
++      __gen_e_acsl_assert_data_3.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_3.pred_txt = "\\aligned(stat_loc,4)";
++      __gen_e_acsl_assert_data_3.file = "FRAMAC_SHARE/libc/sys/wait.h";
++      __gen_e_acsl_assert_data_3.fct = "waitpid";
++      __gen_e_acsl_assert_data_3.line = 80;
++      __gen_e_acsl_assert_data_3.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_3,& __gen_e_acsl_assert_data_3);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++    }
++    __e_acsl_contract_set_behavior_assumes(__gen_e_acsl_contract,0UL,
++                                           stat_loc == (int *)0);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_4 = __e_acsl_aligned((void *)stat_loc,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"stat_loc",
++                                 (void *)stat_loc);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "\"pointer alignment\": \\aligned(stat_loc,4)",
++                                 0,__gen_e_acsl_aligned_4);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(stat_loc,4); */
++    {
++      __gen_e_acsl_assert_data_4.blocking = 1;
++      __gen_e_acsl_assert_data_4.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_4.pred_txt = "\\aligned(stat_loc,4)";
++      __gen_e_acsl_assert_data_4.file = "FRAMAC_SHARE/libc/sys/wait.h";
++      __gen_e_acsl_assert_data_4.fct = "waitpid";
++      __gen_e_acsl_assert_data_4.line = 83;
++      __gen_e_acsl_assert_data_4.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_4,& __gen_e_acsl_assert_data_4);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    }
++    __e_acsl_contract_set_behavior_assumes(__gen_e_acsl_contract,1UL,
++                                           stat_loc != (int *)0);
++    __gen_e_acsl_assumes_value = __e_acsl_contract_get_behavior_assumes
++    ((__e_acsl_contract_t const *)__gen_e_acsl_contract,1UL);
++    if (__gen_e_acsl_assumes_value) {
++      int __gen_e_acsl_aligned_5;
++      int __gen_e_acsl_valid;
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++        {.values = (void *)0};
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++        {.values = (void *)0};
++      __gen_e_acsl_aligned_5 = __e_acsl_aligned((void *)stat_loc,4UL);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_6,"stat_loc",
++                                   (void *)stat_loc);
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                   "\"pointer alignment\": \\aligned(stat_loc,4)",
++                                   0,__gen_e_acsl_aligned_5);
++      /*@ assert E_ACSL: "pointer alignment": \aligned(stat_loc,4); */
++      {
++        __gen_e_acsl_assert_data_6.blocking = 1;
++        __gen_e_acsl_assert_data_6.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_6.pred_txt = "\\aligned(stat_loc,4)";
++        __gen_e_acsl_assert_data_6.file = "FRAMAC_SHARE/libc/sys/wait.h";
++        __gen_e_acsl_assert_data_6.fct = "waitpid";
++        __gen_e_acsl_assert_data_6.line = 84;
++        __gen_e_acsl_assert_data_6.name = "pointer alignment";
++        __e_acsl_assert(__gen_e_acsl_aligned_5,& __gen_e_acsl_assert_data_6);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++      }
++      __gen_e_acsl_valid = __e_acsl_valid((void *)stat_loc,sizeof(int),
++                                          (void *)stat_loc,
++                                          (void *)(& stat_loc));
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"stat_loc",
++                                   (void *)stat_loc);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_5,
++                                     "sizeof(int)",0,sizeof(int));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                   "stat_loc_non_null: valid_stat_loc: \\valid(stat_loc)",
++                                   0,__gen_e_acsl_valid);
++      __gen_e_acsl_assert_data_5.blocking = 1;
++      __gen_e_acsl_assert_data_5.kind = "Precondition";
++      __gen_e_acsl_assert_data_5.pred_txt = "\\valid(stat_loc)";
++      __gen_e_acsl_assert_data_5.file = "FRAMAC_SHARE/libc/sys/wait.h";
++      __gen_e_acsl_assert_data_5.fct = "waitpid";
++      __gen_e_acsl_assert_data_5.line = 84;
++      __gen_e_acsl_assert_data_5.name = "stat_loc_non_null/valid_stat_loc";
++      __e_acsl_assert(__gen_e_acsl_valid,& __gen_e_acsl_assert_data_5);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++    }
++  }
++  __retres = waitpid(pid,stat_loc,options);
++  {
++    int __gen_e_acsl_or;
++    int __gen_e_acsl_and;
++    int __gen_e_acsl_implies;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,"\\result",0,
++                                 __retres);
++    if (__retres == -1) __gen_e_acsl_or = 1;
++    else {
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,"\\result",0,
++                                   __retres);
++      __gen_e_acsl_or = __retres >= 0;
++    }
++    __gen_e_acsl_assert_data_7.blocking = 1;
++    __gen_e_acsl_assert_data_7.kind = "Postcondition";
++    __gen_e_acsl_assert_data_7.pred_txt = "\\result == -1 || \\result >= 0";
++    __gen_e_acsl_assert_data_7.file = "FRAMAC_SHARE/libc/sys/wait.h";
++    __gen_e_acsl_assert_data_7.fct = "waitpid";
++    __gen_e_acsl_assert_data_7.line = 76;
++    __gen_e_acsl_assert_data_7.name = "result_ok_or_error";
++    __e_acsl_assert(__gen_e_acsl_or,& __gen_e_acsl_assert_data_7);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,"\\result",0,
++                                 __retres);
++    if (__retres >= 0) {
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_8,
++                                   "\\old(stat_loc)",
++                                   (void *)__gen_e_acsl_at_2);
++      __gen_e_acsl_and = __gen_e_acsl_at_2 != (int *)0;
++    }
++    else __gen_e_acsl_and = 0;
++    if (! __gen_e_acsl_and) __gen_e_acsl_implies = 1;
++    else {
++      int __gen_e_acsl_initialized;
++      __gen_e_acsl_initialized = __e_acsl_initialized((void *)__gen_e_acsl_at,
++                                                      sizeof(int));
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_8,
++                                   "\\old(stat_loc)",(void *)__gen_e_acsl_at);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_8,
++                                     "sizeof(int)",0,sizeof(int));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,
++                                   "\\initialized(\\old(stat_loc))",0,
++                                   __gen_e_acsl_initialized);
++      __gen_e_acsl_implies = __gen_e_acsl_initialized;
++    }
++    __gen_e_acsl_assert_data_8.blocking = 1;
++    __gen_e_acsl_assert_data_8.kind = "Postcondition";
++    __gen_e_acsl_assert_data_8.pred_txt = "\\result >= 0 && \\old(stat_loc) != \\null ==> \\initialized(\\old(stat_loc))";
++    __gen_e_acsl_assert_data_8.file = "FRAMAC_SHARE/libc/sys/wait.h";
++    __gen_e_acsl_assert_data_8.fct = "waitpid";
++    __gen_e_acsl_assert_data_8.line = 78;
++    __gen_e_acsl_assert_data_8.name = "initialization/stat_loc_init_on_success";
++    __e_acsl_assert(__gen_e_acsl_implies,& __gen_e_acsl_assert_data_8);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++    __e_acsl_contract_clean(__gen_e_acsl_contract);
++    __e_acsl_delete_block((void *)(& stat_loc));
++    return __retres;
++  }
++}
++
++/*@ terminates \false;
++    exits status: \exit_status == \old(status);
++    ensures never_terminates: \false;
++    
++    assigns \exit_status \from status;
++ */
++ __attribute__((__noreturn__)) void __gen_e_acsl_exit(int status)
++{
++  exit(status);
++  {
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Postcondition";
++    __gen_e_acsl_assert_data.pred_txt = "\\false";
++    __gen_e_acsl_assert_data.file = "FRAMAC_SHARE/libc/stdlib.h";
++    __gen_e_acsl_assert_data.fct = "exit";
++    __gen_e_acsl_assert_data.line = 742;
++    __gen_e_acsl_assert_data.name = "never_terminates";
++    __e_acsl_assert(0,& __gen_e_acsl_assert_data);
++    return;
++  }
++}
++
++
+diff --git a/plugins/e-acsl/tests/format/oracle/printf_promoted.0.res.oracle b/plugins/e-acsl/tests/format/oracle/printf_promoted.0.res.oracle
+new file mode 100644
+index 0000000000..c7d8fa7266
+--- /dev/null
++++ b/plugins/e-acsl/tests/format/oracle/printf_promoted.0.res.oracle
+@@ -0,0 +1,31 @@
++[e-acsl] beginning translation.
++[e-acsl] FRAMAC_SHARE/libc/unistd.h:899: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/sys/wait.h:71: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/sys/wait.h:71: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:738: Warning: 
++  E-ACSL construct `terminates clause' is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:738: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:741: Warning: 
++  E-ACSL construct `abnormal termination case in behavior'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] FRAMAC_SHARE/libc/unistd.h:902: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/unistd.h:902: Warning: 
++  function __gen_e_acsl_fork: postcondition 'result_ok_child_or_error' got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/sys/wait.h:78: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/sys/wait.h:78: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/sys/wait.h:80: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/sys/wait.h:83: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/sys/wait.h:84: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+diff --git a/plugins/e-acsl/tests/format/oracle_dev/printf_promoted.0.e-acsl.err.log b/plugins/e-acsl/tests/format/oracle_dev/printf_promoted.0.e-acsl.err.log
+new file mode 100644
+index 0000000000..3a1f90d901
+--- /dev/null
++++ b/plugins/e-acsl/tests/format/oracle_dev/printf_promoted.0.e-acsl.err.log
+@@ -0,0 +1,20 @@
++TEST 1: OK: Expected execution at printf_promoted.c:26
++TEST 2: OK: Expected execution at printf_promoted.c:27
++TEST 3: OK: Expected execution at printf_promoted.c:28
++TEST 4: OK: Expected execution at printf_promoted.c:29
++TEST 5: OK: Expected execution at printf_promoted.c:30
++TEST 6: OK: Expected execution at printf_promoted.c:31
++TEST 7: OK: Expected execution at printf_promoted.c:32
++TEST 8: OK: Expected execution at printf_promoted.c:36
++printf: directive 1 ('%u') expects argument of type 'unsigned int' but the corresponding argument has type 'int'
++TEST 9: OK: Expected signal at printf_promoted.c:37
++printf: directive 1 ('%x') expects argument of type 'unsigned int' but the corresponding argument has type 'int'
++TEST 10: OK: Expected signal at printf_promoted.c:38
++printf: directive 1 ('%u') expects argument of type 'unsigned int' but the corresponding argument has type 'int'
++TEST 11: OK: Expected signal at printf_promoted.c:41
++printf: directive 1 ('%d') expects argument of type 'int' but the corresponding argument has type 'unsigned int'
++TEST 12: OK: Expected signal at printf_promoted.c:42
++printf: directive 1 ('%lu') expects argument of type 'unsigned long' but the corresponding argument has type 'unsigned char'
++TEST 13: OK: Expected signal at printf_promoted.c:45
++printf: directive 1 ('%llx') expects argument of type 'unsigned long long' but the corresponding argument has type 'unsigned short'
++TEST 14: OK: Expected signal at printf_promoted.c:46
+diff --git a/plugins/e-acsl/tests/format/printf_promoted.c b/plugins/e-acsl/tests/format/printf_promoted.c
+new file mode 100644
+index 0000000000..a23f8b6c59
+--- /dev/null
++++ b/plugins/e-acsl/tests/format/printf_promoted.c
+@@ -0,0 +1,48 @@
++/* run.config
++   COMMENT: Check format validation of arguments promoted to int
++   DEPS: @PTEST_DEPS@ utils/signalled.h
++   STDOPT:
++*/
++/* run.config_dev
++   MACRO: INCLUDED_HEADERS utils/signalled.h
++   COMMENT: This part is blank on purpose (test stability + Dune)
++
++*/
++
++#include "utils/signalled.h"
++#include <stdio.h>
++
++int main(void) {
++  unsigned char uc = 200;
++  unsigned short us = 60000;
++  _Bool b = 1;
++  signed char sc = -1;
++  short s = -2;
++  const unsigned char addr[4] = {192, 168, 1, 200};
++  char t[16];
++
++  // An argument of an unsigned type smaller than int is promoted to int, and
++  // each of its values is representable in both int and unsigned int
++  OK(printf("%u %o %x %X\n", uc, uc, uc, uc));
++  OK(printf("%u %o %x %X\n", us, us, us, us));
++  OK(printf("%u %x %d\n", b, b, b));
++  OK(printf("%d %i %c\n", uc, us, uc));
++  OK(printf("%hhu %hhd %hu %hd\n", uc, uc, us, us));
++  OK(snprintf(t, sizeof t, "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]));
++  OK(printf("%u\n", (unsigned char)(uc + 100)));
++
++  // A signed type smaller than int is promoted to int too, but a negative
++  // value is not representable in unsigned int
++  OK(printf("%d %i %hhd %hd\n", sc, s, sc, s));
++  ABRT(printf("%u\n", sc));
++  ABRT(printf("%x\n", s));
++
++  // int and unsigned int are still distinct types
++  ABRT(printf("%u\n", 7));
++  ABRT(printf("%d\n", 7u));
++
++  // The promoted argument is an int: it does not match a longer type
++  ABRT(printf("%lu\n", uc));
++  ABRT(printf("%llx\n", us));
++  return 0;
++}
+-- 
+2.56.0.windows.4
+

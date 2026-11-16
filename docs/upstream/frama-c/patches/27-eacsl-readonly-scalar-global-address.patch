@@ -1,0 +1,410 @@
+From 15a114119fdb499e2913c2e73bf9604a01773b42 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 18:09:12 +0100
+Subject: [PATCH] [e-acsl] mark const globals read-only through their address
+
+__e_acsl_mark_readonly expects the address of the block to mark. For every
+const global that is neither an array nor a struct, Global_observer passed
+the value of the global instead:
+
+- for a scalar (`const uint64_t k = 23;`), the runtime takes 23 as an
+  address and aborts with "Use of invalid address 0x17 in predicate";
+- for a union, the generated cast from the union to void * is rejected
+  ("implicit cast: cast from union u to void *");
+- for a pointer, the block it points to is marked instead of the pointer.
+
+Pass the address of the global for those types, and keep the array, which
+decays to its address. A struct with a bitfield member also aborted, in
+Cil.mkAddrOf on that member ("Taking the address of a bitfield"): mark such
+a struct through its own address too.
+
+Regression test: tests/full-mtracking/const_globals.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/code_generator/global_observer.ml     |  12 +-
+ .../tests/full-mtracking/const_globals.c      |  30 ++
+ .../oracle/const_globals.0.res.oracle         |   4 +
+ .../oracle/gen_const_globals.0.c              | 293 ++++++++++++++++++
+ 4 files changed, 337 insertions(+), 2 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/full-mtracking/const_globals.c
+ create mode 100644 plugins/e-acsl/tests/full-mtracking/oracle/const_globals.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/full-mtracking/oracle/gen_const_globals.0.c
+
+diff --git a/plugins/e-acsl/src/code_generator/global_observer.ml b/plugins/e-acsl/src/code_generator/global_observer.ml
+index 6ecf11fe8d..a1d38d4b1c 100644
+--- a/plugins/e-acsl/src/code_generator/global_observer.ml
++++ b/plugins/e-acsl/src/code_generator/global_observer.ml
+@@ -120,14 +120,22 @@ let mk_init_function () =
+            let loc = vi.vdecl in
+            let rec mark_readonly ty = match ty.tnode with
+              | TNamed {ttype} -> mark_readonly ttype
+-             | TComp {cstruct = true; cfields = Some fields} ->
++             | TComp {cstruct = true; cfields = Some fields}
++               when List.for_all (fun f -> f.fbitfield = None) fields ->
+                List.map
+                  (fun field ->
+                     let lval = Var vi, Field (field, NoOffset) in
+                     Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOf ~loc lval)
+ 
+                  fields
+-             | _ -> [Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi]
++             | TArray _ ->
++               (* the array decays to its address *)
++               [Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi]
++             | _ ->
++               (* scalars, pointers, unions and structures with a bitfield
++                  (which has no address): the runtime expects the address of
++                  the global, not its value *)
++               [Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOfVi vi]
+            in
+            let stmts =
+              if Ast_types.C.is_const vi.vtype then
+diff --git a/plugins/e-acsl/tests/full-mtracking/const_globals.c b/plugins/e-acsl/tests/full-mtracking/const_globals.c
+new file mode 100644
+index 0000000000..c114f76263
+--- /dev/null
++++ b/plugins/e-acsl/tests/full-mtracking/const_globals.c
+@@ -0,0 +1,30 @@
++/* run.config
++   COMMENT: const globals are marked read-only through their address
++*/
++
++union u {
++  unsigned char b[4];
++  unsigned int w;
++};
++
++struct bf {
++  unsigned a : 3;
++  unsigned b : 5;
++};
++
++const unsigned long scalar = 23;
++const union u un = {{1}};
++static const union u zero_union;
++const struct bf bits = {1, 2};
++int x;
++int *const ptr = &x;
++
++int main(void) {
++  /*@ assert \valid_read(&scalar) && !\valid(&scalar); */
++  /*@ assert \valid_read(&un) && !\valid(&un); */
++  /*@ assert \valid_read(&zero_union) && !\valid(&zero_union); */
++  /*@ assert \valid_read(&bits) && !\valid(&bits); */
++  /*@ assert \valid(ptr) && !\valid(&ptr); */
++  *ptr = 1;
++  return scalar + un.b[0] + zero_union.b[0] + bits.a + x != 26;
++}
+diff --git a/plugins/e-acsl/tests/full-mtracking/oracle/const_globals.0.res.oracle b/plugins/e-acsl/tests/full-mtracking/oracle/const_globals.0.res.oracle
+new file mode 100644
+index 0000000000..2fab39a2ce
+--- /dev/null
++++ b/plugins/e-acsl/tests/full-mtracking/oracle/const_globals.0.res.oracle
+@@ -0,0 +1,4 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] const_globals.c:27: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+diff --git a/plugins/e-acsl/tests/full-mtracking/oracle/gen_const_globals.0.c b/plugins/e-acsl/tests/full-mtracking/oracle/gen_const_globals.0.c
+new file mode 100644
+index 0000000000..262ee77ee6
+--- /dev/null
++++ b/plugins/e-acsl/tests/full-mtracking/oracle/gen_const_globals.0.c
+@@ -0,0 +1,293 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++union u {
++   unsigned char b[4] ;
++   unsigned int w ;
++};
++struct bf {
++   unsigned int a : 3 ;
++   unsigned int b : 5 ;
++};
++unsigned long const scalar = 23UL;
++union u const un = {.b = {(unsigned char)1}};
++static union u const zero_union;
++struct bf const bits = {.a = (unsigned int)1, .b = (unsigned int)2};
++int x;
++int * const ptr = & x;
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)(& zero_union),4UL);
++    __e_acsl_full_init((void *)(& zero_union));
++    __e_acsl_mark_readonly((void *)(& zero_union));
++    __e_acsl_store_block((void *)(& ptr),8UL);
++    __e_acsl_full_init((void *)(& ptr));
++    __e_acsl_mark_readonly((void *)(& ptr));
++    __e_acsl_store_block((void *)(& x),4UL);
++    __e_acsl_full_init((void *)(& x));
++    __e_acsl_store_block((void *)(& bits),4UL);
++    __e_acsl_full_init((void *)(& bits));
++    __e_acsl_mark_readonly((void *)(& bits));
++    __e_acsl_store_block((void *)(& un),4UL);
++    __e_acsl_full_init((void *)(& un));
++    __e_acsl_mark_readonly((void *)(& un));
++    __e_acsl_store_block((void *)(& scalar),8UL);
++    __e_acsl_full_init((void *)(& scalar));
++    __e_acsl_mark_readonly((void *)(& scalar));
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)(& zero_union));
++  __e_acsl_delete_block((void *)(& ptr));
++  __e_acsl_delete_block((void *)(& x));
++  __e_acsl_delete_block((void *)(& bits));
++  __e_acsl_delete_block((void *)(& un));
++  __e_acsl_delete_block((void *)(& scalar));
++  return;
++}
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_globals_init();
++  __e_acsl_store_block((void *)(& __retres),4UL);
++  {
++    int __gen_e_acsl_valid_read;
++    int __gen_e_acsl_and;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_valid_read = __e_acsl_valid_read((void *)(& scalar),
++                                                  sizeof(unsigned long),
++                                                  (void *)(& scalar),
++                                                  (void *)0);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"&scalar",
++                                 (void *)(& scalar));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                   "sizeof(unsigned long)",0,
++                                   sizeof(unsigned long));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\valid_read(&scalar)",0,
++                                 __gen_e_acsl_valid_read);
++    if (__gen_e_acsl_valid_read) {
++      int __gen_e_acsl_valid;
++      __gen_e_acsl_valid = __e_acsl_valid((void *)(& scalar),
++                                          sizeof(unsigned long),
++                                          (void *)(& scalar),(void *)0);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"&scalar",
++                                   (void *)(& scalar));
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                     "sizeof(unsigned long)",0,
++                                     sizeof(unsigned long));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                   "\\valid(&scalar)",0,__gen_e_acsl_valid);
++      __gen_e_acsl_and = ! __gen_e_acsl_valid;
++    }
++    else __gen_e_acsl_and = 0;
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\valid_read(&scalar) && !\\valid(&scalar)";
++    __gen_e_acsl_assert_data.file = "const_globals.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 23;
++    __e_acsl_assert(__gen_e_acsl_and,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert \valid_read(&scalar) && !\valid(&scalar); */ ;
++  {
++    int __gen_e_acsl_valid_read_2;
++    int __gen_e_acsl_and_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_valid_read_2 = __e_acsl_valid_read((void *)(& un),
++                                                    sizeof(union u),
++                                                    (void *)(& un),(void *)0);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"&un",
++                                 (void *)(& un));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_2,
++                                   "sizeof(union u)",0,sizeof(union u));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\\valid_read(&un)",0,
++                                 __gen_e_acsl_valid_read_2);
++    if (__gen_e_acsl_valid_read_2) {
++      int __gen_e_acsl_valid_2;
++      __gen_e_acsl_valid_2 = __e_acsl_valid((void *)(& un),sizeof(union u),
++                                            (void *)(& un),(void *)0);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"&un",
++                                   (void *)(& un));
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_2,
++                                     "sizeof(union u)",0,sizeof(union u));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                   "\\valid(&un)",0,__gen_e_acsl_valid_2);
++      __gen_e_acsl_and_2 = ! __gen_e_acsl_valid_2;
++    }
++    else __gen_e_acsl_and_2 = 0;
++    __gen_e_acsl_assert_data_2.blocking = 1;
++    __gen_e_acsl_assert_data_2.kind = "Assertion";
++    __gen_e_acsl_assert_data_2.pred_txt = "\\valid_read(&un) && !\\valid(&un)";
++    __gen_e_acsl_assert_data_2.file = "const_globals.c";
++    __gen_e_acsl_assert_data_2.fct = "main";
++    __gen_e_acsl_assert_data_2.line = 24;
++    __e_acsl_assert(__gen_e_acsl_and_2,& __gen_e_acsl_assert_data_2);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++  }
++  /*@ assert \valid_read(&un) && !\valid(&un); */ ;
++  {
++    int __gen_e_acsl_valid_read_3;
++    int __gen_e_acsl_and_3;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __gen_e_acsl_valid_read_3 = __e_acsl_valid_read((void *)(& zero_union),
++                                                    sizeof(union u),
++                                                    (void *)(& zero_union),
++                                                    (void *)0);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"&zero_union",
++                                 (void *)(& zero_union));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_3,
++                                   "sizeof(union u)",0,sizeof(union u));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                 "\\valid_read(&zero_union)",0,
++                                 __gen_e_acsl_valid_read_3);
++    if (__gen_e_acsl_valid_read_3) {
++      int __gen_e_acsl_valid_3;
++      __gen_e_acsl_valid_3 = __e_acsl_valid((void *)(& zero_union),
++                                            sizeof(union u),
++                                            (void *)(& zero_union),(void *)0);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,
++                                   "&zero_union",(void *)(& zero_union));
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_3,
++                                     "sizeof(union u)",0,sizeof(union u));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                   "\\valid(&zero_union)",0,
++                                   __gen_e_acsl_valid_3);
++      __gen_e_acsl_and_3 = ! __gen_e_acsl_valid_3;
++    }
++    else __gen_e_acsl_and_3 = 0;
++    __gen_e_acsl_assert_data_3.blocking = 1;
++    __gen_e_acsl_assert_data_3.kind = "Assertion";
++    __gen_e_acsl_assert_data_3.pred_txt = "\\valid_read(&zero_union) && !\\valid(&zero_union)";
++    __gen_e_acsl_assert_data_3.file = "const_globals.c";
++    __gen_e_acsl_assert_data_3.fct = "main";
++    __gen_e_acsl_assert_data_3.line = 25;
++    __e_acsl_assert(__gen_e_acsl_and_3,& __gen_e_acsl_assert_data_3);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++  }
++  /*@ assert \valid_read(&zero_union) && !\valid(&zero_union); */ ;
++  {
++    int __gen_e_acsl_valid_read_4;
++    int __gen_e_acsl_and_4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gen_e_acsl_valid_read_4 = __e_acsl_valid_read((void *)(& bits),
++                                                    sizeof(struct bf),
++                                                    (void *)(& bits),
++                                                    (void *)0);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"&bits",
++                                 (void *)(& bits));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_4,
++                                   "sizeof(struct bf)",0,sizeof(struct bf));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "\\valid_read(&bits)",0,
++                                 __gen_e_acsl_valid_read_4);
++    if (__gen_e_acsl_valid_read_4) {
++      int __gen_e_acsl_valid_4;
++      __gen_e_acsl_valid_4 = __e_acsl_valid((void *)(& bits),
++                                            sizeof(struct bf),
++                                            (void *)(& bits),(void *)0);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"&bits",
++                                   (void *)(& bits));
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_4,
++                                     "sizeof(struct bf)",0,sizeof(struct bf));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                   "\\valid(&bits)",0,__gen_e_acsl_valid_4);
++      __gen_e_acsl_and_4 = ! __gen_e_acsl_valid_4;
++    }
++    else __gen_e_acsl_and_4 = 0;
++    __gen_e_acsl_assert_data_4.blocking = 1;
++    __gen_e_acsl_assert_data_4.kind = "Assertion";
++    __gen_e_acsl_assert_data_4.pred_txt = "\\valid_read(&bits) && !\\valid(&bits)";
++    __gen_e_acsl_assert_data_4.file = "const_globals.c";
++    __gen_e_acsl_assert_data_4.fct = "main";
++    __gen_e_acsl_assert_data_4.line = 26;
++    __e_acsl_assert(__gen_e_acsl_and_4,& __gen_e_acsl_assert_data_4);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++  }
++  /*@ assert \valid_read(&bits) && !\valid(&bits); */ ;
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_valid_5;
++    int __gen_e_acsl_and_5;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)ptr,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_6,"ptr",
++                                 (void *)ptr);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                 "\"pointer alignment\": \\aligned(ptr,4)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(ptr,4); */
++    {
++      __gen_e_acsl_assert_data_6.blocking = 1;
++      __gen_e_acsl_assert_data_6.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_6.pred_txt = "\\aligned(ptr,4)";
++      __gen_e_acsl_assert_data_6.file = "const_globals.c";
++      __gen_e_acsl_assert_data_6.fct = "main";
++      __gen_e_acsl_assert_data_6.line = 27;
++      __gen_e_acsl_assert_data_6.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_6);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++    }
++    __gen_e_acsl_valid_5 = __e_acsl_valid((void *)ptr,sizeof(int),
++                                          (void *)ptr,(void *)(& ptr));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"ptr",
++                                 (void *)ptr);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_5,
++                                   "sizeof(int)",0,sizeof(int));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,"\\valid(ptr)",
++                                 0,__gen_e_acsl_valid_5);
++    if (__gen_e_acsl_valid_5) {
++      int __gen_e_acsl_valid_6;
++      __gen_e_acsl_valid_6 = __e_acsl_valid((void *)(& ptr),sizeof(int *),
++                                            (void *)(& ptr),(void *)0);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"&ptr",
++                                   (void *)(& ptr));
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_5,
++                                     "sizeof(int *)",0,sizeof(int *));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                   "\\valid(&ptr)",0,__gen_e_acsl_valid_6);
++      __gen_e_acsl_and_5 = ! __gen_e_acsl_valid_6;
++    }
++    else __gen_e_acsl_and_5 = 0;
++    __gen_e_acsl_assert_data_5.blocking = 1;
++    __gen_e_acsl_assert_data_5.kind = "Assertion";
++    __gen_e_acsl_assert_data_5.pred_txt = "\\valid(ptr) && !\\valid(&ptr)";
++    __gen_e_acsl_assert_data_5.file = "const_globals.c";
++    __gen_e_acsl_assert_data_5.fct = "main";
++    __gen_e_acsl_assert_data_5.line = 27;
++    __e_acsl_assert(__gen_e_acsl_and_5,& __gen_e_acsl_assert_data_5);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++  }
++  /*@ assert \valid(ptr) && !\valid(&ptr); */ ;
++  __e_acsl_initialize((void *)ptr,sizeof(int));
++  *ptr = 1;
++  __e_acsl_full_init((void *)(& __retres));
++  __retres = (((23UL + (unsigned long)un.b[0]) + (unsigned long)zero_union.b[0]) + (unsigned long)bits.a) + (unsigned long)x != 26UL;
++  __e_acsl_delete_block((void *)(& __retres));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+-- 
+2.56.0.windows.4
+

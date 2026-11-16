@@ -97,3 +97,23 @@ Issues encountered during build capture (`build_capture.py`), Phase 0 model pars
 - **Seen on:** minmea run-1, 2026-11-14, Windows host, target checked out with `core.autocrlf=true`. `run_metadata.py init` wrote `source_ref.dirty: true`; on the host, `git status --porcelain` and `git diff --stat` print nothing. The agent noticed it, could not explain it and went on.
 - **Cause:** target-side checkout issue that the pipeline reports wrongly. `source_ref` in [`../../scripts/run_metadata.py`](../../scripts/run_metadata.py) runs `git status --porcelain --untracked-files=no` inside the Linux container, where `core.autocrlf` is not set. The working files have CRLF and the index has LF (`git ls-files --eol` shows `i/lf w/crlf` for every text file), so git in the container sees every text file as modified. This was read from the code and the checkout, not reproduced in a container. The same CRLF files are copied into `workspace/work/`.
 - **Fix:** **Open pipeline gap:** `dirty` cannot tell a CRLF checkout from real local changes, so the report's reproducibility note is wrong for every Windows checkout with `autocrlf`. Either compare with line endings normalized, or record the CRLF checkout as its own field. Workaround: check out the target with `core.autocrlf=false` (or `input`). For minmea run-1 the parent confirmed the host checkout was clean at the pinned commit and corrected `source_ref.dirty` in `run-metadata.json` to `false` before regenerating `REPORT.md`; the pipeline is still unfixed.
+- **Seen again:** c-ares run-1, 2026-11-16 (`source_ref.dirty: true`; the target's files have CRLF endings).
+
+### Symptom: Every Module Including `<pthread.h>` Is Fuzzed With the Sanitizers ("includes setjmp.h ... E-ACSL cannot build it")
+- **Seen on:** c-ares run-1, 2026-11-16 ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)).
+  - `build_callgraph_dag.py` warned, for `libcares_a`, `adig` and `ahost`: `module <m>: includes setjmp.h (src/lib/util/ares_threads.c), whose setjmp declaration Frama-C rejects (CERT MSC38-C): E-ACSL cannot build it; fuzzed with the sanitizers`.
+  - Every unit got `fuzz_engine: sanitizers`, which removed E-ACSL runtime checking from Phase 1 for the whole target.
+  - `ares_threads.c` never includes `<setjmp.h>`: on Linux it includes `<pthread.h>`, `<time.h>` and `<sys/time.h>`. `clang -M` lists only `/usr/include/x86_64-linux-gnu/bits/setjmp.h`.
+- **Cause:** [`../../scripts/build_capture.py`](../../scripts/build_capture.py) set `compiles[].includes_setjmp_h` whenever a system dependency's basename is `setjmp.h`.
+  - That also matches glibc's private `bits/setjmp.h`, which `<pthread.h>` includes for `__jmp_buf`.
+  - E-ACSL builds that code. Measured with `run_eacsl_fuzz.py build --engine eacsl` in `framac-analysis:latest`: a source that only includes `<pthread.h>` gives `status: built`, `engine_used: eacsl`, with or without c-ares's feature macros.
+  - Only the libc's `<setjmp.h>` fails: `[kernel:CERT:MSC:38] /usr/include/setjmp.h:36: User Error: Attempt to declare setjmp as external identifier outside of the stdlib`.
+- **Fix:** `build_capture.includes_setjmp_h()` counts a `setjmp.h` only when its directory is not `bits/`. The setjmp/longjmp call detection is unchanged.
+  - Tests: `tests/test_build_capture.py::test_only_the_top_level_setjmp_h_counts`, the `lock.c` case of `::test_compiles_record_setjmp_h_and_the_functions_the_build_defines`, and `::test_eacsl_builds_pthread_h_and_rejects_setjmp_h` (Docker).
+  - Commit `625b74b`, from branch `sup/c-ares-setjmp-basename`, fixed and merged into `phase1-remediation` (2026-11-16).
+- **Recovering a run captured before the fix:** rerunning `build_callgraph_dag.py` alone is not enough. The per-compile system dependencies are not stored, so the flag cannot be recomputed from the report. Instead:
+  1. Rerun `build_capture.py run` with the fixed scripts.
+  2. Rerun `build_callgraph_dag.py` and the Phase 0 steps after it.
+  3. Rebuild the modules (`build-<mod>`), so the harness gate reads the new `engine_used`.
+
+  Untested shortcut: `pipeline_make.py params set --module <m> --fuzz-engine auto`.

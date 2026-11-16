@@ -1,0 +1,1895 @@
+From d55a4f6f849b3716c7725a7ba6f53dab3baa34aa Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 15 Nov 2026 19:01:40 +0100
+Subject: [PATCH 1/2] [e-acsl] mark formal parameters as initialized on
+ function entry
+
+On function entry, E-ACSL registered each tracked formal with
+__e_acsl_store_block but never marked it initialized, although the
+caller has just written it. Any check that reads the shadow memory of a
+formal then failed on every call, whatever the caller passed:
+- \initialized(&s.f) on a field of a struct passed by value, in a user
+  annotation (issue #177) or in an RTE guard with -e-acsl-rte-initialized;
+- \initialized(p) on a pointer to a scalar formal, even after an
+  explicit assignment, since add_initializer emits no full_init for an
+  assignment to a whole formal.
+
+The rest of E-ACSL already assumes formals are initialized
+(add_initializer and needs_guard skip them), and globals are stored and
+marked initialized the same way (global_observer.ml). Emit
+__e_acsl_full_init right after the __e_acsl_store_block of each formal.
+
+Most E-ACSL oracles (gen_*.c) change: each gets one
+__e_acsl_full_init((void *)(& p)); line after the store_block of a
+formal. Add bts/issue-framac-177.c as a regression test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/src/code_generator/injector.ml |   3 +-
+ .../src/code_generator/memory_observer.ml     |  13 ++
+ .../src/code_generator/memory_observer.mli    |   4 +
+ plugins/e-acsl/tests/bts/issue-framac-177.c   |  23 +++
+ .../e-acsl/tests/bts/oracle/gen_bts1304.0.c   |   1 +
+ .../e-acsl/tests/bts/oracle/gen_bts1307.0.c   |  12 ++
+ .../e-acsl/tests/bts/oracle/gen_bts1324.0.c   |   1 +
+ .../e-acsl/tests/bts/oracle/gen_bts1326.0.c   |   4 +
+ .../oracle/gen_bts1386_complex_flowgraph.0.c  |   3 +
+ .../e-acsl/tests/bts/oracle/gen_bts1390.0.c   |   2 +
+ .../e-acsl/tests/bts/oracle/gen_bts2192.0.c   |   1 +
+ .../e-acsl/tests/bts/oracle/gen_bts2252.0.c   |   3 +
+ .../e-acsl/tests/bts/oracle/gen_bts2386.0.c   |   1 +
+ .../tests/bts/oracle/gen_issue-eacsl-139.0.c  |   2 +
+ .../tests/bts/oracle/gen_issue-eacsl-40.0.c   |   5 +
+ .../bts/oracle/gen_issue-framac-1119.0.c      |   1 +
+ .../tests/bts/oracle/gen_issue-framac-177.0.c | 154 ++++++++++++++++++
+ .../bts/oracle/issue-framac-177.0.res.oracle  |   4 +
+ .../tests/builtin/oracle/gen_strcat.0.c       |   1 +
+ .../tests/builtin/oracle/gen_strcmp.0.c       |   1 +
+ .../tests/builtin/oracle/gen_strcpy.0.c       |   1 +
+ .../tests/builtin/oracle/gen_strlen.0.c       |   1 +
+ .../oracle/gen_parallel_threads.0.c           |  23 +++
+ .../oracle/gen_sequential_threads.0.c         |   8 +
+ .../concurrency/oracle/gen_threads_debug.0.c  |  21 +++
+ .../oracle/gen_threads_safe_locations.0.c     |   7 +
+ .../constructs/oracle/gen_acsl_check.0.c      |   1 +
+ .../e-acsl/tests/constructs/oracle/gen_at.0.c |   4 +
+ .../oracle/gen_at_on_logic_vars.0.c           |   2 +
+ .../tests/constructs/oracle/gen_axiomatic.0.c |   2 +
+ .../tests/constructs/oracle/gen_functions.0.c |   1 +
+ .../tests/constructs/oracle/gen_functions.1.c |   1 +
+ .../tests/format/oracle/gen_fprintf.0.c       |   2 +
+ .../e-acsl/tests/format/oracle/gen_printf.0.c |  10 ++
+ .../inductive/oracle/gen_stable_sort.0.c      |  10 ++
+ plugins/e-acsl/tests/libc/oracle/gen_file.0.c |   5 +
+ plugins/e-acsl/tests/libc/oracle/gen_mem.0.c  |   9 +
+ plugins/e-acsl/tests/libc/oracle/gen_str.0.c  |  10 ++
+ .../e-acsl/tests/memory/oracle/gen_alias.0.c  |   1 +
+ .../e-acsl/tests/memory/oracle/gen_call.0.c   |   4 +
+ .../memory/oracle/gen_decl_in_switch.0.c      |   1 +
+ .../tests/memory/oracle/gen_hidden_malloc.0.c |   2 +
+ .../tests/memory/oracle/gen_local_var.0.c     |   1 +
+ .../tests/memory/oracle/gen_mainargs.0.c      |   2 +
+ .../tests/memory/oracle/gen_memalign.0.c      |   5 +
+ .../tests/memory/oracle/gen_ptr_init.0.c      |   1 +
+ .../memory/oracle/gen_ranges_in_builtins.0.c  |   3 +
+ .../e-acsl/tests/memory/oracle/gen_valid.0.c  |   2 +
+ .../memory/oracle/gen_valid_in_contract.0.c   |   2 +
+ .../e-acsl/tests/memory/oracle/gen_vdso.0.c   |   1 +
+ .../e-acsl/tests/memory/oracle/gen_vector.0.c |   1 +
+ .../tests/special/oracle/gen_builtin.0.c      |   2 +
+ .../special/oracle/gen_e-acsl-functions.0.c   |   2 +
+ .../special/oracle/gen_e-acsl-instrument.0.c  |   4 +
+ .../tests/special/oracle/gen_e-acsl-valid.0.c |   4 +
+ .../tests/temporal/oracle/gen_t_darray.0.c    |   2 +
+ .../tests/temporal/oracle/gen_t_fun_lib.0.c   |   2 +
+ .../tests/temporal/oracle/gen_t_fun_ptr.0.c   |   1 +
+ .../tests/temporal/oracle/gen_t_getenv.0.c    |   1 +
+ .../temporal/oracle/gen_t_global_init.0.c     |   1 +
+ .../tests/temporal/oracle/gen_t_labels.0.c    |   2 +
+ .../temporal/oracle/gen_t_local_init.0.c      |   1 +
+ .../tests/temporal/oracle/gen_t_memcpy.0.c    |   6 +
+ 63 files changed, 410 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/e-acsl/tests/bts/issue-framac-177.c
+ create mode 100644 plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
+ create mode 100644 plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
+
+diff --git a/plugins/e-acsl/src/code_generator/injector.ml b/plugins/e-acsl/src/code_generator/injector.ml
+index 8a6c712fc5..6d91a49ad0 100644
+--- a/plugins/e-acsl/src/code_generator/injector.ml
++++ b/plugins/e-acsl/src/code_generator/injector.ml
+@@ -467,7 +467,8 @@ and inject_in_stmt env kf stmt =
+           env
+         else
+           let env =
+-            Memory_observer.store env kf (Kernel_function.get_formals kf)
++            Memory_observer.store_formals
++              env kf (Kernel_function.get_formals kf)
+           in
+           Temporal.handle_function_parameters kf env
+       in
+diff --git a/plugins/e-acsl/src/code_generator/memory_observer.ml b/plugins/e-acsl/src/code_generator/memory_observer.ml
+index 7bb49c542e..1b37c48061 100644
+--- a/plugins/e-acsl/src/code_generator/memory_observer.ml
++++ b/plugins/e-acsl/src/code_generator/memory_observer.ml
+@@ -29,6 +29,19 @@ let store env kf vars =
+     kf
+     vars
+ 
++let store_formals env kf formals =
++  tracking_stmt
++    List.fold_right (* small list *)
++    (fun vi ->
++       (* on function entry, a formal is both allocated and initialized (with
++          the value of the corresponding argument) *)
++       Smart_stmt.block_from_stmts
++         [ Smart_stmt.store_stmt vi;
++           Smart_stmt.initialize ~loc:vi.vdecl (Cil.var vi) ])
++    env
++    kf
++    formals
++
+ let duplicate_store env kf vars =
+   tracking_stmt
+     Varinfo.Set.fold
+diff --git a/plugins/e-acsl/src/code_generator/memory_observer.mli b/plugins/e-acsl/src/code_generator/memory_observer.mli
+index bcd8bb7de3..ef4cb44dfd 100644
+--- a/plugins/e-acsl/src/code_generator/memory_observer.mli
++++ b/plugins/e-acsl/src/code_generator/memory_observer.mli
+@@ -16,6 +16,10 @@ val store: Env.t -> kernel_function -> varinfo list -> Env.t
+ (** For each variable of the given list, if necessary according to the mtracking
+     analysis, add a call to [__e_acsl_store_block] in the given environment. *)
+ 
++val store_formals: Env.t -> kernel_function -> varinfo list -> Env.t
++(** Same as [store] for the formals of a function, which are also marked as
++    initialized with a call to [__e_acsl_full_init]. *)
++
+ val duplicate_store: Env.t -> kernel_function -> Varinfo.Set.t -> Env.t
+ (** Same as [store], with a call to [__e_acsl_duplicate_store_block]. *)
+ 
+diff --git a/plugins/e-acsl/tests/bts/issue-framac-177.c b/plugins/e-acsl/tests/bts/issue-framac-177.c
+new file mode 100644
+index 0000000000..d2e65a1807
+--- /dev/null
++++ b/plugins/e-acsl/tests/bts/issue-framac-177.c
+@@ -0,0 +1,23 @@
++/* run.config
++   COMMENT: formal parameters are initialized on function entry (issue #177)
++*/
++
++struct S { int t; unsigned long len; };
++
++/*@ requires \initialized(&s.len); */
++int f_struct(struct S s) {
++  /*@ assert \initialized(&s.t); */
++  return s.len > 3;
++}
++
++int f_scalar(int k) {
++  k = 7;
++  int *pk = &k;
++  /*@ assert \initialized(pk); */
++  return *pk;
++}
++
++int main(void) {
++  struct S full = { 1, 5 };
++  return f_struct(full) + f_scalar(3) - 8;
++}
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1304.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1304.0.c
+index cf8e41f79a..0772a578e8 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts1304.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts1304.0.c
+@@ -25,6 +25,7 @@ union msg {
+ void read_sensor_4(unsigned int *m)
+ {
+   __e_acsl_store_block((void *)(& m),8UL);
++  __e_acsl_full_init((void *)(& m));
+   /*@ assert Eva: pointer_alignment: \aligned(m,alignof(unsigned int)); */
+   __e_acsl_initialize((void *)m,sizeof(unsigned int));
+   /*@ assert Eva: pointer_alignment: \aligned(m,alignof(unsigned int)); */
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1307.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1307.0.c
+index 9daeb5608f..f2dd09160c 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts1307.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts1307.0.c
+@@ -21,8 +21,11 @@ void __gen_e_acsl_foo(float *Mtmax_in, float *Mwmax, float *Mtmax_out);
+ void foo(float *Mtmax_in, float *Mwmax, float *Mtmax_out)
+ {
+   __e_acsl_store_block((void *)(& Mtmax_out),8UL);
++  __e_acsl_full_init((void *)(& Mtmax_out));
+   __e_acsl_store_block((void *)(& Mwmax),8UL);
++  __e_acsl_full_init((void *)(& Mwmax));
+   __e_acsl_store_block((void *)(& Mtmax_in),8UL);
++  __e_acsl_full_init((void *)(& Mtmax_in));
+   __e_acsl_initialize((void *)Mtmax_out,sizeof(float));
+   *Mtmax_out = *Mtmax_in + (5.0f - (0.0625f * *Mwmax) * 0.4f);
+   __e_acsl_delete_block((void *)(& Mtmax_out));
+@@ -49,8 +52,11 @@ void __gen_e_acsl_bar(float *Mtmin_in, float *Mwmin, float *Mtmin_out);
+ void bar(float *Mtmin_in, float *Mwmin, float *Mtmin_out)
+ {
+   __e_acsl_store_block((void *)(& Mtmin_out),8UL);
++  __e_acsl_full_init((void *)(& Mtmin_out));
+   __e_acsl_store_block((void *)(& Mwmin),8UL);
++  __e_acsl_full_init((void *)(& Mwmin));
+   __e_acsl_store_block((void *)(& Mtmin_in),8UL);
++  __e_acsl_full_init((void *)(& Mtmin_in));
+   __e_acsl_initialize((void *)Mtmin_out,sizeof(float));
+   *Mtmin_out = 0.85f * *Mwmin;
+   __e_acsl_delete_block((void *)(& Mtmin_out));
+@@ -135,8 +141,11 @@ void __gen_e_acsl_bar(float *Mtmin_in, float *Mwmin, float *Mtmin_out)
+     int __gen_e_acsl_aligned_15;
+     int __gen_e_acsl_valid_3;
+     __e_acsl_store_block((void *)(& Mtmin_out),8UL);
++    __e_acsl_full_init((void *)(& Mtmin_out));
+     __e_acsl_store_block((void *)(& Mwmin),8UL);
++    __e_acsl_full_init((void *)(& Mwmin));
+     __e_acsl_store_block((void *)(& Mtmin_in),8UL);
++    __e_acsl_full_init((void *)(& Mtmin_in));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)Mwmin,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"Mwmin",
+@@ -810,8 +819,11 @@ void __gen_e_acsl_foo(float *Mtmax_in, float *Mwmax, float *Mtmax_out)
+     int __gen_e_acsl_aligned_9;
+     int __gen_e_acsl_valid_3;
+     __e_acsl_store_block((void *)(& Mtmax_out),8UL);
++    __e_acsl_full_init((void *)(& Mtmax_out));
+     __e_acsl_store_block((void *)(& Mwmax),8UL);
++    __e_acsl_full_init((void *)(& Mwmax));
+     __e_acsl_store_block((void *)(& Mtmax_in),8UL);
++    __e_acsl_full_init((void *)(& Mtmax_in));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)Mwmax,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"Mwmax",
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1324.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1324.0.c
+index 77ca8c81cc..19840fc578 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts1324.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts1324.0.c
+@@ -71,6 +71,7 @@ int __gen_e_acsl_sorted(int *t, int n)
+     int __gen_e_acsl_forall;
+     int __gen_e_acsl_i;
+     __e_acsl_store_block((void *)(& t),8UL);
++    __e_acsl_full_init((void *)(& t));
+     __gen_e_acsl_contract = __e_acsl_contract_init(1UL);
+     __gen_e_acsl_forall = 1;
+     __gen_e_acsl_i = 1;
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1326.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1326.0.c
+index a2811a81a1..41b4e91909 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts1326.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts1326.0.c
+@@ -20,7 +20,9 @@ void __gen_e_acsl_atp_NORMAL_computeAverageAccel(ArrayInt *Accel,
+ void atp_NORMAL_computeAverageAccel(ArrayInt *Accel, int *AverageAccel)
+ {
+   __e_acsl_store_block((void *)(& AverageAccel),8UL);
++  __e_acsl_full_init((void *)(& AverageAccel));
+   __e_acsl_store_block((void *)(& Accel),8UL);
++  __e_acsl_full_init((void *)(& Accel));
+   __e_acsl_initialize((void *)AverageAccel,sizeof(int));
+   *AverageAccel = (((((*Accel)[4] + (*Accel)[3]) + (*Accel)[2]) + (*Accel)[1]) + (*Accel)[0]) / 5;
+   __e_acsl_delete_block((void *)(& AverageAccel));
+@@ -87,7 +89,9 @@ void __gen_e_acsl_atp_NORMAL_computeAverageAccel(ArrayInt *Accel,
+     int __gen_e_acsl_aligned_11;
+     int __gen_e_acsl_aligned_12;
+     __e_acsl_store_block((void *)(& AverageAccel),8UL);
++    __e_acsl_full_init((void *)(& AverageAccel));
+     __e_acsl_store_block((void *)(& Accel),8UL);
++    __e_acsl_full_init((void *)(& Accel));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)Accel,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"Accel",
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1386_complex_flowgraph.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1386_complex_flowgraph.0.c
+index f596e1d692..61fbdae772 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts1386_complex_flowgraph.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts1386_complex_flowgraph.0.c
+@@ -9,7 +9,9 @@ extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
+ void duffcopy(char *to, char *from, int count)
+ {
+   __e_acsl_store_block((void *)(& from),8UL);
++  __e_acsl_full_init((void *)(& from));
+   __e_acsl_store_block((void *)(& to),8UL);
++  __e_acsl_full_init((void *)(& to));
+   int n = (count + 7) / 8;
+   switch (count % 8) 
+     case 0:
+@@ -259,6 +261,7 @@ void initialize(char *arr, int length)
+ {
+   int i;
+   __e_acsl_store_block((void *)(& arr),8UL);
++  __e_acsl_full_init((void *)(& arr));
+   i = 0;
+   while (i < length) {
+     __e_acsl_initialize((void *)(arr + i),sizeof(char));
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1390.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1390.0.c
+index 7b633abf67..e12d1ad129 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts1390.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts1390.0.c
+@@ -28,6 +28,7 @@ void *memchr(void const *buf, int c, size_t n)
+   int i;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& buf),8UL);
++  __e_acsl_full_init((void *)(& buf));
+   char *s = (char *)buf;
+   __e_acsl_store_block((void *)(& s),8UL);
+   __e_acsl_full_init((void *)(& s));
+@@ -83,6 +84,7 @@ void *__gen_e_acsl_memchr(void const *buf, int c, size_t n)
+     int __gen_e_acsl_forall;
+     int __gen_e_acsl_k;
+     __e_acsl_store_block((void *)(& buf),8UL);
++    __e_acsl_full_init((void *)(& buf));
+     __gen_e_acsl_at = c;
+     __gen_e_acsl_at_2 = buf;
+     __gen_e_acsl_at_3 = buf;
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts2192.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts2192.0.c
+index f7140dafca..d1a0db5137 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts2192.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts2192.0.c
+@@ -26,6 +26,7 @@ int __gen_e_acsl_atoi(char const *nptr)
+ {
+   int __retres;
+   __e_acsl_store_block((void *)(& nptr),8UL);
++  __e_acsl_full_init((void *)(& nptr));
+   __retres = atoi(nptr);
+   __e_acsl_delete_block((void *)(& nptr));
+   return __retres;
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts2252.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts2252.0.c
+index cc20d257a3..e52f199c3d 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts2252.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts2252.0.c
+@@ -100,8 +100,11 @@ char *__gen_e_acsl_strncpy(char * restrict dest, char const * restrict src,
+     unsigned long __gen_e_acsl_if_7;
+     int __gen_e_acsl_separated;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)src,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"src",
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts2386.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts2386.0.c
+index e970d4d16f..d52a7a1d2c 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_bts2386.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_bts2386.0.c
+@@ -9,6 +9,7 @@ extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
+ void f(void const *s, int c, unsigned long n)
+ {
+   __e_acsl_store_block((void *)(& s),8UL);
++  __e_acsl_full_init((void *)(& s));
+   unsigned char const *p = (unsigned char const *)s;
+   __e_acsl_store_block((void *)(& p),8UL);
+   __e_acsl_full_init((void *)(& p));
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-139.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-139.0.c
+index 11c2b6892c..689664fd49 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-139.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-139.0.c
+@@ -15,6 +15,7 @@ void __gen_e_acsl_f(struct X *item);
+ void f(struct X *item)
+ {
+   __e_acsl_store_block((void *)(& item),8UL);
++  __e_acsl_full_init((void *)(& item));
+   __e_acsl_delete_block((void *)(& item));
+   return;
+ }
+@@ -46,6 +47,7 @@ void __gen_e_acsl_f(struct X *item)
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_aligned_3;
+     __e_acsl_store_block((void *)(& item),8UL);
++    __e_acsl_full_init((void *)(& item));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)item,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"item",
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-40.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-40.0.c
+index 29cb09f032..bbf8ab6a4d 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-40.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-eacsl-40.0.c
+@@ -84,7 +84,9 @@ size_t __gen_e_acsl_fread(void * restrict ptr, size_t size, size_t nmemb,
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& stream),8UL);
++    __e_acsl_full_init((void *)(& stream));
+     __e_acsl_store_block((void *)(& ptr),8UL);
++    __e_acsl_full_init((void *)(& ptr));
+     __gmpz_init_set_ui(__gen_e_acsl_size,size);
+     __gmpz_init_set(__gen_e_acsl_at,
+                     (__e_acsl_mpz_struct const *)(__gen_e_acsl_size));
+@@ -457,7 +459,9 @@ FILE *__gen_e_acsl_fopen(char const * restrict filename,
+   FILE *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& mode),8UL);
++  __e_acsl_full_init((void *)(& mode));
+   __e_acsl_store_block((void *)(& filename),8UL);
++  __e_acsl_full_init((void *)(& filename));
+   __retres = fopen(filename,mode);
+   __e_acsl_delete_block((void *)(& mode));
+   __e_acsl_delete_block((void *)(& filename));
+@@ -477,6 +481,7 @@ int __gen_e_acsl_fclose(FILE *stream)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& stream),8UL);
++    __e_acsl_full_init((void *)(& stream));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-1119.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-1119.0.c
+index ced6d8f040..b8035720c0 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-1119.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-1119.0.c
+@@ -10,6 +10,7 @@ int find_last_of(int const *a, int len, int value)
+ {
+   int __retres;
+   __e_acsl_store_block((void *)(& a),8UL);
++  __e_acsl_full_init((void *)(& a));
+   size_t o = (size_t)len;
+   {
+     int __gen_e_acsl_forall;
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
+new file mode 100644
+index 0000000000..4cafaa8b40
+--- /dev/null
++++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
+@@ -0,0 +1,154 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++struct S {
++   int t ;
++   unsigned long len ;
++};
++/*@ requires \initialized(&s.len); */
++int __gen_e_acsl_f_struct(struct S s);
++
++int f_struct(struct S s)
++{
++  int __retres;
++  {
++    int __gen_e_acsl_initialized;
++    __e_acsl_store_block((void *)(& s),16UL);
++    __e_acsl_full_init((void *)(& s));
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_initialized = __e_acsl_initialized((void *)(& s.t),
++                                                    sizeof(int));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"&s.t",
++                                 (void *)(& s.t));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,"sizeof(int)",
++                                   0,sizeof(int));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\initialized(&s.t)",0,
++                                 __gen_e_acsl_initialized);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.t)";
++    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
++    __gen_e_acsl_assert_data.fct = "f_struct";
++    __gen_e_acsl_assert_data.line = 9;
++    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert \initialized(&s.t); */ ;
++  __retres = s.len > 3UL;
++  __e_acsl_delete_block((void *)(& s));
++  return __retres;
++}
++
++int f_scalar(int k)
++{
++  int __retres;
++  __e_acsl_store_block((void *)(& k),4UL);
++  __e_acsl_full_init((void *)(& k));
++  k = 7;
++  int *pk = & k;
++  __e_acsl_store_block((void *)(& pk),8UL);
++  __e_acsl_full_init((void *)(& pk));
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_initialized;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)pk,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"pk",
++                                 (void *)pk);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(pk,4)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(pk,4); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(pk,4)";
++      __gen_e_acsl_assert_data_2.file = "issue-framac-177.c";
++      __gen_e_acsl_assert_data_2.fct = "f_scalar";
++      __gen_e_acsl_assert_data_2.line = 16;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_initialized = __e_acsl_initialized((void *)pk,sizeof(int));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"pk",(void *)pk);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,"sizeof(int)",
++                                   0,sizeof(int));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\initialized(pk)",0,
++                                 __gen_e_acsl_initialized);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\initialized(pk)";
++    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
++    __gen_e_acsl_assert_data.fct = "f_scalar";
++    __gen_e_acsl_assert_data.line = 16;
++    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert \initialized(pk); */ ;
++  __retres = *pk;
++  __e_acsl_delete_block((void *)(& k));
++  __e_acsl_delete_block((void *)(& pk));
++  return __retres;
++}
++
++int main(void)
++{
++  int __retres;
++  int tmp;
++  int tmp_0;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  struct S full = {.t = 1, .len = 5UL};
++  __e_acsl_store_block((void *)(& full),16UL);
++  __e_acsl_full_init((void *)(& full));
++  tmp = __gen_e_acsl_f_struct(full);
++  tmp_0 = f_scalar(3);
++  __retres = (tmp + tmp_0) - 8;
++  __e_acsl_delete_block((void *)(& full));
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++/*@ requires \initialized(&s.len); */
++int __gen_e_acsl_f_struct(struct S s)
++{
++  int __retres;
++  {
++    int __gen_e_acsl_initialized;
++    __e_acsl_store_block((void *)(& s),16UL);
++    __e_acsl_full_init((void *)(& s));
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_initialized = __e_acsl_initialized((void *)(& s.len),
++                                                    sizeof(unsigned long));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"&s.len",
++                                 (void *)(& s.len));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                   "sizeof(unsigned long)",0,
++                                   sizeof(unsigned long));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\initialized(&s.len)",0,
++                                 __gen_e_acsl_initialized);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Precondition";
++    __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.len)";
++    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
++    __gen_e_acsl_assert_data.fct = "f_struct";
++    __gen_e_acsl_assert_data.line = 7;
++    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  __retres = f_struct(s);
++  __e_acsl_delete_block((void *)(& s));
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
+new file mode 100644
+index 0000000000..ff49609cc8
+--- /dev/null
++++ b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
+@@ -0,0 +1,4 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] issue-framac-177.c:16: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
+index f2b99d7626..f04d13d0f0 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
+@@ -693,6 +693,7 @@ pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_assumes_value;
+     __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_full_init((void *)(& stat_loc));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c
+index 95bf63814e..fce5d5fc47 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c
+@@ -146,6 +146,7 @@ pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_assumes_value;
+     __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_full_init((void *)(& stat_loc));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c
+index 6ce906e88f..464883038f 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c
+@@ -583,6 +583,7 @@ pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_assumes_value;
+     __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_full_init((void *)(& stat_loc));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c
+index ce3853cdf7..9df7882378 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c
+@@ -134,6 +134,7 @@ pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_assumes_value;
+     __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_full_init((void *)(& stat_loc));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
+diff --git a/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c b/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c
+index f67b2cd453..7d39b5bacb 100644
+--- a/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c
++++ b/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c
+@@ -158,6 +158,7 @@ void *write_value(void *arg)
+   __e_acsl_store_block((void *)(& tmp),4UL);
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& arg),8UL);
++  __e_acsl_full_init((void *)(& arg));
+   __e_acsl_full_init((void *)(& tmp));
+   tmp = __gen_e_acsl_pthread_mutex_lock(& write_mutex);
+   if (tmp != 0) {
+@@ -213,6 +214,7 @@ void *read_value(void *arg)
+   __e_acsl_store_block((void *)(& tmp),4UL);
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& arg),8UL);
++  __e_acsl_full_init((void *)(& arg));
+   __e_acsl_full_init((void *)(& tmp));
+   tmp = __gen_e_acsl_pthread_mutex_lock(& read_mutex);
+   if (tmp != 0) {
+@@ -536,6 +538,7 @@ void *__gen_e_acsl_read_value(void *arg)
+     int __gen_e_acsl_valid_read_2;
+     int __gen_e_acsl_and_3;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -722,6 +725,7 @@ void *__gen_e_acsl_write_value(void *arg)
+   void *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& arg),8UL);
++  __e_acsl_full_init((void *)(& arg));
+   __gen_e_acsl_at = arg;
+   __gen_e_acsl_at_2 = arg;
+   __gen_e_acsl_at_3 = arg;
+@@ -922,6 +926,7 @@ int __gen_e_acsl_usleep(useconds_t usec)
+   int __retres;
+   __e_acsl_store_block((void *)(& __retres),4UL);
+   __e_acsl_store_block((void *)(& usec),4UL);
++  __e_acsl_full_init((void *)(& usec));
+   __retres = usleep(usec);
+   {
+     int __gen_e_acsl_or;
+@@ -958,6 +963,7 @@ int __gen_e_acsl_usleep(useconds_t usec)
+  __attribute__((__noreturn__)) void __gen_e_acsl_exit(int status)
+ {
+   __e_acsl_store_block((void *)(& status),4UL);
++  __e_acsl_full_init((void *)(& status));
+   exit(status);
+   {
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+@@ -981,6 +987,7 @@ int __gen_e_acsl_usleep(useconds_t usec)
+ void __gen_e_acsl_perror(char const *s)
+ {
+   __e_acsl_store_block((void *)(& s),8UL);
++  __e_acsl_full_init((void *)(& s));
+   perror(s);
+   __e_acsl_delete_block((void *)(& s));
+   return;
+@@ -1000,6 +1007,7 @@ int __gen_e_acsl_pthread_mutex_unlock(pthread_mutex_t *mutex)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -1079,6 +1087,7 @@ int __gen_e_acsl_pthread_mutex_trylock(pthread_mutex_t *mutex)
+   int __retres;
+   __e_acsl_store_block((void *)(& __retres),4UL);
+   __e_acsl_store_block((void *)(& mutex),8UL);
++  __e_acsl_full_init((void *)(& mutex));
+   __retres = pthread_mutex_trylock(mutex);
+   __e_acsl_delete_block((void *)(& mutex));
+   __e_acsl_delete_block((void *)(& __retres));
+@@ -1101,6 +1110,7 @@ int __gen_e_acsl_pthread_mutex_lock(pthread_mutex_t *mutex)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -1208,7 +1218,9 @@ int __gen_e_acsl_pthread_mutex_init(pthread_mutex_t * restrict mutex,
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_or;
+     __e_acsl_store_block((void *)(& attrs),8UL);
++    __e_acsl_full_init((void *)(& attrs));
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)mutex,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"mutex",
+@@ -1440,7 +1452,9 @@ int __gen_e_acsl_pthread_join(pthread_t thread, void **retval)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& retval),8UL);
++    __e_acsl_full_init((void *)(& retval));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __gen_e_acsl_contract = __e_acsl_contract_init(2UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -1627,9 +1641,13 @@ int __gen_e_acsl_pthread_create(pthread_t * restrict thread,
+     int __gen_e_acsl_or;
+     int __gen_e_acsl_or_2;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_store_block((void *)(& start_routine),8UL);
++    __e_acsl_full_init((void *)(& start_routine));
+     __e_acsl_store_block((void *)(& attr),8UL);
++    __e_acsl_full_init((void *)(& attr));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)thread,8UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"thread",
+@@ -1884,7 +1902,9 @@ int __gen_e_acsl_pthread_cond_wait(pthread_cond_t * restrict cond,
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_store_block((void *)(& cond),8UL);
++    __e_acsl_full_init((void *)(& cond));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -2011,7 +2031,9 @@ int __gen_e_acsl_pthread_cond_init(pthread_cond_t * restrict cond,
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_or;
+     __e_acsl_store_block((void *)(& attr),8UL);
++    __e_acsl_full_init((void *)(& attr));
+     __e_acsl_store_block((void *)(& cond),8UL);
++    __e_acsl_full_init((void *)(& cond));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)cond,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"cond",
+@@ -2202,6 +2224,7 @@ int __gen_e_acsl_pthread_cond_broadcast(pthread_cond_t *cond)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& cond),8UL);
++    __e_acsl_full_init((void *)(& cond));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/concurrency/oracle/gen_sequential_threads.0.c b/plugins/e-acsl/tests/concurrency/oracle/gen_sequential_threads.0.c
+index 8a4b4da94f..dace4f73bc 100644
+--- a/plugins/e-acsl/tests/concurrency/oracle/gen_sequential_threads.0.c
++++ b/plugins/e-acsl/tests/concurrency/oracle/gen_sequential_threads.0.c
+@@ -57,6 +57,7 @@ void *write_value(void *arg)
+   void *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& arg),8UL);
++  __e_acsl_full_init((void *)(& arg));
+   int idx = *((int *)arg);
+   __e_acsl_store_block((void *)(& idx),4UL);
+   __e_acsl_full_init((void *)(& idx));
+@@ -77,6 +78,7 @@ void *read_value(void *arg)
+   void *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& arg),8UL);
++  __e_acsl_full_init((void *)(& arg));
+   int idx = *((int *)arg);
+   __e_acsl_store_block((void *)(& idx),4UL);
+   __e_acsl_full_init((void *)(& idx));
+@@ -204,7 +206,9 @@ int __gen_e_acsl_pthread_join(pthread_t thread, void **retval)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& retval),8UL);
++    __e_acsl_full_init((void *)(& retval));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __gen_e_acsl_contract = __e_acsl_contract_init(2UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -391,9 +395,13 @@ int __gen_e_acsl_pthread_create(pthread_t * restrict thread,
+     int __gen_e_acsl_or;
+     int __gen_e_acsl_or_2;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_store_block((void *)(& start_routine),8UL);
++    __e_acsl_full_init((void *)(& start_routine));
+     __e_acsl_store_block((void *)(& attr),8UL);
++    __e_acsl_full_init((void *)(& attr));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)thread,8UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"thread",
+diff --git a/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c b/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c
+index 1e47d87a86..135f2dec4f 100644
+--- a/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c
++++ b/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c
+@@ -163,6 +163,7 @@ void *__gen_e_acsl_read_value(void *arg)
+     int __gen_e_acsl_valid_read_2;
+     int __gen_e_acsl_and_3;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -349,6 +350,7 @@ void *__gen_e_acsl_write_value(void *arg)
+   void *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& arg),8UL);
++  __e_acsl_full_init((void *)(& arg));
+   __gen_e_acsl_at = arg;
+   __gen_e_acsl_at_2 = arg;
+   __gen_e_acsl_at_3 = arg;
+@@ -549,6 +551,7 @@ int __gen_e_acsl_usleep(useconds_t usec)
+   int __retres;
+   __e_acsl_store_block((void *)(& __retres),4UL);
+   __e_acsl_store_block((void *)(& usec),4UL);
++  __e_acsl_full_init((void *)(& usec));
+   __retres = usleep(usec);
+   {
+     int __gen_e_acsl_or;
+@@ -585,6 +588,7 @@ int __gen_e_acsl_usleep(useconds_t usec)
+  __attribute__((__noreturn__)) void __gen_e_acsl_exit(int status)
+ {
+   __e_acsl_store_block((void *)(& status),4UL);
++  __e_acsl_full_init((void *)(& status));
+   exit(status);
+   {
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+@@ -608,6 +612,7 @@ int __gen_e_acsl_usleep(useconds_t usec)
+ void __gen_e_acsl_perror(char const *s)
+ {
+   __e_acsl_store_block((void *)(& s),8UL);
++  __e_acsl_full_init((void *)(& s));
+   perror(s);
+   __e_acsl_delete_block((void *)(& s));
+   return;
+@@ -627,6 +632,7 @@ int __gen_e_acsl_pthread_mutex_unlock(pthread_mutex_t *mutex)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -706,6 +712,7 @@ int __gen_e_acsl_pthread_mutex_trylock(pthread_mutex_t *mutex)
+   int __retres;
+   __e_acsl_store_block((void *)(& __retres),4UL);
+   __e_acsl_store_block((void *)(& mutex),8UL);
++  __e_acsl_full_init((void *)(& mutex));
+   __retres = pthread_mutex_trylock(mutex);
+   __e_acsl_delete_block((void *)(& mutex));
+   __e_acsl_delete_block((void *)(& __retres));
+@@ -728,6 +735,7 @@ int __gen_e_acsl_pthread_mutex_lock(pthread_mutex_t *mutex)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -835,7 +843,9 @@ int __gen_e_acsl_pthread_mutex_init(pthread_mutex_t * restrict mutex,
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_or;
+     __e_acsl_store_block((void *)(& attrs),8UL);
++    __e_acsl_full_init((void *)(& attrs));
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)mutex,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"mutex",
+@@ -1067,7 +1077,9 @@ int __gen_e_acsl_pthread_join(pthread_t thread, void **retval)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& retval),8UL);
++    __e_acsl_full_init((void *)(& retval));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __gen_e_acsl_contract = __e_acsl_contract_init(2UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -1254,9 +1266,13 @@ int __gen_e_acsl_pthread_create(pthread_t * restrict thread,
+     int __gen_e_acsl_or;
+     int __gen_e_acsl_or_2;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_store_block((void *)(& start_routine),8UL);
++    __e_acsl_full_init((void *)(& start_routine));
+     __e_acsl_store_block((void *)(& attr),8UL);
++    __e_acsl_full_init((void *)(& attr));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)thread,8UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"thread",
+@@ -1511,7 +1527,9 @@ int __gen_e_acsl_pthread_cond_wait(pthread_cond_t * restrict cond,
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& mutex),8UL);
++    __e_acsl_full_init((void *)(& mutex));
+     __e_acsl_store_block((void *)(& cond),8UL);
++    __e_acsl_full_init((void *)(& cond));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+@@ -1638,7 +1656,9 @@ int __gen_e_acsl_pthread_cond_init(pthread_cond_t * restrict cond,
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_or;
+     __e_acsl_store_block((void *)(& attr),8UL);
++    __e_acsl_full_init((void *)(& attr));
+     __e_acsl_store_block((void *)(& cond),8UL);
++    __e_acsl_full_init((void *)(& cond));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)cond,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"cond",
+@@ -1829,6 +1849,7 @@ int __gen_e_acsl_pthread_cond_broadcast(pthread_cond_t *cond)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& cond),8UL);
++    __e_acsl_full_init((void *)(& cond));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/concurrency/oracle/gen_threads_safe_locations.0.c b/plugins/e-acsl/tests/concurrency/oracle/gen_threads_safe_locations.0.c
+index 74184afd7b..14d1f7f19c 100644
+--- a/plugins/e-acsl/tests/concurrency/oracle/gen_threads_safe_locations.0.c
++++ b/plugins/e-acsl/tests/concurrency/oracle/gen_threads_safe_locations.0.c
+@@ -53,6 +53,7 @@ void *thread_start(void *arg)
+   {
+     int __gen_e_acsl_and;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     if (1) __gen_e_acsl_and = 1; else __gen_e_acsl_and = 0;
+     __gen_e_acsl_assert_data.blocking = 1;
+@@ -234,7 +235,9 @@ int __gen_e_acsl_pthread_join(pthread_t thread, void **retval)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& retval),8UL);
++    __e_acsl_full_init((void *)(& retval));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __gen_e_acsl_contract = __e_acsl_contract_init(2UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -421,9 +424,13 @@ int __gen_e_acsl_pthread_create(pthread_t * restrict thread,
+     int __gen_e_acsl_or;
+     int __gen_e_acsl_or_2;
+     __e_acsl_store_block((void *)(& arg),8UL);
++    __e_acsl_full_init((void *)(& arg));
+     __e_acsl_store_block((void *)(& start_routine),8UL);
++    __e_acsl_full_init((void *)(& start_routine));
+     __e_acsl_store_block((void *)(& attr),8UL);
++    __e_acsl_full_init((void *)(& attr));
+     __e_acsl_store_block((void *)(& thread),8UL);
++    __e_acsl_full_init((void *)(& thread));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)thread,8UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"thread",
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_acsl_check.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_acsl_check.0.c
+index fd9244667a..25b4a7cc78 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_acsl_check.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_acsl_check.0.c
+@@ -22,6 +22,7 @@ void g(int a, int *b)
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_valid_read;
+     __e_acsl_store_block((void *)(& b),8UL);
++    __e_acsl_full_init((void *)(& b));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_at.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_at.0.c
+index d554741f43..484fe05c06 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_at.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_at.0.c
+@@ -209,7 +209,9 @@ void g(int *p, int *q)
+   int __gen_e_acsl_at_2;
+   int __gen_e_acsl_at;
+   __e_acsl_store_block((void *)(& q),8UL);
++  __e_acsl_full_init((void *)(& q));
+   __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
+   __e_acsl_initialize((void *)p,sizeof(int));
+   *p = 0;
+   __e_acsl_initialize((void *)(p + 1),sizeof(int));
+@@ -723,6 +725,7 @@ int __gen_e_acsl_h(int x);
+ int h(int x)
+ {
+   __e_acsl_store_block((void *)(& x),4UL);
++  __e_acsl_full_init((void *)(& x));
+   __e_acsl_delete_block((void *)(& x));
+   return x;
+ }
+@@ -868,6 +871,7 @@ int __gen_e_acsl_h(int x)
+   int __retres;
+   __e_acsl_store_block((void *)(& __retres),4UL);
+   __e_acsl_store_block((void *)(& x),4UL);
++  __e_acsl_full_init((void *)(& x));
+   __gen_e_acsl_at = x;
+   __retres = h(x);
+   {
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_at_on_logic_vars.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_at_on_logic_vars.0.c
+index d30d668063..859ccafbea 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_at_on_logic_vars.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_at_on_logic_vars.0.c
+@@ -16,6 +16,7 @@ void __gen_e_acsl_f(int *t);
+ void f(int *t)
+ {
+   __e_acsl_store_block((void *)(& t),8UL);
++  __e_acsl_full_init((void *)(& t));
+   __e_acsl_delete_block((void *)(& t));
+   return;
+ }
+@@ -543,6 +544,7 @@ void __gen_e_acsl_f(int *t)
+   __gen_e_acsl_at_2 = (int *)malloc(4UL);
+   __gen_e_acsl_at = (int *)malloc(4UL);
+   __e_acsl_store_block((void *)(& t),8UL);
++  __e_acsl_full_init((void *)(& t));
+   {
+     int __gen_e_acsl_m;
+     __gen_e_acsl_m = 4;
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_axiomatic.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_axiomatic.0.c
+index 9394322d1a..edab496acd 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_axiomatic.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_axiomatic.0.c
+@@ -18,6 +18,7 @@ void __gen_e_acsl_f(int s);
+ void f(int s)
+ {
+   __e_acsl_store_block((void *)(& s),4UL);
++  __e_acsl_full_init((void *)(& s));
+   __e_acsl_delete_block((void *)(& s));
+   return;
+ }
+@@ -84,6 +85,7 @@ void __gen_e_acsl_f(int s)
+ {
+   int __gen_e_acsl_at;
+   __e_acsl_store_block((void *)(& s),4UL);
++  __e_acsl_full_init((void *)(& s));
+   __gen_e_acsl_at = s;
+   f(s);
+   __e_acsl_delete_block((void *)(& s));
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c
+index e3bbcd96aa..e28d1d6641 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c
+@@ -1176,6 +1176,7 @@ void __gen_e_acsl_k(int x)
+   {
+     int __gen_e_acsl_k_pred_2;
+     __e_acsl_store_block((void *)(& x),4UL);
++    __e_acsl_full_init((void *)(& x));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_k_pred_2 = __gen_e_acsl_k_pred(x);
+     __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"x",0,x);
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c b/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c
+index 4a2303904f..c5d538ff95 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c
+@@ -1411,6 +1411,7 @@ void __gen_e_acsl_k(int x)
+     __e_acsl_mpz_t __gen_e_acsl_x;
+     int __gen_e_acsl_k_pred_2;
+     __e_acsl_store_block((void *)(& x),4UL);
++    __e_acsl_full_init((void *)(& x));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gmpz_init_set_si(__gen_e_acsl_x,(long)x);
+     __gen_e_acsl_k_pred_2 = __gen_e_acsl_k_pred((__e_acsl_mpz_struct *)__gen_e_acsl_x);
+diff --git a/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c b/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c
+index edf9561bfa..01874c8d9d 100644
+--- a/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c
++++ b/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c
+@@ -427,6 +427,7 @@ pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_assumes_value;
+     __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_full_init((void *)(& stat_loc));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
+@@ -660,6 +661,7 @@ int __gen_e_acsl_fclose(FILE *stream)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& stream),8UL);
++    __e_acsl_full_init((void *)(& stream));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/format/oracle/gen_printf.0.c b/plugins/e-acsl/tests/format/oracle/gen_printf.0.c
+index 719df6298c..484d1bbc9a 100644
+--- a/plugins/e-acsl/tests/format/oracle/gen_printf.0.c
++++ b/plugins/e-acsl/tests/format/oracle/gen_printf.0.c
+@@ -122,7 +122,9 @@ void apply_specifier(char *format, int spec)
+   char *tmp_1;
+   __e_acsl_store_block((void *)(& tmp_1),8UL);
+   __e_acsl_store_block((void *)(& spec),4UL);
++  __e_acsl_full_init((void *)(& spec));
+   __e_acsl_store_block((void *)(& format),8UL);
++  __e_acsl_full_init((void *)(& format));
+   void *p = (void *)0;
+   __e_acsl_full_init((void *)(& tmp_1));
+   tmp_1 = __gen_e_acsl_strchr(__fc_lit_string10,spec);
+@@ -169,7 +171,9 @@ void test_specifier_application(char const *allowed, char const *fmt,
+   unsigned long __lengthof_format;
+   int i;
+   __e_acsl_store_block((void *)(& fmt),8UL);
++  __e_acsl_full_init((void *)(& fmt));
+   __e_acsl_store_block((void *)(& allowed),8UL);
++  __e_acsl_full_init((void *)(& allowed));
+   tmp = __gen_e_acsl_strlen(fmt);
+   int len = (int)tmp;
+   {
+@@ -330,7 +334,9 @@ char *__gen_e_acsl_strcpy(char * restrict dest, char const * restrict src)
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_aligned_3;
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)dest,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"dest",
+@@ -524,7 +530,9 @@ char *__gen_e_acsl_strchr(char const *s, int c)
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_aligned_4;
+     __e_acsl_store_block((void *)(& c),4UL);
++    __e_acsl_full_init((void *)(& c));
+     __e_acsl_store_block((void *)(& s),8UL);
++    __e_acsl_full_init((void *)(& s));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)s,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"s",(void *)s);
+@@ -780,6 +788,7 @@ size_t __gen_e_acsl_strlen(char const *s)
+   {
+     int __gen_e_acsl_aligned;
+     __e_acsl_store_block((void *)(& s),8UL);
++    __e_acsl_full_init((void *)(& s));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)s,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"s",(void *)s);
+@@ -879,6 +888,7 @@ pid_t __gen_e_acsl_waitpid(pid_t pid, int *stat_loc, int options)
+     int __gen_e_acsl_aligned_4;
+     int __gen_e_acsl_assumes_value;
+     __e_acsl_store_block((void *)(& stat_loc),8UL);
++    __e_acsl_full_init((void *)(& stat_loc));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)stat_loc,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"stat_loc",
+diff --git a/plugins/e-acsl/tests/inductive/oracle/gen_stable_sort.0.c b/plugins/e-acsl/tests/inductive/oracle/gen_stable_sort.0.c
+index cd8a033d60..a2f3265a29 100644
+--- a/plugins/e-acsl/tests/inductive/oracle/gen_stable_sort.0.c
++++ b/plugins/e-acsl/tests/inductive/oracle/gen_stable_sort.0.c
+@@ -51,8 +51,11 @@ void __gen_e_acsl_swap(int *t, int i, int j);
+ void swap(int *t, int i, int j)
+ {
+   __e_acsl_store_block((void *)(& j),4UL);
++  __e_acsl_full_init((void *)(& j));
+   __e_acsl_store_block((void *)(& i),4UL);
++  __e_acsl_full_init((void *)(& i));
+   __e_acsl_store_block((void *)(& t),8UL);
++  __e_acsl_full_init((void *)(& t));
+   int tmp = *(t + i);
+   __e_acsl_initialize((void *)(t + i),sizeof(int));
+   *(t + i) = *(t + j);
+@@ -85,7 +88,9 @@ void min_sort(int *t, int n)
+   __e_acsl_store_block((void *)(& mi),4UL);
+   __e_acsl_store_block((void *)(& i),4UL);
+   __e_acsl_store_block((void *)(& n),4UL);
++  __e_acsl_full_init((void *)(& n));
+   __e_acsl_store_block((void *)(& t),8UL);
++  __e_acsl_full_init((void *)(& t));
+   if (n <= 0) goto return_label;
+   __e_acsl_full_init((void *)(& i));
+   i = 0;
+@@ -304,7 +309,9 @@ void __gen_e_acsl_min_sort(int *t, int n)
+     long __gen_e_acsl_if;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& n),4UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& t),8UL);
++    __e_acsl_full_init((void *)(& t));
+     __gen_e_acsl_at = n;
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)t,4UL);
+@@ -428,8 +435,11 @@ void __gen_e_acsl_swap(int *t, int i, int j)
+     int __gen_e_acsl_valid;
+     int __gen_e_acsl_and_3;
+     __e_acsl_store_block((void *)(& j),4UL);
++    __e_acsl_full_init((void *)(& j));
+     __e_acsl_store_block((void *)(& i),4UL);
++    __e_acsl_full_init((void *)(& i));
+     __e_acsl_store_block((void *)(& t),8UL);
++    __e_acsl_full_init((void *)(& t));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/libc/oracle/gen_file.0.c b/plugins/e-acsl/tests/libc/oracle/gen_file.0.c
+index c9d01bc1df..a0e7565902 100644
+--- a/plugins/e-acsl/tests/libc/oracle/gen_file.0.c
++++ b/plugins/e-acsl/tests/libc/oracle/gen_file.0.c
+@@ -84,7 +84,9 @@ size_t __gen_e_acsl_fread(void * restrict ptr, size_t size, size_t nmemb,
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_valid_2;
+     __e_acsl_store_block((void *)(& stream),8UL);
++    __e_acsl_full_init((void *)(& stream));
+     __e_acsl_store_block((void *)(& ptr),8UL);
++    __e_acsl_full_init((void *)(& ptr));
+     __gmpz_init_set_ui(__gen_e_acsl_size,size);
+     __gmpz_init_set(__gen_e_acsl_at,
+                     (__e_acsl_mpz_struct const *)(__gen_e_acsl_size));
+@@ -457,7 +459,9 @@ FILE *__gen_e_acsl_fopen(char const * restrict filename,
+   FILE *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& mode),8UL);
++  __e_acsl_full_init((void *)(& mode));
+   __e_acsl_store_block((void *)(& filename),8UL);
++  __e_acsl_full_init((void *)(& filename));
+   __retres = fopen(filename,mode);
+   __e_acsl_delete_block((void *)(& mode));
+   __e_acsl_delete_block((void *)(& filename));
+@@ -477,6 +481,7 @@ int __gen_e_acsl_fclose(FILE *stream)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& stream),8UL);
++    __e_acsl_full_init((void *)(& stream));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/libc/oracle/gen_mem.0.c b/plugins/e-acsl/tests/libc/oracle/gen_mem.0.c
+index 9f26b15f8c..e8e93e2ef9 100644
+--- a/plugins/e-acsl/tests/libc/oracle/gen_mem.0.c
++++ b/plugins/e-acsl/tests/libc/oracle/gen_mem.0.c
+@@ -414,8 +414,11 @@ void *__gen_e_acsl_memset(void *s, int c, size_t n)
+   {
+     int __gen_e_acsl_valid_or_empty_here_2;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& c),4UL);
++    __e_acsl_full_init((void *)(& c));
+     __e_acsl_store_block((void *)(& s),8UL);
++    __e_acsl_full_init((void *)(& s));
+     __gen_e_acsl_at = s;
+     __gen_e_acsl_at_2 = n;
+     __gen_e_acsl_at_3 = c;
+@@ -485,8 +488,11 @@ void *__gen_e_acsl_memmove(void *dest, void const *src, size_t n)
+     int __gen_e_acsl_valid_or_empty_here_3;
+     int __gen_e_acsl_valid_read_or_empty_here_2;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __gen_e_acsl_at = dest;
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_valid_or_empty_here_3 = __gen_e_acsl_valid_or_empty_here
+@@ -593,8 +599,11 @@ void *__gen_e_acsl_memcpy(void * restrict dest, void const * restrict src,
+     unsigned long __gen_e_acsl_if_4;
+     int __gen_e_acsl_separated;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __gen_e_acsl_at = dest;
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_valid_or_empty_here_4 = __gen_e_acsl_valid_or_empty_here
+diff --git a/plugins/e-acsl/tests/libc/oracle/gen_str.0.c b/plugins/e-acsl/tests/libc/oracle/gen_str.0.c
+index 32f0b26ffa..b113d1833c 100644
+--- a/plugins/e-acsl/tests/libc/oracle/gen_str.0.c
++++ b/plugins/e-acsl/tests/libc/oracle/gen_str.0.c
+@@ -191,8 +191,11 @@ char *__gen_e_acsl_strncat(char * restrict dest, char const * restrict src,
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_aligned_3;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)dest,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"dest",
+@@ -400,7 +403,9 @@ char *__gen_e_acsl_strcat(char * restrict dest, char const * restrict src)
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_aligned_4;
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)dest,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"dest",
+@@ -647,8 +652,11 @@ char *__gen_e_acsl_strncpy(char * restrict dest, char const * restrict src,
+     unsigned long __gen_e_acsl_if_5;
+     int __gen_e_acsl_separated;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)src,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"src",
+@@ -1098,7 +1106,9 @@ char *__gen_e_acsl_strcpy(char * restrict dest, char const * restrict src)
+     int __gen_e_acsl_aligned_2;
+     int __gen_e_acsl_aligned_3;
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)dest,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"dest",
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_alias.0.c b/plugins/e-acsl/tests/memory/oracle/gen_alias.0.c
+index 2ad0429f0d..a12663e59f 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_alias.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_alias.0.c
+@@ -9,6 +9,7 @@ extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
+ void f(int *dest, int val)
+ {
+   __e_acsl_store_block((void *)(& dest),8UL);
++  __e_acsl_full_init((void *)(& dest));
+   int *ptr = dest;
+   __e_acsl_store_block((void *)(& ptr),8UL);
+   __e_acsl_full_init((void *)(& ptr));
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_call.0.c b/plugins/e-acsl/tests/memory/oracle/gen_call.0.c
+index 11ff730253..f0fa1324af 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_call.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_call.0.c
+@@ -14,7 +14,9 @@ int *__gen_e_acsl_f(int *x, int *y);
+ int *f(int *x, int *y)
+ {
+   __e_acsl_store_block((void *)(& y),8UL);
++  __e_acsl_full_init((void *)(& y));
+   __e_acsl_store_block((void *)(& x),8UL);
++  __e_acsl_full_init((void *)(& x));
+   __e_acsl_initialize((void *)y,sizeof(int));
+   *y = 1;
+   __e_acsl_delete_block((void *)(& y));
+@@ -53,7 +55,9 @@ int *__gen_e_acsl_f(int *x, int *y)
+   int *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& y),8UL);
++  __e_acsl_full_init((void *)(& y));
+   __e_acsl_store_block((void *)(& x),8UL);
++  __e_acsl_full_init((void *)(& x));
+   __retres = f(x,y);
+   {
+     int __gen_e_acsl_aligned;
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_decl_in_switch.0.c b/plugins/e-acsl/tests/memory/oracle/gen_decl_in_switch.0.c
+index e5e61898a8..e226de5bdb 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_decl_in_switch.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_decl_in_switch.0.c
+@@ -9,6 +9,7 @@ extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
+ void decl_in_switch(int value)
+ {
+   __e_acsl_store_block((void *)(& value),4UL);
++  __e_acsl_full_init((void *)(& value));
+   switch (value) {
+     int *p;
+     __e_acsl_store_block((void *)(& p),8UL);
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_hidden_malloc.0.c b/plugins/e-acsl/tests/memory/oracle/gen_hidden_malloc.0.c
+index 7db4febc44..9de4659181 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_hidden_malloc.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_hidden_malloc.0.c
+@@ -173,7 +173,9 @@ char *__gen_e_acsl_realpath(char const * restrict file_name,
+     int __gen_e_acsl_or;
+     int __gen_e_acsl_aligned_8;
+     __e_acsl_store_block((void *)(& resolved_name),8UL);
++    __e_acsl_full_init((void *)(& resolved_name));
+     __e_acsl_store_block((void *)(& file_name),8UL);
++    __e_acsl_full_init((void *)(& file_name));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)resolved_name,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"resolved_name",
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_local_var.0.c b/plugins/e-acsl/tests/memory/oracle/gen_local_var.0.c
+index 63f679ba78..a28e7d61f3 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_local_var.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_local_var.0.c
+@@ -17,6 +17,7 @@ struct list *add(struct list *l, int i)
+   struct list *new;
+   __e_acsl_store_block((void *)(& new),8UL);
+   __e_acsl_store_block((void *)(& l),8UL);
++  __e_acsl_full_init((void *)(& l));
+   __e_acsl_full_init((void *)(& new));
+   new = (struct list *)malloc(16UL);
+   {
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_mainargs.0.c b/plugins/e-acsl/tests/memory/oracle/gen_mainargs.0.c
+index 7891d4c97d..44284e3b41 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_mainargs.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_mainargs.0.c
+@@ -26,6 +26,7 @@ int __gen_e_acsl_main(int argc, char **argv)
+     int __gen_e_acsl_forall;
+     long __gen_e_acsl_k;
+     __e_acsl_store_block((void *)(& argv),8UL);
++    __e_acsl_full_init((void *)(& argv));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_forall = 1;
+     __gen_e_acsl_k = 0L;
+@@ -853,6 +854,7 @@ size_t __gen_e_acsl_strlen(char const *s)
+   {
+     int __gen_e_acsl_aligned;
+     __e_acsl_store_block((void *)(& s),8UL);
++    __e_acsl_full_init((void *)(& s));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)s,1UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"s",(void *)s);
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_memalign.0.c b/plugins/e-acsl/tests/memory/oracle/gen_memalign.0.c
+index 97cb7695e6..87ea28bc90 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_memalign.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_memalign.0.c
+@@ -628,8 +628,11 @@ int __gen_e_acsl_posix_memalign(void **memptr, size_t alignment, size_t size)
+     int __gen_e_acsl_valid;
+     int __gen_e_acsl_is_posix_alignment_2;
+     __e_acsl_store_block((void *)(& size),8UL);
++    __e_acsl_full_init((void *)(& size));
+     __e_acsl_store_block((void *)(& alignment),8UL);
++    __e_acsl_full_init((void *)(& alignment));
+     __e_acsl_store_block((void *)(& memptr),8UL);
++    __e_acsl_full_init((void *)(& memptr));
+     __gen_e_acsl_contract = __e_acsl_contract_init(3UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -794,7 +797,9 @@ void *__gen_e_acsl_aligned_alloc(size_t alignment, size_t size)
+     int __gen_e_acsl_is_valid_alignment_2;
+     int __gen_e_acsl_is_valid_alignment_4;
+     __e_acsl_store_block((void *)(& size),8UL);
++    __e_acsl_full_init((void *)(& size));
+     __e_acsl_store_block((void *)(& alignment),8UL);
++    __e_acsl_full_init((void *)(& alignment));
+     __gen_e_acsl_at = errno;
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,"alignment",0,
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_ptr_init.0.c b/plugins/e-acsl/tests/memory/oracle/gen_ptr_init.0.c
+index 083dc2ede3..c706819a43 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_ptr_init.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_ptr_init.0.c
+@@ -20,6 +20,7 @@ void g(int *C, int *D)
+ {
+   {
+     __e_acsl_store_block((void *)(& C),8UL);
++    __e_acsl_full_init((void *)(& C));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_assert_data.blocking = 1;
+     __gen_e_acsl_assert_data.kind = "Assertion";
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_ranges_in_builtins.0.c b/plugins/e-acsl/tests/memory/oracle/gen_ranges_in_builtins.0.c
+index b0e53c28b9..93fb33ab12 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_ranges_in_builtins.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_ranges_in_builtins.0.c
+@@ -29,6 +29,7 @@ void __gen_e_acsl_g(long *ptr, size_t size);
+ void g(long *ptr, size_t size)
+ {
+   __e_acsl_store_block((void *)(& ptr),8UL);
++  __e_acsl_full_init((void *)(& ptr));
+   __e_acsl_delete_block((void *)(& ptr));
+   return;
+ }
+@@ -1064,6 +1065,7 @@ void __gen_e_acsl_g(long *ptr, size_t size)
+     unsigned long __gen_e_acsl_size_3;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& ptr),8UL);
++    __e_acsl_full_init((void *)(& ptr));
+     __gmpz_init_set_ui(__gen_e_acsl_size,size);
+     __gmpz_init_set(__gen_e_acsl_at,
+                     (__e_acsl_mpz_struct const *)(__gen_e_acsl_size));
+@@ -1334,6 +1336,7 @@ void __gen_e_acsl_f(char *s, long n)
+     unsigned long __gen_e_acsl_size_2;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& s),8UL);
++    __e_acsl_full_init((void *)(& s));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_valid.0.c b/plugins/e-acsl/tests/memory/oracle/gen_valid.0.c
+index c486998e99..88f348f4d1 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_valid.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_valid.0.c
+@@ -22,6 +22,7 @@ int *f(int *x)
+     int __gen_e_acsl_initialized;
+     int __gen_e_acsl_and;
+     __e_acsl_store_block((void *)(& x),8UL);
++    __e_acsl_full_init((void *)(& x));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_initialized = __e_acsl_initialized((void *)(& y),
+                                                     sizeof(int *));
+@@ -244,6 +245,7 @@ int *__gen_e_acsl_f(int *x)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& x),8UL);
++    __e_acsl_full_init((void *)(& x));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_valid_in_contract.0.c b/plugins/e-acsl/tests/memory/oracle/gen_valid_in_contract.0.c
+index 78f246321d..6cf4e65f19 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_valid_in_contract.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_valid_in_contract.0.c
+@@ -26,6 +26,7 @@ struct list *f(struct list *l)
+   struct list *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& l),8UL);
++  __e_acsl_full_init((void *)(& l));
+   if (l == (struct list *)0) {
+     __e_acsl_full_init((void *)(& __retres));
+     __retres = l;
+@@ -77,6 +78,7 @@ struct list *__gen_e_acsl_f(struct list *l)
+     int __gen_e_acsl_valid;
+     int __gen_e_acsl_or;
+     __e_acsl_store_block((void *)(& l),8UL);
++    __e_acsl_full_init((void *)(& l));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)l,8UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"l",(void *)l);
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_vdso.0.c b/plugins/e-acsl/tests/memory/oracle/gen_vdso.0.c
+index 7706d6193a..57c0f20d28 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_vdso.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_vdso.0.c
+@@ -90,6 +90,7 @@ time_t __gen_e_acsl_time(time_t *timer)
+     int __gen_e_acsl_assumes_value;
+     int __gen_e_acsl_active_bhvrs;
+     __e_acsl_store_block((void *)(& timer),8UL);
++    __e_acsl_full_init((void *)(& timer));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)timer,8UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"timer",
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_vector.0.c b/plugins/e-acsl/tests/memory/oracle/gen_vector.0.c
+index ff92b3702c..e2305afff4 100644
+--- a/plugins/e-acsl/tests/memory/oracle/gen_vector.0.c
++++ b/plugins/e-acsl/tests/memory/oracle/gen_vector.0.c
+@@ -19,6 +19,7 @@ int *new_inversed(int len, int *v)
+     int __gen_e_acsl_valid;
+     int __gen_e_acsl_and;
+     __e_acsl_store_block((void *)(& v),8UL);
++    __e_acsl_full_init((void *)(& v));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_builtin.0.c b/plugins/e-acsl/tests/special/oracle/gen_builtin.0.c
+index 81f2f39607..4f393086ee 100644
+--- a/plugins/e-acsl/tests/special/oracle/gen_builtin.0.c
++++ b/plugins/e-acsl/tests/special/oracle/gen_builtin.0.c
+@@ -14,6 +14,7 @@ int __gen_e_acsl_f(int i);
+ int f(int i)
+ {
+   __e_acsl_store_block((void *)(& i),4UL);
++  __e_acsl_full_init((void *)(& i));
+   int j = i + 1;
+   __e_acsl_delete_block((void *)(& i));
+   return j;
+@@ -42,6 +43,7 @@ int __gen_e_acsl_f(int i)
+   int __gen_e_acsl_at;
+   int __retres;
+   __e_acsl_store_block((void *)(& i),4UL);
++  __e_acsl_full_init((void *)(& i));
+   __gen_e_acsl_at = i;
+   __retres = f(i);
+   {
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-functions.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-functions.0.c
+index ef945323bb..2cb43e0e4b 100644
+--- a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-functions.0.c
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-functions.0.c
+@@ -15,6 +15,7 @@ int f(int *p)
+ {
+   int __retres;
+   __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
+   {
+     int i = 0;
+     {
+@@ -109,6 +110,7 @@ int __gen_e_acsl_f(int *p)
+     int __gen_e_acsl_aligned_3;
+     int __gen_e_acsl_valid_read_2;
+     __e_acsl_store_block((void *)(& p),8UL);
++    __e_acsl_full_init((void *)(& p));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)p,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"p",(void *)p);
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-instrument.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-instrument.0.c
+index 8039e95458..8ab92dd791 100644
+--- a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-instrument.0.c
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-instrument.0.c
+@@ -36,6 +36,7 @@ int instrument1(int *p)
+ {
+   int __retres;
+   __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
+   __e_acsl_initialize((void *)p,sizeof(int));
+   *p = 0;
+   __retres = 0;
+@@ -50,6 +51,7 @@ int instrument2(int *p)
+ {
+   int __retres;
+   __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
+   {
+     int *q = p;
+     __e_acsl_store_block((void *)(& q),8UL);
+@@ -72,6 +74,7 @@ int vol(int n, void * const *__va_params)
+   int tmp;
+   __e_acsl_store_block((void *)(& vl),8UL);
+   __e_acsl_store_block((void *)(& __va_params),8UL);
++  __e_acsl_full_init((void *)(& __va_params));
+   __e_acsl_full_init((void *)(& vl));
+   vl = __va_params;
+   tmp = *((int *)*vl);
+@@ -167,6 +170,7 @@ int __gen_e_acsl_instrument2(int *p)
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid;
+     __e_acsl_store_block((void *)(& p),8UL);
++    __e_acsl_full_init((void *)(& p));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+       {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-valid.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-valid.0.c
+index c73c1be766..6a235c122b 100644
+--- a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-valid.0.c
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-valid.0.c
+@@ -38,7 +38,9 @@ void f(int *x, int *y)
+       int __gen_e_acsl_aligned;
+       int __gen_e_acsl_valid_read;
+       __e_acsl_store_block((void *)(& y),8UL);
++      __e_acsl_full_init((void *)(& y));
+       __e_acsl_store_block((void *)(& x),8UL);
++      __e_acsl_full_init((void *)(& x));
+       __e_acsl_assert_data_t __gen_e_acsl_assert_data =
+         {.values = (void *)0};
+       __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -316,7 +318,9 @@ void __gen_e_acsl_f(int *x, int *y)
+     int __gen_e_acsl_valid_read_4;
+     int __gen_e_acsl_active_bhvrs;
+     __e_acsl_store_block((void *)(& y),8UL);
++    __e_acsl_full_init((void *)(& y));
+     __e_acsl_store_block((void *)(& x),8UL);
++    __e_acsl_full_init((void *)(& x));
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __gen_e_acsl_aligned = __e_acsl_aligned((void *)x,4UL);
+     __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"x",(void *)x);
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_darray.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_darray.0.c
+index 89609cdf5f..2c62abee13 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_darray.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_darray.0.c
+@@ -12,6 +12,7 @@ void area_triangle(double (*vertices)[4])
+     int __gen_e_acsl_aligned;
+     int __gen_e_acsl_valid_read;
+     __e_acsl_store_block((void *)(& vertices),8UL);
++    __e_acsl_full_init((void *)(& vertices));
+     __e_acsl_temporal_pull_parameter((void *)(& vertices),0U,8UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
+@@ -112,6 +113,7 @@ void area_triangle(double (*vertices)[4])
+ void abe_matrix(double (*vertices)[4])
+ {
+   __e_acsl_store_block((void *)(& vertices),8UL);
++  __e_acsl_full_init((void *)(& vertices));
+   __e_acsl_temporal_pull_parameter((void *)(& vertices),0U,8UL);
+   __e_acsl_temporal_reset_parameters();
+   __e_acsl_temporal_reset_return();
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_lib.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_lib.0.c
+index f7e83c556d..8f11dd9fba 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_lib.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_lib.0.c
+@@ -173,7 +173,9 @@ char *__gen_e_acsl_realpath(char const * restrict file_name,
+     int __gen_e_acsl_or;
+     int __gen_e_acsl_aligned_8;
+     __e_acsl_store_block((void *)(& resolved_name),8UL);
++    __e_acsl_full_init((void *)(& resolved_name));
+     __e_acsl_store_block((void *)(& file_name),8UL);
++    __e_acsl_full_init((void *)(& file_name));
+     __e_acsl_temporal_pull_parameter((void *)(& file_name),0U,8UL);
+     __e_acsl_temporal_pull_parameter((void *)(& resolved_name),1U,8UL);
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_ptr.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_ptr.0.c
+index ec12ec9e1f..7ec724843a 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_ptr.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_fun_ptr.0.c
+@@ -10,6 +10,7 @@ extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
+ int *pfun(char c, int *p, int *p2, int *p3, int *p4, int i)
+ {
+   __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
+   __e_acsl_temporal_pull_parameter((void *)(& p),1U,8UL);
+   int *q = p;
+   __e_acsl_temporal_store_nreferent((void *)(& q),(void *)(& p));
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_getenv.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_getenv.0.c
+index d0de458ca8..435bf15b1e 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_getenv.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_getenv.0.c
+@@ -34,6 +34,7 @@ char *__gen_e_acsl_getenv(char const *name)
+   char *__retres;
+   __e_acsl_store_block((void *)(& __retres),8UL);
+   __e_acsl_store_block((void *)(& name),8UL);
++  __e_acsl_full_init((void *)(& name));
+   __e_acsl_temporal_pull_parameter((void *)(& name),0U,8UL);
+   __e_acsl_temporal_reset_parameters();
+   __e_acsl_temporal_reset_return();
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_global_init.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_global_init.0.c
+index 827b1c3311..a3c27d0168 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_global_init.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_global_init.0.c
+@@ -27,6 +27,7 @@ void build_tree(tree_desc *desc)
+   int *extra;
+   __e_acsl_store_block((void *)(& extra),8UL);
+   __e_acsl_store_block((void *)(& desc),8UL);
++  __e_acsl_full_init((void *)(& desc));
+   __e_acsl_temporal_pull_parameter((void *)(& desc),0U,8UL);
+   __e_acsl_full_init((void *)(& extra));
+   __e_acsl_temporal_store_nreferent((void *)(& extra),
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_labels.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_labels.0.c
+index 99a62c9443..953a9ddd72 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_labels.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_labels.0.c
+@@ -9,7 +9,9 @@ extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
+ void foo(int *a, int *b)
+ {
+   __e_acsl_store_block((void *)(& b),8UL);
++  __e_acsl_full_init((void *)(& b));
+   __e_acsl_store_block((void *)(& a),8UL);
++  __e_acsl_full_init((void *)(& a));
+   __e_acsl_temporal_pull_parameter((void *)(& a),0U,8UL);
+   __e_acsl_temporal_pull_parameter((void *)(& b),1U,8UL);
+   int t = *a;
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_local_init.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_local_init.0.c
+index 7936b709a1..dfab2b6b62 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_local_init.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_local_init.0.c
+@@ -19,6 +19,7 @@ void build_tree(tree_desc *desc)
+   int *extra;
+   __e_acsl_store_block((void *)(& extra),8UL);
+   __e_acsl_store_block((void *)(& desc),8UL);
++  __e_acsl_full_init((void *)(& desc));
+   __e_acsl_temporal_pull_parameter((void *)(& desc),0U,8UL);
+   __e_acsl_full_init((void *)(& extra));
+   __e_acsl_temporal_store_nreferent((void *)(& extra),
+diff --git a/plugins/e-acsl/tests/temporal/oracle/gen_t_memcpy.0.c b/plugins/e-acsl/tests/temporal/oracle/gen_t_memcpy.0.c
+index b1612002e8..9ff25d8958 100644
+--- a/plugins/e-acsl/tests/temporal/oracle/gen_t_memcpy.0.c
++++ b/plugins/e-acsl/tests/temporal/oracle/gen_t_memcpy.0.c
+@@ -989,8 +989,11 @@ void *__gen_e_acsl_memset(void *s, int c, size_t n)
+   {
+     int __gen_e_acsl_valid_or_empty_here_2;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& c),4UL);
++    __e_acsl_full_init((void *)(& c));
+     __e_acsl_store_block((void *)(& s),8UL);
++    __e_acsl_full_init((void *)(& s));
+     __e_acsl_temporal_pull_parameter((void *)(& s),0U,8UL);
+     __gen_e_acsl_at = s;
+     __gen_e_acsl_at_2 = n;
+@@ -1086,8 +1089,11 @@ void *__gen_e_acsl_memcpy(void * restrict dest, void const * restrict src,
+     unsigned long __gen_e_acsl_if_5;
+     int __gen_e_acsl_separated;
+     __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_full_init((void *)(& n));
+     __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_full_init((void *)(& src));
+     __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_full_init((void *)(& dest));
+     __e_acsl_temporal_pull_parameter((void *)(& dest),0U,8UL);
+     __e_acsl_temporal_pull_parameter((void *)(& src),1U,8UL);
+     __gen_e_acsl_at = dest;
+-- 
+2.56.0.windows.4
+
+
+From 3849f2be5f3127a7fe1929f6a9b464a9e08992d1 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 15 Nov 2026 19:13:05 +0100
+Subject: [PATCH 2/2] [e-acsl] clang-format the new test
+
+Formatting only, as `make check-lint` requires; the oracles follow the
+new line numbers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/tests/bts/issue-framac-177.c               | 7 +++++--
+ plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c  | 8 ++++----
+ .../e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle | 2 +-
+ 3 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/plugins/e-acsl/tests/bts/issue-framac-177.c b/plugins/e-acsl/tests/bts/issue-framac-177.c
+index d2e65a1807..c6468b362b 100644
+--- a/plugins/e-acsl/tests/bts/issue-framac-177.c
++++ b/plugins/e-acsl/tests/bts/issue-framac-177.c
+@@ -2,7 +2,10 @@
+    COMMENT: formal parameters are initialized on function entry (issue #177)
+ */
+ 
+-struct S { int t; unsigned long len; };
++struct S {
++  int t;
++  unsigned long len;
++};
+ 
+ /*@ requires \initialized(&s.len); */
+ int f_struct(struct S s) {
+@@ -18,6 +21,6 @@ int f_scalar(int k) {
+ }
+ 
+ int main(void) {
+-  struct S full = { 1, 5 };
++  struct S full = {1, 5};
+   return f_struct(full) + f_scalar(3) - 8;
+ }
+diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
+index 4cafaa8b40..c89dda255a 100644
+--- a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
++++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
+@@ -35,7 +35,7 @@ int f_struct(struct S s)
+     __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.t)";
+     __gen_e_acsl_assert_data.file = "issue-framac-177.c";
+     __gen_e_acsl_assert_data.fct = "f_struct";
+-    __gen_e_acsl_assert_data.line = 9;
++    __gen_e_acsl_assert_data.line = 12;
+     __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
+     __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
+   }
+@@ -73,7 +73,7 @@ int f_scalar(int k)
+       __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(pk,4)";
+       __gen_e_acsl_assert_data_2.file = "issue-framac-177.c";
+       __gen_e_acsl_assert_data_2.fct = "f_scalar";
+-      __gen_e_acsl_assert_data_2.line = 16;
++      __gen_e_acsl_assert_data_2.line = 19;
+       __gen_e_acsl_assert_data_2.name = "pointer alignment";
+       __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
+       __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
+@@ -90,7 +90,7 @@ int f_scalar(int k)
+     __gen_e_acsl_assert_data.pred_txt = "\\initialized(pk)";
+     __gen_e_acsl_assert_data.file = "issue-framac-177.c";
+     __gen_e_acsl_assert_data.fct = "f_scalar";
+-    __gen_e_acsl_assert_data.line = 16;
++    __gen_e_acsl_assert_data.line = 19;
+     __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
+     __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
+   }
+@@ -142,7 +142,7 @@ int __gen_e_acsl_f_struct(struct S s)
+     __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.len)";
+     __gen_e_acsl_assert_data.file = "issue-framac-177.c";
+     __gen_e_acsl_assert_data.fct = "f_struct";
+-    __gen_e_acsl_assert_data.line = 7;
++    __gen_e_acsl_assert_data.line = 10;
+     __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
+     __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
+   }
+diff --git a/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
+index ff49609cc8..dfa5b51ec4 100644
+--- a/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
++++ b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
+@@ -1,4 +1,4 @@
+ [e-acsl] beginning translation.
+ [e-acsl] translation done in project "e-acsl".
+-[eva:alarm] issue-framac-177.c:16: Warning: 
++[eva:alarm] issue-framac-177.c:19: Warning: 
+   function __e_acsl_assert, behavior blocking: precondition got status unknown.
+-- 
+2.56.0.windows.4
+

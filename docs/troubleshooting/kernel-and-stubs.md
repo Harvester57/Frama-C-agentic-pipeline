@@ -23,7 +23,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
 
 ### Symptom: `User Error: syntax error` on `fd_set`, `sizeof on incomplete type 'struct ip_mreq'`, or `Cannot find field sin_zero in type struct sockaddr_in` in the Phase 0 Model Parse
 - **Seen on:** ptf-original run-1, unit `src/LibPtfCom/libPtfCom.a` (`LitePing.c:111`, `LowLevelPortHandler.c:126` and `:237`), 2026-11-10. The whole unit fell back to GCC, which would have blocked Eva and WP for the run's only module.
-- **Cause:** three `__fc_libc` gaps. Frama-C's `<sys/socket.h>` pulls neither `<sys/types.h>` nor `<sys/select.h>`, so `fd_set` is undeclared (glibc reaches it through `sys/types.h -> sys/select.h`). `__fc_inet.h` has `ip_mreqn` and `ipv6_mreq` but not glibc's `__USE_MISC` `struct ip_mreq`. And no `__fc_libc` header defines `sockaddr_in`'s `sin_zero[8]` padding field.
+- **Cause:** three `__fc_libc` gaps. Frama-C's `<sys/socket.h>` pulls neither `<sys/types.h>` nor `<sys/select.h>`, so `fd_set` is undeclared (glibc reaches it through `sys/types.h -> sys/select.h`). `__fc_inet.h` has `ip_mreqn` and `ipv6_mreq` but not glibc's `__USE_MISC` `struct ip_mreq`. And no `__fc_libc` header defines `sockaddr_in`'s `sin_zero[8]` padding field. All three are still present on upstream `master` `3dff90fc70`: drafted with a validated libc patch as Issue 26, [`../upstream/frama-c/frama-c-libc-socket-header-gaps.md`](../upstream/frama-c/frama-c-libc-socket-header-gaps.md), filed as [pub/frama-c#2814](https://git.frama-c.com/pub/frama-c/-/work_items/2814) with merge request [!45](https://git.frama-c.com/pub/frama-c/-/merge_requests/45). The repairs below can go once a release carries it.
 - **Fix (fixed, uncommitted):** `fd_set` and `struct ip_mreq` are repaired in [`../../templates/fc_stubs/fc_compat_types.h`](../../templates/fc_stubs/fc_compat_types.h) (`#include <sys/select.h>` and `#include <netinet/in.h>` before the missing definitions, `__fc_libc` branch only). `sin_zero` cannot live there (a force-included redefinition of `sockaddr_in` collides with `__fc_inet.h`), so the analysis image patches the installed `__fc_inet.h` in place: a `RUN` step in the `framac-analysis` stage of the `Dockerfile` appends `unsigned char sin_zero[8];` to `struct sockaddr_in` (asserts on the upstream shape first). Rebuild the image after pulling.
 
 ### Symptom: `fatal error: elf.h: No such file or directory` or `linux/audit.h: No such file or directory` During Frama-C Model Parse
@@ -33,7 +33,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
 - **Caveat (by design):** functions declared only by these glibc headers have no ACSL contract: Eva lists them under `repair_hints`, WP marks them `unsound_proof`.
 
 ### Symptom: `User Error: Unable to compute offset .arr[i] in type struct s: Index is not constant`
-- **Cause:** Frama-C's `<stddef.h>` (and gcc's, in E-ACSL host-header builds) defines `offsetof` as `__builtin_offsetof`, which the kernel folds to a constant at parse time. GCC also accepts a non-constant array index in the member designator (`offsetof(type, member[i])`); Frama-C aborts on it. Found on `libseccomp` (`src/arch.c:54`, `default_arg_offset(x)` is `offsetof(struct seccomp_data, args[x])`, used at `src/arch.c:267`). Frama-C limitation, candidate for an upstream report.
+- **Cause:** Frama-C's `<stddef.h>` (and gcc's, in E-ACSL host-header builds) defines `offsetof` as `__builtin_offsetof`, which the kernel folds to a constant at parse time. GCC also accepts a non-constant array index in the member designator (`offsetof(type, member[i])`); Frama-C aborts on it. Found on `libseccomp` (`src/arch.c:54`, `default_arg_offset(x)` is `offsetof(struct seccomp_data, args[x])`, used at `src/arch.c:267`). Frama-C limitation (C17 requires a constant designator; GCC and Clang accept this as an extension): drafted as a feature request with a validated kernel patch, Issue 25, [`../upstream/frama-c/frama-c-kernel-offsetof-non-constant-index.md`](../upstream/frama-c/frama-c-kernel-offsetof-non-constant-index.md), filed as [pub/frama-c#2813](https://git.frama-c.com/pub/frama-c/-/work_items/2813) with merge request [!44](https://git.frama-c.com/pub/frama-c/-/merge_requests/44). The wrapper below can go once a release carries it.
 - **Rejected workaround:** the libseccomp run redefined `offsetof` for every target as `((size_t)&(((type *)0)->member))` in `fc_compat_types.h` (and in an untracked `templates/fc_stubs/eacsl/stddef.h`). Reproduced on the analysis image (Frama-C 35.0~~dev), 2026-11-09: the kernel no longer folds it (`(size_t)(& ((struct s *)0)->arr)` instead of `4UL`); Eva with `-warn-invalid-pointer` reports `\object_pointer(&((struct s *)0)->arr)` **invalid** and the function becomes `NON TERMINATING`; WP can no longer prove `\result == 4`; `_Static_assert` on an offset stops the parse. Both overrides are removed; `test_no_fc_stub_redefines_offsetof` keeps them out.
 - **Fix (pipeline, commit `7e15154`):** new `scripts/fc_cpp_wrapper.py`, a gcc `-wrapper` that `augment_framac_cppflags` (model, Eva, WP, kernel AST) passes to the preprocessor. `build_eacsl_flag_sets` (E-ACSL frontend only) passes `scripts/fc_cpp_wrapper_eacsl.py`, which does the same repair and also rewrites `<==>` (see [`./wp-and-guardrail.md`](./wp-and-guardrail.md), `labels pre-analysis`). After `cc1 -E` succeeds, it rewrites in the `.i` file only the `__builtin_offsetof(T, D)` whose designator has an index that is not an integer literal: `__builtin_offsetof(T, m[i])` becomes `(__builtin_offsetof(T, m) + (__typeof__(sizeof(0)))(i) * sizeof((((T *)0)->m)[0]))` (nested designators through `__typeof__`). Constant offsets stay folded, comments, literals and directives are untouched, the line count is kept, line markers gcc puts inside a system-header macro expansion are skipped, and each rewrite is logged as `[fc-cpp] <file>:<line>: offsetof with a non-constant index rewritten: ...`. Any failure leaves the output alone; `FRAMAC_CPP_REWRITE=off` disables it. Verified on the analysis image: Eva 0 alarms with `-warn-invalid-pointer`, WP 11/11 including `\result == 16 + 8*a`, the E-ACSL build and run pass (`test_frama_c_and_eacsl_accept_a_non_constant_offsetof_without_losing_precision`, `FRAMAC_DOCKER_TESTS=1`).
 - **Caveats:** the wrapper is offered only on POSIX hosts where it is executable and its path has no space or comma (gcc and Frama-C split on them). Both wrapper scripts are committed with mode 100755, and a test checks it. The cache key covers them (keys hash all of `scripts/`).
@@ -71,6 +71,23 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
 - **Cause:** `_QUOTE_OPEN` in [`../../scripts/framac_common.py`](../../scripts/framac_common.py) omitted backticks, and the `Calling undeclared function` pattern only supported optional ASCII apostrophe `'?`.
 - **Fix (fixed 2026-11-11, uncommitted, [`../../scripts/framac_common.py`](../../scripts/framac_common.py)):** expanded `_QUOTE_OPEN` to `['`\u2018]` and applied `{_QUOTE_OPEN}?` and `{_QUOTE_CLOSE}?` to `Calling undeclared function`. Tests: [`../../tests/test_regex_hardening_infra.py`](../../tests/test_regex_hardening_infra.py).
 
+### Symptom: Frama-C Cannot Parse glibc `<sys/epoll.h>` / `<sys/inotify.h>`; the Library Goes to the GCC Fallback
+- **Seen on:** c-ares `run-1` (2026-11-16, [`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)). `phase0_model.py run` put `build/lib/libcares.a` and `libcares.so` on `gcc_fallback`, which blocks Eva and WP for the whole library: `[kernel] /usr/include/x86_64-linux-gnu/sys/inotify.h:34: User Error: syntax error` (`char name __flexarr;`). With that fixed, the parse stopped at `sys/epoll.h:139` (`__attr_access ((__write_only__, 2, 3)) __nonnull ((2));`), then at `sys/epoll.h:150` (`__sigset_t` undefined), then at `bits/types/struct_timespec.h:11: User Error: redefinition of 'timespec' in the same scope`.
+- **Cause:** Frama-C 34.0~beta's libc has no `<sys/epoll.h>` or `<sys/inotify.h>`, so they resolve to glibc's through the `-idirafter /usr/include/x86_64-linux-gnu` that `augment_framac_cppflags` appends. glibc's headers expect glibc's `<sys/cdefs.h>`, which Frama-C's libc never includes. Frama-C's `features.h` defines `__THROW`, `__nonnull` and `__BEGIN_DECLS`, but not `__attr_access` or `__flexarr`. Frama-C's `__fc_define_sigset_t.h` sets `__sigset_t_defined`, the guard of glibc's `bits/types/sigset_t.h`, so `__sigset_t` is never defined. glibc guards its `struct timespec` with `_STRUCT_TIMESPEC`, Frama-C with `__FC_DEFINE_TIMESPEC_H`. Any Linux target with an epoll or inotify event loop is affected.
+- **Run workaround (run-1 only, not in the pipeline):** the run's agent wrote `workspace/stubs/sys/epoll.h` and `sys/inotify.h`. They include glibc's `<sys/cdefs.h>` and `<bits/types/__sigset_t.h>`, set `_STRUCT_TIMESPEC`, then `#include_next`. They parse, with side effects:
+  - glibc's cdefs redefines `__THROW` and others for every later libc header (cpp "redefined" warnings in Frama-C's `time.h`, `__attribute__((__nothrow__))` in the model's prototypes).
+  - glibc's `__sigset_t` struct turns `epoll_pwait(..., &mask)` with a `<signal.h>` mask into an `incompatible-types-call` warning.
+  - Because they contain `#include_next`, `stub_gen.py write_overlay` appends its draft blocks after their include guard.
+
+  Delete them once the fix below is merged.
+- **Fix:** `templates/fc_stubs/sys/epoll.h` and `sys/inotify.h`, parse shims for Eva and WP only.
+  - Each defines what glibc's header needs, under `#ifndef`, then `#include_next`s glibc's header: `__attr_access` as a no-op and `__flexarr` as `[]` (both removed after the header), `__sigset_t` as Frama-C's `sigset_t` with `____sigset_t_defined`, and `_STRUCT_TIMESPEC`.
+  - They never include glibc's `<sys/cdefs.h>`.
+  - E-ACSL gets glibc's header unchanged.
+  - They declare nothing, so `stub_gen.py` still classifies `epoll_*` and `inotify_*` as `host_header`.
+  - Tests: `tests/test_fc_stub_repairs.py::test_frama_c_parses_glibc_epoll_and_inotify_with_the_pipeline_flags` (Docker) and `::test_linux_event_shims_only_reconcile_glibc_for_eva_and_wp`.
+  - Commit `20a23bd` on branch `sup/c-ares-linux-header-shims`. **Open pipeline bug:** held on that branch until c-ares run-1 ends.
+
 ---
 
 ## Stub Contract & Layout Verification (`stub_check.py`)
@@ -81,6 +98,69 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
 - **Gotcha met on the way (not a pipeline defect):** `e-acsl-gcc` re-splits every option value on spaces and matches each word against its own options (`for i in $@` in the script), so a link value `-l '-lfoo -L /dir'` makes the lone `-L` eat the input file and the build fails with `e-acsl-gcc: fatal error: no input files`. `eacsl_toolchain.normalize_passthrough` joins such pairs (`-L/dir`); `stub_check.build_driver` now uses it, as `run_eacsl_fuzz.py` does.
 - **Open pipeline bug:** module fuzzing never checks stub contracts. `run_eacsl_fuzz.compile_eacsl_binary` restricts `-e-acsl-functions` and `-rte-select` to the functions defined in the slice, and E-ACSL then leaves out the contracts of declared-only functions at their call sites; both options also refuse a function without a body (`-rte-select: no function 'ml_hash'`), so the stubbed functions cannot simply be added to the list. Stub-check builds its own driver without a selection for that reason. A fuzz campaign therefore cannot find a caller that breaks a stub's `requires`, nor a library that breaks its `ensures`.
 - **Limits:** generic arguments only: every pointer gets a 64-byte initialized buffer, every other value is zero. A function whose arguments must be a real object (an opened handle, a parsed context) gets an `inconclusive` or `driver_rejected` dynamic check, never a pass, and a variadic or function-pointer prototype is `not_callable`. The dynamic check needs the library in the snapshot (`no_library` otherwise). A header that changes after a failure stays blocking until stub-check runs again on it.
+
+### Symptom: `stub-check` Blocks Every Module With `eva: error`, Reason `[eva:assigns:missing] .../workspace/stubs/sys/epoll.h:49: User Error:`, and No Log to Read
+- **Seen on:** c-ares run-1, 2026-11-16, 02:20-02:22 UTC, `pipeline_make.py run stubs stub-check` ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)).
+  - The stub authors had filled `epoll_create1`, `epoll_ctl` and `epoll_wait` with `assigns errno, \result;`, and the inotify frames the same way.
+  - The dynamic check reported `build_failed`.
+- **Cause:** three defects.
+  1. **Pipeline:** `stub_check.check_eva` wrote `eva.log` into a `tempfile.TemporaryDirectory` that was then deleted, and `_first_error` returned only the first line containing "error". Frama-C prints the message on the next, indented line, so the agent saw neither the text nor a log.
+  2. **Brief:** rule 4 of [`../../skills/framac-slice/stub_author_brief.md`](../../skills/framac-slice/stub_author_brief.md) made `\from` optional. Eva treats `assigns:missing` as a deferred error and aborts on any location other than `\result` that has no `\from`: `no \from part for clause 'assigns __fc_errno;'` (or `'assigns *__event;'`), then `[kernel] Plug-in eva aborted: invalid user input.` Phase 2 Eva (`run_eva_slice.py`) aborts the same way.
+  3. **Brief:** it prescribed `__fc_errno`, which is unbound in the E-ACSL build: `[kernel:annot-error] ...: Failure: unbound logic variable __fc_errno`, then `e-acsl-gcc: fatal error: aborted by Frama-C`.
+  - **Ground truth in `framac-analysis:latest`:**
+    - `errno` and `__fc_errno` fail Eva identically, with or without `<errno.h>`. Frama-C's `<time.h>` already brings in errno as `__fc_errno`.
+    - Only `assigns errno \from ...;` with `<errno.h>` passes abi, eva and dynamic. The shipped `templates/fc_stubs/errno.h` maps `errno` to `__fc_eacsl_errno` under E-ACSL.
+  - **What the run did without logs:** its agent concluded "Eva treats the errno location in the frame as fatal" and dropped `errno` from the three epoll frames and the two inotify frames. Those five frames are now unsound for errno: callers that read errno after these calls are analysed with a stale value.
+- **Fix:** commits `d8e6d7c` and `778f2ae` on branch `sup/c-ares-stubcheck-eva-log`. **Open pipeline bug:** held on that branch until c-ares run-1 ends.
+  - **Logs kept:** [`../../scripts/stub_check.py`](../../scripts/stub_check.py) keeps every header's generated programs and logs under `workspace/reports/stub_check/<include with / as __>/`, for example `sys__epoll.h/`. It names them in `stub_check.json` (`artifacts`, plus a `log` per check) and in the gate text.
+  - **Reason:** the reason is now the most fatal message with its continuation lines, followed by `(see <log>)`.
+  - **E-ACSL errors block:** a header whose E-ACSL build stops on an `annot-error` located in the header now fails. Before, a dynamic `build_failed` never blocked.
+  - **Header preamble:** [`../../scripts/stub_gen.py`](../../scripts/stub_gen.py) writes `#include <errno.h>` after `#include_next`. Headers written earlier keep their text.
+  - **Brief:** it requires a `\from` on every location other than `\result`, and the spelling `errno`.
+  - **Tests:**
+    - `tests/test_stub_check.py::test_the_reason_is_the_fatal_message_with_its_text`
+    - `::test_run_keeps_each_headers_logs_and_names_them`
+    - `::test_an_eacsl_annotation_error_in_the_header_blocks_it`
+    - `::test_errno_in_a_stub_contract_against_eva_and_eacsl` (Docker)
+- **Recovering a run:**
+  - Restore `assigns errno \from \nothing;` (or `\from indirect:<args>`) in each frame.
+  - Add `#include <errno.h>` after `#include_next` in any older header.
+  - Give every pointer location a `\from`, then rerun `pipeline_make.py run stubs stub-check`.
+- **Follow-up fix:** commit `7da578d` on branch `sup/c-ares-stub-skeleton-from`, cut from `778f2ae`; merge it after the branch above. **Open pipeline bug:** held until c-ares run-1 ends.
+  - **Skeleton:** `stub_gen.skeleton_contract` gives each frame one `\from` that lists every named parameter, for example `assigns *ctx, out[0 .. 31], \result \from ctx, data, len, out;`. A `// TODO(stub-author):` note asks the author to add what the function reads through those pointers and to mark as `indirect:` a pointer that only says where it writes. Until then, Eva reports `garbled-mix:assigns`.
+    - The old skeleton aborted Eva in the image: `no \from part for clause 'assigns *ctx;'`.
+    - The new skeleton reaches `VALUES COMPUTED`.
+    - `assigns \result;` alone only warns (`assigns:missing-result`).
+  - **Static check:** `stub_check.assigns_without_from` reads every active contract of the header, without running anything. It skips drafts under `#ifdef FC_STUB_DRAFT` and includes named behaviors and `//@` lines. It fails the header whatever the checks or reachability: `<header>:<line>: assigns clause of <fn> lacks \from for <loc>: Eva aborts on it ([eva:assigns:missing])`.
+    - This closes the reachability gap: on run-1, `epoll_wait` passed `eva: ok` because its valid call failed `positive_maxevents` first. The check now flags `sys/epoll.h:91` (`__events[0 .. __maxevents - 1]`).
+  - **Brief:** the stub-author brief shows the new skeleton and the new reason.
+  - **Tests:**
+    - `tests/test_stub_gen.py::test_every_skeleton_location_but_result_has_a_from`
+    - `tests/test_stub_gen.py::test_a_skeleton_filled_as_written_passes_eva_in_the_image` (Docker)
+    - `tests/test_stub_check.py::test_assigns_without_from_is_found_in_the_header`
+    - `tests/test_stub_check.py::test_a_header_whose_frame_lacks_from_fails_without_running_eva`
+  - **Also checked:** nothing under `templates/` and no other generator in `scripts/` writes a function `assigns` without `\from`. `frame_skeleton.py` always emits one, and `loop_seeds` writes only `loop assigns`.
+- **Still open:** Phase 2 may hide such a frame instead of aborting. See "A Stub Frame Without `\from` Is Downgraded in Phase 2 Under a Recursion Label" in [`./eva.md`](./eva.md).
+
+### Symptom: The Ledger Has No `stub_contract` Assumptions Although `stubs.json` Has Filled Overlay Contracts
+- **Seen on:** c-ares run-1, 2026-11-16 ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)).
+  - Phase 0 Step 5 was run by hand, following `skills/framac-slice/SKILL.md`: `ledger.py seed`, `validate_artifacts.py`, `checkpoint.py init`, `pipeline_make.py gen`.
+  - The resulting `coverage-ledger.json` (1942 units) had 0 `stub_contract` assumptions.
+  - `workspace/reports/stubs.json` had 5 `filled` contracts in `workspace/stubs/sys/epoll.h` and `sys/inotify.h`, with 6 callers in `src/lib/event/`.
+  - The run's agent believed "`ledger.py seed` will add ... stub contracts".
+  - Reports therefore cannot say which proofs rest on overlay stubs.
+- **Cause:** [`../../scripts/ledger.py`](../../scripts/ledger.py) `cmd_seed` never read the stub report.
+  - Only the `seed` target of `templates/pipeline.mk` ran `ledger.py record-stub-contracts` after `ledger.py seed`.
+  - The hand route of Step 5 does not run it, and neither do `scripts/benchmark.py` and `scripts/benchmark_seeded.py`.
+  - The skip message of `cmd_record_stub_contracts` ("no ledger yet: `seed` records the stub contracts") and its docstring were wrong.
+- **Fix:** commit `f26935e` on branch `sup/c-ares-seed-stub-contracts`. **Open pipeline bug:** held on that branch until c-ares run-1 ends.
+  - Before its single commit, `cmd_seed` now applies `workspace/reports/stubs.json`, with the stub-check statuses from `workspace/reports/stub_check.json`.
+  - It does this through `_apply_stub_contracts`, now shared with `record-stub-contracts`, and reports the result under `stub_contracts`.
+  - A `record-stub-contracts` run after the seed changes nothing.
+  - On a copy of run-1's files, the seed now records 15 assumptions on 13 units.
+  - Test: `tests/test_stub_gen.py::test_seed_records_active_stub_contracts`.
+- **Workaround until merged:** run `python3 /opt/framac-pipeline/scripts/ledger.py record-stub-contracts` once from the run directory.
+- **Still open:** running `stub_gen.py run` or `stub_check.py run` by hand after the seed, instead of `pipeline_make.py run stubs stub-check`, does not re-record the new states.
 
 ### Symptom: `stub_check.py` Reports a Stub `passed` Although Eva Raised a Precondition Alarm on the Valid Call
 - **Seen:** 2026-11-11, regex audit (no target run). With the location written `fc_stub_smoke.c:12:3:`, `_WARNING_RE` read file `12` and line `3`, and `check_eva` dropped the alarm as not from the smoke file. Whether Eva prints a column in this message was not established.

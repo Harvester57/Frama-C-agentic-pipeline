@@ -1,0 +1,348 @@
+From 207503305b11f74f2653d7c8be549cea3ba5be73 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:29:12 +0100
+Subject: [PATCH] [kernel] print _Alignas with the base type, never inside the
+ declarator
+
+_Alignas is an alignment specifier, part of the declaration specifiers
+(C17 6.7.5). The printer emitted it in three invalid places:
+
+- after the declarator of a struct or union member:
+    uint64_t u64[2] _Alignas(16) ;
+- after the '*' of a pointer declarator (globals, locals and members):
+    int *_Alignas(16) gp;
+    int (*_Alignas(16) gfp)(int );
+- after the '*' of a pointer element of an array:
+    char * _Alignas(8)gap[2];
+
+GCC, Clang and Frama-C itself reject all of them, so the output of
+-print or -ocode could not be compiled or re-parsed (E-ACSL's generated
+code included).
+
+Cil_printer.typ now passes the alignment down through TPtr, TArray and
+TFun to the base type, where it is printed after the type name and its
+qualifiers (int _Alignas(16) *gp;), and fieldinfo uses the same path as
+vdecl instead of appending the specifier after the member name.
+
+Declarations whose alignment was already valid only change spacing
+(char  _Alignas(16)la[4] becomes char _Alignas(16) la[4]), which updates
+the oracles of tests/syntax/alignas_typing_constrains and
+plugins/rte/tests/basic/unaligned_pointer. The new test
+tests/pretty_printing/alignas.c re-parses the printed code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../oracle/unaligned_pointer.0.res.oracle     |  4 +-
+ .../services/ast_printing/cil_printer.ml      | 32 ++++----
+ tests/pretty_printing/alignas.c               | 39 +++++++++
+ .../oracle/alignas.0.res.oracle               | 81 +++++++++++++++++++
+ .../alignas_typing_constrains.2.res.oracle    |  4 +-
+ .../alignas_typing_constrains.29.res.oracle   |  4 +-
+ .../alignas_typing_constrains.3.res.oracle    |  4 +-
+ .../alignas_typing_constrains.30.res.oracle   |  4 +-
+ 8 files changed, 144 insertions(+), 28 deletions(-)
+ create mode 100644 tests/pretty_printing/alignas.c
+ create mode 100644 tests/pretty_printing/oracle/alignas.0.res.oracle
+
+diff --git a/plugins/rte/tests/basic/oracle/unaligned_pointer.0.res.oracle b/plugins/rte/tests/basic/oracle/unaligned_pointer.0.res.oracle
+index e10b52a0d5..9c65c025ec 100644
+--- a/plugins/rte/tests/basic/oracle/unaligned_pointer.0.res.oracle
++++ b/plugins/rte/tests/basic/oracle/unaligned_pointer.0.res.oracle
+@@ -110,9 +110,9 @@ void addrof_to_ptr(void)
+ void startof_to_ptr(void)
+ {
+   int8_t c[4];
+-  int8_t  _Alignas(4)c4[4];
++  int8_t _Alignas(4) c4[4];
+   int32_t i[4];
+-  int8_t  _Alignas(8)i8[4];
++  int8_t _Alignas(8) i8[4];
+   int8_t *pc1 = c;
+   int8_t *pc2 = c4;
+   int8_t *pc3 = (int8_t *)(i);
+diff --git a/src/kernel/services/ast_printing/cil_printer.ml b/src/kernel/services/ast_printing/cil_printer.ml
+index ab38658129..579e5c76f6 100644
+--- a/src/kernel/services/ast_printing/cil_printer.ml
++++ b/src/kernel/services/ast_printing/cil_printer.ml
+@@ -1893,13 +1893,12 @@ class cil_printer () = object (self)
+           fprintf fmt "%s@\n" s
+ 
+   method fieldinfo fmt fi =
+-    fprintf fmt "%a%a %s%a;"
+-      (self#typ
++    fprintf fmt "%a %s%a;"
++      (self#typ ?alignas:fi.falignas
+          (Some (fun fmt ->
+               if fi.fname <> Cil.missingFieldName then
+                 self#varname fmt fi.fname)))
+       fi.ftype
+-      (self#alignas ~space:true) fi.falignas
+       (match fi.fbitfield with
+        | None -> ""
+        | Some i -> ": " ^ string_of_int i ^ " ")
+@@ -2068,11 +2067,7 @@ class cil_printer () = object (self)
+       in
+       let name' =
+         fun fmt ->
+-        let attr = t.tattr <> [] in
+-        fprintf fmt "*%a%a%a"
+-          printAttributes t.tattr
+-          palignas attr
+-          pname (attr || alignas <> None)
++        fprintf fmt "*%a%a" printAttributes t.tattr pname (t.tattr <> [])
+       in
+       let name'' =
+         fun fmt ->
+@@ -2081,7 +2076,9 @@ class cil_printer () = object (self)
+         | Some p -> fprintf fmt "%t%t)" p name'
+         | None -> fprintf fmt "%t" name'
+       in
+-      self#typ (Some name'') fmt bt'
++      (* _Alignas is a declaration specifier: it cannot appear inside the
++         declarator, it is printed with the base type. *)
++      self#typ ?alignas (Some name'') fmt bt'
+ 
+     | TArray (elemt, lo) ->
+       let atts_elem, a = Ast_attributes.split_array_attributes t.tattr in
+@@ -2110,14 +2107,12 @@ class cil_printer () = object (self)
+         | _ -> ()
+       in
+       let name' fmt =
+-        if filter_printing_attributes a = [] then
+-          fprintf fmt "%a%a" palignas true pname false
+-        else if nameOpt = None then
+-          fprintf fmt "%a%a" printAttributes a palignas true
+-        else
+-          fprintf fmt "(%a%a%a)" printAttributes a palignas true pname true
++        if filter_printing_attributes a = [] then pname fmt false
++        else if nameOpt = None then printAttributes fmt a
++        else fprintf fmt "(%a%a)" printAttributes a pname true
+       in
+-      self#typ
++      (* As for pointers, _Alignas is printed with the base type. *)
++      self#typ ?alignas
+         (Some (fun fmt ->
+              fprintf fmt "%t[%t]"
+                name'
+@@ -2130,7 +2125,8 @@ class cil_printer () = object (self)
+         elemt
+ 
+     | TFun (restyp, args, isvararg) ->
+-      (* Note: no printing of _Alignas here, since it does not make sense. *)
++      (* Note: a function cannot have an _Alignas. If [alignas] is given, we are
++         printing a pointer to a function: it goes with the return type. *)
+       let name' fmt =
+         if filter_printing_attributes t.tattr = [] then pname fmt false
+         else if nameOpt = None then printAttributes fmt t.tattr
+@@ -2181,7 +2177,7 @@ class cil_printer () = object (self)
+           let p = partition_ghosts Cil.isGhostFormalVarinfo args in
+           pp_params fmt p self#vdecl
+       in
+-      self#typ (Some pp_params) fmt restyp
++      self#typ ?alignas (Some pp_params) fmt restyp
+ 
+     | TNamed ti ->
+       fprintf fmt "%a%a%a%a"
+diff --git a/tests/pretty_printing/alignas.c b/tests/pretty_printing/alignas.c
+new file mode 100644
+index 0000000000..8cbac8be42
+--- /dev/null
++++ b/tests/pretty_printing/alignas.c
+@@ -0,0 +1,39 @@
++/* run.config
++   STDOPT:
++*/
++
++/* _Alignas is a declaration specifier: it must be printed with the base type,
++   never after or inside the declarator. */
++
++union blk {
++  _Alignas(16) unsigned long long u64[2];
++  unsigned char b[16];
++};
++
++struct s {
++  char c;
++  _Alignas(8) char d;
++  _Alignas(16) int *p;
++  _Alignas(8) int *a[2];
++  _Alignas(16) int (*fp)(int);
++  _Alignas(4) unsigned x __attribute__((__unused__));
++};
++
++_Static_assert(_Alignof(union blk) == 16, "union blk is 16-aligned");
++_Static_assert(_Alignof(struct s) == 16, "struct s is 16-aligned");
++
++_Alignas(16) int *gp;
++_Alignas(16) int (*gfp)(int);
++_Alignas(16) int ga[2][3];
++_Alignas(16) const char *const gcp = 0;
++_Alignas(8) char *gap[2];
++
++int main(void)
++{
++  _Alignas(16) int *lp = 0;
++  _Alignas(16) char la[4] = { 0 };
++  union blk u = { .b = { 0 } };
++  struct s v = { 0 };
++  return (int)u.u64[0] + v.c + (lp == 0) + la[0] + (gp == 0) + (gfp == 0)
++    + ga[0][0] + (gcp == 0) + (gap[0] == 0);
++}
+diff --git a/tests/pretty_printing/oracle/alignas.0.res.oracle b/tests/pretty_printing/oracle/alignas.0.res.oracle
+new file mode 100644
+index 0000000000..775d34e529
+--- /dev/null
++++ b/tests/pretty_printing/oracle/alignas.0.res.oracle
+@@ -0,0 +1,81 @@
++[kernel] Parsing alignas.c (with preprocessing)
++/* Generated by Frama-C */
++union blk {
++   unsigned long long _Alignas(16) u64[2] ;
++   unsigned char b[16] ;
++};
++struct s {
++   char c ;
++   char _Alignas(8) d ;
++   int _Alignas(16) *p ;
++   int _Alignas(8) *a[2] ;
++   int _Alignas(16) (*fp)(int ) ;
++   unsigned int _Alignas(4) x  __attribute__((__unused__));
++};
++int _Alignas(16) *gp;
++int _Alignas(16) (*gfp)(int );
++int _Alignas(16) ga[2][3];
++char const _Alignas(16) * const gcp = (char const *)0;
++char _Alignas(8) *gap[2];
++int main(void)
++{
++  int __retres;
++  int _Alignas(16) *lp = (int *)0;
++  char _Alignas(16) la[4] = {(char)0};
++  union blk u = {.b = {(unsigned char)0}};
++  struct s v =
++    {.c = (char)0,
++     .d = (char)0,
++     .p = (int *)0,
++     .a = {(int *)0, (int *)0},
++     .fp = (int (*)(int ))0,
++     .x = 0U};
++  __retres = ((((((((int)u.u64[0] + (int)v.c) + (lp == (int *)0)) + (int)la[0]) + (
++                 gp == (int *)0)) + (gfp == (int (*)(int ))0)) + ga[0][0]) + (
++              gcp == (char const *)0)) + (gap[0] == (char *)0);
++  return __retres;
++}
++
++
++[kernel] Parsing ocode_alignas.c (with preprocessing)
++[kernel] Parsing alignas.c (with preprocessing)
++[kernel] alignas.c:31: Warning: 
++  def'n of func main at alignas.c:31-39 (sum 4629) conflicts with the one at ocode_alignas.c:19-36 (sum 5516); keeping the one at ocode_alignas.c:19-36.
++/* Generated by Frama-C */
++union blk {
++   unsigned long long _Alignas(16) u64[2] ;
++   unsigned char b[16] ;
++};
++struct s {
++   char c ;
++   char _Alignas(8) d ;
++   int _Alignas(16) *p ;
++   int _Alignas(8) *a[2] ;
++   int _Alignas(16) (*fp)(int ) ;
++   unsigned int _Alignas(4) x  __attribute__((__unused__));
++};
++int _Alignas(16) *gp;
++int _Alignas(16) (*gfp)(int );
++int _Alignas(16) ga[2][3];
++char const _Alignas(16) * const gcp = (char const *)0;
++char _Alignas(8) *gap[2];
++int main(void)
++{
++  int __retres;
++  int _Alignas(16) *lp = (int *)0;
++  char _Alignas(16) la[4] = {(char)0};
++  union blk u = {.b = {(unsigned char)0}};
++  struct s v =
++    {.c = (char)0,
++     .d = (char)0,
++     .p = (int *)0,
++     .a = {(int *)0, (int *)0},
++     .fp = (int (*)(int ))0,
++     .x = 0U};
++  __retres = ((((((((int)u.u64[0] + (int)v.c) + (lp == (int *)0)) + (int)la[0]) + (
++                 gp == (int *)0)) + (gfp == (int (*)(int ))0)) + ga[0][0]) + (
++              gcp == (char const *)0)) + (gap[0] == (char *)0);
++  return __retres;
++}
++
++
+diff --git a/tests/syntax/oracle/alignas_typing_constrains.2.res.oracle b/tests/syntax/oracle/alignas_typing_constrains.2.res.oracle
+index a1bfa64e66..6fbbe5dbc7 100644
+--- a/tests/syntax/oracle/alignas_typing_constrains.2.res.oracle
++++ b/tests/syntax/oracle/alignas_typing_constrains.2.res.oracle
+@@ -71,10 +71,10 @@ struct Al4 {
+    long c ;
+ };
+ struct SAlF {
+-   int field _Alignas(8) ;
++   int _Alignas(8) field ;
+ };
+ union UAlF {
+-   int field _Alignas(8) ;
++   int _Alignas(8) field ;
+ };
+ void c17_6_2_8_1(void)
+ {
+diff --git a/tests/syntax/oracle/alignas_typing_constrains.29.res.oracle b/tests/syntax/oracle/alignas_typing_constrains.29.res.oracle
+index 94d5041e4a..67ab867dc1 100644
+--- a/tests/syntax/oracle/alignas_typing_constrains.29.res.oracle
++++ b/tests/syntax/oracle/alignas_typing_constrains.29.res.oracle
+@@ -4,10 +4,10 @@
+   Definitions of struct SAlF are not isomorphic. Reason follows:
+   incompatible _Alignas specification
+   struct SAlF {
+-     int field _Alignas(16) ;
++     int _Alignas(16) field ;
+   };
+   struct SAlF {
+-     int field _Alignas(8) ;
++     int _Alignas(8) field ;
+   };
+   
+   First declaration was at alignas_typing_constrains.c:314
+diff --git a/tests/syntax/oracle/alignas_typing_constrains.3.res.oracle b/tests/syntax/oracle/alignas_typing_constrains.3.res.oracle
+index c845826aa7..66da55aff8 100644
+--- a/tests/syntax/oracle/alignas_typing_constrains.3.res.oracle
++++ b/tests/syntax/oracle/alignas_typing_constrains.3.res.oracle
+@@ -71,10 +71,10 @@ struct Al4 {
+    long c ;
+ };
+ union UAlF {
+-   int field _Alignas(8) ;
++   int _Alignas(8) field ;
+ };
+ struct SAlF {
+-   int field _Alignas(8) ;
++   int _Alignas(8) field ;
+ };
+ void c17_6_2_8_1(void)
+ {
+diff --git a/tests/syntax/oracle/alignas_typing_constrains.30.res.oracle b/tests/syntax/oracle/alignas_typing_constrains.30.res.oracle
+index b7054f7e7e..472b086614 100644
+--- a/tests/syntax/oracle/alignas_typing_constrains.30.res.oracle
++++ b/tests/syntax/oracle/alignas_typing_constrains.30.res.oracle
+@@ -4,10 +4,10 @@
+   Definitions of union UAlF are not isomorphic. Reason follows:
+   incompatible _Alignas specification
+   union UAlF {
+-     int field _Alignas(16) ;
++     int _Alignas(16) field ;
+   };
+   union UAlF {
+-     int field _Alignas(8) ;
++     int _Alignas(8) field ;
+   };
+   
+   First declaration was at alignas_typing_constrains.c:334
+-- 
+2.56.0.windows.4
+

@@ -1,0 +1,348 @@
+From 4212f44eb5fd1a3a8e4e704916c4e12ac9b63a35 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:41:41 +0100
+Subject: [PATCH] [libc] add sockaddr_in.sin_zero, struct ip_mreq and fd_set
+ via sys/types.h
+
+Three definitions that glibc provides in its default mode were missing,
+so code that builds with them could not be parsed by Frama-C:
+
+- struct sockaddr_in had no sin_zero[8] padding. Besides
+  "Cannot find field sin_zero", it made struct sockaddr_in 8 bytes
+  instead of sizeof(struct sockaddr) == 16, so the common idiom
+    memset(&sin, 0, sizeof(struct sockaddr));
+  got an invalid 'valid_s' precondition from Eva on correct code.
+- struct ip_mreq (the argument of IP_ADD_MEMBERSHIP and
+  IP_DROP_MEMBERSHIP, whose macros are defined) and struct
+  ip_mreq_source (for the *_SOURCE_MEMBERSHIP options) were not defined.
+  They are added unguarded, like the other non-POSIX definitions of the
+  file: the __USE_MISC/__USE_GNU guard around ip_mreqn is never enabled
+  by Frama-C's libc.
+- fd_set was not visible after #include <sys/socket.h> alone. glibc's
+  <sys/socket.h> includes <sys/types.h>, which includes <sys/select.h>
+  in the default (_DEFAULT_SOURCE) mode. Frama-C's <sys/types.h>
+  already exposes the other default-mode definitions (u_char, caddr_t),
+  so it now includes <sys/select.h>, and <sys/socket.h> includes
+  <sys/types.h>.
+
+Oracle changes: struct sockaddr_in is now 16 bytes (tests/libc socket,
+socket_h, sys_select), declarations from __fc_select.h are now reached
+through sys/select.h (fc_libc, and the list of included headers in six
+E-ACSL gen_*.c oracles of builtin/ and format/). New test:
+tests/libc/socket_glibc_compat.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tests/builtin/oracle/gen_strcat.0.c       |  1 +
+ .../tests/builtin/oracle/gen_strcmp.0.c       |  1 +
+ .../tests/builtin/oracle/gen_strcpy.0.c       |  1 +
+ .../tests/builtin/oracle/gen_strlen.0.c       |  1 +
+ .../tests/format/oracle/gen_fprintf.0.c       |  1 +
+ .../e-acsl/tests/format/oracle/gen_printf.0.c |  1 +
+ share/libc/__fc_inet.h                        | 15 +++++++++
+ share/libc/sys/socket.h                       |  2 ++
+ share/libc/sys/types.h                        |  4 +++
+ tests/libc/oracle/fc_libc.0.res.oracle        |  3 --
+ tests/libc/oracle/socket.0.res.oracle         |  2 +-
+ tests/libc/oracle/socket.1.res.oracle         |  2 +-
+ .../oracle/socket_glibc_compat.0.res.oracle   | 31 +++++++++++++++++++
+ tests/libc/oracle/socket_h.0.res.oracle       |  3 +-
+ tests/libc/oracle/sys_select.0.res.oracle     |  3 +-
+ tests/libc/socket_glibc_compat.c              | 29 +++++++++++++++++
+ 16 files changed, 93 insertions(+), 7 deletions(-)
+ create mode 100644 tests/libc/oracle/socket_glibc_compat.0.res.oracle
+ create mode 100644 tests/libc/socket_glibc_compat.c
+
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
+index f2b99d7626..5027d650fd 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
+@@ -6,6 +6,7 @@
+ #include "stdio.h"
+ #include "stdlib.h"
+ #include "string.h"
++#include "sys/select.h"
+ #include "sys/time.h"
+ #include "sys/types.h"
+ #include "sys/wait.h"
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c
+index 95bf63814e..79d1b28629 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strcmp.0.c
+@@ -6,6 +6,7 @@
+ #include "stdio.h"
+ #include "stdlib.h"
+ #include "string.h"
++#include "sys/select.h"
+ #include "sys/time.h"
+ #include "sys/types.h"
+ #include "sys/wait.h"
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c
+index 6ce906e88f..4baad2f1c5 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strcpy.0.c
+@@ -6,6 +6,7 @@
+ #include "stdio.h"
+ #include "stdlib.h"
+ #include "string.h"
++#include "sys/select.h"
+ #include "sys/time.h"
+ #include "sys/types.h"
+ #include "sys/wait.h"
+diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c
+index ce3853cdf7..df069ce558 100644
+--- a/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c
++++ b/plugins/e-acsl/tests/builtin/oracle/gen_strlen.0.c
+@@ -6,6 +6,7 @@
+ #include "stdio.h"
+ #include "stdlib.h"
+ #include "string.h"
++#include "sys/select.h"
+ #include "sys/time.h"
+ #include "sys/types.h"
+ #include "sys/wait.h"
+diff --git a/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c b/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c
+index edf9561bfa..6a35139a66 100644
+--- a/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c
++++ b/plugins/e-acsl/tests/format/oracle/gen_fprintf.0.c
+@@ -4,6 +4,7 @@
+ #include "stdint.h"
+ #include "stdio.h"
+ #include "stdlib.h"
++#include "sys/select.h"
+ #include "sys/time.h"
+ #include "sys/types.h"
+ #include "sys/wait.h"
+diff --git a/plugins/e-acsl/tests/format/oracle/gen_printf.0.c b/plugins/e-acsl/tests/format/oracle/gen_printf.0.c
+index 719df6298c..c172a11106 100644
+--- a/plugins/e-acsl/tests/format/oracle/gen_printf.0.c
++++ b/plugins/e-acsl/tests/format/oracle/gen_printf.0.c
+@@ -5,6 +5,7 @@
+ #include "stdio.h"
+ #include "stdlib.h"
+ #include "string.h"
++#include "sys/select.h"
+ #include "sys/time.h"
+ #include "sys/types.h"
+ #include "sys/wait.h"
+diff --git a/share/libc/__fc_inet.h b/share/libc/__fc_inet.h
+index dfe70de65c..4bb2ec11d4 100644
+--- a/share/libc/__fc_inet.h
++++ b/share/libc/__fc_inet.h
+@@ -40,6 +40,8 @@ struct sockaddr_in {
+   sa_family_t     sin_family;
+   in_port_t       sin_port;
+   struct in_addr  sin_addr;
++  // Non-POSIX: padding to the size of struct sockaddr, as in glibc
++  unsigned char   sin_zero[8];
+ };
+ 
+ struct in6_addr {
+@@ -76,6 +78,19 @@ struct ipv6_mreq {
+   unsigned         ipv6mr_interface;
+ };
+ 
++// Non-POSIX: IPv4 multicast requests (IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP
++// and the *_SOURCE_MEMBERSHIP / *_BLOCK_SOURCE options below)
++struct ip_mreq {
++  struct in_addr imr_multiaddr; /* IP multicast address of group */
++  struct in_addr imr_interface; /* local IP address of interface */
++};
++
++struct ip_mreq_source {
++  struct in_addr imr_multiaddr; /* IP multicast address of group */
++  struct in_addr imr_interface; /* IP address of interface */
++  struct in_addr imr_sourceaddr; /* IP address of source */
++};
++
+ 
+ struct in6_pktinfo
+   {
+diff --git a/share/libc/sys/socket.h b/share/libc/sys/socket.h
+index f3c1bbcd22..dbadd95e5b 100644
+--- a/share/libc/sys/socket.h
++++ b/share/libc/sys/socket.h
+@@ -13,6 +13,8 @@ __PUSH_FC_STDLIB
+ __BEGIN_DECLS
+ 
+ #include <errno.h>
++// Non-POSIX: as in glibc, <sys/socket.h> includes <sys/types.h>
++#include <sys/types.h>
+ 
+ // Note: most constants used here are based on Linux, independently of the
+ // chosen machdep. If using other OSs (e.g. MacOS), consider redefining them.
+diff --git a/share/libc/sys/types.h b/share/libc/sys/types.h
+index c4e36093b1..a1270bc151 100644
+--- a/share/libc/sys/types.h
++++ b/share/libc/sys/types.h
+@@ -48,6 +48,10 @@ typedef unsigned char u_char;
+ typedef char *caddr_t;
+ #endif
+ 
++// Non-POSIX: in its default mode, glibc makes fd_set and select() visible
++// from <sys/types.h>
++#include <sys/select.h>
++
+ __END_DECLS
+ __POP_FC_STDLIB
+ #endif
+diff --git a/tests/libc/oracle/fc_libc.0.res.oracle b/tests/libc/oracle/fc_libc.0.res.oracle
+index 563a9c4f95..c27f326656 100644
+--- a/tests/libc/oracle/fc_libc.0.res.oracle
++++ b/tests/libc/oracle/fc_libc.0.res.oracle
+@@ -12,14 +12,11 @@
+   
+ /* Generated by Frama-C */
+ #include "__fc_builtin.c"
+-#include "__fc_define_fd_set_t.h"
+ #include "__fc_define_fs_cnt.h"
+ #include "__fc_define_ioctl.h"
+-#include "__fc_define_timeval.h"
+ #include "__fc_file.c"
+ #include "__fc_gcc_builtins.h"
+ #include "__fc_integer.h"
+-#include "__fc_select.h"
+ #include "__fc_utmp_constants.h"
+ #include "aio.h"
+ #include "alloca.h"
+diff --git a/tests/libc/oracle/socket.0.res.oracle b/tests/libc/oracle/socket.0.res.oracle
+index 975fe4fd30..135bd20b39 100644
+--- a/tests/libc/oracle/socket.0.res.oracle
++++ b/tests/libc/oracle/socket.0.res.oracle
+@@ -295,7 +295,7 @@
+   __fc_socket_counter ∈ [--..--]
+   fd ∈ [-1..1023]
+   addr ∈ [--..--] or UNINITIALIZED
+-  addrlen ∈ {8} or UNINITIALIZED
++  addrlen ∈ {16} or UNINITIALIZED
+   client_fd ∈ [-1..1023] or UNINITIALIZED
+   buf[0..63] ∈ [--..--] or UNINITIALIZED
+   r ∈ [-1..64] or UNINITIALIZED
+diff --git a/tests/libc/oracle/socket.1.res.oracle b/tests/libc/oracle/socket.1.res.oracle
+index 2dc897981c..e8b2184123 100644
+--- a/tests/libc/oracle/socket.1.res.oracle
++++ b/tests/libc/oracle/socket.1.res.oracle
+@@ -297,7 +297,7 @@
+   __fc_socket_counter ∈ [--..--]
+   fd ∈ [-1..1023]
+   addr ∈ [--..--] or UNINITIALIZED
+-  addrlen ∈ {8} or UNINITIALIZED
++  addrlen ∈ {16} or UNINITIALIZED
+   client_fd ∈ [-1..1023] or UNINITIALIZED
+   buf[0..63] ∈ [--..--] or UNINITIALIZED
+   r ∈ [-1..64] or UNINITIALIZED
+diff --git a/tests/libc/oracle/socket_glibc_compat.0.res.oracle b/tests/libc/oracle/socket_glibc_compat.0.res.oracle
+new file mode 100644
+index 0000000000..7872b756df
+--- /dev/null
++++ b/tests/libc/oracle/socket_glibc_compat.0.res.oracle
+@@ -0,0 +1,31 @@
++[kernel] Parsing socket_glibc_compat.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] socket_glibc_compat.c:12: assertion got status valid.
++[eva:progress] socket_glibc_compat.c:14: Call to builtin memset
++[eva:progress] socket_glibc_compat.c:14: 
++  function memset: precondition 'valid_s' got status valid.
++[eva:acsl:unsupported] FRAMAC_SHARE/libc/string.h:167: 
++  cannot evaluate ACSL term, unsupported ACSL construct: logic function memset
++[eva:progress] socket_glibc_compat.c:18: Call to builtin memset
++[eva:progress] socket_glibc_compat.c:18: 
++  function memset: precondition 'valid_s' got status valid.
++[eva:progress] 
++  computing for function nfds <- main.
++  Called from socket_glibc_compat.c:28.
++[eva:progress] Recording results for nfds
++[eva:progress] Done for function nfds
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function nfds:
++  __retres ∈ {0}
++[eva:final-states] Values at end of function main:
++  sin.sin_family ∈ {2}
++     {.sin_port; .sin_addr; .sin_zero[0..7]} ∈ {0}
++  mreq ∈ {0}
++  mreq_src ∈ {0}
++  __retres ∈ {0}
+diff --git a/tests/libc/oracle/socket_h.0.res.oracle b/tests/libc/oracle/socket_h.0.res.oracle
+index a880932400..5d868cd2ef 100644
+--- a/tests/libc/oracle/socket_h.0.res.oracle
++++ b/tests/libc/oracle/socket_h.0.res.oracle
+@@ -122,11 +122,12 @@
+   sockfd ∈ [0..1023]
+   addr.sin_family ∈ {2}
+       {.sin_port; .sin_addr} ∈ [--..--]
++      .sin_zero[0..7] ∈ UNINITIALIZED
+   rc ∈ {-1; 0}
+   optval ∈ [--..--] or UNINITIALIZED
+   optlen ∈ {4}
+   addr2 ∈ [--..--] or UNINITIALIZED
+-  socklen ∈ [0..8]
++  socklen ∈ [0..16]
+   buf[0..39] ∈ [--..--]
+   sent ∈ {-1; 0; 1; 2; 3}
+   sent2 ∈ {-1; 0; 1; 2; 3}
+diff --git a/tests/libc/oracle/sys_select.0.res.oracle b/tests/libc/oracle/sys_select.0.res.oracle
+index 0372127afc..51b1a364d6 100644
+--- a/tests/libc/oracle/sys_select.0.res.oracle
++++ b/tests/libc/oracle/sys_select.0.res.oracle
+@@ -99,15 +99,16 @@
+ [eva:progress] Done for function main
+ [eva] ====== VALUES COMPUTED ======
+ [eva:final-states] Values at end of function main:
++  __fc_fds_state ∈ [--..--]
+   __fc_sockfds[0..1023] ∈ [--..--]
+   __fc_socket_counter ∈ [--..--]
+-  __fc_fds_state ∈ [--..--]
+   fd1 ∈ [0..1023]
+   max_fd ∈ [0..1023]
+   fds1 ∈ [--..--]
+   fds2 ∈ [--..--]
+   addr.sin_family ∈ {2}
+       {.sin_port; .sin_addr} ∈ [--..--]
++      .sin_zero[0..7] ∈ {0}
+   res ∈ [--..--]
+   timeout ∈ [--..--]
+   __retres ∈ {0}
+diff --git a/tests/libc/socket_glibc_compat.c b/tests/libc/socket_glibc_compat.c
+new file mode 100644
+index 0000000000..181f15e12f
+--- /dev/null
++++ b/tests/libc/socket_glibc_compat.c
+@@ -0,0 +1,29 @@
++// Definitions that glibc provides in its default mode.
++#include <sys/socket.h> // must make fd_set visible, through <sys/types.h>
++#include <netinet/in.h>
++#include <string.h>
++
++int nfds(fd_set *s) {
++  return s != 0;
++}
++
++int main() {
++  // sin_zero pads struct sockaddr_in to the size of struct sockaddr
++  //@ assert sizeof(struct sockaddr_in) == sizeof(struct sockaddr);
++  struct sockaddr_in sin;
++  memset(&sin, 0, sizeof(struct sockaddr));
++  sin.sin_family = AF_INET;
++  sin.sin_port = 0;
++  sin.sin_addr.s_addr = INADDR_ANY;
++  memset(sin.sin_zero, 0, sizeof sin.sin_zero);
++
++  struct ip_mreq mreq;
++  mreq.imr_multiaddr.s_addr = INADDR_ANY;
++  mreq.imr_interface.s_addr = INADDR_ANY;
++  struct ip_mreq_source mreq_src;
++  mreq_src.imr_multiaddr = mreq.imr_multiaddr;
++  mreq_src.imr_interface = mreq.imr_interface;
++  mreq_src.imr_sourceaddr = sin.sin_addr;
++
++  return nfds(0) + (int)mreq_src.imr_sourceaddr.s_addr;
++}
+-- 
+2.56.0.windows.4
+

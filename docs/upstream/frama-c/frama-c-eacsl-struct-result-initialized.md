@@ -1,11 +1,17 @@
 # E-ACSL: false `\initialized(&\result.a)` failure in the postcondition of every function returning a struct, when initialization checks are on
 
+**Filed upstream on 2026-11-15:** issue [#2801](https://git.frama-c.com/pub/frama-c/-/work_items/2801), merge request [!32](https://git.frama-c.com/pub/frama-c/-/merge_requests/32).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/08-eacsl-struct-result-initialized-issue.md), [MR](./filing/08-eacsl-struct-result-initialized-mr.md), [reproducer](./repro/08-eacsl-struct-result-initialized.sh), [patch](./patches/08-eacsl-struct-result-initialized.patch)
 
 **Same family as
 [frama-c-eacsl-formal-params-initialized.md](./frama-c-eacsl-formal-params-initialized.md)**: there the
 formals are registered in shadow memory but never marked initialized, here the wrapper's `__retres`
-is. File the two together. The two patches apply cleanly together and were tested together.
+is. File the two together, as separate issues and MRs. Each patch applies alone on `3dff90fc70`;
+they also apply together, and were tested together (reproducers, negative controls, and the E-ACSL
+ptests in both configurations).
 
 ## Summary
 
@@ -62,9 +68,10 @@ does not fail.
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02),
-  Debian 13, gcc 14.2.0, clang 19.1.7.
-- Same behaviour in `34.0~~dev (Selenium)`.
+- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`), Debian 13,
+  gcc 14.2.0, with [`./repro/08-eacsl-struct-result-initialized.sh`](./repro/08-eacsl-struct-result-initialized.sh)
+  (2026-11-15). First reproduced on `ad24dca` (2026-11-02), with gcc and clang 19.1.7.
+- Same output on `34.0~beta (Selenium)` (2026-11-15).
 
 ## Reproduction
 
@@ -87,7 +94,7 @@ int main(void) {
 ```
 
 ```text
-$ e-acsl-gcc -F "-rte -rte-initialized" -o si.c -O sb struct_repro.c && ./sb.e-acsl
+$ e-acsl-gcc -F "-rte -rte-initialized @all" -o si.c -O sb struct_repro.c && ./sb.e-acsl
 struct_repro.c: In function 'make_s'
 struct_repro.c:4: Error: E-ACSL RTE failed:
 	The failing predicate is:
@@ -102,7 +109,13 @@ The same failure occurs with `-F "-e-acsl-rte 2"`, and with `-M -F "-rte -rte-in
 (`ensures \result.a == x && \result.b == x + 1;`). Without initialization checks (plain
 `e-acsl-gcc`, or `-M` alone), the program runs and exits 0.
 
-## Proposed fix
+## Fix
+
+Patch: [`./patches/08-eacsl-struct-result-initialized.patch`](./patches/08-eacsl-struct-result-initialized.patch),
+one commit on `fix/e-acsl-struct-result-initialized` from `3dff90fc70`, "[e-acsl] no
+initialization guard on the fields of \result". It adds the regression test
+`plugins/e-acsl/tests/acsl-rte/struct_result.c` (`STDOPT: #"-e-acsl-rte-initialized"`, a two-field
+struct with `ensures \result.a == x && \result.b == x + 1`) with its default-configuration oracles.
 
 Extend the existing `__retres` exemption to its fields:
 
@@ -125,26 +138,41 @@ Extend the existing `__retres` exemption to its fields:
 
 This matches what E-ACSL already does for any other struct copy, which it marks fully initialized
 (`__e_acsl_full_init`). No check is lost compared with a struct returned into a caller's variable.
+A user cannot write `\initialized(&\result.a)` (the kernel rejects it: `not an addressable left
+value: \result.a`), so the guard was the only reader of the shadow memory of `__retres`.
+
+Cost: a field of the returned struct that the function left uninitialized is no longer reported
+when the postcondition reads it. Checked on `3dff90fc70`: with a function that sets only `.a`, the
+postcondition on `\result.b` now compares the garbage value instead of failing on initialization.
+Today that check fails on correct functions too, so it could not tell the two cases apart.
 
 ### Alternative
 
 Emit `__e_acsl_full_init((void *)(& __retres));` after `__retres = f(...);` in the generated
 wrapper, like every other tracked struct assignment. The `\initialized` guard then stays and
 passes. That fixes the runtime state rather than skipping the check, but it touches the wrapper
-generator. I have not implemented or tested it.
+generator, and it has the same cost (a field left uninitialized by the callee is then marked
+initialized too). I have not implemented or tested it.
 
-## Validation of the proposed fix
+## Validation of the fix
 
-Built from `ad24dca` with the patch:
+Built on `3dff90fc70` with the patch (image `framac-master-audit:3dff90f`, incremental
+`dune build @install --release` and `dune install`), 2026-11-15:
 
-| Check | `master` | Patched |
-|---|---|---|
-| `struct_repro.c`, `-F "-e-acsl-rte 2"` | false `\initialized(&\result.a)`, abort | builds; runs, exit 0 |
-| `scalar_repro.c` (`ensures \result >= 0;`), `-F "-e-acsl-rte 2"` | runs, exit 0 | runs, exit 0 |
-| `struct_repro.c`, `-M -F "-rte -rte-initialized @all"` | false `\initialized(&\result.a)`, abort | builds; runs, exit 0 |
-| `partial_struct.c` (two fields), `-F "-e-acsl-rte 2"` | false `\initialized(&\result.a)`, abort | builds; runs, exit 0 |
-| `uninit_neg.c` (a genuinely uninitialized local, `int x; /*@ assert x == 0; */`), `-F "-e-acsl-rte 2"` | reported | still reported (`E-ACSL RTE failed … uninitialized`) |
-| ptests `plugins/e-acsl/tests` (default and `dev` configurations) | — | no change |
+| Check | `master` `3dff90fc70` | 34.0~beta | Patched |
+|---|---|---|---|
+| `struct_repro.c`, plain `e-acsl-gcc` | runs, exit 0 | same | runs, exit 0 |
+| `struct_repro.c`, `-F "-rte -rte-initialized @all"` | false `\initialized(&\result.a)`, abort | same | builds; runs, exit 0 |
+| `struct_repro.c`, `-F -e-acsl-rte-initialized` | false `\initialized(&\result.a)`, abort | not run | builds; runs, exit 0 |
+| scalar result (`ensures \result >= 0;`) with initialization checks | runs, exit 0 | not run | runs, exit 0 |
+| a genuinely uninitialized local (`int y; /*@ assert y == 0; */`) with initialization checks | reported | not run | still reported |
+| ptests `plugins/e-acsl/tests`, default configuration (198 results) | — | — | only the two new oracles; promoted; rerun clean |
+| ptests `plugins/e-acsl/tests`, `dev` configuration (compile and run) | new test fails on the postcondition | — | pass, new test included |
+| With the formal-parameter patch also applied: E-ACSL ptests, default and `dev` | — | — | pass with the oracles of both patches, no difference |
+| `make check-lint` (4 changed files, ocp-indent 1.10.0) | — | — | clean (`clang-format` not installed: new C test not checked) |
+
+Earlier validation on `ad24dca` (2026-11-02) gave the same results, plus: `-F "-e-acsl-rte 2"` and
+`-M -F "-rte -rte-initialized @all"` (full memory tracking) fail on `master` and pass patched.
 
 ## Workaround
 

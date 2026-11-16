@@ -1,0 +1,405 @@
+From d4da7d56bc833421f74c1616582dd8cc10f6d7b9 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:28:23 +0100
+Subject: [PATCH] [e-acsl] do not modify `environ` when tracking the
+ environment strings
+
+When `main` takes `argc` and `argv`, `eacsl_memory_init` calls `argv_alloca`,
+which also registers the environment strings. Both observation models walked
+the strings with `while (*environ) { ...; environ++; }`, incrementing the
+global `environ` itself. When the loop ended, `environ` pointed to the
+terminating NULL entry: the instrumented program saw an empty environment,
+and every later `getenv` returned NULL.
+
+Walk the array with a local cursor, as `get_stack_start` in
+`e_acsl_shadow_layout.c` already does. `environ` keeps its value. With
+temporal analysis, the segment model still replaces each entry by its
+shadow copy, as before.
+
+The new test `libc/getenv.c` checks that `getenv("PATH")` is not NULL in a
+`main(int argc, char **argv)`, with the segment model and with the bittree
+model and full memory tracking. `temporal/t_getenv.c` did not catch the bug
+because it accepts a NULL result.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../e_acsl_bittree_observation_model.c        |  13 +-
+ .../e_acsl_segment_observation_model.c        |  15 ++-
+ plugins/e-acsl/tests/libc/getenv.c            |  20 +++
+ .../e-acsl/tests/libc/oracle/gen_getenv.0.c   | 110 +++++++++++++++++
+ .../e-acsl/tests/libc/oracle/gen_getenv.1.c   | 114 ++++++++++++++++++
+ .../tests/libc/oracle/getenv.0.res.oracle     |  18 +++
+ .../tests/libc/oracle/getenv.1.res.oracle     |  18 +++
+ 7 files changed, 297 insertions(+), 11 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/libc/getenv.c
+ create mode 100644 plugins/e-acsl/tests/libc/oracle/gen_getenv.0.c
+ create mode 100644 plugins/e-acsl/tests/libc/oracle/gen_getenv.1.c
+ create mode 100644 plugins/e-acsl/tests/libc/oracle/getenv.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/libc/oracle/getenv.1.res.oracle
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+index af459ec298..322376b9b4 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+@@ -570,11 +570,14 @@ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+     eacsl_temporal_store_nblock(argv + i, *(argv + i));
+ #endif
+ 
+-  while (*environ) {
+-    size_t envlen = strlen(*environ) + 1;
+-    eacsl_store_block(*environ, envlen);
+-    eacsl_initialize(*environ, envlen);
+-    environ++;
++  /* Track environment strings. Iterate with a local cursor: `environ` itself
++     must not be modified. */
++  char **env = environ;
++  while (*env) {
++    size_t envlen = strlen(*env) + 1;
++    eacsl_store_block(*env, envlen);
++    eacsl_initialize(*env, envlen);
++    env++;
+   }
+ }
+ 
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+index 3176a965ec..b050fab259 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -281,15 +281,18 @@ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+     eacsl_temporal_store_nblock(argv + i, *(argv + i));
+ #endif
+ 
+-  while (*environ) {
+-    size_t envlen = strlen(*environ) + 1;
++  /* Track environment strings. Iterate with a local cursor: `environ` itself
++     must not be modified. */
++  char **env = environ;
++  while (*env) {
++    size_t envlen = strlen(*env) + 1;
+ #ifdef E_ACSL_TEMPORAL
+-    *environ = shadow_copy(*environ, envlen, 1);
++    *env = shadow_copy(*env, envlen, 1);
+ #else
+-    shadow_alloca(*environ, envlen);
+-    initialize_static_region((uintptr_t)*environ, envlen);
++    shadow_alloca(*env, envlen);
++    initialize_static_region((uintptr_t)*env, envlen);
+ #endif
+-    environ++;
++    env++;
+   }
+ }
+ /* }}} */
+diff --git a/plugins/e-acsl/tests/libc/getenv.c b/plugins/e-acsl/tests/libc/getenv.c
+new file mode 100644
+index 0000000000..e31974337c
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/getenv.c
+@@ -0,0 +1,20 @@
++/* run.config
++   COMMENT: The tracking of the program arguments and of the environment at
++   COMMENT: program start must not modify `environ`: `getenv` must still find
++   COMMENT: the variables of the environment (`PATH` is set when running the
++   COMMENT: tests).
++   STDOPT:
++   STDOPT: #"-e-acsl-full-mtracking"
++*/
++/* run.config_dev
++   EXECNOW: LOG @EACSL_ERR@ @EACSL_EXEC@
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT --full-mtracking --memory-model bittree
++*/
++
++#include <stdlib.h>
++
++int main(int argc, char **argv) {
++  char *path = getenv("PATH");
++  //@ assert path != \null;
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/libc/oracle/gen_getenv.0.c b/plugins/e-acsl/tests/libc/oracle/gen_getenv.0.c
+new file mode 100644
+index 0000000000..447b87841c
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/oracle/gen_getenv.0.c
+@@ -0,0 +1,110 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "stdlib.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++/*@ requires valid_name: valid_read_string(name);
++    ensures
++      null_or_valid_result:
++        \result == \null || (\valid(\result) && valid_read_string(\result));
++    assigns \result;
++    assigns \result
++      \from __fc_env[0 ..], (indirect: name),
++            (indirect: *(name + (0 .. strlen{Old}(name))));
++ */
++char *__gen_e_acsl_getenv(char const *name);
++
++char const __fc_lit_string1[5UL] = "PATH";
++/*@ requires valid_name: valid_read_string(name);
++    ensures
++      null_or_valid_result:
++        \result == \null || (\valid(\result) && valid_read_string(\result));
++    assigns \result;
++    assigns \result
++      \from __fc_env[0 ..], (indirect: name),
++            (indirect: *(name + (0 .. strlen{Old}(name))));
++ */
++char *__gen_e_acsl_getenv(char const *name)
++{
++  char *__retres;
++  __e_acsl_store_block((void *)(& __retres),8UL);
++  __e_acsl_store_block((void *)(& name),8UL);
++  __retres = getenv(name);
++  __e_acsl_delete_block((void *)(& name));
++  __e_acsl_delete_block((void *)(& __retres));
++  return __retres;
++}
++
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)(__fc_lit_string1),5UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
++  return;
++}
++
++int main(int argc, char **argv)
++{
++  int __retres;
++  __e_acsl_memory_init(& argc,& argv,8UL);
++  __e_acsl_globals_init();
++  char *path = __gen_e_acsl_getenv(__fc_lit_string1);
++  __e_acsl_store_block((void *)(& path),8UL);
++  __e_acsl_full_init((void *)(& path));
++  {
++    int __gen_e_acsl_aligned;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)path,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"path",
++                                 (void *)path);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(path,1)",
++                                 0,__gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(path,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(path,1)";
++      __gen_e_acsl_assert_data_2.file = "getenv.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 18;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"path",
++                                 (void *)path);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "path != \\null";
++    __gen_e_acsl_assert_data.file = "getenv.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 18;
++    __e_acsl_assert(path != (char *)0,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert path != \null; */ ;
++  __retres = 0;
++  __e_acsl_delete_block((void *)(& path));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/libc/oracle/gen_getenv.1.c b/plugins/e-acsl/tests/libc/oracle/gen_getenv.1.c
+new file mode 100644
+index 0000000000..405d8b385c
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/oracle/gen_getenv.1.c
+@@ -0,0 +1,114 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "stdlib.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++/*@ requires valid_name: valid_read_string(name);
++    ensures
++      null_or_valid_result:
++        \result == \null || (\valid(\result) && valid_read_string(\result));
++    assigns \result;
++    assigns \result
++      \from __fc_env[0 ..], (indirect: name),
++            (indirect: *(name + (0 .. strlen{Old}(name))));
++ */
++char *__gen_e_acsl_getenv(char const *name);
++
++/*@ requires valid_name: valid_read_string(name);
++    ensures
++      null_or_valid_result:
++        \result == \null || (\valid(\result) && valid_read_string(\result));
++    assigns \result;
++    assigns \result
++      \from __fc_env[0 ..], (indirect: name),
++            (indirect: *(name + (0 .. strlen{Old}(name))));
++ */
++char *__gen_e_acsl_getenv(char const *name)
++{
++  char *__retres;
++  __e_acsl_store_block((void *)(& __retres),8UL);
++  __e_acsl_store_block((void *)(& name),8UL);
++  __retres = getenv(name);
++  __e_acsl_delete_block((void *)(& name));
++  __e_acsl_delete_block((void *)(& __retres));
++  return __retres;
++}
++
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)"PATH",5UL);
++    __e_acsl_full_init((void *)(& "PATH"));
++    __e_acsl_mark_readonly((void *)"PATH");
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)"PATH");
++  return;
++}
++
++int main(int argc, char **argv)
++{
++  int __retres;
++  __e_acsl_memory_init(& argc,& argv,8UL);
++  __e_acsl_globals_init();
++  __e_acsl_store_block((void *)(& __retres),4UL);
++  char *path = __gen_e_acsl_getenv("PATH");
++  __e_acsl_store_block((void *)(& path),8UL);
++  __e_acsl_full_init((void *)(& path));
++  {
++    int __gen_e_acsl_aligned;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)path,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"path",
++                                 (void *)path);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(path,1)",
++                                 0,__gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(path,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(path,1)";
++      __gen_e_acsl_assert_data_2.file = "getenv.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 18;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"path",
++                                 (void *)path);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "path != \\null";
++    __gen_e_acsl_assert_data.file = "getenv.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 18;
++    __e_acsl_assert(path != (char *)0,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert path != \null; */ ;
++  __e_acsl_full_init((void *)(& __retres));
++  __retres = 0;
++  __e_acsl_delete_block((void *)(& argv));
++  __e_acsl_delete_block((void *)(& argc));
++  __e_acsl_delete_block((void *)(& path));
++  __e_acsl_delete_block((void *)(& __retres));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/libc/oracle/getenv.0.res.oracle b/plugins/e-acsl/tests/libc/oracle/getenv.0.res.oracle
+new file mode 100644
+index 0000000000..9b71c388b8
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/oracle/getenv.0.res.oracle
+@@ -0,0 +1,18 @@
++[e-acsl] beginning translation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:756: Warning: 
++  no assigns clause generated for function valid_read_string because pointers as arguments is not yet supported
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:755: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] FRAMAC_SHARE/libc/stdlib.h:760: Warning: 
++  function __gen_e_acsl_getenv: postcondition 'null_or_valid_result' got status unknown.
++[eva:alarm] getenv.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+diff --git a/plugins/e-acsl/tests/libc/oracle/getenv.1.res.oracle b/plugins/e-acsl/tests/libc/oracle/getenv.1.res.oracle
+new file mode 100644
+index 0000000000..9b71c388b8
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/oracle/getenv.1.res.oracle
+@@ -0,0 +1,18 @@
++[e-acsl] beginning translation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:756: Warning: 
++  no assigns clause generated for function valid_read_string because pointers as arguments is not yet supported
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/stdlib.h:755: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] FRAMAC_SHARE/libc/stdlib.h:760: Warning: 
++  function __gen_e_acsl_getenv: postcondition 'null_or_valid_result' got status unknown.
++[eva:alarm] getenv.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+-- 
+2.56.0.windows.4
+

@@ -1,0 +1,113 @@
+From 239288eaa5c47ba6dc84b1eb53af7b81ea4b9f54 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:52:04 +0100
+Subject: [PATCH] [kernel] Variadic: print original callee for calls in local
+ initializers
+
+The Variadic translation replaces calls to variadic functions with calls
+to generated fixed-arity prototypes (__va_open_void, open_fallback_1,
+printf_va_1, ...). Since these only exist as prototypes, change_printer
+prints the original callee with the generated name in a comment.
+
+It only matched Call instructions. A call that initializes a local
+variable is a Local_init(v, ConsInit(f, args, kind), loc), so
+`int fd = open(path, O_RDONLY);` was printed as
+`int fd = __va_open_void(path,0);`, or `open_fallback_1(...)` with
+-no-frama-c-stdlib. Neither function is defined anywhere, so the printed
+program does not link (e-acsl-gcc fails on it).
+
+Handle ConsInit the same way as Call. The four variadic oracles that
+change are Local_init lines that now print like the Call lines next to
+them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../services/ast_transformations/variadic/variadic.ml    | 9 +++++++++
+ tests/variadic/known/oracle/fcntl.0.res.oracle           | 2 +-
+ tests/variadic/known/oracle/ioctl.0.res.oracle           | 4 ++--
+ tests/variadic/known/oracle/open.0.res.oracle            | 6 +++---
+ .../known/oracle/printf_garbled_mix.0.res.oracle         | 2 +-
+ 5 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/src/kernel/services/ast_transformations/variadic/variadic.ml b/src/kernel/services/ast_transformations/variadic/variadic.ml
+index 51b0d4e3f6..a781139a0c 100644
+--- a/src/kernel/services/ast_transformations/variadic/variadic.ml
++++ b/src/kernel/services/ast_transformations/variadic/variadic.ml
+@@ -35,6 +35,15 @@ let change_printer =
+                 Call(res, Var old_vi, args, loc)
+               in
+               Format.fprintf fmt "%a /* %s */" super#instr old_instr vi.vname
++            (* Same for a call initializing a local variable. *)
++            | Local_init(v, ConsInit(vi, args, kind), loc)
++              when Replacements.mem vi ->
++              let old_vi = Replacements.find vi in
++              let old_vi = { vi with vname = old_vi.vname } in
++              let old_instr =
++                Local_init(v, ConsInit(old_vi, args, kind), loc)
++              in
++              Format.fprintf fmt "%a /* %s */" super#instr old_instr vi.vname
+             (* Otherwise keep the instruction. *)
+             | _ ->
+               super#instr fmt i
+diff --git a/tests/variadic/known/oracle/fcntl.0.res.oracle b/tests/variadic/known/oracle/fcntl.0.res.oracle
+index e9357afee4..9c2821af13 100644
+--- a/tests/variadic/known/oracle/fcntl.0.res.oracle
++++ b/tests/variadic/known/oracle/fcntl.0.res.oracle
+@@ -65,7 +65,7 @@ int main(void)
+   int __retres;
+   struct flock fl;
+   int volatile choice = 0;
+-  int flags = __va_fcntl_void(0,1);
++  int flags = fcntl(0,1); /* __va_fcntl_void */
+   fcntl(0,2,flags); /* __va_fcntl_int */
+   fcntl(0,5,& fl); /* __va_fcntl_flock */
+   switch (choice) {
+diff --git a/tests/variadic/known/oracle/ioctl.0.res.oracle b/tests/variadic/known/oracle/ioctl.0.res.oracle
+index 0f1f2467f3..7709fc5772 100644
+--- a/tests/variadic/known/oracle/ioctl.0.res.oracle
++++ b/tests/variadic/known/oracle/ioctl.0.res.oracle
+@@ -35,9 +35,9 @@ int main(void)
+   int __retres;
+   int fd1 = 1;
+   int request1 = 0;
+-  int r1 = __va_ioctl_void(fd1,request1);
++  int r1 = ioctl(fd1,request1); /* __va_ioctl_void */
+   char arg = (char)42;
+-  int r2 = __va_ioctl_ptr(fd1,request1,(void *)(& arg));
++  int r2 = ioctl(fd1,request1,(void *)(& arg)); /* __va_ioctl_ptr */
+   struct st *p = (struct st *)0;
+   ioctl(fd1,request1,(void *)p); /* __va_ioctl_ptr */
+   ioctl(fd1,request1,42); /* __va_ioctl_int */
+diff --git a/tests/variadic/known/oracle/open.0.res.oracle b/tests/variadic/known/oracle/open.0.res.oracle
+index 5e696428f7..12b8c58110 100644
+--- a/tests/variadic/known/oracle/open.0.res.oracle
++++ b/tests/variadic/known/oracle/open.0.res.oracle
+@@ -49,9 +49,9 @@ int main(void)
+   int flag = 0;
+   int mode = 0;
+   char *file = (char *)"file";
+-  int fd1 = __va_open_mode_t((char const *)file,flag,(mode_t)mode);
+-  int fd2 = __va_open_void((char const *)file,flag);
+-  int fd3 = open_fallback_1((char const *)file,flag,mode,3,"arg4",5);
++  int fd1 = open((char const *)file,flag,(mode_t)mode); /* __va_open_mode_t */
++  int fd2 = open((char const *)file,flag); /* __va_open_void */
++  int fd3 = open((char const *)file,flag,mode,3,"arg4",5); /* open_fallback_1 */
+   __retres = 0;
+   return __retres;
+ }
+diff --git a/tests/variadic/known/oracle/printf_garbled_mix.0.res.oracle b/tests/variadic/known/oracle/printf_garbled_mix.0.res.oracle
+index 9d4365c8dc..58f91144c9 100644
+--- a/tests/variadic/known/oracle/printf_garbled_mix.0.res.oracle
++++ b/tests/variadic/known/oracle/printf_garbled_mix.0.res.oracle
+@@ -80,7 +80,7 @@ void main(void)
+   int *b = (int *)((uintptr_t)(a) * (uintptr_t)2);
+   /*@ assert Eva: pointer_alignment: \aligned(b,alignof(int)); */
+   /*@ assert Eva: pointer_downcast: (unsigned long)b ≤ 2147483647; */
+-  int nb_printed = printf_va_1("%d",(int)b);
++  int nb_printed = printf("%d",(int)b); /* printf_va_1 */
+   Frama_C_show_each_nb_printed(nb_printed);
+   b = (int *)0;
+   return;
+-- 
+2.56.0.windows.4
+

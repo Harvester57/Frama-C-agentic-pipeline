@@ -1,0 +1,376 @@
+From 34fb547fb49397ee1ff1b95aedb98649f20c79c8 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:41:33 +0100
+Subject: [PATCH] [e-acsl] e-acsl-gcc: compile with -D_DEFAULT_SOURCE, as
+ Frama-C preprocesses
+
+e-acsl-gcc preprocesses the sources for Frama-C with
+"-std=c99 -D_DEFAULT_SOURCE" (FRAMAC_CPP_EXTRA), but compiles both the
+original and the instrumented program with "-std=c99" alone (CFLAGS).
+With glibc, -std=c99 alone hides the POSIX and BSD declarations
+(strdup, stpcpy, strtok_r, fileno, getline, ...): Frama-C sees and
+instruments the calls, while the compiler sees implicit int
+declarations. GCC 14 rejects the resulting int-to-pointer conversion,
+so any program calling such a function fails to build
+("fail to compile/link un-instrumented code"; with -L, the instrumented
+code, which includes the libc headers, fails the same way).
+
+Add -D_DEFAULT_SOURCE next to -std=c99 in CFLAGS, so that the compiler
+sees the same declarations as Frama-C. -std=c99 itself is unchanged.
+
+Test: libc/default_source.c calls stpcpy. Its dev run uses -L, since
+the test configuration always passes -X and so never compiles the
+original program.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/doc/Changelog                  |   4 +
+ plugins/e-acsl/scripts/e-acsl-gcc             |   2 +-
+ plugins/e-acsl/tests/libc/default_source.c    |  18 ++
+ .../libc/oracle/default_source.0.res.oracle   |  53 +++++
+ .../tests/libc/oracle/gen_default_source.0.c  | 220 ++++++++++++++++++
+ 5 files changed, 296 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/e-acsl/tests/libc/default_source.c
+ create mode 100644 plugins/e-acsl/tests/libc/oracle/default_source.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/libc/oracle/gen_default_source.0.c
+
+diff --git a/plugins/e-acsl/doc/Changelog b/plugins/e-acsl/doc/Changelog
+index 57448f82ab..a854e8f1db 100644
+--- a/plugins/e-acsl/doc/Changelog
++++ b/plugins/e-acsl/doc/Changelog
+@@ -25,6 +25,10 @@
+ Plugin E-ACSL <next-release>
+ ###############################################################################
+ 
++-* e-acsl-gcc [2026-11-15] Compile with -D_DEFAULT_SOURCE, as Frama-C
++                           preprocesses, so that POSIX functions such as
++                           strdup are declared
++
+ ###############################################################################
+ Plugin E-ACSL 34.0 (Selenium)
+ ###############################################################################
+diff --git a/plugins/e-acsl/scripts/e-acsl-gcc b/plugins/e-acsl/scripts/e-acsl-gcc
+index 81e8f8ae7a..4e51de1d14 100755
+--- a/plugins/e-acsl/scripts/e-acsl-gcc
++++ b/plugins/e-acsl/scripts/e-acsl-gcc
+@@ -890,7 +890,7 @@ fi
+ # Gcc and related flags
+ CC="$OPTION_CC"
+ CFLAGS="$OPTION_CFLAGS
+-  -std=c99 $GCCMACHDEP $OPT_CFLAGS
++  -std=c99 -D_DEFAULT_SOURCE $GCCMACHDEP $OPT_CFLAGS
+   -fno-builtin -fno-merge-constants
+   -Wall \
+   -Wno-long-long \
+diff --git a/plugins/e-acsl/tests/libc/default_source.c b/plugins/e-acsl/tests/libc/default_source.c
+new file mode 100644
+index 0000000000..f1e2691a9b
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/default_source.c
+@@ -0,0 +1,18 @@
++/* run.config
++   COMMENT: POSIX functions that glibc declares only with _DEFAULT_SOURCE (or
++   COMMENT: an equivalent feature macro), such as stpcpy, must also be
++   COMMENT: declared when e-acsl-gcc compiles the program with -std=c99.
++*/
++/* run.config_dev
++   COMMENT: with Frama-C's libc (-L), the instrumented code includes <string.h>
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT -L
++*/
++
++#include <string.h>
++
++int main() {
++  char dest[8];
++  char *end = stpcpy(dest, "abc");
++  //@ assert end == dest + 3;
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/libc/oracle/default_source.0.res.oracle b/plugins/e-acsl/tests/libc/oracle/default_source.0.res.oracle
+new file mode 100644
+index 0000000000..351cb20c11
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/oracle/default_source.0.res.oracle
+@@ -0,0 +1,53 @@
++[e-acsl] beginning translation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:24: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:48: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:48: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:51: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:51: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:479: Warning: 
++  no assigns clause generated for function valid_read_string because pointers as arguments is not yet supported
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:480: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:482: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:479: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:485: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:486: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] FRAMAC_SHARE/libc/string.h:486: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:486: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:485: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:485: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:485: Warning: 
++  function __gen_e_acsl_stpcpy: postcondition 'equal_contents' got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:486: Warning: 
++  function __gen_e_acsl_stpcpy: postcondition 'points_to_end' got status unknown.
++[eva:alarm] default_source.c:16: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] default_source.c:16: Warning: 
++  pointer comparison.
++  assert \pointer_comparable((void *)end, (void *)(&dest[3]));
+diff --git a/plugins/e-acsl/tests/libc/oracle/gen_default_source.0.c b/plugins/e-acsl/tests/libc/oracle/gen_default_source.0.c
+new file mode 100644
+index 0000000000..a088c15210
+--- /dev/null
++++ b/plugins/e-acsl/tests/libc/oracle/gen_default_source.0.c
+@@ -0,0 +1,220 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "string.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++/*@ requires valid_string_src: valid_read_string(src);
++    requires room_string: \valid(dest + (0 .. strlen(src)));
++    requires
++      separation:
++        \separated(dest + (0 .. strlen(src)), src + (0 .. strlen(src)));
++    ensures equal_contents: strcmp(\old(dest), \old(src)) == 0;
++    ensures points_to_end: \result == \old(dest) + strlen(\old(dest));
++    assigns *(dest + (0 .. strlen{Old}(src))), \result;
++    assigns *(dest + (0 .. strlen{Old}(src)))
++      \from *(src + (0 .. strlen{Old}(src)));
++    assigns \result \from dest;
++ */
++char *__gen_e_acsl_stpcpy(char * restrict dest, char const * restrict src);
++
++char const __fc_lit_string1[4UL] = "abc";
++/*@ requires valid_string_src: valid_read_string(src);
++    requires room_string: \valid(dest + (0 .. strlen(src)));
++    requires
++      separation:
++        \separated(dest + (0 .. strlen(src)), src + (0 .. strlen(src)));
++    ensures equal_contents: strcmp(\old(dest), \old(src)) == 0;
++    ensures points_to_end: \result == \old(dest) + strlen(\old(dest));
++    assigns *(dest + (0 .. strlen{Old}(src))), \result;
++    assigns *(dest + (0 .. strlen{Old}(src)))
++      \from *(src + (0 .. strlen{Old}(src)));
++    assigns \result \from dest;
++ */
++char *__gen_e_acsl_stpcpy(char * restrict dest, char const * restrict src)
++{
++  char *__gen_e_acsl_at_4;
++  char const *__gen_e_acsl_at_3;
++  char *__gen_e_acsl_at_2;
++  char *__gen_e_acsl_at;
++  char *__retres;
++  __e_acsl_store_block((void *)(& __retres),8UL);
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_aligned_2;
++    int __gen_e_acsl_aligned_3;
++    int __gen_e_acsl_aligned_4;
++    __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data.blocking = 1;
++      __gen_e_acsl_assert_data.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data.fct = "stpcpy";
++      __gen_e_acsl_assert_data.line = 486;
++      __gen_e_acsl_assert_data.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    }
++    __gen_e_acsl_at = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_2.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_2.fct = "stpcpy";
++      __gen_e_acsl_assert_data_2.line = 486;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_at_2 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned_3);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data_3.blocking = 1;
++      __gen_e_acsl_assert_data_3.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_3.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data_3.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_3.fct = "stpcpy";
++      __gen_e_acsl_assert_data_3.line = 485;
++      __gen_e_acsl_assert_data_3.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_3,& __gen_e_acsl_assert_data_3);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++    }
++    __gen_e_acsl_at_3 = src;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_4 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_4);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_4.blocking = 1;
++      __gen_e_acsl_assert_data_4.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_4.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_4.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_4.fct = "stpcpy";
++      __gen_e_acsl_assert_data_4.line = 485;
++      __gen_e_acsl_assert_data_4.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_4,& __gen_e_acsl_assert_data_4);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    }
++    __gen_e_acsl_at_4 = dest;
++  }
++  __retres = stpcpy(dest,src);
++  __e_acsl_delete_block((void *)(& src));
++  __e_acsl_delete_block((void *)(& dest));
++  __e_acsl_delete_block((void *)(& __retres));
++  return __retres;
++}
++
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)(__fc_lit_string1),4UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
++  return;
++}
++
++int main(void)
++{
++  int __retres;
++  char dest[8];
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_globals_init();
++  __e_acsl_store_block((void *)(dest),8UL);
++  char *end = __gen_e_acsl_stpcpy(dest,__fc_lit_string1);
++  __e_acsl_store_block((void *)(& end),8UL);
++  __e_acsl_full_init((void *)(& end));
++  {
++    int __gen_e_acsl_aligned;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)end,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"end",
++                                 (void *)end);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(end,1)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(end,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(end,1)";
++      __gen_e_acsl_assert_data_2.file = "default_source.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 16;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"end",
++                                 (void *)end);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"&dest[3]",
++                                 (void *)(& dest[3]));
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "end == &dest[3]";
++    __gen_e_acsl_assert_data.file = "default_source.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 16;
++    /*@ assert
++          Eva: ptr_comparison:
++            \pointer_comparable((void *)end, (void *)(&dest[3]));
++    */
++    __e_acsl_assert(end == & dest[3],& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert end == &dest[3]; */ ;
++  __retres = 0;
++  __e_acsl_delete_block((void *)(& end));
++  __e_acsl_delete_block((void *)(dest));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+-- 
+2.56.0.windows.4
+

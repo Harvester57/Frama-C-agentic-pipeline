@@ -1,6 +1,10 @@
 # Variadic: calls in declaration initializers are printed with the generated name (`int fd = open_fallback_1(...)`), so printed code does not link
 
+**Filed upstream on 2026-11-15:** issue [#2796](https://git.frama-c.com/pub/frama-c/-/work_items/2796), merge request [!27](https://git.frama-c.com/pub/frama-c/-/merge_requests/27).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/03-variadic-fallback-local-init-issue.md), [MR](./filing/03-variadic-fallback-local-init-mr.md), [reproducer](./repro/03-variadic-fallback-local-init.sh), [patch](./patches/03-variadic-fallback-local-init.patch)
 
 ## Summary
 
@@ -31,9 +35,10 @@ and compiles its printed output. But it is a kernel bug: plain `frama-c -print -
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02),
-  Debian 13, gcc 14.2.0.
-- Also present in `34.0~~dev (Selenium)`, and first seen with 33.0.
+- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`), Debian 13,
+  gcc 14.2.0, with [`./repro/03-variadic-fallback-local-init.sh`](./repro/03-variadic-fallback-local-init.sh)
+  (2026-11-15). First reproduced on `ad24dca` (2026-11-02).
+- Same output on `34.0~beta (Selenium)` (2026-11-15). First seen with 33.0.
 
 ## Reproduction
 
@@ -77,9 +82,13 @@ The repository's own oracles show both forms side by side. In
   ioctl(fd1,request1,(void *)p); /* __va_ioctl_ptr */        /* Call */
 ```
 
-## Proposed fix
+## Fix
 
-Give `Local_init` / `ConsInit` the same treatment as `Call`:
+Patch: [`./patches/03-variadic-fallback-local-init.patch`](./patches/03-variadic-fallback-local-init.patch),
+one commit on `fix/variadic-local-init-printer` from `3dff90fc70`,
+"[kernel] Variadic: print original callee for calls in local initializers". It gives
+`Local_init` / `ConsInit` the same treatment as `Call` in `change_printer`, and updates the four
+oracles below, which serve as the regression test:
 
 ```diff
 --- a/src/kernel/services/ast_transformations/variadic/variadic.ml
@@ -102,16 +111,25 @@ Give `Local_init` / `ConsInit` the same treatment as `Call`:
                super#instr fmt i
 ```
 
-## Validation of the proposed fix
+## Validation of the fix
 
-Built from `ad24dca` with the patch:
+Built on `3dff90fc70` with the patch (image `framac-master-audit:3dff90f`, incremental
+`dune build @install --release` and `dune install`), 2026-11-15:
 
-| Check | `master` | Patched |
-|---|---|---|
-| `frama-c -no-frama-c-stdlib v3.c -print`, then `gcc` | `int fd = open_fallback_1(…)`; link fails | `int fd = open(…); /* open_fallback_1 */`; links |
-| `e-acsl-gcc v.c` (`int fd = open("/dev/null", O_RDONLY, 0);`) | link fails | builds; runs, exit 0 |
-| Assignment form (`fd = open(…);`) | `/* open_fallback_1 */` comment | unchanged |
-| ptests `tests/variadic`, `tests/libc`, `tests/pretty_printing` | — | 4 oracle changes, all intended (below) |
+| Check | `master` `3dff90fc70` | 34.0~beta | Patched |
+|---|---|---|---|
+| Reproducer (`frama-c -no-frama-c-stdlib -print`, then `gcc`) | `int fd = open_fallback_1(…)`; link fails | same | `int fd = open(…); /* open_fallback_1 */`; links |
+| `e-acsl-gcc` on the reproducer | `fail to compile/link instrumented code` | not run | builds; runs, exit 0 |
+| `e-acsl-gcc -F -no-variadic-translation` (workaround) | builds; runs, exit 0 | not run | builds; runs, exit 0 |
+| ptests `tests/variadic`, `tests/libc`, `tests/pretty_printing` (398 results) | — | — | 4 oracle changes, all intended (below), promoted; rerun clean |
+| `make check-lint` (changed files, ocp-indent 1.10.0), `git diff --check` | — | — | clean |
+
+Other ptest suites were not run. A `git grep` of all oracles on `3dff90fc70` for a local
+initialized by a call to a translated variadic function (`__va_*`, `*_va_<n>`, `*_fallback_<n>`)
+finds only the lines of the four oracles below.
+
+Earlier validation on `ad24dca` (2026-11-02) gave the same results, plus: the assignment form
+(`fd = open(…);`) is unchanged.
 
 The four oracles that change are each a `Local_init` line that now prints like the `Call` lines next
 to it:

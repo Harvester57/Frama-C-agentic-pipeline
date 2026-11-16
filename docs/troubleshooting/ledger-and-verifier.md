@@ -128,3 +128,33 @@ Issues encountered in coverage ledger ingestion (`ledger.py`), Crash Verifier sc
   - Add a `caller_argument` value to `controlled_by`, for an exported function's parameter that the application normally supplies as a constant or as derived state, and cap it at `low` unless the header documents the parameter as untrusted.
   - Add a severity anchor for a corrupt value the library returns, when the caller's use of it goes out of bounds. Rate it like the out-of-bounds access it causes.
   - State that reading an indeterminate object whose address is taken is not UB, and that MSan's eager parameter check reports a value that is only passed, never used.
+
+### Symptom: A Reproducible E-ACSL False Positive Has No Rejection Class in the Crash Verifier Brief
+- **Seen on:** c-ares run-1, 2026-11-16 ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)). Two Phase 1 candidates come from the checking tool, not from the target ([`./eacsl-and-fuzzing.md`](./eacsl-and-fuzzing.md)):
+  - `src/lib/str/ares_buf.c#ares_buf_consume_until_charset::mem_access::32e8ca0441`: string literals merged at link time.
+  - `unknown#inet_ntop4::eacsl_format_error::1f30ebf225`: `%u` given a promoted `unsigned char`.
+- **Cause:** the schemas allow `toolchain_artifact`, and QCBOR run-5 used it. But [`../../skills/framac-wp/crash_verifier_brief.md`](../../skills/framac-wp/crash_verifier_brief.md) named only `harness_induced` and the source-based classes. A verifier facing a reproducing E-ACSL false alarm had three options, all wrong:
+  - **Confirm it under Rule 2:** a false finding.
+  - **Reject it as `harness_induced`:** this creates a harness repair that cannot help (`scripts/wp_scheduler.py` `_ensure_repair`, up to 2 per module), then `harness_unchanged` marks.
+  - **Reject it under another class with basis `model` or `located`:** every new reproducer reopens it, up to `max_reopenings`.
+
+  The ledger and the scheduler already handle `toolchain_artifact` correctly:
+  - it creates no repair;
+  - with `refutation_basis: checked`, later tool reproducers are recorded as `checked_rejection` and do not reopen it (`scripts/ledger.py` around 474-479).
+- **Fix:** commits `fca3aa6` and `66166bd`, from branch `sup/c-ares-verifier-toolchain-artifact`, fixed and merged into `phase1-remediation` (2026-11-16).
+  - **Brief, Case A:** a new step, "Check That the Tool Is Right". The class follows what makes the property hold: a line of the target means `disproved_by_source`; a compiler, linker or tool behaviour means `toolchain_artifact`. Never use `harness_induced` for a tool's false alarm.
+  - **Brief, "Rejection Classes":** a new section covering all 7 classes.
+  - **Brief, "Toolchain Artifacts":** a new section. Basis `checked` needs all three of: a source that is correct at the sink, a named toolchain fact, and a tool output.
+    - The tool output can be a replay on an independent checker that covers the alarm kind, a standalone minimal program, or the instrumented source.
+    - A rebuild without the check is not evidence.
+  - **Skills:** `framac-wp/SKILL.md` and `framac-verify/SKILL.md` say the class creates no task and is recorded as a pipeline or upstream defect.
+  - **Tests:**
+    - `tests/test_brief_result_contract.py::test_verifier_brief_names_every_rejection_class` (fails on `aab6b8f`)
+    - `tests/test_rejection_reopen.py::test_a_checked_toolchain_artifact_is_not_repaired_or_reopened`
+    - `tests/test_rejection_reopen.py::test_a_located_toolchain_artifact_is_reopened_by_a_new_reproducer`
+    - `tests/test_wp_scheduler.py::test_toolchain_artifact_rejection_creates_no_repair`
+- **Still open:**
+  - `docs/references/e-acsl-quickref.md`, the only list of known issues verifiers see in the image, does not list the two c-ares families yet. Their fixes (`sup/c-ares-eacsl-literal-charset` and `sup/c-ares-eacsl-format-promotion`) are now merged into `phase1-remediation` (2026-11-16), so the families can be added.
+  - A `located` or `model` `toolchain_artifact` still reopens, up to `max_reopenings`.
+  - Ingest does not check a stated `checked` basis against `record.evidence`.
+  - A run on a checkout older than the merge (such as c-ares run-1) reads the old brief: its verifiers may still confirm these two families, or reject them as `harness_induced`.

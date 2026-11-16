@@ -1,0 +1,142 @@
+From cea7e7bb480563d673d514609e0a579a363703b7 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:51:38 +0100
+Subject: [PATCH] [e-acsl] e-acsl-gcc: do not read the words of option
+ arguments as options
+
+After getopt, e-acsl-gcc walked its options with an unquoted
+"for i in $@", while each case branch shifts the real positional
+parameters. The word list of the for loop is split on whitespace once,
+when the loop starts, so every word of an option argument was matched
+against the option patterns again. A word equal to an e-acsl-gcc option
+ran that option's branch: it changed a setting and shifted the
+positional parameters out of step, and the final "shift" (meant to drop
+"--") then dropped an input file. For instance:
+
+- -e "-g -O1" enabled -e-acsl-O-gmp-only (-g is --gmp) and dropped the
+  first input file, or the run aborted;
+- -E "-I inc" and -l "-L /usr/lib -lm" failed with "no input files"
+  (-I is --frama-c, -L is --frama-c-stdlib).
+
+Loop on the positional parameters themselves: each branch already
+shifts its option and argument. "--" ends the loop, which replaces the
+trailing shift. Any other word cannot happen after getopt, but is
+reported as an error rather than making the loop spin.
+
+Test: special/e-acsl-gcc-option-arguments.c passes "-e -g" to
+e-acsl-gcc in its dev run; it failed with "no input files".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/doc/Changelog                   |  3 +++
+ plugins/e-acsl/scripts/e-acsl-gcc              | 17 +++++++++++++----
+ .../special/e-acsl-gcc-option-arguments.c      |  9 +++++++++
+ .../e-acsl-gcc-option-arguments.0.res.oracle   |  2 ++
+ .../oracle/gen_e-acsl-gcc-option-arguments.0.c | 18 ++++++++++++++++++
+ 5 files changed, 45 insertions(+), 4 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/special/e-acsl-gcc-option-arguments.c
+ create mode 100644 plugins/e-acsl/tests/special/oracle/e-acsl-gcc-option-arguments.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/special/oracle/gen_e-acsl-gcc-option-arguments.0.c
+
+diff --git a/plugins/e-acsl/doc/Changelog b/plugins/e-acsl/doc/Changelog
+index 57448f82ab..b52132695e 100644
+--- a/plugins/e-acsl/doc/Changelog
++++ b/plugins/e-acsl/doc/Changelog
+@@ -25,6 +25,9 @@
+ Plugin E-ACSL <next-release>
+ ###############################################################################
+ 
++-* e-acsl-gcc [2026-11-15] Fix the words of an option argument being read
++                           again as options (e.g. -g in -e "-g -O1")
++
+ ###############################################################################
+ Plugin E-ACSL 34.0 (Selenium)
+ ###############################################################################
+diff --git a/plugins/e-acsl/scripts/e-acsl-gcc b/plugins/e-acsl/scripts/e-acsl-gcc
+index 81e8f8ae7a..828147f694 100755
+--- a/plugins/e-acsl/scripts/e-acsl-gcc
++++ b/plugins/e-acsl/scripts/e-acsl-gcc
+@@ -438,10 +438,12 @@ fi
+ # Set all options in $@ before -- and other after
+ eval set -- "$ARGS"
+ 
+-# Switch statements for other options
+-for i in $@
++# Switch statements for other options. Loop on the positional parameters
++# themselves: each branch shifts its option (and its argument), so the words
++# of an option argument are never read again as options.
++while [ $# -gt 0 ]
+ do
+-  case "$i" in
++  case "$1" in
+     # Do compile instrumented code
+     --help|-h)
+       shift;
+@@ -809,9 +811,16 @@ $zone_help_msg"
+       OPTION_MBITS="$1"
+       shift;
+     ;;
++    # End of the options normalized by getopt: the input files follow
++    --)
++      shift;
++      break;
++    ;;
++    *)
++      error "unexpected argument '$1'";
++    ;;
+   esac
+ done
+-shift;
+ 
+ # Bail if no files to translate are given and we're not trying to only compile
+ # dlmalloc
+diff --git a/plugins/e-acsl/tests/special/e-acsl-gcc-option-arguments.c b/plugins/e-acsl/tests/special/e-acsl-gcc-option-arguments.c
+new file mode 100644
+index 0000000000..bde422c770
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/e-acsl-gcc-option-arguments.c
+@@ -0,0 +1,9 @@
++/* run.config_dev
++  COMMENT: The argument of an e-acsl-gcc option must not be read again as an
++  COMMENT: e-acsl-gcc option: '-g' passed with -e must reach the compiler, not
++  COMMENT: enable -g|--gmp and drop the input file ("no input files").
++  MACRO: ROOT_EACSL_GCC_OPTS_EXT -e -g
++ */
++int main() {
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/special/oracle/e-acsl-gcc-option-arguments.0.res.oracle b/plugins/e-acsl/tests/special/oracle/e-acsl-gcc-option-arguments.0.res.oracle
+new file mode 100644
+index 0000000000..efd0263112
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/e-acsl-gcc-option-arguments.0.res.oracle
+@@ -0,0 +1,2 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-gcc-option-arguments.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-gcc-option-arguments.0.c
+new file mode 100644
+index 0000000000..b199ab90da
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-gcc-option-arguments.0.c
+@@ -0,0 +1,18 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __retres = 0;
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+-- 
+2.56.0.windows.4
+

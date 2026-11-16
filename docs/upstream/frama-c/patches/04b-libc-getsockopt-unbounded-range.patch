@@ -1,0 +1,116 @@
+From 054e5ba4be9d26ea1d922d9c51d6781fdce153b0 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:53:40 +0100
+Subject: [PATCH] [libc] getsockopt: bound optval by *optlen
+
+In behavior other_options, getsockopt required
+  optval == \null || \valid(((char*)optval)+(0..))
+The range has no upper bound, so no object satisfies it: every call
+with a non-null optval, other than SOL_SOCKET/SO_ERROR, was rejected.
+Eva reports the precondition as invalid on correct calls and considers
+the call non-terminating, so nothing after it is analyzed; WP aborts
+with "Invalid infinite range".
+
+getsockopt(2) writes at most *optlen bytes into optval (a longer value
+is truncated), so bound the range by *optlen, as setsockopt already does
+with optlen and getsockname with *address_len. The two assigns clauses
+on optval get the same bound. A null optval and *optlen == 0 stay
+allowed; behavior so_error is unchanged.
+
+tests/libc/socket_h.c gets a getsockopt call through other_options,
+with a valid optval and with a null one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ share/libc/sys/socket.h                 |  6 +++---
+ tests/libc/oracle/socket_h.0.res.oracle | 28 +++++++++++++++++++++++++
+ tests/libc/socket_h.c                   |  8 ++++++-
+ 3 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/share/libc/sys/socket.h b/share/libc/sys/socket.h
+index f3c1bbcd22..aad242f04f 100644
+--- a/share/libc/sys/socket.h
++++ b/share/libc/sys/socket.h
+@@ -377,7 +377,7 @@ extern int getsockname(int socket, struct sockaddr *restrict address,
+ /*@
+   requires valid_sockfd: 0 <= sockfd < __FC_MAX_OPEN_SOCKETS;
+   requires valid_optlen: \valid(optlen);
+-  assigns ((char*)optval)[0..], \result
++  assigns ((char*)optval)[0 .. *optlen-1], \result
+           \from indirect:sockfd, indirect:level, indirect:optname,
+                 indirect:*optlen, indirect:optval,
+                 indirect:__fc_sockfds[sockfd];
+@@ -395,8 +395,8 @@ extern int getsockname(int socket, struct sockaddr *restrict address,
+   behavior other_options:
+     assumes optname_not_error: !(level == SOL_SOCKET && optname == SO_ERROR);
+     requires optval_null_or_valid:
+-      optval == \null || \valid(((char*)optval)+(0..));
+-    assigns ((char*)optval)[0..], \result
++      optval == \null || \valid(((char*)optval)+(0 .. *optlen-1));
++    assigns ((char*)optval)[0 .. *optlen-1], \result
+             \from indirect:sockfd, indirect:level, indirect:optname,
+                   indirect:*optlen, indirect:optval,
+                   indirect:__fc_sockfds[sockfd];
+diff --git a/tests/libc/oracle/socket_h.0.res.oracle b/tests/libc/oracle/socket_h.0.res.oracle
+index a880932400..a076d1a463 100644
+--- a/tests/libc/oracle/socket_h.0.res.oracle
++++ b/tests/libc/oracle/socket_h.0.res.oracle
+@@ -112,6 +112,29 @@
+   for assigns clause *((char *)addrbuf + (0 .. \old(*addrbuf_len) - 1)).
+   Ignoring.
+ [eva:progress] Done for function recvfrom
++[eva:progress] 
++  computing for function getsockopt <- main.
++  Called from socket_h.c:42.
++[eva:progress] socket_h.c:42: 
++  function getsockopt: precondition 'valid_sockfd' got status valid.
++[eva:progress] socket_h.c:42: 
++  function getsockopt: precondition 'valid_optlen' got status valid.
++[eva:progress] socket_h.c:42: 
++  function getsockopt, behavior other_options: precondition 'optval_null_or_valid' got status valid.
++[eva:progress] Done for function getsockopt
++[eva:progress] 
++  computing for function getsockopt <- main.
++  Called from socket_h.c:43.
++[eva:progress] socket_h.c:43: 
++  function getsockopt: precondition 'valid_sockfd' got status valid.
++[eva:progress] socket_h.c:43: 
++  function getsockopt: precondition 'valid_optlen' got status valid.
++[eva:progress] socket_h.c:43: 
++  function getsockopt, behavior other_options: precondition 'optval_null_or_valid' got status valid.
++[eva:assigns:invalid-location] socket_h.c:43: 
++  Completely invalid destination
++  for assigns clause *((char *)optval + (0 .. *optlen - 1)). Ignoring.
++[eva:progress] Done for function getsockopt
+ [eva:progress] Recording results for main
+ [eva:progress] Done for function main
+ [eva] ====== VALUES COMPUTED ======
+@@ -134,3 +157,8 @@
+   recvfrom_addr_len ∈ [--..--]
+   received ∈ [-1..40]
+   received2 ∈ [-1..40]
++  rcvbuf ∈ [--..--] or UNINITIALIZED
++  rcvbuf_len ∈ [--..--]
++  rc2 ∈ {-1; 0}
++  rc3 ∈ {-1; 0}
++  __retres ∈ {-3; -2; -1; 0}
+diff --git a/tests/libc/socket_h.c b/tests/libc/socket_h.c
+index d52cb75cf2..ad81f5e230 100644
+--- a/tests/libc/socket_h.c
++++ b/tests/libc/socket_h.c
+@@ -35,5 +35,11 @@ int main() {
+     //@ assert \initialized(&recvfrom_addr);
+   }
+   ssize_t received2 = recvfrom(sockfd, buf, sizeof(buf), 0, 0, 0);
+-  return rc;
++
++  // behavior other_options: optval must be valid for *optlen bytes only
++  int rcvbuf;
++  socklen_t rcvbuf_len = sizeof(rcvbuf);
++  int rc2 = getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rcvbuf_len);
++  int rc3 = getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, 0, &rcvbuf_len);
++  return rc + rc2 + rc3;
+ }
+-- 
+2.56.0.windows.4
+

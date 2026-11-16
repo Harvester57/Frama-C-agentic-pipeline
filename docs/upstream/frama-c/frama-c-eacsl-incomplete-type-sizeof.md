@@ -1,6 +1,10 @@
 # E-ACSL: annotations on pointers to incomplete (opaque) struct types produce `sizeof`/`alignof` of the incomplete type, so the instrumented code does not compile
 
+**Filed upstream on 2026-11-15:** issue [#2805](https://git.frama-c.com/pub/frama-c/-/work_items/2805), merge request [!36](https://git.frama-c.com/pub/frama-c/-/merge_requests/36).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/05-eacsl-incomplete-type-sizeof-issue.md), [MR](./filing/05-eacsl-incomplete-type-sizeof-mr.md), [reproducer](./repro/05-eacsl-incomplete-type-sizeof.sh), [patch](./patches/05-eacsl-incomplete-type-sizeof.patch)
 
 ## Summary
 
@@ -29,9 +33,11 @@ The terms that come from RTE or from the user, and the memory built-ins (`Smart_
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02),
-  Debian 13, gcc 14.2.0 and clang 19.1.7 (both reject the generated code).
-- Same behaviour in `34.0~~dev (Selenium)`.
+- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`), Debian 13,
+  gcc 14.2.0 and clang 19.1.7 (both reject the generated code), with
+  [`./repro/05-eacsl-incomplete-type-sizeof.sh`](./repro/05-eacsl-incomplete-type-sizeof.sh)
+  (2026-11-15). First reproduced on `ad24dca` (2026-11-02).
+- Same output on `34.0~beta (Selenium)` (2026-11-15).
 
 ## Reproduction
 
@@ -85,7 +91,14 @@ e-acsl-gcc: fatal error: fail to compile/link instrumented code
 
 Replacing `\valid_read(obj)` with `\initialized(obj)` fails the same way.
 
-## Proposed fix
+## Fix
+
+Patch: [`./patches/05-eacsl-incomplete-type-sizeof.patch`](./patches/05-eacsl-incomplete-type-sizeof.patch),
+one commit on `fix/e-acsl-incomplete-type-sizeof` from `3dff90fc70`, "[e-acsl] ignore annotations
+needing the size of an incomplete type". It adds the regression test
+`plugins/e-acsl/tests/constructs/incomplete_type.c` (an opaque struct, `requires \valid_read(obj)`
+and `requires \initialized(obj)` on a pointer to it, and a cast from `void *` that gets the RTE
+alignment assertion with `-rte`), with its default-configuration oracles.
 
 When E-ACSL meets one of these terms, ignore the annotation with a "not yet supported" warning,
 which is what it does for every other construct it cannot translate:
@@ -183,16 +196,22 @@ of any statement the translation would add to `env`.
   check that `obj` points into an allocated block (one byte), rather than dropping the annotation.
   That is a semantic choice, so the patch only drops it.
 
-## Validation of the proposed fix
+## Validation of the fix
 
-Built from `ad24dca` with the patch:
+Built on `3dff90fc70` with the patch (image `framac-master-audit:3dff90f`, incremental
+`dune build @install --release` and `dune install`), 2026-11-15:
 
-| Check | `master` | Patched |
-|---|---|---|
-| `e-acsl-gcc -F -rte opaque_cast.c`, clang and gcc | compile error (`__alignof__`) | `E-ACSL construct 'sizeof or alignof of an incomplete type' is not yet supported. Ignoring annotation.`; builds; runs, exit 0 |
-| `e-acsl-gcc opaque_valid.c` | compile error (`sizeof`) | `E-ACSL construct 'memory predicate on a pointer to an incomplete type' is not yet supported. Ignoring annotation.`; builds; runs, exit 0 |
-| `e-acsl-gcc opaque_init.c` (`\initialized(obj)`) | compile error (`sizeof`) | same warning; builds; runs, exit 0 |
-| ptests `plugins/e-acsl/tests` (default and `dev` configurations), `plugins/rte/tests` | — | no change |
+| Check | `master` `3dff90fc70` | 34.0~beta | Patched |
+|---|---|---|---|
+| `e-acsl-gcc -F -rte opaque_cast.c` | compile error (`__alignof__`) | same | `E-ACSL construct 'sizeof or alignof of an incomplete type' is not yet supported. Ignoring annotation.`; builds; runs, exit 0 |
+| `e-acsl-gcc opaque_valid.c` | compile error (`sizeof`) | same | `E-ACSL construct 'memory predicate on a pointer to an incomplete type' is not yet supported. Ignoring annotation.`; builds; runs, exit 0 |
+| `opaque_valid.c` with `\valid(obj)`, with `\initialized(obj)` | compile error (`sizeof`) | not run | same warning; builds; runs, exit 0 |
+| the four programs above with `-G clang` (clang 19.1.7) | compile error (`sizeof`/`alignof`) | not run | builds; runs, exit 0 |
+| ptests `plugins/e-acsl/tests`, default configuration (198 results) | — | — | only the two new oracles; promoted; rerun clean |
+| ptests `plugins/e-acsl/tests`, `dev` configuration (compile and run) | new test fails to compile | — | pass, new test included |
+| `make check-lint` (5 changed files, ocp-indent 1.10.0) | — | — | clean (`clang-format` not installed: new C test not checked) |
+
+Earlier validation on `ad24dca` (2026-11-02) also ran `plugins/rte/tests`: no change.
 
 ## Workaround
 

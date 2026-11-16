@@ -91,6 +91,11 @@ Issues encountered in E-ACSL instrumentation (`e-acsl-gcc`, `eacsl_toolchain.py`
 ### Symptom: Instrumentation Aborts With `no function 'X'`
 - **Cause:** `-rte-select` / `-e-acsl-functions` named a function that is absent from the parsed AST (disabled by `#if`, or in a file that failed to parse).
 - **Fix:** function discovery runs on preprocessed sources. Names Frama-C still rejects are dropped once and listed in `rte_select_dropped`.
+- **Open pipeline gap:** the Frama-C kernel renames a function defined with plain `inline` (C99 semantics, no external declaration) to `<fn>__fc_inline`.
+  - `-e-acsl-functions <fn>` then aborts: `[e-acsl] User Error: incorrect argument for option -e-acsl-functions (no function 'fix_scale')`.
+  - The drop-and-retry leaves the function uninstrumented, whatever the `-std`.
+  - Seen on a supervisor fixer's fixture (branch `sup/c-ares-tf-std-flag`, 2026-11-16), not on c-ares.
+  - Proposed: map `<fn>` to `<fn>__fc_inline` in the selection, which would keep its checks.
 
 ### Symptom: Linker or Shadow Memory Conflict When Combining E-ACSL with AddressSanitizer (`-fsanitize=address`)
 - **Cause:** E-ACSL embeds its own shadow-memory runtime (`rtl`) to track byte-level pointer validity (`\valid`), initialization (`\initialized`), and sub-object bounds. AddressSanitizer (`ASan`) also maps shadow memory and intercepts `malloc`/`free`. Running both in the same binary causes immediate `mmap` collisions or false aborts.
@@ -251,3 +256,120 @@ Issues encountered in E-ACSL instrumentation (`e-acsl-gcc`, `eacsl_toolchain.py`
   - `tests/test_fuzz_keep_going.py::test_runtime_skip_cases_marker_and_c_execution` returns early when the host has neither clang nor gcc, so on a Windows host its C-execution half never runs and the test still reports as passed. It should `pytest.skip` or run in the analysis image under `FRAMAC_DOCKER_TESTS=1`.
   - The skip variable is parsed leniently: `0x10` skips case 0, `7x` skips 7, `1.5` skips 1. Only the pipeline sets it, so this is low severity.
 - **Status (2026-11-15, run-6 remediation):** **fixed** (`73a2ec2`, ledger side `769619e`). The E-ACSL engine uses the runtime skip only when its build's `environ_keep.status` is `built`; otherwise it rebuilds with `-DFRAMAC_FUZZ_SKIP_CASES` and records `keep_going.runtime_skip_unavailable`. A round whose crash is in a case it had skipped stops with `stopped: crash_in_skipped_case`, `keep_going.status: error` and an `error_summary` line; the top-level `status` still classifies the artifacts, so the crashes are ingested, and `ledger.py ingest-fuzz` adds `fuzz_keep_going_error` evidence to the module's units. Checked in `framac-analysis:latest` on a 3-case fixture with the shim disabled: rebuilds `0x1` then `0x3`, rounds crashed in cases 0 then 1, third round clean. The test whose C half never ran on a host without a compiler is split (`48330b3`): the C half runs with a host compiler or in the analysis image under `FRAMAC_DOCKER_TESTS=1`, else is skipped. Tests: `tests/test_fuzz_keep_going.py`, `tests/test_ledger.py::test_ingest_fuzz_records_keep_going_rounds_that_stopped_early`. **Open:** the lenient parse of the skip variable (`0x10`, `7x`, `1.5`); not run on QCBOR's 182-case harness.
+
+### Symptom: A Keep-Going Campaign Stops After Its First Round With `stopped: time_budget_spent`, `skipped_cases: []` and `fuzz_seconds` Far Above `max_time`
+- **Seen on:** c-ares run-1, module `libcares_a__parsers`, 2026-11-16, found while reviewing [`../plans/fuzz-budget-design.md`](../plans/fuzz-budget-design.md). The fuzz report has `sizing.max_time: 60`, `keep_going.fuzz_seconds: 182.0`, one round with `crashed_cases: [1]` and `stopped: time_budget_spent`, and `skipped_cases: []`. The log tail shows a crash while reading the seed corpus (`ReadAndExecuteSeedCorpora`) after 22 executed units, on the `inet_ntop4` `%u` false positive. The other 17 cases, fed by 690 imported DNS packets and 14 harvested seeds, were never fuzzed.
+- **Cause:** **Open pipeline bug:** `run_campaign_rounds` in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) measures `spent` around the whole `campaign()` call (around line 1993). That call is `run_fuzz_campaign`, which after libFuzzer exits also replays the crash artifacts and builds the ASan+UBSan attribution binary (`<out-bin>.sanreplay`, around lines 2569 to 2624). All of that is charged to the fuzz budget. Once `max_time - spent` is below `MIN_ROUND_WALL_S`, the loop stops before it skips the crashed case, so a crash that needs attribution can end a dispatch campaign after one round. How the 182 s split between libFuzzer, the replays and the attribution build was not measured.
+- **Fix:** none yet. Proposed: count only libFuzzer's own run time against the budget (time the sandboxed fuzzer call, not the whole of `run_fuzz_campaign`), or build the attribution binary once before the first round. Not a run-directory workaround: run-1 was only read.
+
+### Symptom: After `params set --fuzz-engine eacsl` to Undo the DAG's `sanitizers` Choice, Every Campaign Reports `engine_used: eacsl` and the Dual-Engine Split Never Runs
+- **Seen on:** c-ares run-1, all 7 modules, 2026-11-16 (`cmd-set-eacsl.sh` in the run directory). The DAG had chosen `sanitizers` for the units because of the setjmp false positive (F2 of the supervision report). The model overrode it with `--fuzz-engine eacsl`, and Phase 1 fuzzed with E-ACSL only.
+- **Cause:** **Open pipeline gap:** `eacsl` means one engine only, and `auto` is the value that keeps both (ASan+UBSan first, then E-ACSL). A recorded `auto` overrides the DAG's choice as well ([`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py), `_plan_module`: the DAG's engine applies only when `params.json` has no `fuzz_engine` for the module). `skills/framac-fuzz/SKILL.md` says that `eacsl` fuzzes with one engine only, but neither the skills nor the DAG's `fuzz_engine_reason` name `auto` as the way to undo a wrong DAG choice, and `params set --fuzz-engine eacsl` gives no warning.
+- **Fix:** none yet. Proposed in [`../plans/fuzz-budget-design.md`](../plans/fuzz-budget-design.md) (P2b): a warning from `params set --fuzz-engine eacsl` that names `auto`, and the same in the skills and the DAG's reason. In a run, use `params set --module <mod> --fuzz-engine auto`.
+
+### Symptom: libFuzzer Reports `-max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes` While the Harness Rejects Every Input Above `MAX_INPUT_SIZE` (1500)
+- **Seen on:** no run. Read in the code on 2026-11-16 while extending [`../plans/fuzz-budget-design.md`](../plans/fuzz-budget-design.md). The generated harness returns -1 for `size > MAX_INPUT_SIZE` (default 1500 in [`../../scripts/generate_harness.py`](../../scripts/generate_harness.py), 4096 for a target's own fuzzers; `harness_libcares_a__dnsrec.c` of c-ares run-1 has 1500). The campaign command in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) (`run_fuzz_campaign`) passes `-max_total_time`, `-timeout`, `-rss_limit_mb`, `-artifact_prefix`, `-print_final_stats` and, when there is one, `-dict`, but no `-max_len`.
+- **Cause:** **Open pipeline gap:** without `-max_len`, libFuzzer takes the larger of 4096 and the largest corpus file as its limit (checked in `framac-analysis:latest`, clang 19.1.7: 4096 with an empty corpus and with a 100-byte seed, 6000 with a 6000-byte seed). Inputs between the harness limit and that limit are generated, rejected and counted as executions.
+- **Cost:** none found so far.
+  - On a toy target with one 1,400-byte seed, 200,000 executions produced no input above 1,500 bytes, with and without `-max_len=1500`: libFuzzer raises its length limit slowly (`-len_control=100`).
+  - On minmea's harness (`MAX_INPUT_SIZE` 128; coverage build, the 64 seeds, 3,000,000 executions, three libFuzzer seeds, 2026-11-16): without `-max_len` the length limit had grown to 4,096 at the end (`lim: 4096`), so over-long inputs were generated. The corpus still reached 270 or 271 edges and the run took about 14 s, the same as with `-max_len=128`. minmea is saturated at that count, so this does not show the cost on a target that is still finding coverage.
+- **Fix:** none yet. Possible: pass `-max_len=<the harness's MAX_INPUT_SIZE>` from the harness sidecar.
+
+### Symptom: With `-warn-invalid-pointer`, Almost Every Input Fails an E-ACSL Build With `invalid pointer: \null ≡ format ∨ \object_pointer(format)`
+- **Seen on:** a trial on 2026-11-16 for [`../plans/fuzz-budget-design.md`](../plans/fuzz-budget-design.md) (P9), in copies of minmea run-1 and nettle run-3, Frama-C 34.0~beta in `framac-analysis:latest`. The pipeline does not pass this option to E-ACSL, so no run shows it.
+  - `minmea`: 371 of the 372 inputs that pass the normal build fail at `workspace/work/minmea.c:114` (`while (*format)` in `minmea_scan`), with `\object_pointer(format): 0` and `format` pointing to a format string literal.
+  - `libnettle_a__sha3`: 15 of 24 fail at `workspace/work/sha3-permute.c:169` on `\null ≡ &nettle_sha3_permute_rc[i] ∨ \object_pointer(...)`, a pointer into a `static const` table.
+- **Cause:** not a pipeline defect. E-ACSL's `\object_pointer` is false for a pointer to read-only static data, although the E-ACSL manual lists the predicate as supported. The program below passes for objects 0 and 1 and aborts for 2 and 3, at the object's first byte:
+
+  ```c
+  #include <stdio.h>
+
+  static const unsigned char const_table[4] = {1, 2, 3, 0};
+  static unsigned char plain_table[4] = {1, 2, 3, 0};
+
+  static int scan(const unsigned char *p) {
+    int n = 0;
+    while (*p) {
+      unsigned char v = *p++;
+      n += v;
+    }
+    return n;
+  }
+
+  int main(int argc, char **argv) {
+    unsigned char local[4] = {1, 2, 3, 0};
+    int which = argc > 1 ? argv[1][0] - '0' : 0;
+    if (which == 0) fprintf(stderr, "local array: done %d\n", scan(local));
+    if (which == 1) fprintf(stderr, "plain global array: done %d\n", scan(plain_table));
+    if (which == 2) fprintf(stderr, "static const array: done %d\n", scan(const_table));
+    if (which == 3) fprintf(stderr, "string literal: done %d\n", scan((const unsigned char *)"abc"));
+    return 0;
+  }
+  ```
+
+  - Build: `e-acsl-gcc -c -G clang -F "-rte -warn-invalid-pointer -e-acsl-full-mtracking" -e "-O1 -gline-tables-only" -o five.inst.c -O five five.c`, then `./five.e-acsl <0..3>`.
+  - A string literal alone fails the same way with gcc as the back end and without `-e-acsl-full-mtracking`.
+  - The check that fails is E-ACSL's own guard named `invalid pointer`, not the `rte/pointer_value` assertion.
+  - Why the runtime answers 0: `eacsl_object_pointer` (`share/e-acsl/observation_model/e_acsl_observation_model.c:103-107`) is built on `eacsl_valid`, which is false for a block marked read-only; `eacsl_valid_read` would be right. A direct `//@ assert \object_pointer(p);` fails the same way without `-warn-invalid-pointer`, right after `\valid_read(p)` passes. Same on master (35.0~~dev, `3dff90f`). Tail-merged literals (F11 of [`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)) are not the cause: one literal alone fails.
+- **Fix:** none. Do not add `-warn-invalid-pointer` to the E-ACSL build. Eva's `pointer_value` alarms therefore have no run-time check in Phase 1. Upstream draft, not filed: [`../upstream/frama-c/frama-c-eacsl-object-pointer-readonly-static.md`](../upstream/frama-c/frama-c-eacsl-object-pointer-readonly-static.md) (Issue 29). It has the cause, the matrix (gcc/clang, with and without full tracking, 34.0~beta and master) and a two-line runtime change checked on a copy of the runtime.
+
+### Symptom: An E-ACSL Build Stopped by MSC38-C (`<setjmp.h>`) Gets the Hint "E-ACSL encountered an unsupported ACSL construct ..."
+- **Seen on:** the `<setjmp.h>` probe of the c-ares run-1 setjmp investigation, 2026-11-16 (`run_eacsl_fuzz.py build --engine eacsl` on a source that only includes `<setjmp.h>`, in `framac-analysis:latest`). The log has `[kernel:CERT:MSC:38] /usr/include/setjmp.h:36: User Error: Attempt to declare setjmp as external identifier outside of the stdlib ...` and `e-acsl-gcc: fatal error: aborted by Frama-C`, yet `diagnostic_hints` advises rewriting axiomatic logic functions or struct comparisons.
+- **Cause:** not diagnosed. The hint matcher apparently keys on the generic Frama-C abort, not on the kernel error.
+- **Fix:** none yet. **Open pipeline bug:** the hint should name the MSC38-C setjmp declaration and say the unit is fuzzed with the sanitizers (`build_callgraph_dag.route_nonlocal_jumps`).
+
+### Symptom: `\valid_read(charset + j)` Fails at `j: 1` in `ares_buf_consume_until_charset` (`ares_buf.c:980`) on Every Input, Before the Input Is Read
+- **Seen on:** c-ares run-1, 2026-11-16, Phase 1 ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)). Fingerprint `src/lib/str/ares_buf.c#ares_buf_consume_until_charset::mem_access::32e8ca0441`.
+  - `ahost`, `adig` and `tf_ares-test-fuzz-name` crash on the empty input (`crash-da39a3ee...`), so these three campaigns never ran past init.
+  - `libcares_a__channel` hits it on some inputs only.
+  - Stack: `ares_buf_split` <- `ares_sconfig_append_fromstr` <- `ares_sysconfig_parse_resolv_line` <- ... <- `ares_init_options`, reading the container's `/etc/resolv.conf`.
+- **Cause:** upstream E-ACSL combined with clang. It is not a pipeline function-selection bug: the caller is instrumented, and `" ,"` is registered.
+  1. Under `-e-acsl-full-mtracking`, E-ACSL never turns string literals into named arrays. `memory_tracking.ml` does that only in `Varinfos.add`. Each literal is registered as its own block and printed as a literal.
+  2. clang ignores `-fno-merge-constants` and emits literals in `.rodata.str1.1` (`AMS`).
+  3. GNU ld then stores `","` inside `" ,"`.
+  4. `","` is registered after `" ,"` in `__e_acsl_globals_init`, so the shared bytes leave the block of `" ,"`.
+  5. `\valid_read(" ," + 1)` then fails the segment model's same-block check.
+  - Reproduced with a 15-line fixture on 34.0~beta and on master (35.0~~dev, `3dff90f`). Builds with gcc, and builds without full tracking, are clean.
+  - Upstream draft: `docs/upstream/frama-c/frama-c-eacsl-full-mtracking-tail-merged-literals.md`, not part of the merge (the branch dropped its copy in `06c4736`); it is kept as an uncommitted draft. It is related to Issue 10 but is not a duplicate.
+- **Fix:** commit `078e336`, from branch `sup/c-ares-eacsl-literal-charset`, fixed and merged into `phase1-remediation` (2026-11-16).
+  - `order_literal_registrations` in [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py) registers literals by ascending block size, so the enclosing literal is the last to write the shared bytes.
+  - It is applied in `compile_eacsl_binary` in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) and recorded as `compile.literal_registrations_reordered`.
+  - Tests:
+    - `tests/test_eacsl_toolchain.py::test_order_literal_registrations_*`
+    - `tests/test_eacsl_toolchain.py::test_tail_merged_string_literals_do_not_fail_valid_read_in_the_analysis_image` (needs `FRAMAC_DOCKER_TESTS=1`)
+  - Checked on a relink of run-1's `ahost`: the empty input gets past init, then stops at the `inet_ntop4` format false positive (next entry).
+  - Run-1's fuzz results for these four modules are stale. Rebuild them with a checkout that has both fixes (this one and the format fix in the next entry, both now merged).
+- **Still open:**
+  - The reorder accepts a false negative: a read just before a merged suffix, but inside the enclosing literal, is not reported, and the suffix's `\base_addr`, `\offset` and `\block_length` are those of the enclosing literal. The upstream fix (demoting literals under full tracking) would remove it.
+  - The Crash Verifier brief never names `toolchain_artifact`. A reproducible E-ACSL tool false positive can then be confirmed, or rejected as `harness_induced`, which triggers useless harness repairs (`wp_scheduler.py` `_ensure_repair`). Fixed and merged into `phase1-remediation` (2026-11-16), from branch `sup/c-ares-verifier-toolchain-artifact` (`fca3aa6`, `66166bd`); see [`./ledger-and-verifier.md`](./ledger-and-verifier.md).
+
+### Symptom: Every Input That Formats a Byte With `%u`/`%x` Stops the Campaign With `snprintf: directive 1 ('%u') expects argument of type 'unsigned int' but the corresponding argument has type 'int'`
+- **Seen on:** c-ares run-1, 2026-11-16, Phase 1 ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)).
+  - `libcares_a__parsers` produced 6 artifacts and `tf_ares-test-fuzz` 20, all with fingerprint `unknown#inet_ntop4::eacsl_format_error::1f30ebf225` (`file` `unknown`, line 0).
+  - The caller is `inet_ntop4`: `snprintf(tmp, sizeof(tmp), fmt, src[0], ...)`, with `static const char fmt[] = "%u.%u.%u.%u"` and `const unsigned char *src`.
+- **Cause:** E-ACSL's runtime is stricter than C; this is an upstream bug.
+  - **Exact type match:** with `--validate-format-strings` (`EACSL_GCC_CHECK_OPTIONS`, adopted 2026-11-14), `validate_format_type` in `share/e-acsl/libc_replacements/e_acsl_stdio.c` requires the directive's type to equal the argument's static type after promotion.
+  - **What aborts:** a promoted `unsigned char` or `unsigned short` is an `int`, so `%u`, `%x` and `%o` abort on every call. `%d` with a small `unsigned int` aborts too. The runtime sees only static types, so the message is identical for `-1` and for `7`.
+  - **What C allows:** C11 7.16.1.1p2 lets `va_arg` read the type of the other signedness when the value fits both types; 7.21.6.1p9 alone reads stricter. gcc and clang `-Wformat` do not warn, and glibc prints the right value.
+  - **Effect:** a tool false positive that also blinds the fuzzer. In fork mode, every input reaching the call aborts there, so the code after it is never reached.
+  - **Second defect in the same function:** arguments are collected with `va_arg(ap, void *)`, so a `%s`, `%p` or `%n` after a `double` or `long double` reads the wrong slot. This gives `attempt to access unallocated memory via directive 2 ('%s')` or `unterminated string in directive 2 ('%s')`.
+  - **Upstream draft:** `docs/upstream/frama-c/frama-c-eacsl-format-promoted-argument-signedness.md`, not part of the merge (the branch dropped its copy in `75b1cc9`); it is kept as an uncommitted draft. Make it a link once it is committed.
+- **Fix:** commits `e66a68c` and `99a6871`, from branch `sup/c-ares-eacsl-format-promotion`, fixed and merged into `phase1-remediation` (2026-11-16). It ships a patched copy of an upstream runtime.
+  - **Patched runtime:** stage 2 compiles the runtime from a run-local patched copy of the E-ACSL share directory, passed with `e-acsl-gcc --e-acsl-share` (`eacsl_toolchain.prepare_patched_eacsl_share`, patch `format-runtime-1`). The image is never written.
+  - **What the copy accepts:** an `int`/`unsigned int`, `long`/`unsigned long` or `long long`/`unsigned long long` pair whose value fits both types. It also reads `double` and `long double` arguments with their own types.
+  - **What still aborts:** negative or out-of-range values. They now carry `format_mismatch: "signedness"`, and nothing is dismissed automatically.
+  - **Recorded outcome:** in `compile.runtime_patches.format_runtime`. On `not_applied` (share not found, anchor moved, patched file does not compile), the build uses the image's runtime and the false positive remains.
+  - **Tests:** `tests/test_eacsl_format_signedness.py`, including a Docker probe of 15 cases built with and without the patch.
+- **Run-1 consequence:** its binaries keep the unpatched runtime. Its 26 `inet_ntop4` artifacts are this false positive and should not be verified as findings.
+- **Workaround on an unfixed checkout:** `pipeline_make.py params set --module <mod> --no-fuzz-libc-checks`, recorded as `-no-libc-checks`. This also drops the libc buffer checks.
+- **Not a pipeline defect:** without `-e-acsl-full-mtracking`, a literal format string aborts as `invalid format string (unallocated or unterminated)`. This is upstream and not analysed; the pipeline always uses full tracking.
+- **Phase 3 guardrail consequence (c-ares run-1, 2026-11-16, prover `negotiate-config_defaults` on `src/tools/adig.c#config_defaults`):** the same false positive makes the Dual-Oracle guardrail unusable for module `adig`, not only the Phase 1 campaigns.
+  - The brief's guardrail command for the module ends with `status: "guardrail_error"`, `reason: "A check failed outside the checked functions (E-ACSL eacsl_format_error: printf: directive expects argument of type 'unsigned int' but the corresponding argument has type 'int' at unknown:0 in print_header) on an input that cannot be dropped (not a replayed corpus file)"`, `crash_input: agents/<agent>/scratch/guard/crash-da39a3ee...`, and `reach.functions.config_defaults: 0`.
+  - `print_header` in `adig.c` formats a `uint16_t` with `%u`, so the libc replacement aborts on every input the harness replays (the 33-file corpus and every mutation); the checked function is never reached, and the crash comes from a fresh mutation, so it is not an excludable corpus input.
+  - **Workaround measured on the unfixed checkout:** add `--no-libc-checks` to the same `run_eacsl_fuzz.py guardrail` command (out-bin, scratch-dir and out-json pointed at separate names). With it the guardrail returns `passed_dynamic_oracle`, `reduced_checks: ["-no-libc-checks"]`, 100 executed inputs, `reach.functions.config_defaults: 39`, no excluded input. `config_defaults` calls no libc formatting function, so dropping the libc replacement checks does not weaken the check of that contract.
+  - **Open pipeline bug:** the prover brief builds the guardrail command from the module's sources and cppflags only. It does not carry the `-no-libc-checks` a run records with `pipeline_make.py params set --module <mod> --no-fuzz-libc-checks`, so every prover of a module with a `%u`/`%x` call site has to add the flag by hand and explain it, and the parent's post-merge re-check rebuilds the flagless command and hits the same `guardrail_error`.
+
+### Symptom: A Campaign Records Sanitizer Artifacts With `"failure": null`, `"frames": []` and `"reproducible": false`, and Replaying Them Exits 0
+- **Seen on:** c-ares run-1, 2026-11-16, module `adig`, Adversarial Breaker `breaker-free_config` (`agents/breaker-free_config/scratch/campaign.json`, 8 seed inputs, `--workers 2 --max-time 60`). The sanitizer round reports `"sanitizers": {"status": "crash_found", "artifacts": 2}` and lists `crashes/crash-729edfc4b0b7a6855ef9af2111aba9e5fcf30c9a` (63 bytes) and `crashes/crash-9ae1a4de4219375259c0882029624c4b217360c8` (8 bytes), both with `failure: null`, `fingerprint: null`, `frames: []`, `reproducible: false`. Their `replay_log_tail` shows a normal run and `Executed ... in 4 ms` with no sanitizer report, and re-running the same inputs by hand on the same binary prints the adig usage text and exits 0 (their C string form is `"+"` and `"u:u://.."`, both handled by `read_cmdline`).
+- **Cause:** not diagnosed; **Open pipeline gap:** the recorded artifacts carry no failing predicate at all, so nothing says which sanitizer check fired, in which function, on which input. Only the campaign's `log_tail` is kept (a few hundred lines, most of it target stdout), and it holds just the last round's tail, not the find-time report of the two artifacts. A breaker therefore cannot tell a real sanitizer crash from a fork-mode artefact or a stale binary, and `run_eacsl_fuzz.py replay` answers `not_reproduced` without a predicate.
+- **Fix:** not implemented. Suggested: keep the find-time per-artifact sanitizer log (e.g. `<out-bin>.<artifact-sha256>.sanlog`) next to the artifact and record the parsed `failure` in the campaign report before attribution replay; when attribution replay yields no failure, mark the artifact `"attribution": "none"` instead of `"kind": "crash"` with a null `failure`. A breaker brief should then be able to ignore unattributed artifacts explicitly. Related symptoms: "One Defect Gets Different Fingerprints ... Reports `not_reproduced`" above and the `.sanreplay` masked-binary entry next to it.

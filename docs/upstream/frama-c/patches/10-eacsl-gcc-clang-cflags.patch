@@ -1,0 +1,60 @@
+From 10e7b112b5934efb59a7c806e150f8fa4c7a3b52 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:50:20 +0100
+Subject: [PATCH] [e-acsl] e-acsl-gcc: with -G clang, append to CFLAGS instead
+ of replacing it
+
+The clang-specific block of e-acsl-gcc assigned CFLAGS instead of
+appending to it, so with -G clang both the original and the instrumented
+program were compiled without -std=c99, -m<bits>, the optimization and
+debug flags (-g -O2, or -g3 -O0 -fno-omit-frame-pointer with --rt-debug),
+-fno-builtin -fno-merge-constants and the warning settings. The
+--rt-debug backtrace was empty, --mbits never reached the compiler, and
+clang printed more than a hundred warnings on an empty main. With --validate-format-strings, the
+runtime did not even build, since clang 16 and later reject the
+implicit declarations in e_acsl_stdio.c that
+-Wno-implicit-function-declaration normally hides.
+
+Append the clang-only warning flags to CFLAGS.
+
+This depends on the previous commit (-D_DEFAULT_SOURCE in CFLAGS):
+today, clang builds of programs calling POSIX functions such as strdup
+only work because -std=c99 is dropped. Restoring -std=c99 without
+-D_DEFAULT_SOURCE breaks them, as it already breaks them with gcc.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/doc/Changelog      | 3 +++
+ plugins/e-acsl/scripts/e-acsl-gcc | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/e-acsl/doc/Changelog b/plugins/e-acsl/doc/Changelog
+index a854e8f1db..60e07964eb 100644
+--- a/plugins/e-acsl/doc/Changelog
++++ b/plugins/e-acsl/doc/Changelog
+@@ -25,6 +25,9 @@
+ Plugin E-ACSL <next-release>
+ ###############################################################################
+ 
++-* e-acsl-gcc [2026-11-15] With -G clang, keep the default compiler flags
++                           (-std=c99, -m<bits>, -g -O2 or the --rt-debug
++                           flags, warnings) instead of overwriting them
+ -* e-acsl-gcc [2026-11-15] Compile with -D_DEFAULT_SOURCE, as Frama-C
+                            preprocesses, so that POSIX functions such as
+                            strdup are declared
+diff --git a/plugins/e-acsl/scripts/e-acsl-gcc b/plugins/e-acsl/scripts/e-acsl-gcc
+index 4e51de1d14..15d35dd4ca 100755
+--- a/plugins/e-acsl/scripts/e-acsl-gcc
++++ b/plugins/e-acsl/scripts/e-acsl-gcc
+@@ -909,7 +909,7 @@ CFLAGS="$OPTION_CFLAGS
+ 
+ # Disable extra warning for clang
+ if [ "`basename $CC`" = 'clang' ]; then
+-  CFLAGS="-Wno-unknown-warning-option \
++  CFLAGS="$CFLAGS -Wno-unknown-warning-option \
+     -Wno-extra-semi \
+     -Wno-tautological-compare \
+     -Wno-gnu-empty-struct \
+-- 
+2.56.0.windows.4
+

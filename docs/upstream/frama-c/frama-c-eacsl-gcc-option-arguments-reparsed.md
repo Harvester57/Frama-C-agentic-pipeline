@@ -1,6 +1,10 @@
 # e-acsl-gcc: option arguments are re-parsed as options (`-e "-g"` enables GMP and drops an input file, `-E "-I dir"` loses every input)
 
+**Filed upstream on 2026-11-15:** issue [#2807](https://git.frama-c.com/pub/frama-c/-/work_items/2807), merge request [!38](https://git.frama-c.com/pub/frama-c/-/merge_requests/38).
+
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
+
+**Filing package:** [issue](./filing/01-eacsl-gcc-option-arguments-reparsed-issue.md), [MR](./filing/01-eacsl-gcc-option-arguments-reparsed-mr.md), [reproducer](./repro/01-eacsl-gcc-option-arguments-reparsed.sh), [patch](./patches/01-eacsl-gcc-option-arguments-reparsed.patch)
 
 ## Summary
 
@@ -25,10 +29,10 @@ problem. Arguments containing spaces (include paths with spaces) cannot be passe
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02), on
-  Debian 13 (bash 5.2, util-linux `getopt`).
-- `plugins/e-acsl/scripts/e-acsl-gcc` is byte-identical in `34.0~~dev (Selenium)`. The bug was
-  first seen with 33.0.
+- Reproduced on 2026-11-15 with Frama-C `35.0~~dev (Bromine)`, `master` at `3dff90fc70`
+  (2026-11-13), and with `34.0~beta (Selenium)`: same output on both, Debian 13 (bash 5.2,
+  util-linux `getopt`) ([reproducer](./repro/01-eacsl-gcc-option-arguments-reparsed.sh)).
+- First seen with 33.0, then on `master` `ad24dca` (2026-11-02).
 
 ## Reproduction
 
@@ -64,7 +68,15 @@ Trace of the second command. After `getopt`, the positional parameters are
 `t.instrumented.c` and `-e` normally, then visits `-g` (taken from inside the `-e` argument). That
 sets `OPTION_GMP` and shifts `--` away. The line 814 `shift` then drops `t1.c`.
 
-## Proposed fix
+## Fix (patch)
+
+[`patches/01-eacsl-gcc-option-arguments-reparsed.patch`](./patches/01-eacsl-gcc-option-arguments-reparsed.patch),
+one commit on `fix/eacsl-gcc-option-arguments` from `3dff90fc70`, "[e-acsl] e-acsl-gcc: do not read
+the words of option arguments as options". It contains the script change below, a regression test
+`plugins/e-acsl/tests/special/e-acsl-gcc-option-arguments.c` whose `dev` run passes `-e -g` to
+`e-acsl-gcc` (on `master` it fails with `no input files`), the test's default-configuration
+oracles, and a Changelog entry. The 56 option branches all shift their option (checked against
+`SHORTOPTIONS` and `LONGOPTIONS`).
 
 Loop on the positional parameters themselves. Each branch already shifts its own option and
 argument, so nothing else changes. `--` ends the loop, and the trailing `shift` goes away.
@@ -79,8 +91,8 @@ argument, so nothing else changes. `--` ends the loop, and the trailing `shift` 
 -# Switch statements for other options
 -for i in $@
 +# Switch statements for other options. Loop on the positional parameters
-+# themselves: each branch shifts its option (and argument), so option
-+# arguments are never re-read as options.
++# themselves: each branch shifts its option (and its argument), so the words
++# of an option argument are never read again as options.
 +while [ $# -gt 0 ]
  do
 -  case "$i" in
@@ -111,9 +123,27 @@ argument, so nothing else changes. `--` ends the loop, and the trailing `shift` 
 The `*)` branch should never be reached, because `getopt` puts every non-option after `--`. It
 protects the `while` loop from spinning forever if a future branch forgets to shift.
 
-## Validation of the proposed fix
+## Validation
 
-Patched script on `ad24dca`, same container:
+Validated on 2026-11-15: patch built over `framac-master-audit:3dff90f` (master `3dff90fc70`) and
+installed. `main.c` needs `inc/value.h`, `helper.c` defines `helper`:
+
+| Invocation | `master` `3dff90fc70` | Patched |
+|---|---|---|
+| `-n -E -Iinc -e "-g -O1" -o a.c main.c helper.c` | Frama-C gets `helper.c … -e-acsl-O-gmp-only … -ocode --`, aborts | Frama-C gets `main.c helper.c`, no GMP, `-ocode a.c` |
+| `-n -o a.c -e "-g -O1" helper.c main.c` (here `main.c` has no include) | exit 0, Frama-C gets `main.c` only, with `-e-acsl-O-gmp-only` | exit 0, `helper.c main.c`, no GMP; `helper` in `a.c` |
+| `-n -E "-I inc" -o b.c main.c` | `no input files` | builds |
+| `-E -Iinc -e -Iinc -l "-L /usr/lib -lm" -o c.c -O c main.c` | `no input files` | builds and links; `c.e-acsl` exits 0 |
+| New test `special/e-acsl-gcc-option-arguments.c`, `dev` run (`-e -g`) | `no input files` | pass |
+| ptests `plugins/e-acsl/tests`, `dev` configuration (196 tests, each through `e-acsl-gcc`) | — | all pass |
+| ptests `special`, default configuration | — | pass; only the new oracles added |
+| `34.0~beta (Selenium)` | same as `master` | — |
+
+`git diff --check` is clean except for the final empty line of the generated `gen_*.0.c` oracle.
+`clang-format-19 --dry-run` passes on the test file. `make check-lint` / `make check-headers` were
+not run (no `ocp-indent` or `headache` in the image).
+
+Earlier validation of the same script change on `ad24dca`:
 
 | Invocation | `master` | Patched |
 |---|---|---|
@@ -124,9 +154,6 @@ Patched script on `ad24dca`, same container:
 | `-X --oexec-e-acsl=t_inst --zone-sizes=heap:128 -D … t2.c` | — | builds; `t_inst` runs, exit 0 |
 | `--frama-c-extra=… --ocode=t4.c --oexec=t4 t1.c t2.c` | — | builds `t4` and `t4.e-acsl` from both files |
 | `-n -o t5.c` (no input file) | `no input files` | `no input files` (unchanged) |
-
-The E-ACSL test suite in its `dev` configuration, which runs `e-acsl-gcc` on every test, is
-covered in the [validation summary](./frama-c-e-acsl-issues.md#validation-of-the-proposed-fixes).
 
 ## Workaround
 

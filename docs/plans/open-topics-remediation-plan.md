@@ -190,6 +190,8 @@ Two more rules for this plan:
 
 ### O8. Upstream drafts (P2, M)
 
+- **Done 2026-11-15.** All five are drafted with validated patches on upstream `master` `3dff90fc70`. They became Issues 20 to 27, not 15 to 17 (those numbers were taken), and the `static const` union turned out to be the same bug as Issue 27. Index: [`../upstream/frama-c/README.md`](../upstream/frama-c/README.md). Filing stays the user's decision.
+
 - **Goal:** each Frama-C or E-ACSL bug the pipeline works around or degrades for has a draft with a minimal reproduction, so it can be filed and the workaround removed later.
 - **Drafts** (the reproductions of 2026-11-09 were not kept; re-create each in `framac-analysis:latest`):
   - **E-ACSL:** `-e-acsl-full-mtracking` aborts on a `register` local (`Cil.mkAddrOf`). Workaround: `-Dregister=` in the E-ACSL frontend.

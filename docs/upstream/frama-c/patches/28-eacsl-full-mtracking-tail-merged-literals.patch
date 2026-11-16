@@ -1,0 +1,1160 @@
+From 8d252bf9cf4ac27651eab27f53de08853002cff3 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 16 Nov 2026 13:17:40 +0100
+Subject: [PATCH] [e-acsl] demote the string literals registered under full
+ memory tracking
+
+With -e-acsl-full-mtracking, every global is registered as a block in
+__e_acsl_globals_init, including the variables that represent string
+literals. The memory tracking analysis, which demotes the literals that it
+monitors to named arrays, is not used in that mode, so the literals stayed
+literals and were printed as such, both in the registration and where they
+are used. Their storage then depends on the compiler and the linker: clang
+puts literals in a mergeable section, and GNU ld stores "," at the end of
+" ,". The two registered blocks overlap, and \valid_read(" ," + 1) fails on
+correct code.
+
+Under full tracking, demote every registered string literal before the
+injection. Demoting them one by one with Demote_string_literal.demote costs
+one traversal of the AST per literal (98 s instead of 2 s for a file with
+4000 literals), so add Demote_string_literal.demote_list, which demotes a
+list of literals in one traversal and marks the AST as changed once.
+
+Regression test: tests/full-mtracking/literal_strings.c. The tests compile
+with gcc and -fno-merge-constants, so the run-time failure does not show
+there; the generated code shows the literals as named arrays. The oracles
+of concurrency/parallel_threads.c and concurrency/threads_debug.c, which
+run with full tracking, change accordingly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/src/code_generator/injector.ml |  19 +
+ .../oracle/gen_parallel_threads.0.c           | 163 +++---
+ .../concurrency/oracle/gen_threads_debug.0.c  | 134 +++--
+ .../tests/full-mtracking/literal_strings.c    |  25 +
+ .../oracle/gen_literal_strings.0.c            | 467 ++++++++++++++++++
+ .../oracle/literal_strings.0.res.oracle       |  16 +
+ .../demote_string_literal.ml                  |  26 +-
+ .../demote_string_literal.mli                 |   8 +
+ 8 files changed, 704 insertions(+), 154 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/full-mtracking/literal_strings.c
+ create mode 100644 plugins/e-acsl/tests/full-mtracking/oracle/gen_literal_strings.0.c
+ create mode 100644 plugins/e-acsl/tests/full-mtracking/oracle/literal_strings.0.res.oracle
+
+diff --git a/plugins/e-acsl/src/code_generator/injector.ml b/plugins/e-acsl/src/code_generator/injector.ml
+index 8a6c712fc5..64d5466e19 100644
+--- a/plugins/e-acsl/src/code_generator/injector.ml
++++ b/plugins/e-acsl/src/code_generator/injector.ml
+@@ -847,7 +847,26 @@ let inject_mtracking_handler main =
+     Option.iter handle_main main
+   end
+ 
++(* With -e-acsl-full-mtracking, every global is registered as a block,
++   including the variables that represent string literals. A registered
++   literal must be printed as a variable of its own, not as a literal: two
++   literals may share their storage (a linker may store a literal at the end
++   of a longer one), and their registered blocks would then overlap. Without
++   full tracking, the memory tracking analysis demotes the literals that it
++   monitors. *)
++let demote_monitored_string_literals file =
++  if Options.Full_mtracking.get () then
++    Demote_string_literal.demote_list
++      (List.filter_map
++         (function
++           | GVar (vi, _, _)
++             when Ast_info.is_string_literal vi
++               && Memory_tracking.must_monitor_vi vi -> Some vi
++           | _ -> None)
++         file.globals)
++
+ let inject_in_file file =
++  demote_monitored_string_literals file;
+   let main =
+     List.fold_left inject_in_global None file.globals
+   in
+diff --git a/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c b/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c
+index f67b2cd453..36127a16ca 100644
+--- a/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c
++++ b/plugins/e-acsl/tests/concurrency/oracle/gen_parallel_threads.0.c
+@@ -141,6 +141,11 @@ pthread_cond_t write_cond;
+ pthread_cond_t read_cond;
+ pthread_mutex_t write_mutex;
+ pthread_mutex_t read_mutex;
++char const __fc_lit_string1[38UL] = "Unable to lock mutex in write_value()";
++char const __fc_lit_string2[43UL] =
++  "Unable to wait on condvar in write_value()";
++char const __fc_lit_string3[40UL] =
++  "Unable to unlock mutex in write_value()";
+ /*@ ensures
+       \let idx = *((int *)\old(arg));
+       \valid(values[idx]) && \initialized(values[idx]);
+@@ -161,20 +166,20 @@ void *write_value(void *arg)
+   __e_acsl_full_init((void *)(& tmp));
+   tmp = __gen_e_acsl_pthread_mutex_lock(& write_mutex);
+   if (tmp != 0) {
+-    __gen_e_acsl_perror("Unable to lock mutex in write_value()");
++    __gen_e_acsl_perror(__fc_lit_string1);
+     __gen_e_acsl_exit(1);
+   }
+   write_count ++;
+   __e_acsl_full_init((void *)(& tmp_0));
+   tmp_0 = __gen_e_acsl_pthread_cond_wait(& write_cond,& write_mutex);
+   if (tmp_0 != 0) {
+-    __gen_e_acsl_perror("Unable to wait on condvar in write_value()");
++    __gen_e_acsl_perror(__fc_lit_string2);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_1));
+   tmp_1 = __gen_e_acsl_pthread_mutex_unlock(& write_mutex);
+   if (tmp_1 != 0) {
+-    __gen_e_acsl_perror("Unable to unlock mutex in write_value()");
++    __gen_e_acsl_perror(__fc_lit_string3);
+     __gen_e_acsl_exit(1);
+   }
+   __gen_e_acsl_usleep(100U);
+@@ -196,6 +201,10 @@ void *write_value(void *arg)
+   return __retres;
+ }
+ 
++char const __fc_lit_string4[37UL] = "Unable to lock mutex in read_value()";
++char const __fc_lit_string5[42UL] =
++  "Unable to wait on condvar in read_value()";
++char const __fc_lit_string6[39UL] = "Unable to unlock mutex in read_value()";
+ /*@ requires
+       !(\let idx = *((int *)arg);
+         \valid_read(values[idx]) && \initialized(values[idx]));
+@@ -216,20 +225,20 @@ void *read_value(void *arg)
+   __e_acsl_full_init((void *)(& tmp));
+   tmp = __gen_e_acsl_pthread_mutex_lock(& read_mutex);
+   if (tmp != 0) {
+-    __gen_e_acsl_perror("Unable to lock mutex in read_value()");
++    __gen_e_acsl_perror(__fc_lit_string4);
+     __gen_e_acsl_exit(1);
+   }
+   read_count ++;
+   __e_acsl_full_init((void *)(& tmp_0));
+   tmp_0 = __gen_e_acsl_pthread_cond_wait(& read_cond,& read_mutex);
+   if (tmp_0 != 0) {
+-    __gen_e_acsl_perror("Unable to wait on condvar in read_value()");
++    __gen_e_acsl_perror(__fc_lit_string5);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_1));
+   tmp_1 = __gen_e_acsl_pthread_mutex_unlock(& read_mutex);
+   if (tmp_1 != 0) {
+-    __gen_e_acsl_perror("Unable to unlock mutex in read_value()");
++    __gen_e_acsl_perror(__fc_lit_string6);
+     __gen_e_acsl_exit(1);
+   }
+   __gen_e_acsl_usleep(100U);
+@@ -519,6 +528,14 @@ void *read_value(void *arg)
+   return __retres;
+ }
+ 
++char const __fc_lit_string7[33UL] = "Unable to initialize write mutex";
++char const __fc_lit_string8[36UL] = "Unable to initialize write cond var";
++char const __fc_lit_string9[32UL] = "Unable to initialize read mutex";
++char const __fc_lit_string10[35UL] = "Unable to initialize read cond var";
++char const __fc_lit_string11[27UL] = "Unable to lock write_mutex";
++char const __fc_lit_string12[26UL] = "Unable to lock read_mutex";
++char const __fc_lit_string13[38UL] = "Unable to broadcast to write cond var";
++char const __fc_lit_string14[37UL] = "Unable to broadcast to read cond var";
+ /*@ requires
+       !(\let idx = *((int *)arg);
+         \valid_read(values[idx]) && \initialized(values[idx]));
+@@ -2269,54 +2286,48 @@ void __e_acsl_globals_init(void)
+   static char __e_acsl_already_run = 0;
+   if (! __e_acsl_already_run) {
+     __e_acsl_already_run = 1;
+-    __e_acsl_store_block((void *)"Unable to broadcast to read cond var",37UL);
+-    __e_acsl_full_init((void *)(& "Unable to broadcast to read cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to broadcast to read cond var");
+-    __e_acsl_store_block((void *)"Unable to broadcast to write cond var",
+-                         38UL);
+-    __e_acsl_full_init((void *)(& "Unable to broadcast to write cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to broadcast to write cond var");
+-    __e_acsl_store_block((void *)"Unable to lock read_mutex",26UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock read_mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock read_mutex");
+-    __e_acsl_store_block((void *)"Unable to lock write_mutex",27UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock write_mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock write_mutex");
+-    __e_acsl_store_block((void *)"Unable to initialize read cond var",35UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize read cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize read cond var");
+-    __e_acsl_store_block((void *)"Unable to initialize read mutex",32UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize read mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize read mutex");
+-    __e_acsl_store_block((void *)"Unable to initialize write cond var",36UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize write cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize write cond var");
+-    __e_acsl_store_block((void *)"Unable to initialize write mutex",33UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize write mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize write mutex");
+-    __e_acsl_store_block((void *)"Unable to unlock mutex in read_value()",
+-                         39UL);
+-    __e_acsl_full_init((void *)(& "Unable to unlock mutex in read_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to unlock mutex in read_value()");
+-    __e_acsl_store_block((void *)"Unable to wait on condvar in read_value()",
+-                         42UL);
+-    __e_acsl_full_init((void *)(& "Unable to wait on condvar in read_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to wait on condvar in read_value()");
+-    __e_acsl_store_block((void *)"Unable to lock mutex in read_value()",37UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock mutex in read_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock mutex in read_value()");
+-    __e_acsl_store_block((void *)"Unable to unlock mutex in write_value()",
+-                         40UL);
+-    __e_acsl_full_init((void *)(& "Unable to unlock mutex in write_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to unlock mutex in write_value()");
+-    __e_acsl_store_block((void *)"Unable to wait on condvar in write_value()",
+-                         43UL);
+-    __e_acsl_full_init((void *)(& "Unable to wait on condvar in write_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to wait on condvar in write_value()");
+-    __e_acsl_store_block((void *)"Unable to lock mutex in write_value()",
+-                         38UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock mutex in write_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock mutex in write_value()");
++    __e_acsl_store_block((void *)(__fc_lit_string14),37UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string14));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string14));
++    __e_acsl_store_block((void *)(__fc_lit_string13),38UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string13));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string13));
++    __e_acsl_store_block((void *)(__fc_lit_string12),26UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string12));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string12));
++    __e_acsl_store_block((void *)(__fc_lit_string11),27UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string11));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string11));
++    __e_acsl_store_block((void *)(__fc_lit_string10),35UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string10));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string10));
++    __e_acsl_store_block((void *)(__fc_lit_string9),32UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string9));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string9));
++    __e_acsl_store_block((void *)(__fc_lit_string8),36UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string8));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string8));
++    __e_acsl_store_block((void *)(__fc_lit_string7),33UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string7));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string7));
++    __e_acsl_store_block((void *)(__fc_lit_string6),39UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string6));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string6));
++    __e_acsl_store_block((void *)(__fc_lit_string5),42UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string5));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string5));
++    __e_acsl_store_block((void *)(__fc_lit_string4),37UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string4));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string4));
++    __e_acsl_store_block((void *)(__fc_lit_string3),40UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string3));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string3));
++    __e_acsl_store_block((void *)(__fc_lit_string2),43UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string2));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string2));
++    __e_acsl_store_block((void *)(__fc_lit_string1),38UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
+     __e_acsl_store_block((void *)(& read_mutex),4UL);
+     __e_acsl_full_init((void *)(& read_mutex));
+     __e_acsl_store_block((void *)(& write_mutex),4UL);
+@@ -2339,20 +2350,20 @@ void __e_acsl_globals_init(void)
+ 
+ void __e_acsl_globals_clean(void)
+ {
+-  __e_acsl_delete_block((void *)"Unable to broadcast to read cond var");
+-  __e_acsl_delete_block((void *)"Unable to broadcast to write cond var");
+-  __e_acsl_delete_block((void *)"Unable to lock read_mutex");
+-  __e_acsl_delete_block((void *)"Unable to lock write_mutex");
+-  __e_acsl_delete_block((void *)"Unable to initialize read cond var");
+-  __e_acsl_delete_block((void *)"Unable to initialize read mutex");
+-  __e_acsl_delete_block((void *)"Unable to initialize write cond var");
+-  __e_acsl_delete_block((void *)"Unable to initialize write mutex");
+-  __e_acsl_delete_block((void *)"Unable to unlock mutex in read_value()");
+-  __e_acsl_delete_block((void *)"Unable to wait on condvar in read_value()");
+-  __e_acsl_delete_block((void *)"Unable to lock mutex in read_value()");
+-  __e_acsl_delete_block((void *)"Unable to unlock mutex in write_value()");
+-  __e_acsl_delete_block((void *)"Unable to wait on condvar in write_value()");
+-  __e_acsl_delete_block((void *)"Unable to lock mutex in write_value()");
++  __e_acsl_delete_block((void *)(__fc_lit_string14));
++  __e_acsl_delete_block((void *)(__fc_lit_string13));
++  __e_acsl_delete_block((void *)(__fc_lit_string12));
++  __e_acsl_delete_block((void *)(__fc_lit_string11));
++  __e_acsl_delete_block((void *)(__fc_lit_string10));
++  __e_acsl_delete_block((void *)(__fc_lit_string9));
++  __e_acsl_delete_block((void *)(__fc_lit_string8));
++  __e_acsl_delete_block((void *)(__fc_lit_string7));
++  __e_acsl_delete_block((void *)(__fc_lit_string6));
++  __e_acsl_delete_block((void *)(__fc_lit_string5));
++  __e_acsl_delete_block((void *)(__fc_lit_string4));
++  __e_acsl_delete_block((void *)(__fc_lit_string3));
++  __e_acsl_delete_block((void *)(__fc_lit_string2));
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
+   __e_acsl_delete_block((void *)(& read_mutex));
+   __e_acsl_delete_block((void *)(& write_mutex));
+   __e_acsl_delete_block((void *)(& read_cond));
+@@ -2392,28 +2403,28 @@ int main(void)
+   tmp = __gen_e_acsl_pthread_mutex_init(& write_mutex,
+                                         (pthread_mutexattr_t const *)0);
+   if (tmp != 0) {
+-    __gen_e_acsl_perror("Unable to initialize write mutex");
++    __gen_e_acsl_perror(__fc_lit_string7);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_0));
+   tmp_0 = __gen_e_acsl_pthread_cond_init(& write_cond,
+                                          (pthread_condattr_t const *)0);
+   if (tmp_0 != 0) {
+-    __gen_e_acsl_perror("Unable to initialize write cond var");
++    __gen_e_acsl_perror(__fc_lit_string8);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_1));
+   tmp_1 = __gen_e_acsl_pthread_mutex_init(& read_mutex,
+                                           (pthread_mutexattr_t const *)0);
+   if (tmp_1 != 0) {
+-    __gen_e_acsl_perror("Unable to initialize read mutex");
++    __gen_e_acsl_perror(__fc_lit_string9);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_2));
+   tmp_2 = __gen_e_acsl_pthread_cond_init(& read_cond,
+                                          (pthread_condattr_t const *)0);
+   if (tmp_2 != 0) {
+-    __gen_e_acsl_perror("Unable to initialize read cond var");
++    __gen_e_acsl_perror(__fc_lit_string10);
+     __gen_e_acsl_exit(1);
+   }
+   {
+@@ -2451,7 +2462,7 @@ int main(void)
+       __e_acsl_delete_block((void *)(& done));
+     }
+     else 
+-      if (res != 16) __gen_e_acsl_perror("Unable to lock write_mutex");
++      if (res != 16) __gen_e_acsl_perror(__fc_lit_string11);
+     __gen_e_acsl_usleep(100U);
+     __e_acsl_delete_block((void *)(& res));
+   }
+@@ -2472,14 +2483,14 @@ int main(void)
+       __e_acsl_delete_block((void *)(& done_0));
+     }
+     else 
+-      if (res_0 != 16) __gen_e_acsl_perror("Unable to lock read_mutex");
++      if (res_0 != 16) __gen_e_acsl_perror(__fc_lit_string12);
+     __gen_e_acsl_usleep(100U);
+     __e_acsl_delete_block((void *)(& res_0));
+   }
+   __e_acsl_full_init((void *)(& tmp_5));
+   tmp_5 = __gen_e_acsl_pthread_cond_broadcast(& write_cond);
+   if (tmp_5 != 0) {
+-    __gen_e_acsl_perror("Unable to broadcast to write cond var");
++    __gen_e_acsl_perror(__fc_lit_string13);
+     __gen_e_acsl_exit(11);
+   }
+   {
+@@ -2496,7 +2507,7 @@ int main(void)
+   __e_acsl_full_init((void *)(& tmp_6));
+   tmp_6 = __gen_e_acsl_pthread_cond_broadcast(& read_cond);
+   if (tmp_6 != 0) {
+-    __gen_e_acsl_perror("Unable to broadcast to read cond var");
++    __gen_e_acsl_perror(__fc_lit_string14);
+     __gen_e_acsl_exit(12);
+   }
+   {
+diff --git a/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c b/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c
+index 1e47d87a86..600ceb8220 100644
+--- a/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c
++++ b/plugins/e-acsl/tests/concurrency/oracle/gen_threads_debug.0.c
+@@ -1896,54 +1896,48 @@ void __e_acsl_globals_init(void)
+   static char __e_acsl_already_run = 0;
+   if (! __e_acsl_already_run) {
+     __e_acsl_already_run = 1;
+-    __e_acsl_store_block((void *)"Unable to broadcast to read cond var",37UL);
+-    __e_acsl_full_init((void *)(& "Unable to broadcast to read cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to broadcast to read cond var");
+-    __e_acsl_store_block((void *)"Unable to broadcast to write cond var",
+-                         38UL);
+-    __e_acsl_full_init((void *)(& "Unable to broadcast to write cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to broadcast to write cond var");
+-    __e_acsl_store_block((void *)"Unable to lock read_mutex",26UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock read_mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock read_mutex");
+-    __e_acsl_store_block((void *)"Unable to lock write_mutex",27UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock write_mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock write_mutex");
+-    __e_acsl_store_block((void *)"Unable to initialize read cond var",35UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize read cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize read cond var");
+-    __e_acsl_store_block((void *)"Unable to initialize read mutex",32UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize read mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize read mutex");
+-    __e_acsl_store_block((void *)"Unable to initialize write cond var",36UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize write cond var"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize write cond var");
+-    __e_acsl_store_block((void *)"Unable to initialize write mutex",33UL);
+-    __e_acsl_full_init((void *)(& "Unable to initialize write mutex"));
+-    __e_acsl_mark_readonly((void *)"Unable to initialize write mutex");
+-    __e_acsl_store_block((void *)"Unable to unlock mutex in read_value()",
+-                         39UL);
+-    __e_acsl_full_init((void *)(& "Unable to unlock mutex in read_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to unlock mutex in read_value()");
+-    __e_acsl_store_block((void *)"Unable to wait on condvar in read_value()",
+-                         42UL);
+-    __e_acsl_full_init((void *)(& "Unable to wait on condvar in read_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to wait on condvar in read_value()");
+-    __e_acsl_store_block((void *)"Unable to lock mutex in read_value()",37UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock mutex in read_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock mutex in read_value()");
+-    __e_acsl_store_block((void *)"Unable to unlock mutex in write_value()",
+-                         40UL);
+-    __e_acsl_full_init((void *)(& "Unable to unlock mutex in write_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to unlock mutex in write_value()");
+-    __e_acsl_store_block((void *)"Unable to wait on condvar in write_value()",
+-                         43UL);
+-    __e_acsl_full_init((void *)(& "Unable to wait on condvar in write_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to wait on condvar in write_value()");
+-    __e_acsl_store_block((void *)"Unable to lock mutex in write_value()",
+-                         38UL);
+-    __e_acsl_full_init((void *)(& "Unable to lock mutex in write_value()"));
+-    __e_acsl_mark_readonly((void *)"Unable to lock mutex in write_value()");
++    __e_acsl_store_block((void *)(__fc_lit_string14),37UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string14));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string14));
++    __e_acsl_store_block((void *)(__fc_lit_string13),38UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string13));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string13));
++    __e_acsl_store_block((void *)(__fc_lit_string12),26UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string12));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string12));
++    __e_acsl_store_block((void *)(__fc_lit_string11),27UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string11));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string11));
++    __e_acsl_store_block((void *)(__fc_lit_string10),35UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string10));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string10));
++    __e_acsl_store_block((void *)(__fc_lit_string9),32UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string9));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string9));
++    __e_acsl_store_block((void *)(__fc_lit_string8),36UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string8));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string8));
++    __e_acsl_store_block((void *)(__fc_lit_string7),33UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string7));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string7));
++    __e_acsl_store_block((void *)(__fc_lit_string6),39UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string6));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string6));
++    __e_acsl_store_block((void *)(__fc_lit_string5),42UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string5));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string5));
++    __e_acsl_store_block((void *)(__fc_lit_string4),37UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string4));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string4));
++    __e_acsl_store_block((void *)(__fc_lit_string3),40UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string3));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string3));
++    __e_acsl_store_block((void *)(__fc_lit_string2),43UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string2));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string2));
++    __e_acsl_store_block((void *)(__fc_lit_string1),38UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
+     __e_acsl_store_block((void *)(& read_mutex),4UL);
+     __e_acsl_full_init((void *)(& read_mutex));
+     __e_acsl_store_block((void *)(& write_mutex),4UL);
+@@ -1966,20 +1960,20 @@ void __e_acsl_globals_init(void)
+ 
+ void __e_acsl_globals_clean(void)
+ {
+-  __e_acsl_delete_block((void *)"Unable to broadcast to read cond var");
+-  __e_acsl_delete_block((void *)"Unable to broadcast to write cond var");
+-  __e_acsl_delete_block((void *)"Unable to lock read_mutex");
+-  __e_acsl_delete_block((void *)"Unable to lock write_mutex");
+-  __e_acsl_delete_block((void *)"Unable to initialize read cond var");
+-  __e_acsl_delete_block((void *)"Unable to initialize read mutex");
+-  __e_acsl_delete_block((void *)"Unable to initialize write cond var");
+-  __e_acsl_delete_block((void *)"Unable to initialize write mutex");
+-  __e_acsl_delete_block((void *)"Unable to unlock mutex in read_value()");
+-  __e_acsl_delete_block((void *)"Unable to wait on condvar in read_value()");
+-  __e_acsl_delete_block((void *)"Unable to lock mutex in read_value()");
+-  __e_acsl_delete_block((void *)"Unable to unlock mutex in write_value()");
+-  __e_acsl_delete_block((void *)"Unable to wait on condvar in write_value()");
+-  __e_acsl_delete_block((void *)"Unable to lock mutex in write_value()");
++  __e_acsl_delete_block((void *)(__fc_lit_string14));
++  __e_acsl_delete_block((void *)(__fc_lit_string13));
++  __e_acsl_delete_block((void *)(__fc_lit_string12));
++  __e_acsl_delete_block((void *)(__fc_lit_string11));
++  __e_acsl_delete_block((void *)(__fc_lit_string10));
++  __e_acsl_delete_block((void *)(__fc_lit_string9));
++  __e_acsl_delete_block((void *)(__fc_lit_string8));
++  __e_acsl_delete_block((void *)(__fc_lit_string7));
++  __e_acsl_delete_block((void *)(__fc_lit_string6));
++  __e_acsl_delete_block((void *)(__fc_lit_string5));
++  __e_acsl_delete_block((void *)(__fc_lit_string4));
++  __e_acsl_delete_block((void *)(__fc_lit_string3));
++  __e_acsl_delete_block((void *)(__fc_lit_string2));
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
+   __e_acsl_delete_block((void *)(& read_mutex));
+   __e_acsl_delete_block((void *)(& write_mutex));
+   __e_acsl_delete_block((void *)(& read_cond));
+@@ -2019,28 +2013,28 @@ int main(void)
+   tmp = __gen_e_acsl_pthread_mutex_init(& write_mutex,
+                                         (pthread_mutexattr_t const *)0);
+   if (tmp != 0) {
+-    __gen_e_acsl_perror("Unable to initialize write mutex");
++    __gen_e_acsl_perror(__fc_lit_string7);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_0));
+   tmp_0 = __gen_e_acsl_pthread_cond_init(& write_cond,
+                                          (pthread_condattr_t const *)0);
+   if (tmp_0 != 0) {
+-    __gen_e_acsl_perror("Unable to initialize write cond var");
++    __gen_e_acsl_perror(__fc_lit_string8);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_1));
+   tmp_1 = __gen_e_acsl_pthread_mutex_init(& read_mutex,
+                                           (pthread_mutexattr_t const *)0);
+   if (tmp_1 != 0) {
+-    __gen_e_acsl_perror("Unable to initialize read mutex");
++    __gen_e_acsl_perror(__fc_lit_string9);
+     __gen_e_acsl_exit(1);
+   }
+   __e_acsl_full_init((void *)(& tmp_2));
+   tmp_2 = __gen_e_acsl_pthread_cond_init(& read_cond,
+                                          (pthread_condattr_t const *)0);
+   if (tmp_2 != 0) {
+-    __gen_e_acsl_perror("Unable to initialize read cond var");
++    __gen_e_acsl_perror(__fc_lit_string10);
+     __gen_e_acsl_exit(1);
+   }
+   {
+@@ -2078,7 +2072,7 @@ int main(void)
+       __e_acsl_delete_block((void *)(& done));
+     }
+     else 
+-      if (res != 16) __gen_e_acsl_perror("Unable to lock write_mutex");
++      if (res != 16) __gen_e_acsl_perror(__fc_lit_string11);
+     __gen_e_acsl_usleep(100U);
+     __e_acsl_delete_block((void *)(& res));
+   }
+@@ -2099,14 +2093,14 @@ int main(void)
+       __e_acsl_delete_block((void *)(& done_0));
+     }
+     else 
+-      if (res_0 != 16) __gen_e_acsl_perror("Unable to lock read_mutex");
++      if (res_0 != 16) __gen_e_acsl_perror(__fc_lit_string12);
+     __gen_e_acsl_usleep(100U);
+     __e_acsl_delete_block((void *)(& res_0));
+   }
+   __e_acsl_full_init((void *)(& tmp_5));
+   tmp_5 = __gen_e_acsl_pthread_cond_broadcast(& write_cond);
+   if (tmp_5 != 0) {
+-    __gen_e_acsl_perror("Unable to broadcast to write cond var");
++    __gen_e_acsl_perror(__fc_lit_string13);
+     __gen_e_acsl_exit(11);
+   }
+   {
+@@ -2123,7 +2117,7 @@ int main(void)
+   __e_acsl_full_init((void *)(& tmp_6));
+   tmp_6 = __gen_e_acsl_pthread_cond_broadcast(& read_cond);
+   if (tmp_6 != 0) {
+-    __gen_e_acsl_perror("Unable to broadcast to read cond var");
++    __gen_e_acsl_perror(__fc_lit_string14);
+     __gen_e_acsl_exit(12);
+   }
+   {
+diff --git a/plugins/e-acsl/tests/full-mtracking/literal_strings.c b/plugins/e-acsl/tests/full-mtracking/literal_strings.c
+new file mode 100644
+index 0000000000..61bb82aabc
+--- /dev/null
++++ b/plugins/e-acsl/tests/full-mtracking/literal_strings.c
+@@ -0,0 +1,25 @@
++/* run.config
++   COMMENT: string literals are registered as named arrays, not as literals:
++   COMMENT: a literal may otherwise be stored inside another one (here "," at
++   COMMENT: the end of " ,", as clang and GNU ld do), and their blocks overlap
++*/
++
++int main(void) {
++  const char *comma = ",";
++  const char *again = ",";
++  const char *s = " ,";
++  char buf[] = "ab";
++  int in_loop = 0, found = 0;
++  for (int i = 0; i < 2; i++) {
++    const char *t = "loop";
++    /*@ assert \valid_read(t + 4) && !\valid(t); */
++    in_loop = t[i] == 'o';
++  }
++  for (int j = 0; j < 2; j++) {
++    /*@ assert \valid_read(s + j) && !\valid(s + j); */
++    found = s[j] == ',';
++  }
++  /*@ assert \valid_read(comma) && \valid_read(again); */
++  /*@ assert \valid(&buf[2]); */
++  return !(in_loop && found && comma[0] == again[0] && buf[1] == 'b');
++}
+diff --git a/plugins/e-acsl/tests/full-mtracking/oracle/gen_literal_strings.0.c b/plugins/e-acsl/tests/full-mtracking/oracle/gen_literal_strings.0.c
+new file mode 100644
+index 0000000000..e3b2fc5551
+--- /dev/null
++++ b/plugins/e-acsl/tests/full-mtracking/oracle/gen_literal_strings.0.c
+@@ -0,0 +1,467 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++char const __fc_lit_string1[2UL] = ",";
++char const __fc_lit_string2[2UL] = ",";
++char const __fc_lit_string3[3UL] = " ,";
++char const __fc_lit_string4[3UL] = "ab";
++char const __fc_lit_string5[5UL] = "loop";
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)(__fc_lit_string5),5UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string5));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string5));
++    __e_acsl_store_block((void *)(__fc_lit_string4),3UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string4));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string4));
++    __e_acsl_store_block((void *)(__fc_lit_string3),3UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string3));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string3));
++    __e_acsl_store_block((void *)(__fc_lit_string2),2UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string2));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string2));
++    __e_acsl_store_block((void *)(__fc_lit_string1),2UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)(__fc_lit_string5));
++  __e_acsl_delete_block((void *)(__fc_lit_string4));
++  __e_acsl_delete_block((void *)(__fc_lit_string3));
++  __e_acsl_delete_block((void *)(__fc_lit_string2));
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
++  return;
++}
++
++int main(void)
++{
++  int tmp;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_globals_init();
++  __e_acsl_store_block((void *)(& tmp),4UL);
++  char const *comma = __fc_lit_string1;
++  __e_acsl_store_block((void *)(& comma),8UL);
++  __e_acsl_full_init((void *)(& comma));
++  char const *again = __fc_lit_string2;
++  __e_acsl_store_block((void *)(& again),8UL);
++  __e_acsl_full_init((void *)(& again));
++  char const *s = __fc_lit_string3;
++  __e_acsl_store_block((void *)(& s),8UL);
++  __e_acsl_full_init((void *)(& s));
++  char buf[3UL] = {'a', 'b', '\000'};
++  __e_acsl_store_block((void *)(buf),3UL);
++  __e_acsl_full_init((void *)(& buf));
++  int in_loop = 0;
++  __e_acsl_store_block((void *)(& in_loop),4UL);
++  __e_acsl_full_init((void *)(& in_loop));
++  int found = 0;
++  __e_acsl_store_block((void *)(& found),4UL);
++  __e_acsl_full_init((void *)(& found));
++  {
++    int i = 0;
++    __e_acsl_store_block((void *)(& i),4UL);
++    __e_acsl_full_init((void *)(& i));
++    while (i < 2) {
++      {
++        char const *t = __fc_lit_string5;
++        __e_acsl_store_block((void *)(& t),8UL);
++        __e_acsl_full_init((void *)(& t));
++        {
++          int __gen_e_acsl_aligned;
++          int __gen_e_acsl_valid_read;
++          int __gen_e_acsl_and;
++          __e_acsl_assert_data_t __gen_e_acsl_assert_data =
++            {.values = (void *)0};
++          __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++            {.values = (void *)0};
++          __gen_e_acsl_aligned = __e_acsl_aligned((void *)t,1UL);
++          __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"t",
++                                       (void *)t);
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                       "\"pointer alignment\": \\aligned(t,1)",
++                                       0,__gen_e_acsl_aligned);
++          /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++          {
++            __gen_e_acsl_assert_data_2.blocking = 1;
++            __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++            __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(t,1)";
++            __gen_e_acsl_assert_data_2.file = "literal_strings.c";
++            __gen_e_acsl_assert_data_2.fct = "main";
++            __gen_e_acsl_assert_data_2.line = 15;
++            __gen_e_acsl_assert_data_2.name = "pointer alignment";
++            __e_acsl_assert(__gen_e_acsl_aligned,
++                            & __gen_e_acsl_assert_data_2);
++            __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++          }
++          __gen_e_acsl_valid_read = __e_acsl_valid_read((void *)(t + 4),
++                                                        sizeof(char const),
++                                                        (void *)t,
++                                                        (void *)(& t));
++          __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"t",
++                                       (void *)t);
++          __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                         "sizeof(char const)",0,
++                                         sizeof(char const));
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                       "\\valid_read(t + 4)",0,
++                                       __gen_e_acsl_valid_read);
++          if (__gen_e_acsl_valid_read) {
++            int __gen_e_acsl_aligned_2;
++            int __gen_e_acsl_valid;
++            __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++              {.values = (void *)0};
++            __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)t,1UL);
++            __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"t",
++                                         (void *)t);
++            __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                         "\"pointer alignment\": \\aligned(t,1)",
++                                         0,__gen_e_acsl_aligned_2);
++            /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++            {
++              __gen_e_acsl_assert_data_3.blocking = 1;
++              __gen_e_acsl_assert_data_3.kind = "E-ACSL RTE";
++              __gen_e_acsl_assert_data_3.pred_txt = "\\aligned(t,1)";
++              __gen_e_acsl_assert_data_3.file = "literal_strings.c";
++              __gen_e_acsl_assert_data_3.fct = "main";
++              __gen_e_acsl_assert_data_3.line = 15;
++              __gen_e_acsl_assert_data_3.name = "pointer alignment";
++              __e_acsl_assert(__gen_e_acsl_aligned_2,
++                              & __gen_e_acsl_assert_data_3);
++              __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++            }
++            __gen_e_acsl_valid = __e_acsl_valid((void *)t,sizeof(char const),
++                                                (void *)t,(void *)(& t));
++            __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"t",
++                                         (void *)t);
++            __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                           "sizeof(char const)",0,
++                                           sizeof(char const));
++            __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                         "\\valid(t)",0,__gen_e_acsl_valid);
++            __gen_e_acsl_and = ! __gen_e_acsl_valid;
++          }
++          else __gen_e_acsl_and = 0;
++          __gen_e_acsl_assert_data.blocking = 1;
++          __gen_e_acsl_assert_data.kind = "Assertion";
++          __gen_e_acsl_assert_data.pred_txt = "\\valid_read(t + 4) && !\\valid(t)";
++          __gen_e_acsl_assert_data.file = "literal_strings.c";
++          __gen_e_acsl_assert_data.fct = "main";
++          __gen_e_acsl_assert_data.line = 15;
++          __e_acsl_assert(__gen_e_acsl_and,& __gen_e_acsl_assert_data);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++        }
++        /*@ assert \valid_read(t + 4) && !\valid(t); */ ;
++        __e_acsl_full_init((void *)(& in_loop));
++        in_loop = (int)*(t + i) == 111;
++        __e_acsl_delete_block((void *)(& t));
++      }
++      __e_acsl_full_init((void *)(& i));
++      i ++;
++    }
++    __e_acsl_delete_block((void *)(& i));
++  }
++  {
++    int j = 0;
++    __e_acsl_store_block((void *)(& j),4UL);
++    __e_acsl_full_init((void *)(& j));
++    while (j < 2) {
++      {
++        int __gen_e_acsl_aligned_3;
++        int __gen_e_acsl_and_2;
++        int __gen_e_acsl_valid_read_2;
++        int __gen_e_acsl_and_4;
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++          {.values = (void *)0};
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++          {.values = (void *)0};
++        __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)s,1UL);
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"s",
++                                     (void *)s);
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                     "\"pointer alignment\": \\aligned(s,1)",
++                                     0,__gen_e_acsl_aligned_3);
++        /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++        {
++          __gen_e_acsl_assert_data_5.blocking = 1;
++          __gen_e_acsl_assert_data_5.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_5.pred_txt = "\\aligned(s,1)";
++          __gen_e_acsl_assert_data_5.file = "literal_strings.c";
++          __gen_e_acsl_assert_data_5.fct = "main";
++          __gen_e_acsl_assert_data_5.line = 19;
++          __gen_e_acsl_assert_data_5.name = "pointer alignment";
++          __e_acsl_assert(__gen_e_acsl_aligned_3,
++                          & __gen_e_acsl_assert_data_5);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++        }
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++          {.values = (void *)0};
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,"j",0,j);
++        if ((-9223372036854775807L-1L) <= (long)j) {
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,"j",0,j);
++          __gen_e_acsl_and_2 = (long)j <= 9223372036854775807L;
++        }
++        else __gen_e_acsl_and_2 = 0;
++        /*@ assert
++              E_ACSL: "signed downcast":
++                -9223372036854775808 <= j <= 9223372036854775807;
++        */
++        {
++          __gen_e_acsl_assert_data_6.blocking = 1;
++          __gen_e_acsl_assert_data_6.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_6.pred_txt = "-9223372036854775808 <= j <= 9223372036854775807";
++          __gen_e_acsl_assert_data_6.file = "literal_strings.c";
++          __gen_e_acsl_assert_data_6.fct = "main";
++          __gen_e_acsl_assert_data_6.line = 19;
++          __gen_e_acsl_assert_data_6.name = "signed downcast";
++          __e_acsl_assert(__gen_e_acsl_and_2,& __gen_e_acsl_assert_data_6);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++        }
++        __gen_e_acsl_valid_read_2 = __e_acsl_valid_read((void *)(s + j),
++                                                        sizeof(char const),
++                                                        (void *)s,
++                                                        (void *)(& s));
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"s",
++                                     (void *)s);
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,"j",0,j);
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_4,
++                                       "sizeof(char const)",0,
++                                       sizeof(char const));
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                     "\\valid_read(s + j)",0,
++                                     __gen_e_acsl_valid_read_2);
++        if (__gen_e_acsl_valid_read_2) {
++          int __gen_e_acsl_aligned_4;
++          int __gen_e_acsl_and_3;
++          int __gen_e_acsl_valid_2;
++          __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++            {.values = (void *)0};
++          __gen_e_acsl_aligned_4 = __e_acsl_aligned((void *)s,1UL);
++          __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_7,"s",
++                                       (void *)s);
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,
++                                       "\"pointer alignment\": \\aligned(s,1)",
++                                       0,__gen_e_acsl_aligned_4);
++          /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++          {
++            __gen_e_acsl_assert_data_7.blocking = 1;
++            __gen_e_acsl_assert_data_7.kind = "E-ACSL RTE";
++            __gen_e_acsl_assert_data_7.pred_txt = "\\aligned(s,1)";
++            __gen_e_acsl_assert_data_7.file = "literal_strings.c";
++            __gen_e_acsl_assert_data_7.fct = "main";
++            __gen_e_acsl_assert_data_7.line = 19;
++            __gen_e_acsl_assert_data_7.name = "pointer alignment";
++            __e_acsl_assert(__gen_e_acsl_aligned_4,
++                            & __gen_e_acsl_assert_data_7);
++            __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++          }
++          __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++            {.values = (void *)0};
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,"j",0,j);
++          if ((-9223372036854775807L-1L) <= (long)j) {
++            __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,"j",0,
++                                         j);
++            __gen_e_acsl_and_3 = (long)j <= 9223372036854775807L;
++          }
++          else __gen_e_acsl_and_3 = 0;
++          /*@ assert
++                E_ACSL: "signed downcast":
++                  -9223372036854775808 <= j <= 9223372036854775807;
++          */
++          {
++            __gen_e_acsl_assert_data_8.blocking = 1;
++            __gen_e_acsl_assert_data_8.kind = "E-ACSL RTE";
++            __gen_e_acsl_assert_data_8.pred_txt = "-9223372036854775808 <= j <= 9223372036854775807";
++            __gen_e_acsl_assert_data_8.file = "literal_strings.c";
++            __gen_e_acsl_assert_data_8.fct = "main";
++            __gen_e_acsl_assert_data_8.line = 19;
++            __gen_e_acsl_assert_data_8.name = "signed downcast";
++            __e_acsl_assert(__gen_e_acsl_and_3,& __gen_e_acsl_assert_data_8);
++            __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++          }
++          __gen_e_acsl_valid_2 = __e_acsl_valid((void *)(s + j),
++                                                sizeof(char const),(void *)s,
++                                                (void *)(& s));
++          __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"s",
++                                       (void *)s);
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,"j",0,j);
++          __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_4,
++                                         "sizeof(char const)",0,
++                                         sizeof(char const));
++          __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                       "\\valid(s + j)",0,
++                                       __gen_e_acsl_valid_2);
++          __gen_e_acsl_and_4 = ! __gen_e_acsl_valid_2;
++        }
++        else __gen_e_acsl_and_4 = 0;
++        __gen_e_acsl_assert_data_4.blocking = 1;
++        __gen_e_acsl_assert_data_4.kind = "Assertion";
++        __gen_e_acsl_assert_data_4.pred_txt = "\\valid_read(s + j) && !\\valid(s + j)";
++        __gen_e_acsl_assert_data_4.file = "literal_strings.c";
++        __gen_e_acsl_assert_data_4.fct = "main";
++        __gen_e_acsl_assert_data_4.line = 19;
++        __e_acsl_assert(__gen_e_acsl_and_4,& __gen_e_acsl_assert_data_4);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++      }
++      /*@ assert \valid_read(s + j) && !\valid(s + j); */ ;
++      __e_acsl_full_init((void *)(& found));
++      found = (int)*(s + j) == 44;
++      __e_acsl_full_init((void *)(& j));
++      j ++;
++    }
++    __e_acsl_delete_block((void *)(& j));
++  }
++  {
++    int __gen_e_acsl_aligned_5;
++    int __gen_e_acsl_valid_read_3;
++    int __gen_e_acsl_and_5;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_9 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_10 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_5 = __e_acsl_aligned((void *)comma,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_10,"comma",
++                                 (void *)comma);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_10,
++                                 "\"pointer alignment\": \\aligned(comma,1)",
++                                 0,__gen_e_acsl_aligned_5);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(comma,1); */
++    {
++      __gen_e_acsl_assert_data_10.blocking = 1;
++      __gen_e_acsl_assert_data_10.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_10.pred_txt = "\\aligned(comma,1)";
++      __gen_e_acsl_assert_data_10.file = "literal_strings.c";
++      __gen_e_acsl_assert_data_10.fct = "main";
++      __gen_e_acsl_assert_data_10.line = 22;
++      __gen_e_acsl_assert_data_10.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_5,& __gen_e_acsl_assert_data_10);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_10);
++    }
++    __gen_e_acsl_valid_read_3 = __e_acsl_valid_read((void *)comma,
++                                                    sizeof(char const),
++                                                    (void *)comma,
++                                                    (void *)(& comma));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_9,"comma",
++                                 (void *)comma);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_9,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_9,
++                                 "\\valid_read(comma)",0,
++                                 __gen_e_acsl_valid_read_3);
++    if (__gen_e_acsl_valid_read_3) {
++      int __gen_e_acsl_aligned_6;
++      int __gen_e_acsl_valid_read_4;
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_11 =
++        {.values = (void *)0};
++      __gen_e_acsl_aligned_6 = __e_acsl_aligned((void *)again,1UL);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_11,"again",
++                                   (void *)again);
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_11,
++                                   "\"pointer alignment\": \\aligned(again,1)",
++                                   0,__gen_e_acsl_aligned_6);
++      /*@ assert E_ACSL: "pointer alignment": \aligned(again,1); */
++      {
++        __gen_e_acsl_assert_data_11.blocking = 1;
++        __gen_e_acsl_assert_data_11.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_11.pred_txt = "\\aligned(again,1)";
++        __gen_e_acsl_assert_data_11.file = "literal_strings.c";
++        __gen_e_acsl_assert_data_11.fct = "main";
++        __gen_e_acsl_assert_data_11.line = 22;
++        __gen_e_acsl_assert_data_11.name = "pointer alignment";
++        __e_acsl_assert(__gen_e_acsl_aligned_6,& __gen_e_acsl_assert_data_11);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_11);
++      }
++      __gen_e_acsl_valid_read_4 = __e_acsl_valid_read((void *)again,
++                                                      sizeof(char const),
++                                                      (void *)again,
++                                                      (void *)(& again));
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_9,"again",
++                                   (void *)again);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_9,
++                                     "sizeof(char const)",0,
++                                     sizeof(char const));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_9,
++                                   "\\valid_read(again)",0,
++                                   __gen_e_acsl_valid_read_4);
++      __gen_e_acsl_and_5 = __gen_e_acsl_valid_read_4;
++    }
++    else __gen_e_acsl_and_5 = 0;
++    __gen_e_acsl_assert_data_9.blocking = 1;
++    __gen_e_acsl_assert_data_9.kind = "Assertion";
++    __gen_e_acsl_assert_data_9.pred_txt = "\\valid_read(comma) && \\valid_read(again)";
++    __gen_e_acsl_assert_data_9.file = "literal_strings.c";
++    __gen_e_acsl_assert_data_9.fct = "main";
++    __gen_e_acsl_assert_data_9.line = 22;
++    __e_acsl_assert(__gen_e_acsl_and_5,& __gen_e_acsl_assert_data_9);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_9);
++  }
++  /*@ assert \valid_read(comma) && \valid_read(again); */ ;
++  {
++    int __gen_e_acsl_valid_3;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_12 =
++      {.values = (void *)0};
++    __gen_e_acsl_valid_3 = __e_acsl_valid((void *)(& buf[2]),sizeof(char),
++                                          (void *)(buf),(void *)0);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_12,"&buf[2]",
++                                 (void *)(& buf[2]));
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_12,
++                                   "sizeof(char)",0,sizeof(char));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_12,
++                                 "\\valid(&buf[2])",0,__gen_e_acsl_valid_3);
++    __gen_e_acsl_assert_data_12.blocking = 1;
++    __gen_e_acsl_assert_data_12.kind = "Assertion";
++    __gen_e_acsl_assert_data_12.pred_txt = "\\valid(&buf[2])";
++    __gen_e_acsl_assert_data_12.file = "literal_strings.c";
++    __gen_e_acsl_assert_data_12.fct = "main";
++    __gen_e_acsl_assert_data_12.line = 23;
++    __e_acsl_assert(__gen_e_acsl_valid_3,& __gen_e_acsl_assert_data_12);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_12);
++  }
++  /*@ assert \valid(&buf[2]); */ ;
++  if (in_loop) 
++    if (found) 
++      if ((int)*(comma + 0) == (int)*(again + 0)) 
++        if ((int)buf[1] == 98) {
++          __e_acsl_full_init((void *)(& tmp));
++          tmp = 0;
++        }
++        else {
++          __e_acsl_full_init((void *)(& tmp));
++          tmp = 1;
++        }
++      else {
++        __e_acsl_full_init((void *)(& tmp));
++        tmp = 1;
++      }
++    else {
++      __e_acsl_full_init((void *)(& tmp));
++      tmp = 1;
++    }
++  else {
++    __e_acsl_full_init((void *)(& tmp));
++    tmp = 1;
++  }
++  __e_acsl_delete_block((void *)(& tmp));
++  __e_acsl_delete_block((void *)(& found));
++  __e_acsl_delete_block((void *)(& in_loop));
++  __e_acsl_delete_block((void *)(buf));
++  __e_acsl_delete_block((void *)(& s));
++  __e_acsl_delete_block((void *)(& again));
++  __e_acsl_delete_block((void *)(& comma));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return tmp;
++}
++
++
+diff --git a/plugins/e-acsl/tests/full-mtracking/oracle/literal_strings.0.res.oracle b/plugins/e-acsl/tests/full-mtracking/oracle/literal_strings.0.res.oracle
+new file mode 100644
+index 0000000000..242507169b
+--- /dev/null
++++ b/plugins/e-acsl/tests/full-mtracking/oracle/literal_strings.0.res.oracle
+@@ -0,0 +1,16 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] literal_strings.c:15: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] literal_strings.c:15: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] literal_strings.c:19: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] literal_strings.c:19: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] literal_strings.c:19: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] literal_strings.c:22: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] literal_strings.c:22: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+diff --git a/src/kernel/services/ast_transformations/demote_string_literal.ml b/src/kernel/services/ast_transformations/demote_string_literal.ml
+index 6c8f99999b..cfc0a3eb7b 100644
+--- a/src/kernel/services/ast_transformations/demote_string_literal.ml
++++ b/src/kernel/services/ast_transformations/demote_string_literal.ml
+@@ -55,24 +55,34 @@ let mk_array_init loc dest src =
+   let l = Seq.map2 (init_idx loc) idx elts in
+   CompoundInit (dest.vtype,List.of_seq l)
+ 
+-class demote vi =
++class demote vis =
+   object
+     inherit Visitor.frama_c_inplace
+ 
++    val mutable changed = false
++    method changed = changed
++
+     method! vinst i =
+       match i with
+       | Local_init(
+           dest,AssignInit(SingleInit { enode = Lval(Var src,NoOffset) }),loc)
+-        when Cil_datatype.Varinfo.equal vi src ->
++        when Cil_datatype.Varinfo.Set.mem src vis ->
+         let new_init = mk_array_init loc dest src in
+-        Ast.mark_as_changed();
++        changed <- true;
+         Cil.ChangeTo [Local_init(dest,AssignInit new_init,loc)]
+       | _ -> Cil.SkipChildren
+   end
+ 
+-let demote vi =
+-  if Ast_info.is_string_literal vi then begin
+-    let vis = new demote vi in
+-    Visitor.visitFramacFileSameGlobals vis (Ast.get());
+-    vi.vattr <- Ast_attributes.(drop fc_literal vi.vattr)
++let demote_list vis =
++  let vis = List.filter Ast_info.is_string_literal vis in
++  if vis <> [] then begin
++    let vis' = new demote (Cil_datatype.Varinfo.Set.of_list vis) in
++    Visitor.visitFramacFileSameGlobals
++      (vis' :> Visitor.frama_c_visitor) (Ast.get());
++    if vis'#changed then Ast.mark_as_changed ();
++    List.iter
++      (fun vi -> vi.vattr <- Ast_attributes.(drop fc_literal vi.vattr))
++      vis
+   end
++
++let demote vi = demote_list [vi]
+diff --git a/src/kernel/services/ast_transformations/demote_string_literal.mli b/src/kernel/services/ast_transformations/demote_string_literal.mli
+index b0bb7011e2..16c955d8ca 100644
+--- a/src/kernel/services/ast_transformations/demote_string_literal.mli
++++ b/src/kernel/services/ast_transformations/demote_string_literal.mli
+@@ -16,3 +16,11 @@
+    @since 32.0-Germanium
+ *)
+ val demote : Cil_types.varinfo -> unit
++
++(**
++   same as {!demote} on each variable of the list, in a single traversal of
++   the AST.
++
++   @since Frama-C+dev
++*)
++val demote_list : Cil_types.varinfo list -> unit
+-- 
+2.56.0.windows.4
+

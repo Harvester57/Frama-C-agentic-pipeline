@@ -24,21 +24,45 @@ patches together.
 > ([`pub-frama-c_work_items_2026-11-09.csv`](./pub-frama-c_work_items_2026-11-09.csv)) duplicates any
 > issue on this page.
 
+> [!IMPORTANT]
+> **2026-11-15 re-check and filing packages.** Every issue below that is filed upstream was
+> re-run on a local build of upstream `master` at `3dff90fc70` (2026-11-13) and on the
+> `34.0~beta (Selenium)` release, and all reproduce on both. Each now has a paste-ready issue text, a
+> merge-request text, a standalone reproducer and a `git format-patch` file rebased on `3dff90fc70`,
+> validated before and after on a patched build. Issue 15 has no patch (a design choice for the
+> maintainers), and Issue 27's patch also fixes Issue 23. Issues 20 to 27 were drafted on that date
+> from bugs the pipeline had only worked around. The coverage table and the filing order are in
+> [`./README.md`](./README.md). A live search of the tracker on 2026-11-15 (issues and MRs, all
+> states) found no duplicate; #2752, #2787 and #197 are related but distinct, as each issue text
+> says. The `ad24dca` validation below is kept as history.
+
 ## Filing decision
 
 | # | Issue | Frama-C 35 | File upstream? | Why | Draft |
 |---|---|---|---|---|---|
 | 1 | `e-acsl-gcc` re-parses `-e`/`-E`/`-l`/`-F` values as script options | **Present** | **Yes, high** | `-E "-I inc"` and `-l "-L dir -lm"` abort with `no input files`; `-e "-g"` silently enables GMP and drops the first input file | [option-arguments-reparsed](./frama-c-eacsl-gcc-option-arguments-reparsed.md) |
 | 3 | Variadic fallback names printed in declaration initializers | **Present** | **Yes, high** | Kernel bug, not E-ACSL-specific: `int fd = open(p, O_RDONLY);` printed by any `frama-c -no-frama-c-stdlib -print` does not link | [variadic-fallback-local-init](./frama-c-variadic-fallback-local-init.md) |
-| 4 | Unbounded ranges in Frama-C's own libc abort E-ACSL | **Present** | **Yes, medium** | `e-acsl-gcc -L` cannot instrument any program calling `strtok_r`, `getsockopt` or `wcschr` | [unbounded-range-abort](./frama-c-eacsl-unbounded-range-abort.md) |
+| 4 | Unbounded ranges in Frama-C's own libc abort E-ACSL | **Present** | **Yes, medium** | `e-acsl-gcc -L` cannot instrument any program calling `strtok_r`, `getsockopt`, `wcschr`, `wcspbrk`, `wcsrchr` or `wcsstr` (the last three found on `3dff90fc70`) | [unbounded-range-abort](./frama-c-eacsl-unbounded-range-abort.md) |
 | 5 | `alignof`/`sizeof` emitted on incomplete (opaque) struct types | **Present** | **Yes, medium** | Opaque handles (`typedef struct X X;`) are ubiquitous; the generated C does not compile with gcc or clang | [incomplete-type-sizeof](./frama-c-eacsl-incomplete-type-sizeof.md) |
 | 8 | Wrapper `__retres` left uninitialized, struct `\result.f` false positive | **Present** | **Yes, high** | False runtime failure from E-ACSL's own `-e-acsl-rte 2`; no RTE plugin or `-M` needed | [struct-result-initialized](./frama-c-eacsl-struct-result-initialized.md) |
 | 9 | `-e-acsl-assert-print-data` aliased to `-e-acsl-O-valid` | **Present** | **Yes, trivial fix** | One-line copy-paste error in `options.ml` | [assert-print-data-alias](./frama-c-eacsl-assert-print-data-alias.md) |
 | 10 | `e-acsl-gcc -G clang` overwrites `CFLAGS` | **Present** | **Yes, medium** | Drops `-std=c99`, `-m<bits>`, `-g -O2`, `--rt-debug` flags; the `--rt-debug` backtrace comes out empty. File together with 12 | [clang-cflags](./frama-c-eacsl-gcc-clang-cflags.md) |
 | 12 | `e-acsl-gcc` compiles with `-std=c99` but without the `-D_DEFAULT_SOURCE` Frama-C preprocessed with | **Present** | **Yes, medium** | With gcc 14, any program calling `strdup`, `strtok_r`, `fileno`, … fails to build; clang works only because of Issue 10 | [default-source](./frama-c-eacsl-gcc-default-source.md) |
 | 13 | Formals registered with `__e_acsl_store_block` but never marked initialized | **Present** (also 34) | **Yes, high** | Any `\initialized` on a by-value struct field fails on every call, with or without `-rte`. Same bug as closed #177, which fails again. Same family as 8: file together | [formal-params-initialized](./frama-c-eacsl-formal-params-initialized.md) |
-| 14 | `<==>` over a labelled term (`\old`, `\at`, a formal in `ensures`) aborts with `labels pre-analysis was not performed` | **Present** (regression; `34.0~~dev` worked, `34.0~beta` fails too) | **Yes, high** | A common postcondition shape (`(\result != 0) <==> (b->n == 0)`) cannot be instrumented at all; fix not validated yet | [iff-labelled-term](./frama-c-eacsl-iff-labelled-term.md) |
-| 15 | `--temporal` with `-e-acsl-full-mtracking`: a function's address passed as an argument aborts with `Unreachable` | Not checked (found on `34.0~beta`) | **Yes, medium** | The callee pulls temporal metadata for the function-pointer parameter, the call site never saves it. Blocks temporal analysis on callback APIs | [temporal-function-address-argument](./frama-c-eacsl-temporal-function-address-argument.md) |
+| 14 | `<==>` over a labelled term (`\old`, `\at`, a formal in `ensures`) aborts with `labels pre-analysis was not performed` | **Present** (regression; `34.0~~dev` worked, `34.0~beta` fails too) | **Yes, high** | A common postcondition shape (`(\result != 0) <==> (b->n == 0)`) cannot be instrumented at all; fix validated on `3dff90fc70` (2026-11-15) | [iff-labelled-term](./frama-c-eacsl-iff-labelled-term.md) |
+| 15 | `--temporal`: a function's address (or a constant) passed as an argument aborts with `Unreachable` | **Present** (also `34.0~beta`) | **Yes, medium** | The callee pulls temporal metadata for a parameter the call site never saved (`must_monitor_vi` vs `must_monitor_exp`). Blocks temporal analysis on callback APIs. No patch: the issue offers three fixes for the maintainers to choose | [temporal-function-address-argument](./frama-c-eacsl-temporal-function-address-argument.md) |
+| 16 | A `loop variant` that is one application of a memory-reading logic function aborts with `typing was not performed` | **Present** (also `34.0~beta`) | **Yes, high** | Common string-walking variant (`loop variant len(s);`) aborts translation (`rc=4`) | [loop-variant-logic-function-application](./frama-c-eacsl-loop-variant-logic-function-application.md) |
+| 17 | `eacsl_builtin_memcmp` (`--libc-replacements`) aborts on overlapping or identical buffers with `memcpy: overlapping memory areas` | **Present** (also `34.0~beta`) | **Yes, high** | Copy-paste bug in `e_acsl_string.c:240`; `memcmp` permits overlapping objects in ISO C 7.24.4.1, causing false crash reports when comparing slices of one buffer | [memcmp-overlapping-buffers](./frama-c-eacsl-memcmp-overlapping-buffers.md) |
+| 18 | `argv_alloca()` increments global `environ` in place to `NULL`, breaking `getenv()` | **Present** (also `34.0~beta`) | **Yes, high** | Both the segment and bittree observation models do `environ++` on the global `environ`, emptying the process environment of every instrumented program whose `main` takes `argc`/`argv` (with or without `-M`) | [memory-init-clobbers-environ](./frama-c-eacsl-memory-init-clobbers-environ.md) |
+| 19 | WP `-wp-counter-examples` (or any `probe` annotation) loses the relation between the pre- and post-state memories, so a postcondition on unwritten memory becomes unprovable | **Present** (also `34.0~beta`) | **Yes, medium** | `Prove: true.` becomes `Prove: Mptr_0[a] = Mptr_1[a].`: `probe_vc` in `cfgWP.ml` keeps only the probe's variables. Enabling counter-examples changes the verdict of valid goals. Related to, but not a duplicate of, #2787 and #2752 | [wp-counter-examples-drops-frame](./frama-c-wp-counter-examples-drops-frame.md) |
+| 20 | Kernel printer puts `_Alignas` after the declarator of struct members and inside pointer declarators | **Present** (also `34.0~beta`) | **Yes, high** | Printed code is invalid C (clang rejects members; pointer, function-pointer and pointer-array forms too); blocked the E-ACSL builds of six nettle clusters | [alignas-member-printed-after-declarator](./frama-c-kernel-alignas-member-printed-after-declarator.md) |
+| 21 | `register` local aborts E-ACSL under `-e-acsl-full-mtracking` (`Taking the address of a register variable`) | **Present** (also `34.0~beta`) | **Yes, high** | Any program with a `register` local cannot be instrumented with full tracking (19 nettle clusters) | [register-local-full-mtracking](./frama-c-eacsl-register-local-full-mtracking.md) |
+| 22 | `Rtl.Symbols.Unregistered("__gmpz_clear")` when the program declares GMP and an annotation needs GMP | **Present** (also `34.0~beta`) | **Yes, medium** | Programs using `<gmp.h>` lose E-ACSL as soon as one check exceeds 64 bits; distinct from #197 | [gmp-symbol-unregistered](./frama-c-eacsl-gmp-symbol-unregistered.md) |
+| 23 | A monitored `const` union global fails with `implicit cast: cast from union u to void *` | **Present** (also `34.0~beta`) | **Yes, medium** | Same root cause as 27; fixed by 27's patch | [static-const-union-cast](./frama-c-eacsl-static-const-union-cast.md) |
+| 24 | Guarded `\exists`/`\forall`: the conjunct right after the guard is not checked | **Present** (also `34.0~beta`) | **Yes, high (soundness)** | `\exists integer n; 0 <= n < size && P && Q` checks only `Q`: a false clause passes the runtime check | [guarded-exists-drops-conjunct](./frama-c-eacsl-guarded-exists-drops-conjunct.md) |
+| 25 | `offsetof(T, m[i])` with a non-constant index aborts the parse | **Present** (also `34.0~beta`) | **Yes, as a feature request** | GCC/Clang extension used by glibc-style code (libseccomp); C17 requires a constant | [offsetof-non-constant-index](./frama-c-kernel-offsetof-non-constant-index.md) |
+| 26 | libc socket headers: no `sin_zero`, no `struct ip_mreq`, `fd_set` not visible from `<sys/socket.h>` | **Present** (also `34.0~beta`) | **Yes, medium** | Correct glibc code fails to parse, or Eva reports a false `memset` alarm on an 8-byte `sockaddr_in` | [socket-header-gaps](./frama-c-libc-socket-header-gaps.md) |
+| 27 | `__e_acsl_mark_readonly` gets the value of a `const` global instead of its address | **Present** (also `34.0~beta`) | **Yes, high** | Scalar `const` globals abort every instrumented program at start-up ("Use of invalid address") | [readonly-scalar-global-address](./frama-c-eacsl-readonly-scalar-global-address.md) |
 | 2 | `-O` builds plain + `.e-acsl`; `-X`/`--oexec-e-acsl` absent from `-h` | Unchanged | No | Documented behaviour (`man e-acsl-gcc` describes `-O`, `-X`, `--oexec-e-acsl`; `-h` says it lists only basic options) | — |
 | 6 | RTL abort in `unsafe_initialize` has no target location | Unchanged | No | `--rt-debug` already prints a backtrace naming the target function; its failure under clang is Issue 10 | — |
 | 7 | Unknown names in `-rte-select`/`-e-acsl-functions` abort | Unchanged | No | Same convention as `-wp-fct`; deliberate kernel-wide behaviour | — |
@@ -695,6 +719,26 @@ term and `Loops.handle_annotations` asks for it on the original one.
 
 **Workaround.** Write the variant as `len(s) + 0`. Seventeen-line reproducer and the analysis:
 [frama-c-eacsl-loop-variant-logic-function-application.md](./frama-c-eacsl-loop-variant-logic-function-application.md).
+
+---
+
+## Issue 17: `eacsl_builtin_memcmp` (`--libc-replacements`) aborts on overlapping or identical buffers
+
+**Status.** Found 2026-11-14 on `34.0~beta (Selenium)` in QCBOR `run-6`
+([`../../runs/2026-11-14-qcbor-run6-supervision.md`](../../runs/2026-11-14-qcbor-run6-supervision.md)).
+Not filed.
+
+**Observed.** Under `--libc-replacements`, `memcmp(s1, s2, n)` with `n > 0` and overlapping
+`[s1, s1 + n)` and `[s2, s2 + n)` aborts at run time with `memcpy: overlapping memory areas`
+(exit 134). `eacsl_builtin_memcmp` (`share/e-acsl/libc_replacements/e_acsl_string.c:240`) copied
+`validate_overlapping_spaces((uintptr_t)s1, n, (uintptr_t)s2, n, "memcpy");` from
+`eacsl_builtin_memcpy`. ISO C 7.24.4.1 permits overlapping objects in `memcmp` (as
+`eacsl_builtin_strcmp` and `eacsl_builtin_strncmp` in the same file already allow).
+
+**Workaround.** Wrap `__e_acsl_builtin_memcmp` (`-Wl,--wrap`) or rewrite calls in `instrumented.c`
+to check readable validity without non-overlap, or build with `--no-libc-checks`. Nine-line
+reproducer and proposed RTL diff:
+[frama-c-eacsl-memcmp-overlapping-buffers.md](./frama-c-eacsl-memcmp-overlapping-buffers.md).
 
 ---
 

@@ -1,0 +1,239 @@
+From 1d1623cd2166471d46c727b59070e125f0166617 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 17:21:54 +0100
+Subject: [PATCH] [e-acsl] ignore annotations needing the size of an incomplete
+ type
+
+For a pointer to an incomplete (opaque) struct or union, E-ACSL emitted
+sizeof or __alignof__ of the incomplete type into the instrumented
+code, which does not compile:
+- \valid(obj), \valid_read(obj) and \initialized(obj) use the size of
+  the pointed type (term_to_ptr_and_size, range_to_ptr_and_size);
+- the RTE assertion \aligned(p, alignof(T)) generated for a cast to
+  T * translates alignof(T) as is.
+E-ACSL already checks completeness for its own alignment guards (and
+warns instead), but not for these terms.
+
+Reject sizeof/alignof of an incomplete struct or union in typing, and
+memory predicates whose pointee is incomplete in memory_translate,
+before any statement is generated. The annotation is ignored with the
+usual "not yet supported" warning. void and function types are left
+out: sizeof(void) is accepted by gcc and clang, so \valid on a void *
+keeps working.
+
+Add constructs/incomplete_type.c as a regression test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/e-acsl/src/analyses/typing.ml         |  9 +++
+ .../src/code_generator/memory_translate.ml    | 12 +++-
+ .../e-acsl/tests/constructs/incomplete_type.c | 26 ++++++++
+ .../constructs/oracle/gen_incomplete_type.0.c | 62 +++++++++++++++++++
+ .../oracle/incomplete_type.0.res.oracle       | 24 +++++++
+ 5 files changed, 132 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/e-acsl/tests/constructs/incomplete_type.c
+ create mode 100644 plugins/e-acsl/tests/constructs/oracle/gen_incomplete_type.0.c
+ create mode 100644 plugins/e-acsl/tests/constructs/oracle/incomplete_type.0.res.oracle
+
+diff --git a/plugins/e-acsl/src/analyses/typing.ml b/plugins/e-acsl/src/analyses/typing.ml
+index 6263c8243b..bcb1828f42 100644
+--- a/plugins/e-acsl/src/analyses/typing.ml
++++ b/plugins/e-acsl/src/analyses/typing.ml
+@@ -16,6 +16,13 @@ open Analyses_datatype
+ let dkey = Options.Dkey.typing
+ module Error = Error.Make(struct let phase = dkey end)
+ 
++(* An incomplete struct or union has no size nor alignment: [sizeof] or
++   [alignof] of such a type would not compile. *)
++let is_incomplete_type ty =
++  not (Ast_types.C.is_void ty
++       || Ast_types.C.is_fun ty
++       || Cil.isCompleteType ty)
++
+ (* In order to properly handle recursive functions the typing method has to
+    store the result of the fixpoint algorithm on intervals before typing
+    the inner block of the function. To this end, we stop the recursive
+@@ -341,6 +348,8 @@ let rec type_term
+        (and of course also covers the missing cases). Also enforce the invariant
+        that every subterm is typed, even if it is not an integer. *)
+     match t.term_node with
++    | TSizeOf ty | TAlignOf ty when is_incomplete_type ty ->
++      Error.not_yet "sizeof or alignof of an incomplete type"
+     | TConst (Boolean _ | Integer _ | LChr _ | LEnum _ | LReal _)
+     | TSizeOf _
+     | TAlignOf _ ->
+diff --git a/plugins/e-acsl/src/code_generator/memory_translate.ml b/plugins/e-acsl/src/code_generator/memory_translate.ml
+index cfad697df9..7936067379 100644
+--- a/plugins/e-acsl/src/code_generator/memory_translate.ml
++++ b/plugins/e-acsl/src/code_generator/memory_translate.ml
+@@ -167,6 +167,14 @@ let gmp_to_sizet ~adata ~loc ?pp kf env size _p =
+     env
+     size
+ 
++(* The memory built-ins take the size of the pointed type, which an incomplete
++   struct or union does not have: [sizeof] of it would not compile. *)
++let check_complete_pointee ty =
++  if not (Ast_types.C.is_void ty
++          || Ast_types.C.is_fun ty
++          || Cil.isCompleteType ty)
++  then Error.not_yet "memory predicate on a pointer to an incomplete type"
++
+ (* Take a term of the form [ptr + r] where [ptr] is an address and [r] a range
+    offset, and return a tuple [(ptr, size, env)] where [ptr] is the address of
+    the start of the range, [size] is the size of the range in bytes and [env] is
+@@ -186,6 +194,7 @@ let range_to_ptr_and_size ~adata ~loc kf env ptr r p =
+     | TPtr ty | TArray (ty, _) -> ty
+     | _ -> assert false
+   in
++  check_complete_pointee ty;
+   let s = Logic_const.term ~loc (TSizeOf ty) Linteger in
+   (* ptr *)
+   let typ_charptr = Cil_const.charPtrType in
+@@ -272,12 +281,13 @@ let range_to_ptr_and_size ~adata ~loc kf env ptr r p =
+    [ptr] is an expression representing [t], [sizeof] is the size of the
+    expression in bytes. [adata] and [env] as usual. *)
+ let term_to_ptr_and_size ~adata ~loc kf env t =
++  let ty = Misc.unghost_type @@ Misc.cty t.term_type in
++  check_complete_pointee (Ast_types.C.direct_pointed ty);
+   let (e, adata), env =
+     Env.with_params_and_result ~env (fun env ->
+         let e, adata, env = Translate_terms.to_exp ~adata kf env t in
+         (e, adata), env)
+   in
+-  let ty = Misc.unghost_type @@ Misc.cty t.term_type in
+   let sizeof = Smart_exp.ptr_sizeof ~loc ty in
+   let adata =
+     Assert.register
+diff --git a/plugins/e-acsl/tests/constructs/incomplete_type.c b/plugins/e-acsl/tests/constructs/incomplete_type.c
+new file mode 100644
+index 0000000000..e15bfc8c70
+--- /dev/null
++++ b/plugins/e-acsl/tests/constructs/incomplete_type.c
+@@ -0,0 +1,26 @@
++/* run.config
++   COMMENT: annotations that would need the size or the alignment of an
++   COMMENT: incomplete struct type are ignored with a warning, instead of
++   COMMENT: generating code that does not compile
++   STDOPT: #"-rte"
++*/
++/* run.config_dev
++   MACRO: ROOT_EACSL_GCC_FC_EXTRA_EXT -rte
++*/
++
++typedef struct opaque opaque;
++
++/*@ requires obj == \null || \valid_read(obj);
++    requires obj == \null || \initialized(obj); */
++int is_set(const opaque *obj) {
++  return obj != 0;
++}
++
++/* -rte: pointer_alignment assertion with alignof(opaque) */
++opaque *from_void(void *p) {
++  return (opaque *)p;
++}
++
++int main(void) {
++  return is_set(from_void(0));
++}
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_incomplete_type.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_incomplete_type.0.c
+new file mode 100644
+index 0000000000..62c5cb2205
+--- /dev/null
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_incomplete_type.0.c
+@@ -0,0 +1,62 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++struct opaque;
++typedef struct opaque opaque;
++/*@ requires obj == \null || \valid_read(obj);
++    requires obj == \null || \initialized(obj);
++ */
++int __gen_e_acsl_is_set(opaque const *obj);
++
++int is_set(opaque const *obj)
++{
++  int __retres;
++  __retres = obj != (opaque const *)0;
++  return __retres;
++}
++
++opaque *from_void(void *p)
++{
++  opaque *__retres;
++  __e_acsl_store_block((void *)(& __retres),8UL);
++  __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& __retres));
++  /*@ assert rte: pointer_alignment: \aligned(p,alignof(opaque)); */
++  __retres = (opaque *)p;
++  __e_acsl_delete_block((void *)(& p));
++  __e_acsl_delete_block((void *)(& __retres));
++  return __retres;
++}
++
++int main(void)
++{
++  int tmp_0;
++  opaque *tmp;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_store_block((void *)(& tmp),8UL);
++  __e_acsl_full_init((void *)(& tmp));
++  tmp = from_void((void *)0);
++  tmp_0 = __gen_e_acsl_is_set((opaque const *)tmp);
++  __e_acsl_delete_block((void *)(& tmp));
++  __e_acsl_memory_clean();
++  return tmp_0;
++}
++
++/*@ requires obj == \null || \valid_read(obj);
++    requires obj == \null || \initialized(obj);
++ */
++int __gen_e_acsl_is_set(opaque const *obj)
++{
++  int __retres;
++  __e_acsl_store_block((void *)(& obj),8UL);
++  __retres = is_set(obj);
++  __e_acsl_delete_block((void *)(& obj));
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/constructs/oracle/incomplete_type.0.res.oracle b/plugins/e-acsl/tests/constructs/oracle/incomplete_type.0.res.oracle
+new file mode 100644
+index 0000000000..9af253e567
+--- /dev/null
++++ b/plugins/e-acsl/tests/constructs/oracle/incomplete_type.0.res.oracle
+@@ -0,0 +1,24 @@
++[e-acsl] beginning translation.
++[e-acsl] incomplete_type.c:21: Warning: 
++  cannot create the pointer alignment guard of p because void is an incomplete type
++[e-acsl] incomplete_type.c:13: Warning: 
++  cannot create the pointer alignment guard of obj because opaque const is an incomplete type
++[e-acsl] incomplete_type.c:13: Warning: 
++  cannot create the pointer alignment guard of obj because opaque const is an incomplete type
++[e-acsl] incomplete_type.c:14: Warning: 
++  cannot create the pointer alignment guard of obj because opaque const is an incomplete type
++[e-acsl] incomplete_type.c:14: Warning: 
++  cannot create the pointer alignment guard of obj because opaque const is an incomplete type
++[e-acsl] incomplete_type.c:21: Warning: 
++  E-ACSL construct `sizeof or alignof of an incomplete type'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] incomplete_type.c:13: Warning: 
++  E-ACSL construct `memory predicate on a pointer to an incomplete type'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] incomplete_type.c:14: Warning: 
++  E-ACSL construct `memory predicate on a pointer to an incomplete type'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
+-- 
+2.56.0.windows.4
+

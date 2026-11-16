@@ -1,0 +1,154 @@
+From 043ad4a8457877cfce9ef457b3ae52812164a86f Mon Sep 17 00:00:00 2001
+From: Florian Stosse <florian.stosse@gmail.com>
+Date: Sun, 15 Nov 2026 13:52:06 +0100
+Subject: [PATCH] [kernel] offsetof: accept non-constant array indexes (GCC
+ extension)
+
+GCC and Clang accept __builtin_offsetof(T, m[i]) with a non-constant
+index i, and compute it at run time; glibc-based code relies on it (for
+instance libseccomp, offsetof(struct seccomp_data, args[x])). The
+grammar already accepts such designators, but the typer folded the
+whole designator with Cil.bitsOffset, which raises SizeOfError
+"Index is not constant", and parsing stopped with
+
+  User Error: Unable to compute offset .args[i] in type struct s:
+  Index is not constant
+
+The typer now replaces each non-constant index of the designator by 0,
+folds the resulting constant offset as before, and adds
+(size_t)i * sizeof(element) for each such index:
+
+  offsetof(struct s, inner[i].v[j])
+    ~> (16UL + (unsigned long)i * 40UL) + (unsigned long)j * 8UL
+
+Designators with constant indexes are folded to a constant exactly as
+before, so they remain integer constant expressions; designators with a
+non-constant index give a non-constant size_t expression, as with GCC.
+
+New test: tests/syntax/offsetof_non_constant_index.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/internals/typing/cabs2cil.ml       | 37 +++++++++++++++++--
+ tests/syntax/offsetof_non_constant_index.c    | 23 ++++++++++++
+ .../offsetof_non_constant_index.0.res.oracle  | 25 +++++++++++++
+ 3 files changed, 82 insertions(+), 3 deletions(-)
+ create mode 100644 tests/syntax/offsetof_non_constant_index.c
+ create mode 100644 tests/syntax/oracle/offsetof_non_constant_index.0.res.oracle
+
+diff --git a/src/kernel/internals/typing/cabs2cil.ml b/src/kernel/internals/typing/cabs2cil.ml
+index 23929aaca3..c6601b9859 100644
+--- a/src/kernel/internals/typing/cabs2cil.ml
++++ b/src/kernel/internals/typing/cabs2cil.ml
+@@ -6965,14 +6965,45 @@ and doExp local_env
+                 | [{ enode = CastE (_, {enode = AddrOf (host, offset)}) } as e] ->
+                   begin
+                     piscall := false;
+-                    prestype := Machine.sizeof_type ();
++                    let size_t = Machine.sizeof_type () in
++                    prestype := size_t;
+                     let typ = Cil.typeOfLhost host in
++                    (* GCC extension: the designator may contain array
++                       indexes that are not constant ([offsetof(t, a[i])]).
++                       Each of them is replaced by 0 in the designator, which
++                       has then a constant offset, and contributes
++                       [(size_t)i * sizeof(elt)] to the result. *)
++                    let rec split typ = function
++                      | NoOffset -> NoOffset, []
++                      | Field (fi, off) ->
++                        let off, idx = split fi.ftype off in
++                        Field (fi, off), idx
++                      | Index (i, off) ->
++                        let elt = Ast_types.C.direct_array_element typ in
++                        let off, idx = split elt off in
++                        match Cil.constFoldToInt i with
++                        | Some _ -> Index (i, off), idx
++                        | None ->
++                          Index (Cil.zero ~loc:i.eloc, off), (i, elt) :: idx
++                    in
+                     try
+-                      let start, _width = Cil.bitsOffset typ offset in
++                      let cst_offset, indexes = split typ offset in
++                      let start, _width = Cil.bitsOffset typ cst_offset in
+                       if start mod 8 <> 0 then
+                         Kernel.error ~current:true "Using offset of bitfield";
+                       let kind = Machine.sizeof_kind () in
+-                      pres := Cil.kinteger ~loc:e.eloc kind (start / 8);
++                      let loc = e.eloc in
++                      let add acc (i, elt) =
++                        let size =
++                          Cil.kinteger ~loc kind (Cil.bytesSizeOf elt) in
++                        let i = Cil.mkCast ~newt:size_t i in
++                        let i =
++                          Cil.new_exp ~loc (BinOp (Mult, i, size, size_t)) in
++                        Cil.new_exp ~loc (BinOp (PlusA, acc, i, size_t))
++                      in
++                      pres :=
++                        List.fold_left add
++                          (Cil.kinteger ~loc kind (start / 8)) indexes
+                     with Cil.SizeOfError (s, _) ->
+                       pres := e;
+                       Kernel.error ~once:true ~current:true
+diff --git a/tests/syntax/offsetof_non_constant_index.c b/tests/syntax/offsetof_non_constant_index.c
+new file mode 100644
+index 0000000000..16f42e83a6
+--- /dev/null
++++ b/tests/syntax/offsetof_non_constant_index.c
+@@ -0,0 +1,23 @@
++/* GCC extension: non-constant array indexes in the member designator of
++   offsetof. Constant designators are still folded. */
++#include "stddef.h"
++
++struct s {
++  int hdr;
++  struct { char c; int v[4]; } inner[3];
++  unsigned long long args[6];
++};
++
++_Static_assert(offsetof(struct s, args[2]) == 80, "constant index");
++
++size_t arg_offset(int i) {
++  return offsetof(struct s, args[i]);
++}
++
++size_t inner_offset(int i, int j) {
++  return offsetof(struct s, inner[i].v[j]);
++}
++
++size_t mixed_offset(int i) {
++  return offsetof(struct s, inner[1].v[i]);
++}
+diff --git a/tests/syntax/oracle/offsetof_non_constant_index.0.res.oracle b/tests/syntax/oracle/offsetof_non_constant_index.0.res.oracle
+new file mode 100644
+index 0000000000..174548bd5d
+--- /dev/null
++++ b/tests/syntax/oracle/offsetof_non_constant_index.0.res.oracle
+@@ -0,0 +1,25 @@
++[kernel] Parsing offsetof_non_constant_index.c (with preprocessing)
++/* Generated by Frama-C */
++#include "stddef.h"
++size_t arg_offset(int i)
++{
++  size_t __retres;
++  __retres = 64U + (unsigned int)i * 8U;
++  return __retres;
++}
++
++size_t inner_offset(int i, int j)
++{
++  size_t __retres;
++  __retres = (8U + (unsigned int)i * 20U) + (unsigned int)j * 4U;
++  return __retres;
++}
++
++size_t mixed_offset(int i)
++{
++  size_t __retres;
++  __retres = 28U + (unsigned int)i * 4U;
++  return __retres;
++}
++
++
+-- 
+2.56.0.windows.4
+

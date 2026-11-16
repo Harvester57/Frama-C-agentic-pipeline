@@ -1,0 +1,853 @@
+From 0386c81d8f620aa9e1c8a33156e18d91ea356f35 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 16 Nov 2026 12:55:52 +0100
+Subject: [PATCH] [e-acsl] \object_pointer does not require the object to be
+ writable
+
+The ACSL definition of \object_pointer only asks the pointer to point
+into an object, or one past its end: nothing requires the object to be
+writable. The runtime implemented it with eacsl_valid, which is false
+on a block marked read-only, so \object_pointer(p) was false for any
+pointer into a string literal, a const global array or stdin, although
+\valid_read(p) held. With -warn-invalid-pointer, the "invalid pointer"
+guard (\null == p || \object_pointer(p)) then failed on the first read
+through such a pointer.
+
+Use eacsl_valid_read in eacsl_object_pointer, and \valid_read instead of
+\valid in the behaviours of its contract, which stated the same
+writability requirement (Eva concluded from it that \object_pointer is
+false on a const array).
+
+Regression test: tests/memory/object_pointer_readonly.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../e_acsl_observation_model.c                |   4 +-
+ .../e_acsl_observation_model.h                |  15 +-
+ .../tests/memory/object_pointer_readonly.c    |  32 +
+ .../oracle/gen_object_pointer_readonly.0.c    | 677 ++++++++++++++++++
+ .../object_pointer_readonly.0.res.oracle      |  34 +
+ 5 files changed, 755 insertions(+), 7 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/memory/object_pointer_readonly.c
+ create mode 100644 plugins/e-acsl/tests/memory/oracle/gen_object_pointer_readonly.0.c
+ create mode 100644 plugins/e-acsl/tests/memory/oracle/object_pointer_readonly.0.res.oracle
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c
+index a3fde368a9..a5e7bee8b8 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c
+@@ -102,8 +102,8 @@ int eacsl_separated(size_t count, ...) {
+ 
+ int eacsl_object_pointer(void *ptr, size_t size, void *ptr_base,
+                          void *addrof_base) {
+-  return eacsl_valid(ptr, size, ptr_base, addrof_base)
+-         || eacsl_valid(ptr - size, size, ptr_base, addrof_base);
++  return eacsl_valid_read(ptr, size, ptr_base, addrof_base)
++         || eacsl_valid_read(ptr - size, size, ptr_base, addrof_base);
+ }
+ 
+ int eacsl_aligned(void *ptr, size_t alignment) {
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h
+index c4bb566f5f..fcbed26de2 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h
++++ b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h
+@@ -322,25 +322,30 @@ int eacsl_valid(void *ptr, size_t size, void *base, void *addrof_base)
+   @ */
+ int eacsl_aligned(void *ptr, size_t alignment) __attribute__((FC_BUILTIN));
+ 
++/*! \brief Implementation of the \b \\object_pointer predicate of E-ACSL.
++ *
++ * Returns `true` if the `size` bytes from `ptr`, or the `size` bytes before
++ * `ptr` (one past the end of an object), are allocated, as in
++ * ::eacsl_valid_read: the object does not need to be writable. */
+ /*@ assigns \result \from *(((char*)ptr)+(-size..size-1)), ptr, size;
+   @ behavior valid:
+-  @   assumes \valid(((char *)ptr)+(0..size-1));
++  @   assumes \valid_read(((char *)ptr)+(0..size-1));
+   @   assumes
+   @     size <= 0 ||
+   @     ! \separated(((char *)ptr)+(0..size-1),
+   @                  ((char *)\base_addr(base))+(0..\block_length(base)-1));
+   @   ensures \result == 1;
+   @ behavior minus_one:
+-  @   assumes \valid(((char *)ptr)+(-size..-1));
+-  @   assumes ! \valid(((char *)ptr)+(0..size-1));
++  @   assumes \valid_read(((char *)ptr)+(-size..-1));
++  @   assumes ! \valid_read(((char *)ptr)+(0..size-1));
+   @   assumes
+   @     size <= 0 ||
+   @     ! \separated(((char *)ptr)+(-size..-1),
+   @                  ((char *)\base_addr(base))+(0..\block_length(base)-1));
+   @   ensures \result == 1;
+   @ behavior invalid_pointer_ptr:
+-  @   assumes ! \valid(((char *)ptr)+(-size..-1));
+-  @   assumes ! \valid(((char *)ptr)+(0..size-1));
++  @   assumes ! \valid_read(((char *)ptr)+(-size..-1));
++  @   assumes ! \valid_read(((char *)ptr)+(0..size-1));
+   @   ensures \result == 0;
+   @ behavior separated_ptr:
+   @   assumes size > 0;
+diff --git a/plugins/e-acsl/tests/memory/object_pointer_readonly.c b/plugins/e-acsl/tests/memory/object_pointer_readonly.c
+new file mode 100644
+index 0000000000..d27022c4fd
+--- /dev/null
++++ b/plugins/e-acsl/tests/memory/object_pointer_readonly.c
+@@ -0,0 +1,32 @@
++/* run.config
++   COMMENT: \object_pointer holds for pointers into read-only objects
++*/
++
++#include <stdio.h>
++
++static const char table[4] = {1, 2, 3, 0};
++
++int main(void) {
++  const char *t = table;
++  const char *s = "abc";
++
++  /* a const global array: read-only, but an object */
++  //@ check RO_T: \valid_read(t) && !\valid(t);
++  //@ check T0:   \object_pointer(t);
++  //@ check T3:   \object_pointer(t + 3);
++  //@ check T4:   \object_pointer(t + 4);
++  //@ check T5:  !\object_pointer(t + 5);
++  //@ check TM1: !\object_pointer(t - 1);
++
++  /* a string literal */
++  //@ check RO_S: \valid_read(s) && !\valid(s);
++  //@ check S0:   \object_pointer(s);
++  //@ check S4:   \object_pointer(s + 4);
++  //@ check S5:  !\object_pointer(s + 5);
++  //@ check SM1: !\object_pointer(s - 1);
++
++  /* a read-only standard stream */
++  //@ check IN:   \object_pointer(stdin);
++
++  return t[0] + s[0] != 'b';
++}
+diff --git a/plugins/e-acsl/tests/memory/oracle/gen_object_pointer_readonly.0.c b/plugins/e-acsl/tests/memory/oracle/gen_object_pointer_readonly.0.c
+new file mode 100644
+index 0000000000..a29fe7f912
+--- /dev/null
++++ b/plugins/e-acsl/tests/memory/oracle/gen_object_pointer_readonly.0.c
+@@ -0,0 +1,677 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++static char const table[4] = {(char)1, (char)2, (char)3, (char)0};
++char const __fc_lit_string1[4UL] = "abc";
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)(table),4UL);
++    __e_acsl_full_init((void *)(& table));
++    __e_acsl_mark_readonly((void *)(table));
++    __e_acsl_store_block((void *)(__fc_lit_string1),4UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)(table));
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
++  return;
++}
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_globals_init();
++  char const *t = table;
++  __e_acsl_store_block((void *)(& t),8UL);
++  __e_acsl_full_init((void *)(& t));
++  char const *s = __fc_lit_string1;
++  __e_acsl_store_block((void *)(& s),8UL);
++  __e_acsl_full_init((void *)(& s));
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_valid_read;
++    int __gen_e_acsl_and;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)t,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"t",(void *)t);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(t,1)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(t,1)";
++      __gen_e_acsl_assert_data_2.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 14;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_valid_read = __e_acsl_valid_read((void *)t,
++                                                  sizeof(char const),
++                                                  (void *)t,(void *)(& t));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"t",(void *)t);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\valid_read(t)",0,__gen_e_acsl_valid_read);
++    if (__gen_e_acsl_valid_read) {
++      int __gen_e_acsl_aligned_2;
++      int __gen_e_acsl_valid;
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++        {.values = (void *)0};
++      __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)t,1UL);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"t",
++                                   (void *)t);
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                   "\"pointer alignment\": \\aligned(t,1)",0,
++                                   __gen_e_acsl_aligned_2);
++      /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++      {
++        __gen_e_acsl_assert_data_3.blocking = 1;
++        __gen_e_acsl_assert_data_3.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_3.pred_txt = "\\aligned(t,1)";
++        __gen_e_acsl_assert_data_3.file = "object_pointer_readonly.c";
++        __gen_e_acsl_assert_data_3.fct = "main";
++        __gen_e_acsl_assert_data_3.line = 14;
++        __gen_e_acsl_assert_data_3.name = "pointer alignment";
++        __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_3);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++      }
++      __gen_e_acsl_valid = __e_acsl_valid((void *)t,sizeof(char const),
++                                          (void *)t,(void *)(& t));
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"t",(void *)t);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                     "sizeof(char const)",0,
++                                     sizeof(char const));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"\\valid(t)",0,
++                                   __gen_e_acsl_valid);
++      __gen_e_acsl_and = ! __gen_e_acsl_valid;
++    }
++    else __gen_e_acsl_and = 0;
++    __gen_e_acsl_assert_data.blocking = 0;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\valid_read(t) && !\\valid(t)";
++    __gen_e_acsl_assert_data.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 14;
++    __gen_e_acsl_assert_data.name = "RO_T";
++    __e_acsl_assert(__gen_e_acsl_and,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ check RO_T: \valid_read(t) && !\valid(t); */ ;
++  {
++    int __gen_e_acsl_aligned_3;
++    int __gen_e_acsl_object_pointer;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)t,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"t",(void *)t);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                 "\"pointer alignment\": \\aligned(t,1)",0,
++                                 __gen_e_acsl_aligned_3);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++    {
++      __gen_e_acsl_assert_data_5.blocking = 1;
++      __gen_e_acsl_assert_data_5.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_5.pred_txt = "\\aligned(t,1)";
++      __gen_e_acsl_assert_data_5.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_5.fct = "main";
++      __gen_e_acsl_assert_data_5.line = 15;
++      __gen_e_acsl_assert_data_5.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_3,& __gen_e_acsl_assert_data_5);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++    }
++    __gen_e_acsl_object_pointer = __e_acsl_object_pointer((void *)t,
++                                                          sizeof(char const),
++                                                          (void *)t,
++                                                          (void *)(& t));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"t",(void *)t);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_4,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "T0: \\object_pointer(t)",0,
++                                 __gen_e_acsl_object_pointer);
++    __gen_e_acsl_assert_data_4.blocking = 0;
++    __gen_e_acsl_assert_data_4.kind = "Assertion";
++    __gen_e_acsl_assert_data_4.pred_txt = "\\object_pointer(t)";
++    __gen_e_acsl_assert_data_4.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_4.fct = "main";
++    __gen_e_acsl_assert_data_4.line = 15;
++    __gen_e_acsl_assert_data_4.name = "T0";
++    __e_acsl_assert(__gen_e_acsl_object_pointer,& __gen_e_acsl_assert_data_4);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++  }
++  /*@ check T0: \object_pointer(t); */ ;
++  {
++    int __gen_e_acsl_aligned_4;
++    int __gen_e_acsl_object_pointer_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_4 = __e_acsl_aligned((void *)t,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_7,"t",(void *)t);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,
++                                 "\"pointer alignment\": \\aligned(t,1)",0,
++                                 __gen_e_acsl_aligned_4);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++    {
++      __gen_e_acsl_assert_data_7.blocking = 1;
++      __gen_e_acsl_assert_data_7.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_7.pred_txt = "\\aligned(t,1)";
++      __gen_e_acsl_assert_data_7.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_7.fct = "main";
++      __gen_e_acsl_assert_data_7.line = 16;
++      __gen_e_acsl_assert_data_7.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_4,& __gen_e_acsl_assert_data_7);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++    }
++    __gen_e_acsl_object_pointer_2 = __e_acsl_object_pointer((void *)(
++                                                            t + 3),
++                                                            sizeof(char const),
++                                                            (void *)t,
++                                                            (void *)(& t));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_6,"t",(void *)t);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_6,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                 "T3: \\object_pointer(t + 3)",0,
++                                 __gen_e_acsl_object_pointer_2);
++    __gen_e_acsl_assert_data_6.blocking = 0;
++    __gen_e_acsl_assert_data_6.kind = "Assertion";
++    __gen_e_acsl_assert_data_6.pred_txt = "\\object_pointer(t + 3)";
++    __gen_e_acsl_assert_data_6.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_6.fct = "main";
++    __gen_e_acsl_assert_data_6.line = 16;
++    __gen_e_acsl_assert_data_6.name = "T3";
++    __e_acsl_assert(__gen_e_acsl_object_pointer_2,
++                    & __gen_e_acsl_assert_data_6);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++  }
++  /*@ check T3: \object_pointer(t + 3); */ ;
++  {
++    int __gen_e_acsl_aligned_5;
++    int __gen_e_acsl_object_pointer_3;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_9 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_5 = __e_acsl_aligned((void *)t,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_9,"t",(void *)t);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_9,
++                                 "\"pointer alignment\": \\aligned(t,1)",0,
++                                 __gen_e_acsl_aligned_5);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++    {
++      __gen_e_acsl_assert_data_9.blocking = 1;
++      __gen_e_acsl_assert_data_9.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_9.pred_txt = "\\aligned(t,1)";
++      __gen_e_acsl_assert_data_9.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_9.fct = "main";
++      __gen_e_acsl_assert_data_9.line = 17;
++      __gen_e_acsl_assert_data_9.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_5,& __gen_e_acsl_assert_data_9);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_9);
++    }
++    __gen_e_acsl_object_pointer_3 = __e_acsl_object_pointer((void *)(
++                                                            t + 4),
++                                                            sizeof(char const),
++                                                            (void *)t,
++                                                            (void *)(& t));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_8,"t",(void *)t);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_8,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,
++                                 "T4: \\object_pointer(t + 4)",0,
++                                 __gen_e_acsl_object_pointer_3);
++    __gen_e_acsl_assert_data_8.blocking = 0;
++    __gen_e_acsl_assert_data_8.kind = "Assertion";
++    __gen_e_acsl_assert_data_8.pred_txt = "\\object_pointer(t + 4)";
++    __gen_e_acsl_assert_data_8.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_8.fct = "main";
++    __gen_e_acsl_assert_data_8.line = 17;
++    __gen_e_acsl_assert_data_8.name = "T4";
++    __e_acsl_assert(__gen_e_acsl_object_pointer_3,
++                    & __gen_e_acsl_assert_data_8);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++  }
++  /*@ check T4: \object_pointer(t + 4); */ ;
++  {
++    int __gen_e_acsl_aligned_6;
++    int __gen_e_acsl_object_pointer_4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_10 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_11 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_6 = __e_acsl_aligned((void *)t,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_11,"t",(void *)t);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_11,
++                                 "\"pointer alignment\": \\aligned(t,1)",0,
++                                 __gen_e_acsl_aligned_6);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++    {
++      __gen_e_acsl_assert_data_11.blocking = 1;
++      __gen_e_acsl_assert_data_11.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_11.pred_txt = "\\aligned(t,1)";
++      __gen_e_acsl_assert_data_11.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_11.fct = "main";
++      __gen_e_acsl_assert_data_11.line = 18;
++      __gen_e_acsl_assert_data_11.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_6,& __gen_e_acsl_assert_data_11);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_11);
++    }
++    __gen_e_acsl_object_pointer_4 = __e_acsl_object_pointer((void *)(
++                                                            t + 5),
++                                                            sizeof(char const),
++                                                            (void *)t,
++                                                            (void *)(& t));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_10,"t",(void *)t);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_10,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_10,
++                                 "\\object_pointer(t + 5)",0,
++                                 __gen_e_acsl_object_pointer_4);
++    __gen_e_acsl_assert_data_10.blocking = 0;
++    __gen_e_acsl_assert_data_10.kind = "Assertion";
++    __gen_e_acsl_assert_data_10.pred_txt = "!\\object_pointer(t + 5)";
++    __gen_e_acsl_assert_data_10.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_10.fct = "main";
++    __gen_e_acsl_assert_data_10.line = 18;
++    __gen_e_acsl_assert_data_10.name = "T5";
++    __e_acsl_assert(! __gen_e_acsl_object_pointer_4,
++                    & __gen_e_acsl_assert_data_10);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_10);
++  }
++  /*@ check T5: !\object_pointer(t + 5); */ ;
++  {
++    int __gen_e_acsl_aligned_7;
++    int __gen_e_acsl_object_pointer_5;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_12 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_13 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_7 = __e_acsl_aligned((void *)t,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_13,"t",(void *)t);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_13,
++                                 "\"pointer alignment\": \\aligned(t,1)",0,
++                                 __gen_e_acsl_aligned_7);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(t,1); */
++    {
++      __gen_e_acsl_assert_data_13.blocking = 1;
++      __gen_e_acsl_assert_data_13.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_13.pred_txt = "\\aligned(t,1)";
++      __gen_e_acsl_assert_data_13.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_13.fct = "main";
++      __gen_e_acsl_assert_data_13.line = 19;
++      __gen_e_acsl_assert_data_13.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_7,& __gen_e_acsl_assert_data_13);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_13);
++    }
++    __gen_e_acsl_object_pointer_5 = __e_acsl_object_pointer((void *)(
++                                                            t - 1),
++                                                            sizeof(char const),
++                                                            (void *)t,
++                                                            (void *)(& t));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_12,"t",(void *)t);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_12,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_12,
++                                 "\\object_pointer(t - 1)",0,
++                                 __gen_e_acsl_object_pointer_5);
++    __gen_e_acsl_assert_data_12.blocking = 0;
++    __gen_e_acsl_assert_data_12.kind = "Assertion";
++    __gen_e_acsl_assert_data_12.pred_txt = "!\\object_pointer(t - 1)";
++    __gen_e_acsl_assert_data_12.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_12.fct = "main";
++    __gen_e_acsl_assert_data_12.line = 19;
++    __gen_e_acsl_assert_data_12.name = "TM1";
++    __e_acsl_assert(! __gen_e_acsl_object_pointer_5,
++                    & __gen_e_acsl_assert_data_12);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_12);
++  }
++  /*@ check TM1: !\object_pointer(t - 1); */ ;
++  {
++    int __gen_e_acsl_aligned_8;
++    int __gen_e_acsl_valid_read_2;
++    int __gen_e_acsl_and_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_14 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_15 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_8 = __e_acsl_aligned((void *)s,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_15,"s",(void *)s);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_15,
++                                 "\"pointer alignment\": \\aligned(s,1)",0,
++                                 __gen_e_acsl_aligned_8);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++    {
++      __gen_e_acsl_assert_data_15.blocking = 1;
++      __gen_e_acsl_assert_data_15.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_15.pred_txt = "\\aligned(s,1)";
++      __gen_e_acsl_assert_data_15.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_15.fct = "main";
++      __gen_e_acsl_assert_data_15.line = 22;
++      __gen_e_acsl_assert_data_15.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_8,& __gen_e_acsl_assert_data_15);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_15);
++    }
++    __gen_e_acsl_valid_read_2 = __e_acsl_valid_read((void *)s,
++                                                    sizeof(char const),
++                                                    (void *)s,(void *)(& s));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_14,"s",(void *)s);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_14,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_14,
++                                 "\\valid_read(s)",0,
++                                 __gen_e_acsl_valid_read_2);
++    if (__gen_e_acsl_valid_read_2) {
++      int __gen_e_acsl_aligned_9;
++      int __gen_e_acsl_valid_2;
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_16 =
++        {.values = (void *)0};
++      __gen_e_acsl_aligned_9 = __e_acsl_aligned((void *)s,1UL);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_16,"s",
++                                   (void *)s);
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_16,
++                                   "\"pointer alignment\": \\aligned(s,1)",0,
++                                   __gen_e_acsl_aligned_9);
++      /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++      {
++        __gen_e_acsl_assert_data_16.blocking = 1;
++        __gen_e_acsl_assert_data_16.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_16.pred_txt = "\\aligned(s,1)";
++        __gen_e_acsl_assert_data_16.file = "object_pointer_readonly.c";
++        __gen_e_acsl_assert_data_16.fct = "main";
++        __gen_e_acsl_assert_data_16.line = 22;
++        __gen_e_acsl_assert_data_16.name = "pointer alignment";
++        __e_acsl_assert(__gen_e_acsl_aligned_9,& __gen_e_acsl_assert_data_16);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_16);
++      }
++      __gen_e_acsl_valid_2 = __e_acsl_valid((void *)s,sizeof(char const),
++                                            (void *)s,(void *)(& s));
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_14,"s",
++                                   (void *)s);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_14,
++                                     "sizeof(char const)",0,
++                                     sizeof(char const));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_14,
++                                   "\\valid(s)",0,__gen_e_acsl_valid_2);
++      __gen_e_acsl_and_2 = ! __gen_e_acsl_valid_2;
++    }
++    else __gen_e_acsl_and_2 = 0;
++    __gen_e_acsl_assert_data_14.blocking = 0;
++    __gen_e_acsl_assert_data_14.kind = "Assertion";
++    __gen_e_acsl_assert_data_14.pred_txt = "\\valid_read(s) && !\\valid(s)";
++    __gen_e_acsl_assert_data_14.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_14.fct = "main";
++    __gen_e_acsl_assert_data_14.line = 22;
++    __gen_e_acsl_assert_data_14.name = "RO_S";
++    __e_acsl_assert(__gen_e_acsl_and_2,& __gen_e_acsl_assert_data_14);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_14);
++  }
++  /*@ check RO_S: \valid_read(s) && !\valid(s); */ ;
++  {
++    int __gen_e_acsl_aligned_10;
++    int __gen_e_acsl_object_pointer_6;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_17 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_18 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_10 = __e_acsl_aligned((void *)s,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_18,"s",(void *)s);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_18,
++                                 "\"pointer alignment\": \\aligned(s,1)",0,
++                                 __gen_e_acsl_aligned_10);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++    {
++      __gen_e_acsl_assert_data_18.blocking = 1;
++      __gen_e_acsl_assert_data_18.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_18.pred_txt = "\\aligned(s,1)";
++      __gen_e_acsl_assert_data_18.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_18.fct = "main";
++      __gen_e_acsl_assert_data_18.line = 23;
++      __gen_e_acsl_assert_data_18.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_10,& __gen_e_acsl_assert_data_18);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_18);
++    }
++    __gen_e_acsl_object_pointer_6 = __e_acsl_object_pointer((void *)s,
++                                                            sizeof(char const),
++                                                            (void *)s,
++                                                            (void *)(& s));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_17,"s",(void *)s);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_17,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_17,
++                                 "S0: \\object_pointer(s)",0,
++                                 __gen_e_acsl_object_pointer_6);
++    __gen_e_acsl_assert_data_17.blocking = 0;
++    __gen_e_acsl_assert_data_17.kind = "Assertion";
++    __gen_e_acsl_assert_data_17.pred_txt = "\\object_pointer(s)";
++    __gen_e_acsl_assert_data_17.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_17.fct = "main";
++    __gen_e_acsl_assert_data_17.line = 23;
++    __gen_e_acsl_assert_data_17.name = "S0";
++    __e_acsl_assert(__gen_e_acsl_object_pointer_6,
++                    & __gen_e_acsl_assert_data_17);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_17);
++  }
++  /*@ check S0: \object_pointer(s); */ ;
++  {
++    int __gen_e_acsl_aligned_11;
++    int __gen_e_acsl_object_pointer_7;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_19 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_20 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_11 = __e_acsl_aligned((void *)s,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_20,"s",(void *)s);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_20,
++                                 "\"pointer alignment\": \\aligned(s,1)",0,
++                                 __gen_e_acsl_aligned_11);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++    {
++      __gen_e_acsl_assert_data_20.blocking = 1;
++      __gen_e_acsl_assert_data_20.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_20.pred_txt = "\\aligned(s,1)";
++      __gen_e_acsl_assert_data_20.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_20.fct = "main";
++      __gen_e_acsl_assert_data_20.line = 24;
++      __gen_e_acsl_assert_data_20.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_11,& __gen_e_acsl_assert_data_20);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_20);
++    }
++    __gen_e_acsl_object_pointer_7 = __e_acsl_object_pointer((void *)(
++                                                            s + 4),
++                                                            sizeof(char const),
++                                                            (void *)s,
++                                                            (void *)(& s));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_19,"s",(void *)s);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_19,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_19,
++                                 "S4: \\object_pointer(s + 4)",0,
++                                 __gen_e_acsl_object_pointer_7);
++    __gen_e_acsl_assert_data_19.blocking = 0;
++    __gen_e_acsl_assert_data_19.kind = "Assertion";
++    __gen_e_acsl_assert_data_19.pred_txt = "\\object_pointer(s + 4)";
++    __gen_e_acsl_assert_data_19.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_19.fct = "main";
++    __gen_e_acsl_assert_data_19.line = 24;
++    __gen_e_acsl_assert_data_19.name = "S4";
++    __e_acsl_assert(__gen_e_acsl_object_pointer_7,
++                    & __gen_e_acsl_assert_data_19);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_19);
++  }
++  /*@ check S4: \object_pointer(s + 4); */ ;
++  {
++    int __gen_e_acsl_aligned_12;
++    int __gen_e_acsl_object_pointer_8;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_21 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_22 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_12 = __e_acsl_aligned((void *)s,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_22,"s",(void *)s);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_22,
++                                 "\"pointer alignment\": \\aligned(s,1)",0,
++                                 __gen_e_acsl_aligned_12);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++    {
++      __gen_e_acsl_assert_data_22.blocking = 1;
++      __gen_e_acsl_assert_data_22.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_22.pred_txt = "\\aligned(s,1)";
++      __gen_e_acsl_assert_data_22.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_22.fct = "main";
++      __gen_e_acsl_assert_data_22.line = 25;
++      __gen_e_acsl_assert_data_22.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_12,& __gen_e_acsl_assert_data_22);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_22);
++    }
++    __gen_e_acsl_object_pointer_8 = __e_acsl_object_pointer((void *)(
++                                                            s + 5),
++                                                            sizeof(char const),
++                                                            (void *)s,
++                                                            (void *)(& s));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_21,"s",(void *)s);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_21,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_21,
++                                 "\\object_pointer(s + 5)",0,
++                                 __gen_e_acsl_object_pointer_8);
++    __gen_e_acsl_assert_data_21.blocking = 0;
++    __gen_e_acsl_assert_data_21.kind = "Assertion";
++    __gen_e_acsl_assert_data_21.pred_txt = "!\\object_pointer(s + 5)";
++    __gen_e_acsl_assert_data_21.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_21.fct = "main";
++    __gen_e_acsl_assert_data_21.line = 25;
++    __gen_e_acsl_assert_data_21.name = "S5";
++    __e_acsl_assert(! __gen_e_acsl_object_pointer_8,
++                    & __gen_e_acsl_assert_data_21);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_21);
++  }
++  /*@ check S5: !\object_pointer(s + 5); */ ;
++  {
++    int __gen_e_acsl_aligned_13;
++    int __gen_e_acsl_object_pointer_9;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_23 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_24 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_13 = __e_acsl_aligned((void *)s,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_24,"s",(void *)s);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_24,
++                                 "\"pointer alignment\": \\aligned(s,1)",0,
++                                 __gen_e_acsl_aligned_13);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(s,1); */
++    {
++      __gen_e_acsl_assert_data_24.blocking = 1;
++      __gen_e_acsl_assert_data_24.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_24.pred_txt = "\\aligned(s,1)";
++      __gen_e_acsl_assert_data_24.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_24.fct = "main";
++      __gen_e_acsl_assert_data_24.line = 26;
++      __gen_e_acsl_assert_data_24.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_13,& __gen_e_acsl_assert_data_24);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_24);
++    }
++    __gen_e_acsl_object_pointer_9 = __e_acsl_object_pointer((void *)(
++                                                            s - 1),
++                                                            sizeof(char const),
++                                                            (void *)s,
++                                                            (void *)(& s));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_23,"s",(void *)s);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_23,
++                                   "sizeof(char const)",0,sizeof(char const));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_23,
++                                 "\\object_pointer(s - 1)",0,
++                                 __gen_e_acsl_object_pointer_9);
++    __gen_e_acsl_assert_data_23.blocking = 0;
++    __gen_e_acsl_assert_data_23.kind = "Assertion";
++    __gen_e_acsl_assert_data_23.pred_txt = "!\\object_pointer(s - 1)";
++    __gen_e_acsl_assert_data_23.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_23.fct = "main";
++    __gen_e_acsl_assert_data_23.line = 26;
++    __gen_e_acsl_assert_data_23.name = "SM1";
++    __e_acsl_assert(! __gen_e_acsl_object_pointer_9,
++                    & __gen_e_acsl_assert_data_23);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_23);
++  }
++  /*@ check SM1: !\object_pointer(s - 1); */ ;
++  {
++    int __gen_e_acsl_aligned_14;
++    int __gen_e_acsl_object_pointer_10;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_25 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_26 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_14 = __e_acsl_aligned((void *)stdin,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_26,"__fc_stdin",
++                                 (void *)stdin);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_26,
++                                 "\"pointer alignment\": \\aligned(__fc_stdin,4)",
++                                 0,__gen_e_acsl_aligned_14);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(__fc_stdin,4); */
++    {
++      __gen_e_acsl_assert_data_26.blocking = 1;
++      __gen_e_acsl_assert_data_26.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_26.pred_txt = "\\aligned(__fc_stdin,4)";
++      __gen_e_acsl_assert_data_26.file = "object_pointer_readonly.c";
++      __gen_e_acsl_assert_data_26.fct = "main";
++      __gen_e_acsl_assert_data_26.line = 29;
++      __gen_e_acsl_assert_data_26.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_14,& __gen_e_acsl_assert_data_26);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_26);
++    }
++    __gen_e_acsl_object_pointer_10 = __e_acsl_object_pointer((void *)stdin,
++                                                             sizeof(FILE),
++                                                             (void *)stdin,
++                                                             (void *)(& stdin));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_25,"__fc_stdin",
++                                 (void *)stdin);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_25,
++                                   "sizeof(FILE)",0,sizeof(FILE));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_25,
++                                 "IN: \\object_pointer(__fc_stdin)",0,
++                                 __gen_e_acsl_object_pointer_10);
++    __gen_e_acsl_assert_data_25.blocking = 0;
++    __gen_e_acsl_assert_data_25.kind = "Assertion";
++    __gen_e_acsl_assert_data_25.pred_txt = "\\object_pointer(__fc_stdin)";
++    __gen_e_acsl_assert_data_25.file = "object_pointer_readonly.c";
++    __gen_e_acsl_assert_data_25.fct = "main";
++    __gen_e_acsl_assert_data_25.line = 29;
++    __gen_e_acsl_assert_data_25.name = "IN";
++    __e_acsl_assert(__gen_e_acsl_object_pointer_10,
++                    & __gen_e_acsl_assert_data_25);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_25);
++  }
++  /*@ check IN: \object_pointer(__fc_stdin); */ ;
++  __retres = (int)*(t + 0) + (int)*(s + 0) != 98;
++  __e_acsl_delete_block((void *)(& s));
++  __e_acsl_delete_block((void *)(& t));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/memory/oracle/object_pointer_readonly.0.res.oracle b/plugins/e-acsl/tests/memory/oracle/object_pointer_readonly.0.res.oracle
+new file mode 100644
+index 0000000000..0589499cca
+--- /dev/null
++++ b/plugins/e-acsl/tests/memory/oracle/object_pointer_readonly.0.res.oracle
+@@ -0,0 +1,34 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] object_pointer_readonly.c:14: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:14: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:15: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:16: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:17: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:19: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:22: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:22: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:23: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:24: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:25: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:26: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:29: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:29: Warning: 
++  function __e_acsl_assert, behavior non_blocking: precondition got status unknown.
++[eva:alarm] object_pointer_readonly.c:29: Warning: 
++  check 'IN' got status unknown.
+-- 
+2.56.0.windows.4
+

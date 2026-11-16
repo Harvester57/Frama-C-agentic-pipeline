@@ -1,6 +1,10 @@
 # E-ACSL: formal parameters are registered in shadow memory but never marked initialized, so `\initialized` on a by-value struct field fails on every call (#177 is back)
 
-Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues). Not filed yet.
+**Filed upstream on 2026-11-15:** issue [#2797](https://git.frama-c.com/pub/frama-c/-/work_items/2797), merge request [!28](https://git.frama-c.com/pub/frama-c/-/merge_requests/28).
+
+Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues). Not filed yet at the time of writing; see the filing note at the top.
+
+**Filing package:** [issue](./filing/13-eacsl-formal-params-initialized-issue.md), [MR](./filing/13-eacsl-formal-params-initialized-mr.md), [reproducer](./repro/13-eacsl-formal-params-initialized.sh), [patch](./patches/13-eacsl-formal-params-initialized.patch)
 
 **Same bug as [#177](https://git.frama-c.com/pub/frama-c/-/work_items/177)**, closed on 2022-09-28 with
 "The assertion does not fail anymore." Its program fails again on 34 and 35 (see
@@ -76,9 +80,13 @@ E-ACSL emits `__e_acsl_full_init` at each of their assignments.
 
 ## Versions
 
-- Reproduced with Frama-C `35.0~~dev (Bromine)`, built from `master` at `ad24dca` (2026-11-02),
-  Debian 13, gcc 14.2.0 and clang 19.1.7, with and without `-M` (full memory tracking).
-- Same behaviour in `34.0~~dev (Selenium)` (#177's program, gcc and clang, with and without `-M`).
+- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`), Debian 13,
+  gcc 14.2.0, with [`./repro/13-eacsl-formal-params-initialized.sh`](./repro/13-eacsl-formal-params-initialized.sh)
+  (2026-11-15: the `requires \initialized(&s.len)` program `c.c`, and the scalar `k = 7; pk = &k`
+  program with `-F "-rte -rte-initialized @all"`). First reproduced on `ad24dca` (2026-11-02), with
+  gcc and clang 19.1.7, with and without `-M` (full memory tracking).
+- Same output on `34.0~beta (Selenium)` (2026-11-15). Earlier also on `34.0~~dev (Selenium)`
+  (#177's program, gcc and clang, with and without `-M`).
 - #177 was closed in 2022 as no longer failing. I cannot tell which release brought it back.
 
 ## Reproduction
@@ -147,7 +155,15 @@ Aborted
 #177's program (`i177.c`, quoted on the issue) fails with plain `e-acsl-gcc i177.c`, as shown in the
 [Summary](#summary).
 
-## Proposed fix
+## Fix
+
+Patch: [`./patches/13-eacsl-formal-params-initialized.patch`](./patches/13-eacsl-formal-params-initialized.patch),
+one commit on `fix/e-acsl-formals-initialized` from `3dff90fc70`, "[e-acsl] mark formal parameters
+as initialized on function entry" (63 files, 410 lines added, 1 removed). Besides the source change
+below, it contains the 57 promoted `gen_*.c` oracles (see the validation) and the regression test
+`plugins/e-acsl/tests/bts/issue-framac-177.c` (`requires \initialized(&s.len)` and
+`assert \initialized(&s.t)` on a by-value struct, `assert \initialized(pk)` on `&k` after `k = 7`)
+with its default-configuration oracles.
 
 Where E-ACSL stores the formals, also mark each one fully initialized, as `global_observer.ml` does
 for globals:
@@ -232,7 +248,25 @@ and `__e_acsl_temporal_pull_parameter` runs in the callee. An initialization cou
 the argument's init bits when the argument is a tracked lvalue, and fall back to full
 initialization otherwise. Only struct and union formals need it. I have not implemented it.
 
-## Validation of the proposed fix
+## Validation of the fix
+
+### On `3dff90fc70` (2026-11-15)
+
+Built on `3dff90fc70` with the patch (image `framac-master-audit:3dff90f`, incremental
+`dune build @install --release` and `dune install`). Programs built with `e-acsl-gcc` (gcc 14.2.0).
+
+| Check | `master` `3dff90fc70` | 34.0~beta | Patched |
+|---|---|---|---|
+| `c.c` (`requires \initialized(&s.len)`), plain `e-acsl-gcc` | `Precondition failed: \initialized(&s.len)`, exit 134 | same | runs, exit 0 |
+| scalar `k = 7; int *pk = &k; return *pk * 2;`, `-F "-rte -rte-initialized @all"` | `E-ACSL RTE failed: \initialized(pk)`, exit 134 | same | runs, exit 0 |
+| `t.c` (RTE guard on `s.len`), `-F "-rte -rte-initialized @all"` | false `\initialized(&s.len)`, abort | not run | runs, exit 0 |
+| `u.c`, uninitialized local, and `su.c`, uninitialized `int` passed by value, `-F` | reported | not run | still reported |
+| ptests `plugins/e-acsl/tests`, default configuration (198 results with the new test) | — | — | the 57 `gen_*.c` changes described below plus the new test's oracles; promoted; rerun clean |
+| ptests `plugins/e-acsl/tests`, `dev` configuration (compile and run) | existing tests pass; new test fails | — | pass, new test included |
+| With the Issue 8 patch applied too | — | — | both apply together on `3dff90fc70`; reproducers and negative controls as above; E-ACSL ptests with the oracles of both patches pass in default and `dev` with no difference |
+| `make check-lint` (63 changed files, ocp-indent 1.10.0) | — | — | clean (`clang-format` not installed: new C test not checked) |
+
+### On `ad24dca` (2026-11-02)
 
 Built from `ad24dca` with the patch, then installed over the switch of a throwaway copy of the
 35 image. Every program was built with `e-acsl-gcc -G clang`, and `-F` is
@@ -255,9 +289,10 @@ Built from `ad24dca` with the patch, then installed over the switch of a throwaw
 | With the Issue 8 patch applied too | — | both apply cleanly together; `struct_repro.c` (Issue 8), `t.c` and `i177.c` run clean; `u.c` and Issue 8's `uninit_neg.c` still report |
 
 The 57 oracles are spread over `bts` (12), `memory` (13), `temporal` (8), `constructs` (6),
-`builtin` (4), `concurrency` (4), `special` (4), `libc` (3), `format` (2) and `inductive` (1). They
-need promoting with the patch. No existing test checks `\initialized` on a formal, which is why the
-suite never caught this.
+`builtin` (4), `concurrency` (4), `special` (4), `libc` (3), `format` (2) and `inductive` (1). The
+same 57 changed on `3dff90fc70`, and the patch includes them, promoted. No existing test checked
+`\initialized` on a formal, which is why the suite never caught this; the new
+`bts/issue-framac-177.c` does.
 
 ## Workaround
 
