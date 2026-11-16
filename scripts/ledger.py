@@ -7,7 +7,8 @@ Subcommands (run with the run directory as working directory):
                            [--security-props workspace/reports/security_props.json] [--refresh]
                            (refuses while the reach gate fails, or while the model has a threat
                            model and security_props.json is missing; --refresh re-derives the
-                           units without evidence from the current DAG)
+                           units without evidence from the current DAG; records the stub overlay's
+                           active contracts as record-stub-contracts does)
   ingest-fuzz              <workspace/reports/fuzz/*.json ...>
   ingest-eva               <workspace/reports/eva/*.json ...>
   ingest-wp                <workspace/reports/wp/*.json ...> [--sweep]
@@ -72,6 +73,7 @@ from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
     EVA_REPORT_MAX_BYTES,
+    STUB_REPORT_REL,
     ArtifactError,
     RunLockTimeout,
     atomic_write_json,
@@ -107,6 +109,9 @@ LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame"}
 # Step I9: classes keyed to the MetAcsl properties of scripts/security_props.py.
 SECURITY_CLASSES = ("l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
 DEFAULT_SECURITY_PROPS = Path("workspace/reports/security_props.json")
+# The stub overlay's report (scripts/stub_gen.py) and its stub-check (scripts/stub_check.py).
+DEFAULT_STUB_REPORT = Path(STUB_REPORT_REL)
+DEFAULT_STUB_CHECK = Path("workspace/reports/stub_check.json")
 METACSL_CLASSES = ("l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
 # Plan step M2: obligations security_props.py decided from the model, recorded at seed time as
 # evidence of this phase. A seed refresh re-derives a unit whose only evidence is of this phase.
@@ -930,11 +935,15 @@ def cmd_seed(
     profile: str | None = None,
     security_props: Path | None = None,
     refresh: bool = False,
+    stub_report: Path = DEFAULT_STUB_REPORT,
+    stub_check: Path | None = DEFAULT_STUB_CHECK,
 ) -> dict:
     """
     Add the units the DAG derives that the ledger lacks; an existing unit is never rewound. With
     `refresh` (a Phase 0 re-run on a changed target), the units without evidence also follow the
-    current DAG (`_refresh_units`), and the result reports what changed.
+    current DAG (`_refresh_units`), and the result reports what changed. The stub overlay's active
+    contracts (`stub_report`, when present) are recorded as `stub_contract` assumptions as
+    `record-stub-contracts` does, so a seed run by hand records them too.
     """
     dag = load_json_strict(dag_path)
     units, candidates = load_state()
@@ -946,6 +955,7 @@ def cmd_seed(
     for cid in added:
         units[cid] = derived[cid]
     changes = _refresh_units(units, derived, set(added), dag_fns) if refresh else None
+    stubs = _apply_stub_contracts(units, stub_report, stub_check)
     commit(units, candidates)
     out: dict[str, Any] = {
         "added_units": len(added),
@@ -958,6 +968,7 @@ def cmd_seed(
             "functions": len(sec_matched),
             "unmatched": sorted(set(obligations or {}) - sec_matched)[:20],
         },
+        "stub_contracts": stubs,
     }
     if changes is not None:
         out["refresh"] = changes
@@ -2893,22 +2904,20 @@ def stub_contract_descriptions(report: dict, check: dict | None = None) -> dict[
     return out
 
 
-@ledger_locked
-def cmd_record_stub_contracts(report_path: Path, check_path: Path | None = None) -> dict:
+def _apply_stub_contracts(units: dict[str, dict], report_path: Path, check_path: Path | None) -> dict:
     """
-    Record the run's stub overlay contracts (`stub_gen.py run`) as `stub_contract` assumptions on the
-    units of the functions that call them. Replaces the overlay assumptions recorded before, so an
-    edited header (a new digest) or a contract back in draft never leaves a stale one. No ledger yet:
-    nothing to do (`seed` records them).
+    Make the `stub_contract` assumptions of `units` match the stub report at `report_path` (and the
+    stub-check statuses at `check_path`), in memory; the caller commits when `units_changed` is not 0.
     """
-    if not Path(LEDGER).is_file():
-        return {"recorded": 0, "skipped_reason": "no ledger yet: `seed` records the stub contracts"}
     report = load_json_optional(report_path, None)
     if not isinstance(report, dict):
-        return {"recorded": 0, "skipped_reason": f"no stub report at {report_path}: run `stubs` first"}
+        return {
+            "recorded": 0,
+            "units_changed": 0,
+            "skipped_reason": f"no stub report at {report_path}: run `stubs` first",
+        }
     check = load_json_optional(check_path, None) if check_path is not None else None
     wanted = stub_contract_descriptions(report, check if isinstance(check, dict) else None)
-    units, candidates = load_state()
     changed = 0
     recorded = 0
     for u in units.values():
@@ -2929,9 +2938,24 @@ def cmd_record_stub_contracts(report_path: Path, check_path: Path | None = None)
         if new != u["assumptions"]:
             u["assumptions"] = new
             changed += 1
-    if changed:
-        commit(units, candidates, run_dir=Path.cwd())
     return {"recorded": recorded, "units_changed": changed, "callers": len(wanted)}
+
+
+@ledger_locked
+def cmd_record_stub_contracts(report_path: Path, check_path: Path | None = None) -> dict:
+    """
+    Record the run's stub overlay contracts (`stub_gen.py run`) as `stub_contract` assumptions on the
+    units of the functions that call them. Replaces the overlay assumptions recorded before, so an
+    edited header (a new digest) or a contract back in draft never leaves a stale one, and running it
+    again changes nothing. No ledger yet: nothing to do, `seed` records them when it creates the units.
+    """
+    if not Path(LEDGER).is_file():
+        return {"recorded": 0, "skipped_reason": "no ledger yet: `ledger.py seed` records the stub contracts"}
+    units, candidates = load_state()
+    out = _apply_stub_contracts(units, report_path, check_path)
+    if out["units_changed"]:
+        commit(units, candidates, run_dir=Path.cwd())
+    return out
 
 
 def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_outputs: list[str]) -> set[str]:
@@ -4182,8 +4206,8 @@ def main(argv: list[str] | None = None) -> int:
     p_sc = sub.add_parser(
         "record-stub-contracts", help="Record the stub overlay's active contracts as stub_contract assumptions"
     )
-    p_sc.add_argument("--report", type=Path, default=Path("workspace/reports/stubs.json"))
-    p_sc.add_argument("--check-report", type=Path, default=Path("workspace/reports/stub_check.json"))
+    p_sc.add_argument("--report", type=Path, default=DEFAULT_STUB_REPORT)
+    p_sc.add_argument("--check-report", type=Path, default=DEFAULT_STUB_CHECK)
     p_ver = sub.add_parser("ingest-verifier")
     p_ver.add_argument("result", type=Path)
     p_ver.add_argument("--replay-report", action="append", type=Path, default=[])
