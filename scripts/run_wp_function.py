@@ -266,10 +266,16 @@ def goal_costs_from_report(entries: list[dict], fn_name: str) -> tuple[list[dict
         names = [n for n in (_prover_name(p.get("prover")) for p in smt) if n]
         times = [t for t in (_positive_ms(p.get("time")) for p in smt) if t is not None]
         prop = e.get("property")
+        src, line = e.get("file"), e.get("line")
         unproven.append(
             {
                 "goal": goal,
                 "property": prop if isinstance(prop, str) and prop else None,
+                # Where WP reports the goal, as it writes them (the file is a path of the analysis
+                # run). With `property` they pair a goal with its row in `unproven_goals`, which has
+                # no goal name (scripts/wp_residual_census.py).
+                "file": src if isinstance(src, str) and src else None,
+                "line": line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None,
                 "verdict_kind": kind,
                 "provers": list(dict.fromkeys(names)),
                 "time_ms": max(times) if times else None,
@@ -284,8 +290,8 @@ def goal_costs_from_log(log: str) -> list[dict]:
     """
     unproven_goal_costs from the log tags, when no JSON report is available. Only a line that is exactly
     `[wp] [<Verdict>] <goal>` followed by parenthesised tags yields provers and the cached mark; any other
-    tail leaves them empty. The log carries no solver time, so `time_ms` is always null and `property`
-    (not reliably encoded in the goal name) too.
+    tail leaves them empty. The log carries no solver time, so `time_ms` is always null, and so are
+    `property` (not reliably encoded in the goal name), `file` and `line`.
     """
     costs: list[dict] = []
     seen: set[str] = set()
@@ -305,6 +311,8 @@ def goal_costs_from_log(log: str) -> list[dict]:
             {
                 "goal": goal,
                 "property": None,
+                "file": None,
+                "line": None,
                 "verdict_kind": m.group(1).lower(),
                 "provers": provers,
                 "time_ms": None,

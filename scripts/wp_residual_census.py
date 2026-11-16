@@ -14,11 +14,20 @@ written is the one named by `--out`.
 
 Verdict kinds come from `unproven_goal_costs` (one entry per WP goal: timeout, stepout, unknown,
 failed). A report written before that field existed has verdict kind `unrecorded`. The costs are
-keyed by WP goal name while `unproven_goals` are rows of the WP CSV report, so the two are paired
-only when every unproved goal's `annotation` equals exactly one cost's `property` and the reverse
-(`join: by_property`); otherwise a function's verdict kinds are reported as a distribution next to
-its class and bucket distributions without pairing (`join: per_function_only`, goals marked
-`unjoined`).
+keyed by WP goal name while `unproven_goals` are rows of the WP CSV report, which has no goal name,
+so a row is paired with the costs WP reports at the same source line (and file name) whose property
+name has the row's kind: `signed_overflow` pairs with `<function>_assert_rte_signed_overflow_3`,
+`postcondition` with `<function>_ensures...`. The row takes the verdict kind those costs agree on,
+`mixed` when they disagree, and `unjoined` when there is none, when a cost has no line (it came
+from the log, or the report predates the `file` and `line` fields), or when the line has more rows
+than costs. `join` says how far that went for a function: `by_line_and_kind` (every row paired),
+`partial`, or `per_function_only` (none; the verdict kinds are then only a distribution next to the
+class and bucket distributions). The kind mapping was checked on Frama-C 34 for RTE assertions,
+postconditions, loop invariants and user assertions; the other kinds (a callee's precondition, a
+clause in a behavior) follow WP's naming scheme unchecked, and a mismatch there gives `unjoined`.
+
+A verdict kind is WP's merged verdict over the provers of the run: with several provers a timeout
+can hide another prover's unknown, so `would_be_all_proven_if_timeouts_closed` is an upper bound.
 
 Fail closed: a report that cannot be read or has the wrong shape is counted and named under
 `reports.unreadable`, never dropped. A missing WP report directory is an error.
@@ -32,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from collections import Counter
@@ -50,10 +60,28 @@ PROVEN_STATUS = "all_proven"
 TIMEOUT_KINDS = frozenset({"timeout", "stepout"})
 UNRECORDED = "unrecorded"
 UNJOINED = "unjoined"
-JOIN_BY_PROPERTY = "by_property"
+MIXED = "mixed"
+JOIN_BY_LINE = "by_line_and_kind"
+JOIN_PARTIAL = "partial"
 JOIN_PER_FUNCTION = "per_function_only"
-JOIN_KEY = "unproven_goals[].annotation == unproven_goal_costs[].property (exact string match)"
+JOIN_KEY = (
+    "unproven_goals[] (file name, line, kind) against unproven_goal_costs[] (file name, line, kind token of property)"
+)
 DEFAULT_NEAR_MISS = 3
+
+# The CSV report's `property kind` -> the token WP's property name carries for it after the
+# `<function>_` prefix. A kind that is one word and not listed is an RTE alarm kind, which WP names
+# `assert_rte_<kind>`. A kind in neither group pairs on the line alone.
+_CLAUSE_KIND_TOKENS = {
+    "postcondition": "ensures",
+    "precondition": "requires",
+    "loop invariant": "loop_invariant",
+    "loop variant": "loop_variant",
+    "assigns clause": "assigns",  # `loop_assigns` too: the CSV has one kind for both
+    "termination clause": "terminates",
+    "user assertion": "assert",
+}
+_RTE_KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
 
 
 class CensusError(RuntimeError):
@@ -99,24 +127,69 @@ def _verdict_kind(cost: dict) -> str:
     return str(cost.get("verdict_kind") or "unspecified")
 
 
-def join_by_property(goals: list[dict], costs: list[dict]) -> list[str] | None:
+def _line_number(raw: object) -> int | None:
+    """A positive source line from a report field (the CSV rows carry it as a number or as text)."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        raw = int(raw.strip())
+    return raw if isinstance(raw, int) and raw > 0 else None
+
+
+def _file_name(raw: object) -> str:
+    """The last path component: a cost's file is a path of the analysis run, a row's is relative."""
+    return str(raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _kind_matches(kind: str, prop: str, function: str) -> bool:
+    """Whether WP's property name `prop` is of the CSV report kind `kind` (see _CLAUSE_KIND_TOKENS)."""
+    kind = " ".join(kind.lower().split())
+    rest = prop[len(function) + 1 :] if function and prop.startswith(function + "_") else prop
+    token = _CLAUSE_KIND_TOKENS.get(kind)
+    if token is None and _RTE_KIND_RE.fullmatch(kind):
+        # Anchored on both sides: `signed_overflow` must not pair with `unsigned_overflow`.
+        return re.search(rf"(?:^|_)assert_rte_{re.escape(kind)}(?:_|$)", rest) is not None
+    if token is None:
+        return True
+    if re.search(rf"(?:^|_){token}(?:_|$)", rest) is None:
+        return False
+    return not (kind == "user assertion" and re.search(r"(?:^|_)assert_rte(?:_|$)", rest))
+
+
+def join_by_line(goals: list[dict], costs: list[dict], function: str) -> tuple[list[str], int]:
     """
-    Verdict kind per unproved goal, in goal order, when the pairing through `property` is total
-    and one-to-one; None otherwise. One CSV row can split into several WP goals, so a repeated
-    property is normal and simply means no pairing.
+    Verdict kind per unproved goal, in goal order, and the number of costs paired with no goal.
+    A goal's candidates are the costs at its line (and file name, when both give one) whose property
+    is of its kind. Fails closed to `unjoined`: no candidate, or more goals than costs sharing the
+    same candidates (one of those rows then has no cost of its own).
     """
-    if not goals or len(goals) != len(costs):
-        return None
-    goal_props = [g.get("annotation") for g in goals]
-    cost_props = [c.get("property") for c in costs]
-    if not all(isinstance(p, str) and p for p in goal_props + cost_props):
-        return None
-    if len(set(goal_props)) != len(goal_props) or len(set(cost_props)) != len(cost_props):
-        return None
-    by_prop = {str(c["property"]): _verdict_kind(c) for c in costs}
-    if set(by_prop) != set(goal_props):
-        return None
-    return [by_prop[str(p)] for p in goal_props]
+    located = [
+        (i, line, _file_name(c.get("file")), str(c.get("property") or ""))
+        for i, c in enumerate(costs)
+        if (line := _line_number(c.get("line"))) is not None
+    ]
+    candidates: list[frozenset[int]] = []
+    for g in goals:
+        g_line, g_file, g_kind = _line_number(g.get("line")), _file_name(g.get("file")), str(g.get("kind") or "")
+        candidates.append(
+            frozenset(
+                i
+                for i, line, file, prop in located
+                if line == g_line
+                and (not file or not g_file or file == g_file)
+                and _kind_matches(g_kind, prop, function)
+            )
+        )
+    sharing = Counter(candidates)
+    kinds: list[str] = []
+    for cand in candidates:
+        if not cand or sharing[cand] > len(cand):
+            kinds.append(UNJOINED)
+            continue
+        verdicts = {_verdict_kind(costs[i]) for i in cand}
+        kinds.append(verdicts.pop() if len(verdicts) == 1 else MIXED)
+    paired = set().union(*(c for c, k in zip(candidates, kinds, strict=True) if k != UNJOINED))
+    return kinds, len(costs) - len(paired)
 
 
 def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
@@ -129,15 +202,16 @@ def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
     function = str(report.get("function"))
 
     join: str | None = None
+    unpaired_costs = 0
     if not goals:
         goal_kinds: list[str] = []
     elif not recorded:
         goal_kinds = [UNRECORDED] * len(goals)
         join = JOIN_PER_FUNCTION
     else:
-        paired = join_by_property(goals, costs)
-        join = JOIN_BY_PROPERTY if paired is not None else JOIN_PER_FUNCTION
-        goal_kinds = paired if paired is not None else [UNJOINED] * len(goals)
+        goal_kinds, unpaired_costs = join_by_line(goals, costs, function)
+        joined = sum(k != UNJOINED for k in goal_kinds)
+        join = JOIN_BY_LINE if joined == len(goals) else JOIN_PARTIAL if joined else JOIN_PER_FUNCTION
 
     if recorded:
         by_verdict = dict(sorted(Counter(_verdict_kind(c) for c in costs).items()))
@@ -159,8 +233,14 @@ def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
         "by_class": dict(sorted(Counter(str(g.get("obligation_class") or "rte") for g in goals).items())),
         "by_bucket": dict(sorted(Counter(str(g.get("diagnostic_bucket") or "unbucketed") for g in goals).items())),
         "by_verdict": by_verdict,
+        # The same verdicts counted per CSV row (what `unproved`, classes and buckets count).
+        "rows_by_verdict": dict(sorted(Counter(goal_kinds).items())),
         "verdicts_recorded": recorded,
         "join": join,
+        "unpaired_costs": unpaired_costs,
+        "provers": [p for p in report.get("wp_provers") or [] if isinstance(p, str)]
+        if isinstance(report.get("wp_provers"), list)
+        else [],
     }
     unproved = [
         {
@@ -271,9 +351,23 @@ def census(run_dir: Path, near_miss: int = DEFAULT_NEAR_MISS) -> dict:
     frame = [g for r in near for g in goals_by_fn[(r["file"], r["function"])]]
 
     joins = Counter(str(r["join"]) for r in with_unproved)
-    join = (
-        JOIN_BY_PROPERTY if with_unproved and joins.get(JOIN_BY_PROPERTY) == len(with_unproved) else JOIN_PER_FUNCTION
-    )
+    if with_unproved and joins.get(JOIN_BY_LINE) == len(with_unproved):
+        join = JOIN_BY_LINE
+    elif joins.get(JOIN_BY_LINE) or joins.get(JOIN_PARTIAL):
+        join = JOIN_PARTIAL
+    else:
+        join = JOIN_PER_FUNCTION
+    unpaired = sum(r["unpaired_costs"] for r in records)
+    if unpaired:
+        notes.append(
+            f"{unpaired} WP goal(s) with a verdict kind were paired with no unproved report row "
+            "(no line recorded, or no row of that kind at that line); they count in the verdict totals only"
+        )
+    if any(len(r["provers"]) != 1 for r in recorded):
+        notes.append(
+            "verdict kinds are WP's merged verdict over the provers of a run: with several provers a timeout "
+            "can hide another prover's unknown, so would_be_all_proven_if_timeouts_closed is an upper bound"
+        )
     undecided = [
         {"file": r["file"], "function": r["function"], "status": r["status"]}
         for r in records
@@ -332,6 +426,7 @@ def census(run_dir: Path, near_miss: int = DEFAULT_NEAR_MISS) -> dict:
             "unproved_by_class": _sum_counts(records, "by_class"),
             "unproved_by_bucket": _sum_counts(records, "by_bucket"),
             "unproved_by_verdict": _sum_counts(records, "by_verdict"),
+            "unproved_rows_by_verdict": _sum_counts(records, "rows_by_verdict"),
         },
         "functions": records,
         "functions_without_decided_goals": undecided,
@@ -385,6 +480,7 @@ def render_table(data: dict) -> str:
         ("obligation class", "unproved_by_class"),
         ("diagnostic bucket", "unproved_by_bucket"),
         ("verdict kind", "unproved_by_verdict"),
+        ("verdict kind, per report row", "unproved_rows_by_verdict"),
     ):
         out += [f"### Unproved goals by {title}", ""]
         out += _table([title.capitalize(), "Goals"], [[k, v] for k, v in totals[key].items()] or [["-", 0]])

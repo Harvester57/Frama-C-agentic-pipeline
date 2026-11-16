@@ -25,8 +25,57 @@ def _goal(line: int, annotation: str, cls: str = "rte", bucket: str = "step_c_rt
     }
 
 
-def _cost(prop: str | None, kind: str) -> dict:
-    return {"goal": f"typed_f_{prop}", "property": prop, "verdict_kind": kind, "provers": ["alt-ergo"], "time_ms": 10}
+def _cost(prop: str | None, kind: str, line: int | None = None, file: str | None = "/w/a.c") -> dict:
+    """A cost as run_wp_function.py writes it; `line=None` is a cost from the log (no location)."""
+    return {
+        "goal": f"typed_f_{prop}",
+        "property": prop,
+        "file": file if line is not None else None,
+        "line": line,
+        "verdict_kind": kind,
+        "provers": ["alt-ergo"],
+        "time_ms": 10,
+    }
+
+
+def _row(line: int, kind: str, annotation: str = "p") -> dict:
+    return {
+        "file": "probe.c",
+        "function": "f",
+        "line": line,
+        "kind": kind,
+        "status": "Unknown",
+        "annotation": annotation,
+    }
+
+
+# The unproved rows and goals of one real run (Frama-C 34, `-wp-report-csv` beside `-wp-report-json`
+# on the same function): the CSV row has the predicate text, the JSON goal has WP's property name.
+# Lines, kinds and property names are the run's; two of its ten timeouts are set to `unknown` here.
+_PROBE_ROWS = [
+    _row(4, "postcondition", "bad: \\result == 42"),
+    _row(5, "postcondition", "\\result >= 0"),
+    _row(10, "loop invariant", "s == i"),
+    _row(15, "signed_overflow", "s + *(a + i) <= 2147483647"),
+    _row(16, "signed_overflow", "-2147483648 <= s + (int)(*(a + i) * x)"),
+    _row(16, "signed_overflow", "s + (int)(*(a + i) * x) <= 2147483647"),
+    _row(16, "signed_overflow", "*(a + i) * x <= 2147483647"),
+    _row(16, "signed_overflow", "-2147483648 <= *(a + i) * x"),
+    _row(18, "user assertion", "s != 7"),
+    _row(19, "signed_overflow", "s + x <= 2147483647"),
+]
+_PROBE_COSTS = [
+    _cost("f_ensures_bad", "timeout", 4, "/w/probe.c"),
+    _cost("f_ensures", "timeout", 5, "/w/probe.c"),
+    _cost("f_loop_invariant_wrong", "timeout", 10, "/w/probe.c"),
+    _cost("f_assert_rte_signed_overflow_2", "timeout", 15, "/w/probe.c"),
+    _cost("f_assert_rte_signed_overflow_3", "timeout", 16, "/w/probe.c"),
+    _cost("f_assert_rte_signed_overflow_4", "unknown", 16, "/w/probe.c"),
+    _cost("f_assert_rte_signed_overflow_5", "timeout", 16, "/w/probe.c"),
+    _cost("f_assert_rte_signed_overflow_6", "timeout", 16, "/w/probe.c"),
+    _cost("f_assert", "unknown", 18, "/w/probe.c"),
+    _cost("f_assert_rte_signed_overflow_9", "timeout", 19, "/w/probe.c"),
+]
 
 
 def _report(fn: str, goals: list[dict], total: int, costs: list[dict] | None = None, **extra) -> dict:
@@ -61,7 +110,7 @@ def census_run(tmp_path: Path) -> Path:
     _write(run, "proved", _report("proved", [], 5))
     # Old report: no unproven_goal_costs.
     _write(run, "legacy", _report("legacy", [_goal(10, "p1"), _goal(11, "p2", cls="l2_termination")], 6))
-    # Costs pair one-to-one through property; all timeouts.
+    # Each row pairs with the cost at its line and of its kind; all timeouts.
     _write(
         run,
         "timeouts",
@@ -69,23 +118,22 @@ def census_run(tmp_path: Path) -> Path:
             "timeouts",
             [_goal(20, "q1"), _goal(21, "q2", bucket="step_b_loop_invariant")],
             9,
-            costs=[_cost("q2", "stepout"), _cost("q1", "timeout")],
+            costs=[
+                _cost("timeouts_assert_rte_mem_access_2", "stepout", 21),
+                _cost("timeouts_assert_rte_mem_access", "timeout", 20),
+            ],
         ),
     )
-    # A repeated property: no pairing, distribution only.
+    # Costs from the log carry no line: no pairing, distribution only.
     _write(
         run,
         "split",
-        _report(
-            "split",
-            [_goal(30, "r"), _goal(31, "r")],
-            4,
-            costs=[_cost("r", "timeout"), _cost("r", "unknown")],
-        ),
+        _report("split", [_goal(30, "r"), _goal(31, "r")], 4, costs=[_cost(None, "timeout"), _cost(None, "unknown")]),
     )
-    # Many unproved goals, one failed: not a near miss, not timeouts only.
+    # Many unproved goals, all failed: not a near miss, not timeouts only.
     many = [_goal(40 + i, f"s{i}") for i in range(5)]
-    _write(run, "many", _report("many", many, 12, costs=[_cost(f"s{i}", "failed") for i in range(5)]))
+    many_costs = [_cost(f"many_assert_rte_mem_access_{i}", "failed", 40 + i) for i in range(5)]
+    _write(run, "many", _report("many", many, 12, costs=many_costs))
     # Not a per-function report, a guardrail report, and an unreadable one.
     _write(run, "guard", {"mode": "guardrail", "function": "g", "status": "passed_dynamic_oracle"})
     _write(run, "notes", {"something": "else"})
@@ -134,35 +182,107 @@ def test_legacy_report_is_unrecorded(census_run: Path) -> None:
     assert [g["verdict_kind"] for g in legacy_goals] == ["unrecorded", "unrecorded"]
 
 
-def test_join_by_property(census_run: Path) -> None:
+def test_join_by_line_and_kind(census_run: Path) -> None:
     data = census_mod.census(census_run)
     rec = _by_fn(data)["timeouts"]
-    assert rec["join"] == "by_property"
+    assert rec["join"] == "by_line_and_kind"
+    assert rec["rows_by_verdict"] == {"stepout": 1, "timeout": 1}
     goals = {g["line"]: g["verdict_kind"] for g in data["near_miss_goals"] if g["function"] == "timeouts"}
     assert goals == {20: "timeout", 21: "stepout"}
 
 
-def test_join_fallback_on_repeated_property(census_run: Path) -> None:
+def test_join_fallback_on_costs_without_a_line(census_run: Path) -> None:
     data = census_mod.census(census_run)
     rec = _by_fn(data)["split"]
     assert rec["join"] == "per_function_only"
     assert rec["by_verdict"] == {"timeout": 1, "unknown": 1}
+    assert rec["unpaired_costs"] == 2
     assert {g["verdict_kind"] for g in data["near_miss_goals"] if g["function"] == "split"} == {"unjoined"}
-    assert data["join"] == "per_function_only"
-    assert data["join_by_function"] == {"by_property": 2, "per_function_only": 2}
+    assert data["join"] == "partial"
+    assert data["join_by_function"] == {"by_line_and_kind": 2, "per_function_only": 2}
+    assert any("paired with no unproved report row" in n for n in data["notes"])
+
+
+def test_join_on_a_real_report_pair() -> None:
+    kinds, unpaired = census_mod.join_by_line(_PROBE_ROWS, _PROBE_COSTS, "f")
+    # Line 16 has four rows and four goals of one kind that disagree: each row is `mixed`, since
+    # nothing says which goal belongs to which row. Line 15 pairs although a proved goal of the
+    # same kind sits on it (a proved goal has no cost).
+    assert kinds == [
+        "timeout",
+        "timeout",
+        "timeout",
+        "timeout",
+        "mixed",
+        "mixed",
+        "mixed",
+        "mixed",
+        "unknown",
+        "timeout",
+    ]
+    assert unpaired == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "prop", "expected"),
+    [
+        ("signed_overflow", "f_assert_rte_signed_overflow_3", True),
+        ("signed_overflow", "f_assert_rte_unsigned_overflow", False),
+        ("unsigned_overflow", "f_assert_rte_unsigned_overflow", True),
+        ("signed_downcast", "f_assert_rte_unsigned_downcast_2", False),
+        ("mem_access", "f_assert_rte_signed_overflow", False),
+        ("postcondition", "f_ensures_bad", True),
+        ("postcondition", "f_assert_rte_mem_access", False),
+        ("loop invariant", "f_loop_invariant_wrong", True),
+        ("loop invariant", "f_loop_variant", False),
+        ("assigns clause", "f_loop_assigns", True),
+        ("user assertion", "f_assert", True),
+        ("user assertion", "f_assert_rte_mem_access", False),
+        # The function's own name is not read as a kind token.
+        ("postcondition", "check_ensures_ensures", True),
+        ("user assertion", "check_ensures_ensures", False),
+        # A kind the mapping does not know pairs on the line alone.
+        ("instance of something", "f_whatever", True),
+    ],
+)
+def test_kind_matches(kind: str, prop: str, expected: bool) -> None:
+    function = "check_ensures" if prop.startswith("check_ensures") else "f"
+    assert census_mod._kind_matches(kind, prop, function) is expected
 
 
 @pytest.mark.parametrize(
     ("goals", "costs", "expected"),
     [
-        ([{"annotation": "a"}], [{"property": "a", "verdict_kind": "timeout"}], ["timeout"]),
-        ([{"annotation": "a"}], [{"property": None, "verdict_kind": "timeout"}], None),
-        ([{"annotation": "a"}], [{"property": "b", "verdict_kind": "timeout"}], None),
-        ([{"annotation": "a"}, {"annotation": "b"}], [{"property": "a", "verdict_kind": "timeout"}], None),
+        # Same line and kind: paired.
+        ([_row(3, "mem_access")], [_cost("f_assert_rte_mem_access", "timeout", 3, "/w/probe.c")], (["timeout"], 0)),
+        # Another line, another kind, another file name: no candidate.
+        ([_row(3, "mem_access")], [_cost("f_assert_rte_mem_access", "timeout", 4, "/w/probe.c")], (["unjoined"], 1)),
+        ([_row(3, "mem_access")], [_cost("f_ensures", "timeout", 3, "/w/probe.c")], (["unjoined"], 1)),
+        ([_row(3, "mem_access")], [_cost("f_assert_rte_mem_access", "timeout", 3, "/w/other.h")], (["unjoined"], 1)),
+        # A cost from the log has no line and is never a candidate.
+        ([_row(3, "mem_access")], [_cost(None, "timeout")], (["unjoined"], 1)),
+        # A row whose line is text still pairs, and so does a cost without a file name.
+        (
+            [{**_row(3, "mem_access"), "line": "3"}],
+            [{**_cost("f_assert_rte_mem_access", "failed", 3), "file": None}],
+            (["failed"], 0),
+        ),
+        # Two rows, one cost: one row has no cost of its own, and nothing says which.
+        (
+            [_row(3, "mem_access"), _row(3, "mem_access")],
+            [_cost("f_assert_rte_mem_access", "timeout", 3, "/w/probe.c")],
+            (["unjoined", "unjoined"], 1),
+        ),
+        # One row split into two goals that agree.
+        (
+            [_row(9, "loop invariant")],
+            [_cost("f_loop_invariant", "timeout", 9, "probe.c"), _cost("f_loop_invariant", "timeout", 9, "probe.c")],
+            (["timeout"], 0),
+        ),
     ],
 )
-def test_join_by_property_rules(goals: list[dict], costs: list[dict], expected: list[str] | None) -> None:
-    assert census_mod.join_by_property(goals, costs) == expected
+def test_join_by_line_rules(goals: list[dict], costs: list[dict], expected: tuple[list[str], int]) -> None:
+    assert census_mod.join_by_line(goals, costs, "f") == expected
 
 
 def test_timeouts_only_and_near_miss(census_run: Path) -> None:
@@ -174,6 +294,15 @@ def test_timeouts_only_and_near_miss(census_run: Path) -> None:
     totals = data["totals"]
     assert totals["unproved"] == 11
     assert totals["unproved_by_verdict"] == {"failed": 5, "stepout": 1, "timeout": 2, "unknown": 1, "unrecorded": 2}
+    assert totals["unproved_rows_by_verdict"] == {
+        "failed": 5,
+        "stepout": 1,
+        "timeout": 1,
+        "unjoined": 2,
+        "unrecorded": 2,
+    }
+    # No fixture report names its provers, so the merged-verdict caveat is stated.
+    assert any("upper bound" in n for n in data["notes"])
     assert totals["functions_by_status"] == {"all_proven": 1, "unproven_goals_remain": 4}
 
 
@@ -197,10 +326,14 @@ def test_undecided_status_is_named(tmp_path: Path) -> None:
 
 def test_verdict_and_row_count_difference_is_noted(tmp_path: Path) -> None:
     run = tmp_path / "run"
-    costs = [_cost("x", "timeout"), _cost("x", "timeout")]
-    _write(run, "twice", _report("twice", [_goal(1, "x")], 3, costs=costs))
+    costs = [_cost("twice_assert_rte_mem_access", "timeout", 1), _cost("twice_assert_rte_mem_access", "timeout", 1)]
+    _write(run, "twice", _report("twice", [_goal(1, "x")], 3, costs=costs, wp_provers=["alt-ergo"]))
     data = census_mod.census(run)
     assert data["totals"]["unproved_by_verdict"] == {"timeout": 2}
+    assert data["totals"]["unproved_rows_by_verdict"] == {"timeout": 1}
+    assert data["join"] == "by_line_and_kind"
+    # One prover: the verdict is that prover's own, so no merged-verdict caveat.
+    assert not any("upper bound" in n for n in data["notes"])
     assert any("verdict kinds count WP goals (2)" in n for n in data["notes"])
     assert [w["function"] for w in data["would_be_all_proven_if_timeouts_closed"]] == ["twice"]
 

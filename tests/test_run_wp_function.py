@@ -385,6 +385,8 @@ def test_goal_costs_from_report_reads_verdict_provers_and_cached() -> None:
         {
             "goal": "typed_f_ensures_fast_false",
             "property": "f_ensures_fast_false",
+            "file": "/w/probe.c",
+            "line": 3,
             "verdict_kind": "unknown",
             "provers": ["CVC5"],
             "time_ms": None,  # WP 34 writes a 0 placeholder for an unproved goal
@@ -393,6 +395,8 @@ def test_goal_costs_from_report_reads_verdict_provers_and_cached() -> None:
         {
             "goal": "typed_f_assert_fermat3",
             "property": "f_assert_fermat3",
+            "file": None,  # an entry without a location keeps the goal, with no place to pair it by
+            "line": None,
             "verdict_kind": "timeout",
             "provers": ["Alt-Ergo"],
             "time_ms": None,
@@ -415,7 +419,8 @@ def test_goal_costs_from_report_fails_closed() -> None:
         {"property": "no_goal", "passed": False, "verdict": "timeout"},
         {"goal": "typed_f_odd_verdict", "function": "f", "passed": False, "verdict": "computing"},
         {"goal": "typed_f_no_passed", "function": "f", "verdict": "timeout"},
-        {"goal": "typed_f_bad_provers", "function": "f", "passed": False, "verdict": "stepout", "provers": "Alt-Ergo"},
+        {"goal": "typed_f_bad_provers", "function": "f", "passed": False, "verdict": "stepout", "provers": "Alt-Ergo",
+         "file": 7, "line": "12"},
         {"goal": "typed_f_bad_time", "function": "f", "passed": True, "verdict": "valid",
          "provers": [{"prover": "Z3", "time": "12", "success": 1}, {"prover": "CVC5", "time": True, "success": 1}]},
         {"goal": "typed_f_measured", "function": "f", "passed": False, "verdict": "failed",
@@ -423,9 +428,12 @@ def test_goal_costs_from_report_fails_closed() -> None:
     ]
     unproven, slowest = W.goal_costs_from_report(entries, "f")
     assert unproven == [
-        {"goal": "typed_f_bad_provers", "property": None, "verdict_kind": "stepout", "provers": [], "time_ms": None, "cached": False},
+        # A file that is not a string and a line that is not a number are dropped, not guessed.
+        {"goal": "typed_f_bad_provers", "property": None, "file": None, "line": None, "verdict_kind": "stepout",
+         "provers": [], "time_ms": None, "cached": False},
         # A positive time is a measurement and is kept; `cached: true` (a bool, not WP's count) is not read as cached.
-        {"goal": "typed_f_measured", "property": None, "verdict_kind": "failed", "provers": ["Z3"], "time_ms": 250, "cached": False},
+        {"goal": "typed_f_measured", "property": None, "file": None, "line": None, "verdict_kind": "failed",
+         "provers": ["Z3"], "time_ms": 250, "cached": False},
     ]
     assert slowest == []
 
@@ -473,6 +481,8 @@ def test_goal_costs_from_log_tag_forms(line: str, kind: str, provers: list[str],
     assert costs[0] == {
         "goal": goal,
         "property": None,
+        "file": None,
+        "line": None,
         "verdict_kind": kind,
         "provers": provers,
         "time_ms": None,
