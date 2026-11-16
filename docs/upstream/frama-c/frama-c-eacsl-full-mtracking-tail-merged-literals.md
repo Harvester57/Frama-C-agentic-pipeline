@@ -44,7 +44,7 @@ merged, and the same program runs clean. With gcc, `e-acsl-gcc` passes `-fno-mer
 emits literals in plain `.rodata`, and the program runs clean too. Only the combination full tracking
 + clang fails, and clang is what libFuzzer and the sanitizers need.
 
-Found by fuzzing c-ares 1.34 with E-ACSL: `ares_buf_split(buf, (const unsigned char *)" ,", 2, ...)`
+Found by fuzzing c-ares 1.34.5 with E-ACSL: `ares_buf_split(buf, (const unsigned char *)" ,", 2, ...)`
 reads `" ,"` while `","` is also a literal of the program. The call runs when the library reads
 `/etc/resolv.conf` at initialization, so every input of three campaigns stopped there before the
 code under test ran.
@@ -96,8 +96,15 @@ $ objdump -s -j .rodata base.e-acsl | grep ' 202c'
  14000 01000200 202c0026 72007369 7a656f66  .... ,.&r.sizeof
 ```
 
-`" ,"` is at `0x14004`; `","` was given `0x14005`, inside it. `clang -c` emits the strings in
-`.rodata.str1.1` with flags `AMS` with or without `-fno-merge-constants`.
+`" ,"` is at `0x14004`, and no separate `","` follows it. `clang -c` emits the strings in
+`.rodata.str1.1` with flags `AMS` with or without `-fno-merge-constants`. Without E-ACSL, a program
+that prints both addresses (`printf("%p %p", " ,", ",")`) shows the same layout:
+
+```text
+clang -O0: " ,"=0x58a376d0b004 ","=0x58a376d0b005 diff=1
+clang -O1: " ,"=0x63e22a209004 ","=0x63e22a209005 diff=1
+gcc -O0 -fno-merge-constants: " ,"=0x635c2f461004 ","=0x635c2f461007 diff=3
+```
 
 Control: moving the `","` group before the `" ,"` group in `__e_acsl_globals_init` of `full.inst.c`
 and rebuilding with `e-acsl-gcc -C -G clang` gives exit 0. The longer block, registered last, covers
