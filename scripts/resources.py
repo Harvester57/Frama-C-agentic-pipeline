@@ -979,6 +979,45 @@ def container_running(engine: str, lease_id: str) -> bool | None:
     return bool((proc.stdout or "").strip())
 
 
+def kill_container(engine: str, name: str) -> bool:
+    """Start `<engine> kill <name>` without waiting for it (callers hold the broker lock); False if it cannot start."""
+    try:
+        subprocess.Popen([engine, "kill", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    return True
+
+
+DEFAULT_ORPHAN_GRACE_S = 60.0
+
+
+def orphan_grace_s() -> float | None:
+    """
+    FRAMAC_ORPHAN_GRACE_S: seconds a granted lease's container may keep running after its holder died before a
+    reaping pass kills it (default 60); `off`/`never` keeps such containers running (the old behaviour).
+    """
+    raw = (os.environ.get("FRAMAC_ORPHAN_GRACE_S") or "").strip().lower()
+    if raw in ("off", "never", "no", "false"):
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_ORPHAN_GRACE_S
+    return value if math.isfinite(value) and value >= 0 else DEFAULT_ORPHAN_GRACE_S
+
+
+def _orphan_killer(fallback_engine: str | None) -> Callable[[dict], bool] | None:
+    """The kill a host broker uses on an orphaned lease's container, or None when reaping is off."""
+    if orphan_grace_s() is None:
+        return None
+
+    def kill(entry: dict) -> bool:
+        engine = str(entry.get("engine") or fallback_engine or "")
+        return bool(engine) and kill_container(engine, str(entry["container"]))
+
+    return kill
+
+
 # ---------------------------------------------------------------------------
 # Pool: everything a decision needs, measured now
 # ---------------------------------------------------------------------------
@@ -2272,6 +2311,14 @@ class Broker:
     (unless `container_alive` says its container still runs). broker.lock serializes decisions.
     The pool is re-measured on every attempt, so a shrink blocks new grants; grants are never
     preempted. Light (ungated) classes are registered but never wait and never count.
+
+    A granted lease whose holder died while its container still runs is an orphan: nobody reads
+    its output or waits for it (on Windows a killed client runs no signal handler, so it never
+    stops its container). It stays counted against the pool while the container runs. With
+    `container_kill`, a reaping pass (`entries(reap=True)`: acquire, rebalance, gc) kills
+    it once it has been orphaned for `orphan_grace_s`, and again every `orphan_retry_s` while it
+    still runs; only containers named `framac-<lease id>`, and only when a fresh `container_alive`
+    says True (never when it cannot tell). The lease is dropped once the container is gone.
     """
 
     def __init__(
@@ -2282,9 +2329,13 @@ class Broker:
         history_fn: Callable[[str, str | None], int | None] | None = None,
         placer: Callable[[int, set[int]], list[int] | None] | None = None,
         container_alive: Callable[[dict], bool | None] | None = None,
+        container_kill: Callable[[dict], bool] | None = None,
         poll: float = 0.1,
         max_poll: float = 0.5,
         orphan_recheck_s: float = 5.0,
+        orphan_grace_s: float = DEFAULT_ORPHAN_GRACE_S,
+        orphan_retry_s: float = 30.0,
+        clock: Callable[[], float] = time.time,
         log: Any = None,
     ) -> None:
         self.dir = Path(directory)
@@ -2294,9 +2345,13 @@ class Broker:
         self.history_fn = history_fn
         self.placer = placer
         self.container_alive = container_alive
+        self.container_kill = container_kill
         self.poll = poll
         self.max_poll = max_poll
         self.orphan_recheck_s = orphan_recheck_s
+        self.orphan_grace_s = orphan_grace_s
+        self.orphan_retry_s = orphan_retry_s
+        self.clock = clock
         self.log = log
 
     @contextlib.contextmanager
@@ -2322,7 +2377,7 @@ class Broker:
         _unlink(self.leases / f"{lease_id}.lock")
 
     def _container_running(self, entry: dict) -> bool:
-        now = time.time()
+        now = self.clock()
         if "orphan_running" in entry and now - float(entry.get("orphan_checked_at") or 0) < self.orphan_recheck_s:
             return bool(entry["orphan_running"])
         running = self.container_alive(entry) if self.container_alive else False
@@ -2331,6 +2386,45 @@ class Broker:
         with contextlib.suppress(OSError):
             self._write_entry(entry)
         return keep
+
+    def _reap_orphan(self, entry: dict) -> None:
+        """Kill an orphan's container once its grace has passed (see the class docstring); never drops the entry."""
+        if self.container_kill is None or self.container_alive is None:
+            return
+        lid = str(entry.get("id") or "")
+        container = entry.get("container")
+        if not _LEASE_ID_RE.fullmatch(lid) or container != f"framac-{lid}":
+            return  # not a container this broker named: never touch it
+        now = self.clock()
+        if entry.get("orphan_since") is None:
+            entry["orphan_since"] = now
+            self._report(f"lease {lid}: holder gone, container {container} still running")
+            with contextlib.suppress(OSError):
+                self._write_entry(entry)
+        if now - float(entry["orphan_since"]) < self.orphan_grace_s:
+            return
+        last = entry.get("orphan_kill_at")
+        if last is not None and now - float(last) < self.orphan_retry_s:
+            return
+        if self.container_alive(entry) is not True:  # fresh and definite, never the cached or unknown answer
+            return
+        entry["orphan_kill_at"] = now
+        entry["orphan_kills"] = int(entry.get("orphan_kills") or 0) + 1
+        entry.pop("orphan_checked_at", None)  # look again on the next pass
+        entry.pop("orphan_running", None)
+        with contextlib.suppress(OSError):
+            self._write_entry(entry)
+        self._report(
+            f"lease {lid}: holder gone for {now - float(entry['orphan_since']):.0f}s, "
+            f"killing orphaned container {container}"
+        )
+        try:
+            started = self.container_kill(entry)
+        except Exception as exc:  # a failed kill is retried after orphan_retry_s
+            self._report(f"lease {lid}: cannot kill {container}: {exc}")
+            return
+        if not started:
+            self._report(f"lease {lid}: cannot kill {container}")
 
     def entries(self, reap: bool = True) -> list[dict]:
         """Live tickets and leases (call under `locked()`); dead holders' entries are reclaimed when `reap`."""
@@ -2346,6 +2440,11 @@ class Broker:
                     self._drop(lease_id)
                 continue
             entry["alive"] = alive
+            if alive and reap and "orphan_since" in entry:  # its holder is back: restart the grace if it dies
+                entry.pop("orphan_since", None)
+                entry.pop("orphan_kill_at", None)
+                with contextlib.suppress(OSError):
+                    self._write_entry(entry)
             if not alive:
                 if (
                     entry.get("state") == "granted"
@@ -2354,6 +2453,8 @@ class Broker:
                     and self._container_running(entry)
                 ):
                     entry["orphaned"] = True
+                    if reap:
+                        self._reap_orphan(entry)
                 elif reap:
                     self._drop(lease_id)
                     continue
@@ -3425,6 +3526,8 @@ def cmd_exec(argv: list[str]) -> int:
         history_fn=lambda c, k: history_estimate(run_dir, c, k, cache_dir=cache_host),
         placer=placer,
         container_alive=lambda e: container_running(str(e.get("engine") or engine_bin), e["id"]),
+        container_kill=_orphan_killer(engine_bin),
+        orphan_grace_s=orphan_grace_s() or 0.0,
         log=sys.stderr,
     )
     if cache_mode == "rw" and not args.cache_rw:
@@ -3540,6 +3643,10 @@ def _status(scope: str, broker_dir: str | None, gc: bool, engine: str | None = N
             if scope == "host"
             else None
         ),
+        # Only `gc` reaps (status reads with reap=False); only leases that recorded their engine.
+        container_kill=_orphan_killer(None) if scope == "host" and gc else None,
+        orphan_grace_s=orphan_grace_s() or 0.0,
+        log=sys.stderr,
     )
     if gc:
         out["reclaimed"] = broker.gc()
@@ -3647,6 +3754,9 @@ def main(argv: list[str] | None = None) -> int:
             bdir,
             lambda: probe("host", engine=eng_obj or eng_bin, broker_dir=bdir),
             container_alive=lambda e: container_running(str(e.get("engine") or eng_bin or "docker"), e["id"]),
+            container_kill=_orphan_killer(eng_bin or "docker"),
+            orphan_grace_s=orphan_grace_s() or 0.0,
+            log=sys.stderr,
         )
         out = {"rebalanced": broker.rebalance(eng=eng_obj, dry_run=args.dry_run)}
     else:

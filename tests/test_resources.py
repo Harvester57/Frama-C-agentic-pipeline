@@ -693,6 +693,125 @@ def test_lease_of_a_dead_holder_is_kept_while_its_container_runs(tmp_path):
     assert broker.gc() == ["cccccccccccc"]
 
 
+class _OrphanWorld:
+    """A broker over `tmp_path` with a fake clock, a fake engine view and a recording kill."""
+
+    def __init__(self, tmp_path: Path, grace: float = 60.0, retry: float = 30.0) -> None:
+        self.dir = tmp_path
+        self.now = 1000.0
+        self.state: dict[str, bool | None] = {}
+        self.kills: list[str] = []
+        self.broker = R.Broker(
+            tmp_path,
+            lambda: R.Budget(4, 8000, "t"),
+            container_alive=lambda e: self.state.get(e["id"], False),
+            container_kill=self._kill,
+            orphan_recheck_s=0.0,
+            orphan_grace_s=grace,
+            orphan_retry_s=retry,
+            clock=lambda: self.now,
+        )
+
+    def _kill(self, entry: dict) -> bool:
+        self.kills.append(str(entry["container"]))
+        return True
+
+    def lease(self, lid: str, **kw: Any) -> None:
+        entry = _ticket(lid, cls="phase-static", state="granted", cpus=2.0, mem_mb=4096, engine="docker", **kw)
+        entry.setdefault("container", f"framac-{lid}")
+        (self.dir / "leases").mkdir(parents=True, exist_ok=True)
+        (self.dir / "leases" / f"{lid}.json").write_text(json.dumps(entry), encoding="utf-8")
+
+    def ids(self, reap: bool = True) -> list[str]:
+        with self.broker.locked():
+            return [e["id"] for e in self.broker.entries(reap=reap)]
+
+
+def test_orphaned_container_is_killed_after_the_grace_and_its_lease_dropped_once_gone(tmp_path):
+    w = _OrphanWorld(tmp_path, grace=60.0, retry=30.0)
+    w.lease("aaaaaaaaaaaa")  # no lock file: its holder is dead
+    w.state["aaaaaaaaaaaa"] = True
+    assert w.ids() == ["aaaaaaaaaaaa"] and w.kills == []  # first sighting starts the grace
+    w.now += 59.0
+    assert w.ids() == ["aaaaaaaaaaaa"] and w.kills == []  # still inside the grace
+    w.now += 2.0
+    assert w.ids() == ["aaaaaaaaaaaa"] and w.kills == ["framac-aaaaaaaaaaaa"]  # killed, still counted
+    w.now += 10.0
+    assert w.ids() == ["aaaaaaaaaaaa"] and len(w.kills) == 1  # no retry before orphan_retry_s
+    w.now += 25.0
+    assert w.ids() == ["aaaaaaaaaaaa"] and len(w.kills) == 2  # the kill did not take: retried
+    w.state["aaaaaaaaaaaa"] = False  # the container is gone
+    assert w.ids() == [] and not (tmp_path / "leases" / "aaaaaaaaaaaa.json").exists()
+    assert len(w.kills) == 2
+
+
+def test_orphan_reaper_never_kills_a_live_holders_container(tmp_path):
+    w = _OrphanWorld(tmp_path, grace=0.0)
+    w.lease("bbbbbbbbbbbb")
+    w.state["bbbbbbbbbbbb"] = True
+    holder = R.FileLock(tmp_path / "leases" / "bbbbbbbbbbbb.lock")
+    holder.acquire()
+    try:
+        for _ in range(3):
+            w.now += 3600.0
+            assert w.ids() == ["bbbbbbbbbbbb"]
+    finally:
+        holder.release()
+    assert w.kills == []
+
+
+def test_orphan_reaper_never_kills_when_liveness_is_unknown(tmp_path):
+    w = _OrphanWorld(tmp_path, grace=0.0)
+    w.lease("cccccccccccc")
+    w.state["cccccccccccc"] = None  # `<engine> ps` failed: cannot tell
+    for _ in range(3):
+        w.now += 3600.0
+        assert w.ids() == ["cccccccccccc"]  # kept, still counted against the pool
+    assert w.kills == []
+    w.state["cccccccccccc"] = True  # the engine answers again: now it may be reaped
+    w.now += 1.0
+    assert w.ids() == ["cccccccccccc"] and w.kills == ["framac-cccccccccccc"]
+
+
+def test_orphan_reaper_kills_only_containers_named_after_their_lease(tmp_path):
+    w = _OrphanWorld(tmp_path, grace=0.0)
+    w.lease("dddddddddddd", container="someone-elses-container")
+    w.state["dddddddddddd"] = True
+    w.now += 3600.0
+    assert w.ids() == ["dddddddddddd"] and w.kills == []
+
+
+def test_orphan_reaper_runs_only_on_reaping_passes_and_when_enabled(tmp_path):
+    w = _OrphanWorld(tmp_path, grace=0.0)
+    w.lease("eeeeeeeeeeee")
+    w.state["eeeeeeeeeeee"] = True
+    w.now += 3600.0
+    assert w.ids(reap=False) == ["eeeeeeeeeeee"] and w.kills == []  # `status` only looks
+    off = R.Broker(
+        tmp_path,
+        lambda: R.Budget(4, 8000, "t"),
+        container_alive=lambda e: True,
+        orphan_recheck_s=0.0,
+        orphan_grace_s=0.0,
+        clock=lambda: w.now,
+    )  # no container_kill: the pre-existing behaviour, kept and counted
+    with off.locked():
+        assert [e["id"] for e in off.entries()] == ["eeeeeeeeeeee"]
+    assert w.kills == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "grace"),
+    [(None, 60.0), ("", 60.0), ("15", 15.0), ("0", 0.0), ("off", None), ("never", None), ("junk", 60.0)],
+)
+def test_orphan_grace_from_the_environment(monkeypatch, raw, grace):
+    if raw is None:
+        monkeypatch.delenv("FRAMAC_ORPHAN_GRACE_S", raising=False)
+    else:
+        monkeypatch.setenv("FRAMAC_ORPHAN_GRACE_S", raw)
+    assert R.orphan_grace_s() == grace
+
+
 def test_in_process_acquire_release_and_light_leases(tmp_path):
     pool = R.Budget(4, 8000, "t")
     broker = R.Broker(tmp_path, lambda: pool)
@@ -1098,6 +1217,18 @@ def make_fake_engine(bin_dir: Path, info: dict, log: Path) -> None:
             print("Docker version 28.0.0")
         elif cmd == "kill":
             (here / "killed").write_text(" ".join(sys.argv[2:]))
+            with (here / "kill_calls.txt").open("a", encoding="utf-8") as fh:
+                fh.write(" ".join(sys.argv[2:]) + "\\n")
+            running = here / "running"  # lease ids whose container `ps` reports as running
+            if running.exists():
+                gone = {{a[len("framac-"):] for a in sys.argv[2:] if a.startswith("framac-")}}
+                running.write_text(" ".join(i for i in running.read_text().split() if i not in gone))
+        elif cmd == "ps":
+            running = here / "running"
+            ids = running.read_text().split() if running.exists() else []
+            want = next((a.split("=")[-1] for a in sys.argv if a.startswith("label=framac.lease=")), None)
+            if want in ids:
+                print("c0ffee" + want)
         elif cmd == "volume":
             vols = here / "volumes"
             vols.mkdir(exist_ok=True)
@@ -1828,3 +1959,34 @@ def test_history_estimate_3_tier_hierarchical_fallback_and_oom_inheritance(tmp_p
     # Completely unknown key returns None
     assert R.history_estimate(run_dir, "wp", "unknown_mod:src/file.c#fn") is None
     assert R.history_estimate(run_dir, "wp", "nonexistent") is None
+
+
+def test_gc_kills_the_container_of_a_dead_exec_client_and_then_drops_its_lease(tmp_path, fake_engine, monkeypatch):
+    """
+    c-ares run-1: an agent's shell timeout TerminateProcess'd `resources.py exec` and its docker client, so no
+    signal handler ran; the `docker run --rm` container kept running with no client and its lease was kept,
+    counted against the pool, forever. A reaping pass now kills it (`<engine> kill framac-<id>`) and drops the
+    lease once `<engine> ps` no longer lists it. `status` only looks.
+    """
+    import shutil
+
+    fake_engine(DOCKER_DESKTOP)
+    monkeypatch.setenv("FRAMAC_ORPHAN_GRACE_S", "0")
+    broker = tmp_path / "broker"
+    lid = "fb23319b0e17"
+    entry = _ticket(lid, cls="light", state="granted", cpus=1.0, mem_mb=1024, gated=True)
+    entry.update(container=f"framac-{lid}", engine=shutil.which("docker"), scope="host")
+    (broker / "leases").mkdir(parents=True)
+    (broker / "leases" / f"{lid}.json").write_text(json.dumps(entry), encoding="utf-8")
+    (tmp_path / "bin" / "running").write_text(lid)  # holder dead (no lock), container running
+    kills = tmp_path / "bin" / "kill_calls.txt"
+    host = ["--scope", "host", "--broker-dir", str(broker), "--engine", "docker"]
+
+    assert R.main(["status", *host]) == 0
+    assert not kills.exists()
+    assert R.main(["gc", *host]) == 0
+    assert wait_for(lambda: kills.exists() and kills.read_text(encoding="utf-8").split()) == [f"framac-{lid}"]
+    assert (broker / "leases" / f"{lid}.json").exists()  # still counted until the container is gone
+    wait_for(lambda: not (tmp_path / "bin" / "running").read_text().split())
+    assert R.main(["gc", *host]) == 0
+    assert not (broker / "leases" / f"{lid}.json").exists()
