@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from framac_common import (  # noqa: E402
     ArtifactError,
     atomic_write_json,
+    is_pre_c99_std,
     load_json_optional,
     load_json_strict,
     normalize_flag_args,
@@ -1814,6 +1815,25 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
     return cppflags
 
 
+def _drop_pre_c99_std(module_name: str, cppflags: str) -> str:
+    """
+    `cppflags` without a language standard older than C99 (`-std=gnu90`, `-ansi`), said on stderr. It
+    comes from `--cppflags` (the unit's build flags, as for a target fuzzer) or a non-link-unit DAG
+    module. The harness code is ours and C99, and Frama-C prints C99 (`restrict` in glibc prototypes),
+    which E-ACSL then compiles with these flags: dropped, as the DAG path drops a link unit's `-std=`.
+    """
+    tokens = _split_cppflags(cppflags)
+    dropped = [t for t in tokens if is_pre_c99_std(t)]
+    if not dropped:
+        return cppflags
+    print(
+        f"[generate_harness] {module_name}: dropped {' '.join(dict.fromkeys(dropped))} from the harness "
+        "cppflags: the harness and E-ACSL's printed code need C99 or later",
+        file=sys.stderr,
+    )
+    return " ".join(shlex.quote(t) for t in tokens if not is_pre_c99_std(t)) or "-I."
+
+
 def _merge_dag_module_ldflags(module_name: str, out_dir: Path, ldflags: str, unit: str | None = None) -> str:
     """
     `ldflags` followed by the libraries the module's link unit links from outside the project (the
@@ -2260,6 +2280,7 @@ def _generate_module_harness(
 
     norm_header, norm_cppflags = _normalize_header_include(header_include, cppflags)
     norm_cppflags = _merge_dag_module_cppflags(module_name, out_dir, norm_cppflags, unit)
+    norm_cppflags = _drop_pre_c99_std(module_name, norm_cppflags)
     norm_ldflags = _merge_dag_module_ldflags(module_name, out_dir, norm_ldflags, unit)
     norm_extra_includes: list[str] = []
     for ext_inc in extra_includes or []:

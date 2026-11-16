@@ -237,6 +237,26 @@ def test_resolve_target_fuzzer_id() -> None:
         G.resolve_target_fuzzer_id("x.c", "a/b")
 
 
+@pytest.mark.parametrize("std", ["-std=gnu90", "-std=gnu89", "-std=c89", "-std=c90", "-std=iso9899:199409", "-ansi"])
+def test_target_fuzzer_drops_a_pre_c99_std_given_in_cppflags(
+    run_dir: Path, std: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # c-ares run-1: the unit's cppflags carry the build's -std=gnu90; with it, the E-ACSL instrumented
+    # file (which Frama-C prints with C99 `restrict`) fails to compile: `expected ')'` at `fd_set * restrict`.
+    assert _generate("--cppflags", f"-Iworkspace/work/src {std} -DKEEP=1") == 0
+    flags = _sidecar(run_dir)["cppflags"].split()
+    assert std not in flags
+    assert "-Iworkspace/work/src" in flags and "-DKEEP=1" in flags
+    err = capsys.readouterr().err
+    assert std in err and "C99" in err
+
+
+def test_target_fuzzer_keeps_a_c99_or_later_std(run_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _generate("--cppflags", "-Iworkspace/work/src -std=gnu11") == 0
+    assert "-std=gnu11" in _sidecar(run_dir)["cppflags"].split()
+    assert "-std=" not in capsys.readouterr().err
+
+
 @pytest.mark.skipif(shutil.which("clang") is None, reason="clang not installed")
 def test_target_fuzzer_harness_compiles_with_its_sources(run_dir: Path) -> None:
     assert _generate() == 0

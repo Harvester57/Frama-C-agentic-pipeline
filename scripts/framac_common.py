@@ -746,6 +746,26 @@ def stub_repair_action(function: str) -> str:
     )
 
 
+# The language standards older than C99 (`-ansi` is `-std=c90` for C). Harness code is ours and C99, and
+# Frama-C prints C99 (`restrict` in glibc prototypes), so no harness or E-ACSL compile may use them.
+PRE_C99_STD_FLAGS = frozenset(
+    {
+        "-ansi",
+        "-std=c89",
+        "-std=c90",
+        "-std=gnu89",
+        "-std=gnu90",
+        "-std=iso9899:1990",
+        "-std=iso9899:199409",
+    }
+)
+
+
+def is_pre_c99_std(flag: str) -> bool:
+    """True for a compiler flag that selects a C standard older than C99 (`-std=gnu90`, `-ansi`)."""
+    return flag in PRE_C99_STD_FLAGS
+
+
 def augment_framac_cppflags(cppflags: str) -> str:
     """
     Prepend the run's stub overlay (`-I<workspace/stubs>`, when it exists), then

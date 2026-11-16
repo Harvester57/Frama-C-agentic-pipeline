@@ -41,7 +41,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import framac_cpp_wrapper, resolve_fc_stubs_dir, stub_overlay_dir  # noqa: E402
+from framac_common import framac_cpp_wrapper, is_pre_c99_std, resolve_fc_stubs_dir, stub_overlay_dir  # noqa: E402
 from patterns import FUZZER_INIT_DEF_RE  # noqa: E402
 
 # Frama-C has no 128-bit integer type, and host headers such as <linux/types.h> declare
@@ -181,6 +181,9 @@ def build_eacsl_flag_sets(
     """
     stubs = resolve_fc_stubs_dir() if fc_stubs == "auto" else (Path(fc_stubs) if fc_stubs else None)
     pre, forced, other = split_preprocessor_flags(cppflags)
+    # A build's pre-C99 -std (an old sidecar; generate_harness.py drops it now): Frama-C prints C99
+    # (`restrict` in glibc prototypes) and e-acsl-gcc compiles its own C99 runtime with the `-e` flags.
+    other = [t for t in other if not is_pre_c99_std(t)]
     joined_user = " ".join(pre + forced)
     front: list[str] = list(EACSL_DEFINES)
     if full_mtracking:
