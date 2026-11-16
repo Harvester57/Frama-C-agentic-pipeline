@@ -45,6 +45,17 @@ Shard plan (deterministic, in `pipeline_make.py`, like the ladder):
   goes higher only while the predicted makespan still falls by at least 10%. *k* is recorded with the
   shard plan. It changes what each run analyses, so, like `LADDER_VERSION`, it is part of the
   settings digest and never comes from the machine size.
+- *k* stops at `MAX_SHARDS` (16) or one shard per case even when the slowest shard is still predicted
+  at or over the threshold. The plan records it (`basis.predicted_over_limit`, with each shard's
+  prediction in `predicted_shard_s`) and `gen` says `the plan is over its planning limit` in its
+  sharding warning. When the planning run itself timed out (`basis.censored`), its time and its
+  per-case costs are truncated, so every prediction is a lower bound and the shard is likely to time
+  out again. The plan is still made: the other shards finish in time. But a failed shard fails the
+  merge (below), so the warning tells the user to make those cases cheaper, or to run the module
+  unsharded with a longer `eva_timeout` first. Raising `eva_timeout` alone does not help then: the
+  timed-out run's time is floored to the new timeout, so the plan is predicted over the new limit too.
+  After a completed run, a higher `eva_timeout` gives a new plan under the higher limit. Plans recorded
+  before these keys existed get the warning for a timed-out run, without the shard's name.
 - Make targets: `evashard-<mod>--<i>` (base run per shard) and `evarung-<mod>--<i>--<rung>`. Each
   has its own resource-history key, `<mod>:shard<i>` and `<mod>:shard<i>:<rung>`. Before a shard has
   a peak of its own, `history_estimate`'s module-prefix tier gives it the largest peak recorded for the

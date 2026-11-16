@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import phase0_gates  # noqa: E402
 from eva_flamegraph import fold_flamegraph  # noqa: E402
+from eva_options import TUNING_SKIP_MARGIN  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_NEVER_TRIED,
     ArtifactError,
@@ -165,10 +166,15 @@ def pack(costs: list[float], k: int) -> list[list[int]]:
     return [sorted(b) for b in bins if b]
 
 
+def predicted_shard_times(costs: list[float], shards: list[list[int]], total_s: float) -> list[float]:
+    """Each shard's predicted time, with the single run's time spread by cost."""
+    whole = sum(costs) or 1.0
+    return [sum(costs[c] for c in shard) * total_s / whole for shard in shards]
+
+
 def predicted_makespan(costs: list[float], shards: list[list[int]], total_s: float) -> float:
     """The slowest shard's predicted time, with the single run's time spread by cost."""
-    whole = sum(costs) or 1.0
-    return max((sum(costs[c] for c in shard) for shard in shards), default=0.0) * total_s / whole
+    return max(predicted_shard_times(costs, shards, total_s), default=0.0)
 
 
 def choose_shard_count(costs: list[float], total_s: float, limit_s: float) -> int:
@@ -197,11 +203,21 @@ def make_plan(
     settings_digest: str,
     forced: int | None = None,
     basis_report: str | None = None,
+    censored: bool = False,
 ) -> dict:
-    """A module's shard plan: which cases each shard keeps, and what it was predicted from."""
+    """
+    A module's shard plan: which cases each shard keeps, and what it was predicted from. `censored`: the
+    run it is predicted from timed out, so its time and its flamegraph's per-case costs are truncated and
+    every predicted time is a lower bound. `choose_shard_count` stops at MAX_SHARDS (or one shard per
+    case) even when the slowest shard is still predicted over `limit_s`; `predicted_over_limit` records
+    that, and `over_limit_note` says it at `gen`. The plan is still made then: the other shards finish,
+    and a single run would hit the same limit.
+    """
     costs, basis = case_costs(cases, flamegraph_txt)
     k = forced if forced else choose_shard_count(costs, total_s, limit_s)
     shards = pack(costs, k)
+    times = predicted_shard_times(costs, shards, total_s)
+    makespan = max(times, default=0.0)
     return {
         "format": SHARD_FORMAT,
         "settings_digest": settings_digest,
@@ -215,9 +231,73 @@ def make_plan(
             "flamegraph": str(flamegraph_txt) if flamegraph_txt and basis == "flamegraph" else None,
             "single_run_s": round(total_s, 1),
             "limit_s": round(limit_s, 1),
+            "censored": bool(censored),
+            "predicted_over_limit": makespan >= limit_s,
         },
-        "predicted_makespan_s": round(predicted_makespan(costs, shards, total_s), 1),
+        "predicted_makespan_s": round(makespan, 1),
+        "predicted_shard_s": [round(t, 1) for t in times],
     }
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def over_limit_note(record: Any, module: str) -> str | None:
+    """
+    What to tell the user when a plan's slowest shard is predicted at or over its limit, or None. Plans
+    recorded before `predicted_over_limit` existed are judged from their makespan and limit.
+    """
+    if not isinstance(record, dict):
+        return None
+    raw_basis = record.get("basis")
+    basis: dict = raw_basis if isinstance(raw_basis, dict) else {}
+    predicted, limit = _number(record.get("predicted_makespan_s")), _number(basis.get("limit_s"))
+    over = basis.get("predicted_over_limit")
+    if not isinstance(over, bool):
+        over = predicted is not None and limit is not None and predicted >= limit
+    if not over:
+        return None
+    raw_shards = record.get("shards")
+    shards: list = raw_shards if isinstance(raw_shards, list) else []
+    raw_times = record.get("predicted_shard_s")
+    times = [_number(t) for t in raw_times] if isinstance(raw_times, list) else []
+    which, single = "the slowest shard", False
+    if times and len(times) == len(shards) and all(t is not None for t in times):
+        i = max(range(len(times)), key=lambda j: (times[j] or 0.0, -j))
+        cases = shards[i] if isinstance(shards[i], list) else []
+        single = len(cases) == 1
+        which = f"the slowest shard, shard {i} ({'case' if single else 'cases'} {cases}),"
+    note = (
+        f"the plan is over its planning limit: {which} is predicted {predicted} s, at or over the {limit} s "
+        f"limit (the module's Eva timeout / {TUNING_SKIP_MARGIN})"
+    )
+    censored = basis.get("censored")
+    if censored is True:
+        note += (
+            "; that is a lower bound, since the run it is predicted from timed out (its time and its "
+            "flamegraph's per-case costs are truncated), so the shard is likely to time out again"
+        )
+    elif censored is None:  # recorded before plans said so
+        note += (
+            "; the plan does not record whether the run it is predicted from timed out: if it did, that is "
+            "a lower bound and the shard is likely to time out again"
+        )
+    if single:
+        note += "; it is one case alone, so more shards cannot help"
+    note += "; a shard that fails makes the module's merged report fail, so the other shards' results are lost too"
+    if censored is False:
+        # A completed run's time does not depend on the limit: a higher one gives a new plan under it.
+        return note + (
+            f". To keep every shard under the limit, raise it (pipeline_make.py params set --module {module} "
+            "--eva-timeout <s>: the plan is made again under it) or make that shard's cases cheaper"
+        )
+    # A timed-out run's time is floored to the module's limit, so a higher limit scales it up too.
+    return note + (
+        f". Before running eva-{module}, make that shard's cases cheaper, or run the module unsharded with a "
+        f"longer limit (pipeline_make.py params set --module {module} --eva-shards 1 --eva-timeout <s>); "
+        "raising --eva-timeout alone plans the shards again from the same timed-out run"
+    )
 
 
 def plan_problem(record: Any, case_count: int, settings_digest: str, forced: int | None = None) -> str | None:
