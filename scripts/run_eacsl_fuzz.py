@@ -96,6 +96,7 @@ from acsl_ast import tokenize_c_acsl  # noqa: E402
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
     EACSL_FC_EXTRA_FLAGS,
+    EACSL_FORMAT_RUNTIME_PATCH,
     EACSL_FULL_MTRACKING_DEFINES,
     EACSL_GCC_CHECK_OPTIONS,
     EACSL_NO_LIBC_CHECKS,
@@ -105,6 +106,7 @@ from eacsl_toolchain import (  # noqa: E402
     build_errno_shim_object,
     build_fallback_object,
     defines_fuzzer_initialize,
+    eacsl_share_dir,
     fix_readonly_scalar_globals,
     is_eacsl_instrumented,
     mark_formals_initialized,
@@ -112,6 +114,7 @@ from eacsl_toolchain import (  # noqa: E402
     normalize_passthrough,
     parse_missing_functions,
     parse_undefined_fallbacks,
+    prepare_patched_eacsl_share,
     preprocess_source,
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
@@ -668,7 +671,15 @@ def _parse_libc_failure(text: str) -> dict | None:
     }
     if where:
         res["instrumented_location"] = where
+    if frozenset((groups.get("exp", ""), groups.get("act", ""))) in _SIGNEDNESS_PAIRS:
+        # A signed/unsigned pair of one rank. The patched runtime (EACSL_FORMAT_RUNTIME_PATCH) lets it
+        # through when the value fits both types, so this abort means it did not (a negative int for %u),
+        # or the build ran without the patch (`runtime_patches` in the compile report). Informational only.
+        res["format_mismatch"] = "signedness"
     return res
+
+
+_SIGNEDNESS_PAIRS = frozenset(frozenset((t, f"unsigned {t}")) for t in ("int", "long", "long long"))
 
 
 def _failing_predicate(text: str, start: int) -> tuple[str, str]:
@@ -964,12 +975,33 @@ def _eacsl_cache_material(
         "no_constfold": True,
         "concurrency": has_pthread,
         "check_options": _check_options(is_modern, libc_checks),
+        "runtime_patches": _runtime_patches(_check_options(is_modern, libc_checks)),
     }
 
 
 def _check_options(is_modern: bool, libc_checks: bool) -> list[str]:
     """e-acsl-gcc options for both stages (EACSL_GCC_CHECK_OPTIONS); the long-option CLI of Frama-C <= 32 gets none."""
     return list(EACSL_GCC_CHECK_OPTIONS) if is_modern and libc_checks else []
+
+
+def _runtime_patches(check_options: list[str]) -> list[str]:
+    """Patches of the E-ACSL runtime a build with `check_options` compiles in (EACSL_FORMAT_RUNTIME_PATCH)."""
+    return [EACSL_FORMAT_RUNTIME_PATCH] if "--validate-format-strings" in check_options else []
+
+
+def _format_runtime_share(eacsl_bin: str, dest_root: Path) -> dict:
+    """The patched E-ACSL share directory for stage 2 (eacsl_toolchain.prepare_patched_eacsl_share)."""
+    src = eacsl_share_dir(eacsl_bin)
+    if src is None:
+        return {
+            "patch": EACSL_FORMAT_RUNTIME_PATCH,
+            "status": "not_applied",
+            "reason": f"no E-ACSL share directory beside {eacsl_bin}",
+        }
+    try:
+        return prepare_patched_eacsl_share(src, dest_root)
+    except OSError as exc:
+        return {"patch": EACSL_FORMAT_RUNTIME_PATCH, "status": "not_applied", "reason": f"copy failed: {exc}"}
 
 
 _GETENV_CALL_RE = re.compile(r"\bgetenv\s*\(")
@@ -1464,8 +1496,38 @@ def _compile_eacsl_binary_uncached(
             }
             log_parts.append(f"errno shim not linked: {shim.get('reason')}\n")
 
+        # The runtime is compiled at stage 2 only, from a patched copy of the share directory when
+        # format strings are validated (eacsl_toolchain.EACSL_FORMAT_RUNTIME_PATCH).
+        share_args: list[str] = []
+        if _runtime_patches(check_options):
+            patch = _format_runtime_share(eacsl_bin, out_bin.parent / "eacsl_share")
+            result["runtime_patches"] = {"format_runtime": patch}
+            if patch["status"] == "applied":
+                share_args = ["--e-acsl-share", patch["share"]]
+                log_parts.append(
+                    f"Runtime patch format_runtime ({patch['patch']}): the runtime is compiled from {patch['share']}; "
+                    "a signed/unsigned argument of one rank passes a format directive when its value fits both types, "
+                    "and pointer arguments after a floating-point one are read from their own slots.\n"
+                )
+            else:
+                log_parts.append(
+                    f"Runtime patch format_runtime not applied ({patch['reason']}): the runtime aborts on every "
+                    "promoted unsigned char/short argument of %u/%x/%o and on a %s/%p/%n after a %f/%e/%g.\n"
+                )
+
         def _stage2(link: str) -> tuple[list[str], int, str, str]:
-            cmd2 = [eacsl_bin, "-C", *check_options, "-G", "clang", "-e", flags["backend"], "-O", str(out_bin)]
+            cmd2 = [
+                eacsl_bin,
+                "-C",
+                *check_options,
+                *share_args,
+                "-G",
+                "clang",
+                "-e",
+                flags["backend"],
+                "-O",
+                str(out_bin),
+            ]
             if link:
                 cmd2.extend(["-l", link])
             cmd2.extend(init_hook)

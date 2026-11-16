@@ -30,11 +30,14 @@ spaces break. This module enforces the invocation contract:
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -82,6 +85,167 @@ EACSL_GCC_CHECK_OPTIONS = ("--libc-replacements", "--validate-format-strings")
 # libc allocates itself (`strerror`'s buffer), so `fprintf(f, "%s", strerror(e))` or `strncpy(d,
 # strerror(e), n)` aborts as unallocated: a module whose seeds stop on such a call fuzzes without them.
 EACSL_NO_LIBC_CHECKS = "-no-libc-checks"
+# --validate-format-strings compares each directive's type with the argument's static type exactly
+# (validate_format_type in share/e-acsl/libc_replacements/e_acsl_stdio.c). An `unsigned char` or
+# `unsigned short` argument is promoted to `int`, so `snprintf(b, n, "%u", byte)` aborts on every
+# input ("directive 1 ('%u') expects argument of type 'unsigned int' but the corresponding argument
+# has type 'int'"; c-ares inet_ntop4, run-1 2026-11-16), and so does `"%d"` with a small `unsigned`.
+# C11 6.5.2.2p6 and 7.16.1.1p2 accept the signed and unsigned types of one rank when the value is
+# representable in both; gcc and clang -Wformat do not warn. The runtime sees only static types
+# (fmtdesc), so the pipeline compiles it from a run-local copy of the share directory whose
+# validate_format reads each argument's value and skips the comparison for such a pair: a negative
+# `int` for "%u" or an `unsigned` above INT_MAX for "%d" still aborts with the runtime's own message.
+# The same copy fixes how validate_format collects the arguments: it read every one with
+# `va_arg(ap, void *)`, so after a `double` (passed in an SSE register on x86_64) or a `long double`
+# (on the stack) the pointer of a later "%s", "%p" or "%n" came from the wrong slot
+# (`snprintf(b, n, "%f %s", 1.5, s)` aborts with "attempt to access unallocated memory via directive 2").
+# Stage 2 only (`--e-acsl-share`); upstream draft: docs/upstream/frama-c/frama-c-eacsl-format-promoted-argument-signedness.md.
+EACSL_FORMAT_RUNTIME_PATCH = "format-runtime-1"
+_EACSL_STDIO_REL = "libc_replacements/e_acsl_stdio.c"
+_FMT_PATCH_TAG = f"framac-pipeline patch ({EACSL_FORMAT_RUNTIME_PATCH})"
+_FMT_VALUES_BLOCK = f"""\
+  /* {_FMT_PATCH_TAG}: read each argument with its own promoted
+     type, per fmtdesc, and record whether an integer value is representable in both the signed
+     and the unsigned type of its rank. An unknown type leaves that argument and the rest strict. */
+  signed char fc_both[arglen > 0 ? arglen : 1];
+  {{
+    va_list fc_ap;
+    int fc_k;
+    va_copy(fc_ap, ap);
+    for (fc_k = 0; fc_k < arglen; fc_k++) {{
+      fc_both[fc_k] = 0;
+      switch (fmtdesc[fc_k]) {{
+      case 'c':
+      case 'h':
+      case 'd': {{
+        int v = va_arg(fc_ap, int);
+        fc_both[fc_k] = v >= 0;
+        break;
+      }}
+      case 'C':
+      case 'H':
+      case 'D': {{
+        unsigned int v = va_arg(fc_ap, unsigned int);
+        fc_both[fc_k] = v <= (~0u >> 1);
+        break;
+      }}
+      case 'l': {{
+        long v = va_arg(fc_ap, long);
+        fc_both[fc_k] = v >= 0;
+        break;
+      }}
+      case 'L': {{
+        unsigned long v = va_arg(fc_ap, unsigned long);
+        fc_both[fc_k] = v <= (~0ul >> 1);
+        break;
+      }}
+      case 'r': {{
+        long long v = va_arg(fc_ap, long long);
+        fc_both[fc_k] = v >= 0;
+        break;
+      }}
+      case 'R': {{
+        unsigned long long v = va_arg(fc_ap, unsigned long long);
+        fc_both[fc_k] = v <= (~0ull >> 1);
+        break;
+      }}
+      case 'f':
+      case 'e':
+        (void)va_arg(fc_ap, double);
+        break;
+      case 'E':
+        (void)va_arg(fc_ap, long double);
+        break;
+      case 's':
+      case 'S':
+      case 'q':
+      case 'Q':
+      case 'i':
+      case 'I':
+      case 'z':
+      case 'Z':
+      case 'w':
+      case 'W':
+      case 'p':
+        (void)va_arg(fc_ap, void *);
+        break;
+      default:
+        goto fc_strict;
+      }}
+    }}
+  fc_strict:
+    for (; fc_k < arglen; fc_k++)
+      fc_both[fc_k] = 0;
+    va_end(fc_ap);
+  }}
+"""
+_FMT_HELPER = f"""\
+/* {_FMT_PATCH_TAG}: 1 when the directive's type and the
+   argument's type are the signed and unsigned types of one integer rank and the argument's value
+   is representable in both (C11 6.5.2.2p6, 7.16.1.1p2); `both` holds that per argument. */
+static int fc_signedness_only(abbrev_t expected_t, abbrev_t actual_t,
+                              const signed char *both, int idx) {{
+  if (expected_t == actual_t)
+    return 0;
+  switch (expected_t) {{
+  case IInt:
+  case IUInt:
+    if (actual_t != IInt && actual_t != IUInt)
+      return 0;
+    break;
+  case ILong:
+  case IULong:
+    if (actual_t != ILong && actual_t != IULong)
+      return 0;
+    break;
+  case ILongLong:
+  case IULongLong:
+    if (actual_t != ILongLong && actual_t != IULongLong)
+      return 0;
+    break;
+  default:
+    return 0;
+  }}
+  return both[idx] != 0;
+}}
+
+"""
+# (name, anchor, replacement): each anchor must occur exactly once in e_acsl_stdio.c.
+_FMT_HUNKS: tuple[tuple[str, str, str], ...] = (
+    (
+        "validate_format",
+        "static void validate_format(const char *fmtdesc,",
+        _FMT_HELPER + "static void validate_format(const char *fmtdesc,",
+    ),
+    (
+        "arglen",
+        "  int arglen = strlen(fmtdesc); /* number of variadic arguments */\n",
+        "  int arglen = strlen(fmtdesc); /* number of variadic arguments */\n" + _FMT_VALUES_BLOCK,
+    ),
+    (
+        "args",
+        "  for (int i = 0; i < arglen; i++)\n    args[i] = va_arg(ap, void *);\n",
+        f"  /* {_FMT_PATCH_TAG}: a floating-point argument is read with its\n"
+        "     own type, so the pointers after it come from their own slots. */\n"
+        "  for (int i = 0; i < arglen; i++) {\n"
+        "    if (fmtdesc[i] == 'f' || fmtdesc[i] == 'e') {\n"
+        "      (void)va_arg(ap, double);\n"
+        "      args[i] = NULL;\n"
+        "    } else if (fmtdesc[i] == 'E') {\n"
+        "      (void)va_arg(ap, long double);\n"
+        "      args[i] = NULL;\n"
+        "    } else\n"
+        "      args[i] = va_arg(ap, void *);\n"
+        "  }\n",
+    ),
+    (
+        "validate_type",
+        "#  define validate_type(_t) validate_format_type(_t, fmtdesc, dir, func)",
+        f"/* {_FMT_PATCH_TAG}: no abort for a signedness-only mismatch whose value fits both types. */\n"
+        "#  define validate_type(_t) (fc_signedness_only((_t), fmtdesc[dir->arg.index], fc_both, dir->arg.index)"
+        " ? (void)0 : validate_format_type(_t, fmtdesc, dir, func))",
+    ),
+)
 # Full tracking registers every local with `__e_acsl_store_block(&local, ...)`, and the kernel aborts
 # on a `register` local ("Taking the address of a register variable", Cil.mkAddrOf; nettle arcfour.c:
 # `register uint8_t i, j;`). Dropping the storage class changes nothing for a local whose address is
@@ -1507,3 +1671,80 @@ def build_errno_shim_object(
     if effects_error:
         result["effects_error"] = effects_error
     return result
+
+
+def patch_format_runtime(text: str) -> tuple[str, list[str]]:
+    """
+    Apply EACSL_FORMAT_RUNTIME_PATCH to the text of e_acsl_stdio.c. Returns (patched text, names
+    of the anchors not found exactly once); on any missing anchor the text comes back unchanged.
+    """
+    missing = [name for name, anchor, _ in _FMT_HUNKS if text.count(anchor) != 1 or _FMT_PATCH_TAG in text]
+    if missing:
+        return text, missing
+    for _, anchor, replacement in _FMT_HUNKS:
+        text = text.replace(anchor, replacement, 1)
+    return text, []
+
+
+def eacsl_share_dir(eacsl_bin: str) -> Path | None:
+    """E-ACSL's share directory as e-acsl-gcc computes it (`$BASEDIR/../share/frama-c/share/e-acsl`), or None."""
+    path = Path(eacsl_bin)
+    if len(path.parts) == 1:
+        found = shutil.which(eacsl_bin)
+        if not found:
+            return None
+        path = Path(found)
+    for base in dict.fromkeys((path.parent, path.resolve().parent)):
+        share = base.parent / "share" / "frama-c" / "share" / "e-acsl"
+        if (share / "e_acsl_rtl.c").is_file():
+            return share
+    return None
+
+
+def _tree_digest(root: Path) -> str:
+    h = hashlib.sha256(EACSL_FORMAT_RUNTIME_PATCH.encode())
+    for p in sorted(q for q in root.rglob("*") if q.is_file()):
+        h.update(p.relative_to(root).as_posix().encode() + b"\0" + p.read_bytes() + b"\0")
+    return h.hexdigest()[:12]
+
+
+def prepare_patched_eacsl_share(src: Path, dest_root: Path) -> dict[str, str]:
+    """
+    A copy of the E-ACSL share directory `src` under `dest_root/<patch>-<digest>/e-acsl` with
+    EACSL_FORMAT_RUNTIME_PATCH applied to its e_acsl_stdio.c, for `e-acsl-gcc --e-acsl-share`.
+    The image is never written. The digest covers the patch and every file of `src`, so a new
+    Frama-C gets a new copy; concurrent builds publish one copy with an atomic rename and reuse it.
+    `status` is `applied` (with `share`) or `not_applied` (with `reason`: no share, a moved anchor).
+    """
+    src = Path(src)
+    out = {"patch": EACSL_FORMAT_RUNTIME_PATCH}
+    stdio = src / _EACSL_STDIO_REL
+    if not stdio.is_file():
+        return {**out, "status": "not_applied", "reason": f"no {_EACSL_STDIO_REL} under {src.as_posix()}"}
+    patched, missing = patch_format_runtime(stdio.read_text(encoding="utf-8", errors="surrogateescape"))
+    if missing:
+        return {
+            **out,
+            "status": "not_applied",
+            "reason": f"anchor(s) not found exactly once in {_EACSL_STDIO_REL}: {', '.join(missing)}",
+        }
+    final = Path(dest_root) / f"{EACSL_FORMAT_RUNTIME_PATCH}-{_tree_digest(src)}"
+    applied = {**out, "status": "applied", "share": Path(os.path.abspath(final / "e-acsl")).as_posix()}
+    if (final / ".complete").is_file():
+        return applied
+    Path(dest_root).mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=".tmp-", dir=dest_root))
+    try:
+        shutil.copytree(src, tmp / "e-acsl")
+        target = tmp / "e-acsl" / _EACSL_STDIO_REL
+        target.chmod(0o644)
+        target.write_text(patched, encoding="utf-8", errors="surrogateescape", newline="\n")
+        (tmp / ".complete").write_text(EACSL_FORMAT_RUNTIME_PATCH + "\n", encoding="utf-8")
+        try:
+            os.rename(tmp, final)
+        except OSError:
+            if not (final / ".complete").is_file():
+                raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return applied
