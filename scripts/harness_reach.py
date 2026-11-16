@@ -268,6 +268,27 @@ def _callees_from_clang(harness_path: Path, cppflags: str) -> set[str] | None:
         return None
 
 
+def cppflag_renames(cppflags: str) -> dict[str, set[str]]:
+    """
+    The function renames the cppflags define (`-Dname=alias`, both identifiers): alias -> the names it
+    stands for. generate_harness.py renames an `argv` harness's `main` (`-Dmain=__framac_target_main`),
+    so the preprocessed harness calls the alias, and clang's AST names the alias, not `main`.
+    """
+    try:
+        words = shlex.split(cppflags)
+    except ValueError:
+        words = cppflags.split()
+    out: dict[str, set[str]] = {}
+    for i, word in enumerate(words):
+        define = word[2:] if word.startswith("-D") else ""
+        if word == "-D" and i + 1 < len(words):
+            define = words[i + 1]
+        name, sep, alias = define.partition("=")
+        if sep and name != alias and _IDENT_RE.fullmatch(name) and _IDENT_RE.fullmatch(alias):
+            out.setdefault(alias, set()).add(name)
+    return out
+
+
 def harness_roots(
     harness_text: str,
     fn_names: set[str],
@@ -275,9 +296,17 @@ def harness_roots(
     harness_path: Path | None = None,
     cppflags: str = "-I.",
 ) -> set[str]:
-    """DAG functions the harness names directly or through a header macro (inline wrappers are DAG functions)."""
+    """DAG functions the harness names directly or through a header macro (inline wrappers are DAG functions).
+
+    Clang's callees are those of the preprocessed harness: a callee a `-Dname=alias` cppflag renamed
+    also stands for `name` (c-ares run-1: an `argv` harness's `main(2, argv)` is `__framac_target_main`
+    in the AST, and the program's `main` was no root). The text names `name` itself.
+    """
     roots: set[str] = set()
     ast_callees = _callees_from_clang(harness_path, cppflags) if harness_path else None
+    if ast_callees is not None:
+        renames = cppflag_renames(cppflags)
+        ast_callees = ast_callees | {n for c in ast_callees for n in renames.get(c, ())}
     idents = ast_callees if ast_callees is not None else _used_identifiers(harness_text)
     for ident in idents:
         if ident in fn_names:
@@ -1317,6 +1346,12 @@ def check_dynamic(
     match = exemption_matcher(exempt, dag.get("functions") or {})
     static_gap_set = set(static_gaps) if static_gaps is not None else set()
     runs = _executions(coverage)
+    # The coverage build names a renamed function by its alias (an `argv` harness's program `main` is
+    # `__framac_target_main`, libseccomp run-4): its rows count for the name it stands for.
+    for alias, names in cppflag_renames(str(sidecar.get("cppflags") or "")).items():
+        for name in names:
+            if alias in runs:
+                runs[name] = [*runs.get(name, []), *runs[alias]]
     executed: dict[str, int] = {}
     unexecuted: list[str] = []
     for e in _module_entries(module, dag, mm):
