@@ -702,6 +702,63 @@ def test_shards_of_different_analyses_are_refused(tmp_path, capsys):
     assert rc == 1 and "not the same analysis" in report["reason"]
 
 
+def test_a_shard_that_retried_on_missing_recursion_assigns_merges_with_one_that_did_not(tmp_path, capsys):
+    # c-ares run-1, libcares_a__parsers: run_eva_slice retries with assigns:missing downgraded only when
+    # the run aborts on it, so only the shards whose cases reach the recursion carry the reduced check.
+    # A shard that finished without it never met the recursion: it is the same analysis.
+    run = tmp_path
+    _shard(run, 0, [_row(1, "Valid")], {"parse": 5}, reduced_checks=["-no-warn-unsigned-downcast"])
+    _shard(
+        run,
+        1,
+        [_row(1, "Valid")],
+        {"parse": 5},
+        reduced_checks=["-no-warn-unsigned-downcast", es.RECURSION_REDUCED_CHECK],
+        auto_recursion_fallback=True,
+    )
+    rc, report = _merge(run)
+    capsys.readouterr()
+    assert rc == 0 and report["status"] == "ok", report.get("reason")
+    # The caveat stays on the module: the ledger reads it from the merged reduced_checks.
+    assert report["reduced_checks"] == ["-no-warn-unsigned-downcast", es.RECURSION_REDUCED_CHECK]
+    assert report["auto_recursion_fallback"] is True and report["auto_recursion_fallback_shards"] == [1]
+
+
+def test_shards_differing_in_another_reduced_check_are_still_refused(tmp_path, capsys):
+    run = tmp_path
+    _shard(run, 0, [_row(1, "Valid")], {"parse": 5}, reduced_checks=[es.RECURSION_REDUCED_CHECK])
+    _shard(
+        run,
+        1,
+        [_row(1, "Valid")],
+        {"parse": 5},
+        reduced_checks=["-no-warn-unsigned-downcast", es.RECURSION_REDUCED_CHECK],
+    )
+    rc, report = _merge(run)
+    capsys.readouterr()
+    assert rc == 1 and report["status"] == "analysis_error" and "not the same analysis" in report["reason"]
+
+
+def test_the_recursion_reduced_check_is_the_one_run_eva_slice_records(tmp_path):
+    import run_eva_slice
+
+    _, plain = run_eva_slice._eva_command(["a.c"], "eva_main", tmp_path, "gcc_x86_64", "", 1, True, True, True, None)
+    _, retried = run_eva_slice._eva_command(
+        ["a.c"],
+        "eva_main",
+        tmp_path,
+        "gcc_x86_64",
+        "",
+        1,
+        True,
+        True,
+        True,
+        None,
+        allow_incomplete_recursion_specs=True,
+    )
+    assert [rc for rc in retried if rc not in plain] == [es.RECURSION_REDUCED_CHECK]
+
+
 def test_flows_merge_as_hints_over_the_shards():
     a = {
         "status": "ok",

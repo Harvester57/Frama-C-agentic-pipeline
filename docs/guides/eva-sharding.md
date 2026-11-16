@@ -225,6 +225,15 @@ the design above:
   `error_summary`, the same as a failed single run. Its obligations are not reported as Unknown one by
   one.
 - **Identity.** Shards must agree on `main_fn`, sources, reduced checks and assumption options.
+  One reduced check is exempt: `-eva-warn-key assigns:missing=warning (recursive calls use
+  kernel-inferred assigns)` (`eva_shards.RECURSION_REDUCED_CHECK`). `run_eva_slice.py` adds it only
+  when a run aborts on `assigns:missing` (a recursive call without an ACSL assigns clause) and is
+  retried, so only the shards whose cases reach that recursion carry it. A shard that finished
+  without it never raised `assigns:missing`, which is an error by default, so running it with the
+  downgrade would change nothing: every shard is the analysis with the downgrade. The merged report's
+  `reduced_checks` is the union over the shards (the first shard's order, then new entries in shard
+  order), so the ledger keeps the recursion caveat, and `auto_recursion_fallback_shards` names the
+  shards that were retried. Any other difference in reduced checks is still refused.
   `input_digest` differs by construction; the merged report's is a digest of the shards' digests.
   They must also carry the same `harness_digest`: shards of an older and of a repaired harness, or
   a stamped shard beside an unstamped one, are refused, and must be run again. A merged report built
