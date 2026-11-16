@@ -98,7 +98,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_capture as bc  # noqa: E402
 import target_env  # noqa: E402
-from framac_common import atomic_write_json, augment_framac_cppflags, load_json_optional, utc_now  # noqa: E402
+from framac_common import (  # noqa: E402
+    atomic_write_json,
+    augment_framac_cppflags,
+    is_pre_c99_std,
+    load_json_optional,
+    utc_now,
+)
 from kernel_ast import compile_dump_module  # noqa: E402
 
 # 2: every function record carries `external_calls`, `kernel_names` and `param_sizes` when callers pass
@@ -313,7 +319,7 @@ def framac_file_flags(flags: list[str], tree: str) -> list[str]:
     """
     out: list[str] = []
     for tok in bc.absolute_flags(flags, tree):
-        if tok in ("-std=c89", "-std=c90", "-std=gnu89", "-std=gnu90", "-std=iso9899:1990"):
+        if is_pre_c99_std(tok):
             continue
         out.append(shlex.quote(tok))
     return out

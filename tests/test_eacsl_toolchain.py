@@ -67,6 +67,18 @@ def test_flag_sets_keep_preprocessor_flags_on_frontend_only(tmp_path):
     assert "-g" not in back and "-std=gnu99" in back
 
 
+@pytest.mark.parametrize("std", ["-std=gnu90", "-std=c89", "-std=iso9899:1990", "-ansi"])
+def test_flag_sets_never_compile_instrumented_code_before_c99(tmp_path, std):
+    # A sidecar written before generate_harness.py dropped them (c-ares run-1) may still carry the
+    # build's pre-C99 -std; Frama-C prints C99 `restrict`, which such a compile rejects.
+    stubs = tmp_path / "fc_stubs"
+    stubs.mkdir()
+    flags = T.build_eacsl_flag_sets(f"-Isrc {std} -fcommon", fuzzer=True, fc_stubs=stubs)
+    front, back = flags["frontend"].split(), flags["backend"].split()
+    assert std not in front and std not in back
+    assert "-Isrc" in front and "-fcommon" in back
+
+
 def test_flag_sets_route_glibc_fp_classification_away_from_gcc_builtins(tmp_path):
     # QCBOR run-4: glibc expanded isnan to __builtin_isnan, Frama-C printed a K&R prototype for it,
     # and clang refused the instrumented file ("cannot redeclare builtin function").
