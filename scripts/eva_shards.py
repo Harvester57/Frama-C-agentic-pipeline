@@ -325,8 +325,8 @@ def timed_out_run_s(report: dict) -> float | None:
     it ran, as its report recorded them (run_eva_slice.py puts both in the timed-out run's
     `cost_profile`, which a completed fallback tier's report keeps), else a timed-out report's own
     `elapsed_s` (the timed-out run's, also when no fallback tier completed). None when the report does
-    not say: a completed fallback tier's report from before the fields existed, whose `elapsed_s` is
-    the tier's.
+    not say: a completed fallback tier's report from before the fields existed, or one whose timed-out
+    run left no flamegraph samples (no `cost_profile` then); its `elapsed_s` is the tier's.
     """
     seen: list[float] = []
     profile = report.get("cost_profile")

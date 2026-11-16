@@ -999,7 +999,8 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
             if timed_out:
                 # At least the time the timed-out run is recorded to have taken (the limit it ran under),
                 # not the module's limit now: else a raised eva_timeout would raise the prediction with it.
-                # A completed fallback tier's report from before that was recorded only has the tier's
+                # A completed fallback tier's report without that record (written before it existed, or
+                # whose timed-out run left no flamegraph samples, so no cost_profile) only has the tier's
                 # time, so it keeps the module's limit as its floor.
                 observed = timed_out_run_s(report)
                 total_s = max(total_s, observed if observed is not None else limit_s * TUNING_SKIP_MARGIN)

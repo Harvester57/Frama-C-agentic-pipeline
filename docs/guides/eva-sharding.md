@@ -59,8 +59,9 @@ Shard plan (deterministic, in `pipeline_make.py`, like the ladder):
   `cost_profile` (`timeout_s`, `elapsed_s`), or the report's `elapsed_s` when no fallback tier
   completed (it is then the timed-out run's). It is never floored to the module's limit at `gen` time,
   which would raise the prediction with every raise of `eva_timeout`. Only a completed fallback tier's
-  report written before those fields existed falls back to that limit, because its `elapsed_s` is the
-  tier's. The new plan stays a lower bound. Plans recorded before these keys existed get the warning
+  report without that record falls back to that limit, because its `elapsed_s` is the tier's: one
+  written before those fields existed, or one whose timed-out run left no flamegraph samples (no
+  `cost_profile` then). The new plan stays a lower bound. Plans recorded before these keys existed get the warning
   for a timed-out run, without the shard's name.
 - Cases a timed-out run never reached: when the flamegraph is the timed-out run's (not a completed
   fallback tier's), a case with no sample in any of its own callees (the direct callees the fewest
