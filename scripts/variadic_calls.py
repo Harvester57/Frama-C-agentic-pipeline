@@ -18,7 +18,9 @@ script reads them from the source, without running anything:
      read from the work tree (workspace/work) when their text names one of the functions. Each is
      parsed with `clang -fsyntax-only -Xclang -ast-dump=json` and the preprocessing flags of its
      own compile, plus the run snapshot's include options (scripts/target_env.py), so the headers
-     of the test framework are found;
+     of the test framework are found. clang writes the AST to a temporary file in the workspace;
+     an AST above MAX_AST_BYTES is refused unread, and the harvest stops starting clang once its
+     total budget (HARVEST_BUDGET_S) is spent, counting the sources it left out;
   3. the call sites: every `CallExpr` of one of the functions. The rule that names the format: it
      is the LAST FIXED PARAMETER, and it must be declared `const char *`; a function whose
      prototype does not fit is skipped with the reason. A call site is kept only when
@@ -47,11 +49,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -66,6 +71,19 @@ REPORT_JSON = Path("workspace/reports/variadic_calls.json")
 WORK_DIR = Path("workspace/work")
 
 CLANG_TIMEOUT_S = 300  # one source
+# The whole harvest. It runs inside harness generation (`api_harness.generate` -> `ensure`), so it
+# must not hold Phase 0 up: 64 sources at 300 s each is over 5 hours. 900 s is three times the limit
+# of one source and far more than a test suite of ordinary size needs (minmea run-1: one source, a few
+# seconds); the sources it leaves out are counted in `sources.over_budget`, never a failure.
+HARVEST_BUDGET_S = 900
+# clang's JSON AST of one source, refused above this size without being read. The dump repeats the
+# whole of every header the source includes (a few tens of MB for a test file that includes the C
+# library's headers: an estimate, not measured on this host), and `json.load` builds a Python tree
+# several times the size of its text, so 128 MiB keeps the peak around 1 GB in the analysis image.
+# The size is checked once clang has finished (stdout goes to a file, not a pipe): stopping clang
+# while it writes would need a Popen loop in place of the injectable `runner`, and the file is on the
+# run's disk, not in memory.
+MAX_AST_BYTES = 128 * 1024 * 1024
 MAX_SOURCES = 64  # sources parsed (each names a variadic API function)
 MAX_CASES_PER_FUNCTION = 256  # distinct (format, objects) kept per function
 MAX_DATA_PER_CASE = 64  # distinct literal data kept per case
@@ -491,21 +509,52 @@ def group_cases(sites: list[dict]) -> list[dict]:
     return list(cases.values())
 
 
+def read_ast(argv: list[str], timeout: float, runner: Callable[..., Any], tmp_dir: Path | None) -> tuple[Any, Any, str]:
+    """
+    (clang's JSON AST of one source, the finished process, why there is none). `runner` is called
+    like `subprocess.run`, with `stdout` a binary temporary file it must write the AST to; the file
+    is removed on every path. An AST above MAX_AST_BYTES is refused without being read. Raises what
+    the runner raises (OSError, subprocess.TimeoutExpired) and ValueError for an AST that is no JSON.
+    """
+    with tempfile.TemporaryFile(prefix=".variadic_ast_", dir=tmp_dir) as ast:
+        proc = runner(argv, stdout=ast, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
+        ast.flush()
+        size = os.fstat(ast.fileno()).st_size
+        if size > MAX_AST_BYTES:
+            why = f"clang's AST is {size} bytes, above the cap of {MAX_AST_BYTES} (MAX_AST_BYTES): not read"
+            return None, proc, why
+        ast.seek(0)
+        return json.load(ast), proc, ""
+
+
 def harvest(
     model: Any,
     capture: Any,
     work: Path = WORK_DIR,
     clang: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """The report (see the module docstring); `runner` runs clang (tests replace it)."""
+    """
+    The report (see the module docstring); `runner` runs clang and `clock` measures the budget
+    (tests replace both). clang's AST goes to a temporary file in the parent of `work` (the
+    workspace, on the run's disk).
+    """
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
         "status": "error",
         "model_generated_at": model.get("generated_at") if isinstance(model, dict) else None,
         "functions": {},
-        "sources": {"scanned": [], "library": 0, "not_calling": 0, "missing": [], "failed": {}, "over_cap": 0},
+        "sources": {
+            "scanned": [],
+            "library": 0,
+            "not_calling": 0,
+            "missing": [],
+            "failed": {},
+            "over_cap": 0,
+            "over_budget": 0,
+        },
         "warnings": [],
     }
     if not isinstance(model, dict) or model.get("status") != "ok":
@@ -536,6 +585,8 @@ def harvest(
     usable: dict[str, list[dict]] = {name: [] for name in api}
     unusable: dict[str, int] = {name: 0 for name in api}
     src_info = report["sources"]
+    tmp_dir = work.parent if work.parent.is_dir() else None
+    deadline = clock() + HARVEST_BUDGET_S
     for c in compiles:
         src = str(c["source"])
         path = work / src
@@ -548,12 +599,22 @@ def harvest(
         if len(src_info["scanned"]) + len(src_info["failed"]) >= MAX_SOURCES:
             src_info["over_cap"] += 1
             continue
+        left = deadline - clock()
+        if left <= 0:
+            src_info["over_budget"] += 1
+            continue
+        limit = min(float(CLANG_TIMEOUT_S), left)
         try:
             argv = clang_argv(exe, path, c, work)
-            proc = runner(argv, capture_output=True, text=True, timeout=CLANG_TIMEOUT_S, check=False)
-            tree = json.loads(proc.stdout or "")
+            tree, proc, why = read_ast(argv, limit, runner, tmp_dir)
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-            src_info["failed"][src] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if isinstance(exc, subprocess.TimeoutExpired) and limit < CLANG_TIMEOUT_S:
+                reason += f" (cut to the {limit:.0f} s left of the harvest budget, HARVEST_BUDGET_S)"
+            src_info["failed"][src] = reason
+            continue
+        if tree is None:
+            src_info["failed"][src] = why
             continue
         if not isinstance(tree, dict):
             src_info["failed"][src] = "clang's AST is not an object"
@@ -574,6 +635,11 @@ def harvest(
             listed = report["functions"][s["function"]]["skipped"]
             if len(listed) < MAX_SKIPPED_PER_FUNCTION:
                 listed.append({"source": src, "caller": s.get("caller"), "why": s["why"]})
+    if src_info["over_budget"]:
+        report["warnings"].append(
+            f"{src_info['over_budget']} source(s) naming a variadic function left unparsed: the harvest's "
+            f"budget of {HARVEST_BUDGET_S} s (HARVEST_BUDGET_S) was spent; the cases come from the others"
+        )
     for name in api:
         entry = report["functions"][name]
         entry["sites"] = len(usable[name]) + unusable[name]

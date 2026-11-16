@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -211,6 +212,24 @@ def _work(tmp_path: Path) -> Path:
     return work
 
 
+def _clang_writes(ast: Any, returncode: int = 0, stderr: str = "", seen: list[dict] | None = None):
+    """A fake `runner` that writes `ast` (JSON of a tree, or raw bytes) where harvest sends clang's stdout."""
+    data = ast if isinstance(ast, bytes) else json.dumps(ast).encode()
+
+    def fake_run(argv, **kwargs):
+        if seen is not None:
+            seen.append({"argv": list(argv), **kwargs})
+        kwargs["stdout"].write(data)
+        return subprocess.CompletedProcess(argv, returncode, stdout=None, stderr=stderr)
+
+    return fake_run
+
+
+def _leftovers(work: Path) -> list[str]:
+    """Files harvest left beside the work tree (its temporary AST files go there)."""
+    return sorted(p.name for p in work.parent.iterdir() if p.name != work.name)
+
+
 def test_harvest_reads_the_programs_sources_and_groups_the_call_sites(tmp_path, monkeypatch):
     monkeypatch.delenv("FRAMAC_SNAPSHOT_DIR", raising=False)
     work = _work(tmp_path)
@@ -223,13 +242,8 @@ def test_harvest_reads_the_programs_sources_and_groups_the_call_sites(tmp_path, 
             _scan(_lit("x"), _lit("s"), _rvalue(_var("p", "char *"))),
         ]
     )
-    seen: list[list[str]] = []
-
-    def fake_run(argv, **kwargs):
-        seen.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(tree), stderr="")
-
-    report = vc.harvest(_model(), _capture(), work, clang="clang", runner=fake_run)
+    seen: list[dict] = []
+    report = vc.harvest(_model(), _capture(), work, clang="clang", runner=_clang_writes(tree, seen=seen))
     assert list(va.validate_variadic_calls(report)) == []
     assert report["status"] == "ok" and report["model_generated_at"] == "t0"
     # The library's own source is not a caller; a program that does not name the function is not parsed.
@@ -240,9 +254,13 @@ def test_harvest_reads_the_programs_sources_and_groups_the_call_sites(tmp_path, 
         "missing": ["gone.c"],
         "failed": {},
         "over_cap": 0,
+        "over_budget": 0,
     }
-    argv = seen[0]
+    assert report["warnings"] == [] and _leftovers(work) == []
+    argv = seen[0]["argv"]
     assert len(seen) == 1 and argv[-1] == str(work / "tests.c") and "-ast-dump=json" in argv
+    # clang's stdout goes to a file, not a pipe, with the limit of one source.
+    assert "capture_output" not in seen[0] and seen[0]["timeout"] == vc.CLANG_TIMEOUT_S
     assert argv[argv.index("-I") + 1] == (work.resolve() / "include").as_posix() and "-DT=1" in argv
     scan = report["functions"]["scan"]
     assert (scan["key"], scan["fixed"], scan["sites"], scan["unusable"]) == ("lib.c#scan", 2, 5, 1)
@@ -261,13 +279,123 @@ def test_harvest_statuses_are_reasons_not_failures(tmp_path):
     assert vc.harvest(plain, _capture(), work, clang="clang")["status"] == "no_variadic_api"
     assert vc.harvest(_model(), None, work, clang="clang")["status"] == "no_capture"
 
-    def no_ast(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="fatal error")
-
+    no_ast = _clang_writes(b"", returncode=1, stderr="fatal error")
     report = vc.harvest(_model(), _capture(), work, clang="clang", runner=no_ast)
     assert report["status"] == "ok" and list(report["sources"]["failed"]) == ["tests.c"]
     assert report["functions"]["scan"]["cases"] == []
     assert list(va.validate_variadic_calls(report)) == []
+    assert _leftovers(work) == []
+
+
+def _many_callers(tmp_path: Path, n: int) -> tuple[Path, dict]:
+    """A work tree whose `n` test sources all call `scan`, and their capture."""
+    work = tmp_path / "workspace" / "work"
+    work.mkdir(parents=True)
+    names = [f"t{i}.c" for i in range(n)]
+    for name in names:
+        (work / name).write_text('void t(void) { scan("a", "s", v); }\n')
+    compiles = [{"source": name, "flags": [], "system_flags": []} for name in names]
+    return work, {"status": "ok", "compiles": compiles, "units": {"t": {"kind": "executable", "files": names}}}
+
+
+def test_the_harvest_budget_cuts_the_last_clang_and_counts_the_sources_left_out(tmp_path, monkeypatch):
+    monkeypatch.delenv("FRAMAC_SNAPSHOT_DIR", raising=False)
+    work, capture = _many_callers(tmp_path, 5)
+    tree = _tu(t=[_scan(_lit("x"), _lit("s"), _decay(_var("v", "char[8]")))])
+    now = [1000.0]
+    timeouts: list[float] = []
+
+    def slow_clang(argv, **kwargs):
+        # Each clang takes 400 s of the (fake, monotonic) clock; one cut short by the budget times out.
+        timeouts.append(kwargs["timeout"])
+        now[0] += 400
+        if kwargs["timeout"] < vc.CLANG_TIMEOUT_S:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        kwargs["stdout"].write(json.dumps(tree).encode())
+        return subprocess.CompletedProcess(argv, 0, stdout=None, stderr="")
+
+    assert vc.HARVEST_BUDGET_S == 900
+    report = vc.harvest(_model(), capture, work, clang="clang", runner=slow_clang, clock=lambda: now[0])
+    assert list(va.validate_variadic_calls(report)) == []
+    # 900 s: two full clangs (0 -> 400 -> 800), a third limited to the 100 s left, then nothing.
+    assert timeouts == [300, 300, 100]
+    src = report["sources"]
+    assert report["status"] == "ok" and src["scanned"] == ["t0.c", "t1.c"] and src["over_budget"] == 2
+    assert list(src["failed"]) == ["t2.c"] and "left of the harvest budget" in src["failed"]["t2.c"]
+    assert src["over_cap"] == 0
+    # The harvest keeps the cases it has, and says once what it left out.
+    assert report["functions"]["scan"]["cases"][0]["sites"] == 2
+    assert [w for w in report["warnings"] if "budget" in w] == report["warnings"]
+    assert len(report["warnings"]) == 1 and report["warnings"][0].startswith("2 source(s)")
+    assert _leftovers(work) == []
+
+
+def test_an_ast_above_the_cap_is_refused_without_being_read(tmp_path, monkeypatch):
+    monkeypatch.delenv("FRAMAC_SNAPSHOT_DIR", raising=False)
+    work = _work(tmp_path)
+    tree = _tu(t=[_scan(_lit("x"), _lit("s"), _decay(_var("v", "char[8]")))])
+    data = json.dumps(tree).encode()
+    dirs: list[Any] = []
+    temporary_file, real_load = vc.tempfile.TemporaryFile, json.load
+
+    def where(*a, **k):
+        dirs.append(k.get("dir"))
+        return temporary_file(*a, **k)
+
+    def no_load(*a, **k):
+        raise AssertionError("an AST above the cap was read")
+
+    monkeypatch.setattr(vc.tempfile, "TemporaryFile", where)
+    monkeypatch.setattr(vc, "MAX_AST_BYTES", len(data) - 1)
+    monkeypatch.setattr(vc.json, "load", no_load)
+    report = vc.harvest(_model(), _capture(), work, clang="clang", runner=_clang_writes(data))
+    assert list(va.validate_variadic_calls(report)) == []
+    assert report["status"] == "ok" and report["sources"]["scanned"] == []
+    why = report["sources"]["failed"]["tests.c"]
+    assert f"{len(data)} bytes, above the cap of {len(data) - 1}" in why and "not read" in why
+    # The temporary file is in the workspace (the run's disk), and is gone afterwards.
+    assert dirs == [work.parent] and _leftovers(work) == []
+    # At the cap itself, the AST is read.
+    monkeypatch.setattr(vc.json, "load", real_load)
+    monkeypatch.setattr(vc, "MAX_AST_BYTES", len(data))
+    report = vc.harvest(_model(), _capture(), work, clang="clang", runner=_clang_writes(data))
+    assert report["sources"]["scanned"] == ["tests.c"] and report["sources"]["failed"] == {}
+
+
+def test_the_temporary_ast_is_removed_when_clang_fails(tmp_path, monkeypatch):
+    monkeypatch.delenv("FRAMAC_SNAPSHOT_DIR", raising=False)
+    work = _work(tmp_path)
+
+    def times_out(argv, **kwargs):
+        kwargs["stdout"].write(b'{"kind": "Transl')
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    for runner in (times_out, _clang_writes(b'{"kind": "Transl'), _clang_writes(b"[1]")):
+        report = vc.harvest(_model(), _capture(), work, clang="clang", runner=runner)
+        assert report["status"] == "ok" and list(report["sources"]["failed"]) == ["tests.c"]
+        assert _leftovers(work) == []
+    # A timeout within the limit of one source is not blamed on the budget.
+    report = vc.harvest(_model(), _capture(), work, clang="clang", runner=times_out)
+    assert "TimeoutExpired" in report["sources"]["failed"]["tests.c"]
+    assert "budget" not in report["sources"]["failed"]["tests.c"]
+
+
+def test_harvest_through_a_real_process_writing_to_the_file(tmp_path, monkeypatch):
+    # The default runner is subprocess.run: a child process (Python standing in for clang) writes
+    # the AST straight into the temporary file harvest gives it.
+    monkeypatch.delenv("FRAMAC_SNAPSHOT_DIR", raising=False)
+    work = _work(tmp_path)
+    ast = tmp_path / "ast.json"
+    ast.write_text(json.dumps(_tu(t=[_scan(_lit("x"), _lit("s"), _decay(_var("v", "char[8]")))])))
+    child = "import shutil, sys; shutil.copyfileobj(open(sys.argv[1], 'rb'), sys.stdout.buffer)"
+
+    def as_python(argv, **kwargs):
+        return subprocess.run([sys.executable, "-c", child, str(ast)], **kwargs)
+
+    report = vc.harvest(_model(), _capture(), work, clang="clang", runner=as_python)
+    assert report["status"] == "ok" and report["sources"]["scanned"] == ["tests.c"]
+    assert [c["varargs"][0]["type"] for c in report["functions"]["scan"]["cases"]] == ["char[8]"]
+    assert _leftovers(work) == []
 
 
 def test_only_variadic_api_entry_points_are_harvested():
