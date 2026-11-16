@@ -51,7 +51,11 @@ byte selects it), with arguments built from the model's signature of each functi
     headers only declare is never declared as an object (it would not compile): with no constructor,
     no destructor, or two such handles in one call the function is skipped with the reason;
   - a pointer to another scalar or struct: one object (an output, or read from the input when `const`
-    and the struct has no pointers; zeroed otherwise);
+    and the struct has no pointers; zeroed otherwise). A pointer to an anonymous enum (the model's
+    `enum __anonenum_ares_dns_class_t_7 *` for c-ares's `typedef enum { ... } ares_dns_class_t`)
+    declares its object through the header's typedef, as the layout probe saw the parameter written
+    (`enum_pointer_spellings`); with no typedef name the function is skipped. A pointer to an
+    anonymous struct or union is always skipped;
   - a function pointer: a callback stub of its prototype (`callback_stub`, defined after the headers:
     it writes nothing and returns the zero value of its type), when the layout probe spelled the
     prototype from the headers' own typedefs (`callback_prototypes`); else NULL. Either way the case's
@@ -86,7 +90,8 @@ writers make nothing for them, and a later `--api` run without the flag keeps th
 The layout of every case (which input bytes feed which argument) goes to the sidecar as `api_cases`,
 which seed_harvest.py write reads to turn recorded calls (and, for a `variadic` case, the literal
 data of its call sites) into seeds for each case. Functions the generator cannot call (static, a
-variadic function with no usable call site, an anonymous struct by value, a case the compiler
+variadic function with no usable call site, an anonymous struct by value or behind a pointer, a
+pointer to an anonymous enum the headers name no typedef for, a case the compiler
 refuses, with the compiler's first error) go to `api_skipped` with the reason, and the reach gate
 reports an entry point the harness does not call directly as a gap. A variadic function leaves
 `api_skipped` once one of its cases is in the harness.
@@ -273,6 +278,10 @@ class ApiInfo:
     # the callback stubs the cases use (stub name -> its file-scope definition, `callback_stub`).
     callbacks: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
     stubs: dict[str, str] = field(default_factory=dict)
+    # Pointers to an enum the headers name by a typedef (`enum_pointer_spellings`): per function,
+    # parameter index -> {type, pointee} as the declaration writes them (`cls_t *`, `cls_t`). A pointer
+    # to an anonymous enum (`enum __anonenum_cls_t_7 *` in the model) is spelled only through these.
+    enum_ptrs: dict[str, dict[int, dict[str, str]]] = field(default_factory=dict)
 
 
 class _Case:
@@ -566,6 +575,7 @@ def _bind_call(
     from `params` as they are (the objects behind a variadic call, `variadic_case`).
     """
     shared = shared or {}
+    params = _respell_enum_pointers(case.api, name, params)
     varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
     before: list[str] = []
@@ -790,8 +800,17 @@ def plan_params(signature: str, formals: Sequence[Any] | None = None) -> tuple[l
     return _spell_params(params_s)
 
 
+_ANON_TAG_RE = re.compile(r"\b(struct|union|enum)\s+__anon\w*")
+_ANON_ENUM_RE = re.compile(r"enum\s+__anon\w*")
+
+
 def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | None]:
-    """The parameter types of a model signature as the generator spells them, or why it cannot."""
+    """
+    The parameter types of a model signature as the generator spells them, or why it cannot. A pointer
+    to an anonymous enum (Frama-C's `enum __anonenum_cls_t_7 *` for a header's `cls_t *`) is accepted
+    and flagged `anon_enum`: `_bind_call` spells it through the header's typedef, or skips the case.
+    A pointer to an anonymous struct or union is refused: no object of it can be declared.
+    """
     params: list[dict] = []
     for t in params_s:
         c = classify_type(t)
@@ -799,12 +818,39 @@ def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | Non
             return None, c.get("why") or "void parameter"
         if c["kind"] == "struct" and str(c.get("tag", "")).startswith("__anon"):
             return None, "anonymous struct by value"
-        if c["kind"] == "ptr" and "__anon" in str(c.get("pointee") or ""):
-            return None, "pointer to an anonymous struct"
+        pointee = str(c.get("pointee") or "")
+        if c["kind"] == "ptr" and "__anon" in pointee:
+            if _ANON_ENUM_RE.fullmatch(pointee):
+                c["anon_enum"] = True
+            else:
+                m = _ANON_TAG_RE.search(pointee)
+                return None, f"pointer to an anonymous {m.group(1) if m else 'struct'}"
         # An array parameter is a pointer: cast to `void *`, which converts to it.
         c["type"] = "void *" if "[" in t else " ".join(t.split())
         params.append(c)
     return params, None
+
+
+def _respell_enum_pointers(api: ApiInfo, name: str, params: list[dict]) -> list[dict]:
+    """
+    `params` with each pointer to an anonymous enum spelled as the header declares it (`cls_t *`,
+    `ApiInfo.enum_ptrs`): its object is declared and cast through the typedef, never through Frama-C's
+    generated tag, which no header defines. With no such spelling the case cannot be built: an integer
+    stand-in would be a pointer of another type, and its size need not be the enum's.
+    """
+    if not any(p.get("anon_enum") for p in params):
+        return params
+    spelled = api.enum_ptrs.get(name) or {}
+    out: list[dict] = []
+    for i, p in enumerate(params):
+        if p.get("anon_enum"):
+            s = spelled.get(i)
+            if s is None:
+                why = "the headers name no typedef for it" if api.probed else "no layout probe to read its typedef"
+                raise _Unbuildable(f"pointer to an anonymous enum {p.get('pointee')}: {why}")
+            p = {**p, "pointee": s["pointee"], "type": s["type"]}
+        out.append(p)
+    return out
 
 
 def _model_record(model: dict, dag_rec: dict, key: str) -> dict:
@@ -1455,6 +1501,7 @@ def plan(
         out_ctor_names=outp.names,
         parents={t: p for t, p in outp.parents.items() if t in out_ctors},
         callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
+        enum_ptrs=dict(getattr(visible, "enum_pointers", None) or {}),
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -1593,17 +1640,21 @@ class Declared(set):  # type: ignore[type-arg]
 
     prototypes: dict[str, dict[str, Any]]
     callbacks: dict[str, dict[int, dict[str, Any]]]
+    enum_pointers: dict[str, dict[int, dict[str, str]]]
 
     def __init__(
         self,
         names: Any = (),
         prototypes: dict[str, dict[str, Any]] | None = None,
         callbacks: dict[str, dict[int, dict[str, Any]]] | None = None,
+        enum_pointers: dict[str, dict[int, dict[str, str]]] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
         # `callback_prototypes`: per function, parameter index -> the callback's spelled prototype.
         self.callbacks = callbacks or {}
+        # `enum_pointer_spellings`: per function, parameter index -> {type, pointee} of an enum pointer.
+        self.enum_pointers = enum_pointers or {}
 
 
 def _spelled(t: str) -> str:
@@ -1691,6 +1742,58 @@ def callback_prototypes(tree: dict) -> dict[str, dict[int, dict[str, Any]]]:
             proto = _callback_prototype(str((parm.get("type") or {}).get("qualType") or ""), typedefs)
             if proto is not None:
                 out.setdefault(name, {})[i] = proto
+    return out
+
+
+_TRAILING_QUALIFIER_RE = re.compile(r"\s*\b(?:const|volatile|restrict|__restrict)\s*$")
+
+
+def enum_pointer_spellings(tree: dict) -> dict[str, dict[int, dict[str, str]]]:
+    """
+    Per declared function, its parameters that point to an enum through a typedef name, as the
+    declaration writes them: index -> {"type": `cls_t *` (a `const` pointee kept, the parameter's own
+    qualifier dropped), "pointee": `cls_t`}. c-ares's `typedef enum { ... } ares_dns_class_t;` is
+    anonymous: the model names it `enum __anonenum_ares_dns_class_t_7`, which no header defines, so
+    a case declares the object as `ares_dns_class_t`. Typedefs are followed only to learn that the
+    name is an enum, never to spell it; a pointee that is not a plain typedef name is left out.
+    """
+    typedefs: dict[str, str] = {}
+    decls: list[dict] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        if kind == "FunctionDecl":
+            decls.append(node)
+            continue
+        if kind == "TypedefDecl" and isinstance(node.get("name"), str):
+            typedefs.setdefault(node["name"], str((node.get("type") or {}).get("qualType") or ""))
+        stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+
+    def is_enum(name: str) -> bool:
+        seen: set[str] = set()
+        t = name
+        while t in typedefs and t not in seen:
+            seen.add(t)
+            t = _spelled(typedefs[t])
+        return t.startswith("enum ")
+
+    out: dict[str, dict[int, dict[str, str]]] = {}
+    for node in decls:
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        parms = [n for n in node.get("inner") or [] if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"]
+        for i, parm in enumerate(parms):
+            qual = " ".join(str((parm.get("type") or {}).get("qualType") or "").split())
+            written = _TRAILING_QUALIFIER_RE.sub("", qual)
+            bare = _spelled(written)
+            if not bare.endswith("*"):
+                continue
+            base = bare[:-1].strip()
+            if not _IDENT_RE.fullmatch(base) or not is_enum(base):
+                continue
+            out.setdefault(name, {})[i] = {"type": written, "pointee": base}
     return out
 
 
@@ -1887,7 +1990,9 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         return out
 
     layouts = {k: lay for k in raw if (lay := layout(k)) is not None}
-    return layouts, Declared(functions, handle_prototypes(tree, set(raw)), callback_prototypes(tree))
+    return layouts, Declared(
+        functions, handle_prototypes(tree, set(raw)), callback_prototypes(tree), enum_pointer_spellings(tree)
+    )
 
 
 def probe_layouts(
