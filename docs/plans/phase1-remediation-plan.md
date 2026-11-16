@@ -64,7 +64,7 @@ These settle choices the steps left open. Each step below applies them without r
 | D17 | How one bug seen at two sites becomes one finding (D1b). | **Through the existing `duplicate` rejection class.** S4 records the link (`related`) and the brief shows it. The verifier of the second candidate rejects it as `duplicate`, naming the first, as `crash_verifier_brief.md` already describes. No `same_root_cause_as` field and no change to `ingest-verifier`. The cost is one verifier run for the second candidate. |
 | D18 | How D2 keeps a gated module's units out of WP. | **`ledger.py gate-reach`.** Reach rows record `origin`. `phase0_gates.check` passes a row whose only failure is dynamic. `gate-reach` gives the planned units of each dynamically gated module `reach_gated` evidence and the status `blocked` with the reason `dynamic_reach_gap: <entry points>`, and returns them to `planned` when the gap is gone. `blocked`, not `deferred`: the ledger refuses `deferred` on a unit that carries evidence. `wp_scheduler.py init` and the `wp-replay` recipe call it. |
 | D19 | F6's CPU-second floor and the `stopped` names. | **`MIN_ROUND_CPU_S = 10`**, fixed. A new round needs at least that many CPU-seconds left, CPU-seconds being wall seconds times workers. `stopped` keeps the names in the code (`time_budget_spent`, `every_case_skipped`, `unskippable_case`, `rebuild_failed`, `crash_in_skipped_case`) and gains `no_new_case` and `insufficient_memory`. |
-| D20 | How S6 is cut. | **S6a** (F6 and `stopped`) and **S6b** (D7's two-byte selector). S6b comes last, after S5, because it changes `harness_reach.py`. Its selector is `identity16`: the first two input bytes, little-endian, are the case. |
+| D20 | How S6 is cut. | **S6a** (F6 and `stopped`) and **S6b** (D7's two-byte selector). S6b comes last, after S5, because it changes `harness_reach.py`. Its selector is `identity16`: the first two input bytes, little-endian, are the case. **S6b moved after the merge** (user, 2026-11-17): F3 no longer loses cases silently, since more than 256 cases is refused, so the selector is an extension, and no validation target needs it. |
 | D21 | When a coverage report is usable for F7. | **Status `ok`, or `partial` with `inputs.not_replayed` 0 or absent**, as `harness_reach.partial_coverage_reason` reads it. A function the report does not list counts as not executed, as in the dynamic reach gate. |
 
 ## Rules for every step
@@ -373,6 +373,8 @@ Added by the re-check, for the steps before the merge:
 
 #### S6b. Two-byte selector above 256 cases (D7)
 
+- **When (D20):** after the merge, on `main`.
+
 - **Before starting:** this is the widest change of the plan and no longer fixes a silent defect (see the re-check). The reviewer may decide to move it after the merge; if so, mark it in the Status table and skip it.
 - **Owns:** `scripts/generate_harness.py` (dispatch code), `scripts/api_harness.py` (`MAX_CASES`), `scripts/seed_harvest.py` and `scripts/fuzz_assets.py` (the selector bytes they write), `scripts/harness_reach.py` (`_artifact_first_byte` and its callers), `artifact_dispatch_case` in `scripts/run_eacsl_fuzz.py`, `templates/harness_dual.c.template` if the skip function's argument type must widen, `schemas/harness_sidecar.schema.json` (`dispatch_selector`), `skills/framac-fuzz/SKILL.md`, `skills/framac-slice/SKILL.md`, `tests/test_dispatch_selector.py`, `tests/test_dispatch_selector_wide.py` (new).
 - **Work**, one commit:
@@ -538,7 +540,6 @@ Added by the re-check, for the steps before the merge:
     - S3: `workspace/build/<mod>.build.json` of an `auto` module holds `sanitizer_compile`, and the campaign's two builds are cache hits; no module passed `build-check` and then fuzzed with the sanitizers alone without an `engine_fallback_reason`;
     - S4: on libmnl, LIBMNL-04's two candidates are `related`, and the report lists one finding;
     - S5: `ledger.py gate-reach` ran before `wp-queue`; if a run shows a dynamic gap, its module's units are `blocked` with `dynamic_reach_gap` and the other modules are queued. If no run shows one, say so in the run record: D2 then rests on its unit tests;
-    - S6b, if it landed: no run needs it (no target here has more than 256 cases); say so;
     - S7: a function with `fuzz_not_executed` evidence has `executions` 0 or no row in its module's coverage report, and one with `fuzz_clean` has more than 0; a campaign report with an engine in `fuzzer_error` has `engine_errors`, and its module's units carry `fuzz_fuzzer_error`. Count the units that moved from `fuzz_clean` to `fuzz_not_executed` for the baseline's explanation.
   - LIBMNL-01, -03, -04 and -05 found, with LIBMNL-04 as one finding;
   - the seeded benchmark finds what `seeded-s14` found (9 of 9 bugs, 0 of 4 decoys);
@@ -560,7 +561,6 @@ Before the merge (D11):
 S1 ─┬─▶ S2 ─────┐
     └─▶ S3 ─┬───┴─▶ S4 ─▶ S5 ─┬─▶ S7 ───────────┬─▶ V (user) ─▶ merge to main
             └─▶ S6a ──────────┤                 │
-                              ├─▶ S6b ──────────┤
                               └─▶ S12 (F14, F16)┘
 (S9 and S14 are done.)
 ```
@@ -569,18 +569,19 @@ After the merge, on `main`:
 
 ```text
 V ─▶ S8
+S6b: any time
 S10 (user) ─▶ S12 (F13)
 S11, S13: any time, S13 before S11 if both land
 ```
 
-- **One step at a time is the default:** S1, S2, S3, S4, S5, S12 (F14, F16), S6a, S7, S6b. Each step's worktree is cut after the step before it is merged. Nothing below is needed for that order.
+- **One step at a time is the default:** S1, S2, S3, S4, S5, S12 (F14, F16), S6a, S7. Each step's worktree is cut after the step before it is merged. Nothing below is needed for that order.
 - **S1 comes first:** it creates the module that S2 and S4 extend.
 - **S2 and S3 can run in parallel.** S2 owns `failure_identity.py`, the fixtures, new test files and the leak branch of ingest. S3 owns the build code, `fuzz_common.py` and the patch lines of the existing test files. They share no file. Both touch `run_eacsl_fuzz.py` only through S3.
 - **S4 needs both:** the line-text helpers from S2, and the seam, `fuzz_build` and `fuzz_common` from S3.
 - **S5 after S4.** Both change `scripts/ledger.py`, `scripts/generate_report.py` and `templates/pipeline.mk`, and S5's coverage move imports what S4's move left in place.
 - **S6a after S3; in parallel with S4 and S5 only with care.** It owns `run_campaign_rounds`, which neither moves. But all three edit the import block of `run_eacsl_fuzz.py` and `skills/framac-fuzz/SKILL.md`, so a parallel S6a ends in a textual merge. Run it after S5 unless time matters.
 - **S7 comes last among the ledger steps**, since it touches `cmd_ingest_fuzz` after S2, S4 and S5. It also edits `merge_engine_campaigns`, next to S6a's function: after S6a.
-- **S6b after S5 and S6a:** it changes `harness_reach.py` (S5's file) and `artifact_dispatch_case`.
+- **S6b after the merge (D20), and after S5 and S6a:** it changes `harness_reach.py` (S5's file) and `artifact_dispatch_case`.
 - **S12 (F14, F16) after S5:** both edit `skills/framac-verify/SKILL.md` and `docs/guides/architecture.md`.
 - **Shared files, one writer at a time:** `skills/framac-verify/SKILL.md` and `docs/guides/architecture.md` (S5, S12), `skills/framac-slice/SKILL.md` (S5, S6b), `skills/framac-fuzz/SKILL.md` (S2, S4, S5, S6a, S6b, S7), `scripts/ledger.py` (S2, S4, S5, S7), `templates/pipeline.mk` (S3, S4, S5), `tests/test_seam_guard.py` (S3, S4, S5).
 
@@ -604,7 +605,7 @@ Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; th
 | S4 | L | before merge | open |
 | S5 | M | before merge | open; the crash credit of F2(a) is on the branch (`d5ae38a`, `a923d42`, `ffca52b`), D2 is to do |
 | S6a | S | before merge | open (F6, `stopped`) |
-| S6b | M | before merge | open; F3 is fixed on the branch (`18bc5e9`, `45c7a5f`), the two-byte selector (D7) is an extension |
+| S6b | M | after merge (D20) | open; F3 is fixed on the branch (`18bc5e9`, `45c7a5f`), the two-byte selector (D7) is an extension |
 | S7 | S | before merge | open |
 | S8 | S | after merge | open, after V |
 | S9 | M | before merge | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |
