@@ -7,7 +7,7 @@ Fixes for the pipeline problems that the [`run-6` supervision report](./2026-11-
 - Landed locally on `phase1-remediation` as merge commit `0b2e048` (`integ/run6-remediation`, tip `62c12cb`). Nothing is pushed.
 - The run agent's uncommitted hot patches in the main checkout (12 files) were replaced by these fixes. They are kept on the branch `backup/run6-hotpatches`.
 - The troubleshooting updates and this report are committed as `f9c5d12`, with the six troubleshooting files taken whole. Those files link to upstream drafts under `docs/upstream/frama-c/` that are still uncommitted in the main checkout.
-- On 2026-11-16 the two minmea run-1 fixes were merged on top: `fix/variadic-va-params-detection` (`4d214f5`) and `fix/reach-gate-direct-call` (`fd139c4`). `feat/variadic-api-cases` is not merged.
+- On 2026-11-16 the two minmea run-1 fixes were merged on top: `fix/variadic-va-params-detection` (`4d214f5`) and `fix/reach-gate-direct-call` (`fd139c4`). `feat/variadic-api-cases` followed (`e295c44`), with a time budget and an AST size cap for its call-site harvest (`459bde8`).
 - Work was done by nine agents in separate worktrees (six fixers, then skills, harness and guides), each reviewed and merged with `--no-ff`. The fixer worktrees and branches are deleted. The agents' commits carry a `Claude Opus 5.5` trailer; the merges and follow-ups a `Claude Fable 5.2` one.
 
 ## What was fixed
