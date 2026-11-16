@@ -1,0 +1,12 @@
+$ e-acsl-gcc -n --no-constfold -G clang -F '-machdep gcc_x86_64' -E '-D__FRAMAC_EACSL__ -D_Float128=double -U__SIZEOF_INT128__ -D__SUPPORT_SNAN__ -I/framac-run/out/c/workspace/stubs -I/opt/framac-pipeline/templates/fc_stubs/eacsl -I/opt/framac-pipeline/templates/fc_stubs -include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h -wrapper /opt/framac-pipeline/scripts/fc_cpp_wrapper_eacsl.py -I.' -o /tmp/stub-check-gci_tno2/fc_stub_driver.instrumented.c fc_stub_driver.c
+[kernel:pp:extra-args-std] Warning: 
+  Preprocessing options contain '-std='; make sure they are consistent with Frama-C's '-std' option. These arguments may come from -cpp-command, -cpp-extra-args, -cpp-extra-args-per-file, or from a compilation database. Use '-kernel-warn-key=pp:extra-args-std=inactive' to disable this warning.
+[kernel] Parsing fc_stub_driver.c (with preprocessing)
+[kernel:typing:gcc-mode] /usr/include/x86_64-linux-gnu/sys/types.h:164: 
+  Converting type 'int' with 'mode(__word__)' attribute into mode-less type 'long'
+[kernel:annot-error] /framac-run/out/c/workspace/stubs/sys/epoll.h:18: Failure: 
+  unbound logic variable __fc_errno. Ignoring specification of function epoll_create1
+[kernel] User Error: warning annot-error treated as fatal error.
+[kernel] Frama-C aborted: invalid user input.
+++ /home/opam/.opam/5.5/bin/frama-c -machdep gcc_x86_64 -keep-unused-functions none -machdep gcc_x86_64 '-cpp-extra-args= -std=c99 -D_DEFAULT_SOURCE -D__NO_CTYPE -D__FC_MACHDEP_X86_64  -D__FRAMAC_EACSL__ -D_Float128=double -U__SIZEOF_INT128__ -D__SUPPORT_SNAN__ -I/framac-run/out/c/workspace/stubs -I/opt/framac-pipeline/templates/fc_stubs/eacsl -I/opt/framac-pipeline/templates/fc_stubs -include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h -wrapper /opt/framac-pipeline/scripts/fc_cpp_wrapper_eacsl.py -I.' -no-frama-c-stdlib fc_stub_driver.c -e-acsl -e-acsl-share=/home/opam/.opam/5.5/bin/../share/frama-c/share/e-acsl -then-last -print -ocode /tmp/stub-check-gci_tno2/fc_stub_driver.instrumented.c
+e-acsl-gcc: fatal error: aborted by Frama-C

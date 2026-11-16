@@ -194,6 +194,162 @@ def test_the_ledger_records_what_stub_check_found_for_the_same_content():
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics: the fatal message and the logs kept for the agent (c-ares run-1, 2026-11-16)
+# ---------------------------------------------------------------------------
+
+EPOLL_HDR = "workspace/stubs/sys/epoll.h"
+EPOLL_CREATE1 = "extern  __attribute__((__nothrow__)) int epoll_create1(int __flags) __attribute__(( __leaf__))"
+EPOLL_LOGS = "workspace/reports/stub_check/sys__epoll.h"
+
+
+@pytest.mark.unit
+def test_the_reason_is_the_fatal_message_with_its_text():
+    """
+    Eva prints `[eva:assigns:missing] <file>:18: User Error:` and the message on the next, indented line;
+    stub_check used to report the first line alone, so the agent never saw "no \\from part".
+    """
+    eva = (FIXTURE / "eva_assigns_missing.log").read_text(encoding="utf-8")
+    reason = stub_check._first_error(eva)
+    assert reason.startswith("[eva:assigns:missing] "), reason
+    assert "User Error: no \\from part for clause 'assigns __fc_errno;'" in reason, reason
+    eacsl = (FIXTURE / "eacsl_unbound_fc_errno.log").read_text(encoding="utf-8")
+    reason = stub_check._first_error(eacsl)
+    assert "Failure: unbound logic variable __fc_errno" in reason, reason
+    assert stub_check.header_annot_error({"status": "build_failed", "reason": reason}, EPOLL_HDR)
+    assert not stub_check.header_annot_error({"status": "build_failed", "reason": reason}, "workspace/stubs/zlib.h")
+    # cpp's `warning: "__errordecl" redefined` merely contains "error": the fatal message wins wherever it is.
+    noisy = (
+        'x.h:431:9: warning: "__errordecl" redefined\n'
+        "[eva] analyzing\n"
+        "[kernel] x.h:3: User Error:\n  bad annotation\n"
+        "[kernel] Plug-in eva aborted: invalid user input.\n"
+    )
+    assert stub_check._first_error(noisy) == "[kernel] x.h:3: User Error: bad annotation"
+    assert stub_check._first_error("cc1: some note\nlast line\n") == "last line"
+
+
+def _epoll_inputs() -> None:
+    write_json(Path("workspace/reports/stubs.json"), {"headers": {EPOLL_HDR: {
+        "include_name": "sys/epoll.h", "digest": "e1", "problems": [],
+        "functions": {"epoll_create1": {"state": "filled"}}}}})  # fmt: skip
+    write_json(Path("workspace/reports/phase0_model.json"), {"external_decls": {"epoll_create1": {"proto": EPOLL_CREATE1}}})
+    write_json(Path("workspace/reports/callgraph_dag.json"), {"modules": {"m": {"external_callees": ["epoll_create1"]}}})
+
+
+@pytest.mark.unit
+def test_run_keeps_each_headers_logs_and_names_them(run_dir, monkeypatch):
+    """The Eva log, the smoke program and the reason's `(see <log>)` survive the run; the gate names them."""
+    eva = (FIXTURE / "eva_assigns_missing.log").read_text(encoding="utf-8")
+    monkeypatch.setattr(stub_check, "_run", lambda cmd, cwd, **_: (1, eva) if cmd[0] == "frama-c" else (0, ""))
+    _epoll_inputs()
+    stale = run_dir / EPOLL_LOGS / "run7.log"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("from an older check", encoding="utf-8")
+    assert stub_check.main(["run", "--checks", "eva"]) == 1
+    rec = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))["headers"][EPOLL_HDR]
+    assert rec["eva"]["status"] == "error"
+    assert rec["eva"]["log"] == f"{EPOLL_LOGS}/eva.log"
+    assert rec["artifacts"] == {"dir": EPOLL_LOGS, "files": ["fc_stub_smoke.c", "eva.log"]}
+    assert rec["reasons"] == [
+        f"Frama-C: {stub_check._first_error(eva)} (see {EPOLL_LOGS}/eva.log)"
+    ]
+    assert "no \\from part for clause" in rec["reasons"][0]
+    kept = (run_dir / EPOLL_LOGS / "eva.log").read_text(encoding="utf-8")
+    assert kept.startswith("$ frama-c ") and "Deferred error" in kept
+    assert "epoll_create1(" in (run_dir / EPOLL_LOGS / "fc_stub_smoke.c").read_text(encoding="utf-8")
+    assert not stale.exists()  # the header was re-checked: its old artifacts went
+    gate = phase0_gates.check(run_dir, "m", need=())
+    assert len(gate) == 1 and f"logs and generated programs in {EPOLL_LOGS}/" in gate[0], gate
+    # A header left out of the next run keeps its result and its artifacts.
+    stub_check.main(["run", "--header", "workspace/stubs/other.h", "--checks", "eva"])
+    assert (run_dir / EPOLL_LOGS / "eva.log").is_file()
+
+
+@pytest.mark.unit
+def test_an_eacsl_annotation_error_in_the_header_blocks_it(run_dir, monkeypatch):
+    """`__fc_errno` is unbound under E-ACSL: every fuzz build including the header would abort."""
+    eacsl = (FIXTURE / "eacsl_unbound_fc_errno.log").read_text(encoding="utf-8")
+    monkeypatch.setattr(stub_check, "_run", lambda cmd, cwd, **_: (1, eacsl) if cmd[0] == "e-acsl-gcc" else (0, ""))
+    _epoll_inputs()
+    assert stub_check.main(["run", "--checks", "dynamic"]) == 1
+    data = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
+    rec = data["headers"][EPOLL_HDR]
+    assert rec["dynamic"]["status"] == "build_failed"
+    assert rec["reasons"] == [
+        f"E-ACSL: {stub_check._first_error(eacsl)} (see {EPOLL_LOGS}/eacsl_instrument.log)"
+    ]
+    assert data["blocked_modules"] == {"m": [EPOLL_HDR]}
+
+
+# The c-ares run-1 overlay wrapper for glibc's <sys/epoll.h> (its parse aids), then the header stub_gen.py
+# writes (`#include <errno.h>`), then one contract whose `assigns` each case varies.
+_EPOLL_OVERLAY = """#pragma once
+#include <time.h>
+#include <bits/types/__sigset_t.h>
+#include <sys/cdefs.h>
+#ifndef _STRUCT_TIMESPEC
+#  define _STRUCT_TIMESPEC 1
+#endif
+#include_next <sys/epoll.h>
+#include <errno.h>
+/* fc-stub: epoll_create1 */
+/*@
+  terminates \\true;
+  exits \\false;
+  ASSIGNS
+  ensures result_fd_or_error: \\result >= 0 || \\result == -1;
+*/
+extern int epoll_create1(int __flags);
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "assigns, eva, dynamic",
+    [
+        # c-ares run-1's stub authors: no \from on errno. Eva aborts (Phase 2 Eva would too).
+        ("assigns errno, \\result;", "no \\from part for clause 'assigns __fc_errno;'", "passed"),
+        # The old brief's spelling: Eva parses it, the E-ACSL build does not.
+        ("assigns __fc_errno \\from \\nothing; assigns \\result \\from indirect:__flags;", None,
+         "unbound logic variable __fc_errno"),
+        ("assigns errno \\from \\nothing; assigns \\result \\from indirect:__flags;", None, "passed"),
+    ],
+)  # fmt: skip
+def test_errno_in_a_stub_contract_against_eva_and_eacsl(tmp_path, assigns, eva, dynamic):
+    require_docker_images(ANALYSIS_IMAGE)
+    run = tmp_path / "run"
+    hdr = run / EPOLL_HDR
+    hdr.parent.mkdir(parents=True)
+    hdr.write_text(_EPOLL_OVERLAY.replace("ASSIGNS", assigns), encoding="utf-8", newline="\n")
+    reports = {
+        "stubs.json": {"headers": {EPOLL_HDR: {"include_name": "sys/epoll.h", "problems": [],
+                                               "functions": {"epoll_create1": {"state": "filled"}}}}},
+        "phase0_model.json": {"external_decls": {"epoll_create1": {"proto": EPOLL_CREATE1}}},
+        "callgraph_dag.json": {"modules": {"m": {"external_callees": ["epoll_create1"]}}},
+    }  # fmt: skip
+    for name, data in reports.items():
+        write_json(run / "workspace" / "reports" / name, data)
+    out = _docker(
+        "sh", "-c",
+        "cd /w && FRAMAC_STUB_OVERLAY_DIR=/w/workspace/stubs FRAMAC_CACHE=off timeout 900 "
+        "python3 /opt/framac-pipeline/scripts/stub_check.py run --trials 2",
+        mounts={run: "/w"},
+    )  # fmt: skip
+    rec = json.loads((run / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))["headers"][EPOLL_HDR]
+    if eva is None:
+        assert rec["eva"]["status"] == "ok", out
+    else:
+        assert rec["eva"]["status"] == "error" and eva in rec["eva"]["reason"], out
+        assert (run / EPOLL_LOGS / "eva.log").is_file(), out
+    if dynamic == "passed":
+        assert rec["dynamic"]["functions"]["epoll_create1"]["status"] == "passed", out
+    else:
+        assert rec["dynamic"]["status"] == "build_failed" and dynamic in rec["dynamic"]["reason"], out
+    assert rec["status"] == ("passed" if eva is None and dynamic == "passed" else "failed"), out
+
+
+# ---------------------------------------------------------------------------
 # Make and the stage order
 # ---------------------------------------------------------------------------
 
