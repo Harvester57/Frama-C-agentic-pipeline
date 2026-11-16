@@ -170,6 +170,220 @@ def parse_model_goals(log: str) -> list[dict[str, str]]:
 def parse_failed_wp_goals(log: str) -> set[str]:
     """Names of the goals a WP log reports as not proved."""
     return set(_FAILED_GOAL_RE.findall(log))
+
+
+# Per-goal solver cost (Tier 1 of docs/plans/proof-papers-generalization-plan.md). Source: WP's own JSON
+# report (`-wp-report-json`, Frama-C 34), which names each goal, its property, its verdict, a `cached`
+# count and the prover entries with their time in seconds. Measured in framac-analysis:latest
+# (2026-11-16): a proved goal carries the time of the prover that proved it; an unproved goal carries ONE
+# merged prover entry whose time is a 0 placeholder (Why3 measured 0.01 s or 4.00 s for it), and WP ranks
+# a Timeout above an Unknown when it merges provers (z3 Timeout + cvc5 Unknown reads `[Timeout] (Alt-Ergo)`).
+# So an unproved goal's `time_ms` is null unless a positive time is reported, and "every prover timed out"
+# is only known when a single prover was configured. The log tags are the fallback when the JSON is missing:
+# they carry no solver time at all (the `Qed 2ms` tag is the simplifier's), and `(Cached)` also appears on
+# a first run under `-wp-cache update`, so a log-sourced entry never has a time either.
+GOAL_COSTS_ENV = "FRAMAC_WP_GOAL_COSTS"
+_VERDICT_KINDS = {"timeout": "timeout", "stepout": "stepout", "unknown": "unknown", "failed": "failed"}
+SLOWEST_PROVED_MAX = 5
+# "Well under the timeout" for an Unknown, and "at the timeout" for a Timeout, as fractions of -wp-timeout.
+UNKNOWN_FAST_FRACTION = 0.5
+TIMEOUT_REACHED_FRACTION = 0.9
+_COST_LINE_RE = re.compile(r"^\[wp\] \[(Timeout|Stepout|Unknown|Failed)\] ([A-Za-z_]\w*)(.*)$", re.MULTILINE)
+_COST_TAGS_RE = re.compile(r"(?:[ \t]+\([^()\n]*\))*[ \t]*")
+_PROVER_TAG_RE = re.compile(r"^(?:Alt-Ergo|Z3|CVC4|CVC5|Colibri2?|Vampire|Eprover|Coq|Rocq|Script)$", re.IGNORECASE)
+
+
+def goal_costs_enabled() -> bool:
+    """FRAMAC_WP_GOAL_COSTS=off drops the goal-cost hints (the fields stay), for A/B comparisons."""
+    return os.environ.get(GOAL_COSTS_ENV, "on").strip().lower() not in ("off", "0", "false", "no", "disabled")
+
+
+def _prover_name(raw: object) -> str | None:
+    """`Alt-Ergo:2.4.3` -> `Alt-Ergo`; None for anything that is not a non-empty string."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw.split(":", 1)[0].strip() or None
+
+
+def _positive_ms(raw: object) -> int | None:
+    """A JSON time in seconds as whole milliseconds; None for a missing, non-numeric or zero placeholder."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return None
+    ms = round(raw * 1000)
+    return ms if ms > 0 else None
+
+
+def parse_wp_report_json(text: str) -> list[dict] | None:
+    """The goal entries of a `-wp-report-json` file, or None when it is not a JSON list of objects."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    return [e for e in data if isinstance(e, dict)]
+
+
+def goal_costs_from_report(entries: list[dict], fn_name: str) -> tuple[list[dict], list[dict]]:
+    """
+    (unproven_goal_costs, slowest_proved_goals) from `-wp-report-json` entries. Fails closed: an entry
+    without a goal name, a smoke goal, another function's goal, or an unproved verdict outside
+    timeout/stepout/unknown/failed is left out; a time is kept only when it is a positive measurement.
+    A cached proved goal never enters the slowest list.
+    """
+    unproven: list[dict] = []
+    proved: list[dict] = []
+    seen: set[str] = set()
+    for e in entries:
+        goal = e.get("goal")
+        if not isinstance(goal, str) or not re.fullmatch(r"[A-Za-z_]\w*", goal) or goal in seen:
+            continue
+        if e.get("smoke") is True:
+            continue
+        fn = e.get("function")
+        if isinstance(fn, str) and fn and fn != fn_name:
+            continue
+        seen.add(goal)
+        cached_raw = e.get("cached")
+        cached = isinstance(cached_raw, int) and not isinstance(cached_raw, bool) and cached_raw > 0
+        raw_provers = e.get("provers")
+        provers = [p for p in raw_provers if isinstance(p, dict)] if isinstance(raw_provers, list) else []
+        if e.get("passed") is True:
+            if e.get("verdict") != "valid" or cached:
+                continue
+            for p in provers:
+                name, ms = _prover_name(p.get("prover")), _positive_ms(p.get("time"))
+                if p.get("success") == 1 and name and ms is not None:
+                    proved.append({"goal": goal, "prover": "Qed" if name.lower() == "qed" else name, "time_ms": ms})
+                    break
+            continue
+        if e.get("passed") is not False:
+            continue
+        kind = _VERDICT_KINDS.get(str(e.get("verdict") or ""))
+        if kind is None:
+            continue
+        smt = [p for p in provers if (_prover_name(p.get("prover")) or "").lower() != "qed"]
+        names = [n for n in (_prover_name(p.get("prover")) for p in smt) if n]
+        times = [t for t in (_positive_ms(p.get("time")) for p in smt) if t is not None]
+        prop = e.get("property")
+        unproven.append(
+            {
+                "goal": goal,
+                "property": prop if isinstance(prop, str) and prop else None,
+                "verdict_kind": kind,
+                "provers": list(dict.fromkeys(names)),
+                "time_ms": max(times) if times else None,
+                "cached": cached,
+            }
+        )
+    proved.sort(key=lambda g: (-g["time_ms"], g["goal"]))
+    return unproven, proved[:SLOWEST_PROVED_MAX]
+
+
+def goal_costs_from_log(log: str) -> list[dict]:
+    """
+    unproven_goal_costs from the log tags, when no JSON report is available. Only a line that is exactly
+    `[wp] [<Verdict>] <goal>` followed by parenthesised tags yields provers and the cached mark; any other
+    tail leaves them empty. The log carries no solver time, so `time_ms` is always null and `property`
+    (not reliably encoded in the goal name) too.
+    """
+    costs: list[dict] = []
+    seen: set[str] = set()
+    for m in _COST_LINE_RE.finditer(log):
+        goal = m.group(2)
+        if goal in seen:  # WP prints a goal twice under -wp-cache update or -wp-steps
+            continue
+        seen.add(goal)
+        tail = m.group(3)
+        provers: list[str] = []
+        cached = False
+        if _COST_TAGS_RE.fullmatch(tail):
+            tags = [t.strip() for t in _PAREN_TAG_RE.findall(tail)]
+            provers = list(dict.fromkeys(t for t in tags if _PROVER_TAG_RE.match(t)))
+            cached = "Cached" in tags
+        costs.append(
+            {
+                "goal": goal,
+                "property": None,
+                "verdict_kind": m.group(1).lower(),
+                "provers": provers,
+                "time_ms": None,
+                "cached": cached,
+            }
+        )
+    return costs
+
+
+def collect_goal_costs(json_path: Path, log: str, fn_name: str) -> tuple[list[dict], list[dict], str | None]:
+    """(unproven_goal_costs, slowest_proved_goals, source): the JSON report first, else the log tags."""
+    entries: list[dict] | None = None
+    if json_path.exists():
+        entries = parse_wp_report_json(json_path.read_text(encoding="utf-8", errors="replace"))
+    if entries is not None:
+        unproven, slowest = goal_costs_from_report(entries, fn_name)
+        return unproven, slowest, "report_json"
+    unproven = goal_costs_from_log(log)
+    return unproven, [], ("log" if unproven else None)
+
+
+def _goal_list(names: list[str]) -> str:
+    shown = ", ".join(f"`{n}`" for n in names[:5])
+    return shown + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+
+
+def goal_cost_hints(res: dict) -> list[str]:
+    """
+    The two verdict-kind hints. Each needs every unproven goal (the Degenerated function-pointer goals the
+    result assumes are left out) to agree, and the run's -wp-timeout; a cached time is never used, and an
+    Unknown/Timeout with a measured time on the wrong side of the threshold blocks the hint. Not on a
+    counter-example run, whose merged verdicts differ (an Unknown with a Model beats a Timeout there).
+    """
+    costs = res.get("unproven_goal_costs")
+    timeout_s = res.get("wp_timeout_s")
+    if not isinstance(costs, list) or not costs or res.get("counter_examples"):
+        return []
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+        return []
+    assumed = set((res.get("soundness") or {}).get("assumed_function_pointer_goals") or [])
+    goals = [c for c in costs if isinstance(c, dict) and c.get("goal") not in assumed]
+    if not goals:
+        return []
+    timeout_ms = timeout_s * 1000
+
+    def measured(c: dict) -> int | None:
+        t = c.get("time_ms")
+        return t if isinstance(t, int) and not isinstance(t, bool) and not c.get("cached") else None
+
+    def gave_up_early(c: dict) -> bool:
+        t = measured(c)
+        return c.get("verdict_kind") == "unknown" and (t is None or t <= UNKNOWN_FAST_FRACTION * timeout_ms)
+
+    def ran_out(c: dict) -> bool:
+        t = measured(c)
+        if c.get("verdict_kind") == "stepout":
+            return True
+        return c.get("verdict_kind") == "timeout" and (t is None or t >= TIMEOUT_REACHED_FRACTION * timeout_ms)
+
+    names = [str(c.get("goal")) for c in goals]
+    hints: list[str] = []
+    if all(gave_up_early(c) for c in goals):
+        hints.append(
+            f"Every unproven goal ({_goal_list(names)}) got Unknown, not Timeout: the provers gave up before the "
+            f"{timeout_s}s limit (WP reports a Timeout over an Unknown, so none of them ran out of time). The goal is "
+            "probably false or missing a fact: read its sequent with `--prop <clause> --dump-goal` and check the "
+            "claim with the E-ACSL guardrail before strengthening anything."
+        )
+    provers = [p for p in (res.get("wp_provers") or []) if isinstance(p, str) and p]
+    if len(provers) == 1 and all(ran_out(c) for c in goals):
+        hints.append(
+            f"Every unproven goal ({_goal_list(names)}) ran out of time or steps with the only configured prover "
+            f"({provers[0]}, {timeout_s}s limit): the goal may be true and too large. Isolate it (`--prop <clause>`) "
+            "and reduce what it depends on (split the clause, add an intermediate `assert`, drop facts it does not "
+            "need) before weakening it."
+        )
+    return hints
+
+
 _VC_DUMP_RE = re.compile(
     r"-{20,}\n(\s*Goal [^\n]+:.*?)(?=\n-{20,}|\Z)",
     re.DOTALL,
@@ -972,6 +1186,9 @@ def derive_wp_diagnostic_hints(
                     "'requires n > 0 ==> \\initialized(in_buf + (0 .. n - 1));' for caller inputs, or add "
                     "'loop invariant \\initialized(out_buf + (0 .. i - 1));' for loops that populate an output buffer."
                 )
+        if goal_costs_enabled():
+            for cost_hint in goal_cost_hints(res):
+                _add(cost_hint)
     unframed_var = res.get("unframed_variadic_callees") or []
     has_variadic_err = bool(_VARIADIC_CALLEE_RE.search(aborts_and_unsound)) or bool(
         _VARIADIC_CALLEE_RE.search(log_text or "")
@@ -1449,8 +1666,11 @@ def run_wp_on_function(
     log_path = out_dir / f"{stem}.log"
     sarif_path = out_dir / f"{stem}.sarif"
     sav_path = out_dir / f"{stem}.sav"
+    # Not `.json`: spec_kb (`wp_*.json`) and mutation_check (`*.json`) read every such file next to the
+    # result as a WP result object, and this one is a JSON list.
+    goals_json_path = out_dir / f"{stem}.wp-report-json"
     # A report left over from an earlier run must never be read as this run's result.
-    for stale in (csv_path, sarif_path, sav_path):
+    for stale in (csv_path, sarif_path, sav_path, goals_json_path):
         if stale.exists():
             stale.unlink()
     # Goal files are only kept when asked for (or for a VC dump); otherwise WP writes them to a
@@ -1526,6 +1746,10 @@ def run_wp_on_function(
             str(WP_MEMLIMIT_MB),
             "-wp-out",
             str(wp_out_dir),
+            # Per-goal verdict, provers and times (unproven_goal_costs, slowest_proved_goals): an output
+            # option only, it changes no proof.
+            "-wp-report-json",
+            str(goals_json_path),
         ]
     )
     if wp_steps > 0:
@@ -1969,6 +2193,7 @@ def run_wp_on_function(
         next_focus = "complete"
 
     model_goals = parse_model_goals(combined_log) if counter_examples else []
+    goal_costs, slowest_proved, goal_costs_source = collect_goal_costs(goals_json_path, combined_log, fn_name)
 
     res = {
         "status": status,
@@ -1998,6 +2223,12 @@ def run_wp_on_function(
         "next_synthesis_focus": next_focus,
         "unproven_by_bucket": buckets,
         "unproven_goals": unproven_goals,
+        # Keyed by WP goal name (the CSV rows above carry none): verdict kind, provers, time, cached.
+        "unproven_goal_costs": goal_costs,
+        "slowest_proved_goals": slowest_proved,
+        "goal_costs_source": goal_costs_source,
+        "wp_timeout_s": timeout,
+        "wp_provers": [p.strip() for p in provers.split(",") if p.strip()],
         "proven_under_hyp_goals": under_hyp_goals,
         "layer_goals": layer_goals,
         "goal_dumps": goal_dumps,

@@ -78,6 +78,7 @@ AB_SWITCHES = (
     "FRAMAC_PROOF_CARRY",
     "FRAMAC_LOOP_SEEDS",
     "FRAMAC_REJECTION_REOPEN",
+    "FRAMAC_WP_GOAL_COSTS",
 )
 # The value that turns each switch to its baseline side.
 AB_BASELINE = {name: "off" for name in AB_SWITCHES} | {"FRAMAC_CANDIDATE_RANK": "legacy"}
