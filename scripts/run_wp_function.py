@@ -54,7 +54,15 @@ import cache  # noqa: E402
 import function_facts  # noqa: E402
 import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
-from acsl_ast import find_named_clause, is_trivial_predicate  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    SHAPE_UNKNOWN,
+    AcslError,
+    contract_shape,
+    find_named_clause,
+    function_contract_text,
+    function_returns_void,
+    is_trivial_predicate,
+)
 from framac_common import (  # noqa: E402
     _CPP_ERROR_RE,
     STATUS_DEAD,
@@ -2528,11 +2536,48 @@ def layer_clause_limits(goals: list[dict], c_file: Path) -> dict:
     }
 
 
-def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None) -> dict:
+_LOCAL_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"\n]+)"', re.MULTILINE)
+_INCLUDE_DIR_RE = re.compile(r"(?:^|\s)-I\s*(\S+)")
+
+
+def contract_shape_limit(c_file: Path, fn_name: str, cppflags: str = "") -> str:
+    """
+    The shape of the contract WP proved for `fn_name` (acsl_ast.contract_shape): `functional`,
+    `safety_only` or `not_applicable`. The contract is read where Frama-C takes it from: in front of
+    the definition in `c_file`, and on the function's declarations in the headers `c_file` includes
+    by name (looked up beside it and in the `-I` directories of `cppflags`), merged. `unknown` when
+    none of them is found or a file cannot be read: a contract that was not read is never reported
+    as `safety_only`.
+    """
+    try:
+        source = c_file.read_text(encoding="utf-8", errors="replace")
+        parts = [function_contract_text(source, fn_name, is_header=False, path=str(c_file))]
+        returns_void = function_returns_void(source, fn_name, is_header=False, path=str(c_file))
+    except (OSError, AcslError):
+        return SHAPE_UNKNOWN
+    dirs = [c_file.parent] + [
+        d if d.is_absolute() else c_file.parent / d for d in map(Path, _INCLUDE_DIR_RE.findall(cppflags))
+    ]
+    seen: set[Path] = set()
+    for name in [c_file.with_suffix(".h").name, *_LOCAL_INCLUDE_RE.findall(source)]:
+        header = next((d / name for d in dirs if (d / name).is_file()), None)
+        if header is None or header.resolve() in seen:
+            continue
+        seen.add(header.resolve())
+        with contextlib.suppress(OSError, AcslError):
+            text = header.read_text(encoding="utf-8", errors="replace")
+            parts.append(function_contract_text(text, fn_name, is_header=True, path=str(header)))
+            if returns_void is None:
+                returns_void = function_returns_void(text, fn_name, is_header=True, path=str(header))
+    return contract_shape("\n".join(p for p in parts if p), returns_void=bool(returns_void))
+
+
+def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None, cppflags: str = "") -> dict:
     """
     Record what this verdict covered in `res["limits"]`. `coverage-ledger` credits a proof only when
     the limits are recorded (scripts/ledger.py), and a contradictory contract fails the proof here.
-    `vacuity` is None when the check did not run.
+    `vacuity` is None when the check did not run. A proof that stands also records
+    `limits.contract_shape`: reported only, it changes no status and no credit.
     """
     soundness = res.get("soundness") or {}
     missing_spec = sorted(
@@ -2556,6 +2601,8 @@ def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None) -> dict:
         res["status"] = "unsound_proof"
         res["next_synthesis_focus"] = "tier_b_soundness_fix_required"
         res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, "")
+    if res.get("status") == "all_proven" and res.get("function"):
+        res["limits"]["contract_shape"] = contract_shape_limit(c_file, str(res["function"]), cppflags)
     return res
 
 
@@ -2991,7 +3038,7 @@ def main(argv: list[str] | None = None) -> int:
             wp_par=args.wp_par,
             extra_sources=args.extra_sources,
         )
-    apply_verdict_limits(res, args.file, vacuity)
+    apply_verdict_limits(res, args.file, vacuity, cppflags=args.cppflags)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     if args.counter_examples:
         res["counter_examples"] = True

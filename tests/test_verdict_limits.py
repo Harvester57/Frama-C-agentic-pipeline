@@ -225,7 +225,75 @@ def test_report_section_names_what_verdicts_did_not_establish():
     assert "no guardrail input reached the function (1): `a.c#f`" in text
     assert "inconclusive (1)" in text
     assert "`a.c#f (L5_empty)`" in text and "`a.c#f (L6_gone)`" in text
+    # No report in this ledger records a contract shape: the section does not invent one.
+    assert "Contract shape" not in text and "safety-only" not in text
     assert verdict_limits_section([{"file": "a.c", "function": "f", "evidence": []}]) == []
+
+
+def _credited(file: str, function: str, cls: str, shape: str | None) -> dict:
+    limits: dict = {"vacuity": {"status": "consistent"}}
+    if shape is not None:
+        limits["contract_shape"] = shape
+    return {
+        "file": file,
+        "function": function,
+        "obligation_class": cls,
+        "evidence": [{"phase": "wp", "details": {"limits": limits}}],
+    }
+
+
+def test_report_section_counts_contract_shapes_per_function():
+    ledger = [
+        # One proof is the evidence of two classes: counted once.
+        _credited("a.c", "plain", "rte", "safety_only"),
+        _credited("a.c", "plain", "l3_frame", "safety_only"),
+        _credited("a.c", "sum", "rte", "functional"),
+        _credited("b.c", "log", "rte", "not_applicable"),
+        _credited("b.c", "hidden", "rte", "unknown"),
+        # A proof carried from a run before the field: counted apart, not as safety-only.
+        _credited("b.c", "carried", "rte", None),
+    ]
+    text = "\n".join(verdict_limits_section(ledger))
+    assert "`functional` 1, `safety_only` 1, `not_applicable` 1, `unknown` 1, `not recorded` 1" in text
+    assert "a caller learns nothing about the result" in text
+    assert "- Proven with a safety-only contract (1): `a.c#plain`" in text
+    assert "carried" not in text and "hidden" not in text
+
+
+def test_proof_records_the_contract_shape_from_source_and_header(tmp_path):
+    (tmp_path / "inc").mkdir()
+    (tmp_path / "inc" / "api.h").write_text(
+        "/*@ assigns \\nothing; ensures \\result == a + b; */\nint add(int a, int b);\n"
+        "/*@ assigns \\nothing; */\nvoid note(int a);\n",
+        encoding="utf-8",
+    )
+    c = tmp_path / "api.c"
+    c.write_text(
+        '#include "api.h"\n'
+        "int add(int a, int b) { return a + b; }\n"
+        "void note(int a) { (void)a; }\n"
+        "/*@ requires \\valid(p); assigns *p; */\nvoid touch(int *p) { *p = 0; }\n"
+        "int bare(void) { return 1; }\n",
+        encoding="utf-8",
+    )
+    consistent = {"status": "consistent", "doomed": [], "dead_goals": 0}
+
+    def shape(function, cppflags="-Iinc", **kw):
+        res = W.apply_verdict_limits(_report(function=function, **kw), c, consistent, cppflags=cppflags)
+        return res["limits"].get("contract_shape")
+
+    # The contract sits on the header prototype, found through the -I directory.
+    assert shape("add") == "functional"
+    assert shape("note") == "not_applicable"
+    assert shape("touch") == "safety_only"
+    # No contract found (none written, or the header is out of reach): unknown, never safety_only.
+    assert shape("bare") == "unknown"
+    assert shape("add", cppflags="") == "unknown"
+    # Only a proof that stands records a shape.
+    assert shape("add", status="unproven_goals_remain") is None
+    res = W.apply_verdict_limits(_report(function="add"), tmp_path / "gone.c", consistent)
+    assert res["limits"]["contract_shape"] == "unknown" and res["status"] == "all_proven"
+    assert wp_limits_problem(res["limits"]) is None
 
 
 def test_validator_rejects_discharging_wp_evidence_without_limits():

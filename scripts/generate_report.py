@@ -445,12 +445,19 @@ def assurance_table(ledger: list[dict]) -> list[str]:
     return lines
 
 
+CONTRACT_SHAPE_NOT_RECORDED = "not recorded"
+# acsl_ast.CONTRACT_SHAPES, then the proofs whose report predates the field.
+CONTRACT_SHAPE_ORDER = ("functional", "safety_only", "not_applicable", "unknown", CONTRACT_SHAPE_NOT_RECORDED)
+
+
 def verdict_limits_section(ledger: list[dict]) -> list[str]:
     """What the WP verdicts did and did not establish, from the limits on their evidence."""
     unexercised: set[str] = set()
     inconclusive: set[str] = set()
     unchecked: set[str] = set()
     trivial: set[str] = set()
+    # Per function, not per ledger unit: one proof is the evidence of several obligation classes.
+    shapes: dict[str, str] = {}
     credited = 0
     for u in ledger:
         for e in u["evidence"]:
@@ -465,6 +472,12 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
                 inconclusive.add(name)
             unchecked.update(f"{name} ({c})" for c in limits.get("unchecked_layer_clauses") or [])
             trivial.update(f"{name} ({c})" for c in limits.get("trivial_layer_clauses") or [])
+            # A proof carried from an older run records no shape: counted apart, never as safety-only.
+            shape = limits.get("contract_shape")
+            if isinstance(shape, str) and shape:
+                shapes[name] = shape
+            else:
+                shapes.setdefault(name, CONTRACT_SHAPE_NOT_RECORDED)
     if not credited:
         return []
     out = [
@@ -473,7 +486,21 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
         "- Contract consistency means no prover refuted the contract within its timeout, not that it is satisfiable.",
         "- Trivial-clause detection is syntactic: a tautology it cannot recognize is still credited.",
     ]
+    shape_counts = Counter(shapes.values())
+    if set(shape_counts) - {CONTRACT_SHAPE_NOT_RECORDED}:
+        order = [s for s in CONTRACT_SHAPE_ORDER if s in shape_counts] + sorted(
+            set(shape_counts) - set(CONTRACT_SHAPE_ORDER)
+        )
+        out.append(
+            "- Contract shape of the proven functions, read from the contract text (syntactic): "
+            + ", ".join(f"`{s}` {shape_counts[s]}" for s in order)
+            + ". A `safety_only` proof is fully credited for the absence of runtime errors, but its "
+            "postconditions state validity, initialization or a constant range at most, so a caller learns "
+            "nothing about the result."
+        )
+    safety_only = {name for name, shape in shapes.items() if shape == "safety_only"}
     for label, names in (
+        ("Proven with a safety-only contract", safety_only),
         ("Proven, but no guardrail input reached the function", unexercised),
         ("Contract consistency check inconclusive", inconclusive),
         ("Layer clauses that say nothing about the function", trivial),
