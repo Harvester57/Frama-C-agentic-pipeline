@@ -53,6 +53,9 @@ Modes:
    ok | partial | no_inputs | compile_error | coverage_error. Reach only: never proof or a verdict.
    The replay goes on past failing inputs until `--max-time`; inputs whose sha256 matches a file
    under `--known-crashes-dir` (default workspace/crashes/<module>) replay last (`known_crash`).
+8. `minimize`: minimizes crash input(s) with cvise/creduce on a given or built binary.
+9. `minimize-candidates`: minimizes the reproducers of every unverified candidate.
+10. `minimize-interest`: the cvise interest test, called by the generated interest.sh.
 
 All fuzzer, replay and guardrail executions run through scripts/sandbox_exec.py. The shared
 corpus is never written by the guardrail: new units go to a scratch corpus directory.
