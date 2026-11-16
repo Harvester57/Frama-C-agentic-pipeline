@@ -27,7 +27,8 @@ frontend (eacsl_toolchain.build_eacsl_flag_sets), ahead of templates/fc_stubs.
   3. A new block is a skeleton: the real prototype and a conservative frame derived from the signature
      (const pointers are read only; a pointer followed by its length bounds a range: `\\valid_read` or
      `\\valid` and, when written, `assigns p[0 .. n - 1]`; a fixed-size array parameter bounds its own
-     range; any other written pointer `assigns *p`; a result `assigns \\result`), guarded by
+     range; any other written pointer `assigns *p`; a result `assigns \\result`; one `\\from` listing every
+     named parameter, since Eva aborts on a location other than \\result without one), guarded by
      `#ifdef FC_STUB_DRAFT` under a `TODO(stub-author)` line. The guard keeps it out of every analysis
      until a stub author (the judgment half: skills/framac-slice/stub_author_brief.md) fills the contract
      from the library's documentation and removes the guard and the TODO line.
@@ -246,7 +247,19 @@ def skeleton_contract(proto: str, formals: list[dict]) -> list[str]:
         if "*" in (return_type_tokens(proto) or proto.split("(", 1)[0]):
             notes.append("result: a pointer; may it be NULL? what does it point to (a ghost pool, an argument)?")
     frame = ", ".join(assigns) if assigns else "\\nothing"
-    from_part = f" \\from {', '.join(n for n in names if n)}" if assigns == ["\\result"] and any(names) else ""
+    # Eva aborts on a location other than \result without `\from` ([eva:assigns:missing], a deferred error
+    # in stub_check and in Phase 2 Eva). Every named parameter, as a direct dependency, is the conservative
+    # default: a written pointer may then point wherever an argument does (an `indirect:` source would not
+    # let it), and parameter names type-check where `*p` of an incomplete or void type would not. A frame
+    # with a location other than \result always has a named pointer, so it never lacks a `\from`.
+    params = [n for n in names if n]
+    from_part = f" \\from {', '.join(params)}" if assigns and params else ""
+    if from_part and assigns != ["\\result"]:
+        notes.append(
+            "\\from lists every parameter; add what the function reads through them (src[0 .. n - 1]), mark "
+            "`indirect:` a pointer that only says where it writes (Eva writes a garbled mix of a direct "
+            "pointer source's addresses), never drop a source the documentation does not rule out"
+        )
     lines = [*requires, f"assigns {frame}{from_part};"]
     return [*(f"// {TODO_MARK}: {n}" for n in notes), *lines]
 
