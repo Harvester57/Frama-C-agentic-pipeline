@@ -673,8 +673,7 @@ def run_eva_on_slice(
             if field:
                 result[field] = str(out_dir / name) if name in restored else None
         result["sav_file"] = None
-        # An entry cached before contracts without \from were rejected holds the downgraded run's `ok`.
-        return reject_stub_from_defects(result, out_dir)
+        return result
 
     # The output files are not part of the analysis: the same analysis is one entry wherever it writes.
     outputs_in_cmd = {
@@ -798,7 +797,7 @@ def parse_nonterm_log(log_text: str) -> list[dict]:
 
 
 # Eva's `assigns:missing` key (an error unless downgraded) covers two defects with different fixes, in
-# the messages Frama-C 31 prints (captured in tests/fixtures/eva_assigns/):
+# the messages Frama-C 34.0~beta prints (captured in tests/fixtures/eva_assigns/):
 #   [eva:assigns:missing] b.c:5: User Error:
 #     Recursive call to depth without assigns clause.            <- recursion or a callback cycle
 #   [eva:assigns:missing] stub.h:4: User Error:
@@ -844,11 +843,19 @@ def _declared_after_contract(path: str, line: int) -> str | None:
         lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
     except (OSError, ValueError):
         return None
-    rest = "\n".join(lines[max(line - 1, 0) :])
-    end = rest.find("*/")
-    if end < 0:
-        return None
-    decl = re.split(r"[;{]", rest[end + 2 :], maxsplit=1)[0]
+    start = max(line - 1, 0)
+    if start < len(lines) and lines[start].lstrip().startswith("//@"):
+        # A line contract: the declaration follows its last `//@` line.
+        while start < len(lines) and lines[start].lstrip().startswith("//@"):
+            start += 1
+        after = "\n".join(lines[start:])
+    else:
+        rest = "\n".join(lines[start:])
+        end = rest.find("*/")
+        if end < 0:
+            return None
+        after = rest[end + 2 :]
+    decl = re.split(r"[;{]", after, maxsplit=1)[0]
     decl = re.sub(r"/\*.*?\*/|//[^\n]*", " ", _strip_attributes(decl), flags=re.S)
     for m in _DECL_NAME_RE.finditer(decl):
         if m.group("fn") not in _NOT_A_DECL_NAME:

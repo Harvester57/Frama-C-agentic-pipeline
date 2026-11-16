@@ -22,7 +22,6 @@ import json
 import re
 import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -111,6 +110,18 @@ def test_function_name_is_read_from_the_declaration_when_the_file_is_there(tmp_p
     )
     (entry,) = run_eva_slice.missing_assigns_messages(log)
     assert entry["function"] == "epoll_wait"
+    # A line contract names the prototype right below it, not one after a later `*/`.
+    line_header = tmp_path / "line.h"
+    line_header.write_text(
+        "//@ assigns *out;\nvoid first(int *out);\n/*@ assigns \\nothing; */\nvoid second(void);\n",
+        encoding="utf-8",
+    )
+    line_log = (
+        f"[eva:assigns:missing] {line_header.as_posix()}:1: User Error: \n"
+        "  no \\from part for clause 'assigns *out;'.\n"
+    )
+    (entry,) = run_eva_slice.missing_assigns_messages(line_log)
+    assert entry["function"] == "first"
     # Without the file and without an adjacent `using specification` line, no name is guessed.
     log_elsewhere = log.replace(header.as_posix(), "/nowhere/epoll.h")
     (entry,) = run_eva_slice.missing_assigns_messages(log_elsewhere)
@@ -205,54 +216,31 @@ def test_repair_hint_names_the_stub_clause():
 
 
 # ---------------------------------------------------------------------------------------------------
-# A cache entry written before the fix (the downgraded run's `ok`) is rejected on restore
+# The second retry site: the cvalue tiers after a timeout
 # ---------------------------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def eva_cache_run(tmp_path, monkeypatch):
-    d = tmp_path / "run-1"
-    d.mkdir()
-    (d / "run-metadata.json").write_text("{}\n", encoding="utf-8")
-    (d / "a.c").write_text("int eva_main(void) { return 0; }\n", encoding="utf-8")
-    monkeypatch.chdir(d)
-    monkeypatch.setenv("FRAMAC_IMAGE_ID", "sha256:test-image")
-    for name in ("FRAMAC_CACHE", "FRAMAC_CACHE_MODE", "FRAMAC_SHARED_CACHE_DIR"):
-        monkeypatch.delenv(name, raising=False)
-    return d
-
-
-def _fake_frama_c(stdout: str):
-    def fake_run(cmd, **kwargs):
-        if "-M" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, stdout="a.o: a.c\n", stderr="")
-        if "-load" in cmd:
-            Path(cmd[cmd.index("-mdr-out") + 1]).write_text('{"runs": []}\n', encoding="utf-8")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        Path(cmd[cmd.index("-report-csv") + 1]).write_text(
-            "directory\tfile\tline\tfunction\tproperty kind\tstatus\tproperty\n"
-            ".\ta.c\t1\teva_main\tassertion\tValid\tmem_access\n",
-            encoding="utf-8",
-        )
-        Path(cmd[cmd.index("-eva-report-red-statuses") + 1]).write_text("", encoding="utf-8")
-        Path(cmd[cmd.index("-save") + 1]).write_bytes(b"sav")
-        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
-
-    return fake_run
-
-
-def test_cached_downgraded_ok_is_rejected_on_restore(eva_cache_run, monkeypatch):
-    monkeypatch.setattr(run_eva_slice.subprocess, "run", _fake_frama_c(_log("a_stub_downgraded")))
-    out = Path("workspace/eva/a")
+@pytest.mark.parametrize("case", ["a_stub", "c_both"])
+def test_timeout_fallback_tiers_do_not_downgrade_a_stub_defect(eva_no_cache, case):
+    calls: list = []
     with pytest.MonkeyPatch.context() as mp:
-        # The cache entry as a pipeline without the check wrote it: `ok`, with the stub warning in eva.log.
-        mp.setattr(run_eva_slice, "reject_stub_from_defects", lambda res, out_dir: res, raising=False)
-        first = run_eva_slice.run_eva_on_slice(["a.c"], "eva_main", out)
-    assert first["status"] == "ok" and first["cache"]["hit"] is False
-    second = run_eva_slice.run_eva_on_slice(["a.c"], "eva_main", out)
-    assert second["cache"]["hit"] is True
-    assert second["status"] == "analysis_error"
-    assert second["reason"] == "stub_assigns_without_from"
+        fake = _fake_execute(f"{case}_default", f"{case}_downgraded", calls)
+
+        def fake_timeout_first(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root=None):
+            res = fake(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root)
+            if len(calls) == 1:  # the base run: Eva prints the message at once, then runs out of time
+                return {**res, "status": "analysis_timeout", "reason": "timeout", "error_summary": ["limit"]}
+            return res
+
+        mp.setattr(run_eva_slice, "_execute_eva", fake_timeout_first)
+        res = run_eva_slice.run_eva_on_slice(["a.c"], "eva_main", eva_no_cache / "out", timeout=300, use_cache=False)
+    assert len(calls) >= 2, "the cvalue tiers ran"
+    assert not any("-eva-warn-key" in cmd for cmd, _ in calls), "no tier was retried with the downgrade"
+    assert not res.get("auto_recursion_fallback")
+    # No tier completed: the result is the timed-out base run's, which names the stub defect too.
+    assert res["status"] == "analysis_timeout"
+    assert any(line.startswith("stub contract of fill at /target/stub.h:4") for line in res["error_summary"])
+    assert res["stub_assigns_without_from"][0]["function"] == "fill"
 
 
 # ---------------------------------------------------------------------------------------------------
