@@ -1185,6 +1185,10 @@ def test_exec_dry_run_builds_the_full_engine_command(tmp_path, fake_engine, monk
     assert ("--cpus", R._fmt_cpus(out["cpus"])) in pairs and ("--memory", f"{out['mem_mb']}m") in pairs
     assert ("-e", "FRAMAC_JOB_CLASS=wp") in pairs and ("-e", "FRAMAC_JOB_KEY=f") in pairs
     assert ("-e", "FRAMAC_IMAGE_ID=sha256:feedface") in pairs and ("-e", "FRAMAC_CACHE_MODE=ro") in pairs
+    # The lease's queue time reaches the container: run_wp_function.py leaves it out of the prover's wall budget.
+    assert ("-e", f"FRAMAC_LEASE_ID={out['lease']}") in pairs
+    waited = [b for a, b in pairs if a == "-e" and b.startswith("FRAMAC_LEASE_WAITED_S=")]
+    assert len(waited) == 1 and float(waited[0].split("=", 1)[1]) >= 0
     assert argv[-1] == "python3 /opt/framac-pipeline/scripts/run_wp_function.py --file a.c"
     assert not list((tmp_path / "broker" / "leases").glob("*.json"))  # the lease was released
 
