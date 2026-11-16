@@ -2802,7 +2802,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Continue Eva when a recursive call has no assigns clause by downgrading the "
-            "assigns:missing error to a warning (recorded in reduced_checks)."
+            "assigns:missing error to a warning (recorded in reduced_checks). A stub contract "
+            "whose assigns clause lacks \\from still fails Eva: write the \\from."
         ),
     )
     eva_rec.add_argument(
