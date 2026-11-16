@@ -60,7 +60,7 @@
     "model_generated_at": {"$comment": "the `generated_at` of the model the functions came from: api_harness.generate harvests again when the model on disk has another", "type": ["string", "null"]},
     "functions": {"type": "object", "additionalProperties": {"$ref": "#/definitions/function"}},
     "sources": {
-      "$comment": "`scanned`: sources parsed (each names one of the functions); `library`: sources of library units, left out; `not_calling`: program sources that name none of the functions; `missing`: not in the work tree; `failed`: clang gave no AST; `over_cap`: left out by the cap on parsed sources.",
+      "$comment": "`scanned`: sources parsed (each names one of the functions); `library`: sources of library units, left out; `not_calling`: program sources that name none of the functions; `missing`: not in the work tree; `failed`: clang gave no AST, or one above the size cap (MAX_AST_BYTES); `over_cap`: left out by the cap on parsed sources; `over_budget`: left out because the harvest's time budget (HARVEST_BUDGET_S) was spent (optional: reports written before it lack it).",
       "type": "object",
       "properties": {
         "scanned": {"$ref": "#/definitions/strings"},
@@ -68,7 +68,8 @@
         "not_calling": {"type": "integer", "minimum": 0},
         "missing": {"$ref": "#/definitions/strings"},
         "failed": {"type": "object", "additionalProperties": {"type": "string"}},
-        "over_cap": {"type": "integer", "minimum": 0}
+        "over_cap": {"type": "integer", "minimum": 0},
+        "over_budget": {"type": "integer", "minimum": 0}
       },
       "required": ["scanned", "library", "not_calling", "missing", "failed", "over_cap"],
       "additionalProperties": false
