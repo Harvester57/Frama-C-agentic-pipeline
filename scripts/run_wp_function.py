@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -306,6 +307,55 @@ def _is_synthetic_probe_file(c_file: Path, scratch_dir: Path | None) -> bool:
     except ValueError:
         return False
     return not rel.parts or rel.parts[0] != "work"
+
+
+def _lease_wait_from_env() -> tuple[str, float] | None:
+    """(lease id, queued seconds) of the host lease this container runs under, or None when unknown.
+
+    `resources.py exec` passes FRAMAC_LEASE_ID and FRAMAC_LEASE_WAITED_S into the container. Without
+    both (no broker, an older wrapper, a garbled value) the wait is unknown and nothing is credited.
+    """
+    lease_id = (os.environ.get("FRAMAC_LEASE_ID") or "").strip()
+    raw = (os.environ.get("FRAMAC_LEASE_WAITED_S") or "").strip()
+    if not lease_id or not raw:
+        return None
+    try:
+        waited = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(waited) or waited < 0:
+        return None
+    return lease_id, waited
+
+
+# Lease ids already credited to a prover budget are kept to this many, newest last.
+_CREDITED_LEASES_KEPT = 64
+
+
+def _prover_budget_lease_wait(budget_data: dict, since_first_s: float, first_call: bool) -> float:
+    """Seconds queued for WP leases since `first_wp_at`, to leave out of the prover's wall budget.
+
+    Accumulates `lease_wait_s` in `budget_data` (the `.prover_budget.json` payload, updated in
+    place). The first call's lease wait came before `first_wp_at` and is never credited; each lease
+    is credited once (`lease_wait_credited`), even if one container runs the script twice. The
+    total never exceeds the time since `first_wp_at`.
+    """
+    stored = budget_data.get("lease_wait_s")
+    total = 0.0
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool) and math.isfinite(stored) and stored > 0:
+        total = float(stored)
+    raw_credited = budget_data.get("lease_wait_credited")
+    credited = [x for x in raw_credited if isinstance(x, str)] if isinstance(raw_credited, list) else []
+    lease = _lease_wait_from_env()
+    if lease is not None and lease[0] not in credited:
+        if not first_call:
+            total += lease[1]
+        credited = [*credited, lease[0]][-_CREDITED_LEASES_KEPT:]
+        budget_data["lease_wait_credited"] = credited
+    total = min(total, max(0.0, since_first_s))
+    if total > 0 or "lease_wait_s" in budget_data:
+        budget_data["lease_wait_s"] = round(total, 1)
+    return total
 
 
 # soundness.reduced_checks of a run with --waive-signed-downcast. workspace_overlay replays the flag for
@@ -1358,19 +1408,25 @@ def run_wp_on_function(
                     budget_data = None
                 if isinstance(budget_data, dict):
                     now_ts = time.time()
-                    first_wp_at = budget_data.get("first_wp_at")
-                    if not isinstance(first_wp_at, (int, float)) or first_wp_at <= 0:
-                        first_wp_at = now_ts
+                    stored_first = budget_data.get("first_wp_at")
+                    first_call = True
+                    first_wp_at = now_ts
+                    if isinstance(stored_first, (int, float)) and stored_first > 0:
+                        first_call, first_wp_at = False, float(stored_first)
+                    if first_call:
                         budget_data["first_wp_at"] = first_wp_at
                     invocations = int(budget_data.get("wp_invocations") or 0) + 1
                     budget_data["wp_invocations"] = invocations
+                    since_first_s = max(0.0, now_ts - float(first_wp_at))
+                    queued_s = _prover_budget_lease_wait(budget_data, since_first_s, first_call)
                     try:
                         budget_path.write_text(json.dumps(budget_data, indent=2) + "\n", encoding="utf-8")
                     except Exception:
                         pass
                     max_inv = int(budget_data.get("max_wp_invocations") or 0)
                     max_wall_s = int(budget_data.get("max_wall_clock_s") or 0)
-                    elapsed_s = max(0.0, now_ts - float(first_wp_at))
+                    # Effort budget: time queued for WP leases in the host broker is not the prover's time.
+                    elapsed_s = max(0.0, since_first_s - queued_s)
                     inv_exceeded = max_inv > 0 and invocations > max_inv
                     wall_exceeded = invocations > 1 and max_wall_s > 0 and elapsed_s > max_wall_s
                     if inv_exceeded or wall_exceeded:
@@ -1386,7 +1442,8 @@ def run_wp_on_function(
                         exhausted_msg = (
                             f"Prover budget exhausted for '{fn_name}' "
                             f"(wp_invocations={invocations}/{max_inv or 'unlimited'}, "
-                            f"elapsed={int(elapsed_s)}s/{max_wall_s or 'unlimited'}s). "
+                            f"elapsed={int(elapsed_s)}s/{max_wall_s or 'unlimited'}s, "
+                            f"excluding {int(queued_s)}s queued for WP leases). "
                             "Stop immediately and write agents/<id>/scratch/result.json with "
                             "status 'stalled_after_k_retries'."
                         )

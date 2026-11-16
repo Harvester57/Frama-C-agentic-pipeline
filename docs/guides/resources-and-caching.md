@@ -94,6 +94,7 @@ The wrappers ([`../../wrappers/framac-docker.sh`](../../wrappers/framac-docker.s
    - `FRAMAC_JOB_CPUS`, `FRAMAC_JOB_MEM_MB`, `FRAMAC_JOB_CLASS` (and `FRAMAC_JOB_KEY`);
    - `FRAMAC_POOL_CPUS` / `FRAMAC_POOL_MEM_MB`, so in-container code sees the whole node;
    - `FRAMAC_IMAGE_ID`, the toolchain identity in every cache key;
+   - `FRAMAC_LEASE_ID` and `FRAMAC_LEASE_WAITED_S`, the seconds this lease was queued. `run_wp_function.py` leaves that queue time out of the prover's wall budget (`max_wall_clock_s` in `agents/<id>/scratch/.prover_budget.json`; the total is recorded there as `lease_wait_s`). Without these variables the budget counts all time since the first WP call;
    - `FRAMAC_CACHE_MODE` (`rw`, `ro` or `off`) and, when the shared store is mounted, `FRAMAC_SHARED_CACHE_DIR=/framac-cache`.
 
    The command string reaches the container through `FRAMAC_CONTAINER_CMD` and the entry shim `container_entry.sh`, which runs it with `bash -lc` and then records the container's usage.

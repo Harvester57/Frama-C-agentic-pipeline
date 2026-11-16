@@ -29,8 +29,10 @@ Knobs: FRAMAC_POOL_CPUS / FRAMAC_POOL_MEMORY (caps), FRAMAC_RESERVE_CPUS / FRAMA
 FRAMAC_CACHE_VOLUME=auto|on|off (shared cache in the named volume framac-cache-<repo key> instead of a
 bind mount; auto when the engine runs in a VM or is remote, or the cache dir is on a network fs),
 FRAMAC_ALLOW_UNENFORCED_LIMITS=1, FRAMAC_MAX_AGENTS, FRAMAC_RESOURCES_VERBOSE=1. Containers receive
-FRAMAC_JOB_CPUS/_MEM_MB/_CLASS[/_KEY], FRAMAC_POOL_CPUS/_MEM_MB, FRAMAC_IMAGE_ID, FRAMAC_CACHE_MODE and,
-when the shared store is mounted, FRAMAC_SHARED_CACHE_DIR. Test hooks: FRAMAC_PROBE_ROOT (fake
+FRAMAC_JOB_CPUS/_MEM_MB/_CLASS[/_KEY], FRAMAC_POOL_CPUS/_MEM_MB, FRAMAC_IMAGE_ID, FRAMAC_CACHE_MODE,
+FRAMAC_LEASE_ID and FRAMAC_LEASE_WAITED_S (seconds the host lease was queued, so effort budgets such as
+the prover's wall budget can leave queue time out) and, when the shared store is mounted,
+FRAMAC_SHARED_CACHE_DIR. Test hooks: FRAMAC_PROBE_ROOT (fake
 /proc and /sys tree), FRAMAC_PROBE_MEMO_S (probe memo, default 5 s).
 
 Tool limits that decide results are fixed (WP_MEMLIMIT_MB, FUZZ_RSS_LIMIT_MB): hardware
@@ -1989,6 +1991,7 @@ class Lease:
     pool_cpus: int
     pool_mem_mb: int
     waited: bool = False
+    wait_s: float = 0.0  # monotonic seconds from the request to the grant (queue time when `waited`)
     warnings: list[str] = field(default_factory=list)
     lock: FileLock | None = field(default=None, repr=False)
 
@@ -2371,10 +2374,13 @@ class Broker:
     ) -> Lease:
         cls = CLASSES[cls_name]
         lid = lease_id or new_lease_id()
+        started = time.monotonic()
         lock = FileLock(self.leases / f"{lid}.lock")
         lock.acquire()
         try:
-            return self._acquire(lid, lock, cls, key, fixed_cpus, fixed_mem_mb, mem_floor_mb, extra or {}, timeout)
+            lease = self._acquire(lid, lock, cls, key, fixed_cpus, fixed_mem_mb, mem_floor_mb, extra or {}, timeout)
+            lease.wait_s = max(0.0, time.monotonic() - started)
+            return lease
         except BaseException:
             with contextlib.suppress(Exception), self.locked():
                 _unlink(self.leases / f"{lid}.json")
@@ -3024,11 +3030,13 @@ def build_engine_argv(
     command: str | None = None,
     image_id: str | None = None,
     cache_volume: str | None = None,
+    lease_wait_s: float | None = None,
 ) -> list[str]:
     """
     `<engine> run <lease flags> <caller's flags...> [command]`. Inserted right after `run`: the
     lease's --name/--label, --init, the CPU/memory/pids limits (each only when the engine can
-    enforce it), the job and pool environment, and the shared cache mount: the named volume
+    enforce it), the job and pool environment (with FRAMAC_LEASE_ID and, when `lease_wait_s` is
+    known, FRAMAC_LEASE_WAITED_S), and the shared cache mount: the named volume
     `cache_volume` when given (no SELinux relabel: the engine labels its own volumes), else the
     host directory `cache_host`.
     """
@@ -3062,6 +3070,10 @@ def build_engine_argv(
     env += [("FRAMAC_POOL_CPUS", str(int(pool_cpus))), ("FRAMAC_POOL_MEM_MB", str(int(pool_mem_mb)))]
     if image_id:
         env.append(("FRAMAC_IMAGE_ID", image_id))
+    # Queue time of this lease: run_wp_function.py leaves it out of the prover's wall budget.
+    env.append(("FRAMAC_LEASE_ID", lease_id))
+    if lease_wait_s is not None and math.isfinite(lease_wait_s) and lease_wait_s >= 0:
+        env.append(("FRAMAC_LEASE_WAITED_S", f"{lease_wait_s:.1f}"))
     source = cache_volume or (str(cache_host) if cache_host else None)
     mounted = cache_mode in ("ro", "rw") and bool(source)
     env.append(("FRAMAC_CACHE_MODE", cache_mode if mounted else "off"))
@@ -3462,11 +3474,13 @@ def cmd_exec(argv: list[str]) -> int:
             command=command,
             image_id=os.environ.get("FRAMAC_IMAGE_ID") or None,
             cache_volume=cache.volume if cache_mode != "off" else None,
+            lease_wait_s=lease.wait_s,
         )
         if lease.waited or os.environ.get("FRAMAC_RESOURCES_VERBOSE") == "1":
             _say(
                 f"{cls_name} lease {lease.id}: {_fmt_cpus(lease.cpus)} CPUs, {lease.mem_mb} MiB "
                 f"(pool {lease.pool_cpus} CPUs, {lease.pool_mem_mb} MiB)"
+                + (f" after {lease.wait_s:.0f}s queued" if lease.waited else "")
             )
         if args.dry_run:
             print(
