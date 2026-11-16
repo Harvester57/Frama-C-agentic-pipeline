@@ -396,7 +396,11 @@ A harness that calls one entry point leaves the rest of the module's API unexerc
 python3 /opt/framac-pipeline/scripts/harness_reach.py check
 ```
 
-It reads `workspace/reports/callgraph_dag.json` and each `harness_<mod>.json` / `harness_<mod>.c`. It takes the DAG functions the harness names (directly, through a header macro such as a `for_each` iterator, through a macro alias, or through a header `static inline` wrapper) and their transitive in-repo callees, direct and indirect. Then it checks that every `candidate_entry_points` function of the module is reached:
+It reads `workspace/reports/callgraph_dag.json` and each `harness_<mod>.json` / `harness_<mod>.c`. It takes the DAG functions the harness names (directly, through a header macro such as a `for_each` iterator, or through a macro alias): the harness's `roots`. Then it checks that the harness calls every `candidate_entry_points` function of the module itself:
+- An entry point is reached when it is a root, or when a root reaches it through header `static inline` wrappers only.
+- An entry point that only another function calls is a gap, even when that caller is a root: it gets the caller's arguments, not the harness's (minmea: the variadic `minmea_scan`, called by the `minmea_parse_*` functions with fixed format strings). The row lists it under `reached_only_through`, with the roots that lead to it.
+- An `argv` harness (`entry_style: argv`) runs a program through its `main`, so its entry points count when `main` reaches them through any chain of calls.
+- Internal functions are counted through the transitive in-repo callees of the roots, direct and indirect (`functions_reached`).
 - A sub-module is checked against the unit's entry points in its own scope.
 - Entry points of a unit that no harness module's scope holds are reported as the unit's gaps.
 - A Tier 1A/1B/2 module without a harness fails with `no_harness`.
@@ -405,7 +409,7 @@ The report goes to `workspace/reports/harness_reach.json`; exit code 1 means a g
 
 For each module with `gaps`:
 
-1. Regenerate its harness with `--api` (every entry point the model can call, plus one `--dispatch-case '<one line of C>'` per entry point left in `api_skipped`: appended after the generated cases, kept by later `--api` runs, dropped with `--dispatch-case ''`), or with `--entry-style dispatch`, one `--dispatch-case` per unreached entry point (several related calls may share a case, for example building a message then parsing it). Keep the existing parser call as a case. Do not cover a gap by violating a callee's contract: a crash from such a case is `rejected` as harness-induced.
+1. Regenerate its harness with `--api` (every entry point the model can call, plus one `--dispatch-case '<one line of C>'` per entry point left in `api_skipped`: appended after the generated cases, kept by later `--api` runs, dropped with `--dispatch-case ''`), or with `--entry-style dispatch`, one `--dispatch-case` per unreached entry point (several related calls may share a case, for example building a message then parsing it). Keep the existing parser call as a case. A gap listed in `reached_only_through` needs its own case too, with arguments its callers never pass. Do not cover a gap by violating a callee's contract: a crash from such a case is `rejected` as harness-induced.
 2. Re-run `harness_reach.py check`.
 3. An entry point that cannot be driven from bytes (it needs a live kernel socket, a real file descriptor, or a process-global the harness cannot set up safely) gets a recorded reason instead: `harness_reach.py exempt --module <mod> --function <fn> --reason '<why>'`. Name the function by its DAG key (`file#name` when the name collides) or by its plain name when no other DAG function has it; the static and the dynamic gate match it the same way. A Tier 1A/1B/2 module that needs no harness at all (example programs, test drivers) gets `harness_reach.py exempt --module <mod> --reason '<why>'`. Exemptions survive harness regeneration. Never exempt an entry point only because writing its case is tedious.
 
