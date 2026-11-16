@@ -310,6 +310,154 @@ def test_make_plan_records_censoring_and_the_limit_verdict():
     assert note is not None and "lower bound" in note and "one case alone" in note
 
 
+def _plan(run: Path) -> dict:
+    return json.loads((run / es.SHARD_DIR / "snmp" / "plan.json").read_text(encoding="utf-8"))
+
+
+def _timed_out_profile(limit_s: int = 7200, elapsed_s: float = 7200.3) -> dict:
+    # What run_eva_slice.py records for a run that hit its wall limit.
+    return {"run": "timed_out", "timeout_s": limit_s, "elapsed_s": elapsed_s, "self": [], "inclusive": []}
+
+
+def test_a_raised_timeout_replans_from_the_limit_the_timed_out_run_hit(tmp_path):
+    # c-ares run-1 dnsrec: the base run hit 7200 s. Raising eva_timeout to 14400 gives a new plan (the
+    # settings digest covers the timeout), predicted from the 7200 s the run is known to have taken, not
+    # from the new limit: the dominant case then fits under 14400 / TUNING_SKIP_MARGIN.
+    run = _dominated_timeout_run(tmp_path)
+    _single_run(
+        run,
+        7200.3,
+        [f"eva_main;snmp_call_{k} {9500.0 if k == 11 else 25.0}" for k in range(19)],
+        status="analysis_timeout",
+        cost_profile=_timed_out_profile(),
+    )
+    _mk(run)
+    assert _plan(run)["basis"]["predicted_over_limit"] is True
+    pm.params_set(run, "snmp", eva_timeout=14400)
+    text, res = _mk(run)
+    # The whole run is predicted at its 7200.3 s, under 14400 / 1.25: one run, no shards, no warning.
+    assert "EVA_SHARDS_snmp :=\n" in text
+    assert not any("Eva sharding:" in w for w in res["warnings"])
+    # Forced into shards, the plan shows the same floor.
+    pm.params_set(run, "snmp", eva_shards=2)
+    _, res = _mk(run)
+    plan = _plan(run)
+    assert plan["basis"]["limit_s"] == 14400 / es.TUNING_SKIP_MARGIN
+    assert plan["basis"]["single_run_s"] == 7200.3  # not floored to the new 14400 s limit
+    assert plan["basis"]["censored"] is True and plan["basis"]["predicted_over_limit"] is False
+    warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as" in w)
+    assert "planning limit" not in warning
+
+
+def test_a_completed_fallback_tier_is_floored_to_the_timed_out_runs_recorded_time(tmp_path):
+    # A fallback tier completed: the report's elapsed_s is the tier's (640 s), its cost_profile the
+    # timed-out base run's. The floor is the base run's recorded 7200.3 s, whatever eva_timeout is now.
+    run = _sharded_run(tmp_path, cases=4)
+    pm.params_set(run, "snmp", eva_timeout=14400)
+    lines = ["eva_main;snmp_call_0 900.0", "eva_main;snmp_call_1 50.0", "eva_main;snmp_call_2 50.0"]
+    lines.append("eva_main;snmp_call_3 0.0")
+    _single_run(run, 640.0, lines, timeout_fallback="cvalue_fast", cost_profile=_timed_out_profile())
+    _mk(run)
+    plan = _plan(run)
+    assert plan["basis"]["single_run_s"] == 7200.3 and plan["basis"]["censored"] is True
+    assert plan["basis"]["imputed_cases"] == [3]  # the flamegraph is the timed-out run's
+    # Without the recorded fields (a report from before them), elapsed_s is only the tier's time: the
+    # module's limit stays the floor.
+    _single_run(run, 640.0, lines, timeout_fallback="cvalue_fast")
+    pm.params_set(run, "snmp", eva_timeout=10000)
+    _mk(run)
+    assert _plan(run)["basis"]["single_run_s"] == 10000.0
+
+
+def _unreached_timeout_run(tmp_path: Path) -> Path:
+    # c-ares run-1 libcares_a__parsers: Eva spent the 7200 s limit in case 2 (ares_parse_a_reply) and never
+    # reached the cases after it: their API functions have no sample. Case 6 shares its only callee with
+    # case 0, so it shows no sign of its own and is not taken as sampled through case 0's time.
+    sidecars = copy.deepcopy(SIDECARS)
+    sidecars["snmp"]["entry_style"] = "dispatch"
+    cases = [
+        "memset(b, 0, 4); snmp_a(fuzz_buf);",
+        "memset(b, 0, 4); snmp_b(fuzz_buf);",
+        "memset(b, 0, 4); snmp_c(fuzz_buf);",
+        "memset(b, 0, 4); snmp_d(fuzz_buf);",
+        "memset(b, 0, 4); snmp_e(fuzz_buf);",
+        "memset(b, 0, 4); snmp_f(fuzz_buf);",
+        "snmp_a(fuzz_buf); snmp_g(fuzz_buf);",
+        "snmp_h(fuzz_buf);",
+    ]
+    sidecars["snmp"]["dispatch_cases"] = cases
+    run = _make_run(tmp_path, sidecars=sidecars)
+    (run / pm.HARNESS_DIR / "harness_snmp.c").write_text(_build_dispatch_invocation(cases) + "\n", encoding="utf-8")
+    lines = ["eva_main;memset 30.0", "eva_main;snmp_a 20.0", "eva_main;snmp_b 10.0", "eva_main;snmp_c 9000.0"]
+    _single_run(run, 7200.3, lines, status="analysis_timeout", cost_profile=_timed_out_profile())
+    return run
+
+
+def test_unsampled_cases_are_those_whose_own_callees_have_no_sample():
+    counts = [es.case_callee_counts(c) for c in ["m(); a();", "m(); b();", "m(); c();", "a(); g();", "m();"]]
+    # Case 3's own callee is g (a is case 0's too); case 4 calls only the helper m, which has samples.
+    assert es.unsampled_cases(counts, {"m": 5.0, "a": 3.0, "b": 1.0}) == [2, 3]
+    assert es.unsampled_cases(counts, {"m": 5.0, "a": 3.0, "b": 1.0, "c": 1.0, "g": 2.0}) == []
+    costs, prior = es.impute_unsampled([1.0, 3.0, 0.0, 0.0], [2, 3])
+    assert prior == 2.0 and costs == [1.0, 3.0, 2.0, 2.0]
+    assert es.impute_unsampled([0.0, 0.0], [0, 1]) == ([0.0, 0.0], None)
+
+
+def test_a_timed_out_plan_guesses_the_cost_of_the_cases_it_never_reached(tmp_path):
+    run = _unreached_timeout_run(tmp_path)
+    _, res = _mk(run)
+    plan = _plan(run)
+    basis = plan["basis"]
+    assert basis["censored"] is True and basis["imputed_cases"] == [3, 4, 5, 6, 7]
+    # The prior is the mean sampled case's time, added on top of the run's 7200.3 s: the dominant case
+    # keeps the time the run gave it, it is not diluted by the guessed ones.
+    sidecar = json.loads((run / pm.HARNESS_DIR / "harness_snmp.json").read_text(encoding="utf-8"))
+    costs, _ = es.case_costs(sidecar["dispatch_cases"], run / "workspace/eva/snmp/tune/base/flamegraph.txt")
+    seconds = 7200.3 / sum(costs)
+    assert basis["imputed_case_s"] == pytest.approx((costs[0] + costs[1] + costs[2]) / 3 * seconds, abs=0.1)
+    by_shard = dict(zip((tuple(s) for s in plan["shards"]), plan["predicted_shard_s"], strict=True))
+    assert by_shard[(2,)] == pytest.approx(costs[2] * seconds, abs=0.1)
+    # Each unreached case is counted at the guess, not at the ~0 its missing samples gave it.
+    for case in (3, 4, 5, 6, 7):
+        load = next(t for s, t in by_shard.items() if case in s)
+        assert load >= basis["imputed_case_s"] - 0.1
+    warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as" in w)
+    assert "no sample of cases [3, 4, 5, 6, 7]" in warning and "not reached before the timeout" in warning
+
+
+def test_imputed_cases_are_spread_over_the_shards(tmp_path):
+    # Two cheap reached cases, one dominant, four never reached: packed by their ~0 cost, the four would
+    # share one shard; counted at the mean sampled case's cost they go one per shard.
+    cases = ["a();", "b();", "c();", "d();", "e();", "f();", "g();"]
+    fg = _flamegraph(tmp_path / "fg.txt", ["eva_main;a 10.0", "eva_main;b 10.0", "eva_main;c 9000.0"])
+    plan = es.make_plan(cases, fg, 7200.3, 5760.0, "dig", 5, censored=True)
+    assert plan["basis"]["imputed_cases"] == [3, 4, 5, 6]
+    for shard in plan["shards"]:
+        assert len(set(shard) & {3, 4, 5, 6}) <= 1
+    # A completed run's zeros are real: the same profile, not censored, packs them by their ~0 cost.
+    done = es.make_plan(cases, fg, 7200.3, 5760.0, "dig", 5)
+    assert "imputed_cases" not in done["basis"]
+    assert any(len(set(shard) & {3, 4, 5, 6}) > 1 for shard in done["shards"])
+
+
+def test_a_completed_basis_never_guesses_case_costs(tmp_path):
+    # Zero samples in a completed run are real: nothing is imputed and the plan has no imputation keys,
+    # as before. A completed fallback tier's own profile (the timed-out run left none) is complete too.
+    run = _unreached_timeout_run(tmp_path)
+    lines = ["eva_main;memset 30.0", "eva_main;snmp_a 20.0", "eva_main;snmp_b 10.0", "eva_main;snmp_c 9000.0"]
+    _single_run(run, 7200.3, lines)
+    pm.params_set(run, "snmp", eva_shards=4)
+    _, res = _mk(run)
+    assert "imputed_cases" not in _plan(run)["basis"]
+    pm.params_set(run, "snmp", eva_shards=3)
+    profile = {"run": "fallback", "self": [], "inclusive": []}
+    _single_run(run, 640.0, lines, timeout_fallback="cvalue_fast", cost_profile=profile)
+    _, res = _mk(run)
+    plan = _plan(run)
+    assert plan["basis"]["censored"] is True and "imputed_cases" not in plan["basis"]
+    assert not any("no sample of" in w for w in res["warnings"])
+
+
 def test_a_module_fast_enough_to_tune_is_not_sharded(tmp_path):
     run = _sharded_run(tmp_path)
     _single_run(run, 900.0, unknown_obligations_by_function={"parse": [{"directory": "w", "file": "a.c"}]})
