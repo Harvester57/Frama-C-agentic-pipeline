@@ -2782,3 +2782,154 @@ def declaration_contract_text(decl: DeclSpan, path: str = "<input>") -> str:
         for t in tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
         if t.kind in ("acsl_block", "acsl_line")
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract shape: does a proved contract say what the function computes?
+# ---------------------------------------------------------------------------
+
+SHAPE_FUNCTIONAL = "functional"
+SHAPE_SAFETY_ONLY = "safety_only"
+SHAPE_NOT_APPLICABLE = "not_applicable"
+# No contract text was found for the function, so nothing can be said about its shape.
+SHAPE_UNKNOWN = "unknown"
+CONTRACT_SHAPES = (SHAPE_FUNCTIONAL, SHAPE_SAFETY_ONLY, SHAPE_NOT_APPLICABLE, SHAPE_UNKNOWN)
+
+_BEHAVIOR_HEAD_RE = re.compile(r"(?<![\\\w])behavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:")
+_PRE_STATE_RE = re.compile(r"\\(old|at)\s*\(")
+# `\at(t, L)` reads the post-state under these labels and the pre-state under any other.
+_POST_LABELS = frozenset({"Post", "Here"})
+_BINDER_DECL_RE = re.compile(r"\\(?:forall|exists)\b([^;]*);")
+_LET_RE = re.compile(r"\\let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=")
+# `(type) term`: a parenthesised type name directly in front of a term.
+_CAST_RE = re.compile(r"\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)*[A-Za-z_][A-Za-z0-9_]*\s*\**\s*\)(?=\s*[\w\\(])")
+# An all-capitals name is read as a constant (a macro or an enumerator), not as a program value.
+_CONSTANT_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
+_NOT_A_VALUE = frozenset(
+    {"sizeof", "integer", "real", "boolean", "Pre", "Post", "Old", "Here", "LoopEntry", "LoopCurrent"}
+)
+_SHAPE_ONLY_NAMES = SHAPE_VOCABULARY_PREDICATES | _NUL_TERMINATION_PREDICATES
+
+
+def _split_pre_state(text: str) -> tuple[str, str]:
+    """(`text` without its `\\old(...)` / `\\at(..., Pre)` terms, the text of those terms)."""
+    post: list[str] = []
+    pre: list[str] = []
+    i = 0
+    while (m := _PRE_STATE_RE.search(text, i)) is not None:
+        inner, end = _paren_group_at(text, m.end() - 1)
+        post.append(text[i : m.start()])
+        if m.group(1) == "at":
+            parts = _split_top_level(inner, ",")
+            label = parts[-1] if len(parts) > 1 else ""
+            inner = ",".join(parts[:-1]) if len(parts) > 1 else inner
+            (post if label in _POST_LABELS else pre).append(f" ({inner}) ")
+        else:
+            pre.append(f" ({inner}) ")
+        i = end
+    post.append(text[i:])
+    return "".join(post), " ".join(pre)
+
+
+def _value_names(text: str, bound: frozenset[str]) -> set[str]:
+    """Program values `text` names: not a member, a call name, a bound variable, a type or a constant."""
+    names: set[str] = set()
+    for m in _IDENT_RE.finditer(text):
+        name = m.group(0)
+        before = text[: m.start()].rstrip()
+        after = text[m.end() :].lstrip()
+        if before.endswith(("->", "\\")) or (before.endswith(".") and not before.endswith("..")):
+            continue
+        if before[-1:].isdigit() or after.startswith("(") or name in bound or name in _NOT_A_VALUE:
+            continue
+        if _CONSTANT_NAME_RE.fullmatch(name):
+            continue
+        names.add(name)
+    return names
+
+
+def _relates_output(predicate: str, roots: frozenset[str] | None, guarded: bool) -> bool:
+    """
+    Whether an `ensures` predicate relates an output to another value. Outputs are `\\result` and the
+    roots of the assigned locations in the post-state (`roots` None: no `assigns` clause, so any
+    post-state value may be one). The other value is a second output, a value the function does not
+    assign, or anything in the pre-state (`\\old`). Arguments of the validity, initialization and
+    separation built-ins are locations, not values, and are left out, so `\\valid(\\result)` and the
+    constant range `\\result >= 0` relate nothing. `guarded` (the clause sits in a behavior with an
+    `assumes`) makes the assumption the other value.
+    """
+    text = _strip_shape_calls(" ".join(predicate.split()), _SHAPE_ONLY_NAMES)
+    bound: set[str] = set(_LET_RE.findall(text))
+    for decl in _BINDER_DECL_RE.findall(text):
+        # `\forall integer i, j;`: the last identifier of each part is the bound name.
+        bound.update(ids[-1] for part in _split_top_level(decl, ",") if (ids := _IDENT_RE.findall(part)))
+    text = _CAST_RE.sub(" ", _BINDER_DECL_RE.sub(" ", text))
+    post_text, pre_text = _split_pre_state(text)
+    post = _value_names(post_text, frozenset(bound))
+    outputs = (post if roots is None else post & roots) | ({"\\result"} if "\\result" in post_text else set())
+    if not outputs:
+        return False
+    others = _value_names(pre_text, frozenset(bound)) | (post - outputs)
+    return guarded or bool(others) or len(outputs) > 1
+
+
+def contract_shape(contract_text: str, returns_void: bool = False) -> str:
+    """
+    What a function contract says beyond the absence of runtime errors:
+
+    - `functional`: at least one `ensures` that is not trivial (`is_trivial_predicate`) relates an
+      output (`\\result`, or the content of a location an `assigns` clause names) to another value:
+      an input, the pre-state (`\\old`), a second output, or the `assumes` of its behavior.
+    - `not_applicable`: a `void` function whose every `assigns` clause is `assigns \\nothing`: it has
+      no output a postcondition could describe.
+    - `safety_only`: anything else. The postconditions, if any, state validity, initialization,
+      separation or a constant range only, so a caller learns nothing about the result.
+    - `unknown`: no contract text.
+
+    Syntactic, like `is_trivial_predicate`: it reads names, not meaning. A postcondition through a
+    logic function or predicate counts by its arguments (`\\result == sum(a, n)` is functional), an
+    all-capitals name counts as a constant, and a tautology the trivial check cannot see through may
+    count as functional.
+    """
+    if not contract_text.strip():
+        return SHAPE_UNKNOWN
+    locs = [loc.strip() for a in extract_frame_clauses(contract_text)["assigns"] for loc in a["locs"] if loc.strip()]
+    roots: frozenset[str] | None = None
+    if locs:
+        found: set[str] = set()
+        for loc in locs:
+            for m in _IDENT_RE.finditer(loc):
+                if not loc[: m.start()].endswith("\\"):
+                    found.add(m.group(0))
+                    break
+        roots = frozenset(found)
+    masked = mask_comments_and_literals(contract_text, acsl="mask", on_error="mask")
+    clauses = list(iter_clauses(contract_text))
+    for kind, _label, predicate, span in clauses:
+        if kind != "ensures" or not predicate or is_trivial_predicate(predicate):
+            continue
+        heads = [m.start() for m in _BEHAVIOR_HEAD_RE.finditer(masked, 0, span[0])]
+        guarded = bool(heads) and any(
+            k == "assumes" and heads[-1] < s[0] < span[0] and not is_trivial_predicate(p) for k, _l, p, s in clauses
+        )
+        if _relates_output(predicate, roots, guarded):
+            return SHAPE_FUNCTIONAL
+    if returns_void and locs and all(loc == "\\nothing" for loc in locs):
+        return SHAPE_NOT_APPLICABLE
+    return SHAPE_SAFETY_ONLY
+
+
+def function_returns_void(source: str, function: str, is_header: bool = False, path: str = "<input>") -> bool | None:
+    """
+    Whether `function` is declared `void` (and not `void *`), read from the first declaration the
+    pipeline takes its contract from. None when the function is not declared in `source`.
+    """
+    decls = contract_declaration_spans(source, function, is_header=is_header, path=path)
+    if not decls:
+        return None
+    head = mask_comments_and_literals(_span_contract_part(decls[0], path=path), acsl="blank", on_error="mask")
+    m = re.search(rf"(?<![A-Za-z0-9_]){re.escape(function)}\s*\(", head)
+    if m is None:
+        return None
+    prefix = head[: m.start()]
+    return "*" not in prefix and "void" in _IDENT_RE.findall(prefix)

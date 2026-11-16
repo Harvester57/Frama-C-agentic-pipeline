@@ -93,6 +93,7 @@ known-first-party = [
     "validate_artifacts",
     "variadic_calls",
     "workspace_overlay",
+    "wp_residual_census",
     "wp_scheduler",
 ]
 

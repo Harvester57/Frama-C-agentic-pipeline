@@ -17,8 +17,10 @@ from acsl_ast import (
     _is_acsl_comment_or_whitespace_only,
     added_top_level_acsl_declarations,
     check_conflicting_acsl_profiles,
+    contract_shape,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
+    function_returns_void,
     splice_prover_changes,
     verify_acsl_only,
 )
@@ -357,3 +359,95 @@ class TestTopLevelAdditions:
         agent = "int g(void) { /*@ assert \\true; */ return 0; }\n" + _BASE
         with pytest.raises(ScopeViolationError, match=r"agent modified content outside assigned function 'f'$"):
             splice_prover_changes(base, agent, base, "f")
+
+
+_BEHAVIOR_CONTRACT = """/*@ assigns \\nothing;
+  @ behavior negative:
+  @   assumes n < 0;
+  @   ensures \\result == -1;
+  @ behavior other:
+  @   assumes n >= 0;
+  @   ensures \\result == 0;
+  @ complete behaviors;
+  @*/"""
+
+
+class TestContractShape:
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            # The result against an input, the pre-state, an input bound, a logic function of the inputs.
+            "/*@ assigns \\nothing; ensures \\result == \\old(x) + 1; */",
+            "/*@ assigns \\nothing; ensures 0 <= \\result <= n; */",
+            "/*@ assigns \\nothing; ensures \\result == sum(a, n); */",
+            "/*@ assigns \\nothing; ensures n < 0 ==> \\result == -1; */",
+            # The content of an assigned location against its old value, an input, or the result.
+            "/*@ assigns *p; ensures *p == \\old(*p) + 1; */",
+            "/*@ assigns out->len; ensures out->len == n; */",
+            "/*@ assigns *p; ensures \\result == *p; */",
+            "/*@ assigns buf[0 .. n - 1]; ensures \\forall integer i; 0 <= i < n ==> buf[i] == 0; */",
+            "/*@ assigns *p; ensures \\at(*p, Post) == \\at(*p, Pre); */",
+            # No assigns clause: any value of the post-state may be an output.
+            "/*@ ensures g == \\old(g) + 1; */",
+            # A constant result is functional once the behavior's `assumes` ties it to an input.
+            _BEHAVIOR_CONTRACT,
+            # One functional clause is enough.
+            "/*@ assigns \\nothing; ensures \\result >= 0; ensures \\result == a + b; */",
+        ],
+    )
+    def test_functional(self, contract: str) -> None:
+        assert contract_shape(contract) == "functional"
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            "/*@ requires \\valid(p); assigns \\nothing; */",
+            # A constant range, also through a cast or as a set of constants.
+            "/*@ assigns \\nothing; ensures \\result >= 0; */",
+            "/*@ assigns \\nothing; ensures (uint8_t)\\result >= 0; */",
+            "/*@ assigns \\nothing; ensures \\result == 0 || \\result == -1; */",
+            "/*@ assigns \\nothing; ensures \\result == MNL_CB_OK; */",
+            "/*@ assigns *p; ensures *p == 5; */",
+            # Validity, initialization and separation, whatever their arguments name.
+            "/*@ assigns \\nothing; ensures \\result == \\null || \\valid(\\result + (0 .. n - 1)); */",
+            "/*@ assigns buf[0 .. n - 1]; ensures \\initialized(buf + (0 .. n - 1)); */",
+            "/*@ assigns *p; ensures \\separated(p, q); */",
+            "/*@ assigns buf[0 .. n - 1]; ensures valid_read_buffer(buf, n); */",
+            # One output against itself, the pre-state alone, a trivial clause.
+            "/*@ assigns p->x; ensures p->x <= p->cap; */",
+            "/*@ assigns \\nothing; ensures \\old(n) >= 0; */",
+            "/*@ assigns \\nothing; ensures \\true; ensures \\result == \\result; */",
+            # A behavior without an `assumes` ties the constant to nothing.
+            "/*@ assigns \\nothing; behavior only: ensures \\result == 0; */",
+        ],
+    )
+    def test_safety_only(self, contract: str) -> None:
+        assert contract_shape(contract) == "safety_only"
+
+    def test_not_applicable_needs_void_and_assigns_nothing(self) -> None:
+        nothing = "/*@ requires \\valid_read(p); assigns \\nothing; */"
+        assert contract_shape(nothing, returns_void=True) == "not_applicable"
+        # A function that returns a value owes its caller a word about it.
+        assert contract_shape(nothing, returns_void=False) == "safety_only"
+        # A void function that writes, or that says nothing about what it writes, has outputs.
+        assert contract_shape("/*@ assigns *p; */", returns_void=True) == "safety_only"
+        assert contract_shape("/*@ requires \\valid(p); */", returns_void=True) == "safety_only"
+        assert contract_shape("/*@ assigns *p; ensures *p == \\old(*p) + 1; */", returns_void=True) == "functional"
+
+    def test_no_contract_is_unknown(self) -> None:
+        assert contract_shape("") == "unknown"
+        assert contract_shape("  \n", returns_void=True) == "unknown"
+
+    def test_function_returns_void(self) -> None:
+        source = (
+            "void *alloc(int n);\n"
+            "/*@ assigns \\nothing; */\n"
+            "void f(int *p) { }\n"
+            "static inline unsigned int g(void) { return 0; }\n"
+        )
+        assert function_returns_void(source, "f") is True
+        assert function_returns_void(source, "g") is False
+        # `void *` is a result, and a prototype is read in a header only.
+        assert function_returns_void(source, "alloc", is_header=True) is False
+        assert function_returns_void(source, "alloc") is None
+        assert function_returns_void(source, "missing") is None
