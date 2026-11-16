@@ -1584,9 +1584,14 @@ def test_auto_retry_on_missing_assigns_recursion_error(tmp_path, monkeypatch):
     def fake_execute(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root=None):
         calls.append((cmd, list(reduced_checks)))
         if "-eva-warn-key" not in cmd:
+            # Eva's own message (Frama-C 34.0~beta; tests/fixtures/eva_assigns/b_rec_default.log).
             (out_dir / "eva.log").write_text(
-                "[eva:assigns:missing] a.c:10: Recursive call to parse_node without assigns clause.\n"
-                "[eva] User Error: Deferred error message was emitted during execution. See above messages for more information.\n",
+                "[eva:assigns:missing] a.c:10: User Error: \n"
+                "  Recursive call to parse_node without assigns clause.\n"
+                "  Generating probably incomplete assigns to interpret the call.\n"
+                "[eva] Deferred error: warning as error assigns:missing:\n"
+                "  a.c:10: Recursive call to parse_node without assigns clause.\n"
+                "[kernel] Plug-in eva aborted: invalid user input.\n",
                 encoding="utf-8",
             )
             return {

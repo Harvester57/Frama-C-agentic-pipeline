@@ -552,15 +552,22 @@ def run_eva_on_slice(
             and not options.get("domains")
         )
 
+        def _exec(run_cmd: list[str], run_reduced: list[str], run_timeout: int | None) -> dict:
+            # Every run (base, recursion retry, fallback tier) fails on a contract without \from.
+            out = _execute_eva(run_cmd, eff_sources, main_fn, out_dir, run_reduced, run_timeout, path_root=path_root)
+            return reject_stub_from_defects(out, out_dir)
+
         cur_allow_rec = allow_incomplete_recursion_specs
         cur_cmd, cur_reduced = cmd, reduced_checks
-        res = _execute_eva(cur_cmd, eff_sources, main_fn, out_dir, cur_reduced, timeout, path_root=path_root)
+        res = _exec(cur_cmd, cur_reduced, timeout)
 
-        # Auto-retry when Frama-C aborts on a recursive call or indirect callback cycle without an ACSL assigns clause.
+        # Auto-retry when Frama-C aborts on a recursive call or indirect callback cycle without an ACSL
+        # assigns clause, and on nothing else under the same warning key.
         if (
             res["status"] == "analysis_error"
             and not cur_allow_rec
-            and _is_missing_assigns_error(out_dir / "eva.log", res.get("error_summary") or [])
+            and res.get("reason") != "stub_assigns_without_from"
+            and _recursion_retry_applies(out_dir / "eva.log")
         ):
             cur_allow_rec = True
             cur_cmd, cur_reduced = _eva_command(
@@ -579,15 +586,7 @@ def run_eva_on_slice(
                 eva_options=options,
                 flamegraph=flamegraph,
             )
-            res = _execute_eva(
-                cur_cmd,
-                eff_sources,
-                main_fn,
-                out_dir,
-                cur_reduced,
-                _remaining(int(budget_s or 300)),
-                path_root=path_root,
-            )
+            res = _exec(cur_cmd, cur_reduced, _remaining(int(budget_s or 300)))
             res["auto_recursion_fallback"] = True
 
         # Fast cvalue fallback when the default 5-domain base run times out. Preserve both eva.log
@@ -618,11 +617,12 @@ def run_eva_on_slice(
                     eva_options=fb_opts,
                     flamegraph=fb_flamegraph,
                 )
-                fb_res = _execute_eva(fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root)
+                fb_res = _exec(fb_cmd, fb_reduced, fb_budget)
                 if (
                     fb_res["status"] == "analysis_error"
                     and not cur_allow_rec
-                    and _is_missing_assigns_error(out_dir / "eva.log", fb_res.get("error_summary") or [])
+                    and fb_res.get("reason") != "stub_assigns_without_from"
+                    and _recursion_retry_applies(out_dir / "eva.log")
                 ):
                     cur_allow_rec = True
                     fb_cmd, fb_reduced = _eva_command(
@@ -641,9 +641,7 @@ def run_eva_on_slice(
                         eva_options=fb_opts,
                         flamegraph=fb_flamegraph,
                     )
-                    fb_res = _execute_eva(
-                        fb_cmd, eff_sources, main_fn, out_dir, fb_reduced, fb_budget, path_root=path_root
-                    )
+                    fb_res = _exec(fb_cmd, fb_reduced, fb_budget)
                     fb_res["auto_recursion_fallback"] = True
                 if fb_res["status"] == "ok":
                     fb_res["eva_options"] = fb_opts
@@ -730,7 +728,8 @@ def extract_repair_hints(log_text: str) -> list[dict]:
     """
     Repair hints from Frama-C log patterns ported from upstream make-wrapper
     (docs/upstream/sources/make_wrapper_tips.md): recursive calls without an assigns clause,
-    and called functions with neither code nor a specification.
+    and called functions with neither code nor a specification; plus contract assigns clauses
+    without \\from (`stub_missing_from`).
     """
     hints: list[dict] = []
     specs = missing_spec_messages(log_text or "")
@@ -755,6 +754,22 @@ def extract_repair_hints(log_text: str) -> list[dict]:
             )
             spec_kind = "assigns"
         hints.append({"pattern": "missing_spec", "function": fname, "spec_kind": spec_kind, "action": action})
+    for entry in missing_assigns_messages(log_text or ""):
+        if entry["kind"] != "stub_from":
+            continue
+        hints.append(
+            {
+                "pattern": "stub_missing_from",
+                "function": entry["function"],
+                "location": entry["location"],
+                "action": (
+                    f"write the \\from of '{entry['clause']}' in the contract at {entry['location']} (the run's "
+                    "stub overlay workspace/stubs/, or the shipped stub it comes from), for example "
+                    "`assigns *p \\from p, *q;` or `\\from \\nothing` when nothing is read; the recursion "
+                    "fallback does not cover this"
+                ),
+            }
+        )
     if _RE_RECURSIVE_CALL_RE.search(log_text or ""):
         hints.append(
             {
@@ -781,15 +796,171 @@ def parse_nonterm_log(log_text: str) -> list[dict]:
     ]
 
 
-def _is_missing_assigns_error(log_path: Path, error_summary: list[str]) -> bool:
-    """Whether Frama-C Eva aborted due to a recursive call / callback cycle lacking an ACSL assigns clause."""
-    if any("assigns:missing" in line or "without assigns clause" in line for line in error_summary):
-        return True
+# Eva's `assigns:missing` key (an error unless downgraded) covers two defects with different fixes, in
+# the messages Frama-C 34.0~beta prints (captured in tests/fixtures/eva_assigns/):
+#   [eva:assigns:missing] b.c:5: User Error:
+#     Recursive call to depth without assigns clause.            <- recursion or a callback cycle
+#   [eva:assigns:missing] stub.h:4: User Error:
+#     no \from part for clause 'assigns *p;'.                    <- a contract (a stub) without \from
+# Only the first is what the recursion fallback is for. The second makes Eva assume `\from \nothing`
+# ("probably incorrect"): it is a defect in the contract, fixed by writing the \from.
+_ASSIGNS_MISSING_RE = re.compile(
+    r"^\[eva:assigns:missing\] (?P<loc>\S+?:\d+): (?:User Error|Warning|Error):"
+    r"(?P<head>[^\n]*)\n?(?P<body>(?:[ \t]+[^\n]*(?:\n|$))*)",
+    re.MULTILINE,
+)
+_RECURSIVE_NO_ASSIGNS_RE = re.compile(r"Recursive call to (?P<fn>[A-Za-z_]\w*) without assigns clause")
+_NO_FROM_RE = re.compile(r"no \\from part for clause '(?P<clause>[^']*)'")
+_USING_SPEC_RE = re.compile(r"^\[eva\] using specification for function (?P<fn>[A-Za-z_]\w*)[ \t]*$", re.MULTILINE)
+_DECL_NAME_RE = re.compile(r"\b(?P<fn>[A-Za-z_]\w*)\s*\(")
+_NOT_A_DECL_NAME = frozenset({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm", "typeof"})
+RECURSION_REDUCED_CHECK = "-eva-warn-key assigns:missing=warning (recursive calls use kernel-inferred assigns)"
+
+
+def _strip_attributes(text: str) -> str:
+    """`text` without `__attribute__((...))` groups (balanced parentheses)."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        m = re.compile(r"__attribute__\s*\(").match(text, i)
+        if not m:
+            out.append(text[i])
+            i += 1
+            continue
+        depth, j = 0, m.end() - 1
+        while j < len(text):
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+            if depth == 0:
+                break
+        i = j
+    return "".join(out)
+
+
+def _declared_after_contract(path: str, line: int) -> str | None:
+    """The function declared right after the ACSL contract holding `path`:`line`, when the file is readable."""
     try:
-        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError):
+        return None
+    start = max(line - 1, 0)
+    if start < len(lines) and lines[start].lstrip().startswith("//@"):
+        # A line contract: the declaration follows its last `//@` line.
+        while start < len(lines) and lines[start].lstrip().startswith("//@"):
+            start += 1
+        after = "\n".join(lines[start:])
+    else:
+        rest = "\n".join(lines[start:])
+        end = rest.find("*/")
+        if end < 0:
+            return None
+        after = rest[end + 2 :]
+    decl = re.split(r"[;{]", after, maxsplit=1)[0]
+    decl = re.sub(r"/\*.*?\*/|//[^\n]*", " ", _strip_attributes(decl), flags=re.S)
+    for m in _DECL_NAME_RE.finditer(decl):
+        if m.group("fn") not in _NOT_A_DECL_NAME:
+            return m.group("fn")
+    return None
+
+
+def _spec_function_before(log_text: str, start: int) -> str | None:
+    """
+    The function Eva announced (`using specification for function f`) right before the message at
+    `start`, with nothing but other `[eva:assigns...]` messages in between; None otherwise (never a guess).
+    """
+    found = None
+    for m in _USING_SPEC_RE.finditer(log_text, 0, start):
+        found = m
+    if found is None:
+        return None
+    between = log_text[found.end() : start]
+    if any(ln and not ln[0].isspace() and not ln.startswith("[eva:assigns") for ln in between.splitlines()):
+        return None
+    return found.group("fn")
+
+
+def missing_assigns_messages(log_text: str) -> list[dict]:
+    """
+    Every `[eva:assigns:missing]` message of an Eva log (as an error or, downgraded, as a warning), one
+    entry per location: `kind` is `recursion` (a recursive call or callback cycle without an assigns
+    clause; `function` is the callee), `stub_from` (an assigns clause without \\from in a contract;
+    `function` is the declared function when it can be told, `clause` the clause) or `other`.
+    """
+    entries: list[dict] = []
+    seen: set[tuple] = set()
+    for m in _ASSIGNS_MISSING_RE.finditer(log_text or ""):
+        loc = m.group("loc")
+        text = " ".join((m.group("head") + "\n" + m.group("body")).split())
+        rec = _RECURSIVE_NO_ASSIGNS_RE.search(text)
+        no_from = _NO_FROM_RE.search(text)
+        if rec:
+            entry = {"kind": "recursion", "location": loc, "function": rec.group("fn"), "clause": None}
+        elif no_from:
+            path, _, line = loc.rpartition(":")
+            fn = _declared_after_contract(path, int(line)) or _spec_function_before(log_text, m.start())
+            entry = {"kind": "stub_from", "location": loc, "function": fn, "clause": no_from.group("clause")}
+        else:
+            entry = {"kind": "other", "location": loc, "function": None, "clause": None}
+        entry["message"] = text
+        key = (entry["kind"], loc, entry["function"], entry["clause"])
+        if key not in seen:
+            seen.add(key)
+            entries.append(entry)
+    return entries
+
+
+def _read_log(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     except OSError:
-        return False
-    return "[eva:assigns:missing]" in text or "without assigns clause" in text
+        return ""
+
+
+def _recursion_retry_applies(log_path: Path) -> bool:
+    """
+    Whether an aborted Eva run is the case the recursion fallback is for: every `assigns:missing`
+    message is a recursive call or callback cycle without an assigns clause. A contract without \\from
+    (or a message this does not know) is not retried: the downgrade would hide it.
+    """
+    entries = missing_assigns_messages(_read_log(log_path))
+    return bool(entries) and all(e["kind"] == "recursion" for e in entries)
+
+
+def stub_from_defect_message(entry: dict) -> str:
+    """The error line for one contract assigns clause without \\from."""
+    who = f"stub contract of {entry['function']}" if entry.get("function") else "stub contract"
+    return (
+        f"{who} at {entry['location']} lacks \\from for '{entry['clause']}': add a \\from clause "
+        "(Eva would assume \\from \\nothing, which it calls probably incorrect)"
+    )
+
+
+def reject_stub_from_defects(res: dict, out_dir: Path) -> dict:
+    """
+    Turn a run whose log shows a contract assigns clause without \\from into an `analysis_error` that
+    names the function and the clause, whatever `-eva-warn-key assigns:missing` was: the recursion
+    downgrade (automatic or --allow-incomplete-recursion-specs) must not hide it under a recursion label.
+    A timed-out run keeps its status; its error summary names the defect too.
+    """
+    log_text = _read_log(Path(res.get("log_file") or out_dir / "eva.log"))
+    entries = missing_assigns_messages(log_text)
+    defects = [e for e in entries if e["kind"] == "stub_from"]
+    if not defects:
+        return res
+    lines = [stub_from_defect_message(e) for e in defects]
+    recursive = sorted({e["function"] for e in entries if e["kind"] == "recursion"})
+    if recursive:
+        lines.append(
+            "Eva also reports recursive calls without an assigns clause ("
+            + ", ".join(recursive)
+            + "); the recursion fallback applies to them once every \\from is written"
+        )
+    res["stub_assigns_without_from"] = [{k: e[k] for k in ("function", "location", "clause")} for e in defects]
+    if res.get("status") in ("ok", "analysis_error"):
+        res["status"] = "analysis_error"
+        res["reason"] = "stub_assigns_without_from"
+    res["error_summary"] = (lines + [x for x in res.get("error_summary") or [] if x not in lines])[:20]
+    return res
 
 
 def _keep_timed_out_log(res: dict, out_dir: Path) -> None:
@@ -981,11 +1152,12 @@ def _eva_command(
         # A recursive call with no ACSL assigns clause aborts Eva with a deferred
         # "warning as error assigns:missing". Downgrading the key keeps the analysis
         # going with the kernel-inferred (incomplete) assigns; recorded as a reduced
-        # check because the recursion boundary is then interpreted unsoundly.
+        # check because the recursion boundary is then interpreted unsoundly. The same
+        # key also covers contracts without \from: reject_stub_from_defects fails those.
         # Insert inside the Eva option group (before the next -then), not after -save.
         insert_at = cmd.index("-then", cmd.index("-eva"))
         cmd[insert_at:insert_at] = ["-eva-warn-key", "assigns:missing=warning"]
-        reduced_checks.append("-eva-warn-key assigns:missing=warning (recursive calls use kernel-inferred assigns)")
+        reduced_checks.append(RECURSION_REDUCED_CHECK)
     return cmd, reduced_checks
 
 
@@ -1243,7 +1415,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Downgrade the deferred 'assigns:missing' error for recursive calls without an "
-            "ACSL assigns clause to a warning and continue (recorded in reduced_checks)."
+            "ACSL assigns clause to a warning and continue (recorded in reduced_checks). A contract "
+            "assigns clause without \\from still fails the run (reason stub_assigns_without_from)."
         ),
     )
     parser.add_argument(
