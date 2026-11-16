@@ -17,7 +17,7 @@ import benchmark
 import build_capture as bc
 import checkpoint
 import run_metadata
-from conftest import BUILD_IMAGE, PHASE0_FIXTURES, ROOT, require_docker_images
+from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, PHASE0_FIXTURES, ROOT, require_docker_images
 from framac_common import ArtifactError
 from test_sandbox_and_overlay import _engine_run_args, _fake_engine
 
@@ -871,6 +871,22 @@ def test_reproducer_units_and_entry_points_match_the_truth(build_image_run, tmp_
     assert report["snapshot"]["files"] == 0  # the reproducers use only libc
 
 
+@pytest.mark.parametrize(
+    ("deps", "expected"),
+    [
+        # c-ares run-1: glibc's <pthread.h> pulls in <bits/setjmp.h> for `__jmp_buf`; E-ACSL builds it.
+        (["/usr/include/pthread.h", "/usr/include/x86_64-linux-gnu/bits/setjmp.h"], False),
+        (["/usr/include/bits/setjmp.h", "/usr/include/x86_64-linux-gnu/bits/setjmp2.h"], False),
+        (["/usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h"], False),
+        (["/usr/include/setjmp.h", "/usr/include/x86_64-linux-gnu/bits/setjmp.h"], True),
+        (["/framac-run/workspace/snapshot/sysroot/usr/include/setjmp.h"], True),
+        ([], False),
+    ],
+)
+def test_only_the_top_level_setjmp_h_counts(deps: list[str], expected: bool) -> None:
+    assert bc.includes_setjmp_h(deps) is expected
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 def test_compiles_record_setjmp_h_and_the_functions_the_build_defines(build_image_run, tmp_path):
@@ -884,7 +900,16 @@ def test_compiles_record_setjmp_h_and_the_functions_the_build_defines(build_imag
         "int plain(int x) { return x; }\n#ifdef __SSE2__\nint filter_sse2(int x) { return x + 1; }\n#endif\n",
         encoding="utf-8",
     )
-    build = "cc -c jump.c -o jump.o && cc -c simd.c -o simd.o && ar rcs libk.a jump.o simd.o"
+    # c-ares: <pthread.h> includes glibc's <bits/setjmp.h>, not <setjmp.h>.
+    (fixture / "lock.c").write_text(
+        "#include <pthread.h>\nstatic pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;\n"
+        "int lock(void) { return pthread_mutex_lock(&m); }\n",
+        encoding="utf-8",
+    )
+    build = (
+        "cc -c jump.c -o jump.o && cc -c simd.c -o simd.o && cc -c lock.c -o lock.o"
+        " && ar rcs libk.a jump.o simd.o lock.o"
+    )
     proc = build_image_run(fixture, tmp_path / "run", f"{CAPTURE} --recipe-file '' --command '{build}'")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     report = json.loads((tmp_path / "run" / "workspace/reports/build_capture.json").read_text(encoding="utf-8"))
@@ -892,8 +917,53 @@ def test_compiles_record_setjmp_h_and_the_functions_the_build_defines(build_imag
     by_source = {c["source"]: c for c in report["compiles"]}
     assert by_source["jump.c"]["includes_setjmp_h"] is True
     assert by_source["simd.c"]["includes_setjmp_h"] is False
+    assert by_source["lock.c"]["includes_setjmp_h"] is False
     assert by_source["jump.c"]["defined_functions"] == ["jump.c#jump"]
     assert by_source["simd.c"]["defined_functions"] == ["simd.c#filter_sse2", "simd.c#plain"]
+
+
+_EACSL_PROBE_BODY = """#include <stddef.h>
+#include <stdint.h>
+static int counter;
+int bump(const uint8_t *data, size_t size) { if (size > 0) counter += data[0]; return counter; }
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { bump(data, size); return 0; }
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_eacsl_builds_pthread_h_and_rejects_setjmp_h(tmp_path):
+    """
+    The ground truth behind `includes_setjmp_h`: the pipeline's E-ACSL build of a source including
+    <pthread.h> (glibc's <bits/setjmp.h>, `__sigsetjmp`) succeeds; one including <setjmp.h> stops on MSC38-C.
+    """
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "pthread_only.c").write_text(
+        "#include <pthread.h>\n" + _EACSL_PROBE_BODY, encoding="utf-8", newline="\n"
+    )
+    (tmp_path / "setjmp_h.c").write_text("#include <setjmp.h>\n" + _EACSL_PROBE_BODY, encoding="utf-8", newline="\n")
+    build = (
+        "timeout 300 python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py build --engine eacsl --no-cache "
+        "--sources /w/{0}.c --cppflags=-I/w --out-bin /w/out/{0} --out-json /w/out/{0}.json > /w/{0}.out 2>&1; "
+    )
+    script = "cd /w; mkdir -p out; " + build.format("pthread_only") + build.format("setjmp_h") + "true"
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", f"{tmp_path}:/w",
+            "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+            "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+            "--entrypoint", "bash", ANALYSIS_IMAGE, "-c", script,
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    pthread_only = json.loads((tmp_path / "out" / "pthread_only.json").read_text(encoding="utf-8"))
+    setjmp_h = json.loads((tmp_path / "out" / "setjmp_h.json").read_text(encoding="utf-8"))
+    assert (pthread_only["status"], pthread_only["engine_used"]) == ("built", "eacsl"), pthread_only
+    assert setjmp_h["status"] == "compile_error", setjmp_h
+    log = (tmp_path / "out" / "setjmp_h.compile.log").read_text(encoding="utf-8")
+    assert "Attempt to declare setjmp as external identifier" in log and "MSC38-C" in log
 
 
 @pytest.mark.integration
