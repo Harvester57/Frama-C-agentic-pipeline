@@ -114,6 +114,19 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   and the free in `json_object_put` are not modelled.
 - `<netinet/ip_icmp.h>` follows glibc's layout and names, including the BSD ones (`struct icmp`
   with `icmp_ip` a `struct ip`, `ICMP_UNREACH`, `ICMP_TIMXCEED`, `ICMP_MASKREQ`, ...).
+- `<sys/epoll.h>` and `<sys/inotify.h>` ([`./sys/epoll.h`](./sys/epoll.h), [`./sys/inotify.h`](./sys/inotify.h))
+  are parse shims, not stubs: Frama-C's libc has neither header, so glibc's resolves through the
+  `-idirafter` host directories, and it assumes glibc's `<sys/cdefs.h>` and `<bits/types/...>` guards
+  (c-ares run-1 lost Eva and WP on its whole library: `sys/epoll.h:139: User Error: syntax error` on
+  `__attr_access`, then `__sigset_t` and a second `struct timespec`; `sys/inotify.h:34` on `__flexarr`).
+  For Eva and WP only, each defines what glibc's header needs under `#ifndef` (`__attr_access` and
+  `__flexarr` as no-op / `[]`, dropped after the header; `__sigset_t` as Frama-C's `sigset_t`, so
+  `epoll_pwait(..., &mask)` type-checks against `<signal.h>`; `_STRUCT_TIMESPEC`, so Frama-C's
+  `struct timespec` stays the only one), then `#include_next`s glibc's header. They never include
+  glibc's `<sys/cdefs.h>`, which redefines `__THROW`, `__nonnull`, ... for every later libc header.
+  E-ACSL gets glibc's header unchanged. They declare nothing: the functions stay declared in glibc's
+  header, `stub_gen.py` classifies them `host_header`, and its overlay `sys/epoll.h` (`#include_next`)
+  reaches glibc through the shim.
 - `tests/test_fc_stub_repairs.py` checks these headers in the images: Eva on valid and short
   buffers, WP, E-ACSL against the real json-c, and the ABI (prototypes, constants, layouts)
   against glibc and json-c headers. libbsd is in neither image, so `strnstr`'s prototype is not

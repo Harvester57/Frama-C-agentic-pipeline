@@ -720,3 +720,117 @@ def test_compat_eacsl_string_predicates_have_one_conjunct_after_the_guard():
     for body in bodies:
         conjuncts = _top_level_conjuncts(body)
         assert len(conjuncts) == 2 and re.fullmatch(r"__fc_\w+\([^;]*\)", conjuncts[1], re.S), body
+
+
+# ---------------------------------------------------------------------------------------------------
+# <sys/epoll.h> and <sys/inotify.h>: glibc's headers, parsed by Frama-C (c-ares run-1, 2026-11-16)
+# ---------------------------------------------------------------------------------------------------
+
+LINUX_EVENT_SHIMS = {
+    "sys/epoll.h": ("__attr_access", "____sigset_t_defined", "_STRUCT_TIMESPEC"),
+    "sys/inotify.h": ("__flexarr",),
+}
+_EVA_WP_ONLY = "#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rel", sorted(LINUX_EVENT_SHIMS))
+def test_linux_event_shims_only_reconcile_glibc_for_eva_and_wp(rel):
+    text = _read(rel)
+    # Declarations stay in glibc's header, so stub_gen classifies the functions as host_header, not pipeline_stub.
+    assert stub_prototypes(rel) == []
+    assert f"#include_next <{rel}>" in text
+    # Never glibc's <sys/cdefs.h>: it would redefine __THROW, __nonnull, ... for every later libc header.
+    assert not re.search(r"#\s*include\s*<sys/cdefs\.h>", text)
+    fixes = text.split(_EVA_WP_ONLY, 1)[1].split("#endif /* Eva / WP */", 1)[0]
+    rest = text.replace(fixes, "")
+    for name in LINUX_EVENT_SHIMS[rel]:
+        # A run's hand-written overlay wrapper may have defined it already: every definition is guarded.
+        assert re.search(rf"#\s*ifndef {name}\b", fixes), name
+        assert not re.search(rf"#\s*(?:define|ifndef) {name}\b", rest), f"{name} outside the Eva / WP branch"
+    assert text.index(_EVA_WP_ONLY) < text.index(f"#include_next <{rel}>")
+
+
+EPOLL_USE = r"""#include <sys/epoll.h>
+#include <signal.h>
+#include <time.h>
+int use_epoll(void) {
+  struct epoll_event ev[4];
+  sigset_t mask;
+  struct timespec ts = {0, 0};
+  int fd = epoll_create1(EPOLL_CLOEXEC);
+  if (fd < 0) return -1;
+  ev[0].events = EPOLLIN;
+  ev[0].data.u64 = 1;
+  (void)epoll_ctl(fd, EPOLL_CTL_ADD, 0, ev);
+  sigemptyset(&mask);
+  return epoll_wait(fd, ev, 4, 0) + epoll_pwait(fd, ev, 4, 0, &mask) + epoll_pwait2(fd, ev, 4, &ts, &mask);
+}
+"""
+
+# Frama-C's <signal.h> and <time.h> before glibc's <sys/epoll.h>.
+EPOLL_LATE = "#include <signal.h>\n#include <time.h>\n" + EPOLL_USE
+
+INOTIFY_USE = r"""#include <sys/inotify.h>
+int use_inotify(void) {
+  char buf[sizeof(struct inotify_event) + 16];
+  struct inotify_event *e = (struct inotify_event *)buf;
+  int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+  if (fd < 0) return -1;
+  e->len = 0;
+  return inotify_add_watch(fd, "/etc", IN_MODIFY) + inotify_rm_watch(fd, 1) + (int)sizeof(e->name[0]);
+}
+"""
+
+# A filled stub_gen overlay header in front of the shim: overlay -> fc_stubs shim -> glibc.
+EPOLL_OVERLAY_BLOCK = """
+/* fc-stub: epoll_create1 */
+/*@ assigns \\result \\from __flags; */
+extern int epoll_create1(int __flags);
+"""
+LINUX_EVENT_CASES = (
+    # (case, source, flags variable, extra Frama-C options)
+    ("epoll", "epoll.c", "$A", ""),
+    ("epoll_late", "epoll_late.c", "$A", ""),
+    ("inotify", "inotify.c", "$A", ""),
+    ("overlay", "epoll.c", "$O", "-print"),
+    ("eacsl_epoll", "epoll.c", "$F", "-no-frama-c-stdlib"),
+    ("eacsl_inotify", "inotify.c", "$F", "-no-frama-c-stdlib"),
+)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_frama_c_parses_glibc_epoll_and_inotify_with_the_pipeline_flags(tmp_path):
+    import stub_gen
+
+    require_docker_images(ANALYSIS_IMAGE)
+    for name, text in (("epoll.c", EPOLL_USE), ("epoll_late.c", EPOLL_LATE), ("inotify.c", INOTIFY_USE)):
+        (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
+    overlay = tmp_path / "ov" / "sys"
+    overlay.mkdir(parents=True)
+    (overlay / "epoll.h").write_text(
+        stub_gen.header_preamble("sys/epoll.h", "/usr/include/x86_64-linux-gnu/sys/epoll.h") + EPOLL_OVERLAY_BLOCK,
+        encoding="utf-8",
+        newline="\n",
+    )
+    # c-ares's own defines (phase0 log of run-1): glibc declares epoll_pwait2 under __USE_GNU.
+    defines = "-D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700"
+    script = (
+        'O=$(FRAMAC_STUB_OVERLAY_DIR=/w/ov python3 -c "$py import framac_common; '
+        'print(framac_common.augment_framac_cppflags(\\"-I.\\"))"); '
+    )
+    for case, src, flags, extra in LINUX_EVENT_CASES:
+        script += (
+            f'echo "@@MAIN {case}"; timeout 300 frama-c -no-unicode -machdep gcc_x86_64 {src} '
+            f'-cpp-extra-args="{flags} {defines}" {extra} 2>&1 && echo PARSE_OK; '
+        )
+    log = _docker(ANALYSIS_IMAGE, tmp_path, script, timeout=1200)
+    per = _per_main(log)
+    for case, *_ in LINUX_EVENT_CASES:
+        assert "PARSE_OK" in per[case], per[case]
+        assert "User Error" not in per[case] and "incompatible" not in per[case].lower(), per[case]
+    for case in ("epoll", "epoll_late", "inotify", "overlay"):
+        assert "Warning" not in per[case], per[case]
+    # The overlay's contract reached Frama-C: overlay -> shim -> glibc.
+    assert re.search(r"assigns \\result\s*\\from __flags;", per["overlay"]), per["overlay"]
