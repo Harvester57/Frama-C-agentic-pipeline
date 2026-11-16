@@ -573,6 +573,80 @@ def parse_eacsl_failure(text: str) -> dict | None:
     return res
 
 
+# LeakSanitizer, at exit of a run that leaked:
+#   ==1==ERROR: LeakSanitizer: detected memory leaks
+#   Direct leak of 16 byte(s) in 1 object(s) allocated from:
+#       #0 0x... in malloc ...
+#       #1 0x... in make_buf src/demo.c:5:14
+_LSAN_ERR_RE = re.compile(r"ERROR:\s*LeakSanitizer:\s*detected memory leaks")
+_LSAN_BLOCK_RE = re.compile(
+    r"^(?P<kind>Direct|Indirect) leak of \d+ byte\(s\) in \d+ object\(s\) allocated from:", re.M
+)
+
+# The allocators a leak's stack starts in: the defect is the caller that kept the object.
+_LSAN_ALLOCATORS = frozenset(
+    (
+        "malloc",
+        "calloc",
+        "realloc",
+        "reallocarray",
+        "strdup",
+        "strndup",
+        "aligned_alloc",
+        "posix_memalign",
+        "memalign",
+        "valloc",
+    )
+)
+
+
+def _parse_leak_failure(text: str) -> dict | None:
+    """
+    The first LeakSanitizer block of a report: the first `Direct leak`, else the first `Indirect leak`.
+    Its location is the first frame of its allocation stack that is no runtime, harness or allocator
+    frame. A leak links no obligation class (`alarm_kind` memory_leak, CWE-401 in the verifier brief).
+    """
+    blocks = list(_LSAN_BLOCK_RE.finditer(text))
+    if not blocks or not _LSAN_ERR_RE.search(text):
+        return None
+    block = next((b for b in blocks if b.group("kind") == "Direct"), blocks[0])
+    stack_lines: list[str] = []
+    for line in text[block.end() :].split("\n")[1:]:  # [0] is the rest of the header line
+        if not line.strip():
+            break
+        stack_lines.append(line)
+    frame = None
+    for m in _STACK_FRAME_RE.finditer("\n".join(stack_lines)):
+        fn, fpath = m.group("function"), m.group("file") or ""
+        base = re.sub(r"^__interceptor_", "", fn)
+        if (
+            is_runtime_function(fn, fpath)
+            or Path(fpath).name.startswith("harness_")
+            or is_harness_fuzz_function(fn)
+            or base in _LSAN_ALLOCATORS
+        ):
+            continue
+        frame = m
+        break
+    file_ = (frame.group("file") or "unknown") if frame else "unknown"
+    line_ = int(frame.group("line") or 0) if frame else 0
+    fn = frame.group("function") if frame else "unknown_function"
+    which = block.group("kind").lower()
+    pred = f"memory_leak: LeakSanitizer: {which} leak allocated in {fn}"
+    line_hash = line_text_hash(file_, line_)
+    if line_hash is not None:
+        pred += f" [line {line_hash}]"
+    return {
+        "file": file_,
+        "line": line_,
+        "function": fn,
+        "kind": f"lsan_{which}_leak",
+        "alarm_kind": "memory_leak",
+        "is_rte": False,
+        "predicate": pred,
+    }
+
+
 def parse_sanitizer_failure(text: str) -> dict | None:
     """Extract the first UBSan or ASan runtime failure from LibFuzzer/sanitizer output."""
     if not text:
@@ -653,7 +727,7 @@ def parse_sanitizer_failure(text: str) -> dict | None:
             "predicate": f"rte: {alarm}: {pred}",
         }
 
-    return None
+    return _parse_leak_failure(text)
 
 
 def parse_runtime_failure(text: str) -> dict | None:
