@@ -696,21 +696,26 @@ def test_lease_of_a_dead_holder_is_kept_while_its_container_runs(tmp_path):
 class _OrphanWorld:
     """A broker over `tmp_path` with a fake clock, a fake engine view and a recording kill."""
 
-    def __init__(self, tmp_path: Path, grace: float = 60.0, retry: float = 30.0) -> None:
+    def __init__(self, tmp_path: Path, grace: float = 60.0, retry: float = 30.0, recheck: float = 0.0) -> None:
         self.dir = tmp_path
         self.now = 1000.0
         self.state: dict[str, bool | None] = {}
         self.kills: list[str] = []
+        self.probes = 0
         self.broker = R.Broker(
             tmp_path,
             lambda: R.Budget(4, 8000, "t"),
-            container_alive=lambda e: self.state.get(e["id"], False),
+            container_alive=self._alive,
             container_kill=self._kill,
-            orphan_recheck_s=0.0,
+            orphan_recheck_s=recheck,
             orphan_grace_s=grace,
             orphan_retry_s=retry,
             clock=lambda: self.now,
         )
+
+    def _alive(self, entry: dict) -> bool | None:
+        self.probes += 1
+        return self.state.get(entry["id"], False)
 
     def _kill(self, entry: dict) -> bool:
         self.kills.append(str(entry["container"]))
@@ -771,6 +776,23 @@ def test_orphan_reaper_never_kills_when_liveness_is_unknown(tmp_path):
     w.state["cccccccccccc"] = True  # the engine answers again: now it may be reaped
     w.now += 1.0
     assert w.ids() == ["cccccccccccc"] and w.kills == ["framac-cccccccccccc"]
+
+
+def test_orphan_reaper_asks_the_engine_at_most_once_per_recheck_interval(tmp_path):
+    # acquire polls entries() every 0.1-0.5 s per waiting client: an engine that cannot answer must not be
+    # asked on every pass, under the broker lock.
+    w = _OrphanWorld(tmp_path, grace=0.0, recheck=5.0)
+    w.lease("ffffffffffff")
+    w.state["ffffffffffff"] = None
+    for _ in range(10):
+        w.now += 0.4
+        assert w.ids() == ["ffffffffffff"]
+    assert w.probes == 1 and w.kills == []
+    w.state["ffffffffffff"] = True
+    w.now += 0.4
+    assert w.ids() == ["ffffffffffff"] and w.kills == []  # the cached answer is not acted on
+    w.now += 5.0
+    assert w.ids() == ["ffffffffffff"] and w.kills == ["framac-ffffffffffff"] and w.probes == 2
 
 
 def test_orphan_reaper_kills_only_containers_named_after_their_lease(tmp_path):

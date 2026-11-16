@@ -102,7 +102,7 @@ The wrappers ([`../../wrappers/framac-docker.sh`](../../wrappers/framac-docker.s
    - When a gated lease releases and no tickets are waiting, the broker can grow running elastic container leases via `<engine> update` (`resources.py rebalance`); leases are never shrunk while running.
    - Ctrl-C and SIGTERM are forwarded as `docker kill`.
    - If the holder process dies, its lease is kept while the labelled container is still running, so the pool stays correctly counted. Such a container is an orphan: nobody reads its output or waits for its exit code. This happens on Windows when an agent's shell timeout kills the wrapper's process tree (TerminateProcess runs no signal handler, so the container is never killed).
-   - Orphans are reaped. A reaping pass kills an orphan's container with `<engine> kill framac-<lease>` once it has been orphaned for `FRAMAC_ORPHAN_GRACE_S` seconds (default 60; `off` disables this), and retries every 30 s while it still runs. A reaping pass is any `exec` lease request, the rebalance after a gated lease's release, `resources.py rebalance` or `resources.py gc`; `status` only looks. With no broker client running, an orphan waits for the next one (or a `gc`). The lease is dropped once `<engine> ps` no longer lists the container.
+   - Orphans are reaped. A reaping pass kills an orphan's container with `<engine> kill framac-<lease>` once `FRAMAC_ORPHAN_GRACE_S` seconds (default 60; `off` disables this) have passed since the first reaping pass that saw it orphaned, and retries every 30 s while it still runs. The grace counts from that first sighting, not from the holder's death, so a single `gc` with the default grace only starts the clock. A reaping pass is any `exec` lease request, the rebalance after a gated lease's release, `resources.py rebalance` or `resources.py gc`; `status` only looks. With no broker client running, an orphan waits for the next one (or a `gc`). The lease is dropped once `<engine> ps` no longer lists the container.
    - A reaping pass only kills containers named after their own lease (`framac-<id>`, labelled `framac.lease=<id>`), and only when `<engine> ps` says it is running. When the engine cannot tell, the lease is kept and nothing is killed.
 
 While a request waits, the broker prints its queue position. Long phases are meant to run in the background, so a 10-minute foreground tool limit is never the bottleneck.
@@ -110,7 +110,7 @@ While a request waits, the broker prints its queue position. Long phases are mea
 ```text
 python3 scripts/resources.py status     # leases held and waiting requests
 python3 scripts/resources.py rebalance  # grow running elastic container leases when free pool allows
-python3 scripts/resources.py gc         # reclaim dead holders' leases; kill their orphaned containers after the grace
+python3 scripts/resources.py gc         # reclaim dead holders' leases; kill orphaned containers seen past the grace
 ```
 
 **Pinning.**

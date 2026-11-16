@@ -2353,6 +2353,7 @@ class Broker:
         self.orphan_retry_s = orphan_retry_s
         self.clock = clock
         self.log = log
+        self._fresh_alive: dict[str, bool | None] = {}  # container_alive answers of the current entries() pass
 
     @contextlib.contextmanager
     def locked(self) -> Iterator[None]:
@@ -2381,6 +2382,7 @@ class Broker:
         if "orphan_running" in entry and now - float(entry.get("orphan_checked_at") or 0) < self.orphan_recheck_s:
             return bool(entry["orphan_running"])
         running = self.container_alive(entry) if self.container_alive else False
+        self._fresh_alive[str(entry.get("id"))] = running  # what _reap_orphan may act on, this pass only
         keep = True if running is None else bool(running)  # cannot tell: keep it, re-check later
         entry["orphan_checked_at"], entry["orphan_running"] = now, keep
         with contextlib.suppress(OSError):
@@ -2406,7 +2408,9 @@ class Broker:
         last = entry.get("orphan_kill_at")
         if last is not None and now - float(last) < self.orphan_retry_s:
             return
-        if self.container_alive(entry) is not True:  # fresh and definite, never the cached or unknown answer
+        # Act only on an answer `<engine> ps` gave in this pass (at most one per orphan_recheck_s), and only on a
+        # definite True: never on a cached or unknown one.
+        if self._fresh_alive.get(lid) is not True:
             return
         entry["orphan_kill_at"] = now
         entry["orphan_kills"] = int(entry.get("orphan_kills") or 0) + 1
@@ -2429,6 +2433,7 @@ class Broker:
     def entries(self, reap: bool = True) -> list[dict]:
         """Live tickets and leases (call under `locked()`); dead holders' entries are reclaimed when `reap`."""
         out: list[dict] = []
+        self._fresh_alive = {}
         for path in sorted(self.leases.glob("*.json")):
             lease_id = path.stem
             if not _LEASE_ID_RE.fullmatch(lease_id):
@@ -3646,6 +3651,7 @@ def _status(scope: str, broker_dir: str | None, gc: bool, engine: str | None = N
         # Only `gc` reaps (status reads with reap=False); only leases that recorded their engine.
         container_kill=_orphan_killer(None) if scope == "host" and gc else None,
         orphan_grace_s=orphan_grace_s() or 0.0,
+        orphan_recheck_s=0.0,  # a one-shot command: ask the engine once per orphan, whatever an earlier pass cached
         log=sys.stderr,
     )
     if gc:
