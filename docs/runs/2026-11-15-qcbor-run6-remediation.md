@@ -7,6 +7,7 @@ Fixes for the pipeline problems that the [`run-6` supervision report](./2026-11-
 - Landed locally on `phase1-remediation` as merge commit `0b2e048` (`integ/run6-remediation`, tip `62c12cb`). Nothing is pushed.
 - The run agent's uncommitted hot patches in the main checkout (12 files) were replaced by these fixes. They are kept on the branch `backup/run6-hotpatches`.
 - The troubleshooting updates and this report are committed as `f9c5d12`, with the six troubleshooting files taken whole. Those files link to upstream drafts under `docs/upstream/frama-c/` that are still uncommitted in the main checkout.
+- On 2026-11-16 the two minmea run-1 fixes were merged on top: `fix/variadic-va-params-detection` (`4d214f5`) and `fix/reach-gate-direct-call` (`fd139c4`). `feat/variadic-api-cases` is not merged.
 - Work was done by nine agents in separate worktrees (six fixers, then skills, harness and guides), each reviewed and merged with `--no-ff`. The fixer worktrees and branches are deleted. The agents' commits carry a `Claude Opus 5.5` trailer; the merges and follow-ups a `Claude Fable 5.2` one.
 
 ## What was fixed
@@ -54,5 +55,6 @@ Fixes for the pipeline problems that the [`run-6` supervision report](./2026-11-
 
 1. Remove the merged `requires \aligned` contract of `UsefulOutBuf_Reset` and restore its dropped `keep_UB_ptr` postcondition. Until then every merge into that header is refused.
 2. Decide whether to regenerate the harness. Regenerating gives the identity selector and the callback stubs, but an input whose first byte is at or above the case count (182) then selects no case. That holds for corpus inputs and for recorded crash files: 5 of run-6's 42 reproducible crash files (first bytes 239, 239, 250, 250, 255) would stop reproducing, and the findings that rest on them would need new reproducers. Keeping the current harness keeps the modulo selector, which is still decoded, and every recorded reproducer; it gives up the stable selector and the stubs for this run. There is no remapping tool. Either way, run `reach-gate`, then `module-libqcbor_a` (fuzz, Eva, facts): the Eva shards are from the 181-case harness. After a regeneration, harvest seeds again first.
+   Since the merge of `fix/reach-gate-direct-call` on 2026-11-16 (`fd139c4`) the static reach gate fails on run-6 with one gap, with or without a regeneration: `QCBORDecode_Private_MapSearch` is in `api_skipped` (`pointer to an anonymous struct`) and was counted as reached only through the `*InMap*` accessors (measured on a scratch copy of the run's reports and harness: 170 of 171 entry points, 1 gap). Give it a hand-written `--api --dispatch-case`, or exempt it with `harness_reach.py exempt`.
 3. Run `wp_scheduler.py refresh --module libqcbor_a`; it now refuses until step 2 is done.
 4. Merge the two `merge_queued` proofs (`QCBORDecode_Private_MapTagNumber`, `QCBOR_Private_DecodeTagNumber`) through the scheduler.
