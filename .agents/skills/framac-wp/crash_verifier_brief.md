@@ -55,8 +55,11 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
    - The test is the decision point (step 4): if it is a `harness_choice` that no legitimate caller could make, the candidate is harness-induced.
    - **If harness-induced:** return `decision: "rejected"` with `rejection_class: "harness_induced"` and explain the exact change needed in `harness_{module_name}.c` in `record.reason` so the parent orchestrator can repair the harness and re-fuzz.
 3. **Check That the Tool Is Right:**
-   - Read the failing statement and the values the replay prints. If the property holds there for this input (the pointer is inside a live object that large, the bytes were written, the argument has a type the format accepts), the failure comes from the checking tool, not from the target.
-   - Then reject it as `toolchain_artifact`, with the evidence "Toolchain Artifacts" below requires. Do not reject it as `harness_induced`: the harness is correct, a repair changes nothing, and the same failure comes back.
+   - Read the failing statement and the values the replay prints. The property may hold there for this input although the tool reports it failed: the pointer is inside a live object that large, or the argument has a type the format accepts.
+   - What makes it hold decides the class:
+     - A line of the target: a check, or a call into code E-ACSL does not instrument that wrote the bytes (step 2). Reject it as `disproved_by_source` and cite that line.
+     - A behaviour of the compiler, the linker or the checking tool itself (how it lays out objects, converts arguments, registers or initializes memory). Reject it as `toolchain_artifact`, with the evidence "Toolchain Artifacts" below requires.
+   - Do not reject a tool's false alarm as `harness_induced`: the harness is correct, a repair changes nothing, and the same failure comes back.
 4. **Trace Root Cause in Target Code:**
    - If the harness call is legitimate (`contract_respected: true`) and the fault is in target C code:
      - Construct `record.trace` starting with an `entrypoint` step, zero or more `propagation` steps, and ending with a `sink` step at the failing line.
@@ -135,8 +138,8 @@ Choose `record.rejection_class` by what would have to change for the failure to 
 - `"disproved_by_source"`: nothing. A check in the target excludes the failure (a bounds check, a sanitization, an external call that initialized the bytes).
 - `"dead_code"`: nothing. The sink cannot execute.
 - `"contract_overconstraint"`: an ACSL contract, not the code. The failing clause demands more than the function's callers need or its documentation states.
-- `"toolchain_artifact"`: the checking tool. The target and the harness are both correct, and the tool itself produces the failure: E-ACSL's instrumentation or runtime, a sanitizer runtime, or the compiler or linker under the instrumented build. See "Toolchain Artifacts" below.
-- `"duplicate"`: nothing new. Another verified record already covers the same defect under a different fingerprint. Name that fingerprint in `record.reason`. A duplicate does not count as an opposite verdict at its sink. When the fingerprint is merely wrong, refingerprint instead (see "Refingerprinting, Merging, and Splitting").
+- `"toolchain_artifact"`: the checking tool. The target and the harness are both correct, and the tool itself produces the failure: E-ACSL's instrumentation or runtime, a sanitizer runtime, or the compiler or linker under the instrumented build. What makes the property hold is a behaviour of the toolchain, not a line of the target (that would be `disproved_by_source`). See "Toolchain Artifacts" below.
+- `"duplicate"`: nothing new. Another verified record already covers the same root cause at a different sink. Name its fingerprint in `record.reason`. A duplicate does not count as an opposite verdict at its sink. Records at the same sink are merged by the parent without this class, and a wrong fingerprint is fixed by refingerprinting (see "Refingerprinting, Merging, and Splitting").
 - `"other"`: none of the above fits. This is the last resort: say in `record.reason` why no other class applies.
 
 Only `harness_induced` makes the parent change anything (a harness repair, up to 2 per module). Every other class leaves the target and the harness as they are.
@@ -162,7 +165,7 @@ A failure that reproduces is not yet a defect of the target. E-ACSL's instrument
 
 Rebuilding without the check (`--no-libc-checks`, `--no-rte-initialized`) only removes the checker, so it is not evidence.
 
-With such an output cited in `record.evidence`, state `refutation_basis: "checked"`. Without one, the basis is at most `located`, and a later reproducer at the same sink reopens the rejection. A `checked` rejection holds against every later reproducer of this fingerprint, so it must hold for the predicate, not only for your input. For `\valid_read(charset + j)`, for example, show that every `j` the loop reaches lies inside the string.
+With such an output cited in `record.evidence`, state `refutation_basis: "checked"`. Without one, the basis is at most `located`, and a later reproducer at the same sink reopens the rejection. A `checked` rejection holds against every later tool reproducer of this fingerprint (only a `confirmed` sibling verdict reopens it), so it must hold for the predicate, not only for your input. For `\valid_read(charset + j)`, for example, show that every `j` the loop reaches lies inside the string.
 
 In `record.reason`, name the tool, the alarm kind, the toolchain fact and the path of the standalone program if you wrote one. The parent records the defect for the pipeline maintainers and for an upstream report. Nothing in the target or the harness changes.
 
