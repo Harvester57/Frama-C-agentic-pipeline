@@ -31,7 +31,8 @@ Line numbers drift: search for the named function.
 | D7 | F3: dispatch harnesses above 64 cases (skip mask) and above 256 (selector). | (a) Change the generated code of every dispatch harness; (b) change it only for harnesses that need it. | **(b)** (planning). The wider skip mask applies above 64 cases and the two-byte selector above 256. Smaller harnesses keep their code, their seeds and their `harness_digest`. |
 | D8 | F15: `build-%` reads the selftest result without depending on `selftest`. | (a) Depend on `selftest`; (b) stop reading the selftest result in `build`. | **(b)** (planning), following the deliberate Make comment. `build` compiles what `--engine` asks for (both engines for `auto`), and the campaign applies the selftest. The campaign then reuses the cached builds instead of rebuilding. |
 | D9 | F12: `run_sandboxed(writable=...)` is not enforced. | (a) Rename the parameter now, and leave the mount namespace to the backlog; (b) both now. | **(a)** (planning). The namespace needs a check of the hardened container profile first (see Backlog). |
-| D10 | When `phase1-remediation` merges to `main`. | (a) Step by step; (b) after the steps and one validation run. | **(b)** (planning, as Phase 0's D1′). One validation (V) covers all the steps, and `main` stays as it is until V passes. |
+| D10 | When `phase1-remediation` merges to `main`. | (a) Step by step; (b) after the steps and one validation run. | **(b)** (planning, as Phase 0's D1′). One validation (V) covers the steps before the merge, and `main` stays as it is until V passes. Which steps come before the merge: see D11. |
+| D11 | Which steps must land before the merge (re-scope, 2026-11-17). | (a) All steps, as first planned; (b) only the steps that change results, with the rest on `main` after the merge. | **(b)** (user). Before the merge: S1–S7, S12's F14 and F16, then V. S0 is dropped: V checks what it was to confirm. After the merge, on `main`: S8 (decided from V), S10 and S12's F13, and S11 and S13, which change no result. |
 
 ## Rules for every step
 
@@ -39,7 +40,7 @@ The same rules as the Phase 0 plans:
 - **Ownership:** each step owns the files it lists, and parallel steps own disjoint files.
 - **Checks:** `ruff`, `ruff format --check`, `mypy scripts tests` and the full pytest suite pass after each step.
 - **Docs and skills** change in the same step as the behavior. `skills/` is mirrored into `.claude/skills/`, and this Windows checkout holds those mirrors as plain directories: never commit their "deletion".
-- **Pipeline runs:** no step needs one to land, except S0, S10 and V, which the user starts. Unit tests on recorded fixtures cover each item.
+- **Pipeline runs:** no step needs one to land, except S10 and V, which the user starts (S0 was dropped, D11). Unit tests on recorded fixtures cover each item.
 - **Fingerprint changes:** a step that changes how a fingerprint is computed recomputes the known-bug fingerprints in `benchmark/manifest.json` and `docs/bugs-found/`, as `684052f` did, and says so in its commit message. Recall matches by file, function, kind and line, so it is unaffected. A compare against an older baseline shows the changed candidates once, as gone and as new.
 - **Moves before changes:** a step that moves code (D3) lands the move as its own commit with no behavior change, then the fixes.
 
@@ -47,6 +48,7 @@ The same rules as the Phase 0 plans:
 
 ### S0. Confirming run on libmnl (user-triggered)
 
+- **Dropped (D11, 2026-11-17).** Its checks moved into V, which runs after the fixes and shows the same things. Kept below for the record.
 - **Goal:** reproduce the defects found by reading the code, before fixing them.
 - **Run:** libmnl with the blind protocol of the earlier runs, on `edcbf50`, twice: with `--workers 1` and with the machine's default worker count.
 - **Check:**
@@ -105,6 +107,7 @@ The same rules as the Phase 0 plans:
   - each fixture parses to the expected file, function, kind and predicate;
   - a leak gives a `leak` candidate with no linked unit.
 - **Acceptance:** replaying any fixture twice gives the same fingerprint; `minimize_interest` accepts a reduction that keeps the same defect.
+- **Already on the branch (checked 2026-11-17):** `_ASAN_ERR_RE` in `scripts/run_eacsl_fuzz.py` captures `attempting double-free`, `attempting free on address which was not malloc()-ed` and `requested allocation size` whole. Their mapping to `freeable` and everything else in this step are still to do.
 
 ### S3. Sandbox seam and build module (D3 step 2, items 1–2; F15/D8) (M, after S1)
 
@@ -224,6 +227,7 @@ The same rules as the Phase 0 plans:
   - a 300-case harness reaches case 280, and its seeds carry two selector bytes;
   - with a recorded runner, the same campaign with 1 and with 8 workers runs the same rounds;
   - every exit path records `stopped`.
+- **Already on the branch (checked 2026-11-17):** F3's Phase 1 half landed in `18bc5e9`. `generate_harness.py` emits `-DFRAMAC_FUZZ_SKIP_CASES_<k>` words for cases `64k..64k+63`, so every case of a large harness can be skipped. Still to do: the two-byte selector above 256 cases (D7), the `case_beyond_mask` fallback, and F6 (rounds by CPU-seconds; `MIN_ROUND_WALL_S` still bounds rounds by wall time).
 
 ### S7. Ledger evidence (F7, F9) (S, after S4 and S5)
 
@@ -241,12 +245,13 @@ The same rules as the Phase 0 plans:
   - a module with an internal function no input reaches;
   - an ASan crash together with an E-ACSL `fuzzer_error` keeps both.
 
-### S8. UBSan check set (F10) (S, after S0)
+### S8. UBSan check set (F10) (S, after V, on `main`)
 
+- **When (D11):** after the merge. V records whether UBSan's `alignment` and `pointer-overflow` checks fire and on which inputs; this step acts on that.
 - **Goal:** UBSan checks what the pipeline means to check while fuzzing, no more.
 - **Work:**
-  - **If S0 shows `alignment` firing:** add `-fno-sanitize=alignment` to `compile_sanitizer_binary` (now in `fuzz_build.py`), since misaligned access is normal in packet parsers.
-  - **`pointer-overflow`:** keep it unless S0 shows it stopping campaigns, since it is UB that RTE also reports.
+  - **If V shows `alignment` firing:** add `-fno-sanitize=alignment` to `compile_sanitizer_binary` (now in `fuzz_build.py`), since misaligned access is normal in packet parsers.
+  - **`pointer-overflow`:** keep it unless V shows it stopping campaigns, since it is UB that RTE also reports.
   - **Skill:** document the sanitizer check set next to the RTE one in `skills/framac-fuzz/SKILL.md`.
 - **Owns:** `scripts/fuzz_build.py` (sanitizer flags), `skills/framac-fuzz/SKILL.md`.
 - **Tests:** the compile command carries the flag set; a fixture with a misaligned read is not a candidate.
@@ -290,7 +295,9 @@ The same rules as the Phase 0 plans:
     - The unit tests check the generated wrappers.
     - There is no list parser to test, since nothing parses `share/libc`.
 
-### S10. Engine split decision (D4) (user-triggered, after S9)
+### S10. Engine split decision (D4) (user-triggered, after S9 and the merge)
+
+- **When (D11):** after the merge, on `main`.
 
 - **Goal:** decide E-ACSL's share of each campaign on evidence.
 - **Work:**
@@ -308,12 +315,13 @@ The same rules as the Phase 0 plans:
   - **Meanwhile:** `run_eacsl_fuzz.py guardrail` keeps dispatching until every caller has moved.
 - **Owns:** `scripts/run_guardrail.py` (new), the guardrail section of `scripts/run_eacsl_fuzz.py`, `scripts/prover_candidates.py`, `scripts/workspace_overlay.py` (the guardrail call), `skills/framac-wp/`.
 - **Tests:** the guardrail tests (`test_guardrail_p1.py`, `test_diagnostic_hints.py`, `test_verdict_limits.py`) against the new module; the old subcommand still works.
-- **When:** any time after S3, ideally when Phase 3 next changes the guardrail.
+- **When:** after the merge (D11), on `main`, ideally when Phase 3 next changes the guardrail. It moves code and changes no result.
 
 ### S12. Docs (F13, F14, F16) (S)
 
 - **F14** (any time): `skills/framac-verify/SKILL.md:110` says the build check makes sure the E-ACSL half of each campaign can run.
 - **F16** (any time): redraw the Phase 1 diagram in `docs/guides/architecture.md` from the Make targets: `selftest`, `build`, `seeds`, `fuzz`, `coverage`, `reach-dynamic`, `ingest`, `replay`, `minimize`. Candidates, not "True Bug".
+- **Before the merge (D11):** F14 and F16. F13 comes after the merge, with S10.
 - **F13** (after S10): rewrite "Why This Runs Before Eva and WP" for both engines, what each catches and how the time is split; update the skill's `description`.
 - **Owns:** `skills/framac-verify/SKILL.md`, `docs/guides/architecture.md`, `skills/framac-fuzz/SKILL.md` (rationale and description).
 
@@ -323,6 +331,7 @@ The same rules as the Phase 0 plans:
   - rename `run_sandboxed(writable=...)` to `work_dirs` in `sandbox_exec.py` and every caller;
   - the docstring says it sets cwd and HOME only.
 - **Owns:** `scripts/sandbox_exec.py` and the call sites. After S3, so the seam is in place; S11 takes the new name if it lands later.
+- **When (D11):** after the merge, on `main`. A rename changes no result.
 
 ### S14. The target's own fuzz targets and corpora (M, before S3, S6 and S11)
 
@@ -339,9 +348,14 @@ The same rules as the Phase 0 plans:
 
 - **Runs:**
   - libmnl, minmea and oscs-tweetnacl, with the blind protocol;
+  - libmnl a second time with `--workers 1` (S0's check of F6, D11);
   - the seeded benchmark;
   - `FRAMAC_DOCKER_TESTS=1 python -m pytest`.
 - **Check:**
+  - **From S0 (D11):**
+    - F2: a dispatch case that crashes on every input counts as executed, and its module is not `unmeasured`;
+    - F6: `keep_going` runs the same rounds with `--workers 1` and with the default count;
+    - F10: whether UBSan's `alignment` or `pointer-overflow` checks fire, and on which inputs. Record it for S8.
   - LIBMNL-01, -03, -04 and -05 found, with LIBMNL-04 as one finding;
   - no getsockname false alarm;
   - no ASan candidate merging two bugs;
@@ -353,24 +367,29 @@ The same rules as the Phase 0 plans:
 
 ## Order and parallelism
 
+Before the merge (D11):
+
 ```text
-S0 (user) ─────────────────────────────────────▶ S8
 S1 ─┬─▶ S2 ─────────┐
-    └─▶ S3 ─┬───────┴─▶ S4 ─▶ S5 ─▶ S7
-            ├─▶ S6
-            ├─▶ S9 ─▶ S10 (user) ─▶ S12 (F13)
-            ├─▶ S11
-            └─▶ S13
-S12 (F14, F16): any time
-S14 ─▶ S3, S6, S11 (it lands first)
-                                         all ─▶ V (user)
+    └─▶ S3 ─┬───────┴─▶ S4 ─▶ S5 ─▶ S7 ─┐
+            └─▶ S6 ─────────────────────┤
+S12 (F14, F16): any time ───────────────┴─▶ V (user) ─▶ merge to main
+(S9 and S14 are done.)
+```
+
+After the merge, on `main`:
+
+```text
+V ─▶ S8
+S10 (user) ─▶ S12 (F13)
+S11, S13: any time, S13 before S11 if both land
 ```
 
 - **S1 comes first:** it creates the module that S2 and S4 extend.
 - **S2 and S3 can run in parallel.** S2 owns `failure_identity.py`, the fixtures and the leak branch of ingest. S3 owns the build code and the test patches.
 - **S4 needs both:** the stable fingerprints from S2, and the cached builds and seam from S3.
 - **S5 after S4.** Both change `scripts/ledger.py`, and one writer at a time keeps their ownership disjoint. S5 needs S3's seam for its coverage move.
-- **S6, S9, S11 and S13 own disjoint files after S3** and can run in parallel with S4 and S5. S6 and S4 both touch `run_eacsl_fuzz.py`, but different sections (rounds vs replay).
+- **S6 owns disjoint files after S3** and can run in parallel with S4 and S5. S6 and S4 both touch `run_eacsl_fuzz.py`, but different sections (rounds vs replay).
 - **S7 comes last among the ledger steps**, since it touches `cmd_ingest_fuzz` after S4 and S5.
 
 ## Backlog (not planned)
@@ -381,21 +400,23 @@ S14 ─▶ S3, S6, S11 (it lands first)
 
 ## Status
 
-| Step | Size | Status |
-| :--- | :--- | :--- |
-| S0 | — | waits for the user |
-| S1 | S | open |
-| S2 | M | open |
-| S3 | M | open |
-| S4 | L | open |
-| S5 | M | open |
-| S6 | M | open |
-| S7 | S | open |
-| S8 | S | open, after S0 |
-| S9 | M | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |
-| S10 | — | waits for S9, then the user |
-| S11 | M | open |
-| S12 | S | open (F13 after S10) |
-| S13 | S | open |
-| S14 | M | done; seeded benchmark 9/9 bugs, 0/4 decoys (run seeded-s14, s09 found by both `tf_fuzz_parse` and the imported corpus in `librcf_a`); a c-ares coverage comparison is still to do |
-| V | — | waits for the user |
+Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; the others land on `main` after it.
+
+| Step | Size | When | Status |
+| :--- | :--- | :--- | :--- |
+| S0 | — | — | dropped; its checks are in V |
+| S1 | S | before merge | open |
+| S2 | M | before merge | open; the double-free headline capture is on the branch |
+| S3 | M | before merge | open |
+| S4 | L | before merge | open |
+| S5 | M | before merge | open |
+| S6 | M | before merge | open; F3's wide skip mask is on the branch (`18bc5e9`) |
+| S7 | S | before merge | open |
+| S8 | S | after merge | open, after V |
+| S9 | M | before merge | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |
+| S10 | — | after merge | waits for the user |
+| S11 | M | after merge | open |
+| S12 | S | F14, F16 before merge; F13 after | open |
+| S13 | S | after merge | open |
+| S14 | M | before merge | done; seeded benchmark 9/9 bugs, 0/4 decoys (run seeded-s14, s09 found by both `tf_fuzz_parse` and the imported corpus in `librcf_a`); a c-ares coverage comparison is still to do |
+| V | — | last before merge | waits for S1–S7, F14 and F16, then the user |
