@@ -2536,7 +2536,7 @@ def layer_clause_limits(goals: list[dict], c_file: Path) -> dict:
     }
 
 
-_LOCAL_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"\n]+)"', re.MULTILINE)
+_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*["<]([^">\n]+)[">]', re.MULTILINE)
 _INCLUDE_DIR_RE = re.compile(r"(?:^|\s)-I\s*(\S+)")
 
 
@@ -2545,9 +2545,11 @@ def contract_shape_limit(c_file: Path, fn_name: str, cppflags: str = "") -> str:
     The shape of the contract WP proved for `fn_name` (acsl_ast.contract_shape): `functional`,
     `safety_only` or `not_applicable`. The contract is read where Frama-C takes it from: in front of
     the definition in `c_file`, and on the function's declarations in the headers `c_file` includes
-    by name (looked up beside it and in the `-I` directories of `cppflags`), merged. `unknown` when
-    none of them is found or a file cannot be read: a contract that was not read is never reported
-    as `safety_only`.
+    directly, merged. A header is looked up beside `c_file` and in the `-I` directories of
+    `cppflags`, a relative one against the working directory as the preprocessor does; a header that
+    is not found there (a system header, the Frama-C libc) is skipped. `unknown` when no contract
+    is found or the source cannot be read: a contract that was not read is never reported as
+    `safety_only`. A contract on a header reached only through another header is not read.
     """
     try:
         source = c_file.read_text(encoding="utf-8", errors="replace")
@@ -2555,11 +2557,11 @@ def contract_shape_limit(c_file: Path, fn_name: str, cppflags: str = "") -> str:
         returns_void = function_returns_void(source, fn_name, is_header=False, path=str(c_file))
     except (OSError, AcslError):
         return SHAPE_UNKNOWN
-    dirs = [c_file.parent] + [
-        d if d.is_absolute() else c_file.parent / d for d in map(Path, _INCLUDE_DIR_RE.findall(cppflags))
-    ]
+    dirs = [c_file.parent]
+    for d in map(Path, _INCLUDE_DIR_RE.findall(cppflags)):
+        dirs += [d] if d.is_absolute() else [Path.cwd() / d, c_file.parent / d]
     seen: set[Path] = set()
-    for name in [c_file.with_suffix(".h").name, *_LOCAL_INCLUDE_RE.findall(source)]:
+    for name in [c_file.with_suffix(".h").name, *_INCLUDE_RE.findall(source)]:
         header = next((d / name for d in dirs if (d / name).is_file()), None)
         if header is None or header.resolve() in seen:
             continue

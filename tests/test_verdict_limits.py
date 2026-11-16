@@ -260,16 +260,21 @@ def test_report_section_counts_contract_shapes_per_function():
     assert "carried" not in text and "hidden" not in text
 
 
-def test_proof_records_the_contract_shape_from_source_and_header(tmp_path):
-    (tmp_path / "inc").mkdir()
-    (tmp_path / "inc" / "api.h").write_text(
+def test_proof_records_the_contract_shape_from_source_and_header(tmp_path, monkeypatch):
+    # The layout of a run: the working directory is the run, `-I` is relative to it, the source
+    # sits in a subdirectory and includes its public header with angle brackets.
+    (tmp_path / "work" / "include" / "lib").mkdir(parents=True)
+    (tmp_path / "work" / "include" / "lib" / "api.h").write_text(
         "/*@ assigns \\nothing; ensures \\result == a + b; */\nint add(int a, int b);\n"
         "/*@ assigns \\nothing; */\nvoid note(int a);\n",
         encoding="utf-8",
     )
-    c = tmp_path / "api.c"
+    (tmp_path / "work" / "src").mkdir()
+    monkeypatch.chdir(tmp_path)
+    c = tmp_path / "work" / "src" / "api.c"
     c.write_text(
-        '#include "api.h"\n'
+        "#include <stdlib.h>\n"
+        "#include <lib/api.h>\n"
         "int add(int a, int b) { return a + b; }\n"
         "void note(int a) { (void)a; }\n"
         "/*@ requires \\valid(p); assigns *p; */\nvoid touch(int *p) { *p = 0; }\n"
@@ -278,7 +283,7 @@ def test_proof_records_the_contract_shape_from_source_and_header(tmp_path):
     )
     consistent = {"status": "consistent", "doomed": [], "dead_goals": 0}
 
-    def shape(function, cppflags="-Iinc", **kw):
+    def shape(function, cppflags="-I. -Iwork/include", **kw):
         res = W.apply_verdict_limits(_report(function=function, **kw), c, consistent, cppflags=cppflags)
         return res["limits"].get("contract_shape")
 

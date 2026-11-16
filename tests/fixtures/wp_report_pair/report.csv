@@ -1,0 +1,21 @@
+directory	file	line	function	property kind	status	property
+.	probe.c	4	f	postcondition	Unknown	bad: \result ≡ 42
+.	probe.c	5	f	postcondition	Unknown	\result ≥ 0
+.	probe.c	7	f	postcondition	Valid	\false
+.	probe.c	7	f	termination clause	Partially proven	\true
+.	probe.c	7	f	assigns clause	Partially proven	assigns \nothing;
+.	probe.c	9	f	loop invariant	Partially proven	0 ≤ i ≤ n
+.	probe.c	10	f	loop invariant	Unknown	s ≡ i
+.	probe.c	11	f	assigns clause	Partially proven	assigns i, s;
+.	probe.c	14	f	signed_overflow	Partially proven	i + 1 ≤ 2147483647
+.	probe.c	15	f	mem_access	Partially proven	\valid_read(a + i)
+.	probe.c	15	f	signed_overflow	Partially proven	-2147483648 ≤ s + *(a + i)
+.	probe.c	15	f	signed_overflow	Unknown	s + *(a + i) ≤ 2147483647
+.	probe.c	16	f	mem_access	Partially proven	\valid_read(a + i)
+.	probe.c	16	f	signed_overflow	Unknown	-2147483648 ≤ s + (int)(*(a + i) * x)
+.	probe.c	16	f	signed_overflow	Unknown	s + (int)(*(a + i) * x) ≤ 2147483647
+.	probe.c	16	f	signed_overflow	Unknown	*(a + i) * x ≤ 2147483647
+.	probe.c	16	f	signed_overflow	Unknown	-2147483648 ≤ *(a + i) * x
+.	probe.c	18	f	user assertion	Unknown	s ≢ 7
+.	probe.c	19	f	signed_overflow	Partially proven	-2147483648 ≤ s + x
+.	probe.c	19	f	signed_overflow	Unknown	s + x ≤ 2147483647

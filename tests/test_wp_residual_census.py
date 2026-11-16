@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+import run_wp_function
 import wp_residual_census as census_mod
+from framac_common import read_report_csv
 
 pytestmark = pytest.mark.unit
 
@@ -220,6 +222,33 @@ def test_join_on_a_real_report_pair() -> None:
         "unknown",
         "timeout",
     ]
+    assert unpaired == 0
+
+
+def test_join_through_the_real_parsers() -> None:
+    """
+    The two files WP wrote for one function, read by the code that reads them in a run: the CSV
+    rows as run_wp_function.py turns them into `unproven_goals`, the JSON goals as it turns them
+    into `unproven_goal_costs`. Made-up reports hid a join key that matched nothing.
+    """
+    fixtures = Path(__file__).parent / "fixtures" / "wp_report_pair"
+    goals = [
+        {
+            "file": r["file"],
+            "function": r["function"],
+            "line": r["line"],
+            "kind": r["kind"],
+            "annotation": r["property"],
+        }
+        for r in read_report_csv(fixtures / "report.csv")
+        if r["status_raw"] == "Unknown"
+    ]
+    entries = run_wp_function.parse_wp_report_json((fixtures / "report.wp-report-json").read_text(encoding="utf-8"))
+    assert entries is not None
+    costs, _slowest = run_wp_function.goal_costs_from_report(entries, "f")
+    assert len(goals) == 10 and len(costs) == 10
+    kinds, unpaired = census_mod.join_by_line(goals, costs, "f")
+    assert kinds == ["timeout"] * 10
     assert unpaired == 0
 
 
