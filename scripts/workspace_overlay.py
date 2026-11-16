@@ -3095,7 +3095,9 @@ def prepare_agent(
             f"- **Detected WP Blockers:** `{json.dumps(wp_blockers)}`\n"
             f"- **Detected WP Notes:** `{json.dumps(wp_notes)}`\n"
             f"- **Enforced Budget (`agents/{agent_id}/scratch/.prover_budget.json`):** "
-            f"at most `{max_wp_invocations}` `run_wp_function.py` invocations and `{max_wall_clock_s}s` wall-clock.\n"
+            f"at most `{max_wp_invocations}` `run_wp_function.py` invocations and `{max_wall_clock_s}s` wall-clock, "
+            "counted from your first `run_wp_function.py` call; time your later calls spend queued for a WP "
+            "lease in the host resource broker does not count.\n"
         )
         if verifiability == "shell_unverifiable_wp" or "dynamic_allocation" in wp_blockers:
             rendered += (
