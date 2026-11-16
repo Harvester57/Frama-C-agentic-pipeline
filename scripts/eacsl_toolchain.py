@@ -1703,7 +1703,10 @@ def eacsl_share_dir(eacsl_bin: str) -> Path | None:
 
 
 def _tree_digest(root: Path) -> str:
+    # The hunks' text too: an edited patch that keeps its tag must not reuse a copy patched by the old one.
     h = hashlib.sha256(EACSL_FORMAT_RUNTIME_PATCH.encode())
+    for hunk in _FMT_HUNKS:
+        h.update("\0".join(hunk).encode() + b"\0")
     for p in sorted(q for q in root.rglob("*") if q.is_file()):
         h.update(p.relative_to(root).as_posix().encode() + b"\0" + p.read_bytes() + b"\0")
     return h.hexdigest()[:12]
@@ -1713,8 +1716,8 @@ def prepare_patched_eacsl_share(src: Path, dest_root: Path) -> dict[str, str]:
     """
     A copy of the E-ACSL share directory `src` under `dest_root/<patch>-<digest>/e-acsl` with
     EACSL_FORMAT_RUNTIME_PATCH applied to its e_acsl_stdio.c, for `e-acsl-gcc --e-acsl-share`.
-    The image is never written. The digest covers the patch and every file of `src`, so a new
-    Frama-C gets a new copy; concurrent builds publish one copy with an atomic rename and reuse it.
+    The image is never written. The digest covers the patch (tag and hunks) and every file of `src`,
+    so a new Frama-C or an edited patch gets a new copy; concurrent builds publish one copy with an atomic rename and reuse it.
     `status` is `applied` (with `share`) or `not_applied` (with `reason`: no share, a moved anchor).
     """
     src = Path(src)
