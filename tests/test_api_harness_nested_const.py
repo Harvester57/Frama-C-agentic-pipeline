@@ -224,6 +224,40 @@ def test_the_compile_probe_refuses_dropped_nested_qualifiers(monkeypatch, tmp_pa
     assert "-w" in seen[-1] and not any("discards-qualifiers" in a for a in seen[-1])
 
 
+NC_TAG = "[-Werror,-Wincompatible-pointer-types-discards-qualifiers]"
+
+
+@pytest.mark.unit
+def test_only_the_cases_are_held_to_the_nested_qualifier_error(monkeypatch, tmp_path):
+    """The target's own code (an inline function of its headers) compiled under `-w`: it still does."""
+    harness = tmp_path / "h.c"
+    harness.write_text('#include "lib.h"\nint x;\n        case 0U: { f(0); } break;\n', encoding="utf-8")
+    header_err = f"./lib.h:4:12: error: passing 'char **' to parameter of type 'const char **' {NC_TAG}"
+    case_err = f"{harness.name}:3:22: error: passing 'char **' to parameter of type 'const char **' {NC_TAG}"
+    outputs: list[str] = []
+
+    def fake_run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, "", outputs[-1])
+
+    monkeypatch.delenv("FRAMAC_SNAPSHOT_DIR", raising=False)
+    monkeypatch.setattr(ah.subprocess, "run", fake_run)
+    outputs.append(header_err + "\n1 error generated.\n")
+    assert ah.probe_cases(harness, "-I.", clang="/usr/bin/clang") == ({}, [])
+    outputs.append(header_err + "\n" + case_err + "\n2 errors generated.\n")
+    bad, other = ah.probe_cases(harness, "-I.", clang="/usr/bin/clang") or ({}, [])
+    assert list(bad) == [0] and "discards-qualifiers" in bad[0] and other == []
+    # Any other error off the cases still fails the harness, as before.
+    outputs.append(header_err + "\n./lib.h:9:1: error: unknown type name 'foo_t'\n2 errors generated.\n")
+    assert ah.probe_cases(harness, "-I.", clang="/usr/bin/clang") == (
+        {},
+        ["./lib.h:9:1: error: unknown type name 'foo_t'"],
+    )
+    # A driver error next to it is not swallowed either.
+    outputs.append(header_err + "\nclang: error: no such file or directory: 'x.c'\n")
+    _, other = ah.probe_cases(harness, "-I.", clang="/usr/bin/clang") or ({}, [])
+    assert other == ["clang: error: no such file or directory: 'x.c'"]
+
+
 # --- end to end: real clang's AST of the header, then the cases compile strictly and run -----------
 
 NC_LIB_H = """#include <stddef.h>

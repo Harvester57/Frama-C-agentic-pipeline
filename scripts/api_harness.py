@@ -2134,6 +2134,8 @@ def _no_error_limit(exe: str) -> str:
 
 
 _ERROR_OPTION_RE = re.compile(r"-Werror(?:=|$)|-pedantic-errors$")
+# The tag clang puts on the warning `_strict_case_flags` makes an error.
+_PROMOTED_WARNING = "-Werror,-Wincompatible-pointer-types-discards-qualifiers]"
 
 
 def _strict_case_flags(exe: str) -> list[str]:
@@ -2194,6 +2196,7 @@ def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tup
     output = (proc.stdout or "") + (proc.stderr or "")
     bad: dict[int, str] = {}
     other: list[str] = []
+    promoted = False
     for m in _ERR_LINE_RE.finditer(output):
         line = int(m.group("line"))
         if Path(m.group("file")).name == harness_c.name and line in case_of_line:
@@ -2201,8 +2204,17 @@ def probe_cases(harness_c: Path, cppflags: str, clang: str | None = None) -> tup
             if len(diag) > MAX_DIAGNOSTIC_CHARS:
                 diag = diag[: MAX_DIAGNOSTIC_CHARS - 3] + "..."
             bad.setdefault(case_of_line[line], diag)
+        elif _PROMOTED_WARNING in m.group("msg"):
+            # Only the cases are held to it: the target's own code (an inline function of its
+            # headers, an included source) compiled under `-w` before and is not the harness's.
+            promoted = True
         else:
             other.append(m.group(0).strip())
+    if not bad and not other and promoted:
+        unlocated = [t for t in output.splitlines() if "error:" in t and not _ERR_LINE_RE.match(t)]
+        if not unlocated:
+            return {}, []
+        other.append(unlocated[0].strip())
     if not bad and not other:
         # A failed compile with no located error (a fatal one, a driver error): not a case's fault.
         other.append(output.strip().splitlines()[0] if output.strip() else f"exit code {proc.returncode}")
