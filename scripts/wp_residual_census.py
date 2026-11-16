@@ -287,6 +287,13 @@ def census(run_dir: Path, near_miss: int = DEFAULT_NEAR_MISS) -> dict:
     mismatched = [r["function"] for r in records if r["unproved"] != r["unproven_count_reported"]]
     if mismatched:
         notes.append(f"unproven_goals length differs from unproven_count in: {', '.join(sorted(mismatched))}")
+    verdict_total = sum(sum(r["by_verdict"].values()) for r in records)
+    unproved_total = sum(r["unproved"] for r in records)
+    if verdict_total != unproved_total:
+        notes.append(
+            f"verdict kinds count WP goals ({verdict_total}) while classes and buckets count CSV report rows "
+            f"({unproved_total}); one row can be several WP goals"
+        )
     ambiguous = ambiguous_function_names(run_dir, notes)
     if ambiguous:
         notes.append(

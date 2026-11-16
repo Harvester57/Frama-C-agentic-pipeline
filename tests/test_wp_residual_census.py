@@ -195,6 +195,16 @@ def test_undecided_status_is_named(tmp_path: Path) -> None:
     assert data["near_miss_functions"] == []
 
 
+def test_verdict_and_row_count_difference_is_noted(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    costs = [_cost("x", "timeout"), _cost("x", "timeout")]
+    _write(run, "twice", _report("twice", [_goal(1, "x")], 3, costs=costs))
+    data = census_mod.census(run)
+    assert data["totals"]["unproved_by_verdict"] == {"timeout": 2}
+    assert any("verdict kinds count WP goals (2)" in n for n in data["notes"])
+    assert [w["function"] for w in data["would_be_all_proven_if_timeouts_closed"]] == ["twice"]
+
+
 def test_bad_shape_is_unreadable(tmp_path: Path) -> None:
     run = tmp_path / "run"
     _write(run, "odd", _report("odd", [], 1, unproven_goals="nope"))
