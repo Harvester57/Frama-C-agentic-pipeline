@@ -12,7 +12,8 @@ Isolation model:
   - This module is the inner layer. It applies, to every run:
       * a cleared environment populated only from an explicit allowlist;
       * rlimits on CPU time, file size, open files and process count (optional
-        address space), and core dumps disabled;
+        address space), and core dumps disabled (RLIMIT_CORE of 1 byte,
+        see CORE_LIMIT_BYTES);
       * a wall-clock timeout that SIGKILLs the whole process group
         (the child is started in its own session).
   - There is NO filesystem isolation inside the container: a target-controlled
@@ -104,6 +105,15 @@ def build_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, str]
     return env
 
 
+# RLIMIT_CORE for sandboxed children. 1 byte, not 0: when the kernel's
+# core_pattern is a pipe (Docker Desktop / WSL2: "|/wsl-capture-crash ..."),
+# the kernel ignores a limit of 0 and still streams the whole core to the
+# helper, which made every abort() of an E-ACSL binary cost from about 0.8 s
+# up to minutes. A limit of 1 makes it skip the pipe dump, and under a file
+# core_pattern a 1-byte limit writes no core either. Nothing reads core files.
+CORE_LIMIT_BYTES = 1
+
+
 def _make_preexec(limits: Limits):
     def _apply() -> None:
         import resource  # POSIX only; imported lazily so the module loads on any host
@@ -118,7 +128,7 @@ def _make_preexec(limits: Limits):
         _set(resource.RLIMIT_NPROC, limits.processes)  # type: ignore[attr-defined]
         if limits.address_space_mb:
             _set(resource.RLIMIT_AS, limits.address_space_mb * 1024 * 1024)  # type: ignore[attr-defined]
-        _set(resource.RLIMIT_CORE, 0)  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_CORE, CORE_LIMIT_BYTES)  # type: ignore[attr-defined]
 
     return _apply
 
