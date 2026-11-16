@@ -722,6 +722,89 @@ def fix_readonly_scalar_globals(c_text: str) -> tuple[str, int]:
     return _READONLY_SCALAR_RE.subn(_repl, c_text)
 
 
+_C_STRING_LITERAL = r'L?"(?:[^"\\\n]|\\.)*"'
+_LITERAL_STORE_RE = re.compile(
+    rf"__e_acsl_store_block\(\(void \*\)(?P<lit>{_C_STRING_LITERAL}),(?P<size>\d+)[uUlL]*\);"
+)
+_GLOBALS_INIT_HEAD_RE = re.compile(r"^void __e_acsl_globals_init\(void\)\n\{\n", re.MULTILINE)
+_REGISTRATION_CALLS = ("__e_acsl_store_block(", "__e_acsl_full_init(", "__e_acsl_mark_readonly(")
+
+
+def _globals_init_statements(lines: list[str]) -> list[tuple[list[str], str]]:
+    """Group body lines into statements: a registration call the printer wrapped over several lines is one."""
+    units: list[tuple[list[str], str]] = []
+    i = 0
+    while i < len(lines):
+        chunk = [lines[i]]
+        if lines[i].strip().startswith(_REGISTRATION_CALLS):
+            while not chunk[-1].rstrip().endswith(");") and i + len(chunk) < len(lines) and len(chunk) < 8:
+                chunk.append(lines[i + len(chunk)])
+        units.append((chunk, "".join(part.strip() for part in chunk)))
+        i += len(chunk)
+    return units
+
+
+def order_literal_registrations(c_text: str) -> tuple[str, int]:
+    """
+    Register string literals shortest first in `__e_acsl_globals_init`.
+
+    Under full memory tracking E-ACSL registers every string literal as its own block. clang ignores
+    `-fno-merge-constants` and puts literals in a mergeable string section, and GNU ld then stores a
+    literal that is a suffix of another one (`","` of `" ,"`) inside it. The two blocks overlap: when
+    the shorter one is registered last, the shadow of the shared bytes names it as their block, and
+    `\\valid_read(" ," + 1)` fails because that byte no longer belongs to the block of `" ,"` (c-ares:
+    `ares_buf_split(buf, " ,", 2, ...)` aborted at init on every input). Registering literals by
+    ascending size makes the longer, enclosing block the last writer, so every merged suffix lies inside
+    one registered block that ends at the shared terminator.
+
+    Cost: a merged suffix reports the enclosing literal's block, so a read before the start of the
+    suffix (but inside the longer literal) and its `\\base_addr`/`\\offset`/`\\block_length` are not
+    the suffix's own. Each group (store_block, then the full_init/mark_readonly lines of the same
+    literal) moves as a whole; the other globals keep their place. Returns (new_text, number of
+    literal groups whose position changed).
+    """
+    head = _GLOBALS_INIT_HEAD_RE.search(c_text)
+    if head is None:
+        return c_text, 0
+    body_start = head.start()
+    end = c_text.find("\n}\n", body_start)
+    if end < 0:
+        return c_text, 0
+    units = _globals_init_statements(c_text[body_start:end].split("\n"))
+    groups: list[tuple[int, int, int]] = []  # (first statement, statement count, block size)
+    i = 0
+    while i < len(units):
+        m = _LITERAL_STORE_RE.fullmatch(units[i][1])
+        if not m:
+            i += 1
+            continue
+        lit = m.group("lit")
+        n = 1
+        follow = (f"__e_acsl_full_init((void *)(& {lit}));", f"__e_acsl_mark_readonly((void *){lit});")
+        while i + n < len(units) and units[i + n][1] in follow:
+            n += 1
+        groups.append((i, n, int(m.group("size"))))
+        i += n
+    ordered = sorted(groups, key=lambda g: g[2])
+    moved = sum(1 for a, b in zip(groups, ordered, strict=True) if a != b)
+    if not moved:
+        return c_text, 0
+    out: list[str] = []
+    slot = 0
+    i = 0
+    while i < len(units):
+        if slot < len(groups) and i == groups[slot][0]:
+            first, count, _size = ordered[slot]
+            for chunk, _joined in units[first : first + count]:
+                out.extend(chunk)
+            i += groups[slot][1]
+            slot += 1
+        else:
+            out.extend(units[i][0])
+            i += 1
+    return c_text[:body_start] + "\n".join(out) + c_text[end:], moved
+
+
 _ALIGNAS_RE = re.compile(r"\b_Alignas\s*\(")
 _ATTRIBUTE_RE = re.compile(r"\s*__attribute__\s*\(")
 

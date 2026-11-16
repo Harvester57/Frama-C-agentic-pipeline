@@ -2157,3 +2157,154 @@ def test_fix_readonly_scalar_globals_supports_all_integer_suffix_forms(suffix):
     patched, n = T.fix_readonly_scalar_globals(src)
     assert n == 1
     assert "__e_acsl_mark_readonly((void *)(& kMaxEmbeddedInt));" in patched
+
+
+# ---------------------------------------------------------------------------
+# String literals the linker tail-merges (c-ares run-1, ares_buf_split(buf, " ,", 2, ...))
+# ---------------------------------------------------------------------------
+
+GLOBALS_INIT_LITERALS_C = r"""int keep(void)
+{
+  __e_acsl_store_block((void *)",",2UL);
+  return 0;
+}
+
+void __e_acsl_globals_init(void)
+{
+  static char __e_acsl_already_run = 0;
+  if (! __e_acsl_already_run) {
+    __e_acsl_already_run = 1;
+    __e_acsl_store_block((void *)(tab),256UL);
+    __e_acsl_full_init((void *)(& tab));
+    __e_acsl_store_block((void *)" ,",3UL);
+    __e_acsl_full_init((void *)(& " ,"));
+    __e_acsl_mark_readonly((void *)" ,");
+    __e_acsl_store_block((void *)(& counter),4UL);
+    __e_acsl_full_init((void *)(& counter));
+    __e_acsl_store_block((void *)"a\"b\n",5UL);
+    __e_acsl_full_init((void *)(& "a\"b\n"));
+    __e_acsl_mark_readonly((void *)"a\"b\n");
+    __e_acsl_store_block((void *)",",2UL);
+    __e_acsl_full_init((void *)(& ","));
+    __e_acsl_mark_readonly((void *)",");
+  }
+  return;
+}
+
+void __e_acsl_globals_clean(void)
+{
+  __e_acsl_delete_block((void *)" ,");
+}
+"""
+
+
+def test_order_literal_registrations_registers_the_enclosing_literal_last():
+    patched, n = T.order_literal_registrations(GLOBALS_INIT_LITERALS_C)
+    init = patched[patched.index("void __e_acsl_globals_init") : patched.index("void __e_acsl_globals_clean")]
+    stores = re.findall(r"__e_acsl_store_block\(\(void \*\)(.*?),(\d+)UL\);", init)
+    # Literals by ascending size in the literal slots; the other globals keep their place.
+    assert stores == [("(tab)", "256"), (r'","', "2"), ("(& counter)", "4"), (r'" ,"', "3"), (r'"a\"b\n"', "5")]
+    assert n == 3  # each of the three literal slots now holds another literal
+    # Each literal keeps its full_init and mark_readonly lines right after its store_block.
+    for lit in (r'","', r'" ,"', r'"a\"b\n"'):
+        group = (
+            f"    __e_acsl_store_block((void *){lit},",
+            f"    __e_acsl_full_init((void *)(& {lit}));",
+            f"    __e_acsl_mark_readonly((void *){lit});",
+        )
+        at = init.index(group[0])
+        assert init[at:].split("\n")[1:3] == list(group[1:]), lit
+    # Code outside __e_acsl_globals_init is untouched.
+    assert patched.startswith(GLOBALS_INIT_LITERALS_C[: GLOBALS_INIT_LITERALS_C.index("void __e_acsl_globals_init")])
+    assert patched.endswith(GLOBALS_INIT_LITERALS_C[GLOBALS_INIT_LITERALS_C.index("void __e_acsl_globals_clean") :])
+    # Idempotent.
+    assert T.order_literal_registrations(patched) == (patched, 0)
+
+
+def test_order_literal_registrations_moves_calls_the_printer_wrapped():
+    long_lit = '"' + "x" * 90 + '"'
+    src = (
+        "void __e_acsl_globals_init(void)\n{\n"
+        f"    __e_acsl_store_block((void *){long_lit},\n                         91UL);\n"
+        f"    __e_acsl_full_init((void *)(& {long_lit}));\n"
+        f"    __e_acsl_mark_readonly((void *){long_lit});\n"
+        '    __e_acsl_store_block((void *)"x",2UL);\n'
+        '    __e_acsl_full_init((void *)(& "x"));\n'
+        "  return;\n}\n"
+    )
+    patched, n = T.order_literal_registrations(src)
+    assert n == 2
+    body = patched.split("\n")
+    assert body[2:4] == ['    __e_acsl_store_block((void *)"x",2UL);', '    __e_acsl_full_init((void *)(& "x"));']
+    assert body[4:8] == src.split("\n")[2:6]  # the wrapped store_block keeps its two lines and its group
+    assert sorted(patched.split("\n")) == sorted(src.split("\n"))
+
+
+def test_order_literal_registrations_leaves_sources_without_literal_registrations_alone():
+    assert T.order_literal_registrations("int main(void) { return 0; }\n") == ("int main(void) { return 0; }\n", 0)
+    # Already shortest first (the wide literal's size is in bytes): nothing moves.
+    ordered = GLOBALS_INIT_LITERALS_C.replace('","', 'L","').replace(",2UL", ",8UL").replace('" ,",3UL', '" ,",1UL')
+    assert T.order_literal_registrations(ordered) == (ordered, 0)
+
+
+LITERAL_SUFFIX_FUZZ_C = r"""#include <stddef.h>
+#include <stdint.h>
+
+#define TAIL "is the tail of a literal longer than sixty-four bytes, so that its block is a long one"
+
+static int in_charset(const unsigned char *charset, size_t len, unsigned char c)
+{
+    size_t j;
+    for (j = 0; j < len; j++) {
+        if (charset[j] == c)
+            return 1;
+    }
+    return 0;
+}
+
+static const char *comma(void) { return ","; }
+static const char *tail(void) { return TAIL; }
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    unsigned char c = size > 0 ? data[0] : 0;
+    int r = in_charset((const unsigned char *)" ,", 2, c);
+    r += in_charset((const unsigned char *)"this " TAIL, sizeof("this " TAIL) - 1, c);
+    r += comma()[0] == c;
+    r += in_charset((const unsigned char *)tail(), sizeof(TAIL) - 1, c);
+    return r & 0;
+}
+"""
+
+LITERAL_IMAGE_SCRIPT = r"""set -e
+cp -r /fixture /tmp/w && cd /tmp/w
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/repo/scripts")
+import run_eacsl_fuzz as R
+res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
+keys = ("returncode", "reason", "binary", "literal_registrations_reordered")
+print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
+EOF
+timeout 120 ./out/fuzz_mod.e-acsl -runs=200 > run.log 2>&1 && echo RUN_OK || tail -20 run.log
+"""
+
+
+@pytest.mark.integration
+def test_tail_merged_string_literals_do_not_fail_valid_read_in_the_analysis_image(tmp_path):
+    """c-ares run-1: `","` stored inside `" ,"` made `\\valid_read(charset + 1)` fail on every input."""
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mod.c").write_text(LITERAL_SUFFIX_FUZZ_C, encoding="utf-8")
+    argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro"]
+    argv += ["-v", f"{REPO}:/repo:ro", ANALYSIS_IMAGE, LITERAL_IMAGE_SCRIPT]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    out = proc.stdout + proc.stderr
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    assert line, out[-4000:]
+    res = json.loads(line[len("RESULT ") :])
+    assert res["returncode"] == 0, out[-4000:]
+    assert "RUN_OK" in proc.stdout, out[-4000:]
+    assert res["literal_registrations_reordered"], res

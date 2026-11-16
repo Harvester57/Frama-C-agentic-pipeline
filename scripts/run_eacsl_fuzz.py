@@ -112,6 +112,7 @@ from eacsl_toolchain import (  # noqa: E402
     mark_formals_initialized,
     mark_wrapper_results_initialized,
     normalize_passthrough,
+    order_literal_registrations,
     parse_missing_functions,
     parse_undefined_fallbacks,
     prepare_patched_eacsl_share,
@@ -1420,6 +1421,18 @@ def _compile_eacsl_binary_uncached(
                 log_parts.append(
                     f"Fixed {n_readonly} E-ACSL readonly mark(s) for scalar const globals "
                     "(the printer passed the value instead of its address).\n"
+                )
+
+            # Without this, a literal the linker tail-merged into a longer one (`","` in `" ,"`) splits
+            # the longer literal's block, and every read past its first byte fails \valid_read.
+            c_text, n_literals = order_literal_registrations(c_text)
+            if n_literals:
+                c_modified = True
+                result["literal_registrations_reordered"] = n_literals
+                log_parts.append(
+                    f"Reordered {n_literals} string literal registration(s) shortest first "
+                    "(the linker stores a literal that is a suffix of another inside it; the enclosing "
+                    "block must be registered last).\n"
                 )
 
             c_text, n_rewrites = rewrite_sound_verdict_resets(c_text)
