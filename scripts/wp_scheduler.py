@@ -39,6 +39,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -2191,14 +2192,22 @@ def _caller_report(state: dict | None, caller: dict) -> tuple[str | None, dict |
     breaker = ((state or {}).get("tasks") or {}).get(f"breaker:{_key(caller)}") or {}
     if breaker.get("wp_report"):
         paths.append(breaker["wp_report"])
-    paths.append(f"workspace/reports/wp/{fn}.json")
+    c_file = str(caller.get("file") or "")
+    # Name-only canonical report (another file's when the name is shared), then the baseline's of this file.
+    shared = [f"workspace/reports/wp/{fn}.json"]
+    if c_file:
+        shared.append(f"workspace/{workspace_overlay.baseline_wp_report_rel(c_file, fn)}")
+    paths.extend(shared)
     for path in dict.fromkeys(paths):
         try:
             report = _load_report(path)
         except OSError:
             report = None
-        if report is not None and report.get("function") in (None, fn):
-            return path, report
+        if report is None or report.get("function") not in (None, fn):
+            continue
+        if path in shared and not workspace_overlay.wp_report_is_for(report, c_file or None, fn):
+            continue
+        return path, report
     return None, None
 
 
@@ -4473,17 +4482,28 @@ def cmd_baseline(
             continue
 
         if not recheck_all:
-            wp_rep_path = run_dir / "workspace" / "reports" / "wp" / f"{fn}.json"
-            if not wp_rep_path.is_file():
-                wp_rep_path = run_dir / "reports" / "wp" / f"{fn}.json"
+            # Only a report of this very file and function counts: the task's own baseline report, else the
+            # name-only canonical one when its `file` is this file's (a same-named static function of another
+            # file shares that name).
             is_proven = False
-            if wp_rep_path.is_file():
+            for wp_rep_path in (
+                run_dir / "workspace" / workspace_overlay.baseline_wp_report_rel(c_file, fn),
+                run_dir / "workspace" / "reports" / "wp" / f"{fn}.json",
+                run_dir / "reports" / "wp" / f"{fn}.json",
+            ):
+                if not wp_rep_path.is_file():
+                    continue
                 try:
                     rdata = json.loads(wp_rep_path.read_text(encoding="utf-8"))
-                    if rdata.get("status") == "all_proven":
-                        is_proven = True
                 except Exception:
-                    pass
+                    continue
+                if (
+                    isinstance(rdata, dict)
+                    and rdata.get("status") == "all_proven"
+                    and workspace_overlay.wp_report_is_for(rdata, c_file, fn)
+                ):
+                    is_proven = True
+                    break
             if not is_proven and t.get("state") == "done" and t.get("outcome") in ("all_proven", "merged"):
                 is_proven = True
             if is_proven:
@@ -4516,6 +4536,12 @@ def cmd_baseline(
                 save_schedule(state)
                 _write_wp_queue(state)
 
+    # Files that define each function name in the queue: a name in several files has no name-only report.
+    name_files: dict[str, set[str]] = {}
+    for t in raw_tasks:
+        if t.get("file") and t.get("function"):
+            name_files.setdefault(str(t["function"]), set()).add(norm_path(t["file"]))
+
     task_plans: list[dict] = []
     for item in to_run:
         tid = item["task_id"]
@@ -4532,9 +4558,16 @@ def cmd_baseline(
         cppflags = (hmeta.get("cppflags") if isinstance(hmeta, dict) else None) or "-I."
         extra_sources = mod_params.get("wp_extra_sources", [])
 
-        slug = _slugify(c_file)
+        # The report, like the work dir, is keyed by file and function: same-named static functions of
+        # different files never share it. The name-only reports/wp/<fn>.json is published afterwards, and
+        # only for a name no other file defines.
+        slug = workspace_overlay.wp_work_slug(c_file)
         out_dir = run_dir / "workspace" / "reports" / "wp" / "work" / f"{slug}_{fn}"
-        out_json = run_dir / "workspace" / "reports" / "wp" / f"{fn}.json"
+        out_json = run_dir / "workspace" / workspace_overlay.baseline_wp_report_rel(c_file, fn)
+        canonical_json = run_dir / "workspace" / "reports" / "wp" / f"{fn}.json"
+        shared_name = bool(name_files.get(fn, set()) - {norm_c}) or workspace_overlay.function_name_is_shared(
+            run_dir, fn, norm_c
+        )
         key = f"{mod}:{c_file}#{fn}"
 
         cmd = [
@@ -4574,17 +4607,23 @@ def cmd_baseline(
                 "module": mod,
                 "out_dir": out_dir,
                 "out_json": out_json,
+                "canonical_json": canonical_json,
+                "shared_name": shared_name,
                 "cmd": cmd,
             }
         )
 
     def _run_single(plan: dict) -> dict:
         plan["out_dir"].mkdir(parents=True, exist_ok=True)
-        if plan["out_json"].is_file():
-            try:
-                plan["out_json"].unlink()
-            except OSError:
-                pass
+        stale = [plan["out_json"]]
+        if not plan["shared_name"]:
+            stale.append(plan["canonical_json"])  # an unambiguous name: its one report is about to be replaced
+        for path in stale:
+            if path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
         proc = DEPS.run_cmd(
             plan["cmd"],
             cwd=str(run_dir),
@@ -4603,6 +4642,8 @@ def cmd_baseline(
             "file": plan["file"],
             "module": plan["module"],
             "out_json": plan["out_json"],
+            "canonical_json": plan["canonical_json"],
+            "shared_name": plan["shared_name"],
             "returncode": getattr(proc, "returncode", 0),
             "status": status,
             "report": report,
@@ -4617,6 +4658,12 @@ def cmd_baseline(
                 res = future.result()
                 results.append(res)
                 out_json_path = res["out_json"]
+                if out_json_path.is_file() and not res["shared_name"]:
+                    # The name-only report older readers know, for a name only this file defines.
+                    try:
+                        shutil.copy2(out_json_path, res["canonical_json"])
+                    except OSError:
+                        pass
 
                 with run_lock("ledger", run_dir):
                     # Only a full proof reaches the ledger: a baseline that fails on code without

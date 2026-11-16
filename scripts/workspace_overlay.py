@@ -160,6 +160,69 @@ def _function_files(run_dir: Path, function: str) -> set[str]:
     return {_normalize_work_relpath(u.get("file") or "") for u in units if u.get("function") == function}
 
 
+_REPORT_FILE_PREFIX_RE = re.compile(
+    r"^(?:.*/)?(?:workspace/(?:work|baseline)/|agents/[A-Za-z0-9_-]+/scratch/(?:work|base)/)"
+)
+_WP_SLUG_LIMIT = 40
+
+
+def wp_work_slug(c_file: str) -> str:
+    """
+    Directory stem of a file in `workspace/reports/wp/work/`: its normalised path in `[a-z0-9_]`. A path
+    whose slug exceeds the limit keeps a prefix and a hash of the whole path, so two long paths never share a stem.
+    """
+    norm = _normalize_work_relpath(c_file or "")
+    slug = re.sub(r"[^a-z0-9_]+", "_", norm.lower()).strip("_") or "task"
+    if len(slug) <= _WP_SLUG_LIMIT:
+        return slug
+    digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
+    return f"{slug[: _WP_SLUG_LIMIT - 9].rstrip('_')}_{digest}"
+
+
+def baseline_wp_report_rel(c_file: str, function: str) -> str:
+    """
+    Where the Phase-3 baseline writes the WP report of one function of one file, relative to the overlay:
+    keyed by file and function, one level below `reports/wp/` so `reports/wp/*.json` globs never see it.
+    """
+    return f"reports/wp/work/{wp_work_slug(c_file)}_{function}.json"
+
+
+def wp_report_is_for(report: Any, c_file: str | None, function: str | None) -> bool:
+    """
+    Whether a WP report describes `function` of `c_file`. A report that names no function or no file is
+    not contradicted; one that names another function or another file is not this function's.
+    """
+    if not isinstance(report, dict):
+        return False
+    if function and report.get("function") not in (None, function):
+        return False
+    rep_file = str(report.get("file") or "")
+    if not c_file or not rep_file:
+        return True
+    want = _normalize_work_relpath(c_file)
+    got = _REPORT_FILE_PREFIX_RE.sub("", rep_file.replace("\\", "/"))
+    got = _normalize_work_relpath(got)
+    if got == want:
+        return True
+    absolute = got.startswith("/") or bool(re.match(r"^[A-Za-z]:/", got))
+    return absolute and got.endswith("/" + want)
+
+
+def load_function_wp_report(overlay: Path, c_file: str | None, function: str) -> dict:
+    """
+    The latest WP report of `function` in `c_file`: the canonical `reports/wp/<function>.json` when it is this
+    file's (a merge refreshes it), else the baseline's report of this file. {} when neither exists.
+    """
+    candidates = [overlay / "reports" / "wp" / f"{function}.json"]
+    if c_file:
+        candidates.append(overlay / baseline_wp_report_rel(c_file, function))
+    for path in candidates:
+        data = load_json_optional(path, {})
+        if data and wp_report_is_for(data, c_file, function):
+            return data
+    return {}
+
+
 class OverlayMergeError(RuntimeError):
     """An agent scratch overlay failed scope, ACSL-only, or parent re-verification checks."""
 
@@ -1065,6 +1128,8 @@ def _prover_wp_config(
         cand_paths.append((agent_dir / "scratch" / "parent_wp" / f"{function}.json", False))
     if function:
         cand_paths.append((overlay / "reports" / "wp" / f"{function}.json", False))
+        if norm_c:
+            cand_paths.append((overlay / baseline_wp_report_rel(norm_c, function), False))
 
     reduced: list[str] = []
     wp_model: str | None = None
@@ -1084,6 +1149,8 @@ def _prover_wp_config(
             continue
         if function and rep.get("function") not in (None, function):
             continue
+        if not own and not wp_report_is_for(rep, norm_c, function):
+            continue  # another file's report of a same-named static function
         rc = (rep.get("soundness") or {}).get("reduced_checks")
         if isinstance(rc, list):
             for item in rc:
@@ -1368,9 +1435,14 @@ def _parent_guard_json(run_dir: Path, agent_id: str, function: str | None, modul
     return run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
 
 
+def function_name_is_shared(run_dir: Path, function: str, norm_c: str) -> bool:
+    """Whether the ledger has `function` in a file other than `norm_c` (a same-named static function)."""
+    return len(_function_files(run_dir, function) - {norm_c}) > 0
+
+
 def _publish_canonical_wp(run_dir: Path, overlay_dir: Path, wp_json: Path, norm_c: str, function: str) -> None:
     """Copy a parent WP report to reports/wp/<function>.json unless the name is ambiguous across files."""
-    if len(_function_files(run_dir, function) - {norm_c}) == 0:
+    if not function_name_is_shared(run_dir, function, norm_c):
         canonical = overlay_dir / "reports" / "wp" / f"{function}.json"
         canonical.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(wp_json, canonical)
@@ -2906,7 +2978,7 @@ def prepare_agent(
         wp_data = load_json_optional(wp_report_path, {})
         wp_report_rel = wp_report.replace("\\", "/")
     elif function:
-        wp_data = load_json_optional(overlay / "reports" / "wp" / f"{function}.json", {})
+        wp_data = load_function_wp_report(overlay, norm_c_file, function)
 
     unknown_obligations: list = []
     if eva_unknown_obligations is not None:

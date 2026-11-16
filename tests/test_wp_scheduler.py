@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -2345,3 +2346,148 @@ def test_a_candidate_the_ledger_reopened_gets_its_verify_task_back_once(sim):
     task = tasks()[f"verify:{fp}"]
     assert task["state"] == "pending" and task["candidate_reopens"] == 1
     assert f"verify:{fp}" not in S.cmd_refresh()["sync"]["reopened"]
+
+
+# ---------------------------------------------------------------------------
+# Baseline reports of same-named static functions in different files
+# ---------------------------------------------------------------------------
+
+
+def _collide_build(sim):
+    sim.build(
+        {
+            "src/a/x.c#helper": ("src/a/x.c", "m", []),
+            "src/b/y.c#helper": ("src/b/y.c", "m", []),
+        }
+    )
+
+
+def _collide_fake_run(statuses, calls=None, barrier=None):
+    """A run_cmd that writes one report per --file; `statuses` maps a path fragment to the report status."""
+
+    def fake_run(cmd, cwd, **kwargs):
+        c_file = cmd[cmd.index("--file") + 1].replace("\\", "/")
+        out_json = Path(cmd[cmd.index("--out-json") + 1])
+        status = next(s for frag, s in statuses.items() if frag in c_file)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        write_json(
+            out_json,
+            {
+                "function": cmd[cmd.index("--function") + 1],
+                "file": c_file,
+                "status": status,
+                "by_obligation_class": {"rte": {"proven": 1, "unproven": 0 if status == "all_proven" else 1}},
+                "unproven_goals": [] if status == "all_proven" else [{"kind": "mem_access", "line": 3}],
+            },
+        )
+        if calls is not None:
+            calls.append(c_file)
+        if barrier is not None:
+            barrier.wait()  # both tasks are inside run_cmd, both reports written
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return fake_run
+
+
+def _collide_reports(sim):
+    """Every WP report under reports/wp/, recursively: {source file: status}, one entry per report file."""
+    wp_dir = sim.run_dir / "workspace" / "reports" / "wp"
+    return sorted(
+        (Path(d["file"].replace("\\", "/")).as_posix().split("/src/")[-1], d["status"])
+        for d in (json.loads(p.read_text(encoding="utf-8")) for p in wp_dir.rglob("*.json"))
+        if d.get("function") == "helper"
+    )
+
+
+def test_baseline_same_name_functions_keep_each_files_report(sim, monkeypatch):
+    _collide_build(sim)
+    monkeypatch.setattr(S.DEPS, "run_cmd", _collide_fake_run({"src/a/x.c": "all_proven", "src/b/y.c": "unproven"}))
+
+    S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+
+    # x.c's proof is not overwritten by y.c's report.
+    assert _collide_reports(sim) == [("a/x.c", "all_proven"), ("b/y.c", "unproven")]
+    # The name-only report would be one file's: it is not published for a name two files define.
+    wp_dir = sim.run_dir / "workspace" / "reports" / "wp"
+    assert not (wp_dir / "helper.json").exists()
+    assert sorted(p.name for p in wp_dir.glob("*.json")) == []
+
+
+def test_baseline_skip_test_reads_only_the_tasks_own_file_report(sim, monkeypatch):
+    _collide_build(sim)
+    calls: list[str] = []
+    fake = _collide_fake_run({"src/a/x.c": "unproven", "src/b/y.c": "all_proven"}, calls)
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake)
+    S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+    assert len(calls) == 2
+    calls.clear()
+
+    summary = S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+
+    # y.c is proven; x.c is still open and runs again.
+    assert [t["task"] for t in summary["already_proven_tasks"]] == ["prove:src/b/y.c#helper"]
+    assert [c.rsplit("/src/", 1)[-1] for c in calls] == ["a/x.c"]
+    sched = load(sim.run_dir / "state" / "wp_schedule.json")["tasks"]
+    assert sched["prove:src/a/x.c#helper"]["state"] == "pending"
+    assert sched["prove:src/b/y.c#helper"]["state"] == "done"
+
+
+def test_baseline_skip_test_ignores_a_legacy_name_only_report_of_another_file(sim, monkeypatch):
+    _collide_build(sim)
+    legacy = sim.run_dir / "workspace" / "reports" / "wp" / "helper.json"
+    write_json(legacy, wp_report("helper", "src/b/y.c", "all_proven"))
+    calls: list[str] = []
+    monkeypatch.setattr(S.DEPS, "run_cmd", _collide_fake_run({"src/a/x.c": "unproven", "src/b/y.c": "unproven"}, calls))
+
+    summary = S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+
+    assert [t["task"] for t in summary["already_proven_tasks"]] == ["prove:src/b/y.c#helper"]
+    assert [c.rsplit("/src/", 1)[-1] for c in calls] == ["a/x.c"]
+
+
+def test_baseline_pending_task_records_and_is_briefed_from_its_own_report(sim, monkeypatch):
+    _collide_build(sim)
+    monkeypatch.setattr(S.DEPS, "run_cmd", _collide_fake_run({"src/a/x.c": "unproven", "src/b/y.c": "unproven"}))
+
+    S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+
+    sched = load(sim.run_dir / "state" / "wp_schedule.json")["tasks"]
+    reports = {}
+    for tid, frag in (("prove:src/a/x.c#helper", "src/a/x.c"), ("prove:src/b/y.c#helper", "src/b/y.c")):
+        path = Path(sched[tid]["baseline"]["report"])
+        reports[tid] = path
+        assert frag in json.loads(path.read_text(encoding="utf-8"))["file"].replace("\\", "/")
+    assert reports["prove:src/a/x.c#helper"] != reports["prove:src/b/y.c#helper"]
+    # The prover's brief reads the goals of its own file, even when the name-only report is another file's.
+    overlay = sim.run_dir / "workspace"
+    write_json(overlay / "reports" / "wp" / "helper.json", wp_report("helper", "src/b/y.c", "unproven"))
+    brief_report = workspace_overlay.load_function_wp_report(overlay, "src/a/x.c", "helper")
+    assert brief_report["file"].replace("\\", "/").endswith("src/a/x.c")
+
+
+def test_baseline_same_name_tasks_running_together_do_not_share_a_report(sim, monkeypatch):
+    _collide_build(sim)
+    barrier = threading.Barrier(2, timeout=30)  # both tasks are inside run_cmd with their reports written
+    fake = _collide_fake_run({"src/a/x.c": "all_proven", "src/b/y.c": "unproven"}, barrier=barrier)
+    monkeypatch.setattr(S.DEPS, "run_cmd", fake)
+
+    summary = S.cmd_baseline(run_dir=sim.run_dir, jobs=2)
+
+    by_task = {r["task"]: r["status"] for r in summary["results"]}
+    assert by_task == {"prove:src/a/x.c#helper": "all_proven", "prove:src/b/y.c#helper": "unproven"}
+    sched = load(sim.run_dir / "state" / "wp_schedule.json")["tasks"]
+    assert sched["prove:src/a/x.c#helper"]["state"] == "done"
+    assert sched["prove:src/a/x.c#helper"]["outcome"] == "merged"
+    assert sched["prove:src/b/y.c#helper"]["state"] == "pending"
+
+
+def test_baseline_unambiguous_name_still_publishes_the_name_only_report(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    monkeypatch.setattr(S.DEPS, "run_cmd", _collide_fake_run({"src/m/a.c": "unproven"}))
+    S.cmd_baseline(run_dir=sim.run_dir, jobs=1)
+
+    canonical = sim.run_dir / "workspace" / "reports" / "wp" / "a.json"
+    assert json.loads(canonical.read_text(encoding="utf-8"))["status"] == "unproven"
+    task = load(sim.run_dir / "state" / "wp_schedule.json")["tasks"]["prove:src/m/a.c#a"]
+    assert Path(task["baseline"]["report"]).is_file()
+    assert Path(task["baseline"]["report"]) != canonical
