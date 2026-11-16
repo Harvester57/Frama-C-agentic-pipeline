@@ -242,26 +242,48 @@ def test_a_plan_predicted_over_the_limit_from_a_timed_out_run_says_so(tmp_path):
     slowest = plan["shards"].index([11])
     assert plan["predicted_shard_s"][slowest] == plan["predicted_makespan_s"]
     warning = next(w for w in res["warnings"] if w.startswith("snmp: Eva sharding: eva-snmp runs as 16 shards"))
-    assert "predicted to time out" in warning and f"shard {slowest} (case [11])" in warning
-    assert "lower bound" in warning and "one case alone" in warning
+    assert "over its planning limit" in warning and f"shard {slowest} (case [11])" in warning
+    assert "lower bound" in warning and "likely to time out again" in warning and "one case alone" in warning
     assert "merged report fail" in warning
     assert "params set --module snmp --eva-shards 1 --eva-timeout" in warning
     assert "\n" not in warning
+    # The command the warning suggests is one the CLI takes.
+    assert (
+        pm.main(
+            ["--run-dir", str(run), "params", "set", "--module", "snmp", "--eva-shards", "1", "--eva-timeout", "20000"]
+        )
+        == 0
+    )
 
 
-def test_a_plan_under_the_limit_carries_no_time_out_warning(tmp_path):
+def test_a_completed_run_over_the_limit_gets_no_time_out_claim(tmp_path):
+    # A completed 6963.6 s run with one dominant case: its slowest shard is over the planning limit
+    # (timeout / TUNING_SKIP_MARGIN) but not a lower bound, and a higher eva_timeout does give a new plan.
+    run = _sharded_run(tmp_path)
+    _single_run(run, 6963.6, ["eva_main;snmp_call_0 9000.0", "eva_main;snmp_call_1 10.0", "eva_main;snmp_call_2 10.0"])
+    _, res = _mk(run)
+    plan = json.loads((run / es.SHARD_DIR / "snmp" / "plan.json").read_text(encoding="utf-8"))
+    assert plan["basis"]["censored"] is False and plan["basis"]["predicted_over_limit"] is True
+    warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as" in w)
+    assert "over its planning limit" in warning and "lower bound" not in warning
+    assert "likely to time out" not in warning and "--eva-shards 1" not in warning
+    assert "params set --module snmp --eva-timeout <s>: the plan is made again" in warning
+
+
+def test_a_plan_under_the_limit_carries_no_limit_warning(tmp_path):
     run = _sharded_run(tmp_path, cases=8)
     _single_run(run, 9000.0, [f"eva_main;snmp_call_{k} 100.0" for k in range(8)])
     _, res = _mk(run)
     plan = json.loads((run / es.SHARD_DIR / "snmp" / "plan.json").read_text(encoding="utf-8"))
     assert plan["basis"]["censored"] is False and plan["basis"]["predicted_over_limit"] is False
     warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as" in w)
-    assert "predicted to time out" not in warning
+    assert "planning limit" not in warning
 
 
 def test_a_recorded_plan_without_the_new_fields_still_warns_when_over_the_limit(tmp_path):
     # A plan.json recorded before `censored` / `predicted_over_limit` (c-ares run-1) stays usable, and its
-    # prediction against its own limit still gives the warning, without claiming a lower bound.
+    # prediction against its own limit still gives the warning: it may be a lower bound, so it keeps the
+    # advice for a timed-out run, without naming the shard (no per-shard predictions recorded).
     run = _dominated_timeout_run(tmp_path)
     _mk(run)
     plan_path = run / es.SHARD_DIR / "snmp" / "plan.json"
@@ -273,7 +295,8 @@ def test_a_recorded_plan_without_the_new_fields_still_warns_when_over_the_limit(
     _, res = _mk(run)
     assert json.loads(plan_path.read_text(encoding="utf-8")) == plan  # kept, not replanned
     warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as 16 shards" in w)
-    assert "predicted to time out" in warning and "lower bound" not in warning
+    assert "over its planning limit" in warning and "does not record whether" in warning
+    assert "the slowest shard is predicted" in warning and "--eva-shards 1 --eva-timeout" in warning
 
 
 def test_make_plan_records_censoring_and_the_limit_verdict():
