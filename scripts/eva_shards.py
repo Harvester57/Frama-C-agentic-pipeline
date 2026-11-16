@@ -58,6 +58,13 @@ from framac_common import (  # noqa: E402
 SHARD_FORMAT = 1
 SHARD_DIR = "workspace/reports/eva-shards"
 EVA_SHARD_MACRO = "FRAMAC_EVA_SHARD"  # generate_harness.EVA_SHARD_MACRO
+# The reduced check run_eva_slice records when it retries a run that aborted on `assigns:missing` (a
+# recursive call without an ACSL assigns clause). Must equal the string run_eva_slice._eva_command
+# appends (a test checks it). It reacts to what a shard's cases reached, not to how the shard was
+# configured: a shard that finished without it never raised `assigns:missing` (an error by default), so
+# running it with the downgrade changes nothing. Shards may therefore differ in it alone, and the merged
+# report carries it when any shard does.
+RECURSION_REDUCED_CHECK = "-eva-warn-key assigns:missing=warning (recursive calls use kernel-inferred assigns)"
 # How many shards a module may run as. Fixed: k decides what each run analyses, so it never follows
 # the machine (a machine with fewer slots runs the same shards one after another).
 MAX_SHARDS = 16
@@ -482,7 +489,10 @@ def _bucket(row: dict) -> str:
 
 
 def identity_problem(shards: list[Shard]) -> str | None:
-    """Shards differ only in their cases: the same sources, entry, checks and assumptions."""
+    """
+    Shards differ only in their cases: the same sources, entry, checks and assumptions. The one reduced
+    check a shard may add on its own is RECURSION_REDUCED_CHECK (see there); merge() unions it.
+    """
     from eva_options import assumption_options
 
     def identity(s: Shard) -> tuple:
@@ -490,7 +500,7 @@ def identity_problem(shards: list[Shard]) -> str | None:
         return (
             r.get("main_fn"),
             tuple(sorted(r.get("sources") or [])),
-            tuple(sorted(r.get("reduced_checks") or [])),
+            tuple(sorted(c for c in (r.get("reduced_checks") or []) if c != RECURSION_REDUCED_CHECK)),
             tuple(sorted(assumption_options(r.get("eva_options") or {}).items())),
         )
 
@@ -919,6 +929,14 @@ def merge(
     fallbacks = [s.index for s in shards if s.run.report.get("timeout_fallback")]
     if fallbacks:
         report["timeout_fallback_shards"] = fallbacks
+    # The shards agree on every reduced check but the recursion retry (identity_problem); the module's
+    # result carries it when any shard needed it, so the ledger keeps the caveat.
+    report["reduced_checks"] = _union(s.run.report.get("reduced_checks") for s in shards)
+    report.pop("auto_recursion_fallback", None)
+    retried = [s.index for s in shards if s.run.report.get("auto_recursion_fallback")]
+    if retried:
+        report["auto_recursion_fallback"] = True
+        report["auto_recursion_fallback_shards"] = retried
     if flamegraph_out is not None and concat_flamegraphs(
         [Path(p) for s in shards if (p := s.run.report.get("flamegraph_file"))], flamegraph_out
     ):
