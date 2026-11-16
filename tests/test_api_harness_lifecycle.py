@@ -122,7 +122,12 @@ def test_plan_adds_one_lifecycle_case_per_uncovered_handle_type():
     dag, model = _dag_and_model(list(RECORDS))
     p = ah.plan(dag, model, "lib", "lib", 64, [], None, {}, _declared())
     kinds = [lay["kind"] for lay in p["layouts"]]
-    assert kinds == ["single"] * len(RECORDS) + ["lifecycle"]
+    # ctx_merge takes two handles of a struct the header only declares: two zeroed `struct ctx`
+    # objects would not compile, and who owns the handles after the merge is not known.
+    assert kinds == ["single"] * (len(RECORDS) - 1) + ["lifecycle"]
+    assert p["skipped"] == {
+        "lib.c#ctx_merge": f"{CTX}: the call takes 2 such handles and who owns them afterwards is not known"
+    }
     assert p["layouts"][-1]["methods"] == ["ctx_push", "ctx_reset", "ctx_sum"]
     # A recorded chain on the handle comes first but does not replace it: it passes the handle as a
     # zeroed buffer, never the constructor's result.
