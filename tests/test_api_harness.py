@@ -161,7 +161,9 @@ def test_a_translated_variadic_definition_is_skipped_as_variadic():
     dag = _dag({"a": _fn("a"), "scan": _fn("scan")}, ["a", "scan"])
     model = _model(a={"signature": "void(int)", "formals": _formals("value")}, scan=scan)
     p = ah.plan(dag, model, "lib", "lib", 64)
-    assert p["entries"] == ["a"] and p["skipped"] == {"scan": "variadic"}
+    # Without a call site of the target's own programs to copy (tests/test_variadic_calls.py), no case.
+    assert p["entries"] == ["a"] and p["skipped"] == {"scan": ah.NO_VARIADIC_SITE}
+    assert p["skipped"]["scan"].startswith("variadic")
     assert all("scan(" not in c for c in p["cases"])
     # A trace that calls it is not replayed either.
     trace = [{"fn": "scan", "addrs": {"0": "10"}}, {"fn": "scan", "addrs": {"0": "10"}}]

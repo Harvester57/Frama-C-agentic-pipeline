@@ -46,6 +46,7 @@ def test_every_schema_loads_with_the_minimal_interpreter():
         "harness_reach_dynamic",
         "seed_harvest",
         "seed_trace",
+        "variadic_calls",
     ):
         assert va.get_schema(name)["$comment"]
 

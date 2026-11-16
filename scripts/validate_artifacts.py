@@ -10,7 +10,7 @@ Subcommands:
   snapshot      <snapshot-manifest.json> [--run-dir DIR]
   agent-result  <result.json>
   dag | sidecar | build-check | reach-dynamic | seed-harvest | build-capture | phase0-model
-  | security-props  <artifact.json>    (Phase 0 artifacts, remediation R5)
+  | security-props | variadic-calls  <artifact.json>    (Phase 0 artifacts, remediation R5)
   traces        <traces.jsonl>
   run-dir       <run-dir>             (all present artifacts + cross-file consistency)
 
@@ -503,6 +503,10 @@ def validate_fuzz_assets(data: Any) -> Errors:
     return _schema_check("fuzz_assets", data)
 
 
+def validate_variadic_calls(data: Any) -> Errors:
+    return _schema_check("variadic_calls", data)
+
+
 def validate_dynamic_reach(data: Any) -> Errors:
     errors = _schema_check("harness_reach_dynamic", data)
     if errors:
@@ -628,6 +632,7 @@ PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
     (f"{REPORTS}/harness_reach_dynamic.json", validate_dynamic_reach),
     (f"{REPORTS}/seed_harvest.json", validate_seed_harvest),
     (f"{REPORTS}/fuzz_assets.json", validate_fuzz_assets),
+    (f"{REPORTS}/variadic_calls.json", validate_variadic_calls),
 )
 
 
@@ -669,6 +674,7 @@ PHASE0_COMMANDS: dict[str, Any] = {
     "reach-dynamic": validate_dynamic_reach,
     "seed-harvest": validate_seed_harvest,
     "fuzz-assets": validate_fuzz_assets,
+    "variadic-calls": validate_variadic_calls,
     "build-capture": validate_build_capture,
     "phase0-model": validate_phase0_model,
     "security-props": validate_security_props,

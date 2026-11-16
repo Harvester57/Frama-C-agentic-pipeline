@@ -91,6 +91,7 @@ known-first-party = [
     "trust",
     "unit_split",
     "validate_artifacts",
+    "variadic_calls",
     "workspace_overlay",
     "wp_scheduler",
 ]

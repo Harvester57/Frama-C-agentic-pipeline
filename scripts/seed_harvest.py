@@ -43,6 +43,11 @@ by case for a dispatch harness:
     variable assigned or copied from it, or a struct whose field is set to it (`in.ptr = fuzz_buf`),
     filled from the recorded string, buffer, or struct's `(ptr, len)` buffer.
 
+An API harness (`api_cases` in the sidecar) is laid out from those layouts instead. Its `variadic`
+cases call functions the recorder cannot wrap: their seeds come from the string literals the target's
+own call sites pass with the case's format (workspace/reports/variadic_calls.json, written by
+scripts/variadic_calls.py), also when nothing was recorded.
+
 Each recorded call of an API function a case passes the input to becomes one seed for that case; the
 data files become seeds for every case that passes the whole input as one buffer. Seeds larger than
 the harness's `max_input_size` are dropped. They go to workspace/seeds/<module>/ (replaced on each
@@ -1350,12 +1355,40 @@ def _init_args(lay: dict, call_args: list[dict], trace: list[dict] | None, at: l
     return out
 
 
-def layout_seeds(layouts: list[dict], calls: list[dict], traces: list[list[dict]]) -> dict[int, list[bytes]]:
+def variadic_call_args(layout: dict, variadic: dict[str, list[dict]] | None) -> list[dict]:
     """
-    Seeds per selector of an API harness: single cases from recorded calls, sequences from traces. A
-    case that initializes an object first takes that initializer's arguments from the trace call that
-    initialized the same object; a recorded call no trace holds pairs with the initializer's recorded
-    calls in turn (their inputs, a CBOR document for a decoder, are what the case decodes).
+    The recorded-argument form of the literal data the target's call sites pass to a `variadic`
+    case's function with that case's format (scripts/variadic_calls.py: the recorder cannot wrap a
+    variadic function, so its seeds come from the source): one `{param: [["s", 0, hex]]}` per
+    distinct set of string literals, whatever objects the call site passed after the format.
+    """
+    fn = (layout.get("calls") or [""])[0]
+    out: list[dict] = []
+    for case in (variadic or {}).get(fn) or []:
+        if not isinstance(case, dict) or case.get("format") != layout.get("format"):
+            continue
+        for data in case.get("data") or []:
+            if not isinstance(data, dict):
+                continue
+            args = {str(k): [["s", 0, v]] for k, v in data.items() if isinstance(v, str)}
+            if args and args not in out:
+                out.append(args)
+    return out
+
+
+def layout_seeds(
+    layouts: list[dict],
+    calls: list[dict],
+    traces: list[list[dict]],
+    variadic: dict[str, list[dict]] | None = None,
+) -> dict[int, list[bytes]]:
+    """
+    Seeds per selector of an API harness: single cases from recorded calls, sequences from traces,
+    `variadic` cases from the literal data of the target's call sites (`variadic`:
+    variadic_calls.load_cases). A case that initializes an object first takes that initializer's
+    arguments from the trace call that initialized the same object; a recorded call no trace holds
+    pairs with the initializer's recorded calls in turn (their inputs, a CBOR document for a
+    decoder, are what the case decodes).
     """
     by_fn: dict[str, list[dict]] = {}
     for rec in calls:
@@ -1363,7 +1396,12 @@ def layout_seeds(layouts: list[dict], calls: list[dict], traces: list[list[dict]
     out: dict[int, list[bytes]] = {}
     for lay in layouts:
         made: list[bytes] = []
-        if lay.get("kind") == "sequence":
+        if lay.get("kind") == "variadic":
+            for args in variadic_call_args(lay, variadic):
+                seed = layout_seed(lay, [args])
+                if seed is not None:
+                    made.append(seed)
+        elif lay.get("kind") == "sequence":
             want = list(lay.get("calls") or [])
             for trace in traces:
                 fns = [c.get("fn") for c in trace]
@@ -1429,14 +1467,20 @@ def load_traces(records: Path = RECORDS_DIR) -> list[list[dict]]:
     return out
 
 
-def write_layout_module(module: str, sidecar: dict, calls: list[dict], traces: list[list[dict]]) -> dict:
+def write_layout_module(
+    module: str,
+    sidecar: dict,
+    calls: list[dict],
+    traces: list[list[dict]],
+    variadic: dict[str, list[dict]] | None = None,
+) -> dict:
     """Seeds of an API harness from its sidecar's case layouts (`api_cases`)."""
     layouts = [lay for lay in sidecar.get("api_cases") or [] if isinstance(lay, dict) and "selector" in lay]
     max_size = int(sidecar.get("max_input_size") or 0) or 1 << 20
     seeds: dict[str, bytes] = {}
     too_large = 0
     per_case: dict[str, dict[str, Any]] = {}
-    for sel, made in sorted(layout_seeds(layouts, calls, traces).items()):
+    for sel, made in sorted(layout_seeds(layouts, calls, traces, variadic).items()):
         lay = next(lay for lay in layouts if int(lay["selector"]) == sel)
         per_case[str(sel)] = {"functions": list(lay.get("calls") or []), "kind": lay.get("kind"), "from_calls": 0}
         for s in made:
@@ -1610,6 +1654,10 @@ def write(modules: list[str]) -> dict:
         traces = load_traces()
         files_dir = RECORDS_DIR / "files"
         files = [p.read_bytes() for p in sorted(files_dir.glob("*"))] if files_dir.is_dir() else []
+        # The literal data of the variadic API's call sites (the recorder cannot wrap those functions).
+        from variadic_calls import load_cases
+
+        variadic = load_cases()
     except Exception as exc:  # noqa: BLE001 - recorded per module: seeds never stop the pipeline
         reason = f"cannot read {RECORDS_DIR.as_posix()}: {type(exc).__name__}: {exc}"
         out["error"] = reason
@@ -1628,12 +1676,17 @@ def write(modules: list[str]) -> dict:
                     f"no harness sidecar object and source ({sidecar_path.as_posix()}, {c_path.name})",
                 )
                 continue
-            if not calls and not files:
+            from_sites = any(
+                variadic_call_args(lay, variadic)
+                for lay in sidecar.get("api_cases") or []
+                if isinstance(lay, dict) and lay.get("kind") == "variadic"
+            )
+            if not calls and not files and not from_sites:
                 _clear_seeds(module)
                 done(module, "skipped", "no records (seed_harvest.py record has not run)", seeds=0)
                 continue
             if sidecar.get("api_cases"):
-                summary = write_layout_module(module, sidecar, calls, traces)
+                summary = write_layout_module(module, sidecar, calls, traces, variadic)
             else:
                 harness_c = c_path.read_text(encoding="utf-8", errors="replace")
                 summary = write_module(module, sidecar, harness_c, calls, files)

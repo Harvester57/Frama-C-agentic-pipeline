@@ -1,0 +1,80 @@
+{
+  "$comment": "Contract for workspace/reports/variadic_calls.json, written by scripts/variadic_calls.py run (and by api_harness.generate when the report is missing or was made from another model): the call sites of the model's variadic API entry points in the target's own programs (the sources of the build's executables: tests, examples), read from clang's AST without running anything. The format is the last fixed parameter, which must be `const char *`. A call site is usable when its format is a string literal and every argument after it is the address of a declared object or an array passed by name; `cases` groups the usable sites of a function by (format, varargs). Read by api_harness.py (one `variadic` dispatch case per case) and seed_harvest.py write (seeds from `data`). A status other than ok is a reason, never a failure of Phase 0: without call sites the function stays in the sidecar's `api_skipped`.",
+  "type": "object",
+  "definitions": {
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "vararg": {
+      "$comment": "The object behind one argument after the format: its type as declared at the call site, and how it is passed (`addr`: `&object`; `array`: the array by name).",
+      "type": "object",
+      "properties": {
+        "type": {"type": "string", "minLength": 1},
+        "pass": {"type": "string", "enum": ["addr", "array"]}
+      },
+      "required": ["type", "pass"],
+      "additionalProperties": false
+    },
+    "case": {
+      "$comment": "`format`: the literal's bytes as latin-1 text; `format_param`: its parameter index; `sites`: the call sites grouped here; `callers`: some of them as `source:function`; `data`: per distinct call site, the string literals among the other fixed arguments ({parameter index: hex of the bytes before the first NUL}).",
+      "type": "object",
+      "properties": {
+        "format": {"type": "string"},
+        "format_param": {"type": "integer", "minimum": 0},
+        "varargs": {"type": "array", "items": {"$ref": "#/definitions/vararg"}},
+        "sites": {"type": "integer", "minimum": 1},
+        "callers": {"$ref": "#/definitions/strings"},
+        "data": {"type": "array", "items": {"type": "object", "additionalProperties": {"type": "string"}}}
+      },
+      "required": ["format", "format_param", "varargs", "sites", "callers", "data"],
+      "additionalProperties": false
+    },
+    "skipped_site": {
+      "type": "object",
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "caller": {"type": ["string", "null"]},
+        "why": {"type": "string", "minLength": 1}
+      },
+      "required": ["source", "caller", "why"],
+      "additionalProperties": false
+    },
+    "function": {
+      "$comment": "`key`: the model's function id; `fixed`: its fixed parameters; `sites`: every call site found; `unusable`: those of them that are not usable (`skipped` lists the first ones with the reason).",
+      "type": "object",
+      "properties": {
+        "key": {"type": "string", "minLength": 1},
+        "fixed": {"type": "integer", "minimum": 0},
+        "sites": {"type": "integer", "minimum": 0},
+        "unusable": {"type": "integer", "minimum": 0},
+        "cases": {"type": "array", "items": {"$ref": "#/definitions/case"}},
+        "skipped": {"type": "array", "items": {"$ref": "#/definitions/skipped_site"}}
+      },
+      "required": ["key", "fixed", "sites", "unusable", "cases", "skipped"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["ok", "error", "no_model", "no_capture", "no_clang", "no_variadic_api"]},
+    "error": {"type": "string"},
+    "model_generated_at": {"$comment": "the `generated_at` of the model the functions came from: api_harness.generate harvests again when the model on disk has another", "type": ["string", "null"]},
+    "functions": {"type": "object", "additionalProperties": {"$ref": "#/definitions/function"}},
+    "sources": {
+      "$comment": "`scanned`: sources parsed (each names one of the functions); `library`: sources of library units, left out; `not_calling`: program sources that name none of the functions; `missing`: not in the work tree; `failed`: clang gave no AST; `over_cap`: left out by the cap on parsed sources.",
+      "type": "object",
+      "properties": {
+        "scanned": {"$ref": "#/definitions/strings"},
+        "library": {"type": "integer", "minimum": 0},
+        "not_calling": {"type": "integer", "minimum": 0},
+        "missing": {"$ref": "#/definitions/strings"},
+        "failed": {"type": "object", "additionalProperties": {"type": "string"}},
+        "over_cap": {"type": "integer", "minimum": 0}
+      },
+      "required": ["scanned", "library", "not_calling", "missing", "failed", "over_cap"],
+      "additionalProperties": false
+    },
+    "warnings": {"$ref": "#/definitions/strings"}
+  },
+  "required": ["schema_version", "generated_at", "status", "functions", "warnings"],
+  "additionalProperties": false
+}
