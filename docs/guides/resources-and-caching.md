@@ -101,14 +101,16 @@ The wrappers ([`../../wrappers/framac-docker.sh`](../../wrappers/framac-docker.s
 4. **Releases the lease** when the container exits.
    - When a gated lease releases and no tickets are waiting, the broker can grow running elastic container leases via `<engine> update` (`resources.py rebalance`); leases are never shrunk while running.
    - Ctrl-C and SIGTERM are forwarded as `docker kill`.
-   - If the holder process dies, its lease is kept while the labelled container is still running.
+   - If the holder process dies, its lease is kept while the labelled container is still running, so the pool stays correctly counted. Such a container is an orphan: nobody reads its output or waits for its exit code. This happens on Windows when an agent's shell timeout kills the wrapper's process tree (TerminateProcess runs no signal handler, so the container is never killed).
+   - Orphans are reaped. A reaping pass kills an orphan's container with `<engine> kill framac-<lease>` once `FRAMAC_ORPHAN_GRACE_S` seconds (default 60; `off` disables this) have passed since the first reaping pass that saw it orphaned, and retries every 30 s while it still runs. The grace counts from that first sighting, not from the holder's death, so a single `gc` with the default grace only starts the clock. A reaping pass is any `exec` lease request, the rebalance after a gated lease's release, `resources.py rebalance` or `resources.py gc`; `status` only looks. With no broker client running, an orphan waits for the next one (or a `gc`). The lease is dropped once `<engine> ps` no longer lists the container.
+   - A reaping pass only kills containers named after their own lease (`framac-<id>`, labelled `framac.lease=<id>`), and only when `<engine> ps` says it is running. When the engine cannot tell, the lease is kept and nothing is killed.
 
 While a request waits, the broker prints its queue position. Long phases are meant to run in the background, so a 10-minute foreground tool limit is never the bottleneck.
 
 ```text
 python3 scripts/resources.py status     # leases held and waiting requests
 python3 scripts/resources.py rebalance  # grow running elastic container leases when free pool allows
-python3 scripts/resources.py gc         # reclaim leases of dead holders whose containers are gone
+python3 scripts/resources.py gc         # reclaim dead holders' leases; kill orphaned containers seen past the grace
 ```
 
 **Pinning.**
@@ -183,6 +185,7 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR` | Set by the broker inside the container: how the shared store is mounted, and where | — |
 | `FRAMAC_PYTHON` | Host Python the wrappers use for the broker | first `python3` ≥ 3.10 (`py -3` on Windows) |
 | `FRAMAC_RESOURCES_VERBOSE` | `1` prints every lease, not only those that waited | off |
+| `FRAMAC_ORPHAN_GRACE_S` | Seconds a container may keep running after its `exec` client died before a reaping pass kills it; `off` keeps such containers running | 60 |
 | `FRAMAC_SCHEDULER` | `waves` restores wave-by-wave dispatch with barriers | continuous reactive sliding-window loop |
 | `FRAMAC_SELINUX_TARGET` | `relabel` or `disable` for the read-only target mount on SELinux hosts | required there |
 | `FRAMAC_ALLOW_UNENFORCED_LIMITS` | Allow target-executing classes without memory/pids limits | off |
