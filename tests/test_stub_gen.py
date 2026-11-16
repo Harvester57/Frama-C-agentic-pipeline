@@ -327,6 +327,48 @@ def test_ledger_records_active_stub_contracts(stub_run, run_dir):
     assert len([a for a in rte["assumptions"] if a["kind"] == "stub_contract"]) == 1
 
 
+@pytest.mark.unit
+def test_seed_records_active_stub_contracts(stub_run, run_dir):
+    """
+    The hand route of Phase 0 Step 5 runs `ledger.py seed` without `record-stub-contracts` (c-ares run-1:
+    5 filled contracts, 0 assumptions). The seed records them itself, with the stub-check status, and the
+    make route's `record-stub-contracts` after it changes nothing.
+    """
+    stub_run()
+    header = run_dir / "workspace/stubs/mylib/mylib.h"
+    block = stub_gen.split_blocks(header.read_text(encoding="utf-8"))["ml_hash"]
+    done = block.replace("#ifdef FC_STUB_DRAFT\n", "").replace("#endif\n", "")
+    done = "\n".join(line for line in done.splitlines() if "TODO(stub-author)" not in line) + "\n"
+    header.write_text(header.read_text(encoding="utf-8").replace(block, done), encoding="utf-8")
+    report = stub_run()
+    rec = report["headers"]["workspace/stubs/mylib/mylib.h"]
+    write_json(
+        run_dir / "workspace/reports/stub_check.json",
+        {
+            "headers": {
+                "workspace/stubs/mylib/mylib.h": {
+                    "digest": rec["digest"],
+                    "status": "passed",
+                    "dynamic": {"functions": {"ml_hash": {"status": "passed"}}},
+                }
+            }
+        },
+    )
+    out = seed(run_dir)
+    rte = units_by_id(run_dir)["src/snmp/ber.c#ber_decode_len::rte"]
+    assert [a["description"] for a in rte["assumptions"] if a["kind"] == "stub_contract"] == [
+        f"Overlay stub contract of ml_hash in workspace/stubs/mylib/mylib.h (sha256 {rec['digest'][:12]}, filled)"
+        " is assumed, not proven; stub-check: dynamic passed."
+    ]
+    assert out["stub_contracts"]["recorded"] >= 1
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+    before = (run_dir / "coverage-ledger.json").read_bytes()
+    assert L.main(["record-stub-contracts"]) == 0
+    assert (run_dir / "coverage-ledger.json").read_bytes() == before
+    seed(run_dir)
+    assert (run_dir / "coverage-ledger.json").read_bytes() == before
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 def test_overlay_contract_reaches_eva_in_the_image(tmp_path):
