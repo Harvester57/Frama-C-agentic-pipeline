@@ -222,6 +222,71 @@ def test_a_module_too_slow_to_tune_runs_as_shards_with_a_recorded_plan(tmp_path)
     assert shards_line in text2
 
 
+def _dominated_timeout_run(tmp_path: Path) -> Path:
+    # c-ares run-1 libcares_a__dnsrec: 19 cases, the base run hit the 7200 s limit, and ~95% of the
+    # flamegraph's samples sit under one case (ares_dns_parse).
+    run = _sharded_run(tmp_path, cases=19)
+    lines = [f"eva_main;snmp_call_{k} {9500.0 if k == 11 else 25.0}" for k in range(19)]
+    _single_run(run, 7200.3, lines, status="analysis_timeout")
+    return run
+
+
+def test_a_plan_predicted_over_the_limit_from_a_timed_out_run_says_so(tmp_path):
+    run = _dominated_timeout_run(tmp_path)
+    _, res = _mk(run)
+    plan = json.loads((run / es.SHARD_DIR / "snmp" / "plan.json").read_text(encoding="utf-8"))
+    assert plan["k"] == es.MAX_SHARDS and [11] in plan["shards"]
+    assert plan["predicted_makespan_s"] >= plan["basis"]["limit_s"]
+    # The plan records that its prediction is a lower bound and that it is predicted over the limit.
+    assert plan["basis"]["censored"] is True and plan["basis"]["predicted_over_limit"] is True
+    slowest = plan["shards"].index([11])
+    assert plan["predicted_shard_s"][slowest] == plan["predicted_makespan_s"]
+    warning = next(w for w in res["warnings"] if w.startswith("snmp: Eva sharding: eva-snmp runs as 16 shards"))
+    assert "predicted to time out" in warning and f"shard {slowest} (case [11])" in warning
+    assert "lower bound" in warning and "one case alone" in warning
+    assert "merged report fail" in warning
+    assert "params set --module snmp --eva-shards 1 --eva-timeout" in warning
+    assert "\n" not in warning
+
+
+def test_a_plan_under_the_limit_carries_no_time_out_warning(tmp_path):
+    run = _sharded_run(tmp_path, cases=8)
+    _single_run(run, 9000.0, [f"eva_main;snmp_call_{k} 100.0" for k in range(8)])
+    _, res = _mk(run)
+    plan = json.loads((run / es.SHARD_DIR / "snmp" / "plan.json").read_text(encoding="utf-8"))
+    assert plan["basis"]["censored"] is False and plan["basis"]["predicted_over_limit"] is False
+    warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as" in w)
+    assert "predicted to time out" not in warning
+
+
+def test_a_recorded_plan_without_the_new_fields_still_warns_when_over_the_limit(tmp_path):
+    # A plan.json recorded before `censored` / `predicted_over_limit` (c-ares run-1) stays usable, and its
+    # prediction against its own limit still gives the warning, without claiming a lower bound.
+    run = _dominated_timeout_run(tmp_path)
+    _mk(run)
+    plan_path = run / es.SHARD_DIR / "snmp" / "plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    for key in ("censored", "predicted_over_limit"):
+        plan["basis"].pop(key, None)
+    plan.pop("predicted_shard_s", None)
+    write_json(plan_path, plan)
+    _, res = _mk(run)
+    assert json.loads(plan_path.read_text(encoding="utf-8")) == plan  # kept, not replanned
+    warning = next(w for w in res["warnings"] if "Eva sharding: eva-snmp runs as 16 shards" in w)
+    assert "predicted to time out" in warning and "lower bound" not in warning
+
+
+def test_make_plan_records_censoring_and_the_limit_verdict():
+    over = es.make_plan(["f();", "g();"], None, 20_000.0, 5760.0, "dig", censored=True)
+    assert over["basis"]["censored"] is True and over["basis"]["predicted_over_limit"] is True
+    assert over["predicted_shard_s"] == [10_000.0, 10_000.0]
+    under = es.make_plan(["f();", "g();"], None, 9000.0, 5760.0, "dig")
+    assert under["basis"]["censored"] is False and under["basis"]["predicted_over_limit"] is False
+    assert es.over_limit_note(under, "m") is None
+    note = es.over_limit_note(over, "m")
+    assert note is not None and "lower bound" in note and "one case alone" in note
+
+
 def test_a_module_fast_enough_to_tune_is_not_sharded(tmp_path):
     run = _sharded_run(tmp_path)
     _single_run(run, 900.0, unknown_obligations_by_function={"parse": [{"directory": "w", "file": "a.c"}]})

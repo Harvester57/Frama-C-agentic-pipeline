@@ -75,7 +75,15 @@ from eva_options import (  # noqa: E402
     tuned_record_problem,
     tuning_skip_reason,
 )
-from eva_shards import MAX_SHARDS, SHARD_DIR, harness_shardable, make_plan, plan_problem, shard_cppflags  # noqa: E402
+from eva_shards import (  # noqa: E402
+    MAX_SHARDS,
+    SHARD_DIR,
+    harness_shardable,
+    make_plan,
+    over_limit_note,
+    plan_problem,
+    shard_cppflags,
+)
 from framac_common import (  # noqa: E402
     EVA_REPORT_MAX_BYTES,
     ArtifactError,
@@ -973,6 +981,7 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
         basis = _shard_basis(plan, mod.name)
         module_timeout = mod.params.get("eva_timeout")
         limit_s = (module_timeout or TRIAL_TIMEOUT_CEILING_S) / TUNING_SKIP_MARGIN
+        timed_out = False
         if basis is None:
             if not forced:
                 return
@@ -986,17 +995,19 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
                 return
             if timed_out:
                 total_s = max(total_s, limit_s * TUNING_SKIP_MARGIN)
-        record = make_plan(cases, flamegraph, total_s, limit_s, mod.settings_digest, forced, rel)
+        # A timed-out run's time and per-case costs are truncated: the prediction is a lower bound.
+        record = make_plan(cases, flamegraph, total_s, limit_s, mod.settings_digest, forced, rel, censored=timed_out)
         if record["k"] < 2:
             return
         atomic_write_json(plan_path, record)
     assert isinstance(record, dict)
     mod.shards = [list(s) for s in record["shards"]]
     predicted = record.get("predicted_makespan_s")
+    risk = over_limit_note(record, mod.name)
     mod.warnings.append(
         SHARD_WARNING_PREFIX + f"eva-{mod.name} runs as {len(mod.shards)} shards "
         f"({SHARD_DIR}/{mod.name}/plan.json, predicted {predicted} s for the slowest); the ladder does "
-        "not run per shard yet"
+        "not run per shard yet" + (f". Warning: {risk}" if risk else "")
     )
 
 
