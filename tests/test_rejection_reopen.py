@@ -454,6 +454,34 @@ def test_a_checked_harness_induced_rejection_speaks_for_its_harness_only(run_dir
     assert validate_run_dir(run_dir) == []
 
 
+def test_a_checked_toolchain_artifact_is_not_repaired_or_reopened(run_dir):
+    """c-ares run-1: E-ACSL false positives rejected as `toolchain_artifact` (crash_verifier_brief.md).
+
+    No harness repair (the unit is blocked, not planned), and a `checked` rejection is not reopened by
+    later reproducers, even through another harness: only `harness_induced` speaks for one harness.
+    """
+    _seed_run(run_dir)
+    _sidecar(run_dir)
+    _reject(run_dir, "toolchain_artifact", "checked")
+    unit = _unit(run_dir)
+    assert unit["status"] == "blocked"
+    assert unit["unresolved"][0].startswith("candidate_rejected (toolchain_artifact)")
+    _fuzz(run_dir, artifact="workspace/crashes/snmp/crash-other")
+    _sidecar(run_dir, source="int harness_repaired;\n", repair_attempts=1)
+    _fuzz(run_dir, artifact="workspace/crashes/snmp/crash-third")
+    cand = _cand(run_dir)
+    assert cand["status"] == "verified" and "reopened" not in cand
+    assert {e["reason"] for e in cand["contradicting_evidence"]} == {"checked_rejection"}
+    assert validate_run_dir(run_dir) == []
+
+
+def test_a_located_toolchain_artifact_is_reopened_by_a_new_reproducer(run_dir):
+    _seed_run(run_dir)
+    _reject(run_dir, "toolchain_artifact", "located")
+    assert _fuzz(run_dir, artifact="workspace/crashes/snmp/crash-other")["reopened"] == 1
+    assert _cand(run_dir)["reopened"][0]["rejection_class"] == "toolchain_artifact"
+
+
 # ------------------------------------------------------------------ A/B switch
 
 

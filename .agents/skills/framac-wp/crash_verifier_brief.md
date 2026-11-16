@@ -15,7 +15,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 ## Strict Rules
 
 1. **Write Isolation:** Never modify `workspace/work/`, `workspace/harnesses/`, `workspace/corpus/`, `workspace/crashes/`, `candidates.json`, `findings.json`, or `coverage-ledger.json`. Write all temporary binaries, minimized inputs, notes, and optional remediation `.fix.patch` files strictly under `agents/{agent_id}/scratch/`. The only exception is the report `decision_point_check.py` writes itself under `workspace/reports/decision_point/`; never write or edit a file there by hand.
-2. **Never Confirm Without a Reproducible Witness:** A `confirmed` verdict requires at least one concrete input that triggers an E-ACSL failure through the module harness (`reproducible: true`), with the fault located in target C code and the harness respecting the entry function's declared or documented contract (`contract_respected: true`).
+2. **Never Confirm Without a Reproducible Witness:** A `confirmed` verdict requires at least one concrete input that triggers an E-ACSL failure through the module harness (`reproducible: true`), with the fault located in target C code and the harness respecting the entry function's declared or documented contract (`contract_respected: true`). A witness that reproduces is not enough on its own: the checking tool can be wrong (see "Toolchain Artifacts" below).
 3. **Severity Anchors & Cap (`confirmed` only):**
    - `reachability` comes from `workspace/harnesses/harness_{module_name}.json` (`untrusted_surface` or `internal_api`).
    - If `reachability == "internal_api"`, `severity` is capped at `medium` (`medium` or `low` only).
@@ -52,9 +52,12 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
    - An `initialization` failure on memory written outside instrumented code is not a target defect. Two cases:
      - Target code read libFuzzer's `data` instead of the harness copy `fuzz_buf`: reject it as `harness_induced`.
      - Source review shows an external-library or `read`/`recv` call initialized the bytes: reject it as `disproved_by_source`.
-   - The test is the decision point (step 3): if it is a `harness_choice` that no legitimate caller could make, the candidate is harness-induced.
+   - The test is the decision point (step 4): if it is a `harness_choice` that no legitimate caller could make, the candidate is harness-induced.
    - **If harness-induced:** return `decision: "rejected"` with `rejection_class: "harness_induced"` and explain the exact change needed in `harness_{module_name}.c` in `record.reason` so the parent orchestrator can repair the harness and re-fuzz.
-3. **Trace Root Cause in Target Code:**
+3. **Check That the Tool Is Right:**
+   - Read the failing statement and the values the replay prints. If the property holds there for this input (the pointer is inside a live object that large, the bytes were written, the argument has a type the format accepts), the failure comes from the checking tool, not from the target.
+   - Then reject it as `toolchain_artifact`, with the evidence "Toolchain Artifacts" below requires. Do not reject it as `harness_induced`: the harness is correct, a repair changes nothing, and the same failure comes back.
+4. **Trace Root Cause in Target Code:**
    - If the harness call is legitimate (`contract_respected: true`) and the fault is in target C code:
      - Construct `record.trace` starting with an `entrypoint` step, zero or more `propagation` steps, and ending with a `sink` step at the failing line.
      - Name the **decision point** in `record.decision_point` (see "Decision Point" below): where the failure became inevitable and who controlled it.
@@ -67,7 +70,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 
 1. **Static Source Review:**
    - Trace the control-flow and data-flow path from `entry_fn` in `harness_{module_name}.c` to `location.file:location.line`.
-   - If the alarm or hypothesis is unreachable due to prior sanitization/bounds checks, dead code, or an overly strict ACSL contract: return `decision: "rejected"` with `rejection_class` set to `"disproved_by_source"`, `"dead_code"`, or `"contract_overconstraint"`, and state `refutation_basis` (see "Rejection Basis" below).
+   - If the alarm or hypothesis is unreachable due to prior sanitization/bounds checks, dead code, or an overly strict ACSL contract: return `decision: "rejected"` with `rejection_class` set to `"disproved_by_source"`, `"dead_code"`, or `"contract_overconstraint"`, and state `refutation_basis` (see "Rejection Basis" below). If the path is feasible and the property holds on it, but a tool defect raises the alarm, the class is `"toolchain_artifact"` (see "Toolchain Artifacts" below).
    - If the path is feasible, name the **decision point** on it (see "Decision Point" below) and put it in `record.decision_point` of the `confirmed` or `needs_validation` record. If it is a `harness_choice` that no legitimate caller could make, reject the candidate as `harness_induced`.
 2. **Targeted Reproduction Attempt (Up to 20s):**
    - If the path appears feasible from `LLVMFuzzerTestOneInput`, write 1–3 targeted seed files into `agents/{agent_id}/scratch/seeds/` and run a short sandboxed E-ACSL campaign:
@@ -124,15 +127,58 @@ Rules:
 3. If the decision point you checked is controlled by `harness_choice` (the patch guards the target against an argument or state that only the harness sets, and no legitimate caller could set), the candidate is `harness_induced`. Return `rejected` with `rejection_class: "harness_induced"`, `refutation_basis: "checked"`, and the report in `record.evidence`.
 4. The check changes no verdict by itself and no severity. Use its patch as a starting point for `remediation.fix_patch` only if it is a correct fix.
 
+### Rejection Classes (`rejected`)
+
+Choose `record.rejection_class` by what would have to change for the failure to go away:
+
+- `"harness_induced"`: the harness. It breaks the entry function's contract (a `harness_choice` no legitimate caller could make, or target code reading libFuzzer's `data`). The parent repairs the harness and fuzzes the module again, so `record.reason` must say what to change.
+- `"disproved_by_source"`: nothing. A check in the target excludes the failure (a bounds check, a sanitization, an external call that initialized the bytes).
+- `"dead_code"`: nothing. The sink cannot execute.
+- `"contract_overconstraint"`: an ACSL contract, not the code. The failing clause demands more than the function's callers need or its documentation states.
+- `"toolchain_artifact"`: the checking tool. The target and the harness are both correct, and the tool itself produces the failure: E-ACSL's instrumentation or runtime, a sanitizer runtime, or the compiler or linker under the instrumented build. See "Toolchain Artifacts" below.
+- `"duplicate"`: nothing new. Another verified record already covers the same defect under a different fingerprint. Name that fingerprint in `record.reason`. A duplicate does not count as an opposite verdict at its sink. When the fingerprint is merely wrong, refingerprint instead (see "Refingerprinting, Merging, and Splitting").
+- `"other"`: none of the above fits. This is the last resort: say in `record.reason` why no other class applies.
+
+Only `harness_induced` makes the parent change anything (a harness repair, up to 2 per module). Every other class leaves the target and the harness as they are.
+
+### Toolchain Artifacts (`toolchain_artifact`)
+
+A failure that reproduces is not yet a defect of the target. E-ACSL's instrumentation and runtime have false positives, and so do sanitizers, rarely. The pipeline works around the ones it knows (`{references_dir}/e-acsl-quickref.md`, "Limitations that change verdicts" and "Verified in the pipeline container"). Reject a candidate as `toolchain_artifact` only when all three of these hold:
+
+1. **The source is correct at the sink.** Cite the lines showing that the property holds there for the reproducer.
+2. **A fact about the toolchain contradicts the alarm's premise.** Name it, for example:
+   - how the compiler or linker lays out the object (string literals stored inside one another);
+   - how C converts the argument (an `unsigned char` passed through `...` arrives as an `int`);
+   - what the instrumented code registers or marks initialized. It is next to the module's binary, usually `workspace/harnesses/fuzz_{module_name}.instrumented.c`;
+   - a limitation listed in `e-acsl-quickref.md`.
+3. **A tool output shows it.** Accept one of these:
+   - **An independent checker that covers this alarm kind replays the same reproducer clean.** For the ASan+UBSan build of the module, run:
+     ```text
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module_name} --engine sanitizers --sources {module_sources} workspace/harnesses/harness_{module_name}.c --out-bin agents/{agent_id}/scratch/san_{module_name} --cppflags='{cppflags}' --ldflags='{ldflags}' --inputs <reproducer files> --out-json agents/{agent_id}/scratch/san_replay_{module_name}.json
+     ```
+     ASan covers accesses outside any object and use after free. UBSan covers signed overflow, shifts and division. Neither checks initialization, bounds inside one object, ACSL contracts or format strings, so for those kinds a clean sanitizer replay refutes nothing.
+   - **A standalone program shows the defect.** Write a few lines in your scratch directory, with no target code, on which the same tool raises the same kind of alarm although the code is correct.
+   - **The instrumented source shows the defect**, for example a block registered with `__e_acsl_store_block` that is never marked initialized.
+
+Rebuilding without the check (`--no-libc-checks`, `--no-rte-initialized`) only removes the checker, so it is not evidence.
+
+With such an output cited in `record.evidence`, state `refutation_basis: "checked"`. Without one, the basis is at most `located`, and a later reproducer at the same sink reopens the rejection. A `checked` rejection holds against every later reproducer of this fingerprint, so it must hold for the predicate, not only for your input. For `\valid_read(charset + j)`, for example, show that every `j` the loop reaches lies inside the string.
+
+In `record.reason`, name the tool, the alarm kind, the toolchain fact and the path of the standalone program if you wrote one. The parent records the defect for the pipeline maintainers and for an upstream report. Nothing in the target or the harness changes.
+
+Examples from c-ares run-1 (both are E-ACSL defects):
+- `\valid_read(charset + j)` in `ares_buf_consume_until_charset` failed at `j == 1` on the literal `","`. Clang and GNU ld store a literal that ends another one inside it (`","` inside `" ,"`). E-ACSL with full memory tracking registers each literal as its own block, so a read that is in bounds fails.
+- In `inet_ntop4`, `--validate-format-strings` rejected `%u` for an `unsigned char` argument. The call promotes it to `int`, which `%u` accepts for a value that is not negative.
+
 ### Rejection Basis (`rejected`)
 
 State in `record.refutation_basis` what the rejection rests on, on every rejection:
 
-- `checked`: a tool output cited in `record.evidence` refutes the candidate (WP or an Eva rung proves the property, Eva reports the statement Dead, a repaired harness no longer fails).
+- `checked`: a tool output cited in `record.evidence` refutes the candidate (WP or an Eva rung proves the property, Eva reports the statement Dead, a repaired harness no longer fails, a sanitizer replay or a standalone program shows a toolchain artifact).
 - `located`: you cite the file and line of the check or dead branch in `record.reason`, with no tool output.
 - `model`: reasoning only.
 
-`disproved_by_source` and `dead_code` need at least `located`. Never state a basis stronger than what you cite. For `dead_code`, the parent compares the claim with the module's Eva report and Phase 1 coverage and raises the basis to `checked` when they agree.
+`disproved_by_source` and `dead_code` need at least `located`. `toolchain_artifact` needs at least `located` and should be `checked` (see "Toolchain Artifacts"). Never state a basis stronger than what you cite. For `dead_code`, the parent compares the claim with the module's Eva report and Phase 1 coverage and raises the basis to `checked` when they agree.
 
 The basis decides what happens later. When a tool reproduces a failure at the same sink after your rejection (a breaker crash, a guardrail `code_fault`, a new fuzz reproducer), a rejection that is not `checked` is reopened and verified again. A `checked` rejection stays, and the report counts the contradiction. If the candidate record has a `reopened` entry, an earlier rejection was contradicted by the evidence named there: replay that artifact first, and do not repeat the earlier reason without a tool output that refutes it.
 
@@ -143,7 +189,7 @@ A `reopened` entry whose evidence `source` is `sibling_verdict` means another ve
 When the meaning of an alarm decides the verdict and neither this brief nor the tool output settles it, grep the greppable Frama-C manuals under `{references_dir}`. Grep `INDEX.md` for the topic and Read only the reported line range; never read a manual whole. Useful sections:
 - RTE manual `rte/frama-c-rte-manual.md`: the condition behind each `rte` alarm kind §2, undefined behaviours RTE does not cover §2.8.
 - Eva manual `eva/frama-c-eva-manual.md`: what Eva checks §3.2, its log messages and statuses §3.3.
-- `e-acsl-quickref.md`, which summarizes the E-ACSL plug-in manual `eacsl/e-acsl-manual.md`. It covers runtime errors inside annotations (§2.3.1) and the known limitations (§3). E-ACSL misses violations that depend on undefined functions, recursion or function pointers (§3.3.2–3.6), so a failed reproduction attempt does not show the alarm is spurious. Fuzz binaries are built with full memory tracking and a runtime init hook, because harnesses have no `main` (§3.3.1). If a replay crashes inside the E-ACSL runtime (`shadow_alloca`, `e_acsl_segment_tracking.c`), suspect the toolchain rather than the target: rerun `run_eacsl_fuzz.py selftest`.
+- `e-acsl-quickref.md`, which summarizes the E-ACSL plug-in manual `eacsl/e-acsl-manual.md`. It covers runtime errors inside annotations (§2.3.1) and the known limitations (§3). E-ACSL misses violations that depend on undefined functions, recursion or function pointers (§3.3.2–3.6), so a failed reproduction attempt does not show the alarm is spurious. Fuzz binaries are built with full memory tracking and a runtime init hook, because harnesses have no `main` (§3.3.1). If a replay crashes inside the E-ACSL runtime (`shadow_alloca`, `e_acsl_segment_tracking.c`), suspect the toolchain rather than the target: rerun `run_eacsl_fuzz.py selftest`. A false alarm in correct code is a `toolchain_artifact` (see "Toolchain Artifacts").
 
 ---
 
