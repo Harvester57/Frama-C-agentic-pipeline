@@ -765,8 +765,9 @@ def gate_reasons(run_dir: Path, module: str | None) -> list[str]:
             rec = (data.get("headers") or {}).get(h) or {}
             why = "; ".join(rec.get("reasons") or [])[:400]
             # The logs' directory survives the cut above, which can drop a reason's own "(see ...)".
-            logs = ((rec.get("artifacts") or {}) if isinstance(rec.get("artifacts"), dict) else {}).get("dir")
-            where = f"; logs and generated programs in {logs}/" if logs else ""
+            art = rec.get("artifacts")
+            art = art if isinstance(art, dict) else {}
+            where = f"; logs and generated programs in {art['dir']}/" if art.get("dir") and art.get("files") else ""
             reasons.append(
                 f"stub-check failed for {h} ({why}{where}), which module {mod} depends on: fix the header, then run "
                 "`pipeline_make.py run stubs stub-check`"
