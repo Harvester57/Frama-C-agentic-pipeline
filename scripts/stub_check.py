@@ -27,11 +27,19 @@ Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md ste
            the generated arguments do not meet it (`driver_rejected`), a crash or a link failure leaves
            the check `inconclusive`.
 
-A header fails when its ABI check fails, Frama-C cannot parse it, or a contract is `violated`. A failed
+A header fails when its ABI check fails, Frama-C cannot parse it or Eva aborts on it (a deferred error such
+as `assigns:missing`, a location other than \\result without `\\from`, which Phase 2 Eva aborts on too), the
+E-ACSL build fails on an annotation of the header itself (`annot-error`, which every fuzz build including
+it would hit), or a contract is `violated`. A failed
 header blocks every module whose DAG `external_callees` name one of its functions (with the module's
 lexer modules and sub-modules): workspace/reports/stub_check.json lists them under `blocked_modules`, and
 phase0_gates.py refuses those modules until a stub-check of the unchanged header passes. Eva warnings
 (`too_weak`, `valid_call_alarm`) and inconclusive dynamic checks are reported, never blocking.
+
+Each checked header leaves its generated programs and tool logs (each starting with its command line) in
+workspace/reports/stub_check/<include with / as __>/ (abi.log, fc_stub_smoke.c, eva.log, fc_stub_driver.c,
+eacsl_instrument.log, eacsl_build.log, run<N>.log): the header's `artifacts` and each check's `log` name
+them, and a failure's reason is the tool's most fatal message followed by `(see <log>)`.
 
 `shipped` runs the ABI check on the pipeline's own templates/fc_stubs (whole-header replacements): one
 translation unit per stub that includes the real system header, then the stub's prototypes; and, per
@@ -97,6 +105,17 @@ TOOL_TIMEOUT_S = 600
 RUN_TIMEOUT_S = 60
 SMOKE = "fc_stub_smoke.c"
 DRIVER = "fc_stub_driver.c"
+ABI_SRC = "fc_stub_abi.c"
+ABI_LOG = "abi.log"
+EVA_LOG = "eva.log"
+EVA_CSV = "fc_stub_smoke_report.csv"
+INSTRUMENT_LOG = "eacsl_instrument.log"
+BUILD_LOG = "eacsl_build.log"
+# What each header's check leaves for the agent to read (`stub_check.py run`, under ARTIFACTS_DIR/<slug>/):
+# the generated programs, every tool's log (its command line first) and one log per dynamic run.
+ARTIFACT_NAMES = (ABI_SRC, ABI_LOG, SMOKE, EVA_LOG, EVA_CSV, DRIVER, INSTRUMENT_LOG, BUILD_LOG)
+ARTIFACT_GLOBS = ("run*.log",)
+ARTIFACTS_DIR = "stub_check"  # next to stub_check.json: workspace/reports/stub_check/<slug>/
 
 _WARNING_RE = re.compile(
     # The column and the `, behavior <name>` part are optional: without them here, a location printed as
@@ -311,11 +330,44 @@ def _run(cmd: list[str], cwd: Path, timeout: int = TOOL_TIMEOUT_S, env: dict | N
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-def _first_error(log: str) -> str:
+# How fatal a tool's message is, most fatal first. Frama-C prints `[plugin:key] file:line: User Error:` and the
+# text on the indented lines after it; a warning promoted to an error is repeated at the end as `Deferred
+# error`. `\berror\b` leaves out cpp's `warning: "__errordecl" redefined`, which merely contains "error".
+_FATAL_TIERS = (
+    re.compile(r"User Error|\bFailure\b|[Ff]atal error|Deferred error|^\[kernel[^\]]*\].*\bError\b"),
+    re.compile(r"\berror:"),
+    re.compile(r"\baborted\b"),
+    re.compile(r"\berror\b", re.IGNORECASE),
+)
+_MESSAGE_MAX = 500
+
+
+def _messages(log: str) -> list[str]:
+    """A log's messages: each line, with the indented lines after a Frama-C `[...]` line joined to it."""
+    out: list[str] = []
+    framac = False
     for line in log.splitlines():
-        if "error" in line.lower():
-            return line.strip()[:500]
-    return log.strip().splitlines()[-1][:500] if log.strip() else ""
+        if framac and out and line[:1] in (" ", "\t") and line.strip():
+            out[-1] = f"{out[-1]} {line.strip()}"
+            continue
+        framac = line.startswith("[")
+        if line.strip():
+            out.append(line.strip())
+    return out
+
+
+def _first_error(log: str) -> str:
+    """The most fatal message of a tool's log (with its continuation lines), else its last line."""
+    msgs = _messages(log)
+    for tier in _FATAL_TIERS:
+        for msg in msgs:
+            if tier.search(msg):
+                return msg[:_MESSAGE_MAX]
+    return msgs[-1][:_MESSAGE_MAX] if msgs else ""
+
+
+def _with_log(reason: str, log: Path | str | None) -> str:
+    return f"{reason} (see {Path(log).as_posix()})" if log else reason
 
 
 def system_include_flags(capture: dict) -> list[str]:
@@ -327,22 +379,24 @@ def system_include_flags(capture: dict) -> list[str]:
 
 
 def check_abi(include: str, overlay: Path, sys_flags: list[str], work: Path) -> dict:
-    src = work / "fc_stub_abi.c"
+    src = work / ABI_SRC
     src.write_text(f"#include <{include}>\n", encoding="utf-8")
     cmd = ["gcc", "-fsyntax-only", "-DFC_STUB_DRAFT", f"-I{overlay.as_posix()}", *sys_flags, src.name]
     rc, log = _run(cmd, work)
+    (work / ABI_LOG).write_text(f"$ {shlex.join(cmd)}\n{log}", encoding="utf-8")
     if rc == 0:
-        return {"status": "passed"}
+        return {"status": "passed", "log": ABI_LOG}
     if "No such file or directory" in log and include in log and "include_next" in log:
-        return {"status": "error", "reason": f"the real <{include}> is not on the include path: {_first_error(log)}"}
-    return {"status": "failed", "reason": _first_error(log), "command": shlex.join(cmd)}
+        reason = f"the real <{include}> is not on the include path: {_first_error(log)}"
+        return {"status": "error", "reason": reason, "log": ABI_LOG}
+    return {"status": "failed", "reason": _first_error(log), "command": shlex.join(cmd), "log": ABI_LOG}
 
 
 def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
     """{status, functions: {name: {status, alarms}}}: `error` when Frama-C cannot parse the program."""
     text, lines_of = smoke_source(include, sigs)
     (work / SMOKE).write_text(text, encoding="utf-8")
-    csv_path = work / "fc_stub_smoke_report.csv"
+    csv_path = work / EVA_CSV
     cmd = [
         "frama-c",
         "-no-unicode",
@@ -360,11 +414,13 @@ def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
         str(csv_path),
     ]
     rc, log = _run(cmd, work)
-    (work / "eva.log").write_text(log, encoding="utf-8")
+    (work / EVA_LOG).write_text(f"$ {shlex.join(cmd)}\n{log}", encoding="utf-8")
+    # Eva prints its results before it aborts on a deferred error (a warning key set to error, e.g.
+    # `assigns:missing`): a non-zero exit is an error even with VALUES COMPUTED in the log.
     if rc != 0 or ("[eva] done" not in log and "====== VALUES COMPUTED ======" not in log):
-        return {"status": "error", "reason": _first_error(log) or f"frama-c exited {rc}"}
+        return {"status": "error", "reason": _first_error(log) or f"frama-c exited {rc}", "log": EVA_LOG}
     if not csv_path.is_file():
-        return {"status": "error", "reason": f"no Eva report CSV produced in {work}"}
+        return {"status": "error", "reason": "no Eva report CSV produced", "log": EVA_LOG}
 
     alarms: dict[tuple[str, str], list[str]] = {}
     for row in read_report_csv(csv_path):
@@ -419,7 +475,7 @@ def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
             rec["short_call_alarms"] = short_alarms
             rec["status"] = "valid_call_alarm" if ok_alarms else ("passed" if short_alarms else "too_weak")
         functions[fn] = rec
-    return {"status": "ok", "functions": functions}
+    return {"status": "ok", "functions": functions, "log": EVA_LOG}
 
 
 def build_driver(work: Path, ldflags: str) -> dict:
@@ -447,8 +503,9 @@ def build_driver(work: Path, ldflags: str) -> dict:
     cmd1 = ["e-acsl-gcc", "-n", "--no-constfold", "-G", "clang", "-F", fc_flags, "-E", flags["frontend"]]
     cmd1 += ["-o", str(instrumented), DRIVER]
     rc, log = _run(cmd1, work)
+    (work / INSTRUMENT_LOG).write_text(f"$ {shlex.join(cmd1)}\n{log}", encoding="utf-8")
     if rc != 0 or not instrumented.is_file():
-        return {"status": "build_failed", "reason": _first_error(log) or f"e-acsl-gcc exited {rc}"}
+        return {"status": "build_failed", "reason": _first_error(log) or f"e-acsl-gcc exited {rc}", "log": INSTRUMENT_LOG}
     text = instrumented.read_text(encoding="utf-8", errors="replace")
     for repair in (rewrite_trailing_alignas, mark_wrapper_results_initialized, mark_formals_initialized):
         text, _ = repair(text)
@@ -458,7 +515,7 @@ def build_driver(work: Path, ldflags: str) -> dict:
     try:
         link = normalize_passthrough(" ".join(x for x in (ldflags, target_env.with_link_flags("")) if x.strip()))
     except UnsafePassthroughError as exc:
-        return {"status": "build_failed", "reason": str(exc)}
+        return {"status": "build_failed", "reason": str(exc), "log": INSTRUMENT_LOG}
     cmd2 = ["e-acsl-gcc", "-C", "-G", "clang", "-O", str(out_bin)]
     if flags["backend"]:
         cmd2 += ["-e", flags["backend"]]
@@ -466,10 +523,11 @@ def build_driver(work: Path, ldflags: str) -> dict:
         cmd2 += ["-l", link.strip()]
     cmd2.append(str(instrumented))
     rc, log = _run(cmd2, work)
+    (work / BUILD_LOG).write_text(f"$ {shlex.join(cmd2)}\n{log}", encoding="utf-8")
     if rc != 0:
         status = "no_library" if "undefined reference" in log else "build_failed"
-        return {"status": status, "reason": _first_error(log) or f"e-acsl-gcc exited {rc}"}
-    return {"status": "built", "binary": str(select_eacsl_binary(out_bin))}
+        return {"status": status, "reason": _first_error(log) or f"e-acsl-gcc exited {rc}", "log": BUILD_LOG}
+    return {"status": "built", "binary": str(select_eacsl_binary(out_bin)), "log": BUILD_LOG}
 
 
 def check_dynamic(include: str, sigs: list[dict], ldflags: str, trials: int, work: Path) -> dict:
@@ -491,8 +549,11 @@ def check_dynamic(include: str, sigs: list[dict], ldflags: str, trials: int, wor
                 limits=Limits(cpu_seconds=RUN_TIMEOUT_S * 2),
             )
         except SandboxUnavailable as exc:
-            return {"status": "sandbox_unavailable", "reason": str(exc)}
+            return {"status": "sandbox_unavailable", "reason": str(exc), "log": BUILD_LOG}
         out = res.stdout + "\n" + res.stderr
+        (work / f"run{idx}.log").write_text(
+            f"$ {binary.name} {idx}  # {sig['name']}, exit {res.returncode}\n{out}", encoding="utf-8"
+        )
         fail = _EACSL_FAIL_RE.search(out)
         if res.returncode == 0 and not fail:
             functions[sig["name"]] = {"status": "passed", "trials": trials}
@@ -509,7 +570,10 @@ def check_dynamic(include: str, sigs: list[dict], ldflags: str, trials: int, wor
                 "reason": "timeout" if res.timed_out else f"exit {res.returncode}",
                 "output_tail": out[-800:],
             }
-    return {"status": "ok", "functions": functions, "ldflags": ldflags}
+    for idx, sig in enumerate(sigs):
+        if sig["name"] in functions:
+            functions[sig["name"]]["log"] = f"run{idx}.log"
+    return {"status": "ok", "functions": functions, "ldflags": ldflags, "log": BUILD_LOG}
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +621,52 @@ def module_ldflags(dag: dict, functions: list[str]) -> list[str]:
     return list(dict.fromkeys(opts))
 
 
+def artifact_slug(include: str) -> str:
+    """The directory name of a header's artifacts: `sys/epoll.h` -> `sys__epoll.h`."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", include.strip("/").replace("/", "__")) or "header"
+
+
+def persist_artifacts(work: Path, dest: Path) -> dict:
+    """
+    Copy the check's programs and logs from the scratch directory `work` to `dest` (emptied first: what
+    it held was a previous check of the same header). {dir, files}, paths as the report names them.
+    """
+    if dest.is_dir():
+        shutil.rmtree(dest, ignore_errors=True)
+    names = [n for n in ARTIFACT_NAMES if (work / n).is_file()]
+    names += sorted({p.name for g in ARTIFACT_GLOBS for p in work.glob(g) if p.is_file()})
+    copied: list[str] = []
+    for name in names:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(work / name, dest / name)
+        except OSError:
+            continue
+        copied.append(name)
+    return {"dir": dest.as_posix(), "files": copied}
+
+
+def header_annot_error(dynamic: dict, header: str) -> bool:
+    """
+    Whether the E-ACSL build failed on an annotation of `header` itself (`[kernel:annot-error] <header>:N:
+    Failure: unbound logic variable __fc_errno`): every fuzz build including the header aborts the same way.
+    """
+    reason = str(dynamic.get("reason") or "")
+    return dynamic.get("status") == "build_failed" and "annot-error" in reason and Path(header).as_posix() in reason
+
+
+def _point_logs_at(res: dict, dest: Path) -> None:
+    """Rewrite each check's `log` (a file name in the scratch directory) to its persisted path."""
+    for key in ("abi", "eva", "dynamic"):
+        check = res.get(key)
+        if not isinstance(check, dict):
+            continue
+        records = [check, *((check.get("functions") or {}).values())]
+        for r in records:
+            if isinstance(r, dict) and r.get("log"):
+                r["log"] = (dest / str(r["log"])).as_posix()
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     report = load_json_optional(args.report, None)
     if not isinstance(report, dict):
@@ -570,6 +680,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     sys_flags = system_include_flags(capture if isinstance(capture, dict) else {})
     headers = report.get("headers") or {}
     wanted = args.header or sorted(headers)
+    artifacts_root = Path(args.out).parent / ARTIFACTS_DIR
     results: dict[str, dict] = {}
     failed: dict[str, list[str]] = {}
     for header in wanted:
@@ -583,22 +694,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         sigs, skipped = _signatures(rec, model if isinstance(model, dict) else {})
         res: dict[str, Any] = {"digest": digest, "include_name": include, "not_callable": skipped}
         reasons: list[str] = list(rec.get("problems") or [])
+        dest = artifacts_root / artifact_slug(include)
         with tempfile.TemporaryDirectory(prefix="stub-check-") as tmp:
             work = Path(tmp)
-            if "abi" in checks:
-                res["abi"] = check_abi(include, overlay, sys_flags, work)
-                if res["abi"]["status"] == "failed":
-                    reasons.append(f"ABI: {res['abi']['reason']}")
-            if "eva" in checks and sigs:
-                res["eva"] = check_eva(include, sigs, work)
-                if res["eva"]["status"] == "error":
-                    reasons.append(f"Frama-C: {res['eva']['reason']}")
-            if "dynamic" in checks and sigs:
-                ld = " ".join([*module_ldflags(dag, [s["name"] for s in sigs]), args.ldflags or ""]).strip()
-                res["dynamic"] = check_dynamic(include, sigs, ld, args.trials, work)
-                for fn, f in (res["dynamic"].get("functions") or {}).items():
-                    if f["status"] == "violated":
-                        reasons.append(f"{fn}: postcondition failed against the real library")
+            try:
+                if "abi" in checks:
+                    res["abi"] = check_abi(include, overlay, sys_flags, work)
+                if "eva" in checks and sigs:
+                    res["eva"] = check_eva(include, sigs, work)
+                if "dynamic" in checks and sigs:
+                    ld = " ".join([*module_ldflags(dag, [s["name"] for s in sigs]), args.ldflags or ""]).strip()
+                    res["dynamic"] = check_dynamic(include, sigs, ld, args.trials, work)
+            finally:
+                # Kept even when a check raised: the logs are what the agent reads to fix the header.
+                res["artifacts"] = persist_artifacts(work, dest)
+        _point_logs_at(res, dest)
+        if res.get("abi", {}).get("status") == "failed":
+            reasons.append(_with_log(f"ABI: {res['abi']['reason']}", res["abi"].get("log")))
+        if res.get("eva", {}).get("status") == "error":
+            reasons.append(_with_log(f"Frama-C: {res['eva']['reason']}", res["eva"].get("log")))
+        if header_annot_error(res.get("dynamic") or {}, header):
+            reasons.append(_with_log(f"E-ACSL: {res['dynamic']['reason']}", res["dynamic"].get("log")))
+        for fn, f in (res.get("dynamic", {}).get("functions") or {}).items():
+            if f["status"] == "violated":
+                reasons.append(_with_log(f"{fn}: postcondition failed against the real library", f.get("log")))
         res["status"] = "failed" if reasons else "passed"
         res["reasons"] = reasons
         results[header] = res
@@ -643,9 +762,14 @@ def gate_reasons(run_dir: Path, module: str | None) -> list[str]:
         if module is not None and mod != module:
             continue
         for h in hdrs:
-            why = "; ".join(((data.get("headers") or {}).get(h) or {}).get("reasons") or [])[:400]
+            rec = (data.get("headers") or {}).get(h) or {}
+            why = "; ".join(rec.get("reasons") or [])[:400]
+            # The logs' directory survives the cut above, which can drop a reason's own "(see ...)".
+            art = rec.get("artifacts")
+            art = art if isinstance(art, dict) else {}
+            where = f"; logs and generated programs in {art['dir']}/" if art.get("dir") and art.get("files") else ""
             reasons.append(
-                f"stub-check failed for {h} ({why}), which module {mod} depends on: fix the header, then run "
+                f"stub-check failed for {h} ({why}{where}), which module {mod} depends on: fix the header, then run "
                 "`pipeline_make.py run stubs stub-check`"
             )
     return reasons

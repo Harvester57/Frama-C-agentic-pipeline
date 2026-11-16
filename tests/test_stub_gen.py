@@ -144,6 +144,9 @@ def test_run_writes_an_inactive_skeleton_in_the_entry_header(stub_run, run_dir):
     header = run_dir / "workspace/stubs/mylib/mylib.h"
     text = header.read_text(encoding="utf-8")
     assert "#include_next <mylib/mylib.h>" in text and "#pragma once" in text
+    # errno for the contracts: __fc_errno under Eva and WP, __fc_eacsl_errno under E-ACSL (stub_check's errno test).
+    assert "#include_next <mylib/mylib.h>\n#include <errno.h>\n" in text
+    assert "#include <errno.h>" not in stub_gen.header_preamble("errno.h", "/usr/include/errno.h")
     assert text.count("\n#ifdef FC_STUB_DRAFT\n") == 3
     assert "extern int ml_hash(ml_ctx *ctx, unsigned char const *data, size_t len, unsigned char out[32]);" in text
     rec = report["headers"]["workspace/stubs/mylib/mylib.h"]

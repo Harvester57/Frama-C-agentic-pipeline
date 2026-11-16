@@ -276,9 +276,12 @@ def header_preamble(name: str, real: str) -> str:
         f" * A block still under #ifdef {DRAFT_GUARD} is a skeleton, inactive until a stub author fills it\n"
         " * (skills/framac-slice/stub_author_brief.md). Contracts only: never a function body. Every active\n"
         " * contract is an assumption the ledger records with this file's digest.\n"
+        " *\n"
+        " * <errno.h> declares errno for the contracts (`assigns errno \\from ...;`): Frama-C's libc maps it to\n"
+        " * __fc_errno, templates/fc_stubs/errno.h to __fc_eacsl_errno under E-ACSL, where __fc_errno is unbound.\n"
         " */\n"
         "#pragma once\n"
-        f"#include_next <{name}>\n"
+        f"#include_next <{name}>\n" + ("" if name == "errno.h" else "#include <errno.h>\n")
     )
 
 
