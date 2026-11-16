@@ -207,7 +207,7 @@ def test_the_declarator_of_a_function_returning_a_function_pointer():
 )
 def test_the_skeleton_of_a_void_function_has_no_result(proto):
     lines = stub_gen.skeleton_contract(proto, [{"name": "p", "kind": "pointer"}])
-    assert lines[-1] == "assigns *p;"
+    assert lines[-1] == r"assigns *p \from p;"
 
 
 def test_the_skeleton_of_a_function_returning_a_function_pointer_keeps_its_result():

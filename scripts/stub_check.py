@@ -27,8 +27,10 @@ Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md ste
            the generated arguments do not meet it (`driver_rejected`), a crash or a link failure leaves
            the check `inconclusive`.
 
-A header fails when its ABI check fails, Frama-C cannot parse it or Eva aborts on it (a deferred error such
-as `assigns:missing`, a location other than \\result without `\\from`, which Phase 2 Eva aborts on too), the
+A header fails when an active contract has an `assigns` location other than \\result without `\\from`
+(read statically, whatever the checks: Eva aborts on it with `assigns:missing`, Phase 2 Eva too, but only
+when a call reaches the contract, and a valid call that fails its own precondition never does), its ABI
+check fails, Frama-C cannot parse it or Eva aborts on it (a deferred error such as `assigns:missing`), the
 E-ACSL build fails on an annotation of the header itself (`annot-error`, which every fuzz build including
 it would hit), or a contract is `violated`. A failed
 header blocks every module whose DAG `external_callees` name one of its functions (with the module's
@@ -70,7 +72,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import stub_gen  # noqa: E402
 import target_env  # noqa: E402
-from acsl_ast import AcslError, AcslSyntaxError, Token, locate_all_prototype_spans, tokenize_c_acsl  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    AcslError,
+    AcslSyntaxError,
+    Token,
+    _acsl_comment_body,
+    extract_frame_clauses,
+    iter_clauses,
+    locate_all_prototype_spans,
+    tokenize_c_acsl,
+)
 from c_definitions import (  # noqa: E402
     TYPE_MODIFIERS_AND_PRIMITIVES,
     _find_matching_backward,
@@ -368,6 +379,86 @@ def _first_error(log: str) -> str:
 
 def _with_log(reason: str, log: Path | str | None) -> str:
     return f"{reason} (see {Path(log).as_posix()})" if log else reason
+
+
+# ---------------------------------------------------------------------------
+# Frames Eva refuses (read statically)
+# ---------------------------------------------------------------------------
+
+_DRAFT_IF_RE = re.compile(rf"^\s*#\s*if(?:def\s+|\s+(?:defined\s*\(?\s*)?){stub_gen.DRAFT_GUARD}\b")
+_PP_IF_RE = re.compile(r"^\s*#\s*if")
+_PP_ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
+_DECL_SKIP_WORDS = frozenset(
+    "__attribute__ __attribute __asm__ __asm asm __declspec _Alignas __typeof__ __typeof typeof".split()
+)
+_NO_FROM_NEEDED = frozenset(("\\result", "\\nothing"))
+
+
+def _declared_name(tokens: list[Token], start: int) -> str:
+    """The function a contract annotates: the first name called at top level in the declaration after it."""
+    depth = 0
+    code = [t for t in tokens[start:] if t.kind == "c_token"]
+    for i, tok in enumerate(code):
+        if tok.text in (";", "{") and depth == 0:
+            break
+        if tok.text == "(":
+            depth += 1
+        elif tok.text == ")":
+            depth -= 1
+        elif depth == 0 and _is_ident(tok.text) and tok.text not in _DECL_SKIP_WORDS:
+            if i + 1 < len(code) and code[i + 1].text == "(":
+                return tok.text
+    return "?"
+
+
+def assigns_without_from(text: str, path: str = "<header>") -> list[tuple[str, int, str]]:
+    """
+    (function, line, location) for every `assigns` location other than \\result and \\nothing, in an
+    active contract of an overlay header, whose clause has no `\\from`. Eva aborts on each one
+    ([eva:assigns:missing] no \\from part for clause), but only when a call reaches the contract: a valid
+    call that fails its own precondition never reads the frame, so the Eva check alone can say `ok`.
+    Blocks still under `#ifdef FC_STUB_DRAFT` are inactive and skipped. Syntactic: the clause boundaries
+    are acsl_ast's, as Frama-C's are.
+    """
+    try:
+        tokens = tokenize_c_acsl(text, path=path)
+    except AcslError:
+        return []  # the ABI and Eva checks report a header that does not tokenize
+    found: list[tuple[str, int, str]] = []
+    draft_depth = 0
+    for idx, tok in enumerate(tokens):
+        if tok.kind == "pp_directive":
+            if draft_depth:
+                if _PP_IF_RE.match(tok.text):
+                    draft_depth += 1
+                elif _PP_ENDIF_RE.match(tok.text):
+                    draft_depth -= 1
+            elif _DRAFT_IF_RE.match(tok.text):
+                draft_depth = 1
+            continue
+        if draft_depth or tok.kind not in ("acsl_block", "acsl_line"):
+            continue
+        body = _acsl_comment_body(tok.text)
+        fn: str | None = None
+        for kind, _label, clause, (start, _end) in iter_clauses(body):
+            if kind != "assigns":
+                continue
+            frame = extract_frame_clauses(f"assigns {clause};")["assigns"]
+            if not frame or frame[0]["from"]:
+                continue
+            for loc in frame[0]["locs"]:
+                if loc.strip() and loc.strip() not in _NO_FROM_NEEDED:
+                    fn = fn or _declared_name(tokens, idx + 1)
+                    found.append((fn, tok.line + body.count("\n", 0, start), loc.strip()))
+    return found
+
+
+def frame_reasons(header: str, text: str) -> list[str]:
+    """The stub-check reasons for the locations `assigns_without_from` finds in the header `header`."""
+    return [
+        f"{header}:{line}: assigns clause of {fn} lacks \\from for {loc}: Eva aborts on it ([eva:assigns:missing])"
+        for fn, line, loc in assigns_without_from(text, path=header)
+    ]
 
 
 def system_include_flags(capture: dict) -> list[str]:
@@ -690,10 +781,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             continue
         include = rec.get("include_name") or header[len(STUB_OVERLAY_REL) + 1 :]
         path = Path(header)
-        digest = stub_gen.sha256_text(path.read_text(encoding="utf-8")) if path.is_file() else None
+        text = path.read_text(encoding="utf-8") if path.is_file() else None
+        digest = stub_gen.sha256_text(text) if text is not None else None
         sigs, skipped = _signatures(rec, model if isinstance(model, dict) else {})
         res: dict[str, Any] = {"digest": digest, "include_name": include, "not_callable": skipped}
         reasons: list[str] = list(rec.get("problems") or [])
+        # Whatever the checks and whether a call reaches the contract: Eva aborts on such a frame.
+        reasons += frame_reasons(header, text or "")
         dest = artifacts_root / artifact_slug(include)
         with tempfile.TemporaryDirectory(prefix="stub-check-") as tmp:
             work = Path(tmp)

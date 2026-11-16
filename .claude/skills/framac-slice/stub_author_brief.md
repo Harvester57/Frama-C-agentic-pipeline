@@ -23,14 +23,15 @@ Each function has a block:
 #ifdef FC_STUB_DRAFT
 /*@
   // TODO(stub-author): out: written through; one object (*out) or a range? may it be NULL?
+  // TODO(stub-author): \from lists every parameter; add what the function reads through them (src[0 .. n - 1]), mark `indirect:` a pointer that only says where it writes (Eva writes a garbled mix of a direct pointer source's addresses), never drop a source the documentation does not rule out
   requires valid_read_buf: len > 0 ==> \valid_read(buf + (0 .. len - 1));
-  assigns *out, \result;
+  assigns *out, \result \from buf, len, out;
 */
 extern int foo(const unsigned char *buf, size_t len, struct foo_out *out);
 #endif
 ```
 
-The frame is a guess from the signature: a pointer followed by a length-named value bounds a range, a `const` pointer is read only, any other pointer is written as `*p`. Check every clause against the documentation.
+The frame is a guess from the signature: a pointer followed by a length-named value bounds a range, a `const` pointer is read only, any other pointer is written as `*p`, and one `\from` lists every parameter (Eva refuses a frame without it, rule 4). Check every clause against the documentation; split the clause when locations depend on different inputs.
 
 ## Strict Rules
 
@@ -59,7 +60,9 @@ python3 /opt/framac-pipeline/scripts/pipeline_make.py run stubs stub-check
 
 An `eva` with `status: error` means Frama-C refused the header or a contract; a dynamic `build_failed` whose reason is an `annot-error` in your header means E-ACSL did, and every fuzz build that includes the header would abort the same way. The reason is the tool's most fatal message, followed by the log to read: every check leaves its generated program and its logs, each starting with its command line, in `workspace/reports/stub_check/<include name with / as __>/` (`abi.log`, `fc_stub_smoke.c`, `eva.log`, `fc_stub_driver.c`, `eacsl_instrument.log`, `eacsl_build.log`, `run<N>.log`), which the header's `artifacts` lists. Read the log before you change the contract, and never drop a location from `assigns` to get past an error: a frame one location short is unsound.
 
-A header with a failed `abi`, an `eva` error, an E-ACSL `annot-error` in the header or a `violated` contract blocks every module that calls it, so fix those before you finish.
+A reason `<header>:<line>: assigns clause of <fn> lacks \from for <loc>: Eva aborts on it` comes from reading the header itself, before any tool runs: Eva aborts on that frame whenever a call reaches it, even when the `eva` check said `ok` because its valid call failed a precondition first. Give the location its `\from` (rule 4).
+
+A header with a frame lacking `\from`, a failed `abi`, an `eva` error, an E-ACSL `annot-error` in the header or a `violated` contract blocks every module that calls it, so fix those before you finish.
 
 ## Result
 

@@ -281,6 +281,76 @@ def test_an_eacsl_annotation_error_in_the_header_blocks_it(run_dir, monkeypatch)
     assert data["blocked_modules"] == {"m": [EPOLL_HDR]}
 
 
+_FROM_HEADER = """#pragma once
+#include_next <sys/epoll.h>
+#include <errno.h>
+/* fc-stub: epoll_create1 */
+/*@
+  requires flags_ok: __flags == 0;
+  assigns errno, \\result;
+*/
+extern  __attribute__((__nothrow__)) int epoll_create1(int __flags) __attribute__(( __leaf__));
+/* fc-stub: epoll_wait */
+/*@
+  requires positive_maxevents: maxevents > 0;
+  assigns events[0 .. maxevents - 1] \\from epfd, maxevents;
+  assigns errno \\from \\nothing;
+  assigns \\result;
+  behavior timed:
+    assumes timeout > 0;
+    assigns *events;
+*/
+extern int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+/* fc-stub: epoll_ctl */
+/* TODO(stub-author): write epoll_ctl's contract ... */
+#ifdef FC_STUB_DRAFT
+/*@
+  assigns *event, \\result;
+*/
+extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+#endif
+//@ assigns \\nothing;
+extern int epoll_pure(void);
+//@ assigns errno;
+extern int epoll_line(void);
+"""
+
+
+@pytest.mark.unit
+def test_assigns_without_from_is_found_in_the_header():
+    """
+    Eva aborts on a location other than \\result without `\\from`, but only on a call it reaches: run-1's
+    epoll_wait valid call failed its precondition, so Eva never read the frame and said `ok`. Read statically.
+    """
+    found = stub_check.assigns_without_from(_FROM_HEADER)
+    # The draft (epoll_ctl) is inactive; `\\result` alone and `\\nothing` pass Eva without `\\from`.
+    assert [(fn, loc) for fn, _line, loc in found] == [
+        ("epoll_create1", "errno"),
+        ("epoll_wait", "*events"),
+        ("epoll_line", "errno"),
+    ]
+    assert found[0][1] == 7 and found[1][1] == 18
+    assert stub_check.assigns_without_from("/*@ assigns *p \\from p; */ int f(int *p);\n") == []
+
+
+@pytest.mark.unit
+def test_a_header_whose_frame_lacks_from_fails_without_running_eva(run_dir, monkeypatch):
+    monkeypatch.setattr(stub_check, "_run", lambda cmd, cwd, **_: (_ for _ in ()).throw(AssertionError(cmd)))
+    _epoll_inputs()
+    hdr = run_dir / EPOLL_HDR
+    hdr.parent.mkdir(parents=True)
+    hdr.write_text(_FROM_HEADER, encoding="utf-8", newline="\n")
+    assert stub_check.main(["run", "--checks", ""]) == 1
+    data = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
+    rec = data["headers"][EPOLL_HDR]
+    assert rec["reasons"][0] == (
+        f"{EPOLL_HDR}:7: assigns clause of epoll_create1 lacks \\from for errno: Eva aborts on it "
+        "([eva:assigns:missing])"
+    )
+    assert len(rec["reasons"]) == 3 and rec["status"] == "failed"
+    assert data["blocked_modules"] == {"m": [EPOLL_HDR]}
+
+
 # The c-ares run-1 overlay wrapper for glibc's <sys/epoll.h> (its parse aids), then the header stub_gen.py
 # writes (`#include <errno.h>`), then one contract whose `assigns` each case varies.
 _EPOLL_OVERLAY = """#pragma once

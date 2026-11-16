@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import acsl_ast
 import cache
 import eacsl_toolchain
 import framac_common
@@ -128,12 +129,46 @@ def test_skeleton_frame_from_the_signature():
     text = "\n".join(lines)
     assert r"requires valid_read_data: len > 0 ==> \valid_read(data + (0 .. len - 1));" in text
     assert r"requires valid_out: \valid(out + (0 .. 31));" in text
-    assert r"assigns *ctx, out[0 .. 31], \result;" in text
+    assert r"assigns *ctx, out[0 .. 31], \result \from ctx, data, len, out;" in text
     assert "TODO(stub-author): ctx:" in text and "ensures" not in text
     void = stub_gen.skeleton_contract("void ml_free(ml_ctx *ctx)", [{"name": "ctx", "kind": "pointer"}])
-    assert "assigns *ctx;" in void
+    assert r"assigns *ctx \from ctx;" in void
     pure = stub_gen.skeleton_contract("int ml_id(int x)", [{"name": "x", "kind": "value"}])
     assert pure[-1] == r"assigns \result \from x;"
+
+
+_FROM_PLACEHOLDER_NOTE = "\\from lists every parameter"
+# Signatures whose skeleton writes through a pointer, with and without a result and a length.
+_WRITING_SIGNATURES = [
+    ("int ml_hash(ml_ctx *ctx, unsigned char const *data, size_t len, unsigned char out[32])",
+     [{"name": "ctx", "kind": "pointer"}, {"name": "data", "kind": "const_pointer"},
+      {"name": "len", "kind": "value"}, {"name": "out", "kind": "pointer"}]),
+    ("void ml_free(ml_ctx *ctx)", [{"name": "ctx", "kind": "pointer"}]),
+    ("char *ml_fill(char *buf, size_t len, int c)",
+     [{"name": "buf", "kind": "pointer"}, {"name": "len", "kind": "value"}, {"name": "c", "kind": "value"}]),
+    ("int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)",
+     [{"name": "epfd", "kind": "value"}, {"name": "events", "kind": "pointer"},
+      {"name": "maxevents", "kind": "value"}, {"name": "timeout", "kind": "value"}]),
+]  # fmt: skip
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("proto, formals", _WRITING_SIGNATURES)
+def test_every_skeleton_location_but_result_has_a_from(proto, formals):
+    """
+    Eva aborts on an `assigns` location other than \\result without `\\from` ([eva:assigns:missing], a
+    deferred error: stub_check and Phase 2 Eva). A skeleton filled as written must not hit it.
+    """
+    contract = "\n".join(line for line in stub_gen.skeleton_contract(proto, formals) if not line.startswith("//"))
+    clauses = acsl_ast.extract_frame_clauses(contract)["assigns"]
+    assert clauses, contract
+    for clause in clauses:
+        written = [loc for loc in clause["locs"] if loc not in ("\\result", "\\nothing")]
+        assert not written or clause["from"], f"no \\from for {written}: {contract}"
+        # Conservative: every named parameter (the inputs the written values may depend on).
+        assert not written or set(clause["from"]) == {f["name"] for f in formals}, contract
+    # The author learns the \from is a placeholder to complete with what the function reads.
+    assert any(_FROM_PLACEHOLDER_NOTE in line for line in stub_gen.skeleton_contract(proto, formals))
 
 
 @pytest.mark.unit
@@ -393,6 +428,82 @@ python3 -c "import json; print('state=' + json.load(open('stubs.json'))['headers
     assert "draft_missing=1" in out, out
     assert "filled_missing=0" in out, out
     assert "state=filled" in out, out
+
+
+# A library whose functions cover each skeleton shape: a range, a fixed-size array and an object written
+# with a result, a void writer, a pointer result, a result alone without parameters, nothing at all.
+_SK_FUNCTIONS = {
+    "sk_hash": ("int sk_hash(struct sk_ctx *ctx, unsigned char const *data, size_t len, unsigned char out[32])",
+                [{"name": "ctx", "kind": "pointer"}, {"name": "data", "kind": "const_pointer"},
+                 {"name": "len", "kind": "value"}, {"name": "out", "kind": "pointer"}]),
+    "sk_reset": ("void sk_reset(struct sk_ctx *ctx)", [{"name": "ctx", "kind": "pointer"}]),
+    "sk_name": ("char *sk_name(struct sk_ctx *ctx, int which)",
+                [{"name": "ctx", "kind": "pointer"}, {"name": "which", "kind": "value"}]),
+    "sk_fill": ("int sk_fill(char *buf, size_t len, int c)",
+                [{"name": "buf", "kind": "pointer"}, {"name": "len", "kind": "value"}, {"name": "c", "kind": "value"}]),
+    "sk_count": ("int sk_count(void)", []),
+    "sk_tick": ("void sk_tick(void)", []),
+}  # fmt: skip
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_a_skeleton_filled_as_written_passes_eva_in_the_image(tmp_path):
+    """
+    c-ares run-1: a skeleton's `assigns *p, \\result;` filled as written aborted Eva
+    ([eva:assigns:missing] no \\from part for clause). Guard and TODO lines removed, nothing else
+    changed, every skeleton shape must let Eva run to the end (stub_check's Eva, Phase 2 Eva).
+    """
+    require_docker_images(ANALYSIS_IMAGE)
+    real = tmp_path / "inc" / "sk" / "sk.h"
+    real.parent.mkdir(parents=True)
+    real.write_text(
+        "#include <stddef.h>\nstruct sk_ctx { int n; char *p; };\n"
+        + "".join(f"{proto};\n" for proto, _ in _SK_FUNCTIONS.values()),
+        encoding="utf-8",
+        newline="\n",
+    )
+    blocks = "".join(stub_gen.draft_block(name, proto, formals) for name, (proto, formals) in _SK_FUNCTIONS.items())
+    filled = "\n".join(
+        line
+        for line in (stub_gen.header_preamble("sk/sk.h", "/w/inc/sk/sk.h") + blocks).splitlines()
+        if stub_gen.TODO_MARK not in line and stub_gen.DRAFT_GUARD not in line and line != "#endif"
+    )
+    overlay = tmp_path / "stubs" / "sk" / "sk.h"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text(filled + "\n", encoding="utf-8", newline="\n")
+    (tmp_path / "a.c").write_text(
+        "#include <sk/sk.h>\n"
+        "int main(void) {\n"
+        "  struct sk_ctx c = {0, 0};\n"
+        "  unsigned char d[4] = {0}, o[32];\n"
+        "  char b[8];\n"
+        "  int r = sk_hash(&c, d, 4, o);\n"
+        "  sk_reset(&c);\n"
+        "  char *n = sk_name(&c, 1);\n"
+        "  r += sk_fill(b, 8, 'a');\n"
+        "  r += sk_count();\n"
+        "  sk_tick();\n"
+        "  return r + o[0] + b[0] + c.n + (n != 0);\n"
+        "}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    script = (
+        "cd /w && timeout 300 frama-c -no-unicode -machdep gcc_x86_64 -cpp-extra-args='-I/w/stubs -I/w/inc' a.c "
+        "-eva -eva-no-alloc-returns-null; echo \"frama_c_exit=$?\""
+    )
+    proc = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/w:ro",
+         "--entrypoint", "sh", ANALYSIS_IMAGE, "-c", script],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, check=False,
+    )  # fmt: skip
+    out = proc.stdout + proc.stderr
+    # `assigns \\result;` alone (sk_count) is only a warning, [eva:assigns:missing-result].
+    assert "[eva:assigns:missing]" not in out and "no \\from part" not in out, out
+    assert "frama_c_exit=0" in out, out
+    assert "====== VALUES COMPUTED ======" in out or "[eva] done" in out, out
+    assert "Neither code nor specification" not in out, out
 
 
 @pytest.mark.unit
