@@ -195,6 +195,10 @@ def run_sandboxed(
     limits: Limits | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> SandboxResult:
+    """Run argv in the sandbox.
+
+    Callers reach it as `sandbox_exec.run_sandboxed`, so a test patch on the module applies to every caller.
+    """
     mode = sandbox_mode()  # raises SandboxUnavailable on non-POSIX hosts
     limits = limits or Limits()
     writable = [Path(w).resolve() for w in writable]

@@ -10,6 +10,7 @@ import pytest
 import fuzz_dictionary
 import generate_harness
 import run_eacsl_fuzz as R
+import sandbox_exec
 from sandbox_exec import SandboxResult
 
 EACSL_MARKER_BYTES = b"\x7fELF...__e_acsl_assert...eacsl_store_block"
@@ -160,7 +161,7 @@ def test_run_fuzz_campaign_passes_dictionary_to_libfuzzer(tmp_path, monkeypatch)
         calls.append(list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
     src, _ = _slice(tmp_path)
     info = R.build_auto_dictionary([str(src)], tmp_path / "d" / "mod.dict")
@@ -205,7 +206,7 @@ def test_guardrail_code_fault_records_crash_input(tmp_path, monkeypatch):
         out = EACSL_RTE_FAILURE + f"artifact_prefix='{prefix}'; Test unit written to {prefix}crash-abc\n"
         return SandboxResult(1, "", out, False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     res = R.run_guardrail_check(binary, corpus, scratch, runs=5, module="mod", use_cache=False)
     assert res["status"] == "code_fault"
     assert res["crash_input"] == "agents/a1/scratch/guard/crash-abc"
@@ -223,7 +224,7 @@ def test_guardrail_crash_input_from_listing_without_log_line(tmp_path, monkeypat
         # A runtime_trace truncated past the "Test unit written" line.
         return SandboxResult(1, "", EACSL_RTE_FAILURE, False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     res = R.run_guardrail_check(binary, corpus, scratch, runs=5, module="mod", use_cache=False)
     assert res["status"] == "code_fault"
     assert res["crash_input"] == "agents/a1/scratch/guard/crash-new"
@@ -239,7 +240,7 @@ def test_guardrail_ignores_stale_artifacts_and_passing_runs(tmp_path, monkeypatc
     def fake(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
         return SandboxResult(rc["value"], "", EACSL_RTE_FAILURE if rc["value"] else "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     res = R.run_guardrail_check(binary, corpus, scratch, runs=5, module="mod", use_cache=False)
     assert res["status"] == "code_fault" and res["crash_input"] is None
     rc["value"] = 0

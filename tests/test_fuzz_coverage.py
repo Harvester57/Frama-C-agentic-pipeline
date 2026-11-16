@@ -10,6 +10,7 @@ import pytest
 import pipeline_make as pm
 import resources
 import run_eacsl_fuzz as R
+import sandbox_exec
 from generate_report import fuzz_reach_lines, load_coverage_reports
 from sandbox_exec import SandboxResult, SandboxUnavailable
 from test_pipeline_make import ACSL, FakeMake, _make_run
@@ -203,7 +204,7 @@ def _replay(tmp_path, files, **kwargs):
 
 def test_replay_runs_each_input_once_in_batches(tmp_path, monkeypatch):
     fake = CoverageSandbox()
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     files = _corpus(tmp_path, *[b"x"] * 5)
     res, profiles = _replay(tmp_path, files, batch_size=2)
     assert [len(b) for b in fake.batches] == [2, 2, 1]
@@ -216,7 +217,7 @@ def test_replay_runs_each_input_once_in_batches(tmp_path, monkeypatch):
 
 def test_replay_isolates_a_crash_and_keeps_every_other_inputs_profile(tmp_path, monkeypatch):
     fake = CoverageSandbox()
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     files = _corpus(tmp_path, b"ok", b"ok", b"CRASH", b"ok", b"ok")
     res, profiles = _replay(tmp_path, files)
     assert res["replayed"] == 4
@@ -230,7 +231,7 @@ def test_replay_isolates_a_crash_and_keeps_every_other_inputs_profile(tmp_path, 
 
 def test_replay_treats_an_empty_profile_as_a_failed_input(tmp_path, monkeypatch):
     """A target's `_exit(0)` returns 0 and leaves the empty file the profile runtime created at start."""
-    monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     files = _corpus(tmp_path, b"ok", b"EXIT")
     res, _ = _replay(tmp_path, files)
     assert res["replayed"] == 1
@@ -240,7 +241,7 @@ def test_replay_treats_an_empty_profile_as_a_failed_input(tmp_path, monkeypatch)
 
 def test_replay_goes_on_past_any_number_of_failures_and_lists_the_first_few(tmp_path, monkeypatch):
     # QCBOR run-4: 16 crashing seeds ended the replay with 1,971 of 2,240 inputs never replayed.
-    monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     files = _corpus(tmp_path, *[b"CRASH"] * 8, b"ok", b"ok")
     res, _ = _replay(tmp_path, files, listed_failed=2)
     assert res["failed"] == 8
@@ -266,7 +267,7 @@ class RunningSandbox(CoverageSandbox):
 
 def test_replay_takes_out_the_input_running_at_the_crash_and_reruns_the_rest_once(tmp_path, monkeypatch):
     fake = RunningSandbox()
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     files = _corpus(tmp_path, b"ok", b"CRASH", b"ok", b"CRASH", b"ok")
     res, _ = _replay(tmp_path, files)
     names = [f.name for f in files]
@@ -287,7 +288,7 @@ def test_input_running_at_exit_needs_a_running_line_without_executed(tmp_path):
 
 def test_replay_runs_last_inputs_after_the_rest_in_batches_of_their_own(tmp_path, monkeypatch):
     fake = CoverageSandbox()
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     files = _corpus(tmp_path, b"ok", b"ok", b"ok")
     res, _ = _replay(tmp_path, files[:1], batch_size=4, last_inputs=files[1:])
     assert fake.batches == [[files[0].name], [files[1].name, files[2].name]]
@@ -296,7 +297,7 @@ def test_replay_runs_last_inputs_after_the_rest_in_batches_of_their_own(tmp_path
 
 def test_replay_stops_at_the_deadline_and_reports_the_rest(tmp_path, monkeypatch):
     fake = CoverageSandbox()
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     files = _corpus(tmp_path, *[b"x"] * 4)
     res, _ = _replay(tmp_path, files, batch_size=1, max_time=0)
     assert fake.batches == []
@@ -307,7 +308,7 @@ def test_replay_treats_a_killed_batch_like_a_crash(tmp_path, monkeypatch):
     def hang(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
         return SandboxResult(-9, "", "", True, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", hang)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", hang)
     files = _corpus(tmp_path, b"x")
     res, _ = _replay(tmp_path, files)
     assert res["failed_inputs"][0]["timed_out"] is True
@@ -355,7 +356,7 @@ def test_report_compile_error_claims_no_coverage(tmp_path, monkeypatch):
 def _measured(tmp_path, monkeypatch, *contents, export=None, export_error=None):
     _corpus(tmp_path, *contents)
     monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
-    monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     default = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     monkeypatch.setattr(
         R, "_export_coverage", lambda *a: (export or default, None) if not export_error else (None, export_error)
@@ -386,7 +387,7 @@ def test_report_replays_known_crashes_last_and_counts_them(tmp_path, monkeypatch
     fake = CoverageSandbox()
     _corpus(tmp_path, b"CRASH seed", b"a", b"b")
     monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     monkeypatch.setattr(
         R, "_export_coverage", lambda *a: (_export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)])), None)
     )
@@ -421,7 +422,7 @@ def _truncated_then_ok(tmp_path, monkeypatch, pre_included: list[str]):
     good = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     results = iter([(None, f"llvm-cov export failed (1): error: {R.COVERAGE_TRUNCATED_MAPPING}"), (good, None)])
     monkeypatch.setattr(R, "compile_coverage_binary", compile_)
-    monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     monkeypatch.setattr(R, "_export_coverage", lambda *a: next(results))
     monkeypatch.setattr(R, "in_function_includes", lambda sources, cppflags="": pre_included)
     return _report(tmp_path, cppflags="-Iinc"), flags
@@ -573,7 +574,7 @@ def _cli(tmp_path, *extra):
 def test_cli_writes_the_full_report_and_prints_a_summary(tmp_path, monkeypatch, capsys):
     _corpus(tmp_path, b"a")
     monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
-    monkeypatch.setattr(R, "run_sandboxed", CoverageSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     export = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     monkeypatch.setattr(R, "_export_coverage", lambda *a: (export, None))
     assert _cli(tmp_path) == 0
@@ -590,7 +591,7 @@ def test_cli_exits_3_without_the_sandbox(tmp_path, monkeypatch, capsys):
     def unavailable(*a, **k):
         raise SandboxUnavailable("no sandbox")
 
-    monkeypatch.setattr(R, "run_sandboxed", unavailable)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", unavailable)
     assert _cli(tmp_path) == 3
     assert json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))["status"] == "sandbox_unavailable"
 

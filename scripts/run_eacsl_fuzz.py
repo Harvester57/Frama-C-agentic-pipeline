@@ -93,6 +93,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 import prover_candidates  # noqa: E402
+import sandbox_exec  # noqa: E402
 import target_env  # noqa: E402
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code  # noqa: E402
 from eacsl_toolchain import (  # noqa: E402
@@ -212,7 +213,7 @@ from resources import (  # noqa: E402
     enforced_memory_mb,
     fuzz_workers,
 )
-from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed  # noqa: E402
+from sandbox_exec import Limits, SandboxUnavailable  # noqa: E402
 
 # Below this, a single LibFuzzer worker cannot have its fixed -rss_limit_mb=2048 alongside
 # runtime/fork overhead without risking cgroup OOM kills (sizing model: 512 + int(2048 * 1.25) = 3072).
@@ -1223,7 +1224,7 @@ def replay_artifact(
     binary = Path(binary)
     seed = derive_seed(binary, module) if seed is None else seed
     wall = max(int(timeout_s), 2 * int(per_input_timeout) + 10)
-    res = run_sandboxed(
+    res = sandbox_exec.run_sandboxed(
         [
             str(binary.resolve()),
             "-runs=1",
@@ -1795,7 +1796,7 @@ def run_fuzz_campaign(
 
         wall_timeout = max_time * waves + 180
         cpu_mult = max(2, eff_workers + 1)
-        res = run_sandboxed(
+        res = sandbox_exec.run_sandboxed(
             cmd,
             writable=[scratch, corpus_dir, artifacts_dir],
             timeout_s=wall_timeout,
@@ -2500,7 +2501,9 @@ def run_guardrail_check(
             str(replay_dir.resolve()),
         ]
         artifacts_before = _prefix_artifacts(scratch_dir)
-        res = run_sandboxed(cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2))
+        res = sandbox_exec.run_sandboxed(
+            cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2)
+        )
         reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
         verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
         crash_input = (
@@ -3753,7 +3756,7 @@ def minimize_input(
     # --not-c: inputs are raw fuzzer bytes, not C sources, so skip the parsability check.
     cmd = [tool, "--not-c", "-n", str(max(1, int(jobs))), str(interest), str(variant)]
     try:
-        res = run_sandboxed(
+        res = sandbox_exec.run_sandboxed(
             cmd,
             writable=[work, scratch],
             timeout_s=max(30, int(max_time_s)),
@@ -3973,7 +3976,7 @@ def replay_for_coverage(
         batch_no += 1
         batch_dir = profile_dir / f"batch-{batch_no}"
         wall = min(int(per_input_timeout) * len(batch) + 30, max(int(remaining), min_wall))
-        res = run_sandboxed(
+        res = sandbox_exec.run_sandboxed(
             [
                 str(Path(binary).resolve()),
                 f"-timeout={per_input_timeout}",
@@ -4117,7 +4120,7 @@ def _export_coverage(binary: Path, profile_dir: Path, scratch: Path) -> tuple[di
     merged = (scratch / "merged.profdata").resolve()
     export_path = (scratch / "export.json").resolve()
     limits = Limits(cpu_seconds=COVERAGE_TOOL_TIMEOUT_S * 2)
-    res = run_sandboxed(
+    res = sandbox_exec.run_sandboxed(
         ["llvm-profdata", "merge", "-sparse", "-o", str(merged), *_written_profiles(profile_dir)],
         writable=[scratch],
         timeout_s=COVERAGE_TOOL_TIMEOUT_S,
@@ -4126,7 +4129,7 @@ def _export_coverage(binary: Path, profile_dir: Path, scratch: Path) -> tuple[di
     if res.returncode != 0 or res.timed_out:
         return None, f"llvm-profdata merge failed ({res.returncode}): {res.stderr[-1000:]}"
     # llvm-cov export only writes to stdout, which the sandbox truncates, so redirect it to a file.
-    res = run_sandboxed(
+    res = sandbox_exec.run_sandboxed(
         [
             "/bin/sh",
             "-c",

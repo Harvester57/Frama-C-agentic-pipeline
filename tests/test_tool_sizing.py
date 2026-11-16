@@ -14,6 +14,7 @@ import resources
 import run_eacsl_fuzz as R
 import run_eva_slice
 import run_wp_function as W
+import sandbox_exec
 import workspace_overlay
 from resources import CLASSES, Budget
 from sandbox_exec import SandboxResult
@@ -33,7 +34,9 @@ def _flag(cmd: list[str], name: str) -> str:
 class FakeFramaC:
     """Records WP runs; writes the report CSV it is asked for (all goals Valid by default)."""
 
-    def __init__(self, status: str = "Valid", rc: int = 0, log: str = "[wp] 1 goal scheduled\n[wp] Proved goals:    1 / 1\n"):
+    def __init__(
+        self, status: str = "Valid", rc: int = 0, log: str = "[wp] 1 goal scheduled\n[wp] Proved goals:    1 / 1\n"
+    ):
         self.calls: list[tuple[list[str], dict]] = []
         self.status, self.rc, self.log = status, rc, log
 
@@ -410,7 +413,7 @@ def test_campaign_rss_limit_is_fixed_whatever_the_worker_count(tmp_path, monkeyp
         captured["cmd"] = list(cmd)
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_sandbox)
     binary = tmp_path / "bin"
     binary.write_bytes(b"x")
     R.run_fuzz_campaign(binary, tmp_path / "corpus", tmp_path / "crashes", max_time=30, workers=workers)
@@ -424,7 +427,7 @@ def test_guardrail_and_replay_use_fixed_limits_and_a_deterministic_seed(tmp_path
         calls.append(list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_sandbox)
     binary = tmp_path / "guard_f.e-acsl"
     binary.write_bytes(EACSL_MARKER_BYTES)
     verdict = R.run_guardrail_check(binary, tmp_path / "corpus", tmp_path / "scratch", runs=50)
@@ -592,7 +595,7 @@ def test_parent_recheck_argv_is_accepted_by_the_real_clis(tmp_path, monkeypatch)
     monkeypatch.setattr(R, "compile_eacsl_binary", compile_ok)
     coverage = "UNCOVERED_FUNC: hits: 0 edges: 0/1 __gen_e_acsl_callee m.c:1\nstat::number_of_executed_units: 3\n"
     monkeypatch.setattr(
-        R, "run_sandboxed", lambda cmd, **k: SandboxResult(0, coverage, "", False, "rlimits", list(cmd))
+        sandbox_exec, "run_sandboxed", lambda cmd, **k: SandboxResult(0, coverage, "", False, "rlimits", list(cmd))
     )
     monkeypatch.chdir(run_dir)
     try:

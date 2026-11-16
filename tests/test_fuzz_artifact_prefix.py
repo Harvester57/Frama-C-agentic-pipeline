@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import run_eacsl_fuzz as R
+import sandbox_exec
 from sandbox_exec import SandboxResult
 
 pytestmark = pytest.mark.unit
@@ -40,7 +41,7 @@ def _assert_scratch_prefix(cmd: list[str], writable: list[Path], scratch: Path) 
 def test_replay_of_one_input_writes_its_artifacts_under_its_scratch(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     calls: list = []
-    monkeypatch.setattr(R, "run_sandboxed", _recorder(calls))
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _recorder(calls))
     binary = tmp_path / "fuzz_mod"
     binary.write_bytes(b"BIN")
     crash = tmp_path / "crash-1"
@@ -49,7 +50,7 @@ def test_replay_of_one_input_writes_its_artifacts_under_its_scratch(tmp_path, mo
     scratch.mkdir()
     rep = R.replay_artifact(binary, crash, scratch, module="mod")
     assert rep["reproduced"] is True
-    (cmd, writable), = calls
+    ((cmd, writable),) = calls
     assert cmd[0] == str(binary.resolve()) and cmd[-1] == str(crash.resolve())
     _assert_scratch_prefix(cmd, writable, scratch)
 
@@ -57,7 +58,7 @@ def test_replay_of_one_input_writes_its_artifacts_under_its_scratch(tmp_path, mo
 def test_coverage_replay_writes_its_artifacts_under_its_scratch(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     calls: list = []
-    monkeypatch.setattr(R, "run_sandboxed", _recorder(calls))
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _recorder(calls))
     binary = tmp_path / "cov_mod"
     binary.write_bytes(b"BIN")
     inputs = []
@@ -87,7 +88,7 @@ def test_campaign_runs_and_its_replays_never_write_artifacts_in_the_working_dire
             Path(f"{prefix}crash-x").write_bytes(b"\x00")
         return SandboxResult(1, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     binary = tmp_path / "fuzz_mod"
     binary.write_bytes(b"BIN")
     artifacts_dir = tmp_path / "crashes"

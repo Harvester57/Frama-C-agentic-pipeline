@@ -14,6 +14,7 @@ import pytest
 import eacsl_toolchain as T
 import ledger
 import run_eacsl_fuzz as R
+import sandbox_exec
 from conftest import makefile_rule, makefile_rules
 from framac_common import scan_undeclared_functions
 from sandbox_exec import SandboxResult
@@ -1228,7 +1229,7 @@ def test_differential_replay_attributes_unlocated_eacsl_crash(tmp_path, monkeypa
         (artifacts / "crash-abc").write_bytes(b"FC33")
         return SandboxResult(1, "", "==1== ERROR: libFuzzer: deadly signal\n", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
     built = []
 
     def builder():

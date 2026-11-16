@@ -1358,7 +1358,7 @@ class TestHarnessLegitimacyAndMetadata:
                 },
             }
 
-        monkeypatch.setattr(fuzz_mod, "run_sandboxed", fake_run_sandboxed)
+        monkeypatch.setattr(sb_mod, "run_sandboxed", fake_run_sandboxed)
         monkeypatch.setattr(fuzz_mod, "replay_artifact", fake_replay)
 
         report = fuzz_mod.run_fuzz_campaign(
@@ -1422,7 +1422,9 @@ class TestHarnessLegitimacyAndMetadata:
                         ".\tcksum.c\tInCksum\t1\trte: unsigned_downcast\tValid\t(sum >> 16) <= 65535\n",
                         encoding="utf-8",
                     )
-            stdout = "[wp] Proved goals:    1 / 1\n" if "-wp" in cmd and cmd[cmd.index("-wp-model") + 1] != "Typed" else ""
+            stdout = (
+                "[wp] Proved goals:    1 / 1\n" if "-wp" in cmd and cmd[cmd.index("-wp-model") + 1] != "Typed" else ""
+            )
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
         monkeypatch.setattr(wp_mod.subprocess, "run", fake_run)

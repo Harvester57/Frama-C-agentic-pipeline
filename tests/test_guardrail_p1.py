@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import run_eacsl_fuzz as R
+import sandbox_exec
 import workspace_overlay
 from acsl_ast import (
     TrustBoundaryError,
@@ -66,7 +67,7 @@ def _instrumented(monkeypatch, captured: list) -> None:
         captured.append(list(cmd))
         return SandboxResult(0, "stat::number_of_executed_units: 5\n", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
 
 
 def test_guardrail_replays_seeds_and_reports_the_sample(tmp_path, monkeypatch):
@@ -541,7 +542,7 @@ def _crashing_replays(monkeypatch, crasher: bytes, calls: list, report: str = SE
             0, stats + f"stat::number_of_executed_units: {len(replayed)}\n", "", False, "rlimits", list(cmd)
         )
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
 
 
 def _corpus(tmp_path: Path) -> Path:
@@ -791,7 +792,7 @@ def _mutation_guardrail(tmp_path: Path, monkeypatch, functions: list[str], calls
             return SandboxResult(77, "", out, False, "rlimits", list(cmd))
         return SandboxResult(0, "stat::number_of_executed_units: 6\n", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
     binary = tmp_path / "guard.e-acsl"
     binary.write_bytes(b"bin")
     return R.run_guardrail_check(
