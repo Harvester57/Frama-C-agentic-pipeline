@@ -24,7 +24,7 @@ def test_preexec_sets_core_limit_to_one_byte(monkeypatch):
     # abort() streamed a full core to the crash helper; 1 byte skips the dump.
     import types
 
-    calls = {}
+    calls: dict[str, tuple[int, int]] = {}
     fake = types.SimpleNamespace(
         RLIMIT_CPU="cpu", RLIMIT_FSIZE="fsize", RLIMIT_NOFILE="nofile",
         RLIMIT_NPROC="nproc", RLIMIT_AS="as", RLIMIT_CORE="core",
