@@ -461,6 +461,132 @@ def test_argv_harness_keeps_the_transitive_reach_of_a_program(tmp_path, monkeypa
     assert row["reached_only_through"] == {"conv_parse": ["main"], "conv_token": ["main"], "write_data": ["main"]}
 
 
+def _two_program_dag() -> dict[str, Any]:
+    """Two executables whose `main`s collide (DAG keys `file#main`), as c-ares's adig and ahost."""
+
+    def prog_fn(name: str, module: str, file: str, callees: list[str] | None = None) -> dict[str, Any]:
+        return {**_fn(name, callees or [], module=module), "file": file}
+
+    functions = {
+        "src/tools/adig.c#main": prog_fn("main", "adig", "src/tools/adig.c", ["ares_init"]),
+        "src/tools/ahost.c#main": prog_fn("main", "ahost", "src/tools/ahost.c", ["ares_getopt", "ares_getopt_init"]),
+        "ares_getopt": prog_fn("ares_getopt", "ahost", "src/tools/ares_getopt.c"),
+        "ares_getopt_init": prog_fn("ares_getopt_init", "ahost", "src/tools/ares_getopt.c"),
+        "ares_init": prog_fn("ares_init", "libcares_a", "src/lib/ares_init.c"),
+    }
+    modules = {
+        "adig": {
+            "tier": TIER_1A,
+            "functions": ["src/tools/adig.c#main"],
+            "candidate_entry_points": ["src/tools/adig.c#main"],
+        },
+        "ahost": {
+            "tier": TIER_1A,
+            "functions": ["src/tools/ahost.c#main", "ares_getopt", "ares_getopt_init"],
+            "candidate_entry_points": ["src/tools/ahost.c#main", "ares_getopt", "ares_getopt_init"],
+        },
+    }
+    return {"modules": modules, "functions": functions}
+
+
+def _clang_ast_calling(monkeypatch, callee: str) -> None:
+    """A fake clang on the PATH whose AST of any harness is one call of `callee`."""
+    tree = {
+        "kind": "TranslationUnitDecl",
+        "inner": [
+            {
+                "kind": "FunctionDecl",
+                "name": "LLVMFuzzerTestOneInput",
+                "inner": [
+                    {
+                        "kind": "CallExpr",
+                        "inner": [{"kind": "DeclRefExpr", "referencedDecl": {"kind": "FunctionDecl", "name": callee}}],
+                    }
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(harness_reach.shutil, "which", lambda name: "/usr/bin/clang" if name == "clang" else None)
+    monkeypatch.setattr(
+        harness_reach.subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(argv, 0, stdout=json.dumps(tree), stderr=""),
+    )
+
+
+@pytest.mark.parametrize("module", ["adig", "ahost"])
+def test_argv_harness_roots_its_renamed_main_through_clang(tmp_path, monkeypatch, module):
+    # c-ares run-1 (adig, ahost): the argv harness's `main(2, argv)` is `__framac_target_main` in clang's AST
+    # (cppflags `-Dmain=__framac_target_main`), so the gate found no root and failed on the program's main.
+    _clang_ast_calling(monkeypatch, "__framac_target_main")
+    harness = tmp_path / f"workspace/harnesses/harness_{module}.c"
+    harness.parent.mkdir(parents=True)
+    harness.write_text(
+        "int main(int argc, char **argv);\nvoid drive(char **argv) { main(2, argv); }\n", encoding="utf-8"
+    )
+    sidecar = {
+        "module": module,
+        "unit": module,
+        "harness_file": f"workspace/harnesses/harness_{module}.c",
+        "entry_fn": "main",
+        "entry_style": "argv",
+        "cppflags": "-I. -DHAVE_CONFIG_H=1 -Iworkspace/work -Dmain=__framac_target_main",
+    }
+    dag_doc = _two_program_dag()
+    text = harness.read_text(encoding="utf-8")
+    row = harness_reach.check_module(module, dag_doc, sidecar, text, [], run_dir=tmp_path)
+    own_main = f"src/tools/{module}.c#main"
+    assert row["passed"] is True and row["gaps"] == []
+    assert row["entry_points_reached"] == row["entry_points"]
+    # The root is the plain name the harness calls; the walk resolves it to the module's own main.
+    assert row["roots"] == ["main"] and row["functions_reached"] == row["functions"]
+    assert row["unreached_entry_points"] == [] and row["reached_only_through"] == {}
+
+    # A harness that never calls the renamed main still fails on it.
+    _clang_ast_calling(monkeypatch, "ares_library_init")
+    row = harness_reach.check_module(module, dag_doc, sidecar, text, [], run_dir=tmp_path)
+    assert row["passed"] is False and own_main in row["gaps"]
+
+
+def test_dynamic_gate_counts_the_renamed_main_of_an_argv_harness(tmp_path):
+    # libseccomp run-4 (scmp_bpf_disasm): the coverage build lists the program's main as
+    # `__framac_target_main` (executions 1), and the dynamic gate read `main` as never executed.
+    hdir = tmp_path / "workspace/harnesses"
+    hdir.mkdir(parents=True)
+    sidecar = {
+        "module": "ahost",
+        "unit": "ahost",
+        "entry_fn": "main",
+        "entry_style": "argv",
+        "cppflags": "-I. -Dmain=__framac_target_main",
+        "reach_exempt": {},
+    }
+    (hdir / "harness_ahost.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    dag_doc = _two_program_dag()
+    mm = harness_reach.ModuleMap(dag_doc, harness_reach.load_sidecars(hdir))
+
+    def row_for(main_runs: int) -> dict[str, Any]:
+        cov = {
+            "functions": [
+                {"function": "__framac_target_main", "file": "src/tools/ahost.c", "executions": main_runs},
+                {"function": "ares_getopt", "file": "src/tools/ares_getopt.c", "executions": 4},
+                {"function": "ares_getopt_init", "file": "src/tools/ares_getopt.c", "executions": 1},
+            ]
+        }
+        return harness_reach.check_dynamic("ahost", dag_doc, mm, cov, harnesses_dir=hdir)
+
+    row = row_for(1)
+    assert row["executions"]["src/tools/ahost.c#main"] == 1
+    assert row["gaps"] == [] and row["passed"] is True
+    # A main the corpus never ran is still a gap.
+    assert row_for(0)["gaps"] == ["src/tools/ahost.c#main"]
+
+
+def test_cppflag_renames_reads_identifier_defines_only():
+    flags = "-I. -DHAVE_CONFIG_H=1 -D NDEBUG -D main=__framac_target_main -DX='a b' -Dfoo=foo"
+    assert harness_reach.cppflag_renames(flags) == {"__framac_target_main": {"main"}}
+
+
 def test_target_fuzz_module_row_has_no_transitive_only_entry_point(tmp_path, monkeypatch):
     dag, hdir = _unit_run(tmp_path, monkeypatch, {"decode": "dec_run(); dec_peek();"})
     _add_target_fuzzer(tmp_path, FUZZER_C)
