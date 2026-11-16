@@ -74,7 +74,7 @@ Every single iteration of the Function Prover Subagent ([`../../skills/framac-wp
 
 ### Per-Goal Solver Cost (`FRAMAC_WP_GOAL_COSTS`, on by default)
 
-Every WP run also writes WP's own JSON report (`-wp-report-json`, file `wp_<fn>[suffix]_goals.json` next to the CSV), and [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) adds three fields to its result:
+Every WP run also writes WP's own JSON report (`-wp-report-json`, file `wp_<fn>[suffix].wp-report-json` next to the CSV; not `.json`, because `spec_kb.py` and `mutation_check.py` read every `wp_*.json` there as a result object), and [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) adds these fields to its result:
 
 - `unproven_goal_costs`: one object per goal WP reports as not proved, keyed by the WP goal name (the report CSV has no goal name): `{"goal", "property", "verdict_kind", "provers", "time_ms", "cached"}`. `verdict_kind` is `timeout`, `stepout`, `unknown` or `failed`; `property` is WP's property name from the JSON report (null when the entry comes from the log); `provers` are prover names without their version; `cached` is true when WP took the result from its cache.
 - `slowest_proved_goals`: at most five `{"goal", "prover", "time_ms"}`, slowest first, cached results left out, so a goal proved close to the timeout is visible before it flips.

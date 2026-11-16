@@ -1666,7 +1666,9 @@ def run_wp_on_function(
     log_path = out_dir / f"{stem}.log"
     sarif_path = out_dir / f"{stem}.sarif"
     sav_path = out_dir / f"{stem}.sav"
-    goals_json_path = out_dir / f"{stem}_goals.json"
+    # Not `.json`: spec_kb (`wp_*.json`) and mutation_check (`*.json`) read every such file next to the
+    # result as a WP result object, and this one is a JSON list.
+    goals_json_path = out_dir / f"{stem}.wp-report-json"
     # A report left over from an earlier run must never be read as this run's result.
     for stale in (csv_path, sarif_path, sav_path, goals_json_path):
         if stale.exists():

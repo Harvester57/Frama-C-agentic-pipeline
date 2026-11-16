@@ -603,7 +603,7 @@ def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pyte
     out_dir.mkdir()
     c_file = tmp_path / "f.c"
     c_file.write_text("int f(int x) { return x; }\n", encoding="utf-8")
-    stale = out_dir / "wp_f_goals.json"
+    stale = out_dir / "wp_f.wp-report-json"
     stale.write_text(
         json.dumps([{"goal": "typed_f_stale", "function": "f", "passed": False, "verdict": "timeout"}]), encoding="utf-8"
     )
@@ -633,3 +633,5 @@ def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pyte
     assert res["slowest_proved_goals"] == []
     assert res["wp_timeout_s"] == 8
     assert any("probably false or missing a fact" in h for h in res["diagnostic_hints"])
+    # spec_kb and mutation_check read every `wp_*.json` / `*.json` there as a WP result object.
+    assert not [p.name for p in out_dir.glob("*.json")]
