@@ -7,7 +7,8 @@ here is implemented. It comes from the supervision of c-ares run-1
 says what the evidence does not cover. All ten proposals (`P1`–`P10`, with `P4` rejected) and their
 alignment with [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md) (`D1b`, `D4`, `D8`,
 `F7`) were settled with the user on 2026-11-16; numeric thresholds remain starting values to be
-calibrated once `P5` lands. Note: held fixes from the c-ares supervision branch are written `CA-F2`,
+calibrated once `P5` lands. A reassessment on 2026-11-16 against the scripts and run-1's lease
+records corrected section 1.4 and added `P7g` and section 6, whose points are open. Note: held fixes from the c-ares supervision branch are written `CA-F2`,
 `CA-F10`, and `CA-F11` below so they do not collide with `F1`–`F17` of
 [`./phase1-review.md`](./phase1-review.md).
 
@@ -120,22 +121,42 @@ faster engine, with no warning.
   [`../troubleshooting/resources-and-infra.md`](../troubleshooting/resources-and-infra.md). So the
   broker's CPU figures above understate what ran, and the wall times of section 1.2 come from a
   worker count no lease granted.
-- **`run fuzz` triggered uncached E-ACSL builds alongside `fuzz` leases.** In
-  [`../../templates/pipeline.mk`](../../templates/pipeline.mk), `build-%` is `.PHONY` and
-  `fuzz-%: selftest build-%`, while `STAGE_OF_TARGET` in `pipeline_make.py` puts `build` and `fuzz`
-  in the same Make stage. During Phase 0's `run build`, modules whose DAG `fuzz_engine` was
-  `sanitizers` built only Clang sanitizer binaries. After `cmd-set-eacsl.sh` switched every module
-  to `eacsl`, `run fuzz` ran full ~4.3 GiB Frama-C E-ACSL compilations inside the same `make`
-  invocation as `fuzz-%` jobs holding up to `18,432 MiB` out of `25,088 MiB`, causing head-of-line
-  memory blocking in the container broker. Inside `fuzz-%` itself, `run_eacsl_fuzz.py campaign`
-  calls `build_module_binary` again (repeating failed pre-`link_repair` attempts on modules whose
-  sources needed link repair, and attributing container-wide `memory.peak` when a lease finishes
-  alone in `resources.py`), which accounts for the 4,208 and 4,333 MiB peaks recorded on `ahost` and
-  `channel`.
+- **`run fuzz` built every module again, twice, and three of those builds ran in full without a
+  cache key.** Corrected on 2026-11-16 from the records in `state/resource-history/` and the build
+  and fuzz reports; the first revision named an engine switch, link repair and container-wide
+  `memory.peak`, and none of the three is in the records.
+  - **Two places build during `run fuzz`.** In
+    [`../../templates/pipeline.mk`](../../templates/pipeline.mk), `build-%` is `.PHONY` and
+    `fuzz-%: selftest build-%`, and `STAGE_OF_TARGET` in `pipeline_make.py` puts `build` and `fuzz`
+    in the same Make stage. Inside `fuzz-%`, `run_eacsl_fuzz.py campaign` calls
+    `build_module_binary` once more. Both are meant to be cache restores.
+  - **The builds existed.** All seven modules had full E-ACSL builds (largest process 4.2 to
+    4.3 GiB) before `run fuzz` started. `run build` (348 s) had just run seven leases of 155 to
+    188 s with a largest process of 81 MiB, which is a restore, not a build.
+  - **Six of the seven `build-%` steps were restores, at 154 to 200 s each.**
+    `libcares_a__channel` was built in full instead: 882 s, 4,327 MiB.
+  - **Two campaigns built in full inside their `fuzz` lease.** `libcares_a__channel` took 986 s
+    for 1.8 s of fuzzing, and `ahost` 1,046 s for a 30 s campaign. Both records have the source
+    `rusage`, so the 4,333 and 4,208 MiB are a process of the lease itself, a Frama-C run.
+  - **All three full builds report `"cache": {"hit": false, "key": null}`**, and neither report
+    has a `link_repair` field. `cache.memoize` in [`../../scripts/cache.py`](../../scripts/cache.py)
+    gives a build no key when the dependency scan (`gcc -M -MG`, then `clang -M -MG`, over all 95
+    to 97 sources) fails or passes `DEPS_TIMEOUT_S = 120`.
+  - **The scan is at its limit on c-ares.** Measured on 2026-11-16 in a separate container with
+    2 CPUs while the live run was busy on the same host: the `gcc` scan took 242 s, the `clang`
+    scan 41 s, and `cache.dependency_manifest` returned `None` after 120.0 s. What makes the
+    scan's time vary was not measured: it stayed under 120 s on the restores, and the second full
+    build of `libcares_a__channel` started when only one other lease was running.
+  - **Not confirmed for run-1 itself.** The scan was timed afterwards, and no report records why a
+    key is missing. See "A Module's E-ACSL Build Runs in Full Again Although Nothing Changed" in
+    [`../troubleshooting/resources-and-infra.md`](../troubleshooting/resources-and-infra.md).
+  - **One module makes the whole 2,026 s.** `libcares_a__channel` waited 156 s for its build
+    lease, built for 882 s, and then held its `fuzz` lease for 986 s.
 
 Any larger budget has to be read against this: on run-1 the time that fuzzing did not get went to
-coupled builds and lease queueing, not to Eva. P7e and P7f remove the structural cause, and P5d
-records the breakdown per module so future runs do not require log inspection.
+two uncached builds of one module and to lease queueing, not to Eva. `P7f` removes the builds inside
+`fuzz` leases and `P7g` the lost cache key. `P5d` records
+the breakdown per module so future runs do not require log inspection.
 
 ## 2. Proposals
 
@@ -146,10 +167,11 @@ design review.
 The implementation order puts infrastructure and accounting fixes **before** `P5` calibration, so
 that speeds and memory peaks are not measured under ignored sub-leases or phony `build-%` stalls:
 
-1. **Step 0 — Infrastructure & accounting prerequisites (`P7e`, `P7f`, `P1c`, `P10c`, `P2b`).**
-   Honor `FRAMAC_SUBLEASE_ID` in `job_budget`/`enforced_memory_mb`; separate `build` from `fuzz` so
-   no compilation runs inside a `fuzz` lease (aligned with `D8` of
-   [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md)); charge only libFuzzer execution
+1. **Step 0 — Infrastructure & accounting prerequisites (`P7e`, `P7f`, `P7g`, `P1c`, `P10c`,
+   `P2b`).** Honor `FRAMAC_SUBLEASE_ID` in `job_budget`/`enforced_memory_mb`; separate `build` from
+   `fuzz` so no compilation runs inside a `fuzz` lease (aligned with `D8` of
+   [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md)); keep a build's cache key when
+   the dependency scan is slow, and report a missing key; charge only libFuzzer execution
    time to the round budget; clamp `RLIMIT_CORE` to `min(1, hard)` in `sandbox_exec.py`; warn on
    `--fuzz-engine eacsl`.
 2. **Step 1 — Telemetry (`P5a`, `P5b`, `P5d`).** Multi-job coverage/RSS/exec-s series, per-engine
@@ -346,7 +368,19 @@ What these rules do in practice:
 ### P4. Running Phase 1 fuzzing alongside Phase 2 Eva (Rejected)
 
 Label kept because earlier notes cite `P4`. **Decided on 2026-11-16: do not overlap Phase 1 fuzzing
-and Phase 2 Eva; keep `fuzz` and `eva` in separate Make stages (`STAGE_OF_TARGET`).**
+and Phase 2 Eva.**
+
+The code and the skills do not enforce this today (read on 2026-11-16), so the decision needs a
+change, not only restraint:
+
+- **`STAGE_OF_TARGET` puts `fuzz` and `eva` in the same stage (4).** `pipeline_make.py run fuzz eva`
+  runs both in one `make` invocation, in parallel.
+- **Two skills offer the overlap.** `skills/framac-verify/SKILL.md` (step 3) and
+  `skills/framac-fuzz/SKILL.md` (step 3) allow `run fuzz` and `run eva` concurrently when the host
+  harness supports background calls.
+- **What enforcing it takes:** a later stage for `eva` than for `fuzz` (and for `coverage` and
+  `reach-dynamic`, whose gate is meant to stop Eva), and the two skill sentences removed. Not
+  decided; listed in section 6.
 
 Why it is rejected:
 
@@ -442,7 +476,7 @@ Why naive OOM-rely fails in today's broker:
    `idempotent=False` and `cmd_run` retries at most once (`attempt == 1`). Thus the broker today
    **never** detects an OOM-killed fuzz worker.
 3. In `-fork` mode, libFuzzer's parent records a `SIGKILL`ed child as a `crash-*` file unless
-   filtered.
+   filtered. (Not verified in `framac-analysis:latest`; `P7d`'s filter is harmless if it is wrong.)
 4. `RUSAGE_CHILDREN` (`maxrss`) measures one child's max RSS, whereas `history_estimate` treats
    `peak_mb` as a whole-job floor; and ASan's default `256 MiB` quarantine per worker makes ASan
    workers larger than run-1's 56–125 MiB E-ACSL processes.
@@ -456,6 +490,17 @@ Settled design:
   `fuzz-%` in `templates/pipeline.mk`, stage `build` strictly before `fuzz` in `STAGE_OF_TARGET`,
   and have `fuzz-%` and `judge-%` consume the binaries recorded in `workspace/build/<mod>.build.json`
   (reusing repaired `link_repair` source lists without re-running failed link attempts).
+- **P7g. A slow dependency scan must not cost a full build.** Added on 2026-11-16 from the
+  reassessment of section 1.4; not yet discussed, and nothing below was tried. `P7f` removes the
+  two rebuilds inside `fuzz` leases, but `build-%` itself still builds in full when
+  `cache.dependency_manifest` returns `None`. What it needs:
+  - **Say why a key is missing.** The `cache` field records `timeout`, `tool_failed` or
+    `no_sources`, and the build warns. Today a missing key looks like an ordinary cache miss.
+  - **Make the scan's time independent of the module's size**, or size its timeout from the number
+    of sources. A full E-ACSL build of a c-ares module costs about 15 minutes and 4.3 GiB; the
+    scan it replaces took 242 s at worst.
+  - **Measure the scan first.** A cache hit cost 154 to 200 s on run-1, most of it presumably the
+    scan; where that time goes (the two tools, hashing, the bind mount) was not measured.
 - **P7a. Keep `-rss_limit_mb=2048` and default ASan quarantine unchanged** so OOM and UAF findings
   never change with hardware or reservation sizing.
 - **P7b & P7c. Size per-worker leases from libFuzzer `peak_rss_mb` plus a `2,048 MiB` container
@@ -647,11 +692,14 @@ Measured on minmea's fuzz binaries (`framac-analysis:latest`, 2 CPUs, five runs 
 | An input that fails, as the pipeline runs it | 452 ms | 440 ms |
 | The same with `symbolize=0` in `ASAN_OPTIONS` and `UBSAN_OPTIONS` | 94 ms | 88 ms |
 
-- **350 ms per failure goes to per-process `llvm-symbolizer` startup and DWARF parsing.** Notably,
+- **`symbolize=0` removes about 350 ms per failure.** A standalone `llvm-symbolizer` call on the
+  same binary takes 27 ms (see `P10a`), so the symbolizer's own start-up is not most of it; where
+  the rest goes was not measured. Notably,
   `run_fuzz_campaign` in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py)
   currently runs `-fork` campaigns with `symbolize=1` even though it discards in-campaign stack
-  traces and re-runs `replay_artifact` on saved crash files afterwards (costing ~700 CPU-seconds of
-  wasted symbolization across 2,000 crashes on `adig`/`ahost`).
+  traces and re-runs `replay_artifact` on saved crash files afterwards (about 700 CPU-seconds
+  across 2,000 crashes on `adig`/`ahost`, if minmea's 350 ms per failure holds there; not measured
+  on c-ares).
 - **With `symbolize=0`, ASan, UBSan, and libFuzzer still emit deterministic module-relative frame
   offsets** (`(/path/to/binary+0x42ab0)`) at zero runtime cost.
 - **Piped `core_pattern` (`RLIMIT_CORE`):** On WSL2 / piped `core_pattern` hosts, a standalone
@@ -669,7 +717,10 @@ Settled design:
   Set `symbolize=0` in `ASAN_OPTIONS` and `UBSAN_OPTIONS` across **`explore` (`run_fuzz_campaign`),
   `judge`, and `replay_artifact`**. At the end of a `judge` or `replay` pass, collect all unique
   `(binary, +0xoffset)` pairs from failing outputs and resolve them in **one** `llvm-symbolizer`
-  invocation (~20–50 ms total regardless of failure count, zero binary reruns), rewriting raw offset
+  invocation (no binary reruns; measured on 2026-11-16 in `framac-analysis:latest`, five runs each:
+  27 ms on minmea's 2 MB sanitizer binary for 1 or for 50 addresses; on c-ares's 17 MB
+  `fuzz_adig.e-acsl`, 32 ms for 1 address and about 110 ms for 50, with 230 to 790 ms for the first
+  call on a file not yet read), rewriting raw offset
   lines into standard `#N 0x... in fn file:line` frames before `parse_sanitizer_failure` and
   `stack_frames` run. For unlocated E-ACSL libc/format failures (`needs_attribution`), group
   failures by `(eacsl_message, raw_offset_stack)` first and run sanitizer attribution once per unique
@@ -677,7 +728,10 @@ Settled design:
 - **P10c. Clamp `RLIMIT_CORE` to `min(1, hard)` in `sandbox_exec.py`.** Query
   `soft, hard = resource.getrlimit(RLIMIT_CORE)` in `_make_preexec` and set `(target, target)` with
   `target = 1 if hard != 0 else 0` (`RLIM_INFINITY` is `-1` in Python `resource`, so `hard != 0`
-  handles both positive limits and `RLIM_INFINITY` safely).
+  handles both positive limits and `RLIM_INFINITY` safely). The unmerged branch
+  `fix/sandbox-core-limit` (`21a1144`) sets the limit to 1 without this clamp; add it there before
+  merging. The pipeline itself never passes `--ulimit core`, so the clamp matters on hosts whose
+  runtime sets a hard limit of 0.
 
 ## 3. What not to do
 
@@ -705,6 +759,9 @@ Settled design:
 
 - **One run, one engine.** Section 1's campaign numbers come from c-ares run-1, fuzzed with E-ACSL
   only under the sub-lease bug (`9` workers regardless of lease).
+- **Section 1.4's cause was measured after the run.** The lease records and the missing cache keys
+  are run-1's own; the 242 s dependency scan was timed on 2026-11-16 on a busy host, not during
+  run-1.
 - **The held c-ares fixes change c-ares specifically.** `CA-F2` (`setjmp`), `CA-F10` (`%u`), and
   `CA-F11` (tail-merged literals) remove both c-ares false-positive families and the wrong DAG
   choice; the architectural defects (`P1c`, lack of per-case blinding, single-job telemetry `P5a`,
@@ -732,3 +789,34 @@ Settled design:
   alarm kinds, how often multi-line statements cause 1–3 line offsets between Frama-C CIL (`alarms.csv`),
   E-ACSL `.instrumented.c`, and `llvm-cov` regions, and whether `executed_unchecked` counts on
   `unsigned_overflow` / `signed_downcast` justify an optional `--keep-going` judge build later.
+
+## 6. Open design points from the reassessment of 2026-11-16
+
+The revision was checked against the scripts and run-1's records after it was written. Section 1.4,
+`P7g`, the `P4` note and the figures in `P10` were corrected in place. The points below are not
+decided. Each is reasoned from the code or from how libFuzzer is known to behave; none was tested.
+
+- **`P6a`: a crash file from the floor pass does not name its case.** Only corpus files get byte 0
+  rewritten to the pinned case before `P6b`. A `crash-*` file written under
+  `FRAMAC_FUZZ_ONLY_CASE=<k>` keeps whatever byte 0 the mutation left, so the judge, `replay` and
+  the crash verifier, which run without the variable, would dispatch it to another case and not
+  reproduce it. Either rewrite byte 0 of floor-pass artifacts the same way, or record the case
+  with the artifact and replay with the variable set. In an E-ACSL build the variable is only
+  visible with the `environ_keep` shim, as for `FRAMAC_FUZZ_SKIP_CASES`.
+- **`P8`: leaving `exit()` with `siglongjmp` may be reported as a leak.** Whatever `main`
+  allocated before `usage()` stays allocated. libFuzzer checks for leaks by default, and the
+  pipeline sets only `abort_on_error=1` in `ASAN_OPTIONS`. Decide between `-detect_leaks=0` for
+  `argv` harnesses (real leaks are then not reported there) and classifying a leak found on an
+  input that ended in `__wrap_exit` as an artifact of the wrap.
+- **`P6a` with `P3`: the floor can use the whole cap.** With 182 cases under `standard`, the safety
+  stops alone allow 182 x 120 = 21,840 CPU-s against a cap of 21,600. Say whether the floor pass
+  is charged to the unit's budget, and if so, bound its total.
+- **`P9d`: dropping `-skip-expansions` changes `coverage-%` too.** `summarize_coverage_export`
+  reads the same export for the coverage report and the dynamic reach gate. Check what the extra
+  expansion regions do to its function and line counts before changing the flag, or export twice.
+- **`P4`: enforcing the rejection.** See the note under `P4`: a stage change in `STAGE_OF_TARGET`
+  and two skill sentences.
+- **`P7g`: not discussed yet.** Which of its three parts to do, and whether a cache hit that costs
+  154 to 200 s on a 95-source module is acceptable once nothing is rebuilt.
+- **Labels.** The supervision report has no `CA-F` label: it writes `F2`, `F10` and `F11` for the
+  held c-ares fixes that this document calls `CA-F2`, `CA-F10` and `CA-F11`.
