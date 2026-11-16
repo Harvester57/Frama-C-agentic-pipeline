@@ -43,7 +43,13 @@ byte selects it), with arguments built from the model's signature of each functi
     zeroed byte buffer is no such object: it is not aligned for the struct behind
     the handle and fails the target's own validity checks. Built only when the call takes one handle
     of the type and both functions are known; otherwise, and without a probe, the parameter is a
-    byte pointer as below and the case's `notes` say why;
+    byte pointer as below and the case's `notes` say why. When no constructor returns the handle, an
+    out-parameter constructor builds it (`outparam_constructors`: `ares_dns_record_create(H **, ...)`
+    writes `H *h = NULL` through `&h`; the call runs only on a non-NULL `h`), and a child handle with
+    no destructor is added to a parent built first, which is released after the call
+    (`ares_dns_record_rr_add(ares_dns_rr_t **, ares_dns_record_t *, ...)`). A pointer to a struct the
+    headers only declare is never declared as an object (it would not compile): with no constructor,
+    no destructor, or two such handles in one call the function is skipped with the reason;
   - a pointer to another scalar or struct: one object (an output, or read from the input when `const`
     and the struct has no pointers; zeroed otherwise);
   - a function pointer: a callback stub of its prototype (`callback_stub`, defined after the headers:
@@ -129,6 +135,10 @@ FUZZ_COPY = "FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off)"
 _INIT_NAME_RE = re.compile(
     r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)init(?:$|_)|_new$|_create$"
 )
+# Out-parameter constructor names (`H **` written by the call): the initializer names, and parsers and
+# adders (c-ares's ares_dns_record_create, ares_init, ares_dns_parse, ares_dns_record_rr_add).
+_OUT_CTOR_NAME_RE = re.compile(rf"{_INIT_NAME_RE.pattern}|(?:^|_)(?:create|new|alloc|parse|add)(?:$|_)")
+MAX_HANDLE_DEPTH = 3  # parents built for a child handle (a record set needs its record)
 # Destructor names: seccomp_release, foo_free, bar_destroy, ctx_close, FooFree.
 _DTOR_NAME_RE = re.compile(
     r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|"
@@ -159,8 +169,19 @@ class ApiHarnessError(ValueError):
     pass
 
 
-class _DeclError(Exception):
+class _CaseError(Exception):
+    """A case the generator cannot build: it is skipped with the exception's text as the reason."""
+
+
+class _DeclError(_CaseError):
     """A case would declare a variable twice, or under a name that is not an identifier: the case is skipped."""
+
+
+class _Unbuildable(_CaseError):
+    """
+    A case needs an object the generator cannot make: an opaque handle (a pointer to a struct the headers
+    only declare) with no constructor or destructor known. A stack object of that struct would not compile.
+    """
 
 
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
@@ -240,6 +261,14 @@ class ApiInfo:
     dtors: dict[str, str] = field(default_factory=dict)
     dtor_names: dict[str, set[str]] = field(default_factory=dict)
     returns: dict[str, str] = field(default_factory=dict)  # function -> the handle type it returns
+    # Out-parameter handles (`outparam_constructors`): per function, parameter index -> the handle type
+    # it writes through `H **`; per handle type, the out-parameter constructor chosen (when no
+    # constructor returns it) with its out index, every candidate, and the parent handle the chosen
+    # one takes (parameter index, type): a child handle the parent owns.
+    outs: dict[str, dict[int, str]] = field(default_factory=dict)
+    out_ctors: dict[str, tuple[str, int]] = field(default_factory=dict)
+    out_ctor_names: dict[str, set[str]] = field(default_factory=dict)
+    parents: dict[str, tuple[int, str]] = field(default_factory=dict)
     # Function-pointer parameters whose prototype the layout probe spelled (`callback_prototypes`), and
     # the callback stubs the cases use (stub name -> its file-scope definition, `callback_stub`).
     callbacks: dict[str, dict[int, dict[str, Any]]] = field(default_factory=dict)
@@ -445,6 +474,81 @@ def _handle_call(case: _Case, htype: str, var: str, call: int, param: int) -> st
     return stmt.replace("(void)", f"{htype} {case.declare(var)} = ", 1)
 
 
+def _opaque(htype: str) -> bool:
+    """
+    A handle type naming a pointer to a struct the headers only declare (`struct tag *`, as
+    `handle_prototypes` names it): no object of the struct can be declared, only pointers to one. A
+    typedef of `void *` (`scmp_filter_ctx`) is not: a zeroed buffer stands in for it and compiles.
+    """
+    return htype.endswith("*")
+
+
+def _constructible(api: ApiInfo, htype: str) -> bool:
+    return htype in api.ctors or htype in api.out_ctors
+
+
+def _releasable(api: ApiInfo, htype: str) -> bool:
+    """A destructor releases the handle, or it is a child its parent owns (no destructor, built from a parent)."""
+    return htype in api.dtors or (htype not in api.ctors and htype in api.parents)
+
+
+_RESERVED_REST: dict[str, Any] = {"reserved": True}
+
+
+def _construct(
+    case: _Case, htype: str, var: str, call: int, param: int, depth: int = 0
+) -> tuple[list[str], str | None, list[str], str | None]:
+    """
+    Build a handle of `htype` in `var` before call `call`: (the statements that declare and build it,
+    its own release or None, the releases of the parents built for it (child first), the guard the
+    call needs or None). A constructor that returns the handle is called as before (`_handle_call`).
+    An out-parameter constructor gets `&var` (`H var = 0;`), and the call runs only when it wrote a
+    handle (`var != 0`); a child handle's parent is built first, the child's constructor runs only on
+    a built parent, and the parent is released after the call: it owns the child. An out-parameter
+    constructor never takes the rest of the input: it stays for the call under test.
+    """
+    api = case.api
+    if htype in api.ctors:
+        release = f"if ({var} != 0) {{ (void){api.dtors[htype]}({var}); }}" if htype in api.dtors else None
+        return [_handle_call(case, htype, var, call, param)], release, [], None
+    fn, out = api.out_ctors[htype]
+    rec = api.records.get(fn) or {}
+    params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if params is None:
+        raise _Unbuildable(f"{fn}, the constructor of opaque handle {htype}: {why}")
+    before: list[str] = []
+    later: list[str] = []
+    shared = {out: f"&{var}"}
+    parent_guard: str | None = None
+    if htype in api.parents:
+        pidx, ptype = api.parents[htype]
+        if depth >= MAX_HANDLE_DEPTH or not _constructible(api, ptype):
+            raise _Unbuildable(f"no constructor for opaque handle {ptype}")
+        if not _releasable(api, ptype):
+            raise _Unbuildable(f"no destructor for opaque handle {ptype}")
+        pvar = f"{var}p"
+        pstmts, prelease, pparents, pguard = _construct(case, ptype, pvar, call, param, depth + 1)
+        before += pstmts
+        later = [*([prelease] if prelease else []), *pparents]
+        shared[pidx] = pvar
+        parent_guard = pguard or f"{pvar} != 0"
+    k = case.ncalls + len(case.inits)
+    case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
+    reserved = case.rest is None
+    if reserved:
+        case.rest = _RESERVED_REST
+    try:
+        stmt = _bind_call(case, k, fn, params, list(rec.get("formals") or []), rec, shared, allow_init=False)
+    finally:
+        if reserved and case.rest is _RESERVED_REST:
+            case.rest = None
+    if parent_guard:
+        stmt = f"if ({parent_guard}) {{ {stmt} }}"
+    before.append(f"{htype} {case.declare(var)} = 0; {stmt}")
+    release = f"if ({var} != 0) {{ (void){api.dtors[htype]}({var}); }}" if htype in api.dtors else None
+    return before, release, later, f"{var} != 0"
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -466,33 +570,55 @@ def _bind_call(
     args: list[str] = []
     before: list[str] = []
     after: list[str] = []
-    handles = case.api.handles.get(name) or {}
+    guards: list[str] = []
+    api = case.api
+    handles = api.handles.get(name) or {}
+    outs = api.outs.get(name) or {}
     i = 0
     n = len(params)
     while i < n:
         p = params[i]
         v = f"c{call}a{i}"
         nxt = params[i + 1] if i + 1 < n else None
-        htype = handles.get(i) if allow_init and i not in shared and p["kind"] == "ptr" else None
-        if htype is not None and htype in case.api.ctors:
+        htype = handles.get(i) if i not in shared and p["kind"] == "ptr" else None
+        # A pointer to a struct the headers only declare is a handle or nothing: never a stack object.
+        if htype is not None and (allow_init or _opaque(htype)):
             same = sum(1 for t in handles.values() if t == htype)
-            if htype not in case.api.dtors:
+            if not allow_init or not _constructible(api, htype):
+                if _opaque(htype):
+                    raise _Unbuildable(f"no constructor for opaque handle {htype}")
+            elif not _releasable(api, htype):
+                if _opaque(htype):
+                    raise _Unbuildable(f"no destructor for opaque handle {htype}")
                 case.note(call, i, f"{htype}: no destructor known: a zeroed buffer, not a constructed handle")
             elif same > 1:
-                case.note(
-                    call,
-                    i,
-                    f"{htype}: the call takes {same} such handles and who owns them afterwards is not known: "
-                    "zeroed buffers, not constructed handles",
-                )
+                why = f"{htype}: the call takes {same} such handles and who owns them afterwards is not known"
+                if _opaque(htype):
+                    raise _Unbuildable(why)
+                case.note(call, i, f"{why}: zeroed buffers, not constructed handles")
             else:
                 # A handle: the constructor's result, released afterwards unless this call is the release.
-                before.append(_handle_call(case, htype, v, call, i))
-                if name not in case.api.dtor_names.get(htype, set()):
-                    after.append(f"if ({v} != 0) {{ (void){case.api.dtors[htype]}({v}); }}")
+                made_here, release, parents_release, guard = _construct(case, htype, v, call, i)
+                before += made_here
+                if guard:
+                    guards.append(guard)
+                if release and name not in api.dtor_names.get(htype, set()):
+                    after.append(release)
+                after += parents_release
                 args.append(f"({p['type']}){v}")
                 i += 1
                 continue
+        out_h = outs.get(i) if i not in shared and p["kind"] == "ptr" and not _is_input(formals, i) else None
+        if out_h is not None:
+            # A handle the call writes (`H **`): a NULL handle, its address passed. A constructor's own
+            # case releases what it built; another function's output may be borrowed, and a child's
+            # parent owns it, so neither is released.
+            case.decls.append(f"{out_h} {case.declare(v)} = 0;")
+            args.append(f"({p['type']})&{v}")
+            if allow_init and name in api.out_ctor_names.get(out_h, set()) and out_h in api.dtors:
+                after.append(f"if ({v} != 0) {{ (void){api.dtors[out_h]}({v}); }}")
+            i += 1
+            continue
         if i in shared:
             args.append(f"({p['type']}){shared[i]}")
             if nxt is not None and (i + 1) not in shared and _is_pair(params, i, formals):
@@ -641,8 +767,12 @@ def _bind_call(
         # The call under test makes a handle: release it, or every run of the case leaks one.
         r = f"c{call}r"
         own = f"{{ {made} {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){case.api.dtors[made]}({r}); }} }}"
-        return " ".join([*before, own, *after])
-    return " ".join([*before, f"(void){name}({', '.join(args)});", *after])
+    else:
+        own = f"(void){name}({', '.join(args)});"
+    if guards:
+        # Only on handles an out-parameter constructor built: one that failed wrote nothing.
+        own = f"if ({' && '.join(guards)}) {{ {own} }}"
+    return " ".join([*before, own, *after])
 
 
 def plan_params(signature: str, formals: Sequence[Any] | None = None) -> tuple[list[dict] | None, str | None]:
@@ -696,7 +826,7 @@ def single_case(
     case = _Case(spare, api, calls=1)
     try:
         call = _bind_call(case, 0, name, params, list(model_rec.get("formals") or []), model_rec)
-    except _DeclError as e:
+    except _CaseError as e:
         return None, None, str(e)
     return case.statements([call]), case.layout("single", [name]), None
 
@@ -798,7 +928,7 @@ def variadic_case(
         rec = {**model_rec, "param_sizes": sizes}
         literal = c_string_literal(fmt_bytes)
         call = _bind_call(case, 0, name, params, formals, rec, {fmt_at: literal}, extra_args=extra)
-    except _DeclError as e:
+    except _CaseError as e:
         return None, None, str(e)
     layout = case.layout(VARIADIC_KIND, [name])
     layout.update(format=fmt, format_param=fmt_at, varargs=varargs)
@@ -873,7 +1003,9 @@ def initializers(
         if not params or params[0]["kind"] != "ptr" or _is_input(formals, 0):
             continue
         pointee = str(params[0].get("pointee") or "")
-        if not _is_record(pointee):
+        # A `struct tag **` first parameter is an out-parameter constructor (`outparam_constructors`),
+        # not an initializer of a struct object.
+        if not _is_record(pointee) or "*" in pointee:
             continue
         cands.setdefault(pointee, set()).add(name)
         records[name] = rec
@@ -941,6 +1073,85 @@ def handle_functions(
     ctors = {t: min(names, key=lambda n: (len(protos[n]["params"]), n)) for t, names in ctor_cands.items()}
     dtors = {t: min(names) for t, names in dtor_cands.items()}
     return handles, ctors, dtors, dtor_cands, {n: by_name[n] for n in ctors.values()}, returns
+
+
+@dataclass
+class OutParamConstructors:
+    """`outparam_constructors`: what `ApiInfo` takes (`outs`, `out_ctors`, `out_ctor_names`, `parents`) and the records."""
+
+    outs: dict[str, dict[int, str]] = field(default_factory=dict)
+    ctors: dict[str, tuple[str, int]] = field(default_factory=dict)
+    names: dict[str, set[str]] = field(default_factory=dict)
+    parents: dict[str, tuple[int, str]] = field(default_factory=dict)
+    records: dict[str, dict] = field(default_factory=dict)
+
+
+def outparam_constructors(
+    functions: dict[str, dict],
+    visible: set[str] | None,
+    handles: dict[str, dict[int, str]],
+    traces: list[list[dict]] | None = None,
+) -> OutParamConstructors:
+    """
+    Constructors that write an opaque handle through an out-parameter (`H **`, the layout probe's
+    `outs`, written by the call: a non-const pointer in the model's formals), as c-ares builds its
+    handles: `ares_dns_record_create(ares_dns_record_t **, ...)`, `ares_init(ares_channel_t **)`,
+    `ares_dns_parse(buf, len, flags, ares_dns_record_t **)`. A candidate is named like an initializer,
+    a creator, a parser or an adder (`_OUT_CTOR_NAME_RE`), writes one handle, and takes at most one
+    other handle, never one of the type it builds: that other handle is its parent, which owns the
+    child (`ares_dns_record_rr_add(ares_dns_rr_t **, ares_dns_record_t *, ...)`). Per handle type the
+    recorded traces decide (the candidate called first), else a candidate without a parent, the
+    plainest name (an initializer's), the fewest parameters, then the name.
+    """
+    protos = getattr(visible, "prototypes", None) or {}
+    out = OutParamConstructors()
+    by_name: dict[str, dict] = {}
+    for key, rec in functions.items():
+        if isinstance(rec, dict) and not (rec.get("static") and not rec.get("header")):
+            by_name.setdefault(str(rec.get("name") or key.split("#")[-1]), rec)
+    cands: dict[str, list[str]] = {}
+    for name, rec in by_name.items():
+        proto = protos.get(name)
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if not isinstance(proto, dict) or params is None or len(proto.get("params") or []) > len(params):
+            continue
+        formals = list(rec.get("formals") or [])
+        written = {
+            int(i): str(t)
+            for i, t in (proto.get("outs") or {}).items()
+            if t and int(i) < len(params) and params[int(i)]["kind"] == "ptr" and not _is_input(formals, int(i))
+        }
+        if not written:
+            continue
+        out.outs[name] = written
+        takes = handles.get(name) or {}
+        if len(written) != 1 or len(takes) > 1 or not _OUT_CTOR_NAME_RE.search(name):
+            continue
+        ((_, htype),) = written.items()
+        if htype in takes.values():
+            continue  # a copy (`*_dup(dest, src)`) needs a handle of the type first
+        cands.setdefault(htype, []).append(name)
+        out.records[name] = rec
+
+    def plainest(n: str) -> tuple[bool, bool, int, str]:
+        parts = split_signature(str(by_name[n].get("signature") or ""))
+        return (bool(handles.get(n)), not _INIT_NAME_RE.search(n), len(parts[1]) if parts else 99, n)
+
+    chosen: dict[str, str] = {}
+    for trace in traces or []:
+        for c in trace:
+            for htype, names in cands.items():
+                if c.get("fn") in names and htype not in chosen:
+                    chosen[htype] = str(c["fn"])
+    for htype, names in cands.items():
+        fn = chosen.get(htype) or min(names, key=plainest)
+        out.ctors[htype] = (fn, next(iter(out.outs[fn])))
+        out.names[htype] = set(names)
+        takes = handles.get(fn) or {}
+        if takes:
+            out.parents[htype] = next(iter(takes.items()))
+    out.records = {fn: out.records[fn] for fn, _ in out.ctors.values()}
+    return out
 
 
 def load_traces(path: Path = TRACES_JSONL) -> list[list[dict]]:
@@ -1016,7 +1227,7 @@ def sequence_case(
     """
     try:
         return _sequence_case(trace, chain, records, spare, api)
-    except _DeclError as e:
+    except _CaseError as e:
         return None, None, str(e)
 
 
@@ -1092,6 +1303,8 @@ def lifecycle_methods(htype: str, records: dict[str, dict], api: ApiInfo) -> lis
             continue
         if name == api.ctors.get(htype) or name in api.dtor_names.get(htype, set()):
             continue
+        if name == (api.out_ctors.get(htype) or ("", 0))[0]:
+            continue
         out.append(name)
     return out[:MAX_CASES]
 
@@ -1114,7 +1327,7 @@ def lifecycle_case(
     """
     try:
         return _lifecycle_case(htype, methods, records, spare, api, max_calls)
-    except _DeclError as e:
+    except _CaseError as e:
         return None, None, str(e)
 
 
@@ -1122,6 +1335,11 @@ def _lifecycle_case(
     htype: str, methods: list[str], records: dict[str, dict], spare: int, api: ApiInfo, max_calls: int
 ) -> tuple[str | None, dict | None, str | None]:
     ctor, dtor = api.ctors.get(htype), api.dtors.get(htype)
+    out: int | None = None
+    if ctor is None and htype in api.out_ctors:
+        ctor, out = api.out_ctors[htype]
+        if htype in api.parents:
+            return None, None, f"{htype}: its constructor {ctor} needs a parent handle"
     if ctor is None or dtor is None:
         return None, None, f"{htype}: no constructor or destructor known"
     if not methods:
@@ -1132,9 +1350,15 @@ def _lifecycle_case(
         return None, None, f"{ctor}: {why}"
     ncalls = len(methods) + 2
     case = _Case(spare, api, calls=ncalls)
-    make = _bind_call(case, 0, ctor, cparams, list(crec.get("formals") or []), crec, allow_init=False)
-    # Without initializers the statement is the call alone: keep its result instead of dropping it.
-    make = make.replace("(void)", f"{htype} {case.declare('fc_h')} = ", 1)
+    formals = list(crec.get("formals") or [])
+    if out is None:
+        make = _bind_call(case, 0, ctor, cparams, formals, crec, allow_init=False)
+        # Without initializers the statement is the call alone: keep its result instead of dropping it.
+        make = make.replace("(void)", f"{htype} {case.declare('fc_h')} = ", 1)
+    else:
+        # An out-parameter constructor writes the handle; one that fails leaves it NULL.
+        make = _bind_call(case, 0, ctor, cparams, formals, crec, {out: "&fc_h"}, allow_init=False)
+        make = f"{htype} {case.declare('fc_h')} = 0; {make}"
     branches: list[str] = []
     for k, name in enumerate(methods):
         rec = records[name]
@@ -1212,17 +1436,24 @@ def plan(
     }
     inits, candidates, init_records = initializers(init_pool, traces, visible)
     handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
+    outp = outparam_constructors(init_pool, visible, handles, traces)
+    # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
+    out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
     api = ApiInfo(
         structs=dict(struct_layouts or {}),
         probed=struct_layouts is not None,
         inits=inits,
         candidates=candidates,
-        records={**init_records, **ctor_records},
+        records={**init_records, **ctor_records, **{c[0]: outp.records[c[0]] for c in out_ctors.values()}},
         handles=handles,
         ctors=ctors,
         dtors=dtors,
         dtor_names=dtor_names,
         returns=returns,
+        outs=outp.outs,
+        out_ctors=out_ctors,
+        out_ctor_names=outp.names,
+        parents={t: p for t, p in outp.parents.items() if t in out_ctors},
         callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
     )
     for key in entries:
@@ -1278,7 +1509,7 @@ def plan(
     # type: sequence_case passes a shared handle as a zeroed buffer (an incomplete struct does not
     # even compile), never the constructor's result, which the traces do not record.
     n_seq = len(seq_seen)
-    for htype in sorted(set(api.ctors) & set(api.dtors)):
+    for htype in sorted((set(api.ctors) | set(api.out_ctors)) & set(api.dtors)):
         if n_seq >= MAX_SEQUENCE_CASES:
             break
         methods = lifecycle_methods(htype, records, api)
@@ -1523,20 +1754,27 @@ def handle_prototypes(tree: dict, complete: set[str]) -> dict[str, dict[str, Any
             return f"{base} *"
         return None
 
+    def out_handle(t: str) -> str | None:
+        """The handle type an `H **` parameter points to (`rec_t **` -> `struct rec *`), else None."""
+        full = resolve(_spelled(t))
+        return handle(full[:-1]) if full.endswith("*") else None
+
     out: dict[str, dict[str, Any]] = {}
     for node in decls:
         name = node.get("name")
         qual = str((node.get("type") or {}).get("qualType") or "")
         if not isinstance(name, str) or "(" not in qual:
             continue
-        params = [
-            handle(str((n.get("type") or {}).get("qualType") or ""))
+        written = [
+            str((n.get("type") or {}).get("qualType") or "")
             for n in node.get("inner") or []
             if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"
         ]
+        params = [handle(t) for t in written]
+        outs = {i: h for i, t in enumerate(written) if (h := out_handle(t)) is not None}
         ret = handle(qual[: qual.index("(")])
-        if ret or any(params):
-            out.setdefault(name, {"ret": ret, "params": params})
+        if ret or any(params) or outs:
+            out.setdefault(name, {"ret": ret, "params": params, **({"outs": outs} if outs else {})})
     return out
 
 
@@ -1883,6 +2121,12 @@ def generate(
             lay["selector"] = sel
         return [*planned["cases"], *custom], lays, dict(planned["skipped"])
 
+    warnings: list[str] = []
+    if header is None:
+        # c-ares run-1: 18 of 19 cases dropped as `call to undeclared function`. Not a failure: a header
+        # given through --extra-include, or a module of one function, still works.
+        warnings.append(no_header_warning(dag_file.parent / "build_capture.json"))
+        print(f"api_harness: warning: {warnings[-1]}", file=sys.stderr)
     traces = load_traces(traces_path)
     if variadic is None:
         from variadic_calls import ensure
@@ -2039,4 +2283,24 @@ def generate(
         api_custom=sum(1 for lay in layouts if lay["kind"] == CUSTOM_KIND),
         api_skipped=skipped,
     )
+    if warnings:
+        result["api_warnings"] = warnings
     return result
+
+
+def no_header_warning(capture_path: Path) -> str:
+    """
+    Why an `--api` harness without `--header` loses its cases: the harness declares only the first
+    entry point, so every other case calls an undeclared function and the compile probe drops it.
+    Names the build capture's public headers (`public_headers.files`) when it has them.
+    """
+    cap = load_json_optional(capture_path, None)
+    pub = cap.get("public_headers") if isinstance(cap, dict) else None
+    files = pub.get("files") if isinstance(pub, dict) else None
+    names = sorted({Path(str(f)).name for f in files or [] if f})
+    hint = f" (the build capture's public headers: {', '.join(names)})" if names else ""
+    return (
+        "--api without --header: the harness includes no header of the target and declares only its first "
+        "entry point, so the compile probe drops every other case as `call to undeclared function`; pass "
+        f"--header <public header>{hint}"
+    )
