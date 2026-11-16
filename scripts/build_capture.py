@@ -1805,6 +1805,18 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
     return report, 0
 
 
+def includes_setjmp_h(system_deps: list[str]) -> bool:
+    """
+    Whether a compile's system headers include the libc's `<setjmp.h>`, whose setjmp declaration Frama-C
+    rejects (CERT MSC38-C): E-ACSL builds against glibc, so it cannot build that code
+    (build_callgraph_dag.route_nonlocal_jumps). The libc's private `bits/setjmp.h` does not count: glibc's
+    `<pthread.h>` includes it for `__jmp_buf` and declares `__sigsetjmp`, and E-ACSL builds that.
+    """
+    return any(
+        posixpath.basename(d) == "setjmp.h" and posixpath.basename(posixpath.dirname(d)) != "bits" for d in system_deps
+    )
+
+
 def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, timeout: int, jobs: int) -> None:
     """Units, flags, symbols, entry points and the snapshot of a successful build."""
     t = str(tree)
@@ -1848,8 +1860,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
             r = tree_rel(d, t)
             (project if r is not None else system).append(r if r is not None else d)
         c["headers"] = sorted(set(project))
-        # E-ACSL builds against glibc, whose setjmp.h Frama-C rejects (build_callgraph_dag.route_nonlocal_jumps).
-        c["includes_setjmp_h"] = any(posixpath.basename(d) == "setjmp.h" for d in system)
+        c["includes_setjmp_h"] = includes_setjmp_h(system)
         system_headers |= set(system)
     fn_of = {c["object"]: function_ids(c, syms[c["object"]], t) for c in entries}
     for c in entries:
