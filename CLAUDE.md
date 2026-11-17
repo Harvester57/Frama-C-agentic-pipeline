@@ -1,10 +1,14 @@
 This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
 
-## Windows shell & file-writing rules
-- Never write code, tests, or docs containing backslashes (ACSL `\valid_read`, `\result`, regex, `\n`) through shell heredocs. Use the Write/Edit tools instead.
-- Write files with LF line endings. In Python scripts, open files with `newline='\n'`.
-- Pass git commit messages through a file (`git commit -F msg.txt`), not through a PowerShell pipe.
-- If Git Bash hits fork errors under load, switch to PowerShell instead of retrying.
+## Writing files on Windows
+- NEVER use shell heredocs (bash `cat <<EOF` or PowerShell here-strings) to write source, test, or doc files. They drop or mangle backslashes in ACSL (\valid_read, \result) and Python string literals, and they can insert literal \n or control characters. Use the Write/Edit tools instead.
+- When generating files from Python, open them with `newline='\n'` so files are written with LF, not CRLF.
+- For git commit messages, write the message to a temp file and run `git commit -F <file>`. Do not pipe messages through PowerShell.
+
+Add under a ## Environment section\n\n## Shell environment
+- This is Windows. Prefer PowerShell for Docker and long-running commands, because Git Bash hits fork errors under load.
+- When matching container mount paths, normalize slashes rather than hand-escaping backslashes.
+- Symlinks may not work on Windows. Check before relying on them.
 
 ## Generated-text guardrails
 - Write and change files with the Write/Edit tools only. A PreToolUse hook (`tools/block_heredoc_writes.py`) blocks Bash/PowerShell commands that write a file through a heredoc or here-string.
