@@ -534,3 +534,15 @@ Issues encountered in Phase 3 deductive verification (`run_wp_function.py`), Dua
   - Test: `tests/test_architect_guardrail_scope.py`, 4 cases; all failed before the fix.
   - The supervisor reran the 82 tests of `test_architect_guardrail_scope.py`, `test_agent_result_evidence_files.py` and `test_wp_scheduler.py` (all green), ran `ruff` and `mypy` (clean), and dry-ran the merges with S13, S14, S16 and `phase1-remediation` (all clean).
   - Limit: in run-4, `sax_example__program`'s harness passes the fuzz bytes as the argv path, so it never reaches `parse_messagepack` and the module still needs a harness repair. The fix only stops a known defect in `main` from blocking the header's contracts.
+
+### Symptom: `wp_scheduler.py requeue` Reopens a Verifier as "never returned" Although Its `scratch/result.json` Is Written, and `--stale-minutes 0` Reassigns Live Agents
+- **Seen on:** mpack run-4, 2026-11-17, Phase 3 (supervisor). Both gates (`gate:libmpack_a`, `gate:sax_example`) waited on 10 verify tasks still `running` after 2–2.5 h. Three of them already had results: `agents/verify-unknown_function_fd03be63af/scratch/result.json` (14:37), `verify-unknown_function_3117fe4adc` (14:32) and `verify-mpack_write_bool_da7350c06e` (14:58). The parent had never run `complete` on them, and had never launched the other seven. At 16:55 it ran `requeue --agent-id` on all ten. The history recorded `reopened ... requeued: agent verify-unknown_function_fd03be63af never returned`, and `next --prepare` assigned `-2` agents. Its own summary script then misread `next`'s output as "tasks: 0", so at 16:58 it ran `requeue --stale-minutes 0`. That reassigned every running task to `-2`/`-3` agents, including live negotiation subagents (`mpack_encode_array32`, `mpack_encode_map16`, …).
+- **Cause:**
+  - The missed returns and the misread are model errors.
+  - Pipeline gap 1: `requeue` does not look for a result the agent already wrote. It discards a finished verdict as "never returned", and the work is redone (about 15 min of agent time per verifier).
+  - Pipeline gap 2: `requeue --stale-minutes 0` reassigns every running task with no guard. It does not check the agent's age against its `wall_budget_s`, or whether its scratch directory is still being written. So one confused call duplicates live work.
+  - Pipeline gap 3: `status` gives no hint that a running task's result already sits on disk, waiting for `complete`.
+- **Fix:** **Open pipeline bug:** not fixed.
+  - Suggested change: `requeue` and `status` report a running task whose `agents/<id>/scratch/result.json` validates as `result_waiting` and point to `step --complete <id>`.
+  - Suggested change: `requeue` refuses tasks younger than their `wall_budget_s` unless the call passes `--force`.
+  - Workaround used in run-4: the supervisor nudged the parent to launch the agents it now holds, to complete the three late results if `complete` accepts them, and to stop requeueing.

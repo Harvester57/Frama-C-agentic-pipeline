@@ -69,4 +69,6 @@ At the user's request, a read-only subagent grouped the 106 Phase 1 artifacts an
 
 ## Model struggles that are not pipeline bugs
 
+- **Missed verifier returns, 14:32-16:58.** Three verifiers wrote `scratch/result.json` (`fd03be63af` 14:37, `3117fe4adc` 14:32, `write_bool_da7350c06e` 14:58), but the parent never ran `complete` on them; seven more were prepared but never launched. Both gates waited on these ten for about 2 h. (The earlier note that re-fingerprinted candidates stay unverified was wrong for these: they were never completed.) At 16:55 the parent requeued the ten. Its own summary script misread `next --prepare` as "tasks: 0", so at 16:58 it ran `requeue --stale-minutes 0` and reassigned every running task, live negotiations included. The supervisor nudged it at 16:59 (launch the assigned agents, complete the three late results, stop requeueing). The pipeline side, with `requeue` ignoring written results and having no guard on live agents, is an open entry in [`../troubleshooting/wp-and-guardrail.md`](../troubleshooting/wp-and-guardrail.md).
+
 ## Open pipeline bugs
