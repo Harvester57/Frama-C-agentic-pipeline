@@ -606,7 +606,7 @@ Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; th
 | S4 | L | before merge | done (2026-11-17), merge `4de97ca`; replay and minimize accept a candidate's observations (`586d28d`); hypotheses without a line stay at function + kind (open entry in `ledger-and-verifier.md`) |
 | S5 | M | before merge | done (2026-11-17), merge `72db709` (in `cd4f827`) |
 | S6a | S | before merge | done (2026-11-17), merge `7e431a6`; round wall time is the time left (`cb56350`) |
-| S6b | M | after merge (D20) | open; F3 is fixed on the branch (`18bc5e9`, `45c7a5f`), the two-byte selector (D7) is an extension |
+| S6b | M | after merge (D20) | written on `p1/s6b-wide-selector` (`4a2f29c` code and tests, then skills and docs), started early (user, 2026-11-17); lands after the merge, rebased over S5 |
 | S7 | S | before merge | done (2026-11-17), merge `9890f29` |
 | S8 | S | after merge | open, after V |
 | S9 | M | before merge | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |

@@ -23,7 +23,8 @@ is the same: sources, flags, options, slevel, checks and the prefix of `eva_main
 
 How cases are removed matters. The fuzz build already has a skip mask (`FRAMAC_FUZZ_SKIP_CASES`, a
 run-time test on `harness_selector`). That test does not work for Eva. `harness_selector` is an
-unknown byte, so Eva evaluates the test to `{0, 1}`, takes both branches and still enters every case.
+unknown byte (two bytes above 256 cases), so Eva evaluates the test to `{0, 1}`, takes both branches
+and still enters every case.
 A shard has to remove the excluded cases from the source text:
 
 - `generate_harness.py` wraps each `case k:` in `#if !defined(FRAMAC_EVA_SKIP_CASE_k) ... #endif`.
@@ -95,8 +96,9 @@ So an obligation is Valid only if no shard leaves it Unknown or Invalid. *Not he
 "no execution of this shard reaches it", never as a proof on its own.
 
 Why this is sound. Each execution of the original `eva_main` takes exactly one value of
-`harness_selector` (the case index itself; a value at or above the case count runs no case, and a
-harness generated before the identity selector switches on `harness_selector % N`), so it is an
+`harness_selector` (the case index itself, read from the first input byte, or from the first two
+bytes little-endian above 256 cases; a value at or above the case count runs no case, and a harness
+generated before the identity selector switches on `harness_selector % N`), so it is an
 execution of at most one shard's case. The prefix before the `switch` is
 the same in every shard, and the selector values a shard does not handle go to `default` and call
 nothing. Each shard is a sound Eva analysis of its own executions. Eva's Valid statuses hold under the
