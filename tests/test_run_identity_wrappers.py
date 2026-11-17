@@ -334,13 +334,17 @@ def _cygwin_fork_failed(proc: subprocess.CompletedProcess[str]) -> bool:
 
 def _judge_allocations(procs: list[subprocess.CompletedProcess[str]], expected: list[str]) -> None:
     """
-    Fail on a run directory claimed twice, whatever else happened. Skip when Git Bash could not fork: a `mkdir`
-    that never ran makes the loop take the next number, so the set of names says nothing about atomicity. Otherwise
-    every process must succeed with the expected names.
+    Fail on a run directory claimed twice, whatever else happened. Pass when every process got one of the expected
+    names (Cygwin retries some failed forks). Otherwise skip when Git Bash could not fork: a process that died, or a
+    `mkdir` that never ran and made the loop take the next number, leaves names that say nothing about atomicity.
+    Anything else fails.
     """
     names = [p.stdout.strip().rsplit("/", 1)[-1] for p in procs if p.returncode == 0]
     twice = sorted({n for n in names if names.count(n) > 1})
     assert not twice, f"run directories allocated twice: {twice} ({names})"
+    ordered = sorted(names, key=lambda n: int(n[4:]) if n[4:].isdigit() else -1)
+    if len(names) == len(procs) and ordered == expected:
+        return  # Cygwin may have retried a failed fork: the allocation still came out right
     forks = [p for p in procs if _cygwin_fork_failed(p)]
     if forks:
         pytest.skip(
@@ -350,7 +354,7 @@ def _judge_allocations(procs: list[subprocess.CompletedProcess[str]], expected: 
         )
     failed = [(p.returncode, p.stderr) for p in procs if p.returncode != 0]
     assert not failed, f"allocation failed: {failed}"
-    assert sorted(names, key=lambda n: int(n[4:])) == expected, names
+    assert ordered == expected, names
 
 
 def _proc(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -366,13 +370,19 @@ FORK_ERROR = (
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "failed",
-    [_proc(3221225794), _proc(-1073741502), _proc(1, stderr=FORK_ERROR), _proc(0, "/b/run-9\n", FORK_ERROR)],
-    ids=["status-dll-init-failed", "signed-return-code", "win32-error-299", "fork-failure-in-a-child"],
+    [_proc(3221225794), _proc(-1073741502), _proc(127, stderr=FORK_ERROR), _proc(0, "/b/run-10\n", FORK_ERROR)],
+    ids=["status-dll-init-failed", "signed-return-code", "win32-error-299", "mkdir-fork-failed-number-skipped"],
 )
 def test_a_git_bash_fork_failure_skips_the_allocation_check(failed):
     procs = [_proc(stdout=f"/b/run-{n}\n") for n in range(2, 9)] + [failed]
     with pytest.raises(pytest.skip.Exception, match="Git Bash could not fork"):
         _judge_allocations(procs, [f"run-{n}" for n in range(2, 10)])
+
+
+@pytest.mark.unit
+def test_a_fork_failure_cygwin_retried_does_not_skip_a_correct_allocation():
+    procs = [_proc(stdout=f"/b/run-{n}\n") for n in range(2, 9)] + [_proc(0, "/b/run-9\n", FORK_ERROR)]
+    _judge_allocations(procs, [f"run-{n}" for n in range(2, 10)])
 
 
 @pytest.mark.unit
