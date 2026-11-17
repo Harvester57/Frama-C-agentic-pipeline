@@ -522,6 +522,11 @@ def check_module(
         roots |= harness_roots(fuzzer_text, fn_names, macros, harness_path=src, cppflags=cppflags)
         if not roots:
             return {**tf_row, "roots": [], "passed": False, "error": "target_fuzzer_reaches_nothing"}
+    # An `--api` harness's initializers and destructors from another cluster of the unit (sidecar
+    # `api_helpers`) set up and release a context object with arguments no case reads from the input:
+    # neither they nor what they call answer for this module's entry points.
+    helpers = {str(h) for h in sidecar.get("api_helpers") or [] if isinstance(h, str)}
+    roots -= helpers - set(mod_fns) - set(entries)
     reached = callee_closure(roots, by_name, unit)
     # An entry point counts only when the harness calls it itself: a root, or behind header inline
     # wrappers of a root. One that only another function calls is driven with that caller's arguments

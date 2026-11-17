@@ -21,6 +21,14 @@ byte selects it), with arguments built from the model's signature of each functi
     whose formal name says length, never an enum): the first input pair gets the rest of the input
     itself, so a read past it is caught; an output pair gets a spare buffer and a length read from
     the input, clamped to the buffer;
+  - pointers to non-byte elements followed by their count (`const char *strings[], size_t count`;
+    `const char *keys[], bool found[], size_t count`; `mpack_node_data_t *node_pool, size_t
+    node_pool_count`; `_array_count`: the count's formal name says count, or length or size when no
+    array points to a struct): each array gets ARRAY_ELEMENTS valid elements (an array of byte
+    strings distinct NUL-terminated strings, other pointers NULL, scalars and structs zeroed with
+    element 0 read from the input as one object would be), and the count, still read from the input,
+    is mapped into 1..ARRAY_ELEMENTS (never 0: mpack asserts `count != 0`). A single object passed
+    for such an array was read past for any count above 1 (mpack run-3, `mpack_expect_enum`);
   - a byte pointer with a size the call sites in the code base agree on (`param_sizes` in the model,
     step "call-site sizes"): a buffer of exactly that size (the largest), read from the input when it
     is an input (a `const` pointee), else zeroed. An input byte array whose call sites pass several
@@ -30,11 +38,25 @@ byte selects it), with arguments built from the model's signature of each functi
   - a byte pointer without a known size: a zeroed spare buffer (`2 * MAX_INPUT_SIZE + 1024` bytes), so
     an unknown contract does not read as a target bug; a `const char *` alone takes the rest of the
     input as a NUL-terminated string;
-  - a pointer to a struct the API has an initializer for (a function named like `*_Init`, `*_init`,
-    `*Init*`, `*_new`, `*_create` whose first parameter is a non-const pointer to that struct; the one
-    the recorded traces call first, else the plainest): one object, initialized by that call before
-    the call under test (its own arguments built by the same rules; the case's `inits` name it). The
-    initializer's own case does not call it first;
+  - a pointer to a struct the unit has an initializer for (a function of the unit, also from another
+    cluster than the module's, named like `*_Init`, `*_init`, `*Init*`, `*_new`, `*_create` whose
+    first parameter is a non-const pointer to that struct; never an error or `FILE *` one, else first
+    one reading a (buffer, length) pair, see `initializers`): one object, initialized by that call
+    before the call under test (its own arguments built by the same rules; the case's `inits` name
+    it). An initializer or destructor from outside the module's scope is in the sidecar's
+    `api_helpers` (`case_helpers`), which the reach gate counts as no root of the module. The
+    initializer's own case does not call it first. After the call under test the object is released
+    with the struct's destructor when the unit has one (a function of the unit named like a
+    destructor whose one parameter is a non-const pointer to that struct, `struct_destructors`):
+    `mpack_writer_init_growable` mallocs and `mpack_writer_init_filename` opens a file, and a case run
+    millions of times must not keep either. The initializer's own case releases its object the same
+    way; the destructor's own case does not release twice. The release reads no input: the layout
+    does not change;
+  - a byte-string parameter named like a file-system path (`filename`, `file_name`, `fname`, `path`,
+    `pathname`, `filePath`, `dirname`; `path_parameter`): the function is skipped with the reason,
+    and is never chosen as an initializer or constructor. A path read from the input makes the
+    target open or create a file the fuzzer names, anywhere the sandbox user can write (the run
+    directory included), on every execution;
   - an opaque handle (a typedef of `void *`, or a pointer to a struct the headers only declare, as
     the layout probe saw the parameter written): the result of the API's constructor for that type
     (a function named like an initializer that returns it), released after the call under test with
@@ -118,6 +140,7 @@ from framac_common import load_json_optional  # noqa: E402
 from seed_harvest import (  # noqa: E402
     _CHAR_POINTEES,
     _QUALIFIERS_RE,
+    _norm_type,
     classify_type,
     is_length,
     is_variadic,
@@ -134,6 +157,19 @@ VARIADIC_KIND = "variadic"  # the layout kind of a case built from a call site (
 NO_VARIADIC_SITE = "variadic: no call site with a literal format and sized objects in the target's own sources"
 CUSTOM_KIND = "custom"  # the layout kind of a hand-written case (`--api --dispatch-case`)
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
+# A pointer to non-byte elements followed by their count (`mpack_expect_enum(reader, const char
+# *strings[], size_t count)`): an array of ARRAY_ELEMENTS elements, the count mapped into
+# 1..ARRAY_ELEMENTS. Never 0: `mpack_expect_enum_optional` asserts `count != 0`, which a release build
+# turns into `__builtin_unreachable()`, a crash only the harness would make.
+ARRAY_ELEMENTS = 4
+# The elements of an array of byte strings: distinct, NUL-terminated, the empty string included.
+ARRAY_STRINGS = ("", "a", "bc", "def")
+ARRAY_STRING_BYTES = 16  # the storage of each element of an array of `const` strings
+# The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`.
+_ARRAY_COUNT_RE = re.compile(r"[Cc]ount|[Cc]nt|^n(?:[A-Z_0-9]|$)|^num|^N$|[Nn]memb|[Nn]elem|[Nn]items")
+# `len` and `size` count elements too, except after a struct pointer: `(struct ctx *c, size_t size)`
+# is far more often a context and some size than an array of contexts.
+_ARRAY_LEN_RE = re.compile(r"[Ll]en|[Ss]ize")
 MAX_DIAGNOSTIC_CHARS = 300
 POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
 # The source of a copy the harness makes itself: the input, or in eva_main an initialized shadow of it
@@ -151,6 +187,14 @@ MAX_HANDLE_DEPTH = 3  # parents built for a child handle (a record set needs its
 _DTOR_NAME_RE = re.compile(
     r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|"
     r"(?:^|(?<=[a-z0-9_]))(?:Free|Destroy|Release)(?=[A-Z0-9_]|$)"
+)
+# File-system path parameter names, as words of the formal's name (`filename`, `file_name`, `filePath`).
+_PATH_WORDS = frozenset({"filename", "fname", "path", "pathname", "filepath", "dirname", "dirpath"})
+_PATH_WORD_PAIRS = frozenset({("file", "name"), ("file", "path"), ("dir", "name"), ("dir", "path"), ("path", "name")})
+_NAME_WORD_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+PATH_SKIP_REASON = (
+    "takes a file-system path (parameter `{name}`): the harness never passes input bytes as a path, "
+    "which would open or create a file the fuzzer names on every execution"
 )
 
 # Byte size of the scalars a slot can hold (x86_64): a seed needs it to lay out the input.
@@ -242,6 +286,21 @@ def _storage(size: int | None) -> str:
     return "" if size else "static "
 
 
+# The alignment of every byte buffer a case declares: `alignof(max_align_t)` on x86_64, the
+# strictest of any object Frama-C accepts (its machdep refuses `_Alignas(32)`: "exceeds
+# alignof(max_align_t): 16, and machdep does not allow extended alignment"). Spelled as a number:
+# `max_align_t` is missing from C99 headers, and E-ACSL builds compile with -std=c99. A buffer backs
+# typed objects (`node.data = (void *)c0a0f0`, a struct shared by a sequence): a plain
+# `unsigned char[]` left `\aligned(node.data, 8)` Unknown for Eva (mpack run-3). `_Alignas` is what
+# Eva reads; it does not use a trailing `__attribute__((aligned(16)))` on such an array.
+BYTE_BUFFER_ALIGN = 16
+
+
+def _byte_buffer(storage: str, var: str, n: int | str) -> str:
+    """The zeroed declaration of byte buffer `var[n]`, aligned for any object (`BYTE_BUFFER_ALIGN`)."""
+    return f"{storage}_Alignas({BYTE_BUFFER_ALIGN}) unsigned char {var}[{n}]; memset({var}, 0, sizeof({var}));"
+
+
 def _is_input(formals: list[dict], index: int) -> bool:
     """A pointer the function only reads (`const` pointee), per the model; unknown counts as input."""
     if index < len(formals) and isinstance(formals[index], dict):
@@ -289,6 +348,10 @@ class ApiInfo:
     # {type, pointee} as the declaration writes them (`const char **`, `const char *`). The model drops
     # the nested `const` (`char **`), which a compiler refuses to pass (gcc 14) or warns about (clang).
     qual_ptrs: dict[str, dict[int, dict[str, str]]] = field(default_factory=dict)
+    # Struct objects (`struct_destructors`): per struct type, the destructor that releases what an
+    # initializer set up in it, and every function named like a destructor of it.
+    struct_dtors: dict[str, str] = field(default_factory=dict)
+    struct_dtor_names: dict[str, set[str]] = field(default_factory=dict)
 
 
 class _Case:
@@ -370,6 +433,121 @@ def _is_pair(params: list[dict], i: int, formals: list[dict] | None = None) -> b
     return p["kind"] == "ptr" and _charlike(p) and nxt is not None and is_length(nxt, _name(formals or [], i + 1))
 
 
+def _array_element(p: dict) -> bool:
+    return p["kind"] == "ptr" and not _charlike(p) and not p.get("anon_enum")
+
+
+def _array_count(params: list[dict], i: int, formals: list[dict]) -> int | None:
+    """
+    The index of the count of the arrays starting at parameter `i`, or None. An array is a pointer to
+    non-byte elements; one or more of them in a row followed by their count make a group
+    (`const char *strings[], size_t count`; `const char *keys[], bool found[], size_t count`). The
+    count is an integer `is_length` accepts whose formal name says count (`_ARRAY_COUNT_RE`), or
+    length or size when no array of the group points to a struct. Only the last array of a group
+    may point to a struct, and only with a count-named count: `(struct ctx *c, size_t size)` is far
+    more often a context and some size than an array of contexts. Without the count's name nothing
+    says it counts elements: a pointer and a value (`int *dst, unsigned value`) stay one object and
+    a scalar.
+    """
+    j = i
+    while j < len(params) and _array_element(params[j]):
+        j += 1
+    if j == i or j >= len(params):
+        return None
+    name = _name(formals, j)
+    if name is None or not is_length(params[j], name):
+        return None
+    records = [_is_record(str(params[k].get("pointee") or "")) for k in range(i, j)]
+    if any(records[:-1]):
+        return None
+    if _ARRAY_COUNT_RE.search(name):
+        return j
+    return None if records[-1] or not _ARRAY_LEN_RE.search(name) else j
+
+
+def _array_object(case: _Case, call: int, i: int, p: dict, size: int | None, is_input: bool) -> str:
+    """
+    Declare the array behind parameter `i` (`_array_count`); returns its element count as a C
+    expression. It has ARRAY_ELEMENTS valid elements (or the elements of its call sites' size,
+    `param_size`): an array of byte strings points each element to a distinct NUL-terminated string
+    (`ARRAY_STRINGS`, in writable storage), other pointer elements are NULL, scalars and structs are
+    zeroed, and element 0 is read from the input as the one object was before, so the layout does
+    not change. A pointer element is never read from the input.
+    """
+    v = f"c{call}a{i}"
+    pointee = str(p.get("pointee") or "void")
+    elem = str(p.get("decl") or pointee)
+    n_expr = f"{ARRAY_ELEMENTS}ULL"
+    if pointee.endswith("*"):
+        inner = pointee[:-1].strip()
+        case.decls.append(f"{elem} {case.declare(v)}[{ARRAY_ELEMENTS}]; memset({v}, 0, sizeof({v}));")
+        if inner in ("char", "signed char", "unsigned char"):
+            # `const` strings get room for their text; strings the callee may write a spare buffer each.
+            width = ARRAY_STRING_BYTES if "const" in elem.rsplit("*", 1)[0] else case.spare
+            store = case.declare(f"{v}s")
+            case.decls.append(
+                f"static {inner} {store}[{ARRAY_ELEMENTS}][{width}]; memset({store}, 0, sizeof({store}));"
+            )
+            for k, s in enumerate(ARRAY_STRINGS[:ARRAY_ELEMENTS]):
+                if s:
+                    case.decls.append(f'memcpy({store}[{k}], "{s}", {len(s)});')
+                case.decls.append(f"{v}[{k}] = ({elem}){store}[{k}];")
+            what = "distinct NUL-terminated strings"
+        else:
+            what = "NULL pointers"
+    else:
+        lay = case.api.structs.get(pointee) if _is_record(pointee) else None
+        raw_ok = pointee != "_Bool" and (not _is_record(pointee) or _raw_ok(lay))
+        if is_input and not raw_ok and lay is None:
+            case.note(call, i, f"{_layout_why(case.api, pointee)}: the elements are zeroed, not read from the input")
+        if size:
+            case.decls.append(
+                f"{elem} {case.declare(v)}[({size} + sizeof({elem}) - 1) / sizeof({elem})]; memset({v}, 0, sizeof({v}));"
+            )
+            if is_input and raw_ok:
+                case.slot(v, size, call, i, "bytes", addr=False)
+            n_expr = f"(sizeof({v}) / sizeof({v}[0]))"
+        else:
+            case.decls.append(f"{elem} {case.declare(v)}[{ARRAY_ELEMENTS}]; memset({v}, 0, sizeof({v}));")
+            if is_input and pointee == "_Bool":
+                case.bool_slot(f"{v}[0]", call, i, "pointee")
+            elif is_input and raw_ok:
+                case.slot(f"{v}[0]", SCALAR_BYTES.get(pointee) or (lay or {}).get("size"), call, i, "pointee")
+        if is_input and not raw_ok and lay is not None and lay.get("what") == "struct":
+            _fill_fields(case, call, i, f"{v}[0]", lay, 0)
+        what = "zeroed elements, element 0 read from the input" if is_input else "zeroed elements"
+    if size:
+        case.note(call, i, f"array of the call sites' {size} bytes ({what}); its count is mapped into 1..its elements")
+    else:
+        n = ARRAY_ELEMENTS
+        case.note(call, i, f"array of {n} elements ({what}); its count is mapped into 1..{n}")
+    return n_expr
+
+
+def _array_args(
+    case: _Case, call: int, params: list[dict], formals: list[dict], rec: dict, i: int, j: int
+) -> list[str]:
+    """
+    The arguments of arrays `i`..`j - 1` and their count `j` (`_array_count`). The count keeps the
+    input slot it had and is mapped into 1..elements of the smallest array: never past an array, and
+    never 0 (`ARRAY_ELEMENTS`).
+    """
+    args: list[str] = []
+    bound = ""
+    for k in range(i, j):
+        n_expr = _array_object(case, call, k, params[k], param_size(rec, k), _is_input(formals, k))
+        bound = n_expr if not bound or bound == n_expr else f"({bound} < {n_expr} ? {bound} : {n_expr})"
+        args.append(f"({params[k]['type']})c{call}a{k}")
+    ln = f"c{call}a{j}"
+    ct = params[j]["ctype"]
+    case.decls.append(f"{ct} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+    case.slot(ln, SCALAR_BYTES.get(ct), call, j, "int")
+    # 1..bound, counts 1..bound kept as read; no unsigned wrap (a short input leaves the count 0),
+    # which -warn-unsigned-overflow and E-ACSL's --rte=all would report in the harness.
+    case.decls.append(f"{ln} = ({ct})(1ULL + ((unsigned long long){ln} % {bound} + ({bound} - 1ULL)) % {bound});")
+    return [*args, ln]
+
+
 def _variable_length(params: list[dict], formals: list[dict], rec: dict, shared: dict[int, str]) -> bool:
     """
     Whether the call reads an input pair of no known size, so its length comes from the fuzz input. A
@@ -428,9 +606,7 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
                 case.post.append(f"{fx} = (void *)(fuzz_buf + fuzz_off); {lx} = ({nxt['ctype']})(fuzz_len - fuzz_off);")
             else:
                 size = PAIR_BYTES if f.get("const") else case.spare
-                case.decls.append(
-                    f"{_storage(None)}unsigned char {case.declare(tag)}[{size}]; memset({tag}, 0, sizeof({tag}));"
-                )
+                case.decls.append(_byte_buffer(_storage(None), case.declare(tag), size))
                 if f.get("const"):
                     case.slot(tag, size, call, param, "field_bytes", addr=False, off=off)
                 case.slot(lx, int(nxt["size"]), call, param, "field_len", off=off, max=size)
@@ -440,9 +616,7 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
             i += 2
             continue
         if f["kind"] == "ptr":
-            case.decls.append(
-                f"static unsigned char {case.declare(tag)}[{case.spare}]; memset({tag}, 0, sizeof({tag})); {fx} = (void *){tag};"
-            )
+            case.decls.append(f"{_byte_buffer('static ', case.declare(tag), case.spare)} {fx} = (void *){tag};")
         elif f["kind"] == "int" and f.get("ctype") == "_Bool":
             case.bool_slot(fx, call, param, "field", off=off)
         elif f["kind"] in ("int", "float", "enum") or (f["kind"] in ("array", "record") and _raw_ok(f)):
@@ -565,6 +739,14 @@ def _construct(
     return before, release, later, f"{var} != 0"
 
 
+def _struct_release(api: ApiInfo, pointee: str, name: str, expr: str) -> str | None:
+    """The release of struct object `expr` after call `name`, or None (no destructor, or `name` is one)."""
+    dtor = api.struct_dtors.get(pointee)
+    if dtor is None or name in api.struct_dtor_names.get(pointee, set()):
+        return None
+    return f"(void){dtor}({expr});"
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -588,6 +770,7 @@ def _bind_call(
     before: list[str] = []
     after: list[str] = []
     guards: list[str] = []
+    bound_handles: set[int] = set()  # parameters a handle constructor built (released as handles)
     api = case.api
     handles = api.handles.get(name) or {}
     outs = api.outs.get(name) or {}
@@ -616,6 +799,7 @@ def _bind_call(
             else:
                 # A handle: the constructor's result, released afterwards unless this call is the release.
                 made_here, release, parents_release, guard = _construct(case, htype, v, call, i)
+                bound_handles.add(i)
                 before += made_here
                 if guard:
                     guards.append(guard)
@@ -678,7 +862,20 @@ def _bind_call(
                 case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
                 before.append(_init_call(case, pointee, f"&{v}", call, i))
                 args.append(f"&{v}")
+                release = _struct_release(api, pointee, name, f"&{v}")
+                if release:
+                    after.append(release)
                 i += 1
+                continue
+            j = _array_count(params, i, formals)
+            # No array of the group may be an object the generator builds otherwise: shared with
+            # another call, a handle, or a struct the unit initializes.
+            if j is not None and not any(
+                k in shared or k in handles or k in outs or str(params[k].get("pointee") or "") in api.inits
+                for k in range(i, j + 1)
+            ):
+                args += _array_args(case, call, params, formals, rec, i, j)
+                i = j + 1
                 continue
             if pair and nxt is not None and (i + 1) not in shared:
                 if is_input and case.rest is None and size is None:
@@ -687,12 +884,10 @@ def _bind_call(
                     args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
                 else:
                     buf = size or case.spare
-                    case.decls.append(
-                        f"{_storage(size)}unsigned char {case.declare(v)}[{buf}]; memset({v}, 0, sizeof({v}));"
-                    )
+                    case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
                     if size and is_input:
                         case.slot(v, size, call, i, "bytes", addr=False)
-                    ln = f"c{call}a{i + 1}"
+                    ln =f"c{call}a{i + 1}"
                     case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                     case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
                     case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({nxt['ctype']}){buf}; }}")
@@ -702,9 +897,7 @@ def _bind_call(
                 continue
             if charlike:
                 buf = size or case.spare
-                case.decls.append(
-                    f"{_storage(size)}unsigned char {case.declare(v)}[{buf}]; memset({v}, 0, sizeof({v}));"
-                )
+                case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
                 if size and is_input:
                     case.slot(v, size, call, i, "bytes", addr=False)
                     if _sentinel_sized(rec, i):
@@ -728,10 +921,13 @@ def _bind_call(
                 i += 1
                 continue
             # A pointer to a scalar or a struct: an array of the known size, else one object. A struct
-            # with pointers (or of unknown layout) is never read from the input as raw bytes.
+            # with pointers (or of unknown layout) is never read from the input as raw bytes, nor is a
+            # pointer (`const char **`): input bytes would become an address the callee follows.
             lay = case.api.structs.get(pointee) if _is_record(pointee) else None
-            raw_ok = pointee != "_Bool" and (not _is_record(pointee) or _raw_ok(lay))
-            if is_input and not raw_ok and lay is None:
+            raw_ok = pointee != "_Bool" and not pointee.endswith("*") and (not _is_record(pointee) or _raw_ok(lay))
+            if is_input and pointee.endswith("*"):
+                case.note(call, i, f"{pointee}: a pointer, zeroed (NULL), never read from the input")
+            elif is_input and not raw_ok and lay is None:
                 case.note(call, i, f"{_layout_why(case.api, pointee)}: the object is zeroed, not read from the input")
             # The object's type as declared: the header's spelling of a qualified pointer (`decl`,
             # `_respell_qualified_pointers`), else the model's pointee.
@@ -755,7 +951,7 @@ def _bind_call(
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
                 args.append(f"({p['type']}){v}")
             elif varlen and _lone_output(params, formals, i):
-                case.decls.append(f"static unsigned char {case.declare(v)}[{case.spare}]; memset({v}, 0, sizeof({v}));")
+                case.decls.append(_byte_buffer("static ", case.declare(v), case.spare))
                 args.append(f"({p['type']}){v}")
             else:
                 case.decls.append(f"{elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
@@ -782,6 +978,14 @@ def _bind_call(
         args.append(v)
         i += 1
     args += extra_args or []
+    if allow_init and params and 0 not in shared and 0 not in bound_handles and params[0]["kind"] == "ptr":
+        # An initializer's own case: what it set up in its (unshared) object is released after it. A
+        # handle a constructor built is released as a handle already (`_construct`), never twice.
+        pointee0 = str(params[0].get("pointee") or "")
+        if name in api.candidates.get(pointee0, set()):
+            release = _struct_release(api, pointee0, name, args[0])
+            if release:
+                after.append(release)
     made = case.api.returns.get(name) if allow_init else None
     if made is not None and made in case.api.dtors:
         # The call under test makes a handle: release it, or every run of the case leaks one.
@@ -835,7 +1039,12 @@ def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | Non
             else:
                 m = _ANON_TAG_RE.search(pointee)
                 return None, f"pointer to an anonymous {m.group(1) if m else 'struct'}"
-        # An array parameter is a pointer: cast to `void *`, which converts to it.
+        # An array parameter is a pointer: cast to `void *`, which converts to it. An array of pointers
+        # (`char *[]`) points to pointers, as `char **` does; any other array stays a byte buffer.
+        if c["kind"] == "ptr" and "[" in t:
+            elem = _norm_type(t[: t.index("[")])
+            if elem.endswith("*"):
+                c["pointee"] = elem
         c["type"] = "void *" if "[" in t else " ".join(t.split())
         params.append(c)
     return params, None
@@ -1054,16 +1263,80 @@ def still_skipped(layouts: Sequence[dict], skipped: dict[str, str]) -> dict[str,
     return {k: v for k, v in skipped.items() if k not in alive}
 
 
+def _is_path_name(name: str) -> bool:
+    words = [w.lower() for w in _NAME_WORD_RE.findall(name)]
+    pairs = zip(words, words[1:], strict=False)
+    return any(w in _PATH_WORDS for w in words) or any(p in _PATH_WORD_PAIRS for p in pairs)
+
+
+def path_parameter(rec: dict) -> str | None:
+    """
+    The name of the first byte-string parameter of a model record named like a file-system path
+    (`filename`, `file_name`, `fname`, `path`, `filePath`, `dirname`), or None. Such a function opens,
+    creates or lists what the string names (mpack's `mpack_writer_init_filename` fopen()s it for
+    writing): fed input bytes, it would touch a file the fuzzer names on every execution.
+    """
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    formals = list(rec.get("formals") or [])
+    for i, p in enumerate(params or []):
+        name = _name(formals, i)
+        if name and p["kind"] == "ptr" and p.get("pointee") in ("char", "signed char", "unsigned char"):
+            if _is_path_name(name):
+                return name
+    return None
+
+
+def struct_destructors(
+    functions: dict[str, dict], visible: set[str] | None = None
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """
+    Per struct type, the destructor that releases a struct object an initializer set up, and every
+    function named like a destructor of it: named like a destructor (`*_destroy`, `*_free`, ...), one
+    parameter, a non-const pointer to that struct (`mpack_error_t mpack_writer_destroy(mpack_writer_t
+    *)`). `functions` are the model's records the harness links (the unit's); a header `static` one
+    counts only when the layout probe saw it declared (`visible`), and with a probe every one must be.
+    Several candidates: the first name.
+    """
+    names: dict[str, set[str]] = {}
+    for key, rec in functions.items():
+        if not isinstance(rec, dict):
+            continue
+        name = str(rec.get("name") or key.split("#")[-1])
+        if not _DTOR_NAME_RE.search(name):
+            continue
+        if rec.get("static") and not rec.get("header"):
+            continue
+        if (rec.get("static") and visible is None) or (visible is not None and name not in visible):
+            continue
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if not params or len(params) != 1 or params[0]["kind"] != "ptr":
+            continue
+        if _is_input(list(rec.get("formals") or []), 0):
+            continue
+        pointee = str(params[0].get("pointee") or "")
+        if _is_record(pointee) and "*" not in pointee:
+            names.setdefault(pointee, set()).add(name)
+    return {t: min(n) for t, n in names.items()}, names
+
+
 def initializers(
     functions: dict[str, dict], traces: list[list[dict]] | None = None, visible: set[str] | None = None
 ) -> tuple[dict[str, str], dict[str, set[str]], dict[str, dict]]:
     """
     Per struct type, the initializer the harness calls on a pointer to it, and every candidate: a
     function named like an initializer whose first parameter is a non-const pointer to that struct.
-    `functions` are the model's records (key -> record); a header `static` function counts only when
-    the layout probe saw it declared in the harness (`visible`), every function then must be. The
-    recorded traces decide between candidates (the one called first), else the plainest name
-    (`*_Init`/`*_init`), the fewest parameters, then the name.
+    `functions` are the model's records (key -> record): `plan` passes the whole unit's, an
+    initializer often lies in another cluster than the API it serves (mpack). A header `static`
+    function counts only when the layout probe saw it declared in the harness (`visible`), every
+    function then must be.
+
+    An initializer that sets up a broken object is a candidate (its own case does not call another
+    first) but never chosen (`_unusable_initializer`): one named for an error (`*_init_error`) or one
+    taking a `FILE *`. Among the others, the order is: a (buffer, length) pair the call only reads
+    (`mpack_reader_init_data`: its bytes come from the input), then any (buffer, length) pair
+    (`mpack_writer_init`: a spare buffer, rather than `*_init_growable`, whose buffer the caller must
+    free), then the one the recorded traces call first, then the plainest name (`*_Init`/`*_init`),
+    the fewest parameters, then the name.
     """
     cands: dict[str, set[str]] = {}
     records: dict[str, dict] = {}
@@ -1081,6 +1354,8 @@ def initializers(
         formals = list(rec.get("formals") or [])
         if not params or params[0]["kind"] != "ptr" or _is_input(formals, 0):
             continue
+        if path_parameter(rec):
+            continue  # it would open a file the input names (path_parameter)
         pointee = str(params[0].get("pointee") or "")
         # A `struct tag **` first parameter is an out-parameter constructor (`outparam_constructors`),
         # not an initializer of a struct object.
@@ -1088,22 +1363,50 @@ def initializers(
             continue
         cands.setdefault(pointee, set()).add(name)
         records[name] = rec
-    chosen: dict[str, str] = {}
+    traced: dict[str, int] = {}  # each function the traces call, by the order of its first call
     for trace in traces or []:
         for c in trace:
             fn = c.get("fn")
-            for t, names in cands.items():
-                if fn in names and t not in chosen:
-                    chosen[t] = str(fn)
+            if isinstance(fn, str):
+                traced.setdefault(fn, len(traced))
 
-    def plainest(n: str) -> tuple[bool, int, str]:
-        parts = split_signature(str(records[n].get("signature") or ""))
-        return (not re.search(r"_[Ii]nit$", n), len(parts[1]) if parts else 99, n)
+    def rank(n: str) -> tuple[bool, bool, int, bool, int, str]:
+        rec = records[n]
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        formals = list(rec.get("formals") or [])
+        pairs = [i for i in range(1, len(params or [])) if _is_pair(params or [], i, formals)]
+        parts = split_signature(str(rec.get("signature") or ""))
+        return (
+            not any(_is_input(formals, i) for i in pairs),
+            not pairs,
+            traced.get(n, len(traced)),
+            not re.search(r"_[Ii]nit$", n),
+            len(parts[1]) if parts else 99,
+            n,
+        )
 
+    chosen: dict[str, str] = {}
     for t, names in cands.items():
-        if t not in chosen:
-            chosen[t] = min(names, key=plainest)
+        usable = [n for n in names if not _unusable_initializer(n, records[n])]
+        if usable:
+            chosen[t] = min(usable, key=rank)
     return chosen, cands, records
+
+
+_ERROR_WORD_RE = re.compile(r"(?:^|_)error(?:$|_)|Error(?=[A-Z0-9_]|$)")
+_STDIO_FILE_RE = re.compile(r"\b(?:FILE|struct _IO_FILE)\b")
+
+
+def _unusable_initializer(name: str, rec: dict) -> bool:
+    """
+    An initializer that leaves its object unusable for the call under test: one named for an error
+    (`mpack_writer_init_error` flags the writer as failed, so every later call returns at once) or
+    one that takes a `FILE *` (`mpack_writer_init_stdfile`: the harness has no stream to give it).
+    """
+    if _ERROR_WORD_RE.search(name):
+        return True
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    return any(_STDIO_FILE_RE.search(str(p.get("pointee") or p.get("type") or "")) for p in params or [])
 
 
 def handle_functions(
@@ -1145,7 +1448,7 @@ def handle_functions(
         ret = proto.get("ret")
         if ret:
             returns[name] = ret
-        if ret and not mine and _INIT_NAME_RE.search(name):
+        if ret and not mine and _INIT_NAME_RE.search(name) and not path_parameter(rec):
             ctor_cands.setdefault(ret, []).append(name)
         if len(params) == 1 and mine and _DTOR_NAME_RE.search(name):
             dtor_cands.setdefault(mine[0], set()).add(name)
@@ -1206,6 +1509,8 @@ def outparam_constructors(
         takes = handles.get(name) or {}
         if len(written) != 1 or len(takes) > 1 or not _OUT_CTOR_NAME_RE.search(name):
             continue
+        if path_parameter(rec):
+            continue  # it would open a file the input names (path_parameter)
         ((_, htype),) = written.items()
         if htype in takes.values():
             continue  # a copy (`*_dup(dest, src)`) needs a handle of the type first
@@ -1350,9 +1655,7 @@ def _sequence_case(
                 if is_record:
                     # Room for the whole object, whatever size the call sites showed.
                     n_bytes = f"({n_bytes} > sizeof({pointee}) ? {n_bytes} : sizeof({pointee}))"
-                case.decls.append(
-                    f"{_storage(size or None)}unsigned char {case.declare(var)}[{n_bytes}]; memset({var}, 0, sizeof({var}));"
-                )
+                case.decls.append(_byte_buffer(_storage(size or None), case.declare(var), n_bytes))
                 # Filled from the input when its first use reads it, its size is known, and it holds
                 # no pointer.
                 raw_ok = not is_record or _raw_ok(lay)
@@ -1513,9 +1816,26 @@ def plan(
         if isinstance(rec, dict)
         and (str(rec.get("name") or k.split("#")[-1]) in entry_names or (rec.get("static") and rec.get("header")))
     }
-    inits, candidates, init_records = initializers(init_pool, traces, visible)
     handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
     outp = outparam_constructors(init_pool, visible, handles, traces)
+    # Initializers and destructors of struct objects may lie outside the scope: mpack's
+    # mpack_writer_init and mpack_writer_destroy are in other clusters than most of the writer API
+    # (mpack run-3: every mpack_writer_2 case passed an all-zero writer). Any function of the unit
+    # counts; the harness's sources take in the unit of every function a case names
+    # (generate_harness._merge_dag_harness_sources).
+    unit_names = {
+        str((functions.get(k) or {}).get("name") or str(k).split("#")[-1])
+        for k in mm.unit_record(module).get("functions") or []
+    } | entry_names
+    unit_pool = {
+        k: rec
+        for k, rec in (model.get("functions") or {}).items()
+        if isinstance(rec, dict)
+        and (str(rec.get("name") or k.split("#")[-1]) in unit_names or (rec.get("static") and rec.get("header")))
+    }
+    inits, candidates, init_records = initializers(unit_pool, traces, visible)
+    struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible)
+    helper_pool = (set(inits.values()) | set(struct_dtors.values())) - entry_names
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
     api = ApiInfo(
@@ -1536,6 +1856,8 @@ def plan(
         callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
         enum_ptrs=dict(getattr(visible, "enum_pointers", None) or {}),
         qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
+        struct_dtors=struct_dtors,
+        struct_dtor_names=struct_dtor_names,
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -1548,6 +1870,10 @@ def plan(
         mrec = _model_record(model, drec, key)
         if not mrec:
             skipped[key] = "not in the Phase 0 model"
+            continue
+        path = path_parameter(mrec)
+        if path:
+            skipped[key] = PATH_SKIP_REASON.format(name=path)
             continue
         if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
             # Not in `records`: a sequence or a lifecycle case builds its calls from the signature.
@@ -1617,7 +1943,22 @@ def plan(
         "skipped": skipped,
         "stubs": dict(api.stubs),
         "variadic_dropped": dropped,
+        "helpers": case_helpers(cases, layouts, helper_pool),
+        "helper_pool": sorted(helper_pool),
     }
+
+
+def case_helpers(cases: Sequence[str], layouts: Sequence[dict], pool: set[str] | Sequence[str]) -> list[str]:
+    """
+    The functions of `pool` (initializers and destructors from outside the module's scope) the cases
+    call to set up or release an object: the sidecar's `api_helpers`. They run with arguments no case
+    reads from the input, so the reach gate counts none of them as a root of the module
+    (`harness_reach.check_module`).
+    """
+    names = set(pool)
+    used = {str(i.get("fn")) for lay in layouts for i in lay.get("inits") or [] if isinstance(i, dict)}
+    used |= {n for n in names if any(re.search(rf"\b{re.escape(n)}\s*\(", c) for c in cases)}
+    return sorted(used & names)
 
 
 _STUB_NAME_RE = re.compile(r"\bframac_cb_\w+")
@@ -2492,6 +2833,7 @@ def generate(
         skipped = still_skipped(layouts, skipped)
         sidecar["api_cases"] = layouts
         sidecar["api_skipped"] = skipped
+        sidecar["api_helpers"] = case_helpers(cases, layouts, p.get("helper_pool") or [])
         sidecar.pop("api_variadic_dropped", None)
         if dropped:
             sidecar["api_variadic_dropped"] = dropped

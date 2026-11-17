@@ -179,6 +179,7 @@
       "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}, {"$ref": "#/definitions/custom_case"}, {"$ref": "#/definitions/variadic_case"}]}
     },
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason. A variadic function is here only when none of its call sites made a case", "type": "object", "additionalProperties": {"type": "string"}},
+    "api_helpers": {"$comment": "Functions from outside the module's scope (another cluster of the unit) the cases call only to set up or release a struct object: its initializer and destructor (api_harness.case_helpers). harness_reach.check_module counts none of them as a root of the module. Absent on an older sidecar.", "$ref": "#/definitions/strings"},
     "api_variadic_dropped": {
       "$comment": "Call sites of a variadic entry point that made no case (over a cap, a type the harness cannot declare, a case the compiler refused), with the reason. Absent when there is none.",
       "type": "array",

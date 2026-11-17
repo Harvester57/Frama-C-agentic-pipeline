@@ -225,6 +225,22 @@ def load_json_strict(path: Path, max_bytes: int = DEFAULT_JSON_MAX_BYTES):
         raise ArtifactError(f"malformed JSON in {path}: {exc}") from exc
 
 
+# Header files: a slice's `sources` may list one (a target that defines functions in its headers, such
+# as mpack's MPACK_INLINE, has them mapped to the header), but a compiler never takes one as an input.
+HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".hxx", ".h++", ".inc")
+
+
+def compile_inputs(sources: Iterable[str]) -> list[str]:
+    """
+    The translation units among a slice's `sources`, for a clang command line: every header left out.
+    `clang a.c a.h -o bin` treats the header as a precompiled-header output and fails with "cannot
+    specify -o when generating multiple output files" (mpack run-3). Frama-C parses a header as a file
+    of its own, and the header stays in `sources` for the tools that read it as data (E-ACSL's function
+    discovery, the module scope).
+    """
+    return [s for s in sources if posixpath.splitext(str(s).replace("\\", "/"))[1].lower() not in HEADER_SUFFIXES]
+
+
 def load_json_optional(path: Path, default, max_bytes: int = DEFAULT_JSON_MAX_BYTES):
     """Load JSON if present; a present-but-malformed file still raises."""
     path = Path(path)

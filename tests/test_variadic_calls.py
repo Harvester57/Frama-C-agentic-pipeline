@@ -483,7 +483,7 @@ def test_the_case_fixes_the_format_and_declares_the_call_sites_objects():
     assert "char c0v0[80]; memset(c0v0, 0, sizeof(c0v0));" in stmt and "static char c0v0" not in stmt
     # The format is the literal; the sentence is the rest of the input, NUL-terminated.
     assert '(void)scan((char *)c0a0, (char *)"s", c0v0);' in stmt
-    assert f"static unsigned char c0a0[{VA_SPARE}]" in stmt and "c0a0[rest_n] = 0;" in stmt
+    assert f"static _Alignas(16) unsigned char c0a0[{VA_SPARE}]" in stmt and "c0a0[rest_n] = 0;" in stmt
     assert layout == {
         "kind": "variadic",
         "calls": ["scan"],

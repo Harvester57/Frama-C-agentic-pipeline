@@ -60,7 +60,7 @@ def test_output_pair_gets_a_spare_buffer_and_a_clamped_length():
         "fill", {"signature": "void(unsigned char *,unsigned long)", "formals": _formals("pointer", "value")}, SPARE
     )
     assert stmt is not None and layout is not None
-    assert f"static unsigned char c0a0[{SPARE}]" in stmt
+    assert f"static _Alignas(16) unsigned char c0a0[{SPARE}]" in stmt
     assert f"if ((unsigned long long)c0a1 > {SPARE}ULL)" in stmt
     assert layout["rest"] is None
     assert layout["slots"] == [{"call": 0, "param": 1, "size": 8, "kind": "int"}]
@@ -74,7 +74,7 @@ def test_known_size_gives_an_exact_stack_buffer_read_from_the_input():
     }
     stmt, layout, _ = ah.single_case("box", rec, SPARE)
     assert stmt is not None and layout is not None
-    assert "unsigned char c0a0[32]; memset" in stmt and "static unsigned char c0a0" not in stmt
+    assert "unsigned char c0a0[32]; memset" in stmt and "static _Alignas(16) unsigned char c0a0" not in stmt
     assert "unsigned char c0a1[24]" in stmt
     # The output is zeroed; only the input is read from the fuzz input.
     assert layout["slots"] == [{"call": 0, "param": 1, "size": 24, "kind": "bytes"}]
@@ -85,7 +85,7 @@ def test_unknown_size_byte_pointer_is_a_zeroed_spare_buffer():
         "key", {"signature": "int(unsigned char *)", "formals": _formals("const_pointer")}, SPARE
     )
     assert stmt is not None and layout is not None
-    assert f"static unsigned char c0a0[{SPARE}]" in stmt
+    assert f"static _Alignas(16) unsigned char c0a0[{SPARE}]" in stmt
     assert layout["slots"] == [] and layout["rest"] is None
 
 
@@ -212,10 +212,10 @@ def test_sequence_case_passes_shared_buffers_between_calls():
     trace = _trace()
     trace[2] = {**trace[2], "sizes": {"0": 1}}
     stmt, _, _ = ah.sequence_case(trace, [0, 2], records, SPARE)
-    assert stmt is not None and f"static unsigned char c1a0[{SPARE}];" in stmt
+    assert stmt is not None and f"static _Alignas(16) unsigned char c1a0[{SPARE}];" in stmt
     shared_out = [{"fn": "box", "args": {}, "addrs": {"0": "500"}}, {"fn": "box", "args": {}, "addrs": {"1": "500"}}]
     stmt, _, _ = ah.sequence_case(shared_out, [0, 1], records, SPARE)
-    assert stmt is not None and f"static unsigned char s0[{SPARE}];" in stmt
+    assert stmt is not None and f"static _Alignas(16) unsigned char s0[{SPARE}];" in stmt
 
 
 def test_single_case_gives_a_variable_length_call_spare_outputs():
@@ -226,7 +226,7 @@ def test_single_case_gives_a_variable_length_call_spare_outputs():
     }
     stmt, layout, _ = ah.single_case("box", rec, SPARE)
     assert stmt is not None and layout is not None
-    assert f"static unsigned char c0a0[{SPARE}];" in stmt and "unsigned char c0a3[24];" in stmt
+    assert f"static _Alignas(16) unsigned char c0a0[{SPARE}];" in stmt and "unsigned char c0a3[24];" in stmt
     # with a known-size input there is no variable length: the output keeps its call-site size
     rec["param_sizes"]["1"] = {"max": 16}
     stmt, _, _ = ah.single_case("box", rec, SPARE)
@@ -472,7 +472,9 @@ def _declared(stmt: str) -> list[str]:
     """The zero-initialized variables a case declares (`<type> <name>[...]; memset(...)`), as the generator writes them."""
     import re
 
-    return re.findall(r"(?:^|; |\} )(?:static )?(?:[A-Za-z_]\w* )+([^ ;=]+?)(?:\[[^;]*\])?;", stmt)
+    return re.findall(
+        r"(?:^|; |\} )(?:static )?(?:_Alignas\(\d+\) )?(?:[A-Za-z_]\w* )+([^ ;=]+?)(?:\[[^;]*\])?;", stmt
+    )
 
 
 def test_pointer_field_storage_of_a_struct_in_an_array_has_an_identifier_for_a_name():
@@ -485,12 +487,12 @@ def test_pointer_field_storage_of_a_struct_in_an_array_has_an_identifier_for_a_n
     # ... and the storage of its lone pointer field was `static unsigned char c0a0[0]f2[N]`: a second
     # `c0a0`, of type `unsigned char[0]`.
     assert "c0a0[0]f" not in stmt
-    assert f"static unsigned char c0a0_0_f2[{SPARE}];" in stmt and "c0a0[0].Name = (void *)c0a0_0_f2;" in stmt
+    assert f"static _Alignas(16) unsigned char c0a0_0_f2[{SPARE}];" in stmt and "c0a0[0].Name = (void *)c0a0_0_f2;" in stmt
     names = _declared(stmt)
     assert names == ["c0a0", "c0a0_0_f2", "c0a1"]
     # Without a call-site size the object is one struct, named as before.
     stmt, _, _ = ah.single_case("WriteAnomaly", {**_ANOMALY_REC, "param_sizes": {}}, SPARE, api)
-    assert stmt is not None and f"static unsigned char c0a0f2[{SPARE}];" in stmt
+    assert stmt is not None and f"static _Alignas(16) unsigned char c0a0f2[{SPARE}];" in stmt
 
 
 @pytest.mark.skipif(shutil.which("clang") is None, reason="needs clang")

@@ -54,7 +54,7 @@ from eacsl_toolchain import (
     uses_full_mtracking,
 )
 from failure_identity import is_harness_fuzz_function
-from framac_common import load_json_optional, scan_undeclared_functions
+from framac_common import compile_inputs, load_json_optional, scan_undeclared_functions
 from fuzz_common import (
     BUILD_TIMEOUT_S,
     DEFAULT_SELFTEST_JSON,
@@ -841,7 +841,11 @@ def _compile_clang_binary(
     runner,
     use_cache: bool,
 ) -> dict:
-    """Compile a slice directly with Clang, cached (binary and compile log) outside agents/*/scratch."""
+    """
+    Compile a slice directly with Clang, cached (binary and compile log) outside agents/*/scratch.
+    Headers among `sources` are left out (`framac_common.compile_inputs`): clang cannot take one.
+    """
+    sources = compile_inputs(sources)
     out_bin = Path(out_bin)
     compile_log = out_bin.with_suffix(log_suffix)
     cppflags = target_env.with_include_flags(cppflags)
