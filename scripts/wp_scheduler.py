@@ -200,6 +200,8 @@ BRIEF_RENDER_KEYS: tuple[str, ...] = (
     "target_dir",
     "run_dir",
     "references_dir",
+    "pipeline_dir",
+    "header_functions_args",
 )
 
 
@@ -1219,6 +1221,8 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
     _compute_deps(state, ctx)
     _compute_graph(state)
     if _contract_less_callees(state, ctx, changes, persist=persist):
+        # A negotiation opened later in the pass may be the open negotiation an earlier one waits on.
+        _refresh_negotiate_deps(state, ctx)
         _compute_graph(state)  # new negotiate tasks and their waiting callers change the heights
     return changes
 
@@ -1553,10 +1557,7 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
     tasks = state["tasks"]
     prove_by_key = {_key(t): tid for tid, t in tasks.items() if t["kind"] == "prove"}
     # A module's architects: one per header of its harnesses (defect 13).
-    arch_of: dict[str, list[str]] = defaultdict(list)
-    for tid in sorted(tasks):
-        if tasks[tid]["kind"] == "arch" and tasks[tid]["state"] != "skipped":
-            arch_of[tasks[tid]["module"]].append(tid)
+    arch_of = _architects_by_module(tasks)
     for tid in sorted(tasks):
         task = tasks[tid]
         if task["kind"] == "prove":
@@ -1598,6 +1599,7 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
             task["deps"] = _repair_verify_deps(tasks, task["module"], ctx)
         elif task["kind"] in ("breaker", "negotiate"):
             task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task.get("function") or "")
+    _refresh_negotiate_deps(state, ctx, arch_of)
     # Architects of modules sharing a header run one after the other: the second merge would
     # otherwise see a concurrent edit of the header and be refused.
     by_header: dict[str, list[str]] = defaultdict(list)
@@ -1607,6 +1609,81 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
     for ids in by_header.values():
         for i in range(1, len(ids)):
             tasks[ids[i]]["deps"] = sorted(set(tasks[ids[i]]["deps"]) | {ids[i - 1]})
+
+
+def _architects_by_module(tasks: dict) -> dict[str, list[str]]:
+    arch_of: dict[str, list[str]] = defaultdict(list)
+    for tid in sorted(tasks):
+        if tasks[tid]["kind"] == "arch" and tasks[tid]["state"] != "skipped":
+            arch_of[tasks[tid]["module"]].append(tid)
+    return arch_of
+
+
+def _negotiate_deps(state: dict, ctx: Ctx, task: dict, arch_of: dict[str, list[str]] | None = None) -> list[str]:
+    """
+    What `negotiate:<callee>` waits on. With a live prove task for the callee, that task (never strengthen a
+    contract still being proved). Without one (Eva closed the callee, or its prove task was skipped), what a
+    prove task of the callee would wait on (mpack run-4, S19: the negotiators ran before the module's architect
+    and gate and before the callee's own callees were proved, and stalled on contract-less calls): its module's
+    gate, its architects (same exemption as `_compute_deps`), and per callee without a visible contract its
+    prove task, or its open negotiation, and the architects of the callee's module.
+
+    A callee whose call cone reaches the negotiated function is left out: its proof (or a caller waiting on this
+    negotiation) waits on this negotiation, so waiting on it would deadlock. Negotiate tasks have no recursion
+    group; the negotiator then sees that callee without a contract, as before.
+    """
+    tasks = state["tasks"]
+    key = _key(task)
+    own = tasks.get(f"prove:{key}")
+    if own is not None and own["state"] != "skipped":
+        return [own["id"]]
+    if arch_of is None:
+        arch_of = _architects_by_module(tasks)
+    file, fn, mod = str(task.get("file") or ""), str(task.get("function") or ""), task.get("module")
+    deps: set[str] = set()
+    if mod and f"gate:{mod}" in (state.get("gates") or {}):
+        deps.add(f"gate:{mod}")
+    callees: set[str] = set()
+    for callee in ctx.callees(file, fn):
+        for cfile, cname, cmod in ctx.resolve(callee, file):
+            ckey = f"{cfile}#{cname}"
+            if ckey == key:
+                continue
+            callees.add(ckey)
+            if callee_has_contract(ctx, cfile, cname, cmod, caller_file=file):
+                continue
+            if (file, fn) in _call_cone(cfile, cname, ctx):
+                continue  # the callee (or a caller waiting on this negotiation) waits on it: no cycle
+            if f"prove:{ckey}" in tasks:
+                deps.add(f"prove:{ckey}")
+            else:
+                neg = tasks.get(f"negotiate:{ckey}")
+                if neg is not None and neg["state"] not in TERMINAL:
+                    deps.add(neg["id"])
+            if cmod:
+                deps.update(arch_of.get(cmod, ()))
+    if mod:
+        touches_hdr = touches_module_header(ctx, file, fn, mod)
+        if not ((not callees or is_static_fn(ctx, file, fn)) and not touches_hdr):
+            deps.update(arch_of.get(mod, ()))
+    return sorted(deps)
+
+
+def _refresh_negotiate_deps(state: dict, ctx: Ctx, arch_of: dict[str, list[str]] | None = None) -> bool:
+    """Recompute the deps of every pending negotiation (a running or finished one keeps its own). Returns a change."""
+    tasks = state["tasks"]
+    if arch_of is None:
+        arch_of = _architects_by_module(tasks)
+    changed = False
+    for tid in sorted(tasks):
+        task = tasks[tid]
+        if task["kind"] != "negotiate" or task["state"] != "pending":
+            continue
+        deps = _negotiate_deps(state, ctx, task, arch_of)
+        if deps != list(task.get("deps") or []):
+            task["deps"] = deps
+            changed = True
+    return changed
 
 
 def _compute_graph(state: dict) -> None:
@@ -1676,7 +1753,8 @@ def _gate_blockers(
     """
     Verify and repair tasks blocking a gate or a task.
     When task is None (or neither prove nor arch): coarse module gating for _chain_heights and cmd_status.
-    When task has kind == 'prove': fine-grained gating blocking only on verify tasks in task's call cone,
+    When task has kind == 'prove' (or 'negotiate', which proves its function the same way): fine-grained
+    gating blocking only on verify tasks in task's call cone,
     external contributor slices, and the verify and repair tasks of the module's harnesses whose scope
     meets the call cone (a sub-module's candidates do not hold another sub-module's functions).
     When task has kind == 'arch': the repairs of its own harness and of the unit.
@@ -1700,7 +1778,7 @@ def _gate_blockers(
     # Active repair tasks on the module always block
     active_repairs = repairs(own)
 
-    if task is None or task.get("kind") != "prove":
+    if task is None or task.get("kind") not in ("prove", "negotiate"):
         # Coarse module gate for _chain_heights, and cmd_status reporting
         gate = state.get("gates", {}).get(f"gate:{module}") or {"contributors": [module], "files": []}
         out = set(active_repairs)
@@ -1710,7 +1788,7 @@ def _gate_blockers(
             out |= by_file.get(file, set())
         return out
 
-    # Fine-grained gate for prove:<fn>
+    # Fine-grained gate for prove:<fn> and negotiate:<fn>
     fn_file, fn_name = str(task.get("file") or ""), str(task.get("function") or "")
     cone_memo: list[set[tuple[str, str]]] = []
 
@@ -1857,7 +1935,7 @@ class _View:
                 t = self.tasks.get(dep)
                 if t:
                     cctx = self.ctx or Ctx()
-                    caller_file = task.get("file") if task and task.get("kind") == "prove" else None
+                    caller_file = task.get("file") if task and task.get("kind") in ("prove", "negotiate") else None
                     if callee_has_contract(cctx, t["file"], t["function"], t.get("module"), caller_file=caller_file):
                         return True
             return False
@@ -2482,7 +2560,8 @@ def _newest_template_mtime() -> float | None:
     here = Path(__file__).resolve().parent
     for base in (here.parent / "skills" / "framac-wp", Path("/opt/framac-pipeline/skills/framac-wp")):
         if base.is_dir():
-            for tpl in base.glob("*_brief.md"):
+            # run_commands.md is spliced into every brief.
+            for tpl in [*base.glob("*_brief.md"), base / "run_commands.md"]:
                 with contextlib.suppress(OSError):
                     mtime = tpl.stat().st_mtime
                     newest = mtime if newest is None else max(newest, mtime)
@@ -3083,8 +3162,7 @@ def _emit_negotiations(
                 analysis_errors=0,
                 invalid_results=0,
             )
-            if f"prove:{key}" in tasks:
-                task["deps"] = [f"prove:{key}"]  # never strengthen a contract still being proved
+            task["deps"] = _negotiate_deps(state, ctx, task)  # the callee's prove task, else what it would wait on
         elif task["state"] == "pending":
             task["requests"] = list(dict.fromkeys([*task.get("requests", []), rid]))
             task["callers"] = list(dict.fromkeys([*task.get("callers", []), caller["id"]]))
@@ -3092,6 +3170,7 @@ def _emit_negotiations(
         elif task["state"] in TERMINAL:
             task.update(requests=[rid], callers=[caller["id"]], header=header or task.get("header"))
             _reopen(state, task, f"new strengthening request {rid}")
+            task["deps"] = _negotiate_deps(state, ctx, task)
         else:  # running or merging: the next round handles it
             task.setdefault("followup_requests", []).append(rid)
             task.setdefault("followup_callers", []).append(caller["id"])

@@ -6,7 +6,7 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
 - **Module Name:** `{module_name}`
 - **Stalled Function:** `{function_name}` (`workspace/work/{c_file}`)
 - **Unproven Assertions / Goals:** `{unproven_goals_json}`
@@ -17,6 +17,8 @@ Your mission is the opposite of the Prover's: **show that the stalled RTE or sec
 A `Known Dead Ends` section, when present, lists clauses already refuted on this function or rejected by a callee; never re-add them. A clause refuted under E-ACSL came with an input that violates it: use its predicate as a hint for inputs that violate the current contract.
 
 <!-- spec-kb -->
+
+<!-- run-commands -->
 
 ## Rules
 

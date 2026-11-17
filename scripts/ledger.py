@@ -70,7 +70,7 @@ import cache  # noqa: E402
 import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
-from failure_identity import parse_eacsl_resource_abort, site_key  # noqa: E402
+from failure_identity import is_sanitizer_allocation_cap, parse_eacsl_resource_abort, site_key  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
@@ -1157,7 +1157,14 @@ def _eacsl_resource_abort(art: dict) -> dict | None:
     if found is None:
         return None
     attribution = art.get("attribution")
-    if isinstance(attribution, dict) and attribution.get("failure"):
+    san_failure = attribution.get("failure") if isinstance(attribution, dict) else None
+    if is_sanitizer_allocation_cap(san_failure):
+        # ASan's own allocator cap on the same input (run-4 reports, before allocator_may_return_null=1).
+        return {**found, "sanitizer_replay": "allocation_size_too_big"}
+    if san_failure:
+        return None
+    if art.get("kind") == "oom" and isinstance(attribution, dict) and attribution.get("out_of_memory"):
+        # libFuzzer's OOM, and the sanitizer build ran out of memory too: not the E-ACSL limit alone.
         return None
     return {**found, "sanitizer_replay": "unavailable" if not attribution else "no_failure"}
 
@@ -1362,8 +1369,9 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 continue
             else:
                 kind = art.get("kind", "crash")
+                # An OOM is keyed by its input too: `module:oom:` alone merged every OOM of a module (mpack run-4).
                 digest = hashlib.sha256(
-                    f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak') else ''}".encode()
+                    f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak', 'oom') else ''}".encode()
                 ).hexdigest()[:10]
                 fp = f"harness_{re.sub(r'[^A-Za-z0-9_.-]', '_', module)}.c#unknown_function::{'unparsed_' + kind if kind in ('crash', 'leak') else kind}::{digest}"
                 cand = upsert_candidate(
@@ -1377,7 +1385,8 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     [artifact_rel],
                     tool_output,
                     [],
-                    "no E-ACSL failure report could be parsed; verifier must triage and link units",
+                    "no E-ACSL failure report could be parsed; verifier must triage and link units"
+                    + ("; did not reproduce on replay" if art.get("reproducible") is False else ""),
                     engine=_detection_engine(art, report),
                 )
                 fp = cand["fingerprint"]

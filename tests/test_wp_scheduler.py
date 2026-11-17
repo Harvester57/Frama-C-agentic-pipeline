@@ -514,12 +514,10 @@ def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_modul
     assert t["arch:m2"]["header"] == "src/m2/m2.h" and t["arch:m2"]["deps"] == ["gate:m2"]
 
     # g has no contract and no prove task: the scheduler asks for one, and f also waits on that negotiation.
-    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["arch:m1", "arch:m2", "negotiate:src/m2/g.c#g"]
-    assert {(a, r) for a, r, _ in sim.prepared} == {
-        ("arch-m1", "architect"),
-        ("arch-m2", "architect"),
-        ("negotiate-g", "prover"),
-    }
+    # The negotiation waits, as a prove task of g would, for g's module architect (S19, mpack run-4).
+    assert tasks()["negotiate:src/m2/g.c#g"]["deps"] == ["arch:m2", "gate:m2"]
+    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["arch:m1", "arch:m2"]
+    assert {(a, r) for a, r, _ in sim.prepared} == {("arch-m1", "architect"), ("arch-m2", "architect")}
 
     sim.architect("arch-m1", "src/m1/m1.h")
     out = S.cmd_complete("arch-m1")
@@ -528,7 +526,8 @@ def test_prover_waits_for_the_architects_of_its_module_and_of_every_callee_modul
 
     sim.architect("arch-m2", "src/m2/m2.h", status="failed")
     assert S.cmd_complete("arch-m2")["action"] == "architect_failed"  # provers proceed anyway
-    assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m2/g2.c#g2"]  # f waits for g's contract
+    # f waits for g's contract
+    assert sorted(ids(S.cmd_next("auto", prepare=True))) == ["negotiate:src/m2/g.c#g", "prove:src/m2/g2.c#g2"]
     sim.finish("negotiate-g", "g", "src/m2/g.c", force=True)
     assert ids(S.cmd_next("auto", prepare=True)) == ["prove:src/m1/f.c#f"]
 

@@ -25,9 +25,14 @@ DEFAULT_PER_INPUT_TIMEOUT_S = 10
 DUAL_ENGINE = "eacsl+sanitizers"
 
 
+# allocator_may_return_null=1: a request past ASan's own allocator maximum (1 TiB on x86_64) returns NULL,
+# as malloc may, instead of aborting with allocation-size-too-big. A target that checks the result then
+# runs its error path; one that does not fails on the NULL pointer, located in its own frame. Requests
+# above -rss_limit_mb still end as libFuzzer's `out-of-memory (malloc(N))` (oom- artifact). Measured in
+# framac-analysis:latest, mpack run-4 (docs/troubleshooting/eacsl-and-fuzzing.md).
 SANITIZER_RUNTIME_ENV = {
     "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
-    "ASAN_OPTIONS": "abort_on_error=1",
+    "ASAN_OPTIONS": "abort_on_error=1:allocator_may_return_null=1",
 }
 
 

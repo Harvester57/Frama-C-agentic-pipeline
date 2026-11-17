@@ -8,7 +8,7 @@ Subcommands:
   ledger        <coverage-ledger.json> [--run-dir DIR]
   metadata      <run-metadata.json>
   snapshot      <snapshot-manifest.json> [--run-dir DIR]
-  agent-result  <result.json>
+  agent-result  <result.json>          [--run-dir DIR]  (default: the run dir of an agents/<id>/scratch/ result)
   dag | sidecar | build-check | reach-dynamic | seed-harvest | build-capture | phase0-model
   | security-props | variadic-calls  <artifact.json>    (Phase 0 artifacts, remediation R5)
   traces        <traces.jsonl>
@@ -49,6 +49,7 @@ from framac_common import (  # noqa: E402
     wp_limits_problem,
 )
 from minischema import MAX_ERRORS, Validator, load_schema  # noqa: E402
+from promote_artifact import PromotionError, check_promotable  # noqa: E402
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -347,7 +348,57 @@ def _under_agent_dir(errors: Errors, where: str, agent_id: str, value: str | Non
         errors.add(f"{where}: must live under agents/{agent_id}/ (agents write only to their own directory)")
 
 
-def validate_agent_result(data) -> Errors:
+def _verifier_files(errors: Errors, data: dict, run_dir: Path) -> None:
+    """
+    The file checks `ledger.py ingest-verifier` makes, so the verifier sees them before it returns
+    (mpack run-4: a cited repository doc failed the ingest and lost the verdict). A file under the
+    agent's scratch is promoted (promote_artifact.check_promotable: size caps); any other must exist
+    under the run dir, as validate_findings requires of the merged findings.json.
+    """
+    aid = data["agent_id"]
+    scratch = f"agents/{aid}/scratch/"
+    pending = 0
+    seen: set[str] = set()
+
+    def check(where: str, value: str | None, kind: str) -> None:
+        nonlocal pending
+        if not isinstance(value, str) or not is_safe_relative_path(value):
+            return  # the schema and _path_ok report it
+        norm = value.replace("\\", "/")
+        if not norm.startswith(scratch):
+            _exists(errors, where, run_dir, value)
+            return
+        try:
+            st = check_promotable(run_dir, aid, norm, kind, pending_bytes=pending)
+        except PromotionError as exc:
+            errors.add(f"{where}: ingest would refuse this file: {exc}")
+            return
+        if kind == "artifact" and norm not in seen:
+            seen.add(norm)
+            pending += st.st_size
+
+    records = [("$.record", data["record"])] + [
+        (f"$.additional_records[{i}]", r) for i, r in enumerate(data.get("additional_records") or [])
+    ]
+    for where, rec in records:
+        for idx, ev in enumerate(rec.get("evidence") or []):
+            check(f"{where}.evidence[{idx}].tool_output", ev.get("tool_output"), "artifact")
+        if rec.get("verdict") == "confirmed":
+            for idx, rep in enumerate(rec.get("reproducers") or []):
+                check(f"{where}.reproducers[{idx}].input", rep.get("input"), "crash")
+            check(f"{where}.remediation.fix_patch", (rec.get("remediation") or {}).get("fix_patch"), "artifact")
+
+
+def run_dir_of_result(path: Path) -> Path | None:
+    """The run dir of a result written where briefs say: <run>/agents/<agent-id>/scratch/<file>."""
+    p = path.resolve()
+    if p.parent.name == "scratch" and p.parent.parent.parent.name == "agents":
+        return p.parents[3]
+    return None
+
+
+def validate_agent_result(data, run_dir: Path | None = None) -> Errors:
+    """With `run_dir`, also the cited files a crash verifier's ingest promotes or requires (_verifier_files)."""
     errors = Errors()
     for e in Validator(get_schema("agent-result")).errors(data):
         errors.add(e)
@@ -404,6 +455,8 @@ def validate_agent_result(data) -> Errors:
             errors.add(
                 "$.refingerprint_reason: required when the record fingerprint differs from the candidate or additional_records are present"
             )
+        if run_dir is not None:
+            _verifier_files(errors, data, run_dir)
     elif role == "critic":
         if data["stop"] and (data["missing_units"] or data["reassign_ids"]):
             errors.add("$.stop: may only be true when no missing_units and no reassign_ids are proposed")
@@ -836,9 +889,17 @@ def main(argv=None) -> int:
         p = sub.add_parser(name)
         p.add_argument("path", type=Path)
         p.add_argument("--run-dir", type=Path, default=None)
-    for name in ("candidates", "metadata", "agent-result"):
+    for name in ("candidates", "metadata"):
         p = sub.add_parser(name)
         p.add_argument("path", type=Path)
+    p = sub.add_parser("agent-result")
+    p.add_argument("path", type=Path)
+    p.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Check cited files as the ingest does (default: the run dir of an agents/<id>/scratch/ result)",
+    )
     for name in (*PHASE0_COMMANDS, "traces"):
         p = sub.add_parser(name)
         p.add_argument("path", type=Path)
@@ -864,7 +925,7 @@ def main(argv=None) -> int:
             return _emit(PHASE0_COMMANDS[args.cmd](data))
         if args.cmd == "agent-result":
             data = load_agent_result_json(args.path)
-            return _emit(validate_agent_result(data))
+            return _emit(validate_agent_result(data, args.run_dir or run_dir_of_result(args.path)))
         data = load_json_strict(args.path)
         if args.cmd == "findings":
             return _emit(validate_findings(data, args.run_dir))

@@ -84,7 +84,15 @@ byte selects it), with arguments built from the model's signature of each functi
   - a function pointer: a callback stub of its prototype (`callback_stub`, defined after the headers:
     it writes nothing and returns the zero value of its type), when the layout probe spelled the
     prototype from the headers' own typedefs (`callback_prototypes`); else NULL. Either way the case's
-    `notes` say which. A function pointer inside a struct stays NULL.
+    `notes` say which. A function pointer inside a struct stays NULL;
+  - argument domains (mpack run-4, `_domain_rules`, `_realloc_like`, `_owned_result`): a value read
+    from the input that breaks a documented precondition is normalized after the read, and only
+    then, so slots and seeds do not move: (min, max) bounds ordered, and a lone bound an inline
+    wrapper forwards to such a range with a literal other bound kept past it (A, `bound_forwards`); a NUL-terminated output's
+    capacity and a limit setter's `max_*` at least 1 (B); an initializer's (buffer, size, count)
+    count at most the size (C); an enum by value one of its declared constants (D, from the probe);
+    a realloc-like call given a harness malloc (E); a heap result or `char **` output the caller
+    owns freed (F). Each restriction is in the case's `notes`.
 
 Recorded call sequences (seed_harvest.py traces) add sequence cases: the calls of one traced chain in
 order, the buffers they share passed between them, so a later call sees what an earlier one produced
@@ -197,6 +205,62 @@ PATH_SKIP_REASON = (
     "takes a file-system path (parameter `{name}`): the harness never passes input bytes as a path, "
     "which would open or create a file the fuzzer names on every execution"
 )
+
+# --- argument domains (mpack run-4) ------------------------------------------------------------------
+# Each rule below normalizes an argument after it is read from the input, and only when the value is
+# outside the domain the API documents: a value inside it is passed as read, so recorded seeds keep
+# their meaning and no slot moves. A rule never widens what reaches the call; each one is a documented
+# precondition whose violation the Crash Verifier rejects as `harness_induced`, never a library bug.
+#
+# A. The bounds of a range (`min_value`/`max_value`, `lo`/`hi`, `low`/`high`, `lower`/`upper`,
+#    `minimum`/`maximum`: the same name but for that one word, the same scalar type) are ordered, and a
+#    NaN bound of a floating range replaced (MPack: `mpack_assert(min_value <= max_value)`).
+#    A lone bound whose function forwards it to such a range with a literal other bound (an inline
+#    function of the headers, read from the probe's AST: `bound_forwards`) is kept on its side of
+#    that literal (mpack run-4: `mpack_expect_i8_max(reader, -1)` reached the same assert).
+_RANGE_WORDS = frozenset({("min", "max"), ("lo", "hi"), ("low", "high"), ("lower", "upper"), ("minimum", "maximum")})
+# B. The capacity of a writable NUL-terminated output (a byte pair of a function named with the word
+#    `cstr`) is at least 1: room for the terminator (`mpack_node_copy_cstr`: "you must have room for
+#    at least a null-terminator"; `mpack_node_copy_data` takes 0 and is left alone). A `max_*` limit
+#    of a limit setter (`mpack_tree_set_limits`), or forwarded under the same formal name to one by a
+#    function that calls it (`mpack_tree_init_stream`), is at least 1 too (MPack asserts
+#    `max_message_size > 0`, `max_message_nodes > 0`; `limit_parameters`). A `max_*` of any other
+#    function is left alone: `mpack_tree_init_stdfile(tree, file, max_bytes, ...)` reads 0 as
+#    "unlimited size".
+_CSTR_WORDS = frozenset({"cstr"})
+_LIMIT_SETTER_RE = re.compile(r"(?:^|_)set_limits?$|[a-z0-9]SetLimits?$")
+# C. In a (buffer, size, count) triple an initializer records, the count of bytes already in the
+#    buffer is at most its size (`mpack_reader_init(reader, buffer, size, count)`: "count: the number
+#    of bytes already in the buffer"). The size's name says size or capacity, the count's says count,
+#    used, fill or length. Only an initializer: it stores the triple and cannot reject it, while an
+#    operation given a byte count larger than its buffer must check it (`mpack_read_cstr` flags
+#    `mpack_error_too_big`), which is a check the fuzzer is there to exercise.
+_TRIPLE_SIZE_WORDS = frozenset({"size", "cap", "capacity", "bufsize"})
+_TRIPLE_COUNT_WORDS = frozenset({"count", "used", "fill", "filled", "len", "length", "avail"})
+# E. A realloc-like function (named `*_realloc`/`*Realloc`, first parameter a writable `void *`, the
+#    rest sizes, reaching an allocator) gets a pointer the harness allocated (REALLOC_OLD_BYTES), never
+#    a static buffer (ASan: "attempting free on address which was not malloc-ed"). The used size stays
+#    within that allocation and the new size; the new size is in 1..spare: 0 frees the old pointer
+#    (C23 makes `realloc(p, 0)` undefined), and a size above libFuzzer's malloc limit is an OOM report
+#    the harness made. The result is freed, or the old pointer when the call failed.
+_REALLOC_NAME_RE = re.compile(r"(?:^|_)realloc$|[a-z0-9]Realloc$")
+_REALLOC_USED_WORDS = frozenset({"used", "old", "cur", "current"})
+REALLOC_OLD_BYTES = 64
+# F. A result the caller owns is freed after the call: a pointer returned by a function named with
+#    the word `alloc` or `dup` (`mpack_expect_cstr_alloc`, `mpack_read_bytes_alloc_impl`, `*_strdup`)
+#    that reaches an allocator (`ALLOCATORS`, through the model's call sites) and whose header does
+#    not return a `const` pointee (the model drops that `const`: `mpack_type_to_string` is `char *`
+#    there). The same goes for a writable `char **`/`void **` output of such a function, or of one
+#    named `*growable*` (`mpack_writer_init_growable`'s `*target_data`), freed after the object's
+#    destructor. A pool or arena slot named `*_alloc` reaches no allocator and is never freed.
+_OWNED_RESULT_WORDS = frozenset({"alloc", "dup", "strdup", "strndup"})
+_OWNED_OUT_WORDS = _OWNED_RESULT_WORDS | {"growable"}
+ALLOCATORS = frozenset({"malloc", "calloc", "realloc", "reallocarray", "strdup", "strndup", "aligned_alloc"})
+
+
+def _words(name: str | None) -> list[str]:
+    """The lowercase words of an identifier (`max_message_nodes`, `maxNodes`, `mpack_expect_cstr`)."""
+    return [w.lower() for w in _NAME_WORD_RE.findall(name or "")]
 
 # Byte size of the scalars a slot can hold (x86_64): a seed needs it to lay out the input.
 SCALAR_BYTES = {
@@ -353,6 +417,16 @@ class ApiInfo:
     # initializer set up in it, and every function named like a destructor of it.
     struct_dtors: dict[str, str] = field(default_factory=dict)
     struct_dtor_names: dict[str, set[str]] = field(default_factory=dict)
+    # Argument domains (`_domain_rules`): per function, enum parameter index -> the enum's declared
+    # constants (`param_enums`); the functions whose header returns a `const` pointee
+    # (`const_returns`); the functions that reach an allocator through the model's call sites
+    # (`allocating_functions`); per function, the formal names of its limits (`limit_parameters`).
+    enum_params: dict[str, dict[int, list[str]]] = field(default_factory=dict)
+    const_returns: set[str] = field(default_factory=set)
+    allocating: set[str] = field(default_factory=set)
+    limits: dict[str, set[str]] = field(default_factory=dict)
+    # Per function, parameter index -> (">=" or "<=", constant) of a lone range bound (`bound_forwards`).
+    bounds: dict[str, dict[int, tuple[str, str]]] = field(default_factory=dict)
 
 
 class _Case:
@@ -369,6 +443,9 @@ class _Case:
         self.inits: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self.declared: set[str] = set()
+        # Frees of heap outputs of an initializer or constructor call (rule F), placed after the
+        # releases of the call they were built for.
+        self.owned_frees: list[str] = []
 
     def declare(self, name: str) -> str:
         """
@@ -748,6 +825,169 @@ def _struct_release(api: ApiInfo, pointee: str, name: str, expr: str) -> str | N
     return f"(void){dtor}({expr});"
 
 
+def _return_type(rec: dict) -> str:
+    parts = split_signature(str(rec.get("signature") or ""))
+    return " ".join(parts[0].split()) if parts else ""
+
+
+def _realloc_like(name: str, params: list[dict], formals: list[dict], rec: dict, api: ApiInfo) -> tuple[list[int], list[int]] | None:
+    """
+    (used-size indices, new-size indices) of a realloc-like function (rule E), or None: named like
+    `*_realloc`, a writable `void *` first, then only integers, at least one of them a new size, a
+    pointer returned, and an allocator reached.
+    """
+    if not _REALLOC_NAME_RE.search(name) or name not in api.allocating or not params:
+        return None
+    p0 = params[0]
+    if p0["kind"] != "ptr" or str(p0.get("pointee") or "") not in ("void", "") or _is_input(formals, 0):
+        return None
+    if not _return_type(rec).endswith("*"):
+        return None
+    used: list[int] = []
+    new: list[int] = []
+    for k in range(1, len(params)):
+        if params[k]["kind"] != "int" or params[k].get("enum") or params[k].get("ctype") == "_Bool":
+            return None
+        (used if set(_words(_name(formals, k))) & _REALLOC_USED_WORDS else new).append(k)
+    return (used, new) if new else None
+
+
+def _owned_result(name: str, rec: dict, api: ApiInfo) -> bool:
+    """Whether the call returns a heap object its caller frees (rule F)."""
+    return (
+        bool(set(_words(name)) & _OWNED_RESULT_WORDS)
+        and name in api.allocating
+        and name not in api.const_returns
+        and _return_type(rec).endswith("*")
+    )
+
+
+def _range_partner(a: str | None, b: str | None) -> bool:
+    """Whether formals `a` and `b` are the bounds of one range, `a` the lower (rule A)."""
+    wa, wb = _words(a), _words(b)
+    if not wa or len(wa) != len(wb):
+        return False
+    diff = [(x, y) for x, y in zip(wa, wb, strict=True) if x != y]
+    return len(diff) == 1 and diff[0] in _RANGE_WORDS
+
+
+def _domain_rules(
+    case: _Case,
+    call: int,
+    name: str,
+    params: list[dict],
+    formals: list[dict],
+    scalars: dict[int, str],
+    pairs: list[tuple[int, str, bool]],
+) -> None:
+    """
+    Rules A-D (see `_RANGE_WORDS` and below) on the arguments of one call, once all of them are read:
+    statements appended to the case's declarations (after every input slot, before the call), or to
+    its `post` statements for a length that is the rest of the input. `scalars` maps a parameter read
+    as one scalar to its variable; `pairs` lists each byte (pointer, length) pair as (pointer index,
+    length expression, whether the length is the rest of the input).
+    """
+
+    def plain(k: int) -> bool:
+        p = params[k]
+        return p["kind"] in ("int", "float") and not p.get("enum") and p.get("ctype") != "_Bool"
+
+    # A: ordered bounds.
+    taken: set[int] = set()
+    for i in sorted(scalars):
+        for j in sorted(scalars):
+            if j <= i or i in taken or j in taken or not (plain(i) and plain(j)):
+                continue
+            if params[i]["ctype"] != params[j]["ctype"] or not _range_partner(_name(formals, i), _name(formals, j)):
+                continue
+            a, b, ct = scalars[i], scalars[j], params[i]["ctype"]
+            if params[i]["kind"] == "float":
+                case.decls.append(f"if ({a} != {a}) {{ {a} = 0; }} if ({b} != {b}) {{ {b} = {a}; }}")
+            case.decls.append(f"if ({b} < {a}) {{ {ct} fc_t = {a}; {a} = {b}; {b} = fc_t; }}")
+            case.note(call, j, f"range bound: ordered after argument {i} (the API requires {_name(formals, i)} <= {_name(formals, j)})")
+            taken |= {i, j}
+    # A': a lone bound forwarded to a range-like callee with a constant other bound (`bound_forwards`).
+    for k, (op, const) in sorted((case.api.bounds.get(name) or {}).items()):
+        if k not in scalars or k in taken or not plain(k):
+            continue
+        num = _number(const)
+        if num is None or (str(params[k]["ctype"]).startswith("unsigned") and num <= 0):
+            continue  # an unsigned value is never below 0, and a negative constant does not fit it
+        v = scalars[k]
+        if params[k]["kind"] == "float":
+            case.decls.append(f"if ({v} != {v}) {{ {v} = {const}; }}")
+        cmp = "<" if op == ">=" else ">"
+        case.decls.append(f"if ({v} {cmp} {const}) {{ {v} = {const}; }}")
+        side = "upper" if op == ">=" else "lower"
+        case.note(call, k, f"range bound: forwarded as the {side} bound of a range whose other bound is {const}: kept {op} {const}")
+    lengths = {i + 1: (ln, rest) for i, ln, rest in pairs}
+    # B: a NUL-terminated output's capacity; a limit of an initializer or a limit setter.
+    if set(_words(name)) & _CSTR_WORDS:
+        for i, ln, rest in pairs:
+            if not rest and not _is_input(formals, i):
+                case.decls.append(f"if ({ln} < 1) {{ {ln} = 1; }}")
+                case.note(call, i + 1, "capacity of a NUL-terminated output: at least 1 (room for the terminator)")
+    limits = case.api.limits.get(name) or set()
+    if limits:
+        ints = {**scalars, **{k: ln for k, (ln, rest) in lengths.items() if not rest}}
+        for k in sorted(ints):
+            if _name(formals, k) in limits and params[k]["kind"] == "int" and plain(k):
+                case.decls.append(f"if ({ints[k]} < 1) {{ {ints[k]} = 1; }}")
+                case.note(call, k, "limit of a limit setter: at least 1")
+    # C: (buffer, size, count) of an initializer.
+    for i, ln, rest in pairs if _INIT_NAME_RE.search(name) else []:
+        c = i + 2
+        if c not in scalars or not plain(c) or not is_length(params[c], _name(formals, c)):
+            continue
+        if not set(_words(_name(formals, i + 1))) & _TRIPLE_SIZE_WORDS:
+            continue
+        if not set(_words(_name(formals, c))) & _TRIPLE_COUNT_WORDS:
+            continue
+        v, ct = scalars[c], params[c]["ctype"]
+        stmt = f"if ((unsigned long long){v} > (unsigned long long){ln}) {{ {v} = ({ct}){ln}; }}"
+        (case.post if rest else case.decls).append(stmt)
+        case.note(call, c, f"count of a (buffer, size, count) triple: at most argument {i + 1}")
+    # D: an enum by value is one of its declared constants.
+    for k in sorted(scalars):
+        if not params[k].get("enum"):
+            continue
+        names = (case.api.enum_params.get(name) or {}).get(k)
+        if not names:
+            case.note(
+                call, k, "enum: its declared constants are not known (no layout probe, a flag enum, or not in the headers): passed as read"
+            )
+            continue
+        v, ct, n = scalars[k], params[k]["ctype"], len(names)
+        # A plain disjunction, which Eva narrows the value by, unlike a loop over the table.
+        member = " || ".join(f"(long long){v} == (long long){c}" for c in names)
+        case.decls.append(
+            f"if (!({member})) {{ static const long long fc_e[{n}] = {{ {', '.join(names)} }}; "
+            f"{v} = ({ct})fc_e[(unsigned int){v} % {n}U]; }}"
+        )
+        case.note(call, k, f"enum: a value none of its {n} declared constants is mapped onto one")
+
+
+def _realloc_rules(
+    case: _Case, call: int, scalars: dict[int, str], params: list[dict], used: list[int], new: list[int]
+) -> None:
+    """Rule E's sizes: each new size in 1..spare, then each used size within the old allocation and every new size."""
+    spare = case.spare
+    new = [k for k in new if k in scalars]
+    used = [k for k in used if k in scalars]
+    for k in new:
+        v, ct = scalars[k], params[k]["ctype"]
+        case.decls.append(
+            f"if ({v} < 1 || (unsigned long long){v} > {spare}ULL) {{ {v} = ({ct})(1ULL + (unsigned long long){v} % {spare}ULL); }}"
+        )
+        case.note(call, k, f"new size of a realloc-like call: in 1..{spare}")
+    for k in used:
+        v, ct = scalars[k], params[k]["ctype"]
+        case.decls.append(f"if ((unsigned long long){v} > {REALLOC_OLD_BYTES}ULL) {{ {v} = {REALLOC_OLD_BYTES}; }}")
+        for m in new:
+            case.decls.append(f"if ((unsigned long long){v} > (unsigned long long){scalars[m]}) {{ {v} = ({ct}){scalars[m]}; }}")
+        case.note(call, k, f"used size of a realloc-like call: within the {REALLOC_OLD_BYTES}-byte old allocation and the new size")
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -775,6 +1015,12 @@ def _bind_call(
     api = case.api
     handles = api.handles.get(name) or {}
     outs = api.outs.get(name) or {}
+    # Argument domains (`_domain_rules`): the variables of the scalars and byte pairs read for this call.
+    scalars: dict[int, str] = {}
+    pairs: list[tuple[int, str, bool]] = []
+    owned_outs: list[str] = []
+    realloc = _realloc_like(name, params, formals, rec, api) if allow_init and 0 not in shared else None
+    realloc_old: str | None = None
     i = 0
     n = len(params)
     while i < n:
@@ -832,6 +1078,7 @@ def _bind_call(
                     f"if ((unsigned long long){ln} > sizeof({shared[i]})) {{ {ln} = ({nxt['ctype']})sizeof({shared[i]}); }}"
                 )
                 args.append(ln)
+                pairs.append((i, ln, False))
                 i += 2
                 continue
             i += 1
@@ -849,6 +1096,17 @@ def _bind_call(
                     call, i, "function pointer: NULL (no callback stub: no layout probe, or its prototype not spelled)"
                 )
                 args.append("0")
+            i += 1
+            continue
+        if p["kind"] == "ptr" and i == 0 and realloc is not None:
+            # Rule E: the old pointer of a realloc-like call is the harness's own allocation.
+            realloc_old = case.declare(v)
+            case.decls.append(
+                f"unsigned char *{v} = (unsigned char *)malloc({REALLOC_OLD_BYTES}); "
+                f"if ({v} != 0) {{ memset({v}, 0, {REALLOC_OLD_BYTES}); }}"
+            )
+            case.note(call, i, f"old pointer of a realloc-like call: a {REALLOC_OLD_BYTES}-byte malloc of the harness")
+            args.append(f"({p['type']}){v}")
             i += 1
             continue
         if p["kind"] == "ptr":
@@ -883,6 +1141,7 @@ def _bind_call(
                     case.rest = {"call": call, "param": i, "kind": "bytes"}
                     args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
                     args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
+                    pairs.append((i, "(fuzz_len - fuzz_off)", True))
                 else:
                     buf = size or case.spare
                     case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
@@ -894,6 +1153,7 @@ def _bind_call(
                     case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({nxt['ctype']}){buf}; }}")
                     args.append(f"({p['type']}){v}")
                     args.append(ln)
+                    pairs.append((i, ln, False))
                 i += 2
                 continue
             if charlike:
@@ -962,6 +1222,16 @@ def _bind_call(
                     case.slot(v, SCALAR_BYTES.get(pointee) or (lay or {}).get("size"), call, i, "pointee")
                 elif is_input and lay is not None and lay.get("what") == "struct":
                     _fill_fields(case, call, i, v, lay, 0)
+                elif (
+                    not is_input
+                    and pointee in ("char *", "void *", "unsigned char *")
+                    and i not in (api.qual_ptrs.get(name) or {})
+                    and set(_words(name)) & _OWNED_OUT_WORDS
+                    and name in api.allocating
+                ):
+                    # Rule F: a heap object the call hands to its caller through `char **`.
+                    owned_outs.append(v)
+                    case.note(call, i, "heap output the caller owns: freed after the call and its object's release")
                 args.append(f"&{v}")
             i += 1
             continue
@@ -976,8 +1246,12 @@ def _bind_call(
             case.bool_slot(v, call, i, "int")
         else:
             case.slot(v, SCALAR_BYTES.get(p["ctype"]), call, i, "int")
+        scalars[i] = v
         args.append(v)
         i += 1
+    if realloc is not None:
+        _realloc_rules(case, call, scalars, params, *realloc)
+    _domain_rules(case, call, name, params, formals, scalars, pairs)
     args += extra_args or []
     if allow_init and params and 0 not in shared and 0 not in bound_handles and params[0]["kind"] == "ptr":
         # An initializer's own case: what it set up in its (unshared) object is released after it. A
@@ -992,8 +1266,27 @@ def _bind_call(
         # The call under test makes a handle: release it, or every run of the case leaks one.
         r = f"c{call}r"
         own = f"{{ {made} {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){case.api.dtors[made]}({r}); }} }}"
+    elif realloc_old is not None:
+        # Rule E: the result is freed; on failure (a new size of at least 1) the old pointer still is the caller's.
+        r = f"c{call}r"
+        own = (
+            f"if ({realloc_old} != 0) {{ void *{r} = (void *){name}({', '.join(args)}); "
+            f"if ({r} != 0) {{ free({r}); }} else {{ free({realloc_old}); }} }}"
+        )
+    elif allow_init and _owned_result(name, rec, api):
+        # Rule F: a heap result the caller owns, freed, or every run of the case leaks it.
+        r = f"c{call}r"
+        own = f"{{ void *{r} = (void *){name}({', '.join(args)}); free({r}); }}"
+        case.notes.append(f"call {call} result: a heap object the caller owns, freed after the call")
     else:
         own = f"(void){name}({', '.join(args)});"
+    if allow_init:
+        # Rule F's outputs: after this call's releases, the destructor that hands them over included.
+        # Those of an initializer or a constructor run first wait for the call under test's.
+        after += [*(f"free({v});" for v in owned_outs), *case.owned_frees]
+        case.owned_frees = []
+    else:
+        case.owned_frees += [f"free({v});" for v in owned_outs]
     if guards:
         # Only on handles an out-parameter constructor built: one that failed wrote nothing.
         own = f"if ({' && '.join(guards)}) {{ {own} }}"
@@ -1761,7 +2054,9 @@ def _lifecycle_case(
     )
     layout = case.layout("lifecycle", [ctor, dtor])
     layout.update(handle=htype, methods=list(methods), max_calls=max_calls)
-    return case.statements([make, loop]), layout, None
+    # Rule F's outputs of the constructor (built with allow_init=False), freed after its destructor.
+    frees, case.owned_frees = case.owned_frees, []
+    return case.statements([make, loop, *frees]), layout, None
 
 
 def plan(
@@ -1859,6 +2154,11 @@ def plan(
         qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
         struct_dtors=struct_dtors,
         struct_dtor_names=struct_dtor_names,
+        enum_params=dict(getattr(visible, "enum_params", None) or {}),
+        const_returns=set(getattr(visible, "const_returns", None) or ()),
+        allocating=allocating_functions(model.get("functions") or {}),
+        limits=limit_parameters(model.get("functions") or {}),
+        bounds=dict(getattr(visible, "bound_forwards", None) or {}),
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -2018,6 +2318,9 @@ class Declared(set):  # type: ignore[type-arg]
     callbacks: dict[str, dict[int, dict[str, Any]]]
     enum_pointers: dict[str, dict[int, dict[str, str]]]
     qualified_pointers: dict[str, dict[int, dict[str, str]]]
+    enum_params: dict[str, dict[int, list[str]]]
+    const_returns: set[str]
+    bound_forwards: dict[str, dict[int, tuple[str, str]]]
 
     def __init__(
         self,
@@ -2026,6 +2329,9 @@ class Declared(set):  # type: ignore[type-arg]
         callbacks: dict[str, dict[int, dict[str, Any]]] | None = None,
         enum_pointers: dict[str, dict[int, dict[str, str]]] | None = None,
         qualified_pointers: dict[str, dict[int, dict[str, str]]] | None = None,
+        enum_params: dict[str, dict[int, list[str]]] | None = None,
+        const_returns: set[str] | None = None,
+        bound_forwards: dict[str, dict[int, tuple[str, str]]] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
@@ -2036,6 +2342,12 @@ class Declared(set):  # type: ignore[type-arg]
         # `qualified_pointer_spellings`: per function, parameter index -> {type, pointee} of a `T *const *`
         # or `const T **` parameter, as the header writes it.
         self.qualified_pointers = qualified_pointers or {}
+        # `param_enums`: per function, parameter index -> the declared constants of an enum by value.
+        self.enum_params = enum_params or {}
+        # `const_returns`: the functions whose declaration returns a pointer to `const`.
+        self.const_returns = set(const_returns or ())
+        # `bound_forwards`: per function, parameter index -> (">=" or "<=", constant) of a lone range bound.
+        self.bound_forwards = bound_forwards or {}
 
 
 def _spelled(t: str) -> str:
@@ -2219,6 +2531,291 @@ def qualified_pointer_spellings(tree: dict) -> dict[str, dict[int, dict[str, str
             if not _spelled(pointee).endswith("*") or not _QUALIFIERS_RE.search(pointee):
                 continue
             out.setdefault(name, {})[i] = {"type": written, "pointee": _drop_trailing_qualifiers(pointee)}
+    return out
+
+
+def _enum_ref(node: Any) -> str | None:
+    """The id of the first EnumDecl a typedef's type nodes refer to (`ownedTagDecl`, `decl`), if any."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if cur.get("kind") == "EnumDecl" and isinstance(cur.get("id"), str):
+                return cur["id"]
+            stack.extend(reversed([v for k, v in cur.items() if k in ("inner", "ownedTagDecl", "decl")]))
+        elif isinstance(cur, list):
+            stack.extend(reversed(cur))
+    return None
+
+
+def _flag_enum(values: list[int | None]) -> bool:
+    """Constants a caller combines with `|`: at least three, every nonzero one a distinct power of two."""
+    known = [v for v in values if v is not None]
+    if len(known) != len(values):
+        return False
+    nonzero = [v for v in known if v]
+    return len(nonzero) >= 3 and len(set(nonzero)) == len(nonzero) and all(v > 0 and v & (v - 1) == 0 for v in nonzero)
+
+
+def param_enums(tree: dict) -> dict[str, dict[int, list[str]]]:
+    """
+    Per declared function, its enum parameters by value (index -> the enum's constant names, in
+    declaration order), as the headers define the enum: through `enum tag` or through a typedef,
+    an anonymous enum's included (`typedef enum { ... } t;`, followed by the typedef's own tag
+    reference). A case maps an input value that is none of them onto one (rule D). A flag enum
+    (`_flag_enum`) is left out: its callers pass combinations, which a single constant would hide.
+    """
+    consts: dict[str, list[tuple[str, int | None]]] = {}
+    by_name: dict[str, str] = {}
+    typedefs: dict[str, str] = {}
+    typedef_enum: dict[str, str] = {}
+    decls: list[dict] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        if kind == "FunctionDecl":
+            decls.append(node)
+            continue
+        if kind == "EnumDecl" and isinstance(node.get("id"), str):
+            items: list[tuple[str, int | None]] = []
+            nxt: int | None = 0
+            for c in node.get("inner") or []:
+                if not isinstance(c, dict) or c.get("kind") != "EnumConstantDecl" or not isinstance(c.get("name"), str):
+                    continue
+                init = [x for x in c.get("inner") or [] if isinstance(x, dict)]
+                if init:
+                    try:
+                        nxt = int(str(init[0].get("value")), 0)
+                    except ValueError:
+                        nxt = None
+                items.append((c["name"], nxt))
+                nxt = None if nxt is None else nxt + 1
+            if items:
+                consts[node["id"]] = items
+                if isinstance(node.get("name"), str) and node["name"]:
+                    by_name[node["name"]] = node["id"]
+        if kind == "TypedefDecl" and isinstance(node.get("name"), str):
+            qual = str((node.get("type") or {}).get("qualType") or "")
+            typedefs.setdefault(node["name"], qual)
+            ref = _enum_ref(node.get("inner"))
+            if ref is not None and "*" not in qual and "(" not in qual:
+                typedef_enum.setdefault(node["name"], ref)
+        stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+
+    def resolve(t: str) -> str | None:
+        t = _spelled(t)
+        for _ in range(8):
+            if t.startswith("enum "):
+                return by_name.get(t[5:].strip())
+            if typedef_enum.get(t) in consts:
+                return typedef_enum[t]
+            if t not in typedefs:
+                return None
+            t = _spelled(typedefs[t])
+        return None
+
+    out: dict[str, dict[int, list[str]]] = {}
+    for node in decls:
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        parms = [n for n in node.get("inner") or [] if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"]
+        for i, parm in enumerate(parms):
+            qual = " ".join(str((parm.get("type") or {}).get("qualType") or "").split())
+            if "*" in qual or "[" in qual or "(" in qual:
+                continue
+            ref = resolve(qual)
+            if ref is None or _flag_enum([v for _, v in consts[ref]]):
+                continue
+            out.setdefault(name, {})[i] = [n for n, _ in consts[ref]]
+    return out
+
+
+def const_returns(tree: dict) -> set[str]:
+    """The declared functions whose return type is a pointer to `const` (`const char *`), as written."""
+    out: set[str] = set()
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if node.get("kind") != "FunctionDecl":
+            stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+            continue
+        fn = _FN_TYPE_RE.match(" ".join(str((node.get("type") or {}).get("qualType") or "").split()))
+        ret = fn.group("ret") if fn else ""
+        if isinstance(node.get("name"), str) and "*" in ret and re.search(r"\bconst\b", ret[: ret.rfind("*")]):
+            out.add(node["name"])
+    return out
+
+
+_TRANSPARENT_EXPRS = frozenset({"ImplicitCastExpr", "ParenExpr", "ConstantExpr"})
+
+
+def _strip_expr(node: Any) -> Any:
+    """`node` without implicit casts and parentheses (an explicit cast stays: it may change the value)."""
+    while isinstance(node, dict) and node.get("kind") in _TRANSPARENT_EXPRS and node.get("inner"):
+        node = node["inner"][0]
+    return node
+
+
+def _literal(node: Any) -> str | None:
+    """The text of an integer or floating literal, a negated one included (`-5`), else None."""
+    node = _strip_expr(node)
+    if not isinstance(node, dict):
+        return None
+    if node.get("kind") in ("IntegerLiteral", "FloatingLiteral") and isinstance(node.get("value"), str):
+        return node["value"]
+    if node.get("kind") == "UnaryOperator" and node.get("opcode") in ("-", "+") and node.get("inner"):
+        inner = _literal(node["inner"][0])
+        if inner is not None and not inner.startswith("-"):
+            return inner if node["opcode"] == "+" else f"-{inner}"
+    return None
+
+
+def _number(text: str) -> float | None:
+    try:
+        return float(int(text, 0))
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+
+def _param_ref(arg: Any, pids: list[str]) -> int | None:
+    """The index of the parameter (by AST id) an argument passes unchanged but for implicit conversions."""
+    a = _strip_expr(arg)
+    decl = a.get("referencedDecl") if isinstance(a, dict) and a.get("kind") == "DeclRefExpr" else None
+    if isinstance(decl, dict) and decl.get("kind") == "ParmVarDecl" and decl.get("id") in pids:
+        return pids.index(decl["id"])
+    return None
+
+
+def bound_forwards(tree: dict) -> dict[str, dict[int, tuple[str, str]]]:
+    """
+    Per function with a body in the probe's AST (an inline function of a header), its lone range
+    bounds (rule A'): parameter index -> (">=", constant) when it passes that parameter, unchanged
+    but for implicit conversions, as the upper bound of a range-like callee (two parameters
+    `_range_partner` pairs, `min_value`/`max_value`) and a literal constant as the lower bound
+    (`mpack_expect_i8_max(reader, max_value)` returns `mpack_expect_i8_range(reader, 0, max_value)`),
+    or ("<=", constant) for a lower bound under a constant upper one. The callee asserts
+    `min <= max`, so a value past the constant is a precondition the wrapper passes on. With several
+    such calls the strictest constant is kept. An explicit cast, an expression or a constant macro
+    that is not a literal gives nothing.
+    """
+    names: dict[str, list[str]] = {}
+    bodies: list[tuple[str, list[str], dict]] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if node.get("kind") != "FunctionDecl":
+            stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+            continue
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        inner = [n for n in node.get("inner") or [] if isinstance(n, dict)]
+        parms = [n for n in inner if n.get("kind") == "ParmVarDecl"]
+        pnames = [str(p.get("name") or "") for p in parms]
+        if all(pnames) and name not in names:
+            names[name] = pnames
+        body = next((n for n in inner if n.get("kind") == "CompoundStmt"), None)
+        if body is not None:
+            bodies.append((name, [str(p.get("id") or "") for p in parms], body))
+
+    def ranges(callee: str) -> list[tuple[int, int]]:
+        ps = names.get(callee) or []
+        return [(i, j) for i in range(len(ps)) for j in range(i + 1, len(ps)) if _range_partner(ps[i], ps[j])]
+
+    out: dict[str, dict[int, tuple[str, str]]] = {}
+    for name, pids, body in bodies:
+        calls: list[dict] = []
+        walk: list[Any] = [body]
+        while walk:
+            cur = walk.pop()
+            if isinstance(cur, dict):
+                if cur.get("kind") == "CallExpr":
+                    calls.append(cur)
+                walk.extend(reversed(cur.get("inner") or []))
+        for call in calls:
+            parts = [n for n in call.get("inner") or [] if isinstance(n, dict)]
+            if not parts:
+                continue
+            ref = _strip_expr(parts[0])
+            callee = str(((ref or {}).get("referencedDecl") or {}).get("name") or "")
+            args = parts[1:]
+            for lo, hi in ranges(callee):
+                if hi >= len(args):
+                    continue
+                for bound, const_at, op in ((hi, lo, ">="), (lo, hi, "<=")):
+                    k, c = _param_ref(args[bound], pids), _literal(args[const_at])
+                    if k is None or c is None or _number(c) is None:
+                        continue
+                    old = out.get(name, {}).get(k)
+                    if old is not None:
+                        if old[0] != op:
+                            continue
+                        prev, new = _number(old[1]), _number(c)
+                        if prev is not None and new is not None and (new <= prev if op == ">=" else new >= prev):
+                            continue
+                    out.setdefault(name, {})[k] = (op, c)
+    return out
+
+
+def _callee_names(model_functions: dict) -> dict[str, set[str]]:
+    """Per model function name, the names it calls directly (call sites and external calls)."""
+    callees: dict[str, set[str]] = {}
+    for key, rec in model_functions.items():
+        if not isinstance(rec, dict):
+            continue
+        name = str(rec.get("name") or str(key).split("#")[-1])
+        got = callees.setdefault(name, set())
+        for c in [*(rec.get("call_sites") or []), *(rec.get("external_calls") or [])]:
+            callee = c.get("callee") if isinstance(c, dict) else c
+            if isinstance(callee, str):
+                got.add(callee.split("#")[-1])
+    return callees
+
+
+def limit_parameters(model_functions: dict) -> dict[str, set[str]]:
+    """
+    Per function, the formal names of the limits rule B keeps at least 1: the `max_*` formals of a
+    limit setter (`mpack_tree_set_limits(tree, max_message_size, max_message_nodes)`), and the formals
+    of the same names of a function that calls one (`mpack_tree_init_stream`).
+    """
+    formals: dict[str, set[str]] = {}
+    for key, rec in model_functions.items():
+        if isinstance(rec, dict):
+            name = str(rec.get("name") or str(key).split("#")[-1])
+            formals[name] = {str(f.get("name")) for f in rec.get("formals") or [] if isinstance(f, dict) and f.get("name")}
+    setters = {
+        n: {f for f in fs if len(_words(f)) >= 2 and _words(f)[0] == "max"}
+        for n, fs in formals.items()
+        if _LIMIT_SETTER_RE.search(n)
+    }
+    out: dict[str, set[str]] = {n: fs for n, fs in setters.items() if fs}
+    for name, cs in _callee_names(model_functions).items():
+        got = set().union(*(setters[c] for c in cs if c in setters)) & formals.get(name, set())
+        if got:
+            out.setdefault(name, set()).update(got)
+    return out
+
+
+def allocating_functions(model_functions: dict) -> set[str]:
+    """
+    The functions of the model that reach an allocator (`ALLOCATORS`) through their call sites, by
+    name: `mpack_expect_cstr_alloc` -> `mpack_expect_cstr_alloc_unchecked` ->
+    `mpack_read_bytes_alloc_impl` -> `malloc`. Indirect calls are not followed.
+    """
+    callees = _callee_names(model_functions)
+    out: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, cs in callees.items():
+            if name not in out and cs & (ALLOCATORS | out):
+                out.add(name)
+                changed = True
     return out
 
 
@@ -2421,6 +3018,9 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         callback_prototypes(tree),
         enum_pointer_spellings(tree),
         qualified_pointer_spellings(tree),
+        param_enums(tree),
+        const_returns(tree),
+        bound_forwards(tree),
     )
 
 

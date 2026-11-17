@@ -6,13 +6,15 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
 - **Isolated Scratch Header Path:** `agents/{agent_id}/scratch/work/{header_file}`
 - **Isolated Scratch Module Sources:** `{scratch_module_sources}`
 - **Module Harness & Fuzzer Corpus:** `workspace/harnesses/harness_{harness_module_name}.c` and `workspace/corpus/{harness_module_name}/` (read-only for you)
 - **Security Properties (Layer 2 from `callgraph_dag.json`; Layers 3–6 generated from the threat model as MetAcsl meta-properties, `workspace/reports/security_props.json`):** `{security_properties_json}`
 - **Untrusted entry functions in this header:** `{untrusted_entry_functions_json}`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
+
+<!-- run-commands -->
 
 ## Strict Rules
 
@@ -50,10 +52,13 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
    - **Check 1 (Frama-C Kernel Syntax):** run `run_wp_function.py` or `frama-c -kernel-warn-key annot-error=abort` on `agents/{agent_id}/scratch/work/` to confirm zero ACSL syntax or typing errors.
    - **Check 2 (Dynamic E-ACSL Anti-Hallucination Guardrail):**
      ```text
-     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{harness_module_name}.c --out-bin agents/{agent_id}/scratch/guard_{module_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{harness_module_name} --extra-runs 200 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/header_guard_{module_name}.json
+     python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources {scratch_module_sources} workspace/harnesses/harness_{harness_module_name}.c {header_functions_args} --out-bin agents/{agent_id}/scratch/guard_{module_name} --scratch-dir agents/{agent_id}/scratch/guard --corpus-dir workspace/corpus/{harness_module_name} --extra-runs 200 --cppflags='{scratch_cppflags}' --ldflags='{ldflags}' --out-json agents/{agent_id}/scratch/header_guard_{module_name}.json
      ```
+   - The `--functions` list is every function this header declares: the guardrail checks their contracts and RTE, as a prover's checks its function. A check that fails in other code of the module (often a defect a crash verifier already confirmed, such as one in the program's `main`) is not held against your contracts: the guardrail drops the input that hit it (`excluded_inputs`) and replays the rest.
    - `rejected_overconstrained`: inspect `runtime_trace` and `failure`, relax the clause that failed on real inputs, and re-run until `passed_dynamic_oracle`.
-   - `code_fault`: an RTE failed on a real input; report it (status `failed`) instead of weakening contracts around it.
+   - `code_fault`: an RTE failed on a real input inside a function of this header; report it (status `failed`) instead of weakening contracts around it.
+   - `guardrail_error` with `outside_checked_functions`: a check failed in other code on an input the guardrail could not drop (libFuzzer's empty input on an empty corpus, or more inputs than it drops). Your contracts were neither refuted nor tested. Do not change them for it. Return `failed`, with the report in `evidence` and an evidence `result` that says "untested: failure outside the header's functions" and names the failure. The parent's re-check would stop on the same input, so `passed` could not merge; `failed` ends the task, and the provers proceed with the contracts that exist.
+   - `passed_dynamic_oracle` with `corpus_empty: true`, with every replayed input in `excluded_inputs`, or with a function of this header in `reach.unreached`: no real input tested those contracts. Return `passed` only when Check 1 is clean, and say so in the guardrail evidence `result` ("passed on no real input: corpus empty", "... all inputs excluded", or "... unreached: <functions>") instead of a bare `passed_dynamic_oracle`. The parent re-checks the merged tree the same way, and the provers' proofs record the missing runtime test as an open assumption.
 
 ## Reference Manuals (Last Resort)
 
@@ -78,5 +83,7 @@ Write your annotation diff to `agents/{agent_id}/scratch/{module_name}_header.pa
 ```
 
 List in `functions` every function whose contract you wrote or changed: the parent records your `boundary_assumptions` on those functions' ledger units.
+
+Every `evidence[].tool_output` is a report in the run directory, given relative to it (your `agents/{agent_id}/scratch/` or `workspace/`). Reference manuals and repository docs are not evidence files: name them in prose (`notes`).
 
 **Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the result schema does not have: remove it, in nested objects too) and run the check again. The parent discards a result that fails it and reruns the whole task.

@@ -24,6 +24,8 @@ from eacsl_toolchain import (
 )
 from failure_identity import failure_fingerprint as _failure_fingerprint
 from failure_identity import (
+    is_libfuzzer_out_of_memory,
+    is_sanitizer_allocation_cap,
     needs_attribution,
     parse_eacsl_resource_abort,
     parse_runtime_failure,
@@ -95,6 +97,7 @@ def replay_artifact(
         "failure": failure,
         # Read from the whole output: the runtime prints its message before the stack, out of the tail.
         "resource_abort": None if failure else parse_eacsl_resource_abort(out),
+        "out_of_memory": is_libfuzzer_out_of_memory(out),
         "sandbox": res.sandbox,
         "seed": seed,
         "log_tail": out[-3000:],
@@ -102,14 +105,23 @@ def replay_artifact(
     }
 
 
-def resource_abort_record(abort: dict, attribution: dict | None) -> dict | None:
+def resource_abort_record(abort: dict, attribution: dict | None, kind: str = "crash") -> dict | None:
     """
     An artifact's `eacsl_resource_abort`: the E-ACSL runtime stopped on its own limit (no target check
     failed), and what the sanitizer replay of the same input said: `unavailable` (no sanitizer build),
-    `not_reproduced` or `no_failure`. None when the sanitizer replay reported a failure, located or not:
-    the artifact then stays an ordinary (unparsed) crash for a verifier.
+    `not_reproduced`, `no_failure`, or `allocation_size_too_big` (ASan refused the same request past its own
+    allocator maximum: the same tool limit). None when the sanitizer replay reported any other failure,
+    located or not: the artifact then stays an ordinary (unparsed) crash for a verifier.
+
+    An `oom-` artifact is libFuzzer's own out-of-memory report: when the sanitizer build of the same input
+    runs out of memory too, the E-ACSL limit does not explain it, and it stays for a verifier (None).
     """
-    if attribution and attribution.get("failure"):
+    san_failure = attribution.get("failure") if attribution else None
+    if is_sanitizer_allocation_cap(san_failure):
+        return {**abort, "sanitizer_replay": "allocation_size_too_big"}
+    if san_failure:
+        return None
+    if kind == "oom" and attribution and attribution.get("out_of_memory"):
         return None
     if not attribution:
         san = "unavailable"
@@ -158,13 +170,14 @@ def replay_inputs(
                     "binary": str(san_bin),
                     "reproduced": san.get("reproduced"),
                     "failure": san.get("failure"),
+                    "out_of_memory": bool(san.get("out_of_memory")),
                 }
                 if san.get("failure") and not needs_attribution(san["failure"]):
                     failure = san["failure"]
                     entry["failure_source"] = "sanitizer_replay"
         entry["failure"] = failure
         if not failure and rep.get("resource_abort"):
-            record = resource_abort_record(rep["resource_abort"], entry.get("attribution"))
+            record = resource_abort_record(rep["resource_abort"], entry.get("attribution"), entry["kind"])
             if record is not None:
                 entry["eacsl_resource_abort"] = record
         if failure:
