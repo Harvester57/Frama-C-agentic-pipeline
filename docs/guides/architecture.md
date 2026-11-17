@@ -28,7 +28,9 @@ flowchart TD
         MO --> C["DAG View: Link-Unit Modules, Waves 0..K,<br/>Tiers from Trust, Unit Split<br/>(build_callgraph_dag.py, tiers.py, unit_split.py)"]
         MO --> SP["MetAcsl Layer 3-6 Properties<br/>(security_props.py)"]
         C --> D["Stub External Boundaries<br/>(__fc_libc, fc_stubs + run overlay workspace/stubs,<br/>stub_gen.py + stub author)"]
-        D --> E{"Route Modules by<br/>Risk Tier"}
+        D --> HG["Dual harness per module (generate_harness.py)<br/>harness_mod.c and harness_mod.json"]
+        HG --> RG["Reach gate (make reach-gate, harness_reach.py check)<br/>and E-ACSL build check (pipeline_make.py build-check)<br/>phase0_gates.json, build_check.json"]
+        RG --> E{"Route Modules by<br/>Risk Tier"}
     end
 
     E -- "Tier 1A: Untrusted Binary Parser<br/>(e.g. SNMPv3 ASN.1/BER)" --> M1["Module Slice: Binary Parser"]
@@ -37,23 +39,26 @@ flowchart TD
     E -- "Tier 3: Internal Glue & State" --> M4["Spot Eva & On-Demand WP"]
 
     subgraph P1["Phase 1: Zero-ACSL Dynamic Triage (/framac-fuzz)"]
-        M1 & M2 & M3 --> F["Generate Dual Harness (generate_harness.py)<br/>LLVMFuzzerTestOneInput + eva_main"]
-        F --> FR{"Reachability Gate (harness_reach.py)<br/>every DAG entry point called by its harness or exempted?"}
-        FR -- "No: add dispatch cases" --> F
-        FR -- "Yes" --> G["RTE + E-ACSL two-stage build, -fsanitize=fuzzer<br/>seeded from the tests (run_eacsl_fuzz.py campaign)"]
-        G --> DR{"Dynamic Reach Gate (harness_reach.py dynamic)<br/>every entry point executed by the corpus?"}
-        DR -- "No: repair or exempt" --> F
-        G --> H{"Runtime Crash /<br/>RTE Triggered?"}
-        H -- "Yes (True Bug)" --> I["Emit Concrete Crash Reproducer<br/>& Exclude Broken Function from Proof Queue"]
+        M1 & M2 & M3 --> SELF["make selftest<br/>(E-ACSL toolchain canary)"]
+        SELF --> BLD["make build-mod<br/>(E-ACSL and ASan+UBSan builds)"]
+        SEEDS["make seeds<br/>(seed_harvest.py write, fuzz_assets.py write)"] --> FZ
+        BLD --> FZ["make fuzz-mod: ASan+UBSan, then E-ACSL, keep-going rounds<br/>(run_eacsl_fuzz.py campaign)"]
+        FZ --> COV["make coverage-mod<br/>(replays the corpus)"]
+        COV --> RD{"make reach-dynamic-mod (harness_reach.py dynamic)<br/>every entry point executed by the corpus?"}
+        FZ -- "Failure: candidate" --> CAND["Candidate in candidates.json; a Crash Verifier decides (Phase 3 gate)"]
+        RD -- "no gap" --> ING["make ingest"]
+        RD -- "gap: the module's units stay out of WP" --> ING
+        CAND --> ING
+        ING --> REP["make replay<br/>(replay-candidates, candidates.json)"]
+        REP --> MIN["make minimize<br/>(minimize-candidates)"]
     end
 
-    H -- "Clean (Tier 2 XML/Tree)" --> T2_DONE["Keep in CI Fuzzing +<br/>Verify Only Post-Parse Config Validator"]
-    H -- "Clean (Tier 1A & Tier 1B)" --> J
+    ING -- "Clean (any fuzzed tier)" --> J
 
     subgraph P2["Phase 2: Module-Level Abstract Interpretation (/framac-eva)"]
         J["Run frama-c -eva -main eva_main ... -then -rte<br/>(run_eva_slice.py)"] --> K{"Inspect RTE Alarm Table"}
         K -- "Green (Valid: ~85%)" --> L["Discharged Automatically"]
-        K -- "Red (Invalid)" --> I
+        K -- "Red (Invalid): candidate" --> CAND
         K -- "Orange (Unknown: ~15%)" --> M["Queue Surviving Unknown Functions<br/>(wp_scheduler.py init)"]
     end
 
@@ -63,11 +68,11 @@ flowchart TD
         O --> P{"All Goals Proven<br/>within K Retries?"}
         P -- "Yes" --> Q["Lock Verified Contract in .h<br/>& Process Strengthening Requests"]
         P -- "Stalled after K Retries" --> R["Stage 3C: Spawn Adversarial Breaker Subagent<br/>(Targeted E-ACSL Seed Synthesis)"]
-        R -- "Crash Triggered" --> I
+        R -- "Crash Triggered: candidate" --> CAND
         R -- "Unreachable / Non-Linear" --> S["Retain Surgical E-ACSL Runtime Check<br/>for Residual Assertion"]
     end
 
-    Q & S & I & T2_DONE --> Z["Phase 4: Validate ledger + findings, derive REPORT.md,<br/>FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, verified_acsl.patch, & report.sarif"]
+    Q & S & CAND --> Z["Phase 4: Validate ledger + findings, derive REPORT.md,<br/>FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, verified_acsl.patch, & report.sarif"]
 ```
 
 ### Phase 0 in short
