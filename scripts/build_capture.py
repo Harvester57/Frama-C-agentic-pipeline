@@ -1317,7 +1317,8 @@ def system_dir_links(dirs: Iterable[str] = target_env.DEFAULT_SYSTEM_DIRS) -> di
     """
     Real path -> include path of the symlinks (files or directories) under gcc's system directories that
     point outside them: Debian trixie's linux-libc-dev ships `/usr/include/x86_64-linux-gnu/asm/types.h`
-    as a link to `/usr/lib/linux/uapi/x86/asm/types.h`, and the dependency lists name the real path.
+    as a link to `/usr/lib/linux/uapi/x86/asm/types.h`, and `cc -M` names the real path (gcc canonicalizes
+    system header paths by default, `-fcanonical-system-headers`).
     """
     dirs = list(dirs)
     out: dict[str, str] = {}

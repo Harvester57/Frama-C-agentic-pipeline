@@ -154,7 +154,8 @@ def test_the_capture_exports_only_the_gaps_of_frama_c_s_libc():
 @pytest.mark.unit
 def test_a_header_behind_a_symlinked_system_dir_is_exported_where_include_finds_it():
     # Debian trixie: /usr/include/x86_64-linux-gnu/asm/types.h -> /usr/lib/linux/uapi/x86/asm/types.h,
-    # and the dependency list names the real path, which no `-idirafter` of a Frama-C parse reaches.
+    # and `cc -M` names the real path (gcc's default -fcanonical-system-headers), which no `-idirafter`
+    # of a Frama-C parse reaches.
     file_link = {"/usr/lib/linux/uapi/x86/asm/types.h": "/usr/include/x86_64-linux-gnu/asm/types.h"}
     assert bc.include_path("/usr/lib/linux/uapi/x86/asm/types.h", file_link) == next(iter(file_link.values()))
     # A linked directory maps every header below it.
@@ -209,3 +210,7 @@ def test_build_snapshot_hands_the_gaps_to_the_export_and_reports_them(tmp_path, 
     ]
     assert result["excluded"]["libc_headers"] == 1
     assert [h["path"] for h in result["headers"]] == ["/usr/include/seccomp.h"]
+    base = {"schema_version": 1, "generated_at": "t", "target": "/target", "warnings": [], "status": "error"}
+    assert not bc.validate_report({**base, "error": "x", "snapshot": result})
+    result["framac_libc_gaps"][0]["class"] = "libc"
+    assert bc.validate_report({**base, "error": "x", "snapshot": result})

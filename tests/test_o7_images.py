@@ -36,6 +36,7 @@ def test_frama_c_reads_the_build_image_s_libc_gaps_from_the_snapshot(volume, tmp
     )  # fmt: skip
     assert cap.returncode == 0, cap.stdout + cap.stderr
     report = json.loads((run_dir / "workspace/reports/build_capture.json").read_text(encoding="utf-8"))
+    assert not [w for w in report["warnings"] if "does not match its schema" in w], report["warnings"]
     gaps = {g["path"]: g["package"] for g in report["snapshot"]["framac_libc_gaps"]}
     assert gaps["/usr/include/elf.h"] == "libc6-dev"
     assert gaps["/usr/include/linux/audit.h"] == "linux-libc-dev"
