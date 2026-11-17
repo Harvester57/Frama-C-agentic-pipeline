@@ -1128,7 +1128,9 @@ def _artifact_identity_problem(
                 case = (
                     ""
                     if first_byte is None
-                    else f", case {idx}" if idx is not None else f", no case (first byte {first_byte})"
+                    else f", case {idx}"
+                    if idx is not None
+                    else f", no case (first byte {first_byte})"
                 )
                 # The encodings are named only when they differ (a harness regenerated across the change).
                 how = f" ({sel} selector)" if found_sel != selector else ""
@@ -1456,6 +1458,22 @@ def run_dynamic(
         cov = load_json_optional(coverage_dir / f"{module}.json", None)
         if not isinstance(cov, dict) or cov.get("status") not in _COVERAGE_OK:
             status = cov.get("status") if isinstance(cov, dict) else "missing"
+            # No usable coverage (F2): the module is still measured when its reproducible crashes prove
+            # every entry point ran, as a report that lists no function executed nothing. A gap the
+            # crashes do not close stays unmeasured, so a module whose every input crashes (oscs-qlz) is
+            # not held back by a corpus that could not be measured.
+            proven = check_dynamic(
+                module,
+                dag,
+                mm,
+                {"status": status, "functions": []},
+                fuzz_dir=fuzz_dir,
+                harnesses_dir=resolved_hdir,
+                static_gaps=static_gaps.get(module),
+            )
+            if proven["passed"]:
+                rows.append({**proven, "measured_by": "crashes"})
+                continue
             rows.append({"module": module, "mode": "dynamic", "passed": None, "error": f"no coverage ({status})"})
             continue
         row = check_dynamic(
