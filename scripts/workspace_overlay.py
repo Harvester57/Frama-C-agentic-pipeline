@@ -60,6 +60,7 @@ from acsl_ast import (  # noqa: E402
     extract_top_level_acsl_declarations,
     function_trust_records,
     is_trust_boundary,
+    locate_all_definition_spans,
     locate_all_prototype_spans,
     splice_architect_header,
     splice_prover_changes,
@@ -598,6 +599,40 @@ def _resolve_include_header(run_dir: Path, work_dir: Path, header: str | None, c
     tails = [p.relative_to(work_dir).as_posix() for p in work_dir.rglob(Path(norm).name) if p.is_file()]
     tails = [t for t in tails if t == norm or t.endswith("/" + norm)]
     return tails[0] if len(tails) == 1 else norm
+
+
+def header_function_names(text: str, path: str = "<input>") -> list[str]:
+    """
+    The functions a header declares (prototypes and `static inline` definitions): the ones whose contracts a
+    header architect may write. Its guardrails check these (`--functions` in its brief, `--reach-functions`
+    in the parent's re-check), so a failure in other code of the module is never its `code_fault`.
+    An architect adds no declaration, so the work tree's header gives the same set as its patched one.
+    An unreadable header gives [] (the guardrail then checks the whole module, as before).
+    """
+    try:
+        names = {s.function for s in locate_all_prototype_spans(text, path=path)}
+        names |= set(locate_all_definition_spans(text, path=path))
+    except (AcslError, ValueError):
+        return []
+    return sorted(n for n in names if n)
+
+
+def _header_functions_of(
+    run_dir: Path, overlay: Path, module: str | None, header: str | None, cppflags: str
+) -> list[str]:
+    """header_function_names of `header` (as named by a brief or a merge entry) in the shared work tree."""
+    if not header:
+        return []
+    rel = _resolve_include_header(
+        run_dir, overlay / "work", _normalize_work_relpath(header), _module_header_flags(overlay, module, cppflags)
+    )
+    if not rel:
+        return []
+    try:
+        text = (overlay / "work" / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return header_function_names(text, rel)
 
 
 def _declares_function(text: str, function: str) -> bool:
@@ -1977,6 +2012,16 @@ def _merge_agent_overlay_locked(
                 }
                 if wp_extra_sources is not None and _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
                     reverify_kwargs["wp_extra_sources"] = wp_extra_sources
+                if role == "architect" and norm_header_file:
+                    # The module guardrail checks the header's functions: a failure in other code is
+                    # excused as outside them, never this contract's code_fault (mpack run-4).
+                    arch_fns = header_function_names(
+                        new_contents.get(norm_header_file)
+                        or (shared_work / norm_header_file).read_text(encoding="utf-8", errors="replace"),
+                        norm_header_file,
+                    )
+                    if arch_fns and _supports_kwarg(_run_parent_reverify, "reach_functions"):
+                        reverify_kwargs["reach_functions"] = arch_fns
                 try:
                     ok, reason = _run_parent_reverify(
                         run_dir,
@@ -2329,6 +2374,14 @@ def _verify_batch_round(
     reach_by_check: dict[int, list[int]] = {}
     for (mod, srcs, cpp, ld), idxs in modules.items():
         provers = [i for i in idxs if _is_prover_check_item(items[i])]
+        # An architect's header functions are checked too (mpack run-4: a known defect in `main` was
+        # otherwise the architect's code_fault).
+        arch_fns = {
+            fn
+            for i in idxs
+            if items[i].get("role") == "architect"
+            for fn in _header_functions_of(run_dir, overlay, mod, items[i].get("header_file"), cpp)
+        }
         mod_kwargs: dict[str, Any] = {
             "agent_id": items[idxs[0]]["agent_id"],
             "role": "architect",
@@ -2339,8 +2392,9 @@ def _verify_batch_round(
             "cppflags": cpp,
             "ldflags": ld,
         }
+        if provers or arch_fns:
+            mod_kwargs["reach_functions"] = sorted({items[i]["function"] for i in provers} | arch_fns)
         if provers:
-            mod_kwargs["reach_functions"] = sorted({items[i]["function"] for i in provers})
             reach_by_check[len(checks)] = provers
         checks.append((idxs, mod_kwargs))
     prover_check: dict[int, int] = {}
@@ -3138,6 +3192,16 @@ def prepare_agent(
             _earlier_refutations(run_dir, agent_id, function, norm_c_file),
         )
     tpl = tpl.replace(RUN_COMMANDS_SENTINEL, _resolve_brief_template("run_commands").rstrip("\n"))
+    # An architect's guardrail checks the header's functions, as a prover's checks its function (mpack run-4:
+    # without it, a known defect in the program's `main` was the architect's `code_fault`).
+    header_fns: list[str] = []
+    if role == "architect" and norm_header:
+        try:
+            header_fns = header_function_names(
+                (overlay / "work" / norm_header).read_text(encoding="utf-8", errors="replace"), norm_header
+            )
+        except OSError:
+            header_fns = []
     references_host = _brief_path(
         os.environ.get("FRAMAC_REFERENCES_HOST") or str(Path(__file__).resolve().parent.parent / "docs" / "references")
     )
@@ -3175,6 +3239,7 @@ def prepare_agent(
         "{references_dir}": references_host,
         # The wrappers live in the same checkout as docs/references (both are host paths).
         "{pipeline_dir}": _pipeline_host_dir(references_host),
+        "{header_functions_args}": f"--functions {' '.join(header_fns)}" if header_fns else "",
     }
     rendered = tpl
     for k, v in replacements.items():

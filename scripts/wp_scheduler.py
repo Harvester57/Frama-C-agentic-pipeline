@@ -194,6 +194,7 @@ BRIEF_RENDER_KEYS: tuple[str, ...] = (
     "run_dir",
     "references_dir",
     "pipeline_dir",
+    "header_functions_args",
 )
 
 
