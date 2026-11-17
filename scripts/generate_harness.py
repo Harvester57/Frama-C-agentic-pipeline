@@ -54,7 +54,59 @@ VALID_ENTRY_STYLES = (
     "auto_prototype",
     "argv",
     "dispatch",
+    "stdin",
 )
+# The entry styles that run a whole program through its `main`, renamed by -Dmain= in every build: `argv`
+# passes the input as argv[1], `stdin` as the program's standard input.
+MAIN_ENTRY_STYLES = ("argv", "stdin")
+# The fuzz-side helper of a `stdin` harness, written after its headers (_stdin_invocations calls it). Each
+# input becomes the whole of the program's standard input, for read(0, ...) and stdio on stdin alike,
+# also on the second and later inputs of one process. Eva does not see it: there, main reads Frama-C's
+# libc model of stdin. `__fpurge` is declared here: glibc and musl define it, and Frama-C's libc, which
+# E-ACSL parses the harness with, has no <stdio_ext.h>.
+STDIN_FEED_PRELUDE = """\
+#if !defined(__FRAMAC__) || defined(__FRAMAC_EACSL__)
+/* stdin entry style: each input becomes the program's whole standard input. */
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+extern void __fpurge(FILE *stream);
+static int framac_stdin_feed(const uint8_t *buf, size_t len) {
+    int fds[2];
+    size_t off = 0;
+    /* What stdio buffered or pushed back from the previous input goes, with its EOF and error flags. */
+    __fpurge(stdin);
+    clearerr(stdin);
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    /* Non-blocking: an input above the pipe's capacity fails here instead of hanging the fuzzer. */
+    if (fcntl(fds[1], F_SETFL, O_NONBLOCK) == -1) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    while (off < len) {
+        ssize_t n = write(fds[1], buf + off, len - off);
+        if (n <= 0) {
+            close(fds[0]);
+            close(fds[1]);
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    /* The write end closed: the reader sees end of file after the input. */
+    close(fds[1]);
+    if (fds[0] != 0) {
+        if (dup2(fds[0], 0) == -1) {
+            close(fds[0]);
+            return -1;
+        }
+        close(fds[0]);
+    }
+    return 0;
+}
+#endif"""
 # Compile-time bit mask of dispatch cases a fuzz build skips (run_eacsl_fuzz.py campaign rounds):
 # DISPATCH_SKIP_MACRO holds cases 0..63, DISPATCH_SKIP_MACRO_<k> cases 64k..64k+63. A harness whose
 # guard carries DISPATCH_SKIP_ALL_MARKER reads every word; one generated before it reads cases 0..63 only.
@@ -1159,7 +1211,9 @@ def _build_invocations(
     null_terminate: bool = False,
     auto_params: list[dict[str, Any]] | None = None,
     dispatch_cases: list[str] | None = None,
+    main_arity: int | None = None,
 ) -> tuple[str, str]:
+    # `main_arity`: the number of parameters of a `stdin` entry's main (None when unknown: argc, argv).
     if entry_style == "dispatch":
         stmt = _build_dispatch_invocation(dispatch_cases or [])
         if null_terminate:
@@ -1255,7 +1309,46 @@ def _build_invocations(
             f"    {entry_fn}(2, argv);"
         )
         return eva_call, fuzz_call
+    if entry_style == "stdin":
+        return _stdin_invocations(entry_fn, main_arity)
     raise ValueError(f"invalid entry_style: {entry_style!r}")
+
+
+def _stdin_main_call(entry_fn: str, main_arity: int | None) -> str:
+    """
+    The call of a `stdin` entry's main: no arguments for a `main(void)` (or K&R `main()`), else the
+    program name alone (argc 1), with an empty environment for a three-parameter main.
+    """
+    if main_arity == 0:
+        return f"{entry_fn}();"
+    lines = ['char framac_argv0[5] = "prog";', "char *argv[2] = {framac_argv0, 0};"]
+    if main_arity is not None and main_arity >= 3:
+        lines.append("char *envp[1] = {0};")
+        lines.append(f"{entry_fn}(1, argv, envp);")
+    else:
+        lines.append(f"{entry_fn}(1, argv);")
+    return "\n    ".join(lines)
+
+
+def _stdin_invocations(entry_fn: str, main_arity: int | None) -> tuple[str, str]:
+    """
+    A program that reads its input from stdin, driven through its `main` (renamed by -Dmain= like an
+    `argv` entry). Eva side: main reads Frama-C's libc model of stdin (`__fc_stdin` for stdio, fd 0 for
+    `read`), whose contents are any bytes. Fuzz side: framac_stdin_feed (STDIN_FEED_PRELUDE, written
+    after the harness's headers) makes the input the whole of fd 0, through a fresh pipe per input, after
+    dropping what stdio buffered from the previous input and its EOF flag; an input it cannot feed (larger
+    than the pipe's capacity, 64 KiB on Linux) is rejected.
+    """
+    call = _stdin_main_call(entry_fn, main_arity)
+    eva_call = "(void)input_buf; (void)input_len; (void)fuzz_buf; (void)fuzz_len;\n    " + call
+    fuzz_call = (
+        "if (framac_stdin_feed(bounded_buf, size) != 0) {\n"
+        "        FRAMAC_FUZZ_REJECT();\n"
+        "    } else {\n"
+        "        " + call.replace("\n    ", "\n        ") + "\n"
+        "    }"
+    )
+    return eva_call, fuzz_call
 
 
 # ---------------------------------------------------------------------------
@@ -2106,30 +2199,39 @@ _FUZZ_FN_BLOCK_RE = re.compile(
 )
 
 
+def _main_entry_params(
+    entry_fn: str, sources: list[str], cppflags: str, headers: Sequence[str] = ()
+) -> list[dict[str, Any]] | None:
+    """
+    The parameters of a program's `main` (an `argv` or `stdin` entry): the definition in `sources`
+    decides; without one, the first of the harness's `headers` that declares it does. None when
+    neither shows it.
+    """
+    for hdr, srcs in ((None, sources), *((h, None) for h in headers if h)):
+        try:
+            return extract_function_prototype(entry_fn, hdr, srcs, cppflags)
+        except ValueError:
+            continue
+    return None
+
+
 def _check_argv_entry(
     module_name: str, entry_fn: str, sources: list[str], cppflags: str, headers: Sequence[str] = ()
 ) -> None:
     """
     An argv entry calls `main(argc, argv)`: a `main(void)` takes no arguments, so the input cannot
     reach it that way (it reads stdin, a fixed file, or nothing). Fail with what to do instead of
-    writing a harness that does not compile. The definition in `sources` decides; without one, the
-    first of the harness's `headers` that declares main does. A main found in neither is left to
-    the compiler.
+    writing a harness that does not compile. A main found in neither the sources nor the headers
+    (_main_entry_params) is left to the compiler.
     """
-    params: list[dict[str, Any]] | None = None
-    for hdr, srcs in ((None, sources), *((h, None) for h in headers if h)):
-        try:
-            params = extract_function_prototype(entry_fn, hdr, srcs, cppflags)
-        except ValueError:
-            continue
-        break
+    params = _main_entry_params(entry_fn, sources, cppflags, headers)
     if params is None or params:
         return
     raise ValueError(
         f"{entry_fn}() of module {module_name!r} takes no arguments: an argv harness cannot pass it the "
-        "input. If the program reads no input, or only stdin (no stdin entry style yet), record the gap: "
-        f"harness_reach.py exempt --module {module_name} --reason '<why>'; otherwise give --entry-style "
-        "with --call-expr."
+        "input. If the program reads its input from stdin, give --entry-style stdin. If it reads no input, "
+        f"record the gap: harness_reach.py exempt --module {module_name} --reason '<why>'; otherwise give "
+        "--entry-style custom with --call-expr."
     )
 
 
@@ -2365,6 +2467,7 @@ def _generate_module_harness(
         _, _, auto_needs_nt = _build_auto_prototype_invocations(entry_fn, auto_params)
 
     effective_null_terminate = bool(null_terminate or entry_style == "c_string" or auto_needs_nt)
+    main_arity: int | None = None
     if entry_style == "argv":
         _check_argv_entry(
             module_name,
@@ -2373,9 +2476,15 @@ def _generate_module_harness(
             norm_cppflags,
             headers=[norm_header or "", *norm_extra_includes, *norm_compat_includes],
         )
+    elif entry_style == "stdin":
+        main_params = _main_entry_params(
+            entry_fn, sources, norm_cppflags, headers=[norm_header or "", *norm_extra_includes, *norm_compat_includes]
+        )
+        main_arity = None if main_params is None else len(main_params)
+    if entry_style in MAIN_ENTRY_STYLES:
         # Rename the target's main in every build of this module (Eva and fuzz alike): the harness
-        # calls main(argc, argv), and the -D renames that call together with the target's
-        # definition, so libFuzzer's own main is the only main at link time.
+        # calls main, and the -D renames that call together with the target's definition, so
+        # libFuzzer's own main is the only main at link time.
         norm_cppflags = _append_cppflag(norm_cppflags, "-Dmain=__framac_target_main")
     eva_call, fuzz_call = _build_invocations(
         entry_fn=entry_fn,
@@ -2389,6 +2498,7 @@ def _generate_module_harness(
         null_terminate=effective_null_terminate,
         auto_params=auto_params,
         dispatch_cases=dispatch_cases,
+        main_arity=main_arity,
     )
     if entry_style == "dispatch" and target_fuzzer_record is None:
         fuzz_disc = _build_dispatch_invocation(dispatch_cases or [], runtime_skip=True)
@@ -2456,7 +2566,7 @@ def _generate_module_harness(
         if not norm_header and target_fuzzer_record is None:
             if effective_self_harnessed:
                 inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
-            elif entry_style == "argv":
+            elif entry_style in MAIN_ENTRY_STYLES:
                 inc_lines.append(_argv_entry_declaration(entry_fn, sources, norm_cppflags))
             else:
                 synth_decl = extract_function_declaration(entry_fn, None, sources, norm_cppflags)
@@ -2465,7 +2575,7 @@ def _generate_module_harness(
         elif effective_self_harnessed:
             inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
         elif (
-            entry_style == "argv"
+            entry_style in MAIN_ENTRY_STYLES
             and target_fuzzer_record is None
             and not any(
                 extract_function_declaration(entry_fn, h, None, norm_cppflags) is not None
@@ -2477,6 +2587,9 @@ def _generate_module_harness(
             inc_lines.append(_argv_entry_declaration(entry_fn, sources, norm_cppflags))
     if target_fuzzer_record is not None:
         inc_lines.append(_target_fuzzer_prelude(bool(target_fuzzer_record["initialize"])))
+    if entry_style == "stdin" and target_fuzzer_record is None:
+        # Last, so it never becomes the prelude resolution's anchor; the fuzz call uses it.
+        inc_lines.append(STDIN_FEED_PRELUDE)
 
     if not inc_lines:
         inc_lines.append("/* No external module header required */")
@@ -2878,7 +2991,7 @@ def main(argv: list[str] | None = None) -> int:
         "--entry-style",
         choices=list(VALID_ENTRY_STYLES),
         default="buffer_len",
-        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, auto_prototype, argv (CLI main(argc, argv); defaults automatically when --entry-fn is main), or dispatch (first input byte selects one of the --dispatch-case statements)",
+        help="Entry invocation pattern: buffer_len (default), c_string, global_buffer, struct_arg, void_call, custom, auto_prototype, argv (CLI main(argc, argv); defaults automatically when --entry-fn is main), dispatch (first input byte selects one of the --dispatch-case statements), or stdin (CLI main reading its input from stdin: the input becomes the program's standard input)",
     )
     parser.add_argument(
         "--auto-args",
