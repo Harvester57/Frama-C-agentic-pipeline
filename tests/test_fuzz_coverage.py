@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import fuzz_build
+import fuzz_coverage
 import pipeline_make as pm
 import resources
 import run_eacsl_fuzz as R
@@ -360,7 +361,9 @@ def _measured(tmp_path, monkeypatch, *contents, export=None, export_error=None):
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     default = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     monkeypatch.setattr(
-        R, "_export_coverage", lambda *a: (export or default, None) if not export_error else (None, export_error)
+        fuzz_coverage,
+        "_export_coverage",
+        lambda *a: (export or default, None) if not export_error else (None, export_error),
     )
     return _report(tmp_path)
 
@@ -390,7 +393,9 @@ def test_report_replays_known_crashes_last_and_counts_them(tmp_path, monkeypatch
     monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     monkeypatch.setattr(
-        R, "_export_coverage", lambda *a: (_export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)])), None)
+        fuzz_coverage,
+        "_export_coverage",
+        lambda *a: (_export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)])), None),
     )
     report = _report(tmp_path, known_crash_dirs=[crashes, tmp_path / "missing"])
     assert fake.batches[0] == ["input-001", "input-002"]
@@ -424,8 +429,8 @@ def _truncated_then_ok(tmp_path, monkeypatch, pre_included: list[str]):
     results = iter([(None, f"llvm-cov export failed (1): error: {R.COVERAGE_TRUNCATED_MAPPING}"), (good, None)])
     monkeypatch.setattr(fuzz_build, "compile_coverage_binary", compile_)
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
-    monkeypatch.setattr(R, "_export_coverage", lambda *a: next(results))
-    monkeypatch.setattr(R, "in_function_includes", lambda sources, cppflags="": pre_included)
+    monkeypatch.setattr(fuzz_coverage, "_export_coverage", lambda *a: next(results))
+    monkeypatch.setattr(fuzz_coverage, "in_function_includes", lambda sources, cppflags="": pre_included)
     return _report(tmp_path, cppflags="-Iinc"), flags
 
 
@@ -577,7 +582,7 @@ def test_cli_writes_the_full_report_and_prints_a_summary(tmp_path, monkeypatch, 
     monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     export = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
-    monkeypatch.setattr(R, "_export_coverage", lambda *a: (export, None))
+    monkeypatch.setattr(fuzz_coverage, "_export_coverage", lambda *a: (export, None))
     assert _cli(tmp_path) == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed["status"] == "ok"

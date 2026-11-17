@@ -21,7 +21,7 @@ SEAM_ROOT = Path(__file__).resolve().parent.parent
 SEAM_SCRIPTS = SEAM_ROOT / "scripts"
 SEAM_TESTS = SEAM_ROOT / "tests"
 # The homes of moved functions (D12). A module joins when its first function moves.
-SEAM_MODULES = ("sandbox_exec", "fuzz_build", "crash_replay")
+SEAM_MODULES = ("sandbox_exec", "fuzz_build", "crash_replay", "fuzz_coverage")
 SEAM_MOVED_FROM = "run_eacsl_fuzz"
 
 

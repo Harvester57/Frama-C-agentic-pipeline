@@ -60,6 +60,7 @@ known-first-party = [
     "fuzz_assets",
     "fuzz_build",
     "fuzz_common",
+    "fuzz_coverage",
     "fuzz_dictionary",
     "generate_harness",
     "generate_report",
