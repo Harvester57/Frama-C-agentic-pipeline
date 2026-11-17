@@ -129,7 +129,7 @@
         "properties": {
           "kind": {"type": "string", "enum": ["executable", "shared_lib", "static_lib", "unlinked"]},
           "test": {"type": "boolean"},
-          "test_reason": {"type": ["string", "null"], "enum": ["name", "directory", "test_sources", "name_and_sources", null]},
+          "test_reason": {"type": ["string", "null"], "enum": ["name", "directory", "test_sources", "name_and_sources", "main_in_test_source", null]},
           "files": {"type": "array", "items": {"type": "string"}},
           "objects": {"type": "array", "items": {"type": "string"}},
           "links": {"type": "array", "items": {"type": "string"}},

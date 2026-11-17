@@ -97,10 +97,13 @@ TOOL_TIMEOUT_S = 120
 LOG_TAIL_CHARS = 4000
 
 TEST_RULE = (
-    "a unit is `test` when its artifact name, split on _ - . into words, has a word test/tests/check/checks/"
-    "unittest/unittests/testsuite; or a directory of its path is test/tests/testing/check/unittest(s); or all "
+    "a unit is `test` when its artifact name, split on _ - . into words, has a word test/tests/unittest/"
+    "unittests/testsuite; or a directory of its path is test/tests/testing/check/checks/unittest(s); or all "
     "its own sources are test sources (in such a directory, or named with such a word); or its name ends in "
-    "`test`/`tests` and one of its own sources is a test source. The test command is not run here (step I6)."
+    "`test`/`tests` and one of its own sources is a test source; or it is an executable whose `main` is "
+    "defined in a test source and whose other own sources are all sources of a non-test library of the "
+    "build (a test driver compiling the library's sources again, mpack's `runner`): its product code is "
+    "analysed in that library. The test command is not run here (step I6)."
 )
 CANDIDATE_RULE = (
     "best effort, no apt-file: a table of common headers, pkg-config modules, CMake packages and commands; "
@@ -862,6 +865,30 @@ def test_reason(name: str, files: list[str]) -> str | None:
     if re.search(r"tests?$", stem.lower()) and any(is_test_source(f) for f in files):
         return "name_and_sources"
     return None
+
+
+def mark_test_drivers(units: dict[str, dict], main_file: dict[str, str]) -> list[str]:
+    """
+    Mark the test drivers the name rules miss (TEST_RULE, last case), in place; returns their names.
+
+    `main_file` maps an executable unit to the source defining its global `main`. A driver is an
+    executable whose `main` is in a test source and whose other own sources are all sources of a
+    non-test library unit: dropping it loses no product code. A program whose `main` is in product
+    code, or a test driver compiling product sources no library holds, stays a product unit.
+    """
+    lib_files = {
+        f for u in units.values() if u["kind"] in ("static_lib", "shared_lib") and not u["test"] for f in u["files"]
+    }
+    marked: list[str] = []
+    for name, u in sorted(units.items()):
+        main = main_file.get(name)
+        if u["kind"] != "executable" or u["test"] or not main or not is_test_source(main):
+            continue
+        if all(is_test_source(f) or f in lib_files for f in u["files"]):
+            u["test"] = True
+            u["test_reason"] = "main_in_test_source"
+            marked.append(name)
+    return marked
 
 
 def derive_units(capture: dict, tree: str) -> dict[str, dict]:
@@ -1863,6 +1890,16 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
         c["includes_setjmp_h"] = includes_setjmp_h(system)
         system_headers |= set(system)
     fn_of = {c["object"]: function_ids(c, syms[c["object"]], t) for c in entries}
+    main_files = {
+        name: info["id"].split("#", 1)[0]
+        for name, u in units.items()
+        for o in u["objects"]
+        if (info := fn_of.get(o, {}).get("main")) and info["global"]
+    }
+    for name in mark_test_drivers(units, main_files):
+        report["warnings"].append(
+            f"{name}: a test driver (`main` in {main_files[name]}, its other sources in a library), marked `test`"
+        )
     for c in entries:
         # What the compiler emitted, for the DAG to compare with what Frama-C parsed: code behind a
         # macro the compiler defines and Frama-C does not (`__SSE2__`) is in the build only.

@@ -1056,5 +1056,146 @@ def test_a_build_for_another_architecture_stops_and_resumes_after_a_native_recip
     assert json.loads((run / "state/progress.json").read_text(encoding="utf-8"))["status"] == "running"
 
 
+# ---------------------------------------------------- test drivers that compile the library again
+
+# mpack run-2's shape: `libmpack.a` from src/mpack/*.c, and the unit-test driver `runner` (no test word,
+# not in a test directory) compiling the same sources again next to test/unit/src/test*.c, whose
+# test.c holds `main`. A product CLI does the same with its `main` in tools/.
+_DRIVER_SYMBOLS = {
+    "src/mpack/mpack-reader.c": {"mpack_read": ("T", None)},
+    "src/mpack/mpack-writer.c": {"mpack_write": ("T", None)},
+    "test/unit/src/test.c": {"main": ("T", None)},
+    "test/unit/src/test-reader.c": {"test_reader": ("T", None)},
+    "tools/cli.c": {"main": ("T", None)},
+}
+_DRIVER_HEADERS = {
+    "src/mpack/mpack.h": "int mpack_read(int fd);\nint mpack_write(int fd);\n",
+    # Outside every source directory, and not the library's: before the fix the only public header.
+    "examples/sax-example.h": "void sax_example(void);\n",
+    "test/unit/src/test.h": "void test_reader(void);\n",
+}
+
+
+def _driver_execs() -> list[dict]:
+    lib = ["src/mpack/mpack-reader.c", "src/mpack/mpack-writer.c"]
+    tests = ["test/unit/src/test.c", "test/unit/src/test-reader.c"]
+    execs: list[dict] = []
+
+    def compile_all(srcs: list[str], out_dir: str) -> list[str]:
+        objs = [f"{out_dir}/{Path(s).stem}.o" for s in srcs]
+        execs.extend(cc("-Isrc/mpack", "-c", "-o", o, s) for s, o in zip(srcs, objs, strict=True))
+        return objs
+
+    lib_objs = compile_all(lib, ".build/mpack-lib")
+    execs.append({"exe": "/usr/bin/ar", "args": ["ar", "rcs", ".build/mpack-lib/libmpack.a", *lib_objs], "cwd": TREE})
+    runner_objs = compile_all(lib + tests, ".build/unit/everything-debug/obj")
+    execs.append(cc("-o", ".build/unit/everything-debug/runner", *runner_objs))
+    cli_objs = compile_all([*lib, "tools/cli.c"], ".build/cli")
+    execs.append(cc("-o", ".build/mpack-cli", *cli_objs))
+    return execs
+
+
+def _driver_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """analyse() on the mpack-shaped build, with the probes (cc -M, nm, install, snapshot) stubbed."""
+    tree = tmp_path / "tree"
+    for rel, text in _DRIVER_HEADERS.items():
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_text(text, encoding="utf-8")
+
+    def deps(c: dict, t: str) -> tuple[list[str], None]:
+        header = "test/unit/src/test.h" if c["source"].startswith("test/") else "src/mpack/mpack.h"
+        return [c["object"], f"{t}/{header}"], None
+
+    monkeypatch.setattr(bc, "compile_deps", deps)
+    monkeypatch.setattr(bc, "compile_symbols", lambda c, t, tmp, i: (_DRIVER_SYMBOLS[c["source"]], None))
+    monkeypatch.setattr(bc, "try_install", lambda *a: ([], "no install target"))
+    monkeypatch.setattr(bc, "generated_headers", lambda *a: [])
+    monkeypatch.setattr(bc, "build_snapshot", lambda *a, **k: {"files": 0})
+    cap = bc.classify_executions(_driver_execs(), TREE)
+    report: dict = {"warnings": [], "build": {}, "target": str(tmp_path / "target")}
+    bc.analyse(report, cap, tree, tmp_path / "scratch", {}, 60, 1)
+    return report
+
+
+@pytest.mark.unit
+def test_a_test_driver_compiling_the_library_again_is_a_test_unit(tmp_path, monkeypatch):
+    report = _driver_capture(tmp_path, monkeypatch)
+    units = report["units"]
+    runner = units[".build/unit/everything-debug/runner"]
+    assert (runner["test"], runner["test_reason"]) == (True, "main_in_test_source")
+    # The CLI compiles the same library sources, but its `main` is product code.
+    assert (units[".build/mpack-cli"]["test"], units[".build/mpack-cli"]["test_reason"]) == (False, None)
+    assert not units[".build/mpack-lib/libmpack.a"]["test"]
+    assert "test/unit/src/test.c#main" not in report["entry_points"]
+
+
+def _driver_plans(report: dict) -> list[str]:
+    import seed_harvest as sh
+
+    functions = {
+        f"{src}#{name}": {"name": name, "signature": "int(int)"}
+        for src, syms in _DRIVER_SYMBOLS.items()
+        for name in syms
+    }
+    model = {"entry_points": report["entry_points"], "units": report["units"], "functions": functions}
+    plans, _ = sh.plan_recorder(model)
+    return sorted(p["name"] for p in plans)
+
+
+@pytest.mark.unit
+def test_the_seed_recorder_no_longer_wraps_the_test_drivers_functions(tmp_path, monkeypatch):
+    # Before the fix the runner was a product unit: its embedded API (test_reader, from test.h)
+    # was wrapped, and only the outermost call is recorded, so no library call reached calls.jsonl.
+    assert "test_reader" not in _driver_plans(_driver_capture(tmp_path, monkeypatch))
+
+
+@pytest.mark.unit
+@pytest.mark.xfail(
+    strict=True,
+    reason="open: a static library whose public headers are chosen outside the source directories "
+    "(a stray examples/ header) gets no entry point; public-header API entry points are plan H1 "
+    "(docs/plans/header-entry-points-plan.md), not this fix",
+)
+def test_a_stray_header_outside_the_sources_hides_a_static_librarys_api(tmp_path, monkeypatch):
+    report = _driver_capture(tmp_path, monkeypatch)
+    assert report["public_headers"]["method"] == "outside_source_dirs"
+    lib = report["units"][".build/mpack-lib/libmpack.a"]
+    assert lib["entry_points"] == ["src/mpack/mpack-reader.c#mpack_read", "src/mpack/mpack-writer.c#mpack_write"]
+    assert _driver_plans(report) == ["mpack_read", "mpack_write"]
+
+
+def _unit(kind: str, files: list[str], test: bool = False) -> dict:
+    return {"kind": kind, "files": files, "test": test, "test_reason": "name" if test else None}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("files", "main", "marked"),
+    [
+        # mpack's runner: library sources again, plus the tests holding `main`.
+        (["src/a.c", "test/t.c"], "test/t.c", True),
+        # A product CLI over the library sources: `main` in tools/.
+        (["src/a.c", "tools/cli.c"], "tools/cli.c", False),
+        # A test driver compiling product code no library holds: dropping it would lose that code.
+        (["src/a.c", "src/only_here.c", "test/t.c"], "test/t.c", False),
+        # Library sources only, `main` among them: no test source at all.
+        (["src/a.c", "src/main.c"], "src/main.c", False),
+        # `main` not found (the symbol probe failed): left as it is.
+        (["src/a.c", "test/t.c"], None, False),
+    ],
+)
+def test_only_drivers_with_main_in_a_test_source_over_library_sources_are_marked(files, main, marked):
+    units = {
+        "libx.a": _unit("static_lib", ["src/a.c", "src/main.c"]),
+        "libtestonly.a": _unit("static_lib", ["src/only_here.c"], test=True),
+        "app": _unit("executable", files),
+    }
+    got = bc.mark_test_drivers(units, {"app": main} if main else {})
+    assert (got == ["app"]) is marked
+    assert units["app"]["test"] is marked
+    assert units["app"]["test_reason"] == ("main_in_test_source" if marked else None)
+    assert not units["libx.a"]["test"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
