@@ -97,6 +97,14 @@ def test_no_hint_without_crlf_scripts_or_for_an_unrelated_failure(tmp_path):
     assert line_endings.failure_hint("the build", 2, "/bin/sh: 0: Illegal option -", scan) is not None
 
 
+def test_a_127_naming_no_crlf_script_singles_none_out(tmp_path):
+    scan = line_endings.scan_crlf_scripts(_crlf_target(tmp_path))
+    hint = line_endings.failure_hint("the build command", 127, "sh: 1: ninja: not found", scan, "ninja")
+    assert hint is not None
+    assert hint.startswith("the build command exited 127; the tree has 1 script(s) with CRLF line endings")
+    assert "if the command runs one" in hint
+
+
 # --- the early warning -----------------------------------------------------------------------------
 
 

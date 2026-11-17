@@ -196,6 +196,13 @@ def failure_hint(what: str, returncode: int | None, log: str, scan: Scan, comman
     if not looks_like_crlf_failure(returncode, log, scan, command):
         return None
     text = log + "\n" + command
+    if not any(_mentioned(h, text) for h in scan.hits):
+        # Nothing names one (a missing tool exits 127 too): no culprit is singled out.
+        count = f"{len(scan.hits)}{'+' if not scan.complete else ''}"
+        return (
+            f"{what} exited {returncode}; the tree has {count} script(s) with CRLF line endings that cannot "
+            f"run in the Linux container ({named(scan)}): if the command runs one, {FIX}"
+        )
     first = sorted(scan.hits, key=lambda h: not _mentioned(h, text))[0]
     shebang = f" ({first.first_line})" if first.first_line else ""
     others = Scan([h for h in scan.hits if h != first], scan.complete)
