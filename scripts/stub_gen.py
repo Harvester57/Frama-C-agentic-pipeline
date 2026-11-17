@@ -74,7 +74,9 @@ TODO_MARK = "TODO(stub-author)"
 BLOCK_MARK_RE = re.compile(r"^/\* fc-stub: ([A-Za-z_]\w*) \*/[ \t]*$", re.MULTILINE)
 # System include directories gcc searches by default (scripts/target_env.py), longest first.
 DEFAULT_SYSTEM_DIRS = ("/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include")
-_SNAPSHOT_ROOT_RE = re.compile(r"^(?P<root>.*?/workspace/snapshot/root)(?P<path>/.+)$")
+# A snapshot copy of a system header: the target's packages under `root/`, the build image's copies of the libc
+# headers Frama-C's libc lacks under `libc/` (scripts/target_env.py). Both hold absolute paths.
+_SNAPSHOT_ROOT_RE = re.compile(r"^(?P<root>.*?/workspace/snapshot/(?:root|libc))(?P<path>/.+)$")
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 _INCLUDE_DIR_OPTIONS = ("-isystem", "-idirafter", "-iquote", "-I")
 _LENGTH_NAME_RE = re.compile(r"(?:^|_)(?:n|len|length|size|sz|cap|capacity|count|nbytes|bytes|max|maxlen)$|len$|size$")

@@ -121,6 +121,17 @@ def test_include_name_uses_the_longest_root():
 
 
 @pytest.mark.unit
+def test_system_path_maps_both_snapshot_subtrees_back():
+    # `libc/` holds the build image's copies of the libc headers Frama-C's libc lacks (O7).
+    libc = "/framac-run/workspace/snapshot/libc"
+    assert stub_gen.system_path(f"{SNAP}/usr/include/json-c/json.h") == ("/usr/include/json-c/json.h", SNAP)
+    assert stub_gen.system_path(f"{libc}/usr/include/linux/netlink.h") == ("/usr/include/linux/netlink.h", libc)
+    assert stub_gen.system_path("/usr/include/stdio.h") == ("/usr/include/stdio.h", "")
+    generated = "/framac-run/workspace/snapshot/generated/config.h"
+    assert stub_gen.system_path(generated) == (generated, "")
+
+
+@pytest.mark.unit
 def test_skeleton_frame_from_the_signature():
     formals = _model()["external_formals"]["ml_hash"]
     lines = stub_gen.skeleton_contract(

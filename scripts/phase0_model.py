@@ -307,7 +307,8 @@ def snapshot_dirs(snapshot_root: str | None, system_flags: Iterable[str]) -> lis
     """
     `-idirafter` options for the target's system headers, read from the snapshot: the include
     directories the compile named outside the tree, then gcc's default system directories, each only
-    when the snapshot has it. Searched after Frama-C's libc, so a libc header never comes from there.
+    when the snapshot has it. Searched after Frama-C's libc, so a libc header never comes from `root/`
+    (the libc headers Frama-C lacks come from the snapshot's `libc/`, target_env.libc_include_flags).
     """
     return target_env.include_flags(snapshot_root, system_flags)
 
