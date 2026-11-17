@@ -127,3 +127,92 @@ def test_a_failed_cross_build_is_recorded_and_skipped(tmp_path, monkeypatch):
     cross, _ = _xb_run(tmp_path, monkeypatch, other_build_ok=False)
     assert cross["engine"] == "eacsl" and cross["status"] == "build_failed"
     assert cross["failures"] == []
+
+
+def _obs_candidate(tmp_path):
+    """A candidate whose key is a sanitizer failure, with an E-ACSL observation on its second reproducer."""
+    rep_san, rep_eac = tmp_path / "crash-san", tmp_path / "crash-eac"
+    rep_san.write_bytes(b"\x30")
+    rep_eac.write_bytes(b"\x31")
+    return {
+        "fingerprint": XB_FP_SAN,
+        "status": "unverified",
+        "module": "snmp",
+        "location": {"file": "src/snmp/ber.c", "line": 42, "function": "ber_decode_len"},
+        "reproducers": [str(rep_san), str(rep_eac)],
+        "tool_outputs": [],
+        "observations": [
+            {
+                "fingerprint": XB_FP_EAC,
+                "origin": "fuzz",
+                "engine": "eacsl",
+                "kind": "initialization",
+                "message": "",
+                "tool_output": "",
+                "reproducer": str(rep_eac),
+            }
+        ],
+    }
+
+
+def test_replay_runs_an_observation_reproducer_on_its_engine(tmp_path, monkeypatch):
+    from conftest import write_json
+
+    cand = _obs_candidate(tmp_path)
+    write_json(tmp_path / "candidates.json", [cand])
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_prepare(module, sources, out_bin, **kwargs):
+        return {"binary": str(out_bin)}
+
+    def fake_replay(module, inputs, scratch, *, prepared, per_input_timeout):
+        calls.append((Path(prepared["binary"]).name, [Path(p).name for p in inputs]))
+        fp = XB_FP_EAC if prepared["binary"].endswith("cross_eacsl_snmp") else XB_FP_SAN
+        return {"status": "crash_found", "artifacts": [{"fingerprint": fp, "failure": {}}]}
+
+    monkeypatch.setattr(crash_replay, "replay_build_spec", lambda *a, **k: dict(XB_SPEC))
+    monkeypatch.setattr(crash_replay, "prepare_replay_binary", fake_prepare)
+    monkeypatch.setattr(crash_replay, "replay_report", fake_replay)
+    crash_replay.replay_candidates(
+        tmp_path / "candidates.json", tmp_path / "harnesses", tmp_path / "replay", bin_dir=tmp_path / "bin"
+    )
+    # The E-ACSL reproducer replays on the E-ACSL build alone; the sanitizer one on the candidate's own build.
+    assert sorted(calls) == sorted([("fuzz_snmp", ["crash-san"]), ("cross_eacsl_snmp", ["crash-eac"])])
+    report = json.loads(
+        (tmp_path / "replay" / f"{crash_replay._candidate_slug(XB_FP_SAN)}.json").read_text(encoding="utf-8")
+    )
+    assert {a["fingerprint"] for a in report["artifacts"]} == {XB_FP_SAN, XB_FP_EAC}
+    # An observation's fingerprint is this candidate's failure too.
+    assert report["fingerprint_matches"] is True
+
+
+def test_minimize_interest_accepts_any_of_the_given_fingerprints(tmp_path, monkeypatch):
+    monkeypatch.setattr(crash_replay, "replay_artifact", lambda *a, **k: {"reproduced": True, "failure": {"kind": "x"}})
+    monkeypatch.setattr(crash_replay, "_failure_fingerprint", lambda failure: XB_FP_EAC)
+    binary, variant = tmp_path / "bin", tmp_path / "v"
+    scratch = tmp_path / "s"
+    assert crash_replay.minimize_interest(binary, variant, scratch, f"{XB_FP_SAN},{XB_FP_EAC}") is True
+    assert crash_replay.minimize_interest(binary, variant, scratch, XB_FP_SAN) is False
+
+
+def test_minimize_candidates_passes_every_fingerprint_and_the_observation_engine(tmp_path, monkeypatch):
+    from conftest import write_json
+
+    cand = _obs_candidate(tmp_path)
+    write_json(tmp_path / "candidates.json", [cand])
+    seen: list[tuple[str, str, str | None]] = []
+
+    def fake_minimize(binary, input_path, scratch, *, module, fingerprint, **kwargs):
+        seen.append((Path(binary).name, Path(input_path).name, fingerprint))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(crash_replay, "replay_build_spec", lambda *a, **k: dict(XB_SPEC))
+    monkeypatch.setattr(
+        crash_replay, "prepare_replay_binary", lambda module, sources, out_bin, **kw: {"binary": str(out_bin)}
+    )
+    monkeypatch.setattr(crash_replay, "minimize_input", fake_minimize)
+    crash_replay.minimize_candidates(
+        tmp_path / "candidates.json", tmp_path / "h", tmp_path / "min", bin_dir=tmp_path / "bin"
+    )
+    joined = f"{XB_FP_SAN},{XB_FP_EAC}"
+    assert sorted(seen) == sorted([("fuzz_snmp", "crash-san", joined), ("cross_eacsl_snmp", "crash-eac", joined)])

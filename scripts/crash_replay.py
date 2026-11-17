@@ -380,6 +380,92 @@ def _reproducer_paths(cand: dict) -> list[Path]:
     return paths
 
 
+_ENGINES = ("eacsl", "sanitizers")
+
+
+def _accepted_fingerprints(cand: dict) -> list[str]:
+    """The candidate's key, then the fingerprint of each observation: every failure that is this candidate."""
+    out = [str(cand.get("fingerprint") or "")]
+    for obs in cand.get("observations") or []:
+        fp = str(obs.get("fingerprint") or "") if isinstance(obs, dict) else ""
+        if fp and fp not in out:
+            out.append(fp)
+    return out
+
+
+def _reproducers_by_engine(cand: dict, default: str, *, use_observations: bool) -> dict[str, list[Path]]:
+    """
+    The candidate's reproducers grouped by the engine to replay them on. A reproducer named by an
+    observation (`observations[].reproducer`) replays on that observation's engine; the others on `default`.
+    Candidates without observations, and a caller that forces an engine, give one group: as before.
+    """
+    named: dict[str, str] = {}
+    if use_observations:
+        for obs in cand.get("observations") or []:
+            if isinstance(obs, dict) and obs.get("reproducer") and obs.get("engine") in _ENGINES:
+                named.setdefault(str(Path(str(obs["reproducer"]))), str(obs["engine"]))
+    groups: dict[str, list[Path]] = {}
+    for path in _reproducer_paths(cand):
+        groups.setdefault(named.get(str(path), default), []).append(path)
+    ordered = {default: groups[default]} if default in groups else {}
+    for name in (*_ENGINES, *sorted(groups)):
+        if name in groups and name not in ordered:
+            ordered[name] = groups[name]
+    return ordered
+
+
+def _prepared_replay(
+    module: str,
+    spec: dict | str,
+    engine_name: str,
+    *,
+    own_engine: str,
+    bin_dir: Path,
+    prepared_by_key: dict[tuple[str, str], dict],
+    attribution: bool,
+    selftest_json: Path | None,
+    machdep: str,
+) -> dict:
+    """
+    The replay binary for one engine of a module's harness. The candidate's own engine keeps the path of
+    `make build`; another engine (an observation's, D1) builds as cross_<engine>_<harness> so the two never share a file.
+    """
+    if isinstance(spec, str):
+        return prepared_by_key.setdefault((f"!{module}", engine_name), {"binary": None, "reason": spec})
+    harness_module = str(spec.get("harness_module") or module)
+    key = (harness_module, engine_name)
+    if key not in prepared_by_key:
+        name = f"fuzz_{harness_module}" if engine_name == own_engine else f"cross_{engine_name}_{harness_module}"
+        prepared_by_key[key] = prepare_replay_binary(
+            harness_module,
+            spec["sources"],
+            bin_dir / name,
+            attribution=attribution,
+            engine=engine_name,
+            selftest_json=selftest_json,
+            machdep=machdep,
+            cppflags=spec["cppflags"],
+            ldflags=spec["ldflags"],
+            rte_initialized=bool(spec.get("rte_initialized", True)),
+            libc_checks=bool(spec.get("libc_checks", True)),
+        )
+    return prepared_by_key[key]
+
+
+def _merged_replay_report(reports: list[tuple[str, dict]]) -> dict:
+    """
+    One report from the replays of each engine group. A single group is returned as it is. With several,
+    the first group's report is kept and its artifacts are joined by every group's; `engines` names each group's status.
+    """
+    first = reports[0][1]
+    if len(reports) == 1:
+        return first
+    merged = dict(first)
+    merged["artifacts"] = [a for _, rep in reports for a in rep.get("artifacts") or []]
+    merged["engines"] = {name: rep.get("status") for name, rep in reports}
+    return merged
+
+
 def _cross_engine_replay(
     *,
     module: str,
@@ -497,39 +583,48 @@ def replay_candidates(
             except (OSError, ValueError, RuntimeError) as exc:
                 specs[skey] = f"no build spec for module {module!r}: {exc}"
         spec = specs[skey]
-        if isinstance(spec, str):
-            key = (f"!{module}", eng)
-            prepared_by_key.setdefault(key, {"binary": None, "reason": spec})
-        else:
-            harness_module = str(spec.get("harness_module") or module)
-            key = (harness_module, eng)
-            if key not in prepared_by_key:
-                prepared_by_key[key] = prepare_replay_binary(
-                    harness_module,
-                    spec["sources"],
-                    bin_dir / f"fuzz_{harness_module}",
-                    attribution=attribution,
-                    engine=eng,
-                    selftest_json=selftest_json,
-                    machdep=machdep,
-                    cppflags=spec["cppflags"],
-                    ldflags=spec["ldflags"],
-                    rte_initialized=bool(spec.get("rte_initialized", True)),
-                    libc_checks=bool(spec.get("libc_checks", True)),
-                )
         scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
-        report = replay_report(
-            module,
-            list(inputs or []) if only is not None else _reproducer_paths(cand),
-            scratch,
-            prepared=prepared_by_key[key],
-            per_input_timeout=per_input_timeout,
-        )
+        # Each reproducer replays on its own engine (its observation's, D1); the candidate's engine otherwise.
+        groups = (
+            {eng: list(inputs or [])}
+            if only is not None
+            else _reproducers_by_engine(cand, eng, use_observations=engine is None)
+        ) or {eng: []}
+        replays: list[tuple[str, dict]] = []
+        for group_eng, paths in groups.items():
+            prepared = _prepared_replay(
+                module,
+                spec,
+                group_eng,
+                own_engine=eng,
+                bin_dir=bin_dir,
+                prepared_by_key=prepared_by_key,
+                attribution=attribution,
+                selftest_json=selftest_json,
+                machdep=machdep,
+            )
+            group_scratch = scratch if group_eng == eng else scratch.parent / f"{scratch.name}-{group_eng}"
+            replays.append(
+                (
+                    group_eng,
+                    replay_report(
+                        module,
+                        paths,
+                        group_scratch,
+                        prepared=prepared,
+                        per_input_timeout=per_input_timeout,
+                    ),
+                )
+            )
+        report = _merged_replay_report(replays)
         report["candidate_fingerprint"] = fingerprint
-        report["fingerprint_matches"] = any(a.get("fingerprint") == fingerprint for a in report["artifacts"])
+        # Any failure that is this candidate: its key or one of its observations' fingerprints (D1).
+        accepted = _accepted_fingerprints(cand)
+        report["fingerprint_matches"] = any(a.get("fingerprint") in accepted for a in report["artifacts"])
         report_path = Path(out_json) if out_json is not None else out_dir / f"{_candidate_slug(fingerprint)}.json"
         atomic_write_json(report_path, report)
         entry: dict[str, Any] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
+        harness_module = module if isinstance(spec, str) else str(spec.get("harness_module") or module)
         if cross_engine and only is None and eng in ("eacsl", "sanitizers") and not isinstance(spec, str):
             # D1b: the same reproducers on the other engine's binary, so one bug seen by both links (link-related).
             other = "sanitizers" if eng == "eacsl" else "eacsl"
@@ -616,12 +711,15 @@ def minimize_interest(
     module: str = "",
     per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
 ) -> bool:
-    """cvise interest test: the variant still crashes the binary with the same fingerprint."""
+    """
+    cvise interest test: the variant still crashes the binary with one of the fingerprints. `fingerprint` may
+    name several, comma-separated (a candidate's key and its observations', D1).
+    """
     rep = replay_artifact(binary, variant, scratch, module=module, per_input_timeout=per_input_timeout)
     if not rep.get("reproduced"):
         return False
     fp = _failure_fingerprint(rep.get("failure"))
-    return fp is not None and (fingerprint is None or fp == fingerprint)
+    return fp is not None and (fingerprint is None or fp in fingerprint.split(","))
 
 
 def minimize_input(
@@ -714,7 +812,7 @@ def minimize_input(
     # Verify the best-so-far still reproduces with the same fingerprint before reporting it.
     check = replay_artifact(binary, variant, scratch, module=module, per_input_timeout=per_input_timeout)
     report["reproduced"] = bool(check.get("reproduced")) and (
-        fingerprint is None or _failure_fingerprint(check.get("failure")) == fingerprint
+        fingerprint is None or _failure_fingerprint(check.get("failure")) in fingerprint.split(",")
     )
     minimized = Path(str(input_path) + ".min")
     shutil.copyfile(variant, minimized)
@@ -770,51 +868,51 @@ def minimize_candidates(
             except (OSError, ValueError, RuntimeError) as exc:
                 specs[where] = f"no build spec for module {module!r}: {exc}"
         spec = specs[where]
-        # Minimized on the harness holding the crashing function (the unit's own one otherwise).
-        key = (str(spec.get("harness_module") or module), eng) if isinstance(spec, dict) else ("!" + module, eng)
-        if key not in prepared_by_key:
-            if isinstance(spec, str):
-                prepared_by_key[key] = {"binary": None, "reason": spec}
-            else:
-                harness_module = key[0]
-                prepared_by_key[key] = prepare_replay_binary(
-                    harness_module,
-                    spec["sources"],
-                    bin_dir / f"fuzz_{harness_module}",
-                    engine=eng,
-                    selftest_json=selftest_json,
-                    machdep=machdep,
-                    cppflags=spec["cppflags"],
-                    ldflags=spec["ldflags"],
-                    rte_initialized=bool(spec.get("rte_initialized", True)),
-                    libc_checks=bool(spec.get("libc_checks", True)),
-                )
-        prepared = prepared_by_key[key]
-        binary = prepared.get("binary") if isinstance(prepared, dict) else None
+        # Minimized on the harness holding the crashing function (the unit's own one otherwise), each
+        # reproducer on its own engine (D1). The interest test accepts the candidate's key or any observation's.
         scratch = out_dir / ".scratch" / (re.sub(r"[^A-Za-z0-9_.-]+", "_", module) or "unknown")
-        if binary is None:
-            report = {
-                "mode": "minimize",
-                "status": "error",
-                "reason": (prepared.get("reason") if isinstance(prepared, dict) else None) or "no binary",
-                "tool": tool,
-            }
-        else:
-            reproducers = _reproducer_paths(cand)
-            reports = [
+        accepted = ",".join(_accepted_fingerprints(cand))
+        reports: list[dict] = []
+        reason: str | None = None
+        for group_eng, paths in _reproducers_by_engine(cand, eng, use_observations=engine is None).items():
+            prepared = _prepared_replay(
+                module,
+                spec,
+                group_eng,
+                own_engine=eng,
+                bin_dir=bin_dir,
+                prepared_by_key=prepared_by_key,
+                attribution=True,
+                selftest_json=selftest_json,
+                machdep=machdep,
+            )
+            binary = prepared.get("binary")
+            if binary is None:
+                reason = reason or prepared.get("reason") or "no binary"
+                continue
+            reports.extend(
                 minimize_input(
                     Path(binary),
                     rep,
                     scratch,
                     module=module,
-                    fingerprint=fingerprint or None,
+                    fingerprint=accepted or None,
                     max_time_s=max_time_s,
                     jobs=jobs,
                     per_input_timeout=per_input_timeout,
                     tool=tool,
                 )
-                for rep in reproducers
-            ]
+                for rep in paths
+            )
+        report: dict[str, Any]
+        if not reports:
+            report = {
+                "mode": "minimize",
+                "status": "error",
+                "reason": reason or "no binary",
+                "tool": tool,
+            }
+        else:
             report = {
                 "mode": "minimize",
                 "status": "ok" if any(r["status"] == "ok" for r in reports) else "error",
