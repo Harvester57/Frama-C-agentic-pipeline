@@ -30,10 +30,13 @@ byte selects it), with arguments built from the model's signature of each functi
   - a byte pointer without a known size: a zeroed spare buffer (`2 * MAX_INPUT_SIZE + 1024` bytes), so
     an unknown contract does not read as a target bug; a `const char *` alone takes the rest of the
     input as a NUL-terminated string;
-  - a pointer to a struct the API has an initializer for (a function named like `*_Init`, `*_init`,
-    `*Init*`, `*_new`, `*_create` whose first parameter is a non-const pointer to that struct; the one
-    the recorded traces call first, else the plainest): one object, initialized by that call before
-    the call under test (its own arguments built by the same rules; the case's `inits` name it). The
+  - a pointer to a struct the unit has an initializer for (a function of the unit, also from another
+    cluster than the module's, named like `*_Init`, `*_init`, `*Init*`, `*_new`, `*_create` whose
+    first parameter is a non-const pointer to that struct; never an error or `FILE *` one, else first
+    one reading a (buffer, length) pair, see `initializers`): one object, initialized by that call
+    before the call under test (its own arguments built by the same rules; the case's `inits` name
+    it). An initializer or destructor from outside the module's scope is in the sidecar's
+    `api_helpers` (`case_helpers`), which the reach gate counts as no root of the module. The
     initializer's own case does not call it first. After the call under test the object is released
     with the struct's destructor when the unit has one (a function of the unit named like a
     destructor whose one parameter is a non-const pointer to that struct, `struct_destructors`):
@@ -1160,10 +1163,18 @@ def initializers(
     """
     Per struct type, the initializer the harness calls on a pointer to it, and every candidate: a
     function named like an initializer whose first parameter is a non-const pointer to that struct.
-    `functions` are the model's records (key -> record); a header `static` function counts only when
-    the layout probe saw it declared in the harness (`visible`), every function then must be. The
-    recorded traces decide between candidates (the one called first), else the plainest name
-    (`*_Init`/`*_init`), the fewest parameters, then the name.
+    `functions` are the model's records (key -> record): `plan` passes the whole unit's, an
+    initializer often lies in another cluster than the API it serves (mpack). A header `static`
+    function counts only when the layout probe saw it declared in the harness (`visible`), every
+    function then must be.
+
+    An initializer that sets up a broken object is a candidate (its own case does not call another
+    first) but never chosen (`_unusable_initializer`): one named for an error (`*_init_error`) or one
+    taking a `FILE *`. Among the others, the order is: a (buffer, length) pair the call only reads
+    (`mpack_reader_init_data`: its bytes come from the input), then any (buffer, length) pair
+    (`mpack_writer_init`: a spare buffer, rather than `*_init_growable`, whose buffer the caller must
+    free), then the one the recorded traces call first, then the plainest name (`*_Init`/`*_init`),
+    the fewest parameters, then the name.
     """
     cands: dict[str, set[str]] = {}
     records: dict[str, dict] = {}
@@ -1190,22 +1201,50 @@ def initializers(
             continue
         cands.setdefault(pointee, set()).add(name)
         records[name] = rec
-    chosen: dict[str, str] = {}
+    traced: dict[str, int] = {}  # each function the traces call, by the order of its first call
     for trace in traces or []:
         for c in trace:
             fn = c.get("fn")
-            for t, names in cands.items():
-                if fn in names and t not in chosen:
-                    chosen[t] = str(fn)
+            if isinstance(fn, str):
+                traced.setdefault(fn, len(traced))
 
-    def plainest(n: str) -> tuple[bool, int, str]:
-        parts = split_signature(str(records[n].get("signature") or ""))
-        return (not re.search(r"_[Ii]nit$", n), len(parts[1]) if parts else 99, n)
+    def rank(n: str) -> tuple[bool, bool, int, bool, int, str]:
+        rec = records[n]
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        formals = list(rec.get("formals") or [])
+        pairs = [i for i in range(1, len(params or [])) if _is_pair(params or [], i, formals)]
+        parts = split_signature(str(rec.get("signature") or ""))
+        return (
+            not any(_is_input(formals, i) for i in pairs),
+            not pairs,
+            traced.get(n, len(traced)),
+            not re.search(r"_[Ii]nit$", n),
+            len(parts[1]) if parts else 99,
+            n,
+        )
 
+    chosen: dict[str, str] = {}
     for t, names in cands.items():
-        if t not in chosen:
-            chosen[t] = min(names, key=plainest)
+        usable = [n for n in names if not _unusable_initializer(n, records[n])]
+        if usable:
+            chosen[t] = min(usable, key=rank)
     return chosen, cands, records
+
+
+_ERROR_WORD_RE = re.compile(r"(?:^|_)error(?:$|_)|Error(?=[A-Z0-9_]|$)")
+_STDIO_FILE_RE = re.compile(r"\b(?:FILE|struct _IO_FILE)\b")
+
+
+def _unusable_initializer(name: str, rec: dict) -> bool:
+    """
+    An initializer that leaves its object unusable for the call under test: one named for an error
+    (`mpack_writer_init_error` flags the writer as failed, so every later call returns at once) or
+    one that takes a `FILE *` (`mpack_writer_init_stdfile`: the harness has no stream to give it).
+    """
+    if _ERROR_WORD_RE.search(name):
+        return True
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    return any(_STDIO_FILE_RE.search(str(p.get("pointee") or p.get("type") or "")) for p in params or [])
 
 
 def handle_functions(
@@ -1617,22 +1656,26 @@ def plan(
         if isinstance(rec, dict)
         and (str(rec.get("name") or k.split("#")[-1]) in entry_names or (rec.get("static") and rec.get("header")))
     }
-    inits, candidates, init_records = initializers(init_pool, traces, visible)
     handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
     outp = outparam_constructors(init_pool, visible, handles, traces)
-    # Destructors of struct objects may lie outside the scope (mpack_writer_destroy is in another
-    # cluster than mpack_writer_init): any function of the unit, which the harness links whole.
+    # Initializers and destructors of struct objects may lie outside the scope: mpack's
+    # mpack_writer_init and mpack_writer_destroy are in other clusters than most of the writer API
+    # (mpack run-3: every mpack_writer_2 case passed an all-zero writer). Any function of the unit
+    # counts; the harness's sources take in the unit of every function a case names
+    # (generate_harness._merge_dag_harness_sources).
     unit_names = {
         str((functions.get(k) or {}).get("name") or str(k).split("#")[-1])
         for k in mm.unit_record(module).get("functions") or []
     } | entry_names
-    dtor_pool = {
+    unit_pool = {
         k: rec
         for k, rec in (model.get("functions") or {}).items()
         if isinstance(rec, dict)
         and (str(rec.get("name") or k.split("#")[-1]) in unit_names or (rec.get("static") and rec.get("header")))
     }
-    struct_dtors, struct_dtor_names = struct_destructors(dtor_pool, visible)
+    inits, candidates, init_records = initializers(unit_pool, traces, visible)
+    struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible)
+    helper_pool = (set(inits.values()) | set(struct_dtors.values())) - entry_names
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
     api = ApiInfo(
@@ -1740,7 +1783,22 @@ def plan(
         "skipped": skipped,
         "stubs": dict(api.stubs),
         "variadic_dropped": dropped,
+        "helpers": case_helpers(cases, layouts, helper_pool),
+        "helper_pool": sorted(helper_pool),
     }
+
+
+def case_helpers(cases: Sequence[str], layouts: Sequence[dict], pool: set[str] | Sequence[str]) -> list[str]:
+    """
+    The functions of `pool` (initializers and destructors from outside the module's scope) the cases
+    call to set up or release an object: the sidecar's `api_helpers`. They run with arguments no case
+    reads from the input, so the reach gate counts none of them as a root of the module
+    (`harness_reach.check_module`).
+    """
+    names = set(pool)
+    used = {str(i.get("fn")) for lay in layouts for i in lay.get("inits") or [] if isinstance(i, dict)}
+    used |= {n for n in names if any(re.search(rf"\b{re.escape(n)}\s*\(", c) for c in cases)}
+    return sorted(used & names)
 
 
 _STUB_NAME_RE = re.compile(r"\bframac_cb_\w+")
@@ -2615,6 +2673,7 @@ def generate(
         skipped = still_skipped(layouts, skipped)
         sidecar["api_cases"] = layouts
         sidecar["api_skipped"] = skipped
+        sidecar["api_helpers"] = case_helpers(cases, layouts, p.get("helper_pool") or [])
         sidecar.pop("api_variadic_dropped", None)
         if dropped:
             sidecar["api_variadic_dropped"] = dropped
