@@ -2557,10 +2557,21 @@ KNOWN_EACSL_FAILURES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "eacsl_static_const_union",
         re.compile(r"implicit cast: cast from union \w+ to void \*"),
-        "E-ACSL cannot instrument a `static const` union (local or file scope, initialized or not): its "
-        "code casts the union to void * (E-ACSL bug)",
+        "E-ACSL cannot instrument a const union object (local or file scope, initialized or not): its "
+        "code casts the union to void * (E-ACSL bug, pub/frama-c#2795)",
     ),
 )
+# With the E-ACSL-only rewrite on (scripts/fc_cpp_wrapper_eacsl.py, O9), a `static const union` no longer fails:
+# an eacsl_static_const_union row then names a declaration the rewrite missed, and gives no sanitizers command.
+
+
+def _const_union_rewrite_on(attempt: dict) -> bool:
+    """
+    Whether the failed E-ACSL attempt ran with the `static const union` rewrite (O9,
+    scripts/fc_cpp_wrapper_eacsl.py), as its build report records it. A report without the field is from a
+    build that predates the rewrite.
+    """
+    return attempt.get("const_union_rewrite") is True
 
 
 def sanitizers_command(module: str) -> str:
@@ -2686,7 +2697,9 @@ def build_check(
     compiler error of its E-ACSL attempt. Fuzzing it would lose the E-ACSL checks without anyone
     deciding so. When the error is a known E-ACSL limitation with no source-level fix
     (KNOWN_EACSL_FAILURES), the row adds its `reason_code` and, as `next_step`, the `params set`
-    command that records the sanitizers choice; the module still fails until someone runs it.
+    command that records the sanitizers choice; the module still fails until someone runs it. The
+    exception is `eacsl_static_const_union` from a build with the E-ACSL-only `static const union` rewrite
+    on (O9): the row's `reason` asks for the rewrite to be extended, and it gives no `next_step`.
     A module whose `fuzz_engine` param is `sanitizers` passes: that is a recorded choice
     (`params set --module M --fuzz-engine sanitizers`), or the DAG's for its unit (the GCC fallback,
     setjmp/longjmp), whose reason the row gives. A module the reach gate stops (its `build-<mod>`
@@ -2757,7 +2770,19 @@ def build_check(
                 entry["compile_log"] = log
                 entry["first_error"] = _first_build_error(run_dir / log)
                 known = known_eacsl_failure(run_dir / log)
-                if known:
+                if known and known[0] == "eacsl_static_const_union" and _const_union_rewrite_on(attempt):
+                    # O9: the E-ACSL frontend drops `const` from `static const union` objects, so the
+                    # declaration that still fails is one the rewrite does not cover: extend it, do not give
+                    # up E-ACSL for the module.
+                    entry["reason_code"] = known[0]
+                    entry["reason"] = (
+                        f"{known[1]}. The E-ACSL-only rewrite of `static const union` declarations "
+                        "(scripts/fc_cpp_wrapper_eacsl.py) was on for this build and did not cover the "
+                        "declaration the compile log names (a `const union` without `static`, a union "
+                        "named through a typedef, or `const` placed after the type): extend the rewrite to "
+                        "it and rebuild; record the gap in docs/troubleshooting/harnesses-and-seeds.md"
+                    )
+                elif known:
                     entry["reason_code"], why = known
                     entry["reason"] = (
                         f"{why}. Fuzzing the module with the sanitizers instead loses the E-ACSL checks "
