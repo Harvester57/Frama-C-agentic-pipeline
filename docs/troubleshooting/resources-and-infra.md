@@ -256,7 +256,10 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
   - Verified in Docker: `/proc/self/limits` shows `1 1 bytes`, a 200 MB abort leaves no dump, and `ulimit -c unlimited` is refused.
   - Tests: `tests/test_sandbox_and_overlay.py::test_wrappers_cap_core_dumps_for_every_container_they_start` and `::test_cache_volume_init_container_caps_core_dumps`, and `tests/test_remediation_p2_container.py::test_compose_services_cap_core_dumps_like_the_wrappers`. The supervisor reran the two files on the branch: 34 passed, 2 skipped.
   - **Open pipeline bug:** a process that lowers its own limit to 0 (`ulimit -c 0`) turns the pipe dump back on, even under `core=1:1` (reproduced: a 4.6 MB dump). The ASan, UBSan/libFuzzer and E-ACSL runtimes leave the limit at 1, so the risk comes from ad-hoc agent commands. The Crash Verifier and breaker briefs should forbid lowering the core limit and require reproductions through `sandbox_exec.py`.
-  - Disabling WSL crash capture on the host (`WSL_ENABLE_CRASH_DUMP` or `.wslconfig`) would close the gap completely. That is the user's decision.
+  - Disabling WSL crash capture on the host would close the gap completely. That is the user's decision. Two `.wslconfig` settings were tried on 2026-11-17 (WSL 3.0.5.0, kernel 6.18.58.1-1) and **neither disables it**:
+    - `[wsl2] kernelCommandLine = sysctl.kernel.core_pattern=core`: WSL resets `core_pattern` after boot, and the live value stays `|/wsl-capture-crash %t %E %p %s`.
+    - `[wsl2] maxCrashDumpCount=-1` (described as "disable" by a third-party write-up): after `wsl --shutdown`, a 200 MB `os.abort()` in a container run with `--ulimit core=-1` still wrote a 214 MB `%TEMP%\wsl-crashes\wsl-crash-*.dmp`. The count limit does not bound a dump's size either.
+    - What does work per container is a core limit of exactly 1 byte (the fix above). Docker Desktop's engine setting `"default-ulimits": {"core": {"Name": "core", "Soft": 1, "Hard": 1}}` would apply it to every container, including ad-hoc `docker run` calls that bypass the wrappers; it shares the `ulimit -c 0` gap.
 
 ### Symptom: `sandbox_exec.py run` Fails With `FileNotFoundError: [Errno 2] No such file or directory: 'workspace/harnesses/fuzz_<module>.e-acsl'` on a Relative Binary Path
 
