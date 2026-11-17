@@ -1076,7 +1076,7 @@ _DRIVER_HEADERS = {
 }
 
 
-def _driver_execs() -> list[dict]:
+def _driver_execs(with_cli: bool) -> list[dict]:
     lib = ["src/mpack/mpack-reader.c", "src/mpack/mpack-writer.c"]
     tests = ["test/unit/src/test.c", "test/unit/src/test-reader.c"]
     execs: list[dict] = []
@@ -1090,12 +1090,13 @@ def _driver_execs() -> list[dict]:
     execs.append({"exe": "/usr/bin/ar", "args": ["ar", "rcs", ".build/mpack-lib/libmpack.a", *lib_objs], "cwd": TREE})
     runner_objs = compile_all(lib + tests, ".build/unit/everything-debug/obj")
     execs.append(cc("-o", ".build/unit/everything-debug/runner", *runner_objs))
-    cli_objs = compile_all([*lib, "tools/cli.c"], ".build/cli")
-    execs.append(cc("-o", ".build/mpack-cli", *cli_objs))
+    if with_cli:
+        cli_objs = compile_all([*lib, "tools/cli.c"], ".build/cli")
+        execs.append(cc("-o", ".build/mpack-cli", *cli_objs))
     return execs
 
 
-def _driver_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+def _driver_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_cli: bool = False) -> dict:
     """analyse() on the mpack-shaped build, with the probes (cc -M, nm, install, snapshot) stubbed."""
     tree = tmp_path / "tree"
     for rel, text in _DRIVER_HEADERS.items():
@@ -1111,7 +1112,7 @@ def _driver_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(bc, "try_install", lambda *a: ([], "no install target"))
     monkeypatch.setattr(bc, "generated_headers", lambda *a: [])
     monkeypatch.setattr(bc, "build_snapshot", lambda *a, **k: {"files": 0})
-    cap = bc.classify_executions(_driver_execs(), TREE)
+    cap = bc.classify_executions(_driver_execs(with_cli), TREE)
     report: dict = {"warnings": [], "build": {}, "target": str(tmp_path / "target")}
     bc.analyse(report, cap, tree, tmp_path / "scratch", {}, 60, 1)
     return report
@@ -1119,7 +1120,7 @@ def _driver_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
 
 @pytest.mark.unit
 def test_a_test_driver_compiling_the_library_again_is_a_test_unit(tmp_path, monkeypatch):
-    report = _driver_capture(tmp_path, monkeypatch)
+    report = _driver_capture(tmp_path, monkeypatch, with_cli=True)
     units = report["units"]
     runner = units[".build/unit/everything-debug/runner"]
     assert (runner["test"], runner["test_reason"]) == (True, "main_in_test_source")
@@ -1146,6 +1147,9 @@ def _driver_plans(report: dict) -> list[str]:
 def test_the_seed_recorder_no_longer_wraps_the_test_drivers_functions(tmp_path, monkeypatch):
     # Before the fix the runner was a product unit: its embedded API (test_reader, from test.h)
     # was wrapped, and only the outermost call is recorded, so no library call reached calls.jsonl.
+    # With the CLI, the library API comes from the CLI's embedded API; without it, nothing is planned
+    # until the static library has entry points (the xfail below).
+    assert _driver_plans(_driver_capture(tmp_path, monkeypatch, with_cli=True)) == ["mpack_read", "mpack_write"]
     assert "test_reader" not in _driver_plans(_driver_capture(tmp_path, monkeypatch))
 
 
