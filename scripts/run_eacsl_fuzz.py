@@ -293,10 +293,10 @@ def fuzz_required_memory_mb(workers: int = 1) -> int:
 GUARDRAIL_PER_INPUT_TIMEOUT_S = 30
 DEFAULT_MAX_TIME_S = 60
 MIN_FUZZ_WALL_S = 30
-# A keep-going round after a crash runs on what is left of the campaign's time, down to this floor.
-# Below MIN_FUZZ_WALL_S on purpose: a campaign sized at that minimum must still get a second round
-# when its first one crashed within a second. Fixed, never derived from the machine.
-MIN_ROUND_WALL_S = 5
+# Rounds are bounded by CPU-seconds: wall seconds times LibFuzzer workers, so a campaign runs the same
+# rounds whatever its worker count. A new round needs at least this many CPU-seconds left. Fixed, never
+# derived from the machine.
+MIN_ROUND_CPU_S = 10
 # Keep-going campaigns: a fork-mode run saves the same bug over and over, so only this many crash
 # inputs are replayed and this many listed per fingerprint. Fixed, never derived from the machine.
 MAX_REPLAYED_CRASHES = 64
@@ -539,9 +539,11 @@ def run_campaign_rounds(
     skippable: int | None = None,
     runtime_skip: bool = False,
     selector: str = DISPATCH_SELECTOR_MODULO,
+    workers: int = 1,
 ) -> dict:
     """
-    A campaign that keeps going after a crash, within `max_time` seconds of fuzzing in all. A crash's
+    A campaign that keeps going after a crash, within `max_time` wall seconds of fuzzing in all, which
+    is `max_time * workers` CPU-seconds. A crash's
     case is its input's first byte decoded with the harness's `selector` (`dispatch_selector`).
 
     `campaign(binary, max_time, fork)` runs one libFuzzer campaign (run_fuzz_campaign) and
@@ -552,7 +554,9 @@ def run_campaign_rounds(
     - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
       the next round on, so a shallow bug stops ending every run and the other cases get the rest of
       the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
-      MIN_ROUND_WALL_S seconds are left, a round's new crashing cases cannot be skipped
+      MIN_ROUND_CPU_S CPU-seconds (wall seconds times `workers`) or a whole wall second are left. A round's
+      wall budget is the wall time left, rounded down (`-max_total_time`), so no round overruns the
+      campaign. A round's new crashing cases cannot be skipped
       (`unskippable_case`: cases `skippable` and above, for a harness generated before every case
       was skippable), or a rebuild fails. In the last two, the time left runs in fork mode with
       crashes ignored on the last binary built (`fork_fallback`).
@@ -577,7 +581,8 @@ def run_campaign_rounds(
     fallback_reason: str | None = None
     skip_error: str | None = None
     while True:
-        budget = max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))
+        # A round never runs longer than the wall time the campaign has left. The first round always runs.
+        budget = max(1, int(max_time - spent)) if not rounds else int(max_time - spent)
         started = time.monotonic()
         if runtime_skip:
             skip_env = {DISPATCH_SKIP_MACRO: format_skip_cases_env(skipped)} if skipped else None
@@ -620,9 +625,14 @@ def run_campaign_rounds(
             break
         fresh = [c for c in crashed if c not in skipped]
         new = [c for c in fresh if c < skippable]
-        if last.get("status") == "insufficient_memory" or not fresh:
+        if last.get("status") == "insufficient_memory":
+            rnd["stopped"] = "insufficient_memory"
             break
-        if max_time - spent < MIN_ROUND_WALL_S:
+        if not fresh:
+            rnd["stopped"] = "no_new_case"
+            break
+        # The next round needs the CPU floor and at least one whole second of wall time left.
+        if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S or int(max_time - spent) < 1:
             rnd["stopped"] = "time_budget_spent"
             break
         if not new:
@@ -645,7 +655,7 @@ def run_campaign_rounds(
 
     fallback: dict | None = None
     left = int(max_time - spent)
-    if fallback_reason and left >= MIN_ROUND_WALL_S:
+    if fallback_reason and left >= 1 and (max_time - spent) * max(1, workers) >= MIN_ROUND_CPU_S:
         # The cases still crashing cannot be skipped: the time left goes to fork mode, which keeps
         # fuzzing past each crash, on the last binary built (its skipped cases stay skipped).
         started = time.monotonic()
@@ -688,6 +698,9 @@ def run_campaign_rounds(
         "skippable_cases": skippable,
         "skipped_cases": sorted(skipped),
         "fuzz_seconds": round(spent, 1),
+        "workers": max(1, workers),
+        "cpu_seconds_spent": round(spent * max(1, workers), 1),
+        "stopped": rounds[-1].get("stopped"),
         "rounds": rounds,
     }
     if runtime_skip:
@@ -2550,6 +2563,7 @@ def _run_campaign_mode(args) -> dict:
                 skippable=skippable,
                 runtime_skip=runtime_skip,
                 selector=selector,
+                workers=workers,
             )
             if harness_runtime_skip and not runtime_skip and isinstance(out.get("keep_going"), dict):
                 out["keep_going"]["runtime_skip_unavailable"] = (
