@@ -297,6 +297,10 @@ MIN_FUZZ_WALL_S = 30
 # Below MIN_FUZZ_WALL_S on purpose: a campaign sized at that minimum must still get a second round
 # when its first one crashed within a second. Fixed, never derived from the machine.
 MIN_ROUND_WALL_S = 5
+# Rounds are bounded by CPU-seconds: wall seconds times LibFuzzer workers, so a campaign runs the same
+# rounds whatever its worker count. A new round needs at least this many CPU-seconds left. Fixed, never
+# derived from the machine.
+MIN_ROUND_CPU_S = 10
 # Keep-going campaigns: a fork-mode run saves the same bug over and over, so only this many crash
 # inputs are replayed and this many listed per fingerprint. Fixed, never derived from the machine.
 MAX_REPLAYED_CRASHES = 64
@@ -539,9 +543,11 @@ def run_campaign_rounds(
     skippable: int | None = None,
     runtime_skip: bool = False,
     selector: str = DISPATCH_SELECTOR_MODULO,
+    workers: int = 1,
 ) -> dict:
     """
-    A campaign that keeps going after a crash, within `max_time` seconds of fuzzing in all. A crash's
+    A campaign that keeps going after a crash, within `max_time` wall seconds of fuzzing in all, which
+    is `max_time * workers` CPU-seconds. A crash's
     case is its input's first byte decoded with the harness's `selector` (`dispatch_selector`).
 
     `campaign(binary, max_time, fork)` runs one libFuzzer campaign (run_fuzz_campaign) and
@@ -2550,6 +2556,7 @@ def _run_campaign_mode(args) -> dict:
                 skippable=skippable,
                 runtime_skip=runtime_skip,
                 selector=selector,
+                workers=workers,
             )
             if harness_runtime_skip and not runtime_skip and isinstance(out.get("keep_going"), dict):
                 out["keep_going"]["runtime_skip_unavailable"] = (
