@@ -1,6 +1,7 @@
 """
 The dispatch selector (generate_harness._build_dispatch_invocation): the first input byte is the case
-index, a byte at or above the case count runs no case, at most 256 cases. A harness generated before
+index, a byte at or above the case count runs no case, at most 256 cases (above that, two bytes:
+test_dispatch_selector_wide.py). A harness generated before
 (sidecar without `dispatch_selector`) is still decoded modulo its case count by every decoder.
 """
 
@@ -77,12 +78,10 @@ def test_appending_a_case_keeps_the_case_of_every_old_byte(tmp_path):
     assert new[181] == "(void)hit_case(181U);"
 
 
-def test_more_than_256_cases_is_refused_and_leaves_no_harness(tmp_path):
-    _gen(tmp_path, 256)  # the most one byte selects
-    (tmp_path / "harnesses" / "harness_mod.c").unlink()
-    (tmp_path / "harnesses" / "harness_mod.json").unlink()
-    with pytest.raises(ValueError, match=r"at most 256 cases; this one has 257\. Split the module"):
-        _gen(tmp_path, 257)
+def test_more_than_4096_cases_is_refused_and_leaves_no_harness(tmp_path):
+    # Above 256 cases the selector is two bytes (test_dispatch_selector_wide.py), up to 4096 cases.
+    with pytest.raises(ValueError, match=r"at most 4096 cases; this one has 4097\. Split the module"):
+        _gen(tmp_path, 4097)
     assert not (tmp_path / "harnesses" / "harness_mod.c").exists()
     assert not (tmp_path / "harnesses" / "harness_mod.json").exists()
 

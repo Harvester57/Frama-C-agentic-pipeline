@@ -158,7 +158,7 @@
     "fuzz_expr": {"type": ["string", "null"]},
     "dispatch_cases": {"$ref": "#/definitions/strings"},
     "dispatch_case_count": {"type": "integer", "minimum": 0},
-    "dispatch_selector": {"$comment": "how a dispatch harness's first input byte selects its case (generate_harness.py): `identity`, the byte is the case index and a byte at or above `dispatch_case_count` runs no case. Absent on a dispatch harness generated before the field existed, which selects with the byte modulo `dispatch_case_count`; every decoder (run_eacsl_fuzz.py, harness_reach.py) reads it that way.", "type": "string", "enum": ["identity"]},
+    "dispatch_selector": {"$comment": "how a dispatch harness's first input bytes select its case (generate_harness.py): `identity`, the first byte is the case index and a byte at or above `dispatch_case_count` runs no case; `identity16`, for more than 256 cases, the same with the first two bytes, little-endian. Absent on a dispatch harness generated before the field existed, which selects with the first byte modulo `dispatch_case_count`; every decoder (run_eacsl_fuzz.py, harness_reach.py) reads it that way.", "type": "string", "enum": ["identity", "identity16"]},
     "include_source": {"type": "boolean"},
     "stubbed_callees": {"$ref": "#/definitions/strings"},
     "reachability": {"type": "string", "enum": ["untrusted_surface", "internal_api"]},

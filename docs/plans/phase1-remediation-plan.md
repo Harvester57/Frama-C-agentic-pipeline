@@ -395,6 +395,24 @@ Added by the re-check, for the steps before the merge:
   - `test_keep_going_skips_case_280`;
   - when host clang is present, as `test_generated_dispatch_harness_runs_case_k_for_byte_k` does: `test_generated_wide_harness_runs_case_280`.
 - **Acceptance:** the standard checks; `python -m pytest tests/test_dispatch_selector.py tests/test_dispatch_selector_wide.py tests/test_fuzz_keep_going.py tests/test_harness_reach.py tests/test_harness_reach_crash_credit.py -q`.
+- **Review (2026-11-17), on the branch rebased onto `b540121` (S1 to S7 and S12 merged):**
+  - Re-run: `ruff check`, `mypy scripts tests`, `tools/check_generated_text.py`, `tools/sync_skill_mirrors.py --check`, `tests/test_docs_structure.py`, and the whole suite (5941 passed, 219 skipped). `ruff format --check` reports 44 files, all in lines the branch did not write (the four it touches were unformatted before the step too).
+  - `test_generated_wide_harness_runs_case_280` passes in the analysis image (`FRAMAC_DOCKER_TESTS=1`): a compiled 300-case harness runs case k for selector k, and nothing for a selector at or above 300 or a one-byte input.
+  - After the rebase no script outside the ones this step owns reads or writes the selector byte (searched at `b540121`: `read(1)`, `bytes([sel])`, `first_byte`, `<= 255`).
+  - Measured with libFuzzer on trivial harnesses from an empty corpus (`-seed=1`, cases reached after 2,000 / 10,000 / 30,000 executions): 250 cases, one byte: 188 / 250 / 250. 300 cases, two bytes: 98 / 225 / 292. 1,000 cases: 175 / 545 / 872. At 300,000 executions every case of 300 and of 1,000 is reached, and 3,950 of 4,000. So the two-byte selector does not hide cases, but a case without a seed costs about three times the executions to find. With one two-byte seed per case in the corpus every case runs when the corpus is loaded. The pipeline writes no such seed today (open, not part of this step).
+  - The selector enum is in `schemas/harness_sidecar.schema.json` only, so a crash artifact stamped `identity16` validates. The skip function takes `unsigned int`, so `templates/harness_dual.c.template` did not need to change.
+  - The seed cost above is one run per size on a trivial harness; it is recorded as an open gap in `docs/troubleshooting/harnesses-and-seeds.md`.
+  - Not checked: the skip of a case at or above 256 in a compiled harness, Eva on a wide harness (one analysis over 300 or more cases, and a shard's `-DFRAMAC_EVA_SHARD_CASE_<k>` list for that many cases), and a real target.
+- **Rebased again (2026-11-17) onto `434d4a9`** (R1, the mpack run-3 supervisor fixes and the redone S5 merged):
+  - One conflict, in the `argv` and `dispatch` lines of `skills/framac-slice/SKILL.md`: the tip's `argv` text and this step's `dispatch` text are kept, and the mirrors are regenerated.
+  - Re-run on it: the same checks, and the whole suite (6065 passed, 224 skipped). `test_generated_wide_harness_runs_case_280` passes in the rebuilt analysis image.
+  - The scripts and templates the tip changed since `b540121` add no reader or writer of the selector byte (their diff was searched for the selector, the first byte and the case index).
+  - Still not checked: the three items above.
+- **Rebased a third time (2026-11-17) onto `890a101`** (the open-topics steps O4, O5, O7, O9 to O12 and the mpack run-4 fixes S13 to S19 of the supervision's numbering landed):
+  - One conflict, again in `skills/framac-slice/SKILL.md`: the tip's new `stdin` bullet and its `--api` text are kept with this step's `dispatch` text, and the mirrors are regenerated. The code applied without a conflict.
+  - Re-run on it: `ruff check`, `mypy scripts tests`, the generated-text and mirror checks, and the whole suite (6202 passed, 230 skipped). With `FRAMAC_DOCKER_TESTS=1`, `tests/test_dispatch_selector.py` and `tests/test_dispatch_selector_wide.py` pass on the branch with H1 on top.
+  - The scripts and templates the tip changed since `434d4a9` add no reader or writer of the selector byte (same search of their diff). The `stdin` entry style (O10) is a `main` style and has no selector.
+  - Still not checked: the same three items.
 
 ### S7. Ledger evidence (F7, F9) (S, after S4, S5 and S6a)
 
@@ -606,7 +624,7 @@ Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; th
 | S4 | L | before merge | done (2026-11-17), merge `4de97ca`; replay and minimize accept a candidate's observations (`586d28d`); hypotheses without a line stay at function + kind (open entry in `ledger-and-verifier.md`) |
 | S5 | M | before merge | done (2026-11-17), merge `72db709` (in `cd4f827`) |
 | S6a | S | before merge | done (2026-11-17), merge `7e431a6`; round wall time is the time left (`cb56350`) |
-| S6b | M | after merge (D20) | open; F3 is fixed on the branch (`18bc5e9`, `45c7a5f`), the two-byte selector (D7) is an extension |
+| S6b | M | after merge (D20) | written on `p1/s6b-wide-selector` (code and tests, then skills and docs), started early (user, 2026-11-17) and rebased onto `phase1-remediation` with S1 to S7 and S12 merged; the compiled wide harness test passes in the analysis image (`FRAMAC_DOCKER_TESTS=1`); lands after the merge |
 | S7 | S | before merge | done (2026-11-17), merge `9890f29` |
 | S8 | S | after merge | open, after V |
 | S9 | M | before merge | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |

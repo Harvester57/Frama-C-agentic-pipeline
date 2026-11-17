@@ -99,14 +99,14 @@ from framac_common import (  # noqa: E402
     utc_now,
 )
 from generate_harness import (  # noqa: E402
-    DISPATCH_SELECTOR_IDENTITY,
     DISPATCH_SELECTOR_MODULO,
     DISPATCH_SKIP_FN,
     TARGET_EMBEDDED_PREFIX,
     _include_dirs_from_cppflags,
     _strip_c_comments,
-    dispatch_case_of,
+    dispatch_case_of_bytes,
     dispatch_selector_of,
+    dispatch_selector_width,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
 
@@ -1046,7 +1046,11 @@ def _candidate_roots(*paths: Path | None) -> list[Path]:
     return roots
 
 
-def _artifact_first_byte(raw_path: object, roots: list[Path]) -> int | None:
+def _artifact_selector_bytes(raw_path: object, roots: list[Path]) -> bytes | None:
+    """
+    The first bytes of an artifact's input, as many as the widest dispatch selector reads (two for
+    `identity16`), so that it decodes under either encoding; None for an empty or unreadable input.
+    """
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
     rel = Path(raw_path.strip())
@@ -1056,8 +1060,8 @@ def _artifact_first_byte(raw_path: object, roots: list[Path]) -> int | None:
             continue
         try:
             with cand.open("rb") as fh:
-                first = fh.read(1)
-            return first[0] if first else None
+                prefix = fh.read(2)
+            return prefix or None
         except OSError:
             continue
     return None
@@ -1108,7 +1112,7 @@ def _artifact_identity_problem(
     legacy_problem: str | None,
     harness_digest: str | None,
     n_cases: int | None,
-    first_byte: int | None,
+    selector_bytes: bytes | None,
     selector: str = DISPATCH_SELECTOR_MODULO,
 ) -> str | None:
     """
@@ -1121,24 +1125,23 @@ def _artifact_identity_problem(
     """
     if "harness_digest" in art and "dispatch_case_count" in art:
         found_n = _case_count(art.get("dispatch_case_count"))
-        found_sel = (
-            DISPATCH_SELECTOR_IDENTITY
-            if art.get("dispatch_selector") == DISPATCH_SELECTOR_IDENTITY
-            else DISPATCH_SELECTOR_MODULO
-        )
+        found_sel = dispatch_selector_of(art)
         if found_n != n_cases or (n_cases is not None and found_sel != selector):
 
             def _under(n: int | None, sel: str) -> str:
                 if n is None:
                     return "a harness without dispatch cases"
-                idx = dispatch_case_of(first_byte, n, sel) if first_byte is not None else None
-                case = (
-                    ""
-                    if first_byte is None
-                    else f", case {idx}"
-                    if idx is not None
-                    else f", no case (first byte {first_byte})"
+                sb = selector_bytes
+                idx = dispatch_case_of_bytes(sb, n, sel) if sb is not None else None
+                width = dispatch_selector_width(sel)
+                shown = (
+                    f"first byte {sb[0]}"
+                    if sb is not None and width == 1
+                    else f"first two bytes {int.from_bytes(sb, 'little')}"
+                    if sb is not None and len(sb) >= width
+                    else "input shorter than the selector"
                 )
+                case = "" if sb is None else f", case {idx}" if idx is not None else f", no case ({shown})"
                 # The encodings are named only when they differ (a harness regenerated across the change).
                 how = f" ({sel} selector)" if found_sel != selector else ""
                 return f"{n} dispatch cases{how}{case}"
@@ -1185,10 +1188,10 @@ def _crashed_entry_points(
       sanitizer's (`asan_*`, `ubsan_*`, `msan_*`, `lsan_*`: its function is the top frame of its own
       stack) or a Postcondition. Any other E-ACSL failure under the entry's name without a stack may be
       the wrapper's check before the body: not credited, with a note;
-    - its input selects a `single` dispatch case of the entry point (its first byte decoded with the
-      sidecar's `dispatch_selector`: the case index itself, nothing at or above the case count; modulo
-      the case count for a harness without the field) and the failure is in the entry's callee closure
-      but in none of the case's init helpers' closures (they run before the entry); this is the fallback
+    - its input selects a `single` dispatch case of the entry point (its first byte, or first two bytes
+      for `identity16`, decoded with the sidecar's `dispatch_selector`: the case index itself, nothing at
+      or above the case count; modulo the case count for a harness without the field) and the failure
+      is in the entry's callee closure but in none of the case's init helpers' closures (they run before the entry); this is the fallback
       when a tail call removed the entry's frame. A failure at an unknown location credits nothing (the
       harness body runs before the call) and gets a note. A `custom` or `sequence` case calls several functions in an order the sidecar does not record, so
       only the first two kinds of evidence credit it.
@@ -1236,9 +1239,9 @@ def _crashed_entry_points(
             break
         raw_path = art.get("artifact") or art.get("path")
         name = Path(str(raw_path)).name if raw_path else "artifact"
-        first_byte = _artifact_first_byte(raw_path, roots)
+        selector_bytes = _artifact_selector_bytes(raw_path, roots)
         problem = _artifact_identity_problem(
-            art, stamped_report, legacy_problem, harness_digest, n_cases, first_byte, selector
+            art, stamped_report, legacy_problem, harness_digest, n_cases, selector_bytes, selector
         )
         if problem:
             notes.append(f"{name}: not used ({problem})")
@@ -1267,11 +1270,11 @@ def _crashed_entry_points(
                         f"{name}: failed in {fn} ({fail_kind or 'unknown kind'}) with no stack frame: an E-ACSL "
                         "check under the entry's name may be its wrapper's, before the body ran"
                     )
-        if in_harness or not api_cases or first_byte is None or n_cases is None:
+        if in_harness or not api_cases or selector_bytes is None or n_cases is None:
             continue
-        sel_case = dispatch_case_of(first_byte, n_cases, selector)
+        sel_case = dispatch_case_of_bytes(selector_bytes, n_cases, selector)
         if sel_case is None:
-            continue  # the identity selector rejects this first byte: no case ran
+            continue  # the identity selector rejects these selector bytes: no case ran
         idx = sel_case
         case = api_cases[idx] if idx < len(api_cases) and isinstance(api_cases[idx], dict) else {}
         kind = str(case.get("kind") or "")

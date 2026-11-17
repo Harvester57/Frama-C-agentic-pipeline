@@ -36,7 +36,8 @@ seed inputs for each harness module, in the byte layout that harness reads.
 each harness's fuzz entry point is read for the way it turns the fuzz input into API arguments, case
 by case for a dispatch harness:
 
-  - the selector byte of a dispatch harness (case i of n is byte i);
+  - the selector byte of a dispatch harness (case i of n is byte i; above 256 cases, the two bytes
+    of i, little-endian: generate_harness.dispatch_selector_width);
   - leading scalar slots: `memcpy(&v, fuzz_buf [+ fuzz_off], sizeof v)` in order, filled from the
     recorded argument passed as `v` (or `&v`);
   - the rest of the input: an argument that is `fuzz_buf` itself (through casts or `+ fuzz_off`), a
@@ -79,6 +80,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import line_endings  # noqa: E402
 from framac_common import VA_PARAMS, atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from generate_harness import dispatch_selector_of, dispatch_selector_width  # noqa: E402
 
 SCHEMA_VERSION = 1
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
@@ -1240,9 +1242,17 @@ def _value(rec_args: dict[str, list], idx: int, want: str) -> bytes | None:
     return bytes.fromhex(hits[0][1]) if hits else None
 
 
-def seeds_for_case(selector: int | None, binding: dict[str, Any], calls: list[dict]) -> list[bytes]:
-    """Seed inputs of one case from the recorded calls of the functions it passes its input to."""
-    prefix = bytes([selector]) if selector is not None else b""
+def selector_width(sidecar: dict | None, harness_c: str | None = None) -> int:
+    """How many selector bytes a dispatch harness's inputs start with (1, or 2 above 256 cases)."""
+    return dispatch_selector_width(dispatch_selector_of(sidecar or None, harness_c))
+
+
+def seeds_for_case(selector: int | None, binding: dict[str, Any], calls: list[dict], width: int = 1) -> list[bytes]:
+    """
+    Seed inputs of one case from the recorded calls of the functions it passes its input to, behind
+    the case's `width` selector bytes (little-endian).
+    """
+    prefix = selector.to_bytes(width, "little") if selector is not None else b""
     out: list[bytes] = []
     by_fn: dict[str, list[dict]] = {}
     for c in binding["calls"]:
@@ -1338,14 +1348,15 @@ def _slot_value(slot: dict, args: dict) -> bytes | None:
     return _recorded(args, param, _LAYOUT_KINDS.get(kind, ()))
 
 
-def layout_seed(layout: dict, call_args: list[dict]) -> bytes | None:
+def layout_seed(layout: dict, call_args: list[dict], width: int = 1) -> bytes | None:
     """
     One seed for an API harness case from the recorded arguments of its calls (one dict per call of
-    the case, in order, then one per initializer call of `inits`): the selector byte, each slot's
-    value (fitted to its size; zeros when the call did not record it), then the rest of the input.
-    None when nothing recorded feeds the case, or a slot of unknown size has no recorded value.
+    the case, in order, then one per initializer call of `inits`): the selector (`width` bytes,
+    little-endian), each slot's value (fitted to its size; zeros when the call did not record it), then
+    the rest of the input. None when nothing recorded feeds the case, or a slot of unknown size has no
+    recorded value.
     """
-    out = bytearray([int(layout["selector"])])
+    out = bytearray(int(layout["selector"]).to_bytes(width, "little"))
     fed = False
     for slot in layout.get("slots") or []:
         args = call_args[slot["call"]] if slot["call"] < len(call_args) else {}
@@ -1421,11 +1432,12 @@ def layout_seeds(
     calls: list[dict],
     traces: list[list[dict]],
     variadic: dict[str, list[dict]] | None = None,
+    width: int = 1,
 ) -> dict[int, list[bytes]]:
     """
-    Seeds per selector of an API harness: single cases from recorded calls, sequences from traces,
-    `variadic` cases from the literal data of the target's call sites (`variadic`:
-    variadic_calls.load_cases). A case that initializes an object first takes that initializer's
+    Seeds per selector of an API harness (`width` selector bytes, layout_seed): single cases from
+    recorded calls, sequences from traces, `variadic` cases from the literal data of the target's call
+    sites (`variadic`: variadic_calls.load_cases). A case that initializes an object first takes that initializer's
     arguments from the trace call that initialized the same object; a recorded call no trace holds
     pairs with the initializer's recorded calls in turn (their inputs, a CBOR document for a
     decoder, are what the case decodes).
@@ -1438,7 +1450,7 @@ def layout_seeds(
         made: list[bytes] = []
         if lay.get("kind") == "variadic":
             for args in variadic_call_args(lay, variadic):
-                seed = layout_seed(lay, [args])
+                seed = layout_seed(lay, [args], width)
                 if seed is not None:
                     made.append(seed)
         elif lay.get("kind") == "sequence":
@@ -1458,7 +1470,7 @@ def layout_seeds(
                         at.append(k)
                         k += 1
                     if len(picked) == len(want):
-                        seed = layout_seed(lay, _init_args(lay, picked, trace, at))
+                        seed = layout_seed(lay, _init_args(lay, picked, trace, at), width)
                         if seed is not None:
                             made.append(seed)
                         break
@@ -1473,7 +1485,7 @@ def layout_seeds(
                             continue
                         args = c.get("args") or {}
                         traced.add(json.dumps(args, sort_keys=True))
-                        seed = layout_seed(lay, _init_args(lay, [args], trace, [j]))
+                        seed = layout_seed(lay, _init_args(lay, [args], trace, [j]), width)
                         if seed is not None:
                             made.append(seed)
             for n, rec in enumerate(by_fn.get(fn, [])):
@@ -1485,7 +1497,7 @@ def layout_seeds(
                     pool = by_fn.get(str(init.get("fn")), [])
                     if pool:
                         call_args[int(init["call"])] = pool[n % len(pool)].get("args") or {}
-                seed = layout_seed(lay, call_args)
+                seed = layout_seed(lay, call_args, width)
                 if seed is not None:
                     made.append(seed)
         out[int(lay["selector"])] = made
@@ -1520,7 +1532,8 @@ def write_layout_module(
     seeds: dict[str, bytes] = {}
     too_large = 0
     per_case: dict[str, dict[str, Any]] = {}
-    for sel, made in sorted(layout_seeds(layouts, calls, traces, variadic).items()):
+    width = selector_width(sidecar)
+    for sel, made in sorted(layout_seeds(layouts, calls, traces, variadic, width).items()):
         lay = next(lay for lay in layouts if int(lay["selector"]) == sel)
         per_case[str(sel)] = {"functions": list(lay.get("calls") or []), "kind": lay.get("kind"), "from_calls": 0}
         for s in made:
@@ -1571,11 +1584,12 @@ def write_module(module: str, sidecar: dict, harness_c: str, calls: list[dict], 
         cases = harness_cases(harness_c)
     bindings = [(sel, case_bindings(stmt, functions)) for sel, stmt in cases]
     max_size = int(sidecar.get("max_input_size") or 0) or 1 << 20
+    width = selector_width(sidecar, harness_c)
     seeds: dict[str, bytes] = {}
     too_large = 0
     per_case: dict[str, dict[str, Any]] = {}
     for sel, b in bindings:
-        made = seeds_for_case(sel, b, calls)
+        made = seeds_for_case(sel, b, calls, width)
         label = "all" if sel is None else str(sel)
         fns = sorted({c["fn"] for c in b["calls"]})
         per_case[label] = {"functions": fns, "slots": b["slots"], "from_calls": 0, "from_files": 0}
@@ -1587,7 +1601,7 @@ def write_module(module: str, sidecar: dict, harness_c: str, calls: list[dict], 
                 per_case[label]["from_calls"] += 1
             seeds.setdefault(hashlib.sha256(s).hexdigest(), s)
     for sel in whole_input_cases(bindings):
-        prefix = bytes([sel]) if sel is not None else b""
+        prefix = sel.to_bytes(width, "little") if sel is not None else b""
         for data in files:
             s = prefix + data
             if len(s) > max_size:

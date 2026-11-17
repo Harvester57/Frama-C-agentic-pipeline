@@ -127,11 +127,18 @@ DISPATCH_SELECTOR_IDENTITY = "identity"
 DISPATCH_SELECTOR_MODULO = "modulo"
 DISPATCH_MAX_CASES = 256
 DISPATCH_IDENTITY_MARKER = "dispatch selector: identity"
-# Both selector forms in harness text: `switch (harness_selector % <n>U)` (modulo) and
-# `switch (harness_selector) { /* dispatch selector: identity, <n> cases */` (identity).
+# Above DISPATCH_MAX_CASES cases (D7) the selector is the first two input bytes, little-endian
+# (`identity16`), with the same rejection at or above the case count. A harness with at most
+# DISPATCH_MAX_CASES cases keeps the one-byte selector, its text and its harness_digest. Two bytes
+# select at most DISPATCH_MAX_CASES_WIDE cases, the most a campaign can skip at run time.
+DISPATCH_SELECTOR_IDENTITY16 = "identity16"
+DISPATCH_MAX_CASES_WIDE = DISPATCH_RUNTIME_SKIP_MAX_CASES
+DISPATCH_IDENTITY16_MARKER = "dispatch selector: identity16"
+# The selector forms in harness text: `switch (harness_selector % <n>U)` (modulo) and
+# `switch (harness_selector) { /* dispatch selector: identity, <n> cases */` (identity, or identity16).
 DISPATCH_SWITCH_RE = re.compile(
     r"switch \(harness_selector % (?P<mod>\d+)U\)"
-    r"|switch \(harness_selector\) \{ /\* " + re.escape(DISPATCH_IDENTITY_MARKER) + r", (?P<ident>\d+) cases \*/"
+    r"|switch \(harness_selector\) \{ /\* dispatch selector: (?P<enc>identity|identity16), (?P<ident>\d+) cases \*/"
 )
 # Eva sharding (eva_shards.py): a shard is built with -DFRAMAC_EVA_SHARD and -DFRAMAC_EVA_SHARD_CASE_<k>
 # for each case it keeps. Without FRAMAC_EVA_SHARD every case is there, as before.
@@ -1041,7 +1048,7 @@ def dispatch_selector_of_text(text: str) -> tuple[str, int] | None:
     if not m:
         return None
     if m.group("ident") is not None:
-        return DISPATCH_SELECTOR_IDENTITY, int(m.group("ident"))
+        return str(m.group("enc")), int(m.group("ident"))
     return DISPATCH_SELECTOR_MODULO, int(m.group("mod"))
 
 
@@ -1049,22 +1056,47 @@ def dispatch_selector_of(sidecar: dict[str, Any] | None, text: str | None = None
     """
     The selector encoding of a dispatch harness: the sidecar's `dispatch_selector`; without a sidecar,
     the harness text's switch. A sidecar without the field is a harness generated before the field
-    existed, which selects modulo the case count.
+    existed, which selects modulo the case count. A crash artifact's stamp reads the same way.
     """
     if isinstance(sidecar, dict):
         raw = sidecar.get("dispatch_selector")
-        return DISPATCH_SELECTOR_IDENTITY if raw == DISPATCH_SELECTOR_IDENTITY else DISPATCH_SELECTOR_MODULO
+        return raw if raw in (DISPATCH_SELECTOR_IDENTITY, DISPATCH_SELECTOR_IDENTITY16) else DISPATCH_SELECTOR_MODULO
     found = dispatch_selector_of_text(text) if text else None
     return found[0] if found else DISPATCH_SELECTOR_MODULO
 
 
+def dispatch_selector_for(n_cases: int) -> str:
+    """The selector _build_dispatch_invocation generates for `n_cases` cases."""
+    return DISPATCH_SELECTOR_IDENTITY16 if n_cases > DISPATCH_MAX_CASES else DISPATCH_SELECTOR_IDENTITY
+
+
+def dispatch_selector_width(selector: str) -> int:
+    """How many leading input bytes select the case: 2 for `identity16`, else 1."""
+    return 2 if selector == DISPATCH_SELECTOR_IDENTITY16 else 1
+
+
 def dispatch_case_of(first_byte: int, n_cases: int, selector: str) -> int | None:
-    """The case an input whose first byte is `first_byte` runs, or None when the harness rejects it."""
+    """
+    The case an input whose selector value is `first_byte` runs (the first byte, or for `identity16`
+    the first two bytes little-endian: dispatch_case_of_bytes), or None when the harness rejects it.
+    """
     if n_cases <= 0:
         return None
-    if selector == DISPATCH_SELECTOR_IDENTITY:
+    if selector in (DISPATCH_SELECTOR_IDENTITY, DISPATCH_SELECTOR_IDENTITY16):
         return first_byte if first_byte < n_cases else None
     return first_byte % n_cases
+
+
+def dispatch_case_of_bytes(prefix: bytes, n_cases: int, selector: str) -> int | None:
+    """
+    The case an input starting with `prefix` runs: its first dispatch_selector_width(selector) bytes,
+    little-endian, decoded by dispatch_case_of. None when the input is shorter than the selector (the
+    harness rejects it) or the harness rejects the value.
+    """
+    width = dispatch_selector_width(selector)
+    if len(prefix) < width:
+        return None
+    return dispatch_case_of(int.from_bytes(prefix[:width], "little"), n_cases, selector)
 
 
 def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) -> str:
@@ -1073,7 +1105,10 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     (identity selector) and the rest of the input is the case's `fuzz_buf`/`fuzz_len`. A first byte at
     or above the case count runs no case and is rejected, so a case appended later never changes the
     case an existing input (corpus, seed, crash file) selects. One byte selects at most
-    DISPATCH_MAX_CASES cases: more is a ValueError, never a harness whose last cases are never fuzzed.
+    DISPATCH_MAX_CASES cases. Above that (D7), the first two input bytes, little-endian, are the case
+    index (`identity16`, marker DISPATCH_IDENTITY16_MARKER) and the case gets the input after them; a
+    harness with at most DISPATCH_MAX_CASES cases is generated exactly as before. More than
+    DISPATCH_MAX_CASES_WIDE cases is a ValueError, never a harness whose last cases are never fuzzed.
     Eva sees an unknown selector, so one analysis covers every case (the values at or above the count
     run nothing). Cases must not `return` (the fuzz side frees its buffer after).
 
@@ -1096,14 +1131,33 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     if not stmts:
         raise ValueError("entry_style 'dispatch' requires at least one --dispatch-case")
     n = len(stmts)
-    if n > DISPATCH_MAX_CASES:
+    if n > DISPATCH_MAX_CASES_WIDE:
         raise ValueError(
-            f"a dispatch harness selects its case with one input byte, so it holds at most {DISPATCH_MAX_CASES} "
-            f"cases; this one has {n}. Split the module into sub-module harnesses (--scope-file), each with at "
-            f"most {DISPATCH_MAX_CASES} cases"
+            f"a dispatch harness selects its case with at most two input bytes and skips at most "
+            f"{DISPATCH_MAX_CASES_WIDE} cases, so it holds at most {DISPATCH_MAX_CASES_WIDE} cases; this one has "
+            f"{n}. Split the module into sub-module harnesses (--scope-file), each with at most "
+            f"{DISPATCH_MAX_CASES_WIDE} cases"
         )
     case = "harness_selector"
-    switch_head = f"    switch (harness_selector) {{ /* {DISPATCH_IDENTITY_MARKER}, {n} cases */"
+    wide = dispatch_selector_for(n) == DISPATCH_SELECTOR_IDENTITY16
+    marker = DISPATCH_IDENTITY16_MARKER if wide else DISPATCH_IDENTITY_MARKER
+    switch_head = f"    switch (harness_selector) {{ /* {marker}, {n} cases */"
+    # The selector bytes leave the input before the case runs. The same number of lines either way.
+    prelude = (
+        [
+            "if (fuzz_len > 1) {",
+            "    uint16_t harness_selector = (uint16_t)(fuzz_buf[0] | (fuzz_buf[1] << 8));",
+            "    fuzz_buf += 2;",
+            "    fuzz_len -= 2;",
+        ]
+        if wide
+        else [
+            "if (fuzz_len > 0) {",
+            "    uint8_t harness_selector = fuzz_buf[0];",
+            "    fuzz_buf += 1;",
+            "    fuzz_len -= 1;",
+        ]
+    )
     n_words = (n + 63) // 64
     # The mask word of the selected case: word k for cases 64k..64k+63 (no comma, so the -D values
     # never pass through a comma-separated option list).
@@ -1116,10 +1170,7 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
     if runtime_skip:
         skip_guard = f"#if defined({DISPATCH_SKIP_MACRO}) || defined({DISPATCH_SKIP_FN})"
         lines = [
-            "if (fuzz_len > 0) {",
-            "    uint8_t harness_selector = fuzz_buf[0];",
-            "    fuzz_buf += 1;",
-            "    fuzz_len -= 1;",
+            *prelude,
             skip_guard,
             "    int harness_skip_case = 0;",
             f"#ifdef {DISPATCH_SKIP_MACRO}",
@@ -1159,10 +1210,7 @@ def _build_dispatch_invocation(cases: list[str], *, runtime_skip: bool = False) 
         return "\n    ".join(lines)
     # Joined with a newline plus 4 spaces under the template's indent, so nested lines carry 4 more.
     lines = [
-        "if (fuzz_len > 0) {",
-        "    uint8_t harness_selector = fuzz_buf[0];",
-        "    fuzz_buf += 1;",
-        "    fuzz_len -= 1;",
+        *prelude,
         f"#ifdef {DISPATCH_SKIP_MACRO}",
         f"    /* {DISPATCH_SKIP_ALL_MARKER}: {DISPATCH_SKIP_MACRO}_<k> holds cases 64k..64k+63 */",
     ]
@@ -2744,8 +2792,9 @@ def _generate_module_harness(
         **prelude_fields,
     }
     if entry_style == "dispatch" and target_fuzzer_record is None:
-        # The harness written above selects with _build_dispatch_invocation's identity selector.
-        sidecar["dispatch_selector"] = DISPATCH_SELECTOR_IDENTITY
+        # The harness written above selects with _build_dispatch_invocation's identity selector, two
+        # bytes wide above DISPATCH_MAX_CASES cases.
+        sidecar["dispatch_selector"] = dispatch_selector_for(len(norm_dispatch_cases))
     if target_fuzzer_record is not None:
         sidecar["target_fuzzer"] = dict(target_fuzzer_record)
     write_sidecar(harness_meta_file, sidecar)
@@ -3071,7 +3120,8 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help=(
             "One API-call case for --entry-style=dispatch (repeatable): C statements using fuzz_buf and "
-            "fuzz_len (the input after the selector byte); must respect the callee's contract and never return. "
+            "fuzz_len (the input after the selector bytes: one, two above 256 cases); must respect the "
+            "callee's contract and never return. "
             "With --api: a hand-written case appended after the generated ones (for a function in api_skipped), "
             "one line of C; kept by a later --api run without the flag, replaced by one with it "
             "(--dispatch-case '' drops them)"
