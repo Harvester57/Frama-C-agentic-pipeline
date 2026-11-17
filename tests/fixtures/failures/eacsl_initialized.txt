@@ -1,0 +1,5 @@
+src/demo.c: In function 'read_uninit'
+src/demo.c:92: Error: Assertion failed:
+	The failing predicate is:
+	rte/initialization:
+		\initialized(&v).

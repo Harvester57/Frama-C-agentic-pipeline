@@ -149,7 +149,7 @@ For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickr
 
 | Status | Meaning |
 | :--- | :--- |
-| `crash_found` | At least one `crash-*` artifact in any round. Each listed artifact was replayed once (`reproducible`), its E-ACSL failure parsed (`failure`: file, line, function, kind, predicate), and fingerprinted. |
+| `crash_found` | At least one `crash-*` artifact in any round. Each listed artifact was replayed once (`reproducible`), its failure parsed (`failure`: file, line, function, kind, alarm_kind, predicate), and fingerprinted. A sanitizer failure has `kind` `asan_<kind>` or `ubsan_runtime_error`. A LeakSanitizer leak has `kind` `lsan_direct_leak` or `lsan_indirect_leak` and `alarm_kind` `memory_leak`: it is a candidate with `property.kind` `memory_leak`, verified by its allocation stack (CWE-401), and it links no ledger unit, since no obligation class covers leaks. |
 | `timeout_found` / `oom_found` | Per-input timeout or RSS limit hit. A termination/DoS lead, not a memory-safety bug. |
 | `clean` | No failure within the time budget. The corpus in `workspace/corpus/<mod>/` becomes the dynamic anti-hallucination corpus for `/framac-wp`. Fuzzing is not proof. |
 | `fuzzer_error` / `compile_error` / `sandbox_unavailable` | The campaign did not run to completion. Never read this as clean. |

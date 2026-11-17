@@ -1,0 +1,7 @@
+src/demo.c: In function 'checked_div'
+src/demo.c:86: Error: Assertion failed:
+	The failing predicate is:
+	rte/division_by_zero:
+		y != 0.
+	With values at failure point:
+	- y: 0

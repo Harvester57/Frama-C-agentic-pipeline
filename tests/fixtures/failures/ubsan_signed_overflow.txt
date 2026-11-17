@@ -1,0 +1,4 @@
+src/demo.c:71:12: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+    #0 0x55555558c100 in add_wrap src/demo.c:71:12
+    #1 0x55555558c200 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/demo.c:71:12 in add_wrap

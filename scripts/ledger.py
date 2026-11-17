@@ -476,8 +476,12 @@ def tool_evidence_on_verified_candidate(
         return "known"
 
     # What a verifier cited about a `harness_induced` rejection speaks for the harness it was made on.
-    verifier_checked = not override_checked and not (rej_class == "harness_induced" and harness_changed) and any(
-        r.get("refutation_basis") == "checked" and source_of(r) not in INGEST_RAISED_BASIS_SOURCES for r in recs
+    verifier_checked = (
+        not override_checked
+        and not (rej_class == "harness_induced" and harness_changed)
+        and any(
+            r.get("refutation_basis") == "checked" and source_of(r) not in INGEST_RAISED_BASIS_SOURCES for r in recs
+        )
     )
     reason: str | None = None
     if verifier_checked:
@@ -1131,16 +1135,24 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 cls = goal_obligation_class(
                     {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
                 )
-                linked = [
-                    u["coverage_id"]
-                    for u in units_for_function(units, file, source_fn)
-                    if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
-                ]
+                # A leak has no obligation class (D5): it links no unit, whatever the units of its function are.
+                leak = failure.get("alarm_kind") == "memory_leak"
+                linked = (
+                    []
+                    if leak
+                    else [
+                        u["coverage_id"]
+                        for u in units_for_function(units, file, source_fn)
+                        if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
+                    ]
+                )
                 proposed = "confirmed" if art.get("reproducible") else "needs_validation"
                 notes = [] if art.get("reproducible") else ["crash did not reproduce on replay"]
                 if source_fn != function:
                     notes.append(f"reported in {function}, which is {source_fn} in the source")
-                if not linked:
+                if leak:
+                    notes.append("a memory leak has no obligation class: no unit is linked (D5)")
+                elif not linked:
                     notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
                 note = "; ".join(notes) or None
                 prior = candidates.get(fp)

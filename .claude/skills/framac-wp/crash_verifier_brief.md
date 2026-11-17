@@ -69,6 +69,13 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
      - Optionally write a unified diff fix against `workspace/baseline/` to `agents/{agent_id}/scratch/{candidate_short}.fix.patch` and reference it in `record.remediation.fix_patch` (the parent promotes it to `agents/{agent_id}/artifacts/` and never applies it to `workspace/work/`). The fix belongs at or just after the decision point (the missing validation), not at the sink.
      - Return `decision: "confirmed"`.
 
+### Memory Leaks (`property.kind: memory_leak`)
+
+A leak candidate comes from LeakSanitizer: its failure kind is `lsan_direct_leak` or `lsan_indirect_leak`, and its alarm kind is `memory_leak`. No obligation class covers leaks, so the candidate links no ledger unit and gates no WP task. Verify it on its own:
+- Replay the reproducer as in Case A. Then read the allocation stack that LeakSanitizer printed (the `Direct leak ... allocated from:` block). The candidate's location is the first frame of that stack that is neither a runtime frame, a harness frame nor an allocator (`malloc`, `calloc`, `strdup` and the like).
+- A leak of the harness's own allocation, or of an object the harness creates and never releases, is `harness_induced`: repair the harness and re-fuzz.
+- A leak the target makes on a call a legitimate caller can make, with no release on the path the input takes, is a defect: `confirmed`, with CWE-401 (Missing Release of Memory after Effective Lifetime) named in `record.reason`. The allocation site is the sink of `record.trace`.
+
 ### Case B — Witness-Less Candidate (`origin: "eva"`, `"prover"`, or `"breaker"` `fault_hypothesis`)
 
 1. **Static Source Review:**

@@ -1,0 +1,8 @@
+=================================================================
+==4251==ERROR: AddressSanitizer: global-buffer-overflow on address 0x000000c0e0a0 at pc 0x55555558a4f1 bp 0x7ffd4c2f0b20 sp 0x7ffd4c2f0b18
+READ of size 4 at 0x000000c0e0a0 thread T0
+    #0 0x55555558a4f0 in global_overflow src/demo.c:59:12
+    #1 0x55555558a5c0 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+    #2 0x55555558a700 in main
+
+0x000000c0e0a0 is located 0 bytes to the right of global variable 'table' defined in 'src/demo.c:5:5' (0xc0e080) of size 32

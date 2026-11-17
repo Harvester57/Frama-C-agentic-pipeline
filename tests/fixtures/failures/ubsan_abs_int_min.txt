@@ -1,0 +1,4 @@
+src/demo.c:81:25: runtime error: negation of -2147483648 cannot be represented in type 'int'; cast to an unsigned type to negate this value to itself
+    #0 0x55555558c500 in abs_min src/demo.c:81:25
+    #1 0x55555558c600 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/demo.c:81:25 in abs_min

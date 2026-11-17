@@ -1,0 +1,9 @@
+=================================================================
+==5151==ERROR: LeakSanitizer: detected memory leaks
+
+Indirect leak of 8 byte(s) in 1 object(s) allocated from:
+    #0 0x55555558e111 in __interceptor_malloc
+    #1 0x55555558e222 in heap_overflow src/demo.c:45:15
+    #2 0x55555558e333 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+
+SUMMARY: AddressSanitizer: 8 byte(s) leaked in 1 allocation(s).
