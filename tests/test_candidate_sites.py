@@ -244,6 +244,44 @@ def test_a_code_fault_at_a_known_site_links_the_site_candidates_key(ber_run):
     assert units_by_id(ber_run)[RTE_UNIT]["result_fingerprints"] == [key]
 
 
+def test_an_eva_invalid_in_the_module_loop_at_a_known_site_links_the_site_candidates_key(ber_run):
+    """The module loop (cmd_ingest_eva) is the Eva path that a unit's own invalid alarm takes."""
+    from test_ledger import eva_report
+
+    key = _fuzz(ber_run, "a", engine="sanitizers", predicate=PRED_SAN, line=42)
+    base = eva_report()["invalid_alarms"][0]
+    alarm = {**base, "kind": "mem_access", "annotation": PRED_EVA, "line": 42}
+    report = ber_run / "workspace" / "reports" / "eva" / "snmp.json"
+    write_json(report, eva_report(invalid_alarms=[alarm]))
+    L.cmd_ingest_eva([report])
+    cands = _candidates(ber_run)
+    assert list(cands) == [key]
+    assert [o["origin"] for o in cands[key]["observations"]] == ["fuzz", "eva"]
+    # The unit carries the candidate's key, not the Eva detection's own fingerprint.
+    assert units_by_id(ber_run)[RTE_UNIT]["result_fingerprints"] == [key]
+
+
+def test_the_landing_candidate_is_the_key_or_the_unverified_site_candidate():
+    """Callers read a candidate's state through landing_candidate, the rule upsert_candidate records by."""
+    site = "src/snmp/ber.c#ber_decode_len@abcdef0123"
+    unverified = {"fingerprint": "K1", "status": "unverified", "site": site}
+    verified = {"fingerprint": "K2", "status": "verified", "site": site}
+    candidates = {"K1": unverified}
+    assert L.landing_candidate(candidates, "K1", None) is unverified  # its own key
+    assert L.landing_candidate(candidates, "K9", site) is unverified  # another key, the site's unverified candidate
+    assert L.landing_candidate(candidates, "K9", None) is None  # no site: a new candidate
+    assert L.landing_candidate({"K2": verified}, "K9", site) is None  # a verified candidate is never landed on
+
+
+def test_a_reproducer_already_listed_at_the_site_is_not_recorded_twice(ber_run):
+    key = _fuzz(ber_run, "a", engine="sanitizers", predicate=PRED_SAN, line=42)
+    # The same crash input, reported by E-ACSL at the same statement, lands on the same candidate.
+    _fuzz(ber_run, "a", engine="eacsl", predicate=PRED_EACSL, line=42)
+    cand = _candidates(ber_run)[key]
+    assert len(cand["reproducers"]) == 1
+    assert len(cand["observations"]) == 2
+
+
 def test_a_hypothesis_with_a_line_merges_by_site(ber_run):
     """A prover's code fault carries a line, so it merges by site (D1c), not by the function-and-kind rule."""
     from test_ledger_p1 import _code_fault_report, _prover_result

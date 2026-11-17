@@ -327,6 +327,21 @@ def _observe(cand: dict, fp: str, origin: str, engine: str | None, prop: dict, t
     )
 
 
+def landing_candidate(candidates, fp, site: str | None) -> dict | None:
+    """
+    The candidate a detection with fingerprint `fp` at `site` is recorded on, by upsert_candidate's rule: the
+    candidate keyed by `fp`, else the unverified candidate at the site. None when the detection opens a new one.
+    Callers read a candidate's state through this before recording the detection.
+    """
+    cand = candidates.get(fp)
+    if cand is None and site is not None:
+        cand = next(
+            (c for c in candidates.values() if c.get("site") == site and c.get("status") == "unverified"),
+            None,
+        )
+    return cand
+
+
 def upsert_candidate(
     candidates,
     fp,
@@ -348,12 +363,7 @@ def upsert_candidate(
     is not always `fp`: a detection at the `site` of an unverified candidate that `fp` does not key takes
     that candidate (D1, F5). Callers use the returned candidate's fingerprint for everything after this.
     """
-    cand = candidates.get(fp)
-    if cand is None and site is not None:
-        cand = next(
-            (c for c in candidates.values() if c.get("site") == site and c.get("status") == "unverified"),
-            None,
-        )
+    cand = landing_candidate(candidates, fp, site)
     if cand is None:
         cand = {
             "fingerprint": fp,
@@ -1196,7 +1206,9 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 elif not linked:
                     notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
                 note = "; ".join(notes) or None
-                prior = candidates.get(fp)
+                # The state read is of the candidate this detection lands on (its key, or the site's unverified one).
+                site = _candidate_site(file, failure.get("line"), source_fn, index)
+                prior = landing_candidate(candidates, fp, site)
                 already_listed = prior is not None and artifact_rel in prior["reproducers"]
                 rejected_before = reopen and prior is not None and _rejected_resolution(prior, findings) is not None
                 cand = upsert_candidate(
@@ -1214,7 +1226,7 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     linked,
                     note,
-                    site=_candidate_site(file, failure.get("line"), source_fn, index),
+                    site=site,
                     engine=_detection_engine(art, report),
                 )
                 # A detection at a known site lands on that site's candidate: its key, not `fp`, from here on.
