@@ -313,6 +313,24 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
   - On real mpack the recording went from 3 calls to 55,714 (9,641 unique), covering 189 of 342 functions. The rest are `MPACK_INLINE` header functions, which the recorder cannot wrap.
   - A run that recorded before the fix must rerun `seed_harvest.py record`, then regenerate its `--api` harnesses so the seeds bind to cases.
 
+### Symptom: An `--api` Campaign Stops With `Too many open files: /framac-run/workspace/corpus/<mod>; exiting`
+- **Seen on:** mpack run-3, Phase 1, 2026-11-17. `workspace/reports/fuzz/libmpack_a__mpack_writer_3.json` has status `fuzzer_error` and returncode 1 after about 64k executions. `libmpack_a__mpack_reader` shows the same message.
+- **Cause:** pipeline defect in `scripts/api_harness.py`.
+  - In `harness_libmpack_a__mpack_writer_3.c`, `case 7U` called `mpack_writer_init_filename(&c0a0, (char *)c0a1)` with the rest of the input as the path, and never called `mpack_writer_destroy`.
+  - Every execution created or truncated a file the fuzzer named, and leaked its `FILE *`, until `RLIMIT_NOFILE` 1024 (`sandbox_exec.Limits.open_files`) was exhausted.
+  - `mpack_reader_init_filename`, `mpack_tree_init_filename` and the `*_init_file` aliases had the same shape.
+  - `sandbox_exec` has no filesystem isolation. The campaign's working directory is `/tmp/fuzz_scratch_*` in the container, but the coverage, replay, minimize and guardrail scratch directories sit under the run directory, and absolute or `../` names reach `/framac-run`. No stray file was found in run-3.
+- **Open pipeline bug:** fixed on branch `sup/mpack-harness-sources-and-fd-leak` (`7dc1be4`), held until run-3 ends and not yet merged.
+  - `api_harness.path_parameter` matches a byte-string parameter named like a path (`filename`, `file_name`, `fname`, `path`, `pathname`, `filePath`, `dirname`). Such a function goes to `api_skipped` with the reason "takes a file-system path ..." and is never chosen as an initializer or constructor. The match is on the name only, so a non-file `path` string is skipped too and stays a visible reach gap.
+  - `struct_destructors` finds, per struct type, the unit's destructor, which may be outside the module's scope. An initializer's object is then released after the call; a destructor's own case and opaque handles are released only once.
+  - On run-3's inputs, only the six `*_init_file*` functions become skipped, and `mpack_writer_destroy` and `mpack_tree_destroy` releases are added.
+  - Fixture: 571 files and an exhausted fd table before the fix, 0 files and 3 fds after.
+  - Tests are in `tests/test_api_harness_file_paths.py`.
+- **Still open:**
+  - The skipped functions are reach gaps: exempt them, or write a `custom` case on a fixed scratch file.
+  - Struct objects shared in sequence cases are still not released, which matters under LeakSanitizer.
+  - Regenerating the harness renumbers the selectors, so the module's existing corpus becomes stale.
+
 ### Symptom: A Module's Fuzz Campaign Starts From an Empty Corpus Although the Target Has Tests or Shipped Corpora, and No Log Says Why
 - **Cause:** in `templates/pipeline.mk`, the `seeds` recipe and the two seed lines of `fuzz-%` (`seed_harvest.py write`, `fuzz_assets.py write`) start with `-`, and the `seeds` loop ends in `|| true`. Seeds are optional, so the recipes are non-blocking on purpose, but a failed write was invisible. Both writes stopped at the first exception with a traceback and exit 1, after deleting the module's old inputs, so `workspace/seeds/<mod>/` or `workspace/imported_corpus/<mod>/` could hold part of the new inputs while their per-module reports kept their old content. `fuzz_assets.py write` also raised on a malformed `workspace/reports/fuzz_assets.json`; `seed_harvest.py write` silently skipped a requested module with no sidecar. The fuzz report said nothing about seeds.
 - **Fix (fixed, K1 of [`../plans/templates-and-stubs-improvement-plan.md`](../plans/templates-and-stubs-improvement-plan.md), commit 93446b9):** `scripts/seed_harvest.py` and `scripts/fuzz_assets.py` `write` record each module's outcome (`ok`, `skipped` with a reason, `failed` with the exception) in `workspace/reports/seed_status/<writer>/<mod>.json`. An exception fails only that module, and the write exits 1; the Make lines keep `-`, so a seed failure never fails the target. `scripts/run_eacsl_fuzz.py campaign` copies both statuses into `workspace/reports/fuzz/<mod>.json` as `seeds: {status, reason, writers}`; a writer that recorded no status while the campaign reads `--extra-corpus` counts as `failed`. Read `seeds.status` before tuning a module whose corpus is empty. A status file left over from an older run is shown as is, with its `generated_at`.
