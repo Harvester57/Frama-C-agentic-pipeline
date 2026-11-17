@@ -140,30 +140,46 @@ def _mark_rewrite(run: Path, mod: str, on: bool) -> None:
     path.write_text(json.dumps(report), encoding="utf-8")
 
 
-def test_build_check_sends_a_missed_const_union_to_the_rewrite_not_to_the_sanitizers(tmp_path):
+def test_build_check_names_a_missed_const_union_as_a_gap_and_keeps_the_sanitizers_way_forward(tmp_path):
     run = _make_run(tmp_path)
     _failed_build(run, "log", UNION_LOG, fallback=False)
     _mark_rewrite(run, "log", True)
     out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
     row = out["modules"]["log"]
     assert (row["status"], row["reason_code"], row["ok"]) == ("build_failed", "eacsl_static_const_union", False)
-    assert "next_step" not in row
-    assert "fc_cpp_wrapper_eacsl.py" in row["reason"] and "extend the rewrite" in row["reason"]
-    assert "sanitizers" not in row["reason"]
+    assert row["rewrite_missed"] is True
+    assert row["next_step"] == pm.sanitizers_command("log")
+    reason = row["reason"]
+    # In order: what failed, the rewrite was on and missed it (three forms), the gap to record, the way on.
+    marks = ["E-ACSL bug", "fc_cpp_wrapper_eacsl.py", "without `static`", "typedef", "`const` placed after",
+             "pipeline gap", "harnesses-and-seeds.md", "sanitizers", "loses the E-ACSL checks"]  # fmt: skip
+    positions = [reason.index(m) for m in marks]
+    assert positions == sorted(positions)
     assert not validate_artifacts.validate_build_check(out)
-    # The gate stamp keeps the row; a refused fuzz-<mod> shows the first error, and no sanitizers command.
+    # The gate stamp keeps the row; a refused fuzz-<mod> names the sanitizers command, as for any known failure.
     gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))["build_check"]
     assert gates["modules"]["log"]["reason_code"] == "eacsl_static_const_union"
-    assert "next_step" not in gates["modules"]["log"]
+    assert gates["modules"]["log"]["next_step"] == row["next_step"]
     assert not validate_artifacts.validate_phase0_gates(gates)
-    (reason,) = phase0_gates.check(run, "log", ("build_check",))
-    assert reason.startswith("build-check failed for log: build_failed (") and "implicit cast" in reason
-    assert "sanitizers" not in reason
+    (gate,) = phase0_gates.check(run, "log", ("build_check",))
+    assert gate.startswith("build-check failed for log: build_failed (") and row["next_step"] in gate
 
-    # With the switch off, the module gets the sanitizers command as before.
+    # With the switch off (or a report from before O9), the row is the plain known failure.
     _mark_rewrite(run, "log", False)
-    row = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)["modules"]["log"]
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    row = out["modules"]["log"]
     assert row["next_step"] == pm.sanitizers_command("log") and "recorded choice" in row["reason"]
+    assert "rewrite_missed" not in row and "fc_cpp_wrapper_eacsl.py" not in row["reason"]
+    assert not validate_artifacts.validate_build_check(out)
+
+
+def test_build_check_schema_rejects_a_false_rewrite_missed(tmp_path):
+    run = _make_run(tmp_path)
+    _failed_build(run, "log", UNION_LOG, fallback=False)
+    _mark_rewrite(run, "log", True)
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    out["modules"]["log"]["rewrite_missed"] = False
+    assert validate_artifacts.validate_build_check(out)
 
 
 def _build_report(run: Path, mod: str, comp: dict) -> None:
