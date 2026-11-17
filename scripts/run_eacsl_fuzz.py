@@ -558,7 +558,7 @@ def run_campaign_rounds(
     - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
       the next round on, so a shallow bug stops ending every run and the other cases get the rest of
       the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
-      MIN_ROUND_WALL_S seconds are left, a round's new crashing cases cannot be skipped
+      MIN_ROUND_CPU_S CPU-seconds (wall seconds times `workers`) are left, a round's new crashing cases cannot be skipped
       (`unskippable_case`: cases `skippable` and above, for a harness generated before every case
       was skippable), or a rebuild fails. In the last two, the time left runs in fork mode with
       crashes ignored on the last binary built (`fork_fallback`).
@@ -628,7 +628,7 @@ def run_campaign_rounds(
         new = [c for c in fresh if c < skippable]
         if last.get("status") == "insufficient_memory" or not fresh:
             break
-        if max_time - spent < MIN_ROUND_WALL_S:
+        if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S:
             rnd["stopped"] = "time_budget_spent"
             break
         if not new:
@@ -650,8 +650,8 @@ def run_campaign_rounds(
             binary = next_binary
 
     fallback: dict | None = None
-    left = int(max_time - spent)
-    if fallback_reason and left >= MIN_ROUND_WALL_S:
+    left = max(MIN_ROUND_WALL_S, int(max_time - spent))
+    if fallback_reason and (max_time - spent) * max(1, workers) >= MIN_ROUND_CPU_S:
         # The cases still crashing cannot be skipped: the time left goes to fork mode, which keeps
         # fuzzing past each crash, on the last binary built (its skipped cases stay skipped).
         started = time.monotonic()
