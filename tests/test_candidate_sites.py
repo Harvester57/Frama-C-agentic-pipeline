@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 
 import pytest
 
@@ -333,6 +334,77 @@ def test_link_related_links_two_candidates_of_one_reproducer(ber_run):
     # Once: a second run adds nothing.
     assert L.cmd_link_related(index_path)["links_added"] == 0
     assert list(validate_candidates(load(ber_run / "candidates.json"))) == []
+
+
+def test_a_duplicate_verdict_on_a_related_candidate_leaves_one_finding(ber_run):
+    """D17: the second engine's candidate of one bug is rejected as `duplicate`, and the report lists one finding."""
+    import generate_report as G
+    from conftest import confirmed_record, rejected_record
+
+    fp_eac = _fuzz(ber_run, "eac", engine="eacsl", predicate=PRED_EACSL, line=42)
+    fp_san = _fuzz(ber_run, "san", engine="sanitizers", predicate=PRED_SAN_NEXT, line=47)
+    index = {
+        "by_fingerprint": {
+            fp_eac: {
+                "module": "snmp",
+                "status": "crash_found",
+                "cross_engine": {
+                    "engine": "sanitizers",
+                    "status": "crash_found",
+                    "failures": [
+                        {
+                            "fingerprint": fp_san,
+                            "file": "/framac-run/workspace/work/src/snmp/ber.c",
+                            "line": 47,
+                            "function": "ber_decode_len",
+                            "kind": "mem_access",
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    index_path = ber_run / "workspace" / "reports" / "replay" / "index.json"
+    write_json(index_path, index)
+    L.cmd_link_related(index_path)
+    # The first verdict is already recorded: a confirmed finding of the eacsl candidate. The files its record
+    # cites must exist under the run directory (validate_findings).
+    crash = b"\x30"
+    first = confirmed_record(fp_eac)
+    first["reproducers"][0].update(sha256=hashlib.sha256(crash).hexdigest(), size_bytes=len(crash))
+    write_json(ber_run / "findings.json", [first])
+    for rel_path, data in (
+        ("agents/verifier-3/artifacts/notes.txt", b"Harness bug.\n"),
+        ("workspace/reports/fuzz/snmp.json", b'{"module": "snmp"}\n'),
+        ("workspace/crashes/snmp/crash-1", crash),
+    ):
+        (ber_run / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (ber_run / rel_path).write_bytes(data)
+    rec = rejected_record(fp_san)
+    rec["location"] = {"file": "src/snmp/ber.c", "line": 47, "function": "ber_decode_len"}
+    rec["property"] = {"kind": "mem_access", "predicate": PRED_SAN_NEXT}
+    rec["rejection_class"] = "duplicate"
+    rec["reason"] = f"The same reproducer and root cause as {fp_eac}, reported by E-ACSL at line 42."
+    rec["linked_units"] = [RTE_UNIT]
+    res = ber_run / "agents" / "verifier-dup" / "scratch" / "verifier_result.json"
+    write_json(
+        res,
+        {
+            "role": "crash_verifier",
+            "agent_id": "verifier-dup",
+            "candidate_fingerprint": fp_san,
+            "decision": "rejected",
+            "refingerprint_reason": None,
+            "record": rec,
+        },
+    )
+    out = L.cmd_ingest_verifier(res, replay_reports=[])
+    assert out["decision"] == "rejected"
+    findings = {f["fingerprint"]: f for f in load(ber_run / "findings.json")}
+    assert findings[fp_san]["verdict"] == "rejected" and findings[fp_san]["rejection_class"] == "duplicate"
+    report = G.render_findings_detail(list(findings.values()), ber_run)
+    assert report.count("\n## ") == 1
+    assert f"Related candidates: `{fp_san}`" in report
 
 
 def test_candidates_without_site_load_and_validate(run_dir):

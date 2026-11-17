@@ -35,6 +35,8 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
    - Start from the facts:
      - the existing fuzz report in `tool_outputs`;
      - the deterministic replay the parent already ran for this candidate. Look it up in `workspace/reports/replay/index.json`, which maps fingerprints to replay reports. Each artifact records `reproducible`, the parsed `failure` and the fingerprint.
+     - the candidate's `observations`: every detection that landed on its statement site, with the engine and origin that made it. One site is one candidate, so a sanitizer and E-ACSL report of the same statement appear here together.
+     - the candidate's `related` list (`ledger.py link-related`): candidates that another engine reports on the same reproducer, in the same function. A related candidate that is already verified with the same root cause makes this one a duplicate: reject it as `duplicate` and name that candidate's fingerprint in `record.reason`. The cost is one verifier run for the second candidate: its verifier reads the first verdict and rejects the second as `duplicate`.
    - To replay the reproducer(s) yourself, for example after editing a seed, reuse the module's own build. Take its path from `compile.binary` in `workspace/reports/fuzz/{module_name}.json`; it is usually `workspace/harnesses/fuzz_{module_name}.e-acsl`:
      ```text
      python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py replay --module {module_name} --inputs <reproducer files> --binary <compile.binary> --out-json agents/{agent_id}/scratch/replay_{module_name}.json
