@@ -61,8 +61,9 @@ At the user's request, a read-only subagent grouped the 106 Phase 1 artifacts an
 ## Findings so far
 
 - **Confirmed (1, in the example program, not the library):** `examples/sax-example.c:186`, `main()` uses `stat.st_size` without checking `open()` or `fstat()` (`run-3`'s bug). The verifier rated it `medium` because the pipeline treats the example's `argv` as an untrusted surface. It does not affect the MPack library. Open gap recorded in [`../troubleshooting/phase0-build-and-model.md`](../troubleshooting/phase0-build-and-model.md) ("A Bug in a Target's Example Program...").
-- **Pending:** the unchecked `mmap()` in the same example (`mpack_reader_init_data::mem_access::22aa038aa3`).
-- **Library:** 23 candidates rejected by about 15:05 (harness-made or toolchain artifacts), 3 breakers clean. No library defect so far, as the pre-assessment expected.
+- **Confirmed (2, also in the example program):** the unchecked `mmap()` in the same `main()` (`sax-example.c:186-187`): a directory path makes `mmap()` return `MAP_FAILED`, which reaches `mpack_reader_init_data` and overflows `end = data + count`. Severity `medium`. The verifier's decision point names `main()`, but the record's location and title stay in `src/mpack/mpack-reader.c:62`, so it reads like a library bug; added to the example-program gap entry. Its first draft (16:05) had severity `high` and a placeholder decision point; the final result (16:09) is sound.
+- **Library:** 41 candidates rejected by about 16:05 (harness-made, `contract_overconstraint` or toolchain artifacts), 4 breakers clean. No library defect so far, as the pre-assessment expected.
+- **Weak record:** the `mpack_tree_set_limits` rejection (correct: `mpack-node.c:1096` asserts `max_message_nodes > 0`) has `refutation_basis: model`, `method: source_review`, and a notes line with no reasoning; the gate accepts a rejection with no stated reason.
 
 ## Model struggles that are not pipeline bugs
 
