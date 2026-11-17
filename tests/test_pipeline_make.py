@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+import crash_replay
 import generate_harness
 import ledger
 import phase0_gates
@@ -2024,7 +2025,7 @@ def test_replay_of_a_unit_candidate_builds_its_harness_module(tmp_path, monkeypa
         built.append((module, Path(out_bin).as_posix()))
         return {"binary": None, "reason": "not built in this test"}
 
-    monkeypatch.setattr(fuzz, "prepare_replay_binary", fake_prepare)
+    monkeypatch.setattr(crash_replay, "prepare_replay_binary", fake_prepare)
     (run / "crash-1").write_bytes(b"x")
     cands = run / "candidates.json"
     write_json(
@@ -2058,7 +2059,7 @@ def test_replay_of_a_unit_candidate_builds_the_harness_holding_its_function(tmp_
         built.append(module)
         return {"binary": None, "reason": "not built in this test"}
 
-    monkeypatch.setattr(fuzz, "prepare_replay_binary", fake_prepare)
+    monkeypatch.setattr(crash_replay, "prepare_replay_binary", fake_prepare)
     (run / "crash-1").write_bytes(b"x")
     cands = run / "candidates.json"
     loc = {"file": "src/encode.c", "function": "enc_run", "line": 1}

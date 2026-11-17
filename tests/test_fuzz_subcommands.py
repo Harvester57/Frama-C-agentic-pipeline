@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import crash_replay
 import fuzz_build
 import ledger
 import run_eacsl_fuzz as R
@@ -731,7 +732,7 @@ def test_minimize_input_runs_cvise_and_writes_a_verified_min(tmp_path, monkeypat
     tool = tmp_path / "cvise"
     tool.write_text("#!/bin/sh\n", encoding="utf-8")
     fake = FakeCviseSandbox()
-    monkeypatch.setattr(R, "find_creduce", lambda: str(tool))
+    monkeypatch.setattr(crash_replay, "find_creduce", lambda: str(tool))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     rep = R.minimize_input(binary, crash, tmp_path / "scratch", module="snmp", fingerprint=FP_PARSE)
     assert rep["status"] == "ok" and rep["reproduced"] is True
@@ -748,7 +749,7 @@ def test_minimize_input_runs_cvise_and_writes_a_verified_min(tmp_path, monkeypat
 
 
 def test_minimize_input_reports_missing_tool(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "find_creduce", lambda: None)
+    monkeypatch.setattr(crash_replay, "find_creduce", lambda: None)
     binary = tmp_path / "b"
     binary.write_bytes(b"x")
     crash = tmp_path / "crash-a"
@@ -784,7 +785,7 @@ def test_minimize_candidates_writes_index_and_min_files(run_dir, monkeypatch):
     tool = run_dir / "cvise"
     tool.write_text("#!/bin/sh\n", encoding="utf-8")
     fake = FakeCviseSandbox()
-    monkeypatch.setattr(R, "find_creduce", lambda: str(tool))
+    monkeypatch.setattr(crash_replay, "find_creduce", lambda: str(tool))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     rc = R.main(["minimize-candidates", "--selftest-json", "none.json"])
     assert rc == 1  # `ghost` has no build spec -> error, but the others minimize
