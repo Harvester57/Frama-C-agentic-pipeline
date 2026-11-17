@@ -25,6 +25,7 @@ from eacsl_toolchain import (
 from failure_identity import failure_fingerprint as _failure_fingerprint
 from failure_identity import (
     needs_attribution,
+    parse_eacsl_resource_abort,
     parse_runtime_failure,
     stack_frames,
 )
@@ -86,16 +87,37 @@ def replay_artifact(
         extra_env=SANITIZER_RUNTIME_ENV,
     )
     out = res.stdout + "\n" + res.stderr
+    failure = parse_runtime_failure(out)
     return {
         "reproduced": res.returncode != 0 or res.timed_out,
         "returncode": res.returncode,
         "timed_out": res.timed_out,
-        "failure": parse_runtime_failure(out),
+        "failure": failure,
+        # Read from the whole output: the runtime prints its message before the stack, out of the tail.
+        "resource_abort": None if failure else parse_eacsl_resource_abort(out),
         "sandbox": res.sandbox,
         "seed": seed,
         "log_tail": out[-3000:],
         "frames": stack_frames(out),
     }
+
+
+def resource_abort_record(abort: dict, attribution: dict | None) -> dict | None:
+    """
+    An artifact's `eacsl_resource_abort`: the E-ACSL runtime stopped on its own limit (no target check
+    failed), and what the sanitizer replay of the same input said: `unavailable` (no sanitizer build),
+    `not_reproduced` or `no_failure`. None when the sanitizer replay reported a failure, located or not:
+    the artifact then stays an ordinary (unparsed) crash for a verifier.
+    """
+    if attribution and attribution.get("failure"):
+        return None
+    if not attribution:
+        san = "unavailable"
+    elif not attribution.get("reproduced"):
+        san = "not_reproduced"
+    else:
+        san = "no_failure"
+    return {**abort, "sanitizer_replay": san}
 
 
 def replay_inputs(
@@ -141,6 +163,10 @@ def replay_inputs(
                     failure = san["failure"]
                     entry["failure_source"] = "sanitizer_replay"
         entry["failure"] = failure
+        if not failure and rep.get("resource_abort"):
+            record = resource_abort_record(rep["resource_abort"], entry.get("attribution"))
+            if record is not None:
+                entry["eacsl_resource_abort"] = record
         if failure:
             entry["fingerprint"] = make_fingerprint(
                 failure.get("file") or "unknown",

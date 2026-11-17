@@ -26,6 +26,7 @@ from eacsl_toolchain import (
     EACSL_FORMAT_RUNTIME_PATCH,
     EACSL_FULL_MTRACKING_DEFINES,
     EACSL_GCC_CHECK_OPTIONS,
+    EACSL_HEAP_ZONE_MB,
     EACSL_NO_LIBC_CHECKS,
     EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
@@ -34,6 +35,7 @@ from eacsl_toolchain import (
     build_fallback_object,
     defines_fuzzer_initialize,
     eacsl_share_dir,
+    eacsl_zone_size_options,
     fix_readonly_scalar_globals,
     is_eacsl_instrumented,
     mark_formals_initialized,
@@ -200,7 +202,13 @@ def _eacsl_cache_material(
         "concurrency": has_pthread,
         "check_options": _check_options(is_modern, libc_checks),
         "runtime_patches": _runtime_patches(_check_options(is_modern, libc_checks)),
+        "zone_sizes": _zone_size_options(is_modern),
     }
+
+
+def _zone_size_options(is_modern: bool) -> list[str]:
+    """Stage-2 `--zone-sizes` (eacsl_toolchain.EACSL_HEAP_ZONE_MB); the long-option CLI of Frama-C <= 32 gets none."""
+    return eacsl_zone_size_options(EACSL_HEAP_ZONE_MB) if is_modern else []
 
 
 def _check_options(is_modern: bool, libc_checks: bool) -> list[str]:
@@ -764,11 +772,17 @@ def _compile_eacsl_binary_uncached(
                     "promoted unsigned char/short argument of %u/%x/%o and on a %s/%p/%n after a %f/%e/%g.\n"
                 )
 
+        # The runtime's tracked heap (eacsl_toolchain.EACSL_HEAP_ZONE_MB): fixed, it decides which
+        # input-sized allocations abort the runtime.
+        zone_args = _zone_size_options(is_modern)
+        result["eacsl_zone_sizes"] = {"heap_mb": int(zone_args[1].split(":", 1)[1])}
+
         def _stage2(link: str) -> tuple[list[str], int, str, str]:
             cmd2 = [
                 eacsl_bin,
                 "-C",
                 *check_options,
+                *zone_args,
                 *share_args,
                 "-G",
                 "clang",

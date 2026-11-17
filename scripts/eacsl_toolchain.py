@@ -81,6 +81,41 @@ EACSL_FC_EXTRA_FLAGS = (EACSL_FULL_MTRACKING_FLAG,)
 # Not --temporal: it aborts on any call that passes a function's address under full tracking
 # (docs/upstream/frama-c/frama-c-eacsl-temporal-function-address-argument.md).
 EACSL_GCC_CHECK_OPTIONS = ("--libc-replacements", "--validate-format-strings")
+# Size in MiB of the program heap E-ACSL's segment model tracks: `e-acsl-gcc --zone-sizes heap:<N>`
+# at stage 2, which compiles the runtime with -DE_ACSL_HEAP_SIZE=<N> (share/e-acsl/observation_model/
+# segment_model/e_acsl_shadow_layout.h; the upstream default is 128). A larger allocation aborts the
+# runtime with "Exceeded heap allocation limit of <N>MB": E-ACSL's limit, not a target defect
+# (failure_identity.parse_eacsl_resource_abort). A target that allocates a size read from its input
+# (mpack's *_alloc APIs, mpack run-3) hit 128 on legitimate inputs.
+# Result-deciding, so fixed, never sized from the machine. Measured in framac-analysis (2026-11-17,
+# docs/troubleshooting/eacsl-and-fuzzing.md): the runtime writes the heap shadow of a block when it
+# is allocated, so each tracked MiB costs about one MiB of RSS (a one-byte touch of a 64 MiB block:
+# 55 -> 126 MB max RSS; of a 1000 MiB block: 1.2 GB), while the zone itself is reserved address
+# space only (no RLIMIT_AS, see sandbox_exec.py); startup RSS and throughput did not change from 128.
+# 1024 keeps the largest tracked block plus its shadow inside the fixed -rss_limit_mb of 2048
+# (resources.FUZZ_RSS_LIMIT_MB; measured: 1.2 GB max RSS for a 1000 MiB block). A calloc'd one (block,
+# shadow and init shadow all written) comes to about 2.2 GB by computation, not measured: inside the
+# 1.25x per-worker sizing, where libFuzzer's RSS check should report an oom- artifact. The time spent
+# writing the shadow of a 500-1000 MiB block against the per-input timeout is not measured yet. A
+# larger block aborts in the runtime as before. 2048 itself is not possible (measured: exit 139 at
+# startup on every input); the cause is inferred from the source: the runtime computes
+# `E_ACSL_HEAP_SIZE * MB` in `int`, which overflows at 2048. 2047 is untested.
+EACSL_HEAP_ZONE_MB = 1024
+_EACSL_MIN_HEAP_ZONE_MB = 64  # e-acsl-gcc's MIN_HEAP
+_EACSL_MAX_HEAP_ZONE_MB = 2047  # E_ACSL_HEAP_SIZE * MB is an int product in the runtime
+
+
+def eacsl_zone_size_options(heap_mb: int | None = None) -> list[str]:
+    """`e-acsl-gcc` stage-2 options that size the runtime's tracked heap (EACSL_HEAP_ZONE_MB)."""
+    mb = EACSL_HEAP_ZONE_MB if heap_mb is None else int(heap_mb)
+    if not _EACSL_MIN_HEAP_ZONE_MB <= mb <= _EACSL_MAX_HEAP_ZONE_MB:
+        raise ValueError(
+            f"E-ACSL heap zone {mb} MiB is outside [{_EACSL_MIN_HEAP_ZONE_MB}, {_EACSL_MAX_HEAP_ZONE_MB}] "
+            "(e-acsl-gcc's minimum; the runtime's int product E_ACSL_HEAP_SIZE * MB overflows at 2048)"
+        )
+    return ["--zone-sizes", f"heap:{mb}"]
+
+
 # The `reduced_checks` entry of a build without them (`--no-libc-checks`). E-ACSL does not track memory
 # libc allocates itself (`strerror`'s buffer), so `fprintf(f, "%s", strerror(e))` or `strncpy(d,
 # strerror(e), n)` aborts as unallocated: a module whose seeds stop on such a call fuzzes without them.

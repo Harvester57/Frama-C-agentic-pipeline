@@ -150,6 +150,7 @@ from failure_identity import (  # noqa: E402, F401
     is_runtime_function,
     needs_attribution,
     parse_eacsl_failure,
+    parse_eacsl_resource_abort,
     parse_runtime_failure,
     parse_sanitizer_failure,
     stable_ubsan_message,
@@ -984,6 +985,23 @@ def run_fuzz_campaign(
                             failure = san_replay["failure"]
                             entry["failure_source"] = "sanitizer_replay"
                 entry["failure"] = failure
+                if not failure:
+                    # The E-ACSL runtime stopped on its own limit (its tracked heap zone): no target
+                    # check failed. Kept as a crash artifact so keep-going skips its case like any
+                    # other, but marked, so ingest makes no candidate of it (ledger.cmd_ingest_fuzz).
+                    abort = replay.get("resource_abort") or (
+                        parse_eacsl_resource_abort(combined_out) if crash_like == 1 else None
+                    )
+                    attribution = entry.get("attribution")
+                    record = (
+                        crash_replay.resource_abort_record(
+                            abort, attribution if isinstance(attribution, dict) else None
+                        )
+                        if abort
+                        else None
+                    )
+                    if record is not None:
+                        entry["eacsl_resource_abort"] = record
                 if failure:
                     entry["fingerprint"] = make_fingerprint(
                         failure["file"],
@@ -1065,6 +1083,16 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
     if returncode == 0 and not timed_out:
         return {"status": "passed_dynamic_oracle"}
     failure = parse_eacsl_failure(output)
+    if failure is None and (abort := parse_eacsl_resource_abort(output)):
+        return {
+            "status": "guardrail_error",
+            "reason": (
+                f"The E-ACSL runtime stopped on its own {abort['resource']} limit ({abort['message']}): "
+                "no check failed, so this says nothing about the contract."
+            ),
+            "failure": None,
+            "eacsl_resource_abort": abort,
+        }
     if failure is None:
         return {
             "status": "guardrail_error",
